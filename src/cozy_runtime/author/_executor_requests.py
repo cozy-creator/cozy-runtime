@@ -281,10 +281,16 @@ class Handoff(Answer, frozen=True, kw_only=True):
     descriptor: int = -1
 
 
+class HostTierGrant(msgspec.Struct, frozen=True, kw_only=True):
+    descriptor: int
+    readonly: bool = False
+
+
 class Tier(Answer, frozen=True, kw_only=True):
     """The worker's answer to a `HostTier` ask; one memfd follows when `held`."""
 
     held: bool = False
+    readonly: bool = False
     descriptor: int = -1
 
 

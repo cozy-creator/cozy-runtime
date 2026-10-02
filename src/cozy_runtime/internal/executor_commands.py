@@ -222,6 +222,9 @@ class Load(Command, frozen=True, kw_only=True, tag="load"):
     host_tier: bool = False
     #: host_tiers.owner/1: register typed partitions before adopting machine-created tiers.
     host_tier_owner: bool = False
+    host_tier_disk: bool = False
+    #: Negotiated initial host admission; applies before registration/autofill.
+    initial_host_budget_bytes: Annotated[int, msgspec.Meta(ge=0)] | UnsetType = UNSET
     #: The worker grants a turn per component-use scope (`stage/1`): `StageEnter` before each
     #: scope plans, `StageExit` after it. Older workers never set it.
     stages: bool = False

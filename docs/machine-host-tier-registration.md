@@ -31,3 +31,24 @@ pageable bytes separately. Only exact process exit authorizes machine reclaim in
 checkpoint. Live cooperative release/refill with DMA/compute fences, complete machine memory
 accounting, actual SDXL/Anima/H3, multi-GPU/NCCL, GPU crash tests and ordinary CLI qualification
 remain open. Root owns GPU/rental tests; no GPU/NVML was used for these gates.
+
+The bounded follow-up adds omitted-default `initial_host_budget_bytes` and optional
+`host_tier_disk`, with distinct `host_tiers.initial_budget/1` and `host_tiers.disk/1`
+capabilities. The initial nonnegative budget is applied before backend construction,
+registration and automatic fill; omission retains the old behavior. Authenticated readonly
+Tier grants select native `register_machine_host` and skip executor weight object descriptors,
+hash traversal and private host-data fills. The general untrusted source path still verifies
+bytes. CPU readonly weights bind their file mapping without requiring full host residency.
+
+The native disk candidate and SDK socket/file path have CPU proof only. Thirty-one paired SDK
+transport/initial-budget/readonly-file and real older/current-bound inference tests pass with
+native PR305; three native disk and twelve existing host-tier tests pass. This does not
+qualify standalone machine disk wiring or GPU behavior. The previous 46-gate source/owner
+checkpoint remains available separately. A temporary CPU Torch import test was removed
+because a CUDA-enabled Torch wheel mapped libcuda; the final clean gate uses actual host-only
+native budget allocation and has no driver mapping.
+
+Root has held expansion pending a matched current/new-stack value comparison. Legacy loading
+must remain the default until descriptor loading is equal or faster under matched cache,
+allocator and resource settings without weakening integrity. Initial-budget safety can
+benefit either stack; these drafts are reviewable candidates, not a migration requirement.

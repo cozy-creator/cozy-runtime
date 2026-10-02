@@ -8,6 +8,7 @@ from pathlib import Path
 
 import msgspec
 import pytest
+from tensorfs import plane as native_plane
 
 from cozy_runtime.author._executor_requests import Answer, HostTierPlan, HostTierPrepare, decode
 from cozy_runtime.internal import canonical, host_tiers
@@ -99,3 +100,86 @@ def test_omitted_load_selector_keeps_baseline_and_unknown_fields_are_harmless():
     assert new.host_tier_owner
     encoded = msgspec.json.encode(Answer(ok=True))
     assert msgspec.json.decode(encoded, type=Answer).ok
+
+
+def test_initial_host_budget_is_typed_and_real_host_only_native_book_applies_it():
+    command = msgspec.json.decode(
+        b'{"cmd":"load","construction":"a","initial_host_budget_bytes":0}', type=Load
+    )
+    assert command.initial_host_budget_bytes == 0
+    with pytest.raises(msgspec.ValidationError):
+        msgspec.json.decode(
+            b'{"cmd":"load","construction":"a","initial_host_budget_bytes":-1}', type=Load
+        )
+    native = native_plane.Plane(devices=[], readers=1)
+    try:
+        native.set_pinned_budget(command.initial_host_budget_bytes)
+        assert native.stats()["host"]["budget"] == 0
+        assert "libcuda.so" not in Path("/proc/self/maps").read_text()
+    finally:
+        native.close()
+
+
+def test_readonly_disk_tier_transport_uses_native_machine_layout_without_source(tmp_path):
+    if not host_tiers.disk_available():
+        pytest.skip("requires optional native disk-host dependency candidate")
+    from cozy_runtime.author._executor_requests import HostTierGrant
+    from cozy_runtime.internal.fill import Checkpoint
+    from test_machine_model_sources import owner_model
+
+    store, manifest, lease, _files, _header, data = owner_model(tmp_path)
+    checkpoint = Checkpoint(tmp_path / "owner", manifest)
+    plan = checkpoint.read_plan((("linear", "weight"),), 4 << 20, ("linear",))
+    producer = native_plane.Plane(devices=[], readers=1, direct_io=False)
+    source = producer.source(store, lease)
+    regions = (("linear/weight",),)
+    owner_set = producer.register_file("disk/linear", source, plan, regions,
+                                       str(tmp_path / "host-files"))
+    producer.set_pinned_budget(owner_set.nbytes)
+    producer.want(owner_set, "pinned").wait()
+    fd = owner_set.publish_readonly_host()
+    left, right = socket.socketpair()
+    executor = Executor(Channel(left), tmp_path / "attempt")
+    owner = Channel(right)
+    errors = []
+
+    def serve():
+        try:
+            frame = owner.recv()
+            owner.send({"event": "answer", "seq": frame["seq"], "ok": True,
+                        "held": True, "readonly": True, "descriptor": True})
+            owner.send_readonly_file(fd)
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            owner.close()
+
+    thread = threading.Thread(target=serve)
+    thread.start()
+    consumer = native_plane.Plane(devices=[], readers=1)
+    try:
+        consumer.set_pinned_budget(0)
+        held = executor._ask_tier("disk/linear", "layout")
+        assert isinstance(held, HostTierGrant) and held.readonly
+        ws = consumer.register_machine_host("disk/linear", plan, regions, held.descriptor)
+        os.close(held.descriptor)
+        assert ws.host_readonly
+        assert consumer.stats()["host"]["used"] == 0
+        assert consumer.stats()["host"]["fills"] == 0
+        assert consumer.stats()["host"]["buffered_bytes"] == 0
+        assert os.pread(ws.host_fd, len(data), ws.parts[0]["offset"]) == data
+        with pytest.raises(OSError):
+            os.pwrite(ws.host_fd, b"x", 0)
+        ws.close()
+        assert "libcuda.so" not in Path("/proc/self/maps").read_text()
+        thread.join()
+        assert not errors
+    finally:
+        left.close()
+        right.close()
+        thread.join()
+        consumer.close()
+        os.close(fd)
+        owner_set.close()
+        del source
+        producer.close()

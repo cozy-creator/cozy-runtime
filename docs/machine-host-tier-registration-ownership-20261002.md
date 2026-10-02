@@ -14,3 +14,7 @@
 - Paired owner: cozy-machine PR18/native host plane; wire/header prerequisite e9c520a.
 - 46 actual SDK/source/native CPU gates pass; checksum and readonly integrity unchanged.
 - Preserve original local-safe env/wheel, old candidate/profiler envs and primary checkouts.
+- Bounded follow-up: initial host budget before registration, optional readonly file grant;
+  31 actual SDK/older/current-bound CPU tests passed with native PR305. No GPU claim.
+- Standalone disk-mode response/config wiring is intentionally not expanded after Root's
+  audit decision gate. Legacy loader default remains; descriptor optimization is next.

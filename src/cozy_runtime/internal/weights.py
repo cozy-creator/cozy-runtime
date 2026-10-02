@@ -28,7 +28,7 @@ import msgspec
 import tensorfs
 
 from cozy_runtime.author._errors import RuntimeFailure, is_device_oom
-from cozy_runtime.author._executor_requests import HostTierPlan
+from cozy_runtime.author._executor_requests import HostTierGrant, HostTierPlan
 from cozy_runtime.author._loader import Census, TensorLike, TensorSpec, _members
 from cozy_runtime.author._stage_memo import inexact
 from cozy_runtime.internal import (
@@ -591,14 +591,15 @@ class Weights:
         if self.pinned < 0:
             self._pin(sum(c.ws.nbytes for c in self.components.values()))
         try:
-            ticket = self.plane.want(
+            ticket = None if getattr(component.ws, "host_readonly", False) else self.plane.want(
                 component.ws, plane.PINNED, None, priority=self.tick(), pin=True
             )
         except (plane.error("Shortfall"), plane.error("BelowFloor")) as exc:
             raise ResidencyRefusal(
                 "device_shortfall", f"{component.key} does not fit host memory: {exc}"
             ) from None
-        ticket.wait()
+        if ticket is not None:
+            ticket.wait()
         fd = os.dup(component.ws.host_fd)
         try:
             # Private: the pages are the tier's until written, and nothing here writes them.
@@ -1513,27 +1514,34 @@ class PlaneBackend:
                     traversal=tuple(traversal), components=(name,),
                     regions=tuple(tuple(region) for region in ids), parts=tuple(parts),
                 ))
-            source_key = (checkpoint.manifest_id if checkpoint.source_provider is None else
-                          f"{checkpoint.manifest_id}/{name}")
-            source = self.sources.get(source_key)
-            if source is None:
-                if checkpoint.source_provider is not None:
-                    source = checkpoint.source_provider.source(weights.plane,
-                                                               checkpoint.manifest_id, plan)
-                else:
-                    assert checkpoint.store is not None
-                    source = plane.source(weights.plane, checkpoint.store, self.leases.take(name))
-                self.sources[source_key] = source
             held = tiers.ask(key, digest) if tiers is not None else None
+            descriptor = held.descriptor if isinstance(held, HostTierGrant) else held
             try:
-                ws = weights.plane.register(key, source, plan, ids, host_fd=held)
+                if isinstance(held, HostTierGrant) and held.readonly:
+                    # Authenticated machine-verified native layout. No executor Store,
+                    # object descriptors, hash traversal or private host fill for weights.
+                    ws = weights.plane.register_machine_host(key, plan, ids, descriptor)
+                else:
+                    source_key = (checkpoint.manifest_id if checkpoint.source_provider is None else
+                                  f"{checkpoint.manifest_id}/{name}")
+                    source = self.sources.get(source_key)
+                    if source is None:
+                        if checkpoint.source_provider is not None:
+                            source = checkpoint.source_provider.source(weights.plane,
+                                                                       checkpoint.manifest_id, plan)
+                        else:
+                            assert checkpoint.store is not None
+                            source = plane.source(
+                                weights.plane, checkpoint.store, self.leases.take(name))
+                        self.sources[source_key] = source
+                    ws = weights.plane.register(key, source, plan, ids, host_fd=descriptor)
             except plane.error("Invalid"):
-                if held is None:
-                    raise
-                ws = None  # the held tier is not this layout after all
+                if descriptor is None or isinstance(held, HostTierGrant):
+                    raise  # corrupt/unsupported immutable layout is never privately rewritten
+                ws = None
             finally:
-                if held is not None:
-                    os.close(held)  # the plane reopened its own description
+                if descriptor is not None:
+                    os.close(descriptor)
             if ws is None:
                 held, ws = None, weights.plane.register(key, source, plan, ids)
         if tiers is not None:
@@ -1613,7 +1621,7 @@ class HostTiers:
     `offer` hands the worker one this process filled; `share` hands every registered one on
     (rank 0 to its followers, so K ranks pin one copy)."""
 
-    ask: Callable[[str, str], int | None]
+    ask: Callable[[str, str], int | HostTierGrant | None]
     offer: Callable[[str, str, int], None]
     share: Callable[[str, str, int], None] = lambda name, layout, memfd: None
     prepare: Callable[[HostTierPlan], None] | None = None

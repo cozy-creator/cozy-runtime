@@ -82,6 +82,7 @@ from cozy_runtime.author._executor_requests import (
     DeviceRoom,
     Handoff,
     HostTier,
+    HostTierGrant,
     HostTierPlan,
     HostTierPrepare,
     Publish,
@@ -606,8 +607,11 @@ class Executor:
             "memory": [
                 "import_only",
                 "vacate_ranks",
+                *([host_tiers.DISK_CAPABILITY]
+                  if host_tiers.disk_available() and self.world == 1 else []),
                 *([plane.CAPABILITY, STAGE_TURNS] if plane.available() else []),
-                *([host_tiers.CAPABILITY] if host_tiers.available() and self.world == 1 else []),
+                *([host_tiers.CAPABILITY, host_tiers.INITIAL_BUDGET]
+                  if host_tiers.available() and self.world == 1 else []),
                 *(
                     [model_sources.CAPABILITY]
                     if model_sources.available() and self.world == 1 else []
@@ -1392,6 +1396,9 @@ class Executor:
         it touched the process leaves the other constructions serving; one that commanded
         followers or raised poisons the process.
         """
+        if command.host_tier_disk and (self.world != 1 or not host_tiers.disk_available()):
+            return {"ok": False, "code": "host_tier_disk_unavailable",
+                    "detail": "machine readonly host layouts are unavailable"}
         if command.host_tier_owner and (self.world != 1 or not host_tiers.available()):
             return {"ok": False, "code": "host_tier_owner_unavailable",
                     "detail": "machine host partition registration is unavailable"}
@@ -1983,7 +1990,10 @@ class Executor:
         weights = host.weights
         # A load plans in what the driver has: the Worker made room for it, and an earlier
         # cut to 0 is no grant for this construction.
-        weights.set_budget(-1)
+        if not isinstance(command.initial_host_budget_bytes, UnsetType):
+            weights.set_budget(-1, command.initial_host_budget_bytes)
+        else:
+            weights.set_budget(-1)
         backend = PlaneBackend(
             checkpoints,
             rows,
@@ -1994,7 +2004,7 @@ class Executor:
             qualified=qualified_pair,
             device_facts=device_facts,
             custody=binding.custody,
-            tiers=self._tiers(command.host_tier, command.host_tier_owner),
+            tiers=self._tiers(command.host_tier, command.host_tier_owner or command.host_tier_disk),
         )
         stage("backend_ctor")
         # THE GROUP AGREES ITS PLAN before any rank registers a byte (cr-068). Budgets are
@@ -2360,6 +2370,8 @@ class Executor:
                     sequence_parallel_degree=max(self.world, 1),
                     host_tier=command.host_tier,
                     host_tier_owner=command.host_tier_owner,
+                    host_tier_disk=command.host_tier_disk,
+                    initial_host_budget_bytes=command.initial_host_budget_bytes,
                     descriptor_sources=command.descriptor_sources,
                 ),
                 optional_attention_scope=True,
@@ -3726,10 +3738,13 @@ class Executor:
             raise GroupRefusal(f"{_gpu(self.rank)} expected rank 0's tier for {name!r}")
         return self.channel.recv_memfd() if frame.get("held") is True else None
 
-    def _ask_tier(self, name: str, layout: str) -> int | None:
+    def _ask_tier(self, name: str, layout: str) -> int | HostTierGrant | None:
         """The pinned host tier the worker keeps for exactly this weight set's layout."""
         answer = self._durable(HostTier(name=name, layout=layout), Tier)
-        return answer.descriptor if answer.ok and answer.held and answer.descriptor >= 0 else None
+        if not (answer.ok and answer.held and answer.descriptor >= 0):
+            return None
+        return (HostTierGrant(descriptor=answer.descriptor, readonly=True)
+                if answer.readonly else answer.descriptor)
 
     def _prepare_tier(self, plan: HostTierPlan) -> None:
         """Offer native plan metadata; older owners refuse the optional cache operation."""
@@ -3850,7 +3865,9 @@ class Executor:
                     source_descriptor = self.channel.recv_readonly_file()
                     frame["descriptor"] = source_descriptor
                 elif issubclass(into, Tier):
-                    frame["descriptor"] = self.channel.recv_memfd()
+                    frame["descriptor"] = (self.channel.recv_readonly_file()
+                                           if frame.get("readonly") is True
+                                           else self.channel.recv_memfd())
                 elif not handoff:
                     self.channel.close()
                     raise SeamError("seam_descriptor", "unexpected capability in control reply")

@@ -14,11 +14,14 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 
 import msgspec
+from tensorfs import plane as native_plane
 
 from cozy_runtime.author._executor_requests import HostTierPlan, HostTierPrepare
 from cozy_runtime.internal import canonical
 
 CAPABILITY = "host_tiers.owner/1"
+INITIAL_BUDGET = "host_tiers.initial_budget/1"
+DISK_CAPABILITY = "host_tiers.disk/1"
 _LIBC = ctypes.CDLL(None, use_errno=True)
 _MEMFD = getattr(_LIBC, "memfd_create", None)
 if _MEMFD is not None:
@@ -32,6 +35,10 @@ _SEALS = 0x0F  # SEAL, SHRINK, GROW, WRITE
 
 def available() -> bool:
     return sys.platform == "linux" and _MEMFD is not None
+
+
+def disk_available() -> bool:
+    return available() and hasattr(native_plane.Plane, "register_machine_host")
 
 
 @contextmanager
