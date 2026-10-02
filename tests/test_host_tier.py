@@ -75,11 +75,22 @@ def test_a_replacement_executor_adopts_the_tier_the_worker_kept(tmp_path: Path) 
         filled_bytes = plane.stats(first.plane).host.fill_bytes
         assert filled_bytes > 0
 
+        # The first executor goes (its weight set closes): the Worker's claim keeps the RAM.
+        probe = os.dup(filled.ws.host_fd)
+        first.forget("tier")
+        assert os.fstat(probe).st_blocks * 512 >= filled_bytes
+
         second = Weights(torch, torch.device("cpu"), "cpu")
         second.set_budget(-1, pinned=1 << 30)
         adopted = load(second, checkpoint, "tier", tiers=seam).backend.components["stack"]
         assert_pinned(second, adopted, values)
         assert plane.stats(second.plane).host.fill_bytes == 0  # nothing read from the store
+
+        # Released by the Worker and closed by the last executor, the tier holds no RAM.
+        second.forget("tier")
+        tiers.close()
+        assert os.fstat(probe).st_blocks * 512 <= 4096  # its state page only
+        os.close(probe)
     finally:
         stop.set()
         ours.close()

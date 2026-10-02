@@ -7,6 +7,7 @@ never reorders a schedule. It maps, copies, streams and counts; `weights.py` and
 
 from __future__ import annotations
 
+import os
 from types import ModuleType
 from typing import TYPE_CHECKING, Final
 
@@ -156,6 +157,23 @@ def stats(plane: Plane) -> Stats:
 
 def events(plane: Plane) -> list[Event]:
     return msgspec.convert(plane.events(), list[Event])
+
+
+def hold_tier(fd: int) -> int:
+    """Claim every region of a pinned-tier memfd for the Worker (no plane of its own): while
+    it holds the returned descriptor no executor's eviction or close frees the tier's RAM. A
+    TensorFS before claims keeps the descriptor as it is."""
+    hold = getattr(_plane, "hold_tier", None)
+    return int(hold(fd)) if hold is not None else os.dup(fd)
+
+
+def release_tier(hold: int) -> None:
+    """End `hold_tier`: frees every region no executor claims, and closes the descriptor."""
+    release = getattr(_plane, "release_tier", None)
+    if release is not None:
+        release(hold)
+    else:
+        os.close(hold)
 
 
 def error(name: str) -> type[BaseException]:

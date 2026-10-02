@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from cozy_runtime.internal.accel import readable
+
 # Tensors and triton's kernels are `Any`: neither torch nor triton is installed in the check venv.
 
 #: The largest finite e4m3fn magnitude, and the value a head's amax is mapped onto instead.
@@ -94,8 +96,9 @@ def quantise(tensor: Any) -> tuple[Any, Any]:
     amax = torch.zeros((batch, heads), dtype=torch.float32, device=tensor.device)
     out = torch.empty(tensor.shape, dtype=torch.float8_e4m3fn, device=tensor.device)
     grid = (batch * heads, cdiv(seq, CHUNK))
-    amax_kernel[grid](tensor, amax, seq, heads, CHUNK=CHUNK, DIM=dim)
-    cast_kernel[grid](tensor, out, amax, seq, heads, CHUNK=CHUNK, DIM=dim)
+    with readable(tensor) as (tensor,):
+        amax_kernel[grid](tensor, amax, seq, heads, CHUNK=CHUNK, DIM=dim)
+        cast_kernel[grid](tensor, out, amax, seq, heads, CHUNK=CHUNK, DIM=dim)
     return out, (amax / E4M3_TARGET).clamp_(min=SCALE_FLOOR)
 
 

@@ -22,6 +22,8 @@ from typing import Any
 
 from packaging.version import InvalidVersion, Version
 
+from cozy_runtime.internal.accel import readable
+
 DIFFUSERS_VERSION = "0.40.0"
 # The kernels ride cozy-runtime's own cp312-abi3 wheel (cr-094): the module is probed,
 # never version-pinned. The revision names the native sources' review state and is bumped
@@ -271,14 +273,16 @@ class _FusedSelfAttention:
                 "anima_optimization_rope_absent",
                 "the exact Anima Cosmos self-attention call omitted rotary embeddings",
             )
-        query, key = self.anima_kernels.rms_rope_split_half(
-            query,
-            key,
-            self.rope.get(image_rotary_emb),
-            attn.norm_q.weight,
-            attn.norm_k.weight,
-            attn.norm_q.eps,
-        )
+        # The kernel reads the scales by pointer, without calling the norms that own them.
+        with readable(attn.norm_q.weight, attn.norm_k.weight) as (q_scale, k_scale):
+            query, key = self.anima_kernels.rms_rope_split_half(
+                query,
+                key,
+                self.rope.get(image_rotary_emb),
+                q_scale,
+                k_scale,
+                attn.norm_q.eps,
+            )
         query_width, key_width, value_width = query.shape[3], key.shape[3], value.shape[3]
         key = key.repeat_interleave(query_width // key_width, dim=3)
         value = value.repeat_interleave(query_width // value_width, dim=3)

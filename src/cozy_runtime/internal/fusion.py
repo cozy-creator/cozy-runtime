@@ -36,12 +36,13 @@ from __future__ import annotations
 import hashlib
 import inspect
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from cozy_runtime.internal import kernel_cache, kernel_compile
+from cozy_runtime.internal.accel import readable
 from cozy_runtime.internal.encoding.leaves import PreQuantized
 
 try:
@@ -524,14 +525,36 @@ def build(
 
 
 @dataclass(frozen=True, slots=True)
+class _Launch:
+    """A compiled kernel's launch. Its tensor operands are read by pointer, so each has real
+    bytes behind it first (`accel.readable`): a norm scale read from a sibling module may be
+    a weight the plane has not mapped."""
+
+    kernel: Mapping[tuple[int, ...], Callable[..., object]]
+
+    def __getitem__(self, grid: tuple[int, ...]) -> Callable[..., None]:
+        launch = self.kernel[grid]
+
+        def run(*args: object) -> None:
+            at = [i for i, value in enumerate(args) if isinstance(value, torch.Tensor)]
+            with readable(*(args[i] for i in at)) as real:
+                operands = list(args)
+                for i, value in zip(at, real, strict=True):
+                    operands[i] = value
+                launch(*operands)
+
+        return run
+
+
+@dataclass(frozen=True, slots=True)
 class _Loaded:
     arch: int
     compiled: dict[str, Any]
 
-    def launch(self, kernel: str, **constexprs: int) -> Any:
+    def launch(self, kernel: str, **constexprs: int) -> _Launch:
         key = f"{kernel}[" + ",".join(f"{k}={v}" for k, v in constexprs.items()) + "]"
         try:
-            return self.compiled[key]
+            return _Launch(self.compiled[key])
         except KeyError:
             raise FusionUnavailable(
                 "fusion_kernels_absent",

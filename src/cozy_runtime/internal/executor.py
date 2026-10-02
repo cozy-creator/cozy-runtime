@@ -79,11 +79,13 @@ from cozy_runtime.author._executor_requests import (
     Checkpoint,
     CheckpointReceipt,
     ChildEvents,
+    DeviceRoom,
     Handoff,
     HostTier,
     Publish,
     Published,
     Request,
+    Room,
     StageEnter,
     StageExit,
     StageGo,
@@ -1961,6 +1963,7 @@ class Executor:
                 host.weights.world = self.world
                 if self.rank == 0:
                     host.weights.cell = host._budget_cell()
+                    host.weights.room = host._device_room
             except plane.Unavailable as exc:
                 return {"ok": False, "code": "weight_plane_unavailable", "detail": str(exc)}
         weights = host.weights
@@ -3731,6 +3734,11 @@ class Executor:
         """The pinned host tier the worker keeps for exactly this weight set's layout."""
         answer = self._durable(HostTier(name=name, layout=layout), Tier)
         return answer.descriptor if answer.ok and answer.held and answer.descriptor >= 0 else None
+
+    def _device_room(self, free_bytes: int) -> None:
+        """Ask the worker for `free_bytes` free on this GPU from its other tenants; it answers
+        once they gave what they could (an older worker refuses, and nothing changes)."""
+        self._durable(DeviceRoom(free_bytes=free_bytes), Room)
 
     def _budget_cell(self) -> budget_cell.Cell | None:
         """Hand the worker this process's budget cell; None from an older worker."""

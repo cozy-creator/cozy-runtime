@@ -9,9 +9,11 @@ card, so run it under the shared GPU lock.
 
 from __future__ import annotations
 
+import gc
 import io
 import mmap
 import os
+from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -25,7 +27,8 @@ from tensorfs.derived import Config as NativeConfig  # noqa: E402
 from tensorfs.derived import Derivation, Part, Target, Tensor  # noqa: E402
 
 from cozy_runtime.author._loader import census  # noqa: E402
-from cozy_runtime.internal import accel, plane, weight_policy  # noqa: E402
+from cozy_runtime.internal import accel, paging, plane, weight_policy  # noqa: E402
+from cozy_runtime.internal import weights as weights_module  # noqa: E402
 from cozy_runtime.internal.derive import Observations, serving_substrate  # noqa: E402
 from cozy_runtime.internal.encoding import SPEC_PLAIN  # noqa: E402
 from cozy_runtime.internal.fill import Checkpoint  # noqa: E402
@@ -171,6 +174,15 @@ def tight(model: Any) -> int:
     return layout.common + 3 * layout.largest
 
 
+@pytest.fixture(autouse=True)
+def _collected() -> Iterator[None]:
+    """A construction is a reference cycle (its blocks' hooks hold it) that keeps one file
+    open per stored tensor: the last test's is collected before this one opens its own."""
+    gc.collect()
+    yield
+    gc.collect()
+
+
 @pytest.fixture
 def card(tmp_path: Path) -> Any:
     weights = Weights(torch, torch.device("cuda", 0), "cuda")
@@ -214,6 +226,7 @@ def test_an_unbound_weight_is_parked_as_packages_know_it() -> None:
     streaming (not on the card) and failed. A weight with no plane bytes bound has a zero-byte
     storage, which is how packages already tell a parked weight; its shape, dtype and device
     stay facts."""
+    pytest.importorskip("diffusers")
     from cozy_runtime.internal.weights import unbound
     from cozy_runtime.models.minimax_h3.official import _inspectable
 
@@ -223,6 +236,36 @@ def test_an_unbound_weight_is_parked_as_packages_know_it() -> None:
     assert (standin.shape, standin.dtype, standin.device.type) == (held.shape, held.dtype, "cpu")
     assert not _inspectable(standin) and _inspectable(held)
     assert standin.to(torch.float32).untyped_storage().nbytes() == 0
+    # Run 2793: inside an out-of-memory retry `Tensor.to` reaches the stand-in whole (not as
+    # the copy it decomposes into); the plane retyping one there mapped it, and recursed.
+    aten, kind = torch.ops.aten, type(standin)
+    for func, args, kwargs in (
+        (aten.to.dtype, (standin, torch.float32), {}),
+        (aten.to.device, (standin, torch.device("cpu"), torch.float32), {}),
+        (aten.to.dtype_layout, (standin,), {"dtype": torch.float32}),
+        (aten.to.other, (standin, torch.empty(1, dtype=torch.float32)), {}),
+    ):
+        moved = kind.__torch_dispatch__(func, (kind,), args, kwargs)
+        assert type(moved) is kind and moved.shape == held.shape
+        assert moved.dtype == torch.float32 and moved.untyped_storage().nbytes() == 0
+
+
+def test_a_kernel_launch_is_never_handed_a_weight_with_no_bytes() -> None:
+    """A Triton kernel reads its operands by pointer. One that is a weight with no plane
+    bytes bound, which nothing here can map (no stage owns it), is refused before the launch;
+    every other operand passes through untouched."""
+    from cozy_runtime.internal import fusion
+    from cozy_runtime.internal.weights import ResidencyRefusal, unbound
+
+    launched: list[tuple[Any, ...]] = []
+    kernel: Any = {(4, 1, 1): lambda *args: launched.append(args)}
+    scale = torch.ones(8)
+    fusion._Launch(kernel)[(4, 1, 1)](scale, 8, 1e-6)
+    assert len(launched) == 1 and launched[0][0] is scale and launched[0][1:] == (8, 1e-6)
+    standin = unbound(torch, torch.nn.Parameter(torch.empty(8)), torch.device("cpu"))
+    with pytest.raises(ResidencyRefusal, match="no plane bytes") as refused:
+        fusion._Launch(kernel)[(4, 1, 1)](scale, standin, 8)
+    assert refused.value.code == "weight_unbound" and len(launched) == 1
 
 
 def assert_pinned(weights: Weights, component: Any, values: dict[str, Any]) -> None:
@@ -267,6 +310,171 @@ def test_a_budget_below_the_block_floor_runs_at_the_sub_block_grain(card: Any) -
     streamed = run(model, x)
     assert model.residency.components["stack"].fine
     assert same(resident, streamed)
+
+
+HEADS = 16
+
+
+class Scale(torch.nn.Module):  # type: ignore[misc,name-defined]
+    """A norm's scale, which its owner reads without calling the norm (as fused kernels do)."""
+
+    eps = 1e-6
+
+    def __init__(self, width: int) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.empty(width, dtype=torch.float16))
+
+
+class SiblingBlock(Block):
+    """Reads its sub-modules' weights itself: a norm scale, and a whole projection."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.scale = Scale(HIDDEN)
+
+    def forward(self, x: Any) -> Any:
+        hidden = torch.tanh(self.proj(x * self.norm * self.scale.weight))
+        return x + torch.tanh(torch.nn.functional.linear(hidden, self.out.weight))
+
+
+class FusedBlock(torch.nn.Module):  # type: ignore[misc,name-defined]
+    """A Cosmos self-attention as Anima runs it: the Runtime's fused processor, which hands
+    the head norms' scales to our compiled kernel (read by pointer, outside torch)."""
+
+    heads = HEADS
+
+    def __init__(self) -> None:
+        super().__init__()
+        for name in ("to_q", "to_k", "to_v"):
+            setattr(self, name, torch.nn.Linear(HIDDEN, HIDDEN, bias=False, dtype=torch.float16))
+        self.to_out = torch.nn.ModuleList(
+            [torch.nn.Linear(HIDDEN, HIDDEN, bias=False, dtype=torch.float16), torch.nn.Identity()]
+        )
+        self.norm_q, self.norm_k = Scale(HIDDEN // HEADS), Scale(HIDDEN // HEADS)
+
+    def forward(self, x: Any) -> Any:
+        from cozy_runtime import _kernels
+        from cozy_runtime.internal.anima_optimization import _FusedSelfAttention, _RopeMatrix
+
+        fused = _FusedSelfAttention(torch, _kernels, _RopeMatrix(torch))
+        turn = torch.eye(2, device=x.device).expand(1, 1, x.shape[0], 64, 2, 2).contiguous()
+        return x + torch.tanh(fused(self, x[None], image_rotary_emb=turn)[0])
+
+
+def stack_of(
+    block: type, matrices: tuple[str, ...], scales: tuple[tuple[str, int], ...]
+) -> tuple[Any, dict[str, Any]]:
+    """A `Stack` of `block`s and its checkpoint: each block's projections and norm scales."""
+
+    class Stacked(Stack):
+        _no_split_modules = (block.__name__,)
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.blocks = torch.nn.ModuleList([block() for _ in range(BLOCKS)])
+
+    generator = torch.Generator().manual_seed(7)
+    values: dict[str, Any] = {"embed": torch.rand(HIDDEN, generator=generator) + 0.5}
+    for index in range(BLOCKS):
+        for name in matrices:
+            values[f"blocks.{index}.{name}.weight"] = (
+                torch.randn(HIDDEN, HIDDEN, generator=generator) / HIDDEN**0.5
+            )
+        for name, width in scales:
+            key = f"blocks.{index}.{name}"
+            values[key if name == "norm" else f"{key}.weight"] = (
+                torch.rand(width, generator=generator) + 0.5
+            )
+    return Stacked, values
+
+
+def at_the_sub_block_grain(weights: Weights, model: Any, x: Any) -> tuple[list[Any], list[Any]]:
+    """The model's outputs resident, then in a budget below its block floor."""
+    weights.set_budget(1 << 30)
+    resident = run(model, x)
+    layout = model.residency.components["stack"].layout
+    assert layout.fine is not None
+    weights.set_budget(layout.fine[0] + 2 * layout.fine[1])
+    streamed = run(model, x)
+    assert model.residency.components["stack"].fine
+    assert weights.modes["stack.grain"] == "sub-block"  # the run record's confession
+    return resident, streamed
+
+
+@on_card
+def test_weights_read_outside_their_modules_forward_stream_exact(tmp_path: Path) -> None:
+    """A weight is bound inside its own module's forward, and code reads weights other ways:
+    a block multiplies by a sibling norm's scale, a package reaches for `.weight`. At the
+    sub-block grain those modules are regions of their own that nothing calls. The small one
+    stays in `common` (bound for the stage); the large one is mapped and held for the one op
+    that reads it. Either way the bits are the resident run's."""
+    weights = Weights(torch, torch.device("cuda", 0), "cuda")
+    weights.set_budget(-1, pinned=1 << 30)
+    factory, values = stack_of(SiblingBlock, ("proj", "out"), (("norm", HIDDEN), ("scale", HIDDEN)))
+    model = load(weights, store_component(tmp_path, "stack", values), "siblings", factory=factory)
+    x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
+    resident, streamed = at_the_sub_block_grain(weights, model, x)
+    component = model.residency.components["stack"]
+    assert component.common is not None
+    assert {f"blocks.{i}.scale.weight" for i in range(BLOCKS)} <= {
+        w.row.name for w in component.common.weights
+    }
+    assert "blocks.0.out" in {region.path for region in component.blocks}
+    assert same(resident, streamed)
+
+
+@on_card
+@pytest.mark.parametrize("small", [paging.SMALL, 1 << 40])
+def test_a_kernel_launched_outside_torch_never_reads_an_unmapped_weight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, small: int
+) -> None:
+    """Run 2744, the laptop's Xid 31: at the sub-block grain Anima's fused self-attention
+    handed its head norms' scales to our compiled kernel while no plane bytes were bound to
+    them, and the kernel read a pointer with nothing mapped behind it. The scales stay in
+    `common`; and were one its own region after all (the second case), the launch maps it
+    first (`accel.readable`) and never faults the device."""
+    pytest.importorskip("cozy_runtime._kernels._C")
+    pytest.importorskip("diffusers")
+    own_region = small != paging.SMALL
+    monkeypatch.setattr(paging, "SMALL", small)
+    weights = Weights(torch, torch.device("cuda", 0), "cuda")
+    weights.set_budget(-1, pinned=1 << 30)
+    width = HIDDEN // HEADS
+    factory, values = stack_of(
+        FusedBlock, ("to_q", "to_k", "to_v", "to_out.0"), (("norm_q", width), ("norm_k", width))
+    )
+    model = load(weights, store_component(tmp_path, "stack", values), "kernel", factory=factory)
+    x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
+    resident, streamed = at_the_sub_block_grain(weights, model, x)
+    units = {region.path for region in model.residency.components["stack"].blocks}
+    assert ("blocks.0.norm_q" in units) == own_region
+    assert same(resident, streamed)
+
+
+@on_card
+def test_a_stage_entered_inside_another_leaves_the_outer_its_own_grain(card: Any) -> None:
+    """Run 2763: Anima's DiT, mid-stage and so unable to move to the sub-block grain, was
+    given only its sub-block floor when the stage was placed again, and the run failed with
+    "does not fit at its grain" in a budget that held it. A component that cannot refine now
+    keeps at least what its current grain needs; the others stream instead."""
+    weights = card.weights
+    outer = load(weights, card.checkpoint, "b-outer")
+    inner = load(weights, card.checkpoint, "a-inner")  # placed first: it would take the spare
+    x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
+    weights.set_budget(1 << 30)
+    want = run(outer, x, passes=1), run(inner, x, passes=1)
+    layout: weight_policy.Layout = outer.residency.components["stack"].layout
+    assert layout.fine is not None and sum(layout.fine) < layout.common + layout.largest
+    weights.set_budget(layout.total + layout.common + layout.largest - (4 << 20))
+    outer.residency.admit("run", ("stack",))
+    try:
+        got_inner = run(inner, x, passes=1)  # placed together with the outer's open stage
+        with torch.inference_mode():
+            got_outer = [outer.stack(x)]
+    finally:
+        outer.residency.release("run", ("stack",))
+    assert not outer.residency.components["stack"].fine
+    assert same(want[0], got_outer) and same(want[1], got_inner)
 
 
 @on_card
@@ -334,14 +542,28 @@ def sdxl_unet() -> Any:
     ).to(torch.float16)
 
 
+def refined(model: Any, name: str) -> weight_policy.Layout:
+    """Move a component to the sub-block grain, as a budget below its block floor does."""
+    model.residency.unpark()
+    assert model.residency._refine(model.residency.components[name].key)
+    component = model.residency.components[name]
+    assert component.fine and len(component.blocks) > 1
+    layout: weight_policy.Layout = component.layout
+    return layout
+
+
 @on_card
-@pytest.mark.parametrize("pressure", [False, True])
-def test_an_sdxl_unet_streams_bit_exact(tmp_path: Path, pressure: bool) -> None:
+@pytest.mark.parametrize("pressure,fine", [(False, False), (True, False), (False, True)])
+def test_an_sdxl_unet_streams_bit_exact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pressure: bool, fine: bool
+) -> None:
     """SDXL's UNet resident, then streamed through a tight budget, computes the same bits.
     Under pressure the streamed arm alone also has a ballast leaving only the plane's budget
     and the resident run's measured activations free, as physical ballast does in G4: every
     streamed lease's bytes are checked against the store (`verify_bytes`), so a difference
     can only be the kernels' choice under memory pressure."""
+    if fine:  # the sub-block grain of a UNet this small: units of at most 256 KiB
+        monkeypatch.setattr(weights_module, "REGION_LIMIT", 256 << 10)
     torch.manual_seed(11)
     values = {k: v.float() * 0.05 for k, v in sdxl_unet().state_dict().items()}
     weights = Weights(torch, torch.device("cuda", 0), "cuda")
@@ -377,6 +599,8 @@ def test_an_sdxl_unet_streams_bit_exact(tmp_path: Path, pressure: bool) -> None:
     resident = steps()
     peak = torch.cuda.max_memory_allocated() - base
     layout: weight_policy.Layout = model.residency.components["unet"].layout
+    if fine:
+        layout = refined(model, "unet")
     weights.set_budget(layout.common + 3 * layout.largest)
     ballast = None
     if pressure:
@@ -479,6 +703,133 @@ def test_a_block_that_writes_its_inputs_recovers_op_by_op(card: Any) -> None:
         torch.cuda.empty_cache()
     assert weights.facts().oom_retries > retries
     assert same(reference, retried)
+
+
+@on_card
+def test_budgets_cut_and_raised_while_streaming_stay_exact(card: Any) -> None:
+    """Xid 31 (a copy engine wrote into an unmapped address): the Worker's cuts land at block
+    boundaries while the cursor's copies are in flight, and every cut closes the ring and maps
+    a new one. Hundreds of them, alternately tight and roomy, compute the resident bits; run
+    under `compute-sanitizer --tool memcheck` this is the reproduction."""
+    from cozy_runtime.internal import budget_cell
+
+    weights = card.weights
+    model = load(weights, card.checkpoint, "churn")
+    x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
+    weights.set_budget(1 << 30)
+    reference = run(model, x, passes=1)
+    cell, fd = budget_cell.Cell.create()
+    worker = budget_cell.Cell(fd)
+    os.close(fd)
+    weights.cell = cell
+    budgets = (tight(model), 1 << 30, model.residency.components["stack"].layout.common)
+    out = []
+    model.residency.admit("run", ("stack",))
+    try:
+        with torch.inference_mode():
+            for i in range(200):
+                worker.ask(budgets[i % len(budgets)])
+                out.append(model.stack(x))
+        torch.cuda.synchronize()
+    finally:
+        model.residency.release("run", ("stack",))
+        weights.cell = None
+        cell.close()
+        worker.close()
+    assert all(same(reference, [o]) for o in out)
+
+
+@on_card
+@pytest.mark.parametrize("cut", ["next stage", "worker", "oom"])
+def test_weights_leave_only_after_the_kernels_that_read_them(tmp_path: Path, cut: str) -> None:
+    """A stage's resident set is bound for the whole stage, and code reads it outside block
+    forwards too (a tied embedding, a numerical check, a LoRA merge): those kernels hold no
+    lease, and they are queued long before they run (here behind a one-second kernel).
+    Whatever unmaps the set next (the next stage's weights, a Worker's mid-call cut, an
+    out-of-memory cut) waits for them; unmapping under them was an illegal address (on a
+    laptop, an MMU fault that can freeze it)."""
+    from cozy_runtime.internal import budget_cell
+
+    weights = Weights(torch, torch.device("cuda", 0), "cuda")
+    weights.set_budget(-1, pinned=1 << 30)
+    checkpoint = write_checkpoint(tmp_path)[0]
+    first, second = load(weights, checkpoint, "first"), load(weights, checkpoint, "second")
+    x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
+    layout: weight_policy.Layout = first.residency.components["stack"].layout
+    weights.set_budget(layout.total + (8 << 20))  # one construction's weights at a time
+
+    def outside(model: Any) -> Any:  # a read outside every block forward
+        return x @ model.stack.blocks[3].proj.weight.T
+
+    first.residency.admit("run", ("stack",))
+    with torch.inference_mode():
+        reference = outside(first)
+    first.residency.release("run", ("stack",))
+    cell, fd = budget_cell.Cell.create()
+    worker = budget_cell.Cell(fd)
+    os.close(fd)
+    weights.cell = cell
+    try:
+        with torch.inference_mode():
+            first.residency.admit("run", ("stack",))
+            torch.cuda._sleep(int(2e9))  # the GPU falls a second behind the host
+            late = outside(first)  # reads a resident weight after the sleep
+            if cut == "worker":
+                worker.ask(layout.common)  # applied at the next block boundary
+                first.stack(x)
+            elif cut == "oom":
+                weights.shrink(layout.total, 0)
+            first.residency.release("run", ("stack",))
+            if cut == "next stage":
+                run(second, x, passes=1)  # wants the room: evicts the first's resident set
+        torch.cuda.synchronize()
+    finally:
+        weights.cell = None
+        cell.close()
+        worker.close()
+    assert torch.equal(reference, late)
+
+
+@on_card
+def test_an_op_that_no_unmap_can_help_fails_once(card: Any) -> None:
+    """The 3 GiB freeze (W5, 21:53): an allocation retried about 40 times in 1.3 s while the
+    driver's free bytes never grew, each retry unmapping weights, closing and remapping the
+    stage's ring. A retry runs again only when memory came back: this process's unmapping,
+    else the Worker's other tenants on the GPU (`DeviceRoom`); when neither can, it fails,
+    naming the op and its size."""
+    weights = card.weights
+    model = load(weights, card.checkpoint, "stuck")
+    x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
+    layout: weight_policy.Layout = model.residency.components["stack"].layout
+    weights.set_budget(tight(model))
+    run(model, x, passes=1)
+    calls = {"room": 0}
+    make_room = weights.make_room
+
+    def counted(need: int, operands: Any, op: str = "") -> None:
+        calls["room"] += 1
+        make_room(need, operands, op)
+
+    weights.make_room = counted
+    asked: list[int] = []
+    weights.room = asked.append  # the Worker: no other tenant here gives anything
+    model.residency.admit("run", ("stack",))
+    try:
+        # far beyond the card: no amount of unmapping makes room for it
+        with (
+            weights.recovering(),
+            torch.inference_mode(),
+            pytest.raises(Exception, match=r"aten\.empty.* of \d+ B: nothing on this GPU"),
+        ):
+            torch.empty(1 << 40, dtype=torch.uint8, device="cuda")
+    finally:
+        model.residency.release("run", ("stack",))
+        del weights.make_room
+        weights.room = None
+        torch.cuda.empty_cache()
+    assert calls["room"] <= 1 + len(layout.blocks)
+    assert asked and all(n > 1 << 39 for n in asked)
+    assert same(run(model, x, passes=1), run(model, x, passes=1))
 
 
 @on_card
@@ -728,6 +1079,31 @@ def test_h3_with_its_loras_pages_instead_of_running_out(tmp_path: Path) -> None:
     assert now.streamed["fl2va_dit"].resident_blocks < len(layout.blocks)
     assert now.h2d_bytes > was.h2d_bytes and now.evictions > was.evictions
     assert now.oom_retries > was.oom_retries
+    assert same(list(resident), list(paged))
+
+
+@on_card
+def test_h3_with_its_loras_at_the_sub_block_grain_is_bit_exact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """H3's DiT (its LoRA consumers, the turbo bank's factors read from its blocks) with its
+    blocks split into their projections computes the resident run's bits."""
+    monkeypatch.setattr(weights_module, "REGION_LIMIT", 1 << 20)
+    weights = Weights(torch, torch.device("cuda", 0), "cuda")
+    weights.set_budget(-1, pinned=1 << 30)
+    dit, turbo = h3_models(weights, tmp_path, "h3-fine")
+    inputs = h3_inputs("cuda")
+    weights.set_budget(1 << 30)
+    resident, _ = h3_reference(weights, dit, turbo, inputs)
+    turbo.residency.unpark()
+    layout = refined(dit, "fl2va_dit")
+    overlay = turbo.residency.components["fl2va_turbo"].layout.total
+    weights.set_budget(layout.common + overlay + 3 * layout.largest)
+    try:
+        paged = h3_denoise(weights, dit, turbo, inputs, lambda step: None)
+    finally:
+        torch.cuda.empty_cache()
+    assert weights.facts().streamed["fl2va_dit"].resident_blocks < len(layout.blocks)
     assert same(list(resident), list(paged))
 
 

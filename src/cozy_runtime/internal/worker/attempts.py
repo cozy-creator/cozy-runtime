@@ -50,6 +50,7 @@ from cozy_runtime.author._assets import InputMetadata
 from cozy_runtime.author._errors import DEVICE_OOM, OutputError
 from cozy_runtime.author._executor_requests import (
     Answer,
+    BudgetCell,
     Checkpoint,
     CheckpointReceipt,
     DeviceRoom,
@@ -1630,7 +1631,7 @@ class AttemptEngine:
                 return self.publish(attempt, request)
             case Checkpoint():
                 return self.checkpoint_exchange(attempt, request)
-            case DeviceRoom() | HostTier() | StageEnter() | StageExit():
+            case DeviceRoom() | HostTier() | BudgetCell() | StageEnter() | StageExit():
                 return refuse("no_durable_exchange", "a job's executor holds its whole turn")
             case TreeMember():
                 if self.calls is None:
