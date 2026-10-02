@@ -17,6 +17,7 @@ import mmap
 import os
 import re
 import time
+import weakref
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field, replace
@@ -209,6 +210,11 @@ class Weights:
         self.adaptive: set[str] = set()
         self.oom_retries = 0
         self.modes: dict[str, str] = {}
+        #: the stages open now, outermost first. A stage another model slot enters inside one
+        #: (H3's turbo LoRA inside its DiT's) is placed with it, inside the one budget.
+        self.open: list[tuple[WeightResidency, str, tuple[str, ...]]] = []
+        self.residencies: weakref.WeakSet[WeightResidency] = weakref.WeakSet()
+        self._recovery: Any = None
         #: the CUDA context and library workspaces outside torch and the plane, measured once
         self.context_bytes = -1
 
@@ -300,6 +306,50 @@ class Weights:
         if self.budget >= 0:
             self.budget = min(self.budget, target)
         return self._apply(target)
+
+    def opened(self) -> dict[str, tuple[WeightResidency, str, Component]]:
+        """Every open stage's components by weight set: their slot's residency and method."""
+        return {
+            row.components[name].key: (row, method, row.components[name])
+            for row, method, local in self.open
+            for name in local
+        }
+
+    @contextmanager
+    def recovering(self) -> Iterator[None]:
+        """Run the caller's torch ops with out-of-memory recovery: an op that cannot allocate
+        unmaps weights and runs again. A block runs with this off and retries as a unit."""
+        if self.host_only:
+            yield
+            return
+        if self._recovery is None:
+            self._recovery = _recovery_type(self.torch)
+        with self._recovery(self):
+            yield
+
+    def make_room(self, need: int, operands: Sequence[Any]) -> None:
+        """An op outside every block ran out of device memory: unmap `need` bytes of weights,
+        idle ones first. An operand that is itself a weight must still be mapped after."""
+        read = [
+            (region, region.bound)
+            for pointer in _pointers(operands)
+            for component in self.components.values()
+            for region in component.regions
+            if region.bound is not None and region.bound <= pointer < region.bound + region.span
+        ]
+        accel.release_cached(self.torch, self.kind)
+        if self.open:
+            self.open[-1][0]._make_room(need)
+        elif not self.shrink(need, 0):
+            raise ResidencyRefusal(
+                "device_shortfall",
+                f"an allocation of {need} B does not fit and no weight bytes are left to unmap",
+            )
+        if any(region.bound != address for region, address in read):
+            raise ResidencyRefusal(
+                "device_shortfall",
+                f"an allocation of {need} B needed the room of the weights the same op reads",
+            )
 
     def drain(self) -> None:
         """Read the plane's events: a region evicted from this device goes back to meta before
@@ -585,6 +635,42 @@ def _unbound_type(torch: Any) -> type:
             )
 
     return Unbound
+
+
+def _recovery_type(torch: Any) -> type:
+    mode: Any = torch.utils._python_dispatch.TorchDispatchMode
+
+    class Recovery(mode):  # type: ignore[misc]
+        """Every torch op outside a block: one that runs out of device memory runs again
+        after weights were unmapped for it (retry the op, never the run)."""
+
+        def __init__(self, weights: Weights) -> None:
+            super().__init__()
+            self.weights = weights
+
+        def __torch_dispatch__(
+            self, func: Any, types: Any, args: tuple[Any, ...] = (), kwargs: Any = None
+        ) -> Any:
+            kwargs = kwargs or {}
+            while True:
+                try:
+                    return func(*args, **kwargs)
+                except Exception as exc:
+                    if not is_device_oom(exc):
+                        raise
+                    need = _requested(exc)
+                # outside `except`, so the failed op's frames are gone
+                self.weights.make_room(need, (*args, *kwargs.values()))
+
+    return Recovery
+
+
+def _pointers(operands: Sequence[Any]) -> Iterator[int]:
+    """Device addresses of an op's tensor operands (one level deep)."""
+    for value in operands:
+        for item in value if isinstance(value, (tuple, list)) else (value,):
+            if getattr(item, "is_cuda", False) and type(item).__name__ != "Unbound":
+                yield int(item.data_ptr())
 
 
 def unbind(region: Region) -> None:
@@ -1338,15 +1424,18 @@ class WeightResidency:
         self._budget_error = plane.error("BudgetExceeded")
         self._capacity = (*self._shortfall_error, self._budget_error)
         self._poisoned_error = plane.error("Poisoned")
+        self._quiet = weights.torch.utils._python_dispatch._disable_current_modes
+        weights.residencies.add(self)
         for component in self.components.values():
-            if weights.host_only:
-                continue  # bound whole at registration: no stage moves a byte
             self._hook(component)
-            if _image_vae(component.root):
+            if not weights.host_only and _image_vae(component.root):
                 component.root.decode = self._decode(component.name, component.root.decode)
 
     def _hook(self, component: Component) -> None:
-        """One wrapper per block region: its module's forward acquires and releases it."""
+        """One wrapper per block region: its module's forward acquires and releases it. A CPU
+        executor has none: its weights are bound whole at registration, at either grain."""
+        if self.weights.host_only:
+            return
         rows = self.hooks[component.name] = []
         for region in component.blocks:
             module = region.module
@@ -1374,7 +1463,8 @@ class WeightResidency:
     def admit(self, method: str, components: tuple[str, ...]) -> None:
         self._require_clean(method)
         try:
-            self._admit(method, components)
+            with self._quiet():  # the plane's own binds are not the package's ops
+                self._admit(method, components)
         except self._poisoned_error as exc:
             raise self._poison(exc) from exc
 
@@ -1392,28 +1482,32 @@ class WeightResidency:
                 weights.set_budget(granted)
         self.entries[method] = self.entries.get(method, 0) + 1
         self.repeats[method] = max(self.repeats.get(method, 0), self.entries[method])
-        if self.parked is not None:
-            if self.parked == (method, local, weights.budget):
-                # The same stage again: its plan, leases and cursors carry on.
-                self.parked = None
-                self.active = (method, local)
-                for name in local:
-                    self.components[name].passes = 0
-                self._entered(method)
-                return
-            self.unpark()
-        self.active = (method, local)
         if weights.host_only:  # everything is bound in place already; no device to measure
+            self.active = (method, local)
             self.entered_ns = time.perf_counter_ns()
             return
+        if self.parked == (method, local, weights.budget):
+            # The same stage again: its plan, leases and cursors carry on.
+            self.parked = None
+            self.active = (method, local)
+            weights.open.append((self, method, local))
+            for name in local:
+                self.components[name].passes = 0
+            self._entered(method)
+            return
+        # A new plan: no stage left open by an earlier step survives it, in any model slot.
+        for row in list(weights.residencies):
+            row.unpark()
+        self.active = (method, local)
+        weights.open.append((self, method, local))
         try:
             budget = weights.stage_budget(method)
             if method not in weights.activation:
-                # Activations first, and these are not measured yet: the stage's own weights
-                # are all the plane keeps; every other byte stays torch's until it is.
-                budget = min(budget, sum(self.components[n].layout.total for n in local))
+                # Activations first, and these are not measured yet: the open stages' own
+                # weights are all the plane keeps; every other byte stays torch's until it is.
+                budget = min(budget, sum(c.layout.total for _, _, c in weights.opened().values()))
             try:
-                self._plan(method, local, budget)
+                self._plan(budget)
             except self._budget_error as exc:
                 if not _device_pool(exc):
                     raise self._shortfall(method, 0, budget, str(exc)) from None
@@ -1422,7 +1516,7 @@ class WeightResidency:
                 accel.release_cached(weights.torch, weights.kind)
                 budget = min(budget, weights.driver_budget(method))
                 try:
-                    self._plan(method, local, budget)
+                    self._plan(budget)
                 except self._budget_error as again:
                     raise self._shortfall(method, 0, budget, str(again)) from None
             stream = weights.stream()
@@ -1440,9 +1534,15 @@ class WeightResidency:
         except BaseException:
             with suppress(Exception):  # the original failure is the one to report
                 self._close(local)
-            self.active = None
+            self._left()
             raise
         self._entered(method)
+
+    def _left(self) -> None:
+        if self.active is not None:
+            with suppress(ValueError):
+                self.weights.open.remove((self, *self.active))
+        self.active = None
 
     def _entered(self, method: str) -> None:
         weights = self.weights
@@ -1461,7 +1561,8 @@ class WeightResidency:
 
     def release(self, method: str, components: tuple[str, ...]) -> None:
         try:
-            self._release(method, components)
+            with self._quiet():
+                self._release(method, components)
         except self._poisoned_error as exc:
             raise self._poison(exc) from exc
 
@@ -1481,7 +1582,7 @@ class WeightResidency:
                 self._close(local)
             weights.drain()
         finally:
-            self.active = None
+            self._left()
         peak = 0
         if self.baseline >= 0:
             peak = max(accel.peak_allocated(weights.torch, weights.kind) - self.baseline, 0)
@@ -1577,11 +1678,12 @@ class WeightResidency:
             memory["reserved_bytes"] - memory["allocated_bytes"], 0
         )
         device = plane.stats(weights.plane).device(weights.index)
+        held = {self.components[name].key for name in components if name in self.components}
+        held.update(weights.opened())
         own = sum(
-            self.components[name].regions[index].span
-            for name in components
-            if name in self.components
-            for index in self.components[name].resident
+            weights.components[key].regions[index].span
+            for key in held
+            for index in weights.components[key].resident
         )
         movable = device.committed - device.leased_bytes - device.held_bytes - own
         return free, max(movable, 0)
@@ -1618,56 +1720,54 @@ class WeightResidency:
 
     # -- the stage
 
-    def _plan(
-        self, method: str, local: tuple[str, ...], budget: int, resume: Mapping[str, int] = {}
-    ) -> None:
-        """Place the stage's components inside `budget`: each resident set wanted, the rest
-        streamed by a cursor in the blocks' execution order (from `resume[name]` when a block
-        boundary re-plans mid-pass). Before a component's order is observed its blocks are
-        acquired on demand. A component whose block floor does not fit moves to the
-        sub-block grain first."""
+    def _plan(self, budget: int, resume: Mapping[str, int] = {}) -> None:
+        """Place every open stage's components inside `budget`: each resident set wanted, the
+        rest streamed by a cursor in the blocks' execution order (from `resume[weight set]`
+        when a block boundary re-plans mid-pass). Before a component's order is observed its
+        blocks are acquired on demand. A component whose block floor does not fit moves to
+        the sub-block grain first."""
         weights = self.weights
-        components = {name: self.components[name] for name in local}
+        opened = weights.opened()
+        components = {key: component for key, (_, _, component) in opened.items()}
+        method = weights.open[-1][1]
         try:
             placed = weight_policy.stage(
-                {name: c.layout for name, c in components.items()},
+                {key: c.layout for key, c in components.items()},
                 budget,
                 orders={
-                    name: [c.numbers[index] for index in c.order]
-                    for name, c in components.items()
+                    key: [c.numbers[index] for index in c.order]
+                    for key, c in components.items()
                     if c.observed
                 },
-                costs=_costs(weights, components, method),
+                costs=_costs(weights, {key: (c, opened[key][1]) for key, c in components.items()}),
                 cyclic={
-                    name
-                    for name, c in components.items()
-                    if c.last_passes != 1 or self.repeats.get(method, 0) > 1
+                    key
+                    for key, (row, tag, c) in opened.items()
+                    if c.last_passes != 1 or row.repeats.get(tag, 0) > 1
                 },
             )
         except weight_policy.BelowFloor as exc:
-            if name := self._refinable(exc.component, method):
-                self._refine(name)
-                return self._plan(method, local, budget, resume)
+            if exc.component in opened and opened[exc.component][0]._refine(exc.component):
+                return self._plan(budget, resume)
             raise self._shortfall(method, exc.needed, exc.available, str(exc)) from None
         # A budget that only fits one block at a time streams with no overlap: regions of at
         # most 16 MiB let it hold a window of several. (Window 1 chosen when two fit stays.)
-        crawl = [
-            n
-            for n, r in placed.items()
-            if r.streamed
-            and r.window == 1
-            and components[n].layout.common + 2 * components[n].layout.largest > budget
-        ]
-        if name := next((n for n in crawl if self._refinable(n, method)), ""):
-            self._refine(name)
-            return self._plan(method, local, budget, resume)
-        need = sum(r.vram_bytes(components[n].layout) for n, r in placed.items())
+        for key, residence in placed.items():
+            layout = components[key].layout
+            if (
+                residence.streamed
+                and residence.window == 1
+                and layout.common + 2 * layout.largest > budget
+                and opened[key][0]._refine(key)
+            ):
+                return self._plan(budget, resume)
+        need = sum(r.vram_bytes(components[key].layout) for key, r in placed.items())
         if self.spare and need > budget:
             raise ResidencyRefusal("device_spared", f"{method}() declined: needs {need} B")
         weights._apply(budget)
         clock = weights.tick()
-        for name, residence in placed.items():
-            component = components[name]
+        for key, residence in placed.items():
+            component = components[key]
             close_cursor(component)
             component.residence = residence
             before = set(component.resident)
@@ -1705,8 +1805,8 @@ class WeightResidency:
         # resident sets bind (a region evicted earlier and wanted again binds after this).
         weights.drain()
         stream = weights.stream()
-        for name, residence in placed.items():
-            component = components[name]
+        for key, residence in placed.items():
+            component = components[key]
             # The resident set binds for the whole stage, ordered after its fills on the
             # compute stream: code that reads a resident weight outside its block's forward
             # sees real bytes, exactly as when the component was simply on the device.
@@ -1718,7 +1818,7 @@ class WeightResidency:
                     lease.release()
             if residence.streamed and component.observed:
                 order = component.order
-                start = order.index(resume[name]) if name in resume else 0
+                start = order.index(resume[key]) if key in resume else 0
                 try:
                     component.cursor = weights.plane.stream(
                         component.ws,
@@ -1727,7 +1827,7 @@ class WeightResidency:
                         residence.window,
                         repeat=0,
                         priority=plane.STREAMED + clock,
-                        tag=method,
+                        tag=opened[key][1],
                         ring_bytes=residence.ring,
                     )
                 except self._shortfall_error as exc:
@@ -1741,9 +1841,10 @@ class WeightResidency:
             for t in r.derived
         )
 
-    def _refinable(self, name: str, method: str) -> str:
-        """`name`, when it can still move to the sub-block grain: at a stage's start, never
-        inside one (its leases pin the coarse regions)."""
+    def _refine(self, key: str) -> bool:
+        """Move the weight set `key` to the sub-block grain, if it still can: at a stage's
+        start, never inside one (its slot's leases pin the coarse regions)."""
+        name = next((n for n, c in self.components.items() if c.key == key), "")
         component = self.components.get(name)
         if (
             component is None
@@ -1752,14 +1853,11 @@ class WeightResidency:
             or self.refine is None
             or any(c.lease is not None or c.cursor is not None for c in self.components.values())
         ):
-            return ""
-        return name
-
-    def _refine(self, name: str) -> None:
-        assert self.refine is not None
+            return False
         self._unhook(name)
         component = self.components[name] = self.refine(name)
         self._hook(component)
+        return True
 
     def _block(
         self, component: Component, region: Region, forward: Callable[..., Any]
@@ -1771,7 +1869,8 @@ class WeightResidency:
 
         def run(*args: Any, **kwargs: Any) -> Any:
             try:
-                return attempt(*args, **kwargs)
+                with self._quiet():  # the block retries as a unit, not op by op
+                    return attempt(*args, **kwargs)
             except self._poisoned_error as exc:
                 raise self._poison(exc) from exc
 
@@ -1783,12 +1882,12 @@ class WeightResidency:
                 try:
                     lease = self._acquire(component, region.index, stream)
                 except self._capacity:
-                    self._make_room(region.span, component, region.index)
+                    self._make_room(region.span, {component.key: region.index})
                     continue
                 need = 0
                 try:
-                    bind(torch, region, lease)
                     try:
+                        bind(torch, region, lease)
                         return forward(*args, **kwargs)
                     except Exception as exc:
                         if not is_device_oom(exc):
@@ -1806,7 +1905,7 @@ class WeightResidency:
                         f"{component.name}.{region.path} ran out of memory after changing its "
                         "inputs in place, so it cannot run again",
                     )
-                self._make_room(need, component, region.index)
+                self._make_room(need, {component.key: region.index})
 
         return run
 
@@ -1824,25 +1923,22 @@ class WeightResidency:
             component.ws, weights.index, index, stream, priority=plane.STREAMED + weights.tick()
         )
 
-    def _make_room(self, need: int, component: Component, index: int) -> None:
-        """Activations first: unmap `need` bytes of weights, then re-place the stage with the
-        OOMing component's cursor resuming at the block that runs again."""
+    def _make_room(self, need: int, resume: Mapping[str, int] = {}) -> None:
+        """Activations first: unmap `need` bytes of weights, idle ones first, then re-place the
+        open stages (a block that runs again resumes its component's cursor: `resume`)."""
         weights = self.weights
-        if self.active is None:
-            if not weights.shrink(need, 0):
-                raise self._shortfall("", need, 0, "no weight bytes are left to unmap")
-            return
-        method, local = self.active
-        for name in local:
-            close_cursor(self.components[name])
+        opened = [component for _, _, component in weights.opened().values()]
+        method = weights.open[-1][1] if weights.open else ""
+        for component in opened:
+            close_cursor(component)
         # Mid-stage no component can refine (its leases hold the coarse regions).
-        floor = sum(
-            weight_policy.floor(replace(self.components[name].layout, fine=None)) for name in local
-        )
+        floor = sum(weight_policy.floor(replace(c.layout, fine=None)) for c in opened)
         if not weights.shrink(need, floor):
             raise self._shortfall(method, need, 0, "no weight bytes are left to unmap")
+        if not opened:
+            return
         try:
-            self._plan(method, local, weights.applied, resume={component.name: index})
+            self._plan(weights.applied, resume)
         except self._budget_error as exc:
             raise self._shortfall(method, need, weights.applied, str(exc)) from None
 
@@ -2027,25 +2123,25 @@ class WeightResidency:
 
 
 def _costs(
-    weights: Weights, components: Mapping[str, Component], tag: str
+    weights: Weights, components: Mapping[str, tuple[Component, str]]
 ) -> dict[str, weight_policy.Costs]:
-    """Each component's measured streaming costs for the stage `tag`: GPU seconds per use of
+    """Each component's measured streaming costs for its stage's tag: GPU seconds per use of
     each block from the plane's per-region timing, and the achieved pinned-to-device rate."""
     held = plane.stats(weights.plane)
     device = held.device(weights.index)
     link = device.host_copy_bytes * 1e9 / device.host_copy_ns if device.host_copy_ns else 0.0
     out: dict[str, weight_policy.Costs] = {}
-    for name, component in components.items():
+    for key, (component, tag) in components.items():
         compute = {
             component.numbers[row.region]: row.compute_ns / row.uses / 1e9
             for row in held.regions
-            if row.ws == component.key
+            if row.ws == key
             and row.tag == tag
             and row.device == weights.index
             and row.uses
             and row.region in component.numbers
         }
-        out[name] = weight_policy.Costs(compute=compute, link_bps=link)
+        out[key] = weight_policy.Costs(compute=compute, link_bps=link)
     return out
 
 

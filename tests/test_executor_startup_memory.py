@@ -240,6 +240,30 @@ def test_prespawn_admission_uses_the_same_ordered_physical_locks(machine: Machin
 
 
 @needs_executor
+def test_start_ends_an_idle_tenant_whose_executor_is_already_gone(
+    machine: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Run 2567: the idle tenant on the cards was a group that had just broken. Cutting its
+    budget wrote to its closed seam, and the next replica's activation failed on a bad file
+    descriptor. A closed seam is an executor that is gone: it is ended and the start goes on."""
+    idle, fresh, occupied = contexts(machine, monkeypatch)
+    old, executor = idle.supervision.current, fresh.supervision.current
+    assert old is not None and executor is not None
+    calls, _ = allocation(machine, fresh, monkeypatch, idle, occupied)
+    old.close()
+    reclaim = machine.worker.memory.reclaim
+
+    def ended(*args: object) -> None:
+        occupied.clear()  # the driver frees a dead process's memory
+        reclaim(*args)
+
+    monkeypatch.setattr(machine.worker.memory, "reclaim", ended)
+    with fresh.lane.device:
+        assert machine.worker._start_executor(fresh, executor) == ""
+    assert len(calls) == 1 and not occupied
+
+
+@needs_executor
 def test_a_started_executor_reuses_its_context_without_evicting_idle_neighbors(
     machine: Machine,
     monkeypatch: pytest.MonkeyPatch,

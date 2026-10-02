@@ -554,6 +554,8 @@ class Executor:
             case RunJob():
                 return self._settled(self.run_job(command))
             case Probe():
+                if command.collect:
+                    gc.collect()
                 return self.probe()
             case Vacate():
                 return self.vacate(residents=command.residents, ranks=command.ranks)
@@ -825,6 +827,7 @@ class Executor:
             seen: set[str] = set()
             active: dict[str, tuple[str, ...]] = {}
             with contextlib.ExitStack() as stack:
+                stack.enter_context(self._recovering())
                 for scope in scopes:
                     key = scope["model"]
                     if key not in models or key in seen:
@@ -1070,6 +1073,11 @@ class Executor:
         }
         return None
 
+    def _recovering(self) -> contextlib.AbstractContextManager[None]:
+        """Torch ops outside a block run again after weights were unmapped for them."""
+        weights = self.host.weights
+        return weights.recovering() if weights is not None else contextlib.nullcontext()
+
     def _warm_model(self, model: Any) -> float:
         """Preparation has its own spool; component calls need no request to warm."""
         from cozy_runtime.internal.warm import warm_generation
@@ -1081,7 +1089,10 @@ class Executor:
             self.root / "warm" / hashlib.sha256(self._group_model_key.encode()).hexdigest()
         )
         try:
-            return warm_generation(model, device=self._device(), cancel=lambda: bool(self.poisoned))
+            with self._recovering():
+                return warm_generation(
+                    model, device=self._device(), cancel=lambda: bool(self.poisoned)
+                )
         finally:
             owner._attempt_spool = None
             if self.residency is not None:
@@ -2744,6 +2755,7 @@ class Executor:
         stage_memo.ENGINE.open(self._durable, spool)
         try:
             with (
+                self._recovering(),
                 attention.override(
                     self._attention_snapshot(), self._attention_roots(), swap, pin
                 ) as served_attention,
@@ -3870,7 +3882,7 @@ class Executor:
             self._unpark()  # a parked stage's holds would make a cut unreleasable
             return weights.set_budget(command.vram_bytes, command.pinned_bytes)
 
-        freed, refused = self._followers(range(1, self.world), command, "budget", own)
+        freed, refused = self._followers(self._plane_ranks(), command, "budget", own)
         if refused:
             return refused
         return {"ok": True, "freed_bytes": freed, "plane": self._plane_facts()}
@@ -3887,10 +3899,17 @@ class Executor:
             members = child.model_executors or [child]
             return sum(self.weights.prefetch(member._group_model_key) for member in members)
 
-        filling, refused = self._followers(range(1, self.world), command, "prefetch", own)
+        filling, refused = self._followers(self._plane_ranks(), command, "prefetch", own)
         if refused:
             return refused
         return {"ok": True, "filling_bytes": filling}
+
+    def _plane_ranks(self) -> list[int]:
+        """The follower GPUs that answer the plane's commands. One from before the plane
+        (its `hello` does not say so) keeps its weights its own way: no budget reaches it."""
+        if self.group is None:
+            return []
+        return [f.rank for f in self.group.followers if plane.CAPABILITY in f.memory]
 
     def _unpark(self) -> None:
         """Close every construction's parked stage (a repeating method's open plan)."""
@@ -4204,10 +4223,30 @@ _FOLLOWER_COMMANDS = frozenset(
         "attention",
         "vacate",
         "restore",
+        "budget",
+        "prefetch",
         "probe",
         "shutdown",
     }
 )
+
+
+def answer(executor: Executor, frame: Mapping[str, Any]) -> dict[str, Any] | None:
+    """One command's reply as this GPU's process answers it; None is `shutdown`."""
+    name = str(frame.get("cmd", ""))
+    if executor.rank > 0 and name not in _FOLLOWER_COMMANDS:
+        return {
+            "ok": False,
+            "code": "follower_command_unsupported",
+            "detail": f"{_gpu(executor.rank)} answers {sorted(_FOLLOWER_COMMANDS)}, not {name!r}",
+        }
+    if name == "run":
+        return executor.run(frame)
+    if name not in executor_commands.NAMES:
+        return {"ok": False, "code": "unknown_command", "detail": name}
+    command = executor_commands.decode(frame)
+    return None if isinstance(command, Shutdown) else executor.handle(command)
+
 
 #: The commands whose refusals carry the raising traceback to the worker.
 _TRACED_COMMANDS = frozenset({"start", "load", "join"})
@@ -4286,25 +4325,13 @@ def main(argv: list[str] | None = None) -> int:
             # command reads `poisoned_generation` and rebuilds the whole cgroup.
             executor.poisoned = f"group: {executor.group.broken}"[:200]
         try:
-            if executor.rank > 0 and name not in _FOLLOWER_COMMANDS:
-                reply = {
-                    "ok": False,
-                    "code": "follower_command_unsupported",
-                    "detail": f"{_gpu(executor.rank)} answers {sorted(_FOLLOWER_COMMANDS)}, "
-                    f"not {name!r}",
-                }
-            elif name == "run":
-                reply = executor.run(frame)
-            elif name not in executor_commands.NAMES:
-                reply = {"ok": False, "code": "unknown_command", "detail": name}
-            else:
-                command = executor_commands.decode(frame)
-                if isinstance(command, Shutdown):
-                    if executor.group is not None:
-                        executor.group.close()
-                    channel.send({"reply": name, "ok": True})
-                    return int(Exit.ok)
-                reply = executor.handle(command)
+            answered = answer(executor, frame)
+            if answered is None:  # shutdown
+                if executor.group is not None:
+                    executor.group.close()
+                channel.send({"reply": name, "ok": True})
+                return int(Exit.ok)
+            reply = answered
         except msgspec.ValidationError as exc:
             reply = {"ok": False, "code": "command_malformed", "detail": str(exc)[:1024]}
         except Exception as exc:  # the executor reports its own faults; it never hides one

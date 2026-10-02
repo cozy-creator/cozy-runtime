@@ -77,6 +77,23 @@ def burst(ctx: Context, payload: BurstInput, model: TenantModel, tel: Telemetry)
     return TouchOutput(checksum=checksum, components=sorted(model.pipe.components))
 
 
+@app.entrypoint
+def cycle(ctx: Context, payload: BurstInput, model: TenantModel, tel: Telemetry) -> TouchOutput:
+    """Leave cyclic garbage that holds device memory, old enough that only a full collection
+    finds it."""
+    import gc
+
+    import torch
+
+    view = model.for_request(ctx, seed=1)
+    checksum = model.touch(view._seed)
+    held: list = [torch.ones(payload.scratch_bytes, dtype=torch.uint8, device="cuda")]
+    held.append(held)
+    gc.collect()
+    del held
+    return TouchOutput(checksum=checksum, components=sorted(model.pipe.components))
+
+
 from typing import Annotated
 
 from cozy_runtime.author import Shape, invocable
@@ -109,7 +126,7 @@ app.entrypoint(segment)
 BINDING = "".join(
     f'\n[bindings."{entrypoint}.models.model"]\nmodel = "cozytest/tenant"\nrelease = "1"\n'
     'lane = "bf16"\n'
-    for entrypoint in ("burst", "segment")
+    for entrypoint in ("burst", "cycle", "segment")
 )
 
 
@@ -648,3 +665,17 @@ def test_a_capacity_failure_is_not_inherited_and_poisons_no_binding(
     body = card.call("p-big-2", "burst", "p", scratch_bytes=free() - 3 * store.weight_bytes)
     assert succeeded(body), body
     assert succeeded(card.call("p-2", "touch", "p"))
+
+
+@needs_card
+def test_cyclic_garbage_holding_device_memory_costs_no_executor(
+    card: Card, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A package that leaves a reference cycle around a device tensor has leaked nothing: the
+    terminal ledger collects and reads again, and the same executor keeps serving."""
+    assert succeeded(card.call("p-1", "touch", "p"))
+    with caplog.at_level("WARNING", logger="cozy_runtime.internal.worker.attempts"):
+        assert succeeded(card.call("p-cycle", "cycle", "p", scratch_bytes=8 << 20))
+    assert f"{8 << 20} B of device memory were held by cyclic garbage" in caplog.text
+    assert succeeded(card.call("p-2", "touch", "p"))
+    assert set(card.epochs().values()) == {1}

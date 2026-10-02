@@ -686,6 +686,13 @@ class Ledger:
         """Every class as one flat mapping — the before half of a reconciliation."""
         return {counter.name: counter.bytes for counter in self.counters()}
 
+    def unaccounted(self, before: Mapping[str, int]) -> int:
+        """The device bytes `close_attempt` would call a leak as the ledger reads now."""
+        was, now = before.get("device_allocated", -1), self.snapshot()["device_allocated"]
+        if was < 0 or now < 0 or self.closed_since_baseline == 0:
+            return 0
+        return max(now - was - self.residency_delta, 0)
+
     def close_attempt(self, key: str, before: Mapping[str, int]) -> dict[str, Json]:
         """Reconcile EVERY class against the snapshot taken BEFORE the attempt was accepted.
 

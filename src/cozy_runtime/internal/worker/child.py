@@ -237,7 +237,10 @@ class Executor:
         with self._calls:
             name = command.__struct_config__.tag
             deadline = time.monotonic() + total_timeout if total_timeout is not None else None
-            self.channel.send(executor_commands.encode(command))
+            try:
+                self.channel.send(executor_commands.encode(command))
+            except OSError as exc:  # its seam is closed: it was reaped (a broken group's rank 0)
+                raise ExecutorGone(f"seam: {exc}", self.exit_status) from exc
             while True:
                 try:
                     remaining = None if deadline is None else max(deadline - time.monotonic(), 0)
