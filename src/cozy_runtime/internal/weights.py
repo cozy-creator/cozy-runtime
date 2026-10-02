@@ -700,6 +700,7 @@ class Weights:
             h2d_bytes=copied,
             h2d_gbps=round(copied / copy_ns, 3) if copy_ns else 0.0,
             disk_copy_bytes=device.disk_copy_bytes,
+            mapped_copy_bytes=device.mapped_copy_bytes,
             disk_read_bytes=held.host.disk_read_bytes,
             late=sum(row.late for row in stages),
             stall_ns=sum(row.stall_ns for row in stages),
@@ -2634,7 +2635,9 @@ def _costs(
     each block from the plane's per-region timing, and the achieved pinned-to-device rate."""
     held = plane.stats(weights.plane)
     device = held.device(weights.index)
-    link = device.host_copy_bytes * 1e9 / device.host_copy_ns if device.host_copy_ns else 0.0
+    # the pinned tier's rate (a ring streams from it), not blended with the page cache's
+    tier_ns = device.host_copy_ns - device.mapped_copy_ns
+    link = (device.host_copy_bytes - device.mapped_copy_bytes) * 1e9 / tier_ns if tier_ns else 0.0
     out: dict[str, weight_policy.Costs] = {}
     for key, (component, tag) in components.items():
         compute = {
