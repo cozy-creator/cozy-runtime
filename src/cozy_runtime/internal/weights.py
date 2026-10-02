@@ -343,17 +343,18 @@ class Weights:
         }
 
     @contextmanager
-    def recovering(self, watch: frozenset[int] | None = None) -> Iterator[Any]:
+    def recovering(self, watch: frozenset[int] = frozenset()) -> Iterator[Watch]:
         """Run the caller's torch ops with out-of-memory recovery: an op that cannot allocate
-        unmaps weights and runs again. With `watch` (storage addresses), the mode also notes
-        whether any op wrote into one of them (`.mutated`)."""
+        unmaps weights and runs again. With `watch` (storage addresses), the yielded record
+        notes whether any op wrote into one of them."""
+        seen = Watch(watch)
         if self.host_only:
-            yield None
+            yield seen
             return
         if self._recovery is None:
             self._recovery = _recovery_type(self.torch)
-        with self._recovery(self, watch) as mode:
-            yield mode
+        with self._recovery(self, seen):
+            yield seen
 
     def make_room(self, need: int, operands: Sequence[object]) -> None:
         """An op outside every block ran out of device memory: unmap `need` bytes of weights,
@@ -695,19 +696,19 @@ def _recovery_type(torch: ModuleType) -> type:
         """Every torch op outside a block: one that runs out of device memory runs again
         after weights were unmapped for it (retry the op, never the run)."""
 
-        def __init__(self, weights: Weights, watch: frozenset[int] | None = None) -> None:
+        def __init__(self, weights: Weights, seen: Watch) -> None:
             super().__init__()
             self.weights = weights
-            self.watch = watch
-            self.mutated = False
+            self.seen = seen
 
         def __torch_dispatch__(
             self, func: Any, types: Any, args: tuple[Any, ...] = (), kwargs: Any = None
         ) -> Any:
             kwargs = kwargs or {}
-            if self.watch and not self.mutated and func._schema.is_mutable:
-                self.mutated = any(
-                    _storage(value) in self.watch for value in _written(func, args, kwargs)
+            seen = self.seen
+            if seen.storages and not seen.mutated and func._schema.is_mutable:
+                seen.mutated = any(
+                    _storage(value) in seen.storages for value in _written(func, args, kwargs)
                 )
             while True:
                 try:
@@ -722,7 +723,15 @@ def _recovery_type(torch: ModuleType) -> type:
     return Recovery
 
 
-def _written(func: Any, args: tuple[Any, ...], kwargs: Mapping[str, Any]) -> Iterator[Any]:
+@dataclass(slots=True)
+class Watch:
+    """Storages to watch for in-place writes, and whether an op wrote into one."""
+
+    storages: frozenset[int]
+    mutated: bool = False
+
+
+def _written(func: Any, args: tuple[object, ...], kwargs: Mapping[str, object]) -> Iterator[object]:
     """The arguments an op writes into (`Tensor(a!)` in its schema, `out=` included)."""
     for index, argument in enumerate(func._schema.arguments):
         if argument.alias_info is not None and argument.alias_info.is_write:
@@ -2009,12 +2018,12 @@ class WeightResidency:
                 watch = (
                     frozenset(_storage(v) for v in _tensor_operands(inputs))
                     if region.mutates is None
-                    else None
+                    else frozenset()
                 )
-                with weights.recovering(watch) as mode:
+                with weights.recovering(watch) as seen:
                     out = attempt(*args, **kwargs)
-                if region.mutates is None and mode is not None:
-                    region.mutates = bool(mode.mutated)
+                if region.mutates is None and not weights.host_only:
+                    region.mutates = seen.mutated
                 return out
             except self._poisoned_error as exc:
                 raise self._poison(exc) from exc

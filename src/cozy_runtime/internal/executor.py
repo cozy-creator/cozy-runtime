@@ -1084,7 +1084,7 @@ class Executor:
         }
         return None
 
-    def _recovering(self) -> contextlib.AbstractContextManager[None]:
+    def _recovering(self) -> contextlib.AbstractContextManager[object]:
         """Torch ops outside a block run again after weights were unmapped for them."""
         weights = self.host.weights
         return weights.recovering() if weights is not None else contextlib.nullcontext()
