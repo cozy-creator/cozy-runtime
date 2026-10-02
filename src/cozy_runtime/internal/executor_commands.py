@@ -217,6 +217,8 @@ class GroupHardware(msgspec.Struct, frozen=True, kw_only=True):
 
 #: An executor capability: it applies `Load.pinned_bytes` before its weights register.
 LOAD_PINNED = "load_pinned/1"
+#: An executor capability: it adopts the machine's sealed host layouts (`Load.sealed_tiers`).
+SEALED_TIERS = "host_tiers.sealed/1"
 
 
 class Load(Command, frozen=True, kw_only=True, tag="load"):
@@ -246,6 +248,9 @@ class Load(Command, frozen=True, kw_only=True, tag="load"):
     #: The machine keeps GPU weights across executors (`weights.attach/1`): each weight set
     #: attaches the regions it holds (`DeviceTier`). Older workers never set it.
     device_weights: bool = False
+    #: The machine keeps sealed host layouts (`SEALED_TIERS`): each weight set asks for one
+    #: (`SealedTier`) and adopts it read-only, reading the store only when none is held.
+    sealed_tiers: bool = False
 
     def single(self) -> ModelLoad:
         return ModelLoad(

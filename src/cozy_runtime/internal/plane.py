@@ -7,6 +7,8 @@ never reorders a schedule. It maps, copies, streams and counts; `weights.py` and
 
 from __future__ import annotations
 
+import ctypes
+import fcntl
 import os
 from types import ModuleType
 from typing import TYPE_CHECKING, Final
@@ -50,6 +52,8 @@ class HostStats(msgspec.Struct, frozen=True, kw_only=True):
     fill_ns: int = 0
     #: -1: a TensorFS before 0.3.92 does not count it (a 0 there was never a measurement)
     disk_read_bytes: int = -1
+    #: RAM of the machine's sealed layouts this plane maps (theirs, not this process's)
+    sealed_bytes: int = 0
     evictions: int = 0
 
 
@@ -149,6 +153,43 @@ def sharing() -> bool:
     """This TensorFS can export and attach GPU regions (whether the GPU can is the plane's
     `device_sharing(ordinal)`)."""
     return _plane is not None and hasattr(_plane.Plane, "export_device")
+
+
+#: Linux `fcntl` seals, by number (python-build-standalone may lack the names).
+_GET_SEALS, _ADD_SEALS = 1034, 1033
+#: write, grow, shrink, and sealing itself: no process can change a sealed layout's bytes
+_SEALS = 0x8 | 0x4 | 0x2 | 0x1
+
+
+def sealed_available() -> bool:
+    """This TensorFS adopts sealed host layouts (`Plane.register_sealed`)."""
+    return _plane is not None and hasattr(_plane.Plane, "register_sealed")
+
+
+def is_sealed(fd: int) -> bool:
+    """Whether `fd` is a memfd nobody can write, resize or unseal: a sealed host layout."""
+    try:
+        return fcntl.fcntl(fd, _GET_SEALS) & _SEALS == _SEALS
+    except OSError:
+        return False
+
+
+def sealed_memfd(name: str, body: bytes) -> int:
+    """`body` in a new memfd, sealed: what crosses beside a request too large for a frame."""
+    # libc's own: python-build-standalone's old glibc build lacks `os.memfd_create`.
+    # MFD_CLOEXEC | MFD_ALLOW_SEALING
+    fd: int = ctypes.CDLL(None, use_errno=True).memfd_create(name.encode(), 0x1 | 0x2)
+    if fd < 0:
+        raise OSError(ctypes.get_errno(), "memfd_create")
+    try:
+        view = memoryview(body)
+        while view:
+            view = view[os.write(fd, view) :]
+        fcntl.fcntl(fd, _ADD_SEALS, _SEALS)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
 
 
 def open_plane(device: int | None) -> Plane:

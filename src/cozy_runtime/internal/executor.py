@@ -88,6 +88,8 @@ from cozy_runtime.author._executor_requests import (
     Published,
     Request,
     Room,
+    SealedPlan,
+    SealedTier,
     SharedRegion,
     StageEnter,
     StageExit,
@@ -132,6 +134,7 @@ from cozy_runtime.internal.config import restore_seal, seal_snapshot
 from cozy_runtime.internal.discovery import discover_distribution, discover_installed
 from cozy_runtime.internal.executor_commands import (
     LOAD_PINNED,
+    SEALED_TIERS,
     Activate,
     Attention,
     Binding,
@@ -614,6 +617,7 @@ class Executor:
                 "vacate_ranks",
                 *([plane.CAPABILITY, STAGE_TURNS, LOAD_PINNED] if plane.available() else []),
                 *(plane.SHARING if plane.sharing() else ()),
+                *([SEALED_TIERS] if plane.sealed_available() else []),
             ],
             "memo": [stage_memo.CAPABILITY],
             "pgid": os.getpgrp(),
@@ -1995,7 +1999,7 @@ class Executor:
             qualified=qualified_pair,
             device_facts=device_facts,
             custody=binding.custody,
-            tiers=self._tiers(command.host_tier),
+            tiers=self._tiers(command.host_tier, command.sealed_tiers),
         )
         stage("backend_ctor")
         # THE GROUP AGREES ITS PLAN before any rank registers a byte (cr-068). Budgets are
@@ -2361,6 +2365,7 @@ class Executor:
                     sequence_parallel_degree=max(self.world, 1),
                     host_tier=command.host_tier,
                     pinned_bytes=command.pinned_bytes,
+                    sealed_tiers=command.sealed_tiers,
                 ),
                 optional_attention_scope=True,
             )
@@ -3688,19 +3693,20 @@ class Executor:
         """One product onto the run's output log, durable before this returns."""
         return self._durable(request, Published)
 
-    def _tiers(self, worker: bool) -> HostTiers | None:
+    def _tiers(self, worker: bool, sealed: bool = False) -> HostTiers | None:
         """Where this rank's pinned tiers come from: a follower adopts its leader's (one copy
-        for K ranks); rank 0 asks and offers the worker's when it keeps them, and shares every
-        tier with its followers."""
+        for K ranks); rank 0 asks the machine for its sealed layouts, or asks and offers the
+        worker's tiers when it keeps them, and shares every tier with its followers."""
         host = self.host
         if self.rank > 0:
             return HostTiers(ask=self._leader_tier, offer=lambda *_: None)
-        if not worker and self.group is None:
+        if not worker and not sealed and self.group is None:
             return None
         return HostTiers(
             ask=host._ask_tier if worker else lambda *_: None,
             offer=host._offer_tier if worker else lambda *_: None,
             share=self._share_tier,
+            seal=host._seal_tier if sealed else None,
         )
 
     def _share_tier(self, name: str, layout: str, memfd: int) -> None:
@@ -3727,6 +3733,25 @@ class Executor:
     def _ask_tier(self, name: str, layout: str) -> int | None:
         """The pinned host tier the worker keeps for exactly this weight set's layout."""
         answer = self._durable(HostTier(name=name, layout=layout), Tier)
+        return answer.descriptor if answer.ok and answer.held and answer.descriptor >= 0 else None
+
+    def _seal_tier(self, plan: SealedPlan) -> int | None:
+        """The machine's sealed layout for `plan`, filled once and kept across executors; None
+        when it holds none (no room), and this weight set reads the store itself."""
+        body = canonical.write(msgspec.to_builtins(plan))
+        memfd = plane.sealed_memfd("cozy-sealed-plan", body)
+        try:
+            request = SealedTier(
+                manifest=plan.manifest,
+                name=plan.name,
+                layout=plan.layout,
+                sha256=hashlib.sha256(body).hexdigest(),
+                length=len(body),
+                memfd=memfd,
+            )
+            answer = self._durable(request, Tier)
+        finally:
+            os.close(memfd)
         return answer.descriptor if answer.ok and answer.held and answer.descriptor >= 0 else None
 
     def _device_room(self, free_bytes: int) -> None:
@@ -3815,7 +3840,8 @@ class Executor:
         body = encode_request(request)
         sending = (
             request.memfd
-            if (isinstance(request, HostTier) and request.offer) or isinstance(request, BudgetCell)
+            if (isinstance(request, HostTier) and request.offer)
+            or isinstance(request, BudgetCell | SealedTier)
             else -1
         )
         body.pop("memfd", None)
