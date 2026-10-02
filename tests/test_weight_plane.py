@@ -225,6 +225,18 @@ def test_an_unbound_weight_is_parked_as_packages_know_it() -> None:
     assert (standin.shape, standin.dtype, standin.device.type) == (held.shape, held.dtype, "cpu")
     assert not _inspectable(standin) and _inspectable(held)
     assert standin.to(torch.float32).untyped_storage().nbytes() == 0
+    # Run 2793: inside an out-of-memory retry `Tensor.to` reaches the stand-in whole (not as
+    # the copy it decomposes into); the plane retyping one there mapped it, and recursed.
+    aten, kind = torch.ops.aten, type(standin)
+    for func, args, kwargs in (
+        (aten.to.dtype, (standin, torch.float32), {}),
+        (aten.to.device, (standin, torch.device("cpu"), torch.float32), {}),
+        (aten.to.dtype_layout, (standin,), {"dtype": torch.float32}),
+        (aten.to.other, (standin, torch.empty(1, dtype=torch.float32)), {}),
+    ):
+        moved = kind.__torch_dispatch__(func, (kind,), args, kwargs)
+        assert type(moved) is kind and moved.shape == held.shape
+        assert moved.dtype == torch.float32 and moved.untyped_storage().nbytes() == 0
 
 
 def test_a_kernel_launch_is_never_handed_a_weight_with_no_bytes() -> None:
@@ -235,7 +247,7 @@ def test_a_kernel_launch_is_never_handed_a_weight_with_no_bytes() -> None:
     from cozy_runtime.internal.weights import ResidencyRefusal, unbound
 
     launched: list[tuple[Any, ...]] = []
-    kernel = {(4, 1, 1): lambda *args: launched.append(args)}
+    kernel: Any = {(4, 1, 1): lambda *args: launched.append(args)}
     scale = torch.ones(8)
     fusion._Launch(kernel)[(4, 1, 1)](scale, 8, 1e-6)
     assert len(launched) == 1 and launched[0][0] is scale and launched[0][1:] == (8, 1e-6)
@@ -426,6 +438,32 @@ def test_a_kernel_launched_outside_torch_never_reads_an_unmapped_weight(
     units = {region.path for region in model.residency.components["stack"].blocks}
     assert ("blocks.0.norm_q" in units) == own_region
     assert same(resident, streamed)
+
+
+@on_card
+def test_a_stage_entered_inside_another_leaves_the_outer_its_own_grain(card: Any) -> None:
+    """Run 2763: Anima's DiT, mid-stage and so unable to move to the sub-block grain, was
+    given only its sub-block floor when the stage was placed again, and the run failed with
+    "does not fit at its grain" in a budget that held it. A component that cannot refine now
+    keeps at least what its current grain needs; the others stream instead."""
+    weights = card.weights
+    outer = load(weights, card.checkpoint, "b-outer")
+    inner = load(weights, card.checkpoint, "a-inner")  # placed first: it would take the spare
+    x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
+    weights.set_budget(1 << 30)
+    want = run(outer, x, passes=1), run(inner, x, passes=1)
+    layout: weight_policy.Layout = outer.residency.components["stack"].layout
+    assert layout.fine is not None and sum(layout.fine) < layout.common + layout.largest
+    weights.set_budget(layout.total + layout.common + layout.largest - (4 << 20))
+    outer.residency.admit("run", ("stack",))
+    try:
+        got_inner = run(inner, x, passes=1)  # placed together with the outer's open stage
+        with torch.inference_mode():
+            got_outer = [outer.stack(x)]
+    finally:
+        outer.residency.release("run", ("stack",))
+    assert not outer.residency.components["stack"].fine
+    assert same(want[0], got_outer) and same(want[1], got_inner)
 
 
 @on_card

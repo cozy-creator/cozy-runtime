@@ -366,7 +366,7 @@ def synchronize(torch: Any, kind: str) -> None:
 
 
 @contextmanager
-def readable(*tensors: Any) -> Iterator[tuple[Any, ...]]:
+def readable(*tensors: object) -> Iterator[tuple[object, ...]]:
     """The operands of a kernel launched outside torch's dispatch (Triton, the compiled
     extension), which reads them by pointer. A weight with no plane bytes bound is a stand-in
     with nothing behind its pointer: its plane maps and holds it for the launch, or refuses
@@ -375,7 +375,8 @@ def readable(*tensors: Any) -> Iterator[tuple[Any, ...]]:
     if not standins:
         yield tensors
         return
-    with type(standins[0]).reading(standins, "a kernel launch") as read:
+    reading = getattr(type(standins[0]), "reading")  # noqa: B009
+    with reading(standins, "a kernel launch") as read:
         yield tuple(read.operand(t) for t in tensors)
 
 

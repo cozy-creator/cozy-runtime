@@ -22,7 +22,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field, replace
 from types import ModuleType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import msgspec
 import tensorfs
@@ -69,6 +69,8 @@ if TYPE_CHECKING:
 
 #: a module's parameter or buffer table (`Module._parameters`, `Module._buffers`)
 type Table = dict[str, Tensor | None]
+#: where a stand-in's bytes bind: its plane, weight set, region and the table entry it holds
+type Origin = tuple[Weights, Component, Region, Table, str]
 
 #: The largest region at the sub-block grain (proving-cpu.md C2: SDXL runs at 1 GiB).
 REGION_LIMIT = 16 << 20
@@ -237,6 +239,8 @@ class Weights:
         self.world = 1
         #: blocks in their forward now (their leases pin their own weights)
         self.running = 0
+        #: a read outside a module's forward is being mapped (`reading`)
+        self.mapping = False
         #: a group's stage whose activations are not measured yet runs its first pass at the
         #: floor, and is placed again at its second with what that pass measured
         self.growing = False
@@ -424,16 +428,19 @@ class Weights:
             )
 
     @contextmanager
-    def reading(self, standins: Sequence[Any], op: str) -> Iterator[Read]:
+    def reading(self, standins: Sequence[Tensor], op: str) -> Iterator[Read]:
         """A weight read outside its own module's forward (a fused kernel handed a sibling's
         scale, a package reading `.weight`): its region is mapped and leased for the op, as
         its forward would, and leaves with it. Only inside its component's stage: anywhere
         else the read is refused, and no kernel is ever handed its empty pointer."""
         opened = self.opened()
         held: list[tuple[Component, Region, Lease]] = []
+        if self.mapping:  # a read from inside the mapping of another: never a second one
+            raise _unbound_read(op)
+        self.mapping = True
         try:
             for standin in standins:
-                origin = standin.origin
+                origin: Origin | None = getattr(standin, "origin", None)
                 if origin is None or origin[0] is not self:
                     raise _unbound_read(op)
                 _, component, region, _, _ = origin
@@ -446,15 +453,17 @@ class Weights:
                 bind(self.torch, region, lease)
             real: dict[int, Tensor] = {}
             for standin in standins:
-                _, _, _, table, name = standin.origin
+                _, _, _, table, name = getattr(standin, "origin")  # noqa: B009
                 value = table[name]
                 if value is None or type(value) is type(standin):
                     raise _unbound_read(op)
                 real[id(standin)] = value.to(dtype=standin.dtype, device=standin.device)
+            self.mapping = False
             yield Read(
                 real, tuple((r.bound, r.bound + r.span) for _, r, _ in held if r.bound is not None)
             )
         finally:
+            self.mapping = False
             for component, region, lease in reversed(held):
                 if region.index not in component.resident:
                     unbind(region)
@@ -722,8 +731,8 @@ def _unbound_type(torch: ModuleType) -> type:
     base: type = torch.Tensor
 
     class Unbound(base):  # type: ignore[misc]
-        #: where its bytes bind: (weights, component, region, table, name)
-        origin: tuple[Weights, Component, Region, Table, str] | None = None
+        #: where its bytes bind
+        origin: Origin | None = None
 
         @staticmethod
         def parameter(held: Tensor) -> Tensor:
@@ -740,9 +749,10 @@ def _unbound_type(torch: ModuleType) -> type:
 
         @classmethod
         @contextmanager
-        def reading(cls, standins: Sequence[Any], op: str) -> Iterator[Read]:
+        def reading(cls, standins: Sequence[Tensor], op: str) -> Iterator[Read]:
             """Real bytes behind `standins` for one op (`Weights.reading`), or a refusal."""
-            origin = next((s.origin for s in standins if s.origin is not None), None)
+            origins = (getattr(standin, "origin", None) for standin in standins)
+            origin: Origin | None = next((found for found in origins if found is not None), None)
             if origin is None:
                 raise _unbound_read(op)
             with origin[0].reading(standins, op) as read:
@@ -754,16 +764,19 @@ def _unbound_type(torch: ModuleType) -> type:
         ) -> Any:
             if func in (aten.detach.default, aten.alias.default):
                 return args[0]
-            if func is aten._to_copy.default:
-                held, options = args[0], kwargs or {}
-                copy = cls(
-                    tuple(held.shape),
-                    options.get("dtype") or held.dtype,
-                    options.get("device") or held.device,
-                )
+            kwargs = kwargs or {}
+            if func is aten._to_copy.default or func.overloadpacket is aten.to:
+                # A conversion (`module.to(dtype)`, a retyped stand-in) is still a stand-in:
+                # no bytes move until something computes with it.
+                held = args[0]
+                names = [argument.name for argument in func._schema.arguments]
+                given = {**dict(zip(names, args, strict=False)), **kwargs}
+                other = given.get("other")
+                dtype = given.get("dtype") or getattr(other, "dtype", held.dtype)
+                device = given.get("device") or getattr(other, "device", held.device)
+                copy = cls(tuple(held.shape), dtype, torch.device(device))
                 copy.origin = held.origin
                 return copy
-            kwargs = kwargs or {}
             operands = (*args, *kwargs.values())
             standins = [v for v in _tensor_operands(operands) if isinstance(v, cls)]
             if func._schema.is_mutable and any(
@@ -797,19 +810,20 @@ class Read:
     #: device address ranges the op's leases hold
     spans: tuple[tuple[int, int], ...]
 
-    def operand(self, value: Any) -> Any:
+    def operand(self, value: object) -> object:
         if isinstance(value, (tuple, list)):
             return type(value)(self.real.get(id(item), item) for item in value)
         return self.real.get(id(value), value)
 
-    def kept(self, out: Any) -> Any:
+    def kept(self, out: object) -> object:
         """The op's result, without a view into bytes that leave with the op's leases."""
         if isinstance(out, (tuple, list)):
             return type(out)(self.kept(item) for item in out)
-        if not getattr(out, "is_cuda", False) or not out.numel():
+        if not getattr(out, "is_cuda", False):
             return out
-        address = int(out.data_ptr())
-        return out.clone() if any(a <= address < b for a, b in self.spans) else out
+        tensor = cast("Tensor", out)
+        address = int(tensor.data_ptr()) if tensor.numel() else 0
+        return tensor.clone() if any(a <= address < b for a, b in self.spans) else out
 
 
 def _recovery_type(torch: ModuleType) -> type:
@@ -1478,7 +1492,7 @@ class PlaneBackend:
         )
         for region in regions:
             for table, attr, standin in region.unbound:
-                standin.origin = (weights, component, region, table, attr)
+                setattr(standin, "origin", (weights, component, region, table, attr))  # noqa: B010
         return component
 
 
@@ -1825,6 +1839,9 @@ class WeightResidency:
             # choose by shape alone.
             cudnn.benchmark = False
             weights.modes["cudnn.benchmark"] = "off (the package had turned it on)"
+        for name in self.active[1] if self.active is not None else ():
+            if self.components[name].fine:  # the run's record of how tight its memory was
+                weights.modes[f"{name}.grain"] = "sub-block"
         self.baseline = accel.allocated(weights.torch, weights.kind)
         accel.reset_peak(weights.torch, weights.kind)
         self.entered_ns = time.perf_counter_ns()
@@ -2004,7 +2021,12 @@ class WeightResidency:
         method = weights.open[-1][1]
         try:
             placed = weight_policy.stage(
-                {key: c.layout for key, c in components.items()},
+                {
+                    # A component that cannot refine now (mid-stage) has no finer floor: its
+                    # share of the budget is never below what its current grain needs.
+                    key: c.layout if opened[key][0]._refinable(c) else replace(c.layout, fine=None)
+                    for key, c in components.items()
+                },
                 budget,
                 orders={
                     key: [c.numbers[index] for index in c.order]
@@ -2113,23 +2135,24 @@ class WeightResidency:
             for t in r.derived
         )
 
+    def _refinable(self, component: Component) -> bool:
+        return not (
+            component.fine
+            or component.layout.fine is None
+            or self.refine is None
+            or any(c.lease is not None or c.cursor is not None for c in self.components.values())
+        )
+
     def _refine(self, key: str) -> bool:
         """Move the weight set `key` to the sub-block grain, if it still can: at a stage's
         start, never inside one (its slot's leases pin the coarse regions)."""
         name = next((n for n, c in self.components.items() if c.key == key), "")
         component = self.components.get(name)
-        if (
-            component is None
-            or component.fine
-            or component.layout.fine is None
-            or self.refine is None
-            or any(c.lease is not None or c.cursor is not None for c in self.components.values())
-        ):
+        if component is None or self.refine is None or not self._refinable(component):
             return False
         self._unhook(name)
         component = self.components[name] = self.refine(name)
         self._hook(component)
-        self.weights.modes[f"{name}.grain"] = "sub-block"
         return True
 
     def _block(

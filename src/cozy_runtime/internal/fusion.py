@@ -36,7 +36,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -530,12 +530,12 @@ class _Launch:
     bytes behind it first (`accel.readable`): a norm scale read from a sibling module may be
     a weight the plane has not mapped."""
 
-    kernel: Any
+    kernel: Mapping[tuple[int, ...], Callable[..., object]]
 
     def __getitem__(self, grid: tuple[int, ...]) -> Callable[..., None]:
         launch = self.kernel[grid]
 
-        def run(*args: Any) -> None:
+        def run(*args: object) -> None:
             at = [i for i, value in enumerate(args) if isinstance(value, torch.Tensor)]
             with readable(*(args[i] for i in at)) as real:
                 operands = list(args)
