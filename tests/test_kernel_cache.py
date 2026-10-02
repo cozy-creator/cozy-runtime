@@ -19,7 +19,7 @@ from typing import Any
 
 import pytest
 
-from cozy_runtime.internal import attention_sol, jit_cache, kernel_cache
+from cozy_runtime.internal import accel, attention_sol, jit_cache, kernel_cache
 
 KEY_DOC = {"library": {"sol_attn_sources": "0" * 64}, "target": "sm_90a", "variant": {}}
 
@@ -252,7 +252,7 @@ def test_a_second_process_loads_the_sol_object_the_first_compiled(tmp_path: Path
     bitwise-identical attention."""
     _site()
     torch = pytest.importorskip("torch")
-    if not torch.cuda.is_available():
+    if not accel.present(torch, "cuda"):
         pytest.skip("requires a CUDA device")
     if tuple(torch.cuda.get_device_capability()) not in attention_sol.ROUTES:
         pytest.skip("requires a card one of Sol's CuTe routes serves")
@@ -268,7 +268,7 @@ def test_a_second_process_loads_the_sol_object_the_first_compiled(tmp_path: Path
 def test_fa4_second_process_loads_from_its_persistent_cache(tmp_path: Path) -> None:
     """flash-attn-4's own disk cache, at the directory the machine store gives it."""
     torch = pytest.importorskip("torch")
-    if importlib.util.find_spec("flash_attn") is None or not torch.cuda.is_available():
+    if importlib.util.find_spec("flash_attn") is None or not accel.present(torch, "cuda"):
         pytest.skip("requires flash-attn-4 and a CUDA device")
     env = {
         "FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED": "1",
@@ -299,7 +299,7 @@ def test_a_triton_kernel_compiles_once_per_machine(tmp_path: Path) -> None:
     executor, a later boot) loads what an earlier one compiled and compiles nothing."""
     torch = pytest.importorskip("torch")
     pytest.importorskip("triton")
-    if not torch.cuda.is_available():
+    if not accel.present(torch, "cuda"):
         pytest.skip("requires a CUDA device")
     env = jit_cache.machine(tmp_path / "var/lib/cozy/kernels")
     cache = Path(env["TRITON_CACHE_DIR"])
@@ -337,7 +337,7 @@ def test_a_torch_nvrtc_kernel_compiles_once_per_installation(tmp_path: Path) -> 
     """PyTorch's NVRTC cache (jiterator ops) lives in the machine store under the executor's
     installation, so a later executor of that environment reads what an earlier one built."""
     torch = pytest.importorskip("torch")
-    if not torch.cuda.is_available():
+    if not accel.present(torch, "cuda"):
         pytest.skip("requires a CUDA device")
     env = jit_cache.machine(tmp_path / "var/lib/cozy/kernels", installation="release-x")
     cache = Path(env["PYTORCH_KERNEL_CACHE_PATH"])

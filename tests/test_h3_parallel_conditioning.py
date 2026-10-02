@@ -25,7 +25,7 @@ pytest.importorskip("transformers")
 
 from cozy_runtime.author import CapabilityError, DerivedCache, concurrently  # noqa: E402
 from cozy_runtime.author.fakes import fake_telemetry  # noqa: E402
-from cozy_runtime.internal import spawn  # noqa: E402
+from cozy_runtime.internal import accel, spawn  # noqa: E402
 from cozy_runtime.internal.executor import Executor  # noqa: E402
 from cozy_runtime.internal.parallel.group import RankGroup  # noqa: E402
 from cozy_runtime.internal.seam import Channel  # noqa: E402
@@ -81,7 +81,7 @@ def test_reference_encode_is_the_official_block_and_its_memo_is_exact(
 ) -> None:
     """The per-reference encode is Diffusers' reference encoder step, value for value, and a
     memo hit hands back exactly what was encoded. Audio is never memoized."""
-    if device_kind == "cuda" and not torch.cuda.is_available():
+    if device_kind == "cuda" and not accel.present(torch, "cuda"):
         pytest.skip("needs a CUDA device")
     model = h3.model()
     for name in ("video_vae", "audio_vae"):

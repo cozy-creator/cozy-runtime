@@ -13,7 +13,7 @@ from typing import Any
 
 import pytest
 
-from cozy_runtime.internal import attention, attention_ulysses
+from cozy_runtime.internal import accel, attention, attention_ulysses
 from cozy_runtime.internal import attention_upstream as upstream
 
 torch = pytest.importorskip("torch")
@@ -206,7 +206,7 @@ def test_real_upstream_matches_sdpa_and_preserves_inputs(
         pytest.skip("adapter serves equal Q/KV heads only")
     if importlib.util.find_spec(dependency) is None:
         pytest.skip(f"{dependency} is not installed")
-    if not torch.cuda.is_available():
+    if not accel.present(torch, "cuda"):
         pytest.skip("CUDA is unavailable")
     capability = torch.cuda.get_device_capability()
     if capability not in cards:

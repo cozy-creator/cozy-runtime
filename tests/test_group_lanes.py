@@ -2,6 +2,11 @@
 
 Actual sharded component forwards and native residency are exercised separately
 in test_parallel_calls.py. These tests do not establish multi-GPU H3 performance.
+
+The gloo cases open the NVIDIA device nodes on a host that has a driver, even with
+`CUDA_VISIBLE_DEVICES=""`: `torch.distributed` asks torch for its accelerator, and a CUDA
+build of torch answers by counting devices. Beside a GPU benchmark, run this file only while
+holding the GPU lock, or where `/dev/nvidia*` is hidden.
 """
 
 from __future__ import annotations
