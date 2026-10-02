@@ -823,6 +823,8 @@ def test_a_restarted_machine_prewarms_before_its_claim_and_store_walk(
         try:
             assert walking.wait(60) and prewarmed.wait(60), "the prewarm waited for the walk"
             assert owners == [OWNER] and not second.fence.record_owner_recorded
+            slot = _wait(lambda: second.prespawns.slots.get((INSTALLATION, (0,))), "its slot")
+            assert slot.started.wait(300)  # torn down after its process exists, not mid-spawn
         finally:
             walked.set()
             second.request_stop()
