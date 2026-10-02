@@ -26,7 +26,10 @@ Readonly-file transport is distinct from connected-socket Handoff and mutable ho
 memfd transport; numeric fd values from JSON never become authority.
 
 Metadata blobs are verified against the received SHA-256/length. Native SourceDescriptor
-duplicates, verifies and retains each immutable object fd. `Checkpoint` opens no local
+duplicates and verifies each immutable object fd, then retains its pageable read-only
+inode mapping and closes the transient fd. Object count does not grow the consumer's
+open-FD set; provider teardown releases mappings after the last source/weight-set drops.
+`Checkpoint` opens no local
 Store; backend expect skips local read-lease acquire and component registration uses the
 machine source provider. Legacy code still performs its original lease/source operations.
 
@@ -52,6 +55,9 @@ The source hook does not make all host allocations machine-owned: the existing e
 can still fill its own pinned tier, allocate staging/activations, and retain model assets.
 Those private bytes must remain visible in the machine ledger and budget/recovery policy.
 Sole-writer shared host-tier adoption and universal low-memory recovery remain separate.
+Mapped virtual ranges, VMA entries and mapped RSS are also consumer resources. The owner
+legacy ReadLease still retains its complete descriptor closure and raises the soft FD
+limit toward the hard limit; this is known released behavior, not a general-size solution.
 
 After the CPU gates, root coordinates unchanged SDXL through the stock executor and
 existing model/codec path, with source mode explicitly recorded and valid saved WebP.
