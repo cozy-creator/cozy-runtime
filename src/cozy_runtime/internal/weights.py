@@ -362,7 +362,18 @@ class Weights:
         # torch reuses its own cached segments first; only growth beyond them needs the driver
         slack = max(memory["reserved_bytes"] - memory["allocated_bytes"], 0)
         growth = max(self.activation.get(method, 0) - slack, 0)
-        return weight_policy.plane_budget(memory["driver_free_bytes"] + committed, growth)
+        # the bound weights' decoded copies are the weights' own, in torch's bytes
+        held = committed + self.decoded()
+        return weight_policy.plane_budget(memory["driver_free_bytes"] + held, growth)
+
+    def decoded(self) -> int:
+        """Device bytes the bound regions' decoded copies hold now."""
+        return sum(
+            int(t.numel() * t.element_size())
+            for component in self.components.values()
+            for region in component.regions
+            for t in region.derived
+        )
 
     def shrink(self, need: int, floor: int) -> int:
         """OOM at a block boundary: give torch `need` more bytes by unmapping plane bytes. The
@@ -415,7 +426,7 @@ class Weights:
             # Inside a block (one GPU of a group): nothing is re-placed under its lease. Other
             # weights leave, least recently used first; their blocks map them again as they run.
             floor = sum(
-                weight_policy.floor(replace(component.layout, fine=None))
+                weight_policy.floor(replace(component.planned, fine=None))
                 for _, _, component in self.opened().values()
             )
             self.shrink(need, floor)
@@ -1812,7 +1823,7 @@ class WeightResidency:
                 # weights are all the plane keeps; every other byte stays torch's until it is.
                 # One GPU of a group keeps only a streaming window for the first pass (its
                 # blocks cannot run again after an out-of-memory), then grows by what it measured.
-                own = [component.layout for _, _, component in weights.opened().values()]
+                own = [component.planned for _, _, component in weights.opened().values()]
                 weights.growing = weights.grouped
                 budget = min(
                     budget,
@@ -1868,7 +1879,7 @@ class WeightResidency:
                 continue
             accel.release_cached(weights.torch, weights.kind)
             window = sum(
-                c.layout.common + 2 * c.layout.largest for _, _, c in weights.opened().values()
+                c.planned.common + 2 * c.planned.largest for _, _, c in weights.opened().values()
             )
             budget = min(budget, max(weights.driver_budget(method), window))
 
@@ -1880,10 +1891,7 @@ class WeightResidency:
         accel.release_cached(weights.torch, weights.kind)
         opened = [component for _, _, component in weights.opened().values()]
         mapped = max(plane.stats(weights.plane).device(weights.index).committed, 0)
-        decoded = sum(
-            int(t.numel() * t.element_size()) for c in opened for r in c.regions for t in r.derived
-        )
-        room = mapped + decoded + weights.allocatable() - need - weight_policy.MARGIN
+        room = mapped + weights.decoded() + weights.allocatable() - need - weight_policy.MARGIN
         floor = sum(weight_policy.floor(replace(c.planned, fine=None)) for c in opened)
         lowered = max(min(room, budget - weight_policy.MARGIN), floor)
         if lowered >= budget:
@@ -1913,7 +1921,7 @@ class WeightResidency:
         if wanted is None:
             return
         opened = [component for _, _, component in weights.opened().values()]
-        floor = sum(weight_policy.floor(replace(c.layout, fine=None)) for c in opened)
+        floor = sum(weight_policy.floor(replace(c.planned, fine=None)) for c in opened)
         for component in opened:
             close_cursor(component)
         weights.set_budget(max(wanted, floor) if wanted >= 0 else wanted)
@@ -2157,7 +2165,7 @@ class WeightResidency:
         # A budget that only fits one block at a time streams with no overlap: regions of at
         # most 16 MiB let it hold a window of several. (Window 1 chosen when two fit stays.)
         for key, residence in placed.items():
-            layout = components[key].layout
+            layout = layouts[key]
             if (
                 residence.streamed
                 and residence.window == 1
@@ -2409,7 +2417,7 @@ class WeightResidency:
         for component in opened:
             close_cursor(component)
         # Mid-stage no component can refine (its leases hold the coarse regions).
-        floor = sum(weight_policy.floor(replace(c.layout, fine=None)) for c in opened)
+        floor = sum(weight_policy.floor(replace(c.planned, fine=None)) for c in opened)
         weights.shrink(need, floor)
         if opened:
             self._place(weights.applied, resume)
@@ -2554,7 +2562,7 @@ class WeightResidency:
     def _floor(self, names: Sequence[str]) -> int:
         """The plane bytes `names` cannot run below at their current grain."""
         return sum(
-            weight_policy.floor(replace(self.components[n].layout, fine=None))
+            weight_policy.floor(replace(self.components[n].planned, fine=None))
             for n in names
             if n in self.components
         )
