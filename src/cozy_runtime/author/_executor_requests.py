@@ -166,6 +166,14 @@ class HostTier(_Request, frozen=True, kw_only=True, tag="host_tier"):
     memfd: int = -1
 
 
+class BudgetCell(_Request, frozen=True, kw_only=True, tag="budget_cell"):
+    """The executor's plane budget cell (`internal/budget_cell.py`; its memfd follows this
+    request): the Worker lowers a running call's budget through it, at a block boundary."""
+
+    #: the memfd the worker received; never on the wire
+    memfd: int = -1
+
+
 class StageEnter(_Request, frozen=True, kw_only=True, tag="stage_enter"):
     """A component-use scope asks for its turn on the executor's devices (`stage/1`); the
     worker answers `StageGo` once the turn is this attempt's."""
@@ -194,6 +202,7 @@ class StageExit(_Request, frozen=True, kw_only=True, tag="stage_exit"):
 type _Tagged = (
     DeviceRoom
     | HostTier
+    | BudgetCell
     | StageEnter
     | StageExit
     | ChildEvents
@@ -411,7 +420,7 @@ def respond(
             request = decode(frame)
         except CapabilityError as exc:
             reply = refuse(exc.code, exc.message)
-    if isinstance(request, HostTier):
+    if isinstance(request, HostTier | BudgetCell):
         # The descriptor is only ever the one that arrived: a number on the wire is not.
         request = msgspec.structs.replace(request, memfd=-1 if received is None else received)
     elif received is not None:
@@ -421,7 +430,7 @@ def respond(
         try:
             reply = handler(request)
         except Exception as exc:  # answered, so the executor's exchange stays in step
-            if isinstance(request, HostTier) and request.memfd >= 0:
+            if isinstance(request, HostTier | BudgetCell) and request.memfd >= 0:
                 with contextlib.suppress(OSError):
                     os.close(request.memfd)
             reply = refuse("request_failed", f"{type(exc).__name__}: {exc}"[:400])

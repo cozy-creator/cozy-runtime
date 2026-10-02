@@ -41,8 +41,24 @@ from pathlib import Path
 from typing import Any, NotRequired, TypedDict, Unpack
 
 from cozy_runtime import __version__ as RUNTIME_VERSION
-from cozy_runtime.author._executor_requests import Handler, respond
-from cozy_runtime.internal import accel, executor_commands, jit_cache, liveness, proctree, spawn
+from cozy_runtime.author._executor_requests import (
+    Answer,
+    BudgetCell,
+    Handler,
+    Reply,
+    Request,
+    refuse,
+    respond,
+)
+from cozy_runtime.internal import (
+    accel,
+    budget_cell,
+    executor_commands,
+    jit_cache,
+    liveness,
+    proctree,
+    spawn,
+)
 from cozy_runtime.internal.child_env import (
     ALLOWLIST,
     EXECUTOR_SCOPE_ENV,
@@ -194,6 +210,9 @@ class Executor:
     #: the longest gap between frames this process has shown across its attempts (seconds);
     #: a later cancel's patience is never derived from less
     worst_pause: float = 0.0
+    #: its plane budget cell (`budget_cell`), handed over at its first load; None before, or
+    #: from an executor older than the cell
+    cell: budget_cell.Cell | None = None
     _calls: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     @property
@@ -267,7 +286,7 @@ class Executor:
                         )
                     except SeamError as exc:
                         raise ExecutorGone(f"seam: {exc}") from exc
-                    answer, handoff = respond(frame, on_request, received)
+                    answer, handoff = respond(frame, self._cells(on_request), received)
                     try:
                         self.channel.send(answer)
                         if isinstance(handoff, int):
@@ -286,6 +305,38 @@ class Executor:
                 if frame.get("reply") != name:
                     raise ExecutorGone(f"out-of-order reply {frame.get('reply')!r} for {name!r}")
                 return frame
+
+    def _cells(self, handler: Handler | None) -> Handler | None:
+        """Keep this executor's budget cell; every other request goes to `handler`."""
+
+        def answer(request: Request) -> Reply:
+            if isinstance(request, BudgetCell):
+                if self.cell is not None:
+                    self.cell.close()
+                try:
+                    self.cell = budget_cell.Cell(request.memfd)
+                finally:
+                    os.close(request.memfd)
+                return Answer(ok=True)
+            if handler is None:
+                return refuse("no_durable_exchange", f"no handler for {request!r}"[:200])
+            return handler(request)
+
+        return answer
+
+    def cut(self, vram_bytes: int, *, every: float = 0.005) -> int | None:
+        """Lower (or raise) a running call's plane budget at its next block boundary: the
+        bytes it applied, or None when it has no cell or its call ended first (the next call
+        carries its grant). Waits on the call itself, never on a clock."""
+        cell = self.cell
+        if cell is None:
+            return None
+        ticket = cell.ask(vram_bytes)
+        while (applied := cell.answered(ticket)) is None:
+            if not (self.busy() and self.alive()):
+                return cell.answered(ticket)
+            threading.Event().wait(every)
+        return applied
 
     def busy(self) -> bool:
         """A call holds the seam now (an attempt, a load): a new one would wait for it."""
@@ -338,6 +389,9 @@ class Executor:
 
     def close(self) -> None:
         self.channel.close()
+        if self.cell is not None:
+            self.cell.close()
+            self.cell = None
 
 
 @dataclass(frozen=True, slots=True)

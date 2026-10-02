@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import io
 import mmap
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -403,6 +404,40 @@ def test_an_sdxl_unet_streams_bit_exact(tmp_path: Path, pressure: bool) -> None:
     assert weights.facts().streamed["unet"].resident_blocks < len(layout.blocks)
     exact = [torch.equal(a, b) for a, b in zip(resident, streamed, strict=True)]
     assert all(exact), f"bytes exact, outputs not ({exact}): kernels chose by free memory"
+
+
+@on_card
+def test_the_worker_lowers_a_running_stage_at_its_next_block(card: Any) -> None:
+    """Room for another executor's context, made while a call runs: the Worker asks through
+    the budget cell, and the stage unmaps and streams from its next block on, unchanged."""
+    from cozy_runtime.internal import budget_cell
+
+    weights = card.weights
+    model = load(weights, card.checkpoint, "cut")
+    x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
+    weights.set_budget(1 << 30)
+    reference = run(model, x)
+    cell, fd = budget_cell.Cell.create()
+    worker = budget_cell.Cell(fd)
+    os.close(fd)
+    weights.cell = cell
+    model.residency.admit("run", ("stack",))
+    try:
+        with torch.inference_mode():
+            outputs = [model.stack(x)]
+            ticket = worker.ask(tight(model))
+            outputs += [model.stack(x), model.stack(x)]
+    finally:
+        model.residency.release("run", ("stack",))
+        weights.cell = None
+        applied = worker.answered(ticket)
+        cell.close()
+        worker.close()
+    assert applied == tight(model)
+    facts = weights.facts()
+    assert weights.applied == tight(model) and facts.committed_bytes <= tight(model)
+    assert facts.streamed["stack"].resident_blocks < BLOCKS
+    assert same(reference, outputs)
 
 
 @on_card

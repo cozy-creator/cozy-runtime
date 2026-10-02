@@ -75,6 +75,7 @@ from cozy_runtime.author._errors import (
 )
 from cozy_runtime.author._executor_requests import (
     Answer,
+    BudgetCell,
     Checkpoint,
     CheckpointReceipt,
     ChildEvents,
@@ -104,6 +105,7 @@ from cozy_runtime.internal import (
     attention,
     attention_sol,
     attention_ulysses,
+    budget_cell,
     canonical,
     child_env,
     execution_evidence,
@@ -1956,6 +1958,8 @@ class Executor:
                 # One GPU of a group: its blocks hold the group's collectives, so they
                 # recover from an out-of-memory op by op, never by running a block again.
                 host.weights.grouped = self.world > 1
+                if self.rank == 0:
+                    host.weights.cell = host._budget_cell()
             except plane.Unavailable as exc:
                 return {"ok": False, "code": "weight_plane_unavailable", "detail": str(exc)}
         weights = host.weights
@@ -3724,6 +3728,18 @@ class Executor:
         answer = self._durable(HostTier(name=name, layout=layout), Tier)
         return answer.descriptor if answer.ok and answer.held and answer.descriptor >= 0 else None
 
+    def _budget_cell(self) -> budget_cell.Cell | None:
+        """Hand the worker this process's budget cell; None from an older worker."""
+        cell, fd = budget_cell.Cell.create()
+        try:
+            answer = self._durable(BudgetCell(memfd=fd), Answer)
+        finally:
+            os.close(fd)
+        if answer.ok:
+            return cell
+        cell.close()
+        return None
+
     def _offer_tier(self, name: str, layout: str, memfd: int) -> None:
         """Hand the worker a tier this process filled, so its bytes outlive the process."""
         self._durable(HostTier(name=name, layout=layout, offer=True, memfd=memfd), Answer)
@@ -3791,7 +3807,11 @@ class Executor:
         the lossy lane's whole contract is that it may shed.
         """
         body = encode_request(request)
-        sending = request.memfd if isinstance(request, HostTier) and request.offer else -1
+        sending = (
+            request.memfd
+            if (isinstance(request, HostTier) and request.offer) or isinstance(request, BudgetCell)
+            else -1
+        )
         body.pop("memfd", None)
         with self._durable_lock:
             self._exchange += 1

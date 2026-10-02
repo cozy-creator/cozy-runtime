@@ -30,7 +30,7 @@ import tensorfs
 from cozy_runtime.author._errors import RuntimeFailure, is_device_oom
 from cozy_runtime.author._loader import Census, TensorLike, TensorSpec, _members
 from cozy_runtime.author._stage_memo import inexact
-from cozy_runtime.internal import accel, canonical, plane, proctree, weight_policy
+from cozy_runtime.internal import accel, budget_cell, canonical, plane, proctree, weight_policy
 from cozy_runtime.internal.derive import placing
 from cozy_runtime.internal.encoding import (
     TORCH_DTYPES,
@@ -234,6 +234,8 @@ class Weights:
         #: a group's stage whose activations are not measured yet runs its first pass at the
         #: floor, and is placed again at its second with what that pass measured
         self.growing = False
+        #: the Worker's mid-call budget (`budget_cell`): read at every block boundary
+        self.cell: budget_cell.Cell | None = None
         #: the CUDA context and library workspaces outside torch and the plane, measured once
         self.context_bytes = -1
 
@@ -1603,6 +1605,24 @@ class WeightResidency:
         if not self.weights.open:
             self.weights.growing = False
 
+    def _asked(self, resume: Mapping[str, int] = {}) -> None:
+        """The Worker lowered (or raised) this executor's budget mid-call: apply it at this
+        block boundary, never below the open stages' floor, and say what was applied."""
+        weights = self.weights
+        assert weights.cell is not None
+        wanted = weights.cell.poll()
+        if wanted is None:
+            return
+        opened = [component for _, _, component in weights.opened().values()]
+        floor = sum(weight_policy.floor(replace(c.layout, fine=None)) for c in opened)
+        for component in opened:
+            close_cursor(component)
+        weights.set_budget(max(wanted, floor) if wanted >= 0 else wanted)
+        weights.drain()
+        if opened and weights.open:
+            self._plan(max(weights.applied, floor), resume)
+        weights.cell.acknowledge(weights.applied)
+
     def _grow(self) -> None:
         """A group's unmeasured stage begins its second pass: place the open stages again
         with the activations the first pass measured, inside what the driver has now."""
@@ -1956,6 +1976,8 @@ class WeightResidency:
                 raise self._poison(exc) from exc
 
         def attempt(*args: Any, **kwargs: Any) -> Any:
+            if weights.cell is not None and not weights.running:
+                self._asked({component.key: region.index})
             passes = component.passes
             self._observe(component, region.index)
             if weights.growing and component.passes == 2 > passes:
