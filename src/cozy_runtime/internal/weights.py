@@ -1565,9 +1565,13 @@ class WeightResidency:
                 if not _device_pool(exc):
                     raise self._shortfall(method, 0, budget, str(exc)) from None
                 # The driver had less than the budget (another process, or torch's idle cache,
-                # holds it): plan again inside what it has now, never above the grant.
+                # holds it): plan again inside what it has now, never above the grant, and
+                # never below a two-block streaming window while the driver can map one.
                 accel.release_cached(weights.torch, weights.kind)
-                budget = min(budget, weights.driver_budget(method))
+                window = sum(
+                    c.layout.common + 2 * c.layout.largest for _, _, c in weights.opened().values()
+                )
+                budget = min(budget, max(weights.driver_budget(method), window))
                 try:
                     self._plan(budget)
                 except self._budget_error as again:
