@@ -1,8 +1,8 @@
 """Native TensorFS-backed, component-staged Qwen Image 2.1 inference.
 
-Only the maintained upstream architecture and sampling implementation are reused.
-Runtime constructs/fills the modules and owns their residency; no upstream weight
-loader, device placement, or offload hook participates in serving.
+The architecture and sampling are Diffusers' own (`QwenImage21Pipeline`, Diffusers 0.41+).
+Runtime constructs/fills the modules and owns their residency; no Diffusers weight loader,
+device placement, or offload hook participates in serving.
 """
 
 from __future__ import annotations
@@ -12,7 +12,9 @@ import zlib
 from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
+import diffusers
 import torch
+from diffusers import FlowMatchEulerDiscreteScheduler
 from tokenizers import Tokenizer
 from transformers import (
     AutoModelForImageTextToText,
@@ -24,12 +26,22 @@ from transformers import (
 )
 from transformers import initialization as transformer_init
 
-from cozy_runtime.author import Config, Loader, Model, uses_components
+from cozy_runtime.author import Config, ConformanceError, Loader, Model, uses_components
 from cozy_runtime.models._progress import PipelineProgress
 
-from .upstream.autoencoder_kl_qwenimage21 import AutoencoderKLQwenImage21
-from .upstream.pipeline_qwenimage21 import QwenImage21Pipeline, calculate_dimensions
-from .upstream.transformer_qwenimage21 import QwenImage21Transformer2DModel
+try:
+    from diffusers import (
+        AutoencoderKLQwenImage21,
+        QwenImage21Pipeline,
+        QwenImage21Transformer2DModel,
+    )
+    from diffusers.pipelines.qwenimage21.pipeline_qwenimage21 import calculate_dimensions
+except ImportError:
+    # Older Diffusers: this module still imports, because H3 imports qwen-image-2 for its
+    # call proxies without running it. Building the model refuses (`QwenImage21Graph`).
+    QwenImage21Pipeline = None
+
+_Pipeline: Any = QwenImage21Pipeline or object
 
 
 def _section(value: object, name: str) -> dict[str, Any]:
@@ -42,13 +54,19 @@ class QwenImage21Graph:
     """One native construction census, with source checkpoint precision preserved."""
 
     def __init__(self, config: Config) -> None:
+        if QwenImage21Pipeline is None:
+            raise ConformanceError(
+                "Qwen Image 2.1 needs Diffusers 0.41 or newer (QwenImage21Pipeline); this "
+                f"package environment has diffusers {diffusers.__version__}",
+                code="qwen_image21_diffusers",
+            )
         mapping = config.mapping()
         with transformer_init.no_init_weights():
             self.components: dict[str, Any] = {
                 "transformer": QwenImage21Transformer2DModel.from_config(
                     _section(mapping["transformer"], "transformer")
                 ).to(dtype=torch.bfloat16),
-                # Construction dtype leaves derived RoPE buffers in upstream F32.
+                # Construction dtype leaves derived RoPE buffers in Transformers' F32.
                 # Casting the completed module would round those frequencies to BF16.
                 "text_encoder": AutoModelForImageTextToText.from_config(
                     Qwen3VLConfig(**_section(mapping["text_encoder"], "text_encoder")),
@@ -97,7 +115,24 @@ def build_processor(config: Mapping[str, Any]) -> Any:
     )
 
 
-class _StagedPipeline(QwenImage21Pipeline):
+class _HiddenStates:
+    """The text encoder as the pipeline calls it, without the language-model head.
+
+    The pipeline reads only `hidden_states`; calling the inner model skips the
+    151,936-wide logits projection over every prompt and vision token.
+    """
+
+    def __init__(self, encoder: Any) -> None:
+        self._encoder = encoder
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._encoder, name)
+
+    def __call__(self, **kwargs: Any) -> Any:
+        return self._encoder.model(**kwargs)
+
+
+class _StagedPipeline(_Pipeline):
     reference_latents: torch.Tensor | None = None
     reference_pad_mask: torch.Tensor | None = None
 
@@ -108,14 +143,14 @@ class _StagedPipeline(QwenImage21Pipeline):
 
     @property
     def _execution_device(self) -> torch.device:
-        # Upstream chooses the first registered module (VAE), which can correctly
+        # Diffusers chooses the first registered module (VAE), which can correctly
         # remain parked on CPU while Runtime admits the denoiser. Follow the active
         # denoising component instead. Encoding supplies its own leased device.
         return next(self.transformer.parameters()).device
 
     def encode_prompt(self, *args: Any, **kwargs: Any) -> Any:
         # The denoiser must reuse the vision token positions from the separately
-        # leased text encoder. Upstream otherwise rejects precomputed image embeds.
+        # leased text encoder. Diffusers otherwise rejects precomputed image embeds.
         if self.reference_pad_mask is not None:
             kwargs["image_pad_mask"] = self.reference_pad_mask
         return super().encode_prompt(*args, **kwargs)
@@ -152,7 +187,7 @@ def _prefix_cache_fits(
 
 
 #: Runtime code the encoders read beyond their own bodies: their memo key binds it.
-_ENCODER_CODE = (_StagedPipeline, build_processor)
+_ENCODER_CODE = (_StagedPipeline, _HiddenStates, build_processor)
 
 
 class QwenImage21Model(Model[QwenImage21Graph]):
@@ -164,10 +199,9 @@ class QwenImage21Model(Model[QwenImage21Graph]):
         self.processor = build_processor(self.graph.processor_config)
 
     def _pipeline(self) -> _StagedPipeline:
-        from diffusers import FlowMatchEulerDiscreteScheduler
-
+        components = self.graph.components
         return _StagedPipeline(
-            **self.graph.components,
+            **{**components, "text_encoder": _HiddenStates(components["text_encoder"])},
             processor=self.processor,
             scheduler=FlowMatchEulerDiscreteScheduler.from_config(self.graph.scheduler_config),
         )
@@ -183,7 +217,7 @@ class QwenImage21Model(Model[QwenImage21Graph]):
 
     @uses_components("vae", memoize=True, memo_dependencies=_ENCODER_CODE)
     def encode_reference_images(self, images: list[Any]) -> tuple[list[Any], torch.Tensor]:
-        """Encode each reference once, using upstream's 1 MP conditioning size."""
+        """Encode each reference once, using Diffusers' 1 MP conditioning size."""
         if not 1 <= len(images) <= 10:
             raise ValueError("Qwen Image requires between one and ten reference images")
         vae = self.graph.components["vae"]
@@ -289,5 +323,5 @@ class QwenImage21Model(Model[QwenImage21Graph]):
             latents = latents.to(device=device, dtype=vae.dtype)
             mean = latents.new_tensor(vae.config.latents_mean).view(1, vae.config.z_dim, 1, 1, 1)
             std = latents.new_tensor(vae.config.latents_std).view(1, vae.config.z_dim, 1, 1, 1)
-            # Identical to the upstream final decode, with no cast of F32 source weights.
+            # Identical to the pipeline's final decode, with no cast of F32 source weights.
             return vae.decode(latents * std + mean, return_dict=False)[0][:, :, 0]

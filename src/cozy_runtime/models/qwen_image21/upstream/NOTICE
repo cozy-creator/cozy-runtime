@@ -1,5 +1,0 @@
-Copyright 2026 Qwen-Image Team and The HuggingFace Team.
-Apache-2.0 source from huggingface/diffusers commit 4295ee3ec58efa6577bc459e9b84ca3f63aa9a96.
-Three files retain upstream algorithms; imports are relocated to installed Diffusers core and sibling modules.
-Local conditioning change: call the Qwen3VL multimodal backbone directly, preserving its hidden states and final-norm hook while skipping the unused language-model logits projection.
-Model weights are separately licensed under the Qwen Research License.

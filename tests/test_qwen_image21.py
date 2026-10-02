@@ -1,4 +1,4 @@
-"""Real tiny Qwen modules: staged execution agrees with the upstream pipeline."""
+"""Real tiny Qwen modules: staged execution agrees with Diffusers' pipeline."""
 
 import subprocess
 import sys
@@ -7,12 +7,27 @@ from pathlib import Path
 import pytest
 
 torch = pytest.importorskip("torch")
-pytest.importorskip("diffusers")
+diffusers = pytest.importorskip("diffusers")
 pytest.importorskip("transformers")
 pytest.importorskip("tokenizers")
+QWEN = hasattr(diffusers, "QwenImage21Pipeline")
 
 
-def test_staged_qwen_image21_matches_upstream_and_preserves_scopes(tmp_path: Path) -> None:
+@pytest.mark.skipif(QWEN, reason="this Diffusers has Qwen-Image-2.1")
+def test_model_imports_and_refuses_construction_on_older_diffusers() -> None:
+    # H3 imports qwen-image-2 (and so this model) for its call proxies in a 0.40 environment.
+    from cozy_runtime.author import Config, ConformanceError
+    from cozy_runtime.models.qwen_image21 import QwenImage21Model
+    from cozy_runtime.models.qwen_image21.model import build_qwen_image21
+
+    assert QwenImage21Model.__name__ == "QwenImage21Model"
+    with pytest.raises(ConformanceError) as refused:
+        build_qwen_image21(Config({}))
+    assert refused.value.code == "qwen_image21_diffusers"
+
+
+@pytest.mark.skipif(not QWEN, reason="Diffusers predates Qwen-Image-2.1 (0.41)")
+def test_staged_qwen_image21_matches_diffusers_and_preserves_scopes(tmp_path: Path) -> None:
     # Repeated invocations share one executor's observer state, independently of
     # unrelated Worker/server threads created by other tests in pytest's process.
     code = (
@@ -31,7 +46,7 @@ def _staged_qwen_proof(tmp_path: Path) -> None:
     import base64
     import zlib
 
-    from diffusers import FlowMatchEulerDiscreteScheduler
+    from diffusers import FlowMatchEulerDiscreteScheduler, QwenImage21Pipeline
     from tokenizers import Tokenizer, models, pre_tokenizers
     from transformers import (
         PreTrainedTokenizerFast,
@@ -47,7 +62,6 @@ def _staged_qwen_proof(tmp_path: Path) -> None:
         build_processor,
         build_qwen_image21,
     )
-    from cozy_runtime.models.qwen_image21.upstream.pipeline_qwenimage21 import QwenImage21Pipeline
 
     config = {
         "transformer": dict(
@@ -236,6 +250,7 @@ def _staged_qwen_proof(tmp_path: Path) -> None:
     assert {x.dtype for x in graph.components["transformer"].parameters()} == {torch.bfloat16}
 
 
+@pytest.mark.skipif(not QWEN, reason="Diffusers predates Qwen-Image-2.1 (0.41)")
 def test_runtime_pipeline_progress_preserves_cooperative_timing() -> None:
     # An executor owns a fresh Python process. Repeated invocations must remain
     # known, without hiding real author threads that outlive synchronous work.

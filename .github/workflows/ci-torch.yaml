@@ -43,6 +43,11 @@ jobs:
             --setenv="OMP_NUM_THREADS=$OMP_NUM_THREADS" --setenv="MKL_NUM_THREADS=$MKL_NUM_THREADS" \
             .venv/bin/python -c 'import sys; sys.path.insert(0, "tests"); from test_end_to_end import NO_EXECUTOR; assert not NO_EXECUTOR, NO_EXECUTOR; import pytest; raise SystemExit(pytest.main(sys.argv[1:]))' \
             -rs --junitxml=torch-pytest-results.xml "${files[@]}"
+      # Qwen-Image-2.1 is in Diffusers main, not 0.40; qwen-image-2 locks this commit's build.
+      - name: Qwen-Image-2.1 on Diffusers main
+        run: |
+          uv pip install --python .venv/bin/python "diffusers @ git+https://github.com/huggingface/diffusers@578c9b2c6636ab2424a0e56186268b83623656b2"
+          .venv/bin/python -m pytest -rs tests/test_qwen_image21.py
       - name: Torch test receipt
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
