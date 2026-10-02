@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from cozy_runtime.internal import package_installation, package_interface
+from cozy_runtime.internal import package_environment, package_installation, package_interface
 from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.execution_evidence import gpu_names
 from cozy_runtime.internal.executor_commands import Start
@@ -68,6 +68,8 @@ class Slot:
     executor: Executor | None = None
     #: the dead replica of these cards whose own slot this starts its successor in
     replica: str = ""
+    #: the interpreter of the installation generation the process was started from
+    python: str = ""
     #: where phase rows go; rows wait here until a root's journal takes them
     sink: Emit | None = None
     frames: list[dict[str, Json]] = field(default_factory=list)
@@ -259,9 +261,14 @@ class Prespawns:
         started, began = time.time(), time.perf_counter()
         lane = _lane(worker, slot.ordinals)
         try:
-            installed = package_installation.open_installation(
-                Path(worker.options.install_root or ""), slot.installation
+            # A Runtime update leaves the installation's SDK generation behind. Rebuild it
+            # first, so no executor starts from the old one (runs 2495, 2575, 2710).
+            installed = package_installation.refresh(
+                Path(worker.options.install_root or ""),
+                slot.installation,
+                cache=worker.config.dependency_cache,
             )
+            slot.python = str(installed.python)
             interface = package_interface.parse(raw, "prespawned installation")
             path = (
                 Path(worker.options.artifact_cache or "")
@@ -353,24 +360,52 @@ class Prespawns:
                 if key[0] == installation and slot.executor is not None
             ]
 
-    def claim(self, installation: str, ordinals: Ordinals, sink: Emit | None = None) -> Slot | None:
+    def claim(
+        self, installation: str, ordinals: Ordinals, sink: Emit | None = None, placement: str = ""
+    ) -> Slot | None:
         """The replica about to bind these cards takes the slot started for them; every other
         slot of its installation is now useless and yields. A slot started for no root sends
         its phase rows to `sink`, the claiming execution's journal. The slot stays known until
-        `settle`, so a caller arriving while the replica starts finds it and starts nothing."""
+        `settle`, so a caller arriving while the replica starts finds it and starts nothing.
+
+        Two slots yield instead of being taken, and the replica starts its own process: one
+        started from a generation of the installation that a Runtime update has since replaced,
+        and one started in another (dead) replica's own executor slot, which `placement` would
+        otherwise share with it (run 2493, `executor_replaced_before_entry`)."""
         with self.lock:
             slot = self.slots.get((installation, ordinals))
+            yields = slot is not None and (
+                bool(slot.replica and placement and slot.replica != placement)
+                or not self._current(slot)
+            )
             stale = [s for key, s in self.slots.items() if key[0] == installation and s is not slot]
-            if slot is not None:
+            if slot is not None and yields:
+                del self.slots[(installation, ordinals)]
+            elif slot is not None:
                 slot.claimed.set()
         for other in stale:
             self._drop(other)
+        if slot is not None and yields:
+            self._retire(slot)  # now: the replica's own start never meets this process
+            return None
         if slot is not None:
             if sink is not None:
                 slot.attach(sink)
             if slot.executor is not None:
                 _nice(slot.executor, _WORKER)
         return slot
+
+    def _current(self, slot: Slot) -> bool:
+        """Whether the slot's process runs its installation's current generation."""
+        if not slot.python:
+            return True  # not spawned yet: its start refreshes the installation first
+        try:
+            installed = package_installation.open_installation(
+                Path(self.worker.options.install_root or ""), slot.installation
+            )
+        except package_environment.EnvironmentRefusal:
+            return False
+        return str(installed.python) == slot.python
 
     def settle(self, slot: Slot, placement_id: str) -> None:
         """Wait out the claimed slot's imports (the replica would pay them anyway), then hand
