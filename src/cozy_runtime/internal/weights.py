@@ -3392,10 +3392,12 @@ class WeightResidency:
                     )
                     for key, cost in measured.items()
                 },
+                # A stage on its second pass is cyclic whatever its last run was (a denoise
+                # after a one-pass warm-up): placed again, it keeps a resident set.
                 cyclic={
                     key
                     for key, (row, tag, c) in opened.items()
-                    if c.last_passes != 1 or row.repeats.get(tag, 0) > 1
+                    if c.passes > 1 or c.last_passes != 1 or row.repeats.get(tag, 0) > 1
                 },
             )
 
