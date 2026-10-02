@@ -149,6 +149,13 @@ class GpuTier(Weights):  # a GPU executor's host tier, without its device
         finally:
             self.host_only = True
 
+    def hold_host(self):
+        self.host_only = False
+        try:
+            getattr(super(), "hold_host", lambda: None)()
+        finally:
+            self.host_only = True
+
 weights = GpuTier(torch, torch.device("cpu"), "cpu")
 started, models, throttled = time.monotonic(), [], False
 for index, (root, manifest) in enumerate(json.loads(sys.argv[2])):
@@ -159,9 +166,16 @@ for index, (root, manifest) in enumerate(json.loads(sys.argv[2])):
         time.sleep(0.01)
     if throttled:
         break
+pinned = plane.stats(weights.plane).host.used
+# Process memory grows afterwards (a stage's activations): the tier gives way at each pass.
+grown = []
+while not throttled and len(grown) < 20:
+    grown.append(bytearray(os.urandom(16 << 20)))
+    weights.hold_host()
+    throttled = sum(held()) >= high
 anon, shmem = held()
 print(json.dumps({"high": high, "anon": anon, "shmem": shmem, "loaded": len(models),
-                  "throttled": throttled or anon + shmem >= high,
+                  "throttled": throttled or anon + shmem >= high, "pinned_before": pinned,
                   "pinned": plane.stats(weights.plane).host.used,
                   "seconds": round(time.monotonic() - started, 2)}), flush=True)
 os._exit(0)
@@ -176,7 +190,8 @@ def test_the_pinned_tier_stays_under_the_cgroups_memory_high(tmp_path: Path) -> 
     for 11 minutes. The host budget was `memory.max - memory.current`: it never read
     `memory.high`. Here five weight sets (640 MiB) load in a cgroup whose `memory.high` is
     below them: every load completes, a prefix of the weights is pinned, the rest stays on
-    disk, and what cannot be reclaimed stays under `memory.high`."""
+    disk, and what cannot be reclaimed stays under `memory.high`, also while the process
+    then grows by 320 MiB."""
     sets = [write_checkpoint(tmp_path / str(index))[0] for index in range(5)]
     scope = ("systemd-run", "--user", "--scope", "--quiet", "--collect")
     limits = (
@@ -202,4 +217,5 @@ def test_the_pinned_tier_stays_under_the_cgroups_memory_high(tmp_path: Path) -> 
     facts = json.loads(ran.stdout.strip().splitlines()[-1])
     assert not facts["throttled"] and facts["loaded"] == len(sets), facts
     assert facts["anon"] + facts["shmem"] < facts["high"], facts
-    assert 0 < facts["pinned"] < 640 << 20, facts  # a prefix is pinned, never all of it
+    assert 0 < facts["pinned_before"] < 640 << 20, facts  # a prefix is pinned, never all
+    assert facts["pinned"] < facts["pinned_before"], facts  # and it gave way to the process

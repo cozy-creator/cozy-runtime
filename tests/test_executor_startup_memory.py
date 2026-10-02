@@ -16,10 +16,11 @@ from typing import Any
 import pytest
 
 from cozy_runtime.author._executor_requests import Handler
-from cozy_runtime.internal import accel
+from cozy_runtime.internal import accel, proctree
 from cozy_runtime.internal.executor_commands import Budget, Command, Start, Vacate
 from cozy_runtime.internal.executor_replies import PlaneFacts
 from cozy_runtime.internal.worker import child, prespawn
+from cozy_runtime.internal.worker import memory as memory_module
 from cozy_runtime.internal.worker.session import HostedPlacement, Tenant
 from cozy_runtime.protocol import worker_pb2 as pb
 from test_gpu_scheduler import VIRTUAL, Machine
@@ -273,3 +274,47 @@ def test_a_started_executor_reuses_its_context_without_evicting_idle_neighbors(
     assert machine.worker._prepare_generation(fresh) == ("", True)
     assert not calls and executor.alive()
     assert occupied == HELD and not cut(machine)
+
+
+@needs_executor
+def test_idle_tenants_give_pinned_memory_back_when_the_host_has_none_left(
+    machine: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The laptop under MemoryHigh 12 GiB (rebench, 2026-10-02): pinned tiers were only ever
+    raised, each by half of what was free at its moment, and the cgroup sat over its limit
+    with 10 GiB pinned. When the host has nothing left, an idle tenant pinning more than its
+    share of the machine's pinned total is lowered to it (its device budget untouched) and
+    the Worker's kept tiers are trimmed; a tenant in its turn is left alone."""
+    idle, _fresh, _ = contexts(machine, monkeypatch)
+    memory = machine.worker.memory
+    row = idle.row()
+    slot = next(slot for slot, _lane, found in memory.tenants() if found is row)
+    row.ledger.weights_bytes = 8 * GiB
+    held = PlaneFacts(budget_bytes=6 * GiB, pinned_budget_bytes=8 * GiB, pinned_bytes=8 * GiB)
+    row.ledger.plane = held
+    original = child.Executor.call
+    sent: list[tuple[child.Executor, Budget]] = []
+
+    def call(current: child.Executor, command: Command, **kwargs: Any) -> dict[str, object]:
+        if isinstance(command, Budget):
+            sent.append((current, command))
+        return original(current, command, **kwargs)
+
+    monkeypatch.setattr(child.Executor, "call", call)
+    trimmed: list[bool] = []
+
+    def trim() -> int:
+        trimmed.append(True)
+        return 0
+
+    monkeypatch.setattr(memory, "trim", trim)
+    # The cgroup is at its limit: nothing free, and 8 GiB of it is pinned.
+    monkeypatch.setattr(memory_module, "read_host_memory", lambda: proctree.HostMemory(0, 8 * GiB))
+    memory.active.add(slot)
+    memory.shed()
+    assert not sent and trimmed == [True], "a tenant in its turn keeps its tier"
+    memory.active.discard(slot)
+    memory.shed()
+    assert [(e is idle.supervision.current, c.vram_bytes, c.pinned_bytes) for e, c in sent] == [
+        (True, 6 * GiB, 4 * GiB)
+    ]

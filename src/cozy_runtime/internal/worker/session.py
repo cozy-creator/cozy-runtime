@@ -989,6 +989,7 @@ class Worker:
         self.memory = MemoryManager(self.lanes, self.note, self._end_tenant)
         #: every weight set's pinned host tier, kept across executors (`host_tier.py`)
         self.host_tiers = HostTiers(read_host_available)
+        self.memory.trim = self.host_tiers.trim
         self.authorizer = grants.Authorizer(roots=tuple(options.grant_roots))
         # Before any executor starts: an older executor reads the image kernel site once.
         self.machine_kernels = machine_kernels.boot(

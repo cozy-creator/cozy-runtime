@@ -134,6 +134,12 @@ def test_the_pinned_tier_takes_half_the_host_most_recently_used_first() -> None:
     split = pinned_split(4 * GiB, [("a", 8 * GiB, 0), ("b", 8 * GiB, 8 * GiB)])
     assert split == {"a": 2 * GiB, "b": 4 * GiB}
     assert pinned_split(-1, [("a", GiB, 0)]) == {"a": 0}
+    # The machine's pinned total is one sum: memory pinned outside these tenants (a tier the
+    # Worker keeps for an executor that is gone) counts in it, and leaves them less.
+    two = [("a", 8 * GiB, 5 * GiB), ("b", 8 * GiB, 0)]
+    assert pinned_split(3 * GiB, two) == {"a": 4 * GiB, "b": 0}
+    assert pinned_split(3 * GiB, two, held=9 * GiB) == {"a": 6 * GiB, "b": 0}
+    assert pinned_split(0, two, held=9 * GiB) == {"a": 4 * GiB + GiB // 2, "b": 0}
 
 
 def test_a_plane_document_is_telemetry_and_a_new_generation_forgets_it() -> None:

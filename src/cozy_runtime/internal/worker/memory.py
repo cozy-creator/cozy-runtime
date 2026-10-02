@@ -28,7 +28,7 @@ from cozy_runtime.internal.executor_replies import AttemptReply, PlaneFacts
 from cozy_runtime.internal.worker import child
 from cozy_runtime.internal.worker.child import ExecutorGone
 from cozy_runtime.internal.worker.lanes import DeviceLane, LaneRow, LaneSet
-from cozy_runtime.internal.worker.ledger import Ledger, read_host_available
+from cozy_runtime.internal.worker.ledger import Ledger, read_host_available, read_host_memory
 
 #: The executor capability that runs its weights on the plane.
 PLANE = "weight_plane/1"
@@ -159,15 +159,18 @@ def floor_bytes(layouts: Mapping[str, weight_policy.Layout], components: Collect
     return max(per.values(), default=0)
 
 
-def pinned_split(available: int, tenants: Sequence[tuple[str, int, int]]) -> dict[str, int]:
+def pinned_split(
+    available: int, tenants: Sequence[tuple[str, int, int]], held: int = -1
+) -> dict[str, int]:
     """Pinned host-tier budgets over `(tenant, weights, pinned now)`, most recently used first.
 
-    Pinned memory is unreclaimable, so the tier takes at most half of what the host has (free
-    plus what the tier already pins); the rest stays for processes and the page cache, the
-    tier's own fallback. No tenant rises by more than half of what is free now.
+    The tenants share the machine's one pinned total (`weight_policy.pinned_total`: half of
+    what the host has free plus `held`, everything pinned now; without it, what the tenants
+    pin). No tenant rises by more than half of what is free now.
     """
     free = max(available, 0)
-    left = (free + sum(max(pinned, 0) for _, _, pinned in tenants)) // 2
+    pinned = held if held >= 0 else sum(max(pinned, 0) for _, _, pinned in tenants)
+    left = weight_policy.pinned_total(free, pinned)
     split: dict[str, int] = {}
     for tenant, size, pinned in tenants:
         split[tenant] = min(max(size, 0), left, max(pinned, 0) + free // 2)
@@ -200,6 +203,8 @@ class MemoryManager:
         self.seen: dict[int, DeviceMemory] = {}
         #: tenants in their turn: never cut while alive
         self.active: set[str] = set()
+        #: releases the pinned tiers the Worker keeps beyond the host's room (`HostTiers.trim`)
+        self.trim: Callable[[], int] | None = None
 
     def tenants(self, ordinals: set[int] | None = None) -> list[tuple[str, DeviceLane, LaneRow]]:
         """Every model-bearing tenant with a device among `ordinals` (None: any), each once."""
@@ -294,13 +299,15 @@ class MemoryManager:
         keys = [key for key in contents if key in executor.loaded]
         if not keys:
             return False
+        # Idle tenants over their share give pinned memory back first: this tenant's fill
+        # then lands in room that exists, never over the host's limit.
+        self.shed(keep=tenant)
         pinned = self._pinned(tenant, first=True)
         current = row.ledger.plane.pinned_budget_bytes if row.ledger.plane else -1
         try:
             with executor.watched("prefill"):
                 # Only ever raised here: a tenant about to run keeps the tier it has (shrinking
-                # it sent SDXL's streamed blocks to disk run after run); idle tenants give
-                # theirs back when cut.
+                # it sent SDXL's streamed blocks to disk run after run).
                 if pinned >= 0 and pinned > current:
                     # no device grant: its attempt carries one when it holds the device
                     command = executor_commands.Budget(vram_bytes=-1, pinned_bytes=pinned)
@@ -320,9 +327,11 @@ class MemoryManager:
         return False
 
     def end(self, tenant: str) -> None:
-        """The turn is over. Budgets stay; its bytes stay mapped until a tenant that can use
-        them cuts it, least recently used first."""
+        """The turn is over. Device budgets stay; its bytes stay mapped until a tenant that can
+        use them cuts it, least recently used first. The pinned host tiers are held to what
+        the host has now (`shed`): process memory may have grown during the turn."""
         self.active.discard(tenant)
+        self.shed()
 
     # ------------------------------------------------------------------ today's attempt path
 
@@ -593,20 +602,61 @@ class MemoryManager:
     def _pinned(self, tenant: str, *, first: bool) -> int:
         """`tenant`'s share of the pinned host tier (`pinned_split`), most recently used first
         and `first` ahead of all; -1 when the host or its weights are unreadable."""
-        available = read_host_available()
+        return self._shares(tenant if first else "").get(tenant, -1)
+
+    def _shares(self, first: str = "") -> dict[str, int]:
+        """Every plane tenant's share of the machine's pinned total, most recently used first
+        and `first` ahead of all. Empty when the host is unreadable."""
+        memory = read_host_memory()
+        if memory.available < 0:
+            return {}
         rows = sorted(
             ((slot, row) for slot, _lane, row in self.tenants() if row.ledger.plane),
-            key=lambda item: (not (first and item[0] == tenant), -item[1].last_used),
+            key=lambda item: (item[0] != first, -item[1].last_used),
         )
         sizes = {slot: weights(row.ledger) for slot, row in rows}
         split = pinned_split(
-            available,
+            memory.available,
             [
                 (slot, sizes[slot], row.ledger.plane.pinned_bytes if row.ledger.plane else 0)
                 for slot, row in rows
             ],
+            held=memory.shmem,
         )
-        return split[tenant] if available >= 0 and sizes.get(tenant, 0) > 0 else -1
+        return {slot: share for slot, share in split.items() if sizes[slot] > 0}
+
+    def shed(self, keep: str = "") -> None:
+        """Hold the machine's pinned host tiers inside what the host has now: every idle
+        tenant pinning more than its share is lowered to it (the plane punches its least
+        recently used regions; page cache and disk stay beneath), then the tiers the Worker
+        keeps are trimmed. Before a tenant's tier is raised (`keep`), at the end of every
+        turn, and never a tenant in its turn."""
+        shares = self._shares(keep)
+        for slot, _lane, row in self.tenants():
+            executor = row.executor()
+            plane = row.ledger.plane
+            share = shares.get(slot, -1)
+            if (
+                slot == keep
+                or slot in self.active
+                or executor is None
+                or plane is None
+                or not plane_capable(executor)
+                or executor.busy()
+                or not 0 <= share < plane.pinned_budget_bytes
+            ):
+                continue
+            # its device budget stays what it is; only the pinned tier is lowered
+            command = executor_commands.Budget(vram_bytes=plane.budget_bytes, pinned_bytes=share)
+            try:
+                with executor.watched("budget"):
+                    self.observe(row, executor, executor.call(command, timeout=None))
+            except ExecutorGone:
+                continue  # its tier goes with its process
+            except Exception as exc:  # the host tier is optional: never a turn's failure
+                self.note("residency", f"{slot!r}: pinned tier not lowered: {exc}"[:400])
+        if self.trim is not None:
+            self.trim()
 
     def _lane(self, tenant: str, gpus: Sequence[int]) -> DeviceLane:
         ordinals = tuple(gpus)
