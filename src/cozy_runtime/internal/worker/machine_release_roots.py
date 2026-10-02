@@ -143,6 +143,9 @@ class ReleaseRoots:
         self.jobs: dict[tuple[str, str], _Job] = {}
         # Install facts by Hub and release, read at that catalog: immutable, read once.
         self.facts: dict[tuple[str, str], pb.DeferredInstallation] = {}
+        # Same-org index wheels, by Hub, that the Hub publishes no package for: dependencies
+        # a release carries, not callees. Read once per Runtime.
+        self.carried: set[tuple[str, str]] = set()
 
     def submit(
         self, owner: str, request: pb.MachineExecutionSubmit, context: ServicerContext
@@ -337,17 +340,25 @@ class ReleaseRoots:
             lock = self._locked(key, hub, held, own)
             for locked in machine_release_catalog.callees(package, lock):
                 callee = self._served(locked, hub)
+                if callee is None:
+                    continue
                 edges.add((key, callee))
                 pending.append(callee)
         return installed, sorted(edges)
 
-    def _served(self, locked: str, hub: str) -> str:
+    def _served(self, locked: str, hub: str) -> str | None:
         """A callee release a caller's lock names is a floor, not a pin: the newest release
         its Hub's catalog publishes at or above it serves the call, read once per package
-        until the controller that publishes names it to `forget`."""
+        until the controller that publishes names it to `forget`. None for a wheel the Hub
+        publishes no package for."""
         package, _, release = locked.partition("@")
+        if (hub, package) in self.carried:
+            return None
         try:
             served = self._newest(hub, package)
+        except machine_release_catalog.NotPublished:
+            self.carried.add((hub, package))
+            return None
         except WorkspaceRefusal:
             return locked
         return _key(package, served) if Version(served) > Version(release) else locked

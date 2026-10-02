@@ -807,6 +807,43 @@ def test_a_newer_callee_release_serves_the_callee_a_lock_names(
         catalog.close()
 
 
+def test_a_wheel_a_release_carries_is_installed_not_called(
+    published: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The tenant's lock also names a third-party wheel on its org's index (the build of a
+    pinned commit). The Hub publishes no package by that name, so it is a dependency: the
+    closure holds the one real callee, and the catalog is asked about the wheel once."""
+    machine = published
+    monkeypatch.setattr(
+        hostfacts,
+        "measure",
+        lambda *_: hostfacts.HostFacts(gpu_name="NVIDIA H100 80GB HBM3", gpu_count=4),
+    )
+    length = len(
+        tensorfs.Store.open(str(machine.store_root)).manifest(machine.manifest)["manifest"]
+    )
+    catalog = Catalog(
+        machine.manifest, length, [{"gpu": "H100", "lane": LANE}], interface=machine.interface
+    )
+    wheel = f"sha256:{'d' * 64}/diffusers-0.41.0.dev0-py3-none-any.whl"
+    carried = f"{catalog.origin}/v1/index/cozytest/files/{wheel}"
+    lock = f"/v1/packages/{PACKAGE}/releases/{RELEASE}/locked-requirements"
+    catalog.releases[lock] += f"diffusers @ {carried} --hash=sha256:{'d' * 64}\n".encode()
+    catalog.serve(machine)
+    try:
+        for request in ("carried", "again"):
+            receipt, _ = submit(machine, submission(machine, request))
+            assert receipt.request_id == request
+            capture = machine.executions.capture(OWNER, request)
+            assert [row["key"] for row in capture["deferred_installations"]] == [
+                f"{CALLEE}@{RELEASE}"
+            ]
+        asked = [urlsplit(row).path for row in catalog.reads]
+        assert asked.count("/v1/packages/cozytest/diffusers") == 1
+    finally:
+        catalog.close()
+
+
 def test_an_open_child_slot_is_resolved_by_the_machine_at_its_own_hub() -> None:
     manifest = "sha256:" + "22" * 32
     catalog = Catalog(manifest, 321, [{"gpu": "*", "lane": LANE}])
