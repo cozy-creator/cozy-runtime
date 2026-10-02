@@ -124,17 +124,22 @@ class ProcessExitObserver:
     process: ProcessIdentity
     descriptor: int
 
-    def wait(self) -> None:
+    def wait(self, seconds: float | None = None) -> bool:
+        """Whether this birth has exited: `seconds` bounds the wait, None waits for the exit."""
         # Model preparation can leave descriptors above select's FD_SETSIZE. The kernel
         # selector has no such limit and still observes exit without reaping the child.
+        deadline = None if seconds is None else time.monotonic() + seconds
         with selectors.DefaultSelector() as selector:
             selector.register(self.descriptor, selectors.EVENT_READ)
             while True:
+                remaining = None if deadline is None else max(deadline - time.monotonic(), 0)
                 try:
-                    if selector.select():
-                        return
+                    if selector.select(remaining):
+                        return True
                 except InterruptedError:
                     continue
+                if remaining == 0:
+                    return False
 
     def close(self) -> None:
         if self.descriptor < 0:
@@ -1223,6 +1228,22 @@ def reap_child(process: ProcessIdentity) -> int | None:
     except ChildProcessError:
         return None
     return status if pid else None
+
+
+def peek_child_exit(process: ProcessIdentity) -> int | None:
+    """One exact child zombie's wait status, read WITHOUT reaping: its PID stays pinned."""
+    if process_state(process) != "Z":
+        return None
+    try:
+        info = os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOWAIT | os.WNOHANG)
+    except ChildProcessError:
+        return None
+    if info is None:
+        return None
+    # wait(2)'s encoding, so this reads exactly like the status `reap_child` returns later.
+    if info.si_code == os.CLD_EXITED:
+        return info.si_status << 8
+    return info.si_status | (0x80 if info.si_code == os.CLD_DUMPED else 0)
 
 
 def progress_burn(pid: int, tid: int = 0) -> int:

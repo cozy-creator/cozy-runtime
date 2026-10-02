@@ -1,0 +1,1 @@
+An attempt whose executor dies now says how: `the executor was killed by SIGBUS during 'invoke': a read fault on mapped weights (…)`, another signal by name, or `exited with status N`, instead of `exit status None`. The status is read without reaping, so retirement still owns the reap.

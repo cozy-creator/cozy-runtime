@@ -93,6 +93,16 @@ HELLO_SECONDS = 10.0
 #: 100 GB context whose teardown takes a minute is moving the whole time and is waited for.
 RECLAIM_SAMPLE_SECONDS = 0.25
 
+#: The kernel closes a dying process's descriptors before its exit is reportable; one that
+#: closed its seam without dying is waited for this long, then reported with no cause.
+EXIT_SETTLE_SECONDS = 2.0
+
+#: The weight plane copies to the device from read-only file mappings.
+SIGBUS_MEANS = (
+    ": a read fault on mapped weights (a disk read error, or a store object changed under "
+    "its mapping)"
+)
+
 
 def work(pid: int) -> int:
     """Monotone CPU and byte work observed for one process, or -1 if unreadable."""
@@ -127,6 +137,21 @@ class ExecutorGone(Exception):
         super().__init__(detail)
         self.detail = detail
         self.status = status
+
+
+def death(status: int | None, name: object) -> str:
+    """An executor's end during `name`, from its wait status; "died" when none was readable."""
+    if status is None or status < 0:
+        return f"the executor died during {name!r}"
+    code = os.waitstatus_to_exitcode(status)
+    if code >= 0:
+        return f"the executor exited with status {code} during {name!r}"
+    try:
+        cause = signal.Signals(-code).name
+    except ValueError:
+        cause = f"signal {-code}"
+    killed = f"the executor was killed by {cause} during {name!r}"
+    return killed + SIGBUS_MEANS if code == -signal.SIGBUS else killed
 
 
 class ExecutorProtocolMismatch(ExecutorGone):
@@ -267,11 +292,7 @@ class Executor:
                 except SeamError as exc:
                     raise ExecutorGone(f"seam: {exc}") from exc
                 if frame is None:
-                    raise ExecutorGone(
-                        self.wedged
-                        or f"the executor died during {name!r} (exit status {self.exit_status})",
-                        self.exit_status,
-                    )
+                    raise self._gone(name)
                 if frame.get("event") == "progress":
                     if on_progress is not None:
                         try:
@@ -305,6 +326,21 @@ class Executor:
                 if frame.get("reply") != name:
                     raise ExecutorGone(f"out-of-order reply {frame.get('reply')!r} for {name!r}")
                 return frame
+
+    def _gone(self, name: object) -> ExecutorGone:
+        """This process's death during `name`, read without reaping: retirement owns that."""
+        if self.wedged:
+            return ExecutorGone(self.wedged, self.exit_status)
+        status: int | None = None
+        with (
+            contextlib.suppress(OSError),
+            contextlib.closing(proctree.observe_process_exit(self.process)) as exited,
+        ):
+            if exited.wait(EXIT_SETTLE_SECONDS):
+                status = proctree.peek_child_exit(self.process)
+        if status is None:
+            status = self.exit_status
+        return ExecutorGone(death(status, name), status)
 
     def _cells(self, handler: Handler | None) -> Handler | None:
         """Keep this executor's budget cell; every other request goes to `handler`."""
