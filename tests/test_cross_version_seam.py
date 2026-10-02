@@ -18,6 +18,7 @@ the cached installation linked in, and prepares it through its ordinary reuse pa
 from __future__ import annotations
 
 import base64
+import contextlib
 import datetime
 import hashlib
 import json
@@ -30,7 +31,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -293,6 +294,8 @@ class Harness:
     prepared: pb.PreparePackageSetResult
     capture: bytes
     capture_digest: bytes
+    #: what the Host sends with every submission of this package
+    preparation: pb.PrepareLocalPackageRequest
 
     def settle(self, request_id: str) -> dict[str, object]:
         """The succeeded result. A hang is stillness, never elapsed time."""
@@ -420,14 +423,32 @@ class Harness:
 def harness(request: pytest.FixtureRequest) -> Iterator[Harness]:
     locked, requirement = request.param
     installation, wheel, lock, version = _installation(locked, requirement)
+
+    def link(install_root: Path) -> None:
+        (install_root / "installations" / installation).symlink_to(
+            CACHE / "installs" / "installations" / installation
+        )
+
+    with _session(installation, wheel, lock, version, requirement, link) as serving:
+        yield serving
+
+
+@contextlib.contextmanager
+def _session(
+    installation: str,
+    wheel: Path,
+    lock: bytes,
+    version: str,
+    requirement: str,
+    place: Callable[[Path], None],
+) -> Iterator[Harness]:
+    """One worker serving `installation`, which `place` puts into its install root."""
     # Short: the executors' control sockets live under it and `sun_path` holds 108 bytes.
     with tempfile.TemporaryDirectory(prefix="cz-seam.") as raw:
         root = Path(raw)
         install_root = root / "installs"
         (install_root / "installations").mkdir(parents=True)
-        (install_root / "installations" / installation).symlink_to(
-            CACHE / "installs" / "installations" / installation
-        )
+        place(install_root)
         staged = install_root / ".stage" / installation / "wheels"
         staged.mkdir(parents=True)
         shutil.copyfile(wheel, staged / wheel.name)
@@ -461,15 +482,14 @@ def harness(request: pytest.FixtureRequest) -> Iterator[Harness]:
         thread = threading.Thread(target=worker.run, daemon=True)
         channel: grpc.Channel | None = None
         try:
-            prepared = worker.prepare_local_package(
-                pb.PrepareLocalPackageRequest(
-                    operation_id=installation,
-                    package=_development(PACKAGE, RELEASE, installation),
-                    files=_wheel_rows([staged / wheel.name]),
-                    dependency_requirements=lock,
-                    install_root=str(install_root),
-                )
+            preparation = pb.PrepareLocalPackageRequest(
+                operation_id=installation,
+                package=_development(PACKAGE, RELEASE, installation),
+                files=_wheel_rows([staged / wheel.name]),
+                dependency_requirements=lock,
+                install_root=str(install_root),
             )
+            prepared = worker.prepare_local_package(preparation)
             capture, capture_digest = documents.identity(
                 pb.MachineExecutionCapture(
                     root_installation_id=installation,
@@ -506,6 +526,7 @@ def harness(request: pytest.FixtureRequest) -> Iterator[Harness]:
                 prepared,
                 capture,
                 capture_digest,
+                preparation,
             )
         finally:
             if channel is not None:
@@ -575,3 +596,38 @@ def test_an_exact_pin_keeps_its_runtime_and_a_bound_runs_the_machines(harness: H
         assert harness.version == harness.requirement.removeprefix("==")
         return
     assert Version(harness.version) > Version("0.18.67")
+
+
+def test_a_runtime_update_retires_the_warm_executor_and_the_next_run_reports_the_new_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Runs 2575 and 2710: after `cozy rental update --runtime-wheel`, a request was served by
+    an executor of the Runtime the machine ran before. Here the machine ran 0.18.67 when the
+    package was installed and its executor is warm. The machine is updated; the next
+    submission's preparation rebuilds the installation's SDK generation, and that run is
+    served by an executor of the new generation, never by the warm one. Nothing is refused."""
+    old = "0.18.67"
+    lock, wheel = _lock(old), _wheel(f">={old}")
+
+    def install(install_root: Path) -> None:
+        monkeypatch.setattr(package_installation, "machine_sdk", lambda: {"cozy-runtime": old})
+        package_installation.install(
+            install_root,
+            package=PACKAGE,
+            release=RELEASE,
+            python=PYTHON,
+            installation_id="updated",
+            requirements=lock,
+            wheels=(wheel,),
+        )
+
+    with _session("updated", wheel, lock, old, f">={old}", install) as serving:
+        assert serving.serve("before", "double", {"n": 2}) == {"value": 4, "runtime": old}
+        record = serving.root / "installs" / "installations" / "updated" / "installation.json"
+        before = json.loads(record.read_text())["python"]
+        monkeypatch.undo()  # the Runtime update: this machine now runs another SDK
+        serving.prepared = serving.worker.prepare_local_package(serving.preparation)
+        rebuilt = json.loads(record.read_text())
+        assert rebuilt["python"] != before and rebuilt["sdk"]["cozy-runtime"] != old
+        after = serving.serve("after", "double", {"n": 3})
+        assert after == {"value": 6, "runtime": rebuilt["sdk"]["cozy-runtime"]}

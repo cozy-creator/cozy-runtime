@@ -769,6 +769,16 @@ def _slot(slot: pb.Slot, known: set[str]) -> str:
     return _identifier(slot.slot, "Slot.slot")
 
 
+#: why an executor of a replaced installation generation is ended
+REPLACED = "its installation's generation was replaced"
+
+
+def _replaced(supervision: ExecutorSupervision, executor: child.Executor) -> bool:
+    """Whether `executor` was started from another interpreter than its slot names now: a
+    generation of its installation that a Runtime update has since replaced."""
+    return executor.launch_python != supervision.python
+
+
 def _demand(attempt: AttemptRecord) -> str:
     """The stage scheduler's name for an attempt's GPU call."""
     return f"{attempt.request_id}#{attempt.attempt}"
@@ -2889,7 +2899,9 @@ class Worker:
         placement = self._placement_by_id(placement_id)
         if executor is not None and lane is not None and placement is not None:
             # Its successor may already be importing, started while this root waited.
-            warm = self.prespawns.claim(placement.installation_id, placement.device_pin or ())
+            warm = self.prespawns.claim(
+                placement.installation_id, placement.device_pin or (), placement=placement_id
+            )
             if warm is not None:
                 self.prespawns.settle(warm, placement_id)
             self._rebuild_lane(lane, placement_id, executor, granted=True)
@@ -3196,7 +3208,9 @@ class Worker:
         placement.device_pin = pin
         # The process imported ahead of this grant (`prespawn`), when there is one.
         journal = functools.partial(self._journal_row, request_id, attempt)
-        warm = self.prespawns.claim(placement.installation_id, pin or (), journal)
+        warm = self.prespawns.claim(
+            placement.installation_id, pin or (), journal, placement.placement_id
+        )
         supervision = (
             warm.supervision
             if warm is not None
@@ -5151,6 +5165,7 @@ class Worker:
         )
         if fresh:
             hosted.failed_bindings.clear()
+        self._name_generation(hosted)
         latch, _reused = self._prepare_generation(self._tenant(placement.placement_id))
         if latch:
             hosted.latched = latch
@@ -5747,6 +5762,7 @@ class Worker:
             and not executor.poisoned
             and not executor.reserved_for_job
             and executor.sealed_devices == tenant.lane.devices
+            and not _replaced(tenant.supervision, executor)
         ):
             executor.ready_bindings = set(wanted)
             self._load_weightless(tenant, executor)
@@ -5808,22 +5824,22 @@ class Worker:
                 and not executor.poisoned
                 and not executor.reserved_for_job
                 and executor.sealed_devices == lane.devices
+                and not _replaced(tenant.supervision, executor)
             ):
                 self.note(
                     "boot",
                     f"{placement_id!r}: starting epoch {executor.epoch} pid {executor.pid}",
                 )
             else:
-                self.note(
-                    "boot",
-                    f"{placement_id!r}: replacing the device executor "
-                    f"({executor.poisoned or 'sealed to other devices or exited'})"[:256],
+                why = (
+                    executor.poisoned
+                    or (_replaced(tenant.supervision, executor) and REPLACED)
+                    or "sealed to other devices or exited"
                 )
+                self.note("boot", f"{placement_id!r}: replacing the device executor ({why})"[:256])
                 with self._seat(lane, placement_id):
                     executor = tenant.supervision.replace(
-                        executor,
-                        imposed=self.imposed(lane),
-                        why=executor.poisoned or "executor seal or process changed",
+                        executor, imposed=self.imposed(lane), why=why
                     )
             self.note(
                 "boot",
@@ -6877,6 +6893,7 @@ class Worker:
                 self._prefill(attempt)
             with self._seat(lane, attempt.placement_id):
                 self._wake_on_cancel(attempt)
+                self._follow_generation(lane, attempt.placement_id)
                 attempt.stage_turns = self._turns_for(attempt)
                 if not attempt.stage_turns:
                     self._whole_turn(attempt, lane)
@@ -6909,6 +6926,41 @@ class Worker:
         if released is not None:
             with lane.posting:
                 self.finish(released)
+
+    def _follow_generation(self, lane: DeviceLane, placement_id: str) -> None:
+        """Before an attempt enters a replica's executor (the caller holds its seat): a warm
+        process started from a generation of its installation that a Runtime update has since
+        replaced never serves it. It is retired and one starts from the current generation;
+        the attempt waits for that start, and nothing is refused (runs 2575, 2710)."""
+        with self.control_lock:
+            hosted = self.hosted.get(placement_id)
+            executor = hosted.supervision.current if hosted is not None else None
+            if hosted is None or executor is None:
+                return
+            self._name_generation(hosted)
+            if not _replaced(hosted.supervision, executor):
+                return
+        self.note(
+            "boot",
+            f"{placement_id!r}: epoch {executor.epoch} pid {executor.pid} runs cozy-runtime "
+            f"{executor.hello.get('runtime_version')} from a generation of its installation "
+            "that was replaced; starting one from the current generation",
+        )
+        self._rebuild_lane(lane, placement_id)
+
+    def _name_generation(self, hosted: HostedPlacement) -> None:
+        """Point a replica's executor slot at its installation's current generation, as its
+        record names it now: what its next process starts from."""
+        root = self.options.install_root
+        if root is None:
+            return
+        try:
+            installed = package_installation.open_installation(
+                root, hosted.placement.installation_id
+            )
+        except package_environment.EnvironmentRefusal:
+            return  # collected under it: device entry says so
+        hosted.supervision.use_environment(str(installed.python), installed.installation_id)
 
     def _seat(self, lane: DeviceLane, placement_id: str) -> threading.RLock:
         """The tenant's executor, one user at a time: an attempt from entry to its rebuild,
@@ -7490,7 +7542,12 @@ class Worker:
             hosted = self.hosted.get(placement_id)
             if hosted is not None:
                 current = hosted.supervision.current
-                rebuild = current is None or not current.alive() or bool(current.poisoned)
+                rebuild = (
+                    current is None
+                    or not current.alive()
+                    or bool(current.poisoned)
+                    or _replaced(hosted.supervision, current)
+                )
             else:
                 current = self.supervision.current
                 rebuild = current is None or not current.alive() or bool(current.poisoned)

@@ -938,7 +938,50 @@ def test_a_dead_replica_starts_its_successor_while_its_root_waits(
     assert executor is not None and executor.alive() and not executor.started
     failed = [e.step for e in list(machine.worker.activity)[notes:] if "no prespawn" in e.step]
     assert failed == [], failed
-    assert machine.worker.prespawns.claim(INSTALLATION, (0,)) is slot
+    # Run 2493: another placement sharing this slot would share the dead replica's executor
+    # between two rows. Its claim takes nothing; the dead replica's own claim takes it.
+    prespawns = machine.worker.prespawns
+    assert slot.replica == "machine-dead"
+    assert prespawns.claim(INSTALLATION, (0,), placement="machine-dead") is slot
+    slot.claimed.clear()
+    assert prespawns.claim(INSTALLATION, (0,), placement="machine-other") is None
+    assert supervision.current is None and not executor.alive() and prespawns.slots == {}
+
+
+def test_a_prespawn_of_a_replaced_generation_yields_at_its_claim(
+    warm: Callable[..., Warm],
+) -> None:
+    """Runs 2495, 2575, 2710: a Runtime update rebuilds an installation's SDK as a new
+    generation. A process prespawned from the old one (the boot prewarm, before the first
+    preparation refreshed it) is never adopted: at the claim it yields, and the replica
+    starts its own from the current generation. A later prespawn starts from that one."""
+    machine = warm()
+    prespawns = machine.worker.prespawns
+    root = machine.worker.options.install_root
+    assert root is not None
+
+    def ask() -> prespawn.Slot:
+        prespawns.request_landing(INSTALLATION, _interface(), [{"path": "marco.models.model"}])
+        (slot,) = prespawns.slots.values()
+        assert slot.started.wait(300) and slot.ready, slot.frames
+        return slot
+
+    stale = ask()
+    old = stale.executor
+    assert old is not None and old.alive()
+    # What `package_installation.refresh` leaves after a Runtime update: the record names a
+    # new generation; the old one's files stay for the processes still running from it.
+    _install(root, "generation")
+    record = root / "installations" / INSTALLATION / "installation.json"
+    current = root / "installations" / "generation" / "venv" / "bin" / "python"
+    record.write_text(json.dumps({**json.loads(record.read_text()), "python": str(current)}))
+
+    assert prespawns.claim(INSTALLATION, (0,)) is None, "never adopted"
+    assert not old.alive(), "the old generation's process yields at the claim"
+    fresh = ask()
+    assert fresh is not stale and fresh.executor is not None
+    assert fresh.executor.launch_python == str(current) != old.launch_python
+    assert prespawns.claim(INSTALLATION, (0,)) is fresh
 
 
 def test_an_executor_before_import_only_starts_is_only_spawned(
