@@ -4231,7 +4231,7 @@ _FOLLOWER_COMMANDS = frozenset(
 )
 
 
-def answer(executor: Executor, frame: Mapping[str, Any]) -> dict[str, Any] | None:
+def answer(executor: Executor, frame: dict[str, Any]) -> dict[str, Any] | None:
     """One command's reply as this GPU's process answers it; None is `shutdown`."""
     name = str(frame.get("cmd", ""))
     if executor.rank > 0 and name not in _FOLLOWER_COMMANDS:
