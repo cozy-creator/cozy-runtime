@@ -116,6 +116,16 @@ CHILD_ENV_ALLOWLIST: tuple[ProjectedVar, ...] = (
         "executor's process on every GPU refuses to form a communicator under any other value",
     ),
     ProjectedVar(
+        "NCCL_P2P_LEVEL",
+        "worker.device_lane",
+        "FORCED to NVL in a GROUP lane's seal: NCCL's GPU-to-GPU peer memory is used only "
+        "between GPUs joined by NVLink. Over PCI (two A40s, torch 2.14 / NCCL 2.30.7) the "
+        "communicator hung at formation 4 times in 10, both GPUs spinning in the first "
+        "barrier (runs 2852, 2909); with peer memory off those GPUs exchange through host "
+        "shared memory (measured: all_reduce -10%, all_to_all -28% in raw transfer rate) and "
+        "every formation completes. Erased then imposed, like the NVLS row",
+    ),
+    ProjectedVar(
         "PYTORCH_CUDA_ALLOC_CONF",
         "plan.allocator_policy",
         "the CUDA caching allocator reads this once at init; late imposition is a no-op",

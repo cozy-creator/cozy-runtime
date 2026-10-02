@@ -595,11 +595,15 @@ def test_an_executor_sealed_to_two_ordinals_and_its_reclaim_over_both(
         group = worker.lanes.group((0, 1))
         assert worker.imposed(group)["CUDA_VISIBLE_DEVICES"] == "64,65"
         assert worker.imposed(group)["NCCL_NVLS_ENABLE"] == "0"
+        # Run 2852: over PCI the group's communicator hung at formation; peer memory is
+        # NVLink's only, by the seal.
+        assert worker.imposed(group)["NCCL_P2P_LEVEL"] == "NVL"
         # the wide envelope lane a job takes IS a group lane (K = the envelope), so its
         # seal carries the row too; a ONE-device lane's seal is exactly what it was
         assert worker.imposed(worker.lanes.envelope)["NCCL_NVLS_ENABLE"] == "0"
         single = lanes.DeviceLane("lane-0", (0,), "64", worker_pid=os.getpid())
         assert "NCCL_NVLS_ENABLE" not in worker.imposed(single)
+        assert "NCCL_P2P_LEVEL" not in worker.imposed(single)
         assert worker.imposed(single)["CUDA_VISIBLE_DEVICES"] == "64"
         executor = worker.supervision.spawn(imposed=worker.imposed(group))
         try:
@@ -607,6 +611,7 @@ def test_an_executor_sealed_to_two_ordinals_and_its_reclaim_over_both(
             rows = dict(row.split(b"=", 1) for row in environ if b"=" in row)
             assert rows[b"CUDA_VISIBLE_DEVICES"] == b"64,65", rows
             assert rows[b"NCCL_NVLS_ENABLE"] == b"0", rows
+            assert rows[b"NCCL_P2P_LEVEL"] == b"NVL", rows
             assert executor.hello["sealed"]["CUDA_VISIBLE_DEVICES"] == "64,65"
             assert executor.hello["rank"] == 0 and executor.hello["world"] == 1
             assert worker.supervision.devices == ("64", "65")
