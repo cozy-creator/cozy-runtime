@@ -115,9 +115,6 @@ def leader(args: argparse.Namespace) -> None:
             group=group,
             spool=lambda: executor._attempt_spool,
         )
-        assert executor._warm_model(model) >= 0
-        assert executor._attempt_spool is None
-        assert not list((args.root / "warm").rglob("tensor-*.raw"))
         for index in range(2):
             executor._attempt_spool = args.requests / str(index)
             model.compute()

@@ -539,7 +539,7 @@ class Weights:
         if row.state == "present":
             reserved = accel.allocation(self.torch, self.kind)["reserved_bytes"]
             mapped = max(plane.stats(self.plane).device(self.index).committed, 0)
-            self.context_bytes = max(row.bytes - reserved - mapped, 0)
+            self.context_bytes = max(row.bytes - reserved - mapped, self.context_bytes, 0)
 
     def resident_bytes(self, component: Component) -> int:
         return plane.stats(self.plane).ready(component.key, self.index)
