@@ -285,10 +285,11 @@ def test_a_device_start_waits_for_room_until_the_call_in_flight_is_past_its_stag
 def test_a_load_short_of_device_memory_beside_a_call_in_flight_is_loaded_again(
     machine: Machine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Run 2609: Anima's load ran out of device memory beside a running SDXL and its request
-    was refused without ever starting. For an attempt that takes stage turns such a shortfall
-    is the room the call in flight holds: the worker waits until that call is past its stages
-    and loads again; the request is refused only when nobody was in flight to wait for."""
+    """Runs 2609 and 2628: Anima's first load ran out of device memory, beside a running SDXL
+    or alone, and its request was refused without ever starting. Nothing of it had run, so
+    the worker loads again: once the call in flight is past its stages, or when the shortfall
+    is one it had not met (its executor measured what it lacked). The same shortfall twice
+    with nobody beside it is the request's own."""
     worker = machine.worker
     worker.stages.open_root("X", 1)
     worker.stages.want("X#1", Want(root="X", template=("inst-x", "b"), entrypoint="generate"))
@@ -319,10 +320,25 @@ def test_a_load_short_of_device_memory_beside_a_call_in_flight_is_loaded_again(
     worker.stages.release("X#1")
     loading.join(30)
     assert loads == [True, False], "loaded again once X was past"
-    # Alone on the GPU the same shortfall is the request's own: refused, with its reason.
-    loads.clear()
-    with pytest.raises(AttemptRefusal, match="CUDA out of memory"):
+    # Alone on the GPU: a new shortfall is tried again (the executor measured what it
+    # lacked); the same one twice is the request's own, refused with its reason.
+    shortfalls = iter(["the decode ran out of memory", "a block ran out of memory"])
+    tries: list[str] = []
+
+    def short(_attempt: AttemptRecord) -> None:
+        tries.append(next(shortfalls, "a block ran out of memory"))
+        raise AttemptRefusal(
+            "device_shortfall", tries[-1], cause=pb.CAUSE_CODE_CONSTRAINT_INFEASIBLE
+        )
+
+    monkeypatch.setattr(worker, "_ensure_once", short)
+    with pytest.raises(AttemptRefusal, match="a block ran out of memory"):
         worker._ensure_construction(attempt)
+    assert tries == [
+        "the decode ran out of memory",
+        "a block ran out of memory",
+        "a block ran out of memory",
+    ]
 
 
 def test_a_scope_waiting_for_its_turn_is_not_counted_as_execution(

@@ -5965,30 +5965,37 @@ class Worker:
     def _ensure_construction(self, attempt: AttemptRecord) -> None:
         """LOAD the attempt's construction if its process has not built it, then ACTIVATE it.
 
-        A turn-taking attempt loads beside whoever holds the GPU. A device shortfall there is
-        the room a call in flight holds, not this request's verdict: once that call is past
-        its stages the load runs again, in a fresh process when the refusal took the old one.
+        A turn-taking attempt loads beside whoever holds the GPU, and nothing of it has run, so
+        a device shortfall there is not yet this request's verdict. It loads again once a call
+        in flight beside it is past its stages, or when the shortfall changed since the last
+        try: the executor measured what it lacked (a first load's activations) and plans with
+        it. The same shortfall twice with nobody beside it is the request's own.
         """
+        last = ""
         while True:
             try:
                 return self._ensure_once(attempt)
             except AttemptRefusal as exc:
                 lane = self.lanes.by_id.get(attempt.lane_id)
-                if (
-                    exc.code not in DEVICE_SHORTFALL_CODES
-                    or not attempt.stage_turns
-                    or lane is None
-                    or not self.stages.await_clear(
-                        lane.ordinals,
-                        self._template(attempt.placement_id),
-                        lambda: bool(attempt.canceling) or self.stop.is_set(),
-                    )
-                ):
+                if exc.code not in DEVICE_SHORTFALL_CODES or not attempt.stage_turns or not lane:
                     raise
+                waited = self.stages.await_clear(
+                    lane.ordinals,
+                    self._template(attempt.placement_id),
+                    lambda: bool(attempt.canceling) or self.stop.is_set(),
+                )
+                if attempt.canceling or self.stop.is_set() or (not waited and exc.detail == last):
+                    raise
+                last = exc.detail
                 self.note(
                     "attempt",
                     f"{attempt.request_id}#{attempt.attempt} load was short of device memory "
-                    "beside a call in flight; that call is past its stages, loading again",
+                    + (
+                        "beside a call in flight; that call is past its stages"
+                        if waited
+                        else "for a reason it had not met before"
+                    )
+                    + ", loading again",
                 )
                 self._rebuild_lane(lane, attempt.placement_id)
 
