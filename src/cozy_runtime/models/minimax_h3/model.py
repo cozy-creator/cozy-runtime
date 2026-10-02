@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import sys
 import math
 import time
 from collections.abc import Callable, Sequence
@@ -12,7 +11,6 @@ from typing import Any, Literal
 from cozy_runtime.author import (
     AdapterCompatibility,
     AttentionContext,
-    Context,
     DerivedCache,
     Loader,
     Model,
@@ -116,39 +114,8 @@ class H3Model(Model[OfficialH3Pipeline], encoded_leaves="accept", fusion="accept
     def choose_attention(self, context: AttentionContext) -> tuple[str, ...] | None:
         return DIT_ATTENTION if context.component in DIT_COMPONENTS else None
 
-    def warm(self, ctx: Context) -> None:
-        """One dry DiT forward per entrypoint DiT this device ADMITS, before serving.
-
-        Both DiTs are offered, because one construction carries both entrypoints and a
-        switch between them must not pay a first call either (h3a-018). The runtime has
-        already applied the fused glue and loaded its cubins for this device by the time
-        `warm` runs (h3a-015, `fusion="accept"` above); the dry forward is what pays their
-        first launches, the rotary tables and the projections' first GEMM plans.
-
-        Offered, not required. Warm uses the same staged component-use admission as a
-        request: unrelated completed components are evicted before each DiT runs. A
-        parked DiT can therefore warm if its own scope fits. A measured device_shortfall
-        remains optional and is recorded and skipped; it is not a requirement to fit
-        both DiTs simultaneously. Later requests select their own placement rung from
-        the actual post-warm resident set. Warming a parked DiT may add checkpoint I/O.
-        """
-        warmers: dict[Task, Callable[[], None]] = {
-            "fl2va": self.warm_fl2va,
-            "ref2va": self.warm_ref2va,
-        }
-        for warm_one in warmers.values():
-            ctx.raise_if_cancelled()
-            try:
-                warm_one()
-            except Exception as exc:
-                if getattr(exc, "code", "") != "device_shortfall":
-                    raise
-                print(
-                    f"[minimax-h3] {warm_one.__name__} not applied: {exc}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-
+    # Published interfaces (paul/minimax-h3) name these two scopes in `component_use`; they
+    # stay until that package is republished. The runtime no longer calls `Model.warm`.
     @uses_components("fl2va_dit")
     def warm_fl2va(self) -> None:
         self.pipe.warm_dit("fl2va")

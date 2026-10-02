@@ -397,6 +397,9 @@ class _CompositeResidency:
         }
 
 
+#: Model classes that still define `warm` (packages built for an older Runtime), noted once each.
+_WARM_NOTED: set[type] = set()
+
 #: The runtime modules a construction imports, named ONCE so `start` can warm
 #: exactly the set `_prepare_first` re-imports (cr-104). Warming a name this tuple omits
 #: is a missed saving and never a wrong answer: the prepare imports what it needs either
@@ -411,7 +414,6 @@ _CONSTRUCTION_MODULES = (
     "cozy_runtime.internal.fill",
     "cozy_runtime.internal.fusion",
     "cozy_runtime.internal.planfacts",
-    "cozy_runtime.internal.warm",
     "cozy_runtime.internal.probe",
     "cozy_runtime.internal.weights",
     "cozy_runtime.internal.resolution",
@@ -1864,6 +1866,14 @@ class Executor:
         stage("qualify")
         objective = binding.objective or "latency"
         model_cls = getattr(self.discovered.module, binding.model_class)
+        if callable(getattr(model_cls, "warm", None)) and model_cls not in _WARM_NOTED:
+            _WARM_NOTED.add(model_cls)
+            print(
+                f"[executor] {model_cls.__qualname__}.warm is not called: the call that waits "
+                "on a load pays its own first launches",
+                file=sys.stderr,
+                flush=True,
+            )
         config_checkpoint = next(
             (
                 checkpoint

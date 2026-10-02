@@ -119,9 +119,7 @@ def derive_seed(request_id: str) -> int:
 class Context:
     """The execution surface: where and under what conditions this code runs.
 
-    Injected into a handler when its signature names it, and handed to `Model.warm` by
-    the runtime. Under `warm` there is no attempt: `request_id` is empty, the adapter
-    stack is empty, and no package-call broker is bound (model-lifecycle.md, cr-110).
+    Injected into a handler when its signature names it.
     """
 
     request_id: str

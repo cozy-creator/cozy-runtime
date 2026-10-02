@@ -14,50 +14,44 @@ import pytest
 from cozy_runtime.internal import prepare_diagnostics as diagnostics
 
 
-def test_real_chained_warm_retains_causal_frames_without_values() -> None:
+def test_real_chained_failure_retains_causal_frames_without_values() -> None:
     if importlib.util.find_spec("torch") is None:
-        pytest.skip("the real warm boundary requires Torch")
-    # The warm/derive boundary belongs to an executor, not the test runner that
+        pytest.skip("the executor boundary requires Torch")
+    # The executor boundary belongs to an executor, not the test runner that
     # also proves worker metadata preparation never imports derive.
     script = """
 import json, socket
-from cozy_runtime.author import Context, Model
-from cozy_runtime.author._context import Device
 from cozy_runtime.internal import prepare_diagnostics as diagnostics
 from cozy_runtime.internal.executor import _send_reply
 from cozy_runtime.internal.seam import Channel
-from cozy_runtime.internal.warm import WarmFailed, warm_generation
 
-class ChainedWarm(Model[None]):
-    def warm(self, ctx: Context) -> None:
-        ctx.raise_if_cancelled()
-        try:
-            self.collective()
-        except OSError as exc:
-            raise RuntimeError("collective failed") from exc
+def collective() -> None:
+    secret = "not-for-diagnostics"
+    exc = OSError(secret)
+    exc.add_note("private diagnostic note")
+    raise exc
 
-    @staticmethod
-    def collective() -> None:
-        secret = "not-for-diagnostics"
-        exc = OSError(secret)
-        exc.add_note("private diagnostic note")
-        raise exc
+def prepare() -> None:
+    try:
+        collective()
+    except OSError as exc:
+        raise RuntimeError("collective failed") from exc
 
 try:
-    warm_generation(ChainedWarm(), device=Device("cpu"), cancel=lambda: False)
-except WarmFailed as exc:
+    prepare()
+except RuntimeError as exc:
     trace = diagnostics.exception_trace(exc)
     detail = str(exc)
 else:
-    raise AssertionError("the warm must fail")
+    raise AssertionError("the prepare must fail")
 left, right = socket.socketpair()
 with left, right:
     _send_reply(Channel(left), {
-        "reply": "load", "ok": False, "code": "warm_failed", "detail": detail,
+        "reply": "load", "ok": False, "code": "prepare_failed", "detail": detail,
         "traceback": trace, "envelope": "x" * 100000,
     })
     reply = Channel(right).recv(timeout=2)
-assert reply is not None and reply["code"] == "warm_failed"
+assert reply is not None and reply["code"] == "prepare_failed"
 print(json.dumps(reply))
 """
     result = subprocess.run(
@@ -65,8 +59,8 @@ print(json.dumps(reply))
     )
     reply = json.loads(result.stdout)
     retained = "\n".join(diagnostics.activity_lines(reply["traceback"]))
-    assert retained.index("OSError") < retained.index("RuntimeError") < retained.index("WarmFailed")
-    assert "in collective" in retained and "in warm_generation" in retained
+    assert retained.index("OSError") < retained.index("RuntimeError")
+    assert "in collective" in retained and "in prepare" in retained
     assert "<string>:" in retained
     assert "not-for-diagnostics" not in retained
     assert "private diagnostic note" not in retained

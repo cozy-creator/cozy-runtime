@@ -714,8 +714,7 @@ class Ledger:
         them for the life of the PROCESS, not the attempt. That is a baseline SHIFT, not a
         leak: the ledger records it with its size, re-baselines, and holds every later attempt
         to the new line — where a genuine per-attempt leak would keep growing and be caught on
-        attempt two. An author's `Model.warm` that launches kernels pays it inside the
-        prepare, before this baseline is read (cr-110).
+        attempt two.
 
         THE DECLARED RESIDENCY TRANSITION (cl-003's second-1024px defect). Under a staged
         rung the attempt evicts and stages components ON PURPOSE, so `device_allocated`

@@ -15,8 +15,7 @@ the executor feeds it.
 
 `invoke_with_fakes()` runs a registered handler through the REAL kernel with fakes standing
 in for the runtime's side of the contract: same decode, same overlay, same preflight, same
-injection, same return validation, same output transaction. `warm_with_fakes()` runs a
-`for_test` model's `warm` under the Context the executor builds for it (cr-110).
+injection, same return validation, same output transaction.
 
 `StagedBackend`/`ResidentBackend` are the weightless fill doubles a `Model` constructs
 against with no store and no device.
@@ -39,7 +38,7 @@ from cozy_runtime.author._defaults import Clamp, Recipe
 from cozy_runtime.author._errors import CapabilityError
 from cozy_runtime.author._invoke import Invocation, InvocationResult, invoke, prepare
 from cozy_runtime.author._loader import Census, TensorLike, TensorSpec
-from cozy_runtime.author._model import Model, warm_context
+from cozy_runtime.author._model import Model
 from cozy_runtime.author._observations import Observation
 from cozy_runtime.author._services import (
     MAX_OUTPUT_BYTES,
@@ -129,26 +128,6 @@ def fake_context(
 ) -> Context:
     """A real `Context` for a handler: the attempt's id, deadline, device and cancellation."""
     return Context(request_id, time.monotonic() + seconds, device or Device(), lambda: cancelled)
-
-
-def warm_with_fakes(
-    model: Model[Any],
-    *,
-    device: Device | None = None,
-    seconds: float = 300.0,
-    cancelled: bool = False,
-) -> Context:
-    """Run a `for_test` model's `warm` under the Context the executor hands it, and return
-    that Context. Same constructor as the executor's (`warm_context`): no request id, no
-    adapters, no package-call broker — an invocable called inside refuses
-    `child_broker_absent`. The harness records every component-use scope the warm body
-    opens, exactly as it records a handler's. What no fake supplies is torch, so the
-    `torch.compile(module)` refusal is the executor's alone (`internal/warm.py`)."""
-    ctx = warm_context(
-        device or Device(), deadline=time.monotonic() + seconds, cancel=lambda: cancelled
-    )
-    model.warm(ctx)
-    return ctx
 
 
 class OutputsRecorder(Outputs):

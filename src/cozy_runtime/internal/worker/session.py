@@ -5189,7 +5189,7 @@ class Worker:
 
         The serving edge is the hosted placement's own; the worker-level latch is not
         touched — a hosted placement that cannot prepare latches itself and the others keep
-        serving. The author's `Model.warm` ran inside its prepare, as for every placement.
+        serving.
         """
         placement = hosted.placement
         self._hosted_set_serving(
@@ -6153,7 +6153,7 @@ class Worker:
         turns = attempt is not None and attempt.stage_turns
         if not first.weightless and not turns:
             # Idle tenants of every device give room for the weights first: an executor before
-            # the plane fills them onto the device, and a plane executor's `Model.warm` stages
+            # the plane fills them onto the device, and a plane executor's first stage maps
             # them. A plane tenant gives room by a budget cut, so its bytes stay pinned.
             # Bindings of one construction share its weights, so they are counted once.
             declared = max(binding.logical_weight_bytes for binding in group)
@@ -6519,11 +6519,7 @@ class Worker:
         )
 
     def _finish_activation(self) -> None:
-        """Publish the activation edge, or its typed failure when the executor was lost.
-
-        No entrypoint-level warm pass runs here any more (cr-110): the author's `Model.warm`
-        ran INSIDE the prepare, on every worker, before the executor reported Ready.
-        """
+        """Publish the activation edge, or its typed failure when the executor was lost."""
         executor = self.supervision.current
         if executor is None or not self.supervision.owns(executor):
             self.latched = self.latched or "executor_lost_during_activation"

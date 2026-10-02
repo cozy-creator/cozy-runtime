@@ -15,9 +15,9 @@ from cozy_runtime.internal.worker.child import ExecutorSupervision
 
 @pytest.mark.skipif(os.geteuid() != 0, reason="requires root to launch the pod executor UID")
 @pytest.mark.parametrize("degree", [2, 4])
-def test_warm_then_two_requests_under_pod_executor_uid(degree: int) -> None:
+def test_two_requests_under_pod_executor_uid(degree: int) -> None:
     pytest.importorskip("torch")
-    with tempfile.TemporaryDirectory(prefix="cozy-warm-uid-") as directory:
+    with tempfile.TemporaryDirectory(prefix="cozy-uid-") as directory:
         root = Path(directory)
         root.chmod(0o755)
         worker = root / "worker"
@@ -39,7 +39,7 @@ def test_warm_then_two_requests_under_pod_executor_uid(degree: int) -> None:
             result = subprocess.run(
                 [
                     sys.executable,
-                    str(Path(__file__).parent / "testdata" / "warm_isolation.py"),
+                    str(Path(__file__).parent / "testdata" / "uid_isolation.py"),
                     "--root",
                     str(worker),
                     "--requests",
@@ -57,7 +57,8 @@ def test_warm_then_two_requests_under_pod_executor_uid(degree: int) -> None:
                 check=False,
             )
             assert result.returncode == 0, result.stdout
-            assert '"warm": true, "requests": 2' in result.stdout
+            assert '"requests": 2' in result.stdout
+            # Provisioned for an older executor's `Model.warm` spool: still the executor's.
             warm = worker / "warm"
             assert warm.stat().st_uid == 65533 and warm.stat().st_mode & 0o777 == 0o700
             assert worker.stat().st_mode & 0o777 == 0o710
