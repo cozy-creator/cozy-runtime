@@ -501,17 +501,28 @@ class Weights:
 
     # -- the pinned tier
 
+    def host_share(self) -> int:
+        """This process's pinned tier when no Worker states one: its weights, inside the
+        machine's pinned total (`weight_policy.pinned_total`) less what others pin already."""
+        total = sum(c.ws.nbytes for c in self.components.values())
+        try:
+            memory = proctree.host_memory()
+        except proctree.ProcessTreeUnsupported:
+            return 0
+        others = max(memory.shmem - max(plane.stats(self.plane).host.used, 0), 0)
+        allowed = weight_policy.pinned_total(memory.available, memory.shmem)
+        return min(total, max(allowed - others, 0) // self.world)
+
     def register(self, component: Component) -> None:
         """Track a new weight set and start filling the pinned tier with it. Without a Worker
-        budget the tier holds what this process registered, up to half the host's available
-        memory; it is optional and shrinkable (page cache and disk remain beneath it)."""
+        budget the tier holds what this process registered, inside its share of the host; it
+        is optional and shrinkable (page cache and disk remain beneath it)."""
         self.components[component.key] = component
         if self.host_only:
             self._bind_host(component)
             return
         if self.pinned < 0:
-            total = sum(c.ws.nbytes for c in self.components.values())
-            self._pin(min(total, max(_host_available(), 0) // 2 // self.world))
+            self._pin(self.host_share())
         self._fill(component)
 
     def _bind_host(self, component: Component) -> None:
@@ -638,14 +649,6 @@ class Weights:
             oom_retries=self.oom_retries,
             modes=dict(self.modes),
         )
-
-
-def _host_available() -> int:
-    """The host bytes this process may still use (its cgroup's, else `MemAvailable`), or -1."""
-    try:
-        return proctree.available_host_bytes()
-    except proctree.ProcessTreeUnsupported:
-        return -1
 
 
 # ---------------------------------------------------------------------------- binding
