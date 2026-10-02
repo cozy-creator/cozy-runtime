@@ -27,8 +27,10 @@ import signal
 import stat
 import sys
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple
 
 from cozy_runtime.internal.child_env import EXECUTOR_SCOPE_ENV
 
@@ -1291,41 +1293,100 @@ def rss_bytes(pid: int) -> int:
     return -1
 
 
-def available_host_bytes() -> int:
-    """The LIVE host budget, from the cgroup when there is one, else MemAvailable.
+class HostMemory(NamedTuple):
+    """What the host can still give this process, and the shared memory it already counts."""
 
-    §3.2's host-RAM rule: re-read at every grant, because a budget fixed at boot describes
-    a machine nobody else is on. -1 means UNREADABLE, never 0.
+    #: bytes left before the tightest limit; -1 is UNREADABLE, never 0
+    available: int
+    #: shared (tmpfs/memfd) bytes charged where that limit is: the pinned weight tiers
+    shmem: int
+
+
+def host_memory() -> HostMemory:
+    """The LIVE host budget: the tightest of every cgroup on this process's path (its own and
+    each parent's `memory.high` and `memory.max`, less what that cgroup uses and cannot give
+    back) and the host's `MemAvailable`.
+
+    `memory.high` counts: past it the kernel throttles every allocation, and pinned memory
+    cannot be reclaimed to get back under it. A cgroup's page cache is reclaimable, so it is
+    available, as `MemAvailable` counts it. §3.2's host-RAM rule: re-read at every grant,
+    because a budget fixed at boot describes a machine nobody else is on.
     """
-    _linux_only("available_host_bytes")
-    if (Path("/sys/fs/cgroup") / "cgroup.controllers").is_file():
+    _linux_only("host_memory")
+    meminfo = _meminfo()
+    best = HostMemory(meminfo.get("MemAvailable", -1), meminfo.get("Shmem", 0))
+    for cgroup, limits, usage in _memory_cgroups():
         try:
+            bounds = [int(text) for name in limits if (text := _cgroup_text(cgroup, name)) != "max"]
+            # cgroup v1 spells "unlimited" as a page-rounded value near LONG_MAX
+            bounds = [bound for bound in bounds if 0 < bound < (1 << 60)]
+            if not bounds:
+                continue
+            stat = _cgroup_stat(cgroup)
+            used = int(_cgroup_text(cgroup, usage)) - stat["inactive_file"] - stat["active_file"]
+            room = max(min(bounds) - max(used, 0), 0)
+        except (OSError, ValueError):
+            continue
+        if best.available < 0 or room < best.available:
+            best = HostMemory(room, stat["shmem"])
+    return best
+
+
+def available_host_bytes() -> int:
+    """`host_memory().available`: -1 means UNREADABLE, never 0."""
+    return host_memory().available
+
+
+def _memory_cgroups() -> Iterator[tuple[Path, tuple[str, ...], str]]:
+    """This process's memory cgroup and every parent of it, innermost first: its directory,
+    its limit files and the file holding its usage."""
+    root = Path("/sys/fs/cgroup")
+    limits: tuple[str, ...]
+    try:
+        if (root / "cgroup.controllers").is_file():
             relative = next(
                 line.split("::", 1)[1]
                 for line in Path("/proc/self/cgroup").read_text().splitlines()
                 if line.startswith("0::")
             )
-            cgroup = Path("/sys/fs/cgroup") / relative.lstrip("/")
-            v2_limit = (cgroup / "memory.max").read_text().strip()
-            if v2_limit != "max":
-                current = int((cgroup / "memory.current").read_text().strip())
-                return max(int(v2_limit) - current, 0)
-        except (OSError, StopIteration, ValueError):
-            pass
-    else:
-        try:
-            memory = _cgroup_v1_controller_path("memory")
-            v1_limit = int((memory / "memory.limit_in_bytes").read_text().strip())
-            current = int((memory / "memory.usage_in_bytes").read_text().strip())
-            # cgroup v1 represents "unlimited" as a page-rounded value near LONG_MAX.
-            if 0 < v1_limit < (1 << 60):
-                return max(v1_limit - current, 0)
-        except (ContainmentUnavailable, OSError, ValueError):
-            pass
+            leaf, top = root / relative.lstrip("/"), root
+            limits, usage = ("memory.high", "memory.max"), "memory.current"
+        else:
+            leaf = _cgroup_v1_controller_path("memory")
+            # the controller's mount; a container's own cgroup is mounted there itself
+            top = next((p for p in (leaf, *leaf.parents) if p.name == "memory"), leaf)
+            limits, usage = ("memory.limit_in_bytes",), "memory.usage_in_bytes"
+    except (ContainmentUnavailable, OSError, StopIteration):
+        return
+    for cgroup in (leaf, *leaf.parents):
+        yield cgroup, limits, usage
+        if cgroup == top:
+            return
+
+
+def _cgroup_text(cgroup: Path, name: str) -> str:
+    return (cgroup / name).read_text().strip()
+
+
+def _cgroup_stat(cgroup: Path) -> dict[str, int]:
+    """A cgroup's page cache and shared memory, in bytes (0 where it does not say). cgroup v1
+    states its subtree's under `total_`."""
+    stat = {"inactive_file": 0, "active_file": 0, "shmem": 0}
+    rows = dict(
+        line.split(None, 1) for line in (cgroup / "memory.stat").read_text().splitlines() if line
+    )
+    for name in stat:
+        stat[name] = int(rows.get(f"total_{name}", rows.get(name, "0")))
+    return stat
+
+
+def _meminfo() -> dict[str, int]:
+    """`/proc/meminfo` fields in bytes (empty when unreadable)."""
+    fields: dict[str, int] = {}
     try:
         for line in Path("/proc/meminfo").read_text().splitlines():
-            if line.startswith("MemAvailable:"):
-                return int(line.split()[1]) * 1024
+            name, _, rest = line.partition(":")
+            fields[name] = int(rest.split()[0]) * 1024
     except (OSError, IndexError, ValueError):
-        return -1
-    return -1
+        return {}
+    return fields

@@ -4,9 +4,10 @@ An executor's weight plane fills one memfd per weight set (its layout plus a sta
 marks which regions are Ready) and offers it here. The Worker keeps it, holding a claim on its
 regions (`plane.hold_tier`), so a replacement executor, or another package's executor
 registering the same layout, adopts the filled regions instead of reading the disk
-(weight-plane.md §3). Pinned memory is unreclaimable, so the tiers held here count in this
-budget: at most half of what the host has, the least recently used released first (which
-frees what no executor claims). Page cache and disk stay beneath it.
+(weight-plane.md §3). Pinned memory is unreclaimable, so the tiers held here stay inside the
+machine's pinned total (`weight_policy.pinned_total`: half of what the host has under its
+tightest limit), the least recently used released first (which frees what no executor
+claims). Page cache and disk stay beneath it.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ from cozy_runtime.author._executor_requests import (
     Tier,
     refuse,
 )
-from cozy_runtime.internal import plane
+from cozy_runtime.internal import plane, weight_policy
 
 
 @dataclass(slots=True)
@@ -93,9 +94,18 @@ class HostTiers:
         for row in self.held.values():
             with contextlib.suppress(OSError):
                 row.nbytes = _resident(row.fd)
-        while self.held and self._nbytes() > (max(self.available(), 0) + self._nbytes()) // 2:
+        while self.held and self._nbytes() > weight_policy.pinned_total(
+            self.available(), self._nbytes()
+        ):
             key = min(self.held, key=lambda k: self.held[k].used)
             plane.release_tier(self.held.pop(key).fd)
+
+    def trim(self) -> int:
+        """Release the least recently used tiers the host no longer has room for (its limit
+        moved, or other memory grew); returns the bytes still held."""
+        with self.lock:
+            self._trim()
+            return self._nbytes()
 
     def close(self) -> None:
         with self.lock:

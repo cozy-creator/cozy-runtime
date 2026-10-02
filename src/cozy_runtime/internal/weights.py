@@ -501,17 +501,42 @@ class Weights:
 
     # -- the pinned tier
 
+    def host_share(self) -> int:
+        """This process's pinned tier at most: its weights, inside the machine's pinned total
+        (`weight_policy.pinned_total`) less what others pin already. -1: the host is
+        unreadable."""
+        total = sum(c.ws.nbytes for c in self.components.values())
+        try:
+            memory = proctree.host_memory()
+        except proctree.ProcessTreeUnsupported:
+            return -1
+        if memory.available < 0:
+            return -1
+        others = max(memory.shmem - max(plane.stats(self.plane).host.used, 0), 0)
+        allowed = weight_policy.pinned_total(memory.available, memory.shmem)
+        return min(total, max(allowed - others, 0) // self.world)
+
+    def hold_host(self) -> None:
+        """Keep the pinned tier inside what the host has now, whoever set its budget: the
+        limit may have moved and other memory grown since. Read at every stage and every
+        pass; only ever lowers (the plane punches its least recently used regions, which
+        then come from the page cache or disk)."""
+        if self.host_only:
+            return  # a CPU executor computes on its tier
+        share = self.host_share()
+        if 0 <= share < self.pinned_applied:
+            self._pin(share)
+
     def register(self, component: Component) -> None:
         """Track a new weight set and start filling the pinned tier with it. Without a Worker
-        budget the tier holds what this process registered, up to half the host's available
-        memory; it is optional and shrinkable (page cache and disk remain beneath it)."""
+        budget the tier holds what this process registered, inside its share of the host; it
+        is optional and shrinkable (page cache and disk remain beneath it)."""
         self.components[component.key] = component
         if self.host_only:
             self._bind_host(component)
             return
         if self.pinned < 0:
-            total = sum(c.ws.nbytes for c in self.components.values())
-            self._pin(min(total, max(_host_available(), 0) // 2 // self.world))
+            self._pin(max(self.host_share(), 0))
         self._fill(component)
 
     def _bind_host(self, component: Component) -> None:
@@ -638,14 +663,6 @@ class Weights:
             oom_retries=self.oom_retries,
             modes=dict(self.modes),
         )
-
-
-def _host_available() -> int:
-    """The host bytes this process may still use (its cgroup's, else `MemAvailable`), or -1."""
-    try:
-        return proctree.available_host_bytes()
-    except proctree.ProcessTreeUnsupported:
-        return -1
 
 
 # ---------------------------------------------------------------------------- binding
@@ -1743,6 +1760,7 @@ class WeightResidency:
                 weights.set_budget(granted)
         self.entries[method] = self.entries.get(method, 0) + 1
         self.repeats[method] = max(self.repeats.get(method, 0), self.entries[method])
+        weights.hold_host()
         if weights.host_only:  # everything is bound in place already; no device to measure
             self.active = (method, local)
             self.entered_ns = time.perf_counter_ns()
@@ -2221,6 +2239,8 @@ class WeightResidency:
                 self._asked({component.key: region.index})
             passes = component.passes
             self._observe(component, region.index)
+            if component.passes > passes:
+                weights.hold_host()
             if weights.growing and component.passes == 2 > passes:
                 self._grow()
             versions = _versions(args, kwargs)

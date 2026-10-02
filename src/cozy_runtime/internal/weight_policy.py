@@ -75,6 +75,14 @@ def plane_budget(free: int, activation: int, context: int = 0, margin: int = MAR
     return max(free - activation - context - margin, 0)
 
 
+def pinned_total(available: int, pinned: int) -> int:
+    """The most the pinned host tier may hold across the machine: half of what the host has
+    for it (free before its tightest limit, plus what is pinned already). Pinned memory is
+    unreclaimable; the other half stays for processes and the page cache, the tier's own
+    fallback. Everyone who pins (each executor, the Worker's kept tiers) shares this one sum."""
+    return (max(available, 0) + max(pinned, 0)) // 2
+
+
 def floor(layout: Layout, activation: int = 0) -> int:
     """The least a stage can run in: common, a ring of the largest region, activations, at
     the finest grain the component offers. A component without blocks cannot stream, so all

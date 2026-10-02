@@ -127,6 +127,11 @@ def read_host_available() -> int:
     return proctree.available_host_bytes()
 
 
+def read_host_memory() -> proctree.HostMemory:
+    """The same budget with the shared memory it already counts (the pinned weight tiers)."""
+    return proctree.host_memory()
+
+
 def read_vmrss(pid: int) -> int:
     """Current resident bytes for one pid, or -1 when the process is gone (UNREADABLE)."""
     return proctree.rss_bytes(pid)

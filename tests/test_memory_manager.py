@@ -134,6 +134,25 @@ def test_the_pinned_tier_takes_half_the_host_most_recently_used_first() -> None:
     split = pinned_split(4 * GiB, [("a", 8 * GiB, 0), ("b", 8 * GiB, 8 * GiB)])
     assert split == {"a": 2 * GiB, "b": 4 * GiB}
     assert pinned_split(-1, [("a", GiB, 0)]) == {"a": 0}
+    # The machine's pinned total is one sum: memory pinned outside these tenants (a tier the
+    # Worker keeps for an executor that is gone) counts in it, and leaves them less.
+    two = [("a", 8 * GiB, 5 * GiB), ("b", 8 * GiB, 0)]
+    assert pinned_split(3 * GiB, two) == {"a": 4 * GiB, "b": 0}
+    assert pinned_split(3 * GiB, two, held=9 * GiB) == {"a": 6 * GiB, "b": 0}
+    assert pinned_split(0, two, held=9 * GiB) == {"a": 4 * GiB + GiB // 2, "b": 0}
+
+
+def test_a_cgroups_page_cache_and_shared_memory_are_read_in_either_version(
+    tmp_path: Path,
+) -> None:
+    """A rented pod is cgroup v1 (its subtree's counters under `total_`), a desktop v2."""
+    (tmp_path / "memory.stat").write_text(
+        "cache 900\nshmem 7\ntotal_inactive_file 300\ntotal_active_file 200\ntotal_shmem 100\n"
+    )
+    v1 = {"inactive_file": 300, "active_file": 200, "shmem": 100}
+    assert proctree._cgroup_stat(tmp_path) == v1
+    (tmp_path / "memory.stat").write_text("anon 5\nfile 900\nshmem 100\ninactive_file 300\n")
+    assert proctree._cgroup_stat(tmp_path) == {"inactive_file": 300, "active_file": 0, "shmem": 100}
 
 
 def test_a_plane_document_is_telemetry_and_a_new_generation_forgets_it() -> None:
