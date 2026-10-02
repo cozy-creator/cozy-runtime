@@ -112,6 +112,7 @@ from cozy_runtime.internal import (
     child_env,
     execution_evidence,
     executor_commands,
+    image_vae,
     kernel_cache,
     model_config,
     native_interfaces,
@@ -2108,10 +2109,12 @@ class Executor:
                 if consent in ("accept", "require")
                 else None
             )
+            roots = backend.roots
+            for root in roots.values():
+                image_vae.fast_decode(root)
             stage("execution_plan")
             # THE FASTEST KERNEL THIS DEVICE AND IMAGE SUPPORT, PINNED POST-FILL (cr-124),
             # per attention site and before any warm step (see `_prepare_attention`).
-            roots = backend.roots
             reselect = functools.partial(
                 self._prepare_attention,
                 binding,

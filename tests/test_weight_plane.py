@@ -27,7 +27,7 @@ from tensorfs.derived import Config as NativeConfig  # noqa: E402
 from tensorfs.derived import Derivation, Part, Target, Tensor  # noqa: E402
 
 from cozy_runtime.author._loader import census  # noqa: E402
-from cozy_runtime.internal import accel, paging, plane, weight_policy  # noqa: E402
+from cozy_runtime.internal import accel, image_vae, paging, plane, weight_policy  # noqa: E402
 from cozy_runtime.internal import weights as weights_module  # noqa: E402
 from cozy_runtime.internal.derive import Observations, serving_substrate  # noqa: E402
 from cozy_runtime.internal.encoding import SPEC_PLAIN  # noqa: E402
@@ -1335,3 +1335,42 @@ def test_an_op_outside_every_block_runs_again_after_weights_leave(card: Any) -> 
         torch.cuda.empty_cache()
     assert weights.facts().oom_retries > retries
     assert same(reference, [out])
+
+
+@on_card
+def test_a_qwen_image_vae_decodes_untiled_when_it_fits(tmp_path: Path) -> None:
+    """Anima's VAE (diffusers' AutoencoderKLQwenImage) with tiling on, as the published package
+    constructs it: the plane decides the decode and runs it untiled when it fits, on one
+    kernel tap per causal convolution. The image is the stock untiled decode's, to fp16."""
+    diffusers = pytest.importorskip("diffusers")
+    torch.manual_seed(5)
+
+    def vae() -> Any:
+        return diffusers.AutoencoderKLQwenImage(base_dim=32, num_res_blocks=1).to(torch.float16)
+
+    values = {k: v.float() for k, v in vae().state_dict().items()}
+    checkpoint = store_component(tmp_path, "vae", values)
+    weights = Weights(torch, torch.device("cuda", 0), "cuda")
+    weights.set_budget(1 << 30, pinned=1 << 30)
+
+    def lone() -> Any:  # the executor's execution plan, before the residency installs
+        module = vae()
+        assert image_vae.fast_decode(module)
+        return module
+
+    model = load(weights, checkpoint, "qwen-vae", name="vae", factory=lone)
+    plain = vae().cuda().eval()
+    plain.load_state_dict({k: v.half() for k, v in values.items()})
+    z = torch.randn(1, 16, 1, 64, 64, device="cuda", dtype=torch.float16)
+    model.stack.enable_tiling()
+    model.residency.admit("run", ("vae",))
+    try:
+        with torch.inference_mode():
+            image = model.stack.decode(z).sample
+            reference = plain.decode(z).sample
+    finally:
+        model.residency.release("run", ("vae",))
+    assert weights.modes["vae.decode"] == "untiled"
+    assert image.shape == (1, 3, 1, 512, 512)
+    # norms in fp16 rather than fp32, and a 2D kernel: the image moves by a few fp16 ulps
+    torch.testing.assert_close(image, reference, atol=1e-2, rtol=0)
