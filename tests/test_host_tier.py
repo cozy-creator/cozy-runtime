@@ -128,7 +128,7 @@ from pathlib import Path
 import torch
 torch.set_num_threads(2)
 sys.path.insert(0, sys.argv[1])
-from cozy_runtime.internal import plane, proctree
+from cozy_runtime.internal import plane
 from cozy_runtime.internal.fill import Checkpoint
 from cozy_runtime.internal.weights import Weights
 from test_weight_plane import load
@@ -162,7 +162,6 @@ for index, (root, manifest) in enumerate(json.loads(sys.argv[2])):
 anon, shmem = held()
 print(json.dumps({"high": high, "anon": anon, "shmem": shmem, "loaded": len(models),
                   "throttled": throttled or anon + shmem >= high,
-                  "available": proctree.host_memory().available,
                   "pinned": plane.stats(weights.plane).host.used,
                   "seconds": round(time.monotonic() - started, 2)}), flush=True)
 os._exit(0)
