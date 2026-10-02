@@ -455,7 +455,10 @@ class StageScheduler:
         demand.tenant = False
         idle()
         claim = self._claimant(demand)
-        if claim is None:
+        # Its own model's next call runs in this executor, on these weights: they stay mapped.
+        if claim is None or (
+            claim.gpus == demand.gpus and claim.want.template == demand.want.template != ("", "")
+        ):
             self._free(demand.key)
             return Exit(past=True)
         # The next turn measures the GPU: this one stays until its executor has unmapped,

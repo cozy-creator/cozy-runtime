@@ -2464,7 +2464,8 @@ class WeightResidency:
         """An image VAE's decode mode, decided before the call from what is free plus what the
         plane may unmap: untiled when its measured activations fit, else tiled with the tile
         clamped to what is free. A size never measured at or above runs untiled (its blocks
-        retry on OOM; a fixed cost makes small decodes' per-pixel peaks overstate large ones).
+        retry on OOM), sized by the largest size measured below it: a fixed cost makes small
+        decodes' per-pixel peaks overstate large ones.
         A decode that cannot run untiled even with every idle weight unmapped runs again tiled,
         and a tile that does not fit runs again at half the side, down to the smallest tile.
         The mode is recorded in the run's outputs."""
@@ -2485,17 +2486,18 @@ class WeightResidency:
             pixels = int(z.shape[0]) * height * width
             free, evictable = self.room((name,))
             size = min((n for n in peaks if n >= pixels), default=0)
-            per_pixel = peaks[size] // size if size else 0
+            known = size or max(peaks, default=0)
+            per_pixel = peaks[known] // known if known else 0
             mode = (
                 weight_policy.decode_mode(free, evictable, per_pixel * pixels)
                 if size
                 else "untiled"
             )
             # Activations first: idle weights leave before a decode needs their room (all of
-            # them unless a measured untiled peak says less), since a decode's convolutions
-            # outside any block hook cannot retry.
-            need = per_pixel * pixels if mode == "untiled" and size else free + evictable
-            free = self._room_for_decode(name, free, evictable, need)
+            # them unless a measured untiled peak says less), since a decode run short of
+            # memory takes slower convolutions.
+            need = per_pixel * pixels if mode == "untiled" and known else free + evictable
+            free = self._room_for_decode(name, free, evictable, min(need, free + evictable))
             # a tile under half the image, so tiling always lowers the peak
             largest = _side(min(height, width) // 2)
             side = min(_side(free // max(per_pixel, 1)), sides.get(pixels, largest), largest)

@@ -1374,3 +1374,66 @@ def test_a_qwen_image_vae_decodes_untiled_when_it_fits(tmp_path: Path) -> None:
     assert image.shape == (1, 3, 1, 512, 512)
     # norms in fp16 rather than fp32, and a 2D kernel: the image moves by a few fp16 ulps
     torch.testing.assert_close(image, reference, atol=1e-2, rtol=0)
+
+
+def test_a_larger_decode_is_sized_by_the_largest_one_measured(card: Any, tmp_path: Path) -> None:
+    """Run 2955: the first decode at a size unmapped every idle weight, whatever was free, and
+    the model's next request uploaded all 6.4 GiB again. A size above every measured one asks
+    for what the largest below it used per pixel: none while that is free, that much when not."""
+    diffusers = pytest.importorskip("diffusers")
+    weights = card.weights
+    weights.set_budget(1 << 30)
+    idle = load(weights, card.checkpoint, "idle")
+    x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
+    stack = idle.residency.components["stack"]
+
+    def vae() -> Any:
+        torch.manual_seed(5)
+        return diffusers.AutoencoderKL(
+            down_block_types=("DownEncoderBlock2D",) * 2,
+            up_block_types=("UpDecoderBlock2D",) * 2,
+            block_out_channels=(32, 64),
+        ).to(torch.float16)
+
+    values = {k: v.float() for k, v in vae().state_dict().items()}
+    (tmp_path / "vae").mkdir()
+    model = load(
+        weights, store_component(tmp_path / "vae", "vae", values), "kl", name="vae", factory=vae
+    )
+    plain = vae().cuda().eval()
+    plain.load_state_dict({k: v.half() for k, v in values.items()})
+    latents = [
+        torch.randn(1, 4, side, side, device="cuda", dtype=torch.float16) for side in (32, 64, 128)
+    ]
+    with torch.inference_mode():
+        references = [plain.decode(z).sample for z in latents]
+
+    def decode(z: Any, left: int = 0) -> Any:
+        ballast = None
+        model.residency.admit("run", ("vae",))
+        try:
+            with weights.recovering(), torch.inference_mode():
+                torch.cuda.empty_cache()
+                free, _ = torch.cuda.mem_get_info()
+                ballast = torch.empty(free - left if left else 0, dtype=torch.uint8, device="cuda")
+                return model.stack.decode(z).sample
+        finally:
+            model.residency.release("run", ("vae",))
+            del ballast
+            torch.cuda.empty_cache()
+
+    assert same([decode(latents[0])], references[:1])  # the first size is measured
+    run(idle, x, passes=1)
+    torch.cuda.synchronize()  # its last copies land
+    was, mapped = weights.facts(), weights.resident_bytes(stack)
+    assert mapped > 0
+    image = decode(latents[1])
+    assert weights.modes["vae.decode"] == "untiled"
+    assert weights.facts().evictions == was.evictions and weights.resident_bytes(stack) >= mapped
+    assert same([image], references[1:2])
+    # Larger again, on a card with 8 MiB left: idle weights give its room before the call.
+    image = decode(latents[2], left=8 << 20)
+    assert weights.modes["vae.decode"] == "untiled"
+    assert weights.resident_bytes(stack) < mapped
+    # short of memory cuDNN may take an algorithm with a smaller workspace: fp16 rounding
+    torch.testing.assert_close(image, references[2], atol=1e-2, rtol=0)
