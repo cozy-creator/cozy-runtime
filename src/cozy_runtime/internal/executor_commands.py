@@ -77,6 +77,19 @@ class Budget(Command, frozen=True, kw_only=True, tag="budget"):
     pinned_bytes: int = -1
 
 
+class Share(Command, frozen=True, kw_only=True, tag="share"):
+    """Offer the machine every GPU region this executor filled and has not shared yet
+    (`weights.attach/1`): they outlive the process and other executors attach them."""
+
+
+class Revoke(Command, frozen=True, kw_only=True, tag="revoke"):
+    """Stop using the shared GPU memory of one layout (`weights.revoke/1`): finish queued work,
+    unmap, release, then answer; later uses fill a private copy."""
+
+    layout: str
+    generation: int = 0
+
+
 class Prefetch(Command, frozen=True, kw_only=True, tag="prefetch"):
     """Fill one loaded construction's host tier now, before its attempt holds the device."""
 
@@ -230,6 +243,9 @@ class Load(Command, frozen=True, kw_only=True, tag="load"):
     #: The pinned host tier's budget (`LOAD_PINNED`), applied before any weight set registers,
     #: so a fill never pins past it; -1: none, the executor sizes its tier from the host.
     pinned_bytes: int = -1
+    #: The machine keeps GPU weights across executors (`weights.attach/1`): each weight set
+    #: attaches the regions it holds (`DeviceTier`). Older workers never set it.
+    device_weights: bool = False
 
     def single(self) -> ModelLoad:
         return ModelLoad(
@@ -356,6 +372,8 @@ type KnownCommand = (
     | Vacate
     | Restore
     | Budget
+    | Share
+    | Revoke
     | Prefetch
     | Unload
     | Activate

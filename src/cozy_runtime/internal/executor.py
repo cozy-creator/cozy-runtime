@@ -80,12 +80,15 @@ from cozy_runtime.author._executor_requests import (
     CheckpointReceipt,
     ChildEvents,
     DeviceRoom,
+    DeviceTier,
+    DeviceTierAnswer,
     Handoff,
     HostTier,
     Publish,
     Published,
     Request,
     Room,
+    SharedRegion,
     StageEnter,
     StageExit,
     StageGo,
@@ -148,7 +151,9 @@ from cozy_runtime.internal.executor_commands import (
     Release,
     Residency,
     Restore,
+    Revoke,
     RunJob,
+    Share,
     Shutdown,
     Start,
     Unload,
@@ -181,6 +186,7 @@ from cozy_runtime.internal.seam import (
 )
 from cozy_runtime.internal.stages import STAGE_TURNS
 from cozy_runtime.internal.weights import (
+    DeviceTiers,
     HostTiers,
     PlaneBackend,
     ResidencyRefusal,
@@ -580,6 +586,10 @@ class Executor:
                 return self.restore(names=command.names)
             case Budget():
                 return self.budget(command)
+            case Share():
+                return self.share()
+            case Revoke():
+                return self.revoke(command)
             case Prefetch():
                 return self.prefetch(command)
             case Shutdown():
@@ -603,6 +613,7 @@ class Executor:
                 "import_only",
                 "vacate_ranks",
                 *([plane.CAPABILITY, STAGE_TURNS, LOAD_PINNED] if plane.available() else []),
+                *(plane.SHARING if plane.sharing() else ()),
             ],
             "memo": [stage_memo.CAPABILITY],
             "pgid": os.getpgrp(),
@@ -1964,6 +1975,11 @@ class Executor:
             except plane.Unavailable as exc:
                 return {"ok": False, "code": "weight_plane_unavailable", "detail": str(exc)}
         weights = host.weights
+        # The machine keeps GPU weights across executors: attach what it holds, offer the rest.
+        sharing = command.device_weights and self.world == 1 and plane.sharing()
+        weights.sharing = (
+            DeviceTiers(ask=self._ask_device, offer=self._offer_device) if sharing else None
+        )
         # A load plans in what the driver has: the Worker made room for it, and an earlier
         # cut to 0 is no grant for this construction. Its pinned budget arrives with it, so
         # the fill stays inside it (a CPU executor computes on its tier: never cut there).
@@ -3803,14 +3819,20 @@ class Executor:
             else -1
         )
         body.pop("memfd", None)
+        shared = request.fds if isinstance(request, DeviceTier) else ()
+        body.pop("fds", None)
         with self._durable_lock:
             self._exchange += 1
             exchange = f"{body['kind']}#{self._exchange}"
             if sending >= 0:
                 body["descriptor"] = True
+            if shared:
+                body["descriptors"] = len(shared)
             self.channel.send({"event": "request", "seq": self._exchange, **body})
             if sending >= 0:
                 self.channel.send_memfd(sending)
+            for fd in shared:
+                self.channel.send_shared(fd)
             frame = self.channel.recv()
             if frame is None:
                 raise SeamError("seam_closed", f"the worker closed during {exchange}")
@@ -3830,6 +3852,21 @@ class Executor:
                     frame["descriptor"] = self.channel.recv_descriptor()
             elif handoff and frame.get("ok") is True:
                 raise SeamError("seam_descriptor", "successful reply omitted its capability")
+            frame.pop("fds", None)  # descriptors arrive by SCM_RIGHTS, never as numbers
+            count = frame.pop("descriptors", 0)
+            if count:
+                if not issubclass(into, DeviceTierAnswer) or type(count) is not int or count < 0:
+                    self.channel.close()
+                    raise SeamError("seam_descriptor", "unexpected GPU allocations in a reply")
+                received: list[int] = []
+                try:
+                    for _ in range(count):
+                        received.append(self.channel.recv_shared())
+                except BaseException:
+                    for fd in received:
+                        os.close(fd)
+                    raise
+                frame["fds"] = received
         try:
             return tolerant.read(frame, into, ("progress", "observation"))[0]
         except msgspec.ValidationError as exc:
@@ -3965,6 +4002,60 @@ class Executor:
         if refused:
             return refused
         return {"ok": True, "freed_bytes": freed, "plane": self._plane_facts()}
+
+    def share(self) -> dict[str, Any]:
+        """Offer the machine every GPU region this executor filled and has not shared yet."""
+        if self.poisoned:
+            return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
+        if self.weights is None:
+            return {"ok": True, "shared_bytes": 0}
+        self._unpark()
+        return {"ok": True, "shared_bytes": self.weights.share(), "plane": self._plane_facts()}
+
+    def revoke(self, command: Revoke) -> dict[str, Any]:
+        """Let the machine's GPU regions of one layout go: queued work first, then unmap."""
+        if self.weights is None:
+            return {"ok": True, "released_bytes": 0}
+        self._unpark()
+        try:
+            released = self.weights.revoke(command.layout)
+        except plane.error("LeaseViolation") as exc:
+            return {"ok": False, "code": "in_use", "detail": str(exc)}
+        except plane.error("Poisoned") as exc:
+            return {"ok": False, "code": "poisoned_generation", "detail": str(exc)}
+        return {"ok": True, "released_bytes": released, "plane": self._plane_facts()}
+
+    def _ask_device(self, name: str, layout: str, device: str) -> DeviceTierAnswer | None:
+        """The GPU regions the machine keeps for exactly this weight set's layout, with fds."""
+        answer = self._durable(
+            DeviceTier(name=name, layout=layout, device=device), DeviceTierAnswer
+        )
+        if (
+            answer.ok
+            and answer.held
+            and len(answer.fds) == sum(len(r.chunks) for r in answer.regions)
+        ):
+            return answer
+        for fd in answer.fds:
+            os.close(fd)
+        return None
+
+    def _offer_device(
+        self,
+        name: str,
+        layout: str,
+        device: str,
+        regions: tuple[SharedRegion, ...],
+        fds: tuple[int, ...],
+    ) -> DeviceTierAnswer:
+        """Hand the machine regions this process filled; it keeps them past this process."""
+        request = DeviceTier(
+            name=name, layout=layout, device=device, offer=True, regions=regions, fds=fds
+        )
+        answer = self._durable(request, DeviceTierAnswer)
+        for fd in answer.fds:
+            os.close(fd)
+        return answer
 
     def prefetch(self, command: Prefetch) -> dict[str, Any]:
         """Fill one construction's host tier now, before its attempt holds the device."""

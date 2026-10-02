@@ -122,6 +122,9 @@ class PlaneFacts(msgspec.Struct, frozen=True, kw_only=True):
     #: and straight from the page cache (it did not either)
     disk_copy_bytes: int = 0
     mapped_copy_bytes: int = 0
+    #: GPU regions mapped from the machine's custody (`weights.attach/1`): outside
+    #: `committed_bytes`, counted once by the machine
+    shared_bytes: int = 0
     #: bytes this executor process read from storage since it started (`/proc/self/io`;
     #: TensorFS 0.3.92): a gate compares a delta across a return. -1: not counted
     disk_read_bytes: int = -1
