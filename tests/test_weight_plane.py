@@ -603,6 +603,70 @@ def test_a_component_converted_with_to_streams_in_that_dtype(card: Any) -> None:
     assert all(torch.equal(a, b) for a, b in zip(resident, streamed, strict=True))
 
 
+@on_card
+def test_a_bind_that_runs_out_of_device_memory_plans_again_in_what_is_left(card: Any) -> None:
+    """Run 2932: on a card without fp8, binding a stage's resident set decodes each weight
+    into a float copy, and with the card full that allocation failed inside the plan. The
+    stage ended there and the group with it. Binding's copies are torch's bytes (here a
+    component converted to fp32: twice its stored bytes): when one does not fit, the plan
+    gives room back and binds again, and the stage computes the same bits."""
+    weights = card.weights
+    model = load(weights, card.checkpoint, "bind")
+    x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float32)
+    weights.set_budget(1 << 30)
+    model.stack.to(torch.float32)
+    resident = run(model, x)
+    model.residency.unpark()
+    weights.set_budget(0)  # nothing mapped: the next stage binds, and converts, everything
+    layout: weight_policy.Layout = model.residency.components["stack"].layout
+    retries = weights.facts().oom_retries
+    torch.cuda.empty_cache()
+    free, _ = torch.cuda.mem_get_info()
+    # Room for the stored weights and half of their fp32 copies, no more.
+    ballast = torch.empty(free - 2 * layout.total, dtype=torch.uint8, device="cuda")
+    try:
+        weights.set_budget(layout.total + (8 << 20))
+        squeezed = run(model, x)
+    finally:
+        del ballast
+        torch.cuda.empty_cache()
+    assert weights.facts().oom_retries > retries
+    assert weights.facts().streamed["stack"].resident_blocks < BLOCKS
+    assert all(torch.equal(a, b) for a, b in zip(resident, squeezed, strict=True))
+
+
+def test_decoded_copies_count_in_a_stages_budget(tmp_path: Path) -> None:
+    """A weight the card cannot run as stored (fp8 before sm89) is decoded into a float copy
+    when its region binds. That copy is torch's memory beside the plane's stored bytes, so a
+    stage's budget counts both: the plane's ring stays sized by the stored bytes alone."""
+    weights = Weights(torch, torch.device("cpu"), "cpu")
+    weights.set_budget(-1, pinned=1 << 30)
+    model = load(weights, write_checkpoint(tmp_path)[0], "decoded")
+    component = model.residency.components["stack"]
+    assert component.planned == component.layout
+    for block in component.blocks:
+        for weight in block.weights:
+            weight.route = "decoded_float"
+    stored = component.layout
+    planned = component.planned
+    copies = [
+        sum(HIDDEN * HIDDEN * 2 for w in block.weights if w.row.name.endswith(".weight"))
+        for block in component.blocks
+    ]
+    assert all(copy > 0 for copy in copies)
+    assert planned.common == stored.common
+    assert planned.blocks == tuple(
+        size + copy + 2 * HIDDEN for size, copy in zip(stored.blocks, copies, strict=True)
+    )
+    # The same budget keeps fewer blocks resident, and the ring is the stored blocks' ring.
+    budget = stored.common + 5 * stored.largest
+    plain = weight_policy.residence(stored, budget)
+    counted = weight_policy.residence(planned, budget)
+    assert len(counted.resident) < len(plain.resident)
+    ring = weight_policy.ring_bytes([stored.blocks[i] for i in counted.streamed], counted.window)
+    assert ring < counted.ring
+
+
 def sdxl_unet() -> Any:
     """SDXL's UNet architecture (convolutions, group norms, cross-attention transformer
     blocks, text-time embeddings), small: what streams in SDXL, in fp16."""
