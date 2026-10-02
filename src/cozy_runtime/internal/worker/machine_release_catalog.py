@@ -32,10 +32,16 @@ def _path(package: str) -> str:
     return f"/v1/packages/{quote(org)}/{quote(name)}"
 
 
+class NotPublished(WorkspaceRefusal):
+    """The catalog answered that it publishes no such package."""
+
+
 def newest(catalog: Catalog, package: str) -> str:
     """The newest non-yanked release by PEP 440 order; a prerelease only when there is no
     final release."""
     card = catalog.get(_path(package))
+    if card is None:
+        raise NotPublished(f"{package} is not a published package at the catalog")
     rows = card.get("releases") if isinstance(card, dict) else None
     if not isinstance(rows, list):
         raise WorkspaceRefusal(f"{package} is not a published package at the catalog")
@@ -91,8 +97,9 @@ def facts(catalog: Catalog, package: str, release: str) -> pb.DeferredInstallati
 
 
 def callees(package: str, locked: bytes) -> list[str]:
-    """The published releases a lock names: its own org's index wheels other than the
-    package itself, as `org/name@version`."""
+    """The releases a lock may name: its own org's index wheels other than the package
+    itself, as `org/name@version`. A wheel the release carries (a third-party build) sits
+    on that index too; the catalog says which names are packages (`NotPublished`)."""
     org, _, name = package.partition("/")
     own = re.sub(r"[-_.]+", "-", name.lower())
     prefix = f"/v1/index/{org}/files/"
