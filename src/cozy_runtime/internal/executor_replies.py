@@ -119,10 +119,11 @@ class PlaneFacts(msgspec.Struct, frozen=True, kw_only=True):
     h2d_bytes: int = 0
     h2d_gbps: float = 0.0
     #: of those, copied to the device straight from disk (the pinned tier did not hold them)
-    #: and straight from the page cache (it did not either); and the bytes the pinned tier
-    #: read from disk: a return from the tier or the page cache reads none
+    #: and straight from the page cache (it did not either)
     disk_copy_bytes: int = 0
     mapped_copy_bytes: int = 0
+    #: bytes this executor process read from storage since it started (`/proc/self/io`;
+    #: TensorFS 0.3.92, always 0 before): a gate compares a delta across a return
     disk_read_bytes: int = 0
     late: int = 0
     stall_ns: int = 0
