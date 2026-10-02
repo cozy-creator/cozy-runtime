@@ -261,7 +261,7 @@ class Upload:
     def resolve(self) -> Selection:
         request, recipe = self.request, self.recipe
         if isinstance(request, UploadCivitai):
-            carriers: list[str] | None = [request.file] if request.file else []
+            carriers: list[str] | None = [request.file] if request.file else None
         elif recipe is not None:
             carriers = list(recipe.carriers)
         else:

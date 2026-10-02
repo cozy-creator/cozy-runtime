@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import queue
 import struct
 from pathlib import Path
@@ -201,6 +202,50 @@ def test_an_unrecognized_civitai_file_uploads_as_is_and_a_package_refuses_it_by_
         _prepare(root, "example/as-is", digest)
     assert refused.value.code == "checkpoint_unnormalized"
     assert "normalize job" in str(refused.value)
+
+
+def _h3_kohya_lora(fill: int) -> bytes:
+    """The reviewed 600-key Kohya H3 LoRA key set at rank 1."""
+    header: dict[str, Any] = {}
+    offset = 0
+    projections = {
+        "attn_qkv_proj": (5376, 21504),
+        "attn_out_proj": (7168, 5376),
+        "mlp_fc1": (5376, 28672),
+        "mlp_fc2": (14336, 5376),
+    }
+    for block in range(50):
+        for leaf, (fan_in, fan_out) in projections.items():
+            roles = {"lora_down.weight": [1, fan_in], "lora_up.weight": [fan_out, 1], "alpha": []}
+            for role, shape in roles.items():
+                size = 2 * math.prod(shape)
+                header[f"lora_unet_blocks_{block}_{leaf}.{role}"] = {
+                    "dtype": "F16",
+                    "shape": shape,
+                    "data_offsets": [offset, offset + size],
+                }
+                offset += size
+    raw = json.dumps(header).encode()
+    return struct.pack("<Q", len(raw)) + raw + bytes([fill]) * offset
+
+
+def test_a_declared_profile_takes_the_primary_of_a_civitai_version_with_a_companion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Headers cannot select an `auto_select: false` profile, so resolution must carry the
+    # declared one or a second SafeTensors file makes the version ambiguous.
+    files = {"style.safetensors": _h3_kohya_lora(1), "style-alt.safetensors": _h3_kohya_lora(2)}
+    request = {
+        "version": 3270784,
+        "destination": "example/h3-lora",
+        "profiles": ["h3/native-lora-kohya/2"],
+        "file": "",
+    }
+    root = tmp_path / "machine"
+    selected, finished, _ = _upload(root, monkeypatch, "upload_civitai", files, request)
+    assert selected == {"civitai/files/1"}
+    _, header = _checkpoint(root, finished)
+    assert len(header["components"]["adapter"]) == 900
 
 
 @needs_as_is
