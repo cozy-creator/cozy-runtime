@@ -1,0 +1,1 @@
+A stage's clock covers its own device work and nothing else: it ends when the kernels it queued have run (the tail of the last denoise step no longer lands in the decode), and its wait for weights is a `loading weights` stage of its own, off the stage's clock.

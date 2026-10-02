@@ -26,6 +26,7 @@ from tensorfs import Store  # noqa: E402
 from tensorfs.derived import Config as NativeConfig  # noqa: E402
 from tensorfs.derived import Derivation, Part, Target, Tensor  # noqa: E402
 
+from cozy_runtime.author._activity import asides  # noqa: E402
 from cozy_runtime.author._loader import census  # noqa: E402
 from cozy_runtime.internal import accel, image_vae, paging, plane, weight_policy  # noqa: E402
 from cozy_runtime.internal import weights as weights_module  # noqa: E402
@@ -357,6 +358,28 @@ def assert_pinned(weights: Weights, component: Any, values: dict[str, Any]) -> N
             start = region.offset + offset
             expected = values[weight.row.name].numpy().tobytes()
             assert held[start : start + len(expected)] == expected, weight.row.name
+
+
+@on_card
+def test_a_stage_waits_for_its_weights_before_its_clock_starts(card: Any) -> None:
+    """The bytes a new plan wants reach the device before they bind, and that wait is
+    recorded as loading: nothing is copied after it and no lease of the stage is late."""
+    weights = card.weights
+    model = load(weights, card.checkpoint, "arrive")
+    spans: list[tuple[str, float]] = []
+    weights.set_budget(1 << 30)
+    with asides(lambda name, ms: spans.append((name, ms))):
+        model.residency.admit("run", ("stack",))
+    arrived = weights.facts().h2d_bytes
+    assert arrived > 0 and {name for name, _ in spans} == {"loading weights"}
+    with torch.inference_mode():
+        model.stack(torch.zeros(1, HIDDEN, device="cuda", dtype=torch.float16))
+    torch.cuda.synchronize()
+    model.residency.release("run", ("stack",))
+    stages = plane.stats(weights.plane).stages
+    # a lease's own bookkeeping is nanoseconds; a wait for bytes is milliseconds
+    assert weights.facts().h2d_bytes == arrived
+    assert sum(row.late for row in stages) == 0 and sum(row.stall_ns for row in stages) < 1e6
 
 
 @on_card

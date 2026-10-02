@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any, Literal, NoReturn, Protocol, TypeVar, cast, runtime_checkable
 
 from cozy_runtime.author import _codec
-from cozy_runtime.author._activity import work_clock
+from cozy_runtime.author._activity import settle, work_clock
 from cozy_runtime.author._assets import (
     Asset,
     AudioAsset,
@@ -1349,6 +1349,7 @@ class Telemetry(_Bound):
         succeeded = False
         try:
             yield
+            settle()
             succeeded = True
         finally:
             elapsed = (work_clock() - start) * 1000
