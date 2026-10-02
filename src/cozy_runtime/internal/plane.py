@@ -8,7 +8,11 @@ never reorders a schedule. It maps, copies, streams and counts; `weights.py` and
 from __future__ import annotations
 
 from types import ModuleType
-from typing import Any
+from typing import TYPE_CHECKING, Final
+
+if TYPE_CHECKING:
+    from tensorfs import ReadLease, Store
+    from tensorfs.plane import Plane, Source
 
 import msgspec
 
@@ -20,7 +24,7 @@ except ImportError:  # an older TensorFS: the executor offers no `weight_plane/1
 
 #: The executor capability a Worker negotiates on (`hello.memory`).
 CAPABILITY = "weight_plane/1"
-PINNED = "pinned"
+PINNED: Final = "pinned"
 #: Priorities are plain integers; the plane evicts ascending and never picks among equals, so
 #: every band carries the LRU clock. Idle regions (a finished stage's) sit lowest; a running
 #: stage's streamed and demand-filled blocks above them, each newer one above the older; its
@@ -129,27 +133,28 @@ def available() -> bool:
     return _plane is not None
 
 
-def open_plane(device: int | None) -> Any:
+def open_plane(device: int | None) -> Plane:
     """One plane per executor process (phase 1), over this rank's device; `None` opens the
     host tier alone (no CUDA), which fills pinned memory before any device is granted."""
     if _plane is None:
         raise Unavailable("this TensorFS build carries no weight plane")
     try:
-        return _plane.Plane(devices=[] if device is None else [device])
+        opened: Plane = _plane.Plane(devices=[] if device is None else [device])
+        return opened
     except _plane.PlaneError as exc:  # no CUDA driver here (CPU or MPS executor)
         raise Unavailable(f"the weight plane cannot open device {device}: {exc}") from exc
 
 
-def source(plane: Any, store: Any, lease: Any) -> Any:
+def source(plane: Plane, store: Store, lease: ReadLease) -> Source:
     """One manifest's read source, shared by its components' weight sets; consumes `lease`."""
     return plane.source(store, lease)
 
 
-def stats(plane: Any) -> Stats:
+def stats(plane: Plane) -> Stats:
     return msgspec.convert(plane.stats(), Stats)
 
 
-def events(plane: Any) -> list[Event]:
+def events(plane: Plane) -> list[Event]:
     return msgspec.convert(plane.events(), list[Event])
 
 
