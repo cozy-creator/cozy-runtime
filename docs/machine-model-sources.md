@@ -72,3 +72,24 @@ work and must be interpreted with the existing load-stage telemetry. The diagnos
 Runtime wheel is installed only in a separate immutable `profile-env`, preserving the
 original candidate and SDK99. All 34 source/read-lease/skew CPU tests, Ruff and compile
 checks pass with these timing records.
+
+Bounded verification continuation keeps the same untrusted native constructor and every
+SHA/length/readonly/immutable-inode check. The main thread serializes exchanges, while a
+stdlib worker pool imports descriptors. Width derives from affinity/cgroup CPU quota
+(half the entitlement, up to4) and live host headroom; unreadable/tight resources use1.
+Pending FD count and declared object bytes are bounded. An object larger than the byte
+window runs alone, without a size refusal or complete private byte copy. The worker
+atomically takes received-FD custody and closes it after native import; cancellation
+closes only unstarted offers. Failure drains started imports and publishes no partial
+new descriptor cache. Repeated components reuse previously verified handles.
+
+All37 source/read-lease/skew CPU checks pass, including oversized single-worker fallback,
+corrupt immutable export rejection, and multiple real pending imports drained without
+FD/mapping leaks or partial cache. The isolated coherent verified-parallel environment
+imported actualSDXL2601 objects under unchanged soft FD limit1024: workers3, pending6FDs/
+128MiB, observed FD peak14 from baseline5, full-source wall2.902s. Repeating every component
+made zero additional object RPCs. No CUDA/catalog or authored model import occurred.
+Aggregate constructor_ms is the sum of overlapping worker durations, not elapsed source
+time. This CPU throughput gate does not establish GPU load latency; root runs unchanged
+SDXL3 requests before any model performance conclusion. Original and profile envs remain
+immutable; no attestation/trust shortcut or environment logic switch was introduced.
