@@ -93,3 +93,15 @@ Aggregate constructor_ms is the sum of overlapping worker durations, not elapsed
 time. This CPU throughput gate does not establish GPU load latency; root runs unchanged
 SDXL3 requests before any model performance conclusion. Original and profile envs remain
 immutable; no attestation/trust shortcut or environment logic switch was introduced.
+
+Root-owned actual A40 qualification then passed the same three unchanged published SDXL
+requests with Store empty and full verification retained: 2,606 source exports during
+load, zero during all three inference calls. Verified-parallel load measured7,506.65ms
+versus11,629.0ms for the sequential source candidate after efficient observation/no
+external sampling. Worker width3/pendingFD6/window128MiB were recorded. Constructor_ms
+is an overlapping worker sum; elapsed source records must not be summed with that value.
+First start in the new environment was10,808ms and has cache/environment confounders,
+so no full cold-start ratio or ComfyUI comparison is claimed. This qualifies the real
+world-one SDXL descriptor/verification path on A40; it does not complete Degree1 host
+memory ownership/accounting,8GB/display GPU safety, ordinary Cozy CLI, streaming/H3,
+multi-GPU/NCCL or Degree2. Root owns saved GPU artifacts and independent image verification.
