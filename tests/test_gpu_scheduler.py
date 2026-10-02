@@ -1086,9 +1086,10 @@ def test_memory_pressure_vacates_idle_co_tenants_on_every_rank_device_and_kills_
 ) -> None:
     """Darkness 1513: the group's attempt freed only its lead card, and rank 3 refused
     `device_shortfall` beside an idle Qwen on card 3. A group short of room takes idle
-    co-tenants off the rank cards it is short on, LRU-first: a plane executor's unmeasured
-    shape is admitted optimistically, so only the short card's neighbour is cut; an older
-    executor's has every card. Their processes stay, and the caller is never its own victim."""
+    co-tenants off the rank cards it is short on, LRU-first. The shot's shape was never
+    measured, so it cannot say what it needs: every rank's idle neighbour gives room, for a
+    plane executor as for an older one. Their processes stay, and the caller is never its own
+    victim."""
     shot, by_lane = _warm_shot(machine, monkeypatch)
     worker = machine.worker
     before = machine.executors()
@@ -1122,8 +1123,7 @@ def test_memory_pressure_vacates_idle_co_tenants_on_every_rank_device_and_kills_
         worker._arbitrate_residency(attempt, slot)
         worker.memory.end(h3)
     assert hosted.supervision.current is not None
-    plane = memory.plane_capable(hosted.supervision.current)
-    first = [q0] if plane else [q0, q1, q2]
+    first = [q0, q1, q2]
     assert vacated() == first
     # Qwen on card 1 needs room: the idle H3 group is its only co-tenant there
     machine.free.pop("0")  # type: ignore[attr-defined]
