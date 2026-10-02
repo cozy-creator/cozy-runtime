@@ -280,7 +280,7 @@ class MemoryManager:
     def room(self, lane: DeviceLane, slot: str, need: dict[int, int], why: str) -> bool:
         """Cut idle tenants until `need` is free on each of `lane`'s devices. Whether it is,
         as the driver measures it now: another process's memory counts as it stands."""
-        measured = self.make_room(lane, slot, need, why)
+        measured = self.make_room(lane, slot, need, why, contexts=True)
         return all(
             m.state == "measured" and m.free_bytes >= need.get(o, 0) for o, m in measured.items()
         )
@@ -392,15 +392,22 @@ class MemoryManager:
             row.activation.pop(shape, None)
 
     def make_room(
-        self, lane: DeviceLane, slot: str, need: dict[int, int] | None, why: str
+        self,
+        lane: DeviceLane,
+        slot: str,
+        need: dict[int, int] | None,
+        why: str,
+        *,
+        contexts: bool = False,
     ) -> dict[int, DeviceMemory]:
         """Cut idle tenants of `lane`'s devices until `need` is free on each (None: the whole
-        device), for a load or an older executor that asks for room."""
+        device), for a load or an older executor that asks for room. With `contexts`, a
+        shortfall that remains ends idle processes too, for the device contexts they hold."""
 
         def short(o: int, memory: DeviceMemory) -> bool:
             return need is None or memory.free_bytes < need.get(o, 0)
 
-        measured, _ = self._give(lane, slot, short, why)
+        measured, _ = self._give(lane, slot, short, why, contexts=contexts)
         if need is not None and (
             left := [o for o, m in measured.items() if m.state == "measured" and short(o, m)]
         ):
@@ -438,7 +445,11 @@ class MemoryManager:
         # A stage whose activations were never measured cannot say what it needs: every idle
         # tenant of its GPUs gives room, least recently used first.
         read, evicted = self._give(
-            lane, tenant, lambda o, m: banked is None or want is None or usable(m) < want, why
+            lane,
+            tenant,
+            lambda o, m: banked is None or want is None or usable(m) < want,
+            why,
+            contexts=banked is not None,
         )
         if any(m.state != "measured" for m in read.values()):
             self.note("residency", f"{lane.lane_id}: unreadable; {tenant!r} derives its budget")
@@ -501,7 +512,7 @@ class MemoryManager:
             refill = built if o in row.emptied else missing
             return grow is None or memory.free_bytes + min(ledger.slack, grow) < grow + refill
 
-        read, evicted = self._give(lane, tenant, short, why)
+        read, evicted = self._give(lane, tenant, short, why, contexts=grow is not None)
         fits = grow is None or all(
             m.state == "measured" and not short(o, m) for o, m in read.items()
         )
@@ -523,11 +534,20 @@ class MemoryManager:
         return Budget(whole=fits, evicted=tuple(evicted))
 
     def _give(
-        self, lane: DeviceLane, slot: str, short: Callable[[int, DeviceMemory], bool], why: str
+        self,
+        lane: DeviceLane,
+        slot: str,
+        short: Callable[[int, DeviceMemory], bool],
+        why: str,
+        *,
+        contexts: bool = False,
     ) -> tuple[dict[int, DeviceMemory], list[str]]:
         """Cut idle tenants from `lane`'s short devices until none is short or nobody is left:
-        one driver read, and one more after each cut."""
+        one driver read, and one more after each cut. With `contexts`, a measured need that
+        cuts did not meet then ends idle processes, least recently used first, for the device
+        contexts they hold: an idle executor stays warm only while there is room for it."""
         tried: set[str] = set()
+        ended: set[str] = set()
         evicted: list[str] = []
         while True:
             measured = lane.measure(self.kind)
@@ -536,11 +556,35 @@ class MemoryManager:
                 return measured, evicted
             devices = {o for o, m in measured.items() if short(o, m)}
             victim = self._victim(slot, devices, tried) if devices else None
-            if victim is None:
+            if victim is not None:
+                tried.add(victim[0])
+                evicted.append(victim[0])
+                self._cut(victim, slot, why, devices)
+                continue
+            idle = self._idle_context(slot, devices, ended) if devices and contexts else None
+            if idle is None:
                 return measured, evicted
-            tried.add(victim[0])
-            evicted.append(victim[0])
-            self._cut(victim, slot, why, devices)
+            other, other_lane, _row, executor = idle
+            ended.add(other)
+            evicted += [other] if other not in evicted else []
+            self.note(
+                "residency",
+                f"{other_lane.lane_id}: {other!r} (epoch {executor.epoch} pid {executor.pid}) is "
+                f"idle and holds only its device context; ended for {slot!r} on {why}",
+            )
+            self.reclaim(other, executor, f"idle context reclaimed for {slot!r} on {why}")
+
+    def _idle_context(self, slot: str, short: set[int], ended: set[str]) -> Victim | None:
+        """The least recently used idle process on `short` that holds a device context and
+        nothing a cut could still take. Never `slot`, never a tenant in its turn or mid-call."""
+        idle: list[Victim] = []
+        for other, lane, row in self.tenants(short):
+            executor = row.supervision.current if row.supervision is not None else None
+            if other == slot or other in ended or other in self.active or executor is None:
+                continue
+            if executor.started and executor.alive() and not executor.busy():
+                idle.append((other, lane, row, executor))
+        return min(idle, key=lambda item: item[2].last_used, default=None)
 
     def _victim(self, slot: str, short: set[int], tried: set[str]) -> Victim | None:
         """The next tenant to give room on `short`: a dead one, else the least recently used

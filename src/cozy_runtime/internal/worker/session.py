@@ -6002,7 +6002,9 @@ class Worker:
                 )
                 self._rebuild_lane(lane, attempt.placement_id)
                 self.memory.unmap(attempt.placement_id, "its refused load")
-                self.memory.make_room(lane, attempt.placement_id, None, "its refused load")
+                self.memory.make_room(
+                    lane, attempt.placement_id, None, "its refused load", contexts=True
+                )
 
     @staticmethod
     def _exhausted(lane: DeviceLane, exc: AttemptRefusal | MemoryShortfall) -> DeviceExhausted:
@@ -6671,7 +6673,9 @@ class Worker:
                 return refuse("no_durable_exchange", "device_room or host_tier only")
             need = request.free_bytes
             why = f"its executor needs {need} B free"
-            self.memory.make_room(lane, slot, {ordinal: need for ordinal in lane.ordinals}, why)
+            self.memory.make_room(
+                lane, slot, {ordinal: need for ordinal in lane.ordinals}, why, contexts=True
+            )
             try:
                 return Room(ok=True, authorized_device_limit_bytes=self._ceiling(lane, slot))
             except LaneRefusal as exc:

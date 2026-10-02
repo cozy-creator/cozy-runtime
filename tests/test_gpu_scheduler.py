@@ -1200,6 +1200,47 @@ def test_a_tenants_budget_leaves_what_an_executor_waiting_to_start_wants(
 
 
 @needs_executor
+def test_idle_contexts_are_reclaimed_least_recently_used_first_only_where_room_is_short(
+    machine: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every construction that ever ran leaves a process, and its device context, on its GPU
+    (8 of them took ~19 GB of one H100 and a later load did not fit). An idle executor stays
+    warm while there is room. When a measured need is still short after every idle weight
+    byte was cut, idle processes end, least recently used first, until it fits: only on the
+    short GPUs, never the asker's own, and each restarts at its next grant."""
+    shot, by_lane = _warm_shot(machine, monkeypatch)
+    worker = machine.worker
+    h3 = by_lane["lane-0+1+2+3"]
+    q0, q1, q2 = (by_lane[k] for k in ("lane-0", "lane-1", "lane-2"))
+    group = worker._lane_of(h3)
+    before = machine.executors()
+    for hosted in worker.hosted.values():  # each was started on its GPUs: it holds a context
+        assert hosted.supervision.current is not None
+        hosted.supervision.current.started = {"ok": True}
+    context = 2 * GiB
+    reclaim = worker.memory.reclaim
+
+    def ended(tenant: str, executor: Any, why: str) -> bool:
+        done = reclaim(tenant, executor, why)
+        gpu = str(worker._lane_of(tenant).ordinals[0])
+        machine.free[gpu] += context  # type: ignore[attr-defined]  # what the driver reads next
+        return done
+
+    monkeypatch.setattr(worker.memory, "reclaim", ended)
+    machine.free.update({"0": GiB, "1": GiB})  # type: ignore[attr-defined]
+    need = {0: 3 * GiB, 1: 3 * GiB, 2: 3 * GiB}
+
+    worker.memory.make_room(group, h3, need, "a load")
+    assert machine.executors() == before, "cuts alone end no process"
+    worker.memory.make_room(group, h3, need, "a load", contexts=True)
+    assert set(before) - set(machine.executors()) == {q0, q1}, "GPU 2 had room: q2 stays warm"
+    assert h3 in machine.executors() and q2 in machine.executors()
+    steps = [e.step for e in worker.activity if "holds only its device context" in e.step]
+    assert [s.split("'")[1] for s in steps] == [q0, q1], "least recently used first"
+    assert machine.granted(shot) == [0, 1, 2, 3]
+
+
+@needs_executor
 def test_a_busy_tenant_outside_its_turn_gives_room_through_its_budget_cell(
     machine: Machine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
