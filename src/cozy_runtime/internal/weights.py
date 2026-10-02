@@ -423,6 +423,43 @@ class Weights:
                 f"memory back ({after} B allocatable before and after)",
             )
 
+    @contextmanager
+    def reading(self, standins: Sequence[Any], op: str) -> Iterator[Read]:
+        """A weight read outside its own module's forward (a fused kernel handed a sibling's
+        scale, a package reading `.weight`): its region is mapped and leased for the op, as
+        its forward would, and leaves with it. Only inside its component's stage: anywhere
+        else the read is refused, and no kernel is ever handed its empty pointer."""
+        opened = self.opened()
+        held: list[tuple[Component, Region, Lease]] = []
+        try:
+            for standin in standins:
+                origin = standin.origin
+                if origin is None or origin[0] is not self:
+                    raise _unbound_read(op)
+                _, component, region, _, _ = origin
+                row = opened.get(component.key)
+                if row is None or row[2] is not component:
+                    raise _unbound_read(op)
+                if region.bound is None and all(region is not other for _, other, _ in held):
+                    held.append((component, region, row[0]._lease(component, region, op)))
+            for _, region, lease in held:  # a re-plan for a later lease unbound earlier ones
+                bind(self.torch, region, lease)
+            real: dict[int, Tensor] = {}
+            for standin in standins:
+                _, _, _, table, name = standin.origin
+                value = table[name]
+                if value is None or type(value) is type(standin):
+                    raise _unbound_read(op)
+                real[id(standin)] = value.to(dtype=standin.dtype, device=standin.device)
+            yield Read(
+                real, tuple((r.bound, r.bound + r.span) for _, r, _ in held if r.bound is not None)
+            )
+        finally:
+            for component, region, lease in reversed(held):
+                if region.index not in component.resident:
+                    unbind(region)
+                lease.release()
+
     def drain(self) -> None:
         """Read the plane's events: a region evicted from this device goes back to meta before
         any kernel could read unmapped pages (a pinned-tier eviction leaves it bound)."""
@@ -685,6 +722,9 @@ def _unbound_type(torch: ModuleType) -> type:
     base: type = torch.Tensor
 
     class Unbound(base):  # type: ignore[misc]
+        #: where its bytes bind: (weights, component, region, table, name)
+        origin: tuple[Weights, Component, Region, Table, str] | None = None
+
         @staticmethod
         def parameter(held: Tensor) -> Tensor:
             out: Tensor = torch.nn.Parameter(held, requires_grad=False)
@@ -699,6 +739,16 @@ def _unbound_type(torch: ModuleType) -> type:
             )
 
         @classmethod
+        @contextmanager
+        def reading(cls, standins: Sequence[Any], op: str) -> Iterator[Read]:
+            """Real bytes behind `standins` for one op (`Weights.reading`), or a refusal."""
+            origin = next((s.origin for s in standins if s.origin is not None), None)
+            if origin is None:
+                raise _unbound_read(op)
+            with origin[0].reading(standins, op) as read:
+                yield read
+
+        @classmethod
         def __torch_dispatch__(
             cls, func: Any, types: Any, args: tuple[Any, ...] = (), kwargs: Any = None
         ) -> Any:
@@ -706,17 +756,60 @@ def _unbound_type(torch: ModuleType) -> type:
                 return args[0]
             if func is aten._to_copy.default:
                 held, options = args[0], kwargs or {}
-                return cls(
+                copy = cls(
                     tuple(held.shape),
                     options.get("dtype") or held.dtype,
                     options.get("device") or held.device,
                 )
-            raise RuntimeError(
-                f"{func}: a weight is read while no plane bytes are bound to it (outside its "
-                "block's forward, or after its stage)"
-            )
+                copy.origin = held.origin
+                return copy
+            kwargs = kwargs or {}
+            operands = (*args, *kwargs.values())
+            standins = [v for v in _tensor_operands(operands) if isinstance(v, cls)]
+            if func._schema.is_mutable and any(
+                isinstance(v, cls) for v in _tensor_operands(tuple(_written(func, args, kwargs)))
+            ):
+                raise _unbound_read(str(func))  # a write would be lost with the mapping
+            with cls.reading(standins, str(func)) as read:
+                return read.kept(
+                    func(
+                        *(read.operand(v) for v in args),
+                        **{k: read.operand(v) for k, v in kwargs.items()},
+                    )
+                )
 
     return Unbound
+
+
+def _unbound_read(op: str) -> ResidencyRefusal:
+    return ResidencyRefusal(
+        "weight_unbound",
+        f"{op}: a weight is read while no plane bytes are bound to it (outside its stage)",
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class Read:
+    """Weights mapped for one op that reads them outside their own module's forward."""
+
+    #: stand-in id -> the bound tensor it stands for
+    real: dict[int, Tensor]
+    #: device address ranges the op's leases hold
+    spans: tuple[tuple[int, int], ...]
+
+    def operand(self, value: Any) -> Any:
+        if isinstance(value, (tuple, list)):
+            return type(value)(self.real.get(id(item), item) for item in value)
+        return self.real.get(id(value), value)
+
+    def kept(self, out: Any) -> Any:
+        """The op's result, without a view into bytes that leave with the op's leases."""
+        if isinstance(out, (tuple, list)):
+            return type(out)(self.kept(item) for item in out)
+        if not getattr(out, "is_cuda", False) or not out.numel():
+            return out
+        address = int(out.data_ptr())
+        return out.clone() if any(a <= address < b for a, b in self.spans) else out
 
 
 def _recovery_type(torch: ModuleType) -> type:
@@ -1367,7 +1460,7 @@ class PlaneBackend:
             regions.append(region)
         common = regions[0] if kept[0][0] == 0 else None
         blocks = [region for region in regions if region is not common]
-        return Component(
+        component = Component(
             name=name,
             key=f"{self.construction}/{name}",
             root=root,
@@ -1383,6 +1476,10 @@ class PlaneBackend:
             ),
             fine=fine,
         )
+        for region in regions:
+            for table, attr, standin in region.unbound:
+                standin.origin = (weights, component, region, table, attr)
+        return component
 
 
 @dataclass(frozen=True, slots=True)
@@ -2032,6 +2129,7 @@ class WeightResidency:
         self._unhook(name)
         component = self.components[name] = self.refine(name)
         self._hook(component)
+        self.weights.modes[f"{name}.grain"] = "sub-block"
         return True
 
     def _block(
@@ -2096,7 +2194,9 @@ class WeightResidency:
                             raise
                         need = _requested(exc) or region.span
                 finally:
-                    if lease.ring_offset is not None:
+                    # Outside its lease only a stage-resident region stays bound: any other
+                    # read finds the stand-in (`Weights.reading`), never a stale address.
+                    if region.index not in component.resident:
                         unbind(region)
                     lease.release()
                 if weights.grouped or region.mutates is not False:
@@ -2129,12 +2229,35 @@ class WeightResidency:
         block is the one it can displace."""
         weights = self.weights
         if component.cursor is not None:
-            return component.cursor.acquire(index, stream)
-        priority = None if index in component.resident else plane.STREAMED + weights.tick()
-        lease: Lease = weights.plane.acquire(
-            component.ws, weights.index, index, stream, priority=priority
-        )
+            lease: Lease = component.cursor.acquire(index, stream)
+        else:
+            priority = None if index in component.resident else plane.STREAMED + weights.tick()
+            lease = weights.plane.acquire(
+                component.ws, weights.index, index, stream, priority=priority
+            )
+        weights.drain()  # what this fill displaced is unbound at once, in every weight set
         return lease
+
+    def _lease(self, component: Component, region: Region, op: str) -> Lease:
+        """A region's lease for an op that reads it outside its forward (`Weights.reading`)."""
+        weights = self.weights
+        while True:
+            try:
+                return self._acquire(component, region.index, weights.stream())
+            except self._capacity:
+                if weights.running:
+                    raise self._shortfall(
+                        weights.open[-1][1],
+                        region.span,
+                        0,
+                        f"{op} reads {component.name}.{region.path} inside another block's "
+                        "forward, whose lease no weight can leave under",
+                    ) from None
+                weights.open[-1][0]._make_room(
+                    region.span,
+                    {component.key: region.index},
+                    f"{op} ({component.name}.{region.path})",
+                )
 
     def _make_room(self, need: int, resume: Mapping[str, int] = {}, op: str = "") -> None:
         """Activations first: unmap `need` bytes of weights, idle ones first, then re-place the

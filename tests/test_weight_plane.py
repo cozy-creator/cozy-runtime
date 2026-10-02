@@ -25,7 +25,8 @@ from tensorfs.derived import Config as NativeConfig  # noqa: E402
 from tensorfs.derived import Derivation, Part, Target, Tensor  # noqa: E402
 
 from cozy_runtime.author._loader import census  # noqa: E402
-from cozy_runtime.internal import accel, plane, weight_policy  # noqa: E402
+from cozy_runtime.internal import accel, paging, plane, weight_policy  # noqa: E402
+from cozy_runtime.internal import weights as weights_module  # noqa: E402
 from cozy_runtime.internal.derive import Observations, serving_substrate  # noqa: E402
 from cozy_runtime.internal.encoding import SPEC_PLAIN  # noqa: E402
 from cozy_runtime.internal.fill import Checkpoint  # noqa: E402
@@ -226,6 +227,24 @@ def test_an_unbound_weight_is_parked_as_packages_know_it() -> None:
     assert standin.to(torch.float32).untyped_storage().nbytes() == 0
 
 
+def test_a_kernel_launch_is_never_handed_a_weight_with_no_bytes() -> None:
+    """A Triton kernel reads its operands by pointer. One that is a weight with no plane
+    bytes bound, which nothing here can map (no stage owns it), is refused before the launch;
+    every other operand passes through untouched."""
+    from cozy_runtime.internal import fusion
+    from cozy_runtime.internal.weights import ResidencyRefusal, unbound
+
+    launched: list[tuple[Any, ...]] = []
+    kernel = {(4, 1, 1): lambda *args: launched.append(args)}
+    scale = torch.ones(8)
+    fusion._Launch(kernel)[(4, 1, 1)](scale, 8, 1e-6)
+    assert len(launched) == 1 and launched[0][0] is scale and launched[0][1:] == (8, 1e-6)
+    standin = unbound(torch, torch.nn.Parameter(torch.empty(8)), torch.device("cpu"))
+    with pytest.raises(ResidencyRefusal, match="no plane bytes") as refused:
+        fusion._Launch(kernel)[(4, 1, 1)](scale, standin, 8)
+    assert refused.value.code == "weight_unbound" and len(launched) == 1
+
+
 def assert_pinned(weights: Weights, component: Any, values: dict[str, Any]) -> None:
     weights.plane.want(component.ws, "pinned").wait()
     held = mmap.mmap(component.ws.host_fd, component.ws.nbytes, prot=mmap.PROT_READ)
@@ -267,6 +286,145 @@ def test_a_budget_below_the_block_floor_runs_at_the_sub_block_grain(card: Any) -
     assert layout.common + layout.largest > weights.budget
     streamed = run(model, x)
     assert model.residency.components["stack"].fine
+    assert same(resident, streamed)
+
+
+HEADS = 16
+
+
+class Scale(torch.nn.Module):  # type: ignore[misc,name-defined]
+    """A norm's scale, which its owner reads without calling the norm (as fused kernels do)."""
+
+    eps = 1e-6
+
+    def __init__(self, width: int) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.empty(width, dtype=torch.float16))
+
+
+class SiblingBlock(Block):
+    """Reads its sub-modules' weights itself: a norm scale, and a whole projection."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.scale = Scale(HIDDEN)
+
+    def forward(self, x: Any) -> Any:
+        hidden = torch.tanh(self.proj(x * self.norm * self.scale.weight))
+        return x + torch.tanh(torch.nn.functional.linear(hidden, self.out.weight))
+
+
+class FusedBlock(torch.nn.Module):  # type: ignore[misc,name-defined]
+    """A Cosmos self-attention as Anima runs it: the Runtime's fused processor, which hands
+    the head norms' scales to our compiled kernel (read by pointer, outside torch)."""
+
+    heads = HEADS
+
+    def __init__(self) -> None:
+        super().__init__()
+        for name in ("to_q", "to_k", "to_v"):
+            setattr(self, name, torch.nn.Linear(HIDDEN, HIDDEN, bias=False, dtype=torch.float16))
+        self.to_out = torch.nn.ModuleList(
+            [torch.nn.Linear(HIDDEN, HIDDEN, bias=False, dtype=torch.float16), torch.nn.Identity()]
+        )
+        self.norm_q, self.norm_k = Scale(HIDDEN // HEADS), Scale(HIDDEN // HEADS)
+
+    def forward(self, x: Any) -> Any:
+        from cozy_runtime import _kernels
+        from cozy_runtime.internal.anima_optimization import _FusedSelfAttention, _RopeMatrix
+
+        fused = _FusedSelfAttention(torch, _kernels, _RopeMatrix(torch))
+        turn = torch.eye(2, device=x.device).expand(1, 1, x.shape[0], 64, 2, 2).contiguous()
+        return x + torch.tanh(fused(self, x[None], image_rotary_emb=turn)[0])
+
+
+def stack_of(
+    block: type, matrices: tuple[str, ...], scales: tuple[tuple[str, int], ...]
+) -> tuple[Any, dict[str, Any]]:
+    """A `Stack` of `block`s and its checkpoint: each block's projections and norm scales."""
+
+    class Stacked(Stack):
+        _no_split_modules = (block.__name__,)
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.blocks = torch.nn.ModuleList([block() for _ in range(BLOCKS)])
+
+    generator = torch.Generator().manual_seed(7)
+    values: dict[str, Any] = {"embed": torch.rand(HIDDEN, generator=generator) + 0.5}
+    for index in range(BLOCKS):
+        for name in matrices:
+            values[f"blocks.{index}.{name}.weight"] = (
+                torch.randn(HIDDEN, HIDDEN, generator=generator) / HIDDEN**0.5
+            )
+        for name, width in scales:
+            key = f"blocks.{index}.{name}"
+            values[key if name == "norm" else f"{key}.weight"] = (
+                torch.rand(width, generator=generator) + 0.5
+            )
+    return Stacked, values
+
+
+def at_the_sub_block_grain(weights: Weights, model: Any, x: Any) -> tuple[list[Any], list[Any]]:
+    """The model's outputs resident, then in a budget below its block floor."""
+    weights.set_budget(1 << 30)
+    resident = run(model, x)
+    layout = model.residency.components["stack"].layout
+    assert layout.fine is not None
+    weights.set_budget(layout.fine[0] + 2 * layout.fine[1])
+    streamed = run(model, x)
+    assert model.residency.components["stack"].fine
+    assert weights.modes["stack.grain"] == "sub-block"  # the run record's confession
+    return resident, streamed
+
+
+@on_card
+def test_weights_read_outside_their_modules_forward_stream_exact(tmp_path: Path) -> None:
+    """A weight is bound inside its own module's forward, and code reads weights other ways:
+    a block multiplies by a sibling norm's scale, a package reaches for `.weight`. At the
+    sub-block grain those modules are regions of their own that nothing calls. The small one
+    stays in `common` (bound for the stage); the large one is mapped and held for the one op
+    that reads it. Either way the bits are the resident run's."""
+    weights = Weights(torch, torch.device("cuda", 0), "cuda")
+    weights.set_budget(-1, pinned=1 << 30)
+    factory, values = stack_of(SiblingBlock, ("proj", "out"), (("norm", HIDDEN), ("scale", HIDDEN)))
+    model = load(weights, store_component(tmp_path, "stack", values), "siblings", factory=factory)
+    x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
+    resident, streamed = at_the_sub_block_grain(weights, model, x)
+    component = model.residency.components["stack"]
+    assert component.common is not None
+    assert {f"blocks.{i}.scale.weight" for i in range(BLOCKS)} <= {
+        w.row.name for w in component.common.weights
+    }
+    assert "blocks.0.out" in {region.path for region in component.blocks}
+    assert same(resident, streamed)
+
+
+@on_card
+@pytest.mark.parametrize("small", [paging.SMALL, 1 << 40])
+def test_a_kernel_launched_outside_torch_never_reads_an_unmapped_weight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, small: int
+) -> None:
+    """Run 2744, the laptop's Xid 31: at the sub-block grain Anima's fused self-attention
+    handed its head norms' scales to our compiled kernel while no plane bytes were bound to
+    them, and the kernel read a pointer with nothing mapped behind it. The scales stay in
+    `common`; and were one its own region after all (the second case), the launch maps it
+    first (`accel.readable`) and never faults the device."""
+    pytest.importorskip("cozy_runtime._kernels._C")
+    pytest.importorskip("diffusers")
+    own_region = small != paging.SMALL
+    monkeypatch.setattr(paging, "SMALL", small)
+    weights = Weights(torch, torch.device("cuda", 0), "cuda")
+    weights.set_budget(-1, pinned=1 << 30)
+    width = HIDDEN // HEADS
+    factory, values = stack_of(
+        FusedBlock, ("to_q", "to_k", "to_v", "to_out.0"), (("norm_q", width), ("norm_k", width))
+    )
+    model = load(weights, store_component(tmp_path, "stack", values), "kernel", factory=factory)
+    x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
+    resident, streamed = at_the_sub_block_grain(weights, model, x)
+    units = {region.path for region in model.residency.components["stack"].blocks}
+    assert ("blocks.0.norm_q" in units) == own_region
     assert same(resident, streamed)
 
 
@@ -335,14 +493,28 @@ def sdxl_unet() -> Any:
     ).to(torch.float16)
 
 
+def refined(model: Any, name: str) -> weight_policy.Layout:
+    """Move a component to the sub-block grain, as a budget below its block floor does."""
+    model.residency.unpark()
+    assert model.residency._refine(model.residency.components[name].key)
+    component = model.residency.components[name]
+    assert component.fine and len(component.blocks) > 1
+    layout: weight_policy.Layout = component.layout
+    return layout
+
+
 @on_card
-@pytest.mark.parametrize("pressure", [False, True])
-def test_an_sdxl_unet_streams_bit_exact(tmp_path: Path, pressure: bool) -> None:
+@pytest.mark.parametrize("pressure,fine", [(False, False), (True, False), (False, True)])
+def test_an_sdxl_unet_streams_bit_exact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pressure: bool, fine: bool
+) -> None:
     """SDXL's UNet resident, then streamed through a tight budget, computes the same bits.
     Under pressure the streamed arm alone also has a ballast leaving only the plane's budget
     and the resident run's measured activations free, as physical ballast does in G4: every
     streamed lease's bytes are checked against the store (`verify_bytes`), so a difference
     can only be the kernels' choice under memory pressure."""
+    if fine:  # the sub-block grain of a UNet this small: units of at most 256 KiB
+        monkeypatch.setattr(weights_module, "REGION_LIMIT", 256 << 10)
     torch.manual_seed(11)
     values = {k: v.float() * 0.05 for k, v in sdxl_unet().state_dict().items()}
     weights = Weights(torch, torch.device("cuda", 0), "cuda")
@@ -378,6 +550,8 @@ def test_an_sdxl_unet_streams_bit_exact(tmp_path: Path, pressure: bool) -> None:
     resident = steps()
     peak = torch.cuda.max_memory_allocated() - base
     layout: weight_policy.Layout = model.residency.components["unet"].layout
+    if fine:
+        layout = refined(model, "unet")
     weights.set_budget(layout.common + 3 * layout.largest)
     ballast = None
     if pressure:
@@ -856,6 +1030,31 @@ def test_h3_with_its_loras_pages_instead_of_running_out(tmp_path: Path) -> None:
     assert now.streamed["fl2va_dit"].resident_blocks < len(layout.blocks)
     assert now.h2d_bytes > was.h2d_bytes and now.evictions > was.evictions
     assert now.oom_retries > was.oom_retries
+    assert same(list(resident), list(paged))
+
+
+@on_card
+def test_h3_with_its_loras_at_the_sub_block_grain_is_bit_exact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """H3's DiT (its LoRA consumers, the turbo bank's factors read from its blocks) with its
+    blocks split into their projections computes the resident run's bits."""
+    monkeypatch.setattr(weights_module, "REGION_LIMIT", 1 << 20)
+    weights = Weights(torch, torch.device("cuda", 0), "cuda")
+    weights.set_budget(-1, pinned=1 << 30)
+    dit, turbo = h3_models(weights, tmp_path, "h3-fine")
+    inputs = h3_inputs("cuda")
+    weights.set_budget(1 << 30)
+    resident, _ = h3_reference(weights, dit, turbo, inputs)
+    turbo.residency.unpark()
+    layout = refined(dit, "fl2va_dit")
+    overlay = turbo.residency.components["fl2va_turbo"].layout.total
+    weights.set_budget(layout.common + overlay + 3 * layout.largest)
+    try:
+        paged = h3_denoise(weights, dit, turbo, inputs, lambda step: None)
+    finally:
+        torch.cuda.empty_cache()
+    assert weights.facts().streamed["fl2va_dit"].resident_blocks < len(layout.blocks)
     assert same(list(resident), list(paged))
 
 

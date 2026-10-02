@@ -22,6 +22,8 @@ from __future__ import annotations
 import ctypes
 import subprocess
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -361,6 +363,20 @@ def synchronize(torch: Any, kind: str) -> None:
         raise AcceleratorUnsupported("mps", "synchronize")
     if kind == "cuda":
         torch.cuda.synchronize()
+
+
+@contextmanager
+def readable(*tensors: Any) -> Iterator[tuple[Any, ...]]:
+    """The operands of a kernel launched outside torch's dispatch (Triton, the compiled
+    extension), which reads them by pointer. A weight with no plane bytes bound is a stand-in
+    with nothing behind its pointer: its plane maps and holds it for the launch, or refuses
+    (`weights.Unbound.reading`). Every such launch goes through here, so none is handed one."""
+    standins = [t for t in tensors if hasattr(type(t), "reading")]
+    if not standins:
+        yield tensors
+        return
+    with type(standins[0]).reading(standins, "a kernel launch") as read:
+        yield tuple(read.operand(t) for t in tensors)
 
 
 def drain(torch: Any, kind: str) -> None:

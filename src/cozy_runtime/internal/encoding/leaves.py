@@ -25,6 +25,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from cozy_runtime.internal.accel import readable
 from cozy_runtime.internal.encoding.formats import (
     E4M3_MAX,
     E8M0_BIAS,
@@ -143,9 +144,10 @@ def quantize_activation_rowwise(torch: Any, x: Any) -> tuple[Any, Any]:
             out = torch.empty(rows, columns, dtype=torch.float8_e4m3fn, device=flat.device)
             scale = torch.empty(rows, 1, dtype=torch.float32, device=flat.device)
             try:
-                kernel[(rows,)](
-                    flat, out, scale, columns, flat.stride(0), columns, BLOCK=1024, num_warps=8
-                )
+                with readable(flat) as (flat,):
+                    kernel[(rows,)](
+                        flat, out, scale, columns, flat.stride(0), columns, BLOCK=1024, num_warps=8
+                    )
                 return out, scale
             except Exception:
                 # One honest disable: a device triton cannot serve falls to eager for the
