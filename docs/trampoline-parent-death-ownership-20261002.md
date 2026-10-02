@@ -18,9 +18,13 @@
   observe the kernel guard after exec, actual creator death and wrong-parent refusal;
   process-exit observer gates also pass. Fixture pipes control termination; no timer
   kills or GPU/device imports are used.
-- Privileged gates still required: foreign UID/GID exec and creator death, plus the
-  native Store-owner interaction. The latter intentionally documents the existing
-  loss of the guard; it is not a claim that this narrow trampoline fix repairs it.
+- Privileged gate executed by root on the owned rented CPU fixture: seven passes,
+  one expected native xfail, zero skips, 2.26 seconds. Foreign UID/GID exec and actual
+  creator-death cases pass. A separate test environment used accepted SDK101 and
+  native 0.3.93 wheel `b2fbd5cf`; the genuine SDK generation was untouched.
+  The native Store-owner interaction remains an expected failure, not a claim that
+  this narrow trampoline fix repairs it. The portable bundle is recorded under
+  outputs/cozy-machine-continued-20261002/trampoline-parent-death.
 - Current native 0.3.93 source: `filesystem_identity.rs:59-60` changes fsGID/fsUID,
   `:78-79` restores them, and `:41-42` skips adoption for nonroot callers. Neither
   transition re-arms PDEATHSIG. The fixture opens the actual native Store after
@@ -31,3 +35,19 @@
   146 existing generated `worker_pb2.pyi` errors, with none in the three owned files.
 - The FD observer test duplicates a real pidfd above 2048; its test process raises
   its own soft FD limit to 4096. This is unrelated to descriptor consumer bounds.
+
+## Native follow-up boundary
+
+Preserving an existing parent-death signal is a small separate Linux-local native
+change, but re-arming only when the filesystem guard drops is insufficient: the
+entire I/O scope would remain unprotected. Capture the current thread's configured
+signal and expected parent, preserve it after both credential entry and restoration,
+and re-check the parent after each. Preserve an originally disabled signal; TensorFS
+must not invent a new process lifecycle policy. The persistent creating-thread fix
+remains necessary because `getppid()` cannot detect that thread's death while its
+process is still alive.
+
+Until actual privileged tests cover successful I/O, errors/unwind, parent death
+inside the scope, and nonroot/same-owner no-op behavior, privileged foreign Store
+adoption stays explicitly unresolved. No native policy or production changes were
+made as part of this qualification update.
