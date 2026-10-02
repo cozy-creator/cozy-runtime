@@ -115,6 +115,8 @@ class _Demand:
     counted: bool = True
     #: its attempt holds its whole turn in its device phase (not still dispatching)
     entered: bool = False
+    #: open scopes of its stage turn: the turn is the outermost one's
+    depth: int = 0
 
 
 class Exit(NamedTuple):
@@ -363,13 +365,18 @@ class StageScheduler:
         """A `stage/1` executor's scope asks for its turn; blocks until granted. None when
         `stop()` came first (a cancel, a dead executor). An uncounted scope (a load's warm)
         takes a turn the call's graph and book never see. `cell`, once the request is
-        resolved, refines the graph the call was placed by."""
+        resolved, refines the graph the call was placed by. A scope opened inside the call's
+        own open scope (H3 turbo's LoRA sampler inside its base model's) is part of that turn:
+        it returns at once and its exit ends nothing."""
         with self.lock:
             demand = self.demands.get(key)
             if demand is None or not demand.gpus:
                 return None
             if demand.whole and demand.running:
                 return Grant(demand.gpus, False)  # inside its own whole turn
+            if demand.depth:
+                demand.depth += 1
+                return Grant(demand.gpus, False)
             if cell and not demand.want.cell:
                 self._refine(demand, cell)
             if counted:
@@ -386,7 +393,7 @@ class StageScheduler:
                     demand.asking = False
                 return None
             start = not demand.tenant
-            demand.tenant = True
+            demand.tenant, demand.depth = True, 1
             return Grant(demand.gpus, start)
 
     def exit(
@@ -407,6 +414,9 @@ class StageScheduler:
             if demand.whole:
                 if counted:
                     demand.samples.append(sample)
+                return Exit()
+            if demand.depth > 1:
+                demand.depth -= 1
                 return Exit()
             if not counted:
                 self._free(key)
@@ -439,7 +449,7 @@ class StageScheduler:
             return Exit(past=True)
         # The next turn measures the GPU: this one stays until its executor has unmapped,
         # or the Worker finds the claimant has room beside it.
-        demand.asking = False
+        demand.asking, demand.depth = False, 0
         return Exit(past=True, claim=claim.want)
 
     def yielded(self, key: str) -> None:
@@ -767,6 +777,7 @@ class StageScheduler:
         demand = self.demands.get(key)
         if demand is not None:
             demand.running = demand.asking = False
+            demand.depth = 0
         for o in [o for o, k in self.holder.items() if k == key]:
             del self.holder[o]
 
