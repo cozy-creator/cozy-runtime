@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import hashlib
 import os
+import sys
+import time
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Protocol
 
@@ -37,10 +39,23 @@ class ModelSourceProvider(Protocol):
 class _ObjectItem(msgspec.Struct, tag="object", tag_field="source", frozen=True):
     object: str
     object_length: int
+    what: str = ""
 
 
 class _InlineItem(msgspec.Struct, tag="inline", tag_field="source", frozen=True):
-    pass
+    what: str = ""
+
+
+class SourceProfile(msgspec.Struct, frozen=True):
+    event: str
+    components: list[str]
+    objects: int
+    new_objects: int
+    new_bytes: int
+    rpc_ms: float
+    constructor_ms: float
+    source_build_ms: float
+    total_ms: float
 
 
 def available() -> bool:
@@ -57,9 +72,14 @@ class BrokeredModelSources:
         self.exchange = exchange
         self.headers: dict[str, bytes] = {}
         self.descriptors: dict[tuple[str, str], SourceDescriptor] = {}
+        self.rpc_seconds = 0.0
 
     def _open(self, request: ModelSourceRead) -> SourceBlob:
-        reply = self.exchange(request, SourceBlob)
+        started = time.perf_counter()
+        try:
+            reply = self.exchange(request, SourceBlob)
+        finally:
+            self.rpc_seconds += time.perf_counter() - started
         if not reply.ok or reply.descriptor < 0:
             if reply.descriptor >= 0:
                 os.close(reply.descriptor)
@@ -98,6 +118,10 @@ class BrokeredModelSources:
                 for name in names}
 
     def source(self, plane: Plane, manifest: str, plan: ReadPlan) -> Source:
+        started = time.perf_counter()
+        rpc_before = self.rpc_seconds
+        constructor_seconds = 0.0
+        new_objects, new_bytes = 0, 0
         rows = msgspec.convert(plan.items(), list[_ObjectItem | _InlineItem], strict=True)
         wanted: dict[str, int] = {}
         for row in rows:
@@ -116,13 +140,27 @@ class BrokeredModelSources:
                     if reply.sha256 != object_id.removeprefix("sha256:") or reply.length != length:
                         raise CapabilityError("object grant differs from its read plan",
                                               code="model_source_changed")
+                    before = time.perf_counter()
                     self.descriptors[key] = native_plane.SourceDescriptor(
                         reply.sha256, reply.length, reply.descriptor
                     )
+                    constructor_seconds += time.perf_counter() - before
+                    new_objects += 1
+                    new_bytes += length
                 finally:
                     os.close(reply.descriptor)
             descriptors.append(self.descriptors[key])
-        return plane.source_from_descriptors(descriptors)
+        before = time.perf_counter()
+        source = plane.source_from_descriptors(descriptors)
+        build_seconds = time.perf_counter() - before
+        record = SourceProfile(
+            "diagnostic.model_source", sorted({row.what.partition("/")[0] for row in rows}),
+            len(wanted), new_objects, new_bytes, (self.rpc_seconds - rpc_before) * 1000,
+            constructor_seconds * 1000, build_seconds * 1000,
+            (time.perf_counter() - started) * 1000,
+        )
+        print(msgspec.json.encode(record).decode(), file=sys.stderr)
+        return source
 
     def close(self) -> None:
         self.descriptors.clear()

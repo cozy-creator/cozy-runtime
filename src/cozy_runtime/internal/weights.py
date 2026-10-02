@@ -16,6 +16,7 @@ from __future__ import annotations
 import mmap
 import os
 import re
+import sys
 import time
 import weakref
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
@@ -66,6 +67,23 @@ if TYPE_CHECKING:
     from torch import device as Device
     from torch import dtype as Dtype
     from torch.nn import Module
+
+
+class RegistrationProfile(msgspec.Struct, frozen=True):
+    event: str
+    component: str
+    source_ms: float
+    tiers_ms: float
+    native_register_ms: float
+    total_ms: float
+
+
+class PinnedRegistrationProfile(msgspec.Struct, frozen=True):
+    event: str
+    component: str
+    host_only: bool
+    pinned_budget: int
+    enqueue_ms: float
 
 #: a module's parameter or buffer table (`Module._parameters`, `Module._buffers`)
 type Table = dict[str, Tensor | None]
@@ -430,14 +448,23 @@ class Weights:
         """Track a new weight set and start filling the pinned tier with it. Without a Worker
         budget the tier holds what this process registered, up to half the host's available
         memory; it is optional and shrinkable (page cache and disk remain beneath it)."""
+        started = time.perf_counter()
         self.components[component.key] = component
         if self.host_only:
             self._bind_host(component)
+            print(msgspec.json.encode(PinnedRegistrationProfile(
+                "diagnostic.pinned_register", component.key, True, self.pinned_applied,
+                (time.perf_counter() - started) * 1000,
+            )).decode(), file=sys.stderr)
             return
         if self.pinned < 0:
             total = sum(c.ws.nbytes for c in self.components.values())
             self._pin(min(total, max(_host_available(), 0) // 2 // self.world))
         self._fill(component)
+        print(msgspec.json.encode(PinnedRegistrationProfile(
+            "diagnostic.pinned_register", component.key, False, self.pinned_applied,
+            (time.perf_counter() - started) * 1000,
+        )).decode(), file=sys.stderr)
 
     def _bind_host(self, component: Component) -> None:
         """A CPU executor computes on its pinned tier: every region pinned there (never evicted
@@ -1257,6 +1284,8 @@ class PlaneBackend:
     ) -> Component:
         """Partition the component into regions (common, then each block or sub-block unit),
         register them as one weight set, and bind every stored part to its destinations."""
+        started = time.perf_counter()
+        source_ms = tiers_ms = native_register_ms = 0.0
         try:
             layout = partition(root, REGION_LIMIT if fine else None)
         except ValueError:
@@ -1277,6 +1306,7 @@ class PlaneBackend:
         digest = canonical.digest({"manifest": checkpoint.manifest_id, "regions": ids})
         tiers = None if fine else self.tiers
         with store_refusals(f"registering {name}"):
+            phase = time.perf_counter()
             source_key = (checkpoint.manifest_id if checkpoint.source_provider is None else
                           f"{checkpoint.manifest_id}/{name}")
             source = self.sources.get(source_key)
@@ -1288,7 +1318,11 @@ class PlaneBackend:
                     assert checkpoint.store is not None
                     source = plane.source(weights.plane, checkpoint.store, self.leases.take(name))
                 self.sources[source_key] = source
+            source_ms = (time.perf_counter() - phase) * 1000
+            phase = time.perf_counter()
             held = tiers.ask(key, digest) if tiers is not None else None
+            tiers_ms += (time.perf_counter() - phase) * 1000
+            phase = time.perf_counter()
             try:
                 ws = weights.plane.register(key, source, plan, ids, host_fd=held)
             except plane.error("Invalid"):
@@ -1300,10 +1334,18 @@ class PlaneBackend:
                     os.close(held)  # the plane reopened its own description
             if ws is None:
                 held, ws = None, weights.plane.register(key, source, plan, ids)
+            native_register_ms = (time.perf_counter() - phase) * 1000
         if tiers is not None:
+            phase = time.perf_counter()
             if held is None:
                 tiers.offer(key, digest, ws.host_fd)
             tiers.share(key, digest, ws.host_fd)
+            tiers_ms += (time.perf_counter() - phase) * 1000
+        if checkpoint.source_provider is not None:
+            print(msgspec.json.encode(RegistrationProfile(
+                "diagnostic.component_register", name, source_ms, tiers_ms,
+                native_register_ms, (time.perf_counter() - started) * 1000,
+            )).decode(), file=sys.stderr)
         spans = msgspec.convert(ws.regions, list[_Span])
         placed = {row.what: row for row in msgspec.convert(ws.parts, list[_Placed])}
         sites = _sites(root, name)

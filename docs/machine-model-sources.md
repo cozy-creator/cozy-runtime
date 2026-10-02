@@ -62,3 +62,13 @@ limit toward the hard limit; this is known released behavior, not a general-size
 After the CPU gates, root coordinates unchanged SDXL through the stock executor and
 existing model/codec path, with source mode explicitly recorded and valid saved WebP.
 No model/worker code is copied. No GPU or rental was used by this agent.
+
+Diagnostic continuation retains the same matched candidate code and full integrity
+checks, emitting aggregate stderr records per component for source RPC/constructor/build,
+native registration/host-tier exchanges, and initial pinned registration enqueue. It adds
+no per-object logs, per-step control messages, extra waits or stream synchronization.
+Pinned enqueue time is not fill completion or CUDA HostReg time; those remain native/GPU
+work and must be interpreted with the existing load-stage telemetry. The diagnostic
+Runtime wheel is installed only in a separate immutable `profile-env`, preserving the
+original candidate and SDK99. All 34 source/read-lease/skew CPU tests, Ruff and compile
+checks pass with these timing records.
