@@ -22,6 +22,7 @@ import argparse
 import contextlib
 import fcntl
 import json
+import math
 import os
 import re
 import signal
@@ -323,10 +324,7 @@ def width(unit_bytes: int) -> int:
     """How many compiler processes one wide build runs: every CPU this process may use (its
     affinity and its cgroup's quota), as far as the memory it may still take holds one
     `unit_bytes` process each. Measured each build; the machine is the pod's."""
-    cpus = len(os.sched_getaffinity(0))
-    quota = _read("/sys/fs/cgroup/cpu.max").split()
-    if len(quota) == 2 and quota[0].isdigit() and quota[1].isdigit() and int(quota[1]):
-        cpus = min(cpus, -(-int(quota[0]) // int(quota[1])))
+    cpus = max(1, math.ceil(proctree.available_cpus()))
     memory = [_meminfo("MemAvailable")]
     limit, used = _read("/sys/fs/cgroup/memory.max"), _read("/sys/fs/cgroup/memory.current")
     if limit.isdigit() and used.isdigit():

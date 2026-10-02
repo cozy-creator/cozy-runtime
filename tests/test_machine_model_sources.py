@@ -1,6 +1,7 @@
 """Real owner store + typed socket/fd broker + native descriptor plane, CPU only."""
 from __future__ import annotations
 
+import gc
 import hashlib
 import io
 import mmap
@@ -311,6 +312,7 @@ def test_parallel_failure_drains_pending_imports_without_partial_cache(tmp_path:
         return SourceBlob(ok=True, sha256=sha, length=path.stat().st_size,
                           descriptor=os.open(path, os.O_RDONLY | os.O_CLOEXEC))
 
+    gc.collect()  # settle unrelated fixture finalizers before the exact fd baseline
     baseline = len(list(Path("/proc/self/fd").iterdir()))
     provider = BrokeredModelSources(exchange, limits=VerificationLimits(2, 4, 32 << 20))
     checkpoint = Checkpoint("", manifest, source_provider=provider)

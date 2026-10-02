@@ -13,7 +13,6 @@ from collections.abc import Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import suppress
 from dataclasses import dataclass, field
-from pathlib import Path
 from threading import Lock
 from typing import TYPE_CHECKING, Protocol
 
@@ -75,27 +74,7 @@ class VerificationLimits:
 
     @classmethod
     def for_process(cls) -> VerificationLimits:
-        cpus = float(len(os.sched_getaffinity(0)))
-        root = Path("/sys/fs/cgroup")
-        try:
-            relative = next(
-                line.split("::", 1)[1]
-                for line in Path("/proc/self/cgroup").read_text().splitlines()
-                if line.startswith("0::")
-            )
-            current = root / relative.lstrip("/")
-            while current.is_relative_to(root):
-                try:
-                    quota, period = (current / "cpu.max").read_text().split()
-                    if quota.isdigit() and period.isdigit() and int(period):
-                        cpus = min(cpus, int(quota) / int(period))
-                except (OSError, ValueError):
-                    pass
-                if current == root:
-                    break
-                current = current.parent
-        except (OSError, StopIteration):
-            cpus = 1
+        cpus = proctree.available_cpus()
         available_bytes = proctree.available_host_bytes()
         workers = max(1, min(4, int(cpus // 2)))
         if available_bytes < workers * (16 << 20):

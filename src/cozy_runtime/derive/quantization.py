@@ -10,14 +10,12 @@ from __future__ import annotations
 import contextlib
 import functools
 import math
-import os
 import tempfile
 import threading
 from collections import deque
 from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from importlib.resources import files
-from pathlib import Path
 from typing import IO, Any, NamedTuple
 
 import msgspec
@@ -31,6 +29,7 @@ from cozy_runtime.author import (
     UnsupportedInput,
     _numeric,
 )
+from cozy_runtime.internal import proctree
 
 from . import safetensors_io as st
 from .microscale import (
@@ -607,19 +606,8 @@ def _pool() -> ThreadPoolExecutor:
 
 @functools.cache
 def _cpu_budget() -> int:
-    """CPUs this process may use: its affinity, capped by any cgroup v2 quota above it."""
-    count = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count()
-    with contextlib.suppress(OSError, IndexError, ValueError):
-        root = Path("/sys/fs/cgroup")
-        own = root / Path("/proc/self/cgroup").read_text().split("::", 1)[1].strip().lstrip("/")
-        for directory in (own, *own.parents):
-            if not directory.is_relative_to(root):
-                break
-            with contextlib.suppress(OSError, ValueError):
-                quota, period = (directory / "cpu.max").read_text().split()
-                if quota != "max":
-                    count = min(count or 1, -(-int(quota) // int(period)))
-    return max(1, count or 1)
+    """CPUs this process may use, from the shared affinity/cgroup entitlement."""
+    return max(1, math.ceil(proctree.available_cpus()))
 
 
 def _artifact_plan(raw: bytes) -> ArtifactQuantizationPlan:

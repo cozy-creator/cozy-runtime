@@ -1357,6 +1357,47 @@ def host_memory() -> HostMemory:
     return best
 
 
+
+def available_cpus() -> float:
+    """Live affinity bounded by visible v1/v2 CPU quotas, including ancestors.
+
+    Reuse the containment controller mount/membership resolver: a container's cgroup may
+    be mounted at its own root. Unreadable/malformed entitlement conservatively yields one
+    worker, while an explicitly unlimited quota retains measured affinity.
+    """
+    _linux_only("cpu_entitlement")
+    cpus = float(len(os.sched_getaffinity(0)))
+    root = Path("/sys/fs/cgroup")
+    try:
+        unified = (root / "cgroup.controllers").is_file()
+        if unified:
+            relative = next(line.split("::", 1)[1] for line in
+                            Path("/proc/self/cgroup").read_text().splitlines()
+                            if line.startswith("0::"))
+            leaf, top = root / relative.lstrip("/"), root
+        else:
+            leaf = _cgroup_v1_controller_path("cpu")
+            top = next(mount.target for mount in _cgroup_v1_mounts()
+                       if "cpu" in mount.controllers and leaf.is_relative_to(mount.target))
+        for directory in (leaf, *leaf.parents):
+            if unified:
+                quota, period = _cgroup_text(directory, "cpu.max").split()
+                unlimited = quota == "max"
+            else:
+                quota = _cgroup_text(directory, "cpu.cfs_quota_us")
+                period = _cgroup_text(directory, "cpu.cfs_period_us")
+                unlimited = quota == "-1"
+            if int(period) <= 0 or (not unlimited and int(quota) <= 0):
+                return 1.0
+            if not unlimited:
+                cpus = min(cpus, int(quota) / int(period))
+            if directory == top:
+                break
+    except (ContainmentUnavailable, OSError, StopIteration, ValueError):
+        return 1.0
+    return cpus if cpus > 0 else 1.0
+
+
 def available_host_bytes() -> int:
     """`host_memory().available`: -1 means UNREADABLE, never 0."""
     return host_memory().available

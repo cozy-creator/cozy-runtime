@@ -13,3 +13,7 @@
 - Legacy loading stays default. Descriptor promotion requires matched parity or better;
   full byte verification and inference precision/inputs remain unchanged.
 - No GPU/NVML/rental calls; root owns hardware checks.
+- Draft PR: https://github.com/cozy-creator/cozy-runtime/pull/1114
+- CPU gates include actual v1/v2 filesystem fixtures, native full verification and corrupt
+  byte rejection, strict fd cleanup, compiler/weight-policy and real cross-version inference.
+- Existing quantization SIM115 lint at spill TemporaryFile predates this task; unchanged.
