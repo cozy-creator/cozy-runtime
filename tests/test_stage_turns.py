@@ -369,6 +369,13 @@ def test_a_load_short_of_device_memory_beside_a_call_in_flight_is_loaded_again(
         "a block ran out of memory",
         "a block ran out of memory",
     ]
+    # An attempt holding a whole turn (an older executor, a group) never waits for others while
+    # it holds the GPU, and is never refused for size either.
+    attempt.stage_turns, tries[:] = False, []
+    shortfalls = iter(["a block ran out of memory"])
+    with pytest.raises(DeviceExhausted, match="every idle byte"):
+        worker._ensure_construction(attempt)
+    assert tries == ["a block ran out of memory", "a block ran out of memory"]
 
 
 def test_a_scope_waiting_for_its_turn_is_not_counted_as_execution(

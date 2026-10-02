@@ -5966,12 +5966,13 @@ class Worker:
     def _ensure_construction(self, attempt: AttemptRecord) -> None:
         """LOAD the attempt's construction if its process has not built it, then ACTIVATE it.
 
-        A turn-taking attempt loads beside whoever holds the GPU, and nothing of it has run, so
-        a device shortfall there is never a refusal for size. Every idle tenant of its GPU is
-        cut, least recently used first, and it loads again: once every call of another model
-        ahead of it has left, or when the shortfall changed since the last try (the executor
-        measured what it lacked and plans with it). The same shortfall twice, alone on a GPU
-        with every idle byte given, is FAILED with what did not fit (`DeviceExhausted`).
+        Nothing of the attempt has run, so a device shortfall here is never a refusal for size.
+        Every idle tenant of its GPUs is cut, least recently used first, and it loads again:
+        once every call of another model ahead of it has left (a turn-taking attempt holds no
+        turn while it waits; one holding a whole turn does not wait), or when the shortfall
+        changed since the last try (the executor measured what it lacked and plans with it).
+        The same shortfall twice with every idle byte given is FAILED with what did not fit
+        (`DeviceExhausted`).
         """
         last = ""
         while True:
@@ -5979,19 +5980,15 @@ class Worker:
                 return self._ensure_once(attempt)
             except AttemptRefusal as exc:
                 lane = self.lanes.by_id.get(attempt.lane_id)
-                if exc.code not in DEVICE_SHORTFALL_CODES or not attempt.stage_turns or not lane:
+                if exc.code not in DEVICE_SHORTFALL_CODES or not lane:
                     raise
-                waited = self.stages.await_released(
+                waited = attempt.stage_turns and self.stages.await_released(
                     _demand(attempt), lambda: bool(attempt.canceling) or self.stop.is_set()
                 )
                 if attempt.canceling or self.stop.is_set():
                     raise
                 if not waited and exc.detail == last:
-                    raise DeviceExhausted(
-                        exc.code,
-                        f"{exc.detail} (every idle byte of {execution_evidence.gpu_names(lane.entries)} was given)",
-                        cause=CAUSE.CAUSE_CODE_NO_CAPACITY,
-                    ) from exc
+                    raise self._exhausted(lane, exc) from exc
                 last = exc.detail
                 self.note(
                     "attempt",
@@ -6006,6 +6003,17 @@ class Worker:
                 self._rebuild_lane(lane, attempt.placement_id)
                 self.memory.unmap(attempt.placement_id, "its refused load")
                 self.memory.make_room(lane, attempt.placement_id, None, "its refused load")
+
+    @staticmethod
+    def _exhausted(lane: DeviceLane, exc: AttemptRefusal | MemoryShortfall) -> DeviceExhausted:
+        """What did not fit, with every idle byte of `lane`'s GPUs given: a FAILED terminal."""
+        detail = exc.detail
+        gpus = execution_evidence.gpu_names(lane.entries)
+        return DeviceExhausted(
+            "device_shortfall",
+            f"{detail} (every idle byte of {gpus} was given)",
+            cause=CAUSE.CAUSE_CODE_NO_CAPACITY,
+        )
 
     def _ensure_once(self, attempt: AttemptRecord) -> None:
         """One load and activation.
@@ -6536,9 +6544,7 @@ class Worker:
         why = f"attempt {attempt.request_id}#{attempt.attempt}"
         granted = self.memory.start(tenant, self._stage_need(attempt, declared), lane.ordinals, why)
         if isinstance(granted, MemoryShortfall):
-            raise AttemptRefusal(
-                "device_shortfall", granted.detail, cause=CAUSE.CAUSE_CODE_NO_CAPACITY
-            )
+            raise self._exhausted(lane, granted)  # every idle tenant was cut: FAILED, not sized
         attempt.room, attempt.plane_budget_bytes = granted.whole, granted.plane_bytes
         row = lane.row(tenant)
         executor = row.executor()
