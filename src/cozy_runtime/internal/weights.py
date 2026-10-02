@@ -284,6 +284,8 @@ class Weights:
         nbytes = max(nbytes, 0)
         if nbytes == self.applied or self.host_only:
             return 0
+        if nbytes < self.applied:
+            self.quiesce()
         trim = self.plane.set_vram_budget(self.index, nbytes)
         self.applied = nbytes
         self._evicted(trim.get("evicted", ()))
@@ -293,6 +295,14 @@ class Weights:
         if nbytes != self.pinned_applied:
             self.plane.set_pinned_budget(nbytes)
             self.pinned_applied = nbytes
+
+    def quiesce(self) -> None:
+        """Wait for every kernel and copy this process queued. Only leases tell the plane
+        what a kernel reads, and bound weights are read past them (a stage's resident set,
+        code outside block forwards): unmapping under a queued kernel faults the device's
+        MMU, which on a GPU that drives a display can hang the whole machine."""
+        if not self.host_only:
+            self.torch.cuda.synchronize(self.device)
 
     def vacate(self) -> int:
         """Unmap every unleased weight (an older Worker's `Vacate`) without fixing a budget:
@@ -332,9 +342,6 @@ class Weights:
         target = max(min(self.applied, mapped) - need - weight_policy.MARGIN, floor)
         if target >= self.applied:
             return 0
-        # Kernels already queued may read any bound weight (a stage's resident set holds no
-        # lease while they run): the cut waits for them, as every unmap must.
-        self.torch.cuda.current_stream(self.device).synchronize()
         self.oom_retries += 1
         if self.budget >= 0:
             self.budget = min(self.budget, target)
@@ -523,6 +530,7 @@ class Weights:
             self.plane.set_vram_budget(self.index, self.applied)
 
     def close(self, component: Component) -> None:
+        self.quiesce()
         close_cursor(component)
         if component.lease is not None:
             component.lease.release()
@@ -1650,6 +1658,7 @@ class WeightResidency:
         above `budget` and never below a two-block streaming window. Returns the budget used."""
         weights = self.weights
         method = weights.open[-1][1]
+        weights.quiesce()  # a plan unmaps: other components' sets, this one's stale regions
         try:
             self._plan(budget, resume)
             return budget
@@ -1687,7 +1696,6 @@ class WeightResidency:
         floor = sum(weight_policy.floor(replace(c.layout, fine=None)) for c in opened)
         for component in opened:
             close_cursor(component)
-            self._seal(component)
         weights.set_budget(max(wanted, floor) if wanted >= 0 else wanted)
         weights.drain()
         if opened and weights.open:
@@ -1709,7 +1717,6 @@ class WeightResidency:
             return  # no room to grow into: the floor's plan carries on
         for _, _, component in weights.opened().values():
             close_cursor(component)
-            self._seal(component)
         self._place(budget)
 
     def _entered(self, method: str) -> None:
@@ -2260,7 +2267,6 @@ class WeightResidency:
             component.last_passes = component.passes
             try:
                 close_cursor(component)
-                self._seal(component)
             except BaseException as exc:  # release the rest, then raise the first
                 failure = failure or exc
             if component.lease is not None:
@@ -2270,21 +2276,6 @@ class WeightResidency:
                 weights.plane.prioritise(component.ws, weights.index, None, priority=idle)
         if failure is not None:
             raise failure
-
-    def _seal(self, component: Component) -> None:
-        """The stage's kernels read its resident set long after the leases that bound it were
-        released: a lease taken and released now, on the compute stream, records where they
-        end, and the plane waits for that before it unmaps any of them."""
-        weights = self.weights
-        if weights.host_only:
-            return
-        stream = weights.stream()
-        common = component.common.index if component.common is not None else -1
-        for index in component.resident:
-            # the common lease is released at the stage's end; an unbound region was unmapped
-            # already (by a cut that waited for its kernels, or between calls)
-            if index != common and component.regions[index].bound is not None:
-                weights.plane.acquire(component.ws, weights.index, index, stream).release(stream)
 
     def _room_for_decode(self, name: str, free: int, evictable: int, need: int) -> int:
         """Activations first: idle weights leave before a decode needs their room (never what
@@ -2309,6 +2300,7 @@ class WeightResidency:
         weights = self.weights
         if weights.host_only:
             return
+        weights.quiesce()
         for component in components:
             close_cursor(component)
             weights.plane.drop(component.ws, weights.index, None)
