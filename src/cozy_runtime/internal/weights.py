@@ -2573,8 +2573,8 @@ class WeightResidency:
 
     def _room_for_decode(self, name: str, free: int, evictable: int, need: int) -> int:
         """Activations first: idle weights leave before a decode needs their room (never what
-        the stage holds, which may still be filling), since a decode's convolutions outside
-        any block hook cannot retry. Returns what is free after."""
+        the stage holds, which may still be filling), since a decode run short of memory takes
+        slower convolutions. Returns what is free after."""
         if need <= free or evictable <= 0:
             return free
         weights = self.weights

@@ -1376,6 +1376,7 @@ def test_a_qwen_image_vae_decodes_untiled_when_it_fits(tmp_path: Path) -> None:
     torch.testing.assert_close(image, reference, atol=1e-2, rtol=0)
 
 
+@on_card
 def test_a_larger_decode_is_sized_by_the_largest_one_measured(card: Any, tmp_path: Path) -> None:
     """Run 2955: the first decode at a size unmapped every idle weight, whatever was free, and
     the model's next request uploaded all 6.4 GiB again. A size above every measured one asks
