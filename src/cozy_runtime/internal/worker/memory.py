@@ -568,6 +568,16 @@ class MemoryManager:
         else:
             self._vacate(victim, slot, why, short)
 
+    def unmap(self, tenant: str, why: str) -> None:
+        """Unmap every device byte of `tenant`'s plane (they stay pinned): what a refused load
+        left mapped would otherwise count against its own next try."""
+        row = self._row(tenant)
+        executor = row.executor() if row is not None else None
+        if row is None or executor is None or not plane_capable(executor) or executor.busy():
+            return
+        lane = next(lane for lane in self.lanes if lane.ordinals and tenant in lane.rows)
+        self._cut_plane((tenant, lane, row, executor), tenant, why)
+
     def _cut_plane(self, victim: Victim, slot: str, why: str) -> None:
         """Budget 0: the plane unmaps at once and keeps the bytes in its host tier (lowered to
         its LRU share of the host) or the page cache. One that refuses or dies is ended."""

@@ -310,6 +310,8 @@ def test_a_load_short_of_device_memory_beside_a_call_in_flight_is_loaded_again(
 
     monkeypatch.setattr(worker, "_ensure_once", load)
     monkeypatch.setattr(worker, "_rebuild_lane", lambda lane, slot: None)
+    unmapped: list[str] = []
+    monkeypatch.setattr(worker.memory, "unmap", lambda tenant, why: unmapped.append(tenant))
     loading = threading.Thread(target=worker._ensure_construction, args=(attempt,), daemon=True)
     loading.start()
     bound = time.monotonic() + 30  # a hang bound on a loaded box, not a budget
@@ -320,6 +322,7 @@ def test_a_load_short_of_device_memory_beside_a_call_in_flight_is_loaded_again(
     worker.stages.release("X#1")
     loading.join(30)
     assert loads == [True, False], "loaded again once X was past"
+    assert unmapped == ["tenant-b"], "what the refused load left mapped is unmapped first"
     # Alone on the GPU: a new shortfall is tried again (the executor measured what it
     # lacked); the same one twice is the request's own, refused with its reason.
     shortfalls = iter(["the decode ran out of memory", "a block ran out of memory"])

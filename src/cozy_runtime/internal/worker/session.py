@@ -5998,6 +5998,7 @@ class Worker:
                     + ", loading again",
                 )
                 self._rebuild_lane(lane, attempt.placement_id)
+                self.memory.unmap(attempt.placement_id, "its refused load")
 
     def _ensure_once(self, attempt: AttemptRecord) -> None:
         """One load and activation.
