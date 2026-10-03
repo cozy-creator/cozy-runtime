@@ -11,6 +11,7 @@ artifact refuses before construction.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import os
 import threading
 from collections.abc import Iterator, Mapping, Sequence
@@ -468,13 +469,24 @@ class Checkpoint:
         return lease
 
     def model_assets(self) -> dict[str, bytes]:
-        """Read the header-declared model files through one verified closure lease."""
+        """Read the header-declared model files through one verified lease over their own
+        objects: never the whole closure (SDXL's is 2,602 objects, a descriptor each)."""
         names = sorted(self.header["assets"])
         if not names:
             return {}
+        # The header object too: the lease reads each asset through it.
+        header = (hashlib.sha256(self.header_bytes).hexdigest(), len(self.header_bytes))
+        segments = sorted(
+            {header}
+            | {
+                (segment["sha256"], int(segment["length"]))
+                for name in names
+                for segment in self.header["assets"][name]["segments"]
+            }
+        )
         with (
             store_refusals(f"reading model assets from {self.manifest_id[:23]}"),
-            self.acquire() as lease,
+            self.store.acquire(self.manifest_id, segments) as lease,
         ):
             assets = {
                 name: bytes(lease.read_asset(self.header_bytes, name, max_bytes=64 << 20))
