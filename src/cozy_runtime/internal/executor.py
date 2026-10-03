@@ -138,6 +138,7 @@ from cozy_runtime.internal.discovery import discover_distribution, discover_inst
 from cozy_runtime.internal.executor_commands import (
     LOAD_PINNED,
     PROCESS_CAP,
+    RANK_CELLS,
     SEALED_FILLING,
     SEALED_TIERS,
     Activate,
@@ -503,6 +504,8 @@ class Executor:
         self.pg: Any = None
         self._device_ready = False
         self._startup_reported = False
+        #: a follower's budget cell from rank 0 (`RANK_CELLS`), for its weight plane
+        self.rank_cell: budget_cell.Cell | None = None
         #: the attempt spool while an attempt runs: where a mirrored call's payloads go
         self._attempt_spool: Path | None = None
         #: rank 0 only: the attempt whose cancel marker the mirror reads before each call
@@ -627,7 +630,7 @@ class Executor:
                 zygote.CAPABILITY,
                 "vacate_ranks",
                 *(
-                    [plane.CAPABILITY, STAGE_TURNS, LOAD_PINNED, PROCESS_CAP]
+                    [plane.CAPABILITY, STAGE_TURNS, LOAD_PINNED, PROCESS_CAP, RANK_CELLS]
                     if plane.available()
                     else []
                 ),
@@ -783,6 +786,13 @@ class Executor:
         """A FOLLOWER joins rank 0's store and forms its half of the process group."""
         if self.rank == 0:
             return {"ok": False, "code": "not_a_follower", "detail": f"{_gpu(0)} forms the group"}
+        if command.cell:
+            # It follows the frame on the seam: taken first, whatever this join answers.
+            fd = self.channel.recv_memfd()
+            try:
+                self.host.rank_cell = budget_cell.Cell(fd)
+            finally:
+                os.close(fd)
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
         _restore_seal()
@@ -1308,7 +1318,12 @@ class Executor:
                             code="group_unformed",
                         )
                 if not command.import_only:
-                    self.pg = self.group.form(self.torch, _SEALED)
+                    cells = self._rank_cells() if command.rank_cells else []
+                    try:
+                        self.pg = self.group.form(self.torch, _SEALED, cells)
+                    finally:
+                        for fd in cells:
+                            os.close(fd)
                     stage("group_form")
         except GroupRefusal as exc:
             return self._group_refusal(exc)
@@ -2054,6 +2069,8 @@ class Executor:
                 if self.rank == 0:
                     host.weights.cell = host._budget_cell()
                     host.weights.room = host._device_room
+                else:
+                    host.weights.cell = host.rank_cell
             except plane.Unavailable as exc:
                 return {"ok": False, "code": "weight_plane_unavailable", "detail": str(exc)}
         weights = host.weights
@@ -2062,8 +2079,9 @@ class Executor:
         weights.sharing = (
             DeviceTiers(ask=self._ask_device, offer=self._offer_device) if sharing else None
         )
-        if not isinstance(command.cap_bytes, UnsetType):
-            weights.set_cap(command.cap_bytes)
+        cap = _rank_cap(command.rank_caps, self.rank, command.cap_bytes)
+        if not isinstance(cap, UnsetType):
+            weights.set_cap(cap)
         # A load plans in what the driver has: the Worker made room for it, and an earlier
         # cut to 0 is no grant for this construction. Its pinned budget arrives with it, so
         # the fill stays inside it (a CPU executor computes on its tier: never cut there).
@@ -2450,6 +2468,7 @@ class Executor:
                     pinned_bytes=command.pinned_bytes,
                     sealed_tiers=command.sealed_tiers,
                     cap_bytes=command.cap_bytes,
+                    rank_caps=command.rank_caps,
                 ),
                 optional_attention_scope=True,
             )
@@ -2706,9 +2725,14 @@ class Executor:
         if self.weights is not None and (
             command.plane_budget_bytes != self.weights.budget
             or command.cap_bytes != self.weights.cap
+            or command.rank_caps
         ):
             granted = self.budget(
-                Budget(vram_bytes=command.plane_budget_bytes, cap_bytes=command.cap_bytes)
+                Budget(
+                    vram_bytes=command.plane_budget_bytes,
+                    cap_bytes=command.cap_bytes,
+                    rank_caps=command.rank_caps,
+                )
             )
             if not granted.get("ok"):
                 return granted
@@ -3864,6 +3888,17 @@ class Executor:
         if answer.ok and answer.cap_bytes >= 0 and self.weights is not None:
             self.weights.set_cap(answer.cap_bytes)
 
+    def _rank_cells(self) -> list[int]:
+        """One budget cell per follower (`RANK_CELLS`), each handed to the owner with its
+        rank; the memfds go to the followers with their `join`, and the caller closes them."""
+        fds: list[int] = []
+        for rank in range(1, self.world):
+            cell, fd = budget_cell.Cell.create()
+            cell.close()
+            fds.append(fd)
+            self._durable(BudgetCell(memfd=fd, rank=rank), Answer)
+        return fds
+
     def _budget_cell(self) -> budget_cell.Cell | None:
         """Hand the worker this process's budget cell; None from an older worker."""
         cell, fd = budget_cell.Cell.create()
@@ -4125,8 +4160,9 @@ class Executor:
             if weights is None:
                 return 0
             self._unpark()  # a parked stage's holds would make a cut unreleasable
-            if not isinstance(command.cap_bytes, UnsetType):
-                weights.set_cap(command.cap_bytes)  # every GPU's own process
+            cap = _rank_cap(command.rank_caps, self.rank, command.cap_bytes)
+            if not isinstance(cap, UnsetType):
+                weights.set_cap(cap)  # every GPU's own process
             # The pinned budget is the group's: every GPU pins its own weights in host memory.
             pinned = command.pinned_bytes // self.world if command.pinned_bytes >= 0 else -1
             return weights.set_budget(command.vram_bytes, pinned)
@@ -4509,6 +4545,11 @@ def _assets_at(node: Any, path: str) -> list[dict[str, Any]]:
         for index, value in enumerate(node):
             found += _assets_at(value, f"{path}.{index}" if path else str(index))
     return found
+
+
+def _rank_cap(caps: tuple[int, ...], rank: int, default: int | UnsetType) -> int | UnsetType:
+    """This GPU's process cap: its own entry when the owner sent one per GPU, else the one."""
+    return caps[rank] if rank < len(caps) else default
 
 
 # --------------------------------------------------------------------------- main

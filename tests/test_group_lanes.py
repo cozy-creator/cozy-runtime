@@ -23,7 +23,15 @@ import msgspec
 import pytest
 
 from cozy_runtime.author._signature import ModelBinding
-from cozy_runtime.internal import accel, canonical, executor_commands, package_interface, spawn
+from cozy_runtime.internal import (
+    accel,
+    budget_cell,
+    canonical,
+    executor_commands,
+    package_interface,
+    spawn,
+)
+from cozy_runtime.internal import executor as executor_module
 from cozy_runtime.internal.config import seal_snapshot
 from cozy_runtime.internal.discovery import discover, discover_installed
 from cozy_runtime.internal.executor_commands import Start
@@ -806,6 +814,50 @@ def test_the_plan_agrees_field_by_field_or_refuses() -> None:
         assert refused.value.field_name == field_name and refused.value.gpu == "GPU 3"
         assert refused.value.message.startswith(f"GPU 3 disagrees on {field_name!r}: GPU 2 decided")
         assert "no GPU adapts locally" in refused.value.message
+
+
+@needs_torch
+def test_each_follower_takes_its_own_budget_cell_with_its_join(tmp_path: Path) -> None:
+    """`RANK_CELLS`: rank 0 hands every follower its own budget cell right after `join`, so
+    the owner's floor watchdog writes each GPU's cap where that GPU's process reads it. Real
+    follower executors; the cell is the memfd each one maps, and nobody else's."""
+    import torch
+
+    env = {**os.environ, "CUDA_VISIBLE_DEVICES": "4,5,6"}
+    group = RankGroup(
+        degree=3,
+        backend="gloo",
+        python=sys.executable,
+        root=str(tmp_path),
+        sample_seconds=0.2,
+        launch=_launcher(env),
+        devices=("4", "5", "6"),
+    )
+    cells = [budget_cell.Cell.create() for _ in range(2)]
+    try:
+        group.spawn()
+        group.dial_back(seal_snapshot(env))
+        group.form(torch, {"NCCL_NVLS_ENABLE": "0"}, [fd for _, fd in cells])
+        assert group.formed
+        for (_cell, fd), follower in zip(cells, group.followers, strict=True):
+            mine = os.fstat(fd).st_ino
+            maps = Path(f"/proc/{follower.pid}/maps").read_text().splitlines()
+            held = {int(line.split()[4]) for line in maps if "memfd:cozy-budget-cell" in line}
+            assert held == {mine}, (follower.gpu, held, mine)
+        # the followers still answer, and the cells are the owner's to write
+        assert [r["ok"] for r in group.call({"cmd": "probe"})] == [True, True]
+        assert cells[0][0].ask(-2 - (1 << 30)) == 1
+    finally:
+        group.close()
+        for cell, fd in cells:
+            cell.close()
+            os.close(fd)
+
+
+def test_a_rank_takes_its_own_cap_or_the_one_cap() -> None:
+    assert executor_module._rank_cap((7, 8, 9), 1, 5) == 8
+    assert executor_module._rank_cap((7,), 2, 5) == 5
+    assert executor_module._rank_cap((), 0, msgspec.UNSET) is msgspec.UNSET
 
 
 @needs_torch

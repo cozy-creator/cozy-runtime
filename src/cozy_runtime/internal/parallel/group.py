@@ -17,7 +17,7 @@ import socket
 import sys
 import threading
 from collections import Counter
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Annotated, Any, Protocol, TypedDict
 
@@ -405,9 +405,10 @@ class RankGroup:
                 )
             follower.memory = hello.memory
 
-    def form(self, torch: Any, sealed: Mapping[str, str]) -> Any:
+    def form(self, torch: Any, sealed: Mapping[str, str], cells: Sequence[int] = ()) -> Any:
         """Form the process group: the store on a kernel-chosen loopback port, every
-        follower joining it, rank 0 joining last, one barrier as the proof."""
+        follower joining it, rank 0 joining last, one barrier as the proof. `cells`, one per
+        follower in rank order, are their budget cells: each follows its `join`."""
         dist = torch.distributed
 
         self.check_alive()
@@ -416,7 +417,13 @@ class RankGroup:
             "127.0.0.1", 0, self.degree, is_master=True, wait_for_workers=False
         )
         self.port = int(self.store.port)
-        self.broadcast({"cmd": "join", "port": self.port, "backend": self.backend})
+        join = {"cmd": "join", "port": self.port, "backend": self.backend}
+        if cells:
+            for follower, cell in zip(self.followers, cells, strict=True):
+                self.send_one(follower.rank, {**join, "cell": True})
+                self.memfd_to(follower.rank, cell)
+        else:
+            self.broadcast(join)
         dist.init_process_group(self.backend, store=self.store, rank=0, world_size=self.degree)
         self.pg = dist.group.WORLD
         dist.barrier()

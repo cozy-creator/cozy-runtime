@@ -238,6 +238,9 @@ class BudgetCell(_Request, frozen=True, kw_only=True, tag="budget_cell"):
 
     #: the memfd the worker received; never on the wire
     memfd: int = -1
+    #: Which GPU of a group the cell caps (`RANK_CELLS`): rank 0 hands its owner one cell per
+    #: follower at formation, the follower reads it. 0 is rank 0's own (every older executor).
+    rank: int = 0
 
 
 class StageEnter(_Request, frozen=True, kw_only=True, tag="stage_enter"):
