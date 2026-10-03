@@ -633,7 +633,10 @@ class Weights:
         row = accel.process_memory(os.getpid(), self.kind)
         if row.state == "present":
             reserved = accel.allocation(self.torch, self.kind)["reserved_bytes"]
-            mapped = max(plane.stats(self.plane).device(self.index).committed, 0)
+            device = plane.stats(self.plane).device(self.index)
+            # Shared regions (exported or attached) are the machine's to count, once: the
+            # driver charges one to whichever process it picks, never this one's context.
+            mapped = max(device.committed, 0) + max(device.shared_bytes, 0)
             self.context_bytes = max(row.bytes - reserved - mapped, self.context_bytes, 0)
             self.limit_torch()
 

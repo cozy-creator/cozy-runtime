@@ -104,6 +104,9 @@ def test_a_replacement_attaches_the_kept_weights_and_computes_bit_identically(
         facts = first.facts()
         assert (facts.shared_bytes, facts.committed_bytes) == (total, 0), "offered at stage exit"
         assert first.share() == 0, "regions are offered once"
+        # The driver charges the exported regions to this process: never its context.
+        first.measure_context()
+        assert first.context_bytes < total, (first.context_bytes, total)
         assert same(run(model, x), expected), "the filler still computes on its read-only copy"
 
         replacement, _ = executor_with(custody, tmp_path / "b")
@@ -121,6 +124,37 @@ def test_a_replacement_attaches_the_kept_weights_and_computes_bit_identically(
         assert replacement.facts().shared_bytes == 0
         assert same(run(again, x), expected)
         assert replacement.facts().h2d_bytes == filled
+    finally:
+        custody.close()
+
+
+def test_an_executor_loaded_without_device_weights_shares_when_the_machine_asks(
+    tmp_path: Path,
+) -> None:
+    """Degree 2 after the fact: the machine learns from a call that the construction fits and
+    sends `share` to an executor it loaded without device weights."""
+    checkpoint, _ = write_checkpoint(tmp_path)
+    x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
+    custody = Custody()
+    try:
+        first, executor = executor_with(custody, tmp_path / "a")
+        if not first.plane.device_sharing(0):
+            pytest.skip("this GPU cannot export memory")
+        first.sharing = None
+        model = load(first, checkpoint, "late")
+        expected = run(model, x)
+        total = sum(r.span for r in model.backend.components["stack"].regions)
+        assert first.facts().shared_bytes == 0, "Degree 1: nothing offered"
+        executor.weights = first
+        assert executor.share()["shared_bytes"] == total
+        facts = first.facts()
+        assert (facts.shared_bytes, facts.committed_bytes) == (total, 0)
+        assert same(run(model, x), expected)
+
+        replacement, _ = executor_with(custody, tmp_path / "b")
+        again = load(replacement, checkpoint, "late")
+        assert same(run(again, x), expected)
+        assert replacement.facts().h2d_bytes == 0, "attached, never copied"
     finally:
         custody.close()
 
