@@ -2066,7 +2066,7 @@ class WeightResidency:
                 # weights are all the plane keeps; every other byte stays torch's until it is.
                 # One GPU of a group keeps only a streaming window for the first pass (its
                 # blocks cannot run again after an out-of-memory), then grows by what it measured.
-                own = [component.planned for _, _, component in weights.opened().values()]
+                own = [_paid(c, c.planned)[0] for _, _, c in weights.opened().values()]
                 weights.growing = weights.grouped
                 budget = min(
                     budget,
@@ -2391,6 +2391,11 @@ class WeightResidency:
         components = {key: component for key, (_, _, component) in opened.items()}
         method = weights.open[-1][1]
         arriving: list[Ticket] = []
+        # The policy places only the blocks the budget pays for: a region attached from the
+        # machine is on the device already and is never streamed (see `_paid`).
+        kept = {key: _paid(c, c.planned)[1] for key, c in components.items()}
+        at = {key: {block: p for p, block in enumerate(blocks)} for key, blocks in kept.items()}
+        measured = _costs(weights, {key: (c, opened[key][1]) for key, c in components.items()})
 
         def stage(
             layouts: Mapping[str, weight_policy.Layout],
@@ -2399,11 +2404,17 @@ class WeightResidency:
                 layouts,
                 budget,
                 orders={
-                    key: [c.numbers[index] for index in c.order]
+                    key: [at[key][n] for n in map(c.numbers.__getitem__, c.order) if n in at[key]]
                     for key, c in components.items()
                     if c.observed
                 },
-                costs=_costs(weights, {key: (c, opened[key][1]) for key, c in components.items()}),
+                costs={
+                    key: replace(
+                        cost,
+                        compute={at[key][n]: v for n, v in cost.compute.items() if n in at[key]},
+                    )
+                    for key, cost in measured.items()
+                },
                 cyclic={
                     key
                     for key, (row, tag, c) in opened.items()
@@ -2415,23 +2426,23 @@ class WeightResidency:
         # larger component never takes the room a smaller one needs to stay whole (H3's
         # turbo LoRA beside its DiT, run 2947). Only when those floors do not fit does a
         # component that can still refine count at its finer floor, and move to it.
-        layouts = {key: replace(c.planned, fine=None) for key, c in components.items()}
+        layouts = {key: _paid(c, replace(c.planned, fine=None))[0] for key, c in components.items()}
         try:
             try:
-                placed = stage(layouts)
+                paid = stage(layouts)
             except weight_policy.BelowFloor:
                 layouts = {
-                    key: c.planned if opened[key][0]._refinable(c) else layouts[key]
+                    key: _paid(c, c.planned)[0] if opened[key][0]._refinable(c) else layouts[key]
                     for key, c in components.items()
                 }
-                placed = stage(layouts)
+                paid = stage(layouts)
         except weight_policy.BelowFloor as exc:
             if exc.component in opened and opened[exc.component][0]._refine(exc.component):
                 return self._plan(budget, resume)
             raise self._shortfall(method, exc.needed, exc.available, str(exc)) from None
         # A budget that only fits one block at a time streams with no overlap: regions of at
         # most 16 MiB let it hold a window of several. (Window 1 chosen when two fit stays.)
-        for key, residence in placed.items():
+        for key, residence in paid.items():
             layout = layouts[key]
             if (
                 residence.streamed
@@ -2440,7 +2451,8 @@ class WeightResidency:
                 and opened[key][0]._refine(key)
             ):
                 return self._plan(budget, resume)
-        need = sum(r.vram_bytes(layouts[key]) for key, r in placed.items())
+        need = sum(r.vram_bytes(layouts[key]) for key, r in paid.items())
+        placed = {key: _unpaid(components[key], kept[key], r) for key, r in paid.items()}
         if self.spare and need > budget:
             raise ResidencyRefusal("device_spared", f"{method}() declined: needs {need} B")
         weights._apply(budget)
@@ -2872,6 +2884,37 @@ class WeightResidency:
             raise ResidencyRefusal(
                 "residency_poisoned", f"{what}() against a poisoned weight plane: {self.poisoned}"
             )
+
+
+def _paid(
+    component: Component, layout: weight_policy.Layout
+) -> tuple[weight_policy.Layout, tuple[int, ...]]:
+    """What a stage's budget pays for, and the block numbers the policy may place. A region
+    attached from the machine is on the device already, outside the budget, and never
+    streamed: only its decoded copies cost (torch's bytes), held beside `common`."""
+    if not component.shared:
+        return layout, tuple(range(len(layout.blocks)))
+    kept = tuple(i for i, b in enumerate(component.blocks) if b.index not in component.shared)
+    common = component.common
+    fixed = (common.decoded if common.index in component.shared else layout.common) if common else 0
+    fixed += sum(b.decoded for b in component.blocks if b.index in component.shared)
+    blocks = tuple(layout.blocks[i] for i in kept)
+    return weight_policy.Layout(common=fixed, blocks=blocks, fine=None), kept
+
+
+def _unpaid(
+    component: Component, kept: Sequence[int], paid: weight_policy.Residence
+) -> weight_policy.Residence:
+    """`paid` (over the placed blocks) in the component's block numbers: attached blocks are
+    resident, and the ring streams only blocks the budget pays for."""
+    if len(kept) == len(component.blocks):
+        return paid
+    attached = [i for i in range(len(component.blocks)) if i not in set(kept)]
+    return replace(
+        paid,
+        resident=(*(kept[p] for p in paid.resident), *attached),
+        streamed=tuple(kept[p] for p in paid.streamed),
+    )
 
 
 def _unshared(component: Component) -> bool:

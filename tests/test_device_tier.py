@@ -22,7 +22,7 @@ from cozy_runtime.internal import accel, plane  # noqa: E402
 from cozy_runtime.internal.executor import Executor  # noqa: E402
 from cozy_runtime.internal.seam import Channel  # noqa: E402
 from cozy_runtime.internal.weights import DeviceTiers, Weights  # noqa: E402
-from test_weight_plane import HIDDEN, load, run, same, write_checkpoint  # noqa: E402
+from test_weight_plane import BLOCKS, HIDDEN, load, run, same, tight, write_checkpoint  # noqa: E402
 
 pytestmark = [
     pytest.mark.skipif(not plane.sharing(), reason="a TensorFS that shares GPU regions"),
@@ -142,5 +142,30 @@ def test_a_duplicate_offer_is_replaced_by_the_kept_copy(tmp_path: Path) -> None:
         assert same(run(second, x), expected)
         assert two.facts().committed_bytes == 0 and two.facts().shared_bytes == total
         assert same(run(second, x), expected)
+    finally:
+        custody.close()
+
+
+def test_attached_weights_cost_no_budget_and_are_never_streamed(tmp_path: Path) -> None:
+    """A budget that would stream the component holds it whole once it is attached: the plan
+    pays only for unattached regions, so no ring, no copy, and no attached region dropped."""
+    checkpoint, _ = write_checkpoint(tmp_path)
+    x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
+    custody = Custody()
+    try:
+        first, _ = executor_with(custody, tmp_path / "a")
+        if not first.plane.device_sharing(0):
+            pytest.skip("this GPU cannot export memory")
+        model = load(first, checkpoint, "free")
+        expected = run(model, x)
+        replacement, _ = executor_with(custody, tmp_path / "b")
+        again = load(replacement, checkpoint, "free")
+        replacement.set_budget(tight(again))
+        assert same(run(again, x), expected)
+        facts = replacement.facts()
+        assert facts.h2d_bytes == 0 and facts.committed_bytes == 0
+        assert facts.streamed["stack"].resident_blocks == BLOCKS
+        assert facts.streamed["stack"].window == 0
+        assert facts.shared_bytes == sum(r.span for r in again.backend.components["stack"].regions)
     finally:
         custody.close()

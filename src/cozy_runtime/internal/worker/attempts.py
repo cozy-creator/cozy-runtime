@@ -61,6 +61,7 @@ from cozy_runtime.author._executor_requests import (
     Published,
     Reply,
     Request,
+    SealedTier,
     StageEnter,
     StageExit,
     StageMemoLookup,
@@ -1650,6 +1651,8 @@ class AttemptEngine:
                 return refuse("no_durable_exchange", "a job's executor holds its whole turn")
             case DeviceTier():
                 return refuse("no_durable_exchange", "this worker keeps no GPU weights")
+            case SealedTier():
+                return refuse("no_durable_exchange", "this worker keeps no sealed host layouts")
             case TreeMember():
                 if self.calls is None:
                     return refuse("child_broker_absent", "no RecordOwner call lane")

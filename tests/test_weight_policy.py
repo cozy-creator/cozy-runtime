@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import csv
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from cozy_runtime.internal import weight_policy as policy
+from cozy_runtime.internal.weights import Component, Region, _paid, _unpaid
 
 ROWS = list(csv.DictReader((Path(__file__).parent / "testdata" / "sdxl_blocks.csv").open()))
 BLOCKS = [row for row in ROWS if not row["name"].startswith("common")]
@@ -74,3 +76,42 @@ def test_activations_come_first() -> None:
     )
     assert policy.decode_mode(free=1 << 30, evictable=3 << 30, untiled_bytes=3 << 30) == "untiled"
     assert policy.decode_mode(free=1 << 30, evictable=0, untiled_bytes=3 << 30) == "tiled"
+
+
+def test_attached_regions_are_resident_and_cost_only_their_decoded_copies() -> None:
+    """A region the machine keeps (`weights.attach/1`) is on the device outside the budget: the
+    stage pays only for the rest, never streams an attached block, and so never drops one."""
+    mib = 1 << 20
+
+    unused: Any = None  # module, root and weight set: the arithmetic never touches them
+
+    def region(index: int, span: int) -> Region:
+        return Region(index=index, path=f"blocks.{index}", module=unused, weights=[], span=span)
+
+    common, blocks = region(0, 2 * mib), [region(i, 64 * mib) for i in range(1, 5)]
+    layout = policy.Layout(common=2 * mib, blocks=(64 * mib,) * 4)
+    component = Component(
+        name="unet",
+        key="sdxl/unet",
+        root=unused,
+        ws=unused,
+        device=0,
+        regions=[common, *blocks],
+        common=common,
+        blocks=blocks,
+        layout=layout,
+        sealed=False,
+    )
+    component.shared = {0, 2, 3}  # common, and the blocks at positions 1 and 2
+    paid, kept = _paid(component, layout)
+    assert kept == (0, 3)
+    assert paid == policy.Layout(common=0, blocks=(64 * mib, 64 * mib))
+
+    whole = _unpaid(component, kept, policy.residence(paid, 128 * mib))
+    assert sorted(whole.resident) == [0, 1, 2, 3] and whole.streamed == () and whole.ring == 0
+
+    tight = policy.residence(paid, 96 * mib, cyclic=True)
+    assert tight.streamed, "the budget holds one paid block and a ring, not both"
+    placed = _unpaid(component, kept, tight)
+    assert set(placed.streamed) <= {0, 3} and {1, 2} <= set(placed.resident)
+    assert placed.ring == tight.ring
