@@ -130,6 +130,7 @@ from cozy_runtime.internal import (
     stage_memo,
     tolerant,
     weight_policy,
+    zygote,
 )
 from cozy_runtime.internal import weights as weight_stages
 from cozy_runtime.internal.config import restore_seal, seal_snapshot
@@ -144,6 +145,7 @@ from cozy_runtime.internal.executor_commands import (
     Budget,
     CallInterface,
     DescribeInstalled,
+    Fork,
     GroupHardware,
     Hello,
     Invoke,
@@ -475,6 +477,8 @@ class Executor:
         self.started = False
         #: torch, the Runtime and the package are imported (`Start.import_only`); no device yet
         self.imported = False
+        #: children forked from this import-only process and not reaped yet (`fork/1`)
+        self.forked: set[int] = set()
         self.package_warmed = False
         #: rank 0 only: each follower's own start ledger, in rank order
         self.follower_stages: list[list[Any]] = []
@@ -564,6 +568,8 @@ class Executor:
                 return self.select_attention(command)
             case DescribeInstalled():
                 return self.describe_installed(command)
+            case Fork():
+                return self.fork(command)
             case Start():
                 return self.start(command)
             case Warm():
@@ -617,6 +623,7 @@ class Executor:
             #: what the worker's memory manager may ask beyond the floor's commands
             "memory": [
                 "import_only",
+                zygote.CAPABILITY,
                 "vacate_ranks",
                 *(
                     [plane.CAPABILITY, STAGE_TURNS, LOAD_PINNED, PROCESS_CAP]
@@ -1224,6 +1231,7 @@ class Executor:
 
         imported = self.imported
         warmup_error = ""
+        driverless = contextlib.ExitStack()
         try:
             if degree > 1 and self.rank == 0:
                 self.world = degree
@@ -1244,6 +1252,8 @@ class Executor:
             if model_bearing:
                 import torch
 
+                if command.import_only:
+                    driverless.enter_context(zygote.driverless(torch, len(_sealed_entries())))
                 if not imported:
                     stage("torch_import")
                 if not command.import_only:
@@ -1305,6 +1315,8 @@ class Executor:
             if self.group is not None:
                 self.group.close()
             raise
+        finally:
+            driverless.close()
         self.imported = True
         self.started = not command.import_only
         took_ms = (time.perf_counter() - started) * 1000
@@ -1315,6 +1327,60 @@ class Executor:
             "legs_ms": {**self.boot.get("legs_ms", {}), **dict(stages)},
         }
         return self._start_reply(stages, warmup_error=warmup_error, compiles=compiles)
+
+    def fork(self, command: Fork) -> dict[str, Any]:
+        """Fork this import-only process into an executor of `command.root` (`fork/1`).
+
+        The child's imports are done; its device start initializes CUDA for the first time
+        in its lineage. A process that is not provably single-threaded and driver-free
+        refuses, and the machine spawns instead."""
+        if self.rank or self.world != 1 or self.group is not None:
+            return self._refusal("fork_unsupported", "only a world-one executor forks")
+        if self.poisoned:
+            return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
+        if not self.imported or self.started or self.constructions:
+            return self._refusal(
+                "fork_unready", "an executor forks after its import-only start, before a device"
+            )
+        moved = [n for n in zygote.LOADED if command.environment.get(n, "") != _SEALED.get(n, "")]
+        if moved:
+            return self._refusal(
+                "fork_environment", f"{moved} were read at this process's imports and differ"
+            )
+        # Exited children stay zombies until now, so the machine reads their exit status.
+        self.forked -= zygote.collect(self.forked)
+        reason = zygote.unsafe(sys.modules.get("torch"))
+        if reason:
+            return self._refusal("fork_unsafe", reason)
+        started = time.perf_counter()
+        pid = zygote.fork(command.environment, functools.partial(self._forked, command, started))
+        self.forked.add(pid)
+        return {"ok": True, "pid": pid}
+
+    def _forked(self, command: Fork, started: float) -> int:
+        """In the child: an executor on its own seam, keeping this process's imports."""
+        self.channel.sock.close()
+        for fd, name in ((1, "stdout.log"), (2, "stderr.log")):
+            log = os.open(Path(command.root) / name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            os.dup2(log, fd)
+            os.close(log)
+        _capture_seal()
+        kernel_cache.configure(kernel_cache.from_sealed(_SEALED))
+        channel = connect(command.socket)
+        child = Executor(
+            channel,
+            Path(command.root),
+            fill_forensics_dir=_SEALED.get(child_env.FILL_FORENSICS_DIR, "").strip(),
+        )
+        child.imported = True
+        child.discovered = self.discovered
+        child.surface_names = dict(self.surface_names)
+        legs = {
+            **self.boot.get("legs_ms", {}),
+            "fork": round((time.perf_counter() - started) * 1000, 1),
+        }
+        child.boot = {**self.boot, "legs_ms": legs}
+        return serve(child, channel)
 
     def _start_reply(
         self,
@@ -4545,7 +4611,11 @@ def main(argv: list[str] | None = None) -> int:
         rank=args.rank,
         world=args.world,
     )
+    return serve(executor, channel)
 
+
+def serve(executor: Executor, channel: Channel) -> int:
+    """Answer commands until the worker shuts this executor down or its seam ends."""
     while True:
         try:
             frame = channel.recv()

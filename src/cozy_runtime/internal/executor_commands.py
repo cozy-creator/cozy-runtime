@@ -52,6 +52,15 @@ class Join(Command, frozen=True, kw_only=True, tag="join"):
     backend: str = "nccl"
 
 
+class Fork(Command, frozen=True, kw_only=True, tag="fork"):
+    """Fork an import-only executor into a new one on its own seam (`fork/1`)."""
+
+    socket: str
+    root: str
+    #: The child's whole environment, as the machine seals a spawned executor's.
+    environment: dict[str, str]
+
+
 class DescribeInstalled(Command, frozen=True, kw_only=True, tag="describe_installed"):
     distribution: str
     output: str
@@ -384,6 +393,7 @@ type KnownCommand = (
     | Residency
     | Warm
     | Join
+    | Fork
     | DescribeInstalled
     | Vacate
     | Restore
