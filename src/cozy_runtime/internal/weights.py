@@ -602,14 +602,15 @@ class Weights:
                 os.close(fd)
         return attached
 
-    def share(self) -> int:
-        """Offer the machine every region on the GPU not shared yet, so it outlives this
-        process and other executors attach it. Returns the bytes the machine kept."""
+    def share(self, components: Iterable[Component] | None = None) -> int:
+        """Offer the machine every region on the GPU not shared yet (of `components`, else
+        all), so it outlives this process and other executors attach it. Returns the bytes
+        the machine kept."""
         if self.sharing is None or not self._shares():
             return 0
         self.quiesce()
         kept = 0
-        for component in list(self.components.values()):
+        for component in list(self.components.values() if components is None else components):
             exported = self.plane.export_device(component.ws, self.index)
             if not exported:
                 continue
@@ -2169,6 +2170,11 @@ class WeightResidency:
             else:
                 self._close(local)
             weights.drain()
+            if weights.sharing is not None:
+                # Shared while resident: the next stage's plan would evict it otherwise.
+                fresh = [c for c in map(self.components.__getitem__, local) if _unshared(c)]
+                if fresh:
+                    weights.share(fresh)
         finally:
             self._left()
         peak = 0
@@ -2800,6 +2806,12 @@ class WeightResidency:
             raise ResidencyRefusal(
                 "residency_poisoned", f"{what}() against a poisoned weight plane: {self.poisoned}"
             )
+
+
+def _unshared(component: Component) -> bool:
+    """Resident regions not yet offered to the machine; a leased one cannot be (yet)."""
+    leased = {component.common.index} if component.lease and component.common else set()
+    return bool(set(component.resident) - component.shared - leased)
 
 
 def _costs(
