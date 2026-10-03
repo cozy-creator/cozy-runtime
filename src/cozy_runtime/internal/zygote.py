@@ -94,6 +94,18 @@ def unsafe(torch: Any) -> str:
     return ""
 
 
+def collect(children: set[int]) -> set[int]:
+    """Reap the exited ones of `children`; the reaped pids."""
+    reaped = set()
+    for pid in children:
+        try:
+            if os.waitpid(pid, os.WNOHANG)[0] == pid:
+                reaped.add(pid)
+        except ChildProcessError:
+            reaped.add(pid)
+    return reaped
+
+
 def fork(environment: Mapping[str, str], child: Callable[[], int]) -> int:
     """The child's pid. The child seals itself, runs `child` and exits; it never returns."""
     gc.collect()

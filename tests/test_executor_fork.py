@@ -73,6 +73,13 @@ def _call(channel: Channel, frame: dict[str, Any]) -> dict[str, Any]:
             return reply
 
 
+def _wait_zombie(pid: int) -> None:
+    deadline = time.monotonic() + 30
+    while Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z":
+        assert time.monotonic() < deadline, f"{pid} did not exit"
+        time.sleep(0.02)
+
+
 def _listener(path: Path) -> socket.socket:
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(str(path))
@@ -151,10 +158,15 @@ def test_a_forked_child_is_a_sealed_executor_with_the_imports_done(
     assert started["ok"], started
     assert "package_import" not in dict(started["stages"]), "the child imported again"
     assert ready_s < 5, f"a forked executor dialed after {ready_s:.1f} s"
+    assert (tmp_path / "a" / "stderr.log").exists(), "the child logs in its own root"
     assert _call(child, {"cmd": "shutdown"})["ok"]
-    reaped = _call(channel, {"cmd": "reap", "pid": peer})
-    assert reaped["ok"] and os.waitstatus_to_exitcode(reaped["status"]) == 0
-    assert not _call(channel, {"cmd": "reap", "pid": peer})["ok"], "reaped once"
+    _wait_zombie(peer)
+    stat = Path(f"/proc/{peer}/stat").read_text().rsplit(")", 1)[1].split()
+    assert int(stat[49]) == 0, "its exit status waits for the machine until the next fork"
+    listener = _listener(tmp_path / "c.sock")
+    assert _fork(tmp_path, channel, "c")["ok"]
+    _accept(listener)
+    assert not Path(f"/proc/{peer}").exists(), "the next fork reaped it"
 
 
 def test_a_fork_refuses_what_it_cannot_keep(

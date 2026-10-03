@@ -61,12 +61,6 @@ class Fork(Command, frozen=True, kw_only=True, tag="fork"):
     environment: dict[str, str]
 
 
-class Reap(Command, frozen=True, kw_only=True, tag="reap"):
-    """The wait status of a forked child the machine saw exit."""
-
-    pid: int
-
-
 class DescribeInstalled(Command, frozen=True, kw_only=True, tag="describe_installed"):
     distribution: str
     output: str
@@ -400,7 +394,6 @@ type KnownCommand = (
     | Warm
     | Join
     | Fork
-    | Reap
     | DescribeInstalled
     | Vacate
     | Restore

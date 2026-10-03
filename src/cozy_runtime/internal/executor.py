@@ -156,7 +156,6 @@ from cozy_runtime.internal.executor_commands import (
     Prefetch,
     PrepareRequest,
     Probe,
-    Reap,
     Release,
     Residency,
     Restore,
@@ -571,8 +570,6 @@ class Executor:
                 return self.describe_installed(command)
             case Fork():
                 return self.fork(command)
-            case Reap():
-                return self.reap(command)
             case Start():
                 return self.start(command)
             case Warm():
@@ -1350,6 +1347,8 @@ class Executor:
             return self._refusal(
                 "fork_environment", f"{moved} were read at this process's imports and differ"
             )
+        # Exited children stay zombies until now, so the machine reads their exit status.
+        self.forked -= zygote.collect(self.forked)
         reason = zygote.unsafe(sys.modules.get("torch"))
         if reason:
             return self._refusal("fork_unsafe", reason)
@@ -1361,6 +1360,10 @@ class Executor:
     def _forked(self, command: Fork, started: float) -> int:
         """In the child: an executor on its own seam, keeping this process's imports."""
         self.channel.sock.close()
+        for fd, name in ((1, "stdout.log"), (2, "stderr.log")):
+            log = os.open(Path(command.root) / name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            os.dup2(log, fd)
+            os.close(log)
         _capture_seal()
         kernel_cache.configure(kernel_cache.from_sealed(_SEALED))
         channel = connect(command.socket)
@@ -1378,14 +1381,6 @@ class Executor:
         }
         child.boot = {**self.boot, "legs_ms": legs}
         return serve(child, channel)
-
-    def reap(self, command: Reap) -> dict[str, Any]:
-        """Wait for one forked child; the machine asks once it has seen it exit."""
-        if command.pid not in self.forked:
-            return self._refusal("reap_unknown", f"{command.pid} is not a child of this process")
-        _, status = os.waitpid(command.pid, 0)
-        self.forked.discard(command.pid)
-        return {"ok": True, "status": status}
 
     def _start_reply(
         self,
