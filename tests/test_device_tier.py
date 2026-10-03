@@ -123,6 +123,8 @@ def test_a_replacement_attaches_the_kept_weights_and_computes_bit_identically(
         if not first.plane.device_sharing(0):
             pytest.skip("this GPU cannot export memory")
         model = load(first, checkpoint, "share")
+        first.measure_context()
+        before = first.context_bytes
         expected = run(model, x)
         filled = first.facts().h2d_bytes
         assert filled > 0
@@ -130,9 +132,10 @@ def test_a_replacement_attaches_the_kept_weights_and_computes_bit_identically(
         facts = first.facts()
         assert (facts.shared_bytes, facts.committed_bytes) == (total, 0), "offered at stage exit"
         assert first.share() == 0, "regions are offered once"
-        # The driver charges the exported regions to this process: never its context.
+        # The driver charges the exported regions to this process: never its context (which
+        # may still grow by a library workspace, never by the shared bytes).
         first.measure_context()
-        assert first.context_bytes < total, (first.context_bytes, total)
+        assert first.context_bytes < before + total, (before, first.context_bytes, total)
         assert same(run(model, x), expected), "the filler still computes on its read-only copy"
 
         replacement, _ = executor_with(custody, tmp_path / "b")
