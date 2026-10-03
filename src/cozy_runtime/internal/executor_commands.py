@@ -235,6 +235,9 @@ class GroupHardware(msgspec.Struct, frozen=True, kw_only=True):
 LOAD_PINNED = "load_pinned/1"
 #: An executor capability: it adopts the machine's sealed host layouts (`Load.sealed_tiers`).
 SEALED_TIERS = "host_tiers.sealed/1"
+#: An executor capability: it adopts a sealed host layout its machine is still filling, using
+#: each region once Ready; machines give other executors complete layouts only.
+SEALED_FILLING = "host_tiers.filling/1"
 
 
 class Load(Command, frozen=True, kw_only=True, tag="load"):
