@@ -54,6 +54,7 @@ from cozy_runtime.author._executor_requests import (
     Checkpoint,
     CheckpointReceipt,
     DeviceRoom,
+    DeviceTier,
     Handler,
     HostTier,
     Publish,
@@ -1647,6 +1648,8 @@ class AttemptEngine:
                 return self.checkpoint_exchange(attempt, request)
             case DeviceRoom() | HostTier() | BudgetCell() | StageEnter() | StageExit():
                 return refuse("no_durable_exchange", "a job's executor holds its whole turn")
+            case DeviceTier():
+                return refuse("no_durable_exchange", "this worker keeps no GPU weights")
             case TreeMember():
                 if self.calls is None:
                     return refuse("child_broker_absent", "no RecordOwner call lane")

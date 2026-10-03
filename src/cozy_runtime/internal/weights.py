@@ -29,6 +29,7 @@ import tensorfs
 
 from cozy_runtime.author._activity import aside
 from cozy_runtime.author._errors import RuntimeFailure, is_device_oom, is_library_refusal
+from cozy_runtime.author._executor_requests import DeviceTierAnswer, SharedRegion
 from cozy_runtime.author._loader import Census, TensorLike, TensorSpec, _members
 from cozy_runtime.author._stage_memo import inexact
 from cozy_runtime.internal import (
@@ -203,6 +204,8 @@ class Component:
     mapping: Any = None
     #: the pinned tier's fill in flight (a weight set closes only after it)
     filling: Ticket | None = None
+    #: region indexes mapped from GPU memory the machine keeps (`weights.attach/1`)
+    shared: set[int] = field(default_factory=set)
 
     def __post_init__(self) -> None:
         self.numbers = {region.index: i for i, region in enumerate(self.blocks)}
@@ -286,6 +289,8 @@ class Weights:
         self.room: Callable[[int], None] | None = None
         #: the CUDA context and library workspaces outside torch and the plane, measured once
         self.context_bytes = -1
+        #: the machine's custody of GPU weights (`weights.attach/1`); None: every region private
+        self.sharing: DeviceTiers | None = None
 
     def tick(self) -> int:
         self.clock += 1
@@ -549,6 +554,106 @@ class Weights:
     def resident_bytes(self, component: Component) -> int:
         return plane.stats(self.plane).ready(component.key, self.index)
 
+    # -- GPU memory the machine keeps (`weights.attach/1`)
+
+    def _shares(self) -> bool:
+        return (
+            self.sharing is not None
+            and not self.host_only
+            and bool(self.plane.device_sharing(self.index))
+        )
+
+    def _uuid(self) -> str:
+        return dict(self.plane.devices).get(self.index, "")
+
+    def attach(self, component: Component) -> int:
+        """Map the regions the machine keeps for exactly this layout, read-only and without a
+        copy. A region that cannot attach fills privately, as without a machine. Returns the
+        bytes attached."""
+        if self.sharing is None or not self._shares():
+            return 0
+        answer = self.sharing.ask(component.key, component.ws.digest, self._uuid())
+        if answer is None:
+            return 0
+        attached, at = 0, 0
+        try:
+            for row in answer.regions:
+                fds = answer.fds[at : at + len(row.chunks)]
+                at += len(row.chunks)
+                if not 0 <= row.region < len(component.regions):
+                    continue
+                try:
+                    self.plane.attach_device(
+                        component.ws,
+                        self.index,
+                        row.region,
+                        list(zip(row.chunks, fds, strict=True)),
+                    )
+                except plane.error("Poisoned"):
+                    raise
+                except plane.error("PlaneError"):
+                    continue
+                component.shared.add(row.region)
+                attached += component.regions[row.region].span
+        finally:
+            for fd in answer.fds:
+                os.close(fd)
+        return attached
+
+    def share(self) -> int:
+        """Offer the machine every region on the GPU not shared yet, so it outlives this
+        process and other executors attach it. Returns the bytes the machine kept."""
+        if self.sharing is None or not self._shares():
+            return 0
+        self.quiesce()
+        kept = 0
+        for component in list(self.components.values()):
+            exported = self.plane.export_device(component.ws, self.index)
+            if not exported:
+                continue
+            regions = tuple(
+                SharedRegion(region=row["region"], chunks=tuple(n for n, _ in row["chunks"]))
+                for row in exported
+            )
+            fds = tuple(fd for row in exported for _, fd in row["chunks"])
+            indexes = [row.region for row in regions]
+            component.shared.update(indexes)
+            try:
+                answer = self.sharing.offer(
+                    component.key, component.ws.digest, self._uuid(), regions, fds
+                )
+            finally:
+                for fd in fds:
+                    os.close(fd)
+            if answer.ok and not answer.duplicate:
+                kept += sum(component.regions[i].span for i in indexes)
+                continue
+            # Not kept: ours goes (it is outside the budget now); a duplicate is replaced by
+            # the copy the machine keeps, any other region fills privately when next used.
+            self._release_shared(component, indexes)
+            if answer.duplicate:
+                self.attach(component)
+        return kept
+
+    def revoke(self, layout: str) -> int:
+        """Stop using the machine's regions of `layout`: queued work finishes, then they are
+        unmapped and released. A later use fills a private copy. Returns the bytes let go."""
+        self.quiesce()
+        return sum(
+            self._release_shared(component, sorted(component.shared))
+            for component in self.components.values()
+            if component.shared and component.ws.digest == layout
+        )
+
+    def _release_shared(self, component: Component, indexes: Sequence[int]) -> int:
+        if not indexes:
+            return 0
+        freed = int(self.plane.drop(component.ws, self.index, list(indexes)))
+        for index in indexes:
+            unbind(component.regions[index])
+            component.shared.discard(index)
+        return freed
+
     # -- the pinned tier
 
     def host_share(self) -> int:
@@ -631,6 +736,8 @@ class Weights:
         so one larger than it pins a prefix and the rest reads from disk."""
         room, regions = self.pinned_applied, []
         for region in component.regions:
+            if region.index in component.shared:
+                continue  # on the GPU already, kept by the machine
             if region.span > room:
                 break
             room -= region.span
@@ -663,6 +770,7 @@ class Weights:
             unbind(region)
             region.views.clear()
         component.mapping = None
+        component.shared.clear()
         if component.filling is not None:
             component.filling.wait()  # a filling tier refuses to close
             component.filling = None
@@ -709,6 +817,7 @@ class Weights:
             h2d_gbps=round(copied / copy_ns, 3) if copy_ns else 0.0,
             disk_copy_bytes=device.disk_copy_bytes,
             mapped_copy_bytes=device.mapped_copy_bytes,
+            shared_bytes=device.shared_bytes,
             disk_read_bytes=held.host.disk_read_bytes,
             late=sum(row.late for row in stages),
             stall_ns=sum(row.stall_ns for row in stages),
@@ -1595,7 +1704,19 @@ class PlaneBackend:
         for region in regions:
             for table, attr, standin in region.unbound:
                 setattr(standin, "origin", (weights, component, region, table, attr))  # noqa: B010
+        if not fine:
+            weights.attach(component)
         return component
+
+
+@dataclass(frozen=True, slots=True)
+class DeviceTiers:
+    """The machine's custody of GPU regions (`weights.attach/1`): `ask` returns the regions it
+    keeps for exactly (weight set, layout, GPU) and their fds, or None; `offer` hands it the
+    regions this process filled and exported, with their fds."""
+
+    ask: Callable[[str, str, str], DeviceTierAnswer | None]
+    offer: Callable[[str, str, str, tuple[SharedRegion, ...], tuple[int, ...]], DeviceTierAnswer]
 
 
 @dataclass(frozen=True, slots=True)

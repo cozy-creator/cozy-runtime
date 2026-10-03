@@ -166,6 +166,30 @@ class HostTier(_Request, frozen=True, kw_only=True, tag="host_tier"):
     memfd: int = -1
 
 
+class SharedRegion(msgspec.Struct, frozen=True, kw_only=True):
+    """One plane region of shared GPU memory: its chunks' bytes, in address order. One fd per
+    chunk crosses the seam after the frame, in the same order."""
+
+    region: int
+    chunks: tuple[int, ...]
+
+
+class DeviceTier(_Request, frozen=True, kw_only=True, tag="device_tier"):
+    """One weight set's GPU memory the machine keeps across executors (`weights.attach/1`): an
+    ask names the layout (the machine answers with what it holds); an offer hands over the
+    regions this executor filled and exported (`fds` follow the frame)."""
+
+    name: str
+    #: the plane's layout digest: the same bytes at the same offsets
+    layout: str
+    #: the GPU's UUID
+    device: str
+    offer: bool = False
+    regions: tuple[SharedRegion, ...] = ()
+    #: the fds that go with an offer, in `regions` order; never on the wire
+    fds: tuple[int, ...] = ()
+
+
 class BudgetCell(_Request, frozen=True, kw_only=True, tag="budget_cell"):
     """The executor's plane budget cell (`internal/budget_cell.py`; its memfd follows this
     request): the Worker lowers a running call's budget through it, at a block boundary."""
@@ -202,6 +226,7 @@ class StageExit(_Request, frozen=True, kw_only=True, tag="stage_exit"):
 type _Tagged = (
     DeviceRoom
     | HostTier
+    | DeviceTier
     | BudgetCell
     | StageEnter
     | StageExit
@@ -252,6 +277,18 @@ class Tier(Answer, frozen=True, kw_only=True):
 
     held: bool = False
     descriptor: int = -1
+
+
+class DeviceTierAnswer(Answer, frozen=True, kw_only=True):
+    """The machine's answer to a `DeviceTier` exchange. An ask that is `held` is followed by
+    one fd per chunk of `regions`; `duplicate` answers an offer another executor's won."""
+
+    held: bool = False
+    generation: int = 0
+    regions: tuple[SharedRegion, ...] = ()
+    duplicate: bool = False
+    #: the fds that followed the answer, in `regions` order; never on the wire
+    fds: tuple[int, ...] = ()
 
 
 class StageGo(Answer, frozen=True, kw_only=True):
@@ -423,6 +460,8 @@ def respond(
     if isinstance(request, HostTier | BudgetCell):
         # The descriptor is only ever the one that arrived: a number on the wire is not.
         request = msgspec.structs.replace(request, memfd=-1 if received is None else received)
+    elif isinstance(request, DeviceTier):
+        request = msgspec.structs.replace(request, fds=())
     elif received is not None:
         os.close(received)
         request, reply = None, refuse("seam_descriptor", "unexpected memfd with a request")

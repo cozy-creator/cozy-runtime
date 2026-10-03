@@ -25,6 +25,9 @@ except ImportError:  # an older TensorFS: the executor offers no `weight_plane/1
 
 #: The executor capability a Worker negotiates on (`hello.memory`).
 CAPABILITY = "weight_plane/1"
+#: GPU memory the machine keeps across executors: attach on `Load.device_weights`, `share`
+#: after a call, `revoke` (TensorFS `Plane.export_device`).
+SHARING = ("weights.attach/1", "weights.revoke/1")
 PINNED: Final = "pinned"
 #: Priorities are plain integers; the plane evicts ascending and never picks among equals, so
 #: every band carries the LRU clock. Idle regions (a finished stage's) sit lowest; a running
@@ -60,6 +63,8 @@ class DeviceStats(msgspec.Struct, frozen=True, kw_only=True):
     host_copy_ns: int = 0
     disk_copy_bytes: int = 0
     disk_copy_ns: int = 0
+    #: shared regions mapped here (exported or attached): outside `committed` and the budget
+    shared_bytes: int = 0
     #: of the host pair, the copies from mappings of objects the page cache held; the rest
     #: came from the pinned tier (TensorFS 0.3.92; 0 before)
     mapped_copy_bytes: int = 0
@@ -72,6 +77,7 @@ class DeviceStats(msgspec.Struct, frozen=True, kw_only=True):
 class SetDevice(msgspec.Struct, frozen=True, kw_only=True):
     ordinal: int
     ready_bytes: int = 0
+    shared_bytes: int = 0
 
 
 class SetStats(msgspec.Struct, frozen=True, kw_only=True):
@@ -137,6 +143,12 @@ class Event(msgspec.Struct, frozen=True, kw_only=True):
 
 def available() -> bool:
     return _plane is not None
+
+
+def sharing() -> bool:
+    """This TensorFS can export and attach GPU regions (whether the GPU can is the plane's
+    `device_sharing(ordinal)`)."""
+    return _plane is not None and hasattr(_plane.Plane, "export_device")
 
 
 def open_plane(device: int | None) -> Plane:
