@@ -21,11 +21,14 @@ var errReleased = errors.New("this machine's idle release is due or committed")
 
 // idleState is the machine's idle ledger, rewritten only when a fact changes.
 type idleState struct {
-	Deadline     int64               `json:"deadline_ms"`
-	Released     bool                `json:"released"` // the claim is irreversible for a rental
-	WorkObserved bool                `json:"work_observed"`
-	Unknown      bool                `json:"unknown"` // activity unreadable after work: it holds
-	Keepalives   map[string][2]int64 `json:"keepalives,omitempty"`
+	Deadline     int64 `json:"deadline_ms"`
+	Released     bool  `json:"released"` // the claim is irreversible for a rental
+	WorkObserved bool  `json:"work_observed"`
+	Unknown      bool  `json:"unknown"` // activity unreadable while an accepted run is unsettled: it holds
+	// Unsettled is when the Runtime last accepted a run that no later report of its own has
+	// shown finished; 0 when every run it accepted has been.
+	Unsettled  int64               `json:"unsettled_ms"`
+	Keepalives map[string][2]int64 `json:"keepalives,omitempty"`
 }
 
 type idle struct {
@@ -34,7 +37,15 @@ type idle struct {
 	mu         sync.Mutex
 	s          idleState
 	renewed    int64
+	quiet      time.Time // the first idle report written after Unsettled
 	admissions map[*admission]struct{}
+}
+
+// sample is one reading of Runtime demand; at is when the Runtime wrote the report it came
+// from, zero when the agent answered itself.
+type sample struct {
+	busy, known bool
+	at          time.Time
 }
 
 type admission struct {
@@ -45,8 +56,15 @@ type admission struct {
 func openIdle(path string, fresh bool, now time.Time) (*idle, error) {
 	i := &idle{path: path, admissions: map[*admission]struct{}{}}
 	if raw, err := os.ReadFile(path); err == nil && !fresh {
-		if err := json.Unmarshal(raw, &i.s); err != nil {
+		var recorded struct {
+			Unsettled *int64 `json:"unsettled_ms"`
+		}
+		if err := errors.Join(json.Unmarshal(raw, &i.s), json.Unmarshal(raw, &recorded)); err != nil {
 			return nil, fmt.Errorf("the idle ledger is unreadable: %w", err)
+		}
+		if recorded.Unsettled == nil && i.s.WorkObserved {
+			// An older agent kept no record of accepted runs: one may still be running.
+			i.s.Unsettled = now.UnixMilli()
 		}
 	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err
@@ -65,38 +83,52 @@ func (i *idle) save() error {
 	return writeAtomic(i.path, raw, 0o600)
 }
 
-// observe folds one activity sample into the deadline. Busy work renews it; activity that
-// cannot be read after work was seen holds it; an idle machine lets it run out.
-func (i *idle) observe(now time.Time, busy, known bool) (time.Time, error) {
+// observe folds one activity sample into the deadline. Busy work renews it. Two idle reports
+// the Runtime wrote after the last run it accepted settle every accepted run (one could have
+// been computed before that acceptance). Activity that cannot be read holds the deadline only
+// while an accepted run is unsettled: the agent records every run the Runtime accepts, so an
+// unreachable Runtime with none is idle.
+func (i *idle) observe(now time.Time, s sample) (time.Time, error) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	if i.s.Released {
 		return now, errReleased
 	}
-	hadWork := i.s.WorkObserved || known && busy
-	unknown := !known && hadWork
-	// A live Runtime with unreadable activity holds the deadline. Once the
-	// Runtime is known dead, its prior unknown sample must not start a fresh
-	// idle window.
-	if known && busy || unknown {
+	hadWork, unsettled := i.s.WorkObserved || s.known && s.busy, i.s.Unsettled
+	switch {
+	case s.known && s.busy:
+		i.quiet = time.Time{}
+	case s.known && s.at.UnixMilli() > unsettled && unsettled != 0:
+		if i.quiet.UnixMilli() <= unsettled {
+			i.quiet = s.at
+		} else if s.at.After(i.quiet) {
+			unsettled = 0
+		}
+	}
+	unknown := !s.known && unsettled != 0
+	if s.known && s.busy || unknown {
 		i.renewed = max(i.renewed, now.Add(idleGrace).UnixMilli())
 	}
 	target := max(i.s.Deadline, i.renewed)
-	if unknown == i.s.Unknown && hadWork == i.s.WorkObserved && target-i.s.Deadline < idleGrace.Milliseconds()/2 {
+	if unknown == i.s.Unknown && hadWork == i.s.WorkObserved && unsettled == i.s.Unsettled && target-i.s.Deadline < idleGrace.Milliseconds()/2 {
 		return time.UnixMilli(target), nil
 	}
-	i.s.Deadline, i.s.Unknown, i.s.WorkObserved = target, unknown, hadWork
+	i.s.Deadline, i.s.Unknown, i.s.WorkObserved, i.s.Unsettled = target, unknown, hadWork, unsettled
 	return time.UnixMilli(target), i.save()
 }
 
-// work renews the deadline for accepted work.
-func (i *idle) work(now time.Time) error {
+// work renews the deadline for accepted work. A run the Runtime accepted stays unsettled
+// until its later reports show it finished.
+func (i *idle) work(now time.Time, run bool) error {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	if i.s.Released {
 		return errReleased
 	}
 	i.s.Deadline, i.s.WorkObserved = max(i.s.Deadline, now.Add(idleGrace).UnixMilli()), true
+	if run {
+		i.s.Unsettled = max(i.s.Unsettled, now.UnixMilli())
+	}
 	return i.save()
 }
 
@@ -112,14 +144,15 @@ func (i *idle) admit(call context.Context, now time.Time) (*admission, error) {
 	return a, nil
 }
 
-func (a *admission) finish(work bool, now time.Time) error {
+// finish ends the call; accepted says the Runtime accepted the run it carried.
+func (a *admission) finish(accepted bool, now time.Time) error {
 	a.i.mu.Lock()
 	delete(a.i.admissions, a)
 	a.i.mu.Unlock()
-	if !work {
+	if !accepted {
 		return nil
 	}
-	return a.i.work(now)
+	return a.i.work(now, true)
 }
 
 // claim takes the idle release once its deadline passed and nothing holds it.
@@ -188,32 +221,34 @@ type activity struct {
 
 const activityFreshness = 10 * time.Second
 
-func (a *activity) observe(now time.Time) (busy bool, err error) {
+// observe reads the Runtime's report and when it was written.
+func (a *activity) observe(now time.Time) (busy bool, at time.Time, err error) {
 	file, err := os.Open(a.path)
 	if err != nil {
-		return false, err
+		return false, at, err
 	}
 	defer file.Close()
 	info, err := file.Stat()
 	if err != nil {
-		return false, err
+		return false, at, err
 	}
-	if now.Sub(info.ModTime()) > activityFreshness || info.ModTime().After(now.Add(activityFreshness)) {
-		return false, errors.New("the Runtime's activity is stale")
+	at = info.ModTime()
+	if now.Sub(at) > activityFreshness || at.After(now.Add(activityFreshness)) {
+		return false, at, errors.New("the Runtime's activity is stale")
 	}
 	var facts struct {
 		ActiveWork *bool    `json:"active_work"`
 		Holding    []string `json:"holding"`
 	}
 	if err := json.NewDecoder(io.LimitReader(file, 4096)).Decode(&facts); err != nil || facts.ActiveWork == nil {
-		return false, errors.New("the Runtime's activity does not report active_work")
+		return false, at, errors.New("the Runtime's activity does not report active_work")
 	}
 	if !*facts.ActiveWork {
-		return false, nil
+		return false, at, nil
 	}
 	holders := strings.Join(facts.Holding, ", ")
 	a.say(now, "cozy machine: idle held by the Runtime: "+holders)
-	return true, nil
+	return true, at, nil
 }
 
 func (a *activity) say(now time.Time, line string) {
@@ -336,6 +371,12 @@ func (r *restarts) exited(err error, wasReady bool) bool {
 	}
 	r.retryAt = time.Now().Add(time.Second)
 	return true
+}
+
+func (i *idle) unsettled() bool {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	return i.s.Unsettled != 0
 }
 
 func (i *idle) releasedNow() bool {

@@ -599,25 +599,8 @@ func (m *Machine) supervise(ctx context.Context) error {
 			default: // keep observing rental idleness while an in-flight commit settles
 			}
 		}
-		busy, known := m.observeActivity(work, now)
-		deadline, observeErr := m.idle.observe(now, busy, known)
-		if observeErr != nil && !errors.Is(observeErr, errReleased) {
-			return observeErr
-		}
-		if !m.owned && !now.Before(deadline) && !now.Before(nextAsk) {
-			released, err := m.idle.claim(now)
-			if err != nil {
-				return err
-			}
-			if released {
-				done, err := m.release(ctx)
-				if err != nil {
-					fmt.Fprintln(m.log, "cozy machine: idle release not accepted; retrying without extending the deadline:", err)
-					nextAsk = now.Add(5 * time.Second)
-				} else if done {
-					return nil
-				}
-			}
+		if done, err := m.idleTick(ctx, work, now, &nextAsk); done || err != nil {
+			return err
 		}
 		select {
 		case <-ctx.Done():
@@ -640,20 +623,52 @@ func (m *Machine) supervise(ctx context.Context) error {
 	}
 }
 
-// A live process protects unknown activity. Maintenance without a Runtime is not
-// accepted work and cannot renew a rental's idle deadline.
-func (m *Machine) observeActivity(work *activity, now time.Time) (busy, known bool) {
+// idleTick folds one activity sample into the idle ledger and, on a rental whose deadline
+// passed with nothing held, asks the Hub to release it. done means the Hub accepted.
+func (m *Machine) idleTick(ctx context.Context, work *activity, now time.Time, nextAsk *time.Time) (done bool, err error) {
+	s := m.observeActivity(work, now)
+	deadline, err := m.idle.observe(now, s)
+	if err != nil && !errors.Is(err, errReleased) {
+		return false, err
+	}
+	unreadable := !s.known
+	if unreadable && m.idle.unsettled() {
+		work.say(now, "cozy machine: idle held: the Runtime's activity is unreadable and a run it accepted has not finished")
+	}
+	if m.owned || now.Before(deadline) || now.Before(*nextAsk) {
+		return false, nil
+	}
+	released, err := m.idle.claim(now)
+	if err != nil || !released {
+		return false, err
+	}
+	if unreadable {
+		fmt.Fprintln(m.log, "cozy machine: releasing with the Runtime's activity unreadable; every run it accepted has finished")
+	}
+	done, err = m.release(ctx)
+	if err != nil {
+		fmt.Fprintln(m.log, "cozy machine: idle release not accepted; retrying without extending the deadline:", err)
+		*nextAsk = now.Add(5 * time.Second)
+		return false, nil
+	}
+	return done, nil
+}
+
+// observeActivity reads Runtime demand. A live Runtime whose activity cannot be read is
+// unknown; the ledger decides whether that holds. A Runtime that is not running is known
+// idle, and maintenance without a Runtime is not accepted work.
+func (m *Machine) observeActivity(work *activity, now time.Time) sample {
 	if !m.running() {
-		return false, true
+		return sample{known: true}
 	}
 	if m.preparations() {
-		return true, true
+		return sample{busy: true, known: true}
 	}
 	if m.phase() != "ready" {
-		return false, false
+		return sample{}
 	}
-	busy, err := work.observe(now)
-	return busy, err == nil
+	busy, at, err := work.observe(now)
+	return sample{busy: busy, known: err == nil, at: at}
 }
 
 func (m *Machine) running() bool {
