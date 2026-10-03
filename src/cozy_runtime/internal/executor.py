@@ -138,6 +138,7 @@ from cozy_runtime.internal.discovery import discover_distribution, discover_inst
 from cozy_runtime.internal.executor_commands import (
     LOAD_PINNED,
     PROCESS_CAP,
+    SEALED_FILLING,
     SEALED_TIERS,
     Activate,
     Attention,
@@ -632,6 +633,7 @@ class Executor:
                 ),
                 *(plane.SHARING if plane.sharing() else ()),
                 *([SEALED_TIERS] if plane.sealed_available() else []),
+                *([SEALED_FILLING] if plane.sealed_filling() else []),
             ],
             "memo": [stage_memo.CAPABILITY],
             "pgid": os.getpgrp(),

@@ -169,6 +169,11 @@ def sealed_available() -> bool:
     return _plane is not None and hasattr(_plane.Plane, "register_sealed")
 
 
+def sealed_filling() -> bool:
+    """This TensorFS adopts a sealed layout still filling, waiting per region."""
+    return sealed_available() and getattr(_plane, "SEALED_WHILE_FILLING", False) is True
+
+
 def is_sealed(fd: int) -> bool:
     """Whether `fd` is a memfd nobody can write, resize or unseal: a sealed host layout."""
     try:
