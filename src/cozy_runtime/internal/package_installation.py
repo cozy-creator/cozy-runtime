@@ -437,11 +437,26 @@ def _build(
             machine_sdk(),
             machine_wheels(directory.parent.parent),
         )
+    _compile_bytecode(generation, site)
     return {
         name: distribution.version
         for distribution in importlib.metadata.distributions(path=[str(site)])
         if (name := canonicalize_name(distribution.metadata["Name"] or "")) in SDK
     }
+
+
+def _compile_bytecode(generation: Path, site: Path) -> None:
+    """Compile the environment once, at install. Executors run `python -I` (no bytecode prefix)
+    under an identity that may not write the environment, so an uncompiled one compiles torch,
+    Diffusers and Transformers again in every executor: SDXL's imports 8.7 s, 3.2 s compiled.
+    Best effort: a file that does not compile is imported from source, as before."""
+    subprocess.run(
+        [str(generation / "bin" / "python"), "-I", "-m", "compileall", "-q", "-j", "0", str(site)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
 
 
 def _write_record(directory: Path, generation: Path, record: InstallationRecord) -> None:
