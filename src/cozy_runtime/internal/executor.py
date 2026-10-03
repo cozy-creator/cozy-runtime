@@ -469,6 +469,9 @@ class Executor:
         self.channel = channel
         self.root = root
         self.host: Executor = host or self
+        #: this process's CUDA context and first library launches, measured at device init
+        #: from the device's own used bytes (-1: unmeasured); per-process NVML refines it
+        self.device_context = -1
         #: the construction key this generation was loaded under; "" on the host
         self.construction = construction
         #: HOST ONLY: every loaded construction and the active one. Their weights share one
@@ -713,11 +716,23 @@ class Executor:
                 "detail": "Torch CUDA was already initialized before Runtime's explicit "
                 "allocator boundary; package execution is refused",
             }
+        entries = _sealed_entries()
+        index = self.rank if self.world > 1 else 0
+        entry = entries[index] if index < len(entries) else str(index)
+        before = accel.device_used(entry)
         accel.initialize(torch, self.device_kind)
         if self.world > 1 and self.device_kind == "cuda":
             torch.cuda.set_device(self.rank)
         accel.first_launches(torch, self.device_kind)
         accel.reset_peak(torch, self.device_kind)
+        after = accel.device_used(entry) if before >= 0 else -1
+        if after >= 0:
+            # This process's context and libraries as the device saw them appear: its own
+            # measurement where the driver lists no process (containers). Both readings are
+            # NVML's (CUDA's total leaves out what the driver reserves). Another process moving
+            # memory in these milliseconds is noise in either direction.
+            reserved = accel.allocation(torch, self.device_kind)["reserved_bytes"]
+            self.host.device_context = max(after - before - reserved, 0)
         self._device_ready = True
         return None
 
@@ -2061,6 +2076,7 @@ class Executor:
         if host.weights is None:
             try:
                 host.weights = Weights(torch, self._rank_device(torch), self.device_kind)
+                host.weights.adopt_context(host.device_context)
                 settles(host.weights.quiesce)
                 # One GPU of a group: its blocks hold the group's collectives, so they
                 # recover from an out-of-memory op by op, never by running a block again.
@@ -2726,16 +2742,20 @@ class Executor:
             command.plane_budget_bytes != self.weights.budget
             or command.cap_bytes != self.weights.cap
             or command.rank_caps
+            or command.floor_bytes != self.weights.owner_floor
         ):
             granted = self.budget(
                 Budget(
                     vram_bytes=command.plane_budget_bytes,
                     cap_bytes=command.cap_bytes,
                     rank_caps=command.rank_caps,
+                    floor_bytes=command.floor_bytes,
                 )
             )
             if not granted.get("ok"):
                 return granted
+        if self.weights is not None:
+            self.weights.seed_activations(command.activation_bytes)
         with self._turns(target.residency, command.stages and self.world == 1):
             reply = target.invoke(command)
         self.attempts += 1
@@ -4160,6 +4180,8 @@ class Executor:
             if weights is None:
                 return 0
             self._unpark()  # a parked stage's holds would make a cut unreleasable
+            if not isinstance(command.floor_bytes, UnsetType):
+                weights.set_floor(command.floor_bytes)
             cap = _rank_cap(command.rank_caps, self.rank, command.cap_bytes)
             if not isinstance(cap, UnsetType):
                 weights.set_cap(cap)  # every GPU's own process

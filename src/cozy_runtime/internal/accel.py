@@ -310,6 +310,15 @@ def _nvml_device_memory(device: str) -> DeviceMemory | None:
     return _device_memory_of(int(memory.free), int(memory.total))
 
 
+def device_used(device: str) -> int:
+    """Bytes in use on one envelope entry by every process, from NVML, torch-free; -1 where NVML
+    cannot say."""
+    memory = _nvml_device_memory(device)
+    if memory is None or memory.state != "measured":
+        return -1
+    return memory.total_bytes - memory.free_bytes
+
+
 def device_capability(device: str) -> int:
     """One envelope entry's CUDA capability as `major * 10 + minor` (sm_120 is 120), from
     the driver, torch-free; zero where NVML is absent or does not know the entry."""
@@ -494,6 +503,14 @@ def peak_allocated(torch: Any, kind: str) -> int:
     if kind == "mps":
         raise AcceleratorUnsupported("mps", "peak_allocated")
     return int(torch.cuda.max_memory_allocated())
+
+
+def peak_reserved(torch: Any, kind: str) -> int:
+    """The allocator's reserved high-water mark since the last `reset_peak`: live tensors plus
+    the segments torch held for them, which is what a stage takes from the device."""
+    if kind == "mps":
+        raise AcceleratorUnsupported("mps", "peak_reserved")
+    return int(torch.cuda.max_memory_reserved())
 
 
 def release_cached(torch: Any, kind: str) -> None:
