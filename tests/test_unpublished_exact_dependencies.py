@@ -57,6 +57,15 @@ def _wheel(
     return path
 
 
+def sysconfig_purelib(python: Path) -> str:
+    return subprocess.run(
+        [str(python), "-I", "-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"],
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout.strip()
+
+
 def test_conflicting_private_closures_ignore_base_and_ambient_settings(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -99,6 +108,8 @@ def test_conflicting_private_closures_ignore_base_and_ambient_settings(
             check=True,
         )
         assert result.stdout.strip() == version
+        site = Path(sysconfig_purelib(installed.python))
+        assert list((site / "__pycache__").glob("huggingface_hub.*.pyc")), "compiled at install"
         assert "include-system-site-packages = false" in (
             (installed.generation / "pyvenv.cfg").read_text()
         )
