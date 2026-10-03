@@ -29,7 +29,7 @@ import tensorfs
 
 from cozy_runtime.author._activity import aside
 from cozy_runtime.author._errors import RuntimeFailure, is_device_oom, is_library_refusal
-from cozy_runtime.author._executor_requests import DeviceTierAnswer, SharedRegion
+from cozy_runtime.author._executor_requests import DeviceTierAnswer, SealedPlan, SharedRegion
 from cozy_runtime.author._loader import Census, TensorLike, TensorSpec, _members
 from cozy_runtime.author._stage_memo import inexact
 from cozy_runtime.internal import (
@@ -179,6 +179,8 @@ class Component:
     device: int
     #: every region, by plane index
     regions: list[Region]
+    #: its bytes are the machine's sealed layout: adopted read-only, never filled here
+    sealed: bool
     #: the region outside every block, if any, and the blocks in address order
     common: Region | None
     blocks: list[Region]
@@ -676,8 +678,8 @@ class Weights:
         limit may have moved and other memory grown since. Read at every stage and every
         pass; only ever lowers (the plane punches its least recently used regions, which
         then come from the page cache or disk)."""
-        if self.host_only:
-            return  # a CPU executor computes on its tier
+        if self.host_only or self._all_sealed():
+            return  # a CPU executor computes on its tier; a sealed one is the machine's RAM
         share = self.host_share()
         if 0 <= share < self.pinned_applied:
             self._pin(share)
@@ -690,12 +692,22 @@ class Weights:
         if self.host_only:
             self._bind_host(component)
             return
-        share = self.host_share()
-        if self.pinned < 0:
-            self._pin(max(share, 0))
-        else:  # the Worker's budget, inside what the host has now
-            self._pin(self.pinned if share < 0 else min(self.pinned, share))
+        if self._all_sealed():
+            # The machine's RAM, already resident: its budget is what this process registers.
+            self._pin(self.pinned if self.pinned >= 0 else self._total())
+        else:
+            share = self.host_share()
+            if self.pinned < 0:
+                self._pin(max(share, 0))
+            else:  # the Worker's budget, inside what the host has now
+                self._pin(self.pinned if share < 0 else min(self.pinned, share))
         self._fill(component)
+
+    def _all_sealed(self) -> bool:
+        return all(c.sealed for c in self.components.values())
+
+    def _total(self) -> int:
+        return sum(c.ws.nbytes for c in self.components.values())
 
     def _bind_host(self, component: Component) -> None:
         """A CPU executor computes on its pinned tier: every region pinned there (never evicted
@@ -819,6 +831,7 @@ class Weights:
             mapped_copy_bytes=device.mapped_copy_bytes,
             shared_bytes=device.shared_bytes,
             disk_read_bytes=held.host.disk_read_bytes,
+            sealed_bytes=held.host.sealed_bytes,
             late=sum(row.late for row in stages),
             stall_ns=sum(row.stall_ns for row in stages),
             misses=device.misses,
@@ -1344,8 +1357,11 @@ class PlaneBackend:
         """Completeness sets, and the verified read leases: a corrupt artifact refuses here,
         before construction."""
         self.expected = {name: frozenset(keys) for name, keys in sets.items()}
-        for name in sets:
-            self.leases.acquire(name)
+        if self.tiers is None or self.tiers.seal is None:
+            # With sealed tiers the machine verified every byte it filled; a weight set it
+            # holds none of takes its lease when it registers.
+            for name in sets:
+                self.leases.acquire(name)
         self.stats["leases"] = self.leases.document()
 
     def fit(self, walked: Census, *, encoded_leaves: str) -> Mapping[str, object] | None:
@@ -1583,6 +1599,15 @@ class PlaneBackend:
         self.weights.register(component)
         return component
 
+    def _source(self, name: str, checkpoint: Checkpoint) -> Source:
+        """The manifest's one store source, made by its first weight set that reads it."""
+        source = self.sources.get(checkpoint.manifest_id)
+        if source is None:
+            source = self.sources[checkpoint.manifest_id] = plane.source(
+                self.weights.plane, checkpoint.store, self.leases.take(name)
+            )
+        return source
+
     def _register(
         self, name: str, root: Module, keys: list[str], *, fine: bool = False
     ) -> Component:
@@ -1600,34 +1625,52 @@ class PlaneBackend:
         kept = [(index, group) for index, group in enumerate(members) if group]
         checkpoint = self.checkpoints[name]
         skipped = self.skipped.get(name, ())
-        plan = checkpoint.read_plan(
-            [(name, self.plan[key].name) for key in keys] + [(name, key) for key in skipped],
-            READ_WINDOW,
-            (name,),
+        traversal = [(name, self.plan[key].name) for key in keys] + [(name, key) for key in skipped]
+        plan = checkpoint.read_plan(traversal, READ_WINDOW, (name,))
+        parts = (
+            [
+                self.plan[key].role_what(part.role)
+                for key in keys
+                for part in self.plan[key].encoded.parts
+            ]
+            if skipped
+            else []
         )
         if skipped:
             # The plan names every stored tensor; only what the code builds is read or mapped.
-            plan = plan.select(
-                [
-                    self.plan[key].role_what(part.role)
-                    for key in keys
-                    for part in self.plan[key].encoded.parts
-                ]
-            )
+            plan = plan.select(parts)
         weights = self.weights
         key = f"{self.construction}/{name}"
         ids = [[f"{name}/{self.plan[k].name}" for k in group] for _, group in kept]
         digest = canonical.digest({"manifest": checkpoint.manifest_id, "regions": ids})
         tiers = None if fine else self.tiers
         with store_refusals(f"registering {name}"):
-            source = self.sources.get(checkpoint.manifest_id)
-            if source is None:
-                source = self.sources[checkpoint.manifest_id] = plane.source(
-                    weights.plane, checkpoint.store, self.leases.take(name)
+            held = None
+            if tiers is not None and tiers.seal is not None:
+                held = tiers.seal(
+                    SealedPlan(
+                        manifest=checkpoint.manifest_id,
+                        name=key,
+                        layout=digest,
+                        window=READ_WINDOW,
+                        traversal=tuple(traversal),
+                        components=(name,),
+                        regions=tuple(tuple(group) for group in ids),
+                        parts=tuple(parts),
+                    )
                 )
-            held = tiers.ask(key, digest) if tiers is not None else None
+            elif tiers is not None:
+                held = tiers.ask(key, digest)
+            sealed = held is not None and plane.is_sealed(held)
             try:
-                ws = weights.plane.register(key, source, plan, ids, host_fd=held)
+                if sealed:
+                    assert held is not None
+                    # The machine's: no store, no lease, no fill here, ever.
+                    ws = weights.plane.register_sealed(key, plan, ids, held)
+                else:
+                    ws = weights.plane.register(
+                        key, self._source(name, checkpoint), plan, ids, host_fd=held
+                    )
             except plane.error("Invalid"):
                 if held is None:
                     raise
@@ -1636,7 +1679,8 @@ class PlaneBackend:
                 if held is not None:
                     os.close(held)  # the plane reopened its own description
             if ws is None:
-                held, ws = None, weights.plane.register(key, source, plan, ids)
+                held, sealed = None, False
+                ws = weights.plane.register(key, self._source(name, checkpoint), plan, ids)
         if tiers is not None:
             if held is None:
                 tiers.offer(key, digest, ws.host_fd)
@@ -1692,6 +1736,7 @@ class PlaneBackend:
             ws=ws,
             device=weights.index,
             regions=regions,
+            sealed=sealed,
             common=common,
             blocks=blocks,
             layout=weight_policy.Layout(
@@ -1729,6 +1774,8 @@ class HostTiers:
     ask: Callable[[str, str], int | None]
     offer: Callable[[str, str, int], None]
     share: Callable[[str, str, int], None] = lambda name, layout, memfd: None
+    #: the machine's sealed layout for a plan (`SealedTier`), asked instead of `ask`
+    seal: Callable[[SealedPlan], int | None] | None = None
 
 
 class _Span(msgspec.Struct, frozen=True):

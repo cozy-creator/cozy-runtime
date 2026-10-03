@@ -128,6 +128,8 @@ class PlaneFacts(msgspec.Struct, frozen=True, kw_only=True):
     #: bytes this executor process read from storage since it started (`/proc/self/io`;
     #: TensorFS 0.3.92): a gate compares a delta across a return. -1: not counted
     disk_read_bytes: int = -1
+    #: RAM of the machine's sealed layouts this executor maps (theirs, never its own)
+    sealed_bytes: int = 0
     late: int = 0
     stall_ns: int = 0
     misses: int = 0

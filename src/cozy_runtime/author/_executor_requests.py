@@ -190,6 +190,37 @@ class DeviceTier(_Request, frozen=True, kw_only=True, tag="device_tier"):
     fds: tuple[int, ...] = ()
 
 
+class SealedPlan(msgspec.Struct, frozen=True, kw_only=True):
+    """What one weight set's sealed host layout holds (`host_tiers.sealed/1`): the TensorFS
+    read plan and region grouping the model code chose. The machine builds the same plan from
+    its own copy of `manifest`'s header and fills it once; the layout digest must match."""
+
+    manifest: str
+    #: the weight set's key and region digest, as `HostTier` names them
+    name: str
+    layout: str
+    window: int
+    traversal: tuple[tuple[str, str], ...]
+    components: tuple[str, ...]
+    regions: tuple[tuple[str, ...], ...]
+    #: the stored parts the code builds, when it skips some (all of them when empty)
+    parts: tuple[str, ...] = ()
+
+
+class SealedTier(_Request, frozen=True, kw_only=True, tag="sealed_tier"):
+    """One weight set's sealed host layout from the machine, which fills it once and keeps
+    it across executors. The canonical `SealedPlan` follows in a sealed memfd (a plan is
+    larger than a control frame); `Tier` answers, the layout's memfd following when `held`."""
+
+    manifest: str
+    name: str
+    layout: str
+    sha256: str
+    length: Annotated[int, msgspec.Meta(ge=0)]
+    #: the plan's memfd; never on the wire
+    memfd: int = -1
+
+
 class BudgetCell(_Request, frozen=True, kw_only=True, tag="budget_cell"):
     """The executor's plane budget cell (`internal/budget_cell.py`; its memfd follows this
     request): the Worker lowers a running call's budget through it, at a block boundary."""
@@ -227,6 +258,7 @@ type _Tagged = (
     DeviceRoom
     | HostTier
     | DeviceTier
+    | SealedTier
     | BudgetCell
     | StageEnter
     | StageExit
