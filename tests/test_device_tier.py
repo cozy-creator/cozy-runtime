@@ -101,10 +101,9 @@ def test_a_replacement_attaches_the_kept_weights_and_computes_bit_identically(
         filled = first.facts().h2d_bytes
         assert filled > 0
         total = sum(r.span for r in model.backend.components["stack"].regions)
-        assert first.share() == total
-        assert first.share() == 0, "regions are offered once"
         facts = first.facts()
-        assert (facts.shared_bytes, facts.committed_bytes) == (total, 0)
+        assert (facts.shared_bytes, facts.committed_bytes) == (total, 0), "offered at stage exit"
+        assert first.share() == 0, "regions are offered once"
         assert same(run(model, x), expected), "the filler still computes on its read-only copy"
 
         replacement, _ = executor_with(custody, tmp_path / "b")
@@ -137,10 +136,10 @@ def test_a_duplicate_offer_is_replaced_by_the_kept_copy(tmp_path: Path) -> None:
         two, _ = executor_with(custody, tmp_path / "b")
         first, second = load(one, checkpoint, "dup"), load(two, checkpoint, "dup")
         expected = run(first, x)
-        assert same(run(second, x), expected)
         total = sum(r.span for r in first.backend.components["stack"].regions)
-        assert one.share() == total
-        assert two.share() == 0, "the second copy goes; the kept one is attached"
+        assert one.facts().shared_bytes == total
+        # The second fills its own copy; offered at its stage exit, it goes for the kept one.
+        assert same(run(second, x), expected)
         assert two.facts().committed_bytes == 0 and two.facts().shared_bytes == total
         assert same(run(second, x), expected)
     finally:
