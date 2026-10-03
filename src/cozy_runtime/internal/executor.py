@@ -4215,12 +4215,16 @@ class Executor:
         return {"ok": True, "freed_bytes": freed, "plane": self._plane_facts()}
 
     def share(self) -> dict[str, Any]:
-        """Offer the machine every GPU region this executor filled and has not shared yet."""
+        """Offer the machine every GPU region this executor filled and has not shared yet. An
+        executor loaded without device weights takes them on here: the machine asks once a
+        call measured that its construction fits beside the other tenants."""
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
         if self.weights is None:
             return {"ok": True, "shared_bytes": 0}
         self._unpark()
+        if self.weights.sharing is None and self.world == 1 and plane.sharing():
+            self.weights.sharing = DeviceTiers(ask=self._ask_device, offer=self._offer_device)
         return {"ok": True, "shared_bytes": self.weights.share(), "plane": self._plane_facts()}
 
     def revoke(self, command: Revoke) -> dict[str, Any]:
