@@ -209,6 +209,9 @@ class Component:
     filling: Ticket | None = None
     #: region indexes mapped from GPU memory the machine keeps (`weights.attach/1`)
     shared: set[int] = field(default_factory=set)
+    #: the machine's lease sockets for those regions: open while they are mapped, closed (by
+    #: this process or its death) once they are let go, which ends the lease
+    leases: list[int] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.numbers = {region.index: i for i, region in enumerate(self.blocks)}
@@ -679,11 +682,13 @@ class Weights:
                 if not 0 <= row.region < len(component.regions):
                     continue
                 try:
+                    # The plane maps only when the holder's layout is this weight set's.
                     self.plane.attach_device(
                         component.ws,
                         self.index,
                         row.region,
                         list(zip(row.chunks, fds, strict=True)),
+                        answer.layout,
                     )
                 except plane.error("Poisoned"):
                     raise
@@ -694,6 +699,10 @@ class Weights:
         finally:
             for fd in answer.fds:
                 os.close(fd)
+            if attached:
+                component.leases.append(answer.lease_fd)
+            else:
+                os.close(answer.lease_fd)
         return attached
 
     def share(self, components: Iterable[Component] | None = None) -> int:
@@ -723,6 +732,8 @@ class Weights:
                 for fd in fds:
                     os.close(fd)
             if answer.ok and not answer.duplicate:
+                if answer.lease_fd >= 0:
+                    component.leases.append(answer.lease_fd)
                 kept += sum(component.regions[i].span for i in indexes)
                 continue
             # Not kept: ours goes (it is outside the budget now); a duplicate is replaced by
@@ -749,6 +760,8 @@ class Weights:
         for index in indexes:
             unbind(component.regions[index])
             component.shared.discard(index)
+        if not component.shared:
+            _end_leases(component)
         return freed
 
     # -- the pinned tier
@@ -889,6 +902,7 @@ class Weights:
             self.torch.cuda.synchronize(self.device)
             self.plane.set_vram_budget(self.index, self.applied)
             component.ws.close()
+        _end_leases(component)  # after the close released every shared region
 
     # -- facts
 
@@ -3025,6 +3039,15 @@ def _unpaid(
         resident=(*(kept[p] for p in paid.resident), *attached),
         streamed=tuple(kept[p] for p in paid.streamed),
     )
+
+
+def _end_leases(component: Component) -> None:
+    """Close the machine's lease sockets once none of the component's regions maps shared
+    memory any longer: the machine sees each lease end without being told."""
+    for fd in component.leases:
+        with suppress(OSError):
+            os.close(fd)
+    component.leases.clear()
 
 
 def _unshared(component: Component) -> bool:

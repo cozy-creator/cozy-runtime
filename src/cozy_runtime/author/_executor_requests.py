@@ -346,14 +346,21 @@ class SourceBytes(Tier, frozen=True, kw_only=True):
 
 class DeviceTierAnswer(Answer, frozen=True, kw_only=True):
     """The machine's answer to a `DeviceTier` exchange. An ask that is `held` is followed by
-    one fd per chunk of `regions`; `duplicate` answers an offer another executor's won."""
+    one fd per chunk of `regions`; `duplicate` answers an offer another executor's won. With
+    `lease` one socket follows the chunks: the reader's lease, held open while it maps the
+    holding and closed once it let the bytes go (a crash closes it too)."""
 
     held: bool = False
     generation: int = 0
+    #: the holding's layout digest, which the attaching plane verifies before it maps
+    layout: str = ""
     regions: tuple[SharedRegion, ...] = ()
     duplicate: bool = False
+    lease: bool = False
     #: the fds that followed the answer, in `regions` order; never on the wire
     fds: tuple[int, ...] = ()
+    #: the lease socket that followed them, -1 when none; never on the wire
+    lease_fd: int = -1
 
 
 class StageGo(Answer, frozen=True, kw_only=True):

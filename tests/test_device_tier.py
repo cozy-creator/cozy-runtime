@@ -31,10 +31,30 @@ pytestmark = [
 
 
 class Custody:
-    """cozy-machine's `ResidentCustody` in miniature: layout -> (regions, fds)."""
+    """cozy-machine's `ResidentCustody` in miniature: layout -> (regions, fds), and one lease
+    socket per offer kept or attachment, whose other end the executor holds."""
 
-    def __init__(self) -> None:
+    def __init__(self, layout_says: str = "") -> None:
         self.held: dict[str, tuple[list[dict[str, Any]], list[int]]] = {}
+        self.leases: list[socket.socket] = []
+        #: a holder that names another layout than the one it was asked for
+        self.layout_says = layout_says
+
+    def lease(self, channel: Channel) -> None:
+        ours, theirs = socket.socketpair()
+        channel.send_lease(theirs.fileno())
+        theirs.close()
+        self.leases.append(ours)
+
+    def ended(self) -> list[bool]:
+        """Which leases the executor ended (closed, or died)."""
+        out = []
+        for ours in self.leases:
+            try:
+                out.append(ours.recv(1, socket.MSG_DONTWAIT) == b"")
+            except BlockingIOError:
+                out.append(False)
+        return out
 
     def serve(self, channel: Channel) -> None:
         while (frame := channel.recv()) is not None:
@@ -46,10 +66,11 @@ class Custody:
                     answer["duplicate"] = True
                     for fd in fds:
                         os.close(fd)
+                    channel.send(answer)
                 else:
                     self.held[frame["layout"]] = (frame["regions"], fds)
-                    answer["generation"] = 1
-                channel.send(answer)
+                    channel.send({**answer, "generation": 1, "lease": True})
+                    self.lease(channel)
                 continue
             held = self.held.get(frame["layout"])
             if held is None:
@@ -61,18 +82,23 @@ class Custody:
                     **answer,
                     "held": True,
                     "generation": 1,
+                    "layout": self.layout_says or frame["layout"],
                     "regions": regions,
                     "descriptors": len(kept),
+                    "lease": True,
                 }
             )
             for fd in kept:
                 channel.send_shared(fd)
+            self.lease(channel)
 
     def close(self) -> None:
         for _, fds in self.held.values():
             for fd in fds:
                 os.close(fd)
         self.held.clear()
+        for ours in self.leases:
+            ours.close()
 
 
 def executor_with(custody: Custody, tmp_path: Path) -> tuple[Weights, Executor]:
@@ -118,9 +144,14 @@ def test_a_replacement_attaches_the_kept_weights_and_computes_bit_identically(
         assert facts.h2d_bytes == 0, "attached weights are never copied"
         assert facts.shared_bytes == total
 
-        # Revoked: queued work first, then unmapped; the next stage fills a private copy.
+        # Two live leases: the filler's offer and the replacement's attachment.
+        assert custody.ended() == [False, False]
+
+        # Revoked: queued work first, then unmapped; the next stage fills a private copy. The
+        # replacement's lease ends with it, with no message; the filler's stays.
         layout = component.ws.digest
         assert replacement.revoke(layout) == total
+        assert custody.ended() == [False, True]
         assert replacement.facts().shared_bytes == 0
         assert same(run(again, x), expected)
         assert replacement.facts().h2d_bytes == filled
@@ -201,5 +232,26 @@ def test_attached_weights_cost_no_budget_and_are_never_streamed(tmp_path: Path) 
         assert facts.streamed["stack"].resident_blocks == BLOCKS
         assert facts.streamed["stack"].window == 0
         assert facts.shared_bytes == sum(r.span for r in again.backend.components["stack"].regions)
+    finally:
+        custody.close()
+
+
+def test_a_holder_naming_another_layout_is_never_mapped(tmp_path: Path) -> None:
+    """The holder's answer carries the layout it holds; a reader whose own differs maps
+    nothing (and the plane would refuse it too) and fills its own copy."""
+    checkpoint, _ = write_checkpoint(tmp_path)
+    x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
+    custody = Custody(layout_says="f" * 64)
+    try:
+        first, _ = executor_with(custody, tmp_path / "a")
+        if not first.plane.device_sharing(0):
+            pytest.skip("this GPU cannot export memory")
+        expected = run(load(first, checkpoint, "lie"), x)
+        replacement, _ = executor_with(custody, tmp_path / "b")
+        again = load(replacement, checkpoint, "lie")
+        assert again.backend.components["stack"].shared == set()
+        assert custody.ended()[-1], "the refused answer's lease is closed at once"
+        assert same(run(again, x), expected)
+        assert replacement.facts().h2d_bytes > 0
     finally:
         custody.close()
