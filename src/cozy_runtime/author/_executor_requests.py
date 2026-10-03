@@ -221,6 +221,15 @@ class SealedTier(_Request, frozen=True, kw_only=True, tag="sealed_tier"):
     memfd: int = -1
 
 
+class ModelSource(_Request, frozen=True, kw_only=True, tag="model_source"):
+    """One model file from the machine (`Load.model_sources`): the CozyTensors header (`name`
+    empty) or one header-declared asset. `SourceBytes` answers, a sealed memfd of exactly
+    those bytes following: the executor reads no store."""
+
+    manifest: str
+    name: str = ""
+
+
 class SealedPrefetch(_Request, frozen=True, kw_only=True, tag="sealed_prefetch"):
     """Every component's `SealedPlan` of one construction at once (a canonical JSON list in a
     sealed memfd after the request): the machine starts filling them all, and each later
@@ -274,6 +283,7 @@ type _Tagged = (
     | DeviceTier
     | SealedTier
     | SealedPrefetch
+    | ModelSource
     | BudgetCell
     | StageEnter
     | StageExit
@@ -324,6 +334,14 @@ class Tier(Answer, frozen=True, kw_only=True):
 
     held: bool = False
     descriptor: int = -1
+
+
+class SourceBytes(Tier, frozen=True, kw_only=True):
+    """The machine's answer to `ModelSource`: the sealed memfd follows (`held`), holding
+    `length` bytes whose SHA-256 is `sha256`."""
+
+    sha256: str = ""
+    length: Annotated[int, msgspec.Meta(ge=0)] = 0
 
 
 class DeviceTierAnswer(Answer, frozen=True, kw_only=True):

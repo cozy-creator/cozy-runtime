@@ -84,6 +84,7 @@ from cozy_runtime.author._executor_requests import (
     DeviceTierAnswer,
     Handoff,
     HostTier,
+    ModelSource,
     Publish,
     Published,
     Request,
@@ -92,6 +93,7 @@ from cozy_runtime.author._executor_requests import (
     SealedPrefetch,
     SealedTier,
     SharedRegion,
+    SourceBytes,
     StageEnter,
     StageExit,
     StageGo,
@@ -1974,11 +1976,20 @@ class Executor:
             reference=True,
         )
         vmap = reference.snapshot_map()
+        host = self.host
+
+        def sourced(manifest: str) -> Callable[[str], bytes] | None:
+            """Header and assets from the machine (`Load.model_sources`), never the store; a
+            group's followers still read the store (rank 0 relaying them is not built)."""
+            if not command.model_sources or self.rank > 0:
+                return None
+            return lambda name: host._model_source(manifest, name)
+
         # One Checkpoint per manifest: each opens and parses the whole header (SDXL's four
         # components share one, 2,641 rows).
         opened: dict[str, Checkpoint] = {}
         for manifest in {vmap.get(name, reference.snapshot) for name in names}:
-            opened[manifest] = Checkpoint(reference.store, manifest)
+            opened[manifest] = Checkpoint(reference.store, manifest, sourced=sourced(manifest))
         checkpoints = {name: opened[vmap.get(name, reference.snapshot)] for name in names}
         # `names` is what the DERIVE constructed (model-code-fit D9), not what the header
         # carries: a constructed component the checkpoint lacks is the fit's own
@@ -2024,7 +2035,7 @@ class Executor:
                 if checkpoint.manifest_id == reference.snapshot
             ),
             None,
-        ) or Checkpoint(reference.store, reference.snapshot)
+        ) or Checkpoint(reference.store, reference.snapshot, sourced=sourced(reference.snapshot))
         config_bytes = model_config.construction_config(config_checkpoint.header.get("configs"))
         config_document = canonical.parse_canonical(config_bytes)
         if not isinstance(config_document, dict):
@@ -3555,16 +3566,22 @@ class Executor:
 
             weights_values = read_values_into
 
-        from cozy_runtime.internal.weights_writer import ExecutionStorage
+        from cozy_runtime.internal.fill import store_available
 
-        execution_storage = ExecutionStorage(
-            spool,
-            self._durable,
-            {output.name: output.max_new_bytes for output in surface.weights_outputs},
-        )
-        tensorfs_source = execution_storage.source
-        tensorfs_output = execution_storage.open_output
-        tensorfs_adopt = execution_storage.adopt_model
+        tensorfs_source = tensorfs_output = tensorfs_adopt = None
+        # A plane-only TensorFS (Rust-machine executors) carries no derived storage: a job
+        # that reads or writes weights there is refused by the capability itself.
+        if store_available():
+            from cozy_runtime.internal.weights_writer import ExecutionStorage
+
+            execution_storage = ExecutionStorage(
+                spool,
+                self._durable,
+                {output.name: output.max_new_bytes for output in surface.weights_outputs},
+            )
+            tensorfs_source = execution_storage.source
+            tensorfs_output = execution_storage.open_output
+            tensorfs_adopt = execution_storage.adopt_model
 
         from cozy_runtime.author._services import (
             BudgetFacts,
@@ -3900,6 +3917,28 @@ class Executor:
             self._durable(request, Answer)
         finally:
             os.close(memfd)
+
+    def _model_source(self, manifest: str, name: str) -> bytes:
+        """One model file from the machine (`ModelSource`): the header (`name` empty) or one
+        asset, checked against the length and digest the machine states."""
+        answer = self._durable(ModelSource(manifest=manifest, name=name), SourceBytes)
+        if not (answer.ok and answer.held and answer.descriptor >= 0):
+            raise RuntimeError(
+                f"the machine served no {name or 'header'} of {manifest[:23]}: "
+                f"{answer.code} {answer.detail}"
+            )
+        try:
+            body = bytearray()
+            while len(body) < answer.length:
+                chunk = os.pread(answer.descriptor, answer.length - len(body), len(body))
+                if not chunk:
+                    break
+                body += chunk
+        finally:
+            os.close(answer.descriptor)
+        if len(body) != answer.length or hashlib.sha256(body).hexdigest() != answer.sha256:
+            raise RuntimeError(f"{name or 'header'} of {manifest[:23]} differs from its digest")
+        return bytes(body)
 
     def _seal_tier(self, plan: SealedPlan) -> int | None:
         """The machine's sealed layout for `plan`, filled once and kept across executors; None

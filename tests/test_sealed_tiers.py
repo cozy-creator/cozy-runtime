@@ -27,6 +27,7 @@ from tensorfs import plane as tfs_plane  # noqa: E402
 from cozy_runtime.author._executor_requests import SealedPlan  # noqa: E402
 from cozy_runtime.internal import canonical, plane  # noqa: E402
 from cozy_runtime.internal.executor import Executor  # noqa: E402
+from cozy_runtime.internal.fill import Checkpoint, FillRefusal  # noqa: E402
 from cozy_runtime.internal.seam import Channel  # noqa: E402
 from cozy_runtime.internal.weights import HostTiers, Weights  # noqa: E402
 from test_host_tier import GpuTier  # noqa: E402
@@ -54,6 +55,7 @@ class Machine:
         self.held: dict[tuple[str, str], int] = {}
         self.fills = 0
         self.prefetches = 0
+        self.sourced = 0
 
     @staticmethod
     def plans(frame: dict[str, Any], memfd: int) -> Any:
@@ -82,11 +84,32 @@ class Machine:
             self.fills += 1
         return os.open(f"/proc/self/fd/{self.held[key]}", os.O_RDONLY | os.O_CLOEXEC)
 
+    def source(self, frame: dict[str, Any]) -> bytes:
+        """A model file, as the machine serves it (`model_source`): the header or an asset."""
+        manifest, name = frame["manifest"], frame.get("name", "")
+        header = self.store.manifest(manifest)["header"]
+        if not name:
+            return bytes(header)
+        with self.store.acquire_cozytensors(manifest) as lease:
+            return bytes(lease.read_asset(header, name, max_bytes=64 << 20))
+
     def serve(self, channel: Channel, stop: threading.Event) -> None:
         while not stop.is_set():
             frame = channel.recv()
             if frame is None:
                 return
+            if frame["kind"] == "model_source":
+                self.sourced += 1
+                body = self.source(frame)
+                memfd = plane.sealed_memfd("model-source", body)
+                channel.send(
+                    {"event": "answer", "seq": frame["seq"], "ok": True, "held": True}
+                    | {"descriptor": True, "sha256": hashlib.sha256(body).hexdigest()}
+                    | {"length": len(body)}
+                )
+                channel.send_memfd(memfd)
+                os.close(memfd)
+                continue
             assert frame.get("descriptor") is True
             sent = self.plans(frame, channel.recv_memfd())
             if frame["kind"] == "sealed_prefetch":  # fill every plan now; asks then hit
@@ -123,7 +146,7 @@ class Session:
             target=machine.serve, args=(Channel(theirs), self.stop), daemon=True
         )
         self.thread.start()
-        executor = Executor(Channel(ours), tmp)
+        executor = self.executor = Executor(Channel(ours), tmp)
         self.tiers = HostTiers(
             ask=lambda *_: None,
             offer=lambda *_: None,
@@ -195,6 +218,39 @@ def test_without_room_at_the_machine_a_weight_set_reads_the_store_itself(
         assert not component.sealed and machine.fills == 0
         assert_pinned(weights, component, values)
         assert plane.stats(weights.plane).host.fill_bytes > 0
+    finally:
+        session.close()
+        machine.close()
+
+
+def test_with_model_sources_an_executor_opens_no_store(tmp_path: Path) -> None:
+    """`Load.model_sources`: the header comes from the machine and the weights from its sealed
+    layout. The checkpoint's store path names nothing, so any store access would refuse."""
+    stored, values = write_checkpoint(tmp_path)
+    machine = Machine(stored.root)
+    session = Session(machine, tmp_path)
+    try:
+        manifest = stored.manifest_id
+        checkpoint = Checkpoint(
+            tmp_path / "no-store-here",
+            manifest,
+            sourced=lambda name: session.executor._model_source(manifest, name),
+        )
+        assert checkpoint.store is None and checkpoint.header_bytes == stored.header_bytes
+        assert checkpoint.model_assets() == stored.model_assets()
+        with pytest.raises(FillRefusal, match="reads no store"):
+            checkpoint.acquire()
+        weights = Weights(torch, torch.device("cpu"), "cpu")
+        model = load(weights, checkpoint, "sourced", tiers=session.tiers)
+        assert model.backend.components["stack"].sealed and machine.sourced >= 1
+        assert_pinned(weights, model.backend.components["stack"], values)
+        x = torch.rand(4, HIDDEN, generator=torch.Generator().manual_seed(5)).half()
+        reference = Stack()
+        reference.load_state_dict(values)
+        with torch.inference_mode():
+            expected = reference(x)
+        assert same(run(model, x, passes=1), [expected])
+        assert model.backend.stats["leases"]["acquisitions"] == 0
     finally:
         session.close()
         machine.close()
