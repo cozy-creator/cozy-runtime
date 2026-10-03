@@ -208,15 +208,19 @@ def test_children_die_with_their_parent(
         pytest.fail(f"forked child {forked['pid']} outlived its parent")
 
 
-def test_an_import_only_capability_read_leaves_no_thread_behind(
+def test_an_import_only_fusion_compile_leaves_no_thread_behind(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """NVML starts a driver thread that outlives it (driver 580): an import-only start reads
-    the sealed devices' capability in a child, so the parent stays forkable. CUDA is hidden
-    here, so the child answers 0 without asking a driver; the GPU half is a rental's."""
+    """NVML leaves a driver thread (driver 580) and a compile has a watcher thread: an
+    import-only start runs both in a child, so the parent stays forkable while it compiles.
+    CUDA is hidden here, so the child finds no card and ends; the GPU half is a rental's."""
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
     monkeypatch.setenv("PYTHONPATH", str(SOURCE))
     before = set(os.listdir("/proc/self/task"))
-    assert fork_parent.capabilities(["0", "1"]) == {"0": 0, "1": 0}
-    assert fork_parent.capabilities([]) == {}
+    line = fork_parent.expect_fusion(["0"])
+    assert line.startswith("fusion compile started by child")
     assert set(os.listdir("/proc/self/task")) == before
+    (child,) = fork_parent._COMPILERS
+    assert child.wait(timeout=120) == 0
+    fork_parent.reap()
+    assert fork_parent._COMPILERS == []

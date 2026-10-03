@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import contextlib
 import gc
-import json
 import os
 import subprocess
 import sys
@@ -43,29 +42,39 @@ def driverless(torch: Any, devices: int) -> Iterator[None]:
         torch.cuda.is_available, torch.cuda.device_count = saved
 
 
-def capabilities(entries: Sequence[str]) -> dict[str, int]:
-    """Each sealed device's CUDA capability (`accel.device_capability`), read by NVML in a
-    child process: on current drivers NVML starts a thread that outlives it, and a process
-    with a live thread does not fork."""
-    if not entries:
-        return {}
-    done = subprocess.run(
-        [sys.executable, "-I", "-c", _CAPABILITIES, *entries],
-        capture_output=True,
-        text=True,
-        check=False,
+#: Fused-glue compiles this process started in a child, reaped when they end.
+_COMPILERS: list[subprocess.Popen[bytes]] = []
+
+
+def expect_fusion(entries: Sequence[str]) -> str:
+    """Start the fused glue's compile for the sealed cards in a child that lives until the
+    compile ends: NVML (which leaves a driver thread on current drivers) and the compile's
+    watcher thread live there, so this process stays forkable. The compile and its key are
+    the ones `fusion.expect` starts in-process; construction takes the build once ready."""
+    reap()
+    child = subprocess.Popen(
+        [sys.executable, "-I", "-c", _EXPECT, *entries], stdin=subprocess.DEVNULL
     )
-    try:
-        found = json.loads(done.stdout)
-    except ValueError:
-        return {}
-    return {str(entry): int(sm) for entry, sm in found.items()}
+    _COMPILERS.append(child)
+    return f"fusion compile started by child {child.pid}"
 
 
-_CAPABILITIES = (
-    "import json, sys; from cozy_runtime.internal import accel; "
-    "print(json.dumps({e: accel.device_capability(e) for e in sys.argv[1:]}))"
-)
+def reap() -> None:
+    """Reap fused-glue compile children that have ended."""
+    _COMPILERS[:] = [child for child in _COMPILERS if child.poll() is None]
+
+
+_EXPECT = """
+import os, sys, threading
+from cozy_runtime.internal import accel, fusion, kernel_cache
+kernel_cache.configure(kernel_cache.from_sealed(os.environ))
+archs = sorted({accel.device_capability(entry) for entry in sys.argv[1:]} - {0})
+for arch in archs:
+    print(f"[fusion] sm{arch} {fusion.expect(arch)}", file=sys.stderr, flush=True)
+for thread in threading.enumerate():
+    if thread is not threading.main_thread():
+        thread.join()
+"""
 
 
 def _threads() -> list[str]:

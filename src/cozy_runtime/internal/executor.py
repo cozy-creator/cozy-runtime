@@ -1383,6 +1383,7 @@ class Executor:
             )
         # Exited children stay zombies until now, so the machine reads their exit status.
         self.forked -= zygote.collect(self.forked)
+        zygote.reap()
         reason = zygote.unsafe(sys.modules.get("torch"))
         if reason:
             return self._refusal("fork_unsafe", reason)
@@ -1457,21 +1458,18 @@ class Executor:
         """Start the fused glue's compile for each sealed card's architecture, read from the
         driver's management library: no device context, so it runs beside the wait for the
         grant and the weights (h3a-087). Construction takes the build once it is ready.
-        `isolated` (an import-only start, which may be forked): NVML is read in a child."""
+        `isolated` (an import-only start, which may be forked): both run in a child."""
         if not any(
             getattr(cls, "__fusion__", "refuse") in ("accept", "require")
             for cls in self._model_classes()
         ):
             return ""
         try:
-            fusion = importlib.import_module("cozy_runtime.internal.fusion")
             entries = _sealed_entries()
-            measured = (
-                zygote.capabilities(entries)
-                if isolated
-                else {entry: accel.device_capability(entry) for entry in entries}
-            )
-            archs = sorted(set(measured.values()) - {0})
+            if isolated:
+                return zygote.expect_fusion(entries)
+            fusion = importlib.import_module("cozy_runtime.internal.fusion")
+            archs = sorted({accel.device_capability(entry) for entry in entries} - {0})
             return "; ".join(f"fusion sm{arch} {fusion.expect(arch)}" for arch in archs)
         except Exception as exc:  # an optimization, never the start's verdict
             return f"fusion compile not started: {type(exc).__name__}: {exc}"[:300]
