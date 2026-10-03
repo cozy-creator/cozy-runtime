@@ -1716,6 +1716,12 @@ class PlaneBackend:
         """The manifest's one store source, made by its first weight set that reads it."""
         source = self.sources.get(checkpoint.manifest_id)
         if source is None:
+            if checkpoint.store is None:
+                raise _refuse(
+                    "store_unusable",
+                    f"{name}: the machine served no layout for this weight set, and this "
+                    "executor reads no store",
+                )
             source = self.sources[checkpoint.manifest_id] = plane.source(
                 self.weights.plane, checkpoint.store, self.leases.take(name)
             )
@@ -1782,7 +1788,9 @@ class PlaneBackend:
         units, kept, checkpoint, plan = layout.units, layout.kept, layout.checkpoint, layout.plan
         ids, digest, key = layout.ids, layout.digest, layout.sealed.name
         weights = self.weights
-        tiers = None if fine else self.tiers
+        # A finer re-registration reads its own store, except where the machine serves this
+        # checkpoint (`Load.model_sources`): there it asks for the finer layout too.
+        tiers = None if fine and checkpoint.store is not None else self.tiers
         with store_refusals(f"registering {name}"):
             held = None
             if tiers is not None and tiers.seal is not None:

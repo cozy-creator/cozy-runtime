@@ -284,6 +284,9 @@ class Load(Command, frozen=True, kw_only=True, tag="load"):
     #: The machine keeps sealed host layouts (`SEALED_TIERS`): each weight set asks for one
     #: (`SealedTier`) and adopts it read-only, reading the store only when none is held.
     sealed_tiers: bool = False
+    #: The machine serves the header and model assets (`ModelSource`): with sealed tiers,
+    #: this executor reads no store. Older workers never set it.
+    model_sources: bool = False
     #: The process's device cap for the load (`PROCESS_CAP`); unset: none given
     cap_bytes: int | UnsetType = UNSET
     #: Per GPU of a group, its own cap for the load (index = rank, `RANK_CELLS`)
