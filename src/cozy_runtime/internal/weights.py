@@ -637,6 +637,13 @@ class Weights:
             self.context_bytes = max(row.bytes - reserved - mapped, self.context_bytes, 0)
             self.limit_torch()
 
+    def adopt_context(self, measured: int) -> None:
+        """The context the process measured at device init, where the driver could not list
+        it per process: what `process_bytes` and every cap count until NVML says more."""
+        if measured > self.context_bytes:
+            self.context_bytes = measured
+            self.limit_torch()
+
     def resident_bytes(self, component: Component) -> int:
         return plane.stats(self.plane).ready(component.key, self.index)
 
@@ -893,9 +900,11 @@ class Weights:
         stages = [row for row in held.stages if row.device == self.index]
         copied = device.host_copy_bytes + device.disk_copy_bytes
         reserved = -1 if self.host_only else int(self.torch.cuda.memory_reserved(self.device))
+        # This process's own count (per-process NVML only refines the context in it); an
+        # unmeasured context counts nothing rather than hiding the rest.
         process = (
-            self.context_bytes + reserved + max(device.committed, 0)
-            if self.context_bytes >= 0 and reserved >= 0
+            max(self.context_bytes, 0) + reserved + max(device.committed, 0)
+            if reserved >= 0
             else -1
         )
         copy_ns = device.host_copy_ns + device.disk_copy_ns

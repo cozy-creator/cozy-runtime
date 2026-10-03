@@ -310,6 +310,15 @@ def _nvml_device_memory(device: str) -> DeviceMemory | None:
     return _device_memory_of(int(memory.free), int(memory.total))
 
 
+def device_used(device: str) -> int:
+    """Bytes in use on one envelope entry by every process, from NVML, torch-free; -1 where NVML
+    cannot say."""
+    memory = _nvml_device_memory(device)
+    if memory is None or memory.state != "measured":
+        return -1
+    return memory.total_bytes - memory.free_bytes
+
+
 def device_capability(device: str) -> int:
     """One envelope entry's CUDA capability as `major * 10 + minor` (sm_120 is 120), from
     the driver, torch-free; zero where NVML is absent or does not know the entry."""

@@ -675,7 +675,8 @@ def test_a_process_cap_holds_torch_and_the_plane_inside_it(card: Any) -> None:
     # Room for the measured activations and a margin: a stage that keeps every weight (here
     # 128 MiB, more than the margin) leaves its activations short, one that streams does not.
     measured = weights.activation["run"]
-    cap = weights.context_bytes + torch.cuda.memory_reserved() + measured + weight_policy.MARGIN
+    context = max(weights.context_bytes, 0)  # unreadable per process: counts nothing
+    cap = context + torch.cuda.memory_reserved() + measured + weight_policy.MARGIN
     weights.activation.clear()  # an estimate that is wrong: the stage keeps all its weights
     retries = weights.facts().oom_retries
     torch.cuda.reset_peak_memory_stats()
@@ -692,7 +693,7 @@ def test_a_process_cap_holds_torch_and_the_plane_inside_it(card: Any) -> None:
     torch.cuda.empty_cache()
     assert facts.cap_bytes == cap
     assert facts.oom_retries > retries
-    assert peak + weights.context_bytes <= cap
+    assert peak + context <= cap
     assert 0 <= facts.process_bytes <= cap
     assert exact
 
@@ -883,7 +884,8 @@ def test_the_owner_lowers_a_running_process_cap_at_its_next_block(card: Any) -> 
     reference = run(model, x)
     torch.cuda.empty_cache()  # the cap is measured against what torch holds live
     weights.measure_context()
-    cap = weights.context_bytes + torch.cuda.memory_reserved() + tight(model) + weight_policy.MARGIN
+    context = max(weights.context_bytes, 0)
+    cap = context + torch.cuda.memory_reserved() + tight(model) + weight_policy.MARGIN
     cell, fd = budget_cell.Cell.create()
     owner = budget_cell.Cell(fd)
     os.close(fd)
@@ -904,7 +906,7 @@ def test_the_owner_lowers_a_running_process_cap_at_its_next_block(card: Any) -> 
     facts = weights.facts()
     assert applied is not None and applied == weights.applied
     assert facts.streamed["stack"].resident_blocks < BLOCKS
-    assert weights.context_bytes + torch.cuda.memory_reserved() + facts.committed_bytes <= cap
+    assert context + torch.cuda.memory_reserved() + facts.committed_bytes <= cap
     assert same(reference, outputs)
 
 

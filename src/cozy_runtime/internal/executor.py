@@ -469,6 +469,9 @@ class Executor:
         self.channel = channel
         self.root = root
         self.host: Executor = host or self
+        #: this process's CUDA context and first library launches, measured at device init
+        #: from the device's own used bytes (-1: unmeasured); per-process NVML refines it
+        self.device_context = -1
         #: the construction key this generation was loaded under; "" on the host
         self.construction = construction
         #: HOST ONLY: every loaded construction and the active one. Their weights share one
@@ -713,11 +716,21 @@ class Executor:
                 "detail": "Torch CUDA was already initialized before Runtime's explicit "
                 "allocator boundary; package execution is refused",
             }
+        entries = _sealed_entries()
+        index = self.rank if self.world > 1 else 0
+        before = accel.device_used(entries[index]) if index < len(entries) else -1
         accel.initialize(torch, self.device_kind)
         if self.world > 1 and self.device_kind == "cuda":
             torch.cuda.set_device(self.rank)
         accel.first_launches(torch, self.device_kind)
         accel.reset_peak(torch, self.device_kind)
+        if before >= 0 and self.device_kind == "cuda":
+            # This process's context and libraries as the device saw them appear: its own
+            # measurement where the driver lists no process (containers). Another process
+            # moving memory in these milliseconds is noise in either direction.
+            memory = accel.allocation(torch, self.device_kind)
+            used = memory["driver_total_bytes"] - memory["driver_free_bytes"]
+            self.host.device_context = max(used - before - memory["reserved_bytes"], 0)
         self._device_ready = True
         return None
 
@@ -2061,6 +2074,7 @@ class Executor:
         if host.weights is None:
             try:
                 host.weights = Weights(torch, self._rank_device(torch), self.device_kind)
+                host.weights.adopt_context(host.device_context)
                 settles(host.weights.quiesce)
                 # One GPU of a group: its blocks hold the group's collectives, so they
                 # recover from an out-of-memory op by op, never by running a block again.
