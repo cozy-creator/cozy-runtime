@@ -275,6 +275,8 @@ class RankGroup:
         self.broken = ""
         #: per follower rank, the largest working peak its mirrored calls reported this attempt
         self.working_peaks: dict[int, int] = {}
+        #: per follower rank, its executor's plane facts as its latest reply stated them
+        self.rank_planes: dict[int, dict[str, Any]] = {}
         #: per follower rank, its `execution_evidence` record folded over this attempt's calls
         self.rank_records: dict[int, execution_evidence.RankEvidence] = {}
         #: per spread method this attempt
@@ -345,6 +347,8 @@ class RankGroup:
                     with contextlib.suppress(SeamError):
                         self.forward({**frame, "name": f"{follower.gpu}:{head.name}"})
                 continue
+            if isinstance(frame.get("plane"), dict):
+                self.rank_planes[follower.rank] = frame["plane"]
             follower.replies.put((head, frame))
             if head.reply == "run" and not head.ok:
                 self._break(
