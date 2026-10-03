@@ -71,6 +71,7 @@ from cozy_runtime.internal.probe import QualificationResult, observed_capability
 from cozy_runtime.internal.resolution import ResolvedModelPlan, TensorResolution, script_plan
 
 if TYPE_CHECKING:
+    from tensorfs import ReadPlan
     from tensorfs.plane import Cursor, Lease, Source, Ticket, WeightSet
     from torch import Tensor
     from torch import device as Device
@@ -1572,12 +1573,19 @@ class PlaneBackend:
         self.leaves = {
             key: self._install_leaf(key) for key in order if self._route(key) == "encoded_gemm"
         }
-        for name, root in self.roots.items():
-            keys = [key for key in order if self.plan[key].component == name]
-            if keys:
-                component = self._register(name, root, keys)
-                self.components[name] = component
-                self.weights.register(component)
+        prepared = {
+            name: self._prepare_layout(name, root, keys)
+            for name, root in self.roots.items()
+            if (keys := [key for key in order if self.plan[key].component == name])
+        }
+        if self.tiers is not None and self.tiers.prefetch is not None and prepared:
+            # Every component's sealed layout starts filling now, and fills while the ones
+            # before it register: each ask below waits only for its own.
+            self.tiers.prefetch([layout.sealed for layout in prepared.values()])
+        for name, layout in prepared.items():
+            component = self._register(name, self.roots[name], layout.keys, prepared=layout)
+            self.components[name] = component
+            self.weights.register(component)
         self.stats["register_ms"] = round((time.perf_counter() - started) * 1000, 2)
         self.state = "ready"
 
@@ -1667,11 +1675,11 @@ class PlaneBackend:
             )
         return source
 
-    def _register(
+    def _prepare_layout(
         self, name: str, root: Module, keys: list[str], *, fine: bool = False
-    ) -> Component:
-        """Partition the component into regions (common, then each block or sub-block unit),
-        register them as one weight set, and bind every stored part to its destinations."""
+    ) -> _Prepared:
+        """Partition the component into regions (common, then each block or sub-block unit)
+        and plan its read: everything its weight set's layout is made of."""
         try:
             layout = partition(root, REGION_LIMIT if fine else None)
         except ValueError:
@@ -1698,26 +1706,41 @@ class PlaneBackend:
         if skipped:
             # The plan names every stored tensor; only what the code builds is read or mapped.
             plan = plan.select(parts)
-        weights = self.weights
         key = f"{self.construction}/{name}"
         ids = [[f"{name}/{self.plan[k].name}" for k in group] for _, group in kept]
         digest = canonical.digest({"manifest": checkpoint.manifest_id, "regions": ids})
+        sealed_plan = SealedPlan(
+            manifest=checkpoint.manifest_id,
+            name=key,
+            layout=digest,
+            window=READ_WINDOW,
+            traversal=tuple(traversal),
+            components=(name,),
+            regions=tuple(tuple(group) for group in ids),
+            parts=tuple(parts),
+        )
+        return _Prepared(keys, units, kept, checkpoint, plan, ids, digest, sealed_plan)
+
+    def _register(
+        self,
+        name: str,
+        root: Module,
+        keys: list[str],
+        *,
+        fine: bool = False,
+        prepared: _Prepared | None = None,
+    ) -> Component:
+        """Register the component's layout as one weight set and bind every stored part to
+        its destinations."""
+        layout = prepared or self._prepare_layout(name, root, keys, fine=fine)
+        units, kept, checkpoint, plan = layout.units, layout.kept, layout.checkpoint, layout.plan
+        ids, digest, key = layout.ids, layout.digest, layout.sealed.name
+        weights = self.weights
         tiers = None if fine else self.tiers
         with store_refusals(f"registering {name}"):
             held = None
             if tiers is not None and tiers.seal is not None:
-                held = tiers.seal(
-                    SealedPlan(
-                        manifest=checkpoint.manifest_id,
-                        name=key,
-                        layout=digest,
-                        window=READ_WINDOW,
-                        traversal=tuple(traversal),
-                        components=(name,),
-                        regions=tuple(tuple(group) for group in ids),
-                        parts=tuple(parts),
-                    )
-                )
+                held = tiers.seal(layout.sealed)
             elif tiers is not None:
                 held = tiers.ask(key, digest)
             sealed = held is not None and plane.is_sealed(held)
@@ -1835,6 +1858,23 @@ class HostTiers:
     share: Callable[[str, str, int], None] = lambda name, layout, memfd: None
     #: the machine's sealed layout for a plan (`SealedTier`), asked instead of `ask`
     seal: Callable[[SealedPlan], int | None] | None = None
+    #: start the machine filling every component's layout at once (`SealedPrefetch`)
+    prefetch: Callable[[list[SealedPlan]], None] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _Prepared:
+    """One component's layout before it registers: its keys, block units, kept groups,
+    checkpoint, read plan, region ids and digest, and the plan the machine fills from."""
+
+    keys: list[str]
+    units: list[str]
+    kept: list[tuple[int, list[str]]]
+    checkpoint: Checkpoint
+    plan: ReadPlan
+    ids: list[list[str]]
+    digest: str
+    sealed: SealedPlan
 
 
 class _Span(msgspec.Struct, frozen=True):

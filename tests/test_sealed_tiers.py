@@ -53,12 +53,16 @@ class Machine:
         self.room = room
         self.held: dict[tuple[str, str], int] = {}
         self.fills = 0
+        self.prefetches = 0
 
-    def answer(self, frame: dict[str, Any], memfd: int) -> int | None:
+    @staticmethod
+    def plans(frame: dict[str, Any], memfd: int) -> Any:
         body = os.pread(memfd, frame["length"], 0)
         os.close(memfd)
         assert hashlib.sha256(body).hexdigest() == frame["sha256"]
-        doc = msgspec.convert(canonical.parse(body), SealedPlan)
+        return canonical.parse(body)
+
+    def answer(self, doc: SealedPlan) -> int | None:
         key = (doc.name, doc.layout)
         if key not in self.held:
             if not self.room:
@@ -83,8 +87,18 @@ class Machine:
             frame = channel.recv()
             if frame is None:
                 return
-            assert frame["kind"] == "sealed_tier" and frame.get("descriptor") is True
-            granted = self.answer(frame, channel.recv_memfd())
+            assert frame.get("descriptor") is True
+            sent = self.plans(frame, channel.recv_memfd())
+            if frame["kind"] == "sealed_prefetch":  # fill every plan now; asks then hit
+                self.prefetches += 1
+                for doc in msgspec.convert(sent, list[SealedPlan]):
+                    fd = self.answer(doc)
+                    if fd is not None:
+                        os.close(fd)
+                channel.send({"event": "answer", "seq": frame["seq"], "ok": True})
+                continue
+            assert frame["kind"] == "sealed_tier"
+            granted = self.answer(msgspec.convert(sent, SealedPlan))
             channel.send(
                 {"event": "answer", "seq": frame["seq"], "ok": True, "held": granted is not None}
                 | ({"descriptor": True} if granted is not None else {})
@@ -110,7 +124,12 @@ class Session:
         )
         self.thread.start()
         executor = Executor(Channel(ours), tmp)
-        self.tiers = HostTiers(ask=lambda *_: None, offer=lambda *_: None, seal=executor._seal_tier)
+        self.tiers = HostTiers(
+            ask=lambda *_: None,
+            offer=lambda *_: None,
+            seal=executor._seal_tier,
+            prefetch=executor._prefetch_tiers,
+        )
 
     def close(self) -> None:
         self.stop.set()
@@ -131,6 +150,7 @@ def test_an_executor_computes_on_the_machines_sealed_layout_and_reads_no_store(
         model = load(weights, checkpoint, "sealed", tiers=first.tiers)
         component = model.backend.components["stack"]
         assert component.sealed and machine.fills == 1
+        assert machine.prefetches == 1  # filled before the ask, which then found it held
         assert_pinned(weights, component, values)
         x = torch.rand(4, HIDDEN, generator=torch.Generator().manual_seed(3)).half()
         reference = Stack()
