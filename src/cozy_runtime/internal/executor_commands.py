@@ -50,6 +50,8 @@ class Warm(Command, frozen=True, kw_only=True, tag="warm"):
 class Join(Command, frozen=True, kw_only=True, tag="join"):
     port: int
     backend: str = "nccl"
+    #: A budget cell memfd follows this command: the follower's own (`RANK_CELLS`).
+    cell: bool = False
 
 
 class Fork(Command, frozen=True, kw_only=True, tag="fork"):
@@ -86,7 +88,14 @@ class Budget(Command, frozen=True, kw_only=True, tag="budget"):
     pinned_bytes: int = -1
     #: The process's device cap (`PROCESS_CAP`); -1 lifts it, unset leaves it as it is
     cap_bytes: int | UnsetType = UNSET
+    #: Per GPU of a group, its own process cap (index = rank, `RANK_CELLS`); a rank past the
+    #: end takes `cap_bytes`.
+    rank_caps: tuple[int, ...] = ()
 
+
+#: An executor capability: a group's followers obey their own GPU's cap and budget cell: the
+#: owner's `Start.rank_cells` and the `rank_caps` of `Load`, `Budget` and `Invoke`.
+RANK_CELLS = "rank_cells/1"
 
 #: An executor capability: it holds its whole device footprint (CUDA context, torch's reserved
 #: bytes, the plane's maps) inside `cap_bytes`, every plane budget and torch's allocator with it.
@@ -158,6 +167,9 @@ class Start(Command, frozen=True, kw_only=True, tag="start"):
     import_only: bool = False
     #: Absent from an older Worker: the executor keeps its in-memory tier at its default.
     memo: MemoSettings | None = None
+    #: The owner keeps one budget cell per GPU of a group (`RANK_CELLS`): rank 0 creates each
+    #: follower's at formation, hands it to its owner (`BudgetCell.rank`) and to the follower.
+    rank_cells: bool = False
 
     def release(self) -> Release:
         return Release(application=self.application, package_interface=self.package_interface)
@@ -272,6 +284,8 @@ class Load(Command, frozen=True, kw_only=True, tag="load"):
     sealed_tiers: bool = False
     #: The process's device cap for the load (`PROCESS_CAP`); unset: none given
     cap_bytes: int | UnsetType = UNSET
+    #: Per GPU of a group, its own cap for the load (index = rank, `RANK_CELLS`)
+    rank_caps: tuple[int, ...] = ()
 
     def single(self) -> ModelLoad:
         return ModelLoad(
@@ -339,6 +353,8 @@ class Invoke(_Run, frozen=True, kw_only=True, tag="invoke"):
     stages: bool = False
     #: The process's device cap for this attempt (`PROCESS_CAP`); -1: none
     cap_bytes: int = -1
+    #: Per GPU of a group, its own cap for this attempt (index = rank, `RANK_CELLS`)
+    rank_caps: tuple[int, ...] = ()
     #: Read only by executors before the weight plane.
     placement: str = "all_resident"
     headroom_bytes: int = 0
