@@ -496,6 +496,14 @@ def peak_allocated(torch: Any, kind: str) -> int:
     return int(torch.cuda.max_memory_allocated())
 
 
+def peak_reserved(torch: Any, kind: str) -> int:
+    """The allocator's reserved high-water mark since the last `reset_peak`: live tensors plus
+    the segments torch held for them, which is what a stage takes from the device."""
+    if kind == "mps":
+        raise AcceleratorUnsupported("mps", "peak_reserved")
+    return int(torch.cuda.max_memory_reserved())
+
+
 def release_cached(torch: Any, kind: str) -> None:
     """Return the caching allocator's UNUSED segments to the driver. Frees nothing the
     process still holds; it is what makes an eviction visible to other processes."""

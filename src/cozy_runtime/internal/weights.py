@@ -301,12 +301,15 @@ class Weights:
         self.total = (
             0 if self.host_only else int(torch.cuda.get_device_properties(device).total_memory)
         )
-        #: physical free bytes this process leaves on its GPU (a floor where it drives a display)
-        self.floor_free = (
+        #: physical free bytes this process leaves on its GPU: a display's own floor, raised to
+        #: the owner's (`owner_floor`, -1: none given)
+        self.display_floor = (
             0
             if self.host_only
             else weight_policy.free_floor(self.total, accel.drives_display(self.index))
         )
+        self.owner_floor = -1
+        self.floor_free = self.display_floor
         if not self.host_only:
             self.measure_context()
 
@@ -356,6 +359,37 @@ class Weights:
                 accel.release_cached(self.torch, self.kind)
         self.torch.cuda.set_per_process_memory_fraction(fraction, self.device)
         self._torch_limited = self.cap >= 0
+
+    def set_floor(self, floor: int) -> None:
+        """The owner's physical free floor on this GPU; -1 leaves only a display's own."""
+        self.owner_floor = floor
+        self.floor_free = max(self.display_floor, floor)
+
+    def seed_activations(self, measured: Mapping[str, int]) -> None:
+        """Activation growth the owner measured for these methods in earlier processes: this
+        process plans its first stages with room for them instead of keeping every weight
+        and recovering from the out-of-memory that follows. Only ever raises an estimate."""
+        for method, nbytes in measured.items():
+            if nbytes > self.activation.get(method, 0):
+                self.activation[method] = int(nbytes)
+
+    def room_before(self, method: str) -> None:
+        """Under a cap, before a stage plans: when other processes on the GPU leave less free
+        than this stage's measured activations need of what the cap grants, ask the owner to
+        make room first (`DeviceRoom`: idle tenants leave). Activations cannot shrink once
+        the stage runs; a stage never measured asks nothing."""
+        if self.room is None or self.cap < 0 or self.host_only:
+            return
+        memory = accel.allocation(self.torch, self.kind)
+        slack = max(memory["reserved_bytes"] - memory["allocated_bytes"], 0)
+        need = self.activation.get(method, 0) - slack
+        if need <= 0:
+            return
+        committed = max(plane.stats(self.plane).device(self.index).committed, 0)
+        held = max(self.context_bytes, 0) + memory["reserved_bytes"] + committed
+        granted = min(need + weight_policy.MARGIN, self.cap - held)
+        if memory["driver_free_bytes"] - self.floor_free < granted:
+            self.room(granted)
 
     def headroom(self, memory: Mapping[str, int]) -> int:
         """Device bytes this process may still take: the driver's free above the floor and,
@@ -2081,6 +2115,7 @@ class WeightResidency:
         self.entries[method] = self.entries.get(method, 0) + 1
         self.repeats[method] = max(self.repeats.get(method, 0), self.entries[method])
         weights.hold_host()
+        weights.room_before(method)
         if weights.host_only:  # everything is bound in place already; no device to measure
             self.active = (method, local)
             self.entered_ns = time.perf_counter_ns()
@@ -2285,7 +2320,13 @@ class WeightResidency:
             self._left()
         peak = 0
         if self.baseline >= 0:
-            peak = max(accel.peak_allocated(weights.torch, weights.kind) - self.baseline, 0)
+            # What the stage took beyond its live bytes at entry: its tensors' peak, or the
+            # segments torch reserved for them, whichever is more (a cap counts the segments).
+            peak = max(
+                accel.peak_allocated(weights.torch, weights.kind) - self.baseline,
+                accel.peak_reserved(weights.torch, weights.kind) - self.baseline,
+                0,
+            )
             self.peaks[method] = max(self.peaks.get(method, 0), peak)
             weights.activation[method] = max(weights.activation.get(method, 0), peak)
             item = peak // max(self.batch.pop(method, 1), 1)

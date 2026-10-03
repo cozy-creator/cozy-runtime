@@ -91,6 +91,8 @@ class Budget(Command, frozen=True, kw_only=True, tag="budget"):
     #: Per GPU of a group, its own process cap (index = rank, `RANK_CELLS`); a rank past the
     #: end takes `cap_bytes`.
     rank_caps: tuple[int, ...] = ()
+    #: Physical free bytes the owner keeps on the GPU (`PROCESS_CAP`); unset leaves it
+    floor_bytes: int | UnsetType = UNSET
 
 
 #: An executor capability: a group's followers obey their own GPU's cap and budget cell: the
@@ -355,6 +357,11 @@ class Invoke(_Run, frozen=True, kw_only=True, tag="invoke"):
     cap_bytes: int = -1
     #: Per GPU of a group, its own cap for this attempt (index = rank, `RANK_CELLS`)
     rank_caps: tuple[int, ...] = ()
+    #: Physical free bytes the owner keeps on the GPU; -1: only a display's own floor
+    floor_bytes: int = -1
+    #: Activation growth per stage method the owner measured for this request's shape in
+    #: earlier processes: a floor under this executor's own estimates, never a cap
+    activation_bytes: dict[str, int] = {}
     #: Read only by executors before the weight plane.
     placement: str = "all_resident"
     headroom_bytes: int = 0

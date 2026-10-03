@@ -2726,16 +2726,20 @@ class Executor:
             command.plane_budget_bytes != self.weights.budget
             or command.cap_bytes != self.weights.cap
             or command.rank_caps
+            or command.floor_bytes != self.weights.owner_floor
         ):
             granted = self.budget(
                 Budget(
                     vram_bytes=command.plane_budget_bytes,
                     cap_bytes=command.cap_bytes,
                     rank_caps=command.rank_caps,
+                    floor_bytes=command.floor_bytes,
                 )
             )
             if not granted.get("ok"):
                 return granted
+        if self.weights is not None:
+            self.weights.seed_activations(command.activation_bytes)
         with self._turns(target.residency, command.stages and self.world == 1):
             reply = target.invoke(command)
         self.attempts += 1
@@ -4160,6 +4164,8 @@ class Executor:
             if weights is None:
                 return 0
             self._unpark()  # a parked stage's holds would make a cut unreleasable
+            if not isinstance(command.floor_bytes, UnsetType):
+                weights.set_floor(command.floor_bytes)
             cap = _rank_cap(command.rank_caps, self.rank, command.cap_bytes)
             if not isinstance(cap, UnsetType):
                 weights.set_cap(cap)  # every GPU's own process
