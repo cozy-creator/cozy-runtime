@@ -75,7 +75,7 @@ func (m *Machine) prepare(stream grpc.ServerStream, message proto.Message,
 	if err := m.requireRuntimeRange(ctx); err != nil {
 		return err
 	}
-	if err := m.idle.work(time.Now()); err != nil {
+	if err := m.idle.work(time.Now(), false); err != nil {
 		return status.Error(codes.FailedPrecondition, "this machine's idle release is already committed")
 	}
 	done := m.beginPreparation()

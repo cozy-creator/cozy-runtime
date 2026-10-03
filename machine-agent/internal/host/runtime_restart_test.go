@@ -50,25 +50,25 @@ func TestUsedRentalDeadRuntimeDoesNotRenewDeadline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := i.work(now); err != nil {
+	if err := i.work(now, true); err != nil {
 		t.Fatal(err)
 	}
-	_, err = i.observe(now, false, true)
+	_, err = i.observe(now, sample{known: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	unknownDeadline, err := i.observe(now, false, false)
+	unknownDeadline, err := i.observe(now, sample{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	for n := 1; n <= 3; n++ {
-		next, err := i.observe(unknownDeadline.Add(time.Duration(n)*time.Second), false, false)
+		next, err := i.observe(unknownDeadline.Add(time.Duration(n)*time.Second), sample{})
 		if err != nil {
 			t.Fatal(err)
 		}
 		unknownDeadline = next
 	}
-	knownDead, err := i.observe(unknownDeadline.Add(idleGrace), false, true)
+	knownDead, err := i.observe(unknownDeadline.Add(idleGrace), sample{known: true})
 	if err != nil || !knownDead.Equal(unknownDeadline) {
 		t.Fatal("dead Runtime renewed deadline", knownDead, err)
 	}
@@ -96,13 +96,13 @@ func TestLiveUnreadyProcessProtectsUsedRentalUntilActualExit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = i.work(now)
+	_ = i.work(now, true)
 	work := &activity{path: filepath.Join(t.TempDir(), "absent"), log: io.Discard}
-	busy, known := m.observeActivity(work, now)
-	if busy || known {
+	s := m.observeActivity(work, now)
+	if s.busy || s.known {
 		t.Fatal("live unready Runtime lost unknown-work protection")
 	}
-	deadline, err := i.observe(now, busy, known)
+	deadline, err := i.observe(now, s)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,11 +112,11 @@ func TestLiveUnreadyProcessProtectsUsedRentalUntilActualExit(t *testing.T) {
 	_ = input.Close()
 	<-p.done
 	m.active = 1 // an update/preparation still holds admission, not workload
-	busy, known = m.observeActivity(work, now)
-	if busy || !known {
+	s = m.observeActivity(work, now)
+	if s.busy || !s.known {
 		t.Fatal("dead Runtime still held rental")
 	}
-	deadline, err = i.observe(now, busy, known)
+	deadline, err = i.observe(now, s)
 	if err != nil {
 		t.Fatal(err)
 	}

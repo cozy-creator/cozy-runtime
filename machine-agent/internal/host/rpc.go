@@ -130,6 +130,7 @@ func (m *Machine) forward(stream grpc.ServerStream, r *route) (err error) {
 	if err != nil {
 		return err
 	}
+	accepted := false // the Runtime answered the work this call carries
 	if r.work || isResume(first) {
 		if err := admitWork(client, "new work"); err != nil {
 			return err
@@ -141,7 +142,7 @@ func (m *Machine) forward(stream grpc.ServerStream, r *route) (err error) {
 		if refused != nil {
 			return status.Error(codes.FailedPrecondition, "this machine's idle release is due or committed")
 		}
-		defer func() { _ = a.finish(err == nil, time.Now()) }()
+		defer func() { _ = a.finish(accepted, time.Now()) }()
 	}
 	phase := m.phase()
 	if (phase == "starting" || phase == "booting") && publicReadMethod(string(r.method.Name())) {
@@ -217,6 +218,7 @@ func (m *Machine) forward(stream grpc.ServerStream, r *route) (err error) {
 			stream.SetTrailer(out.Trailer())
 			return behind(err, r)
 		}
+		accepted = true
 		m.claims.answer(reply, client)
 		if err := stream.SendMsg(reply); err != nil {
 			return err
