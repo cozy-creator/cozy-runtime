@@ -2844,6 +2844,12 @@ class WeightResidency:
             height, width = int(z.shape[-2]) * scale, int(z.shape[-1]) * scale
             pixels = int(z.shape[0]) * height * width
             free, evictable = self.room((name,))
+            seeded = weights.activation.get(self.active[0], 0) if self.active else 0
+            if weights.cap >= 0 and not peaks and seeded > 0:
+                # Under an owner's cap a first decode takes its stage's measured peak (this
+                # process's or the owner's seed for this shape) instead of unmapping every idle
+                # weight: what is resident stays for the next call (keep hot).
+                peaks[pixels] = seeded
             size = min((n for n in peaks if n >= pixels), default=0)
             known = size or max(peaks, default=0)
             per_pixel = peaks[known] // known if known else 0
