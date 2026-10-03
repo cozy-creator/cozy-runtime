@@ -2152,11 +2152,14 @@ class WeightResidency:
                 # blocks cannot run again after an out-of-memory), then grows by what it measured.
                 own = [_paid(c, c.planned)[0] for _, _, c in weights.opened().values()]
                 weights.growing = weights.grouped
-                budget = min(
-                    budget,
-                    # a window of two blocks: one more than the floor, so nothing refines
-                    sum(o.common + 2 * o.largest if weights.grouped else o.total for o in own),
-                )
+                keep = sum(o.common + 2 * o.largest if weights.grouped else o.total for o in own)
+                if weights.cap >= 0 and not weights.grouped:
+                    # Under an owner's cap other stages' weights stay mapped too (keep hot): an
+                    # activation that then lacks room is an out-of-memory at the cap, and the
+                    # plane unmaps the least recently used to run it. Without one, they leave.
+                    keep += max(plane.stats(weights.plane).device(weights.index).committed, 0)
+                # a window of two blocks: one more than the floor, so nothing refines
+                budget = min(budget, keep)
             budget = self._place(budget)
             stream = weights.stream()
             for name in local:

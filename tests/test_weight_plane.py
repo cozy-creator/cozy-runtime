@@ -667,14 +667,17 @@ def test_a_process_cap_holds_torch_and_the_plane_inside_it(card: Any) -> None:
     weights = card.weights
     model = load(weights, card.checkpoint, "cap")
     x = torch.randn(1 << 15, HIDDEN, device="cuda", dtype=torch.float16)  # 128 MiB each
+    torch.cuda.reset_peak_memory_stats()
+    live = torch.cuda.memory_allocated()
     uncapped = run(model, x, passes=1)
+    # the activations' tensors at their peak, without any segment slack torch kept
+    measured = torch.cuda.max_memory_allocated() - live
     model.residency.unpark()
     weights.set_budget(0)
     torch.cuda.empty_cache()
     weights.measure_context()
     # Room for the measured activations and a margin: a stage that keeps every weight (here
     # 128 MiB, more than the margin) leaves its activations short, one that streams does not.
-    measured = weights.activation["run"]
     context = max(weights.context_bytes, 0)  # unreadable per process: counts nothing
     cap = context + torch.cuda.memory_reserved() + measured + weight_policy.MARGIN
     weights.activation.clear()  # an estimate that is wrong: the stage keeps all its weights

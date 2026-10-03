@@ -718,19 +718,21 @@ class Executor:
             }
         entries = _sealed_entries()
         index = self.rank if self.world > 1 else 0
-        before = accel.device_used(entries[index]) if index < len(entries) else -1
+        entry = entries[index] if index < len(entries) else str(index)
+        before = accel.device_used(entry)
         accel.initialize(torch, self.device_kind)
         if self.world > 1 and self.device_kind == "cuda":
             torch.cuda.set_device(self.rank)
         accel.first_launches(torch, self.device_kind)
         accel.reset_peak(torch, self.device_kind)
-        if before >= 0 and self.device_kind == "cuda":
+        after = accel.device_used(entry) if before >= 0 else -1
+        if after >= 0:
             # This process's context and libraries as the device saw them appear: its own
-            # measurement where the driver lists no process (containers). Another process
-            # moving memory in these milliseconds is noise in either direction.
-            memory = accel.allocation(torch, self.device_kind)
-            used = memory["driver_total_bytes"] - memory["driver_free_bytes"]
-            self.host.device_context = max(used - before - memory["reserved_bytes"], 0)
+            # measurement where the driver lists no process (containers). Both readings are
+            # NVML's (CUDA's total leaves out what the driver reserves). Another process moving
+            # memory in these milliseconds is noise in either direction.
+            reserved = accel.allocation(torch, self.device_kind)["reserved_bytes"]
+            self.host.device_context = max(after - before - reserved, 0)
         self._device_ready = True
         return None
 
