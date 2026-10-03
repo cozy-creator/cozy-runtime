@@ -22,6 +22,7 @@ from typing import Any
 import pytest
 
 from cozy_runtime.internal import package_interface
+from cozy_runtime.internal import zygote as fork_parent
 from cozy_runtime.internal.discovery import discover_installed
 from cozy_runtime.internal.seam import Channel
 
@@ -205,3 +206,17 @@ def test_children_die_with_their_parent(
         time.sleep(0.05)
     else:
         pytest.fail(f"forked child {forked['pid']} outlived its parent")
+
+
+def test_an_import_only_capability_read_leaves_no_thread_behind(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """NVML starts a driver thread that outlives it (driver 580): an import-only start reads
+    the sealed devices' capability in a child, so the parent stays forkable. CUDA is hidden
+    here, so the child answers 0 without asking a driver; the GPU half is a rental's."""
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    monkeypatch.setenv("PYTHONPATH", str(SOURCE))
+    before = set(os.listdir("/proc/self/task"))
+    assert fork_parent.capabilities(["0", "1"]) == {"0": 0, "1": 0}
+    assert fork_parent.capabilities([]) == {}
+    assert set(os.listdir("/proc/self/task")) == before

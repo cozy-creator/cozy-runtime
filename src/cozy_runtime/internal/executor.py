@@ -1311,7 +1311,9 @@ class Executor:
                 self._discover_provisioned(command.release())
                 stage("package_import")
             compiles = (
-                self._expect_fusion() if model_bearing and self.rank == 0 and not imported else ""
+                self._expect_fusion(isolated=command.import_only)
+                if model_bearing and self.rank == 0 and not imported
+                else ""
             )
             if command.import_only:
                 if model_bearing and accel.initialized(torch, self.device_kind):
@@ -1451,10 +1453,11 @@ class Executor:
         values = vars(module).values() if module is not None else ()
         return [v for v in values if isinstance(v, type) and issubclass(v, Model) and v != Model]
 
-    def _expect_fusion(self) -> str:
+    def _expect_fusion(self, *, isolated: bool) -> str:
         """Start the fused glue's compile for each sealed card's architecture, read from the
         driver's management library: no device context, so it runs beside the wait for the
-        grant and the weights (h3a-087). Construction takes the build once it is ready."""
+        grant and the weights (h3a-087). Construction takes the build once it is ready.
+        `isolated` (an import-only start, which may be forked): NVML is read in a child."""
         if not any(
             getattr(cls, "__fusion__", "refuse") in ("accept", "require")
             for cls in self._model_classes()
@@ -1462,7 +1465,13 @@ class Executor:
             return ""
         try:
             fusion = importlib.import_module("cozy_runtime.internal.fusion")
-            archs = sorted({accel.device_capability(entry) for entry in _sealed_entries()} - {0})
+            entries = _sealed_entries()
+            measured = (
+                zygote.capabilities(entries)
+                if isolated
+                else {entry: accel.device_capability(entry) for entry in entries}
+            )
+            archs = sorted(set(measured.values()) - {0})
             return "; ".join(f"fusion sm{arch} {fusion.expect(arch)}" for arch in archs)
         except Exception as exc:  # an optimization, never the start's verdict
             return f"fusion compile not started: {type(exc).__name__}: {exc}"[:300]
