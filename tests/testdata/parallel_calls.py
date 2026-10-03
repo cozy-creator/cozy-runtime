@@ -467,6 +467,7 @@ def main() -> None:
     )
     if args.staged:
         plane_residency(args.root / f"rank-{args.rank}", model)
+        executor.weights = model._cozy_residency.weights
     executor.residency = model._cozy_residency
     executor._group_model_key = "fixture"
     roots = (

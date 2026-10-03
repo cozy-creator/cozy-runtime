@@ -1583,6 +1583,17 @@ class Executor:
         weights = self.host.weights
         return msgspec.to_builtins(weights.facts()) if weights is not None else None
 
+    def with_planes(self, reply: dict[str, Any]) -> dict[str, Any]:
+        """Each GPU's own plane facts: a follower states its own to rank 0, and rank 0's
+        reply carries every follower's (`rank_planes`, rank 1 first; None: not stated yet),
+        so the owner charges each GPU of the group its own process."""
+        if self.rank > 0:
+            if reply.get("ok") and reply.get("plane") is None and self.host.weights is not None:
+                reply["plane"] = self._plane_facts()
+        elif self.group is not None:
+            reply["rank_planes"] = [self.group.rank_planes.get(r) for r in range(1, self.world)]
+        return reply
+
     def _follower_load(self, command: Load) -> dict[str, Any]:
         """Rank r's half of rank 0's load: one construction, or one model of a many-model
         construction (`model_key`), filled under rank 0's agreed plan and ceiling."""
@@ -4614,11 +4625,11 @@ def answer(executor: Executor, frame: dict[str, Any]) -> dict[str, Any] | None:
             "detail": f"{_gpu(executor.rank)} answers {sorted(_FOLLOWER_COMMANDS)}, not {name!r}",
         }
     if name == "run":
-        return executor.run(frame)
+        return executor.with_planes(executor.run(frame))
     if name not in executor_commands.NAMES:
         return {"ok": False, "code": "unknown_command", "detail": name}
     command = executor_commands.decode(frame)
-    return None if isinstance(command, Shutdown) else executor.handle(command)
+    return None if isinstance(command, Shutdown) else executor.with_planes(executor.handle(command))
 
 
 #: The commands whose refusals carry the raising traceback to the worker.
