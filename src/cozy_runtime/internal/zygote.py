@@ -10,7 +10,6 @@ CUDA, so the parent measures that it did not, and refuses rather than forks.
 from __future__ import annotations
 
 import contextlib
-import ctypes
 import gc
 import os
 import threading
@@ -23,26 +22,22 @@ from cozy_runtime.internal.exits import Exit
 
 CAPABILITY = "fork/1"
 
-#: Torch's own switch for an availability check that asks NVML and leaves the driver alone.
-_NVML_CHECK = "PYTORCH_NVML_BASED_CUDA_CHECK"
-
 #: Names their libraries read once at load, during the parent's imports: a child keeps them.
 LOADED = ("OMP_NUM_THREADS",)
 
 
 @contextlib.contextmanager
-def driverless() -> Iterator[None]:
-    """Imports that ask whether CUDA exists (Diffusers does, at import) ask NVML instead of
-    initializing the CUDA driver."""
-    prior = os.environ.get(_NVML_CHECK)
-    os.environ[_NVML_CHECK] = "1"
+def driverless(torch: Any, devices: int) -> Iterator[None]:
+    """Imports that ask whether CUDA exists (Diffusers does, at import) get the seal's answer.
+    Torch asks the CUDA driver (`cuInit`) or NVML, and on current drivers either opens the
+    device and starts a driver thread that outlives it: no child of that process can fork."""
+    saved = torch.cuda.is_available, torch.cuda.device_count
+    torch.cuda.is_available = lambda: devices > 0
+    torch.cuda.device_count = lambda: devices
     try:
         yield
     finally:
-        if prior is None:
-            os.environ.pop(_NVML_CHECK, None)
-        else:
-            os.environ[_NVML_CHECK] = prior
+        torch.cuda.is_available, torch.cuda.device_count = saved
 
 
 def _threads() -> list[str]:
@@ -63,17 +58,6 @@ def _device_files() -> list[str]:
     return sorted(found)
 
 
-def _close_nvml() -> None:
-    """End the NVML sessions availability checks opened: a child must not share them."""
-    try:
-        nvml = ctypes.CDLL("libnvidia-ml.so.1", mode=os.RTLD_NOLOAD | os.RTLD_LAZY)
-    except OSError:
-        return
-    for _ in range(64):  # one per nvmlInit; NVML answers non-zero once none is left
-        if nvml.nvmlShutdown() != 0:
-            return
-
-
 def unsafe(torch: Any) -> str:
     """Why this process must not fork, or "". Every fact is read, none assumed."""
     if len(_threads()) > 1:
@@ -82,7 +66,6 @@ def unsafe(torch: Any) -> str:
         if pid == 0:
             os._exit(0)
         os.waitpid(pid, 0)
-    _close_nvml()
     if torch is not None and torch.cuda.is_initialized():
         return "torch initialized CUDA"
     threads = _threads()

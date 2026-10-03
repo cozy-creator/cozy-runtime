@@ -1232,8 +1232,6 @@ class Executor:
         imported = self.imported
         warmup_error = ""
         driverless = contextlib.ExitStack()
-        if command.import_only:
-            driverless.enter_context(zygote.driverless())
         try:
             if degree > 1 and self.rank == 0:
                 self.world = degree
@@ -1254,6 +1252,8 @@ class Executor:
             if model_bearing:
                 import torch
 
+                if command.import_only:
+                    driverless.enter_context(zygote.driverless(torch, len(_sealed_entries())))
                 if not imported:
                     stage("torch_import")
                 if not command.import_only:
