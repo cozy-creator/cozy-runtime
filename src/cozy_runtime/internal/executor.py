@@ -2675,10 +2675,12 @@ class Executor:
         }
 
     def _discover_provisioned(self, release: Release) -> None:
-        """Import the installed release and bind its PackageInterface."""
+        """Import the installed release and bind its PackageInterface. No elapsed-time limit:
+        the worker or machine ends an import only on its measured lack of progress, and a slow
+        first import on a busy host is still an import."""
         if not release.application or not release.package_interface:
             raise RuntimeError("executor requires the canonical installed release identity")
-        discovered = discover_installed(release.application)
+        discovered = discover_installed(release.application, seconds=None)
         self.discovered = discovered
         self.surface_names = {surface.name: surface for surface in discovered.surfaces}
 
