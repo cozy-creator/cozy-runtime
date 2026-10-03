@@ -350,6 +350,9 @@ class Weights:
             committed = max(plane.stats(self.plane).device(self.index).committed, 0)
             allowed = self.cap - max(self.context_bytes, 0) - committed
             fraction = min(max(allowed, 0) / max(self.total, 1), 1.0)
+            # A lowered cap stops new segments; the idle ones torch keeps go back now.
+            if int(self.torch.cuda.memory_reserved(self.device)) > allowed:
+                accel.release_cached(self.torch, self.kind)
         self.torch.cuda.set_per_process_memory_fraction(fraction, self.device)
         self._torch_limited = self.cap >= 0
 

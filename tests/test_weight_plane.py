@@ -687,11 +687,14 @@ def test_a_process_cap_holds_torch_and_the_plane_inside_it(card: Any) -> None:
         facts = weights.facts()
     finally:
         weights.set_cap(-1)
+    exact = same(uncapped, capped)
+    del x, uncapped, capped  # its 128 MiB segments must not shape the next test's allocations
+    torch.cuda.empty_cache()
     assert facts.cap_bytes == cap
     assert facts.oom_retries > retries
     assert peak + weights.context_bytes <= cap
     assert 0 <= facts.process_bytes <= cap
-    assert same(uncapped, capped)
+    assert exact
 
 
 def test_decoded_copies_count_in_a_stages_budget(tmp_path: Path) -> None:
@@ -878,6 +881,7 @@ def test_the_owner_lowers_a_running_process_cap_at_its_next_block(card: Any) -> 
     model = load(weights, card.checkpoint, "cap-cut")
     x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
     reference = run(model, x)
+    torch.cuda.empty_cache()  # the cap is measured against what torch holds live
     weights.measure_context()
     cap = weights.context_bytes + torch.cuda.memory_reserved() + tight(model) + weight_policy.MARGIN
     cell, fd = budget_cell.Cell.create()
