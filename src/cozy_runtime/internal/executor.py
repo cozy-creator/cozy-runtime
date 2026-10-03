@@ -1857,9 +1857,12 @@ class Executor:
             reference=True,
         )
         vmap = reference.snapshot_map()
-        checkpoints = {
-            name: Checkpoint(reference.store, vmap.get(name, reference.snapshot)) for name in names
-        }
+        # One Checkpoint per manifest: each opens and parses the whole header (SDXL's four
+        # components share one, 2,641 rows).
+        opened: dict[str, Checkpoint] = {}
+        for manifest in {vmap.get(name, reference.snapshot) for name in names}:
+            opened[manifest] = Checkpoint(reference.store, manifest)
+        checkpoints = {name: opened[vmap.get(name, reference.snapshot)] for name in names}
         # `names` is what the DERIVE constructed (model-code-fit D9), not what the header
         # carries: a constructed component the checkpoint lacks is the fit's own
         # `component_missing`, judged at construction with the §3 text, so the plan is
