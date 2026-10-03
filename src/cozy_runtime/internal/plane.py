@@ -157,8 +157,11 @@ def sharing() -> bool:
 
 #: Linux `fcntl` seals, by number (python-build-standalone may lack the names).
 _GET_SEALS, _ADD_SEALS = 1034, 1033
-#: write, grow, shrink, and sealing itself: no process can change a sealed layout's bytes
+#: seal, shrink, grow, write: what a plan memfd carries
 _SEALS = 0x8 | 0x4 | 0x2 | 0x1
+#: a sealed layout: shrink, grow and sealing itself, and write or future write (its filler may
+#: still be unmapping; no other mapping or write can ever change a byte)
+_LAYOUT_SEALS, _WRITE_SEALS = 0x1 | 0x2 | 0x4, 0x8 | 0x10
 
 
 def sealed_available() -> bool:
@@ -169,9 +172,10 @@ def sealed_available() -> bool:
 def is_sealed(fd: int) -> bool:
     """Whether `fd` is a memfd nobody can write, resize or unseal: a sealed host layout."""
     try:
-        return fcntl.fcntl(fd, _GET_SEALS) & _SEALS == _SEALS
+        seals = fcntl.fcntl(fd, _GET_SEALS)
     except OSError:
         return False
+    return seals & _LAYOUT_SEALS == _LAYOUT_SEALS and bool(seals & _WRITE_SEALS)
 
 
 def sealed_memfd(name: str, body: bytes) -> int:

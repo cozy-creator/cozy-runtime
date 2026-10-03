@@ -221,6 +221,17 @@ class SealedTier(_Request, frozen=True, kw_only=True, tag="sealed_tier"):
     memfd: int = -1
 
 
+class SealedPrefetch(_Request, frozen=True, kw_only=True, tag="sealed_prefetch"):
+    """Every component's `SealedPlan` of one construction at once (a canonical JSON list in a
+    sealed memfd after the request): the machine starts filling them all, and each later
+    `SealedTier` ask waits only for its own. An older machine refuses; nothing changes."""
+
+    sha256: str
+    length: Annotated[int, msgspec.Meta(ge=0)]
+    #: the plans' memfd; never on the wire
+    memfd: int = -1
+
+
 class BudgetCell(_Request, frozen=True, kw_only=True, tag="budget_cell"):
     """The executor's plane budget cell (`internal/budget_cell.py`; its memfd follows this
     request): the Worker lowers a running call's budget through it, at a block boundary."""
@@ -259,6 +270,7 @@ type _Tagged = (
     | HostTier
     | DeviceTier
     | SealedTier
+    | SealedPrefetch
     | BudgetCell
     | StageEnter
     | StageExit

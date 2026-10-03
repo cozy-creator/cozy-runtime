@@ -89,6 +89,7 @@ from cozy_runtime.author._executor_requests import (
     Request,
     Room,
     SealedPlan,
+    SealedPrefetch,
     SealedTier,
     SharedRegion,
     StageEnter,
@@ -3727,6 +3728,7 @@ class Executor:
             offer=host._offer_tier if worker else lambda *_: None,
             share=self._share_tier,
             seal=host._seal_tier if sealed else None,
+            prefetch=host._prefetch_tiers if sealed else None,
         )
 
     def _share_tier(self, name: str, layout: str, memfd: int) -> None:
@@ -3754,6 +3756,18 @@ class Executor:
         """The pinned host tier the worker keeps for exactly this weight set's layout."""
         answer = self._durable(HostTier(name=name, layout=layout), Tier)
         return answer.descriptor if answer.ok and answer.held and answer.descriptor >= 0 else None
+
+    def _prefetch_tiers(self, plans: list[SealedPlan]) -> None:
+        """Start the machine filling every component's layout now (an older one refuses)."""
+        body = canonical.write([msgspec.to_builtins(plan) for plan in plans])
+        memfd = plane.sealed_memfd("cozy-sealed-plans", body)
+        try:
+            request = SealedPrefetch(
+                sha256=hashlib.sha256(body).hexdigest(), length=len(body), memfd=memfd
+            )
+            self._durable(request, Answer)
+        finally:
+            os.close(memfd)
 
     def _seal_tier(self, plan: SealedPlan) -> int | None:
         """The machine's sealed layout for `plan`, filled once and kept across executors; None
@@ -3864,7 +3878,7 @@ class Executor:
         sending = (
             request.memfd
             if (isinstance(request, HostTier) and request.offer)
-            or isinstance(request, BudgetCell | SealedTier)
+            or isinstance(request, BudgetCell | SealedTier | SealedPrefetch)
             else -1
         )
         body.pop("memfd", None)
