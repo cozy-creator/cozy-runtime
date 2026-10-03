@@ -128,12 +128,14 @@ from cozy_runtime.internal import (
     sandbox,
     stage_memo,
     tolerant,
+    weight_policy,
 )
 from cozy_runtime.internal import weights as weight_stages
 from cozy_runtime.internal.config import restore_seal, seal_snapshot
 from cozy_runtime.internal.discovery import discover_distribution, discover_installed
 from cozy_runtime.internal.executor_commands import (
     LOAD_PINNED,
+    PROCESS_CAP,
     SEALED_TIERS,
     Activate,
     Attention,
@@ -615,7 +617,11 @@ class Executor:
             "memory": [
                 "import_only",
                 "vacate_ranks",
-                *([plane.CAPABILITY, STAGE_TURNS, LOAD_PINNED] if plane.available() else []),
+                *(
+                    [plane.CAPABILITY, STAGE_TURNS, LOAD_PINNED, PROCESS_CAP]
+                    if plane.available()
+                    else []
+                ),
                 *(plane.SHARING if plane.sharing() else ()),
                 *([SEALED_TIERS] if plane.sealed_available() else []),
             ],
@@ -1984,6 +1990,8 @@ class Executor:
         weights.sharing = (
             DeviceTiers(ask=self._ask_device, offer=self._offer_device) if sharing else None
         )
+        if not isinstance(command.cap_bytes, UnsetType):
+            weights.set_cap(command.cap_bytes)
         # A load plans in what the driver has: the Worker made room for it, and an earlier
         # cut to 0 is no grant for this construction. Its pinned budget arrives with it, so
         # the fill stays inside it (a CPU executor computes on its tier: never cut there).
@@ -2260,6 +2268,9 @@ class Executor:
                     "common": c.layout.common,
                     "blocks": list(c.layout.blocks),
                     "fine": list(c.layout.fine) if c.layout.fine else None,
+                    # as a stage's budget counts it: decoded (fp8 → float) copies included
+                    "planned_total": c.planned.total,
+                    "planned_floor": weight_policy.floor(c.planned),
                 }
                 for name, c in backend.components.items()
             },
@@ -2366,6 +2377,7 @@ class Executor:
                     host_tier=command.host_tier,
                     pinned_bytes=command.pinned_bytes,
                     sealed_tiers=command.sealed_tiers,
+                    cap_bytes=command.cap_bytes,
                 ),
                 optional_attention_scope=True,
             )
@@ -2619,8 +2631,13 @@ class Executor:
             return target
         # Every attempt carries its grant; none (-1: an older Worker, or no reading) derives
         # from the driver, so a cut to 0 never outlives the attempt that follows it.
-        if self.weights is not None and command.plane_budget_bytes != self.weights.budget:
-            granted = self.budget(Budget(vram_bytes=command.plane_budget_bytes))
+        if self.weights is not None and (
+            command.plane_budget_bytes != self.weights.budget
+            or command.cap_bytes != self.weights.cap
+        ):
+            granted = self.budget(
+                Budget(vram_bytes=command.plane_budget_bytes, cap_bytes=command.cap_bytes)
+            )
             if not granted.get("ok"):
                 return granted
         with self._turns(target.residency, command.stages and self.world == 1):
@@ -3756,8 +3773,11 @@ class Executor:
 
     def _device_room(self, free_bytes: int) -> None:
         """Ask the worker for `free_bytes` free on this GPU from its other tenants; it answers
-        once they gave what they could (an older worker refuses, and nothing changes)."""
-        self._durable(DeviceRoom(free_bytes=free_bytes), Room)
+        once they gave what they could, with this process's cap raised into that room when it
+        holds one (an older worker refuses, and nothing changes)."""
+        answer = self._durable(DeviceRoom(free_bytes=free_bytes), Room)
+        if answer.ok and answer.cap_bytes >= 0 and self.weights is not None:
+            self.weights.set_cap(answer.cap_bytes)
 
     def _budget_cell(self) -> budget_cell.Cell | None:
         """Hand the worker this process's budget cell; None from an older worker."""
@@ -4020,6 +4040,8 @@ class Executor:
             if weights is None:
                 return 0
             self._unpark()  # a parked stage's holds would make a cut unreleasable
+            if not isinstance(command.cap_bytes, UnsetType):
+                weights.set_cap(command.cap_bytes)  # every GPU's own process
             # The pinned budget is the group's: every GPU pins its own weights in host memory.
             pinned = command.pinned_bytes // self.world if command.pinned_bytes >= 0 else -1
             return weights.set_budget(command.vram_bytes, pinned)

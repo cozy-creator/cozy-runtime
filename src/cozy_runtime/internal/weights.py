@@ -293,6 +293,21 @@ class Weights:
         self.context_bytes = -1
         #: the machine's custody of GPU weights (`weights.attach/1`); None: every region private
         self.sharing: DeviceTiers | None = None
+        #: the owner's cap on this process's device bytes (context, torch's reserved bytes and
+        #: the plane's maps); -1: none
+        self.cap = -1
+        self._torch_limited = False
+        self.total = (
+            0 if self.host_only else int(torch.cuda.get_device_properties(device).total_memory)
+        )
+        #: physical free bytes this process leaves on its GPU (a floor where it drives a display)
+        self.floor_free = (
+            0
+            if self.host_only
+            else weight_policy.free_floor(self.total, accel.drives_display(self.index))
+        )
+        if not self.host_only:
+            self.measure_context()
 
     def tick(self) -> int:
         self.clock += 1
@@ -318,6 +333,39 @@ class Weights:
             accel.release_cached(self.torch, self.kind)
         return freed
 
+    def set_cap(self, cap: int) -> None:
+        """The owner's process cap; -1 lifts it. Every plane budget stays inside it, and torch's
+        allocator is held to what it leaves beside the context and the plane's maps: an
+        activation over its estimate is an out-of-memory the plane recovers from by unmapping,
+        never a full card."""
+        self.cap = cap
+        self.limit_torch()
+
+    def limit_torch(self) -> None:
+        """Hold torch's allocator to what the cap leaves beside the context and the plane."""
+        if self.host_only or (self.cap < 0 and not self._torch_limited):
+            return
+        fraction = 1.0
+        if self.cap >= 0:
+            committed = max(plane.stats(self.plane).device(self.index).committed, 0)
+            allowed = self.cap - max(self.context_bytes, 0) - committed
+            fraction = min(max(allowed, 0) / max(self.total, 1), 1.0)
+            # A lowered cap stops new segments; the idle ones torch keeps go back now.
+            if int(self.torch.cuda.memory_reserved(self.device)) > allowed:
+                accel.release_cached(self.torch, self.kind)
+        self.torch.cuda.set_per_process_memory_fraction(fraction, self.device)
+        self._torch_limited = self.cap >= 0
+
+    def headroom(self, memory: Mapping[str, int]) -> int:
+        """Device bytes this process may still take: the driver's free above the floor and,
+        under a cap, the cap less what the process holds (context, torch, the plane's maps)."""
+        free = memory["driver_free_bytes"] - self.floor_free
+        if self.cap >= 0:
+            committed = max(plane.stats(self.plane).device(self.index).committed, 0)
+            held = max(self.context_bytes, 0) + memory["reserved_bytes"] + committed
+            free = min(free, self.cap - held)
+        return max(free, 0)
+
     def sizing(self) -> int:
         """The largest measured activations a grant must leave room for (adaptive stages
         make their own room)."""
@@ -335,6 +383,7 @@ class Weights:
         trim = self.plane.set_vram_budget(self.index, nbytes)
         self.applied = nbytes
         self._evicted(trim.get("evicted", ()))
+        self.limit_torch()
         return int(trim.get("freed", 0))
 
     def _pin(self, nbytes: int) -> None:
@@ -364,15 +413,16 @@ class Weights:
         same device bytes, re-split per stage)."""
         if self.budget >= 0:
             own = self.activation.get(method)
-            if own is None:
-                return self.budget
-            return self.budget + max(self.sizing() - own, 0)
+            granted = self.budget if own is None else self.budget + max(self.sizing() - own, 0)
+            if self.cap < 0 and not self.floor_free:
+                return granted
+            return min(granted, self.driver_budget(method))
         driver = self.driver_budget(method)
         return min(driver, self.ceiling) if self.ceiling >= 0 else driver
 
     def driver_budget(self, method: str) -> int:
-        """What the driver has free beside this process's weights, less the activation growth
-        this method measured (activations first)."""
+        """What the driver has free beside this process's weights, inside its cap and above its
+        floor, less the activation growth this method measured (activations first)."""
         memory = accel.allocation(self.torch, self.kind)
         committed = max(plane.stats(self.plane).device(self.index).committed, 0)
         # torch reuses its own cached segments first; only growth beyond them needs the driver
@@ -380,7 +430,7 @@ class Weights:
         growth = max(self.activation.get(method, 0) - slack, 0)
         # the bound weights' decoded copies are the weights' own, in torch's bytes
         held = committed + self.decoded()
-        return weight_policy.plane_budget(memory["driver_free_bytes"] + held, growth)
+        return weight_policy.plane_budget(self.headroom(memory) + held, growth)
 
     def decoded(self) -> int:
         """Device bytes the bound regions' decoded copies hold now."""
@@ -463,11 +513,9 @@ class Weights:
         self.progressed(before, need, op)
 
     def allocatable(self) -> int:
-        """Device bytes torch can allocate now: the driver's free plus its own idle cache."""
+        """Device bytes torch can allocate now: its headroom plus its own idle cache."""
         memory = accel.allocation(self.torch, self.kind)
-        return memory["driver_free_bytes"] + max(
-            memory["reserved_bytes"] - memory["allocated_bytes"], 0
-        )
+        return self.headroom(memory) + max(memory["reserved_bytes"] - memory["allocated_bytes"], 0)
 
     def progressed(self, before: int, need: int, op: str = "") -> None:
         """An out-of-memory retry runs again only when memory came back: first this process's
@@ -552,6 +600,7 @@ class Weights:
             reserved = accel.allocation(self.torch, self.kind)["reserved_bytes"]
             mapped = max(plane.stats(self.plane).device(self.index).committed, 0)
             self.context_bytes = max(row.bytes - reserved - mapped, self.context_bytes, 0)
+            self.limit_torch()
 
     def resident_bytes(self, component: Component) -> int:
         return plane.stats(self.plane).ready(component.key, self.index)
@@ -808,6 +857,12 @@ class Weights:
             )
         stages = [row for row in held.stages if row.device == self.index]
         copied = device.host_copy_bytes + device.disk_copy_bytes
+        reserved = -1 if self.host_only else int(self.torch.cuda.memory_reserved(self.device))
+        process = (
+            self.context_bytes + reserved + max(device.committed, 0)
+            if self.context_bytes >= 0 and reserved >= 0
+            else -1
+        )
         copy_ns = device.host_copy_ns + device.disk_copy_ns
         return PlaneFacts(
             budget_bytes=device.budget,
@@ -816,6 +871,9 @@ class Weights:
             pinned_budget_bytes=held.host.budget,
             pinned_bytes=held.host.used,
             context_bytes=self.context_bytes,
+            reserved_bytes=reserved,
+            process_bytes=process,
+            cap_bytes=self.cap,
             resident=resident,
             streamed={
                 component.name: Streamed(
@@ -2049,6 +2107,7 @@ class WeightResidency:
             oom: tuple[int, str] | None = None
             try:
                 self._plan(budget, resume)
+                weights.limit_torch()
                 return budget
             except self._budget_error as exc:
                 if pooled or not _device_pool(exc):
@@ -2107,7 +2166,14 @@ class WeightResidency:
         floor = weights.floor()
         for component in opened:
             close_cursor(component)
+        before, capped = weights.applied, wanted <= budget_cell.CAP
+        if capped:  # a process cap: the plane re-placed inside it
+            weights.set_cap(budget_cell.CAP - wanted)
+            wanted = weights.stage_budget(weights.open[-1][1]) if weights.open else -1
         weights.set_budget(max(wanted, floor) if wanted >= 0 else wanted)
+        if not capped and wanted >= 0 and weights.cap >= 0:
+            # a plane ask moves the cap by what it moved the plane
+            weights.set_cap(max(weights.cap + weights.applied - before, 0))
         weights.drain()
         if opened and weights.open:
             self._place(max(weights.applied, floor), resume)
@@ -2268,7 +2334,7 @@ class WeightResidency:
         (theirs is the stage's own set, just wanted)."""
         weights = self.weights
         memory = accel.allocation(weights.torch, weights.kind)
-        free = memory["driver_free_bytes"] + max(
+        free = weights.headroom(memory) + max(
             memory["reserved_bytes"] - memory["allocated_bytes"], 0
         )
         device = plane.stats(weights.plane).device(weights.index)

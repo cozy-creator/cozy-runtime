@@ -75,6 +75,13 @@ class Budget(Command, frozen=True, kw_only=True, tag="budget"):
     vram_bytes: int
     #: -1 leaves the pinned host tier's budget as it is
     pinned_bytes: int = -1
+    #: The process's device cap (`PROCESS_CAP`); -1 lifts it, unset leaves it as it is
+    cap_bytes: int | UnsetType = UNSET
+
+
+#: An executor capability: it holds its whole device footprint (CUDA context, torch's reserved
+#: bytes, the plane's maps) inside `cap_bytes`, every plane budget and torch's allocator with it.
+PROCESS_CAP = "process_cap/1"
 
 
 class Share(Command, frozen=True, kw_only=True, tag="share"):
@@ -251,6 +258,8 @@ class Load(Command, frozen=True, kw_only=True, tag="load"):
     #: The machine keeps sealed host layouts (`SEALED_TIERS`): each weight set asks for one
     #: (`SealedTier`) and adopts it read-only, reading the store only when none is held.
     sealed_tiers: bool = False
+    #: The process's device cap for the load (`PROCESS_CAP`); unset: none given
+    cap_bytes: int | UnsetType = UNSET
 
     def single(self) -> ModelLoad:
         return ModelLoad(
@@ -316,6 +325,8 @@ class Invoke(_Run, frozen=True, kw_only=True, tag="invoke"):
     plane_budget_bytes: int = -1
     #: Each component-use scope asks for its turn (`stage/1`, as `Load.stages`).
     stages: bool = False
+    #: The process's device cap for this attempt (`PROCESS_CAP`); -1: none
+    cap_bytes: int = -1
     #: Read only by executors before the weight plane.
     placement: str = "all_resident"
     headroom_bytes: int = 0

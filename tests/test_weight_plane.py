@@ -658,6 +658,45 @@ def test_a_bind_that_runs_out_of_device_memory_plans_again_in_what_is_left(card:
     assert all(torch.equal(a, b) for a, b in zip(resident, squeezed, strict=True))
 
 
+@on_card
+def test_a_process_cap_holds_torch_and_the_plane_inside_it(card: Any) -> None:
+    """The owner's cap bounds the whole process: its CUDA context, torch's reserved bytes and
+    the plane's maps. Activations the plan did not count are an out-of-memory torch's
+    allocator raises at the cap, and the plane unmaps weights to run them: the same bits, and
+    the process never above its cap, whatever the driver has free."""
+    weights = card.weights
+    model = load(weights, card.checkpoint, "cap")
+    x = torch.randn(1 << 15, HIDDEN, device="cuda", dtype=torch.float16)  # 128 MiB each
+    uncapped = run(model, x, passes=1)
+    model.residency.unpark()
+    weights.set_budget(0)
+    torch.cuda.empty_cache()
+    weights.measure_context()
+    # Room for the measured activations and a margin: a stage that keeps every weight (here
+    # 128 MiB, more than the margin) leaves its activations short, one that streams does not.
+    measured = weights.activation["run"]
+    cap = weights.context_bytes + torch.cuda.memory_reserved() + measured + weight_policy.MARGIN
+    weights.activation.clear()  # an estimate that is wrong: the stage keeps all its weights
+    retries = weights.facts().oom_retries
+    torch.cuda.reset_peak_memory_stats()
+    weights.set_cap(cap)
+    try:
+        weights.set_budget(-1)
+        capped = run(model, x, passes=1)
+        peak = torch.cuda.max_memory_reserved()
+        facts = weights.facts()
+    finally:
+        weights.set_cap(-1)
+    exact = same(uncapped, capped)
+    del x, uncapped, capped  # its 128 MiB segments must not shape the next test's allocations
+    torch.cuda.empty_cache()
+    assert facts.cap_bytes == cap
+    assert facts.oom_retries > retries
+    assert peak + weights.context_bytes <= cap
+    assert 0 <= facts.process_bytes <= cap
+    assert exact
+
+
 def test_decoded_copies_count_in_a_stages_budget(tmp_path: Path) -> None:
     """A weight the card cannot run as stored (fp8 before sm89) is decoded into a float copy
     when its region binds. That copy is torch's memory beside the plane's stored bytes, so a
@@ -828,6 +867,44 @@ def test_the_worker_lowers_a_running_stage_at_its_next_block(card: Any) -> None:
     facts = weights.facts()
     assert weights.applied == tight(model) and facts.committed_bytes <= tight(model)
     assert facts.streamed["stack"].resident_blocks < BLOCKS
+    assert same(reference, outputs)
+
+
+@on_card
+def test_the_owner_lowers_a_running_process_cap_at_its_next_block(card: Any) -> None:
+    """Room for another executor, or a display's floor, made while a call runs: the owner
+    asks for a smaller process cap through the budget cell; from its next block the stage
+    streams inside it and the process holds no more than the cap, with the same bits."""
+    from cozy_runtime.internal import budget_cell
+
+    weights = card.weights
+    model = load(weights, card.checkpoint, "cap-cut")
+    x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
+    reference = run(model, x)
+    torch.cuda.empty_cache()  # the cap is measured against what torch holds live
+    weights.measure_context()
+    cap = weights.context_bytes + torch.cuda.memory_reserved() + tight(model) + weight_policy.MARGIN
+    cell, fd = budget_cell.Cell.create()
+    owner = budget_cell.Cell(fd)
+    os.close(fd)
+    weights.cell = cell
+    model.residency.admit("run", ("stack",))
+    try:
+        with torch.inference_mode():
+            outputs = [model.stack(x)]
+            ticket = owner.ask(budget_cell.CAP - cap)
+            outputs += [model.stack(x), model.stack(x)]
+    finally:
+        model.residency.release("run", ("stack",))
+        weights.cell = None
+        applied = owner.answered(ticket)
+        cell.close()
+        owner.close()
+        weights.set_cap(-1)
+    facts = weights.facts()
+    assert applied is not None and applied == weights.applied
+    assert facts.streamed["stack"].resident_blocks < BLOCKS
+    assert weights.context_bytes + torch.cuda.memory_reserved() + facts.committed_bytes <= cap
     assert same(reference, outputs)
 
 
