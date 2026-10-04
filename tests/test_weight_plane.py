@@ -1134,7 +1134,8 @@ class Table(torch.nn.Module):  # type: ignore[misc,name-defined]
         self.table = torch.nn.Parameter(torch.empty(4096, HIDDEN, dtype=torch.float16))
 
     def forward(self, x: Any) -> Any:
-        return x * self.table[7]
+        rows = torch.full((x.shape[0],), 7, dtype=torch.long, device=x.device)
+        return x * torch.nn.functional.embedding(rows, self.table)
 
 
 @on_card
@@ -1198,6 +1199,7 @@ def test_a_stage_spares_its_idle_components_for_the_one_that_runs(tmp_path: Path
             assert encoder.common.bound is None, "mapped for that op only"
     finally:
         residency.release("run", scope)
+    residency.unpark()  # a repeating stage stays open until the next request plans afresh
     assert not encoder.spared, "a stage's end clears it"
     assert weights.facts().oom_retries >= 1
 
