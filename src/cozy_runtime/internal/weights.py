@@ -718,7 +718,9 @@ class Weights:
     def measure_context(self) -> None:
         """What the driver charges this process beyond torch's segments and the plane's maps:
         the CUDA context and library workspaces the Worker must leave room for."""
-        row = accel.process_memory(os.getpid(), self.kind)
+        pid = os.getpid()
+        device_id = self._uuid()
+        row = accel.process_memories_by_device({pid}, self.kind, (device_id,))[device_id][pid]
         if row.state == "present":
             reserved = accel.allocation(self.torch, self.kind)["reserved_bytes"]
             device = plane.stats(self.plane).device(self.index)
@@ -729,8 +731,7 @@ class Weights:
             self.limit_torch()
 
     def adopt_context(self, measured: int) -> None:
-        """The context the process measured at device init, where the driver could not list
-        it per process: what `process_bytes` and every cap count until NVML says more."""
+        """The context this process's own driver row showed at device init (-1: none)."""
         if measured > self.context_bytes:
             self.context_bytes = measured
             self.limit_torch()
