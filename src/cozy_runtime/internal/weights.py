@@ -423,19 +423,38 @@ class Weights:
         """Under a cap, before a stage plans: when other processes on the GPU leave less free
         than this stage's measured activations need of what the cap grants, ask the owner to
         make room first (`DeviceRoom`: idle tenants leave). Activations cannot shrink once
-        the stage runs; a stage never measured asks nothing."""
+        the stage runs; a stage never measured asks nothing. A process over its cap gives
+        back its own cached segments and idle maps first, then asks for the rest."""
         if self.room is None or self.cap < 0 or self.host_only:
             return
-        memory = accel.allocation(self.torch, self.kind)
+        memory, held = self._held()
+        if held > self.cap:
+            accel.release_cached(self.torch, self.kind)
+            memory, held = self._held()
+            if held > self.cap:
+                for residency in list(self.residencies):
+                    residency.unpark()
+                self.shrink(held - self.cap, self.floor())
+                self.drain()
+                memory, held = self._held()
         slack = max(memory["reserved_bytes"] - memory["allocated_bytes"], 0)
         need = self.activation.get(method, 0) - slack
+        if held > self.cap:
+            # Still over: the owner raises the cap into the room it makes (never a negative ask).
+            self.room(max(need, 0) + weight_policy.MARGIN)
+            return
         if need <= 0:
             return
-        committed = max(plane.stats(self.plane).device(self.index).committed, 0)
-        held = max(self.context_bytes, 0) + memory["reserved_bytes"] + committed
         granted = min(need + weight_policy.MARGIN, self.cap - held)
-        if memory["driver_free_bytes"] - self.floor_free < granted:
+        if granted > 0 and memory["driver_free_bytes"] - self.floor_free < granted:
             self.room(granted)
+
+    def _held(self) -> tuple[Mapping[str, int], int]:
+        """Torch's allocation figures, and what this process holds on the device: its context,
+        torch's reserved segments and the plane's maps."""
+        memory = accel.allocation(self.torch, self.kind)
+        committed = max(plane.stats(self.plane).device(self.index).committed, 0)
+        return memory, max(self.context_bytes, 0) + memory["reserved_bytes"] + committed
 
     def headroom(self, memory: Mapping[str, int]) -> int:
         """Device bytes this process may still take: the driver's free above the floor and,
