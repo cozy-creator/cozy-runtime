@@ -52,6 +52,10 @@ class Join(Command, frozen=True, kw_only=True, tag="join"):
     backend: str = "nccl"
     #: A budget cell memfd follows this command: the follower's own (`RANK_CELLS`).
     cell: bool = False
+    #: A socket follows: a byte on it aborts this follower's collectives (`RankGroup.interrupt`).
+    abort: bool = False
+    #: The group forms again after a call ran out of memory: device bytes to give back first.
+    room: int = -1
 
 
 class Fork(Command, frozen=True, kw_only=True, tag="fork"):

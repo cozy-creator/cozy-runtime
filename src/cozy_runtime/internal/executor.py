@@ -52,7 +52,7 @@ import socket
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -67,6 +67,7 @@ from cozy_runtime.author._capture import ActivationCapture
 from cozy_runtime.author._context import AdapterRef, Device
 from cozy_runtime.author._demand import shape_cell
 from cozy_runtime.author._errors import (
+    DEVICE_OOM,
     Cancelled,
     CapabilityError,
     InvalidRequest,
@@ -181,6 +182,7 @@ from cozy_runtime.internal.parallel import cp, mirror, wire
 from cozy_runtime.internal.parallel.group import (
     RankGroup,
     RankSpec,
+    abort_process_group,
     join_rank,
     receive_residence,
 )
@@ -514,6 +516,12 @@ class Executor:
         self.world = int(world)
         self.group: RankGroup | None = None
         self.pg: Any = None
+        #: HOST ONLY: the group's handle as every installed component reads it (`CpComms`)
+        self.comms: cp.CpComms | None = None
+        #: a follower's watcher aborted its collectives; cleared when the group forms again
+        self._interrupted = threading.Event()
+        #: a follower's stage methods of the group call that last ran out of memory
+        self._rerun_methods: tuple[str, ...] = ()
         self._device_ready = False
         self._startup_reported = False
         #: a follower's budget cell from rank 0 (`RANK_CELLS`), for its weight plane
@@ -815,12 +823,23 @@ class Executor:
                 self.host.rank_cell = budget_cell.Cell(fd)
             finally:
                 os.close(fd)
+        if command.abort:
+            watcher = socket.socket(fileno=self.channel.recv_descriptor())
+            threading.Thread(
+                target=self._watch_abort, args=(watcher,), name="group-abort", daemon=True
+            ).start()
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
         _restore_seal()
         import torch
 
         self.torch = torch
+        if command.room >= 0:
+            # Rank 0 interrupted before it asked: the watcher has aborted the old group.
+            self._interrupted.wait()
+            self._interrupted.clear()
+            if torch.distributed.is_initialized():
+                torch.distributed.destroy_process_group()
         spec = RankSpec(
             rank=self.rank,
             world=self.world,
@@ -846,7 +865,47 @@ class Executor:
                 f"{type(exc).__name__}: {exc}"[:900],
                 "traceback": prepare_diagnostics.exception_trace(exc),
             }
-        return {"ok": True, "rank": self.rank, "world": self.world, "backend": spec.backend}
+        if self.comms is not None:
+            self.comms.pg = self.pg
+        reply = {"ok": True, "rank": self.rank, "world": self.world, "backend": spec.backend}
+        if command.room >= 0:
+            try:
+                reply["freed"] = self._group_room(command.room, self._rerun_methods)
+            except ResidencyRefusal as exc:
+                return {"ok": False, "code": exc.code, "detail": str(exc)[:900]}
+        return reply
+
+    def _watch_abort(self, watcher: socket.socket) -> None:
+        """A follower's collectives end when rank 0 says so (`RankGroup.interrupt`): its main
+        thread may be inside one, where no command reaches it."""
+        with watcher:
+            while watcher.recv(1):
+                abort_process_group()
+                self._interrupted.set()
+
+    def _group_room(self, need: int, methods: Iterable[str]) -> int:
+        """Before a group call runs again: this GPU plans `methods` with `need` more room for
+        activations and gives that many device bytes back now. The bytes that came back; a
+        GPU with nothing left to give refuses (`Weights.make_room`)."""
+        weights = self.host.weights
+        if weights is None or weights.host_only:
+            return 0
+        need = max(need, weight_policy.MARGIN)
+        weights.seed_activations({m: weights.activation.get(m, 0) + need for m in methods})
+        before = weights.allocatable()
+        weights.make_room(need, (), "a group call that ran out of memory")
+        return max(weights.allocatable() - before, 0)
+
+    def _group_rerun(self, need: int) -> int:
+        """Rank 0's half of a group rerun: every GPU gives `need` bytes back and the group
+        forms again. The bytes the whole group gave back."""
+        assert self.group is not None and self.torch is not None
+        weights = self.host.weights
+        gave = self._group_room(need, [m for _, m, _ in weights.open] if weights else ())
+        self.host.pg = self.group.form(self.torch, _SEALED, room=need)
+        if self.host.comms is not None:
+            self.host.comms.pg = self.host.pg
+        return gave + self.group.gave
 
     def run(self, command: dict[str, Any]) -> dict[str, Any]:
         """Run a prepared sharded component, or one this rank hosts, under its leader's
@@ -1000,6 +1059,22 @@ class Executor:
                         "working_peak_bytes": 0,
                         "declined": declined,
                     }
+            if not (hosted or spread):
+                # Out of memory here, or rank 0 ended this collective because another GPU
+                # was: the group gives memory back and runs the call again (`mirror.mirrored`).
+                need = mirror.out_of_memory(exc)
+                ended = need is None and type(exc).__name__ == "DistBackendError"
+                if need is not None or ended:
+                    self._rerun_methods = tuple(
+                        str(scope["method"]) for scope in command.get("scopes") or ()
+                    )
+                    return {
+                        "ok": False,
+                        "code": "group_call_ended" if ended else DEVICE_OOM,
+                        "detail": f"{type(exc).__name__}: {exc}"[:900],
+                        "rank": self.rank,
+                        "rerun": need or 0,
+                    }
             outcome = classify(exc)
             self.poisoned = f"mirrored {name} failed: {outcome.code}"
             return {
@@ -1063,9 +1138,10 @@ class Executor:
         # sharded model. The complete multi-model prepare still requires a sharded root.
         installed: tuple[str, ...] = ()
         if candidates or self._group_parent is None:
-            comms = cp.CpComms(self.pg, self.rank, self._rank_device(torch))
+            if owner.comms is None:
+                owner.comms = cp.CpComms(owner.pg, self.rank, self._rank_device(torch))
             try:
-                installed = cp.install_context_parallel(model, degree=self.world, comms=comms)
+                installed = cp.install_context_parallel(model, degree=self.world, comms=owner.comms)
             except GroupRefusal as exc:
                 return self._group_refusal(exc)
         for _label, component in candidates:
@@ -1088,6 +1164,7 @@ class Executor:
                         bool(owner._attempt_request)
                         and _cancelled(owner.root, owner._attempt_request)
                     ),
+                    rerun=owner._group_rerun,
                 )
         hosted = mirror.hosting_plan(
             placeable=tuple(getattr(type(model), "__placeable__", ())),
