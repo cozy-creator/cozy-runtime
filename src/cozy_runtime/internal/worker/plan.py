@@ -27,6 +27,7 @@ from dataclasses import dataclass
 
 import msgspec
 
+from cozy_runtime.author._demand import shape_cell
 from cozy_runtime.internal import canonical, installed_interfaces, tolerant
 from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.delivery import RUNGS_BY_NAME, DeliveryRefusal, cost_class
@@ -34,10 +35,6 @@ from cozy_runtime.internal.execution_evidence import Boot
 from cozy_runtime.internal.resolution import ROUTE_KERNEL
 from cozy_runtime.internal.worker.ledger import Ledger
 from cozy_runtime.protocol import worker_pb2 as pb
-
-
-def shape_cell(features: Mapping[str, int]) -> str:
-    return ",".join(f"{axis}={value}" for axis, value in sorted(features.items())) or "-"
 
 
 class PlanRefusal(Exception):

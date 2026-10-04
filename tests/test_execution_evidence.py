@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 import os
 import socket
 import sys
@@ -15,15 +14,11 @@ import pytest
 
 from cozy_runtime.author._observations import MAX_SERIES, Attribution, EventRing
 from cozy_runtime.internal import execution_evidence, executor_replies, package_interface
-from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.executor import _SEALED, Executor, _send_reply
 from cozy_runtime.internal.executor_commands import Activate, Invoke, Load, PrepareRequest, Start
 from cozy_runtime.internal.executor_replies import AttemptReply
 from cozy_runtime.internal.seam import MAX_FRAME, Channel
-from cozy_runtime.internal.worker.attempts import AttemptRecord
-from cozy_runtime.internal.worker.control import InMemoryControlHost
-from cozy_runtime.internal.worker.session import Worker, WorkerOptions
 
 MODULE = "execution_evidence_fixture"
 SOURCE = """
@@ -147,44 +142,6 @@ def test_an_attempt_records_its_rank_setup_and_every_step(executor: Executor) ->
     assert len(ends) == 4 and ends == sorted(ends)
     assert condition["ended_unix_ms"] <= ends[0] <= rank["end_us"] // 1000
     assert sum(ms for _end, ms in denoise["series"]) == pytest.approx(denoise["total_ms"], abs=0.01)
-
-
-def test_telemetry_of_any_shape_reaches_the_worker_and_never_fails_the_attempt(
-    executor: Executor, tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    """Run 1566: one `complete=True` field failed a finished attempt `executor_reply_malformed`.
-    A 300-character log message, a 2^60 seed, NaN, a numpy scalar and ten fields each raised
-    into the handler or broke the seam. All arrive bounded, as scalars JSON holds exactly; a
-    row an older executor sends that the worker cannot read costs itself, with one warning."""
-    frame = _invoke(executor, "scalars")
-    frame["observations"].append({"kind": "log", "name": "older", "fields": {"shape": [1, 2]}})
-    reply = executor_replies.decode(frame, AttemptReply)
-    assert reply.ok and reply.outcome is not None, reply
-    assert reply.outcome.terminal == "succeeded", reply.outcome
-    worker = Worker(
-        RuntimeConfig(cozy_home=tmp_path / "home", credentials=Credentials()),
-        WorkerOptions(root=tmp_path / "worker", tensorfs_root=tmp_path / "store"),
-        InMemoryControlHost(),
-    )
-    attempt = AttemptRecord("scalars", 1, b"digest", {})
-    try:
-        with caplog.at_level(logging.WARNING):
-            worker.engine.absorb(attempt, reply, apply_ledger=False)
-    finally:
-        worker.shutdown()
-    rows = {row["name"]: row for row in attempt.ring.rows()}
-    fields: Any = rows["delivery"]["fields"]
-    assert fields["complete"] is True and fields["delivered"] == 4
-    assert rows["unreadable"]["fields"] == {"shape": "[1, 2]"}
-    (long,) = [row for name, row in rows.items() if str(name).startswith("mmm")]
-    assert len(str(long["name"])) == 200 and "~" in str(long["name"])
-    assert long["fields"] == {
-        "seed": str(2**60), "loss": "nan", "scale": 0.5, "k0": 0, "k1": 1, "k2": 2, "k3": 3, "k4": 4
-    }
-    assert rows["loss"]["value"] == "inf"
-    assert "older" not in rows and attempt.caps["unreadable_rows"] == 1
-    (warning,) = [row.getMessage() for row in caplog.records if "cannot read" in row.getMessage()]
-    assert "'older'" in warning and "got `array`" in warning, warning
 
 
 def test_a_reply_too_large_for_one_frame_sheds_telemetry_and_keeps_its_result(

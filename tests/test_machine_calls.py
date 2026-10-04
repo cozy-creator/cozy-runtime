@@ -148,35 +148,6 @@ def test_child_progress_poll_reuses_journal_and_fences_owner_parent_and_attempt(
     assert transport._progress(pending) is None
 
 
-def test_preparation_start_is_visible_without_fabricated_fraction(tmp_path: Path) -> None:
-    from types import SimpleNamespace
-    from typing import Any, cast
-
-    from cozy_runtime.internal.worker.machine_serving import Serving
-
-    emitted = []
-    worker = SimpleNamespace(
-        workspace=None,
-        emit_progress=lambda *args: emitted.append(args),
-        calls=SimpleNamespace(progress_label=lambda *args: "Shot 1 of 7"),
-    )
-    serving = Serving(cast(Any, worker))
-    call = SimpleNamespace(parent_request="parent", child_request="child", call_index=0)
-    incoming = pb.ChildCallRequest(parent_attempt_ordinal=1)
-    with (
-        pytest.raises(ValueError),
-        serving.phase(cast(Any, call), incoming, "Downloading model weights"),
-    ):
-        assert emitted[-1] == (
-            "parent",
-            1,
-            {"kind": "progress", "stage": "Shot 1 of 7 / Downloading model weights"},
-        )
-        raise ValueError("download failed")
-    assert emitted[-1][2]["fields"]["completed"] is False
-    serving.close()
-
-
 def test_optional_child_progress_cannot_turn_a_valid_result_into_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

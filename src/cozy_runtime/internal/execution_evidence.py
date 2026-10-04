@@ -32,7 +32,14 @@ import time
 from collections.abc import Mapping, Sequence
 from typing import Any, NotRequired, TypedDict
 
-from cozy_runtime.internal.readiness import RuntimeGPU
+
+class RuntimeGPU(TypedDict):
+    device_index: int
+    device_name: str
+    device_uuid: str
+    driver_version: str
+    memory_bytes: int
+    pci_bus_id: str
 
 
 class Boot(TypedDict):

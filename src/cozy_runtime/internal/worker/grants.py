@@ -69,6 +69,7 @@ from cozy_runtime.author._errors import RuntimeFailure
 from cozy_runtime.author._media import SNIFF_BYTES, extension, normalize, reconcile, sniff
 from cozy_runtime.internal import canonical, egress
 from cozy_runtime.internal.canonical import Json
+from cozy_runtime.internal.weights_writer import MODEL_PREFIX as MODEL_PREFIX
 from cozy_runtime.protocol import worker_pb2 as pb
 
 if TYPE_CHECKING:
@@ -88,7 +89,6 @@ TREE_PREFIX = "tree:"
 
 #: A job Model parameter is one exact TensorFS Manifest identity. Its grant access is an
 #: opaque host-local capability, never a filesystem path or URL the executor can spend.
-MODEL_PREFIX = "model:"
 MODEL_MIME = "application/vnd.cozy.model-manifest"
 _MODEL_PARAM = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 _MODEL_SOURCE_PARAM = re.compile(

@@ -7,49 +7,6 @@ import pytest
 
 from cozy_runtime.internal import derive
 from cozy_runtime.internal.paging import partition
-from cozy_runtime.internal.worker.lanes import LaneSet
-from cozy_runtime.internal.worker.plan import DeclaredBinding, PreparedModel, PreparedRequest
-
-
-@pytest.mark.parametrize("degree", [1, 2, 4])
-def test_h3_encoder_block_floor_reaches_the_attempt_planner(degree: int) -> None:
-    # Exact full-H3 meta census, including its non-persistent buffers. These are
-    # shape facts, not a claimed activation peak or a full-video fit certificate.
-    nominal, working = 51_506_192_132, 2_898_621_988
-    lanes = LaneSet.from_envelope(",".join(str(rank) for rank in range(degree)), worker_pid=1)
-    lane = lanes.group(tuple(range(degree))) if degree > 1 else lanes.lanes[0]
-    ledger = lane.row("fixture").ledger
-    ledger.begin_generation(1)
-    ledger.observe_construction(
-        {
-            "filled_bytes": nominal,
-            "allocator_bytes": 0,
-            "reserved_bytes": 0,
-            "resident": {},
-            "parked": ["text_encoder"],
-            "evicted": {"text_encoder": nominal},
-            "paging": {"text_encoder": {"total_bytes": nominal, "working_bytes": working}},
-            "declared_scopes": {"condition_text": ["text_encoder"]},
-            "device_free_bytes": 8 << 30,
-            "device_total_bytes": 24 << 30,
-        }
-    )
-    binding = DeclaredBinding(
-        entrypoint_binding_digest="sha256:fixture",
-        entrypoint="generate",
-        model_class="H3Model",
-        model_binding_path="h3:H3Model",
-        model_parameter_name="model",
-        release="fixture@1",
-        logical_weight_bytes=nominal,
-    )
-    chooser = lane.row("fixture").chooser
-    prepared = PreparedRequest.unresolved("generate", {})
-    model = PreparedModel(delivery_rung="verbatim")
-    # Parked at construction: staged, whatever room the call was given.
-    assert chooser.choose(binding, model, prepared).placement == "component_staged"
-    ledger.device_free = working - 1
-    assert chooser.choose(binding, model, prepared).placement == "component_staged"
 
 
 def test_declared_blocks_with_shared_storage_are_not_independently_pageable() -> None:

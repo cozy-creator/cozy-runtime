@@ -85,7 +85,7 @@ For labelled model-ready input media, see [Ordered media inputs](docs/assets.md)
 | `cozy_runtime.author` | the whole author surface — the only package code imports | stdlib + msgspec |
 | `cozy_runtime.internal` | runtime implementation; owns the ONE config authority | author, protocol, stdlib |
 | `cozy_runtime.protocol` | `cozy.worker.v1` — worker-protocol's bindings, copied verbatim into `src/cozy/`, plus canonical document handling | protobuf, internal.canonical |
-| `cozy_runtime.cli` | user CLI plus the fixed product-host worker entrypoint | author, internal |
+| `cozy_runtime.cli` | user CLI | author, internal |
 
 Re-vendor worker-protocol with `uv run python scripts/vendor-worker-protocol.py <commit>`: it
 rewrites the bindings and the canonical test corpus from that one commit, so their pins move together.
@@ -104,45 +104,26 @@ the entrypoint, a frozen `RuntimeConfig` passed explicitly thereafter. Second re
 `internal/spawn.py` executes the seal (ERASE -> IMPOSE -> SEAL) around it.
 `internal/exits.py` is the one shared exit-code matrix.
 
-## The two processes, and the RecordOwner
+## The executor and the machine
 
-    RecordOwner ──gRPC + signed Claim──▶ worker (no CUDA) ──seam──▶ executor (CUDA)
+    cozy-machine ──seam──▶ executor (CUDA)
 
-Product hosts run `cozy-runtime-worker`, a private no-argument entrypoint that constructs
-the worker core directly. On a base worker image it starts as root, consumes the six-value
-owner-neutral host handoff, proves the worker and media TLS listeners, publishes readiness,
-then opens Claim admission. The fixed handoff also carries the operator-owned direct Tensorhub
-API origin as canonical `TENSORHUB_ORIGIN=https://host[:port]`. Package executors alone drop to UID/GID
-65533. The removed
-wrapper executable has no compatibility alias; placement acquisition now lives in
-`internal/placement_materialization.py`.
-
-The handoff's one `COZY_RECORD_OWNER_AUTH_JSON` value is a closed record containing the rental's
-Ed25519 control public key and the media bearer's sorted hashes. Claim authenticates the
-RecordOwner; media hashes open only media HTTP. Neither reaches an executor. The exact
-PlacementSet is the sole package/model selection. Runtime names only its digest to
-`POST /v1/worker/downloads/resolve` over its existing per-boot mTLS leaf, then downloads the
-returned package wheels and model-weight files directly from their short-lived R2 GET URLs.
-The supervisor may project its decoded private CA as `SSL_CERT_FILE`; Runtime accepts no CA
-payload environment variable, certificate bypass, proxy certificate header, or
-authentication fallback.
+The Python worker and its `cozy-runtime-worker` entrypoint are deleted. The Rust
+`cozy-machine` owns the API, the journal, the store and executor supervision, and starts
+`internal/executor.py` through `internal/trampoline.py`. What is left under
+`internal/worker/` is the import closure of the weights writer, held until the machine
+writes weights outputs; nothing starts it.
 
 | module | role |
 |---|---|
-| `internal/worker/session.py` | the protocol client and the worker entrypoint |
-| `internal/worker/control.py` | the worker-owned control transport: gRPC and in-memory hosts |
 | `internal/worker/attempts.py` | offer -> prepare -> accept -> terminal, attestation, ledger close |
 | `internal/worker/ledger.py` | the worker-scoped byte ledger and the attempt reconciliation |
 | `internal/worker/plan.py` | the AttemptPlan, the PlanChooser, the local binding-plan record |
-| `internal/worker/downloads.py` | canonical Claim verification and direct Tensorhub package/model download resolve |
 | `internal/worker/grants.py` | DeliveryGrant reads/writes + the closed hub-call table |
 | `internal/worker/child.py` | spawn/supervise/kill the executor; the two ordinals |
-| `internal/residency.py` | component-use admission: materialize a declared set before entry, event-fence, make evictable |
 | `internal/worker/observe.py` | typed boot steps, confessions, and the SILENCE-BOUNDED liveness detector |
 | `internal/worker/triage.py` | bounded triage assembly and receipt-checked bundle store |
 | `internal/worker/refusal.py` | reader-vs-data fault, verbatim upstream remedy, the REF_ORIGIN severity split |
-| `internal/witness.py` | the out-of-process postmortem witness: it names the WORKER's own death (DECLARED, not yet wired — the pod launcher does not start it) |
-| `internal/local.py` | the ephemeral local worker: one request, no network |
 | `internal/worker/records.py` | bounded same-process worker facts; callers own restart recovery |
 | `internal/seam.py` | the control-only, byte-accounted worker<->executor channel |
 | `internal/trampoline.py` | the exec-first stage: pdeathsig, no_new_privs, oom_score_adj |
@@ -157,17 +138,9 @@ implementation, plan, and generation digests; those names are executable identit
 formats. Command requests, planner values, worker records, proof-local state, and benchmark reports
 are typed by their command/path or storage table and carry no global format tag.
 
-The worker never imports torch, and that is proved against the RUNNING process
-(the worker process's `/proc/<pid>/maps` and the device's compute-app
-list), not against the import graph.
-
-**One attempt kernel** (§8). A one-shot local run is not a second execution path: it is an
-ephemeral local worker whose RecordOwner is a pair of in-process queues, over the same
-process boundary, acceptance boundary, freeze point and ledger. The rule is
-structural, not a promise — the `one-attempt-kernel` fence proves the invocation kernel has
-exactly one caller (the device executor) and the attempt engine exactly one constructor (the
-worker session), so a direct-call runner beside them cannot be written without turning
-CI red.
+**One attempt kernel** (§8). The rule is structural, not a promise: the `one-attempt-kernel`
+fence proves the invocation kernel has exactly one caller (the device executor), so a
+direct-call runner beside it cannot be written without turning CI red.
 
 **Observability is bounded, or it is not observability.** `author/_observations.py` holds the
 ONE record shape, a ring bounded by count AND bytes that sheds oldest first and counts what it

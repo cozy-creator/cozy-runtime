@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import sys
 import time
 from pathlib import Path
@@ -14,21 +13,11 @@ import pytest
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author import App, AssetBound, Invocation, Outputs, Tree, attempt
-from cozy_runtime.internal import (
-    output_budget,
-    package_interface,
-    source_interfaces,
-    static_interface,
-)
+from cozy_runtime.internal import output_budget, package_interface, static_interface
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.executor import _serialize_result
 from cozy_runtime.internal.executor_replies import AttemptReply
-from cozy_runtime.internal.worker import (
-    commit_files,
-    grants,
-    workspace_byte_outputs,
-    workspace_sources,
-)
+from cozy_runtime.internal.worker import grants, workspace_byte_outputs
 from cozy_runtime.internal.worker.attempts import AttemptEngine, AttemptRecord
 from cozy_runtime.internal.worker.calls import Calls, _Pending
 from cozy_runtime.internal.worker.plan import AttemptPlan, DeclaredBinding
@@ -97,79 +86,6 @@ def assemble(payload: Request, media: MediaDecoder) -> Result:
     source = static_interface.build(tmp_path)
     imported = package_interface.build(discover(tmp_path))
     assert package_interface.canonical_bytes(source) == package_interface.canonical_bytes(imported)
-
-
-@pytest.mark.parametrize("final_bytes", [140 << 20, 8])
-def test_native_file_commit_uses_the_recorded_parent_budget(
-    tmp_path: Path,
-    final_bytes: int,
-) -> None:
-    workspace = Workspace(tmp_path / "store")
-    spec = pb.InvocationSpec(
-        job=pb.JobInvocationSpec(),
-        outputs=[
-            pb.OutputBinding(output_id=name, max_bytes=final_bytes) for name in ("first", "second")
-        ],
-    )
-    raw, digest = documents.identity(spec)
-    workspace.accept(
-        "owner",
-        pb.AttemptOffer(
-            request_id="producer",
-            attempt_ordinal=1,
-            invocation_spec_digest=digest,
-            invocation_spec_canonical_bytes=raw,
-        ),
-    )
-    workspace.mark_running(
-        "owner",
-        pb.AttemptAccepted(
-            request_id="producer",
-            attempt_ordinal=1,
-            invocation_spec_digest=digest,
-        ),
-    )
-    for index, size in enumerate((129 << 20, 129 << 20, 23 << 20, 257 << 20), start=1):
-        arguments = {
-            "slot": f"file/{index:04d}",
-            "digest": "sha256:" + "aa" * 32,
-            "size_bytes": size,
-            "media_type": "application/octet-stream",
-        }
-        intent = canonical_json.encode(
-            {
-                "module": source_interfaces.MODULE,
-                "export": "commit_file",
-                "request": arguments,
-            }
-        )
-        command = pb.NativeSourceCommand(
-            service_id=workspace_sources.identity("owner", "producer", index),
-            operation=pb.NATIVE_SOURCE_OPERATION_COMMIT_FILE,
-            parent_call=pb.ChildCallRequest(
-                parent_request_id="producer",
-                parent_attempt_ordinal=1,
-                parent_invocation_spec_digest=digest,
-                call_index=index,
-                module=source_interfaces.MODULE,
-                export="commit_file",
-                request_canonical_bytes=canonical_json.encode(arguments),
-                intent_digest=hashlib.sha256(intent).digest(),
-            ),
-        )
-        workspace_sources.accepted(workspace, "owner", command)
-        if index <= (2 if final_bytes > 8 else 1):
-            prepared = commit_files.prepare(workspace, "owner", command, b"c" * 32, tmp_path)
-            assert prepared.basename == f"file-{index:04d}"
-        else:
-            with pytest.raises(ValueError, match=r"budget|bounded"):
-                commit_files.prepare(workspace, "owner", command, b"c" * 32, tmp_path)
-    # Preparation records bounded intent but has written no native payload bytes.
-    with workspace.locked() as db:
-        assert (
-            db.execute("SELECT count(*) FROM byte_outputs WHERE state='complete'").fetchone()[0]
-            == 0
-        )
 
 
 def test_worker_command_keeps_intermediate_room_for_a_small_final_report(tmp_path: Path) -> None:

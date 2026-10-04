@@ -32,9 +32,9 @@ from cozy_runtime.author import (
     prepare,
 )
 from cozy_runtime.author._assets import GrantedInput
+from cozy_runtime.author._demand import shape_cell
 from cozy_runtime.internal.executor_replies import Metrics
 from cozy_runtime.internal.worker.ledger import Ledger
-from cozy_runtime.internal.worker.plan import shape_cell
 
 #: Stands in for H3's `official.frames_for` table (whole seconds onto its frame grid).
 FRAMES = {s: 24 * s + 5 for s in range(5, 16)}

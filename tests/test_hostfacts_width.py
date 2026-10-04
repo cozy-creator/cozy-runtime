@@ -89,50 +89,6 @@ def test_cpu_profile_holds_no_card(monkeypatch: pytest.MonkeyPatch) -> None:
     assert facts.state("gpu_count") == "absent"
 
 
-def test_worker_measures_its_cards_once_per_boot(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Child calls read the boot's facts; only an unreadable driver or a death re-measures."""
-    from types import SimpleNamespace
-    from typing import Any, cast
-
-    from cozy_runtime.internal.worker.control import InMemoryControlHost
-    from cozy_runtime.internal.worker.session import Worker, WorkerOptions
-    from test_device_lanes import _config
-
-    calls, healthy = tmp_path / "calls", tmp_path / "healthy"
-    binary = tmp_path / "bin" / "nvidia-smi"
-    binary.parent.mkdir()
-    binary.write_text(
-        f'#!/bin/sh\necho >>"{calls}"\n[ -e "{healthy}" ] || exit 1\n'
-        f'printf "%s\\n" "{H100}" "{H100}" "{H100}" "{H100}"\n'
-    )
-    binary.chmod(0o755)
-    monkeypatch.setenv("PATH", str(binary.parent) + os.pathsep + os.environ["PATH"])
-    worker = Worker(
-        _config(tmp_path / "home"),
-        WorkerOptions(root=tmp_path / "worker", devices="", accelerator_backend="cuda"),
-        InMemoryControlHost(),
-    )
-
-    def measured() -> int:
-        return len(calls.read_text().splitlines()) if calls.exists() else 0
-
-    before = measured()
-    assert "gpu_name" in worker.host_facts().unreadable
-    assert "gpu_name" in worker.host_facts().unreadable
-    assert measured() == before + 2  # a wedged driver is never remembered
-    healthy.touch()
-    for _ in range(3):
-        assert worker.host_facts().gpu_count == 4
-        worker.resources()
-        worker.numerical_environment()
-    assert measured() == before + 3
-    worker.executor_exited(cast(Any, SimpleNamespace(epoch=1, pid=1)))
-    assert worker.host_facts().gpu_count == 4
-    assert measured() == before + 4
-
-
 def test_a_process_that_sees_no_gpu_measures_none_without_asking(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

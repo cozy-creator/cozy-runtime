@@ -2,15 +2,35 @@
 
 from __future__ import annotations
 
+import contextlib
+import os
+import tempfile
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
 from conftest import image_python
-from cozy_runtime.internal import accel
+from cozy_runtime.internal import accel, child_env
+from cozy_runtime.internal.config import Credentials, RuntimeConfig
 from cozy_runtime.internal.worker.child import ExecutorSupervision
-from test_device_lanes import _config, _workspace
 from test_end_to_end import NO_EXECUTOR
+
+
+def _config(home: Path) -> RuntimeConfig:
+    base = {k: v for k, v in os.environ.items() if not child_env.erased(k) and k != "PYTHONPATH"}
+    return RuntimeConfig(
+        cozy_home=home,
+        credentials=Credentials(),
+        child_base_env=tuple(sorted(base.items())),
+    )
+
+
+@contextlib.contextmanager
+def _workspace() -> Iterator[Path]:
+    # Short: the executor's control socket lives under it and `sun_path` holds 108 bytes.
+    with tempfile.TemporaryDirectory(prefix="cz-lanes.", dir="/tmp") as raw:
+        yield Path(raw)
 
 
 @pytest.mark.skipif(bool(NO_EXECUTOR), reason=NO_EXECUTOR or "")

@@ -11,13 +11,6 @@ from cozy_runtime import canonical_json
 from cozy_runtime.author import ConformanceError
 from cozy_runtime.internal import interface_wheel, package_interface, static_interface
 from cozy_runtime.internal.discovery import discover
-from cozy_runtime.internal.worker.internal_calls import require_child
-from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
-from cozy_runtime.internal.worker.workspace_calls import Calls
-from cozy_runtime.internal.worker.workspace_executions import Executions
-from cozy_runtime.protocol import worker_pb2 as pb
-from test_machine_calls import request, running
-from test_machine_execution import offer
 
 SOURCE = """import msgspec
 from cozy_runtime.author import App, Context, invocable
@@ -90,83 +83,3 @@ def test_interface_reader_rejects_nonboolean_internal(tmp_path: Path, value: obj
     document["entrypoints"][1]["internal"] = value
     with pytest.raises(ConformanceError, match="internal"):
         package_interface.read_bytes(canonical_json.encode(document))
-
-
-def test_child_authority_survives_reopen_but_cannot_be_reused_by_roots_or_other_installations(
-    tmp_path: Path,
-) -> None:
-    workspace = Workspace(tmp_path / "store")
-    executions = Executions(workspace)
-    parent = offer("parent")
-    executions.submit(
-        "owner",
-        "parent",
-        b"c" * 32,
-        parent,
-        expected_execution_workspace_id=executions.workspace_id,
-    )
-    calls = Calls(workspace)
-    call = calls.accept("owner", request(running(executions)))
-    installation = "local-" + "11" * 16
-    calls.freeze(
-        "owner",
-        call,
-        canonical_json.encode({"installation_id": installation, "entrypoint": "segment"}),
-    )
-    child = offer(call.child_request)
-    executions.submit(
-        "owner",
-        call.child_request,
-        b"c" * 32,
-        child,
-        expected_execution_workspace_id=executions.workspace_id,
-    )
-    reopened = Workspace(tmp_path / "store")
-    require_child(reopened, "owner", child, installation, "segment", machine_owned=True)
-    for selected, owner, requested_installation, name, machine_owned in (
-        (child, "owner", installation, "segment", False),
-        (parent, "owner", installation, "segment", True),
-        (child, "another-owner", installation, "segment", True),
-        (child, "owner", "local-" + "22" * 16, "segment", True),
-        (child, "owner", installation, "another-helper", True),
-    ):
-        with pytest.raises(WorkspaceRefusal, match="internal_callable"):
-            require_child(
-                reopened,
-                owner,
-                selected,
-                requested_installation,
-                name,
-                machine_owned=machine_owned,
-            )
-    foreign_request = request(running(executions))
-    foreign_request.call_index = 1
-    foreign_call = calls.accept("owner", foreign_request)
-    foreign_installation = "local-" + "22" * 16
-    calls.freeze(
-        "owner",
-        foreign_call,
-        canonical_json.encode({"installation_id": foreign_installation, "entrypoint": "segment"}),
-    )
-    foreign_child = offer(foreign_call.child_request)
-    executions.submit(
-        "owner",
-        foreign_call.child_request,
-        b"c" * 32,
-        foreign_child,
-        expected_execution_workspace_id=executions.workspace_id,
-    )
-    with pytest.raises(WorkspaceRefusal, match="internal_callable"):
-        require_child(
-            reopened,
-            "owner",
-            foreign_child,
-            foreign_installation,
-            "segment",
-            machine_owned=True,
-        )
-    altered = pb.AttemptOffer()
-    altered.CopyFrom(child)
-    altered.invocation_spec_digest = b"x" * 32
-    with pytest.raises(WorkspaceRefusal, match="internal_callable"):
-        require_child(reopened, "owner", altered, installation, "segment", machine_owned=True)

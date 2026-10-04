@@ -7,7 +7,6 @@ import json
 import ssl
 import subprocess
 import sys
-import threading
 import time
 from pathlib import Path
 
@@ -442,78 +441,6 @@ def test_worker_https_renews_and_keeps_worker_and_operation_authority_separate(
         thread.join()
 
 
-@pytest.mark.parametrize(
-    "origin",
-    [
-        "https://hub.example.test",
-        "http://localhost:8080",
-        "http://127.0.0.1:8080",
-        "http://[::1]:8080",
-    ],
-)
-def test_scoped_access_renews_without_machine_registration_and_revokes_per_hub(
-    tmp_path: Path,
-    origin: str,
-) -> None:
-    from types import SimpleNamespace
-    from typing import cast
-
-    from cozy_runtime.internal.worker import machine_model_defaults, machine_model_resolve
-    from cozy_runtime.internal.worker.session import Worker, WorkerOptions
-
-    path = tmp_path / "machine-hubs.json"
-    row = {"origin": origin, "access_token": execution_token(), "expires_at": int(time.time()) + 60}
-    path.write_text(json.dumps({"version": 1, "hubs": [row, {"origin": "unreadable"}]}))
-    worker = cast(
-        Worker,
-        SimpleNamespace(
-            options=WorkerOptions(tmp_path, hub_access_path=path),
-            hub_access_lock=threading.Lock(),
-            hub_access_principals={},
-        ),
-    )
-    assert machine_model_resolve.registration(worker, "") is None
-    authority = machine_model_resolve.registration(worker, origin)
-    assert authority is not None
-    assert authority.worker_id == authority.worker_token == ""
-    assert authority.headers() == {"Authorization": "Bearer " + execution_token()}
-    assert execution_token() not in repr(authority)
-    assert machine_model_defaults.credential(worker, origin) == "bearer " + execution_token()
-    assert machine_model_defaults.credential(worker, "https://other.example.test") == ""
-    path.write_text(
-        json.dumps(
-            {"version": 1, "hubs": [{**row, "access_token": execution_token(nonce="renewed")}]}
-        )
-    )
-    assert machine_model_defaults.credential(worker, origin) == "bearer " + execution_token(
-        nonce="renewed"
-    )
-    for token in (
-        execution_token("account-b"),
-        execution_token(issuer="other-issuer"),
-        "opaque-token",
-    ):
-        path.write_text(json.dumps({"version": 1, "hubs": [{**row, "access_token": token}]}))
-        for read in (
-            lambda: machine_model_defaults.credential(worker, origin),
-            lambda: machine_model_resolve.own(worker, hub=origin),
-        ):
-            with pytest.raises(ValueError, match="another account"):
-                read()
-        with pytest.raises(PublicationRefusal, match="authority_principal_conflict"):
-            authority.current()
-        assert machine_model_defaults.credential(worker, "https://other.example.test") == ""
-    path.write_text(json.dumps({"version": 1, "hubs": [{**row, "expires_at": 1}]}))
-    with pytest.raises(PublicationRefusal, match="authority_expired"):
-        machine_model_defaults.credential(worker, origin)
-    with pytest.raises(ValueError, match="execution access has expired"):
-        machine_model_resolve.own(worker, hub=origin)
-    path.write_text(json.dumps({"version": 1, "hubs": []}))
-    assert machine_model_resolve.registration(worker, origin) is None
-    with pytest.raises(PublicationRefusal, match="authority_absent"):
-        authority.current()
-
-
 def test_scoped_plain_http_is_only_explicit_loopback_access(tmp_path: Path) -> None:
     from cozy_runtime.internal.config import ConfigError
 
@@ -554,47 +481,3 @@ def test_scoped_plain_http_is_only_explicit_loopback_access(tmp_path: Path) -> N
             PublicationAuthority(origin, "rental", "A" * 43).client(
                 "019aaaab-0000-7000-8000-000000000003"
             )
-
-
-def test_boot_account_binding_survives_projection_replacement_without_blocking_other_hubs(
-    tmp_path: Path,
-) -> None:
-    from cozy_runtime.internal.config import Credentials, RuntimeConfig
-    from cozy_runtime.internal.worker import machine_model_defaults, machine_model_resolve
-    from cozy_runtime.internal.worker.control import InMemoryControlHost
-    from cozy_runtime.internal.worker.session import Worker, WorkerOptions
-
-    origin, other = "https://hub.example.test", "https://other.example.test"
-    path = tmp_path / "machine-hubs.json"
-    original = PublicationAuthority(origin, access_token=execution_token(), expires_at=1)
-    worker = Worker(
-        RuntimeConfig(cozy_home=tmp_path / "home", credentials=Credentials()),
-        WorkerOptions(tmp_path / "worker", hubs=(original,), hub_access_path=path),
-        InMemoryControlHost(),
-    )
-    try:
-        rows = [
-            {
-                "origin": origin + ":443",
-                "access_token": execution_token("account-b"),
-                "expires_at": int(time.time()) + 60,
-            },
-            {
-                "origin": other,
-                "access_token": execution_token("account-c"),
-                "expires_at": int(time.time()) + 60,
-            },
-        ]
-        path.write_text(json.dumps({"version": 1, "hubs": rows}))
-        with pytest.raises(ValueError, match="another account"):
-            machine_model_resolve.registration(worker, origin)
-        assert machine_model_defaults.credential(worker, other) == "bearer " + execution_token(
-            "account-c"
-        )
-        rows[0]["access_token"] = execution_token(nonce="fresh")
-        path.write_text(json.dumps({"version": 1, "hubs": rows}))
-        assert machine_model_defaults.credential(worker, origin) == "bearer " + execution_token(
-            nonce="fresh"
-        )
-    finally:
-        worker.shutdown()

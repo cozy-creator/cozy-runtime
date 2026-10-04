@@ -42,7 +42,6 @@ dev = [
 
 [project.scripts]
 cozy-runtime = "cozy_runtime.cli.main:main"
-cozy-runtime-worker = "cozy_runtime.cli.runtime_worker:main"
 cozy-native-wheel-proof = "cozy_runtime.cli.native_wheel_proof:main"
 
 [tool.pytest.ini_options]

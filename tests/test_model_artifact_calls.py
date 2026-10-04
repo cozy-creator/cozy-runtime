@@ -1,14 +1,11 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
-import grpc
 import msgspec
 import pytest
 import tensorfs
@@ -35,15 +32,8 @@ from cozy_runtime.cli import describe as describe_cli
 from cozy_runtime.cli.io import Options
 from cozy_runtime.internal import interface_wheel, package_interface
 from cozy_runtime.internal.discovery import Discovered
-from cozy_runtime.internal.weights_sink import same_receipt
-from cozy_runtime.internal.worker import derived_retention
-from cozy_runtime.internal.worker.control import _PreparationServicer
-from cozy_runtime.protocol import documents
-from cozy_runtime.protocol import worker_pb2 as pb
-from cozy_runtime.protocol import worker_pb2_grpc as rpc
 from durable_seam import wire
 from native_weights import NativeExecution
-from test_weights_resume_native import _committed
 
 
 class Source(Model[object]):
@@ -193,77 +183,3 @@ def test_model_proxy_is_an_exact_artifact_and_dispatch_checks_bound_model(tmp_pa
     # Existing top-level fixed Model bindings remain valid without a derived handle.
     result, outcome, _ = attempt(app.get("consume"), {}, invocation)
     assert outcome.terminal == "succeeded" and result is not None
-
-
-def test_native_artifact_receipt_and_independent_loopback_retention_survive_original_dispose(
-    tmp_path: Path,
-) -> None:
-    store, _, _, receipt = _committed(tmp_path)
-    artifact = receipt.artifact
-    native = json.loads(receipt.tensorfs_receipt)
-    assert artifact.producer_request_id == "request"
-    assert artifact.manifest == ObjectRef(
-        "sha256:" + native["manifest"]["sha256"], native["manifest"]["length"]
-    )
-    assert (
-        artifact.tensorfs_receipt_digest
-        == "sha256:" + hashlib.sha256(receipt.tensorfs_receipt).hexdigest()
-    )
-    root = tmp_path / "store"
-    server = grpc.server(ThreadPoolExecutor(max_workers=2))
-    handler = _PreparationServicer(
-        None,
-        None,
-        None,
-        None,
-        derived_retainer=lambda req, release: derived_retention.change(
-            req, tensorfs_root=root, release=release
-        ),
-        derived_result_releaser=lambda req: derived_retention.release_result(
-            req, tensorfs_root=root
-        ),
-    )
-    rpc.add_RuntimePreparationServicer_to_server(handler, server)
-    port = server.add_insecure_port("127.0.0.1:0")
-    server.start()
-    request = pb.DerivedRetentionRequest(
-        weights_transaction_id=receipt.weights_transaction_id,
-        tensorfs_receipt_digest=documents.raw(artifact.tensorfs_receipt_digest),
-        retention_id="sha256:" + "19" * 32,
-    )
-    try:
-        with grpc.insecure_channel(f"127.0.0.1:{port}") as channel:
-            client = rpc.RuntimePreparationStub(channel)
-            held = client.RetainDerivedResult(request, timeout=5)
-            assert not held.released and held.manifest.digest == documents.raw(
-                artifact.manifest.digest
-            )
-            assert client.RetainDerivedResult(request, timeout=5) == held
-            store.derived_adopt(receipt.weights_transaction_id, "original-result")
-            original_release = pb.DerivedResultReleaseRequest(
-                weights_transaction_id=request.weights_transaction_id,
-                tensorfs_receipt_digest=request.tensorfs_receipt_digest,
-            )
-            for _ in range(2):
-                released_original = client.ReleaseDerivedResult(original_release, timeout=5)
-                assert released_original.released
-            assert same_receipt(
-                store.derived_lookup(receipt.weights_transaction_id)["receipt"], native
-            )
-            tensorfs.gc(str(root))
-            assert client.RetainDerivedResult(request, timeout=5) == held
-            assert store.manifest(artifact.manifest.digest)
-            changed = pb.DerivedRetentionRequest()
-            changed.CopyFrom(request)
-            changed.tensorfs_receipt_digest = b"x" * 32
-            with pytest.raises(grpc.RpcError) as refused:
-                client.RetainDerivedResult(changed, timeout=5)
-            assert refused.value.code() == grpc.StatusCode.FAILED_PRECONDITION
-            released = client.ReleaseDerivedRetention(request, timeout=5)
-            assert (
-                released.released and client.ReleaseDerivedRetention(request, timeout=5) == released
-            )
-            with pytest.raises(grpc.RpcError):
-                client.RetainDerivedResult(request, timeout=5)
-    finally:
-        server.stop(0).wait()

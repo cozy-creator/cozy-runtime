@@ -46,12 +46,14 @@ from cozy_runtime.author._executor_requests import (
     refuse,
 )
 from cozy_runtime.internal import storage_admission, weights_sink
-from cozy_runtime.internal.worker.grants import MODEL_PREFIX
 from cozy_runtime.protocol import documents, weights_limits
 from cozy_runtime.protocol import worker_pb2 as pb
 
 if TYPE_CHECKING:
     from tensorfs.derived import Derivation
+
+#: A granted input whose id starts with this is one model manifest.
+MODEL_PREFIX = "model:"
 
 
 class DerivationArguments(NamedTuple):
