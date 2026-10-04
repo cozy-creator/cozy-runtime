@@ -4015,6 +4015,10 @@ class Executor:
         """Ask the worker for `free_bytes` free on this GPU from its other tenants; it answers
         once they gave what they could, with this process's cap raised into that room when it
         holds one (an older worker refuses, and nothing changes)."""
+        if free_bytes < 0:
+            raise ResidencyRefusal(
+                "invalid_device_room", "a device room request cannot be negative"
+            )
         answer = self._durable(DeviceRoom(free_bytes=free_bytes), Room)
         if answer.ok and answer.cap_bytes >= 0 and self.weights is not None:
             self.weights.set_cap(answer.cap_bytes)
