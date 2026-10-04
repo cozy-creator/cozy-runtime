@@ -341,6 +341,7 @@ class Weights:
         self.last_retry: tuple[str, int] | None = None
         #: the CUDA context and library workspaces outside torch and the plane, measured once
         self.context_bytes = -1
+        self._indexed_h2d = self._indexed_copy_ns = self._indexed_read = self._indexed_peak = 0
         #: the machine's custody of GPU weights (`weights.attach/1`); None: every region private
         self.sharing: DeviceTiers | None = None
         #: how LoRA'd linears are served: baked into their weights (owner, 2026-10-04: the
@@ -523,7 +524,7 @@ class Weights:
         # estimate (a seed for an untiled decode, say) that left a stage no room for its own
         # weights would refuse it for size. An adaptive stage then tiles; any other recovers
         # from its out-of-memory by unmapping.
-        return max(weight_policy.plane_budget(available, growth), min(self.window(), available))
+        return max(weight_policy.plane_budget(available, growth), min(self.floor(), available))
 
     def window(self) -> int:
         """What the open stages stream in at least: each component's common weights and two
@@ -1016,7 +1017,12 @@ class Weights:
             unbind(region)
             region.views.clear()
             if region.indexed is not None:
+                self._indexed_h2d += region.indexed.h2d_bytes
+                self._indexed_copy_ns += region.indexed.copy_ns
+                self._indexed_read += region.indexed.read_bytes
+                self._indexed_peak = max(self._indexed_peak, region.indexed.peak_host_bytes)
                 region.indexed.close()
+                region.indexed = None
         component.mapping = None
         component.shared.clear()
         if component.filling is not None:
@@ -1049,7 +1055,10 @@ class Weights:
             for region in component.regions
             if region.indexed is not None
         ]
-        copied = device.host_copy_bytes + device.disk_copy_bytes + sum(r.h2d_bytes for r in indexed)
+        copied = (
+            device.host_copy_bytes + device.disk_copy_bytes + self._indexed_h2d
+            + sum(r.h2d_bytes for r in indexed)
+        )
         reserved = -1 if self.host_only else int(self.torch.cuda.memory_reserved(self.device))
         # This process's own count (per-process NVML only refines the context in it); an
         # unmeasured context counts nothing rather than hiding the rest.
@@ -1058,11 +1067,16 @@ class Weights:
             if reserved >= 0
             else -1
         )
-        copy_ns = device.host_copy_ns + device.disk_copy_ns + sum(r.copy_ns for r in indexed)
-        if indexed:
-            self.modes["selected_embedding_read_bytes"] = str(sum(r.read_bytes for r in indexed))
+        copy_ns = (
+            device.host_copy_ns + device.disk_copy_ns + self._indexed_copy_ns
+            + sum(r.copy_ns for r in indexed)
+        )
+        if indexed or self._indexed_read:
+            self.modes["selected_embedding_read_bytes"] = str(
+                self._indexed_read + sum(r.read_bytes for r in indexed)
+            )
             self.modes["selected_embedding_host_peak_bytes"] = str(
-                max(r.peak_host_bytes for r in indexed)
+                max(self._indexed_peak, max((r.peak_host_bytes for r in indexed), default=0))
             )
         return PlaneFacts(
             budget_bytes=device.budget,
@@ -2070,10 +2084,10 @@ class PlaneBackend:
                         if (
                             row.name == "model.language_model.embed_tokens.weight"
                             and self._route(group[0]) == "verbatim"
-                        and row.dtype == "bf16"
-                        and type(module) is self.torch.nn.Embedding
-                        and "forward" not in module.__dict__
-                        and module.max_norm is None
+                            and row.dtype == "bf16"
+                            and type(module) is self.torch.nn.Embedding
+                            and "forward" not in module.__dict__
+                            and module.max_norm is None
                         ):
                             indexed[group[0]] = SelectedRows(
                                 cast("tuple[int, int]", tuple(row.shape)),
@@ -2930,6 +2944,11 @@ class WeightResidency:
                     for key, (row, tag, c) in opened.items()
                     if c.last_passes != 1 or row.repeats.get(tag, 0) > 1
                 },
+                single_slot={
+                    key
+                    for key, component in components.items()
+                    if any(region.selected_rows for region in component.blocks)
+                },
             )
 
         # Every component keeps its grain while the budget holds each one's floor at it: a
@@ -2960,7 +2979,7 @@ class WeightResidency:
             if selected:
                 for region in selected:
                     region.selected_rows = True
-                return self._plan(budget, resume, asked)
+                return self._plan(min(budget, weights.driver_budget(method)), resume, asked)
             if not asked and weights.room is not None and weights.cap >= 0:
                 # Never refused for size while the GPU has room to give: the owner makes it
                 # (idle tenants leave, held weights nobody reads are revoked) and raises the cap.
