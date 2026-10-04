@@ -45,3 +45,31 @@ accounting: the original complete native forward keeps global normalization and
 attention. It needs a CPU target and host admission before entry, plus a bounded
 latent transfer for a GPU-produced input. Those integration gates still need
 review; no failed GPU decoder may be retried on CPU as whole-forward recovery.
+
+## Precision and the minimal integration gate
+
+The actual SDXL2.4 source selects BF16 when its input is CUDA and native CUDA BF16
+is available; its authored CPU branch selects FP32. BF16 CPU is a diagnostic
+comparison to the GPU path, not a product requirement that overrides that CPU
+branch. Root authorized one separate FP32 CPU operation only after the admitted
+BF16 CPU forward finishes. It will use the same saved latent/source/full shape
+with independent admission and quality receipts, never replay the BF16 operation.
+The laptop reports AVX2; native BF16 CPU latency must be measured honestly.
+
+For integration, use the existing whole-host binding mechanism before the first
+VAE forward, rather than copying a GPU module. Weights._bind_host already maps
+the pinned tier and binds each region through _HostSpan; bind honors the module's
+requested dtype. A mixed GPU/CPU slot still needs a reviewed stage target that
+quiesces its own GPU weight work, binds the same component's CPU source views,
+and prevents GPU region hooks from running during that CPU forward. Restore
+unbound/device views for the next stage afterward. Preserve author hooks and
+serialized model-slot ownership; do not mutate other constructions or destroy
+their allocations.
+
+Admission must cover CPU source/decoded weights, activations and native workspace
+under the actual machine/container host budget before entry. The current proof's
+16 GiB allowance and available-memory checks only prove its local snapshot; they
+are not that reserved machine admission contract. Transfer only the required
+latent to the selected CPU target, retain the authored CPU upcast, and invoke
+native decode exactly once. A CPU failure retires that operation; it does not
+trigger another whole forward on either device.
