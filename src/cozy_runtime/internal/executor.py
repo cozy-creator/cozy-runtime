@@ -2515,6 +2515,7 @@ class Executor:
                     host_tier=command.host_tier,
                     pinned_bytes=command.pinned_bytes,
                     sealed_tiers=command.sealed_tiers,
+                    model_sources=command.model_sources,
                     cap_bytes=command.cap_bytes,
                     rank_caps=command.rank_caps,
                 ),
