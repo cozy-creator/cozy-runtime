@@ -42,7 +42,11 @@ from cozy_runtime.internal.weights import (  # noqa: E402
 from cozy_runtime.internal.weights_sink import weights_transaction_id  # noqa: E402
 
 pytestmark = pytest.mark.skipif(not plane.available(), reason="a TensorFS with the weight plane")
-on_card = pytest.mark.skipif(not accel.present(torch, "cuda"), reason="a CUDA card")
+# These tests fill the card to its last megabytes: never on one a desktop is drawn on.
+on_card = pytest.mark.skipif(
+    not accel.present(torch, "cuda") or accel.drives_display(0),
+    reason="a CUDA card that drives no display",
+)
 
 HIDDEN = 2048
 BLOCKS = 8
@@ -1427,6 +1431,7 @@ def test_an_op_outside_every_block_runs_again_after_weights_leave(card: Any) -> 
     reference = run(model, x, passes=1)
     retries = weights.facts().oom_retries
     model.residency.admit("run", ("stack",))
+    ballast = scratch = None  # a refusal below is the failure reported, not an unbound name
     try:
         with weights.recovering(), torch.inference_mode():
             torch.cuda.empty_cache()

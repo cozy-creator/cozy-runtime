@@ -334,8 +334,10 @@ def device_capability(device: str) -> int:
 
 
 def drives_display(index: int) -> bool:
-    """Whether CUDA device `index` of this process drives a display (NVML's display mode or
-    active state); False where NVML cannot say."""
+    """Whether a display is initialized on CUDA device `index` of this process (NVML's display
+    active state: a display server holds memory for a screen there); False where NVML cannot
+    say. A connector with a display attached (NVML's display mode: a dummy plug on many
+    datacenter GPUs) is not one."""
     entries = [e.strip() for e in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")]
     entries = [e for e in entries if e]
     library = _nvml_library()
@@ -343,11 +345,9 @@ def drives_display(index: int) -> bool:
     handle = _nvml_handle(library, entry) if library is not None else None
     if library is None or handle is None:
         return False
-    for query in (library.nvmlDeviceGetDisplayMode, library.nvmlDeviceGetDisplayActive):
-        state = ctypes.c_int()
-        if query(handle, ctypes.byref(state)) == _NVML_SUCCESS and state.value == 1:
-            return True
-    return False
+    state = ctypes.c_int()
+    active = library.nvmlDeviceGetDisplayActive(handle, ctypes.byref(state))
+    return bool(active == _NVML_SUCCESS and state.value == 1)
 
 
 def _device_memory_of(free: int, total: int) -> DeviceMemory:
