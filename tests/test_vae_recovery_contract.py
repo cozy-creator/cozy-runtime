@@ -1,0 +1,160 @@
+"""Real native VAE/subclass CPU decodes; only device allocator probes are replaced."""
+
+from __future__ import annotations
+
+import threading
+from types import SimpleNamespace
+
+import pytest
+import torch
+from diffusers import AutoencoderKL
+from diffusers.configuration_utils import FrozenDict
+
+from cozy_runtime.internal import accel, weights
+from cozy_runtime.internal.weights import ResidencyRefusal
+
+
+class StatefulVAE(AutoencoderKL):
+    def __init__(self, failure):
+        torch.nn.Module.__init__(self)
+        self._internal_dict = FrozenDict({"block_out_channels": [1, 2, 3, 4]})
+        self.use_tiling = False
+        self.calls = 0
+        self.failure = failure
+
+    def decode(self, z, *args, **kwargs):
+        self.calls += 1
+        z.add_(1)
+        torch.rand(1)
+        if self.failure:
+            raise self.failure
+        return z
+
+
+def residency(monkeypatch, vae, *, peak=0, free=1 << 30):
+    owner = SimpleNamespace(
+        torch=torch,
+        kind="cuda",
+        adaptive=set(),
+        activation={"decode": peak},
+        cap=free,
+        modes={},
+        poisoned="",
+        residencies=set(),
+        host_only=False,
+        _recovery_local=threading.local(),
+    )
+    owner.recovery_refusal = lambda detail: weights.Weights.recovery_refusal(owner, detail)
+    row = weights.WeightResidency.__new__(weights.WeightResidency)
+    row.weights, row.active, row.poisoned = owner, ("decode", ("vae",)), ""
+    row.components = {"vae": SimpleNamespace(root=vae)}
+    row.room = lambda *_: (free, 0)
+    row._room_for_decode = lambda _name, available, _evictable, _need: available
+    owner.residencies.add(row)
+    monkeypatch.setattr(accel, "allocated", lambda *_: 0)
+    monkeypatch.setattr(accel, "peak_allocated", lambda *_: 0)
+    monkeypatch.setattr(accel, "reset_peak", lambda *_: None)
+    monkeypatch.setattr(accel, "release_cached", lambda *_: None)
+    monkeypatch.setattr(weights, "inexact", lambda: None)
+    return row, owner
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 16.00 MiB"),
+        ResidencyRefusal(weights.INDIVISIBLE, "aten.mm operation needs more room"),
+    ],
+)
+def test_uncontracted_decode_failure_keeps_effects_once_and_retires(monkeypatch, failure):
+    torch.set_num_threads(2)
+    vae = StatefulVAE(failure)
+    row, owner = residency(monkeypatch, vae)
+    z = torch.zeros(1, 4, 128, 128)
+    torch.manual_seed(324)
+    torch.rand(1)
+    expected_random = torch.get_rng_state().clone()
+    torch.manual_seed(324)
+    with pytest.raises(ResidencyRefusal, match="whole-decode replay") as caught:
+        row._decode("vae", vae.decode)(z)
+    assert caught.value.code == "recovery_contract_unavailable"
+    assert vae.calls == 1 and torch.equal(z, torch.ones_like(z))
+    assert torch.equal(torch.get_rng_state(), expected_random)
+    assert owner.poisoned and row.poisoned
+    with pytest.raises(ResidencyRefusal) as next_call, weights.Weights.recovering(owner):
+        pytest.fail("a retained poisoned executor must not enter its next handler")
+    assert next_call.value.code == "residency_poisoned"
+
+
+def test_successful_subclass_still_decodes_once(monkeypatch):
+    vae = StatefulVAE(None)
+    row, owner = residency(monkeypatch, vae)
+    z = torch.zeros(1, 4, 16, 16)
+    out = row._decode("vae", vae.decode)(z)
+    assert vae.calls == 1 and out is z and not owner.poisoned
+
+
+def test_noncapacity_error_is_not_hidden_or_replayed(monkeypatch):
+    vae = StatefulVAE(ValueError("authored refusal"))
+    row, _owner = residency(monkeypatch, vae)
+    with pytest.raises(ValueError, match="authored refusal"):
+        row._decode("vae", vae.decode)(torch.zeros(1, 4, 16, 16))
+    assert vae.calls == 1
+
+
+def test_native_decode_matches_baseline_and_hook_runs_once(monkeypatch):
+    torch.set_num_threads(2)
+    vae = AutoencoderKL(
+        down_block_types=("DownEncoderBlock2D",) * 2,
+        up_block_types=("UpDecoderBlock2D",) * 2,
+        block_out_channels=(32, 64),
+        layers_per_block=1,
+        sample_size=32,
+        norm_num_groups=8,
+        latent_channels=4,
+    )
+    z = torch.randn(1, 4, 16, 16)
+    with torch.inference_mode():
+        expected = vae.decode(z).sample
+    calls = []
+    vae.decoder.register_forward_pre_hook(lambda *_: calls.append(True))
+    row, owner = residency(monkeypatch, vae)
+    with torch.inference_mode():
+        actual = row._decode("vae", vae.decode)(z).sample
+    assert calls == [True] and not owner.poisoned
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_native_hook_oom_is_not_replayed(monkeypatch):
+    torch.set_num_threads(2)
+    vae = AutoencoderKL(
+        down_block_types=("DownEncoderBlock2D",) * 2,
+        up_block_types=("UpDecoderBlock2D",) * 2,
+        block_out_channels=(32, 64),
+        layers_per_block=1,
+        sample_size=32,
+        norm_num_groups=8,
+        latent_channels=4,
+    )
+    calls = []
+
+    def fail(*_):
+        calls.append(True)
+        raise torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 16.00 MiB")
+
+    vae.decoder.register_forward_pre_hook(fail)
+    row, owner = residency(monkeypatch, vae)
+    with pytest.raises(ResidencyRefusal) as caught:
+        row._decode("vae", vae.decode)(torch.zeros(1, 4, 16, 16))
+    assert caught.value.code == "recovery_contract_unavailable"
+    assert calls == [True] and owner.poisoned
+
+
+def test_measured_tile_is_selected_before_first_decode(monkeypatch):
+    vae = StatefulVAE(None)
+    row, owner = residency(monkeypatch, vae, peak=2 << 30, free=512 << 20)
+    shape = (1, 4, 128, 128)
+    result = row._decode("vae", vae.decode)(torch.zeros(shape))
+    assert result.shape == shape and vae.calls == 1 and not owner.poisoned
+    assert vae.use_tiling and owner.modes["vae.decode"].startswith("tiled ")
+    assert vae.tile_sample_min_size <= 512
