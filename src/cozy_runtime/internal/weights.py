@@ -2901,20 +2901,26 @@ class WeightResidency:
             versions = _versions(args, kwargs)
             # a library's refusal is answered once: by its op where ops recover one by one
             refused = weights.grouped or region.mutates is not False
-            grown = False
+            refusals = 0
             while True:
                 stream = weights.stream()
                 try:
                     lease = self._acquire(component, region.index, stream)
                 except self._capacity:
-                    # the plane's own budget first, while the device has room for it
-                    grown = not grown and weights.grow(region.span)
-                    if not grown:
-                        self._make_room(
-                            region.span,
-                            {component.key: region.index},
-                            f"{component.name}.{region.path}",
-                        )
+                    # The plane refused the region for its own plan: grow its budget into
+                    # the device's free room, then plan the stage afresh, and only then
+                    # unmap (which must give memory back, or the op cannot run).
+                    refusals += 1
+                    if refusals == 1 and weights.grow(region.span):
+                        continue
+                    if refusals <= 2:
+                        self._replan({component.key: region.index})
+                        continue
+                    self._make_room(
+                        region.span,
+                        {component.key: region.index},
+                        f"{component.name}.{region.path}",
+                    )
                     continue
                 need = 0
                 try:
@@ -2997,6 +3003,15 @@ class WeightResidency:
                     {component.key: region.index},
                     f"{op} ({component.name}.{region.path})",
                 )
+
+    def _replan(self, resume: Mapping[str, int]) -> None:
+        """Plan the open stages again in the budget they have: their cursors start over from
+        the block that runs again (`resume`)."""
+        opened = [component for _, _, component in self.weights.opened().values()]
+        for component in opened:
+            close_cursor(component)
+        if opened:
+            self._place(self.weights.applied, resume)
 
     def _make_room(self, need: int, resume: Mapping[str, int] = {}, op: str = "") -> None:
         """Activations first: unmap `need` bytes of weights, idle ones first, then re-place the

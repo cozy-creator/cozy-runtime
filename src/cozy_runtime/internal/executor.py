@@ -2784,6 +2784,9 @@ class Executor:
             if not granted.get("ok"):
                 return granted
         if self.weights is not None:
+            # A new request plans its stages afresh: a repeating stage the last one left open
+            # (its cursor at that request's end) never carries over. Its weights stay mapped.
+            self._unpark()
             self.weights.seed_activations(command.activation_bytes)
             if not isinstance(command.device_weights, UnsetType):
                 self._device_weights(command.device_weights)
