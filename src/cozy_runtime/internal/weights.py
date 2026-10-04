@@ -232,6 +232,8 @@ class Component:
     cursor: Cursor | None = None
     #: the common region's lease for the running stage
     lease: Lease | None = None
+    #: Idle in its open stage, with its common lease and regions released for activations.
+    spared: bool = False
     #: region indexes wanted resident for the running stage
     resident: tuple[int, ...] = ()
     #: block region index -> its position in `blocks` (the policy's block number)
@@ -321,6 +323,7 @@ class Weights:
         self.world = 1
         #: blocks in their forward now (their leases pin their own weights)
         self.running = 0
+        self.executing: list[str] = []
         #: a read outside a module's forward is being mapped (`reading`)
         self.mapping = False
         #: a group's stage whose activations are not measured yet runs its first pass at the
@@ -522,7 +525,11 @@ class Weights:
     def window(self) -> int:
         """What the open stages stream in at least: each component's common weights and two
         of its largest regions (one in use, the next arriving), at its current grain."""
-        return sum(c.planned.common + 2 * c.planned.largest for _, _, c in self.opened().values())
+        return sum(
+            c.planned.common + 2 * c.planned.largest
+            for _, _, c in self.opened().values()
+            if not c.spared
+        )
 
     def grow(self, need: int) -> bool:
         """The plane refused a region for its own budget while the device has room: map
@@ -572,6 +579,7 @@ class Weights:
         return sum(
             weight_policy.floor(replace(component.planned, fine=None))
             for _, _, component in self.opened().values()
+            if not component.spared
         )
 
     @contextmanager
@@ -616,7 +624,14 @@ class Weights:
                 f"{op or 'an allocation'} needs {need} B of device memory at once beside the "
                 "weights it reads, and the GPU cannot give that with them mapped",
             )
-        self.progressed(before, need, op)
+        try:
+            self.progressed(before, need, op)
+        except ResidencyRefusal:
+            if not self.running or not self.open:
+                raise
+            if not self.open[-1][0]._spare_idle(read):
+                raise
+            self.progressed(before, need, op)
 
     def allocatable(self) -> int:
         """Device bytes torch can allocate now: its headroom plus its own idle cache."""
@@ -2835,7 +2850,7 @@ class WeightResidency:
         blocks are acquired on demand. A component whose block floor does not fit moves to
         the sub-block grain first."""
         weights = self.weights
-        opened = weights.opened()
+        opened = {key: row for key, row in weights.opened().items() if not row[2].spared}
         components = {key: component for key, (_, _, component) in opened.items()}
         method = weights.open[-1][1]
         arriving: list[Ticket] = []
@@ -3044,6 +3059,8 @@ class WeightResidency:
                 weights.hold_host()
             if weights.growing and component.passes == 2 > passes:
                 self._grow()
+            if component.spared:
+                self._unspare(component)
             # A library's refusal is answered by its op, never by replaying the forward.
             refused = True
             refusals = 0
@@ -3072,9 +3089,11 @@ class WeightResidency:
                     try:
                         bind(torch, region, lease, refill=True)
                         weights.running += 1
+                        weights.executing.append(component.key)
                         try:
                             return forward(*args, **kwargs)
                         finally:
+                            weights.executing.pop()
                             weights.running -= 1
                     except _Stale:
                         stale = True
@@ -3173,6 +3192,69 @@ class WeightResidency:
         if opened:
             self._place(weights.applied, resume)
         weights.progressed(before, need, op or f"{method}()")
+
+    def _spare_idle(self, protected: Sequence[tuple[Region, int | None]]) -> bool:
+        """Release idle stage components while the failed op keeps its current block leased.
+
+        Never close or replan an executing component's cursor. An operand-backed region
+        keeps its component too, including one acquired by `Weights.reading`.
+        """
+        weights = self.weights
+        guarded = {id(region) for region, _ in protected}
+        busy = set(weights.executing)
+        idle = [
+            component
+            for key, (_, _, component) in weights.opened().items()
+            if key not in busy
+            and not component.spared
+            and not any(id(region) in guarded for region in component.regions)
+        ]
+        if weights.host_only or not idle:
+            return False
+        weights.quiesce()
+        before = max(plane.stats(weights.plane).device(weights.index).committed, 0)
+        for component in idle:
+            close_cursor(component)
+            if component.lease is not None:
+                component.lease.release()
+                component.lease = None
+            for region in component.regions:
+                unbind(region)
+            with suppress(plane.error("LeaseViolation")):
+                weights.plane.drop(
+                    component.ws, weights.index, [region.index for region in component.regions]
+                )
+            component.resident = ()
+            component.spared = True
+        weights.drain()
+        # Dropped bytes can remain an idle plane cache. Trim that cache without replacing
+        # any running cursor or its ring; its live leases remain an absolute lower bound.
+        device = plane.stats(weights.plane).device(weights.index)
+        target = max(
+            min(weights.applied, max(weights.window(), weights.floor())),
+            device.leased_bytes + device.held_bytes,
+        )
+        weights._apply(target)
+        after = max(plane.stats(weights.plane).device(weights.index).committed, 0)
+        if after >= before:
+            return False
+        weights.oom_retries += 1
+        weights.last_retry = None
+        return True
+
+    def _unspare(self, component: Component) -> None:
+        """An idle component is needed again: acquire its common region before its block."""
+        weights = self.weights
+        component.spared = False
+        if component.common is not None and component.lease is None:
+            component.lease = self._acquire_common(
+                weights.open[-1][1] if weights.open else "",
+                component,
+                weights.applied,
+                weights.stream(),
+            )
+            bind(weights.torch, component.common, component.lease)
+            component.resident = (component.common.index,)
 
     def _observe(self, component: Component, index: int) -> None:
         """Count passes and learn the blocks' execution order from a stage's first pass."""
@@ -3303,6 +3385,7 @@ class WeightResidency:
             if component.lease is not None:
                 component.lease.release()
                 component.lease = None
+            component.spared = False
             if not weights.host_only:
                 weights.plane.prioritise(component.ws, weights.index, None, priority=idle)
         if failure is not None:
