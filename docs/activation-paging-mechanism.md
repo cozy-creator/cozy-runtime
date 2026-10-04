@@ -148,3 +148,15 @@ cozy-machine PID 1268/birth 33267283, absent from compute-apps. Attribute the
 state before claiming full physical restoration. No reclaim, reset or process
 kill was performed. Evidence: activation-probe-1/result, RESOURCE-SUMMARY.json,
 physical-after-process.json, post-stability.json and post-device-clients.json.
+
+A source-backed inference now explains the exact delta. The actual Open Kernel
+Module is 580.65.06; its [UVM physical allocator](https://raw.githubusercontent.com/NVIDIA/open-gpu-kernel-modules/580.65.06/kernel-open/nvidia-uvm/uvm_pmm_gpu.c)
+uses 2 MiB root chunks and batches non-pinned user allocations by 2^order, leaving
+unused chunks on a per-GPU free list. Actual read-only module parameters are
+order=6 and global_oversubscription=1. One first batch can therefore allocate
+128 MiB; freeing the used 2 MiB chunk leaves 63 cached chunks, exactly 126 MiB.
+The source's free path releases one available root chunk, and its device teardown
+releases remaining free roots. Classification: PLAUSIBLE SOURCE+GPU-consistent
+UVM batch cache. No PMM trace or physical eviction test ran, so actual cache
+reclamation and full physical restoration remain unqualified. Module settings
+were only read. Evidence: uvm-module-readonly.json and UVM-CACHE-INFERENCE.json.
