@@ -31,11 +31,14 @@ pytestmark = [
 
 
 class Custody:
-    """cozy-machine's `ResidentCustody` in miniature: layout -> (regions, fds), and one lease
-    socket per offer kept or attachment, whose other end the executor holds."""
+    """cozy-machine's `ResidentCustody` in miniature: (layout, variant) -> (regions, fds), and
+    one lease socket per offer kept or attachment, whose other end the executor holds. An ask
+    for variant "*" is answered with the layout's baked variant offered last."""
 
-    def __init__(self, layout_says: str = "") -> None:
-        self.held: dict[str, tuple[list[dict[str, Any]], list[int]]] = {}
+    def __init__(self, layout_says: str = "", variants: bool = True) -> None:
+        self.held: dict[tuple[str, str], tuple[list[dict[str, Any]], list[int]]] = {}
+        #: an older machine keys holdings by layout alone and never says `variants`
+        self.variants = variants
         self.leases: list[socket.socket] = []
         #: a holder that names another layout than the one it was asked for
         self.layout_says = layout_says
@@ -61,18 +64,25 @@ class Custody:
             assert frame["kind"] == "device_tier", frame
             fds = [channel.recv_shared() for _ in range(frame.get("descriptors", 0))]
             answer: dict[str, Any] = {"event": "answer", "seq": frame["seq"], "ok": True}
+            variant = frame.get("variant", "") if self.variants else ""
+            if self.variants:
+                answer["variants"] = True
+            if variant == "*":
+                baked = [v for layout, v in self.held if layout == frame["layout"] and v]
+                variant = baked[-1] if baked else "*"
+            key = (frame["layout"], variant)
             if frame["offer"]:
-                if frame["layout"] in self.held:
+                if key in self.held:
                     answer["duplicate"] = True
                     for fd in fds:
                         os.close(fd)
                     channel.send(answer)
                 else:
-                    self.held[frame["layout"]] = (frame["regions"], fds)
+                    self.held[key] = (frame["regions"], fds)
                     channel.send({**answer, "generation": 1, "lease": True})
                     self.lease(channel)
                 continue
-            held = self.held.get(frame["layout"])
+            held = self.held.get(key)
             if held is None:
                 channel.send(answer)
                 continue
@@ -87,10 +97,14 @@ class Custody:
                     "descriptors": len(kept),
                     "lease": True,
                 }
+                | ({"variant": variant} if variant else {})
             )
             for fd in kept:
                 channel.send_shared(fd)
             self.lease(channel)
+
+    def regions(self, layout: str, variant: str) -> list[int]:
+        return [row["region"] for row in self.held.get((layout, variant), ([], []))[0]]
 
     def close(self) -> None:
         for _, fds in self.held.values():

@@ -185,6 +185,14 @@ class Region:
     baked: bool = False
     #: what each bake added (`_bake_key`), while `baked`
     baked_with: list[tuple[object, ...]] = field(default_factory=list)
+    #: while `baked`: the digest naming those deltas to other executors (`_variant`); "" when
+    #: it cannot be named, and the bytes then stay this process's own
+    variant: str = ""
+    #: the variant of baked bytes mapped from the machine's custody, until the first forward
+    #: that reads them says whether they are what it would bake
+    attached: str = ""
+    #: the weight set whose plane bytes a tensor views (`Weights.content`)
+    locate: Callable[[Tensor], str | None] | None = None
     #: a bake failed part way: the resident bytes must refill before any use
     dirty: bool = False
 
@@ -336,6 +344,8 @@ class Weights:
         self.context_bytes = -1
         #: the machine's custody of GPU weights (`weights.attach/1`); None: every region private
         self.sharing: DeviceTiers | None = None
+        #: the machine keeps baked variants beside stored bytes (its answers say so)
+        self.variants = False
         #: how LoRA'd linears are served: baked into their weights (owner, 2026-10-04: the
         #: default for every LoRA on every lane), or their update computed every forward (a
         #: request's `lora_mode: per_step`, `set_lora`)
@@ -728,8 +738,7 @@ class Weights:
             if component is not None and 0 <= int(index) < len(component.regions):
                 region = component.regions[int(index)]
                 unbind(region)
-                # it refills unmodified
-                region.baked, region.baked_with, region.dirty = False, [], False
+                _unbaked(region)
 
     def measure_context(self) -> None:
         """What the driver charges this process beyond torch's segments and the plane's maps:
@@ -767,14 +776,39 @@ class Weights:
     def _uuid(self) -> str:
         return dict(self.plane.devices).get(self.index, "")
 
+    def content(self, tensor: Tensor) -> str | None:
+        """The layout digest of the weight set whose plane bytes `tensor` views: what names
+        its content to another executor. None for a decoded or computed tensor."""
+        if not getattr(tensor, "is_cuda", False) or type(tensor).__name__ == "Unbound":
+            return None
+        pointer = int(tensor.data_ptr())
+        for component in self.components.values():
+            for region in component.regions:
+                if (
+                    region.bound is not None
+                    and region.bound <= pointer < region.bound + region.span
+                ):
+                    return str(component.ws.digest)
+        return None
+
     def attach(self, component: Component) -> int:
         """Map the regions the machine keeps for exactly this layout, read-only and without a
         copy. A region that cannot attach fills privately, as without a machine. Returns the
         bytes attached."""
         if self.sharing is None or not self._shares():
             return 0
-        answer = self.sharing.ask(component.key, component.ws.digest, self._uuid())
-        if answer is None:
+        attached = self._attach(component, "")
+        if any(region.bake for region in component.regions):
+            # Baked bytes are a variant of the layout: the machine names the one it holds, and
+            # the first forward that reads a region says whether it is its own (`_bake`).
+            attached += self._attach(component, "*")
+        return attached
+
+    def _attach(self, component: Component, variant: str) -> int:
+        assert self.sharing is not None
+        answer = self.sharing.ask(component.key, component.ws.digest, self._uuid(), variant)
+        self.variants = self.variants or answer.variants
+        if not answer.held:
             return 0
         attached, at = 0, 0
         try:
@@ -783,8 +817,12 @@ class Weights:
                 at += len(row.chunks)
                 if not 0 <= row.region < len(component.regions):
                     continue
-                if component.regions[row.region].bake:
-                    continue  # its bytes take deltas here: a private copy, never a shared one
+                region = component.regions[row.region]
+                if region.bake != bool(variant) or row.region in component.shared:
+                    continue  # stored bytes where a bake is due, or baked ones where none is
+                graph = variant and not any(bake.hooks for bake in region.bakes)
+                if graph and _variant(region, list(map(_bake_key, region.bakes))) != answer.variant:
+                    continue  # only a prepared graph bakes here, always the same: known now
                 try:
                     # The plane maps only when the holder's layout is this weight set's.
                     self.plane.attach_device(
@@ -799,7 +837,10 @@ class Weights:
                 except plane.error("PlaneError"):
                     continue
                 component.shared.add(row.region)
-                attached += component.regions[row.region].span
+                attached += region.span
+                if variant:
+                    region.baked, region.baked_with, region.dirty = True, [], False
+                    region.attached = answer.variant
         finally:
             for fd in answer.fds:
                 os.close(fd)
@@ -817,12 +858,16 @@ class Weights:
             return 0
         self.quiesce()
         kept = 0
-        for component in list(self.components.values() if components is None else components):
-            # Baked bytes are this process's variant, never the layout's stored bytes.
-            plain = [region.index for region in component.regions if not region.baked]
-            if not plain:
+        offers = [
+            (component, variant, indexes)
+            for component in list(self.components.values() if components is None else components)
+            for variant, indexes in _variants(component).items()
+        ]
+        # Stored bytes first: their answers say whether the machine keeps variants at all.
+        for component, variant, indexes in sorted(offers, key=lambda offer: offer[1] != ""):
+            if variant and not self.variants:
                 continue
-            exported = self.plane.export_device(component.ws, self.index, plain)
+            exported = self.plane.export_device(component.ws, self.index, indexes)
             if not exported:
                 continue
             regions = tuple(
@@ -834,11 +879,12 @@ class Weights:
             component.shared.update(indexes)
             try:
                 answer = self.sharing.offer(
-                    component.key, component.ws.digest, self._uuid(), regions, fds
+                    component.key, component.ws.digest, self._uuid(), regions, fds, variant
                 )
             finally:
                 for fd in fds:
                     os.close(fd)
+            self.variants = self.variants or answer.variants
             if answer.ok and not answer.duplicate:
                 if answer.lease_fd >= 0:
                     component.leases.append(answer.lease_fd)
@@ -865,21 +911,26 @@ class Weights:
             dropped = []
             for region in component.regions:
                 region.bake = _bakes_here(self, component, region)
-                if region.bakes and region.baked != region.bake and region.bound is not None:
+                held = region.bound is not None or region.index in component.shared
+                if region.bakes and region.baked != region.bake and held:
                     unbind(region)
                     dropped.append(region.index)
                 if not (region.baked and region.bake):
                     region.baked, region.baked_with = False, []
             if dropped:
+                self._release_shared(component, [i for i in dropped if i in component.shared])
                 self.plane.drop(component.ws, self.index, dropped)
 
     def refill(self, component: Component, region: Region) -> None:
         """Drop a region's resident bytes (it is unleased): its next placement copies the
-        unmodified host bytes again."""
+        unmodified host bytes again. Bytes mapped from the machine's custody are let go."""
         unbind(region)
         self.quiesce()
-        self.plane.drop(component.ws, self.index, [region.index])
-        region.baked, region.baked_with, region.dirty = False, [], False
+        if region.index in component.shared:
+            self._release_shared(component, [region.index])
+        else:
+            self.plane.drop(component.ws, self.index, [region.index])
+            _unbaked(region)
 
     def revoke(self, layout: str) -> int:
         """Stop using the machine's regions of `layout`: queued work finishes, then they are
@@ -897,6 +948,7 @@ class Weights:
         freed = int(self.plane.drop(component.ws, self.index, list(indexes)))
         for index in indexes:
             unbind(component.regions[index])
+            _unbaked(component.regions[index])
             component.shared.discard(index)
         if not component.shared:
             _end_leases(component)
@@ -1092,6 +1144,7 @@ class Weights:
             sealed_bytes=held.host.sealed_bytes,
             lora_baked=int(BAKED[0]),
             lora_bake_ms=round(BAKED[1], 1),
+            lora_attached=int(BAKED[2]),
             late=sum(row.late for row in stages),
             stall_ns=sum(row.stall_ns for row in stages),
             misses=device.misses,
@@ -1351,6 +1404,11 @@ def _pointers(operands: Sequence[object]) -> Iterator[int]:
                 yield int(item.data_ptr())
 
 
+def _unbaked(region: Region) -> None:
+    """The region's bytes went: the next ones are the stored bytes, unmodified."""
+    region.baked, region.baked_with, region.dirty, region.attached = False, [], False, ""
+
+
 def unbind(region: Region) -> None:
     """Put the stand-ins back, keeping a dtype the component was converted to meanwhile."""
     for table, name, standin in region.unbound:
@@ -1409,6 +1467,15 @@ def _bake(
     read sees the bytes as they are."""
     keys = [_bake_key(bake) for bake in region.bakes]
     some = region.bake and any(key is not None for row in keys for key in row)
+    if home and region.attached:
+        # Baked bytes from the machine's custody: this forward's own when its bake would be
+        # the same variant, else stale like a local bake it does not want. A placement ahead
+        # of its forward (no hook serves yet) leaves the question to that forward.
+        if some and _variant(region, keys) == region.attached:
+            region.baked_with, region.variant, region.attached = keys, region.attached, ""
+            BAKED[2] += len(region.bakes)
+        elif refill:
+            raise _Stale(region.index)
     if not home:
         if some:
             BAKED[0] += _apply(torch, region, parts, keys)
@@ -1424,6 +1491,7 @@ def _bake(
                 torch.cuda.synchronize(stored_device(parts[0]))
             BAKED[1] += (time.perf_counter() - began) * 1000
             region.baked, region.baked_with, region.dirty = True, keys, False
+            region.variant = _variant(region, keys)
         baked = region.baked and keys == region.baked_with
     for bake, (graph, *hooks) in zip(region.bakes, keys, strict=True):
         if bake.layer is not None:
@@ -1432,9 +1500,49 @@ def _bake(
             hook._cozy_baked = baked and key is not None
 
 
-#: This process's bakes (one plane per process): weights baked, and the milliseconds its
-#: resident bakes took (a streamed copy's bake is not timed: that would stall its stream).
-BAKED: list[float] = [0, 0.0]
+#: This process's bakes (one plane per process): weights baked, the milliseconds its resident
+#: bakes took (a streamed copy's bake is not timed: that would stall its stream), and weights
+#: whose baked bytes came from the machine's custody.
+BAKED: list[float] = [0, 0.0, 0]
+
+
+def _variant(region: Region, keys: list[tuple[object, ...]]) -> str:
+    """The digest that names what baking `keys` into the region adds, the same in every
+    executor: a prepared graph's factors are the layout's own weights, so their scales name
+    it; a hook's are named by the weight set its factors are bytes of (`Weights.content`) and
+    its scale. "" when a hook's factors are not plane bytes: such a bake is never shared."""
+    rows: set[tuple[str, str]] = set()
+    for bake, (graph, *hooks) in zip(region.bakes, keys, strict=True):
+        if graph is not None:
+            # an adapter's factors are `<site>.lora_A.<adapter>.weight`: its name and scale
+            rows.update(
+                ("graph:" + region.weights[a].row.name.rpartition(".lora_A.")[2], repr(scale))
+                for a, _, scale in bake.factors
+            )
+        for hook, key in zip(bake.hooks, hooks, strict=True):
+            got = hook.lora_factors() if key is not None else None
+            if got is None:
+                continue
+            locate = region.locate
+            content = {locate(got[1]), locate(got[2])} if locate is not None else {None}
+            (named,) = content if len(content) == 1 else (None,)
+            if named is None:
+                return ""
+            rows.add((named, repr(float(got[3]))))
+    return canonical.digest([lora_bake.VARIANT, sorted(rows)]) if rows else ""
+
+
+def _variants(component: Component) -> dict[str, list[int]]:
+    """The component's regions the machine may keep, by what their bytes hold: "" for stored
+    bytes, a variant for baked ones it can name. Bytes mapped from custody but not yet read
+    are not this process's to offer."""
+    found: dict[str, list[int]] = {}
+    for region in component.regions:
+        private = region.bake and not region.baked  # its next forward bakes into these bytes
+        if region.dirty or region.attached or private or (region.baked and not region.variant):
+            continue
+        found.setdefault(region.variant if region.baked else "", []).append(region.index)
+    return found
 
 
 def _apply(
@@ -2154,6 +2262,7 @@ class PlaneBackend:
                 setattr(standin, "origin", (weights, component, region, table, attr))  # noqa: B010
             region.bakes = _lora_layers(root, region)
             region.bake = _bakes_here(weights, component, region)
+            region.locate = weights.content
         if not fine:
             weights.attach(component)
         return component
@@ -2162,11 +2271,13 @@ class PlaneBackend:
 @dataclass(frozen=True, slots=True)
 class DeviceTiers:
     """The machine's custody of GPU regions (`weights.attach/1`): `ask` returns the regions it
-    keeps for exactly (weight set, layout, GPU) and their fds, or None; `offer` hands it the
-    regions this process filled and exported, with their fds."""
+    keeps for exactly (weight set, layout, GPU, variant) and their fds, `held` False when it
+    keeps none; `offer` hands it the regions this process filled and exported, with their fds."""
 
-    ask: Callable[[str, str, str], DeviceTierAnswer | None]
-    offer: Callable[[str, str, str, tuple[SharedRegion, ...], tuple[int, ...]], DeviceTierAnswer]
+    ask: Callable[[str, str, str, str], DeviceTierAnswer]
+    offer: Callable[
+        [str, str, str, tuple[SharedRegion, ...], tuple[int, ...], str], DeviceTierAnswer
+    ]
 
 
 @dataclass(frozen=True, slots=True)

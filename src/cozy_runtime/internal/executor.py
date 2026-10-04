@@ -4384,10 +4384,16 @@ class Executor:
             return {"ok": False, "code": "poisoned_generation", "detail": str(exc)}
         return {"ok": True, "released_bytes": released, "plane": self._plane_facts()}
 
-    def _ask_device(self, name: str, layout: str, device: str) -> DeviceTierAnswer | None:
-        """The GPU regions the machine keeps for exactly this weight set's layout, with fds."""
+    def _ask_device(
+        self, name: str, layout: str, device: str, variant: str = ""
+    ) -> DeviceTierAnswer:
+        """The GPU regions the machine keeps for exactly this weight set's layout, with fds:
+        its stored bytes, or with `variant` "*" its most recent baked variant (the answer
+        names it; an older machine names none, and its answer is not one). `held` is False
+        when it keeps none this process can map."""
         answer = self._durable(
-            DeviceTier(name=name, layout=layout, device=device), DeviceTierAnswer
+            DeviceTier(name=name, layout=layout, device=device, variant=variant),
+            DeviceTierAnswer,
         )
         if (
             answer.ok
@@ -4395,11 +4401,12 @@ class Executor:
             and answer.layout == layout
             and answer.lease_fd >= 0
             and len(answer.fds) == sum(len(r.chunks) for r in answer.regions)
+            and bool(answer.variant) == bool(variant)
         ):
             return answer
         for fd in (*answer.fds, *([answer.lease_fd] if answer.lease_fd >= 0 else [])):
             os.close(fd)
-        return None
+        return msgspec.structs.replace(answer, held=False, regions=(), fds=(), lease_fd=-1)
 
     def _offer_device(
         self,
@@ -4408,10 +4415,17 @@ class Executor:
         device: str,
         regions: tuple[SharedRegion, ...],
         fds: tuple[int, ...],
+        variant: str = "",
     ) -> DeviceTierAnswer:
         """Hand the machine regions this process filled; it keeps them past this process."""
         request = DeviceTier(
-            name=name, layout=layout, device=device, offer=True, regions=regions, fds=fds
+            name=name,
+            layout=layout,
+            device=device,
+            offer=True,
+            regions=regions,
+            fds=fds,
+            variant=variant,
         )
         answer = self._durable(request, DeviceTierAnswer)
         for fd in answer.fds:

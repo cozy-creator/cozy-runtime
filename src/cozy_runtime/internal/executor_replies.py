@@ -139,6 +139,8 @@ class PlaneFacts(msgspec.Struct, frozen=True, kw_only=True):
     #: at every acquire), and the milliseconds its resident bakes took
     lora_baked: int = 0
     lora_bake_ms: float = 0.0
+    #: LoRA'd weights whose bytes arrived baked from the machine's custody: no bake here
+    lora_attached: int = 0
     late: int = 0
     stall_ns: int = 0
     misses: int = 0
