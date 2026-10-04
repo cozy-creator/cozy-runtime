@@ -2142,7 +2142,7 @@ def _lora_layers(root: Module, region: Region) -> list[Bake]:
     active adapter's factors lie in the same region (so they are bound together), and, in a
     block, linears carrying a model's consumer hook (`LoRASource`)."""
     where = {weight.row.name: index for index, weight in enumerate(region.weights)}
-    found = []
+    found: list[Bake] = []
     for index, weight in enumerate(region.weights):
         roles = {role: dtype for role, (_, dtype, _) in weight.parts.items()}
         if not lora_bake.bakeable(roles):
@@ -2151,9 +2151,10 @@ def _lora_layers(root: Module, region: Region) -> list[Bake]:
         if target == weight.row.name:
             site = weight.row.name.removesuffix(".weight")
             if region.path and site != weight.row.name:
+                hooks: Iterable[object] = root.get_submodule(site)._forward_hooks.values()
                 found.extend(
                     Bake(hook, index, [], hook.lora_factors, hook.lora_strategy)
-                    for hook in root.get_submodule(site)._forward_hooks.values()
+                    for hook in hooks
                     if isinstance(hook, LoRASource)
                 )
             continue
