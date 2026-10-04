@@ -90,33 +90,29 @@ Runtime never creates an unused processor attribute to claim partial coverage.
 
 ## Kernels compiled on the machine, and Ulysses
 
-Nothing is compiled on a builder. The worker image carries every kernel as pinned source
+Nothing is compiled on a builder. The image carries every kernel as pinned source
 (`python -m cozy_runtime.internal.kernel_sources fetch /opt/cozy/kernel-sources`: sources
-by commit or version and sha256, plus `index.json`) and the CUDA toolkit. At worker boot,
-before any executor starts, the worker compiles the installed models' ladder for each card
-(`internal/machine_kernels.py`: Sol's Python sources, SageAttention2, FA3 on sm90), best
-first, through the compile manager (`internal/kernel_compile.py`): one niced build per exact
-key (sources, arch, torch, CUDA, Python, compiler) per machine, into the worker's store
-namespace that every executor reads. An extension build runs as many compiler processes as
-the machine's CPUs (affinity, cgroup quota) and memory (4 GiB each) allow, one such build at
-a time. An executor's warm submits what its model prefers too; a key the worker holds is
-compiling, never built twice. Upstream's own `setup.py` detects the card; no source is
-patched. A build is ended only when its whole process tree stops burning CPU and writing
-output; a failure is recorded for that worker boot and retried at the next.
+by commit or version and sha256, plus `index.json`) and the CUDA toolkit. At machine start
+and after each install, while weights download, the machine runs the kernel boot for each
+installed generation under that generation's seal (`internal/machine_kernels.py`): the
+ladder for each card (Sol's Python sources, SageAttention2, FA3 on sm90), best first, then
+Sol's card objects, through the compile manager (`internal/kernel_compile.py`). One niced
+build per exact key (sources, arch, driver, torch, CUDA, Python, compiler) per machine, into
+the store its executors read; a key already built is never built again, so a restart
+compiles nothing. An extension build runs as many compiler processes as the machine's CPUs
+(affinity, cgroup quota) and memory (4 GiB each) allow, one such build at a time. Upstream's
+own `setup.py` detects the card; no source is patched. A build is ended only when its whole
+process tree stops burning CPU and writing output; a failure is recorded for that machine
+run and retried at the next.
 
-An executor is the Runtime its package locked. One before 0.18.70 compiles nothing and reads
-only the image kernel site, `/opt/cozy/kernels` (`internal/kernel_site.py`): the worker
-writes its manifest at boot and links each ready tree into it, and such an executor takes a
-kernel at its next construction after it lands, through its own probe. It never gets Sol off
-SM90 or the fused glue; relock the package for those.
-
-Selection serves a kernel only once it is compiled, imports and launches. One still
-compiling is skipped with its progress (`sageattention: compiling (42%)`), and the chain
-falls through to the next ready kernel; SDPA is always ready. A request never compiles
-and never waits: at its start, a construction that skipped a kernel now ready selects
-again. Sol compiles one object per card, except on SM90, where upstream specializes on
-the length's 64-token block layout; the first sight of a length (intake or a dense step)
-submits that object, and a sparse step whose object is not ready runs dense.
+Selection serves a kernel only once it is compiled, imports and launches. A site that will
+run a kernel still compiling waits for it, judged by the build's measured progress, and the
+request shows `compiling <kernel>`; it never runs another kernel in its place. One whose
+compile failed is skipped with why, and the chain falls through; SDPA is always ready. A
+ranked kernel no site runs is not waited for. Sol compiles one object per card, except on
+SM90, where upstream specializes on the length's 64-token block layout; the first sight of
+a length (intake or a dense step) submits that object, and its first sparse step waits for
+it.
 
 Every kernel is a Runtime-local forward (`attention_upstream`, `attention_sol`) that
 `attention_ulysses` registers with Diffusers. Without a parallel config it calls the

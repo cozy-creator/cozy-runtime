@@ -7,10 +7,10 @@ model supplies its live layout, step policy and dense module paths explicitly.
 The kernel compiles once per object per machine, out of process (`kernel_compile`): one per
 card, and on SM90 one per 64-token block layout (`variant`), which only the request knows. So
 the first sight of a length (a model's intake statement, or the first dense step) submits its
-compile, and conditioning and the dense steps cover it. A sparse step whose object is not
-compiled yet runs the dense reference instead: nothing waits on a compile. Upstream's
-preprocess autotuning is pinned to one configuration, because its candidates differ bitwise
-and a timing race must not choose the output.
+compile, and conditioning and the dense steps cover it. A sparse step whose object is still
+compiling waits for it, by the build's measured progress: it never runs the dense reference in
+its place. Upstream's preprocess autotuning is pinned to one configuration, because its
+candidates differ bitwise and a timing race must not choose the output.
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ from typing import Any
 
 from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT, AttentionLayout
 from cozy_runtime.author._observations import Scalar
-from cozy_runtime.internal import config, kernel_cache, kernel_compile
+from cozy_runtime.internal import accel, config, kernel_cache, kernel_compile
 from cozy_runtime.internal.attention_ulysses import Local
 
 # Tensors, devices, modules and the dense reference are `Any`: torch is not in the check venv.
@@ -302,7 +302,13 @@ def job(tokens: int, capability: tuple[int, int]) -> kernel_compile.Job:
     imposed before it imports."""
     arch = target(capability)
     shape = variant(tokens, capability)
-    inputs = {"library": sol_library(), "target": arch, "options": OPTIONS, "variant": shape}
+    inputs = {
+        "library": sol_library(),
+        "target": arch,
+        "driver": accel.driver_version(),
+        "options": OPTIONS,
+        "variant": shape,
+    }
     return kernel_compile.Job(
         "sol",
         kernel_cache.Key.of(KERNEL, inputs),
@@ -441,9 +447,16 @@ def specialize(tokens: int, device: Any, step: int) -> None:
         )
 
 
+def card_jobs(store: kernel_cache.Store, capability: tuple[int, int]) -> list[kernel_compile.Job]:
+    """What a card compiles ahead of any request: its one object, or on SM90, whose object is
+    per length layout, every layout this machine has served."""
+    if capability != (9, 0):
+        return [_job_for(1, capability)]
+    return kernel_compile.learned(store, _scope(capability))
+
+
 def submit_card(index: int) -> None:
-    """At the startup warm, as soon as Sol is ready here: a card whose kernel takes no length
-    compiles its one object; SM90 compiles every length layout this machine has served."""
+    """As soon as Sol is ready here, for a machine whose kernel boot has not: `card_jobs`."""
     device = import_module("torch").device("cuda", index)
     capability = _capability(device)
     store = kernel_cache.configured()
@@ -452,15 +465,16 @@ def submit_card(index: int) -> None:
     if capability != (9, 0):
         specialize(1, device, -2)
         return
-    for found in kernel_compile.learned(store, _scope(capability)):
+    for found in card_jobs(store, capability):
         if found.key.digest not in _SUBMITTED:
             _SUBMITTED.add(found.key.digest)
             kernel_compile.submit(store, found)
 
 
 def _scope(capability: tuple[int, int]) -> str:
-    """Learned layouts are this library's on this card: another build learns its own."""
-    digest = hashlib.sha256(json.dumps(sol_library(), sort_keys=True).encode()).hexdigest()
+    """Learned layouts are this library's on this card and driver: another learns its own."""
+    library = {**sol_library(), "driver": accel.driver_version()}
+    digest = hashlib.sha256(json.dumps(library, sort_keys=True).encode()).hexdigest()
     return f"{KERNEL}-{target(capability)}-{digest[:16]}"
 
 
@@ -485,8 +499,9 @@ def _row(
 
 
 def _ready(tokens: int, device: Any, step: int) -> Loaded | None:
-    """The object for this length when it is compiled, else None and its compile submitted:
-    the step then runs dense. Nothing here compiles or waits."""
+    """The object for this length, after waiting for its compile when it is not built yet.
+    None only when there is no store or its compile failed this machine run: the step then
+    runs dense and its row says so."""
     capability = _capability(device)
     store = kernel_cache.configured()
     if capability is None or store is None:
@@ -496,15 +511,17 @@ def _ready(tokens: int, device: Any, step: int) -> Loaded | None:
     if loaded is not None:
         return loaded
     started = time.perf_counter()
-    data = store.get(found.key)
+    data, source = store.get(found.key), "store"
     if data is None:
-        state = kernel_compile.submit(store, found)
         _SUBMITTED.add(found.key.digest)
-        _kernel_row(_row(tokens, found, "cold_compile", started, step=step, state=state.line()))
-        return None
+        state, source = kernel_compile.wait(store, found), "waited"
+        data = store.get(found.key)
+        if data is None:
+            _kernel_row(_row(tokens, found, "failed", started, step=step, state=state.line()))
+            return None
     loaded = _KERNELS[found.key.digest] = load(data)
     entry = kernel_compile.status(store, found)
-    _kernel_row(_row(tokens, found, "store", started, step=step, compile_ms=entry.ms))
+    _kernel_row(_row(tokens, found, source, started, step=step, compile_ms=entry.ms))
     return loaded
 
 
@@ -625,8 +642,8 @@ def _execute(
         if layout.step >= layout.dense_until_step:
             loaded = _ready(layout.live_tokens, query.device, layout.step)
     if loaded is None:
-        # A dense step, a dense path, or a sparse step whose variant is still compiling: the
-        # dense reference serves it, and nothing waits on the compile.
+        # A dense step, a dense path, or a sparse step whose variant failed to compile: the
+        # dense reference serves it.
         live_output = _dense(q, k, v, scale)
         _count("dense_path" if dense_path else "dense_step")
     else:

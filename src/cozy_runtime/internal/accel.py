@@ -20,16 +20,17 @@ hand in their `torch` module; this module imports none.
 from __future__ import annotations
 
 import ctypes
-import os
+import re
 import subprocess
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
+from pathlib import Path
 from types import ModuleType
 from typing import Any, Literal, cast
 
-from cozy_runtime.internal.config import sees_no_gpu
+from cozy_runtime.internal.config import inherited_environment, sees_no_gpu
 
 #: The #450 law, imposed on every MPS executor's sealed environment: enabling the fallback
 #: silently runs unsupported operations on CPU, which violates the CPU-refusal law. Forced,
@@ -333,12 +334,24 @@ def device_capability(device: str) -> int:
     return major.value * 10 + minor.value if answer == _NVML_SUCCESS else 0
 
 
+def driver_version() -> str:
+    """The loaded NVIDIA driver's version, read from the kernel: no NVML and no thread, so a
+    fork parent may ask. A compiled kernel's key carries it. Empty where there is none."""
+    for path in ("/sys/module/nvidia/version", "/proc/driver/nvidia/version"):
+        with suppress(OSError):
+            found = re.search(r"\d+\.\d+(\.\d+)*", Path(path).read_text().splitlines()[0])
+            if found:
+                return found.group()
+    return ""
+
+
 def drives_display(index: int) -> bool:
     """Whether a display is initialized on CUDA device `index` of this process (NVML's display
     active state: a display server holds memory for a screen there); False where NVML cannot
     say. A connector with a display attached (NVML's display mode: a dummy plug on many
     datacenter GPUs) is not one."""
-    entries = [e.strip() for e in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")]
+    visible = inherited_environment().get("CUDA_VISIBLE_DEVICES", "")
+    entries = [e.strip() for e in visible.split(",")]
     entries = [e for e in entries if e]
     library = _nvml_library()
     entry = entries[index] if index < len(entries) else str(index)

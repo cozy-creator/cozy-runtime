@@ -232,6 +232,17 @@ def restore_seal(sealed: Mapping[str, str], names: Iterable[str]) -> None:
             os.environ.pop(name, None)
 
 
+def replace_environment(environment: Mapping[str, str]) -> None:
+    """This process's whole environment becomes `environment`: a forked executor's own seal."""
+    os.environ.clear()
+    os.environ.update(environment)
+
+
+def hide_gpus() -> None:
+    """From here on this process, and what it starts, is told it has no GPU (`sees_no_gpu`)."""
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
+
 _read: bool = False
 _worker_host_read: bool = False
 

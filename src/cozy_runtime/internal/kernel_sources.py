@@ -2,7 +2,7 @@
 
 `PINS` is every kernel source this Runtime builds from, by version, release tag or commit and
 sha256. The worker image fetches them once (`python -m cozy_runtime.internal.kernel_sources
-fetch /opt/cozy/kernel-sources`), verified, beside the index the boot compiler reads; it
+fetch /opt/cozy/kernel-sources`), verified, beside the index the machine's kernel boot reads; it
 carries no kernel binary built elsewhere:
 
     <root>/index.json
@@ -16,8 +16,9 @@ card and no upstream patch is needed; a one-line incompatibility with this torch
 replacement applied at build time, in the open, in the recipe. `python` unpacks every Python
 source (wheels, and a tree's pure package by its `package` path) into one importable tree: the
 CuTe DSL, TVM-FFI and the JIT kernels built on them (Sol, FlashAttention-4, FlashInfer). Every
-source's digest is a key input, with the card's architecture, torch, CUDA, Python and the
-compiler, so another image or card builds its own entry and never loads this one's.
+source's digest is a key input, with the card's architecture, the driver, torch, CUDA, Python
+and the compiler, so another image, card or driver builds its own entry and never loads this
+one's.
 """
 
 from __future__ import annotations
@@ -41,7 +42,7 @@ from importlib import metadata, util
 from pathlib import Path
 from typing import Any
 
-from cozy_runtime.internal import config, egress, kernel_cache, kernel_compile
+from cozy_runtime.internal import accel, config, egress, kernel_cache, kernel_compile
 
 ROOT = Path("/opt/cozy/kernel-sources")
 INDEX = "index.json"
@@ -369,6 +370,7 @@ def job(name: str, sm: int, root: Path | None = None) -> kernel_compile.Job:
             raise Absent("this environment has no torch to build against")
         inputs = {
             "arch": f"sm_{sm}",
+            "driver": accel.driver_version(),
             "torch": release,
             "cuda": cuda,
             "python": _python(),
@@ -379,7 +381,7 @@ def job(name: str, sm: int, root: Path | None = None) -> kernel_compile.Job:
             ),
         }
     inputs["sources"] = {n: s.sha256 for n, s in sorted(wanted.items())}
-    # 2: every tree carries an installed distribution's dist-info (`kernel_site`).
+    # 2: every tree carries an installed distribution's dist-info.
     inputs["layout"] = 2
     spec = {
         "recipe": name,
@@ -551,7 +553,7 @@ def _units(build: Path) -> dict[str, int]:
 
 def _dist_info(site: Path, name: str, version: str, installed: list[Path]) -> None:
     """The installed distribution's record a tree needs to be one: an executor reads a
-    kernel's version and RECORD from it (`kernel_site`)."""
+    kernel's version and RECORD from it."""
     info = site / f"{re.sub(r'[-_.]+', '_', name)}-{version}.dist-info"
     info.mkdir()
     (info / "METADATA").write_text(f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n")

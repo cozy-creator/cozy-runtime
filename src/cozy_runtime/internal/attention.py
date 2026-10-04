@@ -5,10 +5,12 @@ Every kernel is a Runtime-local forward (`attention_upstream`, `attention_sol`) 
 that is not part of torch is compiled on this machine for this card (`kernel_sources`,
 `kernel_compile`) and serves once its artifact is published: selection checks the device's
 architecture, the site's dtype, head dimension and context-parallel support, and that the
-kernel is compiled, imports and launches. A kernel still compiling is skipped with its
-progress, and the chain falls through to the next ready one; SDPA is always ready. Explicit
-pins refuse an unsupported or unready kernel. Automatic selection preserves attention
-activation precision; quantizing those activations requires an explicit backend choice.
+kernel is compiled, imports and launches. A kernel a site needs that is still compiling is
+waited for, by its build's measured progress (`kernel_compile.wait`): a selection never serves
+another kernel in its place. One whose compile failed this machine run is skipped with why,
+and the chain falls through; SDPA is always ready. Explicit pins refuse an unsupported or
+failed kernel. Automatic selection preserves attention activation precision; quantizing those
+activations requires an explicit backend choice.
 """
 
 from __future__ import annotations
@@ -17,7 +19,7 @@ import site
 import sys
 from collections import deque
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from importlib import import_module, util
 from pathlib import Path
@@ -310,11 +312,11 @@ def _job(candidate: Candidate, device: DeviceFacts) -> kernel_compile.Job:
         raise AttentionRefusal("attention_kernel_absent", f"{candidate.name}: {exc}") from exc
 
 
-def _compiled(candidate: Candidate, device: DeviceFacts) -> dict[str, str] | None:
-    """Place the candidate's compiled artifact on the import path, or refuse with its state:
-    `compiling` with its progress, `failed` for this boot, `absent`. Submitting is the whole
-    of what happens to an unready one; nothing here waits. A package environment that
-    carries the module itself serves it, as its pinned version always has."""
+def _compiled(candidate: Candidate, device: DeviceFacts, wait: bool) -> dict[str, str] | None:
+    """Place the candidate's compiled artifact on the import path, after waiting for its build
+    when `wait`, or refuse with its state: `failed` for this machine run, `absent`, or
+    `compiling` for a caller that only asks. A package environment that carries the module
+    itself serves it, as its pinned version always has."""
     if util.find_spec(candidate.import_name.split(".")[0]) is not None:
         return None
     store = kernel_cache.configured()
@@ -323,7 +325,8 @@ def _compiled(candidate: Candidate, device: DeviceFacts) -> dict[str, str] | Non
             "attention_kernel_absent", f"{candidate.name}: no machine kernel store to compile into"
         )
     job = _job(candidate, device)
-    state = _STATES[candidate.name] = kernel_compile.submit(store, job)
+    state = (kernel_compile.wait if wait else kernel_compile.submit)(store, job)
+    _STATES[candidate.name] = state
     if state.state != "ready":
         raise AttentionRefusal(
             f"attention_kernel_{state.state}", f"{candidate.name}: {state.line()}"
@@ -346,7 +349,7 @@ def _import(candidate: Candidate) -> ModuleType:
 def _launch(ready: Ready, device: DeviceFacts) -> None:
     """One small call through a compiled kernel: one whose first launch raises is not served.
     Not an accuracy check. Torch's own backends need none; Sol launches only inside its
-    model's layout, and a sparse step whose object is not ready runs dense."""
+    model's layout."""
     if not ready.candidate.artifact or ready.name == "sol-attn" or device.kind != "cuda":
         return
     import torch
@@ -377,15 +380,16 @@ def _launch(ready: Ready, device: DeviceFacts) -> None:
         )
 
 
-def _resolve(candidate: Candidate, device: DeviceFacts) -> Ready:
-    """One candidate compiled, imported and launched on this device, or a typed refusal."""
+def _resolve(candidate: Candidate, device: DeviceFacts, wait: bool = True) -> Ready:
+    """One candidate compiled, imported and launched on this device, or a typed refusal. A
+    site that will run it waits for its build; `available` only asks what is ready."""
     known = _READY.get((candidate.name, device))
     if known is not None:
         return known
     if (candidate.name, device) in _BROKEN:
         raise _BROKEN[(candidate.name, device)]
     _registry()
-    artifact = _compiled(candidate, device) if candidate.artifact else None
+    artifact = _compiled(candidate, device, wait) if candidate.artifact else None
     if candidate.import_name:
         module = _import(candidate)
         if candidate.local in (upstream.FA3, upstream.FA3_FP8):
@@ -404,24 +408,6 @@ def _resolve(candidate: Candidate, device: DeviceFacts) -> Ready:
     _READY[(candidate.name, device)] = ready
     if candidate.artifact:
         _STATES.setdefault(candidate.name, kernel_compile.State(candidate.artifact, "ready"))
-    return ready
-
-
-def pending(applied: Applied, device: DeviceFacts) -> list[str]:
-    """Kernels this selection skipped while they compiled that are now ready: a request start
-    re-selects to take them."""
-    store = kernel_cache.configured()
-    names = [name for name, why in (applied.skipped or {}).items() if "compiling" in why]
-    if store is None or not names:
-        return []
-    ready = []
-    for name in names:
-        candidate = BY_NAME.get(name)
-        if candidate is None or not candidate.artifact:
-            continue
-        with suppress(AttentionRefusal, kernel_sources.Absent):
-            if kernel_compile.status(store, _job(candidate, device)).state == "ready":
-                ready.append(name)
     return ready
 
 
@@ -481,10 +467,9 @@ def _sol_dense(
     """The kernel Sol recomputes dense rows with (its dense steps, protected prefix and dense
     paths): the first one after Sol in the model's preference that serves BF16 at head
     dimension 128 on this rank, else the first ranked one. It runs locally after the Ulysses
-    exchange, so it needs no context parallelism. A preferred kernel still compiling is
-    recorded in `refused`, so `pending` re-selects when it is ready (run 1565: SDPA served
-    Sol's dense steps at 35 s where SageAttention takes about 24 s)."""
-    for name in order:
+    exchange, so it needs no context parallelism. One still compiling is waited for (run
+    1565: SDPA served Sol's dense steps at 35 s where SageAttention takes about 24 s)."""
+    for name in (*order, *(candidate.name for candidate in CANDIDATES)):
         candidate = BY_NAME.get(name)
         if (
             candidate is None
@@ -500,13 +485,7 @@ def _sol_dense(
                 refused.setdefault(name, f"{type(exc).__name__}: {exc}"[:300])
                 continue
         return resolved[name]
-    dense = next(
-        (entry for entry in available(device) if _admits(entry.candidate, "bfloat16", 128)),
-        None,
-    )
-    if dense is None:
-        raise AttentionRefusal("attention_kernel_absent", "Sol has no ready dense reference")
-    return dense
+    raise AttentionRefusal("attention_kernel_absent", "Sol has no ready dense reference")
 
 
 def _bind_sol_dense(dense: Ready) -> None:
@@ -544,18 +523,21 @@ def for_device(device: DeviceFacts) -> list[Candidate]:
 
 
 def available(device: DeviceFacts, skipped: dict[str, str] | None = None) -> list[Ready]:
-    """The ranked kernels this device and environment can actually run, fastest first.
+    """The ranked kernels this device and environment can run now, fastest first.
 
-    Never raises: the floor takes everything, so auto-selection has no refusal arm. A ranked
-    kernel still compiling, failed or absent here is not in the answer; why is written into
-    `skipped`. An environment with no diffusers at all offers nothing: it holds no site.
+    Never raises and never waits: the floor takes everything, so auto-selection has no refusal
+    arm. A ranked kernel failed or absent here is not in the answer, and why is written into
+    `skipped`; one still compiling is not in it either, and the site that would run it waits
+    for it (`install`). An environment with no diffusers at all offers nothing: it holds no
+    site.
     """
     ready: list[Ready] = []
     for candidate in for_device(device):
         try:
-            ready.append(_resolve(candidate, device))
+            ready.append(_resolve(candidate, device, wait=False))
         except Exception as exc:
-            if skipped is not None:
+            compiling = isinstance(exc, AttentionRefusal) and exc.code.endswith("_compiling")
+            if skipped is not None and not compiling:
                 skipped[candidate.name] = f"{type(exc).__name__}: {exc}"[:300]
             # BROAD ON PURPOSE. Auto-selection has no refusal arm (the floor takes
             # everything), so a kernel that fails to resolve for ANY reason drops out of the
@@ -1119,6 +1101,7 @@ def install(
                 )
             raise detail
         entry = offered[0]
+        preferred = forced or isinstance(processor, ClassicSdpa)
         if choose is not None and not forced:
             assert device is not None
             key = (dtype, head_dim)
@@ -1144,10 +1127,9 @@ def install(
             )
             selection = choose(context)
             if isinstance(selection, (tuple, list)):
-                entry = (
-                    _preferred(selection, device, dtype, head_dim, degree, resolved, refused)
-                    or entry
-                )
+                found = _preferred(selection, device, dtype, head_dim, degree, resolved, refused)
+                preferred = preferred or found is not None
+                entry = found or entry
                 if entry.name == "sol-attn" and sol_order is None:
                     sol_order = tuple(selection[list(selection).index("sol-attn") + 1 :])
             elif selection is not None:
@@ -1159,7 +1141,16 @@ def install(
                     )
                 if selection not in resolved:
                     resolved[selection] = pinned(selection, device)[0]
-                entry = resolved[selection]
+                entry, preferred = resolved[selection], True
+        ranked = for_device(device) if device is not None and not preferred else []
+        if device is not None and entry.candidate in ranked:
+            # A ranked kernel above the one ready now is still compiling: this site runs it.
+            above = [
+                candidate.name
+                for candidate in ranked[: ranked.index(entry.candidate)]
+                if _admits(candidate, dtype, head_dim)
+            ]
+            entry = _preferred(above, device, dtype, head_dim, degree, resolved, refused) or entry
         assignments.append((component, path, module, processor, entry))
         hosts.setdefault(component, {})
         hosts[component][entry.name] = hosts[component].get(entry.name, 0) + 1

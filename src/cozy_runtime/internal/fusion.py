@@ -14,13 +14,13 @@ from torch's fused kernel by one bf16 ulp on ~4e-6 of elements (fp32 reduction o
 the row variance), and those elements are the whole distance between fused and eager.
 
 The `@triton.jit` functions below are the kernel SOURCES. They compile on the machine that runs
-them, at worker boot, in the compile manager's niced background builder (`build`), into
+them, at executor start, in the compile manager's niced background builder (`build`), into
 Triton's own keyed cache (`TRITON_CACHE_DIR`, inside the machine's kernel store); the store's
-entry for `job(arch)` marks that cache filled. `load` serves a READY build or raises typed:
-`fusion_kernels_compiling`, `fusion_kernels_failed`, `fusion_kernels_absent` (no store). A
-request never compiles. The key is Triton's own hash of every entry (sources, signature,
-architecture, options, Triton) plus its launcher module's and the cache location, so a LoRA,
-a component swap or a step count cannot invalidate it.
+entry for `job(arch)` marks that cache filled. `load` waits for a live build, then serves it
+or raises typed: `fusion_kernels_failed`, `fusion_kernels_absent` (no store). A request never
+compiles. The key is Triton's own hash of every entry (sources, signature, architecture,
+options, Triton) plus the driver, its launcher module's and the cache location, so a LoRA, a
+component swap or a step count cannot invalidate it.
 
 Adapted from NVlabs/Sana `sol-engine` `models/minimax_h3/{GB200,GB10}/fusions.py`
 (Apache-2.0): the per-row program shape, the table-row gather inside the kernel, the
@@ -42,7 +42,7 @@ from pathlib import Path
 from typing import Any
 
 from cozy_runtime.internal import kernel_cache, kernel_compile
-from cozy_runtime.internal.accel import readable
+from cozy_runtime.internal.accel import driver_version, readable
 from cozy_runtime.internal.encoding.leaves import PreQuantized
 
 try:
@@ -488,6 +488,7 @@ def job(arch: int) -> kernel_compile.Job:
     entries = {spec.key: cache_key(spec, arch) for spec in _all_specs()}
     inputs = {
         "arch": arch,
+        "driver": driver_version(),
         "triton": triton.__version__,
         "entries": entries,
         "launcher": _launcher_key(),
@@ -591,28 +592,20 @@ def expect(arch: int) -> str:
         return f"{exc.code}: {exc}"
 
 
-def load(device: Any, *, wait: bool = False) -> _Loaded:
-    """This device's compiled kernels, loaded onto it from Triton's cache; never a compile.
-
-    Not ready is typed. `wait` is construction under `fusion="require"`, never a request: it
-    first waits on the live build of the key. Idempotent per (process, device)."""
+def load(device: Any) -> _Loaded:
+    """This device's compiled kernels, loaded onto it from Triton's cache; never a compile
+    here. A construction waits for the key's live build, by its measured progress; a build
+    that ended without publishing is typed. Idempotent per (process, device)."""
     _require_triton()
     _require_torch()
     index = torch.device(device).index or 0
     if index in _LOADED:
         return _LOADED[index]
     store, found = _job(index)
-    state = kernel_compile.submit(store, found)
-    if wait and state.state == "compiling":
-        with store.building(found.key):
-            pass
-        state = kernel_compile.status(store, found)
+    state = kernel_compile.wait(store, found)
     arch = int(found.spec["arch"])
     if state.state != "ready":
-        # After the wait, anything but ready is a build that ended without publishing.
-        failed = wait or state.state == "failed"
-        code = "fusion_kernels_failed" if failed else "fusion_kernels_compiling"
-        raise FusionUnavailable(code, f"sm{arch} fused kernels: {state.line()}")
+        raise FusionUnavailable("fusion_kernels_failed", f"sm{arch} fused kernels: {state.line()}")
     compiled: dict[str, Any] = {}
     for spec in _all_specs():
         digest = found.spec["entries"][spec.key]

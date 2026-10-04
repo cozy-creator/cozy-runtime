@@ -123,6 +123,7 @@ from cozy_runtime.internal import (
     executor_commands,
     image_vae,
     kernel_cache,
+    kernel_compile,
     model_config,
     native_interfaces,
     package_interface,
@@ -544,8 +545,6 @@ class Executor:
         #: What the runtime pinned on this generation's attention sites (cr-124). One BOOT
         #: line, not a per-attempt record: the choice is a function of device and image.
         self.attention: attention.Applied | None = None
-        #: selects this construction again, when a kernel it skipped while compiling is ready
-        self._reselect: Callable[[], attention.Applied] | None = None
         self.attention_defaults = attention.Snapshot(())
         #: Device facts for this prepared generation, reused for per-request pin checks.
         self.device_facts: Any = None
@@ -2272,8 +2271,7 @@ class Executor:
             stage("execution_plan")
             # THE FASTEST KERNEL THIS DEVICE AND IMAGE SUPPORT, PINNED POST-FILL (cr-124),
             # per attention site and before any warm step (see `_prepare_attention`).
-            reselect = functools.partial(
-                self._prepare_attention,
+            applied = self._prepare_attention(
                 binding,
                 roots,
                 pin,
@@ -2283,7 +2281,6 @@ class Executor:
                 else None,
                 optional_scope=optional_attention_scope,
             )
-            applied = reselect()
             self.device_facts = device_facts
             stage("attention_pin")
         except (AnimaOptimizationRefusal, FusionRefusal, attention.AttentionRefusal) as exc:
@@ -2315,7 +2312,7 @@ class Executor:
         )
         record = registry.generations()[0].record
         self.plan = plan
-        self.attention, self._reselect = applied, reselect
+        self.attention = applied
         constructed_preimage = canonical.write(
             {
                 "plan_digest": plan.digest(),
@@ -2893,8 +2890,6 @@ class Executor:
         # and the worker reports a run none of whose calls applied it.
         pin = requested if requested and self._attention_reaches(requested) else ""
         try:
-            if not pin:
-                self._upgrade_attention()
             swap = self._attention_plan(pin) if pin else None
             self._restore_attention()
         except attention.AttentionRefusal as exc:
@@ -3176,30 +3171,6 @@ class Executor:
         applied = attention.select(device, roots, local, degree=self.world, choose=choose)
         return replace(applied, pin=pin) if local else applied
 
-    def _upgrade_attention(self) -> None:
-        """A kernel this construction skipped while it compiled joins at a request boundary,
-        never inside a request: the construction selects again and the group agrees. A
-        compiled graph holds its kernel, so a construction warmed into one keeps it."""
-        for executor in self.model_executors or [self]:
-            applied, device = executor.attention, executor.device_facts
-            if applied is None or executor._reselect is None or device is None:
-                continue
-            if not attention.pending(applied, device) or executor.backend is None:
-                continue
-            roots = executor.backend.roots
-            if attention._baked_in(roots):
-                continue
-            upgraded = executor._reselect()
-            executor.attention = replace(upgraded, pin=applied.pin)
-            executor.attention_defaults = attention.snapshot(roots)
-            print(f"[attention] upgraded: {upgraded.line()}", file=sys.stderr, flush=True)
-            if self.group is not None and self.rank == 0:
-                refused = executor._agree_attention(upgraded)
-                if refused is not None:
-                    raise attention.AttentionRefusal(
-                        str(refused.get("code")), str(refused.get("detail"))
-                    )
-
     def _attention_snapshot(self) -> attention.Snapshot:
         return attention.Snapshot(
             tuple(
@@ -3293,16 +3264,6 @@ class Executor:
         if self.rank == 0 or target is None or target.backend is None:
             return {"ok": False, "code": "gpu_divergence", "detail": "no such construction"}
         roots = target.backend.roots
-        device, applied = target.device_facts, target.attention
-        if (
-            target._reselect is not None
-            and applied is not None
-            and device is not None
-            and attention.pending(applied, device)
-        ):
-            # Rank 0 upgraded at a request boundary; a kernel this rank skipped while it
-            # compiled joins here too, e.g. Sol's dense reference, which `adopt` cannot name.
-            target.attention = replace(target._reselect(), pin=applied.pin)
         held = attention.observed(roots).hosts
         try:
             for component, name in sorted(adopt.items()):
@@ -4752,8 +4713,24 @@ def main(argv: list[str] | None = None) -> int:
     return serve(executor, channel)
 
 
+def _compiling(channel: Channel, state: kernel_compile.State) -> None:
+    """A wait on a compiling kernel, told to the machine as the running request's stage."""
+    with contextlib.suppress(SeamError):
+        channel.send(
+            {
+                "event": "progress",
+                "request_id": "",
+                "kind": "progress",
+                "stage": f"compiling {state.kernel}",
+                "stage_fraction": state.progress,
+                "advance": 0,
+            }
+        )
+
+
 def serve(executor: Executor, channel: Channel) -> int:
-    """Answer commands until the worker shuts this executor down or its seam ends."""
+    """Answer commands until the machine shuts this executor down or its seam ends."""
+    kernel_compile.waiting = functools.partial(_compiling, channel)
     while True:
         try:
             frame = channel.recv()
