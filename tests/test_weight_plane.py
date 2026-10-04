@@ -1532,6 +1532,34 @@ def test_an_image_decode_short_of_memory_is_still_the_untiled_image(tmp_path: Pa
 
 
 @on_gpu
+def test_a_driver_out_of_memory_in_a_host_map_decode_makes_room_and_runs_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Run 4297 (Anima in 1.25 GiB): on a full card the driver could not make the decode's copy
+    streams, an error that is not torch's OutOfMemoryError, and the run failed. Room is made
+    and the decode runs again; the image is still the untiled one."""
+    weights = Weights(torch, torch.device("cuda", 0), "cuda")
+    weights.set_budget(-1, pinned=1 << 30)
+    model, plain = plane_vae(weights, tmp_path / "vae", kl_vae)
+    z = torch.randn(1, 4, 256, 256, device="cuda", dtype=torch.float16)
+    with torch.inference_mode():
+        reference = plain.decode(z).sample
+        exact = image_vae.Decode(plain, z)
+    del plain
+    made, full = image_vae.streams, [torch.AcceleratorError("CUDA error: out of memory")]
+
+    def streams(*args: Any) -> Any:
+        if full:
+            raise full.pop()
+        return made(*args)
+
+    monkeypatch.setattr(image_vae, "streams", streams)
+    image = decode(model, z, room(weights, exact.peak(True)))
+    assert not full and weights.modes["vae.decode"] == f"chunked {exact.rows} host"
+    torch.testing.assert_close(image, reference, atol=1e-2, rtol=0)
+
+
+@on_gpu
 def test_a_qwen_image_vae_decodes_exactly_on_the_plane(tmp_path: Path) -> None:
     """Anima's VAE (diffusers' AutoencoderKLQwenImage) with tiling on, as the published package
     constructs it: the plane decodes it in row bands whatever the package asked, on one kernel
