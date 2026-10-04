@@ -73,3 +73,18 @@ are not that reserved machine admission contract. Transfer only the required
 latent to the selected CPU target, retain the authored CPU upcast, and invoke
 native decode exactly once. A CPU failure retires that operation; it does not
 trigger another whole forward on either device.
+
+Independent review adds four product boundaries. CPU mode is currently
+executor-wide; do not toggle Weights.host_only for one VAE. for_script's device
+measurement follows a visible accelerator rather than Weights.device, so a mixed
+slot must resolve explicit CPU facts rather than reuse that inference. A complete
+CPU mapping requires every VAE region ready: staged STORE=False sealed holes can
+be skipped by PINNED want, and window layouts can refuse pinning. Retain and
+materialize the same source data through the supported machine handoff before
+binding, not by treating holes as zero weights.
+
+The reviewed plan must also preserve CPU views/derived buffers and suppress only
+Runtime-installed GPU hooks. Select the target and transfer the latent before
+the authored CPU dtype branch; preserve author hooks and source custody. These
+are SOURCE gates, not closed by the Store-enabled diagnostic. No mixed-slot
+implementation proceeds before a concrete independent review.
