@@ -3151,8 +3151,6 @@ class WeightResidency:
                     region.module.weight.dtype,
                     weights.pinned_applied,
                 )
-            # a library's refusal is answered once: by its op where ops recover one by one
-            refused = weights.grouped or region.mutates is not False
             refusals = 0
             while True:
                 stream = weights.stream()
