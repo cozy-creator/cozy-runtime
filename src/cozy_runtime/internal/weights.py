@@ -783,7 +783,7 @@ class Weights:
                 at += len(row.chunks)
                 if not 0 <= row.region < len(component.regions):
                     continue
-                if component.regions[row.region].bake:
+                if not _shareable(component.regions[row.region]):
                     continue  # its bytes take deltas here: a private copy, never a shared one
                 try:
                     # The plane maps only when the holder's layout is this weight set's.
@@ -819,7 +819,7 @@ class Weights:
         kept = 0
         for component in list(self.components.values() if components is None else components):
             # Baked bytes are this process's variant, never the layout's stored bytes.
-            plain = [region.index for region in component.regions if not region.baked]
+            plain = [region.index for region in component.regions if _shareable(region)]
             if not plain:
                 continue
             exported = self.plane.export_device(component.ws, self.index, plain)
@@ -2252,6 +2252,13 @@ def _lora_layers(root: Module, region: Region) -> list[Bake]:
         if bake.layer is not None or bake.hooks:
             found.append(bake)
     return found
+
+
+def _shareable(region: Region) -> bool:
+    """A LoRA-capable region stays private even in per-step mode: exporting makes its
+    producer read-only, and a refused offer otherwise drops and refills it each stage.
+    Already modified or half-baked bytes must never claim the canonical layout either."""
+    return not (region.bakes or region.baked or region.dirty)
 
 
 def _bakes_here(weights: Weights, component: Component, region: Region) -> bool:
