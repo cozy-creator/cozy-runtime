@@ -855,6 +855,8 @@ class Executor:
     def run(self, command: dict[str, Any]) -> dict[str, Any]:
         """Run a prepared sharded component, or one this rank hosts, under its leader's
         scope and execution modes. A hosted call's result returns through the spool."""
+        if self.host.weights is not None and self.host.weights.poisoned:
+            self.poisoned = self.poisoned or f"weights: {self.host.weights.poisoned}"
         if self.rank == 0:
             return {
                 "ok": False,
@@ -2882,6 +2884,8 @@ class Executor:
 
     def invoke(self, command: Invoke) -> dict[str, Any]:
         """ONE attempt through the author kernel, with the §3.4 freeze point held."""
+        if self.host.weights is not None and self.host.weights.poisoned:
+            self.poisoned = self.poisoned or f"weights: {self.host.weights.poisoned}"
         if not self.ready:
             return {
                 "ok": False,
@@ -3102,6 +3106,8 @@ class Executor:
         # is the process, so the worker must replace it either way.
         if self.residency is not None and self.residency.poisoned:
             self.poisoned = self.poisoned or f"weights: {self.residency.poisoned[:200]}"
+        if self.host.weights is not None and self.host.weights.poisoned:
+            self.poisoned = self.poisoned or f"weights: {self.host.weights.poisoned[:200]}"
         # The BOUNDED observation tail and the O(1) time attribution cross the seam on every
         # path, success or fault. A failed attempt's log tail is the one triage most needs,
         # and cr-011 hoisted the record out of `invoke` precisely so it survives the failure.
@@ -3490,6 +3496,8 @@ class Executor:
         3. **Quiescence is proven by what exists.** A torch-free job has no stream that
            could still be moving, so the proof is structural rather than a device query.
         """
+        if self.host.weights is not None and self.host.weights.poisoned:
+            self.poisoned = self.poisoned or f"weights: {self.host.weights.poisoned}"
         if command.capture is not None:
             return {
                 "ok": False,
@@ -3650,6 +3658,8 @@ class Executor:
             and outcome.code not in CAPACITY_CODES
         ):
             self.poisoned = f"{outcome.terminal}/{outcome.code}"
+        if self.host.weights is not None and self.host.weights.poisoned:
+            self.poisoned = self.poisoned or f"weights: {self.host.weights.poisoned[:200]}"
         return {
             "ok": True,
             "kind": "job",

@@ -16,6 +16,7 @@ from __future__ import annotations
 import mmap
 import os
 import re
+import threading
 import time
 import weakref
 import zlib
@@ -318,7 +319,8 @@ class Weights:
         self.open: list[tuple[WeightResidency, str, tuple[str, ...]]] = []
         self.residencies: weakref.WeakSet[WeightResidency] = weakref.WeakSet()
         self._recovery: type | None = None
-        self._recovering = False
+        self._recovery_local = threading.local()
+        self.poisoned = ""
         #: one GPU of a group: a block's forward holds collectives the other GPUs are already
         #: in, so it can never run again; its ops recover one by one instead
         self.grouped = False
@@ -342,6 +344,7 @@ class Weights:
         self.last_retry: tuple[str, int] | None = None
         #: the CUDA context and library workspaces outside torch and the plane, measured once
         self.context_bytes = -1
+        self._indexed_h2d = self._indexed_copy_ns = self._indexed_read = self._indexed_peak = 0
         #: Only a per-device driver row attributable to this process trains future budgets.
         self.context_measurement = ""
         #: the machine's custody of GPU weights (`weights.attach/1`); None: every region private
@@ -526,7 +529,7 @@ class Weights:
         # estimate (a seed for an untiled decode, say) that left a stage no room for its own
         # weights would refuse it for size. An adaptive stage then tiles; any other recovers
         # from its out-of-memory by unmapping.
-        return max(weight_policy.plane_budget(available, growth), min(self.window(), available))
+        return max(weight_policy.plane_budget(available, growth), min(self.floor(), available))
 
     def window(self) -> int:
         """What the open stages stream in at least: each component's common weights and two
@@ -592,17 +595,27 @@ class Weights:
     @contextmanager
     def recovering(self) -> Iterator[None]:
         """Recover allocation failures at safe operator boundaries, never whole forwards."""
-        if self.host_only or self._recovering:
+        if self.poisoned:
+            raise ResidencyRefusal("residency_poisoned", self.poisoned)
+        if self.host_only or getattr(self._recovery_local, "active", False):
             yield
             return
         if self._recovery is None:
             self._recovery = _recovery_type(self.torch)
-        self._recovering = True
+        self._recovery_local.active = True
         try:
             with self._recovery(self):
                 yield
         finally:
-            self._recovering = False
+            self._recovery_local.active = False
+
+    def recovery_refusal(self, detail: str) -> ResidencyRefusal:
+        """An allocation failure may have changed state: latch it even if authored code
+        catches the refusal or it happened before handler entry. This process must retire."""
+        self.poisoned = self.poisoned or f"recovery_contract_unavailable: {detail}"[:400]
+        for residency in self.residencies:
+            residency.poisoned = residency.poisoned or self.poisoned
+        return ResidencyRefusal("recovery_contract_unavailable", detail)
 
     def make_room(self, need: int, operands: Sequence[object], op: str = "") -> None:
         """An op outside every block ran out of device memory: unmap `need` bytes of weights,
@@ -1035,7 +1048,12 @@ class Weights:
             unbind(region)
             region.views.clear()
             if region.indexed is not None:
+                self._indexed_h2d += region.indexed.h2d_bytes
+                self._indexed_copy_ns += region.indexed.copy_ns
+                self._indexed_read += region.indexed.read_bytes
+                self._indexed_peak = max(self._indexed_peak, region.indexed.peak_host_bytes)
                 region.indexed.close()
+                region.indexed = None
         component.mapping = None
         component.shared.clear()
         if component.filling is not None:
@@ -1068,7 +1086,10 @@ class Weights:
             for region in component.regions
             if region.indexed is not None
         ]
-        copied = device.host_copy_bytes + device.disk_copy_bytes + sum(r.h2d_bytes for r in indexed)
+        copied = (
+            device.host_copy_bytes + device.disk_copy_bytes + self._indexed_h2d
+            + sum(r.h2d_bytes for r in indexed)
+        )
         reserved = -1 if self.host_only else int(self.torch.cuda.memory_reserved(self.device))
         # This process's own count (per-process NVML only refines the context in it); an
         # unmeasured context counts nothing rather than hiding the rest.
@@ -1077,11 +1098,16 @@ class Weights:
             if reserved >= 0
             else -1
         )
-        copy_ns = device.host_copy_ns + device.disk_copy_ns + sum(r.copy_ns for r in indexed)
-        if indexed:
-            self.modes["selected_embedding_read_bytes"] = str(sum(r.read_bytes for r in indexed))
+        copy_ns = (
+            device.host_copy_ns + device.disk_copy_ns + self._indexed_copy_ns
+            + sum(r.copy_ns for r in indexed)
+        )
+        if indexed or self._indexed_read:
+            self.modes["selected_embedding_read_bytes"] = str(
+                self._indexed_read + sum(r.read_bytes for r in indexed)
+            )
             self.modes["selected_embedding_host_peak_bytes"] = str(
-                max(r.peak_host_bytes for r in indexed)
+                max(self._indexed_peak, max((r.peak_host_bytes for r in indexed), default=0))
             )
         return PlaneFacts(
             budget_bytes=device.budget,
@@ -1304,6 +1330,16 @@ class Read:
         return tensor.clone() if any(a <= address < b for a, b in self.spans) else out
 
 
+# Layout/compiler annotations that do not change a pure operator's replay contract.
+# Unknown future annotations are isolated to OOM recovery, not baseline execution.
+_REPLAY_TAGS = frozenset({
+    "core", "cudagraph_unsafe", "data_dependent_output", "dynamic_output_shape",
+    "flexible_layout", "generated", "needs_contiguous_strides", "needs_exact_strides",
+    "needs_fixed_stride_order", "nondeterministic_bitwise", "pointwise",
+    "pt2_compliant_tag", "reduction", "view_copy",
+})
+
+
 def _recovery_type(torch: ModuleType) -> type:
     mode: type = torch.utils._python_dispatch.TorchDispatchMode
 
@@ -1319,23 +1355,28 @@ def _recovery_type(torch: ModuleType) -> type:
             self, func: Any, types: Any, args: tuple[Any, ...] = (), kwargs: Any = None
         ) -> Any:
             kwargs = kwargs or {}
+            if self.weights.poisoned:
+                raise ResidencyRefusal("residency_poisoned", self.weights.poisoned)
             refused = False
             while True:
                 try:
                     return func(*args, **kwargs)
                 except Exception as exc:
                     need, refused = _room_for(exc, refused)
+                    schema = getattr(func, "_schema", None)
+                    name = getattr(schema, "name", None)
+                    tags = getattr(func, "tags", None)
                     # A schema can declare writes, but not whether a failing kernel already
                     # made them. Random draws and opaque custom operators have the same
                     # problem. Without rollback, replay would silently change the result.
                     if (
-                        not func._schema.name.startswith("aten::")
-                        or func._schema.is_mutable
-                        or torch.Tag.nondeterministic_seeded in func.tags
-                        or torch.Tag.maybe_aliasing_or_mutating in func.tags
+                        not isinstance(name, str)
+                        or not name.startswith("aten::")
+                        or getattr(schema, "is_mutable", None) is not False
+                        or tags is None
+                        or any(getattr(tag, "name", None) not in _REPLAY_TAGS for tag in tags)
                     ):
-                        raise ResidencyRefusal(
-                            "recovery_contract_unavailable",
+                        raise self.weights.recovery_refusal(
                             f"{func} ran out of memory; automatic replay requires a contract "
                             "that restores any writes and random state from its failed call",
                         ) from exc
@@ -2085,10 +2126,10 @@ class PlaneBackend:
                         if (
                             row.name == "model.language_model.embed_tokens.weight"
                             and self._route(group[0]) == "verbatim"
-                        and row.dtype == "bf16"
-                        and type(module) is self.torch.nn.Embedding
-                        and "forward" not in module.__dict__
-                        and module.max_norm is None
+                            and row.dtype == "bf16"
+                            and type(module) is self.torch.nn.Embedding
+                            and "forward" not in module.__dict__
+                            and module.max_norm is None
                         ):
                             indexed[group[0]] = SelectedRows(
                                 cast("tuple[int, int]", tuple(row.shape)),
@@ -2945,6 +2986,11 @@ class WeightResidency:
                     for key, (row, tag, c) in opened.items()
                     if c.last_passes != 1 or row.repeats.get(tag, 0) > 1
                 },
+                single_slot={
+                    key
+                    for key, component in components.items()
+                    if any(region.selected_rows for region in component.blocks)
+                },
             )
 
         # Every component keeps its grain while the budget holds each one's floor at it: a
@@ -2975,7 +3021,7 @@ class WeightResidency:
             if selected:
                 for region in selected:
                     region.selected_rows = True
-                return self._plan(budget, resume, asked)
+                return self._plan(min(budget, weights.driver_budget(method)), resume, asked)
             if not asked and weights.room is not None and weights.cap >= 0:
                 # Never refused for size while the GPU has room to give: the owner makes it
                 # (idle tenants leave, held weights nobody reads are revoked) and raises the cap.
@@ -3182,7 +3228,7 @@ class WeightResidency:
                         try:
                             return forward(*args, **kwargs)
                         finally:
-                            weights.executing.pop()
+                            weights.executing.remove(component.key)
                             weights.running -= 1
                     except _Stale:
                         stale = True
@@ -3198,8 +3244,7 @@ class WeightResidency:
                 if stale:
                     self._restore(component, region)
                     continue
-                raise ResidencyRefusal(
-                    "recovery_contract_unavailable",
+                raise weights.recovery_refusal(
                     f"{component.name}.{region.path} ran out of memory outside a recoverable "
                     "torch operation; the forward cannot be replayed without restoring its state",
                 )

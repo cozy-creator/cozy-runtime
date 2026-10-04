@@ -78,6 +78,22 @@ def test_activations_come_first() -> None:
     assert policy.decode_mode(free=1 << 30, evictable=0, untiled_bytes=3 << 30) == "tiled"
 
 
+def test_h3_bf16_mlp_leaves_can_stream_one_slot_beside_activations_at_one_gib() -> None:
+    # Actual H3 Qwen text MLP leaf: 25600 x 5120 bf16 = 250 MiB. Two copies do not
+    # fit beside this request's context, activation growth and allocation margin.
+    mib = 1 << 20
+    layout = policy.Layout(common=2 * mib, blocks=(25600 * 5120 * 2,) * 6)
+    available, activation = (1 << 30) - 300 * mib, 350 * mib
+    budget = policy.plane_budget(available, activation)
+    placed = policy.stage({"h3": layout}, budget, single_slot={"h3"})["h3"]
+    assert placed.window == 1
+    assert placed.vram_bytes(layout) + activation + policy.MARGIN <= available
+    # Unknown first-pass activations still use one slot for this actual degraded path,
+    # even where two slots technically fit the unmeasured weight budget.
+    unknown = policy.stage({"h3": layout}, available, single_slot={"h3"})["h3"]
+    assert unknown.window == 1
+
+
 def test_attached_regions_are_resident_and_cost_only_their_decoded_copies() -> None:
     """A region the machine keeps (`weights.attach/1`) is on the device outside the budget: the
     stage pays only for the rest, never streams an attached block, and so never drops one."""

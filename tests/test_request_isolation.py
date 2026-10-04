@@ -28,6 +28,9 @@ import msgspec
 from cozy_runtime.author import App, Context, InvalidRequest
 
 app = App()
+fault_weights = None
+fault_input = None
+fault_calls = 0
 
 
 class Request(msgspec.Struct):
@@ -40,6 +43,28 @@ class Result(msgspec.Struct):
 
 @app.entrypoint
 def generate(ctx: Context, payload: Request) -> Result:
+    global fault_input, fault_calls
+    if payload.mode in ("unsafe", "unsafe_caught"):
+        import torch
+        from cozy_runtime.internal.weights import ResidencyRefusal, _recovery_type
+        fault_input = torch.ones(1)
+        library = torch.library.Library("cozy_retained_fault", "FRAGMENT")
+        library.define("mutate(Tensor(a!) value) -> Tensor")
+        def fail(value):
+            global fault_calls
+            fault_calls += 1
+            value.add_(1)
+            raise torch.OutOfMemoryError("Tried to allocate 1 MiB")
+        library.impl("mutate", fail, "CPU")
+        try:
+            with _recovery_type(torch)(fault_weights):
+                try:
+                    torch.ops.cozy_retained_fault.mutate(fault_input)
+                except ResidencyRefusal:
+                    if payload.mode != "unsafe_caught":
+                        raise
+        finally:
+            library._destroy()
     if payload.mode == "refuse":
         raise InvalidRequest("the handler refused this request", code="mode_refused")
     if payload.mode == "cancel":
@@ -124,6 +149,35 @@ def test_a_refused_load_leaves_loaded_constructions_serving(
     assert not executor.poisoned and "b" not in executor.constructions
     assert executor.activate(Activate(construction="a"))["ok"]
     assert _serve(executor, "after", "ok")["outcome"]["terminal"] == "succeeded"
+
+
+@pytest.mark.parametrize("mode", ["unsafe", "unsafe_caught"])
+def test_uncertain_operator_state_retires_a_retained_executor_before_its_next_call(
+    host: tuple[Executor, dict[str, Any]], mode: str
+) -> None:
+    torch = pytest.importorskip("torch")
+    torch.set_num_threads(2)
+    from cozy_runtime.internal.weights import Weights
+
+    executor, load = host
+    assert executor.load(msgspec.convert({**load, "construction": "a"}, Load))["ok"]
+    assert executor.activate(Activate(construction="a"))["ok"]
+    # Real CPU plane + real dispatcher + retained executor. No CUDA context is created.
+    weights = Weights(torch, torch.device("cpu"), "cuda")
+    executor.weights = weights
+    module = sys.modules[MODULE]
+    module.fault_weights = weights
+    failed = _serve(executor, "unsafe", mode)
+    assert failed["poisoned"] and weights.poisoned
+    if mode == "unsafe":
+        assert failed["outcome"]["code"] == "recovery_contract_unavailable"
+    # Even authored code swallowing the refusal cannot make unknown state reusable.
+    assert module.fault_calls == 1 and module.fault_input.item() == 2
+    later = executor.serve_request(
+        PrepareRequest(request_id="later", entrypoint="generate", payload={"mode": "ok"})
+    )
+    assert not later["ok"] and later["code"] == "poisoned_generation"
+    assert module.fault_calls == 1 and module.fault_input.item() == 2
 
 
 def test_a_pin_no_parallel_group_can_run_refuses_before_construction(
