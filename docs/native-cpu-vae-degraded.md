@@ -88,3 +88,18 @@ Runtime-installed GPU hooks. Select the target and transfer the latent before
 the authored CPU dtype branch; preserve author hooks and source custody. These
 are SOURCE gates, not closed by the Store-enabled diagnostic. No mixed-slot
 implementation proceeds before a concrete independent review.
+
+## User-requested stop and revised acceptance gate
+
+On October4 the user explicitly stopped all agents/current work for Opus takeover.
+Root terminated only the recorded BF16 diagnostic PID2137083/birth3277039 with
+SIGTERM and verified exit. The full forward was interrupted; no completed decode,
+image or fidelity result exists. FP32 CPU diagnostic was not run. The partial
+result.json records bindings/admission only; USER-STOP.json is authoritative.
+
+The user explicitly requires byte-identical outputs across memory regimes. The
+previous35dB screen cannot qualify a CPU fallback or memory-dependent tile policy.
+Any future CPU/precision/kernel changes must prove their stated equivalence and
+be separated from same-GPU memory determinism; neither is established here.
+Do not resume an interrupted operation as a successful/replayed forward. A new
+diagnostic must be explicitly independent, with captured source/latent/tensors.
