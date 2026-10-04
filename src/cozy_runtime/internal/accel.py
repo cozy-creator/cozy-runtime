@@ -20,7 +20,6 @@ hand in their `torch` module; this module imports none.
 from __future__ import annotations
 
 import ctypes
-import os
 import re
 import subprocess
 import threading
@@ -31,7 +30,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, Literal, cast
 
-from cozy_runtime.internal.config import sees_no_gpu
+from cozy_runtime.internal.config import inherited_environment, sees_no_gpu
 
 #: The #450 law, imposed on every MPS executor's sealed environment: enabling the fallback
 #: silently runs unsupported operations on CPU, which violates the CPU-refusal law. Forced,
@@ -351,7 +350,8 @@ def drives_display(index: int) -> bool:
     active state: a display server holds memory for a screen there); False where NVML cannot
     say. A connector with a display attached (NVML's display mode: a dummy plug on many
     datacenter GPUs) is not one."""
-    entries = [e.strip() for e in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")]
+    visible = inherited_environment().get("CUDA_VISIBLE_DEVICES", "")
+    entries = [e.strip() for e in visible.split(",")]
     entries = [e for e in entries if e]
     library = _nvml_library()
     entry = entries[index] if index < len(entries) else str(index)
