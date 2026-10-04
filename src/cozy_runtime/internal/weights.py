@@ -1290,21 +1290,24 @@ def close_cursor(component: Component) -> None:
         pass
 
 
-#: Every bake this process made (one plane per process).
-BAKED = lora_bake.Stats()
-
-
 def _bake(torch: ModuleType, region: Region, parts: list[dict[str, Tensor]], home: bool) -> None:
     """Add each LoRA'd linear's delta into the region's resident bytes the first time they are
     placed, before any decode reads them; its PEFT layer then skips the update. A streamed
-    copy holds the unmodified bytes, so it keeps the update every forward."""
+    copy holds the unmodified bytes, so it keeps the update every forward.
+
+    Each weight is baked into a scratch copy and written back in one copy, so a failure (an
+    out-of-memory the block recovers from) leaves the stored bytes as they were."""
     if home and region.bake and not region.baked:
         for bake in region.bakes:
+            stored = parts[bake.weight]
             name = region.weights[bake.weight].row.name
             down = torch.cat([parts[a]["value"] for a, _, _ in bake.factors])
             up = torch.cat([parts[b]["value"] * scale for _, b, scale in bake.factors], dim=1)
             generator = torch.Generator(device=down.device).manual_seed(zlib.crc32(name.encode()))
-            lora_bake.bake(torch, parts[bake.weight], down, up, generator=generator, stats=BAKED)
+            scratch = {role: tensor.clone() for role, tensor in stored.items()}
+            lora_bake.bake(torch, scratch, down, up, generator=generator)
+            for role, tensor in stored.items():
+                tensor.copy_(scratch[role])
         region.baked = True
     for bake in region.bakes:
         bake.layer._cozy_baked = home and region.baked
