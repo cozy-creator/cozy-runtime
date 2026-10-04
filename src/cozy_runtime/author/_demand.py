@@ -161,6 +161,11 @@ class RequestFeatures:
     digest: str
 
 
+def shape_cell(features: Mapping[str, int]) -> str:
+    """The cell demand is banked and read per: the sorted axes, never the whole request."""
+    return ",".join(f"{axis}={value}" for axis, value in sorted(features.items())) or "-"
+
+
 def normalize(payload: object) -> RequestFeatures:
     """Request-time normalization. Same rules as `feature_specs`, applied to VALUES."""
     values: dict[str, int] = {}

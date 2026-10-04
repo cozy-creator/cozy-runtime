@@ -20,11 +20,11 @@ import sys
 import uuid
 from collections.abc import Sequence
 from pathlib import Path
-from typing import TypedDict
 
 import grpc
 
 from cozy_runtime.internal import canonical
+from cozy_runtime.internal.execution_evidence import RuntimeGPU as RuntimeGPU
 from cozy_runtime.internal.refusal import LaunchRefusal
 from cozy_runtime.protocol import WIRE_MINOR
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -32,15 +32,6 @@ from cozy_runtime.protocol import worker_pb2_grpc as pb_grpc
 
 MAX_HTTP_PROOF_BYTES = 64 << 10
 WORKER_TLS_SERVER_NAME = "cozy-worker"
-
-
-class RuntimeGPU(TypedDict):
-    device_index: int
-    device_name: str
-    device_uuid: str
-    driver_version: str
-    memory_bytes: int
-    pci_bus_id: str
 
 
 def pod_boot_id(path: Path) -> str:

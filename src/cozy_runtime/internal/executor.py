@@ -65,6 +65,7 @@ from cozy_runtime.author._activity import blocked, settles
 from cozy_runtime.author._assets import GrantedInput
 from cozy_runtime.author._capture import ActivationCapture
 from cozy_runtime.author._context import AdapterRef, Device
+from cozy_runtime.author._demand import shape_cell
 from cozy_runtime.author._errors import (
     Cancelled,
     CapabilityError,
@@ -205,7 +206,6 @@ from cozy_runtime.internal.weights import (
     WeightResidency,
     Weights,
 )
-from cozy_runtime.internal.worker.plan import shape_cell
 
 #: The inline-result door (worker-protocol/01 `ResultEnvelope`): a small typed result rides
 #: the terminal envelope and skips the file-store round trip. Larger than this REFUSES at

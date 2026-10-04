@@ -24,12 +24,12 @@ from packaging.utils import InvalidWheelFilename, parse_wheel_filename
 from packaging.version import InvalidVersion
 
 from cozy_runtime.internal import base_observation
-from cozy_runtime.protocol import weights_limits
 
 MAX_METADATA_BYTES = 4 << 20
 
 
-MAX_PACKAGE_WHEELS = weights_limits.MAX_LOCAL_PACKAGE_FILES
+MAX_PACKAGE_WHEELS = 129
+MAX_LOCKED_REQUIREMENTS_BYTES = 1 << 20
 
 
 _NORMALIZE = re.compile(r"[-_.]+")
@@ -176,7 +176,7 @@ def read_locked_requirements(raw: bytes) -> LockedRequirements:
     Row order is the exporter's choice; a name may repeat under different markers.
     """
 
-    ceiling = int(weights_limits.MAX_LOCKED_REQUIREMENTS_BYTES)
+    ceiling = MAX_LOCKED_REQUIREMENTS_BYTES
     if not 0 < len(raw) <= ceiling:
         raise EnvironmentRefusal(
             "package_environment_lock_invalid", f"{len(raw)} B is empty or over {ceiling} B"
