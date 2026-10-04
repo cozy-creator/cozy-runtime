@@ -62,7 +62,6 @@ requires = ["hatchling"]
 build-backend = "dual_build_backend"
 backend-path = ["scripts"]
 
-# The public source archive includes the Go agent; default Python builds never compile it.
 # Local dotenv files are not distribution source. VCS ignores also exclude task/output trees.
 [tool.hatch.build.targets.sdist]
 exclude = ["**/.env", "**/.env.*"]
