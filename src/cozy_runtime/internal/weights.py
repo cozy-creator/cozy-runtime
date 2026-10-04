@@ -6,9 +6,9 @@ byte, one weight set per component, in regions: `common` and each innermost no-s
 each component's resident set, window and ring inside the plane budget; the resident set is
 wanted and a cursor streams the rest through its byte ring in the blocks' execution order.
 Each block runs inside exactly one acquire/release; a resident region binds at its stable
-address, a streamed one at its place in the ring, from cached views. A torch OOM at a block
-boundary lowers the budget (unmap only) and runs the block again; capacity never poisons the
-executor.
+address, a streamed one at its place in the ring, from cached views. A safe torch operation
+that runs out of memory lowers the budget (unmap only) and runs again. A block's forward
+is never replayed: successful operations, module state and random draws stay committed.
 """
 
 from __future__ import annotations
@@ -178,9 +178,6 @@ class Region:
     bound: int | None = None
     #: decoded tensors and derived leaf roles kept alive while bound
     derived: list[Tensor] = field(default_factory=list)
-    #: whether its forward writes into its inputs in place, learned on its first run: such a
-    #: block can never run again, so its ops recover from out-of-memory one by one
-    mutates: bool | None = None
     #: its LoRA'd linears; whether to bake them when its bytes are placed; and whether its
     #: resident bytes hold their deltas now (cleared when the plane evicts it)
     bakes: list[Bake] = field(default_factory=list)
@@ -577,18 +574,15 @@ class Weights:
         )
 
     @contextmanager
-    def recovering(self, watch: frozenset[int] = frozenset()) -> Iterator[Watch]:
-        """Run the caller's torch ops with out-of-memory recovery: an op that cannot allocate
-        unmaps weights and runs again. With `watch` (storage addresses), the yielded record
-        notes whether any op wrote into one of them."""
-        seen = Watch(watch)
+    def recovering(self) -> Iterator[None]:
+        """Recover allocation failures at safe operator boundaries, never whole forwards."""
         if self.host_only:
-            yield seen
+            yield
             return
         if self._recovery is None:
             self._recovery = _recovery_type(self.torch)
-        with self._recovery(self, seen):
-            yield seen
+        with self._recovery(self):
+            yield
 
     def make_room(self, need: int, operands: Sequence[object], op: str = "") -> None:
         """An op outside every block ran out of device memory: unmap `need` bytes of weights,
@@ -1273,38 +1267,38 @@ def _recovery_type(torch: ModuleType) -> type:
         """Every torch op outside a block: one that runs out of device memory runs again
         after weights were unmapped for it (retry the op, never the run)."""
 
-        def __init__(self, weights: Weights, seen: Watch) -> None:
+        def __init__(self, weights: Weights) -> None:
             super().__init__()
             self.weights = weights
-            self.seen = seen
 
         def __torch_dispatch__(
             self, func: Any, types: Any, args: tuple[Any, ...] = (), kwargs: Any = None
         ) -> Any:
             kwargs = kwargs or {}
-            seen = self.seen
-            if seen.storages and not seen.mutated and func._schema.is_mutable:
-                seen.mutated = any(
-                    _storage(value) in seen.storages for value in _written(func, args, kwargs)
-                )
             refused = False
             while True:
                 try:
                     return func(*args, **kwargs)
                 except Exception as exc:
                     need, refused = _room_for(exc, refused)
+                    # A schema can declare writes, but not whether a failing kernel already
+                    # made them. Random draws and opaque custom operators have the same
+                    # problem. Without rollback, replay would silently change the result.
+                    if (
+                        not func._schema.name.startswith("aten::")
+                        or func._schema.is_mutable
+                        or torch.Tag.nondeterministic_seeded in func.tags
+                        or torch.Tag.maybe_aliasing_or_mutating in func.tags
+                    ):
+                        raise ResidencyRefusal(
+                            "recovery_contract_unavailable",
+                            f"{func} ran out of memory; automatic replay requires a contract "
+                            "that restores any writes and random state from its failed call",
+                        ) from exc
                 # outside `except`, so the failed op's frames are gone
                 self.weights.make_room(need, (*args, *kwargs.values()), str(func))
 
     return Recovery
-
-
-@dataclass(slots=True)
-class Watch:
-    """Storages to watch for in-place writes, and whether an op wrote into one."""
-
-    storages: frozenset[int]
-    mutated: bool = False
 
 
 def _written(func: Any, args: tuple[object, ...], kwargs: Mapping[str, object]) -> Iterator[object]:
@@ -1312,11 +1306,6 @@ def _written(func: Any, args: tuple[object, ...], kwargs: Mapping[str, object]) 
     for index, argument in enumerate(func._schema.arguments):
         if argument.alias_info is not None and argument.alias_info.is_write:
             yield args[index] if index < len(args) else kwargs.get(argument.name)
-
-
-def _storage(value: object) -> int:
-    pointer = getattr(value, "untyped_storage", None)
-    return int(pointer().data_ptr()) if pointer is not None else -1
 
 
 def _tensor_operands(operands: Sequence[object]) -> Iterator[object]:
@@ -3029,29 +3018,15 @@ class WeightResidency:
     def _block(
         self, component: Component, region: Region, forward: Callable[..., Any]
     ) -> Callable[..., Any]:
-        """The one hook per block: acquire, bind, run, release. A torch OOM releases, lowers
-        the plane budget and runs the block again, while its inputs are untouched."""
+        """The one hook per block: acquire, bind, run once, release. Safe operations recover
+        independently; no observed input behavior can establish a forward replay contract."""
         weights = self.weights
         torch = weights.torch
 
         def run(*args: Any, **kwargs: Any) -> Any:
             try:
-                if region.mutates is False and not weights.grouped:
-                    with self._quiet():  # the block retries as a unit, not op by op
-                        return attempt(*args, **kwargs)
-                # Its first run, a block that writes into its inputs, or one GPU of a group:
-                # its ops recover one by one, and the first run learns whether it writes.
-                inputs = (*args, *kwargs.values())
-                watch = (
-                    frozenset(_storage(v) for v in _tensor_operands(inputs))
-                    if region.mutates is None
-                    else frozenset()
-                )
-                with weights.recovering(watch) as seen:
-                    out = attempt(*args, **kwargs)
-                if region.mutates is None and not weights.host_only:
-                    region.mutates = seen.mutated
-                return out
+                with weights.recovering():
+                    return attempt(*args, **kwargs)
             except self._poisoned_error as exc:
                 raise self._poison(exc) from exc
 
@@ -3064,9 +3039,8 @@ class WeightResidency:
                 weights.hold_host()
             if weights.growing and component.passes == 2 > passes:
                 self._grow()
-            versions = _versions(args, kwargs)
-            # a library's refusal is answered once: by its op where ops recover one by one
-            refused = weights.grouped or region.mutates is not False
+            # A library's refusal is answered by its op, never by replaying the forward.
+            refused = True
             refusals = 0
             while True:
                 stream = weights.stream()
@@ -3111,25 +3085,10 @@ class WeightResidency:
                 if stale:
                     self._restore(component, region)
                     continue
-                if weights.grouped or region.mutates is not False:
-                    raise self._shortfall(
-                        self.active[0] if self.active else "",
-                        need,
-                        0,
-                        f"{component.name}.{region.path} ran out of memory outside torch's "
-                        "own ops, and it shares its call with its group or writes into its "
-                        "inputs, so it cannot run again",
-                    )
-                if _versions(args, kwargs) != versions:
-                    raise self._shortfall(
-                        self.active[0] if self.active else "",
-                        need,
-                        0,
-                        f"{component.name}.{region.path} ran out of memory after changing its "
-                        "inputs in place, so it cannot run again",
-                    )
-                self._make_room(
-                    need, {component.key: region.index}, f"{component.name}.{region.path}"
+                raise ResidencyRefusal(
+                    "recovery_contract_unavailable",
+                    f"{component.name}.{region.path} ran out of memory outside a recoverable "
+                    "torch operation; the forward cannot be replayed without restoring its state",
                 )
 
         return run
@@ -3520,18 +3479,6 @@ def _device_pool(exc: BaseException) -> bool:
     if pool is not None:
         return bool(pool == "device")
     return str(exc).startswith("budget exceeded in device")
-
-
-def _versions(args: tuple[Any, ...], kwargs: Mapping[str, Any]) -> tuple[int, ...]:
-    """In-place mutation counters of the block's tensor inputs (one level deep). Inference
-    tensors keep none; a block under `inference_mode` re-runs unchecked (retry the op)."""
-    out: list[int] = []
-    for value in (*args, *kwargs.values()):
-        for item in value if isinstance(value, (tuple, list)) else (value,):
-            inference = getattr(item, "is_inference", None)
-            if inference is not None and not inference():
-                out.append(int(item._version))
-    return tuple(out)
 
 
 def _requested(exc: BaseException) -> int:
