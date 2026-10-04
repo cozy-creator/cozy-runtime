@@ -205,6 +205,14 @@ class Channel:
             raise
         return received
 
+    def pass_fd(self, to: Channel) -> None:
+        """Relay one descriptor to another seam unopened: its receiver checks what it is."""
+        fd = self._recv_fd()
+        try:
+            to._send_fd(fd, "relayed capability")
+        finally:
+            os.close(fd)
+
     def _send_fd(self, fd: int, what: str) -> None:
         try:
             sent = self.sock.sendmsg(

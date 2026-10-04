@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import os
 import socket
+import sys
 import threading
 from pathlib import Path
 from typing import Any
@@ -25,9 +26,10 @@ from tensorfs import Store  # noqa: E402
 from tensorfs import plane as tfs_plane  # noqa: E402
 
 from cozy_runtime.author._executor_requests import SealedPlan  # noqa: E402
-from cozy_runtime.internal import canonical, plane  # noqa: E402
+from cozy_runtime.internal import canonical, plane, spawn  # noqa: E402
 from cozy_runtime.internal.executor import Executor  # noqa: E402
 from cozy_runtime.internal.fill import Checkpoint, FillRefusal  # noqa: E402
+from cozy_runtime.internal.parallel.group import RankGroup  # noqa: E402
 from cozy_runtime.internal.seam import Channel  # noqa: E402
 from cozy_runtime.internal.weights import HostTiers, Weights  # noqa: E402
 from test_host_tier import GpuTier  # noqa: E402
@@ -252,5 +254,63 @@ def test_with_model_sources_an_executor_opens_no_store(tmp_path: Path) -> None:
         assert same(run(model, x, passes=1), [expected])
         assert model.backend.stats["leases"]["acquisitions"] == 0
     finally:
+        session.close()
+        machine.close()
+
+
+def test_a_groups_follower_asks_the_machine_through_rank_0_and_opens_no_store(
+    tmp_path: Path,
+) -> None:
+    """A real follower process loads as rank 0 does: its header, assets and sealed layouts are
+    its own requests to the machine, relayed on rank 0's seam. Its store path names nothing.
+    The machine fills each layout once for both GPUs, and a follower refining later, on its
+    own, is served the same way."""
+    stored, values = write_checkpoint(tmp_path)
+    machine = Machine(stored.root)
+    session = Session(machine, tmp_path)
+    leader: Any = session.executor
+    fixture = Path(__file__).parent / "testdata" / "sealed_follower.py"
+
+    def launch(module_argv: list[str], fd: int) -> spawn.Child:
+        return spawn.spawn_follower(
+            python=sys.executable,
+            module_argv=[str(fixture), *module_argv[2:]],
+            inherit_fd=fd,
+            env={**os.environ, "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"},
+        )
+
+    group = RankGroup(
+        degree=2, backend="cpu:gloo", root=str(tmp_path), launch=launch, relay=leader._relay
+    )
+    manifest = stored.manifest_id
+    try:
+        group.spawn()
+        # Both GPUs load at once: rank 0's own requests and the relayed ones share its seam.
+        group.send_one(1, {"cmd": "adopt", "manifest": manifest, "construction": "group"})
+        checkpoint = Checkpoint(
+            tmp_path / "no-store-here",
+            manifest,
+            sourced=lambda name: leader._model_source(manifest, name),
+        )
+        weights = Weights(torch, torch.device("cpu"), "cpu")
+        model = load(weights, checkpoint, "group", tiers=leader._tiers(False, True))
+        assert model.backend.components["stack"].sealed
+        x = torch.rand(4, HIDDEN, generator=torch.Generator().manual_seed(3)).half()
+        reference = Stack()
+        reference.load_state_dict(values)
+        with torch.inference_mode():
+            expected = hashlib.sha256(reference(x).numpy().tobytes()).hexdigest()
+        reply = group.reply_one(1, "adopt")
+        assert reply["ok"] and not group.broken, (reply, group.broken)
+        assert reply["store"] is False and reply["leases"] == 0
+        assert reply["assets"] == len(stored.model_assets())
+        assert reply["sealed"] == [True, True] and reply["refined"] is True
+        assert reply["outputs"] == [expected, expected]
+        assert reply["refused"] is True  # only the machine's layouts and files are relayed
+        # one copy of each layout for both GPUs: the coarse one, and the follower's finer one
+        assert machine.fills == 2 and len(machine.held) == 2
+        assert_pinned(weights, model.backend.components["stack"], values)
+    finally:
+        group.close()
         session.close()
         machine.close()
