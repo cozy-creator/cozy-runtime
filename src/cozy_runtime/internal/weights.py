@@ -190,10 +190,6 @@ class Region:
     baked_with: list[object] = field(default_factory=list)
     #: a bake failed part way: the resident bytes must refill before any use
     dirty: bool = False
-    #: streamed copies baked in place: ring address -> (what was added, bytes that show it)
-    ring: dict[int, tuple[list[object], list[tuple[Tensor, Tensor, Tensor]]]] = field(
-        default_factory=dict
-    )
 
     @property
     def transforms(self) -> bool:
@@ -1131,7 +1127,7 @@ def bind(
                 views.writes[i] = (table, name, tensor, value)
             table[name] = value
     if region.bakes:
-        _bake(torch, region, views.parts, address, lease.ring_offset is None, refill)
+        _bake(torch, region, views.parts, lease.ring_offset is None, refill)
     if region.transforms and (moved or lease.ring_offset is not None):
         region.derived = _transform(torch, region, views.parts)
     region.bound = address
@@ -1374,51 +1370,40 @@ def _bake(
     torch: ModuleType,
     region: Region,
     parts: list[dict[str, Tensor]],
-    address: int,
     home: bool,
     refill: bool,
 ) -> None:
     """Add each LoRA'd linear's delta into the region's bytes before any decode reads them;
     its update then skips. Resident bytes are baked the first time they are placed. A
-    streamed copy is the stored bytes again, so it is baked as it arrives, the same way (a
-    seed per weight makes every bake of a weight the same bytes): outputs never depend on
-    placement. A copy already baked in its ring slot is recognized by bytes the bake changed.
+    streamed copy is a fresh copy of the stored bytes at every acquire (each cursor position
+    is its own copy), so it is baked as it arrives, the same way: one seed per weight makes
+    every bake of a weight the same bytes, and outputs never depend on placement.
 
     Resident bytes holding a delta the coming forward does not want (a base forward of a DiT
-    baked for its turbo overlay, or another overlay) raise `_Stale` where the caller can
-    refill them (`refill`, a block's own lease); elsewhere the read sees the baked bytes.
-    Each weight is baked into a scratch copy and written back in one copy, so a failure (an
-    out-of-memory the block recovers from) leaves the stored bytes as they were."""
+    baked for its turbo overlay, or another overlay), or left half baked by a failure, raise
+    `_Stale` where the caller can refill them (`refill`, a block's own lease); elsewhere the
+    read sees the bytes as they are."""
     keys = [_bake_key(bake) for bake in region.bakes]
     wanted = region.bake and None not in keys
-    if home:
-        if refill and (region.dirty or (region.baked and keys != region.baked_with)):
-            raise _Stale(region.index)
-        if wanted and not region.baked:
+    if not home:
+        if wanted:
             _apply(torch, region, parts)
-            region.baked, region.baked_with = True, keys
-        baked = region.baked and keys == region.baked_with
-    else:
-        mark = region.ring.get(address)
-        if wanted and not (mark and mark[0] == keys and _shows(mark[1])):
-            region.ring.pop(address, None)
-            while len(region.ring) > weight_policy.MAX_WINDOW:
-                del region.ring[next(iter(region.ring))]
-            region.ring[address] = (keys, _apply(torch, region, parts))
-        baked = wanted
+        for bake in region.bakes:
+            bake.layer._cozy_baked = wanted
+        return
+    if refill and (region.dirty or (region.baked and keys != region.baked_with)):
+        raise _Stale(region.index)
+    if wanted and not region.baked:
+        region.dirty = True  # until every weight is baked
+        _apply(torch, region, parts)
+        region.baked, region.baked_with, region.dirty = True, keys, False
+    baked = region.baked and keys == region.baked_with
     for bake in region.bakes:
         bake.layer._cozy_baked = baked
 
 
-def _apply(
-    torch: ModuleType, region: Region, parts: list[dict[str, Tensor]]
-) -> list[tuple[Tensor, Tensor, Tensor]]:
-    """Bake every LoRA'd weight of the region in place, a row chunk at a time; returns, per
-    weight, up to 16 sampled bytes the bake changed (stored bytes, positions, values) to
-    recognize a baked copy by. A failure part way (an out-of-memory) leaves the region dirty:
-    its bytes are neither the stored ones nor baked, so it refills before any use."""
-    marks = []
-    region.dirty = True
+def _apply(torch: ModuleType, region: Region, parts: list[dict[str, Tensor]]) -> None:
+    """Bake every LoRA'd weight of the region in place, a row chunk at a time."""
     for bake in region.bakes:
         stored = parts[bake.weight]
         name = region.weights[bake.weight].row.name
@@ -1433,28 +1418,7 @@ def _apply(
         generator = torch.Generator(device=stored_device(stored)).manual_seed(
             zlib.crc32(name.encode())
         )
-        raws = {role: tensor.view(-1).view(torch.uint8) for role, tensor in stored.items()}
-        probes = {
-            role: torch.arange(0, raw.numel(), max(raw.numel() // _PROBES, 1), device=raw.device)
-            for role, raw in raws.items()
-        }
-        before = {role: raws[role][where].clone() for role, where in probes.items()}
         lora_bake.bake(torch, stored, down, up, generator=generator)
-        for role, where in probes.items():
-            changed = where[raws[role][where] != before[role]][:16]
-            if changed.numel():
-                marks.append((raws[role], changed, raws[role][changed].clone()))
-    region.dirty = False
-    return marks
-
-
-#: Bytes of each baked weight sampled to find bytes its bake changed.
-_PROBES = 1 << 16
-
-
-def _shows(marks: list[tuple[Tensor, Tensor, Tensor]]) -> bool:
-    """The copy at this address still holds what its bake wrote (a fresh copy differs)."""
-    return all(bool((raw[where] == values).all()) for raw, where, values in marks)
 
 
 def stored_device(stored: dict[str, Tensor]) -> Any:
@@ -2197,7 +2161,10 @@ def _lora_layers(root: Module, region: Region) -> list[Bake]:
         if target == weight.row.name:
             site = weight.row.name.removesuffix(".weight")
             if region.path and site != weight.row.name:
-                hooks: Iterable[object] = root.get_submodule(site)._forward_hooks.values()
+                try:
+                    hooks: Iterable[object] = root.get_submodule(site)._forward_hooks.values()
+                except AttributeError:  # a tensor named `.weight` on no module of its own
+                    continue
                 found.extend(
                     Bake(hook, index, [], hook.lora_factors)
                     for hook in hooks
