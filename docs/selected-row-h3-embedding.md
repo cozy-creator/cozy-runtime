@@ -44,3 +44,15 @@ Required rental gates:
 The safe OOM-recovery and idle-component changes in Runtime #1159 are required before
 combining this path with constrained inference. Whole-forward and collective replay
 are not a substitute for a state-preserving allocation recovery contract.
+
+The actual degraded text component streams one slot so speculative double buffering
+cannot consume an unknown first-pass activation peak. The remaining H3 bf16 MLP leaf
+is250MiB (25600x5120), which fits one slot at1GiB beside measured context/activations.
+Driver budgeting uses the actual one-slot floor and recomputes after the table leaves
+residency; two slots are an optimization, never a mandatory minimum.
+
+Integration prerequisite: ObjectFiles is exposed only when Load.staged_tiers and
+plane.SEALED_HOLES are available. The reviewed B1 machine wiring and a TensorFS plane
+with register_sealed(files=...) are required; stock e044plane and current master
+without staged_tiers do not activate this path. This affects selected-row recovery,
+not baseline operation compatibility.

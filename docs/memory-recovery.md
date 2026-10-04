@@ -39,7 +39,7 @@ safe recovery on continued H3 groups remain unqualified.
 | Work | Implementation | Completion gate |
 |---|---|---|
 | Atomic recovery | Never replay a whole forward from inferred purity. Retry pure ATen operations; failed mutable, random or opaque ops identify `recovery_contract_unavailable`. | Real CPU fault tests, exact-output constrained CUDA inference, matched launch overhead |
-| Nested dispatch | One recovery mode per active execution, avoiding duplicate nested block modes. | Dispatcher ordering tests and GPU launch timings |
+| Nested dispatch | One recovery mode per Python thread, avoiding duplicate nested block modes without suppressing another thread. | Dispatcher ordering tests and GPU launch timings |
 | Idle components | Implemented: track executing components and reclaim other idle regions while a failed safe op retains its block lease. Operand-backed components stay; live executing cursors never close or replan. | Added real GPU plane gate; bit-identical grouped and alternating Anima at 1.5, 1.25 and 1 GiB remain pending |
 | Trusted context | Use per-device attributable process memory. Unknown stays unknown. Add measurement provenance, discard only old untrusted persisted context rows, and learn each rank's own context. | CPU migration/rank-selection tests and concurrent foreign-allocation CUDA startup |
 | Collective recovery | Keep the inherited whole-call rerun branch unmerged. Define an explicit collective operation transaction with rollback or restart from an authored checkpoint. | Mid-collective failure on two real GPUs with state/RNG/output proof |
@@ -90,3 +90,5 @@ execution, output delivery, paging traffic, lowest free memory and executor reus
 Compare against ComfyUI with identical workload semantics and independently
 recorded cache state. Success requires every request completing correctly and the
 matched workload winning; mechanism tests alone do not establish either outcome.
+
+Unsafe failed operators latch process poison even before handler entry or when authored code catches the refusal. Retained executors cannot serve a subsequent call from unproven state; the machine also fences held GPU allocations until reader release or observed exit. New CPU retained-executor cases cover uncaught and caught failures. Unknown future tag/schema metadata is isolated to typed recovery capability failure, without a Torch version gate.

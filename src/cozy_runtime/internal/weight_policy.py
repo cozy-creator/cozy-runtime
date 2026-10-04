@@ -178,6 +178,7 @@ def residence(
     order: Sequence[int] = (),
     costs: Costs | None = None,
     cyclic: bool = True,
+    single_slot: bool = False,
 ) -> Residence:
     """The fastest placement of one component that fits `budget`.
 
@@ -205,10 +206,16 @@ def residence(
     typical = sum(known) / len(known) if known else 1.0
     compute = [costs.compute.get(i, typical) for i in walk] if measured else [1.0] * count
     if not cyclic:
-        width = DEFAULT_WINDOW if layout.common + ring_bytes(sizes, DEFAULT_WINDOW) <= budget else 1
+        width = (
+            DEFAULT_WINDOW
+            if not single_slot and layout.common + ring_bytes(sizes, DEFAULT_WINDOW) <= budget
+            else 1
+        )
         return Residence((), tuple(walk), width, ring_bytes(sizes, width))
     best: tuple[float, int, int, Residence] | None = None
-    widths = range(1, MAX_WINDOW + 1) if measured else (DEFAULT_WINDOW, 1)
+    widths = (
+        (1,) if single_slot else (range(1, MAX_WINDOW + 1) if measured else (DEFAULT_WINDOW, 1))
+    )
     picks = (_spread(compute), _tail(count), _dense(sizes, compute))
     for width in widths:
         for pick in picks:
@@ -301,6 +308,7 @@ def stage(
     orders: Mapping[str, Sequence[int]] | None = None,
     costs: Mapping[str, Costs] | None = None,
     cyclic: Collection[str] = (),
+    single_slot: Collection[str] = (),
 ) -> dict[str, Residence]:
     """Every declared component's residence for one stage, inside one plane budget.
 
@@ -328,6 +336,7 @@ def stage(
                 order=orders.get(name, ()),
                 costs=costs.get(name),
                 cyclic=name in cyclic,
+                single_slot=name in single_slot,
             )
         except BelowFloor as exc:
             raise BelowFloor(
