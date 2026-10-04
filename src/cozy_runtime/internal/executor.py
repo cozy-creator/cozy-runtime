@@ -736,6 +736,9 @@ class Executor:
         if self.world > 1 and self.device_kind == "cuda":
             torch.cuda.set_device(self.rank)
         accel.first_launches(torch, self.device_kind)
+        device = self._rank_device(torch)
+        if device.type == "cuda":
+            image_vae.streams(torch, device)
         accel.reset_peak(torch, self.device_kind)
         pid = os.getpid()
         row = accel.process_memories_by_device({pid}, self.device_kind, (entry,))[entry][pid]

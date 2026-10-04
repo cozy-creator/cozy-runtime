@@ -37,3 +37,15 @@ def test_torch_device_oom_is_still_recognized() -> None:
     torch = pytest.importorskip("torch")
     exc = torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 2.00 GiB")
     assert classify(exc).code == DEVICE_OOM
+
+
+def test_a_driver_call_out_of_device_memory_is_a_device_oom() -> None:
+    """Run 4297: the driver could not allocate a stream on a full card."""
+    torch = pytest.importorskip("torch")
+    exc = torch.AcceleratorError(
+        "CUDA error: out of memory\nSearch for `cudaErrorMemoryAllocation' in the CUDA runtime "
+        "API for more information.\nThe CUDA driver logged these messages:\n"
+        "Returning 2 (CUDA_ERROR_OUT_OF_MEMORY) from cuStreamCreateWithPriority"
+    )
+    assert is_device_oom(exc)
+    assert classify(exc).code == DEVICE_OOM

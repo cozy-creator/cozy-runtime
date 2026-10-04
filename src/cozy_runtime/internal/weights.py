@@ -3360,6 +3360,7 @@ class WeightResidency:
         never depends on memory: memory decides only where its maps live. Idle weights unmap
         for its maps and bands first (activations first); short of that room, or out of memory
         part way, its maps live in host memory, and a failed step runs again from its input.
+        Out of device memory on host maps (a driver call included), room is made and it runs again.
         The mode is recorded in the run's outputs."""
         weights = self.weights
 
@@ -3377,13 +3378,18 @@ class WeightResidency:
                     out = exact.run(self._within(name), host)
                     break
                 except Exception as exc:
-                    capacity = is_device_oom(exc) or (
-                        isinstance(exc, ResidencyRefusal) and exc.code == INDIVISIBLE
-                    )
-                    if host or not capacity:
+                    oom = is_device_oom(exc)
+                    refused = isinstance(exc, ResidencyRefusal) and exc.code == INDIVISIBLE
+                    if not oom and (host or not refused):
                         raise
+                    need = _requested(exc) if host else -1
                 # outside `except`, so the failed step's frames are gone
                 accel.release_cached(weights.torch, weights.kind)
+                if need >= 0:
+                    # Already on host maps: weights unmap and idle tenants leave, then the
+                    # failed step runs again from its input; a retry that gains nothing ends
+                    # it by its own name.
+                    weights.make_room(need, (), f"{name}.decode")
                 host = True
             weights.modes[f"{name}.decode"] = f"chunked {exact.rows}" + (" host" if host else "")
             # The decode's transient activations go back to the driver: kept in torch's

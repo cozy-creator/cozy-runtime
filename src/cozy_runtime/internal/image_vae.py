@@ -48,6 +48,16 @@ AHEAD = 4
 #: keeps a stream's freed blocks for that stream alone.
 _STREAMS: dict[Any, tuple[Any, Any]] = {}
 
+
+def streams(torch: Any, device: Any) -> tuple[Any, Any]:
+    """`device`'s host map copy streams, made once. The executor makes them at device init,
+    before any weights map: on a full card the driver cannot allocate a stream, under a name
+    that is not torch's out-of-memory (run 4297: `cuStreamCreateWithPriority`)."""
+    if device not in _STREAMS:
+        _STREAMS[device] = torch.cuda.Stream(device), torch.cuda.Stream(device)
+    return _STREAMS[device]
+
+
 #: (module, body) -> body(), with the module's weights bound for all of it
 type Within = Callable[[Any, Callable[[], Any]], Any]
 
@@ -249,10 +259,7 @@ class Decode:
         memory when `host`, and so does the map the step that runs first reads."""
         self.within, self.host = within or _direct, host
         if host and self.device.type == "cuda":
-            if self.device not in _STREAMS:
-                stream = self.torch.cuda.Stream
-                _STREAMS[self.device] = stream(self.device), stream(self.device)
-            self.reads, self.writes = _STREAMS[self.device]
+            self.reads, self.writes = streams(self.torch, self.device)
         if host and self.step > 0 and self.x.dim() == 4 and self.device.type == "cuda":
             x, (channels, height, width) = self.x, _dims(self.x)
             self.x = self._new(channels, height, width)
