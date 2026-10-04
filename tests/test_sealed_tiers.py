@@ -1,4 +1,5 @@
-"""Executors adopt the machine's sealed host layouts (`host_tiers.sealed/1`).
+"""Executors adopt the machine's sealed host layouts (`host_tiers.sealed/1`), staged in part
+when they read the holes from the object files the machine hands over (`host_tiers.staged/1`).
 
 Real: a TensorFS store, the machine's half as TensorFS does it (`tensorfs.plane.fill_sealed`:
 the verified read path, then seals), the executor's own durable exchange over a seam
@@ -51,13 +52,17 @@ pytestmark = pytest.mark.skipif(
 class Machine:
     """The machine's half: fill each asked layout once, keep it, hand out read-only views."""
 
-    def __init__(self, root: str, room: bool = True) -> None:
+    def __init__(self, root: str, room: bool = True, staged: bool = False) -> None:
         self.store = Store.open(root)
         self.room = room
+        #: its executors read holes: a prefetch opens layouts with nothing staged (no fill)
+        self.staged = staged
         self.held: dict[tuple[str, str], int] = {}
         self.fills = 0
         self.prefetches = 0
         self.sourced = 0
+        self.stage_asks: list[tuple[int, ...]] = []
+        self.handed = 0
 
     @staticmethod
     def plans(frame: dict[str, Any], memfd: int) -> Any:
@@ -66,7 +71,7 @@ class Machine:
         assert hashlib.sha256(body).hexdigest() == frame["sha256"]
         return canonical.parse(body)
 
-    def answer(self, doc: SealedPlan) -> int | None:
+    def answer(self, doc: SealedPlan, stage: list[int] | None = None) -> int | None:
         key = (doc.name, doc.layout)
         if key not in self.held:
             if not self.room:
@@ -79,12 +84,33 @@ class Machine:
             if doc.parts:
                 plan = plan.select(list(doc.parts))
             lease = self.store.acquire_cozytensors(doc.manifest)
-            fd, _ = tfs_plane.fill_sealed(
-                self.store, lease, plan, [list(r) for r in doc.regions], doc.name, 2
-            )
+            regions = [list(r) for r in doc.regions]
+            staged: dict[str, Any] = {} if stage is None else {"staged": stage}
+            fd, _ = tfs_plane.fill_sealed(self.store, lease, plan, regions, doc.name, 2, **staged)
             self.held[key] = fd
             self.fills += 1
         return os.open(f"/proc/self/fd/{self.held[key]}", os.O_RDONLY | os.O_CLOEXEC)
+
+    def object_files(self, doc: SealedPlan) -> list[tuple[str, int, int]]:
+        """The verified object files behind a layout's plan, read-only, in SHA-256 order: its
+        holes read them."""
+        header = self.store.manifest(doc.manifest)["header"]
+        plan = tensorfs.plan(header, list(doc.traversal), list(doc.components), window=doc.window)
+        if doc.parts:
+            plan = plan.select(list(doc.parts))
+        with self.store.acquire_cozytensors(doc.manifest):  # verifies the closure
+            objects = sorted(
+                {
+                    i["object"].removeprefix("sha256:"): i["object_length"]
+                    for i in plan.items()
+                    if i.get("source") == "object"
+                }.items()
+            )
+        files = []
+        for digest, length in objects:
+            path = Path(self.store.root, "blobs", digest[:2], digest[2:4], digest)
+            files.append((digest, length, os.open(path, os.O_RDONLY | os.O_CLOEXEC)))
+        return files
 
     def source(self, frame: dict[str, Any]) -> bytes:
         """A model file, as the machine serves it (`model_source`): the header or an asset."""
@@ -116,14 +142,34 @@ class Machine:
             sent = self.plans(frame, channel.recv_memfd())
             if frame["kind"] == "sealed_prefetch":  # fill every plan now; asks then hit
                 self.prefetches += 1
-                for doc in msgspec.convert(sent, list[SealedPlan]):
+                for doc in [] if self.staged else msgspec.convert(sent, list[SealedPlan]):
                     fd = self.answer(doc)
                     if fd is not None:
                         os.close(fd)
                 channel.send({"event": "answer", "seq": frame["seq"], "ok": True})
                 continue
+            if frame["kind"] == "object_files":
+                files = self.object_files(msgspec.convert(sent, SealedPlan))
+                self.handed += len(files)
+                listed = "".join(f"{sha}:{length}\n" for sha, length, _ in files).encode()
+                channel.send(
+                    {"event": "answer", "seq": frame["seq"], "ok": True}
+                    | {"objects_sha256": hashlib.sha256(listed).hexdigest()}
+                    | {"descriptors": len(files)}
+                )
+                for _, _, fd in files:
+                    channel._send_fd(fd, "object file")
+                    os.close(fd)
+                continue
+            if frame["kind"] == "sealed_stage":  # no room to stage more: they read the files
+                self.stage_asks.append(tuple(frame["stage_regions"]))
+                channel.send({"event": "answer", "seq": frame["seq"], "ok": True, "staged": []})
+                continue
             assert frame["kind"] == "sealed_tier"
-            granted = self.answer(msgspec.convert(sent, SealedPlan))
+            stage = frame.get("stage_regions")
+            if stage is not None:
+                self.stage_asks.append(tuple(stage))
+            granted = self.answer(msgspec.convert(sent, SealedPlan), stage)
             channel.send(
                 {"event": "answer", "seq": frame["seq"], "ok": True, "held": granted is not None}
                 | ({"descriptor": True} if granted is not None else {})
@@ -140,7 +186,7 @@ class Machine:
 class Session:
     """One executor's seam to the machine."""
 
-    def __init__(self, machine: Machine, tmp: Path) -> None:
+    def __init__(self, machine: Machine, tmp: Path, stage: tuple[int, ...] | None = None) -> None:
         ours, theirs = socket.socketpair()
         self.stop = threading.Event()
         self.sockets = (ours, theirs)
@@ -149,11 +195,14 @@ class Session:
         )
         self.thread.start()
         executor = self.executor = Executor(Channel(ours), tmp)
+        staged = stage is not None
         self.tiers = HostTiers(
             ask=lambda *_: None,
             offer=lambda *_: None,
-            seal=executor._seal_tier,
+            seal=(lambda p: executor._seal_tier(p, stage)) if staged else executor._seal_tier,
             prefetch=executor._prefetch_tiers,
+            stage=executor._stage_tier if staged else None,
+            files=executor._object_files if staged else None,
         )
 
     def close(self) -> None:
@@ -313,4 +362,48 @@ def test_a_groups_follower_asks_the_machine_through_rank_0_and_opens_no_store(
     finally:
         group.close()
         session.close()
+        machine.close()
+
+
+@pytest.mark.skipif(not plane.sealed_holes(), reason="a TensorFS that reads holes from files")
+def test_a_layout_staged_in_part_pins_only_what_was_staged_and_reads_no_store(
+    tmp_path: Path,
+) -> None:
+    """`host_tiers.staged/1`: a GPU executor asks for its layout with nothing staged (the
+    machine stages only what streams), or with some regions staged. The machine hands over the
+    verified object files for the holes; the executor pins only staged regions, fills nothing
+    itself and takes no lease."""
+    checkpoint = write_checkpoint(tmp_path)[0]
+    machine = Machine(checkpoint.root, staged=True)
+    budget = 64 << 20
+    nothing, some = Session(machine, tmp_path, stage=()), Session(machine, tmp_path, stage=(0,))
+    try:
+        gpu = GpuTier(torch, torch.device("cpu"), "cpu")
+        gpu.set_budget(-1, budget)
+        model = load(gpu, checkpoint, "holes", tiers=nothing.tiers)
+        component = model.backend.components["stack"]
+        assert component.sealed and component.staging is not None
+        assert machine.stage_asks == [()] and machine.handed > 0
+        if component.filling is not None:
+            component.filling.wait()
+        tier = plane.stats(gpu.plane).host
+        assert tier.used == 0 and tier.fill_bytes == 0, tier  # holes: nothing here to pin
+        assert model.backend.stats["leases"]["acquisitions"] == 0
+
+        # Streaming blocks are asked for as stages plan them; this machine has no room left.
+        plan, tiers = component.staging
+        assert tiers.stage is not None and tiers.stage(plan, [1, 2]) == []
+        assert machine.stage_asks == [(), (1, 2)]
+
+        part = GpuTier(torch, torch.device("cpu"), "cpu")
+        part.set_budget(-1, budget)
+        again = load(part, checkpoint, "part", tiers=some.tiers).backend.components["stack"]
+        assert again.sealed and machine.stage_asks[2:] == [(0,)]
+        if again.filling is not None:
+            again.filling.wait()
+        tier = plane.stats(part.plane).host
+        assert tier.used == again.regions[0].span and tier.fill_bytes == 0, tier
+    finally:
+        nothing.close()
+        some.close()
         machine.close()

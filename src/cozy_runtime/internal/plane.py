@@ -169,6 +169,11 @@ def sealed_available() -> bool:
     return _plane is not None and hasattr(_plane.Plane, "register_sealed")
 
 
+def sealed_holes() -> bool:
+    """This TensorFS takes a layout staged in part, reading its holes from object files."""
+    return sealed_available() and getattr(_plane, "SEALED_HOLES", False) is True
+
+
 def sealed_filling() -> bool:
     """This TensorFS adopts a sealed layout still filling, waiting per region."""
     return sealed_available() and getattr(_plane, "SEALED_WHILE_FILLING", False) is True

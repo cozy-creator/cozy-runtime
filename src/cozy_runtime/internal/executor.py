@@ -86,15 +86,19 @@ from cozy_runtime.author._executor_requests import (
     Handoff,
     HostTier,
     ModelSource,
+    ObjectFiles,
+    ObjectFilesAnswer,
     Publish,
     Published,
     Request,
     Room,
     SealedPlan,
     SealedPrefetch,
+    SealedStage,
     SealedTier,
     SharedRegion,
     SourceBytes,
+    Staged,
     StageEnter,
     StageExit,
     StageGo,
@@ -144,6 +148,7 @@ from cozy_runtime.internal.executor_commands import (
     PROCESS_CAP,
     RANK_CELLS,
     SEALED_FILLING,
+    SEALED_STAGED,
     SEALED_TIERS,
     Activate,
     Attention,
@@ -647,6 +652,7 @@ class Executor:
                 *(plane.SHARING if plane.sharing() else ()),
                 *([SEALED_TIERS] if plane.sealed_available() else []),
                 *([SEALED_FILLING] if plane.sealed_filling() else []),
+                *([SEALED_STAGED] if plane.sealed_holes() else []),
             ],
             "memo": [stage_memo.CAPABILITY],
             "pgid": os.getpgrp(),
@@ -2148,7 +2154,11 @@ class Executor:
             qualified=qualified_pair,
             device_facts=device_facts,
             custody=binding.custody,
-            tiers=self._tiers(command.host_tier, command.sealed_tiers),
+            tiers=self._tiers(
+                command.host_tier,
+                command.sealed_tiers,
+                staged=command.staged_tiers and not weights.host_only,
+            ),
         )
         stage("backend_ctor")
         # THE GROUP AGREES ITS PLAN before any rank registers a byte (cr-068). Budgets are
@@ -2517,6 +2527,7 @@ class Executor:
                     pinned_bytes=command.pinned_bytes,
                     sealed_tiers=command.sealed_tiers,
                     model_sources=command.model_sources,
+                    staged_tiers=command.staged_tiers,
                     cap_bytes=command.cap_bytes,
                     rank_caps=command.rank_caps,
                 ),
@@ -3837,23 +3848,31 @@ class Executor:
         """One product onto the run's output log, durable before this returns."""
         return self._durable(request, Published)
 
-    def _tiers(self, worker: bool, sealed: bool = False) -> HostTiers | None:
+    def _tiers(self, worker: bool, sealed: bool = False, staged: bool = False) -> HostTiers | None:
         """Where this rank's pinned tiers come from. Sealed: every rank asks the machine for
         its layouts (a follower through rank 0, `_relay`), and the machine hands K ranks one
         copy. Otherwise a follower adopts its leader's, and rank 0 asks and offers the
-        worker's tiers when it keeps them and shares every tier with its followers."""
+        worker's tiers when it keeps them and shares every tier with its followers. `staged`:
+        a GPU executor, whose layouts may be staged in part (a CPU one computes on them)."""
         host = self.host
         if self.rank > 0 and not sealed:
             return HostTiers(ask=self._leader_tier, offer=lambda *_: None)
         worker = worker and self.rank == 0
         if not worker and not sealed and self.group is None:
             return None
+        # With a TensorFS that reads holes from object files, the machine stages only the
+        # regions this executor streams (`host_tiers.staged/1`).
+        staged = staged and sealed and plane.sealed_holes()
         return HostTiers(
             ask=host._ask_tier if worker else lambda *_: None,
             offer=host._offer_tier if worker else lambda *_: None,
             share=(lambda *_: None) if sealed else self._share_tier,
-            seal=host._seal_tier if sealed else None,
+            seal=((lambda p: host._seal_tier(p, ())) if staged else host._seal_tier)
+            if sealed
+            else None,
             prefetch=host._prefetch_tiers if sealed else None,
+            stage=host._stage_tier if staged else None,
+            files=host._object_files if staged else None,
         )
 
     def _share_tier(self, name: str, layout: str, memfd: int) -> None:
@@ -3916,9 +3935,10 @@ class Executor:
             raise RuntimeError(f"{name or 'header'} of {manifest[:23]} differs from its digest")
         return bytes(body)
 
-    def _seal_tier(self, plan: SealedPlan) -> int | None:
+    def _seal_tier(self, plan: SealedPlan, stage: tuple[int, ...] | None = None) -> int | None:
         """The machine's sealed layout for `plan`, filled once and kept across executors; None
-        when it holds none (no room), and this weight set reads the store itself."""
+        when it holds none (no room), and this weight set reads the store itself. `stage`: only
+        those regions staged (`host_tiers.staged/1`), the rest holes read from object files."""
         body = canonical.write(msgspec.to_builtins(plan))
         memfd = plane.sealed_memfd("cozy-sealed-plan", body)
         try:
@@ -3929,11 +3949,59 @@ class Executor:
                 sha256=hashlib.sha256(body).hexdigest(),
                 length=len(body),
                 memfd=memfd,
+                **({} if stage is None else {"stage_regions": stage}),
             )
             answer = self._durable(request, Tier)
         finally:
             os.close(memfd)
         return answer.descriptor if answer.ok and answer.held and answer.descriptor >= 0 else None
+
+    def _stage_tier(self, plan: SealedPlan, regions: list[int]) -> list[int]:
+        """Ask the machine to stage `regions` of `plan`'s layout (`SealedStage`); returns those
+        staged or staging (an older machine stages none: they keep reading the files)."""
+        body = canonical.write(msgspec.to_builtins(plan))
+        memfd = plane.sealed_memfd("cozy-sealed-plan", body)
+        try:
+            request = SealedStage(
+                sha256=hashlib.sha256(body).hexdigest(),
+                length=len(body),
+                stage_regions=tuple(regions),
+                memfd=memfd,
+            )
+            answer = self._durable(request, Staged)
+        finally:
+            os.close(memfd)
+        return list(answer.staged) if answer.ok else []
+
+    def _object_files(
+        self, plan: SealedPlan, objects: list[tuple[str, int]]
+    ) -> list[tuple[str, int, int]]:
+        """The verified object files behind `plan` (`ObjectFiles`), for its layout's holes:
+        `(sha256, length, fd)` per object of `objects` (the plan's own, in SHA-256 order), the
+        fds the caller's to close. None unless the machine's answer names that same list."""
+        # One descriptor per object (SDXL's UNet: about 1,700): lift the soft limit to the hard.
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft != hard:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+        body = canonical.write(msgspec.to_builtins(plan))
+        memfd = plane.sealed_memfd("cozy-sealed-plan", body)
+        try:
+            request = ObjectFiles(
+                sha256=hashlib.sha256(body).hexdigest(), length=len(body), memfd=memfd
+            )
+            answer = self._durable(request, ObjectFilesAnswer)
+        finally:
+            os.close(memfd)
+        listed = "".join(f"{sha}:{length}\n" for sha, length in objects).encode()
+        if (
+            not answer.ok
+            or len(answer.fds) != len(objects)
+            or answer.objects_sha256 != hashlib.sha256(listed).hexdigest()
+        ):
+            for fd in answer.fds:
+                os.close(fd)
+            return []
+        return [(sha, length, fd) for (sha, length), fd in zip(objects, answer.fds, strict=True)]
 
     def _device_room(self, free_bytes: int) -> None:
         """Ask the worker for `free_bytes` free on this GPU from its other tenants; it answers
@@ -4036,7 +4104,9 @@ class Executor:
         sending = (
             request.memfd
             if (isinstance(request, HostTier) and request.offer)
-            or isinstance(request, BudgetCell | SealedTier | SealedPrefetch)
+            or isinstance(
+                request, BudgetCell | SealedTier | SealedPrefetch | SealedStage | ObjectFiles
+            )
             else -1
         )
         body.pop("memfd", None)
@@ -4079,13 +4149,21 @@ class Executor:
             count = frame.pop("descriptors", 0)
             lease = frame.get("lease") is True
             if count or lease:
-                if not issubclass(into, DeviceTierAnswer) or type(count) is not int or count < 0:
+                files = issubclass(into, ObjectFilesAnswer)
+                if (
+                    not (files or issubclass(into, DeviceTierAnswer))
+                    or (files and lease)
+                    or type(count) is not int
+                    or count < 0
+                ):
                     self.channel.close()
-                    raise SeamError("seam_descriptor", "unexpected GPU allocations in a reply")
+                    raise SeamError("seam_descriptor", "unexpected descriptors in a reply")
                 received: list[int] = []
                 try:
                     for _ in range(count):
-                        received.append(self.channel.recv_shared())
+                        received.append(
+                            self.channel.recv_file() if files else self.channel.recv_shared()
+                        )
                     if lease:
                         frame["lease_fd"] = self.channel.recv_lease()
                 except BaseException:
