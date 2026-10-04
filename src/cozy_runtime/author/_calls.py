@@ -39,6 +39,7 @@ from cozy_runtime.author._memo import MemoDependency
 from cozy_runtime.author._memo import declare as declare_memo
 from cozy_runtime.author._model_defaults import DefaultLadder, model_defaults
 from cozy_runtime.author._services import Telemetry, _progress_scope, _ProgressScope
+from cozy_runtime.internal import application_json
 
 _LOG = logging.getLogger(__name__)
 
@@ -408,7 +409,7 @@ class _Broker:
             raise ConformanceError(
                 "package call arguments do not match its interface", code="child_arguments"
             ) from exc
-        payload = canonical_json.encode(_served(binding, request, encoded))
+        payload = application_json.encode(_served(binding, request, encoded))
         if len(payload) > MAX_CALL_BYTES:
             raise CapabilityError("package call exceeds inline bound", code="child_payload_bound")
         call = PendingCall[Any](self, self.next_index, binding, payload, ctx)
@@ -442,7 +443,7 @@ class _Broker:
                             "child_result_bound", "child result exceeds inline bound", call.index
                         )
                     try:
-                        value = canonical_json.decode(raw)
+                        value = application_json.decode(raw)
                         from cozy_runtime.author._call_results import decode
 
                         def guard() -> None:
