@@ -12,13 +12,15 @@ from cozy_runtime.internal import weights as module
 from cozy_runtime.internal.executor import Executor
 from cozy_runtime.internal.weights import INDIVISIBLE, ResidencyRefusal, Weights
 
-
 MIB = 1 << 20
 
 
 def account(monkeypatch, *, cached: int = 0, trim: bool = True):
-    memory = {"driver_free_bytes": 200 * MIB, "reserved_bytes": (300 + cached) * MIB,
-              "allocated_bytes": 300 * MIB}
+    memory = {
+        "driver_free_bytes": 200 * MIB,
+        "reserved_bytes": (300 + cached) * MIB,
+        "allocated_bytes": 300 * MIB,
+    }
     cap = 2951872512
     context = 213909504
     committed = cap + 40 * MIB - context - memory["reserved_bytes"]
@@ -26,9 +28,18 @@ def account(monkeypatch, *, cached: int = 0, trim: bool = True):
     asks, trimmed, unparked = [], [], []
     floor = committed - 100 * MIB
     own = SimpleNamespace(
-        room=asks.append, cap=cap, host_only=False, torch=None, kind="cuda",
-        floor_free=256 * MIB, activation={"denoise": 512 * MIB}, plane=None,
-        index=0, context_bytes=context, floor=lambda: floor, drain=lambda: None,
+        room=asks.append,
+        cap=cap,
+        host_only=False,
+        torch=None,
+        kind="cuda",
+        floor_free=256 * MIB,
+        activation={"denoise": 512 * MIB},
+        plane=None,
+        index=0,
+        context_bytes=context,
+        floor=lambda: floor,
+        drain=lambda: None,
         residencies=[SimpleNamespace(unpark=lambda: unparked.append(True))],
     )
 
@@ -39,7 +50,11 @@ def account(monkeypatch, *, cached: int = 0, trim: bool = True):
 
     def shrink(need, protected_floor):
         trimmed.append((need, protected_floor))
-        freed = min(need + module.weight_policy.MARGIN, device.committed - protected_floor) if trim else 0
+        freed = (
+            min(need + module.weight_policy.MARGIN, device.committed - protected_floor)
+            if trim
+            else 0
+        )
         device.committed -= freed
         memory["driver_free_bytes"] += freed
 
@@ -57,7 +72,10 @@ def test_cached_reservations_are_released_before_cap_credit_is_requested(monkeyp
     assert memory["reserved_bytes"] == memory["allocated_bytes"]
     assert own.context_bytes + memory["reserved_bytes"] + device.committed <= own.cap
     assert not trimmed and not unparked
-    assert all(0 < n <= own.cap - own.context_bytes - memory["reserved_bytes"] - device.committed for n in asks)
+    assert all(
+        0 < n <= own.cap - own.context_bytes - memory["reserved_bytes"] - device.committed
+        for n in asks
+    )
 
 
 def test_over_cap_maps_trim_at_stage_boundary_and_keep_active_floor(monkeypatch):
@@ -69,7 +87,10 @@ def test_over_cap_maps_trim_at_stage_boundary_and_keep_active_floor(monkeypatch)
     assert unparked == [True]
     assert device.committed >= original_floor
     assert own.context_bytes + memory["reserved_bytes"] + device.committed <= own.cap
-    assert all(0 < n <= own.cap - own.context_bytes - memory["reserved_bytes"] - device.committed for n in asks)
+    assert all(
+        0 < n <= own.cap - own.context_bytes - memory["reserved_bytes"] - device.committed
+        for n in asks
+    )
 
 
 def test_unreleasable_live_holdings_refuse_locally_without_negative_rpc(monkeypatch):
