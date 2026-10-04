@@ -93,8 +93,12 @@ def test_a_gpu_executor_bakes_a_prepared_graph_and_per_step_serves_it_unbaked(
 
         # f32 weights and small integers: baked and per-step sums are both exact here
         cuda = device == "cuda"
+        before = weights.facts().lora_baked
         out, skipped, baked = served()
         assert torch.equal(out, expected(x)) and (skipped, baked) == (cuda, cuda)
+        facts = weights.facts()  # the invoke reply says what was baked
+        assert facts.lora_baked - before == (1 if cuda else 0)
+        assert (facts.lora_bake_ms > 0) is cuda or before > 0
         if cuda:
             weights.set_lora("per_step")  # drops the baked bytes; they refill unmodified
             assert (region.bake, region.baked) == (False, False)

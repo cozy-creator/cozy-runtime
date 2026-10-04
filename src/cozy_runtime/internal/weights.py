@@ -1069,6 +1069,8 @@ class Weights:
             shared_bytes=device.shared_bytes,
             disk_read_bytes=held.host.disk_read_bytes,
             sealed_bytes=held.host.sealed_bytes,
+            lora_baked=int(BAKED[0]),
+            lora_bake_ms=round(BAKED[1], 1),
             late=sum(row.late for row in stages),
             stall_ns=sum(row.stall_ns for row in stages),
             misses=device.misses,
@@ -1388,14 +1390,18 @@ def _bake(
     some = region.bake and any(key is not None for row in keys for key in row)
     if not home:
         if some:
-            _apply(torch, region, parts, keys)
+            BAKED[0] += _apply(torch, region, parts, keys)
         baked = some
     else:
         if refill and (region.dirty or (region.baked and keys != region.baked_with)):
             raise _Stale(region.index)
         if some and not region.baked:
             region.dirty = True  # until every weight is baked
-            _apply(torch, region, parts, keys)
+            began = time.perf_counter()
+            BAKED[0] += _apply(torch, region, parts, keys)
+            if stored_device(parts[0]).type == "cuda":
+                torch.cuda.synchronize(stored_device(parts[0]))
+            BAKED[1] += (time.perf_counter() - began) * 1000
             region.baked, region.baked_with, region.dirty = True, keys, False
         baked = region.baked and keys == region.baked_with
     for bake, (graph, *hooks) in zip(region.bakes, keys, strict=True):
@@ -1405,14 +1411,20 @@ def _bake(
             hook._cozy_baked = baked and key is not None
 
 
+#: This process's bakes (one plane per process): weights baked, and the milliseconds its
+#: resident bakes took (a streamed copy's bake is not timed: that would stall its stream).
+BAKED: list[float] = [0, 0.0]
+
+
 def _apply(
     torch: ModuleType,
     region: Region,
     parts: list[dict[str, Tensor]],
     keys: list[tuple[object, ...]],
-) -> None:
+) -> int:
     """Bake every LoRA'd weight of the region in place, a row chunk at a time: everything
-    that updates a weight now (`keys`) summed, then rounded once."""
+    that updates a weight now (`keys`) summed, then rounded once. Returns the weights baked."""
+    count = 0
     for bake, row in zip(region.bakes, keys, strict=True):
         downs, ups = [], []
         if bake.layer is not None:
@@ -1425,6 +1437,7 @@ def _apply(
                 ups.append(got[2] * got[3])
         if not downs:
             continue
+        count += 1
         stored = parts[bake.weight]
         kind = downs[0].dtype
         name = region.weights[bake.weight].row.name
@@ -1438,6 +1451,7 @@ def _apply(
             torch.cat([u.to(kind) for u in ups], dim=1),
             generator=generator,
         )
+    return count
 
 
 def stored_device(stored: dict[str, Tensor]) -> Any:

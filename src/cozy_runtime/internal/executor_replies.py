@@ -135,6 +135,10 @@ class PlaneFacts(msgspec.Struct, frozen=True, kw_only=True):
     disk_read_bytes: int = -1
     #: RAM of the machine's sealed layouts this executor maps (theirs, never its own)
     sealed_bytes: int = 0
+    #: LoRA'd weights baked into device bytes since the process started (a streamed copy counts
+    #: at every acquire), and the milliseconds its resident bakes took
+    lora_baked: int = 0
+    lora_bake_ms: float = 0.0
     late: int = 0
     stall_ns: int = 0
     misses: int = 0
