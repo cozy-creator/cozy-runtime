@@ -155,8 +155,6 @@ class Bake:
     weight: int
     factors: list[tuple[int, int, float]]
     source: Callable[[], tuple[object, Tensor, Tensor, float] | None] | None = None
-    #: the strategy the model states for it, unless the caller chose (`Weights.set_lora`)
-    prefer: lora_bake.Strategy = "per_step"
 
 
 class _Stale(Exception):
@@ -190,6 +188,10 @@ class Region:
     baked: bool = False
     #: what each bake added (`_bake_key`), while `baked`
     baked_with: list[object] = field(default_factory=list)
+    #: streamed copies baked in place: ring address -> (what was added, bytes that show it)
+    ring: dict[int, tuple[list[object], list[tuple[Tensor, Tensor, Tensor]]]] = field(
+        default_factory=dict
+    )
 
     @property
     def transforms(self) -> bool:
@@ -335,11 +337,10 @@ class Weights:
         self.context_bytes = -1
         #: the machine's custody of GPU weights (`weights.attach/1`); None: every region private
         self.sharing: DeviceTiers | None = None
-        #: how LoRA'd linears are served: their update computed every forward, or baked into
-        #: resident bytes when they are placed. None follows what each model states (a
-        #: prepared graph: per step); `set_lora` is the caller's measured choice. A baked
-        #: component whose region streams computes that region's update per step.
-        self.lora: lora_bake.Strategy | None = None
+        #: how LoRA'd linears are served: baked into their weights (owner, 2026-10-04: the
+        #: default for every LoRA on every lane), or their update computed every forward (a
+        #: request's `lora_mode: per_step`, `set_lora`)
+        self.lora: lora_bake.Strategy = "bake"
         #: the owner's cap on this process's device bytes (context, torch's reserved bytes and
         #: the plane's maps); -1: none
         self.cap = -1
@@ -827,10 +828,12 @@ class Weights:
                 self.attach(component)
         return kept
 
-    def set_lora(self, strategy: lora_bake.Strategy | None) -> None:
-        """Serve LoRA'd linears by `strategy` (None: as each model states) from their next
-        placement on. A region whose resident bytes are the other form is dropped: it
-        refills from the unmodified host copy and its next placement bakes, or not."""
+    def set_lora(self, strategy: lora_bake.Strategy) -> None:
+        """Serve LoRA'd linears by `strategy` from their next placement on. A region whose
+        resident bytes are the other form is dropped: it refills from the unmodified host
+        copy and its next placement bakes, or not."""
+        if strategy == self.lora:
+            return
         self.lora = strategy
         for row in list(self.residencies):
             row.unpark()  # a repeating stage left open holds its leases
@@ -1125,7 +1128,7 @@ def bind(
                 views.writes[i] = (table, name, tensor, value)
             table[name] = value
     if region.bakes:
-        _bake(torch, region, views.parts, lease.ring_offset is None, refill)
+        _bake(torch, region, views.parts, address, lease.ring_offset is None, refill)
     if region.transforms and (moved or lease.ring_offset is not None):
         region.derived = _transform(torch, region, views.parts)
     region.bound = address
@@ -1368,47 +1371,76 @@ def _bake(
     torch: ModuleType,
     region: Region,
     parts: list[dict[str, Tensor]],
+    address: int,
     home: bool,
     refill: bool,
 ) -> None:
-    """Add each LoRA'd linear's delta into the region's resident bytes the first time they are
-    placed, before any decode reads them; its update then skips. A streamed copy holds the
-    unmodified bytes, so it keeps the update every forward.
+    """Add each LoRA'd linear's delta into the region's bytes before any decode reads them;
+    its update then skips. Resident bytes are baked the first time they are placed. A
+    streamed copy is the stored bytes again, so it is baked as it arrives, the same way (a
+    seed per weight makes every bake of a weight the same bytes): outputs never depend on
+    placement. A copy already baked in its ring slot is recognized by bytes the bake changed.
 
     Resident bytes holding a delta the coming forward does not want (a base forward of a DiT
     baked for its turbo overlay, or another overlay) raise `_Stale` where the caller can
     refill them (`refill`, a block's own lease); elsewhere the read sees the baked bytes.
     Each weight is baked into a scratch copy and written back in one copy, so a failure (an
     out-of-memory the block recovers from) leaves the stored bytes as they were."""
-    if not home:
-        for bake in region.bakes:
-            bake.layer._cozy_baked = False
-        return
     keys = [_bake_key(bake) for bake in region.bakes]
-    if region.baked and keys != region.baked_with and refill:
-        raise _Stale(region.index)
-    if region.bake and not region.baked and None not in keys:
-        for bake in region.bakes:
-            stored = parts[bake.weight]
-            name = region.weights[bake.weight].row.name
-            if bake.source is None:
-                down = torch.cat([parts[a]["value"] for a, _, _ in bake.factors])
-                up = torch.cat([parts[b]["value"] * scale for _, b, scale in bake.factors], dim=1)
-            else:
-                got = bake.source()
-                assert got is not None
-                _, down, up, scale = got
-                up = up * scale
-            generator = torch.Generator(device=stored_device(stored)).manual_seed(
-                zlib.crc32(name.encode())
-            )
-            scratch = {role: tensor.clone() for role, tensor in stored.items()}
-            lora_bake.bake(torch, scratch, down, up, generator=generator)
-            for role, tensor in stored.items():
-                tensor.copy_(scratch[role])
-        region.baked, region.baked_with = True, keys
+    wanted = region.bake and None not in keys
+    if home:
+        if region.baked and keys != region.baked_with and refill:
+            raise _Stale(region.index)
+        if wanted and not region.baked:
+            _apply(torch, region, parts)
+            region.baked, region.baked_with = True, keys
+        baked = region.baked and keys == region.baked_with
+    else:
+        mark = region.ring.get(address)
+        if wanted and not (mark and mark[0] == keys and _shows(mark[1])):
+            region.ring.pop(address, None)
+            while len(region.ring) > weight_policy.MAX_WINDOW:
+                del region.ring[next(iter(region.ring))]
+            region.ring[address] = (keys, _apply(torch, region, parts))
+        baked = wanted
     for bake in region.bakes:
-        bake.layer._cozy_baked = region.baked
+        bake.layer._cozy_baked = baked
+
+
+def _apply(
+    torch: ModuleType, region: Region, parts: list[dict[str, Tensor]]
+) -> list[tuple[Tensor, Tensor, Tensor]]:
+    """Bake every LoRA'd weight of the region in place; returns, per weight, up to 16 bytes the
+    bake changed (stored bytes, positions, values) to recognize a baked copy by."""
+    marks = []
+    for bake in region.bakes:
+        stored = parts[bake.weight]
+        name = region.weights[bake.weight].row.name
+        if bake.source is None:
+            down = torch.cat([parts[a]["value"] for a, _, _ in bake.factors])
+            up = torch.cat([parts[b]["value"] * scale for _, b, scale in bake.factors], dim=1)
+        else:
+            got = bake.source()
+            assert got is not None
+            _, down, up, scale = got
+            up = up * scale
+        generator = torch.Generator(device=stored_device(stored)).manual_seed(
+            zlib.crc32(name.encode())
+        )
+        scratch = {role: tensor.clone() for role, tensor in stored.items()}
+        lora_bake.bake(torch, scratch, down, up, generator=generator)
+        for role, tensor in stored.items():
+            raw, baked = tensor.view(-1).view(torch.uint8), scratch[role].view(-1).view(torch.uint8)
+            where = (raw != baked).nonzero().flatten()[:16]
+            if where.numel():
+                marks.append((raw, where, baked[where]))
+            tensor.copy_(scratch[role])
+    return marks
+
+
+def _shows(marks: list[tuple[Tensor, Tensor, Tensor]]) -> bool:
+    """The copy at this address still holds what its bake wrote (a fresh copy differs)."""
+    return all(bool((raw[where] == values).all()) for raw, where, values in marks)
 
 
 def stored_device(stored: dict[str, Tensor]) -> Any:
@@ -2153,7 +2185,7 @@ def _lora_layers(root: Module, region: Region) -> list[Bake]:
             if region.path and site != weight.row.name:
                 hooks: Iterable[object] = root.get_submodule(site)._forward_hooks.values()
                 found.extend(
-                    Bake(hook, index, [], hook.lora_factors, hook.lora_strategy)
+                    Bake(hook, index, [], hook.lora_factors)
                     for hook in hooks
                     if isinstance(hook, LoRASource)
                 )
@@ -2173,23 +2205,19 @@ def _lora_layers(root: Module, region: Region) -> list[Bake]:
 
 
 def _bakes_here(weights: Weights, component: Component, region: Region) -> bool:
-    """A region bakes its LoRA'd linears when the caller's strategy, else what the model
-    states, says so, on a GPU: a CPU executor computes on its host tier, which other
-    executors adopt as the stored bytes."""
+    """A region bakes its LoRA'd linears unless the request said per step, on a GPU: a CPU
+    executor computes on its host tier, which other executors adopt as the stored bytes."""
     del component
-    if not region.bakes or weights.host_only:
-        return False
-    return (weights.lora or region.bakes[0].prefer) == "bake"
+    return bool(region.bakes) and not weights.host_only and weights.lora == "bake"
 
 
 @runtime_checkable
 class LoRASource(Protocol):
     """A model's forward hook on a linear that adds a LoRA update the model owns (H3's turbo
     overlay). The weight plane bakes `lora_factors()` (identity, down, up, scale; None when
-    the hook adds nothing now) into the linear's resident bytes, and sets `_cozy_baked`
-    while they hold it, when the hook's `lora_strategy` (or the caller) says bake."""
+    the hook adds nothing now) into the linear's bytes, and sets `_cozy_baked` while the
+    bytes it reads hold it."""
 
-    lora_strategy: lora_bake.Strategy
     _cozy_baked: bool
 
     def lora_factors(self) -> tuple[object, Tensor, Tensor, float] | None: ...
@@ -2361,6 +2389,10 @@ class WeightResidency:
         self.entries.clear()
         self.last_shortfall = None
         self.derived_at_open = self._derived()
+
+    def serve_lora(self, strategy: lora_bake.Strategy) -> None:
+        """A request's LoRA serving (`lora_mode`): baked, or per step."""
+        self.weights.set_lora(strategy)
 
     def admit(self, method: str, components: tuple[str, ...]) -> None:
         self._require_clean(method)

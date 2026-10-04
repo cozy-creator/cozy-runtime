@@ -194,3 +194,26 @@ def test_a_stochastic_bf16_bake_keeps_a_delta_below_half_an_ulp() -> None:
         assert torch.all((weight.float() - merged).abs() <= merged.abs() * 2**-7)
     assert kept["nearest"] < 0.5
     assert 0.8 < kept["stochastic"] < 1.2
+
+
+def test_a_request_serves_its_loras_per_step_only_when_it_says_so() -> None:
+    import msgspec
+
+    from cozy_runtime.author._invoke import lora_mode
+
+    class Plain(msgspec.Struct):
+        prompt: str
+
+    class Declares(msgspec.Struct):
+        prompt: str
+        lora_mode: str = ""
+
+    assert lora_mode(Plain, {"prompt": "a"}) == ({"prompt": "a"}, "bake")
+    assert lora_mode(Plain, {"prompt": "a", "lora_mode": "per_step"}) == (
+        {"prompt": "a"},
+        "per_step",
+    )
+    # an unknown value stays in the request: the ordinary ignored-field warning names it
+    assert lora_mode(Plain, {"prompt": "a", "lora_mode": "fast"})[1] == "bake"
+    wire = {"prompt": "a", "lora_mode": "per_step"}
+    assert lora_mode(Declares, wire) == (wire, "bake")

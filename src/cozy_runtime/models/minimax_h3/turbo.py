@@ -83,9 +83,6 @@ class _LoRAHook:
     adds nothing; a base forward or another overlay finds those bytes refilled first."""
 
     __slots__ = ("_cozy_baked", "owner", "path")
-    #: measured (cozy-machine #26, RTX PRO 6000, fp8 lane): baking takes 7 s once and saves
-    #: 20 s of every 15 s clip after it, keeping 0.96 of the overlay's effect
-    lora_strategy = "bake"
 
     def __init__(self, owner: Any, path: str) -> None:
         self.owner = owner

@@ -1,6 +1,6 @@
 """A prepared LoRA graph on the weight plane: a GPU executor bakes each LoRA'd linear into its
-resident bytes when they are placed; a CPU executor and the per-step strategy compute the
-update every forward. The checkpoint's stored bytes never change."""
+bytes when they are placed (the default); a CPU executor and a request's per-step mode compute
+the update every forward. The checkpoint's stored bytes never change."""
 
 from __future__ import annotations
 
@@ -66,7 +66,6 @@ def test_a_gpu_executor_bakes_a_prepared_graph_and_per_step_serves_it_unbaked(
         torch, torch.device(device, 0) if device == "cuda" else torch.device(device), device
     )
     weights.set_budget(-1, pinned=64 << 20)
-    weights.set_lora("bake")
     backend = PlaneBackend.for_script(
         {"transformer": checkpoint}, rows, weights=weights, construction="baked", release="baked/1"
     )
@@ -203,7 +202,6 @@ def test_a_baked_fp8_projection_keeps_the_loras_effect(tmp_path: Path) -> None:
     )
     weights = Weights(torch, torch.device("cuda", 0), "cuda")
     weights.set_budget(-1, pinned=64 << 20)
-    weights.set_lora("bake")
     backend = PlaneBackend.for_script(
         {"transformer": checkpoint}, rows, weights=weights, construction="fp8", release="fp8/1"
     )
