@@ -34,6 +34,7 @@ from cozy_runtime.internal.executor_commands import Budget, Prefetch  # noqa: E4
 from cozy_runtime.internal.parallel import cp, mirror, wire  # noqa: E402
 from cozy_runtime.internal.parallel.group import RankGroup  # noqa: E402
 from cozy_runtime.internal.parallel.mirror import mirror_component  # noqa: E402
+from cozy_runtime.internal.parallel.plan import GroupRefusal  # noqa: E402
 from cozy_runtime.internal.seam import Channel  # noqa: E402
 from testdata.parallel_calls import (  # noqa: E402
     HOSTED_CAPACITY,
@@ -258,14 +259,16 @@ def test_leader_calls_real_follower_executors_twice(tmp_path: Path, degree: int,
         if kind in ("collective", "staged"):
             # The follower returns a failure while rank 0 is already in all_reduce.
             # Reading the failure only AFTER rank 0's body returns would wait forever.
-            with pytest.raises((RuntimeError, ValueError)) as failed:
+            # Either way the call fails with the follower's own error, not GPU 0's consequence
+            # of it (run 4074 reported only "NCCL communicator was aborted on rank 0"): the
+            # error monitor aborts the group, so torch either interrupts GPU 0's collective or
+            # refuses it entry.
+            with pytest.raises(GroupRefusal) as failed:
                 model.fail_before_collective()
-            if isinstance(failed.value, ValueError):
-                # A follower can fail before rank 0 enters all_reduce. The error
-                # monitor then destroys the group first, so Torch refuses entry
-                # rather than interrupting a collective already in progress.
-                assert "Default process group has not been initialized" in str(failed.value)
-            assert group.broken
+            assert failed.value.code == "group_broken"
+            assert " failed its part of the call" in str(failed.value)  # any follower first
+            assert "ValueError: follower failed before joining the collective" in str(failed.value)
+            assert group.broken == failed.value.message
             assert not cp.in_gated_call()
     finally:
         group.close()
