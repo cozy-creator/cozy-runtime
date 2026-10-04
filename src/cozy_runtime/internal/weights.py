@@ -312,6 +312,7 @@ class Weights:
         self.open: list[tuple[WeightResidency, str, tuple[str, ...]]] = []
         self.residencies: weakref.WeakSet[WeightResidency] = weakref.WeakSet()
         self._recovery: type | None = None
+        self._recovering = False
         #: one GPU of a group: a block's forward holds collectives the other GPUs are already
         #: in, so it can never run again; its ops recover one by one instead
         self.grouped = False
@@ -578,13 +579,17 @@ class Weights:
     @contextmanager
     def recovering(self) -> Iterator[None]:
         """Recover allocation failures at safe operator boundaries, never whole forwards."""
-        if self.host_only:
+        if self.host_only or self._recovering:
             yield
             return
         if self._recovery is None:
             self._recovery = _recovery_type(self.torch)
-        with self._recovery(self):
-            yield
+        self._recovering = True
+        try:
+            with self._recovery(self):
+                yield
+        finally:
+            self._recovering = False
 
     def make_room(self, need: int, operands: Sequence[object], op: str = "") -> None:
         """An op outside every block ran out of device memory: unmap `need` bytes of weights,

@@ -63,3 +63,20 @@ def test_safe_successful_operations_preserve_outputs_and_input_mutations() -> No
             value.add_(1)
         assert torch.equal(result, torch.tanh(torch.arange(8, dtype=torch.float32) + 2))
         assert torch.equal(value, torch.arange(8, dtype=torch.float32) + 1)
+
+
+def test_nested_recovery_scopes_install_one_dispatch_mode_and_unwind_it() -> None:
+    weights = Weights(torch, torch.device("cpu"), "cuda")
+    # Activate dispatcher recovery over a real CPU plane without creating a CUDA context.
+    # This exercises scope ownership, not device allocation recovery.
+    weights.host_only = False
+    current = torch.utils._python_dispatch._get_current_dispatch_mode
+    with torch.inference_mode(), weights.recovering():
+        mode = current()
+        assert mode is not None
+        with weights.recovering():
+            assert current() is mode
+            assert torch.equal(torch.ones(1) + 1, torch.full((1,), 2.0))
+        assert current() is mode
+    assert current() is None
+    assert not weights._recovering
