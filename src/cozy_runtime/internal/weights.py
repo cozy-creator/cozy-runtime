@@ -440,14 +440,36 @@ class Weights:
         if self.room is None or self.cap < 0 or self.host_only:
             return
         memory = accel.allocation(self.torch, self.kind)
+        committed = max(plane.stats(self.plane).device(self.index).committed, 0)
+        held = max(self.context_bytes, 0) + memory["reserved_bytes"] + committed
+        if held > self.cap:
+            # A previous stage may leave cached torch segments or idle plane maps over
+            # the cap. Recover this process's own bytes before asking other tenants;
+            # a negative cap credit is never a request for negative physical room.
+            accel.release_cached(self.torch, self.kind)
+            memory = accel.allocation(self.torch, self.kind)
+            committed = max(plane.stats(self.plane).device(self.index).committed, 0)
+            held = max(self.context_bytes, 0) + memory["reserved_bytes"] + committed
+            if held > self.cap:
+                for residency in list(self.residencies):
+                    residency.unpark()
+                self.shrink(held - self.cap, self.floor())
+                self.drain()
+                memory = accel.allocation(self.torch, self.kind)
+                committed = max(plane.stats(self.plane).device(self.index).committed, 0)
+                held = max(self.context_bytes, 0) + memory["reserved_bytes"] + committed
+            if held > self.cap:
+                raise ResidencyRefusal(
+                    INDIVISIBLE,
+                    f"{method}(): live device holdings {held} B exceed cap {self.cap} B "
+                    "after cached allocations and idle weights were released",
+                )
         slack = max(memory["reserved_bytes"] - memory["allocated_bytes"], 0)
         need = self.activation.get(method, 0) - slack
         if need <= 0:
             return
-        committed = max(plane.stats(self.plane).device(self.index).committed, 0)
-        held = max(self.context_bytes, 0) + memory["reserved_bytes"] + committed
         granted = min(need + weight_policy.MARGIN, self.cap - held)
-        if memory["driver_free_bytes"] - self.floor_free < granted:
+        if granted > 0 and memory["driver_free_bytes"] - self.floor_free < granted:
             self.room(granted)
 
     def headroom(self, memory: Mapping[str, int]) -> int:
