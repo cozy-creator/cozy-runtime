@@ -28,6 +28,19 @@ Actual ilulu Torch is 2.14.0+cu130, commit 08187d9e0fba026dc8217405802ab5381dc88
 CUDA 13.0, driver 580.65.06. C++/g++ and the installed cu13 runtime headers/library
 exist; nvcc does not. No allocation or kernel is required to inspect these facts.
 
+A subsequent read-only CUDA query returned managedMemory=1,
+concurrentManagedAccess=1 and pageableMemoryAccess=1 on that actual 3070, with
+host-page-table and direct-host managed-access flags both zero. All return codes
+were zero; the CUDA process list remained holder PID 113 and owned idle executor
+PID 2059, with no new tensor allocation or kernel. This confirms the hardware
+capability flag, not actual oversubscription or a full decode.
+
+The container memory.max is 17,999,998,976 bytes, memory.current was
+15,603,408,896 bytes, historical memory.peak equals that limit, and swap.max is
+zero. Host MemAvailable is a separate machine-wide fact and cannot replace this
+container limit. Record reclaimable/file and anonymous charges before assigning
+a bounded managed-host allowance. Evidence: activation-managed-capabilities.json.
+
 ## Supported API and the accounting gate
 
 [PyTorch 2.14 CUDA semantics](https://docs.pytorch.org/docs/2.14/notes/cuda.html)
