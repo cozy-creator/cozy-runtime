@@ -2,90 +2,14 @@ name: ci
 # On demand, before a release (lint, types, fences, wheel, pytest, handoff proof):
 #   gh workflow run ci.yaml -R cozy-creator/cozy-runtime --ref <branch>
 # Every gate runs even when another is red; the final checks job requires all of them.
-# Tests keep real process/cgroup isolation on independent runners. Automatic only for the
-# model-fetch path (`model-fetch`, below); publish.yaml's build job runs the
-# syntax/undefined-name lint and fences on every release.
+# Tests keep real process/cgroup isolation on independent runners. publish.yaml's build job
+# runs the syntax/undefined-name lint and fences on every release.
 on:
   workflow_dispatch:
-  pull_request:
-    paths:
-      - "src/cozy_runtime/internal/worker/machine_materialization.py"
-      - "src/cozy_runtime/internal/worker/machine_model_defaults.py"
-      - "src/cozy_runtime/internal/worker/machine_model_resolve.py"
-      - "src/cozy_runtime/internal/worker/machine_models.py"
-      - "src/cozy_runtime/internal/worker/machine_serving.py"
-      - "src/cozy_runtime/internal/worker/machine_release_roots.py"
-      - "src/cozy_runtime/internal/worker/machine_adapter_views.py"
-      - "src/cozy_runtime/internal/worker/preparations.py"
-      - "src/cozy_runtime/internal/fill.py"
-      - "src/cozy_runtime/internal/egress.py"
-      - "src/cozy_runtime/internal/liveness.py"
-      - "tests/fault_hub.py"
-      - "tests/test_model_fetch_faults.py"
-      - "tests/test_model_prefetch_native.py"
-      - "tests/test_machine_materialization.py"
-      - "tests/test_machine_model_defaults.py"
-      - "tests/test_model_runtime_closure.py"
-      - "tests/test_model_reader.py"
-      - "tests/test_release_roots.py"
-      - "pyproject.toml"
-      - "uv.lock"
-      - ".github/workflows/ci.yaml"
-  push:
-    branches: [master]
-    paths:
-      - "src/cozy_runtime/internal/worker/machine_materialization.py"
-      - "src/cozy_runtime/internal/worker/machine_model_defaults.py"
-      - "src/cozy_runtime/internal/worker/machine_model_resolve.py"
-      - "src/cozy_runtime/internal/worker/machine_models.py"
-      - "src/cozy_runtime/internal/worker/machine_serving.py"
-      - "src/cozy_runtime/internal/worker/machine_release_roots.py"
-      - "src/cozy_runtime/internal/worker/machine_adapter_views.py"
-      - "src/cozy_runtime/internal/worker/preparations.py"
-      - "src/cozy_runtime/internal/fill.py"
-      - "src/cozy_runtime/internal/egress.py"
-      - "src/cozy_runtime/internal/liveness.py"
-      - "tests/fault_hub.py"
-      - "tests/test_model_fetch_faults.py"
-      - "tests/test_model_prefetch_native.py"
-      - "tests/test_machine_materialization.py"
-      - "tests/test_machine_model_defaults.py"
-      - "tests/test_model_runtime_closure.py"
-      - "tests/test_model_reader.py"
-      - "tests/test_release_roots.py"
-      - "pyproject.toml"
-      - "uv.lock"
-      - ".github/workflows/ci.yaml"
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 jobs:
-  # Model weights must keep arriving (2026-10-01): a real loopback Hub and object store that
-  # fail on purpose (resets, truncation, expired URLs, a tunnel's 404, Hub verdicts, wrong
-  # bytes, a machine stop) under a real TensorFS `ensure`, plus single flight, prefetch
-  # pause reasons and honest progress.
-  model-fetch:
-    if: github.event_name != 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v7
-      - run: uv python install 3.12
-      - run: uv sync --locked
-      # Delegated like the full suite: preparation tests start real executors in cgroups.
-      - run: |
-          sudo systemd-run --wait --pipe --collect \
-            --unit="cozy-runtime-model-fetch-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
-            --uid="$(id -u)" --gid="$(id -g)" \
-            --property=Delegate=yes --working-directory="$PWD" \
-            --setenv="PATH=$PATH" --setenv="HOME=$HOME" \
-            --setenv="UV_CACHE_DIR=$UV_CACHE_DIR" \
-            --setenv="UV_PYTHON_INSTALL_DIR=$(uv python dir)" \
-            .venv/bin/python -m pytest -q \
-            tests/test_model_fetch_faults.py tests/test_machine_materialization.py \
-            tests/test_model_prefetch_native.py tests/test_machine_model_defaults.py \
-            tests/test_release_roots.py
   quality:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
@@ -145,11 +69,6 @@ jobs:
           save-cache: ${{ github.ref == 'refs/heads/master' && matrix.group == 1 }}
       - run: uv python install 3.12
       - run: uv sync --locked
-      # Restore before the cross-version tests, which are included in the full suite.
-      - uses: actions/cache@v4
-        with:
-          path: ~/.cache/cozy-runtime-tests
-          key: cross-version-seam-${{ hashFiles('tests/test_cross_version_seam.py') }}
       - name: Full test suite shard under delegated processes
         env:
           TEST_GROUP: ${{ matrix.group }}

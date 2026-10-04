@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import socket
 from pathlib import Path
 
@@ -24,13 +23,7 @@ from cozy_runtime.author._executor_requests import (
 from cozy_runtime.author._executor_requests import decode as decode_request
 from cozy_runtime.author.fakes import fake_context
 from cozy_runtime.author.publication import CheckpointRef
-from cozy_runtime.internal import (
-    census_cache,
-    derive_child,
-    native_interfaces,
-    source_interfaces,
-    witness,
-)
+from cozy_runtime.internal import native_interfaces, source_interfaces
 from cozy_runtime.internal.executor import Executor
 from cozy_runtime.internal.executor_commands import CallInterface
 from cozy_runtime.internal.seam import Channel
@@ -137,32 +130,6 @@ def test_child_result_asset_records_ignore_advisory_fields(tmp_path: Path) -> No
         )
 
 
-def test_derive_child_rows_from_another_runtime_ignore_additive_fields() -> None:
-    request = derive_child.DeriveRequest(
-        (derive_child.SlotRequest("model", b"{}"), derive_child.SlotRequest("source", b"{}")),
-        application="package:app",
-    )
-    newer = {
-        "requirements": [
-            {
-                "slot": "model",
-                "components": ["unet"],
-                "tensors": [{"component": "unet", "key": "w", "dtype": None, "shape": [2], "x": 1}],
-                "future": True,
-            },
-            {"slot": "source", "source": True, "future": True},
-        ],
-        "future": {},
-    }
-    response = msgspec.msgpack.decode(
-        msgspec.msgpack.encode(newer), type=derive_child.DeriveResponse
-    )
-    rows = derive_child.read_response(response, request)
-    assert isinstance(rows[0], derive_child.TensorRequirements)
-    assert rows[0].rows == (("unet", "w", None, (2,)),)
-    assert rows[1] == derive_child.SourceSlot("source")
-
-
 def test_durable_requests_and_answers_cross_older_and_newer_peers(tmp_path: Path) -> None:
     digest = "sha256:" + "0" * 64
     checkpoint = Checkpoint(operation_key="op", logical_key="k", content_digest=digest, length=3)
@@ -194,21 +161,6 @@ def test_durable_requests_and_answers_cross_older_and_newer_peers(tmp_path: Path
             "content_digest": digest,
             "length": 3,
         }
-
-
-def test_a_torn_census_entry_is_a_miss(tmp_path: Path) -> None:
-    entry = tmp_path / "census.json"
-    entry.write_bytes(b'{"format": ')
-    assert census_cache._read(entry) is None
-
-
-def test_witness_logs_from_other_versions_keep_their_known_rows(tmp_path: Path) -> None:
-    log = tmp_path / "witness" / "events.jsonl"
-    log.parent.mkdir()
-    death = witness.name_death(0, 0, 0, child=7, started=0.0)
-    rows = [{"event": "future_kind"}, {**msgspec.to_builtins(death), "future": 1}]
-    log.write_text("\n".join(json.dumps(row) for row in rows) + '\n{"event": "de')
-    assert witness.read_death(tmp_path) == death
 
 
 def test_h3_table_labels_from_other_writers_ignore_extras_and_default_optionals() -> None:

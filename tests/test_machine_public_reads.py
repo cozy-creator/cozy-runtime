@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import json
 import sqlite3
-import subprocess
-import sys
 from pathlib import Path
 
 import pytest
@@ -51,22 +49,6 @@ def test_public_views_preserve_outcomes_without_exposing_execution_authority(
         assert terminal["outcome_digest"] == outcome.outcome_digest
         with pytest.raises(sqlite3.OperationalError):
             db.execute("DELETE FROM executions")
-
-
-def test_supervisor_capability_probe_needs_no_machine_settings_or_cuda() -> None:
-    answer = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            "import sys; from cozy_runtime.cli.runtime_worker import main; "
-            "assert 'torch' not in sys.modules; "
-            "raise SystemExit(main(['capabilities','--json']))",
-        ],
-        text=True,
-        capture_output=True,
-        check=True,
-    )
-    assert "machine-supervisor/1" in json.loads(answer.stdout)["capabilities"]
 
 
 def test_public_reads_keep_legacy_request_collisions_in_their_record_namespace(

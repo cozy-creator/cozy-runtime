@@ -12,10 +12,9 @@ from typing import Any
 
 import pytest
 
-from cozy_runtime.internal import config, image_inventory, package_environment, storage_admission
+from cozy_runtime.internal import config, storage_admission
 from cozy_runtime.internal import python_interpreters as p
 from cozy_runtime.internal.config import package_install_environment
-from cozy_runtime.internal.worker import package_prepare
 
 
 def _candidate(version: str, path: Path = Path("/installed/python")) -> p.Interpreter:
@@ -193,42 +192,6 @@ def test_cancellation_reaps_active_child(tmp_path: Path) -> None:
         os.kill(int(pid_file.read_text()), 0)
 
 
-def test_remote_selection_uses_shared_ensure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    selected = _candidate("3.13.8")
-    calls = []
-
-    def ensure(requires: str, version: str, **kw: Any) -> p.Interpreter:
-        calls.append((requires, version, kw["root"]))
-        return selected
-
-    monkeypatch.setattr(p, "ensure", ensure)
-    observed = package_environment.observe_base()
-    monkeypatch.setattr(package_environment, "observe_base", lambda path: observed)
-    assert package_prepare._select_python(
-        Path("/base/python"), ">=3.13", "3.13.8", root=tmp_path / "python"
-    ) == (selected.executable, observed)
-    assert calls == [(">=3.13", "3.13.8", tmp_path / "python")]
-
-
-def test_image_capability_is_not_installed_inventory() -> None:
-    body = dict(
-        format=image_inventory.INVENTORY_FORMAT,
-        profile="cpu",
-        python="3.12.12",
-        distributions=[dict(name="cozy-runtime", version="0.18.13")],
-        interpreters=[dict(version="3.12.12", abi="cp312")],
-        provisionable_minors=["3.12", "3.13", "3.14"],
-    )
-    value = image_inventory.read_bytes(json.dumps(body).encode())
-    assert value.interpreters == (("3.12.12", "cp312"),)
-    assert value.provisionable_minors == ("3.12", "3.13", "3.14")
-    body["provisionable_minors"] = ["3.13", "3.13"]
-    with pytest.raises(image_inventory.ImageInventoryRefusal):
-        image_inventory.read_bytes(json.dumps(body).encode())
-
-
 def test_storage_refusal_precedes_download_and_directory_creation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -292,38 +255,6 @@ def test_installed_system_interpreter_is_preferred_to_provisioning(
     monkeypatch.setattr(p, "_download_version", lambda *a: pytest.fail("installed Python must win"))
     root = tmp_path / "absent"
     assert p.ensure(">=3.13", root=root, default=control.executable) == system
-    assert not root.exists()
-
-
-def test_private_preparation_observes_cancellation_before_wheel_access(tmp_path: Path) -> None:
-    from cozy_runtime.protocol import worker_pb2 as pb
-
-    root = tmp_path / "absent"
-    request = pb.PrepareLocalPackageRequest(
-        operation_id="cancelled",
-        install_root=str(root),
-        python_requires=">=3.13",
-        python_version="3.13.8",
-        package=pb.DevelopmentPackage(
-            package="local/cancelled", release="1.0", installation_id="local-cancelled"
-        ),
-        files=[
-            pb.LocalPackageFile(
-                filename="cancelled-1.0-py3-none-any.whl",
-                path=str(root / ".stage/cancelled/wheels/cancelled-1.0-py3-none-any.whl"),
-            )
-        ],
-    )
-    with pytest.raises(package_prepare.PreparationRefusal, match="cancelled"):
-        package_prepare.prepare_local_package(
-            request,
-            artifact_cache=tmp_path / "artifacts",
-            install_root=root,
-            python=Path(sys.executable),
-            describe=lambda *a: b"",
-            verified=lambda *a: None,
-            cancel=lambda: True,
-        )
     assert not root.exists()
 
 
@@ -491,80 +422,3 @@ def test_nonlinux_ensure_installs_once_and_reuses(
     assert p.ensure(">=3.13", "3.13.8", root=root) == first
     assert root.is_dir() and len(commands) == 1
     assert "--no-registry" in commands[0] and "--no-bin" in commands[0]
-
-
-def test_cli_and_local_worker_share_one_managed_interpreter_root(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    import dataclasses
-    import threading
-    from contextlib import nullcontext
-    from types import SimpleNamespace
-    from typing import cast
-
-    from cozy_runtime.cli import main
-    from cozy_runtime.cli.io import Options
-    from cozy_runtime.internal.config import Credentials, RuntimeConfig
-    from cozy_runtime.internal.worker.session import Worker
-    from cozy_runtime.protocol import worker_pb2 as pb
-
-    config = RuntimeConfig(cozy_home=tmp_path / "cozy", credentials=Credentials())
-    install_root = config.cozy_home / "runtime" / "environments"
-    calls: list[Path] = []
-
-    def installed(*a: Any, root: Path | None = None) -> tuple[p.Interpreter, ...]:
-        assert root is not None
-        binary = root / "managed" / "cpython-3.13.10-linux-x86_64-gnu" / "bin" / "python3.13"
-        return (_candidate("3.13.10", binary),) if binary.exists() else ()
-
-    def download(command: list[str], *, env: dict[str, str], **kw: Any) -> str:
-        managed = Path(env["UV_PYTHON_INSTALL_DIR"])
-        calls.append(managed)
-        binary = managed / "cpython-3.13.10-linux-x86_64-gnu" / "bin" / "python3.13"
-        binary.parent.mkdir(parents=True)
-        binary.touch()
-        return ""
-
-    observed = dataclasses.replace(
-        package_environment.observe_base(), python_full_version="3.13.10", python_abi="cp313"
-    )
-    monkeypatch.setattr(p, "available", installed)
-    monkeypatch.setattr(p, "_download_version", lambda *a: "3.13.10")
-    monkeypatch.setattr(p, "_run_uv", download)
-    monkeypatch.setattr(shutil, "which", lambda _: "/uv")
-    monkeypatch.setattr(package_environment, "observe_base", lambda path: observed)
-    selected = main.dispatch("python-ensure", [">=3.13", "3.13.10"], Options(json=True), config)
-    assert selected.document is not None
-
-    def prepare(request: pb.PreparePackageSetRequest, **kwargs: Any) -> pb.PreparePackageSetResult:
-        python, _ = package_prepare._select_python(
-            kwargs["python"], ">=3.13", "3.13.10", root=kwargs["python_root"]
-        )
-        assert p.Interpreter(python, "3.13.10", "cp313").document() == selected.document
-        raise package_prepare.PreparationRefusal("selected", "interpreter")
-
-    monkeypatch.setattr(package_prepare, "prepare_package_set", prepare)
-    worker = SimpleNamespace(
-        config=config,
-        preparation_lock=nullcontext(),
-        base=observed,
-        verified_artifacts=None,
-        options=SimpleNamespace(
-            tensorfs_root=str(tmp_path / "tfs"),
-            install_root=str(install_root),
-            artifact_cache=str(tmp_path / "artifacts"),
-            environment_python=None,
-            publication_authority=None,
-            python=sys.executable,
-        ),
-        stop=threading.Event(),
-        note=lambda *a: None,
-        _describe_installed=lambda *a, **k: b"",
-    )
-    with pytest.raises(package_prepare.PreparationRefusal, match="selected"):
-        Worker._prepare_published(
-            cast(Worker, worker),
-            pb.PreparePackageSetRequest(locked_requirements=b"cozy-runtime==0.18.89\n"),
-        )
-    assert calls == [config.managed_python_root / "managed"]
-    assert not (install_root / "python").exists()

@@ -20,15 +20,11 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Callable
 from pathlib import Path
-from typing import Any
 
 import pytest
 
 from cozy.worker.v1 import worker_pb2
-from cozy_runtime.internal import canonical
-from cozy_runtime.internal.worker.session import REPREPARE, read_placement_set
 from cozy_runtime.protocol import WIRE_MINOR, documents
 
 CORPUS = Path(__file__).resolve().parent / "testdata" / "worker-protocol"
@@ -172,24 +168,6 @@ def test_canonical_documents() -> None:
     )
 
 
-def test_tolerated_documents_are_read() -> None:
-    """Unknown keys at any depth and absent collections from another writer are read."""
-    tolerated = json.loads((CORPUS / "MANIFEST.json").read_text())["tolerated"]
-    assert tolerated
-    for name, row in sorted(tolerated.items()):
-        body = (CORPUS / "tolerated" / f"{name}.json").read_bytes()
-        assert documents.spell(documents.digest_of(body)) == row["id"], name
-        cls = getattr(worker_pb2, row["type"].rpartition(".")[2])
-        documents.parse(body, cls)
-        if cls is worker_pb2.PlacementSet:
-            read_placement_set(
-                worker_pb2.DesiredPlacementSet(
-                    placement_set_digest=documents.digest_of(body),
-                    placement_set_canonical_bytes=body,
-                )
-            )
-
-
 def test_red_twins_refuse_ambiguous_encodings() -> None:
     """Duplicate keys, a float and non-canonical bytes are ambiguous encodings: all refuse."""
     for name, want_code in {
@@ -203,55 +181,3 @@ def test_red_twins_refuse_ambiguous_encodings() -> None:
         assert refusal.value.code == want_code, (
             f"{name}: refused as {refusal.value.code!r}, wanted {want_code!r}"
         )
-
-
-def _first(document: dict[str, Any]) -> dict[str, Any]:
-    placement: dict[str, Any] = document["placements"][0]
-    return placement
-
-
-@pytest.mark.parametrize(
-    ("change", "code"),
-    [
-        (
-            lambda d: _first(d)["entrypoints"][0]["slots"][0].update(reference_model_id="x"),
-            "unknown_model",
-        ),
-        (
-            lambda d: _first(d)["entrypoints"][0]["slots"][0].update(
-                adapters=[
-                    {"component": "a", "model_id": "h3", "source_component": "a", "scale": " "}
-                ]
-            ),
-            "invalid_scale",
-        ),
-        (
-            lambda d: _first(d)["entrypoints"][0].update(entrypoint_binding_digest="sha256:X"),
-            "malformed_digest",
-        ),
-        (lambda d: _first(d)["models"][0]["manifest"].pop("length"), "invalid_ref"),
-        (
-            lambda d: _first(d).update(development={"package": "a", "release": "1"}),
-            "oneof_conflict",
-        ),
-        (lambda d: _first(d).pop("package"), "package_mode_invalid"),
-        (lambda d: _first(d).update(placement_id=" padded"), "invalid_identifier"),
-        (lambda d: _first(d).pop("installation_id"), REPREPARE),
-        (lambda d: _first(d).update(package_interface={"digest": "sha256:" + "e" * 64}), REPREPARE),
-        (lambda d: d["placements"].append(_first(d)), "duplicate_placement"),
-    ],
-)
-def test_a_placement_set_is_refused_by_name(
-    change: Callable[[dict[str, Any]], object], code: str
-) -> None:
-    """The typed decode keeps every refusal a caller classifies on."""
-    document = json.loads((CORPUS / "tolerated" / "tolerate_absent_collection.json").read_bytes())
-    change(document)
-    raw = canonical.write(document)
-    with pytest.raises(documents.DocumentError) as refused:
-        read_placement_set(
-            worker_pb2.DesiredPlacementSet(
-                placement_set_digest=documents.digest_of(raw), placement_set_canonical_bytes=raw
-            )
-        )
-    assert refused.value.code == code

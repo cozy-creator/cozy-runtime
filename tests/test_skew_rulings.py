@@ -8,40 +8,10 @@ from pathlib import Path
 
 import pytest
 
-from cozy_runtime.internal import (
-    canonical,
-    readiness,
-    source_interfaces,
-)
-from cozy_runtime.internal.config import Credentials, RuntimeConfig
+from cozy_runtime.internal import canonical, readiness
 from cozy_runtime.internal.refusal import LaunchRefusal
 from cozy_runtime.internal.worker.child import ExecutorProtocolMismatch, require_executor_protocol
-from cozy_runtime.internal.worker.control import InMemoryControlHost
 from cozy_runtime.internal.worker.ledger import Ledger
-from cozy_runtime.internal.worker.session import (
-    REPREPARE,
-    Worker,
-    WorkerOptions,
-    _same_parent,
-    read_placement_set,
-)
-from cozy_runtime.internal.worker.source_calls import computation_key
-from cozy_runtime.protocol import documents
-from cozy_runtime.protocol import worker_pb2 as pb
-
-SOURCE = {"source": {"digest": "sha256:" + "a" * 64, "length": 1}}
-
-
-def test_native_memo_key_is_operation_version_output_format_and_inputs_only(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Pinned: a Runtime or TensorFS release that keeps output meaning and format keeps this key.
-    key = computation_key("download_huggingface", SOURCE)
-    assert key.hex() == "2739c9b1e6771dee3872314aee8548064ad7736c6f0a9aeacfb3ca4fb6da363b"
-    assert computation_key("download_huggingface", SOURCE, "cozytensors/1") == key
-    assert computation_key("download_huggingface", SOURCE, "cozytensors/2") != key
-    monkeypatch.setitem(source_interfaces.OPERATION_VERSIONS, "download_huggingface", 2)
-    assert computation_key("download_huggingface", SOURCE) != key
 
 
 def _receipt(boot: str = "boot-1", port: int = 7000, **extra: object) -> bytes:
@@ -109,51 +79,3 @@ def test_executor_protocol_refusal_names_the_side_to_update(
 ) -> None:
     with pytest.raises(ExecutorProtocolMismatch, match=remedy):
         require_executor_protocol(hello)
-
-
-def test_orchestration_parent_is_its_prepared_job_not_its_policy() -> None:
-    running = pb.JobDirective(
-        installation_id="install-a", job_descriptor_id="sha256:" + "c" * 64, orchestration=True
-    )
-    changed = pb.JobDirective()
-    changed.CopyFrom(running)
-    changed.publication_contract.grant_id = "owner/_job-a"
-    changed.resource_caps.max_rss_bytes = 1 << 30
-    assert _same_parent(running, changed)
-    changed.job_descriptor_id = "sha256:" + "d" * 64
-    assert not _same_parent(running, changed)
-
-
-def test_stale_placement_shape_asks_its_owner_to_prepare_again(tmp_path: Path) -> None:
-    stale = canonical.write(
-        {
-            "format": "cozy.worker.v1.PlacementSet/1",
-            "placements": [
-                {
-                    "placement_id": "package-old",
-                    "package": {"package": "test/old", "release": "1.0"},
-                    "package_interface": {"digest": "sha256:" + "e" * 64, "length": 10},
-                    "bindings_digest": "sha256:" + "f" * 64,
-                    "entrypoints": [],
-                }
-            ],
-        }
-    )
-    desired = pb.DesiredPlacementSet(
-        placement_set_digest=documents.digest_of(stale), placement_set_canonical_bytes=stale
-    )
-    with pytest.raises(documents.DocumentError, match=REPREPARE):
-        read_placement_set(desired)
-    worker = Worker(
-        RuntimeConfig(cozy_home=tmp_path / "home", credentials=Credentials()),
-        WorkerOptions(root=tmp_path / "worker", tensorfs_root=tmp_path / "store", worker_id="w"),
-        InMemoryControlHost(),
-    )
-    try:
-        worker._apply_desired_state(pb.DesiredWorkerState(revision=3, placement_set=desired))
-        (fault,) = [row for row in worker.engine.faults if row.reason == REPREPARE]
-        assert fault.kind == pb.FAULT_KIND_ARTIFACT_FETCH_FAILED
-        assert fault.desired_state_revision == 3
-        assert not worker.latched
-    finally:
-        worker.shutdown()

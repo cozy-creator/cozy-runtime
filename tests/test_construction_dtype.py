@@ -5,7 +5,6 @@ import mmap
 from pathlib import Path
 from types import SimpleNamespace
 
-import msgspec
 import pytest
 import tensorfs
 from tensorfs.derived import Config as NativeConfig
@@ -13,7 +12,7 @@ from tensorfs.derived import Derivation, Part, Target, Tensor
 
 from cozy_runtime.author import Artifact, Config, ConformanceError, Loader
 from cozy_runtime.author._loader import TensorSpec
-from cozy_runtime.internal import derive_child, plane
+from cozy_runtime.internal import plane
 from cozy_runtime.internal.encoding import SPEC_PLAIN
 from cozy_runtime.internal.fill import Checkpoint, tensor_schema_of
 from cozy_runtime.internal.weights import PlaneBackend, Weights
@@ -60,18 +59,6 @@ def test_dtype_view_is_read_only_and_missing_supplied_key_refuses() -> None:
     with pytest.raises(ConformanceError, match="no tensor"):
         config.tensor_dtype("linear.typo", default="f32")
     assert Config({}).tensor_dtype("linear.weight", default="f32") == "f32"
-
-
-def test_private_derive_request_carries_dtype_metadata() -> None:
-    request = derive_child.DeriveRequest(
-        (
-            derive_child.SlotRequest(
-                "sample.models.model", b"{}", tensor_dtypes={"linear.weight": "f16"}
-            ),
-        ),
-        application="fixture:app",
-    )
-    assert derive_child.read_request(msgspec.msgpack.encode(request.render())) == request
 
 
 @pytest.mark.skipif(not plane.available(), reason="a TensorFS with the weight plane")

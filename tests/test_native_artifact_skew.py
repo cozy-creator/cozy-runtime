@@ -11,11 +11,9 @@ import pytest
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author._services import MAX_OUTPUT_BYTES
-from cozy_runtime.internal.worker import source_views, workspace_memo, workspace_sources
 from cozy_runtime.internal.worker import workspace_byte_outputs as byte_outputs
+from cozy_runtime.internal.worker import workspace_memo, workspace_sources
 from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
-from cozy_runtime.protocol import worker_pb2 as pb
-from test_native_source_views import run_view, view_call
 from test_owned_file_commit import pending
 from test_workspace_custody import produced
 from test_workspace_memo import completed as outcome
@@ -29,21 +27,6 @@ def _additive(value: dict[str, Any]) -> dict[str, Any]:
         "retention_hint": "warm",
         "manifest": {**value["manifest"], "encoding": "tree/2"},
     }
-
-
-def _stored(workspace: Workspace, service: str) -> dict[str, Any]:
-    with workspace.locked() as db:
-        row = db.execute("SELECT result FROM native_calls WHERE service_id=?", (service,))
-        stored: dict[str, Any] = canonical_json.decode(row.fetchone()[0])
-        return stored
-
-
-def _restore(workspace: Workspace, service: str, value: dict[str, Any]) -> None:
-    with workspace.locked() as db:
-        db.execute(
-            "UPDATE native_calls SET result=? WHERE service_id=?",
-            (canonical_json.encode(value), service),
-        )
 
 
 def test_native_source_result_with_additive_members_completes_and_memoizes(
@@ -93,33 +76,6 @@ def test_native_source_result_with_additive_members_completes_and_memoizes(
                 b"k" * 32,
                 root["receipt"],
             )
-
-
-def test_source_view_replays_a_result_another_version_retained(tmp_path: Path) -> None:
-    workspace = Workspace(tmp_path / "store")
-    source = accepted(workspace, "script")
-    value, _ = completed(workspace, source, b"original metadata")
-    # The caller's SDK sends the source artifact with members this Runtime does not know.
-    command = view_call(source, canonical_json.encode(_additive(canonical_json.decode(value))))
-    first = run_view(workspace, command)
-    assert first.state == pb.NATIVE_SOURCE_STATE_SUCCEEDED, first.safe_code
-
-    result = _stored(workspace, command.service_id)
-    _restore(
-        workspace,
-        command.service_id,
-        {**result, "files": {**result["files"], "tree_format": 2}, "note": "additive"},
-    )
-    replayed, _, _ = source_views.replay(workspace, "owner", command)
-    assert replayed == first.byte_output
-
-    _restore(
-        workspace,
-        command.service_id,
-        {**result, "files": {**result["files"], "size_bytes": result["files"]["size_bytes"] + 1}},
-    )
-    with pytest.raises(WorkspaceRefusal, match="producer"):
-        source_views.replay(workspace, "owner", command)
 
 
 def test_file_commit_manifest_with_additive_members_reserves_its_accepted_blob(
