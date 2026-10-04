@@ -35,6 +35,9 @@ from cozy_runtime.models.minimax_h3.vae_tiles import TileBatchedVideoVAE
 
 
 class Collective(torch.nn.Module):  # type: ignore[misc]  # torch is optional in the base checking env
+    #: this process's calls that asked to run out of memory
+    ooms = 0
+
     def __init__(self) -> None:
         super().__init__()
         self.weight = torch.nn.Parameter(torch.full((1,), 2.0))
@@ -47,6 +50,7 @@ class Collective(torch.nn.Module):  # type: ignore[misc]  # torch is optional in
         fail: bool = False,
         fail_leader: bool = False,
         step: int | None = None,
+        oom: int = 0,
     ) -> Any:
         assert in_gated_call()
         expected_layout = None if step is None else AttentionLayout(29, 9, step, 1, ("blocks.0",))
@@ -62,6 +66,11 @@ class Collective(torch.nn.Module):  # type: ignore[misc]  # torch is optional in
             raise RuntimeError("GPU 0 ran out of memory")
         result = value.detach().cpu().clone() + torch.distributed.get_rank()
         torch.distributed.all_reduce(result)
+        if oom and torch.distributed.get_rank() > 0:
+            # A follower's first `oom` calls run out of memory after its collectives.
+            Collective.ooms += 1
+            if Collective.ooms <= oom:
+                raise torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 64.00 MiB.")
         return result
 
 
@@ -92,6 +101,11 @@ class ModelCalls(Model[object]):
     def fail_before_collective(self) -> None:
         with torch.no_grad():
             self.block(torch.ones(1), fail=True)
+
+    @uses_components("block", "overlay")
+    def out_of_memory(self, times: int) -> Any:
+        with torch.no_grad():
+            return self.block(torch.ones(1), oom=times)
 
     @uses_components("block", "overlay")
     def fail_on_leader(self) -> None:
