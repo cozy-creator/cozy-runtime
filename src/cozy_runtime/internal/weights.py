@@ -3410,12 +3410,12 @@ class WeightResidency:
     def _decode(self, name: str, decode: Callable[..., Any]) -> Callable[..., Any]:
         """An image VAE's decode mode, decided before the call from what is free plus what the
         plane may unmap: untiled when its measured activations fit, else tiled with the tile
-        clamped to what is free. A size never measured at or above runs untiled (its blocks
-        retry on OOM), sized by the largest size measured below it: a fixed cost makes small
+        clamped to what is free. A size never measured at or above runs untiled (reviewed
+        pure operators may recover OOM), sized by the largest size measured below it: a fixed cost makes small
         decodes' per-pixel peaks overstate large ones.
-        A decode that cannot run untiled even with every idle weight unmapped runs again tiled,
-        and a tile that does not fit runs again at half the side, down to the smallest tile.
-        The mode is recorded in the run's outputs."""
+        The mode is selected before the first decode. A decode has no generic rollback
+        contract for module/input/random state, so capacity failures retire it instead
+        of replaying it at a different tile size. The mode is recorded in the outputs."""
         root: Any = self.components[name].root  # a diffusers image VAE, read as it is
         vae = image_vae.geometry(root)
         assert vae is not None
@@ -3456,30 +3456,25 @@ class WeightResidency:
             side = min(_side(free // max(per_pixel, 1)), sides.get(pixels, largest), largest)
             baseline = accel.allocated(weights.torch, weights.kind)
             accel.reset_peak(weights.torch, weights.kind)
-            while True:
-                if mode == "tiled":
-                    vae.tile(side)
-                else:
-                    root.disable_tiling()
-                try:
-                    out = decode(z, *args, **kwargs)
-                    break
-                except Exception as exc:
-                    capacity = is_device_oom(exc) or (
-                        isinstance(exc, ResidencyRefusal) and exc.code == INDIVISIBLE
-                    )
-                    if not capacity or (mode == "tiled" and side <= MIN_TILE):
-                        raise
-                # outside `except`, so the failed call's frames are gone
-                accel.release_cached(weights.torch, weights.kind)
-                if mode == "tiled":
-                    side = _tile(side // 2)
-                    continue
-                # it needs more than all it had: the next decode of this size starts tiled
-                peaks[pixels] = max(peaks.get(pixels, 0), free + evictable + 1)
-                mode = "tiled"
-                free, evictable = self.room((name,))
-                self._room_for_decode(name, free, evictable, free + evictable)
+            if mode == "tiled":
+                vae.tile(side)
+            else:
+                root.disable_tiling()
+            try:
+                out = decode(z, *args, **kwargs)
+            except Exception as exc:
+                capacity = is_device_oom(exc) or (
+                    isinstance(exc, ResidencyRefusal) and exc.code == INDIVISIBLE
+                )
+                if not capacity:
+                    raise
+                # Successful operations before this refusal may have changed inputs,
+                # RNG, buffers, hooks or Python state, including on a stock class.
+                # MRO/family recognition only gives geometry, never a replay promise.
+                raise weights.recovery_refusal(
+                    f"{name}.decode could not complete ({exc}); whole-decode replay has "
+                    "no contract restoring its module, input and random state",
+                ) from exc
             if mode == "tiled":
                 sides[pixels] = side
                 inexact()  # a tiled decode's arithmetic differs from an untiled one
