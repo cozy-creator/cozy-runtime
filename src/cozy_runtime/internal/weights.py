@@ -71,6 +71,7 @@ from cozy_runtime.internal.paging import partition
 from cozy_runtime.internal.planfacts import PlanFacts
 from cozy_runtime.internal.probe import QualificationResult, observed_capability_records, qualify
 from cozy_runtime.internal.resolution import ResolvedModelPlan, TensorResolution, script_plan
+from cozy_runtime.internal.selected_rows import SelectedRows
 
 if TYPE_CHECKING:
     from tensorfs import ReadPlan
@@ -190,6 +191,9 @@ class Region:
     baked_with: list[tuple[object, ...]] = field(default_factory=list)
     #: a bake failed part way: the resident bytes must refill before any use
     dirty: bool = False
+    #: A plain H3 token embedding can read selected source rows when its table cannot fit.
+    indexed: SelectedRows | None = None
+    selected_rows: bool = False
 
     @property
     def transforms(self) -> bool:
@@ -524,7 +528,8 @@ class Weights:
     def window(self) -> int:
         """What the open stages stream in at least: each component's common weights and two
         of its largest regions (one in use, the next arriving), at its current grain."""
-        return sum(c.planned.common + 2 * c.planned.largest for _, _, c in self.opened().values())
+        layouts = (_paid(c, c.planned)[0] for _, _, c in self.opened().values())
+        return sum(layout.common + 2 * layout.largest for layout in layouts)
 
     def grow(self, need: int) -> bool:
         """The plane refused a region for its own budget while the device has room: map
@@ -572,7 +577,7 @@ class Weights:
         """The plane bytes the open stages cannot run below, each component at its grain
         (mid-stage none can refine: its leases hold the coarse regions)."""
         return sum(
-            weight_policy.floor(replace(component.planned, fine=None))
+            weight_policy.floor(replace(_paid(component, component.planned)[0], fine=None))
             for _, _, component in self.opened().values()
         )
 
@@ -1010,6 +1015,8 @@ class Weights:
         for region in component.regions:
             unbind(region)
             region.views.clear()
+            if region.indexed is not None:
+                region.indexed.close()
         component.mapping = None
         component.shared.clear()
         if component.filling is not None:
@@ -1036,7 +1043,13 @@ class Weights:
                 component.key, self.index
             )
         stages = [row for row in held.stages if row.device == self.index]
-        copied = device.host_copy_bytes + device.disk_copy_bytes
+        indexed = [
+            region.indexed
+            for component in self.components.values()
+            for region in component.regions
+            if region.indexed is not None
+        ]
+        copied = device.host_copy_bytes + device.disk_copy_bytes + sum(r.h2d_bytes for r in indexed)
         reserved = -1 if self.host_only else int(self.torch.cuda.memory_reserved(self.device))
         # This process's own count (per-process NVML only refines the context in it); an
         # unmeasured context counts nothing rather than hiding the rest.
@@ -1045,7 +1058,12 @@ class Weights:
             if reserved >= 0
             else -1
         )
-        copy_ns = device.host_copy_ns + device.disk_copy_ns
+        copy_ns = device.host_copy_ns + device.disk_copy_ns + sum(r.copy_ns for r in indexed)
+        if indexed:
+            self.modes["selected_embedding_read_bytes"] = str(sum(r.read_bytes for r in indexed))
+            self.modes["selected_embedding_host_peak_bytes"] = str(
+                max(r.peak_host_bytes for r in indexed)
+            )
         return PlaneFacts(
             budget_bytes=device.budget,
             committed_bytes=device.committed,
@@ -2041,7 +2059,31 @@ class PlaneBackend:
                 if sealed and tiers is not None and tiers.files
                 else []
             )
+            indexed: dict[str, SelectedRows] = {}
             try:
+                if fine and name == "text_encoder" and files:
+                    for region_index, group in layout.kept:
+                        if region_index == 0 or len(group) != 1:
+                            continue
+                        row = self.plan[group[0]]
+                        module = root.get_submodule(layout.units[region_index - 1])
+                        if (
+                            row.name == "model.language_model.embed_tokens.weight"
+                            and self._route(group[0]) == "verbatim"
+                            and row.dtype == "bf16"
+                            and type(module) is self.torch.nn.Embedding
+                            and module.max_norm is None
+                        ):
+                            indexed[group[0]] = SelectedRows(
+                                cast("tuple[int, int]", tuple(row.shape)),
+                                "bf16",
+                                [
+                                    item
+                                    for item in plan.items()
+                                    if item["what"] == row.role_what("value")
+                                ],
+                                files,
+                            )
                 if sealed:
                     assert held is not None
                     # The machine's: no store, no lease, no fill here, ever. (`files` only
@@ -2054,14 +2096,23 @@ class PlaneBackend:
                     )
             except plane.error("Invalid"):
                 if held is None:
+                    for reader in indexed.values():
+                        reader.close()
                     raise
                 ws = None  # the held tier is not this layout after all
+            except BaseException:
+                for reader in indexed.values():
+                    reader.close()
+                raise
             finally:
                 if held is not None:
                     os.close(held)  # the plane reopened its own description
                 for _, _, fd in files:
                     os.close(fd)  # the plane duplicated each
             if ws is None:
+                for reader in indexed.values():
+                    reader.close()
+                indexed.clear()
                 held, sealed = None, False
                 ws = weights.plane.register(key, self._source(name, checkpoint), plan, ids)
         if tiers is not None:
@@ -2108,6 +2159,7 @@ class PlaneBackend:
                     for table, attr, _ in weight.sites
                 )
                 region.weights.append(weight)
+                region.indexed = indexed.get(key)
             unbind(region)
             regions.append(region)
         common = regions[0] if kept[0][0] == 0 else None
@@ -2467,6 +2519,9 @@ class WeightResidency:
         # A new plan: no stage left open by an earlier step survives it, in any model slot.
         for row in list(weights.residencies):
             row.unpark()
+        for name in local:
+            for region in self.components[name].blocks:
+                region.selected_rows = False
         self.active = (method, local)
         weights.open.append((self, method, local))
         try:
@@ -2893,6 +2948,18 @@ class WeightResidency:
         except weight_policy.BelowFloor as exc:
             if exc.component in opened and opened[exc.component][0]._refine(exc.component):
                 return self._plan(budget, resume, asked)
+            # Refinement cannot split a leaf tensor. H3's plain bf16 token table reads only
+            # requested rows; it does not occupy a plane window when the table cannot fit.
+            selected = [
+                region
+                for component in components.values()
+                for region in component.blocks
+                if region.indexed is not None and not region.selected_rows
+            ]
+            if selected:
+                for region in selected:
+                    region.selected_rows = True
+                return self._plan(budget, resume, asked)
             if not asked and weights.room is not None and weights.cap >= 0:
                 # Never refused for size while the GPU has room to give: the owner makes it
                 # (idle tenants leave, held weights nobody reads are revoked) and raises the cap.
@@ -2977,7 +3044,7 @@ class WeightResidency:
                 finally:
                     lease.release()
             if residence.streamed and component.observed:
-                order = component.order
+                order = [i for i in component.order if not component.regions[i].selected_rows]
                 start = order.index(resume[key]) if key in resume else 0
                 try:
                     component.cursor = weights.plane.stream(
@@ -3064,6 +3131,21 @@ class WeightResidency:
                 weights.hold_host()
             if weights.growing and component.passes == 2 > passes:
                 self._grow()
+            if region.selected_rows and region.indexed is not None:
+                if len(args) == 1 and not kwargs:
+                    indices = args[0]
+                elif not args and kwargs.keys() == {"input"}:
+                    indices = kwargs["input"]
+                else:
+                    raise TypeError("Embedding.forward requires one input tensor")
+                weights.modes[f"{component.name}.{region.path}"] = "selected_rows"
+                return region.indexed.lookup(
+                    torch,
+                    indices,
+                    weights.device,
+                    region.module.weight.dtype,
+                    weights.pinned_applied,
+                )
             versions = _versions(args, kwargs)
             # a library's refusal is answered once: by its op where ops recover one by one
             refused = weights.grouped or region.mutates is not False
@@ -3434,9 +3516,12 @@ def _paid(
     """What a stage's budget pays for, and the block numbers the policy may place. A region
     attached from the machine is on the device already, outside the budget, and never
     streamed: only its decoded copies cost (torch's bytes), held beside `common`."""
-    if not component.shared:
+    selected = {region.index for region in component.blocks if region.selected_rows}
+    if not component.shared and not selected:
         return layout, tuple(range(len(layout.blocks)))
-    kept = tuple(i for i, b in enumerate(component.blocks) if b.index not in component.shared)
+    kept = tuple(
+        i for i, b in enumerate(component.blocks) if b.index not in component.shared | selected
+    )
     common = component.common
     fixed = (common.decoded if common.index in component.shared else layout.common) if common else 0
     fixed += sum(b.decoded for b in component.blocks if b.index in component.shared)
@@ -3451,7 +3536,7 @@ def _unpaid(
     resident, and the ring streams only blocks the budget pays for."""
     if len(kept) == len(component.blocks):
         return paid
-    attached = [i for i in range(len(component.blocks)) if i not in set(kept)]
+    attached = [i for i, block in enumerate(component.blocks) if block.index in component.shared]
     return replace(
         paid,
         resident=(*(kept[p] for p in paid.resident), *attached),
