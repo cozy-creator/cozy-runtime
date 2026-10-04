@@ -168,3 +168,29 @@ def test_accumulate_adds_the_update_to_the_base_output() -> None:
     want = out + 0.5 * torch.nn.functional.linear(torch.nn.functional.linear(x, down), up)
     lora_bake.accumulate(torch, x, out, down, up, 0.5)
     assert torch.allclose(out, want, atol=1e-5)
+
+
+def test_a_stochastic_bf16_bake_keeps_a_delta_below_half_an_ulp() -> None:
+    values, down, up = _layer()
+    kept = {}
+    roundings: tuple[lora_bake.Rounding, ...] = ("nearest", "stochastic")
+    for rounding in roundings:
+        weight = torch.from_numpy(values).to(torch.bfloat16)
+        before = weight.float()
+        stats = lora_bake.Stats()
+        lora_bake.bake_plain(
+            torch,
+            weight,
+            down,
+            up,
+            0.02,
+            rounding=rounding,
+            generator=torch.Generator().manual_seed(2),
+            stats=stats,
+        )
+        kept[rounding] = stats.retention
+        # every stored value is one of the two bf16 neighbours of the merged weight
+        merged = before + (up @ down) * 0.02
+        assert torch.all((weight.float() - merged).abs() <= merged.abs() * 2**-7)
+    assert kept["nearest"] < 0.5
+    assert 0.8 < kept["stochastic"] < 1.2

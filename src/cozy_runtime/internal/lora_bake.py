@@ -16,6 +16,7 @@ from typing import Any, Literal
 
 from cozy_runtime.internal.encoding import E4M3_MAX, E8M0_BIAS, MX_BLOCK
 
+Strategy = Literal["bake", "per_step"]
 Rounding = Literal["nearest", "stochastic", "feedback"]
 ROUNDINGS: tuple[Rounding, ...] = ("nearest", "stochastic", "feedback")
 #: A rowwise row's scale after a bake: unchanged, what its new maximum needs, or that moved
@@ -174,16 +175,42 @@ def _account(
 
 
 def bake_plain(
-    torch: Any, weight: Any, down: Any, up: Any, alpha: float, *, stats: Stats | None = None
+    torch: Any,
+    weight: Any,
+    down: Any,
+    up: Any,
+    alpha: float,
+    *,
+    rounding: Rounding = "nearest",
+    generator: Any = None,
+    stats: Stats | None = None,
 ) -> None:
-    """`weight += alpha * up @ down`, computed in f32 and rounded once to its dtype."""
+    """`weight += alpha * up @ down`, computed in f32 and rounded once to its dtype.
+
+    A bf16 weight has 8 significant bits, so a small delta vanishes under nearest rounding
+    there too; `stochastic` keeps it in expectation. Other dtypes round to nearest.
+    """
     began = time.perf_counter()
     for start, stop in _chunks(*weight.shape):
         base = weight[start:stop].to(torch.float32, copy=True)
         delta = _delta(up, down, alpha, start, stop)
-        weight[start:stop].copy_(base + delta)
+        target = base + delta
+        if rounding == "stochastic" and weight.dtype == torch.bfloat16:
+            target = _bf16_either(torch, target, generator)
+        weight[start:stop].copy_(target)
         _account(stats, base, delta, weight[start:stop].float(), 0, down)
     _finish(torch, weight, stats, began)
+
+
+def _bf16_either(torch: Any, values: Any, generator: Any) -> Any:
+    """f32 -> one of its two bf16 neighbours (as f32), the farther one with the probability
+    of the distance covered."""
+    toward_zero = values.contiguous().view(torch.int32) & -65536
+    low, high = toward_zero.view(torch.float32), (toward_zero + 65536).view(torch.float32)
+    gap = high - low
+    fraction = torch.where(torch.isfinite(gap) & (gap != 0), (values - low) / gap, 0.0)
+    draw = torch.rand(fraction.shape, device=values.device, generator=generator)
+    return torch.where(draw < fraction, high, low)
 
 
 def bake_rowwise(
@@ -303,6 +330,64 @@ def _finish(torch: Any, tensor: Any, stats: Stats | None, began: float) -> None:
         torch.cuda.synchronize(tensor.device)
     stats.layers += 1
     stats.seconds += time.perf_counter() - began
+
+
+def bakeable(roles: dict[str, str]) -> bool:
+    """Whether a stored weight (role -> TensorFS dtype) takes `bake`."""
+    if set(roles) == {"value"}:
+        return roles["value"] in ("bf16", "f16", "f32")
+    return (
+        set(roles) == {"data", "scale"}
+        and roles["data"] == "f8_e4m3fn"
+        and roles["scale"] in ("f32", "u8")
+    )
+
+
+def bake(
+    torch: Any,
+    stored: dict[str, Any],
+    down: Any,
+    up: Any,
+    *,
+    generator: Any = None,
+    stats: Stats | None = None,
+) -> None:
+    """Bake `up @ down` into one stored weight by its roles: plain floats, `fp8-rowwise/1`
+    (E4M3 data, f32 row scale) or `mxfp8/1` (E4M3 data, E8M0 block grid). bf16 and E4M3 round
+    stochastically, scales kept: nearest returns a small delta to where it was, and loses
+    most of a LoRA's effect on fp8 (MEASURE.md, cozy-machine #26)."""
+    if set(stored) == {"value"}:
+        weight = stored["value"]
+        rounding: Rounding = "stochastic" if weight.dtype == torch.bfloat16 else "nearest"
+        bake_plain(
+            torch, weight, down, up, 1.0, rounding=rounding, generator=generator, stats=stats
+        )
+    elif stored["scale"].dtype == torch.float32:
+        bake_rowwise(
+            torch,
+            stored["data"],
+            stored["scale"],
+            down,
+            up,
+            1.0,
+            rounding="stochastic",
+            grid="keep",
+            generator=generator,
+            stats=stats,
+        )
+    else:
+        bake_mx(
+            torch,
+            stored["data"],
+            stored["scale"],
+            down,
+            up,
+            1.0,
+            rounding="stochastic",
+            refit=False,
+            generator=generator,
+            stats=stats,
+        )
 
 
 def accumulate(torch: Any, x: Any, out: Any, down: Any, up: Any, alpha: float) -> None:

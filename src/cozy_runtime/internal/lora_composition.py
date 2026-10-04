@@ -287,9 +287,14 @@ def composer(graph: Graph) -> Callable[[object], None]:
     config = LoraConfig(init_lora_weights=False, inference_mode=True, lora_dropout=0.0)
 
     class _Linear(PeftLinear):  # type: ignore[misc]
+        #: the weight plane baked the update into the base weight's resident bytes
+        _cozy_baked = False
+
         def forward(self, x: torch.Tensor, *args: object, **kwargs: object) -> torch.Tensor:
             # Base hooks (Turbo's overlay) run inside `base_layer`. Extra memory: [rows, rank].
             result = self.base_layer(x, *args, **kwargs).contiguous()
+            if self._cozy_baked:
+                return result
             flat, rows = result.view(-1, result.shape[-1]), x.reshape(-1, x.shape[-1])
             for name in self.active_adapters:
                 low = nn.functional.linear(rows, self.lora_A[name].weight.to(rows.dtype))
