@@ -1123,6 +1123,96 @@ def test_an_oom_at_a_block_boundary_unmaps_weights_and_retries(card: Any) -> Non
     assert same(reference, retried)
 
 
+class Table(torch.nn.Module):  # type: ignore[misc,name-defined]
+    """A component with no blocks: all of it is its common region (a text encoder's
+    embedding table is most of one)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.table = torch.nn.Parameter(torch.empty(4096, HIDDEN, dtype=torch.float16))
+
+    def forward(self, x: Any) -> Any:
+        rows = torch.full((x.shape[0],), 7, dtype=torch.long, device=x.device)
+        return x * torch.nn.functional.embedding(rows, self.table)
+
+
+@on_card
+def test_a_stage_spares_its_idle_components_for_the_one_that_runs(tmp_path: Path) -> None:
+    """Anima scopes its conditioner, text encoder, transformer and VAE in one stage, and each
+    component's common region stays leased for all of it: at a 1.25 GiB pool the second
+    request's transformer had 173 MB for its activations beside 675 MB of idle components.
+    While the running component cannot get memory, the others give theirs back; a read of one
+    maps it for that op, and the results are the same bits."""
+    weights = Weights(torch, torch.device("cuda", 0), "cuda")
+    weights.set_budget(120 << 20, pinned=1 << 30)
+    stack_checkpoint, _ = write_checkpoint(tmp_path / "stack")
+    generator = torch.Generator().manual_seed(11)
+    encoder_checkpoint = store_component(
+        tmp_path / "encoder", "encoder", {"table": torch.rand(4096, HIDDEN, generator=generator)}
+    )
+    checkpoints = {"stack": stack_checkpoint, "encoder": encoder_checkpoint}
+    backend = PlaneBackend.for_script(
+        checkpoints,
+        [*stack_checkpoint.rows("stack"), *encoder_checkpoint.rows("encoder")],
+        weights=weights,
+        construction="spare",
+        release="plane-test/1",
+    )
+    major, minor = torch.cuda.get_device_capability(0)
+    with serving_substrate(f"sm{major}{minor}", Observations()):
+        modules = {"stack": Stack(), "encoder": Table()}
+    holder = SimpleNamespace(components=modules)
+    walked = census(holder)
+    backend.expect(
+        {name: [d.key for d in walked.destinations if d.key.startswith(name)] for name in modules}
+    )
+    live = backend.materialize(holder, walked)
+    for destination in walked.destinations:
+        backend.fill(destination.key, destination.spec, live[destination.key])
+    backend.commit()
+    scope = ("encoder", "stack")
+    residency = WeightResidency(weights, backend.components, {"run": scope}, refine=backend.refine)
+    x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
+
+    residency.admit("run", scope)
+    try:
+        with torch.inference_mode():
+            encoded = modules["encoder"](x)
+            reference = modules["stack"](encoded)
+    finally:
+        residency.release("run", scope)
+    encoder, stack = residency.components["encoder"], residency.components["stack"]
+
+    residency.admit("run", scope)
+    try:
+        with torch.inference_mode():
+            assert torch.equal(modules["encoder"](x), encoded)
+            mapped = weights.facts().committed_bytes
+            original = modules["stack"].blocks[0].proj.forward
+
+            def reclaim_inside_block(value: Any) -> Any:
+                # The parent block already holds its real plane lease and cursor here.
+                cursor = stack.cursor
+                bound = stack.blocks[0].bound
+                assert weights.running and stack.key in weights.executing
+                assert residency._spare_idle(())
+                assert stack.cursor is cursor and stack.blocks[0].bound == bound
+                assert encoder.spared and encoder.lease is None and encoder.common.bound is None
+                assert weights.facts().committed_bytes <= mapped - encoder.common.span
+                return original(value)
+
+            modules["stack"].blocks[0].proj.forward = reclaim_inside_block
+            assert torch.equal(modules["stack"](encoded), reference)
+            assert torch.equal(modules["encoder"](x), encoded)
+            assert encoder.common.bound is None, "mapped for that op only"
+    finally:
+        residency.release("run", scope)
+    residency.unpark()  # a repeating stage stays open until the next request plans afresh
+    assert not encoder.spared, "a stage's end clears it"
+    assert weights.facts().oom_retries >= 1
+
+
+
 @on_card
 def test_an_idle_construction_gives_room_and_returns_from_the_pinned_tier(card: Any) -> None:
     weights = card.weights
