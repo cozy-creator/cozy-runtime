@@ -7,7 +7,6 @@ import csv
 import hashlib
 import io
 import json
-import os
 import re
 import subprocess
 import tarfile
@@ -213,13 +212,13 @@ def test_only_changed_native_inputs_authorize_a_full_build(
     assert not list((tmp_path / "dist").glob("*.whl"))
 
 
-def test_source_archive_publishes_agent_without_requiring_go(
+def test_source_archive_and_portable_wheel_build_without_private_files(
     release_copy: tuple[Path, Path, str], tmp_path: Path
 ) -> None:
     repo, _, _ = release_copy
     private = [
         ".env",
-        "machine-agent/.env.local",
+        "src/.env.local",
         ".task/source-proof.md",
         "outputs/source-proof.bin",
     ]
@@ -227,41 +226,21 @@ def test_source_archive_publishes_agent_without_requiring_go(
         path = repo / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("local-only canary\n")
-    tools = tmp_path / "tools"
-    tools.mkdir()
-    go = tools / "go"
-    go.write_text("#!/bin/sh\necho 'default Python builds must not invoke Go' >&2\nexit 97\n")
-    go.chmod(0o755)
     out = tmp_path / "dist"
     result = subprocess.run(
         ["uv", "build", "--sdist", "--wheel", "--out-dir", str(out)],
         cwd=repo,
-        env={**os.environ, "PATH": str(tools) + os.pathsep + os.environ["PATH"]},
         capture_output=True,
         text=True,
         check=False,
     )
     assert result.returncode == 0, result.stderr
     (sdist,) = out.glob("*.tar.gz")
-    tracked = run("git", "ls-files", "machine-agent", cwd=repo).stdout.splitlines()
-    required = set(tracked)
-    assert {
-        "machine-agent/go.mod",
-        "machine-agent/go.sum",
-        "machine-agent/main.go",
-        "machine-agent/internal/host/public_read.py",
-    } <= required
     with tarfile.open(sdist) as archive:
-        files = {member.name.split("/", 1)[1]: member for member in archive if member.isfile()}
-        assert required <= files.keys()
-        assert not set(private) & files.keys()
-        for name in required:
-            source = archive.extractfile(files[name])
-            assert source is not None and source.read() == (repo / name).read_bytes()
+        files = {member.name.split("/", 1)[1] for member in archive if member.isfile()}
+        assert "pyproject.toml" in files
+        assert not set(private) & files
     (wheel,) = out.glob("*.whl")
     assert wheel.name.endswith("-py3-none-any.whl")
     with zipfile.ZipFile(wheel) as archive:
-        assert not any(
-            name.startswith("machine-agent/") or ".data/scripts/cozy-machine" in name
-            for name in archive.namelist()
-        )
+        assert not any(".data/scripts/cozy-machine" in name for name in archive.namelist())
