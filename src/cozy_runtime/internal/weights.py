@@ -188,6 +188,8 @@ class Region:
     baked: bool = False
     #: what each bake added (`_bake_key`), while `baked`
     baked_with: list[object] = field(default_factory=list)
+    #: a bake failed part way: the resident bytes must refill before any use
+    dirty: bool = False
     #: streamed copies baked in place: ring address -> (what was added, bytes that show it)
     ring: dict[int, tuple[list[object], list[tuple[Tensor, Tensor, Tensor]]]] = field(
         default_factory=dict
@@ -707,7 +709,8 @@ class Weights:
             if component is not None and 0 <= int(index) < len(component.regions):
                 region = component.regions[int(index)]
                 unbind(region)
-                region.baked, region.baked_with = False, []  # it refills unmodified
+                # it refills unmodified
+                region.baked, region.baked_with, region.dirty = False, [], False
 
     def measure_context(self) -> None:
         """What the driver charges this process beyond torch's segments and the plane's maps:
@@ -856,7 +859,7 @@ class Weights:
         unbind(region)
         self.quiesce()
         self.plane.drop(component.ws, self.index, [region.index])
-        region.baked, region.baked_with = False, []
+        region.baked, region.baked_with, region.dirty = False, [], False
 
     def revoke(self, layout: str) -> int:
         """Stop using the machine's regions of `layout`: queued work finishes, then they are
@@ -1389,7 +1392,7 @@ def _bake(
     keys = [_bake_key(bake) for bake in region.bakes]
     wanted = region.bake and None not in keys
     if home:
-        if region.baked and keys != region.baked_with and refill:
+        if refill and (region.dirty or (region.baked and keys != region.baked_with)):
             raise _Stale(region.index)
         if wanted and not region.baked:
             _apply(torch, region, parts)
@@ -1410,9 +1413,12 @@ def _bake(
 def _apply(
     torch: ModuleType, region: Region, parts: list[dict[str, Tensor]]
 ) -> list[tuple[Tensor, Tensor, Tensor]]:
-    """Bake every LoRA'd weight of the region in place; returns, per weight, up to 16 bytes the
-    bake changed (stored bytes, positions, values) to recognize a baked copy by."""
+    """Bake every LoRA'd weight of the region in place, a row chunk at a time; returns, per
+    weight, up to 16 sampled bytes the bake changed (stored bytes, positions, values) to
+    recognize a baked copy by. A failure part way (an out-of-memory) leaves the region dirty:
+    its bytes are neither the stored ones nor baked, so it refills before any use."""
     marks = []
+    region.dirty = True
     for bake in region.bakes:
         stored = parts[bake.weight]
         name = region.weights[bake.weight].row.name
@@ -1427,15 +1433,23 @@ def _apply(
         generator = torch.Generator(device=stored_device(stored)).manual_seed(
             zlib.crc32(name.encode())
         )
-        scratch = {role: tensor.clone() for role, tensor in stored.items()}
-        lora_bake.bake(torch, scratch, down, up, generator=generator)
-        for role, tensor in stored.items():
-            raw, baked = tensor.view(-1).view(torch.uint8), scratch[role].view(-1).view(torch.uint8)
-            where = (raw != baked).nonzero().flatten()[:16]
-            if where.numel():
-                marks.append((raw, where, baked[where]))
-            tensor.copy_(scratch[role])
+        raws = {role: tensor.view(-1).view(torch.uint8) for role, tensor in stored.items()}
+        probes = {
+            role: torch.arange(0, raw.numel(), max(raw.numel() // _PROBES, 1), device=raw.device)
+            for role, raw in raws.items()
+        }
+        before = {role: raws[role][where].clone() for role, where in probes.items()}
+        lora_bake.bake(torch, stored, down, up, generator=generator)
+        for role, where in probes.items():
+            changed = where[raws[role][where] != before[role]][:16]
+            if changed.numel():
+                marks.append((raws[role], changed, raws[role][changed].clone()))
+    region.dirty = False
     return marks
+
+
+#: Bytes of each baked weight sampled to find bytes its bake changed.
+_PROBES = 1 << 16
 
 
 def _shows(marks: list[tuple[Tensor, Tensor, Tensor]]) -> bool:
