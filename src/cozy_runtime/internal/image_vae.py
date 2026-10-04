@@ -7,7 +7,8 @@ map kept on the device or in host memory. A convolution runs in full-width row b
 reading its rows plus the kernel's reach (zero rows only past the image's edges) with no
 vertical padding; a GroupNorm normalizes every band with the whole map's statistics, merged
 in float32; the mid-block attention runs whole, at latent resolution. The band partition
-follows the image size and the model only: memory decides only where the maps live.
+follows the image size and the model only: memory decides only where the maps live. Host
+maps move on their own copy streams, a band ahead of the one computing.
 
 Decoding one image, ComfyUI's Wan VAE beats diffusers' by 2x at the same size: a causal 3D
 convolution pads two zero frames in front of a lone frame and convolves all three, so only
@@ -21,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+from collections import deque
 from collections.abc import Callable, Iterable, Iterator
 from functools import cache, partial
 from types import MethodType, ModuleType
@@ -40,6 +42,11 @@ ENTRIES = ("decode", "_decode")
 WHOLE = ("Attention", "QwenImageAttentionBlock")
 #: Elements in a band of a layer's wider map, input or output: the fixed partition.
 BAND = 1 << 22
+#: Host map reads queued ahead of the device.
+AHEAD = 4
+#: device -> its host map copy streams (rows in, bands out). One pair per process: torch
+#: keeps a stream's freed blocks for that stream alone.
+_STREAMS: dict[Any, tuple[Any, Any]] = {}
 
 #: (module, body) -> body(), with the module's weights bound for all of it
 type Within = Callable[[Any, Callable[[], Any]], Any]
@@ -209,6 +216,18 @@ class Decode:
         self.x: Any = self.inputs[0]
         self.within: Within = _direct
         self.host = False
+        #: host maps' copy streams (rows in, bands out); per host map its last write, the end
+        #: row of its last read and the band read ahead; the reads the device has yet to reach
+        self.reads: Any = None
+        self.writes: Any = None
+        self.written: dict[int, Any] = {}
+        self.last: dict[int, int] = {}
+        self.ahead: dict[int, tuple[int, int, Any, Any]] = {}
+        self.queued: deque[Any] = deque()
+        #: GroupNorm groups (0: none), and the statistics of the maps the last step wrote,
+        #: gathered as it wrote them
+        self.groups = 0
+        self.gathered: dict[int, _Stats] = {}
         #: bytes of the most full maps one step holds, and of a block that runs whole (input,
         #: queries, keys, values); elements of the largest map; rows of a full-resolution band
         self.maps = self.whole = self.biggest = self.rows = 0
@@ -229,18 +248,28 @@ class Decode:
         """The decode's output, as the family's `decode` returns it. New maps go to pinned host
         memory when `host`, and so does the map the step that runs first reads."""
         self.within, self.host = within or _direct, host
+        if host and self.device.type == "cuda":
+            if self.device not in _STREAMS:
+                stream = self.torch.cuda.Stream
+                _STREAMS[self.device] = stream(self.device), stream(self.device)
+            self.reads, self.writes = _STREAMS[self.device]
         if host and self.step > 0 and self.x.dim() == 4 and self.device.type == "cuda":
             x, (channels, height, width) = self.x, _dims(self.x)
             self.x = self._new(channels, height, width)
             self._put(self.x, 0, x)
         while True:
             while self.step < len(self.steps):
+                self.last.clear()
+                self.ahead.clear()
+                kept = self.gathered.get(self.x.data_ptr())
+                self.gathered = {} if kept is None else {self.x.data_ptr(): kept}
                 self.x = self.steps[self.step](self.x)
                 self.step += 1
             self.done.append(self.x)
             if len(self.done) == len(self.inputs):
                 break
             self.step, self.x = 0, self.inputs[len(self.done)]
+        self.steps.clear()  # they hold this decode: without them it is freed at its last use
         sample = self.done[0] if len(self.done) == 1 else self.torch.cat(self.done)
         return self.module.DecoderOutput(sample=sample) if self.return_dict else (sample,)
 
@@ -248,23 +277,54 @@ class Decode:
 
     def _new(self, channels: int, height: int, width: int, final: bool = False) -> Any:
         """A map: on the device, or in pinned host memory rows outermost (a band of rows is
-        one contiguous copy each way)."""
-        if self.host and not final and self.device.type == "cuda":
+        one contiguous copy each way). A step's maps that fit where its attention already
+        needs room stay on the device."""
+        small = 3 * channels * height * width * self.dtype.itemsize <= self.whole
+        if self.host and not final and not small and self.device.type == "cuda":
             return self.torch.empty((height, channels, width), dtype=self.dtype, pin_memory=True)
         return self.torch.empty((1, channels, height, width), dtype=self.dtype, device=self.device)
 
     def _rows(self, x: Any, lo: int, hi: int) -> Any:
-        """Rows [lo, hi) of map `x` on the device (a view of a device map)."""
-        if x.dim() == 3:
+        """Rows [lo, hi) of map `x` on the device: a view of a device map; a host map's come
+        on their own stream, and the rows one band on follow them while this band computes."""
+        if x.dim() == 4:
+            return x[:, :, lo:hi]
+        key, end = x.data_ptr(), int(x.shape[0])
+        ahead = self.ahead.pop(key, None)
+        if ahead is not None and ahead[:2] == (lo, hi):
+            band, ready = ahead[2:]
+        else:
+            if hi <= self.last.get(key, hi) and key in self.written:  # a new pass
+                self.reads.wait_event(self.written[key])
+            band, ready = self._read(x, lo, hi)
+        step, self.last[key] = hi - self.last.get(key, hi), hi
+        if step > 0 and lo + step < end:
+            self.ahead[key] = (lo + step, min(hi + step, end), *self._read(x, lo + step, hi + step))
+        stream = self.torch.cuda.current_stream(self.device)
+        stream.wait_event(ready)
+        band.record_stream(stream)
+        # Bands used on another stream than their own return to the allocator only once the
+        # device passes them: the host queues at most a few reads ahead of the device.
+        self.queued.append(stream.record_event())
+        if len(self.queued) > AHEAD:
+            self.queued.popleft().synchronize()
+        return band
+
+    def _read(self, x: Any, lo: int, hi: int) -> tuple[Any, Any]:
+        with self.torch.cuda.stream(self.reads):
             band = x[lo:hi].to(self.device, non_blocking=True)
-            return band.permute(1, 0, 2).unsqueeze(0).contiguous()
-        return x[:, :, lo:hi]
+            band = band.permute(1, 0, 2).unsqueeze(0).contiguous()
+            return band, self.reads.record_event()
 
     def _put(self, out: Any, a: int, y: Any) -> None:
-        if out.dim() == 3:
-            out[a : a + y.shape[2]].copy_(y[0].permute(1, 0, 2), non_blocking=True)
-        else:
+        if out.dim() == 4:
             out[:, :, a : a + y.shape[2]].copy_(y)
+            return
+        self.writes.wait_stream(self.torch.cuda.current_stream(self.device))
+        y.record_stream(self.writes)
+        with self.torch.cuda.stream(self.writes):
+            out[a : a + y.shape[2]].copy_(y[0].permute(1, 0, 2), non_blocking=True)
+            self.written[out.data_ptr()] = self.writes.record_event()
 
     def _bands(self, height: int, width: int, channels: int) -> Iterator[tuple[int, int]]:
         rows = _rows_of(self.band, height, width, channels)
@@ -300,11 +360,16 @@ class Decode:
         stats: _Stats | None = None,
     ) -> Any:
         """`conv` band by band into map `out` with its weights bound, each band plus its
-        `residual` rows and over `scale` (written in place into a map on the device); `stats`
-        gathers the stored bands' statistics."""
+        `residual` rows and over `scale`; `stats` gathers the stored bands' statistics. No pass
+        reads the map it writes: one that runs again (its block retried out of memory) writes
+        the same."""
         channels, height, width = _dims(out)
+        if stats is None and self.groups and channels % self.groups == 0:
+            stats = _Stats(self.torch, self.groups)
 
         def body() -> None:
+            if stats is not None:
+                stats.bands.clear()
             for a, b in self._bands(height, width, max(channels, _in(conv))):
                 y = self._convolve(conv, source, height, a, b)
                 if residual is not None:
@@ -318,12 +383,18 @@ class Decode:
                     self._put(out, a, y)
 
         self.within(conv, body)
+        if stats is not None:
+            self.gathered[out.data_ptr()] = stats
         return out
 
     def _source(self, x: Any) -> Callable[[int, int], Any]:
         return lambda lo, hi: self._rows(x, lo, hi)
 
     def _stats(self, x: Any, groups: int) -> _Stats:
+        """`x`'s statistics: gathered as the last step wrote it, or read again."""
+        stats = self.gathered.get(x.data_ptr())
+        if stats is not None and stats.groups == groups:
+            return stats
         stats = _Stats(self.torch, groups)
         channels, height, width = _dims(x)
         for a, b in self._bands(height, width, channels):
@@ -370,6 +441,7 @@ class Decode:
     #    `UpDecoderBlock2D`, `ResnetBlock2D`, `Upsample2D`)
 
     def _kl(self, height: int, width: int) -> None:
+        self.groups = self.root.decoder.conv_norm_out.num_groups
         if self.root.post_quant_conv is not None:
             self.steps.append(self.root.post_quant_conv)
         self._decoder(height, width, self._kl_resnet)
@@ -382,14 +454,14 @@ class Decode:
         return module(x)
 
     def _kl_resnet(self, resnet: Any, height: int, width: int) -> None:
-        """`ResnetBlock2D.forward` with no time embedding: a stats pass over the input, conv1
-        gathering its output's statistics, conv2, then the shortcut, all scaled as
+        """`ResnetBlock2D.forward` with no time embedding: the input's statistics, conv1
+        gathering its output's, conv2, then the shortcut, all scaled as
         `(input_tensor + hidden_states) / output_scale_factor`."""
         c_in, c_out = resnet.in_channels, resnet.conv2.out_channels
         self._size((c_in, height, width), (c_out, height, width), (c_out, height, width))
         act, scale, shortcut = resnet.nonlinearity, resnet.output_scale_factor, resnet.conv_shortcut
 
-        def body(x: Any) -> Any:
+        def main(x: Any) -> Any:
             first = self._stats(x, resnet.norm1.num_groups)
             second = _Stats(self.torch, resnet.norm2.num_groups)
             h = self._pass(
@@ -398,7 +470,7 @@ class Decode:
                 self._new(resnet.conv1.out_channels, height, width),
                 stats=second,
             )
-            out = self._pass(
+            return self._pass(
                 resnet.conv2,
                 lambda lo, hi: resnet.dropout(
                     act(second.norm(resnet.norm2, self._rows(h, lo, hi)))
@@ -407,11 +479,8 @@ class Decode:
                 None if shortcut is not None else self._source(x),
                 scale,
             )
-            if shortcut is None:
-                return out
-            return self._pass(shortcut, self._source(x), out, self._source(out), scale)
 
-        self.steps.append(lambda x: self.within(resnet, lambda: body(x)))
+        self._resnet(resnet, main, shortcut, scale)
 
     def _upsampler(self, upsampler: Any, height: int, width: int) -> None:
         """`Upsample2D.forward` (nearest 2x, then its convolution) or, for one frame with no
@@ -459,17 +528,15 @@ class Decode:
         return lambda lo, hi: act(norm(self._rows(x, lo, hi).unsqueeze(2))[:, :, 0])
 
     def _qwen_resnet(self, resnet: Any, height: int, width: int) -> None:
-        """`QwenImageResidualBlock.forward`: the shortcut, conv1, then conv2 plus the
-        shortcut."""
+        """`QwenImageResidualBlock.forward`: conv1, conv2, then the shortcut plus them (its
+        sum, the shortcut last)."""
         c_out = resnet.out_dim
         self._size((resnet.in_dim, height, width), (c_out, height, width), (c_out, height, width))
         shortcut = resnet.conv_shortcut
-        conv = type(shortcut).__name__ != "Identity"
+        if type(shortcut).__name__ == "Identity":
+            shortcut = None
 
-        def body(x: Any) -> Any:
-            out = self._new(c_out, height, width)
-            if conv:
-                self._pass(shortcut, self._source(x), out)
+        def main(x: Any) -> Any:
             h = self._pass(
                 resnet.conv1,
                 self._local(resnet.norm1, resnet.nonlinearity, x),
@@ -479,8 +546,25 @@ class Decode:
             return self._pass(
                 resnet.conv2,
                 lambda lo, hi: resnet.dropout(second(lo, hi)),
-                out,
-                self._source(out if conv else x),
+                self._new(c_out, height, width),
+                None if shortcut is not None else self._source(x),
+            )
+
+        self._resnet(resnet, main, shortcut)
+
+    def _resnet(
+        self, resnet: Any, main: Callable[[Any], Any], shortcut: Any, scale: float = 1.0
+    ) -> None:
+        """A residual block's step: `main` (conv1 then conv2, plus the input when there is no
+        shortcut convolution), then the shortcut convolution plus `main`'s map into a new
+        one, conv1's map released first."""
+
+        def body(x: Any) -> Any:
+            out = main(x)
+            if shortcut is None:
+                return out
+            return self._pass(
+                shortcut, self._source(x), self._new(*_dims(out)), self._source(out), scale
             )
 
         self.steps.append(lambda x: self.within(resnet, lambda: body(x)))

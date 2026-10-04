@@ -125,6 +125,22 @@ def test_a_failed_step_runs_again_from_its_input() -> None:
         assert torch.equal(decode.run(within, host=True).sample, clean)
 
 
+@pytest.mark.parametrize("vae, z", [(kl, (1, 4, 6, 6)), (qwen, (1, 16, 1, 5, 3))])
+def test_a_block_that_runs_twice_writes_the_same(vae: Any, z: tuple[int, ...]) -> None:
+    """The plane runs a block again when it ran out of memory part way: every pass, run twice,
+    leaves the bits of one run (no pass reads the map it writes, and its statistics start
+    over)."""
+    root, latent = vae(), torch.randn(*z)
+
+    def twice(module: Any, body: Any) -> Any:
+        body()
+        return body()
+
+    with torch.inference_mode():
+        clean = image_vae.Decode(root, latent, band=100).run().sample
+        assert torch.equal(image_vae.Decode(root, latent, band=100).run(twice).sample, clean)
+
+
 def test_only_the_reviewed_decode_is_exact() -> None:
     vae = kl()
     assert image_vae.exact(vae) and image_vae.exact(qwen())
