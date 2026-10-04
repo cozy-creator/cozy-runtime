@@ -240,6 +240,9 @@ class Component:
     cursor: Cursor | None = None
     #: the common region's lease for the running stage
     lease: Lease | None = None
+    #: gave its weights back to another component's activations for the rest of the stage:
+    #: none of its regions is leased or planned; its common maps again when it next runs
+    spared: bool = False
     #: region indexes wanted resident for the running stage
     resident: tuple[int, ...] = ()
     #: block region index -> its position in `blocks` (the policy's block number)
@@ -550,7 +553,11 @@ class Weights:
     def window(self) -> int:
         """What the open stages stream in at least: each component's common weights and two
         of its largest regions (one in use, the next arriving), at its current grain."""
-        return sum(c.planned.common + 2 * c.planned.largest for _, _, c in self.opened().values())
+        return sum(
+            c.planned.common + 2 * c.planned.largest
+            for _, _, c in self.opened().values()
+            if not c.spared
+        )
 
     def grow(self, need: int) -> bool:
         """The plane refused a region for its own budget while the device has room: map
@@ -600,6 +607,7 @@ class Weights:
         return sum(
             weight_policy.floor(replace(component.planned, fine=None))
             for _, _, component in self.opened().values()
+            if not component.spared
         )
 
     @contextmanager
@@ -2969,7 +2977,7 @@ class WeightResidency:
         blocks are acquired on demand. A component whose block floor does not fit moves to
         the sub-block grain first."""
         weights = self.weights
-        opened = weights.opened()
+        opened = {key: row for key, row in weights.opened().items() if not row[2].spared}
         components = {key: component for key, (_, _, component) in opened.items()}
         method = weights.open[-1][1]
         arriving: list[Ticket] = []
@@ -3192,6 +3200,8 @@ class WeightResidency:
                 weights.hold_host()
             if weights.growing and component.passes == 2 > passes:
                 self._grow()
+            if component.spared:
+                self._unspare(component)
             versions = _versions(args, kwargs)
             # a library's refusal is answered once: by its op where ops recover one by one
             refused = weights.grouped or region.mutates is not False
@@ -3336,7 +3346,70 @@ class WeightResidency:
         weights.shrink(need, weights.floor())
         if opened:
             self._place(weights.applied, resume)
-        weights.progressed(before, need, op or f"{method}()")
+        try:
+            weights.progressed(before, need, op or f"{method}()")
+        except ResidencyRefusal:
+            if not self._spare(resume):
+                raise
+
+    def _spare(self, running: Mapping[str, int]) -> bool:
+        """Activations first, past the stage's floor. A stage that scopes several components
+        (Anima's `render`: conditioner, text encoder, transformer and VAE) keeps every one's
+        common region leased and bound for the whole stage; while one of them runs out of
+        memory, the others give theirs back: leases released, regions unbound and unmapped.
+        A read of one meanwhile maps it for that op (`Weights.reading`), and its next block
+        maps its common again (`_unspare`). False when nobody else held anything."""
+        weights = self.weights
+        if weights.host_only or not running:  # only a block's own retry spares the others
+            return False
+        idle = [
+            component
+            for key, (_, _, component) in weights.opened().items()
+            if key not in running and not component.spared
+        ]
+        if not idle:
+            return False
+        weights.quiesce()  # nothing queued still reads what leaves
+        before = max(plane.stats(weights.plane).device(weights.index).committed, 0)
+        for component in idle:
+            close_cursor(component)
+            if component.lease is not None:
+                component.lease.release()
+                component.lease = None
+            regions = [region.index for region in component.regions]
+            for region in component.regions:
+                if region.bound is not None:
+                    unbind(region)
+            with suppress(plane.error("LeaseViolation")):
+                weights.plane.drop(component.ws, weights.index, regions)
+            component.resident = ()
+            component.spared = True
+        weights.drain()
+        # Dropped regions stay mapped as the plane's idle cache until its budget leaves them
+        # no room: the plane keeps what the running component streams in, torch the rest.
+        weights._apply(min(weights.applied, max(weights.window(), weights.floor())))
+        self._place(weights.applied, running)
+        after = max(plane.stats(weights.plane).device(weights.index).committed, 0)
+        if after >= before:
+            return False
+        weights.oom_retries += 1
+        weights.last_retry = None
+        return True
+
+    def _unspare(self, component: Component) -> None:
+        """A spared component runs again within its stage: its common region is leased and
+        bound for the rest of the stage, and its blocks join the stage's plan."""
+        weights = self.weights
+        component.spared = False
+        if component.common is not None and component.lease is None:
+            component.lease = self._acquire_common(
+                weights.open[-1][1] if weights.open else "",
+                component,
+                weights.applied,
+                weights.stream(),
+            )
+            bind(weights.torch, component.common, component.lease)
+            component.resident = (component.common.index,)
 
     def _observe(self, component: Component, index: int) -> None:
         """Count passes and learn the blocks' execution order from a stage's first pass."""
@@ -3437,6 +3510,7 @@ class WeightResidency:
             if component.lease is not None:
                 component.lease.release()
                 component.lease = None
+            component.spared = False
             if not weights.host_only:
                 weights.plane.prioritise(component.ws, weights.index, None, priority=idle)
         if failure is not None:
