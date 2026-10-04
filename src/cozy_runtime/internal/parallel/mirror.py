@@ -69,7 +69,12 @@ def mirror_component(
                         attention_sol.record_rank(follower.rank, reply.sol_calls)
                     return result
                 except BaseException as exc:
+                    first = group.broken
                     group._break(_failed(f"mirrored component {name!r}", exc))
+                    if first and not isinstance(exc, (Cancelled, GroupRefusal)):
+                        # A follower failed first and its collectives were aborted: this
+                        # error is the consequence, and the call fails with the cause.
+                        raise GroupRefusal(first) from exc
                     raise
         finally:
             payloads.clear()
