@@ -2784,6 +2784,8 @@ class Executor:
                 return granted
         if self.weights is not None:
             self.weights.seed_activations(command.activation_bytes)
+            if not isinstance(command.device_weights, UnsetType):
+                self._device_weights(command.device_weights)
         with self._turns(target.residency, command.stages and self.world == 1):
             reply = target.invoke(command)
         self.attempts += 1
@@ -4228,9 +4230,21 @@ class Executor:
         if self.weights is None:
             return {"ok": True, "shared_bytes": 0}
         self._unpark()
-        if self.weights.sharing is None and self.world == 1 and plane.sharing():
-            self.weights.sharing = DeviceTiers(ask=self._ask_device, offer=self._offer_device)
+        self._device_weights(True)
         return {"ok": True, "shared_bytes": self.weights.share(), "plane": self._plane_facts()}
+
+    def _device_weights(self, on: bool) -> None:
+        """Degree 2 on or off for this executor, as its owner decides per attempt: on, the
+        machine's GPU weights are attached and each stage's regions are offered at its exit;
+        off, every region is private and streams. Regions already attached stay until the
+        owner revokes them."""
+        weights = self.weights
+        if weights is None:
+            return
+        if not on:
+            weights.sharing = None
+        elif weights.sharing is None and self.world == 1 and plane.sharing():
+            weights.sharing = DeviceTiers(ask=self._ask_device, offer=self._offer_device)
 
     def revoke(self, command: Revoke) -> dict[str, Any]:
         """Let the machine's GPU regions of one layout go: queued work first, then unmap."""

@@ -631,6 +631,24 @@ def test_a_component_converted_with_to_streams_in_that_dtype(card: Any) -> None:
 
 
 @on_card
+def test_an_activation_estimate_larger_than_the_card_never_refuses_the_stage(card: Any) -> None:
+    """F, rtx-3070 with a 3 GiB pool: SDXL's decode seed (3.1 GB, its untiled peak at 1024²)
+    was more than the room under the cap, so the stage's plane budget came out 0 and every
+    SDXL request was refused for size. An estimate gives way to the stage's floor: the
+    weights stream and the stage computes the same bits."""
+    weights = card.weights
+    model = load(weights, card.checkpoint, "seeded")
+    x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
+    weights.set_budget(1 << 30)
+    reference = run(model, x)
+    model.residency.unpark()
+    weights.set_budget(-1)
+    weights.seed_activations({"run": weights.total})
+    assert weights.driver_budget("run") == 0, "no stage open: no floor to keep"
+    assert same(run(model, x), reference)
+
+
+@on_card
 def test_a_bind_that_runs_out_of_device_memory_plans_again_in_what_is_left(card: Any) -> None:
     """Run 2932: on a card without fp8, binding a stage's resident set decodes each weight
     into a float copy, and with the card full that allocation failed inside the plan. The
