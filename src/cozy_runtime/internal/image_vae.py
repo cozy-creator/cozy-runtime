@@ -84,12 +84,20 @@ class _Qwen(Protocol):
 
 
 @dataclass(frozen=True)
+class DecodeEstimate:
+    """Strategy bytes: the full peak and the portion that does not shrink with tiles."""
+
+    peak: int
+    retained: int
+
+
+@dataclass(frozen=True)
 class Geometry:
     """Pixels per latent side, and how the VAE is told to decode in tiles of a pixel side."""
 
     scale: int
     tile: Callable[[int], None]
-    decode_estimate: Callable[[Sequence[int], int], int] | None = None
+    decode_estimate: Callable[[Sequence[int], int], DecodeEstimate | None] | None = None
 
 
 def _family(root: object) -> type | None:
@@ -122,7 +130,7 @@ def geometry(root: object) -> Geometry | None:
         kl.tile_sample_min_size = side
         kl.tile_latent_min_size = side // scale
 
-    def estimate(shape: Sequence[int], item_bytes: int) -> int:
+    def estimate(shape: Sequence[int], item_bytes: int) -> DecodeEstimate | None:
         """A cold strategy estimate, never a measured peak or a fit guarantee.
 
         Follow the actual decoder's spatial expansion. Upsampling and residual/
@@ -132,27 +140,42 @@ def geometry(root: object) -> Geometry | None:
         """
         decoder = getattr(kl, "decoder", None)
         if decoder is None:
-            return 0
-        batch, channels, height, width = (int(n) for n in shape)
-        element = max(
-            item_bytes,
-            max(
-                (p.element_size() for p in decoder.parameters() if p.is_floating_point()), default=0
-            ),
-        )
-        latent = batch * channels * height * width * item_bytes
-        active_batch = 1 if getattr(kl, "use_slicing", False) else batch
-        peak = 0
-        for block in decoder.up_blocks:
-            for resnet in block.resnets:
-                channels = int(resnet.out_channels)
-                peak = max(peak, 3 * active_batch * channels * height * width * element)
-            for upsample in block.upsamplers or ():
-                height, width = height * 2, width * 2
-                channels = int(upsample.channels)
-                peak = max(peak, 3 * active_batch * channels * height * width * element)
-        output = batch * int(kl.config.out_channels) * height * width * element
-        return latent + peak + 2 * output
+            return None
+        try:
+            batch, channels, height, width = (int(n) for n in shape)
+            if min(batch, channels, height, width, item_bytes) <= 0:
+                return None
+            element = max(
+                item_bytes,
+                max(
+                    (p.element_size() for p in decoder.parameters() if p.is_floating_point()),
+                    default=0,
+                ),
+            )
+            latent = batch * channels * height * width * item_bytes
+            active_batch = 1 if getattr(kl, "use_slicing", False) else batch
+            peak = 0
+            for block in decoder.up_blocks:
+                for resnet in block.resnets:
+                    channels = int(resnet.out_channels)
+                    if channels <= 0:
+                        return None
+                    peak = max(peak, 3 * active_batch * channels * height * width * element)
+                for upsample in block.upsamplers or ():
+                    height, width = height * 2, width * 2
+                    channels = int(upsample.channels)
+                    if channels <= 0:
+                        return None
+                    peak = max(peak, 3 * active_batch * channels * height * width * element)
+            output = batch * int(kl.config.out_channels) * height * width * element
+            if peak <= 0 or output <= 0:
+                return None
+            retained = latent + 2 * output
+            return DecodeEstimate(peak + retained, retained)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            # Family recognition also admits subclasses with a different decoder.
+            # Unsupported metadata retains its existing path, without a fit claim.
+            return None
 
     return Geometry(scale, tile, estimate)
 

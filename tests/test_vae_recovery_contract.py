@@ -178,15 +178,18 @@ def test_cold_estimate_follows_real_upsample_channels_dtype_and_batch_slicing():
     geometry = image_vae.geometry(vae)
     assert geometry is not None and geometry.decode_estimate is not None
     single = geometry.decode_estimate((1, 4, 128, 128), 2)
+    assert single is not None
     # The last upsampler still has256 channels at1024 square, larger than final128.
-    assert single == (3 * 256 * 1024 * 1024 + 2 * 3 * 1024 * 1024 + 4 * 128 * 128) * 2
+    assert single.peak == (3 * 256 * 1024 * 1024 + 2 * 3 * 1024 * 1024 + 4 * 128 * 128) * 2
+    assert single.retained == (2 * 3 * 1024 * 1024 + 4 * 128 * 128) * 2
     doubled = geometry.decode_estimate((2, 4, 128, 128), 2)
-    assert doubled == single * 2
+    assert doubled is not None and doubled.peak == single.peak * 2
     vae.enable_slicing()
     sliced = geometry.decode_estimate((2, 4, 128, 128), 2)
-    assert single < sliced < doubled
+    assert sliced is not None and single.peak < sliced.peak < doubled.peak
     vae.to(dtype=torch.float32)
-    assert geometry.decode_estimate((1, 4, 128, 128), 2) > single * 1.99
+    upcast = geometry.decode_estimate((1, 4, 128, 128), 2)
+    assert upcast is not None and upcast.peak > single.peak * 1.99
 
 
 @pytest.mark.parametrize("owner_seed", [0, 1008372224, 400 << 20])
@@ -219,3 +222,28 @@ def test_cold_native_decode_keeps_large_room_untiled_fast_path(monkeypatch):
     z = torch.zeros(1, 4, 128, 128, dtype=torch.bfloat16)
     assert row._decode("vae", decode)(z) is z
     assert seen == [False] and owner.modes["vae.decode"] == "untiled"
+
+
+def test_unsupported_custom_decoder_keeps_its_existing_one_call_path(monkeypatch):
+    vae = StatefulVAE(None)
+    vae.decoder = torch.nn.Identity()
+    geometry = image_vae.geometry(vae)
+    assert geometry is not None and geometry.decode_estimate is not None
+    assert geometry.decode_estimate((1, 4, 16, 16), 4) is None
+    row, owner = residency(monkeypatch, vae)
+    z = torch.zeros(1, 4, 16, 16)
+    assert row._decode("vae", vae.decode)(z) is z
+    assert vae.calls == 1 and not owner.poisoned
+
+
+def test_tile_budget_leaves_full_image_latent_and_output_retention(monkeypatch):
+    vae = native_sdxl_geometry()
+    row, _owner = residency(monkeypatch, vae, free=391 << 20)
+    seen = []
+
+    def decode(z):
+        seen.append(vae.tile_sample_min_size)
+        return z
+
+    row._decode("vae", decode)(torch.zeros(1, 4, 128, 128, dtype=torch.bfloat16))
+    assert seen == [448]

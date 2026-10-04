@@ -3471,12 +3471,14 @@ class WeightResidency:
             known = size or max(peaks, default=0)
             per_pixel = peaks[known] // known if known else 0
             peak = per_pixel * pixels
+            retained = 0
             if not size:
                 geometry = (
-                    vae.decode_estimate(z.shape, z.element_size()) if vae.decode_estimate else 0
+                    vae.decode_estimate(z.shape, z.element_size()) if vae.decode_estimate else None
                 )
-                peak = max(peak, geometry, seeded)
-                per_pixel = (peak + max(pixels, 1) - 1) // max(pixels, 1)
+                retained = geometry.retained if geometry else 0
+                peak = max(peak, geometry.peak if geometry else 0, seeded)
+                per_pixel = (max(peak - retained, 0) + max(pixels, 1) - 1) // max(pixels, 1)
             mode = weight_policy.decode_mode(free, evictable, peak) if peak else "untiled"
             # Activations first: idle weights leave before a decode needs their room (all of
             # them unless a measured untiled peak says less), since a decode run short of
@@ -3485,7 +3487,11 @@ class WeightResidency:
             free = self._room_for_decode(name, free, evictable, min(need, free + evictable))
             # a tile under half the image, so tiling always lowers the peak
             largest = _tile(min(height, width) // 2)
-            side = min(_side(free // max(per_pixel, 1)), sides.get(pixels, largest), largest)
+            side = min(
+                _side(max(free - retained, 0) // max(per_pixel, 1)),
+                sides.get(pixels, largest),
+                largest,
+            )
             baseline = accel.allocated(weights.torch, weights.kind)
             accel.reset_peak(weights.torch, weights.kind)
             if mode == "tiled":
