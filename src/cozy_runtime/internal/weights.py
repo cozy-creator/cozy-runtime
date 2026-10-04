@@ -2220,6 +2220,7 @@ class WeightResidency:
         method = weights.open[-1][1]
         weights.quiesce()  # a plan unmaps: other components' sets, this one's stale regions
         pooled = False
+        asked = False
         while True:
             oom: tuple[int, str] | None = None
             try:
@@ -2236,7 +2237,7 @@ class WeightResidency:
                 oom = (_requested(exc), str(exc).splitlines()[0][:300])
             # outside `except`, so the failed plan's frames (and their tensors) are gone
             if oom is not None:
-                budget = self._after_bind(budget, method, *oom)
+                budget, asked = self._after_bind(budget, method, *oom, asked=asked)
                 continue
             accel.release_cached(weights.torch, weights.kind)
             window = sum(
@@ -2244,15 +2245,22 @@ class WeightResidency:
             )
             budget = min(budget, max(weights.driver_budget(method), window))
 
-    def _after_bind(self, budget: int, method: str, need: int, failed: str) -> int:
+    def _after_bind(
+        self, budget: int, method: str, need: int, failed: str, asked: bool = False
+    ) -> tuple[int, bool]:
         """The budget to plan again in after binding ran out of device memory: what the open
-        stages' weights and their decoded copies can have now (mapped, decoded and free), or
-        the failure by its own name when that is no less than before."""
+        stages' weights and their decoded copies can have now (mapped, decoded and free). At
+        the stage's floor the owner is asked for room once (its idle tenants leave); the
+        failure is reported by its own name only when that gave nothing either."""
         weights = self.weights
         accel.release_cached(weights.torch, weights.kind)
         mapped = max(plane.stats(weights.plane).device(weights.index).committed, 0)
         room = mapped + weights.decoded() + weights.allocatable() - need - weight_policy.MARGIN
         lowered = max(min(room, budget - weight_policy.MARGIN), weights.floor())
+        if lowered >= budget and not asked and weights.room is not None and weights.cap >= 0:
+            weights.oom_retries += 1
+            weights.room(need + weight_policy.MARGIN)
+            return budget, True
         if lowered >= budget:
             raise self._shortfall(
                 method,
@@ -2261,7 +2269,7 @@ class WeightResidency:
                 f"binding its weights ran out of device memory at the stage's floor: {failed}",
             )
         weights.oom_retries += 1
-        return lowered
+        return lowered, asked
 
     def _left(self) -> None:
         if self.active is not None:
