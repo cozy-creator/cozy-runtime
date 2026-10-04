@@ -200,6 +200,7 @@ from cozy_runtime.internal.seam import (
 )
 from cozy_runtime.internal.stages import STAGE_TURNS
 from cozy_runtime.internal.weights import (
+    INDIVISIBLE,
     DeviceTiers,
     HostTiers,
     PlaneBackend,
@@ -215,7 +216,7 @@ from cozy_runtime.internal.weights import (
 INLINE_RESULT_MAX = 4 * 1024 * 1024
 
 #: Outcomes that are capacity, not broken state: they fail the attempt and keep the executor.
-CAPACITY_CODES = frozenset({"device_out_of_memory", "device_shortfall", "device_spared"})
+CAPACITY_CODES = frozenset({"device_out_of_memory", INDIVISIBLE, "device_spared"})
 
 #: How many PREPARED requests this epoch holds at once. A serving lane admits and
 #: runs one attempt at a time, so anything past the newest few is a request the
@@ -2790,6 +2791,9 @@ class Executor:
             if not granted.get("ok"):
                 return granted
         if self.weights is not None:
+            # A new request plans its stages afresh: a repeating stage the last one left open
+            # (its cursor at that request's end) never carries over. Its weights stay mapped.
+            self._unpark()
             self.weights.seed_activations(command.activation_bytes)
             if not isinstance(command.device_weights, UnsetType):
                 self._device_weights(command.device_weights)
