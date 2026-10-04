@@ -484,7 +484,7 @@ class Executor:
         self.root = root
         self.host: Executor = host or self
         #: this process's CUDA context and first library launches, measured at device init
-        #: from the device's own used bytes (-1: unmeasured); per-process NVML refines it
+        #: from this process's own driver row (-1: not attributable)
         self.device_context = -1
         #: the construction key this generation was loaded under; "" on the host
         self.construction = construction
@@ -732,20 +732,18 @@ class Executor:
         entries = _sealed_entries()
         index = self.rank if self.world > 1 else 0
         entry = entries[index] if index < len(entries) else str(index)
-        before = accel.device_used(entry)
         accel.initialize(torch, self.device_kind)
         if self.world > 1 and self.device_kind == "cuda":
             torch.cuda.set_device(self.rank)
         accel.first_launches(torch, self.device_kind)
         accel.reset_peak(torch, self.device_kind)
-        after = accel.device_used(entry) if before >= 0 else -1
-        if after >= 0:
-            # This process's context and libraries as the device saw them appear: its own
-            # measurement where the driver lists no process (containers). Both readings are
-            # NVML's (CUDA's total leaves out what the driver reserves). Another process moving
-            # memory in these milliseconds is noise in either direction.
+        pid = os.getpid()
+        row = accel.process_memories_by_device({pid}, self.device_kind, (entry,))[entry][pid]
+        if row.state == "present":
+            # Foreign allocations cannot enter a context measurement. If a PID namespace or
+            # driver hides our row, leave it unknown rather than adopting a device-wide delta.
             reserved = accel.allocation(torch, self.device_kind)["reserved_bytes"]
-            self.host.device_context = max(after - before - reserved, 0)
+            self.host.device_context = max(row.bytes - reserved, 0)
         self._device_ready = True
         return None
 

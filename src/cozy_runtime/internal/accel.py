@@ -79,15 +79,6 @@ def _smi(*query: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def process_memory(pid: int, kind: str) -> ProcessMemory:
-    """Read per-process device memory from outside the executor.
-
-    A successful query with no row is measured absence. A failed query is unreadable and
-    never masquerades as zero. MPS has no per-process driver query yet.
-    """
-    return process_memories({pid}, kind)[pid]
-
-
 def process_memories(pids: set[int], kind: str) -> dict[int, ProcessMemory]:
     """One coherent driver-table read for all requested process IDs.
 
@@ -309,15 +300,6 @@ def _nvml_device_memory(device: str) -> DeviceMemory | None:
     if library.nvmlDeviceGetMemoryInfo(handle, ctypes.byref(memory)) != _NVML_SUCCESS:
         return DeviceMemory("unreadable")
     return _device_memory_of(int(memory.free), int(memory.total))
-
-
-def device_used(device: str) -> int:
-    """Bytes in use on one envelope entry by every process, from NVML, torch-free; -1 where NVML
-    cannot say."""
-    memory = _nvml_device_memory(device)
-    if memory is None or memory.state != "measured":
-        return -1
-    return memory.total_bytes - memory.free_bytes
 
 
 def device_capability(device: str) -> int:
