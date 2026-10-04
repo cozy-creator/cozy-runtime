@@ -6,8 +6,10 @@ phases 2–3 only on ilulu. No model decode, SDK mutation or global allocator sw
 is authorized here.
 
 Build activation-paging.cc with g++ against the actual generated environment's
-cu13 headers and versioned libcudart. nvcc is unnecessary. Keep source, binary
-hashes and build receipt in the owned operation directory.
+cu13 headers and versioned libcudart. The runtime wheel's CRT headers are
+incomplete; supply official matching nvidia-cuda-crt 13.0.88 in an isolated owned
+build-header directory. nvcc is unnecessary. Keep source, binary hashes and all
+build receipts in the owned operation directory.
 
 Run activation-paging.py with that generated environment's existing interpreter.
 It requires unchanged holder PID113/birth33024000/6,439,436,288 bytes and separately

@@ -2,8 +2,8 @@
 
 Tracker #320; parent #319/#324. Owner gpu_qualification, branch
 `codex/activation-paging-mechanism-20261004`, fetched base b2a93731 advanced to the
-reviewed 2aaac54e candidate. This is a staged design, with no product change or
-allocator/GPU prototype executed.
+reviewed 2aaac54e candidate. This records a staged design and the authorized
+allocator diagnostic. No product implementation or full decode has run.
 
 The objective is one full native SDXL VAE decode of the immutable 131072-byte
 FP16 latent SHA 87cad3ed70cfae838271022697730e7d3c627d75ef6979b4d8e8c2e4aab72899,
@@ -100,8 +100,8 @@ environment switch, ABI/vtable trick or preallocated-cache workaround may pass i
    the decoder or changes its geometry. Archive all failures and scope/pool release
    receipts before any next reviewed attempt.
 
-Current stock MemPool source predicts phase 3 will refuse virtual oversubscription
-at the SDK fraction. This is not a hardware-limit claim. Phase 4 is consequently
+Stock MemPool source predicted, and the authorized diagnostic confirmed, virtual
+cap refusal before its callback. This is not a hardware-limit claim. Phase 4 is consequently
 not authorized by this design alone. If virtual charge is the only gate, present
 an explicit scoped accounting change for review: an activation resource needs
 separate bounded host/virtual accounting and physical residency authority, while
@@ -116,3 +116,35 @@ statistics and full attention K/V, and use bounded convolution halos/output chun
 only with proved equivalent math. Cropping global context or using stock tiled_decode
 does not close the fidelity gate. No implementation starts before a reviewed
 mechanism can execute the immutable full latent and retain numerical quality.
+
+## Authorized allocator diagnostic result
+
+Clean probe source 180d9b57 built with g++ against the installed CUDA runtime
+13.0.96 and isolated official nvidia-cuda-crt 13.0.88 headers. The initial missing
+CRT-header build failure and subsequent header-path failure remain archived.
+No generated executor dependencies or SDK files changed. The bridge binary SHA is
+fe0c9b5e2e764888c84cd8176788a3c0206e85727d9bac63c36d6a462f7fd274.
+
+On ilulu, one 1 MiB uint8 tensor used a scoped managed pool. Its actual pointer
+type was cudaMemoryTypeManaged; one fill and CPU copy verified its contents.
+The bridge obtained one 2 MiB segment. A declared 514 MiB allocation under this
+new diagnostic process's 512 MiB Torch cap raised OOM with 606.81 MiB CUDA free.
+Custom allocation callbacks remained 1 before and after the request, with zero
+bridge budget denials. This is actual pre-callback virtual-limit evidence, not
+managed oversubscription or full-decode qualification.
+
+After tensor/pool release, Torch reserved bytes and bridge live bytes were zero;
+one cudaFree succeeded, with no invalid free or stream-sync failure. Probe PID
+2564 exited naturally. Holder PID 113/birth 33024000 and original idle executor
+PID 2059/birth 33529715 were preserved. Shared container current samples rose by
+340,963,328 bytes; probe RSS high-water was 646,107,136 bytes. Cgroup max/OOM
+events did not change, and historical peak already equaled the limit before entry.
+
+Physical cleanup is not fully classified: NVML free remained 794 MiB after exit
+versus 920 MiB before, while both original compute-app charges were unchanged.
+FB reserved remained 352 MiB. Device FD inventory also includes owned
+cozy-machine PID 1268/birth 33267283, absent from compute-apps. Attribute the
+126 MiB FB-used delta between machine/contextless allocations and driver/UVM
+state before claiming full physical restoration. No reclaim, reset or process
+kill was performed. Evidence: activation-probe-1/result, RESOURCE-SUMMARY.json,
+physical-after-process.json, post-stability.json and post-device-clients.json.
