@@ -1,7 +1,0 @@
-repository=https://github.com/cozy-creator/worker-protocol
-commit=d0867e3c57f9cc63ef3b7ec3c1e4859f0b2ecdd8
-wire_minor=72
-weights_limits.go=sha256:b4a8e225c8594df199e17393b45c55391e4c5575ccd9803b08f092552893599b
-wire_version.go=sha256:cf90b0a7463376abc7cc30eb68309a06971fc533a88a8da1eba7b8d01c1aeec9
-worker.pb.go=sha256:9e482cf304983daa99515ea30548eea4e472a6a752ee7cb8c0100fa9b8f1f2c8
-worker_grpc.pb.go=sha256:e3b4219fe029910f396f844c5d93c1fca426c16620c68d9a37f9dc8d66af798d
