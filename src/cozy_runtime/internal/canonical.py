@@ -60,8 +60,17 @@ class CanonicalError(Exception):
 
 def write(value: Json) -> bytes:
     """The canonical bytes of `value`. These are what gets stored and what gets hashed."""
+    return _write(value, application=False)
+
+
+def write_application(value: Json) -> bytes:
+    """Typed application values retain exact integers and integer/float kind."""
+    return _write(value, application=True)
+
+
+def _write(value: Json, *, application: bool) -> bytes:
     out: list[str] = []
-    _emit(value, out, 0)
+    _emit(value, out, 0, application=application)
     data = "".join(out).encode("utf-8")
     if len(data) > DOC_MAX_BYTES:
         raise CanonicalError("size_cap", f"{len(data)} bytes exceeds cap {DOC_MAX_BYTES}")
@@ -73,7 +82,7 @@ def digest(value: Json) -> str:
     return "sha256:" + hashlib.sha256(write(value)).hexdigest()
 
 
-def _emit(value: Json, out: list[str], depth: int) -> None:
+def _emit(value: Json, out: list[str], depth: int, *, application: bool) -> None:
     if depth > DEPTH_MAX:
         raise CanonicalError("depth_cap", f"nesting deeper than {DEPTH_MAX}")
     if value is None:
@@ -83,11 +92,11 @@ def _emit(value: Json, out: list[str], depth: int) -> None:
     elif value is False:
         out.append("false")
     elif isinstance(value, int):
-        if not INT_MIN <= value <= INT_MAX:
+        if not application and not INT_MIN <= value <= INT_MAX:
             raise CanonicalError("number_range", f"{value} is outside the interoperable range")
         out.append(str(value))
     elif isinstance(value, float):
-        out.append(_number(value))
+        out.append(_number(value, application=application))
     elif isinstance(value, str):
         out.append(_string(value))
     elif isinstance(value, Mapping):
@@ -97,14 +106,14 @@ def _emit(value: Json, out: list[str], depth: int) -> None:
                 out.append(",")
             out.append(_string(key))
             out.append(":")
-            _emit(item, out, depth + 1)
+            _emit(item, out, depth + 1, application=application)
         out.append("}")
     elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
         out.append("[")
         for index, item in enumerate(value):
             if index:
                 out.append(",")
-            _emit(item, out, depth + 1)
+            _emit(item, out, depth + 1, application=application)
         out.append("]")
     else:
         raise CanonicalError("wrong_type", f"{type(value).__name__} is not a JSON type")
@@ -164,7 +173,7 @@ def _string(value: str) -> str:
     return "".join(out)
 
 
-def _number(value: float) -> str:
+def _number(value: float, *, application: bool = False) -> str:
     """ECMAScript `Number::toString` (ES6 7.1.12.1), which is RFC 8785's number rule.
 
     The whole algorithm runs on the SHORTEST round-tripping digit string — `repr` gives it,
@@ -178,12 +187,14 @@ def _number(value: float) -> str:
     """
     if math.isnan(value) or math.isinf(value):
         raise CanonicalError("number_range", f"{value!r} has no JSON spelling")
-    if abs(value) > INT_MAX:
+    if not application and abs(value) > INT_MAX:
         raise CanonicalError(
             "number_range",
             f"{value!r} is outside the interoperable numeric range +/-{INT_MAX}",
         )
     if value == 0:
+        if application:
+            return "-0.0" if math.copysign(1, value) < 0 else "0.0"
         return "0"
     sign, raw, exponent = Decimal(repr(value)).as_tuple()
     digits = "".join(str(d) for d in raw).rstrip("0") or "0"
@@ -199,6 +210,8 @@ def _number(value: float) -> str:
     else:
         mantissa = digits[0] if k == 1 else digits[0] + "." + digits[1:]
         body = f"{mantissa}e{'+' if n > 0 else '-'}{abs(n - 1)}"
+    if application and "." not in body and "e" not in body:
+        body += ".0"
     return ("-" if sign else "") + body
 
 
@@ -207,6 +220,17 @@ def _number(value: float) -> str:
 
 def parse(data: bytes) -> Json:
     """Parse with the profile's refusals: size cap, duplicate keys, no NaN/Infinity."""
+    return _parse(data, application=False)
+
+
+def parse_application(data: bytes) -> Json:
+    """Parse typed application JSON without the protocol's numeric magnitude cap."""
+    value = _parse(data, application=True)
+    write_application(value)  # structural depth and Unicode rendering bounds
+    return value
+
+
+def _parse(data: bytes, *, application: bool) -> Json:
     if len(data) > DOC_MAX_BYTES:
         raise CanonicalError("size_cap", f"{len(data)} bytes exceeds cap {DOC_MAX_BYTES}")
     try:
@@ -214,8 +238,8 @@ def parse(data: bytes) -> Json:
             data.decode("utf-8"),
             object_pairs_hook=_pairs,
             parse_constant=_no_constants,
-            parse_int=_parse_int,
-            parse_float=_parse_float,
+            parse_int=int if application else _parse_int,
+            parse_float=_parse_application_float if application else _parse_float,
         )
     except UnicodeDecodeError as exc:
         raise CanonicalError("malformed_json", f"not UTF-8: {exc}") from exc
@@ -257,4 +281,11 @@ def _parse_float(token: str) -> float:
     value = float(token)
     if not math.isfinite(value) or abs(value) > INT_MAX:
         raise CanonicalError("number_range", f"{token} is outside the interoperable numeric range")
+    return value
+
+
+def _parse_application_float(token: str) -> float:
+    value = float(token)
+    if not math.isfinite(value):
+        raise CanonicalError("number_range", f"{token} has no finite IEEE-754 spelling")
     return value
