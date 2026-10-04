@@ -317,6 +317,8 @@ class Weights:
         #: asks the Worker for `bytes` free on this GPU from its other tenants (`DeviceRoom`);
         #: None in a process without a Worker
         self.room: Callable[[int], None] | None = None
+        #: the last out-of-memory retry granted without memory coming back: (op, allocatable)
+        self.last_retry: tuple[str, int] | None = None
         #: the CUDA context and library workspaces outside torch and the plane, measured once
         self.context_bytes = -1
         #: the machine's custody of GPU weights (`weights.attach/1`); None: every region private
@@ -607,14 +609,23 @@ class Weights:
         return self.headroom(memory) + max(memory["reserved_bytes"] - memory["allocated_bytes"], 0)
 
     def progressed(self, before: int, need: int, op: str = "") -> None:
-        """An out-of-memory retry runs again only when memory came back: first this process's
-        own unmapping, else the Worker's (its other tenants on this GPU give theirs). The same
-        failure retried at the same free bytes would churn maps on a full card."""
+        """An out-of-memory retry runs again only when it can succeed: memory came back (this
+        process's own unmapping, else the owner's: its other tenants on this GPU give theirs),
+        or a fresh segment of `need` fits now. torch's idle cache and its limit follow first:
+        both lag what the plane and the owner just did. The same failure retried at the same
+        bytes would churn maps on a full card, so a repeat ends it."""
+        accel.release_cached(self.torch, self.kind)
+        self.limit_torch()
         after = self.allocatable()
-        if after <= before and self.room is not None:
+        retry = (op, after)
+        fresh = self.headroom(accel.allocation(self.torch, self.kind))
+        if after <= before and fresh < need + weight_policy.MARGIN and self.room is not None:
             self.room(need + weight_policy.MARGIN)
             after = self.allocatable()
-        if after <= before:
+            fresh = self.headroom(accel.allocation(self.torch, self.kind))
+            retry = (op, after)
+        repeat, self.last_retry = retry == self.last_retry, retry
+        if after <= before and (fresh < need + weight_policy.MARGIN or repeat):
             raise ResidencyRefusal(
                 INDIVISIBLE,
                 f"{op or 'an allocation'} of {need} B: nothing on this GPU could give device "
