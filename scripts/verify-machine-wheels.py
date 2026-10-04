@@ -110,6 +110,7 @@ def main() -> None:
             "--python",
             python,
             "--no-deps",
+            "--no-cache",
             "--no-index",
             "--find-links",
             str(dist),
