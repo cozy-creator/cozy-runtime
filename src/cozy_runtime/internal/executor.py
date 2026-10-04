@@ -420,6 +420,11 @@ class _CompositeResidency:
 #: Model classes that still define `warm` (packages built for an older Runtime), noted once each.
 _WARM_NOTED: set[type] = set()
 
+#: The requests rank 0 relays to the machine for a follower (`_relay`).
+_RELAYED = frozenset(
+    {"sealed_tier", "sealed_prefetch", "sealed_stage", "object_files", "model_source"}
+)
+
 #: The runtime modules a construction imports, named ONCE so `start` can warm
 #: exactly the set `_prepare_first` re-imports (cr-104). Warming a name this tuple omits
 #: is a missed saving and never a wrong answer: the prepare imports what it needs either
@@ -1270,6 +1275,7 @@ class Executor:
                         python=sys.executable,
                         root=str(self.root),
                         forward=self.channel.send,
+                        relay=self._relay,
                         devices=_sealed_entries(),
                     )
                 if not self.group.followers:
@@ -1979,8 +1985,8 @@ class Executor:
 
         def sourced(manifest: str) -> Callable[[str], bytes] | None:
             """Header and assets from the machine (`Load.model_sources`), never the store; a
-            group's followers still read the store (rank 0 relaying them is not built)."""
-            if not command.model_sources or self.rank > 0:
+            follower asks through rank 0 (`_relay`)."""
+            if not command.model_sources:
                 return None
             return lambda name: host._model_source(manifest, name)
 
@@ -2509,6 +2515,7 @@ class Executor:
                     host_tier=command.host_tier,
                     pinned_bytes=command.pinned_bytes,
                     sealed_tiers=command.sealed_tiers,
+                    model_sources=command.model_sources,
                     cap_bytes=command.cap_bytes,
                     rank_caps=command.rank_caps,
                 ),
@@ -3827,18 +3834,20 @@ class Executor:
         return self._durable(request, Published)
 
     def _tiers(self, worker: bool, sealed: bool = False) -> HostTiers | None:
-        """Where this rank's pinned tiers come from: a follower adopts its leader's (one copy
-        for K ranks); rank 0 asks the machine for its sealed layouts, or asks and offers the
-        worker's tiers when it keeps them, and shares every tier with its followers."""
+        """Where this rank's pinned tiers come from. Sealed: every rank asks the machine for
+        its layouts (a follower through rank 0, `_relay`), and the machine hands K ranks one
+        copy. Otherwise a follower adopts its leader's, and rank 0 asks and offers the
+        worker's tiers when it keeps them and shares every tier with its followers."""
         host = self.host
-        if self.rank > 0:
+        if self.rank > 0 and not sealed:
             return HostTiers(ask=self._leader_tier, offer=lambda *_: None)
+        worker = worker and self.rank == 0
         if not worker and not sealed and self.group is None:
             return None
         return HostTiers(
             ask=host._ask_tier if worker else lambda *_: None,
             offer=host._offer_tier if worker else lambda *_: None,
-            share=self._share_tier,
+            share=(lambda *_: None) if sealed else self._share_tier,
             seal=host._seal_tier if sealed else None,
             prefetch=host._prefetch_tiers if sealed else None,
         )
@@ -4084,6 +4093,42 @@ class Executor:
             return tolerant.read(frame, into, ("progress", "observation"))[0]
         except msgspec.ValidationError as exc:
             raise SeamError("seam_answer_malformed", f"{exchange}: {exc}") from exc
+
+    def _relay(self, follower: Channel, frame: dict[str, Any]) -> None:
+        """A follower's own request to the machine, sent on rank 0's seam and answered on the
+        follower's with every descriptor passed through: its sealed layouts and model files,
+        asked exactly as rank 0 asks them. The follower is inside one command and reads
+        nothing else until this answer."""
+        seq, kind = frame.get("seq"), frame.get("kind")
+        sends = frame.get("descriptor") is True
+        if kind not in _RELAYED:
+            if sends:
+                os.close(follower._recv_fd())
+            detail = f"{_gpu(0)} relays no {kind!r} request"
+            follower.send(
+                {"event": "answer", "seq": seq, "ok": False, "code": "request_unsupported"}
+                | {"detail": detail}
+            )
+            return
+        with self._durable_lock:
+            self._exchange += 1
+            self.channel.send({**frame, "seq": self._exchange})
+            if sends:
+                follower.pass_fd(self.channel)
+            answer = self.channel.recv()
+            if answer is None:
+                raise SeamError("seam_closed", f"the machine closed during a relayed {kind}")
+            count = answer.get("descriptors", 0)
+            if (
+                answer.get("event") != "answer"
+                or answer.get("seq") != self._exchange
+                or type(count) is not int
+                or count < 0
+            ):
+                raise SeamError("seam_out_of_order", f"no answer to a relayed {kind}")
+            follower.send({**answer, "seq": seq})
+            for _ in range(count + (answer.get("descriptor") is True)):
+                self.channel.pass_fd(follower)
 
     def _activity_sink(self, request_id: str) -> Callable[[int, bool, bool, bool], None]:
         def activity(sequence: int, active: bool, known: bool, finished: bool) -> None:

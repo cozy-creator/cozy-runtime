@@ -61,7 +61,8 @@ class ChildProcess(Protocol):
 
 class Frame(msgspec.Struct, frozen=True):
     """What rank 0 reads of every follower frame to route it: a progress event is
-    forwarded, anything else is the reply to the command in flight."""
+    forwarded, a request is relayed to the machine, anything else is the reply to the
+    command in flight."""
 
     event: str = ""
     name: str = ""
@@ -140,6 +141,8 @@ class Follower:
     gone: str = ""
     #: its `hello`'s memory capabilities: rank 0 sends it only the commands it answers
     memory: tuple[str, ...] = ()
+    #: a request of its own is with the machine: that wait is not its stillness
+    relaying: bool = False
 
     @property
     def pid(self) -> int:
@@ -248,6 +251,7 @@ class RankGroup:
         root: str = "",
         sample_seconds: float = liveness.SAMPLE_SECONDS,
         forward: Callable[[dict[str, object]], None] | None = None,
+        relay: Callable[[Channel, dict[str, Any]], None] | None = None,
         launch: Callable[[list[str], int], ChildProcess] | None = None,
         devices: Iterable[str] = (),
     ) -> None:
@@ -263,6 +267,8 @@ class RankGroup:
         #: where a follower's progress frame goes: rank 0's own seam, so the worker keeps
         #: reading movement while rank 0 waits on its followers
         self.forward = forward
+        #: answers a follower's own request to the machine on its channel (rank 0's `_relay`)
+        self.relay = relay
         #: how a follower's program is started: the trampoline's `inherit` backend under
         #: rank 0's own environment, or the suite's launcher for the gloo arms
         self._launch = launch or self._spawn_follower
@@ -346,6 +352,16 @@ class RankGroup:
                 if self.forward is not None:
                     with contextlib.suppress(SeamError):
                         self.forward({**frame, "name": f"{follower.gpu}:{head.name}"})
+                continue
+            if head.event == "request" and self.relay is not None:
+                follower.relaying = True
+                try:
+                    self.relay(follower.channel, frame)
+                except SeamError as exc:
+                    follower.gone = f"{follower.gpu}'s request was not relayed: {exc}"
+                    break
+                finally:
+                    follower.relaying = False
                 continue
             if isinstance(frame.get("plane"), dict):
                 self.rank_planes[follower.rank] = frame["plane"]
@@ -531,6 +547,8 @@ class RankGroup:
             try:
                 frame = follower.replies.get(timeout=self.sample_seconds)
             except queue.Empty:
+                if follower.relaying:
+                    continue
                 pace.observe(liveness.burn(follower.pid))
                 if pace.wedged(floor):
                     self._break(f"{follower.gpu} wedged during {name!r}: {pace.verdict(floor)}")
