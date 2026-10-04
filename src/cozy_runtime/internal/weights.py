@@ -2070,9 +2070,10 @@ class PlaneBackend:
                         if (
                             row.name == "model.language_model.embed_tokens.weight"
                             and self._route(group[0]) == "verbatim"
-                            and row.dtype == "bf16"
-                            and type(module) is self.torch.nn.Embedding
-                            and module.max_norm is None
+                        and row.dtype == "bf16"
+                        and type(module) is self.torch.nn.Embedding
+                        and "forward" not in module.__dict__
+                        and module.max_norm is None
                         ):
                             indexed[group[0]] = SelectedRows(
                                 cast("tuple[int, int]", tuple(row.shape)),
