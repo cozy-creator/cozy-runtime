@@ -50,10 +50,9 @@ jobs:
         with:
           # A tag-scoped cache is never restored by another tag.
           save-cache: false
-      - uses: actions/setup-go@v6
+      - uses: arduino/setup-task@v2
         with:
-          go-version-file: source/machine-agent/go.mod
-          cache-dependency-path: source/machine-agent/go.sum
+          repo-token: ${{ github.token }}
       - run: uv python install 3.12
       - id: release
         name: Verify immutable unpublished release identity
@@ -101,12 +100,6 @@ jobs:
           elif [ "$status" -ne 0 ]; then
             exit "$status"
           fi
-      # Build the Go binaries before stamping Python provenance dirties the checkout.
-      - name: Build the standalone Linux machine agents
-        working-directory: source
-        run: |
-          version=$(uv run --no-project --python 3.12 python -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')
-          machine-agent/scripts/build-release.sh --version "$version" --output "$RUNNER_TEMP/machine-agent"
       # The pure wheel remains the portable macOS/Windows/source-build artifact.
       - name: Build (sdist + pure-py wheel)
         working-directory: source
@@ -115,17 +108,30 @@ jobs:
         run: |
           uv run python scripts/stamp-build-provenance.py "$COZY_RUNTIME_BUILD_COMMIT"
           uv build --out-dir dist
-      - name: Bundle cozy-machine into the Linux wheels
+      # Read-only deploy keys: cozy-machine's source at its pin and the TensorFS crates it links.
+      - name: Read access to cozy-machine and TensorFS
+        env:
+          COZY_MACHINE_KEY: ${{ secrets.COZY_MACHINE_READ_KEY }}
+          TENSORFS_KEY: ${{ secrets.TENSORFS_READ_KEY }}
+        run: |
+          mkdir -m 700 -p ~/.ssh && ssh-keyscan github.com >> ~/.ssh/known_hosts
+          for repo in cozy-machine tensorfs; do
+            key=COZY_MACHINE_KEY; [ "$repo" = tensorfs ] && key=TENSORFS_KEY
+            (umask 077; printf '%s\n' "${!key}" > ~/.ssh/$repo)
+            printf 'Host %s.github.com\n  HostName github.com\n  IdentityFile ~/.ssh/%s\n  IdentitiesOnly yes\n' $repo $repo >> ~/.ssh/config
+            git config --global url."git@$repo.github.com:cozy-creator/$repo".insteadOf "https://github.com/cozy-creator/$repo"
+          done
+      - name: Bundle the pinned cozy-machine into the Linux wheel
         working-directory: source
-        run: uv run --script scripts/bundle-machine-agent.py --dist dist --agents "$RUNNER_TEMP/machine-agent"
-      - name: Verify wheel selection and installed agent commands
+        run: task machine
+      - name: Verify wheel selection and the installed machine command
         working-directory: source
         run: uv run --script scripts/verify-machine-wheels.py --dist dist
       # cr-095: a release silently missing a platform file is refused.
       # Everything visible in dist/ is uploaded, so the set is exact; the digests travel to
       # `publish` outside the artifact.
       - id: dist
-        name: Release carries the sdist, portable wheel and two Linux wheels
+        name: Release carries the sdist, portable wheel and the Linux wheel
         working-directory: source
         run: |
           uv run --no-project --python 3.12 python - <<'PY'
@@ -135,7 +141,6 @@ jobs:
               f"cozy_runtime-{v}.tar.gz",
               f"cozy_runtime-{v}-py3-none-any.whl",
               f"cozy_runtime-{v}-cp312-abi3-manylinux_2_28_x86_64.whl",
-              f"cozy_runtime-{v}-py3-none-manylinux_2_17_aarch64.whl",
           }
           dist = pathlib.Path("dist")
           # uv writes dist/.gitignore; hidden files are neither uploaded nor published.
