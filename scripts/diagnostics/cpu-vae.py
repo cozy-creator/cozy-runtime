@@ -85,7 +85,9 @@ def main() -> None:
         "runtime": importlib.metadata.version("cozy-runtime"),
         "tensorfs": importlib.metadata.version("tensorfs"),
         "tensorfs_store_feature": tensorfs.STORE,
-        "plane_limit": "Existing public Store-enabled0.3.93 CPU plane; not f089 STORE=False image proof",
+        "plane_limit": (
+            "Public Store-enabled 0.3.93 CPU plane; not f089 STORE=False image proof"
+        ),
         "torch": torch.__version__,
         "torch_git": torch.version.git_version,
         "diffusers": importlib.metadata.version("diffusers"),
