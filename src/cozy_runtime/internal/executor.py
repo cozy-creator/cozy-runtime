@@ -4719,7 +4719,7 @@ def _serialize_result(
     document = json.loads(msgspec.json.encode(envelope.result, enc_hook=hook))
     assert isinstance(document, dict)
     outputs = sorted(_assets_at(document, ""), key=lambda row: str(row["output_id"]))
-    data = canonical.write(document)
+    data = canonical.write_application(document)
     if len(data) > INLINE_RESULT_MAX:
         return None, [], len(data)
     (spool / RESULT_DOCUMENT).write_bytes(data)
