@@ -243,8 +243,8 @@ def test_an_executor_computes_on_the_machines_sealed_layout_and_reads_no_store(
         gpu.set_budget(-1, budget)
         again = load(gpu, checkpoint, "sealed", tiers=second.tiers).backend.components["stack"]
         assert again.sealed and machine.fills == 1  # the machine's one fill serves both
-        if again.filling is not None:
-            again.filling.wait()
+        for ticket in again.filling:
+            ticket.wait()
         tier = plane.stats(gpu.plane).host
         assert 0 < tier.used <= budget and tier.fill_bytes == 0, tier
         gpu.set_budget(-1, again.ws.nbytes)  # a raise pins the rest, still without a read
@@ -384,8 +384,8 @@ def test_a_layout_staged_in_part_pins_only_what_was_staged_and_reads_no_store(
         component = model.backend.components["stack"]
         assert component.sealed and component.staging is not None
         assert machine.stage_asks == [()] and machine.handed > 0
-        if component.filling is not None:
-            component.filling.wait()
+        for ticket in component.filling:
+            ticket.wait()
         tier = plane.stats(gpu.plane).host
         assert tier.used == 0 and tier.fill_bytes == 0, tier  # holes: nothing here to pin
         assert model.backend.stats["leases"]["acquisitions"] == 0
@@ -399,8 +399,8 @@ def test_a_layout_staged_in_part_pins_only_what_was_staged_and_reads_no_store(
         part.set_budget(-1, budget)
         again = load(part, checkpoint, "part", tiers=some.tiers).backend.components["stack"]
         assert again.sealed and machine.stage_asks[2:] == [(0,)]
-        if again.filling is not None:
-            again.filling.wait()
+        for ticket in again.filling:
+            ticket.wait()
         tier = plane.stats(part.plane).host
         assert tier.used == again.regions[0].span and tier.fill_bytes == 0, tier
     finally:
