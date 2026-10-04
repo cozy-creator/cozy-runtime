@@ -186,6 +186,9 @@ class DeviceTier(_Request, frozen=True, kw_only=True, tag="device_tier"):
     device: str
     offer: bool = False
     regions: tuple[SharedRegion, ...] = ()
+    #: what the regions' bytes hold beside the layout's stored ones: "" (nothing), a baked
+    #: LoRA variant's digest, or in an ask "*": the layout's most recent baked variant
+    variant: str = ""
     #: the fds that go with an offer, in `regions` order; never on the wire
     fds: tuple[int, ...] = ()
 
@@ -401,6 +404,10 @@ class DeviceTierAnswer(Answer, frozen=True, kw_only=True):
     regions: tuple[SharedRegion, ...] = ()
     duplicate: bool = False
     lease: bool = False
+    #: the machine keys holdings by variant (an older one keeps only stored bytes), and the
+    #: variant of the holding it answered an ask with
+    variants: bool = False
+    variant: str = ""
     #: the fds that followed the answer, in `regions` order; never on the wire
     fds: tuple[int, ...] = ()
     #: the lease socket that followed them, -1 when none; never on the wire

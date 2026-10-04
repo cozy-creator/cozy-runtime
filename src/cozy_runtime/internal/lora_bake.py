@@ -17,6 +17,10 @@ from typing import Any, Literal
 from cozy_runtime.internal.encoding import E4M3_MAX, E8M0_BIAS, MX_BLOCK
 
 Strategy = Literal["bake", "per_step"]
+
+#: Names this module's bake to other executors: the same factors and scales baked by the same
+#: rule are the same bytes (one seed per weight). Changed whenever the bytes a bake writes do.
+VARIANT = "cozy.lora-bake/1"
 Rounding = Literal["nearest", "stochastic", "feedback"]
 ROUNDINGS: tuple[Rounding, ...] = ("nearest", "stochastic", "feedback")
 #: A rowwise row's scale after a bake: unchanged, what its new maximum needs, or that moved
