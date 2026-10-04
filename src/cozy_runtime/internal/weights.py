@@ -18,6 +18,7 @@ import os
 import re
 import time
 import weakref
+import zlib
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field, replace
@@ -37,6 +38,7 @@ from cozy_runtime.internal import (
     budget_cell,
     canonical,
     image_vae,
+    lora_bake,
     plane,
     proctree,
     weight_policy,
@@ -135,6 +137,16 @@ class Views:
 
 
 @dataclass(slots=True)
+class Bake:
+    """One LoRA'd linear of a region: its PEFT layer, and indexes into the region's weights of
+    the stored base weight and of each adapter's (A, B) factors, with the scale PEFT applies."""
+
+    layer: Any
+    weight: int
+    factors: list[tuple[int, int, float]]
+
+
+@dataclass(slots=True)
 class Region:
     index: int
     path: str
@@ -154,6 +166,11 @@ class Region:
     #: whether its forward writes into its inputs in place, learned on its first run: such a
     #: block can never run again, so its ops recover from out-of-memory one by one
     mutates: bool | None = None
+    #: its LoRA'd linears; whether to bake them when its bytes are placed; and whether its
+    #: resident bytes hold their deltas now (cleared when the plane evicts it)
+    bakes: list[Bake] = field(default_factory=list)
+    bake: bool = False
+    baked: bool = False
 
     @property
     def transforms(self) -> bool:
@@ -297,6 +314,10 @@ class Weights:
         self.context_bytes = -1
         #: the machine's custody of GPU weights (`weights.attach/1`); None: every region private
         self.sharing: DeviceTiers | None = None
+        #: how LoRA'd linears are served: their update computed every forward, or baked into
+        #: resident bytes when they are placed (`set_lora`, the caller's measured choice). A
+        #: baked component whose region streams computes that region's update per step.
+        self.lora: lora_bake.Strategy = "per_step"
         #: the owner's cap on this process's device bytes (context, torch's reserved bytes and
         #: the plane's maps); -1: none
         self.cap = -1
@@ -633,7 +654,9 @@ class Weights:
         for name, index in pairs:
             component = self.components.get(str(name))
             if component is not None and 0 <= int(index) < len(component.regions):
-                unbind(component.regions[int(index)])
+                region = component.regions[int(index)]
+                unbind(region)
+                region.baked = False  # it refills from the unmodified host copy
 
     def measure_context(self) -> None:
         """What the driver charges this process beyond torch's segments and the plane's maps:
@@ -686,6 +709,8 @@ class Weights:
                 at += len(row.chunks)
                 if not 0 <= row.region < len(component.regions):
                     continue
+                if component.regions[row.region].bake:
+                    continue  # its bytes take deltas here: a private copy, never a shared one
                 try:
                     # The plane maps only when the holder's layout is this weight set's.
                     self.plane.attach_device(
@@ -719,7 +744,11 @@ class Weights:
         self.quiesce()
         kept = 0
         for component in list(self.components.values() if components is None else components):
-            exported = self.plane.export_device(component.ws, self.index)
+            # Baked bytes are this process's variant, never the layout's stored bytes.
+            plain = [region.index for region in component.regions if not region.baked]
+            if not plain:
+                continue
+            exported = self.plane.export_device(component.ws, self.index, plain)
             if not exported:
                 continue
             regions = tuple(
@@ -747,6 +776,25 @@ class Weights:
             if answer.duplicate:
                 self.attach(component)
         return kept
+
+    def set_lora(self, strategy: lora_bake.Strategy) -> None:
+        """Serve LoRA'd linears by `strategy` from their next placement on. A region whose
+        resident bytes are the other form is dropped: it refills from the unmodified host
+        copy and its next placement bakes, or not."""
+        self.lora = strategy
+        for row in list(self.residencies):
+            row.unpark()  # a repeating stage left open holds its leases
+        self.quiesce()
+        for component in self.components.values():
+            dropped = []
+            for region in component.regions:
+                region.bake = _bakes_here(self, component, region)
+                if region.bakes and region.baked != region.bake and region.bound is not None:
+                    unbind(region)
+                    dropped.append(region.index)
+                region.baked = region.baked and region.bake
+            if dropped:
+                self.plane.drop(component.ws, self.index, dropped)
 
     def revoke(self, layout: str) -> int:
         """Stop using the machine's regions of `layout`: queued work finishes, then they are
@@ -1015,6 +1063,8 @@ def bind(torch: ModuleType, region: Region, lease: Lease | _HostSpan) -> None:
                 value = torch.nn.Parameter(tensor, requires_grad=False)
                 views.writes[i] = (table, name, tensor, value)
             table[name] = value
+    if region.bakes:
+        _bake(torch, region, views.parts, lease.ring_offset is None)
     if region.transforms and (moved or lease.ring_offset is not None):
         region.derived = _transform(torch, region, views.parts)
     region.bound = address
@@ -1242,6 +1292,29 @@ def close_cursor(component: Component) -> None:
         # A view into the ring outlives the stage (a failed block's frames hold one): the
         # dropped cursor closes itself when the last of them goes.
         pass
+
+
+def _bake(torch: ModuleType, region: Region, parts: list[dict[str, Tensor]], home: bool) -> None:
+    """Add each LoRA'd linear's delta into the region's resident bytes the first time they are
+    placed, before any decode reads them; its PEFT layer then skips the update. A streamed
+    copy holds the unmodified bytes, so it keeps the update every forward.
+
+    Each weight is baked into a scratch copy and written back in one copy, so a failure (an
+    out-of-memory the block recovers from) leaves the stored bytes as they were."""
+    if home and region.bake and not region.baked:
+        for bake in region.bakes:
+            stored = parts[bake.weight]
+            name = region.weights[bake.weight].row.name
+            down = torch.cat([parts[a]["value"] for a, _, _ in bake.factors])
+            up = torch.cat([parts[b]["value"] * scale for _, b, scale in bake.factors], dim=1)
+            generator = torch.Generator(device=down.device).manual_seed(zlib.crc32(name.encode()))
+            scratch = {role: tensor.clone() for role, tensor in stored.items()}
+            lora_bake.bake(torch, scratch, down, up, generator=generator)
+            for role, tensor in stored.items():
+                tensor.copy_(scratch[role])
+        region.baked = True
+    for bake in region.bakes:
+        bake.layer._cozy_baked = home and region.baked
 
 
 def _views(torch: ModuleType, region: Region, base: Tensor) -> Views:
@@ -1904,6 +1977,8 @@ class PlaneBackend:
         for region in regions:
             for table, attr, standin in region.unbound:
                 setattr(standin, "origin", (weights, component, region, table, attr))  # noqa: B010
+            region.bakes = _lora_layers(root, region)
+            region.bake = _bakes_here(weights, component, region)
         if not fine:
             weights.attach(component)
         return component
@@ -1962,6 +2037,37 @@ class _Placed(msgspec.Struct, frozen=True):
     region: int
     offset: int
     nbytes: int
+
+
+def _lora_layers(root: Module, region: Region) -> list[Bake]:
+    """The region's PEFT layers whose base weight takes a bake and whose every active
+    adapter's factors lie in the same region (so they are bound together)."""
+    where = {weight.row.name: index for index, weight in enumerate(region.weights)}
+    found = []
+    for index, weight in enumerate(region.weights):
+        target = weight.row.name.removesuffix(".base_layer.weight")
+        roles = {role: dtype for role, (_, dtype, _) in weight.parts.items()}
+        if target == weight.row.name or not lora_bake.bakeable(roles):
+            continue
+        layer: Any = root.get_submodule(target)
+        factors = []
+        for name in getattr(layer, "active_adapters", ()):
+            a = where.get(f"{target}.lora_A.{name}.weight")
+            b = where.get(f"{target}.lora_B.{name}.weight")
+            if a is None or b is None:
+                break
+            factors.append((a, b, float(layer.scaling[name])))
+        else:
+            if factors:
+                found.append(Bake(layer, index, factors))
+    return found
+
+
+def _bakes_here(weights: Weights, component: Component, region: Region) -> bool:
+    """A region bakes its LoRA'd linears when the strategy says so on a GPU: a CPU executor
+    computes on its host tier, which other executors adopt as the stored bytes."""
+    del component
+    return bool(region.bakes) and not weights.host_only and weights.lora == "bake"
 
 
 def _fine(root: Module) -> tuple[int, int] | None:
