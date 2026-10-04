@@ -1,4 +1,5 @@
-"""Image VAE decode: the lone-frame path of diffusers' Qwen VAE and both families' tiles.
+"""Image VAE decode: the lone-frame path of diffusers' Qwen VAE, and both families' exact
+decode in row bands against diffusers' own untiled one.
 
 Real diffusers modules with seeded weights on the CPU; nothing is patched.
 """
@@ -61,20 +62,77 @@ def test_tiles_and_videos_keep_the_stock_decode() -> None:
         assert torch.allclose(vae.decode(video).sample, plain.decode(video).sample, atol=1e-5)
 
 
-def test_each_family_takes_a_tile_side_in_pixels() -> None:
+def kl() -> Any:
+    torch.manual_seed(7)
+    return diffusers.AutoencoderKL(
+        down_block_types=("DownEncoderBlock2D",) * 3,
+        up_block_types=("UpDecoderBlock2D",) * 3,
+        block_out_channels=(32, 32, 64),
+        norm_num_groups=8,
+    ).eval()
+
+
+#: bands of one row everywhere, two rows at full resolution, rows that vary by layer, and one
+#: band per layer
+BANDS = (1, 2 * 44 * 32, 5000, image_vae.BAND)
+
+
+@pytest.mark.parametrize("band", BANDS)
+def test_a_chunked_kl_decode_is_the_untiled_one(band: int) -> None:
+    vae = kl()
+    z = torch.randn(2, 4, 7, 11)  # odd sizes, two images
+    with torch.inference_mode():
+        stock = vae.decode(z).sample
+        decode = image_vae.Decode(vae, z, band=band)
+        (chunked,) = image_vae.Decode(vae, z, return_dict=False, band=band).run()
+        assert decode.rows == {1: 1, BANDS[1]: 2}.get(band, decode.rows)
+        assert torch.equal(decode.run().sample, chunked)
+    assert chunked.shape == stock.shape == (2, 3, 28, 44)
+    assert (chunked - stock).abs().max() <= 1e-5
+
+
+@pytest.mark.parametrize("band", BANDS)
+@pytest.mark.parametrize("fast", [True, False])
+def test_a_chunked_qwen_decode_is_the_untiled_one(band: int, fast: bool) -> None:
     vae = qwen()
-    geometry = image_vae.geometry(vae)
-    assert geometry is not None and geometry.scale == 8
-    geometry.tile(512)
-    assert vae.use_tiling
-    assert (vae.tile_sample_min_height, vae.tile_sample_min_width) == (512, 512)
-    assert (vae.tile_sample_stride_height, vae.tile_sample_stride_width) == (384, 384)
+    assert image_vae.fast_decode(vae) or not fast
+    z = torch.randn(1, 16, 1, 5, 3)
+    with torch.inference_mode():
+        stock = vae.decode(z).sample
+        chunked = image_vae.plan(vae, z).run().sample  # type: ignore[union-attr]
+    assert chunked.shape == stock.shape == (1, 3, 1, 40, 24)
+    assert (chunked - stock).abs().max() <= 1e-5
 
-    kl = diffusers.AutoencoderKL(block_out_channels=(32, 32, 32), latent_channels=4)
-    geometry = image_vae.geometry(kl)
-    assert geometry is not None and geometry.scale == 4
-    geometry.tile(256)
-    assert kl.use_tiling and kl.tile_sample_min_size == 256 and kl.tile_latent_min_size == 64
-    assert not image_vae.fast_decode(kl)
 
-    assert image_vae.geometry(torch.nn.Linear(2, 2)) is None
+def test_a_failed_step_runs_again_from_its_input() -> None:
+    """A step that fails (out of memory, say) leaves its input; the decode runs again from it
+    to the uninterrupted decode's bits."""
+    vae, z = kl(), torch.randn(1, 4, 6, 6)
+    calls = []
+
+    def within(module: Any, body: Any) -> Any:
+        calls.append(module)
+        if len(calls) == 9:
+            raise RuntimeError("out of memory")
+        return body()
+
+    with torch.inference_mode():
+        clean = image_vae.Decode(vae, z, band=100).run().sample
+        decode = image_vae.Decode(vae, z, band=100)
+        with pytest.raises(RuntimeError):
+            decode.run(within)
+        assert 0 < decode.step < len(decode.steps)
+        assert torch.equal(decode.run(within, host=True).sample, clean)
+
+
+def test_only_the_reviewed_decode_is_exact() -> None:
+    vae = kl()
+    assert image_vae.exact(vae) and image_vae.exact(qwen())
+
+    class Own(diffusers.AutoencoderKL):
+        def _decode(self, z: Any, return_dict: bool = True) -> Any:
+            return super()._decode(z * 2, return_dict)
+
+    assert not image_vae.exact(Own(block_out_channels=(32,), norm_num_groups=8))
+    assert image_vae.plan(qwen(), torch.randn(1, 16, 2, 4, 4)) is None  # a video
+    assert not image_vae.exact(torch.nn.Linear(2, 2))

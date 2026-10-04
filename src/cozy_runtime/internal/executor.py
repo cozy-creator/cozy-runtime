@@ -3037,8 +3037,8 @@ class Executor:
         # The first stages launch the libraries' kernels and workspaces: the context grows.
         if self.host.weights is not None:
             self.host.weights.measure_context()
-        # THE MODES THIS ATTEMPT RAN IN (weight-plane.md principle 7): decode tiling and batch
-        # layout, each decided before its stage and recorded with the run.
+        # THE MODES THIS ATTEMPT RAN IN (weight-plane.md principle 7): where decode maps lived
+        # and batch layout, each decided before its stage and recorded with the run.
         plane_facts = self._plane_facts()
         for stage, mode in sorted((plane_facts or {}).get("modes", {}).items()):
             record.emit("confession", "weights.mode", mode, stage=stage)

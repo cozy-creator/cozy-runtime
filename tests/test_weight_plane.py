@@ -47,6 +47,8 @@ on_card = pytest.mark.skipif(
     not accel.present(torch, "cuda") or accel.drives_display(0),
     reason="a CUDA card that drives no display",
 )
+# These hold the process to an owner's cap instead: any card runs them.
+on_gpu = pytest.mark.skipif(not accel.present(torch, "cuda"), reason="a CUDA card")
 
 HIDDEN = 2048
 BLOCKS = 8
@@ -1465,79 +1467,123 @@ def test_an_op_outside_every_block_runs_again_after_weights_leave(card: Any) -> 
     assert same(reference, [out])
 
 
-@on_card
-def test_a_qwen_image_vae_decodes_untiled_when_it_fits(tmp_path: Path) -> None:
+def kl_vae(channels: tuple[int, ...] = (64, 128)) -> Any:
+    diffusers = pytest.importorskip("diffusers")
+    torch.manual_seed(5)
+    return diffusers.AutoencoderKL(
+        down_block_types=("DownEncoderBlock2D",) * len(channels),
+        up_block_types=("UpDecoderBlock2D",) * len(channels),
+        block_out_channels=channels,
+    ).to(torch.float16)
+
+
+def plane_vae(weights: Weights, root: Path, factory: Any) -> tuple[Any, Any]:
+    """`factory`'s VAE on the plane, and the same weights as a plain module on the card."""
+    values = {k: v.float() for k, v in factory().state_dict().items()}
+    root.mkdir()
+    model = load(weights, store_component(root, "vae", values), "vae", name="vae", factory=factory)
+    plain = factory().cuda().eval()
+    plain.load_state_dict({k: v.half() for k, v in values.items()})
+    return model, plain
+
+
+def decode(model: Any, z: Any, cap: int = -1) -> Any:
+    weights = model.residency.weights
+    if cap >= 0:
+        weights.set_cap(cap)
+    model.residency.admit("run", ("vae",))
+    try:
+        with weights.recovering(), torch.inference_mode():
+            return model.stack.decode(z).sample
+    finally:
+        model.residency.release("run", ("vae",))
+        weights.set_cap(-1)
+        torch.cuda.empty_cache()
+
+
+def room(weights: Weights, nbytes: int) -> int:
+    """An owner's cap that leaves `nbytes` for activations beside what the process holds."""
+    torch.cuda.empty_cache()
+    weights.measure_context()
+    held = max(weights.context_bytes, 0) + plane.stats(weights.plane).device(0).committed
+    return held + torch.cuda.memory_reserved() + nbytes
+
+
+@on_gpu
+def test_an_image_decode_short_of_memory_is_still_the_untiled_image(tmp_path: Path) -> None:
+    """Run 4281 (SDXL in 1.5 GiB) fell back to a blended tiled decode 30 dB from its control.
+    The decode is now exact in row bands: with room its maps stay on the card; under a cap too
+    small for them they live in host memory. Either way the image is diffusers' untiled one to
+    fp16 rounding. The cap is the process's own: the card is never filled."""
+    weights = Weights(torch, torch.device("cuda", 0), "cuda")
+    weights.set_budget(-1, pinned=1 << 30)
+    model, plain = plane_vae(weights, tmp_path / "vae", kl_vae)
+    z = torch.randn(1, 4, 256, 256, device="cuda", dtype=torch.float16)  # 512x512 pixels
+    with torch.inference_mode():
+        reference = plain.decode(z).sample
+        exact = image_vae.Decode(plain, z)
+    del plain
+    roomy = decode(model, z)
+    assert weights.modes["vae.decode"] == f"chunked {exact.rows}"
+    short = decode(model, z, room(weights, exact.peak(True)))
+    assert weights.modes["vae.decode"] == f"chunked {exact.rows} host"
+    for image in (roomy, short):
+        torch.testing.assert_close(image, reference, atol=1e-2, rtol=0)
+
+
+@on_gpu
+def test_a_qwen_image_vae_decodes_exactly_on_the_plane(tmp_path: Path) -> None:
     """Anima's VAE (diffusers' AutoencoderKLQwenImage) with tiling on, as the published package
-    constructs it: the plane decides the decode and runs it untiled when it fits, on one
-    kernel tap per causal convolution. The image is the stock untiled decode's, to fp16."""
+    constructs it: the plane decodes it in row bands whatever the package asked, on one kernel
+    tap per causal convolution. The image is the stock untiled decode's, to fp16."""
     diffusers = pytest.importorskip("diffusers")
     torch.manual_seed(5)
 
     def vae() -> Any:
         return diffusers.AutoencoderKLQwenImage(base_dim=32, num_res_blocks=1).to(torch.float16)
 
-    values = {k: v.float() for k, v in vae().state_dict().items()}
-    checkpoint = store_component(tmp_path, "vae", values)
-    weights = Weights(torch, torch.device("cuda", 0), "cuda")
-    weights.set_budget(1 << 30, pinned=1 << 30)
-
     def lone() -> Any:  # the executor's execution plan, before the residency installs
         module = vae()
         assert image_vae.fast_decode(module)
         return module
 
-    model = load(weights, checkpoint, "qwen-vae", name="vae", factory=lone)
-    plain = vae().cuda().eval()
-    plain.load_state_dict({k: v.half() for k, v in values.items()})
+    weights = Weights(torch, torch.device("cuda", 0), "cuda")
+    weights.set_budget(1 << 30, pinned=1 << 30)
+    model, plain = plane_vae(weights, tmp_path / "vae", lone)
+    stock = vae().cuda().eval()
+    stock.load_state_dict(plain.state_dict())
+    del plain
     z = torch.randn(1, 16, 1, 64, 64, device="cuda", dtype=torch.float16)
     model.stack.enable_tiling()
-    model.residency.admit("run", ("vae",))
-    try:
-        with torch.inference_mode():
-            image = model.stack.decode(z).sample
-            reference = plain.decode(z).sample
-    finally:
-        model.residency.release("run", ("vae",))
-    assert weights.modes["vae.decode"] == "untiled"
+    image = decode(model, z)
+    assert weights.modes["vae.decode"].startswith("chunked ")
     assert image.shape == (1, 3, 1, 512, 512)
+    with torch.inference_mode():
+        reference = stock.decode(z).sample
     # norms in fp16 rather than fp32, and a 2D kernel: the image moves by a few fp16 ulps
     torch.testing.assert_close(image, reference, atol=1e-2, rtol=0)
 
 
 @on_card
-def test_a_larger_decode_is_sized_by_the_largest_one_measured(card: Any, tmp_path: Path) -> None:
+def test_a_decode_unmaps_idle_weights_only_for_the_room_it_needs(card: Any, tmp_path: Path) -> None:
     """Run 2955: the first decode at a size unmapped every idle weight, whatever was free, and
-    the model's next request uploaded all 6.4 GiB again. A size above every measured one asks
-    for what the largest below it used per pixel: none while that is free, that much when not."""
-    diffusers = pytest.importorskip("diffusers")
+    the model's next request uploaded all 6.4 GiB again. A decode that fits beside the idle
+    weights unmaps none; on a card with 8 MiB left they leave first (activations first) and
+    its maps stay on the card."""
     weights = card.weights
     weights.set_budget(1 << 30)
     idle = load(weights, card.checkpoint, "idle")
     x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
     stack = idle.residency.components["stack"]
-
-    def vae() -> Any:
-        torch.manual_seed(5)
-        return diffusers.AutoencoderKL(
-            down_block_types=("DownEncoderBlock2D",) * 2,
-            up_block_types=("UpDecoderBlock2D",) * 2,
-            block_out_channels=(32, 64),
-        ).to(torch.float16)
-
-    values = {k: v.float() for k, v in vae().state_dict().items()}
-    (tmp_path / "vae").mkdir()
-    model = load(
-        weights, store_component(tmp_path / "vae", "vae", values), "kl", name="vae", factory=vae
-    )
-    plain = vae().cuda().eval()
-    plain.load_state_dict({k: v.half() for k, v in values.items()})
+    model, plain = plane_vae(weights, tmp_path / "vae", lambda: kl_vae((32, 64)))
     latents = [
-        torch.randn(1, 4, side, side, device="cuda", dtype=torch.float16) for side in (32, 64, 128)
+        torch.randn(1, 4, side, side, device="cuda", dtype=torch.float16) for side in (64, 128)
     ]
     with torch.inference_mode():
         references = [plain.decode(z).sample for z in latents]
+    del plain
 
-    def decode(z: Any, left: int = 0) -> Any:
+    def squeezed(z: Any, left: int = 0) -> Any:
         ballast = None
         model.residency.admit("run", ("vae",))
         try:
@@ -1551,82 +1597,21 @@ def test_a_larger_decode_is_sized_by_the_largest_one_measured(card: Any, tmp_pat
             del ballast
             torch.cuda.empty_cache()
 
-    assert same([decode(latents[0])], references[:1])  # the first size is measured
     run(idle, x, passes=1)
     torch.cuda.synchronize()  # its last copies land
     was, mapped = weights.facts(), weights.resident_bytes(stack)
     assert mapped > 0
-    image = decode(latents[1])
-    assert weights.modes["vae.decode"] == "untiled"
+    image = squeezed(latents[0])
+    assert weights.modes["vae.decode"].startswith("chunked ")
     assert weights.facts().evictions == was.evictions and weights.resident_bytes(stack) >= mapped
-    assert same([image], references[1:2])
-    # Larger again, on a card with 8 MiB left: idle weights give its room before the call.
-    image = decode(latents[2], left=8 << 20)
-    assert weights.modes["vae.decode"] == "untiled"
+    torch.testing.assert_close(image, references[0], atol=1e-2, rtol=0)
+    image = squeezed(latents[1], left=8 << 20)
+    assert not weights.modes["vae.decode"].endswith(" host")
     assert weights.resident_bytes(stack) < mapped
-    # short of memory cuDNN may take an algorithm with a smaller workspace: fp16 rounding
-    torch.testing.assert_close(image, references[2], atol=1e-2, rtol=0)
+    torch.testing.assert_close(image, references[1], atol=1e-2, rtol=0)
 
 
-@on_card
-def test_a_decode_that_does_not_fit_takes_the_largest_tile_that_does(
-    card: Any, tmp_path: Path
-) -> None:
-    """Run 3156: every tiled decode ran at the 128-pixel minimum (the tile side was the
-    square root of a side), 8.7 s for one 1536x1536 image and no smaller tile left to try. A
-    decode whose measured peak does not fit starts at half the image."""
-    diffusers = pytest.importorskip("diffusers")
-    weights = card.weights
-    weights.set_budget(1 << 30)
-
-    def vae() -> Any:
-        torch.manual_seed(5)
-        return diffusers.AutoencoderKL(
-            down_block_types=("DownEncoderBlock2D",) * 2,
-            up_block_types=("UpDecoderBlock2D",) * 2,
-            block_out_channels=(32, 64),
-        ).to(torch.float16)
-
-    values = {k: v.float() for k, v in vae().state_dict().items()}
-    (tmp_path / "vae").mkdir()
-    model = load(
-        weights, store_component(tmp_path / "vae", "vae", values), "kl", name="vae", factory=vae
-    )
-    plain = vae().cuda().eval()
-    plain.load_state_dict({k: v.half() for k, v in values.items()})
-    z = torch.randn(1, 4, 512, 512, device="cuda", dtype=torch.float16)  # 1024x1024 pixels
-    with torch.inference_mode():
-        torch.cuda.reset_peak_memory_stats()
-        before = torch.cuda.memory_allocated()
-        plain.decode(z)
-        peak = torch.cuda.max_memory_allocated() - before
-        plain.enable_tiling()
-        plain.tile_sample_min_size, plain.tile_latent_min_size = 512, 256
-        reference = plain.decode(z).sample
-    del plain
-
-    def decode(left: int = 0) -> Any:
-        ballast = None
-        model.residency.admit("run", ("vae",))
-        try:
-            with weights.recovering(), torch.inference_mode():
-                torch.cuda.empty_cache()
-                free, _ = torch.cuda.mem_get_info()
-                ballast = torch.empty(free - left if left else 0, dtype=torch.uint8, device="cuda")
-                return model.stack.decode(z).sample
-        finally:
-            model.residency.release("run", ("vae",))
-            del ballast
-            torch.cuda.empty_cache()
-
-    decode()  # the size is measured
-    assert weights.modes["vae.decode"] == "untiled"
-    image = decode(left=peak * 3 // 4)
-    assert weights.modes["vae.decode"] == "tiled 512"
-    torch.testing.assert_close(image, reference, atol=1e-2, rtol=0)
-
-
-@on_card
+@on_gpu
 def test_a_decode_takes_no_room_from_its_stages_floor(card: Any, tmp_path: Path) -> None:
     """Run 3143 (Anima with 3 GiB free): the VAE decodes inside a stage that also holds a
     streamed component. Making room for the decode cut the plane to what was resident then,
@@ -1676,5 +1661,5 @@ def test_a_decode_takes_no_room_from_its_stages_floor(card: Any, tmp_path: Path)
     finally:
         denoiser.residency.release("render", ("stack",))
         torch.cuda.empty_cache()
-    assert weights.modes["vae.decode"] == "untiled"
+    assert weights.modes["vae.decode"].startswith("chunked ")
     torch.testing.assert_close(image, reference, atol=1e-2, rtol=0)

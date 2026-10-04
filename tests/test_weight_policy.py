@@ -74,8 +74,6 @@ def test_activations_come_first() -> None:
     assert policy.plane_budget(8 << 30, 3 << 30, 300 << 20) == (5 << 30) - (300 << 20) - (
         policy.MARGIN
     )
-    assert policy.decode_mode(free=1 << 30, evictable=3 << 30, untiled_bytes=3 << 30) == "untiled"
-    assert policy.decode_mode(free=1 << 30, evictable=0, untiled_bytes=3 << 30) == "tiled"
 
 
 def test_attached_regions_are_resident_and_cost_only_their_decoded_copies() -> None:
