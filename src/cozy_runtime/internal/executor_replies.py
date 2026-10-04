@@ -112,6 +112,8 @@ class PlaneFacts(msgspec.Struct, frozen=True, kw_only=True):
     pinned_bytes: int = -1
     #: CUDA context and runtime workspaces outside torch and the plane, measured at load
     context_bytes: int = -1
+    #: "process_driver" means a per-device row attributable to this process; "" is unknown.
+    context_measurement: str = ""
     #: torch's reserved bytes, and the process's device bytes (context + reserved + mapped)
     reserved_bytes: int = -1
     process_bytes: int = -1

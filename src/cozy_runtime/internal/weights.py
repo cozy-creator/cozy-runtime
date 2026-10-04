@@ -337,6 +337,8 @@ class Weights:
         self.last_retry: tuple[str, int] | None = None
         #: the CUDA context and library workspaces outside torch and the plane, measured once
         self.context_bytes = -1
+        #: Only a per-device driver row attributable to this process trains future budgets.
+        self.context_measurement = ""
         #: the machine's custody of GPU weights (`weights.attach/1`); None: every region private
         self.sharing: DeviceTiers | None = None
         #: how LoRA'd linears are served: baked into their weights (owner, 2026-10-04: the
@@ -718,7 +720,9 @@ class Weights:
     def measure_context(self) -> None:
         """What the driver charges this process beyond torch's segments and the plane's maps:
         the CUDA context and library workspaces the Worker must leave room for."""
-        row = accel.process_memory(os.getpid(), self.kind)
+        pid = os.getpid()
+        device_id = self._uuid()
+        row = accel.process_memories_by_device({pid}, self.kind, (device_id,))[device_id][pid]
         if row.state == "present":
             reserved = accel.allocation(self.torch, self.kind)["reserved_bytes"]
             device = plane.stats(self.plane).device(self.index)
@@ -726,13 +730,14 @@ class Weights:
             # driver charges one to whichever process it picks, never this one's context.
             mapped = max(device.committed, 0) + max(device.shared_bytes, 0)
             self.context_bytes = max(row.bytes - reserved - mapped, self.context_bytes, 0)
+            self.context_measurement = "process_driver"
             self.limit_torch()
 
-    def adopt_context(self, measured: int) -> None:
-        """The context the process measured at device init, where the driver could not list
-        it per process: what `process_bytes` and every cap count until NVML says more."""
-        if measured > self.context_bytes:
+    def adopt_context(self, measured: int, measurement: str = "") -> None:
+        """Adopt an attributable startup measurement; a device-wide delta is not one."""
+        if measurement == "process_driver" and measured > self.context_bytes:
             self.context_bytes = measured
+            self.context_measurement = measurement
             self.limit_torch()
 
     def resident_bytes(self, component: Component) -> int:
@@ -1053,6 +1058,7 @@ class Weights:
             pinned_budget_bytes=held.host.budget,
             pinned_bytes=held.host.used,
             context_bytes=self.context_bytes,
+            context_measurement=self.context_measurement,
             reserved_bytes=reserved,
             process_bytes=process,
             cap_bytes=self.cap,
