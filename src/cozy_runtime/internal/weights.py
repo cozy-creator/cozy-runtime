@@ -16,6 +16,7 @@ from __future__ import annotations
 import mmap
 import os
 import re
+import threading
 import time
 import weakref
 import zlib
@@ -314,7 +315,8 @@ class Weights:
         self.open: list[tuple[WeightResidency, str, tuple[str, ...]]] = []
         self.residencies: weakref.WeakSet[WeightResidency] = weakref.WeakSet()
         self._recovery: type | None = None
-        self._recovering = False
+        self._recovery_local = threading.local()
+        self.poisoned = ""
         #: one GPU of a group: a block's forward holds collectives the other GPUs are already
         #: in, so it can never run again; its ops recover one by one instead
         self.grouped = False
@@ -585,17 +587,27 @@ class Weights:
     @contextmanager
     def recovering(self) -> Iterator[None]:
         """Recover allocation failures at safe operator boundaries, never whole forwards."""
-        if self.host_only or self._recovering:
+        if self.poisoned:
+            raise ResidencyRefusal("residency_poisoned", self.poisoned)
+        if self.host_only or getattr(self._recovery_local, "active", False):
             yield
             return
         if self._recovery is None:
             self._recovery = _recovery_type(self.torch)
-        self._recovering = True
+        self._recovery_local.active = True
         try:
             with self._recovery(self):
                 yield
         finally:
-            self._recovering = False
+            self._recovery_local.active = False
+
+    def recovery_refusal(self, detail: str) -> ResidencyRefusal:
+        """An allocation failure may have changed state: latch it even if authored code
+        catches the refusal or it happened before handler entry. This process must retire."""
+        self.poisoned = self.poisoned or f"recovery_contract_unavailable: {detail}"[:400]
+        for residency in self.residencies:
+            residency.poisoned = residency.poisoned or self.poisoned
+        return ResidencyRefusal("recovery_contract_unavailable", detail)
 
     def make_room(self, need: int, operands: Sequence[object], op: str = "") -> None:
         """An op outside every block ran out of device memory: unmap `need` bytes of weights,
@@ -1280,6 +1292,16 @@ class Read:
         return tensor.clone() if any(a <= address < b for a, b in self.spans) else out
 
 
+# Layout/compiler annotations that do not change a pure operator's replay contract.
+# Unknown future annotations are isolated to OOM recovery, not baseline execution.
+_REPLAY_TAGS = frozenset({
+    "core", "cudagraph_unsafe", "data_dependent_output", "dynamic_output_shape",
+    "flexible_layout", "generated", "needs_contiguous_strides", "needs_exact_strides",
+    "needs_fixed_stride_order", "nondeterministic_bitwise", "pointwise",
+    "pt2_compliant_tag", "reduction", "view_copy",
+})
+
+
 def _recovery_type(torch: ModuleType) -> type:
     mode: type = torch.utils._python_dispatch.TorchDispatchMode
 
@@ -1295,23 +1317,28 @@ def _recovery_type(torch: ModuleType) -> type:
             self, func: Any, types: Any, args: tuple[Any, ...] = (), kwargs: Any = None
         ) -> Any:
             kwargs = kwargs or {}
+            if self.weights.poisoned:
+                raise ResidencyRefusal("residency_poisoned", self.weights.poisoned)
             refused = False
             while True:
                 try:
                     return func(*args, **kwargs)
                 except Exception as exc:
                     need, refused = _room_for(exc, refused)
+                    schema = getattr(func, "_schema", None)
+                    name = getattr(schema, "name", None)
+                    tags = getattr(func, "tags", None)
                     # A schema can declare writes, but not whether a failing kernel already
                     # made them. Random draws and opaque custom operators have the same
                     # problem. Without rollback, replay would silently change the result.
                     if (
-                        not func._schema.name.startswith("aten::")
-                        or func._schema.is_mutable
-                        or torch.Tag.nondeterministic_seeded in func.tags
-                        or torch.Tag.maybe_aliasing_or_mutating in func.tags
+                        not isinstance(name, str)
+                        or not name.startswith("aten::")
+                        or getattr(schema, "is_mutable", None) is not False
+                        or tags is None
+                        or any(getattr(tag, "name", None) not in _REPLAY_TAGS for tag in tags)
                     ):
-                        raise ResidencyRefusal(
-                            "recovery_contract_unavailable",
+                        raise self.weights.recovery_refusal(
                             f"{func} ran out of memory; automatic replay requires a contract "
                             "that restores any writes and random state from its failed call",
                         ) from exc
@@ -3093,7 +3120,7 @@ class WeightResidency:
                         try:
                             return forward(*args, **kwargs)
                         finally:
-                            weights.executing.pop()
+                            weights.executing.remove(component.key)
                             weights.running -= 1
                     except _Stale:
                         stale = True
@@ -3109,8 +3136,7 @@ class WeightResidency:
                 if stale:
                     self._restore(component, region)
                     continue
-                raise ResidencyRefusal(
-                    "recovery_contract_unavailable",
+                raise weights.recovery_refusal(
                     f"{component.name}.{region.path} ran out of memory outside a recoverable "
                     "torch operation; the forward cannot be replayed without restoring its state",
                 )

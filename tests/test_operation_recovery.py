@@ -6,6 +6,7 @@ They do not qualify low-VRAM inference or CUDA allocation recovery.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import pytest
@@ -79,4 +80,29 @@ def test_nested_recovery_scopes_install_one_dispatch_mode_and_unwind_it() -> Non
             assert torch.equal(torch.ones(1) + 1, torch.full((1,), 2.0))
         assert current() is mode
     assert current() is None
-    assert not weights._recovering
+    assert not getattr(weights._recovery_local, "active", False)
+
+
+def test_recovery_mode_is_owned_by_each_python_thread() -> None:
+    torch.set_num_threads(2)
+    weights = Weights(torch, torch.device("cpu"), "cuda")
+    weights.host_only = False
+    current = torch.utils._python_dispatch._get_current_dispatch_mode
+
+    def work() -> object:
+        assert current() is None
+        with weights.recovering():
+            mode = current()
+            assert mode is not None
+            with weights.recovering():
+                assert current() is mode
+                assert torch.equal(torch.ones(1) + 1, torch.full((1,), 2.0))
+        assert current() is None
+        return mode
+
+    with ThreadPoolExecutor(max_workers=1) as pool, weights.recovering():
+        own = current()
+        other = pool.submit(work).result()
+        assert own is not None and other is not own
+        assert current() is own
+    assert current() is None
