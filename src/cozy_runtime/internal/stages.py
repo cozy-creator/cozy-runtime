@@ -88,7 +88,7 @@ class StageSample(msgspec.Struct, frozen=True, kw_only=True):
     growth_bytes: int = 0
     """Allocator peak during the call minus reserved at entry."""
     floor_growth: int = 0
-    """Activation bytes the stage needs at the memory policy's cheapest rung (tiled decode,
+    """Activation bytes the stage needs at the memory policy's cheapest rung (host decode maps,
     chunked attention), once that policy ran there or fell short there. 0: not known."""
     stall_ns: int = 0
     ok: bool = True
@@ -98,7 +98,7 @@ class StageCost(msgspec.Struct, frozen=True, kw_only=True):
     """Measured cost of one stage kind at one cell and width. Times are smoothed means over
     successful calls (`runs`; 0 means only failures were seen). `growth` is the largest
     successful peak, never averaged (memory-manager rule 3), and only admission's floor reads
-    `floor_growth`: a mode-specific peak such as an untiled decode must never refuse a GPU
+    `floor_growth`: a mode-specific peak such as on-card decode maps must never refuse a GPU
     where the cheapest rung fits."""
 
     runs: int

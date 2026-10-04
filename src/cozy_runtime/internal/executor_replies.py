@@ -144,7 +144,7 @@ class PlaneFacts(msgspec.Struct, frozen=True, kw_only=True):
     misses: int = 0
     evictions: int = 0
     oom_retries: int = 0
-    #: The decode mode and CFG layout each stage chose, e.g. {"decode": "untiled"}
+    #: The decode mode and CFG layout each stage chose, e.g. {"vae.decode": "chunked 32 host"}
     modes: dict[str, str] = {}
 
 

@@ -36,7 +36,7 @@ _EXACT: ContextVar[list[bool] | None] = ContextVar("cozy_stage_memo_exact", defa
 
 
 def inexact() -> None:
-    """Runtime code that changed this call's arithmetic (a tiled retry after OOM) marks its
+    """Runtime code that changed this call's arithmetic (a lossy retry after OOM) marks its
     result unstorable: it is returned, never memoized."""
     if (flags := _EXACT.get()) is not None:
         flags[0] = False

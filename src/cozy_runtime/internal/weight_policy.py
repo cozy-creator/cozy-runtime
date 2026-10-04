@@ -10,7 +10,6 @@ from __future__ import annotations
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from itertools import pairwise
-from typing import Literal
 
 #: Streamed positions in flight when nothing is measured yet: the block computing and the next
 #: one arriving.
@@ -336,11 +335,6 @@ def stage(
         spare -= max(chosen.vram_bytes(layout) - need[name], 0)
         placed[name] = chosen
     return placed
-
-
-def decode_mode(free: int, evictable: int, untiled_bytes: int) -> Literal["untiled", "tiled"]:
-    """Untiled when its activations fit what is free plus what the plane may unmap."""
-    return "untiled" if untiled_bytes <= free + evictable else "tiled"
 
 
 def batch_fits(free: int, evictable: int, extra_bytes: int) -> bool:

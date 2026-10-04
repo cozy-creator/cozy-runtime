@@ -32,7 +32,6 @@ from cozy_runtime.author._activity import aside
 from cozy_runtime.author._errors import RuntimeFailure, is_device_oom, is_library_refusal
 from cozy_runtime.author._executor_requests import DeviceTierAnswer, SealedPlan, SharedRegion
 from cozy_runtime.author._loader import Census, TensorLike, TensorSpec, _members
-from cozy_runtime.author._stage_memo import inexact
 from cozy_runtime.internal import (
     accel,
     budget_cell,
@@ -87,8 +86,6 @@ type Origin = tuple[Weights, Component, Region, Table, str]
 
 #: The largest region at the sub-block grain (proving-cpu.md C2: SDXL runs at 1 GiB).
 REGION_LIMIT = 16 << 20
-#: The smallest image VAE decode tile side, in pixels.
-MIN_TILE = 128
 _REQUESTED = re.compile(r"Tried to allocate ([0-9.]+) (B|KiB|MiB|GiB)")
 _UNITS = {"B": 1, "KiB": 1 << 10, "MiB": 1 << 20, "GiB": 1 << 30}
 #: The TensorFS planning window a weight set's read plan is cut into.
@@ -305,7 +302,7 @@ class Weights:
         self.clock = 0
         self.components: dict[str, Component] = {}
         self.activation: dict[str, int] = {}
-        #: methods whose stage fits itself to the room it finds (an image VAE's decode mode):
+        #: methods whose stage fits itself to the room it finds (an image VAE's decode maps):
         #: their activations never size a grant
         self.adaptive: set[str] = set()
         self.oom_retries = 0
@@ -516,9 +513,9 @@ class Weights:
         held = committed + self.decoded()
         available = self.headroom(memory) + held
         # Activations first, but never below the open stages' floor while that fits: an
-        # estimate (a seed for an untiled decode, say) that left a stage no room for its own
-        # weights would refuse it for size. An adaptive stage then tiles; any other recovers
-        # from its out-of-memory by unmapping.
+        # estimate that left a stage no room for its own weights would refuse it for size. An
+        # adaptive stage then keeps its maps in host memory; any other recovers from its
+        # out-of-memory by unmapping.
         return max(weight_policy.plane_budget(available, growth), min(self.window(), available))
 
     def window(self) -> int:
@@ -2392,7 +2389,7 @@ class WeightResidency:
         for component in self.components.values():
             self._hook(component)
             vae: Any = component.root
-            if not weights.host_only and _image_vae(vae):
+            if not weights.host_only and image_vae.exact(vae):
                 vae.decode = self._decode(component.name, vae.decode)
 
     def _hook(self, component: Component) -> None:
@@ -3229,85 +3226,36 @@ class WeightResidency:
             component.seen.append(index)
 
     def _decode(self, name: str, decode: Callable[..., Any]) -> Callable[..., Any]:
-        """An image VAE's decode mode, decided before the call from what is free plus what the
-        plane may unmap: untiled when its measured activations fit, else tiled with the tile
-        clamped to what is free. A size never measured at or above runs untiled (its blocks
-        retry on OOM), sized by the largest size measured below it: a fixed cost makes small
-        decodes' per-pixel peaks overstate large ones.
-        A decode that cannot run untiled even with every idle weight unmapped runs again tiled,
-        and a tile that does not fit runs again at half the side, down to the smallest tile.
+        """An image VAE's decode, exact in row bands (`image_vae.Decode`) on a partition that
+        never depends on memory: memory decides only where its maps live. Idle weights unmap
+        for its maps and bands first (activations first); short of that room, or out of memory
+        part way, its maps live in host memory, and a failed step runs again from its input.
         The mode is recorded in the run's outputs."""
-        root: Any = self.components[name].root  # a diffusers image VAE, read as it is
-        vae = image_vae.geometry(root)
-        assert vae is not None
         weights = self.weights
-        #: pixels -> the untiled peak measured at that size
-        peaks: dict[int, int] = {}
-        #: pixels -> the tile side that last fit
-        sides: dict[int, int] = {}
-        scale = vae.scale
 
         def run(z: Tensor, *args: object, **kwargs: object) -> object:
+            exact = image_vae.plan(self.components[name].root, z, *args, **kwargs)
+            if exact is None:
+                return decode(z, *args, **kwargs)
             if self.active is not None:
                 weights.adaptive.add(self.active[0])
-            height, width = int(z.shape[-2]) * scale, int(z.shape[-1]) * scale
-            pixels = int(z.shape[0]) * height * width
             free, evictable = self.room((name,))
-            seeded = weights.activation.get(self.active[0], 0) if self.active else 0
-            if weights.cap >= 0 and not peaks and seeded > 0:
-                # Under an owner's cap a first decode takes its stage's measured peak (this
-                # process's or the owner's seed for this shape) instead of unmapping every idle
-                # weight: what is resident stays for the next call (keep hot).
-                peaks[pixels] = seeded
-            size = min((n for n in peaks if n >= pixels), default=0)
-            known = size or max(peaks, default=0)
-            per_pixel = peaks[known] // known if known else 0
-            mode = (
-                weight_policy.decode_mode(free, evictable, per_pixel * pixels)
-                if size
-                else "untiled"
-            )
-            # Activations first: idle weights leave before a decode needs their room (all of
-            # them unless a measured untiled peak says less), since a decode run short of
-            # memory takes slower convolutions.
-            need = per_pixel * pixels if mode == "untiled" and known else free + evictable
-            free = self._room_for_decode(name, free, evictable, min(need, free + evictable))
-            # a tile under half the image, so tiling always lowers the peak
-            largest = _tile(min(height, width) // 2)
-            side = min(_side(free // max(per_pixel, 1)), sides.get(pixels, largest), largest)
-            baseline = accel.allocated(weights.torch, weights.kind)
-            accel.reset_peak(weights.torch, weights.kind)
+            need = exact.peak(host=False)
+            host = need > self._room_for_decode(name, free, evictable, min(need, free + evictable))
             while True:
-                if mode == "tiled":
-                    vae.tile(side)
-                else:
-                    root.disable_tiling()
                 try:
-                    out = decode(z, *args, **kwargs)
+                    out = exact.run(self._within(name), host)
                     break
                 except Exception as exc:
                     capacity = is_device_oom(exc) or (
                         isinstance(exc, ResidencyRefusal) and exc.code == INDIVISIBLE
                     )
-                    if not capacity or (mode == "tiled" and side <= MIN_TILE):
+                    if host or not capacity:
                         raise
-                # outside `except`, so the failed call's frames are gone
+                # outside `except`, so the failed step's frames are gone
                 accel.release_cached(weights.torch, weights.kind)
-                if mode == "tiled":
-                    side = _tile(side // 2)
-                    continue
-                # it needs more than all it had: the next decode of this size starts tiled
-                peaks[pixels] = max(peaks.get(pixels, 0), free + evictable + 1)
-                mode = "tiled"
-                free, evictable = self.room((name,))
-                self._room_for_decode(name, free, evictable, free + evictable)
-            if mode == "tiled":
-                sides[pixels] = side
-                inexact()  # a tiled decode's arithmetic differs from an untiled one
-            else:
-                peak = accel.peak_allocated(weights.torch, weights.kind) - baseline
-                peaks[pixels] = max(peaks.get(pixels, 0), peak)
-            weights.modes[f"{name}.decode"] = f"tiled {side}" if mode == "tiled" else mode
+                host = True
+            weights.modes[f"{name}.decode"] = f"chunked {exact.rows}" + (" host" if host else "")
             # The decode's transient activations go back to the driver: kept in torch's
             # cache they shrink the next grant, and the weights the decode unmapped come
             # back into exactly that room.
@@ -3315,6 +3263,19 @@ class WeightResidency:
             return out
 
         return run
+
+    def _within(self, name: str) -> image_vae.Within:
+        """Run a body with a module's weights bound once for all of it: through the block's
+        own hook when the module is a block region; as it is otherwise (common weights, or a
+        module whose block regions the body binds itself)."""
+        component = self.components[name]
+        regions = {id(region.module): region for region in component.blocks}
+
+        def within(module: object, body: Callable[[], Any]) -> Any:
+            region = regions.get(id(module))
+            return body() if region is None else self._block(component, region, body)()
+
+        return within
 
     def unpark(self) -> None:
         """Close a repeating stage left open: another stage, an attempt's end, or a budget
@@ -3551,18 +3512,3 @@ def _room_for(exc: BaseException, refused: bool) -> tuple[int, bool]:
     if refused or not is_library_refusal(exc):
         raise exc
     return weight_policy.LIBRARY_ROOM, True
-
-
-def _image_vae(root: Module) -> bool:
-    """An image VAE whose decode the plane sizes: one frame, tiling it can switch."""
-    return image_vae.geometry(root) is not None
-
-
-def _tile(side: int) -> int:
-    """`side` as a tile's: a multiple of 64, at least the smallest tile."""
-    return max(side // 64 * 64, MIN_TILE)
-
-
-def _side(pixels: int) -> int:
-    """The largest tile side whose square is at most `pixels`."""
-    return _tile(int(max(pixels, 0) ** 0.5))
