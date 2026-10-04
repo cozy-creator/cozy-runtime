@@ -8,10 +8,11 @@ uv pip install cozy-runtime
 cozy-machine version --json
 ```
 
-It is built from [cozy-machine](https://github.com/cozy-creator/cozy-machine) at the tag in
-`cozy-machine.tag`. `task machine` bundles it into `dist`'s Linux wheel (`MACHINE=<checkout>`
-builds a candidate from that source instead); the publish workflow runs the same task. The
-portable wheel and the source distribution carry no machine.
+It is built from [cozy-machine](https://github.com/cozy-creator/cozy-machine) at
+`cozy-machine.pin`: the gated commit for candidates, the release tag cut on that commit at
+publish. `task machine` bundles it into `dist`'s Linux wheel (`MACHINE=<checkout>` builds a
+local checkout instead); the publish workflow runs the same task. The portable wheel and the
+source distribution carry no machine.
 
 Machine execution requires worker wire 59. Before first submission, the authenticated
 RecordOwner reads `GetMachineExecutionWorkspace` and durably pins its workspace ID

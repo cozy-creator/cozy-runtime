@@ -9,7 +9,7 @@ machine grant in its environment. `cozy-machine version --json` reports identity
 No Creator checkout or client configuration is required.
 
 Legacy: Runtime releases no longer build or bundle this agent. The wheel's `cozy-machine` is the
-Rust machine pinned in `cozy-machine.tag`; this source waits for the cutover's deletion.
+Rust machine pinned in `cozy-machine.pin`; this source waits for the cutover's deletion.
 
 The personal controller and Tensorhub both connect to this machine API. A local
 machine uses `COZY_MACHINE_LIFETIME=persistent`, a stable locally generated

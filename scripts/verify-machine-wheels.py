@@ -118,9 +118,12 @@ def main() -> None:
         command = venv / "bin/cozy-machine"
         assert command.read_bytes() == binaries["cp312-abi3-manylinux_2_28_x86_64"]
         identity = json.loads(run(str(command), "version", "--json"))
-        pin = (Path(__file__).resolve().parents[1] / "cozy-machine.tag").read_text().strip()
+        pin = (Path(__file__).resolve().parents[1] / "cozy-machine.pin").read_text().strip()
         assert identity["name"] == "cozy-machine" and "cozy.machine.v1" in identity["api"]
-        assert "v" + identity["version"] == pin, f"bundled {identity['version']}, pinned {pin}"
+        # A candidate pins a commit; a release pins the tag v<version> cut on that commit.
+        sha = re.fullmatch(r"[0-9a-f]{40}", pin)
+        built = identity.get("commit") if sha else "v" + identity["version"]
+        assert built == pin, f"bundled {built}, pinned {pin}"
         run("uv", "pip", "uninstall", "--python", python, "cozy-runtime")
         assert not command.exists(), "uninstall must remove the owned command"
     print(f"{version}: RECORDs, ELF platforms, modes, selection, installs and uninstall verified")

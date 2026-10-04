@@ -108,7 +108,7 @@ jobs:
         run: |
           uv run python scripts/stamp-build-provenance.py "$COZY_RUNTIME_BUILD_COMMIT"
           uv build --out-dir dist
-      # Read-only deploy keys: cozy-machine's source at the pinned tag and the TensorFS crates it links.
+      # Read-only deploy keys: cozy-machine's source at its pin and the TensorFS crates it links.
       - name: Read access to cozy-machine and TensorFS
         env:
           COZY_MACHINE_KEY: ${{ secrets.COZY_MACHINE_READ_KEY }}
