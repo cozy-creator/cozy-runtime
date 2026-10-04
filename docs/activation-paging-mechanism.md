@@ -36,6 +36,11 @@ and optional fallback. It also warns that managed-memory migration can be costly
 Use a scope, not an environment or global allocator replacement, and retain the
 pool until all tensors and stream work are complete.
 
+The [installed Python pool interface](https://raw.githubusercontent.com/pytorch/pytorch/08187d9e0fba026dc8217405802ab5381dc88d90/torch/cuda/memory.py)
+accepts an allocator, use_on_oom and no_split, with no separate pool fraction.
+The supported fraction setter applies to the device. Do not infer a scoped
+physical-accounting exemption from the pool's separate identity.
+
 [CUDA memory management](https://docs.nvidia.com/cuda/cuda-driver-api/cuda_driver_api/group__CUDA__MEM.html)
 permits managed oversubscription only with nonzero concurrentManagedAccess;
 query the actual device instead of assuming support from its product name.
@@ -73,6 +78,11 @@ environment switch, ABI/vtable trick or preallocated-cache workaround may pass i
    scope; verify their pointer kind and ordinary TensorFS/D2 path. Record managed
    pointers, physical GPU ceiling, host/cgroup peaks, time and complete output.
    Compare RGB with the independent untiled reference and control; no 35 dB change.
+   H0c's cold VAE wrapper currently selects tiled512 from physical room, so this
+   phase also requires a reviewed activation-aware admission plan. Disabling the
+   stock tiling flag alone does not prove a full decode. Preserve the native
+   untiled post_quant_conv then decoder math and record the actual input shape
+   and a single decoder invocation.
 5. A failure after entry retires the affected operation/process; it never retries
    the decoder or changes its geometry. Archive all failures and scope/pool release
    receipts before any next reviewed attempt.
