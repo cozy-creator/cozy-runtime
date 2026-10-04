@@ -10,7 +10,7 @@ import torch
 from diffusers import AutoencoderKL
 from diffusers.configuration_utils import FrozenDict
 
-from cozy_runtime.internal import accel, weights
+from cozy_runtime.internal import accel, image_vae, weights
 from cozy_runtime.internal.weights import ResidencyRefusal
 
 
@@ -158,3 +158,64 @@ def test_measured_tile_is_selected_before_first_decode(monkeypatch):
     assert result.shape == shape and vae.calls == 1 and not owner.poisoned
     assert vae.use_tiling and owner.modes["vae.decode"].startswith("tiled ")
     assert vae.tile_sample_min_size <= 512
+
+
+def native_sdxl_geometry(dtype=torch.bfloat16):
+    # Real native decoder structure and parameter metadata, without allocating weights.
+    with torch.device("meta"):
+        vae = AutoencoderKL(
+            down_block_types=("DownEncoderBlock2D",) * 4,
+            up_block_types=("UpDecoderBlock2D",) * 4,
+            block_out_channels=(128, 256, 512, 512),
+            layers_per_block=2,
+            sample_size=1024,
+        ).to(dtype=dtype)
+    return vae
+
+
+def test_cold_estimate_follows_real_upsample_channels_dtype_and_batch_slicing():
+    vae = native_sdxl_geometry()
+    geometry = image_vae.geometry(vae)
+    assert geometry is not None and geometry.decode_estimate is not None
+    single = geometry.decode_estimate((1, 4, 128, 128), 2)
+    # The last upsampler still has256 channels at1024 square, larger than final128.
+    assert single == (3 * 256 * 1024 * 1024 + 2 * 3 * 1024 * 1024 + 4 * 128 * 128) * 2
+    doubled = geometry.decode_estimate((2, 4, 128, 128), 2)
+    assert doubled == single * 2
+    vae.enable_slicing()
+    sliced = geometry.decode_estimate((2, 4, 128, 128), 2)
+    assert single < sliced < doubled
+    vae.to(dtype=torch.float32)
+    assert geometry.decode_estimate((1, 4, 128, 128), 2) > single * 1.99
+
+
+@pytest.mark.parametrize("owner_seed", [0, 1008372224, 400 << 20])
+def test_first_native_decode_selects_tiles_before_call_despite_partial_or_tiled_owner_seed(
+    monkeypatch, owner_seed
+):
+    vae = native_sdxl_geometry()
+    row, owner = residency(monkeypatch, vae, peak=owner_seed, free=1200 << 20)
+    seen = []
+
+    def decode(z):
+        seen.append((vae.use_tiling, vae.tile_sample_min_size))
+        return z
+
+    z = torch.zeros(1, 4, 128, 128, dtype=torch.bfloat16)
+    assert row._decode("vae", decode)(z) is z
+    assert seen == [(True, 512)] and owner.modes["vae.decode"] == "tiled 512"
+    assert not owner.poisoned
+
+
+def test_cold_native_decode_keeps_large_room_untiled_fast_path(monkeypatch):
+    vae = native_sdxl_geometry()
+    row, owner = residency(monkeypatch, vae, free=3 << 30)
+    seen = []
+
+    def decode(z):
+        seen.append(vae.use_tiling)
+        return z
+
+    z = torch.zeros(1, 4, 128, 128, dtype=torch.bfloat16)
+    assert row._decode("vae", decode)(z) is z
+    assert seen == [False] and owner.modes["vae.decode"] == "untiled"

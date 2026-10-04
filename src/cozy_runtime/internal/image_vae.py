@@ -46,6 +46,7 @@ class _Conv(Protocol):
 
 class _KlConfig(Protocol):
     block_out_channels: Sequence[int]
+    out_channels: int
 
 
 class _Norm(Protocol):
@@ -88,6 +89,7 @@ class Geometry:
 
     scale: int
     tile: Callable[[int], None]
+    decode_estimate: Callable[[Sequence[int], int], int] | None = None
 
 
 def _family(root: object) -> type | None:
@@ -120,7 +122,39 @@ def geometry(root: object) -> Geometry | None:
         kl.tile_sample_min_size = side
         kl.tile_latent_min_size = side // scale
 
-    return Geometry(scale, tile)
+    def estimate(shape: Sequence[int], item_bytes: int) -> int:
+        """A cold strategy estimate, never a measured peak or a fit guarantee.
+
+        Follow the actual decoder's spatial expansion. Upsampling and residual/
+        convolution paths overlap feature buffers; allow three at the largest
+        feature size, plus the live latent and accumulated/concatenated output.
+        Use the decoder's floating parameter dtype when it exceeds the latent's.
+        """
+        decoder = getattr(kl, "decoder", None)
+        if decoder is None:
+            return 0
+        batch, channels, height, width = (int(n) for n in shape)
+        element = max(
+            item_bytes,
+            max(
+                (p.element_size() for p in decoder.parameters() if p.is_floating_point()), default=0
+            ),
+        )
+        latent = batch * channels * height * width * item_bytes
+        active_batch = 1 if getattr(kl, "use_slicing", False) else batch
+        peak = 0
+        for block in decoder.up_blocks:
+            for resnet in block.resnets:
+                channels = int(resnet.out_channels)
+                peak = max(peak, 3 * active_batch * channels * height * width * element)
+            for upsample in block.upsamplers or ():
+                height, width = height * 2, width * 2
+                channels = int(upsample.channels)
+                peak = max(peak, 3 * active_batch * channels * height * width * element)
+        output = batch * int(kl.config.out_channels) * height * width * element
+        return latent + peak + 2 * output
+
+    return Geometry(scale, tile, estimate)
 
 
 def fast_decode(root: object) -> bool:

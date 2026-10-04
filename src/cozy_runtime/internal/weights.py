@@ -556,11 +556,7 @@ class Weights:
     def window(self) -> int:
         """What the open stages stream in at least: each component's common weights and two
         of its largest regions (one in use, the next arriving), at its current grain."""
-        layouts = (
-            _paid(c, c.planned)[0]
-            for _, _, c in self.opened().values()
-            if not c.spared
-        )
+        layouts = (_paid(c, c.planned)[0] for _, _, c in self.opened().values() if not c.spared)
         return sum(layout.common + 2 * layout.largest for layout in layouts)
 
     def grow(self, need: int) -> bool:
@@ -1109,7 +1105,9 @@ class Weights:
             if region.indexed is not None
         ]
         copied = (
-            device.host_copy_bytes + device.disk_copy_bytes + self._indexed_h2d
+            device.host_copy_bytes
+            + device.disk_copy_bytes
+            + self._indexed_h2d
             + sum(r.h2d_bytes for r in indexed)
         )
         reserved = -1 if self.host_only else int(self.torch.cuda.memory_reserved(self.device))
@@ -1121,7 +1119,9 @@ class Weights:
             else -1
         )
         copy_ns = (
-            device.host_copy_ns + device.disk_copy_ns + self._indexed_copy_ns
+            device.host_copy_ns
+            + device.disk_copy_ns
+            + self._indexed_copy_ns
             + sum(r.copy_ns for r in indexed)
         )
         if indexed or self._indexed_read:
@@ -1354,12 +1354,24 @@ class Read:
 
 # Layout/compiler annotations that do not change a pure operator's replay contract.
 # Unknown future annotations are isolated to OOM recovery, not baseline execution.
-_REPLAY_TAGS = frozenset({
-    "core", "cudagraph_unsafe", "data_dependent_output", "dynamic_output_shape",
-    "flexible_layout", "generated", "needs_contiguous_strides", "needs_exact_strides",
-    "needs_fixed_stride_order", "nondeterministic_bitwise", "pointwise",
-    "pt2_compliant_tag", "reduction", "view_copy",
-})
+_REPLAY_TAGS = frozenset(
+    {
+        "core",
+        "cudagraph_unsafe",
+        "data_dependent_output",
+        "dynamic_output_shape",
+        "flexible_layout",
+        "generated",
+        "needs_contiguous_strides",
+        "needs_exact_strides",
+        "needs_fixed_stride_order",
+        "nondeterministic_bitwise",
+        "pointwise",
+        "pt2_compliant_tag",
+        "reduction",
+        "view_copy",
+    }
+)
 
 
 def _recovery_type(torch: ModuleType) -> type:
@@ -3432,9 +3444,9 @@ class WeightResidency:
     def _decode(self, name: str, decode: Callable[..., Any]) -> Callable[..., Any]:
         """An image VAE's decode mode, decided before the call from what is free plus what the
         plane may unmap: untiled when its measured activations fit, else tiled with the tile
-        clamped to what is free. A size never measured at or above runs untiled (reviewed
-        pure operators may recover OOM), sized by the largest size measured below it: a
-        fixed cost makes small decodes' per-pixel peaks overstate large ones.
+        clamped to what is free. A cold native decoder uses its actual geometry and dtype
+        to estimate a strategy. Owner stage peaks are estimates too: they may describe a
+        tiled or incomplete call, rather than a completed untiled decode.
         The mode is selected before the first decode. A decode has no generic rollback
         contract for module/input/random state, so capacity failures retire it instead
         of replaying it at a different tile size. The mode is recorded in the outputs."""
@@ -3455,23 +3467,21 @@ class WeightResidency:
             pixels = int(z.shape[0]) * height * width
             free, evictable = self.room((name,))
             seeded = weights.activation.get(self.active[0], 0) if self.active else 0
-            if weights.cap >= 0 and not peaks and seeded > 0:
-                # Under an owner's cap a first decode takes its stage's measured peak (this
-                # process's or the owner's seed for this shape) instead of unmapping every idle
-                # weight: what is resident stays for the next call (keep hot).
-                peaks[pixels] = seeded
             size = min((n for n in peaks if n >= pixels), default=0)
             known = size or max(peaks, default=0)
             per_pixel = peaks[known] // known if known else 0
-            mode = (
-                weight_policy.decode_mode(free, evictable, per_pixel * pixels)
-                if size
-                else "untiled"
-            )
+            peak = per_pixel * pixels
+            if not size:
+                geometry = (
+                    vae.decode_estimate(z.shape, z.element_size()) if vae.decode_estimate else 0
+                )
+                peak = max(peak, geometry, seeded)
+                per_pixel = (peak + max(pixels, 1) - 1) // max(pixels, 1)
+            mode = weight_policy.decode_mode(free, evictable, peak) if peak else "untiled"
             # Activations first: idle weights leave before a decode needs their room (all of
             # them unless a measured untiled peak says less), since a decode run short of
             # memory takes slower convolutions.
-            need = per_pixel * pixels if mode == "untiled" and known else free + evictable
+            need = peak if mode == "untiled" and peak else free + evictable
             free = self._room_for_decode(name, free, evictable, min(need, free + evictable))
             # a tile under half the image, so tiling always lowers the peak
             largest = _tile(min(height, width) // 2)
