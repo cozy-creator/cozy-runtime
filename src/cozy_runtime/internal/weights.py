@@ -95,6 +95,13 @@ _UNITS = {"B": 1, "KiB": 1 << 10, "MiB": 1 << 20, "GiB": 1 << 30}
 READ_WINDOW = 4 << 20
 
 
+#: The one memory failure a request can end with: an operation that needs more device memory
+#: at once than the GPU can give, with every weight it does not read unmapped, every idle
+#: tenant gone and the stage at its finest grain. Sizes and estimates only change how a stage
+#: runs (tile, stream finer, evict, page from host); they never stop it.
+INDIVISIBLE = "operation_exceeds_device"
+
+
 class ResidencyRefusal(RuntimeFailure):
     """A stage cannot run in what the device has: capacity, never broken state. Carries the
     structured shortfall with both numbers."""
@@ -571,8 +578,9 @@ class Weights:
             self.shrink(need, 0)
         if any(region.bound != address for region, address in read):
             raise ResidencyRefusal(
-                "device_shortfall",
-                f"an allocation of {need} B needed the room of the weights the same op reads",
+                INDIVISIBLE,
+                f"{op or 'an allocation'} needs {need} B of device memory at once beside the "
+                "weights it reads, and the GPU cannot give that with them mapped",
             )
         self.progressed(before, need, op)
 
@@ -591,9 +599,10 @@ class Weights:
             after = self.allocatable()
         if after <= before:
             raise ResidencyRefusal(
-                "device_shortfall",
+                INDIVISIBLE,
                 f"{op or 'an allocation'} of {need} B: nothing on this GPU could give device "
-                f"memory back ({after} B allocatable before and after)",
+                f"memory back ({after} B allocatable before and after, every weight it does "
+                "not read unmapped and every idle tenant asked)",
             )
 
     @contextmanager
@@ -2302,12 +2311,7 @@ class WeightResidency:
                 component = self.components[name]
                 component.passes = 0
                 if component.common is not None:
-                    try:
-                        component.lease = weights.plane.acquire(
-                            component.ws, weights.index, component.common.index, stream
-                        )
-                    except self._capacity as exc:
-                        raise self._shortfall(method, 0, budget, str(exc)) from None
+                    component.lease = self._acquire_common(method, component, budget, stream)
                     bind(weights.torch, component.common, component.lease)
         except BaseException:
             with suppress(Exception):  # the original failure is the one to report
@@ -2315,6 +2319,22 @@ class WeightResidency:
             self._left()
             raise
         self._entered(method)
+
+    def _acquire_common(self, method: str, component: Component, budget: int, stream: Any) -> Any:
+        """The stage's common region's lease; short of device memory, the owner is asked for
+        room once before that is reported."""
+        weights = self.weights
+        assert component.common is not None
+        for asked in (False, True):
+            try:
+                return weights.plane.acquire(
+                    component.ws, weights.index, component.common.index, stream
+                )
+            except self._capacity as exc:
+                if asked or weights.room is None or weights.cap < 0:
+                    raise self._shortfall(method, component.common.span, budget, str(exc)) from None
+                weights.room(component.common.span + weight_policy.MARGIN)
+        raise AssertionError("unreachable")
 
     def _place(self, budget: int, resume: Mapping[str, int] = {}) -> int:
         """`_plan` the open stages in `budget`. When the driver itself has less (another
@@ -2335,8 +2355,24 @@ class WeightResidency:
                 return budget
             except self._budget_error as exc:
                 if pooled or not _device_pool(exc):
-                    raise self._shortfall(method, 0, budget, str(exc)) from None
+                    if asked or weights.room is None or weights.cap < 0:
+                        raise self._shortfall(method, 0, budget, str(exc)) from None
+                    asked = True
+                    weights.room(weight_policy.MARGIN)
+                    budget = max(budget, weights.driver_budget(method))
+                    continue
                 pooled = True
+            except ResidencyRefusal as exc:
+                # Short when the plane placed the plan: the owner makes room once (its idle
+                # tenants leave), then the stage plans again in what that gave.
+                if asked or exc.code != INDIVISIBLE or weights.room is None or weights.cap < 0:
+                    raise
+                asked = True
+                short = self.last_shortfall or {}
+                missing = int(short.get("needed_bytes", 0)) - int(short.get("available_bytes", 0))
+                weights.room(max(missing, 0) + weight_policy.MARGIN)
+                budget = max(budget, weights.driver_budget(method))
+                continue
             except Exception as exc:
                 if not is_device_oom(exc):
                     raise
@@ -3027,7 +3063,7 @@ class WeightResidency:
                     break
                 except Exception as exc:
                     capacity = is_device_oom(exc) or (
-                        isinstance(exc, ResidencyRefusal) and exc.code == "device_shortfall"
+                        isinstance(exc, ResidencyRefusal) and exc.code == INDIVISIBLE
                     )
                     if not capacity or (mode == "tiled" and side <= MIN_TILE):
                         raise
@@ -3118,8 +3154,14 @@ class WeightResidency:
             "request_shape": method,
         }
         self.last_shortfall = shortfall
-        self.refusals.append(f"device_shortfall: {method}: {detail}"[:400])
-        return ResidencyRefusal("device_shortfall", f"{method}(): {detail}", shortfall)
+        self.refusals.append(f"{INDIVISIBLE}: {method}: {detail}"[:400])
+        return ResidencyRefusal(
+            INDIVISIBLE,
+            f"{method}(): {detail}; its smallest working set needs {needed} B of device memory "
+            f"at once and {available} B can be had at the finest grain, the owner having made "
+            "room",
+            shortfall,
+        )
 
     def _poison(self, exc: BaseException) -> ResidencyRefusal:
         """The plane latched poison (a lease lost, a driver mapping in doubt): this process is
