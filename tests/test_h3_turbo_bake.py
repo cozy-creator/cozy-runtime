@@ -160,7 +160,7 @@ def test_a_turbo_forward_bakes_and_a_base_forward_finds_the_bytes_refilled(
         dit = built.components["fl2va_dit"]
         regions = backend.components["fl2va_dit"].regions
         baking = [r for r in regions if r.bakes]
-        hooks = [b.layer for r in baking for b in r.bakes]
+        hooks = [h for r in baking for b in r.bakes for h in b.hooks]
         assert all(isinstance(h, LoRASource) for h in hooks) and len(hooks) == 18
         assert all(r.bake is (device == "cuda") for r in baking)
         residency = WeightResidency(weights, backend.components, {"run": ("fl2va_dit",)})
