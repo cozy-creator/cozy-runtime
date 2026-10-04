@@ -4,6 +4,7 @@ update every forward. The checkpoint's stored bytes never change."""
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -65,6 +66,7 @@ def test_a_gpu_executor_bakes_a_prepared_graph_and_per_step_serves_it_unbaked(
         torch, torch.device(device, 0) if device == "cuda" else torch.device(device), device
     )
     weights.set_budget(-1, pinned=64 << 20)
+    weights.set_lora("bake")
     backend = PlaneBackend.for_script(
         {"transformer": checkpoint}, rows, weights=weights, construction="baked", release="baked/1"
     )
@@ -80,26 +82,28 @@ def test_a_gpu_executor_bakes_a_prepared_graph_and_per_step_serves_it_unbaked(
         x = torch.tensor([[1.25, -2.0, 0.5], [0.0, 1.0, 2.0]], device=device)
         residency = WeightResidency(weights, backend.components, {"run": ("transformer",)})
 
-        def served() -> Any:
+        def served() -> tuple[Any, bool, bool]:
+            """The output, and whether the layer skipped its update over baked bytes, read
+            while the stage holds the weights (a release may evict them)."""
             residency.admit("run", ("transformer",))
             try:
                 with torch.no_grad():
-                    return root.proj(x)
+                    return root.proj(x), root.proj._cozy_baked, region.baked
             finally:
                 residency.release("run", ("transformer",))
 
         # f32 weights and small integers: baked and per-step sums are both exact here
-        assert torch.equal(served(), expected(x))
-        assert root.proj._cozy_baked is (device == "cuda")
-        if device == "cuda":
-            assert (region.bake, region.baked) == (True, True)
+        cuda = device == "cuda"
+        out, skipped, baked = served()
+        assert torch.equal(out, expected(x)) and (skipped, baked) == (cuda, cuda)
+        if cuda:
             weights.set_lora("per_step")  # drops the baked bytes; they refill unmodified
             assert (region.bake, region.baked) == (False, False)
-            assert torch.equal(served(), expected(x))
-            assert root.proj._cozy_baked is False
+            out, skipped, baked = served()
+            assert torch.equal(out, expected(x)) and (skipped, baked) == (False, False)
             weights.set_lora("bake")
-            assert torch.equal(served(), expected(x))
-            assert (region.bake, region.baked) == (True, True)
+            out, skipped, baked = served()
+            assert torch.equal(out, expected(x)) and (skipped, baked) == (True, True)
     finally:
         backend.close()
 
@@ -174,7 +178,9 @@ def test_a_baked_fp8_projection_keeps_the_loras_effect(tmp_path: Path) -> None:
             self.components = {"transformer": root}
 
     class EncodedModel(Model[EncodedPipeline], encoded_leaves="accept"):
-        __adapter_compatibility__ = (AdapterCompatibility("lora", "", ("transformer",)),)
+        __adapter_compatibility__ = (
+            AdapterCompatibility("lora", "", ("transformer",), -math.inf, math.inf),
+        )
         pipe: EncodedPipeline
 
         def load(self, loader: Loader) -> None:
@@ -197,12 +203,14 @@ def test_a_baked_fp8_projection_keeps_the_loras_effect(tmp_path: Path) -> None:
     )
     weights = Weights(torch, torch.device("cuda", 0), "cuda")
     weights.set_budget(-1, pinned=64 << 20)
+    weights.set_lora("bake")
     backend = PlaneBackend.for_script(
         {"transformer": checkpoint}, rows, weights=weights, construction="fp8", release="fp8/1"
     )
     try:
         backend.expect({"transformer": tuple(row.key for row in rows)})
-        built = Loader(artifact, owner=SimpleNamespace(), backend=backend).construct(
+        owner = type("Owner", (), {"__encoded_leaves__": "accept"})()
+        built = Loader(artifact, owner=owner, backend=backend).construct(
             EncodedPipeline, factory=EncodedPipeline
         )
         root: Any = built.components["transformer"]
@@ -210,19 +218,19 @@ def test_a_baked_fp8_projection_keeps_the_loras_effect(tmp_path: Path) -> None:
         x = torch.randn(64, WIDTH, device="cuda", generator=torch.Generator("cuda").manual_seed(1))
         residency = WeightResidency(weights, backend.components, {"run": ("transformer",)})
 
-        def served() -> Any:
+        def served() -> tuple[Any, bool, bool]:
             residency.admit("run", ("transformer",))
             try:
                 with torch.no_grad():
-                    return root.proj(x).float()
+                    return root.proj(x).float(), root.proj._cozy_baked, region.baked
             finally:
                 residency.release("run", ("transformer",))
 
-        baked = served()
-        assert root.proj._cozy_baked is True and region.baked
+        baked, skipped, held = served()
+        assert (skipped, held) == (True, True)
         weights.set_lora("per_step")
-        per_step = served()
-        assert root.proj._cozy_baked is False
+        per_step, skipped, held = served()
+        assert (skipped, held) == (False, False)
         update = (x @ down.cuda().t() @ up.cuda().t()) * strength
         none = per_step - update
         effect = (baked - none).flatten() @ update.flatten() / update.flatten().square().sum()

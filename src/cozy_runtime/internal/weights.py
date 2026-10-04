@@ -314,9 +314,10 @@ class Weights:
         self.context_bytes = -1
         #: the machine's custody of GPU weights (`weights.attach/1`); None: every region private
         self.sharing: DeviceTiers | None = None
-        #: how LoRA'd linears are served: baked into resident bytes when they are placed, or
-        #: their update computed every forward
-        self.lora: lora_bake.Strategy = "bake"
+        #: how LoRA'd linears are served: their update computed every forward, or baked into
+        #: resident bytes when they are placed (`set_lora`, the caller's measured choice). A
+        #: baked component whose region streams computes that region's update per step.
+        self.lora: lora_bake.Strategy = "per_step"
         #: the owner's cap on this process's device bytes (context, torch's reserved bytes and
         #: the plane's maps); -1: none
         self.cap = -1
@@ -777,19 +778,22 @@ class Weights:
         return kept
 
     def set_lora(self, strategy: lora_bake.Strategy) -> None:
-        """Serve LoRA'd linears by `strategy` from their next placement on. Leaving `bake`
-        drops the baked bytes, which refill from the unmodified host copy."""
+        """Serve LoRA'd linears by `strategy` from their next placement on. A region whose
+        resident bytes are the other form is dropped: it refills from the unmodified host
+        copy and its next placement bakes, or not."""
         self.lora = strategy
+        for row in list(self.residencies):
+            row.unpark()  # a repeating stage left open holds its leases
+        self.quiesce()
         for component in self.components.values():
             dropped = []
             for region in component.regions:
                 region.bake = _bakes_here(self, component, region)
-                if region.baked and not region.bake:
+                if region.bakes and region.baked != region.bake and region.bound is not None:
                     unbind(region)
-                    region.baked = False
                     dropped.append(region.index)
+                region.baked = region.baked and region.bake
             if dropped:
-                self.quiesce()
                 self.plane.drop(component.ws, self.index, dropped)
 
     def revoke(self, layout: str) -> int:
