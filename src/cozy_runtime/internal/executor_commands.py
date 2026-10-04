@@ -252,6 +252,9 @@ SEALED_TIERS = "host_tiers.sealed/1"
 #: An executor capability: it adopts a sealed host layout its machine is still filling, using
 #: each region once Ready; machines give other executors complete layouts only.
 SEALED_FILLING = "host_tiers.filling/1"
+#: An executor capability: it reads the holes of a layout staged in part from the object files
+#: its machine hands over, so the machine stages only the regions it streams.
+SEALED_STAGED = "host_tiers.staged/1"
 
 
 class Load(Command, frozen=True, kw_only=True, tag="load"):
@@ -287,6 +290,9 @@ class Load(Command, frozen=True, kw_only=True, tag="load"):
     #: The machine serves the header and model assets (`ModelSource`): with sealed tiers,
     #: this executor reads no store. Older workers never set it.
     model_sources: bool = False
+    #: The machine stages sealed layouts in part and hands over object files (`SealedStage`,
+    #: `ObjectFiles`): a GPU executor asks for them only when told so. Older machines never set it.
+    staged_tiers: bool = False
     #: The process's device cap for the load (`PROCESS_CAP`); unset: none given
     cap_bytes: int | UnsetType = UNSET
     #: Per GPU of a group, its own cap for the load (index = rank, `RANK_CELLS`)

@@ -248,6 +248,10 @@ class Component:
     #: the machine's lease sockets for those regions: open while they are mapped, closed (by
     #: this process or its death) once they are let go, which ends the lease
     leases: list[int] = field(default_factory=list)
+    #: a layout the machine stages in part: its plan, and the regions staged so far (the rest
+    #: copy from the object files; the stream's regions are asked for as stages plan them)
+    staging: tuple[SealedPlan, HostTiers] | None = None
+    staged: set[int] = field(default_factory=set)
 
     def __post_init__(self) -> None:
         self.numbers = {region.index: i for i, region in enumerate(self.blocks)}
@@ -2031,11 +2035,19 @@ class PlaneBackend:
             elif tiers is not None:
                 held = tiers.ask(key, digest)
             sealed = held is not None and plane.is_sealed(held)
+            # A layout staged in part: its holes copy from the verified object files.
+            files = (
+                tiers.files(layout.sealed, _objects(plan))
+                if sealed and tiers is not None and tiers.files
+                else []
+            )
             try:
                 if sealed:
                     assert held is not None
-                    # The machine's: no store, no lease, no fill here, ever.
-                    ws = weights.plane.register_sealed(key, plan, ids, held)
+                    # The machine's: no store, no lease, no fill here, ever. (`files` only
+                    # when there are any: an older TensorFS takes no such argument.)
+                    handed: dict[str, Any] = {"files": files} if files else {}
+                    ws = weights.plane.register_sealed(key, plan, ids, held, **handed)
                 else:
                     ws = weights.plane.register(
                         key, self._source(name, checkpoint), plan, ids, host_fd=held
@@ -2047,6 +2059,8 @@ class PlaneBackend:
             finally:
                 if held is not None:
                     os.close(held)  # the plane reopened its own description
+                for _, _, fd in files:
+                    os.close(fd)  # the plane duplicated each
             if ws is None:
                 held, sealed = None, False
                 ws = weights.plane.register(key, self._source(name, checkpoint), plan, ids)
@@ -2114,6 +2128,9 @@ class PlaneBackend:
                 fine=None if fine else _fine(root),
             ),
             fine=fine,
+            staging=(layout.sealed, tiers)
+            if sealed and tiers is not None and tiers.stage
+            else None,
         )
         for region in regions:
             for table, attr, standin in region.unbound:
@@ -2149,6 +2166,11 @@ class HostTiers:
     seal: Callable[[SealedPlan], int | None] | None = None
     #: start the machine filling every component's layout at once (`SealedPrefetch`)
     prefetch: Callable[[list[SealedPlan]], None] | None = None
+    #: stage more regions of a layout staged in part (`SealedStage`): those staged or staging
+    stage: Callable[[SealedPlan, list[int]], list[int]] | None = None
+    #: the verified object files behind a plan, `(sha256, length, fd)` per object of the list
+    #: given (the plan's, in SHA-256 order; `ObjectFiles`)
+    files: Callable[[SealedPlan, list[tuple[str, int]]], list[tuple[str, int, int]]] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -2931,6 +2953,8 @@ class WeightResidency:
                 )
             except self._shortfall_error as exc:
                 raise self._shortfall(method, need, budget, str(exc)) from None
+            if streams:
+                _stage_stream(weights, component, residence, clock)
         # Every eviction so far is past: its regions leave their bindings now, before the
         # resident sets bind (a region evicted earlier and wanted again binds after this).
         weights.drain()
@@ -3373,6 +3397,35 @@ class WeightResidency:
             raise ResidencyRefusal(
                 "residency_poisoned", f"{what}() against a poisoned weight plane: {self.poisoned}"
             )
+
+
+def _objects(plan: ReadPlan) -> list[tuple[str, int]]:
+    """The objects `plan` reads, `(sha256 hex, length)` in SHA-256 order."""
+    found = {
+        item["object"].removeprefix("sha256:"): item["object_length"]
+        for item in plan.items()
+        if item.get("source") == "object"
+    }
+    return sorted(found.items())
+
+
+def _stage_stream(
+    weights: Weights, component: Component, residence: weight_policy.Residence, clock: int
+) -> None:
+    """The blocks a stage streams every step get the machine's sealed, pinned host copy: ask
+    it to stage those it lacks (a layout staged in part), then pin what it staged. What it
+    cannot stage keeps streaming from the object files through the plane's staging buffers."""
+    if component.staging is None:
+        return  # a whole layout: pinned at registration, inside the pinned budget
+    plan, tiers = component.staging
+    streamed = [component.blocks[i].index for i in residence.streamed]
+    missing = [r for r in streamed if r not in component.staged]
+    if missing and tiers.stage is not None:
+        component.staged.update(tiers.stage(plan, missing))
+    streamed = [r for r in streamed if r in component.staged]
+    if streamed and not weights.host_only:
+        with suppress(plane.error("Shortfall"), plane.error("BelowFloor")):
+            weights.plane.want(component.ws, plane.PINNED, streamed, priority=clock)
 
 
 def _paid(

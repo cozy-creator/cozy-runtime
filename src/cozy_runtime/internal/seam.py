@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import array
 import contextlib
+import fcntl
 import json
 import os
 import socket
@@ -169,6 +170,24 @@ class Channel:
         try:
             _require_memfd(received)
         except SeamError:
+            os.close(received)
+            raise
+        return received
+
+    def recv_file(self) -> int:
+        """Receive exactly one read-only regular file (a verified object file the machine
+        hands over); anything else is closed and refused."""
+        received = self._recv_fd()
+        try:
+            info = os.fstat(received)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or fcntl.fcntl(received, fcntl.F_GETFL) & os.O_ACCMODE
+            ):
+                raise SeamError(
+                    "seam_descriptor", "an object file must be a read-only regular file"
+                )
+        except BaseException:
             os.close(received)
             raise
         return received

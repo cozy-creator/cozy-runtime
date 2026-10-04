@@ -219,6 +219,32 @@ class SealedTier(_Request, frozen=True, kw_only=True, tag="sealed_tier"):
     length: Annotated[int, msgspec.Meta(ge=0)]
     #: the plan's memfd; never on the wire
     memfd: int = -1
+    #: The regions to stage (`host_tiers.staged/1`): the rest are holes this executor reads
+    #: from the object files (`ObjectFiles`). Unset: every region (older executors).
+    stage_regions: tuple[int, ...] | UnsetType = UNSET
+
+
+class SealedStage(_Request, frozen=True, kw_only=True, tag="sealed_stage"):
+    """More of a layout staged in part: the regions this executor now streams every step (its
+    plan in a sealed memfd after the request). `Staged` names those staged or staging; the
+    rest stay holes, read from the object files."""
+
+    sha256: str
+    length: Annotated[int, msgspec.Meta(ge=0)]
+    stage_regions: tuple[int, ...] = ()
+    #: the plan's memfd; never on the wire
+    memfd: int = -1
+
+
+class ObjectFiles(_Request, frozen=True, kw_only=True, tag="object_files"):
+    """The verified object files behind a plan (in a sealed memfd after the request), for the
+    holes of its layout: one read-only fd per object follows `ObjectFilesAnswer`, in SHA-256
+    order of the plan's objects."""
+
+    sha256: str
+    length: Annotated[int, msgspec.Meta(ge=0)]
+    #: the plan's memfd; never on the wire
+    memfd: int = -1
 
 
 class ModelSource(_Request, frozen=True, kw_only=True, tag="model_source"):
@@ -283,6 +309,8 @@ type _Tagged = (
     | DeviceTier
     | SealedTier
     | SealedPrefetch
+    | SealedStage
+    | ObjectFiles
     | ModelSource
     | BudgetCell
     | StageEnter
@@ -342,6 +370,22 @@ class SourceBytes(Tier, frozen=True, kw_only=True):
 
     sha256: str = ""
     length: Annotated[int, msgspec.Meta(ge=0)] = 0
+
+
+class Staged(Answer, frozen=True, kw_only=True):
+    """The machine's answer to `SealedStage`: the regions staged or staging."""
+
+    staged: tuple[int, ...] = ()
+
+
+class ObjectFilesAnswer(Answer, frozen=True, kw_only=True):
+    """The machine's answer to `ObjectFiles`: the read-only fds follow, one per object of the
+    plan in SHA-256 order. The list itself would not fit a control frame (SDXL's UNet: about
+    1,700 objects), so the answer names its digest: SHA-256 of `<sha256>:<length>\n` lines."""
+
+    objects_sha256: str = ""
+    #: the fds that followed the answer; never on the wire
+    fds: tuple[int, ...] = ()
 
 
 class DeviceTierAnswer(Answer, frozen=True, kw_only=True):
