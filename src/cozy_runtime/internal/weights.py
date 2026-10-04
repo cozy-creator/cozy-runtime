@@ -3411,8 +3411,8 @@ class WeightResidency:
         """An image VAE's decode mode, decided before the call from what is free plus what the
         plane may unmap: untiled when its measured activations fit, else tiled with the tile
         clamped to what is free. A size never measured at or above runs untiled (reviewed
-        pure operators may recover OOM), sized by the largest size measured below it: a fixed cost makes small
-        decodes' per-pixel peaks overstate large ones.
+        pure operators may recover OOM), sized by the largest size measured below it: a
+        fixed cost makes small decodes' per-pixel peaks overstate large ones.
         The mode is selected before the first decode. A decode has no generic rollback
         contract for module/input/random state, so capacity failures retire it instead
         of replaying it at a different tile size. The mode is recorded in the outputs."""
