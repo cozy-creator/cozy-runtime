@@ -56,7 +56,8 @@ def partition(root: Module, limit: int | None = None) -> BlockLayout | None:
     """Use declared indivisible blocks; never guess an arbitrary ModuleList's semantics.
 
     With `limit`, the units are instead the largest module subtrees of at most `limit` bytes
-    anywhere in the component (a single larger leaf stays whole). The weights of the modules
+    anywhere in the component (a single larger leaf stays whole, and so does a LoRA'd linear
+    with its factors: they are baked into it when its bytes are placed). The weights of the modules
     that had to be split stay in `common`, and so does a subtree under `limit // SMALL`: a
     region costs 2 MiB of the budget however little it holds, and weights that small (norm
     scales) are what fused kernels read without calling their module. That is the sub-block
@@ -127,7 +128,8 @@ def _split(root: Module, path: str, limit: int) -> list[str]:
         for name, child in module.named_children()
         if next(_tensors(child), None) is not None
     ]
-    if not children or (path and _bytes(module) <= limit and not _container(module)):
+    whole = _bytes(module) <= limit or hasattr(module, "lora_A")
+    if not children or (path and whole and not _container(module)):
         return [path] if _bytes(module) >= limit // SMALL else []
     return [unit for child in children for unit in _split(root, child, limit)]
 

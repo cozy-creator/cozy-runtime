@@ -34,8 +34,10 @@ TURBO_BANK = "turbo"
 LORA_FAMILIES = ("to_q", "to_k", "to_v", "to_out.0", "ff.net.0.proj", "ff.net.2")
 #: The family the producer bakes into the turbo tables; refused on the overlay by name.
 TABLED_FAMILY = "adaln_proj.linear"
-#: Bound the rounded up-projection transient while retaining the original input precision.
-_LORA_ROW_CHUNK = 256
+#: Rows per LoRA GEMM. Fixed, so a row's update never depends on how many rows a rank holds
+#: (Ulysses), and large enough that kernel launches stop mattering (cozy-machine #26: 256-row
+#: chunks cost 7.6% of a dense step on an RTX PRO 6000, one GEMM pair per site 3.3%).
+_LORA_ROW_CHUNK = 4096
 #: Fix the FP32 projection's GEMM shape across Ulysses sequence partitions.
 _HEAD_ROW_CHUNK = 1024
 
@@ -50,41 +52,56 @@ class LoRAFactors(nn.Module):  # type: ignore[misc]
         self.scale = scale
 
     def accumulate(self, x: torch.Tensor, out: torch.Tensor) -> None:
-        """Preserve the reference's BF16 update rounding, with bounded row chunks."""
+        """`out += scale * (x @ down.T) @ up.T` in fixed row chunks: the up projection adds
+        into the base output in place (one rounding, no `[rows, out]` update), and only the
+        tail chunk, padded to the same row count, goes through a temporary."""
         if not isinstance(x, torch.Tensor):
             raise ValueError("a LoRA update requires the original tensor operand")
         if not out.is_contiguous():
             raise ValueError("a LoRA update accumulates into a contiguous base output only")
         flat = out.view(-1, out.shape[-1])
         inputs = x.reshape(-1, x.shape[-1])
-        for start in range(0, int(inputs.shape[0]), _LORA_ROW_CHUNK):
-            rows = inputs[start : start + _LORA_ROW_CHUNK].contiguous()
-            count = rows.shape[0]
-            # Ulysses changes tail lengths. Keep both GEMM row dimensions fixed so
-            # that tail kernel selection cannot change BF16 update rounding.
-            if count < _LORA_ROW_CHUNK:
-                rows = F.pad(rows, (0, 0, 0, _LORA_ROW_CHUNK - count))
-            partial = F.linear(rows, self.lora_down.to(rows.dtype))
-            update = F.linear(partial, self.lora_up.to(rows.dtype)).to(flat.dtype)
-            # addmm_ fuses the up projection and sum, skipping the BF16 update's
-            # rounding. Chunked linear + add_ matches the released adapter.
-            flat[start : start + count].add_(self.scale * update[:count])
+        down = self.lora_down.to(inputs.dtype)
+        up = self.lora_up.to(flat.dtype).t()
+        total = int(inputs.shape[0])
+        for start in range(0, total, _LORA_ROW_CHUNK):
+            count = min(_LORA_ROW_CHUNK, total - start)
+            rows = inputs[start : start + count]
+            if count == _LORA_ROW_CHUNK:
+                low = F.linear(rows, down).to(flat.dtype)
+                flat[start : start + count].addmm_(low, up, alpha=self.scale)
+                continue
+            pad = _LORA_ROW_CHUNK - count
+            low = F.linear(F.pad(rows, (0, 0, 0, pad)), down).to(flat.dtype)
+            tail = F.pad(flat[start:], (0, 0, 0, pad)).addmm_(low, up, alpha=self.scale)
+            flat[start:].copy_(tail[:count])
 
 
 class _LoRAHook:
-    """A permanent consumer hook, inactive for base forwards."""
+    """A permanent consumer hook, inactive for base forwards. The weight plane bakes the armed
+    overlay's factors into the site's resident bytes (`weights.LoRASource`) and the hook then
+    adds nothing; a base forward or another overlay finds those bytes refilled first."""
 
-    __slots__ = ("owner", "path")
+    __slots__ = ("_cozy_baked", "owner", "path")
 
     def __init__(self, owner: Any, path: str) -> None:
         self.owner = owner
         self.path = path
+        self._cozy_baked = False
 
     def __call__(self, module: nn.Module, args: tuple[Any, ...], out: torch.Tensor) -> None:
         del module
         armed = self.owner._arming
-        if armed is not None:
+        if armed is not None and not self._cozy_baked:
             armed.overlay.get_submodule(self.path).accumulate(args[0], out)
+
+    def lora_factors(self) -> tuple[object, torch.Tensor, torch.Tensor, float] | None:
+        """The armed overlay's factors for this site, or None in a base forward."""
+        armed = self.owner._arming
+        if armed is None:
+            return None
+        factors = armed.overlay.get_submodule(self.path)
+        return factors, factors.lora_down, factors.lora_up, float(factors.scale)
 
 
 class _Site(nn.Module):  # type: ignore[misc]

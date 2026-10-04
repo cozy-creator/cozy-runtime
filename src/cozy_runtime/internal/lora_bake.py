@@ -23,8 +23,9 @@ ROUNDINGS: tuple[Rounding, ...] = ("nearest", "stochastic", "feedback")
 #: off the old grid so every element rounds afresh.
 Grid = Literal["keep", "refit", "regrid"]
 GRIDS: tuple[Grid, ...] = ("keep", "refit", "regrid")
-#: Elements decoded at once: 64 MiB of f32.
-CHUNK_ELEMENTS = 1 << 24
+#: Elements decoded at once (8 MiB of f32): a bake's working memory stays well below a
+#: block's activations, so it runs inside the room a stage already has.
+CHUNK_ELEMENTS = 1 << 21
 #: Columns an error-feedback run carries its rounding error across (an mxfp8 block).
 FEEDBACK_RUN = MX_BLOCK
 ROW_SCALE_FLOOR = 1e-12
