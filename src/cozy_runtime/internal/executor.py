@@ -2511,12 +2511,17 @@ class Executor:
             child = self._construction_child(self.construction)
             child._group_parent = self
             reply = child._prepare_first(
-                Load(
+                # The command with one model in place of its set: everything the machine said
+                # about the load holds for each model (a field named one by one here was
+                # dropped twice: `model_sources`, then `device_weights`, so a construction
+                # of two models never attached the machine's GPU weights).
+                msgspec.structs.replace(
+                    command,
                     construction=self.construction,
                     binding=binding,
                     budgets=row.budgets,
-                    devices=command.devices,
-                    authorized_device_limit_bytes=authorized,
+                    models=UNSET,
+                    group=UNSET,
                     attention_pin=aggregate_pin
                     if attention.for_model(aggregate_pin, binding.parameter_names())
                     else "",
@@ -2524,13 +2529,6 @@ class Executor:
                     if self.world > 1
                     else UNSET,
                     sequence_parallel_degree=max(self.world, 1),
-                    host_tier=command.host_tier,
-                    pinned_bytes=command.pinned_bytes,
-                    sealed_tiers=command.sealed_tiers,
-                    model_sources=command.model_sources,
-                    staged_tiers=command.staged_tiers,
-                    cap_bytes=command.cap_bytes,
-                    rank_caps=command.rank_caps,
                 ),
                 optional_attention_scope=True,
             )
