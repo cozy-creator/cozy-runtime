@@ -53,11 +53,11 @@ testpaths = ["tests"]
 addopts = "-q -p no:cacheprovider"
 
 [build-system]
-# ONE package, three wheel files per release. The in-tree shim delegates to
+# ONE package, two wheel files per release. The in-tree shim delegates to
 # hatchling — the toolchain-free default producing the py3-none-any wheel and the sdist —
 # and, only when COZY_RUNTIME_BUILD_KERNELS=1, to scikit-build-core, which compiles
 # `native/` into `cozy_runtime/_kernels/_C.abi3.so` and tags the wheel cp312-abi3.
-# The release publisher adds the Go executable to that wheel and the ARM64 wheel.
+# `task machine` adds the pinned cozy-machine executable to that wheel.
 requires = ["hatchling"]
 build-backend = "dual_build_backend"
 backend-path = ["scripts"]

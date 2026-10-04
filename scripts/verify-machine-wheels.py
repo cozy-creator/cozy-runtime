@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import platform
+import re
 import subprocess
 import tempfile
 from email.parser import BytesParser
@@ -36,7 +37,6 @@ def main() -> None:
     expected = {
         "py3-none-any": None,
         "cp312-abi3-manylinux_2_28_x86_64": 62,
-        "py3-none-manylinux_2_17_aarch64": 183,
     }
     assert {w.name for w in wheels} == {f"cozy_runtime-{version}-{tag}.whl" for tag in expected}, (
         "missing or unexpected platform wheels"
@@ -68,6 +68,9 @@ def main() -> None:
             binary = archive.read(installed_command)
             assert binary[:6] == b"\x7fELF\x02\x01", "expected a 64-bit little-endian ELF"
             assert int.from_bytes(binary[18:20], "little") == architecture
+            # The wheel's tag promises glibc 2.28: the machine may need no newer symbol version.
+            glibc = max((int(a), int(b)) for a, b in re.findall(rb"GLIBC_(\d+)\.(\d+)", binary))
+            assert glibc <= (2, 28), f"cozy-machine needs glibc {glibc[0]}.{glibc[1]}"
             binaries[str(tag)] = binary
 
     for minor in (12, 13, 14):
@@ -77,7 +80,7 @@ def main() -> None:
                 "cp312-abi3-manylinux_2_28_x86_64",
             ),
             (["manylinux_2_17_x86_64"], "py3-none-any"),
-            (["manylinux_2_17_aarch64"], "py3-none-manylinux_2_17_aarch64"),
+            (["manylinux_2_28_aarch64"], "py3-none-any"),
             (["win_amd64"], "py3-none-any"),
             (["macosx_14_0_arm64"], "py3-none-any"),
             (["musllinux_1_2_x86_64"], "py3-none-any"),
@@ -115,7 +118,9 @@ def main() -> None:
         command = venv / "bin/cozy-machine"
         assert command.read_bytes() == binaries["cp312-abi3-manylinux_2_28_x86_64"]
         identity = json.loads(run(str(command), "version", "--json"))
-        assert identity["name"] == "cozy-machine" and identity["version"] == version
+        pin = (Path(__file__).resolve().parents[1] / "cozy-machine.tag").read_text().strip()
+        assert identity["name"] == "cozy-machine" and "cozy.machine.v1" in identity["api"]
+        assert "v" + identity["version"] == pin, f"bundled {identity['version']}, pinned {pin}"
         run("uv", "pip", "uninstall", "--python", python, "cozy-runtime")
         assert not command.exists(), "uninstall must remove the owned command"
     print(f"{version}: RECORDs, ELF platforms, modes, selection, installs and uninstall verified")
