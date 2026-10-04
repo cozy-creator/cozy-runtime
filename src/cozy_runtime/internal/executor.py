@@ -3543,9 +3543,9 @@ class Executor:
         from cozy_runtime.internal.fill import store_available
 
         tensorfs_source = tensorfs_output = tensorfs_adopt = None
-        # A plane-only TensorFS (Rust-machine executors) carries no derived storage: a job
-        # that reads or writes weights there is refused by the capability itself.
-        if store_available():
+        # Weights go through the owner's writer channels: the Rust machine's (`weights`), or the
+        # Python worker's where this process's TensorFS opens a store.
+        if command.weights or store_available():
             from cozy_runtime.internal.weights_writer import ExecutionStorage
 
             execution_storage = ExecutionStorage(

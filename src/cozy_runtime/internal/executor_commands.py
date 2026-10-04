@@ -417,6 +417,9 @@ class RunJob(_Run, frozen=True, kw_only=True, tag="run_job"):
     call_interfaces: tuple[CallInterface, ...] = ()
     publish_to: str = ""
     budget: JobBudget = JobBudget()
+    #: The owner answers `weights_writer` (the Rust machine): weights go through it even
+    #: where this process's TensorFS opens no store.
+    weights: bool = False
 
 
 type KnownCommand = (
