@@ -468,7 +468,12 @@ class Weights:
         growth = max(self.activation.get(method, 0) - slack, 0)
         # the bound weights' decoded copies are the weights' own, in torch's bytes
         held = committed + self.decoded()
-        return weight_policy.plane_budget(self.headroom(memory) + held, growth)
+        available = self.headroom(memory) + held
+        # Activations first, but never below the open stages' floor while that fits: an
+        # estimate (a seed for an untiled decode, say) that left a stage no room for its own
+        # weights would refuse it for size. An adaptive stage then tiles; any other recovers
+        # from its out-of-memory by unmapping.
+        return max(weight_policy.plane_budget(available, growth), min(self.floor(), available))
 
     def decoded(self) -> int:
         """Device bytes the bound regions' decoded copies hold now."""
@@ -2498,7 +2503,7 @@ class WeightResidency:
 
     # -- the stage
 
-    def _plan(self, budget: int, resume: Mapping[str, int] = {}) -> None:
+    def _plan(self, budget: int, resume: Mapping[str, int] = {}, asked: bool = False) -> None:
         """Place every open stage's components inside `budget`: each resident set wanted, the
         rest streamed by a cursor in the blocks' execution order (from `resume[weight set]`
         when a block boundary re-plans mid-pass). Before a component's order is observed its
@@ -2556,7 +2561,12 @@ class WeightResidency:
                 paid = stage(layouts)
         except weight_policy.BelowFloor as exc:
             if exc.component in opened and opened[exc.component][0]._refine(exc.component):
-                return self._plan(budget, resume)
+                return self._plan(budget, resume, asked)
+            if not asked and weights.room is not None and weights.cap >= 0:
+                # Never refused for size while the GPU has room to give: the owner makes it
+                # (idle tenants leave, held weights nobody reads are revoked) and raises the cap.
+                weights.room(max(exc.needed - exc.available, 0) + weight_policy.MARGIN)
+                return self._plan(max(budget, weights.driver_budget(method)), resume, True)
             raise self._shortfall(method, exc.needed, exc.available, str(exc)) from None
         # A budget that only fits one block at a time streams with no overlap: regions of at
         # most 16 MiB let it hold a window of several. (Window 1 chosen when two fit stays.)

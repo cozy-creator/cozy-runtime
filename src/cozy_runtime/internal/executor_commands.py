@@ -365,6 +365,10 @@ class Invoke(_Run, frozen=True, kw_only=True, tag="invoke"):
     #: Activation growth per stage method the owner measured for this request's shape in
     #: earlier processes: a floor under this executor's own estimates, never a cap
     activation_bytes: dict[str, int] = {}
+    #: The owner's Degree 2 for this attempt (`weights.attach/1`): True keeps GPU weights
+    #: with the machine (attached, and offered at each stage's exit), False keeps them private
+    #: (they stream); unset leaves the executor's current setting.
+    device_weights: bool | UnsetType = UNSET
     #: Read only by executors before the weight plane.
     placement: str = "all_resident"
     headroom_bytes: int = 0
