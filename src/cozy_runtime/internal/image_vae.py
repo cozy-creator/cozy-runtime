@@ -170,7 +170,10 @@ def geometry(root: object) -> Geometry | None:
             output = batch * int(kl.config.out_channels) * height * width * element
             if peak <= 0 or output <= 0:
                 return None
-            retained = latent + 2 * output
+            # Default overlap retains up to~1.78 full outputs in decoded rows,
+            # alongside concatenated result rows and final output. Whole-batch
+            # allowance also covers previously sliced images awaiting concatenation.
+            retained = latent + 4 * output
             return DecodeEstimate(peak + retained, retained)
         except (AttributeError, TypeError, ValueError, OverflowError):
             # Family recognition also admits subclasses with a different decoder.

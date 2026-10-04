@@ -180,8 +180,8 @@ def test_cold_estimate_follows_real_upsample_channels_dtype_and_batch_slicing():
     single = geometry.decode_estimate((1, 4, 128, 128), 2)
     assert single is not None
     # The last upsampler still has256 channels at1024 square, larger than final128.
-    assert single.peak == (3 * 256 * 1024 * 1024 + 2 * 3 * 1024 * 1024 + 4 * 128 * 128) * 2
-    assert single.retained == (2 * 3 * 1024 * 1024 + 4 * 128 * 128) * 2
+    assert single.peak == (3 * 256 * 1024 * 1024 + 4 * 3 * 1024 * 1024 + 4 * 128 * 128) * 2
+    assert single.retained == (4 * 3 * 1024 * 1024 + 4 * 128 * 128) * 2
     doubled = geometry.decode_estimate((2, 4, 128, 128), 2)
     assert doubled is not None and doubled.peak == single.peak * 2
     vae.enable_slicing()
