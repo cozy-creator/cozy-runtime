@@ -160,3 +160,46 @@ releases remaining free roots. Classification: PLAUSIBLE SOURCE+GPU-consistent
 UVM batch cache. No PMM trace or physical eviction test ran, so actual cache
 reclamation and full physical restoration remain unqualified. Module settings
 were only read. Evidence: uvm-module-readonly.json and UVM-CACHE-INFERENCE.json.
+
+## Next source and CPU gate
+
+The small managed pool works, but stock MemPool cannot distinguish host-backed
+logical bytes from ordinary physical bytes at its guard. No supported per-pool
+fraction API has been established. Do not proceed by raising the per-device
+fraction around a scope: allocations on another thread could still use the
+ordinary pool, so that would not preserve its protection.
+
+A potential alternative is exact activation streaming between native operators,
+using the [documented Torch dispatch extension](https://docs.pytorch.org/docs/2.14/notes/extending.html).
+An owned activation wrapper would preserve its original logical CUDA metadata
+while retaining complete host backing. Before each original native operator,
+materialize only its required operands under the existing physical cap; afterward
+offload newly derived outputs and release their device storage when stream work
+and readers are complete. Model/parameter sources remain ordinary TensorFS/D2
+allocations. Views and aliases must retain the same owner and mutation semantics.
+This is a proposed mechanism, not an implemented or qualified alternative.
+
+The next CPU gate should inspect the actual selected VAE configuration and run
+metadata-only analysis at full [1,4,128,128] latent shape to enumerate operators,
+aliases, live input/output bytes and full normalization/attention domains. Native
+temporary/workspace bounds require separate evidence; a geometry estimate alone
+does not establish them. Preserve the exact scale/BF16 math, original decoder
+control flow and one forward. If a native operator cannot fit, a reviewed exact
+layer-streaming implementation must preserve full-image normalization statistics,
+full attention K/V and convolution halos. Never return CPU metadata to model code
+where the original tensor was CUDA, crop global context or silently choose tiling.
+
+Externally managed storage remains another research route, with an explicit
+interop gate. [PyTorch DLPack](https://docs.pytorch.org/docs/2.14/dlpack.html)
+supports shared external storage, but the
+[exact installed converter](https://raw.githubusercontent.com/pytorch/pytorch/08187d9e0fba026dc8217405802ab5381dc88d90/aten/src/ATen/DLConvertor.cpp)
+does not accept DLPack's dedicated managed-memory device tag. Do not silently
+relabel a producer's memory to get past that boundary. Nor assume that an ATen
+out variant removes temporary allocations: the
+[exact out code generator](https://raw.githubusercontent.com/pytorch/pytorch/08187d9e0fba026dc8217405802ab5381dc88d90/torchgen/native_function_generation.py)
+implements generated out variants by computing a functional temporary then
+copying it. Any public external-storage route must prove truthful device typing,
+ownership/stream cleanup and native temporary bounds before a full GPU decode.
+
+Only this source/CPU assessment is proposed next. Full-decode GPU execution and
+product implementation require another concrete review; phases 2–3 do not grant it.
