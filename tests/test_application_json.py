@@ -1,9 +1,19 @@
 from __future__ import annotations
 
+import msgspec
 import pytest
 
 from cozy_runtime import canonical_json
 from cozy_runtime.internal import application_json
+
+
+class SpoolRequest(msgspec.Struct):
+    pass
+
+
+class SpoolValue(msgspec.Struct):
+    seed: int
+    number: int | float
 
 
 def test_application_values_preserve_unsigned_seeds_number_kind_and_array_order() -> None:
@@ -35,3 +45,24 @@ def test_application_values_keep_strict_structural_and_finite_number_bounds() ->
     for bad in (b'{"a":1,"a":2}', b"{} {}", b'{"a":1e999}', b"[" * 34 + b"0" + b"]" * 34):
         with pytest.raises(ValueError):
             application_json.decode(bad)
+
+
+def test_typed_job_result_spool_preserves_exact_seed_and_float_kind(tmp_path) -> None:
+    import math
+
+    from cozy_runtime.author import App, Invocation, attempt
+    from cozy_runtime.internal.executor import _serialize_result
+
+    app = App()
+
+    @app.job
+    def echo(payload: SpoolRequest) -> SpoolValue:
+        return SpoolValue((1 << 64) - 1, 1.0)
+
+    spool = tmp_path / "spool"
+    result, outcome, _ = attempt(app.get("echo"), {}, Invocation("seed-proof", spool, math.inf))
+    assert outcome.terminal == "succeeded", outcome
+    reference, outputs, oversize = _serialize_result(result, spool)
+    assert reference is not None and not outputs and oversize == 0
+    decoded = application_json.decode((spool / "result.canonical").read_bytes())
+    assert decoded["seed"] == (1 << 64) - 1 and type(decoded["number"]) is float
