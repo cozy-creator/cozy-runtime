@@ -501,7 +501,24 @@ class Weights:
         # estimate (a seed for an untiled decode, say) that left a stage no room for its own
         # weights would refuse it for size. An adaptive stage then tiles; any other recovers
         # from its out-of-memory by unmapping.
-        return max(weight_policy.plane_budget(available, growth), min(self.floor(), available))
+        return max(weight_policy.plane_budget(available, growth), min(self.window(), available))
+
+    def window(self) -> int:
+        """What the open stages stream in at least: each component's common weights and two
+        of its largest regions (one in use, the next arriving), at its current grain."""
+        return sum(c.planned.common + 2 * c.planned.largest for _, _, c in self.opened().values())
+
+    def grow(self, need: int) -> bool:
+        """The plane refused a region for its own budget while the device has room: map
+        `need` more (up to what is free above the floor and inside the cap) instead of
+        unmapping. False when the device has no such room."""
+        if self.host_only:
+            return False
+        free = self.headroom(accel.allocation(self.torch, self.kind))
+        if free < need + weight_policy.MARGIN:
+            return False
+        self._apply(self.applied + need + weight_policy.MARGIN)
+        return True
 
     def decoded(self) -> int:
         """Device bytes the bound regions' decoded copies hold now."""
@@ -2884,16 +2901,20 @@ class WeightResidency:
             versions = _versions(args, kwargs)
             # a library's refusal is answered once: by its op where ops recover one by one
             refused = weights.grouped or region.mutates is not False
+            grown = False
             while True:
                 stream = weights.stream()
                 try:
                     lease = self._acquire(component, region.index, stream)
                 except self._capacity:
-                    self._make_room(
-                        region.span,
-                        {component.key: region.index},
-                        f"{component.name}.{region.path}",
-                    )
+                    # the plane's own budget first, while the device has room for it
+                    grown = not grown and weights.grow(region.span)
+                    if not grown:
+                        self._make_room(
+                            region.span,
+                            {component.key: region.index},
+                            f"{component.name}.{region.path}",
+                        )
                     continue
                 need = 0
                 try:
@@ -2955,10 +2976,14 @@ class WeightResidency:
     def _lease(self, component: Component, region: Region, op: str) -> Lease:
         """A region's lease for an op that reads it outside its forward (`Weights.reading`)."""
         weights = self.weights
+        grown = False
         while True:
             try:
                 return self._acquire(component, region.index, weights.stream())
             except self._capacity:
+                grown = not grown and weights.grow(region.span)
+                if grown:
+                    continue
                 if weights.running:
                     raise self._shortfall(
                         weights.open[-1][1],
