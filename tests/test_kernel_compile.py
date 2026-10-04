@@ -13,9 +13,11 @@ import os
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 import zipfile
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -74,7 +76,7 @@ def test_a_wheel_artifact_is_built_once_published_whole_and_read_after(tmp_path:
     assert (site / "tiny_extra.py").exists()  # .data/purelib folds into the root
     assert not list((tmp_path / "u1" / job.key.kernel).glob(".tmp-*"))
     assert kernel_compile.submit(store, job).state == "ready"
-    kernel_compile._STARTED[job.key.digest].wait()
+    kernel_compile._STARTED[job.key.digest][0].wait()
     assert store.state(job.key) is None  # the builder's word ends with it
 
 
@@ -118,7 +120,7 @@ def test_a_failure_is_this_boots_and_the_next_boot_retries(
     fresh.mkdir()
     monkeypatch.setenv("TMPDIR", str(fresh))
     monkeypatch.setattr("tempfile.tempdir", None)
-    kernel_compile._STARTED[job.key.digest].wait()  # its lock frees as it exits
+    kernel_compile._STARTED[job.key.digest][0].wait()  # its lock frees as it exits
     assert kernel_compile.status(store, job).state == "pending"
 
 
@@ -188,24 +190,17 @@ def test_learned_artifacts_are_this_machines_and_replay_as_the_same_jobs(tmp_pat
 
 
 def test_the_machines_ordered_builds_are_every_executors(tmp_path: Path) -> None:
-    """The worker claims its boot builds at once and runs them in its order; an executor in
+    """The machine claims its boot builds at once and runs them in its order; an executor in
     its own namespace sees each as compiling while it waits its turn, starts none of its own,
-    and reads it from the worker's namespace once built."""
+    and reads it from the machine's namespace once built."""
     root = _registry(tmp_path / "sources")
     worker = kernel_cache.Store(tmp_path / "u0")
     executor = kernel_cache.Store(tmp_path / "u64001", tmp_path / "u0")
     job = kernel_sources.job(kernel_sources.PYTHON, 89, root)
     finished: list[tuple[str, str]] = []
-    gate = worker.claim(job.key)  # a build ahead of it in the machine's order
-    assert gate is not None
-    os.close(gate)
-    thread = kernel_compile.in_order(
-        worker,
-        [job],
-        dict(os.environ),
-        lambda done, state: finished.append((done.key.kernel, state.state)),
+    kernel_compile.in_order(
+        worker, [job], lambda done, state: finished.append((done.key.kernel, state.state))
     )
-    thread.join()
     assert finished == [("kernel-python", "ready")]
     assert kernel_compile.submit(executor, job).state == "ready"
     assert (
@@ -227,7 +222,7 @@ def test_an_executor_waits_on_the_machines_claim_and_builds_nothing(tmp_path: Pa
         started = dict(kernel_compile._STARTED)
         state = kernel_compile.submit(executor, job)
         assert state.state == "compiling" and state.detail == "queued", state
-        assert kernel_compile._STARTED == started  # no builder of its own
+        assert started == kernel_compile._STARTED  # no builder of its own
     finally:
         os.close(held)
     assert kernel_compile.status(executor, job).state == "pending"  # the machine's claim ended
@@ -237,3 +232,56 @@ def test_a_wide_build_is_as_wide_as_the_cpus_and_memory_this_process_may_use() -
     cpus = len(os.sched_getaffinity(0))
     assert 1 <= kernel_compile.width(1) <= cpus
     assert kernel_compile.width(1 << 60) == 1  # no memory for even one more: still builds
+
+
+def _held(store: kernel_cache.Store, job: kernel_compile.Job, builder: str) -> tuple[int, Any]:
+    """A live build of `job` that is not this process's: its lock held, its word a real
+    process running `builder`."""
+    lock = store.claim(job.key)
+    assert lock is not None
+    process = subprocess.Popen([sys.executable, "-c", builder])
+    store.set_state(job.key, {"pid": process.pid, "progress": 0.25, "phase": "compiling"})
+    return lock, process
+
+
+def test_a_consumer_waits_for_a_live_build_while_it_moves_and_takes_what_it_built(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The wait outlasts many noise floors while the builder moves bytes, reports what it
+    reads, and returns the artifact: built here once the other builder ended without one."""
+    root = _registry(tmp_path / "sources")
+    store = kernel_cache.Store(tmp_path / "u1")
+    job = kernel_sources.job(kernel_sources.PYTHON, 89, root)
+    monkeypatch.setattr(liveness, "SAMPLE_SECONDS", 0.05)
+    monkeypatch.setattr(kernel_compile, "POLL_SECONDS", 0.01)
+    told: list[kernel_compile.State] = []
+    monkeypatch.setattr(kernel_compile, "waiting", told.append)
+    moving = "import os, time\nfor _ in range(75): os.write(2, b'.'); time.sleep(0.02)"
+    lock, builder = _held(store, job, moving)
+    threading.Timer(1.5, os.close, [lock]).start()  # five noise floors
+    started = time.monotonic()
+    state = kernel_compile.wait(store, job)
+    assert state.state == "ready" and time.monotonic() - started >= 1.5, state
+    assert told and {row.state for row in told} == {"compiling"} and told[0].progress == 0.25
+    assert builder.wait() == 0
+
+
+def test_a_wait_on_a_build_that_stopped_ends_failed_for_this_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _registry(tmp_path / "sources")
+    store = kernel_cache.Store(tmp_path / "u1")
+    job = kernel_sources.job(kernel_sources.PYTHON, 89, root)
+    monkeypatch.setattr(liveness, "SAMPLE_SECONDS", 0.05)
+    monkeypatch.setattr(kernel_compile, "POLL_SECONDS", 0.01)
+    lock, builder = _held(store, job, "import time; time.sleep(600)")
+    try:
+        started = time.monotonic()
+        state = kernel_compile.wait(store, job)
+        assert state.state == "failed" and "compile_stalled" in state.detail, state
+        assert "no measurable progress" in state.detail and time.monotonic() - started < 60
+        assert kernel_compile.wait(store, job).state == "failed"  # nobody waits on it again
+    finally:
+        builder.kill()
+        builder.wait()
+        os.close(lock)

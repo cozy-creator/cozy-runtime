@@ -2,18 +2,19 @@
 card present, in a niced background process, and is published whole to the kernel store.
 
 `submit` never blocks and never compiles in the caller. The store holds the artifact (`ready`),
-or a live builder holds its lock (`compiling`, with the progress it reports), or this worker
-boot already failed it (`failed`, retried at the next boot only), or `submit` starts the
-builder and says `compiling`. Nothing waits on a compile: a consumer serves the best READY
-artifact and falls through otherwise.
+or a live builder holds its lock (`compiling`, with the progress it reports), or this machine
+run already failed it (`failed`, retried at the next run only), or `submit` starts the builder
+and says `compiling`. A consumer that needs the artifact `wait`s for its build and never runs
+another kernel in its place; the machine compiles the ones every card needs ahead of any
+request (`machine_kernels`).
 
 The builder is `python -m cozy_runtime.internal.kernel_compile` under the caller's own
 interpreter and import path, so an extension builds against the torch that will import it. It
 inherits the key's lock, takes one of the machine's build slots (flock files, so a dead
 builder frees its slot), runs at nice 19, and is ended only on a PROVEN wedge (`liveness`): its
 whole process tree stopped burning CPU and writing output, against its own observed pace.
-A failure is recorded in the worker boot's scratch scope (`TMPDIR`), which the next boot
-starts without.
+A failure is recorded in the machine run's scratch scope (`TMPDIR`), which the next run starts
+without.
 """
 
 from __future__ import annotations
@@ -104,9 +105,14 @@ class State:
         return row
 
 
-#: This process's builders, by key digest, so their exit is observed without a clock.
-_STARTED: dict[str, subprocess.Popen[bytes]] = {}
+#: This process's builders and their reapers, by key digest: their exit is observed without a
+#: clock, and a dead one's failure is on record before its key is read again.
+_STARTED: dict[str, tuple[subprocess.Popen[bytes], threading.Thread]] = {}
 _GUARD = threading.Lock()
+#: How often a wait reads the state it waits on: resolution, never a verdict.
+POLL_SECONDS = 0.5
+#: Told the state a wait reads, each sample: an executor reports it to its machine.
+waiting: Callable[[State], None] | None = None
 
 
 def status(store: kernel_cache.Store, job: Job) -> State:
@@ -142,57 +148,93 @@ def submit(store: kernel_cache.Store, job: Job) -> State:
     if current.state != "pending":
         return current
     with _GUARD:
-        running = _STARTED.get(job.key.digest)
-        lock = store.claim(job.key) if running is None or running.poll() is not None else None
+        process, reaper = _STARTED.get(job.key.digest) or (None, None)
+        if process is not None and reaper is not None and process.poll() is not None:
+            reaper.join()
+        lock = store.claim(job.key) if process is None or process.poll() is not None else None
         if lock is not None:
             try:
                 if store.entry(job.key) is None and _failure(job.key) is None:
                     store.set_state(job.key, None)  # a dead builder's last word, if any
-                    _STARTED[job.key.digest] = _spawn(store, job, lock)
+                    _spawn(store, job, lock)
             finally:
                 os.close(lock)
     current = status(store, job)
     return current if current.state != "pending" else State(job.key.kernel, "compiling")
 
 
+def wait(store: kernel_cache.Store, job: Job) -> State:
+    """`submit`, then its build's end: `ready`, or `failed` and why. Judged by measured progress
+    alone (`liveness`): while any build on this machine moves, the wait goes on; when they have
+    all stopped, against their own pace, it ends `failed` for this machine run, and the
+    builder's owner ends the builder by the same rule."""
+    state = submit(store, job)
+    pace, sampled = liveness.Pace(), float("-inf")
+    while state.state == "compiling":
+        now = time.monotonic()
+        if now - sampled >= liveness.SAMPLE_SECONDS:
+            sampled = now
+            if waiting is not None:
+                waiting(state)
+            pace.observe(_activity(store), now)
+            if pace.wedged(liveness.noise_floor(), now):
+                verdict = pace.verdict(liveness.noise_floor(), now)
+                _record_failure(job.key, "compile_stalled", verdict)
+                return status(store, job)
+        time.sleep(POLL_SECONDS)
+        state = submit(store, job)
+    return state
+
+
+def _activity(store: kernel_cache.Store) -> object:
+    """The meter a wait is judged by: every live build's word in this machine's store, and
+    the CPU and bytes its process tree has burned. None when no builder's burn is readable."""
+    words: list[str] = []
+    pids: set[int] = set()
+    for namespace in (store.own, store.trusted):
+        for path in sorted(namespace.glob("*/*.state.json")) if namespace is not None else ():
+            with contextlib.suppress(OSError, ValueError, AttributeError):
+                word = path.read_text()
+                pid = json.loads(word).get("pid")
+                words.append(word)
+                if type(pid) is int:
+                    pids.add(pid)
+    try:
+        tree = {member for pid in pids for member in (pid, *proctree.descendants(pid))}
+    except proctree.ProcessTreeUnsupported:
+        return None
+    burns = [burned for member in tree if (burned := liveness.burn(member)) is not None]
+    return (tuple(words), sum(burns)) if burns else None
+
+
 def in_order(
-    store: kernel_cache.Store,
-    jobs: Sequence[Job],
-    environment: Mapping[str, str],
-    done: Callable[[Job, State], None],
-) -> threading.Thread:
+    store: kernel_cache.Store, jobs: Sequence[Job], done: Callable[[Job, State], None]
+) -> None:
     """The machine's own compiles, one after another in `jobs`' order (its priority), each
     as wide as the machine. Every key nobody builds yet is claimed at once, so no executor
     on this machine starts a second build of it while it waits its turn; `done` sees each
-    one ready or failed, and at once one another process already built or builds."""
-    queued: list[tuple[Job, int]] = []
+    one ready or failed."""
+    queued: dict[str, int] = {}
     for job in jobs:
-        lock = store.claim(job.key) if store.entry(job.key) is None else None
-        if lock is None:
+        if store.entry(job.key) is not None or _failure(job.key) is not None:
             continue
-        store.set_state(job.key, {"pid": os.getpid(), "progress": 0.0, "phase": "queued"})
-        queued.append((job, lock))
-
-    def run() -> None:
-        for job in jobs:
-            held = next((lock for queued_job, lock in queued if queued_job is job), None)
-            if held is not None:
-                try:
-                    with _GUARD:
-                        _STARTED[job.key.digest] = _spawn(store, job, held, environment)
-                except OSError as exc:
-                    store.set_state(job.key, None)
-                    done(job, State(job.key.kernel, "failed", detail=f"compile_unstarted: {exc}"))
-                    continue
-                finally:
-                    os.close(held)
-            with store.building(job.key):
-                pass
-            done(job, status(store, job))
-
-    thread = threading.Thread(target=run, name="machine-kernels", daemon=True)
-    thread.start()
-    return thread
+        lock = store.claim(job.key)
+        if lock is not None:
+            store.set_state(job.key, {"pid": os.getpid(), "progress": 0.0, "phase": "queued"})
+            queued[job.key.digest] = lock
+    for job in jobs:
+        held = queued.pop(job.key.digest, None)
+        if held is not None:
+            try:
+                with _GUARD:
+                    _spawn(store, job, held)
+            except OSError as exc:
+                store.set_state(job.key, None)
+                done(job, State(job.key.kernel, "failed", detail=f"compile_unstarted: {exc}"))
+                continue
+            finally:
+                os.close(held)
+        done(job, wait(store, job))
 
 
 def learn(store: kernel_cache.Store, scope: str, job: Job) -> None:
@@ -231,12 +273,7 @@ def learned(store: kernel_cache.Store, scope: str) -> list[Job]:
     return jobs
 
 
-def _spawn(
-    store: kernel_cache.Store,
-    job: Job,
-    lock: int,
-    environment: Mapping[str, str] | None = None,
-) -> subprocess.Popen[bytes]:
+def _spawn(store: kernel_cache.Store, job: Job, lock: int) -> None:
     argv = [
         sys.executable,
         "-I",
@@ -260,13 +297,12 @@ def _spawn(
     ]
     process = subprocess.Popen(
         argv,
-        env={**(config.inherited_environment() if environment is None else environment), **job.env},
+        env={**config.inherited_environment(), **job.env},
         pass_fds=(lock,),
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
     )
-
     scope = _failures()
 
     def reap() -> None:
@@ -277,8 +313,12 @@ def _spawn(
             detail = f"exit {process.returncode}: {tail}"
             _record_failure(job.key, "compile_crashed", detail, scope)
 
-    threading.Thread(target=reap, name=f"kernel-builder-{job.key.kernel}", daemon=True).start()
-    return process
+    reaper = threading.Thread(target=reap, name=f"kernel-builder-{job.key.kernel}", daemon=True)
+    reaper.start()
+    _STARTED[job.key.digest] = (process, reaper)
+    # Its pid is on record before it can say anything itself: a wait meters it from birth.
+    with contextlib.suppress(OSError):
+        store.set_state(job.key, {"pid": process.pid, "progress": 0.0, "phase": "starting"})
 
 
 def _compile_ms(entry_dir: Path) -> float:
@@ -347,10 +387,10 @@ def _meminfo(field: str) -> int:
 
 
 def machine_slot(namespace: Path, *, create: bool = False) -> Path:
-    """The build slot's lock file; the worker creates its own at boot for its executors."""
+    """The build slot's lock file; the machine's kernel boot creates it for its executors."""
     path = namespace / ".slots" / "0.lock"
     if create:
-        path.parent.mkdir(mode=0o755, exist_ok=True)
+        path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
         os.close(os.open(path, os.O_RDONLY | os.O_CREAT | os.O_CLOEXEC, 0o644))
     return path
 
@@ -358,7 +398,7 @@ def machine_slot(namespace: Path, *, create: bool = False) -> Path:
 @contextlib.contextmanager
 def _slot(store: kernel_cache.Store, kind: str) -> Iterator[None]:
     """A wide build holds the machine's one build slot, waiting on a live builder that has
-    it; others need none. The slot lives in the worker's namespace when this process reads
+    it; others need none. The slot lives in the trusted namespace when this process reads
     one (an executor under uid isolation), so the machine has one; it is an flock, so a
     builder that dies frees it."""
     if kind not in WIDE:

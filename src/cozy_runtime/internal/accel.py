@@ -21,11 +21,13 @@ from __future__ import annotations
 
 import ctypes
 import os
+import re
 import subprocess
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
+from pathlib import Path
 from types import ModuleType
 from typing import Any, Literal, cast
 
@@ -331,6 +333,17 @@ def device_capability(device: str) -> int:
         handle, ctypes.byref(major), ctypes.byref(minor)
     )
     return major.value * 10 + minor.value if answer == _NVML_SUCCESS else 0
+
+
+def driver_version() -> str:
+    """The loaded NVIDIA driver's version, read from the kernel: no NVML and no thread, so a
+    fork parent may ask. A compiled kernel's key carries it. Empty where there is none."""
+    for path in ("/sys/module/nvidia/version", "/proc/driver/nvidia/version"):
+        with suppress(OSError):
+            found = re.search(r"\d+\.\d+(\.\d+)*", Path(path).read_text().splitlines()[0])
+            if found:
+                return found.group()
+    return ""
 
 
 def drives_display(index: int) -> bool:

@@ -69,7 +69,6 @@ ROWWISE_LEAF = "cozy.fp8-rowwise.native-leaf/1"
 NOT_INSTALLABLE = frozenset(
     {
         "fusion_kernels_absent",
-        "fusion_kernels_compiling",
         "fusion_kernels_failed",
         "fusion_triton_absent",
         "fusion_dependency_absent",
@@ -364,16 +363,16 @@ def apply_fusion_plan(
 ) -> AppliedFusion:
     """Install the fused glue on every H3 transformer the model holds.
 
-    Called under the class's `fusion=` consent. Without `required` (`fusion="require"`) a
-    `NOT_INSTALLABLE` code is a recorded non-application and eager serves; with it, the build
-    is waited for and the same code refuses typed. Any other code refuses under either.
+    Called under the class's `fusion=` consent. A live build is waited for. Without `required`
+    (`fusion="require"`) a `NOT_INSTALLABLE` code is a recorded non-application and eager
+    serves; with it the same code refuses typed. Any other code refuses under either.
     """
     reason = capability_refusal(torch, device)
     if reason:
         return AppliedFusion(identity(), False, reason, (), 0, 0.0, "fusion_device_incapable")
     try:
         _require_sources()
-        fusion.load(device, wait=required)
+        fusion.load(device)
     except (fusion.FusionUnavailable, FusionRefusal) as exc:
         if required or exc.code not in NOT_INSTALLABLE:
             raise FusionRefusal(exc.code, str(exc)) from exc

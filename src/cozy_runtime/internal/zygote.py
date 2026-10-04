@@ -19,7 +19,7 @@ import traceback
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Any
 
-from cozy_runtime.internal import proctree
+from cozy_runtime.internal import config, proctree
 from cozy_runtime.internal.exits import Exit
 
 CAPABILITY = "fork/1"
@@ -65,9 +65,9 @@ def reap() -> None:
 
 
 _EXPECT = """
-import os, sys, threading
-from cozy_runtime.internal import accel, fusion, kernel_cache
-kernel_cache.configure(kernel_cache.from_sealed(os.environ))
+import sys, threading
+from cozy_runtime.internal import accel, config, fusion, kernel_cache
+kernel_cache.configure(kernel_cache.from_sealed(config.inherited_environment()))
 archs = sorted({accel.device_capability(entry) for entry in sys.argv[1:]} - {0})
 for arch in archs:
     print(f"[fusion] sm{arch} {fusion.expect(arch)}", file=sys.stderr, flush=True)
@@ -140,8 +140,7 @@ def fork(environment: Mapping[str, str], child: Callable[[], int]) -> int:
         proctree.arm_parent_death()
         if os.getppid() != parent:
             os._exit(int(Exit.structural))
-        os.environ.clear()
-        os.environ.update(environment)
+        config.replace_environment(environment)
         code = child()
     except BaseException:
         traceback.print_exc()

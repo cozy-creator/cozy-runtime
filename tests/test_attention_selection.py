@@ -220,10 +220,12 @@ def test_a_candidate_that_fails_to_resolve_for_any_reason_drops_out_of_auto() ->
     broken = attention.BY_NAME["flash-attn3"]
     real = attention._resolve
 
-    def planted(candidate: attention.Candidate, device: DeviceFacts) -> attention.Ready:
+    def planted(
+        candidate: attention.Candidate, device: DeviceFacts, wait: bool = True
+    ) -> attention.Ready:
         if candidate is broken:
             raise RuntimeError("ImportError: undefined symbol: _ZN3c105ErrorC1E")
-        return real(candidate, device)
+        return real(candidate, device, wait)
 
     attention._resolve = planted
     try:

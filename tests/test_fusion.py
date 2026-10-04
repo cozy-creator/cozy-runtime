@@ -30,6 +30,8 @@ import os
 import subprocess
 import sys
 import textwrap
+import threading
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -402,15 +404,15 @@ def test_a_build_not_ready_serves_eager_under_accept_and_is_awaited_under_requir
     monkeypatch.setenv("TRITON_CACHE_DIR", str(cache))
     monkeypatch.setattr(kernel_cache, "_MACHINE_STORE", [store])
     job = fusion.job(_arch())
-    held = store.claim(job.key)  # a live builder holds the key
+    held = store.claim(job.key)  # a live builder holds the key, then ends without publishing
     assert held is not None
-    assert outcome() == "fusion_kernels_compiling"
-    os.close(held)
-
-    cache.chmod(0o500)  # the builder cannot write Triton's cache
+    threading.Timer(1.0, os.close, [held]).start()
+    cache.chmod(0o500)  # and no builder can write Triton's cache
     try:
+        waited = time.perf_counter()
+        assert outcome() == "fusion_kernels_failed"  # after the live build, never eager beside it
+        assert time.perf_counter() - waited >= 1.0
         assert outcome(required=True) == "refused fusion_kernels_failed"
-        assert outcome() == "fusion_kernels_failed"
     finally:
         cache.chmod(0o700)
     assert kernel_compile.status(store, job).state == "failed"

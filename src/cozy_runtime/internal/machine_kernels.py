@@ -1,33 +1,34 @@
-"""The machine's attention kernels, compiled at worker boot on the cards present, best first,
-while the first weights download.
+"""The machine's kernels, compiled at machine start on the cards present, best first, while
+weights download.
 
-The worker compiles, for each distinct card architecture, the artifacts of `LADDER` the card
-admits, in its order, through the compile manager (`kernel_compile.in_order`): one build at a
-time, each as wide as the machine measures, niced. They build into the worker's own store
-namespace, which every executor on the machine reads: a newer executor finds each one ready,
-or building and claimed, and never builds it twice; an older one takes it from the image
-kernel site (`kernel_site`) at its next construction. The builders are the worker's children
-and outlive any executor. A request never waits on any of it: selection serves the best
-kernel ready at the time and takes a better one at a later construction or request.
+The machine launches `python -m cozy_runtime.internal.machine_kernels` once per installed
+generation, under that generation's own seal: its interpreter and torch, every card of the
+machine, and the kernel store and scratch scope its executors use. Each key here is therefore
+the key an executor computes, by the same functions. For each distinct card architecture it
+compiles the artifacts of `LADDER` the card admits, in its order, through the compile manager
+(`kernel_compile.in_order`): one wide build at a time, as wide as the machine measures, niced;
+then Sol's card objects. An executor finds each one ready, or building and claimed, and waits
+for the one it needs (`kernel_compile.wait`): it builds none twice and serves no other kernel
+in its place. This process holds no device memory. It prints one JSON line per artifact as it
+ends and a last one, and exits nonzero when one failed.
 """
 
 from __future__ import annotations
 
 import dataclasses
-import os
-import tempfile
-import threading
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
-from pathlib import Path
+import json
+import site
+import sys
+import time
+from collections.abc import Mapping
 
 from cozy_runtime.internal import (
     accel,
     attention,
-    jit_cache,
+    attention_sol,
+    config,
     kernel_cache,
     kernel_compile,
-    kernel_site,
     kernel_sources,
 )
 from cozy_runtime.internal.encoding import DeviceFacts
@@ -36,57 +37,18 @@ from cozy_runtime.internal.encoding import DeviceFacts
 #: SageAttention2, FA3 BF16; SDPA needs no compile). Models without a preference use the
 #: ranked table, whose only compiled kernel is FA3.
 LADDER: tuple[str, ...] = ("sol-attn", "sageattention", "flash-attn3")
-#: The trees an executor before boot compile imports by distribution.
-SITE_ARTIFACTS = frozenset({kernel_sources.PYTHON, "sageattention"})
 
 
-@dataclass
-class MachineKernels:
-    store: kernel_cache.Store
-    #: (kernel, job) in build order
-    jobs: Sequence[tuple[str, kernel_compile.Job]]
-    #: the image kernel site, and why it is not written (empty when it is)
-    site_root: Path = kernel_site.ROOT
-    site: str = ""
-    thread: threading.Thread | None = None
-    published: list[str] = field(default_factory=list)
-
-    def line(self) -> str:
-        """Each boot kernel's state now, for the warm's phase row."""
-        states = [
-            f"{name} {kernel_compile.status(self.store, job).line()}" for name, job in self.jobs
-        ]
-        site = f"; image kernel site not written: {self.site}" if self.site else ""
-        return "machine: " + ", ".join(states) + site if states else ""
-
-    def _done(self, job: kernel_compile.Job, state: kernel_compile.State) -> None:
-        if state.state != "ready" or self.site or job.key.kernel not in SITE_ARTIFACTS:
-            return
-        try:
-            kernel_site.publish(Path(state.path), job.key, self.site_root)
-        except OSError as exc:
-            self.site = f"publishing {job.key.kernel} failed: {exc}"
-            return
-        self.published.append(job.key.kernel)
+def cards(devices: str) -> dict[int, str]:
+    """Each distinct card architecture among the sealed devices, and the first card of it."""
+    entries = [entry.strip() for entry in devices.split(",") if entry.strip()]
+    return {sm: entry for entry in reversed(entries) if (sm := accel.device_capability(entry))}
 
 
-def boot(
-    kernel_root: Path | None,
-    devices: str,
-    environment: Mapping[str, str],
-    site_root: Path = kernel_site.ROOT,
-) -> MachineKernels | None:
-    """Start compiling this machine's ladder for its cards; returns at once. None when there
-    is no store, no NVIDIA card or no kernel source to build from."""
-    cards = {
-        sm: device
-        for device in reversed([d.strip() for d in devices.split(",") if d.strip()])
-        if (sm := accel.device_capability(device))
-    }
-    if kernel_root is None or not cards:
-        return None
-    jobs: dict[str, tuple[str, kernel_compile.Job]] = {}
-    for sm, device in sorted(cards.items()):
+def ladder(present: Mapping[int, str]) -> list[kernel_compile.Job]:
+    """The ladder artifacts each card architecture admits, in ladder order, once per key."""
+    jobs: dict[str, kernel_compile.Job] = {}
+    for sm, device in sorted(present.items()):
         facts = DeviceFacts("cuda", "", sm, "", "")
         for name in LADDER:
             candidate = attention.BY_NAME[name]
@@ -98,20 +60,69 @@ def boot(
                 continue
             # Upstream's setup.py builds for the cards it sees: this one.
             job = dataclasses.replace(job, env={"CUDA_VISIBLE_DEVICES": device})
-            jobs.setdefault(job.key.digest, (name, job))
-    if not jobs:
-        return None
+            jobs.setdefault(job.key.digest, job)
+    return list(jobs.values())
+
+
+def sol_objects(store: kernel_cache.Store, present: Mapping[int, str]) -> list[kernel_compile.Job]:
+    """Sol's objects for these cards, once its sources are in the store: their keys hash them."""
     try:
-        jit_cache.machine(kernel_root)
-        store = kernel_cache.Store(kernel_cache.namespace(kernel_root, os.geteuid()))
+        tree = store.entry(kernel_sources.job(kernel_sources.PYTHON, 0).key)
+    except kernel_sources.Absent:
+        return []
+    if tree is None:
+        return []
+    site.addsitedir(str(tree / kernel_cache.SITE))
+    jobs: list[kernel_compile.Job] = []
+    for sm in sorted(present):
+        if divmod(sm, 10) in attention_sol.ROUTES:
+            jobs += attention_sol.card_jobs(store, divmod(sm, 10))
+    return jobs
+
+
+def main() -> int:
+    started = time.perf_counter()
+    environment = config.inherited_environment()
+    store = kernel_cache.from_sealed(environment)
+    present = cards(environment.get("CUDA_VISIBLE_DEVICES", ""))
+    # Builders are handed the card they build for; nothing in this process opens one.
+    config.hide_gpus()
+    ended: list[str] = []
+
+    def done(job: kernel_compile.Job, state: kernel_compile.State) -> None:
+        ended.append(state.state)
+        print(json.dumps({**state.document(), "key": job.key.digest[:16]}), flush=True)
+
+    def progress(state: kernel_compile.State) -> None:
+        print(json.dumps(state.document()), flush=True)
+
+    if store is not None and present:
+        kernel_cache.configure(store)
+        kernel_compile.waiting = progress
         kernel_compile.machine_slot(store.own, create=True)
-    except (OSError, jit_cache.JITCacheRefusal):
-        return None  # executors then compile their own, as without a machine build
-    machine = MachineKernels(
-        store, list(jobs.values()), site_root, kernel_site.open_site(site_root)
-    )
-    builders = {**environment, "TMPDIR": tempfile.gettempdir()}
-    machine.thread = kernel_compile.in_order(
-        store, [job for _, job in machine.jobs], builders, machine._done
-    )
-    return machine
+        kernel_compile.in_order(store, ladder(present), done)
+        try:
+            objects = sol_objects(store, present)
+        except Exception as exc:  # its DSL does not import here; an executor says the same
+            objects = []
+            print(json.dumps({"kernel": attention_sol.KERNEL, "state": "absent"}), flush=True)
+            print(f"sol objects: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+        for job in objects:
+            kernel_compile.submit(store, job)
+        for job in objects:
+            done(job, kernel_compile.wait(store, job))
+    last = {
+        "done": True,
+        "cards": sorted(present),
+        "driver": accel.driver_version(),
+        "store": str(store.own) if store is not None else "",
+        "kernels": len(ended),
+        "failed": sum(state != "ready" for state in ended),
+        "ms": round((time.perf_counter() - started) * 1000),
+    }
+    print(json.dumps(last), flush=True)
+    return 1 if last["failed"] else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
