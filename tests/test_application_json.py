@@ -18,10 +18,8 @@ def test_application_values_preserve_unsigned_seeds_number_kind_and_array_order(
     }
     assert type(value["seed"]) is int and type(value["number"]) is float
     encoded = application_json.encode(value)
-    assert encoded == (
-        b'{"number":1.0,"ordered":[9007199254740993,9007199254740992],'
-        b'"seed":18446744073709551615}'
-    )
+    ordered = b"[9007199254740993,9007199254740992]"
+    assert encoded == b'{"number":1.0,"ordered":' + ordered + b',"seed":18446744073709551615}'
     for changed in (
         {**value, "seed": value["seed"] - 1},
         {**value, "number": 1},
