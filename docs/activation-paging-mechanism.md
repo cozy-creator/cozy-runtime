@@ -78,11 +78,14 @@ environment switch, ABI/vtable trick or preallocated-cache workaround may pass i
    receipts before any next reviewed attempt.
 
 Current stock MemPool source predicts phase3 will refuse virtual oversubscription
-at the SDK fraction. Phase4 is consequently not authorized by this design alone.
-If confirmed, report the accounting limitation rather than silently dropping the
-cap. A future typed activation resource would need separate bounded host/virtual
-accounting and physical residency authority while ordinary device allocations
-retain their cap. That is a proposed integration, not an implemented feature.
+at the SDK fraction. This is not a hardware-limit claim. Phase4 is consequently
+not authorized by this design alone. If virtual charge is the only gate, present
+an explicit scoped accounting change for review: an activation resource needs
+separate bounded host/virtual accounting and physical residency authority, while
+ordinary allocations retain their existing protection. No general fraction/cap
+increase or disabled ordinary protection is acceptable. The supported interface
+or minimal integration needed to distinguish the two charges must be proved
+first; it is not an implemented feature or an excuse to bypass admission.
 
 If managed backing cannot provide a supported path, propose exact layer streaming:
 offload complete activations between layers, preserve whole-image group-normalization
