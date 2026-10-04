@@ -631,18 +631,21 @@ class Weights:
         after = self.allocatable()
         retry = (op, after)
         fresh = self.headroom(accel.allocation(self.torch, self.kind))
-        if after <= before and fresh < need + weight_policy.MARGIN and self.room is not None:
+        if after <= before and self.room is not None:
             self.room(need + weight_policy.MARGIN)
             after = self.allocatable()
             fresh = self.headroom(accel.allocation(self.torch, self.kind))
             retry = (op, after)
         repeat, self.last_retry = retry == self.last_retry, retry
         if after <= before and (fresh < need + weight_policy.MARGIN or repeat):
+            device = plane.stats(self.plane).device(self.index)
             raise ResidencyRefusal(
                 INDIVISIBLE,
                 f"{op or 'an allocation'} of {need} B: nothing on this GPU could give device "
                 f"memory back ({after} B allocatable before and after, every weight it does "
-                "not read unmapped and every idle tenant asked)",
+                "not read unmapped and every idle tenant asked; plane budget "
+                f"{device.budget} B, mapped {device.committed} B, leased "
+                f"{device.leased_bytes} B, cap {self.cap} B)",
             )
 
     @contextmanager
