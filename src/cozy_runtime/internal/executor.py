@@ -4097,9 +4097,12 @@ class Executor:
                     frame["descriptor"] = self.channel.recv_descriptor()
             elif handoff and frame.get("ok") is True:
                 raise SeamError("seam_descriptor", "successful reply omitted its capability")
-            frame.pop("fds", None)  # descriptors arrive by SCM_RIGHTS, never as numbers
+            # descriptors arrive by SCM_RIGHTS, never as numbers
+            frame.pop("fds", None)
+            frame.pop("lease_fd", None)
             count = frame.pop("descriptors", 0)
-            if count:
+            lease = frame.get("lease") is True
+            if count or lease:
                 if not issubclass(into, DeviceTierAnswer) or type(count) is not int or count < 0:
                     self.channel.close()
                     raise SeamError("seam_descriptor", "unexpected GPU allocations in a reply")
@@ -4107,6 +4110,8 @@ class Executor:
                 try:
                     for _ in range(count):
                         received.append(self.channel.recv_shared())
+                    if lease:
+                        frame["lease_fd"] = self.channel.recv_lease()
                 except BaseException:
                     for fd in received:
                         os.close(fd)
@@ -4287,10 +4292,12 @@ class Executor:
         if (
             answer.ok
             and answer.held
+            and answer.layout == layout
+            and answer.lease_fd >= 0
             and len(answer.fds) == sum(len(r.chunks) for r in answer.regions)
         ):
             return answer
-        for fd in answer.fds:
+        for fd in (*answer.fds, *([answer.lease_fd] if answer.lease_fd >= 0 else [])):
             os.close(fd)
         return None
 
@@ -4309,6 +4316,9 @@ class Executor:
         answer = self._durable(request, DeviceTierAnswer)
         for fd in answer.fds:
             os.close(fd)
+        if answer.lease_fd >= 0 and not (answer.ok and not answer.duplicate):
+            os.close(answer.lease_fd)
+            answer = msgspec.structs.replace(answer, lease_fd=-1)
         return answer
 
     def prefetch(self, command: Prefetch) -> dict[str, Any]:

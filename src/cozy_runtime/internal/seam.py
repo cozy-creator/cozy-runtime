@@ -188,6 +188,23 @@ class Channel:
             raise
         return received
 
+    def send_lease(self, fd: int) -> None:
+        """Transfer one lease socket (the machine's half of a device-tier answer)."""
+        if not stat.S_ISSOCK(os.fstat(fd).st_mode):
+            raise SeamError("seam_descriptor", "a lease must be a socket")
+        self._send_fd(fd, "lease")
+
+    def recv_lease(self) -> int:
+        """Receive exactly one lease: a connected local stream socket, nothing else."""
+        received = self._recv_fd()
+        try:
+            if not stat.S_ISSOCK(os.fstat(received).st_mode):
+                raise SeamError("seam_descriptor", "a lease must be a socket")
+        except (OSError, SeamError):
+            os.close(received)
+            raise
+        return received
+
     def _send_fd(self, fd: int, what: str) -> None:
         try:
             sent = self.sock.sendmsg(
