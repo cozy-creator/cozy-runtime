@@ -320,6 +320,8 @@ class Weights:
         self.squeezed: dict[str, int] = {}
         #: those this request's own entries measured: what the owner keeps for its shape
         self.squeezes: dict[str, int] = {}
+        #: components given back to make torch room (`page_out`), and their bytes
+        self.paged_out = [0, 0]
         #: methods whose stage fits itself to the room it finds (an image VAE's decode maps):
         #: their activations never size a grant
         self.adaptive: set[str] = set()
@@ -449,10 +451,12 @@ class Weights:
             self.squeezed[method] = max(self.squeezed.get(method, 0), int(nbytes))
 
     def retries(self) -> int:
-        """Times torch dropped its whole cache to place one allocation, since the process began."""
+        """Times torch dropped its whole cache to place one allocation, since the process began.
+        Read at every block boundary of a stage: the allocator's own counters, without the
+        flattened copy `torch.cuda.memory_stats` makes of them."""
         if self.host_only:
             return 0
-        return int(self.torch.cuda.memory_stats(self.device).get("num_alloc_retries", 0))
+        return int(self.torch._C._cuda_memoryStats(self.index).get("num_alloc_retries", 0))
 
     def page_out(self, keep: Collection[str]) -> bool:
         """Give torch the device bytes of one component no stage uses now (none in `keep`): the
@@ -473,6 +477,7 @@ class Weights:
         component = self.components[min(idle)[2]]
         self.quiesce()
         close_cursor(component)
+        before = max(plane.stats(self.plane).device(self.index).committed, 0)
         try:
             shared = self._release_shared(component, sorted(component.shared))
             own = int(self.plane.drop(component.ws, self.index, None))
@@ -483,12 +488,16 @@ class Weights:
             unbind(region)
             _unbaked(region)
         if own:
-            # dropped bytes stay the plane's idle chunks until its budget leaves them no room
-            committed = max(plane.stats(self.plane).device(self.index).committed, 0)
-            self._apply(max(committed - own, 0))
+            # Dropped bytes stay the plane's idle chunks until its budget leaves them no room.
+            # From what was committed before (the drop's own trim may have released some), and
+            # never above the budget a spare lowered; torch's limit follows either way.
+            self._apply(min(self.applied, max(before - own, 0)))
+            self.limit_torch()
         if shared and self.room is not None:
             free = accel.allocation(self.torch, self.kind)["driver_free_bytes"] - self.floor_free
             self.room(max(free, 0) + shared - weight_policy.MARGIN)
+        self.paged_out[0] += 1
+        self.paged_out[1] += own + shared
         return True
 
     def room_before(self, method: str) -> None:
@@ -1245,6 +1254,8 @@ class Weights:
             cache_released_bytes=sum(freed for _, freed in accel.RELEASED.values()),
             cache_released_by={who: (n, freed) for who, (n, freed) in accel.RELEASED.items()},
             squeezed=dict(self.squeezes),
+            paged_out=self.paged_out[0],
+            paged_out_bytes=self.paged_out[1],
             modes=dict(self.modes),
         )
 
@@ -1599,6 +1610,15 @@ def _bake(
 #: bakes took (a streamed copy's bake is not timed: that would stall its stream), and weights
 #: whose baked bytes came from the machine's custody.
 BAKED: list[float] = [0, 0.0, 0]
+
+
+def _in_use(weights: Weights) -> set[str]:
+    """The weight sets an open stage, or a repeating one left open, uses."""
+    keys = set(weights.opened())
+    for row in weights.residencies:
+        if row.parked is not None:
+            keys.update(row.components[name].key for name in row.parked[1])
+    return keys
 
 
 def _variant(region: Region, keys: list[tuple[object, ...]]) -> str:
@@ -2735,12 +2755,28 @@ class WeightResidency:
         bound = weights.squeezed.get(method)
         if bound is None or weights.host_only or weights.grouped:
             return
-        keep = {self.components[name].key for name in local} | set(weights.opened())
-        for row in weights.residencies:
-            if row.parked is not None:
-                keep.update(row.components[name].key for name in row.parked[1])
+        keep = {self.components[name].key for name in local} | _in_use(weights)
         while weights.allocatable() <= bound + weight_policy.MARGIN and weights.page_out(keep):
             pass
+
+    def _squeezing(self) -> None:
+        """At a pass boundary inside a stage: torch dropped its whole cache more than once since
+        the entry or the last page-out, so the room it has squeezes this entry (one stage can
+        be a whole denoise, a pass each step). The room is kept for later entries and
+        executors, and the idle component cheapest to restore leaves now: never one an open or
+        repeating stage uses (`_in_use`), so never one `_spare` gave back either."""
+        weights = self.weights
+        if self.active is None or self.baseline < 0 or weights.grouped or weights.mapping:
+            return
+        room, dropped = self.pressure
+        if weights.retries() - dropped <= 1:
+            return
+        method = self.active[0]
+        weights.squeezed[method] = weights.squeezes[method] = max(
+            weights.squeezed.get(method, 0), room
+        )
+        weights.page_out(_in_use(weights))
+        self.pressure = (weights.allocatable(), weights.retries())
 
     def _acquire_common(self, method: str, component: Component, budget: int, stream: Any) -> Any:
         """The stage's common region's lease; short of device memory, the owner is asked for
@@ -3310,6 +3346,8 @@ class WeightResidency:
             self._observe(component, region.index)
             if component.passes > passes:
                 weights.hold_host()
+                if not weights.running:  # a pass boundary, before this block leases anything
+                    self._squeezing()
             if weights.growing and component.passes == 2 > passes:
                 self._grow()
             if component.spared:

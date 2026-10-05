@@ -159,6 +159,9 @@ class PlaneFacts(msgspec.Struct, frozen=True, kw_only=True):
     #: dropped its cache more than once: the owner keeps it for the request's shape and
     #: gives it to later executors (`Invoke.squeezed_bytes`)
     squeezed: dict[str, int] = {}
+    #: components given back to make torch room since the process began, and their bytes
+    paged_out: int = 0
+    paged_out_bytes: int = 0
     #: The decode mode and CFG layout each stage chose, e.g. {"vae.decode": "chunked 32 host"}
     modes: dict[str, str] = {}
 
