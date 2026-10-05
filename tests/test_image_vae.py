@@ -1,5 +1,5 @@
-"""Image VAE decode: the lone-frame path of diffusers' Qwen VAE, and both families' exact
-decode in row bands against diffusers' own untiled one.
+"""Image VAE decode: both families' exact decode in row bands against diffusers' own
+untiled one, and the Qwen family's one-tap path for a lone frame.
 
 Real diffusers modules with seeded weights on the CPU; nothing is patched.
 """
@@ -21,45 +21,16 @@ def qwen() -> Any:
     return diffusers.AutoencoderKLQwenImage(base_dim=16, num_res_blocks=1).eval()
 
 
-def temporal_taps(vae: Any, z: Any) -> set[int]:
-    """The temporal kernel sizes of the 3D convolutions one decode of `z` ran."""
+def test_a_lone_qwen_frame_decodes_on_one_kernel_tap_with_no_cache() -> None:
+    """Diffusers convolves a lone frame with all three temporal taps (two meet zero padding)
+    and caches every activation for a next frame; the exact decode runs the one tap that
+    meets data as a 2D convolution and keeps no cache."""
+    vae, z = qwen(), torch.randn(1, 16, 1, 24, 16)
     with torch.profiler.profile(record_shapes=True) as profile, torch.inference_mode():
-        vae.decode(z)
-    return {e.input_shapes[1][2] for e in profile.events() if e.name == "aten::conv3d"}
-
-
-def test_a_lone_frame_decodes_to_the_stock_image_on_one_kernel_tap() -> None:
-    vae = qwen()
-    z = torch.randn(1, 16, 1, 24, 16)
-    with torch.inference_mode():
-        stock = vae.decode(z).sample
-    assert temporal_taps(vae, z) == {1, 3}
-
-    assert image_vae.fast_decode(vae)
-    with torch.inference_mode():
-        lone = vae.decode(z).sample
-        (bare,) = vae.decode(z, return_dict=False)
-    assert lone.shape == stock.shape == (1, 3, 1, 192, 128)
-    assert torch.allclose(lone, stock, atol=1e-5)
-    assert torch.equal(bare, lone)
-    assert temporal_taps(vae, z) == {1}
-    # no feature cache is filled for a frame that has no successor
-    assert all(row is None for row in vae._feat_map)
-
-
-def test_tiles_and_videos_keep_the_stock_decode() -> None:
-    vae, plain = qwen(), qwen()
-    assert image_vae.fast_decode(vae)
-    z = torch.randn(1, 16, 1, 24, 24)
-    for each in (vae, plain):
-        each.enable_tiling(128, 128, 96, 96)
-    with torch.inference_mode():
-        assert torch.allclose(vae.decode(z).sample, plain.decode(z).sample, atol=1e-5)
-    for each in (vae, plain):
-        each.disable_tiling()
-    video = torch.randn(1, 16, 2, 8, 8)
-    with torch.inference_mode():
-        assert torch.allclose(vae.decode(video).sample, plain.decode(video).sample, atol=1e-5)
+        image_vae.plan(vae, z).run()  # type: ignore[union-attr]
+    taps = {e.input_shapes[1][2] for e in profile.events() if e.name == "aten::conv3d"}
+    assert taps <= {1}  # post_quant_conv's own single tap at most
+    assert getattr(vae, "_feat_map", None) is None  # never made: no cache for a lone frame
 
 
 def kl() -> Any:
@@ -92,14 +63,12 @@ def test_a_chunked_kl_decode_is_the_untiled_one(band: int) -> None:
 
 
 @pytest.mark.parametrize("band", BANDS)
-@pytest.mark.parametrize("fast", [True, False])
-def test_a_chunked_qwen_decode_is_the_untiled_one(band: int, fast: bool) -> None:
+def test_a_chunked_qwen_decode_is_the_untiled_one(band: int) -> None:
     vae = qwen()
-    assert image_vae.fast_decode(vae) or not fast
     z = torch.randn(1, 16, 1, 5, 3)
     with torch.inference_mode():
         stock = vae.decode(z).sample
-        chunked = image_vae.plan(vae, z).run().sample  # type: ignore[union-attr]
+        chunked = image_vae.Decode(vae, z, band=band).run().sample
     assert chunked.shape == stock.shape == (1, 3, 1, 40, 24)
     assert (chunked - stock).abs().max() <= 1e-5
 

@@ -1697,25 +1697,17 @@ def test_a_qwen_image_vae_decodes_exactly_on_the_plane(tmp_path: Path) -> None:
     def vae() -> Any:
         return diffusers.AutoencoderKLQwenImage(base_dim=32, num_res_blocks=1).to(torch.float16)
 
-    def lone() -> Any:  # the executor's execution plan, before the residency installs
-        module = vae()
-        assert image_vae.fast_decode(module)
-        return module
-
     weights = Weights(torch, torch.device("cuda", 0), "cuda")
     weights.set_budget(1 << 30, pinned=1 << 30)
-    model, plain = plane_vae(weights, tmp_path / "vae", lone)
-    stock = vae().cuda().eval()
-    stock.load_state_dict(plain.state_dict())
-    del plain
+    model, plain = plane_vae(weights, tmp_path / "vae", vae)
     z = torch.randn(1, 16, 1, 64, 64, device="cuda", dtype=torch.float16)
     model.stack.enable_tiling()
     image = decode(model, z)
     assert weights.modes["vae.decode"].startswith("chunked ")
     assert image.shape == (1, 3, 1, 512, 512)
     with torch.inference_mode():
-        reference = stock.decode(z).sample
-    # norms in fp16 rather than fp32, and a 2D kernel: the image moves by a few fp16 ulps
+        reference = plain.decode(z).sample
+    # a 2D kernel and other band shapes: the image moves by a few fp16 ulps
     torch.testing.assert_close(image, reference, atol=1e-2, rtol=0)
 
 

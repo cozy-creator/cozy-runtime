@@ -1,6 +1,5 @@
 """The image VAEs whose decode the weight plane runs (diffusers `AutoencoderKL` and
-`AutoencoderKLQwenImage`): one exact decode, layer by layer in row bands, and the Qwen
-decoder's fast path.
+`AutoencoderKLQwenImage`): one exact decode, layer by layer in row bands.
 
 `Decode` runs the decoder one layer at a time over the whole image, each layer's full output
 map kept on the device or in host memory. A convolution runs in full-width row bands, each
@@ -10,12 +9,11 @@ in float32; the mid-block attention runs whole, at latent resolution. The band p
 follows the image size and the model only: memory decides only where the maps live. Host
 maps move on their own copy streams, a band ahead of the one computing.
 
-Decoding one image, ComfyUI's Wan VAE beats diffusers' by 2x at the same size: a causal 3D
-convolution pads two zero frames in front of a lone frame and convolves all three, so only
-the kernel's last temporal tap meets data; the frame-to-frame feature cache copies every
-activation for a successor that never comes; and norms and upsampling run in float32.
-`fast_decode` does what ComfyUI does: the last tap as a 2D convolution, no cache for a lone
-frame, and norms and nearest upsampling in the activation dtype.
+A Qwen image is a one-frame video to diffusers: each causal 3D convolution pads two zero
+frames in front of it and convolves all three, and a feature cache copies every activation
+for a next frame that never comes. `Decode` runs the one temporal tap that meets data as a
+2D convolution and keeps no cache (ComfyUI's path, 2x diffusers' speed), with diffusers'
+own norms and upsampling, float32 where diffusers is.
 """
 
 from __future__ import annotations
@@ -23,14 +21,11 @@ from __future__ import annotations
 import hashlib
 import inspect
 from collections import deque
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterator
 from functools import cache, partial
-from types import MethodType, ModuleType
-from typing import Any, Protocol, cast
+from types import ModuleType
+from typing import Any, cast
 
-#: diffusers 0.40.0's `autoencoder_kl_qwenimage.py`, the source `fast_decode` was read against.
-#: Another source keeps its own decode.
-QWEN_SOURCE = "db8b9869c16b6e5274b5c4db20b488cf68a2f6a78bc1bee08936f2ae65fb8042"
 #: diffusers 0.40.0's `_decode` and decoder block forwards that `Decode` mirrors, per family.
 REVIEWED = {
     "AutoencoderKL": "95af1233ae21a54a7abcde7699f1e2b80a425f68955e1150028023e00a23b9aa",
@@ -60,50 +55,6 @@ def streams(torch: Any, device: Any) -> tuple[Any, Any]:
 
 #: (module, body) -> body(), with the module's weights bound for all of it
 type Within = Callable[[Any, Callable[[], Any]], Any]
-
-
-class _Tensor(Protocol):
-    shape: tuple[int, ...]
-
-    def __getitem__(self, index: object) -> _Tensor: ...
-    def unsqueeze(self, dim: int) -> _Tensor: ...
-    def __mul__(self, other: object) -> _Tensor: ...
-    def __add__(self, other: object) -> _Tensor: ...
-
-
-class _Conv(Protocol):
-    weight: _Tensor
-    bias: _Tensor | None
-    kernel_size: tuple[int, int, int]
-    stride: tuple[int, int, int]
-    dilation: tuple[int, int, int]
-    groups: int
-    #: (left, right, top, bottom, front, back): the causal padding, all of time in front
-    _padding: tuple[int, int, int, int, int, int]
-    forward: Callable[..., _Tensor]
-
-
-class _Norm(Protocol):
-    channel_first: bool
-    scale: float
-    gamma: _Tensor
-    bias: _Tensor | float
-
-
-class _Upsample(Protocol):
-    mode: str
-
-
-class _Decoder(Protocol):
-    def __call__(self, x: _Tensor) -> _Tensor: ...
-    def modules(self) -> Iterable[object]: ...
-
-
-class _Qwen(Protocol):
-    use_tiling: bool
-    decoder: _Decoder
-    post_quant_conv: Callable[[_Tensor], _Tensor]
-    _decode: Callable[..., object]
 
 
 def _family(root: object) -> type | None:
@@ -523,7 +474,7 @@ class Decode:
         return self.torch.clamp(out, min=-1.0, max=1.0).unsqueeze(2)
 
     # -- AutoencoderKLQwenImage, one frame (diffusers 0.40.0: `_decode`, `QwenImageDecoder3d`
-    #    and its blocks with no feature cache, as `fast_decode` runs it)
+    #    and its blocks for one frame, with no feature cache)
 
     def _qwen(self, height: int, width: int) -> None:
         post = self.root.post_quant_conv
@@ -594,75 +545,3 @@ def _in(conv: Any) -> int:
 
 def _direct(_: Any, body: Callable[[], Any]) -> Any:
     return body()
-
-
-def fast_decode(root: object) -> bool:
-    """Give a Qwen image VAE's decoder ComfyUI's fast path. False leaves `root` as it is: not
-    that family, or not the reviewed source. Call before anything wraps a module's forward."""
-    kind = _family(root)
-    if kind is None or kind.__name__ != "AutoencoderKLQwenImage":
-        return False
-    module = inspect.getmodule(kind)
-    if module is None or _digest(module) != QWEN_SOURCE:
-        return False
-    vae = cast("_Qwen", root)
-    functional = module.F
-    causal = module.QwenImageCausalConv3d
-
-    def tap(conv: _Conv, x: _Tensor, cache_x: object = None) -> _Tensor:
-        if cache_x is not None or x.shape[2] != 1:
-            return cast("_Tensor", causal.forward(conv, x, cache_x))
-        left, _, top, _, _, _ = conv._padding
-        return cast(
-            "_Tensor",
-            functional.conv2d(
-                x[:, :, 0],
-                conv.weight[:, :, -1],
-                conv.bias,
-                conv.stride[1:],
-                (top, left),
-                conv.dilation[1:],
-                conv.groups,
-            ),
-        ).unsqueeze(2)
-
-    def norm(norm: _Norm, x: _Tensor) -> _Tensor:
-        unit = cast("_Tensor", functional.normalize(x, dim=1 if norm.channel_first else -1))
-        return unit * norm.scale * norm.gamma + norm.bias
-
-    def upsample(upsample: object, x: _Tensor) -> _Tensor:  # nearest copies: exact in any dtype
-        return cast("_Tensor", module.nn.Upsample.forward(upsample, x))
-
-    for layer in vae.decoder.modules():
-        if isinstance(layer, causal):
-            conv = cast("_Conv", layer)
-            if (
-                conv.stride[0] == conv.dilation[0] == 1
-                and conv._padding[4] == conv.kernel_size[0] - 1 > 0
-            ):
-                conv.forward = MethodType(tap, conv)
-        elif isinstance(layer, module.QwenImageRMS_norm):
-            layer.forward = MethodType(norm, layer)
-        elif isinstance(layer, module.QwenImageUpsample) and cast("_Upsample", layer).mode in (
-            "nearest",
-            "nearest-exact",
-        ):
-            layer.forward = MethodType(upsample, layer)
-
-    stock = vae._decode
-
-    def decode(vae: _Qwen, z: _Tensor, return_dict: bool = True) -> object:
-        if vae.use_tiling or z.shape[2] != 1:
-            return stock(z, return_dict)
-        out = module.torch.clamp(vae.decoder(vae.post_quant_conv(z)), min=-1.0, max=1.0)
-        return module.DecoderOutput(sample=out) if return_dict else (out,)
-
-    vae._decode = MethodType(decode, vae)
-    return True
-
-
-def _digest(module: ModuleType) -> str:
-    try:
-        return hashlib.sha256(inspect.getsource(module).encode()).hexdigest()
-    except (OSError, TypeError):
-        return ""

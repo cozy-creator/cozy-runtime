@@ -2636,7 +2636,7 @@ class WeightResidency:
         for component in self.components.values():
             self._hook(component)
             vae: Any = component.root
-            if not weights.host_only and image_vae.exact(vae):
+            if image_vae.exact(vae):
                 vae.decode = self._decode(component.name, vae.decode)
 
     def _hook(self, component: Component) -> None:
@@ -3596,6 +3596,8 @@ class WeightResidency:
             exact = image_vae.plan(self.components[name].root, z, *args, **kwargs)
             if exact is None:
                 return decode(z, *args, **kwargs)
+            if weights.host_only:  # its weights are bound whole: no room to make
+                return exact.run()
             if self.active is not None:
                 weights.adaptive.add(self.active[0])
             free, evictable = self.room((name,))
