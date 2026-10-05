@@ -601,6 +601,23 @@ def test_the_execution_order_is_learned_then_streamed(card: Any) -> None:
     assert same(resident, run(model, x))
 
 
+@on_gpu
+def test_batch_fits_asks_an_unmeasured_method_with_what_earlier_executors_measured(
+    card: Any,
+) -> None:
+    """A fresh executor has measured nothing, and "unmeasured is yes" would batch cond and
+    uncond in a pool that cannot hold both. What the machine seeded for the method answers."""
+    weights = card.weights
+    residency = load(weights, card.checkpoint, "batch").residency
+    assert residency.batch_fits("run", 2), "measured nowhere: the first run measures"
+    weights.seed_activations({"run": torch.cuda.get_device_properties(0).total_memory})
+    assert not residency.batch_fits("run", 2)
+    assert weights.modes["run.batch"] == "1"
+    facts = weights.facts()
+    assert facts.bounce_copy_bytes == 0 and facts.register_failed >= 0
+    assert facts.h2d_bytes == 0 or facts.host_gbps + facts.bounce_gbps + facts.disk_gbps > 0
+
+
 @on_card
 def test_a_stage_entered_once_per_step_keeps_a_resident_set(card: Any) -> None:
     """SDXL's package enters its denoise scope once per step: each stage is one pass, and
