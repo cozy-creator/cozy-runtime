@@ -651,6 +651,38 @@ def test_a_component_converted_with_to_streams_in_that_dtype(card: Any) -> None:
     assert all(torch.equal(a, b) for a, b in zip(resident, streamed, strict=True))
 
 
+@on_gpu
+def test_a_component_cast_and_cast_back_in_its_stage_keeps_no_copy_after_it(card: Any) -> None:
+    """SDXL's decode upcasts its VAE and casts it back before its stage ends. The cast back
+    left a float16 copy of every weight in torch's memory beside the plane's bytes, across
+    requests: 169 MiB at an rtx-3070's 6 GiB, and the UNet streamed 8 to 22 blocks each warm
+    step. The stage's end lets the copies go, and the next stage computes the same bits."""
+    weights = card.weights
+    model = load(weights, card.checkpoint, "cast")
+    x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float32)
+    weights.set_budget(1 << 30)
+    total = model.residency.components["stack"].layout.total
+
+    def decode() -> Any:
+        model.residency.open_attempt()
+        model.residency.admit("decode", ("stack",))
+        try:
+            model.stack.to(torch.float32)
+            with torch.inference_mode():
+                out = model.stack(x)
+            model.stack.to(torch.float16)
+            return out
+        finally:
+            model.residency.release("decode", ("stack",))
+
+    before = torch.cuda.memory_allocated()
+    first = decode()
+    assert torch.cuda.memory_allocated() - before < total // 4
+    second = decode()
+    assert torch.cuda.memory_allocated() - before < total // 4
+    assert torch.equal(first, second) and first.dtype == torch.float32
+
+
 @on_card
 def test_an_activation_estimate_larger_than_the_card_never_refuses_the_stage(card: Any) -> None:
     """F, rtx-3070 with a 3 GiB pool: SDXL's decode seed (3.1 GB, its untiled peak at 1024²)
