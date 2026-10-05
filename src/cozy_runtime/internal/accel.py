@@ -412,14 +412,22 @@ def drain(torch: Any, kind: str) -> None:
         torch.cuda.current_stream().synchronize()
 
 
+#: torch's caching allocator, set in code before the first allocation: a segment grows by
+#: mapping only the pages a request adds and gives freed pages back the same way, so torch
+#: fragments less beside the plane's maps. The machine erases every `PYTORCH_` variable from
+#: an executor's environment: nothing outside the Runtime changes this.
+ALLOCATOR = "expandable_segments:True"
+
+
 def initialize(torch: Any, kind: str) -> None:
     """Bring the accelerator context up EAGERLY, so its cost is a measured prepare step
-    rather than a surprise inside the first kernel."""
+    rather than a surprise inside the first kernel. torch's allocator is configured first."""
     if kind == "mps":
         raise AcceleratorUnsupported("mps", "initialize")
     if sees_no_gpu():
         raise RuntimeError("this process sees no GPU (CUDA_VISIBLE_DEVICES is empty)")
     if kind == "cuda":
+        torch._C._accelerator_setAllocatorSettings(ALLOCATOR)
         torch.cuda.init()
 
 

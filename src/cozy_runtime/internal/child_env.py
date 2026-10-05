@@ -126,11 +126,6 @@ CHILD_ENV_ALLOWLIST: tuple[ProjectedVar, ...] = (
         "every formation completes. Erased then imposed, like the NVLS row",
     ),
     ProjectedVar(
-        "PYTORCH_CUDA_ALLOC_CONF",
-        "plan.allocator_policy",
-        "the CUDA caching allocator reads this once at init; late imposition is a no-op",
-    ),
-    ProjectedVar(
         "OMP_NUM_THREADS",
         "plan.cpu_threads",
         "thread cap must be set before torch import to bound host CPU in the executor",
