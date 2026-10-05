@@ -313,8 +313,8 @@ class Weights:
         self.clock = 0
         self.components: dict[str, Component] = {}
         self.activation: dict[str, int] = {}
-        #: the last stage plan's inputs (`driver_budget`), in the facts
-        self.plan_inputs: dict[str, int] = {}
+        #: each stage method's last plan inputs (`driver_budget`), in the facts
+        self.plan_inputs: dict[str, dict[str, int]] = {}
         #: per stage method, the most room torch had (`allocatable`) at an entry in which it
         #: dropped its whole cache more than once: under a limit torch refuses reserved plus
         #: one request, so a peak that fits can still squeeze. An entry of that method is
@@ -620,7 +620,7 @@ class Weights:
         # adaptive stage then keeps its maps in host memory; any other recovers from its
         # out-of-memory by unmapping.
         budget = max(weight_policy.plane_budget(available, growth), min(self.window(), available))
-        self.plan_inputs = {
+        self.plan_inputs[method] = {
             "driver_free": memory["driver_free_bytes"],
             "reserved": memory["reserved_bytes"],
             "allocated": memory["allocated_bytes"],
@@ -1262,7 +1262,7 @@ class Weights:
             bounce_gbps=gbps(device.bounce_copy_bytes, device.bounce_copy_ns),
             disk_gbps=gbps(device.disk_copy_bytes, device.disk_copy_ns),
             register_failed=held.host.register_failed,
-            plan_inputs=dict(self.plan_inputs),
+            plan_inputs={method: dict(row) for method, row in self.plan_inputs.items()},
             shared_bytes=device.shared_bytes,
             disk_read_bytes=held.host.disk_read_bytes,
             sealed_bytes=held.host.sealed_bytes,

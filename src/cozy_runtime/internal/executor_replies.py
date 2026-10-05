@@ -135,10 +135,10 @@ class PlaneFacts(msgspec.Struct, frozen=True, kw_only=True):
     disk_gbps: float = 0.0
     #: page locks the driver refused (a sealed layout counts once)
     register_failed: int = 0
-    #: the last stage plan's inputs, bytes: driver free, torch reserved and allocated, the
-    #: plane's committed and the bound weights' decoded copies, the stage's activation growth
-    #: and the budget that came out (`Weights.driver_budget`)
-    plan_inputs: dict[str, int] = {}
+    #: per stage method, its last plan's inputs, bytes: driver free, torch reserved and
+    #: allocated, the plane's committed and the bound weights' decoded copies, the stage's
+    #: activation growth and the budget that came out (`Weights.driver_budget`)
+    plan_inputs: dict[str, dict[str, int]] = {}
     #: GPU regions mapped from the machine's custody (`weights.attach/1`): outside
     #: `committed_bytes`, counted once by the machine
     shared_bytes: int = 0
