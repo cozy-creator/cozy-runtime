@@ -34,6 +34,9 @@ class DeviceRoom(_Request, frozen=True, kw_only=True, tag="device_room"):
     """Idle co-tenants of the executor's devices give `free_bytes` back."""
 
     free_bytes: int
+    #: what this process holds on its GPU now (context, torch's segments, plane maps), by its
+    #: own count: its last report to the machine may be its load's; -1 when unknown
+    holding_bytes: int = -1
 
 
 class ChildEvents(_Request, frozen=True, kw_only=True, tag="child_events"):
