@@ -371,6 +371,9 @@ class Invoke(_Run, frozen=True, kw_only=True, tag="invoke"):
     #: Activation growth per stage method the owner measured for this request's shape in
     #: earlier processes: a floor under this executor's own estimates, never a cap
     activation_bytes: dict[str, int] = {}
+    #: Per stage method, the most room torch had when an entry of it squeezed in an earlier
+    #: process at this request's shape (`Weights.squeezed`): its entries are given more
+    squeezed_bytes: dict[str, int] = {}
     #: The owner's Degree 2 for this attempt (`weights.attach/1`): True keeps GPU weights
     #: with the machine (attached, and offered at each stage's exit), False keeps them private
     #: (they stream); unset leaves the executor's current setting.

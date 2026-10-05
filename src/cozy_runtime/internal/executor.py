@@ -2805,6 +2805,7 @@ class Executor:
             # (its cursor at that request's end) never carries over. Its weights stay mapped.
             self._unpark()
             self.weights.seed_activations(command.activation_bytes)
+            self.weights.seed_squeezed(command.squeezed_bytes)
             if not isinstance(command.device_weights, UnsetType):
                 self._device_weights(command.device_weights)
         with self._turns(target.residency, command.stages and self.world == 1):

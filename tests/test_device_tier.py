@@ -40,24 +40,38 @@ class Custody:
         #: an older machine keys holdings by layout alone and never says `variants`
         self.variants = variants
         self.leases: list[socket.socket] = []
+        #: each holding's leases
+        self.readers: dict[tuple[str, str], list[socket.socket]] = {}
         #: a holder that names another layout than the one it was asked for
         self.layout_says = layout_says
 
-    def lease(self, channel: Channel) -> None:
+    def lease(self, channel: Channel, key: tuple[str, str]) -> None:
         ours, theirs = socket.socketpair()
         channel.send_lease(theirs.fileno())
         theirs.close()
         self.leases.append(ours)
+        self.readers.setdefault(key, []).append(ours)
 
-    def ended(self) -> list[bool]:
-        """Which leases the executor ended (closed, or died)."""
+    def ended(self, leases: list[socket.socket] | None = None) -> list[bool]:
+        """Which leases (all, in the order given out) the executor ended (closed, or died)."""
         out = []
-        for ours in self.leases:
+        for ours in self.leases if leases is None else leases:
             try:
                 out.append(ours.recv(1, socket.MSG_DONTWAIT) == b"")
             except BlockingIOError:
                 out.append(False)
         return out
+
+    def collect(self) -> int:
+        """Drop every holding no executor maps, as the machine does when one asks for room:
+        its fds close, and with them the last references to its GPU memory. Returns the bytes."""
+        freed = 0
+        for key in [k for k in self.held if all(self.ended(self.readers.get(k, [])))]:
+            regions, fds = self.held.pop(key)
+            for fd in fds:
+                os.close(fd)
+            freed += sum(sum(row["chunks"]) for row in regions)
+        return freed
 
     def serve(self, channel: Channel) -> None:
         while (frame := channel.recv()) is not None:
@@ -80,7 +94,7 @@ class Custody:
                 else:
                     self.held[key] = (frame["regions"], fds)
                     channel.send({**answer, "generation": 1, "lease": True})
-                    self.lease(channel)
+                    self.lease(channel, key)
                 continue
             held = self.held.get(key)
             if held is None:
@@ -101,7 +115,7 @@ class Custody:
             )
             for fd in kept:
                 channel.send_shared(fd)
-            self.lease(channel)
+            self.lease(channel, key)
 
     def regions(self, layout: str, variant: str) -> list[int]:
         return [row["region"] for row in self.held.get((layout, variant), ([], []))[0]]

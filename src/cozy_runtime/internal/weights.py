@@ -313,6 +313,13 @@ class Weights:
         self.clock = 0
         self.components: dict[str, Component] = {}
         self.activation: dict[str, int] = {}
+        #: per stage method, the most room torch had (`allocatable`) at an entry in which it
+        #: dropped its whole cache more than once: under a limit torch refuses reserved plus
+        #: one request, so a peak that fits can still squeeze. An entry of that method is
+        #: given more room first (`WeightResidency._clear`). Measured here or seeded.
+        self.squeezed: dict[str, int] = {}
+        #: those this request's own entries measured: what the owner keeps for its shape
+        self.squeezes: dict[str, int] = {}
         #: methods whose stage fits itself to the room it finds (an image VAE's decode maps):
         #: their activations never size a grant
         self.adaptive: set[str] = set()
@@ -433,6 +440,56 @@ class Weights:
         for method, nbytes in measured.items():
             if nbytes > self.activation.get(method, 0):
                 self.activation[method] = int(nbytes)
+
+    def seed_squeezed(self, measured: Mapping[str, int]) -> None:
+        """Rooms the owner saw squeeze these methods at this request's shape in earlier
+        processes (`squeezed`), as the request begins. Only ever raises one."""
+        self.squeezes = {}
+        for method, nbytes in measured.items():
+            self.squeezed[method] = max(self.squeezed.get(method, 0), int(nbytes))
+
+    def retries(self) -> int:
+        """Times torch dropped its whole cache to place one allocation, since the process began."""
+        if self.host_only:
+            return 0
+        return int(self.torch.cuda.memory_stats(self.device).get("num_alloc_retries", 0))
+
+    def page_out(self, keep: Collection[str]) -> bool:
+        """Give torch the device bytes of one component no stage uses now (none in `keep`): the
+        one with the fewest bytes to copy back, any that holds baked bytes (a bake to restore)
+        after the rest. Its own bytes leave the plane and its budget. Bytes mapped from the
+        machine's custody are let go and the machine is asked for them (`DeviceRoom`: it drops
+        a holding nobody maps, and this process's cap rises into that room). False: nothing
+        to give."""
+        asks = self.room is not None and self.cap >= 0
+        idle = [
+            (any(region.baked for region in c.regions), self.resident_bytes(c), key)
+            for key, c in self.components.items()
+            if key not in keep and (asks or not c.shared)
+        ]
+        idle = [row for row in idle if row[1] > 0]
+        if not idle:
+            return False
+        component = self.components[min(idle)[2]]
+        self.quiesce()
+        close_cursor(component)
+        try:
+            shared = self._release_shared(component, sorted(component.shared))
+            own = int(self.plane.drop(component.ws, self.index, None))
+        except plane.error("LeaseViolation"):
+            self.drain()  # something reads it after all: what did leave is unbound
+            return False
+        for region in component.regions:
+            unbind(region)
+            _unbaked(region)
+        if own:
+            # dropped bytes stay the plane's idle chunks until its budget leaves them no room
+            committed = max(plane.stats(self.plane).device(self.index).committed, 0)
+            self._apply(max(committed - own, 0))
+        if shared and self.room is not None:
+            free = accel.allocation(self.torch, self.kind)["driver_free_bytes"] - self.floor_free
+            self.room(max(free, 0) + shared - weight_policy.MARGIN)
+        return True
 
     def room_before(self, method: str) -> None:
         """Under a cap, before a stage plans: when other processes on the GPU leave less free
@@ -1187,6 +1244,7 @@ class Weights:
             cache_releases=sum(count for count, _ in accel.RELEASED.values()),
             cache_released_bytes=sum(freed for _, freed in accel.RELEASED.values()),
             cache_released_by={who: (n, freed) for who, (n, freed) in accel.RELEASED.items()},
+            squeezed=dict(self.squeezes),
             modes=dict(self.modes),
         )
 
@@ -2531,6 +2589,8 @@ class WeightResidency:
         self.per_item: dict[str, int] = {}
         self.batch: dict[str, int] = {}
         self.baseline = -1
+        #: torch's room and its cache drops so far, at the open entry's start
+        self.pressure = (0, 0)
         self.derived_at_open = 0
         #: The scheduler's turn (W4, `stage/1`): called before a stage plans, returns the
         #: plane budget the Worker granted for it, or None to keep the current one; and its
@@ -2615,6 +2675,7 @@ class WeightResidency:
         self.entries[method] = self.entries.get(method, 0) + 1
         self.repeats[method] = max(self.repeats.get(method, 0), self.entries[method])
         weights.hold_host()
+        self._clear(method, local)
         weights.room_before(method)
         if weights.host_only:  # everything is bound in place already; no device to measure
             self.active = (method, local)
@@ -2665,6 +2726,21 @@ class WeightResidency:
             self._left()
             raise
         self._entered(method)
+
+    def _clear(self, method: str, local: Sequence[str]) -> None:
+        """Before an entry of `method`: while torch has no more room than an entry of it is
+        known to squeeze in (`Weights.squeezed`), components no stage uses now leave the
+        device, the cheapest to restore first. They fill again when their own stage opens."""
+        weights = self.weights
+        bound = weights.squeezed.get(method)
+        if bound is None or weights.host_only or weights.grouped:
+            return
+        keep = {self.components[name].key for name in local} | set(weights.opened())
+        for row in weights.residencies:
+            if row.parked is not None:
+                keep.update(row.components[name].key for name in row.parked[1])
+        while weights.allocatable() <= bound + weight_policy.MARGIN and weights.page_out(keep):
+            pass
 
     def _acquire_common(self, method: str, component: Component, budget: int, stream: Any) -> Any:
         """The stage's common region's lease; short of device memory, the owner is asked for
@@ -2822,6 +2898,7 @@ class WeightResidency:
             if self.components[name].fine:  # the run's record of how tight its memory was
                 weights.modes[f"{name}.grain"] = "sub-block"
         self.baseline = accel.allocated(weights.torch, weights.kind)
+        self.pressure = (weights.allocatable(), weights.retries())
         accel.reset_peak(weights.torch, weights.kind)
         self.entered_ns = time.perf_counter_ns()
         if self.exit is not None:
@@ -2867,6 +2944,12 @@ class WeightResidency:
             )
             self.peaks[method] = max(self.peaks.get(method, 0), peak)
             weights.activation[method] = max(weights.activation.get(method, 0), peak)
+            room, dropped = self.pressure
+            if weights.retries() - dropped > 1:
+                # One drop clears another stage's cache; a second in the same entry is this
+                # stage's own blocks against torch's limit: the room it had squeezes it.
+                room = max(weights.squeezed.get(method, 0), room)
+                weights.squeezed[method] = weights.squeezes[method] = room
             item = peak // max(self.batch.pop(method, 1), 1)
             self.per_item[method] = max(self.per_item.get(method, 0), item)
         self.baseline = -1
