@@ -4005,7 +4005,8 @@ class Executor:
         """Ask the worker for `free_bytes` free on this GPU from its other tenants; it answers
         once they gave what they could, with this process's cap raised into that room when it
         holds one (an older worker refuses, and nothing changes)."""
-        answer = self._durable(DeviceRoom(free_bytes=free_bytes), Room)
+        held = self.weights._held()[1] if self.weights is not None else -1
+        answer = self._durable(DeviceRoom(free_bytes=free_bytes, holding_bytes=held), Room)
         if answer.ok and answer.cap_bytes >= 0 and self.weights is not None:
             self.weights.set_cap(answer.cap_bytes)
 

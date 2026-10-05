@@ -2760,11 +2760,12 @@ class WeightResidency:
             pass
 
     def _squeezing(self) -> None:
-        """At a pass boundary inside a stage: torch dropped its whole cache more than once since
-        the entry or the last page-out, so the room it has squeezes this entry (one stage can
-        be a whole denoise, a pass each step). The room is kept for later entries and
+        """At an outer block boundary inside a stage: torch dropped its whole cache more than
+        once since the entry or the last page-out, so the room it has squeezes this entry (one
+        stage can be a whole denoise). Read at every block, so it acts within the step that
+        squeezes (one read, 11 us on an RTX 4070). The room is kept for later entries and
         executors, and the idle component cheapest to restore leaves now: never one an open or
-        repeating stage uses (`_in_use`), so never one `_spare` gave back either."""
+        repeating stage uses (`_in_use`), so never one `_spare` gave back."""
         weights = self.weights
         if self.active is None or self.baseline < 0 or weights.grouped or weights.mapping:
             return
@@ -3346,8 +3347,8 @@ class WeightResidency:
             self._observe(component, region.index)
             if component.passes > passes:
                 weights.hold_host()
-                if not weights.running:  # a pass boundary, before this block leases anything
-                    self._squeezing()
+            if not weights.running:  # a block boundary, before this block leases anything
+                self._squeezing()
             if weights.growing and component.passes == 2 > passes:
                 self._grow()
             if component.spared:

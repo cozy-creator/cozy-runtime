@@ -161,7 +161,7 @@ def test_a_stage_squeezed_inside_one_entry_pages_out_at_its_next_block(tmp_path:
                 for share in (0.48, 0.54, 0.55):
                     torch.empty(int(room * share), dtype=torch.uint8, device="cuda")
                 retries.append(weights.retries() - dropped)
-                out = [a.stack(x)]  # its first pass boundary: the idle component leaves
+                out = [a.stack(x)]  # its first block boundary: the idle component leaves
                 retries.append(weights.retries())
                 # Larger than the block torch keeps (so it has to grow it): over the room
                 # beside that block, and under that room plus the idle component's bytes.
