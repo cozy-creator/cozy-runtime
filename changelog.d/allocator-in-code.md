@@ -1,0 +1,1 @@
+torch's caching allocator is configured in code when the accelerator initializes (`expandable_segments:True`, `accel.ALLOCATOR`), no longer by a `PYTORCH_CUDA_ALLOC_CONF` the machine imposes; `PYTORCH_CUDA_ALLOC_CONF` is off the child environment allowlist.
