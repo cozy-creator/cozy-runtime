@@ -1,6 +1,6 @@
 [project]
 name = "cozy-runtime"
-version = "0.18.102"
+version = "0.19.0"
 description = "Cozy v2 worker runtime: author surface, worker, executor"
 # The upstream Apache-2.0 LICENSE/NOTICE ride every wheel: the cp312-abi3 wheel carries
 # the derived native kernels, and shipping them from the pure wheel too keeps one manifest.
@@ -13,7 +13,7 @@ requires-python = ">=3.12"
 # what `worker-protocol/scripts/vendored-diff.sh` checks (#536d), and it is why the copy no
 # longer carries the old import rewrite.
 dependencies = [
-    "tensorfs>=0.3.90,<0.4",
+    "tensorfs>=0.4,<0.5",
     "cryptography>=45",
     "grpcio>=1.76",
     "msgspec>=0.19",
@@ -33,7 +33,7 @@ dev = [
     "cozy-eval==0.7.2",
     "ruff>=0.16",
     # Model-bound Runtime tests exercise the real compiled storage boundary.
-    "tensorfs>=0.3.90,<0.4",
+    "tensorfs>=0.4,<0.5",
     "types-protobuf>=6.30",
     "av>=18.1,<19",
     # CI partitions this unchanged suite across independent delegated runners.
@@ -193,7 +193,7 @@ media = [
 # capability; base worker images provide TensorFS from the same PyPI range.
 # 0.3.82 hedges slow tail objects as fresh ranges (run 2322); 0.3.83 asks a wedged Hub again;
 # 0.3.84 carries the weight plane (`tensorfs.plane`) that executors load weights through.
-model-execution = ["tensorfs>=0.3.90,<0.4"]
+model-execution = ["tensorfs>=0.4,<0.5"]
 # peft takes any transformers. Without these floors a resolver that picks huggingface-hub 2.x
 # first backtracks to transformers 4.12, whose tokenizers has no wheel.
 adapters = [

@@ -398,7 +398,7 @@ wheels = [
 
 [[package]]
 name = "cozy-runtime"
-version = "0.18.102"
+version = "0.19.0"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },
@@ -487,8 +487,8 @@ requires-dist = [
     { name = "protobuf", specifier = ">=6.31" },
     { name = "safetensors", marker = "extra == 'minimax-h3'", specifier = ">=0.8.0" },
     { name = "safetensors", marker = "extra == 'qwen-image21'", specifier = ">=0.8" },
-    { name = "tensorfs", specifier = ">=0.3.90,<0.4" },
-    { name = "tensorfs", marker = "extra == 'model-execution'", specifier = ">=0.3.90,<0.4" },
+    { name = "tensorfs", specifier = ">=0.4,<0.5" },
+    { name = "tensorfs", marker = "extra == 'model-execution'", specifier = ">=0.4,<0.5" },
     { name = "tokenizers", marker = "extra == 'adapters'", specifier = ">=0.23.1" },
     { name = "tokenizers", marker = "extra == 'minimax-h3'", specifier = ">=0.23.1" },
     { name = "tokenizers", marker = "extra == 'qwen-image21'", specifier = ">=0.23.1" },
@@ -514,7 +514,7 @@ dev = [
     { name = "pytest", specifier = ">=8.4" },
     { name = "pytest-split", specifier = ">=0.11.0" },
     { name = "ruff", specifier = ">=0.16" },
-    { name = "tensorfs", specifier = ">=0.3.90,<0.4" },
+    { name = "tensorfs", specifier = ">=0.4,<0.5" },
     { name = "types-protobuf", specifier = ">=6.30" },
 ]
 
@@ -1843,11 +1843,10 @@ wheels = [
 
 [[package]]
 name = "tensorfs"
-version = "0.3.90"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/5a/7b/52c67f95416f8c609ce418553d558f52f906d174ee185cb50d832aa8528a/tensorfs-0.3.90.tar.gz", hash = "sha256:a50dde68c2535b13e9a1023d7e58a3856ffa3b7b5b08c71e58f9efe854a17029", size = 1087027, upload-time = "2026-10-02T07:44:24.097Z" }
+version = "0.4.0"
+source = { registry = "/home/fidika/cozy_v2/outputs/codex-current-artifact-cohort-20261005/provided-tensorfs" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/d9/77/071ca9d554588da856715cb7032df53789cb17add07b86cc6fcc20eb77e4/tensorfs-0.3.90-cp312-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:93e6cbc7733572fb7fa9e3c7e35392e778ff92358d1d1bb8bb1d0a40b386bb57", size = 9039173, upload-time = "2026-10-02T07:44:21.474Z" },
+    { path = "/home/fidika/cozy_v2/outputs/codex-current-artifact-cohort-20261005/provided-tensorfs/tensorfs-0.4.0-cp312-abi3-manylinux_2_28_x86_64.whl" },
 ]
 
 [[package]]
