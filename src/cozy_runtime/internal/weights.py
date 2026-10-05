@@ -19,7 +19,7 @@ import re
 import time
 import weakref
 import zlib
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field, replace
 from types import ModuleType
@@ -249,8 +249,8 @@ class Component:
     numbers: dict[int, int] = field(default_factory=dict)
     #: a CPU executor's weight set, mapped from its pinned tier (the bytes it binds)
     mapping: Any = None
-    #: the pinned tier's fill in flight (a weight set closes only after it)
-    filling: Ticket | None = None
+    #: the pinned tier's fills in flight, one per region (a weight set closes only after them)
+    filling: list[Ticket] = field(default_factory=list)
     #: region indexes mapped from GPU memory the machine keeps (`weights.attach/1`)
     shared: set[int] = field(default_factory=set)
     #: the machine's lease sockets for those regions: open while they are mapped, closed (by
@@ -329,8 +329,10 @@ class Weights:
         #: the GPUs of its group: each pins its own weights, so each takes this share of a
         #: host budget the Worker states for the whole group
         self.world = 1
-        #: blocks in their forward now (their leases pin their own weights)
-        self.running = 0
+        #: the components of the blocks in their forward now (their leases pin their own
+        #: weights), innermost last; and the component whose block ran last
+        self.running: list[str] = []
+        self.last = ""
         #: a read outside a module's forward is being mapped (`reading`)
         self.mapping = False
         #: a group's stage whose activations are not measured yet runs its first pass at the
@@ -625,33 +627,49 @@ class Weights:
             yield seen
 
     def make_room(self, need: int, operands: Sequence[object], op: str = "") -> None:
-        """An op outside every block ran out of device memory: unmap `need` bytes of weights,
-        idle ones first. An operand that is itself a weight must still be mapped after."""
+        """An op ran out of device memory (outside every block, or inside one whose ops
+        recover one by one): unmap `need` bytes of weights, idle ones first. When the open
+        stages' floor leaves nothing to unmap, their components that are not in use give
+        theirs back (`_spare`): every one but those the op reads, those with a block in its
+        forward, and the one whose block ran last. An operand that is itself a weight must
+        still be mapped after."""
         read = [
-            (region, region.bound)
+            (component.key, region, region.bound)
             for pointer in _pointers(operands)
             for component in self.components.values()
             for region in component.regions
             if region.bound is not None and region.bound <= pointer < region.bound + region.span
         ]
+
+        def mapped() -> None:
+            if any(region.bound != address for _, region, address in read):
+                raise ResidencyRefusal(
+                    INDIVISIBLE,
+                    f"{op or 'an allocation'} needs {need} B of device memory at once beside "
+                    "the weights it reads, and the GPU cannot give that with them mapped",
+                )
+
         accel.release_cached(self.torch, self.kind)
         before = self.allocatable()
-        if self.running:
-            # Inside a block (one GPU of a group): nothing is re-placed under its lease. Other
-            # weights leave, least recently used first; their blocks map them again as they run.
-            self.shrink(need, self.floor())
-            self.drain()
-        elif self.open:
-            self.open[-1][0]._make_room(need, op=op)
-        else:
-            self.shrink(need, 0)
-        if any(region.bound != address for region, address in read):
-            raise ResidencyRefusal(
-                INDIVISIBLE,
-                f"{op or 'an allocation'} needs {need} B of device memory at once beside the "
-                "weights it reads, and the GPU cannot give that with them mapped",
-            )
-        self.progressed(before, need, op)
+        try:
+            if self.running:
+                # Inside a block: nothing is re-placed under its lease. Other weights leave,
+                # least recently used first; their blocks map them again as they run.
+                self.shrink(need, self.floor())
+                self.drain()
+            elif self.open:
+                self.open[-1][0]._make_room(need, op=op)
+            else:
+                self.shrink(need, 0)
+            mapped()
+            self.progressed(before, need, op)
+        except ResidencyRefusal as exc:
+            keep = {*self.running, self.last, *(key for key, _, _ in read)}
+            if exc.code != INDIVISIBLE or not self.open:
+                raise
+            if not self.open[-1][0]._spare(keep, None if self.running else {}):
+                raise
+            mapped()
 
     def allocatable(self) -> int:
         """Device bytes torch can allocate now: its headroom plus its own idle cache."""
@@ -1060,15 +1078,17 @@ class Weights:
                 break
             room -= region.span
             regions.append(region.index)
-        if not regions:
-            return 0
-        try:
-            component.filling = self.plane.want(
-                component.ws, plane.PINNED, regions, priority=self.tick()
-            )
-        except (plane.error("Shortfall"), plane.error("BelowFloor")):
-            return 0
-        return sum(component.regions[i].span for i in regions)
+        # One ticket per region: the tier is shrinkable, and a ticket over several reports the
+        # first region the tier gave back instead of waiting for the others (run 4365).
+        priority, asked = self.tick(), 0
+        for index in regions:
+            try:
+                ticket = self.plane.want(component.ws, plane.PINNED, [index], priority=priority)
+            except (plane.error("Shortfall"), plane.error("BelowFloor")):
+                break
+            component.filling.append(ticket)
+            asked += component.regions[index].span
+        return asked
 
     def forget(self, construction: str) -> None:
         """Close `construction`'s weight sets and give their device handles back to the
@@ -1089,9 +1109,12 @@ class Weights:
             region.views.clear()
         component.mapping = None
         component.shared.clear()
-        if component.filling is not None:
-            component.filling.wait()  # a filling tier refuses to close
-            component.filling = None
+        for ticket in component.filling:
+            # A filling tier refuses to close. A region the tier gave back since, or whose
+            # fill failed, is not filling: either way the set can close.
+            with suppress(plane.error("PlaneError")):
+                ticket.wait()
+        component.filling.clear()
         try:
             component.ws.close()
         except plane.error("LeaseViolation"):
@@ -3236,11 +3259,12 @@ class WeightResidency:
                 try:
                     try:
                         bind(torch, region, lease, refill=True)
-                        weights.running += 1
+                        weights.running.append(component.key)
+                        weights.last = component.key
                         try:
                             return forward(*args, **kwargs)
                         finally:
-                            weights.running -= 1
+                            weights.running.pop()
                     except _Stale:
                         stale = True
                     except Exception as exc:
@@ -3355,23 +3379,26 @@ class WeightResidency:
         try:
             weights.progressed(before, need, op or f"{method}()")
         except ResidencyRefusal:
-            if not self._spare(resume):
+            if not self._spare(resume, resume):
                 raise
 
-    def _spare(self, running: Mapping[str, int]) -> bool:
+    def _spare(self, keep: Collection[str], resume: Mapping[str, int] | None) -> bool:
         """Activations first, past the stage's floor. A stage that scopes several components
         (Anima's `render`: conditioner, text encoder, transformer and VAE) keeps every one's
-        common region leased and bound for the whole stage; while one of them runs out of
-        memory, the others give theirs back: leases released, regions unbound and unmapped.
-        A read of one meanwhile maps it for that op (`Weights.reading`), and its next block
-        maps its common again (`_unspare`). False when nobody else held anything."""
+        common region leased and bound for the whole stage; while memory runs out, those not
+        in `keep` give theirs back: leases released, regions unbound and unmapped. A read of
+        one meanwhile maps it for that op (`Weights.reading`), and its next block maps its
+        common again (`_unspare`). The open stages are re-placed with `resume` (None: a block
+        is in its forward, and nothing is re-placed under its lease). False when nothing is
+        kept (nothing is known to be in use) or nobody else held anything."""
         weights = self.weights
-        if weights.host_only or not running:  # only a block's own retry spares the others
+        opened = weights.opened()
+        if weights.host_only or not any(key in opened for key in keep):
             return False
         idle = [
             component
-            for key, (_, _, component) in weights.opened().items()
-            if key not in running and not component.spared
+            for key, (_, _, component) in opened.items()
+            if key not in keep and not component.spared
         ]
         if not idle:
             return False
@@ -3394,7 +3421,8 @@ class WeightResidency:
         # Dropped regions stay mapped as the plane's idle cache until its budget leaves them
         # no room: the plane keeps what the running component streams in, torch the rest.
         weights._apply(min(weights.applied, max(weights.window(), weights.floor())))
-        self._place(weights.applied, running)
+        if resume is not None:
+            self._place(weights.applied, resume)
         after = max(plane.stats(weights.plane).device(weights.index).committed, 0)
         if after >= before:
             return False

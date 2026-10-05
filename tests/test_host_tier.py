@@ -64,17 +64,34 @@ def test_a_pinned_budget_given_with_the_load_bounds_the_fill_from_its_first_byte
     weights = GpuTier(torch, torch.device("cpu"), "cpu")
     weights.set_budget(-1, budget)  # what `Executor.load` applies from `Load.pinned_bytes`
     filling = load(weights, checkpoint, "bounded").residency.components["stack"].filling
-    assert filling is not None
-    filling.wait()
+    assert filling
+    for ticket in filling:
+        ticket.wait()
     held = plane.stats(weights.plane).host
     assert 0 < held.fill_bytes <= held.used <= budget == held.budget, held
     assert held.evictions == 0, held
 
     unbounded = GpuTier(torch, torch.device("cpu"), "cpu")
     filling = load(unbounded, checkpoint, "own").residency.components["stack"].filling
-    assert filling is not None
-    filling.wait()
+    assert filling
+    for ticket in filling:
+        ticket.wait()
     assert plane.stats(unbounded.plane).host.used > budget  # its own share holds the set
+
+
+def test_a_weight_set_closes_after_its_pinned_tier_gave_regions_back(tmp_path: Path) -> None:
+    """Run 4365 (SDXL in a 1 GiB pool): the host had less, the pinned tier gave back regions
+    its fill had asked for, and closing the set (to refine it) reported `region 80 left the
+    pinned tier` as the run's failure. The tier is optional: the set closes."""
+    weights = GpuTier(torch, torch.device("cpu"), "cpu")
+    weights.set_budget(-1, 1 << 30)
+    component = load(weights, write_checkpoint(tmp_path)[0], "shrunk").residency.components["stack"]
+    for ticket in component.filling:
+        ticket.wait()
+    weights._pin(component.regions[0].span)  # the host has room for one region now
+    assert plane.stats(weights.plane).host.evictions > 0
+    weights.forget("shrunk")
+    assert not component.filling
 
 
 #: Runs inside a small cgroup: fill the host tier of every weight set given, as a GPU executor
@@ -126,8 +143,8 @@ weights = GpuTier(torch, torch.device("cpu"), "cpu")
 started, models, throttled = time.monotonic(), [], False
 for index, (root, manifest) in enumerate(json.loads(sys.argv[2])):
     models.append(load(weights, Checkpoint(root, manifest), f"set{index}"))
-    ticket = models[-1].residency.components["stack"].filling
-    while ticket is not None and not ticket.done() and not throttled:
+    tickets = models[-1].residency.components["stack"].filling
+    while not all(ticket.done() for ticket in tickets) and not throttled:
         throttled = sum(held()) >= high
         time.sleep(0.01)
     if throttled:

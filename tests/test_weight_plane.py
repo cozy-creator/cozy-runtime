@@ -34,8 +34,10 @@ from cozy_runtime.internal.derive import Observations, serving_substrate  # noqa
 from cozy_runtime.internal.encoding import SPEC_PLAIN  # noqa: E402
 from cozy_runtime.internal.fill import Checkpoint  # noqa: E402
 from cozy_runtime.internal.weights import (  # noqa: E402
+    INDIVISIBLE,
     HostTiers,
     PlaneBackend,
+    ResidencyRefusal,
     WeightResidency,
     Weights,
 )
@@ -1138,13 +1140,10 @@ class Table(torch.nn.Module):  # type: ignore[misc,name-defined]
         return x * torch.nn.functional.embedding(rows, self.table)
 
 
-@on_card
-def test_a_stage_spares_its_idle_components_for_the_one_that_runs(tmp_path: Path) -> None:
-    """Anima scopes its conditioner, text encoder, transformer and VAE in one stage, and each
-    component's common region stays leased for all of it: at a 1.25 GiB pool the second
-    request's transformer had 173 MB for its activations beside 675 MB of idle components.
-    While the running component cannot get memory, the others give theirs back; a read of one
-    maps it for that op, and the results are the same bits."""
+def scoped(tmp_path: Path) -> tuple[Weights, WeightResidency, dict[str, Any]]:
+    """One stage that scopes a block stack and a blockless encoder, as Anima's `render` scopes
+    its conditioner, text encoder, transformer and VAE: each one's common region stays leased
+    for all of it."""
     weights = Weights(torch, torch.device("cuda", 0), "cuda")
     weights.set_budget(1 << 30, pinned=1 << 30)
     stack_checkpoint, _ = write_checkpoint(tmp_path / "stack")
@@ -1172,8 +1171,20 @@ def test_a_stage_spares_its_idle_components_for_the_one_that_runs(tmp_path: Path
     for destination in walked.destinations:
         backend.fill(destination.key, destination.spec, live[destination.key])
     backend.commit()
+    residency = WeightResidency(
+        weights, backend.components, {"run": ("encoder", "stack")}, refine=backend.refine
+    )
+    return weights, residency, modules
+
+
+@on_card
+def test_a_stage_spares_its_idle_components_for_the_one_that_runs(tmp_path: Path) -> None:
+    """At a 1.25 GiB pool Anima's second request's transformer had 173 MB for its activations
+    beside 675 MB of idle components. While the running component cannot get memory, the
+    others give theirs back; a read of one maps it for that op, and the results are the same
+    bits."""
+    weights, residency, modules = scoped(tmp_path)
     scope = ("encoder", "stack")
-    residency = WeightResidency(weights, backend.components, {"run": scope}, refine=backend.refine)
     x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
 
     residency.admit("run", scope)
@@ -1190,7 +1201,7 @@ def test_a_stage_spares_its_idle_components_for_the_one_that_runs(tmp_path: Path
         with torch.inference_mode():
             assert torch.equal(modules["encoder"](x), encoded)
             mapped = weights.facts().committed_bytes
-            assert residency._spare({stack.key: 0})
+            assert residency._spare({stack.key}, {stack.key: 0})
             assert encoder.spared and encoder.lease is None and encoder.common.bound is None
             assert weights.facts().committed_bytes <= mapped - encoder.common.span
             # the running component is untouched, and a read of the spared one maps it
@@ -1202,6 +1213,43 @@ def test_a_stage_spares_its_idle_components_for_the_one_that_runs(tmp_path: Path
     residency.unpark()  # a repeating stage stays open until the next request plans afresh
     assert not encoder.spared, "a stage's end clears it"
     assert weights.facts().oom_retries >= 1
+
+
+@on_card
+def test_an_op_out_of_memory_spares_the_components_not_in_use(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Runs 4360-4369 (Anima in a 1 GiB pool on an RTX 3070, a 758 MiB process cap): an op that
+    recovers by itself (in a block's first run, in a kernel between blocks) asked for 36 MiB
+    beside 420 MB of the stage's other components, and only a block's own retry spared them.
+    When unmapping to the stage's floor gives nothing back, an op's retry spares them too:
+    every component but the one whose block ran last and those the op reads."""
+    weights, residency, modules = scoped(tmp_path)
+    scope = ("encoder", "stack")
+    x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
+    encoder, stack = residency.components["encoder"], residency.components["stack"]
+    progressed, full = weights.progressed, [ResidencyRefusal(INDIVISIBLE, "a full card")]
+
+    def nothing_came_back(*args: Any) -> None:
+        if full:
+            raise full.pop()
+        progressed(*args)
+
+    residency.admit("run", scope)
+    try:
+        with torch.inference_mode():
+            encoded = modules["encoder"](x)
+            reference = modules["stack"](encoded)  # the stack's blocks ran last
+            mapped = weights.facts().committed_bytes
+            monkeypatch.setattr(weights, "progressed", nothing_came_back)
+            weights.make_room(1 << 20, (encoded,), "aten.clone.default")
+            assert not full and encoder.spared and not stack.spared
+            assert weights.facts().committed_bytes <= mapped - encoder.common.span
+            assert torch.equal(modules["stack"](encoded), reference)
+            assert torch.equal(modules["encoder"](x), encoded)
+    finally:
+        residency.release("run", scope)
+    residency.unpark()
 
 
 @on_card
