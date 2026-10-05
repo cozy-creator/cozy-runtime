@@ -28,8 +28,9 @@ except ImportError:  # an older TensorFS: the executor offers no `weight_plane/1
 #: The executor capability a Worker negotiates on (`hello.memory`).
 CAPABILITY = "weight_plane/1"
 #: GPU memory the machine keeps across executors: attach on `Load.device_weights`, `share`
-#: after a call, `revoke` (TensorFS `Plane.export_device`).
-SHARING = ("weights.attach/1", "weights.revoke/1")
+#: after a call, `revoke` all of a layout or `trim` some of its regions (TensorFS
+#: `Plane.export_device`).
+SHARING = ("weights.attach/1", "weights.revoke/1", "weights.trim/1")
 PINNED: Final = "pinned"
 #: Priorities are plain integers; the plane evicts ascending and never picks among equals, so
 #: every band carries the LRU clock. Idle regions (a finished stage's) sit lowest; a running
