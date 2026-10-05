@@ -148,11 +148,13 @@ class PlaneFacts(msgspec.Struct, frozen=True, kw_only=True):
     oom_retries: int = 0
     #: torch's allocator short of room: times it dropped its whole cache to place one
     #: allocation, and out-of-memory errors it raised; then this process's own cache releases
-    #: that returned something, and their bytes. A stage with room shows none of the first two.
+    #: that returned something, their bytes, and both by the function that asked. A stage
+    #: with room shows none of the first two.
     alloc_retries: int = 0
     alloc_ooms: int = 0
     cache_releases: int = 0
     cache_released_bytes: int = 0
+    cache_released_by: dict[str, tuple[int, int]] = {}
     #: The decode mode and CFG layout each stage chose, e.g. {"vae.decode": "chunked 32 host"}
     modes: dict[str, str] = {}
 

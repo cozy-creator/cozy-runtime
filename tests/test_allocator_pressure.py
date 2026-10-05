@@ -45,5 +45,7 @@ def test_facts_count_a_cache_torch_dropped_for_one_allocation() -> None:
         after = weights.facts()
         assert after.cache_releases == squeezed.cache_releases + 1
         assert after.cache_released_bytes - squeezed.cache_released_bytes >= 640 * MIB
+        mine = test_facts_count_a_cache_torch_dropped_for_one_allocation.__name__
+        assert after.cache_released_by[mine][1] >= 640 * MIB, "named by the function that asked"
     finally:
         torch.cuda.set_per_process_memory_fraction(1.0, 0)
