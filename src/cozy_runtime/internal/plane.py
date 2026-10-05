@@ -55,6 +55,8 @@ class HostStats(msgspec.Struct, frozen=True, kw_only=True):
     #: RAM of the machine's sealed layouts this plane maps (theirs, not this process's)
     sealed_bytes: int = 0
     evictions: int = 0
+    #: page locks the driver refused (a sealed layout counts once): those copies bounce
+    register_failed: int = 0
 
 
 class DeviceStats(msgspec.Struct, frozen=True, kw_only=True):
@@ -63,8 +65,14 @@ class DeviceStats(msgspec.Struct, frozen=True, kw_only=True):
     committed: int = -1
     leased_bytes: int = 0
     held_bytes: int = 0
+    #: one DMA from page-locked host memory
     host_copy_bytes: int = 0
     host_copy_ns: int = 0
+    #: host memory that could not be page-locked, through the staging buffers (TensorFS with
+    #: no pageable copies; 0 before, when such copies counted as host copies)
+    bounce_copy_bytes: int = 0
+    bounce_copy_ns: int = 0
+    #: the object files, through the staging buffers
     disk_copy_bytes: int = 0
     disk_copy_ns: int = 0
     #: shared regions mapped here (exported or attached): outside `committed` and the budget

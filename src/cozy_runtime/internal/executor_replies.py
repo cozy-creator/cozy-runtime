@@ -127,6 +127,18 @@ class PlaneFacts(msgspec.Struct, frozen=True, kw_only=True):
     #: and straight from the page cache (it did not either)
     disk_copy_bytes: int = 0
     mapped_copy_bytes: int = 0
+    #: of those, host memory this process could not page-lock, through the staging buffers;
+    #: the rest of the host bytes were one DMA each. Each path's own rate (bytes / ns)
+    bounce_copy_bytes: int = 0
+    host_gbps: float = 0.0
+    bounce_gbps: float = 0.0
+    disk_gbps: float = 0.0
+    #: page locks the driver refused (a sealed layout counts once)
+    register_failed: int = 0
+    #: the last stage plan's inputs, bytes: driver free, torch reserved and allocated, the
+    #: plane's committed and the bound weights' decoded copies, the stage's activation growth
+    #: and the budget that came out (`Weights.driver_budget`)
+    plan_inputs: dict[str, int] = {}
     #: GPU regions mapped from the machine's custody (`weights.attach/1`): outside
     #: `committed_bytes`, counted once by the machine
     shared_bytes: int = 0

@@ -313,6 +313,8 @@ class Weights:
         self.clock = 0
         self.components: dict[str, Component] = {}
         self.activation: dict[str, int] = {}
+        #: the last stage plan's inputs (`driver_budget`), in the facts
+        self.plan_inputs: dict[str, int] = {}
         #: per stage method, the most room torch had (`allocatable`) at an entry in which it
         #: dropped its whole cache more than once: under a limit torch refuses reserved plus
         #: one request, so a peak that fits can still squeeze. An entry of that method is
@@ -610,13 +612,27 @@ class Weights:
         slack = max(memory["reserved_bytes"] - memory["allocated_bytes"], 0)
         growth = max(self.activation.get(method, 0) - slack, 0)
         # the bound weights' decoded copies are the weights' own, in torch's bytes
-        held = committed + self.decoded()
+        decoded = self.decoded()
+        held = committed + decoded
         available = self.headroom(memory) + held
         # Activations first, but never below the open stages' floor while that fits: an
         # estimate that left a stage no room for its own weights would refuse it for size. An
         # adaptive stage then keeps its maps in host memory; any other recovers from its
         # out-of-memory by unmapping.
-        return max(weight_policy.plane_budget(available, growth), min(self.window(), available))
+        budget = max(weight_policy.plane_budget(available, growth), min(self.window(), available))
+        self.plan_inputs = {
+            "driver_free": memory["driver_free_bytes"],
+            "reserved": memory["reserved_bytes"],
+            "allocated": memory["allocated_bytes"],
+            "committed": committed,
+            "decoded": decoded,
+            "activation": self.activation.get(method, 0),
+            "growth": growth,
+            "cap": self.cap,
+            "context": self.context_bytes,
+            "budget": budget,
+        }
+        return budget
 
     def window(self) -> int:
         """What the open stages stream in at least: each component's common weights and two
@@ -1202,7 +1218,7 @@ class Weights:
                 component.key, self.index
             )
         stages = [row for row in held.stages if row.device == self.index]
-        copied = device.host_copy_bytes + device.disk_copy_bytes
+        copied = device.host_copy_bytes + device.bounce_copy_bytes + device.disk_copy_bytes
         reserved = -1 if self.host_only else int(self.torch.cuda.memory_reserved(self.device))
         # This process's own count (per-process NVML only refines the context in it); an
         # unmeasured context counts nothing rather than hiding the rest.
@@ -1211,7 +1227,11 @@ class Weights:
             if reserved >= 0
             else -1
         )
-        copy_ns = device.host_copy_ns + device.disk_copy_ns
+        copy_ns = device.host_copy_ns + device.bounce_copy_ns + device.disk_copy_ns
+
+        def gbps(nbytes: int, ns: int) -> float:
+            return round(nbytes / ns, 3) if ns else 0.0
+
         allocator = {} if self.host_only else self.torch.cuda.memory_stats(self.device)
         return PlaneFacts(
             budget_bytes=device.budget,
@@ -1234,9 +1254,15 @@ class Weights:
                 if component.residence is not None
             },
             h2d_bytes=copied,
-            h2d_gbps=round(copied / copy_ns, 3) if copy_ns else 0.0,
+            h2d_gbps=gbps(copied, copy_ns),
             disk_copy_bytes=device.disk_copy_bytes,
             mapped_copy_bytes=device.mapped_copy_bytes,
+            bounce_copy_bytes=device.bounce_copy_bytes,
+            host_gbps=gbps(device.host_copy_bytes, device.host_copy_ns),
+            bounce_gbps=gbps(device.bounce_copy_bytes, device.bounce_copy_ns),
+            disk_gbps=gbps(device.disk_copy_bytes, device.disk_copy_ns),
+            register_failed=held.host.register_failed,
+            plan_inputs=dict(self.plan_inputs),
             shared_bytes=device.shared_bytes,
             disk_read_bytes=held.host.disk_read_bytes,
             sealed_bytes=held.host.sealed_bytes,
