@@ -21,7 +21,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 from collections import deque
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from functools import cache, partial
 from types import ModuleType
 from typing import Any, cast
@@ -68,6 +68,72 @@ def _family(root: object) -> type | None:
 def exact(root: object) -> bool:
     """Whether the plane decodes `root` with `Decode`."""
     return _reviewed(root) is not None
+
+
+def _replayable(root: object, originals: Mapping[int, Callable[..., object]]) -> bool:
+    """Whole-pass authority for the SDK's bodies, including their callable leaves.
+
+    Successful custom leaves still run. Their Python state/forward hooks are not part of
+    the output-only pass contract, so a failed pass cannot run again. `originals` contains
+    only forwards behind this residency's currently installed SDK weight hooks.
+    """
+    module = _reviewed(root)
+    if module is None:
+        return False
+    hooks = module.torch.nn.modules.module
+    if (
+        hooks._global_forward_hooks
+        or hooks._global_forward_pre_hooks
+        or hooks._global_backward_hooks
+        or hooks._global_backward_pre_hooks
+    ):
+        return False
+    nn = module.torch.nn
+    native = {
+        nn.Conv2d,
+        nn.Conv3d,
+        nn.Linear,
+        nn.GroupNorm,
+        nn.SiLU,
+        nn.Dropout,
+        nn.Identity,
+        nn.ModuleList,
+        nn.Sequential,
+        nn.Upsample,
+    }
+    called = list(cast("Any", root).decoder.modules())
+    post = getattr(root, "post_quant_conv", None)
+    if post is not None:
+        called.extend(post.modules())
+    for leaf in called:
+        kind = type(leaf)
+        if kind not in native and not kind.__module__.startswith("diffusers."):
+            return False
+        if (
+            leaf._forward_hooks
+            or leaf._forward_pre_hooks
+            or leaf._backward_hooks
+            or leaf._backward_pre_hooks
+            or leaf._compiled_call_impl is not None
+        ):
+            return False
+        forward = originals.get(id(leaf), leaf.forward)
+        if getattr(forward, "__func__", None) is not kind.forward:
+            return False
+        if not kind.forward.__module__.startswith(("torch.nn.modules.", "diffusers.")):
+            return False
+        processor = getattr(leaf, "processor", None)
+        if processor is not None:
+            implementation = type(processor)
+            if (
+                implementation.__module__ != "diffusers.models.attention_processor"
+                or implementation.__name__
+                not in ("AttnProcessor", "AttnProcessor2_0", "FusedAttnProcessor2_0")
+                or implementation.__call__.__module__ != implementation.__module__
+                or "__call__" in vars(processor)
+            ):
+                return False
+    return True
 
 
 def plan(root: object, z: Any, *args: object, **kwargs: object) -> Decode | None:

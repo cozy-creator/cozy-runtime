@@ -6,9 +6,10 @@ byte, one weight set per component, in regions: `common` and each innermost no-s
 each component's resident set, window and ring inside the plane budget; the resident set is
 wanted and a cursor streams the rest through its byte ring in the blocks' execution order.
 Each block runs inside exactly one acquire/release; a resident region binds at its stable
-address, a streamed one at its place in the ring, from cached views. A torch OOM at a block
-boundary lowers the budget (unmap only) and runs the block again; capacity never poisons the
-executor.
+address, a streamed one at its place in the ring, from cached views. Reviewed functional
+torch ops recover by unmapping weights. An arbitrary Python forward never replays after it
+started: its state may already have changed, so a failure without recovery authority retires
+the generation.
 """
 
 from __future__ import annotations
@@ -100,8 +101,7 @@ INDIVISIBLE = "operation_exceeds_device"
 
 
 class ResidencyRefusal(RuntimeFailure):
-    """A stage cannot run in what the device has: capacity, never broken state. Carries the
-    structured shortfall with both numbers."""
+    """A residency failure, with a structured shortfall only for measured capacity."""
 
     def __init__(self, code: str, detail: str, shortfall: dict[str, Any] | None = None) -> None:
         super().__init__(detail, code=code)
@@ -175,9 +175,6 @@ class Region:
     bound: int | None = None
     #: decoded tensors and derived leaf roles kept alive while bound
     derived: list[Tensor] = field(default_factory=list)
-    #: whether its forward writes into its inputs in place, learned on its first run: such a
-    #: block can never run again, so its ops recover from out-of-memory one by one
-    mutates: bool | None = None
     #: its LoRA'd linears; whether to bake them when its bytes are placed; and whether its
     #: resident bytes hold their deltas now (cleared when the plane evicts it)
     bakes: list[Bake] = field(default_factory=list)
@@ -695,18 +692,22 @@ class Weights:
         )
 
     @contextmanager
-    def recovering(self, watch: frozenset[int] = frozenset()) -> Iterator[Watch]:
-        """Run the caller's torch ops with out-of-memory recovery: an op that cannot allocate
-        unmaps weights and runs again. With `watch` (storage addresses), the yielded record
-        notes whether any op wrote into one of them."""
-        seen = Watch(watch)
+    def recovering(self) -> Iterator[None]:
+        """Recover reviewed functional torch ops, never infer Python forward replay safety."""
         if self.host_only:
-            yield seen
+            yield
             return
         if self._recovery is None:
             self._recovery = _recovery_type(self.torch)
-        with self._recovery(self, seen):
-            yield seen
+        with self._recovery(self):
+            yield
+
+    def _recovery_unavailable(self, operation: str) -> ResidencyRefusal:
+        """An entered operation may have changed state: no further stage may reuse it."""
+        detail = f"{operation}: failed after entry without a reviewed recovery contract"
+        for residency in list(self.residencies):
+            residency.poisoned = residency.poisoned or detail[:400]
+        return ResidencyRefusal("recovery_contract_unavailable", detail)
 
     def make_room(self, need: int, operands: Sequence[object], op: str = "") -> None:
         """An op ran out of device memory (outside every block, or inside one whose ops
@@ -1471,45 +1472,137 @@ class Read:
         return tensor.clone() if any(a <= address < b for a, b in self.spans) else out
 
 
+# Native, output-only operator families reviewed for inference recovery. A schema that
+# merely omits writes is insufficient (custom ops can change Python state). New families
+# require review; mutable overloads and seeded operations never inherit this contract.
+_FUNCTIONAL_OPS = frozenset(
+    [
+        "empty",
+        "empty_like",
+        "empty_strided",
+        "zeros",
+        "zeros_like",
+        "ones",
+        "ones_like",
+        "full",
+        "full_like",
+        "clone",
+        "_to_copy",
+        "contiguous",
+        "cat",
+        "stack",
+        "split",
+        "split_with_sizes",
+        "unbind",
+        "add",
+        "sub",
+        "mul",
+        "div",
+        "true_divide",
+        "floor_divide",
+        "neg",
+        "abs",
+        "square",
+        "sqrt",
+        "rsqrt",
+        "pow",
+        "exp",
+        "log",
+        "sin",
+        "cos",
+        "tanh",
+        "sigmoid",
+        "silu",
+        "gelu",
+        "relu",
+        "clamp",
+        "maximum",
+        "minimum",
+        "where",
+        "sum",
+        "mean",
+        "amax",
+        "amin",
+        "prod",
+        "cumsum",
+        "mm",
+        "bmm",
+        "matmul",
+        "addmm",
+        "addbmm",
+        "baddbmm",
+        "linear",
+        "convolution",
+        "_convolution",
+        "_softmax",
+        "_log_softmax",
+        "native_layer_norm",
+        "native_group_norm",
+        "group_norm",
+        "layer_norm",
+        "scaled_dot_product_attention",
+        "_scaled_dot_product_flash_attention",
+        "_scaled_dot_product_efficient_attention",
+        "_scaled_dot_product_cudnn_attention",
+        "upsample_nearest2d",
+        "upsample_bilinear2d",
+        "avg_pool2d",
+        "adaptive_avg_pool2d",
+        "constant_pad_nd",
+        "reflection_pad2d",
+        "replication_pad2d",
+        "index",
+        "index_select",
+        "gather",
+        "arange",
+        "linspace",
+        "repeat",
+        "repeat_interleave",
+        "unfold",
+    ]
+)
+
+# Only SDK-owned image_vae output-only pass bodies receive this token, through _within.
+_DECODER_PASS = object()
+
+
+def _functional_op(torch: ModuleType, func: Any, types: Sequence[type[object]]) -> bool:
+    return bool(
+        isinstance(func, torch._ops.OpOverload)
+        and func.namespace == "aten"
+        and func._schema.name.removeprefix("aten::") in _FUNCTIONAL_OPS
+        and not func._schema.is_mutable
+        and torch.Tag.nondeterministic_seeded not in func.tags
+        and all(t in (torch.Tensor, torch.nn.Parameter) for t in types)
+    )
+
+
 def _recovery_type(torch: ModuleType) -> type:
     mode: type = torch.utils._python_dispatch.TorchDispatchMode
 
     class Recovery(mode):  # type: ignore[misc]
-        """Every torch op outside a block: one that runs out of device memory runs again
-        after weights were unmapped for it (retry the op, never the run)."""
+        """Retry only reviewed functional ops after room was made, never an arbitrary call."""
 
-        def __init__(self, weights: Weights, seen: Watch) -> None:
+        def __init__(self, weights: Weights) -> None:
             super().__init__()
             self.weights = weights
-            self.seen = seen
 
         def __torch_dispatch__(
             self, func: Any, types: Any, args: tuple[Any, ...] = (), kwargs: Any = None
         ) -> Any:
             kwargs = kwargs or {}
-            seen = self.seen
-            if seen.storages and not seen.mutated and func._schema.is_mutable:
-                seen.mutated = any(
-                    _storage(value) in seen.storages for value in _written(func, args, kwargs)
-                )
             refused = False
             while True:
                 try:
                     return func(*args, **kwargs)
                 except Exception as exc:
                     need, refused = _room_for(exc, refused)
+                    if not _functional_op(torch, func, types):
+                        raise self.weights._recovery_unavailable(str(func)) from exc
                 # outside `except`, so the failed op's frames are gone
                 self.weights.make_room(need, (*args, *kwargs.values()), str(func))
 
     return Recovery
-
-
-@dataclass(slots=True)
-class Watch:
-    """Storages to watch for in-place writes, and whether an op wrote into one."""
-
-    storages: frozenset[int]
-    mutated: bool = False
 
 
 def _written(func: Any, args: tuple[object, ...], kwargs: Mapping[str, object]) -> Iterator[object]:
@@ -1517,11 +1610,6 @@ def _written(func: Any, args: tuple[object, ...], kwargs: Mapping[str, object]) 
     for index, argument in enumerate(func._schema.arguments):
         if argument.alias_info is not None and argument.alias_info.is_write:
             yield args[index] if index < len(args) else kwargs.get(argument.name)
-
-
-def _storage(value: object) -> int:
-    pointer = getattr(value, "untyped_storage", None)
-    return int(pointer().data_ptr()) if pointer is not None else -1
 
 
 def _tensor_operands(operands: Sequence[object]) -> Iterator[object]:
@@ -2636,8 +2724,10 @@ class WeightResidency:
         self.components = dict(components)
         #: re-registers a component at the sub-block grain (the backend's `refine`)
         self.refine = refine
-        #: component -> (module, had its own `forward`, that forward) per hooked region
-        self.hooks: dict[str, list[tuple[Module, bool, Callable[..., object]]]] = {}
+        #: component -> (module, had its own `forward`, original, SDK hook) per region
+        self.hooks: dict[
+            str, list[tuple[Module, bool, Callable[..., object], Callable[..., object]]]
+        ] = {}
         #: method -> the components it declares (`component_use`)
         self.scopes = dict(scopes or {})
         self.hosted: frozenset[str] = frozenset()
@@ -2689,11 +2779,13 @@ class WeightResidency:
         rows = self.hooks[component.name] = []
         for region in component.blocks:
             module = region.module
-            rows.append((module, "forward" in module.__dict__, module.forward))
-            module.forward = self._block(component, region, module.forward)
+            forward = module.forward
+            hook = self._block(component, region, forward)
+            rows.append((module, "forward" in module.__dict__, forward, hook))
+            module.forward = hook
 
     def _unhook(self, name: str) -> None:
-        for module, had, forward in self.hooks.pop(name, []):
+        for module, had, forward, _hook in self.hooks.pop(name, []):
             if had:
                 module.forward = forward
             else:
@@ -3357,31 +3449,26 @@ class WeightResidency:
         return True
 
     def _block(
-        self, component: Component, region: Region, forward: Callable[..., Any]
+        self,
+        component: Component,
+        region: Region,
+        forward: Callable[..., Any],
+        *,
+        _replay: object | None = None,
     ) -> Callable[..., Any]:
-        """The one hook per block: acquire, bind, run, release. A torch OOM releases, lowers
-        the plane budget and runs the block again, while its inputs are untouched."""
+        """Acquire, bind, run, release. Only reviewed SDK decoder bodies may run again."""
         weights = self.weights
         torch = weights.torch
+        replay = _replay is _DECODER_PASS and not weights.grouped
 
         def run(*args: Any, **kwargs: Any) -> Any:
+            self._require_clean(component.name)
             try:
-                if region.mutates is False and not weights.grouped:
-                    with self._quiet():  # the block retries as a unit, not op by op
+                if replay:
+                    with self._quiet():  # the SDK output-only pass recovers as one body
                         return attempt(*args, **kwargs)
-                # Its first run, a block that writes into its inputs, or one GPU of a group:
-                # its ops recover one by one, and the first run learns whether it writes.
-                inputs = (*args, *kwargs.values())
-                watch = (
-                    frozenset(_storage(v) for v in _tensor_operands(inputs))
-                    if region.mutates is None
-                    else frozenset()
-                )
-                with weights.recovering(watch) as seen:
-                    out = attempt(*args, **kwargs)
-                if region.mutates is None and not weights.host_only:
-                    region.mutates = seen.mutated
-                return out
+                with weights.recovering():
+                    return attempt(*args, **kwargs)
             except self._poisoned_error as exc:
                 raise self._poison(exc) from exc
 
@@ -3398,9 +3485,7 @@ class WeightResidency:
                 self._grow()
             if component.spared:
                 self._unspare(component)
-            versions = _versions(args, kwargs)
-            # a library's refusal is answered once: by its op where ops recover one by one
-            refused = weights.grouped or region.mutates is not False
+            refused = False
             refusals = 0
             while True:
                 stream = weights.stream()
@@ -3422,19 +3507,28 @@ class WeightResidency:
                         f"{component.name}.{region.path}",
                     )
                     continue
-                need, stale = 0, False
+                need, stale, entered = 0, False, False
                 try:
                     try:
                         bind(torch, region, lease, refill=True)
                         weights.running.append(component.key)
                         weights.last = component.key
                         try:
+                            entered = True
                             return forward(*args, **kwargs)
                         finally:
                             weights.running.pop()
                     except _Stale:
                         stale = True
                     except Exception as exc:
+                        if (
+                            entered
+                            and not replay
+                            and (is_device_oom(exc) or is_library_refusal(exc))
+                        ):
+                            raise weights._recovery_unavailable(
+                                f"{component.name}.{region.path}"
+                            ) from exc
                         need, refused = _room_for(exc, refused)
                         need = need or region.span
                 finally:
@@ -3446,23 +3540,6 @@ class WeightResidency:
                 if stale:
                     self._restore(component, region)
                     continue
-                if weights.grouped or region.mutates is not False:
-                    raise self._shortfall(
-                        self.active[0] if self.active else "",
-                        need,
-                        0,
-                        f"{component.name}.{region.path} ran out of memory outside torch's "
-                        "own ops, and it shares its call with its group or writes into its "
-                        "inputs, so it cannot run again",
-                    )
-                if _versions(args, kwargs) != versions:
-                    raise self._shortfall(
-                        self.active[0] if self.active else "",
-                        need,
-                        0,
-                        f"{component.name}.{region.path} ran out of memory after changing its "
-                        "inputs in place, so it cannot run again",
-                    )
                 self._make_room(
                     need, {component.key: region.index}, f"{component.name}.{region.path}"
                 )
@@ -3649,6 +3726,7 @@ class WeightResidency:
             free, evictable = self.room((name,))
             need = exact.peak(host=False)
             host = need > self._room_for_decode(name, free, evictable, min(need, free + evictable))
+            replayable = self._decoder_replayable(name)
             while True:
                 try:
                     out = exact.run(self._within(name), host)
@@ -3658,6 +3736,8 @@ class WeightResidency:
                     refused = isinstance(exc, ResidencyRefusal) and exc.code == INDIVISIBLE
                     if not oom and (host or not refused):
                         raise
+                    if not replayable:
+                        raise weights._recovery_unavailable(f"{name}.decode") from exc
                     need = _requested(exc) if host else -1
                 # outside `except`, so the failed step's frames are gone
                 accel.release_cached(weights.torch, weights.kind)
@@ -3682,12 +3762,23 @@ class WeightResidency:
         module whose block regions the body binds itself)."""
         component = self.components[name]
         regions = {id(region.module): region for region in component.blocks}
+        replay = _DECODER_PASS if self._decoder_replayable(name) else None
 
         def within(module: object, body: Callable[[], Any]) -> Any:
             region = regions.get(id(module))
-            return body() if region is None else self._block(component, region, body)()
+            return (
+                body() if region is None else self._block(component, region, body, _replay=replay)()
+            )
 
         return within
+
+    def _decoder_replayable(self, name: str) -> bool:
+        originals = {
+            id(module): forward
+            for module, _had, forward, hook in self.hooks.get(name, [])
+            if module.forward is hook
+        }
+        return image_vae._replayable(self.components[name].root, originals)
 
     def unpark(self) -> None:
         """Close a repeating stage left open: another stage, an attempt's end, or a budget
@@ -3897,18 +3988,6 @@ def _device_pool(exc: BaseException) -> bool:
     if pool is not None:
         return bool(pool == "device")
     return str(exc).startswith("budget exceeded in device")
-
-
-def _versions(args: tuple[Any, ...], kwargs: Mapping[str, Any]) -> tuple[int, ...]:
-    """In-place mutation counters of the block's tensor inputs (one level deep). Inference
-    tensors keep none; a block under `inference_mode` re-runs unchecked (retry the op)."""
-    out: list[int] = []
-    for value in (*args, *kwargs.values()):
-        for item in value if isinstance(value, (tuple, list)) else (value,):
-            inference = getattr(item, "is_inference", None)
-            if inference is not None and not inference():
-                out.append(int(item._version))
-    return tuple(out)
 
 
 def _requested(exc: BaseException) -> int:

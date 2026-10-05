@@ -1006,16 +1006,16 @@ class WritingStack(Stack):
 @on_card
 def test_a_block_that_writes_its_inputs_recovers_op_by_op(card: Any) -> None:
     """Runs 2619-2623 (Anima's VAE at 6 GiB): a block that ran out of memory after writing
-    into its input in place could not run again, and the load was refused. Its first run
-    learns that it writes; from then on its ops recover one by one and it never runs twice,
-    in inference mode too, where torch keeps no version counter to tell."""
+    into its input in place could not run again, and the load was refused. All generic
+    forwards now recover only at reviewed functional operator boundaries; successful
+    in-place writes remain valid and no tensor version counter grants forward replay."""
     weights = card.weights
     model = load(weights, card.checkpoint, "writes", factory=WritingStack)
     x = torch.randn(8192, HIDDEN, device="cuda", dtype=torch.float16)
     weights.set_budget(1 << 30)
     reference = run(model, x, passes=1)
     blocks = model.residency.components["stack"].blocks
-    assert len(blocks) == BLOCKS and all(region.mutates for region in blocks)
+    assert len(blocks) == BLOCKS
     retries = weights.facts().oom_retries
     torch.cuda.empty_cache()
     free, _ = torch.cuda.mem_get_info()

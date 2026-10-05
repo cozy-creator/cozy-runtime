@@ -1,0 +1,484 @@
+"""Current production block replay on CPU math, with controlled device lease/room I/O.
+
+This exercises the imported WeightResidency wrapper and dispatch/mutation/retry
+logic. Only stream/acquisition/allocator accounting are CPU boundary fixtures;
+no CUDA context, device fault or model inference is involved.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import socket
+import sys
+from pathlib import Path
+from types import MethodType
+from typing import Any
+
+import msgspec
+import pytest
+
+from cozy_runtime.internal import accel, weight_policy
+from cozy_runtime.internal.executor import Executor
+from cozy_runtime.internal.executor_commands import Activate, Load, Start
+from cozy_runtime.internal.seam import Channel
+from cozy_runtime.internal.weights import (
+    Component,
+    Region,
+    ResidencyRefusal,
+    Views,
+    WeightResidency,
+    Weights,
+)
+from test_request_isolation import MODULE, _serve
+
+torch = pytest.importorskip("torch")
+pytest_plugins = ("test_request_isolation",)
+
+
+class StatefulBlock(torch.nn.Module):  # type: ignore[misc,name-defined]
+    def __init__(self, effect: str) -> None:
+        super().__init__()
+        self.linear = torch.nn.Linear(2, 2, bias=False)
+        self.linear.weight = torch.nn.Parameter(torch.eye(2), requires_grad=False)
+        self.register_buffer("ticks", torch.zeros(()))
+        self.calls = 0
+        self.effect = effect
+        self.generator = torch.Generator().manual_seed(1234)
+        self.fail_next = False
+
+    def forward(self, value: Any) -> Any:
+        self.calls += 1
+        if self.effect == "counter":
+            extra = self.calls
+        elif self.effect == "buffer":
+            self.ticks.add_(1)
+            extra = self.ticks
+        else:
+            extra = torch.rand(value.shape, generator=self.generator)
+        result = self.linear(value) + extra
+        if self.fail_next:
+            self.fail_next = False
+            raise torch.OutOfMemoryError("deliberate one-shot OOM after module state advanced")
+        return result
+
+
+class CpuLease:
+    def __init__(self, tensor: Any, trace: dict[str, Any]) -> None:
+        self.tensor, self.trace = tensor, trace
+        self.ptr = tensor.data_ptr()
+        self.ring_offset = None
+        trace["acquired"] += 1
+
+    def view(self) -> Any:
+        return self.tensor.view(torch.uint8).flatten()
+
+    def release(self) -> None:
+        self.trace["released"] += 1
+
+
+def wrapped(
+    module: Any, monkeypatch: Any, *, root: Any = None, weight_module: Any = None
+) -> tuple[Weights, Region, dict[str, Any]]:
+    # Actual CPU plane and actual production objects. Enable the nongrouped
+    # device-control branch while all tensor math/lease storage remains CPU.
+    weights = Weights(torch, torch.device("cpu"), "cpu")
+    weights.host_only = False
+    monkeypatch.setattr(weights, "stream", lambda: 0)
+    monkeypatch.setattr(weights, "hold_host", lambda: None)
+    trace: dict[str, Any] = {"acquired": 0, "released": 0, "room": [], "free": 16}
+    monkeypatch.setattr(
+        accel,
+        "allocation",
+        lambda *args, **kwargs: {
+            "allocated_bytes": 0,
+            "reserved_bytes": 0,
+            "driver_free_bytes": trace["free"],
+            "driver_total_bytes": 1 << 20,
+        },
+    )
+
+    def shrink(need: int, floor: int) -> int:
+        trace["room"].append({"need": need, "floor": floor})
+        trace["free"] += max(need, weight_policy.MARGIN)
+        return max(need, weight_policy.MARGIN)
+
+    monkeypatch.setattr(weights, "shrink", shrink)
+    owner = (
+        weight_module
+        if weight_module is not None
+        else module.linear
+        if isinstance(module, StatefulBlock)
+        else module
+    )
+    tensor = owner.weight.detach()
+    region = Region(1, "block", module, [], span=tensor.numel() * tensor.element_size())
+    # bind() uses its ordinary cached-view path over real owned CPU storage.
+    region.views[tensor.data_ptr()] = Views(
+        [(owner._parameters, "weight", tensor, owner.weight)], []
+    )
+    cpu_weight_set: Any = "cpu-proof"
+    component = Component(
+        "model",
+        "model/1",
+        root if root is not None else module,
+        cpu_weight_set,
+        0,
+        [Region(0, "", module, []), region],
+        False,
+        None,
+        [region],
+        weight_policy.Layout(0, (region.span,)),
+        resident=(1,),
+    )
+    weights.components[component.key] = component
+    residency = WeightResidency(weights, {"model": component})
+    trace["residency"] = residency
+    monkeypatch.setattr(
+        residency, "_acquire", lambda component, index, stream: CpuLease(tensor, trace)
+    )
+    # The original _make_room and Weights.progressed execute; shrink/accounting
+    # above model device I/O and report actual progress before retry is granted.
+    return weights, region, trace
+
+
+def state(module: StatefulBlock) -> dict[str, Any]:
+    return {
+        "calls": module.calls,
+        "ticks": float(module.ticks),
+        "rng_sha256": hashlib.sha256(module.generator.get_state().numpy().tobytes()).hexdigest(),
+    }
+
+
+@pytest.mark.parametrize("effect", ["counter", "buffer", "rng"])
+def test_oom_cannot_replay_a_forward_based_only_on_unchanged_tensor_inputs(
+    effect: str,
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    control = StatefulBlock(effect)
+    current = StatefulBlock(effect)
+    _weights, _region, trace = wrapped(current, monkeypatch)
+    value = torch.tensor([[0.25, -0.5]])
+    before = value.clone()
+    with torch.inference_mode():
+        assert torch.equal(control(value), current(value))
+        expected = control(value)
+        current.fail_next = True
+        with pytest.raises(ResidencyRefusal) as failure:
+            current(value)
+    record = {
+        "effect": effect,
+        "input_exact": torch.equal(value, before),
+        "expected": expected.tolist(),
+        "code": failure.value.code,
+        "control_state": state(control),
+        "actual_state": state(current),
+        "trace": {k: v for k, v in trace.items() if k != "residency"},
+        "poisoned": trace["residency"].poisoned,
+        "wrapper_source": __import__(
+            "cozy_runtime.internal.weights", fromlist=["__file__"]
+        ).__file__,
+        "torch": torch.__version__,
+        "scope": "CPU block-control flow and device I/O fixture; not CUDA or inference proof",
+    }
+    (tmp_path / f"{effect}.json").write_text(json.dumps(record, indent=2) + "\n")
+    assert record["input_exact"]
+    assert failure.value.code == "recovery_contract_unavailable"
+    assert failure.value.shortfall is None and trace["residency"].last_shortfall is None
+    assert trace["acquired"] == trace["released"] == 2 and not trace["room"]
+    assert state(current) == state(control), record
+    assert trace["residency"].poisoned
+    with pytest.raises(ResidencyRefusal, match="residency_poisoned"):
+        current(value)
+    assert current.calls == 2
+
+
+def test_successful_current_block_path_preserves_module_semantics(monkeypatch: Any) -> None:
+    control, current = StatefulBlock("buffer"), StatefulBlock("buffer")
+    _weights, _region, trace = wrapped(current, monkeypatch)
+    value = torch.tensor([[0.25, -0.5]])
+    with torch.inference_mode():
+        for _ in range(3):
+            assert torch.equal(control(value), current(value))
+    assert state(current) == state(control)
+    assert trace["acquired"] == trace["released"] == 3 and not trace["room"]
+
+
+class FailAfterOp(torch.utils._python_dispatch.TorchDispatchMode):  # type: ignore[misc,name-defined]
+    """Real operator execution, then a one-shot CPU exception at its return boundary."""
+
+    def __init__(self, target: Any) -> None:
+        super().__init__()
+        self.target, self.calls = target, 0
+
+    def __torch_dispatch__(self, func: Any, types: Any, args: Any = (), kwargs: Any = None) -> Any:
+        out = func(*args, **(kwargs or {}))
+        if func is self.target:
+            self.calls += 1
+            if self.calls == 1:
+                raise torch.OutOfMemoryError("one-shot operator return-boundary failure")
+        return out
+
+
+def test_a_reviewed_functional_op_recovers_without_replaying_its_python_forward(
+    monkeypatch: Any,
+) -> None:
+    module = StatefulBlock("counter")
+    _weights, _region, trace = wrapped(module, monkeypatch)
+    failed = FailAfterOp(torch.ops.aten.linear.default)
+    value = torch.tensor([[0.25, -0.5]])
+    with failed, torch.inference_mode():
+        actual = module(value)
+    assert torch.equal(actual, value + 1)
+    assert module.calls == 1 and failed.calls == 2
+    assert trace["acquired"] == trace["released"] == 1
+    assert len(trace["room"]) == 1 and not trace["residency"].poisoned
+
+
+@pytest.mark.parametrize("effect", ["mutable", "rng", "custom"])
+def test_uncontracted_operator_failure_does_not_replay_state(effect: str, monkeypatch: Any) -> None:
+    weights, _region, trace = wrapped(StatefulBlock("counter"), monkeypatch)
+    value = torch.zeros(2)
+    generator = torch.Generator().manual_seed(17)
+    control = torch.Generator().manual_seed(17)
+    calls = []
+    if effect == "custom":
+
+        @torch.library.custom_op("cozy_recovery_proof::stateful", mutates_args=())  # type: ignore[untyped-decorator]
+        def stateful(value: torch.Tensor) -> torch.Tensor:  # type: ignore[name-defined]
+            calls.append(1)
+            raise torch.OutOfMemoryError("custom operation advanced Python state")
+
+        def operation() -> Any:
+            return stateful(value)
+
+        failed = FailAfterOp(None)
+    elif effect == "mutable":
+
+        def operation() -> Any:
+            return value.add_(1)
+
+        failed = FailAfterOp(torch.ops.aten.add_.Tensor)
+    else:
+
+        def operation() -> Any:
+            return torch.rand(2, generator=generator)
+
+        failed = FailAfterOp(torch.ops.aten.rand.generator)
+        torch.rand(2, generator=control)
+    with (
+        failed,
+        weights.recovering(),
+        torch.inference_mode(),
+        pytest.raises(ResidencyRefusal) as failure,
+    ):
+        operation()
+    assert failure.value.code == "recovery_contract_unavailable"
+    assert not trace["room"] and trace["residency"].poisoned
+    if effect == "custom":
+        assert calls == [1]
+    else:
+        assert failed.calls == 1
+    if effect == "mutable":
+        assert torch.equal(value, torch.ones(2))
+    if effect == "rng":
+        assert torch.equal(generator.get_state(), control.get_state())
+
+
+def test_before_forward_acquisition_failure_keeps_existing_recovery(monkeypatch: Any) -> None:
+    module = StatefulBlock("counter")
+    weights, region, trace = wrapped(module, monkeypatch)
+    residency = trace["residency"]
+    acquire = residency._acquire
+    attempts = []
+    replans = []
+
+    def constrained(component: Any, index: int, stream: int) -> Any:
+        attempts.append(1)
+        if len(attempts) <= 3:
+            raise residency._budget_error("before forward acquisition")
+        return acquire(component, index, stream)
+
+    monkeypatch.setattr(residency, "_acquire", constrained)
+    monkeypatch.setattr(weights, "grow", lambda need: False)
+    monkeypatch.setattr(residency, "_replan", lambda resume: replans.append(resume))
+    value = torch.tensor([[0.25, -0.5]])
+    with torch.inference_mode():
+        assert torch.equal(module(value), value + 1)
+    assert module.calls == 1 and len(attempts) == 4 and len(replans) == 2
+    assert trace["acquired"] == trace["released"] == 1
+    assert len(trace["room"]) == 1 and trace["room"][0]["need"] == region.span
+    assert not residency.poisoned
+
+
+def test_only_sdk_decoder_pass_replays_to_the_uninterrupted_tensor(monkeypatch: Any) -> None:
+    diffusers = pytest.importorskip("diffusers")
+    from cozy_runtime.internal import image_vae
+
+    torch.manual_seed(71)
+    vae = diffusers.AutoencoderKL(
+        down_block_types=("DownEncoderBlock2D",) * 2,
+        up_block_types=("UpDecoderBlock2D",) * 2,
+        block_out_channels=(8, 8),
+        norm_num_groups=4,
+    ).eval()
+    latent = torch.randn(1, 4, 2, 3)
+    conv = vae.decoder.conv_in
+    with torch.inference_mode():
+        expected = image_vae.Decode(vae, latent, band=100).run().sample
+    _weights, _region, trace = wrapped(conv, monkeypatch, root=vae)
+    assert trace["residency"]._decoder_replayable("model")
+    within = trace["residency"]._within("model")
+    calls = []
+
+    def fail_once(module: Any, body: Any) -> Any:
+        if module is not conv:
+            return within(module, body)
+
+        def pass_body() -> Any:
+            out = body()  # actual SDK pass writes only its output map and scratch statistics
+            calls.append(1)
+            if len(calls) == 1:
+                raise torch.OutOfMemoryError("SDK output-only pass failed after its writes")
+            return out
+
+        return within(module, pass_body)
+
+    with torch.inference_mode():
+        actual = image_vae.Decode(vae, latent, band=100).run(fail_once).sample
+    assert torch.equal(actual, expected)
+    assert calls == [1, 1]
+    assert trace["acquired"] == trace["released"] == 2 and len(trace["room"]) == 1
+    assert not trace["residency"].poisoned
+
+
+@pytest.mark.parametrize("custom", ["leaf", "forward", "hook", "processor", "post_quant"])
+def test_custom_decoder_calls_succeed_but_failed_state_cannot_replay(
+    custom: str, monkeypatch: Any
+) -> None:
+    diffusers = pytest.importorskip("diffusers")
+    from cozy_runtime.internal import image_vae
+
+    torch.manual_seed(72)
+    vae = diffusers.AutoencoderKL(
+        down_block_types=("DownEncoderBlock2D",) * 2,
+        up_block_types=("UpDecoderBlock2D",) * 2,
+        block_out_channels=(8, 8),
+        norm_num_groups=4,
+    ).eval()
+    latent = torch.randn(1, 4, 2, 3)
+    before = latent.clone()
+    resnet = vae.decoder.mid_block.resnets[0]
+    with torch.inference_mode():
+        expected = image_vae.Decode(vae, latent).run().sample
+    calls: list[int] = []
+    armed: list[int] = []
+
+    def advance() -> None:
+        calls.append(1)
+        if armed:
+            armed.clear()
+            raise torch.OutOfMemoryError("custom decoder callback advanced state")
+
+    if custom == "leaf":
+
+        class CustomDropout(torch.nn.Module):  # type: ignore[misc,name-defined]
+            def forward(self, value: Any) -> Any:
+                advance()
+                return value
+
+        resnet.dropout = CustomDropout()
+    elif custom == "forward":
+
+        def forward(_self: Any, value: Any) -> Any:
+            advance()
+            return value
+
+        resnet.dropout.forward = MethodType(forward, resnet.dropout)
+    elif custom == "hook":
+
+        def hook(_module: Any, _args: Any, _out: Any) -> None:
+            advance()
+
+        resnet.dropout.register_forward_hook(hook)
+    elif custom == "processor":
+        attention = vae.decoder.mid_block.attentions[0]
+        original = attention.processor
+
+        class CustomProcessor:
+            def __call__(self, *args: Any, **kwargs: Any) -> Any:
+                result = original(*args, **kwargs)
+                advance()
+                return result
+
+        attention.set_processor(CustomProcessor())
+    else:
+        original_forward = vae.post_quant_conv.forward
+
+        def post_forward(_self: Any, value: Any) -> Any:
+            result = original_forward(value)
+            advance()
+            return result
+
+        vae.post_quant_conv.forward = MethodType(post_forward, vae.post_quant_conv)
+
+    assert image_vae.exact(vae)  # this remains a valid successful custom decoder
+    _weights, _region, trace = wrapped(resnet, monkeypatch, root=vae, weight_module=resnet.conv1)
+    assert not trace["residency"]._decoder_replayable("model")
+    with torch.inference_mode():
+        assert torch.equal(vae.decode(latent).sample, expected)
+        count = len(calls)
+        armed.append(1)
+        with pytest.raises(ResidencyRefusal) as failure:
+            vae.decode(latent)
+    assert failure.value.code == "recovery_contract_unavailable"
+    assert len(calls) == count + 1 and torch.equal(latent, before)
+    assert trace["residency"].poisoned and not trace["room"]
+    assert trace["acquired"] == trace["released"]
+
+
+def test_executor_failure_retires_state_and_a_fresh_generation_serves(
+    host: tuple[Executor, dict[str, Any]], tmp_path: Path, monkeypatch: Any
+) -> None:
+    runner, load = host
+    assert runner.load(msgspec.convert({**load, "construction": "a"}, Load))["ok"]
+    assert runner.activate(Activate(construction="a"))["ok"]
+    module = StatefulBlock("buffer")
+    _weights, _region, trace = wrapped(module, monkeypatch)
+    value = torch.tensor([[0.25, -0.5]])
+    module.fail_next = True
+
+    def fail_in_handler() -> None:
+        try:
+            module(value)
+        finally:
+            # The actual residency that failed reaches the Executor's existing poison
+            # consumer. The entry is otherwise weightless, keeping this a tiny CPU proof.
+            runner.residency = trace["residency"]
+
+    monkeypatch.setattr(sys.modules[MODULE], "contract_failure", fail_in_handler)
+    failed = _serve(runner, "contract", "contract")
+    assert (failed["outcome"]["terminal"], failed["outcome"]["code"]) == (
+        "failed",
+        "recovery_contract_unavailable",
+    )
+    assert failed["poisoned"] and runner.poisoned and trace["residency"].poisoned
+    assert module.calls == 1 and float(module.ticks) == 1
+    refused = runner.load(msgspec.convert({**load, "construction": "b"}, Load))
+    assert not refused["ok"] and refused["code"] == "poisoned_generation"
+
+    replacement_root = tmp_path / "replacement"
+    replacement_root.mkdir()
+    left, right = socket.socketpair()
+    with left, right:
+        replacement = Executor(Channel(left), replacement_root)
+        assert replacement.start(
+            msgspec.convert({**load["binding"], "devices": load["devices"]}, Start)
+        )["ok"]
+        assert replacement.load(msgspec.convert({**load, "construction": "a"}, Load))["ok"]
+        assert replacement.activate(Activate(construction="a"))["ok"]
+        served = _serve(replacement, "replacement", "ok")
+    assert served["outcome"]["terminal"] == "succeeded" and not served["poisoned"]
+    # This is the real in-process Executor consumer. Supervised OS process replacement
+    # requires the existing delegated-containment host gate, unavailable on this laptop.

@@ -38,6 +38,10 @@ class Result(msgspec.Struct):
     value: int
 
 
+def contract_failure() -> None:
+    raise RuntimeError("contract fixture was not installed")
+
+
 @app.entrypoint
 def generate(ctx: Context, payload: Request) -> Result:
     if payload.mode == "refuse":
@@ -46,6 +50,8 @@ def generate(ctx: Context, payload: Request) -> Result:
         ctx.raise_if_cancelled()
     if payload.mode == "fail":
         raise RuntimeError("handler state is now unknown")
+    if payload.mode == "contract":
+        contract_failure()
     if payload.mode == "env":
         os.environ["OMP_NUM_THREADS"] = "7"
     return Result(7)
