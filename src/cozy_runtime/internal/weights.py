@@ -3081,7 +3081,10 @@ class WeightResidency:
     def batch_fits(self, method: str, batch: int) -> bool:
         """`batch` items of `method` at once, if their measured activations fit what is free
         plus the weights the plane may unmap beyond the stage's own floor. Recorded."""
-        per_item = self.per_item.get(method)
+        # Measured here, else what earlier executors measured for the method (a peak at any
+        # batch, so never smaller than one item): unmeasured anywhere is yes, and the first
+        # run measures.
+        per_item = self.per_item.get(method, self.weights.activation.get(method))
         if per_item is None:
             fits = True
         else:
