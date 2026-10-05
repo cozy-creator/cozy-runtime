@@ -2284,8 +2284,6 @@ class Executor:
                 else None
             )
             roots = backend.roots
-            for root in roots.values():
-                image_vae.fast_decode(root)
             stage("execution_plan")
             # THE FASTEST KERNEL THIS DEVICE AND IMAGE SUPPORT, PINNED POST-FILL (cr-124),
             # per attention site and before any warm step (see `_prepare_attention`).
