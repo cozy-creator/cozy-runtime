@@ -1,0 +1,1 @@
+An executor maps a loaded construction's weights onto its GPU ahead of any request (`map`, capability `weights.map/1`): each component's resident set as its first stage would place it inside the owner's cap, left mapped as after a call. The machine uses it for a warm set member at level `gpu`.

@@ -91,6 +91,8 @@ _REQUESTED = re.compile(r"Tried to allocate ([0-9.]+) (B|KiB|MiB|GiB)")
 _UNITS = {"B": 1, "KiB": 1 << 10, "MiB": 1 << 20, "GiB": 1 << 30}
 #: The TensorFS planning window a weight set's read plan is cut into.
 READ_WINDOW = 4 << 20
+#: The stage `WeightResidency.map_ahead` opens: no package method has this name.
+MAPPING = "(map)"
 
 
 #: The one memory failure a request can end with: an operation that needs more device memory
@@ -3149,6 +3151,38 @@ class WeightResidency:
                     },
                 )
             )
+
+    def map_ahead(self) -> int:
+        """Map every component's resident set now, as one stage of all of them would place
+        it inside the budget, and leave it mapped at idle priority as after a call: nothing
+        runs and nothing is measured. Mapped privately and asking the owner for nothing; a
+        call shares it at its stage's exit. Returns the device bytes its components hold."""
+        weights = self.weights
+        names = tuple(name for name in self.components if name not in self.hosted)
+        if weights.host_only or not names:
+            return 0
+        self.unpark()
+        sharing, room = weights.sharing, weights.room
+        weights.sharing = weights.room = None
+        try:
+            self.admit(MAPPING, names)
+            self.release(MAPPING, names)
+        except ResidencyRefusal:
+            pass  # not even the floor fits: what was placed stays, the rest is host memory
+        finally:
+            weights.sharing, weights.room = sharing, room
+            for table in (
+                weights.activation,
+                weights.plan_inputs,
+                weights.squeezed,
+                weights.squeezes,
+                self.peaks,
+                self.per_item,
+                self.entries,
+                self.repeats,
+            ):
+                table.pop(MAPPING, None)
+        return sum(weights.resident_bytes(self.components[name]) for name in names)
 
     # -- the executor's and the package's calls
 
