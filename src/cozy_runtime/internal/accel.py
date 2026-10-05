@@ -508,13 +508,21 @@ def peak_reserved(torch: Any, kind: str) -> int:
     return int(torch.cuda.max_memory_reserved())
 
 
+#: This process's own cache releases that returned something: how many, and the bytes.
+RELEASED: list[int] = [0, 0]
+
+
 def release_cached(torch: Any, kind: str) -> None:
     """Return the caching allocator's UNUSED segments to the driver. Frees nothing the
     process still holds; it is what makes an eviction visible to other processes."""
     if kind == "mps":
         raise AcceleratorUnsupported("mps", "release_cached")
     if kind == "cuda":
+        before = int(torch.cuda.memory_reserved())
         torch.cuda.empty_cache()
+        if (freed := before - int(torch.cuda.memory_reserved())) > 0:
+            RELEASED[0] += 1
+            RELEASED[1] += freed
 
 
 def completion_event(torch: Any, kind: str) -> Any:

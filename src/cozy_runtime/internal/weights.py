@@ -1123,6 +1123,7 @@ class Weights:
             else -1
         )
         copy_ns = device.host_copy_ns + device.disk_copy_ns
+        allocator = {} if self.host_only else self.torch.cuda.memory_stats(self.device)
         return PlaneFacts(
             budget_bytes=device.budget,
             committed_bytes=device.committed,
@@ -1158,6 +1159,10 @@ class Weights:
             misses=device.misses,
             evictions=device.evictions,
             oom_retries=self.oom_retries,
+            alloc_retries=int(allocator.get("num_alloc_retries", 0)),
+            alloc_ooms=int(allocator.get("num_ooms", 0)),
+            cache_releases=accel.RELEASED[0],
+            cache_released_bytes=accel.RELEASED[1],
             modes=dict(self.modes),
         )
 
