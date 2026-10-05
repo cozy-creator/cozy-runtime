@@ -145,6 +145,7 @@ from cozy_runtime.internal.config import restore_seal, seal_snapshot
 from cozy_runtime.internal.discovery import discover_distribution, discover_installed
 from cozy_runtime.internal.executor_commands import (
     LOAD_PINNED,
+    MAP,
     PROCESS_CAP,
     RANK_CELLS,
     SEALED_FILLING,
@@ -163,6 +164,7 @@ from cozy_runtime.internal.executor_commands import (
     Join,
     KnownCommand,
     Load,
+    Map,
     ModelLoad,
     Prefetch,
     PrepareRequest,
@@ -623,6 +625,8 @@ class Executor:
                 return self.revoke(command)
             case Prefetch():
                 return self.prefetch(command)
+            case Map():
+                return self.map(command)
             case Shutdown():
                 raise AssertionError("shutdown ends the command loop")
 
@@ -645,7 +649,7 @@ class Executor:
                 zygote.CAPABILITY,
                 "vacate_ranks",
                 *(
-                    [plane.CAPABILITY, STAGE_TURNS, LOAD_PINNED, PROCESS_CAP, RANK_CELLS]
+                    [plane.CAPABILITY, STAGE_TURNS, LOAD_PINNED, PROCESS_CAP, RANK_CELLS, MAP]
                     if plane.available()
                     else []
                 ),
@@ -4452,6 +4456,33 @@ class Executor:
         if refused:
             return refused
         return {"ok": True, "filling_bytes": filling}
+
+    def map(self, command: Map) -> dict[str, Any]:
+        """Map one loaded construction's weights onto this GPU now, inside the owner's cap:
+        each component's resident set as its first stage would place it, left mapped as
+        after a call. What the cap cannot hold stays in the host tier. One GPU only: a
+        group's ranks map at its first call."""
+        if self.poisoned:
+            return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
+        child = self.constructions.get(command.construction)
+        if child is None:
+            return self._refusal(
+                "construction_not_loaded", f"{command.construction!r} is not loaded"
+            )
+        if self.weights is None or self.group is not None:
+            return {"ok": True, "mapped_bytes": 0, "plane": self._plane_facts()}
+        granted = self.budget(
+            Budget(vram_bytes=-1, cap_bytes=command.cap_bytes, floor_bytes=command.floor_bytes)
+        )
+        if not granted.get("ok"):
+            return granted
+        members = child.model_executors or [child]
+        mapped = sum(
+            member.residency.map_ahead()
+            for member in members
+            if isinstance(member.residency, WeightResidency)
+        )
+        return {"ok": True, "mapped_bytes": mapped, "plane": self._plane_facts()}
 
     def _plane_ranks(self) -> list[int]:
         """The follower GPUs that answer the plane's commands. One from before the plane

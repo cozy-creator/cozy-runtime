@@ -618,6 +618,29 @@ def test_batch_fits_asks_an_unmeasured_method_with_what_earlier_executors_measur
     assert facts.h2d_bytes == 0 or facts.host_gbps + facts.bounce_gbps + facts.disk_gbps > 0
 
 
+@on_gpu
+def test_weights_mapped_ahead_leave_the_first_stage_nothing_to_copy(card: Any) -> None:
+    """The warm set's `gpu` level (`Map`): a loaded construction's weights reach the card
+    before any request, as much as a call keeps resident in the same budget. Its first stage
+    then copies nothing and computes the same bits, and the map measures nothing of its own."""
+    weights = card.weights
+    weights.set_budget(1 << 30)
+    x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
+    cold = load(weights, card.checkpoint, "cold")
+    expected = run(cold, x, passes=1)
+    resident = weights.resident_bytes(cold.residency.components["stack"])
+    ahead = load(weights, card.checkpoint, "ahead")
+    before = weights.facts().h2d_bytes
+    assert ahead.residency.map_ahead() == resident > 0
+    arrived = weights.facts().h2d_bytes
+    assert arrived - before >= resident
+    assert same(expected, run(ahead, x, passes=1))
+    facts = weights.facts()
+    assert facts.h2d_bytes == arrived
+    assert weights_module.MAPPING not in weights.activation
+    assert weights_module.MAPPING not in facts.plan_inputs
+
+
 @on_card
 def test_a_stage_entered_once_per_step_keeps_a_resident_set(card: Any) -> None:
     """SDXL's package enters its denoise scope once per step: each stage is one pass, and

@@ -125,6 +125,21 @@ class Prefetch(Command, frozen=True, kw_only=True, tag="prefetch"):
     construction: str
 
 
+class Map(Command, frozen=True, kw_only=True, tag="map"):
+    """Map one loaded construction's weights onto the GPU now, inside `cap_bytes`, as its
+    first stages would (`MAP`): nothing runs, and they stay mapped as after a call."""
+
+    construction: str
+    #: The process's device cap (`PROCESS_CAP`); -1 lifts it
+    cap_bytes: int = -1
+    #: Physical free bytes the owner keeps on the GPU; unset leaves it
+    floor_bytes: int | UnsetType = UNSET
+
+
+#: An executor capability: it maps a loaded construction ahead of a request (`Map`).
+MAP = "weights.map/1"
+
+
 class Unload(Command, frozen=True, kw_only=True, tag="unload"):
     construction: str
 
@@ -448,6 +463,7 @@ type KnownCommand = (
     | Share
     | Revoke
     | Prefetch
+    | Map
     | Unload
     | Activate
     | Attention
