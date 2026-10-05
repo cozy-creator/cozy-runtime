@@ -3524,6 +3524,22 @@ class WeightResidency:
                         if (
                             entered
                             and not replay
+                            and isinstance(exc, ResidencyRefusal)
+                            and exc.code == INDIVISIBLE
+                        ):
+                            # The op's capacity measurement stays the attempt's failure.
+                            # Its Python caller may already have changed state, so only
+                            # this entered generic body loses generation reuse authority.
+                            self.poisoned = (
+                                self.poisoned
+                                or (
+                                    f"{component.name}.{region.path}: recovery exhausted after "
+                                    f"forward entry: {exc}"
+                                )[:400]
+                            )
+                        if (
+                            entered
+                            and not replay
                             and (is_device_oom(exc) or is_library_refusal(exc))
                         ):
                             raise weights._recovery_unavailable(
