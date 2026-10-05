@@ -283,9 +283,13 @@ class _FusedSelfAttention:
                 k_scale,
                 attn.norm_q.eps,
             )
-        query_width, key_width, value_width = query.shape[3], key.shape[3], value.shape[3]
-        key = key.repeat_interleave(query_width // key_width, dim=3)
-        value = value.repeat_interleave(query_width // value_width, dim=3)
+        # Diffusers repeats K and V by the ratio of head widths, 1 in every Cosmos model;
+        # `repeat_interleave(1)` still copies both whole (huaisang, rtx-4070-super: 0.35 s
+        # of a 30-step render, most of Anima's gap to ComfyUI).
+        if key.shape[3] != query.shape[3]:
+            key = key.repeat_interleave(query.shape[3] // key.shape[3], dim=3)
+        if value.shape[3] != query.shape[3]:
+            value = value.repeat_interleave(query.shape[3] // value.shape[3], dim=3)
         output = dispatch_attention_fn(
             query.transpose(1, 2),
             key.transpose(1, 2),
