@@ -3510,7 +3510,11 @@ class WeightResidency:
                 need, stale, entered = 0, False, False
                 try:
                     try:
-                        bind(torch, region, lease, refill=True)
+                        # SDK binding owns these bytes and its seeded bake; a partial
+                        # resident bake is dirty and refills through _Stale/_restore.
+                        # Exclude outer Recovery modes too, including a nested block's.
+                        with self._quiet():
+                            bind(torch, region, lease, refill=True)
                         weights.running.append(component.key)
                         weights.last = component.key
                         try:
