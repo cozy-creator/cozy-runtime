@@ -1550,6 +1550,19 @@ def unbind(region: Region) -> None:
     region.bound = None
 
 
+def _drop_copies(region: Region) -> None:
+    """Unbind a region whose destinations a package's `module.to(dtype)` gave bytes of their
+    own: torch's copies beside the plane's (SDXL's VAE upcast and cast back: 160 MiB kept
+    across requests). Its next bind converts again."""
+    views = region.views.get(region.bound) if region.bound is not None else None
+    if views is not None and any(
+        (held := table.get(name)) is not None and held.data_ptr() != tensor.data_ptr()
+        for table, name, tensor, _ in views.writes
+    ):
+        del region.views[region.bound]  # a cached Parameter may hold a copy as its `.data`
+        unbind(region)
+
+
 def close_cursor(component: Component) -> None:
     """Close the stage's cursor after dropping every view into its ring (one keeps the cursor
     open)."""
@@ -3698,7 +3711,9 @@ class WeightResidency:
                 component.lease.release()
                 component.lease = None
             component.spared = False
-            if not weights.host_only:
+            if not weights.host_only:  # host maps bind once, at load
+                for region in component.regions:
+                    _drop_copies(region)
                 weights.plane.prioritise(component.ws, weights.index, None, priority=idle)
         if failure is not None:
             raise failure
