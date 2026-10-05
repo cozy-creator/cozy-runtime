@@ -126,6 +126,13 @@ CHILD_ENV_ALLOWLIST: tuple[ProjectedVar, ...] = (
         "every formation completes. Erased then imposed, like the NVLS row",
     ),
     ProjectedVar(
+        "PYTORCH_CUDA_ALLOC_CONF",
+        "plan.allocator_policy",
+        "REPORTED, never projected: torch's allocator is set in code at the accelerator's init "
+        "(`accel.ALLOCATOR`). An older machine still imposes this name and refuses an executor "
+        "whose seal report lacks it, so the report keeps it; nothing here reads it",
+    ),
+    ProjectedVar(
         "OMP_NUM_THREADS",
         "plan.cpu_threads",
         "thread cap must be set before torch import to bound host CPU in the executor",
