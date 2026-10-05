@@ -190,6 +190,34 @@ def test_a_replacement_attaches_the_kept_weights_and_computes_bit_identically(
         custody.close()
 
 
+def test_a_trim_lets_some_regions_go_and_keeps_the_rest_attached(tmp_path: Path) -> None:
+    """Switches on a 12 GB card (phil): the machine needs part of a layout's room, not all of
+    it (`weights.trim/1`). The trimmed regions go, the rest stay mapped under the same lease,
+    and the next stage copies only the trimmed regions."""
+    checkpoint, _ = write_checkpoint(tmp_path)
+    x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
+    custody = Custody()
+    try:
+        first, _ = executor_with(custody, tmp_path / "a")
+        if not first.plane.device_sharing(0):
+            pytest.skip("this GPU cannot export memory")
+        expected = run(load(first, checkpoint, "share"), x)
+        replacement, _ = executor_with(custody, tmp_path / "b")
+        again = load(replacement, checkpoint, "share")
+        component = again.backend.components["stack"]
+        everything = set(range(len(component.regions)))
+        assert component.shared == everything
+        trimmed = sorted(everything)[-2:]
+        spans = sum(component.regions[i].span for i in trimmed)
+        assert replacement.revoke(component.ws.digest, trimmed) == spans
+        assert component.shared == everything - set(trimmed)
+        assert custody.ended() == [False, False], "its other regions are still mapped"
+        assert same(run(again, x), expected)
+        assert 0 < replacement.facts().h2d_bytes <= spans
+    finally:
+        custody.close()
+
+
 def test_an_executor_loaded_without_device_weights_shares_when_the_machine_asks(
     tmp_path: Path,
 ) -> None:

@@ -1040,12 +1040,15 @@ class Weights:
             self.plane.drop(component.ws, self.index, [region.index])
             _unbaked(region)
 
-    def revoke(self, layout: str) -> int:
-        """Stop using the machine's regions of `layout`: queued work finishes, then they are
-        unmapped and released. A later use fills a private copy. Returns the bytes let go."""
+    def revoke(self, layout: str, regions: Collection[int] = ()) -> int:
+        """Stop using the machine's regions of `layout`, all of them or only `regions`: queued
+        work finishes, then they are unmapped and released. A later use fills a private copy.
+        Returns the bytes let go."""
         self.quiesce()
         return sum(
-            self._release_shared(component, sorted(component.shared))
+            self._release_shared(
+                component, sorted(component.shared & set(regions) if regions else component.shared)
+            )
             for component in self.components.values()
             if component.shared and component.ws.digest == layout
         )

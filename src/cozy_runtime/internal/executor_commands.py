@@ -110,11 +110,13 @@ class Share(Command, frozen=True, kw_only=True, tag="share"):
 
 
 class Revoke(Command, frozen=True, kw_only=True, tag="revoke"):
-    """Stop using the shared GPU memory of one layout (`weights.revoke/1`): finish queued work,
-    unmap, release, then answer; later uses fill a private copy."""
+    """Stop using the shared GPU memory of one layout (`weights.revoke/1`), or of only its
+    `regions` (`weights.trim/1`): finish queued work, unmap, release, then answer; later uses
+    fill a private copy."""
 
     layout: str
     generation: int = 0
+    regions: tuple[int, ...] = ()
 
 
 class Prefetch(Command, frozen=True, kw_only=True, tag="prefetch"):

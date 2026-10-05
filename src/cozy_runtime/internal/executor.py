@@ -4378,7 +4378,7 @@ class Executor:
             return {"ok": True, "released_bytes": 0}
         self._unpark()
         try:
-            released = self.weights.revoke(command.layout)
+            released = self.weights.revoke(command.layout, command.regions)
         except plane.error("LeaseViolation") as exc:
             return {"ok": False, "code": "in_use", "detail": str(exc)}
         except plane.error("Poisoned") as exc:
