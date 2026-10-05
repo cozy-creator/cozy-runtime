@@ -1,6 +1,7 @@
 # Replay contract proposal for root review
 
-Tracker #327; current red arm uses 50af76dd. Production is unchanged.
+Tracker #327; original red arm uses 50af76dd. Root reviewed this proposal and the
+decoder leaf guard on October 5. The implementation/proof is in `recovery-contract.md`.
 
 **CONFIRMED CPU:** three expected contract failures and one successful-path pass.
 The actual production wrapper learned `region.mutates=False` in every case, then
