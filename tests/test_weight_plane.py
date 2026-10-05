@@ -715,6 +715,64 @@ def test_a_component_cast_and_cast_back_in_its_stage_keeps_no_copy_after_it(card
     assert torch.equal(first, second) and first.dtype == torch.float32
 
 
+@on_gpu
+def test_the_next_stage_fills_while_this_one_runs(card: Any, tmp_path: Path) -> None:
+    """phil, 12 GB, SDXL and Anima alternating: SDXL's UNet loaded only once its denoise was
+    placed, after the text encode (0.72 s of its 1.02 s loading). With the last attempt's
+    stage order known, the next stage's resident set fills while this one runs."""
+    weights = card.weights
+    values = write_checkpoint(tmp_path / "values")[1]
+    checkpoints = {
+        "stack": card.checkpoint,
+        "other": store_component(tmp_path / "other", "other", values),
+    }
+    rows = [*checkpoints["stack"].rows("stack"), *checkpoints["other"].rows("other")]
+    backend = PlaneBackend.for_script(
+        checkpoints, rows, weights=weights, construction="stages", release="plane-test/1"
+    )
+    major, minor = torch.cuda.get_device_capability(0)
+    with serving_substrate(f"sm{major}{minor}", Observations()):
+        modules = {"stack": Stack(), "other": Stack()}
+    holder = SimpleNamespace(components=modules)
+    walked = census(holder)
+    backend.expect(
+        {name: [d.key for d in walked.destinations if d.component == name] for name in modules}
+    )
+    live = backend.materialize(holder, walked)
+    for destination in walked.destinations:
+        backend.fill(destination.key, destination.spec, live[destination.key])
+    backend.commit()
+    residency = WeightResidency(
+        weights, backend.components, {"encode": ("stack",), "denoise": ("other",)}
+    )
+    x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
+    weights.set_budget(1 << 30)
+
+    def stage(method: str, name: str, x: Any) -> Any:
+        residency.admit(method, (name,))
+        try:
+            with torch.inference_mode():
+                return modules[name](x)
+        finally:
+            residency.release(method, (name,))
+
+    residency.open_attempt()
+    expected = stage("denoise", "other", stage("encode", "stack", x))
+    spans = {n: sum(r.span for r in c.regions) for n, c in residency.components.items()}
+    weights.set_budget(0)  # another tenant's switch: every weight left the GPU
+    weights.set_budget(1 << 30)
+    residency.open_attempt()
+    residency.admit("encode", ("stack",))
+    try:
+        committed = plane.stats(weights.plane).device(weights.index).committed
+        assert committed == spans["stack"] + spans["other"], "the denoiser is on its way"
+        with torch.inference_mode():
+            encoded = modules["stack"](x)
+    finally:
+        residency.release("encode", ("stack",))
+    assert same([stage("denoise", "other", encoded)], [expected])
+
+
 @on_card
 def test_an_activation_estimate_larger_than_the_card_never_refuses_the_stage(card: Any) -> None:
     """F, rtx-3070 with a 3 GiB pool: SDXL's decode seed (3.1 GB, its untiled peak at 1024²)

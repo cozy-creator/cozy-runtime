@@ -2857,6 +2857,9 @@ class WeightResidency:
         self.peaks: dict[str, int] = {}
         self.per_item: dict[str, int] = {}
         self.batch: dict[str, int] = {}
+        #: the stages of the last attempt in their order of first entry, and this attempt's
+        self.sequence: list[tuple[str, tuple[str, ...]]] = []
+        self.entering: list[tuple[str, tuple[str, ...]]] = []
         self.baseline = -1
         #: torch's room and its cache drops so far, at the open entry's start
         self.pressure = (0, 0)
@@ -2907,6 +2910,8 @@ class WeightResidency:
         self.unpark()
         self.peaks.clear()
         self.entries.clear()
+        if self.entering:
+            self.sequence, self.entering = self.entering, []
         self.last_shortfall = None
         self.derived_at_open = self._derived()
 
@@ -2932,6 +2937,8 @@ class WeightResidency:
         weights = self.weights
         self.entries[method] = self.entries.get(method, 0) + 1
         self.repeats[method] = max(self.repeats.get(method, 0), self.entries[method])
+        if self.entries[method] == 1:
+            self.entering.append((method, local))
         weights.hold_host()
         self._clear(method, local)
         weights.room_before(method)
@@ -2982,7 +2989,36 @@ class WeightResidency:
                 self._close(local)
             self._left()
             raise
+        self._prefetch(method)
         self._entered(method)
+
+    def _prefetch(self, method: str) -> None:
+        """While this stage runs, the later stages of the last attempt fill what the plane's
+        budget has room for beside it: each one's resident set as last placed, in their
+        order, at idle priority (the first to leave if this stage needs the room). SDXL's
+        UNet otherwise loaded only once its denoise was placed, after the text encode: 0.72 s
+        of the 1.02 s loading each alternating request (phil, 12 GB)."""
+        weights = self.weights
+        stages = [m for m, _ in self.sequence]
+        if weights.grouped or weights.host_only or weights.applied < 0 or method not in stages:
+            return
+        device = plane.stats(weights.plane).device(weights.index)
+        room = weights.applied - max(device.committed, 0)
+        opened = {c.key for _, _, c in weights.opened().values()}
+        for _, names in self.sequence[stages.index(method) + 1 :]:
+            for name in names:
+                component = self.components.get(name)
+                if component is None or component.key in opened or name in self.hosted:
+                    continue
+                wanted = [i for i in component.resident if i not in component.shared]
+                need = sum(component.regions[i].span for i in wanted)
+                need -= weights.resident_bytes(component)
+                if not wanted or need > room:
+                    return  # in order: a later stage never takes room an earlier one needs
+                with suppress(*self._capacity):
+                    weights.plane.want(component.ws, weights.index, wanted, priority=weights.tick())
+                    room -= max(need, 0)
+                    opened.add(component.key)
 
     def _clear(self, method: str, local: Sequence[str]) -> None:
         """Before an entry of `method`: while torch has no more room than an entry of it is
