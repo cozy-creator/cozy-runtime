@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import socket
 import sys
 import zlib
-from pathlib import Path
 from typing import Any
 
 import msgspec
@@ -15,9 +13,8 @@ from cozy_runtime.internal import image_vae, lora_bake, weight_policy
 from cozy_runtime.internal import weights as source
 from cozy_runtime.internal.encoding import SPEC_PLAIN, Encoded, RolePart
 from cozy_runtime.internal.executor import Executor
-from cozy_runtime.internal.executor_commands import Activate, Load, Start
+from cozy_runtime.internal.executor_commands import Activate, Load
 from cozy_runtime.internal.fill import PlanRow
-from cozy_runtime.internal.seam import Channel
 from cozy_runtime.internal.weights import (
     INDIVISIBLE,
     Bake,
@@ -143,30 +140,29 @@ def test_sdk_seeded_bind_refills_its_base_before_one_forward(
     assert trace["acquired"] == trace["released"] == (4 if nested else 3)
 
 
-@pytest.mark.parametrize("effect", ["counter", "buffer", "rng"])
-def test_exhausted_op_recovery_retires_once_only_forward_state(
+@pytest.mark.parametrize("effect", ["buffer", "rng"])
+def test_exhausted_recovery_reports_its_capacity_and_leaves_the_state_it_found(
     effect: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Nothing can make room: the call fails with the measured refusal (the only way it may
+    fail), its forward's writes and draws put back, so the executor serves the next call
+    exactly as if the failed one never ran."""
     control, current = StatefulBlock(effect), StatefulBlock(effect)
     weights, _region, trace = wrapped(current, monkeypatch)
     monkeypatch.setattr(weights, "shrink", lambda _need, _floor: 0)
     failed = FailAfterOp(torch.ops.aten.linear.default)
     value = torch.tensor([[0.25, -0.5]])
     before = value.clone()
-    with torch.inference_mode():
-        control(value)
     with failed, torch.inference_mode(), pytest.raises(ResidencyRefusal) as failure:
         current(value)
-    # This is the original measured refusal from Weights.progressed, not a new floor or
-    # contract error replacing the op's capacity cause. The CPU room/lease I/O is controlled.
     assert failure.value.code == INDIVISIBLE and "aten.linear.default" in str(failure.value)
-    assert failure.value.shortfall is None and trace["residency"].last_shortfall is None
-    assert state(current) == state(control) and torch.equal(value, before)
-    assert failed.calls == 1 and trace["acquired"] == trace["released"] == 1
-    assert trace["residency"].poisoned and not trace["room"]
-    with pytest.raises(ResidencyRefusal, match="residency_poisoned"):
-        current(value)
-    assert current.calls == 1
+    assert torch.equal(value, before) and not trace["residency"].poisoned
+    assert trace["acquired"] == trace["released"] == 1
+    with torch.inference_mode():
+        assert torch.equal(current(value), control(value))
+    assert {k: v for k, v in state(current).items() if k != "calls"} == {
+        k: v for k, v in state(control).items() if k != "calls"
+    }
 
 
 def test_exhausted_functional_op_without_a_python_body_keeps_its_contract(
@@ -233,9 +229,8 @@ def test_exhausted_sdk_decoder_body_keeps_its_resumable_output_only_contract(
     assert calls == [1, 1] and trace["acquired"] == trace["released"] == 2
 
 
-def test_executor_capacity_failure_with_changed_state_refuses_generation_reuse(
+def test_an_executor_capacity_failure_keeps_its_generation_serving(
     host: tuple[Executor, dict[str, Any]],
-    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runner, load = host
@@ -260,19 +255,6 @@ def test_executor_capacity_failure_with_changed_state_refuses_generation_reuse(
         "failed",
         INDIVISIBLE,
     ), failed
-    assert failed["poisoned"] and runner.poisoned and trace["residency"].poisoned
-    assert module.calls == 1 and float(module.ticks) == 1
-    refused = runner.load(msgspec.convert({**load, "construction": "b"}, Load))
-    assert not refused["ok"] and refused["code"] == "poisoned_generation"
-    replacement_root = tmp_path / "replacement"
-    replacement_root.mkdir()
-    left, right = socket.socketpair()
-    with left, right:
-        replacement = Executor(Channel(left), replacement_root)
-        assert replacement.start(
-            msgspec.convert({**load["binding"], "devices": load["devices"]}, Start)
-        )["ok"]
-        assert replacement.load(msgspec.convert({**load, "construction": "a"}, Load))["ok"]
-        assert replacement.activate(Activate(construction="a"))["ok"]
-        served = _serve(replacement, "replacement", "ok")
-    assert served["outcome"]["terminal"] == "succeeded" and not served["poisoned"]
+    assert not failed["poisoned"] and not runner.poisoned
+    assert float(module.ticks) == 0, "its write was put back"
+    assert runner.load(msgspec.convert({**load, "construction": "b"}, Load))["ok"]
