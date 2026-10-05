@@ -618,6 +618,25 @@ def test_batch_fits_asks_an_unmeasured_method_with_what_earlier_executors_measur
     assert facts.h2d_bytes == 0 or facts.host_gbps + facts.bounce_gbps + facts.disk_gbps > 0
 
 
+def test_a_fresh_stage_streams_from_its_second_pass(card: Any) -> None:
+    """A fresh executor's denoise is one stage entry, planned before any order was seen: it
+    demand-filled every streamed block of every step (F's R1, an RTX 3070 at a 3 GiB pool:
+    1240 misses and 17 s of stall in SDXL's first request). Once its first pass has learned
+    the order, the rest of the entry streams: only the first pass misses."""
+    weights = card.weights
+    x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
+    weights.set_budget(1 << 30)
+    reference = run(load(weights, card.checkpoint, "reference"), x, passes=1)[0]
+    fresh = load(weights, card.checkpoint, "fresh")
+    weights.set_budget(tight(fresh))
+    before = weights.facts().misses
+    out = run(fresh, x, passes=4)
+    facts = weights.facts()
+    streamed = BLOCKS - facts.streamed["stack"].resident_blocks
+    assert streamed > 0 and facts.misses - before <= streamed, (facts.misses - before, streamed)
+    assert all(same([reference], [step]) for step in out)
+
+
 @on_card
 def test_a_stage_entered_once_per_step_keeps_a_resident_set(card: Any) -> None:
     """SDXL's package enters its denoise scope once per step: each stage is one pass, and

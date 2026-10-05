@@ -2948,6 +2948,19 @@ class WeightResidency:
             close_cursor(component)
         self._place(budget)
 
+    def _stream_now(self, component: Component) -> None:
+        """The stage's first pass just learned `component`'s block order: its plan had no
+        order to stream in, so every block of the pass was a demand fill. Place the open stages
+        again now, in what they have, so a cursor streams the rest of the entry (a fresh
+        executor's denoise is one entry: F's R1, 1240-1743 misses and 17-77 s of stall per
+        first request)."""
+        if component.residence is None or not component.residence.streamed or component.cursor:
+            return
+        weights = self.weights
+        for _, _, other in weights.opened().values():
+            close_cursor(other)
+        self._place(weights.applied)
+
     def _entered(self, method: str) -> None:
         weights = self.weights
         cudnn = weights.torch.backends.cudnn
@@ -3372,7 +3385,7 @@ class WeightResidency:
         def attempt(*args: Any, **kwargs: Any) -> Any:
             if weights.cell is not None and not weights.running:
                 self._asked({component.key: region.index})
-            passes = component.passes
+            passes, observed = component.passes, component.observed
             self._observe(component, region.index)
             if component.passes > passes:
                 weights.hold_host()
@@ -3380,6 +3393,8 @@ class WeightResidency:
                 self._squeezing()
             if weights.growing and component.passes == 2 > passes:
                 self._grow()
+            if component.observed and not observed and not weights.running:
+                self._stream_now(component)
             if component.spared:
                 self._unspare(component)
             versions = _versions(args, kwargs)
