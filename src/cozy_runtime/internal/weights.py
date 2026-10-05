@@ -1161,8 +1161,9 @@ class Weights:
             oom_retries=self.oom_retries,
             alloc_retries=int(allocator.get("num_alloc_retries", 0)),
             alloc_ooms=int(allocator.get("num_ooms", 0)),
-            cache_releases=accel.RELEASED[0],
-            cache_released_bytes=accel.RELEASED[1],
+            cache_releases=sum(count for count, _ in accel.RELEASED.values()),
+            cache_released_bytes=sum(freed for _, freed in accel.RELEASED.values()),
+            cache_released_by={who: (n, freed) for who, (n, freed) in accel.RELEASED.items()},
             modes=dict(self.modes),
         )
 

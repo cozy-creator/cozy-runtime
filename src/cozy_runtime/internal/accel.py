@@ -22,6 +22,7 @@ from __future__ import annotations
 import ctypes
 import re
 import subprocess
+import sys
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
@@ -508,8 +509,9 @@ def peak_reserved(torch: Any, kind: str) -> int:
     return int(torch.cuda.max_memory_reserved())
 
 
-#: This process's own cache releases that returned something: how many, and the bytes.
-RELEASED: list[int] = [0, 0]
+#: This process's own cache releases that returned something, by the function that asked:
+#: how many, and the bytes. (The caller's name is read off its frame: no call site says it.)
+RELEASED: dict[str, list[int]] = {}
 
 
 def release_cached(torch: Any, kind: str) -> None:
@@ -521,8 +523,9 @@ def release_cached(torch: Any, kind: str) -> None:
         before = int(torch.cuda.memory_reserved())
         torch.cuda.empty_cache()
         if (freed := before - int(torch.cuda.memory_reserved())) > 0:
-            RELEASED[0] += 1
-            RELEASED[1] += freed
+            row = RELEASED.setdefault(sys._getframe(1).f_code.co_name, [0, 0])
+            row[0] += 1
+            row[1] += freed
 
 
 def completion_event(torch: Any, kind: str) -> Any:
