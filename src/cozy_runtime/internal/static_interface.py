@@ -26,6 +26,7 @@ import csv
 import email.parser
 import enum
 import json
+import os
 import re
 import sysconfig
 import tomllib
@@ -1224,11 +1225,10 @@ def build_installed(distribution: str, *, environment_python: Path) -> dict[str,
     metadata = matches[0]
 
     def read(name: str) -> str:
+        # uv's symlink link mode (a seeded cache) links each installed file into its cache.
         path = metadata / name
-        if metadata.is_symlink() or path.is_symlink() or not path.is_file():
-            raise StaticRefusal(
-                "installed wheel metadata is absent or linked", code="static_distribution"
-            )
+        if not path.is_file():
+            raise StaticRefusal("installed wheel metadata is absent", code="static_distribution")
         if path.stat().st_size > 8 << 20:
             raise StaticRefusal(
                 "installed wheel metadata exceeds 8 MiB", code="static_distribution"
@@ -1253,15 +1253,20 @@ def build_installed(distribution: str, *, environment_python: Path) -> dict[str,
         raise StaticRefusal("installed application export is invalid", code="static_distribution")
     reader = Reader(metadata.parent, dependency_roots=roots)
     entry = reader.application_module(application.partition(":")[0])
+
+    # Ownership is by installed path, never a link target: a linked install's targets are
+    # in uv's cache, outside site-packages.
+    def installed(path: Path) -> Path:
+        return Path(os.path.normpath(path.absolute()))
+
+    site = installed(metadata.parent)
     owned = {
-        metadata.parent.joinpath(row[0]).resolve()
+        installed(site / row[0])
         for row in csv.reader(read("RECORD").splitlines())
         if len(row) == 3 and row[0].endswith(".py")
     }
-    if (
-        not entry.path.resolve().is_relative_to(metadata.parent.resolve())
-        or entry.path.resolve() not in owned
-    ):
+    source = installed(entry.path)
+    if not source.is_relative_to(site) or source not in owned:
         raise StaticRefusal(
             "installed App source is not owned by its wheel", code="static_distribution"
         )
