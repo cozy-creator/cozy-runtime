@@ -142,6 +142,72 @@ def test_refuses_an_annotation_outside_the_vocabulary(tmp_path: Path) -> None:
     assert "fractions.Fraction is outside the closed vocabulary" in str(refusal)
 
 
+def test_a_callers_signature_reads_its_callee_packages_types_from_the_locked_source(
+    tmp_path: Path,
+) -> None:
+    """cr-114: a caller whose signature uses a callee package's type (H3 long_form beside
+    qwen-image-2; gate 12's two-package pairs). The caller's `uv.lock` pins the callee as a
+    local directory, so the reader reads the type from that source as from an installed
+    package: nothing of either package is built or run. Without the lock it is unresolvable."""
+    uv = shutil.which("uv")
+    if uv is None:
+        pytest.skip("uv locks the pair")
+    project = tmp_path / "parent"
+    child = project / "child"
+    child.mkdir(parents=True)
+
+    def package(root: Path, name: str, module: str, body: str, extra: str = "") -> None:
+        (root / "pyproject.toml").write_text(
+            f'[project]\nname = "{name}"\nversion = "0.1.0"\nrequires-python = ">=3.12"\n'
+            f"{extra}"
+            f'[project.entry-points."cozy.application"]\ndefault = "{module}:app"\n'
+            '[build-system]\nrequires = ["hatchling"]\nbuild-backend = "hatchling.build"\n'
+        )
+        (root / "package.toml").write_text(f'[application]\nobject = "{module}:app"\n')
+        (root / f"{module}.py").write_text(body)
+
+    package(
+        child,
+        "labelled-child",
+        "label_child",
+        "import msgspec\n"
+        "from cozy_runtime.author import App, Context, invocable\n"
+        "class Result(msgspec.Struct):\n"
+        "    labels: list[str]\n"
+        "    fidelity: str = 'high'\n"
+        "@invocable\n"
+        "async def inspect(ctx: Context, *, count: int) -> Result:\n"
+        "    return Result([str(count)])\n"
+        "app = App()\n"
+        "app.job(inspect)\n",
+        "dependencies = []\n",
+    )
+    package(
+        project,
+        "labelled-parent",
+        "label_parent",
+        "from cozy_runtime.author import App, Context, invocable\n"
+        "from label_child import Result, inspect\n"
+        "@invocable\n"
+        "async def run(ctx: Context, *, count: int) -> Result:\n"
+        "    return await inspect(count=count)\n"
+        "app = App()\n"
+        "app.job(run)\n",
+        'dependencies = ["labelled-child"]\n'
+        '[tool.uv.sources]\nlabelled-child = { path = "child" }\n',
+    )
+    _run(uv, "lock", "--offline", "--no-progress", cwd=project)
+    document = static_interface.build(project)
+    (job,) = document["jobs"]
+    assert job["name"] == "run" and "Result" in json.dumps(job)
+    assert '"labels"' in json.dumps(job) and '"fidelity"' in json.dumps(job)
+
+    (project / "uv.lock").unlink()
+    refusal = _refusal(project)
+    assert refusal.code == "static_unresolvable"
+    assert "label_child.Result is outside the closed vocabulary" in str(refusal)
+
+
 def test_refuses_a_computed_decorator_argument(tmp_path: Path) -> None:
     """A comprehension folds only over a CONSTANT; a call in its iterable still refuses."""
     project = _variant(
