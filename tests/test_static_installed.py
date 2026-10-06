@@ -2,17 +2,20 @@
 
 import base64
 import hashlib
+import json
 import shutil
 import subprocess
 import sys
 import zipfile
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+import cozy_runtime
 from cozy_runtime.cli.io import CliError
 from cozy_runtime.cli.main import dispatch, parse
-from cozy_runtime.internal import static_interface
+from cozy_runtime.internal import package_interface, static_interface
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
 
 SOURCE = """
@@ -163,3 +166,110 @@ def test_an_app_installed_by_any_uv_link_mode_is_described(tmp_path: Path, mode:
     )
     document = static_interface.build(caller, environment_python=python)
     assert document["entrypoints"][0]["request"]["fields"][0]["name"] == "value"
+
+
+MEMO_SOURCE = """
+import msgspec
+from cozy_runtime.author import App, Context, MemoDistribution, invocable
+import memo_helper
+app = App()
+class Result(msgspec.Struct, frozen=True):
+    value: int
+def scale(value: int) -> int:
+    return value * 3
+@invocable(
+    memoize=True,
+    memo_version="2",
+    memo_dependencies=(scale, "memo_helper", MemoDistribution("msgspec")),
+)
+async def first(ctx: Context, *, value: int) -> Result:
+    return Result(scale(value) + memo_helper.OFFSET)
+@invocable(memoize=True)
+async def second(ctx: Context, *, value: int) -> Result:
+    return Result(value * 2)
+@invocable(memoize=True, memo_dependencies=(MemoDistribution("msgspec" if True else "numpy"),))
+async def computed(ctx: Context, *, value: int) -> Result:
+    return Result(value)
+app.job(first)
+app.job(second)
+app.job(computed)
+"""
+
+
+IMPORTED = """
+import json, memo_app
+from cozy_runtime.internal.memo_implementation import describe
+# As the Runtime describes an App's callable: its implementation, which carries its declaration.
+fns = {n: getattr(memo_app, n)._cozy_export.implementation for n in ("first", "second")}
+print(json.dumps({n: describe(fn).get("operation_identity") for n, fn in fns.items()}))
+"""
+
+
+def memo_environment(tmp_path: Path, second_body: str = "value * 2") -> Path:
+    """`memo_app` and its helper module, installed by uv from a real wheel."""
+    uv = shutil.which("uv")
+    if uv is None:
+        pytest.skip("uv installs the wheel")
+    project = tmp_path / "memo-project"
+    project.mkdir(parents=True)
+    (project / "pyproject.toml").write_text(
+        '[project]\nname = "memo-app"\nversion = "1.0.0"\ndependencies = ["msgspec"]\n'
+        '[project.entry-points."cozy.application"]\ndefault = "memo_app:app"\n'
+        '[build-system]\nrequires = ["hatchling"]\nbuild-backend = "hatchling.build"\n'
+        '[tool.hatch.build.targets.wheel]\nonly-include = ["memo_app.py", "memo_helper.py"]\n'
+    )
+    (project / "memo_app.py").write_text(MEMO_SOURCE.replace("value * 2", second_body))
+    (project / "memo_helper.py").write_text("OFFSET = 7\n")
+    venv = tmp_path / "memo-venv"
+    subprocess.run([uv, "venv", "-q", "--python", sys.executable, str(venv)], check=True)
+    python = venv / "bin" / "python"
+    subprocess.run([uv, "pip", "install", "-q", "--python", str(python), str(project)], check=True)
+    return python
+
+
+def identities(document: dict[str, Any]) -> dict[str, object]:
+    return {job["name"]: job["invocable"].get("operation_identity") for job in document["jobs"]}
+
+
+def test_an_installed_memoized_callable_carries_the_identity_its_import_would(
+    tmp_path: Path,
+) -> None:
+    """The static identity is `describe`'s: one key whether a machine reads or imports it.
+    A declaration the reader cannot follow carries none (its machine uses the package)."""
+    python = memo_environment(tmp_path)
+    found = identities(static_interface.build_installed("memo-app", environment_python=python))
+    # The environment's own packages first, then this Runtime: describe() imports the App.
+    site = next((python.parent.parent / "lib").glob("python*/site-packages"))
+    runtime = Path(cozy_runtime.__file__).parents[1]
+    imported = subprocess.run(
+        [sys.executable, "-c", IMPORTED],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={"PATH": "/usr/bin:/bin", "PYTHONPATH": f"{site}:{runtime}"},
+    )
+    assert {k: found[k] for k in ("first", "second")} == json.loads(imported.stdout)
+    assert all(str(found[k]).startswith("sha256:") for k in ("first", "second"))
+    assert found["computed"] is None
+    # A source reading carries no installed fact.
+    assert all(
+        "operation_identity" not in job["invocable"]
+        for job in package_interface.source_facts(
+            static_interface.build_installed("memo-app", environment_python=python)
+        )["jobs"]
+    )
+
+
+def test_a_changed_function_changes_only_its_own_identity(tmp_path: Path) -> None:
+    before = identities(
+        static_interface.build_installed(
+            "memo-app", environment_python=memo_environment(tmp_path / "a")
+        )
+    )
+    after = identities(
+        static_interface.build_installed(
+            "memo-app", environment_python=memo_environment(tmp_path / "b", "value * 2 + 1")
+        )
+    )
+    assert after["first"] == before["first"]
+    assert after["second"] != before["second"]
