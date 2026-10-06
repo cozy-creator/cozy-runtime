@@ -15,6 +15,7 @@ from collections.abc import Callable, Iterator
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from fractions import Fraction
+from numbers import Rational
 from pathlib import Path
 from typing import Any, BinaryIO, Literal, Protocol, TypeVar
 
@@ -1531,8 +1532,8 @@ def _required_stream(kind: str, count: int) -> None:
 
 def _fraction(value: object, what: str) -> Fraction:
     try:
-        if isinstance(value, Fraction):
-            return value
+        if isinstance(value, Rational):
+            return Fraction(value.numerator, value.denominator)
         if isinstance(value, int | float | str):
             return Fraction(value)
         raise TypeError(type(value).__name__)
