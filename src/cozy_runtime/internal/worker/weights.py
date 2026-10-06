@@ -16,17 +16,24 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO, cast
+from typing import BinaryIO, Protocol, cast
 from urllib.parse import urlparse
 
 import msgspec
 
 from cozy_runtime import canonical_json
-from cozy_runtime.internal import egress, fill, weights_sink
+from cozy_runtime.internal import egress, fill, weights_receipts, weights_sink
 from cozy_runtime.internal.weights_writer import WriterAttempt, WriterBinding, WriterBroker
 from cozy_runtime.internal.worker.workspace import WeightsTransaction, Workspace
 from cozy_runtime.protocol import documents, weights_limits
 from cozy_runtime.protocol import worker_pb2 as pb
+
+
+class _ReceiptAttempt(WriterAttempt, Protocol):
+    """The worker's receipt registry; the native executor writer does not need it."""
+
+    @property
+    def weights_receipts(self) -> dict[str, pb.WeightsReceiptRef]: ...
 
 
 class _LeaseReader:
@@ -193,7 +200,7 @@ class WeightsExchange:
         wrapped = weights_sink.receipt_from_native(
             binding.slot, transaction, facts, replayed=False, request_id=attempt.request_id
         )
-        _, canonical_receipt, digest = weights_sink.protocol_receipt(
+        _, canonical_receipt, digest = weights_sink.execution_receipt(
             wrapped,
             owner_scope=self.owner_scope(),
             request_id=attempt.request_id,
@@ -400,7 +407,7 @@ class WeightsExchange:
                     weights_receipt_canonical_bytes=row["receipt"],
                 )
                 held = self._hold(transaction_id, epoch, reference)
-                attempt.weights_receipts[output_slot] = held.receipt
+                cast(_ReceiptAttempt, attempt).weights_receipts[output_slot] = held.receipt
             return epoch
         except WeightsExchangeError:
             raise
@@ -432,7 +439,7 @@ class WeightsExchange:
             weights_receipt_digest=receipt_digest,
             weights_receipt_canonical_bytes=canonical_receipt,
         )
-        receipt = documents.parse(canonical_receipt, pb.WeightsReceipt)
+        receipt = weights_receipts.read(canonical_receipt)
         if (
             receipt.request_id != attempt.request_id
             or receipt.owner_authority_scope != self.owner_scope()
@@ -466,7 +473,7 @@ class WeightsExchange:
                 str(getattr(exc, "code", "workspace_refused")),
                 "workspace receipt recording refused",
             ) from exc
-        attempt.weights_receipts[output_slot] = reference
+        cast(_ReceiptAttempt, attempt).weights_receipts[output_slot] = reference
 
     def close(self) -> None:
         """Forget receipt metadata; active transports release their own read leases."""
@@ -589,7 +596,7 @@ class WeightsExchange:
             raise WeightsExchangeError(
                 "weights_receipt_invalid", "receipt ref digest does not match exact bytes"
             )
-        documents.parse(raw, pb.WeightsReceipt)
+        weights_receipts.read(raw)
         return digest
 
     def _hold(
@@ -620,7 +627,7 @@ class WeightsExchange:
                     "weights_receipt_mismatch", "held transaction carries another receipt"
                 )
             return existing
-        value = documents.parse(reference.weights_receipt_canonical_bytes, pb.WeightsReceipt)
+        value = weights_receipts.read(reference.weights_receipt_canonical_bytes)
         if value.weights_transaction_id != transaction_id:
             raise WeightsExchangeError(
                 "weights_receipt_identity_mismatch", "receipt names another transaction"

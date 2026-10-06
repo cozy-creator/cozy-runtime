@@ -124,7 +124,7 @@ def _receipt(
         replayed=True,
         request_id=request.request_id,
     )
-    ref, _raw, digest = weights_sink.protocol_receipt(
+    ref, _raw, digest = weights_sink.execution_receipt(
         receipt,
         owner_scope=request.owner_authority_scope,
         request_id=request.request_id,
@@ -132,7 +132,10 @@ def _receipt(
     )
     if request.weights_receipt_digest and request.weights_receipt_digest != digest:
         raise FinalizationRefusal("weights finalization receipt differs from the committed receipt")
-    return ref
+    return pb.WeightsReceiptRef(
+        weights_receipt_digest=ref.weights_receipt_digest,
+        weights_receipt_canonical_bytes=ref.weights_receipt_canonical_bytes,
+    )
 
 
 def _authorize(

@@ -45,9 +45,7 @@ from cozy_runtime.author._executor_requests import (
     WriterSource,
     refuse,
 )
-from cozy_runtime.internal import storage_admission, weights_sink
-from cozy_runtime.protocol import documents, weights_limits
-from cozy_runtime.protocol import worker_pb2 as pb
+from cozy_runtime.internal import storage_admission, weights_receipts, weights_sink
 
 if TYPE_CHECKING:
     from tensorfs.derived import Derivation
@@ -84,8 +82,6 @@ class WriterAttempt(Protocol):
     def spool(self) -> Path | None: ...
     @property
     def weights_work_fingerprint(self) -> str: ...
-    @property
-    def weights_receipts(self) -> dict[str, pb.WeightsReceiptRef]: ...
     #: The accepted InvocationSpec document; the attempt engine carries it as JSON.
     @property
     def spec(self) -> Mapping[str, object]: ...
@@ -172,7 +168,7 @@ class ExecutionStorage:
         length = _write(
             weights_sink.exchange_file(self.spool, slot, "native-receipt"),
             canonical_json.encode(dict(facts)),
-            weights_limits.MAX_WEIGHTS_RECEIPT_BYTES,
+            weights_receipts.MAX_RECEIPT_BYTES,
         )
         answer = self._call(
             WriterAdopt(output_slot=slot, transaction=transaction, length=length), Adopted
@@ -439,7 +435,7 @@ class WriterBroker:
         with _read(
             _exchange_file(attempt, slot, "native-receipt"),
             frame.length,
-            weights_limits.MAX_WEIGHTS_RECEIPT_BYTES,
+            weights_receipts.MAX_RECEIPT_BYTES,
         ) as source:
             relayed = canonical_json.decode_as(source.read(), dict[str, object])
         native = weights_sink.lookup(self.store(), transaction)
@@ -498,7 +494,7 @@ class WriterBroker:
             receipt = weights_sink.native_receipt(replay)
             if (
                 receipt.transaction_id != transaction
-                or documents.raw(receipt.declaration_digest) != binding.declaration_digest
+                or weights_receipts.raw(receipt.declaration_digest) != binding.declaration_digest
             ):
                 raise CapabilityError(
                     "native receipt differs from intent", code="weights_receipt_mismatch"

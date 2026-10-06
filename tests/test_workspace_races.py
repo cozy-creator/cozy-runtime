@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 import tensorfs
 
-from cozy_runtime.internal.weights_sink import protocol_receipt, weights_transaction_id
+from cozy_runtime.internal.weights_sink import execution_receipt, weights_transaction_id
 from cozy_runtime.internal.worker import workspace_finalize
 from cozy_runtime.internal.worker.weights_finalize import FinalizationRefusal
 from cozy_runtime.internal.worker.workspace import Workspace, WorkspaceRefusal
@@ -192,11 +192,15 @@ def test_conflicting_finalization_cannot_release_an_adopted_result(tmp_path: Pat
     store, workspace, receipt = produced(tmp_path)
     with workspace.locked() as db:
         attempt = dict(db.execute("SELECT * FROM attempts").fetchone())
-    reference, _, _ = protocol_receipt(
+    reference, _, _ = execution_receipt(
         receipt,
         owner_scope="owner",
         request_id="producer",
         invocation_spec_digest=documents.spell(attempt["spec"]),
+    )
+    reference = pb.WeightsReceiptRef(
+        weights_receipt_digest=reference.weights_receipt_digest,
+        weights_receipt_canonical_bytes=reference.weights_receipt_canonical_bytes,
     )
     raw, digest = documents.identity(
         pb.AttemptOutcomeBody(

@@ -1,7 +1,7 @@
-"""Execution identity and protocol projections for native TensorFS output receipts.
+"""Execution identity and stored documents for native TensorFS output receipts.
 
 TensorFS owns source and writer APIs. Runtime binds native facts to the accepted
-execution and converts retained native receipts into its existing protocol documents.
+execution and converts retained native receipts into its stored receipt documents.
 The native source API supplies all reader metadata and bytes.
 """
 
@@ -22,8 +22,7 @@ from cozy_runtime.author._errors import CapabilityError
 from cozy_runtime.author._weights import (
     WeightsReceipt,
 )
-from cozy_runtime.protocol import documents
-from cozy_runtime.protocol import worker_pb2 as pb
+from cozy_runtime.internal import weights_receipts
 
 if TYPE_CHECKING:
     import tensorfs
@@ -77,7 +76,7 @@ def lookup(store: tensorfs.Store, transaction_id: str) -> DerivedLookup:
 
 def declaration_digest(facts: Mapping[str, object]) -> bytes:
     """The declaration a native receipt names by digest."""
-    return documents.raw(native_receipt(facts).declaration_digest)
+    return weights_receipts.raw(native_receipt(facts).declaration_digest)
 
 
 def same_receipt(left: Mapping[str, object], right: Mapping[str, object]) -> bool:
@@ -108,7 +107,7 @@ def work_fingerprint(
         "payload_digest": spec["payload_digest"],
         "inputs": spec.get("inputs", []),
         "outputs": spec.get("outputs", []),
-        "numerical_environment_digest": documents.spell(numerical),
+        "numerical_environment_digest": weights_receipts.spell(numerical),
     }
     return (
         "sha256:"
@@ -184,15 +183,15 @@ def weights_transaction_id(
     return "sha256:" + hashlib.sha256(b"cozy.runtime.artifact-transaction\0" + subject).hexdigest()
 
 
-def protocol_receipt(
+def execution_receipt(
     receipt: WeightsReceipt,
     *,
     owner_scope: str,
     request_id: str,
     invocation_spec_digest: str,
-) -> tuple[pb.WeightsReceiptRef, bytes, bytes]:
-    """Wrap exact TensorFS receipt bytes in Worker Protocol WeightsReceipt/1."""
-    body = pb.WeightsReceipt(
+) -> tuple[weights_receipts.Reference, bytes, bytes]:
+    """Bind exact TensorFS receipt bytes to the accepted execution."""
+    body = weights_receipts.Receipt(
         owner_authority_scope=owner_scope,
         request_id=request_id,
         invocation_spec_digest=invocation_spec_digest,
@@ -201,9 +200,9 @@ def protocol_receipt(
         tensorfs_receipt_digest=receipt.tensorfs_receipt_digest,
         tensorfs_receipt_canonical_bytes=receipt.tensorfs_receipt,
     )
-    canonical_bytes, digest = documents.identity(body)
+    canonical_bytes, digest = weights_receipts.identity(body)
     return (
-        pb.WeightsReceiptRef(
+        weights_receipts.Reference(
             weights_receipt_digest=digest,
             weights_receipt_canonical_bytes=canonical_bytes,
         ),

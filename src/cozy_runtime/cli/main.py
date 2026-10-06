@@ -31,7 +31,7 @@ usage: cozy-runtime [--json] [--full] [--fields a,b] [--dir <path>] <verb> [args
 verbs:
   describe [<fn>]                the PackageInterface, from source alone (no package code runs)
   new <name>                     scaffold a minimal valid package skeleton
-  version                        tag, commit, and the two independent semvers
+  version                        tag, commit, and Python author contract
 
 Packages run on a machine through `cozy run`; this CLI only reads and scaffolds them.
 

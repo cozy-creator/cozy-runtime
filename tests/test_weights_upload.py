@@ -26,7 +26,7 @@ from pathlib import Path
 import pytest
 import tensorfs
 
-from cozy_runtime.internal.weights_sink import protocol_receipt
+from cozy_runtime.internal.weights_sink import execution_receipt
 from cozy_runtime.internal.worker import weights
 from cozy_runtime.protocol import worker_pb2 as pb
 from test_weights_resume_native import _committed
@@ -207,7 +207,7 @@ def test_a_grant_naming_an_unreachable_address_is_refused(tmp_path: Path) -> Non
 
 def test_native_output_leases_belong_only_to_active_transfers(tmp_path: Path) -> None:
     native, _, _, receipt = _committed(tmp_path)
-    _, raw, digest = protocol_receipt(
+    _, raw, digest = execution_receipt(
         receipt,
         owner_scope="resume-proof",
         request_id="request",

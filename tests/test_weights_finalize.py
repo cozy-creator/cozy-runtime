@@ -105,7 +105,7 @@ def _committed(tmp_path: Path) -> tuple[pb.WeightsFinalizeRequest, Path, Any]:
     receipt = weights_sink.receipt_from_native(
         "model", _transaction(request), facts, replayed=True, request_id=request.request_id
     )
-    _ref, _bytes, digest = weights_sink.protocol_receipt(
+    _ref, _bytes, digest = weights_sink.execution_receipt(
         receipt,
         owner_scope="owner",
         request_id=request.request_id,
@@ -236,11 +236,15 @@ def test_abandon_drops_upload_lease_and_late_receipt_cannot_reopen_it(tmp_path: 
     receipt = weights_sink.receipt_from_native(
         "model", _transaction(request), facts, replayed=True, request_id=request.request_id
     )
-    reference, _raw, _digest = weights_sink.protocol_receipt(
+    reference, _raw, _digest = weights_sink.execution_receipt(
         receipt,
         owner_scope="owner",
         request_id=request.request_id,
         invocation_spec_digest="sha256:" + request.invocation_spec_digest.hex(),
+    )
+    reference = pb.WeightsReceiptRef(
+        weights_receipt_digest=reference.weights_receipt_digest,
+        weights_receipt_canonical_bytes=reference.weights_receipt_canonical_bytes,
     )
     exchange = WeightsExchange(store_root=root, stop=Event(), owner_scope=lambda: "owner")
     exchange._hold(_transaction(request), 1, reference)

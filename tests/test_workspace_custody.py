@@ -16,7 +16,7 @@ from tensorfs.derived import Derivation, Part, Target, Tensor
 from cozy_runtime.author import WeightsReceipt
 from cozy_runtime.internal import canonical
 from cozy_runtime.internal.weights_sink import (
-    protocol_receipt,
+    execution_receipt,
     receipt_from_native,
     weights_transaction_id,
 )
@@ -73,11 +73,15 @@ def produced(
         return epoch
 
     def record(receipt: WeightsReceipt) -> None:
-        reference, _, _ = protocol_receipt(
+        reference, _, _ = execution_receipt(
             receipt,
             owner_scope="owner",
             request_id=request_id,
             invocation_spec_digest=documents.spell(spec),
+        )
+        reference = pb.WeightsReceiptRef(
+            weights_receipt_digest=reference.weights_receipt_digest,
+            weights_receipt_canonical_bytes=reference.weights_receipt_canonical_bytes,
         )
         manifest = json.loads(receipt.tensorfs_receipt)["manifest"]
         workspace.record_receipt(

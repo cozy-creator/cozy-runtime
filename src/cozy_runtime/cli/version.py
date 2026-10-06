@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from cozy_runtime import PYTHON_CONTRACT_VERSION, WIRE_PROTOCOL_VERSION, __version__
+from cozy_runtime import PYTHON_CONTRACT_VERSION, __version__
 from cozy_runtime._build_provenance import COMMIT
 from cozy_runtime.cli.io import Result
 from cozy_runtime.internal.config import RuntimeConfig
@@ -13,7 +13,6 @@ def run(config: RuntimeConfig, full: bool = False, fields: tuple[str, ...] = ())
         ("distribution", __version__),
         ("tag", f"v{__version__}"),
         ("commit", COMMIT[:12] if COMMIT != "unknown" else COMMIT),
-        ("wire_protocol", WIRE_PROTOCOL_VERSION),
         ("python_contract", PYTHON_CONTRACT_VERSION),
     )
     if full:
