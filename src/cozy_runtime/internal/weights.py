@@ -1268,6 +1268,7 @@ class Weights:
             bounce_gbps=gbps(device.bounce_copy_bytes, device.bounce_copy_ns),
             disk_gbps=gbps(device.disk_copy_bytes, device.disk_copy_ns),
             register_failed=held.host.register_failed,
+            copied_bytes=held.host.copied_bytes,
             plan_inputs={method: dict(row) for method, row in self.plan_inputs.items()},
             shared_bytes=device.shared_bytes,
             disk_read_bytes=held.host.disk_read_bytes,

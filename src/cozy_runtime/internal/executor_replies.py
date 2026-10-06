@@ -135,6 +135,9 @@ class PlaneFacts(msgspec.Struct, frozen=True, kw_only=True):
     disk_gbps: float = 0.0
     #: page locks the driver refused (a sealed layout counts once)
     register_failed: int = 0
+    #: page-locked copies of streamed sealed regions held now: the executor's own host RAM
+    #: outside the machine's tier, which its PSS does not show
+    copied_bytes: int = 0
     #: per stage method, its last plan's inputs, bytes: driver free, torch reserved and
     #: allocated, the plane's committed and the bound weights' decoded copies, the stage's
     #: activation growth and the budget that came out (`Weights.driver_budget`)

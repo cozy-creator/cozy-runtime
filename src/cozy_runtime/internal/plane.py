@@ -58,6 +58,9 @@ class HostStats(msgspec.Struct, frozen=True, kw_only=True):
     evictions: int = 0
     #: page locks the driver refused (a sealed layout counts once): those copies bounce
     register_failed: int = 0
+    #: page-locked copies of streamed sealed regions the driver would not lock, held now: this
+    #: process's own RAM, invisible in its PSS (0 before TensorFS made them)
+    copied_bytes: int = 0
 
 
 class DeviceStats(msgspec.Struct, frozen=True, kw_only=True):

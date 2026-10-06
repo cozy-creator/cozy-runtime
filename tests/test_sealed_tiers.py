@@ -39,8 +39,10 @@ from test_weight_plane import (  # noqa: E402
     Stack,
     assert_pinned,
     load,
+    on_gpu,
     run,
     same,
+    tight,
     write_checkpoint,
 )
 
@@ -253,6 +255,45 @@ def test_an_executor_computes_on_the_machines_sealed_layout_and_reads_no_store(
     finally:
         first.close()
         second.close()
+        machine.close()
+
+
+@on_gpu
+def test_a_stage_streaming_a_sealed_layout_the_card_will_not_lock_dmas_from_a_copy(
+    tmp_path: Path,
+) -> None:
+    """A consumer GPU locks no read-only memory, so the machine's sealed layout cannot be DMA'd
+    as it is. What a stage streams is copied once into page-locked memory of the executor's own
+    and DMA'd from there after its first pass, bit-identical. A resident fill copies nothing.
+    The executor reports the copies (`copied_bytes`): its own RAM, outside the machine's tier,
+    never more than it streams."""
+    checkpoint, _ = write_checkpoint(tmp_path)
+    machine = Machine(checkpoint.root)
+    session = Session(machine, tmp_path)
+    try:
+        weights = Weights(torch, torch.device("cuda", 0), "cuda")
+        weights.set_budget(1 << 30, pinned=1 << 30)
+        model = load(weights, checkpoint, "sealed", tiers=session.tiers)
+        component = model.backend.components["stack"]
+        assert component.sealed
+        x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
+        resident = run(model, x, passes=1)
+        assert weights.facts().copied_bytes == 0
+        weights.set_budget(tight(model))
+        assert same(resident, run(model, x, passes=1))  # observes the order the ring streams
+        model.residency.unpark()  # the attempt's end: the next stage streams through the ring
+        before = weights.facts()
+        assert same(resident * 4, run(model, x, passes=4))
+        facts = weights.facts()
+        bounced = facts.bounce_copy_bytes - before.bounce_copy_bytes
+        if facts.register_failed == 0:  # this card locks read-only memory: nothing to copy
+            assert facts.copied_bytes == 0 and bounced == 0, facts
+            return
+        assert 0 < facts.copied_bytes < component.ws.nbytes, facts
+        # the first of four passes bounced while its copies were made; the rest were DMA
+        assert bounced * 2 < facts.h2d_bytes - before.h2d_bytes, facts
+    finally:
+        session.close()
         machine.close()
 
 
