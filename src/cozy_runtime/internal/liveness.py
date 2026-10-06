@@ -51,6 +51,16 @@ def noise_floor(sample_seconds: float | None = None) -> float:
     return STILL_SAMPLES * (SAMPLE_SECONDS if sample_seconds is None else sample_seconds)
 
 
+def moved(pid: int) -> int | None:
+    """Bytes a process moved (storage and descriptors), without its CPU time: a process that
+    spins in a wait burns CPU and moves nothing. `None` is unreadable."""
+    try:
+        value = proctree.progress_burn(pid, cpu=False)
+    except proctree.ProcessTreeUnsupported:
+        return None
+    return None if value < 0 else value
+
+
 def burn(pid: int, tid: int = 0) -> int | None:
     """`proctree.progress_burn` as a reading: UNREADABLE is `None`, here and on a platform
     with no `/proc` to read."""

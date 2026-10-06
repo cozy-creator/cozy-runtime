@@ -183,6 +183,16 @@ def require_nvls_off(sealed: Mapping[str, str], backend: str) -> None:
         )
 
 
+def abortable(backend: str) -> None:
+    """Before a process joins an NCCL group: an aborted collective raises in the thread that
+    waits on it, and the process lives on to form the group again (`RankGroup.interrupt`).
+    torch's watchdog otherwise tears the process down on the error an abort leaves (its
+    default handling), and `_abort_process_group` asks for it off. Read when the
+    communicator is made, and this is its only switch."""
+    if "nccl" in backend:
+        os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "0"
+
+
 def join_rank(torch: Any, spec: RankSpec, sealed: Mapping[str, str]) -> Any:
     """A follower joins rank 0's store and forms its half of the process group.
 
@@ -193,6 +203,7 @@ def join_rank(torch: Any, spec: RankSpec, sealed: Mapping[str, str]) -> Any:
     dist = torch.distributed
 
     require_nvls_off(sealed, spec.backend)
+    abortable(spec.backend)
     store = dist.TCPStore("127.0.0.1", spec.port, spec.world, is_master=False)
     dist.init_process_group(spec.backend, store=store, rank=spec.rank, world_size=spec.world)
     dist.barrier()
@@ -297,8 +308,14 @@ class RankGroup:
         self.rerunnable = False
         #: `interrupt` ended this formation's collectives; `form(room=...)` clears it
         self.interrupted = False
+        #: set once this formation's interrupt has aborted its communicator (set: none due)
+        self._ended = threading.Event()
+        self._ended.set()
         #: device bytes the followers gave back at the last `form(room=...)`
         self.gave = 0
+        #: per mirrored component, the pace of its calls (`watched`): the longest pause any
+        #: call of it showed carries over to the next
+        self.paces: dict[str, liveness.Pace] = {}
         #: per follower rank, the largest working peak its mirrored calls reported this attempt
         self.working_peaks: dict[int, int] = {}
         #: per follower rank, its executor's plane facts as its latest reply stated them
@@ -415,19 +432,67 @@ class RankGroup:
         if self.pg is not None:
             abort_process_group()
 
+    @contextlib.contextmanager
+    def watched(self, name: str, device: Callable[[], int]) -> Iterator[None]:
+        """A mirrored call in flight, judged by its own pace (`liveness.Pace`), never a clock:
+        the reading is GPU 0's device progress (`device`), the bytes each follower moved and
+        the answers that arrived. Every GPU of a call waits on the others in its
+        collectives, so a GPU stuck in one stops them all; a spinning wait burns CPU, which is
+        why CPU time is not in the reading. Still for longer than STILL_FACTOR times the
+        longest pause any call of this component showed (the first call learns its own, from
+        its device progress) and the noise floor: the group breaks, naming the GPUs that
+        have not answered. NCCL's own watchdog is off (`abortable`): this is the one that
+        ends a wedged call."""
+        pace = self.paces.setdefault(name, liveness.Pace())
+        pace.reading = None  # this call opens its own clock
+        floor = liveness.noise_floor(self.sample_seconds)
+        finished = threading.Event()
+
+        def watch() -> None:
+            while not finished.wait(self.sample_seconds):
+                pace.observe(
+                    (
+                        device(),
+                        tuple(liveness.moved(f.pid) for f in self.followers),
+                        tuple(f.replies.qsize() for f in self.followers),
+                    )
+                )
+                if pace.wedged(floor):
+                    quiet = [f.gpu for f in self.followers if f.replies.empty()] or ["GPU 0"]
+                    self._break(f"{', '.join(quiet)} wedged in {name!r}: {pace.verdict(floor)}")
+                    return
+
+        watcher = threading.Thread(target=watch, name="group-watch", daemon=True)
+        watcher.start()
+        try:
+            yield
+        finally:
+            finished.set()
+            watcher.join()
+
     def interrupt(self) -> None:
         """End the collective in flight on every GPU and keep the group whole: each
         follower's watcher aborts its communicator, and this process aborts its own. The group
-        forms again (`form(room=...)`) before its next call. Once per formation."""
+        forms again (`form(room=...)`) before its next call. Once per formation: a second
+        caller (the reader thread and the call's own thread both may) returns only once the
+        first one's abort is done, so the group is never formed again under an abort still
+        in progress (that deadlocks torch's process-group teardown)."""
         with self._leases:
-            if self.interrupted:
-                return
-            self.interrupted = True
-        for follower in self.followers:
-            if follower.abort is not None:
-                with contextlib.suppress(OSError):
-                    follower.abort.send(b"\1")
-        self._abort_collectives()
+            first = not self.interrupted
+            if first:
+                self.interrupted = True
+                self._ended.clear()
+        if not first:
+            self._ended.wait()
+            return
+        try:
+            for follower in self.followers:
+                if follower.abort is not None:
+                    with contextlib.suppress(OSError):
+                        follower.abort.send(b"\1")
+            self._abort_collectives()
+        finally:
+            self._ended.set()
 
     def dial_back(self, sealed: Mapping[str, str]) -> None:
         """Every follower answers `hello` as its own rank of this world, under EXACTLY this
@@ -466,6 +531,7 @@ class RankGroup:
 
         self.check_alive()
         require_nvls_off(sealed, self.backend)
+        abortable(self.backend)
         if room >= 0 and dist.is_initialized():
             dist.destroy_process_group()
         self.store = dist.TCPStore(

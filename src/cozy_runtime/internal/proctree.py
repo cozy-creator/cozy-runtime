@@ -1250,7 +1250,7 @@ def peek_child_exit(process: ProcessIdentity) -> int | None:
     return info.si_status | (0x80 if info.si_code == os.CLD_DUMPED else 0)
 
 
-def progress_burn(pid: int, tid: int = 0) -> int:
+def progress_burn(pid: int, tid: int = 0, *, cpu: bool = True) -> int:
     """The progress meter: CPU nanoseconds PLUS every byte moved — read from and written to
     storage, and read from or written through any descriptor (`rchar`/`wchar`, which is how
     a socket or a network filesystem shows up). A child can be making progress by computing,
@@ -1258,7 +1258,8 @@ def progress_burn(pid: int, tid: int = 0) -> int:
     meter missing any one hand kills that one. THIS process, threads included and exited
     threads folded in, unreaped children excluded — or ONE thread of it when `tid` names
     one, which is how a lane is judged apart from the pollers beside it. -1 is UNREADABLE,
-    never a zero (an unreadable meter decides nothing)."""
+    never a zero (an unreadable meter decides nothing). Without `cpu`, only the bytes: a
+    process spinning in a wait (a GPU waiting on a collective) burns CPU and moves none."""
     _linux_only("progress_burn")
     if not pid:
         return -1
@@ -1268,7 +1269,7 @@ def progress_burn(pid: int, tid: int = 0) -> int:
         ticks = int(fields[11]) + int(fields[12])  # utime + stime, after `state`
     except (OSError, IndexError, ValueError):
         return -1
-    burned = ticks * (1_000_000_000 // os.sysconf("SC_CLK_TCK"))
+    burned = ticks * (1_000_000_000 // os.sysconf("SC_CLK_TCK")) if cpu else 0
     try:
         io = dict(
             line.split(": ", 1) for line in Path(f"{base}/io").read_text().splitlines() if line

@@ -212,10 +212,12 @@ from cozy_runtime.internal.weights import (
     INDIVISIBLE,
     DeviceTiers,
     HostTiers,
+    Journal,
     PlaneBackend,
     ResidencyRefusal,
     WeightResidency,
     Weights,
+    journaling,
 )
 
 #: The inline-result door (worker-protocol/01 `ResultEnvelope`): a small typed result rides
@@ -529,6 +531,9 @@ class Executor:
         self._interrupted = threading.Event()
         #: a follower's stage methods of the group call that last ran out of memory
         self._rerun_methods: tuple[str, ...] = ()
+        #: a follower's last mirrored call that succeeded: rewound if the group runs it again
+        #: because another GPU failed it (`join` with `room`), dropped at its next call
+        self._last_journal: Journal | None = None
         self._device_ready = False
         self._startup_reported = False
         #: a follower's budget cell from rank 0 (`RANK_CELLS`), for its weight plane
@@ -846,9 +851,13 @@ class Executor:
 
         self.torch = torch
         if command.room >= 0:
-            # Rank 0 interrupted before it asked: the watcher has aborted the old group.
+            # Rank 0 interrupted before it asked: the watcher has aborted the old group. A
+            # call this GPU finished is undone too: the group runs it again from its inputs.
             self._interrupted.wait()
             self._interrupted.clear()
+            if self._last_journal is not None:
+                self._last_journal.rewind()
+                self._last_journal = None
             if torch.distributed.is_initialized():
                 torch.distributed.destroy_process_group()
         spec = RankSpec(
@@ -1046,7 +1055,15 @@ class Executor:
                         output, wire.TensorSpool(spool / str(command.get("results", "hosted")))
                     )
                 else:
-                    component(*args, **kwargs)
+                    self._last_journal = None
+                    with self._call_journal() as journal:
+                        try:
+                            component(*args, **kwargs)
+                        except BaseException:
+                            if journal is not None:  # the state its blocks found, put back
+                                journal.rewind()
+                            raise
+                    self._last_journal = journal
                 accel.synchronize(self.torch, self.device_kind)
             self._attempt_spool = spool
             working = max(
@@ -1176,6 +1193,7 @@ class Executor:
                         and _cancelled(owner.root, owner._attempt_request)
                     ),
                     rerun=owner._group_rerun,
+                    journaled=owner._call_journal,
                 )
         hosted = mirror.hosting_plan(
             placeable=tuple(getattr(type(model), "__placeable__", ())),
@@ -1241,6 +1259,13 @@ class Executor:
             "followers": list(self.group.pids()) if self.group is not None else [],
         }
         return None
+
+    def _call_journal(self) -> contextlib.AbstractContextManager[Journal | None]:
+        """One GPU of a group in a call: every op it runs is journaled (`weights.journaling`),
+        so the call can be rewound as a whole when any GPU of the group fails it."""
+        if self.torch is None:
+            return contextlib.nullcontext()
+        return journaling(self.torch, Journal())
 
     def _recovering(self) -> contextlib.AbstractContextManager[object]:
         """Torch ops outside a block run again after weights were unmapped for them."""

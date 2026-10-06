@@ -52,6 +52,7 @@ def mirror_component(
     spool: Callable[[], Path | None],
     cancelled: Callable[[], bool] = lambda: False,
     rerun: Callable[[int], int] | None = None,
+    journaled: Callable[[], contextlib.AbstractContextManager[Any]] = contextlib.nullcontext,
 ) -> None:
     """Wrap the module call outside all torch and diffusers hooks.
 
@@ -66,7 +67,8 @@ def mirror_component(
     GPU gives that many device bytes back and the group forms again; it answers the bytes
     that came back) the whole call runs again on every GPU, from the same inputs. It runs
     again once on the failed attempt's own memory alone, and after that only while a rerun
-    gave memory back.
+    gave memory back. Before it does, every GPU puts back what the failed attempt's blocks
+    changed (`journaled`: this GPU's call journal, `Weights.call_journal`).
     """
     if component._compiled_call_impl is not None:
         raise cp.ContextParallelUnavailable(
@@ -88,25 +90,31 @@ def mirror_component(
                         group.rerunnable = rerun is not None
                         group.broadcast(msgspec.to_builtins(command))
                         short: list[tuple[str, int]] = []
-                        try:
-                            with cp.gated_call():
-                                result = call(*args, **kwargs)
-                        except Exception as exc:
-                            need = out_of_memory(exc) if group.rerunnable else None
-                            if need is None and not group.interrupted:
-                                raise
-                            # GPU 0 ran out, or a follower did and ended GPU 0's collective.
-                            short += [(group.gpu(0), need)] if need is not None else []
-                        if short:
-                            group.interrupt()  # the followers wait on GPU 0 in a collective
-                        frames = group.collect("run")
-                        answers = list(zip(group.followers, frames, strict=True))
-                        if not short and not any("rerun" in frame for frame in frames):
-                            for follower, frame in answers:
-                                reply = _accept(name, group, follower.rank, frame)
-                                attention_sol.record_rank(follower.rank, reply.sol_calls)
-                            return result
-                        group.interrupt()
+                        with (
+                            journaled() as journal,
+                            group.watched(name[1], journal.progress if journal else lambda: 0),
+                        ):
+                            try:
+                                with cp.gated_call():
+                                    result = call(*args, **kwargs)
+                            except Exception as exc:
+                                need = out_of_memory(exc) if group.rerunnable else None
+                                if need is None and not group.interrupted:
+                                    raise
+                                # GPU 0 ran out, or a follower did and ended GPU 0's collective.
+                                short += [(group.gpu(0), need)] if need is not None else []
+                            if short:
+                                group.interrupt()  # the followers wait on GPU 0 in a collective
+                            frames = group.collect("run")
+                            answers = list(zip(group.followers, frames, strict=True))
+                            if not short and not any("rerun" in frame for frame in frames):
+                                for follower, frame in answers:
+                                    reply = _accept(name, group, follower.rank, frame)
+                                    attention_sol.record_rank(follower.rank, reply.sol_calls)
+                                return result
+                            group.interrupt()
+                            if journal is not None:  # the call runs again from what it found
+                                journal.rewind()
                         short += [
                             (follower.gpu, int(frame["rerun"]))
                             for follower, frame in answers
