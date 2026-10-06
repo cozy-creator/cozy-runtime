@@ -1548,7 +1548,7 @@ def _required_stream(kind: str, count: int) -> None:
 def _fraction(value: object, what: str) -> Fraction:
     try:
         if isinstance(value, Rational):
-            return Fraction(value.numerator, value.denominator)
+            return Fraction(value)
         if isinstance(value, int | float | str):
             return Fraction(value)
         raise TypeError(type(value).__name__)
