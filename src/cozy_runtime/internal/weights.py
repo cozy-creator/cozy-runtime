@@ -3219,15 +3219,16 @@ class WeightResidency:
                 )
             )
 
-    def map_ahead(self) -> int:
+    def map_ahead(self) -> tuple[int, bool]:
         """Map every component's resident set now, as one stage of all of them would place
         it inside the budget, and leave it mapped at idle priority as after a call: nothing
         runs and nothing is measured. Mapped privately and asking the owner for nothing; a
-        call shares it at its stage's exit. Returns the device bytes its components hold."""
+        call shares it at its stage's exit. Returns the device bytes its components hold,
+        mapped here or attached from the machine, and whether that is every weight."""
         weights = self.weights
         names = tuple(name for name in self.components if name not in self.hosted)
         if weights.host_only or not names:
-            return 0
+            return 0, not names
         self.unpark()
         sharing, room = weights.sharing, weights.room
         weights.sharing = weights.room = None
@@ -3249,7 +3250,12 @@ class WeightResidency:
                 self.repeats,
             ):
                 table.pop(MAPPING, None)
-        return sum(weights.resident_bytes(self.components[name]) for name in names)
+        held, complete = 0, True
+        for component in map(self.components.__getitem__, names):
+            on = set(component.resident) | component.shared
+            held += sum(region.span for region in component.regions if region.index in on)
+            complete = complete and all(region.index in on for region in component.regions)
+        return held, complete
 
     # -- the executor's and the package's calls
 

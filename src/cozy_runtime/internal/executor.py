@@ -4579,12 +4579,17 @@ class Executor:
         if not granted.get("ok"):
             return granted
         members = child.model_executors or [child]
-        mapped = sum(
+        rows = [
             member.residency.map_ahead()
             for member in members
             if isinstance(member.residency, WeightResidency)
-        )
-        return {"ok": True, "mapped_bytes": mapped, "plane": self._plane_facts()}
+        ]
+        return {
+            "ok": True,
+            "mapped_bytes": sum(held for held, _ in rows),
+            "complete": all(complete for _, complete in rows),
+            "plane": self._plane_facts(),
+        }
 
     def _plane_ranks(self) -> list[int]:
         """The follower GPUs that answer the plane's commands. One from before the plane
