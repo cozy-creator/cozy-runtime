@@ -66,7 +66,9 @@ class LoRAFactors(nn.Module):  # type: ignore[misc]
         total = int(inputs.shape[0])
         for start in range(0, total, _LORA_ROW_CHUNK):
             count = min(_LORA_ROW_CHUNK, total - start)
-            rows = inputs[start : start + count]
+            # Row-major operands whatever the input's layout (a transposed view's rows are
+            # strided): the update's GEMMs, and so its bits, never depend on how x is laid out.
+            rows = inputs[start : start + count].contiguous()
             if count == _LORA_ROW_CHUNK:
                 low = F.linear(rows, down).to(flat.dtype)
                 flat[start : start + count].addmm_(low, up, alpha=self.scale)
