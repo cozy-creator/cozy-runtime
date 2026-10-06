@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import copy
 import hashlib
 import importlib.metadata
 import importlib.resources
@@ -88,15 +89,20 @@ def describe(fn: Callable[..., object]) -> dict[str, str]:
                 definitions.append((dependency, _normalized(source)))
             else:
                 definitions.append(_definition(dependency))
-        document = json.dumps(
-            {"operation_version": version, "definitions": definitions},
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=True,
-        ).encode()
     except (ImportError, OSError, TypeError, ValueError, SyntaxError):
         return {"operation_identity_unavailable": "operation_source_unavailable"}
-    return {"operation_identity": "sha256:" + hashlib.sha256(document).hexdigest()}
+    return {"operation_identity": definitions_identity(version, definitions)}
+
+
+def definitions_identity(version: str, definitions: list[tuple[str, str]]) -> str:
+    """The operation identity of a callable's definitions, however they were read."""
+    document = json.dumps(
+        {"operation_version": version, "definitions": definitions},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode()
+    return "sha256:" + hashlib.sha256(document).hexdigest()
 
 
 def _definition(fn: Callable[..., object]) -> tuple[str, str]:
@@ -116,14 +122,29 @@ def _normalized(source: str | bytes, *, callable_only: bool = False) -> str:
             node.body[0], (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
         ):
             raise ValueError("operation source is not one definition")
-        node.body[0].decorator_list = []
+        return normalized_definition(node.body[0])
     return ast.dump(node, annotate_fields=True, include_attributes=False)
+
+
+def normalized_definition(node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) -> str:
+    """One definition as its own module, decorators dropped: its behavior, not its placement."""
+    bare = copy.copy(node)
+    bare.decorator_list = []
+    module = ast.Module(body=[bare], type_ignores=[])
+    return ast.dump(module, annotate_fields=True, include_attributes=False)
 
 
 def _native_identity(name: str) -> str | None:
     """Cheap explicit native metadata; never enumerate RECORD or hash binaries."""
     try:
-        distribution = importlib.metadata.distribution(name)
+        return distribution_identity(importlib.metadata.distribution(name))
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def distribution_identity(distribution: importlib.metadata.Distribution) -> str | None:
+    """An installed distribution's build as metadata states it, read from its files only."""
+    try:
         version = distribution.version
         wheel = distribution.read_text("WHEEL")
         if not version or not wheel:

@@ -25,6 +25,8 @@ import configparser
 import csv
 import email.parser
 import enum
+import hashlib
+import importlib.metadata
 import json
 import os
 import re
@@ -34,7 +36,7 @@ import types
 import typing
 from collections.abc import Callable, Mapping, Sequence, Set
 from dataclasses import dataclass, field, replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Annotated, Literal
 
 import msgspec
@@ -42,6 +44,7 @@ import msgspec
 import cozy_runtime
 import cozy_runtime.internal.invocable_interface as invocable_interface
 import cozy_runtime.internal.locked_sources as locked
+import cozy_runtime.internal.memo_implementation as memo_implementation
 import cozy_runtime.internal.package_interface as package_interface
 import cozy_runtime.internal.static_invocable as static_invocable
 from cozy_runtime import author
@@ -1167,6 +1170,8 @@ class Registration:
     model_defaults: Mapping[str, DefaultLadder] = field(default_factory=dict)
     internal: bool = False
     accelerator: bool | None = None
+    #: `memo_version=` / `memo_dependencies=` as written, and the module they are read in.
+    memo_declaration: tuple[tuple[str, Module, ast.expr], ...] = ()
 
 
 def build(project: Path, *, environment_python: Path | None = None) -> dict[str, Json]:
@@ -1270,11 +1275,15 @@ def build_installed(distribution: str, *, environment_python: Path) -> dict[str,
         raise StaticRefusal(
             "installed App source is not owned by its wheel", code="static_distribution"
         )
-    return _build(reader, application, {})
+    return _build(reader, application, {}, installed=True)
 
 
 def _build(
-    reader: Reader, application: str, bindings: Mapping[str, Mapping[str, object]]
+    reader: Reader,
+    application: str,
+    bindings: Mapping[str, Mapping[str, object]],
+    *,
+    installed: bool = False,
 ) -> dict[str, Json]:
     module_name, _, attribute = application.partition(":")
     entry = reader.application_module(module_name)
@@ -1299,8 +1308,98 @@ def _build(
                 f"duplicate registration {registration.name!r}",
                 "static_unsupported",
             )
-        docs[registration.name] = registration.kind, _callable(reader, registration)
+        doc = _callable(reader, registration)
+        declared = doc.get("invocable")
+        if installed and registration.memoize and isinstance(declared, dict):
+            identity = _operation_identity(reader, registration)
+            if identity is not None:
+                declared["operation_identity"] = identity
+        docs[registration.name] = registration.kind, doc
     return package_interface.assemble(application, list(docs.values()), bindings)
+
+
+def _operation_identity(reader: Reader, registration: Registration) -> str | None:
+    """A memoized callable's operation identity read from installed source alone: the same key
+    `memo_implementation.describe` computes by import. None when any part of its declaration
+    cannot be read statically; its machine then keys the memo by its package's files."""
+    version: object = ""
+    dependencies: list[tuple[Module, ast.expr]] = []
+    try:
+        for argument, module, node in registration.memo_declaration:
+            if argument == "memo_version":
+                version = reader.fold(module, node)
+            elif isinstance(node, (ast.Tuple, ast.List)):
+                dependencies.extend((module, element) for element in node.elts)
+            else:
+                return None
+        if not isinstance(version, str):
+            return None
+        fn = registration.fn
+        definitions = [
+            (f"{registration.module.name}.{fn.name}", memo_implementation.normalized_definition(fn))
+        ]
+        for module, node in dependencies:
+            definition = _memo_dependency(reader, module, node)
+            if definition is None:
+                return None
+            definitions.append(definition)
+    except (StaticRefusal, OSError, SyntaxError, UnicodeDecodeError, ValueError):
+        return None
+    return memo_implementation.definitions_identity(version, definitions)
+
+
+def _memo_dependency(reader: Reader, module: Module, node: ast.expr) -> tuple[str, str] | None:
+    """One declared memo dependency as `describe` names and hashes it, or None."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        path = _installed_source(reader, node.value.split("."))
+        if path is None or path.stat().st_size > memo_implementation.MAX_SOURCE_BYTES:
+            return None
+        return node.value, memo_implementation._normalized(path.read_bytes())
+    if isinstance(node, ast.Call):
+        found = reader.resolve(module, node.func)
+        arguments = [reader.fold(module, a) for a in node.args] + [
+            reader.fold(module, k.value) for k in node.keywords
+        ]
+        if not isinstance(found, Vocab) or not all(isinstance(a, str) for a in arguments):
+            return None
+        if found.key == "author.MemoDistribution" and len(arguments) == 1:
+            name = typing.cast(str, arguments[0])
+            # Each environment root once: the reader names its site-packages more than one way.
+            paths = list(dict.fromkeys(str(root.resolve()) for root in reader.roots))
+            matches = list(importlib.metadata.distributions(name=name, path=paths))
+            built = (
+                memo_implementation.distribution_identity(matches[0]) if len(matches) == 1 else None
+            )
+            return None if built is None else ("distribution:" + name, built)
+        if found.key == "author.MemoResource" and len(arguments) == 2:
+            package, name = typing.cast(list[str], arguments)
+            relative = PurePosixPath(name)
+            if relative.is_absolute() or ".." in relative.parts:
+                return None
+            for root in reader.roots:
+                resource = root.joinpath(*package.split("."), *relative.parts)
+                if resource.is_file():
+                    digest = hashlib.sha256(resource.read_bytes()).hexdigest()
+                    return f"resource:{package}/{name}", digest
+        return None
+    found = reader.resolve(module, node)
+    if isinstance(found, Definition):
+        return f"{found.module.name}.{found.node.name}", memo_implementation.normalized_definition(
+            found.node
+        )
+    return None
+
+
+def _installed_source(reader: Reader, parts: Sequence[str]) -> Path | None:
+    """A module's source file in the described environment, read as a file, never imported."""
+    for root in (*reader.roots, reader.runtime_root):
+        for path in (
+            root.joinpath(*parts).with_suffix(".py"),
+            root.joinpath(*parts, "__init__.py"),
+        ):
+            if path.is_file():
+                return path
+    return None
 
 
 def _is_app_call(reader: Reader, app: Assigned) -> bool:
@@ -1413,6 +1512,7 @@ def _registration(
     function_module = module
     invocable, memoize = False, False
     default_models: dict[str, DefaultLadder] = {}
+    memo_declaration: list[tuple[str, Module, ast.expr]] = []
     for index, export in enumerate(fn.decorator_list):
         target = export.func if isinstance(export, ast.Call) else export
         if not _is_invocable(reader, function_module, target):
@@ -1438,8 +1538,8 @@ def _registration(
                 )
             for keyword in export.keywords:
                 if keyword.arg in {"memo_version", "memo_dependencies"}:
-                    # Operation identity is discovered in the installed environment.
-                    # Static client inspection cannot author or compare that key.
+                    # Operation identity is an installed environment's fact (build_installed).
+                    memo_declaration.append((keyword.arg, function_module, keyword.value))
                     continue
                 value = reader.fold(function_module, keyword.value)
                 if keyword.arg == "defaults":
@@ -1492,6 +1592,7 @@ def _registration(
         if keyword.arg in {"memo_version", "memo_dependencies"}:
             # Like @invocable options, installed-environment memo identities
             # are not part of the source-stable client contract.
+            memo_declaration.append((keyword.arg, module, keyword.value))
             continue
         value = reader.fold(module, keyword.value)
         if keyword.arg == "defaults":
@@ -1538,6 +1639,7 @@ def _registration(
         default_models,
         internal,
         accelerator,
+        tuple(memo_declaration),
     )
 
 
