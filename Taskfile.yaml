@@ -2,15 +2,15 @@ version: "3"
 silent: true
 
 tasks:
-  # The Linux x86_64 wheel delivers the machine: worker images and `cozy machine install` take cozy-machine from it.
-  machine:
-    desc: Bundle cozy-machine at its pin (cozy-machine.pin, a commit or a release tag; MACHINE=checkout builds that source instead) into dist's Linux x86_64 wheel
+  # The Linux x86_64 wheel delivers the machine: worker images and `cozy machine install` take tensord from it.
+  tensord:
+    desc: Bundle tensord at its pin (tensord.pin, a commit or a release tag; MACHINE=checkout builds that source instead) into dist's Linux x86_64 wheel
     cmds:
       - |
         set -eu; work=$(mktemp -d); trap 'rm -rf "$work"' EXIT; wheel=$(ls "$PWD"/dist/cozy_runtime-*-cp312-abi3-manylinux_2_28_x86_64.whl)
         src="{{.MACHINE}}"; [ -n "$src" ] || { src=$work/src; git init -q "$src"
-          git -C "$src" fetch -q --depth 1 https://github.com/cozy-creator/cozy-machine "$(cat cozy-machine.pin)" && git -C "$src" checkout -q FETCH_HEAD; }
+          git -C "$src" fetch -q --depth 1 https://github.com/cozy-creator/tensord "$(cat tensord.pin)" && git -C "$src" checkout -q FETCH_HEAD; }
         task -d "$src" release OUT="$work/bin"
         uvx --from wheel==0.47.0 wheel unpack "$wheel" --dest "$work/wheel"
-        install -D -m 0755 "$work/bin/cozy-machine-linux-x86_64" "$(echo "$work"/wheel/*/*.dist-info | sed 's/\.dist-info$/.data/')/scripts/cozy-machine"
+        install -D -m 0755 "$work/bin/tensord-linux-x86_64" "$(echo "$work"/wheel/*/*.dist-info | sed 's/\.dist-info$/.data/')/scripts/tensord"
         SOURCE_DATE_EPOCH=946684800 uvx --from wheel==0.47.0 wheel pack "$work"/wheel/* --dest-dir dist

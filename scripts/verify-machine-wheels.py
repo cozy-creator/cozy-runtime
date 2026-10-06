@@ -41,7 +41,7 @@ def main() -> None:
     assert {w.name for w in wheels} == {f"cozy_runtime-{version}-{tag}.whl" for tag in expected}, (
         "missing or unexpected platform wheels"
     )
-    installed_command = f"cozy_runtime-{version}.data/scripts/cozy-machine"
+    installed_command = f"cozy_runtime-{version}.data/scripts/tensord"
     tags_by_name = {}
     binaries = {}
     for wheel in wheels:
@@ -70,7 +70,7 @@ def main() -> None:
             assert int.from_bytes(binary[18:20], "little") == architecture
             # The wheel's tag promises glibc 2.28: the machine may need no newer symbol version.
             glibc = max((int(a), int(b)) for a, b in re.findall(rb"GLIBC_(\d+)\.(\d+)", binary))
-            assert glibc <= (2, 28), f"cozy-machine needs glibc {glibc[0]}.{glibc[1]}"
+            assert glibc <= (2, 28), f"tensord needs glibc {glibc[0]}.{glibc[1]}"
             binaries[str(tag)] = binary
 
     for minor in (12, 13, 14):
@@ -99,7 +99,7 @@ def main() -> None:
 
     if platform.system() != "Linux" or platform.machine() != "x86_64":
         raise SystemExit("actual install verification requires Linux x86-64")
-    with tempfile.TemporaryDirectory(prefix="cozy-machine-install-") as directory:
+    with tempfile.TemporaryDirectory(prefix="tensord-install-") as directory:
         venv = Path(directory) / "venv"
         run("uv", "venv", str(venv), "--python", "3.12")
         python = str(venv / "bin/python")
@@ -116,11 +116,11 @@ def main() -> None:
             str(dist),
             f"cozy-runtime=={version}",
         )
-        command = venv / "bin/cozy-machine"
+        command = venv / "bin/tensord"
         assert command.read_bytes() == binaries["cp312-abi3-manylinux_2_28_x86_64"]
         identity = json.loads(run(str(command), "version", "--json"))
-        pin = (Path(__file__).resolve().parents[1] / "cozy-machine.pin").read_text().strip()
-        assert identity["name"] == "cozy-machine" and "cozy.machine.v1" in identity["api"]
+        pin = (Path(__file__).resolve().parents[1] / "tensord.pin").read_text().strip()
+        assert identity["name"] == "tensord" and "cozy.machine.v1" in identity["api"]
         # A candidate pins a commit; a release pins the tag v<version> cut on that commit.
         sha = re.fullmatch(r"[0-9a-f]{40}", pin)
         built = identity.get("commit") if sha else "v" + identity["version"]

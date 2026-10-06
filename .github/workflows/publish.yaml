@@ -108,22 +108,22 @@ jobs:
         run: |
           uv run python scripts/stamp-build-provenance.py "$COZY_RUNTIME_BUILD_COMMIT"
           uv build --out-dir dist
-      # Read-only deploy keys: cozy-machine's source at its pin and the TensorFS crates it links.
-      - name: Read access to cozy-machine and TensorFS
+      # Read-only deploy keys: tensord's source at its pin and the TensorFS crates it links.
+      - name: Read access to tensord and TensorFS
         env:
-          COZY_MACHINE_KEY: ${{ secrets.COZY_MACHINE_READ_KEY }}
+          TENSORD_KEY: ${{ secrets.COZY_MACHINE_READ_KEY }}
           TENSORFS_KEY: ${{ secrets.TENSORFS_READ_KEY }}
         run: |
           mkdir -m 700 -p ~/.ssh && ssh-keyscan github.com >> ~/.ssh/known_hosts
-          for repo in cozy-machine tensorfs; do
-            key=COZY_MACHINE_KEY; [ "$repo" = tensorfs ] && key=TENSORFS_KEY
+          for repo in tensord tensorfs; do
+            key=TENSORD_KEY; [ "$repo" = tensorfs ] && key=TENSORFS_KEY
             (umask 077; printf '%s\n' "${!key}" > ~/.ssh/$repo)
             printf 'Host %s.github.com\n  HostName github.com\n  IdentityFile ~/.ssh/%s\n  IdentitiesOnly yes\n' $repo $repo >> ~/.ssh/config
             git config --global url."git@$repo.github.com:cozy-creator/$repo".insteadOf "https://github.com/cozy-creator/$repo"
           done
-      - name: Bundle the pinned cozy-machine into the Linux wheel
+      - name: Bundle the pinned tensord into the Linux wheel
         working-directory: source
-        run: task machine
+        run: task tensord
       - name: Verify wheel selection and the installed machine command
         working-directory: source
         run: uv run --script scripts/verify-machine-wheels.py --dist dist

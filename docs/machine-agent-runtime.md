@@ -12,5 +12,5 @@ weight-plane handles. TensorFS owns the native storage semantics.
 
 The Runtime CLI reads/scaffolds package interfaces and reports installed
 distribution/build provenance. It does not advertise the retired worker wire
-contract. The machine API and journal are documented in cozy-machine; the former
+contract. The machine API and journal are documented in tensord; the former
 Python worker database views and capability-report command are retired.
