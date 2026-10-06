@@ -1,7 +1,7 @@
 """A small AdaLN-pruned H3 DiT with a real prepared LoRA view, served the executor's way.
 
 Real: a TensorFS store holding a bf16/fp32 H3 checkpoint and an fp32 LoRA checkpoint, the
-production adapter-view child composing them, `lora_composition.bind`, the serving substrate,
+actual native writer/source capabilities and `lora_composition.prepare`/`bind`, the serving substrate,
 the weight plane's `PlaneBackend` and `WeightResidency` (a CPU executor computes on its pinned
 tier), and the group's real follower `Executor`. Run as a script, this is one follower rank.
 """
@@ -10,9 +10,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import io
 import math
-import os
 import socket
 from pathlib import Path
 from typing import Any
@@ -30,10 +28,11 @@ from cozy_runtime.author import (
     Loader,
     Model,
     ModelRegistry,
+    ModelArtifact,
     ObjectRef,
     uses_components,
 )
-from cozy_runtime.internal import adapter_view_child, attention, fill, lora_composition
+from cozy_runtime.internal import attention, fill, lora_composition
 from cozy_runtime.internal.derive import Observations, serving_substrate
 from cozy_runtime.internal.encoding import SPEC_PLAIN, DeviceFacts
 from cozy_runtime.internal.executor import Executor, _capture_seal
@@ -41,13 +40,6 @@ from cozy_runtime.internal.executor_commands import decode
 from cozy_runtime.internal.fill import Checkpoint, tensor_schema_of
 from cozy_runtime.internal.seam import Channel
 from cozy_runtime.internal.weights import PlaneBackend, WeightResidency, Weights
-from cozy_runtime.internal.weights_sink import weights_transaction_id
-from cozy_runtime.internal.adapter_view_child import (
-    AdapterViewInput,
-    AdapterViewReady,
-    PrepareAdapterView,
-)
-from cozy_runtime.internal.native_child import Launch
 from cozy_runtime.models.minimax_h3.adaln_pruned import AdaLNPrunedMiniMaxH3Transformer
 from cozy_runtime.models.minimax_h3.official import _apply_transformer_dtype
 from cozy_runtime.models.minimax_h3.turbo import LORA_FAMILIES
@@ -104,45 +96,52 @@ class LoRAH3(Model[Pipe], encoded_leaves="accept"):
             return self.pipe.components[COMPONENT](**inputs)  # type: ignore[no-any-return]
 
 
-def _write(store: Any, name: str, component: str, tensors: dict[str, Any]) -> ObjectRef:
+def _write(
+    store: Any, root: Path, name: str, component: str, tensors: dict[str, Any]
+) -> ModelArtifact:
+    from native_weights import NativeExecution
+
     model = component != "adapter"
     grant = sum(value.numel() * value.element_size() for value in tensors.values()) + (1 << 20)
-    writer = store.begin_derived(
-        weights_transaction_id(name, "create", "sha256:" + "1" * 64, "model"),
-        1,
-        *Derivation(
-            sources={},
-            targets={
-                component: Target(
-                    add={
-                        key: Tensor(
-                            _DTYPES[value.dtype],
-                            tuple(value.shape),
-                            SPEC_PLAIN,
-                            {"value": Part(_DTYPES[value.dtype], tuple(value.shape))},
-                        )
-                        for key, value in tensors.items()
-                    }
-                )
-            },
-            configs={"model": NativeConfig("add")} if model else {},
-            order=tuple((component, key) for key in tensors),
-        ).native_arguments(grant),
-        work_fingerprint="sha256:" + "2" * 64,
+    declaration = Derivation(
+        sources={},
+        targets={
+            component: Target(
+                add={
+                    key: Tensor(
+                        _DTYPES[value.dtype],
+                        tuple(value.shape),
+                        SPEC_PLAIN,
+                        {"value": Part(_DTYPES[value.dtype], tuple(value.shape))},
+                    )
+                    for key, value in tensors.items()
+                }
+            )
+        },
+        configs={"model": NativeConfig("add")} if model else {},
+        order=tuple((component, key) for key in tensors),
     )
-    for key, value in tensors.items():
-        data = value.contiguous().reshape(-1).view(torch.uint8).numpy().tobytes()
-        writer.add_part(component, key, "value", io.BytesIO(data))
-    if model:
-        writer.add_config("model", io.BytesIO(b"{}"))
-    receipt = writer.commit()["manifest"]
-    return ObjectRef("sha256:" + receipt["sha256"], receipt["length"])
+    with NativeExecution(store, root, name, {}, {"model": grant}) as owner:
+        with owner.client.open_output("model", declaration) as writer:
+            for key, value in tensors.items():
+                writer.add_part(
+                    component,
+                    key,
+                    "value",
+                    value.contiguous().reshape(-1).view(torch.uint8).numpy().tobytes(),
+                )
+            if model:
+                writer.add_config("model", b"{}")
+            return owner.client.adopt_model(writer.commit())
 
 
 def checkpoints(
     root: Path, dtype: Any = torch.float32
 ) -> tuple[ObjectRef, dict[str, Any], dict[str, Any]]:
-    """Base and `dtype` LoRA checkpoints in a real store, composed by the production child."""
+    """Base and `dtype` LoRA checkpoints composed through the real native writer."""
+    from contextlib import ExitStack
+    from native_weights import NativeExecution
+
     store = tensorfs.Store.ensure(str(root))
     torch.manual_seed(0)
     base = dit()
@@ -162,18 +161,24 @@ def checkpoints(
         key: (value * 0.3).to(dtype) if key.endswith(".weight") else value
         for key, value in factors.items()
     }
-    step = PrepareAdapterView(
-        identity="sha256:" + "3" * 64,
-        base=_write(store, "base", COMPONENT, values),
-        adapters=(
-            AdapterViewInput(
-                _write(store, "adapter", "adapter", factors), COMPONENT, "adapter", str(STRENGTH)
-            ),
-        ),
-    )
-    answer = adapter_view_child.execute(Launch(store=str(root), parent_pid=os.getpid(), step=step))
-    assert isinstance(answer, AdapterViewReady), answer
-    return answer.manifest, values, factors
+    base_model = _write(store, root, "base", COMPONENT, values)
+    adapter_model = _write(store, root, "adapter", "adapter", factors)
+    with NativeExecution(
+        store, root, "compose", {"base": base_model, "adapter": adapter_model}, {"model": 1 << 20}
+    ) as owner:
+        with ExitStack() as leases:
+            base_source = leases.enter_context(owner.client.source(base_model.manifest.digest))
+            adapter_source = leases.enter_context(
+                owner.client.source(adapter_model.manifest.digest)
+            )
+            prepared = lora_composition.prepare(
+                base_source,
+                [lora_composition.Selection(adapter_source, COMPONENT, "adapter", STRENGTH)],
+            )
+            with owner.client.open_output("model", prepared.declaration) as writer:
+                writer.add_config(lora_composition.GRAPH_CONFIG, prepared.config)
+                result = owner.client.adopt_model(writer.commit())
+    return result.manifest, values, factors
 
 
 def targets(root: Any) -> list[str]:

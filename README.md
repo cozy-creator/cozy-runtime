@@ -111,7 +111,6 @@ are removed.
 | `internal/trampoline.py` | exec-first stage and process settings |
 | `internal/executor.py` | disposable device process and package invocation |
 | `internal/weights_writer.py` | scoped native source/output client and broker |
-| `internal/native_child.py` | bounded standalone CPU helper framing |
 | `internal/fill.py` | native model metadata, headers and byte access |
 
 `checks/architecture.py` keeps versioned identities in two disjoint registries.
