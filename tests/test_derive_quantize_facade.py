@@ -28,7 +28,6 @@ from cozy_runtime.derive.quantization import (
     quantize_component_into,
     write_bf16,
 )
-from cozy_runtime.internal.worker.workspace import Workspace
 from native_weights import NativeExecution
 
 BOUND = 1 << 20
@@ -101,11 +100,14 @@ def run(
     epoch: int = 1,
     inspected: bool = False,
     compose: bool = False,
+    observed: list[NativeExecution] | None = None,
 ) -> tuple[QuantizeResult | None, ModelArtifact]:
     model = _derive_model(QuantizationSource, source.manifest.digest)
     with NativeExecution(
         store, root, name, {"source": source}, {"model": BOUND}, epoch=epoch
     ) as owner:
+        if observed is not None:
+            observed.append(owner)
         ctx = owner.context()
         tel = fake_telemetry(fake_attempt(name))
         with ctx.tensorfs_source(model) as capability:
@@ -229,13 +231,21 @@ def test_tripwire_and_nonfinite_values_refuse_before_native_commit(tmp_path: Pat
     ):
         root = tmp_path / str(poison)
         store, source = mint(root, sdxl_rows(poison=poison))
+        observed: list[NativeExecution] = []
         with pytest.raises(UnsupportedInput) as refused:
-            run(root, store, source, plan(("unet",), "mxfp8/1", max_relative_frobenius=threshold))
+            run(
+                root,
+                store,
+                source,
+                plan(("unet",), "mxfp8/1", max_relative_frobenius=threshold),
+                observed=observed,
+            )
         assert refused.value.code == code
         # The source is the only committed native result; the refused output never has a receipt.
-        with Workspace(Path(store.root)).locked() as db:
-            rows = db.execute("SELECT receipt FROM weights WHERE request='quantize'").fetchall()
-        assert len(rows) == 1 and not rows[0][0]
+        assert len(observed) == 1 and not observed[0].receipts
+        assert observed[0].declarations
+        for transaction in observed[0].declarations:
+            assert store.derived_lookup(transaction)["state"] != "committed"
     invalid: tuple[Callable[[], QuantizePlan], ...] = (
         lambda: plan(("unet",)),
         lambda: plan((), "mxfp8/1"),

@@ -42,12 +42,12 @@ from cozy_runtime.internal.fill import Checkpoint, tensor_schema_of
 from cozy_runtime.internal.seam import Channel
 from cozy_runtime.internal.weights import PlaneBackend, WeightResidency, Weights
 from cozy_runtime.internal.weights_sink import weights_transaction_id
-from cozy_runtime.internal.worker.source_steps import (
+from cozy_runtime.internal.adapter_view_child import (
     AdapterViewInput,
     AdapterViewReady,
-    Launch,
     PrepareAdapterView,
 )
+from cozy_runtime.internal.native_child import Launch
 from cozy_runtime.models.minimax_h3.adaln_pruned import AdaLNPrunedMiniMaxH3Transformer
 from cozy_runtime.models.minimax_h3.official import _apply_transformer_dtype
 from cozy_runtime.models.minimax_h3.turbo import LORA_FAMILIES

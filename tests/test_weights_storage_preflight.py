@@ -19,7 +19,7 @@ from tensorfs.derived import Derivation, Part, Source, Target, Tensor
 from cozy_runtime.author._errors import CapabilityError
 from cozy_runtime.internal import storage_admission as storage
 from cozy_runtime.internal.weights_writer import WriterBroker
-from cozy_runtime.internal.worker.grants import MODEL_PREFIX
+from cozy_runtime.internal.weights_writer import MODEL_PREFIX
 from test_storage_admission import operation
 from weights_channel import open_output
 

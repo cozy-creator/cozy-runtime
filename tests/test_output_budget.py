@@ -1,29 +1,15 @@
-"""Fixed byte-output budgets remain authoritative across executor and native custody."""
+"""Current author output budgets and static interface parity."""
 
 from __future__ import annotations
-
 import sys
 import time
 from pathlib import Path
-from types import SimpleNamespace
-from typing import Annotated, Any, cast
-
+from typing import Annotated, Any
 import msgspec
 import pytest
-
-from cozy_runtime import canonical_json
 from cozy_runtime.author import App, AssetBound, Invocation, Outputs, Tree, attempt
 from cozy_runtime.internal import output_budget, package_interface, static_interface
 from cozy_runtime.internal.discovery import discover
-from cozy_runtime.internal.executor import _serialize_result
-from cozy_runtime.internal.executor_replies import AttemptReply
-from cozy_runtime.internal.worker import grants, workspace_byte_outputs
-from cozy_runtime.internal.worker.attempts import AttemptEngine, AttemptRecord
-from cozy_runtime.internal.worker.calls import Calls, _Pending
-from cozy_runtime.internal.worker.plan import AttemptPlan, DeclaredBinding
-from cozy_runtime.internal.worker.workspace import Workspace
-from cozy_runtime.protocol import documents
-from cozy_runtime.protocol import worker_pb2 as pb
 
 
 def spec_for(*sizes: int) -> dict[str, Any]:
@@ -88,162 +74,6 @@ def assemble(payload: Request, media: MediaDecoder) -> Result:
     assert package_interface.canonical_bytes(source) == package_interface.canonical_bytes(imported)
 
 
-def test_worker_command_keeps_intermediate_room_for_a_small_final_report(tmp_path: Path) -> None:
-    # The executor receives enough room for intermediate files even when final
-    # output fields are small. The host independently retains final authority.
-    parent = AttemptRecord(
-        "report",
-        1,
-        b"",
-        spec_for(7, 11),
-        declared=DeclaredBinding("", "report", "", "", "", ""),
-        plan=AttemptPlan("", "", "", "cpu", 0, 0, "", ""),
-    )
-    command = AttemptEngine._command(
-        cast(AttemptEngine, SimpleNamespace(attention_pin="")), parent, "report#1", tmp_path, 30
-    )
-    assert command.max_output_bytes == 256 << 20
-    assert (
-        output_budget.effective(parent.spec, {"max_output_bytes": command.max_output_bytes}) == 18
-    )
-
-
-class Request(msgspec.Struct):
-    pass
-
-
-class Pair(msgspec.Struct):
-    first: Annotated[Tree, AssetBound(max_bytes=140 << 20)]
-    second: Annotated[Tree, AssetBound(max_bytes=140 << 20)]
-
-
-def test_two_large_outputs_commit_within_their_admitted_aggregate(tmp_path: Path) -> None:
-    size = 129 << 20
-    source = tmp_path / "source"
-    source.mkdir()
-    with (source / "payload").open("wb") as stream:
-        stream.write(b"bounded output")
-        stream.truncate(size)
-    app = App()
-
-    @app.job
-    def write(payload: Request, out: Outputs) -> Pair:
-        return Pair(out.save_tree(source), out.save_tree(source))
-
-    spec = pb.InvocationSpec(
-        job=pb.JobInvocationSpec(),
-        outputs=[
-            pb.OutputBinding(output_id=name, max_bytes=140 << 20) for name in ("first", "second")
-        ],
-    )
-    raw, digest = documents.identity(spec)
-    body = documents.body(spec)
-    spool = tmp_path / "spool"
-    result, outcome, _ = attempt(
-        app.get("write"),
-        {},
-        Invocation(
-            "producer",
-            spool,
-            time.monotonic() + 120,
-            max_output_bytes=output_budget.admitted(body),
-        ),
-    )
-    assert outcome.terminal == "succeeded", outcome
-    _, rows, _ = _serialize_result(result, spool)
-    assert sum(row["size_bytes"] for row in rows) == size * 2 > 256 << 20
-    workspace = Workspace(tmp_path / "store")
-    workspace.accept(
-        "owner",
-        pb.AttemptOffer(
-            request_id="producer",
-            attempt_ordinal=1,
-            invocation_spec_digest=digest,
-            invocation_spec_canonical_bytes=raw,
-        ),
-    )
-    workspace.mark_running(
-        "owner",
-        pb.AttemptAccepted(
-            request_id="producer",
-            attempt_ordinal=1,
-            invocation_spec_digest=digest,
-        ),
-    )
-    record = AttemptRecord("producer", 1, digest, body, spool=spool)
-    record.grant.outputs = {
-        name: grants.BoundOutput(name, "", 140 << 20, "") for name in ("first", "second")
-    }
-    engine = SimpleNamespace(
-        tensorfs_root=workspace.store_root,
-        calls=SimpleNamespace(),
-        owner_scope=lambda: "owner",
-        _encode_frames=lambda *args: None,
-        _blob_path=AttemptEngine._blob_path,
-        _publication=lambda *args: SimpleNamespace(document=lambda: {}, digest=lambda: b"r" * 32),
-        records=SimpleNamespace(append=lambda *args: None),
-        products=None,
-    )
-    manifest, error = AttemptEngine._tail(
-        cast(AttemptEngine, engine),
-        record,
-        msgspec.convert(
-            {"ok": True, "outputs": rows, "max_output_bytes": output_budget.admitted(body)},
-            AttemptReply,
-        ),
-    )
-    assert error is None and manifest is not None, error
-    assert sum(row.native_tree.content_bytes for row in manifest.outputs) == size * 2
-    # Received intermediate outputs use that same parent declaration, including
-    # the aggregate, rather than a second unrelated 256 MiB hard-coded ceiling.
-    result_value, byte_grants = {}, []
-    for index, output in enumerate(manifest.outputs):
-        retention = pb.NativeByteRetentionRequest(
-            source=output.native_tree,
-            retention_id="sha256:" + f"{index + 1:02x}" * 32,
-        )
-        workspace_byte_outputs.change_hold(workspace, "owner", retention, release=False)
-        byte_grants.append(
-            pb.ChildByteResultGrant(
-                output_id=output.output_id,
-                source=retention.source,
-                retention_id=retention.retention_id,
-            )
-        )
-        identity = documents.spell(output.native_tree.manifest.digest)
-        result_value[output.output_id] = {
-            "asset_ref": identity,
-            "kind": "tree",
-            "digest": identity,
-            "size_bytes": size,
-        }
-    child_result = pb.ChildCallResult(
-        state=pb.CHILD_CALL_STATE_SUCCEEDED,
-        call_index=1,
-        result_canonical_bytes=canonical_json.encode(result_value),
-        byte_result_grants=byte_grants,
-    )
-    consumer = AttemptRecord("consumer", 1, digest, body, spool=tmp_path / "consumer")
-    calls = Calls(lambda *_: pb.ChildCallResult(), workspace=workspace, owner=lambda: "owner")
-    pending = _Pending(pb.ChildCallRequest(), child_result)
-    materialized = calls._materialize(consumer, pending)
-    assert sum(row["content_bytes"] for row in materialized) == size * 2
-    assert calls.materialized[("consumer", 1)][1] == size * 2
-    child_result.call_index = 2
-    with pytest.raises(ValueError, match="byte bound"):
-        calls._materialize(consumer, _Pending(pb.ChildCallRequest(), child_result))
-    # Authority is rechecked after encoding/commit even when a reply claims more.
-    manifest, error = AttemptEngine._tail(
-        cast(AttemptEngine, engine),
-        record,
-        msgspec.convert(
-            {"ok": True, "outputs": rows, "max_output_bytes": output_budget.admitted(body) + 1},
-            AttemptReply,
-        ),
-    )
-    assert manifest is None and error and "budget" in error
-
-
 def test_lower_aggregate_stops_the_author_before_a_second_large_copy(tmp_path: Path) -> None:
     # Small real bytes exercise the same aggregate check without a duplicate large fixture.
     source = tmp_path / "source"
@@ -266,3 +96,12 @@ def test_lower_aggregate_stops_the_author_before_a_second_large_copy(tmp_path: P
         ),
     )
     assert outcome.code == "output_too_large"
+
+
+class Request(msgspec.Struct):
+    pass
+
+
+class Pair(msgspec.Struct):
+    first: Annotated[Tree, AssetBound(max_bytes=140 << 20)]
+    second: Annotated[Tree, AssetBound(max_bytes=140 << 20)]

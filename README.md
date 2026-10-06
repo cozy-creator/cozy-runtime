@@ -79,12 +79,8 @@ For labelled model-ready input media, see [Ordered media inputs](docs/assets.md)
 | package | role | may import |
 |---|---|---|
 | `cozy_runtime.author` | the whole author surface — the only package code imports | stdlib + msgspec |
-| `cozy_runtime.internal` | runtime implementation; owns the ONE config authority | author, protocol, stdlib |
-| `cozy_runtime.protocol` | `cozy.worker.v1` — worker-protocol's bindings, copied verbatim into `src/cozy/`, plus canonical document handling | protobuf, internal.canonical |
+| `cozy_runtime.internal` | executor, storage bindings and the config authority | author, stdlib |
 | `cozy_runtime.cli` | user CLI | author, internal |
-
-Re-vendor worker-protocol with `uv run python scripts/vendor-worker-protocol.py <commit>`: it
-rewrites the bindings and the canonical test corpus from that one commit, so their pins move together.
 
 `cozy_runtime.author` also holds the INVOCATION KERNEL (`_invoke.py`): decode -> resolve
 -> preflight -> hydrate -> invoke -> validate -> finalize. It is pure surface semantics —
@@ -104,27 +100,19 @@ the entrypoint, a frozen `RuntimeConfig` passed explicitly thereafter. Second re
 
     cozy-machine ──seam──▶ executor (CUDA)
 
-The Python worker and its `cozy-runtime-worker` entrypoint are deleted. The Rust
-`cozy-machine` owns the API, the journal, the store and executor supervision, and starts
-`internal/executor.py` through `internal/trampoline.py`. What is left under
-`internal/worker/` is the import closure of the weights writer, held until the machine
-writes weights outputs; nothing starts it.
+The Rust `cozy-machine` owns its API, journal, store and executor supervision.
+Runtime retains the author API, device executor, native TensorFS storage bindings
+and standalone CPU helpers. The Python worker/helper subtree and protobuf facade
+are removed.
 
 | module | role |
 |---|---|
-| `internal/worker/attempts.py` | offer -> prepare -> accept -> terminal, attestation, ledger close |
-| `internal/worker/ledger.py` | the worker-scoped byte ledger and the attempt reconciliation |
-| `internal/worker/plan.py` | the AttemptPlan, the PlanChooser, the local binding-plan record |
-| `internal/worker/grants.py` | DeliveryGrant reads/writes + the closed hub-call table |
-| `internal/worker/child.py` | spawn/supervise/kill the executor; the two ordinals |
-| `internal/worker/observe.py` | typed boot steps, confessions, and the SILENCE-BOUNDED liveness detector |
-| `internal/worker/triage.py` | bounded triage assembly and receipt-checked bundle store |
-| `internal/worker/refusal.py` | reader-vs-data fault, verbatim upstream remedy, the REF_ORIGIN severity split |
-| `internal/worker/records.py` | bounded same-process worker facts; callers own restart recovery |
-| `internal/seam.py` | the control-only, byte-accounted worker<->executor channel |
-| `internal/trampoline.py` | the exec-first stage: pdeathsig, no_new_privs, oom_score_adj |
-| `internal/executor.py` | the disposable device process — the ONE torch importer |
-| `internal/fill.py` | the fill plane: a TensorFS `Checkpoint`, the pinned ring, the transaction |
+| `internal/seam.py` | bounded control framing and native descriptor transfer |
+| `internal/trampoline.py` | exec-first stage and process settings |
+| `internal/executor.py` | disposable device process and package invocation |
+| `internal/weights_writer.py` | scoped native source/output client and broker |
+| `internal/native_child.py` | bounded standalone CPU helper framing |
+| `internal/fill.py` | native model metadata, headers and byte access |
 
 `checks/architecture.py` keeps versioned identities in two disjoint registries.
 `DOCUMENT_KINDS` contains only stored or digested documents that cross a process/repository
@@ -156,30 +144,20 @@ adds exact work-unit coordinates and maps counted steps into a package-owned ove
 within-stage percentage. Invalid progress is omitted and diagnosed on the same bounded lossy
 lane; it cannot route, settle, bill, or otherwise control an attempt.
 
-**Every terminal attempt commits one bounded triage record** — identity, applied posture,
-ledger reconciliation, attribution, confessions, faults, and the capped observation tail —
-written and fsynced BEFORE its write receipt is recorded and before the terminal that names
-it. The handle is an opaque `subject_id`; there is no path in it and no way to name one. A
-killed executor is therefore explainable from a directory, with no live process and no SSH.
-
-**Every granted destination is CONTROL-PLANE-MINTED** (cr-042). The closed `HUB_CALLS` table
-in `internal/worker/grants.py` spends a grant minted for one invocation, so nothing the
-package produced — and nothing a request body can influence — chooses where bytes land; a
-destination with no row is a SECURITY EVENT. Inputs remain local. Outputs use either a local
-destination or the exact presigned HTTPS capability in `OutputAccess.url`; the worker streams
-with `Content-Length` and `If-None-Match: *`, validates every resolved address, and refuses a
-redirect-selected destination. Tensorhub holds the R2 credential; the worker never does.
-Armed by the worker grant path end to end and the egress hook at
-the table.
+The machine owns durable run outcomes and output custody. Runtime returns
+structured executor facts and consumes the native capabilities it is granted.
+The former Python worker triage ledger, destination-grant table and worker
+publication service are retired; see the machine API for current control and
+custody behavior.
 
 **The executor's network claim is Python-deep and says so.** `internal/executor.py:main`
 installs `sandbox.refuse_network`, so package or job code that dials is refused typed at
 the first `NETWORK_EVENTS` spelling. That bounds a BUGGY package (law 15's same-tenant
-rung). It is not a kernel bound: the executor runs in the worker's own network namespace
+rung). It is not a kernel bound: the executor runs in the machine's network namespace
 with no seccomp filter, and a C extension or `ctypes` reaches `connect(2)` underneath the
 hook. The egress arms observe both halves against one reachable
-address, so the claim cannot quietly grow. Granted inputs are fetched by the WORKER and
-handed over as spool paths; the executor is never given an address.
+address, so the claim cannot quietly grow. Granted input bytes are supplied by the machine and
+handed over as verified paths; the executor is never given an address.
 
 **Progress is observed, never promoted into a timer-driven failure.** Advancing monotone
 positions and measured process work are reported; an unchanged sample stays `silent`. Process

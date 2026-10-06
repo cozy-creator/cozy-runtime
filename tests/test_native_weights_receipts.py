@@ -43,7 +43,7 @@ def native_exchange(root: Path) -> None:
         weights_work_fingerprint="sha256:" + "20" * 32,
         spec={"inputs": [], "outputs": [{"output_id": "model", "max_bytes": 8}]},
     )
-    recorded: list[weights_receipts.Reference] = []
+    recorded: list[Mapping[str, object]] = []
     checkpoints: list[Mapping[str, object]] = []
     broker: WriterBroker
 
@@ -63,24 +63,14 @@ def native_exchange(root: Path) -> None:
         native = weights_sink.receipt_from_native(
             binding.slot, transaction, facts, replayed=False, request_id=current.request_id
         )
-        reference, data, digest = weights_sink.execution_receipt(
-            native,
-            owner_scope="proof-owner",
-            request_id=current.request_id,
-            invocation_spec_digest=weights_receipts.spell(current.digest),
-        )
-        decoded = weights_receipts.read(data)
-        assert decoded.request_id == current.request_id
-        assert decoded.output_slot == binding.slot
-        assert decoded.weights_transaction_id == transaction
-        assert decoded.invocation_spec_digest == weights_receipts.spell(current.digest)
-        assert decoded.tensorfs_receipt_canonical_bytes == canonical_json.encode(facts)
-        assert (
-            weights_receipts.raw(decoded.tensorfs_receipt_digest)
-            == hashlib.sha256(decoded.tensorfs_receipt_canonical_bytes).digest()
-        )
-        assert digest == reference.weights_receipt_digest == hashlib.sha256(data).digest()
-        recorded.append(reference)
+        assert native.output_slot == binding.slot
+        assert native.weights_transaction_id == transaction
+        assert native.tensorfs_receipt == canonical_json.encode(facts)
+        assert weights_receipts.raw(native.tensorfs_receipt_digest) == hashlib.sha256(
+            native.tensorfs_receipt
+        ).digest()
+        assert store.derived_lookup(transaction)["receipt"] == facts
+        recorded.append(dict(facts))
 
     broker = WriterBroker(
         lambda: store,
@@ -146,32 +136,4 @@ proof['native_exchange'](pathlib.Path(sys.argv[2]))
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
-def test_stored_receipt_bytes_and_digest_match_existing_custody_fixture() -> None:
-    path = Path(__file__).parent / "testdata/worker-protocol/canonical/weights_receipt.json"
-    stored = path.read_bytes()
-    receipt = weights_receipts.read(stored)
-    encoded, digest = weights_receipts.identity(receipt)
-    assert encoded == stored
-    assert digest == hashlib.sha256(stored).digest()
-    assert weights_receipts.identity(weights_receipts.Receipt())[0] == (
-        b'{"format":"cozy.worker.v1.WeightsReceipt/1"}'
-    )
 
-
-def test_receipt_reader_consumes_known_fields_without_requiring_writer_inventory() -> None:
-    data, _ = weights_receipts.identity(weights_receipts.Receipt(request_id="request"))
-    extended = canonical_json.encode({**canonical_json.decode(data), "future_writer": "new"})
-    assert weights_receipts.read(extended).request_id == "request"
-    assert hashlib.sha256(extended).digest() != hashlib.sha256(data).digest()
-    with pytest.raises(weights_receipts.ReceiptError, match="wrong_type"):
-        weights_receipts.read(
-            canonical_json.encode({**canonical_json.decode(data), "request_id": 7})
-        )
-    with pytest.raises(weights_receipts.ReceiptError, match="malformed_bytes"):
-        weights_receipts.read(
-            canonical_json.encode(
-                {**canonical_json.decode(data), "tensorfs_receipt_canonical_bytes": "!"}
-            )
-        )
-    with pytest.raises(weights_receipts.ReceiptError, match="non_ascii_field"):
-        weights_receipts.identity(weights_receipts.Receipt(request_id="non-ascii-\u00e9"))

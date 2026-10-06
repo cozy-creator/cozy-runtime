@@ -45,7 +45,7 @@ from cozy_runtime.author._invoke import run_prepared
 from cozy_runtime.author.fakes import fake_context
 from cozy_runtime.internal import interface_wheel, package_interface
 from cozy_runtime.internal.discovery import Discovered
-from cozy_runtime.internal.worker import grants
+from cozy_runtime.internal.executor_commands import InputFile
 from durable_seam import wire
 
 Pictures = Annotated[
@@ -149,24 +149,18 @@ def inputs(
     }, rows
 
 
-def test_actual_grant_hydration_preserves_collection_and_named_inputs(tmp_path: Path) -> None:
+def test_native_input_projection_preserves_collection_and_named_inputs(tmp_path: Path) -> None:
     wire, rows = inputs(tmp_path)
-    bound = grants.BoundGrant(
-        inputs={
-            key: grants.BoundInput(
-                key,
-                row.local.as_uri(),
-                bytes.fromhex(row.digest[7:]),
-                row.length,
-                row.media_type,
-                row.order,
-            )
-            for key, row in rows.items()
-        }
-    )
-    verified = grants.hydrate_inputs(
-        bound, grants.Authorizer(roots=(str(tmp_path),)), spool=tmp_path / "spooled"
-    )
+    verified = {
+        key: InputFile(
+            local=str(row.local),
+            media_type=row.media_type,
+            digest=row.digest,
+            length=row.length,
+            order=row.order,
+        ).granted(key)
+        for key, row in rows.items()
+    }
     prepared = prepare(app.get("collect"), wire, input_metadata=rows)
     result, outcome, _ = run_prepared(
         prepared, Invocation("collect", tmp_path / "result", time.monotonic() + 10, assets=verified)

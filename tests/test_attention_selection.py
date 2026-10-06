@@ -30,7 +30,6 @@ from cozy_runtime.author._observations import (
 )
 from cozy_runtime.internal import accel, attention, attention_fp8, attention_upstream
 from cozy_runtime.internal.encoding import DeviceFacts
-from cozy_runtime.internal.worker.attempts import AttemptRecord
 
 
 def _device(sm: int, kind: str = "cuda") -> DeviceFacts:
@@ -763,12 +762,3 @@ def test_an_over_cap_observation_truncates_and_never_faults_the_attempt() -> Non
     first, second = ring.emit("log", "n" * (NAME_CAP + 1)), ring.emit("log", "n" * (NAME_CAP + 2))
     assert len(first.name) == NAME_CAP and first.name != second.name
     assert ring.caps()["refused"] == 0
-
-
-def test_the_attempt_confession_of_a_huge_value_is_admitted() -> None:
-    """The real worker record, through the real `confess` the release path calls."""
-    attempt = AttemptRecord(request_id="req", attempt=1, digest=b"", spec={})
-    attempt.confess("attention", "z" * 4096)
-    assert attempt.ring.caps()["refused"] == 0 and attempt.ring.caps()["truncated"] == 1
-    assert [row["kind"] for row in attempt.confessions] == ["attention"]
-    assert len(str(attempt.ring.events[-1].value)) == TEXT_CAP

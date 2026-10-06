@@ -12,15 +12,26 @@ from tensorfs.derived import SourceCapability, SourceInspection
 
 from cozy_runtime.author import ObjectRef
 from cozy_runtime.internal import fill, lora_composition
-from cozy_runtime.internal.worker.source_steps import (
-    AdapterViewReady,
-    Answer,
-    Launch,
-    PrepareAdapterView,
-    report,
-    serve,
-)
-from cozy_runtime.internal.worker.workspace import WorkspaceRefusal
+from cozy_runtime.internal.native_child import Answer, Launch, report, serve
+
+
+class AdapterViewInput(msgspec.Struct, frozen=True):
+    manifest: ObjectRef
+    component: str
+    source_component: str
+    scale: str
+
+
+class PrepareAdapterView(
+    msgspec.Struct, frozen=True, kw_only=True, tag_field="step", tag="prepare_adapter_view"
+):
+    identity: str
+    base: ObjectRef
+    adapters: tuple[AdapterViewInput, ...]
+
+
+class AdapterViewReady(Answer, frozen=True, tag="adapter_view_ready"):
+    manifest: ObjectRef
 
 
 class _File(msgspec.Struct, frozen=True):
@@ -50,7 +61,7 @@ def _source(
     try:
         header = store.manifest(manifest.digest)["header"]
         if header is None:
-            raise WorkspaceRefusal("adapter source has no CozyTensors header")
+            raise ValueError("adapter source has no CozyTensors header")
 
         structure = fill.tensorfs_module().parse_header(header)
 
