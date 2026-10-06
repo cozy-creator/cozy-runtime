@@ -186,6 +186,7 @@ def test_a_kernel_still_compiling_is_evidence_with_its_progress(
     import hashlib
     import json
     import zipfile
+    from functools import partial
 
     from cozy_runtime.internal import attention, attention_upstream, kernel_cache, kernel_sources
     from cozy_runtime.internal.encoding import DeviceFacts
@@ -196,7 +197,7 @@ def test_a_kernel_still_compiling_is_evidence_with_its_progress(
     digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
     row = {"version": "1.0", "file": wheel.name, "sha256": digest}
     (tmp_path / "index.json").write_text(json.dumps({"sources": {"late-kernel": row}}))
-    monkeypatch.setattr(kernel_sources, "ROOT", tmp_path)
+    monkeypatch.setattr(kernel_sources, "job", partial(kernel_sources.job, root=tmp_path))
     store = kernel_cache.Store(tmp_path / "u0")
     monkeypatch.setattr(kernel_cache, "_MACHINE_STORE", [store])
     job = kernel_sources.job(kernel_sources.PYTHON, 0)

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import sys
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -33,7 +34,7 @@ def test_the_boot_compiles_what_the_cards_admit_into_the_store_its_executors_rea
     root = _registry(tmp_path / "sources")
     scope = tmp_path / "run"
     scope.mkdir()
-    monkeypatch.setattr(kernel_sources, "ROOT", root)
+    monkeypatch.setattr(kernel_sources, "job", partial(kernel_sources.job, root=root))
     monkeypatch.setattr(accel, "device_capability", lambda entry: {"GPU-a": 120}.get(entry, 0))
     monkeypatch.setattr(kernel_compile, "waiting", None)
     monkeypatch.setattr(kernel_cache, "_MACHINE_STORE", [None])

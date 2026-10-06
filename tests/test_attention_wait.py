@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 from collections.abc import Iterator
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -75,7 +76,9 @@ def store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[kernel_ca
     scope.mkdir()
     monkeypatch.setenv("TMPDIR", str(scope))
     monkeypatch.setattr("tempfile.tempdir", None)
-    monkeypatch.setattr(kernel_sources, "ROOT", tmp_path / "sources")
+    monkeypatch.setattr(
+        kernel_sources, "job", partial(kernel_sources.job, root=tmp_path / "sources")
+    )
     monkeypatch.setattr(liveness, "SAMPLE_SECONDS", 0.05)
     monkeypatch.setattr(kernel_compile, "POLL_SECONDS", 0.01)
     monkeypatch.setitem(attention.BY_NAME, "tiny", TINY)

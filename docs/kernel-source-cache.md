@@ -16,4 +16,15 @@ An explicit registry root remains a component-test/custom-source input. It does 
 the normal Runtime pins. Failures remain visible compilation failures and never publish a
 partial archive or artifact. No numerical/kernel-selection changes or local GPU proof.
 
+CPU proof uses tiny HTTP-served wheel and tar sources with the actual builder subprocess and
+an import from its published artifact. It covers concurrent source acquisition, corrupt-cache
+repair, matching preseed reuse, checksum refusal, private redirects and the existing storage
+owner's refusal. It also removes downloaded archives, stops HTTP and reads the compiled
+artifact without starting another builder. Equivalent explicit-registry and pin inputs keep
+the same artifact key.
+
+The acquisition calls the existing Runtime egress helper, including its storage-admission
+hook. This does not add a host-capacity owner or propagate retired supervisor channels to
+builder subprocesses; the existing no-channel local-write behavior remains unchanged.
+
 Tracker: https://github.com/cozy-creator/tracker/issues/334

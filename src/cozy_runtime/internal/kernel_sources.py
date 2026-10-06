@@ -1,9 +1,10 @@
 """Kernels as pinned SOURCE, compiled on the machine that runs them.
 
 `PINS` is every kernel source this Runtime builds from, by version, release tag or commit and
-sha256. The worker image fetches them once (`python -m cozy_runtime.internal.kernel_sources
-fetch /opt/cozy/kernel-sources`), verified, beside the index the machine's kernel boot reads; it
-carries no kernel binary built elsewhere:
+sha256. Normal jobs use those pins without an image index. A missing compile acquires only
+the sources it opens beneath sealed COZY_KERNEL_CACHE, through the Runtime egress/storage
+boundary. Matching read-only preseeded archives may be reused. Explicit registry roots keep
+the component/custom source layout:
 
     <root>/index.json
         {"schema": 1, "sources": {"<name>": {"version": str, "file": str, "sha256": str,
@@ -25,6 +26,7 @@ from __future__ import annotations
 
 import base64
 import email.parser
+import fcntl
 import functools
 import hashlib
 import json
@@ -41,6 +43,7 @@ from dataclasses import asdict, dataclass, field
 from importlib import metadata, util
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from cozy_runtime.internal import accel, config, egress, kernel_cache, kernel_compile
 
@@ -67,6 +70,9 @@ class Source:
     origin: str = ""
     #: a tree source's pure Python package directory, unpacked by the `python` recipe
     package: str = ""
+    #: Runtime-pinned sources are acquired only when their builder opens them.
+    acquire: bool = False
+    preseed: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -350,7 +356,7 @@ def compiler() -> str:
 def job(name: str, sm: int, root: Path | None = None) -> kernel_compile.Job:
     """The exact artifact `name` is on a card of capability `sm` in this environment."""
     recipe = RECIPES[name]
-    sources, why = registry(root or ROOT)
+    sources, why = registry(root) if root is not None else (_pinned_sources(), "")
     if recipe.kind == "python":
         wanted = {
             n: s
@@ -393,6 +399,33 @@ def job(name: str, sm: int, root: Path | None = None) -> kernel_compile.Job:
     return kernel_compile.Job(recipe.kind, kernel_cache.Key.of(name, inputs), spec)
 
 
+def _filename(pin: Pin) -> str:
+    name = Path(urlparse(pin.url).path).name
+    if name.endswith(".tar.gz") and not name.startswith(pin.name):
+        name = f"{pin.name}-{name}"
+    return name
+
+
+def _pinned_sources() -> dict[str, Source]:
+    """No I/O: cache replay uses the Runtime pins even when archives/index are absent."""
+    store = kernel_cache.configured() or kernel_cache.from_sealed(config.inherited_environment())
+    if store is None:
+        raise Absent("kernel source acquisition requires the sealed kernel cache namespace")
+    return {
+        pin.name: Source(
+            pin.name,
+            pin.version,
+            str(store.own / "sources" / pin.sha256 / _filename(pin)),
+            pin.sha256,
+            pin.url,
+            pin.package,
+            True,
+            str(ROOT / _filename(pin)),
+        )
+        for pin in PINS
+    }
+
+
 def _python() -> str:
     return f"cp{sys.version_info.major}{sys.version_info.minor}"
 
@@ -400,8 +433,19 @@ def _python() -> str:
 # ------------------------------------------------------------------------------ builders
 
 
-def _verified(source: Mapping[str, str]) -> Path:
+def _verified(source: Mapping[str, Any]) -> Path:
     path = Path(source["file"])
+    if source.get("acquire"):
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with (path.parent / ".fetch.lock").open("a+b") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if not path.is_file() or _digest(path) != source["sha256"]:
+                preseed = Path(source["preseed"])
+                if preseed.is_file() and _digest(preseed) == source["sha256"]:
+                    return preseed
+                egress.fetch_public_wheel(
+                    path, source["origin"], f"sha256:{source['sha256']}", 1 << 30
+                )
     if _digest(path) != source["sha256"]:
         raise kernel_compile.CompileFailed(
             "compile_source_mismatch", f"{path} is not the source {source['sha256'][:12]}"
@@ -417,7 +461,7 @@ def _digest(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _extract(source: Mapping[str, str], into: Path) -> Path:
+def _extract(source: Mapping[str, Any], into: Path) -> Path:
     """A verified source tree, its one top directory stripped."""
     into.mkdir(parents=True)
     with tarfile.open(_verified(source)) as archive:
@@ -426,7 +470,7 @@ def _extract(source: Mapping[str, str], into: Path) -> Path:
     return tops[0] if len(tops) == 1 and tops[0].is_dir() else into
 
 
-def _unpack(source: Mapping[str, str], site: Path) -> None:
+def _unpack(source: Mapping[str, Any], site: Path) -> None:
     """A wheel into an importable tree: its purelib/platlib data folded into the root."""
     with zipfile.ZipFile(_verified(source)) as wheel:
         for member in wheel.infolist():
@@ -579,9 +623,7 @@ def fetch(root: Path) -> dict[str, Any]:
     root.mkdir(parents=True, exist_ok=True)
     sources: dict[str, Any] = {}
     for pin in PINS:
-        name = Path(pin.url).name
-        if name.endswith(".tar.gz") and not name.startswith(pin.name):
-            name = f"{pin.name}-{name}"
+        name = _filename(pin)
         if not (root / name).exists() or _digest(root / name) != pin.sha256:
             egress.fetch_public_wheel(root / name, pin.url, f"sha256:{pin.sha256}", 1 << 30)
         row = {"version": pin.version, "file": name, "sha256": pin.sha256, "origin": pin.url}
