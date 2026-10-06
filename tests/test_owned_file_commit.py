@@ -14,13 +14,7 @@ from cozy_runtime import canonical_json
 from cozy_runtime.author import App, FileAsset, Invocation, OutputError, Outputs, attempt
 from cozy_runtime.author._calls import _Broker
 from cozy_runtime.internal import source_interfaces
-from cozy_runtime.internal.pathkey import opaque_key
-from cozy_runtime.internal.worker import workspace_sources
-from cozy_runtime.internal.worker.workspace import Workspace
-from cozy_runtime.protocol import documents
-from cozy_runtime.protocol import worker_pb2 as pb
 from durable_seam import wire
-from test_workspace_native_memo import accepted
 
 
 class Empty(msgspec.Struct):
@@ -37,7 +31,7 @@ def test_owned_commit_facade_keeps_budget_and_explicit_result_boundary(
     data = b"parent generated file" * 4000
     ready_path = tmp_path / "received"
     ready_path.write_bytes(data)
-    digest = documents.spell(hashlib.sha256(data).digest())
+    digest = "sha256:" + hashlib.sha256(data).hexdigest()
     submitted = 0
 
     @app.job
@@ -121,45 +115,3 @@ def test_owned_commit_facade_keeps_budget_and_explicit_result_boundary(
     else:
         assert outcome.terminal == "succeeded", outcome
     assert submitted == (0 if fault in ("foreign", "wrong_attempt") else 1)
-
-
-def pending(
-    tmp_path: Path, data: bytes | None = None
-) -> tuple[Workspace, pb.NativeSourceCommand, Path, bytes]:
-    workspace = Workspace(tmp_path / "store")
-    source = accepted(workspace, "script")
-    if data is None:
-        data = canonical_json.encode({"report": "observed" * 12000})
-    spool = tmp_path / "spool" / opaque_key("attempt-input-spool", "script", 1)
-    spool.mkdir(parents=True)
-    path = spool / "file-0001"
-    path.write_bytes(data)
-    arguments = {
-        "slot": "file/0001",
-        "digest": documents.spell(hashlib.sha256(data).digest()),
-        "size_bytes": len(data),
-        "media_type": "application/json",
-    }
-    intent = canonical_json.encode(
-        {
-            "module": source_interfaces.MODULE,
-            "export": "commit_file",
-            "request": arguments,
-        }
-    )
-    command = pb.NativeSourceCommand(
-        service_id=workspace_sources.identity("owner", "script", 1),
-        operation=pb.NATIVE_SOURCE_OPERATION_COMMIT_FILE,
-        phase=pb.NATIVE_SOURCE_PHASE_EXECUTE,
-        parent_call=pb.ChildCallRequest(
-            parent_request_id="script",
-            parent_attempt_ordinal=1,
-            parent_invocation_spec_digest=source.parent_call.parent_invocation_spec_digest,
-            call_index=1,
-            module=source_interfaces.MODULE,
-            export="commit_file",
-            request_canonical_bytes=canonical_json.encode(arguments),
-            intent_digest=hashlib.sha256(intent).digest(),
-        ),
-    )
-    return workspace, command, path, data

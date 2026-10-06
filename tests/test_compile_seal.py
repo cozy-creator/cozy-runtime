@@ -192,32 +192,6 @@ def test_construction_refuses_compile_and_names_itself() -> None:
     torch.compile(lambda x: x)
 
 
-def test_the_worker_imposes_the_jit_scope_for_every_executor(tmp_path: Path) -> None:
-    """The production guarantee the red arm above depends on.
-
-    An UNBOUND executor (no environment installation — a Runtime-only spawn) is the case
-    that used to return `{}` and hand torch an absent `TORCHINDUCTOR_CACHE_DIR`. Every
-    executor now gets the full set, absolute, so torch's own lazy write is a no-op.
-    """
-    from cozy_runtime.internal.worker.child import ExecutorSupervision
-
-    supervision = ExecutorSupervision(
-        root=tmp_path / "run",
-        python="/usr/bin/python3",
-        base_env=(),
-        cozy_home=tmp_path / "home",
-    )
-    try:
-        assert supervision.environment_installation_id == ""
-        imposed = supervision._prepare_jit_cache()
-    finally:
-        supervision.close()
-
-    assert set(imposed) == set(JIT_NAMES)
-    assert all(Path(value).is_absolute() for value in imposed.values())
-    # An absolute path is what makes torch's `os.path.abspath` rewrite a no-op; a relative
-    # one would be normalized under the executor and move the sealed value.
-    assert all(os.path.abspath(value) == value for value in imposed.values())
 
 
 def test_construction_refuses_both_compile_spellings() -> None:

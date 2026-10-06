@@ -48,8 +48,7 @@ __all__ = [
 class DeliveryRung:
     """One (route, when-it-is-paid) pair, with the sentence that explains it.
 
-    `delivery` and `materialization` are the WIRE's own vocabulary (worker-protocol/01
-    `AttemptPlanSummary`): delivery is `native | float`, materialization is
+    Delivery is `native | float`; materialization is
     `aot_decode | staged_decode | jit_decode` and is float-only. A resolved plan DERIVES
     both from its own route census and placement rather than carrying a rung; this table is
     what those derivations mean.

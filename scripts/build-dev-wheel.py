@@ -61,13 +61,17 @@ def native_inputs(commit: str) -> None:
         project, tool = value["project"], value["tool"]
         assert isinstance(project, dict) and isinstance(tool, dict)
         hatch = copy.deepcopy(tool["hatch"])
+        scikit = copy.deepcopy(tool["scikit-build"])
         # Source-archive selection cannot affect the wheel or its native extension.
-        # Keep shared build settings and all wheel-specific settings in the comparison.
+        # Python package rosters are applied by the fresh pure-wheel build; the donor
+        # contributes only its verified extension. Keep every other build/ABI setting.
         hatch["build"]["targets"].pop("sdist", None)
+        hatch["build"]["targets"].get("wheel", {}).pop("packages", None)
+        scikit.get("wheel", {}).pop("packages", None)
         return (
             value["build-system"],
             project["requires-python"],
-            tool["scikit-build"],
+            scikit,
             hatch,
         )
 

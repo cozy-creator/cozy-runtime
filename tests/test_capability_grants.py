@@ -44,7 +44,8 @@ def test_declaring_egress_refuses_at_build() -> None:
     assert refusal.value.code == "ungrantable_capability"
     # A REFUSAL NAMES WHERE IT CAME FROM: the surface, the capability, and what must land.
     assert "fetch" in str(refusal.value)
-    assert "cr-012" in str(refusal.value)
+    assert "machine-granted" in str(refusal.value)
+    assert "Package-authored URLs cannot grant network access" in str(refusal.value)
 
 
 def test_grantable_capabilities_still_describe() -> None:

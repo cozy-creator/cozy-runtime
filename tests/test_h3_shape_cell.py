@@ -33,8 +33,6 @@ from cozy_runtime.author import (
 )
 from cozy_runtime.author._assets import GrantedInput
 from cozy_runtime.author._demand import shape_cell
-from cozy_runtime.internal.executor_replies import Metrics
-from cozy_runtime.internal.worker.ledger import Ledger
 
 #: Stands in for H3's `official.frames_for` table (whole seconds onto its frame grid).
 FRAMES = {s: 24 * s + 5 for s in range(5, 16)}
@@ -132,42 +130,6 @@ def test_length_and_reference_count_are_the_cell(tmp_path: Path) -> None:
     assert _cell(tmp_path, seconds=10, references=2, prompt="another prompt") == ten
 
 
-def test_a_longer_first_request_is_unmeasured_so_staging_frees_the_card(tmp_path: Path) -> None:
-    """The #756 hand-off: a 10 s serve's peaks never let a first 15 s request keep neighbours."""
-    ten = _cell(tmp_path, seconds=10, references=2)
-    fifteen = _cell(tmp_path, seconds=15, references=2)
-    ledger = Ledger(worker_pid=1)
-    ledger.begin_generation(1)
-    ledger.device_free = 60 << 30
-    peaks = {"condition_text": 2 << 30, "sample_ref2va_turbo": 5 << 30}
-    ledger.observe_attempt(
-        msgspec.convert({"activation_peaks": peaks}, Metrics), cell=ten, succeeded=True
-    )
-    assert ledger.measured_scopes(ten) == frozenset(peaks)
-    assert ledger.measured_scopes(fifteen) == frozenset()
-    assert ledger.measured_scopes(_cell(tmp_path, seconds=10, references=5)) == frozenset()
-
-
-def test_an_invocable_payload_carries_its_segment_length_into_the_cell(tmp_path: Path) -> None:
-    """Run 1560: `long_form` calls `motion_segment_turbo(payload=..., assets=...)`, so the
-    length sits one level below the request. Its 6 s and 12 s segments were one cell, and the
-    12 s one kept the text encoder beside a DiT on the 6 s peak and ran out on GPU 1."""
-    describe(app)
-    six = _cell(tmp_path, seconds=6, references=5, entrypoint="motion_segment_turbo")
-    twelve = _cell(tmp_path, seconds=12, references=5, entrypoint="motion_segment_turbo")
-    assert six == f"assets=5,frames={FRAMES[6]},steps=8"
-    assert twelve == f"assets=5,frames={FRAMES[12]},steps=8"
-    ledger = Ledger(worker_pid=1)
-    ledger.begin_generation(1)
-    ledger.device_free = 7 << 30
-    ledger.observe_attempt(
-        msgspec.convert({"activation_peaks": {"sample_ref2va_turbo": 3 << 30}}, Metrics),
-        cell=six,
-        succeeded=True,
-    )
-    assert ledger.measured_scopes(twelve) == frozenset()
-
-
 class Twice(msgspec.Struct):
     duration_s: DurationSeconds = 5
 
@@ -216,3 +178,14 @@ def test_a_table_missing_a_bounded_value_is_refused_at_build() -> None:
 
     with pytest.raises(ConformanceError, match="no entry for 15"):
         describe(local)
+
+
+def test_an_invocable_payload_carries_its_segment_length_into_the_cell(tmp_path: Path) -> None:
+    """Run 1560: `long_form` calls `motion_segment_turbo(payload=..., assets=...)`, so the
+    length sits one level below the request. Its 6 s and 12 s segments were one cell, and the
+    12 s one kept the text encoder beside a DiT on the 6 s peak and ran out on GPU 1."""
+    describe(app)
+    six = _cell(tmp_path, seconds=6, references=5, entrypoint="motion_segment_turbo")
+    twelve = _cell(tmp_path, seconds=12, references=5, entrypoint="motion_segment_turbo")
+    assert six == f"assets=5,frames={FRAMES[6]},steps=8"
+    assert twelve == f"assets=5,frames={FRAMES[12]},steps=8"

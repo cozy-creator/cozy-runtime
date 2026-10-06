@@ -12,24 +12,14 @@ import os
 import socket
 import threading
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 from cozy_runtime.author._executor_requests import Handler, refuse, respond
-from cozy_runtime.internal import budget_cell, proctree
+from cozy_runtime.internal import budget_cell
 from cozy_runtime.internal.executor import Executor
 from cozy_runtime.internal.seam import Channel
-from cozy_runtime.internal.worker import child
 
 
-def worker_side(channel: Channel) -> child.Executor:
-    """The Worker's record of one executor process (here, this one)."""
-    return child.Executor(
-        epoch=1,
-        process=proctree.process_identity(os.getpid()),
-        scope=cast("Any", None),
-        channel=channel,
-        seal_digest="",
-    )
 
 
 def serve_once(channel: Channel, handler: Handler | None) -> None:
@@ -41,31 +31,6 @@ def serve_once(channel: Channel, handler: Handler | None) -> None:
     channel.send(answer)
 
 
-def test_the_worker_lowers_a_running_call_at_its_next_block_boundary(tmp_path: Path) -> None:
-    ours, theirs = socket.socketpair()
-    worker = worker_side(Channel(theirs))
-    serving = threading.Thread(target=serve_once, args=(worker.channel, worker._cells(None)))
-    serving.start()
-    executor = Executor(Channel(ours), tmp_path)
-    cell = executor._budget_cell()
-    serving.join()
-    try:
-        assert cell is not None and worker.cell is not None
-        assert worker.cut(1 << 30) is None  # no call in flight: its next call carries the grant
-        with worker._calls:  # a call holds the seam
-            asked: list[int | None] = []
-            cutting = threading.Thread(target=lambda: asked.append(worker.cut(3 << 30)))
-            cutting.start()
-            while (wanted := cell.poll()) is None:  # the executor's block boundaries
-                threading.Event().wait(0.001)
-            assert wanted == 3 << 30
-            cell.acknowledge(2 << 30)  # what it could apply above its stage's floor
-            cutting.join()
-        assert asked == [2 << 30]
-    finally:
-        cell.close() if cell is not None else None
-        worker.close()
-        ours.close()
 
 
 def test_an_older_worker_leaves_the_executor_without_a_cell(tmp_path: Path) -> None:

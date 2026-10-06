@@ -1,0 +1,7 @@
+{
+  "owner_authority_scope": "record-owner/local/default",
+  "request_id": "job-01HQX",
+  "invocation_spec_digest": "sha256:8774c15861f491e148afc62d3e761e33a750bdd053029b452d871a168b787927",
+  "output_slot": "model",
+  "weights_transaction_id": "sha256:e391a623b37c5f4d1295e23241f192d9a989b74663f8721abb85ebf8abb45653"
+}

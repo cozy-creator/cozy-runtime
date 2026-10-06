@@ -112,6 +112,12 @@ def test_public_native_reuse_preserves_record_tags_version_and_provenance(
     assert wheel.name == f"cozy_runtime-{version}-{TAG}.whl"
     assert hashlib.sha256(wheel.read_bytes()).hexdigest() == receipt["sha256"]
     with zipfile.ZipFile(wheel) as archive, zipfile.ZipFile(donor) as original:
+        assert not any(
+            name.startswith(
+                ("cozy/worker/", "cozy_runtime/protocol/", "cozy_runtime/internal/worker/")
+            )
+            for name in archive.namelist()
+        )
         prefix = f"cozy_runtime-{version}.dist-info/"
         metadata = BytesParser().parsebytes(archive.read(prefix + "METADATA"))
         assert metadata["Name"] == "cozy-runtime" and metadata["Version"] == version
@@ -155,7 +161,7 @@ def test_public_native_reuse_preserves_record_tags_version_and_provenance(
     [
         "native",
         "backend",
-        "hatch_wheel",
+        "wheel_abi",
         "hatch_shared",
         "dirty",
         "commit",
@@ -171,17 +177,15 @@ def test_only_changed_native_inputs_authorize_a_full_build(
 ) -> None:
     repo, donor, commit = release_copy
     sha256 = None
-    if change in {"native", "backend", "hatch_wheel", "hatch_shared", "local_version"}:
+    if change in {"native", "backend", "wheel_abi", "hatch_shared", "local_version"}:
         path = repo / ("CMakeLists.txt" if change == "native" else "pyproject.toml")
         source = path.read_text()
         if change == "native":
             source += "\n# changed native input\n"
         elif change == "backend":
             source = source.replace('cmake.build-type = "Release"', 'cmake.build-type = "Debug"')
-        elif change == "hatch_wheel":
-            source = source.replace(
-                'packages = ["src/cozy_runtime", "src/cozy"]', 'packages = ["src/cozy_runtime"]', 1
-            )
+        elif change == "wheel_abi":
+            source = source.replace('wheel.py-api = "cp312"', 'wheel.py-api = "cp313"', 1)
         elif change == "hatch_shared":
             source += '\n[tool.hatch.build]\nexclude = ["/research"]\n'
         else:
@@ -207,7 +211,7 @@ def test_only_changed_native_inputs_authorize_a_full_build(
         donor = corrupt
     result = build(repo, donor, commit, tmp_path / "dist", sha256=sha256)
     assert result.returncode == (
-        3 if change in {"native", "backend", "hatch_wheel", "hatch_shared"} else 1
+        3 if change in {"native", "backend", "wheel_abi", "hatch_shared"} else 1
     ), result.stderr
     assert not list((tmp_path / "dist").glob("*.whl"))
 

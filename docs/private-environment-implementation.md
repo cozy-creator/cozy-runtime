@@ -35,8 +35,7 @@ Verification: focused tests cover conflicting dependency versions, ambient Pytho
 settings, missing transitive requirements, private direct URL fetch, offline reuse,
 revision identity, warm reopening without uploaded carriers, and physical shared
 inodes for an 8 MiB dependency installed into two separate package roots. Deleting
-one generation leaves sibling bytes and inode permissions unchanged. Canonical wire
-fixtures and generated bindings match the pinned worker-protocol source. Ruff,
+one generation leaves sibling bytes and inode permissions unchanged. Ruff,
 focused mypy and architecture fences are checked. Ordinary installed Creator CLI
 qualification and alternate real Torch/native-stack execution remain root integration
 work; toy Torch metadata admission is not GPU execution evidence.

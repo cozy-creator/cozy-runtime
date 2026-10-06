@@ -8,7 +8,6 @@ import os
 import subprocess
 import sys
 import time
-from dataclasses import replace
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -17,10 +16,10 @@ import pytest
 from PIL import Image
 
 from cozy_runtime.author import App, AssetBound, ImageAsset, Invocation, MediaDecoder, attempt
-from cozy_runtime.author._assets import GrantedInput
+from cozy_runtime.author._assets import GrantedInput, file_state
+from cozy_runtime.author._media import SNIFF_BYTES, reconcile, sniff
 from cozy_runtime.internal.executor_commands import InputFile
 from cozy_runtime.internal.sandbox import refuse_network
-from cozy_runtime.internal.worker import grants
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -47,15 +46,20 @@ def inspect_input(payload: Payload, decoder: MediaDecoder) -> Result:
     return Result(str(source), source.stat().st_ino, frame.rgb[:3].hex())
 
 
-def grant(source: Path) -> grants.BoundGrant:
+def grant(source: Path, declared: str = "image/png") -> dict[str, GrantedInput]:
+    source = source.resolve(strict=True)
     raw = source.read_bytes()
-    return grants.BoundGrant(
-        inputs={
-            "image": grants.BoundInput(
-                "image", source.as_uri(), hashlib.sha256(raw).digest(), len(raw), "image/png", 0
-            )
-        }
-    )
+    actual = reconcile(declared, sniff(raw[:SNIFF_BYTES]))
+    assert actual is not None
+    return {
+        "image": InputFile(
+            local=str(source),
+            media_type=actual,
+            digest="sha256:" + hashlib.sha256(raw).hexdigest(),
+            length=len(raw),
+            file_state=file_state(source),
+        ).granted("image")
+    }
 
 
 def invoke(root: Path, inputs: dict[str, GrantedInput]) -> tuple[Any, Any]:
@@ -119,12 +123,11 @@ def test_symlink_grant_borrows_its_resolved_source(tmp_path: Path) -> None:
     Image.new("RGB", (8, 8), (12, 34, 56)).save(source)
     link = tmp_path / "selected.png"
     link.symlink_to(source)
-    verified = grants.hydrate_inputs(grant(link), grants.Authorizer(), spool=tmp_path / "spool")
+    verified = grant(link)
     assert verified["image"].local == source
     result, outcome = invoke(tmp_path / "result", verified)
     assert outcome.terminal == "succeeded", outcome
     assert result.result.inode == source.stat().st_ino
-    assert grants.release_inputs(tmp_path / "spool") == 0
     assert link.is_symlink() and source.is_file()
 
 
@@ -132,7 +135,7 @@ def test_symlink_grant_borrows_its_resolved_source(tmp_path: Path) -> None:
 def test_changed_borrowed_source_refuses_before_decode(tmp_path: Path, change: str) -> None:
     source = tmp_path / "image.png"
     Image.new("RGB", (8, 8), (12, 34, 56)).save(source)
-    verified = grants.hydrate_inputs(grant(source), grants.Authorizer(), spool=tmp_path / "spool")
+    verified = grant(source)
     if change == "write":
         # Same size, same inode: checking only size or inode would miss this edit.
         raw = source.read_bytes()
@@ -146,7 +149,6 @@ def test_changed_borrowed_source_refuses_before_decode(tmp_path: Path, change: s
     result, outcome = invoke(tmp_path / "result", verified)
     assert result is None
     assert outcome.code == ("input_unavailable" if change == "delete" else "input_changed")
-    assert grants.release_inputs(tmp_path / "spool") == 0
     assert source.exists() == (change != "delete")
 
 
@@ -158,56 +160,18 @@ def test_an_image_declared_under_another_image_type_decodes_as_its_bytes(
     asked for: it used to refuse `input_media_type` before the handler ran."""
     source = tmp_path / "photo.jpg"
     Image.new("RGB", (8, 8), (12, 34, 56)).save(source, format="PNG")
-    bound = grant(source)
-    bound.inputs["image"] = replace(bound.inputs["image"], kind_mime=declared)
-    verified = grants.hydrate_inputs(bound, grants.Authorizer(), spool=tmp_path / "spool")
-    assert verified["image"].media_type == "image/png"
+    verified = grant(source, declared)
     result, outcome = invoke(tmp_path / "result", verified)
     assert outcome.terminal == "succeeded", outcome
     assert result.result.pixel == "0c2238"
-
-
-@pytest.mark.parametrize("fault", ["digest", "length", "mime", "missing", "root", "url"])
-def test_direct_grant_refusals_leave_no_media_copy(tmp_path: Path, fault: str) -> None:
-    source = tmp_path / "image.png"
-    Image.new("RGB", (8, 8), (12, 34, 56)).save(source)
-    bound = grant(source)
-    entry = bound.inputs["image"]
-    expected = {
-        "digest": "input_digest_mismatch",
-        "length": "stream_over_declared_size",
-        "mime": "input_media_type",
-        "missing": "input_unavailable",
-        "root": "grant_path_outside_roots",
-        "url": "grant_transport",
-    }[fault]
-    if fault == "digest":
-        bound.inputs["image"] = replace(entry, digest=b"x" * 32)
-    elif fault == "length":
-        bound.inputs["image"] = replace(entry, length=entry.length - 1)
-    elif fault == "mime":
-        bound.inputs["image"] = replace(entry, kind_mime="video/mp4")
-    elif fault == "missing":
-        source.unlink()
-    elif fault == "url":
-        bound.inputs["image"] = replace(entry, url="https://example.invalid/input.png")
-    auth = grants.Authorizer(roots=(str(tmp_path / "other"),) if fault == "root" else ())
-    with pytest.raises(grants.GrantRefusal) as refusal:
-        grants.hydrate_inputs(bound, auth, spool=tmp_path / "spool")
-    assert refusal.value.code == expected
-    assert not (tmp_path / "spool" / "inputs").exists()
-    assert source.exists() == (fault != "missing")
 
 
 if __name__ == "__main__":
     path = Path(sys.argv[1])
     spool = path.parent / "spool"
     refuse_network("sandboxed direct-input custody proof")
-    verified = grants.hydrate_inputs(
-        grant(path), grants.Authorizer(roots=(str(path.parent),)), spool=spool
-    )
+    verified = grant(path)
     result, outcome = invoke(path.parent / "result", verified)
     assert outcome.terminal == "succeeded", outcome
     assert result is not None
-    assert grants.release_inputs(spool) == 0
     print(msgspec.json.encode(result.result).decode())

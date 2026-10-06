@@ -14,46 +14,7 @@ from tensorfs.derived import Derivation, Part, Target, Tensor
 from cozy_runtime.author._errors import CapabilityError
 from cozy_runtime.internal import storage_admission as storage
 from cozy_runtime.internal.weights_writer import WriterBroker
-from cozy_runtime.internal.worker import workspace_byte_outputs as outputs
-from test_workspace_byte_outputs import producing
 from weights_channel import open_output
-
-
-def test_native_import_refusal_preserves_input_and_can_resume(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    workspace, spec, manifest, path = producing(tmp_path)
-    original = path.read_bytes()
-
-    def refuse(*writes: storage.Write) -> NoReturn:
-        raise storage.StorageRefusal("no native import capacity")
-
-    with monkeypatch.context() as scoped:
-        scoped.setattr(storage, "admit", refuse)
-        with pytest.raises(storage.StorageRefusal):
-            outputs.commit(
-                workspace,
-                "owner",
-                "producer",
-                1,
-                spec,
-                "report",
-                manifest,
-                [("payload", path)],
-                200000,
-            )
-    assert path.read_bytes() == original
-    source = outputs.commit(
-        workspace, "owner", "producer", 1, spec, "report", manifest, [("payload", path)], 200000
-    )
-    path.unlink()
-    # Exact completed native custody replays without the now-absent spool input.
-    assert (
-        outputs.commit(
-            workspace, "owner", "producer", 1, spec, "report", manifest, [("payload", path)], 200000
-        )
-        == source
-    )
 
 
 def test_parent_writer_checks_admission_before_creating_native_writer(

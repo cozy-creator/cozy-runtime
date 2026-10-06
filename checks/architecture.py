@@ -76,7 +76,6 @@ SCOPED_TENSORFS_FILES = frozenset(
         "derive/quantization.py",
     }
 )
-GENERATED_PROTOCOL_PREFIX = "cozy.worker.v1"
 # Pillow is a base dependency and the actual public Image value type; imports stay at module scope.
 AUTHOR_ALLOWED_THIRD_PARTY = ("msgspec", "PIL")
 # The `media` extra's encoder (cr-017): allowed in the author package ONLY function-scoped,
@@ -251,14 +250,6 @@ def fence_package_imports() -> list[str]:
                 name == "tensorfs.derived"
                 and path.relative_to(SRC).as_posix() in SCOPED_TENSORFS_FILES
             )
-            if pkg != "protocol" and (
-                name == GENERATED_PROTOCOL_PREFIX
-                or name.startswith(GENERATED_PROTOCOL_PREFIX + ".")
-            ):
-                bad.append(
-                    f"{rel}: Runtime modules must import generated bindings through "
-                    "cozy_runtime.protocol"
-                )
             if not scoped_tensorfs and any(
                 name == f or name.startswith(f + ".") for f in forbidden
             ):
@@ -790,15 +781,11 @@ def fence_one_attempt_kernel() -> list[str]:
 #: incapable of changing what is resident, where it sits, or what a method may touch.
 OBSERVATION_MODULES = (
     "author/_observations.py",
-    "internal/worker/observe.py",
-    "internal/worker/triage.py",
 )
 #: Modules that DECIDE residency, placement or the component-use contract.
 DECIDING_MODULES = (
     "cozy_runtime.internal.fill",
     "cozy_runtime.internal.derive",
-    "cozy_runtime.internal.worker.plan",
-    "cozy_runtime.internal.worker.ledger",
     "cozy_runtime.author._model",
     "torch",
 )
@@ -826,12 +813,10 @@ def fence_timing_decides_nothing() -> list[str]:
     A TYPE cannot hold this. `stage_ms` is a float the observation plane itself must
     min/max/sum (`_observations.Track.add`) and round for the wire, so an opaque
     non-comparable number would break the observer before it stopped anything — and it
-    would still leave `internal/worker/observe.py` free to import `internal.fill`. The
+    would still permit an observation module to import `internal.fill`. The
     invariant is about a module's import graph, which is not a property of a value.
 
-    `author/_observations.py` is listed for completeness only: `package-imports` already
-    denies the whole author package `cozy_runtime.internal`. The two `internal/worker`
-    modules are what nothing else covers.
+    `package-imports` also denies the author package `cozy_runtime.internal`.
     """
     bad: list[str] = []
     for path in py_files():

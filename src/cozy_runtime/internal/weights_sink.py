@@ -8,7 +8,6 @@ The native source API supplies all reader metadata and bytes.
 from __future__ import annotations
 
 import hashlib
-import os
 import re
 from collections.abc import Mapping
 from pathlib import Path
@@ -74,11 +73,6 @@ def lookup(store: tensorfs.Store, transaction_id: str) -> DerivedLookup:
     return msgspec.convert(store.derived_lookup(transaction_id), DerivedLookup)
 
 
-def declaration_digest(facts: Mapping[str, object]) -> bytes:
-    """The declaration a native receipt names by digest."""
-    return weights_receipts.raw(native_receipt(facts).declaration_digest)
-
-
 def same_receipt(left: Mapping[str, object], right: Mapping[str, object]) -> bool:
     """Whether two native receipts state the same facts."""
     return dict(left) == dict(right)
@@ -124,24 +118,6 @@ def exchange_file(spool: Path, output_slot: str, kind: str) -> Path:
     return spool / f"weights-{output_slot}-{kind}.canonical"
 
 
-def write_exchange_file(spool: Path, output_slot: str, kind: str, data: bytes) -> Path:
-    """Publish immutable exact bytes into the already-brokered attempt spool."""
-    target = exchange_file(spool, output_slot, kind)
-    try:
-        with target.open("xb") as stream:
-            stream.write(data)
-            stream.flush()
-            os.fsync(stream.fileno())
-        target.chmod(0o444)
-    except FileExistsError:
-        if target.read_bytes() != data:
-            raise CapabilityError(
-                f"weights {kind} replay changed exact bytes",
-                code="weights_receipt_mismatch" if kind == "receipt" else "weights_intent_conflict",
-            ) from None
-    return target
-
-
 def receipt_from_native(
     output_slot: str,
     transaction_id: str,
@@ -181,31 +157,3 @@ def weights_transaction_id(
         }
     )
     return "sha256:" + hashlib.sha256(b"cozy.runtime.artifact-transaction\0" + subject).hexdigest()
-
-
-def execution_receipt(
-    receipt: WeightsReceipt,
-    *,
-    owner_scope: str,
-    request_id: str,
-    invocation_spec_digest: str,
-) -> tuple[weights_receipts.Reference, bytes, bytes]:
-    """Bind exact TensorFS receipt bytes to the accepted execution."""
-    body = weights_receipts.Receipt(
-        owner_authority_scope=owner_scope,
-        request_id=request_id,
-        invocation_spec_digest=invocation_spec_digest,
-        output_slot=receipt.output_slot,
-        weights_transaction_id=receipt.weights_transaction_id,
-        tensorfs_receipt_digest=receipt.tensorfs_receipt_digest,
-        tensorfs_receipt_canonical_bytes=receipt.tensorfs_receipt,
-    )
-    canonical_bytes, digest = weights_receipts.identity(body)
-    return (
-        weights_receipts.Reference(
-            weights_receipt_digest=digest,
-            weights_receipt_canonical_bytes=canonical_bytes,
-        ),
-        canonical_bytes,
-        digest,
-    )

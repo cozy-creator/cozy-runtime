@@ -62,7 +62,7 @@ def test_pending_and_adopted_results_replay_but_disposed_metadata_refuses(tmp_pa
     assert same_receipt(retained_metadata["receipt"], json.loads(receipt.tensorfs_receipt))
     with pytest.raises(CapabilityError) as error:
         host.client.open_output("result", request)
-    assert error.value.code == "weights_transaction_abandoned"
+    assert error.value.code == "weights_transaction_closed"
 
 
 def test_pending_receipt_without_native_root_is_not_reusable(tmp_path: Path) -> None:

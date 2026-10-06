@@ -79,12 +79,8 @@ For labelled model-ready input media, see [Ordered media inputs](docs/assets.md)
 | package | role | may import |
 |---|---|---|
 | `cozy_runtime.author` | the whole author surface — the only package code imports | stdlib + msgspec |
-| `cozy_runtime.internal` | runtime implementation; owns the ONE config authority | author, protocol, stdlib |
-| `cozy_runtime.protocol` | `cozy.worker.v1` — worker-protocol's bindings, copied verbatim into `src/cozy/`, plus canonical document handling | protobuf, internal.canonical |
+| `cozy_runtime.internal` | executor, storage bindings and the config authority | author, stdlib |
 | `cozy_runtime.cli` | user CLI | author, internal |
-
-Re-vendor worker-protocol with `uv run python scripts/vendor-worker-protocol.py <commit>`: it
-rewrites the bindings and the canonical test corpus from that one commit, so their pins move together.
 
 `cozy_runtime.author` also holds the INVOCATION KERNEL (`_invoke.py`): decode -> resolve
 -> preflight -> hydrate -> invoke -> validate -> finalize. It is pure surface semantics —
@@ -104,27 +100,18 @@ the entrypoint, a frozen `RuntimeConfig` passed explicitly thereafter. Second re
 
     cozy-machine ──seam──▶ executor (CUDA)
 
-The Python worker and its `cozy-runtime-worker` entrypoint are deleted. The Rust
-`cozy-machine` owns the API, the journal, the store and executor supervision, and starts
-`internal/executor.py` through `internal/trampoline.py`. What is left under
-`internal/worker/` is the import closure of the weights writer, held until the machine
-writes weights outputs; nothing starts it.
+The Rust `cozy-machine` owns its API, journal, store and executor supervision.
+Runtime retains the author API, device executor, native TensorFS storage bindings
+and standalone CPU helpers. The Python worker/helper subtree and protobuf facade
+are removed.
 
 | module | role |
 |---|---|
-| `internal/worker/attempts.py` | offer -> prepare -> accept -> terminal, attestation, ledger close |
-| `internal/worker/ledger.py` | the worker-scoped byte ledger and the attempt reconciliation |
-| `internal/worker/plan.py` | the AttemptPlan, the PlanChooser, the local binding-plan record |
-| `internal/worker/grants.py` | DeliveryGrant reads/writes + the closed hub-call table |
-| `internal/worker/child.py` | spawn/supervise/kill the executor; the two ordinals |
-| `internal/worker/observe.py` | typed boot steps, confessions, and the SILENCE-BOUNDED liveness detector |
-| `internal/worker/triage.py` | bounded triage assembly and receipt-checked bundle store |
-| `internal/worker/refusal.py` | reader-vs-data fault, verbatim upstream remedy, the REF_ORIGIN severity split |
-| `internal/worker/records.py` | bounded same-process worker facts; callers own restart recovery |
-| `internal/seam.py` | the control-only, byte-accounted worker<->executor channel |
-| `internal/trampoline.py` | the exec-first stage: pdeathsig, no_new_privs, oom_score_adj |
-| `internal/executor.py` | the disposable device process — the ONE torch importer |
-| `internal/fill.py` | the fill plane: a TensorFS `Checkpoint`, the pinned ring, the transaction |
+| `internal/seam.py` | bounded control framing and native descriptor transfer |
+| `internal/trampoline.py` | exec-first stage and process settings |
+| `internal/executor.py` | disposable device process and package invocation |
+| `internal/weights_writer.py` | scoped native source/output client and broker |
+| `internal/fill.py` | native model metadata, headers and byte access |
 
 `checks/architecture.py` keeps versioned identities in two disjoint registries.
 `DOCUMENT_KINDS` contains only stored or digested documents that cross a process/repository
@@ -156,30 +143,20 @@ adds exact work-unit coordinates and maps counted steps into a package-owned ove
 within-stage percentage. Invalid progress is omitted and diagnosed on the same bounded lossy
 lane; it cannot route, settle, bill, or otherwise control an attempt.
 
-**Every terminal attempt commits one bounded triage record** — identity, applied posture,
-ledger reconciliation, attribution, confessions, faults, and the capped observation tail —
-written and fsynced BEFORE its write receipt is recorded and before the terminal that names
-it. The handle is an opaque `subject_id`; there is no path in it and no way to name one. A
-killed executor is therefore explainable from a directory, with no live process and no SSH.
-
-**Every granted destination is CONTROL-PLANE-MINTED** (cr-042). The closed `HUB_CALLS` table
-in `internal/worker/grants.py` spends a grant minted for one invocation, so nothing the
-package produced — and nothing a request body can influence — chooses where bytes land; a
-destination with no row is a SECURITY EVENT. Inputs remain local. Outputs use either a local
-destination or the exact presigned HTTPS capability in `OutputAccess.url`; the worker streams
-with `Content-Length` and `If-None-Match: *`, validates every resolved address, and refuses a
-redirect-selected destination. Tensorhub holds the R2 credential; the worker never does.
-Armed by the worker grant path end to end and the egress hook at
-the table.
+The machine owns durable run outcomes and output custody. Runtime returns
+structured executor facts and consumes the native capabilities it is granted.
+The former Python worker triage ledger, destination-grant table and worker
+publication service are retired; see the machine API for current control and
+custody behavior.
 
 **The executor's network claim is Python-deep and says so.** `internal/executor.py:main`
 installs `sandbox.refuse_network`, so package or job code that dials is refused typed at
 the first `NETWORK_EVENTS` spelling. That bounds a BUGGY package (law 15's same-tenant
-rung). It is not a kernel bound: the executor runs in the worker's own network namespace
+rung). It is not a kernel bound: the executor runs in the machine's network namespace
 with no seccomp filter, and a C extension or `ctypes` reaches `connect(2)` underneath the
 hook. The egress arms observe both halves against one reachable
-address, so the claim cannot quietly grow. Granted inputs are fetched by the WORKER and
-handed over as spool paths; the executor is never given an address.
+address, so the claim cannot quietly grow. Granted input bytes are supplied by the machine and
+handed over as verified paths; the executor is never given an address.
 
 **Progress is observed, never promoted into a timer-driven failure.** Advancing monotone
 positions and measured process work are reported; an unchanged sample stays `silent`. Process
@@ -418,9 +395,8 @@ a raise is a typed construction failure (`warm_failed`, naming the exception) th
 placement OFFLINE. Its wall time is the `warm` leg of the prepare, on the fill's boot record.
 There is no entrypoint-level warm pass and no `ctx.boot_warmup`.
 
-A local package is prepared by `PrepareLocalPackage` into an installed environment, as a
-published release is; its Placement carries `development` (package, release, installation) in
-place of `package`. The executor always imports the installed environment, never a source tree.
+A local package's captured wheels are uploaded to the Rust machine and installed into a
+generation through its package installer. The executor imports that installed environment.
 Header-declared model assets travel in the CozyTensors runtime closure and reach package
 construction only through Loader's bounded read-only asset capability; a temporary private
 read-only tree exists only for third-party path-based constructors.
@@ -491,13 +467,6 @@ objects and the CozyTensors header before reserving a destination. Encoding cons
 policy input, not duplicated per tensor. A non-`ok` verdict is the typed prepare refusal
 `model_fit_refused`. Every PlacementSet writer fills `Slot.components` from the private construction,
 never from the header.
-
-On a cold model-body miss, pod-supervisor may call the loopback-only
-`CheckPackageSetCompatibility` before the body finishes. Runtime accepts only the verified package
-files plus model Manifests, CozyTensors headers, inline config, and header-declared model assets;
-tensor-part files are rejected from this call. It constructs under CUDA-hidden CPU/meta, calls the
-same TensorFS fit, discards the transient rows, and returns `checkpoint_incompatible` on a definite
-mismatch. A resident model skips this extra construction and follows the ordinary load path.
 
 A package whose signature declares `MediaDecoder` must install `cozy-runtime[media]`;
 `--conformance describe` refuses the release if PyAV is absent (the static reader has no
@@ -576,13 +545,10 @@ qualification gaps. No dtype or inference backend is substituted to make a model
 An unpublished package runs from captured source without a Tensorhub package release.
 A local script is the single-file form; editable describes an installation mode.
 On a rental, an editable checkout is not mounted or watched. Creator builds one exact
-ephemeral project wheel and closed dependency-wheel set, and pod-supervisor verifies their bounded
-WorkerControl chunks into local files. The loopback-only
-`RuntimePreparation.PrepareLocalPackage` method then calls the same wheel/base/venv/interface/
-job-plan implementation as a published package. Its resulting Placement uses
-`DevelopmentPackage` source identity plus the measured project wheel and Environment, so it cannot
-masquerade as a Tensorhub release. Runtime receives no source path, URL, credential, or catalog
-authority.
+ephemeral project wheel and dependency-wheel set. The Rust machine bounds the upload, verifies
+each wheel's digest and length, then invokes its captured-package installer to build an installed
+generation. The Python executor receives the installed environment and Runtime grants rather
+than controller credentials or a watched source checkout.
 
 **TensorFS.** The fill plane reads through tfs-007's published `tensorfs` facade. The base
 package installs and type-checks without model execution, exactly as it does without torch; a

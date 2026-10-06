@@ -29,14 +29,6 @@ from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.parallel import cp, wire
 from cozy_runtime.internal.parallel.group import RankGroup
 from cozy_runtime.internal.parallel.plan import GpuDivergence, GroupPlan, GroupRefusal
-from cozy_runtime.internal.worker.ledger import Ledger
-from cozy_runtime.internal.worker.plan import (
-    DeclaredBinding,
-    PlanChooser,
-    PreparedModel,
-    PreparedRequest,
-)
-from cozy_runtime.internal.worker.plan import ModelBinding as WorkerSlot
 
 PACKAGE = Path(__file__).resolve().parent.parent / "examples" / "marco-polo"
 GiB = 1 << 30
@@ -55,67 +47,6 @@ needs_torch = pytest.mark.skipif(bool(NO_TORCH), reason=NO_TORCH or "")
 
 
 # --------------------------------------------------------------------- bookkeeping
-
-
-def _worker_slot(degrees: tuple[int, ...]) -> WorkerSlot:
-    return WorkerSlot(
-        model_class="M",
-        model_binding_path="serve.models.m",
-        model_parameter_name="m",
-        store="",
-        variant="",
-        reference_snapshot="",
-        components=("unet",),
-        snapshots={},
-        sequence_parallel_degrees=degrees,
-    )
-
-
-def _binding() -> DeclaredBinding:
-    return DeclaredBinding(
-        entrypoint_binding_digest="sha256:" + "0" * 64,
-        entrypoint="serve",
-        model_class="M",
-        model_binding_path="serve.models.m",
-        model_parameter_name="m",
-        release="r",
-        logical_weight_bytes=GiB,
-    )
-
-
-def _pressed_ledger() -> Ledger:
-    ledger = Ledger(worker_pid=os.getpid())
-    ledger.begin_generation(1)
-    ledger.observe_construction(
-        {
-            "filled_bytes": GiB,
-            "filled": 1,
-            "allocator_bytes": GiB,
-            "reserved_bytes": GiB,
-            "resident": {"unet": GiB},
-            "device_free_bytes": 100 << 20,
-            "device_total_bytes": 8 * GiB,
-        }
-    )
-    ledger.activations_by_cell["height=512,width=512"] = 512 << 20
-    return ledger
-
-
-@pytest.mark.parametrize("measured", [False, True])
-def test_a_call_whose_need_does_not_fit_is_staged_with_its_measured_headroom(
-    measured: bool,
-) -> None:
-    """What the memory manager could not make room for runs one declared scope at a time."""
-    ledger = _pressed_ledger()
-    if not measured:
-        ledger.activations_by_cell.clear()
-    prepared = PreparedRequest.unresolved("serve", {"width": 512, "height": 512})
-    chooser = PlanChooser(ledger)
-    model = PreparedModel(delivery_rung="verbatim")
-    plan = chooser.choose(_binding(), model, prepared, fits=False)
-    assert plan.placement == "component_staged"
-    assert plan.headroom_bytes == (512 << 20 if measured else 0)
-    assert chooser.choose(_binding(), model, prepared).placement == "all_resident"
 
 
 # ------------------------------------------------------------------------ the opt-in
@@ -213,14 +144,6 @@ def test_the_authors_degrees_reach_the_interface_and_its_fixed_point() -> None:
         )
     )
     assert tolerated["entrypoints"][0]["models"][0]["sequence_parallel"]["degrees"] == [2]
-    # the worker-side binding: the degrees every slot declares, intersected
-    two = dataclasses.replace(_binding(), models=())
-    assert two.sequence_parallel_degrees() == ()
-    both = dataclasses.replace(_binding(), models=(_worker_slot((2, 4)), _worker_slot((4, 8))))
-    assert both.sequence_parallel_degrees() == (4,)
-    assert dataclasses.replace(
-        _binding(), models=(_worker_slot((2,)),)
-    ).sequence_parallel_degrees() == (2,)
 
 
 # ---------------------------------------------------------------------- gloo (torch)

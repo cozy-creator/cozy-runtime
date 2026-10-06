@@ -66,7 +66,7 @@ def _condition(torch: Any, model: Any, *, image: bool) -> Any:
         return tuple(state.cpu().clone() for state in result.hidden_states)
 
 
-@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.real_gpu)])
 def test_qwen_image_conditioning_releases_position_cache_without_changing_hidden_states(
     device: str,
 ) -> None:
@@ -74,26 +74,24 @@ def test_qwen_image_conditioning_releases_position_cache_without_changing_hidden
     pytest.importorskip("transformers")
     if device == "cuda" and not accel.present(torch, "cuda"):
         pytest.skip("CUDA allocation proof requires a local accelerator")
-    from cozy_runtime.internal.worker.ledger import Ledger
     from cozy_runtime.models.minimax_h3.conditioner import FinalHiddenState, release_position_cache
 
     previous_threads = torch.get_num_threads()
     torch.set_num_threads(2)
     try:
         model = _conditioner(torch, device)
-        ledger = Ledger(worker_pid=0)
 
-        def observe() -> dict[str, int]:
+        def observe() -> int:
             if device == "cuda":
                 torch.cuda.synchronize()
-                ledger.observe_probe({"allocator_bytes": torch.cuda.memory_allocated()})
-            return ledger.snapshot()
+                return int(torch.cuda.memory_allocated())
+            return 0
 
         # The actual first text-only forward pays cuBLAS's first-use workspace.
         opened = observe()
         _condition(torch, model, image=False)
         observe()
-        assert ledger.close_attempt("text", opened)["closed"]
+        assert observe() == opened
         assert model.model.rope_deltas is None
 
         # Unchanged upstream image conditioning retains its one int64 cache even
@@ -106,16 +104,14 @@ def test_qwen_image_conditioning_releases_position_cache_without_changing_hidden
         del deltas
         observe()
         if device == "cuda":
-            assert ledger.device_allocated - opened["device_allocated"] == 512
-            assert not ledger.close_attempt("unscoped-image", opened)["closed"]
+            assert observe() - opened == 512
         model.model.rope_deltas = None
-        ledger.unreconciled = ""
         observe()
         if device == "cuda":
-            assert ledger.device_allocated == opened["device_allocated"]
+            assert observe() == opened
 
         release_position_cache(model)
-        for index in range(4):
+        for _ in range(4):
             opened = observe()
             actual = _condition(torch, model, image=True)
             assert model.model.rope_deltas is None
@@ -123,7 +119,7 @@ def test_qwen_image_conditioning_releases_position_cache_without_changing_hidden
                 torch.equal(left, right) for left, right in zip(expected, actual, strict=True)
             )
             observe()
-            assert ledger.close_attempt(f"scoped-image-{index}", opened)["closed"]
+            assert observe() == opened
 
         # The block's one-state view computes exactly the tensor it reads.
         with torch.inference_mode():

@@ -8,6 +8,7 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -32,9 +33,7 @@ from cozy_runtime.internal.encoding.formats import (
     SPEC_ROWWISE_KEEPDIM,
 )
 from cozy_runtime.internal.model_values import read_values_into
-from cozy_runtime.internal.weights_writer import ExecutionStorage, WriterBroker
-from cozy_runtime.internal.worker.attempts import AttemptRecord
-from cozy_runtime.internal.worker.grants import MODEL_PREFIX
+from cozy_runtime.internal.weights_writer import MODEL_PREFIX, ExecutionStorage, WriterBroker
 from durable_seam import seam
 from weights_channel import broker_lane
 
@@ -113,17 +112,18 @@ def reader(
     WeightsReader,
     dict[str, QuantizationSource],
     WriterBroker,
-    AttemptRecord,
+    SimpleNamespace,
     Attempt,
     list[Request],
 ]:
     spool = tmp_path / "spool"
     spool.mkdir(exist_ok=True)
-    record = AttemptRecord(
-        "reader-proof",
-        1,
-        b"\x31" * 32,
-        {
+    record = SimpleNamespace(
+        request_id="reader-proof",
+        attempt=1,
+        digest=b"\x31" * 32,
+        canceling="",
+        spec={
             "inputs": [
                 {"input_id": MODEL_PREFIX + name, "digest": ref[0], "length": ref[1]}
                 for name, ref in references.items()

@@ -191,8 +191,6 @@ def test_pending_call_keeps_the_result_type_and_observes_capture_separately(tmp_
 
     from cozy_runtime import __version__
     from cozy_runtime.author._calls import _Broker, _CallType
-    from cozy_runtime.internal.capture_observation import document
-    from cozy_runtime.protocol import worker_pb2 as pb
 
     module = Denoiser()
     model = Tiny.for_test(denoiser=module)
@@ -212,13 +210,13 @@ def test_pending_call_keeps_the_result_type_and_observes_capture_separately(tmp_
                 result, outcome, _ = pool.submit(child).result()
             assert outcome.terminal == "succeeded", outcome
             capture_fact = capture.write(tmp_path / "child")
-            wire = pb.ExecutionObservation(
-                environment=pb.ExecutionEnvironment(runtime_version=__version__, accelerator="CPU"),
-                capture=pb.ActivationCaptureResult(
-                    output_id="runtime.capture",
-                    content_digest=bytes.fromhex(capture_fact["content_digest"][7:]),
-                ),
-            )
+            observation = {
+                "environment": {"runtime_version": __version__, "accelerator": "CPU"},
+                "capture": {
+                    "output_id": "runtime.capture",
+                    "content_digest": capture_fact["content_digest"],
+                },
+            }
             import hashlib
 
             from cozy_runtime import canonical_json
@@ -242,7 +240,7 @@ def test_pending_call_keeps_the_result_type_and_observes_capture_separately(tmp_
                     "ok": True,
                     "state": "succeeded",
                     "result": msgspec.json.encode(result.result).decode(),
-                    "observation": document(wire),
+                    "observation": observation,
                     "byte_grants": [
                         {
                             "output_id": "runtime.capture",

@@ -12,7 +12,7 @@ from tensorfs.derived import SourceCapability
 from cozy_runtime.author import CapabilityError
 from cozy_runtime.author._executor_requests import Opened, WriterSource
 from cozy_runtime.internal.weights_writer import ExecutionStorage, WriterBroker
-from cozy_runtime.internal.worker.grants import MODEL_PREFIX
+from cozy_runtime.internal.weights_writer import MODEL_PREFIX
 from durable_seam import seam
 from test_derived_config_runtime import _released_source
 from test_model_runtime_closure import _CONFIG

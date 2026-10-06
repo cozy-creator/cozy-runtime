@@ -127,11 +127,10 @@ class MemoConfig:
 
 @dataclass(frozen=True, slots=True)
 class WorkerHostConfig:
-    """The fixed product-host handoff to ``cozy-runtime-worker``.
+    """Host configuration consumed by Runtime components.
 
-    The Host names one machine root; every Runtime path is the fixed layout under it
-    (`host_paths.Layout`). The readiness HMAC remains Host-only. Desired placements, accepted
-    placements and attempts arrive after Claim over WorkerControl.
+    The Rust machine owns API requests, accepted work and executor lifecycle. Runtime
+    consumes the settings relevant to its Python executor and storage components.
     """
 
     worker_id: str
@@ -178,7 +177,7 @@ class TensorhubOrigin:
 # image's gcc, and gcc's collect2 finds `ld` through PATH alone — with none, every
 # Triton kernel on a pod failed as `CalledProcessError: … -l:libcuda.so.1 … exit status 1`
 # while the same seal on a local worker inherited a PATH and passed (cl-101). The value is
-# never the provider's: pod-supervisor replaced it before this process started.
+# selected by the machine launcher before this executor starts.
 WORKER_CHILD_PLATFORM_ENV = {
     "LANG",
     "LC_ALL",
@@ -408,15 +407,15 @@ def read_worker_host_config(
         raise ConfigError(
             "config_authority",
             "read_worker_host_config() called twice — a process has one host handoff",
-            "read the host handoff once at cozy-runtime-worker",
+            "read the host handoff once at executor startup",
             Exit.internal,
         )
     env = os.environ if environ is None else environ
     if any(env.get(name) for name in ("PYTHONHOME", "PYTHONPATH")):
         raise ConfigError(
             "worker_host_config",
-            "PYTHONHOME/PYTHONPATH source injection is forbidden for the fixed worker",
-            "execute the image-owned cozy-runtime-worker without source paths",
+            "PYTHONHOME/PYTHONPATH source injection is forbidden for the installed executor",
+            "start the installed Runtime executor without source paths",
         )
     # A newer host may supply settings this worker does not consume. They do
     # not become configuration or child authority merely by existing here;
@@ -428,7 +427,7 @@ def read_worker_host_config(
             raise ConfigError(
                 "worker_host_config",
                 f"required worker environment variable {name} is absent",
-                "launch through cozy-daemon or pod-supervisor",
+                "start the Runtime executor through the Rust machine",
             )
         return value
 

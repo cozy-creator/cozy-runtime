@@ -152,7 +152,7 @@ def _refuse(code: str, message: str, fields: Sequence[str] = ()) -> FillRefusal:
 
 
 def tensorfs_module() -> ModuleType:
-    """TensorFS for `internal/worker` modules, which do not import it themselves (cr-067)."""
+    """Load TensorFS lazily for storage components that keep module imports lightweight."""
     return tensorfs
 
 
