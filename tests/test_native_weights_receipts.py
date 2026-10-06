@@ -104,7 +104,9 @@ def native_exchange(root: Path) -> None:
         facts = writer.commit()
         artifact = client.adopt_model(facts)
         receipt = weights_sink.native_receipt(facts)
-        assert artifact.producer_request_id == attempt.request_id and artifact.output_slot == "model"
+        assert (
+            artifact.producer_request_id == attempt.request_id and artifact.output_slot == "model"
+        )
         assert artifact.manifest.digest == receipt.manifest.digest
         assert artifact.manifest.length == receipt.manifest.length
         assert recorded and all(reference == recorded[0] for reference in recorded)

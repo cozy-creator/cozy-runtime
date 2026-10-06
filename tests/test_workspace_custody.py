@@ -73,15 +73,15 @@ def produced(
         return epoch
 
     def record(receipt: WeightsReceipt) -> None:
-        reference, _, _ = execution_receipt(
+        native_reference, _, _ = execution_receipt(
             receipt,
             owner_scope="owner",
             request_id=request_id,
             invocation_spec_digest=documents.spell(spec),
         )
         reference = pb.WeightsReceiptRef(
-            weights_receipt_digest=reference.weights_receipt_digest,
-            weights_receipt_canonical_bytes=reference.weights_receipt_canonical_bytes,
+            weights_receipt_digest=native_reference.weights_receipt_digest,
+            weights_receipt_canonical_bytes=native_reference.weights_receipt_canonical_bytes,
         )
         manifest = json.loads(receipt.tensorfs_receipt)["manifest"]
         workspace.record_receipt(

@@ -192,15 +192,15 @@ def test_conflicting_finalization_cannot_release_an_adopted_result(tmp_path: Pat
     store, workspace, receipt = produced(tmp_path)
     with workspace.locked() as db:
         attempt = dict(db.execute("SELECT * FROM attempts").fetchone())
-    reference, _, _ = execution_receipt(
+    native_reference, _, _ = execution_receipt(
         receipt,
         owner_scope="owner",
         request_id="producer",
         invocation_spec_digest=documents.spell(attempt["spec"]),
     )
     reference = pb.WeightsReceiptRef(
-        weights_receipt_digest=reference.weights_receipt_digest,
-        weights_receipt_canonical_bytes=reference.weights_receipt_canonical_bytes,
+        weights_receipt_digest=native_reference.weights_receipt_digest,
+        weights_receipt_canonical_bytes=native_reference.weights_receipt_canonical_bytes,
     )
     raw, digest = documents.identity(
         pb.AttemptOutcomeBody(
@@ -229,7 +229,7 @@ def test_conflicting_finalization_cannot_release_an_adopted_result(tmp_path: Pat
         invocation_spec_digest=attempt["spec"],
         invocation_spec_canonical_bytes=attempt["invocation"],
         output_slot="model",
-        weights_receipt_digest=reference.weights_receipt_digest,
+        weights_receipt_digest=native_reference.weights_receipt_digest,
         disposition=pb.WEIGHTS_FINALIZE_DISPOSITION_ADOPT,
         scratch_root_id="test/adopted",
     )

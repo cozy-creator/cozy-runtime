@@ -386,15 +386,15 @@ def test_native_result_has_separate_collection_and_consumer_custody(
     e.submit("owner", "native", b"c" * 32, offered, expected_execution_workspace_id=e.workspace_id)
     store, workspace, receipt = produced(tmp_path)
     independent = workspace.retain("owner", retention(receipt, 42))
-    reference, _, _ = execution_receipt(
+    native_reference, _, _ = execution_receipt(
         receipt,
         owner_scope="owner",
         request_id="producer",
         invocation_spec_digest=documents.spell(offered.invocation_spec_digest),
     )
     reference = pb.WeightsReceiptRef(
-        weights_receipt_digest=reference.weights_receipt_digest,
-        weights_receipt_canonical_bytes=reference.weights_receipt_canonical_bytes,
+        weights_receipt_digest=native_reference.weights_receipt_digest,
+        weights_receipt_canonical_bytes=native_reference.weights_receipt_canonical_bytes,
     )
     body, digest = documents.identity(
         pb.AttemptOutcomeBody(
