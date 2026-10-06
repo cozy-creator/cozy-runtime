@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import io
 import os
 import socket
 import struct
+import time
 from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
@@ -35,9 +37,15 @@ from cozy_runtime.models.minimax_h3.vae_tiles import TileBatchedVideoVAE
 
 
 class Collective(torch.nn.Module):  # type: ignore[misc]  # torch is optional in the base checking env
+    #: this process's calls that asked to run out of memory, after and before the collective
+    ooms = 0
+    ooms_before = 0
+
     def __init__(self) -> None:
         super().__init__()
         self.weight = torch.nn.Parameter(torch.full((1,), 2.0))
+        #: calls that counted themselves in place (`counted`): what a rerun must not double
+        self.register_buffer("seen", torch.zeros(1), persistent=False)
 
     def forward(
         self,
@@ -47,6 +55,11 @@ class Collective(torch.nn.Module):  # type: ignore[misc]  # torch is optional in
         fail: bool = False,
         fail_leader: bool = False,
         step: int | None = None,
+        oom: int = 0,
+        counted: bool = False,
+        oom_before: int = 0,
+        stall: float = 0.0,
+        leader_skips: bool = False,
     ) -> Any:
         assert in_gated_call()
         expected_layout = None if step is None else AttentionLayout(29, 9, step, 1, ("blocks.0",))
@@ -60,8 +73,31 @@ class Collective(torch.nn.Module):  # type: ignore[misc]  # torch is optional in
             raise ValueError("follower failed before joining the collective")
         if fail_leader and torch.distributed.get_rank() == 0:
             raise RuntimeError("GPU 0 ran out of memory")
-        result = value.detach().cpu().clone() + torch.distributed.get_rank()
+        rank = torch.distributed.get_rank()
+        nccl = torch.distributed.get_backend() == "nccl"
+        result = value.detach().clone() if nccl else value.detach().cpu().clone()
+        result = result + rank
+        if counted:
+            self.seen.add_(1)  # in place, in a buffer the call did not make
+            result = result + self.seen.to(result.device)
+        if oom_before and rank > 0:
+            # A follower's first `oom_before` calls run out of memory before the collective:
+            # GPU 0 waits in it until the group's collectives are aborted.
+            Collective.ooms_before += 1
+            if Collective.ooms_before <= oom_before:
+                raise torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 64.00 MiB.")
+        if stall and rank > 0:
+            time.sleep(stall)  # GPU 0 is inside the collective meanwhile
+        if leader_skips and rank == 0:
+            return result  # GPU 0 never joins: GPU 1 waits in the collective for good
         torch.distributed.all_reduce(result)
+        if leader_skips:
+            result = result.cpu()  # GPU 1's host waits on it too
+        if oom and torch.distributed.get_rank() > 0:
+            # A follower's first `oom` calls run out of memory after its collectives.
+            Collective.ooms += 1
+            if Collective.ooms <= oom:
+                raise torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 64.00 MiB.")
         return result
 
 
@@ -92,6 +128,29 @@ class ModelCalls(Model[object]):
     def fail_before_collective(self) -> None:
         with torch.no_grad():
             self.block(torch.ones(1), fail=True)
+
+    @uses_components("block", "overlay")
+    def out_of_memory(self, times: int) -> Any:
+        with torch.no_grad():
+            return self.block(torch.ones(1), oom=times)
+
+    @uses_components("block", "overlay")
+    def counted(self, after: int = 0, before: int = 0) -> Any:
+        with torch.no_grad():
+            value = torch.ones(1, device=self.block.weight.device)
+            return self.block(value, oom=after, oom_before=before, counted=True)
+
+    @uses_components("block", "overlay")
+    def stalled(self, seconds: float) -> Any:
+        with torch.no_grad():
+            value = torch.ones(1, device=self.block.weight.device)
+            return self.block(value, stall=seconds)
+
+    @uses_components("block", "overlay")
+    def stuck(self) -> Any:
+        with torch.no_grad():
+            value = torch.ones(1, device=self.block.weight.device)
+            return self.block(value, leader_skips=True)
 
     @uses_components("block", "overlay")
     def fail_on_leader(self) -> None:
@@ -197,6 +256,13 @@ class H3Calls(Model[object]):
             result = self.dit(**batch)
         torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-6)
         return result
+
+
+class H3Infer(H3Calls):
+    @uses_components("dit")
+    def infer(self, batch: dict[str, Any]) -> Any:
+        with torch.no_grad():
+            return self.dit(**batch)
 
 
 class H3LoRACalls(H3Calls):
@@ -324,7 +390,7 @@ def h3_model(*, adapters: bool = False) -> H3Calls:
     dit.register_forward_pre_hook(no_grad)
     if adapters:
         return h3_lora_model(dit)
-    return H3Calls.for_test(dit=dit, text_encoder=torch.nn.Linear(4, 4))
+    return H3Infer.for_test(dit=dit, text_encoder=torch.nn.Linear(4, 4))
 
 
 #: settled component bytes for the hosting plan: rank 0's capacity holds the DiT and one of the
@@ -436,6 +502,19 @@ def h3_batch(*, mixed_lengths: bool = False) -> dict[str, Any]:
     }
 
 
+def out_of_memory_at(block: torch.nn.Module, call: int) -> None:
+    """`block` runs out of memory on its `call`-th forward, before it runs: the GPUs before it in
+    the group are already in its first collective."""
+    calls = [0]
+
+    def hook(module: Any, args: Any) -> None:
+        calls[0] += 1
+        if calls[0] == call:
+            raise torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 2.00 GiB.")
+
+    block.register_forward_pre_hook(hook)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path)
@@ -449,13 +528,19 @@ def main() -> None:
     parser.add_argument("--hosted", action="store_true")
     parser.add_argument("--spread", action="store_true")
     parser.add_argument("--before-plane", action="store_true")
+    #: an NCCL group: this rank's card, once it has joined
+    parser.add_argument("--cuda", action="store_true")
+    #: the tiny H3 DiT's second transformer block runs out of memory on this call (1-based)
+    parser.add_argument("--oom-at", type=int, default=0)
     args = parser.parse_args()
+    if args.cuda:  # a stuck NCCL test says where each process is
+        faulthandler.dump_traceback_later(60, repeat=True)
     args.h3 = args.h3 or args.h3_lora or args.hosted or args.spread
     torch.set_num_threads(1)
     _capture_seal()
     channel = Channel(socket.socket(fileno=args.rank_fd))
     executor: Any = Executor(channel, args.root, rank=args.rank, world=args.world)
-    executor.device_kind = "cpu"
+    executor.device_kind = "cuda" if args.cuda else "cpu"
     model: Any = (
         hosted_model()
         if args.hosted
@@ -491,7 +576,13 @@ def main() -> None:
             return
         if name == "join":
             reply = executor.join(decode(command))
-            if args.h3 and reply.get("ok"):
+            again = int(command.get("room", -1)) >= 0  # the group formed again: installed
+            if args.cuda and reply.get("ok") and not again:
+                for root in roots.values():
+                    root.to(executor._rank_device(torch))
+                if args.oom_at:
+                    out_of_memory_at(model.dit.transformer_blocks[1], args.oom_at)
+            if args.h3 and reply.get("ok") and not again:
                 refused = executor._install_group(torch, model, HOSTED_CAPACITY)
                 assert refused is None, refused
         elif name == "run":

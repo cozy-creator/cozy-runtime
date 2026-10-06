@@ -20,6 +20,7 @@ import re
 import time
 import weakref
 import zlib
+from collections import deque
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field, replace
@@ -1548,6 +1549,19 @@ class Journal:
     #: generator -> its state before this attempt first drew from it; every one drawn from
     first: dict[int, tuple[Any, Any]] = field(default_factory=dict)
     drawn: dict[int, Any] = field(default_factory=dict)
+    #: device progress of a journaled call (`journaling`): an event recorded every
+    #: `MARK_EVERY` ops on a GPU, and how many of them the device has finished
+    ops: int = 0
+    marks: deque[Any] = field(default_factory=deque)
+    done: int = 0
+
+    def progress(self) -> int:
+        """Marks the device has passed: what a watcher reads, from its own thread, while the
+        call runs. A GPU waiting on a collective that cannot complete passes none."""
+        while self.marks and self.marks[0].query():
+            self.marks.popleft()
+            self.done += 1
+        return self.done
 
     def made(self, out: object) -> None:
         for value in _tensor_operands((out,)):
@@ -1578,6 +1592,55 @@ class Journal:
 
     def effects(self) -> Effects:
         return Effects(self.wrote or bool(self.kept), tuple(self.drawn.values()))
+
+
+_JOURNALING: dict[int, type] = {}
+#: how often a journaled call marks its device progress, in ops (an event costs microseconds)
+MARK_EVERY = 32
+
+
+@contextmanager
+def journaling(torch: ModuleType, journal: Journal) -> Iterator[Journal]:
+    """Every torch op in this context writes into `journal`: the storages it makes, the first
+    content of every other storage it writes into, the generator state a seeded op draws
+    from. One GPU of a group keeps one for a whole call, so the call can be rewound when any
+    GPU of the group fails it (`mirror.mirror_component`). On any device."""
+    kind = _JOURNALING.get(id(torch))
+    if kind is None:
+        kind = _JOURNALING[id(torch)] = _journaling_type(torch)
+    with kind(journal):
+        yield journal
+
+
+def _journaling_type(torch: ModuleType) -> type:
+    mode: type = torch.utils._python_dispatch.TorchDispatchMode
+    seeded = torch.Tag.nondeterministic_seeded
+
+    class Journaling(mode):  # type: ignore[misc]
+        def __init__(self, journal: Journal) -> None:
+            super().__init__()
+            self.journal = journal
+
+        def __torch_dispatch__(
+            self, func: Any, types: Any, args: tuple[Any, ...] = (), kwargs: Any = None
+        ) -> Any:
+            kwargs = kwargs or {}
+            if seeded in func.tags:
+                drawn = _generators(torch, func, args, kwargs)
+                self.journal.draws([(g, g.get_state()) for g in drawn])
+            if func._schema.is_mutable:
+                self.journal.before_write(_tensor_operands(tuple(_written(func, args, kwargs))))
+            out = func(*args, **kwargs)
+            journal = self.journal
+            journal.made(out)
+            journal.ops += 1
+            if journal.ops % MARK_EVERY == 0 and torch.cuda.is_initialized():
+                mark = torch.cuda.Event()
+                mark.record()
+                journal.marks.append(mark)
+            return out
+
+    return Journaling
 
 
 def _generators(
@@ -1611,8 +1674,15 @@ def _written(func: Any, args: tuple[object, ...], kwargs: Mapping[str, object]) 
 
 
 def _storage(value: object) -> int:
+    """The address that names a tensor's storage; -1 for one with none to name (a wrapper
+    subclass, a weight's unbound stand-in), which no journal keeps."""
     pointer = getattr(value, "untyped_storage", None)
-    return int(pointer().data_ptr()) if pointer is not None else -1
+    if pointer is None:
+        return -1
+    try:
+        return int(pointer().data_ptr())
+    except RuntimeError:
+        return -1
 
 
 def _tensor_operands(operands: Sequence[object]) -> Iterator[object]:

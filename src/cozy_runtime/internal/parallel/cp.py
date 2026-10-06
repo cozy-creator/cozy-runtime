@@ -45,10 +45,11 @@ class UngatedShardedForward(GroupRefusal):
     default_code = "ungated_sharded_forward"
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class CpComms:
     """The GROUP's communication facts, passed explicitly - never the default group read
-    ambiently (pgw#773's cross-group corruption)."""
+    ambiently (pgw#773's cross-group corruption). `pg` is replaced when the group forms
+    again; every installed component reads it per collective."""
 
     pg: Any
     rank: int
@@ -59,8 +60,10 @@ class _GroupMesh:
     """The mesh shape diffusers' `ParallelConfig.setup` reads: ONE Ulysses axis of `size`
     over the group's process group; the ring axis is degree 1 and refuses if asked for."""
 
-    def __init__(self, pg: Any, size: int, local_rank: int, *, axis: str = "ulysses") -> None:
-        self._pg = pg
+    def __init__(
+        self, comms: CpComms, size: int, local_rank: int, *, axis: str = "ulysses"
+    ) -> None:
+        self._comms = comms
         self._size = int(size)
         self._local_rank = int(local_rank)
         self._axis = axis
@@ -74,19 +77,19 @@ class _GroupMesh:
                 "ring attention is not supported: the runtime installs Ulysses sequence "
                 "parallelism only (ring_degree=1)"
             )
-        return self._pg
+        return self._comms.pg
 
     def get_local_rank(self) -> int:
         return self._local_rank
 
     def _flatten(self) -> _GroupMesh:
-        return _GroupMesh(self._pg, self._size, self._local_rank)
+        return _GroupMesh(self._comms, self._size, self._local_rank)
 
     def __getitem__(self, key: str | tuple[str, ...]) -> _GroupMesh:
         if isinstance(key, tuple) or key == "ulysses":
-            return _GroupMesh(self._pg, self._size, self._local_rank)
+            return _GroupMesh(self._comms, self._size, self._local_rank)
         if key == "ring":
-            return _GroupMesh(self._pg, 1, 0, axis="ring")
+            return _GroupMesh(self._comms, 1, 0, axis="ring")
         raise KeyError(key)
 
 
@@ -225,7 +228,7 @@ def _install_on_component(component: Any, *, degree: int, comms: CpComms) -> Non
     device = (
         comms.device if isinstance(comms.device, torch.device) else torch.device(str(comms.device))
     )
-    mesh = _GroupMesh(comms.pg, int(degree), int(comms.rank))
+    mesh = _GroupMesh(comms, int(degree), int(comms.rank))
     config.setup(int(comms.rank), int(degree), device, mesh=mesh)
     component._parallel_config = config
     for module in attention_root.modules():

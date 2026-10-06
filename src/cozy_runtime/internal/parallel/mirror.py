@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import sys
 from collections import deque
 from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
@@ -15,7 +16,7 @@ from typing import Any
 import msgspec
 
 from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT
-from cozy_runtime.author._errors import Cancelled
+from cozy_runtime.author._errors import DEVICE_OOM, Cancelled, is_device_oom
 from cozy_runtime.author._model import remote_scope
 from cozy_runtime.internal import attention_sol, execution_evidence
 from cozy_runtime.internal.parallel import cp, wire
@@ -28,6 +29,20 @@ def _failed(what: str, exc: BaseException) -> str:
     return f"{what} failed: {type(exc).__name__}: {exc}"[:600]
 
 
+#: Refusals of the weight plane that mean "this GPU has no room for the call as placed".
+_NO_ROOM = frozenset({"device_shortfall", "operation_exceeds_device"})
+
+
+def out_of_memory(exc: BaseException) -> int | None:
+    """The device bytes `exc` was short of (0: not stated) when it is one GPU of a group
+    running out of memory in its part of a call; None for any other failure."""
+    if is_device_oom(exc):
+        return 0
+    if getattr(exc, "code", None) in _NO_ROOM:
+        return int((getattr(exc, "shortfall", None) or {}).get("needed_bytes") or 0)
+    return None
+
+
 def mirror_component(
     component: Any,
     *,
@@ -36,6 +51,8 @@ def mirror_component(
     group: RankGroup,
     spool: Callable[[], Path | None],
     cancelled: Callable[[], bool] = lambda: False,
+    rerun: Callable[[int], int] | None = None,
+    journaled: Callable[[], contextlib.AbstractContextManager[Any]] = contextlib.nullcontext,
 ) -> None:
     """Wrap the module call outside all torch and diffusers hooks.
 
@@ -45,6 +62,13 @@ def mirror_component(
     Leave forward and its signature intact: diffusers filters layout kwargs through it.
     Scope admission has already happened on the leader. Followers receive that same
     complete scope, including any overlay weights used by component hooks.
+
+    A GPU that runs out of memory in its part does not break the group: with `rerun` (every
+    GPU gives that many device bytes back and the group forms again; it answers the bytes
+    that came back) the whole call runs again on every GPU, from the same inputs. It runs
+    again once on the failed attempt's own memory alone, and after that only while a rerun
+    gave memory back. Before it does, every GPU puts back what the failed attempt's blocks
+    changed (`journaled`: this GPU's call journal, `Weights.call_journal`).
     """
     if component._compiled_call_impl is not None:
         raise cp.ContextParallelUnavailable(
@@ -60,14 +84,57 @@ def mirror_component(
         try:
             # Every follower joins the collective: none may be answering an overlapped call.
             with group.hold(range(1, group.degree)):
+                gave = -1  # bytes the last rerun gave back; -1: no attempt has failed yet
                 try:
-                    group.broadcast(msgspec.to_builtins(command))
-                    with cp.gated_call():
-                        result = call(*args, **kwargs)
-                    for follower, frame in zip(group.followers, group.collect("run"), strict=True):
-                        reply = _accept(name, group, follower.rank, frame)
-                        attention_sol.record_rank(follower.rank, reply.sol_calls)
-                    return result
+                    while True:
+                        group.rerunnable = rerun is not None
+                        group.broadcast(msgspec.to_builtins(command))
+                        short: list[tuple[str, int]] = []
+                        with (
+                            journaled() as journal,
+                            group.watched(name[1], journal.progress if journal else lambda: 0),
+                        ):
+                            try:
+                                with cp.gated_call():
+                                    result = call(*args, **kwargs)
+                            except Exception as exc:
+                                need = out_of_memory(exc) if group.rerunnable else None
+                                if need is None and not group.interrupted:
+                                    raise
+                                # GPU 0 ran out, or a follower did and ended GPU 0's collective.
+                                short += [(group.gpu(0), need)] if need is not None else []
+                            if short:
+                                group.interrupt()  # the followers wait on GPU 0 in a collective
+                            frames = group.collect("run")
+                            answers = list(zip(group.followers, frames, strict=True))
+                            if not short and not any("rerun" in frame for frame in frames):
+                                for follower, frame in answers:
+                                    reply = _accept(name, group, follower.rank, frame)
+                                    attention_sol.record_rank(follower.rank, reply.sol_calls)
+                                return result
+                            group.interrupt()
+                            if journal is not None:  # the call runs again from what it found
+                                journal.rewind()
+                        short += [
+                            (follower.gpu, int(frame["rerun"]))
+                            for follower, frame in answers
+                            if frame.get("code") == DEVICE_OOM and "rerun" in frame
+                        ]
+                        room = max((need for _, need in short), default=0)
+                        gpus = ", ".join(gpu for gpu, _ in short) or "a GPU"
+                        if rerun is None or gave == 0:
+                            raise GroupRefusal(
+                                f"{gpus} ran out of device memory in {name[1]!r}, and no GPU "
+                                f"of the group could give any back ({room} B short)",
+                                code=DEVICE_OOM,
+                            )
+                        gave = rerun(room)
+                        print(
+                            f"[group] {gpus} ran out of device memory in {name[1]!r} "
+                            f"({room} B short); the group gave {gave} B back and runs it again",
+                            file=sys.stderr,
+                            flush=True,
+                        )
                 except BaseException as exc:
                     first = group.broken
                     group._break(_failed(f"mirrored component {name!r}", exc))
@@ -76,6 +143,8 @@ def mirror_component(
                         # error is the consequence, and the call fails with the cause.
                         raise GroupRefusal(first) from exc
                     raise
+                finally:
+                    group.rerunnable = False
         finally:
             payloads.clear()
 

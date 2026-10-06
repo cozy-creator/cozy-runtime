@@ -143,6 +143,8 @@ class Follower:
     memory: tuple[str, ...] = ()
     #: a request of its own is with the machine: that wait is not its stillness
     relaying: bool = False
+    #: a byte here aborts its collectives (its watcher thread; `RankGroup.interrupt`)
+    abort: socket.socket | None = None
 
     @property
     def pid(self) -> int:
@@ -181,6 +183,16 @@ def require_nvls_off(sealed: Mapping[str, str], backend: str) -> None:
         )
 
 
+def abortable(backend: str) -> None:
+    """Before a process joins an NCCL group: an aborted collective raises in the thread that
+    waits on it, and the process lives on to form the group again (`RankGroup.interrupt`).
+    torch's watchdog otherwise tears the process down on the error an abort leaves (its
+    default handling), and `_abort_process_group` asks for it off. Read when the
+    communicator is made, and this is its only switch."""
+    if "nccl" in backend:
+        os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "0"
+
+
 def join_rank(torch: Any, spec: RankSpec, sealed: Mapping[str, str]) -> Any:
     """A follower joins rank 0's store and forms its half of the process group.
 
@@ -191,10 +203,23 @@ def join_rank(torch: Any, spec: RankSpec, sealed: Mapping[str, str]) -> Any:
     dist = torch.distributed
 
     require_nvls_off(sealed, spec.backend)
+    abortable(spec.backend)
     store = dist.TCPStore("127.0.0.1", spec.port, spec.world, is_master=False)
     dist.init_process_group(spec.backend, store=store, rank=spec.rank, world_size=spec.world)
     dist.barrier()
     return dist.group.WORLD
+
+
+def abort_process_group() -> None:
+    """Abort this process's communicator, so a collective in flight raises instead of waiting
+    on a GPU that left it. Best effort (NCCL; a gloo group is only dropped)."""
+    try:
+        c10d = importlib.import_module("torch.distributed.distributed_c10d")
+        abort = getattr(c10d, "_abort_process_group", None)
+        if abort is not None:
+            abort()
+    except Exception:  # teardown must not raise
+        return
 
 
 def _decode[T](
@@ -279,6 +304,18 @@ class RankGroup:
         self.formed = False
         #: the first fault, latched: a broken group never heals, it is rebuilt
         self.broken = ""
+        #: a call in flight may run again when a GPU runs out of memory (`mirror.mirrored`)
+        self.rerunnable = False
+        #: `interrupt` ended this formation's collectives; `form(room=...)` clears it
+        self.interrupted = False
+        #: set once this formation's interrupt has aborted its communicator (set: none due)
+        self._ended = threading.Event()
+        self._ended.set()
+        #: device bytes the followers gave back at the last `form(room=...)`
+        self.gave = 0
+        #: per mirrored component, the pace of its calls (`watched`): the longest pause any
+        #: call of it showed carries over to the next
+        self.paces: dict[str, liveness.Pace] = {}
         #: per follower rank, the largest working peak its mirrored calls reported this attempt
         self.working_peaks: dict[int, int] = {}
         #: per follower rank, its executor's plane facts as its latest reply stated them
@@ -366,7 +403,9 @@ class RankGroup:
             if isinstance(frame.get("plane"), dict):
                 self.rank_planes[follower.rank] = frame["plane"]
             follower.replies.put((head, frame))
-            if head.reply == "run" and not head.ok:
+            if head.reply == "run" and not head.ok and self.rerunnable and "rerun" in frame:
+                self.interrupt()
+            elif head.reply == "run" and not head.ok:
                 self._break(
                     f"{follower.gpu} failed its part of the call: {head.code}: {head.detail}"[:600]
                 )
@@ -390,15 +429,70 @@ class RankGroup:
         """A dead follower must not park rank 0 on a collective that cannot complete:
         abort the communicator so the collective raises instead of waiting on NCCL's
         clock. Best effort - the worker's own liveness watch on rank 0 is the authority."""
-        if self.pg is None:
+        if self.pg is not None:
+            abort_process_group()
+
+    @contextlib.contextmanager
+    def watched(self, name: str, device: Callable[[], int]) -> Iterator[None]:
+        """A mirrored call in flight, judged by its own pace (`liveness.Pace`), never a clock:
+        the reading is GPU 0's device progress (`device`), the bytes each follower moved and
+        the answers that arrived. Every GPU of a call waits on the others in its
+        collectives, so a GPU stuck in one stops them all; a spinning wait burns CPU, which is
+        why CPU time is not in the reading. Still for longer than STILL_FACTOR times the
+        longest pause any call of this component showed (the first call learns its own, from
+        its device progress) and the noise floor: the group breaks, naming the GPUs that
+        have not answered. NCCL's own watchdog is off (`abortable`): this is the one that
+        ends a wedged call."""
+        pace = self.paces.setdefault(name, liveness.Pace())
+        pace.reading = None  # this call opens its own clock
+        floor = liveness.noise_floor(self.sample_seconds)
+        finished = threading.Event()
+
+        def watch() -> None:
+            while not finished.wait(self.sample_seconds):
+                pace.observe(
+                    (
+                        device(),
+                        tuple(liveness.moved(f.pid) for f in self.followers),
+                        tuple(f.replies.qsize() for f in self.followers),
+                    )
+                )
+                if pace.wedged(floor):
+                    quiet = [f.gpu for f in self.followers if f.replies.empty()] or ["GPU 0"]
+                    self._break(f"{', '.join(quiet)} wedged in {name!r}: {pace.verdict(floor)}")
+                    return
+
+        watcher = threading.Thread(target=watch, name="group-watch", daemon=True)
+        watcher.start()
+        try:
+            yield
+        finally:
+            finished.set()
+            watcher.join()
+
+    def interrupt(self) -> None:
+        """End the collective in flight on every GPU and keep the group whole: each
+        follower's watcher aborts its communicator, and this process aborts its own. The group
+        forms again (`form(room=...)`) before its next call. Once per formation: a second
+        caller (the reader thread and the call's own thread both may) returns only once the
+        first one's abort is done, so the group is never formed again under an abort still
+        in progress (that deadlocks torch's process-group teardown)."""
+        with self._leases:
+            first = not self.interrupted
+            if first:
+                self.interrupted = True
+                self._ended.clear()
+        if not first:
+            self._ended.wait()
             return
         try:
-            c10d = importlib.import_module("torch.distributed.distributed_c10d")
-            abort = getattr(c10d, "_abort_process_group", None)
-            if abort is not None:
-                abort()
-        except Exception:  # teardown must not raise
-            return
+            for follower in self.followers:
+                if follower.abort is not None:
+                    with contextlib.suppress(OSError):
+                        follower.abort.send(b"\1")
+            self._abort_collectives()
+        finally:
+            self._ended.set()
 
     def dial_back(self, sealed: Mapping[str, str]) -> None:
         """Every follower answers `hello` as its own rank of this world, under EXACTLY this
@@ -425,36 +519,55 @@ class RankGroup:
                 )
             follower.memory = hello.memory
 
-    def form(self, torch: Any, sealed: Mapping[str, str], cells: Sequence[int] = ()) -> Any:
+    def form(
+        self, torch: Any, sealed: Mapping[str, str], cells: Sequence[int] = (), room: int = -1
+    ) -> Any:
         """Form the process group: the store on a kernel-chosen loopback port, every
         follower joining it, rank 0 joining last, one barrier as the proof. `cells`, one per
-        follower in rank order, are their budget cells: each follows its `join`."""
+        follower in rank order, are their budget cells: each follows its `join`, then the
+        socket its watcher reads (`interrupt`). `room` >= 0 forms it AGAIN after an
+        `interrupt`: every follower joins a new store and gives that many device bytes back."""
         dist = torch.distributed
 
         self.check_alive()
         require_nvls_off(sealed, self.backend)
+        abortable(self.backend)
+        if room >= 0 and dist.is_initialized():
+            dist.destroy_process_group()
         self.store = dist.TCPStore(
             "127.0.0.1", 0, self.degree, is_master=True, wait_for_workers=False
         )
         self.port = int(self.store.port)
         join = {"cmd": "join", "port": self.port, "backend": self.backend}
-        if cells:
-            for follower, cell in zip(self.followers, cells, strict=True):
-                self.send_one(follower.rank, {**join, "cell": True})
-                self.memfd_to(follower.rank, cell)
-        else:
-            self.broadcast(join)
+        for index, follower in enumerate(self.followers):
+            if room >= 0:
+                self.send_one(follower.rank, {**join, "room": room})
+                continue
+            follower.abort, watcher = socket.socketpair()
+            try:
+                self.send_one(follower.rank, {**join, "cell": bool(cells), "abort": True})
+                if cells:
+                    self.memfd_to(follower.rank, cells[index])
+                follower.channel.send_descriptor(watcher)
+            except SeamError as exc:
+                raise GroupRefusal(
+                    f"{follower.gpu} cannot be commanded: {exc}", code="group_broken"
+                ) from exc
+            finally:
+                watcher.close()
         dist.init_process_group(self.backend, store=self.store, rank=0, world_size=self.degree)
         self.pg = dist.group.WORLD
         dist.barrier()
-        for follower, reply in zip(self.followers, self.collect("join"), strict=True):
+        replies = self.collect("join")
+        for follower, reply in zip(self.followers, replies, strict=True):
             if not reply.get("ok"):
                 raise GroupRefusal(
                     f"{follower.gpu} could not join the group: {reply.get('code')}: "
                     f"{reply.get('detail', '')}"[:400],
                     code="group_unformed",
                 )
-        self.formed = True
+        self.gave = sum(int(reply.get("freed") or 0) for reply in replies)
+        self.formed, self.interrupted = True, False
         return self.pg
 
     # ------------------------------------------------------------------ commands
@@ -648,6 +761,8 @@ class RankGroup:
             with contextlib.suppress(OSError):
                 follower.process.wait()
             follower.channel.close()
+            if follower.abort is not None:
+                follower.abort.close()
         if pg is not None:
             with contextlib.suppress(Exception):
                 importlib.import_module("torch.distributed").destroy_process_group()

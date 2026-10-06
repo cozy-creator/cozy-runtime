@@ -325,6 +325,106 @@ def test_a_leader_failure_in_a_mirrored_call_stays_the_attempts_error(tmp_path: 
     assert not torch.distributed.is_initialized()
 
 
+def test_a_group_runs_a_call_again_when_one_gpu_runs_out_of_memory(tmp_path: Path) -> None:
+    """Run 4074: one GPU of two ran out of memory in a mirrored forward and the group aborted.
+    Now every GPU ends the call, the same follower processes form the group again, and the
+    call runs again from the same inputs. A call that runs out again with nothing given back
+    fails with the shortfall, naming the GPU."""
+    fixture = Path(__file__).parent / "testdata" / "parallel_calls.py"
+
+    def launch(module_argv: list[str], fd: int) -> spawn.Child:
+        return spawn.spawn_follower(
+            python=sys.executable,
+            module_argv=[str(fixture), *module_argv[2:]],
+            inherit_fd=fd,
+            env={**os.environ, "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"},
+        )
+
+    group = RankGroup(degree=2, backend="cpu:gloo", root=str(tmp_path), launch=launch)
+    model: Any = collective_model()
+    roots = {"block": model.block, "overlay": model.overlay, "spare": model.spare}
+    ours, theirs = socket.socketpair()
+    leader: Any = Executor(Channel(ours), tmp_path, world=2)
+    leader.device_kind = "cpu"
+    leader.group, leader.torch = group, torch
+    try:
+        group.spawn()
+        group.form(torch, {})
+        leader.pg = first = group.pg
+        mirror_component(
+            model.block,
+            name=("fixture", "block"),
+            prepared={("fixture", key): (model, root) for key, root in roots.items()},
+            group=group,
+            spool=lambda: tmp_path / "attempt",
+            rerun=leader._group_rerun,
+        )
+        pids = group.pids()
+        # GPU 1 runs out once, after its collective: both GPUs run the call again.
+        torch.testing.assert_close(model.out_of_memory(1), torch.tensor([5.0]))
+        assert group.pids() == pids and not group.broken and not group.interrupted
+        assert group.pg is not first and leader.pg is group.pg
+        # The group formed again serves the next call as before.
+        torch.testing.assert_close(model.out_of_memory(0), torch.tensor([5.0]))
+        # Out of memory again with nothing given back: the call fails, naming the GPU.
+        with pytest.raises(GroupRefusal) as failed:
+            model.out_of_memory(1 << 30)
+        assert failed.value.code == "device_out_of_memory"
+        assert "GPU 1 ran out of device memory in 'block'" in str(failed.value)
+        assert group.broken
+    finally:
+        group.close()
+        ours.close()
+        theirs.close()
+    assert not torch.distributed.is_initialized()
+
+
+def test_a_call_run_again_starts_from_the_state_it_found(tmp_path: Path) -> None:
+    """Before a group runs a call again, every GPU puts back what the failed attempt changed
+    (its call journal): here a buffer the call adds to in place. GPU 0 finished its part and
+    GPU 1 ran out after its collective; both count the call once."""
+    fixture = Path(__file__).parent / "testdata" / "parallel_calls.py"
+
+    def launch(module_argv: list[str], fd: int) -> spawn.Child:
+        return spawn.spawn_follower(
+            python=sys.executable,
+            module_argv=[str(fixture), *module_argv[2:]],
+            inherit_fd=fd,
+            env={**os.environ, "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"},
+        )
+
+    group = RankGroup(degree=2, backend="cpu:gloo", root=str(tmp_path), launch=launch)
+    model: Any = collective_model()
+    roots = {"block": model.block, "overlay": model.overlay, "spare": model.spare}
+    ours, theirs = socket.socketpair()
+    leader: Any = Executor(Channel(ours), tmp_path, world=2)
+    leader.device_kind = "cpu"
+    leader.group, leader.torch = group, torch
+    try:
+        group.spawn()
+        group.form(torch, {})
+        leader.pg = group.pg
+        mirror_component(
+            model.block,
+            name=("fixture", "block"),
+            prepared={("fixture", key): (model, root) for key, root in roots.items()},
+            group=group,
+            spool=lambda: tmp_path / "attempt",
+            rerun=leader._group_rerun,
+            journaled=leader._call_journal,
+        )
+        # Each GPU: (2 + its number + the calls it counted), summed.
+        torch.testing.assert_close(model.counted(), torch.tensor([7.0]))
+        torch.testing.assert_close(model.counted(after=1), torch.tensor([9.0]))
+        assert float(model.block.seen) == 2.0, "GPU 0 counted the failed attempt once"
+        torch.testing.assert_close(model.counted(), torch.tensor([11.0]))
+    finally:
+        group.close()
+        ours.close()
+        theirs.close()
+    assert not torch.distributed.is_initialized()
+
+
 @pytest.mark.parametrize("before_plane", [False, True])
 def test_the_plane_budget_reaches_the_followers_that_answer_it(
     tmp_path: Path, before_plane: bool
