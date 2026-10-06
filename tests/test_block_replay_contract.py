@@ -100,6 +100,10 @@ def wrapped(
         return max(need, weight_policy.MARGIN)
 
     monkeypatch.setattr(weights, "shrink", shrink)
+    # The allocator's own counters are the same CPU boundary: a process that initialized
+    # CUDA (an earlier GPU test) would otherwise read them for a CPU device.
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(torch.cuda, "memory_stats", lambda *args, **kwargs: {})
     owner = (
         weight_module
         if weight_module is not None
