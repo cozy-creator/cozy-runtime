@@ -396,9 +396,8 @@ a raise is a typed construction failure (`warm_failed`, naming the exception) th
 placement OFFLINE. Its wall time is the `warm` leg of the prepare, on the fill's boot record.
 There is no entrypoint-level warm pass and no `ctx.boot_warmup`.
 
-A local package is prepared by `PrepareLocalPackage` into an installed environment, as a
-published release is; its Placement carries `development` (package, release, installation) in
-place of `package`. The executor always imports the installed environment, never a source tree.
+A local package's captured wheels are uploaded to the Rust machine and installed into a
+generation through its package installer. The executor imports that installed environment.
 Header-declared model assets travel in the CozyTensors runtime closure and reach package
 construction only through Loader's bounded read-only asset capability; a temporary private
 read-only tree exists only for third-party path-based constructors.
@@ -469,13 +468,6 @@ objects and the CozyTensors header before reserving a destination. Encoding cons
 policy input, not duplicated per tensor. A non-`ok` verdict is the typed prepare refusal
 `model_fit_refused`. Every PlacementSet writer fills `Slot.components` from the private construction,
 never from the header.
-
-On a cold model-body miss, pod-supervisor may call the loopback-only
-`CheckPackageSetCompatibility` before the body finishes. Runtime accepts only the verified package
-files plus model Manifests, CozyTensors headers, inline config, and header-declared model assets;
-tensor-part files are rejected from this call. It constructs under CUDA-hidden CPU/meta, calls the
-same TensorFS fit, discards the transient rows, and returns `checkpoint_incompatible` on a definite
-mismatch. A resident model skips this extra construction and follows the ordinary load path.
 
 A package whose signature declares `MediaDecoder` must install `cozy-runtime[media]`;
 `--conformance describe` refuses the release if PyAV is absent (the static reader has no
@@ -554,13 +546,10 @@ qualification gaps. No dtype or inference backend is substituted to make a model
 An unpublished package runs from captured source without a Tensorhub package release.
 A local script is the single-file form; editable describes an installation mode.
 On a rental, an editable checkout is not mounted or watched. Creator builds one exact
-ephemeral project wheel and closed dependency-wheel set, and pod-supervisor verifies their bounded
-WorkerControl chunks into local files. The loopback-only
-`RuntimePreparation.PrepareLocalPackage` method then calls the same wheel/base/venv/interface/
-job-plan implementation as a published package. Its resulting Placement uses
-`DevelopmentPackage` source identity plus the measured project wheel and Environment, so it cannot
-masquerade as a Tensorhub release. Runtime receives no source path, URL, credential, or catalog
-authority.
+ephemeral project wheel and dependency-wheel set. The Rust machine bounds the upload, verifies
+each wheel's digest and length, then invokes its captured-package installer to build an installed
+generation. The Python executor receives the installed environment and Runtime grants rather
+than controller credentials or a watched source checkout.
 
 **TensorFS.** The fill plane reads through tfs-007's published `tensorfs` facade. The base
 package installs and type-checks without model execution, exactly as it does without torch; a
