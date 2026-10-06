@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 
-
 from cozy_runtime.internal import canonical
 
 MAX_RECEIPT_BYTES = 1 << 20
@@ -25,10 +24,3 @@ def raw(digest: str) -> bytes:
     if canonical.DIGEST_RE.fullmatch(digest) is None:
         raise ReceiptError("malformed_digest", f"{digest!r} is not a lowercase sha256: digest")
     return bytes.fromhex(digest[7:])
-
-
-
-
-
-
-

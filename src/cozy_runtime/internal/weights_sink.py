@@ -73,8 +73,6 @@ def lookup(store: tensorfs.Store, transaction_id: str) -> DerivedLookup:
     return msgspec.convert(store.derived_lookup(transaction_id), DerivedLookup)
 
 
-
-
 def same_receipt(left: Mapping[str, object], right: Mapping[str, object]) -> bool:
     """Whether two native receipts state the same facts."""
     return dict(left) == dict(right)
@@ -120,8 +118,6 @@ def exchange_file(spool: Path, output_slot: str, kind: str) -> Path:
     return spool / f"weights-{output_slot}-{kind}.canonical"
 
 
-
-
 def receipt_from_native(
     output_slot: str,
     transaction_id: str,
@@ -161,5 +157,3 @@ def weights_transaction_id(
         }
     )
     return "sha256:" + hashlib.sha256(b"cozy.runtime.artifact-transaction\0" + subject).hexdigest()
-
-

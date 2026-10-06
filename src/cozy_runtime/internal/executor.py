@@ -220,7 +220,7 @@ from cozy_runtime.internal.weights import (
     journaling,
 )
 
-#: The inline-result door (worker-protocol/01 `ResultEnvelope`): a small typed result rides
+#: The native inline-result door: a small typed result rides
 #: the terminal envelope and skips the file-store round trip. Larger than this REFUSES at
 #: cr-007 — the blob-receipt branch needs a real write-and-receipt transaction, and minting
 #: a receipt for bytes nobody wrote is the fabrication class this runtime exists to prevent.

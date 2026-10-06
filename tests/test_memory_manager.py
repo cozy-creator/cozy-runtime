@@ -22,7 +22,3 @@ def test_a_cgroups_page_cache_and_shared_memory_are_read_in_either_version(
     assert proctree._cgroup_stat(tmp_path) == v1
     (tmp_path / "memory.stat").write_text("anon 5\nfile 900\nshmem 100\ninactive_file 300\n")
     assert proctree._cgroup_stat(tmp_path) == {"inactive_file": 300, "active_file": 0, "shmem": 100}
-
-
-
-

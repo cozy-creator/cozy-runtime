@@ -147,13 +147,12 @@ class Invocation:
     publish_to: str = ""
     """The repository the owner granted this root: each Model it returns is uploaded there."""
     publish: Callable[[Publish], Published] | None = None
-    """`Outputs.publish`'s exchange with the worker, which journals the run's output log."""
+    """`Outputs.publish`'s exchange with the machine, which journals the run's output log."""
 
 
 @dataclass(frozen=True, slots=True)
 class InvocationResult:
-    """What the wire carries (worker-protocol/01). cr-003 pins the serialized shape; the
-    facts this kernel is authoritative for are these."""
+    """The invocation result facts supplied by the author executor."""
 
     result: Any
     outputs: tuple[Mapping[str, Any], ...]
@@ -665,7 +664,7 @@ def asset_inputs(payload: object) -> list[AssetInput]:
     """Every input asset with its identity, order, and concrete typed-field bound.
 
     `input_id` is the payload FIELD PATH with the list index included, which is
-    worker-protocol/01's rule stated in code: inputs are identified, ORDERED subjects and
+    inputs are identified, ordered subjects and
     never a digest-sorted anonymous list. `order` is the position within the containing
     list — 0 for a scalar field — because for H3's mixed reference sets the ORDER IS MODEL
     INPUT, not a presentation fact, and two assets with equal bytes are two subjects.

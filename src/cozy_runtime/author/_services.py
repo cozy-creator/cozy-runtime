@@ -1870,14 +1870,7 @@ SERVING_ONLY: frozenset[str] = frozenset({"adjust"})
 #: at BUILD, naming what has to land, rather than passing describe and deploy and failing on
 #: the first real request — which is the worst clock to learn it on.
 UNGRANTABLE: Mapping[str, str] = {
-    "egress": "no deployment can grant outbound HTTP yet. The broker needs a "
-    "CONTROL-PLANE-MINTED host allowlist, and there is none: cr-042 removed "
-    "`DeclaredBinding.egress_allowed_hosts` because it never had a writer and its "
-    "per-binding shape was unioned across deployments, which decision #451 forbids. "
-    "Deriving the allowlist from the URL instead would grant whatever the package asked "
-    "for, since a `net:` URL comes from package code — every other destination the worker "
-    "opens is control-plane-minted and passes the CLOSED authorization table in "
-    "`internal/worker/grants.py`. cr-012 lands the allowlist writer, the grant row and the "
-    "broker together; until then this declaration is refused here rather than at the first "
-    "request that needs it",
+    "egress": "outbound HTTP is unavailable: the author broker has no machine-granted "
+    "destination allowlist. Package-authored URLs cannot grant network access. This "
+    "declaration refuses at build until the machine grant and broker path exist",
 }

@@ -14,7 +14,7 @@ from cozy_runtime.internal.adapter_view_child import (
     AdapterViewReady,
     PrepareAdapterView,
 )
-from cozy_runtime.internal.native_child import Launch, Refused, Sample
+from cozy_runtime.internal.native_child import MAX_BYTES, Launch, Refused, Sample
 from test_lora_composition import fixture
 
 
@@ -70,3 +70,24 @@ def test_malformed_adapter_launch_is_a_typed_native_refusal() -> None:
     response = child(b'{"store":')
     assert response.returncode == 0
     assert msgspec.json.decode(response.stdout, type=Refused).code == "native_step_malformed"
+
+
+def test_oversized_valid_adapter_launch_refuses_before_preparation(tmp_path: Path) -> None:
+    store, base, first, _ = fixture(tmp_path)
+    identity = "sha256:" + "99" * 32
+    command = msgspec.json.encode(
+        Launch(
+            store=str(store.root),
+            parent_pid=os.getpid(),
+            step=PrepareAdapterView(
+                identity=identity,
+                base=base.manifest,
+                adapters=(AdapterViewInput(first.manifest, "transformer", "adapter", "0.5"),),
+            ),
+        )
+    )
+    # JSON permits trailing whitespace: decoding alone would accept this oversized input.
+    response = child(command + b" " * (MAX_BYTES + 1 - len(command)))
+    assert response.returncode == 0, response.stderr.decode()
+    assert msgspec.json.decode(response.stdout, type=Refused).code == "native_step_bound"
+    assert store.derived_lookup(identity) is None

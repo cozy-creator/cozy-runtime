@@ -66,9 +66,10 @@ def native_exchange(root: Path) -> None:
         assert native.output_slot == binding.slot
         assert native.weights_transaction_id == transaction
         assert native.tensorfs_receipt == canonical_json.encode(facts)
-        assert weights_receipts.raw(native.tensorfs_receipt_digest) == hashlib.sha256(
-            native.tensorfs_receipt
-        ).digest()
+        assert (
+            weights_receipts.raw(native.tensorfs_receipt_digest)
+            == hashlib.sha256(native.tensorfs_receipt).digest()
+        )
         assert store.derived_lookup(transaction)["receipt"] == facts
         recorded.append(dict(facts))
 
@@ -134,6 +135,3 @@ proof['native_exchange'](pathlib.Path(sys.argv[2]))
         text=True,
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
-
-
-

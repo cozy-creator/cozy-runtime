@@ -51,7 +51,11 @@ def serve[S](kind: type[Launch[S]], execute: Callable[[Launch[S]], Answer]) -> N
     faulthandler.enable()
     try:
         try:
-            launch = msgspec.json.decode(sys.stdin.buffer.read(MAX_BYTES + 1), type=kind)
+            command = sys.stdin.buffer.read(MAX_BYTES + 1)
+            if len(command) > MAX_BYTES:
+                _line(msgspec.json.encode(Refused(code="native_step_bound")))
+                return
+            launch = msgspec.json.decode(command, type=kind)
         except msgspec.DecodeError:
             _line(msgspec.json.encode(Refused(code="native_step_malformed")))
             return

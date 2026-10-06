@@ -1,29 +1,0 @@
-
-ı
-plc-h3-t2v-1
-cozy/h3-package1.0.72 Õêç™z¨Ôﬁ¥@·—)-7Dd9.≈O%Öƒ:K
-h3
-minimax/h31.0.0"
-fl2va-bf16*&
- ¥≠ppr'Ïecı]Ir·ÕãúTÖÀ"O@*?{˜™"≥ÄÄ:P
-upscalercozy/upscaler3.1.0"x2-bf16*%
- ,xØ¢M7êÀ’†ÖoM$F@X¿˛+é∏ÃW`ï•Ä@B˘
-generate êπíîæN_J7ºˇIê)%—˚ô∂U ÉÍÔÊTùÜ÷	±
-modelh3"
-text_encoderh3"
-transformerh3"	
-vaeh3*%
- 2jvËïUïÖ√aˇ)ˆª•”^z0y_èLGx0O≤ÁŒÄ02$
-text_encoder	objective	inference2%
-text_encodertaskgeneratevideoñ
-upscalerupscaler"
-upscalerupscaler*%
- eÉSJ∫∂»Ú«ÿÑ[∞é‘-¢·		FÈ>Tì"+9÷LêÄ02 
-upscaler	objective	inference2!
-upscalertaskgeneratevideoBƒ
-upscale E&ÉŒ’ì„D∂!∂Ü •©-$¨}∫ _)N‰§≥&Çñ
-upscalerupscaler"
-upscalerupscaler*%
- eÉSJ∫∂»Ú«ÿÑ[∞é‘-¢·		FÈ>Tì"+9÷LêÄ02 
-upscaler	objective	inference2!
-upscalertaskgeneratevideobinstall-h3-t2v-r7j4{"application":"h3","document":"PackageInterface/1"}
