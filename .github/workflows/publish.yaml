@@ -3,6 +3,8 @@ name: Publish to PyPI
 # Publication IS the tag push (cozy-eval's pattern). No local publish —
 # this workflow is the single release procedure. Manual run for an existing tag:
 #   gh workflow run publish.yaml -R cozy-creator/cozy-runtime -f release_tag=vX.Y.Z
+# Publish exactly the gated files attached to an existing GitHub release, building nothing:
+#   gh workflow run publish.yaml -R cozy-creator/cozy-runtime -f release_tag=vX.Y.Z -f gated_sha256sums='<sum> <file> ...'
 # Two jobs because each bills at least one minute: `build` verifies the release, checks
 # child-call progress, and builds the files; `publish` holds the PyPI OIDC token and runs
 # no project code.
@@ -16,6 +18,10 @@ on:
         description: Existing unpublished version tag to publish
         type: string
         required: true
+      gated_sha256sums:
+        description: '"<sha256> <filename>" pairs, space separated: publish exactly these release assets, no build'
+        type: string
+        default: ''
   push:
     tags:
       - 'v*'
@@ -27,6 +33,7 @@ concurrency:
 
 jobs:
   build:
+    if: ${{ !inputs.gated_sha256sums }}
     outputs:
       version: ${{ steps.dist.outputs.version }}
       sha256sums: ${{ steps.dist.outputs.sha256sums }}
@@ -160,8 +167,40 @@ jobs:
           path: source/dist/
           if-no-files-found: error
 
+  # The gated files a release candidate was proven with, byte for byte: the release's assets,
+  # refused unless they are exactly the sums the release owner recorded. No project code runs.
+  gated:
+    if: ${{ inputs.gated_sha256sums != '' }}
+    outputs:
+      version: ${{ steps.dist.outputs.version }}
+      sha256sums: ${{ steps.dist.outputs.sha256sums }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - id: dist
+        name: The release holds exactly the gated files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag }}
+          SUMS: ${{ inputs.gated_sha256sums }}
+        run: |
+          set -eu
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -D dist
+          printf '%s\n' $SUMS | paste -d' ' - - | sed 's/ /  /' > sums
+          (cd dist && sha256sum --check --strict ../sums)
+          [ "$(ls dist | sort)" = "$(awk '{print $2}' sums | sort)" ]
+          { echo "version=${TAG#v}"; echo "sha256sums<<SUMS"; cat sums; echo SUMS; } >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-dist
+          path: dist/
+          if-no-files-found: error
+
   publish:
-    needs: build
+    needs: [build, gated]
+    if: ${{ !cancelled() && (needs.build.result == 'success' || needs.gated.result == 'success') }}
     runs-on: ubuntu-latest
     environment: pypi
     # Hang bound, not a work budget.
@@ -175,7 +214,7 @@ jobs:
           path: dist
       - name: Upload set is exactly what build hashed
         env:
-          SUMS: ${{ needs.build.outputs.sha256sums }}
+          SUMS: ${{ needs.build.outputs.sha256sums || needs.gated.outputs.sha256sums }}
         working-directory: dist
         run: |
           printf '%s\n' "$SUMS" | sha256sum --check --strict
@@ -186,8 +225,8 @@ jobs:
       # files. Wait while files are absent, refuse at once on any file this run did not build.
       - name: PyPI serves exactly the built files
         env:
-          VERSION: ${{ needs.build.outputs.version }}
-          SUMS: ${{ needs.build.outputs.sha256sums }}
+          VERSION: ${{ needs.build.outputs.version || needs.gated.outputs.version }}
+          SUMS: ${{ needs.build.outputs.sha256sums || needs.gated.outputs.sha256sums }}
         run: |
           python3 - <<'PY'
           import json, os, sys, time, urllib.error, urllib.request
