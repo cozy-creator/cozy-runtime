@@ -1150,10 +1150,33 @@ def build(project: Path, *, environment_python: Path | None = None) -> dict[str,
     """The package interface from source alone. Executes nothing of the package."""
     project = project.resolve()
     application = read_application(project)
-    reader = Reader(
-        project, dependency_roots=environment_roots(environment_python, project=project)
-    )
+    roots = (*environment_roots(environment_python, project=project), *locked_sources(project))
+    reader = Reader(project, dependency_roots=roots)
     return _build(reader, application, read_table(project / "package.toml"))
+
+
+def locked_sources(project: Path) -> tuple[Path, ...]:
+    """The source trees of the local packages the project's `uv.lock` pins (its `directory`
+    and `editable` sources, the project itself aside): a callee package's types are read
+    from there as from an installed one (cr-114). Reading the lock is reading TOML; nothing
+    is built, installed or run."""
+    lock = project / "uv.lock"
+    try:
+        if not lock.is_file() or lock.stat().st_size > 16 << 20:
+            return ()
+        packages = tomllib.loads(lock.read_text()).get("package", [])
+    except (OSError, tomllib.TOMLDecodeError):
+        return ()
+    roots: list[Path] = []
+    for row in packages if isinstance(packages, list) else ():
+        source = row.get("source") if isinstance(row, dict) else None
+        where = (source or {}).get("directory") or (source or {}).get("editable")
+        if not isinstance(where, str):
+            continue
+        tree = (project / where).resolve()
+        if tree != project and tree.is_dir():
+            roots += [tree / "src", tree]
+    return tuple(dict.fromkeys(root for root in roots if root.is_dir()))
 
 
 def build_builtin(name: str) -> dict[str, Json]:

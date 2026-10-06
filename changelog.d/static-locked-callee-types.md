@@ -1,0 +1,1 @@
+Static describe reads a callee package's types from the source the project's `uv.lock` pins as a local directory or editable install (cr-114): a caller whose signature uses a type from another local cozy package describes without running either. A published callee's types still come from `--environment-python` or an installed package.
