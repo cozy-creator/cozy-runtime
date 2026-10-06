@@ -6,10 +6,10 @@ byte, one weight set per component, in regions: `common` and each innermost no-s
 each component's resident set, window and ring inside the plane budget; the resident set is
 wanted and a cursor streams the rest through its byte ring in the blocks' execution order.
 Each block runs inside exactly one acquire/release; a resident region binds at its stable
-address, a streamed one at its place in the ring, from cached views. Reviewed functional
-torch ops recover by unmapping weights. An arbitrary Python forward never replays after it
-started: its state may already have changed, so a failure without recovery authority retires
-the generation.
+address, a streamed one at its place in the ring, from cached views. A torch OOM makes room
+(unmap only) and runs the op again; one that escapes a block's ops runs the block again, with
+the state its forward changed restored first (`Effects`, `Journal`); capacity never poisons
+the executor.
 """
 
 from __future__ import annotations
@@ -103,7 +103,8 @@ INDIVISIBLE = "operation_exceeds_device"
 
 
 class ResidencyRefusal(RuntimeFailure):
-    """A residency failure, with a structured shortfall only for measured capacity."""
+    """A stage cannot run in what the device has: capacity, never broken state. Carries the
+    structured shortfall with both numbers."""
 
     def __init__(self, code: str, detail: str, shortfall: dict[str, Any] | None = None) -> None:
         super().__init__(detail, code=code)
@@ -177,6 +178,8 @@ class Region:
     bound: int | None = None
     #: decoded tensors and derived leaf roles kept alive while bound
     derived: list[Tensor] = field(default_factory=list)
+    #: what its forward changes outside itself, learned on its first run (`Effects`)
+    effects: Effects | None = None
     #: its LoRA'd linears; whether to bake them when its bytes are placed; and whether its
     #: resident bytes hold their deltas now (cleared when the plane evicts it)
     bakes: list[Bake] = field(default_factory=list)
@@ -694,22 +697,18 @@ class Weights:
         )
 
     @contextmanager
-    def recovering(self) -> Iterator[None]:
-        """Recover reviewed functional torch ops, never infer Python forward replay safety."""
+    def recovering(self, journal: Journal | None = None) -> Iterator[Journal | None]:
+        """Run the caller's torch ops with out-of-memory recovery: an op that cannot allocate
+        unmaps weights and runs again (a seeded op from its generator's state before it).
+        With a `journal`, every write into a tensor that existed before is kept first, so the
+        whole call can be rewound and run again."""
         if self.host_only:
-            yield
+            yield journal
             return
         if self._recovery is None:
             self._recovery = _recovery_type(self.torch)
-        with self._recovery(self):
-            yield
-
-    def _recovery_unavailable(self, operation: str) -> ResidencyRefusal:
-        """An entered operation may have changed state: no further stage may reuse it."""
-        detail = f"{operation}: failed after entry without a reviewed recovery contract"
-        for residency in list(self.residencies):
-            residency.poisoned = residency.poisoned or detail[:400]
-        return ResidencyRefusal("recovery_contract_unavailable", detail)
+        with self._recovery(self, journal):
+            yield journal
 
     def make_room(self, need: int, operands: Sequence[object], op: str = "") -> None:
         """An op ran out of device memory (outside every block, or inside one whose ops
@@ -1474,137 +1473,134 @@ class Read:
         return tensor.clone() if any(a <= address < b for a, b in self.spans) else out
 
 
-# Native, output-only operator families reviewed for inference recovery. A schema that
-# merely omits writes is insufficient (custom ops can change Python state). New families
-# require review; mutable overloads and seeded operations never inherit this contract.
-_FUNCTIONAL_OPS = frozenset(
-    [
-        "empty",
-        "empty_like",
-        "empty_strided",
-        "zeros",
-        "zeros_like",
-        "ones",
-        "ones_like",
-        "full",
-        "full_like",
-        "clone",
-        "_to_copy",
-        "contiguous",
-        "cat",
-        "stack",
-        "split",
-        "split_with_sizes",
-        "unbind",
-        "add",
-        "sub",
-        "mul",
-        "div",
-        "true_divide",
-        "floor_divide",
-        "neg",
-        "abs",
-        "square",
-        "sqrt",
-        "rsqrt",
-        "pow",
-        "exp",
-        "log",
-        "sin",
-        "cos",
-        "tanh",
-        "sigmoid",
-        "silu",
-        "gelu",
-        "relu",
-        "clamp",
-        "maximum",
-        "minimum",
-        "where",
-        "sum",
-        "mean",
-        "amax",
-        "amin",
-        "prod",
-        "cumsum",
-        "mm",
-        "bmm",
-        "matmul",
-        "addmm",
-        "addbmm",
-        "baddbmm",
-        "linear",
-        "convolution",
-        "_convolution",
-        "_softmax",
-        "_log_softmax",
-        "native_layer_norm",
-        "native_group_norm",
-        "group_norm",
-        "layer_norm",
-        "scaled_dot_product_attention",
-        "_scaled_dot_product_flash_attention",
-        "_scaled_dot_product_efficient_attention",
-        "_scaled_dot_product_cudnn_attention",
-        "upsample_nearest2d",
-        "upsample_bilinear2d",
-        "avg_pool2d",
-        "adaptive_avg_pool2d",
-        "constant_pad_nd",
-        "reflection_pad2d",
-        "replication_pad2d",
-        "index",
-        "index_select",
-        "gather",
-        "arange",
-        "linspace",
-        "repeat",
-        "repeat_interleave",
-        "unfold",
-    ]
-)
-
-# Only SDK-owned image_vae output-only pass bodies receive this token, through _within.
-_DECODER_PASS = object()
-
-
-def _functional_op(torch: ModuleType, func: Any, types: Sequence[type[object]]) -> bool:
-    return bool(
-        isinstance(func, torch._ops.OpOverload)
-        and func.namespace == "aten"
-        and func._schema.name.removeprefix("aten::") in _FUNCTIONAL_OPS
-        and not func._schema.is_mutable
-        and torch.Tag.nondeterministic_seeded not in func.tags
-        and all(t in (torch.Tensor, torch.nn.Parameter) for t in types)
-    )
-
-
 def _recovery_type(torch: ModuleType) -> type:
     mode: type = torch.utils._python_dispatch.TorchDispatchMode
+    seeded = torch.Tag.nondeterministic_seeded
 
     class Recovery(mode):  # type: ignore[misc]
-        """Retry only reviewed functional ops after room was made, never an arbitrary call."""
+        """Every torch op: one that runs out of device memory runs again after weights were
+        unmapped for it (retry the op, never the run). A seeded op runs again from the
+        generator state it started from. With a journal, writes into tensors that existed
+        before are kept first, and the generators seeded ops draw from are noted."""
 
-        def __init__(self, weights: Weights) -> None:
+        def __init__(self, weights: Weights, journal: Journal | None) -> None:
             super().__init__()
             self.weights = weights
+            self.journal = journal
 
         def __torch_dispatch__(
             self, func: Any, types: Any, args: tuple[Any, ...] = (), kwargs: Any = None
         ) -> Any:
             kwargs = kwargs or {}
+            journal = self.journal
+            drawn = _generators(torch, func, args, kwargs) if seeded in func.tags else []
+            states = [(g, g.get_state()) for g in drawn]
+            written: list[tuple[Any, Any]] = []
+            if func._schema.is_mutable:
+                targets = list(_tensor_operands(tuple(_written(func, args, kwargs))))
+                if journal is not None:
+                    journal.before_write(targets)
+                written = [(t, t.clone()) for t in targets]
+            if journal is not None:
+                journal.draws(states)
             refused = False
             while True:
                 try:
-                    return func(*args, **kwargs)
+                    out = func(*args, **kwargs)
+                    if journal is not None:
+                        journal.made(out)
+                    return out
                 except Exception as exc:
                     need, refused = _room_for(exc, refused)
-                    if not _functional_op(torch, func, types):
-                        raise self.weights._recovery_unavailable(str(func)) from exc
-                # outside `except`, so the failed op's frames are gone
+                # outside `except`, so the failed op's frames are gone; it runs again from
+                # what it read: its generators and the tensors it writes into, as they were
+                for generator, state in states:
+                    generator.set_state(state)
+                for target, first in written:
+                    target.copy_(first)
                 self.weights.make_room(need, (*args, *kwargs.values()), str(func))
 
     return Recovery
+
+
+@dataclass(frozen=True, slots=True)
+class Effects:
+    """What a block's forward changes outside itself, as its first run showed: whether it
+    writes into tensors that existed before it (its inputs, its buffers, anything held
+    elsewhere), and the generators its seeded ops draw from. A forward that changes nothing
+    else runs again unobserved after an out-of-memory; one that writes runs observed, its
+    writes journaled; the generators are put back either way. Python attributes it changes
+    (a counter on the module) are not seen."""
+
+    writes: bool
+    generators: tuple[Any, ...]
+
+
+@dataclass(slots=True)
+class Journal:
+    """One observed attempt of a block: the storages its ops made, the first content of every
+    other storage they wrote into, and the generators its seeded ops drew from. `rewind`
+    puts those storages back, so the attempt can run again from where it started."""
+
+    made_here: set[int] = field(default_factory=set)
+    kept: dict[int, tuple[Any, Any]] = field(default_factory=dict)
+    wrote: bool = False
+    #: generator -> its state before this attempt first drew from it; every one drawn from
+    first: dict[int, tuple[Any, Any]] = field(default_factory=dict)
+    drawn: dict[int, Any] = field(default_factory=dict)
+
+    def made(self, out: object) -> None:
+        for value in _tensor_operands((out,)):
+            self.made_here.add(_storage(value))
+
+    def before_write(self, written: Iterable[object]) -> None:
+        for value in _tensor_operands(tuple(written)):
+            key = _storage(value)
+            if key < 0 or key in self.made_here or key in self.kept:
+                continue
+            storage = value.untyped_storage()  # type: ignore[attr-defined]
+            self.kept[key] = (storage, storage.clone())
+            self.wrote = True
+
+    def draws(self, states: Iterable[tuple[Any, Any]]) -> None:
+        for generator, state in states:
+            self.first.setdefault(id(generator), (generator, state))
+            self.drawn.setdefault(id(generator), generator)
+
+    def rewind(self) -> None:
+        for storage, first in self.kept.values():
+            storage.copy_(first)
+        for generator, state in self.first.values():
+            generator.set_state(state)
+        self.kept.clear()
+        self.made_here.clear()
+        self.first.clear()
+
+    def effects(self) -> Effects:
+        return Effects(self.wrote or bool(self.kept), tuple(self.drawn.values()))
+
+
+def _generators(
+    torch: ModuleType, func: Any, args: tuple[Any, ...], kwargs: Mapping[str, Any]
+) -> list[Any]:
+    """The generators a seeded op draws from: its own, else its device's default."""
+    found = []
+    device = None
+    for index, argument in enumerate(func._schema.arguments):
+        value = args[index] if index < len(args) else kwargs.get(argument.name)
+        if isinstance(value, torch.Generator):
+            found.append(value)
+        elif argument.name == "device" and value is not None:
+            device = torch.device(value)
+    if found:
+        return found
+    if device is None:
+        tensor = next(_tensor_operands((*args, *kwargs.values())), None)
+        device = getattr(tensor, "device", torch.device("cpu"))
+    if device.type == "cuda":
+        index = device.index if device.index is not None else torch.cuda.current_device()
+        return [torch.cuda.default_generators[index]]
+    return [torch.default_generator]
 
 
 def _written(func: Any, args: tuple[object, ...], kwargs: Mapping[str, object]) -> Iterator[object]:
@@ -1612,6 +1608,11 @@ def _written(func: Any, args: tuple[object, ...], kwargs: Mapping[str, object]) 
     for index, argument in enumerate(func._schema.arguments):
         if argument.alias_info is not None and argument.alias_info.is_write:
             yield args[index] if index < len(args) else kwargs.get(argument.name)
+
+
+def _storage(value: object) -> int:
+    pointer = getattr(value, "untyped_storage", None)
+    return int(pointer().data_ptr()) if pointer is not None else -1
 
 
 def _tensor_operands(operands: Sequence[object]) -> Iterator[object]:
@@ -2726,10 +2727,8 @@ class WeightResidency:
         self.components = dict(components)
         #: re-registers a component at the sub-block grain (the backend's `refine`)
         self.refine = refine
-        #: component -> (module, had its own `forward`, original, SDK hook) per region
-        self.hooks: dict[
-            str, list[tuple[Module, bool, Callable[..., object], Callable[..., object]]]
-        ] = {}
+        #: component -> (module, had its own `forward`, that forward) per hooked region
+        self.hooks: dict[str, list[tuple[Module, bool, Callable[..., object]]]] = {}
         #: method -> the components it declares (`component_use`)
         self.scopes = dict(scopes or {})
         self.hosted: frozenset[str] = frozenset()
@@ -2781,13 +2780,11 @@ class WeightResidency:
         rows = self.hooks[component.name] = []
         for region in component.blocks:
             module = region.module
-            forward = module.forward
-            hook = self._block(component, region, forward)
-            rows.append((module, "forward" in module.__dict__, forward, hook))
-            module.forward = hook
+            rows.append((module, "forward" in module.__dict__, module.forward))
+            module.forward = self._block(component, region, module.forward)
 
     def _unhook(self, name: str) -> None:
-        for module, had, forward, _hook in self.hooks.pop(name, []):
+        for module, had, forward in self.hooks.pop(name, []):
             if had:
                 module.forward = forward
             else:
@@ -3483,30 +3480,52 @@ class WeightResidency:
         return True
 
     def _block(
-        self,
-        component: Component,
-        region: Region,
-        forward: Callable[..., Any],
-        *,
-        _replay: object | None = None,
+        self, component: Component, region: Region, forward: Callable[..., Any]
     ) -> Callable[..., Any]:
-        """Acquire, bind, run, release. Only reviewed SDK decoder bodies may run again."""
+        """The one hook per block: acquire, bind, run, release. A torch OOM makes room and
+        runs the op again; one that escapes the block's ops (a library's own allocation)
+        makes room and runs the block again, from the state it started with: the
+        generators it draws from are put back, and so are the tensors it wrote into
+        (`Journal`). Only a block that shares its call with a group cannot run again."""
         weights = self.weights
         torch = weights.torch
-        replay = _replay is _DECODER_PASS and not weights.grouped
 
         def run(*args: Any, **kwargs: Any) -> Any:
-            self._require_clean(component.name)
             try:
-                if replay:
-                    with self._quiet():  # the SDK output-only pass recovers as one body
-                        return attempt(*args, **kwargs)
-                with weights.recovering():
-                    return attempt(*args, **kwargs)
+                effects = region.effects
+                if effects is not None and not effects.writes and not weights.grouped:
+                    # Writes nothing that existed before it: it runs unobserved, and only
+                    # the generators it draws from are kept for a second run.
+                    kept = [(g, g.get_state()) for g in effects.generators]
+
+                    def rewind() -> None:
+                        for generator, state in kept:
+                            generator.set_state(state)
+
+                    with self._quiet():
+                        return rewound(rewind, *args, **kwargs)
+                # Its first run, a block that writes into tensors it did not make, or one
+                # GPU of a group: its ops recover one by one, journaled.
+                journal = Journal()
+                with weights.recovering(journal):
+                    out = rewound(journal.rewind, *args, **kwargs)
+                if effects is None and not weights.host_only:
+                    region.effects = journal.effects()
+                return out
             except self._poisoned_error as exc:
                 raise self._poison(exc) from exc
 
-        def attempt(*args: Any, **kwargs: Any) -> Any:
+        def rewound(rewind: Callable[[], None], *args: Any, **kwargs: Any) -> Any:
+            """A block that fails for good leaves the state it found: the next request on
+            this executor starts from it, as if the failed one never ran."""
+            try:
+                return attempt(rewind, *args, **kwargs)
+            except BaseException:
+                with self._quiet():
+                    rewind()
+                raise
+
+        def attempt(rewind: Callable[[], None], *args: Any, **kwargs: Any) -> Any:
             if weights.cell is not None and not weights.running:
                 self._asked({component.key: region.index})
             passes = component.passes
@@ -3519,7 +3538,9 @@ class WeightResidency:
                 self._grow()
             if component.spared:
                 self._unspare(component)
-            refused = False
+            versions = _versions(args, kwargs)
+            # a library's refusal is answered once: by its op when ops recover one by one
+            refused = weights.grouped or region.effects is None or region.effects.writes
             refusals = 0
             while True:
                 stream = weights.stream()
@@ -3541,48 +3562,22 @@ class WeightResidency:
                         f"{component.name}.{region.path}",
                     )
                     continue
-                need, stale, entered = 0, False, False
+                need, stale = 0, False
                 try:
                     try:
-                        # SDK binding owns these bytes and its seeded bake; a partial
-                        # resident bake is dirty and refills through _Stale/_restore.
-                        # Exclude outer Recovery modes too, including a nested block's.
+                        # The plane's bind and bake are its own math, outside the block's
+                        # recovery: a bake that fails leaves the region dirty, and it refills.
                         with self._quiet():
                             bind(torch, region, lease, refill=True)
                         weights.running.append(component.key)
                         weights.last = component.key
                         try:
-                            entered = True
                             return forward(*args, **kwargs)
                         finally:
                             weights.running.pop()
                     except _Stale:
                         stale = True
                     except Exception as exc:
-                        if (
-                            entered
-                            and not replay
-                            and isinstance(exc, ResidencyRefusal)
-                            and exc.code == INDIVISIBLE
-                        ):
-                            # The op's capacity measurement stays the attempt's failure.
-                            # Its Python caller may already have changed state, so only
-                            # this entered generic body loses generation reuse authority.
-                            self.poisoned = (
-                                self.poisoned
-                                or (
-                                    f"{component.name}.{region.path}: recovery exhausted after "
-                                    f"forward entry: {exc}"
-                                )[:400]
-                            )
-                        if (
-                            entered
-                            and not replay
-                            and (is_device_oom(exc) or is_library_refusal(exc))
-                        ):
-                            raise weights._recovery_unavailable(
-                                f"{component.name}.{region.path}"
-                            ) from exc
                         need, refused = _room_for(exc, refused)
                         need = need or region.span
                 finally:
@@ -3594,6 +3589,28 @@ class WeightResidency:
                 if stale:
                     self._restore(component, region)
                     continue
+                if weights.grouped:
+                    raise self._shortfall(
+                        self.active[0] if self.active else "",
+                        need,
+                        0,
+                        f"{component.name}.{region.path} ran out of memory outside torch's "
+                        "own ops, and it shares its call with its group, so it cannot run "
+                        "again alone",
+                    )
+                if _versions(args, kwargs) != versions:
+                    # It wrote into its inputs although its first run did not: observe it
+                    # from now on. This attempt cannot be rewound.
+                    region.effects = None
+                    raise self._shortfall(
+                        self.active[0] if self.active else "",
+                        need,
+                        0,
+                        f"{component.name}.{region.path} ran out of memory after changing its "
+                        "inputs in place, which its first run did not, so it cannot run again",
+                    )
+                with self._quiet():  # putting state back is not the block's own op
+                    rewind()
                 self._make_room(
                     need, {component.key: region.index}, f"{component.name}.{region.path}"
                 )
@@ -3780,7 +3797,6 @@ class WeightResidency:
             free, evictable = self.room((name,))
             need = exact.peak(host=False)
             host = need > self._room_for_decode(name, free, evictable, min(need, free + evictable))
-            replayable = self._decoder_replayable(name)
             while True:
                 try:
                     out = exact.run(self._within(name), host)
@@ -3790,8 +3806,6 @@ class WeightResidency:
                     refused = isinstance(exc, ResidencyRefusal) and exc.code == INDIVISIBLE
                     if not oom and (host or not refused):
                         raise
-                    if not replayable:
-                        raise weights._recovery_unavailable(f"{name}.decode") from exc
                     need = _requested(exc) if host else -1
                 # outside `except`, so the failed step's frames are gone
                 accel.release_cached(weights.torch, weights.kind)
@@ -3816,23 +3830,12 @@ class WeightResidency:
         module whose block regions the body binds itself)."""
         component = self.components[name]
         regions = {id(region.module): region for region in component.blocks}
-        replay = _DECODER_PASS if self._decoder_replayable(name) else None
 
         def within(module: object, body: Callable[[], Any]) -> Any:
             region = regions.get(id(module))
-            return (
-                body() if region is None else self._block(component, region, body, _replay=replay)()
-            )
+            return body() if region is None else self._block(component, region, body)()
 
         return within
-
-    def _decoder_replayable(self, name: str) -> bool:
-        originals = {
-            id(module): forward
-            for module, _had, forward, hook in self.hooks.get(name, [])
-            if module.forward is hook
-        }
-        return image_vae._replayable(self.components[name].root, originals)
 
     def unpark(self) -> None:
         """Close a repeating stage left open: another stage, an attempt's end, or a budget
@@ -4042,6 +4045,18 @@ def _device_pool(exc: BaseException) -> bool:
     if pool is not None:
         return bool(pool == "device")
     return str(exc).startswith("budget exceeded in device")
+
+
+def _versions(args: tuple[Any, ...], kwargs: Mapping[str, Any]) -> tuple[int, ...]:
+    """In-place mutation counters of the block's tensor inputs (one level deep). Inference
+    tensors keep none; a block under `inference_mode` re-runs unchecked (retry the op)."""
+    out: list[int] = []
+    for value in (*args, *kwargs.values()):
+        for item in value if isinstance(value, (tuple, list)) else (value,):
+            inference = getattr(item, "is_inference", None)
+            if inference is not None and not inference():
+                out.append(int(item._version))
+    return tuple(out)
 
 
 def _requested(exc: BaseException) -> int:

@@ -1,59 +1,27 @@
-# Recovery after an operation has started
+# Recovery after running out of device memory
 
-Tracker #327; Runtime PR #1202. Base 50af76dd. Owner: Codex Runtime memory lane.
+Owner, 2026-10-05: "I want processes to succeed and be resistant to changes, not fail."
 
-A successful call and a lease refusal before a forward starts keep their existing
-behavior. An arbitrary Python forward does not run again after it starts. Tensor
-inputs being unchanged says nothing about its counters, buffers or RNG.
+- **An op that runs out of memory** makes room (idle tenants and weights leave, maps page to
+  the host, the grain gets finer) and runs again. It starts again from what it read: the
+  generator state of a seeded op and the content of the tensors it writes into are put back
+  first.
+- **An out-of-memory that escapes a block's ops** (a library's own allocation) makes room and
+  runs the whole block again from the state it started with:
+  - The first run of each block is observed. It records whether the forward writes into
+    tensors that existed before it (its inputs, its buffers, anything held elsewhere) and
+    which generators its seeded ops draw from.
+  - A block that writes nothing outside itself then runs unobserved. Only its generators
+    are kept, for a second run.
+  - A block that writes runs observed. The first content of every tensor it writes into is
+    kept, and put back before it runs again.
+- **Not seen:** a plain Python attribute a forward changes, such as a counter on a module.
+  A replay advances it once more. A module where that matters is handled by name, never
+  by refusing replays.
+- **A call fails only when nothing can make progress:** no room can be made even at the
+  finest grain. It reports the measured shortfall, with the state its blocks found put back,
+  so the executor serves the next call. A block shared by a GPU group cannot run again
+  alone; its ops still recover one by one.
 
-An OOM or library allocation refusal escaping such a forward reports
-`recovery_contract_unavailable`, without a capacity shortfall. The residency is
-poisoned. The existing Executor consumer reports poison and refuses a subsequent
-load as `poisoned_generation`; an explicit new attempt uses a fresh generation.
-No started request is automatically submitted again.
-
-Functional operator recovery uses a private list of native `aten` families, with
-mutable overloads, seeded RNG and tensor subclasses excluded. A custom namespace
-receives no authority from a read-only schema. The list covers allocation,
-arithmetic, reduction, linear/convolution, normalization and inference attention;
-an unlisted operator succeeds normally but cannot replay after an allocation
-failure. Fused attention carrying a seeded-RNG tag remains excluded even when a
-particular call might disable dropout. This is deliberately conservative.
-
-The only whole-body token is private to SDK image decoder passes. It requires the
-existing mirrored Diffusers source/branch check, the explicit native leaf set,
-native forwards behind the residency's own currently installed weight hooks, no
-custom/global hooks or compiled call replacement, and standard stateless attention
-processors, including the post-quant convolution before the decoder. Custom
-decoder calls remain valid; they receive no whole-pass token.
-The outer failed-step retry uses the same check, including steps without a block
-region. No generic pure annotation, state snapshot or input-mutation inference is
-used. Module/Python state is never rolled back.
-
-**Confirmed CPU:** the actual production wrapper's former three red cases now
-stop after one failing counter/buffer/RNG forward. Observed state matches one
-control execution; inputs remain exact, leases balance and no room action occurs.
-Mutable, RNG and custom operator failures also execute once. A real native linear
-operator retries within one Python forward and returns the control tensor.
-Before-forward acquisition recovery still makes room and executes the body once.
-The real tiny Diffusers SDK pass retries after its output writes and returns the
-uninterrupted decode tensor exactly. Custom leaf/forward/hook/processor calls
-succeed with that tensor, then fail once when their callback advances state. The
-post-quant forward outside a decoder block has the same once-only failure proof.
-The real in-process Executor exposes the distinct error and poison, refuses reuse,
-and a fresh real Executor serves successfully.
-
-Evidence: `outputs/codex-block-replay-contract-20261005/proof-08.log` (42 passed),
-with the original red arm retained in `proof-01.log`. Leases and allocator/room I/O
-are controlled CPU boundaries over a real CPU plane and real tensors. This proves
-control flow and tensor equality for these cases, not physical CUDA OOM, complete
-model inference or image equality across memory regimes. Supervised OS replacement
-remains unrun here: the cgroup mount is read-only. No GPU or rental was used.
-
-Full static gates remain red on the untouched base and this candidate: the same
-51 mypy errors in the same 10 files, and the same two architecture fences
-(`author/_calls.py` imports internal code; `Any` count 995 exceeds the limit 830).
-No type error or `Any` use was added. CI bug-class Ruff and changed-file Ruff pass.
-`FINAL-STATIC-SUMMARY.json` retains the matched base/candidate comparison, using
-fresh same-lock Python environments; this is a recorded baseline failure, not a
-successful full static check. No unrelated source was changed to hide these gates.
+Tests: `tests/test_block_replay_contract.py`, `tests/test_recovery_exhaustion.py` (CPU) and
+the weight plane's GPU tests.
