@@ -90,4 +90,4 @@ def test_oversized_valid_adapter_launch_refuses_before_preparation(tmp_path: Pat
     response = child(command + b" " * (MAX_BYTES + 1 - len(command)))
     assert response.returncode == 0, response.stderr.decode()
     assert msgspec.json.decode(response.stdout, type=Refused).code == "native_step_bound"
-    assert store.derived_lookup(identity) is None
+    assert store.derived_lookup(identity)["state"] == "absent"
