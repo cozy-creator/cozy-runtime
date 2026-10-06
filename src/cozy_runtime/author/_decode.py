@@ -512,6 +512,10 @@ class _VideoStreamDecoder:
             _positive_fraction(rate, "video average rate") if rate is not None else None
         )
         ratio = stream.sample_aspect_ratio
+        # FFmpeg's unset sample-aspect ratio is 0/1. Providers may expose that
+        # exact Rational sentinel rather than None; both mean square pixels.
+        if isinstance(ratio, Rational) and ratio.numerator == 0 and ratio.denominator == 1:
+            ratio = None
         self._pixel_aspect_ratio = (
             _positive_fraction(ratio, "video pixel aspect ratio")
             if ratio is not None
@@ -1472,7 +1476,18 @@ _PURE_DISPLAY_MATRICES = {
 
 def _display_rotation(frame: Any) -> int:
     try:
-        matrices = [side for side in frame.side_data if side.type.name == "DISPLAYMATRIX"]
+        matrices = []
+        index = 0
+        # Positional access exposes every side-data entry, including duplicate types;
+        # mapping iteration can return keys or collapse duplicate display matrices.
+        while True:
+            try:
+                side = frame.side_data[index]
+            except IndexError:
+                break
+            if side.type.name == "DISPLAYMATRIX":
+                matrices.append(side)
+            index += 1
     except ValueError as exc:
         # PyAV 18.1 cannot represent some FFmpeg side-data enums (notably EXIF display
         # transforms). Accepting only frame.rotation would silently discard mirror state.

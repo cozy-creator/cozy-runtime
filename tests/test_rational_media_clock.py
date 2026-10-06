@@ -47,7 +47,10 @@ def inspect_clip(payload: Request, decoder: MediaDecoder) -> Summary:
     )
 
 
-def test_actual_encoded_video_and_audio_clock_reaches_author_decoder(tmp_path: Path) -> None:
+@pytest.mark.parametrize("declared_aspect", [False, True])
+def test_actual_encoded_video_and_audio_clock_reaches_author_decoder(
+    tmp_path: Path, declared_aspect: bool
+) -> None:
     source = tmp_path / "clock.mp4"
     with av.open(str(source), "w", format="mp4") as container:
         video = container.add_stream("libx264", rate=24)
@@ -58,6 +61,8 @@ def test_actual_encoded_video_and_audio_clock_reaches_author_decoder(tmp_path: P
         video.codec_context.color_trc = 1
         video.codec_context.colorspace = 1
         video.codec_context.color_range = 1
+        if declared_aspect:
+            video.codec_context.sample_aspect_ratio = Fraction(1, 1)
         audio = container.add_stream("aac", rate=32000)
         audio.codec_context.thread_count = 1
         audio.codec_context.layout = "mono"
