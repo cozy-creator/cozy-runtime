@@ -1,0 +1,1 @@
+Static describe reads a published callee package's types from the exact wheel the project's `uv.lock` pins: fetched through the egress boundary by its URL and sha256 when a type needs it, unpacked as files and read statically (cr-114). Describing a caller never needs `--environment-python` for its callees.

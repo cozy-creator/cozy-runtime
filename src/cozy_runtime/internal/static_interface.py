@@ -40,6 +40,7 @@ import msgspec
 
 import cozy_runtime
 import cozy_runtime.internal.invocable_interface as invocable_interface
+import cozy_runtime.internal.locked_sources as locked
 import cozy_runtime.internal.package_interface as package_interface
 import cozy_runtime.internal.static_invocable as static_invocable
 from cozy_runtime import author
@@ -272,10 +273,18 @@ class ModelSpec:
 class Reader:
     """One package tree, read lazily. Every method resolves by NAME, never by execution."""
 
-    def __init__(self, project: Path, *, dependency_roots: Sequence[Path] = ()) -> None:
+    def __init__(
+        self,
+        project: Path,
+        *,
+        dependency_roots: Sequence[Path] = (),
+        wheels: Mapping[str, locked.LockedWheel] | None = None,
+    ) -> None:
         self.project = project
         self.project_roots = (project / "src", project)
         self.roots = (*self.project_roots, *dependency_roots)
+        #: published callees, read from the wheels the project's uv.lock pins when needed
+        self.wheels = locked.Wheels(wheels or {})
         self.runtime_root = Path(cozy_runtime.__file__).resolve().parent.parent
         self.installed = _installed_packages(_site_packages(self.runtime_root))
         self.modules: dict[str, Module] = {}
@@ -303,6 +312,8 @@ class Reader:
             # `trusted` is the same rule cozy_runtime.derive gets: followed for types and
             # constants, never scanned for registrations.
             return self._load(name, sibling[0], sibling[1], True)
+        if not trusted and self._fetched(parts[0]):
+            return self.module(name, where=where)
         detail = f"module {name!r} is not a file under {' or '.join(str(r) for r in roots)}"
         if where is not None:
             self.refuse(where[0], where[1], detail, "static_module")
@@ -335,6 +346,17 @@ class Reader:
                 ):
                     return path, is_package
         return None
+
+    def _fetched(self, top: str) -> bool:
+        """A published callee package, unpacked from the exact wheel the project's uv.lock
+        pins for `top` and followed as a dependency root. False: nothing pinned for it."""
+        try:
+            root = self.wheels.root(top)
+        except locked.LockedSourceRefusal as exc:
+            raise StaticRefusal(str(exc), code="static_module") from exc
+        if root is not None:
+            self.roots = (*self.roots, root)
+        return root is not None
 
     def application_module(self, name: str) -> Module:
         """The configured module, with the package `__init__`s Python would run first."""
@@ -392,7 +414,7 @@ class Reader:
         for root in self.roots:
             if (root / top).is_dir() or (root / f"{top}.py").is_file():
                 return {top}
-        return {top} if self._installed((top,)) is not None else set()
+        return {top} if self._installed((top,)) is not None or self._fetched(top) else set()
 
     def _import_base(self, module: Module, stmt: ast.ImportFrom) -> str | None:
         if stmt.level == 0:
@@ -1150,33 +1172,12 @@ def build(project: Path, *, environment_python: Path | None = None) -> dict[str,
     """The package interface from source alone. Executes nothing of the package."""
     project = project.resolve()
     application = read_application(project)
-    roots = (*environment_roots(environment_python, project=project), *locked_sources(project))
-    reader = Reader(project, dependency_roots=roots)
+    # A callee package is read as source too: a local one from the directory the project's
+    # uv.lock names, a published one from the exact wheel it pins (cr-114).
+    pinned = locked.read(project)
+    roots = (*environment_roots(environment_python, project=project), *pinned.roots)
+    reader = Reader(project, dependency_roots=roots, wheels=pinned.wheels)
     return _build(reader, application, read_table(project / "package.toml"))
-
-
-def locked_sources(project: Path) -> tuple[Path, ...]:
-    """The source trees of the local packages the project's `uv.lock` pins (its `directory`
-    and `editable` sources, the project itself aside): a callee package's types are read
-    from there as from an installed one (cr-114). Reading the lock is reading TOML; nothing
-    is built, installed or run."""
-    lock = project / "uv.lock"
-    try:
-        if not lock.is_file() or lock.stat().st_size > 16 << 20:
-            return ()
-        packages = tomllib.loads(lock.read_text()).get("package", [])
-    except (OSError, tomllib.TOMLDecodeError):
-        return ()
-    roots: list[Path] = []
-    for row in packages if isinstance(packages, list) else ():
-        source = row.get("source") if isinstance(row, dict) else None
-        where = (source or {}).get("directory") or (source or {}).get("editable")
-        if not isinstance(where, str):
-            continue
-        tree = (project / where).resolve()
-        if tree != project and tree.is_dir():
-            roots += [tree / "src", tree]
-    return tuple(dict.fromkeys(root for root in roots if root.is_dir()))
 
 
 def build_builtin(name: str) -> dict[str, Json]:
