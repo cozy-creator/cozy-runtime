@@ -10,12 +10,17 @@ once the fixture is installed. Refusal arms plant one construct outside the voca
 
 from __future__ import annotations
 
+import functools
+import hashlib
+import http.server
 import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import zipfile
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -206,6 +211,87 @@ def test_a_callers_signature_reads_its_callee_packages_types_from_the_locked_sou
     refusal = _refusal(project)
     assert refusal.code == "static_unresolvable"
     assert "label_child.Result is outside the closed vocabulary" in str(refusal)
+
+
+def _wheel(path: Path, name: str, module: str, source: str) -> str:
+    """A pure cozy-package wheel at `path`; its sha256."""
+    info = f"{module}-0.1.0.dist-info"
+    files = {
+        f"{module}/__init__.py": source,
+        f"{info}/METADATA": f"Metadata-Version: 2.1\nName: {name}\nVersion: 0.1.0\n",
+        f"{info}/WHEEL": "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+        f"{info}/entry_points.txt": f"[cozy.application]\ndefault = {module}:app\n",
+    }
+    record = "".join(f"{file},,\n" for file in files) + f"{info}/RECORD,,\n"
+    with zipfile.ZipFile(path, "w") as archive:
+        for file, text in {**files, f"{info}/RECORD": record}.items():
+            archive.writestr(file, text)
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_a_published_callees_types_are_read_from_the_wheel_its_lock_pins(tmp_path: Path) -> None:
+    """cr-114, a published callee: the caller's uv.lock pins it from an index by URL and
+    sha256. The reader fetches exactly that wheel and reads its source as files, so describing
+    never needs the callee installed. A wheel whose bytes are not the pinned ones is refused."""
+    uv = shutil.which("uv")
+    if uv is None:
+        pytest.skip("uv locks the caller")
+    index = tmp_path / "index"
+    (index / "files").mkdir(parents=True)
+    (index / "simple" / "labelled-remote").mkdir(parents=True)
+    filename = "labelled_remote-0.1.0-py3-none-any.whl"
+    digest = _wheel(
+        index / "files" / filename,
+        "labelled-remote",
+        "labelled_remote",
+        "import msgspec\n"
+        "from cozy_runtime.author import App, Context, invocable\n"
+        "class Result(msgspec.Struct):\n"
+        "    labels: list[str]\n"
+        "    fidelity: str = 'high'\n"
+        "@invocable\n"
+        "async def inspect(ctx: Context, *, count: int) -> Result:\n"
+        "    return Result([str(count)])\n"
+        "app = App()\n"
+        "app.job(inspect)\n",
+    )
+    (index / "simple" / "labelled-remote" / "index.html").write_text(
+        f'<a href="/files/{filename}#sha256={digest}">{filename}</a>\n'
+    )
+    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(index))
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        project = tmp_path / "parent"
+        project.mkdir()
+        (project / "pyproject.toml").write_text(
+            '[project]\nname = "labelled-parent"\nversion = "0.1.0"\n'
+            'requires-python = ">=3.12"\ndependencies = ["labelled-remote"]\n'
+            f'[[tool.uv.index]]\nname = "local"\n'
+            f'url = "http://127.0.0.1:{server.server_port}/simple/"\ndefault = true\n'
+        )
+        (project / "package.toml").write_text('[application]\nobject = "label_parent:app"\n')
+        (project / "label_parent.py").write_text(
+            "from cozy_runtime.author import App, Context, invocable\n"
+            "from labelled_remote import Result, inspect\n"
+            "@invocable\n"
+            "async def run(ctx: Context, *, count: int) -> Result:\n"
+            "    return await inspect(count=count)\n"
+            "app = App()\n"
+            "app.job(run)\n"
+        )
+        _run(uv, "lock", "--no-progress", cwd=project)
+        assert f"sha256:{digest}" in (project / "uv.lock").read_text()
+        (job,) = static_interface.build(project)["jobs"]
+        assert job["name"] == "run" and '"labels"' in json.dumps(job)
+        assert '"fidelity"' in json.dumps(job)
+
+        (index / "files" / filename).write_bytes(b"not the pinned wheel")
+        refusal = _refusal(project)
+        assert refusal.code == "static_module"
+        assert "labelled-remote: the wheel its uv.lock pins" in str(refusal)
+    finally:
+        server.shutdown()
 
 
 def test_refuses_a_computed_decorator_argument(tmp_path: Path) -> None:

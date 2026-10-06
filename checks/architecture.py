@@ -667,6 +667,9 @@ STATIC_READER_IMPORTS = frozenset(
         "cozy_runtime.internal.static_interface",
         "cozy_runtime.internal.static_invocable",
         "cozy_runtime.internal.invocable_interface",
+        # reads uv.lock and fetches the exact wheels it pins through egress; builds, installs
+        # and imports nothing
+        "cozy_runtime.internal.locked_sources",
     }
 )
 
