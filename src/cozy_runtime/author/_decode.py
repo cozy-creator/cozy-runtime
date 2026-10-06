@@ -1548,6 +1548,8 @@ def _required_stream(kind: str, count: int) -> None:
 def _fraction(value: object, what: str) -> Fraction:
     try:
         if isinstance(value, Rational):
+            if value.denominator == 0:
+                raise ZeroDivisionError("undefined rational clock")
             return Fraction(value)
         if isinstance(value, int | float | str):
             return Fraction(value)
