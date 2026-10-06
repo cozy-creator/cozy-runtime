@@ -631,7 +631,8 @@ def test_weights_mapped_ahead_leave_the_first_stage_nothing_to_copy(card: Any) -
     resident = weights.resident_bytes(cold.residency.components["stack"])
     ahead = load(weights, card.checkpoint, "ahead")
     before = weights.facts().h2d_bytes
-    assert ahead.residency.map_ahead() == resident > 0
+    spans = sum(region.span for region in ahead.residency.components["stack"].regions)
+    assert ahead.residency.map_ahead() == (spans, True) and resident > 0
     arrived = weights.facts().h2d_bytes
     assert arrived - before >= resident
     assert same(expected, run(ahead, x, passes=1))
@@ -639,6 +640,11 @@ def test_weights_mapped_ahead_leave_the_first_stage_nothing_to_copy(card: Any) -
     assert facts.h2d_bytes == arrived
     assert weights_module.MAPPING not in weights.activation
     assert weights_module.MAPPING not in facts.plan_inputs
+    # A budget that holds only part of the weights maps that part, and says so.
+    weights.set_budget(tight(ahead))
+    partial = load(weights, card.checkpoint, "partial")
+    held, complete = partial.residency.map_ahead()
+    assert 0 < held < spans and not complete
 
 
 @on_card
