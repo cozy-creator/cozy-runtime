@@ -185,10 +185,10 @@ class NativeExecution:
                 return self.broker.handle(self.attempt, message)
 
             answer, handoff = respond(frame, handle)
+            assert handoff is None or isinstance(handoff, socket.socket)
             try:
                 owner.send(answer)
                 if handoff is not None:
-                    assert isinstance(handoff, socket.socket)
                     owner.send_descriptor(handoff)
             finally:
                 if handoff is not None:
