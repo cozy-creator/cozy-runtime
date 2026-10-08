@@ -53,6 +53,7 @@ def test_bounded_real_cpu_trace_keeps_request_outputs_and_removes_hooks(detailed
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     facts = json.loads(summary)
     assert facts["record_shapes_and_memory"] is detailed
+    assert facts["events"] and facts["operator_aggregation"] == "key_averages"
     assert len(facts["steps"]) == 8
     assert facts["profiled_step_indices"] == [3, 4]
     assert all(row["plane_delta"] == {} for row in facts["steps"])  # no invented GPU facts
@@ -198,6 +199,7 @@ def test_continuous_trace_covers_preparation_all_steps_and_decode_without_math_c
     torch.testing.assert_close(got, expected, rtol=0, atol=0)
     summary, trace = json.loads(raw), json.loads(gzip.decompress(packed))
     assert summary["full_request_trace"] and not summary["record_shapes_and_memory"]
+    assert summary["events"] == [] and summary["operator_aggregation"] == "offline from raw trace"
     assert summary["profiled_step_indices"] == list(range(step_count))
     events = trace["traceEvents"]
     names = {event.get("name") for event in events}

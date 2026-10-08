@@ -246,6 +246,11 @@ def record_request(
             trace, sizes = retain_trace_file(path, trace_sink)
             traces.append(trace)
             trace_sizes.append(sizes)
+        if full_request_trace:
+            # The raw trace is authoritative and the streaming offline reader owns
+            # aggregation. key_averages constructs Python FunctionEvents for the
+            # entire CPU trace, adding another large memory peak after file export.
+            return
         for event in prof.key_averages(group_by_input_shape=detailed):
             averages.append(
                 {
@@ -367,6 +372,7 @@ def record_request(
         "pre_handler_construction_and_warmup_in_trace": False,
         "steps": steps,
         "events": averages,
+        "operator_aggregation": "offline from raw trace" if full_request_trace else "key_averages",
         "render_call": {
             "wall_ms": render_wall_ms,
             "profiler_context_wall_ms": (time.perf_counter() - profile_began) * 1000,
