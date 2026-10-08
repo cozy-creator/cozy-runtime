@@ -263,6 +263,7 @@ def compare(seed, warmup, repeats, trace_path):
                     "SHARED_QKV_PATCH_COMMIT",
                     "BOUNDED_ROWWISE_GEMM_PATCH_COMMIT",
                     "LORA_BAKE_DEAD_WORK_PATCH_COMMIT",
+                    "LORA_NATIVE_DECODE_PATCH_COMMIT",
                 )
             },
         },
