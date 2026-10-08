@@ -1,11 +1,11 @@
-"""The substitution map for the fused glue (h3a-015): diffusers 0.40 modules -> fused ones.
+"""The substitution map for the fused glue (h3a-015): supported Diffusers H3 modules -> fused ones.
 
 Applied after fill, like `anima_optimization.py`: parameters, buffers, state-dict keys and
-storage identity are invariants (re-censused after the swap), and the diffusers sources
-being replaced are pinned by digest so a patched or upgraded diffusers refuses rather than
-runs a fused forward beside an eager forward it no longer matches. The swap itself is a
-class substitution — each module's `__class__` becomes the fused subclass that overrides
-`forward` and nothing else — so the map is data: `(path, was, now)` per site.
+storage identity are invariants (re-censused after the swap). Compatibility is the callable
+and module topology contract consumed by the plan, not upstream source formatting or
+annotations. Numerical agreement is exercised against supported Diffusers releases.
+The swap itself is a class substitution: each module's `__class__` becomes the fused
+subclass that overrides `forward` and nothing else. The map records `(path, was, now)` per site.
 
 fp8 epilogues are chosen per site from what the fill actually installed: a site whose every
 consumer is a `fp8-rowwise/1` encoded leaf gets the quantizing epilogue and hands the leaf
@@ -29,6 +29,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import logging
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from importlib import metadata
@@ -37,6 +38,7 @@ from typing import Any
 from cozy_runtime.internal import fusion
 
 try:
+    import torch
     from diffusers.models.activations import SwiGLU
     from diffusers.models.attention import FeedForward
     from diffusers.models.attention_dispatch import dispatch_attention_fn
@@ -51,18 +53,8 @@ except ImportError as _absent:  # pragma: no cover - exercised by the typed refu
 else:
     DIFFUSERS_ABSENT = ""
 
-DIFFUSERS_VERSION = "0.40.0"
-_SOURCE_DIGESTS = {
-    "MiniMaxH3TransformerBlock.forward": (
-        "ca6d9ca44871d0ed10fceaa4eecd184a7ac907cbd3e3b8fd9f761b91598a944d"
-    ),
-    "MiniMaxH3AttnProcessor.__call__": (
-        "0db0e6aa98d226a24f88079b97abb3f546b7af5f81f5fad19d6e35336a0638d4"
-    ),
-    "_apply_rotary_emb": "897848a7dac3aed2d8906bdb9c71b0f3f4bcd321fe39ecbd47b67a7203ae7604",
-    "SwiGLU.forward": "c229f3514b2da3ce3c0e81a9fdb79c510a0665dcb73cb6cc61d1e6c58cf7aa19",
-    "FeedForward.forward": "dae2c9f53987c25ad38cacbeafb54bd72d4b780ab9772413b559a0a94c3c7058",
-}
+CONTRACT = "h3-glue-call-and-topology/2"
+_LOG = logging.getLogger(__name__)
 ROWWISE_LEAF = "cozy.fp8-rowwise.native-leaf/1"
 #: The codes a consenting package serves eager past; anything else is breakage and refuses.
 #: Closed on purpose: a new code is a decision, not a default.
@@ -72,7 +64,8 @@ NOT_INSTALLABLE = frozenset(
         "fusion_kernels_failed",
         "fusion_triton_absent",
         "fusion_dependency_absent",
-        "fusion_source_mismatch",
+        "fusion_contract_unsupported",
+        "fusion_block_shape",
     }
 )
 
@@ -126,16 +119,10 @@ def _type_name(value: object) -> str:
     return f"{cls.__module__}:{cls.__qualname__}"
 
 
-def _source_digest(value: Callable[..., object]) -> str:
-    return hashlib.sha256(inspect.getsource(value).encode()).hexdigest()
-
-
 def identity() -> str:
     document = {
-        "diffusers": DIFFUSERS_VERSION,
         "kernels": fusion.source_digest() if not fusion.TRITON_ABSENT else "",
-        "plan": "h3-glue-fusion/1",
-        "sources": _SOURCE_DIGESTS,
+        "plan": CONTRACT,
     }
     return (
         "sha256:"
@@ -146,7 +133,24 @@ def identity() -> str:
     )
 
 
-def _require_sources() -> None:
+def _require_call(function: Callable[..., object], parameters: tuple[str, ...]) -> None:
+    """Validate the inputs this plan substitutes; annotations are not an ABI.
+
+    Positional inputs must keep their names and order. Additional optional inputs are
+    harmless; additional required inputs or reordered inputs cannot use this forward.
+    """
+    try:
+        signature = inspect.signature(function)
+        bound = signature.bind(*(object() for _ in parameters))
+        if tuple(bound.arguments) != parameters:
+            raise TypeError(f"expected positional inputs {parameters}")
+    except (TypeError, ValueError) as exc:
+        raise FusionRefusal(
+            "fusion_contract_unsupported", f"{function.__qualname__}: {exc}"
+        ) from exc
+
+
+def _require_capabilities() -> None:
     if DIFFUSERS_ABSENT:
         raise FusionRefusal("fusion_dependency_absent", DIFFUSERS_ABSENT)
     try:
@@ -155,23 +159,26 @@ def _require_sources() -> None:
         raise FusionRefusal(
             "fusion_dependency_absent", "diffusers is required by the fused glue plan"
         ) from exc
-    # The capability is the exact source of the replaced forwards, checked below; any
-    # Diffusers release that keeps those sources byte-identical is fusable.
-    sources: dict[str, Callable[..., object]] = {
-        "MiniMaxH3TransformerBlock.forward": MiniMaxH3TransformerBlock.forward,
-        "MiniMaxH3AttnProcessor.__call__": MiniMaxH3AttnProcessor.__call__,
-        "_apply_rotary_emb": _apply_rotary_emb,
-        "SwiGLU.forward": SwiGLU.forward,
-        "FeedForward.forward": FeedForward.forward,
-    }
-    for name, source in sources.items():
-        actual = _source_digest(source)
-        if actual != _SOURCE_DIGESTS[name]:
-            raise FusionRefusal(
-                "fusion_source_mismatch",
-                f"{name} has source sha256:{actual}, expected sha256:{_SOURCE_DIGESTS[name]}; "
-                "refusing to fuse beside a diffusers source the kernels were not matched to",
-            )
+    _require_call(
+        MiniMaxH3TransformerBlock.forward,
+        ("self", "hidden_states", "temb", "adaln_indices", "rotary_emb", "attention_mask"),
+    )
+    _require_call(
+        MiniMaxH3AttnProcessor.__call__,
+        ("self", "attn", "hidden_states", "rotary_emb", "attention_mask"),
+    )
+    _require_call(_apply_rotary_emb, ("hidden_states", "cos", "sin"))
+    _require_call(SwiGLU.forward, ("self", "hidden_states"))
+    _require_call(FeedForward.forward, ("self", "hidden_states"))
+
+
+def _record(model: object, result: AppliedFusion) -> AppliedFusion:
+    document = result.document()
+    if hasattr(model, "__dict__"):
+        vars(model)["_cozy_fusion_report"] = document
+    log = _LOG.info if result.applied else _LOG.warning
+    log("H3 glue fusion: %s", json.dumps(document, sort_keys=True))
+    return result
 
 
 # ------------------------------------------------------------------ fused modules
@@ -281,32 +288,59 @@ def _shape(condition: bool, detail: str) -> None:
         raise FusionRefusal("fusion_block_shape", detail)
 
 
-def _install_transformer(transformer: Any, root: str) -> tuple[list[tuple[str, str, str]], int]:
+def _validate_transformer(transformer: Any, root: str) -> None:
     _shape(
-        type(transformer).forward is MiniMaxH3Transformer3DModel.forward,
+        type(transformer).forward is MiniMaxH3Transformer3DModel.forward
+        and "forward" not in vars(transformer),
         f"{root}: {_type_name(transformer)} overrides the Diffusers MiniMax-H3 forward",
     )
-    substitutions: list[tuple[str, str, str]] = []
-    fp8_sites = 0
     for index, block in enumerate(transformer.transformer_blocks):
         path = f"{root}.transformer_blocks.{index}"
         attn, ff = block.attn, block.ff
         _shape(
             type(block) is MiniMaxH3TransformerBlock
+            and "forward" not in vars(block)
             and type(attn.processor) is MiniMaxH3AttnProcessor
             and not attn.fused_projections
             and type(ff) is FeedForward
+            and "forward" not in vars(ff)
             and len(ff.net) == 3
             and type(ff.net[0]) is SwiGLU
-            and type(ff.net[1]).__name__ == "Dropout"
+            and "forward" not in vars(ff.net[0])
+            and type(ff.net[0].activation) is torch.nn.SiLU
+            and type(ff.net[1]) is torch.nn.Dropout
             and ff.net[1].p == 0.0
+            and not any(
+                m._forward_hooks or m._forward_pre_hooks
+                for m in (
+                    ff,
+                    ff.net,
+                    ff.net[1],
+                    ff.net[0].activation,
+                    block.norm1,
+                    block.norm2,
+                    attn.norm_q,
+                    attn.norm_k,
+                )
+            )
+            and all(
+                type(m) is torch.nn.RMSNorm and "forward" not in vars(m)
+                for m in (block.norm1, block.norm2, attn.norm_q, attn.norm_k)
+            )
             and block.norm1.weight is not None
             and block.norm2.weight is not None
             and attn.norm_q.weight is not None
             and attn.norm_k.weight is not None,
-            f"{path} is not the MiniMax-H3 block shape the fused plan was matched to "
-            f"(Diffusers {DIFFUSERS_VERSION} sources)",
+            f"{path} is not the MiniMax-H3 block shape the fused plan was matched to ({CONTRACT})",
         )
+
+
+def _install_transformer(transformer: Any, root: str) -> tuple[list[tuple[str, str, str]], int]:
+    substitutions: list[tuple[str, str, str]] = []
+    fp8_sites = 0
+    for index, block in enumerate(transformer.transformer_blocks):
+        path = f"{root}.transformer_blocks.{index}"
+        attn, ff = block.attn, block.ff
         attn_fp8 = all(_rowwise_leaf(m) for m in (attn.to_q, attn.to_k, attn.to_v))
         ff_fp8 = _rowwise_leaf(ff.net[0].proj)
         out_fp8 = _rowwise_leaf(ff.net[2])
@@ -369,20 +403,25 @@ def apply_fusion_plan(
     """
     reason = capability_refusal(torch, device)
     if reason:
-        return AppliedFusion(identity(), False, reason, (), 0, 0.0, "fusion_device_incapable")
+        return _record(
+            model, AppliedFusion(identity(), False, reason, (), 0, 0.0, "fusion_device_incapable")
+        )
     try:
-        _require_sources()
+        _require_capabilities()
+        transformers = tuple(_transformers(model))
+        for name, transformer in transformers:
+            _validate_transformer(transformer, name)
         fusion.load(device)
     except (fusion.FusionUnavailable, FusionRefusal) as exc:
         if required or exc.code not in NOT_INSTALLABLE:
             raise FusionRefusal(exc.code, str(exc)) from exc
         # NOTHING HAS BEEN SUBSTITUTED: the eager model serves, and the code rides the
         # prepare's `execution_fusion` fact and the session's boot line.
-        return AppliedFusion(identity(), False, str(exc), (), 0, 0.0, exc.code)
+        return _record(model, AppliedFusion(identity(), False, str(exc), (), 0, 0.0, exc.code))
     substitutions: list[tuple[str, str, str]] = []
     fp8_sites = 0
     warm_ms = 0.0
-    for name, transformer in _transformers(model):
+    for name, transformer in transformers:
         before = _tensor_census(transformer)
         installed, sites = _install_transformer(transformer, name)
         if _tensor_census(transformer) != before:
@@ -408,13 +447,18 @@ def apply_fusion_plan(
             # width no profile compiled refuses whatever the consent said.
             raise FusionRefusal(exc.code, str(exc)) from exc
     if not substitutions:
-        return AppliedFusion(
-            identity(),
-            False,
-            "the model holds no MiniMax-H3 transformer to fuse",
-            (),
-            0,
-            0.0,
-            "fusion_no_transformer",
+        return _record(
+            model,
+            AppliedFusion(
+                identity(),
+                False,
+                "the model holds no MiniMax-H3 transformer to fuse",
+                (),
+                0,
+                0.0,
+                "fusion_no_transformer",
+            ),
         )
-    return AppliedFusion(identity(), True, "", tuple(substitutions), fp8_sites, warm_ms)
+    return _record(
+        model, AppliedFusion(identity(), True, "", tuple(substitutions), fp8_sites, warm_ms)
+    )
