@@ -1,2 +1,2 @@
-name = "h3-sage3-lifetimes"
-version = "0.0.1"
+[application]
+object = "h3_sage3_lifetimes:app"
