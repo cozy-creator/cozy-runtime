@@ -188,8 +188,9 @@ def prefetch(
     Runtime sends the hint to TensorD, which controls preparation and can ask a Runtime
     executor to construct/load a model on a GPU. The callable's inference is not invoked.
     Acknowledgment does not promise readiness; the later call resolves its own inputs.
-    Current TensorD uses the callable/parent bindings and does not consume this hint's
-    optional models payload. Model overrides must also be passed to the actual call.
+    Explicit models select the same declared slots as an ordinary child call; omitted
+    or None choices retain inherited bindings/defaults. Pass overrides to the actual
+    call too: older owners may decline the hint or ignore its choices.
     """
     broker = _current.get()
     if broker is None or broker.closed or broker.context is None:
