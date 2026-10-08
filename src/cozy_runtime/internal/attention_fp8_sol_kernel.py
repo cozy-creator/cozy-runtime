@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# mypy: disable-error-code="no-untyped-def,untyped-decorator"
 """Experimental range-bounded FP8/F16 exact tiles within upstream Sol routing.
 
 Derived from TeleFuser f21457a92e92f4a7570f0cb6b445ee334f1072b0,
