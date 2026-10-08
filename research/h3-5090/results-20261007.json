@@ -1,5 +1,5 @@
 {
-  "updated_utc": "2026-10-08T08:30:08.155273+00:00",
+  "updated_utc": "2026-10-08T08:52:38.627088+00:00",
   "status": "completed_requested_benchmark_matrix",
   "request": {
     "requested_duration_s": 15,
@@ -648,10 +648,13 @@
     "explicit_endpoint_maintenance": "PR1131 installed; actual Taiwan Runtime update to.19+dev.sparsemath.93fcc636 passed with TensorFS.4 preserved and same-endpoint observe",
     "explicit_local_directory": "PR1132 installed; actual CPU endpoint upload/execution passed; package and lock stay unchanged; named refs still selected-Hub scoped",
     "external_rental_cleanup": "PR1133/1134 installed;explicit instance+label+stdin credential;null/404absence reconciled;exact ownedinstance54755137confirmedabsent throughCLI",
-    "local_pressure_fix": "Live with allocator/cache fixes on Runtime0.21.1+dev.gpujobs.80a723c/TensorFS0.6;retained0.21.1Python/kernel changespreserved;parent1682922 andservice1682924 both5ab168a7 afternormalCLIstop/start",
-    "local_delivery_evidence": "outputs/accelerator-job-backport-20261008/local-runtime211/live-verification.json",
+    "local_pressure_fix": "Current concurrent delivery Runtime0.21.1/TensorFS0.6.1,native0ae230f4 includes visibility,pressure,allocator,SDK-cache fixes;all10 fix-bearing sourcefiles unchanged fromreviewed80a723c;both liveprocessesb607fd94",
+    "local_delivery_evidence": "outputs/accelerator-job-backport-20261008/current-newer-live-fixes.json",
     "accelerator_job_fix": "PR161 merged;actualGPU parent\u2192CPU intermediary\u2192GPU child job4967 passed;FP8 numericaladmission4968passed on matched.19/.4cohort",
-    "local_source_sdk_cache": "PR163 merged/installed;identical-source SDK-switch regression failsbaseline andpassesfixedcode"
+    "local_source_sdk_cache": "PR163 merged/installed;identical-source SDK-switch regression failsbaseline andpassesfixedcode",
+    "local_runtime": "0.21.1",
+    "local_tensorfs": "0.6.1",
+    "local_native_revision": "0ae230f4316dfb9f73e538e4794a8c15173b8016"
   },
   "rental_cleanup": {
     "5090-1": "ended; provider GET404 and complete-list absence verified2026-10-08T03:56:02Z",
