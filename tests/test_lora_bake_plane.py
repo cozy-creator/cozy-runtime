@@ -54,7 +54,7 @@ def test_a_gpu_executor_bakes_a_prepared_graph_and_per_step_serves_it_unbaked(
 ) -> None:
     store, base, first, second = fixture(tmp_path)
     result, _ = compose(store, tmp_path, "baked", base, [(first, 0.5), (second, -0.25)])
-    checkpoint = Checkpoint(store.root, result.manifest.digest)
+    checkpoint = Checkpoint.from_store(store, result.manifest.digest)
     rows = checkpoint.rows("transformer")
     configs = tensorfs.parse_header(header(store, result))["configs"]
     artifact = lora_composition.bind(
@@ -196,7 +196,7 @@ def test_a_baked_fp8_projection_keeps_the_loras_effect(tmp_path: Path) -> None:
     store, base, adapter, (down, up) = _encoded_fixture(tmp_path)
     strength = 3.0
     result, _ = compose(store, tmp_path, "encoded-view", base, [(adapter, strength)])
-    checkpoint = Checkpoint(store.root, result.manifest.digest)
+    checkpoint = Checkpoint.from_store(store, result.manifest.digest)
     rows = checkpoint.rows("transformer")
     configs = tensorfs.parse_header(header(store, result))["configs"]
     artifact = lora_composition.bind(

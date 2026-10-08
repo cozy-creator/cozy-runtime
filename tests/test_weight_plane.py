@@ -121,7 +121,7 @@ def store_component(root: Path, name: str, values: dict[str, Any]) -> Checkpoint
         writer.add_part(name, key, "value", io.BytesIO(value.half().numpy().tobytes()))
     writer.add_config(name, io.BytesIO(b"{}"))
     receipt = writer.commit()
-    return Checkpoint(root / "store", "sha256:" + receipt["manifest"]["sha256"])
+    return Checkpoint.from_store(store, "sha256:" + receipt["manifest"]["sha256"])
 
 
 def load(

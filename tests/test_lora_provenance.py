@@ -51,7 +51,7 @@ def test_effective_checkpoint_and_source_keep_exact_admitted_base(tmp_path: Path
     registry = ModelRegistry(release="provenance-proof", substrate=lambda: torch.device("meta"))
 
     def construct(name: str, digest: str) -> TinyModel:
-        checkpoint = Checkpoint(store.root, digest)
+        checkpoint = Checkpoint.from_store(store, digest)
         bound = lora_composition.bind(
             Artifact(
                 base.manifest.digest, tensor_schema_of(checkpoint.rows("transformer")), Config({})

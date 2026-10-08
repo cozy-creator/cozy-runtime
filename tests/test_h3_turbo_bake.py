@@ -88,7 +88,7 @@ def _checkpoint(tmp_path: Path, dit: Any) -> Checkpoint:
         for key, value in dit.state_dict().items()
     }
     written = model(store, tmp_path, "dit", "fl2va_dit", tensors, b"{}")
-    return Checkpoint(store.root, written.manifest.digest)
+    return Checkpoint.from_store(store, written.manifest.digest)
 
 
 def _inputs(device: str) -> dict[str, Any]:

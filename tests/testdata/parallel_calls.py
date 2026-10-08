@@ -205,7 +205,7 @@ def plane_residency(root: Path, model: ModelCalls) -> PlaneBackend:
     for name, value in values.items():
         writer.add_part(name, "weight", "value", io.BytesIO(struct.pack("<f", value)))
     writer.add_config("model", io.BytesIO(b"{}"))
-    checkpoint = Checkpoint(root / "store", "sha256:" + writer.commit()["manifest"]["sha256"])
+    checkpoint = Checkpoint.from_store(store, "sha256:" + writer.commit()["manifest"]["sha256"])
     # Every rank's plane on the one card; without one, each rank computes in its host tier.
     on_card = torch.cuda.is_available()
     device = torch.device("cuda", 0) if on_card else torch.device("cpu")

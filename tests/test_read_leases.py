@@ -89,7 +89,7 @@ def test_four_components_of_one_snapshot_take_one_lease(store_root: Path, tmp_pa
     """The count that used to be four. It comes from the store, not from this file."""
     store = tensorfs.Store.open(str(store_root))
     manifest = _snapshot(store, tmp_path, b"vocab\n")
-    leases = fill.ReadLeases({name: fill.Checkpoint(store_root, manifest) for name in SDXL})
+    leases = fill.ReadLeases({name: fill.Checkpoint.from_store(store, manifest) for name in SDXL})
 
     for name in SDXL:
         leases.acquire(name)
@@ -102,7 +102,7 @@ def test_four_components_of_one_snapshot_take_one_lease(store_root: Path, tmp_pa
     # same snapshot leased for a single component rather than against a number written
     # here. Under the component key these read four times the truth, which is how an
     # artifact of 2,602 objects reported 10,408 leased.
-    alone = fill.ReadLeases({"unet": fill.Checkpoint(store_root, manifest)})
+    alone = fill.ReadLeases({"unet": fill.Checkpoint.from_store(store, manifest)})
     alone.acquire("unet")
     assert held["objects"] == alone.document()["objects"], (held, alone.document())
     assert held["bytes"] == alone.document()["bytes"], (held, alone.document())
@@ -121,14 +121,14 @@ def test_four_components_pin_no_more_descriptors_than_one(store_root: Path, tmp_
     store = tensorfs.Store.open(str(store_root))
     manifest = _snapshot(store, tmp_path, b"vocab\n")
 
-    alone = fill.ReadLeases({"unet": fill.Checkpoint(store_root, manifest)})
+    alone = fill.ReadLeases({"unet": fill.Checkpoint.from_store(store, manifest)})
     before = _open_descriptors()
     alone.acquire("unet")
     one_component = _open_descriptors() - before
     alone.release()
     assert one_component > 0, "a real lease pins descriptors; this store handed back none"
 
-    every = fill.ReadLeases({name: fill.Checkpoint(store_root, manifest) for name in SDXL})
+    every = fill.ReadLeases({name: fill.Checkpoint.from_store(store, manifest) for name in SDXL})
     before = _open_descriptors()
     for name in SDXL:
         every.acquire(name)
@@ -161,10 +161,10 @@ def test_a_component_per_snapshot_binding_still_takes_one_lease_each(
 
     leases = fill.ReadLeases(
         {
-            "text_encoder": fill.Checkpoint(store_root, first),
-            "text_encoder_2": fill.Checkpoint(store_root, first),
-            "unet": fill.Checkpoint(store_root, second),
-            "vae": fill.Checkpoint(store_root, second),
+            "text_encoder": fill.Checkpoint.from_store(store, first),
+            "text_encoder_2": fill.Checkpoint.from_store(store, first),
+            "unet": fill.Checkpoint.from_store(store, second),
+            "vae": fill.Checkpoint.from_store(store, second),
         }
     )
     for name in SDXL:
@@ -182,7 +182,7 @@ def test_an_unbound_component_is_a_typed_destination_refusal(
     """The refusal the map owed its caller survives the move off the backend."""
     store = tensorfs.Store.open(str(store_root))
     manifest = _snapshot(store, tmp_path, b"vocab\n")
-    leases = fill.ReadLeases({"unet": fill.Checkpoint(store_root, manifest)})
+    leases = fill.ReadLeases({"unet": fill.Checkpoint.from_store(store, manifest)})
 
     with pytest.raises(fill.FillRefusal) as raised:
         leases.acquire("controlnet")

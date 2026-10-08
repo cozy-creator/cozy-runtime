@@ -184,6 +184,50 @@ def test_a_fork_refuses_what_it_cannot_keep(
     assert not started["ok"] and started["code"] == "fork_unready"
 
 
+@pytest.mark.parametrize("many", [False, True])
+def test_model_load_requires_sources_and_leaves_weightless_execution_usable(
+    zygote: tuple[subprocess.Popen[bytes], Channel, dict[str, Any]], tmp_path: Path, many: bool
+) -> None:
+    """A real control peer cannot turn an installed full Store into model authority."""
+    import tensorfs
+
+    store = tensorfs.Store.init(tmp_path / "store")
+    _process, channel, start = zygote
+    assert _call(channel, start)["ok"]
+    binding = {"model_class": "UnimportableModel", "store": str(store.root)}
+    command: dict[str, Any] = {"cmd": "load", "construction": "ungranted", "devices": ""}
+    command.update(
+        {
+            "models": [
+                {"binding": {**binding, "model_binding_path": name, "model_parameter_name": name}}
+                for name in ("first", "second")
+            ]
+        }
+        if many
+        else {"binding": binding}
+    )
+    refused = _call(channel, command)
+    assert refused["code"] == "model_sources_ungranted", refused
+    assert not refused["poisoned"]
+    loaded = _call(
+        channel,
+        {
+            "cmd": "load",
+            "construction": "weightless",
+            "devices": "",
+            "binding": {
+                "application": start["application"],
+                "package_interface": start["package_interface"],
+            },
+        },
+    )
+    assert loaded["ok"], loaded
+    # Grant presence advances to the next operation's own admission check. It does not
+    # require a particular wheel flavor or fabricate a device budget for this peer.
+    admitted = _call(channel, {**command, "model_sources": True})
+    assert admitted["code"] == "authorization_absent", admitted
+
+
 def test_children_die_with_their_parent(
     zygote: tuple[subprocess.Popen[bytes], Channel, dict[str, Any]], tmp_path: Path
 ) -> None:

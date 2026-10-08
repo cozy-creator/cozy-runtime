@@ -62,7 +62,7 @@ def test_a_replacement_attaches_a_baked_graph_and_never_bakes(tmp_path: Path) ->
     never offered baked bytes."""
     store, base, first, second = fixture(tmp_path)
     result, _ = compose(store, tmp_path, "baked", base, [(first, 0.5), (second, -0.25)])
-    checkpoint = Checkpoint(store.root, result.manifest.digest)
+    checkpoint = Checkpoint.from_store(store, result.manifest.digest)
     x = torch.tensor([[1.25, -2.0, 0.5], [0.0, 1.0, 2.0]], device="cuda")
     backends: list[Any] = []
 
@@ -137,7 +137,9 @@ def _stored(store: Any, root: Path, name: str, module: Any) -> Checkpoint:
         key: Value(tuple(value.shape), tuple(value.float().flatten().tolist()))
         for key, value in module.state_dict().items()
     }
-    return Checkpoint(store.root, model(store, root, name, name, tensors, b"{}").manifest.digest)
+    return Checkpoint.from_store(
+        store, model(store, root, name, name, tensors, b"{}").manifest.digest
+    )
 
 
 def test_a_replacement_attaches_blocks_baked_with_h3s_turbo_overlay(tmp_path: Path) -> None:

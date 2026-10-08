@@ -63,7 +63,7 @@ def test_native_peft_graph_matches_reference_and_keeps_ordinary_destinations(
     if reverse:
         selected.reverse()
     result, graph = compose(store, tmp_path, "prepared", base, selected)
-    checkpoint = Checkpoint(store.root, result.manifest.digest)
+    checkpoint = Checkpoint.from_store(store, result.manifest.digest)
     rows = checkpoint.rows("transformer")
     document = tensorfs.parse_header(header(store, result))
     artifact = lora_composition.bind(
@@ -140,7 +140,7 @@ def test_native_peft_graph_matches_reference_and_keeps_ordinary_destinations(
 def test_graph_cannot_bypass_a_models_adapter_opt_in(tmp_path: Path) -> None:
     store, base, first, _second = fixture(tmp_path)
     result, _graph = compose(store, tmp_path, "prepared", base, [(first, 0.5)])
-    checkpoint = Checkpoint(store.root, result.manifest.digest)
+    checkpoint = Checkpoint.from_store(store, result.manifest.digest)
     with pytest.raises(Exception, match="adapter_incompatible"):
         lora_composition.bind(
             Artifact(

@@ -1,11 +1,9 @@
-"""Checkpoints in a TensorFS store, as the runtime reads them: headers, plan rows, leases.
+"""Granted model headers, tensor read plans and explicit standalone Store utilities.
 
-The weight plane (`weights.py`, `tensorfs-plane`) moves the bytes. What stays here is the
-store side every consumer shares: opening a store, a checkpoint's header projected into the
-contract's rows (`PlanRow`, with each tensor's stored roles), verified read leases keyed by
-snapshot, the servability answer derived from plan resolution, and the one refusal
-vocabulary (`FillRefusal`). A snapshot is verified when its lease is taken, so a corrupt
-artifact refuses before construction.
+The weight plane (`weights.py`, `tensorfs-plane`) moves the bytes. This module projects
+TensorFS headers into contract rows, derives servability from plan resolution and maps
+native refusals into `FillRefusal`. Managed checkpoints consume owner-granted sources;
+standalone callers supply a Store explicitly when they need local verified read leases.
 """
 
 from __future__ import annotations
@@ -154,12 +152,6 @@ def _refuse(code: str, message: str, fields: Sequence[str] = ()) -> FillRefusal:
 def tensorfs_module() -> ModuleType:
     """Load TensorFS lazily for storage components that keep module imports lightweight."""
     return tensorfs
-
-
-def store_available() -> bool:
-    """This process's TensorFS can open a store: False for the plane-only build Rust-machine
-    executors install (weight plane, headers, plans and fit; `tensorfs.STORE`)."""
-    return bool(getattr(tensorfs, "STORE", True))
 
 
 def capabilities() -> frozenset[str]:
@@ -319,37 +311,41 @@ class PlanRow:
 
 
 class Checkpoint:
-    """One model manifest in a TensorFS store, opened through the tfs-007 facade.
+    """A model header and assets granted by the machine, parsed locally with TensorFS.
 
-    This class is the ONLY place in the runtime that speaks to TensorFS, and it is
-    deliberately thin. Object verification, GC-safe holds, plan ordering, dtype names, the
-    reader pool and every refusal are the store's; what this plane adds is the projection
-    from a header into the contract's rows and the H2D transaction on top of the stream.
-
-    It replaces cr-005's interim `CasStore` + `read_plan` outright (decisions #264). The
-    interim reader knew CAS layout, cached a file descriptor per (thread, object) and
-    verified per object in Python; none of that survives, and none of it needs to.
+    Managed executors receive a source; they never infer store authority from a path or
+    an installed build. Standalone callers can explicitly supply their own Store through
+    `from_store`. TensorFS owns verification, leases and read planning in either case.
     """
 
     def __init__(
         self,
-        root: str | Path,
         manifest_id: str,
         *,
-        sourced: Callable[[str], bytes] | None = None,
+        sourced: Callable[[str], bytes],
     ) -> None:
         """`sourced` serves the header (name "") and each asset (the Rust machine's
         `ModelSource`): such a checkpoint opens no store, and has no lease to give."""
-        self.root = str(root)
-        self.manifest_id = manifest_id
-        self.sourced = sourced
+        self.root = ""
+        self.sourced: Callable[[str], bytes] | None = sourced
         self.store: Store | None = None
         with store_refusals(f"opening manifest {manifest_id[:23]}"):
-            if sourced is not None:
-                header: bytes | None = sourced("")
-            else:
-                self.store = store(self.root)
-                header = self.store.manifest(manifest_id)["header"]
+            self._parse(manifest_id, sourced(""))
+
+    @classmethod
+    def from_store(cls, store: Store, manifest_id: str) -> Checkpoint:
+        """Read from an explicitly supplied standalone store, retaining its lease API."""
+        checkpoint = cls.__new__(cls)
+        checkpoint.root = str(store.root)
+        checkpoint.store = store
+        checkpoint.sourced = None
+        with store_refusals(f"opening manifest {manifest_id[:23]}"):
+            checkpoint._parse(manifest_id, store.manifest(manifest_id)["header"])
+        return checkpoint
+
+    def _parse(self, manifest_id: str, header: bytes | None) -> None:
+        self.manifest_id = manifest_id
+        with store_refusals(f"parsing manifest {manifest_id[:23]}"):
             if header is None:
                 raise _refuse("checkpoint_unreadable", f"{manifest_id}: no cozytensors header")
             self.header_bytes = header
@@ -523,12 +519,14 @@ class Checkpoint:
         return assets
 
 
-def logical_weight_bytes(root: str | Path, snapshots: Mapping[str, str]) -> dict[str, int]:
+def logical_weight_bytes(store: Store, snapshots: Mapping[str, str]) -> dict[str, int]:
     """Each constructed component's LOGICAL bytes, from the header of the snapshot it fills
     from: what its destinations hold. An encoded checkpoint stores fewer bytes than that
     (fp8 SDXL: 4.71 GB stored, 6.94 GB logical), so the stored closure never prices one. A
     component its header lacks has no entry; model-code-fit judges that mismatch."""
-    checkpoints = {snapshot: Checkpoint(root, snapshot) for snapshot in set(snapshots.values())}
+    checkpoints = {
+        snapshot: Checkpoint.from_store(store, snapshot) for snapshot in set(snapshots.values())
+    }
     return {
         component: sum(row.nbytes for row in checkpoints[snapshot].rows(component))
         for component, snapshot in snapshots.items()
