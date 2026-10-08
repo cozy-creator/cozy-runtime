@@ -54,3 +54,15 @@ def forward(
 
 
 KITCHEN_SOL = Local(forward, lambda *_: "comfy_kitchen.sol_attn(int8, tau=1, current-call stats)")
+
+
+def sage_dense(*, query: Any, key: Any, value: Any, scale: float | None) -> Any:
+    """The shared, explicit dense reference for sparse-arithmetic comparisons."""
+    return attention_upstream.SAGE.forward(query, key, value, scale=scale)
+
+
+def forward_sage(query: Any, key: Any, value: Any, **options: Any) -> Any:
+    return attention_sol._attention(query, key, value, **options, sparse=sparse, dense=sage_dense)
+
+
+KITCHEN_SOL_SAGE = Local(forward_sage, KITCHEN_SOL.impl)
