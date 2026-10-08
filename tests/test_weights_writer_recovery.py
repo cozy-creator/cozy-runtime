@@ -11,11 +11,11 @@ from types import SimpleNamespace
 import pytest
 import tensorfs
 from tensorfs.derived import Derivation, Part, Source, Target, Tensor
+from tensorfs.records import DeclarationTargets
 
 from cozy_runtime.author._errors import CapabilityError
 from cozy_runtime.author._executor_requests import Request, WriterOutput, decode, encode
-from cozy_runtime.internal.weights_writer import WriterBroker
-from cozy_runtime.internal.weights_writer import MODEL_PREFIX
+from cozy_runtime.internal.weights_writer import MODEL_PREFIX, WriterBroker
 from weights_channel import open_output
 
 
@@ -141,13 +141,15 @@ def test_parent_broker_grafts_without_a_new_bytes_grant(tmp_path: Path) -> None:
     manifest = source_writer.commit()["manifest"]
     source = "sha256:" + manifest["sha256"], manifest["length"]
     sources = {"source": source}
-    targets = {"model": {"source": "source", "source_component": "model", "drop": [], "add": {}}}
+    targets: DeclarationTargets = {
+        "model": {"source": "source", "source_component": "model", "drop": [], "add": {}}
+    }
     order = [("model", "weight")]
     fingerprint = "sha256:" + "83" * 32
     declaration = store.derived_declaration(
         sources, targets, {}, order, 0, work_fingerprint=fingerprint
     )
-    spec = {
+    spec: dict[str, list[dict[str, object]]] = {
         "inputs": [{"input_id": MODEL_PREFIX + "source", "digest": source[0], "length": source[1]}],
         "outputs": [{"output_id": "model", "mime_type": "application/vnd.cozy.model-manifest"}],
     }

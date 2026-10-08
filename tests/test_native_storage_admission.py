@@ -10,6 +10,7 @@ from typing import NoReturn
 import pytest
 import tensorfs
 from tensorfs.derived import Derivation, Part, Target, Tensor
+from tensorfs.records import DeclarationTargets
 
 from cozy_runtime.author._errors import CapabilityError
 from cozy_runtime.internal import storage_admission as storage
@@ -24,7 +25,7 @@ def test_parent_writer_checks_admission_before_creating_native_writer(
     spool = tmp_path / "spool"
     spool.mkdir()
     encoding = next(d for a, d in tensorfs.seed_digests() if a == "plain/1")
-    targets = {
+    targets: DeclarationTargets = {
         "model": {
             "drop": [],
             "add": {

@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 import tensorfs
 from tensorfs.derived import Derivation, Part, PartSource, Source, Target, Tensor
+from tensorfs.records import TensorDeclaration
 
 from cozy_runtime.author import ModelArtifact, ObjectRef, canonical_json
 from cozy_runtime.internal.encoding import SPEC_PLAIN
@@ -26,7 +27,7 @@ def _keys(count: int, width: int) -> list[str]:
 
 
 def _source(store: tensorfs.Store) -> ModelArtifact:
-    tensor = {
+    tensor: TensorDeclaration = {
         "logical_dtype": "f16",
         "shape": [4],
         "encoding": SPEC_PLAIN,

@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 import tensorfs
 from tensorfs.derived import Derivation, Part, Target, Tensor
+from tensorfs.records import DeclarationTargets
 
 from cozy_runtime.internal import storage_admission as storage
 from cozy_runtime.internal.weights_writer import WriterBroker
@@ -25,7 +26,7 @@ def test_native_channel_admission_releases_on_completion_cancel_or_producer_loss
     store = tensorfs.Store.init(tmp_path / "store")
     spool = tmp_path / "spool"
     spool.mkdir()
-    targets = {
+    targets: DeclarationTargets = {
         "model": {
             "drop": [],
             "add": {

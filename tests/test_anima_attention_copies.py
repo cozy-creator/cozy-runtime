@@ -29,7 +29,7 @@ class Attention(torch.nn.Module):  # type: ignore[misc,name-defined]
         self.norm_k = SimpleNamespace(weight=torch.ones(16), eps=1e-5)
 
 
-class Count(torch.overrides.TorchFunctionMode):
+class Count(torch.overrides.TorchFunctionMode):  # type: ignore[misc,name-defined]
     def __init__(self) -> None:
         super().__init__()
         self.repeats = 0
