@@ -79,9 +79,9 @@ def compare(seed):
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.set_float32_matmul_precision("highest")
     cases = []
-    decode_cases = _decode_cases(torch, candidate, baseline)
     try:
         with torch.inference_mode():
+            decode_cases = _decode_cases(torch, candidate, baseline)
             weight = torch.randn((rows, columns), generator=generator, device="cuda") * 0.02
             down = (torch.randn((rank, columns), generator=generator, device="cuda") * 0.02).to(
                 torch.bfloat16
