@@ -32,6 +32,7 @@ from cozy_runtime.author._attention import AttentionContext
 from cozy_runtime.author._attention_scope import _EXPECTED
 from cozy_runtime.internal import (
     accel,
+    attention_kitchen_sol,
     attention_sol,
     attention_ulysses,
     execution_evidence,
@@ -245,6 +246,23 @@ PINNABLE: tuple[Candidate, ...] = (
         ),
     ),
     Candidate(
+        name="kitchen-sol",
+        backend="_cozy_kitchen_sol_int8",
+        local=attention_kitchen_sol.KITCHEN_SOL,
+        min_sm=120,
+        max_sm=120,
+        sms=frozenset({120}),
+        dtypes=frozenset({"bfloat16"}),
+        max_head_dim=128,
+        head_dims=frozenset({128}),
+        artifact="comfy-kitchen",
+        import_name="comfy_kitchen",
+        why=(
+            "Opt-in SM120 INT8 sparse experiment; Runtime's dense-step/path/prefix policy "
+            "with Kitchen dense attention. Matched H3 timing and AV quality pending."
+        ),
+    ),
+    Candidate(
         name="sol-attn",
         backend="_cozy_sol_bf16",
         local=attention_sol.SOL,
@@ -350,7 +368,7 @@ def _launch(ready: Ready, device: DeviceFacts) -> None:
     """One small call through a compiled kernel: one whose first launch raises is not served.
     Not an accuracy check. Torch's own backends need none; Sol launches only inside its
     model's layout."""
-    if not ready.candidate.artifact or ready.name == "sol-attn" or device.kind != "cuda":
+    if not ready.candidate.artifact or ready.name in attention_sol.NAMES or device.kind != "cuda":
         return
     import torch
     from diffusers.models.attention_dispatch import dispatch_attention_fn
@@ -394,6 +412,18 @@ def _resolve(candidate: Candidate, device: DeviceFacts, wait: bool = True) -> Re
         module = _import(candidate)
         if candidate.local in (upstream.FA3, upstream.FA3_FP8):
             upstream.bind_fa3(module, (artifact or {}).get("key", "environment"))
+        if candidate.name == "kitchen-sol":
+            available = getattr(module, "sol_attn_is_available", None)
+            dense_available = getattr(module, "int8_attention_is_available", None)
+            if (
+                not callable(available)
+                or not callable(dense_available)
+                or not (available(device.index) and dense_available(device.index))
+            ):
+                raise AttentionRefusal(
+                    "attention_kernel_absent",
+                    "kitchen-sol requires compiled Sol and INT8 dense kernels",
+                )
     if candidate.name == "sol-attn":
         _sol_route(device)
         if device.kind == "cuda":
@@ -473,7 +503,7 @@ def _sol_dense(
         candidate = BY_NAME.get(name)
         if (
             candidate is None
-            or name == "sol-attn"
+            or name in attention_sol.NAMES
             or _device_admits(candidate, device)
             or not _admits(candidate, "bfloat16", 128)
         ):
@@ -1179,7 +1209,7 @@ def _install_sites(records: Sequence[tuple[Ready, str, str, Any]]) -> None:
     added: list[tuple[str, str, Any]] = []
     try:
         for entry, component, path, module in records:
-            if entry.name != "sol-attn":
+            if entry.name not in attention_sol.NAMES:
                 continue
             local = component.rsplit("/", 1)[-1]
             if getattr(module, "_cozy_sol_site", None) is None:
@@ -1240,7 +1270,7 @@ def override(
             for component, path, module in swap.modules
             if getattr(module, "_cozy_sol_site", None) is None
         ]
-        if swap is not None and swap.entry.name == "sol-attn"
+        if swap is not None and swap.entry.name in attention_sol.NAMES
         else []
     )
     try:

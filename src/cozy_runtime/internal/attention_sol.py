@@ -51,6 +51,7 @@ class Site:
 _SITE: ContextVar[Site | None] = ContextVar("cozy_sol_site", default=None)
 _DENSE: Callable[..., Any] | None = None
 _DENSE_IDENTITY = ""
+NAMES = frozenset({"sol-attn", "kitchen-sol"})
 _COUNTS: ContextVar[dict[str, int] | None] = ContextVar("cozy_sol_counts", default=None)
 _RANK_COUNTS: ContextVar[dict[int, dict[str, int]] | None] = ContextVar(
     "cozy_sol_rank_counts", default=None
@@ -118,8 +119,8 @@ def bind_dense(call: Callable[..., Any], identity: str) -> None:
     _DENSE, _DENSE_IDENTITY = call, identity
 
 
-def dense_identity() -> str:
-    return _DENSE_IDENTITY
+def dense_identity(kernel: str = "sol-attn") -> str:
+    return "kitchen-int8" if kernel == "kitchen-sol" else _DENSE_IDENTITY
 
 
 @dataclass(frozen=True, slots=True)
@@ -583,6 +584,32 @@ def sol_attention(
     Ulysses this runs after the exchange, on the full document of a head subset;
     Sol's block routing is computed per head, so the split matches one GPU.
     """
+    return _attention(
+        query,
+        key,
+        value,
+        attn_mask=attn_mask,
+        dropout_p=dropout_p,
+        is_causal=is_causal,
+        scale=scale,
+        enable_gqa=enable_gqa,
+    )
+
+
+def _attention(
+    query: Any,
+    key: Any,
+    value: Any,
+    *,
+    attn_mask: Any = None,
+    dropout_p: float = 0.0,
+    is_causal: bool = False,
+    scale: float | None = None,
+    enable_gqa: bool = False,
+    sparse: Callable[..., Any] | None = None,
+    dense: Callable[..., Any] = _dense,
+) -> Any:
+    """Shared input and model-policy boundary for the opt-in sparse implementations."""
     import torch
 
     if torch.compiler.is_compiling():
@@ -609,7 +636,7 @@ def sol_attention(
         raise ValueError(f"Sol serves upstream's CuTe routes only: {sorted(ROUTES.values())}")
     if scale is not None and not math.isfinite(scale):
         raise ValueError("attention scale must be finite")
-    return _execute(query, key, value, scale, layout, site)
+    return _execute(query, key, value, scale, layout, site, sparse=sparse, dense=dense)
 
 
 def backend(device: Any) -> str:
@@ -621,7 +648,15 @@ SOL = Local(sol_attention, lambda query, *_: backend(query.device))
 
 
 def _execute(
-    query: Any, key: Any, value: Any, scale: float | None, layout: AttentionLayout, site: Site
+    query: Any,
+    key: Any,
+    value: Any,
+    scale: float | None,
+    layout: AttentionLayout,
+    site: Site,
+    *,
+    sparse: Callable[..., Any] | None = None,
+    dense: Callable[..., Any] = _dense,
 ) -> Any:
     """Apply the model's explicit policy after hardware/operand validation."""
     import torch
@@ -629,25 +664,29 @@ def _execute(
     dense_path = any(site.path == p or site.path.startswith(p + ".") for p in layout.dense_paths)
     if dense_path and query.shape[1] < layout.live_tokens:
         # A refiner has its own shorter document; its explicit dense policy wins.
-        output = _dense(query, key, value, scale)
+        output = dense(query=query, key=key, value=value, scale=scale)
         _count("dense_path")
         return output
     if layout.live_tokens > query.shape[1]:
         raise ValueError("attention layout exceeds Q/K/V sequence length")
     q, k, v = (t[:, : layout.live_tokens] for t in (query, key, value))
     loaded = None
-    if not dense_path:
+    if not dense_path and sparse is None:
         # The dense steps run on the GPU while this length's variant compiles on the CPU.
         specialize(layout.live_tokens, query.device, layout.step)
         if layout.step >= layout.dense_until_step:
             loaded = _ready(layout.live_tokens, query.device, layout.step)
-    if loaded is None:
+    if dense_path or layout.step < layout.dense_until_step or (sparse is None and loaded is None):
         # A dense step, a dense path, or a sparse step whose variant failed to compile: the
         # dense reference serves it.
-        live_output = _dense(q, k, v, scale)
+        live_output = dense(query=q, key=k, value=v, scale=scale)
         _count("dense_path" if dense_path else "dense_step")
     else:
-        live_output = _native(q, k, v, scale, layout.protected_prefix, loaded)
+        live_output = (
+            sparse(q, k, v, scale, layout.protected_prefix)
+            if sparse is not None
+            else _native(q, k, v, scale, layout.protected_prefix, loaded)
+        )
         _validate_result(live_output, q)
         if any(
             live_output.untyped_storage().data_ptr() == t.untyped_storage().data_ptr()
@@ -656,8 +695,8 @@ def _execute(
             raise ValueError("Sol returned output sharing input storage")
         _count("sparse")
         if layout.protected_prefix:
-            live_output[:, : layout.protected_prefix] = _dense(
-                q[:, : layout.protected_prefix], k, v, scale
+            live_output[:, : layout.protected_prefix] = dense(
+                query=q[:, : layout.protected_prefix], key=k, value=v, scale=scale
             )
             _count("dense_prefix")
     _validate_result(live_output, q)
