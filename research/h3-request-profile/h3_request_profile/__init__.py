@@ -21,7 +21,7 @@ from cozy_runtime.author import (
 )
 from cozy_runtime.models.minimax_h3.model import H3Model, H3TurboBase, H3TurboLoRA
 
-from .instrument import profile_request
+from .instrument import profile_request, software_versions
 
 app = App()
 
@@ -57,6 +57,31 @@ class ProfileResult(msgspec.Struct):
     render: RenderResult
     trace: Annotated[FileAsset, AssetBound(media_types=("application/gzip",), max_bytes=256 << 20)]
     summary: Annotated[FileAsset, AssetBound(media_types=("application/json",), max_bytes=64 << 20)]
+
+
+class EnvironmentInput(msgspec.Struct, forbid_unknown_fields=True):
+    pass
+
+
+class EnvironmentResult(msgspec.Struct):
+    device: str
+    software: dict[str, str | None]
+    delegated_handler_symbols: dict[str, list[str]]
+
+
+@app.job
+def environment(payload: EnvironmentInput, ctx: Context) -> EnvironmentResult:
+    """CPU-only capture/submission proof for this exact profiling package; no model load."""
+    if ctx.device.type != "cpu":
+        raise ValueError("The environment receipt must run without a GPU allocation")
+    return EnvironmentResult(
+        str(ctx.device),
+        software_versions(),
+        {
+            name: list(getattr(fn, "__code__").co_names)
+            for name, fn in (("fl2va", fl2va), ("fl2va_turbo", fl2va_turbo))
+        },
+    )
 
 
 def saved(result: tuple[Any, bytes, bytes], out: Outputs) -> ProfileResult:
