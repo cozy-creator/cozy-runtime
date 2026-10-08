@@ -62,6 +62,8 @@ NAMES = frozenset(
         "kitchen-sol-producer-reuse",
         "kitchen-sol-producer-fast",
         "kitchen-sol-producer-fp4",
+        "kitchen-sol-producer-fast-shared-qkv",
+        "kitchen-sol-producer-fp4-shared-qkv",
     }
 )
 _COUNTS: ContextVar[dict[str, int] | None] = ContextVar("cozy_sol_counts", default=None)
@@ -137,9 +139,9 @@ def bind_dense(call: Callable[..., Any], identity: str) -> None:
 def dense_identity(kernel: str = "sol-attn") -> str:
     if kernel == "sol-fp8-fp16-fp4-dense":
         return "sageattention3-fp4-global; sparse-prefix=sageattention"
-    if kernel == "kitchen-sol-producer-fp4":
+    if kernel in {"kitchen-sol-producer-fp4", "kitchen-sol-producer-fp4-shared-qkv"}:
         return "sageattention3-fp4-global; sparse-prefix=kitchen-int8"
-    if kernel == "kitchen-sol-producer-fast":
+    if kernel in {"kitchen-sol-producer-fast", "kitchen-sol-producer-fast-shared-qkv"}:
         return "kitchen-int8; sparse-prefix=kitchen-int8"
     if kernel.startswith("kitchen-sol-producer"):
         return "sageattention; sparse-prefix=kitchen-int8"

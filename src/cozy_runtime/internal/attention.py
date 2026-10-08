@@ -514,7 +514,7 @@ def _resolve(candidate: Candidate, device: DeviceFacts, wait: bool = True) -> Re
     if candidate.name == "sol-fp8-fp16-fp4-dense":
         _resolve(BY_NAME["sageattention3-fp4-global"], device, wait)
         _resolve(BY_NAME["sageattention"], device, wait)
-    elif candidate.name == "kitchen-sol-producer-fp4":
+    elif candidate.name in {"kitchen-sol-producer-fp4", "kitchen-sol-producer-fp4-shared-qkv"}:
         _resolve(BY_NAME["sageattention3-fp4-global"], device, wait)
     elif (
         candidate.name in {"kitchen-sol-sage", "sol-fp8-fp16"}

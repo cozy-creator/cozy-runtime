@@ -18,6 +18,7 @@ from typing import Any
 from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT, AttentionLayout
 from cozy_runtime.internal import attention_sol, attention_ulysses, attention_upstream
 from cozy_runtime.internal.attention_ulysses import Local, Options
+from cozy_runtime.internal.encoding import leaves
 from cozy_runtime.internal.encoding.leaves import PreQuantized
 
 NAMES = frozenset(
@@ -26,10 +27,21 @@ NAMES = frozenset(
         "kitchen-sol-producer-reuse",
         "kitchen-sol-producer-fast",
         "kitchen-sol-producer-fp4",
+        "kitchen-sol-producer-fast-shared-qkv",
+        "kitchen-sol-producer-fp4-shared-qkv",
     }
 )
 REUSE = frozenset(
-    {"kitchen-sol-producer-reuse", "kitchen-sol-producer-fast", "kitchen-sol-producer-fp4"}
+    {
+        "kitchen-sol-producer-reuse",
+        "kitchen-sol-producer-fast",
+        "kitchen-sol-producer-fp4",
+        "kitchen-sol-producer-fast-shared-qkv",
+        "kitchen-sol-producer-fp4-shared-qkv",
+    }
+)
+SHARED_QKV = frozenset(
+    {"kitchen-sol-producer-fast-shared-qkv", "kitchen-sol-producer-fp4-shared-qkv"}
 )
 BACKENDS = {"_cozy_" + name.replace("-", "_"): name for name in NAMES}
 CHUNK = 4096
@@ -142,6 +154,8 @@ LOCALS = {
     "kitchen-sol-producer-reuse": LOCAL,
     "kitchen-sol-producer-fast": FAST_LOCAL,
     "kitchen-sol-producer-fp4": FP4_LOCAL,
+    "kitchen-sol-producer-fast-shared-qkv": FAST_LOCAL,
+    "kitchen-sol-producer-fp4-shared-qkv": FP4_LOCAL,
 }
 
 
@@ -156,14 +170,58 @@ def rows(value: Any, start: int, stop: int) -> Any:
     return value[:, start:stop]
 
 
-def qkv_chunks(attn: Any, hidden: Any, tokens: int) -> Iterator[Any]:
+def shared_qkv_refusal(attn: Any) -> str:
+    """Only known tensor-preserving hooks may share the positional operand's codes.
+
+    WeightResidency wraps forward rather than registering a pre-hook. Calling the
+    original modules below keeps its acquire/bind/bake/release boundary intact.
+    """
+    from torch.nn.modules import module as torch_module
+
+    from cozy_runtime.models.minimax_h3.turbo import _LoRAHook
+
+    if torch_module._global_forward_pre_hooks or torch_module._global_forward_hooks:
+        return "global-projection-hook"
+    for projection in (attn.to_q, attn.to_k, attn.to_v):
+        if getattr(projection, "provider", None) != "cozy.fp8-rowwise.native-leaf/1":
+            return "non-rowwise-leaf"
+        if projection._forward_pre_hooks:
+            return "projection-pre-hook"
+        if any(not isinstance(hook, _LoRAHook) for hook in projection._forward_hooks.values()):
+            return "unknown-projection-hook"
+    return ""
+
+
+def qkv_chunks(
+    attn: Any,
+    hidden: Any,
+    tokens: int,
+    *,
+    shared: bool = False,
+    counts: dict[str, int] | None = None,
+) -> Iterator[Any]:
     import torch
 
+    refusal = shared_qkv_refusal(attn) if shared else "disabled"
     for start in range(0, tokens, CHUNK):
         chunk = rows(hidden, start, min(tokens, start + CHUNK))
+        operand = None
+        outcome = refusal
+        if shared and isinstance(chunk, PreQuantized):
+            outcome = "already-quantized"
+        elif shared and not refusal:
+            payload, scale = leaves.quantize_activation_rowwise(torch, chunk)
+            operand = PreQuantized(payload, scale, tuple(chunk.shape))
+            outcome = "shared"
+        if shared and counts is not None:
+            counts[outcome] = counts.get(outcome, 0) + 1
         # Original module calls retain encoded leaves, resident weights and Turbo hooks.
         yield torch.cat(
-            [projection(chunk) for projection in (attn.to_q, attn.to_k, attn.to_v)], dim=-1
+            [
+                projection(chunk) if operand is None else projection(chunk, prequantized=operand)
+                for projection in (attn.to_q, attn.to_k, attn.to_v)
+            ],
+            dim=-1,
         ).squeeze(0)
 
 
@@ -265,8 +323,11 @@ class Processor:
         reuse = prior_mean is not None
         freqs = rope_presentation(rotary_emb, tokens, state)
         kitchen = import_module("comfy_kitchen")
+        shared_counts: dict[str, int] = {}
         output, mean, scale = kitchen.sol_attn_chunked(
-            lambda: qkv_chunks(attn, hidden_states, tokens),
+            lambda: qkv_chunks(
+                attn, hidden_states, tokens, shared=name in SHARED_QKV, counts=shared_counts
+            ),
             tokens,
             attn.heads,
             freqs,
@@ -283,9 +344,15 @@ class Processor:
         if name in REUSE:
             state.statistics[key] = (layout.step, geometry, mean, scale)
         statistics = "previous-step" if reuse else "current-call"
+        shared_detail = ""
+        if name in SHARED_QKV:
+            shared_detail = ", qkv=" + ",".join(
+                f"{kind}:{count}" for kind, count in sorted(shared_counts.items())
+            )
         attention_ulysses.record(
             backend,
-            f"comfy_kitchen.sol_attn_chunked(int8, stats={statistics}, vmargin=1.1, prefix=int8)",
+            f"comfy_kitchen.sol_attn_chunked(int8, stats={statistics}, vmargin=1.1, "
+            f"prefix=int8{shared_detail})",
         )
         attention_sol._count("sparse")
         if layout.protected_prefix:
