@@ -114,9 +114,7 @@ PINNABLE: tuple[Candidate, ...] = (
         Candidate(
             name=name,
             backend=backend,
-            local=attention_producer.FAST_LOCAL
-            if name.endswith("-fast")
-            else attention_producer.LOCAL,
+            local=attention_producer.LOCALS[name],
             min_sm=120,
             max_sm=120,
             sms=frozenset({120}),
@@ -499,7 +497,9 @@ def _resolve(candidate: Candidate, device: DeviceFacts, wait: bool = True) -> Re
                     "attention_kernel_absent",
                     "kitchen-sol requires compiled Sol and INT8 dense kernels",
                 )
-    if (
+    if candidate.name == "kitchen-sol-producer-fp4":
+        _resolve(BY_NAME["sageattention3-fp4-global"], device, wait)
+    elif (
         candidate.name in {"kitchen-sol-sage", "sol-fp8-fp16"}
         or candidate.name in attention_producer.NAMES
     ):

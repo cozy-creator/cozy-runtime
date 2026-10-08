@@ -193,3 +193,69 @@ def test_cleanup_drops_only_the_owned_upstream_rotary_cache(
     with producer.request_scope() as state:
         state.rope = owned, owned, owned
     assert ("ours",) not in cache and ("theirs",) in cache
+
+
+def test_fp4_hybrid_resolves_both_real_artifact_recipes_before_becoming_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Dependency graph only; no compiled kernel or performance is simulated."""
+    from cozy_runtime.internal.encoding import DeviceFacts
+
+    compiled = []
+
+    def compile_artifact(candidate: Any, *args: Any) -> dict[str, str]:
+        compiled.append((candidate.name, candidate.artifact))
+        return {"artifact": candidate.artifact}
+
+    monkeypatch.setattr(attention, "_READY", {})
+    monkeypatch.setattr(attention, "_BROKEN", {})
+    monkeypatch.setattr(attention, "_compiled", compile_artifact)
+    monkeypatch.setattr(
+        attention,
+        "_import",
+        lambda _: SimpleNamespace(
+            sol_attn_is_available=lambda _: True, int8_attention_is_available=lambda _: True
+        ),
+    )
+    monkeypatch.setattr(attention, "_launch", lambda *args: None)
+    name = "kitchen-sol-producer-fp4"
+    candidate = attention.BY_NAME[name]
+    facts = DeviceFacts("cuda", "unavailable", 120, "", "", 0)
+    assert attention._resolve(candidate, facts).name == name
+    assert compiled == [(name, "comfy-kitchen"), ("sageattention3-fp4-global", "sageattn3")]
+    assert candidate.local is producer.FP4_LOCAL
+    assert name in producer.REUSE and name in attention_sol.NAMES
+    assert attention_sol.dense_identity(name) == (
+        "sageattention3-fp4-global; sparse-prefix=kitchen-int8"
+    )
+
+
+def test_fp4_dense_callback_records_its_actual_global_mean_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cozy_runtime.internal import attention_ulysses, attention_upstream
+
+    q = torch.randn(1, 17, 2, 128, dtype=torch.bfloat16)
+    calls = []
+
+    def cpu_reference(query: Any, key: Any, value: Any, **options: Any) -> Any:
+        calls.append(options)
+        return attention_upstream.sdpa(query, key, value, **options)
+
+    real = attention_upstream.SAGE3_GLOBAL
+    monkeypatch.setattr(
+        attention_upstream, "SAGE3_GLOBAL", attention_ulysses.Local(cpu_reference, real.impl)
+    )
+    with attention_ulysses.observing() as seen:
+        output = producer.dense_fp4(query=q, key=q, value=q, scale=128**-0.5)
+    assert torch.equal(output, attention_upstream.sdpa(q, q, q))
+    assert calls == [
+        {
+            "attn_mask": None,
+            "dropout_p": 0.0,
+            "is_causal": False,
+            "scale": 128**-0.5,
+            "enable_gqa": False,
+        }
+    ]
+    assert attention.implementations(seen) == real.impl(None)

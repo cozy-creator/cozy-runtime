@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 import msgspec
 
 from cozy_runtime.author import App, Context
@@ -10,7 +12,7 @@ app = App()
 
 
 class Request(msgspec.Struct, forbid_unknown_fields=True):
-    pass
+    selector: Literal["all", "kitchen-sol-producer-fp4"] = "all"
 
 
 class Row(msgspec.Struct):
@@ -27,6 +29,7 @@ class Result(msgspec.Struct):
     kitchen: str
     tokens: int
     rows: list[Row]
+    runtime: str
 
 
 @app.job(accelerator=True)
@@ -63,7 +66,10 @@ def verify(payload: Request, ctx: Context) -> Result:
     handles = [p.register_forward_pre_hook(count) for p in (attn.to_q, attn.to_k, attn.to_v)]
     results = []
     try:
-        for name in sorted(attention_producer.NAMES):
+        names = (
+            sorted(attention_producer.NAMES) if payload.selector == "all" else [payload.selector]
+        )
+        for name in names:
             ready = attention.pinned(name, facts)
             attention.install(ready, {"dit": attn}, "dit=" + name, device=facts)
             runs, counts, elapsed = [], [], []
@@ -97,4 +103,10 @@ def verify(payload: Request, ctx: Context) -> Result:
     finally:
         for handle in handles:
             handle.remove()
-    return Result(torch.cuda.get_device_name(index), version("comfy-kitchen"), tokens, results)
+    return Result(
+        torch.cuda.get_device_name(index),
+        version("comfy-kitchen"),
+        tokens,
+        results,
+        version("cozy-runtime"),
+    )

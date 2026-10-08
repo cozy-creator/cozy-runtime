@@ -21,9 +21,16 @@ from cozy_runtime.internal.attention_ulysses import Local, Options
 from cozy_runtime.internal.encoding.leaves import PreQuantized
 
 NAMES = frozenset(
-    {"kitchen-sol-producer", "kitchen-sol-producer-reuse", "kitchen-sol-producer-fast"}
+    {
+        "kitchen-sol-producer",
+        "kitchen-sol-producer-reuse",
+        "kitchen-sol-producer-fast",
+        "kitchen-sol-producer-fp4",
+    }
 )
-REUSE = frozenset({"kitchen-sol-producer-reuse", "kitchen-sol-producer-fast"})
+REUSE = frozenset(
+    {"kitchen-sol-producer-reuse", "kitchen-sol-producer-fast", "kitchen-sol-producer-fp4"}
+)
 BACKENDS = {"_cozy_" + name.replace("-", "_"): name for name in NAMES}
 CHUNK = 4096
 
@@ -105,6 +112,37 @@ FAST_LOCAL = Local(
     lambda *_: "dense=comfy_kitchen.int8; sparse=instance-producer",
     head_local=False,
 )
+
+
+def dense_fp4(*, query: Any, key: Any, value: Any, scale: float | None) -> Any:
+    return attention_ulysses._call(
+        "_cozy_sage3_fp4_global",
+        attention_upstream.SAGE3_GLOBAL,
+        query,
+        key,
+        value,
+        Options(attn_mask=None, dropout_p=0.0, is_causal=False, scale=scale, enable_gqa=False),
+    )
+
+
+def materialized_fp4(query: Any, key: Any, value: Any, **options: Any) -> Any:
+    """FP4 dense steps/refiners/paths; the sparse prefix stays Kitchen INT8."""
+    return attention_sol._attention(
+        query, key, value, **options, sparse=_missing_processor, dense=dense_fp4
+    )
+
+
+FP4_LOCAL = Local(
+    materialized_fp4,
+    lambda *_: "dense=sageattn3.nvfp4_global_head_mean; sparse=instance-producer",
+    head_local=False,
+)
+LOCALS = {
+    "kitchen-sol-producer": LOCAL,
+    "kitchen-sol-producer-reuse": LOCAL,
+    "kitchen-sol-producer-fast": FAST_LOCAL,
+    "kitchen-sol-producer-fp4": FP4_LOCAL,
+}
 
 
 def rows(value: Any, start: int, stop: int) -> Any:

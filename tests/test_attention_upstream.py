@@ -61,17 +61,17 @@ def test_the_wrapper_refuses_lse_and_anything_but_initialized_ulysses(
         backend(query=q, key=q, value=q, **options)
 
 
-def test_every_registered_kernel_is_head_local_and_a_cross_head_one_refuses_ulysses() -> None:
-    """Every Runtime kernel reduces within one head (FlashInfer's scalar V scale is applied per
-    head outside the kernel), so every one is context-parallel. The wrapper still refuses a
-    kernel that declares a cross-head reduction, before any collective."""
+def test_registered_parallelism_matches_the_kernel_contract() -> None:
+    """Head-local kernels support Ulysses; instance producers explicitly refuse it."""
     pytest.importorskip("diffusers")
     from diffusers.models.attention_dispatch import _AttentionBackendRegistry
 
     for candidate in attention.BY_NAME.values():
-        assert candidate.local.head_local, candidate.name
         member = attention._member(candidate)
-        assert _AttentionBackendRegistry._is_context_parallel_available(member), candidate.name
+        assert (
+            _AttentionBackendRegistry._is_context_parallel_available(member)
+            == candidate.local.head_local
+        ), candidate.name
     local = attention_ulysses.Local(lambda *_, **__: None, lambda *_: "", head_local=False)
     member = attention_ulysses.member("_cozy_test_cross_head", local)
     assert not _AttentionBackendRegistry._is_context_parallel_available(member)
