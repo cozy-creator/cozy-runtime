@@ -1,6 +1,6 @@
 import unittest
 
-from attribute_trace import Ranges, attribute
+from attribute_trace import Ranges, attribute, manual_annotations
 
 
 def event(cat, name, ts, dur, *, pid=1, tid=1, corr=None):
@@ -72,6 +72,27 @@ class AttributionTests(unittest.TestCase):
     def test_invalid_gpu_events_are_reported(self):
         rows = [event("kernel", "bad", 1, -1), event("kernel", "nan", float("nan"), 1)]
         self.assertEqual(attribute(lambda: iter(rows))["invalid_gpu_events"], 2)
+
+    def test_manual_unix_ranges_preserve_clock_and_launch_thread(self):
+        base = 1_790_857_026_000_000_000
+        manual = [
+            {
+                "label": "QKV",
+                "start_unix_ns": base + 11_000,
+                "end_unix_ns": base + 15_000,
+                "pid": 1,
+                "tid": 7,
+            }
+        ]
+        rows = list(manual_annotations(manual, {"baseTimeNanoseconds": base}))
+        rows += [
+            event("cuda_runtime", "launch", 12, 1, tid=7, corr=42),
+            event("kernel", "gemm", 80, 20, pid=0, tid=9, corr=42),
+        ]
+        result = attribute(lambda: iter(rows))
+        self.assertEqual(result["groups"][0]["annotations"], ["QKV"])
+        with self.assertRaises(ValueError):
+            list(manual_annotations(manual, {}))
 
 
 if __name__ == "__main__":

@@ -71,6 +71,30 @@ def correlation(event: dict[str, Any]) -> str | None:
     return str(value) if isinstance(value, (int, str)) else None
 
 
+def manual_annotations(
+    rows: list[dict[str, Any]], metadata: dict[str, Any]
+) -> Iterable[dict[str, Any]]:
+    """Map externally recorded host ranges into the retained Kineto clock domain."""
+    base = metadata.get("baseTimeNanoseconds")
+    if not isinstance(base, int):
+        raise ValueError("Manual Unix ranges require trace baseTimeNanoseconds")
+    for row in rows:
+        start, end = row["start_unix_ns"], row["end_unix_ns"]
+        if not isinstance(start, int) or not isinstance(end, int) or end < start:
+            raise ValueError("Invalid manual range timestamps")
+        if "pid" not in row or "tid" not in row:
+            raise ValueError("Manual ranges must identify their host process and thread")
+        yield {
+            "ph": "X",
+            "cat": "user_annotation",
+            "name": row["label"],
+            "pid": row["pid"],
+            "tid": row["tid"],
+            "ts": (start - base) / 1000,
+            "dur": (end - start) / 1000,
+        }
+
+
 def attribute(
     events: Callable[[], Iterable[dict[str, Any]]],
 ) -> dict[str, Any]:
@@ -170,14 +194,27 @@ def main() -> None:
         "--parser", type=Path, required=True, help="Path to PR1243 trace_summary.py"
     )
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument(
+        "--ranges", type=Path, help="CUDA-only capture summary with manual host ranges"
+    )
     options = parser.parse_args()
     spec = importlib.util.spec_from_file_location("h3_trace_stream", options.parser)
     if spec is None or spec.loader is None:
         raise ValueError("Trace parser cannot be imported")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    result = attribute(lambda: module.trace_events(options.trace))
+    metadata: dict[str, Any] = {}
+    manual = json.loads(options.ranges.read_text())["ranges"] if options.ranges else []
+
+    def events() -> Iterable[dict[str, Any]]:
+        yield from module.trace_events(options.trace, metadata)
+        if options.ranges:
+            yield from manual_annotations(manual, metadata)
+
+    result = attribute(events)
     result["trace"] = str(options.trace)
+    result["trace_metadata"] = metadata
+    result["manual_ranges_source"] = str(options.ranges) if options.ranges else None
     options.out.write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps({key: value for key, value in result.items() if key != "groups"}))
 
