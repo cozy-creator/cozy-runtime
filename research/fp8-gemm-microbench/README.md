@@ -46,3 +46,9 @@ CUDA-only activities around labeled H2D, matmul and D2H operations, then exports
 the ChromeTrace plus an actual category/correlation/annotation census. Missing
 user annotations or CUDA-runtime events are reported rather than assumed present.
 Its default512x512 matrices and3repeats do not measure H3 performance.
+
+Probe version0.0.2 also records PID, Python thread identity, native Linux TID and
+the low32 bits of the Python/pthread identity at capture. Each manual host range
+records both Unix and monotonic nanoseconds plus those aliases; it measures host
+enqueue scope, not synchronized GPU duration. Actual trace thread IDs are kept by
+category so their mapping can be verified instead of guessed.

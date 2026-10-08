@@ -1,6 +1,20 @@
 """Small GPU-only capture capability test; does not time or claim H3 performance."""
 
+import os
+import threading
+import time
 from collections import Counter
+from contextlib import contextmanager
+
+
+def thread_identity():
+    ident = threading.get_ident()
+    return {
+        "pid": os.getpid(),
+        "python_thread_ident": ident,
+        "native_tid": threading.get_native_id(),
+        "pthread_low32": ident & 0xFFFFFFFF,
+    }
 
 
 def capture(path, dimension, repeats):
@@ -16,6 +30,26 @@ def capture(path, dimension, repeats):
         result = a @ b
     torch.cuda.synchronize()
     labels = ["probe/h2d", "probe/matmul", "probe/d2h"]
+    capture_thread = thread_identity()
+    ranges = []
+
+    @contextmanager
+    def span(name):
+        identity = thread_identity()
+        start_unix_ns, start_perf_ns = time.time_ns(), time.perf_counter_ns()
+        with record_function(name):
+            yield
+        ranges.append(
+            {
+                "name": name,
+                **identity,
+                "start_unix_ns": start_unix_ns,
+                "end_unix_ns": time.time_ns(),
+                "start_perf_ns": start_perf_ns,
+                "end_perf_ns": time.perf_counter_ns(),
+            }
+        )
+
     with profile(
         activities=[ProfilerActivity.CUDA],
         record_shapes=False,
@@ -23,11 +57,11 @@ def capture(path, dimension, repeats):
         with_stack=False,
     ) as profiler:
         for _ in range(repeats):
-            with record_function(labels[0]):
+            with span(labels[0]):
                 a.copy_(host, non_blocking=True)
-            with record_function(labels[1]):
+            with span(labels[1]):
                 result = a @ b
-            with record_function(labels[2]):
+            with span(labels[2]):
                 received.copy_(result, non_blocking=True)
         torch.cuda.synchronize()
     profiler.export_chrome_trace(str(path))
@@ -40,6 +74,9 @@ def capture(path, dimension, repeats):
             "torch": torch.__version__,
             "dimension": dimension,
             "repeats": repeats,
+            "capture_thread": capture_thread,
+            "manual_ranges": ranges,
+            "manual_range_semantics": "Host enqueue intervals; no per-range CUDA synchronization",
         },
     )
 
@@ -70,6 +107,22 @@ def summarize(path, labels, facts):
         "trace_bytes": path.stat().st_size,
         "events": len(events),
         "categories": dict(categories),
+        "thread_ids_by_category": {
+            category: sorted(
+                {
+                    event["tid"]
+                    for event in events
+                    if event.get("cat", "") == category and "tid" in event
+                },
+                key=str,
+            )
+            for category in categories
+        },
+        "trace_timebase_fields": {
+            key: value
+            for key, value in document.items()
+            if "time" in key.lower() and isinstance(value, (int, float, str))
+        },
         "kernel_events": len(kernels),
         "memcpy_events": len(copies),
         "cuda_runtime_events": len(runtime),
