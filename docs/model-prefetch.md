@@ -14,10 +14,11 @@ The callee must be an existing locked managed callable. Runtime checks the bindi
 serializes any requested `models` choices and sends `ModelPrefetch` to TensorD. The
 acknowledgment does not promise completion or a particular residency state. The later
 ordinary invocation still resolves its own models and performs any required preparation.
-Current TensorD handles this hint using the callable and its parent's bindings; it does
-not consume the hint's `models` payload. Pass model overrides to the later invocation
-itself, where they determine the selected inputs. Selection handling is tracked in
-[tracker #345](https://github.com/cozy-creator/tracker/issues/345).
+TensorD overlays explicit `ModelArtifact` choices on the same inherited choices used by
+an ordinary child call. An omitted entry or `None` retains the parent's applicable choice
+or the callee's captured default. Choices must name declared callee model slots, and the
+normal resolver still checks access to the selected data. Pass the same overrides to the
+later invocation; the hint does not change that invocation's arguments or defaults.
 
 TensorD decides how far to prepare the known call under current machine policy. This can
 include obtaining stored model objects through TensorFS, preparing shared CPU buffers,
@@ -32,6 +33,7 @@ plane. `SealedPrefetch` batches plans for CPU buffers TensorD prepares. Neither 
 that serialized store objects, prepared CPU buffers and GPU tensors are interchangeable.
 
 An owner that does not support the optional hint can decline it; ordinary demand
-preparation remains available. Prefetch does not transfer the machine's budget or storage
+preparation remains available. Older owners may ignore hint choices, so the later call's
+arguments remain authoritative. Prefetch does not transfer the machine's budget or storage
 lifetime authority to package code. For the data and ownership split, see
 [Machine and Runtime roles](machine-agent-runtime.md).
