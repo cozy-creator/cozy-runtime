@@ -78,7 +78,7 @@ def environment(payload: EnvironmentInput, ctx: Context) -> EnvironmentResult:
         str(ctx.device),
         software_versions(),
         {
-            name: list(getattr(fn, "__code__").co_names)
+            name: list(fn.__code__.co_names)
             for name, fn in (("fl2va", fl2va), ("fl2va_turbo", fl2va_turbo))
         },
     )
