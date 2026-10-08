@@ -1,0 +1,77 @@
+{
+  "status": "Design-only. No runtime/default/rental changes; the ready precision wheel is untouched.",
+  "objective": "An opt-in H3 producer that can be measured separately from attention precision, preserving Turbo8 four-dense/four-sparse policy, first2blocks/refiner, full Sage protected-prefix recomputation, LoRA effects and current-call statistics.",
+  "smallest_hook": {
+    "api": "MiniMaxH3Attention.set_processor on the particular attention instance",
+    "existing_owner": "internal/fusion_install.py:FusedMiniMaxH3AttnProcessor and _install_transformer already install per-instance processors after fill",
+    "reason": "The registered attention backend is called only after full Q/K/V projection/norm/RoPE. It is too late to avoid those tensors. Add a producer-aware processor under explicit selection; no global Diffusers monkeypatch.",
+    "policy": "Consult the existing attention layout/site before choosing production. Dense steps, refiner and configured dense paths delegate to the existing processor and Sage path unchanged."
+  },
+  "confirmed_constraints": [
+    {
+      "name": "Current statistics require a replay or retained values",
+      "evidence": "Kitchen sol_attn_chunked(kmean=None,vscale=None) calls the projection factory twice: first collect current post-RoPE K sums and V maxima, then quantize. Passing an iterator instead materializes all chunks to replay.",
+      "implication": "No previous-call statistics need be used, but streaming current statistics is not a free one-pass projection. A one-projection-pass implementation must retain the K/V values needed after global reductions."
+    },
+    {
+      "name": "V scale margin changes arithmetic",
+      "evidence": "Chunked API uses amax/127*1.1; plain sol_attn preprocess uses amax/127.",
+      "implication": "Expose/match margin explicitly (1.0 for parity with current plain Kitchen candidate). Do not call a changed scale policy fusion-only."
+    },
+    {
+      "name": "Norm/RoPE rounding differs",
+      "evidence": "Runtime rounds BF16 norm, BF16 cos/sin, both rotary products and their sum. Kitchen producer rounds norm then combines rotary products in FP32 before final BF16 store.",
+      "implication": "Preserve Runtime rounding in a producer mode, or declare a separate numerical-preparation experiment. The existing stock producer is not bitwise interchangeable."
+    },
+    {
+      "name": "Sage prefix still needs original BF16 K/V",
+      "evidence": "Runtime recomputes every protected query row with the common Sage dense callback against all live K/V. Kitchen sink_q computes dense rows with its INT8 kernel and block granularity.",
+      "implication": "Retain normalized BF16 K/V and prefix Q; do not silently substitute sink_q for Sage. Full elimination of BF16 K/V contradicts this unchanged boundary unless a new streaming Sage interface is added."
+    },
+    {
+      "name": "Ulysses sits after projection today",
+      "evidence": "Diffusers H3 shards hidden states and rotary tables by sequence; processors see local sequence/all56heads. attention_ulysses exchanges projected QKV into global sequence/localheads. Kitchen producer expects global sequence/headlocal chunks.",
+      "implication": "Need bounded projection-chunk exchange plus global offsets/RoPE assembly. Rank boundaries need not be64aligned. A global hidden-state gather followed by full QKV projection on every rank would duplicate projection work and is not the intended solution."
+    },
+    {
+      "name": "LoRA and encoded activation custody",
+      "evidence": "H3 Turbo has permanent _LoRAHook consumers and fixed4096-row LoRA accumulation; weights sets _cozy_baked as the live overlay is materialized. Fused input may be leaves.PreQuantized, which currently has no row-slicing API.",
+      "implication": "Call original to_q/to_k/to_v modules on chunks to preserve hooks and baked overlays. Do not slice raw weights or concatenate replacement linears. Add a view-only PreQuantized row slice for the unhooked path, preserving payload/scales and logical shape. Unknown stateful hooks require explicit handling/refusal."
+    }
+  ],
+  "proposed_correct_pipeline": [
+    "Per-instance processor checks the shared dense policy; only eligible sparse calls enter producer mode.",
+    "Project local4096-token chunks through the original Q/K/V modules. Preserve existing LoRA4096-row padding/rounding and original-tensor operands when hooks require them.",
+    "Use the existing process group and all-to-all primitive to exchange projected chunks into headlocal global-token tiles. Carry explicit global offsets, reassemble64-token boundary fragments and preserve token order; do not pad the semantic document or change Sol neighbour/sink indices.",
+    "A producer measurement stage applies matching norm/RoPE rounding, quantizes Q immediately, retains normalized BF16 K/V and protected Q, and collects current K sums/V maxima. No prior-call statistics.",
+    "Finalize current statistics with a declared reduction/scale policy; quantize retained K/V into the existing Kitchen workspace and run the existing Sol core. Margin1.0 matches the plain current-statistics baseline.",
+    "Recompute protected rows through the unchanged Sage dense callback using retained BF16 K/V, then reuse the existing inverse Ulysses output exchange and original to_out modules.",
+    "Record producer backend, statistics policy, scale margin, protected-row backend and replay count independently from the INT8 precision label."
+  ],
+  "upstream_api_needed": {
+    "producer_workspace": "An explicit workspace/producer API accepting global token offsets and post-norm retention outputs; current Python sol_attn_chunked accepts only sequential contiguous chunks. Low-level _C.sol_producer_chunk already has t0 but exposes no retained normalized BF16 K/V.",
+    "prepare_modes": "Current-statistics measure/finalize stages, selectable scale margin and a Runtime-compatible norm/RoPE rounding mode; reuse existing Sol core rather than create another attention framework."
+  },
+  "scope_estimate": "A single-GPU replay adapter might be150-220lines, but does not satisfy the4GPU/matched-Sage/rounding constraints by itself. A faithful prototype is approximately300-600lines of Runtime processor/communication integration plus100-250lines of producer/API work and dedicated tests. Estimate only; not implemented in this bounded pass.",
+  "validation": [
+    "CPU original-module chunking with armed and baked Turbo hooks; encoded activation row-slice byte/scale preservation.",
+    "Compare materialized and producer preparation with the SAME precision, current-statistics policy, V margin and rounding contract.",
+    "Real unequal-shard2/4/7/8 exchange tests, including64-token boundary fragments, padding poison and no token reorder.",
+    "Rented tiny-kernel admission through CozyCLI before full action samples; compare bytes/error, peak buffers, projection count and stage timings.",
+    "Full15s same-seed Turbo4/4 action pair. Previous-call statistics reuse stays a separate opt-in approximation and measurement."
+  ],
+  "source_refs": [
+    "src/cozy_runtime/internal/fusion_install.py:187-215,290-328",
+    "src/cozy_runtime/internal/fusion.py:395-411",
+    "src/cozy_runtime/internal/encoding/leaves.py:45-56,118-140",
+    "src/cozy_runtime/models/minimax_h3/turbo.py:37-106",
+    "src/cozy_runtime/models/minimax_h3/adaln_pruned.py:205-214",
+    "src/cozy_runtime/internal/weights.py:1810-1815",
+    "src/cozy_runtime/internal/attention_ulysses.py:146-166",
+    "https://github.com/huggingface/diffusers/blob/v0.40.0/src/diffusers/models/transformers/transformer_minimax_h3.py#L160-L204",
+    "https://github.com/huggingface/diffusers/blob/v0.40.0/src/diffusers/models/transformers/transformer_minimax_h3.py#L463-L481",
+    "https://github.com/Comfy-Org/comfy-kitchen/blob/v0.2.37/comfy_kitchen/backends/cuda/__init__.py#L2799-L2901",
+    "https://github.com/Comfy-Org/comfy-kitchen/blob/v0.2.37/comfy_kitchen/backends/cuda/sage_attention/sol_layout.cuh#L219-L265",
+    "https://github.com/Comfy-Org/comfy-kitchen/blob/v0.2.37/comfy_kitchen/backends/cuda/sage_attention/sol_attn_preprocess.cu#L106"
+  ]
+}
