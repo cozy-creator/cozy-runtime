@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import gzip
+import io
 import json
+import shutil
 import tempfile
 import time
 from collections.abc import Callable
@@ -45,8 +47,14 @@ def category(name: str) -> str:
     lower = name.lower()
     if "memcpy" in lower and any(x in lower for x in ("htod", "host to device", "h2d")):
         return "h2d_copy"
+    if "memcpy" in lower and any(x in lower for x in ("dtoh", "device to host", "d2h")):
+        return "d2h_copy"
     if "memcpy" in lower:
         return "other_copy"
+    if "synchronize" in lower or "waitevent" in lower:
+        return "synchronization"
+    if "launchkernel" in lower:
+        return "kernel_launch"
     if "producer" in lower:
         return "fused_norm_rope_quant_producer"
     if any(x in lower for x in ("rope_norm", "rms_rope", "norm_rope")):
@@ -141,6 +149,7 @@ def profile_request(
     outputs: Any,
     telemetry: Any,
     detailed: bool = False,
+    full_request_trace: bool = True,
 ) -> tuple[Any, bytes, bytes]:
     import torch
     from torch.profiler import ProfilerActivity
@@ -163,6 +172,7 @@ def profile_request(
         facts,
         [ProfilerActivity.CPU, ProfilerActivity.CUDA],
         detailed=detailed,
+        full_request_trace=full_request_trace,
         attribution=lambda: telemetry._attempt.attribution.document(),
         output_sinks=observed_outputs.sinks,
     )
@@ -178,9 +188,13 @@ def record_request(
     detailed: bool = False,
     attribution: Callable[[], dict[str, Any]] | None = None,
     output_sinks: list[dict[str, Any]] | None = None,
+    full_request_trace: bool = False,
 ) -> tuple[Any, bytes, bytes]:
     """The same bounded recorder can be exercised with real CPU modules off-rental."""
     from torch.profiler import profile, record_function, schedule
+
+    if full_request_trace and detailed:
+        raise ValueError("Whole-request tracing requires shape/memory recording off")
 
     steps: list[dict[str, Any]] = []
     handles: list[Any] = []
@@ -190,6 +204,7 @@ def record_request(
     began = [0.0]
     traces = []
     averages = []
+    trace_sizes = []
     request_before = facts()
     attribution_before = attribution() if attribution is not None else {}
     profile_began = time.perf_counter()
@@ -198,9 +213,20 @@ def record_request(
         with tempfile.TemporaryDirectory(prefix="h3-profile-") as temp:
             path = Path(temp) / "trace.json"
             prof.export_chrome_trace(str(path))
-            if path.stat().st_size > 512 << 20:
+            raw_bytes = path.stat().st_size
+            if not full_request_trace and raw_bytes > 512 << 20:
                 raise ValueError("Two-step profiler trace exceeds512MiB diagnostic bound")
-            traces.append(gzip.compress(path.read_bytes(), compresslevel=3))
+            compressed = io.BytesIO()
+            with (
+                path.open("rb") as source,
+                gzip.GzipFile(fileobj=compressed, mode="wb", compresslevel=3) as destination,
+            ):
+                shutil.copyfileobj(source, destination, length=1 << 20)
+            trace = compressed.getvalue()
+            if len(trace) > 1 << 30:
+                raise ValueError("Compressed profiler trace exceeds1GiB diagnostic output bound")
+            traces.append(trace)
+            trace_sizes.append({"raw_bytes": raw_bytes, "gzip_bytes": len(trace)})
         for event in prof.key_averages(group_by_input_shape=detailed):
             averages.append(
                 {
@@ -220,8 +246,10 @@ def record_request(
     # are recorded; exports/teardown and all profiler overhead are diagnostic time.
     with profile(
         activities=activities,
-        schedule=schedule(wait=dense_steps - 2, warmup=1, active=2, repeat=1),
-        on_trace_ready=finished_trace,
+        schedule=None
+        if full_request_trace
+        else schedule(wait=dense_steps - 2, warmup=1, active=2, repeat=1),
+        on_trace_ready=None if full_request_trace else finished_trace,
         record_shapes=detailed,
         profile_memory=detailed,
         with_stack=False,
@@ -298,14 +326,24 @@ def record_request(
             for remaining in scopes.values():
                 for marker in remaining if isinstance(remaining, list) else [remaining]:
                     marker.__exit__(None, None, None)
+    if full_request_trace:
+        finished_trace(prof)
     if len(traces) != 1:
-        raise ValueError(f"Expected one bounded two-step trace, captured{len(traces)}")
+        raise ValueError(f"Expected one profiler trace, captured{len(traces)}")
     summary = {
         "diagnostic_only": True,
         "software": software_versions(),
         "record_shapes_and_memory": detailed,
         "not_benchmark_time": True,
-        "profiled_step_indices": [dense_steps - 1, dense_steps],
+        "full_request_trace": full_request_trace,
+        "profiled_step_indices": list(range(len(steps)))
+        if full_request_trace
+        else [dense_steps - 1, dense_steps],
+        "trace_format": "pytorch_chrome_json_gzip",
+        "trace_sizes": trace_sizes,
+        "original_timestamps_preserved": True,
+        "trace_collection": "continuous whole handler" if full_request_trace else "two DiT calls",
+        "pre_handler_construction_and_warmup_in_trace": False,
         "steps": steps,
         "events": averages,
         "render_call": {
@@ -338,6 +376,9 @@ def record_request(
             "must be read from ordinary run-show evidence; reused setup is not charged again. "
             "Sparse-eligible labels describe the schedule, not proof of a sparse kernel; "
             "actual kernel identity comes from the trace and native run evidence."
+            " Full mode continuously records TE, all DiT steps, both VAEs, encode and checks; "
+            "record_shapes/profile_memory/with_stack remain off. Pre-handler construction/warm "
+            "kernels remain outside this authored trace and retain native setup timing evidence. "
             " Plane deltas start at handler entry, after cold construction; raw before/after "
             "snapshots preserve the cumulative counters without charging earlier requests again."
         ),

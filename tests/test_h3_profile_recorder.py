@@ -167,3 +167,59 @@ def test_registered_handler_survives_public_export_proxy_replacement(monkeypatch
     app.get("fl2va").internal = True
     with pytest.raises(ValueError, match="public retained"):
         module.retained_handler("fl2va")
+
+
+@pytest.mark.parametrize("step_count,dense_steps", [(8, 4), (30, 10)])
+def test_continuous_trace_covers_preparation_all_steps_and_decode_without_math_change(
+    step_count,
+    dense_steps,
+):
+    module, model = recorder(), Transformer()
+
+    def render():
+        with torch.profiler.record_function("phase.text_encoder"):
+            value = torch.ones(2, 8).sin()
+        for _ in range(step_count):
+            value = model(value)
+        with torch.profiler.record_function("phase.video_decode"):
+            value = value.cos()
+        return value
+
+    with torch.no_grad():
+        expected = render()
+        got, packed, raw = module.record_request(
+            model,
+            dense_steps,
+            render,
+            lambda: {},
+            [torch.profiler.ProfilerActivity.CPU],
+            full_request_trace=True,
+        )
+    torch.testing.assert_close(got, expected, rtol=0, atol=0)
+    summary, trace = json.loads(raw), json.loads(gzip.decompress(packed))
+    assert summary["full_request_trace"] and not summary["record_shapes_and_memory"]
+    assert summary["profiled_step_indices"] == list(range(step_count))
+    events = trace["traceEvents"]
+    names = {event.get("name") for event in events}
+    assert {"phase.text_encoder", "phase.video_decode"} <= names
+    assert all(
+        f"h3.step.{step}.{'dense' if step < dense_steps else 'sparse_eligible'}" in names
+        for step in range(step_count)
+    )
+    assert summary["trace_sizes"][0]["gzip_bytes"] == len(packed)
+    assert all(event["ts"] > 0 for event in events if "ts" in event)
+    assert not model._forward_hooks and not model._forward_pre_hooks
+
+
+def test_full_trace_refuses_tensor_retaining_detail_mode():
+    module, model = recorder(), Transformer()
+    with pytest.raises(ValueError, match="shape/memory recording off"):
+        module.record_request(
+            model,
+            4,
+            lambda: None,
+            lambda: {},
+            [torch.profiler.ProfilerActivity.CPU],
+            full_request_trace=True,
+            detailed=True,
+        )

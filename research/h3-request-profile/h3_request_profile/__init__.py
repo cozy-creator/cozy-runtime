@@ -41,6 +41,7 @@ class TurboInput(msgspec.Struct, kw_only=True):
     duration_s: Literal[15]
     seed: int | None = None
     profile_detail: bool = False
+    full_request_trace: bool = True
 
 
 class RegularInput(TurboInput, kw_only=True):
@@ -54,7 +55,7 @@ class RenderResult(msgspec.Struct):
 
 class ProfileResult(msgspec.Struct):
     render: RenderResult
-    trace: Annotated[FileAsset, AssetBound(media_types=("application/gzip",), max_bytes=256 << 20)]
+    trace: Annotated[FileAsset, AssetBound(media_types=("application/gzip",), max_bytes=1 << 30)]
     summary: Annotated[FileAsset, AssetBound(media_types=("application/json",), max_bytes=64 << 20)]
 
 
@@ -109,6 +110,7 @@ def regular(
             outputs=out,
             telemetry=tel,
             detailed=payload.profile_detail,
+            full_request_trace=payload.full_request_trace,
         ),
         out,
     )
@@ -139,6 +141,7 @@ def turbo(
             outputs=out,
             telemetry=tel,
             detailed=payload.profile_detail,
+            full_request_trace=payload.full_request_trace,
         ),
         out,
     )

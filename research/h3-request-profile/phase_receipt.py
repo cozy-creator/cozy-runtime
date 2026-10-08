@@ -54,6 +54,8 @@ def receipt(run: dict[str, Any], summary: dict[str, Any]) -> dict[str, Any]:
         "encode_mux_output": summary.get("output_sinks", []),
         "client_completion_tails": tails,
         "bounded_kernel_trace_steps": summary["profiled_step_indices"],
+        "full_request_trace": summary.get("full_request_trace", False),
+        "trace_collection": summary.get("trace_collection", "two DiT calls"),
         "phase_sources": {
             "machine_preparation_and_construction": "native_stages; preserve reused setup detail",
             "loading_weights": "native_stages and render_call.attribution_after.stages",
