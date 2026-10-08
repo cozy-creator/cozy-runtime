@@ -1273,6 +1273,8 @@ def test_a_stage_spares_its_idle_components_for_the_one_that_runs(tmp_path: Path
     finally:
         residency.release("run", scope)
     encoder, stack = residency.components["encoder"], residency.components["stack"]
+    common = encoder.common
+    assert common is not None
 
     residency.admit("run", scope)
     try:
@@ -1280,12 +1282,12 @@ def test_a_stage_spares_its_idle_components_for_the_one_that_runs(tmp_path: Path
             assert torch.equal(modules["encoder"](x), encoded)
             mapped = weights.facts().committed_bytes
             assert residency._spare({stack.key}, {stack.key: 0})
-            assert encoder.spared and encoder.lease is None and encoder.common.bound is None
-            assert weights.facts().committed_bytes <= mapped - encoder.common.span
+            assert bool(encoder.spared) and encoder.lease is None and common.bound is None
+            assert weights.facts().committed_bytes <= mapped - common.span
             # the running component is untouched, and a read of the spared one maps it
             assert torch.equal(modules["stack"](encoded), reference)
             assert torch.equal(modules["encoder"](x), encoded)
-            assert encoder.common.bound is None, "mapped for that op only"
+            assert common.bound is None, "mapped for that op only"
     finally:
         residency.release("run", scope)
     residency.unpark()  # a repeating stage stays open until the next request plans afresh
@@ -1306,6 +1308,8 @@ def test_an_op_out_of_memory_spares_the_components_not_in_use(
     scope = ("encoder", "stack")
     x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
     encoder, stack = residency.components["encoder"], residency.components["stack"]
+    common = encoder.common
+    assert common is not None
     progressed, full = weights.progressed, [ResidencyRefusal(INDIVISIBLE, "a full card")]
 
     def nothing_came_back(*args: Any) -> None:
@@ -1322,7 +1326,7 @@ def test_an_op_out_of_memory_spares_the_components_not_in_use(
             monkeypatch.setattr(weights, "progressed", nothing_came_back)
             weights.make_room(1 << 20, (encoded,), "aten.clone.default")
             assert not full and encoder.spared and not stack.spared
-            assert weights.facts().committed_bytes <= mapped - encoder.common.span
+            assert weights.facts().committed_bytes <= mapped - common.span
             assert torch.equal(modules["stack"](encoded), reference)
             assert torch.equal(modules["encoder"](x), encoded)
     finally:
@@ -1711,7 +1715,7 @@ def room(weights: Weights, nbytes: int) -> int:
     torch.cuda.empty_cache()
     weights.measure_context()
     held = max(weights.context_bytes, 0) + plane.stats(weights.plane).device(0).committed
-    return held + torch.cuda.memory_reserved() + nbytes
+    return held + int(torch.cuda.memory_reserved()) + nbytes
 
 
 @on_gpu

@@ -79,7 +79,8 @@ def test_sdk_only_scope_reuses_but_changed_helper_rejects_partial_and_complete_p
     old_bytes = struct.pack("<f", original_value) * 512
     writer.add_part("model", "a", "value", io.BytesIO(old_bytes))
     checkpoint = writer.checkpoint("first", "model")
-    head, head_length = cast(str, checkpoint["head"]), cast(int, checkpoint["head_length"])
+    head, head_length = checkpoint["head"], checkpoint["head_length"]
+    assert head is not None
     writer.fence()
     adopted = store.adopt_derived_checkpoint(
         caller,
@@ -90,6 +91,7 @@ def test_sdk_only_scope_reuses_but_changed_helper_rejects_partial_and_complete_p
         operation_id="caller",
         slot="model",
     )
+    assert adopted["head"] is not None
     resumed = store.begin_derived(
         caller,
         1,

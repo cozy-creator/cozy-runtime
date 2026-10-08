@@ -114,7 +114,7 @@ def test_only_the_reviewed_decode_is_exact() -> None:
     vae = kl()
     assert image_vae.exact(vae) and image_vae.exact(qwen())
 
-    class Own(diffusers.AutoencoderKL):
+    class Own(diffusers.AutoencoderKL):  # type: ignore[misc,name-defined]
         def _decode(self, z: Any, return_dict: bool = True) -> Any:
             return super()._decode(z * 2, return_dict)
 
