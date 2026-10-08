@@ -441,8 +441,10 @@ class WriterBroker:
             weights_receipts.MAX_RECEIPT_BYTES,
         ) as source:
             relayed = canonical_json.decode_as(source.read(), dict[str, object])
-        native = weights_sink.lookup(self.store(), transaction)
-        if native.state != "committed" or not weights_sink.same_receipt(native.receipt, relayed):
+        store = self.store()
+        native = weights_sink.lookup(store, transaction)
+        receipt = self._retained_receipt(store, native, transaction, binding)
+        if not weights_sink.same_receipt(native.receipt, relayed):
             raise CapabilityError(
                 "receipt differs from native custody", code="weights_receipt_mismatch"
             )
@@ -452,9 +454,10 @@ class WriterBroker:
             )
         # Whichever form the executor relayed, the worker records its own custody's receipt.
         facts = native.receipt
+        self._current(attempt, transaction, binding)
         self.record_receipt(attempt, transaction, binding, facts)
         self._current(attempt, transaction, binding)
-        manifest = weights_sink.native_receipt(facts).manifest
+        manifest = receipt.manifest
         return Adopted(
             ok=True,
             request_id=attempt.request_id,
@@ -462,6 +465,45 @@ class WriterBroker:
             manifest_length=manifest.length,
             receipt_digest="sha256:" + hashlib.sha256(canonical_json.encode(facts)).hexdigest(),
         )
+
+    @staticmethod
+    def _retained_receipt(
+        store: tensorfs.Store,
+        native: weights_sink.DerivedLookup,
+        transaction: str,
+        binding: WriterBinding,
+    ) -> weights_sink.NativeReceipt:
+        """A recorded receipt is reusable only while native custody retains its result."""
+        if native.state != "committed":
+            raise CapabilityError("output is not committed", code="weights_receipt_mismatch")
+        if native.disposition.kind not in {"pending", "adopted"}:
+            raise CapabilityError("output is no longer retained", code="weights_transaction_closed")
+        receipt = weights_sink.native_receipt(native.receipt)
+        if (
+            receipt.transaction_id != transaction
+            or weights_receipts.raw(receipt.declaration_digest) != binding.declaration_digest
+        ):
+            raise CapabilityError(
+                "native receipt differs from intent", code="weights_receipt_mismatch"
+            )
+        try:
+            # The receipt names identity, not a caller-authored tensor selection. Inspect the
+            # complete result using its native header, then let TensorFS verify root/closure.
+            header_bytes = store.manifest(receipt.manifest.digest)["header"]
+            if header_bytes is None:
+                raise ValueError("committed model has no header")
+            header = tensorfs.parse_header(header_bytes)
+            store.inspect_derived_source(
+                receipt.manifest.digest,
+                receipt.manifest.length,
+                list(header["components"]),
+                list(header["configs"]),
+            )
+        except Exception as exc:
+            raise CapabilityError(
+                "completed output is not retained and complete", code="weights_receipt_unavailable"
+            ) from exc
+        return receipt
 
     def _open_native(
         self,
@@ -490,30 +532,7 @@ class WriterBroker:
         replay = existing.receipt if existing.state == "committed" else None
         writer = None
         if replay is not None:
-            if existing.disposition.kind not in {"pending", "adopted"}:
-                raise CapabilityError(
-                    "output is no longer retained", code="weights_transaction_closed"
-                )
-            receipt = weights_sink.native_receipt(replay)
-            if (
-                receipt.transaction_id != transaction
-                or weights_receipts.raw(receipt.declaration_digest) != binding.declaration_digest
-            ):
-                raise CapabilityError(
-                    "native receipt differs from intent", code="weights_receipt_mismatch"
-                )
-            try:
-                store.inspect_derived_source(
-                    receipt.manifest.digest,
-                    receipt.manifest.length,
-                    list(args.targets),
-                    list(args.configs),
-                )
-            except Exception as exc:
-                raise CapabilityError(
-                    "completed output is not retained and complete",
-                    code="weights_receipt_unavailable",
-                ) from exc
+            self._retained_receipt(store, existing, transaction, binding)
         else:
             with self._preflight_writers(attempt, transaction, binding, args, fingerprint):
                 self._current(attempt, transaction, binding)
