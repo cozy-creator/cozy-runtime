@@ -2,12 +2,16 @@
 # Run on the owned benchmark rental after extracting ComfyUI v0.39.0 here.
 set -euo pipefail
 cd /root/h3-bench
+if [ ! -f comfy/main.py ]; then
+  echo 'Extract the ComfyUI source into /root/h3-bench/comfy before setup.' >&2
+  exit 1
+fi
 if [ ! -d comfy-env ]; then
   uv venv --python /usr/local/bin/python comfy-env
 fi
 UV_CACHE_DIR=/opt/cozy/dependency-seed/uv-cache uv pip install \
   --python comfy-env/bin/python -r comfy/requirements.txt \
-  'torch==2.14.0' 'torchvision==0.29.0' websocket-client \
+  'torch==2.14.0' 'torchvision==0.29.0' websocket-client 'huggingface_hub==1.33.0' \
   --extra-index-url https://download.pytorch.org/whl/cu130
 uv pip freeze --python comfy-env/bin/python > comfy-environment.txt
 

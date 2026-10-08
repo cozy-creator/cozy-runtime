@@ -14,16 +14,18 @@ def node(kind, **inputs):
     return {"class_type": kind, "inputs": inputs}
 
 
-def graph(payload, sigmas, label, sparse):
+def graph(payload, sigmas, label, sparse, world_size=1):
+    if world_size > 1 and sparse:
+        raise ValueError("The pinned multi-GPU Comfy node requires --dense")
+    model_node = "7" if sparse else ("6" if world_size == 1 else "5")
     nodes = {
         "1": node("UNETLoader", unet_name="minimax_h3_fl2va_pruned_fp8_scaled.safetensors", weight_dtype="default"),
         "2": node("CLIPLoader", clip_name="qwen3vl_32b_minimax_h3_bf16.safetensors", type="minimax", device="default"),
         "3": node("VAELoader", vae_name="minimax_h3_video_vae_fp16.safetensors"),
         "4": node("VAELoader", vae_name="minimax_h3_audio_vae_fp32.safetensors"),
         "5": node("MiniMaxH3SigmaShift", model=["1", 0], shift_video=12.0, shift_audio=3.0),
-        "6": node("ModelAttentionBackend", model=["5", 0], attention="comfy kitchen attention"),
         "8": node("MiniMaxH3ImageToVideo", clip=["2", 0], vae=["3", 0], prompt=payload["prompt"], width=1344, height=768, length=362),
-        "9": node("BasicGuider", model=["7" if sparse else "6", 0], conditioning=["8", 0]),
+        "9": node("BasicGuider", model=[model_node, 0], conditioning=["8", 0]),
         "10": node("RandomNoise", noise_seed=payload["seed"]),
         "11": node("KSamplerSelect", sampler_name="euler"),
         "12": node("ManualSigmas", sigmas=", ".join(format(s, ".10f") for s in sigmas)),
@@ -33,6 +35,11 @@ def graph(payload, sigmas, label, sparse):
         "16": node("CreateVideo", images=["14", 0], audio=["15", 0], fps=24.0, bit_depth=8),
         "17": node("SaveVideo", video=["16", 0], filename_prefix="h3-bench/" + label, format="mp4", **{"format.codec": "h264"}),
     }
+    if world_size == 1:
+        nodes["6"] = node("ModelAttentionBackend", model=["5", 0], attention="comfy kitchen attention")
+    else:
+        nodes["1"] = node("MiniMaxH3SPUNETLoader", unet_name="minimax_h3_fl2va_pruned_fp8_scaled.safetensors",
+                          weight_dtype="default", world_size=world_size, devices="auto")
     if sparse:
         # Put the threshold between evaluations 9 and 10: exactly ten dense evaluations.
         threshold = (sigmas[9] + sigmas[10]) / 2
@@ -51,14 +58,15 @@ def main():
     parser.add_argument("sigmas", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--dense", action="store_true")
+    parser.add_argument("--world-size", type=int, choices=(1, 2, 4, 7, 8), default=1)
     parser.add_argument("--port", type=int, default=8188)
     args = parser.parse_args()
     payload = json.loads(args.input.read_text())
     assert payload["duration_s"] == 15 and payload["steps"] == 30
     sigmas = json.loads(args.sigmas.read_text())
     assert len(sigmas) == 31
+    prompt = graph(payload, sigmas, args.output.name, not args.dense, args.world_size)
     args.output.mkdir(parents=True, exist_ok=False)
-    prompt = graph(payload, sigmas, args.output.name, not args.dense)
     (args.output / "prompt.json").write_text(json.dumps(prompt, indent=2))
     client = str(uuid.uuid4())
     address = f"127.0.0.1:{args.port}"
