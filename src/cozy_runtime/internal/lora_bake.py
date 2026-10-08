@@ -310,10 +310,11 @@ def bake_mx(
         mult = _exp2(torch, byte - E8M0_BIAS).unsqueeze(-1)
         payload = (target / mult).view(rows, cols)
         code = encode_e4m3(torch, payload, rounding, generator)
+        if stats is not None:
+            stored = decode_e4m3(torch, code).view(rows, -1, MX_BLOCK) * mult
         raw[start:stop].copy_(code)
         grid[start:stop].copy_(byte.to(torch.uint8))
         if stats is not None:
-            stored = decode_e4m3(torch, code).view(rows, -1, MX_BLOCK) * mult
             _account(
                 stats,
                 base.view(rows, cols),
