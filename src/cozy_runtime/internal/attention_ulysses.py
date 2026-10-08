@@ -114,6 +114,12 @@ def _dispatch(backend: str, local: Local) -> Callable[..., Any]:
     return attention
 
 
+def record(backend: str, implementation: str) -> None:
+    seen = _SEEN.get()
+    if seen is not None:
+        seen.setdefault(backend, set()).add(implementation)
+
+
 def _call(backend: str, local: Local, query: Any, key: Any, value: Any, options: Options) -> Any:
     import torch
 

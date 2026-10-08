@@ -33,6 +33,7 @@ from cozy_runtime.author._attention_scope import _EXPECTED
 from cozy_runtime.internal import (
     accel,
     attention_kitchen_sol,
+    attention_producer,
     attention_sol,
     attention_ulysses,
     execution_evidence,
@@ -108,6 +109,26 @@ CANDIDATES: tuple[Candidate, ...] = (
 )
 
 PINNABLE: tuple[Candidate, ...] = (
+    *(
+        Candidate(
+            name=name,
+            backend=backend,
+            local=attention_producer.LOCAL,
+            min_sm=120,
+            max_sm=120,
+            sms=frozenset({120}),
+            dtypes=frozenset({"bfloat16"}),
+            max_head_dim=128,
+            head_dims=frozenset({128}),
+            artifact="comfy-kitchen",
+            import_name="comfy_kitchen",
+            why=(
+                "Explicit one-GPU H3 chunked producer; upstream rounding, V margin1.1 "
+                "and INT8 dense prefix. Reuse variant uses previous-step statistics."
+            ),
+        )
+        for backend, name in attention_producer.BACKENDS.items()
+    ),
     Candidate(
         name="flash-attn3-fp8",
         backend="_cozy_flash_attn3_fp8",
@@ -412,7 +433,7 @@ def _resolve(candidate: Candidate, device: DeviceFacts, wait: bool = True) -> Re
         module = _import(candidate)
         if candidate.local in (upstream.FA3, upstream.FA3_FP8):
             upstream.bind_fa3(module, (artifact or {}).get("key", "environment"))
-        if candidate.name == "kitchen-sol":
+        if candidate.name == "kitchen-sol" or candidate.name in attention_producer.NAMES:
             import torch
 
             target = torch.device("cuda", device.index)
@@ -427,6 +448,8 @@ def _resolve(candidate: Candidate, device: DeviceFacts, wait: bool = True) -> Re
                     "attention_kernel_absent",
                     "kitchen-sol requires compiled Sol and INT8 dense kernels",
                 )
+    if candidate.name in attention_producer.NAMES:
+        _resolve(BY_NAME["sageattention"], device, wait)
     if candidate.name == "sol-attn":
         _sol_route(device)
         if device.kind == "cuda":
@@ -1184,6 +1207,8 @@ def install(
                 if _admits(candidate, dtype, head_dim)
             ]
             entry = _preferred(above, device, dtype, head_dim, degree, resolved, refused) or entry
+        if entry.name in attention_producer.NAMES:
+            attention_producer.validate(module)
         assignments.append((component, path, module, processor, entry))
         hosts.setdefault(component, {})
         hosts[component][entry.name] = hosts[component].get(entry.name, 0) + 1
@@ -1209,6 +1234,9 @@ def install(
 
 def _install_sites(records: Sequence[tuple[Ready, str, str, Any]]) -> None:
     """Install metadata hooks atomically, preserving hooks owned by preparation."""
+    for entry, _component, _path, module in records:
+        if entry.name in attention_producer.NAMES:
+            attention_producer.validate(module)
     added: list[tuple[str, str, Any]] = []
     try:
         for entry, component, path, module in records:
@@ -1218,6 +1246,8 @@ def _install_sites(records: Sequence[tuple[Ready, str, str, Any]]) -> None:
             if getattr(module, "_cozy_sol_site", None) is None:
                 added.append((local, path, module))
             attention_sol.install_site(module, local, path)
+            if entry.name in attention_producer.NAMES:
+                attention_producer.install(module)
     except BaseException:
         for component, path, module in reversed(added):
             if getattr(module, "_cozy_sol_site", None) is not None:
@@ -1402,6 +1432,8 @@ def check(
         dtype, head_dim = _dtype(module), _head_dim(module)
         if not _admits(candidate, dtype, head_dim):
             raise _site_refusal(candidate.name, component, dtype, head_dim)
+        if candidate.name in attention_producer.NAMES:
+            attention_producer.validate(module)
         sites += 1
     if not sites:
         raise AttentionRefusal(
