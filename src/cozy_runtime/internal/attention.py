@@ -32,6 +32,7 @@ from cozy_runtime.author._attention import AttentionContext
 from cozy_runtime.author._attention_scope import _EXPECTED
 from cozy_runtime.internal import (
     accel,
+    attention_fp8_sol,
     attention_kitchen_sol,
     attention_producer,
     attention_sol,
@@ -128,6 +129,34 @@ PINNABLE: tuple[Candidate, ...] = (
             ),
         )
         for backend, name in attention_producer.BACKENDS.items()
+    ),
+    Candidate(
+        name="sol-fp8-fp16",
+        backend="_cozy_sol_fp8_fp16",
+        local=attention_fp8_sol.FP8_SOL,
+        min_sm=120,
+        max_sm=120,
+        sms=frozenset({120}),
+        dtypes=frozenset({"bfloat16"}),
+        max_head_dim=128,
+        head_dims=frozenset({128}),
+        artifact=kernel_sources.PYTHON,
+        import_name="sol_attn",
+        why="Explicit bounded FP8/FP16 exact tiles; BF16 routing/tails and Sage dense regions.",
+    ),
+    Candidate(
+        name="kitchen-sol-sage",
+        backend="_cozy_kitchen_sol_sage",
+        local=attention_kitchen_sol.KITCHEN_SOL_SAGE,
+        min_sm=120,
+        max_sm=120,
+        sms=frozenset({120}),
+        dtypes=frozenset({"bfloat16"}),
+        max_head_dim=128,
+        head_dims=frozenset({128}),
+        artifact="comfy-kitchen",
+        import_name="comfy_kitchen",
+        why="Explicit Kitchen INT8/S32 sparse experiment with BF16 Sol's Sage dense reference.",
     ),
     Candidate(
         name="flash-attn3-fp8",
@@ -433,7 +462,7 @@ def _resolve(candidate: Candidate, device: DeviceFacts, wait: bool = True) -> Re
         module = _import(candidate)
         if candidate.local in (upstream.FA3, upstream.FA3_FP8):
             upstream.bind_fa3(module, (artifact or {}).get("key", "environment"))
-        if candidate.name == "kitchen-sol" or candidate.name in attention_producer.NAMES:
+        if candidate.name in {"kitchen-sol", "kitchen-sol-sage"} or candidate.name in attention_producer.NAMES:
             import torch
 
             target = torch.device("cuda", device.index)
@@ -448,7 +477,7 @@ def _resolve(candidate: Candidate, device: DeviceFacts, wait: bool = True) -> Re
                     "attention_kernel_absent",
                     "kitchen-sol requires compiled Sol and INT8 dense kernels",
                 )
-    if candidate.name in attention_producer.NAMES:
+    if candidate.name in {"kitchen-sol-sage", "sol-fp8-fp16"} or candidate.name in attention_producer.NAMES:
         _resolve(BY_NAME["sageattention"], device, wait)
     if candidate.name == "sol-attn":
         _sol_route(device)
