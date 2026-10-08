@@ -279,7 +279,9 @@ SEALED_STAGED = "host_tiers.staged/1"
 
 
 class Load(Command, frozen=True, kw_only=True, tag="load"):
-    """Construct and fill one construction: one model (`binding`) or several (`models`)."""
+    """Ask Runtime to construct models and register their weight layouts from supplied data.
+    TensorD supplies source/buffer access and budgets; Runtime performs device operations
+    through TensorFS. The command names one model (`binding`) or several (`models`)."""
 
     construction: str
     devices: str = ""
@@ -294,7 +296,7 @@ class Load(Command, frozen=True, kw_only=True, tag="load"):
     #: A follower's half: rank 0's hardware plan and, in a many-model load, which model.
     group: GroupHardware | UnsetType = UNSET
     model_key: str | UnsetType = UNSET
-    #: The worker keeps pinned host tiers (`HostTier` exchanges); older workers do not.
+    #: The owner retains shared CPU weight buffers (`HostTier` exchanges).
     host_tier: bool = False
     #: The worker grants a turn per component-use scope (`stage/1`): `StageEnter` before each
     #: scope plans, `StageExit` after it. Older workers never set it.
@@ -302,17 +304,17 @@ class Load(Command, frozen=True, kw_only=True, tag="load"):
     #: The pinned host tier's budget (`LOAD_PINNED`), applied before any weight set registers,
     #: so a fill never pins past it; -1: none, the executor sizes its tier from the host.
     pinned_bytes: int = -1
-    #: The machine keeps GPU weights across executors (`weights.attach/1`): each weight set
-    #: attaches the regions it holds (`DeviceTier`). Older workers never set it.
+    #: TensorD retains exported GPU allocation handles (`weights.attach/1`); Runtime's
+    #: plane attaches/maps those regions (`DeviceTier`). Older peers may omit this.
     device_weights: bool = False
-    #: The machine keeps sealed host layouts (`SEALED_TIERS`): each weight set asks for one
-    #: (`SealedTier`) and adopts it read-only, reading the store only when none is held.
+    #: TensorD prepares/retains sealed CPU layouts (`SEALED_TIERS`). Runtime adopts the
+    #: buffer read-only (`SealedTier`); a managed executor has no implicit Store fallback.
     sealed_tiers: bool = False
-    #: The machine serves the header and model assets (`ModelSource`). Required for a
-    #: model-bearing load; weightless loads remain valid without storage grants.
+    #: TensorD supplies actual header/model-asset bytes (`ModelSource`). Required for new
+    #: model-bearing construction; weightless loads need no model-source access.
     model_sources: bool = False
-    #: The machine stages sealed layouts in part and hands over object files (`SealedStage`,
-    #: `ObjectFiles`): a GPU executor asks for them only when told so. Older machines never set it.
+    #: TensorD stages shared CPU layouts in part and supplies read-only object files
+    #: (`SealedStage`, `ObjectFiles`). Runtime's plane uses them for unstaged regions.
     staged_tiers: bool = False
     #: The process's device cap for the load (`PROCESS_CAP`); unset: none given
     cap_bytes: int | UnsetType = UNSET

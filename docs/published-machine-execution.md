@@ -1,5 +1,12 @@
 # Published machine execution
 
+The preparation record below describes the retired Python-worker implementation. TensorD
+now owns preparation, acceptance and the durable journal; Runtime constructs and executes
+models from supplied data/buffers. See [Machine and Runtime roles](machine-agent-runtime.md).
+The execution-duration section describes Runtime observations that TensorD records.
+
+## Historical preparation record
+
 Published jobs keep their existing `PackageCodeDigest`: the digest of the canonical
 `Environment` whose locked-requirements reference binds the release's exact code
 closure. Published execution does not invent a `LocalPackageRevision` or rename the

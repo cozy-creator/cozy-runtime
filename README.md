@@ -1,30 +1,28 @@
 # cozy-runtime (v2)
 
-The Linux x86-64 wheel (glibc 2.28+) also installs `cozy-machine`, the machine that runs
-Runtime executors. Worker images and `cozy machine install` take it from there:
+Cozy Runtime supplies the Python author API, model construction and execution helpers,
+TensorD-launched executors, and the package CLI. TensorD makes model weights available to
+those executors and coordinates machine budgets, storage lifetime and process lifecycle.
+TensorFS is a library used inside both TensorD and Runtime.
+
+The Linux x86-64 wheel (glibc 2.28+) also installs TensorD's `cozy-machine` executable.
+Worker images and `cozy machine install` take it from there:
 
 ```sh
 uv pip install cozy-runtime
 cozy-machine version --json
 ```
 
-It is built from [cozy-machine](https://github.com/cozy-creator/cozy-machine) at
-`cozy-machine.pin`: the gated commit for candidates, the release tag cut on that commit at
-publish. `task machine` bundles it into `dist`'s Linux wheel (`MACHINE=<checkout>` builds a
-local checkout instead); the publish workflow runs the same task. The portable wheel and the
-source distribution carry no machine.
+It is built from [TensorD](https://github.com/cozy-creator/tensord) at the revision recorded
+in `cozy-machine.pin`. `task machine` bundles it into `dist`'s Linux wheel
+(`MACHINE=<checkout>` builds a local checkout); the publish workflow runs the same task.
+The pure Python wheel and source distribution carry no machine executable.
 
-Machine execution requires worker wire 59. Before first submission, the authenticated
-RecordOwner reads `GetMachineExecutionWorkspace` and durably pins its workspace ID
-with the exact request. `expected_execution_workspace_id` is required on every submit
-and replay. Runtime compares it inside the existing journal acceptance transaction;
-the returned receipt carries that same transaction's identity. A replacement journal
-refuses as `execution_workspace_changed` even when worker/boot identity is unchanged.
-Clients must retain unresolved work rather than replace the pinned ID and resubmit.
-
-The worker runtime: author surface (`cozy_runtime.author`), worker, disposable device
-executor, and the single-package CLI. Design authority: [tracker-v2](https://github.com/cozy-creator/tracker-v2)
-`cozy-runtime.md` + `cozy-runtime-cli.md`; issues in `tracker/cozy-runtime/`.
+TensorD owns accepted executions and their durable journal behind `cozy.machine.v1`.
+Runtime reports executor facts over the private control/descriptor channel. The retired
+Python worker and its protobuf facade are not part of this topology. See
+[Machine and Runtime roles](docs/machine-agent-runtime.md) for the weight-data and memory
+boundaries, and [the tracker](https://github.com/cozy-creator/tracker) for current work.
 
 ## Compatibility status
 
@@ -34,27 +32,26 @@ modules, Runtime `internal`/`cli`/`protocol`, and administrative TensorFS Store 
 are not package APIs. Package ranges must be requalified for coordinated author API cuts.
 
 Runtime executes packages on the installed standard CPython 3.12, 3.13 and 3.14 window.
-The control process and different package executors may use different versions. The native writer cut requires TensorFS 0.3.41; model readback additionally requires
-the scoped reader API under TensorFS PR170 (currently qualified with a source-identified dev wheel).
-accepted executions receive scoped source/output descriptors while the worker owns Store
-access, admission, epochs and the execution journal.
+TensorD embeds its Rust dependencies; each package environment has its own Python closure. Current
+Runtime Python/TensorFS bounds are in `pyproject.toml`. TensorFS parses headers and performs
+weight-plane operations inside the Runtime executor; managed store operations and shared
+buffer lifetime are coordinated by TensorD. Accepted executions receive scoped source/output
+descriptors and budget grants. A model source supplies actual metadata and byte access, while
+an installed library or a model identifier alone supplies no managed-store authority.
 
 `cozy-runtime --json python-interpreters` reports the packaged rolling policy and actual
 installed interpreters. By default discovery uses `uv python find --no-python-downloads`;
 operators may set `COZY_PACKAGE_PYTHONS` to a colon-separated finite list of absolute
-interpreter paths. Preparation selects the lowest compatible installed version from the
+interpreter paths. TensorD preparation selects the lowest compatible installed version from the
 package's `requires-python` range and optional exact captured version before installing its
 complete private dependency closure. No Python download occurs during preparation. Content
 identity records the actual Python patch and ABI, and retained environments stop reopening
 when their Python minor leaves the supported window. Package `requires-python` declarations
 may remain broader than this execution policy.
 
-The distribution major is the Python compatibility major: compatible additions remain in the
-current range, breaking author changes require a new major, and candidate base worker images must
-replay the supported-range package corpus before activation. Tensorhub images still pin one exact
-Runtime wheel digest; package admission uses the declared range and selects the newest compatible
-active Runtime/profile. The protobuf package major and additive wire minor remain their own
-worker-control compatibility contract.
+Python package compatibility is expressed through dependency ranges. TensorD's machine API
+and the private executor channel use their own operation/capability contracts; a Python
+package version is not a machine-wide authority grant.
 
 Published dependency declarations allow patch upgrades, including optional extras.
 Minimum versions (`>=`) are preferred; major/minor compatibility ranges are permitted.
@@ -62,25 +59,20 @@ Exact development and CI versions belong in `uv.lock`; worker images retain thei
 wheel and image digests. The Python ABI bound is independent of dependency version
 policy. The `dependency-version-ranges` architecture fence holds this boundary.
 
-**One end-to-end test suite, no mocks.** `uv run pytest` runs against
-`examples/marco-polo` through the public CLI installed from a freshly built wheel into a venv
-that has nothing else: describe, an exact byte-identical package interface replay, the exit-code
-matrix, one served request, and one job through the real two-process worker. Nothing is
-stubbed, patched or doubled — a test that passes because a fake agreed with it is worse than
-no test. The two legs that SPAWN AN EXECUTOR skip where the host cannot contain one (a
-runner whose own cgroup is not delegated) and name that host fact as the reason. Beside them
-CI runs the build, ruff, mypy, the reproducible-wheel check and `checks/architecture.py`'s
-AST import scans, and nothing else. Hardware is verified by hand on a rented card.
+`uv run pytest` runs the current suite, including real process, descriptor, native storage,
+and numerical component checks. CI also checks builds, types, lint and architecture fences.
+Tests requiring a GPU or host facilities name those requirements; CPU/descriptor proofs do
+not establish GPU inference or provider qualification.
 
 For labelled model-ready input media, see [Ordered media inputs](docs/assets.md).
 
 ## Layout
 
-| package | role | may import |
-|---|---|---|
-| `cozy_runtime.author` | the whole author surface — the only package code imports | stdlib + msgspec |
-| `cozy_runtime.internal` | executor, storage bindings and the config authority | author, stdlib |
-| `cozy_runtime.cli` | user CLI | author, internal |
+| package | role |
+|---|---|
+| `cozy_runtime.author` | typed author API and invocation services |
+| `cozy_runtime.internal` | executor, model loading, weight policy and scoped storage adapters |
+| `cozy_runtime.cli` | package CLI |
 
 `cozy_runtime.author` also holds the INVOCATION KERNEL (`_invoke.py`): decode -> resolve
 -> preflight -> hydrate -> invoke -> validate -> finalize. It is pure surface semantics —
@@ -98,12 +90,17 @@ the entrypoint, a frozen `RuntimeConfig` passed explicitly thereafter. Second re
 
 ## The executor and the machine
 
-    cozy-machine ──seam──▶ executor (CUDA)
+    TensorD (cozy-machine) ──control + descriptors──▶ Runtime executor (Python/PyTorch)
 
-The Rust `cozy-machine` owns its API, journal, store and executor supervision.
-Runtime retains the author API, device executor, native TensorFS storage bindings
-and standalone CPU helpers. The Python worker/helper subtree and protobuf facade
-are removed.
+TensorD uses TensorFS to obtain verified stored weights and prepare/retain shared CPU
+buffers. Runtime constructs the model, plans its weight layout and uses TensorFS's local
+plane/device APIs for GPU allocation, copies, mapping and unmapping. TensorD may retain
+exported GPU allocation handles between executors; Runtime attaches those allocations and
+binds tensor views in its own process. GPU tensors, prepared CPU buffers, and serialized
+weight objects are different representations with different lifetimes.
+
+TensorFS has no separate daemon in this arrangement. Runtime also has explicit standalone
+Store helpers for tools/tests; managed executors consume TensorD's scoped sources and buffers.
 
 | module | role |
 |---|---|
@@ -111,7 +108,8 @@ are removed.
 | `internal/trampoline.py` | exec-first stage and process settings |
 | `internal/executor.py` | disposable device process and package invocation |
 | `internal/weights_writer.py` | scoped native source/output client and broker |
-| `internal/fill.py` | native model metadata, headers and byte access |
+| `internal/fill.py` | project source headers into model rows and read plans; explicit standalone Store helpers |
+| `internal/weights.py`, `internal/plane.py` | executor weight layout, residency policy and TensorFS GPU/CPU buffer operations |
 
 `checks/architecture.py` keeps versioned identities in two disjoint registries.
 `DOCUMENT_KINDS` contains only stored or digested documents that cross a process/repository

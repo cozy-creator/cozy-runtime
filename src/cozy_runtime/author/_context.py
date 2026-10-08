@@ -138,7 +138,8 @@ class Context:
     _release_gpus: Callable[[], None] | None = field(default=None, repr=False)
 
     def tensorfs_source(self, model: Model[object]) -> SourceCapability:
-        """Bind an admitted model input to TensorFS's source capability."""
+        """Return scoped access to an admitted model's metadata/encoded bytes through TensorFS.
+        TensorD supplies scoped source access; this handle does not construct a GPU model."""
         self.raise_if_cancelled()
         if self._tensorfs_source is None:
             raise CapabilityError(

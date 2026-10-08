@@ -2,8 +2,10 @@
 
 `WeightsReader` is an injected job service. It opens an attempt-scoped read lease over
 an exact granted model input. Ordinary invocable callers pass `ModelArtifact` values;
-the existing owner binding validates their producer/receipt and grants typed model
-parameters such as `QuantizationSource` before the function runs.
+TensorD selects and checks the retained model input and supplies scoped source access on request.
+Runtime binds typed model parameters such as `QuantizationSource` before the function runs. Source
+access provides actual metadata and encoded bytes through TensorFS; it does not construct
+a Python model or create GPU tensors.
 
 ```python
 with reader.open(reference) as original, reader.open(candidate) as changed:
@@ -35,6 +37,6 @@ policy. Quantizer-time saturation is not recoverable from stored values and is n
 invented by the reader.
 
 Views close explicitly or with the context manager. Cancellation, attempt completion
-and revoked leases refuse reads. The parent releases reader custody independently
+and revoked leases refuse reads. TensorD releases reader custody independently
 of producer/memo retention. Opening a view declares no output, opens no writer and
 creates no checkpoint, publication or durable memo record.

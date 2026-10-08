@@ -158,9 +158,9 @@ class WriterAdopt(_Writer, frozen=True, kw_only=True, tag="adopt"):
 
 
 class HostTier(_Request, frozen=True, kw_only=True, tag="host_tier"):
-    """One weight set's pinned host tier (`tensorfs.plane`), which the worker keeps across
-    executors: `offer` sends it (its memfd follows this request), else asks for the one the
-    worker holds for exactly this layout (`Tier` answers; its memfd follows when held)."""
+    """One shared CPU weight buffer retained across executors. `offer` sends TensorD a
+    memfd; an ask receives the matching retained layout (`Tier` plus a memfd when held).
+    Runtime maps/pins the buffer through TensorFS; this exchange carries no GPU tensor."""
 
     name: str
     layout: str
@@ -178,9 +178,9 @@ class SharedRegion(msgspec.Struct, frozen=True, kw_only=True):
 
 
 class DeviceTier(_Request, frozen=True, kw_only=True, tag="device_tier"):
-    """One weight set's GPU memory the machine keeps across executors (`weights.attach/1`): an
-    ask names the layout (the machine answers with what it holds); an offer hands over the
-    regions this executor filled and exported (`fds` follow the frame)."""
+    """GPU allocation handles TensorD retains across executors (`weights.attach/1`).
+    Runtime fills/exports regions before offering their fds; an ask receives retained
+    handles that Runtime's TensorFS plane attaches/maps in this executor."""
 
     name: str
     #: the plane's layout digest: the same bytes at the same offsets
@@ -198,8 +198,9 @@ class DeviceTier(_Request, frozen=True, kw_only=True, tag="device_tier"):
 
 class SealedPlan(msgspec.Struct, frozen=True, kw_only=True):
     """What one weight set's sealed host layout holds (`host_tiers.sealed/1`): the TensorFS
-    read plan and region grouping the model code chose. The machine builds the same plan from
-    its own copy of `manifest`'s header and fills it once; the layout digest must match."""
+    read plan and region grouping Runtime derived from model code. TensorD validates the
+    plan against its copy of the manifest header and fills the shared CPU layout through
+    TensorFS; the layout digest must match."""
 
     manifest: str
     #: the weight set's key and region digest, as `HostTier` names them
@@ -214,8 +215,8 @@ class SealedPlan(msgspec.Struct, frozen=True, kw_only=True):
 
 
 class SealedTier(_Request, frozen=True, kw_only=True, tag="sealed_tier"):
-    """One weight set's sealed host layout from the machine, which fills it once and keeps
-    it across executors. The canonical `SealedPlan` follows in a sealed memfd (a plan is
+    """One weight set's sealed CPU layout, prepared through TensorFS and retained by TensorD
+    across executors. The canonical `SealedPlan` follows in a sealed memfd (a plan is
     larger than a control frame); `Tier` answers, the layout's memfd following when `held`."""
 
     manifest: str
@@ -254,7 +255,7 @@ class ObjectFiles(_Request, frozen=True, kw_only=True, tag="object_files"):
 
 
 class ModelSource(_Request, frozen=True, kw_only=True, tag="model_source"):
-    """One model file from the machine (`Load.model_sources`): the CozyTensors header (`name`
+    """One model file from TensorD (`Load.model_sources`): the CozyTensors header (`name`
     empty) or one header-declared asset. `SourceBytes` answers, a sealed memfd of exactly
     those bytes following: the executor reads no store."""
 
@@ -264,7 +265,7 @@ class ModelSource(_Request, frozen=True, kw_only=True, tag="model_source"):
 
 class SealedPrefetch(_Request, frozen=True, kw_only=True, tag="sealed_prefetch"):
     """Every component's `SealedPlan` of one construction at once (a canonical JSON list in a
-    sealed memfd after the request): the machine starts filling them all, and each later
+    sealed memfd after the request): TensorD starts filling their CPU buffers, and each later
     `SealedTier` ask waits only for its own. An older machine refuses; nothing changes."""
 
     sha256: str

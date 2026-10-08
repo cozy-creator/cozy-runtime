@@ -1,8 +1,9 @@
-"""The weight plane's one door into cozy-runtime (`tensorfs.plane`, weight-plane.md §3).
+"""Runtime's adapter to the in-process TensorFS weight-plane/device library.
 
-The plane is mechanism: it never measures free memory, never picks a victim among equals and
-never reorders a schedule. It maps, copies, streams and counts; `weights.py` and
-`weight_policy.py` decide. Everything the runtime reads back from it is typed here.
+TensorD coordinates machine budgets and supplies model data/shared CPU buffers. Runtime
+constructs models and calls this library to allocate, map, copy, stream and unmap their GPU
+weight regions. `weights.py` and `weight_policy.py` choose executor residency within those
+budgets; TensorFS implements the operations. Facts Runtime reads back are typed here.
 """
 
 from __future__ import annotations
@@ -25,11 +26,10 @@ try:
 except ImportError:  # an older TensorFS: the executor offers no `weight_plane/1`
     _plane = None
 
-#: The executor capability a Worker negotiates on (`hello.memory`).
+#: The executor capability TensorD negotiates on (`hello.memory`).
 CAPABILITY = "weight_plane/1"
-#: GPU memory the machine keeps across executors: attach on `Load.device_weights`, `share`
-#: after a call, `revoke` all of a layout or `trim` some of its regions (TensorFS
-#: `Plane.export_device`).
+#: TensorD retains exported GPU allocation handles between executors. Runtime attaches,
+#: exports, revokes or trims the corresponding GPU mappings through its TensorFS plane.
 SHARING = ("weights.attach/1", "weights.revoke/1", "weights.trim/1")
 PINNED: Final = "pinned"
 #: Priorities are plain integers; the plane evicts ascending and never picks among equals, so
@@ -53,7 +53,7 @@ class HostStats(msgspec.Struct, frozen=True, kw_only=True):
     fill_ns: int = 0
     #: -1: a TensorFS before 0.3.92 does not count it (a 0 there was never a measurement)
     disk_read_bytes: int = -1
-    #: RAM of the machine's sealed layouts this plane maps (theirs, not this process's)
+    #: shared CPU-buffer RAM retained by TensorD and mapped by this executor's plane
     sealed_bytes: int = 0
     evictions: int = 0
     #: page locks the driver refused (a sealed layout counts once): those copies bounce
@@ -216,8 +216,8 @@ def sealed_memfd(name: str, body: bytes) -> int:
 
 
 def open_plane(device: int | None) -> Plane:
-    """One plane per executor process (phase 1), over this rank's device; `None` opens the
-    host tier alone (no CUDA), which fills pinned memory before any device is granted."""
+    """Open this executor's TensorFS plane for its selected GPU. `None` opens only a CPU
+    tier, with no CUDA context; a plane is local execution machinery, not a daemon RPC."""
     if _plane is None:
         raise Unavailable("this TensorFS build carries no weight plane")
     try:
@@ -241,8 +241,8 @@ def events(plane: Plane) -> list[Event]:
 
 
 def hold_tier(fd: int) -> int:
-    """Claim every region of a pinned-tier memfd for the Worker (no plane of its own): while
-    it holds the returned descriptor no executor's eviction or close frees the tier's RAM. A
+    """Retain a shared CPU buffer by descriptor for the execution owner: while it holds
+    this claim, executor eviction or close cannot free the buffer's RAM. A
     TensorFS before claims keeps the descriptor as it is."""
     hold = getattr(_plane, "hold_tier", None)
     return int(hold(fd)) if hold is not None else os.dup(fd)
