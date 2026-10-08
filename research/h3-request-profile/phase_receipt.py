@@ -4,12 +4,31 @@ from __future__ import annotations
 
 import argparse
 import json
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 
 def receipt(run: dict[str, Any], summary: dict[str, Any]) -> dict[str, Any]:
     render = summary["render_call"]
+    tails = []
+    for event in run.get("events", []):
+        if event.get("type") != "client.machine_work_finished":
+            continue
+        observed = event.get("payload", {}).get("observed_unix_ms")
+        if not isinstance(observed, (int, float)) or observed <= 0 or not event.get("at"):
+            continue
+        recorded = datetime.fromisoformat(event["at"].replace("Z", "+00:00")).timestamp() * 1000
+        tails.append(
+            {
+                "attempt": event.get("attempt"),
+                "outcome_observed_unix_ms": observed,
+                "outputs_registered_unix_ms": recorded,
+                "wall_ms": recorded - observed,
+                "scope": "Client outcome receipt through artifact export and completion recording",
+                "clock": "client clock only; not subtracted from the remote machine timestamp",
+            }
+        )
     return {
         "diagnostic_only": True,
         "request": {
@@ -32,6 +51,7 @@ def receipt(run: dict[str, Any], summary: dict[str, Any]) -> dict[str, Any]:
         "native_gpus": run.get("gpus", []),
         "render_call": render,
         "encode_mux_output": summary.get("output_sinks", []),
+        "client_completion_tails": tails,
         "bounded_kernel_trace_steps": summary["profiled_step_indices"],
         "phase_sources": {
             "machine_preparation_and_construction": "native_stages; preserve reused setup detail",
@@ -43,7 +63,7 @@ def receipt(run: dict[str, Any], summary: dict[str, Any]) -> dict[str, Any]:
             "output_checks": "check_output",
             "encode_mux_probe_registration": "encode_mux_output; overlaps decode_video",
             "artifact_commit_and_client_export": (
-                "included in native execution/client wall; no isolated timer exposed"
+                "client_completion_tails: export/recording; native commit is included in execution"
             ),
         },
         "overlap_notes": [
@@ -52,7 +72,7 @@ def receipt(run: dict[str, Any], summary: dict[str, Any]) -> dict[str, Any]:
             "Reused executor boot/construction is historical, not fresh request cost.",
             "Sink wall overlaps decode; source time includes waiting, digest and materialization.",
             "Post-EOF sink time includes flush, mux, probe and registration, not only mux.",
-            "Final artifact commit/export is outside render_call; retain total client wall.",
+            "Native commit is outside render_call; client tails cover export/recording together.",
             "Missing timings remain unmeasured; do not relabel residuals as specific phases.",
         ],
     }
