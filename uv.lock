@@ -482,8 +482,8 @@ requires-dist = [
     { name = "pillow", specifier = ">=12" },
     { name = "safetensors", marker = "extra == 'minimax-h3'", specifier = ">=0.8.0" },
     { name = "safetensors", marker = "extra == 'qwen-image21'", specifier = ">=0.8" },
-    { name = "tensorfs", specifier = ">=0.6,<0.7" },
-    { name = "tensorfs", marker = "extra == 'model-execution'", specifier = ">=0.6,<0.7" },
+    { name = "tensorfs", specifier = ">=0.6.1,<0.7" },
+    { name = "tensorfs", marker = "extra == 'model-execution'", specifier = ">=0.6.1,<0.7" },
     { name = "tokenizers", marker = "extra == 'adapters'", specifier = ">=0.23.1" },
     { name = "tokenizers", marker = "extra == 'minimax-h3'", specifier = ">=0.23.1" },
     { name = "tokenizers", marker = "extra == 'qwen-image21'", specifier = ">=0.23.1" },
@@ -509,7 +509,7 @@ dev = [
     { name = "pytest", specifier = ">=8.4" },
     { name = "pytest-split", specifier = ">=0.11.0" },
     { name = "ruff", specifier = ">=0.16" },
-    { name = "tensorfs", specifier = ">=0.6,<0.7" },
+    { name = "tensorfs", specifier = ">=0.6.1,<0.7" },
 ]
 
 [[package]]
@@ -1781,11 +1781,11 @@ wheels = [
 
 [[package]]
 name = "tensorfs"
-version = "0.6.0"
+version = "0.6.1"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/f7/b6/c0c2e8716e780c4b448e1c0c91c709d4cd25788976ed4638cbc1ba4845c5/tensorfs-0.6.0.tar.gz", hash = "sha256:2cfc0c58da35e95daa1d42ff35e3104a87427802f5d41641a5835440c9b7e055", size = 1087060, upload-time = "2026-10-08T01:51:07.224Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/52/52/99ba2af76a30c53be33a64999dda176261e95da97c62908b7909cdf7c1e7/tensorfs-0.6.1.tar.gz", hash = "sha256:4889f05337dc733d5c18509c0b435f00b0b78d84dbe36c3b94afc5a6c035373b", size = 1091695, upload-time = "2026-10-08T07:52:28.296Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/bc/3a/3ee281ca5841e3d50f999942f977ba9c07561df618c53c1eaff9fcc1af92/tensorfs-0.6.0-cp312-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:9332cf94fd07b42bba3eeca172d051e678e3cef4293a99e7f7bc9a1dbb3abf23", size = 8866794, upload-time = "2026-10-08T01:51:03.944Z" },
+    { url = "https://files.pythonhosted.org/packages/28/2e/c1e935b1cde8878fde26d576962fe6e0c087cf2317313fc2055b63b3c984/tensorfs-0.6.1-cp312-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:a67b4742f7d56aaf1bd6d5197c2c59befc506b8e67b2edf0ff267b99654b0efe", size = 8868774, upload-time = "2026-10-08T07:52:25.855Z" },
 ]
 
 [[package]]
