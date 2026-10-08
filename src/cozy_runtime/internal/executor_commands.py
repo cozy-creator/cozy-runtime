@@ -308,8 +308,8 @@ class Load(Command, frozen=True, kw_only=True, tag="load"):
     #: The machine keeps sealed host layouts (`SEALED_TIERS`): each weight set asks for one
     #: (`SealedTier`) and adopts it read-only, reading the store only when none is held.
     sealed_tiers: bool = False
-    #: The machine serves the header and model assets (`ModelSource`): with sealed tiers,
-    #: this executor reads no store. Older workers never set it.
+    #: The machine serves the header and model assets (`ModelSource`). Required for a
+    #: model-bearing load; weightless loads remain valid without storage grants.
     model_sources: bool = False
     #: The machine stages sealed layouts in part and hands over object files (`SealedStage`,
     #: `ObjectFiles`): a GPU executor asks for them only when told so. Older machines never set it.
@@ -447,8 +447,8 @@ class RunJob(_Run, frozen=True, kw_only=True, tag="run_job"):
     call_interfaces: tuple[CallInterface, ...] = ()
     publish_to: str = ""
     budget: JobBudget = JobBudget()
-    #: The owner answers `weights_writer` (the Rust machine): weights go through it even
-    #: where this process's TensorFS opens no store.
+    #: The owner grants source/output writer channels. The installed TensorFS build never
+    #: supplies this authority; absent channels refuse only operations that require them.
     weights: bool = False
 
 

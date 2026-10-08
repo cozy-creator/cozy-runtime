@@ -283,7 +283,6 @@ def test_with_model_sources_an_executor_opens_no_store(tmp_path: Path) -> None:
     try:
         manifest = stored.manifest_id
         checkpoint = Checkpoint(
-            tmp_path / "no-store-here",
             manifest,
             sourced=lambda name: session.executor._model_source(manifest, name),
         )
@@ -337,7 +336,6 @@ def test_a_groups_follower_asks_the_machine_through_rank_0_and_opens_no_store(
         # Both GPUs load at once: rank 0's own requests and the relayed ones share its seam.
         group.send_one(1, {"cmd": "adopt", "manifest": manifest, "construction": "group"})
         checkpoint = Checkpoint(
-            tmp_path / "no-store-here",
             manifest,
             sourced=lambda name: leader._model_source(manifest, name),
         )

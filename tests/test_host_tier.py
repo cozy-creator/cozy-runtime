@@ -104,7 +104,7 @@ import torch
 torch.set_num_threads(2)
 sys.path.insert(0, sys.argv[1])
 from cozy_runtime.internal import plane
-from cozy_runtime.internal.fill import Checkpoint
+from cozy_runtime.internal.fill import Checkpoint, store
 from cozy_runtime.internal.weights import Weights
 from test_weight_plane import load
 
@@ -142,7 +142,7 @@ cached = dict(line.split() for line in (cgroup / "memory.stat").read_text().spli
 weights = GpuTier(torch, torch.device("cpu"), "cpu")
 started, models, throttled = time.monotonic(), [], False
 for index, (root, manifest) in enumerate(json.loads(sys.argv[2])):
-    models.append(load(weights, Checkpoint(root, manifest), f"set{index}"))
+    models.append(load(weights, Checkpoint.from_store(store(root), manifest), f"set{index}"))
     tickets = models[-1].residency.components["stack"].filling
     while not all(ticket.done() for ticket in tickets) and not throttled:
         throttled = sum(held()) >= high

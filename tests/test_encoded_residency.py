@@ -69,7 +69,7 @@ def test_a_native_leaf_serves_the_stored_bytes_only_with_consent(tmp_path: Path)
     writer.add_part("a", "linear.weight", "scale", io.BytesIO(encoded.companions[0].raw))
     writer.add_part("a", "linear.bias", "value", io.BytesIO(bias.tobytes()))
     writer.add_config("model", io.BytesIO(b"{}"))
-    checkpoint = Checkpoint(tmp_path / "store", "sha256:" + writer.commit()["manifest"]["sha256"])
+    checkpoint = Checkpoint.from_store(store, "sha256:" + writer.commit()["manifest"]["sha256"])
     weights = Weights(torch, torch.device("cuda", 0), "cuda")
     backend = PlaneBackend.for_script(
         {"a": checkpoint},

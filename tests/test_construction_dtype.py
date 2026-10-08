@@ -92,7 +92,7 @@ def test_native_checkpoint_registers_the_dtype_selected_constructor(
     transaction.add_config("model", io.BytesIO(b"{}"))
     receipt = transaction.commit()
     manifest = "sha256:" + receipt["manifest"]["sha256"]
-    checkpoint = Checkpoint(tmp_path / "store", manifest)
+    checkpoint = Checkpoint.from_store(store, manifest)
     rows = checkpoint.rows("linear")
     # The host tier alone: registration and the pinned fill need no card.
     weights = Weights(torch, torch.device("cpu"), "cpu")

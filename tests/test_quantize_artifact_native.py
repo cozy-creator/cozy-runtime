@@ -372,7 +372,7 @@ def test_fp16_quantized_native_header_enters_fp16_fill(tmp_path: Path) -> None:
         tmp_path / "quantize", _host(store, "quantize", source), source, "unet", "fp8-rowwise/1"
     )
     assert outcome.terminal == "succeeded" and result is not None
-    checkpoint = Checkpoint(tmp_path / "store", result.manifest.digest)
+    checkpoint = Checkpoint.from_store(store, result.manifest.digest)
     rows = checkpoint.rows("unet")
     backend = PlaneBackend.for_script(
         {"unet": checkpoint},

@@ -192,7 +192,7 @@ def targets(root: Any) -> list[str]:
 def construct(root: Path, view: str) -> tuple[LoRAH3, PlaneBackend]:
     """Exactly the executor's prepare, on a CPU executor: bind the prepared view, construct
     weightless under the serving substrate, register every weight with the plane."""
-    checkpoint = Checkpoint(root, view)
+    checkpoint = Checkpoint.from_store(fill.store(root), view)
     rows = checkpoint.rows(COMPONENT)
     graph = fill.tensorfs_module().parse_header(checkpoint.header_bytes)["configs"]
     artifact = lora_composition.bind(

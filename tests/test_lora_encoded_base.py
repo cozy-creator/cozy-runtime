@@ -70,7 +70,7 @@ def test_native_encoded_base_keeps_parts_and_matches_cpu_peft_arithmetic(tmp_pat
     assert set(before["parts"]) == {"data", "scale"}
     assert header(store, encoded) == encoded_header
     assert header(store, pristine) == original_header
-    checkpoint = Checkpoint(store.root, selected.manifest.digest)
+    checkpoint = Checkpoint.from_store(store, selected.manifest.digest)
     rows = checkpoint.rows("transformer")
     artifact = lora_composition.bind(
         Artifact(selected.manifest.digest, tensor_schema_of(rows), Config({})),

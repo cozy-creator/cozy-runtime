@@ -27,7 +27,6 @@ def digest(output: Any) -> str:
 
 def adopt(executor: Any, root: Path, manifest: str, construction: str) -> dict[str, Any]:
     checkpoint = Checkpoint(
-        root / "no-store-here",
         manifest,
         sourced=lambda name: executor._model_source(manifest, name),
     )

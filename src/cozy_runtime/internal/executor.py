@@ -1870,6 +1870,12 @@ class Executor:
                 "detail": f"this executor is poisoned ({self.poisoned}); a poisoned "
                 "generation has no recovery edge to Ready — the worker replaces it",
             }
+        if not command.model_sources and any(row.binding.model_class for row in command.rows()):
+            return self._refusal(
+                "model_sources_ungranted",
+                "model-bearing loads require the machine's model source grant; "
+                "an installed TensorFS Store does not grant managed model access",
+            )
         sealed_devices = _SEALED.get("CUDA_VISIBLE_DEVICES", "")
         if command.devices != sealed_devices:
             # THE SEAL IS THE DEVICE SELECTION (cr-066). The worker names the lane it
@@ -2041,9 +2047,8 @@ class Executor:
             self._discover_provisioned(binding)
         stage("package_import")
 
-        # The store IS the artifact identity: one snapshot digest, and TensorFS answers with
-        # the header, the plan and the verified lease. The interim path needed a store root
-        # AND a pre-parsed read-plan file beside it; tfs-007 deleted the second one.
+        # The manifest IS the artifact identity: the machine serves its header and assets,
+        # and local TensorFS plans reads over the granted immutable bytes.
         # The component SET, in the contract's own declared order. A single-component
         # binding is the same code with a one-element set: cr-008b did not add a second
         # path, it widened the one that existed. `snapshots` names ONE snapshot per
@@ -2097,18 +2102,16 @@ class Executor:
         vmap = reference.snapshot_map()
         host = self.host
 
-        def sourced(manifest: str) -> Callable[[str], bytes] | None:
+        def sourced(manifest: str) -> Callable[[str], bytes]:
             """Header and assets from the machine (`Load.model_sources`), never the store; a
             follower asks through rank 0 (`_relay`)."""
-            if not command.model_sources:
-                return None
             return lambda name: host._model_source(manifest, name)
 
         # One Checkpoint per manifest: each opens and parses the whole header (SDXL's four
         # components share one, 2,641 rows).
         opened: dict[str, Checkpoint] = {}
         for manifest in {vmap.get(name, reference.snapshot) for name in names}:
-            opened[manifest] = Checkpoint(reference.store, manifest, sourced=sourced(manifest))
+            opened[manifest] = Checkpoint(manifest, sourced=sourced(manifest))
         checkpoints = {name: opened[vmap.get(name, reference.snapshot)] for name in names}
         # `names` is what the DERIVE constructed (model-code-fit D9), not what the header
         # carries: a constructed component the checkpoint lacks is the fit's own
@@ -2154,7 +2157,7 @@ class Executor:
                 if checkpoint.manifest_id == reference.snapshot
             ),
             None,
-        ) or Checkpoint(reference.store, reference.snapshot, sourced=sourced(reference.snapshot))
+        ) or Checkpoint(reference.snapshot, sourced=sourced(reference.snapshot))
         config_bytes = model_config.construction_config(config_checkpoint.header.get("configs"))
         config_document = canonical.parse_canonical(config_bytes)
         if not isinstance(config_document, dict):
@@ -3655,12 +3658,10 @@ class Executor:
 
             weights_values = read_values_into
 
-        from cozy_runtime.internal.fill import store_available
-
         tensorfs_source = tensorfs_output = tensorfs_adopt = None
-        # Weights go through the owner's writer channels: the Rust machine's (`weights`), or the
-        # Python worker's where this process's TensorFS opens a store.
-        if command.weights or store_available():
+        # The owner grants writer channels explicitly. Installing Store APIs grants nothing;
+        # a job without channels can still run and refuses only a storage operation it asks for.
+        if command.weights:
             from cozy_runtime.internal.weights_writer import ExecutionStorage
 
             execution_storage = ExecutionStorage(

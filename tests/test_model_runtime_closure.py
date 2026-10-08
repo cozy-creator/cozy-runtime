@@ -77,8 +77,8 @@ def _snapshot(
 
 
 def test_loader_consumes_verified_header_assets(tmp_path: Path) -> None:
-    store_root, manifest_id, _manifest_length, _store = _snapshot(tmp_path, include_asset=True)
-    assets = fill.Checkpoint(store_root, manifest_id).model_assets()
+    _store_root, manifest_id, _manifest_length, store = _snapshot(tmp_path, include_asset=True)
+    assets = fill.Checkpoint.from_store(store, manifest_id).model_assets()
     assert assets == {"tokenizer/vocab.txt": _ASSET}
 
     class Owner:
@@ -117,8 +117,38 @@ def test_loader_consumes_verified_header_assets(tmp_path: Path) -> None:
 def test_worker_prepare_reads_tensorfs_03_logical_dtype(tmp_path: Path) -> None:
     """Exercise the exact Checkpoint.rows path the executor's worker prepare calls."""
 
-    store_root, manifest_id, _manifest_length, _store = _snapshot(tmp_path, include_asset=True)
-    rows = fill.Checkpoint(store_root, manifest_id).rows("unet")
+    _store_root, manifest_id, _manifest_length, store = _snapshot(tmp_path, include_asset=True)
+    rows = fill.Checkpoint.from_store(store, manifest_id).rows("unet")
     assert [(row.key, row.dtype, row.shape) for row in rows] == [("unet.weight", "f32", (1,))]
     assert rows[0].encoded.encoding == SPEC_PLAIN
     assert SPEC_PLAIN in launch_providers()
+
+
+def test_granted_checkpoint_reads_header_config_and_assets_over_executor_channel(
+    tmp_path: Path,
+) -> None:
+    """The real ModelSource exchange remains usable with a full TensorFS installation."""
+    pytest.importorskip("torch")
+    from test_sealed_tiers import Machine, Session
+
+    root, manifest, _length, store = _snapshot(tmp_path, include_asset=True)
+    machine = Machine(str(root))
+    session = Session(machine, tmp_path)
+    try:
+        checkpoint = fill.Checkpoint(
+            manifest, sourced=lambda name: session.executor._model_source(manifest, name)
+        )
+        standalone = fill.Checkpoint.from_store(store, manifest)
+        assert checkpoint.store is None and checkpoint.root == ""
+        assert checkpoint.header_bytes == standalone.header_bytes == _HEADER
+        assert checkpoint.header["configs"]["unet"] == _CONFIG
+        assert checkpoint.rows("unet") == standalone.rows("unet")
+        assert checkpoint.model_assets() == {"tokenizer/vocab.txt": _ASSET}
+        assert machine.sourced == 2
+        with pytest.raises(fill.FillRefusal, match="reads no store"):
+            checkpoint.acquire()
+        with pytest.raises(TypeError, match="sourced"):
+            fill.Checkpoint(manifest)  # type: ignore[call-arg]
+    finally:
+        session.close()
+        machine.close()
