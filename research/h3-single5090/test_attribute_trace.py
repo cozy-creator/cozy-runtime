@@ -94,6 +94,30 @@ class AttributionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             list(manual_annotations(manual, {}))
 
+    def test_cupti_signed_thread_alias_and_collision(self):
+        row = {
+            "label": "step",
+            "start_unix_ns": 10000,
+            "end_unix_ns": 30000,
+            "pid": 1,
+            "tid": 7,
+            "native_tid": 7,
+            "python_thread_ident": 0xF0000001,
+            "pthread_tid_int32": -268435455,
+            "pthread_tid_uint32": 4026531841,
+        }
+        ranges = list(manual_annotations([row], {"baseTimeNanoseconds": 0}))
+        events = [
+            *ranges,
+            event("cuda_runtime", "launch", 12, 1, tid=-268435455, corr=4),
+            event("kernel", "gemm", 40, 3, pid=0, tid=0, corr=4),
+        ]
+        result = attribute(lambda: iter(events))
+        self.assertEqual(result["groups"][0]["annotations"], ["step"])
+        collision = dict(row, native_tid=8, tid=8, python_thread_ident=0x1F0000001)
+        with self.assertRaises(ValueError):
+            list(manual_annotations([row, collision], {"baseTimeNanoseconds": 0}))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -78,21 +78,47 @@ def manual_annotations(
     base = metadata.get("baseTimeNanoseconds")
     if not isinstance(base, int):
         raise ValueError("Manual Unix ranges require trace baseTimeNanoseconds")
+    owners: dict[tuple[str, int], set[tuple[Any, Any]]] = defaultdict(set)
+    for row in rows:
+        identity = (row.get("native_tid", row.get("tid")), row.get("python_thread_ident"))
+        for key in (
+            "tid",
+            "native_tid",
+            "pthread_tid_int32",
+            "pthread_tid_uint32",
+            "pthread_tid_chrome",
+        ):
+            if isinstance(row.get(key), int):
+                owners[str(row["pid"]), row[key]].add(identity)
     for row in rows:
         start, end = row["start_unix_ns"], row["end_unix_ns"]
         if not isinstance(start, int) or not isinstance(end, int) or end < start:
             raise ValueError("Invalid manual range timestamps")
         if "pid" not in row or "tid" not in row:
             raise ValueError("Manual ranges must identify their host process and thread")
-        yield {
-            "ph": "X",
-            "cat": "user_annotation",
-            "name": row["label"],
-            "pid": row["pid"],
-            "tid": row["tid"],
-            "ts": (start - base) / 1000,
-            "dur": (end - start) / 1000,
+        aliases = {
+            row[key]
+            for key in (
+                "tid",
+                "native_tid",
+                "pthread_tid_int32",
+                "pthread_tid_uint32",
+                "pthread_tid_chrome",
+            )
+            if isinstance(row.get(key), int)
         }
+        for tid in sorted(aliases):
+            if len(owners[str(row["pid"]), tid]) != 1:
+                raise ValueError("Manual ranges contain colliding thread aliases")
+            yield {
+                "ph": "X",
+                "cat": "user_annotation",
+                "name": row["label"],
+                "pid": row["pid"],
+                "tid": tid,
+                "ts": (start - base) / 1000,
+                "dur": (end - start) / 1000,
+            }
 
 
 def attribute(
@@ -215,6 +241,8 @@ def main() -> None:
     result["trace"] = str(options.trace)
     result["trace_metadata"] = metadata
     result["manual_ranges_source"] = str(options.ranges) if options.ranges else None
+    result["manual_range_count"] = len(manual)
+    result["manual_thread_aliases"] = "Native and captured pthread IDs; collisions refuse"
     options.out.write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps({key: value for key, value in result.items() if key != "groups"}))
 
