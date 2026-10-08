@@ -7,8 +7,9 @@ remain executor allocations. TensorD coordinates budgets and can retain exported
 allocation handles; Runtime attaches those allocations and binds its own tensor views.
 
 The plane registers one weight set per component in regions: `common` and each innermost
-no-split block (`paging.partition`). A scope is a stage: at `admit` the policy (`weight_policy.stage`) picks
-each component's resident set, window and ring inside the plane budget; the resident set is
+no-split block (`paging.partition`). A scope is a stage: at `admit` the policy
+(`weight_policy.stage`) picks each component's resident set, window and ring inside the
+plane budget; the resident set is
 wanted and a cursor streams the rest through its byte ring in the blocks' execution order.
 Each block runs inside exactly one acquire/release; a resident region binds at its stable
 address, a streamed one at its place in the ring, from cached views. A torch OOM makes room
@@ -298,9 +299,9 @@ class Weights:
     """This executor process's plane, budgets and every registered weight set (one per rank).
 
     TensorD supplies budgets; this object carries out local buffer/device operations through
-    TensorFS. Every component of every construction shares one plane. Least recently used across them
-    is the plane's priority order, so a construction switch moves nothing until a stage wants
-    the room, and an evicted component's bytes stay in the pinned tier.
+    TensorFS. Every component of every construction shares one plane. Least recently used
+    across them is the plane's priority order, so a construction switch moves nothing until
+    a stage wants the room, and an evicted component's bytes stay in the pinned tier.
     """
 
     def __init__(self, torch: ModuleType, device: Device, kind: str) -> None:
@@ -1502,7 +1503,7 @@ def _recovery_type(torch: ModuleType) -> type:
             journal = self.journal
             drawn = _generators(torch, func, args, kwargs) if seeded in func.tags else []
             states = [(g, g.get_state()) for g in drawn]
-            written: list[tuple[Any, Any]] = []
+            written: list[tuple[Tensor, Tensor]] = []
             if func._schema.is_mutable:
                 targets = list(_tensor_operands(tuple(_written(func, args, kwargs))))
                 if journal is not None:
@@ -1578,7 +1579,7 @@ class Journal:
             key = _storage(value)
             if key < 0 or key in self.made_here or key in self.kept:
                 continue
-            storage = value.untyped_storage()  # type: ignore[attr-defined]
+            storage = value.untyped_storage()
             self.kept[key] = (storage, storage.clone())
             self.wrote = True
 
@@ -1691,11 +1692,13 @@ def _storage(value: object) -> int:
         return -1
 
 
-def _tensor_operands(operands: Sequence[object]) -> Iterator[object]:
+def _tensor_operands(operands: Sequence[object]) -> Iterator[Tensor]:
+    """Tensor arguments/results of Torch ops, including one level of tensor sequences.
+    The structural check keeps this module importable without importing Torch itself."""
     for value in operands:
         for item in value if isinstance(value, (tuple, list)) else (value,):
             if hasattr(item, "untyped_storage"):
-                yield item
+                yield cast("Tensor", item)
 
 
 def _pointers(operands: Sequence[object]) -> Iterator[int]:
@@ -1724,12 +1727,15 @@ def _drop_copies(region: Region) -> None:
     """Unbind a region whose destinations a package's `module.to(dtype)` gave bytes of their
     own: torch's copies beside the plane's (SDXL's VAE upcast and cast back: 160 MiB kept
     across requests). Its next bind converts again."""
-    views = region.views.get(region.bound) if region.bound is not None else None
+    bound = region.bound
+    if bound is None:
+        return
+    views = region.views.get(bound)
     if views is not None and any(
         (held := table.get(name)) is not None and held.data_ptr() != tensor.data_ptr()
         for table, name, tensor, _ in views.writes
     ):
-        del region.views[region.bound]  # a cached Parameter may hold a copy as its `.data`
+        del region.views[bound]  # a cached Parameter may hold a copy as its `.data`
         unbind(region)
 
 
