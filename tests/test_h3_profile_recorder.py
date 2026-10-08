@@ -145,3 +145,25 @@ def test_output_observer_keeps_source_failures_and_does_not_invent_eof():
         observed.save_video_stream(broken())
     assert not observed.sinks[0]["succeeded"]
     assert observed.sinks[0]["after_source_eof_finalize_probe_ms"] is None
+
+
+def test_registered_handler_survives_public_export_proxy_replacement(monkeypatch):
+    import sys
+
+    from cozy_runtime.author import App
+
+    module, app = recorder(), App()
+
+    @app.entrypoint(name="fl2va")
+    def original():
+        return 7
+
+    def managed_proxy():
+        raise AssertionError("a diagnostic renderer must not submit a child instead")
+
+    monkeypatch.setitem(sys.modules, "h3", SimpleNamespace(app=app, fl2va=managed_proxy))
+    handler = module.retained_handler("fl2va")
+    assert handler is original and handler() == 7
+    app.get("fl2va").internal = True
+    with pytest.raises(ValueError, match="public retained"):
+        module.retained_handler("fl2va")

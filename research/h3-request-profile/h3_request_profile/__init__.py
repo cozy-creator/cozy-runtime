@@ -5,7 +5,6 @@ from __future__ import annotations
 from typing import Annotated, Any, Literal
 
 import msgspec
-from h3 import fl2va, fl2va_turbo
 
 from cozy_runtime.author import (
     App,
@@ -21,7 +20,7 @@ from cozy_runtime.author import (
 )
 from cozy_runtime.models.minimax_h3.model import H3Model, H3TurboBase, H3TurboLoRA
 
-from .instrument import profile_request, software_versions
+from .instrument import profile_request, retained_handler, software_versions
 
 app = App()
 
@@ -69,18 +68,15 @@ class EnvironmentResult(msgspec.Struct):
     delegated_handler_symbols: dict[str, list[str]]
 
 
-@app.entrypoint
+@app.job
 def environment(payload: EnvironmentInput, ctx: Context) -> EnvironmentResult:
-    """Model-free serving proof: jobs intentionally replace child exports with managed proxies."""
+    """CPU receipt proves direct implementation binding despite job-only public-export proxies."""
     if ctx.device.type != "cpu":
         raise ValueError("The environment receipt must run without a GPU allocation")
     return EnvironmentResult(
         str(ctx.device),
         software_versions(),
-        {
-            name: list(fn.__code__.co_names)
-            for name, fn in (("fl2va", fl2va), ("fl2va_turbo", fl2va_turbo))
-        },
+        {name: list(retained_handler(name).__code__.co_names) for name in ("fl2va", "fl2va_turbo")},
     )
 
 
@@ -104,11 +100,12 @@ def regular(
 ) -> ProfileResult:
     if payload.duration_s != 15 or payload.steps != 30:
         raise ValueError("This diagnostic retains the full15-second regular30 request")
+    handler = retained_handler("fl2va")
     return saved(
         profile_request(
             model,
             10,
-            lambda observed_out: fl2va(ctx, payload, assets, model, observed_out, tel),
+            lambda observed_out: handler(ctx, payload, assets, model, observed_out, tel),
             outputs=out,
             telemetry=tel,
             detailed=payload.profile_detail,
@@ -131,11 +128,12 @@ def turbo(
 ) -> ProfileResult:
     if payload.duration_s != 15:
         raise ValueError("This diagnostic retains the full15-second Turbo8 request")
+    handler = retained_handler("fl2va_turbo")
     return saved(
         profile_request(
             base_model,
             4,
-            lambda observed_out: fl2va_turbo(
+            lambda observed_out: handler(
                 ctx, payload, assets, base_model, turbo_lora, observed_out, tel
             ),
             outputs=out,
