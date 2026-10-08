@@ -37,3 +37,9 @@ Example input: `{"case":"all","seed":20261008,"warmup":10,"repeats":30}`.
 The local artifact copy can point `tool.uv.sources.cozy-runtime` at the immutable
 study wheel for metadata preparation. The selected worker SDK remains execution
 authority. No local GPU run is part of preparation.
+
+The separate `trace_cuda_only` job is a tiny profiler-capability probe. It records
+CUDA-only activities around labeled H2D, matmul and D2H operations, then exports
+the ChromeTrace plus an actual category/correlation/annotation census. Missing
+user annotations or CUDA-runtime events are reported rather than assumed present.
+Its default512x512 matrices and3repeats do not measure H3 performance.

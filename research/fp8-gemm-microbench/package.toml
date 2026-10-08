@@ -1,0 +1,2 @@
+[application]
+object = "fp8_gemm_microbench:app"
