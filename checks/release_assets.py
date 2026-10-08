@@ -24,8 +24,20 @@ def selected(sums: str) -> dict[str, str]:
     return files
 
 
-def verify(dist: Path, sums: str) -> str:
+def verify(dist: Path, sums: str, version: str) -> str:
     files = selected(sums)
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+        raise ValueError("release version must be the verified X.Y.Z version")
+    required = {
+        f"cozy_runtime-{version}.tar.gz",
+        f"cozy_runtime-{version}-py3-none-any.whl",
+        f"cozy_runtime-{version}-cp312-abi3-manylinux_2_28_x86_64.whl",
+    }
+    if files.keys() != required:
+        raise ValueError(
+            f"approved files are not the complete {version} release: "
+            f"missing={sorted(required - files.keys())}, extra={sorted(files.keys() - required)}"
+        )
     actual = {path.name for path in dist.iterdir() if not path.name.startswith(".")}
     if actual != files.keys():
         raise ValueError(
@@ -45,8 +57,9 @@ def verify(dist: Path, sums: str) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dist", type=Path, required=True)
+    parser.add_argument("--version", required=True, help="Version verified from the immutable tag")
     args = parser.parse_args()
-    sums = verify(args.dist, os.environ.get("SUMS", ""))
+    sums = verify(args.dist, os.environ.get("SUMS", ""), args.version)
     if output := os.environ.get("GITHUB_OUTPUT"):
         with open(output, "a") as stream:
             stream.write(f"sha256sums<<SUMS\n{sums}\nSUMS\n")

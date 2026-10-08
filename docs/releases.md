@@ -35,8 +35,9 @@ gh workflow run publish.yaml -f release_tag=vX.Y.Z -f mode=prebuilt \
 ```
 
 This path needs no TensorD or TensorFS source credentials. It verifies tag identity,
-downloads the release assets and refuses missing, extra or changed files. It does not
-import or execute downloaded artifact contents. The publishing job rechecks the hashes
+downloads the release assets and requires the native wheel, pure wheel and sdist for
+that same verified version. It refuses wrong-version, missing, extra or changed files.
+It does not import or execute downloaded artifact contents. The publishing job rechecks the hashes
 after artifact transfer, publishes with OIDC, and checks PyPI serves the same file set
 and hashes. Native donor pins and source build checks still belong to source mode.
 

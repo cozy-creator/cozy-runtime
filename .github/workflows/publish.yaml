@@ -206,12 +206,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.release_tag }}
+          VERSION: ${{ steps.release.outputs.version }}
           SUMS: ${{ inputs.gated_sha256sums }}
         run: |
           set -eu
           test -n "$SUMS" || { echo "::error::Prebuilt mode requires gated_sha256sums."; exit 1; }
           gh release download "$TAG" -R "$GITHUB_REPOSITORY" -D dist
-          uv run --no-project --python 3.12 python release-tools/checks/release_assets.py --dist dist
+          uv run --no-project --python 3.12 python release-tools/checks/release_assets.py --dist dist --version "$VERSION"
       - uses: actions/upload-artifact@v4
         with:
           name: release-dist
