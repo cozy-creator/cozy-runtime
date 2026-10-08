@@ -8,7 +8,6 @@ import pytest
 
 from cozy_runtime.internal import attention, attention_fp8_sol, attention_sol
 from cozy_runtime.internal.encoding import DeviceFacts
-from testdata.fp8_sol_cpu import quantize_cpu, reference
 
 torch = pytest.importorskip("torch")
 
@@ -29,6 +28,8 @@ def test_fp16_tile_ranges_are_finite_even_with_all_products_at_the_bound() -> No
 
 @pytest.mark.parametrize("case", ["zeros", "extrema", "random"])
 def test_cpu_oracle_all_exact_preserves_constant_values_and_bounds_error(case: str) -> None:
+    from testdata.fp8_sol_cpu import quantize_cpu, reference
+
     torch.set_num_threads(1)
     generator = torch.Generator().manual_seed(617)
     tensors = [torch.randn(1, 257, 2, 128, generator=generator).bfloat16() for _ in range(3)]
