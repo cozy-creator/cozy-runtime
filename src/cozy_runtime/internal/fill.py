@@ -1,9 +1,11 @@
 """Granted model headers, tensor read plans and explicit standalone Store utilities.
 
-The weight plane (`weights.py`, `tensorfs-plane`) moves the bytes. This module projects
-TensorFS headers into contract rows, derives servability from plan resolution and maps
-native refusals into `FillRefusal`. Managed checkpoints consume owner-granted sources;
-standalone callers supply a Store explicitly when they need local verified read leases.
+TensorD makes stored weight bytes/metadata available and prepares shared CPU buffers using
+TensorFS. Runtime calls TensorFS locally to parse headers and plan reads, then uses its
+weight plane (`weights.py`) for executor buffer/GPU operations. This module projects headers
+into contract rows, derives servability and maps native refusals into `FillRefusal`.
+Managed checkpoints read TensorD-supplied sources; standalone callers explicitly supply
+a Store when they need local verified read leases.
 """
 
 from __future__ import annotations
@@ -311,7 +313,7 @@ class PlanRow:
 
 
 class Checkpoint:
-    """A model header and assets granted by the machine, parsed locally with TensorFS.
+    """Model header/asset byte access supplied by TensorD, parsed locally with TensorFS.
 
     Managed executors receive a source; they never infer store authority from a path or
     an installed build. Standalone callers can explicitly supply their own Store through
@@ -324,8 +326,9 @@ class Checkpoint:
         *,
         sourced: Callable[[str], bytes],
     ) -> None:
-        """`sourced` serves the header (name "") and each asset (the Rust machine's
-        `ModelSource`): such a checkpoint opens no store, and has no lease to give."""
+        """`sourced` reads the header (name "") or a declared asset through TensorD's
+        `ModelSource` exchange. It returns bytes, not just an identifier or permission;
+        this checkpoint opens no Store and cannot issue a local Store lease."""
         self.root = ""
         self.sourced: Callable[[str], bytes] | None = sourced
         self.store: Store | None = None

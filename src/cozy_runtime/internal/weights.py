@@ -1,8 +1,13 @@
-"""Executor weights on the TensorFS weight plane (weight-plane.md §3-4).
+"""Runtime model weights on its in-process TensorFS plane (weight-plane.md §3-4).
 
-Construction runs on meta and torch never allocates a weight. The plane holds every weight
-byte, one weight set per component, in regions: `common` and each innermost no-split block
-(`paging.partition`). A scope is a stage: at `admit` the policy (`weight_policy.stage`) picks
+TensorD makes stored weight data available and prepares/retains shared CPU buffers through
+TensorFS. Runtime constructs models, starts stored parameters as meta placeholders, and
+uses the plane to allocate, copy, map and unmap GPU regions. Decoded/derived Torch buffers
+remain executor allocations. TensorD coordinates budgets and can retain exported GPU
+allocation handles; Runtime attaches those allocations and binds its own tensor views.
+
+The plane registers one weight set per component in regions: `common` and each innermost
+no-split block (`paging.partition`). A scope is a stage: at `admit` the policy (`weight_policy.stage`) picks
 each component's resident set, window and ring inside the plane budget; the resident set is
 wanted and a cursor streams the rest through its byte ring in the blocks' execution order.
 Each block runs inside exactly one acquire/release; a resident region binds at its stable
@@ -292,7 +297,8 @@ class Component:
 class Weights:
     """This executor process's plane, budgets and every registered weight set (one per rank).
 
-    Every component of every construction shares one plane. Least recently used across them
+    TensorD supplies budgets; this object carries out local buffer/device operations through
+    TensorFS. Every component of every construction shares one plane. Least recently used across them
     is the plane's priority order, so a construction switch moves nothing until a stage wants
     the room, and an evicted component's bytes stay in the pinned tier.
     """
@@ -305,7 +311,7 @@ class Weights:
         #: no device in the plane: a CPU executor, whose pinned tier IS its device memory
         self.host_only = device.type != "cuda"
         self.plane = plane.open_plane(None if self.host_only else self.index)
-        #: the Worker's budgets; -1: none given, each stage derives one from the driver
+        #: TensorD's budgets; -1: none given, each stage derives one from the driver
         self.budget = -1
         self.pinned = -1
         #: an older Worker's load ceiling, bounding driver-derived budgets; -1: none
@@ -853,7 +859,7 @@ class Weights:
 
     def measure_context(self) -> None:
         """What the driver charges this process beyond torch's segments and the plane's maps:
-        the CUDA context and library workspaces the Worker must leave room for."""
+        the CUDA context and library workspaces TensorD must leave room for."""
         pid = os.getpid()
         device_id = self._uuid()
         row = accel.process_memories_by_device({pid}, self.kind, (device_id,))[device_id][pid]
@@ -875,7 +881,7 @@ class Weights:
     def resident_bytes(self, component: Component) -> int:
         return plane.stats(self.plane).ready(component.key, self.index)
 
-    # -- GPU memory the machine keeps (`weights.attach/1`)
+    # -- GPU allocations retained by TensorD through exported handles (`weights.attach/1`)
 
     def _shares(self) -> bool:
         return (
@@ -903,9 +909,9 @@ class Weights:
         return None
 
     def attach(self, component: Component) -> int:
-        """Map the regions the machine keeps for exactly this layout, read-only and without a
-        copy. A region that cannot attach fills privately, as without a machine. Returns the
-        bytes attached."""
+        """Use this executor's plane to map GPU allocations TensorD retains for the layout.
+        Attaching is read-only and copies no payload; unavailable regions fill privately
+        under the executor's budget. Returns the bytes attached."""
         if self.sharing is None or not self._shares():
             return 0
         attached = self._attach(component, "")
@@ -1971,7 +1977,8 @@ class PlaneBackend:
     """The loader's `Backend` on the plane (§1.1's one fill path): `fit` judges, `materialize`
     keeps weights on meta and derived buffers real, `fill` validates each destination against
     its stored row, and `commit` installs encoded leaves and registers every component's
-    regions with the plane. No byte moves here; the first stage wants them."""
+    regions with Runtime's TensorFS plane. Stages request GPU residency; CPU-only execution
+    can fill/bind host buffers when those regions register."""
 
     def __init__(
         self,
@@ -1987,8 +1994,8 @@ class PlaneBackend:
         tiers: HostTiers | None = None,
     ) -> None:
         self.weights = weights
-        #: the worker's pinned host tiers, kept across executors: adopted when it holds one
-        #: for exactly this layout, offered when this process filled a new one
+        #: shared CPU weight buffers: reuse TensorD's matching layout, or offer a buffer
+        #: this executor filled through its TensorFS plane
         self.tiers = tiers
         self.torch = weights.torch
         self.construction = construction
@@ -1997,8 +2004,8 @@ class PlaneBackend:
         self.custody = custody
         self.device = weights.device
         self.kind = weights.kind
-        #: Verified at `expect`, then handed to the plane: one source per manifest, shared by
-        #: its components' weight sets, which re-read evicted regions from the store.
+        #: Explicit Store-backed checkpoints use these verified local leases. Managed
+        #: checkpoints instead use TensorD's buffers/object descriptors, without a local Store.
         self.leases = ReadLeases(self.checkpoints)
         self.sources: dict[str, Source] = {}
         self.state = "open"
@@ -2468,8 +2475,8 @@ class PlaneBackend:
         units, kept, checkpoint, plan = layout.units, layout.kept, layout.checkpoint, layout.plan
         ids, digest, key = layout.ids, layout.digest, layout.sealed.name
         weights = self.weights
-        # A finer re-registration reads its own store, except where the machine serves this
-        # checkpoint (`Load.model_sources`): there it asks for the finer layout too.
+        # Standalone checkpoints can reread their explicit Store for a finer layout.
+        # Managed checkpoints ask TensorD for the finer shared CPU layout instead.
         tiers = None if fine and checkpoint.store is not None else self.tiers
         with store_refusals(f"registering {name}"):
             held = None
@@ -2487,8 +2494,9 @@ class PlaneBackend:
             try:
                 if sealed:
                     assert held is not None
-                    # The machine's: no store, no lease, no fill here, ever. (`files` only
-                    # when there are any: an older TensorFS takes no such argument.)
+                    # TensorD supplied the CPU buffer; this executor opens no Store or
+                    # local read lease. TensorFS can read unstaged regions from supplied
+                    # object descriptors (`files` is absent for older plane APIs).
                     handed: dict[str, Any] = {"files": files} if files else {}
                     ws = weights.plane.register_sealed(key, plan, ids, held, **handed)
                 else:
@@ -2588,9 +2596,12 @@ class PlaneBackend:
 
 @dataclass(frozen=True, slots=True)
 class DeviceTiers:
-    """The machine's custody of GPU regions (`weights.attach/1`): `ask` returns the regions it
-    keeps for exactly (weight set, layout, GPU, variant) and their fds, `held` False when it
-    keeps none; `offer` hands it the regions this process filled and exported, with their fds."""
+    """Exchange exported GPU allocation handles with TensorD (`weights.attach/1`).
+
+    `ask` returns retained regions/fds for (weight set, layout, GPU, variant), or `held`
+    False. Runtime attaches/maps them locally. `offer` hands TensorD handles exported by
+    this executor's plane after Runtime filled the regions; it transfers no model object.
+    """
 
     ask: Callable[[str, str, str, str], DeviceTierAnswer]
     offer: Callable[
@@ -2600,17 +2611,19 @@ class DeviceTiers:
 
 @dataclass(frozen=True, slots=True)
 class HostTiers:
-    """Where a weight set's pinned tier comes from and goes to: `ask` returns a memfd already
-    holding exactly (weight set, layout) or None (the worker's, or a group's rank 0's);
-    `offer` hands the worker one this process filled; `share` hands every registered one on
-    (rank 0 to its followers, so K ranks pin one copy)."""
+    """Exchange CPU weight buffers, distinct from stored files and GPU allocations.
+
+    `ask` returns a matching memfd from TensorD or rank zero, or None. `offer` hands the
+    owner a buffer this executor filled; `share` passes it from rank zero to followers.
+    The sealed-layout callbacks ask TensorD to prepare/retain CPU buffers using TensorFS.
+    """
 
     ask: Callable[[str, str], int | None]
     offer: Callable[[str, str, int], None]
     share: Callable[[str, str, int], None] = lambda name, layout, memfd: None
-    #: the machine's sealed layout for a plan (`SealedTier`), asked instead of `ask`
+    #: TensorD's sealed CPU layout for a plan (`SealedTier`), asked instead of `ask`
     seal: Callable[[SealedPlan], int | None] | None = None
-    #: start the machine filling every component's layout at once (`SealedPrefetch`)
+    #: ask TensorD to fill the components' shared CPU layouts (`SealedPrefetch`)
     prefetch: Callable[[list[SealedPlan]], None] | None = None
     #: stage more regions of a layout staged in part (`SealedStage`): those staged or staging
     stage: Callable[[SealedPlan, list[int]], list[int]] | None = None
@@ -2685,7 +2698,7 @@ def _lora_layers(root: Module, region: Region) -> list[Bake]:
 
 def _bakes_here(weights: Weights, component: Component, region: Region) -> bool:
     """A region bakes its LoRA'd linears unless the request said per step, on a GPU: a CPU
-    executor computes on its host tier, which other executors adopt as the stored bytes."""
+    executor computes on its CPU buffer, which other executors reuse as source bytes."""
     del component
     return bool(region.bakes) and not weights.host_only and weights.lora == "bake"
 
@@ -2816,7 +2829,7 @@ class WeightResidency:
         self.pressure = (0, 0)
         self.derived_at_open = 0
         #: The scheduler's turn (W4, `stage/1`): called before a stage plans, returns the
-        #: plane budget the Worker granted for it, or None to keep the current one; and its
+        #: plane budget TensorD granted for it, or None to keep the current one; and its
         #: sink for each stage's measured facts at exit.
         self.turn: Callable[[str, tuple[str, ...]], int | None] | None = None
         self.exit: Callable[[StageExit], None] | None = None
@@ -2828,7 +2841,7 @@ class WeightResidency:
         self.repeats: dict[str, int] = {}
         #: a repeating method's stage left open between its entries (its resident set bound,
         #: its common leases and cursors live, the cursor already copying the next pass), and
-        #: the Worker's budget it was planned in
+        #: TensorD's budget it was planned in
         self.parked: tuple[str, tuple[str, ...], int] | None = None
         self._shortfall_error = (plane.error("Shortfall"), plane.error("BelowFloor"))
         self._budget_error = plane.error("BudgetExceeded")
@@ -4013,9 +4026,9 @@ def _objects(plan: ReadPlan) -> list[tuple[str, int]]:
 def _stage_stream(
     weights: Weights, component: Component, residence: weight_policy.Residence, clock: int
 ) -> None:
-    """The blocks a stage streams every step get the machine's sealed, pinned host copy: ask
-    it to stage those it lacks (a layout staged in part), then pin what it staged. What it
-    cannot stage keeps streaming from the object files through the plane's staging buffers."""
+    """Ask TensorD to stage streamed blocks into its shared CPU buffer, then pin them
+    through the executor's plane. Unstaged regions stream from supplied object descriptors
+    through the plane's staging buffers before GPU use."""
     if component.staging is None:
         return  # a whole layout: pinned at registration, inside the pinned budget
     plan, tiers = component.staging
@@ -4061,8 +4074,8 @@ def _unpaid(
 
 
 def _end_leases(component: Component) -> None:
-    """Close the machine's lease sockets once none of the component's regions maps shared
-    memory any longer: the machine sees each lease end without being told."""
+    """Close TensorD's lease sockets after Runtime stops mapping the shared GPU regions;
+    TensorD observes the end of this executor's use through those sockets."""
     for fd in component.leases:
         with suppress(OSError):
             os.close(fd)

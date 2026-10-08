@@ -2,7 +2,7 @@
 
 `WeightsReader` is an injected job service. It opens an attempt-scoped read lease over
 an exact granted model input. Ordinary invocable callers pass `ModelArtifact` values;
-TensorD validates their producer/receipt and supplies scoped source access on request.
+TensorD selects and checks the retained model input and supplies scoped source access on request.
 Runtime binds typed model parameters such as `QuantizationSource` before the function runs. Source
 access provides actual metadata and encoded bytes through TensorFS; it does not construct
 a Python model or create GPU tensors.

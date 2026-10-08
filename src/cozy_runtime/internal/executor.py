@@ -1,10 +1,14 @@
 """The long-lived device executor: Python, CUDA, loaded constructions, one GPU attempt.
 
-This is the ONLY process in the worker that imports torch or touches a device. It lives
-for its (environment, lane) and holds every construction it has loaded; it is still
-disposable in the strong sense: `kill -9` at any instant is a supported input, and the
-worker converges to a typed terminal and a fresh epoch from what it recorded.
-Nothing durable lives here — no records, no credential, no monotone wire counter.
+Runtime imports the package's Torch stack and constructs its models in this process.
+TensorD makes model data available, prepares shared CPU buffers through TensorFS and
+coordinates machine budgets. Runtime uses its local TensorFS plane/device APIs to allocate,
+copy, map and unmap GPU weight memory, and can attach allocations TensorD keeps through
+exported handles. TensorFS therefore runs in both processes; it is not a separate daemon.
+
+The executor lives for its (environment, lane) and holds its loaded constructions.
+TensorD supervises its disposable lifetime and owns durable execution records; source and
+output transaction durability remain with the native TensorFS store and execution owner.
 
 Its whole surface is the seam (`internal/seam.py`), and its whole vocabulary is:
 
@@ -16,17 +20,16 @@ Its whole surface is the seam (`internal/seam.py`), and its whole vocabulary is:
     unload    drop one construction and free its device bytes
     residency every loaded construction, resident or parked
     prepare_request  resolve ONE request (decode, normalize, preflight) and retain it, so
-              the worker prices a plan against the record the handler will actually run
+              TensorD prices a plan against the record the handler will actually run
     invoke    run ONE PREPARED attempt through the author invocation kernel and report its facts
     run_job   run ONE @app.job to completion through the SAME kernel, with job services
-    probe     device/host memory facts, for the worker's ledger reconciliation
+    probe     device/host memory facts, for TensorD's ledger reconciliation
     shutdown  cooperative exit
 
-Cancellation is attempt-keyed: `ctx.cancelled` reads the marker the worker publishes for
+Cancellation is attempt-keyed: `ctx.raise_if_cancelled` reads the marker TensorD publishes for
 this exact request. A stale cancellation therefore cannot cross into the next attempt.
 Every telemetry step, stage and progress call and, in a group, every mirrored call is a safe
-point; the attempt ends CANCELED there and the process stays Ready. The worker reclaims the
-whole executor scope only when the attempt stops moving against its own measured cadence.
+point. TensorD supervises executor lifetime and records the attempt's terminal outcome.
 
 The env seal is enforced, not trusted: the sealed values are snapshotted BEFORE torch is
 imported, re-imposed before Torch import, CUDA init and every reply, and any names package
@@ -1627,8 +1630,9 @@ class Executor:
     def load(self, command: Load) -> dict[str, Any]:
         """Construct and fill ONE construction under its key; a loaded key answers again.
 
-        The worker names the key (its construction key). Construction registers regions
-        with the plane and maps nothing; the first stage wants them. A load refused before
+        TensorD names the key and supplies model-source access and memory budgets. Runtime
+        constructs the model and registers weight regions with its local TensorFS plane;
+        the first stage requests their GPU residency. A load refused before
         it touched the process leaves the other constructions serving; one that commanded
         followers or raised poisons the process.
         """
@@ -2047,8 +2051,8 @@ class Executor:
             self._discover_provisioned(binding)
         stage("package_import")
 
-        # The manifest IS the artifact identity: the machine serves its header and assets,
-        # and local TensorFS plans reads over the granted immutable bytes.
+        # The manifest identifies stored weights and metadata. TensorD supplies the header
+        # and asset bytes; Runtime calls TensorFS locally to parse them and plan reads.
         # The component SET, in the contract's own declared order. A single-component
         # binding is the same code with a one-element set: cr-008b did not add a second
         # path, it widened the one that existed. `snapshots` names ONE snapshot per
@@ -2103,8 +2107,8 @@ class Executor:
         host = self.host
 
         def sourced(manifest: str) -> Callable[[str], bytes]:
-            """Header and assets from the machine (`Load.model_sources`), never the store; a
-            follower asks through rank 0 (`_relay`)."""
+            """Read actual header/asset bytes supplied by TensorD (`Load.model_sources`).
+            A follower uses rank 0's relay; this executor opens no Store."""
             return lambda name: host._model_source(manifest, name)
 
         # One Checkpoint per manifest: each opens and parses the whole header (SDXL's four
@@ -2241,7 +2245,8 @@ class Executor:
             except plane.Unavailable as exc:
                 return {"ok": False, "code": "weight_plane_unavailable", "detail": str(exc)}
         weights = host.weights
-        # The machine keeps GPU weights across executors: attach what it holds, offer the rest.
+        # TensorD retains exported GPU allocation handles. Runtime's plane attaches those
+        # allocations here and can later export its own filled regions for reuse.
         sharing = command.device_weights and self.world == 1 and plane.sharing()
         weights.sharing = (
             DeviceTiers(ask=self._ask_device, offer=self._offer_device) if sharing else None
@@ -4544,7 +4549,8 @@ class Executor:
         return answer
 
     def prefetch(self, command: Prefetch) -> dict[str, Any]:
-        """Fill one construction's host tier now, before its attempt holds the device."""
+        """Request CPU-tier fill/pinning for an existing construction through this plane.
+        This differs from the author's known-next-call hint sent to TensorD."""
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
 

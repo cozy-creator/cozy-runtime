@@ -1,7 +1,10 @@
-"""Bind admitted executions to worker-owned native TensorFS source and output handles.
+"""Bind Runtime execution to owner-scoped native TensorFS source and output handles.
 
 Only bounded declarations and receipts use the executor control exchange. TensorFS
 owns source/config transport, streamed parts, checkpoints and native writer semantics.
+In managed execution TensorD embeds the Store and serves these channels; Runtime/package
+code uses the local TensorFS client library. The Python broker supports explicit owners
+and component proofs, not a separate TensorFS daemon.
 """
 
 from __future__ import annotations

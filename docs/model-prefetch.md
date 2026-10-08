@@ -14,6 +14,10 @@ The callee must be an existing locked managed callable. Runtime checks the bindi
 serializes any requested `models` choices and sends `ModelPrefetch` to TensorD. The
 acknowledgment does not promise completion or a particular residency state. The later
 ordinary invocation still resolves its own models and performs any required preparation.
+Current TensorD handles this hint using the callable and its parent's bindings; it does
+not consume the hint's `models` payload. Pass model overrides to the later invocation
+itself, where they determine the selected inputs. Selection handling is tracked in
+[tracker #345](https://github.com/cozy-creator/tracker/issues/345).
 
 TensorD decides how far to prepare the known call under current machine policy. This can
 include obtaining stored model objects through TensorFS, preparing shared CPU buffers,
