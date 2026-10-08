@@ -2488,7 +2488,7 @@ class Executor:
         # No warm step: a call waits on every load, so a dry render only delays it. Its first
         # stage maps the weights and pays the first launches (the ledger re-baselines once).
         weights.measure_context()
-        if "sol-attn" in applied.totals():
+        if attention_sol.NAMES.intersection(applied.totals()):
             frozen = attention._baked_in(dict(backend.roots))
             if frozen:
                 backend.poison(())
@@ -3110,21 +3110,25 @@ class Executor:
         stage_memo.ENGINE.close(record.emit)
         if served_attention is not None:
             self._emit_attention(record, served_attention, "attention.selected")
-            if "sol-attn" in served_attention.totals():
+            sparse_kernels = sorted(attention_sol.NAMES.intersection(served_attention.totals()))
+            if sparse_kernels:
+                sparse_name = "+".join(sparse_kernels)
                 record.emit(
                     "confession",
                     "attention.sol.calls",
-                    "sol-attn",
+                    sparse_name,
                     rank=0,
                     world=self.world,
-                    dense_reference=attention_sol.dense_identity(),
+                    dense_reference=", ".join(
+                        dict.fromkeys(attention_sol.dense_identity(name) for name in sparse_kernels)
+                    ),
                     **sol_counts,
                 )
                 for rank, counts in sorted(sol_rank_counts.items()):
                     record.emit(
                         "confession",
                         "attention.sol.calls",
-                        "sol-attn",
+                        sparse_name,
                         rank=rank,
                         world=self.world,
                         **counts,
@@ -3530,7 +3534,11 @@ class Executor:
                     component=component,
                     sites=sites,
                     pin=choices.pin,
-                    dense_reference=attention_sol.dense_identity() if kernel == "sol-attn" else "",
+                    dense_reference=(
+                        attention_sol.dense_identity(kernel)
+                        if kernel in attention_sol.NAMES
+                        else ""
+                    ),
                 )
 
     def _execution_observation(self, choices: attention.Applied | None = None) -> dict[str, Any]:
