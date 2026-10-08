@@ -118,10 +118,12 @@ def test_real_h3_processor_can_restore_its_original_backend_without_reconstructi
     attn.processor._attention_backend = attention._member(attention.BY_NAME["sdpa"])
     hidden = torch.randn(1, 5, 256, dtype=torch.bfloat16)
     original = attn.processor
-    expected = original(attn, hidden)
+    phase = torch.randn(5, 48)
+    rotary = tuple(torch.cat((fn(phase), fn(phase)), dim=-1) for fn in (torch.cos, torch.sin))
+    expected = original(attn, hidden, rotary)
     producer.install(attn)
     assert isinstance(attn.processor, producer.Processor)
-    actual = attn(hidden)
+    actual = attn(hidden, rotary)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     for backend, name in producer.BACKENDS.items():
         attn.processor._attention_backend = backend
@@ -131,7 +133,7 @@ def test_real_h3_processor_can_restore_its_original_backend_without_reconstructi
         with pytest.raises(attention.AttentionRefusal, match="context parallelism"):
             attention.admit(name, 4)
     attn.processor._attention_backend = attention._member(attention.BY_NAME["sdpa"])
-    torch.testing.assert_close(attn(hidden), expected, rtol=0, atol=0)
+    torch.testing.assert_close(attn(hidden, rotary), expected, rtol=0, atol=0)
 
 
 def test_unknown_projection_hooks_and_sparse_cpu_execution_refuse() -> None:

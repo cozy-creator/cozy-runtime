@@ -53,7 +53,7 @@ def verify(payload: Request, ctx: Context) -> Result:
     torch.manual_seed(91)
     attn = MiniMaxH3Attention(hidden_size=256, heads=2, dim_head=128).bfloat16().to(device)
     hidden = torch.randn(1, tokens, 256, generator=generator).bfloat16().to(device)
-    phase = torch.randn(1, tokens, 1, 48, generator=generator).to(device)
+    phase = torch.randn(tokens, 48, generator=generator).to(device)
     cos, sin = (torch.cat((f(phase), f(phase)), dim=-1) for f in (torch.cos, torch.sin))
     calls = [0]
 
