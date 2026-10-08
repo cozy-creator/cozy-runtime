@@ -90,7 +90,8 @@ def verify(payload: Request, ctx: Context) -> Result:
             expected = [3, 12, 6 if name in attention_producer.REUSE else 12]
             if counts != expected or not identical:
                 raise ValueError(
-                    f"Producer replay contract failed: {name}: {counts} vs{expected}, repeat={identical}"
+                    f"Producer replay contract failed: {name}: {counts} vs {expected}, "
+                    f"repeat={identical}"
                 )
             results.append(Row(name, counts, elapsed, True, identical, True))
     finally:
