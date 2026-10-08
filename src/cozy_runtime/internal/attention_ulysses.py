@@ -188,7 +188,9 @@ def exchange_shared(
     # Match Diffusers' CPU-capable group selection; CUDA-only groups carry this tiny
     # metadata tensor on the same device as the operands.
     device = "cpu" if "cpu" in str(dist.get_backend(handle)) else query.device
-    lengths = torch.tensor([t.shape[1] for t in (query, key, value)], device=device)
+    lengths = torch.tensor(
+        [t.shape[1] for t in (query, key, value)], device=device, dtype=torch.int64
+    )
     gathered = [torch.empty_like(lengths) for _ in range(world)]
     dist.all_gather(gathered, lengths, group=handle)
     partitions = list(zip(*(row.tolist() for row in gathered), strict=True))

@@ -44,3 +44,13 @@ def test_the_wrapper_reproduces_one_process_at_degree(
 def test_a_rank_local_wrapper_is_caught(tmp_path: Path) -> None:
     for row in _ranks(tmp_path, 2, "--rows", "67", "--heads", "4", "--plant"):
         assert not row["byte_equal"] and float(row["rel_l2_to_degree1"]) > 0.1, row
+
+
+def test_shared_partitions_change_between_calls_and_allow_different_q_kv(tmp_path: Path) -> None:
+    fixture = FIXTURE.with_name("ulysses_partitions.py")
+    subprocess.run([sys.executable, str(fixture), str(tmp_path)], env=ENV, check=True)
+    for rank in range(4):
+        for report in json.loads((tmp_path / f"rank-{rank}.json").read_text()):
+            assert report["equal_to_original_exchange"], report
+            assert report["equal_to_unsharded"], report
+            assert report["inputs_unchanged"], report

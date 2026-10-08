@@ -55,7 +55,7 @@ def test_author_context_is_immutable_and_model_policy_executes() -> None:
             assert context.component in ("dit", "vae") and context.module_path == "0"
             assert context.device_kind == "cpu" and context.sm == 0
             assert context.activation_dtype == "float32" and context.head_dim == 8
-            assert context.eligible == ("sdpa",) and context.recommended == "sdpa"
+            assert context.eligible == ("sdpa", "sdpa-shared") and context.recommended == "sdpa"
             with pytest.raises(FrozenInstanceError):
                 context.degree = 99  # type: ignore[misc]
             return "sdpa"
