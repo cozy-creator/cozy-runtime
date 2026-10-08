@@ -140,3 +140,42 @@ only the owned competitor server/workers. Native and rental operations use
 ordinary Cozy CLI commands.
 The corrected-library report and original clips are preserved separately in
 `comfy-fixed-cublas/comfy-fixed-results.json` below the action evidence directory.
+
+A later native precision matrix reused the same four executors across all three
+modes. Its BF16 control MP4s matched the pristine controls byte for byte; its
+148.0415-second mean is a separate warm cohort from the earlier 145.1655-second
+baseline. Each mode used the same sparring/rally prompts and seeds, model,
+adapter and eight-evaluation 4/4 schedule, without a text-conditioning output cache.
+
+| Native sparse attention mode | Two-sample warm mean |
+| --- | ---: |
+| BF16 Sol control | 148.0415 s |
+| Kitchen INT8/S32 | 135.6515 s |
+| Experimental FP8/F16 exact sparse tiles | 130.9285 s |
+
+The FP8 prototype retains BF16 routing/tail work and FP32 outer state; it does
+not turn every operation into FP8. It reduced execution time by 11.56% versus
+this BF16 control and 3.48% versus INT8 in these two samples. This is an opt-in
+prototype result, not a default-policy or broad quality qualification.
+
+All six native warm clips passed full audio/video decoding and are retained with
+hashes and original audio under `native-precision-quality/`. Sixteen matched
+frames per clip showed similar overall poses, clothing identities, camera motion
+and car trajectories, without an obvious variant-specific gross collapse.
+Fine anatomy/contact, intermediate motion and subjective audio remain unverified.
+
+| Candidate versus native BF16 | Sparring RGB PSNR | Rally RGB PSNR |
+| --- | ---: | ---: |
+| INT8 | 27.74 dB | 27.28 dB |
+| FP8/F16 | 26.74 dB | 26.75 dB |
+
+These are numerical differences in decoded H.264 outputs, with no alignment or
+resampling, not perceptual quality scores. FP8 showed slightly more RGB drift in
+both scenes; audio drift ordering was mixed (zero-shift PCM correlations
+0.958–0.980). Sparring was quiet on average in every mode, approximately −42 dBFS
+RMS. Retain BF16 as the reference; neither PSNR nor sampled frames establish
+quality equivalence. `native-precision-quality/summary.json` records the scope
+and per-clip findings.
+
+Final cleanup through the ordinary Cozy CLI recorded `provider_absent=true` and
+an empty rental list. Original benchmark media and provenance remain local.
