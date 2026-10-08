@@ -108,6 +108,18 @@ CANDIDATES: tuple[Candidate, ...] = (
 
 PINNABLE: tuple[Candidate, ...] = (
     Candidate(
+        name="sdpa-shared",
+        backend="_cozy_sdpa_shared",
+        local=upstream.SDPA_SHARED,
+        min_sm=0,
+        dtypes=frozenset(),
+        max_head_dim=0,
+        why=(
+            "Explicit experiment: unchanged PyTorch SDPA arithmetic with one per-call "
+            "Ulysses partition metadata collective instead of four. GPU gain unmeasured."
+        ),
+    ),
+    Candidate(
         name="flash-attn3-fp8",
         backend="_cozy_flash_attn3_fp8",
         local=upstream.FA3_FP8,

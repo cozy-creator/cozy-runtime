@@ -44,6 +44,7 @@ class Local:
     forward: Callable[..., Any]
     impl: Callable[..., str]
     head_local: bool = True
+    shared_partitions: bool = False
 
 
 #: backend -> implementations served in the observed scope on this rank
@@ -103,7 +104,8 @@ def _dispatch(backend: str, local: Local) -> Callable[..., Any]:
             raise ValueError(
                 f"{backend} under Ulysses serves unmasked noncausal attention with equal heads"
             )
-        return exchange(
+        exchange_tensors = exchange_shared if local.shared_partitions else exchange
+        return exchange_tensors(
             query,
             key,
             value,
@@ -145,8 +147,7 @@ def group(config: Any) -> Any:
 def exchange(
     query: Any, key: Any, value: Any, handle: Any, compute: Callable[[Any, Any, Any], Any]
 ) -> Any:
-    """Sequence shards -> full sequence per head subset -> `compute` -> back, using Diffusers'
-    unequal-length exchange in both directions (packed H3 lengths do not divide)."""
+    """Diffusers' existing unequal-length exchange, retained as the default."""
     from diffusers.models.attention_dispatch import (
         all_to_all_single_any_o_async,
         all_to_all_single_any_qkv_async,
@@ -158,6 +159,67 @@ def exchange(
     q, k, v = (wait() for wait in waits)
     output = compute(q, k, v)
     result = all_to_all_single_any_o_async(output, handle, **metadata)()
+    if result.shape != query.shape or result.dtype != query.dtype:
+        raise ValueError("Ulysses attention returned incompatible output")
+    return result
+
+
+def exchange_shared(
+    query: Any, key: Any, value: Any, handle: Any, compute: Callable[[Any, Any, Any], Any]
+) -> Any:
+    """Sequence shards -> full sequence per head subset -> `compute` -> back.
+
+    Exchange Q/K/V lengths together once per call. Their partitions may differ and change
+    between calls; no rank can skip this collective because of a local cache hit. The
+    tensor exchanges and head padding are Diffusers' unequal-length Ulysses operations.
+    """
+    import torch
+    import torch.distributed as dist
+    import torch.distributed._functional_collectives as funcol
+    from diffusers.models.attention_dispatch import (
+        _maybe_pad_o_head,
+        _maybe_pad_qkv_head,
+        _maybe_unpad_o_head,
+        _maybe_unpad_qkv_head,
+        _wait_tensor,
+    )
+
+    world = dist.get_world_size(handle)
+    # Match Diffusers' CPU-capable group selection; CUDA-only groups carry this tiny
+    # metadata tensor on the same device as the operands.
+    device = "cpu" if "cpu" in str(dist.get_backend(handle)) else query.device
+    lengths = torch.tensor([t.shape[1] for t in (query, key, value)], device=device)
+    gathered = [torch.empty_like(lengths) for _ in range(world)]
+    dist.all_gather(gathered, lengths, group=handle)
+    partitions = list(zip(*(row.tolist() for row in gathered), strict=True))
+
+    def gather(tensor: Any, sizes: tuple[int, ...]) -> Callable[[], Any]:
+        batch, local, heads, dim = tensor.shape
+        tensor, padding = _maybe_pad_qkv_head(tensor, heads, handle)
+        per_rank = (heads + padding) // world
+        tensor = tensor.reshape(batch, local, world, per_rank, dim)
+        tensor = tensor.permute(2, 1, 0, 3, 4).contiguous().flatten(0, 1)
+        pending = funcol.all_to_all_single(tensor, list(sizes), [local] * world, handle)
+
+        def wait() -> Any:
+            result = _wait_tensor(pending).permute(1, 0, 2, 3).contiguous()
+            return _maybe_unpad_qkv_head(result, padding, handle)
+
+        return wait
+
+    waits = [
+        gather(tensor, sizes) for tensor, sizes in zip((query, key, value), partitions, strict=True)
+    ]
+    q, k, v = (wait() for wait in waits)
+    output = compute(q, k, v)
+    output, padding = _maybe_pad_o_head(output, query.shape[2], handle)
+    batch, _, heads, dim = output.shape
+    local = query.shape[1]
+    tensor = output.permute(1, 0, 2, 3).contiguous()
+    pending = funcol.all_to_all_single(tensor, [local] * world, list(partitions[0]), handle)
+    result = _wait_tensor(pending).reshape(world, local, batch, heads, dim)
+    result = result.permute(2, 1, 0, 3, 4).contiguous().reshape(batch, local, world * heads, dim)
+    result = _maybe_unpad_o_head(result, padding, handle)
     if result.shape != query.shape or result.dtype != query.dtype:
         raise ValueError("Ulysses attention returned incompatible output")
     return result

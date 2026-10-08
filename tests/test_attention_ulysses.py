@@ -30,11 +30,15 @@ def _ranks(root: Path, degree: int, *extra: str) -> list[dict[str, Any]]:
 
 
 @pytest.mark.parametrize("degree", [2, 4, 7, 8])
-def test_the_wrapper_reproduces_one_process_at_degree(tmp_path: Path, degree: int) -> None:
+@pytest.mark.parametrize("kernel", ["sdpa", "sdpa-shared"])
+def test_the_wrapper_reproduces_one_process_at_degree(
+    tmp_path: Path, degree: int, kernel: str
+) -> None:
     # 1031 rows split unequally at every degree (258/258/258/257 at 4), H3's 56 heads.
-    for row in _ranks(tmp_path, degree):
+    for row in _ranks(tmp_path, degree, "--kernel", kernel):
         assert row["byte_equal"] and row["rel_l2_to_degree1"] == 0.0, row
         assert any(impl in str(row["impl"]) for impl in ("flash", "efficient", "math")), row
+        assert row["collectives"]["c10d::allgather_"] == (1 if kernel == "sdpa-shared" else 4), row
 
 
 def test_a_rank_local_wrapper_is_caught(tmp_path: Path) -> None:

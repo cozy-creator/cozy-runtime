@@ -505,6 +505,7 @@ def _named(name: str) -> Callable[..., str]:
 
 
 SDPA = Local(sdpa, sdpa_impl)
+SDPA_SHARED = Local(sdpa, sdpa_impl, shared_partitions=True)
 CUDNN = Local(cudnn, _named("cudnn"))
 FA3 = Local(fa3, lambda *_: f"flash_attn3 {_FA3_VARIANT}")
 FA3_FP8 = Local(fa3_fp8, lambda *_: f"flash_attn3 {_FA3_VARIANT} e4m3 per-head")

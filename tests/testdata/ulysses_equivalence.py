@@ -19,10 +19,12 @@ from torch.multiprocessing.spawn import spawn
 
 from cozy_runtime.internal import attention, attention_ulysses
 from cozy_runtime.internal.encoding import DeviceFacts
-from cozy_runtime.internal.parallel.cp import _GroupMesh
+from cozy_runtime.internal.parallel.cp import CpComms, _GroupMesh
 
 
-def rank_main(rank: int, degree: int, root: Path, shape: tuple[int, ...], plant: bool) -> None:
+def rank_main(
+    rank: int, degree: int, root: Path, shape: tuple[int, ...], plant: bool, kernel: str
+) -> None:
     torch.set_num_threads(1)
     if plant:
         attention_ulysses.exchange = lambda query, key, value, handle, compute: compute(
@@ -41,14 +43,20 @@ def rank_main(rank: int, degree: int, root: Path, shape: tuple[int, ...], plant:
             rank,
             degree,
             torch.device("cpu"),
-            mesh=cast(Any, _GroupMesh(dist.group.WORLD, degree, rank)),
+            mesh=cast(
+                Any, _GroupMesh(CpComms(dist.group.WORLD, rank, torch.device("cpu")), degree, rank)
+            ),
         )
-        ready = attention.pinned("sdpa", DeviceFacts("cpu", "CPU", 0, "", "", 0))[0]
+        ready = attention.pinned(kernel, DeviceFacts("cpu", "CPU", 0, "", "", 0))[0]
         backend = _AttentionBackendRegistry._backends[ready.member]
         seed = torch.Generator().manual_seed(0x51D3)
         q, k, v = (torch.randn(shape, generator=seed) for _ in range(3))
         shards = [t.tensor_split(degree, dim=1)[rank].contiguous() for t in (q, k, v)]
-        with torch.no_grad(), attention_ulysses.observing() as seen:
+        with (
+            torch.no_grad(),
+            attention_ulysses.observing() as seen,
+            torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as profile,
+        ):
             got = backend(query=shards[0], key=shards[1], value=shards[2], _parallel_config=config)
             one = backend(query=q, key=k, value=v).tensor_split(degree, dim=1)[rank]
         report = {
@@ -56,6 +64,11 @@ def rank_main(rank: int, degree: int, root: Path, shape: tuple[int, ...], plant:
             "impl": attention.implementations(seen),
             "byte_equal": bool(torch.equal(got.contiguous(), one.contiguous())),
             "rel_l2_to_degree1": float((got.double() - one.double()).norm() / one.double().norm()),
+            "collectives": {
+                event.key: event.count
+                for event in profile.key_averages()
+                if "allgather" in event.key.lower() or "alltoall" in event.key.lower()
+            },
         }
         (root / f"rank-{rank}.json").write_text(json.dumps(report))
     finally:
@@ -69,11 +82,15 @@ def main() -> None:
     parser.add_argument("--rows", type=int, default=1031)
     parser.add_argument("--heads", type=int, default=56)
     parser.add_argument("--plant", action="store_true")
+    parser.add_argument("--kernel", default="sdpa")
     args = parser.parse_args()
     shape = (1, args.rows, args.heads, 128)
     start: Any = spawn
     start(
-        rank_main, args=(args.degree, args.root, shape, args.plant), nprocs=args.degree, join=True
+        rank_main,
+        args=(args.degree, args.root, shape, args.plant, args.kernel),
+        nprocs=args.degree,
+        join=True,
     )
 
 
