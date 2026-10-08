@@ -33,9 +33,11 @@ def test_quantized_reference_factorization_and_finite_error():
 def test_trace_summary_does_not_invent_gpu_events(tmp_path):
     probe = load("trace_probe")
     path = tmp_path / "cpu.json"
-    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as profiler:
-        with torch.profiler.record_function("probe/cpu-control"):
-            value = torch.ones(16, 16) @ torch.ones(16, 16)
+    with (
+        torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as profiler,
+        torch.profiler.record_function("probe/cpu-control"),
+    ):
+        value = torch.ones(16, 16) @ torch.ones(16, 16)
     assert value[0, 0] == 16
     profiler.export_chrome_trace(str(path))
     report = probe.summarize(path, ["probe/cpu-control", "probe/missing"], {})
