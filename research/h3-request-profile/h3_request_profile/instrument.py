@@ -7,6 +7,7 @@ import json
 import tempfile
 import time
 from collections.abc import Callable
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any, cast
 
@@ -56,6 +57,16 @@ def category(name: str) -> str:
     if any(x in lower for x in ("gemm", "matmul", "scaled_mm")):
         return "gemm"
     return "unclassified"  # full names remain available; no inferred attribution
+
+
+def software_versions() -> dict[str, str | None]:
+    result: dict[str, str | None] = {}
+    for name in ("cozy-runtime", "tensorfs", "torch", "triton", "diffusers", "comfy-kitchen"):
+        try:
+            result[name] = version(name)
+        except PackageNotFoundError:
+            result[name] = None
+    return result
 
 
 class ObservedOutputs:
@@ -282,6 +293,7 @@ def record_request(
         raise ValueError(f"Expected one bounded two-step trace, captured{len(traces)}")
     summary = {
         "diagnostic_only": True,
+        "software": software_versions(),
         "record_shapes_and_memory": detailed,
         "not_benchmark_time": True,
         "profiled_step_indices": [dense_steps - 1, dense_steps],
@@ -317,6 +329,8 @@ def record_request(
             "must be read from ordinary run-show evidence; reused setup is not charged again. "
             "Sparse-eligible labels describe the schedule, not proof of a sparse kernel; "
             "actual kernel identity comes from the trace and native run evidence."
+            " Plane deltas start at handler entry, after cold construction; raw before/after "
+            "snapshots preserve the cumulative counters without charging earlier requests again."
         ),
     }
     return result, traces[0], json.dumps(summary, separators=(",", ":"), allow_nan=False).encode()

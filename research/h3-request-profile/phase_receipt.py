@@ -31,6 +31,7 @@ def receipt(run: dict[str, Any], summary: dict[str, Any]) -> dict[str, Any]:
         )
     return {
         "diagnostic_only": True,
+        "software": summary.get("software", {}),
         "request": {
             key: run.get(key)
             for key in (
