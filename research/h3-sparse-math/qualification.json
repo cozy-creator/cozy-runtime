@@ -4,7 +4,7 @@
   "request": "Two matched warm action scenes, identical per-scene input/seed; 15-second request,1344x768,362 frames at24fps,Turbo8 with4 dense and4 sparse steps",
   "arithmetic": {
     "sol-attn": "BF16/F32 Sol reference",
-    "kitchen-sol-sage": "Kitchen INT8 Q/K/V and probability carriers with INT32 MMA accumulation",
+    "kitchen-sol-sage": "Kitchen signed INT8 Q/K/V and unsigned8 probability carriers with INT32 MMA accumulation",
     "sol-fp8-fp16": "FP8 exact QK/PV with FP16 tile accumulation; original BF16/F32 routing and approximate tail; FP32 outer softmax/output state",
     "dense_reference": "All modes retain Sage dense steps/refiner/protected rows; same sparse eligibility and current-call statistics. No chunked producer or prior-call statistics reuse."
   },
@@ -42,8 +42,9 @@
     "all_six_warm_full_av_decode_pass": true,
     "all_dimensions_frames_verified": true,
     "all_three_bf16_matrix_mp4_hashes_match_pristine_baseline": true,
-    "visual_quality": "Matched contact-sheet review and optional RGB/PCM drift metrics being finalized; no quality-equivalence claim.",
-    "subjective_audio": "Not performed; original audio and full decoding evidence retained."
+    "visual_quality": "Sixteen matched snapshots per clip preserve overall sparring poses/clothing and rally trajectories across modes; no obvious variant-specific gross collapse was seen. Fine hands/contact and continuous temporal quality were not certified. This is not quality equivalence.",
+    "subjective_audio": "Not performed; original audio and full decoding evidence retained.",
+    "numeric_drift": "Optional full decoded RGB/PCM drift metrics are still computing; no acceptance conclusion is based on them."
   },
   "admission": {
     "run": 4968,
