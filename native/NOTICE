@@ -106,3 +106,17 @@ commit d1a57a546c3d395b1ffcbeecc66d81db76f3b4b5.
 
 For full license texts of these dependencies, please refer to their respective
 project repositories or installation directories.
+
+--------------------------------------------------------------------------------
+TeleFuser / NVIDIA Sol-Attn experimental FP8 tile adapter
+--------------------------------------------------------------------------------
+The pointer Sol mainloop in internal/attention_fp8_sol_kernel.py is adapted from
+Tele-AI/TeleFuser commit f21457a92e92f4a7570f0cb6b445ee334f1072b0,
+telefuser/kernel/sol_attn/triton_ref/fwd.py (Apache License 2.0).
+TeleFuser vendors Sol-Attn from NVlabs/Sana sol-engine commit
+8a26fb0ec9e353125ead798cb2e312d5ce48cded (Apache License 2.0).
+Upstream: https://github.com/Tele-AI/TeleFuser
+          https://github.com/NVlabs/Sana/tree/sol-engine/techniques/sparse_backends/sol_attn
+Runtime changes retain BF16 routing and approximate tails, bound quantized exact
+operands to magnitude16 and use FP16 tile products with FP32 online accumulation.
+No FlashAttention scaffold is copied into this pointer kernel.

@@ -621,6 +621,8 @@ def test_every_head_local_kernel_shards() -> None:
     assert sharded.offered == tuple(RANKED)
     assert _backends(roots) == {"dit": ["_cozy_flash_attn3"]}
     for name in sorted(set(attention.BY_NAME) - set(RANKED)):
+        if not attention.BY_NAME[name].local.head_local:
+            continue
         assert attention.install(_ready(name), roots, name, degree=4).totals() == {name: 2}
         attention.admit(f"dit={name}", 4)
 

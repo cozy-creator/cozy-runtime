@@ -266,3 +266,35 @@ def test_source_acquisition_obeys_the_existing_storage_owner_refusal(
         source = Path(row["file"])
         assert received == [{"path": str(source.parent), "bytes": len(body), "inodes": 16}]
         assert not source.exists() and not list(source.parent.glob("*.partial"))
+
+
+def test_dedicated_kitchen_wheel_uses_verified_acquisition_without_a_compiler(
+    store: kernel_cache.Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    body = _wheel()
+    with _http({"/tiny.whl": body}) as (url, requests):
+        monkeypatch.setattr(
+            kernel_sources,
+            "PINS",
+            (
+                _pin("comfy-kitchen", url + "/tiny.whl", body),
+                _pin("other-python", url + "/unused.whl", b"not fetched"),
+            ),
+        )
+        job = kernel_sources.job("comfy-kitchen", 120)
+        assert job.kind == "python" and set(job.spec["sources"]) == {"comfy-kitchen"}
+        assert "comfy-kitchen" not in kernel_sources.job(kernel_sources.PYTHON, 120).spec["sources"]
+        kernel_compile.submit(store, job)
+        state = _wait(store, job)
+        assert state.state == "ready", state
+        assert requests == ["/tiny.whl"]
+        site = Path(state.path) / kernel_cache.SITE
+        assert (
+            subprocess.check_output(
+                [sys.executable, "-c", "import tiny_kernel; print(tiny_kernel.VALUE)"],
+                env={**os.environ, "PYTHONPATH": str(site)},
+            ).strip()
+            == b"42"
+        )
+        kernel_compile._STARTED[job.key.digest][0].wait()
+    assert kernel_compile.submit(store, job).state == "ready"
