@@ -223,3 +223,46 @@ def test_full_trace_refuses_tensor_retaining_detail_mode():
             full_request_trace=True,
             detailed=True,
         )
+
+
+def test_file_backed_continuous_trace_retains_tree_without_changing_outputs(tmp_path):
+    from cozy_runtime.author import Outputs
+    from cozy_runtime.author.fakes import fake_attempt
+
+    module, model = recorder(), Transformer()
+    out = Outputs(fake_attempt(spool=tmp_path / "spool", max_output_bytes=8 << 20))
+
+    def render():
+        value = torch.ones(2, 8)
+        for _ in range(8):
+            value = model(value)
+        return value
+
+    with torch.no_grad():
+        expected = render()
+        actual, tree, raw = module.record_request(
+            model,
+            4,
+            render,
+            lambda: {},
+            [torch.profiler.ProfilerActivity.CPU],
+            full_request_trace=True,
+            trace_sink=out.save_tree,
+        )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    summary = json.loads(raw)
+    assert summary["trace_format"] == "tree/trace.json.gz"
+    trace = tree.path / "trace.json.gz"
+    assert trace.stat().st_size == summary["trace_sizes"][0]["gzip_bytes"]
+    with gzip.open(trace, "rt") as source:
+        names = {row.get("name") for row in json.load(source)["traceEvents"]}
+    assert all(f"h3.step.{i}.{'dense' if i < 4 else 'sparse_eligible'}" in names for i in range(8))
+
+
+def test_old_output_grant_refuses_before_gpu_or_render_work(tmp_path):
+    from cozy_runtime.author import Outputs
+    from cozy_runtime.author.fakes import fake_attempt
+
+    out = Outputs(fake_attempt(spool=tmp_path / "spool"))
+    with pytest.raises(ValueError, match="output grant before rendering"):
+        recorder().profile_request(None, 4, None, outputs=out, telemetry=None)

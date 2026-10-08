@@ -16,6 +16,7 @@ from cozy_runtime.author import (
     Image,
     Outputs,
     Telemetry,
+    Tree,
     VideoAsset,
 )
 from cozy_runtime.models.minimax_h3.model import H3Model, H3TurboBase, H3TurboLoRA
@@ -55,7 +56,7 @@ class RenderResult(msgspec.Struct):
 
 class ProfileResult(msgspec.Struct):
     render: RenderResult
-    trace: Annotated[FileAsset, AssetBound(media_types=("application/gzip",), max_bytes=1 << 30)]
+    trace: Annotated[Tree, AssetBound(max_bytes=64 << 30)]
     summary: Annotated[FileAsset, AssetBound(media_types=("application/json",), max_bytes=64 << 20)]
 
 
@@ -81,11 +82,11 @@ def environment(payload: EnvironmentInput, ctx: Context) -> EnvironmentResult:
     )
 
 
-def saved(result: tuple[Any, bytes, bytes], out: Outputs) -> ProfileResult:
+def saved(result: tuple[Any, Tree, bytes], out: Outputs) -> ProfileResult:
     render, trace, summary = result
     return ProfileResult(
         RenderResult(render.video, render.warnings),
-        out.save_bytes(trace, media_type="application/gzip"),
+        trace,
         out.save_bytes(summary, media_type="application/json"),
     )
 

@@ -117,3 +117,26 @@ def test_actual_cpu_chrome_trace_keeps_host_work_without_inventing_device_work(t
     assert rows["aten::sin"]["kind"] == "host_operator"
     assert rows["h3.step.0.dense"]["kind"] == "host_annotation"
     assert not result["device_activity"] and not result["host_launch_activity"]
+
+
+def test_multiple_segments_exclude_export_pauses_and_retain_time_base(tmp_path):
+    module = summarizer()
+    paths = []
+    for index, start in enumerate((10, 1010)):
+        path = tmp_path / f"trace-{index}.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "baseTimeNanoseconds": 1000000,
+                    "traceEvents": [event("same kernel", "kernel", start, 10)],
+                }
+            )
+        )
+        paths.append(path)
+    result = module.summarize_files(paths)
+    device = result["recorded_device_activity"][0]
+    assert device["recorded_busy_union_us_sum"] == 20
+    assert device["recorded_span_us_sum"] == 20
+    assert device["within_segment_gap_us_sum"] == 0  # 1000us export gap is not model idle
+    assert result["events_by_name"][0]["count"] == 2
+    assert result["segments"][0]["trace_metadata"]["baseTimeNanoseconds"] == 1000000

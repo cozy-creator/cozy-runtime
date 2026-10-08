@@ -57,7 +57,7 @@ class JSONStream:
                 self.more()
 
 
-def trace_events(path: Path) -> Iterator[dict[str, Any]]:
+def trace_events(path: Path, metadata: dict[str, Any] | None = None) -> Iterator[dict[str, Any]]:
     with path.open("rb") as probe:
         compressed = probe.read(2) == b"\x1f\x8b"
     opener = gzip.open if compressed else open
@@ -89,7 +89,17 @@ def trace_events(path: Path) -> Iterator[dict[str, Any]]:
                 found = True
                 yield from array()
             else:
-                reader.value()
+                value = reader.value()
+                if metadata is not None and key in {
+                    "schemaVersion",
+                    "baseTimeNanoseconds",
+                    "displayTimeUnit",
+                    "deviceProperties",
+                    "trace_id",
+                    "traceName",
+                    "host_name",
+                }:
+                    metadata[key] = value
             if reader.peek() != "}":
                 reader.take(",")
         reader.take("}")
@@ -242,7 +252,10 @@ def summarize(events: Iterator[dict[str, Any]]) -> dict[str, Any]:
             for (pid, tid), values in sorted(launches.items())
         ],
         "process_thread_labels": labels,
-        "units": "microseconds, as specified for ChromeTrace ts/dur; timestamps unchanged",
+        "units": (
+            "ChromeTrace ts/dur microseconds, unchanged; Kineto absolute Unix time is "
+            "ts + trace_metadata.baseTimeNanoseconds/1000 when that header is present"
+        ),
         "notes": [
             "Host operator/annotation durations are inclusive and overlap; do not add them.",
             "Device name totals are aggregate kernel/copy duration, not elapsed request time.",
@@ -257,17 +270,88 @@ def summarize(events: Iterator[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def summarize_file(path: Path) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    result = summarize(trace_events(path, metadata))
+    with path.open("rb") as source:
+        digest = hashlib.file_digest(source, "sha256").hexdigest()
+    result["source"] = {"path": str(path), "bytes": path.stat().st_size, "sha256": digest}
+    result["trace_metadata"] = metadata
+    return result
+
+
+def summarize_files(paths: list[Path]) -> dict[str, Any]:
+    if len(paths) == 1:
+        return summarize_file(paths[0])
+    segments = [summarize_file(path) for path in paths]
+    rows: dict[tuple[str, str, str], dict[str, Any]] = {}
+    devices: dict[str, dict[str, Any]] = {}
+    for segment in segments:
+        for source in segment["events_by_name"]:
+            key = source["kind"], source["device"], source["name"]
+            row = rows.setdefault(
+                key,
+                dict(
+                    source,
+                    count=0,
+                    duration_sum_us=0,
+                    duration_max_us=0,
+                    bytes_sum=0,
+                    events_with_bytes=0,
+                ),
+            )
+            for field in ("count", "duration_sum_us", "bytes_sum", "events_with_bytes"):
+                row[field] += source.get(field, 0)
+            row["duration_max_us"] = max(row["duration_max_us"], source["duration_max_us"])
+            row["duration_mean_us"] = row["duration_sum_us"] / row["count"]
+        for source in segment["device_activity"]:
+            row = devices.setdefault(
+                source["device"],
+                {
+                    "device": source["device"],
+                    "segment_count": 0,
+                    "event_count": 0,
+                    "recorded_busy_union_us_sum": 0,
+                    "recorded_span_us_sum": 0,
+                    "within_segment_gap_us_sum": 0,
+                },
+            )
+            row["segment_count"] += 1
+            row["event_count"] += source["event_count"]
+            row["recorded_busy_union_us_sum"] += source["busy_union_us"]
+            row["recorded_span_us_sum"] += source["span_us"]
+            row["within_segment_gap_us_sum"] += source["interior_gap_total_us"]
+    return {
+        "segments": segments,
+        "events_by_name": sorted(rows.values(), key=lambda row: -row["duration_sum_us"]),
+        "recorded_device_activity": list(devices.values()),
+        "inter_segment_gaps_excluded": True,
+        "notes": [
+            "Each segment retains its own metadata, device/stream unions and interior gaps.",
+            "No first-to-last union/gap crosses segment boundaries or profiler-export pauses.",
+            "Recorded busy sums assume disjoint profiler segments, not overlapping captures.",
+            "The collection's unrecorded pauses are not assigned to model/kernel work.",
+        ],
+    }
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("trace", type=Path)
+    parser.add_argument("trace", type=Path, nargs="+")
     parser.add_argument("--out", required=True, type=Path)
     args = parser.parse_args()
-    result = summarize(trace_events(args.trace))
-    with args.trace.open("rb") as source:
-        digest = hashlib.file_digest(source, "sha256").hexdigest()
-    result["source"] = {
-        "path": str(args.trace),
-        "bytes": args.trace.stat().st_size,
-        "sha256": digest,
-    }
+    paths: list[Path] = []
+    for path in args.trace:
+        candidates = list(path.glob("trace*.json.gz")) if path.is_dir() else [path]
+        if path.is_dir() and not candidates:
+            candidates = list(path.glob("trace*.json"))
+        paths.extend(
+            candidate.resolve()
+            for candidate in sorted(candidates)
+            if candidate.resolve() != args.out.resolve()
+        )
+    paths = list(dict.fromkeys(paths))
+    if not paths:
+        parser.error("No trace files found")
+    result = summarize_files(paths)
     args.out.write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")

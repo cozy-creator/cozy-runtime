@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import gzip
-import io
 import json
 import shutil
 import tempfile
@@ -15,6 +14,8 @@ from pathlib import Path
 from typing import Any, cast
 
 import msgspec
+
+TRACE_BYTES = 64 << 30
 
 _COUNTERS = (
     "h2d_bytes",
@@ -76,6 +77,25 @@ def software_versions() -> dict[str, str | None]:
         except PackageNotFoundError:
             result[name] = None
     return result
+
+
+def retain_trace_file(
+    raw: Path, trace_sink: Callable[[Path], Any] | None
+) -> tuple[Any, dict[str, int]]:
+    """Keep the whole ChromeTrace using bounded copies, including traces larger than1GiB."""
+    artifacts = raw.parent / "artifacts"
+    artifacts.mkdir()
+    zipped = artifacts / "trace.json.gz"
+    with (
+        raw.open("rb") as source,
+        gzip.open(zipped, mode="wb", compresslevel=1) as destination,
+    ):
+        shutil.copyfileobj(source, destination, length=1 << 20)
+    sizes = {"raw_bytes": raw.stat().st_size, "gzip_bytes": zipped.stat().st_size}
+    # Production retains through Outputs.save_tree's bounded file copier. Small CPU
+    # contract tests may still consume the original byte return shape without a sink.
+    trace = trace_sink(artifacts) if trace_sink is not None else zipped.read_bytes()
+    return trace, sizes
 
 
 def retained_handler(name: str) -> Callable[..., Any]:
@@ -150,7 +170,12 @@ def profile_request(
     telemetry: Any,
     detailed: bool = False,
     full_request_trace: bool = True,
-) -> tuple[Any, bytes, bytes]:
+) -> tuple[Any, Any, bytes]:
+    if outputs._attempt.max_output_bytes < TRACE_BYTES:
+        raise ValueError(
+            "Full trace requires the declared64GiB output grant before rendering; "
+            f"worker granted{outputs._attempt.max_output_bytes} bytes"
+        )
     import torch
     from torch.profiler import ProfilerActivity
 
@@ -175,6 +200,7 @@ def profile_request(
         full_request_trace=full_request_trace,
         attribution=lambda: telemetry._attempt.attribution.document(),
         output_sinks=observed_outputs.sinks,
+        trace_sink=outputs.save_tree,
     )
 
 
@@ -189,7 +215,8 @@ def record_request(
     attribution: Callable[[], dict[str, Any]] | None = None,
     output_sinks: list[dict[str, Any]] | None = None,
     full_request_trace: bool = False,
-) -> tuple[Any, bytes, bytes]:
+    trace_sink: Callable[[Path], Any] | None = None,
+) -> tuple[Any, Any, bytes]:
     """The same bounded recorder can be exercised with real CPU modules off-rental."""
     from torch.profiler import profile, record_function, schedule
 
@@ -216,17 +243,9 @@ def record_request(
             raw_bytes = path.stat().st_size
             if not full_request_trace and raw_bytes > 512 << 20:
                 raise ValueError("Two-step profiler trace exceeds512MiB diagnostic bound")
-            compressed = io.BytesIO()
-            with (
-                path.open("rb") as source,
-                gzip.GzipFile(fileobj=compressed, mode="wb", compresslevel=3) as destination,
-            ):
-                shutil.copyfileobj(source, destination, length=1 << 20)
-            trace = compressed.getvalue()
-            if len(trace) > 1 << 30:
-                raise ValueError("Compressed profiler trace exceeds1GiB diagnostic output bound")
+            trace, sizes = retain_trace_file(path, trace_sink)
             traces.append(trace)
-            trace_sizes.append({"raw_bytes": raw_bytes, "gzip_bytes": len(trace)})
+            trace_sizes.append(sizes)
         for event in prof.key_averages(group_by_input_shape=detailed):
             averages.append(
                 {
@@ -339,7 +358,9 @@ def record_request(
         "profiled_step_indices": list(range(len(steps)))
         if full_request_trace
         else [dense_steps - 1, dense_steps],
-        "trace_format": "pytorch_chrome_json_gzip",
+        "trace_format": "tree/trace.json.gz"
+        if trace_sink is not None
+        else "pytorch_chrome_json_gzip",
         "trace_sizes": trace_sizes,
         "original_timestamps_preserved": True,
         "trace_collection": "continuous whole handler" if full_request_trace else "two DiT calls",
@@ -381,6 +402,9 @@ def record_request(
             "kernels remain outside this authored trace and retain native setup timing evidence. "
             " Plane deltas start at handler entry, after cold construction; raw before/after "
             "snapshots preserve the cumulative counters without charging earlier requests again."
+            " The trace is streamed to gzip and retained by Outputs.save_tree; no full compressed "
+            "byte buffer or read_bytes is used by the authored profiling path. CPU event buffers "
+            "and the temporary raw ChromeTrace still scale with request length."
         ),
     }
     return result, traces[0], json.dumps(summary, separators=(",", ":"), allow_nan=False).encode()
