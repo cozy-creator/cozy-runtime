@@ -1,13 +1,13 @@
 [project]
 name = "cozy-runtime"
-version = "0.18.102"
+version = "0.21.0"
 description = "Cozy author surface and device executor"
 # The upstream Apache-2.0 LICENSE/NOTICE ride every wheel: the cp312-abi3 wheel carries
 # the derived native kernels, and shipping them from the pure wheel too keeps one manifest.
 license-files = ["native/LICENSE", "native/NOTICE"]
 requires-python = ">=3.12"
 dependencies = [
-    "tensorfs>=0.3.90,<0.4",
+    "tensorfs>=0.6,<0.7",
     "cryptography>=45",
     "msgspec>=0.19",
     "numpy>=1.26",
@@ -25,7 +25,7 @@ dev = [
     "cozy-eval==0.7.2",
     "ruff>=0.16",
     # Model-bound Runtime tests exercise the real compiled storage boundary.
-    "tensorfs>=0.3.90,<0.4",
+    "tensorfs>=0.6,<0.7",
     "av>=18.1,<19",
     # CI partitions this unchanged suite across independent delegated runners.
     "pytest-split>=0.11.0",
@@ -104,12 +104,8 @@ ignore_missing_imports = true
 module = ["av", "av.*"]
 ignore_missing_imports = true
 
-# `tensorfs` is tfs-007's compiled facade. It SHIPS type information (`py.typed` plus a
-# hand-written `_ext.pyi`), so this is not a case of an untyped dependency. The development
-# environment installs it for model-bound Runtime tests; the base package still does not.
-[[tool.mypy.overrides]]
-module = ["tensorfs", "tensorfs.*"]
-ignore_missing_imports = true
+# TensorFS is a required typed dependency, including the public native record aliases.
+# Missing bindings must fail type checking rather than silently becoming Any.
 
 # `corpus/` is the adversarial corpus and the real-torch H3 fixture. Checking it here would
 # be checking torch-shaped code against a torch that is not installed, which produces
@@ -177,7 +173,7 @@ media = [
 # capability; base worker images provide TensorFS from the same PyPI range.
 # 0.3.82 hedges slow tail objects as fresh ranges (run 2322); 0.3.83 asks a wedged Hub again;
 # 0.3.84 carries the weight plane (`tensorfs.plane`) that executors load weights through.
-model-execution = ["tensorfs>=0.3.90,<0.4"]
+model-execution = ["tensorfs>=0.6,<0.7"]
 # peft takes any transformers. Without these floors a resolver that picks huggingface-hub 2.x
 # first backtracks to transformers 4.12, whose tokenizers has no wheel.
 adapters = [
