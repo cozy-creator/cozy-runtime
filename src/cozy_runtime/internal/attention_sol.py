@@ -682,11 +682,11 @@ def _execute(
         live_output = dense(query=q, key=k, value=v, scale=scale)
         _count("dense_path" if dense_path else "dense_step")
     else:
-        live_output = (
-            sparse(q, k, v, scale, layout.protected_prefix)
-            if sparse is not None
-            else _native(q, k, v, scale, layout.protected_prefix, loaded)
-        )
+        if sparse is not None:
+            live_output = sparse(q, k, v, scale, layout.protected_prefix)
+        else:
+            assert loaded is not None
+            live_output = _native(q, k, v, scale, layout.protected_prefix, loaded)
         _validate_result(live_output, q)
         if any(
             live_output.untyped_storage().data_ptr() == t.untyped_storage().data_ptr()
