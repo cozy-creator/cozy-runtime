@@ -28,6 +28,40 @@ def _stored(torch, weight, kind):
     return {"data": (weight * 4096).clamp(-448, 448).to(torch.float8_e4m3fn), "scale": scale}
 
 
+def _decode_cases(torch, candidate, baseline):
+    raw = torch.arange(1024, dtype=torch.int32, device="cuda").to(torch.uint8)
+    layouts = {
+        "flat": raw[:256],
+        "transpose": raw[:256].reshape(16, 16).t(),
+        "stride3": raw[1:769:3],
+        "offset1": raw[1:257],
+        "odd257": raw[:257].reshape(1, 257),
+    }
+    cases = []
+    for name, data in layouts.items():
+        before = data.clone()
+        expected = baseline.decode_e4m3(torch, data)
+        for dtype, view in (("uint8", data), ("float8_e4m3fn", data.view(torch.float8_e4m3fn))):
+            actual = candidate.decode_e4m3(torch, view)
+            same = bool(torch.equal(actual.view(torch.int32), expected.view(torch.int32)))
+            finite = bool(torch.isfinite(actual).all().item())
+            unchanged = bool(torch.equal(data, before))
+            cases.append(
+                {
+                    "layout": name,
+                    "input_dtype": dtype,
+                    "shape": list(view.shape),
+                    "strides": list(view.stride()),
+                    "storage_offset": view.storage_offset(),
+                    "all_fp32_bits_equal": same,
+                    "finite": finite,
+                    "input_unchanged": unchanged,
+                    "passed": same and finite and unchanged,
+                }
+            )
+    return cases
+
+
 def compare(seed):
     import torch
 
@@ -45,6 +79,7 @@ def compare(seed):
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.set_float32_matmul_precision("highest")
     cases = []
+    decode_cases = _decode_cases(torch, candidate, baseline)
     try:
         with torch.inference_mode():
             weight = torch.randn((rows, columns), generator=generator, device="cuda") * 0.02
@@ -123,7 +158,9 @@ def compare(seed):
         torch.set_float32_matmul_precision(old_precision)
         torch.backends.cuda.matmul.allow_tf32 = old_tf32
     return {
-        "passed": factors_unchanged and all(row["passed"] for row in cases),
+        "passed": factors_unchanged
+        and all(row["passed"] for row in cases)
+        and all(row["passed"] for row in decode_cases),
         "seed": seed,
         "rows": rows,
         "columns": columns,
@@ -137,6 +174,7 @@ def compare(seed):
         "software": {name: _software(name) for name in ("cozy-runtime", "tensorfs", "torch")},
         "gpu": torch.cuda.get_device_name(),
         "cases": cases,
+        "decode_cases": decode_cases,
         "limits": [
             "Synthetic stored-weight equivalence gate; not video quality or performance",
             "TF32 disabled identically for both helpers",
