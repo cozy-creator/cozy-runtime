@@ -204,6 +204,10 @@ def attribute(
         row["count"] += 1
         row["duration_sum_us"] += times[1] - times[0]
         row["outcomes"][outcome] += 1
+        size = args(event).get("bytes")
+        if category == "gpu_memcpy" and type(size) is int and size >= 0:
+            row["bytes_sum"] = row.get("bytes_sum", 0) + size
+            row["events_with_bytes"] = row.get("events_with_bytes", 0) + 1
     return {
         "method": "GPU correlation -> unique CPU CUDA API -> annotations on its CPU thread",
         "host_processes": sorted(host_processes),

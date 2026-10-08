@@ -54,6 +54,31 @@ class AttributionTests(unittest.TestCase):
         )
         self.assertTrue(all(not row["annotations"] for row in result["groups"]))
 
+    def test_copy_bytes_keep_missing_sizes_and_unattributed_transfers_explicit(self):
+        rows = [
+            event("user_annotation", "denoise", 0, 100),
+            event("cuda_runtime", "cudaMemcpyAsync", 5, 1, corr=1),
+        ]
+        for size in (16, 32, 0, None, -1, "64", True):
+            copy = event("gpu_memcpy", "Memcpy HtoD", 8, 2, pid=0, tid=7, corr=1)
+            if size is not None:
+                copy["args"]["bytes"] = size
+            rows.append(copy)
+        missing_api = event("gpu_memcpy", "Memcpy DtoH", 20, 3, pid=0, tid=7)
+        missing_api["args"]["bytes"] = 128
+        rows.append(missing_api)
+        result = attribute(lambda: iter(rows))
+        upload = next(row for row in result["groups"] if row["kernel_or_copy"] == "Memcpy HtoD")
+        self.assertEqual(upload["annotations"], ["denoise"])
+        self.assertEqual(upload["count"], 7)
+        self.assertEqual(upload["duration_sum_us"], 14)
+        self.assertEqual(upload["bytes_sum"], 48)
+        self.assertEqual(upload["events_with_bytes"], 3)
+        download = next(row for row in result["groups"] if row["kernel_or_copy"] == "Memcpy DtoH")
+        self.assertEqual(download["annotations"], [])
+        self.assertEqual(download["outcomes"], {"gpu_without_correlation": 1})
+        self.assertEqual(download["bytes_sum"], 128)
+
     def test_ranges_handle_nested_adjacent_and_overlapping_intervals(self):
         ranges = Ranges(
             [
