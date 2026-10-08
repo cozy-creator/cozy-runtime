@@ -37,7 +37,8 @@ def verify(payload: Request, ctx: Context) -> Result:
         raise ValueError("Fusion admission requires the allocated rented GPU")
     device = torch.device(str(ctx.device))
     fusion_install._require_capabilities()
-    fusion.expect(device)
+    major, minor = torch.cuda.get_device_capability(device)
+    fusion.expect(major * 10 + minor)
     cases = []
     with torch.inference_mode():
         for mode in ("bf16", "encoded", "encoded_inactive", "encoded_baked", "encoded_unbaked"):
