@@ -70,7 +70,21 @@ def test_changed_input_contract_is_refused() -> None:
 
 
 @pytest.mark.parametrize(
-    "change", ["dropout", "activation", "norm", "forward", "hook", "norm_hook", "activation_hook"]
+    "change",
+    [
+        "dropout",
+        "activation",
+        "norm",
+        "forward",
+        "hook",
+        "norm_hook",
+        "activation_hook",
+        "dropout_forward",
+        "activation_forward",
+        "attention_hook",
+        "swiglu_hook",
+        "swiglu_post_hook",
+    ],
 )
 def test_unsupported_later_block_leaves_every_block_unmodified(change: str) -> None:
     model = transformer()
@@ -83,6 +97,16 @@ def test_unsupported_later_block_leaves_every_block_unmodified(change: str) -> N
         second.norm1 = torch.nn.LayerNorm(256)
     elif change == "forward":
         second.forward = lambda *args: args[0]
+    elif change == "dropout_forward":
+        second.ff.net[1].forward = lambda value: value + 1
+    elif change == "activation_forward":
+        second.ff.net[0].activation.forward = lambda value: value + 1
+    elif change == "attention_hook":
+        second.attn.register_forward_pre_hook(lambda module, args: (args[0] + 1, *args[1:]))
+    elif change == "swiglu_hook":
+        second.ff.net[0].register_forward_pre_hook(lambda module, args: (args[0] + 1,))
+    elif change == "swiglu_post_hook":
+        second.ff.net[0].register_forward_hook(lambda module, args, output: output + 1)
     elif change == "norm_hook":
         second.norm1.register_forward_pre_hook(lambda module, args: (args[0] + 1,))
     elif change == "activation_hook":

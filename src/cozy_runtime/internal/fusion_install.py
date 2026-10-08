@@ -308,13 +308,17 @@ def _validate_transformer(transformer: Any, root: str) -> None:
             and type(ff.net[0]) is SwiGLU
             and "forward" not in vars(ff.net[0])
             and type(ff.net[0].activation) is torch.nn.SiLU
+            and "forward" not in vars(ff.net[0].activation)
             and type(ff.net[1]) is torch.nn.Dropout
+            and "forward" not in vars(ff.net[1])
             and ff.net[1].p == 0.0
             and not any(
                 m._forward_hooks or m._forward_pre_hooks
                 for m in (
+                    attn,
                     ff,
                     ff.net,
+                    ff.net[0],
                     ff.net[1],
                     ff.net[0].activation,
                     block.norm1,
