@@ -4,8 +4,8 @@ Weight recovery and fixture annotations pass the full configured type check, and
 publication explicitly selects source builds or the verified complete prebuilt file set.
 Installed managed-call proxies retain their public callable identity for prefetch.
 
-TensorFS 0.6.1 preserves inherited model files by reference, including tokenizer assets
-larger than the small-file read cap. The dependency floor selects the fixed local library;
+TensorFS 0.6.1 preserves inherited companion files, including tokenizer assets, by
+reference without copying their payloads. The dependency floor selects the fixed local library;
 machine/executor peers still use operation and capability contracts without requiring
 matching versions.
 
