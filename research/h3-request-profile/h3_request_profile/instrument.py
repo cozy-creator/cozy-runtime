@@ -162,7 +162,9 @@ def record_request(
     """The same bounded recorder can be exercised with real CPU modules off-rental."""
     from torch.profiler import profile, record_function, schedule
 
-    steps, handles, scopes = [], [], {}
+    steps: list[dict[str, Any]] = []
+    handles: list[Any] = []
+    scopes: dict[str, Any] = {}
     step_index = [0]
     before: list[dict[str, Any]] = [{}]
     began = [0.0]
@@ -193,7 +195,8 @@ def record_request(
                 }
             )
 
-    # Full request still executes. Only last dense+first sparse transformer calls
+    # Full request executes. Trace the last forced-dense and first sparse-eligible calls;
+    # a dense-only attention pin can still execute dense kernels in the latter phase.
     # are recorded; exports/teardown and all profiler overhead are diagnostic time.
     with profile(
         activities=activities,
@@ -206,9 +209,8 @@ def record_request(
 
         def step_start(*args: Any) -> None:
             before[0], began[0] = facts(), time.perf_counter()
-            marker = record_function(
-                f"h3.step.{step_index[0]}.{'dense' if step_index[0] < dense_steps else 'sparse'}"
-            )
+            phase = "dense" if step_index[0] < dense_steps else "sparse_eligible"
+            marker: Any = record_function(f"h3.step.{step_index[0]}.{phase}")
             marker.__enter__()
             scopes["step"] = marker
 
@@ -220,7 +222,7 @@ def record_request(
             steps.append(
                 {
                     "step": step_index[0],
-                    "attention": "dense" if step_index[0] < dense_steps else "sparse",
+                    "policy_phase": "dense" if step_index[0] < dense_steps else "sparse_eligible",
                     "cpu_enqueue_wall_ms": (time.perf_counter() - began[0]) * 1000,
                     "plane_before": before[0],
                     "plane_after": after,
@@ -251,7 +253,7 @@ def record_request(
                 continue
 
             def enter(*args: Any, label: str = path) -> None:
-                marker = record_function("h3.module." + label)
+                marker: Any = record_function("h3.module." + label)
                 marker.__enter__()
                 scopes.setdefault(label, []).append(marker)
 
@@ -293,9 +295,7 @@ def record_request(
             "plane_delta": counter_delta(request_before, request_after),
             "attribution_before": attribution_before,
             "attribution_after": attribution_after,
-            "scope": (
-                "Entire H3 handler: prepare, TE, denoise, both VAEs, sink and output checks"
-            ),
+            "scope": ("Entire H3 handler: prepare, TE, denoise, both VAEs, sink and output checks"),
         },
         "output_sinks": output_sinks or [],
         "inclusive_times_must_not_be_summed": True,
@@ -314,7 +314,9 @@ def record_request(
             "source next() includes waiting, digesting and materializing decoded events. "
             "The post-EOF sink tail includes encoder flush, mux, probe and output registration. "
             "Machine preparation before this handler and final artifact commit/export after it "
-            "must be read from ordinary run-show evidence; reused setup is not charged again."
+            "must be read from ordinary run-show evidence; reused setup is not charged again. "
+            "Sparse-eligible labels describe the schedule, not proof of a sparse kernel; "
+            "actual kernel identity comes from the trace and native run evidence."
         ),
     }
     return result, traces[0], json.dumps(summary, separators=(",", ":"), allow_nan=False).encode()

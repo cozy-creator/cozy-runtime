@@ -58,7 +58,7 @@ def test_bounded_real_cpu_trace_keeps_request_outputs_and_removes_hooks(detailed
     assert all(row["plane_delta"] == {} for row in facts["steps"])  # no invented GPU facts
     events = json.loads(gzip.decompress(trace))["traceEvents"]
     markers = {e.get("name") for e in events if str(e.get("name", "")).startswith("h3.step.")}
-    assert markers == {"h3.step.3.dense", "h3.step.4.sparse"}
+    assert markers == {"h3.step.3.dense", "h3.step.4.sparse_eligible"}
     assert any(e.get("name") == "h3.module.block.to_q" for e in events)
     assert not model._forward_pre_hooks and not model._forward_hooks
     assert not model.block.to_q._forward_pre_hooks and not model.block.to_q._forward_hooks
