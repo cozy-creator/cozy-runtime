@@ -1,11 +1,9 @@
-"""Checkpoints in a TensorFS store, as the runtime reads them: headers, plan rows, leases.
+"""Granted model headers, tensor read plans and explicit standalone Store utilities.
 
-The weight plane (`weights.py`, `tensorfs-plane`) moves the bytes. What stays here is the
-store side every consumer shares: opening a store, a checkpoint's header projected into the
-contract's rows (`PlanRow`, with each tensor's stored roles), verified read leases keyed by
-snapshot, the servability answer derived from plan resolution, and the one refusal
-vocabulary (`FillRefusal`). A snapshot is verified when its lease is taken, so a corrupt
-artifact refuses before construction.
+The weight plane (`weights.py`, `tensorfs-plane`) moves the bytes. This module projects
+TensorFS headers into contract rows, derives servability from plan resolution and maps
+native refusals into `FillRefusal`. Managed checkpoints consume owner-granted sources;
+standalone callers supply a Store explicitly when they need local verified read leases.
 """
 
 from __future__ import annotations

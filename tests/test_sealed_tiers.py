@@ -29,6 +29,7 @@ from tensorfs import plane as tfs_plane  # noqa: E402
 from cozy_runtime.author._executor_requests import SealedPlan  # noqa: E402
 from cozy_runtime.internal import canonical, plane, spawn  # noqa: E402
 from cozy_runtime.internal.executor import Executor  # noqa: E402
+from cozy_runtime.internal.executor_commands import Binding, Load  # noqa: E402
 from cozy_runtime.internal.fill import Checkpoint, FillRefusal  # noqa: E402
 from cozy_runtime.internal.parallel.group import RankGroup  # noqa: E402
 from cozy_runtime.internal.seam import Channel  # noqa: E402
@@ -78,6 +79,7 @@ class Machine:
                 return None
             # the machine's own planner, over its own copy of the header
             header = self.store.manifest(doc.manifest)["header"]
+            assert header is not None
             plan = tensorfs.plan(
                 header, list(doc.traversal), list(doc.components), window=doc.window
             )
@@ -95,6 +97,7 @@ class Machine:
         """The verified object files behind a layout's plan, read-only, in SHA-256 order: its
         holes read them."""
         header = self.store.manifest(doc.manifest)["header"]
+        assert header is not None
         plan = tensorfs.plan(header, list(doc.traversal), list(doc.components), window=doc.window)
         if doc.parts:
             plan = plan.select(list(doc.parts))
@@ -116,10 +119,12 @@ class Machine:
         """A model file, as the machine serves it (`model_source`): the header or an asset."""
         manifest, name = frame["manifest"], frame.get("name", "")
         header = self.store.manifest(manifest)["header"]
+        assert header is not None
         if not name:
             return bytes(header)
         with self.store.acquire_cozytensors(manifest) as lease:
-            return bytes(lease.read_asset(header, name, max_bytes=64 << 20))
+            asset = lease.read_asset(header, name, max_bytes=64 << 20)
+        return bytes(asset)
 
     def serve(self, channel: Channel, stop: threading.Event) -> None:
         while not stop.is_set():
@@ -301,6 +306,28 @@ def test_with_model_sources_an_executor_opens_no_store(tmp_path: Path) -> None:
             expected = reference(x)
         assert same(run(model, x, passes=1), [expected])
         assert model.backend.stats["leases"]["acquisitions"] == 0
+
+        # Register the real CPU construction to exercise the executor's reuse branch.
+        # CUDA construction admission is separate; reuse must retain these same grants
+        # without requesting fresh bytes or rebuilding through a Store fallback.
+        executor = session.executor
+        executor.started = True
+        child = executor._construction_child("sourced")
+        child.models["model"] = model
+        child.residency = model.residency
+        executor._register("sourced", child, {"ok": True})
+        sourced_before = machine.sourced
+        reused = executor.handle(
+            Load(
+                construction="sourced",
+                binding=Binding(
+                    model_class="Stack", model_parameter_name="model", snapshot=manifest
+                ),
+            )
+        )
+        assert reused["ok"] and reused["reused"]
+        assert child.models["model"] is model and machine.sourced == sourced_before
+        assert same(run(model, x, passes=1), [expected])
     finally:
         session.close()
         machine.close()
