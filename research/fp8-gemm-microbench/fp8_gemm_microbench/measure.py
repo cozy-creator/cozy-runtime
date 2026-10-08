@@ -130,7 +130,7 @@ def compare_paths(selected, seed, warmup, repeats):
             "Not checkpoint or video quality qualification",
             "Not paging or transfer throughput",
             "No bias, no static calibration",
-            "Different fast-accum flags are explicit",
+            "SM120 rowwise body ignores FastAccum; API flags alone are not an accumulation A/B",
             "Dispatch inferred from scalar/rowwise API contract; kernel trace still required",
             "FP32 numerical reference uses highest precision, TF32 disabled",
             "Existing full-precision Turbo heads are not replaced",

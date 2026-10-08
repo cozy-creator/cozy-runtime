@@ -12,6 +12,9 @@ and fc2 N5376 K14336 with M1024. Turbo's FP32 heads are excluded.
 
 The native path preserves `use_fast_accum=True`; the scalar FP32 candidate uses
 `False`. Those accumulator choices are reported, not treated as bitwise equivalent.
+The inspected Torch SM120 rowwise CUTLASS body does not use its FastAccum template,
+so these API flags do not by themselves form an accumulation-mode A/B. The study
+changes the GEMM implementation and adds FP32 output/epilogue staging.
 The numerical reference is an FP32 dot of the same quantized operands, sequential
 FP32 scaling and BF16 rounding, with TF32 disabled. Errors against the unquantized
 FP32 dot and between implementations are also retained. A/B/scales are checked
