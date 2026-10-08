@@ -23,7 +23,8 @@ def compare(payload: Request, ctx: Context, out: Outputs) -> Result:
     """Compare rowwise native GEMM with unit-scale FP32 GEMM and a fused epilogue."""
     if ctx.device.type != "cuda":
         raise RuntimeError("This accelerator job requires its normally admitted CUDA device")
+    import json
     from .measure import compare_paths
 
     report = compare_paths(payload.case, payload.seed, payload.warmup, payload.repeats)
-    return Result(out.save_json(report))
+    return Result(out.save_bytes(json.dumps(report, allow_nan=False).encode(), media_type="application/json"))

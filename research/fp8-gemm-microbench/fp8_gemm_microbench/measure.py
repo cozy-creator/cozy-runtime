@@ -45,6 +45,9 @@ def _timed(torch, function, warmup, repeats):
 def _error(torch, actual, reference):
     a, b = actual.float(), reference.float()
     finite = bool(torch.isfinite(a).all().item())
+    if not finite:
+        return {"finite": False, "max_abs": None, "rmse": None, "relative_l2": None,
+                "reference_rms": float(b.square().mean().sqrt().item())}
     delta = a - b
     return {"finite": finite, "max_abs": float(delta.abs().max().item()),
             "rmse": float(delta.square().mean().sqrt().item()),
@@ -80,15 +83,15 @@ def compare_paths(selected, seed, warmup, repeats):
                 one = torch.ones((), dtype=torch.float32, device="cuda")
                 dest = torch.empty((m, n), dtype=torch.bfloat16, device="cuda")
                 assert aq.stride(1) == 1 and b.stride(0) == 1
-                versions = [a._version for a in (aq, bq, a_scale, b_scale)]
+                before = tuple(a.clone() for a in (aq, bq, a_scale, b_scale))
 
                 def rowwise():
                     return torch._scaled_mm(aq, b, scale_a=a_scale, scale_b=bs,
-                                            out_dtype=torch.bfloat16, use_fast_accum=True)
+                                            out_dtype=torch.bfloat16, use_fast_accum=True, bias=None)
 
                 def scalar():
                     return torch._scaled_mm(aq, b, scale_a=one, scale_b=one,
-                                            out_dtype=torch.float32, use_fast_accum=False)
+                                            out_dtype=torch.float32, use_fast_accum=False, bias=None)
 
                 native_time, native = _timed(torch, rowwise, warmup, repeats)
                 scalar_time, accum = _timed(torch, scalar, warmup, repeats)
@@ -107,11 +110,12 @@ def compare_paths(selected, seed, warmup, repeats):
                           "composed_vs_native": _error(torch, combined, native),
                           "native_vs_unquantized_fp32": _error(torch, native, original),
                           "composed_vs_unquantized_fp32": _error(torch, combined, original)}
-                assert versions == [a._version for a in (aq, bq, a_scale, b_scale)]
+                assert all(torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+                           for a, b in zip((aq, bq, a_scale, b_scale), before, strict=True))
                 assert torch.equal(aq.view(torch.uint8), quantized[0].view(torch.uint8))
                 assert torch.equal(a_scale, quantized[1])
                 results.append({"name": name, "m": m, "n": n, "k": k,
-                    "quantized_operands_shared_by_identity": True, "input_versions_unchanged": True,
+                    "quantized_operands_shared_by_identity": True, "input_bytes_unchanged": True,
                     "a_shape_stride": [list(aq.shape), list(aq.stride())],
                     "b_shape_stride": [list(b.shape), list(b.stride())],
                     "activation_quantization": quant_time, "rowwise_native_gemm": native_time,
@@ -120,7 +124,7 @@ def compare_paths(selected, seed, warmup, repeats):
                     "peak_torch_allocated_bytes": torch.cuda.max_memory_allocated(),
                     "finite_pass": all(c["finite"] for c in checks.values())})
                 del x, w, aq, bq, b, a_scale, b_scale, bs, one, dest
-                del native, accum, scaled, combined, reference, original, quantized
+                del native, accum, scaled, combined, reference, original, quantized, before
     finally:
         torch.set_float32_matmul_precision(old_precision)
         torch.backends.cuda.matmul.allow_tf32 = old_tf32
