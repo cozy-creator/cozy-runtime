@@ -1,7 +1,9 @@
 """Verify that the GPU admission fixture exercises real leaf hooks and reuse."""
 
 import importlib.util
+import sys
 from pathlib import Path
+from types import ModuleType
 
 import torch
 
@@ -42,3 +44,21 @@ def test_selected_real_matrix_cases_cross_a_tile_and_have_a_nonempty_partial_tai
         tile = rowwise_gemm.tile_rows(n)
         assert m > tile and 0 < m % tile < tile
         assert tile * n * 4 <= rowwise_gemm.MAX_FP32_BYTES
+
+
+def test_full_sequence_comparison_includes_tail_rows(monkeypatch):
+    namespace = ModuleType("rowwise_gate_test")
+    namespace.__path__ = [str(Path(__file__).with_name("rowwise_gemm_gate"))]
+    monkeypatch.setitem(sys.modules, "rowwise_gate_test", namespace)
+    path = Path(namespace.__path__[0]) / "full_sequence.py"
+    spec = importlib.util.spec_from_file_location("rowwise_gate_test.full_sequence", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    original = torch.zeros((129, 16), dtype=torch.bfloat16)
+    same = module._compare_outputs(torch, original, original.clone())
+    assert same == {"bytes_equal": True, "finite": True, "different_elements": 0, "max_abs": 0}
+    changed = original.clone()
+    changed[128, -1] = 2
+    actual = module._compare_outputs(torch, changed, original)
+    assert actual == {"bytes_equal": False, "finite": True, "different_elements": 1, "max_abs": 2}

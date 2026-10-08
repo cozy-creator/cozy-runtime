@@ -13,3 +13,10 @@ FP32 scratch allocation and rescaling; all operands are already GPU resident.
 
 The final output tensor is necessary for the layer and is outside the temporary FP32
 scratch bound. Vendor GEMM workspace is also outside that explicit tensor bound.
+
+The separate `benchmark` callable defaults to 109,192 rows for each complete matrix
+operation. It alternates reference/candidate order, includes every candidate tile and
+its scalar/scratch allocations, and drops each output before the next timed allocation.
+After timing, it compares the full outputs with bounded numerical-diagnostic scratch.
+This measures the full-sequence linear operation, while still excluding model paging,
+activation quantization, and the rest of H3.
