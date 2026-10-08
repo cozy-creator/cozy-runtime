@@ -22,10 +22,17 @@ TRACE_BYTES = 64 << 30
 
 
 def host_range(label: str) -> dict[str, Any]:
+    ident = threading.get_ident()
+    native = threading.get_native_id()
+    low32 = ident & 0xFFFFFFFF
     return {
         "label": label,
         "pid": os.getpid(),
-        "tid": threading.get_native_id(),
+        "tid": native,
+        "native_tid": native,
+        "python_ident": ident,
+        "pthread_tid_int32": low32 if low32 < 0x80000000 else low32 - 0x100000000,
+        "pthread_tid_uint32": low32,
         "start_unix_ns": time.time_ns(),
     }
 
@@ -429,6 +436,11 @@ def record_request(
         if trace_cpu_ops
         else "QKV/out omitted",
         "ranges": ranges,
+        "thread_id_note": (
+            "Linux native_tid and Python get_ident plus signed/unsigned low32 aliases are "
+            "retained. CUDA-only Kineto may use pthread low32 instead of native_tid; "
+            "verify the actual runtime-event join rather than assuming either ID."
+        ),
         "profiled_step_indices": list(range(len(steps)))
         if full_request_trace
         else [dense_steps - 1, dense_steps],

@@ -289,6 +289,12 @@ def test_manual_ranges_preserve_real_telemetry_and_have_native_thread_identity(t
     row = ranges[0]
     assert row["label"] == "h3.phase.condition_text"
     assert row["pid"] == os.getpid() and row["tid"] == threading.get_native_id()
+    assert row["native_tid"] == threading.get_native_id()
+    assert row["python_ident"] == threading.get_ident()
+    assert row["pthread_tid_uint32"] == threading.get_ident() & 0xFFFFFFFF
+    assert row["pthread_tid_int32"] == (
+        (threading.get_ident() + 0x80000000) % 0x100000000 - 0x80000000
+    )
     assert 0 < row["start_unix_ns"] <= row["end_unix_ns"]
 
 
