@@ -111,7 +111,7 @@ def verify(payload: Request, ctx: Context) -> Result:
             setattr(
                 attn,
                 name,
-                RowwiseNativeLeaf().leaf(
+                RowwiseNativeLeaf("fp8-rowwise/1").leaf(
                     torch, {"data": data, "scale": scale}, original, torch.bfloat16
                 ),
             )
