@@ -3838,7 +3838,11 @@ class Executor:
             }
             imported.__dict__["__cozy_bindings__"] = bindings
             for export in bindings:
-                imported.__dict__[export] = companion.__dict__[export]
+                proxy = companion.__dict__[export]
+                # Callable lookup (including prefetch) uses the admitted public
+                # module. Generated wire types stay private to the companion.
+                proxy.__module__ = module
+                imported.__dict__[export] = proxy
 
     def _call_broker(self, request_id: str, rows: tuple[CallInterface, ...]) -> Any:
         from cozy_runtime.author._calls import _Broker, _CallType

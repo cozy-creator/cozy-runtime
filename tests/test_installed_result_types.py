@@ -24,10 +24,11 @@ from cozy_runtime.author import (
 )
 from cozy_runtime.author._call_results import decode
 from cozy_runtime.author._calls import _Broker, _CallType
+from cozy_runtime.author._executor_requests import Answer, ModelPrefetch, Request
 from cozy_runtime.internal import call_types, static_interface
 from cozy_runtime.internal.executor import Executor
 from cozy_runtime.internal.executor_commands import CallInterface
-from durable_seam import wire
+from durable_seam import seam, wire
 
 SOURCE = """from __future__ import annotations
 import msgspec
@@ -47,7 +48,7 @@ app.job(select)
 
 
 def installed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, kind: str = "job"
 ) -> tuple[ModuleType, tuple[CallInterface, ...], Executor]:
     module = "installed_selection"
     monkeypatch.delitem(sys.modules, module, raising=False)
@@ -55,7 +56,14 @@ def installed(
     monkeypatch.syspath_prepend(str(tmp_path))
     (tmp_path / "pyproject.toml").write_text('[project]\nname="selection"\nversion="1.0.0"\n')
     (tmp_path / "package.toml").write_text('[application]\nobject="installed_selection:app"\n')
-    (tmp_path / f"{module}.py").write_text(SOURCE)
+    source = SOURCE
+    if kind == "entrypoint":
+        source = source.replace(
+            "@invocable()\nasync def select(ctx: Context)",
+            "class Payload(msgspec.Struct):\n    pass\n\n"
+            "def select(ctx: Context, payload: Payload)",
+        ).replace("app.job(select)", "app.entrypoint(select)")
+    (tmp_path / f"{module}.py").write_text(source)
     importlib.invalidate_caches()
     document = static_interface.build(tmp_path)
     imported = importlib.import_module(module)
@@ -63,6 +71,55 @@ def installed(
     engine = Executor(cast(Any, None), tmp_path)
     engine._install_call_proxies(rows)
     return imported, rows, engine
+
+
+@pytest.mark.parametrize("kind", ["job", "entrypoint"])
+def test_installed_proxy_prefetch_keeps_its_admitted_public_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str,
+) -> None:
+    imported, rows, engine = installed(tmp_path, monkeypatch, kind=kind)
+    received: list[ModelPrefetch] = []
+
+    def exchange(request: Request) -> Answer:
+        assert isinstance(request, ModelPrefetch)
+        received.append(request)
+        return Answer(ok=True)
+
+    monkeypatch.setattr(engine, "_durable", seam(exchange))
+    for _ in range(2):
+        engine._install_call_proxies(rows)
+        broker = engine._call_broker("parent", rows)
+        assert (imported.select.__module__, imported.select.__name__) == (
+            rows[0].module, rows[0].export,
+        )
+        assert (imported.select.__module__, imported.select.__name__) in broker.bindings
+        assert imported.__cozy_bindings__["select"].python_result is imported.Selection
+        assert imported.__cozy_bindings__["select"].result.__module__ == (
+            imported.__name__ + "._cozy_runtime_callers"
+        )
+
+    # Use the ordinary attempt context and the real installed binding inventory.
+    # The hint crosses control framing; it must not execute the callee implementation.
+    module = "prefetch_installed_client"
+    monkeypatch.delitem(sys.modules, module, raising=False)
+    (tmp_path / f"{module}.py").write_text(
+        "from installed_selection import Selection, select\n"
+        "from cozy_runtime.author import prefetch\n"
+        "async def main() -> Selection:\n"
+        "    prefetch(select)\n"
+        "    return Selection(None, True)\n"
+    )
+    app = script_app(module)
+    result, outcome, _ = attempt(
+        app.get("main"), {},
+        Invocation("parent", tmp_path / "prefetch-result", time.monotonic() + 30, calls=broker),
+    )
+    assert outcome.terminal == "succeeded", outcome
+    assert result is not None and result.result.value.ready
+    assert [(row.module, row.export, row.payload) for row in received] == [
+        (rows[0].module, rows[0].export, "{}"),
+    ]
+    assert broker.calls == {} and broker.next_index == 0
 
 
 def test_plain_script_returns_installed_public_struct_after_managed_call(
