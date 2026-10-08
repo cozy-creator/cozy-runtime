@@ -51,7 +51,17 @@ class Site:
 _SITE: ContextVar[Site | None] = ContextVar("cozy_sol_site", default=None)
 _DENSE: Callable[..., Any] | None = None
 _DENSE_IDENTITY = ""
-NAMES = frozenset({"sol-attn", "kitchen-sol", "kitchen-sol-sage", "sol-fp8-fp16", "kitchen-sol-producer", "kitchen-sol-producer-reuse"})
+NAMES = frozenset(
+    {
+        "sol-attn",
+        "kitchen-sol",
+        "kitchen-sol-sage",
+        "sol-fp8-fp16",
+        "kitchen-sol-producer",
+        "kitchen-sol-producer-reuse",
+        "kitchen-sol-producer-fast",
+    }
+)
 _COUNTS: ContextVar[dict[str, int] | None] = ContextVar("cozy_sol_counts", default=None)
 _RANK_COUNTS: ContextVar[dict[int, dict[str, int]] | None] = ContextVar(
     "cozy_sol_rank_counts", default=None
@@ -123,6 +133,8 @@ def bind_dense(call: Callable[..., Any], identity: str) -> None:
 
 
 def dense_identity(kernel: str = "sol-attn") -> str:
+    if kernel == "kitchen-sol-producer-fast":
+        return "kitchen-int8; sparse-prefix=kitchen-int8"
     if kernel.startswith("kitchen-sol-producer"):
         return "sageattention; sparse-prefix=kitchen-int8"
     if kernel in {"kitchen-sol-sage", "sol-fp8-fp16"}:

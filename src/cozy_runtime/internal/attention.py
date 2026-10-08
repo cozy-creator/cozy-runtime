@@ -114,7 +114,9 @@ PINNABLE: tuple[Candidate, ...] = (
         Candidate(
             name=name,
             backend=backend,
-            local=attention_producer.LOCAL,
+            local=attention_producer.FAST_LOCAL
+            if name.endswith("-fast")
+            else attention_producer.LOCAL,
             min_sm=120,
             max_sm=120,
             sms=frozenset({120}),
@@ -462,7 +464,10 @@ def _resolve(candidate: Candidate, device: DeviceFacts, wait: bool = True) -> Re
         module = _import(candidate)
         if candidate.local in (upstream.FA3, upstream.FA3_FP8):
             upstream.bind_fa3(module, (artifact or {}).get("key", "environment"))
-        if candidate.name in {"kitchen-sol", "kitchen-sol-sage"} or candidate.name in attention_producer.NAMES:
+        if (
+            candidate.name in {"kitchen-sol", "kitchen-sol-sage"}
+            or candidate.name in attention_producer.NAMES
+        ):
             import torch
 
             target = torch.device("cuda", device.index)
@@ -477,7 +482,10 @@ def _resolve(candidate: Candidate, device: DeviceFacts, wait: bool = True) -> Re
                     "attention_kernel_absent",
                     "kitchen-sol requires compiled Sol and INT8 dense kernels",
                 )
-    if candidate.name in {"kitchen-sol-sage", "sol-fp8-fp16"} or candidate.name in attention_producer.NAMES:
+    if (
+        candidate.name in {"kitchen-sol-sage", "sol-fp8-fp16"}
+        or candidate.name in attention_producer.NAMES
+    ):
         _resolve(BY_NAME["sageattention"], device, wait)
     if candidate.name == "sol-attn":
         _sol_route(device)

@@ -7,8 +7,10 @@
   "hypothesis": "Avoiding full BF16QKV and fusing norm/RoPE/quant may reduce sparse-block memory traffic; previous-step stats avoid repeated projections but change approximation. No assured speedup.",
   "selectors": [
     "kitchen-sol-producer",
-    "kitchen-sol-producer-reuse"
+    "kitchen-sol-producer-reuse",
+    "kitchen-sol-producer-fast"
   ],
   "contract": "1GPU only; preserve dense10/4 steps and densepaths viaSage. ProtectedKV exactblocks; prefixqueries denseKitchenINT8 rounded to64rows, explicitly differentfromSage reference. Currentstats replay or scoped previousstep reuse;1.1Vscale margin; upstream fusedrounding. Originalprojection modules preserveLoRAhooks andweightcustody.",
-  "status": "Implementation inprogress; noGPUqualification"
+  "status": "Implementation inprogress; noGPUqualification",
+  "fast_variant": "Previous-step producer statistics plus KitchenINT8 for dense steps/refiner/first2blocks. Same10/20 or4/4 dense/sparse schedule; explicitly different dense arithmetic from Sage-controlled pair."
 }

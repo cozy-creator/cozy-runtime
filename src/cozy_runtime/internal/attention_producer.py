@@ -20,7 +20,10 @@ from cozy_runtime.internal import attention_sol, attention_ulysses, attention_up
 from cozy_runtime.internal.attention_ulysses import Local, Options
 from cozy_runtime.internal.encoding.leaves import PreQuantized
 
-NAMES = frozenset({"kitchen-sol-producer", "kitchen-sol-producer-reuse"})
+NAMES = frozenset(
+    {"kitchen-sol-producer", "kitchen-sol-producer-reuse", "kitchen-sol-producer-fast"}
+)
+REUSE = frozenset({"kitchen-sol-producer-reuse", "kitchen-sol-producer-fast"})
 BACKENDS = {"_cozy_" + name.replace("-", "_"): name for name in NAMES}
 CHUNK = 4096
 
@@ -83,6 +86,24 @@ def materialized(query: Any, key: Any, value: Any, **options: Any) -> Any:
 
 LOCAL = Local(
     materialized, lambda *_: "dense=sageattention; sparse=instance-producer", head_local=False
+)
+
+
+def materialized_kitchen(query: Any, key: Any, value: Any, **options: Any) -> Any:
+    return attention_sol._attention(
+        query,
+        key,
+        value,
+        **options,
+        sparse=_missing_processor,
+        dense=attention_upstream.kitchen_int8,
+    )
+
+
+FAST_LOCAL = Local(
+    materialized_kitchen,
+    lambda *_: "dense=comfy_kitchen.int8; sparse=instance-producer",
+    head_local=False,
 )
 
 
@@ -201,7 +222,7 @@ class Processor:
             raise ValueError("Kitchen producer requires matching Q/K RMSNorm epsilon")
         geometry = (tokens, attn.heads, layout.protected_prefix)
         prior_mean, prior_scale = previous_statistics(
-            state, key, layout.step, geometry, name.endswith("-reuse")
+            state, key, layout.step, geometry, name in REUSE
         )
         reuse = prior_mean is not None
         freqs = rope_presentation(rotary_emb, tokens, state)
@@ -221,7 +242,7 @@ class Processor:
             sink_q=[0, -(-layout.protected_prefix // 64)],
             token_aug=0,
         )
-        if name.endswith("-reuse"):
+        if name in REUSE:
             state.statistics[key] = (layout.step, geometry, mean, scale)
         statistics = "previous-step" if reuse else "current-call"
         attention_ulysses.record(
