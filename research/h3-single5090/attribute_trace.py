@@ -1,6 +1,6 @@
 """Attribute GPU activities to CPU annotation ranges through CUDA correlation IDs.
 
-Use the full ChromeTrace twice; do not load all CPU operators into memory. GPU
+Use three streaming passes; keep only CPU APIs referenced by GPU activities. GPU
 execution can outlive its launching CPU annotation, so GPU timestamps alone are
 not an attribution rule. Durations here are sums, never elapsed critical paths.
 """
@@ -130,6 +130,7 @@ def attribute(
     launches: dict[str, tuple[str, str, float] | None] = {}
     duplicates: set[str] = set()
     host_processes: set[str] = set()
+    referenced: set[str] = set()
     for event in events():
         times = interval(event)
         if times is None:
@@ -138,9 +139,18 @@ def attribute(
         thread = str(event.get("pid")), str(event.get("tid"))
         if category == "user_annotation":
             annotations[thread].append((*times, str(event.get("name", ""))))
-        elif category in {"cuda_runtime", "cuda_driver"}:
+        elif category in {"kernel", "gpu_kernel", "gpu_memcpy", "gpu_memset"}:
             key = correlation(event)
-            if key is None:
+            if key is not None:
+                referenced.add(key)
+    for event in events():
+        times = interval(event)
+        if times is None:
+            continue
+        thread = str(event.get("pid")), str(event.get("tid"))
+        if event.get("cat") in {"cuda_runtime", "cuda_driver"}:
+            key = correlation(event)
+            if key is None or key not in referenced:
                 continue
             host_processes.add(thread[0])
             if key in launches:
@@ -199,6 +209,7 @@ def attribute(
         "host_processes": sorted(host_processes),
         "annotation_count": sum(len(value.rows) for value in ranges.values()),
         "cpu_api_correlation_count": len(launches),
+        "gpu_referenced_correlation_count": len(referenced),
         "ambiguous_cpu_correlations": len(duplicates),
         "gpu_attribution_counts": dict(outcomes),
         "invalid_gpu_events": invalid_gpu,
