@@ -11,8 +11,13 @@ from __future__ import annotations
 from importlib import import_module
 from typing import Any
 
-from cozy_runtime.internal import attention_kitchen_sol, attention_sol
-from cozy_runtime.internal.attention_ulysses import Local
+from cozy_runtime.internal import (
+    attention_kitchen_sol,
+    attention_sol,
+    attention_ulysses,
+    attention_upstream,
+)
+from cozy_runtime.internal.attention_ulysses import Local, Options
 
 
 def sparse(query: Any, key: Any, value: Any, scale: float | None, sink_tokens: int) -> Any:
@@ -80,4 +85,42 @@ def forward(query: Any, key: Any, value: Any, **options: Any) -> Any:
 FP8_SOL = Local(
     forward,
     lambda *_: "exact=e4m3/f16_tile,route_tail=bf16/f32,state=f32,amax=16",
+)
+
+
+def fp4_dense(*, query: Any, key: Any, value: Any, scale: float | None) -> Any:
+    return attention_ulysses._call(
+        "_cozy_sage3_fp4_global",
+        attention_upstream.SAGE3_GLOBAL,
+        query,
+        key,
+        value,
+        Options(attn_mask=None, dropout_p=0.0, is_causal=False, scale=scale, enable_gqa=False),
+    )
+
+
+def sage_prefix(*, query: Any, key: Any, value: Any, scale: float | None) -> Any:
+    return attention_ulysses._call(
+        "_cozy_sage_int8_fp8",
+        attention_upstream.SAGE,
+        query,
+        key,
+        value,
+        Options(attn_mask=None, dropout_p=0.0, is_causal=False, scale=scale, enable_gqa=False),
+    )
+
+
+def forward_fp4_dense(query: Any, key: Any, value: Any, **options: Any) -> Any:
+    """Materialized QKV; NVFP4 dense policy calls, unchanged FP8 sparse tiles, Sage2 prefix."""
+    return attention_sol._attention(
+        query, key, value, **options, sparse=sparse, dense=fp4_dense, prefix_dense=sage_prefix
+    )
+
+
+FP8_SOL_FP4_DENSE = Local(
+    forward_fp4_dense,
+    lambda *_: (
+        "exact=e4m3/f16_tile,route_tail=bf16/f32,state=f32,amax=16; "
+        "dense=nvfp4_global_head_mean; prefix=sageattention"
+    ),
 )

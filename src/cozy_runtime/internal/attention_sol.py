@@ -57,6 +57,7 @@ NAMES = frozenset(
         "kitchen-sol",
         "kitchen-sol-sage",
         "sol-fp8-fp16",
+        "sol-fp8-fp16-fp4-dense",
         "kitchen-sol-producer",
         "kitchen-sol-producer-reuse",
         "kitchen-sol-producer-fast",
@@ -134,6 +135,8 @@ def bind_dense(call: Callable[..., Any], identity: str) -> None:
 
 
 def dense_identity(kernel: str = "sol-attn") -> str:
+    if kernel == "sol-fp8-fp16-fp4-dense":
+        return "sageattention3-fp4-global; sparse-prefix=sageattention"
     if kernel == "kitchen-sol-producer-fp4":
         return "sageattention3-fp4-global; sparse-prefix=kitchen-int8"
     if kernel == "kitchen-sol-producer-fast":
@@ -630,6 +633,7 @@ def _attention(
     enable_gqa: bool = False,
     sparse: Callable[..., Any] | None = None,
     dense: Callable[..., Any] = _dense,
+    prefix_dense: Callable[..., Any] | None = None,
 ) -> Any:
     """Shared input and model-policy boundary for the opt-in sparse implementations."""
     import torch
@@ -658,7 +662,17 @@ def _attention(
         raise ValueError(f"Sol serves upstream's CuTe routes only: {sorted(ROUTES.values())}")
     if scale is not None and not math.isfinite(scale):
         raise ValueError("attention scale must be finite")
-    return _execute(query, key, value, scale, layout, site, sparse=sparse, dense=dense)
+    return _execute(
+        query,
+        key,
+        value,
+        scale,
+        layout,
+        site,
+        sparse=sparse,
+        dense=dense,
+        prefix_dense=prefix_dense,
+    )
 
 
 def backend(device: Any) -> str:
@@ -679,6 +693,7 @@ def _execute(
     *,
     sparse: Callable[..., Any] | None = None,
     dense: Callable[..., Any] = _dense,
+    prefix_dense: Callable[..., Any] | None = None,
 ) -> Any:
     """Apply the model's explicit policy after hardware/operand validation."""
     import torch
@@ -717,7 +732,8 @@ def _execute(
             raise ValueError("Sol returned output sharing input storage")
         _count("sparse")
         if layout.protected_prefix:
-            live_output[:, : layout.protected_prefix] = dense(
+            prefix = dense if prefix_dense is None else prefix_dense
+            live_output[:, : layout.protected_prefix] = prefix(
                 query=q[:, : layout.protected_prefix], key=k, value=v, scale=scale
             )
             _count("dense_prefix")

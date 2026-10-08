@@ -145,6 +145,20 @@ PINNABLE: tuple[Candidate, ...] = (
         why="Explicit bounded FP8/FP16 exact tiles; BF16 routing/tails and Sage dense regions.",
     ),
     Candidate(
+        name="sol-fp8-fp16-fp4-dense",
+        backend="_cozy_sol_fp8_fp16_fp4_dense",
+        local=attention_fp8_sol.FP8_SOL_FP4_DENSE,
+        min_sm=120,
+        max_sm=120,
+        sms=frozenset({120}),
+        dtypes=frozenset({"bfloat16"}),
+        max_head_dim=128,
+        head_dims=frozenset({128}),
+        artifact=kernel_sources.PYTHON,
+        import_name="sol_attn",
+        why="Explicit FP8/FP16 sparse tiles with global-mean NVFP4 dense calls and Sage2 prefix.",
+    ),
+    Candidate(
         name="kitchen-sol-sage",
         backend="_cozy_kitchen_sol_sage",
         local=attention_kitchen_sol.KITCHEN_SOL_SAGE,
@@ -497,7 +511,10 @@ def _resolve(candidate: Candidate, device: DeviceFacts, wait: bool = True) -> Re
                     "attention_kernel_absent",
                     "kitchen-sol requires compiled Sol and INT8 dense kernels",
                 )
-    if candidate.name == "kitchen-sol-producer-fp4":
+    if candidate.name == "sol-fp8-fp16-fp4-dense":
+        _resolve(BY_NAME["sageattention3-fp4-global"], device, wait)
+        _resolve(BY_NAME["sageattention"], device, wait)
+    elif candidate.name == "kitchen-sol-producer-fp4":
         _resolve(BY_NAME["sageattention3-fp4-global"], device, wait)
     elif (
         candidate.name in {"kitchen-sol-sage", "sol-fp8-fp16"}
