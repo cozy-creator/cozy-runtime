@@ -1,0 +1,470 @@
+{
+  "updated_utc": "2026-10-08T03:24:24.897440+00:00",
+  "status": "in_progress",
+  "request": {
+    "requested_duration_s": 15,
+    "video_frames": 362,
+    "width": 1344,
+    "height": 768,
+    "fps": 24,
+    "actual_video_duration_s": 15.083333333333334,
+    "audio_rate_hz": 32000,
+    "audio_channels": 2,
+    "steps": 30,
+    "sampler": "rectified-flow Euler; video shift12, audio shift3; exact native sigmas supplied to ComfyUI",
+    "seeds": [
+      418271,
+      418272,
+      418273
+    ],
+    "prompt_varies_between_samples": true
+  },
+  "software": {
+    "cozy_runtime": "0.19.0",
+    "tensorfs": "0.4.0",
+    "native_h3_package": "paul/minimax-h3@1.26.1",
+    "native_model": "paul/minimax-h3@1.0.0-rc.2/fp8-pruned",
+    "native_model_manifest": "sha256:302eec1e11fd773f6b3cc29a7746f6e5e41ac26f1015ea47225b9392de525433",
+    "worker_image": "sha256:5b23f6556b7beb94e7fd5fe42a76e5614b6679ecd4a2b261ea394f966d62d5d5",
+    "comfyui": "0.39.0",
+    "comfyui_commit": "b0b743566f65daafc423b4fea8a2fbda94b3384a",
+    "comfy_kitchen": "0.2.37",
+    "comfy_aimdo": "0.5.5",
+    "comfy_checkpoint_revision": "e5eb578a89295337b8ff433a035929ce0279e0b6",
+    "comfy_four_gpu_plugin": "buqi-minimax-h3-multigpu@a864277f81ee7609972eb64cd1fb086f239d4c99",
+    "native_torch_distribution": "2.14.0",
+    "comfy_torch_distribution": "2.14.0+cu130",
+    "cuda_runtime": "13.0"
+  },
+  "systems": {
+    "5090-1": {
+      "provider": "RunPod",
+      "gpu": "RTX5090",
+      "gpus": 1,
+      "power_cap_w_each": 600,
+      "driver": "580.126.09",
+      "total_hourly_usd": 1.034619,
+      "vram_nominal_gb_each": 32
+    },
+    "5090-4": {
+      "provider": "Vast.ai",
+      "gpu": "RTX5090",
+      "gpus": 4,
+      "power_cap_w_each": 420,
+      "driver": "580.142",
+      "topology": "SYS across NUMA4/5/6/7",
+      "total_hourly_usd": 2.535667,
+      "additional_ingress_usd_per_gb": 0.0078125,
+      "additional_egress_usd_per_gb": 0.009114583,
+      "vram_nominal_gb_each": 32
+    },
+    "h100-1": {
+      "provider": "RunPod",
+      "gpu": "H100SXM80GB",
+      "gpus": 1,
+      "power_cap_w_each": 700,
+      "driver": "580.159.04",
+      "total_hourly_usd": 3.534619,
+      "vram_nominal_gb_each": 80
+    }
+  },
+  "results": [
+    {
+      "system": "5090-1",
+      "engine": "Cozy",
+      "attention": "Sage dense + BF16 Sol sparse",
+      "runs": [
+        {
+          "run": 4927,
+          "execution_s": 1292.524,
+          "wall_s": 1475.726,
+          "degree": 1,
+          "phase_s": {
+            "prepare": 0.0012079999999999999,
+            "loading weights": 7.375402,
+            "condition_text": 2.7614389999999998,
+            "denoise": 1138.4491810000002,
+            "decode_audio": 0.44305700000000003,
+            "decode_video": 41.141976,
+            "check_output": 0.157328
+          },
+          "gpu_pids": [
+            1071
+          ],
+          "actual_attention_implementations": [
+            "sageattention:sageattn_qk_int8_pv_fp8_cuda(per_warp, fp32+fp16, smooth_k),sdpa:flash,sol-attn:cute_sm120"
+          ],
+          "video_sha256": "bd44684cb0b9947803f7a89424621b2eaeee1cc1b292f66138eb42fa07a10a2c"
+        },
+        {
+          "run": 4929,
+          "execution_s": 1162.243,
+          "wall_s": 1166.858,
+          "degree": 1,
+          "phase_s": {
+            "prepare": 0.002254,
+            "loading weights": 3.1756819999999997,
+            "condition_text": 7.815823,
+            "denoise": 1109.353854,
+            "decode_audio": 0.12380100000000001,
+            "decode_video": 40.945406999999996,
+            "check_output": 0.145061
+          },
+          "gpu_pids": [
+            1071
+          ],
+          "actual_attention_implementations": [
+            "sageattention:sageattn_qk_int8_pv_fp8_cuda(per_warp, fp32+fp16, smooth_k),sdpa:flash,sol-attn:cute_sm120"
+          ],
+          "video_sha256": "d8c3400ba842ab890a5e1e5716ecbef63c3b1c1c160bdd80674ac2988ce01ab5"
+        },
+        {
+          "run": 4930,
+          "execution_s": 1174.736,
+          "wall_s": 2342.477,
+          "degree": 1,
+          "phase_s": {
+            "prepare": 0.000348,
+            "loading weights": 2.679875,
+            "condition_text": 12.007852000000002,
+            "denoise": 1117.656097,
+            "decode_audio": 0.120108,
+            "decode_video": 41.046339,
+            "check_output": 0.127708
+          },
+          "gpu_pids": [
+            1071
+          ],
+          "actual_attention_implementations": [
+            "sageattention:sageattn_qk_int8_pv_fp8_cuda(per_warp, fp32+fp16, smooth_k),sdpa:flash,sol-attn:cute_sm120"
+          ],
+          "video_sha256": "8bb52c0dd57c0205696898291283a9fcc90fb5e2c56bd53f83eef475472333f1"
+        }
+      ],
+      "warm_execution_s": [
+        1162.243,
+        1174.736
+      ],
+      "warm_mean_execution_s": 1168.4895000000001,
+      "steady_generation_cost_per_clip_usd": 0.33581706611125
+    },
+    {
+      "system": "5090-1",
+      "engine": "ComfyUI",
+      "attention": "Kitchen INT8 dense + Kitchen Sol sparse",
+      "runs": [
+        {
+          "label": "comfy-single-cold",
+          "execution_s": 965.4059998989105,
+          "seed": 418271,
+          "video_sha256": "35fdbce3ea7193127380dc169c7110b4a7462951d7f0e5c870ebcf0649fbe549",
+          "full_av_decode_pass": true
+        },
+        {
+          "label": "comfy-single-warm-1",
+          "execution_s": 943.412999868393,
+          "seed": 418272,
+          "video_sha256": "bfa3e2d687a357265b591b456cd02ce2323c847c731f2e1808346f43ca7065d0",
+          "full_av_decode_pass": true
+        },
+        {
+          "label": "comfy-single-warm-2",
+          "execution_s": 934.8580000400543,
+          "seed": 418273,
+          "video_sha256": "27f7f51a88e0a1de861bc994d15a9c163504f8f679f6228d5504507e7cd15d62",
+          "full_av_decode_pass": true
+        }
+      ],
+      "warm_execution_s": [
+        943.412999868393,
+        934.8580000400543
+      ],
+      "warm_mean_execution_s": 939.1354999542236,
+      "steady_generation_cost_per_clip_usd": 0.26990206439642744
+    },
+    {
+      "system": "5090-4",
+      "engine": "Cozy",
+      "attention": "Sage dense + BF16 Sol sparse",
+      "runs": [
+        {
+          "run": 4932,
+          "execution_s": 414.529,
+          "wall_s": 671.252,
+          "degree": 4,
+          "phase_s": {
+            "prepare": 0.001445,
+            "loading weights": 2.875701,
+            "condition_text": 4.351581,
+            "denoise": 369.481495,
+            "decode_audio": 0.529126,
+            "decode_video": 15.467853,
+            "check_output": 0.173424
+          },
+          "gpu_pids": [
+            2940,
+            2945,
+            2947,
+            2949
+          ],
+          "actual_attention_implementations": [
+            "sageattention:sageattn_qk_int8_pv_fp8_cuda(per_warp, fp32+fp16, smooth_k),sdpa:flash,sol-attn:cute_sm120",
+            "sageattention:sageattn_qk_int8_pv_fp8_cuda(per_warp, fp32+fp16, smooth_k),sol-attn:cute_sm120"
+          ],
+          "video_sha256": "d14c5b06d14f087232a0f7c096cc16150d35473239557082aba5994e8673e892"
+        },
+        {
+          "run": 4934,
+          "execution_s": 389.534,
+          "wall_s": 400.244,
+          "degree": 4,
+          "phase_s": {
+            "prepare": 0.000303,
+            "loading weights": 1.099615,
+            "condition_text": 3.751271,
+            "denoise": 368.092925,
+            "decode_audio": 0.129132,
+            "decode_video": 15.734701,
+            "check_output": 0.132539
+          },
+          "gpu_pids": [
+            2940,
+            2945,
+            2947,
+            2949
+          ],
+          "actual_attention_implementations": [
+            "sageattention:sageattn_qk_int8_pv_fp8_cuda(per_warp, fp32+fp16, smooth_k),sdpa:flash,sol-attn:cute_sm120",
+            "sageattention:sageattn_qk_int8_pv_fp8_cuda(per_warp, fp32+fp16, smooth_k),sol-attn:cute_sm120"
+          ],
+          "video_sha256": "9a04a570b19e45b7f05d4a48dd5d4c2934e8da70ae1a9ec7e811f2be591ab027"
+        },
+        {
+          "run": 4935,
+          "execution_s": 398.047,
+          "wall_s": 776.964,
+          "degree": 4,
+          "phase_s": {
+            "prepare": 0.00023,
+            "loading weights": 0.975361,
+            "condition_text": 10.601751,
+            "denoise": 369.456411,
+            "decode_audio": 0.128606,
+            "decode_video": 15.717484,
+            "check_output": 0.126654
+          },
+          "gpu_pids": [
+            2940,
+            2945,
+            2947,
+            2949
+          ],
+          "actual_attention_implementations": [
+            "sageattention:sageattn_qk_int8_pv_fp8_cuda(per_warp, fp32+fp16, smooth_k),sdpa:flash,sol-attn:cute_sm120",
+            "sageattention:sageattn_qk_int8_pv_fp8_cuda(per_warp, fp32+fp16, smooth_k),sol-attn:cute_sm120"
+          ],
+          "video_sha256": "dcf41c80c9117bd86f603c667d07967de541a2785af0b22f3411368671d54cd7"
+        }
+      ],
+      "warm_execution_s": [
+        389.534,
+        398.047
+      ],
+      "warm_mean_execution_s": 393.7905,
+      "steady_generation_cost_per_clip_usd": 0.27736710437875
+    },
+    {
+      "system": "5090-4",
+      "engine": "Cozy",
+      "attention": "dense PyTorch SDPA; actual flash backend on all four ranks",
+      "runs": [
+        {
+          "run": 4936,
+          "execution_s": 844.61,
+          "wall_s": 1460.6,
+          "degree": 4,
+          "phase_s": {
+            "prepare": 0.000277,
+            "loading weights": 0.849182,
+            "condition_text": 1.149905,
+            "denoise": 825.5378129999999,
+            "decode_audio": 0.1298,
+            "decode_video": 15.638759,
+            "check_output": 0.137648
+          },
+          "gpu_pids": [
+            2940,
+            2945,
+            2947,
+            2949
+          ],
+          "actual_attention_implementations": [
+            "flash"
+          ],
+          "video_sha256": "b138b934546a2f863bce18b4ac0c29047fb177fbf09b0756168c8c2d8b1473ea"
+        }
+      ],
+      "warm_execution_s": [
+        844.61
+      ],
+      "warm_mean_execution_s": 844.61,
+      "single_control_sample": true,
+      "notes": "Existing executors and weights reused; input0 text conditioning may be cached. Compare separately from sparse results."
+    },
+    {
+      "system": "h100-1",
+      "engine": "Cozy",
+      "attention": "FA3 dense + BF16 Sol sparse",
+      "runs": [
+        {
+          "run": 4933,
+          "execution_s": 902.612,
+          "wall_s": 1014.252,
+          "degree": 1,
+          "phase_s": {
+            "prepare": 0.0024700000000000004,
+            "loading weights": 6.10351,
+            "condition_text": 1.8070899999999999,
+            "denoise": 564.124286,
+            "decode_audio": 0.33905,
+            "decode_video": 18.637331999999997,
+            "check_output": 0.190723
+          },
+          "gpu_pids": [
+            1907
+          ],
+          "actual_attention_implementations": [
+            "flash-attn3:flash_attn3 ba8dbcef3aa7a307,sageattention:sageattn_qk_int8_pv_fp8_cuda_sm90(per_thread, fp32+fp32, smooth_k),sol-attn:cute_sm90"
+          ],
+          "video_sha256": "91a8208dfdcf5e0d17dae40fe68d9068a1e6726601eb34723ecc573cdfd62e21"
+        },
+        {
+          "run": 4937,
+          "execution_s": 584.39,
+          "wall_s": 589.092,
+          "degree": 1,
+          "phase_s": {
+            "prepare": 0.001729,
+            "loading weights": 2.446844,
+            "condition_text": 1.099346,
+            "denoise": 561.573679,
+            "decode_audio": 0.180953,
+            "decode_video": 18.472829,
+            "check_output": 0.152855
+          },
+          "gpu_pids": [
+            1907
+          ],
+          "actual_attention_implementations": [
+            "flash-attn3:flash_attn3 ba8dbcef3aa7a307,sageattention:sageattn_qk_int8_pv_fp8_cuda_sm90(per_thread, fp32+fp32, smooth_k),sol-attn:cute_sm90"
+          ],
+          "video_sha256": "038e68974efef3542736268492538c6ac5d01f47a9e09562963e26742f821457"
+        },
+        {
+          "run": 4945,
+          "execution_s": 583.036,
+          "wall_s": 591.838,
+          "degree": 1,
+          "phase_s": {
+            "prepare": 0.00023,
+            "loading weights": 1.3654670000000002,
+            "condition_text": 0.164198,
+            "denoise": 562.384139,
+            "decode_audio": 0.185022,
+            "decode_video": 18.222809,
+            "check_output": 0.152444
+          },
+          "gpu_pids": [
+            1907
+          ],
+          "actual_attention_implementations": [
+            "flash-attn3:flash_attn3 ba8dbcef3aa7a307,sageattention:sageattn_qk_int8_pv_fp8_cuda_sm90(per_thread, fp32+fp32, smooth_k),sol-attn:cute_sm90"
+          ],
+          "video_sha256": "72c1273db08f4048d45fb69aab58023a442092746e4dc965ea9dd97c1b1e284c"
+        }
+      ],
+      "warm_execution_s": [
+        584.39,
+        583.036
+      ],
+      "warm_mean_execution_s": 583.713,
+      "steady_generation_cost_per_clip_usd": 0.5731119612075
+    },
+    {
+      "system": "5090-4",
+      "engine": "ComfyUI",
+      "status": "running",
+      "attention": "dense PyTorch SDPA; sparse/backend patches unsupported by plugin"
+    },
+    {
+      "system": "h100-1",
+      "engine": "ComfyUI",
+      "status": "running"
+    },
+    {
+      "system": "5090-1",
+      "engine": "Cozy experimental",
+      "status": "warm repeats running",
+      "runtime": "0.19.0+dev.kitchensol.55427abf",
+      "attention": "Kitchen INT8 dense + Kitchen Sol sparse, current-call stats; standard BF16 default unchanged",
+      "runs": [
+        {
+          "run": 4943,
+          "execution_s": 1066.218,
+          "wall_s": 1074.868,
+          "degree": 1,
+          "phase_s": {
+            "prepare": 0.001297,
+            "loading weights": 10.032238,
+            "condition_text": 4.474876,
+            "denoise": 1002.601012,
+            "decode_audio": 0.38308499999999995,
+            "decode_video": 41.274860999999994,
+            "check_output": 0.17342500000000002
+          },
+          "gpu_pids": [
+            3903
+          ],
+          "actual_attention_implementations": [
+            "kitchen-sol:comfy_kitchen.sol_attn(int8, tau=1, current-call stats),sdpa:flash"
+          ],
+          "video_sha256": "b1a42f7394ffb52a83f1861128f0a4f2a1a90f2bbcc801f85f2197ef6fcea637"
+        }
+      ]
+    }
+  ],
+  "timing_rules": [
+    "Headline times measure request execution and finished local MP4, excluding queueing, package/model download and observer output transfer. Server startup is separate.",
+    "First runs are functional evidence; clean warm samples drive headline comparisons. Native1 cold overlapped Comfy CPU setup; Comfy1 cold overlapped native host-cache cleanup.",
+    "Phase timings can overlap weight-loading spans and must not be summed blindly. Native denoise phase includes preparation beyond summed step timings.",
+    "Steady generation costs are execution time times the actual rental rate including storage. They exclude setup, idle time and network charges; they are not total campaign spend."
+  ],
+  "quality_limits": [
+    "Native and Comfy use different FP8 checkpoint formats, arithmetic and potentially different same-seed noise packing. Cross-engine pixel equivalence is not claimed.",
+    "All50 Comfy main-block fc2 layers are FP8-stored but force BF16 matmul; other150 quantized projection policies do not force it. This is metadata/source evidence, not isolated timing attribution.",
+    "Native uses BF16 text-encoder compute; Comfy uses FP16 compute from the BF16-stored encoder.",
+    "All completed baseline clips passed full362-frame audio/video decoding; sampled frames are coherent. Subjective quality equivalence is unproven.",
+    "The optional INT8 candidate changes video and audio measurably. It remains opt-in and does not replace the BF16 Sol sparse default.",
+    "PyTorch distribution tags differ between native and Comfy environments; binary equivalence is not asserted."
+  ],
+  "eight_way": {
+    "source_supported_degrees": [
+      2,
+      4,
+      7,
+      8
+    ],
+    "distributed_cpu_evidence": "Eight-rank reduced H3 and Ulysses/Sol tests passed; see outputs/h3-4x5090-8way-audit-20261007/verification.json",
+    "eight_gpu_video_qualified": false
+  },
+  "evidence_directories": [
+    "outputs/h3-5090-benchmark-20261007",
+    "outputs/h3-h100-latest-comfy-20261007"
+  ],
+  "delivery": {
+    "cli_hub_and_separator_fixes": "installed; configured Hub remains http://127.0.0.1:8819",
+    "cli_cancel_fix": "installed 0.2.2+dev.cancel.d75158d9; no running observer or daemon restart",
+    "h3_four_card_default_source": "packages PR399 merged bbfd880",
+    "h3_release_preparation": "packages PR400 merged 037ee349;1.26.2 wheel built;publication and unoverridden default invocation still pending"
+  }
+}
