@@ -62,7 +62,8 @@ recomputes conditioning and all eight sampling evaluations.
 | One 5090, 30 steps, stock Kitchen dense/Sol | 943.413 / 934.858 s | 939.1355 s |
 | Four 5090s, 30 steps, buqi dense PyTorch | 857.778 / 858.285 s | 858.0315 s |
 | Four 5090s, Turbo 4/4, lighthouse, stock decode | 251.279 / 195.520 s | 223.3995 s |
-| Four 5090s, Turbo 4/4, optimized action cohort | 179.180 / 168.143 s | 173.6615 s |
+| Four 5090s, Turbo 4/4, optimized action, affected cuBLAS 13.1.1.3 | 179.180 / 168.143 s | 173.6615 s |
+| Four 5090s, Turbo 4/4, optimized action, fixed cuBLAS 13.2.0.9 | 184.584 / 183.259 s | 183.9215 s |
 
 These are queue-free server `execution_start` to `execution_success` timings,
 excluding output transfer. The action warm samples are sparring (seed 581204) and
@@ -76,7 +77,8 @@ weight cache; it is excluded from the warm mean.
 The matching native action runs used the ordinary Cozy CLI, H3 1.26.2,
 Runtime 0.19.0, TensorFS 0.4.0 and the default four-card model selection.
 Sparring took 145.699 seconds and rally racing 144.632 seconds: a 145.1655-second
-warm mean, 16.41% less execution time than this optimized Comfy cohort (1.1963×).
+warm mean. That is 16.41% less execution time than the affected-library Comfy
+cohort (1.1963×), and 21.07% less than the fixed-library cohort (1.2670×).
 All three native clips passed full audio/video decoding. Native used BF16 Sol
 with Sage INT8-QK/FP8-PV dense callbacks; this measured result retains the
 precision, fallback and decoder limitations below. It is not a quality-equivalence
@@ -84,20 +86,42 @@ or universally fastest-engine claim.
 
 FP8 storage does not mean the MultiStream graph performs every projection in FP8.
 Its sliced QKV path dequantizes to BF16, and the checkpoint's 50 `fc2` exceptions
-also use BF16 multiplication. Output projection and `fc1` produced 2,400 FP8
-fallback warnings per full request. A standalone PyTorch 2.14/cu130 reproducer
-shows the same failure outside ComfyUI: for each tested FP8 GEMM shape, the GPU
+also use BF16 multiplication. With the affected library, output projection and
+`fc1` produced 2,400 FP8 fallback warnings per full request. A standalone PyTorch
+2.14/cu130 reproducer shows the same failure outside ComfyUI: for each tested FP8
+GEMM shape, the GPU
 that executes it first succeeds and the other devices fail. Reversing GPU order
 with identical matrix sizes reverses the successful device. Allocator, stream,
 workspace and heuristic-cache controls did not fix it. Preserve this limitation;
 these measurements do not establish the fastest possible ComfyUI configuration
 or a precision-matched engine comparison.
 
+This symptom matches NVIDIA's documented
+[CUB-9487 issue](https://docs.nvidia.com/cuda/archive/13.0.3/cuda-toolkit-release-notes/index.html#cublas-release-13-0-update-2),
+including its process-per-device workaround. The recorded Comfy package is
+cuBLAS 13.1.1.3, which belongs to CUDA Toolkit 13.0 Update 3. NVIDIA documents the
+fix in [Toolkit 13.1](https://docs.nvidia.com/cuda/archive/13.1.0/cuda-toolkit-release-notes/index.html#cublas-release-13-1),
+whose cuBLAS component is 13.2.0.9. The separate, hash-verified library overlay
+passed all 32 exact-shape matmul cases; the affected library passed only eight.
+The three repeated full action renders then completed with zero FP8 fallback
+warnings. Process maps confirmed the fixed libraries in both ComfyUI and its VAE
+workers. The original environment remains intact; only the child processes'
+`LD_PRELOAD`, `LD_LIBRARY_PATH` and `PYTHONPATH` select the overlay.
+
+The fixed-library cohort used the same prompts, seeds, weights, sigmas and
+unmodified plugins. Its setup sample took 255.142 seconds; warm phase means were
+1.662 seconds for conditioning, 150.264 for sampling, 17.978 for video decode,
+0.267 for audio decode and 14.171 for mux/save. Repairing the launch failures did
+not improve total execution time in these two warm samples. Keep both cohorts;
+do not attribute their timing difference to a single kernel from this evidence.
+
 The four-GPU FP16 decoder was checked against stock decode using the identical
-cached sampler result. Decoded PCM matched exactly; 112 of 362 decoded RGB frames
+cached sampler result under cuBLAS 13.1.1.3. Decoded PCM matched exactly; 112 of 362
+decoded RGB frames
 matched exactly. Encoded-output RGB PSNR was 43.289 dB, with mean absolute channel
 difference 0.973/255 and maximum 54/255. This is not bitwise equivalence and is not
-a comparison of raw floating-point VAE tensors. Do not use cross-engine PSNR:
+a comparison of raw floating-point VAE tensors, and was not repeated under the
+fixed library. Do not use cross-engine PSNR:
 matching seeds do not establish matching initial noise across engines.
 
 All recorded clips passed full audio/video decoding. Sixteen sampled frames per
@@ -114,3 +138,5 @@ timings, GPU samples and process handoff receipt are under
 `comfy-action-results.json` is the consolidated Comfy report. GPU handoff stops
 only the owned competitor server/workers. Native and rental operations use
 ordinary Cozy CLI commands.
+The corrected-library report and original clips are preserved separately in
+`comfy-fixed-cublas/comfy-fixed-results.json` below the action evidence directory.
