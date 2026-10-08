@@ -73,6 +73,15 @@ because the first rebuilt text-encoder state after eviction: conditioning took
 sample took 257.509 seconds, including 82.7 seconds to fill a 47.97 GiB encoder
 weight cache; it is excluded from the warm mean.
 
+The matching native action runs used the ordinary Cozy CLI, H3 1.26.2,
+Runtime 0.19.0, TensorFS 0.4.0 and the default four-card model selection.
+Sparring took 145.699 seconds and rally racing 144.632 seconds: a 145.1655-second
+warm mean, 16.41% less execution time than this optimized Comfy cohort (1.1963×).
+All three native clips passed full audio/video decoding. Native used BF16 Sol
+with Sage INT8-QK/FP8-PV dense callbacks; this measured result retains the
+precision, fallback and decoder limitations below. It is not a quality-equivalence
+or universally fastest-engine claim.
+
 FP8 storage does not mean the MultiStream graph performs every projection in FP8.
 Its sliced QKV path dequantizes to BF16, and the checkpoint's 50 `fc2` exceptions
 also use BF16 multiplication. Output projection and `fc1` produced 2,400 FP8
