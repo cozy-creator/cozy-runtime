@@ -171,8 +171,10 @@ def _run(
 
 
 def _gc(store: Any) -> None:
+    # Use the public library in another process: custody must be durable, not a private
+    # in-process pin. The CLI's gc family now plans remote censuses, not local collection.
     subprocess.run(
-        [str(Path(sys.executable).with_name("tfs")), "gc", store.root],
+        [sys.executable, "-c", "import sys,tensorfs; tensorfs.gc(sys.argv[1])", store.root],
         check=True,
         capture_output=True,
     )
