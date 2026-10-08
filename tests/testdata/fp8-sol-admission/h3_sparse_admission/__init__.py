@@ -25,6 +25,7 @@ class Case(msgspec.Struct):
 
 class Result(msgspec.Struct):
     gpu: str
+    kitchen_version: str
     cases: list[Case]
 
 
@@ -47,5 +48,12 @@ def verify(payload: Request, ctx: Context) -> Result:
     attention.pinned(
         "sol-fp8-fp16", DeviceFacts("cuda", torch.cuda.get_device_name(index), 120, "", "", index)
     )
+    attention.pinned(
+        "kitchen-sol-sage",
+        DeviceFacts("cuda", torch.cuda.get_device_name(index), 120, "", "", index),
+    )
+    from importlib.metadata import version
+
     result = admit(index)
+    result["kitchen_version"] = version("comfy-kitchen")
     return msgspec.convert(result, type=Result)

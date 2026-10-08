@@ -115,9 +115,10 @@ PINS: tuple[Pin, ...] = (
     ),
     Pin(
         "comfy-kitchen",
-        "b2a2972ac68c395bbda8ad9030e8ae1089287815",  # v0.2.35
-        _GITHUB.format("Comfy-Org/comfy-kitchen", "b2a2972ac68c395bbda8ad9030e8ae1089287815"),
-        "19e161139f1864fa90d63df796aeffc5ee47ab86c63d299940638cf9ba606da9",
+        "0.2.37",
+        _PYPI + "19/04/d24939d30b077679bfc8bf4a53c7392f9d8650df7ce69164238a673753a1/"
+        "comfy_kitchen-0.2.37-cp312-abi3-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+        "03cca0d10c314aaa13bff8f9422d03974221a344162b23d4f10d27eb2a35d0e8",
     ),
     Pin(
         "sol-attn",
@@ -290,7 +291,7 @@ RECIPES: dict[str, Recipe] = {
                 ("hopper/setup.py", 'if bare_metal_version != Version("12.8"):', "if False:"),
             ),
         ),
-        Recipe("comfy-kitchen", "setup", ("comfy-kitchen",)),
+        Recipe("comfy-kitchen", "python", ("comfy-kitchen",)),
         Recipe(PYTHON, "python"),
     )
 }
@@ -358,10 +359,17 @@ def job(name: str, sm: int, root: Path | None = None) -> kernel_compile.Job:
     recipe = RECIPES[name]
     sources, why = registry(root) if root is not None else (_pinned_sources(), "")
     if recipe.kind == "python":
+        # A dedicated binary-wheel recipe shares the verified unpack builder,
+        # but stays out of the general JIT dependency bundle.
+        dedicated = {n for r in RECIPES.values() if r.kind == "python" for n in r.sources}
+        selected = set(recipe.sources) if recipe.sources else set(sources) - dedicated
+        missing_python = selected - set(sources)
+        if missing_python:
+            raise Absent(why or f"the kernel sources carry no {', '.join(sorted(missing_python))}")
         wanted = {
             n: s
             for n, s in sources.items()
-            if n not in _BUILD_DEPS and (s.file.endswith(".whl") or s.package)
+            if n in selected and n not in _BUILD_DEPS and (s.file.endswith(".whl") or s.package)
         }
         if not wanted:
             raise Absent(why or "the kernel sources carry no Python sources")
