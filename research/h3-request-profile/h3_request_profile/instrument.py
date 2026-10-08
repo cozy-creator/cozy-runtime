@@ -58,8 +58,69 @@ def category(name: str) -> str:
     return "unclassified"  # full names remain available; no inferred attribution
 
 
+class ObservedOutputs:
+    """Delegate the existing sink unchanged; observe its overlapping worker-thread wall."""
+
+    def __init__(self, target: Any) -> None:
+        self.target = target
+        self.sinks: list[dict[str, Any]] = []
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.target, name)
+
+    def save_video_stream(self, events: Any) -> Any:
+        began = time.perf_counter()
+        source = iter(events)
+        source_ms = 0.0
+        count = 0
+        eof: float | None = None
+        succeeded = False
+
+        def observed() -> Any:
+            nonlocal source_ms, count, eof
+            while True:
+                start = time.perf_counter()
+                try:
+                    event = next(source)
+                except StopIteration:
+                    eof = time.perf_counter()
+                    return
+                finally:
+                    source_ms += (time.perf_counter() - start) * 1000
+                count += 1
+                yield event
+
+        try:
+            result = self.target.save_video_stream(observed())
+            succeeded = True
+            return result
+        finally:
+            ended = time.perf_counter()
+            total = (ended - began) * 1000
+            self.sinks.append(
+                {
+                    "operation": "Outputs.save_video_stream",
+                    "succeeded": succeeded,
+                    "wall_ms": total,
+                    "source_event_wait_and_materialize_ms": source_ms,
+                    "sink_wall_excluding_source_ms": total - source_ms,
+                    "after_source_eof_finalize_probe_ms": None
+                    if eof is None
+                    else (ended - eof) * 1000,
+                    "events": count,
+                    "overlaps_decode_video": True,
+                }
+            )
+
+
 def profile_request(
-    model: Any, dense_steps: int, render: Callable[[], Any], *, detailed: bool = False
+    model: Any,
+    dense_steps: int,
+    render: Callable[[Any], Any],
+    *,
+    outputs: Any,
+    telemetry: Any,
+    detailed: bool = False,
 ) -> tuple[Any, bytes, bytes]:
     import torch
     from torch.profiler import ProfilerActivity
@@ -74,13 +135,16 @@ def profile_request(
     def facts() -> dict[str, Any]:
         return cast(dict[str, Any], msgspec.to_builtins(residency.weights.facts()))
 
+    observed_outputs = ObservedOutputs(outputs)
     return record_request(
         transformer,
         dense_steps,
-        render,
+        lambda: render(observed_outputs),
         facts,
         [ProfilerActivity.CPU, ProfilerActivity.CUDA],
         detailed=detailed,
+        attribution=lambda: telemetry._attempt.attribution.document(),
+        output_sinks=observed_outputs.sinks,
     )
 
 
@@ -92,6 +156,8 @@ def record_request(
     activities: list[Any],
     *,
     detailed: bool = False,
+    attribution: Callable[[], dict[str, Any]] | None = None,
+    output_sinks: list[dict[str, Any]] | None = None,
 ) -> tuple[Any, bytes, bytes]:
     """The same bounded recorder can be exercised with real CPU modules off-rental."""
     from torch.profiler import profile, record_function, schedule
@@ -102,6 +168,9 @@ def record_request(
     began = [0.0]
     traces = []
     averages = []
+    request_before = facts()
+    attribution_before = attribution() if attribution is not None else {}
+    profile_began = time.perf_counter()
 
     def finished_trace(prof: Any) -> None:
         with tempfile.TemporaryDirectory(prefix="h3-profile-") as temp:
@@ -196,7 +265,11 @@ def record_request(
                 module.register_forward_hook(leave, always_call=True),
             ]
         try:
+            render_began = time.perf_counter()
             result = render()
+            render_wall_ms = (time.perf_counter() - render_began) * 1000
+            request_after = facts()
+            attribution_after = attribution() if attribution is not None else {}
         finally:
             for handle in handles:
                 handle.remove()
@@ -212,6 +285,19 @@ def record_request(
         "profiled_step_indices": [dense_steps - 1, dense_steps],
         "steps": steps,
         "events": averages,
+        "render_call": {
+            "wall_ms": render_wall_ms,
+            "profiler_context_wall_ms": (time.perf_counter() - profile_began) * 1000,
+            "plane_before": request_before,
+            "plane_after": request_after,
+            "plane_delta": counter_delta(request_before, request_after),
+            "attribution_before": attribution_before,
+            "attribution_after": attribution_after,
+            "scope": (
+                "Entire H3 handler: prepare, TE, denoise, both VAEs, sink and output checks"
+            ),
+        },
+        "output_sinks": output_sinks or [],
         "inclusive_times_must_not_be_summed": True,
         "kernel_category_is_heuristic": True,
         "notes": (
@@ -222,7 +308,13 @@ def record_request(
             "Plane counters are asynchronous boundary snapshots; inspect cumulative "
             "request deltas and correlated CUDA transfers before assigning a step cost. "
             "Detailed shape/memory mode retains tensor references and can perturb paging; "
-            "it is off by default and must not be treated as an unperturbed baseline."
+            "it is off by default and must not be treated as an unperturbed baseline. "
+            "Attribution is the existing Runtime document, not separately timed pipeline stages; "
+            "stage work clocks exclude loading-weight asides. Sink wall overlaps video decode; "
+            "source next() includes waiting, digesting and materializing decoded events. "
+            "The post-EOF sink tail includes encoder flush, mux, probe and output registration. "
+            "Machine preparation before this handler and final artifact commit/export after it "
+            "must be read from ordinary run-show evidence; reused setup is not charged again."
         ),
     }
     return result, traces[0], json.dumps(summary, separators=(",", ":"), allow_nan=False).encode()

@@ -83,7 +83,9 @@ def regular(
         profile_request(
             model,
             10,
-            lambda: fl2va(ctx, payload, assets, model, out, tel),
+            lambda observed_out: fl2va(ctx, payload, assets, model, observed_out, tel),
+            outputs=out,
+            telemetry=tel,
             detailed=payload.profile_detail,
         ),
         out,
@@ -108,7 +110,11 @@ def turbo(
         profile_request(
             base_model,
             4,
-            lambda: fl2va_turbo(ctx, payload, assets, base_model, turbo_lora, out, tel),
+            lambda observed_out: fl2va_turbo(
+                ctx, payload, assets, base_model, turbo_lora, observed_out, tel
+            ),
+            outputs=out,
+            telemetry=tel,
             detailed=payload.profile_detail,
         ),
         out,

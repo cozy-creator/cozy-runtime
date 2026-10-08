@@ -6,6 +6,7 @@ import gzip
 import importlib.util
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -74,3 +75,73 @@ def test_failure_also_removes_observer_hooks():
         module.record_request(model, 4, fail, lambda: {}, [torch.profiler.ProfilerActivity.CPU])
     assert not model._forward_pre_hooks and not model._forward_hooks
     assert not model.block.to_q._forward_pre_hooks and not model.block.to_q._forward_hooks
+
+
+def test_whole_render_counters_and_existing_attribution_include_non_denoise_work():
+    from cozy_runtime.author._observations import Attribution
+
+    module, model = recorder(), Transformer()
+    attribution = Attribution()
+    counters = {"h2d_bytes": 10, "evictions": 1}
+
+    def render():
+        counters["h2d_bytes"] += 100  # before any observed transformer call
+        attribution.stage("condition_text", 2.5)
+        output = torch.ones(2, 8)
+        for _ in range(8):
+            output = model(output)
+        counters["h2d_bytes"] += 200  # decoder work after the final transformer call
+        counters["evictions"] += 2
+        for name in ("decode_audio", "decode_video", "check_output"):
+            attribution.stage(name, 1.0)
+        return output
+
+    with torch.no_grad():
+        _, _, raw = module.record_request(
+            model,
+            4,
+            render,
+            lambda: dict(counters),
+            [torch.profiler.ProfilerActivity.CPU],
+            attribution=attribution.document,
+        )
+    summary = json.loads(raw)
+    whole = summary["render_call"]
+    assert whole["plane_delta"] == {"h2d_bytes": 300, "evictions": 2}
+    assert all(row["plane_delta"] == {"h2d_bytes": 0, "evictions": 0} for row in summary["steps"])
+    assert whole["attribution_before"]["stages"] == {}
+    assert whole["attribution_after"] == attribution.document()
+    assert 0 < whole["wall_ms"] <= whole["profiler_context_wall_ms"]
+
+
+def test_output_observer_forwards_event_identity_and_records_finalize_tail():
+    module = recorder()
+    events = [object(), object(), object()]
+    saved = object()
+
+    def sink(source):
+        assert list(source) == events
+        return saved
+
+    target = SimpleNamespace(save_video_stream=sink, video_audio_frame_samples=1024)
+    observed = module.ObservedOutputs(target)
+    assert observed.save_video_stream(iter(events)) is saved
+    assert observed.video_audio_frame_samples == 1024
+    row = observed.sinks[0]
+    assert row["succeeded"] and row["events"] == 3 and row["overlaps_decode_video"]
+    assert 0 <= row["source_event_wait_and_materialize_ms"] <= row["wall_ms"]
+    assert 0 <= row["after_source_eof_finalize_probe_ms"] <= row["wall_ms"]
+
+
+def test_output_observer_keeps_source_failures_and_does_not_invent_eof():
+    module = recorder()
+
+    def broken():
+        yield object()
+        raise ValueError("bad media")
+
+    observed = module.ObservedOutputs(SimpleNamespace(save_video_stream=list))
+    with pytest.raises(ValueError, match="bad media"):
+        observed.save_video_stream(broken())
+    assert not observed.sinks[0]["succeeded"]
+    assert observed.sinks[0]["after_source_eof_finalize_probe_ms"] is None
