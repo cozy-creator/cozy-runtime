@@ -1,0 +1,373 @@
+{
+  "updated_utc": "2026-10-08T21:33:00Z",
+  "native": [
+    {
+      "label": "native-fast-turbo-warm-1",
+      "receipt": "/home/fidika/cozy_v2/outputs/h3-single5090-optimization-20261008/native-fast-turbo-warm-1-show.json",
+      "run": 4987,
+      "request_id": "req-b784698095a03e6287f37872",
+      "status": "completed",
+      "execution_s": 370.79,
+      "phase_s": {
+        "prepare": 0.005418999999999999,
+        "loading weights": 3.186873,
+        "condition_text": 8.138273,
+        "denoise": 317.684776,
+        "decode_audio": 0.133541,
+        "decode_video": 40.331565000000005,
+        "check_output": 0.15184
+      },
+      "denoise_step_s": [
+        51.661754,
+        49.926941,
+        48.449233,
+        48.313432999999996,
+        31.792597,
+        30.929976999999997,
+        28.239804,
+        27.987286
+      ],
+      "attention": {
+        "requested": "fl2va_dit=kitchen-sol-producer-fast",
+        "observed": "audio_vae=sdpa,fl2va_dit=kitchen-sol-producer-fast,ref2va_dit=sol-attn,video_vae=sdpa",
+        "impl": "kitchen-sol-producer-fast:comfy_kitchen.sol_attn_chunked(int8, stats=current-call, vmargin=1.1, prefix=int8)+comfy_kitchen.sol_attn_chunked(int8, stats=previous-step, vmargin=1.1, prefix=int8)+dense=comfy_kitchen.int8; sparse=instance-producer,sdpa:flash",
+        "kernels": [
+          {
+            "kernel": "kitchen-sol-producer-fast",
+            "state": "ready",
+            "served": true,
+            "compile_ms": 1626.4
+          },
+          {
+            "kernel": "sageattention",
+            "state": "ready",
+            "served": false,
+            "compile_ms": 654287.1
+          },
+          {
+            "kernel": "sdpa",
+            "state": "ready",
+            "served": true
+          },
+          {
+            "kernel": "sol-attn",
+            "state": "ready",
+            "served": true,
+            "compile_ms": 5617.2
+          }
+        ],
+        "sol": {
+          "sparse": 192,
+          "dense_step": 192,
+          "dense_path": 32,
+          "dense_prefix": 192
+        }
+      },
+      "outputs": [
+        {
+          "id": "4987/video",
+          "type": "video",
+          "name": "video",
+          "media_type": "video/mp4",
+          "status": "completed",
+          "rev": 1,
+          "length": 22337289,
+          "sha256": "sha256:4cdae12e11bc7443f29064b52ca1e2711346178895891451d969454d476f28d5",
+          "path": "/home/fidika/.cozy/outputs/h3-single5090-optimization-20261008/native-fast-turbo-warm-1/4987-video.mp4"
+        }
+      ]
+    },
+    {
+      "label": "native-fp4-turbo-warm-1",
+      "receipt": "/home/fidika/cozy_v2/outputs/h3-single5090-optimization-20261008/native-fp4-turbo-warm-1-show.json",
+      "run": 4990,
+      "request_id": "req-91d2e7fbd02236ed451c6214",
+      "status": "completed",
+      "execution_s": 347.82,
+      "phase_s": {
+        "prepare": 0.001034,
+        "loading weights": 2.7876060000000003,
+        "condition_text": 9.955458,
+        "denoise": 293.33536200000003,
+        "decode_audio": 0.129419,
+        "decode_video": 40.251185,
+        "check_output": 0.14649299999999998
+      },
+      "denoise_step_s": [
+        44.206911,
+        42.597277999999996,
+        46.586529,
+        41.378744,
+        32.935804,
+        28.873222000000002,
+        27.942533,
+        28.754698
+      ],
+      "attention": {
+        "requested": "fl2va_dit=kitchen-sol-producer-fp4",
+        "observed": "audio_vae=sdpa,fl2va_dit=kitchen-sol-producer-fp4,ref2va_dit=sol-attn,video_vae=sdpa",
+        "impl": "kitchen-sol-producer-fp4:comfy_kitchen.sol_attn_chunked(int8, stats=current-call, vmargin=1.1, prefix=int8)+comfy_kitchen.sol_attn_chunked(int8, stats=previous-step, vmargin=1.1, prefix=int8)+dense=sageattn3.nvfp4_global_head_mean; sparse=instance-producer,sageattention3-fp4-global:sageattn3.sageattn3_blackwell(nvfp4, global_head_mean),sdpa:flash",
+        "kernels": [
+          {
+            "kernel": "kitchen-sol-producer-fp4",
+            "state": "ready",
+            "served": true,
+            "compile_ms": 1626.4
+          },
+          {
+            "kernel": "sageattention",
+            "state": "ready",
+            "served": false,
+            "compile_ms": 654287.1
+          },
+          {
+            "kernel": "sageattention3-fp4-global",
+            "state": "ready",
+            "served": false,
+            "compile_ms": 217756
+          },
+          {
+            "kernel": "sdpa",
+            "state": "ready",
+            "served": true
+          },
+          {
+            "kernel": "sol-attn",
+            "state": "ready",
+            "served": true,
+            "compile_ms": 5617.2
+          }
+        ],
+        "sol": {
+          "sparse": 192,
+          "dense_step": 192,
+          "dense_path": 32,
+          "dense_prefix": 192
+        }
+      },
+      "outputs": [
+        {
+          "id": "4990/video",
+          "type": "video",
+          "name": "video",
+          "media_type": "video/mp4",
+          "status": "completed",
+          "rev": 1,
+          "length": 24463459,
+          "sha256": "sha256:0a78d463ecfc7b6512f26213e9a7a19954ea7489e74996e07f0bbc0701a21c8b",
+          "path": "/home/fidika/.cozy/outputs/h3-single5090-optimization-20261008/native-fp4-turbo-warm-1/4990-video.mp4"
+        }
+      ]
+    },
+    {
+      "label": "native-solhybrid-turbo-warm-1",
+      "receipt": "/home/fidika/cozy_v2/outputs/h3-single5090-optimization-20261008/native-solhybrid-turbo-warm-1-show.json",
+      "run": 4994,
+      "request_id": "req-52618376b6b017088a241f83",
+      "status": "completed",
+      "execution_s": 357.682,
+      "phase_s": {
+        "prepare": 0.000395,
+        "loading weights": 2.151672,
+        "condition_text": 6.175336000000001,
+        "denoise": 306.991049,
+        "decode_audio": 0.121337,
+        "decode_video": 40.615801,
+        "check_output": 0.150565
+      },
+      "denoise_step_s": [
+        44.797822000000004,
+        42.10053,
+        41.766231,
+        41.45614,
+        33.328972,
+        33.614116,
+        35.299597999999996,
+        34.566288
+      ],
+      "attention": {
+        "requested": "fl2va_dit=sol-fp8-fp16-fp4-dense",
+        "observed": "audio_vae=sdpa,fl2va_dit=sol-fp8-fp16-fp4-dense,ref2va_dit=sol-attn,video_vae=sdpa",
+        "impl": "sageattention:sageattn_qk_int8_pv_fp8_cuda(per_warp, fp32+fp16, smooth_k),sageattention3-fp4-global:sageattn3.sageattn3_blackwell(nvfp4, global_head_mean),sdpa:flash,sol-fp8-fp16-fp4-dense:exact=e4m3/f16_tile,route_tail=bf16/f32,state=f32,amax=16; dense=nvfp4_global_head_mean; prefix=sageattention",
+        "kernels": [
+          {
+            "kernel": "sageattention",
+            "state": "ready",
+            "served": false,
+            "compile_ms": 654287.1
+          },
+          {
+            "kernel": "sageattention3-fp4-global",
+            "state": "ready",
+            "served": false,
+            "compile_ms": 217756
+          },
+          {
+            "kernel": "sdpa",
+            "state": "ready",
+            "served": true
+          },
+          {
+            "kernel": "sol-attn",
+            "state": "ready",
+            "served": true,
+            "compile_ms": 5617.2
+          },
+          {
+            "kernel": "sol-fp8-fp16-fp4-dense",
+            "state": "ready",
+            "served": true
+          }
+        ],
+        "sol": {
+          "sparse": 192,
+          "dense_step": 192,
+          "dense_path": 32,
+          "dense_prefix": 192
+        }
+      },
+      "outputs": [
+        {
+          "id": "4994/video",
+          "type": "video",
+          "name": "video",
+          "media_type": "video/mp4",
+          "status": "completed",
+          "rev": 1,
+          "length": 26928265,
+          "sha256": "sha256:23a361508fae5e4147093c4d34706cdf0eeccf0bd1b114d4e1a2d86c8579dbca",
+          "path": "/home/fidika/.cozy/outputs/h3-single5090-optimization-20261008/native-solhybrid-turbo-warm-1/4994-video.mp4"
+        }
+      ]
+    },
+    {
+      "label": "native-fp4-regular-first",
+      "receipt": "/home/fidika/cozy_v2/outputs/h3-single5090-optimization-20261008/native-fp4-regular-first-show.json",
+      "run": 4993,
+      "request_id": "req-dfb03b1f2799bfa7a7f09ee3",
+      "status": "completed",
+      "execution_s": 969.867,
+      "phase_s": {
+        "prepare": 0.001366,
+        "loading weights": 8.712188,
+        "condition_text": 3.832594,
+        "denoise": 907.558676,
+        "decode_audio": 0.406143,
+        "decode_video": 40.754656000000004,
+        "check_output": 0.90696
+      },
+      "denoise_step_s": [
+        39.831388,
+        39.735304,
+        40.166693,
+        39.741483,
+        40.131833,
+        39.134077,
+        39.856834,
+        40.074534,
+        39.072257,
+        39.036093,
+        28.701917,
+        25.631339,
+        24.990014,
+        25.510197,
+        25.516175999999998,
+        25.06071,
+        25.461707999999998,
+        25.493962,
+        26.12548,
+        25.477255,
+        25.011806,
+        25.191993999999998,
+        25.352983000000002,
+        25.314552,
+        25.647818,
+        25.321814,
+        25.427733,
+        25.132642,
+        25.324899000000002,
+        25.016690999999998
+      ],
+      "attention": {
+        "requested": "fl2va_dit=kitchen-sol-producer-fp4",
+        "observed": "audio_vae=sdpa,fl2va_dit=kitchen-sol-producer-fp4,ref2va_dit=sol-attn,video_vae=sdpa",
+        "impl": "kitchen-sol-producer-fp4:comfy_kitchen.sol_attn_chunked(int8, stats=current-call, vmargin=1.1, prefix=int8)+comfy_kitchen.sol_attn_chunked(int8, stats=previous-step, vmargin=1.1, prefix=int8)+dense=sageattn3.nvfp4_global_head_mean; sparse=instance-producer,sageattention3-fp4-global:sageattn3.sageattn3_blackwell(nvfp4, global_head_mean),sdpa:flash",
+        "kernels": [
+          {
+            "kernel": "kitchen-sol-producer-fp4",
+            "state": "ready",
+            "served": true,
+            "compile_ms": 1626.4
+          },
+          {
+            "kernel": "sageattention",
+            "state": "ready",
+            "served": false,
+            "compile_ms": 654287.1
+          },
+          {
+            "kernel": "sageattention3-fp4-global",
+            "state": "ready",
+            "served": false,
+            "compile_ms": 217756
+          },
+          {
+            "kernel": "sdpa",
+            "state": "ready",
+            "served": true
+          },
+          {
+            "kernel": "sol-attn",
+            "state": "ready",
+            "served": true,
+            "compile_ms": 5617.2
+          }
+        ],
+        "sol": {
+          "sparse": 960,
+          "dense_step": 480,
+          "dense_path": 120,
+          "dense_prefix": 960
+        }
+      },
+      "outputs": [
+        {
+          "id": "4993/video",
+          "type": "video",
+          "name": "video",
+          "media_type": "video/mp4",
+          "status": "completed",
+          "rev": 1,
+          "length": 22229175,
+          "sha256": "sha256:a028b1d9480c03b985f10818aef0c7770fcd9e7c46edfaf8dba13d4d2ff86457",
+          "path": "/home/fidika/.cozy/outputs/h3-single5090-optimization-20261008/native-fp4-regular-first/4993-video.mp4"
+        }
+      ]
+    }
+  ],
+  "comfy": {
+    "version": "0.39.0",
+    "comfy_commit": "b0b743566f65daafc423b4fea8a2fbda94b3384a",
+    "torch": "2.14.0+cu130",
+    "kitchen": "0.2.37",
+    "cublas": "13.2.0.9 isolated overlay; actual mapped paths verified",
+    "settings": "PDD8; four dense Kitchen INT8 evaluations plus four Sol Kitchen INT8 evaluations; tau1; blocks0/1 dense; exact prefix KV/audio-query sinks;362frames1344x76824fps; TE weight cache off, conditioning output cache0, normal DynamicVRAM",
+    "valid_warm_execution_seconds": [
+      325.362
+    ],
+    "valid_warm_count": 1,
+    "warm_phases_seconds": {
+      "conditioning": 2.304743430999224,
+      "sampler": 262.4432216300047,
+      "video_decode": 36.53031632299826,
+      "audio_decode": 0.4081312769994838,
+      "mux_save": 24.037731661999715
+    },
+    "warm_mean_not_established": "Only one completed warm request; the second warm failed and is excluded.",
+    "timing_boundary": "Server execution_start to execution_success; no setup/download/other GPU work overlapped; output transfer excluded.",
+    "precision_boundary": "FP8 weights do not imply FP8 attention. Comfy Kitchen dense/Sol INT8 and its fused producer differ from native BF16/reference; no quality-equivalence claim."
+  },
+  "quality_approval": false,
+  "targets_met": false,
+  "profile_4996": "failed during >1GiB export; full raw trace removed; not a speed measurement"
+}
