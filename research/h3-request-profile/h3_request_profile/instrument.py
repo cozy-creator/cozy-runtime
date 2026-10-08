@@ -25,14 +25,16 @@ def host_range(label: str) -> dict[str, Any]:
     ident = threading.get_ident()
     native = threading.get_native_id()
     low32 = ident & 0xFFFFFFFF
+    signed = low32 if low32 < 0x80000000 else low32 - 0x100000000
     return {
         "label": label,
         "pid": os.getpid(),
         "tid": native,
         "native_tid": native,
         "python_ident": ident,
-        "pthread_tid_int32": low32 if low32 < 0x80000000 else low32 - 0x100000000,
+        "pthread_tid_int32": signed,
         "pthread_tid_uint32": low32,
+        "pthread_tid_chrome": abs(signed),
         "start_unix_ns": time.time_ns(),
     }
 
@@ -121,6 +123,27 @@ def software_versions() -> dict[str, str | None]:
         except PackageNotFoundError:
             result[name] = None
     return result
+
+
+def model_census(transformer: Any) -> dict[str, Any]:
+    """Observe implementation classes without reading tensor storage or adding hooks."""
+    classes: dict[str, dict[str, Any]] = {}
+    sites = []
+    for path, module in transformer.named_modules():
+        cls = type(module)
+        name = cls.__module__ + "." + cls.__qualname__
+        row = classes.setdefault(name, {"count": 0, "examples": []})
+        row["count"] += 1
+        if len(row["examples"]) < 8:
+            row["examples"].append(path)
+        if path.endswith((".attn", ".ff", ".ff.net.0", ".ff.net.2")):
+            sites.append({"path": path, "class": name})
+    return {
+        "classes": classes,
+        "sites": sites,
+        "fusion_report": getattr(transformer, "_cozy_fusion_report", None),
+        "scope": "Implementation metadata only; no tensor reads, materialization or hooks",
+    }
 
 
 def retain_trace_file(
@@ -253,6 +276,7 @@ def profile_request(
         trace_sink=outputs.save_tree,
         trace_cpu_ops=trace_cpu_ops,
         ranges=ranges,
+        fusion_report=getattr(model, "_cozy_fusion_report", None),
     )
 
 
@@ -270,6 +294,7 @@ def record_request(
     trace_sink: Callable[[Path], Any] | None = None,
     trace_cpu_ops: bool = True,
     ranges: list[dict[str, Any]] | None = None,
+    fusion_report: dict[str, Any] | None = None,
 ) -> tuple[Any, Any, bytes]:
     """The same bounded recorder can be exercised with real CPU modules off-rental."""
     from torch.profiler import profile, record_function, schedule
@@ -289,6 +314,9 @@ def record_request(
     traces = []
     averages = []
     trace_sizes = []
+    census = model_census(transformer)
+    if fusion_report is not None:
+        census["fusion_report"] = fusion_report
     request_before = facts()
     attribution_before = attribution() if attribution is not None else {}
     profile_began = time.perf_counter()
@@ -428,6 +456,7 @@ def record_request(
     summary = {
         "diagnostic_only": True,
         "software": software_versions(),
+        "model_census": census,
         "record_shapes_and_memory": detailed,
         "not_benchmark_time": True,
         "full_request_trace": full_request_trace,

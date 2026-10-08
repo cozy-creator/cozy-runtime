@@ -295,6 +295,7 @@ def test_manual_ranges_preserve_real_telemetry_and_have_native_thread_identity(t
     assert row["pthread_tid_int32"] == (
         (threading.get_ident() + 0x80000000) % 0x100000000 - 0x80000000
     )
+    assert row["pthread_tid_chrome"] == abs(row["pthread_tid_int32"])
     assert 0 < row["start_unix_ns"] <= row["end_unix_ns"]
 
 
@@ -329,3 +330,15 @@ def test_manual_mode_does_not_attach_projection_hooks_and_keeps_cpu_output():
     trace = json.loads(gzip.decompress(packed))
     assert not any(event.get("name", "").startswith("h3.module.") for event in trace["traceEvents"])
     assert not model._forward_pre_hooks and not model._forward_hooks
+
+
+def test_model_census_records_actual_classes_and_fusion_report_without_hooks():
+    module, model = recorder(), Transformer()
+    model._cozy_fusion_report = {"applied": ["ffn"], "unsupported": []}
+    facts = module.model_census(model)
+    assert facts["classes"]["torch.nn.modules.linear.Linear"] == {
+        "count": 1, "examples": ["block.to_q"]
+    }
+    assert facts["fusion_report"] == model._cozy_fusion_report
+    assert not model._forward_pre_hooks and not model._forward_hooks
+    assert not model.block.to_q._forward_pre_hooks and not model.block.to_q._forward_hooks
