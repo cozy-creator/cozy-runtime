@@ -17,7 +17,7 @@ import threading
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, BinaryIO, NamedTuple, Protocol
+from typing import TYPE_CHECKING, BinaryIO, NamedTuple, Protocol, cast
 
 import msgspec
 import tensorfs
@@ -49,6 +49,7 @@ from cozy_runtime.internal import storage_admission, weights_receipts, weights_s
 
 if TYPE_CHECKING:
     from tensorfs.derived import Derivation
+    from tensorfs.records import DerivationArguments as NativeDerivationArguments
 
 #: A granted input whose id starts with this is one model manifest.
 MODEL_PREFIX = "model:"
@@ -418,7 +419,9 @@ class WriterBroker:
         ) as source:
             args = self._arguments(attempt, slot, source.read())
         fingerprint = attempt.weights_work_fingerprint
-        declaration = self.store().derived_declaration(*args, work_fingerprint=fingerprint)
+        declaration = self.store().derived_declaration(
+            *cast("NativeDerivationArguments", args), work_fingerprint=fingerprint
+        )
         transaction, epoch = self.bind_output(attempt, slot, declaration)
         binding = self.bindings[self.key(attempt, transaction)]
         if binding.epoch != epoch:
@@ -517,7 +520,7 @@ class WriterBroker:
                 writer = store.begin_derived(
                     transaction,
                     binding.epoch,
-                    *args,
+                    *cast("NativeDerivationArguments", args),
                     work_fingerprint=fingerprint,
                     checkpoint=binding.checkpoint,
                 )
@@ -526,7 +529,7 @@ class WriterBroker:
         with self.lock:
             self.writers[key] = live
 
-        def record_receipt(facts: dict[str, object]) -> None:
+        def record_receipt(facts: Mapping[str, object]) -> None:
             receipt_recorder(attempt, transaction, binding, facts)
             # TensorFS sends the successful receipt after this callback. Release
             # writer ownership here so immediate replay cannot race the serving
@@ -628,7 +631,7 @@ class WriterBroker:
             estimate = store.derived_write_estimate(
                 transaction,
                 binding.epoch,
-                *arguments,
+                *cast("NativeDerivationArguments", arguments),
                 work_fingerprint=fingerprint,
                 checkpoint=binding.checkpoint,
             )
@@ -641,7 +644,7 @@ class WriterBroker:
                 pending = store.derived_write_estimate(
                     key[2],
                     live.binding.epoch,
-                    *live.arguments,
+                    *cast("NativeDerivationArguments", live.arguments),
                     work_fingerprint=live.fingerprint,
                 )
                 payload += int(pending["payload_bytes"])

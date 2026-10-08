@@ -74,8 +74,8 @@ def lookup(store: tensorfs.Store, transaction_id: str) -> DerivedLookup:
 
 
 def same_receipt(left: Mapping[str, object], right: Mapping[str, object]) -> bool:
-    """Whether two native receipts state the same facts."""
-    return dict(left) == dict(right)
+    """Compare adoption identity; record authoritative native facts, not peer observations."""
+    return native_receipt(left) == native_receipt(right)
 
 
 def work_fingerprint(
