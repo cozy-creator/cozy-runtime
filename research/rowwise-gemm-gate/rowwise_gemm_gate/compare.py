@@ -1,5 +1,6 @@
 """Same quantized operands, strict byte equivalence and real kernel evidence."""
 
+import hashlib
 import importlib.metadata
 import json
 import statistics
@@ -228,6 +229,8 @@ def _case(torch, leaves, gemm, generator, name, shape, warmup, repeats, trace_pa
 def compare(seed, warmup, repeats, trace_path):
     import torch
 
+    from cozy_runtime import _build_provenance
+    from cozy_runtime.internal import lora_bake
     from cozy_runtime.internal.encoding import leaves, rowwise_gemm
 
     if torch.cuda.get_device_capability() != (12, 0):
@@ -244,6 +247,24 @@ def compare(seed, warmup, repeats, trace_path):
         "capability": list(torch.cuda.get_device_capability()),
         "software": {
             name: _version(name) for name in ("cozy-runtime", "torch", "tensorfs", "triton")
+        },
+        "implementation": {
+            "modules": {
+                module.__name__: {
+                    "path": module.__file__,
+                    "sha256": hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest(),
+                }
+                for module in (leaves, rowwise_gemm, lora_bake)
+            },
+            "provenance": {
+                name: getattr(_build_provenance, name, None)
+                for name in (
+                    "SAGE3_LIFETIMES_PATCH_COMMIT",
+                    "SHARED_QKV_PATCH_COMMIT",
+                    "BOUNDED_ROWWISE_GEMM_PATCH_COMMIT",
+                    "LORA_BAKE_DEAD_WORK_PATCH_COMMIT",
+                )
+            },
         },
         "seed": seed,
         "warmup": warmup,
