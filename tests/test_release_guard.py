@@ -24,9 +24,9 @@ def git(root: Path, *args: str) -> str:
         [
             "git",
             "-c",
-            "user.name=Release fixture",
+            "user.name=Paul Fidika",
             "-c",
-            "user.email=release@example.invalid",
+            "user.email=paul@fidika.com",
             "-c",
             "commit.gpgsign=false",
             "-c",
@@ -169,6 +169,35 @@ def test_tag_must_match_declared_version(
     event_path.write_text(json.dumps(event))
     monkeypatch.setenv("GITHUB_REF", event["ref"])
     with pytest.raises(ValueError, match=r"tag v2\.0\.0 != pyproject version 1\.2\.3"):
+        guard.main()
+    assert registry.requests == []
+
+
+def test_manual_rehearsal_checks_identity_without_contacting_pypi(
+    release: ReleaseFixture, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    guard, repo, event, registry = release
+    registry.status = 200
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
+    event.write_text(json.dumps({"inputs": {"release_tag": "v1.2.3"}}))
+    monkeypatch.setattr(sys, "argv", [str(GUARD), "--source", str(repo), "--rehearsal"])
+    output = tmp_path / "outputs"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output))
+    assert guard.main() == 0
+    assert output.read_text() == f"source={git(repo, 'rev-parse', 'HEAD')}\nversion=1.2.3\n"
+    assert registry.requests == []
+    (repo / "untracked.py").write_text("VALUE = 1\n")
+    with pytest.raises(ValueError, match="uncommitted or untracked"):
+        guard.main()
+    assert registry.requests == []
+
+
+def test_rehearsal_requires_manual_dispatch(
+    release: ReleaseFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    guard, repo, _, registry = release
+    monkeypatch.setattr(sys, "argv", [str(GUARD), "--source", str(repo), "--rehearsal"])
+    with pytest.raises(ValueError, match="rehearsal requires an explicit manual dispatch"):
         guard.main()
     assert registry.requests == []
 

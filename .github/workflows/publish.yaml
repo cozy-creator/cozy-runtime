@@ -1,16 +1,12 @@
 name: Publish to PyPI
 
-# Publication IS the tag push (cozy-eval's pattern). No local publish —
-# this workflow is the single release procedure. Manual run for an existing tag:
-#   gh workflow run publish.yaml -R cozy-creator/cozy-runtime -f release_tag=vX.Y.Z
-# Publish exactly the gated files attached to an existing GitHub release, building nothing:
-#   gh workflow run publish.yaml -R cozy-creator/cozy-runtime -f release_tag=vX.Y.Z -f gated_sha256sums='<sum> <file> ...'
-# Two jobs because each bills at least one minute: `build` verifies the release, checks
-# child-call progress, and builds the files; `publish` holds the PyPI OIDC token and runs
-# no project code.
-# Success means PyPI's JSON API lists exactly the built files: lock dependents after the
-# simple index lists them too. Broad CI stays in ci.yaml; the owner requires this targeted
-# regression check before publishing to prevent the child-call deadlock from returning.
+# Explicit publication only: creating a tag never starts a companion source build.
+# Source build:
+#   gh workflow run publish.yaml -f release_tag=vX.Y.Z -f mode=source
+# Approved existing release assets:
+#   gh workflow run publish.yaml -f release_tag=vX.Y.Z -f mode=prebuilt -f gated_sha256sums='<sha256> <filename> ...'
+# Add -f rehearsal=true to verify a tag/files without entering the publish job.
+# Build/download jobs have read-only repository access. Only publish obtains PyPI OIDC.
 on:
   workflow_dispatch:
     inputs:
@@ -18,22 +14,31 @@ on:
         description: Existing unpublished version tag to publish
         type: string
         required: true
+      mode:
+        description: Build from the tag or use approved existing release assets
+        type: choice
+        required: true
+        default: source
+        options:
+          - source
+          - prebuilt
+      rehearsal:
+        description: Verify only; allow an existing PyPI version and never publish
+        type: boolean
+        default: false
       gated_sha256sums:
         description: '"<sha256> <filename>" pairs, space separated: publish exactly these release assets, no build'
         type: string
         default: ''
-  push:
-    tags:
-      - 'v*'
 
 # Serialize retries for one release name; distinct versions can build independently.
 concurrency:
-  group: runtime-release-${{ inputs.release_tag || github.ref_name }}
+  group: runtime-release-${{ inputs.release_tag }}
   cancel-in-progress: false
 
 jobs:
   build:
-    if: ${{ !inputs.gated_sha256sums }}
+    if: ${{ inputs.mode == 'source' }}
     outputs:
       version: ${{ steps.dist.outputs.version }}
       sha256sums: ${{ steps.dist.outputs.sha256sums }}
@@ -50,7 +55,7 @@ jobs:
           path: release-tools
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.release_tag || github.ref }}
+          ref: ${{ inputs.release_tag }}
           fetch-depth: 0
           path: source
       - uses: astral-sh/setup-uv@v7
@@ -61,9 +66,21 @@ jobs:
         with:
           repo-token: ${{ github.token }}
       - run: uv python install 3.12
+      - name: Source mode carries no prebuilt asset selection
+        env:
+          SUMS: ${{ inputs.gated_sha256sums }}
+        run: |
+          if [ -n "$SUMS" ]; then
+            echo "::error::Use mode=prebuilt when supplying gated_sha256sums."
+            exit 1
+          fi
       - id: release
-        name: Verify immutable unpublished release identity
-        run: uv run --no-project --python 3.12 python release-tools/checks/release.py --source source
+        name: Verify immutable release identity
+        run: uv run --no-project --python 3.12 python release-tools/checks/release.py --source source ${{ inputs.rehearsal && '--rehearsal' || '' }}
+      - name: Verify source dependency access before building
+        env:
+          TENSORFS_KEY: ${{ secrets.TENSORFS_READ_KEY }}
+        run: bash release-tools/scripts/prepare-release-source-access.sh
       - run: uv sync --locked
         working-directory: source
       # One Python source build plus the kernel wheel (cr-094): the latter is tagged
@@ -115,21 +132,11 @@ jobs:
         run: |
           uv run python scripts/stamp-build-provenance.py "$COZY_RUNTIME_BUILD_COMMIT"
           uv build --out-dir dist
-      # Read-only deploy keys: cozy-machine's source at its pin and the TensorFS crates it links.
-      - name: Read access to cozy-machine and TensorFS
-        env:
-          COZY_MACHINE_KEY: ${{ secrets.COZY_MACHINE_READ_KEY }}
-          TENSORFS_KEY: ${{ secrets.TENSORFS_READ_KEY }}
-        run: |
-          mkdir -m 700 -p ~/.ssh && ssh-keyscan github.com >> ~/.ssh/known_hosts
-          for repo in cozy-machine tensorfs; do
-            key=COZY_MACHINE_KEY; [ "$repo" = tensorfs ] && key=TENSORFS_KEY
-            (umask 077; printf '%s\n' "${!key}" > ~/.ssh/$repo)
-            printf 'Host %s.github.com\n  HostName github.com\n  IdentityFile ~/.ssh/%s\n  IdentitiesOnly yes\n' $repo $repo >> ~/.ssh/config
-            git config --global url."git@$repo.github.com:cozy-creator/$repo".insteadOf "https://github.com/cozy-creator/$repo"
-          done
+      # TensorD itself is public; only private TensorFS source needs additional read access.
       - name: Bundle the pinned cozy-machine into the Linux wheel
         working-directory: source
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
         run: task machine
       - name: Verify wheel selection and the installed machine command
         working-directory: source
@@ -168,30 +175,44 @@ jobs:
           if-no-files-found: error
 
   # The gated files a release candidate was proven with, byte for byte: the release's assets,
-  # refused unless they are exactly the sums the release owner recorded. No project code runs.
+  # refused unless they are exactly the sums the release owner recorded. No artifact code runs.
   gated:
-    if: ${{ inputs.gated_sha256sums != '' }}
+    if: ${{ inputs.mode == 'prebuilt' }}
     outputs:
-      version: ${{ steps.dist.outputs.version }}
+      version: ${{ steps.release.outputs.version }}
       sha256sums: ${{ steps.dist.outputs.sha256sums }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: release-tools
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag }}
+          fetch-depth: 0
+          path: source
+      - uses: astral-sh/setup-uv@v7
+        with:
+          save-cache: false
+      - id: release
+        name: Verify immutable release identity without executing artifact code
+        run: uv run --no-project --python 3.12 python release-tools/checks/release.py --source source ${{ inputs.rehearsal && '--rehearsal' || '' }}
       - id: dist
-        name: The release holds exactly the gated files
+        name: The release holds exactly the approved files
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.release_tag }}
+          VERSION: ${{ steps.release.outputs.version }}
           SUMS: ${{ inputs.gated_sha256sums }}
         run: |
           set -eu
+          test -n "$SUMS" || { echo "::error::Prebuilt mode requires gated_sha256sums."; exit 1; }
           gh release download "$TAG" -R "$GITHUB_REPOSITORY" -D dist
-          printf '%s\n' $SUMS | paste -d' ' - - | sed 's/ /  /' > sums
-          (cd dist && sha256sum --check --strict ../sums)
-          [ "$(ls dist | sort)" = "$(awk '{print $2}' sums | sort)" ]
-          { echo "version=${TAG#v}"; echo "sha256sums<<SUMS"; cat sums; echo SUMS; } >> "$GITHUB_OUTPUT"
+          uv run --no-project --python 3.12 python release-tools/checks/release_assets.py --dist dist --version "$VERSION"
       - uses: actions/upload-artifact@v4
         with:
           name: release-dist
@@ -200,7 +221,7 @@ jobs:
 
   publish:
     needs: [build, gated]
-    if: ${{ !cancelled() && (needs.build.result == 'success' || needs.gated.result == 'success') }}
+    if: ${{ !cancelled() && !inputs.rehearsal && (needs.build.result == 'success' || needs.gated.result == 'success') }}
     runs-on: ubuntu-latest
     environment: pypi
     # Hang bound, not a work budget.

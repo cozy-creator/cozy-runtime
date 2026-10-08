@@ -2,8 +2,7 @@ name: ci
 # On demand, before a release (lint, types, fences, wheel, pytest, handoff proof):
 #   gh workflow run ci.yaml -R cozy-creator/cozy-runtime --ref <branch>
 # Every gate runs even when another is red; the final checks job requires all of them.
-# Tests keep real process/cgroup isolation on independent runners. publish.yaml's build job
-# runs the syntax/undefined-name lint and fences on every release.
+# Tests keep real process/cgroup isolation on independent runners. publish.yaml explicitly selects source-build or approved prebuilt release files.
 on:
   workflow_dispatch:
 concurrency:

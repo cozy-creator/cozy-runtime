@@ -17,6 +17,7 @@ It is built from [TensorD](https://github.com/cozy-creator/tensord) at the revis
 in `cozy-machine.pin`. `task machine` bundles it into `dist`'s Linux wheel
 (`MACHINE=<checkout>` builds a local checkout); the publish workflow runs the same task.
 The pure Python wheel and source distribution carry no machine executable.
+See [Publishing Runtime](docs/releases.md) for explicit source and approved-prebuilt releases.
 
 TensorD owns accepted executions and their durable journal behind `cozy.machine.v1`.
 Runtime reports executor facts over the private control/descriptor channel. The retired
