@@ -42,7 +42,8 @@ def test_kitchen_sol_remains_explicit_and_keeps_ulysses_registration() -> None:
     assert candidate in attention.PINNABLE and candidate not in attention.CANDIDATES
     member = attention._member(candidate)
     assert _AttentionBackendRegistry._is_context_parallel_available(member)
-    module = WanAttention(dim=256, heads=2, dim_head=128, processor=WanAttnProcessor())
+    processor_type: Any = WanAttnProcessor
+    module: Any = WanAttention(dim=256, heads=2, dim_head=128, processor=processor_type())
     roots = {"dit": torch.nn.ModuleList([module]).to(dtype=torch.bfloat16)}
     applied = attention.install(
         [attention.Ready(candidate, member)], roots, "dit=kitchen-sol", degree=4
