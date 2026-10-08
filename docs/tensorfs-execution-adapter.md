@@ -1,4 +1,9 @@
-# TensorFS execution adapter (cr-174)
+# TensorFS execution adapter (cr-174, historical implementation record)
+
+This record describes the earlier Python-worker migration. Current managed execution is
+owned by TensorD; Runtime consumes its scoped data/buffer handles and performs executor
+GPU work using TensorFS. See [Machine and Runtime roles](machine-agent-runtime.md) for the
+current boundary. References below to the former worker/workspace journal are historical.
 
 Owner: Codex `/root/tensorfs_native_resume`.
 Worktree: `~/cozy/.worktrees/cozy-runtime/cr174-tensorfs-execution-adapter`.
