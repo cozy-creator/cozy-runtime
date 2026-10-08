@@ -37,11 +37,15 @@ def _bake(
     scale: Any,
     down: Any,
     up: Any,
-    rounding: str,
+    rounding: lora_bake.Rounding,
     stats: Any = None,
     refit: bool = False,
 ) -> None:
-    kwargs = {"rounding": rounding, "stats": stats, "generator": torch.Generator().manual_seed(99)}
+    kwargs: dict[str, Any] = {
+        "rounding": rounding,
+        "stats": stats,
+        "generator": torch.Generator().manual_seed(99),
+    }
     if kind == "plain":
         lora_bake.bake_plain(torch, data, down, up, 0.75, **kwargs)
     elif kind == "rowwise":
@@ -55,7 +59,9 @@ def _bake(
 @pytest.mark.parametrize("kind", ["plain", "rowwise", "mx"])
 @pytest.mark.parametrize("rounding", ["nearest", "stochastic", "feedback"])
 @pytest.mark.parametrize("refit", [False, True])
-def test_statistics_do_not_change_stored_bytes_or_rng_sequence(monkeypatch, kind, rounding, refit):
+def test_statistics_do_not_change_stored_bytes_or_rng_sequence(
+    monkeypatch: pytest.MonkeyPatch, kind: str, rounding: lora_bake.Rounding, refit: bool
+) -> None:
     # Multiple row chunks exercise the repeated-factor path, including a non-full tail.
     monkeypatch.setattr(lora_bake, "CHUNK_ELEMENTS", 3 * 64)
     weight, down, up = _inputs()
@@ -73,32 +79,34 @@ def test_statistics_do_not_change_stored_bytes_or_rng_sequence(monkeypatch, kind
 
 @pytest.mark.parametrize("kind", ["plain", "rowwise", "mx"])
 @pytest.mark.parametrize("want_stats", [False, True])
-def test_only_requested_diagnostics_and_one_call_scoped_factor_cast(monkeypatch, kind, want_stats):
+def test_only_requested_diagnostics_and_one_call_scoped_factor_cast(
+    monkeypatch: pytest.MonkeyPatch, kind: str, want_stats: bool
+) -> None:
     monkeypatch.setattr(lora_bake, "CHUNK_ELEMENTS", 3 * 64)
     weight, down, up = _inputs()
     data, scale = _stored(kind, weight)
     calls = {"account": 0, "decode": 0, "down_cast": 0, "saturation": 0}
-    copies = []
+    copies: list[weakref.ReferenceType[Any]] = []
     original_float, original_sum = torch.Tensor.float, torch.Tensor.sum
     original_account, original_decode = lora_bake._account, lora_bake.decode_e4m3
 
-    def cast(tensor, *args, **kwargs):
+    def cast(tensor: Any, *args: Any, **kwargs: Any) -> Any:
         result = original_float(tensor, *args, **kwargs)
         if tensor is down:
             calls["down_cast"] += 1
             copies.append(weakref.ref(result))
         return result
 
-    def summed(tensor, *args, **kwargs):
+    def summed(tensor: Any, *args: Any, **kwargs: Any) -> Any:
         if tensor.dtype == torch.bool:
             calls["saturation"] += 1
         return original_sum(tensor, *args, **kwargs)
 
-    def account(*args, **kwargs):
+    def account(*args: Any, **kwargs: Any) -> Any:
         calls["account"] += 1
         return original_account(*args, **kwargs)
 
-    def decode(*args, **kwargs):
+    def decode(*args: Any, **kwargs: Any) -> Any:
         calls["decode"] += 1
         return original_decode(*args, **kwargs)
 
