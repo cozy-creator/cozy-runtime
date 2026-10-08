@@ -407,13 +407,10 @@ class RowwiseNativeLeaf:
         # for a contiguous `[out, in]`. `scale_b` is per COLUMN of that operand, which is per
         # OUTPUT row of the weight — and `reshape(1, -1)` is what serves the alias's rank-1
         # `[out]` and rank-2 `[out, 1]` variants through one spelling.
-        out = torch._scaled_mm(
-            xq,
-            payload.t(),
-            scale_a=xs,
-            scale_b=scale.to(torch.float32).reshape(1, -1),
-            out_dtype=leaf.out_dtype,
-            use_fast_accum=True,
+        from cozy_runtime.internal.encoding import rowwise_gemm
+
+        out = rowwise_gemm.mm(
+            torch, xq, payload.t(), xs, scale.to(torch.float32).reshape(1, -1), leaf.out_dtype
         )
         return out.reshape(*x.shape[:-1], -1)
 
