@@ -43,6 +43,7 @@ class TurboInput(msgspec.Struct, kw_only=True):
     seed: int | None = None
     profile_detail: bool = False
     full_request_trace: bool = True
+    trace_cpu_ops: bool = False
 
 
 class RegularInput(TurboInput, kw_only=True):
@@ -107,11 +108,14 @@ def regular(
         profile_request(
             model,
             10,
-            lambda observed_out: handler(ctx, payload, assets, model, observed_out, tel),
+            lambda observed_out, observed_tel: handler(
+                ctx, payload, assets, model, observed_out, observed_tel
+            ),
             outputs=out,
             telemetry=tel,
             detailed=payload.profile_detail,
             full_request_trace=payload.full_request_trace,
+            trace_cpu_ops=payload.trace_cpu_ops,
         ),
         out,
     )
@@ -136,13 +140,14 @@ def turbo(
         profile_request(
             base_model,
             4,
-            lambda observed_out: handler(
-                ctx, payload, assets, base_model, turbo_lora, observed_out, tel
+            lambda observed_out, observed_tel: handler(
+                ctx, payload, assets, base_model, turbo_lora, observed_out, observed_tel
             ),
             outputs=out,
             telemetry=tel,
             detailed=payload.profile_detail,
             full_request_trace=payload.full_request_trace,
+            trace_cpu_ops=payload.trace_cpu_ops,
         ),
         out,
     )

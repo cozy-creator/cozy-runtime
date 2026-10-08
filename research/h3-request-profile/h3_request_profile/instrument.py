@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import gzip
 import json
+import os
 import shutil
 import tempfile
+import threading
 import time
 from collections.abc import Callable
+from contextlib import contextmanager
 from importlib import import_module
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -16,6 +19,40 @@ from typing import Any, cast
 import msgspec
 
 TRACE_BYTES = 64 << 30
+
+
+def host_range(label: str) -> dict[str, Any]:
+    return {
+        "label": label,
+        "pid": os.getpid(),
+        "tid": threading.get_native_id(),
+        "start_unix_ns": time.time_ns(),
+    }
+
+
+def close_range(row: dict[str, Any], ranges: list[dict[str, Any]]) -> None:
+    row["end_unix_ns"] = time.time_ns()
+    ranges.append(row)
+
+
+class ObservedTelemetry:
+    """Retain the original stage service; add only host-clock correlation ranges."""
+
+    def __init__(self, target: Any, ranges: list[dict[str, Any]]) -> None:
+        self.target, self.ranges = target, ranges
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.target, name)
+
+    @contextmanager
+    def stage(self, name: str, **options: Any) -> Any:
+        row = host_range("h3.phase." + name)
+        try:
+            with self.target.stage(name, **options) as value:
+                yield value
+        finally:
+            close_range(row, self.ranges)
+
 
 _COUNTERS = (
     "h2d_bytes",
@@ -109,14 +146,16 @@ def retained_handler(name: str) -> Callable[..., Any]:
 class ObservedOutputs:
     """Delegate the existing sink unchanged; observe its overlapping worker-thread wall."""
 
-    def __init__(self, target: Any) -> None:
+    def __init__(self, target: Any, ranges: list[dict[str, Any]] | None = None) -> None:
         self.target = target
         self.sinks: list[dict[str, Any]] = []
+        self.ranges = ranges if ranges is not None else []
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.target, name)
 
     def save_video_stream(self, events: Any) -> Any:
+        row = host_range("h3.output.save_video_stream")
         began = time.perf_counter()
         source = iter(events)
         source_ms = 0.0
@@ -144,6 +183,7 @@ class ObservedOutputs:
             return result
         finally:
             ended = time.perf_counter()
+            close_range(row, self.ranges)
             total = (ended - began) * 1000
             self.sinks.append(
                 {
@@ -164,12 +204,13 @@ class ObservedOutputs:
 def profile_request(
     model: Any,
     dense_steps: int,
-    render: Callable[[Any], Any],
+    render: Callable[[Any, Any], Any],
     *,
     outputs: Any,
     telemetry: Any,
     detailed: bool = False,
     full_request_trace: bool = True,
+    trace_cpu_ops: bool = False,
 ) -> tuple[Any, Any, bytes]:
     if outputs._attempt.max_output_bytes < TRACE_BYTES:
         raise ValueError(
@@ -189,18 +230,22 @@ def profile_request(
     def facts() -> dict[str, Any]:
         return cast(dict[str, Any], msgspec.to_builtins(residency.weights.facts()))
 
-    observed_outputs = ObservedOutputs(outputs)
+    ranges: list[dict[str, Any]] = []
+    observed_outputs = ObservedOutputs(outputs, ranges)
+    observed_telemetry = ObservedTelemetry(telemetry, ranges)
     return record_request(
         transformer,
         dense_steps,
-        lambda: render(observed_outputs),
+        lambda: render(observed_outputs, observed_telemetry),
         facts,
-        [ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        [ProfilerActivity.CPU, ProfilerActivity.CUDA] if trace_cpu_ops else [ProfilerActivity.CUDA],
         detailed=detailed,
         full_request_trace=full_request_trace,
         attribution=lambda: telemetry._attempt.attribution.document(),
         output_sinks=observed_outputs.sinks,
         trace_sink=outputs.save_tree,
+        trace_cpu_ops=trace_cpu_ops,
+        ranges=ranges,
     )
 
 
@@ -216,12 +261,17 @@ def record_request(
     output_sinks: list[dict[str, Any]] | None = None,
     full_request_trace: bool = False,
     trace_sink: Callable[[Path], Any] | None = None,
+    trace_cpu_ops: bool = True,
+    ranges: list[dict[str, Any]] | None = None,
 ) -> tuple[Any, Any, bytes]:
     """The same bounded recorder can be exercised with real CPU modules off-rental."""
     from torch.profiler import profile, record_function, schedule
 
     if full_request_trace and detailed:
         raise ValueError("Whole-request tracing requires shape/memory recording off")
+    if detailed and not trace_cpu_ops:
+        raise ValueError("Detailed operator tracing requires explicit trace_cpu_ops")
+    ranges = ranges if ranges is not None else []
 
     steps: list[dict[str, Any]] = []
     handles: list[Any] = []
@@ -235,6 +285,19 @@ def record_request(
     request_before = facts()
     attribution_before = attribution() if attribution is not None else {}
     profile_began = time.perf_counter()
+
+    def begin_scope(label: str) -> tuple[Any, dict[str, Any]]:
+        row = host_range(label)
+        marker: Any = record_function(label) if trace_cpu_ops else None
+        if marker is not None:
+            marker.__enter__()
+        return marker, row
+
+    def end_scope(scope: tuple[Any, dict[str, Any]]) -> None:
+        marker, row = scope
+        if marker is not None:
+            marker.__exit__(None, None, None)
+        close_range(row, ranges)
 
     def finished_trace(prof: Any) -> None:
         with tempfile.TemporaryDirectory(prefix="h3-profile-") as temp:
@@ -282,14 +345,12 @@ def record_request(
         def step_start(*args: Any) -> None:
             before[0], began[0] = facts(), time.perf_counter()
             phase = "dense" if step_index[0] < dense_steps else "sparse_eligible"
-            marker: Any = record_function(f"h3.step.{step_index[0]}.{phase}")
-            marker.__enter__()
-            scopes["step"] = marker
+            scopes["step"] = begin_scope(f"h3.step.{step_index[0]}.{phase}")
 
         def step_end(*args: Any) -> None:
             marker = scopes.pop("step", None)
             if marker is not None:
-                marker.__exit__(None, None, None)
+                end_scope(marker)
             after = facts()
             steps.append(
                 {
@@ -309,7 +370,7 @@ def record_request(
             transformer.register_forward_hook(step_end, always_call=True),
         ]
         for path, module in transformer.named_modules():
-            if not path.endswith(
+            detailed_site = path.endswith(
                 (
                     ".attn",
                     ".to_q",
@@ -321,18 +382,21 @@ def record_request(
                     ".ff.net.0.proj",
                     ".ff.net.2",
                 )
-            ):
+            )
+            block = (path.startswith("transformer_blocks.") and path.count(".") == 1) or (
+                "refiner_blocks." in path and path.rsplit(".", 1)[-1].isdigit()
+            )
+            coarse_site = block or path.endswith((".attn", ".ff", ".ff.net.0", ".ff.net.2"))
+            if not (coarse_site or (trace_cpu_ops and detailed_site)):
                 continue
 
             def enter(*args: Any, label: str = path) -> None:
-                marker: Any = record_function("h3.module." + label)
-                marker.__enter__()
-                scopes.setdefault(label, []).append(marker)
+                scopes.setdefault(label, []).append(begin_scope("h3.module." + label))
 
             def leave(*args: Any, label: str = path) -> None:
                 stack = scopes.get(label, [])
                 if stack:
-                    stack.pop().__exit__(None, None, None)
+                    end_scope(stack.pop())
 
             handles += [
                 module.register_forward_pre_hook(enter),
@@ -349,7 +413,7 @@ def record_request(
                 handle.remove()
             for remaining in scopes.values():
                 for marker in remaining if isinstance(remaining, list) else [remaining]:
-                    marker.__exit__(None, None, None)
+                    end_scope(marker)
     if full_request_trace:
         finished_trace(prof)
     if len(traces) != 1:
@@ -360,6 +424,11 @@ def record_request(
         "record_shapes_and_memory": detailed,
         "not_benchmark_time": True,
         "full_request_trace": full_request_trace,
+        "trace_cpu_ops": trace_cpu_ops,
+        "projection_hooks": "enabled for explicit CPU tracing"
+        if trace_cpu_ops
+        else "QKV/out omitted",
+        "ranges": ranges,
         "profiled_step_indices": list(range(len(steps)))
         if full_request_trace
         else [dense_steps - 1, dense_steps],
@@ -387,7 +456,9 @@ def record_request(
         "inclusive_times_must_not_be_summed": True,
         "kernel_category_is_heuristic": True,
         "notes": (
-            "QKV ranges include original encoded-leaf quantization and LoRA hooks. "
+            "Default ranges cover steps/blocks/attention/FFN and delegated H3 phases. "
+            "QKV/output projection hooks and CPU ATen recording require explicit trace_cpu_ops; "
+            "default CUDA-only profiling preserves shared-QKV eligibility. "
             "Kernel names/input shapes identify child operations. CUDA memcpy spans "
             "and plane deltas distinguish transfers/eviction from compute. CPU enqueue "
             "walls are not GPU execution times; raw trace preserves stream overlap. "
@@ -403,7 +474,8 @@ def record_request(
             "must be read from ordinary run-show evidence; reused setup is not charged again. "
             "Sparse-eligible labels describe the schedule, not proof of a sparse kernel; "
             "actual kernel identity comes from the trace and native run evidence."
-            " Full mode continuously records TE, all DiT steps, both VAEs, encode and checks; "
+            " Full mode continuously records CUDA activity through TE, all DiT steps, "
+            "both VAEs, encode and checks; "
             "record_shapes/profile_memory/with_stack remain off. Pre-handler construction/warm "
             "kernels remain outside this authored trace and retain native setup timing evidence. "
             " Plane deltas start at handler entry, after cold construction; raw before/after "

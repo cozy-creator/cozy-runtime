@@ -268,3 +268,58 @@ def test_old_output_grant_refuses_before_gpu_or_render_work(tmp_path):
     out = Outputs(fake_attempt(spool=tmp_path / "spool"))
     with pytest.raises(ValueError, match="output grant before rendering"):
         recorder().profile_request(None, 4, None, outputs=out, telemetry=None)
+
+
+def test_manual_ranges_preserve_real_telemetry_and_have_native_thread_identity(tmp_path):
+    import os
+    import threading
+
+    from cozy_runtime.author import Telemetry
+    from cozy_runtime.author.fakes import fake_attempt, fake_context
+
+    module = recorder()
+    attempt = fake_attempt(spool=tmp_path / "spool")
+    target = Telemetry(attempt, fake_context())
+    ranges = []
+    observed = module.ObservedTelemetry(target, ranges)
+    with observed.stage("condition_text", overall_range=(0.0, 1.0)):
+        observed.metric("test", 1.0)
+    assert "condition_text" in attempt.attribution.document()["stages"]
+    assert len(ranges) == 1
+    row = ranges[0]
+    assert row["label"] == "h3.phase.condition_text"
+    assert row["pid"] == os.getpid() and row["tid"] == threading.get_native_id()
+    assert 0 < row["start_unix_ns"] <= row["end_unix_ns"]
+
+
+def test_manual_mode_does_not_attach_projection_hooks_and_keeps_cpu_output():
+    module, model = recorder(), Transformer()
+    source = torch.ones(2, 8)
+
+    def render():
+        assert not model.block.to_q._forward_pre_hooks and not model.block.to_q._forward_hooks
+        value = source
+        for _ in range(8):
+            value = model(value)
+        return value
+
+    expected = render()
+    actual, packed, raw = module.record_request(
+        model,
+        4,
+        render,
+        lambda: {},
+        [torch.profiler.ProfilerActivity.CPU],
+        full_request_trace=True,
+        trace_cpu_ops=False,
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    summary = json.loads(raw)
+    assert summary["trace_cpu_ops"] is False and summary["events"] == []
+    assert len(summary["ranges"]) == 8
+    assert {row["label"] for row in summary["ranges"]} == {
+        f"h3.step.{i}.{'dense' if i < 4 else 'sparse_eligible'}" for i in range(8)
+    }
+    trace = json.loads(gzip.decompress(packed))
+    assert not any(event.get("name", "").startswith("h3.module.") for event in trace["traceEvents"])
+    assert not model._forward_pre_hooks and not model._forward_hooks
