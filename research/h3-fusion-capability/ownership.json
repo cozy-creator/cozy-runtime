@@ -1,0 +1,6 @@
+{
+  "owner": "/root/fusion_resume",
+  "purpose": "Replace fragile Diffusers source fingerprint refusal with fusion capability and topology contract; test 0.40 and 0.41 and retain visible application status.",
+  "branch": "fix/h3-fusion-capability-20261008",
+  "base_sha": "c6fea990497a43d7f31bf016a8a06ae57cb14324"
+}
