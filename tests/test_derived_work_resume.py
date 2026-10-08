@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 import tensorfs
+from tensorfs.records import DeclarationTargets, TensorDeclaration
 
 from cozy_runtime.internal.weights_sink import work_fingerprint
 
@@ -38,13 +39,13 @@ def test_output_determining_facts_still_separate_work() -> None:
 def test_interrupted_derived_work_resumes_after_a_new_installation(tmp_path: Path) -> None:
     store = tensorfs.Store.init(tmp_path / "store")
     plain = next(value for alias, value in tensorfs.seed_digests() if alias == "plain/1")
-    tensor = {
+    tensor: TensorDeclaration = {
         "logical_dtype": "f32",
         "shape": [512],
         "encoding": plain,
         "parts": {"value": {"dtype": "f32", "shape": [512]}},
     }
-    targets = {"model": {"add": {"a": tensor, "b": tensor}, "drop": []}}
+    targets: DeclarationTargets = {"model": {"add": {"a": tensor, "b": tensor}, "drop": []}}
     order = [("model", "a"), ("model", "b")]
     transaction = "sha256:" + "44" * 32
     writer = store.begin_derived(

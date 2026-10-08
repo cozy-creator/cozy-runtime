@@ -443,7 +443,7 @@ def test_a_sharded_forward_outside_the_gate_refuses() -> None:
     # and `ulysses_anything` is why that is no longer a refusal.
     cp.refuse_unless_heads_divisible(heads=56, degree=8)
     with pytest.raises(cp.ContextParallelUnavailable) as ring:
-        cp._GroupMesh(None, 2, 0)["ring"].get_group()
+        cp._GroupMesh(cp.CpComms(pg=None, rank=0, device=None), 2, 0)["ring"].get_group()
     assert "Ulysses" in ring.value.message
     with pytest.raises(cp.ContextParallelUnavailable) as unsharded:
         cp.install_context_parallel(object(), degree=2, comms=None)

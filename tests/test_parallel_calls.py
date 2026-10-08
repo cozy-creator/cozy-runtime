@@ -313,9 +313,11 @@ def test_a_leader_failure_in_a_mirrored_call_stays_the_attempts_error(tmp_path: 
             group=group,
             spool=lambda: tmp_path / "attempt",
         )
-        with pytest.raises(RuntimeError) as failed:
-            with leader._ranks_attention("", SimpleNamespace(hosts={})):
-                model.fail_on_leader()
+        with (
+            pytest.raises(RuntimeError) as failed,
+            leader._ranks_attention("", SimpleNamespace(hosts={})),
+        ):
+            model.fail_on_leader()
         assert type(failed.value) is RuntimeError and str(failed.value) == "GPU 0 ran out of memory"
         assert group.broken.endswith("failed: RuntimeError: GPU 0 ran out of memory"), group.broken
     finally:
@@ -362,7 +364,7 @@ def test_a_group_runs_a_call_again_when_one_gpu_runs_out_of_memory(tmp_path: Pat
         pids = group.pids()
         # GPU 1 runs out once, after its collective: both GPUs run the call again.
         torch.testing.assert_close(model.out_of_memory(1), torch.tensor([5.0]))
-        assert group.pids() == pids and not group.broken and not group.interrupted
+        assert group.pids() == pids and not bool(group.broken) and not group.interrupted
         assert group.pg is not first and leader.pg is group.pg
         # The group formed again serves the next call as before.
         torch.testing.assert_close(model.out_of_memory(0), torch.tensor([5.0]))
@@ -371,7 +373,7 @@ def test_a_group_runs_a_call_again_when_one_gpu_runs_out_of_memory(tmp_path: Pat
             model.out_of_memory(1 << 30)
         assert failed.value.code == "device_out_of_memory"
         assert "GPU 1 ran out of device memory in 'block'" in str(failed.value)
-        assert group.broken
+        assert bool(group.broken)
     finally:
         group.close()
         ours.close()

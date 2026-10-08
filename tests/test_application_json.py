@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
 import msgspec
 import pytest
@@ -51,7 +52,7 @@ def test_application_values_keep_strict_structural_and_finite_number_bounds() ->
             application_json.decode(bad)
 
 
-def test_typed_job_result_spool_preserves_exact_seed_and_float_kind(tmp_path) -> None:
+def test_typed_job_result_spool_preserves_exact_seed_and_float_kind(tmp_path: Path) -> None:
     app = App()
 
     @app.job
