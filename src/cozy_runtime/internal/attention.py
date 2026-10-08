@@ -413,12 +413,15 @@ def _resolve(candidate: Candidate, device: DeviceFacts, wait: bool = True) -> Re
         if candidate.local in (upstream.FA3, upstream.FA3_FP8):
             upstream.bind_fa3(module, (artifact or {}).get("key", "environment"))
         if candidate.name == "kitchen-sol":
+            import torch
+
+            target = torch.device("cuda", device.index)
             available = getattr(module, "sol_attn_is_available", None)
             dense_available = getattr(module, "int8_attention_is_available", None)
             if (
                 not callable(available)
                 or not callable(dense_available)
-                or not (available(device.index) and dense_available(device.index))
+                or not (available(target) and dense_available(target))
             ):
                 raise AttentionRefusal(
                     "attention_kernel_absent",
