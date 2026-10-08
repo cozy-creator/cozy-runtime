@@ -69,9 +69,9 @@ class EnvironmentResult(msgspec.Struct):
     delegated_handler_symbols: dict[str, list[str]]
 
 
-@app.job
+@app.entrypoint
 def environment(payload: EnvironmentInput, ctx: Context) -> EnvironmentResult:
-    """CPU-only capture/submission proof for this exact profiling package; no model load."""
+    """Model-free serving proof: jobs intentionally replace child exports with managed proxies."""
     if ctx.device.type != "cpu":
         raise ValueError("The environment receipt must run without a GPU allocation")
     return EnvironmentResult(
