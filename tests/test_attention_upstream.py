@@ -9,6 +9,7 @@ from __future__ import annotations
 import importlib.util
 import os
 from collections.abc import Callable
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -19,7 +20,7 @@ from cozy_runtime.internal import attention_upstream as upstream
 torch = pytest.importorskip("torch")
 
 NONCAUSAL = [upstream.kitchen_int8, upstream.flashinfer_mixed]
-ADAPTERS = [*NONCAUSAL, upstream.sage3_fp4]
+ADAPTERS = [*NONCAUSAL, upstream.sage3_fp4, upstream.sage3_fp4_global]
 
 
 @pytest.mark.parametrize("adapter", NONCAUSAL)
@@ -148,14 +149,53 @@ def test_fp8_flash_attention_needs_bf16_and_equal_heads() -> None:
             adapter(q, q[:, :, :1], q[:, :, :1], enable_gqa=True)
 
 
-def test_sage3_refuses_what_upstream_would_silently_change() -> None:
+@pytest.mark.parametrize("adapter", [upstream.sage3_fp4, upstream.sage3_fp4_global])
+def test_sage3_refuses_what_upstream_would_silently_change(adapter: Callable[..., Any]) -> None:
     """Upstream sends D>=256 to SDPA with a print and fixes the scale at D^-1/2."""
     wide = torch.zeros((1, 2, 2, 256), dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="does not serve head dimension 256"):
-        upstream.sage3_fp4(wide, wide, wide)
+        adapter(wide, wide, wide)
     q = torch.zeros((1, 2, 2, 128), dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="same CUDA device"):
-        upstream.sage3_fp4(q, q, q, scale=128**-0.5)
+        adapter(q, q, q, scale=128**-0.5)
+
+
+@pytest.mark.parametrize(
+    ("adapter", "block_mean"), [(upstream.sage3_fp4, True), (upstream.sage3_fp4_global, False)]
+)
+def test_sage3_mean_choice_and_upstream_mutation_are_explicit(
+    monkeypatch: pytest.MonkeyPatch, adapter: Callable[..., Any], block_mean: bool
+) -> None:
+    """CPU adapter contract only: the stand-in checks arguments and mutates its K input."""
+    calls = []
+
+    def upstream_call(q: Any, k: Any, v: Any, **options: Any) -> Any:
+        calls.append(options)
+        assert q.shape == (2, 3, 7, 128)
+        assert k.is_contiguous()
+        k.sub_(k.mean(dim=-2, keepdim=True))
+        return q + v
+
+    monkeypatch.setattr(upstream, "_cuda_inputs", lambda *_, **__: None)
+    monkeypatch.setattr(
+        upstream, "import_module", lambda _: SimpleNamespace(sageattn3_blackwell=upstream_call)
+    )
+    packed = torch.randn((2, 7, 3, 3, 128), dtype=torch.bfloat16)
+    q, k, v = (packed[:, :, :, i] for i in range(3))
+    saved = packed.clone()
+    got = adapter(q, k, v, is_causal=True, scale=128**-0.5)
+    assert calls == [{"is_causal": True, "per_block_mean": block_mean}]
+    assert torch.equal(packed, saved)
+    assert torch.equal(got, q + v)
+
+
+def test_sage3_global_mean_remains_an_explicit_shared_artifact_candidate() -> None:
+    candidate = attention.BY_NAME["sageattention3-fp4-global"]
+    assert candidate in attention.PINNABLE
+    assert candidate not in attention.CANDIDATES
+    assert candidate.artifact == attention.BY_NAME["sageattention3-fp4"].artifact
+    assert candidate.local.head_local
+    assert "global_head_mean" in candidate.local.impl(None)
 
 
 def test_sage2_selects_upstreams_mode_by_the_querys_card(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -189,6 +229,7 @@ REAL: dict[Any, tuple[str, tuple[tuple[int, int], ...], bool, bool, float | None
     upstream.flashinfer_mixed: ("flashinfer", ((10, 0), (10, 3)), False, True, 0.075, 0.05),
     upstream.fa4_fp8: ("flash_attn", ((10, 0), (10, 3)), False, False, 0.075, 0.06),
     upstream.sage3_fp4: ("sageattn3", ((12, 0),), False, False, None, 0.2),
+    upstream.sage3_fp4_global: ("sageattn3", ((12, 0),), False, False, None, 0.2),
 }
 
 

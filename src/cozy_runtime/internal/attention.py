@@ -245,6 +245,23 @@ PINNABLE: tuple[Candidate, ...] = (
         ),
     ),
     Candidate(
+        name="sageattention3-fp4-global",
+        backend="_cozy_sage3_fp4_global",
+        local=upstream.SAGE3_GLOBAL,
+        min_sm=120,
+        max_sm=120,
+        sms=frozenset({120}),
+        dtypes=_HALF,
+        max_head_dim=128,
+        head_dims=frozenset({64, 128}),
+        artifact="sageattn3",
+        import_name="sageattn3",
+        why=(
+            "Explicit FP4 global-Q-mean experiment. Linear correction storage; changes "
+            "quantization error versus per-block means. H3 speed and quality unqualified."
+        ),
+    ),
+    Candidate(
         name="sol-attn",
         backend="_cozy_sol_bf16",
         local=attention_sol.SOL,

@@ -482,6 +482,41 @@ def sage3_fp4(
     microscales, K mean and per-block Q mean smoothing. Every mean and scale is per head, so
     it is head-local. Upstream subtracts K's mean IN PLACE, so it gets a copy, and its softmax
     scale is fixed at D^-1/2."""
+    return _sage3_fp4(
+        query,
+        key,
+        value,
+        per_block_mean=True,
+        attn_mask=attn_mask,
+        dropout_p=dropout_p,
+        is_causal=is_causal,
+        scale=scale,
+        enable_gqa=enable_gqa,
+    )
+
+
+def sage3_fp4_global(query: Any, key: Any, value: Any, **options: Any) -> Any:
+    """Explicit NVFP4 experiment using upstream's global per-head Q mean.
+
+    The correction has one row per head instead of one per 128 query tokens. This avoids
+    quadratic correction storage, but changes quantization error relative to block means.
+    It does not reuse statistics across calls or fuse QKV production.
+    """
+    return _sage3_fp4(query, key, value, per_block_mean=False, **options)
+
+
+def _sage3_fp4(
+    query: Any,
+    key: Any,
+    value: Any,
+    *,
+    per_block_mean: bool,
+    attn_mask: Any = None,
+    dropout_p: float = 0.0,
+    is_causal: bool = False,
+    scale: float | None = None,
+    enable_gqa: bool = False,
+) -> Any:
     import torch
 
     _options("sageattention3-fp4", attn_mask, dropout_p, scale)
@@ -495,7 +530,11 @@ def sage3_fp4(
         raise ValueError("sageattention3-fp4 fixes the softmax scale at D^-1/2")
     q, k, v = (tensor.transpose(1, 2) for tensor in (query, key, value))
     output = import_module("sageattn3").sageattn3_blackwell(
-        q, k.clone(memory_format=torch.contiguous_format), v, is_causal=is_causal
+        q,
+        k.clone(memory_format=torch.contiguous_format),
+        v,
+        is_causal=is_causal,
+        per_block_mean=per_block_mean,
     )
     return _output(output, q).transpose(1, 2)
 
@@ -524,3 +563,6 @@ SAGE_FP16PV = _sage({90: ("sageattn_qk_int8_pv_fp16_cuda", "per_thread", "fp32")
 KITCHEN = Local(kitchen_int8, _named("comfy_kitchen.int8_attention"))
 FLASHINFER = Local(flashinfer_mixed, _named("cute_dsl_fmha_ragged_prefill jit, e4m3 V per-head"))
 SAGE3 = Local(sage3_fp4, _named("sageattn3.sageattn3_blackwell(nvfp4, per_block_mean)"))
+SAGE3_GLOBAL = Local(
+    sage3_fp4_global, _named("sageattn3.sageattn3_blackwell(nvfp4, global_head_mean)")
+)
