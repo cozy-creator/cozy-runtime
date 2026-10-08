@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Validate an immutable new publication, not ordinary source development.
 
-Only the tag-triggered publish workflow calls this guard. Source branches may
+The explicitly dispatched publish workflow calls this guard. Source branches may
 retain a released manifest version; scripts/build-dev-wheel.py gives their
 unpublished artifacts a source/donor/recipe-derived local version.
 
-The push must create the matching tag on this exact clean checkout, and PyPI
-must not already know the version (including a partial release). Existing
+The selected tag must name this exact clean checkout, and publication requires that PyPI
+does not already know the version (including a partial release). Existing
 filenames remain protected by PyPI and the publishing action; this preflight
 also prevents filling an existing version with artifacts from another source.
 """
@@ -60,6 +60,9 @@ def main() -> int:
     global ROOT
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=pathlib.Path, default=ROOT)
+    parser.add_argument(
+        "--rehearsal", action="store_true", help="Verify source identity only; no publication"
+    )
     args = parser.parse_args()
     ROOT = args.source.resolve()
     event = json.loads(pathlib.Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
@@ -95,11 +98,21 @@ def main() -> int:
         raise ValueError("release tag, push event, and checked-out source must agree")
     if git("status", "--porcelain", "--untracked-files=normal"):
         raise ValueError("release checkout has uncommitted or untracked changes")
-    unpublished(version)
+    if args.rehearsal:
+        if not manual:
+            raise ValueError("rehearsal requires an explicit manual dispatch")
+    else:
+        unpublished(version)
     if os.environ.get("GITHUB_OUTPUT"):
         with open(os.environ["GITHUB_OUTPUT"], "a") as stream:
             print(f"source={head}", file=stream)
-    print(f"release guard green: {tag} at {head}, version absent from PyPI")
+            print(f"version={version}", file=stream)
+    purpose = (
+        "identity-only rehearsal; publication disabled"
+        if args.rehearsal
+        else "version absent from PyPI"
+    )
+    print(f"release guard green: {tag} at {head}, {purpose}")
     return 0
 
 
