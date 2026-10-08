@@ -3,10 +3,11 @@
 Owned benchmark: one GPU first, then four GPUs. Use ordinary default-home `cozy run`
 on an explicitly selected rental. Keep the local display GPU unused.
 
-The request is FP8-pruned H3, 15 seconds, 1344×768, 24 fps and 30 steps with audio.
-Record cold preparation separately from request execution. Repeat with three seeds;
-compare each engine on the same hardware, prompt, geometry, schedule and precision.
-Report the actual attention implementations and checkpoint-format differences.
+The study uses FP8-pruned H3, 15 seconds, 1344×768 and 24 fps with audio:
+standard 30-step generation and Turbo8. Record cold preparation separately from
+request execution. Match hardware, prompts, geometry and schedules, and label the
+different engine arithmetic and checkpoint formats. The native three-mode matrix
+keeps the dense callback fixed while changing the sparse attention implementation.
 Do not shorten the request to make memory fit.
 
 ComfyUI baseline: v0.39.0 (`b0b743566f65daafc423b4fea8a2fbda94b3384a`).
