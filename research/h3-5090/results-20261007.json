@@ -1,6 +1,6 @@
 {
-  "updated_utc": "2026-10-08T05:53:49.428927+00:00",
-  "status": "in_progress",
+  "updated_utc": "2026-10-08T08:30:08.155273+00:00",
+  "status": "completed_requested_benchmark_matrix",
   "request": {
     "requested_duration_s": 15,
     "video_frames": 362,
@@ -638,14 +638,24 @@
   ],
   "delivery": {
     "cli_hub_and_separator_fixes": "installed; configured Hub remains http://127.0.0.1:8819",
-    "cli_cancel_fix": "Installed together with all-Hub rental listing in0.2.2+dev.20591d5a; running daemon hash verified",
+    "cli_cancel_fix": "Installed and running in607dfa64,alongside all prior CLI fixes",
     "h3_four_card_default_source": "packages PR399 merged bbfd880",
     "h3_release_preparation": "1.26.2 published to configured local Hub at2026-10-08T03:50:28Z; normal no-override Turbo runs4950/4951/4952 proved actual release1.26.2,degree4 and PDD adapter",
-    "cli_global_rental_inventory": "PR1130 merged; installed CLI and running daemon both20591d5a; --tensorhub does not filter listings; partial-Hub failures retain unverified last-seen rows"
+    "cli_global_rental_inventory": "PR1130 merged; installed CLI and running daemon both20591d5a; --tensorhub does not filter listings; partial-Hub failures retain unverified last-seen rows",
+    "cli_version": "0.2.2+dev.607dfa64",
+    "cli_sha256": "1ecc815a9082fce8da7e1b6f3c6194eebf3870fe87c4f986400c07dc05aff32b",
+    "running_daemon_pid": 1798146,
+    "explicit_endpoint_maintenance": "PR1131 installed; actual Taiwan Runtime update to.19+dev.sparsemath.93fcc636 passed with TensorFS.4 preserved and same-endpoint observe",
+    "explicit_local_directory": "PR1132 installed; actual CPU endpoint upload/execution passed; package and lock stay unchanged; named refs still selected-Hub scoped",
+    "external_rental_cleanup": "PR1133/1134 installed;explicit instance+label+stdin credential;null/404absence reconciled;exact ownedinstance54755137confirmedabsent throughCLI",
+    "local_pressure_fix": "Live with allocator/cache fixes on Runtime0.21.1+dev.gpujobs.80a723c/TensorFS0.6;retained0.21.1Python/kernel changespreserved;parent1682922 andservice1682924 both5ab168a7 afternormalCLIstop/start",
+    "local_delivery_evidence": "outputs/accelerator-job-backport-20261008/local-runtime211/live-verification.json",
+    "accelerator_job_fix": "PR161 merged;actualGPU parent\u2192CPU intermediary\u2192GPU child job4967 passed;FP8 numericaladmission4968passed on matched.19/.4cohort",
+    "local_source_sdk_cache": "PR163 merged/installed;identical-source SDK-switch regression failsbaseline andpassesfixedcode"
   },
   "rental_cleanup": {
     "5090-1": "ended; provider GET404 and complete-list absence verified2026-10-08T03:56:02Z",
-    "5090-4": "Active for requested matched fast-action Turbo and attention-precision comparisons; all future native operations and eventual teardown through Cozy CLI",
+    "5090-4": "Ended;installedCozyCLI607dfa64confirmedprovider_absent=true for54755137;allmatrix/Comfy/artifacts/provenance retained locally",
     "h100-1": "Ended via cozy rental end; provider404 and complete-list absence verified2026-10-08T04:07:12Z"
   },
   "turbo_lighthouse": {
@@ -877,285 +887,386 @@
     "boundary": "Same official PDD8 adapter and 4dense4sparse schedule; first Comfy warm conditioning reloaded weights. Optimized action cohort uses different prompts and is a separate comparison."
   },
   "action_precision_matrix": {
-    "status": "in_progress",
-    "evidence": "outputs/h3-action-quality-20261007",
-    "scenes": [
-      "parkour seed581203 setup",
-      "sparring seed581204",
-      "rally seed581205"
-    ],
-    "comfy_warm_execution_s": [
-      179.1800000667572,
-      168.143000125885
-    ],
-    "comfy_warm_mean_s": 173.6615000963211,
-    "comfy_settings": "MultiStream4e4381ff; PDD311a65dd; exchange_chunks8; text-encoder weight cache and no conditioning output cache;4GPU VAE",
-    "native_status": "BF16 action baseline complete; new INT8/S32 and FP8/F16 require CLI update and GPU admission",
-    "limits": "Comfy QKV dequantizes to BF16 by plugin design,50fc2 use BF16,fc1/output projection fall back on3GPUs due independently reproduced multi-device scaled_mm failure. No fastest-possible Comfy claim.",
-    "native_baseline": {
-      "engine": "Cozy",
-      "package": "paul/minimax-h3@1.26.2",
-      "runtime": "0.19.0",
-      "tensorfs": "0.4.0",
-      "function": "fl2va_turbo",
-      "schedule": "8 evaluations;4dense then4BF16Sol; protected blocks/prefix dense",
-      "dense": "Sage INT8-QK/FP8-PV dense callbacks",
-      "runs": [
-        {
-          "label": "first",
-          "run": 4953,
-          "execution_s": 236.58,
-          "wall_s": 264.687,
-          "degree": 4,
-          "phase_s": {
-            "prepare": 0.0013859999999999999,
-            "loading weights": 2.9171579999999997,
-            "condition_text": 3.948142,
-            "denoise": 184.384389,
-            "decode_audio": 0.445529,
-            "decode_video": 15.768403000000001,
-            "check_output": 0.263138
-          },
-          "gpus": [
-            {
-              "pid": 12996,
-              "impl": "sageattention:sageattn_qk_int8_pv_fp8_cuda(per_warp, fp32+fp16, smooth_k),sdpa:flash,sol-attn:cute_sm120",
-              "sol": {
-                "sparse": 192,
-                "dense_step": 192,
-                "dense_path": 32,
-                "dense_prefix": 192
-              }
-            },
-            {
-              "pid": 13001,
-              "impl": "sageattention:sageattn_qk_int8_pv_fp8_cuda(per_warp, fp32+fp16, smooth_k),sol-attn:cute_sm120",
-              "sol": {
-                "sparse": 192,
-                "dense_step": 192,
-                "dense_path": 32,
-                "dense_prefix": 192
-              }
-            },
-            {
-              "pid": 13003,
-              "impl": "sageattention:sageattn_qk_int8_pv_fp8_cuda(per_warp, fp32+fp16, smooth_k),sol-attn:cute_sm120",
-              "sol": {
-                "sparse": 192,
-                "dense_step": 192,
-                "dense_path": 32,
-                "dense_prefix": 192
-              }
-            },
-            {
-              "pid": 13005,
-              "impl": "sageattention:sageattn_qk_int8_pv_fp8_cuda(per_warp, fp32+fp16, smooth_k),sol-attn:cute_sm120",
-              "sol": {
-                "sparse": 192,
-                "dense_step": 192,
-                "dense_path": 32,
-                "dense_prefix": 192
-              }
-            }
-          ],
-          "output": [
-            {
-              "id": "4953/video",
-              "type": "video",
-              "name": "video",
-              "media_type": "video/mp4",
-              "status": "completed",
-              "rev": 1,
-              "length": 23658185,
-              "sha256": "sha256:081238abf87dc48517b2a8bab8973a4ea6b706b18108acbc674815ec3890b9f5",
-              "path": "/home/fidika/.cozy/outputs/h3-action-quality-20261007/bf16-first/4953-video.mp4"
-            }
-          ]
+    "status": "completed",
+    "comparison": {
+      "updated_utc": "2026-10-08T08:30:08.155273+00:00",
+      "status": "completed",
+      "hardware": "Same four RTX5090 32GB,420W each,SYS topology",
+      "request": "15s requested;362 frames,1344x768,24fps;stereo32kHz audio;official PDD8 adapter",
+      "attention_schedule": "Four dense evaluations then four sparse; protected prefixes and first two main blocks remain dense",
+      "native_dense_path": "Identical Sage dense callbacks across all three native modes",
+      "warm_means_s": {
+        "bf16": 148.04149999999998,
+        "int8": 135.6515,
+        "fp8": 130.92849999999999
+      },
+      "time_reduction_vs_bf16_percent": {
+        "bf16": 0.0,
+        "int8": 8.369274831719476,
+        "fp8": 11.559596464504885
+      },
+      "comfy_v039_affected_library_mean_s": 173.6615000963211,
+      "comfy_v039_fixed_library_mean_s": 183.9215,
+      "source_provenance": "final-provenance/summary.json",
+      "quality_summary": "native-precision-quality/summary.json",
+      "all_six_native_warm_clips_full_av_pass": true,
+      "defaults": "BF16 default unchanged;INT8 and FP8 remain explicitly selected experimental modes",
+      "videos": {
+        "bf16": {
+          "sparring": "/home/fidika/.cozy/outputs/h3-action-quality-20261007/matrix-bf16-sparring/4971-video.mp4",
+          "rally": "/home/fidika/.cozy/outputs/h3-action-quality-20261007/matrix-bf16-rally-warm/4972-video.mp4"
         },
-        {
-          "label": "sparring",
-          "run": 4954,
-          "execution_s": 145.699,
-          "wall_s": 383.117,
-          "degree": 4,
-          "phase_s": {
-            "prepare": 0.000592,
-            "loading weights": 1.5494169999999998,
-            "condition_text": 2.8910120000000004,
-            "denoise": 123.79996799999999,
-            "decode_audio": 0.15595699999999998,
-            "decode_video": 16.124187,
-            "check_output": 0.236512
-          },
-          "gpus": [
-            {
-              "pid": 12996,
-              "impl": "sageattention:sageattn_qk_int8_pv_fp8_cuda(per_warp, fp32+fp16, smooth_k),sdpa:flash,sol-attn:cute_sm120",
-              "sol": {
-                "sparse": 192,
-                "dense_step": 192,
-                "dense_path": 32,
-                "dense_prefix": 192
-              }
-            },
-            {
-              "pid": 13001,
-              "impl": "sageattention:sageattn_qk_int8_pv_fp8_cuda(per_warp, fp32+fp16, smooth_k),sol-attn:cute_sm120",
-              "sol": {
-                "sparse": 192,
-                "dense_step": 192,
-                "dense_path": 32,
-                "dense_prefix": 192
-              }
-            },
-            {
-              "pid": 13003,
-              "impl": "sageattention:sageattn_qk_int8_pv_fp8_cuda(per_warp, fp32+fp16, smooth_k),sol-attn:cute_sm120",
-              "sol": {
-                "sparse": 192,
-                "dense_step": 192,
-                "dense_path": 32,
-                "dense_prefix": 192
-              }
-            },
-            {
-              "pid": 13005,
-              "impl": "sageattention:sageattn_qk_int8_pv_fp8_cuda(per_warp, fp32+fp16, smooth_k),sol-attn:cute_sm120",
-              "sol": {
-                "sparse": 192,
-                "dense_step": 192,
-                "dense_path": 32,
-                "dense_prefix": 192
-              }
-            }
-          ],
-          "output": [
-            {
-              "id": "4954/video",
-              "type": "video",
-              "name": "video",
-              "media_type": "video/mp4",
-              "status": "completed",
-              "rev": 1,
-              "length": 21907857,
-              "sha256": "sha256:7d325d0c567bf93900f4ff4d1285fac0c3a36f4045bdd4a6710291e9bfb11798",
-              "path": "/home/fidika/.cozy/outputs/h3-action-quality-20261007/bf16-sparring/4954-video.mp4"
-            }
-          ]
+        "int8": {
+          "sparring": "/home/fidika/.cozy/outputs/h3-action-quality-20261007/matrix-int8-sparring/4974-video.mp4",
+          "rally": "/home/fidika/.cozy/outputs/h3-action-quality-20261007/matrix-int8-rally/4975-video.mp4"
         },
-        {
-          "label": "rally",
-          "run": 4955,
-          "execution_s": 144.632,
-          "wall_s": 467.147,
-          "degree": 4,
-          "phase_s": {
-            "prepare": 0.0006590000000000001,
-            "loading weights": 0.805372,
-            "condition_text": 13.276948,
-            "denoise": 112.672838,
-            "decode_audio": 0.15528999999999998,
-            "decode_video": 15.925878,
-            "check_output": 0.26254
-          },
-          "gpus": [
-            {
-              "pid": 12996,
-              "impl": "sageattention:sageattn_qk_int8_pv_fp8_cuda(per_warp, fp32+fp16, smooth_k),sdpa:flash,sol-attn:cute_sm120",
-              "sol": {
-                "sparse": 192,
-                "dense_step": 192,
-                "dense_path": 32,
-                "dense_prefix": 192
-              }
-            },
-            {
-              "pid": 13001,
-              "impl": "sageattention:sageattn_qk_int8_pv_fp8_cuda(per_warp, fp32+fp16, smooth_k),sol-attn:cute_sm120",
-              "sol": {
-                "sparse": 192,
-                "dense_step": 192,
-                "dense_path": 32,
-                "dense_prefix": 192
-              }
-            },
-            {
-              "pid": 13003,
-              "impl": "sageattention:sageattn_qk_int8_pv_fp8_cuda(per_warp, fp32+fp16, smooth_k),sol-attn:cute_sm120",
-              "sol": {
-                "sparse": 192,
-                "dense_step": 192,
-                "dense_path": 32,
-                "dense_prefix": 192
-              }
-            },
-            {
-              "pid": 13005,
-              "impl": "sageattention:sageattn_qk_int8_pv_fp8_cuda(per_warp, fp32+fp16, smooth_k),sol-attn:cute_sm120",
-              "sol": {
-                "sparse": 192,
-                "dense_step": 192,
-                "dense_path": 32,
-                "dense_prefix": 192
-              }
-            }
-          ],
-          "output": [
-            {
-              "id": "4955/video",
-              "type": "video",
-              "name": "video",
-              "media_type": "video/mp4",
-              "status": "completed",
-              "rev": 1,
-              "length": 20493065,
-              "sha256": "sha256:f1e79d98f8e5f94dd79d12160d98fb70b6c2657233daf584339a9f9f08c3a476",
-              "path": "/home/fidika/.cozy/outputs/h3-action-quality-20261007/bf16-rally/4955-video.mp4"
-            }
-          ]
+        "fp8": {
+          "sparring": "/home/fidika/.cozy/outputs/h3-action-quality-20261007/matrix-fp8-sparring/4977-video.mp4",
+          "rally": "/home/fidika/.cozy/outputs/h3-action-quality-20261007/matrix-fp8-rally/4978-video.mp4"
         }
-      ],
-      "warm_mean_execution_s": 145.1655,
-      "warmup_note": "Fresh native service executors; first run excluded from warm mean",
-      "no_model_override": true,
-      "full_media_qa": "native-bf16-*-media.json",
-      "timing_boundary": "Server execution; queueing, preparation and CLI output transfer excluded"
-    },
-    "baseline_comparison": {
-      "created_utc": "2026-10-08T05:53:49.428666+00:00",
-      "hardware": "same4xRTX5090,420Weach,SYS topology",
-      "scene_seeds": {
-        "sparring": 581204,
-        "rally": 581205
       },
-      "native_warm_s": [
-        145.699,
-        144.632
-      ],
-      "native_warm_mean_s": 145.1655,
-      "comfy_warm_s": [
-        179.1800000667572,
-        168.143000125885
-      ],
-      "comfy_warm_mean_s": 173.6615000963211,
-      "native_less_time_percent": 16.408933517512992,
-      "native_throughput_ratio": 1.1963000857388366,
-      "schedule": "TurboPDD8,4dense4sparse,protectedprefix+first2blocks dense",
-      "precision": "Cozy BF16Sol withSagedense;Comfy KitchenINT8Sol/Kitchendense. Native three-mode sparse comparison pending.",
       "limits": [
-        "FP8 storage does not imply fully accelerated FP8 compute: QKV dequantizes to BF16 in MultiStream; 50 fc2 exceptions use BF16; output projection/fc1 fall back on three GPU ranks because of the independently reproduced multi-device PyTorch/cuBLAS FP8 failure. No fastest-possible or precision-matched ComfyUI claim.",
-        "Same retained latent comparison: decoded RGB PSNR 43.289 dB, mean absolute difference 0.973/255, 112/362 exact frames, identical decoded PCM. This compares encoded outputs, not raw float tensors; split FP16 decode is not bitwise equivalent.",
-        "Same prompt and seed do not guarantee same cross-engine noise packing or arithmetic. No general quality equivalence claimed."
+        "Two warm scenes per mode; not a universal speed or quality result.",
+        "FP8/F16 applies to exact QK/PV tiles; routing and approximate tail remain BF16/F32,online state FP32.",
+        "Comfy uses different arithmetic and can pack same-seed noise differently.",
+        "Measured RGB/PCM drift is not perceptual quality or correctness."
       ],
-      "native_videos": {
-        "first": "/home/fidika/.cozy/outputs/h3-action-quality-20261007/bf16-first/4953-video.mp4",
-        "sparring": "/home/fidika/.cozy/outputs/h3-action-quality-20261007/bf16-sparring/4954-video.mp4",
-        "rally": "/home/fidika/.cozy/outputs/h3-action-quality-20261007/bf16-rally/4955-video.mp4"
+      "rental": "Provider absence confirmed through cozy rental end-external; all artifacts retained locally"
+    },
+    "native_modes": {
+      "bf16": {
+        "backend": "fl2va_dit=sol-attn",
+        "warm_mean_execution_s": 148.04149999999998,
+        "runs": [
+          {
+            "scene": "rally",
+            "run": 4969,
+            "execution_s": 225.373,
+            "degree": 4,
+            "phase_s": {
+              "prepare": 0.0016510000000000001,
+              "loading weights": 3.8908620000000003,
+              "condition_text": 4.270663,
+              "denoise": 168.68223600000002,
+              "decode_audio": 0.45070800000000005,
+              "decode_video": 15.72809,
+              "check_output": 0.223155
+            },
+            "output": [
+              {
+                "id": "4969/video",
+                "type": "video",
+                "name": "video",
+                "media_type": "video/mp4",
+                "status": "completed",
+                "rev": 1,
+                "length": 20493065,
+                "sha256": "sha256:f1e79d98f8e5f94dd79d12160d98fb70b6c2657233daf584339a9f9f08c3a476",
+                "path": "/home/fidika/.cozy/outputs/h3-action-quality-20261007/matrix-bf16-rally/4969-video.mp4"
+              }
+            ]
+          },
+          {
+            "scene": "first",
+            "run": 4970,
+            "execution_s": 146.341,
+            "degree": 4,
+            "phase_s": {
+              "prepare": 0.0006450000000000001,
+              "loading weights": 1.6014929999999998,
+              "condition_text": 3.009584,
+              "denoise": 124.29943700000001,
+              "decode_audio": 0.158964,
+              "decode_video": 15.904716,
+              "check_output": 0.228265
+            },
+            "output": [
+              {
+                "id": "4970/video",
+                "type": "video",
+                "name": "video",
+                "media_type": "video/mp4",
+                "status": "completed",
+                "rev": 1,
+                "length": 23658185,
+                "sha256": "sha256:081238abf87dc48517b2a8bab8973a4ea6b706b18108acbc674815ec3890b9f5",
+                "path": "/home/fidika/.cozy/outputs/h3-action-quality-20261007/matrix-bf16-first/4970-video.mp4"
+              }
+            ]
+          },
+          {
+            "scene": "sparring",
+            "run": 4971,
+            "execution_s": 153.527,
+            "degree": 4,
+            "phase_s": {
+              "prepare": 0.000646,
+              "loading weights": 0.881549,
+              "condition_text": 11.939390999999999,
+              "denoise": 122.587539,
+              "decode_audio": 0.136543,
+              "decode_video": 15.733799999999999,
+              "check_output": 0.221529
+            },
+            "output": [
+              {
+                "id": "4971/video",
+                "type": "video",
+                "name": "video",
+                "media_type": "video/mp4",
+                "status": "completed",
+                "rev": 1,
+                "length": 21907857,
+                "sha256": "sha256:7d325d0c567bf93900f4ff4d1285fac0c3a36f4045bdd4a6710291e9bfb11798",
+                "path": "/home/fidika/.cozy/outputs/h3-action-quality-20261007/matrix-bf16-sparring/4971-video.mp4"
+              }
+            ]
+          },
+          {
+            "scene": "rally-warm",
+            "run": 4972,
+            "execution_s": 142.556,
+            "degree": 4,
+            "phase_s": {
+              "prepare": 0.0006580000000000001,
+              "loading weights": 0.8744740000000001,
+              "condition_text": 0.94772,
+              "denoise": 122.89701600000001,
+              "decode_audio": 0.159243,
+              "decode_video": 15.880929,
+              "check_output": 0.193378
+            },
+            "output": [
+              {
+                "id": "4972/video",
+                "type": "video",
+                "name": "video",
+                "media_type": "video/mp4",
+                "status": "completed",
+                "rev": 1,
+                "length": 20493065,
+                "sha256": "sha256:f1e79d98f8e5f94dd79d12160d98fb70b6c2657233daf584339a9f9f08c3a476",
+                "path": "/home/fidika/.cozy/outputs/h3-action-quality-20261007/matrix-bf16-rally-warm/4972-video.mp4"
+              }
+            ]
+          }
+        ]
       },
-      "comfy_videos": {
-        "sparring": "/home/fidika/cozy_v2/outputs/h3-action-quality-20261007/comfy-action-optimized-warm-1.mp4",
-        "rally": "/home/fidika/cozy_v2/outputs/h3-action-quality-20261007/comfy-action-optimized-warm-2.mp4"
+      "int8": {
+        "backend": "fl2va_dit=kitchen-sol-sage",
+        "warm_mean_execution_s": 135.6515,
+        "runs": [
+          {
+            "scene": "first",
+            "run": 4973,
+            "execution_s": 142.024,
+            "degree": 4,
+            "phase_s": {
+              "prepare": 0.000598,
+              "loading weights": 0.887079,
+              "condition_text": 0.942567,
+              "denoise": 119.327623,
+              "decode_audio": 0.15842799999999999,
+              "decode_video": 15.994279,
+              "check_output": 0.223769
+            },
+            "output": [
+              {
+                "id": "4973/video",
+                "type": "video",
+                "name": "video",
+                "media_type": "video/mp4",
+                "status": "completed",
+                "rev": 1,
+                "length": 23750462,
+                "sha256": "sha256:c1abadb16d8194dd4f536d12555f627a1c2ff9db437afdcb2f7c6391556eccdb",
+                "path": "/home/fidika/.cozy/outputs/h3-action-quality-20261007/matrix-int8-first/4973-video.mp4"
+              }
+            ]
+          },
+          {
+            "scene": "sparring",
+            "run": 4974,
+            "execution_s": 142.621,
+            "degree": 4,
+            "phase_s": {
+              "prepare": 0.000618,
+              "loading weights": 0.8786269999999999,
+              "condition_text": 0.946311,
+              "denoise": 122.817489,
+              "decode_audio": 0.136421,
+              "decode_video": 15.973279,
+              "check_output": 0.23389400000000002
+            },
+            "output": [
+              {
+                "id": "4974/video",
+                "type": "video",
+                "name": "video",
+                "media_type": "video/mp4",
+                "status": "completed",
+                "rev": 1,
+                "length": 21602248,
+                "sha256": "sha256:6103045307f6827865a4c7e0a5c12bb01d35e626bda58d4c8b4e3662c4ba3b20",
+                "path": "/home/fidika/.cozy/outputs/h3-action-quality-20261007/matrix-int8-sparring/4974-video.mp4"
+              }
+            ]
+          },
+          {
+            "scene": "rally",
+            "run": 4975,
+            "execution_s": 128.682,
+            "degree": 4,
+            "phase_s": {
+              "prepare": 0.000628,
+              "loading weights": 0.899447,
+              "condition_text": 0.9353279999999999,
+              "denoise": 108.93909,
+              "decode_audio": 0.15514699999999998,
+              "decode_video": 15.655947,
+              "check_output": 0.165429
+            },
+            "output": [
+              {
+                "id": "4975/video",
+                "type": "video",
+                "name": "video",
+                "media_type": "video/mp4",
+                "status": "completed",
+                "rev": 1,
+                "length": 20582590,
+                "sha256": "sha256:5edb1fbcf4a4d54d0a1b4a4f787f829b24b4bdd7b610ff3b197da6cf64ad6ae8",
+                "path": "/home/fidika/.cozy/outputs/h3-action-quality-20261007/matrix-int8-rally/4975-video.mp4"
+              }
+            ]
+          }
+        ]
+      },
+      "fp8": {
+        "backend": "fl2va_dit=sol-fp8-fp16",
+        "warm_mean_execution_s": 130.92849999999999,
+        "runs": [
+          {
+            "scene": "first",
+            "run": 4976,
+            "execution_s": 132.805,
+            "degree": 4,
+            "phase_s": {
+              "prepare": 0.0005989999999999999,
+              "loading weights": 0.860186,
+              "condition_text": 0.944061,
+              "denoise": 112.529883,
+              "decode_audio": 0.136576,
+              "decode_video": 15.972588,
+              "check_output": 0.23930099999999999
+            },
+            "output": [
+              {
+                "id": "4976/video",
+                "type": "video",
+                "name": "video",
+                "media_type": "video/mp4",
+                "status": "completed",
+                "rev": 1,
+                "length": 25919458,
+                "sha256": "sha256:b435da4770debff0ecf9bf046a9c3b4fe5654e333131a0db35445fd41fcd244f",
+                "path": "/home/fidika/.cozy/outputs/h3-action-quality-20261007/matrix-fp8-first/4976-video.mp4"
+              }
+            ]
+          },
+          {
+            "scene": "sparring",
+            "run": 4977,
+            "execution_s": 130.841,
+            "degree": 4,
+            "phase_s": {
+              "prepare": 0.0007199999999999999,
+              "loading weights": 0.856696,
+              "condition_text": 0.9368500000000001,
+              "denoise": 110.63733500000001,
+              "decode_audio": 0.161092,
+              "decode_video": 15.944698,
+              "check_output": 0.187345
+            },
+            "output": [
+              {
+                "id": "4977/video",
+                "type": "video",
+                "name": "video",
+                "media_type": "video/mp4",
+                "status": "completed",
+                "rev": 1,
+                "length": 24533780,
+                "sha256": "sha256:541117d03fb553a4b3531815225b1f4b89b7f535d196a4e42d085560be782d26",
+                "path": "/home/fidika/.cozy/outputs/h3-action-quality-20261007/matrix-fp8-sparring/4977-video.mp4"
+              }
+            ]
+          },
+          {
+            "scene": "rally",
+            "run": 4978,
+            "execution_s": 131.016,
+            "degree": 4,
+            "phase_s": {
+              "prepare": 0.0008990000000000001,
+              "loading weights": 0.860288,
+              "condition_text": 0.94957,
+              "denoise": 111.015276,
+              "decode_audio": 0.158799,
+              "decode_video": 15.821166999999999,
+              "check_output": 0.17153200000000002
+            },
+            "output": [
+              {
+                "id": "4978/video",
+                "type": "video",
+                "name": "video",
+                "media_type": "video/mp4",
+                "status": "completed",
+                "rev": 1,
+                "length": 21326941,
+                "sha256": "sha256:34cd65c3ceeb1b8f9952ff37d9822abd9b05ae514b7ed8c0d278521fa9780f79",
+                "path": "/home/fidika/.cozy/outputs/h3-action-quality-20261007/matrix-fp8-rally/4978-video.mp4"
+              }
+            ]
+          }
+        ]
       }
+    },
+    "preparation": "All10 matrix runs shared one actual generation/preparation and the same4executorPIDs;BF16 outputs byte-identical to pristine controls.",
+    "cold_order": "Concurrent initial BF16 descriptions raced after new SDK preparation;rally4969 was first;only warm4971/4972 enter BF16mean.",
+    "no_conditioning_output_cache": "h3-text-conditioning-cache-audit.json",
+    "experimental_pr": "https://github.com/cozy-creator/cozy-runtime/pull/1230",
+    "quality_findings": {
+      "visual_finding": "At16 matched frame samples per clip, both candidates closely track BF16 in overall pose/clothing/camera/car trajectories. No obvious variant-specific gross collapse was observed. Fine anatomy/contact and continuous temporal quality remain unverified.",
+      "numerical_finding": "FP8 has slightly more decoded RGB drift than INT8 in both tested scenes. Audio drift ordering is mixed. These are differences from BF16, not quality scores or ground-truth errors.",
+      "audio_finding": "All clips contain valid finite audio and decodedPCM is preserved/comparable. Sparring is very quiet on average in all three modes (about-42dBFS RMS); subjective listening was not performed.",
+      "limits": "Two scenes and16 sampled frames per clip are not a broad perceptual qualification. H.264/AAC compression is included in differences. No spatial registration, temporal shifting, frame dropping or resampling was used. No quality-equivalence claim; retain BF16 and keep experimental precision opt-in."
     }
-  }
+  },
+  "comfy_vendor_library_correction": {
+    "issue": "NVIDIA CUB-9487: FP8 launch failure on multi-device Blackwell GeForce",
+    "old": "cuBLAS13.1.1.3,CUDA Toolkit13.0Update3",
+    "fixed": "cuBLAS13.2.0.9,CUDA Toolkit13.1",
+    "probe": "same32exact-shape cases:old24failures,fixed0failures;onlyoverlaylibrarypaths mapped; originalenvironment preserved",
+    "full_action_comparison": "completed;3fullAVpasses,zeroFP8fallbacks",
+    "source": "https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html#cublas-release-13-1",
+    "warm_execution_s": [
+      184.584,
+      183.259
+    ],
+    "warm_mean_execution_s": 183.9215,
+    "interpretation": "Removing CUB-9487 failures did not improve observed end-to-end time; retain both affected and fixed-library cohorts.",
+    "latest_version_final_check": {
+      "html_url": "https://github.com/Comfy-Org/ComfyUI/releases/tag/v0.39.0",
+      "published_at": "2026-10-05T22:49:43Z",
+      "tag_name": "v0.39.0"
+    }
+  },
+  "remaining_limits": [
+    "No8GPUvideo run;source and8rankCPU support evidence only.",
+    "Fused QKV producer work is source/design analysis,not a measured implementation.",
+    "Opt-in sparse modes are not promoted as a new default or public release.",
+    "Actual cgroup-v1 provider replay not repeated after patch;focused and realv2tests plusliveinstallation passed."
+  ]
 }
