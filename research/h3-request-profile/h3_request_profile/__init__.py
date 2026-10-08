@@ -24,6 +24,14 @@ from .instrument import profile_request
 app = App()
 
 
+class RegularInput(StandardClipInput, kw_only=True):
+    profile_detail: bool = False
+
+
+class TurboInput(ClipInput, kw_only=True):
+    profile_detail: bool = False
+
+
 class ProfileResult(msgspec.Struct):
     render: H3VideoOutput
     trace: Annotated[FileAsset, AssetBound(media_types=("application/gzip",), max_bytes=256 << 20)]
@@ -42,7 +50,7 @@ def saved(result: tuple[Any, bytes, bytes], out: Outputs) -> ProfileResult:
 @app.entrypoint(defaults={"model": _DEFAULT_MODEL_LADDER})
 def regular(
     ctx: Context,
-    payload: StandardClipInput,
+    payload: RegularInput,
     assets: KeyframeAssets,
     model: H3Model,
     out: Outputs,
@@ -51,7 +59,13 @@ def regular(
     if payload.duration_s != 15 or payload.steps != 30:
         raise ValueError("This diagnostic retains the full15-second regular30 request")
     return saved(
-        profile_request(model, 10, lambda: fl2va(ctx, payload, assets, model, out, tel)), out
+        profile_request(
+            model,
+            10,
+            lambda: fl2va(ctx, payload, assets, model, out, tel),
+            detailed=payload.profile_detail,
+        ),
+        out,
     )
 
 
@@ -60,7 +74,7 @@ def regular(
 )
 def turbo(
     ctx: Context,
-    payload: ClipInput,
+    payload: TurboInput,
     assets: KeyframeAssets,
     base_model: H3TurboBase,
     turbo_lora: H3TurboLoRA,
@@ -74,6 +88,7 @@ def turbo(
             base_model,
             4,
             lambda: fl2va_turbo(ctx, payload, assets, base_model, turbo_lora, out, tel),
+            detailed=payload.profile_detail,
         ),
         out,
     )

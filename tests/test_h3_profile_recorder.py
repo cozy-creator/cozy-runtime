@@ -33,7 +33,8 @@ class Transformer(torch.nn.Module):
         return self.block.to_q(value).relu()
 
 
-def test_bounded_real_cpu_trace_keeps_request_outputs_and_removes_hooks():
+@pytest.mark.parametrize("detailed", [False, True])
+def test_bounded_real_cpu_trace_keeps_request_outputs_and_removes_hooks(detailed):
     module, model = recorder(), Transformer()
     value = torch.ones(2, 8)
 
@@ -46,10 +47,11 @@ def test_bounded_real_cpu_trace_keeps_request_outputs_and_removes_hooks():
     with torch.no_grad():
         expected = render()
         actual, trace, summary = module.record_request(
-            model, 4, render, lambda: {}, [torch.profiler.ProfilerActivity.CPU]
+            model, 4, render, lambda: {}, [torch.profiler.ProfilerActivity.CPU], detailed=detailed
         )
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     facts = json.loads(summary)
+    assert facts["record_shapes_and_memory"] is detailed
     assert len(facts["steps"]) == 8
     assert facts["profiled_step_indices"] == [3, 4]
     assert all(row["plane_delta"] == {} for row in facts["steps"])  # no invented GPU facts

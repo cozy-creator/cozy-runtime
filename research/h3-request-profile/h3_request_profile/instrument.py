@@ -59,7 +59,7 @@ def category(name: str) -> str:
 
 
 def profile_request(
-    model: Any, dense_steps: int, render: Callable[[], Any]
+    model: Any, dense_steps: int, render: Callable[[], Any], *, detailed: bool = False
 ) -> tuple[Any, bytes, bytes]:
     import torch
     from torch.profiler import ProfilerActivity
@@ -75,7 +75,12 @@ def profile_request(
         return cast(dict[str, Any], msgspec.to_builtins(residency.weights.facts()))
 
     return record_request(
-        transformer, dense_steps, render, facts, [ProfilerActivity.CPU, ProfilerActivity.CUDA]
+        transformer,
+        dense_steps,
+        render,
+        facts,
+        [ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        detailed=detailed,
     )
 
 
@@ -85,6 +90,8 @@ def record_request(
     render: Callable[[], Any],
     facts: Callable[[], dict[str, Any]],
     activities: list[Any],
+    *,
+    detailed: bool = False,
 ) -> tuple[Any, bytes, bytes]:
     """The same bounded recorder can be exercised with real CPU modules off-rental."""
     from torch.profiler import profile, record_function, schedule
@@ -103,7 +110,7 @@ def record_request(
             if path.stat().st_size > 512 << 20:
                 raise ValueError("Two-step profiler trace exceeds512MiB diagnostic bound")
             traces.append(gzip.compress(path.read_bytes(), compresslevel=3))
-        for event in prof.key_averages(group_by_input_shape=True):
+        for event in prof.key_averages(group_by_input_shape=detailed):
             averages.append(
                 {
                     "name": str(event.key),
@@ -123,8 +130,8 @@ def record_request(
         activities=activities,
         schedule=schedule(wait=dense_steps - 2, warmup=1, active=2, repeat=1),
         on_trace_ready=finished_trace,
-        record_shapes=True,
-        profile_memory=True,
+        record_shapes=detailed,
+        profile_memory=detailed,
         with_stack=False,
     ) as prof:
 
@@ -200,6 +207,7 @@ def record_request(
         raise ValueError(f"Expected one bounded two-step trace, captured{len(traces)}")
     summary = {
         "diagnostic_only": True,
+        "record_shapes_and_memory": detailed,
         "not_benchmark_time": True,
         "profiled_step_indices": [dense_steps - 1, dense_steps],
         "steps": steps,
@@ -212,7 +220,9 @@ def record_request(
             "and plane deltas distinguish transfers/eviction from compute. CPU enqueue "
             "walls are not GPU execution times; raw trace preserves stream overlap. "
             "Plane counters are asynchronous boundary snapshots; inspect cumulative "
-            "request deltas and correlated CUDA transfers before assigning a step cost."
+            "request deltas and correlated CUDA transfers before assigning a step cost. "
+            "Detailed shape/memory mode retains tensor references and can perturb paging; "
+            "it is off by default and must not be treated as an unperturbed baseline."
         ),
     }
     return result, traces[0], json.dumps(summary, separators=(",", ":"), allow_nan=False).encode()
