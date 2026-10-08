@@ -1,0 +1,118 @@
+{
+  "status": "Opt-in prototype; H3 BF16 Sol default preserved. No public release or local attention promotion.",
+  "tested_hardware": "4x RTX 5090, same retained four executor processes across all modes",
+  "request": "Two matched warm action scenes, identical per-scene input/seed; 15-second request,1344x768,362 frames at24fps,Turbo8 with4 dense and4 sparse steps",
+  "arithmetic": {
+    "sol-attn": "BF16/F32 Sol reference",
+    "kitchen-sol-sage": "Kitchen INT8 Q/K/V and probability carriers with INT32 MMA accumulation",
+    "sol-fp8-fp16": "FP8 exact QK/PV with FP16 tile accumulation; original BF16/F32 routing and approximate tail; FP32 outer softmax/output state",
+    "dense_reference": "All modes retain Sage dense steps/refiner/protected rows; same sparse eligibility and current-call statistics. No chunked producer or prior-call statistics reuse."
+  },
+  "warm_results": [
+    {
+      "mode": "bf16",
+      "runs": [
+        4972,
+        4971
+      ],
+      "mean_execution_s": 148.0415,
+      "reduction_from_bf16_percent": 0.0
+    },
+    {
+      "mode": "int8",
+      "runs": [
+        4975,
+        4974
+      ],
+      "mean_execution_s": 135.6515,
+      "reduction_from_bf16_percent": 8.369274831719494
+    },
+    {
+      "mode": "fp8",
+      "runs": [
+        4978,
+        4977
+      ],
+      "mean_execution_s": 130.9285,
+      "reduction_from_bf16_percent": 11.559596464504885
+    }
+  ],
+  "interpretation": "Measured backend comparison in this four-GPU Turbo workload, not a universal hardware throughput ratio or an isolated causal share for arithmetic precision. Two warm scenes per mode; no statistical population claim.",
+  "media": {
+    "all_six_warm_full_av_decode_pass": true,
+    "all_dimensions_frames_verified": true,
+    "all_three_bf16_matrix_mp4_hashes_match_pristine_baseline": true,
+    "visual_quality": "Matched contact-sheet review and optional RGB/PCM drift metrics being finalized; no quality-equivalence claim.",
+    "subjective_audio": "Not performed; original audio and full decoding evidence retained."
+  },
+  "admission": {
+    "run": 4968,
+    "cases": 6,
+    "all_finite": true,
+    "all_literal_fp8_f16_mma_assertions": true,
+    "max_relative_l2": 0.006047517526894808,
+    "max_absolute_error": 0.01025390625,
+    "kitchen_version": "0.2.37"
+  },
+  "actual_cohort": {
+    "package": "paul/minimax-h3",
+    "release": "1.26.2",
+    "generation": "8d2c75fe6707d6682fd8d7d29c2ad370",
+    "dependencies": {
+      "cozy-runtime": "0.19.0+dev.sparsemath.93fcc636.gpujobs.f80d7fcb",
+      "tensorfs": "0.4.0",
+      "torch": "2.14.0",
+      "triton": "3.8.0",
+      "diffusers": "0.41.0.dev0"
+    },
+    "models": [
+      {
+        "model_class": "H3TurboBase",
+        "binding_path": "fl2va_turbo.models.base_model",
+        "model": "paul/minimax-h3@1.0.0-rc.2",
+        "snapshot": "sha256:302eec1e11fd773f6b3cc29a7746f6e5e41ac26f1015ea47225b9392de525433",
+        "components": [
+          "audio_vae",
+          "fl2va_dit",
+          "ref2va_dit",
+          "text_encoder",
+          "video_vae"
+        ],
+        "selected_encoded_bytes": 99893949476
+      },
+      {
+        "model_class": "H3TurboLoRA",
+        "binding_path": "fl2va_turbo.models.turbo_lora",
+        "model": "paul/minimax-h3-turbo-lora@1.0.0-audit.1",
+        "snapshot": "sha256:9921c17df2db67e8350769c490249b43659603ad780a67fc713d847a2ff194b0",
+        "components": [
+          "fl2va_turbo",
+          "ref2va_turbo"
+        ],
+        "selected_encoded_bytes": 1596106752
+      }
+    ],
+    "same_preparation_and_input_per_scene": true,
+    "all_rank_policy_counts": {
+      "dense_step": 192,
+      "dense_path": 32,
+      "sparse": 192,
+      "dense_prefix": 192
+    }
+  },
+  "known_limits": [
+    "Generic Triton FP8 kernel is not a tuned CuTe implementation.",
+    "Kitchen adapter calls Sage directly; nested Sage is omitted from its implementation-string observer. Exact source, executed counters and dense_reference confessions verify the callback; no GPU profiling trace is claimed.",
+    "Triton3.8 CPU interpreter BF16 dot/FP8 rounding limitations were retained as failures, not disguised with wider tolerances; actualGPU admission passed.",
+    "Full decoding and pixel/signal similarity do not establish subjective quality equivalence."
+  ],
+  "evidence_root": "/home/fidika/cozy_v2/outputs/h3-action-quality-20261007",
+  "evidence_files": [
+    "final-provenance/summary.json",
+    "final-provenance/matrix-executions.json",
+    "fp8-admission-baseline-result.json",
+    "matrix-int8-dense-telemetry-audit.json",
+    "native-precision-quality/media-validation.json"
+  ],
+  "private_wheel_sha256": "71854681f973854575347f23a6cea507a386f09f0bc6b61aaaf50e8b512089a6"
+}
