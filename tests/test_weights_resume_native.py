@@ -63,6 +63,14 @@ def test_pending_and_adopted_results_replay_but_disposed_metadata_refuses(tmp_pa
     with pytest.raises(CapabilityError) as error:
         host.client.open_output("result", request)
     assert error.value.code == "weights_transaction_closed"
+    tensorfs.gc(store.root)
+    facts = json.loads(receipt.tensorfs_receipt)
+    with pytest.raises(tensorfs.errors.Refusal):
+        store.manifest("sha256:" + facts["manifest"]["sha256"])
+    with pytest.raises(CapabilityError) as adoption:
+        host.client.adopt_model(facts)
+    assert adoption.value.code == "weights_transaction_closed"
+    host.broker.close()
 
 
 def test_pending_receipt_without_native_root_is_not_reusable(tmp_path: Path) -> None:
@@ -79,6 +87,10 @@ def test_pending_receipt_without_native_root_is_not_reusable(tmp_path: Path) -> 
     with pytest.raises(CapabilityError) as error:
         host.client.open_output("result", request)
     assert error.value.code == "weights_receipt_unavailable"
+    with pytest.raises(CapabilityError) as adoption:
+        host.client.adopt_model(json.loads(receipt.tensorfs_receipt))
+    assert adoption.value.code == "weights_receipt_unavailable"
+    host.broker.close()
 
 
 def test_work_identity_ignores_attempt_authority_but_binds_numerical_inputs() -> None:

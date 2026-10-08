@@ -102,6 +102,22 @@ def native_exchange(root: Path) -> None:
         assert artifact.manifest.length == receipt.manifest.length
         assert recorded and all(reference == recorded[0] for reference in recorded)
 
+        extended = {**facts, "future_observation": {"compiler": "newer"}}
+        assert client.adopt_model(extended) == artifact
+        assert all(reference == facts for reference in recorded)
+        for field, value in (
+            ("transaction_id", "sha256:" + "fe" * 32),
+            ("manifest", {"sha256": "ff" * 32, "length": artifact.manifest.length}),
+        ):
+            with pytest.raises(CapabilityError) as changed_identity:
+                client.adopt_model({**facts, field: value})
+            assert changed_identity.value.code == "weights_receipt_mismatch"
+        with pytest.raises(CapabilityError) as malformed:
+            client.adopt_model(
+                {**facts, "manifest": {"sha256": receipt.manifest.sha256, "length": "8"}}
+            )
+        assert malformed.value.code == "weights_receipt_mismatch"
+
         with pytest.raises(CapabilityError) as changed:
             client.adopt_model({**facts, "declaration_digest": "sha256:" + "ff" * 32})
         assert changed.value.code == "weights_receipt_mismatch"
