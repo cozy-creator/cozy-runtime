@@ -20,7 +20,12 @@ from cozy_runtime.internal import attention_upstream as upstream
 torch = pytest.importorskip("torch")
 
 NONCAUSAL = [upstream.kitchen_int8, upstream.flashinfer_mixed]
-ADAPTERS = [*NONCAUSAL, upstream.sage3_fp4, upstream.sage3_fp4_global]
+ADAPTERS = [
+    *NONCAUSAL,
+    upstream.sage3_fp4,
+    upstream.sage3_fp4_global,
+    upstream.sage3_fp4_global_lowmem,
+]
 
 
 @pytest.mark.parametrize("adapter", NONCAUSAL)
@@ -189,13 +194,78 @@ def test_sage3_mean_choice_and_upstream_mutation_are_explicit(
     assert torch.equal(got, q + v)
 
 
-def test_sage3_global_mean_remains_an_explicit_shared_artifact_candidate() -> None:
-    candidate = attention.BY_NAME["sageattention3-fp4-global"]
+@pytest.mark.parametrize("name", ["sageattention3-fp4-global", "sageattention3-fp4-global-lowmem"])
+def test_sage3_global_mean_remains_an_explicit_shared_artifact_candidate(name: str) -> None:
+    candidate = attention.BY_NAME[name]
     assert candidate in attention.PINNABLE
     assert candidate not in attention.CANDIDATES
     assert candidate.artifact == attention.BY_NAME["sageattention3-fp4"].artifact
     assert candidate.local.head_local
     assert "global_head_mean" in candidate.local.impl(None)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("ql,kl", [(128, 128), (129, 257), (4097, 4097)])
+def test_sage3_owned_lifetimes_and_final_layout_contract(
+    monkeypatch: pytest.MonkeyPatch, dtype: Any, ql: int, kl: int
+) -> None:
+    """CPU delegation/lifetime proof, not a stand-in claim about CUDA arithmetic."""
+    import weakref
+
+    q = torch.randn(2, ql, 3, 128, dtype=dtype)
+    packed_kv = torch.randn(2, kl, 3, 2, 128, dtype=dtype)
+    k, v = packed_kv[:, :, :, 0], packed_kv[:, :, :, 1]
+    original = packed_kv.clone()
+    padded = ((ql + 127) // 128) * 128
+    expected = torch.randn(2, 3, padded, 128, dtype=dtype)
+    references: list[Any] = []
+    clone_ref = []
+    calls = []
+
+    def preprocess(qh: Any, kh: Any, vh: Any, **options: Any) -> Any:
+        assert options == {"per_block_mean": False}
+        assert kh.is_contiguous()
+        assert kh.untyped_storage().data_ptr() != k.untyped_storage().data_ptr()
+        clone_ref.append(weakref.ref(kh))
+        kh.sub_(kh.mean(dim=-2, keepdim=True))
+        owned = [qh.clone(), kh.clone(), vh.clone()]
+        references.extend(weakref.ref(value) for value in owned)
+        calls.append("preprocess")
+        return *owned, torch.zeros(1)
+
+    def quantizer(index: int) -> Callable[..., Any]:
+        def quantize(value: Any) -> Any:
+            assert all(reference() is None for reference in references[:index])
+            assert references[index]() is value
+            assert clone_ref[0]() is None
+            calls.append("quantize" + str(index))
+            return torch.zeros(1, dtype=torch.uint8), torch.ones(1)
+
+        return quantize
+
+    def attend(qc: Any, kc: Any, vc: Any, delta: Any, length: int, *options: Any) -> Any:
+        assert all(reference() is None for reference in references)
+        assert length == kl and options == (False, False, dtype == torch.bfloat16)
+        calls.append("attention")
+        return expected, None
+
+    api = SimpleNamespace(
+        preprocess_qkv=preprocess,
+        scale_and_quant_fp4=quantizer(0),
+        scale_and_quant_fp4_permute=quantizer(1),
+        scale_and_quant_fp4_transpose=quantizer(2),
+        blockscaled_fp4_attn=attend,
+    )
+    monkeypatch.setattr(upstream, "_cuda_inputs", lambda *_, **__: None)
+    monkeypatch.setattr(
+        upstream, "import_module", lambda name: api if name == "sageattn3.api" else None
+    )
+    result = upstream.sage3_fp4_global_lowmem(q, k, v)
+    assert calls == ["preprocess", "quantize0", "quantize1", "quantize2", "attention"]
+    assert torch.equal(packed_kv, original)
+    assert torch.equal(result, expected[:, :, :ql].transpose(1, 2))
+    assert result.is_contiguous() and result.shape == q.shape and result.dtype == dtype
+    assert result.flatten(2, 3).untyped_storage().data_ptr() == result.untyped_storage().data_ptr()
 
 
 def test_sage2_selects_upstreams_mode_by_the_querys_card(monkeypatch: pytest.MonkeyPatch) -> None:

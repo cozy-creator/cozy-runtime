@@ -1,0 +1,16 @@
+[build-system]
+requires = ["uv_build>=0.12.7,<0.13"]
+build-backend = "uv_build"
+
+[project]
+name = "h3-sage3-lifetimes"
+version = "0.0.1"
+requires-python = ">=3.12,<3.13"
+dependencies = ["cozy-runtime>=0.19,<0.20", "torch==2.14.0", "triton==3.8.0", "msgspec>=0.19", "diffusers @ git+https://github.com/huggingface/diffusers@578c9b2c6636ab2424a0e56186268b83623656b2"]
+
+[project.entry-points."cozy.application"]
+default = "h3_sage3_lifetimes:app"
+
+[tool.uv.build-backend]
+module-name = "h3_sage3_lifetimes"
+module-root = ""

@@ -195,8 +195,10 @@ def test_cleanup_drops_only_the_owned_upstream_rotary_cache(
     assert ("ours",) not in cache and ("theirs",) in cache
 
 
+@pytest.mark.parametrize("name", ["kitchen-sol-producer-fp4", *sorted(producer.FP4_LOWMEM)])
 def test_fp4_hybrid_resolves_both_real_artifact_recipes_before_becoming_ready(
     monkeypatch: pytest.MonkeyPatch,
+    name: str,
 ) -> None:
     """Dependency graph only; no compiled kernel or performance is simulated."""
     from cozy_runtime.internal.encoding import DeviceFacts
@@ -218,16 +220,15 @@ def test_fp4_hybrid_resolves_both_real_artifact_recipes_before_becoming_ready(
         ),
     )
     monkeypatch.setattr(attention, "_launch", lambda *args: None)
-    name = "kitchen-sol-producer-fp4"
     candidate = attention.BY_NAME[name]
     facts = DeviceFacts("cuda", "unavailable", 120, "", "", 0)
     assert attention._resolve(candidate, facts).name == name
-    assert compiled == [(name, "comfy-kitchen"), ("sageattention3-fp4-global", "sageattn3")]
-    assert candidate.local is producer.FP4_LOCAL
+    lowmem = name in producer.FP4_LOWMEM
+    dense = "sageattention3-fp4-global" + ("-lowmem" if lowmem else "")
+    assert compiled == [(name, "comfy-kitchen"), (dense, "sageattn3")]
+    assert candidate.local is (producer.FP4_LOWMEM_LOCAL if lowmem else producer.FP4_LOCAL)
     assert name in producer.REUSE and name in attention_sol.NAMES
-    assert attention_sol.dense_identity(name) == (
-        "sageattention3-fp4-global; sparse-prefix=kitchen-int8"
-    )
+    assert attention_sol.dense_identity(name) == (dense + "; sparse-prefix=kitchen-int8")
 
 
 def test_fp4_dense_callback_records_its_actual_global_mean_identity(
