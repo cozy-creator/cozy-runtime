@@ -29,6 +29,8 @@ NAMES = frozenset(
         "kitchen-sol-producer-fp4",
         "kitchen-sol-producer-fast-shared-qkv",
         "kitchen-sol-producer-fp4-shared-qkv",
+        "kitchen-sol-producer-fp4-lowmem",
+        "kitchen-sol-producer-fp4-lowmem-shared-qkv",
     }
 )
 REUSE = frozenset(
@@ -38,10 +40,19 @@ REUSE = frozenset(
         "kitchen-sol-producer-fp4",
         "kitchen-sol-producer-fast-shared-qkv",
         "kitchen-sol-producer-fp4-shared-qkv",
+        "kitchen-sol-producer-fp4-lowmem",
+        "kitchen-sol-producer-fp4-lowmem-shared-qkv",
     }
 )
 SHARED_QKV = frozenset(
-    {"kitchen-sol-producer-fast-shared-qkv", "kitchen-sol-producer-fp4-shared-qkv"}
+    {
+        "kitchen-sol-producer-fast-shared-qkv",
+        "kitchen-sol-producer-fp4-shared-qkv",
+        "kitchen-sol-producer-fp4-lowmem-shared-qkv",
+    }
+)
+FP4_LOWMEM = frozenset(
+    {"kitchen-sol-producer-fp4-lowmem", "kitchen-sol-producer-fp4-lowmem-shared-qkv"}
 )
 BACKENDS = {"_cozy_" + name.replace("-", "_"): name for name in NAMES}
 CHUNK = 4096
@@ -149,6 +160,32 @@ FP4_LOCAL = Local(
     lambda *_: "dense=sageattn3.nvfp4_global_head_mean; sparse=instance-producer",
     head_local=False,
 )
+
+
+def dense_fp4_lowmem(*, query: Any, key: Any, value: Any, scale: float | None) -> Any:
+    return attention_ulysses._call(
+        "_cozy_sage3_fp4_global_lowmem",
+        attention_upstream.SAGE3_GLOBAL_LOWMEM,
+        query,
+        key,
+        value,
+        Options(attn_mask=None, dropout_p=0.0, is_causal=False, scale=scale, enable_gqa=False),
+    )
+
+
+def materialized_fp4_lowmem(query: Any, key: Any, value: Any, **options: Any) -> Any:
+    return attention_sol._attention(
+        query, key, value, **options, sparse=_missing_processor, dense=dense_fp4_lowmem
+    )
+
+
+FP4_LOWMEM_LOCAL = Local(
+    materialized_fp4_lowmem,
+    lambda *_: (
+        "dense=sageattn3.nvfp4_global_head_mean(short_owned_lifetimes); sparse=instance-producer"
+    ),
+    head_local=False,
+)
 LOCALS = {
     "kitchen-sol-producer": LOCAL,
     "kitchen-sol-producer-reuse": LOCAL,
@@ -156,6 +193,7 @@ LOCALS = {
     "kitchen-sol-producer-fp4": FP4_LOCAL,
     "kitchen-sol-producer-fast-shared-qkv": FAST_LOCAL,
     "kitchen-sol-producer-fp4-shared-qkv": FP4_LOCAL,
+    **dict.fromkeys(FP4_LOWMEM, FP4_LOWMEM_LOCAL),
 }
 
 

@@ -327,6 +327,20 @@ PINNABLE: tuple[Candidate, ...] = (
         ),
     ),
     Candidate(
+        name="sageattention3-fp4-global-lowmem",
+        backend="_cozy_sage3_fp4_global_lowmem",
+        local=upstream.SAGE3_GLOBAL_LOWMEM,
+        min_sm=120,
+        max_sm=120,
+        sms=frozenset({120}),
+        dtypes=_HALF,
+        max_head_dim=128,
+        head_dims=frozenset({64, 128}),
+        artifact="sageattn3",
+        import_name="sageattn3",
+        why="Explicit global-mean FP4 wrapper with shorter owned lifetimes; GPU agreement pending.",
+    ),
+    Candidate(
         name="kitchen-sol",
         backend="_cozy_kitchen_sol_int8",
         local=attention_kitchen_sol.KITCHEN_SOL,
@@ -514,6 +528,8 @@ def _resolve(candidate: Candidate, device: DeviceFacts, wait: bool = True) -> Re
     if candidate.name == "sol-fp8-fp16-fp4-dense":
         _resolve(BY_NAME["sageattention3-fp4-global"], device, wait)
         _resolve(BY_NAME["sageattention"], device, wait)
+    elif candidate.name in attention_producer.FP4_LOWMEM:
+        _resolve(BY_NAME["sageattention3-fp4-global-lowmem"], device, wait)
     elif candidate.name in {"kitchen-sol-producer-fp4", "kitchen-sol-producer-fp4-shared-qkv"}:
         _resolve(BY_NAME["sageattention3-fp4-global"], device, wait)
     elif (

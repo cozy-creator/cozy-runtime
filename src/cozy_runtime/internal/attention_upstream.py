@@ -505,12 +505,46 @@ def sage3_fp4_global(query: Any, key: Any, value: Any, **options: Any) -> Any:
     return _sage3_fp4(query, key, value, per_block_mean=False, **options)
 
 
+def sage3_fp4_global_lowmem(query: Any, key: Any, value: Any, **options: Any) -> Any:
+    """The same global-mean arithmetic with shorter owned-buffer lifetimes."""
+    return _sage3_fp4(
+        query, key, value, per_block_mean=False, release_intermediates=True, **options
+    )
+
+
+def _sage3_global_owned(q: Any, k: Any, v: Any, *, is_causal: bool) -> Any:
+    import torch
+
+    api = import_module("sageattn3.api")
+    ql, kl, is_bf16 = q.shape[2], k.shape[2], q.dtype == torch.bfloat16
+    # Keep upstream's preprocessing and its order exactly. Only K is mutated;
+    # its owned clone dies after preprocessing instead of after attention returns.
+    q, k, v, delta_s = api.preprocess_qkv(
+        q, k.clone(memory_format=torch.contiguous_format), v, per_block_mean=False
+    )
+    qlist = api.scale_and_quant_fp4(q)
+    del q
+    klist = api.scale_and_quant_fp4_permute(k)
+    del k
+    vlist = api.scale_and_quant_fp4_transpose(v)
+    del v
+    # These official quantizers and attention launch on PyTorch's current stream,
+    # so the allocator can recycle the owned inputs without a synchronization.
+    output = api.blockscaled_fp4_attn(qlist, klist, vlist, delta_s, kl, is_causal, False, is_bf16)[
+        0
+    ]
+    # Directly form Runtime's BTHD result. The public upstream API first copies
+    # the cropped HND tensor, which its caller then copies again to flatten H/D.
+    return output[:, :, :ql, :].transpose(1, 2).contiguous()
+
+
 def _sage3_fp4(
     query: Any,
     key: Any,
     value: Any,
     *,
     per_block_mean: bool,
+    release_intermediates: bool = False,
     attn_mask: Any = None,
     dropout_p: float = 0.0,
     is_causal: bool = False,
@@ -529,6 +563,10 @@ def _sage3_fp4(
     if scale is not None and not math.isclose(scale, query.shape[-1] ** -0.5, rel_tol=1e-6):
         raise ValueError("sageattention3-fp4 fixes the softmax scale at D^-1/2")
     q, k, v = (tensor.transpose(1, 2) for tensor in (query, key, value))
+    if release_intermediates:
+        if per_block_mean:
+            raise ValueError("owned Sage3 lifetimes require global Q mean")
+        return _output(_sage3_global_owned(q, k, v, is_causal=is_causal), query)
     output = import_module("sageattn3").sageattn3_blackwell(
         q,
         k.clone(memory_format=torch.contiguous_format),
@@ -565,4 +603,8 @@ FLASHINFER = Local(flashinfer_mixed, _named("cute_dsl_fmha_ragged_prefill jit, e
 SAGE3 = Local(sage3_fp4, _named("sageattn3.sageattn3_blackwell(nvfp4, per_block_mean)"))
 SAGE3_GLOBAL = Local(
     sage3_fp4_global, _named("sageattn3.sageattn3_blackwell(nvfp4, global_head_mean)")
+)
+SAGE3_GLOBAL_LOWMEM = Local(
+    sage3_fp4_global_lowmem,
+    _named("sageattn3.nvfp4_global_head_mean(short_owned_lifetimes, direct_bthd)"),
 )
