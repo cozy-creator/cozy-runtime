@@ -17,7 +17,7 @@ class Request(msgspec.Struct):
 
 
 class Result(msgspec.Struct):
-    report: Annotated[FileAsset, AssetBound(max_bytes=16 << 20)]
+    report: Annotated[FileAsset, AssetBound(max_bytes=16 << 20, media_types=("application/json",))]
 
 
 @app.job(accelerator=True)
@@ -41,8 +41,8 @@ class TraceRequest(msgspec.Struct):
 
 
 class TraceResult(msgspec.Struct):
-    trace: Annotated[FileAsset, AssetBound(max_bytes=16 << 20)]
-    report: Annotated[FileAsset, AssetBound(max_bytes=1 << 20)]
+    trace: Annotated[FileAsset, AssetBound(max_bytes=16 << 20, media_types=("application/json",))]
+    report: Annotated[FileAsset, AssetBound(max_bytes=1 << 20, media_types=("application/json",))]
 
 
 @app.job(accelerator=True)
