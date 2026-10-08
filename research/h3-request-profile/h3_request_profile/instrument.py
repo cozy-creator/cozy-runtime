@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import gzip
 import json
 import os
@@ -42,6 +43,27 @@ def host_range(label: str) -> dict[str, Any]:
 def close_range(row: dict[str, Any], ranges: list[dict[str, Any]]) -> None:
     row["end_unix_ns"] = time.time_ns()
     ranges.append(row)
+
+
+@contextmanager
+def observe_bakes(ranges: list[dict[str, Any]]) -> Any:
+    """Name the existing bake call without tensor hooks or retained tensor arguments."""
+    module = import_module("cozy_runtime.internal.lora_bake")
+    original = module.bake
+
+    @functools.wraps(original)
+    def observed(*args: Any, **kwargs: Any) -> Any:
+        row = host_range("h3.weights.lora_bake")
+        try:
+            return original(*args, **kwargs)
+        finally:
+            close_range(row, ranges)
+
+    module.bake = observed
+    try:
+        yield
+    finally:
+        module.bake = original
 
 
 class ObservedTelemetry:
@@ -366,7 +388,7 @@ def record_request(
     # Full request executes. Trace the last forced-dense and first sparse-eligible calls;
     # a dense-only attention pin can still execute dense kernels in the latter phase.
     # are recorded; exports/teardown and all profiler overhead are diagnostic time.
-    with profile(
+    with observe_bakes(ranges), profile(
         activities=activities,
         schedule=None
         if full_request_trace
@@ -457,6 +479,7 @@ def record_request(
         "diagnostic_only": True,
         "software": software_versions(),
         "model_census": census,
+        "bake_ranges": "Original lora_bake.bake calls; tensor-free wrapper restored on exit",
         "record_shapes_and_memory": detailed,
         "not_benchmark_time": True,
         "full_request_trace": full_request_trace,

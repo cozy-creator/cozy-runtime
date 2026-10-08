@@ -342,3 +342,32 @@ def test_model_census_records_actual_classes_and_fusion_report_without_hooks():
     assert facts["fusion_report"] == model._cozy_fusion_report
     assert not model._forward_pre_hooks and not model._forward_hooks
     assert not model.block.to_q._forward_pre_hooks and not model.block.to_q._forward_hooks
+
+
+def test_bake_observer_preserves_arguments_result_failure_and_restores_original(monkeypatch):
+    from cozy_runtime.internal import lora_bake
+
+    module, ranges = recorder(), []
+    argument, value = object(), object()
+    calls = []
+
+    def original(*args, **kwargs):
+        calls.append((args, kwargs))
+        if kwargs.get("fail"):
+            raise ValueError("bake failed")
+        return value
+
+    monkeypatch.setattr(lora_bake, "bake", original)
+    with module.observe_bakes(ranges):
+        assert lora_bake.bake(argument, mode="unchanged") is value
+        with pytest.raises(ValueError, match="bake failed"):
+            lora_bake.bake(argument, fail=True)
+    assert lora_bake.bake is original
+    assert calls == [((argument,), {"mode": "unchanged"}), ((argument,), {"fail": True})]
+    assert len(ranges) == 2
+    assert all(row["label"] == "h3.weights.lora_bake" for row in ranges)
+    assert all(row["end_unix_ns"] >= row["start_unix_ns"] for row in ranges)
+    assert all(argument is not item for row in ranges for item in row.values())
+    with pytest.raises(ValueError, match="render failed"), module.observe_bakes(ranges):
+        raise ValueError("render failed")
+    assert lora_bake.bake is original
