@@ -6,13 +6,13 @@ Compare current ComfyUI and native candidates on the same rented RTX 5090, with 
 
 Evidence: `/home/fidika/cozy_v2/outputs/h3-single5090-optimization-20261008/`.
 
-Current status (2026-10-09): optimized warm Turbo completed in280.875seconds, below the prior Comfy target, but a same-host replacement control and updated regular30 result remain pending. Morlock (`pr-df6942e0bdbda053d874`, Vast.ai) was ended through Cozy CLI after CUDA initialization began failing in both fresh Comfy and native processes. Its completed evidence remains retained: RTX5090,575W,driver595.84,73.84GiB container RAM,$0.649167/hour including321GB disk.
+Current status (2026-10-09): optimized warm Turbo completed in 280.875 and 277.306 seconds across sparring and rally clips (mean 279.0905 seconds). The same-host Comfy controls are running; the updated regular 30-step result remains pending. Morlock (`pr-df6942e0bdbda053d874`, Vast.ai) was ended through Cozy CLI after CUDA initialization began failing in both fresh Comfy and native processes. Its completed evidence remains retained: RTX5090,575W,driver595.84,73.84GiB container RAM,$0.649167/hour including321GB disk.
 
 The replacement, Chibisuke (`pr-3fafabe2d3b1c634d3d9`, RunPod), was rented through the same CLI and configured Hub. It has an RTX5090 at600W, driver580.126.20,85.68GiB container RAM and321GB disk, at$1.234619/hour including storage. The old Comfy325.362-second result is a target, not a same-host control for Chibisuke. Local GPU inference is excluded.
 
 ## Completed measurements
 
-All rows below generate 362 frames at 1344×768 and 24 fps, plus stereo 32 kHz audio. Native times are reported handler execution, and Comfy times are server execution start through success; client transfer and observer reconnect delays are excluded. Setup and compilation are separate. These are individual completed requests, not replicated means.
+The first table is retained historical evidence from Morlock. All rows below generate 362 frames at 1344×768 and 24 fps, plus stereo 32 kHz audio. Native times are reported handler execution, and Comfy times are server execution start through success; client transfer and observer reconnect delays are excluded. Setup and compilation are separate. These are individual completed requests, not replicated means.
 
 | Mode | Implementation | Request | Execution | Denoise | Video decode |
 |---|---|---:|---:|---:|---:|
@@ -23,13 +23,23 @@ All rows below generate 362 frames at 1344×768 and 24 fps, plus stereo 32 kHz a
 | Turbo, 4 dense + 4 Sol | Cozy Sage3 global-mean FP4 dense + materialized FP8/F16 Sol | 4994, warm sparring | 357.682 s | 306.991 s | 40.616 s |
 | Regular, 10 dense + 20 Sol | Cozy Sage3 global-mean FP4 dense + chunked INT8 Sol producer | 4993, first sparring | **969.867 s** | 907.559 s | 40.755 s |
 
-The best completed Turbo request remains 8.198 seconds above Comfy, improved by 14.260 seconds from request4990. Its denoising gap is 21.391 seconds. Text conditioning was 5.772 seconds versus 2.305 seconds, while video decode differed by 3.838 seconds. Native video encoding overlaps streamed decode; Comfy reports a separate 24.038-second mux/save node. These spans cannot be added as though their boundaries and overlap were identical. Request5004's output SHA256 is identical to4990 (`0a78d463ecfc7b6512f26213e9a7a19954ea7489e74996e07f0bbc0701a21c8b`), including encoded video/audio bytes.
+On Morlock, the best completed Turbo request was 8.198 seconds above Comfy, improved by 14.260 seconds from request4990. Its denoising gap is 21.391 seconds. Text conditioning was 5.772 seconds versus 2.305 seconds, while video decode differed by 3.838 seconds. Native video encoding overlaps streamed decode; Comfy reports a separate 24.038-second mux/save node. These spans cannot be added as though their boundaries and overlap were identical. Request5004's output SHA256 is identical to4990 (`0a78d463ecfc7b6512f26213e9a7a19954ea7489e74996e07f0bbc0701a21c8b`), including encoded video/audio bytes.
 
 The regular target of 939.1355 seconds is historical Comfy evidence on a different 600 W RTX 5090 with a lighthouse prompt. The new 969.867-second regular request is 30.7315 seconds above that target, but is not a matched fresh comparison. The user stopped additional clean Comfy baseline runs; no fresh regular baseline is claimed. The second fresh Comfy Turbo warm request failed during decode and is excluded. Container memory pressure is consistent with that failure, but no pre-run OOM-counter delta was retained to establish causality.
 
 All completed native rows above have retained original videos and passed full audio/video decoding. Those checks do not establish subjective quality. Precision, statistics reuse, and global-mean FP4 remain explicit opt-in choices pending the user's video review.
 
 On Chibisuke, request5015 completed the first full Turbo video in405.565seconds including initial kernel compilation; it is not a warm benchmark. Request5016, using the matching sparring input/seed, completed in**280.875seconds (4m40.875s)**: denoise232.311s, text6.406s, video decode37.940s. Its23527874-byte video (`cd54bfc0ed35039c6cc78c826b5159ab9cf510719eed6ccd23d11476c6e8d692`) passed full AV checks. It uses restored DiT fusion plus exact LoRA preparation cleanup, shorter-lived FP4 buffers and shared Q/K/V quantization; the experimental alternative GEMM is excluded. The observer lost authorization mid-run, but a read-only `cozy run show` recovered the original completed request without resubmission; the383.024-second CLI wall includes that observation delay.
+
+Request 5017 completed the second warm clip, rally seed 581205, in **277.306 seconds (4m37.306s)**: denoise 227.858 s, text 8.263 s, video decode 37.889 s. Its 20,583,484-byte video (`4f50e45aa0aa034071dd685df07384e900477780e061caab1e38c8aa8ac2f020`) also passed complete audio/video decoding. These two different scenes average 279.0905 seconds; they are not repeated trials of one scene. Both exclude the alternative GEMM.
+
+| Chibisuke Turbo, 4 dense + 4 Sol | Seed | Execution | Denoise | Video decode |
+|---|---:|---:|---:|---:|
+| Cozy optimized, sparring, run 5016 | 581204 | **280.875 s** | 232.311 s | 37.940 s |
+| Cozy optimized, rally, run 5017 | 581205 | **277.306 s** | 227.858 s | 37.889 s |
+| ComfyUI, matching controls | matching | Running | Pending | Pending |
+
+The prior Comfy result is 46.272 seconds above this two-scene average, but hardware/driver differences and the mixed-scene mean prevent treating that subtraction as a matched speedup. Current Comfy has exclusive GPU use for setup, matching clean controls, and a fresh-process CUDA trace. Regular 30-step timing follows the GPU handoff.
 
 ## Kernel investigation
 
@@ -59,9 +69,9 @@ No complete Comfy kernel comparison is retained yet: after the failed CPU/CUDA c
 
 Actual GPU probe4999 retained kernels, copies, and CUDA runtime/driver API events in CUDA-only mode. Probe5005 confirms that Chrome CUDA thread IDs use the absolute signed low32 pthread identity; the attribution helper matches all12 device events to their manual launch ranges. Disk/RAM/process-fault/PCIe sampling remains active, independently of PyTorch tracing. Partial native4998 evidence shows substantial initial disk reads but near-zero physical disk reads in later dense steps; this does not exclude RAM-to-VRAM transfers or quantify their critical-path cost.
 
-`attribute_trace.py` uses the common PR1243 streaming parser to associate GPU correlation IDs with CPU CUDA API calls and their enclosing annotation ranges. It retains ambiguous and unassociated activities in the totals. Six CPU regression tests cover asynchronous execution beyond a CPU scope, thread boundaries/aliases, duplicate IDs, nested ranges, invalid events, and clock conversion. These are diagnostic duration sums; use the common parser's interval unions for GPU busy time.
+`attribute_trace.py` uses the common PR1243 streaming parser to associate GPU correlation IDs with CPU CUDA API calls and their enclosing annotation ranges. It retains ambiguous and unassociated activities in the totals. Seven CPU regression tests cover asynchronous execution beyond a CPU scope, thread boundaries/aliases, duplicate IDs, nested ranges, invalid events, clock conversion, and transfer-byte preservation. These are diagnostic duration sums; use the common parser's interval unions for GPU busy time.
 
-The historical gap is approximately119s in denoising. Progress-based estimates suggest43s in dense evaluations and79s in sparse evaluations; those rounded values are not a CUDA profile. The fused producer targets Q/K/V materialization and quantization work; weight-paging attribution remains unmeasured.
+The earliest historical denoising gap was approximately 119 s. Those progress-based estimates preceded the retained trace and subsequent optimizations; they are not the current gap. The trace now directly measures weight transfers, while their overlap with useful computation still prevents interpreting summed copy duration as critical-path savings.
 
 ## Evidence and candidate boundaries
 
