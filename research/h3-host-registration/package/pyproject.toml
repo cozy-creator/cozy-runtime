@@ -3,9 +3,11 @@ requires = ["uv_build>=0.12.7,<0.13"]
 build-backend = "uv_build"
 [project]
 name = "h3-host-registration"
-version = "0.0.1"
+version = "0.0.2"
 requires-python = ">=3.12,<3.13"
 dependencies = ["cozy-runtime>=0.19,<0.20", "torch==2.14.0", "msgspec>=0.19"]
+[project.entry-points."cozy.application"]
+default = "h3_host_registration:app"
 [tool.uv.build-backend]
 module-name = "h3_host_registration"
 module-root = ""
