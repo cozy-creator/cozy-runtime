@@ -1,0 +1,1 @@
+Bundles TensorD 0.3.5: a run downloads its checkpoints at once; a callable that declares `components` downloads those first and the rest of each checkpoint behind the running request, yielding to any preparation; a rented machine reports its own public endpoint to the Hub so readiness need not wait for the provider (Hub v0.16.30 and newer; older Hubs are left as they were).
