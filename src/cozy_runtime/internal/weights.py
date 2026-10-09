@@ -2152,6 +2152,11 @@ class PlaneBackend:
 
     # -- the Backend protocol
 
+    @property
+    def bound(self) -> frozenset[str]:
+        """The components the binding selects; the construction's others stay on meta."""
+        return frozenset(self.checkpoints)
+
     def expect(self, sets: Mapping[str, Sequence[str]]) -> None:
         """Completeness sets, and the verified read leases: a corrupt artifact refuses here,
         before construction."""

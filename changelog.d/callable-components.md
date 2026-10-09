@@ -1,0 +1,3 @@
+`@app.entrypoint`, `@app.job` and `@invocable` take `components={"<model argument>": ("dit", ...)}`, published as the model slot's `components`: the components that callable runs, so a machine downloads those first and the rest of the checkpoint after. Absent means all; a name no `@uses_components` method declares refuses, in import and static describe alike.
+
+A binding that selects only some of the components a model builds now constructs: the others stay on meta, never fit, filled or registered (`skipped_components` in the prepare facts), and a method using one refuses `component_unbound`. A binding that selects none of them still refuses.

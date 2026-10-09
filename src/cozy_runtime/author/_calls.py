@@ -37,7 +37,7 @@ from cozy_runtime.author._executor_requests import (
 )
 from cozy_runtime.author._memo import MemoDependency
 from cozy_runtime.author._memo import declare as declare_memo
-from cozy_runtime.author._model_defaults import DefaultLadder, model_defaults
+from cozy_runtime.author._model_defaults import DefaultLadder, model_components, model_defaults
 from cozy_runtime.author._services import Telemetry, _progress_scope, _ProgressScope
 from cozy_runtime.internal import application_json
 
@@ -67,6 +67,7 @@ class _Export:
     name: str
     memoize: bool = False
     defaults: Mapping[str, DefaultLadder] = field(default_factory=dict)
+    components: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
 
 @overload
@@ -78,6 +79,7 @@ def invocable[**P, R](
     memo_version: str | None = None,
     memo_dependencies: tuple[MemoDependency, ...] = (),
     defaults: Mapping[str, Sequence[Mapping[str, str | int]]] | None = None,
+    components: Mapping[str, Sequence[str]] | None = None,
 ) -> Callable[P, PendingCall[R]]: ...
 
 
@@ -88,6 +90,7 @@ def invocable[**P, R](
     memo_version: str | None = None,
     memo_dependencies: tuple[MemoDependency, ...] = (),
     defaults: Mapping[str, Sequence[Mapping[str, str | int]]] | None = None,
+    components: Mapping[str, Sequence[str]] | None = None,
 ) -> Callable[[Callable[Concatenate[Context, P], Awaitable[R]]], Callable[P, PendingCall[R]]]: ...
 
 
@@ -99,6 +102,7 @@ def invocable[**P, R](
     memo_version: str | None = None,
     memo_dependencies: tuple[MemoDependency, ...] = (),
     defaults: Mapping[str, Sequence[Mapping[str, str | int]]] | None = None,
+    components: Mapping[str, Sequence[str]] | None = None,
 ) -> (
     Callable[P, PendingCall[R]]
     | Callable[[Callable[Concatenate[Context, P], Awaitable[R]]], Callable[P, PendingCall[R]]]
@@ -130,13 +134,21 @@ def invocable[**P, R](
             memo_version=memo_version,
             memo_dependencies=memo_dependencies,
             defaults=defaults,
+            components=components,
         )
     if not inspect.iscoroutinefunction(fn) or "<locals>" in fn.__qualname__:
         raise ConformanceError(
             "an invocable must be a module-level async function", code="invocable_signature"
         )
     declare_memo(fn, memoize=memoize, version=memo_version, dependencies=memo_dependencies)
-    export = _Export(fn, fn.__module__, fn.__name__, memoize, model_defaults(defaults))
+    export = _Export(
+        fn,
+        fn.__module__,
+        fn.__name__,
+        memoize,
+        model_defaults(defaults),
+        model_components(components),
+    )
 
     def proxy(*args: P.args, **kwargs: P.kwargs) -> PendingCall[R]:
         if args:

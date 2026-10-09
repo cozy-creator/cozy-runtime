@@ -335,6 +335,10 @@ one slot's rungs share its model and release. Omitting the org names a model of 
 own account; the publishing Creator writes that account into the published interface. The invocation override wins over the owner's
 mutable Hub binding, which wins over the published default. Selection resolves before
 dispatch; the executor receives exact artifacts. See [authored defaults](docs/authored-model-defaults.md).
+The same decorators take `components={"model": ("dit", "vae")}`: the slot's `components` names
+the components that callable runs (absent means all), so a machine fetches those first. A
+binding that selects only some components leaves the others on meta; a method using one
+refuses `component_unbound`.
 Known-next calls can [prepare their models in the background](docs/model-prefetch.md)
 with `prefetch(callee, models={...})` while another model runs, and a request done with its
 GPUs can [release them early](docs/gpu-release.md) with `ctx.release_gpus()`.

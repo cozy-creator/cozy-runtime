@@ -26,7 +26,7 @@ from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._markers import Bound
 from cozy_runtime.author._memo import MemoDependency
 from cozy_runtime.author._memo import declare as declare_memo
-from cozy_runtime.author._model_defaults import DefaultLadder, model_defaults
+from cozy_runtime.author._model_defaults import DefaultLadder, model_components, model_defaults
 from cozy_runtime.author._signature import Kind, Surface, analyze
 from cozy_runtime.author._weights import WeightsOutput
 
@@ -50,6 +50,7 @@ class Registration:
     invocable: bool = False
     memoize: bool = False
     model_defaults: Mapping[str, DefaultLadder] = field(default_factory=dict)
+    model_components: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     publishes: bool = False
     emits_media: bool = False
     weights_outputs: tuple[WeightsOutput, ...] = ()
@@ -93,6 +94,7 @@ class Registration:
                 invocable=self.invocable,
                 memoize=self.memoize,
                 model_defaults=self.model_defaults,
+                model_components=self.model_components,
             )
         return self._surface
 
@@ -111,6 +113,7 @@ class App:
         /,
         *,
         defaults: Mapping[str, Sequence[Mapping[str, str | int]]] | None = None,
+        components: Mapping[str, Sequence[str]] | None = None,
         memoize: bool = False,
         memo_version: str | None = None,
         memo_dependencies: tuple[MemoDependency, ...] = (),
@@ -126,6 +129,7 @@ class App:
         preflight: Callable[..., object] | None = None,
         demand: Bound | None = None,
         defaults: Mapping[str, Sequence[Mapping[str, str | int]]] | None = None,
+        components: Mapping[str, Sequence[str]] | None = None,
         hidden: bool = False,
         internal: bool = False,
         memoize: bool = False,
@@ -142,6 +146,7 @@ class App:
         preflight: Callable[..., object] | None = None,
         demand: Bound | None = None,
         defaults: Mapping[str, Sequence[Mapping[str, str | int]]] | None = None,
+        components: Mapping[str, Sequence[str]] | None = None,
         hidden: bool = False,
         internal: bool = False,
         memoize: bool = False,
@@ -159,7 +164,10 @@ class App:
         `memoize=True` explicitly admits deterministic measurement results to the managed
         operation cache. Optional `memo_dependencies` and `memo_version` declare
         result-affecting helpers/resources/native builds just as for `invocable`.
-        Ordinary generation remains nonmemoized by default."""
+        Ordinary generation remains nonmemoized by default.
+
+        `components={"model": ("dit", "vae")}` names the components of each Model argument
+        this callable runs, so a machine fetches those first; absent means all."""
         if type(memoize) is not bool:
             raise RegistrationError("entrypoint memoize must be a boolean")
         return self._register(
@@ -176,6 +184,7 @@ class App:
             memo_version=memo_version,
             memo_dependencies=memo_dependencies,
             defaults=defaults,
+            components=components,
         )
 
     @overload
@@ -189,6 +198,7 @@ class App:
         emits_media: bool = False,
         weights: tuple[WeightsOutput, ...] = (),
         defaults: Mapping[str, Sequence[Mapping[str, str | int]]] | None = None,
+        components: Mapping[str, Sequence[str]] | None = None,
         demand: Bound | None = None,
         internal: bool = False,
         accelerator: bool | None = None,
@@ -204,6 +214,7 @@ class App:
         emits_media: bool = False,
         weights: tuple[WeightsOutput, ...] = (),
         defaults: Mapping[str, Sequence[Mapping[str, str | int]]] | None = None,
+        components: Mapping[str, Sequence[str]] | None = None,
         demand: Bound | None = None,
         internal: bool = False,
         accelerator: bool | None = None,
@@ -219,6 +230,7 @@ class App:
         emits_media: bool = False,
         weights: tuple[WeightsOutput, ...] = (),
         defaults: Mapping[str, Sequence[Mapping[str, str | int]]] | None = None,
+        components: Mapping[str, Sequence[str]] | None = None,
         demand: Bound | None = None,
         internal: bool = False,
         accelerator: bool | None = None,
@@ -246,6 +258,7 @@ class App:
             internal=internal,
             accelerator=accelerator,
             defaults=defaults,
+            components=components,
         )
 
     def _register(
@@ -265,6 +278,7 @@ class App:
         memo_version: str | None = None,
         memo_dependencies: tuple[MemoDependency, ...] = (),
         defaults: Mapping[str, Sequence[Mapping[str, str | int]]] | None = None,
+        components: Mapping[str, Sequence[str]] | None = None,
         accelerator: bool | None = None,
     ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
         if type(internal) is not bool:
@@ -274,6 +288,7 @@ class App:
         if hidden and internal:
             raise RegistrationError("an internal callable cannot also be hidden")
         declared_defaults = model_defaults(defaults)
+        declared_components = model_components(components)
 
         def decorate(target: Callable[P, R]) -> Callable[P, R]:
             if self._frozen:
@@ -291,6 +306,11 @@ class App:
                 raise ConformanceError(
                     "declare defaults once, on invocable or App registration", code="model_defaults"
                 )
+            if declared_components and export is not None and export.components:
+                raise ConformanceError(
+                    "declare components once, on invocable or App registration",
+                    code="model_components",
+                )
             declare_memo(
                 export.implementation if export is not None else target,
                 memoize=export.memoize if export is not None else memoize,
@@ -304,6 +324,8 @@ class App:
                 invocable=export is not None,
                 memoize=export.memoize if export is not None else memoize,
                 model_defaults=declared_defaults or (export.defaults if export is not None else {}),
+                model_components=declared_components
+                or (export.components if export is not None else {}),
                 publishes=publishes,
                 emits_media=emits_media,
                 weights_outputs=weights_outputs,

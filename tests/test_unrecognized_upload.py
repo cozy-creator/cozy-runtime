@@ -37,6 +37,8 @@ def test_a_construction_failing_on_an_as_is_checkpoint_names_the_fix() -> None:
     assert isinstance(failed.value.__cause__, KeyError)
 
     class Verdict:  # the backend's fit over keys the construction does not find
+        bound = None
+
         def fit(self, walked: Census, *, encoded_leaves: str) -> Fit:
             return {"ok": False, "code": "missing_tensor", "detail": "unet.conv_in.weight"}
 
