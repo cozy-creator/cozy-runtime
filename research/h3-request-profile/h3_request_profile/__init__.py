@@ -26,7 +26,7 @@ from .instrument import profile_request, retained_handler, software_versions, un
 app = App()
 
 
-# Same one-5090 choices as retained minimax-h3@1.26.2, fully qualified because
+# Same one-5090 choices as retained minimax-h3@1.26.3, fully qualified because
 # this explicit local diagnostic has its own package namespace.
 _DEFAULT_MODEL_LADDER = [
     {"gpu": "5090", "gpus": 1, "lane": "paul/minimax-h3@1.0.0-rc.2/fp8-pruned"}
