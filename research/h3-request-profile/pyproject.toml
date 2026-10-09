@@ -1,0 +1,26 @@
+[build-system]
+requires = ["uv_build>=0.12.7,<0.13"]
+build-backend = "uv_build"
+
+[project]
+name = "h3-request-profile"
+version = "0.0.12"
+requires-python = ">=3.12,<3.13"
+dependencies = ["cozy-runtime>=0.21.6,<0.22", "tensorfs>=0.6.1,<0.7", "minimax-h3==1.26.3", "torch==2.14.0", "triton==3.8.0", "qwen-image-2>=0.3.0", "msgspec>=0.19", "diffusers>=0.41.0.dev0"]
+
+[project.entry-points."cozy.application"]
+default = "h3_request_profile:app"
+
+[tool.uv.build-backend]
+module-name = "h3_request_profile"
+module-root = ""
+
+# H3's authored wheel retains a direct Git requirement. Override that URL with
+# the exact commit source below, or an explicitly captured wheel from that commit.
+[tool.uv]
+override-dependencies = ["diffusers==0.41.0.dev0"]
+
+[tool.uv.sources]
+minimax-h3 = { index = "tensorhub" }
+qwen-image-2 = { index = "tensorhub" }
+diffusers = {git="https://github.com/huggingface/diffusers", rev="578c9b2c6636ab2424a0e56186268b83623656b2"}
