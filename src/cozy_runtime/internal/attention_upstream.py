@@ -319,7 +319,7 @@ def _sage(modes: dict[int, tuple[str, str, str]]) -> Local:
 
 
 #: Kitchen's wheel carries device code for sm_75 up; these are the cards Runtime admits.
-KITCHEN_SMS = ((9, 0), (10, 0), (10, 3), (12, 0), (12, 1))
+KITCHEN_SMS = ((8, 0), (8, 6), (8, 7), (8, 9), (9, 0), (10, 0), (10, 3), (11, 0), (12, 0), (12, 1))
 
 
 def _cuda_inputs(
@@ -478,14 +478,70 @@ def sage3_fp4(
     scale: float | None = None,
     enable_gqa: bool = False,
 ) -> Any:
-    """SageAttention3's consumer-Blackwell FP4 kernel: NVFP4 Q/K/V with per-16 E4M3
-    microscales, K mean and per-block Q mean smoothing. Every mean and scale is per head, so
-    it is head-local. Upstream subtracts K's mean IN PLACE, so it gets a copy, and its softmax
-    scale is fixed at D^-1/2."""
+    """Upstream per-block-mean Sage3; explicit opt-in, never the H3 default."""
+    return _sage3_fp4(
+        query,
+        key,
+        value,
+        per_block_mean=True,
+        attn_mask=attn_mask,
+        dropout_p=dropout_p,
+        is_causal=is_causal,
+        scale=scale,
+        enable_gqa=enable_gqa,
+    )
+
+
+def sage3_fp4_global_lowmem(query: Any, key: Any, value: Any, **options: Any) -> Any:
+    """The same global-mean arithmetic with shorter owned-buffer lifetimes."""
+    return _sage3_fp4(
+        query, key, value, per_block_mean=False, release_intermediates=True, **options
+    )
+
+
+def _sage3_global_owned(q: Any, k: Any, v: Any, *, is_causal: bool) -> Any:
+    import torch
+
+    api = import_module("sageattn3.api")
+    ql, kl, is_bf16 = q.shape[2], k.shape[2], q.dtype == torch.bfloat16
+    # Keep upstream's preprocessing and its order exactly. Only K is mutated;
+    # its owned clone dies after preprocessing instead of after attention returns.
+    q, k, v, delta_s = api.preprocess_qkv(
+        q, k.clone(memory_format=torch.contiguous_format), v, per_block_mean=False
+    )
+    qlist = api.scale_and_quant_fp4(q)
+    del q
+    klist = api.scale_and_quant_fp4_permute(k)
+    del k
+    vlist = api.scale_and_quant_fp4_transpose(v)
+    del v
+    # These official quantizers and attention launch on PyTorch's current stream,
+    # so the allocator can recycle the owned inputs without a synchronization.
+    output = api.blockscaled_fp4_attn(qlist, klist, vlist, delta_s, kl, is_causal, False, is_bf16)[
+        0
+    ]
+    # Directly form Runtime's BTHD result. The public upstream API first copies
+    # the cropped HND tensor, which its caller then copies again to flatten H/D.
+    return output[:, :, :ql, :].transpose(1, 2).contiguous()
+
+
+def _sage3_fp4(
+    query: Any,
+    key: Any,
+    value: Any,
+    *,
+    per_block_mean: bool,
+    release_intermediates: bool = False,
+    attn_mask: Any = None,
+    dropout_p: float = 0.0,
+    is_causal: bool = False,
+    scale: float | None = None,
+    enable_gqa: bool = False,
+) -> Any:
     import torch
 
     _options("sageattention3-fp4", attn_mask, dropout_p, scale)
-    admitted = ((12, 0),)
+    admitted = ((12, 0), (12, 1))
     _cuda_inputs(
         query, key, value, enable_gqa, name="sageattention3-fp4", admitted=admitted, dims=(64, 128)
     )
@@ -494,8 +550,16 @@ def sage3_fp4(
     if scale is not None and not math.isclose(scale, query.shape[-1] ** -0.5, rel_tol=1e-6):
         raise ValueError("sageattention3-fp4 fixes the softmax scale at D^-1/2")
     q, k, v = (tensor.transpose(1, 2) for tensor in (query, key, value))
+    if release_intermediates:
+        if per_block_mean:
+            raise ValueError("owned Sage3 lifetimes require global Q mean")
+        return _output(_sage3_global_owned(q, k, v, is_causal=is_causal), query)
     output = import_module("sageattn3").sageattn3_blackwell(
-        q, k.clone(memory_format=torch.contiguous_format), v, is_causal=is_causal
+        q,
+        k.clone(memory_format=torch.contiguous_format),
+        v,
+        is_causal=is_causal,
+        per_block_mean=per_block_mean,
     )
     return _output(output, q).transpose(1, 2)
 
@@ -524,3 +588,8 @@ SAGE_FP16PV = _sage({90: ("sageattn_qk_int8_pv_fp16_cuda", "per_thread", "fp32")
 KITCHEN = Local(kitchen_int8, _named("comfy_kitchen.int8_attention"))
 FLASHINFER = Local(flashinfer_mixed, _named("cute_dsl_fmha_ragged_prefill jit, e4m3 V per-head"))
 SAGE3 = Local(sage3_fp4, _named("sageattn3.sageattn3_blackwell(nvfp4, per_block_mean)"))
+
+SAGE3_GLOBAL_LOWMEM = Local(
+    sage3_fp4_global_lowmem,
+    _named("sageattn3.nvfp4_global_head_mean(short_owned_lifetimes, direct_bthd)"),
+)

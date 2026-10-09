@@ -39,6 +39,11 @@ from .turbo import ATTENTION_KWARG, OVERLAY_KWARG, TURBO_BANK
 #: SageAttention2 INT8 Q/K + FP8 P/V, then FA3 BF16, then SDPA. FA3 FP8 garbles H3 output
 #: (H100 Ulysses-4 runs 1240-1252) and is never preferred. The VAEs keep Runtime's ranking.
 DIT_ATTENTION: tuple[str, ...] = ("sol-attn", "sageattention", "flash-attn3", "sdpa")
+BLACKWELL_DIT_ATTENTION: tuple[str, ...] = (
+    "kitchen-sol-producer-fp4-lowmem-shared-qkv",
+    "kitchen-sol-fp4-lowmem",
+    *DIT_ATTENTION,
+)
 DIT_COMPONENTS: frozenset[str] = frozenset({"fl2va_dit", "ref2va_dit"})
 #: Reference latents one generation keeps (`ReferenceMemo`), least recently used first out. A
 #: 2048-edge image reference is ~6 MB of float32 latents, a 5 s video reference ~25 MB.
@@ -112,7 +117,15 @@ class H3Model(Model[OfficialH3Pipeline], encoded_leaves="accept", fusion="accept
         return None
 
     def choose_attention(self, context: AttentionContext) -> tuple[str, ...] | None:
-        return DIT_ATTENTION if context.component in DIT_COMPONENTS else None
+        if context.component not in DIT_COMPONENTS:
+            return None
+        from cozy_runtime.internal.kernel_sources import reviewed_kitchen_wheel_compatible
+
+        # Hardware/site/degree eligibility and the reviewed wheel's actual ABI tags
+        # both apply. Unqualified platform source builds remain explicit choices.
+        if "kitchen-sol-fp4-lowmem" in context.eligible and reviewed_kitchen_wheel_compatible():
+            return BLACKWELL_DIT_ATTENTION
+        return DIT_ATTENTION
 
     # Published interfaces (paul/minimax-h3) name these two scopes in `component_use`; they
     # stay until that package is republished. The runtime no longer calls `Model.warm`.

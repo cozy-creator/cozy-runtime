@@ -34,6 +34,8 @@ from cozy_runtime.author._attention import AttentionContext
 from cozy_runtime.author._attention_scope import _EXPECTED
 from cozy_runtime.internal import (
     accel,
+    attention_kitchen_sol,
+    attention_producer,
     attention_sol,
     attention_ulysses,
     execution_evidence,
@@ -210,7 +212,7 @@ PINNABLE: tuple[Candidate, ...] = (
         name="kitchen-int8",
         backend="_cozy_kitchen_int8",
         local=upstream.KITCHEN,
-        min_sm=90,
+        min_sm=80,
         max_sm=121,
         sms=frozenset(major * 10 + minor for major, minor in upstream.KITCHEN_SMS),
         dtypes=_HALF,
@@ -264,6 +266,73 @@ PINNABLE: tuple[Candidate, ...] = (
         artifact=kernel_sources.PYTHON,
         import_name="sol_attn",
         why="Explicit sparse experiment on its CuTe routes; eager model layout.",
+    ),
+)
+
+# H3 explicitly opts into these recipes; generic automatic selection stays precision-preserving.
+PINNABLE += (
+    Candidate(
+        name="sageattention3-fp4-global-lowmem",
+        backend="_cozy_sage3_fp4_global_lowmem",
+        local=upstream.SAGE3_GLOBAL_LOWMEM,
+        min_sm=120,
+        max_sm=121,
+        sms=frozenset({120, 121}),
+        dtypes=_HALF,
+        max_head_dim=128,
+        head_dims=frozenset({64, 128}),
+        artifact="sageattn3",
+        import_name="sageattn3",
+        why="Explicit global-mean NVFP4 control; all-dense FP4 is not the approved H3 default.",
+    ),
+    Candidate(
+        name="kitchen-sol",
+        backend="_cozy_kitchen_sol_int8",
+        local=attention_kitchen_sol.KITCHEN_SOL,
+        min_sm=80,
+        max_sm=121,
+        sms=frozenset(a * 10 + b for a, b in upstream.KITCHEN_SMS),
+        dtypes=frozenset({"bfloat16"}),
+        max_head_dim=128,
+        head_dims=frozenset({128}),
+        artifact="comfy-kitchen",
+        import_name="comfy_kitchen",
+        why="H3 Kitchen INT8 dense plus INT8 Sol with model-owned protected paths and rows.",
+    ),
+    Candidate(
+        name="kitchen-sol-fp4-lowmem",
+        backend="_cozy_kitchen_sol_fp4_lowmem",
+        local=attention_kitchen_sol.KITCHEN_SOL_FP4_LOWMEM,
+        min_sm=120,
+        max_sm=121,
+        sms=frozenset({120, 121}),
+        dtypes=frozenset({"bfloat16"}),
+        max_head_dim=128,
+        head_dims=frozenset({128}),
+        artifact="comfy-kitchen",
+        import_name="comfy_kitchen",
+        why="H3 NVFP4 dense plus Kitchen INT8 Sol; head-local for Ulysses.",
+    ),
+    *(
+        Candidate(
+            name=name,
+            backend="_cozy_" + name.replace("-", "_"),
+            local=attention_producer.LOCALS[name],
+            min_sm=120 if name in attention_producer.FP4_LOWMEM else 80,
+            max_sm=121,
+            sms=(
+                frozenset({120, 121})
+                if name in attention_producer.FP4_LOWMEM
+                else frozenset(a * 10 + b for a, b in upstream.KITCHEN_SMS)
+            ),
+            dtypes=frozenset({"bfloat16"}),
+            max_head_dim=128,
+            head_dims=frozenset({128}),
+            artifact="comfy-kitchen",
+            import_name="comfy_kitchen",
+            why="H3 single-GPU shared-QKV producer; invocation-local previous-step statistics.",
+        )
+        for name in sorted(attention_producer.NAMES)
     ),
 )
 
@@ -370,7 +439,7 @@ def _launch(ready: Ready, device: DeviceFacts) -> None:
     """One small call through a compiled kernel: one whose first launch raises is not served.
     Not an accuracy check. Torch's own backends need none; Sol launches only inside its
     model's layout."""
-    if not ready.candidate.artifact or ready.name == "sol-attn" or device.kind != "cuda":
+    if not ready.candidate.artifact or ready.name in attention_sol.NAMES or device.kind != "cuda":
         return
     import torch
     from diffusers.models.attention_dispatch import dispatch_attention_fn
@@ -400,6 +469,29 @@ def _launch(ready: Ready, device: DeviceFacts) -> None:
         )
 
 
+def _compile_dependencies(
+    candidates: Sequence[Candidate], device: DeviceFacts, wait: bool
+) -> dict[str, dict[str, str] | None]:
+    """Start every independent build before waiting or returning a no-wait refusal."""
+    artifacts: dict[str, dict[str, str] | None] = {}
+    refused: list[tuple[Candidate, AttentionRefusal]] = []
+    for candidate in candidates:
+        try:
+            artifacts[candidate.name] = _compiled(candidate, device, wait=False)
+        except AttentionRefusal as exc:
+            refused.append((candidate, exc))
+    # Known failures refuse even a strict pin immediately; another dependency's
+    # compile does not turn a failed recipe into a queued one.
+    failed = next((exc for _, exc in refused if not exc.code.endswith("_compiling")), None)
+    if failed is not None:
+        raise failed
+    if refused and not wait:
+        raise refused[0][1]
+    for candidate, _ in refused:
+        artifacts[candidate.name] = _compiled(candidate, device, wait=True)
+    return artifacts
+
+
 def _resolve(candidate: Candidate, device: DeviceFacts, wait: bool = True) -> Ready:
     """One candidate compiled, imported and launched on this device, or a typed refusal. A
     site that will run it waits for its build; `available` only asks what is ready."""
@@ -409,9 +501,40 @@ def _resolve(candidate: Candidate, device: DeviceFacts, wait: bool = True) -> Re
     if (candidate.name, device) in _BROKEN:
         raise _BROKEN[(candidate.name, device)]
     _registry()
-    artifact = _compiled(candidate, device, wait) if candidate.artifact else None
+    artifact: dict[str, str] | None
+    if candidate.name in attention_kitchen_sol.FP4:
+        dense = BY_NAME["sageattention3-fp4-global-lowmem"]
+        artifacts = _compile_dependencies((candidate, dense), device, wait)
+        dense_artifact = _resolve(dense, device, wait).artifact or {}
+        artifact = {
+            **(artifacts[candidate.name] or {}),
+            **{f"dense_{key}": value for key, value in dense_artifact.items()},
+        }
+    else:
+        artifact = _compiled(candidate, device, wait) if candidate.artifact else None
     if candidate.import_name:
         module = _import(candidate)
+        if candidate.name in attention_kitchen_sol.NAMES | attention_producer.NAMES:
+            import torch
+
+            target = torch.device("cuda", device.index)
+            if not module.sol_attn_is_available(target):
+                raise AttentionRefusal(
+                    "attention_kernel_absent",
+                    f"{candidate.name}: compiled Kitchen Sol is unavailable",
+                )
+            if not module.int8_attention_is_available(target):
+                raise AttentionRefusal(
+                    "attention_kernel_absent",
+                    f"{candidate.name}: Kitchen dense INT8 is unavailable",
+                )
+            if candidate.name in attention_producer.NAMES and not callable(
+                getattr(module, "sol_attn_chunked", None)
+            ):
+                raise AttentionRefusal(
+                    "attention_kernel_absent",
+                    f"{candidate.name}: Kitchen lacks its chunked producer",
+                )
         if candidate.local in (upstream.FA3, upstream.FA3_FP8):
             upstream.bind_fa3(module, (artifact or {}).get("key", "environment"))
     if candidate.name == "sol-attn":
@@ -494,7 +617,7 @@ def _sol_dense(
         candidate = BY_NAME.get(name)
         if (
             candidate is None
-            or name == "sol-attn"
+            or name in attention_sol.NAMES
             or _device_admits(candidate, device)
             or not _admits(candidate, "bfloat16", 128)
         ):
@@ -1203,16 +1326,26 @@ def install(
 
 def _install_sites(records: Sequence[tuple[Ready, str, str, Any]]) -> None:
     """Install metadata hooks atomically, preserving hooks owned by preparation."""
+    # Validate all producer topology/hooks before any metadata or processor mutation.
+    for entry, _component, _path, module in records:
+        if entry.name in attention_producer.NAMES:
+            attention_producer.validate(module)
     added: list[tuple[str, str, Any]] = []
+    processors: list[tuple[Any, Any]] = []
     try:
         for entry, component, path, module in records:
-            if entry.name != "sol-attn":
+            if entry.name not in attention_sol.NAMES:
                 continue
             local = component.rsplit("/", 1)[-1]
             if getattr(module, "_cozy_sol_site", None) is None:
                 added.append((local, path, module))
             attention_sol.install_site(module, local, path)
+            if entry.name in attention_producer.NAMES:
+                processors.append((module, module.processor))
+                attention_producer.install(module)
     except BaseException:
+        for module, processor in reversed(processors):
+            module.set_processor(processor)
         for component, path, module in reversed(added):
             if getattr(module, "_cozy_sol_site", None) is not None:
                 attention_sol.remove_site(module, component, path)
@@ -1267,7 +1400,16 @@ def override(
             for component, path, module in swap.modules
             if getattr(module, "_cozy_sol_site", None) is None
         ]
-        if swap is not None and swap.entry.name == "sol-attn"
+        if swap is not None and swap.entry.name in attention_sol.NAMES
+        else []
+    )
+    temporary_processors = (
+        [
+            (module, module.processor)
+            for _component, _path, module in swap.modules
+            if not isinstance(module.processor, attention_producer.Processor)
+        ]
+        if swap is not None and swap.entry.name in attention_producer.NAMES
         else []
     )
     try:
@@ -1289,7 +1431,11 @@ def override(
                 if getattr(module, "_cozy_sol_site", None) is not None:
                     attention_sol.remove_site(module, component, path)
         finally:
-            defaults.restore()
+            try:
+                for module, processor in reversed(temporary_processors):
+                    module.set_processor(processor)
+            finally:
+                defaults.restore()
 
 
 def _site_refusal(name: str, component: str, dtype: str, head_dim: int) -> AttentionRefusal:
@@ -1393,6 +1539,11 @@ def check(
             raise AttentionRefusal(
                 "attention_kernel_unsupported", _unmanaged_reason(component, path, processor)
             )
+        if candidate.name in attention_producer.NAMES:
+            try:
+                attention_producer.validate(module)
+            except ValueError as exc:
+                raise AttentionRefusal("attention_kernel_unsupported", str(exc)) from exc
         dtype, head_dim = _dtype(module), _head_dim(module)
         if not _admits(candidate, dtype, head_dim):
             raise _site_refusal(candidate.name, component, dtype, head_dim)

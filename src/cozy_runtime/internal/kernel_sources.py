@@ -40,11 +40,14 @@ import tempfile
 import zipfile
 from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from importlib import metadata, util
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
+
+from packaging.tags import sys_tags
+from packaging.utils import parse_wheel_filename
 
 from cozy_runtime.internal import accel, config, egress, kernel_cache, kernel_compile
 
@@ -52,9 +55,10 @@ ROOT = Path("/opt/cozy/kernel-sources")
 INDEX = "index.json"
 #: The artifact every Python source unpacks into.
 PYTHON = "kernel-python"
+KITCHEN_WHEEL = "comfy-kitchen-wheel"
 #: Recipe fields outside a key: how many compiler processes a build runs, and other cards'
 #: text fixes.
-_UNKEYED = ("extensions", "unit_bytes", "replace_on")
+_UNKEYED = ("extensions", "unit_bytes", "replace_on", "build_deps")
 #: What `setup.py` itself imports, from the registry when the environment lacks it; build-only.
 _BUILD_DEPS = ("setuptools", "wheel", "packaging")
 
@@ -129,10 +133,24 @@ PINS: tuple[Pin, ...] = (
         keep=_HEADERS,
     ),
     Pin(
+        KITCHEN_WHEEL,
+        "0.2.37",
+        _PYPI + "19/04/d24939d30b077679bfc8bf4a53c7392f9d8650df7ce69164238a673753a1/"
+        "comfy_kitchen-0.2.37-cp312-abi3-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+        "03cca0d10c314aaa13bff8f9422d03974221a344162b23d4f10d27eb2a35d0e8",
+    ),
+    Pin(
+        "nanobind",
+        "3.1.0",
+        _PYPI + "36/c1/6fd56f7a02a478d54a1a3e6000eccd34b446b1c45cbf0d002fe5d2937126/"
+        "nanobind-3.1.0-py3-none-any.whl",
+        "96984dbe8154ffb86e653b1b60aaeed6985c710c5e75ad0279eb87943c66292d",
+    ),
+    Pin(
         "comfy-kitchen",
-        "b2a2972ac68c395bbda8ad9030e8ae1089287815",  # v0.2.35
-        _GITHUB.format("Comfy-Org/comfy-kitchen", "b2a2972ac68c395bbda8ad9030e8ae1089287815"),
-        "19e161139f1864fa90d63df796aeffc5ee47ab86c63d299940638cf9ba606da9",
+        "be003b7c23c5b01328657955b8bc5d3f073d868e",  # v0.2.37: reviewed H3 matrix
+        _GITHUB.format("Comfy-Org/comfy-kitchen", "be003b7c23c5b01328657955b8bc5d3f073d868e"),
+        "364150b13466f51276c08fb77fa54328c9917ea90230151f2abed75a5c362e69",
     ),
     Pin(
         "sol-attn",
@@ -255,6 +273,8 @@ class Recipe:
     #: the peak memory of one of its compiler jobs, which the machine's compile ledger holds
     #: for it: SageAttention2's largest measured 3.2 GB (cicc on its sm89 kernels)
     unit_bytes: int = 4 << 30
+    #: Recipe-specific, pinned build tools; staged ahead of ambient packages and keyed by SHA.
+    build_deps: tuple[str, ...] = ()
 
 
 #: The cards upstream SageAttention builds its SM89 and SM80 kernel families for.
@@ -402,7 +422,7 @@ RECIPES: dict[str, Recipe] = {
                 *_FA3_TOOLKIT,
             ),
         ),
-        Recipe("comfy-kitchen", "setup", ("comfy-kitchen",)),
+        Recipe("comfy-kitchen", "setup", ("comfy-kitchen",), build_deps=("nanobind",)),
         Recipe(PYTHON, "python"),
     )
 }
@@ -469,21 +489,56 @@ def compiler() -> str:
     return hashlib.sha256("\n".join(found).encode()).hexdigest()[:16]
 
 
+def _compatible_kitchen_wheel(source: Source | None) -> bool:
+    """Only the reviewed wheel's actual platform/Python/ABI tags authorize reuse."""
+    if source is None or sys.platform != "linux":
+        return False
+    try:
+        distribution, version, _, tags = parse_wheel_filename(Path(source.file).name)
+    except ValueError:
+        return False
+    if distribution != "comfy-kitchen" or str(version) != source.version:
+        return False
+    native = {tag for tag in tags if tag.abi == "abi3" and tag.platform.startswith("manylinux_")}
+    return bool(native) and not native.isdisjoint(sys_tags())
+
+
+@functools.cache
+def reviewed_kitchen_wheel_compatible() -> bool:
+    """Hardware-independent eligibility for automatic use of the reviewed native wheel."""
+    pin = next(pin for pin in PINS if pin.name == KITCHEN_WHEEL)
+    return _compatible_kitchen_wheel(Source(pin.name, pin.version, _filename(pin), pin.sha256))
+
+
 def job(name: str, sm: int, root: Path | None = None) -> kernel_compile.Job:
     """The exact artifact `name` is on a card of capability `sm` in this environment."""
     recipe = RECIPES[name]
     sources, why = registry(root) if root is not None else (_pinned_sources(), "")
+    inputs: dict[str, Any]
+    wheel = sources.get(KITCHEN_WHEEL) if name == "comfy-kitchen" else None
+    if _compatible_kitchen_wheel(wheel):
+        assert wheel is not None
+        # This exact published binary is the reviewed matrix artifact. Its key is
+        # the installed wheel's bytes and Python ABI, not a source compiler recipe.
+        wheel = replace(wheel, name=name)
+        inputs = {"python": _python(), "sources": {name: wheel.sha256}, "layout": 2}
+        return kernel_compile.Job(
+            "python",
+            kernel_cache.Key.of(name, inputs),
+            {"recipe": name, "sm": sm, "sources": {name: asdict(wheel)}, "build_deps": {}},
+        )
     if recipe.kind == "python":
+        build_only = set(_BUILD_DEPS).union(*(r.build_deps for r in RECIPES.values()))
         wanted = {
             n: s
             for n, s in sources.items()
-            if n not in _BUILD_DEPS and (s.file.endswith(".whl") or s.package)
+            if n not in build_only | {KITCHEN_WHEEL} and (s.file.endswith(".whl") or s.package)
         }
         if not wanted:
             raise Absent(why or "the kernel sources carry no Python sources")
-        inputs: dict[str, Any] = {"python": _python()}
+        inputs = {"python": _python()}
     else:
-        missing = [n for n in recipe.sources if n not in sources]
+        missing = [n for n in (*recipe.sources, *recipe.build_deps) if n not in sources]
         if missing:
             raise Absent(why or f"the kernel sources carry no {', '.join(missing)}")
         wanted = {n: sources[n] for n in recipe.sources}
@@ -504,6 +559,8 @@ def job(name: str, sm: int, root: Path | None = None) -> kernel_compile.Job:
                 )
             ),
         }
+    if recipe.build_deps:
+        inputs["build_deps"] = {n: sources[n].sha256 for n in recipe.build_deps}
     inputs["sources"] = {n: s.sha256 for n, s in sorted(wanted.items())}
     # 2: every tree carries an installed distribution's dist-info.
     inputs["layout"] = 2
@@ -512,7 +569,9 @@ def job(name: str, sm: int, root: Path | None = None) -> kernel_compile.Job:
         "sm": sm,
         "sources": {n: asdict(s) for n, s in wanted.items()},
         "build_deps": {
-            n: asdict(sources[n]) for n in _BUILD_DEPS if n in sources and recipe.kind == "setup"
+            n: asdict(sources[n])
+            for n in (*_BUILD_DEPS, *recipe.build_deps)
+            if n in sources and recipe.kind == "setup"
         },
     }
     return kernel_compile.Job(recipe.kind, kernel_cache.Key.of(name, inputs), spec)
@@ -679,7 +738,7 @@ def build_setup(
         deps = work / "deps"
         deps.mkdir()
         for name, row in spec.get("build_deps", {}).items():
-            if util.find_spec(name) is None:
+            if name in recipe.build_deps or util.find_spec(name) is None:
                 _unpack(row, deps)
         environment = {
             key: value

@@ -226,7 +226,7 @@ def test_registration_is_idempotent_local_and_dispatches_real_cpu_attention() ->
 
 def test_new_approximate_backends_remain_explicit_and_architecture_exact() -> None:
     for name, sms in [
-        ("kitchen-int8", {90, 100, 103, 120, 121}),
+        ("kitchen-int8", {80, 86, 87, 89, 90, 100, 103, 110, 120, 121}),
         ("flashinfer-bf16-fp8", {100, 103}),
         ("flash-attn4-fp8", {100, 103}),
         ("sageattention3-fp4", {120}),
@@ -414,7 +414,7 @@ def _cuda(sm: int) -> DeviceFacts:
     return DeviceFacts(kind="cuda", name=f"sm{sm}", sm=sm, driver="", configuration="", index=0)
 
 
-def test_h3_prefers_sol_then_sage_then_fa3_for_every_dit_and_never_fp8() -> None:
+def test_h3_preserves_other_device_preferences_and_never_defaults_dense_fp8() -> None:
     pytest.importorskip("torch")
     pytest.importorskip("diffusers")
     from cozy_runtime.models.minimax_h3.model import DIT_ATTENTION, H3Model, H3TurboBase
