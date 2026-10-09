@@ -10,3 +10,5 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["attention_matrix_gate"]
+[tool.hatch.metadata]
+allow-direct-references = true
