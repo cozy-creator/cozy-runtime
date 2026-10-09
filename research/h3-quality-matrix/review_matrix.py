@@ -380,7 +380,9 @@ def build(manifest: Path, out: Path) -> dict:
     for row in results:
         row["arithmetic_note"] = attention_note(row)
         if row.get("timed") is True and row["verified"]:
-            row["timing_note"] = "Warm execution; setup/download and warmups excluded."
+            row["timing_note"] = (
+                "Warm worker execution; setup, warmups and client transfer excluded."
+            )
     expected = document.get("expected", 16)
     summary = {
         "title": document.get("title", "MiniMax H3 attention comparison"),
@@ -389,8 +391,14 @@ def build(manifest: Path, out: Path) -> dict:
         "runs": results,
         "quality_approval": "Pending user review",
         "gpu_arithmetic_gate": gate,
+        "benchmark_context": (
+            "1× RTX 5090 (575 W) · 15-second 1344×768 / 24 fps video · Turbo, 8 steps. "  # noqa: RUF001
+            "FP8 model + PDD8 LoRA; same prompt and seed per scene. "
+            "Only attention kernel and dense/Sol schedule vary."
+        ),
         "timing_boundary": (
-            "Recorded Cozy execution time; preparation and observer/download time excluded."
+            "Warm worker execution; setup, warmups and client transfer excluded. "
+            "One timed run per cell."
         ),
         "limits": (
             "File/step checks do not establish visual quality or repeated-run speed confidence."
@@ -425,11 +433,15 @@ border:1px solid #657083;border-radius:4px}
 button:disabled{opacity:.45}@media(max-width:700px){.compare-grid{grid-template-columns:1fr}}
 </style>""",
         "<h1>" + escape(summary["title"]) + "</h1>",
+        "<p>" + escape(summary["benchmark_context"]) + "</p>",
+        "<p class=note>" + escape(summary["timing_boundary"]) + "</p>",
         f"<p>{summary['verified']} / {expected} clips verified. "
         "Quality approval awaits your review.</p>",
+        "<p class=note>Refresh this page to see newly completed clips.</p>"
+        if summary["verified"] < expected
+        else "",
         "<p class=note>Checks require all eight denoising steps. "
-        "Videos play at their original quality. Times are recorded execution times; "
-        "consult each timing note for setup/compile qualifications.</p>",
+        "Videos play at their original quality.</p>",
         "<p class=note>"
         + (
             "GPU arithmetic check passed (run "
