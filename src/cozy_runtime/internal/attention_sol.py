@@ -54,6 +54,8 @@ _DENSE_IDENTITY = ""
 NAMES = frozenset(
     {
         "sol-attn",
+        "sol-bf16-fp32",
+        "sol-fp8-fp16-pure",
         "kitchen-sol",
         "kitchen-sol-sage",
         "sol-fp8-fp16",
@@ -139,6 +141,10 @@ def bind_dense(call: Callable[..., Any], identity: str) -> None:
 
 
 def dense_identity(kernel: str = "sol-attn") -> str:
+    if kernel == "sol-bf16-fp32":
+        return "bf16-fp32-dense"
+    if kernel == "sol-fp8-fp16-pure":
+        return "fp8-fp16-dense"
     if kernel in {"kitchen-sol-producer-fp4-lowmem", "kitchen-sol-producer-fp4-lowmem-shared-qkv"}:
         return "sageattention3-fp4-global-lowmem; sparse-prefix=kitchen-int8"
     if kernel == "sol-fp8-fp16-fp4-dense":

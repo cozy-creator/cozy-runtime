@@ -191,3 +191,55 @@ def forward_kernel(
         (output / row_sum[:, None]).to(tl.bfloat16),
         mask=q_valid[:, None],
     )
+
+
+@triton.jit
+def dense_forward_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    q_scale_ptr,
+    k_scale_ptr,
+    v_scale_ptr,
+    o_ptr,
+    scale,
+    Q,
+    K,
+    H: tl.constexpr,
+    D: tl.constexpr,
+):
+    """Unconditionally visit every KV block; no summaries, threshold or routing."""
+    q_block, batch_head = tl.program_id(0), tl.program_id(1)
+    batch, head = batch_head // H, batch_head % H
+    rows = tl.arange(0, 64)
+    dims = tl.arange(0, D)
+    q_tokens = q_block * 64 + rows
+    q_offsets = ((batch * Q + q_tokens[:, None]).to(tl.int64) * H + head) * D + dims[None, :]
+    q = tl.load(q_ptr + q_offsets, mask=q_tokens[:, None] < Q, other=0.0)
+    q_scale = tl.load(q_scale_ptr + (batch * tl.cdiv(Q, 64) + q_block) * H + head)
+    output = tl.zeros([64, D], tl.float32)
+    row_sum = tl.zeros([64], tl.float32)
+    row_max = tl.full([64], -float("inf"), tl.float32)
+    scale_log2 = scale * 1.4426950408889634
+    for block in range(tl.cdiv(K, 64)):
+        kv_tokens = block * 64 + rows
+        offsets = ((batch * K + kv_tokens[:, None]).to(tl.int64) * H + head) * D + dims[None, :]
+        k = tl.load(k_ptr + offsets, mask=kv_tokens[:, None] < K, other=0.0)
+        k_scale = tl.load(k_scale_ptr + (batch * tl.cdiv(K, 64) + block) * H + head)
+        scores = tl.dot(q, tl.trans(k), out_dtype=tl.float16).to(tl.float32)
+        scores *= q_scale * k_scale * scale_log2
+        scores = tl.where(kv_tokens[None, :] < K, scores, -float("inf"))
+        new_max = tl.maximum(row_max, tl.max(scores, axis=1))
+        alpha = tl.math.exp2(row_max - new_max)
+        probability = tl.math.exp2(scores - new_max[:, None])
+        row_sum = row_sum * alpha + tl.sum(probability, axis=1)
+        v = tl.load(v_ptr + offsets, mask=kv_tokens[:, None] < K, other=0.0)
+        v_scale = tl.load(v_scale_ptr + (batch * tl.cdiv(K, 64) + block) * H + head)
+        p_scale = tl.maximum(tl.max(probability, axis=1), 1.0e-6) / 16.0
+        p_fp8 = tl.minimum(probability / p_scale[:, None], 16.0).to(tl.float8e4nv)
+        partial = tl.dot(p_fp8, v, out_dtype=tl.float16).to(tl.float32)
+        output = output * alpha[:, None] + partial * (p_scale[:, None] * v_scale)
+        row_max = new_max
+    tl.store(
+        o_ptr + q_offsets, (output / row_sum[:, None]).to(tl.bfloat16), mask=q_tokens[:, None] < Q
+    )

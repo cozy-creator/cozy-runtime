@@ -34,6 +34,7 @@ from cozy_runtime.internal import (
     accel,
     attention_fp8_sol,
     attention_kitchen_sol,
+    attention_precision,
     attention_producer,
     attention_sol,
     attention_ulysses,
@@ -110,6 +111,23 @@ CANDIDATES: tuple[Candidate, ...] = (
 )
 
 PINNABLE: tuple[Candidate, ...] = (
+    *(
+        Candidate(
+            name=name,
+            backend="_cozy_" + name.replace("-", "_"),
+            local=local,
+            min_sm=120,
+            max_sm=120,
+            sms=frozenset({120}),
+            dtypes=frozenset({"bfloat16"}),
+            max_head_dim=128,
+            head_dims=frozenset({128}),
+            artifact=kernel_sources.PYTHON if name.startswith("sol-") else "",
+            import_name="sol_attn" if name.startswith("sol-") else "",
+            why="Explicit attention precision comparison; dense and sparse arithmetic are fixed.",
+        )
+        for name, local in attention_precision.NAMES.items()
+    ),
     *(
         Candidate(
             name=name,
@@ -537,7 +555,7 @@ def _resolve(candidate: Candidate, device: DeviceFacts, wait: bool = True) -> Re
         or candidate.name in attention_producer.NAMES
     ):
         _resolve(BY_NAME["sageattention"], device, wait)
-    if candidate.name == "sol-attn":
+    if candidate.name in {"sol-attn", "sol-bf16-fp32"}:
         _sol_route(device)
         if device.kind == "cuda":
             attention_sol.submit_card(device.index)

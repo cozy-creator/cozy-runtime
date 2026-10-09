@@ -1,0 +1,2 @@
+[application]
+object = "attention_matrix_gate:app"
