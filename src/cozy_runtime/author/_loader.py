@@ -174,11 +174,12 @@ class Config:
     a dynamic `__getattr__` would be exactly the declared `Any` seam §1.7 deletes.
     """
 
-    __slots__ = ("_data", "_tensor_dtypes", "_where")
+    __slots__ = ("_bound", "_data", "_tensor_dtypes", "_where")
 
     _data: Mapping[str, object]
     _where: str
     _tensor_dtypes: Mapping[str, str] | None
+    _bound: frozenset[str] | None
 
     def __init__(
         self,
@@ -186,8 +187,10 @@ class Config:
         where: str = "config",
         *,
         tensor_dtypes: Mapping[str, str] | None = None,
+        bound: frozenset[str] | None = None,
     ) -> None:
-        """Freeze one in-memory construction config."""
+        """Freeze one in-memory construction config. `bound` names the components the
+        binding selects (None: all); the others' tensors are not in `tensor_dtypes`."""
         for key, value in data.items():
             carrier = _carrier(key, value)
             if carrier is not None:
@@ -208,6 +211,7 @@ class Config:
             "_tensor_dtypes",
             None if tensor_dtypes is None else MappingProxyType(dict(tensor_dtypes)),
         )
+        object.__setattr__(self, "_bound", bound)
 
     def __setattr__(self, name: str, value: object) -> None:
         raise CapabilityError(
@@ -229,16 +233,21 @@ class Config:
                 f"{self._where}.{name} is {type(value).__name__}, not a config section",
                 code="config_kind",
             )
-        return Config(value, f"{self._where}.{name}", tensor_dtypes=self._tensor_dtypes)
+        return Config(
+            value, f"{self._where}.{name}", tensor_dtypes=self._tensor_dtypes, bound=self._bound
+        )
 
     def tensor_dtype(self, key: str, *, default: str) -> str:
         """Logical dtype of a component-qualified checkpoint tensor, before construction.
 
         This is native header metadata, separate from ``mapping()`` and not a compute
-        dtype override. ``default`` applies only to config-only construction; once a
-        checkpoint is supplied, a missing key refuses rather than hiding a typo.
+        dtype override. ``default`` applies to config-only construction and to a component
+        the binding does not select (it stays on meta); a missing key of a bound component
+        refuses rather than hiding a typo.
         """
         if self._tensor_dtypes is None:
+            return default
+        if self._bound is not None and key.split(".", 1)[0] not in self._bound:
             return default
         try:
             return canonical_dtype(self._tensor_dtypes[key])
@@ -729,6 +738,7 @@ class Loader:
                 tensor_dtypes=config._tensor_dtypes
                 if config._tensor_dtypes is not None
                 else {key: spec.dtype for key, spec in self._artifact.tensor_schema.items()},
+                bound=self._backend.bound,
             )
         try:
             obj = factory(config)

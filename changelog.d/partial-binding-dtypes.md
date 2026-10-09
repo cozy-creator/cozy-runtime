@@ -1,0 +1,1 @@
+A construction whose binding selects only some components no longer refuses `config_tensor_missing` when its factory reads the checkpoint dtype of a component it leaves on meta (H3 `encode_text`: `video_vae.decoder.proj_in.weight`); a bound component's missing tensor still refuses.
