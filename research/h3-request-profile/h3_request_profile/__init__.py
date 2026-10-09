@@ -21,7 +21,7 @@ from cozy_runtime.author import (
 )
 from cozy_runtime.models.minimax_h3.model import H3Model, H3TurboBase, H3TurboLoRA
 
-from .instrument import profile_request, retained_handler, software_versions
+from .instrument import profile_request, retained_handler, software_versions, unprofiled_request
 
 app = App()
 
@@ -44,6 +44,7 @@ class TurboInput(msgspec.Struct, kw_only=True):
     profile_detail: bool = False
     full_request_trace: bool = True
     trace_cpu_ops: bool = False
+    profile_enabled: bool = True
 
 
 class RegularInput(TurboInput, kw_only=True):
@@ -104,6 +105,13 @@ def regular(
     if payload.duration_s != 15 or payload.steps != 30:
         raise ValueError("This diagnostic retains the full15-second regular30 request")
     handler = retained_handler("fl2va")
+    if not payload.profile_enabled:
+        return saved(
+            unprofiled_request(
+                model, lambda: handler(ctx, payload, assets, model, out, tel), outputs=out
+            ),
+            out,
+        )
     return saved(
         profile_request(
             model,
@@ -136,6 +144,15 @@ def turbo(
     if payload.duration_s != 15:
         raise ValueError("This diagnostic retains the full15-second Turbo8 request")
     handler = retained_handler("fl2va_turbo")
+    if not payload.profile_enabled:
+        return saved(
+            unprofiled_request(
+                base_model,
+                lambda: handler(ctx, payload, assets, base_model, turbo_lora, out, tel),
+                outputs=out,
+            ),
+            out,
+        )
     return saved(
         profile_request(
             base_model,

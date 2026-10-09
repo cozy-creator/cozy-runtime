@@ -253,6 +253,43 @@ class ObservedOutputs:
             )
 
 
+def unprofiled_request(
+    model: Any, render: Callable[[], Any], *, outputs: Any
+) -> tuple[Any, Any, bytes]:
+    """Run the unchanged handler without profiler, hooks or output/telemetry wrappers."""
+    residency = getattr(model, "_cozy_residency", None)
+
+    def facts() -> dict[str, Any]:
+        if residency is None:
+            return {}
+        return cast(dict[str, Any], msgspec.to_builtins(residency.weights.facts()))
+
+    before = facts()
+    started = time.perf_counter()
+    result = render()
+    wall_ms = (time.perf_counter() - started) * 1000
+    after = facts()
+    summary = json.dumps(
+        {
+            "profile_enabled": False,
+            "trace_collection": "disabled; unprofiled full request",
+            "render_call": {
+                "wall_ms": wall_ms,
+                "plane_before": before,
+                "plane_after": after,
+                "plane_delta": counter_delta(before, after),
+            },
+        }
+    ).encode()
+    # A Tree must contain a file. Keep only explicit disabled-profiling metadata,
+    # not an empty Chrome trace that could be mistaken for a successful capture.
+    with tempfile.TemporaryDirectory(prefix="h3-unprofiled-") as directory:
+        root = Path(directory)
+        (root / "summary.json").write_bytes(summary)
+        trace = outputs.save_tree(root)
+    return result, trace, summary
+
+
 def profile_request(
     model: Any,
     dense_steps: int,
