@@ -52,8 +52,13 @@ def output_files(value: Any) -> Iterator[dict[str, Any]]:
 
 
 def bounded_copy(source: Path, target: Path, remaining: int) -> int:
+    """Return the retained-byte change, crediting an observer's prior saved copy."""
     if source.is_symlink() or not source.is_file():
         raise ValueError(f"Artifact is not a regular file: {source}")
+    previous = target.stat().st_size if target.exists() else 0
+    remaining += previous
+    if remaining < 0:
+        raise ValueError("Artifacts exceed the declared64GiB bound")
     target.parent.mkdir(parents=True, exist_ok=True)
     total = 0
     with source.open("rb") as reader, target.open("wb") as writer:
@@ -62,13 +67,15 @@ def bounded_copy(source: Path, target: Path, remaining: int) -> int:
             if total > remaining:
                 raise ValueError("Artifacts exceed the declared64GiB bound")
             writer.write(chunk)
-    return total
+    return total - previous
 
 
 def retain_outputs(history: dict[str, Any], output_root: Path, artifacts: Path) -> None:
     root = output_root.resolve()
     seen: set[Path] = set()
-    remaining = MAX_ARTIFACT_BYTES
+    remaining = MAX_ARTIFACT_BYTES - sum(
+        path.stat().st_size for path in artifacts.rglob("*") if path.is_file()
+    )
     for item in output_files(history.get("outputs", {})):
         source = (root / item.get("subfolder", "") / item["filename"]).resolve()
         if not source.is_relative_to(root):
@@ -238,14 +245,20 @@ def observe(
                 )
             else:
                 summary = json.loads((source / "summary.json").read_text())
-                if summary.get("steps_observed") != summary.get(
-                    "expected_steps"
-                ) or not summary.get("segments"):
+                expected = summary.get("expected_steps")
+                if (
+                    type(expected) is not int
+                    or expected < 1
+                    or summary.get("steps_observed") != expected
+                    or not summary.get("segments")
+                ):
                     status, detail = (
                         "failed",
                         "Trace does not contain every expected denoising step",
                     )
-                remaining = MAX_ARTIFACT_BYTES
+                remaining = MAX_ARTIFACT_BYTES - sum(
+                    path.stat().st_size for path in artifacts.rglob("*") if path.is_file()
+                )
                 for path in sorted(source.rglob("*")):
                     if path.is_file():
                         remaining -= bounded_copy(

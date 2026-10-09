@@ -5,10 +5,12 @@ cozy run ./research/comfy-cpu-observer/run --rental=RENTAL --input=observer-inpu
 ```
 
 `observer-input.json` supplies `graph_json` (the serialized Comfy API graph),
-optional `port`, `timeout_s` (1–7200 seconds), and `trace`. The default output and
-trace roots match the H3 benchmark installation. Graph inputs are sent unchanged;
+the worker's `output_root`, optional `port`, `timeout_s` (1–7200 seconds), and
+`trace`. Tracing additionally requires the worker's `trace_root`. Graph inputs are sent unchanged;
 benchmark callers must set the text-encoder cache options in the graph themselves.
 Starting/stopping the server remains separate owned maintenance.
+An exclusive benchmark GPU window is still required: this CPU job observes the
+external server and does not itself reserve its GPU against other submissions.
 
 The job is explicitly `accelerator=False`, imports no Torch, and waits for actual
 Comfy completion. The accepted CPU request remains active on the worker while the

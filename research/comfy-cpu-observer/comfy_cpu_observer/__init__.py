@@ -16,11 +16,11 @@ app = App()
 
 class Request(msgspec.Struct, kw_only=True, forbid_unknown_fields=True):
     graph_json: str
+    output_root: str
     port: int = 8188
     timeout_s: int = 3600
     trace: bool = False
-    output_root: str = "/root/h3-single-bench/ComfyUI/output"
-    trace_root: str = "/root/h3-single-bench/full-trace/cuda-only-v2/traces"
+    trace_root: str = ""
 
 
 class Result(msgspec.Struct):
@@ -40,6 +40,8 @@ def run(payload: Request, ctx: Context, scratch: Scratch, out: Outputs) -> Resul
         raise ValueError("Comfy observation requires a CPU allocation")
     if not 1 <= payload.port <= 65535 or not 1 <= payload.timeout_s <= 7200:
         raise ValueError("port must be1..65535 and timeout_s1..7200")
+    if payload.trace and not payload.trace_root:
+        raise ValueError("A traced request requires its server trace_root")
     directory = scratch.checkpoint_dir(key="comfy-observer")
     result = observe(
         payload.graph_json,
