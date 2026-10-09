@@ -69,3 +69,18 @@ CPU-only regression tests use an executable fake CLI with durable request state:
 CUDA_VISIBLE_DEVICES='' python3 -m unittest discover \
   -s research/h3-quality-matrix -p test_batch_matrix.py -v
 ```
+
+Before each **new** submission, a separate read-only `cozy rental show` receipt
+must confirm the manifest's `rental_id`, `runtime_wheel.version`, `tensorfs_version`
+and `driver`, plus ready status, one device, and no running/queued requests.
+Preflight receipts do not mark a submission attempted; a failed check can be
+corrected and retried without entering uncertain-submission recovery. Known
+accepted/completed requests never require this fresh-rental check.
+
+Every video, including manual/recovered files, must match the completed canonical
+`run show` `output[]` video receipt's SHA256 and length. A `watch` result's `saved[]`
+receipt must agree when present; when absent, the canonical output's retained
+local path supplies the file. Missing canonical output evidence always refuses.
+
+The manifest also pins `hub_url`; every new submission uses that explicit
+`--tensorhub` value and includes it in its persisted request identity.

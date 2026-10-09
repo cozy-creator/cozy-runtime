@@ -22,6 +22,11 @@ args = sys.argv[1:]
 with (root / 'calls.jsonl').open('a') as f: f.write(json.dumps(args)+'\n')
 mode = (root / 'mode').read_text()
 state_path = root / 'state.json'
+if args[:2] == ['rental', 'show']:
+    print(json.dumps({'rental_id':'pr-fixed','state':'ready','running':0,'queued':0,
+          'runtime_version':'wrong' if mode=='preflight-bad-runtime' else 'runtime-fixed',
+          'tensorfs_version':'0.4.0','accelerator_count':1,'devices':[{'driver':'driver-fixed'}]}))
+    sys.exit(0)
 if args[1] not in ['show', 'watch']:
     out = pathlib.Path(next(x.split('=',1)[1] for x in args if x.startswith('--out=')))
     out.mkdir(exist_ok=True, parents=True)
@@ -34,6 +39,8 @@ if args[1] not in ['show', 'watch']:
             'execution_ms':280875,'steps':[{'name':'denoise','count':8}],
             'gpus':[{'uuid':'wrong' if mode=='wrong-gpu' else 'GPU-fixed',
                      'attention':{'observed':'fl2va_dit='+selector,'sol':{'sparse':192}}}]}
+    show['output'] = [{'name':'video','type':'video','status':'completed','path':str(video),
+                      'length':video.stat().st_size, 'sha256':result['saved'][0]['digest']}]
     state_path.write_text(json.dumps({'result':result,'show':show}))
     if mode != 'lost-unknown':
         print(json.dumps({'type':'run.created','request_id':'req-fixed'}),file=sys.stderr,flush=True)
@@ -86,6 +93,11 @@ class BatchTests(unittest.TestCase):
                 "target": "/fixed/package/fl2va_turbo",
                 "rental": "owned-rental",
                 "gpu_uuid": "GPU-fixed",
+                "hub_url": "http://fixture-hub",
+                "rental_id": "pr-fixed",
+                "runtime_wheel": {"version": "runtime-fixed"},
+                "tensorfs_version": "0.4.0",
+                "driver": "driver-fixed",
             },
         )
         self.env = patch.dict(os.environ, {"FAKE_COZY_ROOT": str(self.root)})
@@ -116,6 +128,7 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(calls, self.calls())
         self.assertEqual(len(self.submissions()), 1)
         self.assertIn("--await", self.submissions()[0])
+        self.assertIn("--tensorhub=http://fixture-hub", self.submissions()[0])
         self.assertFalse(any(x.startswith("--timeout") for x in self.submissions()[0]))
         Path(row["video"]).write_bytes(b"corrupt")
         with self.assertRaises(batch.ReviewRequired):
@@ -131,7 +144,9 @@ class BatchTests(unittest.TestCase):
         driver.run_case(row)
         self.assertEqual(row["status"], "completed")
         self.assertEqual(len(self.submissions()), 1)
-        self.assertEqual([x[1] for x in self.calls()[1:]], ["show", "watch", "show"])
+        self.assertEqual(
+            [x[1] for x in self.calls() if x[0] == "run"][1:], ["show", "watch", "show"]
+        )
 
     def test_lost_ack_without_id_never_resubmits(self):
         (self.root / "mode").write_text("lost-unknown")
@@ -217,6 +232,40 @@ class BatchTests(unittest.TestCase):
                 show["execution_ms"] = invalid
                 with self.assertRaisesRegex(batch.ReviewRequired, "execution_ms"):
                     batch.proof(row, show, "GPU-fixed")
+
+    def test_preflight_failure_does_not_mark_submission_attempted(self):
+        (self.root / "mode").write_text("preflight-bad-runtime")
+        driver, row = self.driver()
+        with self.assertRaisesRegex(batch.ReviewRequired, "preflight mismatch"):
+            driver.run_case(row)
+        self.assertEqual(row["status"], "pending")
+        self.assertNotIn("driver_state", row)
+        self.assertEqual(self.submissions(), [])
+        self.assertTrue(list(Path(row["output_dir"]).glob("preflight-*.json")))
+        (self.root / "mode").write_text("success")
+        driver, row = self.driver()
+        driver.run_case(row)
+        self.assertEqual(len(self.submissions()), 1)
+
+    def test_canonical_output_binds_manual_and_watch_without_saved(self):
+        driver, row = self.driver()
+        driver.run_case(row)
+        show = json.loads(Path(row["run_show"]).read_text())
+        row["video"] = None
+        evidence = batch.proof(row, show, "GPU-fixed", {"status": "completed"})
+        self.assertEqual(evidence["video"], show["output"][0]["path"])
+        wrong = self.root / "wrong-video.mp4"
+        wrong.write_bytes(b"wrong")
+        row["video"] = str(wrong)
+        with self.assertRaisesRegex(batch.ReviewRequired, "canonical output"):
+            batch.proof(row, show, "GPU-fixed")
+        row["video"] = evidence["video"]
+        show["output"][0]["length"] += 1
+        with self.assertRaisesRegex(batch.ReviewRequired, "canonical output"):
+            batch.proof(row, show, "GPU-fixed")
+        show.pop("output")
+        with self.assertRaisesRegex(batch.ReviewRequired, "canonical video output"):
+            batch.proof(row, show, "GPU-fixed")
 
     def test_pause_then_stop_submits_nothing(self):
         (self.root / "PAUSE").touch()

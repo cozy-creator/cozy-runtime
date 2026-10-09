@@ -160,17 +160,31 @@ def proof(row, show, gpu_uuid, result=None):
     sparse = attention.get("sol", {}).get("sparse", 0)
     if sparse != {"dense4-sol4": 192, "dense8": 0}[row["schedule"]]:
         raise ReviewRequired("Observed sparse-call count does not match schedule")
+    outputs = [
+        o for o in show.get("output", []) if o.get("name") == "video" and o.get("type") == "video"
+    ]
+    if len(outputs) != 1 or outputs[0].get("status") != "completed":
+        raise ReviewRequired("Run show has no unique completed canonical video output")
+    output = outputs[0]
+    expected = str(output.get("sha256", "")).removeprefix("sha256:")
+    length = output.get("length")
+    if not re.fullmatch(r"[0-9a-f]{64}", expected) or type(length) is not int or length <= 0:
+        raise ReviewRequired("Canonical video output lacks a valid SHA256/length")
     saved = [s for s in (result or {}).get("saved", []) if s.get("output") == "video"]
     if len(saved) > 1:
         raise ReviewRequired("Ambiguous video outputs")
-    video = Path(saved[0]["path"] if saved else row.get("video") or "")
-    if not video.is_file() or video.stat().st_size <= 0:
+    if saved and (
+        saved[0].get("digest", "").removeprefix("sha256:") != expected
+        or saved[0].get("bytes") != length
+    ):
+        raise ReviewRequired("CLI export receipt differs from canonical video output")
+    candidates = [saved[0].get("path") if saved else None, row.get("video"), output.get("path")]
+    video = next((Path(path) for path in candidates if path and Path(path).is_file()), None)
+    if video is None:
         raise ReviewRequired("Completed run has no retained local video; recover with watch")
     digest = sha(video)
-    if saved:
-        expected = saved[0].get("digest", "").removeprefix("sha256:")
-        if not expected or expected != digest or saved[0].get("bytes") != video.stat().st_size:
-            raise ReviewRequired("Video bytes/hash differ from CLI export receipt")
+    if digest != expected or video.stat().st_size != length:
+        raise ReviewRequired("Video bytes/hash differ from canonical output receipt")
     previous = row.get("driver_evidence", {})
     if previous.get("video_sha256") and previous["video_sha256"] != digest:
         raise ReviewRequired("Previously verified video changed")
@@ -303,6 +317,74 @@ class Driver:
         )
         self.manifest.save()
 
+    def preflight(self, row):
+        """Read-only evidence, kept separate from submission intent/recovery markers."""
+        data = self.manifest.data
+        expected = {
+            "rental_id": data["rental_id"],
+            "runtime_version": data["runtime_wheel"]["version"],
+            "tensorfs_version": data["tensorfs_version"],
+            "driver": data["driver"],
+        }
+        args = [
+            self.cozy,
+            "rental",
+            "show",
+            data["rental"],
+            "--json",
+            "--fields=machine,rental_id,state,running,queued,runtime_version,tensorfs_version,devices,accelerator_count",
+        ]
+        out = Path(row["output_dir"])
+        out.mkdir(parents=True, exist_ok=True)
+        receipt = out / f"preflight-{time.time_ns()}.json"
+        try:
+            result = subprocess.run(
+                args, stdin=subprocess.DEVNULL, text=True, capture_output=True, timeout=30
+            )
+        except subprocess.TimeoutExpired as error:
+            atomic(
+                receipt,
+                {"argv": args, "error": "read-only preflight timed out", "expected": expected},
+            )
+            raise ReviewRequired("Rental preflight timed out; no submission attempted") from error
+        atomic(
+            receipt,
+            {
+                "argv": args,
+                "returncode": result.returncode,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "expected": expected,
+                "observed_unix_s": time.time(),
+            },
+        )
+        if result.returncode:
+            raise ReviewRequired(
+                f"Rental preflight failed; inspect {receipt}; no submission attempted"
+            )
+        actual = json.loads(result.stdout)
+        mismatch = [
+            key
+            for key in ("rental_id", "runtime_version", "tensorfs_version")
+            if actual.get(key) != expected[key]
+        ]
+        devices = actual.get("devices", [])
+        if (
+            actual.get("state") != "ready"
+            or actual.get("accelerator_count") != 1
+            or len(devices) != 1
+        ):
+            mismatch.append("ready single-GPU rental")
+        if not devices or any(device.get("driver") != expected["driver"] for device in devices):
+            mismatch.append("driver")
+        if actual.get("running") != 0 or actual.get("queued") != 0:
+            mismatch.append("idle rental")
+        if mismatch:
+            raise ReviewRequired(
+                f"Rental preflight mismatch ({', '.join(mismatch)}); "
+                f"inspect {receipt}; no submission attempted"
+            )
+
     def run_case(self, row):
         self.boundary()
         input_hash = sha(row["input"])
@@ -310,6 +392,7 @@ class Driver:
             raise ReviewRequired("Input differs from pinned manifest hash")
         identity = {
             "target": self.manifest.data["target"],
+            "hub_url": self.manifest.data["hub_url"],
             "input_sha256": input_hash,
             "selector": row["attention_selector"],
             "gpu_uuid": self.manifest.data["gpu_uuid"],
@@ -368,6 +451,8 @@ class Driver:
                 row, [self.cozy, "run", "watch", row["request_id"], "--json"], "watch"
             )
         else:
+            self.preflight(row)
+            self.boundary()
             out = Path(row["output_dir"])
             out.mkdir(parents=True, exist_ok=True)
             atomic(out / "submission-identity.json", identity)
@@ -375,6 +460,7 @@ class Driver:
                 self.cozy,
                 "run",
                 self.manifest.data["target"],
+                "--tensorhub=" + self.manifest.data["hub_url"],
                 "--rental=" + self.manifest.data["rental"],
                 "--input=" + row["input"],
                 "--out=" + str(out),
