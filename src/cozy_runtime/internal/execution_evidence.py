@@ -4,9 +4,11 @@ The executor reports one record per process of its group, in process order, as `
 
     {"rank": int, "pid": int, "ordinal": int, "uuid": str, "arch": str,
      "start_us": int, "end_us": int,
-     "attention": {"requested": str, "observed": str, "impl": str, "kernels"?: [kernel]}}
+     "attention": {"requested": str, "observed": str, "impl": str, "kernels"?: [kernel],
+                   "segments"?: [segment]}}
     kernel = {"kernel": str, "state": str, "line": str, "served": bool,
               "progress"?: float, "compile_ms"?: float, "detail"?: str}
+    segment = {"stage": str, "step": int, "at_us": int, "observed": str, "dense": str}
 
 The worker publishes them as `gpus` (`by_gpu`) in the attempt's triage
 `measurements.execution`, the attention observation and the GPU scheduler's grant and release
@@ -22,7 +24,10 @@ since the epoch exceed the ±2^53 integer range canonical JSON (and every JSON r
 processors held, in the pin grammar, and `impl` the kernel implementation under that backend
 when one was observed. `kernels` is every compiled kernel this GPU knows of: `state` ready,
 compiling (with its `progress`), failed or absent, whether it `served` this attempt, and how
-long its compile took.
+long its compile took. `segments` is present when the run took a kernel that finished
+compiling mid-run: each selection from the step of its stage it first served (`stage` "" is
+the run's start), in the pin grammar, with Sol's dense reference (`dense`, "" without Sol).
+`observed` and `kernels` then cover every selection the run served.
 """
 
 from __future__ import annotations
@@ -62,6 +67,7 @@ class RankAttention(TypedDict):
     observed: str
     impl: str
     kernels: NotRequired[list[dict[str, object]]]
+    segments: NotRequired[list[dict[str, object]]]
 
 
 class RankEvidence(TypedDict):
@@ -97,10 +103,13 @@ def attention(
     observed: str = "",
     impl: str = "",
     kernels: Sequence[Mapping[str, Any]] = (),
+    segments: Sequence[Mapping[str, Any]] = (),
 ) -> RankAttention:
     row = RankAttention(requested=requested, observed=observed, impl=impl)
     if kernels:
         row["kernels"] = [dict(kernel) for kernel in kernels]
+    if segments:
+        row["segments"] = [dict(segment) for segment in segments]
     return row
 
 
@@ -146,13 +155,15 @@ def record(
 
 
 def widen(held: dict[int, RankEvidence], row: RankEvidence) -> None:
-    """Fold one mirrored call's record into its process's: earliest start, latest end."""
+    """Fold one mirrored call's record into its process's: earliest start, latest end, and
+    the attention it served through its latest call."""
     current = held.get(row["rank"])
     if current is None:
         held[row["rank"]] = row.copy()
         return
     current["start_us"] = min(current["start_us"], row["start_us"])
     current["end_us"] = max(current["end_us"], row["end_us"])
+    current["attention"] = row["attention"]
 
 
 def gpu_name(devices: Sequence[str], rank: int) -> str:

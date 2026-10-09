@@ -219,7 +219,7 @@ def test_a_kernel_still_compiling_is_evidence_with_its_progress(
     try:
         skipped: dict[str, str] = {}
         assert [ready.name for ready in attention.available(cpu, skipped)] == ["sdpa"]
-        assert "compiling (42%)" in skipped["late"]
+        assert "late" not in skipped  # still compiling is not a skip: it is evidence
         rows = {row["kernel"]: row for row in attention.evidence(("sdpa",))}
         assert rows["sdpa"] == {"kernel": "sdpa", "state": "ready", "line": "ready", "served": True}
         assert rows["late"]["state"] == "compiling" and rows["late"]["progress"] == 0.42

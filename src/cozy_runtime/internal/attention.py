@@ -7,12 +7,12 @@ that is not part of torch is compiled on this machine for this card (`kernel_sou
 architecture, the site's dtype, head dimension and context-parallel support, and that the
 kernel is compiled, imports and launches. A run never waits for a compile: a kernel still
 compiling is skipped, the site serves the best one ready (SDPA always is), and the selection
-records it (`Applied.waiting`) so the construction selects again between requests once it is
-ready (`compiled`). One whose compile failed this machine run is skipped with why, and the
-chain falls through. Explicit pins and model choices wait, and refuse an unsupported or
-failed kernel. Explicit pins refuse an unsupported or
-failed kernel. Automatic selection preserves attention activation precision; quantizing those
-activations requires an explicit backend choice.
+records it (`Applied.waiting`) so the construction selects again once it is ready
+(`compiled`): at the run's next step or stage boundary, and so for the rest of that run (a
+run may mix kernels, owner ruling 2026-10-09). One whose compile failed this machine run is
+skipped with why, and the chain falls through. Explicit pins and model choices wait, and
+refuse an unsupported or failed kernel. Automatic selection preserves attention activation
+precision; quantizing those activations requires an explicit backend choice.
 """
 
 from __future__ import annotations
@@ -952,6 +952,15 @@ class Applied:
     #: kernels this selection passed over while they compiled: ready, they are selected again
     waiting: tuple[str, ...] = ()
 
+    def joined(self, later: Applied) -> Applied:
+        """This selection and one that served after it in the same run: every kernel each
+        component served."""
+        hosts = {component: dict(kernels) for component, kernels in self.hosts.items()}
+        for component, kernels in later.hosts.items():
+            hosts.setdefault(component, {}).update(kernels)
+        artifacts = {**(self.artifacts or {}), **(later.artifacts or {})}
+        return replace(self, hosts=hosts, artifacts=artifacts or None)
+
     def totals(self) -> dict[str, int]:
         out: dict[str, int] = {}
         for kernels in self.hosts.values():
@@ -1595,17 +1604,21 @@ def select(
 
 def compiled(names: Iterable[str], device: DeviceFacts) -> bool:
     """Whether a kernel a selection passed over while it compiled is built now. Reads the
-    store only: it starts no compile and waits for none."""
+    store only: it starts no compile and waits for none. A build that ended is on record
+    (`_STATES`), so the next selection no longer waits on it."""
     store = kernel_cache.configured()
     for name in names:
         candidate = BY_NAME.get(name)
         if store is None or candidate is None or not candidate.artifact:
             continue
         try:
-            if kernel_compile.status(store, _job(candidate, device)).state == "ready":
-                return True
+            state = kernel_compile.status(store, _job(candidate, device))
         except AttentionRefusal:
             continue
+        if state.state != "compiling":
+            _STATES[name] = state
+        if state.state == "ready":
+            return True
     return False
 
 

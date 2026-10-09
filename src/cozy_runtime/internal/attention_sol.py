@@ -123,7 +123,7 @@ def record_rank(rank: int, counts: dict[str, int]) -> None:
 
 def bind_dense(call: Callable[..., Any], identity: str) -> None:
     """Install the dense reference a selection resolved. Selection runs at preparation and at
-    request boundaries, never inside a request, so a rebind never changes a running one."""
+    a run's step and stage boundaries, so a rebind never changes a running step."""
     if not callable(call) or not identity:
         raise ValueError("Sol requires a resolved dense attention reference and its identity")
     global _DENSE, _DENSE_IDENTITY
