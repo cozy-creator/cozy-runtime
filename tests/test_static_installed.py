@@ -56,6 +56,31 @@ def test_describe_exact_installed_wheel_without_package_toml_or_imports(tmp_path
     assert body["jobs"][0]["invocable"]["memoize"] is True
 
 
+def test_installed_description_reads_only_the_wheels_own_modules(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dependency imported at module scope (Torch, Diffusers) is never scanned: describing
+    an H3 environment's callees read 6,389 dependency files and took a minute per boot."""
+    python, metadata = installed(tmp_path)
+    site = metadata.parent
+    (site / "heavy").mkdir()
+    (site / "heavy" / "__init__.py").write_text("from heavy import deep\n")
+    (site / "heavy" / "deep.py").write_text("VALUE = 1\n")
+    (site / "example_app.py").write_text("import heavy\n" + SOURCE)
+    loaded: list[str] = []
+    load = static_interface.Reader._load
+
+    def spy(self: static_interface.Reader, name: str, *args: Any) -> Any:
+        loaded.append(name)
+        return load(self, name, *args)
+
+    monkeypatch.setattr(static_interface.Reader, "_load", spy)
+    body = static_interface.build_installed("example-app", environment_python=python)
+    assert body["jobs"][0]["name"] == "double"
+    assert "example_app" in loaded
+    assert not [name for name in loaded if name.startswith("heavy")]
+
+
 @pytest.mark.parametrize(
     "mutation", ["missing", "ambiguous", "foreign", "dangling", "identity", "ambient"]
 )

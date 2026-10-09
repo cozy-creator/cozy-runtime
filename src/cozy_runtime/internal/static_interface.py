@@ -283,9 +283,12 @@ class Reader:
         *,
         dependency_roots: Sequence[Path] = (),
         wheels: Mapping[str, locked.LockedWheel] | None = None,
+        own: frozenset[str] | None = None,
     ) -> None:
         self.project = project
         self.project_roots = (project / "src", project)
+        #: top-level import names that are this package's own; None: whatever its roots hold
+        self.own = own
         self.roots = (*self.project_roots, *dependency_roots)
         #: published callees, read from the wheels the project's uv.lock pins when needed
         self.wheels = locked.Wheels(wheels or {})
@@ -404,14 +407,19 @@ class Reader:
         top = name.split(".")[0]
         # Dependency source is followed when a declared type needs it. Importing
         # torch at module scope must not scan its entire tree for app registrations.
-        if name in _VOCAB_MODULES or not any(
-            (root / top).is_dir() or (root / f"{top}.py").is_file() for root in self.project_roots
-        ):
+        if name in _VOCAB_MODULES or not self._own(top):
             return None
         try:
             return self.module(name)
         except StaticRefusal:
             return None
+
+    def _own(self, top: str) -> bool:
+        if self.own is not None:
+            return top in self.own
+        return any(
+            (root / top).is_dir() or (root / f"{top}.py").is_file() for root in self.project_roots
+        )
 
     def _tree_tops(self, name: str) -> set[str]:
         top = name.split(".")[0]
@@ -1256,8 +1264,6 @@ def build_installed(distribution: str, *, environment_python: Path) -> dict[str,
     application = entries[0][1].strip()
     if not re.fullmatch(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*:[A-Za-z_]\w*", application):
         raise StaticRefusal("installed application export is invalid", code="static_distribution")
-    reader = Reader(metadata.parent, dependency_roots=roots)
-    entry = reader.application_module(application.partition(":")[0])
 
     # Ownership is by installed path, never a link target: a linked install's targets are
     # in uv's cache, outside site-packages.
@@ -1270,6 +1276,15 @@ def build_installed(distribution: str, *, environment_python: Path) -> dict[str,
         for row in csv.reader(read("RECORD").splitlines())
         if len(row) == 3 and row[0].endswith(".py")
     }
+    # The wheel's own modules are the package: site-packages at large is its dependencies,
+    # followed only where a declared type needs them, never scanned for registrations.
+    own = frozenset(
+        path.relative_to(site).parts[0].removesuffix(".py")
+        for path in owned
+        if path.is_relative_to(site)
+    )
+    reader = Reader(metadata.parent, dependency_roots=roots, own=own)
+    entry = reader.application_module(application.partition(":")[0])
     source = installed(entry.path)
     if not source.is_relative_to(site) or source not in owned:
         raise StaticRefusal(
