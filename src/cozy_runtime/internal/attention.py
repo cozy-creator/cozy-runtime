@@ -469,6 +469,29 @@ def _launch(ready: Ready, device: DeviceFacts) -> None:
         )
 
 
+def _compile_dependencies(
+    candidates: Sequence[Candidate], device: DeviceFacts, wait: bool
+) -> dict[str, dict[str, str] | None]:
+    """Start every independent build before waiting or returning a no-wait refusal."""
+    artifacts: dict[str, dict[str, str] | None] = {}
+    refused: list[tuple[Candidate, AttentionRefusal]] = []
+    for candidate in candidates:
+        try:
+            artifacts[candidate.name] = _compiled(candidate, device, wait=False)
+        except AttentionRefusal as exc:
+            refused.append((candidate, exc))
+    # Known failures refuse even a strict pin immediately; another dependency's
+    # compile does not turn a failed recipe into a queued one.
+    failed = next((exc for _, exc in refused if not exc.code.endswith("_compiling")), None)
+    if failed is not None:
+        raise failed
+    if refused and not wait:
+        raise refused[0][1]
+    for candidate, _ in refused:
+        artifacts[candidate.name] = _compiled(candidate, device, wait=True)
+    return artifacts
+
+
 def _resolve(candidate: Candidate, device: DeviceFacts, wait: bool = True) -> Ready:
     """One candidate compiled, imported and launched on this device, or a typed refusal. A
     site that will run it waits for its build; `available` only asks what is ready."""
@@ -478,14 +501,17 @@ def _resolve(candidate: Candidate, device: DeviceFacts, wait: bool = True) -> Re
     if (candidate.name, device) in _BROKEN:
         raise _BROKEN[(candidate.name, device)]
     _registry()
-    artifact = _compiled(candidate, device, wait) if candidate.artifact else None
+    artifact: dict[str, str] | None
     if candidate.name in attention_kitchen_sol.FP4:
         dense = BY_NAME["sageattention3-fp4-global-lowmem"]
+        artifacts = _compile_dependencies((candidate, dense), device, wait)
         dense_artifact = _resolve(dense, device, wait).artifact or {}
         artifact = {
-            **(artifact or {}),
+            **(artifacts[candidate.name] or {}),
             **{f"dense_{key}": value for key, value in dense_artifact.items()},
         }
+    else:
+        artifact = _compiled(candidate, device, wait) if candidate.artifact else None
     if candidate.import_name:
         module = _import(candidate)
         if candidate.name in attention_kitchen_sol.NAMES | attention_producer.NAMES:
