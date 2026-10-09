@@ -232,7 +232,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("trace", type=Path)
     parser.add_argument(
-        "--parser", type=Path, required=True, help="Path to PR1243 trace_summary.py"
+        "--parser",
+        type=Path,
+        required=True,
+        help="Path to research/h3-request-profile/trace_summary.py",
     )
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument(
