@@ -105,11 +105,43 @@ def model_defaults(value: object) -> dict[str, DefaultLadder]:
     return out
 
 
-def check_model_arguments(defaults: Mapping[str, DefaultLadder], parameters: Sequence[str]) -> None:
-    unknown = sorted(set(defaults) - set(parameters))
+def model_components(value: object) -> dict[str, tuple[str, ...]]:
+    """Copy a `components=` declaration: Model argument -> the components the callable runs.
+    Absent means all of them."""
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping) or len(value) > 16:
+        raise ConformanceError(
+            "components must map at most 16 Model arguments to component names",
+            code="model_components",
+        )
+    out = {}
+    for parameter, names in value.items():
+        if not isinstance(parameter, str) or not parameter.isidentifier():
+            raise ConformanceError(
+                "model components keys must be argument names", code="model_components"
+            )
+        if (
+            not isinstance(names, (list, tuple))
+            or not names
+            or any(not isinstance(name, str) or not name for name in names)
+            or len(set(names)) != len(names)
+        ):
+            raise ConformanceError(
+                f"components[{parameter!r}] must be a non-empty sequence of unique names",
+                code="model_components",
+            )
+        out[parameter] = tuple(names)
+    return out
+
+
+def check_model_arguments(
+    declared: Mapping[str, object], parameters: Sequence[str], *, what: str = "defaults"
+) -> None:
+    unknown = sorted(set(declared) - set(parameters))
     if unknown:
         raise ConformanceError(
-            "defaults name arguments that are not injected Models: " + ", ".join(unknown),
-            code="model_defaults",
+            f"{what} name arguments that are not injected Models: " + ", ".join(unknown),
+            code=f"model_{what}",
             fields=unknown,
         )

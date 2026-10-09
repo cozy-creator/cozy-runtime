@@ -171,10 +171,12 @@ def _schema_view(doc: Mapping[str, Json], body: Mapping[str, Json], kind: str) -
     lines += _fields(doc["result"])
     for slot in _as_list(doc.get("models", [])):
         assert isinstance(slot, dict)
+        runs = ", ".join(map(str, _as_list(slot.get("components", []))))
         lines.append(
             f"model {slot['path']} -> {slot['class']}  "
             f"encoded_leaves: {slot.get('encoded_leaves', 'refuse')}"
             + (f"  fusion: {slot['fusion']}" if "fusion" in slot else "")
+            + (f"  runs: {runs}" if runs else "")
         )
         components = slot["component_use"]
         assert isinstance(components, dict)

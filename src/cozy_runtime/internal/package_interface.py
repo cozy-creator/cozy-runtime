@@ -82,6 +82,8 @@ class ModelSlot(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
     fusion: str = "refuse"
     default_ladder: tuple[LadderRung, ...] | msgspec.UnsetType = msgspec.UNSET
     sequence_parallel: SequenceParallel | msgspec.UnsetType = msgspec.UNSET
+    #: the components this callable runs; unset means all of them
+    components: tuple[str, ...] | msgspec.UnsetType = msgspec.UNSET
 
     @property
     def parameter(self) -> str:
@@ -197,6 +199,7 @@ def _callable(surface: Surface) -> dict[str, Json]:
                 binding.components,
                 binding.sequence_parallel,
                 defaults=surface.model_defaults.get(binding.param, ()),
+                uses=surface.model_components.get(binding.param, ()),
             )
             for binding in surface.model_bindings
         ],
@@ -292,10 +295,12 @@ def model_slot(
     sequence_parallel: Sequence[int],
     *,
     defaults: DefaultLadder = (),
+    uses: Sequence[str] = (),
 ) -> dict[str, Json]:
     """One model slot. The PATH is the binding point, the CLASS carries `encoded_leaves`,
     and the per-public-method component sets are the ComponentUseContracts. Optional authored
-    defaults are unresolved source metadata; exact artifact selection remains dispatch-owned."""
+    defaults are unresolved source metadata; exact artifact selection remains dispatch-owned.
+    `uses` names the components the callable runs (`components`); empty means all."""
     doc: dict[str, Json] = {
         "path": path,
         "class": class_name,
@@ -315,6 +320,16 @@ def model_slot(
             {"gpu": gpu, **({"gpus": gpus} if gpus else {}), "lane": lane}
             for gpu, gpus, lane in defaults
         ]
+    if uses:
+        unknown = sorted(set(uses) - {name for names in components.values() for name in names})
+        if unknown:
+            raise ConformanceError(
+                f"{path}: components names {', '.join(unknown)}, which no "
+                f"@uses_components method of {class_name} declares",
+                code="model_components",
+                fields=unknown,
+            )
+        doc["components"] = sorted(set(uses))
     if sequence_parallel:
         # The author's opt-in to a group lane (cr-068): the degrees the class's attention
         # shards at. Closed and optional; a slot without it is never sharded.
@@ -625,6 +640,12 @@ def _model_slot(slot: ModelSlot, name: str, source: str, path: str) -> None:
         for _, gpus, _ in default_ladder(msgspec.to_builtins(slot.default_ladder))
     ):
         _invalid(source, path, "default GPU count is not a declared sequence-parallel degree")
+    if slot.components is not msgspec.UNSET and (
+        not slot.components
+        or len(set(slot.components)) != len(slot.components)
+        or not set(slot.components) <= {c for names in slot.component_use.values() for c in names}
+    ):
+        _invalid(source, f"{path}.components", "must be non-empty, unique and within component_use")
     prefix = f"{name}.models."
     if not slot.path.startswith(prefix) or not slot.path[len(prefix) :]:
         _invalid(source, f"{path}.path", f"must start with {prefix!r}")

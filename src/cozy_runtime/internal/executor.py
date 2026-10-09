@@ -1177,8 +1177,12 @@ class Executor:
                 installed = cp.install_context_parallel(model, degree=self.world, comms=owner.comms)
             except GroupRefusal as exc:
                 return self._group_refusal(exc)
-        for _label, component in candidates:
+        record = model._cozy_record
+        skipped = set(record.skipped) if record is not None else set()
+        for label, component in candidates:
             component_name = next((name for name, root in roots.items() if root is component), None)
+            if component_name is None and label.rpartition(".")[2] in skipped:
+                continue  # on meta: the binding does not select it
             if component_name is None:
                 return self._group_refusal(
                     GroupRefusal("a sharded component is not a prepared root")
@@ -2555,6 +2559,8 @@ class Executor:
             },
             "ignored_extra_keys": list(record.ignored_extras),
             "ignored_extra_warnings": list(record.ignored_warnings),
+            # built components the binding does not select: left on meta
+            "skipped_components": list(record.skipped),
             "fit": record.fit,
             "plan": plan.seam_document(),
             "delivery": plan.wire_document(),
@@ -3970,6 +3976,7 @@ class Executor:
                         invocable=True,
                         memoize=declared.memoize,
                         model_defaults=declared.defaults,
+                        model_components=declared.components,
                     ).surface
                     request_type, result_type = surface.payload_type, surface.result_type
                     if not (

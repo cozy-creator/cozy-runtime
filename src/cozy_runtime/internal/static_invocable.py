@@ -70,6 +70,7 @@ def build(reader: Reader, registration: Registration) -> dict[str, Json]:
                     model.components,
                     model.sequence_parallel,
                     defaults=registration.model_defaults.get(arg.arg, ()),
+                    uses=registration.model_components.get(arg.arg, ()),
                 )
             )
             fields.append((arg.arg, author.ModelArtifact | None, None))
@@ -157,10 +158,9 @@ def build(reader: Reader, registration: Registration) -> dict[str, Json]:
     )
     if registration.weights and "weights" not in capabilities:
         capabilities.append("weights")
-    check_model_arguments(
-        registration.model_defaults,
-        [str(slot["path"]).rsplit(".", 1)[-1] for slot in models],
-    )
+    slots = [str(slot["path"]).rsplit(".", 1)[-1] for slot in models]
+    check_model_arguments(registration.model_defaults, slots)
+    check_model_arguments(registration.model_components, slots, what="components")
     metadata = invocable_interface.from_types(
         payload,
         result,
