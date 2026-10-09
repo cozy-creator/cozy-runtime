@@ -55,7 +55,7 @@ import socket
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -469,6 +469,23 @@ def _local_attention_pin(pin: str, parameters: tuple[str, ...]) -> str:
     return attention.for_model(pin, parameters)
 
 
+def _dense(kernels: Iterable[str]) -> str:
+    """The dense reference the Sol kernels among `kernels` recompute rows with."""
+    sparse = sorted(attention_sol.NAMES.intersection(kernels))
+    return ", ".join(dict.fromkeys(attention_sol.dense_identity(name) for name in sparse))
+
+
+def _segment(stage: str, step: int, held: attention.Applied, at_us: int = 0) -> dict[str, Any]:
+    """A selection a run served from step `step` of `stage` on (`execution_evidence`)."""
+    return {
+        "stage": stage,
+        "step": step,
+        "at_us": at_us or execution_evidence.now_us(),
+        "observed": execution_evidence.observed(held.hosts),
+        "dense": _dense(held.totals()),
+    }
+
+
 class Executor:
     """One epoch's mutable state. Everything here dies with the process.
 
@@ -514,9 +531,8 @@ class Executor:
         self.load_reply: dict[str, Any] = {}
         #: follower only: the attempt spool and allocator bytes at its first mirrored call
         self._run_entry: tuple[Path, int] | None = None
-        #: follower only: the attention its processors held at that first call, and its kernels
-        self._run_attention = ""
-        self._run_served: tuple[str, ...] = ()
+        #: follower only: every kernel its processors held across that attempt's calls
+        self._run_held = attention.Applied({}, ())
         #: HOST ONLY: this process's start, for the execution record (wall ms and its legs)
         self.boot: dict[str, Any] = {}
         #: HOST ONLY: this rank's pid, host ordinal, GPU uuid and arch, read once after device init
@@ -790,6 +806,7 @@ class Executor:
         start_us: int,
         end_us: int,
         impl: str = "",
+        segments: Sequence[Mapping[str, Any]] = (),
     ) -> dict[str, Any]:
         """The attempt's execution record: degree, every rank, and the setup it ran on."""
         ranks = [
@@ -803,6 +820,7 @@ class Executor:
                     execution_evidence.observed(choices.hosts) if choices else "",
                     impl,
                     attention.evidence(choices.totals() if choices else ()),
+                    segments,
                 ),
             )
         ]
@@ -978,14 +996,15 @@ class Executor:
         answered = False
         try:
             spool = Path(command["spool"])
+            held = attention.observed(
+                {f"{m}/{c}": root for (m, c), (_, root) in self.group_components.items()}
+            )
             if self._run_entry is None or self._run_entry[0] != spool:
                 accel.reset_peak(self.torch, self.device_kind)
                 self._run_entry = (spool, accel.allocated(self.torch, self.device_kind))
-                held = attention.observed(
-                    {f"{m}/{c}": root for (m, c), (_, root) in self.group_components.items()}
-                )
-                self._run_attention = execution_evidence.observed(held.hosts)
-                self._run_served = tuple(held.totals())
+                self._run_held = held
+            # A run takes rank 0's kernel at a step boundary (`_upgrade_attention`).
+            self._run_held = self._run_held.joined(held)
             scopes = command["scopes"]
             if not isinstance(scopes, list) or not 1 <= len(scopes) <= len(models):
                 raise GroupRefusal("mirrored scope set is not a bounded prepared model set")
@@ -1129,9 +1148,9 @@ class Executor:
                 started_us,
                 execution_evidence.now_us(),
                 execution_evidence.attention(
-                    observed=self._run_attention,
+                    observed=execution_evidence.observed(self._run_held.hosts),
                     impl=attention.implementations(served),
-                    kernels=attention.evidence(self._run_served),
+                    kernels=attention.evidence(self._run_held.totals()),
                 ),
             ),
         }
@@ -3076,6 +3095,30 @@ class Executor:
         sol_rank_counts: dict[int, dict[str, int]] = {}
         sol_kernels: list[dict[str, Any]] = []
         served_impls: dict[str, set[str]] = {}
+        # A kernel that finishes compiling mid-run serves from the next step or stage on
+        # (`_upgrade_attention`): each selection the run served and from which step.
+        segments: list[dict[str, Any]] = []
+        later: list[attention.Applied] = []
+        steps: dict[str, int] = {}
+        handler = threading.get_ident()
+
+        def boundary(frame: Any) -> None:
+            progress(frame)
+            if not isinstance(frame, ProgressFrame) or threading.get_ident() != handler:
+                return
+            if frame.position is not None:
+                steps[frame.stage] = frame.position
+            if pin or served_attention is None:
+                return
+            if not segments:
+                segments.append(_segment("", 0, served_attention, started_us))
+            if not self._upgrade_attention():
+                return
+            later.append(attention.observed(self._attention_roots()))
+            row = _segment(frame.stage, steps.get(frame.stage, 0), later[-1])
+            if row["observed"] != segments[-1]["observed"] or row["dense"] != segments[-1]["dense"]:
+                segments.append(row)
+
         capture = None
         capture_result: dict[str, Any] | None = None
         record: AuthorAttempt | None = None
@@ -3101,7 +3144,7 @@ class Executor:
                             device=self._device(),
                             cancel=lambda: _cancelled(self.root, command.request_id),
                             models=self.models,
-                            progress=progress,
+                            progress=boundary,
                             activity=self._activity_sink(command.request_id),
                             # cr-012: the inputs the WORKER already fetched, verified and spooled.
                             # Every value is a path inside this attempt's own spool: this process is
@@ -3124,6 +3167,11 @@ class Executor:
                 record = AuthorAttempt(command.request_id, spool, 0, sink=progress)
         assert record is not None
         stage_memo.ENGINE.close(record.emit)
+        if later:
+            # The override put back the run's first selection; the construction keeps its last.
+            self._restore_attention()
+            for held in later:
+                served_attention = served_attention.joined(held) if served_attention else held
         if served_attention is not None:
             self._emit_attention(record, served_attention, "attention.selected")
             sparse_kernels = sorted(attention_sol.NAMES.intersection(served_attention.totals()))
@@ -3135,9 +3183,7 @@ class Executor:
                     sparse_name,
                     rank=0,
                     world=self.world,
-                    dense_reference=", ".join(
-                        dict.fromkeys(attention_sol.dense_identity(name) for name in sparse_kernels)
-                    ),
+                    dense_reference=_dense(sparse_kernels),
                     **sol_counts,
                 )
                 for rank, counts in sorted(sol_rank_counts.items()):
@@ -3159,7 +3205,7 @@ class Executor:
         # Nothing was swapped, so the restore left the sites exactly as the entry walk read them.
         restored = (
             served_attention
-            if swap is None and not pin and served_attention is not None
+            if swap is None and not pin and served_attention is not None and not later
             else attention.observed(self._attention_roots())
         )
         self._emit_attention(record, restored, "attention.restored")
@@ -3252,6 +3298,7 @@ class Executor:
                 started_us,
                 released_us,
                 attention.implementations(served_impls),
+                segments if len(segments) > 1 else (),
             ),
             "capture": capture_result,
             "quiescent": quiescent,
@@ -3374,11 +3421,14 @@ class Executor:
             return None
         return attention.plan(self._attention_device(pin), roots, pin, self.world)
 
-    def _upgrade_attention(self) -> None:
-        """BETWEEN REQUESTS (a run never waits for a compile): a kernel the selection passed
-        over while it compiled is ready, so the construction selects again and serves it from
-        this request on; a group's followers take rank 0's kernels. Where they cannot, the
-        prepared selection stays."""
+    def _upgrade_attention(self) -> bool:
+        """A RUN NEVER WAITS FOR A COMPILE: at each step or stage boundary of a run, and
+        between requests, a kernel the selection passed over while it compiled is ready, so
+        the construction selects again and serves it from the next step on (a run may mix
+        kernels, owner ruling 2026-10-09); a group's followers take rank 0's kernels once no
+        call holds them. Where a selection or a follower cannot, the prepared one stays and
+        is not tried again. Whether any construction selected again."""
+        upgraded = False
         for executor in self.model_executors or [self]:
             applied, again, device = executor.attention, executor._reselect, executor.device_facts
             if applied is None or again is None or device is None or not applied.waiting:
@@ -3387,16 +3437,25 @@ class Executor:
                 continue
             try:
                 fresh = again()
-            except attention.AttentionRefusal:
+            except Exception as exc:  # an upgrade is never worth a failed run
+                print(
+                    f"[attention] selecting again refused: {exc}"[:600], file=sys.stderr, flush=True
+                )
                 executor.attention_defaults.restore()
+                executor.attention = replace(applied, waiting=())
                 continue
-            if executor.group is not None and executor._agree_attention(fresh, poison=False):
-                executor.attention_defaults.restore()
-                executor._agree_attention(applied, poison=False)
-                continue
+            if executor.group is not None:
+                with executor.group.hold(range(1, executor.group.degree)):
+                    if executor._agree_attention(fresh, poison=False):
+                        executor.attention_defaults.restore()
+                        executor._agree_attention(applied, poison=False)
+                        executor.attention = replace(applied, waiting=())
+                        continue
             assert executor.backend is not None
             executor.attention = fresh
             executor.attention_defaults = attention.snapshot(dict(executor.backend.roots))
+            upgraded = True
+        return upgraded
 
     def _agree_attention(
         self, applied: attention.Applied, *, poison: bool = True
@@ -3578,11 +3637,7 @@ class Executor:
                     component=component,
                     sites=sites,
                     pin=choices.pin,
-                    dense_reference=(
-                        attention_sol.dense_identity(kernel)
-                        if kernel in attention_sol.NAMES
-                        else ""
-                    ),
+                    dense_reference=_dense((kernel,)),
                 )
 
     def _execution_observation(self, choices: attention.Applied | None = None) -> dict[str, Any]:
