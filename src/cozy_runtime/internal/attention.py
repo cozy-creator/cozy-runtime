@@ -5,10 +5,12 @@ Every kernel is a Runtime-local forward (`attention_upstream`, `attention_sol`) 
 that is not part of torch is compiled on this machine for this card (`kernel_sources`,
 `kernel_compile`) and serves once its artifact is published: selection checks the device's
 architecture, the site's dtype, head dimension and context-parallel support, and that the
-kernel is compiled, imports and launches. A kernel a site needs that is still compiling is
-waited for, by its build's measured progress (`kernel_compile.wait`): a selection never serves
-another kernel in its place. One whose compile failed this machine run is skipped with why,
-and the chain falls through; SDPA is always ready. Explicit pins refuse an unsupported or
+kernel is compiled, imports and launches. A run never waits for a compile: a kernel still
+compiling is skipped, the site serves the best one ready (SDPA always is), and the selection
+records it (`Applied.waiting`) so the construction selects again between requests once it is
+ready (`compiled`). One whose compile failed this machine run is skipped with why, and the
+chain falls through. Explicit pins and model choices wait, and refuse an unsupported or
+failed kernel. Explicit pins refuse an unsupported or
 failed kernel. Automatic selection preserves attention activation precision; quantizing those
 activations requires an explicit backend choice.
 """
@@ -73,6 +75,8 @@ class Candidate:
     why: str = ""
     sms: frozenset[int] = frozenset()
     head_dims: frozenset[int] = frozenset()
+    #: the exact (head dimension, dtype) pairs its build serves; empty is every pair above
+    shapes: frozenset[tuple[int, str]] = frozenset()
 
 
 _HALF = frozenset({"bfloat16", "float16"})
@@ -86,6 +90,9 @@ CANDIDATES: tuple[Candidate, ...] = (
         max_sm=90,  # upstream's hopper/ builds sm_90a only; elsewhere it exits from C++
         dtypes=_HALF,
         max_head_dim=256,
+        # What the packages' sites run (`kernel_sources._FA3_SHAPES`), and all its build has:
+        # H3's and Qwen Image's transformers, H3's video VAE.
+        shapes=frozenset({(128, "bfloat16"), (64, "float16")}),
         artifact="flash-attn3",
         import_name="flash_attn_interface",
         why=(
@@ -115,7 +122,7 @@ PINNABLE: tuple[Candidate, ...] = (
         max_sm=90,
         dtypes=_HALF,
         max_head_dim=128,
-        artifact="flash-attn3",
+        artifact="flash-attn3-full",
         import_name="flash_attn_interface",
         why=(
             "Explicit experiment, numerically out of its budget at H3 length: rel L2 0.31 "
@@ -190,7 +197,7 @@ PINNABLE: tuple[Candidate, ...] = (
         dtypes=_HALF,
         max_head_dim=128,
         max_sm=90,
-        artifact="sageattention",
+        artifact="sageattention-full",
         import_name="sageattention",
         why=(
             "Explicit experiment: INT8 Q/K + FP16 P/V (FP32 accumulation), upstream's SM80 "
@@ -317,9 +324,14 @@ def _compiled(candidate: Candidate, device: DeviceFacts, wait: bool) -> dict[str
     when `wait`, or refuse with its state: `failed` for this machine run, `absent`, or
     `compiling` for a caller that only asks. A package environment that carries the module
     itself serves it, as its pinned version always has."""
-    if util.find_spec(candidate.import_name.split(".")[0]) is not None:
-        return None
     store = kernel_cache.configured()
+    found = util.find_spec(candidate.import_name.split(".")[0])
+    origin = str(found.origin or "") if found is not None else ""
+    built = store is not None and origin.startswith(
+        tuple(str(n) for n in (store.own, store.trusted) if n is not None)
+    )
+    if found is not None and not built:
+        return None
     if store is None:
         raise AttentionRefusal(
             "attention_kernel_absent", f"{candidate.name}: no machine kernel store to compile into"
@@ -331,7 +343,15 @@ def _compiled(candidate: Candidate, device: DeviceFacts, wait: bool) -> dict[str
         raise AttentionRefusal(
             f"attention_kernel_{state.state}", f"{candidate.name}: {state.line()}"
         )
-    site.addsitedir(str(Path(state.path) / kernel_cache.SITE))
+    tree = Path(state.path) / kernel_cache.SITE
+    if built and not origin.startswith(str(tree)):
+        # One process imports one build of a module: another variant needs a fresh executor.
+        raise AttentionRefusal(
+            "attention_kernel_unavailable",
+            f"{candidate.name}: this executor runs {origin}, another build of "
+            f"{candidate.import_name}; a fresh executor serves it",
+        )
+    site.addsitedir(str(tree))
     return {"artifact": job.key.kernel, "key": job.key.digest[:16], "compile_ms": str(state.ms)}
 
 
@@ -467,8 +487,9 @@ def _sol_dense(
     """The kernel Sol recomputes dense rows with (its dense steps, protected prefix and dense
     paths): the first one after Sol in the model's preference that serves BF16 at head
     dimension 128 on this rank, else the first ranked one. It runs locally after the Ulysses
-    exchange, so it needs no context parallelism. One still compiling is waited for (run
-    1565: SDPA served Sol's dense steps at 35 s where SageAttention takes about 24 s)."""
+    exchange, so it needs no context parallelism. One still compiling is passed over (run
+    1565: SDPA served Sol's dense steps at 35 s where SageAttention takes about 24 s, the
+    price of not waiting) and selected again once ready."""
     for name in (*order, *(candidate.name for candidate in CANDIDATES)):
         candidate = BY_NAME.get(name)
         if (
@@ -480,7 +501,7 @@ def _sol_dense(
             continue
         if name not in resolved:
             try:
-                resolved[name] = _resolve(candidate, device)
+                resolved[name] = _resolve(candidate, device, wait=False)
             except Exception as exc:
                 refused.setdefault(name, f"{type(exc).__name__}: {exc}"[:300])
                 continue
@@ -774,6 +795,8 @@ def _dtype(module: Any) -> str:
 
 
 def _admits(candidate: Candidate, dtype: str, head_dim: int) -> bool:
+    if candidate.shapes and (head_dim, dtype) not in candidate.shapes:
+        return False
     if candidate.head_dims and head_dim not in candidate.head_dims:
         return False
     if candidate.dtypes and dtype not in candidate.dtypes:
@@ -803,6 +826,8 @@ class Applied:
     artifacts: dict[str, dict[str, str]] | None = None
     #: ranked kernels auto-selection could not use here, and why (a compiling one's progress)
     skipped: dict[str, str] | None = None
+    #: kernels this selection passed over while they compiled: ready, they are selected again
+    waiting: tuple[str, ...] = ()
 
     def totals(self) -> dict[str, int]:
         out: dict[str, int] = {}
@@ -1016,10 +1041,11 @@ def _preferred(
                 _unsupported(name, reason)
             continue
         try:
-            resolved[name] = _resolve(candidate, device)
+            resolved[name] = _resolve(candidate, device, wait=False)
         except Exception as exc:
             # As in `available`: a preferred kernel that does not resolve or compute here
-            # leaves the walk rather than failing a prepare that has a later preference.
+            # (or still compiles) leaves the walk rather than holding a run that has a later
+            # preference.
             refused[name] = f"{type(exc).__name__}: {exc}"[:300]
             continue
         return resolved[name]
@@ -1171,7 +1197,8 @@ def install(
     if skipped is not None:
         skipped.update(refused)
     artifacts = {name: entry.artifact for name, entry in resolved.items() if entry.artifact}
-    return Applied(hosts, tuple(resolved), pin, artifacts or None)
+    waiting = tuple(sorted(n for n, state in _STATES.items() if state.state == "compiling"))
+    return Applied(hosts, tuple(resolved), pin, artifacts or None, waiting=waiting)
 
 
 def _install_sites(records: Sequence[tuple[Ready, str, str, Any]]) -> None:
@@ -1413,6 +1440,22 @@ def select(
         ready = [entry for entry in ready if entry.name != name] + pinned(name, device)
     applied = install(ready, roots, pin, degree, device=device, choose=choose, skipped=skipped)
     return replace(applied, skipped=skipped or None)
+
+
+def compiled(names: Iterable[str], device: DeviceFacts) -> bool:
+    """Whether a kernel a selection passed over while it compiled is built now. Reads the
+    store only: it starts no compile and waits for none."""
+    store = kernel_cache.configured()
+    for name in names:
+        candidate = BY_NAME.get(name)
+        if store is None or candidate is None or not candidate.artifact:
+            continue
+        try:
+            if kernel_compile.status(store, _job(candidate, device)).state == "ready":
+                return True
+        except AttentionRefusal:
+            continue
+    return False
 
 
 def image_kernels(device: DeviceFacts) -> str:

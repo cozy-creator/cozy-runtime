@@ -5,13 +5,13 @@ The machine launches `python -m cozy_runtime.internal.machine_kernels` once per 
 generation, under that generation's own seal: its interpreter and torch, every card of the
 machine, and the kernel store and scratch scope its executors use. Each key here is therefore
 the key an executor computes, by the same functions. For each distinct card architecture it
-starts every artifact of `LADDER` the card admits at once, through the compile manager: each
-wide build holds one of the machine's build slots, one per wide build here, and takes that
-share of the machine's width, niced; Sol's card objects start once its sources are in. So the
-kernel a request needs first never queues behind one it does not. An executor finds each one
-ready or building, and waits for the one it needs (`kernel_compile.wait`): it builds none
-twice and serves no other kernel in its place. This process holds no device memory. It prints
-one JSON line per artifact as it ends and a last one, and exits nonzero when one failed.
+starts every artifact of `LADDER` the card admits at once, through the compile manager, niced:
+the machine's compile ledger admits their compiler jobs within its CPUs and memory
+(`kernel_compile.compiler_job`); Sol's card objects start once its sources are in. A request
+finds each one ready or building and never waits for one: it serves the best kernel ready
+(`attention`), and no executor builds a key twice. This process holds no device memory. It
+prints one JSON line per artifact as it ends and a last one, and exits nonzero when one
+failed.
 """
 
 from __future__ import annotations
@@ -101,9 +101,6 @@ def main() -> int:
         kernel_cache.configure(store)
         kernel_compile.waiting = progress
         jobs = ladder(present)
-        kernel_compile.machine_slots(
-            store.own, sum(job.kind in kernel_compile.WIDE for job in jobs)
-        )
         for job in jobs:
             kernel_compile.submit(store, job)
         sources = [job for job in jobs if job.key.kernel == kernel_sources.PYTHON]

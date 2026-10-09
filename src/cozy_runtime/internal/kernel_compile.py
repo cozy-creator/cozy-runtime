@@ -10,9 +10,10 @@ request (`machine_kernels`).
 
 The builder is `python -m cozy_runtime.internal.kernel_compile` under the caller's own
 interpreter and import path, so an extension builds against the torch that will import it. It
-inherits the key's lock, takes one of the machine's build slots (flock files, so a dead
-builder frees its slot), runs at nice 19, and is ended only on a PROVEN wedge (`liveness`): its
-whole process tree stopped burning CPU and writing output, against its own observed pace.
+inherits the key's lock, runs at nice 19, and is ended only on a PROVEN wedge (`liveness`):
+every compiler on the machine stopped burning CPU and writing output, against its own
+observed pace. Each of its compiler jobs is admitted by the machine's compile ledger
+(`compiler_job`), within the CPUs and the memory each job is measured to take.
 A failure is recorded in the machine run's scratch scope (`TMPDIR`), which the next run starts
 without.
 """
@@ -48,9 +49,6 @@ BUILDERS = {
     "sol": "cozy_runtime.internal.attention_sol:build",
     "fusion": "cozy_runtime.internal.fusion:build",
 }
-#: Kinds that run many compiler processes: each holds one of the machine's build slots and
-#: builds with that share of its width (`width`). The others are one Python process each.
-WIDE = frozenset({"setup"})
 _BOOT = (
     "import json, sys; boot = json.loads(sys.argv.pop(1)); sys.path[:] = boot['path']; "
     "sys.pycache_prefix = boot['pycache_prefix']; "
@@ -329,19 +327,22 @@ def _record_failure(
 # --------------------------------------------------------------------- the builder process
 
 
-def width(unit_bytes: int, share: int = 1) -> int:
-    """How many compiler processes one wide build runs: its `share` of every CPU this process
-    may use (its affinity and its cgroup's quota), as far as the memory it may still take
-    holds one `unit_bytes` process each. Measured each build; the machine is the pod's."""
-    cpus = len(os.sched_getaffinity(0))
+def cpus() -> int:
+    """Every CPU this process may use: its affinity and its cgroup's quota."""
+    count = len(os.sched_getaffinity(0))
     quota = _read("/sys/fs/cgroup/cpu.max").split()
     if len(quota) == 2 and quota[0].isdigit() and quota[1].isdigit() and int(quota[1]):
-        cpus = min(cpus, -(-int(quota[0]) // int(quota[1])))
+        count = min(count, -(-int(quota[0]) // int(quota[1])))
+    return count
+
+
+def available_memory() -> int:
+    """The memory this process may still take: the host's available, within its cgroup's."""
     memory = [_meminfo("MemAvailable")]
     limit, used = _read("/sys/fs/cgroup/memory.max"), _read("/sys/fs/cgroup/memory.current")
     if limit.isdigit() and used.isdigit():
         memory.append(int(limit) - int(used))
-    return max(1, min(cpus, min(memory) // unit_bytes) // share)
+    return min(memory)
 
 
 def _read(path: str) -> str:
@@ -356,51 +357,83 @@ def _meminfo(field: str) -> int:
     return int(found.group(1)) * 1024 if found else 0
 
 
-def machine_slots(namespace: Path, count: int) -> list[Path]:
-    """The machine's build slots, one per wide build its kernel boot starts at once; the boot
-    creates them for its executors."""
-    directory = namespace / ".slots"
-    directory.mkdir(mode=0o755, parents=True, exist_ok=True)
-    wanted = {f"{index}.lock" for index in range(max(1, count))}
-    for path in directory.glob("*.lock"):
-        if path.name not in wanted:
-            path.unlink(missing_ok=True)
-    for name in wanted:
-        os.close(os.open(directory / name, os.O_RDONLY | os.O_CREAT | os.O_CLOEXEC, 0o644))
-    return _slots(namespace)
+# ----------------------------------------------------------------- the machine's compile ledger
 
 
-def _slots(namespace: Path | None) -> list[Path]:
-    return sorted((namespace / ".slots").glob("*.lock")) if namespace is not None else []
+def ledger(store: kernel_cache.Store) -> Path:
+    """The machine's one compile ledger: in the trusted namespace when this process may write
+    it (an executor under uid isolation may not, and keeps its own)."""
+    shared = store.trusted is not None and os.access(store.trusted, os.W_OK)
+    return ((store.trusted if shared else None) or store.own) / ".compile.json"
 
 
 @contextlib.contextmanager
-def _slot(store: kernel_cache.Store, kind: str) -> Iterator[int]:
-    """The share of the machine a build takes: a wide build holds one of the machine's build
-    slots, waiting while live builders hold them all, and takes one slot's share of its
-    width; others need none. The slots live in the trusted namespace when this process reads
-    one (an executor under uid isolation), so the machine has one set; they are flocks, so a
-    builder that dies frees its slot."""
-    if kind not in WIDE:
-        yield 1
-        return
-    slots = _slots(store.trusted) or _slots(store.own) or machine_slots(store.own, 1)
-    fds = [os.open(path, os.O_RDONLY | os.O_CLOEXEC) for path in slots]
+def _ledger(path: Path) -> Iterator[dict[str, Any]]:
+    """The ledger, read and rewritten under its flock: `jobs` (pid -> admitted compiler job,
+    pruned to live processes) and `budget`, the memory and CPUs the machine's compilers may
+    take, measured again whenever no compiler job runs."""
+    path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    fd = os.open(path.with_suffix(".lock"), os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o666)
     try:
-        while not any(_locked(fd) for fd in fds):
-            time.sleep(POLL_SECONDS)
-        yield len(fds)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            book = json.loads(path.read_text())
+        except (OSError, ValueError):
+            book = {}
+        book["jobs"] = {pid: v for pid, v in dict(book.get("jobs") or {}).items() if _alive(pid)}
+        if not book["jobs"]:
+            book["budget"] = {"bytes": available_memory(), "cpus": cpus()}
+        yield book
+        scratch = path.with_suffix(f".{os.getpid()}")
+        scratch.write_text(json.dumps(book))
+        os.chmod(scratch, 0o666)
+        os.replace(scratch, path)
     finally:
-        for fd in fds:
-            os.close(fd)
+        os.close(fd)
 
 
-def _locked(fd: int) -> bool:
+def _alive(pid: str) -> bool:
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
+        os.kill(int(pid), 0)
+    except PermissionError:
+        return True
+    except (ValueError, ProcessLookupError):
         return False
     return True
+
+
+def _admits(book: dict[str, Any], job_bytes: int) -> bool:
+    """A compiler job runs when the CPUs and memory the ledger holds have room for it; the
+    first always runs."""
+    jobs, budget = book["jobs"].values(), book["budget"]
+    held = sum(job["bytes"] for job in jobs)
+    return not jobs or (
+        len(jobs) < budget["cpus"]
+        and held + job_bytes <= budget["bytes"]
+        and available_memory() >= job_bytes
+    )
+
+
+def compiler_job(path: str, key: str, job_bytes: int, compiler: str) -> None:
+    """A build's compiler, through the ledger at `path`: it waits until admitted, then this
+    process becomes the compiler, on record until it exits. `sys.argv[1:]` are its arguments."""
+    pid = str(os.getpid())
+    with contextlib.suppress(OSError):  # an unwritable ledger admits every job
+        while True:
+            with _ledger(Path(path)) as book:
+                if _admits(book, job_bytes):
+                    book["jobs"][pid] = {"key": key, "bytes": job_bytes}
+                    break
+            time.sleep(POLL_SECONDS)
+    os.execv(compiler, [compiler, *sys.argv[1:]])
+
+
+def compilers(path: Path) -> set[int]:
+    """The machine's admitted compiler jobs: a build waiting its turn is judged by theirs."""
+    try:
+        return {int(pid) for pid in json.loads(path.read_text()).get("jobs", {})}
+    except (OSError, ValueError, AttributeError):
+        return set()
 
 
 def run(
@@ -409,6 +442,7 @@ def run(
     cwd: Path,
     env: Mapping[str, str],
     report: Callable[[float], None],
+    alongside: Callable[[], set[int]] = set,
 ) -> str:
     """Run one compiler command to completion; return its output's tail.
 
@@ -457,7 +491,7 @@ def run(
             break
         except subprocess.TimeoutExpired:
             pass
-        tree = [process.pid, *proctree.descendants(process.pid)]
+        tree = {process.pid, *proctree.descendants(process.pid), *alongside()}
         burns = [liveness.burn(pid) for pid in tree]
         pace.observe((sum(b for b in burns if b is not None), written[0]))
         if pace.wedged(liveness.noise_floor()):
@@ -495,19 +529,18 @@ def main(argv: list[str] | None = None) -> int:
             live = {"pid": os.getpid(), "started_unix_ms": started_unix_ms}
             store.set_state(key, {**live, "progress": progress, "phase": phase})
 
-    report(0.0, "queued for a build slot")
     try:
-        with _slot(store, raw["kind"]) as share:
-            report(0.0)
-            module, name = BUILDERS[raw["kind"]].split(":")
-            build = getattr(import_module(module), name)
+        report(0.0)
+        module, name = BUILDERS[raw["kind"]].split(":")
+        build = getattr(import_module(module), name)
+        spec = {**raw["spec"], "ledger": str(ledger(store)), "key": key.digest}
 
-            def fill(staging: Path) -> Mapping[str, object]:
-                facts = dict(build({**raw["spec"], "share": share}, staging, report))
-                elapsed = (time.perf_counter() - started) * 1000
-                return {"host": os.uname().nodename, "compile_ms": round(elapsed, 1), **facts}
+        def fill(staging: Path) -> Mapping[str, object]:
+            facts = dict(build(spec, staging, report))
+            elapsed = (time.perf_counter() - started) * 1000
+            return {"host": os.uname().nodename, "compile_ms": round(elapsed, 1), **facts}
 
-            store.publish(key, fill)
+        store.publish(key, fill)
     except CompileFailed as exc:
         _record_failure(key, exc.code, str(exc))
         return 1

@@ -20,7 +20,7 @@ def _device() -> DeviceFacts:
     return DeviceFacts(kind="cpu", name="CPU", sm=0, driver="", configuration="", index=0)
 
 
-def _roots() -> dict[str, Any]:
+def _roots(dim: int = 8) -> dict[str, Any]:
     torch = pytest.importorskip("torch")
     pytest.importorskip("diffusers")
     from diffusers.models.transformers.transformer_wan import WanAttention, WanAttnProcessor
@@ -29,7 +29,7 @@ def _roots() -> dict[str, Any]:
 
     return {
         name: torch.nn.ModuleList(
-            [WanAttention(dim=8, heads=1, dim_head=8, processor=processor_type())]
+            [WanAttention(dim=dim, heads=1, dim_head=dim, processor=processor_type())]
         )
         for name in ("dit", "vae")
     }
@@ -83,7 +83,7 @@ def test_invalid_author_choice_leaves_every_processor_unchanged() -> None:
 
 
 def test_scoped_pin_and_snapshot_restore_different_prepared_policy() -> None:
-    roots = _roots()
+    roots = _roots(128)  # a shape FA3's build has
     # Installation-only control: real members, no claim that FA3 executes on CPU.
     for root in roots.values():
         root.to(dtype=__import__("torch").bfloat16)
@@ -263,7 +263,7 @@ def test_failure_restores_policy_and_observations_keep_actual_choice(
 ) -> None:
     from cozy_runtime.author._services import Attempt
 
-    roots = _roots()
+    roots = _roots(128)  # a shape FA3's build has
     torch = pytest.importorskip("torch")
     for root in roots.values():
         root.to(dtype=torch.bfloat16)

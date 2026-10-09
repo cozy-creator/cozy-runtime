@@ -189,46 +189,42 @@ def test_learned_artifacts_are_this_machines_and_replay_as_the_same_jobs(tmp_pat
     assert _wait(store, job).state == "ready"
 
 
-def test_wide_builds_hold_the_machines_slots_and_take_one_slots_share(tmp_path: Path) -> None:
-    """The boot's slots bound the wide builds at once, an executor's builds included: each
-    holder takes one slot's share, and one more waits for a holder to end."""
-    worker = tmp_path / "u0"
-    assert len(kernel_compile.machine_slots(worker, 2)) == 2
-    hold = textwrap.dedent(
-        """
-        import sys
-        from pathlib import Path
-        from cozy_runtime.internal import kernel_cache, kernel_compile
-        trusted = Path(sys.argv[2]) if len(sys.argv) > 2 else None
-        with kernel_compile._slot(kernel_cache.Store(Path(sys.argv[1]), trusted), "setup") as share:
-            print(share, flush=True)
-            sys.stdin.read()
-        """
+def test_the_ledger_admits_compiler_jobs_within_the_memory_each_takes(tmp_path: Path) -> None:
+    """Real compiler jobs through `compiler_job`, as torch runs them through `PYTORCH_NVCC`:
+    when one job's memory fills the machine, the next runs once the first has ended."""
+    ledger = tmp_path / "u0" / ".compile.json"
+    job_bytes = kernel_compile.available_memory() * 2 // 3  # one job fits, two do not
+    compiler = tmp_path / "nvcc"
+    compiler.write_text(
+        f"#!{sys.executable}\nimport sys\nprint(sys.argv[1], flush=True)\nsys.stdin.read()\n"
     )
+    compiler.chmod(0o755)
 
-    def holder(*stores: Path) -> subprocess.Popen[str]:
+    def job(name: str) -> subprocess.Popen[str]:
+        code = (
+            "from cozy_runtime.internal.kernel_compile import compiler_job; "
+            f"compiler_job({str(ledger)!r}, 'fa3', {job_bytes}, {str(compiler)!r})"
+        )
         return subprocess.Popen(
-            [sys.executable, "-c", hold, *map(str, stores)],
+            [sys.executable, "-c", code, name],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             text=True,
             env=os.environ,
         )
 
-    first, second = holder(worker), holder(tmp_path / "u64001", worker)
-    assert [p.stdout.readline() for p in (first, second) if p.stdout] == ["2\n", "2\n"]
-    for slot in kernel_compile._slots(worker):  # both held: a third build must wait
-        fd = os.open(slot, os.O_RDONLY)
-        try:
-            assert not kernel_compile._locked(fd)
-        finally:
-            os.close(fd)
-    third = holder(worker)
+    first = job("first")
+    assert first.stdout is not None and first.stdout.readline() == "first\n"
+    admitted = ledger.stat().st_mtime_ns
+    second = job("second")
+    while ledger.stat().st_mtime_ns == admitted:  # the second asked the ledger at least once
+        time.sleep(kernel_compile.POLL_SECONDS)
+    assert kernel_compile.compilers(ledger) == {first.pid}  # and waits its turn
     first.communicate("")
-    assert third.stdout is not None and third.stdout.readline() == "2\n"
+    assert second.stdout is not None and second.stdout.readline() == "second\n"
+    assert kernel_compile.compilers(ledger) == {second.pid}
     second.communicate("")
-    third.communicate("")
-    assert kernel_compile.machine_slots(worker, 1) == [worker / ".slots" / "0.lock"]
+    assert (first.returncode, second.returncode) == (0, 0)
 
 
 def test_an_executor_waits_on_the_machines_claim_and_builds_nothing(tmp_path: Path) -> None:
@@ -249,11 +245,9 @@ def test_an_executor_waits_on_the_machines_claim_and_builds_nothing(tmp_path: Pa
     assert kernel_compile.status(executor, job).state == "pending"  # the machine's claim ended
 
 
-def test_a_wide_build_is_as_wide_as_the_cpus_and_memory_this_process_may_use() -> None:
-    cpus = len(os.sched_getaffinity(0))
-    assert 1 <= kernel_compile.width(1) <= cpus
-    assert kernel_compile.width(1 << 60) == 1  # no memory for even one more: still builds
-    assert kernel_compile.width(1, 2) == max(1, kernel_compile.width(1) // 2)
+def test_the_machine_offers_the_cpus_and_memory_this_process_may_use() -> None:
+    assert 1 <= kernel_compile.cpus() <= len(os.sched_getaffinity(0))
+    assert 0 < kernel_compile.available_memory() <= kernel_compile._meminfo("MemTotal")
 
 
 def _held(store: kernel_cache.Store, job: kernel_compile.Job, builder: str) -> tuple[int, Any]:

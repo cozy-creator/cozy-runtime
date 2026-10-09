@@ -63,8 +63,9 @@ def test_fp8_admits_a_strict_subset_of_the_bf16_entrys_sites_so_no_floor_site_mo
         ("float16", 64),
         ("float16", 128),
     }
-    assert all(attention._admits(bf16, d, h) for d, h in admitted)
-    assert attention._admits(bf16, "bfloat16", 256) and not attention._admits(fp8, "bfloat16", 256)
+    built = {(d, h) for d in dtypes for h in dims if attention._admits(bf16, d, h)}
+    assert built == {("bfloat16", 128), ("float16", 64)}  # exactly what its build has
+    assert not attention._admits(fp8, "bfloat16", 256)
 
 
 def test_the_fp8_quantiser_maps_each_head_onto_e4m3_and_hands_back_its_descale() -> None:
@@ -117,7 +118,9 @@ def test_every_nameable_kernel_has_one_name_and_one_backend() -> None:
         ("flash-attn3-fp8", "bfloat16", 0, False),
         ("flash-attn3-fp8", "float32", 128, False),
         ("flash-attn3", "bfloat16", 128, True),
-        ("flash-attn3", "bfloat16", 256, True),
+        ("flash-attn3", "bfloat16", 256, False),
+        ("flash-attn3", "bfloat16", 64, False),
+        ("flash-attn3", "float16", 64, True),
         ("flash-attn3", "bfloat16", 512, False),
         ("flash-attn3", "float32", 128, False),
         ("cudnn", "float16", 128, True),
@@ -170,7 +173,7 @@ def test_every_candidate_states_the_architectures_it_serves() -> None:
     )
     assert attention.BY_NAME["sol-attn"].sms == frozenset({89, 90, 100, 120})
     fp16pv = attention.BY_NAME["sageattention-fp16pv"]
-    assert (fp16pv.min_sm, fp16pv.max_sm, fp16pv.artifact) == (90, 90, "sageattention")
+    assert (fp16pv.min_sm, fp16pv.max_sm, fp16pv.artifact) == (90, 90, "sageattention-full")
     assert attention.BY_NAME["cudnn"].max_sm == 0 and attention.BY_NAME["sdpa"].max_sm == 0
     assert attention.CANDIDATES[-1].name == "sdpa"
     assert attention.CANDIDATES[-1].min_sm == 0 and attention.CANDIDATES[-1].max_sm == 0
@@ -512,9 +515,10 @@ def test_auto_keeps_sdpa_on_classic_sites_and_a_pin_moves_them() -> None:
     applied = attention.install(_ready(*RANKED), roots)
     assert applied.hosts["dit"] == {"flash-attn3": 2}
     assert set(applied.hosts["unet"]) == set(applied.hosts["vae"]) == {"sdpa"}
-    pinned = attention.install(_ready("flash-attn3"), {"unet": roots["unet"]}, "unet=flash-attn3")
-    assert set(pinned.hosts["unet"]) == {"flash-attn3"}
-    assert _backends({"unet": roots["unet"]}) == {"unet": ["_cozy_flash_attn3"]}
+    # FA3 serves only the shapes its build has; cuDNN serves this UNet's head dimension 16.
+    pinned = attention.install(_ready("cudnn"), {"unet": roots["unet"]}, "unet=cudnn")
+    assert set(pinned.hosts["unet"]) == {"cudnn"}
+    assert _backends({"unet": roots["unet"]}) == {"unet": ["_cozy_cudnn"]}
 
 
 def test_per_request_swap_can_be_followed_by_auto_without_pin_leak() -> None:
@@ -535,8 +539,8 @@ def test_per_request_swap_can_be_followed_by_auto_without_pin_leak() -> None:
 
 
 def test_explicit_fp8_refuses_unsupported_sites_while_auto_preserves_dtype() -> None:
-    """Both eligible floating sites keep FA3; FP32 uses SDPA. An explicit
-    FP8 selection still refuses a head dimension it cannot execute."""
+    """The site whose shape FA3's build has keeps FA3; FP16 at 256 and FP32 use SDPA. An
+    explicit FP8 selection still refuses a head dimension it cannot execute."""
     why = _diffusers_skip()
     if why:
         pytest.skip(why)
@@ -550,17 +554,17 @@ def test_explicit_fp8_refuses_unsupported_sites_while_auto_preserves_dtype() -> 
     applied = attention.install(_ready(*RANKED), roots)
     assert applied.hosts == {
         "dit": {"flash-attn3": 1},
-        "wide": {"flash-attn3": 1},
+        "wide": {"sdpa": 1},
         "vae": {"sdpa": 1},
     }
     assert applied.line() == (
-        "flash-attn3 x2, sdpa x1 "
+        "flash-attn3 x1, sdpa x2 "
         "(auto over ['flash-attn3', 'sdpa']) "
-        "— dit: flash-attn3; vae: sdpa; wide: flash-attn3"
+        "— dit: flash-attn3; vae: sdpa; wide: sdpa"
     )
     assert _backends(roots) == {
         "dit": ["_cozy_flash_attn3"],
-        "wide": ["_cozy_flash_attn3"],
+        "wide": ["_cozy_sdpa"],
         "vae": ["_cozy_sdpa"],
     }
     # A PIN of fp8 on the 256-dim site is a typed refusal, never a quiet demotion.
