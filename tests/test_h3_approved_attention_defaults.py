@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -90,12 +91,14 @@ def test_temporary_producer_restores_original_processor_identity(fails: bool) ->
         candidate.name,
         (("fl2va_dit", "0", site),),
     )
-    with pytest.raises(RuntimeError, match="handler failed") if fails else nullcontext():
-        with attention.override(defaults, modules, swap):
-            assert isinstance(site.processor, attention_producer.Processor)
-            assert attention.observed(modules).totals() == {candidate.name: 1}
-            if fails:
-                raise RuntimeError("handler failed")
+    with (
+        pytest.raises(RuntimeError, match="handler failed") if fails else nullcontext(),
+        attention.override(defaults, modules, swap),
+    ):
+        assert isinstance(site.processor, attention_producer.Processor)
+        assert attention.observed(modules).totals() == {candidate.name: 1}
+        if fails:
+            raise RuntimeError("handler failed")
     assert site.processor is original and not hasattr(site, "_cozy_sol_site")
     assert attention._is_selected(defaults, modules, "fl2va_dit=sdpa")
 
@@ -123,6 +126,40 @@ def test_explicit_fp4_on_hopper_and_producer_on_multiple_gpus_refuse() -> None:
         attention.check(device, roots(), "kitchen-sol-fp4-lowmem")
     with pytest.raises(attention.AttentionRefusal, match="context parallelism"):
         attention.admit("kitchen-sol-producer-fast-shared-qkv", 4)
+
+
+def test_nonmatching_wheel_keeps_existing_default_but_allows_explicit_recipe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cozy_runtime.internal import kernel_sources
+
+    # Exercise real wheel-tag eligibility with a nonmatching platform artifact.
+    pins = tuple(
+        replace(
+            pin, url=pin.url.rsplit("/", 1)[0] + "/comfy_kitchen-0.2.37-cp312-abi3-win_amd64.whl"
+        )
+        if pin.name == kernel_sources.KITCHEN_WHEEL
+        else pin
+        for pin in kernel_sources.PINS
+    )
+    monkeypatch.setattr(kernel_sources, "PINS", pins)
+    kernel_sources.reviewed_kitchen_wheel_compatible.cache_clear()
+    try:
+        assert not kernel_sources.reviewed_kitchen_wheel_compatible()
+        device = DeviceFacts("cuda", "RTX 5090", 120, "", "", 0)
+        model = object.__new__(H3Model)
+        selected = attention.install(ready(), roots(), device=device, choose=model.choose_attention)
+        assert selected.hosts == {"fl2va_dit": {"sol-attn": 1}}
+        explicit = attention.install(
+            ready(),
+            roots(),
+            "fl2va_dit=kitchen-sol-fp4-lowmem",
+            device=device,
+            choose=model.choose_attention,
+        )
+        assert explicit.hosts == {"fl2va_dit": {"kitchen-sol-fp4-lowmem": 1}}
+    finally:
+        kernel_sources.reviewed_kitchen_wheel_compatible.cache_clear()
 
 
 @pytest.mark.parametrize(

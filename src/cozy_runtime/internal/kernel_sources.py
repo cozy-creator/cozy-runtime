@@ -503,6 +503,13 @@ def _compatible_kitchen_wheel(source: Source | None) -> bool:
     return bool(native) and not native.isdisjoint(sys_tags())
 
 
+@functools.cache
+def reviewed_kitchen_wheel_compatible() -> bool:
+    """Hardware-independent eligibility for automatic use of the reviewed native wheel."""
+    pin = next(pin for pin in PINS if pin.name == KITCHEN_WHEEL)
+    return _compatible_kitchen_wheel(Source(pin.name, pin.version, _filename(pin), pin.sha256))
+
+
 def job(name: str, sm: int, root: Path | None = None) -> kernel_compile.Job:
     """The exact artifact `name` is on a card of capability `sm` in this environment."""
     recipe = RECIPES[name]
