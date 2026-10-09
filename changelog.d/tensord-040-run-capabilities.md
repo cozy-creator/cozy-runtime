@@ -1,0 +1,1 @@
+Bundles TensorD 0.4.0 (th-241): a worker reaches private Hub content only through a per-run capability the CLI signs offline, traded once per run; public work needs no credential, and the th-238 grants are gone. Needs Hub v0.17.0 and CLI v0.3.0; older Hubs and CLIs cannot drive it.
