@@ -1218,16 +1218,16 @@
     "review_decision": "/home/fidika/cozy_v2/outputs/h3-single5090-optimization-20261008/quality-matrix-20261009/review-decision.json"
   },
   "default_promotion": {
-    "status": "correcting_kitchen_build_and_reviewed_version_before_further_default_qualification",
+    "status": "published_and_installed",
     "pr": "https://github.com/cozy-creator/cozy-runtime/pull/1263",
-    "source_head": "06287acf",
-    "runtime": "0.21.6+dev.h3hybrid.06287acf",
+    "source_head": "330d0c85",
+    "runtime": "0.21.6+dev.h3hybrid.330d0c85",
     "tensorfs": "0.6.1",
     "agent": "0.3.4",
-    "wheel_sha256": "47620e0f43c676121b35bcddaa201010995617cbf2bd0ec2ca7450a073042fb4",
+    "wheel_sha256": "1f19e4a2ac7c23588c7310faa5e64b2a7dccb5169ffb32bb55194d9b0859103a",
     "experimental_gemm_included": false,
-    "published": false,
-    "installed_local": false,
+    "published": true,
+    "installed_local": true,
     "first_full_run": {
       "number": 5071,
       "request_id": "req-a038788189bab83ec3cd0259",
@@ -1240,14 +1240,702 @@
       "execution_seconds": 578.083,
       "failure_cause": "Kitchen setup failed before inference: ModuleNotFoundError nanobind. Receipt compiling state was selection-time evidence.",
       "video_full_av_check": "passed"
-    }
+    },
+    "public_release": {
+      "version": "0.21.7",
+      "commit": "89a14fa62875a1437e09291e88a87873c22b6db7",
+      "pr": "https://github.com/cozy-creator/cozy-runtime/pull/1268",
+      "prepared": true,
+      "published": true,
+      "serving_payloads_match_candidate": true,
+      "native_binaries_identical": true
+    },
+    "current_runs": [
+      {
+        "case": "01-turbo-combat-warmup",
+        "run_number": 5084,
+        "request_id": "req-f7de65b7cd8f6d5cbb5f35c2",
+        "render_status": "completed",
+        "qualification_passed": false,
+        "qualification_errors": [
+          "Sparse call count does not match the requested schedule",
+          "Protected-prefix call count does not match the requested schedule"
+        ],
+        "approved_hybrid_warmup": false,
+        "function": "fl2va_turbo",
+        "timed": false,
+        "warmup": true,
+        "execution_ms": 320417,
+        "phases_ms": {
+          "prepare": 1.668,
+          "loading weights": 6002.207,
+          "condition_text": 3166.091,
+          "denoise": 261842.757,
+          "decode_audio": 423.368,
+          "decode_video": 39738.68,
+          "check_output": 209.667
+        },
+        "phase_limit": "Loading-weight aggregates overlap phases; do not add them.",
+        "denoise_steps": [
+          [
+            1791541062398,
+            44388.104
+          ],
+          [
+            1791541099462,
+            37064.044
+          ],
+          [
+            1791541136908,
+            37445.669
+          ],
+          [
+            1791541174405,
+            37497.214
+          ],
+          [
+            1791541204242,
+            29772.246
+          ],
+          [
+            1791541229532,
+            25290.429
+          ],
+          [
+            1791541254929,
+            25397.092
+          ],
+          [
+            1791541279857,
+            24927.753
+          ]
+        ],
+        "attention": {
+          "requested": "fl2va_dit=kitchen-sol-producer-fp4-lowmem-shared-qkv",
+          "observed": "audio_vae=sdpa,fl2va_dit=kitchen-sol-producer-fp4-lowmem-shared-qkv,ref2va_dit=kitchen-sol-producer-fp4-lowmem-shared-qkv,video_vae=sdpa",
+          "impl": "kitchen-sol-producer-fp4-lowmem-shared-qkv:comfy_kitchen.sol_attn_chunked(int8, stats=current-call, vmargin=1.1, prefix=int8, qkv=shared:54)+comfy_kitchen.sol_attn_chunked(int8, stats=previous-step, vmargin=1.1, prefix=int8, qkv=shared:27)+dense=sageattn3.nvfp4_global_head_mean(short_owned_lifetimes); sparse=instance-producer,sageattention3-fp4-global-lowmem:sageattn3.nvfp4_global_head_mean(short_owned_lifetimes, direct_bthd),sdpa:flash",
+          "kernels": [
+            {
+              "kernel": "kitchen-sol-producer-fp4-lowmem-shared-qkv",
+              "state": "ready",
+              "served": true,
+              "compile_ms": 1135.8
+            },
+            {
+              "kernel": "sageattention3-fp4-global-lowmem",
+              "state": "ready",
+              "served": false,
+              "compile_ms": 201265
+            },
+            {
+              "kernel": "sdpa",
+              "state": "ready",
+              "served": true
+            }
+          ],
+          "sol": {
+            "sparse": 193,
+            "dense_step": 192,
+            "dense_path": 32,
+            "dense_prefix": 193
+          }
+        },
+        "fusion_evidence": {
+          "available": false,
+          "records": [],
+          "limit": "Absent CLI evidence does not mean fusion was unapplied; serving report/census is retained by the later profiler."
+        },
+        "executor_pid": 12421,
+        "gpu_uuid": "GPU-daef387f-a2a4-8dcd-a9b3-c87d580fc55b",
+        "local_installation_id": "f72da9e5699d4b48",
+        "input_sha256": "1d7ed542f8397a3fe7883403ab67050bd535f9114c2240c9ecc856ebdc146a47",
+        "video": "/home/fidika/cozy_v2/outputs/h3-single5090-optimization-20261008/current-default-qualification/full-runs-v2/01-turbo-combat-warmup/outputs/5084-video.mp4",
+        "video_sha256": "cd54bfc0ed35039c6cc78c826b5159ab9cf510719eed6ccd23d11476c6e8d692",
+        "geometry": {
+          "codec_type": "video",
+          "width": 1344,
+          "height": 768,
+          "avg_frame_rate": "24/1",
+          "duration": "15.083333",
+          "nb_frames": "362"
+        },
+        "av_decode_exit": 0,
+        "quality": "AV integrity passed; no automatic visual-quality approval",
+        "validated_at_utc": "2026-10-09T10:22:09.656886+00:00"
+      },
+      {
+        "case": "02-turbo-combat-diagnostic",
+        "run_number": 5085,
+        "request_id": "req-93ec45075c54263187a0e005",
+        "render_status": "completed",
+        "qualification_passed": true,
+        "qualification_errors": [],
+        "approved_hybrid_warmup": false,
+        "function": "fl2va_turbo",
+        "timed": true,
+        "warmup": false,
+        "execution_ms": 273775,
+        "phases_ms": {
+          "prepare": 1.324,
+          "loading weights": 2789.51,
+          "condition_text": 6439.597,
+          "denoise": 222140.823,
+          "decode_audio": 123.76,
+          "decode_video": 39750.25,
+          "check_output": 154.201
+        },
+        "phase_limit": "Loading-weight aggregates overlap phases; do not add them.",
+        "denoise_steps": [
+          [
+            1791541858556,
+            35582.624
+          ],
+          [
+            1791541890101,
+            31545.187
+          ],
+          [
+            1791541922068,
+            31966.831
+          ],
+          [
+            1791541954330,
+            32262.301
+          ],
+          [
+            1791541979728,
+            25398.076
+          ],
+          [
+            1791542001524,
+            21795.708
+          ],
+          [
+            1791542023178,
+            21653.539
+          ],
+          [
+            1791542044748,
+            21569.89
+          ]
+        ],
+        "attention": {
+          "requested": "",
+          "observed": "audio_vae=sdpa,fl2va_dit=kitchen-sol-producer-fp4-lowmem-shared-qkv,ref2va_dit=kitchen-sol-producer-fp4-lowmem-shared-qkv,video_vae=sdpa",
+          "impl": "kitchen-sol-producer-fp4-lowmem-shared-qkv:comfy_kitchen.sol_attn_chunked(int8, stats=current-call, vmargin=1.1, prefix=int8, qkv=shared:54)+comfy_kitchen.sol_attn_chunked(int8, stats=previous-step, vmargin=1.1, prefix=int8, qkv=shared:27)+dense=sageattn3.nvfp4_global_head_mean(short_owned_lifetimes); sparse=instance-producer,sageattention3-fp4-global-lowmem:sageattn3.nvfp4_global_head_mean(short_owned_lifetimes, direct_bthd),sdpa:flash",
+          "kernels": [
+            {
+              "kernel": "kitchen-sol-producer-fp4-lowmem-shared-qkv",
+              "state": "ready",
+              "served": true,
+              "compile_ms": 1135.8
+            },
+            {
+              "kernel": "sageattention3-fp4-global-lowmem",
+              "state": "ready",
+              "served": false,
+              "compile_ms": 201265
+            },
+            {
+              "kernel": "sdpa",
+              "state": "ready",
+              "served": true
+            }
+          ],
+          "sol": {
+            "sparse": 192,
+            "dense_step": 192,
+            "dense_path": 32,
+            "dense_prefix": 192
+          }
+        },
+        "fusion_evidence": {
+          "available": false,
+          "records": [],
+          "limit": "Absent CLI evidence does not mean fusion was unapplied; serving report/census is retained by the later profiler."
+        },
+        "executor_pid": 12421,
+        "gpu_uuid": "GPU-daef387f-a2a4-8dcd-a9b3-c87d580fc55b",
+        "local_installation_id": "f72da9e5699d4b48",
+        "input_sha256": "1d7ed542f8397a3fe7883403ab67050bd535f9114c2240c9ecc856ebdc146a47",
+        "video": "/home/fidika/cozy_v2/outputs/h3-single5090-optimization-20261008/current-default-qualification/full-runs-v2/02-turbo-combat-diagnostic/outputs/5085-video.mp4",
+        "video_sha256": "cd54bfc0ed35039c6cc78c826b5159ab9cf510719eed6ccd23d11476c6e8d692",
+        "geometry": {
+          "codec_type": "video",
+          "width": 1344,
+          "height": 768,
+          "avg_frame_rate": "24/1",
+          "duration": "15.083333",
+          "nb_frames": "362"
+        },
+        "av_decode_exit": 0,
+        "quality": "AV integrity passed; no automatic visual-quality approval",
+        "validated_at_utc": "2026-10-09T10:35:52.990563+00:00",
+        "same_executor_as_5084": true,
+        "role": "Reuse as timed combat case; no rerun"
+      },
+      {
+        "case": "03-turbo-combat-kitchen-control",
+        "run_number": 5086,
+        "request_id": "req-81f63ae57f1edf877201c28b",
+        "render_status": "completed",
+        "qualification_passed": true,
+        "qualification_errors": [],
+        "approved_hybrid_warmup": false,
+        "function": "fl2va_turbo",
+        "timed": false,
+        "warmup": false,
+        "execution_ms": 304378,
+        "phases_ms": {
+          "prepare": 1.005,
+          "loading weights": 1258.277,
+          "condition_text": 7986.252,
+          "denoise": 253458.391,
+          "decode_audio": 124.052,
+          "decode_video": 39768.017,
+          "check_output": 191.604
+        },
+        "phase_limit": "Loading-weight aggregates overlap phases; do not add them.",
+        "denoise_steps": [
+          [
+            1791542273521,
+            42300.436
+          ],
+          [
+            1791542313508,
+            39986.567
+          ],
+          [
+            1791542354202,
+            40694.419
+          ],
+          [
+            1791542394936,
+            40733.95
+          ],
+          [
+            1791542417921,
+            22984.213
+          ],
+          [
+            1791542439957,
+            22036.53
+          ],
+          [
+            1791542462021,
+            22063.461
+          ],
+          [
+            1791542484348,
+            22327.493
+          ]
+        ],
+        "attention": {
+          "requested": "fl2va_dit=kitchen-sol",
+          "observed": "audio_vae=sdpa,fl2va_dit=kitchen-sol,ref2va_dit=kitchen-sol-producer-fp4-lowmem-shared-qkv,video_vae=sdpa",
+          "impl": "kitchen-int8:comfy_kitchen.int8_attention,kitchen-sol:comfy_kitchen.sol_attn(int8, tau=1, current-call stats),sdpa:flash",
+          "kernels": [
+            {
+              "kernel": "kitchen-sol",
+              "state": "ready",
+              "served": true,
+              "compile_ms": 1135.8
+            },
+            {
+              "kernel": "kitchen-sol-producer-fp4-lowmem-shared-qkv",
+              "state": "ready",
+              "served": true,
+              "compile_ms": 1135.8
+            },
+            {
+              "kernel": "sageattention3-fp4-global-lowmem",
+              "state": "ready",
+              "served": false,
+              "compile_ms": 201265
+            },
+            {
+              "kernel": "sdpa",
+              "state": "ready",
+              "served": true
+            }
+          ],
+          "sol": {
+            "sparse": 192,
+            "dense_step": 192,
+            "dense_path": 32,
+            "dense_prefix": 192
+          }
+        },
+        "fusion_evidence": {
+          "available": false,
+          "records": [],
+          "limit": "Absent CLI evidence does not mean fusion was unapplied; serving report/census is retained by the later profiler."
+        },
+        "executor_pid": 12421,
+        "gpu_uuid": "GPU-daef387f-a2a4-8dcd-a9b3-c87d580fc55b",
+        "local_installation_id": "f72da9e5699d4b48",
+        "input_sha256": "1d7ed542f8397a3fe7883403ab67050bd535f9114c2240c9ecc856ebdc146a47",
+        "video": "/home/fidika/cozy_v2/outputs/h3-single5090-optimization-20261008/current-default-qualification/full-runs-v2/03-turbo-combat-kitchen-control/outputs/5086-video.mp4",
+        "video_sha256": "4e7b74fc1320874276a2f8b269962cb216c8bf04571c69a0eebaa5d9fdc16fda",
+        "geometry": {
+          "codec_type": "video",
+          "width": 1344,
+          "height": 768,
+          "avg_frame_rate": "24/1",
+          "duration": "15.083333",
+          "nb_frames": "362"
+        },
+        "av_decode_exit": 0,
+        "quality": "AV integrity passed; no automatic visual-quality approval",
+        "validated_at_utc": "2026-10-09T10:43:05.981805+00:00",
+        "restored_default_observation": {
+          "at_unix_ms": 1791542526183,
+          "attempt_key": "55",
+          "fields": {
+            "component": "base_model/fl2va_dit",
+            "dense_reference": "sageattention3-fp4-global-lowmem; sparse-prefix=kitchen-int8",
+            "pin": "",
+            "sites": 52
+          },
+          "kind": "confession",
+          "name": "attention.restored",
+          "seq": 96,
+          "value": "kitchen-sol-producer-fp4-lowmem-shared-qkv"
+        }
+      },
+      {
+        "case": "04-turbo-racing-restored",
+        "run_number": 5087,
+        "request_id": "req-cc1981a4e458e340ced13d8f",
+        "render_status": "completed",
+        "qualification_passed": true,
+        "qualification_errors": [],
+        "approved_hybrid_warmup": false,
+        "function": "fl2va_turbo",
+        "timed": true,
+        "warmup": false,
+        "execution_ms": 268827,
+        "phases_ms": {
+          "prepare": 0.838,
+          "loading weights": 1329.965,
+          "condition_text": 5783.423,
+          "denoise": 220221.524,
+          "decode_audio": 155.602,
+          "decode_video": 39681.913,
+          "check_output": 173.78
+        },
+        "phase_limit": "Loading-weight aggregates overlap phases; do not add them.",
+        "denoise_steps": [
+          [
+            1791542630247,
+            33637.453
+          ],
+          [
+            1791542661382,
+            31135.446
+          ],
+          [
+            1791542693246,
+            31864.12
+          ],
+          [
+            1791542725059,
+            31812.244
+          ],
+          [
+            1791542749572,
+            24513.171
+          ],
+          [
+            1791542770558,
+            20986.275
+          ],
+          [
+            1791542791348,
+            20789.939
+          ],
+          [
+            1791542816700,
+            25352.392
+          ]
+        ],
+        "attention": {
+          "requested": "",
+          "observed": "audio_vae=sdpa,fl2va_dit=kitchen-sol-producer-fp4-lowmem-shared-qkv,ref2va_dit=kitchen-sol-producer-fp4-lowmem-shared-qkv,video_vae=sdpa",
+          "impl": "kitchen-sol-producer-fp4-lowmem-shared-qkv:comfy_kitchen.sol_attn_chunked(int8, stats=current-call, vmargin=1.1, prefix=int8, qkv=shared:54)+comfy_kitchen.sol_attn_chunked(int8, stats=previous-step, vmargin=1.1, prefix=int8, qkv=shared:27)+dense=sageattn3.nvfp4_global_head_mean(short_owned_lifetimes); sparse=instance-producer,sageattention3-fp4-global-lowmem:sageattn3.nvfp4_global_head_mean(short_owned_lifetimes, direct_bthd),sdpa:flash",
+          "kernels": [
+            {
+              "kernel": "kitchen-sol",
+              "state": "ready",
+              "served": false,
+              "compile_ms": 1135.8
+            },
+            {
+              "kernel": "kitchen-sol-producer-fp4-lowmem-shared-qkv",
+              "state": "ready",
+              "served": true,
+              "compile_ms": 1135.8
+            },
+            {
+              "kernel": "sageattention3-fp4-global-lowmem",
+              "state": "ready",
+              "served": false,
+              "compile_ms": 201265
+            },
+            {
+              "kernel": "sdpa",
+              "state": "ready",
+              "served": true
+            }
+          ],
+          "sol": {
+            "sparse": 192,
+            "dense_step": 192,
+            "dense_path": 32,
+            "dense_prefix": 192
+          }
+        },
+        "fusion_evidence": {
+          "available": false,
+          "records": [],
+          "limit": "Absent CLI evidence does not mean fusion was unapplied; serving report/census is retained by the later profiler."
+        },
+        "executor_pid": 12421,
+        "gpu_uuid": "GPU-daef387f-a2a4-8dcd-a9b3-c87d580fc55b",
+        "local_installation_id": "f72da9e5699d4b48",
+        "input_sha256": "0b1263503129e66d16c49f6a3cc90cd942aac1c6c948c6be271ffdcb49f4b2d6",
+        "video": "/home/fidika/cozy_v2/outputs/h3-single5090-optimization-20261008/current-default-qualification/full-runs-v2/04-turbo-racing-restored/outputs/5087-video.mp4",
+        "video_sha256": "4f50e45aa0aa034071dd685df07384e900477780e061caab1e38c8aa8ac2f020",
+        "geometry": {
+          "codec_type": "video",
+          "width": 1344,
+          "height": 768,
+          "avg_frame_rate": "24/1",
+          "duration": "15.083333",
+          "nb_frames": "362"
+        },
+        "av_decode_exit": 0,
+        "quality": "AV integrity passed; no automatic visual-quality approval",
+        "validated_at_utc": "2026-10-09T10:48:23.312526+00:00",
+        "same_turbo_executor": true
+      },
+      {
+        "case": "05-regular30-combat",
+        "run_number": 5088,
+        "request_id": "req-e4d6b36942db639720eff070",
+        "render_status": "completed",
+        "qualification_passed": true,
+        "qualification_errors": [],
+        "approved_hybrid_warmup": false,
+        "function": "fl2va",
+        "timed": true,
+        "warmup": false,
+        "execution_ms": 842631,
+        "phases_ms": {
+          "prepare": 1.864,
+          "loading weights": 9433.618,
+          "condition_text": 2773.108,
+          "denoise": 780796.534,
+          "decode_audio": 588.458,
+          "decode_video": 40037.376,
+          "check_output": 174.916
+        },
+        "phase_limit": "Loading-weight aggregates overlap phases; do not add them.",
+        "denoise_steps": [
+          [
+            1791542963542,
+            34809.341
+          ],
+          [
+            1791542998783,
+            35240.63
+          ],
+          [
+            1791543033077,
+            34293.84
+          ],
+          [
+            1791543072377,
+            39299.781
+          ],
+          [
+            1791543106761,
+            34384.25
+          ],
+          [
+            1791543142376,
+            35614.796
+          ],
+          [
+            1791543177271,
+            34895.563
+          ],
+          [
+            1791543213558,
+            36286.503
+          ],
+          [
+            1791543250834,
+            37276.566
+          ],
+          [
+            1791543287197,
+            36362.593
+          ],
+          [
+            1791543310756,
+            23559.621
+          ],
+          [
+            1791543332396,
+            21640.061
+          ],
+          [
+            1791543352623,
+            20226.086
+          ],
+          [
+            1791543373056,
+            20433.154
+          ],
+          [
+            1791543394637,
+            21581.192
+          ],
+          [
+            1791543414965,
+            20327.856
+          ],
+          [
+            1791543435202,
+            20237.095
+          ],
+          [
+            1791543455487,
+            20284.924
+          ],
+          [
+            1791543477222,
+            21734.826
+          ],
+          [
+            1791543497395,
+            20173.604
+          ],
+          [
+            1791543517628,
+            20232.553
+          ],
+          [
+            1791543538007,
+            20378.975
+          ],
+          [
+            1791543560243,
+            22235.96
+          ],
+          [
+            1791543580614,
+            20371.032
+          ],
+          [
+            1791543600926,
+            20312.689
+          ],
+          [
+            1791543623221,
+            22294.636
+          ],
+          [
+            1791543643411,
+            20190.106
+          ],
+          [
+            1791543664202,
+            20790.495
+          ],
+          [
+            1791543684490,
+            20288.646
+          ],
+          [
+            1791543709142,
+            24651.421
+          ]
+        ],
+        "attention": {
+          "requested": "",
+          "observed": "audio_vae=sdpa,fl2va_dit=kitchen-sol-producer-fp4-lowmem-shared-qkv,ref2va_dit=kitchen-sol-producer-fp4-lowmem-shared-qkv,video_vae=sdpa",
+          "impl": "kitchen-sol-producer-fp4-lowmem-shared-qkv:comfy_kitchen.sol_attn_chunked(int8, stats=current-call, vmargin=1.1, prefix=int8, qkv=already-quantized:54)+comfy_kitchen.sol_attn_chunked(int8, stats=previous-step, vmargin=1.1, prefix=int8, qkv=already-quantized:27)+dense=sageattn3.nvfp4_global_head_mean(short_owned_lifetimes); sparse=instance-producer,sageattention3-fp4-global-lowmem:sageattn3.nvfp4_global_head_mean(short_owned_lifetimes, direct_bthd),sdpa:flash",
+          "kernels": [
+            {
+              "kernel": "kitchen-sol-producer-fp4-lowmem-shared-qkv",
+              "state": "ready",
+              "served": true,
+              "compile_ms": 1135.8
+            },
+            {
+              "kernel": "sageattention3-fp4-global-lowmem",
+              "state": "ready",
+              "served": false,
+              "compile_ms": 201265
+            },
+            {
+              "kernel": "sdpa",
+              "state": "ready",
+              "served": true
+            }
+          ],
+          "sol": {
+            "sparse": 960,
+            "dense_step": 480,
+            "dense_path": 120,
+            "dense_prefix": 960
+          }
+        },
+        "fusion_evidence": {
+          "available": false,
+          "records": [],
+          "limit": "Absent CLI evidence does not mean fusion was unapplied; serving report/census is retained by the later profiler."
+        },
+        "executor_pid": 12920,
+        "gpu_uuid": "GPU-daef387f-a2a4-8dcd-a9b3-c87d580fc55b",
+        "local_installation_id": "f72da9e5699d4b48",
+        "input_sha256": "e4f1aa368918b4262f5c22dbb006d12a393529f2fa9a46de88fd66404b069d51",
+        "video": "/home/fidika/cozy_v2/outputs/h3-single5090-optimization-20261008/current-default-qualification/full-runs-v2/05-regular30-combat/outputs/5088-video.mp4",
+        "video_sha256": "e25cb10a448275a94ab16d49de674ce8559c1d058a70ad45059496cc84f30ac1",
+        "geometry": {
+          "codec_type": "video",
+          "width": 1344,
+          "height": 768,
+          "avg_frame_rate": "24/1",
+          "duration": "15.083333",
+          "nb_frames": "362"
+        },
+        "av_decode_exit": 0,
+        "quality": "AV integrity passed; no automatic visual-quality approval",
+        "validated_at_utc": "2026-10-09T11:03:35.571322+00:00"
+      }
+    ],
+    "warmup_count_boundary": "5084 completed the correct8steps and produced a byte-identical reviewed clip; raw193 sparse/prefix counts retained with6OOM retries. Exact extra dispatch location is not retained. Subsequent timed5085 has192 counts and0OOM retries.",
+    "turbo_mean_seconds": 271.301,
+    "both_turbo_scene_files_match_reviewed_matrix": true,
+    "public_runtime_version": "0.21.7",
+    "local_worker_agent": "0.3.4",
+    "local_worker_tensorfs": "0.6.1",
+    "local_stop_start_proof": "/home/fidika/cozy_v2/outputs/h3-single5090-optimization-20261008/release-0.21.7/local-restart-proof/proof.json",
+    "regular30_seconds": 842.631,
+    "publication_workflow": "https://github.com/cozy-creator/cozy-runtime/actions/runs/37922201531"
   },
   "comfy_current_trace": {
-    "status": "blocked_before_graph_submission",
+    "status": "new_cli_client_live_qualification",
     "job_id": "job-4691cac0d8b08148673f489b",
     "reason": "executor no_network fence refuses localhost8188",
     "gpu_inference_launched": false,
     "owned_server_stopped": true,
-    "next": "Implement explicit controller-side CLI development service client; preserve executor fence."
+    "next": "Implement explicit controller-side CLI development service client; preserve executor fence.",
+    "pr": "https://github.com/cozy-creator/cozy/pull/1160",
+    "candidate_commit": "de4341cb",
+    "prior_cli_attempt": "typed-nil preflight exited before any graph submission; fixed with actual command-path test"
   }
 }
