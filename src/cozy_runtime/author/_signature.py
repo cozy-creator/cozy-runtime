@@ -248,6 +248,8 @@ class Surface:
     invocable: bool = False
     memoize: bool = False
     model_defaults: Mapping[str, DefaultLadder] = field(default_factory=dict)
+    model_components: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    """Model argument -> the components this callable runs; an absent argument runs all."""
 
     @property
     def assets_binding(self) -> AssetsBinding | None:
@@ -357,6 +359,7 @@ def analyze(
     invocable: bool = False,
     memoize: bool = False,
     model_defaults: Mapping[str, DefaultLadder] | None = None,
+    model_components: Mapping[str, tuple[str, ...]] | None = None,
 ) -> Surface:
     """Derive the whole surface from the signature. Every refusal here is a BUILD refusal."""
     where = f"{fn.__module__}:{fn.__qualname__}"
@@ -526,7 +529,9 @@ def analyze(
             preflight, payloads[0].annotation, assets_params[0] if assets_params else None
         )
 
-    check_model_arguments(model_defaults or {}, [p.name for p in params if p.role == "model"])
+    models = [p.name for p in params if p.role == "model"]
+    check_model_arguments(model_defaults or {}, models)
+    check_model_arguments(model_components or {}, models, what="components")
     return Surface(
         name=name,
         kind=kind,
@@ -548,6 +553,7 @@ def analyze(
         invocable=invocable,
         memoize=memoize,
         model_defaults=model_defaults or {},
+        model_components=model_components or {},
     )
 
 

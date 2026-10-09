@@ -275,6 +275,7 @@ class _RecordingBackend:
     route: str
     events: list[FillEvent] = field(default_factory=list)
     poisoned: list[str] = field(default_factory=list)
+    bound: frozenset[str] | None = None
 
     @property
     def filled_bytes(self) -> int:

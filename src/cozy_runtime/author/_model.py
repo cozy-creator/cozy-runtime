@@ -50,6 +50,7 @@ from cozy_runtime.author._loader import (
     DerivedCache,
     Loader,
     Mode,
+    ModelFitRefused,
     Scheduler,
     loading,
 )
@@ -808,6 +809,15 @@ class _ComponentScope:
     def __enter__(self) -> None:
         model = self._model
         model._cozy_require_ready(self._method)
+        record = model._cozy_record
+        unbound = [c for c in self._components if record is not None and c in record.skipped]
+        if unbound:
+            raise CapabilityError(
+                f"{type(model).__name__}.{self._method} uses {', '.join(unbound)}, which this "
+                "construction's binding does not select: those components are on meta",
+                code="component_unbound",
+                fields=unbound,
+            )
         placement = model._cozy_placement
         if placement is not None and placement.remote(self._components):
             if remote_scope(model) is not None:
@@ -1052,6 +1062,15 @@ class ModelRegistry:
                     code="no_construction",
                 )
             record = records[0] if len(records) == 1 else _merge(records)
+            if record.skipped and not record.components:
+                raise ModelFitRefused(
+                    {
+                        "ok": False,
+                        "code": "destination_absent",
+                        "detail": "the binding selects none of the components "
+                        f"{cls.__name__} builds ({', '.join(record.skipped)})",
+                    }
+                )
             _prove_components(cls, record)
             constructed = loader.constructed()
             if adapters and artifact._prepare is None:
@@ -1112,6 +1131,7 @@ def _merge(records: Sequence[ConstructionRecord]) -> ConstructionRecord:
         filled_bytes=sum(r.filled_bytes for r in records),
         ignored_extras=tuple(e for r in records for e in r.ignored_extras),
         ignored_warnings=tuple(w for r in records for w in r.ignored_warnings),
+        skipped=tuple(c for r in records for c in r.skipped),
         fit=next((r.fit for r in records if r.fit is not None), None),
     )
 
@@ -1119,7 +1139,7 @@ def _merge(records: Sequence[ConstructionRecord]) -> ConstructionRecord:
 def _prove_components(cls: type, record: ConstructionRecord) -> None:
     """The EXISTENCE clock: every declared name matched against the censused construction,
     and — when the class declares everywhere — no censused component left undeclared."""
-    censused = set(record.components)
+    censused = set(record.components) | set(record.skipped)
     contract = component_use(cls)
     unknown = sorted({c for names in contract.values() for c in names} - censused)
     if unknown:

@@ -447,6 +447,12 @@ class Backend(Protocol):
     not consent must refuse with nothing to undo, not after its bytes are on the card.
     """
 
+    @property
+    def bound(self) -> frozenset[str] | None:
+        """The components this backend's binding selects, or None for every one. A built
+        component outside the set stays on meta: never fit, filled or registered."""
+        ...
+
     def fit(self, walked: Census, *, encoded_leaves: str) -> Fit | None:
         """The one verdict, or None when this backend holds no checkpoint header to judge
         against (derive mode; a local lane tree). The runtime keeps no other matcher."""
@@ -470,6 +476,8 @@ class Backend(Protocol):
 @dataclass(slots=True)
 class _NullBackend:
     """Derive mode's backend: the walk runs, nothing is judged, allocated or filled."""
+
+    bound: frozenset[str] | None = None
 
     def fit(self, walked: Census, *, encoded_leaves: str) -> Fit | None:
         return None
@@ -635,6 +643,8 @@ class ConstructionRecord:
     """Stored tensors the code does not build: skipped, never loaded, and CONFESSED."""
     ignored_warnings: tuple[str, ...] = ()
     """One line per checkpoint that stores such tensors: count, bytes and the first keys."""
+    skipped: tuple[str, ...] = ()
+    """Built components the binding does not select: on meta, and a scope using one refuses."""
     fit: dict[str, object] | None = None
     """The `ok` Fit document this construction was judged by, verbatim; None where no
     header was there to judge against (derive mode)."""
@@ -739,7 +749,7 @@ class Loader:
         if self._artifact._prepare is not None:
             self._artifact._prepare(obj)
         _weightless = _weightless_census(obj)
-        walked = census(obj)
+        walked, skipped = census(obj).only(self._backend.bound)
         _legs.append(("census", round((time.perf_counter() - _t0) * 1000, 1)))
         _t0 = time.perf_counter()
         # THE ONE VERDICT, before a byte is reserved (model-code-fit §3). The backend holds
@@ -761,6 +771,7 @@ class Loader:
             filled_bytes=filled_bytes,
             ignored_extras=ignored,
             ignored_warnings=warned,
+            skipped=skipped,
             fit=dict(fit) if fit is not None else None,
             stage_ms=tuple(_legs),
             weightless=_weightless,
@@ -864,6 +875,22 @@ class Census:
     components: tuple[str, ...]
     schedulers: tuple[str, ...]
     live: Mapping[str, TensorLike]
+
+    def only(self, bound: frozenset[str] | None) -> tuple[Census, tuple[str, ...]]:
+        """This walk restricted to the `bound` components, and the components left out."""
+        skipped = tuple(c for c in self.components if bound is not None and c not in bound)
+        if not skipped:
+            return self, ()
+        destinations = tuple(d for d in self.destinations if d.component not in skipped)
+        return (
+            Census(
+                destinations,
+                tuple(c for c in self.components if c not in skipped),
+                self.schedulers,
+                {d.key: self.live[d.key] for d in destinations},
+            ),
+            skipped,
+        )
 
 
 def _weightless_census(obj: object) -> tuple[int, int, int]:

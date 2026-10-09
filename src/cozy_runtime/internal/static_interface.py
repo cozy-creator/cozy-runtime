@@ -50,7 +50,12 @@ import cozy_runtime.internal.static_invocable as static_invocable
 from cozy_runtime import author
 from cozy_runtime.author._markers import MODEL_DEFAULT, PREFLIGHT
 from cozy_runtime.author._model import Model
-from cozy_runtime.author._model_defaults import DefaultLadder, check_model_arguments, model_defaults
+from cozy_runtime.author._model_defaults import (
+    DefaultLadder,
+    check_model_arguments,
+    model_components,
+    model_defaults,
+)
 from cozy_runtime.author._script_metadata import byte_parameter, declarations, main_definition
 from cozy_runtime.author._services import SERVICES
 from cozy_runtime.author._signature import AssetsBinding, _classify, assets_binding, assets_payload
@@ -254,11 +259,25 @@ _ENTRYPOINT_KEYWORDS = frozenset(
         "memo_version",
         "memo_dependencies",
         "defaults",
+        "components",
         "internal",
     }
 )
 _JOB_KEYWORDS = frozenset(
-    {"name", "publishes", "emits_media", "weights", "demand", "defaults", "internal", "accelerator"}
+    {
+        "name",
+        "publishes",
+        "emits_media",
+        "weights",
+        "demand",
+        "defaults",
+        "components",
+        "internal",
+        "accelerator",
+    }
+)
+_INVOCABLE_KEYWORDS = frozenset(
+    {"memoize", "defaults", "components", "memo_version", "memo_dependencies"}
 )
 
 
@@ -1180,6 +1199,7 @@ class Registration:
     accelerator: bool | None = None
     #: `memo_version=` / `memo_dependencies=` as written, and the module they are read in.
     memo_declaration: tuple[tuple[str, Module, ast.expr], ...] = ()
+    model_components: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
 
 def build(project: Path, *, environment_python: Path | None = None) -> dict[str, Json]:
@@ -1527,6 +1547,7 @@ def _registration(
     function_module = module
     invocable, memoize = False, False
     default_models: dict[str, DefaultLadder] = {}
+    used_components: dict[str, tuple[str, ...]] = {}
     memo_declaration: list[tuple[str, Module, ast.expr]] = []
     for index, export in enumerate(fn.decorator_list):
         target = export.func if isinstance(export, ast.Call) else export
@@ -1542,13 +1563,13 @@ def _registration(
         invocable = True
         if isinstance(export, ast.Call):
             if export.args or any(
-                keyword.arg not in {"memoize", "defaults", "memo_version", "memo_dependencies"}
-                for keyword in export.keywords
+                keyword.arg not in _INVOCABLE_KEYWORDS for keyword in export.keywords
             ):
                 reader.refuse(
                     function_module,
                     export,
-                    "@invocable accepts memoize, memo_version, memo_dependencies and defaults",
+                    "@invocable accepts memoize, memo_version, memo_dependencies, defaults "
+                    "and components",
                     "static_unsupported",
                 )
             for keyword in export.keywords:
@@ -1559,6 +1580,9 @@ def _registration(
                 value = reader.fold(function_module, keyword.value)
                 if keyword.arg == "defaults":
                     default_models = model_defaults(value)
+                    continue
+                if keyword.arg == "components":
+                    used_components = model_components(value)
                     continue
                 if type(value) is not bool:
                     reader.refuse(
@@ -1617,6 +1641,13 @@ def _registration(
                     module, keyword, "declare defaults once, on invocable or App registration"
                 )
             default_models = declared_defaults or default_models
+        elif keyword.arg == "components":
+            declared_components = model_components(value)
+            if used_components and declared_components:
+                reader.refuse(
+                    module, keyword, "declare components once, on invocable or App registration"
+                )
+            used_components = declared_components or used_components
         elif keyword.arg == "name":
             name = str(value)
         elif keyword.arg == "hidden" and value is True:
@@ -1655,6 +1686,7 @@ def _registration(
         internal,
         accelerator,
         tuple(memo_declaration),
+        used_components,
     )
 
 
@@ -1750,6 +1782,7 @@ def _callable(reader: Reader, registration: Registration) -> dict[str, Json]:
                         spec.components,
                         spec.sequence_parallel,
                         defaults=registration.model_defaults.get(arg.arg, ()),
+                        uses=registration.model_components.get(arg.arg, ()),
                     )
                 )
                 continue
@@ -1757,10 +1790,9 @@ def _callable(reader: Reader, registration: Registration) -> dict[str, Json]:
                 payloads.append(reader.translate(module, arg.annotation))
                 continue
         reader.refuse(module, arg.annotation, f"parameter {arg.arg}: not an author surface type")
-    check_model_arguments(
-        registration.model_defaults,
-        [str(slot["path"]).rsplit(".", 1)[-1] for slot in models],
-    )
+    parameters = [str(slot["path"]).rsplit(".", 1)[-1] for slot in models]
+    check_model_arguments(registration.model_defaults, parameters)
+    check_model_arguments(registration.model_components, parameters, what="components")
     if len(payloads) != 1:
         reader.refuse(
             module, fn, f"exactly one typed request struct is required, found {len(payloads)}"
