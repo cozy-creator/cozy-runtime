@@ -1,5 +1,5 @@
 {
-  "updated_utc": "2026-10-09T07:32:51.743210+00:00",
+  "updated_utc": "2026-10-09T09:21:03.814324+00:00",
   "native": [
     {
       "label": "native-fast-turbo-warm-1",
@@ -619,7 +619,12 @@
   },
   "quality_approval": {
     "chibisuke_retained_comparison": "User found the two videos comparable; scoped to reviewed clips and settings.",
-    "expanded_matrix": "Pending user review; defaults unchanged."
+    "expanded_matrix": {
+      "hybrid_sage3_int8_sol": "User-approved recipe; default promotion authorized on supported Blackwell.",
+      "all_dense_sage3": "User reported water-like warbling artifacts; remains opt-in.",
+      "other_kernels": "No new explicit visual judgment.",
+      "non_blackwell": "Keep existing working defaults until matched evidence supports changing them."
+    }
   },
   "targets_met": false,
   "profile_4996": "failed during >1GiB export; full raw trace removed; not a speed measurement",
@@ -795,7 +800,7 @@
     "same_host_comfy_control": null
   },
   "expanded_turbo_matrix": {
-    "status": "complete_awaiting_user_quality_review",
+    "status": "complete_scoped_user_review_recorded",
     "expected_timed_videos": 16,
     "expected_warmups": 8,
     "kernels": [
@@ -1209,6 +1214,19 @@
     "full_av_checks_pass": true,
     "all_eight_mixed_videos_match_warmup": true,
     "final_phase_report": "/home/fidika/cozy_v2/outputs/h3-single5090-optimization-20261008/quality-matrix-20261009/final-phase-comparison-linear.json",
-    "idle_context_report": "/home/fidika/cozy_v2/outputs/h3-single5090-optimization-20261008/quality-matrix-20261009/idle-executor-cohort-analysis-linear.json"
+    "idle_context_report": "/home/fidika/cozy_v2/outputs/h3-single5090-optimization-20261008/quality-matrix-20261009/idle-executor-cohort-analysis-linear.json",
+    "review_decision": "/home/fidika/cozy_v2/outputs/h3-single5090-optimization-20261008/quality-matrix-20261009/review-decision.json"
+  },
+  "default_promotion": {
+    "status": "primitive_gpu_checks_passed_full_cli_qualification_in_progress",
+    "pr": "https://github.com/cozy-creator/cozy-runtime/pull/1263",
+    "source_head": "06287acf",
+    "runtime": "0.21.6+dev.h3hybrid.06287acf",
+    "tensorfs": "0.6.1",
+    "agent": "0.3.4",
+    "wheel_sha256": "47620e0f43c676121b35bcddaa201010995617cbf2bd0ec2ca7450a073042fb4",
+    "experimental_gemm_included": false,
+    "published": false,
+    "installed_local": false
   }
 }
