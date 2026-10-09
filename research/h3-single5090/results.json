@@ -1218,7 +1218,7 @@
     "review_decision": "/home/fidika/cozy_v2/outputs/h3-single5090-optimization-20261008/quality-matrix-20261009/review-decision.json"
   },
   "default_promotion": {
-    "status": "primitive_gpu_checks_passed_full_cli_qualification_in_progress",
+    "status": "first_no_override_render_completed_with_compiling_hybrid_bf16_fallback",
     "pr": "https://github.com/cozy-creator/cozy-runtime/pull/1263",
     "source_head": "06287acf",
     "runtime": "0.21.6+dev.h3hybrid.06287acf",
@@ -1227,6 +1227,17 @@
     "wheel_sha256": "47620e0f43c676121b35bcddaa201010995617cbf2bd0ec2ca7450a073042fb4",
     "experimental_gemm_included": false,
     "published": false,
-    "installed_local": false
+    "installed_local": false,
+    "first_full_run": {
+      "number": 5071,
+      "request_id": "req-a038788189bab83ec3cd0259",
+      "render_status": "completed",
+      "execution_seconds_rounded": 578.1,
+      "attention_observed": "sol-attn:cute_sm120",
+      "hybrid_state_at_selection": "compiling",
+      "qualification": "not yet served the intended hybrid default",
+      "video_sha256": "ac075e8411acd8a9e2fba5f1c34fcbe250ac22e834d610ee358274c82315f8a4",
+      "video_bytes": 23403789
+    }
   }
 }
