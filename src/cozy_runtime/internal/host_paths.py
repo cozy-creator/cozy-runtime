@@ -111,20 +111,6 @@ class Layout:
         return self.bootstrap / "tls.key"
 
     @property
-    def machine_publication_authority(self) -> Path:
-        return self.bootstrap / "machine-publication-authority.json"
-
-    @property
-    def machine_hubs(self) -> Path:
-        """Every other Hub this machine is registered at (wire 67); the Host writes it."""
-        return self.bootstrap / "machine-hubs.json"
-
-    @property
-    def tensorhub_ca(self) -> Path:
-        """The grant's private Hub CA, which the Host writes when its Hub uses one."""
-        return self.bootstrap / "tensorhub-ca.crt"
-
-    @property
     def worker_state(self) -> Path:
         return self._at("run/cozy/worker")
 

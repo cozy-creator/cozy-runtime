@@ -846,9 +846,8 @@ def fence_timing_decides_nothing() -> list[str]:
     return bad
 
 
-#: The one module that may open an HTTP connection, and only for the worker's
-#: control-plane-minted output grant (`egress.put_from`) — until th-132 moves the upload
-#: half into tensorfs too, when this allowlist shrinks to nothing.
+#: The one module that may open an HTTP connection, and only for a public wheel a lock pins
+#: (`egress.fetch_public_wheel`). Artifact bytes and publication never pass through here.
 HTTP_CLIENT_ALLOWED = frozenset({"internal/egress.py"})
 HTTP_CLIENT_MODULES = frozenset({"urllib.request", "http.client"})
 
@@ -859,8 +858,8 @@ def fence_one_address_predicate() -> list[str]:
     The failure mode this fence exists against is not "the SSRF check was wrong", it is
     "there were two downloaders and only one had the check". The download transport and its
     address predicate live in tensorfs (`tensorfs-core/src/transport/policy.rs`); what this
-    runtime still holds is the upload half in `internal/egress.py`, whose `blocked()` is the
-    ONE address predicate here. A urllib.request/http.client import anywhere else is a new
+    runtime still holds is the public-wheel fetch in `internal/egress.py`, whose `blocked()` is
+    the ONE address predicate here. A urllib.request/http.client import anywhere else is a new
     byte-mover chain that the predicate does not cover — the exemption is never granted; a
     new mover belongs in tensorfs.
     """
