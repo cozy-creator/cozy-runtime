@@ -10,8 +10,6 @@ caller, the worker's control-plane-minted output grant, and it moves to tensorfs
 th-132, taking `blocked()` with it. The `one-address-predicate` fence in
 `checks/architecture.py` reddens if any other urllib/http.client chain appears beside this
 module — a second network byte mover in this runtime is the defect above, restated.
-The bounded machine-publication metadata request also lives here: it uses the
-operator-configured HTTPS control origin and verified TLS context, and never follows redirects.
 
 **A stream may not exceed its declared size.** `copy_bounded` stops at the declared length
 and refuses before writing the over-bound chunk; it never buffers the body in memory. A body that
@@ -48,15 +46,13 @@ import http.client
 import ipaddress
 import socket
 import ssl
-from collections.abc import Iterable, Iterator, Mapping
-from contextlib import contextmanager
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 from urllib.parse import urljoin, urlparse
 
 from cozy_runtime.internal import liveness
-from cozy_runtime.internal.config import TensorhubOrigin
 
 #: How much of a body one read() pulls. Small enough that a cap refusal happens promptly.
 CHUNK = 1 << 20
@@ -119,121 +115,6 @@ class EgressRefusal(Exception):
         super().__init__(f"{code}: {detail}")
         self.code = code
         self.detail = detail
-
-
-def request_control_metadata(
-    origin: TensorhubOrigin,
-    context: ssl.SSLContext,
-    method: str,
-    path: str,
-    body: bytes | None,
-    headers: Mapping[str, str],
-    *,
-    limit: int,
-) -> tuple[int, bytes]:
-    """One bounded request to the fixed control authority, including delegated loopback HTTP.
-
-    The origin comes from the host configuration, never a Python job or a
-    redirect. Unlike a presigned data URL, an operator may intentionally host
-    this authenticated control service on a private address. Model and artifact
-    bytes still move through TensorFS; this function accepts only small metadata.
-    It retries nothing: the execution journal must reconcile ambiguous writes.
-    """
-    if not context.check_hostname or context.verify_mode != ssl.CERT_REQUIRED:
-        raise EgressRefusal("control_tls_required", "control TLS verification is required")
-    if not 0 < limit <= 8 << 20 or (body is not None and len(body) > limit):
-        raise EgressRefusal("control_metadata_bound", "control metadata exceeds its bound")
-    if method not in {"GET", "POST", "PUT"} or not path.startswith("/v1/"):
-        raise EgressRefusal("control_route_invalid", "control route is invalid")
-    connection = (
-        http.client.HTTPConnection(origin.host, origin.port, timeout=SILENCE_SECONDS)
-        if origin.scheme == "http"
-        else http.client.HTTPSConnection(
-            origin.host, origin.port, context=context, timeout=SILENCE_SECONDS
-        )
-    )
-    try:
-        connection.request(method, path, body=body, headers=dict(headers))
-        response = connection.getresponse()
-        raw = response.read(limit + 1)
-        if len(raw) > limit:
-            raise EgressRefusal("control_response_bound", "control response exceeds its bound")
-        return response.status, raw
-    except (OSError, http.client.HTTPException) as exc:
-        raise EgressRefusal(
-            "control_transport_unavailable", "control transport unavailable"
-        ) from exc
-    finally:
-        connection.close()
-
-
-@contextmanager
-def _catalog_get(
-    host: str,
-    port: int | None,
-    tls: ssl.SSLContext | None,
-    path: str,
-    credential: Mapping[str, str],
-) -> Iterator[http.client.HTTPResponse]:
-    """One GET at the catalog, which the caller checked. Plain HTTP (no TLS context) is for
-    a loopback development catalog only. `credential` is the machine's worker capability,
-    sent only to its own Hub, else empty; nothing is retried."""
-    if not path.startswith("/v1/"):
-        raise EgressRefusal("catalog_route_invalid", "catalog route is invalid")
-    connection: http.client.HTTPConnection = (
-        http.client.HTTPSConnection(host, port, context=tls, timeout=SILENCE_SECONDS)
-        if tls is not None
-        else http.client.HTTPConnection(host, port, timeout=SILENCE_SECONDS)
-    )
-    try:
-        connection.request("GET", path, headers={"Accept": "application/json", **credential})
-        yield connection.getresponse()
-    except (OSError, http.client.HTTPException) as exc:
-        raise EgressRefusal(
-            "catalog_unavailable", f"catalog unreachable: {type(exc).__name__}"
-        ) from exc
-    finally:
-        connection.close()
-
-
-def request_catalog_metadata(
-    host: str,
-    port: int | None,
-    tls: ssl.SSLContext | None,
-    path: str,
-    *,
-    limit: int,
-    credential: Mapping[str, str],
-) -> tuple[int, bytes]:
-    """Bounded catalog metadata (bindings, lane resolutions): status and body."""
-    if not 0 < limit <= 8 << 20:
-        raise EgressRefusal("catalog_route_invalid", "catalog route is invalid")
-    with _catalog_get(host, port, tls, path, credential) as response:
-        raw = response.read(limit + 1)
-        if len(raw) > limit:
-            raise EgressRefusal("catalog_response_bound", "catalog response exceeds its bound")
-        return response.status, raw
-
-
-def measure_catalog_document(
-    host: str,
-    port: int | None,
-    tls: ssl.SSLContext | None,
-    path: str,
-    *,
-    limit: int,
-    credential: Mapping[str, str],
-) -> tuple[int, int, bytes]:
-    """A catalog document streamed, never held: status, length and SHA-256. `limit` is the
-    document kind's own cap."""
-    with _catalog_get(host, port, tls, path, credential) as response:
-        digest, length = hashlib.sha256(), 0
-        while chunk := response.read(CHUNK):
-            length += len(chunk)
-            if length > limit:
-                raise EgressRefusal("catalog_response_bound", "catalog document exceeds its cap")
-            digest.update(chunk)
-        return response.status, length, digest.digest()
 
 
 @dataclass(frozen=True, slots=True)
