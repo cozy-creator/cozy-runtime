@@ -365,25 +365,26 @@ COMPARISON_SCRIPT = r"""<script>
 
 
 def quality_review(document: dict, rows: list[dict], path: Path) -> dict | None:
-    """Apply explicit user decisions only to the exact reviewed cohort and video bytes."""
+    """Identify reviewed originals separately from the user's recipe promotion decision."""
     if not path.is_file():
         return None
     decision = json.loads(path.read_text())
-    if (
-        decision["runtime_wheel_sha256"] != document["runtime_wheel"]["sha256"]
-        or decision["gpu_uuid"] != document["gpu_uuid"]
-    ):
-        return None
-    indexed = {row["id"]: row for row in rows}
-    if any(
-        not indexed.get(key, {}).get("verified")
-        or reviewed["sha256"] != indexed[key].get("sha256")
-        for key, reviewed in decision["clips"].items()
-    ):
-        return None
+    same_cohort = (
+        decision["runtime_wheel_sha256"] == document["runtime_wheel"]["sha256"]
+        and decision["gpu_uuid"] == document["gpu_uuid"]
+    )
+    decision["reviewed_cohort_matches_displayed_cohort"] = same_cohort
     for row in rows:
+        row.pop("user_quality_review", None)
+        row.pop("user_quality_note", None)
+        row["subjective_quality_approved"] = False
         reviewed = decision["clips"].get(row["id"])
-        if reviewed and row.get("verified") and reviewed["sha256"] == row.get("sha256"):
+        if (
+            same_cohort
+            and reviewed
+            and row.get("verified")
+            and reviewed["sha256"] == row.get("sha256")
+        ):
             row["user_quality_review"] = reviewed["status"]
             row["user_quality_note"] = reviewed["note"]
             row["subjective_quality_approved"] = reviewed["status"] == "approved"
