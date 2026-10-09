@@ -1,0 +1,1 @@
+Bundles TensorD 0.4.1: a release's Hub-published wheels (its lock rows at the Hub's file door) download through TensorFS's ranged downloader, verified by the lock's sha256, instead of one uv GET each. Run 5107's install sat 5 min behind three such files (6.1 MB) on a slow route; PyPI rows still come from uv and the image's seeded cache.
