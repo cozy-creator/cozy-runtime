@@ -1,8 +1,8 @@
 [project]
 name = "h3-attention-matrix-gate"
-version = "0.0.1"
+version = "0.0.2"
 requires-python = ">=3.12,<3.13"
-dependencies = ["cozy-runtime>=0.19.0", "torch==2.14.0", "triton==3.8.0", "diffusers @ git+https://github.com/huggingface/diffusers@578c9b2c6636ab2424a0e56186268b83623656b2"]
+dependencies = ["cozy-runtime>=0.19.0", "torch==2.14.0", "triton==3.8.0", "diffusers==0.41.0.dev0"]
 [project.entry-points."cozy.application"]
 default = "attention_matrix_gate:app"
 [build-system]
@@ -12,3 +12,6 @@ build-backend = "hatchling.build"
 packages = ["attention_matrix_gate"]
 [tool.hatch.metadata]
 allow-direct-references = true
+
+[tool.uv.sources]
+diffusers = {path = "vendor/diffusers-0.41.0.dev0-py3-none-any.whl"}
