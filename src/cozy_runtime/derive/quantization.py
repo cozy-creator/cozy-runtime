@@ -16,7 +16,6 @@ import threading
 from collections import deque
 from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from importlib.resources import files
 from pathlib import Path
 from typing import IO, Any, NamedTuple
 
@@ -138,11 +137,6 @@ PLAIN_SPEC = "sha256:1fb882a7e46d0aff520f9d8a28cefd643954c19371737443101ba3c5fcc
 _MAX_ARTIFACT_PLAN_BYTES = 8 << 20
 _SOURCE_READ_CHUNK = 8 << 20
 MAX_OUTPUT_BYTES = 32 << 30
-
-
-def h3_quantization_plan() -> bytes:
-    """Return the package-owned exact H3 pruned-DiT quantization plan."""
-    return files(__package__).joinpath("h3-dit-quantization-plan.json").read_bytes()
 
 
 def prepare_quantization(plan_bytes: bytes) -> ArtifactQuantizationPlan:

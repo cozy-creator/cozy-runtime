@@ -1,0 +1,1 @@
+Runtime carries no model-specific quantization plan: `cozy_runtime.derive.quantization.h3_quantization_plan()` and its `h3-dit-quantization-plan.json` are deleted. The H3 recipe (DiT plan and text-encoder selection) lives in `minimax-h3-tools`, which already read its own byte-identical copy.
