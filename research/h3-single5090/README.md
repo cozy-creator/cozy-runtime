@@ -6,7 +6,7 @@ Compare current ComfyUI and native candidates on the same rented RTX 5090, with 
 
 Evidence: `/home/fidika/cozy_v2/outputs/h3-single5090-optimization-20261008/`.
 
-Current status (2026-10-09): optimized warm Turbo completed in 280.875 and 277.306 seconds across sparring and rally clips (mean 279.0905 seconds). The same-host Comfy controls are running; the updated regular 30-step result remains pending. Morlock (`pr-df6942e0bdbda053d874`, Vast.ai) was ended through Cozy CLI after CUDA initialization began failing in both fresh Comfy and native processes. Its completed evidence remains retained: RTX5090,575W,driver595.84,73.84GiB container RAM,$0.649167/hour including321GB disk.
+Current status (2026-10-09): optimized warm Turbo completed in 280.875 and 277.306 seconds across sparring and rally clips (mean 279.0905 seconds). The first same-host Comfy control completed in 282.749 seconds, only 1.874 seconds behind the matching Cozy sparring clip. The second Comfy control completed in 284.782 seconds versus Cozy277.306 seconds. Across both scenes Cozy averages 4.675 seconds (1.65%) faster; the updated regular 30-step result remains pending. Morlock (`pr-df6942e0bdbda053d874`, Vast.ai) was ended through Cozy CLI after CUDA initialization began failing in both fresh Comfy and native processes. Its completed evidence remains retained: RTX5090,575W,driver595.84,73.84GiB container RAM,$0.649167/hour including321GB disk.
 
 The replacement, Chibisuke (`pr-3fafabe2d3b1c634d3d9`, RunPod), was rented through the same CLI and configured Hub. It has an RTX5090 at600W, driver580.126.20,85.68GiB container RAM and321GB disk, at$1.234619/hour including storage. The old Comfy325.362-second result is a target, not a same-host control for Chibisuke. Local GPU inference is excluded.
 
@@ -37,9 +37,10 @@ Request 5017 completed the second warm clip, rally seed 581205, in **277.306 sec
 |---|---:|---:|---:|---:|
 | Cozy optimized, sparring, run 5016 | 581204 | **280.875 s** | 232.311 s | 37.940 s |
 | Cozy optimized, rally, run 5017 | 581205 | **277.306 s** | 227.858 s | 37.889 s |
-| ComfyUI, matching controls | matching | Running | Pending | Pending |
+| ComfyUI, sparring | 581204 | **282.749 s** | 243.829 s | 32.374 s |
+| ComfyUI, rally | 581205 | **284.782 s** | 245.857 s | 32.124 s |
 
-The prior Comfy result is 46.272 seconds above this two-scene average, but hardware/driver differences and the mixed-scene mean prevent treating that subtraction as a matched speedup. Current Comfy has exclusive GPU use for setup, matching clean controls, and a fresh-process CUDA trace. Regular 30-step timing follows the GPU handoff.
+The first matched sparring pair is close: Cozy leads by **1.874 seconds (0.66%)**, not a robust margin from one pair. Cozy denoises 11.517 seconds faster, while conditioning takes 4.301 seconds longer and video decode takes 5.566 seconds longer. Native encoding overlaps streamed decode; Comfy records a separate 4.224-second save/mux phase, so these spans must not be summed as independent differences. The prior-host Comfy result is no longer the direct comparison target. Both matched videos pass complete AV checks. Across sparring and rally, Cozy averages279.0905 seconds versus Comfy283.7655 seconds: a4.675-second or1.65% lead, with one run per scene. This is not a repeated-seed confidence estimate. Current Comfy has exclusive GPU use for a fresh-process CUDA trace. Regular30 timing follows the GPU handoff.
 
 ## Kernel investigation
 
@@ -65,7 +66,7 @@ Steady later steps transfer12.439GiB of weight data from RAM to VRAM each, with 
 
 The full diagnostic device busy union is290.745s across392.734s, with101.989s in traced gaps. Cold setup and profiler overhead contribute to these values; they are **not**102seconds of demonstrated clean-run savings. Clean warm5004's interior282.031seconds had zero physical disk reads, swap, major faults or memory-pressure stalls. Its charged73.8GiB RAM was mostly file cache, not live tensors. PCIe samples are20ms snapshots despite2s polling and are not valid transfer-byte totals.
 
-No complete Comfy kernel comparison is retained yet: after the failed CPU/CUDA capture, an unprofiled warmup failed AudioVAE allocation with `cuMemSetAccess` CUDA999. Fresh Comfy and native processes then also failed CUDA initialization. The rental was ended after artifact retention and replaced. A new same-host control and CUDA trace are required before claiming a matched win.
+No complete Comfy kernel comparison is retained yet: after the failed CPU/CUDA capture, an unprofiled warmup failed AudioVAE allocation with `cuMemSetAccess` CUDA999. Fresh Comfy and native processes then also failed CUDA initialization. The rental was ended after artifact retention and replaced. Both replacement-host matched controls are retained above; the full Comfy CUDA trace is running.
 
 Actual GPU probe4999 retained kernels, copies, and CUDA runtime/driver API events in CUDA-only mode. Probe5005 confirms that Chrome CUDA thread IDs use the absolute signed low32 pthread identity; the attribution helper matches all12 device events to their manual launch ranges. Disk/RAM/process-fault/PCIe sampling remains active, independently of PyTorch tracing. Partial native4998 evidence shows substantial initial disk reads but near-zero physical disk reads in later dense steps; this does not exclude RAM-to-VRAM transfers or quantify their critical-path cost.
 

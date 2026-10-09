@@ -635,8 +635,61 @@
       "rally"
     ],
     "same_scene_repeated_trials": false,
-    "comfy_same_host_controls": "running; not yet reported",
+    "comfy_same_host_controls": "Both completed282.749s/284.782s; Cozy two-scene mean4.675s faster",
     "runtime_wheel_sha256": "4e1d765d496e12c140aa115547257eb36b41f4a6e203a38f708e64ad2299e012",
     "experimental_gemm": false
+  },
+  "comfy_chibisuke": {
+    "rental": "chibisuke",
+    "gpu_uuid": "GPU-4175a7d9-b6a4-b8ac-9ac6-f89019c8735a",
+    "version": "0.39.0",
+    "warm_runs": [
+      {
+        "label": "sparring",
+        "seed": 581204,
+        "prompt_id": "a61db105-15f5-4d07-b7f2-c0f2dcdfa207",
+        "execution_s": 282.749,
+        "phase_s": {
+          "conditioning": 2.1051045283675194,
+          "denoise": 243.8285918198526,
+          "audio_decode": 0.21314921602606773,
+          "video_decode": 32.37439555674791,
+          "mux_save": 4.223500590771437
+        },
+        "progress_count": 8,
+        "receipt": "/home/fidika/cozy_v2/outputs/h3-single5090-optimization-20261008/comfy-chibisuke/warm-1-phase-receipt.json",
+        "matched_cozy_run": 5016,
+        "cozy_total_advantage_s": 1.874,
+        "interpretation": "One pair, about0.7%; not robust repeat-trial margin",
+        "av_checks": "complete audio/video decode passed; 362 frames 1344x768 24fps stereo32k",
+        "video": "/home/fidika/cozy_v2/outputs/h3-single5090-optimization-20261008/comfy-chibisuke/chibisuke-turbo-warm-1_00001_.mp4",
+        "video_sha256": "cb15822f23eecfac9a41c43b260c45783406401fc81edb1017b0eb0e88d2afbe"
+      },
+      {
+        "label": "rally",
+        "seed": 581205,
+        "prompt_id": "5d86504a-2192-4e89-9a28-b911e1184476",
+        "execution_s": 284.782,
+        "receipt": "/home/fidika/cozy_v2/outputs/h3-single5090-optimization-20261008/comfy-chibisuke/turbo-results.json",
+        "matched_cozy_run": 5017,
+        "cozy_total_advantage_s": 7.476,
+        "av_checks": "complete audio/video decode passed; 362 frames 1344x768 24fps stereo32k",
+        "video": "/home/fidika/cozy_v2/outputs/h3-single5090-optimization-20261008/comfy-chibisuke/chibisuke-turbo-warm-2_00001_.mp4",
+        "video_sha256": "bd2d13b54e39eb58c7644258e11c8ca72ce4d3a385a6d83bdbcb6ec3bf6920c7"
+      }
+    ],
+    "second_warm_status": "completed",
+    "matched_means": {
+      "comfy_seconds": 283.7655,
+      "cozy_seconds": 279.0905,
+      "cozy_advantage_seconds": 4.6749999999999545,
+      "cozy_wall_time_reduction_pct": 1.6474870976210831
+    },
+    "limits": [
+      "One matched run per scene; two-scene mean is not a repeated-seed confidence estimate.",
+      "User quality approval remains pending; media decode checks do not establish perceptual equivalence.",
+      "Cold CUDA trace is separate from these clean timings.",
+      "Older Morlock325.362-second result is a different host and excluded from this comparison."
+    ]
   }
 }
