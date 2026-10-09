@@ -239,6 +239,9 @@ class Recipe:
     unit_bytes: int = 4 << 30
 
 
+#: FA3 inference forward only, one KV split and no packed GQA: exactly what
+#: `attention_upstream.fa3` calls (`num_splits=1`), a third of upstream's forward units.
+_FA3_OFF = ("BACKWARD", "SM80", "PAGEDKV", "APPENDKV", "SOFTCAP", "LOCAL", "SPLIT", "PACKGQA")
 #: Torch 2.14's headers need C++20; every recipe below says so in upstream's own terms.
 RECIPES: dict[str, Recipe] = {
     recipe.name: recipe
@@ -268,19 +271,30 @@ RECIPES: dict[str, Recipe] = {
             ("flash-attention", "flash-attention-cutlass"),
             subdir="hopper",
             place={"flash-attention-cutlass": "csrc/cutlass"},
-            # Inference forward only: what `attention_upstream.fa3` calls, and a fraction of
-            # upstream's full instantiation set.
-            env={
-                f"FLASH_ATTENTION_DISABLE_{part}": "TRUE"
-                for part in ("BACKWARD", "SM80", "PAGEDKV", "APPENDKV", "SOFTCAP", "LOCAL")
-            },
+            env={f"FLASH_ATTENTION_DISABLE_{part}": "TRUE" for part in _FA3_OFF},
             # Upstream's own guidance: its hopper instantiations need several GB per job.
             unit_bytes=6 << 30,
             # Upstream updates the submodule with git, and off CUDA 12.8 downloads NVIDIA's
             # 12.6/12.8 compilers over this machine's toolkit; build with the toolkit present.
             # It hard-codes C++17 and reads no append variable. Only `flash_api.cpp`, a host
-            # compiler unit, includes Torch; the CUDA units keep upstream's C++17.
+            # compiler unit, includes Torch; the CUDA units keep upstream's C++17. Its
+            # `hdimall`/`hdimdiff` units each instantiate every head dimension (~190 s apiece
+            # on H100 pods): each dimension's own file is a unit instead, so a pod's cores
+            # build them side by side.
             replace=(
+                (
+                    "hopper/setup.py",
+                    'HEAD_DIMENSIONS_FWD = ["all", "diff"]',
+                    'HEAD_DIMENSIONS_FWD = ["64", "96", "128", "192", "256", "64_256", "64_512",'
+                    ' "192_128"]',
+                ),
+                (
+                    "hopper/setup.py",
+                    "if not (packgqa and (paged or split))]",
+                    "if not (packgqa and (paged or split)) and os.path.exists("
+                    'f"instantiations/flash_fwd_hdim{hdim}_{dtype}{paged}{split}{softcap}'
+                    '{packgqa}_sm90.cu")]',
+                ),
                 ("hopper/setup.py", '"cxx": ["-O3", "-std=c++17"', '"cxx": ["-O3", "-std=c++20"'),
                 (
                     "hopper/setup.py",
@@ -541,7 +555,7 @@ def build_setup(
             for key, value in config.inherited_environment().items()
             if key != "TORCH_CUDA_ARCH_LIST"
         }
-        width = kernel_compile.width(recipe.unit_bytes)
+        width = kernel_compile.width(recipe.unit_bytes, spec.get("share", 1))
         parallel = min(recipe.extensions, width)
         environment.update(
             {

@@ -48,8 +48,8 @@ BUILDERS = {
     "sol": "cozy_runtime.internal.attention_sol:build",
     "fusion": "cozy_runtime.internal.fusion:build",
 }
-#: Kinds that run many compiler processes: one at a time on the machine, each as wide as the
-#: machine measures (`width`). The others are one Python process each and run at once.
+#: Kinds that run many compiler processes: each holds one of the machine's build slots and
+#: builds with that share of its width (`width`). The others are one Python process each.
 WIDE = frozenset({"setup"})
 _BOOT = (
     "import json, sys; boot = json.loads(sys.argv.pop(1)); sys.path[:] = boot['path']; "
@@ -207,36 +207,6 @@ def _activity(store: kernel_cache.Store) -> object:
     return (tuple(words), sum(burns)) if burns else None
 
 
-def in_order(
-    store: kernel_cache.Store, jobs: Sequence[Job], done: Callable[[Job, State], None]
-) -> None:
-    """The machine's own compiles, one after another in `jobs`' order (its priority), each
-    as wide as the machine. Every key nobody builds yet is claimed at once, so no executor
-    on this machine starts a second build of it while it waits its turn; `done` sees each
-    one ready or failed."""
-    queued: dict[str, int] = {}
-    for job in jobs:
-        if store.entry(job.key) is not None or _failure(job.key) is not None:
-            continue
-        lock = store.claim(job.key)
-        if lock is not None:
-            store.set_state(job.key, {"pid": os.getpid(), "progress": 0.0, "phase": "queued"})
-            queued[job.key.digest] = lock
-    for job in jobs:
-        held = queued.pop(job.key.digest, None)
-        if held is not None:
-            try:
-                with _GUARD:
-                    _spawn(store, job, held)
-            except OSError as exc:
-                store.set_state(job.key, None)
-                done(job, State(job.key.kernel, "failed", detail=f"compile_unstarted: {exc}"))
-                continue
-            finally:
-                os.close(held)
-        done(job, wait(store, job))
-
-
 def learn(store: kernel_cache.Store, scope: str, job: Job) -> None:
     """Remember, on this machine only, an artifact a request needed, so the next boot compiles
     it ahead (`learned`). One line per key under the store's own namespace; never shared."""
@@ -359,10 +329,10 @@ def _record_failure(
 # --------------------------------------------------------------------- the builder process
 
 
-def width(unit_bytes: int) -> int:
-    """How many compiler processes one wide build runs: every CPU this process may use (its
-    affinity and its cgroup's quota), as far as the memory it may still take holds one
-    `unit_bytes` process each. Measured each build; the machine is the pod's."""
+def width(unit_bytes: int, share: int = 1) -> int:
+    """How many compiler processes one wide build runs: its `share` of every CPU this process
+    may use (its affinity and its cgroup's quota), as far as the memory it may still take
+    holds one `unit_bytes` process each. Measured each build; the machine is the pod's."""
     cpus = len(os.sched_getaffinity(0))
     quota = _read("/sys/fs/cgroup/cpu.max").split()
     if len(quota) == 2 and quota[0].isdigit() and quota[1].isdigit() and int(quota[1]):
@@ -371,7 +341,7 @@ def width(unit_bytes: int) -> int:
     limit, used = _read("/sys/fs/cgroup/memory.max"), _read("/sys/fs/cgroup/memory.current")
     if limit.isdigit() and used.isdigit():
         memory.append(int(limit) - int(used))
-    return max(1, min(cpus, min(memory) // unit_bytes))
+    return max(1, min(cpus, min(memory) // unit_bytes) // share)
 
 
 def _read(path: str) -> str:
@@ -386,33 +356,51 @@ def _meminfo(field: str) -> int:
     return int(found.group(1)) * 1024 if found else 0
 
 
-def machine_slot(namespace: Path, *, create: bool = False) -> Path:
-    """The build slot's lock file; the machine's kernel boot creates it for its executors."""
-    path = namespace / ".slots" / "0.lock"
-    if create:
-        path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
-        os.close(os.open(path, os.O_RDONLY | os.O_CREAT | os.O_CLOEXEC, 0o644))
-    return path
+def machine_slots(namespace: Path, count: int) -> list[Path]:
+    """The machine's build slots, one per wide build its kernel boot starts at once; the boot
+    creates them for its executors."""
+    directory = namespace / ".slots"
+    directory.mkdir(mode=0o755, parents=True, exist_ok=True)
+    wanted = {f"{index}.lock" for index in range(max(1, count))}
+    for path in directory.glob("*.lock"):
+        if path.name not in wanted:
+            path.unlink(missing_ok=True)
+    for name in wanted:
+        os.close(os.open(directory / name, os.O_RDONLY | os.O_CREAT | os.O_CLOEXEC, 0o644))
+    return _slots(namespace)
+
+
+def _slots(namespace: Path | None) -> list[Path]:
+    return sorted((namespace / ".slots").glob("*.lock")) if namespace is not None else []
 
 
 @contextlib.contextmanager
-def _slot(store: kernel_cache.Store, kind: str) -> Iterator[None]:
-    """A wide build holds the machine's one build slot, waiting on a live builder that has
-    it; others need none. The slot lives in the trusted namespace when this process reads
-    one (an executor under uid isolation), so the machine has one; it is an flock, so a
-    builder that dies frees it."""
+def _slot(store: kernel_cache.Store, kind: str) -> Iterator[int]:
+    """The share of the machine a build takes: a wide build holds one of the machine's build
+    slots, waiting while live builders hold them all, and takes one slot's share of its
+    width; others need none. The slots live in the trusted namespace when this process reads
+    one (an executor under uid isolation), so the machine has one set; they are flocks, so a
+    builder that dies frees its slot."""
     if kind not in WIDE:
-        yield
+        yield 1
         return
+    slots = _slots(store.trusted) or _slots(store.own) or machine_slots(store.own, 1)
+    fds = [os.open(path, os.O_RDONLY | os.O_CLOEXEC) for path in slots]
     try:
-        fd = os.open(machine_slot(store.trusted or store.own), os.O_RDONLY | os.O_CLOEXEC)
-    except FileNotFoundError:
-        fd = os.open(machine_slot(store.own, create=True), os.O_RDONLY | os.O_CLOEXEC)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        yield
+        while not any(_locked(fd) for fd in fds):
+            time.sleep(POLL_SECONDS)
+        yield len(fds)
     finally:
-        os.close(fd)
+        for fd in fds:
+            os.close(fd)
+
+
+def _locked(fd: int) -> bool:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    return True
 
 
 def run(
@@ -509,13 +497,13 @@ def main(argv: list[str] | None = None) -> int:
 
     report(0.0, "queued for a build slot")
     try:
-        with _slot(store, raw["kind"]):
+        with _slot(store, raw["kind"]) as share:
             report(0.0)
             module, name = BUILDERS[raw["kind"]].split(":")
             build = getattr(import_module(module), name)
 
             def fill(staging: Path) -> Mapping[str, object]:
-                facts = dict(build(raw["spec"], staging, report))
+                facts = dict(build({**raw["spec"], "share": share}, staging, report))
                 elapsed = (time.perf_counter() - started) * 1000
                 return {"host": os.uname().nodename, "compile_ms": round(elapsed, 1), **facts}
 

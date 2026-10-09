@@ -5,12 +5,13 @@ The machine launches `python -m cozy_runtime.internal.machine_kernels` once per 
 generation, under that generation's own seal: its interpreter and torch, every card of the
 machine, and the kernel store and scratch scope its executors use. Each key here is therefore
 the key an executor computes, by the same functions. For each distinct card architecture it
-compiles the artifacts of `LADDER` the card admits, in its order, through the compile manager
-(`kernel_compile.in_order`): one wide build at a time, as wide as the machine measures, niced;
-then Sol's card objects. An executor finds each one ready, or building and claimed, and waits
-for the one it needs (`kernel_compile.wait`): it builds none twice and serves no other kernel
-in its place. This process holds no device memory. It prints one JSON line per artifact as it
-ends and a last one, and exits nonzero when one failed.
+starts every artifact of `LADDER` the card admits at once, through the compile manager: each
+wide build holds one of the machine's build slots, one per wide build here, and takes that
+share of the machine's width, niced; Sol's card objects start once its sources are in. So the
+kernel a request needs first never queues behind one it does not. An executor finds each one
+ready or building, and waits for the one it needs (`kernel_compile.wait`): it builds none
+twice and serves no other kernel in its place. This process holds no device memory. It prints
+one JSON line per artifact as it ends and a last one, and exits nonzero when one failed.
 """
 
 from __future__ import annotations
@@ -99,8 +100,15 @@ def main() -> int:
     if store is not None and present:
         kernel_cache.configure(store)
         kernel_compile.waiting = progress
-        kernel_compile.machine_slot(store.own, create=True)
-        kernel_compile.in_order(store, ladder(present), done)
+        jobs = ladder(present)
+        kernel_compile.machine_slots(
+            store.own, sum(job.kind in kernel_compile.WIDE for job in jobs)
+        )
+        for job in jobs:
+            kernel_compile.submit(store, job)
+        sources = [job for job in jobs if job.key.kernel == kernel_sources.PYTHON]
+        for job in sources:
+            done(job, kernel_compile.wait(store, job))
         try:
             objects = sol_objects(store, present)
         except Exception as exc:  # its DSL does not import here; an executor says the same
@@ -109,7 +117,7 @@ def main() -> int:
             print(f"sol objects: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
         for job in objects:
             kernel_compile.submit(store, job)
-        for job in objects:
+        for job in [*(job for job in jobs if job not in sources), *objects]:
             done(job, kernel_compile.wait(store, job))
     last = {
         "done": True,
