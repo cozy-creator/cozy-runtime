@@ -1,5 +1,5 @@
 {
-  "updated_utc": "2026-10-08T23:07:33.937321+00:00",
+  "updated_utc": "2026-10-09T00:32:28.951111+00:00",
   "native": [
     {
       "label": "native-fast-turbo-warm-1",
@@ -423,6 +423,90 @@
           "length": 24463459,
           "sha256": "sha256:0a78d463ecfc7b6512f26213e9a7a19954ea7489e74996e07f0bbc0701a21c8b",
           "path": "/home/fidika/.cozy/outputs/h3-single5090-optimization-20261008/native-lowmem-shared-turbo-warm-1/5004-video.mp4"
+        }
+      ]
+    },
+    {
+      "label": "chibisuke-fusionbake-turbo-warm-1",
+      "rental": "chibisuke",
+      "host_boundary": "600W driver580.126.20; freshComfycontrolpending",
+      "receipt": "/home/fidika/cozy_v2/outputs/h3-single5090-optimization-20261008/chibisuke-fusionbake-turbo-warm-1-show.json",
+      "run": 5016,
+      "request_id": "req-203ec68feda3a64040ceca0f",
+      "status": "completed",
+      "execution_s": 280.875,
+      "phase_s": {
+        "prepare": 0.000308,
+        "loading weights": 3.5704499999999997,
+        "condition_text": 6.40577,
+        "denoise": 232.311288,
+        "decode_audio": 0.11645,
+        "decode_video": 37.940127000000004,
+        "check_output": 0.085175
+      },
+      "denoise_step_s": [
+        35.164216999999994,
+        33.707586000000006,
+        34.009161999999996,
+        34.051969,
+        26.423682,
+        23.064245,
+        23.092059000000003,
+        22.647769
+      ],
+      "attention": {
+        "requested": "fl2va_dit=kitchen-sol-producer-fp4-lowmem-shared-qkv",
+        "observed": "audio_vae=sdpa,fl2va_dit=kitchen-sol-producer-fp4-lowmem-shared-qkv,ref2va_dit=sol-attn,video_vae=sdpa",
+        "impl": "kitchen-sol-producer-fp4-lowmem-shared-qkv:comfy_kitchen.sol_attn_chunked(int8, stats=current-call, vmargin=1.1, prefix=int8, qkv=shared:54)+comfy_kitchen.sol_attn_chunked(int8, stats=previous-step, vmargin=1.1, prefix=int8, qkv=shared:27)+dense=sageattn3.nvfp4_global_head_mean(short_owned_lifetimes); sparse=instance-producer,sageattention3-fp4-global-lowmem:sageattn3.nvfp4_global_head_mean(short_owned_lifetimes, direct_bthd),sdpa:flash",
+        "kernels": [
+          {
+            "kernel": "kitchen-sol-producer-fp4-lowmem-shared-qkv",
+            "state": "ready",
+            "served": true,
+            "compile_ms": 861.6
+          },
+          {
+            "kernel": "sageattention",
+            "state": "ready",
+            "served": false,
+            "compile_ms": 240108.8
+          },
+          {
+            "kernel": "sageattention3-fp4-global-lowmem",
+            "state": "ready",
+            "served": false,
+            "compile_ms": 110357
+          },
+          {
+            "kernel": "sdpa",
+            "state": "ready",
+            "served": true
+          },
+          {
+            "kernel": "sol-attn",
+            "state": "ready",
+            "served": true,
+            "compile_ms": 2505.9
+          }
+        ],
+        "sol": {
+          "sparse": 192,
+          "dense_step": 192,
+          "dense_path": 32,
+          "dense_prefix": 192
+        }
+      },
+      "outputs": [
+        {
+          "id": "5016/video",
+          "type": "video",
+          "name": "video",
+          "media_type": "video/mp4",
+          "status": "completed",
+          "rev": 1,
+          "length": 23527874,
+          "sha256": "sha256:cd54bfc0ed35039c6cc78c826b5159ab9cf510719eed6ccd23d11476c6e8d692",
+          "path": "/home/fidika/.cozy/outputs/h3-single5090-optimization-20261008/chibisuke-fusionbake-turbo-warm-1/5016-video.mp4"
         }
       ]
     }
