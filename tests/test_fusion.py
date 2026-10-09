@@ -442,21 +442,19 @@ def test_a_ready_build_that_does_not_load_refuses_even_under_accept(
 
 
 @needs_card
-def test_source_drift_serves_eager_before_any_substitution(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_unsupported_topology_serves_eager_before_any_substitution() -> None:
     device = torch.device("cuda")
     transformer = _one_block_transformer(torch, device)
     was = type(transformer.transformer_blocks[0])
-    monkeypatch.setitem(fusion_install._SOURCE_DIGESTS, "SwiGLU.forward", "0" * 64)
+    transformer.transformer_blocks[0].ff.net[1].p = 0.5
     record = fusion_install.apply_fusion_plan(_Holder(transformer), torch=torch, device=device)
-    assert not record.applied and record.code == "fusion_source_mismatch"
+    assert not record.applied and record.code == "fusion_block_shape"
     assert type(transformer.transformer_blocks[0]) is was
     with pytest.raises(fusion_install.FusionRefusal) as refused:
         fusion_install.apply_fusion_plan(
             _Holder(transformer), torch=torch, device=device, required=True
         )
-    assert refused.value.code == "fusion_source_mismatch"
+    assert refused.value.code == "fusion_block_shape"
     assert type(transformer.transformer_blocks[0]) is was
 
 

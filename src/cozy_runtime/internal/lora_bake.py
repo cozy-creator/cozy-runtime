@@ -101,9 +101,11 @@ def _magnitudes(torch: Any, device: Any) -> Any:
 
 
 def decode_e4m3(torch: Any, data: Any) -> Any:
-    raw = data.view(torch.uint8)
-    magnitude = _magnitudes(torch, raw.device)[(raw & 0x7F).clamp(max=126).long()]
-    return torch.where(raw >= 0x80, -magnitude, magnitude)
+    decoded = data.view(torch.uint8).view(torch.float8_e4m3fn).float()
+    # This codec saturates the two reserved NaN codes to their signed maxima.
+    # Keep their original signs (and signed zero) after the native conversion.
+    fixed = torch.nan_to_num(decoded, nan=E4M3_MAX)
+    return fixed.copysign_(decoded)
 
 
 def _floor_code(torch: Any, mags: Any, magnitude: Any) -> tuple[Any, Any]:
@@ -122,7 +124,12 @@ def _nearest(torch: Any, mags: Any, values: Any) -> Any:
 
 
 def encode_e4m3(
-    torch: Any, values: Any, rounding: Rounding = "nearest", generator: Any = None
+    torch: Any,
+    values: Any,
+    rounding: Rounding = "nearest",
+    generator: Any = None,
+    *,
+    magnitudes: Any = None,
 ) -> Any:
     """`[rows, cols]` f32 in payload units -> E4M3 bytes.
 
@@ -131,7 +138,7 @@ def encode_e4m3(
     error into the next one of its `FEEDBACK_RUN`, so a run's sum is kept without a random
     draw (the same bytes on every bake).
     """
-    mags = _magnitudes(torch, values.device)
+    mags = _magnitudes(torch, values.device) if magnitudes is None else magnitudes
     if rounding == "nearest":
         return _nearest(torch, mags, values)
     if rounding == "stochastic":
@@ -158,8 +165,8 @@ def _chunks(rows: int, cols: int) -> list[tuple[int, int]]:
     return [(start, min(start + step, rows)) for start in range(0, rows, step)]
 
 
-def _delta(up: Any, down: Any, alpha: float, start: int, stop: int) -> Any:
-    return (up[start:stop].float() @ down.float()) * alpha
+def _delta(up: Any, down_fp32: Any, alpha: float, start: int, stop: int) -> Any:
+    return (up[start:stop].float() @ down_fp32) * alpha
 
 
 def _account(
@@ -196,14 +203,18 @@ def bake_plain(
     there too; `stochastic` keeps it in expectation. Other dtypes round to nearest.
     """
     began = time.perf_counter()
+    # The immutable rank-by-input factor is shared by every row chunk of this bake.
+    # Keep only this call's FP32 copy, never a cache across weights or invocations.
+    down_fp32 = down.float()
     for start, stop in _chunks(*weight.shape):
         base = weight[start:stop].to(torch.float32, copy=True)
-        delta = _delta(up, down, alpha, start, stop)
+        delta = _delta(up, down_fp32, alpha, start, stop)
         target = base + delta
         if rounding == "stochastic" and weight.dtype == torch.bfloat16:
             target = _bf16_either(torch, target, generator)
         weight[start:stop].copy_(target)
-        _account(stats, base, delta, weight[start:stop].float(), 0, down)
+        if stats is not None:
+            _account(stats, base, delta, weight[start:stop].float(), 0, down_fp32)
     _finish(torch, weight, stats, began)
 
 
@@ -241,10 +252,12 @@ def bake_rowwise(
     """
     began = time.perf_counter()
     raw, scales = data.view(torch.uint8), scale.view(-1)
+    down_fp32 = down.float()
+    magnitudes = _magnitudes(torch, data.device)
     for start, stop in _chunks(*data.shape):
         old = scales[start:stop].float().unsqueeze(1)
         base = decode_e4m3(torch, raw[start:stop]) * old
-        delta = _delta(up, down, alpha, start, stop)
+        delta = _delta(up, down_fp32, alpha, start, stop)
         target = base + delta
         new = old
         if grid != "keep":
@@ -253,11 +266,12 @@ def bake_rowwise(
             row = torch.arange(start, stop, device=new.device, dtype=torch.float32)
             new = new * (1 + (1 + 2 * torch.frac(row * 0.6180339887)).unsqueeze(1) / 32)
         payload = target / new
-        code = encode_e4m3(torch, payload, rounding, generator)
+        code = encode_e4m3(torch, payload, rounding, generator, magnitudes=magnitudes)
         raw[start:stop].copy_(code)
         scales[start:stop].copy_(new.view(-1))
-        saturated = (payload.abs() > SATURATION).sum()
-        _account(stats, base, delta, decode_e4m3(torch, code) * new, saturated, down)
+        if stats is not None:
+            saturated = (payload.abs() > SATURATION).sum()
+            _account(stats, base, delta, decode_e4m3(torch, code) * new, saturated, down_fp32)
     _finish(torch, data, stats, began)
 
 
@@ -284,11 +298,13 @@ def bake_mx(
     began = time.perf_counter()
     raw, grid = data.view(torch.uint8), scale.view(torch.uint8)
     cols = int(data.shape[1])
+    down_fp32 = down.float()
+    magnitudes = _magnitudes(torch, data.device)
     for start, stop in _chunks(*data.shape):
         rows = stop - start
         old = _exp2(torch, grid[start:stop].to(torch.int32) - E8M0_BIAS).unsqueeze(-1)
         base = decode_e4m3(torch, raw[start:stop]).view(rows, -1, MX_BLOCK) * old
-        delta = _delta(up, down, alpha, start, stop).view(rows, -1, MX_BLOCK)
+        delta = _delta(up, down_fp32, alpha, start, stop).view(rows, -1, MX_BLOCK)
         target = base + delta
         byte = grid[start:stop].to(torch.int32)
         if refit:
@@ -298,29 +314,34 @@ def bake_mx(
             low = (floor + E8M0_BIAS).clamp(0, 254).to(torch.int32)
             high = (low + 1).clamp(max=254)
             byte = torch.where(
-                _mx_error(torch, target, high) < _mx_error(torch, target, low), high, low
+                _mx_error(torch, target, high, magnitudes)
+                < _mx_error(torch, target, low, magnitudes),
+                high,
+                low,
             )
         mult = _exp2(torch, byte - E8M0_BIAS).unsqueeze(-1)
         payload = (target / mult).view(rows, cols)
-        code = encode_e4m3(torch, payload, rounding, generator)
-        stored = decode_e4m3(torch, code).view(rows, -1, MX_BLOCK) * mult
+        code = encode_e4m3(torch, payload, rounding, generator, magnitudes=magnitudes)
+        if stats is not None:
+            stored = decode_e4m3(torch, code).view(rows, -1, MX_BLOCK) * mult
         raw[start:stop].copy_(code)
         grid[start:stop].copy_(byte.to(torch.uint8))
-        _account(
-            stats,
-            base.view(rows, cols),
-            delta.view(rows, cols),
-            stored.view(rows, cols),
-            (payload.abs() > SATURATION).sum(),
-            down,
-        )
+        if stats is not None:
+            _account(
+                stats,
+                base.view(rows, cols),
+                delta.view(rows, cols),
+                stored.view(rows, cols),
+                (payload.abs() > SATURATION).sum(),
+                down_fp32,
+            )
     _finish(torch, data, stats, began)
 
 
-def _mx_error(torch: Any, target: Any, byte: Any) -> Any:
+def _mx_error(torch: Any, target: Any, byte: Any, magnitudes: Any) -> Any:
     """Each block's squared error stored to nearest under exponent byte `byte`."""
     mult = _exp2(torch, byte - E8M0_BIAS).unsqueeze(-1)
-    code = _nearest(torch, _magnitudes(torch, target.device), target / mult)
+    code = _nearest(torch, magnitudes, target / mult)
     return (decode_e4m3(torch, code) * mult - target).square().sum(dim=-1)
 
 
