@@ -8,3 +8,5 @@ Purpose: request-selectable full dense and four-dense/four-Sol attention compari
 The running private cohort is allfast 6a429905054893bcac6514a7ba39fddc5f28f5a5d57cf885565c043392a709ba. Candidate wheels overlay only reviewed attention modules; existing bounded linear GEMM, LoRA bake, fusion, native executable and dependencies are preserved. Root owns GPU qualification and installation.
 
 The existing FP8 Sol selectors use Sage or NVFP4 dense calls and do not represent pure FP8 dense attention. This task adds explicit dense FP8/F16 and BF16/F32 controls, with matching mixed selectors. Full-dense controls must never invoke sparse routing. All numerical changes remain opt-in pending the user's video review.
+
+The prerequisite attention sources are carried byte-for-byte from the running wheel (the prior opt-in producer, shared-QKV, FP8 sparse and low-memory Sage3 work through 072ed5e2). No default ranking changes are introduced. They are a separate prerequisite commit; this PR is not evidence that those unmerged experiments are qualified defaults.
