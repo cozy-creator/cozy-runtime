@@ -1,0 +1,1 @@
+Bundles TensorD 0.3.4: the machine reaches the Hub through AuthKit grants (th-238). It redeems the OAuth codes the CLI approves for its own leaf key and signs every Hub request with a DPoP proof; delegated bearers are gone. Needs Hub v0.16.28 and CLI v0.2.3, and a machine with this Runtime cannot use an older Hub.
