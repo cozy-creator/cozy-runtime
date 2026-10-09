@@ -364,6 +364,32 @@ COMPARISON_SCRIPT = r"""<script>
 </script>"""
 
 
+def quality_review(document: dict, rows: list[dict], path: Path) -> dict | None:
+    """Apply explicit user decisions only to the exact reviewed cohort and video bytes."""
+    if not path.is_file():
+        return None
+    decision = json.loads(path.read_text())
+    if (
+        decision["runtime_wheel_sha256"] != document["runtime_wheel"]["sha256"]
+        or decision["gpu_uuid"] != document["gpu_uuid"]
+    ):
+        return None
+    indexed = {row["id"]: row for row in rows}
+    if any(
+        not indexed.get(key, {}).get("verified")
+        or reviewed["sha256"] != indexed[key].get("sha256")
+        for key, reviewed in decision["clips"].items()
+    ):
+        return None
+    for row in rows:
+        reviewed = decision["clips"].get(row["id"])
+        if reviewed and row.get("verified") and reviewed["sha256"] == row.get("sha256"):
+            row["user_quality_review"] = reviewed["status"]
+            row["user_quality_note"] = reviewed["note"]
+            row["subjective_quality_approved"] = reviewed["status"] == "approved"
+    return decision
+
+
 def build(manifest: Path, out: Path) -> dict:
     document = json.loads(manifest.read_text())
     rows = document["runs"]
@@ -376,6 +402,7 @@ def build(manifest: Path, out: Path) -> dict:
     for child in ("qa", "media"):
         (out / child).mkdir(exist_ok=True)
     results = [read_run(row, out) for row in rows]
+    decision = quality_review(document, results, manifest.parent / "review-decision.json")
     gate = arithmetic_gate(document)
     for row in results:
         row["arithmetic_note"] = attention_note(row)
@@ -389,7 +416,8 @@ def build(manifest: Path, out: Path) -> dict:
         "expected": expected,
         "verified": sum(r["verified"] for r in results),
         "runs": results,
-        "quality_approval": "Pending user review",
+        "quality_approval": decision["summary"] if decision else "Pending user review",
+        "user_review_decision": decision,
         "gpu_arithmetic_gate": gate,
         "benchmark_context": (
             "1× RTX 5090 (575 W) · 15-second 1344×768 / 24 fps video · Turbo, 8 steps. "  # noqa: RUF001
@@ -436,7 +464,8 @@ button:disabled{opacity:.45}@media(max-width:700px){.compare-grid{grid-template-
         "<p>" + escape(summary["benchmark_context"]) + "</p>",
         "<p class=note>" + escape(summary["timing_boundary"]) + "</p>",
         f"<p>{summary['verified']} / {expected} clips verified. "
-        "Quality approval awaits your review.</p>",
+        + escape(summary["quality_approval"])
+        + "</p>",
         "<p class=note>Refresh this page to see newly completed clips.</p>"
         if summary["verified"] < expected
         else "",
@@ -446,7 +475,7 @@ button:disabled{opacity:.45}@media(max-width:700px){.compare-grid{grid-template-
         + (
             "GPU arithmetic check passed (run "
             + escape(str(gate["run"]))
-            + "); visual quality awaits your review."
+            + "); this arithmetic check does not establish visual quality."
             if gate["passed"]
             else "GPU arithmetic check not recorded for this Runtime."
         )
@@ -497,6 +526,8 @@ button:disabled{opacity:.45}@media(max-width:700px){.compare-grid{grid-template-
                 + escape(row.get("timing_note", "Warm/cold qualification not supplied"))
                 + "</p>"
             )
+            if row.get("user_quality_note"):
+                cell += "<p>" + escape(row["user_quality_note"]) + "</p>"
             if row["verification_error"]:
                 cell += "<p class=bad>" + escape(row["verification_error"]) + "</p>"
             elif not row["verified"]:
