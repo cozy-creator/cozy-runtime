@@ -1,0 +1,1 @@
+Bundles TensorD 0.3.3: a pod's machine compiles its kernels as it starts, with the image's Runtime interpreter and the executors' Runtime, instead of at the first package install (run 5026 started 86 s after lancer was ready).
