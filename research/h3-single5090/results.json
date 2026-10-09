@@ -1,5 +1,5 @@
 {
-  "updated_utc": "2026-10-09T04:39:57.418265+00:00",
+  "updated_utc": "2026-10-09T05:42:04.323077+00:00",
   "native": [
     {
       "label": "native-fast-turbo-warm-1",
@@ -823,6 +823,202 @@
       "scene": "sparring",
       "execution_s": 325.344
     },
-    "quality_approved": false
+    "quality_approved": false,
+    "completed_timed_videos": 8,
+    "timed_results": [
+      {
+        "id": "kitchen-int8--dense4-sol4--sparring",
+        "kernel": "Kitchen INT8",
+        "schedule": "dense4-sol4",
+        "scene": "sparring",
+        "seed": 581204,
+        "run": 5034,
+        "request_id": "req-00d3488dc8f227678f59a5cf",
+        "execution_s": 325.344,
+        "phase_s": {
+          "prepare": 0.0009040000000000001,
+          "loading weights": 1.4647629999999998,
+          "condition_text": 6.01309,
+          "denoise": 276.859865,
+          "decode_audio": 0.122771,
+          "decode_video": 39.810347,
+          "check_output": 0.13691399999999998
+        },
+        "video": "/home/fidika/cozy_v2/outputs/h3-single5090-optimization-20261008/quality-matrix-20261009/runs/kitchen-int8--dense4-sol4--sparring/5034-video.mp4",
+        "sha256": "0413dea016d8d2149b21578e5e0db999399d41741c08242e60ef48a0b0b465aa",
+        "steps": 8,
+        "sparse_calls": 192
+      },
+      {
+        "id": "kitchen-int8--dense4-sol4--rally",
+        "kernel": "Kitchen INT8",
+        "schedule": "dense4-sol4",
+        "scene": "rally",
+        "seed": 581205,
+        "run": 5035,
+        "request_id": "req-a7c0e4bac4cb90936b67458c",
+        "execution_s": 322.761,
+        "phase_s": {
+          "prepare": 0.0009260000000000001,
+          "loading weights": 1.41213,
+          "condition_text": 6.190002000000001,
+          "denoise": 274.364139,
+          "decode_audio": 0.138096,
+          "decode_video": 39.47459,
+          "check_output": 0.138106
+        },
+        "video": "/home/fidika/cozy_v2/outputs/h3-single5090-optimization-20261008/quality-matrix-20261009/runs/kitchen-int8--dense4-sol4--rally/5035-video.mp4",
+        "sha256": "61fa546e406a89ffb597781440426d658712a6e2378e4dfee46317c80382aafa",
+        "steps": 8,
+        "sparse_calls": 192
+      },
+      {
+        "id": "kitchen-int8--dense8--sparring",
+        "kernel": "Kitchen INT8",
+        "schedule": "dense8",
+        "scene": "sparring",
+        "seed": 581204,
+        "run": 5036,
+        "request_id": "req-6954c5aafceafed5bd8d2da2",
+        "execution_s": 398.828,
+        "phase_s": {
+          "prepare": 0.001139,
+          "loading weights": 1.328793,
+          "condition_text": 6.399256,
+          "denoise": 350.04425699999996,
+          "decode_audio": 0.137108,
+          "decode_video": 39.814502999999995,
+          "check_output": 0.147764
+        },
+        "video": "/home/fidika/cozy_v2/outputs/h3-single5090-optimization-20261008/quality-matrix-20261009/runs/kitchen-int8--dense8--sparring/5036-video.mp4",
+        "sha256": "0bca994a930d10325af228add0f880dc1c18d36ef64f1744bcd23172367ba2b0",
+        "steps": 8,
+        "sparse_calls": 0
+      },
+      {
+        "id": "kitchen-int8--dense8--rally",
+        "kernel": "Kitchen INT8",
+        "schedule": "dense8",
+        "scene": "rally",
+        "seed": 581205,
+        "run": 5037,
+        "request_id": "req-4f3d5d0b1645742fbb5046ba",
+        "execution_s": 399.445,
+        "phase_s": {
+          "prepare": 0.001129,
+          "loading weights": 1.42589,
+          "condition_text": 6.436679,
+          "denoise": 350.629679,
+          "decode_audio": 0.123531,
+          "decode_video": 39.678441,
+          "check_output": 0.129555
+        },
+        "video": "/home/fidika/cozy_v2/outputs/h3-single5090-optimization-20261008/quality-matrix-20261009/runs/kitchen-int8--dense8--rally/5037-video.mp4",
+        "sha256": "1e7486ecaacbc449795df75244ac1b70b1b29bfbcb01c745adc8f4c40814e646",
+        "steps": 8,
+        "sparse_calls": 0
+      },
+      {
+        "id": "sage3-nvfp4--dense4-sol4--sparring",
+        "kernel": "SageAttention3 NVFP4",
+        "schedule": "dense4-sol4",
+        "scene": "sparring",
+        "seed": 581204,
+        "run": 5040,
+        "request_id": "req-dcbae9b3b249ef9ec57ec0ef",
+        "execution_s": 284.598,
+        "phase_s": {
+          "prepare": 0.001113,
+          "loading weights": 1.3575329999999999,
+          "condition_text": 7.038463,
+          "denoise": 235.411354,
+          "decode_audio": 0.122945,
+          "decode_video": 39.56629,
+          "check_output": 0.152714
+        },
+        "video": "/home/fidika/cozy_v2/outputs/h3-single5090-optimization-20261008/quality-matrix-20261009/runs/sage3-nvfp4--dense4-sol4--sparring/5040-video.mp4",
+        "sha256": "cd54bfc0ed35039c6cc78c826b5159ab9cf510719eed6ccd23d11476c6e8d692",
+        "steps": 8,
+        "sparse_calls": 192
+      },
+      {
+        "id": "sage3-nvfp4--dense4-sol4--rally",
+        "kernel": "SageAttention3 NVFP4",
+        "schedule": "dense4-sol4",
+        "scene": "rally",
+        "seed": 581205,
+        "run": 5042,
+        "request_id": "req-d3a702950438ddfa42fe1126",
+        "execution_s": 288.643,
+        "phase_s": {
+          "prepare": 0.004255,
+          "loading weights": 1.47912,
+          "condition_text": 6.311388,
+          "denoise": 240.119923,
+          "decode_audio": 0.123337,
+          "decode_video": 39.497172,
+          "check_output": 0.128002
+        },
+        "video": "/home/fidika/cozy_v2/outputs/h3-single5090-optimization-20261008/quality-matrix-20261009/runs/sage3-nvfp4--dense4-sol4--rally/5042-video.mp4",
+        "sha256": "4f50e45aa0aa034071dd685df07384e900477780e061caab1e38c8aa8ac2f020",
+        "steps": 8,
+        "sparse_calls": 192
+      },
+      {
+        "id": "sage3-nvfp4--dense8--sparring",
+        "kernel": "SageAttention3 NVFP4",
+        "schedule": "dense8",
+        "scene": "sparring",
+        "seed": 581204,
+        "run": 5043,
+        "request_id": "req-35ee7e1bdb61ff77aed7425d",
+        "execution_s": 294.698,
+        "phase_s": {
+          "prepare": 0.0014,
+          "loading weights": 1.5169000000000001,
+          "condition_text": 6.28129,
+          "denoise": 246.073614,
+          "decode_audio": 0.129119,
+          "decode_video": 39.530629999999995,
+          "check_output": 0.13571799999999998
+        },
+        "video": "/home/fidika/cozy_v2/outputs/h3-single5090-optimization-20261008/quality-matrix-20261009/runs/sage3-nvfp4--dense8--sparring/5043-video.mp4",
+        "sha256": "1f818f2a66cb99aba17296b81edf7787dbbae3f57f90f322ab24024d4c613ba3",
+        "steps": 8,
+        "sparse_calls": 0
+      },
+      {
+        "id": "sage3-nvfp4--dense8--rally",
+        "kernel": "SageAttention3 NVFP4",
+        "schedule": "dense8",
+        "scene": "rally",
+        "seed": 581205,
+        "run": 5044,
+        "request_id": "req-f5447c538f99f39d86e28b04",
+        "execution_s": 295.061,
+        "phase_s": {
+          "prepare": 0.001307,
+          "loading weights": 1.513523,
+          "condition_text": 6.959225,
+          "denoise": 245.73387899999997,
+          "decode_audio": 0.124994,
+          "decode_video": 39.586406000000004,
+          "check_output": 0.13632
+        },
+        "video": "/home/fidika/cozy_v2/outputs/h3-single5090-optimization-20261008/quality-matrix-20261009/runs/sage3-nvfp4--dense8--rally/5044-video.mp4",
+        "sha256": "f8ae43dce65b93bfbeec94fe5005de84ab343327001b7a8d082204e202a7176c",
+        "steps": 8,
+        "sparse_calls": 0
+      }
+    ],
+    "physical_conditions_report": "/home/fidika/cozy_v2/outputs/h3-single5090-optimization-20261008/quality-matrix-20261009/sage-first4-physical-analysis-linear.json",
+    "memory_io_report": "/home/fidika/cozy_v2/outputs/h3-single5090-optimization-20261008/quality-matrix-20261009/repro-audit-fusion/memory-io/summary-latest.json",
+    "source_dispatch_audit": "/home/fidika/cozy_v2/outputs/h3-single5090-optimization-20261008/quality-matrix-20261009/repro-audit-fusion/sage-dense-dispatch-audit.json",
+    "timing_limits": [
+      "One timed request per scene/kernel/schedule, not a repeated-trial estimate.",
+      "Same long-lived executor; measured activation/allocator history can influence residency. Fresh-executor traces planned.",
+      "Warmups and pre-submission Hub refusal excluded from execution timing.",
+      "Sage mixed uses Kitchen INT8 Sol. Full implementations, not isolated dtype benchmarks."
+    ]
   }
 }
