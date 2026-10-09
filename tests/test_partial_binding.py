@@ -37,8 +37,15 @@ class Pair:
     """Builds both components whatever the binding selects, as H3's pipeline builds both DiTs."""
 
     def __init__(self, config: Config) -> None:
+        # Each component's dtype comes from the checkpoint header, as H3's VAE reads its own.
+        dtypes = {"f16": torch.float16, "f32": torch.float32}
         self.components = {
-            name: torch.nn.Linear(HIDDEN, HIDDEN, bias=False, dtype=torch.float16)
+            name: torch.nn.Linear(
+                HIDDEN,
+                HIDDEN,
+                bias=False,
+                dtype=dtypes[config.tensor_dtype(f"{name}.weight", default="f16")],
+            )
             for name in ("first", "second")
         }
 
@@ -112,3 +119,11 @@ def test_a_binding_that_selects_nothing_built_refuses_the_construction(tmp_path:
         bind(tmp_path, "other")
     assert refused.value.fit["code"] == "destination_absent"
     assert "first, second" in refused.value.message
+
+
+def test_a_bound_components_missing_tensor_still_refuses() -> None:
+    config = Config({}, tensor_dtypes={"first.weight": "f16"}, bound=frozenset({"first"}))
+    assert config.tensor_dtype("second.weight", default="f32") == "f32"  # unbound: on meta
+    with pytest.raises(Exception, match="first.bias") as refused:
+        config.tensor_dtype("first.bias", default="f32")
+    assert getattr(refused.value, "code", None) == "config_tensor_missing"
