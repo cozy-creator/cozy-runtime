@@ -1,0 +1,1 @@
+Bundles TensorD 0.5.1: a published release calls its Hub callee under the callee's own name again (tensord#185). Since 0.4.1 Hub wheels installed from file paths and lost their Hub identity, so cross-package callees failed `model_choice_absent`. 0.23.0 was tagged but never published.
