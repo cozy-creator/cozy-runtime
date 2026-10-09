@@ -11,6 +11,24 @@ from typing import Any
 
 def receipt(run: dict[str, Any], summary: dict[str, Any]) -> dict[str, Any]:
     render = summary["render_call"]
+    profile_enabled = summary.get("profile_enabled", True)
+    if type(profile_enabled) is not bool:
+        raise ValueError("profile_enabled must be a boolean when present")
+    if profile_enabled:
+        # Older enabled captures omit the flag, but must still supply their steps.
+        profiled_steps = summary["profiled_step_indices"]
+        if (
+            not isinstance(profiled_steps, list)
+            or not profiled_steps
+            or any(type(step) is not int or step < 0 for step in profiled_steps)
+        ):
+            raise ValueError("profiled_step_indices must contain recorded step indices")
+    else:
+        if summary.get("profiled_step_indices", []) != [] or summary.get(
+            "full_request_trace", False
+        ) is not False:
+            raise ValueError("An unprofiled summary cannot claim recorded trace steps")
+        profiled_steps = []
     tails = []
     for event in run.get("events", []):
         if event.get("type") != "client.machine_work_finished":
@@ -31,6 +49,7 @@ def receipt(run: dict[str, Any], summary: dict[str, Any]) -> dict[str, Any]:
         )
     return {
         "diagnostic_only": True,
+        "profile_enabled": profile_enabled,
         "software": summary.get("software", {}),
         "request": {
             key: run.get(key)
@@ -53,9 +72,11 @@ def receipt(run: dict[str, Any], summary: dict[str, Any]) -> dict[str, Any]:
         "render_call": render,
         "encode_mux_output": summary.get("output_sinks", []),
         "client_completion_tails": tails,
-        "bounded_kernel_trace_steps": summary["profiled_step_indices"],
+        "bounded_kernel_trace_steps": profiled_steps,
         "full_request_trace": summary.get("full_request_trace", False),
-        "trace_collection": summary.get("trace_collection", "two DiT calls"),
+        "trace_collection": summary.get(
+            "trace_collection", "two DiT calls" if profile_enabled else "disabled"
+        ),
         "phase_sources": {
             "machine_preparation_and_construction": "native_stages; preserve reused setup detail",
             "loading_weights": "native_stages and render_call.attribution_after.stages",

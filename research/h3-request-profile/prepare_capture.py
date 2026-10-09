@@ -16,7 +16,7 @@ from pathlib import Path
 
 
 def prepare(destination: Path, wheels: dict[str, Path]) -> None:
-    expected = {"minimax-h3": "1.26.2", "qwen-image-2": "0.3.0", "diffusers": "0.41.0.dev0"}
+    expected = {"minimax-h3": "1.26.3", "qwen-image-2": "0.3.0", "diffusers": "0.41.0.dev0"}
     receipts = {}
     for name, wheel in wheels.items():
         wheel = wheel.resolve(strict=True)
