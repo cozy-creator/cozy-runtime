@@ -16,7 +16,7 @@ from torch.multiprocessing.spawn import spawn
 
 from cozy_runtime.author._attention_scope import AttentionLayout, attention_scope
 from cozy_runtime.internal import attention, attention_sol, attention_ulysses, kernel_cache
-from cozy_runtime.internal.parallel.cp import _GroupMesh
+from cozy_runtime.internal.parallel.cp import CpComms, _GroupMesh
 
 
 def dense(*, query: Any, key: Any, value: Any, scale: float | None) -> Any:
@@ -99,7 +99,10 @@ def rank_main(rank: int, degree: int, root: Path, device_kind: str, heads: int) 
         cp = ContextParallelConfig(ulysses_degree=degree, ulysses_anything=True)
         config = ParallelConfig(context_parallel_config=cp)
         config.setup(
-            rank, degree, device, mesh=cast(Any, _GroupMesh(dist.group.WORLD, degree, rank))
+            rank,
+            degree,
+            device,
+            mesh=cast(Any, _GroupMesh(CpComms(dist.group.WORLD, rank, device), degree, rank)),
         )
         group = attention_ulysses.group(config)
         registry = import_module("diffusers.models.attention_dispatch")._AttentionBackendRegistry

@@ -272,8 +272,9 @@ def _leaf_class(torch: Any) -> Any:
         def roles(self) -> dict[str, Any]:
             return {role: getattr(self, role) for role in self._cozy_roles}
 
-        def forward(self, x: Any) -> Any:
-            out = self._cozy_forward(self, x)
+        def forward(self, x: Any, *, prequantized: PreQuantized | None = None) -> Any:
+            # Semantic hooks still see the original positional float operand.
+            out = self._cozy_forward(self, x if prequantized is None else prequantized)
             if self.bias is not None:
                 out = out + self.bias
             return out

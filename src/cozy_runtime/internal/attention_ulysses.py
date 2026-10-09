@@ -170,3 +170,10 @@ def describe(seen: dict[str, set[str]], names: dict[str, str]) -> str:
     if len(rows) == 1:
         return next(iter(rows.values()))
     return ",".join(f"{name}:{impl}" for name, impl in sorted(rows.items()))
+
+
+def record(backend: str, implementation: str) -> None:
+    """Record a producer that projects before the ordinary Q/K/V dispatch seam."""
+    seen = _SEEN.get()
+    if seen is not None:
+        seen.setdefault(backend, set()).add(implementation)

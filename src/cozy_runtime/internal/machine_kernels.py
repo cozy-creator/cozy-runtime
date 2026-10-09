@@ -51,7 +51,16 @@ def ladder(present: Mapping[int, str]) -> list[kernel_compile.Job]:
     jobs: dict[str, kernel_compile.Job] = {}
     for sm, device in sorted(present.items()):
         facts = DeviceFacts("cuda", "", sm, "", "")
-        for name in LADDER:
+        # The approved Blackwell recipe needs BOTH binaries before selection. The
+        # registry's capability predicate is shared with the model chooser; other
+        # cards keep their existing boot ladder and compile optional pins on demand.
+        hybrid = attention.BY_NAME["kitchen-sol-fp4-lowmem"]
+        names = (
+            LADDER
+            if attention._device_admits(hybrid, facts)
+            else ("sageattention3-fp4-global-lowmem", "kitchen-int8", *LADDER)
+        )
+        for name in names:
             candidate = attention.BY_NAME[name]
             if attention._device_admits(candidate, facts):
                 continue
