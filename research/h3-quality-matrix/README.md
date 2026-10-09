@@ -84,3 +84,11 @@ local path supplies the file. Missing canonical output evidence always refuses.
 
 The manifest also pins `hub_url`; every new submission uses that explicit
 `--tensorhub` value and includes it in its persisted request identity.
+
+The review page includes scene-matched side-by-side playback from the original
+verified files. Choose each kernel/schedule independently; Play, Pause, Restart,
+and seeking stay synchronized. Audio is restricted to one side (or muted), and
+pending cases remain disabled. The full table and original-file links remain below.
+Human notes distinguish dense-only arithmetic from mixed Sol paths, show the
+verified arithmetic gate for the matching Runtime, and label warm execution only
+for completed, verified timed cases.
