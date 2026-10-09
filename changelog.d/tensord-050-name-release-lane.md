@@ -1,0 +1,1 @@
+Bundles TensorD 0.5.0 (th-245): runs name their models and releases (repository, release, lane) and the machine resolves them at the Hub; an exact hash is private and read only by its owner under the run capability. Needs Hub v0.18.0 and CLI v0.4.0.
