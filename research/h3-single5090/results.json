@@ -690,6 +690,46 @@
       "User quality approval remains pending; media decode checks do not establish perceptual equivalence.",
       "Cold CUDA trace is separate from these clean timings.",
       "Older Morlock325.362-second result is a different host and excluded from this comparison."
-    ]
+    ],
+    "trace_status": "Incomplete: external keepalive loop exited after network timeout; rental released at idle deadline before artifact retention. Clean controls unaffected."
+  },
+  "kojirou": {
+    "rental": "pr-d419d6c7aea6d7162d79",
+    "provider": "runpod",
+    "provider_machine_id": "nzlve5p8w7he",
+    "gpu_uuid": "GPU-daef387f-a2a4-8dcd-a9b3-c87d580fc55b",
+    "gpu_power_w": 575,
+    "driver": "610.43.02",
+    "ram_limit_bytes": 61999996928,
+    "cgroup_version": 1,
+    "setup_run": 5019,
+    "setup_execution_s": 522.783,
+    "setup_phase_s": {
+      "prepare": 0.0016220000000000002,
+      "loading weights": 6.20212,
+      "condition_text": 2.85748,
+      "denoise": 256.258132,
+      "decode_audio": 0.37614,
+      "decode_video": 39.672511,
+      "check_output": 0.196952
+    },
+    "setup_video": {
+      "id": "5019/video",
+      "type": "video",
+      "name": "video",
+      "media_type": "video/mp4",
+      "status": "completed",
+      "rev": 1,
+      "length": 27369930,
+      "sha256": "sha256:110a4ac7512904862a432b691bdcdc84737c485f6c2c45fdd5459eb28107aa3e",
+      "path": "/home/fidika/cozy_v2/h3-single5090-optimization-20261008/kojirou-allfast-turbo-setup/5019-video.mp4"
+    },
+    "setup_av_pass": true,
+    "video_sha256_equal_to_run": 5015,
+    "runtime_wheel_sha256": "6a429905054893bcac6514a7ba39fddc5f28f5a5d57cf885565c043392a709ba",
+    "experimental_gemm": true,
+    "interpretation": "First full call includes compilation/startup; not a clean timing or isolated cross-host GEMM speedup",
+    "regular_run": 5020,
+    "regular_status": "in_progress"
   }
 }
