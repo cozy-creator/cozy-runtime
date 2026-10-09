@@ -33,7 +33,6 @@ COZY_HOME_DEFAULT = "~/.cozy"
 
 # Credential env names, per source. Values only; presence never changes behaviour.
 CREDENTIAL_ENV: tuple[tuple[str, str], ...] = (
-    ("tensorhub", "TENSORHUB_TOKEN"),
     ("huggingface", "HF_TOKEN"),
     ("civitai", "CIVITAI_TOKEN"),
     ("comfy", "COMFY_TOKEN"),
@@ -55,7 +54,6 @@ class ConfigError(Exception):
 class Credentials:
     """Per-source credential VALUES read once. `None` = absent, never "look it up later"."""
 
-    tensorhub: str | None = None
     huggingface: str | None = None
     civitai: str | None = None
     comfy: str | None = None
