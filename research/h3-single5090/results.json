@@ -1,5 +1,5 @@
 {
-  "updated_utc": "2026-10-09T00:32:28.951111+00:00",
+  "updated_utc": "2026-10-09T04:39:57.418265+00:00",
   "native": [
     {
       "label": "native-fast-turbo-warm-1",
@@ -617,7 +617,10 @@
     "timing_boundary": "Server execution_start to execution_success; no setup/download/other GPU work overlapped; output transfer excluded.",
     "precision_boundary": "FP8 weights do not imply FP8 attention. Comfy Kitchen dense/Sol INT8 and its fused producer differ from native BF16/reference; no quality-equivalence claim."
   },
-  "quality_approval": false,
+  "quality_approval": {
+    "chibisuke_retained_comparison": "User found the two videos comparable; scoped to reviewed clips and settings.",
+    "expanded_matrix": "Pending user review; defaults unchanged."
+  },
   "targets_met": false,
   "profile_4996": "failed during >1GiB export; full raw trace removed; not a speed measurement",
   "chibisuke_warm_summary": {
@@ -687,9 +690,9 @@
     },
     "limits": [
       "One matched run per scene; two-scene mean is not a repeated-seed confidence estimate.",
-      "User quality approval remains pending; media decode checks do not establish perceptual equivalence.",
       "Cold CUDA trace is separate from these clean timings.",
-      "Older Morlock325.362-second result is a different host and excluded from this comparison."
+      "Older Morlock325.362-second result is a different host and excluded from this comparison.",
+      "User found the retained videos comparable; this does not approve other kernels or the experimental GEMM."
     ],
     "trace_status": "Incomplete: external keepalive loop exited after network timeout; rental released at idle deadline before artifact retention. Clean controls unaffected."
   },
@@ -730,6 +733,96 @@
     "experimental_gemm": true,
     "interpretation": "First full call includes compilation/startup; not a clean timing or isolated cross-host GEMM speedup",
     "regular_run": 5020,
-    "regular_status": "in_progress"
+    "regular_status": "completed",
+    "regular": {
+      "run": 5020,
+      "request_id": "req-2ef550e331dc4a16cc99bc01",
+      "receipt": "/home/fidika/cozy_v2/outputs/h3-single5090-optimization-20261008/kojirou/allfast-regular-1-show.json",
+      "execution_s": 830.034,
+      "phase_s": {
+        "prepare": 0.0011149999999999999,
+        "loading weights": 8.894185,
+        "condition_text": 3.287866,
+        "denoise": 769.3163549999999,
+        "decode_audio": 0.43015800000000004,
+        "decode_video": 39.839765,
+        "check_output": 0.170638
+      },
+      "outputs": [
+        {
+          "id": "5020/video",
+          "type": "video",
+          "name": "video",
+          "media_type": "video/mp4",
+          "status": "completed",
+          "rev": 1,
+          "length": 22560308,
+          "sha256": "sha256:e25cb10a448275a94ab16d49de674ce8559c1d058a70ad45059496cc84f30ac1",
+          "path": "/home/fidika/cozy_v2/h3-single5090-optimization-20261008/kojirou-allfast-regular-1/5020-video.mp4"
+        }
+      ],
+      "full_av_decode_pass": true
+    },
+    "warm_turbo": {
+      "run": 5021,
+      "request_id": "req-57e57ee405a5c452031c0353",
+      "receipt": "/home/fidika/cozy_v2/outputs/h3-single5090-optimization-20261008/kojirou/allfast-turbo-warm-1-show.json",
+      "execution_s": 287.657,
+      "phase_s": {
+        "prepare": 0.0009310000000000001,
+        "loading weights": 2.100706,
+        "condition_text": 6.351851,
+        "denoise": 237.665686,
+        "decode_audio": 0.13520400000000002,
+        "decode_video": 39.619483,
+        "check_output": 0.15357400000000002
+      },
+      "outputs": [
+        {
+          "id": "5021/video",
+          "type": "video",
+          "name": "video",
+          "media_type": "video/mp4",
+          "status": "completed",
+          "rev": 1,
+          "length": 23527874,
+          "sha256": "sha256:cd54bfc0ed35039c6cc78c826b5159ab9cf510719eed6ccd23d11476c6e8d692",
+          "path": "/home/fidika/cozy_v2/outputs/h3-single5090-optimization-20261008/kojirou/allfast-turbo-warm-1/5021-video.mp4"
+        }
+      ],
+      "full_av_decode_pass": true
+    },
+    "same_host_comfy_control": null
+  },
+  "expanded_turbo_matrix": {
+    "status": "running",
+    "expected_timed_videos": 16,
+    "expected_warmups": 8,
+    "kernels": [
+      "Kitchen INT8",
+      "SageAttention3 NVFP4",
+      "FP8/FP16 tiles",
+      "BF16/FP32"
+    ],
+    "schedules": [
+      "4 dense + 4 Sol",
+      "8 dense"
+    ],
+    "scenes": {
+      "sparring": 581204,
+      "rally": 581205
+    },
+    "manifest": "/home/fidika/cozy_v2/outputs/h3-single5090-optimization-20261008/quality-matrix-20261009/manifest.json",
+    "review_index": "/home/fidika/cozy_v2/outputs/h3-single5090-optimization-20261008/quality-matrix-20261009/review/index.html",
+    "runtime_wheel_sha256": "4460767713804fb09722222af816d8663862e6f51c6211d65d33472db8d2c03a",
+    "experimental_gemm": true,
+    "first_timed_cell": {
+      "run": 5034,
+      "kernel": "Kitchen INT8",
+      "schedule": "4 dense + 4 Sol",
+      "scene": "sparring",
+      "execution_s": 325.344
+    },
+    "quality_approved": false
   }
 }
