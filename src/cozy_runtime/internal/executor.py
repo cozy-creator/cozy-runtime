@@ -575,6 +575,8 @@ class Executor:
         #: line, not a per-attempt record: the choice is a function of device and image.
         self.attention: attention.Applied | None = None
         self.attention_defaults = attention.Snapshot(())
+        #: this construction's selection, made again between requests (`_upgrade_attention`)
+        self._reselect: Callable[[], attention.Applied] | None = None
         #: Device facts for this prepared generation, reused for per-request pin checks.
         self.device_facts: Any = None
         #: a follower's hold of rank 0's attention selection for the current attempt
@@ -2401,7 +2403,8 @@ class Executor:
             stage("execution_plan")
             # THE FASTEST KERNEL THIS DEVICE AND IMAGE SUPPORT, PINNED POST-FILL (cr-124),
             # per attention site and before any warm step (see `_prepare_attention`).
-            applied = self._prepare_attention(
+            self._reselect = functools.partial(
+                self._prepare_attention,
                 binding,
                 roots,
                 pin,
@@ -2411,6 +2414,7 @@ class Executor:
                 else None,
                 optional_scope=optional_attention_scope,
             )
+            applied = self._reselect()
             self.device_facts = device_facts
             stage("attention_pin")
         except (AnimaOptimizationRefusal, FusionRefusal, attention.AttentionRefusal) as exc:
@@ -3025,6 +3029,7 @@ class Executor:
         # A pin is the run's: a call holding no site in its scope runs its own selection,
         # and the worker reports a run none of whose calls applied it.
         pin = requested if requested and self._attention_reaches(requested) else ""
+        self._upgrade_attention()
         try:
             swap = self._attention_plan(pin) if pin else None
             self._restore_attention()
@@ -3359,7 +3364,33 @@ class Executor:
             return None
         return attention.plan(self._attention_device(pin), roots, pin, self.world)
 
-    def _agree_attention(self, applied: attention.Applied) -> dict[str, Any] | None:
+    def _upgrade_attention(self) -> None:
+        """BETWEEN REQUESTS (a run never waits for a compile): a kernel the selection passed
+        over while it compiled is ready, so the construction selects again and serves it from
+        this request on; a group's followers take rank 0's kernels. Where they cannot, the
+        prepared selection stays."""
+        for executor in self.model_executors or [self]:
+            applied, again, device = executor.attention, executor._reselect, executor.device_facts
+            if applied is None or again is None or device is None or not applied.waiting:
+                continue
+            if not attention.compiled(applied.waiting, device):
+                continue
+            try:
+                fresh = again()
+            except attention.AttentionRefusal:
+                executor.attention_defaults.restore()
+                continue
+            if executor.group is not None and executor._agree_attention(fresh, poison=False):
+                executor.attention_defaults.restore()
+                executor._agree_attention(applied, poison=False)
+                continue
+            assert executor.backend is not None
+            executor.attention = fresh
+            executor.attention_defaults = attention.snapshot(dict(executor.backend.roots))
+
+    def _agree_attention(
+        self, applied: attention.Applied, *, poison: bool = True
+    ) -> dict[str, Any] | None:
         """THE GROUP SERVES RANK 0'S PREPARED SELECTION. Each rank selected beside rank 0
         under its own probes, so a follower takes rank 0's per-component kernels before the
         group installs; one that cannot serve them refuses the group instead of serving a
@@ -3381,6 +3412,8 @@ class Executor:
             return self._group_refusal(exc)
         for follower, reply in zip(self.group.followers, replies, strict=True):
             if not reply.get("ok") or reply.get("hosts") != applied.hosts:
+                if not poison:  # an upgrade the followers did not take leaves the group whole
+                    return {"ok": False, "code": "gpu_divergence"}
                 return self._group_refusal(
                     GpuDivergence(
                         follower.gpu,

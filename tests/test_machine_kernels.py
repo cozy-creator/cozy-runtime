@@ -66,7 +66,6 @@ def test_the_boot_compiles_what_the_cards_admit_into_the_store_its_executors_rea
     assert executor is not None and last["store"] == str(executor.own)
     served = kernel_compile.submit(executor, job)
     assert served.state == "ready" and Path(served.path, kernel_cache.SITE, "tiny_kernel").is_dir()
-    assert kernel_compile._slots(executor.own) == [executor.own / ".slots" / "0.lock"]
 
     # The next machine run finds every key built: it starts no builder.
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-a")
@@ -97,17 +96,19 @@ def test_a_machine_without_a_card_or_a_store_compiles_nothing(
     assert not (tmp_path / "u0").exists()
 
 
-#: Upstream's `setup.py build` as each recipe runs it, minus the compiler: it records the
-#: width it was handed and finishes only once the other wide build runs too, meeting it at a
-#: FIFO. A boot that ran them in turn would leave the first one still, and ended as wedged.
+#: Upstream's `setup.py build` as each recipe runs it: it records the jobs it was handed,
+#: runs one compiler job as torch would (`PYTORCH_NVCC`), and finishes only once the other
+#: wide build runs too, meeting it at a FIFO. A boot that ran them in turn would leave the
+#: first one still, and ended as wedged.
 _SETUP = """\
-import os, sys
+import os, subprocess, sys
 from pathlib import Path
 # The text each recipe rewrites: {anchors!r}
 args = sys.argv[1:]
 lib, egg = (Path(args[args.index(flag) + 1]) for flag in ("--build-lib", "--egg-base"))
 meet = Path({meet!r})
 (meet / "{name}").write_text(os.environ["MAX_JOBS"])
+subprocess.run([os.environ["PYTORCH_NVCC"], str(meet / "{name}.nvcc")], check=True)
 (meet / "{name}.py").write_text(Path(__file__).read_text())
 print("[1/2] {name}", flush=True)
 os.close(os.open(meet / "fifo", os.O_RDONLY if "{name}" == "sageattention" else os.O_WRONLY))
@@ -134,27 +135,34 @@ def _tree(root: Path, name: str, files: dict[str, str]) -> dict[str, str]:
     }
 
 
-def test_the_boot_starts_every_wide_build_at_once_each_with_its_share(
+def test_the_boot_starts_every_build_at_once_through_the_compile_ledger(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """On an H100 the request's first kernel (FA3) and H3's (SageAttention2) build side by
-    side, each in one of the boot's two slots: neither waits for the other's turn."""
+    side, every compiler job admitted by the machine's ledger: neither waits for the other."""
     root = _registry(tmp_path / "sources")
     meet = tmp_path / "meet"
     meet.mkdir()
     os.mkfifo(meet / "fifo")
+    toolkit = tmp_path / "toolkit"
+    toolkit.mkdir()
+    (toolkit / "nvcc").write_text('#!/bin/sh\necho compiled > "$1"\n')
+    (toolkit / "nvcc").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{toolkit}{os.pathsep}{os.environ['PATH']}")
 
-    def setup(name: str) -> str:
+    def files(name: str, setup_py: str) -> dict[str, str]:
+        """Every file the recipe rewrites, holding the text it rewrites; `setup_py` runs."""
         recipe = kernel_sources.RECIPES[name]
-        anchors = [old for _, old, _ in (*recipe.replace, *recipe.replace_on.get(90, ()))]
-        return _SETUP.format(anchors=anchors, meet=str(meet), name=name)
+        texts: dict[str, list[str]] = {}
+        for path, old, _ in (*recipe.replace, *recipe.replace_on.get(90, ())):
+            texts.setdefault(path, []).append(old)
+        tree = {path: "\n".join(anchors) + "\n" for path, anchors in texts.items()}
+        return tree | {setup_py: _SETUP.format(anchors=texts[setup_py], meet=str(meet), name=name)}
 
     index = json.loads((root / "index.json").read_text())
     index["sources"] |= {
-        "sageattention": _tree(root, "sageattention", {"setup.py": setup("sageattention")}),
-        "flash-attention": _tree(
-            root, "flash-attention", {"hopper/setup.py": setup("flash-attn3")}
-        ),
+        "sageattention": _tree(root, "sageattention", files("sageattention", "setup.py")),
+        "flash-attention": _tree(root, "flash-attention", files("flash-attn3", "hopper/setup.py")),
         "flash-attention-cutlass": _tree(root, "cutlass", {"README.md": "cutlass\n"}),
     }
     (root / "index.json").write_text(json.dumps(index))
@@ -176,11 +184,13 @@ def test_the_boot_starts_every_wide_build_at_once_each_with_its_share(
     code, lines = _boot(capsys)
     ready = {row["kernel"] for row in lines if row.get("state") == "ready"}
     assert code == 0 and ready == {kernel_sources.PYTHON, "sageattention", "flash-attn3"}, lines
-    assert len(kernel_compile._slots(tmp_path / "kernels" / "u0")) == 2
     for name in ("sageattention", "flash-attn3"):
         recipe = kernel_sources.RECIPES[name]
         rewritten = (meet / f"{name}.py").read_text()
-        for _, old, new in (*recipe.replace, *recipe.replace_on.get(90, ())):
-            assert new in rewritten and old not in rewritten, (name, old)
-        share = kernel_compile.width(recipe.unit_bytes, 2) // min(recipe.extensions, 2)
-        assert 1 <= int((meet / name).read_text()) <= max(1, share), name
+        for path, old, new in (*recipe.replace, *recipe.replace_on.get(90, ())):
+            if path.endswith("setup.py"):
+                assert new in rewritten and old not in rewritten, (name, old)
+        assert int((meet / name).read_text()) == kernel_compile.cpus(), name
+        assert (meet / f"{name}.nvcc").read_text() == "compiled\n", name
+    book = json.loads((tmp_path / "kernels" / "u0" / ".compile.json").read_text())
+    assert book["jobs"] == {} or not kernel_compile.compilers(tmp_path / "kernels" / "u0")

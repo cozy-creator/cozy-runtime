@@ -38,7 +38,8 @@ import sys
 import tarfile
 import tempfile
 import zipfile
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from importlib import metadata, util
 from pathlib import Path
@@ -85,8 +86,11 @@ class Pin:
     url: str
     sha256: str
     package: str = ""
+    #: the archive paths recipes read; a worker image carries only these (`fetch`)
+    keep: tuple[str, ...] = ()
 
 
+_HEADERS = ("include", "tools/util/include", "LICENSE.txt")
 _GITHUB = "https://github.com/{}/archive/{}.tar.gz"
 _PYPI = "https://files.pythonhosted.org/packages/"
 PINS: tuple[Pin, ...] = (
@@ -95,12 +99,21 @@ PINS: tuple[Pin, ...] = (
         "d1a57a546c3d395b1ffcbeecc66d81db76f3b4b5",
         _GITHUB.format("thu-ml/SageAttention", "d1a57a546c3d395b1ffcbeecc66d81db76f3b4b5"),
         "74b6667164f9e368e3799bc2ab59b9b08c4591630f1c6029560208b6fcf354c4",
+        keep=(
+            "setup.py",
+            "csrc",
+            "sageattention",
+            "sageattention3_blackwell",
+            "README.md",
+            "LICENSE",
+        ),
     ),
     Pin(
         "cutlass",
         "098de2a652cf8f00fd70b2df54051c7eccbb855a",
         _GITHUB.format("NVIDIA/cutlass", "098de2a652cf8f00fd70b2df54051c7eccbb855a"),
         "a8a1b952c7f6179bc8076f20d45859f18bd81f21f3d22b6766d7f3f0cceb5d54",
+        keep=_HEADERS,  # SageAttention3's (Blackwell)
     ),
     Pin(
         "flash-attention",
@@ -113,6 +126,7 @@ PINS: tuple[Pin, ...] = (
         "dc4817921edda44a549197ff3a9dcf5df0636e7b",  # flash-attention's csrc/cutlass submodule
         _GITHUB.format("NVIDIA/cutlass", "dc4817921edda44a549197ff3a9dcf5df0636e7b"),
         "f2a3a9df5e6f010c8b02716aa2644a6f071827fafa606fac5f5241cab6a1ab56",
+        keep=_HEADERS,
     ),
     Pin(
         "comfy-kitchen",
@@ -126,6 +140,7 @@ PINS: tuple[Pin, ...] = (
         _GITHUB.format("NVlabs/Sana", "8e0db4fa562d727ea28b8d63015c196db7d97cae"),
         "6e8c00037a2de9e48522c79c8984576e8e227fa7ab770be9502214c263dc1f01",
         package="techniques/sparse_backends/sol_attn",
+        keep=("techniques/sparse_backends/sol_attn",),
     ),
     Pin(
         "apache-tvm-ffi",
@@ -235,19 +250,44 @@ class Recipe:
     replace: tuple[tuple[str, str, str], ...] = ()
     #: more text fixes for one card architecture only (`sm`)
     replace_on: Mapping[int, tuple[tuple[str, str, str], ...]] = field(default_factory=dict)
-    #: the extension modules upstream builds, as many at once as the build is wide
+    #: the extension modules upstream builds, all at once
     extensions: int = 1
-    #: the peak memory of one of its compiler processes, which bounds how wide it runs:
-    #: SageAttention2's largest measured 3.2 GB (cicc on its sm89 kernels)
+    #: the peak memory of one of its compiler jobs, which the machine's compile ledger holds
+    #: for it: SageAttention2's largest measured 3.2 GB (cicc on its sm89 kernels)
     unit_bytes: int = 4 << 30
 
 
 #: The cards upstream SageAttention builds its SM89 and SM80 kernel families for.
 _SAGE_SM89 = "HAS_SM89 or HAS_SM90 or HAS_SM100 or HAS_SM120 or HAS_SM121"
 _SAGE_SM80 = "HAS_SM80 or HAS_SM86 or " + _SAGE_SM89
+_SAGE = {"CXX_APPEND_FLAGS": "-std=c++20", "NVCC_APPEND_FLAGS": "-std=c++20 --threads=1"}
 #: FA3 inference forward only, one KV split and no packed GQA: exactly what
 #: `attention_upstream.fa3` calls (`num_splits=1`), a third of upstream's forward units.
 _FA3_OFF = ("BACKWARD", "SM80", "PAGEDKV", "APPENDKV", "SOFTCAP", "LOCAL", "SPLIT", "PACKGQA")
+#: FA3's head dimensions and dtypes the packages' attention sites run: H3's and Qwen Image's
+#: transformers at 128 in BF16, H3's video VAE at 64 in FP16 (`attention.CANDIDATES`).
+_FA3_SHAPES = (("128", "bf16"), ("64", "fp16"))
+#: Upstream updates the submodule with git, and off CUDA 12.8 downloads NVIDIA's 12.6/12.8
+#: compilers over this machine's toolkit; build with the toolkit present. It hard-codes C++17
+#: and reads no append variable; only `flash_api.cpp`, a host unit, includes Torch.
+_FA3_TOOLKIT = (
+    ("hopper/setup.py", '"cxx": ["-O3", "-std=c++17"', '"cxx": ["-O3", "-std=c++20"'),
+    (
+        "hopper/setup.py",
+        'subprocess.run(["git", "submodule", "update", "--init", "../csrc/cutlass"])',
+        "pass",
+    ),
+    ("hopper/setup.py", 'if bare_metal_version != Version("12.8"):', "if False:"),
+)
+_FA3_UNIT = "if not (packgqa and (paged or split))]"
+_HALF_64_DV = (
+    "return run_mha_fwd_<Arch, cutlass::half_t, 64, {}, Split, PagedKVNonTMA, Has_softcap, "
+    "PackGQA>(params, stream);"
+)
+_HALF_128 = "if (params.d <= 128) { return run_mha_fwd_<Arch, cutlass::half_t"
+_LOCAL_CHECK = (
+    'TORCH_CHECK(!params.is_local, "This flash attention build does not support local attention.");'
+)
 #: Torch 2.14's headers need C++20; every recipe below says so in upstream's own terms.
 RECIPES: dict[str, Recipe] = {
     recipe.name: recipe
@@ -256,22 +296,22 @@ RECIPES: dict[str, Recipe] = {
             "sageattention",
             "setup",
             ("sageattention",),
-            # Upstream appends these after its C++17 defaults.
-            env={"CXX_APPEND_FLAGS": "-std=c++20", "NVCC_APPEND_FLAGS": "-std=c++20 --threads=1"},
+            env=_SAGE,  # upstream appends these after its C++17 defaults
             # _qattn_sm80, _qattn_sm89, _qattn_sm90 (SM90 only) and _fused.
             extensions=4,
-            # Upstream builds every kernel family the card can run; build the ones
-            # `attention_upstream` calls on it: SM90's own (and SM80's FP16 P/V), SM89's on
-            # SM89/SM120. A family not built is one upstream's `core` already tolerates.
+            # Upstream builds every kernel family the card can run; build the one
+            # `sageattention` calls on it: SM90's own, SM89's on SM89/SM120. A family not
+            # built is one upstream's `core` tolerates (`sageattention-full` builds them all).
             replace_on={
-                sm: (("setup.py", f"if {old}:", f"if {new}:"),)
-                for sm, old, new in (
-                    (90, _SAGE_SM89, _SAGE_SM89.replace(" or HAS_SM90", "")),
-                    (89, _SAGE_SM80, "HAS_SM80 or HAS_SM86 or HAS_SM90 or HAS_SM100"),
-                    (120, _SAGE_SM80, "HAS_SM80 or HAS_SM86 or HAS_SM90 or HAS_SM100"),
+                sm: tuple(("setup.py", f"if {old}:", f"if {new}:") for old, new in fixes)
+                for sm, fixes in (
+                    (90, ((_SAGE_SM80, "False"), (_SAGE_SM89, "False"))),
+                    (89, ((_SAGE_SM80, "False"),)),
+                    (120, ((_SAGE_SM80, "False"),)),
                 )
             },
         ),
+        Recipe("sageattention-full", "setup", ("sageattention",), env=_SAGE, extensions=4),
         Recipe(
             "sageattn3",
             "setup",
@@ -288,16 +328,64 @@ RECIPES: dict[str, Recipe] = {
             ("flash-attention", "flash-attention-cutlass"),
             subdir="hopper",
             place={"flash-attention-cutlass": "csrc/cutlass"},
+            env={
+                f"FLASH_ATTENTION_DISABLE_{part}": "TRUE"
+                for part in (*_FA3_OFF, "FP8", "HDIM96", "HDIM192", "HDIM256", "VARLEN")
+            },
+            # One unit per shape in `_FA3_SHAPES` (4.6-4.7 GB max RSS each, cicc), not
+            # upstream's units of every head dimension (14.2 GB, ~190 s apiece on H100 pods);
+            # dispatch to a shape not built is compiled out, and so are causal and variable
+            # length attention, which no package's site runs (bidirectional DiTs and VAEs).
+            unit_bytes=5 << 30,
+            replace=(
+                (
+                    "hopper/static_switch.h",
+                    "CAUSAL_CONST_NAME = true;" + " " * 42 + "\\\n        return __VA_ARGS__();",
+                    "CAUSAL_CONST_NAME = false;" + " " * 41 + "\\\n        return __VA_ARGS__();",
+                ),
+                (
+                    "hopper/flash_api.cpp",
+                    _LOCAL_CHECK,
+                    _LOCAL_CHECK
+                    + '\n    TORCH_CHECK(!params.is_causal, "This build is non-causal.");',
+                ),
+                (
+                    "hopper/setup.py",
+                    'HEAD_DIMENSIONS_FWD = ["all", "diff"]',
+                    f"HEAD_DIMENSIONS_FWD = {sorted({h for h, _ in _FA3_SHAPES})!r}",
+                ),
+                (
+                    "hopper/setup.py",
+                    _FA3_UNIT,
+                    _FA3_UNIT[:-1] + f" and (hdim, dtype) in {_FA3_SHAPES!r}]",
+                ),
+                (
+                    "hopper/flash_api.cpp",
+                    "if (params.is_bf16) {\n            #ifndef FLASHATTENTION_DISABLE_HDIM64",
+                    "if (params.is_bf16) {\n            #if 0",
+                ),
+                (
+                    "hopper/flash_api.cpp",
+                    f"#ifndef FLASHATTENTION_DISABLE_HDIM128\n            {_HALF_128}",
+                    f"#if 0\n            {_HALF_128}",
+                ),
+                *(
+                    ("hopper/flash_api.cpp", _HALF_64_DV.format(dv), "TORCH_CHECK(false);")
+                    for dv in (512, 256)
+                ),
+                *_FA3_TOOLKIT,
+            ),
+        ),
+        # Every forward head dimension and dtype, FP8 included, one unit per dimension: what
+        # the `flash-attn3-fp8` pin runs, built when a pin asks for it.
+        Recipe(
+            "flash-attn3-full",
+            "setup",
+            ("flash-attention", "flash-attention-cutlass"),
+            subdir="hopper",
+            place={"flash-attention-cutlass": "csrc/cutlass"},
             env={f"FLASH_ATTENTION_DISABLE_{part}": "TRUE" for part in _FA3_OFF},
-            # Upstream's own guidance: its hopper instantiations need several GB per job.
-            unit_bytes=6 << 30,
-            # Upstream updates the submodule with git, and off CUDA 12.8 downloads NVIDIA's
-            # 12.6/12.8 compilers over this machine's toolkit; build with the toolkit present.
-            # It hard-codes C++17 and reads no append variable. Only `flash_api.cpp`, a host
-            # compiler unit, includes Torch; the CUDA units keep upstream's C++17. Its
-            # `hdimall`/`hdimdiff` units each instantiate every head dimension (~190 s apiece
-            # on H100 pods): each dimension's own file is a unit instead, so a pod's cores
-            # build them side by side.
+            unit_bytes=5 << 30,
             replace=(
                 (
                     "hopper/setup.py",
@@ -307,18 +395,11 @@ RECIPES: dict[str, Recipe] = {
                 ),
                 (
                     "hopper/setup.py",
-                    "if not (packgqa and (paged or split))]",
-                    "if not (packgqa and (paged or split)) and os.path.exists("
-                    'f"instantiations/flash_fwd_hdim{hdim}_{dtype}{paged}{split}{softcap}'
-                    '{packgqa}_sm90.cu")]',
+                    _FA3_UNIT,
+                    _FA3_UNIT[:-1] + ' and os.path.exists(f"instantiations/flash_fwd_hdim'
+                    '{hdim}_{dtype}{paged}{split}{softcap}{packgqa}_sm90.cu")]',
                 ),
-                ("hopper/setup.py", '"cxx": ["-O3", "-std=c++17"', '"cxx": ["-O3", "-std=c++20"'),
-                (
-                    "hopper/setup.py",
-                    'subprocess.run(["git", "submodule", "update", "--init", "../csrc/cutlass"])',
-                    "pass",
-                ),
-                ("hopper/setup.py", 'if bare_metal_version != Version("12.8"):', "if False:"),
+                *_FA3_TOOLKIT,
             ),
         ),
         Recipe("comfy-kitchen", "setup", ("comfy-kitchen",)),
@@ -368,12 +449,16 @@ def torch_build() -> tuple[str, str]:
     return installed.version, cuda.group(1) if cuda else ""
 
 
+def _nvcc() -> str:
+    home = config.inherited_environment().get("CUDA_HOME") or "/usr/local/cuda"
+    return shutil.which("nvcc") or str(Path(home) / "bin" / "nvcc")
+
+
 @functools.cache
 def compiler() -> str:
     """The CUDA toolkit and host compiler that will build, as they identify themselves."""
     environment = config.inherited_environment()
-    home = environment.get("CUDA_HOME") or "/usr/local/cuda"
-    nvcc = shutil.which("nvcc") or str(Path(home) / "bin" / "nvcc")
+    nvcc = _nvcc()
     try:
         found = [
             subprocess.run([tool, "--version"], capture_output=True, text=True, check=True).stdout
@@ -487,6 +572,12 @@ def _verified(source: Mapping[str, Any]) -> Path:
     return path
 
 
+def _fetched(sources: Iterable[Mapping[str, Any]]) -> None:
+    """A build's sources, downloaded side by side (the image may carry them already)."""
+    with ThreadPoolExecutor() as pool:
+        list(pool.map(_verified, [row for row in sources if not _tree(row).is_dir()]))
+
+
 def _digest(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -495,8 +586,17 @@ def _digest(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _tree(source: Mapping[str, Any]) -> Path:
+    """The part of a source a worker image carries, unpacked (`fetch`)."""
+    named = str(source.get("file") or "")
+    return Path(named if named.endswith(".tree") else f"{source.get('preseed') or '-'}.tree")
+
+
 def _extract(source: Mapping[str, Any], into: Path) -> Path:
-    """A verified source tree, its one top directory stripped."""
+    """A verified source tree, its one top directory stripped; the image's copy when it has."""
+    if _tree(source).is_dir():
+        shutil.copytree(_tree(source), into)
+        return into
     into.mkdir(parents=True)
     with tarfile.open(_verified(source)) as archive:
         archive.extractall(into, filter="data")
@@ -529,6 +629,7 @@ def build_python(
     site = staging / kernel_cache.SITE
     site.mkdir()
     rows = sorted(spec["sources"].values(), key=lambda row: row["name"])
+    _fetched(rows)
     with tempfile.TemporaryDirectory(prefix="cozy-python-") as scratch:
         for done, row in enumerate(rows, 1):
             if row.get("package"):
@@ -542,6 +643,15 @@ def build_python(
     return {"sources": [f"{row['name']}=={row['version']}" for row in rows]}
 
 
+#: `PYTORCH_NVCC` for a build: its compiler jobs, each admitted by the machine's compile ledger.
+_COMPILER = """#!{python} -I
+import sys
+sys.path[:0] = {path!r}
+from cozy_runtime.internal.kernel_compile import compiler_job
+compiler_job(*{job!r})
+"""
+
+
 def build_setup(
     spec: Mapping[str, Any], staging: Path, report: Callable[[float], None]
 ) -> dict[str, object]:
@@ -549,6 +659,7 @@ def build_setup(
     and the card this process sees."""
     recipe = RECIPES[spec["recipe"]]
     sources = spec["sources"]
+    _fetched(sources.values())
     with tempfile.TemporaryDirectory(prefix=f"cozy-build-{recipe.name}-") as scratch:
         work = Path(scratch)
         tree = _extract(sources[recipe.sources[0]], work / "src")
@@ -575,13 +686,23 @@ def build_setup(
             for key, value in config.inherited_environment().items()
             if key != "TORCH_CUDA_ARCH_LIST"
         }
-        width = kernel_compile.width(recipe.unit_bytes, spec.get("share", 1))
-        parallel = min(recipe.extensions, width)
+        # Every compiler job goes through the machine's compile ledger, which admits it.
+        nvcc = work / "nvcc"
+        nvcc.write_text(
+            _COMPILER.format(
+                python=sys.executable,
+                path=sys.path,
+                job=(spec["ledger"], spec["key"], recipe.unit_bytes, _nvcc()),
+            )
+        )
+        nvcc.chmod(0o755)
+        jobs = kernel_compile.cpus()
         environment.update(
             {
                 # Upstream's own knobs: extensions at once, and ninja jobs within each.
-                "EXT_PARALLEL": str(parallel),
-                "MAX_JOBS": str(max(1, width // parallel)),
+                "EXT_PARALLEL": str(recipe.extensions),
+                "MAX_JOBS": str(jobs),
+                "PYTORCH_NVCC": str(nvcc),
                 "PYTHONPATH": os.pathsep.join([str(deps), *sys.path]),
                 "PYTHONNOUSERSITE": "1",
                 **recipe.env,
@@ -604,6 +725,7 @@ def build_setup(
             cwd=tree / recipe.subdir,
             env=environment,
             report=report,
+            alongside=functools.partial(kernel_compile.compilers, Path(spec["ledger"])),
         )
         [info] = work.glob("*.egg-info/PKG-INFO")
         found = email.parser.Parser().parsestr(info.read_text())
@@ -611,8 +733,7 @@ def build_setup(
         units = _units(work / "build")
     return {
         "sources": {name: row["version"] for name, row in sources.items()},
-        "width": width,
-        "extensions_at_once": parallel,
+        "max_jobs": jobs,
         "units_ms": dict(sorted(units.items(), key=lambda unit: -unit[1])[:12]),
         "log_tail": output[-400:],
     }
@@ -652,16 +773,44 @@ def _dist_info(site: Path, name: str, version: str, installed: list[Path]) -> No
 
 
 def fetch(root: Path) -> dict[str, Any]:
-    """Download every pinned source into `root` through the Runtime's one egress boundary,
-    each held to its pinned sha256, and write the index beside them."""
+    """Download every pinned source into `root` side by side through the Runtime's one egress
+    boundary, each held to its pinned sha256, and write the index beside them. A worker image
+    carries them, so a pod's boot compile downloads none; of a source with `keep`, only those
+    paths, unpacked beside where its archive would be (`_tree`)."""
     root.mkdir(parents=True, exist_ok=True)
-    sources: dict[str, Any] = {}
-    for pin in PINS:
+
+    def download(pin: Pin) -> None:
         name = _filename(pin)
+        if (root / f"{name}.tree").is_dir():
+            return
         if not (root / name).exists() or _digest(root / name) != pin.sha256:
             egress.fetch_public_wheel(root / name, pin.url, f"sha256:{pin.sha256}", 1 << 30)
-        row = {"version": pin.version, "file": name, "sha256": pin.sha256, "origin": pin.url}
-        sources[pin.name] = {**row, **({"package": pin.package} if pin.package else {})}
+        if pin.keep:
+            staging = root / f".{name}.tree"
+            shutil.rmtree(staging, ignore_errors=True)
+            with tarfile.open(root / name) as archive:
+                kept = [
+                    member.replace(name=rest)
+                    for member in archive.getmembers()
+                    if (rest := member.name.partition("/")[2])
+                    and any(rest == k or rest.startswith(f"{k}/") for k in pin.keep)
+                ]
+                archive.extractall(staging, members=kept, filter="data")
+            os.replace(staging, root / f"{name}.tree")
+            (root / name).unlink()
+
+    with ThreadPoolExecutor() as pool:
+        list(pool.map(download, PINS))
+    sources = {
+        pin.name: {
+            "version": pin.version,
+            "file": _filename(pin) + (".tree" if pin.keep else ""),
+            "sha256": pin.sha256,
+            "origin": pin.url,
+            **({"package": pin.package} if pin.package else {}),
+        }
+        for pin in PINS
+    }
     index = {"schema": 1, "sources": sources}
     (root / INDEX).write_text(json.dumps(index, indent=1, sort_keys=True) + "\n")
     return index
