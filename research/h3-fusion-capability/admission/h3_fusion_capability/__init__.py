@@ -7,6 +7,7 @@ from importlib.metadata import version
 from types import SimpleNamespace
 
 import msgspec
+
 from cozy_runtime.author import App, Context
 
 app = App()
@@ -36,6 +37,7 @@ def construct_case(
     import torch
     from diffusers import MiniMaxH3Transformer3DModel
     from diffusers.models.transformers.transformer_minimax_h3 import MiniMaxH3RotaryPosEmbed
+
     from cozy_runtime.internal.encoding.leaves import RowwiseNativeLeaf, quantize_activation_rowwise
     from cozy_runtime.models.minimax_h3.turbo import LoRAFactors, _LoRAHook
 
@@ -122,6 +124,7 @@ def construct_case(
 @app.job(accelerator=True)
 def verify(payload: Request, ctx: Context) -> Result:
     import torch
+
     from cozy_runtime.internal import fusion, fusion_install
 
     if ctx.device.type != "cuda":
