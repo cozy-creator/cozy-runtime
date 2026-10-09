@@ -108,6 +108,7 @@ args = sys.argv[1:]
 lib, egg = (Path(args[args.index(flag) + 1]) for flag in ("--build-lib", "--egg-base"))
 meet = Path({meet!r})
 (meet / "{name}").write_text(os.environ["MAX_JOBS"])
+(meet / "{name}.py").write_text(Path(__file__).read_text())
 print("[1/2] {name}", flush=True)
 os.close(os.open(meet / "fifo", os.O_RDONLY if "{name}" == "sageattention" else os.O_WRONLY))
 (lib / "{name}_ext").mkdir(parents=True)
@@ -144,7 +145,8 @@ def test_the_boot_starts_every_wide_build_at_once_each_with_its_share(
     os.mkfifo(meet / "fifo")
 
     def setup(name: str) -> str:
-        anchors = [old for _, old, _ in kernel_sources.RECIPES[name].replace]
+        recipe = kernel_sources.RECIPES[name]
+        anchors = [old for _, old, _ in (*recipe.replace, *recipe.replace_on.get(90, ()))]
         return _SETUP.format(anchors=anchors, meet=str(meet), name=name)
 
     index = json.loads((root / "index.json").read_text())
@@ -177,5 +179,8 @@ def test_the_boot_starts_every_wide_build_at_once_each_with_its_share(
     assert len(kernel_compile._slots(tmp_path / "kernels" / "u0")) == 2
     for name in ("sageattention", "flash-attn3"):
         recipe = kernel_sources.RECIPES[name]
+        rewritten = (meet / f"{name}.py").read_text()
+        for _, old, new in (*recipe.replace, *recipe.replace_on.get(90, ())):
+            assert new in rewritten and old not in rewritten, (name, old)
         share = kernel_compile.width(recipe.unit_bytes, 2) // min(recipe.extensions, 2)
         assert 1 <= int((meet / name).read_text()) <= max(1, share), name
