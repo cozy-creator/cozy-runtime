@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import sys
-from typing import Annotated
+from typing import Annotated, Literal
 
 import msgspec
 
@@ -21,6 +21,7 @@ class Request(msgspec.Struct, kw_only=True, forbid_unknown_fields=True):
     timeout_s: int = 3600
     trace: bool = False
     trace_root: str = ""
+    expected_steps: Literal[8, 30] = 8
 
 
 class Result(msgspec.Struct):
@@ -50,6 +51,7 @@ def run(payload: Request, ctx: Context, scratch: Scratch, out: Outputs) -> Resul
         trace=payload.trace,
         output_root=payload.output_root,
         trace_root=payload.trace_root,
+        expected_steps=payload.expected_steps,
         directory=directory,
         deadline=ctx.deadline,
         check_cancelled=ctx.raise_if_cancelled,

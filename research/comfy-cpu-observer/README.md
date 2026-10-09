@@ -30,3 +30,10 @@ Source proof: Runtime `Executor.run_job` initializes Torch/CUDA only when the jo
 admitted budget has a positive GPU count. Static/imported package interfaces and
 the real CPU execution path must be qualified before rental use. A GPU Comfy render
 has not been exercised through this wrapper yet.
+
+A traced request declares `expected_steps` (8 for Turbo, 30 for regular). Success
+requires matching summary counts and every uniquely named, completed forward-step
+range. Cached/partial/wrong-size traces return `result.status="failed"` while
+retaining their raw trace and observer artifacts. The outer CPU job may complete
+successfully while reporting that diagnostic failure; inspect `result.status`.
+Step validation is not a substitute for offline dense/Sol kernel verification.

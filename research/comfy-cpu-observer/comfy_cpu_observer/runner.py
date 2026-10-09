@@ -98,7 +98,10 @@ def observe(
     directory: Path,
     deadline: float,
     check_cancelled: Callable[[], None],
+    expected_steps: int = 8,
 ) -> dict[str, Any]:
+    if type(expected_steps) is not int or expected_steps not in (8, 30):
+        raise ValueError("H3 trace expects exactly8 Turbo or30 regular denoising steps")
     graph = json.loads(graph_json)
     if not isinstance(graph, dict) or not graph:
         raise ValueError("graph_json must encode a nonempty Comfy API graph")
@@ -113,6 +116,7 @@ def observe(
                 "trace": trace,
                 "output_root": output_root,
                 "trace_root": trace_root,
+                "expected_steps": expected_steps,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -245,16 +249,34 @@ def observe(
                 )
             else:
                 summary = json.loads((source / "summary.json").read_text())
-                expected = summary.get("expected_steps")
+                dense = 4 if expected_steps == 8 else 10
+                wanted = {
+                    f"h3.step.{step}.{'dense' if step < dense else 'sparse_eligible'}"
+                    for step in range(expected_steps)
+                }
+                ranges = [
+                    item
+                    for item in summary.get("ranges", [])
+                    if isinstance(item, dict) and str(item.get("label", "")).startswith("h3.step.")
+                ]
                 if (
-                    type(expected) is not int
-                    or expected < 1
-                    or summary.get("steps_observed") != expected
+                    type(summary.get("expected_steps")) is not int
+                    or summary["expected_steps"] != expected_steps
+                    or type(summary.get("steps_observed")) is not int
+                    or summary["steps_observed"] != expected_steps
+                    or len(ranges) != expected_steps
+                    or {item["label"] for item in ranges} != wanted
+                    or any(
+                        type(item.get("start_unix_ns")) is not int
+                        or type(item.get("end_unix_ns")) is not int
+                        or item["end_unix_ns"] <= item["start_unix_ns"]
+                        for item in ranges
+                    )
                     or not summary.get("segments")
                 ):
                     status, detail = (
                         "failed",
-                        "Trace does not contain every expected denoising step",
+                        f"Incomplete trace: expected {expected_steps} complete step ranges",
                     )
                 remaining = MAX_ARTIFACT_BYTES - sum(
                     path.stat().st_size for path in artifacts.rglob("*") if path.is_file()

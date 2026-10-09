@@ -197,6 +197,14 @@ def test_trace_export_timeout_resumes_to_retained_files_without_resubmission(tmp
                 {
                     "steps_observed": 8,
                     "expected_steps": 8,
+                    "ranges": [
+                        {
+                            "label": f"h3.step.{i}.{'dense' if i < 4 else 'sparse_eligible'}",
+                            "start_unix_ns": i * 10 + 1,
+                            "end_unix_ns": i * 10 + 2,
+                        }
+                        for i in range(8)
+                    ],
                     "segments": [{"file": "trace-000.json.gz"}],
                 }
             )
@@ -204,6 +212,21 @@ def test_trace_export_timeout_resumes_to_retained_files_without_resubmission(tmp
         finished = observe(**request)
         assert finished["status"] == "success" and len(server.posts) == 1
         assert (tmp_path / "scratch/artifacts/trace/trace-000.json.gz").read_bytes() == data
+        complete = json.loads((trace / "summary.json").read_text())
+        # Cached/partial/wrong-size traces retain all raw diagnostics but never
+        # inherit success from Comfy's completed history response.
+        for count in (0, 7, 30):
+            broken = dict(complete, expected_steps=count, steps_observed=count)
+            (trace / "summary.json").write_text(json.dumps(broken))
+            refused = observe(**request)
+            assert refused["status"] == "failed" and len(server.posts) == 1
+            assert refused["server_execution_seconds"] is None
+            assert (tmp_path / "scratch/artifacts/trace/trace-000.json.gz").read_bytes() == data
+            retained = json.loads((tmp_path / "scratch/artifacts/trace/summary.json").read_text())
+            assert retained["steps_observed"] == count
+        broken = dict(complete, ranges=complete["ranges"][:7])
+        (trace / "summary.json").write_text(json.dumps(broken))
+        assert observe(**request)["status"] == "failed"
 
 
 def test_cpu_interface_and_real_executor_need_no_torch_or_cuda(tmp_path):
