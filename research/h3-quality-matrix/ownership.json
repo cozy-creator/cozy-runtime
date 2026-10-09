@@ -1,0 +1,8 @@
+{
+  "owner": "/root/trace_resume",
+  "purpose": "Read-only16-clip AV verification and local static review index",
+  "branch": "bench/h3-quality-matrix-tools-20261009",
+  "base": "c6fea990497a43d7f31bf016a8a06ae57cb14324",
+  "worktree": "/home/fidika/cozy/.worktrees/cozy-runtime/h3-quality-matrix-tools-20261009",
+  "created_unix_s": 1791512070.7187674
+}
