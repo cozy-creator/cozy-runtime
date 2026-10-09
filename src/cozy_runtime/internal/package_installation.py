@@ -9,7 +9,6 @@ import json
 import os
 import re
 import shutil
-import ssl
 import subprocess
 import sys
 import tarfile
@@ -36,8 +35,6 @@ MAX_SOURCE_FILES = 100_000
 IMAGE_UV_CACHE = Path("/opt/cozy/dependency-seed/uv-cache")
 #: Installation ids of published environments keyed by their content (release, lock, ABI).
 PUBLISHED_PREFIX = "release-"
-#: An account-index URL: its origin, then the path that names it (account, then page or file).
-_ACCOUNT_INDEX = re.compile(rb"https?://[^/\s'\"]+(/v1/index/[A-Za-z0-9._-]+/(?:simple|files)/)")
 #: Cozy's SDK. A lock freezes a package's dependencies, not the Runtime its executor runs:
 #: the package's declared bounds choose that, and everything else installs as locked.
 RUNTIME = "cozy-runtime"
@@ -72,14 +69,6 @@ def machine_wheels(install_root: Path) -> Path | None:
     machine layout."""
     layout = host_paths.Layout.of_install_root(install_root)
     return layout.machine_wheels if layout is not None else None
-
-
-@dataclass(frozen=True, slots=True)
-class HubIndex:
-    """This machine's own Hub: where a synced project's account-index rows resolve."""
-
-    origin: str
-    ca: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,27 +214,7 @@ def _extract(archive: Path, destination: Path) -> None:
         )
 
 
-def _bind_account_index(source: Path, hub: HubIndex | None) -> None:
-    """Point a synced project's account-index URLs at this machine's own Hub. A lock names
-    that index by its path (account, page, file digest), never by the Hub its author used."""
-    for name in ("pyproject.toml", "uv.lock"):
-        path = source / name
-        raw = path.read_bytes()
-        if not _ACCOUNT_INDEX.search(raw):
-            continue
-        if hub is None:
-            raise EnvironmentRefusal(
-                "package_account_index_unreachable",
-                "the project resolves account-index packages but this machine has no Hub grant",
-            )
-        path.write_bytes(_ACCOUNT_INDEX.sub(hub.origin.rstrip("/").encode() + rb"\1", raw))
-        if hub.ca is not None:
-            trusted = source.parent / "hub-ca"
-            trusted.mkdir(exist_ok=True)
-            shutil.copyfile(hub.ca, trusted / "tensorhub-ca.pem")
-
-
-def _environment(directory: Path, cache: Path | None) -> dict[str, str]:
+def _environment(cache: Path | None) -> dict[str, str]:
     environment = package_install_environment()
     if IMAGE_UV_CACHE.is_dir():
         # The image already contains uv's expanded wheels and index records.
@@ -256,11 +225,6 @@ def _environment(directory: Path, cache: Path | None) -> dict[str, str]:
         environment["UV_LINK_MODE"] = "symlink"
     elif cache is not None:
         environment["UV_CACHE_DIR"] = str(cache / "uv-cache")
-    if (directory / "hub-ca").is_dir():
-        # uv trusts one certificate set: the platform's, plus the grant's private Hub CA.
-        environment["SSL_CERT_DIR"] = (
-            f"{ssl.get_default_verify_paths().openssl_capath}:{directory / 'hub-ca'}"
-        )
     return environment
 
 
@@ -480,7 +444,6 @@ def _install(
     requirements: bytes = b"",
     wheels: tuple[Path, ...] = (),
     cache: Path | None = None,
-    hub: HubIndex | None = None,
     lock_fd: int = -1,
 ) -> InstalledEnvironment:
     """Create a venv without package fingerprints; existing IDs are operation replays only.
@@ -508,7 +471,6 @@ def _install(
                 shutil.rmtree(staged_source)
             _extract(source_archive, staged_source)
             os.replace(staged_source, source)
-        _bind_account_index(source, hub)
     else:
         if requirements:
             (directory / "requirements.txt").write_bytes(requirements)
@@ -530,7 +492,7 @@ def _install(
         python,
         package=package,
         release=release,
-        environment=_environment(directory, cache),
+        environment=_environment(cache),
         lock_fd=lock_fd,
     )
     _write_record(
@@ -599,7 +561,7 @@ def _refresh(
         Path(record.get("interpreter", installed.python)),
         package=installed.package,
         release=installed.release,
-        environment=_environment(directory, cache),
+        environment=_environment(cache),
         lock_fd=lock_fd,
     )
     record["machine"], record["sdk"] = machine, sdk
@@ -714,7 +676,6 @@ def install(
     requirements: bytes = b"",
     wheels: tuple[Path, ...] = (),
     cache: Path | None = None,
-    hub: HubIndex | None = None,
 ) -> InstalledEnvironment:
     identifier = installation_id or "install-" + uuid.uuid4().hex
     with _installation_lock(root, identifier) as lock_fd:
@@ -728,6 +689,5 @@ def install(
             requirements=requirements,
             wheels=wheels,
             cache=cache,
-            hub=hub,
             lock_fd=lock_fd,
         )
