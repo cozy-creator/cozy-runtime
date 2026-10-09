@@ -1,0 +1,236 @@
+{
+  "status": "Completed local trace comparison; no GPU or source changes",
+  "scope": {
+    "gpu": "Same Kojirou RTX5090 UUID daef387f-a2a4-8dcd-a9b3-c87d580fc55b;575W;driver610.43.02",
+    "request": "15-second1344x768/24fps,362frames,Turbo8,combat prompt/seed581204",
+    "native": "Public Runtime0.21.7/TensorFS0.6.1,H3 1.26.3,diagnostic0.0.12,approved Sage3dense4+KitchenINT8Sol4",
+    "comfy": "ComfyUI0.39.0,Kitchen0.2.37,INT8dense4+Sol4,PDD8,cuBLAS13.2.0.9 overlay",
+    "not_clean_benchmark": "Both captures include profiler overhead. Native diagnostic dependency and warm-state history differ from direct H3 clean runs. No clean speedup is inferred from these sums."
+  },
+  "coverage": {
+    "native": {
+      "gpu_events": 1483599,
+      "kernels": 1427347,
+      "attribution": {
+        "annotated": 1482307,
+        "missing_cpu_api": 1292
+      },
+      "invalid": 0,
+      "all_steps": 8
+    },
+    "comfy": {
+      "gpu_events": 168546,
+      "kernels": 159022,
+      "attribution": {
+        "annotated": 167526,
+        "missing_cpu_api": 1020
+      },
+      "invalid": 0,
+      "all_steps": 8
+    }
+  },
+  "denoise_observed_windows": {
+    "native": {
+      "label": "h3.phase.denoise",
+      "host_window_s": 263.8325663510742,
+      "device_activity_union_s": 210.62062388391112,
+      "window_without_observed_device_activity_s": 53.211942467163084,
+      "device_event_intersections": 1430938
+    },
+    "comfy": {
+      "label": "comfy.node.13.SamplerCustomAdvanced",
+      "host_window_s": 254.461106006958,
+      "device_activity_union_s": 241.47650507885743,
+      "window_without_observed_device_activity_s": 12.984600928100585,
+      "observed_device_activity_fraction": 0.9489721587245419,
+      "device_event_intersections": 65582
+    },
+    "qualification": "All observed GPU intervals clipped to each host window and unioned across streams; this is temporal occupancy, not source attribution or SM utilization."
+  },
+  "confirmed_device_work": [
+    {
+      "work": "Main dense attention",
+      "native_calls": 208,
+      "native_duration_sum_s": 74.25332523596191,
+      "comfy_calls": 208,
+      "comfy_duration_sum_s": 114.11157376855469,
+      "note": "Native Sage3NVFP4 versus Comfy KitchenINT8; different approved recipes. Native also launches16 tiny refiner Sage kernels totaling0.000092s."
+    },
+    {
+      "work": "Sol exact attention",
+      "native_calls": 192,
+      "native_duration_sum_s": 30.329144408569334,
+      "comfy_calls": 192,
+      "comfy_duration_sum_s": 30.136937107177733
+    },
+    {
+      "work": "Main FC1",
+      "native_precision": "FP8 CUTLASS row-scaled path",
+      "native_calls": 400,
+      "native_duration_sum_s": 33.56893640527343,
+      "comfy_precision": "FP8 nvjet path",
+      "comfy_calls": 400,
+      "comfy_duration_sum_s": 20.64010418981932
+    },
+    {
+      "work": "Main FC2",
+      "native_precision": "FP8 CUTLASS path",
+      "native_calls": 400,
+      "native_duration_sum_s": 14.191324587890628,
+      "comfy_precision": "BF16 from explicit checkpoint full_precision_matrix_mult policy",
+      "comfy_calls": 400,
+      "comfy_duration_sum_s": 31.11502746948241
+    }
+  ],
+  "fusion": {
+    "actual_report": {
+      "identity": "sha256:454d5df33af916c4caade2bc911d348c022403911f6bb1e560038a96ff32e952",
+      "applied": true,
+      "substitutions": {
+        "MiniMaxH3AttnProcessor->FusedMiniMaxH3AttnProcessor": 100,
+        "SwiGLU->FusedSwiGLU": 100,
+        "MiniMaxH3TransformerBlock->FusedMiniMaxH3TransformerBlock": 100
+      },
+      "sites": 300,
+      "fp8_sites": 0,
+      "code": "",
+      "reason": "",
+      "warm_ms": 33.8
+    },
+    "traced_dit_classes": {
+      "FusedMiniMaxH3TransformerBlock": 50,
+      "FusedSwiGLU": 50,
+      "EncodedLinear": 313
+    },
+    "actual_kernels": {
+      "_norm_mod_kernel": 800,
+      "_swiglu_kernel": 400
+    },
+    "qualification": "300 applied substitutions span both loaded DiTs; this capture executes one DiT. fp8_sites=0 is fusion-plan metadata, not absence of encoded FP8 tensor-core GEMMs."
+  },
+  "lora_preparation": {
+    "calls": 1296,
+    "kernel_launches": 1308096,
+    "device_duration_sum_s": 7.16636178137207,
+    "host_window_union_s": 42.3483972019043,
+    "gpu_activity_overlap_s": 29.301809795043944,
+    "window_without_observed_gpu_activity_s": 13.046587406860352,
+    "cpu_cudaLaunchKernel_calls": 1267704,
+    "cpu_cudaLaunchKernel_duration_sum_s": 24.52623982800009,
+    "qualification": "GPU activity overlapping a bake window may come from earlier asynchronous work. Neither device sums nor whole bake wall are directly removable runtime."
+  },
+  "allocator_api_evidence": {
+    "native_denoise_outside_bake": {
+      "cuMemUnmap": {
+        "count": 186793,
+        "duration_sum_s": 12.78224449299997
+      },
+      "cuMemRelease": {
+        "count": 186793,
+        "duration_sum_s": 12.433171031000002
+      },
+      "cuMemCreate": {
+        "count": 186702,
+        "duration_sum_s": 4.352297314999994
+      }
+    },
+    "comfy_whole_capture_counts": {
+      "cuMemUnmap": 4507,
+      "cuMemRelease": 2616,
+      "cuMemCreate": 1766
+    },
+    "qualification": "These are observed API calls; sums can overlap or nest and are not added to infer a clean wall-time cost."
+  },
+  "transfers": {
+    "steady_example_step3_device_start_window": {
+      "native_h2d_bytes": 9742934016,
+      "native_h2d_device_duration_sum_s": 0.17740862,
+      "comfy_h2d_bytes": 3065922560,
+      "comfy_h2d_device_duration_sum_s": 0.053811209
+    },
+    "video_d2h_correlated_bytes": {
+      "native": 1120961532,
+      "comfy": 4483842048
+    },
+    "qualification": "Native H2D events lack corresponding captured host API records and remain causally unassigned; the per-step figure uses explicit device start-time windows and matches plane counters. Transfer volume is not physical disk IO or peak residency."
+  },
+  "video_output": {
+    "native_decode_window_s": 40.964531708,
+    "native_decode_gpu_union_s": 39.47084444921875,
+    "native_streamed_sink": {
+      "operation": "Outputs.save_video_stream",
+      "succeeded": true,
+      "wall_ms": 38537.60970663279,
+      "source_event_wait_and_materialize_ms": 36401.12426504493,
+      "sink_wall_excluding_source_ms": 2136.4854415878654,
+      "after_source_eof_finalize_probe_ms": 258.7033184245229,
+      "events": 427,
+      "overlaps_decode_video": true
+    },
+    "comfy_decode_window_s": 37.260414139,
+    "comfy_decode_gpu_union_s": 32.750751840087894,
+    "comfy_save_window_s": 25.093376337,
+    "qualification": "Native encoding overlaps decode; its2.136s sink work excluding source and0.259s post-EOF tail must not be added to decode. Comfy save had severe cgroup CPU throttling on this host, also present during unprofiled warmup, so25s is not a general Comfy constant."
+  },
+  "physical_evidence": [
+    "Native steady denoise sampled interiors have zero executor physical read_bytes and no CPU throttling/swap. The large model reads occur mostly in conditioning/first-step startup.",
+    "Direct warm5085 dense step3:99% sampled utilization, fixed29264MiB VRAM,2482.6MHz. Diagnostic unprofiled5090:86.3%,VRAM22264\u201331562MiB,2568.5MHz. Lower clocks do not explain the slower diagnostic.",
+    "Comfy SaveVideo shows1069.931s aggregate cgroup throttled_time during25s wall; unprofiled setup save also shows964.265s. Aggregate throttle time can exceed wall time; no claim that these seconds are additive."
+  ],
+  "dependencies_and_lifetime": {
+    "direct_capture": "f72da9e5699d4b48",
+    "diagnostic_capture": "8a483855d1afba01",
+    "capture_lock_version_differences": 33,
+    "actual_generation_differences": {
+      "direct330d": {
+        "av": "18.1.0",
+        "numpy": "2.5.2",
+        "torchvision": "0.29.0"
+      },
+      "diagnostic0217": {
+        "av": "19.0.1",
+        "numpy": "2.5.3",
+        "torchvision": "0.29.1"
+      }
+    },
+    "same_actual": "Torch2.14,Triton3.8,cuBLAS13.1.1.3,TensorFS0.6.1,H31.26.3; Diffusers captured wheel103ccb byte-identical",
+    "reuse": "Both serving entrypoints; one diagnostic Load plus3 Invokes.5089after matches5090before in plane counters/residency/plans. No per-request model reconstruction observed.",
+    "audio": "Direct5085 anddiagnostic5089 video streams are encoded/decoded identical, audio differs. AV version difference is plausible but no pre-encode PCM was captured, so encoding-only causality is unproved."
+  },
+  "actionable_opportunities": [
+    {
+      "priority": 1,
+      "action": "Investigate allocator/residency balance using the actual peak-history and per-stage budgets; target repeated cache flush/VMM mapping operations while preserving the request.",
+      "evidence": "493 unprofiled allocation retries versus26 in direct warm run; unstable VRAM and lower utilization despite higher clocks;186k VMM calls in the native trace.",
+      "gate": "Matched unprofiled direct-entrypoint requests with fixed dependency lock and warmup history; do not use the profiled sums as the speed gate."
+    },
+    {
+      "priority": 2,
+      "action": "Fuse or reuse the remaining LoRA FP8 encoding/bake work within existing weight-plane ownership, preserving RNG draws, encoded-byte behavior and eviction semantics.",
+      "evidence": "1.308million tiny bake kernels;13.047s of observed GPU inactivity inside bake windows.",
+      "gate": "Byte/sign/RNG regression and full video quality check; cache identity must include effective LoRA state."
+    },
+    {
+      "priority": 3,
+      "action": "Compare the native FC1 row-scaled FP8 dispatch with the scalar-scale/cuBLAS route and library version used by Comfy, retaining valid scale semantics.",
+      "evidence": "400 FP8 FC1 kernels each but33.569s versus20.640s device sums; FC2 already uses a faster FP8 policy than ComfyBF16.",
+      "gate": "Correctness/quality plus matched clean full request; no blanket claim that INT8 is the sole advantage."
+    },
+    {
+      "priority": 4,
+      "action": "Keep stream encoding overlap and investigate Comfy CPU quota/thread behavior before treating this host save cost as a competitor baseline.",
+      "evidence": "Native stream tail0.259s; Comfy25s save plus strong CPU throttling in both profiled and unprofiled requests."
+    }
+  ],
+  "evidence": {
+    "native_attribution": "native-5091-attribution.json",
+    "native_windows": "native-5091-windows.json",
+    "host_work": "native-host-api-and-bake-overlap.json",
+    "physical": "physical-window-summary.json",
+    "projection": "mlp-matrix-comparison.json",
+    "copies": "copy-comparison.json",
+    "loaded_libraries": "loaded-library-readback.json",
+    "unprofiled_boundary": "../profile-current-021/unprofiled-boundary-audit/audit.json",
+    "comfy_artifacts": "/home/fidika/cozy_v2/outputs/comfy-dev-cli-20261009/kojirou-v3/trace-1"
+  }
+}
