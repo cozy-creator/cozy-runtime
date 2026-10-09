@@ -29,22 +29,10 @@ def _measure(torch, function):
     return row
 
 
-def _compare_outputs(torch, candidate, reference):
-    finite = torch.ones((), device=candidate.device, dtype=torch.bool)
-    maximum = torch.zeros((), device=candidate.device, dtype=torch.float32)
-    different = torch.zeros((), device=candidate.device, dtype=torch.int64)
-    for start in range(0, candidate.shape[0], 128):
-        actual = candidate[start : start + 128]
-        expected = reference[start : start + 128]
-        finite.logical_and_(torch.isfinite(actual).all())
-        different.add_((actual != expected).sum())
-        maximum = torch.maximum(maximum, (actual.float() - expected.float()).abs().max())
-    return {
-        "bytes_equal": bool(torch.equal(candidate.view(torch.uint8), reference.view(torch.uint8))),
-        "finite": bool(finite.item()),
-        "different_elements": int(different.item()),
-        "max_abs": float(maximum.item()),
-    }
+def _compare_outputs(torch, candidate, reference, tile_rows=None):
+    from .error_metrics import compare
+
+    return compare(torch, candidate, reference, tile_rows)
 
 
 def _case(torch, leaves, gemm, generator, name, rows, n, k, repeats):
@@ -75,7 +63,7 @@ def _case(torch, leaves, gemm, generator, name, rows, n, k, repeats):
             order.append(label)
             timings[label].append(_measure(torch, functions[label]))
     original, changed = native(), candidate()
-    numerical = _compare_outputs(torch, changed, original)
+    numerical = _compare_outputs(torch, changed, original, gemm.tile_rows(n))
     return {
         "name": name,
         "shape_mnk": [rows, n, k],

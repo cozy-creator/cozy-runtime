@@ -29,14 +29,10 @@ def _bytes_equal(torch, actual, expected):
     return bool(torch.equal(actual.view(torch.uint8), expected.view(torch.uint8)))
 
 
-def _difference(torch, actual, expected):
-    delta = actual.float() - expected.float()
-    return {
-        "bytes_equal": _bytes_equal(torch, actual, expected),
-        "finite": bool(torch.isfinite(actual).all().item()),
-        "max_abs": float(delta.abs().max().item()),
-        "different_elements": int((actual != expected).sum().item()),
-    }
+def _difference(torch, actual, expected, tile_rows=None):
+    from .error_metrics import compare
+
+    return compare(torch, actual, expected, tile_rows)
 
 
 def _timed(torch, function, warmup, repeats):
@@ -187,7 +183,7 @@ def _case(torch, leaves, gemm, generator, name, shape, warmup, repeats, trace_pa
     candidate_time, candidate = _timed(torch, candidate_call, warmup, repeats)
     with _observe_tiles(gemm) as tiles:
         repeated = candidate_call()
-    exact = _difference(torch, candidate, native)
+    exact = _difference(torch, candidate, native, gemm.tile_rows(n))
     repeat_exact = _bytes_equal(torch, repeated, candidate)
     leaf = _leaf_check(torch, leaves, gemm, x, aq, a_scale, bq, b_scale, native)
     trace = _trace(torch, native_call, candidate_call, trace_path) if name == "qkv" else None
