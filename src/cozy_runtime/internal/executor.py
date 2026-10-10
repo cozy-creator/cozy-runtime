@@ -1018,7 +1018,7 @@ class Executor:
         weights = self.host.weights
         gave = self._group_room(need, [m for _, m, _ in weights.open] if weights else ())
         transport = self.host.transport
-        recalibrate = transport is not None and transport.links.all_direct
+        recalibrate = transport is not None and transport.links.copy_engines
         self.host.pg = self.group.form(
             self.torch, _SEALED, room=need, formed=self.host._calibrated if recalibrate else None
         )
@@ -1574,7 +1574,7 @@ class Executor:
                             _SEALED,
                             cells,
                             nccl=self.transport.nccl,
-                            formed=self._calibrated if measured.all_direct else None,
+                            formed=self._calibrated if measured.copy_engines else None,
                         )
                     finally:
                         for fd in cells:
