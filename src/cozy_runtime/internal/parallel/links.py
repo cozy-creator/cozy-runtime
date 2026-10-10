@@ -78,12 +78,19 @@ class Links:
         return bool(self.pairs) and all(pair.direct for pair in self.pairs)
 
     @property
+    def all_peers(self) -> bool:
+        """Every pair reaches the other's memory and its direct copy lands the right bytes."""
+        return bool(self.pairs) and all(pair.peer and pair.verified for pair in self.pairs)
+
+    @property
     def peer_route(self) -> bool:
         return self.all_direct and bool(self.processes.get("nccl_peer"))
 
     @property
     def copy_engines(self) -> bool:
-        return self.peer_route and bool(self.processes.get("copy_engines"))
+        """Copy engines may carry the exchange where every pair copies correctly and a group of
+        processes mapped each other's memory; the calibration then times them against NCCL."""
+        return self.all_peers and bool(self.processes.get("copy_engines"))
 
     def nccl(self) -> dict[str, str]:
         """NCCL's peer memory where every pair measured direct-and-faster and a group of
@@ -95,6 +102,14 @@ class Links:
         if self.reason:
             return self.reason
         slow = [pair for pair in self.pairs if not pair.direct]
+        if slow and self.copy_engines:
+            pair = slow[0]
+            return (
+                f"GPU {(number or {}).get(pair.src, pair.src)} to GPU "
+                f"{(number or {}).get(pair.dst, pair.dst)} copies directly at "
+                f"{pair.direct_gbps:.1f} GB/s, through host memory at {pair.staged_gbps:.1f}: "
+                "NCCL keeps peer memory on NVLink; copy engines are timed against it"
+            )
         if not slow:
             if not self.peer_route:
                 return f"peer memory between processes failed: {self.processes.get('detail', '')}"
@@ -323,13 +338,13 @@ def _probe(devices: str, count: int) -> Links:
     return Links(tuple(pairs), processes)
 
 
-def _group(torch: Any, rank: int, world: int, port: int) -> dict[str, Any]:
+def _group(torch: Any, rank: int, world: int, port: int, level: str) -> dict[str, Any]:
     """One process of the probe's own group: NCCL over peer memory, then the copy engines
     through symmetric memory, each checked against the other's bytes."""
     from torch.distributed import _symmetric_memory as symm
 
     dist = torch.distributed
-    group.route({"NCCL_P2P_LEVEL": "SYS"})
+    group.route({"NCCL_P2P_LEVEL": level})
     device = torch.device("cuda", rank)
     torch.cuda.set_device(device)
     store = dist.TCPStore("127.0.0.1", port, world, is_master=rank == 0)
@@ -400,7 +415,7 @@ def main(argv: Sequence[str]) -> int:
 
     if argv[0] == "--follower":
         rank, world, port = (int(value) for value in argv[1:4])
-        _group(torch, rank, world, port)
+        _group(torch, rank, world, port, argv[4])
         return 0
     count = int(argv[0])
     pairs: list[Pair] = []
@@ -410,21 +425,23 @@ def main(argv: Sequence[str]) -> int:
         print(json.dumps(asdict(pair)), flush=True)
 
     _measure(torch, count, emit)
-    if all(pair.direct for pair in pairs):
+    if pairs and all(pair.peer and pair.verified for pair in pairs):
+        # NCCL forms at the level the group would take; the copy engines are tried either way.
+        level = "SYS" if all(pair.direct for pair in pairs) else "NVL"
         # Followers launch as an executor's do (its trampoline, its seal), as children.
         port = _free_port()
         seam, unused = os.pipe()
         followers = [
             spawn.spawn_follower(
                 python=sys.executable,
-                module_argv=[*_FOLLOWER, str(rank), str(count), str(port)],
+                module_argv=[*_FOLLOWER, str(rank), str(count), str(port), level],
                 env=os.environ,
                 inherit_fd=unused,
             )
             for rank in range(1, count)
         ]
         os.close(seam)
-        print(json.dumps({"group": _group(torch, 0, count, port)}), flush=True)
+        print(json.dumps({"group": _group(torch, 0, count, port, level)}), flush=True)
         for follower in followers:
             follower.wait()
     return 0

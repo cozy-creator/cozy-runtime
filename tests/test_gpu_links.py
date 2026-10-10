@@ -21,18 +21,30 @@ def test_direct_pairs_and_a_formed_process_group_take_peer_memory_and_copy_engin
     assert Links.read(links.document()) == links
 
 
-def test_one_pair_slower_direct_than_staged_keeps_nvlink_only() -> None:
+def test_one_pair_slower_direct_than_staged_keeps_nccl_on_nvlink() -> None:
     # ruijerd (4x RTX A5000): GPU 2 to GPU 3 copied directly at 0.68 GB/s, staged at 7.7
     slow = tuple(
         Pair(p.src, p.dst, True, 0.68 if (p.src, p.dst) == (2, 3) else 10.5, 7.7, True) for p in NVL
     )
-    links = Links(slow, FORMED)
-    assert links.nccl() == {"NCCL_P2P_LEVEL": "NVL"} and not links.copy_engines
-    record = Transport(4, [4, 5, 6, 7], "nccl", links.nccl(), links).document()
+    unformed = Links(slow, {})
+    assert unformed.nccl() == {"NCCL_P2P_LEVEL": "NVL"} and not unformed.copy_engines
+    record = Transport(4, [4, 5, 6, 7], "nccl", unformed.nccl(), unformed).document()
     assert record["reason"] == (
         "GPU 6 to GPU 7 copies directly at 0.7 GB/s, through host memory at 7.7 GB/s"
     )
+    # Peer copies all land correctly and a process group mapped them: NCCL keeps NVLink-only
+    # peer memory, and the copy engines are still timed against it (masayuki, 4x H100 NVL).
+    formed = Links(slow, FORMED)
+    assert formed.nccl() == {"NCCL_P2P_LEVEL": "NVL"} and formed.copy_engines
+    assert formed.why().endswith("copy engines are timed against it")
     assert [p["route"] for p in record["pairs"] if (p["a"], p["b"]) == (6, 7)] == ["host"]
+
+
+def test_a_corrupting_peer_copy_keeps_nccl_and_copy_engines_off() -> None:
+    # garrod (2x RTX A5000): GPU 1 to GPU 0 direct copies landed different bytes
+    broken = (Pair(0, 1, True, 0.8, 13.1, True), Pair(1, 0, True, 0.0, 13.0, False, "landed"))
+    links = Links(broken, FORMED)
+    assert links.nccl() == {"NCCL_P2P_LEVEL": "NVL"} and not links.copy_engines
 
 
 def test_a_process_group_that_failed_peer_memory_keeps_nvlink_only_and_says_why() -> None:
