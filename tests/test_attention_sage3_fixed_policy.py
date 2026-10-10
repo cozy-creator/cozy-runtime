@@ -119,3 +119,50 @@ def test_source_does_not_modify_h3_schedule_or_default_table() -> None:
                 if default is not None and arg.arg == "sol_dense_steps"
             }
             assert defaults["sol_dense_steps"] == 4
+
+
+def test_full_packed_virtual_offsets_are_widened_before_stride_products() -> None:
+    from pathlib import Path
+
+    import numpy as np
+
+    from cozy_runtime.internal import attention_sage3_fixed as candidate
+
+    tree = ast.parse(Path(candidate.__file__).read_text())
+    functions = {node.name: node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)}
+    for name in ("partial_mean", "center_and_correct"):
+        assignments = {
+            target.id: node.value
+            for node in functions[name].body
+            if isinstance(node, ast.Assign)
+            for target in node.targets
+            if isinstance(target, ast.Name)
+        }
+        for index in ("token", "head"):
+            expression = ast.unparse(assignments[index])
+            assert expression.endswith(".to(tl.int64)"), (name, index, expression)
+    # Evaluate the actual source address expression with virtual full-sequence
+    # indices; the test allocates 128 integer outputs, not a giant QKV buffer.
+    center = functions["center_and_correct"]
+    address = next(
+        node.value
+        for node in center.body
+        if isinstance(node, ast.Assign)
+        and isinstance(node.targets[0], ast.Name)
+        and node.targets[0].id == "source_v"
+    )
+    code = compile(ast.Expression(address), "actual-center-address", "eval")
+    count, heads, dim = 109225, 56, 128
+    context = {
+        "token": np.array([count - 1], dtype=np.int64),
+        "head": np.array(heads - 1, dtype=np.int64),
+        "channel": np.arange(dim, dtype=np.int64),
+        "vt": 3 * heads * dim,
+        "vh": dim,
+    }
+    relative = eval(code, {"__builtins__": {}}, context)
+    absolute = relative + 2 * heads * dim  # V starts after packed Q and K.
+    assert absolute.dtype == np.int64
+    assert int(absolute.max()) == count * 3 * heads * dim - 1
+    assert int(absolute.max()) > 2**31 - 1
+    assert not np.array_equal(absolute.astype(np.int32).astype(np.int64), absolute)
