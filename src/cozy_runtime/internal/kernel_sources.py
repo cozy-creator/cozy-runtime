@@ -375,17 +375,37 @@ def job(name: str, sm: int, root: Path | None = None) -> kernel_compile.Job:
                 json.dumps({k: v for k, v in asdict(recipe).items() if k not in _WIDTH_ONLY})
             ),
         }
+    # This pinned SageAttention setup consumes an explicit target before consulting
+    # torch.cuda. The target comes from device inventory and participates in the key;
+    # neither an ambient architecture override nor a visible device selects the build.
+    target_env = (
+        {"TORCH_CUDA_ARCH_LIST": f"{sm // 10}.{sm % 10}", "CUDA_VISIBLE_DEVICES": ""}
+        if name == "sageattention"
+        else {}
+    )
+    if target_env:
+        inputs["target_environment"] = target_env
     inputs["sources"] = {n: s.sha256 for n, s in sorted(wanted.items())}
     # 2: every tree carries an installed distribution's dist-info (`kernel_site`).
     inputs["layout"] = 2
     spec = {
         "recipe": name,
+        "target_environment": target_env,
         "sources": {n: asdict(s) for n, s in wanted.items()},
         "build_deps": {
             n: asdict(sources[n]) for n in _BUILD_DEPS if n in sources and recipe.kind == "setup"
         },
     }
-    return kernel_compile.Job(recipe.kind, kernel_cache.Key.of(name, inputs), spec)
+    return kernel_compile.Job(
+        recipe.kind,
+        kernel_cache.Key.of(name, inputs),
+        spec,
+        # cpp_extension probes is_available while importing. With no visible
+        # devices, NVML-mode returns zero without initializing the CUDA driver.
+        env={"CUDA_VISIBLE_DEVICES": "", "PYTORCH_NVML_BASED_CUDA_CHECK": "1"}
+        if target_env
+        else {},
+    )
 
 
 def _python() -> str:
@@ -502,6 +522,7 @@ def build_setup(
                 "PYTHONPATH": os.pathsep.join([str(deps), *sys.path]),
                 "PYTHONNOUSERSITE": "1",
                 **recipe.env,
+                **spec.get("target_environment", {}),
             }
         )
         site = staging / kernel_cache.SITE
