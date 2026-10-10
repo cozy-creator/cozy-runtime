@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from functools import partial
+from typing import Any
 
 from .metrics import accumulate, compared, finish, new_metric, operand_layout
 
@@ -12,12 +14,12 @@ DEGREES = (2, 4, 7, 8)
 HEADS, DIM, PREFIX = 56, 128, 257
 
 
-def fresh(torch, values, start=0, stop=HEADS):
+def fresh(torch: Any, values: Any, start: int = 0, stop: int = HEADS) -> list[Any]:
     return [x[:, :, start:stop].clone(memory_format=torch.contiguous_format) for x in values]
 
 
 @contextmanager
-def sparse_scope(sol, tokens, prefix, step, dense):
+def sparse_scope(sol: Any, tokens: int, prefix: int, step: int, dense: Any) -> Iterator[None]:
     from cozy_runtime.author._attention_scope import AttentionLayout, attention_scope
 
     previous, identity = sol._DENSE, sol._DENSE_IDENTITY
@@ -31,11 +33,18 @@ def sparse_scope(sol, tokens, prefix, step, dense):
         sol._SITE.reset(site)
 
 
-def canonical(value):
+def canonical(value: Any) -> Any:
     return value[0].transpose(0, 1).contiguous()
 
 
-def _public_sparse(sol, upstream, values, prefix, step):
+def _public_sparse(
+    sol: Any,
+    upstream: Any,
+    values: Any,
+    prefix: int,
+    step: int,
+    observations: list[dict[str, Any]] | None = None,
+) -> Any:
     with (
         sparse_scope(sol, values[0].shape[1], prefix, step, upstream.SAGE.forward),
         sol.observing() as counts,
@@ -44,10 +53,28 @@ def _public_sparse(sol, upstream, values, prefix, step):
     expected = {"sparse": 1, "dense_step": 0, "dense_path": 0, "dense_prefix": 1}
     if counts != expected or sol.backend(values[0].device) != "cute_sm90":
         raise RuntimeError(f"BF16 CuTe sparse did not serve the requested call: {counts}")
+    if observations is not None:
+        observations.append(
+            {
+                "step": step,
+                "heads": values[0].shape[2],
+                "counts": dict(counts),
+                "implementation": sol.backend(values[0].device),
+                "dense_prefix": upstream.SAGE.impl(*values, {}),
+            }
+        )
     return output
 
 
-def capture(torch, check, values, prefix, step, loaded):
+def capture(
+    torch: Any,
+    check: str,
+    values: Any,
+    prefix: int,
+    step: int,
+    loaded: Any,
+    observations: list[dict[str, Any]],
+) -> dict[str, Any]:
     from cozy_runtime.internal import attention_sol as sol
     from cozy_runtime.internal import attention_upstream as upstream
 
@@ -55,11 +82,11 @@ def capture(torch, check, values, prefix, step, loaded):
         return {"output": canonical(upstream.KITCHEN.forward(*values, scale=DIM**-0.5))}
     # Raw sparse separates CuTe head geometry from the selected Sage2 protected prefix.
     raw = sol._native(*values, DIM**-0.5, prefix, loaded)
-    combined = _public_sparse(sol, upstream, values, prefix, step)
+    combined = _public_sparse(sol, upstream, values, prefix, step, observations)
     return {"raw_sparse": canonical(raw), "output": canonical(combined)}
 
 
-def timed(torch, call):
+def timed(torch: Any, call: Callable[[], Any]) -> dict[str, float]:
     torch.cuda.synchronize()
     start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
     wall = time.perf_counter()
@@ -75,7 +102,7 @@ def timed(torch, call):
     return measured
 
 
-def controls(torch, check, tokens, seed):
+def controls(torch: Any, check: str, tokens: int, seed: int) -> dict[str, Any]:
     from cozy_runtime.internal import attention_sol as sol
     from cozy_runtime.internal import attention_upstream as upstream
 
@@ -86,7 +113,7 @@ def controls(torch, check, tokens, seed):
         raise RuntimeError(f"Requires {required} free/reusable bytes; no shape reduction")
     prefix = min(PREFIX, tokens)
     loaded = None
-    compile_rows = []
+    compile_rows: list[dict[str, Any]] = []
     if check == "bf16_sparse":
         with sol.observing(kernels=compile_rows):
             sol.specialize(tokens, torch.device("cuda"), 3)
@@ -97,6 +124,7 @@ def controls(torch, check, tokens, seed):
             )
     torch.cuda.reset_peak_memory_stats()
     steps = []
+    observations: list[dict[str, Any]] = []
     for step in (4, 5) if check == "bf16_sparse" else (4,):
         case_seed = seed + step - 4
         gen = torch.Generator(device="cuda").manual_seed(case_seed)
@@ -104,8 +132,8 @@ def controls(torch, check, tokens, seed):
             torch.randn(1, tokens, HEADS, DIM, dtype=torch.bfloat16, device="cuda", generator=gen)
             for _ in range(3)
         ]
-        full = capture(torch, check, fresh(torch, values), prefix, step, loaded)
-        again = capture(torch, check, fresh(torch, values), prefix, step, loaded)
+        full = capture(torch, check, fresh(torch, values), prefix, step, loaded, observations)
+        again = capture(torch, check, fresh(torch, values), prefix, step, loaded, observations)
         full_repeat = {name: compared(torch, again[name], value) for name, value in full.items()}
         del again
         parts = []
@@ -116,9 +144,15 @@ def controls(torch, check, tokens, seed):
             protected, suffix = new_metric(), new_metric()
             for start in range(0, HEADS, width):
                 operands = fresh(torch, values, start, start + width)
-                actual = capture(torch, check, operands, prefix, step, loaded)
+                actual = capture(torch, check, operands, prefix, step, loaded, observations)
                 again = capture(
-                    torch, check, fresh(torch, values, start, start + width), prefix, step, loaded
+                    torch,
+                    check,
+                    fresh(torch, values, start, start + width),
+                    prefix,
+                    step,
+                    loaded,
+                    observations,
                 )
                 for name, value in actual.items():
                     accumulate(torch, metrics[name], value, full[name][start : start + width])
@@ -148,20 +182,14 @@ def controls(torch, check, tokens, seed):
                 }
             )
         del full
-        gen = torch.Generator(device="cuda").manual_seed(case_seed)
-        custody = []
-        for value in values:
-            again = torch.randn(value.shape, dtype=value.dtype, device=value.device, generator=gen)
-            custody.append(compared(torch, canonical(value), canonical(again)))
-            del again
-        if any(not row["bytes_equal"] for row in custody):
-            raise RuntimeError("Kernel changed original input bytes")
         # Time actual public full/half-head callables, never instrumentation capture/copies.
         half = fresh(torch, values, 0, 28)
         if check == "bf16_sparse":
             calls = {
-                "full56": partial(_public_sparse, sol, upstream, values, prefix, step),
-                "local28": partial(_public_sparse, sol, upstream, half, prefix, step),
+                "full56": partial(
+                    _public_sparse, sol, upstream, values, prefix, step, observations
+                ),
+                "local28": partial(_public_sparse, sol, upstream, half, prefix, step, observations),
             }
         else:
             calls = {
@@ -177,6 +205,14 @@ def controls(torch, check, tokens, seed):
                 timing.append(
                     {"geometry": name, "repetition": repetition, **timed(torch, calls[name])}
                 )
+        gen = torch.Generator(device="cuda").manual_seed(case_seed)
+        custody = []
+        for value in values:
+            again = torch.randn(value.shape, dtype=value.dtype, device=value.device, generator=gen)
+            custody.append(compared(torch, canonical(value), canonical(again)))
+            del again
+        if any(not row["bytes_equal"] for row in custody):
+            raise RuntimeError("Kernel changed original input bytes")
         steps.append(
             {
                 "step": step,
@@ -197,6 +233,7 @@ def controls(torch, check, tokens, seed):
         "protected_prefix": prefix,
         "steps": steps,
         "compile_rows": compile_rows,
+        "public_sparse_calls": observations,
         "implementation": sol.backend(torch.device("cuda"))
         if check == "bf16_sparse"
         else "comfy_kitchen.int8_attention",
