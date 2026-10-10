@@ -39,7 +39,9 @@ CHUNK = 4096
 
 @dataclass
 class RequestState:
-    statistics: dict[tuple[str, str], tuple[int, tuple[int, ...], Any, Any]] = field(
+    # Current outputs plus the original input statistics: a block can replay this step
+    # after a later allocation fails, outside the producer's own call.
+    statistics: dict[tuple[str, str], tuple[int, tuple[int, ...], Any, Any, Any, Any]] = field(
         default_factory=dict
     )
     # One rotary presentation is shared by all blocks of the current step.
@@ -162,8 +164,15 @@ def rope_presentation(rotary: tuple[Any, Any], tokens: int, state: RequestState)
 def previous_statistics(
     state: RequestState, key: tuple[str, str], step: int, geometry: tuple[int, ...], reuse: bool
 ) -> tuple[Any, Any]:
-    prior = state.statistics.pop(key, None)
-    if reuse and prior is not None and prior[:2] == (step - 1, geometry):
+    if not reuse:
+        state.statistics.pop(key, None)
+        return None, None
+    prior = state.statistics.get(key)
+    if prior is None or prior[1] != geometry:
+        return None, None
+    if prior[0] == step:
+        return prior[4], prior[5]
+    if prior[0] == step - 1:
         return prior[2], prior[3]
     return None, None
 
@@ -260,7 +269,7 @@ class Processor:
             token_aug=0,
         )
         if name in REUSE:
-            state.statistics[key] = (layout.step, geometry, mean, scale)
+            state.statistics[key] = (layout.step, geometry, mean, scale, prior_mean, prior_scale)
         statistics = "previous-step" if reuse else "current-call"
         shared_detail = ""
         if name in SHARED_QKV:

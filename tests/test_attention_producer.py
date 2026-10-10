@@ -180,10 +180,10 @@ def test_statistics_reuse_requires_the_same_site_geometry_and_adjacent_step() ->
         (6, geometry, True, (None, None)),
         (5, (129, 56, 18), True, (None, None)),
     ]:
-        state.statistics[key] = (4, geometry, mean, scale)
+        state.statistics[key] = (4, geometry, mean, scale, None, None)
         assert producer.previous_statistics(state, key, step, shape, enabled) == expected
-        assert key not in state.statistics
-    state.statistics[key] = (4, geometry, mean, scale)
+        assert (key in state.statistics) is enabled
+    state.statistics[key] = (4, geometry, mean, scale, None, None)
     assert producer.previous_statistics(state, ("dit", "block.3"), 5, geometry, True) == (
         None,
         None,
@@ -206,3 +206,81 @@ def test_cleanup_drops_only_the_owned_upstream_rotary_cache(
     with producer.request_scope() as state:
         state.rope = owned, owned, owned
     assert ("ours",) not in cache and ("theirs",) in cache
+
+
+@pytest.mark.parametrize("failure", ["kernel", "projection", "later_block"])
+def test_same_step_replay_preserves_original_statistics_inputs(
+    monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    """A block's tensor/RNG rewind does not rewind the producer's Python dictionary."""
+    key, geometry = ("dit", "transformer_blocks.2"), (129, 56, 17)
+    previous_mean, previous_scale = object(), object()
+    current_mean, current_scale = object(), object()
+    observed: list[tuple[Any, Any]] = []
+    projections = 0
+
+    def kitchen_call(*args: Any, **kwargs: Any) -> Any:
+        observed.append((kwargs["kmean"], kwargs["vscale"]))
+        if failure == "kernel" and len(observed) == 1:
+            raise RuntimeError("simulated allocation failure")
+        return torch.zeros(1, 129, 56, 128), current_mean, current_scale
+
+    def project(value: Any) -> Any:
+        nonlocal projections
+        projections += 1
+        if failure == "projection" and projections == 1:
+            raise RuntimeError("simulated allocation failure")
+        return value
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (12, 0))
+    monkeypatch.setattr(
+        producer, "import_module", lambda _: SimpleNamespace(sol_attn_chunked=kitchen_call)
+    )
+    monkeypatch.setattr(producer, "rope_presentation", lambda *args: object())
+    original = SimpleNamespace(
+        _attention_backend="_cozy_kitchen_sol_producer_fast_shared_qkv", _parallel_config=None
+    )
+    processor = producer.Processor(original)
+    norm = SimpleNamespace(eps=1e-6, weight=torch.ones(128))
+    attn = SimpleNamespace(heads=56, norm_q=norm, norm_k=norm, to_out=[project, lambda x: x])
+    hidden = SimpleNamespace(shape=(1, 129, 5376), device=SimpleNamespace(type="cuda"))
+    token = producer.attention_sol._SITE.set(producer.attention_sol.Site(*key))
+    try:
+        with producer.request_scope() as state:
+            state.statistics[key] = (4, geometry, previous_mean, previous_scale, None, None)
+            layout = AttentionLayout(
+                live_tokens=129, protected_prefix=17, step=5, dense_until_step=4
+            )
+            with attention_scope(layout):
+                with pytest.raises(RuntimeError, match="simulated allocation failure"):
+                    processor(attn, hidden, rotary_emb=object())
+                    if failure == "later_block":
+                        raise RuntimeError("simulated allocation failure")
+                processor(attn, hidden, rotary_emb=object())
+            assert observed == [(previous_mean, previous_scale)] * 2
+            next_layout = AttentionLayout(
+                live_tokens=129, protected_prefix=17, step=6, dense_until_step=4
+            )
+            with attention_scope(next_layout):
+                processor(attn, hidden, rotary_emb=object())
+            assert observed[-1] == (current_mean, current_scale)
+    finally:
+        producer.attention_sol._SITE.reset(token)
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_request_cleanup_releases_current_and_replay_statistics(raises: bool) -> None:
+    import weakref
+
+    references = []
+    try:
+        with producer.request_scope() as state:
+            tensors = [torch.zeros(1) for _ in range(4)]
+            references = [weakref.ref(tensor) for tensor in tensors]
+            state.statistics[("dit", "block.2")] = (5, (129, 56, 17), *tensors)
+            del tensors
+            if raises:
+                raise RuntimeError("request failed")
+    except RuntimeError:
+        assert raises
+    assert all(reference() is None for reference in references)
