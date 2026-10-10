@@ -164,6 +164,8 @@ def rope_presentation(rotary: tuple[Any, Any], tokens: int, state: RequestState)
 def previous_statistics(
     state: RequestState, key: tuple[str, str], step: int, geometry: tuple[int, ...], reuse: bool
 ) -> tuple[Any, Any]:
+    # H3 is guidance-distilled: one forward per site/evaluation, with no CFG branch.
+    # Re-entering that same evaluation must retain its original quantization inputs.
     if not reuse:
         state.statistics.pop(key, None)
         return None, None

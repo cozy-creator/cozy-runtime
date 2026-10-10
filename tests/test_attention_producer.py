@@ -284,3 +284,46 @@ def test_request_cleanup_releases_current_and_replay_statistics(raises: bool) ->
     except RuntimeError:
         assert raises
     assert all(reference() is None for reference in references)
+
+
+@pytest.mark.parametrize("reference", [False, True])
+@pytest.mark.parametrize("steps", [8, 30])
+def test_h3_loop_runs_one_model_forward_per_evaluation(reference: bool, steps: int) -> None:
+    """The supported H3 loop has no separate conditional/unconditional CFG calls."""
+    from diffusers.modular_pipelines.minimax_h3.denoise import (
+        MiniMaxH3LoopDenoiser,
+        MiniMaxH3Ref2VALoopDenoiser,
+    )
+
+    seen = []
+
+    class Counter(torch.nn.Module):
+        def forward(
+            self,
+            hidden_states: Any,
+            audio_hidden_states: Any,
+            encoder_hidden_states: Any,
+            timestep: Any,
+            timestep_indices: Any,
+            attention_kwargs: Any,
+            return_dict: bool,
+            token_tags: Any,
+        ) -> Any:
+            seen.append(int(timestep.item()))
+            assert hidden_states.shape[0] == audio_hidden_states.shape[0] == 1
+            return hidden_states, audio_hidden_states
+
+    model = Counter()
+    components = SimpleNamespace(transformer=model, transformer_ref=model)
+    state = SimpleNamespace(
+        latents=torch.zeros(3, 2),
+        audio_latents=torch.zeros(4, 2),
+        prompt_embeds=torch.zeros(1, 5, 2),
+        row_timestep_plan=[(torch.tensor(i), torch.zeros(12)) for i in range(steps)],
+        denoiser_input_fields={"token_tags": torch.zeros(12)},
+        attention_kwargs=None,
+    )
+    block = MiniMaxH3Ref2VALoopDenoiser() if reference else MiniMaxH3LoopDenoiser()
+    for index in range(steps):
+        block(components, state, i=index, t=torch.tensor(index))
+    assert seen == list(range(steps))
