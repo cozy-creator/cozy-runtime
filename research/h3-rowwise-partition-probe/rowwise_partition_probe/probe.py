@@ -33,23 +33,18 @@ def partitions(rows: int, degree: int) -> list[tuple[int, int]]:
 
 
 def new_metric() -> dict[str, Any]:
-    return {
-        "elements": 0,
-        "different_elements": 0,
-        "first_different_element": None,
-        "nonfinite_elements": 0,
-        "max_absolute_difference": 0.0,
-        "absolute_error_sum": 0.0,
-        "squared_error_sum": 0.0,
-        "reference_squared_sum": 0.0,
-    }
+    return {"elements": 0, "totals": None, "maximum": None, "first": None}
 
 
 def accumulate(torch: Any, result: dict[str, Any], actual: Any, reference: Any) -> None:
     if actual.shape != reference.shape or actual.dtype != reference.dtype:
         raise ValueError("Comparison requires identical geometry and dtype")
+    if result["totals"] is None:
+        result["totals"] = torch.zeros(5, dtype=torch.float64, device=actual.device)
+        result["maximum"] = torch.zeros((), dtype=torch.float64, device=actual.device)
+        result["first"] = torch.full((), math.inf, dtype=torch.float64, device=actual.device)
     columns = math.prod(actual.shape[1:])
-    block_rows = max(1, min(512, (1 << 20) // columns))
+    block_rows = max(1, min(512, (8 << 20) // columns))
     for start in range(0, actual.shape[0], block_rows):
         a = actual[start : start + block_rows].contiguous()
         b = reference[start : start + block_rows].contiguous()
@@ -58,35 +53,50 @@ def accumulate(torch: Any, result: dict[str, Any], actual: Any, reference: Any) 
             .reshape(a.numel(), a.element_size())
             .any(dim=1)
         )
-        count = int(different.sum().item())
-        if count and result["first_different_element"] is None:
-            first = int(different.to(torch.uint8).argmax().item())
-            result["first_different_element"] = result["elements"] + first
+        count = different.sum()
+        first = different.to(torch.uint8).argmax() + result["elements"]
+        result["first"] = torch.minimum(
+            result["first"], torch.where(count > 0, first.to(torch.float64), math.inf)
+        )
         finite = torch.isfinite(a.float()) & torch.isfinite(b.float())
-        nonfinite = int((~finite).sum().item())
         delta = torch.where(finite, a.float() - b.float(), 0.0)
         ref = torch.where(finite, b.float(), 0.0)
-        result["elements"] += a.numel()
-        result["different_elements"] += count
-        result["nonfinite_elements"] += nonfinite
-        result["max_absolute_difference"] = max(
-            result["max_absolute_difference"], float(delta.abs().max().item())
+        values = (
+            count,
+            (~finite).sum(),
+            delta.abs().sum(),
+            delta.square().sum(),
+            ref.square().sum(),
         )
-        result["absolute_error_sum"] += float(delta.abs().sum().item())
-        result["squared_error_sum"] += float(delta.square().sum().item())
-        result["reference_squared_sum"] += float(ref.square().sum().item())
+        result["totals"].add_(torch.stack([value.to(torch.float64) for value in values]))
+        result["maximum"] = torch.maximum(result["maximum"], delta.abs().max().to(torch.float64))
+        result["elements"] += a.numel()
 
 
 def finish(result: dict[str, Any]) -> dict[str, Any]:
+    if not result["elements"]:
+        raise ValueError("No elements were compared")
+    import torch
+
+    # One bounded scalar download per completed metric, not per comparison slice.
+    values = (
+        torch.cat([result["totals"], result["maximum"].reshape(1), result["first"].reshape(1)])
+        .cpu()
+        .tolist()
+    )
+    count, nonfinite, absolute, squared, reference, maximum, first = values
     return {
-        **result,
-        "bytes_equal": result["different_elements"] == 0,
-        "mean_absolute_difference": result["absolute_error_sum"] / result["elements"],
-        "relative_l2": (
-            math.sqrt(result["squared_error_sum"] / result["reference_squared_sum"])
-            if result["reference_squared_sum"]
-            else None
-        ),
+        "elements": result["elements"],
+        "different_elements": int(count),
+        "first_different_element": int(first) if count else None,
+        "nonfinite_elements": int(nonfinite),
+        "max_absolute_difference": maximum,
+        "absolute_error_sum": absolute,
+        "squared_error_sum": squared,
+        "reference_squared_sum": reference,
+        "bytes_equal": count == 0,
+        "mean_absolute_difference": absolute / result["elements"],
+        "relative_l2": math.sqrt(squared / reference) if reference else None,
     }
 
 
@@ -94,6 +104,25 @@ def compared(torch: Any, actual: Any, reference: Any) -> dict[str, Any]:
     result = new_metric()
     accumulate(torch, result, actual, reference)
     return finish(result)
+
+
+def quantizer_route(leaves: Any) -> str:
+    cached = getattr(leaves._triton_rowwise_kernel, "_cached", "unset")
+    if cached is None:
+        return "eager fallback"
+    if isinstance(cached, str) and cached == "unset":
+        return "not resolved yet"
+    return "Triton cached"
+
+
+def operand_layout(value: Any) -> dict[str, Any]:
+    return {
+        "shape": list(value.shape),
+        "stride": list(value.stride()),
+        "storage_offset": value.storage_offset(),
+        "data_alignment_mod256": value.data_ptr() % 256,
+        "contiguous": value.is_contiguous(),
+    }
 
 
 def measured(torch: Any, function: Any, operand: Any) -> tuple[Any, float]:
@@ -108,7 +137,7 @@ def measured(torch: Any, function: Any, operand: Any) -> tuple[Any, float]:
 def case(torch: Any, leaves: Any, name: str, rows: int, seed: int) -> dict[str, Any]:
     n, k = SHAPES[name]
     # Two complete outputs coexist only for the full-shape repeat control. Comparison
-    # temporaries hold at most 2^20 values each. Include operands, allocator/library slack.
+    # temporaries hold at most 2^23 values each. Include operands, allocator/library slack.
     required = rows * n * 4 + rows * k * 3 + n * k * 4 + (3 << 30)
     free, total = torch.cuda.mem_get_info()
     reusable = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
@@ -118,6 +147,7 @@ def case(torch: Any, leaves: Any, name: str, rows: int, seed: int) -> dict[str, 
             f"device has {free + reusable}. No shape was reduced."
         )
     torch.cuda.reset_peak_memory_stats()
+    initial_quantizer_route = quantizer_route(leaves)
     generator = torch.Generator(device="cuda").manual_seed(seed)
     x = torch.randn((rows, k), generator=generator, dtype=torch.bfloat16, device="cuda")
     weight = torch.randn((n, k), generator=generator, dtype=torch.bfloat16, device="cuda")
@@ -125,6 +155,11 @@ def case(torch: Any, leaves: Any, name: str, rows: int, seed: int) -> dict[str, 
     wq, ws = leaves.quantize_activation_rowwise(torch, weight)
     del weight
     aq, scales = leaves.quantize_activation_rowwise(torch, x)
+    after_full_quantizer_route = quantizer_route(leaves)
+    full_layout = {
+        "activation_codes": operand_layout(aq),
+        "activation_scales": operand_layout(scales),
+    }
     leaf = SimpleNamespace(data=wq, scale=ws, out_dtype=torch.bfloat16)
     encoded = leaves.PreQuantized(aq, scales, tuple(x.shape))
 
@@ -144,6 +179,8 @@ def case(torch: Any, leaves: Any, name: str, rows: int, seed: int) -> dict[str, 
             new_metric() for _ in range(5)
         )
         durations = {"fixed_codes_gemm_ms": 0.0, "complete_leaf_ms": 0.0}
+        route_before = quantizer_route(leaves)
+        fixed_layouts = []
         for start, stop in partitions(rows, degree):
             chunk = x[start:stop]
             cq, cs = leaves.quantize_activation_rowwise(torch, chunk)
@@ -151,7 +188,14 @@ def case(torch: Any, leaves: Any, name: str, rows: int, seed: int) -> dict[str, 
             accumulate(torch, quant_scales, cs, scales[start:stop])
             # First keep the exact full-call quantized operands, so any difference is
             # after quantization; then run the ordinary leaf on the original BF16 rows.
-            fixed = leaves.PreQuantized(aq[start:stop], scales[start:stop], tuple(chunk.shape))
+            # Fresh per-rank operands have aligned allocations, not an offset view into
+            # the full tensor. Clones preserve exact codes/scales; copies are untimed.
+            fixed_payload = aq[start:stop].clone()
+            fixed_scale = scales[start:stop].clone()
+            fixed_layouts.append(
+                {"payload": operand_layout(fixed_payload), "scale": operand_layout(fixed_scale)}
+            )
+            fixed = leaves.PreQuantized(fixed_payload, fixed_scale, tuple(chunk.shape))
             fixed_out, ms = measured(torch, forward, fixed)
             durations["fixed_codes_gemm_ms"] += ms
             accumulate(torch, fixed_codes, fixed_out, reference[start:stop])
@@ -161,10 +205,13 @@ def case(torch: Any, leaves: Any, name: str, rows: int, seed: int) -> dict[str, 
             actual, ms = measured(torch, forward, chunk)
             durations["complete_leaf_ms"] += ms
             accumulate(torch, complete, actual, reference[start:stop])
-            del actual, cq, cs
+            del actual, cq, cs, fixed, fixed_payload, fixed_scale
         results.append(
             {
                 "degree_simulated_on_one_gpu": degree,
+                "quantizer_route_before": route_before,
+                "quantizer_route_after": quantizer_route(leaves),
+                "fresh_fixed_operand_layouts": fixed_layouts,
                 "row_splits": [b - a for a, b in partitions(rows, degree)],
                 "activation_codes": finish(quant_codes),
                 "activation_scales": finish(quant_scales),
@@ -176,6 +223,10 @@ def case(torch: Any, leaves: Any, name: str, rows: int, seed: int) -> dict[str, 
         )
     return {
         "shape_mnk": [rows, n, k],
+        "quantizer_route_initial": initial_quantizer_route,
+        "quantizer_route_after_full_quantization": after_full_quantizer_route,
+        "quantizer_route_final": quantizer_route(leaves),
+        "full_operand_layout": full_layout,
         "seed": seed,
         "estimated_required_headroom_bytes": required,
         "device_total_bytes": total,
@@ -232,7 +283,10 @@ def run(selected: str, size: str, seed: int) -> dict[str, Any]:
             "The encoded GEMM core is isolated; module bias, LoRA hooks and paging are excluded.",
             "Actual installed Runtime quantization and RowwiseNativeLeaf._forward are called.",
             "Fixed-code comparisons separate GEMM shape dependence from activation quantization.",
-            "CPU-readable scalar metrics use bounded float32 reductions; byte equality is exact.",
+            "Metrics use bounded float32 reductions accumulated on-device; "
+            "one scalar batch is downloaded per final metric. Byte equality is exact.",
+            "Fixed-code chunks are copied to fresh aligned allocations; copies are untimed.",
+            "Quantizer cached/fallback state is recorded; a route change is not an M-only effect.",
             "CUDA event timings are diagnostic and exclude comparisons; "
             "not a performance benchmark.",
             "No TF32, precision, deterministic-algorithm, kernel "

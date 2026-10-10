@@ -59,3 +59,27 @@ def test_same_codes_and_nonfinite_accounting_are_explicit():
     result = probe.compared(torch, nonfinite.clone(), nonfinite)
     assert result["bytes_equal"]
     assert result["nonfinite_elements"] == 1
+
+
+def test_metric_offsets_across_internal_slices():
+    original = torch.zeros(1300, 3, dtype=torch.bfloat16)
+    changed = original.clone()
+    changed[1100, 2] = 1
+    result = probe.compared(torch, changed, original)
+    assert result["different_elements"] == 1
+    assert result["first_different_element"] == 3302
+    assert result["elements"] == 3900
+
+
+def test_quantizer_route_observation_does_not_compile():
+    from types import SimpleNamespace
+
+    def kernel_factory():
+        raise AssertionError("Observation must not compile or change the quantizer")
+
+    leaves = SimpleNamespace(_triton_rowwise_kernel=kernel_factory)
+    assert probe.quantizer_route(leaves) == "not resolved yet"
+    kernel_factory._cached = object()
+    assert probe.quantizer_route(leaves) == "Triton cached"
+    kernel_factory._cached = None
+    assert probe.quantizer_route(leaves) == "eager fallback"
