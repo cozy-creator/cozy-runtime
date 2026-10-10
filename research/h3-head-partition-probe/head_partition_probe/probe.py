@@ -55,7 +55,10 @@ def canonical(value: Any) -> Any:
 
 
 def metric_rows(value: Any) -> Any:
-    return value.reshape(-1, value.shape[-1])
+    # Keep a head as one row. Flattening tokens into 128-column rows would make
+    # the shared metric's row cap launch thousands of tiny reductions. At full
+    # H3 length one row is about14M elements; its temporary memory remains bounded.
+    return value
 
 
 def fresh(tensors: list[Any], start: int = 0, stop: int = HEADS) -> list[Any]:
