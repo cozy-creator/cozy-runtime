@@ -1,11 +1,29 @@
 """Tiny checkpoint admits a real Runtime group; its weights are not probe operands."""
 
+import json
 from typing import Any, ClassVar
 
 import torch
 from diffusers.models.modeling_utils import ModelMixin
 
 from cozy_runtime.author import Config, Loader, Model, sequence_parallel, uses_components
+
+
+def report_tensor(report: dict[str, Any]) -> torch.Tensor:
+    """The real Diffusers CP post-forward hook requires a tensor even for an empty plan."""
+    encoded = json.dumps(report, allow_nan=False).encode()
+    if len(encoded) > 8 << 20:
+        raise ValueError("Diagnostic report exceeds its declared output bound")
+    return torch.frombuffer(bytearray(encoded), dtype=torch.uint8).clone()
+
+
+def read_report(value: torch.Tensor) -> dict[str, Any]:
+    if value.device.type != "cpu" or value.dtype != torch.uint8 or value.ndim != 1:
+        raise ValueError("Diagnostic component must return one CPU byte tensor")
+    report = json.loads(value.numpy().tobytes())
+    if not isinstance(report, dict):
+        raise ValueError("Diagnostic report must be an object")
+    return report
 
 
 class ProbeComponent(ModelMixin):
@@ -34,7 +52,7 @@ class ProbeComponent(ModelMixin):
         if not in_gated_call():
             raise RuntimeError("This diagnostic requires the Runtime mirrored call gate")
         handle = group(self._parallel_config)
-        return run(seed, handle)
+        return report_tensor(run(seed, handle))
 
 
 class Pipeline:
@@ -56,4 +74,4 @@ class ProbeModel(Model[Pipeline]):
 
     @uses_components("dit")
     def verify(self, seed: int) -> Any:
-        return self.pipe.dit(seed)
+        return read_report(self.pipe.dit(seed))

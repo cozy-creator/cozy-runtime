@@ -1,6 +1,6 @@
 [project]
 name = "h3-sage3-collective-2gpu-probe"
-version = "0.0.1"
+version = "0.0.2"
 requires-python = ">=3.12,<3.13"
 dependencies = ["cozy-runtime==0.23.5", "tensorfs==0.6.1", "torch==2.14.0", "triton==3.8.0", "diffusers @ git+https://github.com/huggingface/diffusers@578c9b2c6636ab2424a0e56186268b83623656b2"]
 [project.entry-points."cozy.application"]

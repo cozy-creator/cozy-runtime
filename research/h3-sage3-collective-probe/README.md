@@ -29,3 +29,9 @@ mismatch details before skipping attention, measures actual peak allocation, and
 primary and sensitivity-control outcomes separately. A normal CLI --timeout=8m --await
 invocation bounds work. Root owns rentals and must authorize execution after finalCPU,
 capture/describe, checkpoint-fit, and independent review proof. No defaults change.
+
+Report transport correction: run5245 reached the component output hook and failed because
+Diffusers rejects dictionary outputs even for an empty CP plan. No numerical pass is
+claimed from that run. Version0.0.2 returns an owned CPU uint8 JSON tensor through the
+actual hook, then decodes it in the author model method. The real ModelMixin/CP hook
+CPU regression reproduces the old refusal and verifies the new report round-trip.
