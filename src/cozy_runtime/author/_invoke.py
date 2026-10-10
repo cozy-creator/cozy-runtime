@@ -66,7 +66,7 @@ from cozy_runtime.author._markers import AssetBound
 from cozy_runtime.author._media import KIND_MEDIA, admits
 from cozy_runtime.author._model import Model
 from cozy_runtime.author._model_reader import ReadValues, WeightsReader
-from cozy_runtime.author._observations import Observation
+from cozy_runtime.author._observations import Observation, Track
 from cozy_runtime.author._services import (
     MAX_OUTPUT_BYTES,
     AdjustmentRow,
@@ -194,6 +194,8 @@ class PreparedRequest:
     asset_bounds: Mapping[str, AssetBound | None] = field(default_factory=dict)
     #: how this request's LoRAs are served (`LORA_MODE`): baked unless it asks per step
     lora: str = "bake"
+    #: what preparing it waited for (its attention kernel's compile): its attempt's first stages
+    stages: Mapping[str, Track] = field(default_factory=dict)
 
     def digests(self) -> dict[str, str]:
         """What a worker can hold, record and price against — never the payload."""
@@ -413,6 +415,7 @@ def run_prepared(
         publish=inv.publish,
         ignored=prepared.overlay.ignored,
     )
+    record.attribution.stages.update(prepared.stages)
 
     def aside(name: str, ms: float) -> None:
         record.attribution.stage(name, ms)

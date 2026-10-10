@@ -4,7 +4,7 @@ is the run's next step. A request's explicit `--attention-kernel` is the opposit
 for its own kernel's build and holds that kernel for every step, or is refused. Real
 Diffusers attention sites, a real source registry, real builder processes and the real
 store; the kernel is a registry wheel a CPU can build, named in a model's ladder and in the
-ranked table.
+ranked table. A cancel ends the override's wait at once, and the wait is a stage of its run.
 """
 
 from __future__ import annotations
@@ -245,6 +245,7 @@ def _host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[SimpleNam
         package = sys.modules["steps_fixture"]
         package.SITES[:] = list(cast(Iterable[object], roots["dit"]))
         package.FINISH[:] = [lambda: None]
+        replies: list[dict[str, Any]] = []
 
         def run(request_id: str, kernel: str = "") -> dict[str, Any]:
             """One request; its rank's attention record, or the prepare's refusal."""
@@ -271,11 +272,17 @@ def _host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[SimpleNam
                 )
             )
             assert reply["outcome"]["terminal"] == "succeeded", reply["outcome"]
+            replies.append(reply)
             [rank] = reply["execution"]["ranks"]
             return dict(rank["attention"])
 
         yield SimpleNamespace(
-            construction=construction, package=package, held=package.HELD, frames=frames, run=run
+            construction=construction,
+            package=package,
+            held=package.HELD,
+            frames=frames,
+            run=run,
+            replies=replies,
         )
     reader.join()
     sys.modules.pop("steps_fixture", None)
@@ -348,7 +355,7 @@ def test_an_override_naming_a_compiling_kernel_waits_for_it_then_runs_every_step
     store: kernel_cache.Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The request waits for its kernel's own build, its progress saying so, and never
-    starts on the kernel that is ready meanwhile."""
+    starts on the kernel that is ready meanwhile. The wait is the run's first stage."""
     _registry(tmp_path / "sources")
     job = kernel_sources.job(kernel_sources.PYTHON, 0)
     lock, builder = _held(store, job, MOVING)
@@ -359,12 +366,53 @@ def test_an_override_naming_a_compiling_kernel_waits_for_it_then_runs_every_step
         request.start()
         while request.is_alive() and not _waiting(host.frames):
             time.sleep(kernel_compile.POLL_SECONDS)
+        seen = time.time() * 1000
         assert request.is_alive() and not host.held, reply
         assert _waiting(host.frames)[0]["stage_fraction"] == 0.25
+        finishing = time.time() * 1000
         _finisher(store, job, lock, builder)()
         request.join()
         assert host.held == [TINY_SITES] * 4
         assert reply["observed"] == "tiny" and "segments" not in reply, reply
+        attribution = host.replies[-1]["attribution"]
+        wait = attribution["stages"]["waiting for tiny compile"]
+        ended = wait["started_unix_ms"] + wait["total_ms"]
+        assert wait["count"] == 1 and wait["started_unix_ms"] <= seen, wait
+        assert finishing - 1 <= ended <= attribution["steps"]["denoise"]["series"][0][0], wait
+
+
+def test_a_cancel_ends_an_override_waiting_for_its_compile_at_once_and_the_build_goes_on(
+    store: kernel_cache.Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The worker's cancel marker landing (TensorD's rename) ends the waiting request canceled
+    at once: the wait sleeps on it, not on its poll (an hour here). The build goes on, and a
+    later request runs every step on the kernel it built."""
+    _registry(tmp_path / "sources")
+    job = kernel_sources.job(kernel_sources.PYTHON, 0)
+    lock, builder = _held(store, job, MOVING)
+    with _host(tmp_path, monkeypatch) as host:
+        monkeypatch.setattr(kernel_compile, "POLL_SECONDS", 3600.0)
+        reply: dict[str, Any] = {}
+        request = threading.Thread(
+            target=lambda: reply.update(host.run("canceled", "tiny")), daemon=True
+        )
+        request.start()
+        while request.is_alive() and not _waiting(host.frames):
+            time.sleep(0.01)
+        pending = tmp_path / "root" / "executor.cancel.pending"
+        pending.write_text("canceled")
+        canceled = time.monotonic()
+        pending.rename(tmp_path / "root" / "executor.cancel")
+        request.join(30)
+        took = time.monotonic() - canceled
+        assert not request.is_alive() and took < 1.0, took
+        assert (reply["ok"], reply["code"], reply["terminal"]) == (False, "cancelled", "canceled")
+        assert builder.poll() is None and kernel_compile.status(store, job).state == "compiling"
+        assert not host.held, reply
+        monkeypatch.setattr(kernel_compile, "POLL_SECONDS", 0.01)
+        _finisher(store, job, lock, builder)()
+        assert host.run("later", "tiny")["observed"] == "tiny"
+        assert host.held == [TINY_SITES] * 4
 
 
 def test_an_override_whose_compile_fails_is_refused_with_the_compiles_reason(
