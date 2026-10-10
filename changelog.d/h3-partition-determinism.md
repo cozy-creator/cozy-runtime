@@ -1,0 +1,1 @@
+Prefer partition-stable H3 attention on Hopper SM90 and Blackwell SM120, align Ulysses sparse producers, and use deterministic audio decoding. Matched 15-second Turbo generations are byte-identical on tested one/two-GPU H100 and RTX 5090 pairs; other counts, kernels and inputs are not universally qualified.
