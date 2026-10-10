@@ -1,0 +1,26 @@
+{
+  "accurate": {
+    "entry": "sageattn_qk_int8_pv_fp8_cuda_sm90",
+    "helper": "per_thread_int8_triton",
+    "quantizer_call": "per_thread_int8_triton(q, k, km, tensor_layout=tensor_layout, BLKQ=64, WARPQ=16, BLKK=128, WARPK=128)",
+    "key_mean": "k.mean(dim=seq_dim, keepdim=True)",
+    "core_sha256": "e475182fc55d6a683499e1eb4d8886fc06e050ed938d8563b090773eede2a99e",
+    "upstream_commit": "d1a57a546c3d395b1ffcbeecc66d81db76f3b4b5"
+  },
+  "per-warp": {
+    "entry": "sageattn_qk_int8_pv_fp8_cuda_sm90",
+    "helper": "per_warp_int8_cuda",
+    "quantizer_call": "per_warp_int8_cuda(q, k, km, tensor_layout=tensor_layout, BLKQ=64, WARPQ=16, BLKK=128)",
+    "key_mean": "k.mean(dim=seq_dim, keepdim=True)",
+    "core_sha256": "e475182fc55d6a683499e1eb4d8886fc06e050ed938d8563b090773eede2a99e",
+    "upstream_commit": "d1a57a546c3d395b1ffcbeecc66d81db76f3b4b5"
+  },
+  "fp16pv": {
+    "entry": "sageattn_qk_int8_pv_fp16_cuda",
+    "helper": "per_thread_int8_triton",
+    "quantizer_call": "per_thread_int8_triton(q, k, km, tensor_layout=tensor_layout, BLKQ=128, WARPQ=16 if q.size(-1) == 128 and pv_accum_dtype == 'fp16+fp32' else 32, BLKK=64, WARPK=64)",
+    "key_mean": "k.mean(dim=seq_dim, keepdim=True)",
+    "core_sha256": "e475182fc55d6a683499e1eb4d8886fc06e050ed938d8563b090773eede2a99e",
+    "upstream_commit": "d1a57a546c3d395b1ffcbeecc66d81db76f3b4b5"
+  }
+}
