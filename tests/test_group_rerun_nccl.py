@@ -10,6 +10,7 @@ block, between Ulysses all-to-alls.
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 import socket
@@ -26,6 +27,7 @@ torch = pytest.importorskip("torch")
 from cozy_runtime.internal import executor as executor_module  # noqa: E402
 from cozy_runtime.internal import spawn  # noqa: E402
 from cozy_runtime.internal.executor import Executor  # noqa: E402
+from cozy_runtime.internal.parallel import links  # noqa: E402
 from cozy_runtime.internal.parallel.group import RankGroup  # noqa: E402
 from cozy_runtime.internal.parallel.mirror import mirror_component  # noqa: E402
 from cozy_runtime.internal.parallel.plan import GroupRefusal  # noqa: E402
@@ -129,6 +131,54 @@ def test_the_h3_dit_reruns_between_its_all_to_alls_and_matches_a_control(
         for a, b, c in zip(control, rerun, alone, strict=True):
             assert torch.equal(a, b), "the rerun's output is the control's"
             torch.testing.assert_close(a, c, rtol=1e-4, atol=1e-5)
+        assert not group.broken
+    finally:
+        group.close()
+        for end in sockets:
+            end.close()
+
+
+def test_the_h3_dit_forms_over_its_measured_route_and_matches_one_gpu(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """The group measures its two GPUs' link in a child process, forms NCCL at the level that
+    measurement allows and, where the copy is direct, times NCCL against the copy engines on
+    both GPUs (the follower through its own `join`). The tiny H3 DiT's Ulysses output equals
+    one GPU's whichever route won, and the execution record says which and why."""
+    pytest.importorskip("diffusers")
+    group = group_of_two(tmp_path, "--h3")
+    leader, sockets = leader_of(group, tmp_path, monkeypatch)
+    model: Any = h3_model()
+    model.dit.to("cuda:0")
+    model.text_encoder.to("cuda:0")
+    batch = {k: v.to("cuda:0") if isinstance(v, torch.Tensor) else v for k, v in h3_batch().items()}
+    with torch.no_grad():
+        alone = model.dit(**batch)
+    leader.backend = prepared({"dit": model.dit, "text_encoder": model.text_encoder})
+    measured = links.measured(tmp_path / "links", "0,1", 2)
+    leader.transport = links.Transport(2, [0, 1], "nccl", measured.nccl(), measured)
+    try:
+        group.spawn()
+        leader.pg = group.form(
+            torch,
+            SEAL,
+            nccl=leader.transport.nccl,
+            formed=leader._calibrated if measured.all_direct else None,
+        )
+        assert leader._install_group(torch, model) is None
+        leader._attempt_spool = tmp_path / "attempt"
+        for a, c in zip(model.infer(batch), alone, strict=True):
+            torch.testing.assert_close(a, c, rtol=1e-4, atol=1e-5)
+        record = leader.transport.document()
+        print(json.dumps(record))
+        assert [(p["a"], p["b"]) for p in record["pairs"]] == [(0, 1), (1, 0)] and record["reason"]
+        if measured.all_direct:
+            assert record["calibration"]["copy_engine_exact"] == 1.0, record
+            assert record["route"] == (
+                "copy-engine"
+                if record["calibration"]["copy_engine_gbps"] > record["calibration"]["nccl_gbps"]
+                else "nccl"
+            )
         assert not group.broken
     finally:
         group.close()

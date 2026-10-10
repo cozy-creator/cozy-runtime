@@ -18,11 +18,27 @@ from diffusers.models._modeling_parallel import ContextParallelConfig, ParallelC
 from diffusers.models.attention_dispatch import _AttentionBackendRegistry
 from torch.distributed import _symmetric_memory as symm
 from torch.multiprocessing.spawn import spawn
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from cozy_runtime.internal import attention, attention_ulysses
 from cozy_runtime.internal.encoding import DeviceFacts
 from cozy_runtime.internal.parallel import copy_engine
 from cozy_runtime.internal.parallel.cp import CpComms, _GroupMesh
+
+
+class Writes(TorchDispatchMode):
+    """Counts mutable ops whose written tensor lies in any of `spans` (device addresses)."""
+
+    def __init__(self, spans: list[tuple[int, int]]) -> None:
+        super().__init__()
+        self.spans, self.seen = spans, 0
+
+    def __torch_dispatch__(self, func: Any, types: Any, args: Any = (), kwargs: Any = None) -> Any:
+        if func._schema.is_mutable:
+            for a in args:
+                if isinstance(a, torch.Tensor):
+                    self.seen += any(lo <= a.data_ptr() < hi for lo, hi in self.spans)
+        return func(*args, **(kwargs or {}))
 
 
 def rank_main(
@@ -79,6 +95,13 @@ def rank_main(
                 engined = backend(
                     query=shards[0], key=shards[1], value=shards[2], _parallel_config=config
                 )
+                # A group GPU runs its blocks under the plane's per-op recovery, which clones
+                # every mutable op's target: no peer copy may reach Python dispatch.
+                spans = [(t.data_ptr(), t.data_ptr() + t.numel()) for t in engines.peers]
+                with Writes(spans) as writes:
+                    backend(
+                        query=shards[0], key=shards[1], value=shards[2], _parallel_config=config
+                    )
         report = {
             "rank": rank,
             "impl": attention.implementations(seen),
@@ -88,6 +111,7 @@ def rank_main(
         if engines is not None:
             report["copy_engine_equal_nccl"] = bool(torch.equal(engined, got))
             report["calibration"] = calibration
+            report["dispatched_peer_writes"] = writes.seen
         (root / f"rank-{rank}.json").write_text(json.dumps(report))
     finally:
         dist.destroy_process_group()

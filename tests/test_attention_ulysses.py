@@ -60,3 +60,4 @@ def test_the_copy_engines_move_the_bytes_nccl_moves(tmp_path: Path) -> None:
         row = json.loads((tmp_path / f"rank-{rank}.json").read_text())
         assert row["copy_engine_equal_nccl"], row
         assert row["calibration"]["copy_engine_exact"] == 1.0, row
+        assert row["dispatched_peer_writes"] == 0, row
