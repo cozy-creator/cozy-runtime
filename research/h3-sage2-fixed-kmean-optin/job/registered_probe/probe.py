@@ -107,8 +107,8 @@ def run(seed: int) -> dict[str, Any]:
     hybrid = attention.pinned(fixed.SOL_NAME, facts)[0]
     dense = attention.pinned(fixed.DENSE_NAME, facts)[0]
     public = attention.pinned("sageattention", facts)[0]
-    # The later H3 VAE uses FA3. Resolve its normal public artifact now so a cold
-    # build cannot change that later request's automatic dense preference.
+    # Job-local FA3 readiness only: later H3 actors may have another kernel-cache
+    # namespace. Their actual VAE attention receipts remain authoritative.
     fa3_started = time.monotonic()
     fa3 = attention.pinned("flash-attn3", facts)[0]
     fa3_ready_seconds = time.monotonic() - fa3_started
@@ -224,7 +224,7 @@ def run(seed: int) -> dict[str, Any]:
         "dependency_warmup": {
             "flash-attn3": fa3.artifact,
             "actual_readiness_seconds": fa3_ready_seconds,
-            "scope": "Public FA3 dependency resolve/launch for later VAE; no added comparison",
+            "scope": "Job-local public FA3 resolve/launch; later actor readiness is independent",
             "compile_ms_note": (
                 "Artifact compile_ms is stored build cost, not necessarily this request's wait"
             ),
