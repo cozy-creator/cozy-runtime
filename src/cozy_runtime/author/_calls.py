@@ -39,7 +39,7 @@ from cozy_runtime.author._memo import MemoDependency
 from cozy_runtime.author._memo import declare as declare_memo
 from cozy_runtime.author._model_defaults import DefaultLadder, model_components, model_defaults
 from cozy_runtime.author._services import Telemetry, _progress_scope, _ProgressScope
-from cozy_runtime.internal import application_json
+from cozy_runtime import _application_json as application_json
 
 _LOG = logging.getLogger(__name__)
 

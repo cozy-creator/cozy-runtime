@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any
 
 from cozy_runtime.internal import spawn
+from cozy_runtime.internal.config import inherited_environment
 from cozy_runtime.internal.parallel import copy_engine, group
 
 #: Bytes each pair copies per measurement: large enough that link setup and launch latency
@@ -290,7 +291,7 @@ def _probe(devices: str, count: int) -> Links:
     """Run the probe child, reading its lines as they come. It may wedge only in the process
     group (inside NCCL); that phase gets four times what the child took to start and measure
     its first pair (torch import, CUDA, a copy), and is ended as a whole if it says nothing."""
-    environment = {**os.environ, "CUDA_VISIBLE_DEVICES": devices}
+    environment = {**inherited_environment(), "CUDA_VISIBLE_DEVICES": devices}
     began = time.monotonic()
     child = subprocess.Popen(
         [sys.executable, "-I", "-m", "cozy_runtime.internal.parallel.links", str(count)],
@@ -439,7 +440,7 @@ def main(argv: Sequence[str]) -> int:
             spawn.spawn_follower(
                 python=sys.executable,
                 module_argv=[*_FOLLOWER, str(rank), str(count), str(port), level],
-                env=os.environ,
+                env=inherited_environment(),
                 inherit_fd=unused,
             )
             for rank in range(1, count)

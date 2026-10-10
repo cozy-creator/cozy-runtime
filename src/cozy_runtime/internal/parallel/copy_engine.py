@@ -12,11 +12,11 @@ measured it faster than NCCL; the result is the same bytes either way.
 
 from __future__ import annotations
 
-import contextlib
 import math
-import os
-from collections.abc import Iterator, Sequence
+from collections.abc import Sequence
 from typing import Any
+
+from cozy_runtime.internal.config import short_socket_directory
 
 #: The exchange the group formed with, by process group; absent: NCCL.
 _BY_GROUP: dict[int, CopyEngineExchange] = {}
@@ -30,24 +30,6 @@ def install(exchange: CopyEngineExchange | None, handle: Any) -> None:
     _BY_GROUP.clear()
     if exchange is not None:
         _BY_GROUP[id(handle)] = exchange
-
-
-@contextlib.contextmanager
-def _socket_directory() -> Iterator[None]:
-    """Symmetric memory passes its handles over a unix socket named `$TMPDIR/symm_mem-<pid>`
-    on every GPU alike; an executor's scratch path is too long for a socket name (108 bytes),
-    so the rendezvous names it in the first short directory every process here shares."""
-    previous = os.environ.get("TMPDIR")
-    os.environ["TMPDIR"] = next(
-        (path for path in ("/tmp", "/dev/shm") if os.access(path, os.W_OK | os.X_OK)), "/tmp"
-    )
-    try:
-        yield
-    finally:
-        if previous is None:
-            os.environ.pop("TMPDIR", None)
-        else:
-            os.environ["TMPDIR"] = previous
 
 
 class CopyEngineExchange:
@@ -73,7 +55,7 @@ class CopyEngineExchange:
             torch.cuda.current_stream(self.device).synchronize()
         self.peers, self.handle, self.buffer = [], None, None
         self.buffer = self.symm.empty(size, dtype=torch.uint8, device=self.device)
-        with _socket_directory():
+        with short_socket_directory():
             self.handle = self.symm.rendezvous(self.buffer, self.pg.group_name)
         self.peers = [self.handle.get_buffer(p, (size,), torch.uint8) for p in range(self.world)]
 

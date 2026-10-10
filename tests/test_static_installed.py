@@ -2,6 +2,7 @@
 
 import base64
 import hashlib
+import importlib.metadata
 import json
 import shutil
 import subprocess
@@ -258,10 +259,16 @@ def identities(document: dict[str, Any]) -> dict[str, object]:
 
 def test_an_installed_memoized_callable_carries_the_identity_its_import_would(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The static identity is `describe`'s: one key whether a machine reads or imports it.
     A declaration the reader cannot follow carries none (its machine uses the package)."""
     python = memo_environment(tmp_path)
+
+    def no_discovery_hooks(*args: object, **kwargs: object) -> None:
+        raise AssertionError("static inspection must not execute installed distribution finders")
+
+    monkeypatch.setattr(importlib.metadata, "distributions", no_discovery_hooks)
     found = identities(static_interface.build_installed("memo-app", environment_python=python))
     # The environment's own packages first, then this Runtime: describe() imports the App.
     site = next((python.parent.parent / "lib").glob("python*/site-packages"))
