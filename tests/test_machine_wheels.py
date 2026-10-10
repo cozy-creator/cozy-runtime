@@ -55,7 +55,9 @@ def uv(*argv: str) -> None:
 
 
 @pytest.fixture
-def package(tmp_path: Path) -> tuple[Path, Path]:
+def package(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
+    # The declared machine wheels must suffice on a fresh worker, without the developer's cache.
+    monkeypatch.setenv("UV_CACHE_DIR", str(tmp_path / "uv-cache"))
     venv = tmp_path / "venv"
     uv("venv", "--no-config", "--python", sys.executable, str(venv))
     python = venv / "bin" / "python"
@@ -83,7 +85,7 @@ def select(python: Path, site: Path, wheels: Path) -> None:
             "pip", "install", "--no-config", "--offline", "--python", str(python), *rows
         ),
         lambda: pytest.fail("a local build never falls back to the lock"),
-        {"cozy-runtime": LOCAL},
+        {"cozy-runtime": LOCAL, "tensorfs": "0.6.1"},
         wheels,
     )
 
@@ -95,11 +97,13 @@ def test_a_local_build_installs_from_the_machines_wheels(
     wheels = tmp_path / "wheels"
     wheels.mkdir()
     wheel(wheels, "cozy-runtime", LOCAL)
+    wheel(wheels, "tensorfs", "0.6.1")
     select(python, site, wheels)
     installed = {
         d.metadata["Name"]: d.version for d in importlib.metadata.distributions(path=[str(site)])
     }
     assert installed["cozy-runtime"] == LOCAL
+    assert installed["tensorfs"] == "0.6.1"
 
 
 def test_the_machine_wheels_live_in_the_machine_layout(tmp_path: Path) -> None:
