@@ -1,0 +1,168 @@
+{
+  "release_tag": "benchmark-h3-2026-10-09",
+  "archive": "h3-turbo-comparison-media-2026-10-09.tar.gz",
+  "archive_bytes": 310691110,
+  "archive_sha256": "b08b4168efd28a6659726654336ec99c459f87f06a790915d89611e11ad0683e",
+  "files": [
+    {
+      "path": "media/rtx5090-1-cozy-a.mp4",
+      "sha256": "45fe0c022489e35fa06dc6322ceb6bafb91de68c13e1d8936d8390685916c525",
+      "bytes": 23236479
+    },
+    {
+      "path": "posters/rtx5090-1-cozy-a.jpg",
+      "sha256": "4dfb370cc81e56b53357ded0b1dd7bb1eafa6c42173a1bdb1f6a40e126704026",
+      "bytes": 37700
+    },
+    {
+      "path": "media/rtx5090-1-cozy-b.mp4",
+      "sha256": "97f8a8bdbf4e7ae3ce35f75f66135a3d1af177973f42ebcf010eba5fad95d2ea",
+      "bytes": 19779836
+    },
+    {
+      "path": "posters/rtx5090-1-cozy-b.jpg",
+      "sha256": "b738618366ebda4d3a00976894ffbcd32c60fee85bd538e5e9e00ca51b9001b9",
+      "bytes": 34199
+    },
+    {
+      "path": "media/rtx5090-4-cozy-a.mp4",
+      "sha256": "91275292b4e03603ca5049665f056ac7337f405f29b78b242b3a5ad5930f5ee2",
+      "bytes": 23170822
+    },
+    {
+      "path": "posters/rtx5090-4-cozy-a.jpg",
+      "sha256": "80af728554fc23e782ab57e409df4fe165ea4684a40fb5e5e9d0fc3a58dcf229",
+      "bytes": 36060
+    },
+    {
+      "path": "media/rtx5090-4-cozy-b.mp4",
+      "sha256": "f1560ef25519463f0f516b8850e14111b3c11120a18e2d6d0c7eaa42969576bc",
+      "bytes": 19720283
+    },
+    {
+      "path": "posters/rtx5090-4-cozy-b.jpg",
+      "sha256": "23b258ccb26226972f2dbf8e1adfcdc739f2434f4ad04b8a191e9a77ae3170d3",
+      "bytes": 33947
+    },
+    {
+      "path": "media/rtx5090-8-cozy-a.mp4",
+      "sha256": "f53af3cf3b15bc8106372ab03baa5ad1efe7e9df95cfba948991ffb219828be3",
+      "bytes": 23767293
+    },
+    {
+      "path": "posters/rtx5090-8-cozy-a.jpg",
+      "sha256": "cb94e4da3e328e7c1de7d5e1b34ca9958e2da47cc95af2662e1106a8cbb1f903",
+      "bytes": 37483
+    },
+    {
+      "path": "media/rtx5090-8-cozy-b.mp4",
+      "sha256": "1818aa89270c55f05425ce013d1f1ae77001c3f69dcc1944ac71bc70d383e318",
+      "bytes": 20131518
+    },
+    {
+      "path": "posters/rtx5090-8-cozy-b.jpg",
+      "sha256": "f37f6f696785d30b236be4b0e58d6d0048cc9dbffe0e9af24b44f0ea6e630f05",
+      "bytes": 33809
+    },
+    {
+      "path": "media/h100-4-cozy-a.mp4",
+      "sha256": "abfe0bc06d7a48fa9bee5e367f76d2e8d1e5791162ac94c748ba767926e53e7e",
+      "bytes": 22737327
+    },
+    {
+      "path": "posters/h100-4-cozy-a.jpg",
+      "sha256": "bb0e48a464cfc914e74d795ff9dda801ff0a6e59da634409062a85f13d506e42",
+      "bytes": 32996
+    },
+    {
+      "path": "media/h100-4-cozy-b.mp4",
+      "sha256": "d299bfc4e005765c0807641fea99786f9f94474ab88fb81dcd3b6b87210669d3",
+      "bytes": 20084650
+    },
+    {
+      "path": "posters/h100-4-cozy-b.jpg",
+      "sha256": "b7a3e7b02217d95d66eae9189758a38029792da0e255f0c6a0f005fe19b1e04f",
+      "bytes": 35440
+    },
+    {
+      "path": "media/h100-4-comfyui-a.mp4",
+      "sha256": "799ca1f044560c82f51247b8246d14a8564793e2696be88f4277795548e7cd05",
+      "bytes": 16404615
+    },
+    {
+      "path": "posters/h100-4-comfyui-a.jpg",
+      "sha256": "628787faf630c73d32445882f0ea9fc7ba426e8a53cfc42269f426e4c958687b",
+      "bytes": 32415
+    },
+    {
+      "path": "media/h100-4-comfyui-b.mp4",
+      "sha256": "9267cdf13b02934ef9e03176b89210c0721502174b9472dd126fe87a34f67afa",
+      "bytes": 17087917
+    },
+    {
+      "path": "posters/h100-4-comfyui-b.jpg",
+      "sha256": "4190bb771d7b0893a2255df45d611dbca1e87c17e05c1e0678869749a2e4b279",
+      "bytes": 30001
+    },
+    {
+      "path": "media/rtx5090-1-comfyui-a.mp4",
+      "sha256": "604efeb8181aaedecbffa5d631d836edf60ffd577bfd53418e8139a569676a4e",
+      "bytes": 17991229
+    },
+    {
+      "path": "posters/rtx5090-1-comfyui-a.jpg",
+      "sha256": "7204f6798625b9ca08f9bbdaf5ed79e832221774b9931ef6c98abdf30d66ceb2",
+      "bytes": 33185
+    },
+    {
+      "path": "media/rtx5090-1-comfyui-b.mp4",
+      "sha256": "7d6c393556e2693096d4bd70892b611ffc346b30c6a440d055544f227b61c4dd",
+      "bytes": 17196528
+    },
+    {
+      "path": "posters/rtx5090-1-comfyui-b.jpg",
+      "sha256": "ad03607912d756bc7727928997f8f86b88c62d28a2057b9b5c85833e92b6a297",
+      "bytes": 29388
+    },
+    {
+      "path": "media/rtx5090-4-comfyui-a.mp4",
+      "sha256": "a6d0bbe5eb7672330684b40743ea2a2fb205db8405be4e0368d55a9490646213",
+      "bytes": 17408727
+    },
+    {
+      "path": "posters/rtx5090-4-comfyui-a.jpg",
+      "sha256": "c88e3fcb71767c568f27c53459e63b8f27e601a0973eace6abe782123f9090d2",
+      "bytes": 32962
+    },
+    {
+      "path": "media/rtx5090-4-comfyui-b.mp4",
+      "sha256": "162a6380d0995cb01928039b344e5481c895b62e4660aab806499fe65a3f4589",
+      "bytes": 17022477
+    },
+    {
+      "path": "posters/rtx5090-4-comfyui-b.jpg",
+      "sha256": "3139c2d7fdf9ae17dcd30febd88d415541cb02e182257d36bd68b7206cdd83cc",
+      "bytes": 29763
+    },
+    {
+      "path": "media/rtx5090-8-comfyui-a.mp4",
+      "sha256": "a51426dd50cecd67a59662da775f97bedc45dc6711e8944430b6c9fe3322c5ae",
+      "bytes": 17410554
+    },
+    {
+      "path": "posters/rtx5090-8-comfyui-a.jpg",
+      "sha256": "ce0300f6e88991d2246b638e9dd606f821c57122fb802415df69d567c0f1b54c",
+      "bytes": 33003
+    },
+    {
+      "path": "media/rtx5090-8-comfyui-b.mp4",
+      "sha256": "79858b9304c94a0a3f481a8e46277126090625d315afead236282926b881658e",
+      "bytes": 17027135
+    },
+    {
+      "path": "posters/rtx5090-8-comfyui-b.jpg",
+      "sha256": "b604fd04083dc2aa2215688f2bc6c793beb7a97ac42b481fa2ca7972d898219b",
+      "bytes": 29745
+    }
+  ]
+}

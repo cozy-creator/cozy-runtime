@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="MiniMax H3 benchmarks: Cozy Creator versus ComfyUI on one, four and eight RTX 5090 GPUs and four H100s. Explore timings, methods and original comparison videos.">
+  <meta name="color-scheme" content="light">
+  <title>MiniMax H3 benchmarks — Cozy Creator vs ComfyUI</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header">
+    <a class="wordmark" href="#top" aria-label="Cozy Creator benchmarks, top"><span class="brand-mark" aria-hidden="true">c</span>cozy<span class="wordmark-detail">benchmarks</span></a>
+    <nav aria-label="On this page"><a href="#results">Results</a><a href="#watch">Watch</a><a href="#how">How it works</a><a href="#method">Method</a></nav>
+  </header>
+
+  <main id="main">
+    <section class="hero section-shell" id="top" aria-labelledby="page-title">
+      <div class="hero-copy">
+        <p class="eyebrow"><span class="status-dot" aria-hidden="true"></span> MiniMax H3 · Measured <time datetime="2026-10-09">October 9, 2026</time></p>
+        <h1 id="page-title">More GPUs.<br>Less waiting.</h1>
+        <p class="hero-lede">Cozy Creator versus ComfyUI, from one GPU to eight. Same submitted scenes, same seeds, full 15-second video—with the original clips here to compare.</p>
+        <div class="hero-actions"><a class="button primary" href="#watch">Watch the comparisons <span aria-hidden="true">↗</span></a><a class="text-link" href="#results">Explore the results <span aria-hidden="true">↓</span></a></div>
+      </div>
+      <aside class="hero-result" aria-label="Featured eight RTX 5090 Turbo result">
+        <div class="result-topline"><span>8 × RTX 5090</span><span class="small-tag">Turbo · 8 steps</span></div>
+        <p class="featured-label">15 seconds of video, generated in</p>
+        <p class="featured-number"><span id="hero-seconds">63.3</span><span class="unit">s</span></p>
+        <div class="featured-comparison"><span><i class="legend-dot cozy-dot" aria-hidden="true"></i>Cozy Creator</span><span>vs <strong id="hero-comfy">110.9s</strong> ComfyUI</span></div>
+        <div class="featured-saving"><strong id="hero-saving">42.9%</strong><span>less generation time</span></div>
+        <p class="microcopy">Mean of two warm runs. Worker generation through output saving; download time excluded.</p>
+      </aside>
+    </section>
+
+    <div class="spec-strip section-shell" aria-label="Shared workload"><span><strong>1344 × 768</strong> resolution</span><span><strong>362 frames</strong> at 24 fps</span><span><strong>Stereo audio</strong> included</span><span><strong>15.08s</strong> actual output</span></div>
+
+    <section class="section-shell section-space" id="results" aria-labelledby="results-heading">
+      <div class="section-heading"><div><p class="eyebrow">01 / The measurements</p><h2 id="results-heading">Faster in every tested configuration.</h2></div><a class="text-link data-link" href="data.json" download>Download the data <span aria-hidden="true">↗</span></a></div>
+      <p class="section-intro">Turbo uses 4 dense + 4 Sol steps. Regular uses 10 dense + 20 Sol steps. Both engines keep protected blocks and the conditioning prefix dense during sparse steps.</p>
+      <div class="table-scroll" role="region" aria-label="Generation time comparison" tabindex="0">
+        <table class="results-table"><caption>Warm worker generation time. Lower is better.</caption><thead><tr><th scope="col">Hardware</th><th scope="col">Mode</th><th scope="col" class="numeric cozy-heading">Cozy Creator</th><th scope="col" class="numeric">ComfyUI</th><th scope="col" class="numeric">Less time</th></tr></thead>
+          <tbody id="results-body">
+            <tr><th scope="row">1 × RTX 5090</th><td>Turbo</td><td class="numeric winner">5m 51.5s</td><td class="numeric">6m 04.3s</td><td class="numeric saving">3.5%</td></tr>
+            <tr><th scope="row">1 × RTX 5090</th><td>Regular</td><td class="numeric winner">16m 38.5s</td><td class="numeric">18m 29.4s</td><td class="numeric saving">10.0%</td></tr>
+            <tr><th scope="row">4 × RTX 5090</th><td>Turbo</td><td class="numeric winner">1m 43.4s</td><td class="numeric">2m 29.2s</td><td class="numeric saving">30.6%</td></tr>
+            <tr><th scope="row">4 × RTX 5090</th><td>Regular</td><td class="numeric winner">4m 56.3s</td><td class="numeric">7m 10.5s</td><td class="numeric saving">31.2%</td></tr>
+            <tr><th scope="row">8 × RTX 5090</th><td>Turbo</td><td class="numeric winner">1m 03.3s</td><td class="numeric">1m 50.9s</td><td class="numeric saving">42.9%</td></tr>
+            <tr><th scope="row">8 × RTX 5090</th><td>Regular</td><td class="numeric winner">2m 58.0s</td><td class="numeric">5m 33.7s</td><td class="numeric saving">46.7%</td></tr>
+            <tr><th scope="row">4 × H100 SXM 80 GB</th><td>Turbo</td><td class="numeric winner">55.5s</td><td class="numeric">2m 01.9s</td><td class="numeric saving">54.4%</td></tr>
+            <tr><th scope="row">4 × H100 SXM 80 GB</th><td>Regular</td><td class="numeric winner">2m 34.3s</td><td class="numeric">5m 53.8s</td><td class="numeric saving">56.4%</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="caption">Each mean uses two timed inputs after a warmup. “Less time” is (ComfyUI − Cozy) / ComfyUI. Two samples are observations, not a confidence interval. This compares the tested applications and settings, not identical arithmetic or every possible ComfyUI configuration.</p>
+    </section>
+
+    <section class="watch-section" id="watch" aria-labelledby="watch-heading">
+      <div class="section-shell section-space">
+        <div class="section-heading"><div><p class="eyebrow">02 / See the original outputs</p><h2 id="watch-heading">Same scene. Side by side.</h2></div><span class="small-tag dark-tag">Turbo · 4 dense + 4 Sol</span></div>
+        <p class="section-intro">Choose a GPU configuration and one of the two inputs. These are the original, untranscoded Turbo clips. Compare motion, detail and audio for yourself; timing results alone do not establish equal quality.</p>
+        <div class="selectors">
+          <label>Hardware<select id="hardware-select" disabled><option value="rtx5090:1">1 × RTX 5090</option><option value="rtx5090:4">4 × RTX 5090</option><option value="rtx5090:8">8 × RTX 5090</option><option value="h100:4">4 × H100 SXM 80 GB</option></select></label>
+          <label>Input<select id="input-select" disabled><option value="1">A · Fighting</option><option value="2">B · Racing</option></select></label>
+          <p class="selection-note">The two inputs are samples of the same benchmark.<br>Clip times below are individual runs.</p>
+        </div>
+        <div class="video-grid">
+          <article class="video-card" aria-labelledby="cozy-video-heading">
+            <div class="video-heading"><h3 id="cozy-video-heading"><i class="legend-dot cozy-dot" aria-hidden="true"></i>Cozy Creator</h3><span class="clip-time" id="cozy-time">—</span></div>
+            <div class="video-stage"><video id="cozy-video" playsinline preload="none" aria-label="Cozy Creator generated comparison video"></video><button class="video-cover" type="button" data-play-cover disabled aria-label="Play both comparison videos"><span class="play-circle" aria-hidden="true">▶</span><span>Play comparison</span></button></div>
+            <p class="kernel-label" id="cozy-attention">Loading clip details…</p>
+            <div class="video-links"><a id="cozy-download" class="text-link" download hidden>Download original <span aria-hidden="true">↓</span></a><span id="cozy-size" class="microcopy"></span></div>
+            <details class="file-details"><summary>Clip details &amp; SHA-256</summary><dl><dt>Text encoder</dt><dd id="cozy-encoder">—</dd><dt>SHA-256</dt><dd><code id="cozy-hash">—</code></dd></dl></details>
+          </article>
+          <article class="video-card" aria-labelledby="comfy-video-heading">
+            <div class="video-heading"><h3 id="comfy-video-heading"><i class="legend-dot comfy-dot" aria-hidden="true"></i>ComfyUI</h3><span class="clip-time" id="comfy-time">—</span></div>
+            <div class="video-stage"><video id="comfy-video" playsinline preload="none" aria-label="ComfyUI generated comparison video"></video><button class="video-cover" type="button" data-play-cover disabled aria-label="Play both comparison videos"><span class="play-circle" aria-hidden="true">▶</span><span>Play comparison</span></button></div>
+            <p class="kernel-label" id="comfy-attention">Loading clip details…</p>
+            <div class="video-links"><a id="comfy-download" class="text-link" download hidden>Download original <span aria-hidden="true">↓</span></a><span id="comfy-size" class="microcopy"></span></div>
+            <details class="file-details"><summary>Clip details &amp; SHA-256</summary><dl><dt>Text encoder</dt><dd id="comfy-encoder">—</dd><dt>SHA-256</dt><dd><code id="comfy-hash">—</code></dd></dl></details>
+          </article>
+        </div>
+        <div class="playback-panel" role="group" aria-label="Paired video controls">
+          <div class="playback-buttons"><button class="button primary" type="button" id="play-button" disabled>Play together</button><button class="button secondary" type="button" id="restart-button" disabled>Restart</button></div>
+          <div class="timeline"><label for="seek-control" class="visually-hidden">Seek both videos</label><input id="seek-control" type="range" min="0" max="15.083333" value="0" step="0.01" disabled><output id="time-display" for="seek-control">0:00 / 0:15</output></div>
+          <div class="playback-options"><label>Speed<select id="speed-select"><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="1.5">1.5×</option><option value="2">2×</option></select></label><label>Audio<select id="audio-select"><option value="cozy" selected>Cozy only</option><option value="comfy">ComfyUI only</option><option value="muted">Muted</option></select></label></div>
+        </div>
+        <p id="player-status" class="player-status" role="status" aria-live="polite">Loading comparison data…</p>
+        <details class="prompt-details"><summary>Read the submitted prompt <span id="seed-label"></span></summary><p id="prompt-text"></p><p class="microcopy">Submitted scene descriptions and seeds match. Cozy adds its default <code>non_diegetic_music: N/A</code> field; text-encoder precision also differs. Identical conditioning or pixels are not claimed.</p></details>
+        <noscript><p class="notice">JavaScript is needed for the paired player. The timing tables and methodology remain available below, and the <a href="data.json">data file</a> lists the original video files.</p></noscript>
+      </div>
+    </section>
+
+    <section class="section-shell section-space" id="scaling" aria-labelledby="scaling-heading">
+      <div class="section-heading"><div><p class="eyebrow">03 / One host, three GPU counts</p><h2 id="scaling-heading">The advantage grows with the group.</h2></div></div>
+      <div class="article-columns"><p>On the same eight-card RTX 5090 host, we selected GPU 0, GPUs 0–3, or all eight. Cozy’s Turbo time fell from <strong>351.5 to 63.3 seconds</strong>: a <strong>5.56× speedup</strong>. ComfyUI improved from 364.3 to 110.9 seconds, or 3.28×.</p><p>Doubling from four to eight GPUs improved Cozy by <strong>1.63× for Turbo and 1.66× for regular</strong>, versus 1.35× and 1.29× for ComfyUI. The advantage also appears within denoising; it does not come entirely from saving the video.</p></div>
+      <figure class="scaling-figure"><img src="scaling.svg" alt="Whole-run RTX 5090 generation times. Turbo: Cozy 351.5, 103.4, 63.3 seconds on one, four, eight GPUs; ComfyUI 364.3, 149.2, 110.9. Regular: Cozy 998.5, 296.3, 178.0; ComfyUI 1109.4, 430.5, 333.7." loading="lazy" decoding="async"><figcaption>All RTX 5090s had a 420 W power limit. Four GPUs were within one NUMA node; eight crossed two. Boost clocks were not locked to an identical frequency. These are application scaling results with the software and kernel differences described below.</figcaption></figure>
+    </section>
+
+    <section class="section-shell section-space divided" id="how" aria-labelledby="how-heading">
+      <div class="section-heading"><div><p class="eyebrow">04 / Where the time goes</p><h2 id="how-heading">More than one faster kernel.</h2></div></div>
+      <div class="explanation-grid">
+        <article><span class="chapter-number" aria-hidden="true">01</span><h3>Choose dense and sparse paths separately.</h3><p>Cozy uses SageAttention3 NVFP4 for dense attention on RTX 5090, then Kitchen INT8 Sol for sparse attention. On H100, it uses the Hopper Sage INT8 QK / FP8 PV dense implementation and BF16 CuTe Sol. The tested ComfyUI workflow explicitly selects Kitchen INT8 dense and Sol with the matched step schedule; these are benchmark settings, not universal ComfyUI defaults.</p><p>FP8 model weights do not determine attention arithmetic. The single-GPU Cozy path shares quantized QKV input and can reuse the previous sparse step’s key mean and value scale. The multi-GPU path materializes Q/K/V for redistribution, then uses current-call statistics on its owned heads. This is not one identical attention kernel replicated at every GPU count.</p></article>
+        <article><span class="chapter-number" aria-hidden="true">02</span><h3>Keep projections and surrounding work efficient.</h3><p>Denoising includes projections and feed-forward layers as well as attention. Earlier traces found different FP8/BF16 linear paths, and the pinned MultiStream plugin dequantizes sliced QKV projections to BF16.</p><p>Cozy also restores fused normalization, modulation, residual and SwiGLU work, avoids repeated activation quantization where possible, and reuses LoRA preparation data. LoRA support stays enabled—Turbo itself uses the PDD8 adapter. These observations do not assign the whole speedup to a single optimization.</p></article>
+        <article><span class="chapter-number" aria-hidden="true">03</span><h3>Exchange less data per GPU as the group grows.</h3><p>MultiStream gathers normalized tokens before projecting each rank’s heads. Its source-checked logs report <strong>218.7 → 446.6 GiB</strong> of aggregate logical activation sends per step from four to eight GPUs. Per GPU, that stays nearly flat at 54.7 → 55.8 GiB.</p><p>Cozy exchanges Q/K/V and attention outputs between token and head partitions. For fixed tensors, its source implies 17% more aggregate payload but 42% less per GPU when doubling the group. Logical payload is not measured PCIe traffic, and communication alone does not explain the latency gap.</p></article>
+        <article><span class="chapter-number" aria-hidden="true">04</span><h3>Distribute decoding, then account for the encoder.</h3><p>Both applications distribute video VAE work across selected GPUs. Cozy splits this workload into 21 temporal clips and streams encoding while clips decode. Its Turbo video-decode stage fell from 14.98 to 8.48 seconds from four to eight RTX 5090s.</p><p>Encoding policies also differ: Cozy uses x264 CRF17 with <code>veryfast</code>; ComfyUI uses CRF18 with no preset override, producing settings consistent with <code>medium</code>. Whole-run results include that difference; they are not GPU-kernel-only measurements.</p></article>
+      </div>
+      <aside class="quality-note"><h3>Does parallelism change the image?</h3><p>Ulysses tensor redistribution is lossless, but the final native video frames in this study were not byte-identical across one, four and eight GPUs. The single-GPU producer differs from the multi-GPU path, and the four- and eight-GPU outputs also differed; intermediate latents were not retained, so the cause is not isolated. Kernels, quantization and rounding can change with execution layout. This is not evidence that parallelism inherently reduces quality. In the separate fixed-degree four-H100 transport test, native decoded video frames did match for both inputs.</p></aside>
+    </section>
+
+    <section class="transport-section" aria-labelledby="transport-heading">
+      <div class="section-shell section-space">
+        <div class="section-heading"><div><p class="eyebrow">05 / A controlled communication comparison</p><h2 id="transport-heading">Direct GPU transfers help.<br>How much depends on the workload.</h2></div></div>
+        <p class="section-intro">On a separate four-H100 host with NVLink, we kept the model, kernels, prompts, seeds and eight Turbo steps fixed within each application, then compared direct transfers with staging through host RAM.</p>
+        <div class="table-scroll" role="region" aria-label="Four H100 transport comparison" tabindex="0"><table><caption>Four H100 SXM GPUs · mean of two warm inputs per arm</caption><thead><tr><th scope="col">Engine / phase</th><th scope="col" class="numeric">Direct GPU</th><th scope="col" class="numeric">Host RAM</th><th scope="col" class="numeric">Less time</th></tr></thead><tbody id="transport-body"><tr><th scope="row">Cozy · complete inference</th><td class="numeric">55.802s</td><td class="numeric">66.963s</td><td class="numeric saving">16.7%</td></tr><tr><th scope="row">Cozy · denoising</th><td class="numeric">45.607s</td><td class="numeric">56.743s</td><td class="numeric saving">19.6%</td></tr><tr><th scope="row">ComfyUI · complete inference</th><td class="numeric">125.576s</td><td class="numeric">140.771s</td><td class="numeric saving">10.8%</td></tr><tr><th scope="row">ComfyUI · denoising</th><td class="numeric">96.867s</td><td class="numeric">109.271s</td><td class="numeric saving">11.4%</td></tr></tbody></table></div>
+        <div class="article-columns transport-copy"><p>Native NCCL logs proved all 12 directed routes. Physical counters recorded zero NVLink payload in the RAM-staged denoising windows; direct-transfer windows recorded about <strong>1.88 TB of transmitted NVLink payload per video</strong> across all four GPUs. Observed averages were 37.6 and 40.9 GB/s across denoising windows, including computation between transfers—not peak link bandwidth.</p><p>Counters were sampled every two seconds, so their brackets can include adjacent work. Cozy’s transport switch affects group traffic including VAE results; ComfyUI’s affects DiT activation exchanges. Compare the change within each application. This separate H100 study must not be mixed into the earlier H100 baseline means.</p></div>
+        <p class="caption">Cozy’s decoded video frames were byte-identical across its two transport arms for both timed inputs; decoded audio differed. ComfyUI’s decoded video and audio were not byte-identical. These observations do not establish a universal quality outcome. Direct PCIe peer access can work without NVLink when hardware and drivers support it, but all directed peer checks on this RTX 5090 host were unavailable.</p>
+      </div>
+    </section>
+
+    <section class="section-shell section-space" id="method" aria-labelledby="method-heading">
+      <div class="section-heading"><div><p class="eyebrow">06 / Methodology &amp; limits</p><h2 id="method-heading">What these numbers do—and don’t—say.</h2></div></div>
+      <div class="method-list">
+        <article><h3>Timing boundary &amp; sampling</h3><p>Warm worker generation includes conditioning, denoising, audio/video decoding and saving. Initial setup, model downloads, compilation, queueing and subsequent client transfer are excluded. Each cell uses one warmup and two timed scene inputs; every timed request recomputes conditioning and sampling. Two samples do not provide a confidence interval. All accepted clips passed full decode, frame, geometry, GPU-count, step-count and hash checks.</p></article>
+        <article><h3>Software &amp; process history</h3><p>H3 source is 1.27.0, with TensorFS 0.6.1. Native four/eight-GPU runs use Runtime 0.22.0; later single-GPU runs use 0.23.1. Relevant inference source, the compiled kernel extension and non-SDK dependencies match; the worker executable changed. This is disclosed cross-version application scaling, not an identical whole-worker binary comparison.</p><p>ComfyUI is v0.39.0, the latest release checked for this campaign, with Kitchen 0.2.37, PyTorch 2.14.0 / CUDA 13.0 and cuBLAS 13.2.0.9. MultiStream and PDD plugin revisions are pinned in the data file. Comfy starts a fresh server per mode and GPU count. Native regular runs retain idle Turbo contexts. The clean Comfy transport arms use Runtime 0.23.1 as background worker software and a separately pinned Comfy environment.</p></article>
+        <article><h3>Hardware &amp; scope</h3><p>RTX 5090 tests share one eight-card host and a 420 W limit per card. Equal power limits do not mean identical clocks. During denoising, Cozy/Comfy averaged 2170/1812 MHz for Turbo and 2012/1770 MHz for regular, around 66–67°C. Workload and boost behavior can differ; GPU throttle-reason flags were not recorded. Four cards stay within one NUMA node; eight span two. H100 tests use four SXM 80 GB cards at 700 W. No two-GPU or eight-H100 result is claimed.</p></article>
+        <article><h3>Conditioning &amp; output quality</h3><p>Cozy uses FP8-rowwise text-encoder weights. Comfy’s official text checkpoint stores BF16, while its loader reports FP16. Cozy also appends a blank line and <code>non_diegetic_music: N/A</code> to the same submitted scene description. Noise packing and attention arithmetic can differ; identical conditioned text or pixels across applications are not claimed. The encoder policies differ as described above.</p><p>These new FP8-text-encoder and multi-GPU clips still require human quality assessment. Approval of earlier single-GPU hybrid outputs does not automatically cover them. The 16 public videos are the original Turbo outputs; regular generation was also timed, but those clips are not part of this selection.</p></article>
+        <article><h3>Exclusions &amp; interpretation</h3><p>Runs affected by worker updates were excluded and replaced. One single-GPU Comfy regular replacement used a stock string-identity node to force fresh conditioning and sampling while retaining loader caches; prompt bytes and all 30 steps were unchanged. A cached-conditioning warmup, a refused request and a VRAM-cache experiment with zero resident cached blocks were also excluded.</p><p>This is a matched-schedule Comfy workflow, not its untouched defaults or a claim to have found its fastest possible configuration. The sparse node defaults to tau 1.3 and start_percent 0.2, which gives 2 dense + 6 sparse steps on this PDD8 schedule. We explicitly used tau 1.0 and a boundary giving 4 dense + 4 sparse for both engines. The H100 kernel choices were established qualified settings; this study did not exhaustively compare every H100 attention kernel. Earlier cohorts used different power limits, software or linear-layer paths and are not spliced into this scaling curve. Eight-GPU execution here used captured local packages; it does not claim that an automatic GPU-selection ladder chooses eight.</p></article>
+      </div>
+      <div class="data-banner"><div><h3>Inspect the measurements.</h3><p>Full means, individual timings, submitted prompts, seeds, software revisions and original clip hashes.</p></div><a class="button secondary" href="data.json" download>Download data.json <span aria-hidden="true">↓</span></a></div>
+      <p class="source-links">Upstream references: <a href="https://github.com/Comfy-Org/ComfyUI/tree/b0b743566f65daafc423b4fea8a2fbda94b3384a">ComfyUI</a> · <a href="https://github.com/martonsagi/Comfy-H3-MultiStream/tree/4e4381ff2cdb061a4cd0065af5b9c3679ded379a">H3 MultiStream</a> · <a href="https://docs.nvidia.com/cuda/cuda-programming-guide/03-advanced/multi-gpu-systems.html">CUDA peer access</a> · <a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html">NCCL transport controls</a></p>
+    </section>
+  </main>
+  <footer class="site-footer section-shell"><span>Cozy Creator · MiniMax H3 benchmarks</span><a href="#top">Back to top ↑</a></footer>
+</body>
+</html>

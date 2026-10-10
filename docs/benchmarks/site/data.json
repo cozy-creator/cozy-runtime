@@ -1,0 +1,590 @@
+{
+  "title": "MiniMax H3: Cozy Creator versus ComfyUI",
+  "date": "2026-10-09",
+  "inputs": [
+    {
+      "id": 1,
+      "label": "A \u00b7 Fighting",
+      "prompt": "integrated_multimodal_description: A continuous cinematic medium-wide tracking shot of two adult martial artists sparring on a training mat in a sunlit brick courtyard. One wears a red jacket and black trousers; the other wears a blue jacket and black trousers. They exchange a fast controlled sequence of punches, blocks and spinning kicks, duck past each other, briefly circle, and resume rapid footwork. Keep both full bodies in frame and their clothing identities consistent throughout. Show clear hands and feet, natural joints, believable contact and balance, fluttering fabric and sharp moving shadows. The camera moves around them smoothly at real-time speed, with no cuts or slow motion. audio: Quick footfalls, cloth swishes, exertion breaths and light contact sounds, no music or speech.",
+      "seed": 581204
+    },
+    {
+      "id": 2,
+      "label": "B \u00b7 Racing",
+      "prompt": "integrated_multimodal_description: A continuous cinematic low tracking shot of two rally cars racing through a tight left-hand bend on a rain-soaked asphalt circuit. A red car with two white stripes leads a blue car into the corner; the blue car draws alongside on the outside as both accelerate out. The camera tracks backward close to road level, keeping both cars clearly visible as wheels spin, suspension compresses over a curb and sheets of water spray from the tires. Preserve each car\u2019s colors, body shape and four wheels through the fast motion and partial spray occlusion. Detailed barriers and grandstands sweep past in strong parallax. Real-time racing, no cuts or slow motion. audio: Rising engine revs, gear changes, tire squeal and splashing water, no music or speech.",
+      "seed": 581205
+    }
+  ],
+  "artifacts": [
+    {
+      "id": "rtx5090-1-cozy-a",
+      "hardware": "rtx5090",
+      "gpu_count": 1,
+      "engine": "Cozy",
+      "input": 1,
+      "mode": "turbo",
+      "seconds": 353.205,
+      "attention": "Sage3 NVFP4 dense + Kitchen INT8 Sol",
+      "text_encoder": "FP8 rowwise",
+      "video": "media/rtx5090-1-cozy-a.mp4",
+      "poster": "posters/rtx5090-1-cozy-a.jpg",
+      "sha256": "45fe0c022489e35fa06dc6322ceb6bafb91de68c13e1d8936d8390685916c525",
+      "bytes": 23236479
+    },
+    {
+      "id": "rtx5090-1-cozy-b",
+      "hardware": "rtx5090",
+      "gpu_count": 1,
+      "engine": "Cozy",
+      "input": 2,
+      "mode": "turbo",
+      "seconds": 349.888,
+      "attention": "Sage3 NVFP4 dense + Kitchen INT8 Sol",
+      "text_encoder": "FP8 rowwise",
+      "video": "media/rtx5090-1-cozy-b.mp4",
+      "poster": "posters/rtx5090-1-cozy-b.jpg",
+      "sha256": "97f8a8bdbf4e7ae3ce35f75f66135a3d1af177973f42ebcf010eba5fad95d2ea",
+      "bytes": 19779836
+    },
+    {
+      "id": "rtx5090-4-cozy-a",
+      "hardware": "rtx5090",
+      "gpu_count": 4,
+      "engine": "Cozy",
+      "input": 1,
+      "mode": "turbo",
+      "seconds": 99.722,
+      "attention": "Sage3 NVFP4 dense + Kitchen INT8 Sol",
+      "text_encoder": "FP8 rowwise",
+      "video": "media/rtx5090-4-cozy-a.mp4",
+      "poster": "posters/rtx5090-4-cozy-a.jpg",
+      "sha256": "91275292b4e03603ca5049665f056ac7337f405f29b78b242b3a5ad5930f5ee2",
+      "bytes": 23170822
+    },
+    {
+      "id": "rtx5090-4-cozy-b",
+      "hardware": "rtx5090",
+      "gpu_count": 4,
+      "engine": "Cozy",
+      "input": 2,
+      "mode": "turbo",
+      "seconds": 107.161,
+      "attention": "Sage3 NVFP4 dense + Kitchen INT8 Sol",
+      "text_encoder": "FP8 rowwise",
+      "video": "media/rtx5090-4-cozy-b.mp4",
+      "poster": "posters/rtx5090-4-cozy-b.jpg",
+      "sha256": "f1560ef25519463f0f516b8850e14111b3c11120a18e2d6d0c7eaa42969576bc",
+      "bytes": 19720283
+    },
+    {
+      "id": "rtx5090-8-cozy-a",
+      "hardware": "rtx5090",
+      "gpu_count": 8,
+      "engine": "Cozy",
+      "input": 1,
+      "mode": "turbo",
+      "seconds": 62.197,
+      "attention": "Sage3 NVFP4 dense + Kitchen INT8 Sol",
+      "text_encoder": "FP8 rowwise",
+      "video": "media/rtx5090-8-cozy-a.mp4",
+      "poster": "posters/rtx5090-8-cozy-a.jpg",
+      "sha256": "f53af3cf3b15bc8106372ab03baa5ad1efe7e9df95cfba948991ffb219828be3",
+      "bytes": 23767293
+    },
+    {
+      "id": "rtx5090-8-cozy-b",
+      "hardware": "rtx5090",
+      "gpu_count": 8,
+      "engine": "Cozy",
+      "input": 2,
+      "mode": "turbo",
+      "seconds": 64.345,
+      "attention": "Sage3 NVFP4 dense + Kitchen INT8 Sol",
+      "text_encoder": "FP8 rowwise",
+      "video": "media/rtx5090-8-cozy-b.mp4",
+      "poster": "posters/rtx5090-8-cozy-b.jpg",
+      "sha256": "1818aa89270c55f05425ce013d1f1ae77001c3f69dcc1944ac71bc70d383e318",
+      "bytes": 20131518
+    },
+    {
+      "id": "h100-4-cozy-a",
+      "hardware": "h100",
+      "gpu_count": 4,
+      "engine": "Cozy",
+      "input": 1,
+      "mode": "turbo",
+      "seconds": 58.51,
+      "attention": "SageAttention dense + BF16 Sol",
+      "text_encoder": "FP8 rowwise",
+      "video": "media/h100-4-cozy-a.mp4",
+      "poster": "posters/h100-4-cozy-a.jpg",
+      "sha256": "abfe0bc06d7a48fa9bee5e367f76d2e8d1e5791162ac94c748ba767926e53e7e",
+      "bytes": 22737327
+    },
+    {
+      "id": "h100-4-cozy-b",
+      "hardware": "h100",
+      "gpu_count": 4,
+      "engine": "Cozy",
+      "input": 2,
+      "mode": "turbo",
+      "seconds": 52.54,
+      "attention": "SageAttention dense + BF16 Sol",
+      "text_encoder": "FP8 rowwise",
+      "video": "media/h100-4-cozy-b.mp4",
+      "poster": "posters/h100-4-cozy-b.jpg",
+      "sha256": "d299bfc4e005765c0807641fea99786f9f94474ab88fb81dcd3b6b87210669d3",
+      "bytes": 20084650
+    },
+    {
+      "id": "h100-4-comfyui-a",
+      "hardware": "h100",
+      "gpu_count": 4,
+      "engine": "ComfyUI",
+      "input": 1,
+      "mode": "turbo",
+      "seconds": 121.615,
+      "attention": "Kitchen INT8 dense + Kitchen INT8 Sol",
+      "text_encoder": "Official BF16 checkpoint; loader reports FP16",
+      "video": "media/h100-4-comfyui-a.mp4",
+      "poster": "posters/h100-4-comfyui-a.jpg",
+      "sha256": "799ca1f044560c82f51247b8246d14a8564793e2696be88f4277795548e7cd05",
+      "bytes": 16404615
+    },
+    {
+      "id": "h100-4-comfyui-b",
+      "hardware": "h100",
+      "gpu_count": 4,
+      "engine": "ComfyUI",
+      "input": 2,
+      "mode": "turbo",
+      "seconds": 122.171,
+      "attention": "Kitchen INT8 dense + Kitchen INT8 Sol",
+      "text_encoder": "Official BF16 checkpoint; loader reports FP16",
+      "video": "media/h100-4-comfyui-b.mp4",
+      "poster": "posters/h100-4-comfyui-b.jpg",
+      "sha256": "9267cdf13b02934ef9e03176b89210c0721502174b9472dd126fe87a34f67afa",
+      "bytes": 17087917
+    },
+    {
+      "id": "rtx5090-1-comfyui-a",
+      "hardware": "rtx5090",
+      "gpu_count": 1,
+      "engine": "ComfyUI",
+      "input": 1,
+      "mode": "turbo",
+      "seconds": 364.334,
+      "attention": "Kitchen INT8 dense + Kitchen INT8 Sol",
+      "text_encoder": "Official BF16 checkpoint; loader reports FP16",
+      "video": "media/rtx5090-1-comfyui-a.mp4",
+      "poster": "posters/rtx5090-1-comfyui-a.jpg",
+      "sha256": "604efeb8181aaedecbffa5d631d836edf60ffd577bfd53418e8139a569676a4e",
+      "bytes": 17991229
+    },
+    {
+      "id": "rtx5090-1-comfyui-b",
+      "hardware": "rtx5090",
+      "gpu_count": 1,
+      "engine": "ComfyUI",
+      "input": 2,
+      "mode": "turbo",
+      "seconds": 364.223,
+      "attention": "Kitchen INT8 dense + Kitchen INT8 Sol",
+      "text_encoder": "Official BF16 checkpoint; loader reports FP16",
+      "video": "media/rtx5090-1-comfyui-b.mp4",
+      "poster": "posters/rtx5090-1-comfyui-b.jpg",
+      "sha256": "7d6c393556e2693096d4bd70892b611ffc346b30c6a440d055544f227b61c4dd",
+      "bytes": 17196528
+    },
+    {
+      "id": "rtx5090-4-comfyui-a",
+      "hardware": "rtx5090",
+      "gpu_count": 4,
+      "engine": "ComfyUI",
+      "input": 1,
+      "mode": "turbo",
+      "seconds": 150.397,
+      "attention": "Kitchen INT8 dense + Kitchen INT8 Sol",
+      "text_encoder": "Official BF16 checkpoint; loader reports FP16",
+      "video": "media/rtx5090-4-comfyui-a.mp4",
+      "poster": "posters/rtx5090-4-comfyui-a.jpg",
+      "sha256": "a6d0bbe5eb7672330684b40743ea2a2fb205db8405be4e0368d55a9490646213",
+      "bytes": 17408727
+    },
+    {
+      "id": "rtx5090-4-comfyui-b",
+      "hardware": "rtx5090",
+      "gpu_count": 4,
+      "engine": "ComfyUI",
+      "input": 2,
+      "mode": "turbo",
+      "seconds": 147.905,
+      "attention": "Kitchen INT8 dense + Kitchen INT8 Sol",
+      "text_encoder": "Official BF16 checkpoint; loader reports FP16",
+      "video": "media/rtx5090-4-comfyui-b.mp4",
+      "poster": "posters/rtx5090-4-comfyui-b.jpg",
+      "sha256": "162a6380d0995cb01928039b344e5481c895b62e4660aab806499fe65a3f4589",
+      "bytes": 17022477
+    },
+    {
+      "id": "rtx5090-8-comfyui-a",
+      "hardware": "rtx5090",
+      "gpu_count": 8,
+      "engine": "ComfyUI",
+      "input": 1,
+      "mode": "turbo",
+      "seconds": 109.457,
+      "attention": "Kitchen INT8 dense + Kitchen INT8 Sol",
+      "text_encoder": "Official BF16 checkpoint; loader reports FP16",
+      "video": "media/rtx5090-8-comfyui-a.mp4",
+      "poster": "posters/rtx5090-8-comfyui-a.jpg",
+      "sha256": "a51426dd50cecd67a59662da775f97bedc45dc6711e8944430b6c9fe3322c5ae",
+      "bytes": 17410554
+    },
+    {
+      "id": "rtx5090-8-comfyui-b",
+      "hardware": "rtx5090",
+      "gpu_count": 8,
+      "engine": "ComfyUI",
+      "input": 2,
+      "mode": "turbo",
+      "seconds": 112.327,
+      "attention": "Kitchen INT8 dense + Kitchen INT8 Sol",
+      "text_encoder": "Official BF16 checkpoint; loader reports FP16",
+      "video": "media/rtx5090-8-comfyui-b.mp4",
+      "poster": "posters/rtx5090-8-comfyui-b.jpg",
+      "sha256": "79858b9304c94a0a3f481a8e46277126090625d315afead236282926b881658e",
+      "bytes": 17027135
+    }
+  ],
+  "results": [
+    {
+      "hardware": "rtx5090",
+      "gpu_count": 1,
+      "mode": "turbo",
+      "cozy_seconds": 351.5465,
+      "comfy_seconds": 364.2785,
+      "cozy_samples_seconds": [
+        353.205,
+        349.888
+      ],
+      "comfy_samples_seconds": [
+        364.334,
+        364.223
+      ]
+    },
+    {
+      "hardware": "rtx5090",
+      "gpu_count": 1,
+      "mode": "regular",
+      "cozy_seconds": 998.5150000000001,
+      "comfy_seconds": 1109.437,
+      "cozy_samples_seconds": [
+        1004.46,
+        992.57
+      ],
+      "comfy_samples_seconds": [
+        1111.487,
+        1107.387
+      ]
+    },
+    {
+      "hardware": "rtx5090",
+      "gpu_count": 4,
+      "mode": "turbo",
+      "cozy_seconds": 103.44149999999999,
+      "comfy_seconds": 149.151,
+      "cozy_samples_seconds": [
+        99.722,
+        107.161
+      ],
+      "comfy_samples_seconds": [
+        150.397,
+        147.905
+      ]
+    },
+    {
+      "hardware": "rtx5090",
+      "gpu_count": 4,
+      "mode": "regular",
+      "cozy_seconds": 296.341,
+      "comfy_seconds": 430.457,
+      "cozy_samples_seconds": [
+        297.63,
+        295.052
+      ],
+      "comfy_samples_seconds": [
+        435.958,
+        424.956
+      ]
+    },
+    {
+      "hardware": "rtx5090",
+      "gpu_count": 8,
+      "mode": "turbo",
+      "cozy_seconds": 63.271,
+      "comfy_seconds": 110.892,
+      "cozy_samples_seconds": [
+        62.197,
+        64.345
+      ],
+      "comfy_samples_seconds": [
+        109.457,
+        112.327
+      ]
+    },
+    {
+      "hardware": "rtx5090",
+      "gpu_count": 8,
+      "mode": "regular",
+      "cozy_seconds": 178.00799999999998,
+      "comfy_seconds": 333.738,
+      "cozy_samples_seconds": [
+        177.404,
+        178.612
+      ],
+      "comfy_samples_seconds": [
+        331.906,
+        335.57
+      ]
+    },
+    {
+      "hardware": "h100",
+      "gpu_count": 4,
+      "mode": "turbo",
+      "cozy_seconds": 55.525,
+      "comfy_seconds": 121.893,
+      "cozy_samples_seconds": [
+        58.51,
+        52.54
+      ],
+      "comfy_samples_seconds": [
+        121.615,
+        122.171
+      ]
+    },
+    {
+      "hardware": "h100",
+      "gpu_count": 4,
+      "mode": "regular",
+      "cozy_seconds": 154.293,
+      "comfy_seconds": 353.8235,
+      "cozy_samples_seconds": [
+        157.263,
+        151.323
+      ],
+      "comfy_samples_seconds": [
+        353.047,
+        354.6
+      ]
+    }
+  ],
+  "transport": {
+    "cozy": {
+      "peer_seconds": 55.802,
+      "host_seconds": 66.9625,
+      "peer_denoise_seconds": 45.6073515,
+      "host_denoise_seconds": 56.7426125
+    },
+    "comfy": {
+      "peer_seconds": 125.576,
+      "host_seconds": 140.7705,
+      "peer_denoise_seconds": 96.8672465,
+      "host_denoise_seconds": 109.2706325
+    },
+    "hardware": "4 \u00d7 H100 SXM 80 GB",
+    "scope": "Separate host; Turbo 8 steps; within-engine direct GPU versus host-memory control."
+  },
+  "versions": {
+    "native_runtime_by_degree": {
+      "1": "0.23.1",
+      "4_and_8": "0.22.0"
+    },
+    "tensorfs": "0.6.1",
+    "h3": "1.27.0",
+    "runtime_022_source_commit": "bdd6f8189af40e7981d2318597527b0ae3e48cbf",
+    "runtime_022_annotated_tag_object": "ff989a073edd9705719d42f4760ca42fae0efafa",
+    "runtime_0231_source_commit": "24b2bf55f74a13e235daede130e83b2c04bf628b",
+    "tensord_by_degree": {
+      "1": "0.5.1",
+      "4_and_8": "0.4.0"
+    },
+    "h3_source_commit": "0ba9b1460ad0476ce4c6c6d6ba6bc5099f4336a3",
+    "comfy_sources": {
+      "comfy": {
+        "repo": "Comfy-Org/ComfyUI",
+        "release": "v0.39.0",
+        "commit": "b0b743566f65daafc423b4fea8a2fbda94b3384a"
+      },
+      "multistream": {
+        "repo": "martonsagi/Comfy-H3-MultiStream",
+        "commit": "4e4381ff2cdb061a4cd0065af5b9c3679ded379a"
+      },
+      "pdd": {
+        "repo": "Jalen-Brunson/ComfyUI-MiniMax-H3-PDD-Acc",
+        "commit": "311a65dd53832d8a5f8177a9d5fb923c09e35a90"
+      }
+    },
+    "comfy_settings": {
+      "width": 1344,
+      "height": 768,
+      "frames": 362,
+      "fps": 24,
+      "attention": "Kitchen INT8 dense + Kitchen Sol",
+      "tau": 1,
+      "protected_dense_blocks": [
+        0,
+        1
+      ],
+      "conditioning_policy": "exact_kv_and_rows",
+      "comfy_torch": "2.14.0+cu130",
+      "comfy_cublas_overlay": "13.2.0.9",
+      "comfy_kitchen": "0.2.37",
+      "multi_gpu_transformer_split": "MultiStream; single GPU uses stock path",
+      "multi_gpu_video_vae_split": true,
+      "text_weight_cache": true,
+      "conditioning_output_cache_entries": 0,
+      "encoding": {
+        "codec": "libx264",
+        "crf": 18,
+        "preset": "not passed by pinned Comfy SaveVideo; actual bitstream matches medium",
+        "native_comparison": "CRF17 and explicit veryfast; separate encoder policy from denoising claims"
+      }
+    }
+  },
+  "scaling": [
+    {
+      "engine": "Cozy",
+      "mode": "turbo",
+      "from_gpus": 1,
+      "to_gpus": 4,
+      "whole_run_speedup": 3.398505435439355,
+      "denoise_speedup": 3.5716276595339376
+    },
+    {
+      "engine": "Cozy",
+      "mode": "turbo",
+      "from_gpus": 1,
+      "to_gpus": 8,
+      "whole_run_speedup": 5.556202683693951,
+      "denoise_speedup": 5.962544030455071
+    },
+    {
+      "engine": "Cozy",
+      "mode": "turbo",
+      "from_gpus": 4,
+      "to_gpus": 8,
+      "whole_run_speedup": 1.6348959238829794,
+      "denoise_speedup": 1.669419267302103
+    },
+    {
+      "engine": "Cozy",
+      "mode": "regular",
+      "from_gpus": 1,
+      "to_gpus": 4,
+      "whole_run_speedup": 3.3694797547420037,
+      "denoise_speedup": 3.4017331816110863
+    },
+    {
+      "engine": "Cozy",
+      "mode": "regular",
+      "from_gpus": 1,
+      "to_gpus": 8,
+      "whole_run_speedup": 5.609382724371939,
+      "denoise_speedup": 5.678806024465232
+    },
+    {
+      "engine": "Cozy",
+      "mode": "regular",
+      "from_gpus": 4,
+      "to_gpus": 8,
+      "whole_run_speedup": 1.6647622578760508,
+      "denoise_speedup": 1.669386080943511
+    },
+    {
+      "engine": "ComfyUI",
+      "mode": "turbo",
+      "from_gpus": 1,
+      "to_gpus": 4,
+      "whole_run_speedup": 2.442347017452112,
+      "denoise_speedup": 2.5658290324020383
+    },
+    {
+      "engine": "ComfyUI",
+      "mode": "turbo",
+      "from_gpus": 1,
+      "to_gpus": 8,
+      "whole_run_speedup": 3.284984489413123,
+      "denoise_speedup": 3.5259901547778933
+    },
+    {
+      "engine": "ComfyUI",
+      "mode": "turbo",
+      "from_gpus": 4,
+      "to_gpus": 8,
+      "whole_run_speedup": 1.3450113624066662,
+      "denoise_speedup": 1.3742108730748075
+    },
+    {
+      "engine": "ComfyUI",
+      "mode": "regular",
+      "from_gpus": 1,
+      "to_gpus": 4,
+      "whole_run_speedup": 2.57734686623751,
+      "denoise_speedup": 2.6198074702683334
+    },
+    {
+      "engine": "ComfyUI",
+      "mode": "regular",
+      "from_gpus": 1,
+      "to_gpus": 8,
+      "whole_run_speedup": 3.3242753297496836,
+      "denoise_speedup": 3.3900852747853443
+    },
+    {
+      "engine": "ComfyUI",
+      "mode": "regular",
+      "from_gpus": 4,
+      "to_gpus": 8,
+      "whole_run_speedup": 1.28980517651571,
+      "denoise_speedup": 1.2940207680368647
+    }
+  ],
+  "limitations": [
+    "These are observed warm worker generation times through output saving, excluding startup, downloads, compilation, queueing and transfer to the client.",
+    "Each mean uses two timed inputs after a warmup. Two samples are not a confidence interval.",
+    "The sixteen public clips are the original Turbo outputs. Regular generation was also timed; its videos are not included in this selection.",
+    "Submitted scene descriptions and seeds match. Cozy appends a blank line and non_diegetic_music: N/A; Comfy encodes the submitted text directly.",
+    "Cozy uses FP8-rowwise text-encoder weights; Comfy stores BF16 text weights and its loader reports FP16. Identical conditioning and pixels are not claimed.",
+    "Cozy encodes x264 CRF17/veryfast; Comfy uses CRF18 without a preset override. Whole-run times include these policies.",
+    "Native one-GPU Runtime is 0.23.1; four/eight-GPU Runtime is 0.22.0. Relevant inference source and compiled kernel extension match, but the TensorD worker executable changed.",
+    "The 5090s share a 420 W cap and use automatic boost. Cozy/Comfy denoising averaged 2170/1812 MHz for Turbo and 2012/1770 MHz for regular, around 66-67 C. GPU throttle-reason flags were not sampled.",
+    "Single-GPU Cozy uses a shared-QKV producer; multi-GPU uses head-local materialized attention. This is application scaling with disclosed implementation differences.",
+    "Native runs Turbo then regular with idle Turbo contexts retained. Comfy starts a fresh server for each GPU count and mode.",
+    "The RTX 5090 host has no usable direct peer access. Four cards share a NUMA node; eight cross two nodes. The H100s have NVLink.",
+    "All accepted clips passed full audio/video decoding, geometry, GPU-count, step-count and hash checks. These checks do not establish perceptual equivalence; judge quality from the originals.",
+    "Worker-update-overlap samples were excluded and replaced. The replacement single-5090 Comfy regular sample recomputed conditioning and all 30 steps through a stock PrimitiveString cache invalidation."
+  ],
+  "comparison_policy": {
+    "comfy_turbo_tested": {
+      "dense_steps": 4,
+      "sparse_steps": 4,
+      "start_percent": 0.4434782451819378,
+      "tau": 1.0,
+      "dense_blocks": [
+        0,
+        1
+      ],
+      "extra_tokens": 0
+    },
+    "comfy_sparse_node_defaults": {
+      "start_percent": 0.2,
+      "dense_steps_on_pdd8": 2,
+      "sparse_steps_on_pdd8": 6,
+      "tau": 1.3,
+      "dense_blocks": [],
+      "extra_tokens": 256
+    },
+    "h100_kernel_selection": "Previously qualified settings; not an exhaustive H100 kernel comparison."
+  }
+}

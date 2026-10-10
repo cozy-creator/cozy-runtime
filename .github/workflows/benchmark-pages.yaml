@@ -1,0 +1,58 @@
+name: Publish benchmark site
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - docs/benchmarks/site/**
+      - scripts/build-benchmark-site.py
+      - .github/workflows/benchmark-pages.yaml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: benchmark-pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pages: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/configure-pages@v5
+      - name: Download the original comparison media
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import json, subprocess
+          from pathlib import Path
+          m = json.loads(Path('docs/benchmarks/site/media-manifest.json').read_text())
+          subprocess.run(['gh', 'release', 'download', m['release_tag'], '--pattern', m['archive'], '--dir', 'benchmark-media'], check=True)
+          subprocess.run(['python3', 'scripts/build-benchmark-site.py', '--media-archive', str(Path('benchmark-media') / m['archive']), '--output', '_benchmark_site'], check=True)
+          PY
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: _benchmark_site
+  deploy:
+    if: github.ref == 'refs/heads/master'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy benchmark site
+        id: deployment
+        uses: actions/deploy-pages@v4
