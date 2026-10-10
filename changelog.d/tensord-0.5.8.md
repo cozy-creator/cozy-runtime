@@ -1,0 +1,1 @@
+Bundles TensorD 0.5.8: a remove run uninstalls a package from a machine and Status names each installation's Hub (tensord#204); every job ends completed or failed, so a queued job that cannot start fails with its reason instead of parking and holding its rental (tensord#205).
