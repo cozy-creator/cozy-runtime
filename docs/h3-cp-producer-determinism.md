@@ -23,6 +23,27 @@ SageAttention2 keeps its INT8 Q/K and FP8 P/V arithmetic, with a fixed K-mean re
 
 ## Evidence and limits
 
+The official H3 audio decode now scopes `torch.backends.cudnn.deterministic=True`
+to its existing audio block and restores the previous value on success or error.
+It preserves all other backend settings and the published mean/std and decoder
+operations. Runtime already disables cuDNN benchmarking at component entry.
+
+H100 runs 5337/5338 had identical final normalized audio latent bytes across one
+and two GPUs, but repeated decodes of each unchanged latent produced different
+waveforms. Isolated run 5340 reproduced that baseline difference; three decodes
+with cuDNN deterministic selection produced identical waveform bytes. The only
+observed numerical-setting change was `cudnn.deterministic`. The selected internal
+cuDNN algorithms and their precision were not traced.
+
+The two warmed decoder samples averaged 0.1775 seconds before the change and
+0.3070 seconds with deterministic selection: about **0.1295 seconds extra per
+decode** on that H100. The observed cumulative allocation peak increased by
+265 MiB; this is not an isolated workspace measurement. The candidate waveform
+also changed: one comparison had relative L2 error 0.001352 and maximum absolute
+difference 0.0002022 versus the baseline. This records numerical differences; it does
+not establish unchanged perceived quality. These are decoder measurements for
+one saved latent, and the integrated full-video one/two-GPU check is still pending.
+
 An earlier private build of the RTX implementation produced byte-identical delivered MP4 files for one 15-second Turbo input across actual one-GPU run 5315 and two-GPU runs 5307/5308. All 362 decoded RGB frames and decoded audio samples also matched. This was a retrospective comparison across different hosts and drivers, so its timings are not a controlled speed comparison. Only the single-GPU run retained pre-encoding diagnostics; equality of every intermediate tensor is not established.
 
 Separate GPU probes covered dense reductions, sparse statistics, FP8 projections with inactive/baked/unbaked LoRA, real two-rank exchange, retries and request cleanup. The faster shared-projection candidate reduced complete sparse-attention time from 213.09 ms to 195.46 ms in three paired samples on the tested two-5090 host. That is an attention-operation measurement, not a full-video speed claim.
