@@ -1,0 +1,2 @@
+[application]
+object = "sage3_collective_probe:app"
