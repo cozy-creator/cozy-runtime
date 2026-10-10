@@ -146,7 +146,7 @@ def audio_replay(
 ) -> ReplayOutput:
     """Three baseline and three scoped deterministic decodes, without denoising or video."""
     ctx.raise_if_cancelled()
-    latent = restore(payload, ctx.device)
+    latent = restore(payload, torch.device(str(ctx.device)))
     state = PipelineState({"audio_latents": latent, "image": None, "last_image": None})
     checks = NumericalChecks(tel, model.pipe.resident)
     before = numerical_context()

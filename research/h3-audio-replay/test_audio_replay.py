@@ -11,7 +11,7 @@ import torch
 from diffusers.modular_pipelines.minimax_h3.decoders import MiniMaxH3AudioDecodeStep
 from diffusers.modular_pipelines.modular_pipeline import PipelineState
 
-from cozy_runtime.author import InvalidRequest, describe
+from cozy_runtime.author import Device, InvalidRequest, describe
 
 
 class Blob:
@@ -112,6 +112,21 @@ class TestReplay(unittest.TestCase):
         self.assertTrue(all(row["unchanged"] for row in report["latent_custody"]))
         self.assertTrue(report["context_restored_exactly"])
         self.assertEqual(replay.numerical_context(), initial)
+
+    def test_actual_public_device_entrypoint(self):
+        decoder = Decoder()
+        result = replay.audio_replay(
+            SimpleNamespace(device=Device("cpu"), raise_if_cancelled=lambda: None),
+            request(),
+            decoder,
+            SimpleNamespace(save_bytes=lambda raw, **_: raw),
+            SimpleNamespace(stage=lambda _: nullcontext()),
+        )
+        report = json.loads(result.diagnostics)
+        self.assertEqual(report["process"]["device"], "cpu")
+        self.assertEqual(decoder.calls, 6)
+        self.assertTrue(report["context_restored_exactly"])
+        self.assertTrue(all(row["unchanged"] for row in report["latent_custody"]))
 
 
 if __name__ == "__main__":
