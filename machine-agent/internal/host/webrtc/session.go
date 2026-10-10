@@ -235,6 +235,10 @@ func (c *session) hello(raw []byte, text bool) {
 		c.bye("auth", "the first message must be hello{v: 1, cap}")
 		return
 	}
+	if err := c.srv.cfg.Source.RefreshKeys(c.ctx); err != nil {
+		c.bye("authority_unavailable", "current machine authority could not be verified")
+		return
+	}
 	keys, _ := c.srv.cfg.Source.Keys()
 	g, err := capability.Verify(h.Cap, c.srv.cfg.Machine, keys, time.Now(), c.ch.binding)
 	switch {

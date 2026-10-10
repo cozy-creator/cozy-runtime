@@ -33,9 +33,7 @@ func (m *Machine) describeMachine(stream grpc.ServerStream) error {
 	if m.grant.HubOrigin != "" {
 		host.Hubs = append(host.Hubs, &pb.MachineHub{Origin: m.grant.HubOrigin, MachineId: m.grant.WorkerID})
 	}
-	for _, other := range m.grant.Hubs {
-		host.Hubs = append(host.Hubs, &pb.MachineHub{Origin: other.Origin, MachineId: other.WorkerID})
-	}
+
 	if !m.owned && !m.idle.releasedNow() {
 		host.IdleDeadlineUnixMs = uint64(m.idle.deadline().UnixMilli())
 	}

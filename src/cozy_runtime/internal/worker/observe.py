@@ -164,68 +164,6 @@ def degradation(subject: str, needed: int, had: int, component: str) -> Confessi
     )
 
 
-# --------------------------------------------------------------------------- demand
-
-
-@dataclass(slots=True)
-class DemandLedger:
-    """Declared-versus-actual, banked per serve. THE FALSIFIER, and it decides nothing.
-
-    §3.2's demand discipline puts the instrument FIRST and gives it no authority, because
-    the v1 failure was an estimator that could refuse. This one lives in the OBSERVATION
-    plane on purpose: the `timing-decides-nothing` fence already proves this module cannot
-    import the planner, the ledger or the fill plane, and cannot name a residency
-    operation — so "the instrument cannot enforce" is a property of the import graph rather
-    than a rule someone has to remember.
-
-    A `demand_miss` is counted per LANE — `(entrypoint, placement rung)`, which is the
-    launch regime's cell — and never per request, so one pathological request cannot look
-    like a broken model. Warm-pass observations are marked and never banked (se#715).
-    """
-
-    #: lane -> (serves, misses, worst declared, worst actual)
-    lanes: dict[str, list[int]] = field(default_factory=dict)
-
-    def bank(
-        self, lane: str, declared: int, actual: int, *, benchmark: bool = False
-    ) -> Confession | None:
-        """Bank one serve's pair. Returns a CONFESSION when the declaration was short.
-
-        A benchmark-override serve banks NOTHING: a synthetic payload at a cheapened
-        schedule is not evidence about demand, and letting one in is how a measurement
-        starts describing the harness.
-        """
-        if benchmark or actual < 0 or declared <= 0:
-            return None
-        row = self.lanes.setdefault(lane, [0, 0, 0, 0])
-        row[0] += 1
-        if actual <= declared:
-            return None
-        row[1] += 1
-        if actual - declared > row[3] - row[2]:
-            row[2], row[3] = declared, actual
-        return Confession(
-            "demand_miss",
-            lane,
-            f"declared {declared} B of headroom and the serve used {actual} B, short by "
-            f"{actual - declared} B; {row[1]} miss(es) in {row[0]} serve(s) on this lane",
-        )
-
-    def document(self) -> dict[str, object]:
-        return {
-            "lanes": {
-                lane: {
-                    "serves": row[0],
-                    "misses": row[1],
-                    "worst_declared_bytes": row[2],
-                    "worst_actual_bytes": row[3],
-                }
-                for lane, row in sorted(self.lanes.items())
-            },
-            "authority": "none - this instrument counts and confesses; it selects nothing",
-        }
-
-
 # ------------------------------------------------------------------------- the boot record
 
 

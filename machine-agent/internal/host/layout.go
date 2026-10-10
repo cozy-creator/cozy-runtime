@@ -100,7 +100,7 @@ func prepare(g *Grant, l Layout) (*Identity, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := projectHubAccess(g.Hubs, access, l); err != nil {
+	if err := projectHubAccess(access, l); err != nil {
 		return nil, err
 	}
 	leaf, err := leaf(l.boot("tls.crt"), l.boot("tls.key"))

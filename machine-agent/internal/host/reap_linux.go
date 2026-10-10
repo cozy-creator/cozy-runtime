@@ -2,12 +2,17 @@ package host
 
 import (
 	"os"
+	"os/exec"
 	"os/signal"
 	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
+
+// A Runtime wheel can replace the installed agent pathname during startup.
+// Its guardian must still execute this process's inode, preserving their private IPC.
+func guardianExecutable() (string, error) { return "/proc/self/exe", nil }
 
 // The guardian is the subreaper of the Runtime's process tree: an executor orphaned by a
 // Runtime that died is adopted and reaped here.
@@ -38,5 +43,21 @@ func reapOrphans() {
 		if _, err := unix.Wait4(pid, &status, unix.WNOHANG, nil); err != nil {
 			return
 		}
+	}
+}
+
+// A maintenance helper has no accepted workload. Its descendants share a group
+// so a measured stall cannot leave uv/probe children holding output pipes open.
+func prepareMaintenanceProcess(cmd *exec.Cmd) {
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if cmd.Cancel != nil {
+		cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
+	}
+}
+func killMaintenanceProcess(cmd *exec.Cmd) { _ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
+
+func requestPlaneCredential(cmd *exec.Cmd) {
+	if os.Geteuid() == 0 {
+		cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: machineUID, Gid: machineUID, Groups: []uint32{}}}
 	}
 }

@@ -155,6 +155,20 @@ def _nvml_handle(library: ctypes.CDLL, device: str) -> ctypes.c_void_p | None:
     return handle if answer == _NVML_SUCCESS else None
 
 
+def device_architecture(device: str, kind: str) -> int | None:
+    """Read compilation architecture through NVML without creating a CUDA context."""
+    if kind != "cuda" or (library := _nvml_library()) is None:
+        return None
+    handle = _nvml_handle(library, device)
+    query = getattr(library, "nvmlDeviceGetCudaComputeCapability", None)
+    if handle is None or query is None:
+        return None
+    major, minor = ctypes.c_int(), ctypes.c_int()
+    if query(handle, ctypes.byref(major), ctypes.byref(minor)) != _NVML_SUCCESS:
+        return None
+    return major.value * 10 + minor.value if major.value > 0 else None
+
+
 def _nvml_device_compute_table(
     library: ctypes.CDLL, handle: ctypes.c_void_p
 ) -> dict[int, int] | None:
@@ -215,7 +229,7 @@ def _table_rows(pids: set[int], table: dict[int, int]) -> dict[int, ProcessMemor
 
 
 def process_memories_by_device(
-    pids: set[int], kind: str, devices: tuple[str, ...]
+    pids: set[int], kind: str, devices: tuple[str, ...], *, allow_subprocess: bool = True
 ) -> dict[str, dict[int, ProcessMemory]]:
     """`process_memories`, PER DEVICE of a lane (cr-068): entry -> pid -> the driver's row.
 
@@ -236,7 +250,7 @@ def process_memories_by_device(
         if library is not None:
             handle = _nvml_handle(library, device)
             table = _nvml_device_compute_table(library, handle) if handle is not None else None
-        else:
+        elif allow_subprocess:
             try:
                 lines = (
                     subprocess.run(
@@ -393,13 +407,6 @@ def initialized(torch: Any, kind: str) -> bool:
     if kind == "cuda":
         return bool(torch.cuda.is_initialized())
     return False
-
-
-def is_oom(torch: Any, exc: BaseException) -> bool:
-    """The OOM PRIMITIVE only — what the failure IS. What it MEANS (#418's
-    accepted_envelope_breach classification) stays with the attempt lifecycle."""
-    oom = getattr(torch.cuda, "OutOfMemoryError", ())
-    return isinstance(exc, oom)
 
 
 def oom_error(torch: Any, kind: str) -> type[BaseException]:

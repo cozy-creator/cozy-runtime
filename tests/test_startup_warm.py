@@ -1,11 +1,12 @@
-"""The startup warm (h3a-087): a serving call's executor starts, and proves its attention
-kernels, while its weights download; a request that is ready takes the started process without
-waiting on warm work it does not need; a started process never sits on another root's GPU.
+"""A serving executor imports code while weights download, without speculative GPU work.
+
+An adopted process initializes its device only after demand receives ownership. Prespawned
+imports never launch kernels, and their device affinity does not reserve another root's GPU.
 
 Real Worker, real durable journal, a real TensorFS pull from an in-process origin whose
 object GETs are held open (the slow download), a real package environment the worker opens
-like any installed one, and real executor processes on this machine's GPU. The one fake is
-`accel.device_memory`, the hardware memory seam, where a test needs cards this box lacks.
+like any installed one, and real executor processes sealed to this machine's devices. The
+one fake is `accel.device_memory`, where a test needs cards this box lacks.
 """
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ import signed_claims
 from cozy_runtime import canonical_json
 from cozy_runtime.internal import package_interface
 from cozy_runtime.internal.discovery import discover
+from cozy_runtime.internal.worker.child import Executor
 from cozy_runtime.internal.worker.control import InMemoryControlHost
 from cozy_runtime.internal.worker.gpu_scheduler import Demand
 from cozy_runtime.internal.worker.machine_child_target import Target
@@ -358,8 +360,23 @@ def _call(parent: str) -> tuple[Call, pb.ChildCallRequest]:
     return call, pb.ChildCallRequest(parent_attempt_ordinal=1)
 
 
+def _assert_imported(executor: Executor) -> None:
+    """Inspect the existing startup receipt; observation must not initialize CUDA."""
+    assert executor.alive()
+    reply = executor.started
+    assert reply["imported"] is True and reply["started"] is False
+    assert reply["warmed"] is False
+    assert reply["device_total_bytes"] == reply["device_free_bytes"] == -1
+    zero = {"allocated_bytes": 0, "reserved_bytes": 0, "overhead_bytes": 0}
+    assert reply["memory"] == zero
+    assert reply["rank_memory"] == {
+        str(rank): zero for rank in range(len(executor.sealed_devices.split(",")))
+    }
+    assert not {"cuda_init", "package_warmup", "group_form"} & dict(reply["stages"]).keys()
+
+
 @needs_gpu
-def test_a_slow_download_overlaps_the_executor_start_and_its_probes(
+def test_a_slow_download_overlaps_imports_without_device_startup(
     warm: Callable[..., Warm],
 ) -> None:
     machine = warm()
@@ -374,23 +391,22 @@ def test_a_slow_download_overlaps_the_executor_start_and_its_probes(
         assert origin.started.wait(60), f"the download never began: {future.exception(0.1)!r}"
         # The weights are still in flight: every object GET is held open.
         phases = _wait(
-            lambda: (p := machine.phases("A")).get("Starting kernel compiles") and p,
-            "the prespawned executor starting its compiles",
+            lambda: (p := machine.phases("A")).get("Starting model executor") and p,
+            "the prespawned executor completing its imports",
         )
         assert not future.done() and origin.landed == 0.0
         started = phases["Starting model executor"]
-        probes = phases["Starting kernel compiles"]
-        assert started["completed"] and probes["completed"], phases
+        assert started["completed"] and "Starting kernel compiles" not in phases, phases
         assert started["ordinals"] == [0] and "torch_import" in started["detail"]
-        assert "GPU 0: " in probes["detail"] and "sdpa ready" in probes["detail"], probes
-        # The download still holds; now it lands, after the start and the probes.
+        # The download still holds; now it lands, after CPU import preparation.
         origin.release.set()
         prepared = future.result(120)
         assert prepared.placement["installation_id"] == INSTALLATION
-        assert origin.landed * 1000 > probes["started_unix_ms"] + probes["elapsed_ms"]
-        # The started process waits on its GPU, sealed there, at the lowest priority.
+        assert origin.landed * 1000 > started["started_unix_ms"] + started["elapsed_ms"]
+        # Device affinity is sealed, but the idle imported process has no CUDA context.
         (slot,) = machine.worker.prespawns.slots.values()
-        assert slot.executor is not None and slot.executor.alive() and slot.executor.started
+        assert slot.executor is not None
+        _assert_imported(slot.executor)
         assert slot.executor.sealed_devices == "0"
         assert machine.worker._warm((INSTALLATION, "any")) == (0,)
         assert os.getpriority(os.PRIO_PROCESS, slot.executor.pid) == 19
@@ -399,12 +415,11 @@ def test_a_slow_download_overlaps_the_executor_start_and_its_probes(
 
 
 @needs_gpu
-def test_a_ready_request_takes_the_started_process_and_skips_the_probes_it_does_not_need(
+def test_a_ready_request_adopts_the_imported_process_without_speculative_warmup(
     warm: Callable[..., Warm],
 ) -> None:
-    """The grant arrives while the process is still starting: the replica waits out only the
-    start it would pay itself, takes that very process at ordinary priority, and no probe is
-    sent to it — its own construction proves exactly the kernels it selects."""
+    """A claim during import preparation takes that process at ordinary priority. Adoption
+    alone creates no CUDA context; the granted construction owns the device phase."""
     machine = warm()
     machine.submit_root("A")
     target = machine.target({"digest": "sha256:" + "0" * 64, "length": 1})
@@ -415,12 +430,13 @@ def test_a_ready_request_takes_the_started_process_and_skips_the_probes_it_does_
     machine.worker.prespawns.settle(slot, "machine-adopter")
     assert slot.finished.wait(60)
     executor = slot.executor
-    assert executor is not None and executor.started and executor.alive()
+    assert executor is not None
+    _assert_imported(executor)
     # Adopted at the worker's own priority: the warm's lowest priority never applied.
     assert os.getpriority(os.PRIO_PROCESS, executor.pid) == os.getpriority(os.PRIO_PROCESS, 0)
     assert [frame["fields"]["phase"] for frame in emitted] == ["Starting model executor"]
 
-    # The replica's own prepare reuses the process: no second spawn, no second start.
+    # The replica's prepare reuses imported code; its device phase still waits for demand.
     placement = machine.worker._placement_from_entry(
         documents.from_body(
             {**target.prepared_installation["placement"], "placement_id": "machine-adopter"},
@@ -454,6 +470,7 @@ def test_a_ready_request_takes_the_started_process_and_skips_the_probes_it_does_
     latch, reused = machine.worker._prepare_generation(machine.worker._tenant("machine-adopter"))
     assert (latch, reused) == ("", True)
     assert hosted.supervision.current is executor and executor.alive()
+    _assert_imported(executor)
 
 
 @needs_gpu
@@ -482,6 +499,7 @@ def test_a_prespawn_never_sits_on_another_roots_gpu_and_yields_when_one_is_grant
     assert slot.root == "B" and slot.ordinals == (0,)
     assert slot.started.wait(120) and slot.executor is not None and slot.executor.alive()
     executor = slot.executor
+    _assert_imported(executor)
 
     machine.submit_root("C")
     c1 = machine.child("C", "qwen")
@@ -519,13 +537,11 @@ def test_the_warm_starts_every_chain_kernel_and_selection_reads_what_is_ready() 
 
 
 @needs_gpu
-def test_probes_wait_while_a_call_runs_on_the_card_and_follow_when_it_leaves(
+def test_imports_finish_while_a_call_owns_the_card_without_speculative_device_work(
     warm: Callable[..., Warm],
 ) -> None:
-    """The root's own call holds the card: its process may start there (the root holds it),
-    but no probe runs beside a call on the device; the pass that sees the card released
-    starts them. The scheduler is driven directly, so the call's grant lasts exactly as
-    long as the test says."""
+    """The root's call owns the card while its next executor imports. Those imports finish
+    without device work; releasing the call does not authorize speculative warmup."""
     machine = warm()
     machine.submit_root("A")
     gpu, prespawns = machine.worker.gpu, machine.worker.prespawns
@@ -535,30 +551,27 @@ def test_probes_wait_while_a_call_runs_on_the_card_and_follow_when_it_leaves(
     target = machine.target({"digest": "sha256:" + "0" * 64, "length": 1})
     prespawns.request(OWNER, "A", target, emitted.append)
     (slot,) = prespawns.slots.values()
-    assert slot.started.wait(120) and slot.executor is not None and slot.executor.started
+    assert slot.finished.wait(120) and slot.executor is not None
+    _assert_imported(slot.executor)
     for _ in range(20):
         prespawns.reconcile(roots, gpu.view())
         time.sleep(0.05)
     assert [frame["fields"]["phase"] for frame in emitted] == ["Starting model executor"]
+    _assert_imported(slot.executor)
     gpu.release("A-call#1")
     gpu.sync(roots, [])
-    released = time.time()
     prespawns.reconcile(roots, gpu.view())
-    assert slot.finished.wait(120)
-    probes = emitted[-1]["fields"]
-    assert probes["phase"] == "Starting kernel compiles" and probes["completed"], probes
-    assert probes["started_unix_ms"] >= int(released * 1000)
+    assert [frame["fields"]["phase"] for frame in emitted] == ["Starting model executor"]
+    assert emitted[0]["fields"]["completed"]
+    _assert_imported(slot.executor)
 
 
 @needs_gpu
-def test_a_host_started_warm_is_adopted_by_the_direct_root_granted_its_card(
+def test_host_prepared_imports_are_adopted_by_the_direct_root_granted_the_card(
     warm: Callable[..., Warm],
 ) -> None:
-    """h3a-089: the Host's preparation starts the installation's executor while it lands the
-    weights of a root nobody has submitted yet. The process starts and proves its kernels on
-    a free card with its rows waiting in the slot; the direct root submitted afterwards is
-    granted that card, adopts that very process, and its journal carries both phases with
-    the times they actually ran."""
+    """Host preparation imports before a root exists. The eventual root adopts that process
+    and receives its completed import record; device initialization waits for its grant."""
     machine = warm()
     prespawns = machine.worker.prespawns
     prespawns.request_landing(INSTALLATION, _interface(), [{"path": "marco.models.model"}])
@@ -567,14 +580,14 @@ def test_a_host_started_warm_is_adopted_by_the_direct_root_granted_its_card(
     assert slot.finished.wait(300)
     assert [frame["fields"]["phase"] for frame in slot.frames] == [
         "Starting model executor",
-        "Starting kernel compiles",
     ]
     assert all(frame["fields"]["completed"] for frame in slot.frames), slot.frames
     # A second landing preparation of the same installation starts nothing more.
     prespawns.request_landing(INSTALLATION, _interface(), [{"path": "marco.models.model"}])
     assert list(prespawns.slots.values()) == [slot]
     executor = slot.executor
-    assert executor is not None and executor.alive()
+    assert executor is not None
+    _assert_imported(executor)
 
     submitted = time.time()
     machine.direct_root("D")
@@ -585,10 +598,9 @@ def test_a_host_started_warm_is_adopted_by_the_direct_root_granted_its_card(
     assert prespawns.slots == {} and slot.frames == []
     phases = machine.phases("D")
     started = phases["Starting model executor"]
-    probes = phases["Starting kernel compiles"]
-    assert started["completed"] and "sdpa ready" in probes["detail"], phases
-    assert started["ordinals"] == probes["ordinals"] == [0]
-    assert probes["started_unix_ms"] + probes["elapsed_ms"] < submitted * 1000
+    assert started["completed"] and "Starting kernel compiles" not in phases, phases
+    assert started["ordinals"] == [0]
+    assert started["started_unix_ms"] + started["elapsed_ms"] < submitted * 1000
 
 
 @needs_gpu
@@ -603,6 +615,7 @@ def test_a_host_started_warm_yields_to_a_root_of_another_installation(
     (slot,) = prespawns.slots.values()
     assert slot.started.wait(300) and slot.executor is not None
     executor = slot.executor
+    _assert_imported(executor)
     machine.serving("B", "qwen")
     machine.tick()
     assert machine.granted("B") == [0]
@@ -640,7 +653,8 @@ def test_a_dead_replica_starts_its_successor_beside_the_next_download(
     assert slot.replica == "machine-dead" and slot.supervision is supervision
     assert slot.started.wait(60)
     executor = supervision.current
-    assert executor is not None and executor.alive() and executor.started
+    assert executor is not None
+    _assert_imported(executor)
     failed = [e.step for e in list(machine.worker.activity)[notes:] if "no prespawn" in e.step]
     assert failed == [], failed
     assert machine.worker.prespawns.claim(INSTALLATION, (0,)) is slot

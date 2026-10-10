@@ -19,7 +19,6 @@ from typing import cast
 
 import pytest
 
-from cozy_runtime.internal.worker.machine_sources import Sources
 from cozy_runtime.protocol import worker_pb2 as pb
 from test_end_to_end import NO_EXECUTOR
 from test_machine_partial_work import Machine, machine
@@ -219,8 +218,11 @@ def test_a_credential_lost_at_restart_holds_the_call_until_the_owner_supplies_it
     with gated_pod(monkeypatch, gate) as (pod, origin):
         submission = pod.submit("gated", credential())
         assert awaiting(pod, "gated") == []
-        # A Runtime restart keeps the journal and loses everything held in memory.
-        pod.worker.machine_sources = Sources(pod.worker)
+        # Lose the volatile credential state while retaining the durable provider
+        # declaration. A real restart rebuilds Sources and SourceCalls together;
+        # replacing just Sources would strand the service's bound status callbacks.
+        with pod.worker.machine_sources.lock:
+            pod.worker.machine_sources.credentials.clear()
         assert awaiting(pod, "gated") == [pb.NATIVE_SOURCE_OPERATION_CIVITAI]
 
         gate.touch()

@@ -1,6 +1,6 @@
 [project]
 name = "cozy-runtime"
-version = "0.18.87"
+version = "0.18.88"
 description = "Cozy v2 worker runtime: author surface, worker, executor"
 # The upstream Apache-2.0 LICENSE/NOTICE ride every wheel: the cp312-abi3 wheel carries
 # the derived native kernels, and shipping them from the pure wheel too keeps one manifest.
@@ -21,6 +21,7 @@ dependencies = [
     "packaging>=24",
     "pillow>=12",
     "protobuf>=6.31",
+    "pyyaml>=6.0",
 ]
 
 [dependency-groups]
@@ -52,19 +53,17 @@ testpaths = ["tests"]
 addopts = "-q -p no:cacheprovider"
 
 [build-system]
-# ONE package, three wheel files per release. The in-tree shim delegates to
+# ONE package, two wheel files per release (cr-094). The in-tree shim delegates to
 # hatchling — the toolchain-free default producing the py3-none-any wheel and the sdist —
 # and, only when COZY_RUNTIME_BUILD_KERNELS=1, to scikit-build-core, which compiles
 # `native/` into `cozy_runtime/_kernels/_C.abi3.so` and tags the wheel cp312-abi3.
-# The release publisher adds the Go executable to that wheel and the ARM64 wheel.
 requires = ["hatchling"]
 build-backend = "dual_build_backend"
 backend-path = ["scripts"]
 
-# The public source archive includes the Go agent; default Python builds never compile it.
-# Local dotenv files are not distribution source. VCS ignores also exclude task/output trees.
+# The Go agent is a separately released binary, not Python source-distribution input.
 [tool.hatch.build.targets.sdist]
-exclude = ["**/.env", "**/.env.*"]
+exclude = ["/machine-agent"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/cozy_runtime", "src/cozy"]

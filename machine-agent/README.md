@@ -12,10 +12,8 @@ The glibc Linux x86-64 and ARM64 `cozy-runtime` PyPI wheels include the `cozy-ma
 executable. `uv pip install cozy-runtime` installs it alongside the Python commands;
 installation does not start a service. The wheel uses the standard scripts
 installation directory and contains the native executable, with no Python launcher
-or first-run binary download. The portable wheel has no Linux executable. The
-source distribution includes the tracked Go agent source, module, and dependencies'
-checksums; its default Python build remains toolchain-free and does not compile Go.
-Building the agent from that source is an explicit `go build .` in `machine-agent/`.
+or first-run binary download. The portable wheel and source distribution remain
+toolchain-free and do not contain the Linux agent.
 
 The personal controller and Tensorhub both connect to this machine API. A local
 machine uses `COZY_MACHINE_LIFETIME=persistent`, a stable locally generated
@@ -56,19 +54,80 @@ The native-kernel x86-64 wheel (glibc 2.28+) also contains the agent. A Python-i
 Linux ARM64 wheel (glibc 2.17+) carries the agent without CUDA kernels. macOS and Windows
 continue to install the portable Python wheel.
 
-Standalone artifacts remain available for existing image and client installers.
-Build a standalone release from committed source with
-`scripts/build-release.sh --version VERSION --output /absolute/output`.
-The private repository's `machine-agent` workflow runs the tests and makes the
-same artifacts on manual dispatch. It does not publish or need a public-repo
-credential. The output contains static Linux amd64/arm64 executables and
-`machine-agent.json` with each platform's immutable public URL and SHA-256.
+The Runtime publisher invokes
+`scripts/build-release.sh --version VERSION --output /absolute/output` from
+committed source. Its static Linux amd64/arm64 executables and local
+`machine-agent.json` hash manifest feed the wheel bundler in that same release.
+The machine-agent workflow runs checks only. There is no separate agent release
+selection or publication path; images and clients obtain the executable from
+the Runtime wheel. Capabilities and worker-protocol ranges determine compatibility.
 
-Publish those exact artifacts to **cozy-creator/cozy**, tag **machine-vVERSION**,
-with `gh release create --latest=false`. Refuse an existing tag; never overwrite
-an artifact or change the CLI's latest release. The standalone release contains binary
-artifacts and their manifest; the Runtime PyPI source archive also publishes the Go
-agent source. Repository visibility is independent of that public source distribution.
-Verify downloaded manifest hashes and `cozy-machine version --json` before
-promotion. Agent and Runtime versions evolve independently through advertised
-capabilities and the supported worker-protocol range.
+Rental control authority is refreshed from the owning Hub before every new gRPC
+call, privileged HTTP request, and WebRTC handshake. The worker's latest-attempt
+credential reads `/v1/worker/rental/authorized-keys`; user login credentials never
+reach this endpoint. Existing client transports are revoked when their signer
+leaves the set or its server-declared lease expires. A failed authority read
+refuses new control and clears cached authority. This never cancels durable work
+or changes the agent's private Runtime-owner claim. Standalone machines retain
+locally owned keys. Deploy the Hub authority endpoint before rolling out agents
+that require it; older Hubs do not provide rental authorization fallback.
+
+At boot, automatic discovery (the default) makes one attempt to select a
+stable Runtime/TensorFS pair within their installed compatible lines (major.minor for 0.x). Selection
+checks the real interpreter, mandatory dependencies, installed media/model
+extras, and reverse dependencies on the pair; other dependencies are never
+upgraded implicitly. Missing dependencies are resolved as an additive wheel-only
+closure with all installed versions fixed, including reverse constraints from
+unrelated frameworks. The pair and added wheels are checked against PyPI HTTPS
+metadata and SHA-256, staged privately, and probed together. Existing-file
+collisions and incompatible installed dependencies defer before mutation and
+require a compatible base. Rollback removes only added distributions whose
+version, private wheel URL/digest and installed RECORD hashes still prove
+transaction ownership. Later operator changes or uncertain partial files remain
+in place with an explicit repair-required result.
+The installer-owned `etc/cozy/software-policy.json` accepts
+`{"startup_update":"auto","agent":"bundled"}` or
+`{"startup_update":"off","agent":"explicit"}` (both fields are required). Off preserves an
+explicitly selected installation without disabling explicit maintenance. Missing
+policy defaults to auto; unknown or unreadable policy defers discovery. Local,
+development and prerelease software also skips automatic discovery.
+Maintenance requests require `agent: "bundled" | "explicit"` and a boolean `pin`: true for explicit wheels or versions,
+false for default-latest selection. The server never infers this intent from the
+resolved version fields. The committed software-policy file is authoritative. A manual transaction journals
+its policy and entry changes with the wheel installation; rollback restores only
+its own changes and preserves later operator edits. Explicit agent selection
+retains the exact running application binary; bundled selection uses the candidate
+Runtime wheel. The client never rewrites this policy or entry after server commit.
+Automatic rental updates stop after any accepted work, including after collection,
+so ordinary restarts and retries retain software. Explicit owner maintenance may
+update a used rental once Runtime-owned quiescence is proven.
+
+The existing machine and Runtime-root locks protect admission. The Runtime-owned
+software-update view applies retention rules across all owners, child attempts,
+native calls, holds, weight intents and input intakes. Missing or unreadable
+update state defers changes. The boot ID, certificate and execution journal are
+preserved. An unavailable index or incompatible candidate leaves the verified
+installed pair in service. The existing guardian is the stable parent, with private ABI
+`machine-bootstrap/1`. It owns the Runtime and a replaceable unprivileged public
+agent. A candidate replaces the public agent before admitting work; candidate
+agent exit or measured stall before commit restores the previous application
+and wheel pair. Public-agent disconnect or crash leaves an accepted Runtime
+running, with the same control signer, incarnation, workspace, TLS and boot ID.
+The parent is base infrastructure, updated on image/service bootstrap, and is
+not advertised as newly replaced application code. Authenticated runtime status
+reports the actual public agent version, SHA-256 and selection separately from
+the bootstrap ABI/version. The immutable identity receipt remains historical;
+rental readiness and authenticated runtime status prove the selected application.
+
+The launcher retains hashed rollback wheels and a fsynced transaction under
+`var/lib/cozy/startup-update`, outside the unprivileged agent's writable state.
+Startup and explicit maintenance use this same transaction and readiness gate.
+Interrupted installation is repaired offline before launching, even when updates
+are now disabled; a later explicit pair supersedes a stale recovery journal. Success requires the actual new Runtime's authenticated fresh
+readiness, workspace and unused-submission closure before admitting any work.
+A candidate that fails that boot is rolled back and the prior Runtime relaunched
+in the same boot. Failed recovery blocks execution while status and repair routes stay available.
+Candidate preparation measures CPU/output and download-byte progress; pending
+readiness does not renew rental billing indefinitely. Previously failed pairs
+are skipped during later automatic discovery. `GET /v1/machine/runtime` includes the secrets-free
+`startup_update` report alongside explicit maintenance status.
