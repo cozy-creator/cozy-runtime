@@ -14,7 +14,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/cozy-creator/cozy-runtime/machine-agent/internal/canonical"
 	"github.com/cozy-creator/cozy-runtime/machine-agent/internal/host/outputs"
 	"github.com/cozy-creator/cozy-runtime/machine-agent/internal/runoutputs"
 	pb "github.com/cozy-creator/cozy-runtime/machine-agent/protocol/cozy/worker/v1"
@@ -113,6 +112,11 @@ func (m *Machine) read(ctx context.Context, run, after uint64, wait bool) (*runL
 		for _, event := range answer.Events {
 			l.add(event)
 		}
+		state, err := client.GetMachineExecution(ctx, request)
+		if err != nil {
+			return nil, err
+		}
+		l.observeState(state)
 		return answer, nil
 	}
 	for {
@@ -124,9 +128,16 @@ func (m *Machine) read(ctx context.Context, run, after uint64, wait bool) (*runL
 			break
 		}
 	}
-	if wait && !l.terminal && len(l.after(after)) == 0 {
+	for wait && !l.terminal && len(l.after(after)) == 0 {
 		if _, err := page(true); err != nil {
 			return nil, err
+		}
+		if !l.terminal && len(l.after(after)) == 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(time.Second):
+			}
 		}
 	}
 	return l.final(), nil
@@ -176,9 +187,7 @@ func (l *runLog) add(event *pb.MachineExecutionEvent) {
 			entry.AppendedFrom = &from
 		}
 		l.entries = append(l.entries, entry)
-	case event.Outcome != nil && event.AttemptOrdinal == l.attempt:
-		l.terminal = true
-		l.entries = append(l.entries, outputs.Entry{Seq: event.Sequence, Index: -1, Status: outcomeStatus(event.Outcome)})
+
 	}
 }
 
@@ -187,19 +196,25 @@ func (l *runLog) after(after uint64) []outputs.Entry {
 	return l.entries[at:]
 }
 
-// outcomeStatus reads the terminal status from the outcome document.
-func outcomeStatus(outcome *pb.AttemptOutcome) string {
-	body, err := canonical.Read(outcome.GetOutcomeCanonicalBytes(), &pb.AttemptOutcomeBody{})
-	if err != nil {
-		return "failed"
+// A canceled attempt may only mean pause. Only the execution's current state
+// can mark output revisions final or end a follow.
+func (l *runLog) observeState(state *pb.MachineExecutionState) {
+	l.entries = slices.DeleteFunc(l.entries, func(entry outputs.Entry) bool { return entry.Status != "" })
+	l.terminal = false
+	terminal := ""
+	switch state.State {
+	case "succeeded":
+		terminal = "completed"
+	case "failed":
+		terminal = "failed"
+	case "canceled":
+		terminal = "canceled"
 	}
-	switch pb.OutcomeStatus(body.Int("status")) {
-	case pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED:
-		return "completed"
-	case pb.OutcomeStatus_OUTCOME_STATUS_CANCELED:
-		return "canceled"
+	if terminal == "" || state.Sequence > l.next {
+		return
 	}
-	return "failed"
+	l.terminal = true
+	l.entries = append(l.entries, outputs.Entry{Seq: state.Sequence, Index: -1, Status: terminal})
 }
 
 // Entries answers run's log after `after`, waiting at the tail; at or past the terminal entry
@@ -294,4 +309,10 @@ func (p *parts) Close() error {
 		file.Close()
 	}
 	return nil
+}
+
+// RefreshKeys proves current rental authority before a new media session.
+func (m *Machine) RefreshKeys(ctx context.Context) error {
+	_, err := m.claims.refreshAuthority(ctx)
+	return err
 }

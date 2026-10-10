@@ -12,9 +12,9 @@ Its whole surface is the seam (`internal/seam.py`), and its whole vocabulary is:
     describe_installed  derive one installed PackageInterface into brokered scratch
     start     spawn and join every rank, import torch, the runtime and the package, warm up
     load      construct + fill one construction under its key; idempotent per key
-    activate  make one loaded construction resident, parking LRU constructions for room
+    activate  name the active construction (its weights arrive with its ops)
     unload    drop one construction and free its device bytes
-    residency every loaded construction, resident or parked
+    residency every loaded construction and what of it is on the device
     prepare_request  resolve ONE request (decode, normalize, preflight) and retain it, so
               the worker prices a plan against the record the handler will actually run
     invoke    run ONE PREPARED attempt through the author invocation kernel and report its facts
@@ -65,7 +65,14 @@ from cozy_runtime.author._assets import GrantedInput
 from cozy_runtime.author._attention import AttentionContext
 from cozy_runtime.author._capture import ActivationCapture
 from cozy_runtime.author._context import AdapterRef, Device
-from cozy_runtime.author._errors import CapabilityError, InvalidRequest, Outcome, classify
+from cozy_runtime.author._errors import (
+    CapabilityError,
+    InvalidRequest,
+    Outcome,
+    RuntimeFailure,
+    classify,
+    is_device_oom,
+)
 from cozy_runtime.author._executor_requests import (
     Answer,
     Checkpoint,
@@ -73,8 +80,10 @@ from cozy_runtime.author._executor_requests import (
     ChildEvents,
     DeviceRoom,
     Handoff,
+    HostRoom,
     Publish,
     Published,
+    RankRoom,
     Request,
     Room,
 )
@@ -99,12 +108,15 @@ from cozy_runtime.internal import (
     execution_evidence,
     executor_commands,
     kernel_cache,
+    kernel_compile,
+    memory,
     model_config,
     native_interfaces,
     package_interface,
     prepare_diagnostics,
     proctree,
     sandbox,
+    tiers,
     tolerant,
 )
 from cozy_runtime.internal.config import restore_seal, seal_snapshot
@@ -126,7 +138,6 @@ from cozy_runtime.internal.executor_commands import (
     Probe,
     Release,
     Residency,
-    Restore,
     RunJob,
     Shutdown,
     Start,
@@ -137,10 +148,13 @@ from cozy_runtime.internal.executor_commands import (
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.parallel import cp, mirror, wire
 from cozy_runtime.internal.parallel.group import (
+    OpReady,
+    PreparedAbort,
+    PreparedPeer,
     RankGroup,
     RankSpec,
     join_rank,
-    receive_residence,
+    offer_plan,
 )
 from cozy_runtime.internal.parallel.mirror import mirror_component
 from cozy_runtime.internal.parallel.plan import (
@@ -149,13 +163,8 @@ from cozy_runtime.internal.parallel.plan import (
     GroupRefusal,
     rank_invariant_digest,
 )
-from cozy_runtime.internal.residency import (
-    Construction,
-    ConstructionArbiter,
-    ResidencyRefusal,
-    RestoreReport,
-)
 from cozy_runtime.internal.seam import (
+    EXECUTOR_MEMORY_CAPABILITIES,
     EXECUTOR_PROTOCOL_REVISION,
     RESULT_DOCUMENT,
     Channel,
@@ -300,235 +309,21 @@ def _trees(command: Invoke | RunJob) -> dict[str, tuple[Path, str]]:
     return {ref: (Path(root), digest) for ref, (root, digest) in command.trees.items()}
 
 
-def _working_peak(peak: int, at_entry: int, residency: Mapping[str, Any]) -> int:
-    """The attempt's working memory: the allocator peak over what was allocated at device
-    entry, less the weights the attempt itself staged in; never below a declared scope's
-    own activation peak, which is measured against that scope's resident baseline."""
-    moved = max(int(residency.get("allocator_delta_bytes", 0)), 0)
-    return max(
-        int(peak) - int(at_entry) - moved,
-        int(residency.get("attempt_activation_peak_bytes", 0)),
-        0,
-    )
-
-
-def residence_ceiling(*, destinations: int, authorized: int, allocatable: int) -> int:
-    """The construction's residence ceiling: ASSIGNED by the worker, VERIFIED by the card.
-
-    `authorized` is the ceiling the worker handed this executor for this prepare (cr-025's
-    `authorized_device_limit_bytes`; cr-066 assigns it from the lane's measured free bytes
-    less what other executors on the lane hold outstanding). `allocatable` is what this
-    process measures it can actually get. Predictions authorize, observations verify: the
-    ceiling is the smaller of the two, capped at the artifact's own complete destination
-    bytes so a card with room reports the artifact's size rather than its own. Nothing here
-    derives a ceiling from free bytes alone any more — that is how two executors preparing
-    on one device were each handed the same headroom. Whatever it comes to is what the
-    generation's digest carries; zero is a typed shortfall at the caller.
-    """
-    return min(int(destinations), max(int(authorized), 0), max(int(allocatable), 0))
-
-
-def settled_capacity(*, resident_budget: int, fill_overhead: int) -> int:
-    """What a rank holds for this construction once its fill has settled.
-
-    `resident_budget` is the FILL ceiling: the card less the widest component's fill
-    transient, which for H3's fp8 DiT (float destinations beside the encoded payload) is
-    ~20 GB. Placing a component on a rank is a steady-state question, so that transient
-    is given back; priced against the fill ceiling, H3's text encoder was never hosted on
-    an H100 (runs 1435-1441).
-    """
-    return int(resident_budget) + int(fill_overhead)
-
-
 # --------------------------------------------------------------------------- state
 
 
-class _CompositeResidency:
-    """Joint view over independently exact model-slot residencies.
+class _Scopes:
+    """A model's `@uses_components` scopes, as the memory planner sees them."""
 
-    Each slot may evict only its own components. A sibling model's residency is
-    never offered as capacity to another slot; sequential preparation therefore
-    admits only the conservative all-slot resident sum plus each slot's own rung.
-    """
+    def __init__(self, planner: memory.Planner, construction: str) -> None:
+        self.planner = planner
+        self.construction = construction
 
-    def __init__(self, rows: Mapping[str, Any]) -> None:
-        self.rows = dict(rows)
+    def admit(self, method: str, components: tuple[str, ...]) -> None:
+        self.planner.enter(self.construction, method, components)
 
-    @property
-    def poisoned(self) -> str:
-        return next((str(row.poisoned) for row in self.rows.values() if row.poisoned), "")
-
-    @property
-    def last_shortfall(self) -> Any:
-        return next(
-            (row.last_shortfall for row in self.rows.values() if row.last_shortfall is not None),
-            None,
-        )
-
-    def open_attempt(
-        self,
-        placement: str,
-        headroom_bytes: int,
-        scope_headroom_bytes: dict[str, int] | None = None,
-        measured: tuple[str, ...] | frozenset[str] = (),
-    ) -> None:
-        for name, row in self.rows.items():
-            prefix = name + "."
-            scoped = {
-                key.removeprefix(prefix): value
-                for key, value in (scope_headroom_bytes or {}).items()
-                if key.startswith(prefix)
-            }
-            mine = tuple(key.removeprefix(prefix) for key in measured if key.startswith(prefix))
-            row.open_attempt(placement, headroom_bytes, scoped, mine)
-
-    def vacate(self) -> dict[str, Any]:
-        """Every slot frees its own components; the reports merge under the slot prefix."""
-        reports = {name: row.vacate() for name, row in sorted(self.rows.items())}
-        prefix = len(reports) > 1
-
-        def keyed(name: str, component: str) -> str:
-            return f"{name}/{component}" if prefix else str(component)
-
-        return {
-            "freed": {
-                keyed(name, component): int(size)
-                for name, report in reports.items()
-                for component, size in report["freed"].items()
-            },
-            "held": {
-                keyed(name, component): str(why)
-                for name, report in reports.items()
-                for component, why in report["held"].items()
-            },
-            "freed_bytes": sum(int(report["freed_bytes"]) for report in reports.values()),
-            "allocator_delta_bytes": sum(
-                int(report["allocator_delta_bytes"]) for report in reports.values()
-            ),
-            "vacate_ms": round(sum(float(report["vacate_ms"]) for report in reports.values()), 2),
-        }
-
-    def restore(self, names: tuple[str, ...] = ()) -> dict[str, Any]:
-        """Every slot re-fills what it can without evicting; the reports merge as above."""
-        prefix = len(self.rows) > 1
-        reports = {}
-        for name, row in sorted(self.rows.items()):
-            local = (
-                tuple(
-                    value.removeprefix(name + "/")
-                    for value in names
-                    if value.startswith(name + "/")
-                )
-                if prefix
-                else names
-            )
-            # An empty selection means "restore everything" to a child, so do not call
-            # unselected models when the worker named specific global components.
-            if names and not local:
-                continue
-            reports[name] = row.restore(names=local)
-
-        def keyed(name: str, component: str) -> str:
-            return f"{name}/{component}" if prefix else str(component)
-
-        return {
-            "restored": {
-                keyed(name, component): int(size)
-                for name, report in reports.items()
-                for component, size in report["restored"].items()
-            },
-            "held": {
-                **{
-                    value: "this generation has no checkpoint for it"
-                    for value in names
-                    if prefix and ("/" not in value or value.partition("/")[0] not in self.rows)
-                },
-                **{
-                    keyed(name, component): str(why)
-                    for name, report in reports.items()
-                    for component, why in report["held"].items()
-                },
-            },
-            "restored_bytes": sum(int(report["restored_bytes"]) for report in reports.values()),
-            "allocator_delta_bytes": sum(
-                int(report["allocator_delta_bytes"]) for report in reports.values()
-            ),
-            "restore_ms": round(sum(float(report["restore_ms"]) for report in reports.values()), 2),
-        }
-
-    def document(self) -> dict[str, Any]:
-        documents = {name: row.document() for name, row in sorted(self.rows.items())}
-        prefix = len(documents) > 1
-        resident = {
-            f"{name}/{component}" if prefix else str(component): int(size)
-            for name, document in documents.items()
-            for component, size in document.get("resident", {}).items()
-        }
-        evicted = {
-            f"{name}/{component}" if prefix else str(component): int(size)
-            for name, document in documents.items()
-            for component, size in document.get("evicted", {}).items()
-        }
-        activation_peaks = {
-            f"{name}.{method}" if prefix else str(method): int(value)
-            for name, document in documents.items()
-            for method, value in (document.get("attempt_activation_peaks") or {}).items()
-        }
-        scope_headrooms = {
-            f"{name}.{method}" if prefix else str(method): int(value)
-            for name, document in documents.items()
-            for method, value in (document.get("scope_headroom_bytes") or {}).items()
-        }
-        return {
-            "placement": next(
-                (document.get("placement", "") for document in documents.values()), ""
-            ),
-            "headroom_bytes": max(
-                (int(document.get("headroom_bytes", 0)) for document in documents.values()),
-                default=0,
-            ),
-            "scope_headroom_bytes": scope_headrooms,
-            "admissions": sum(int(row.get("admissions", 0)) for row in documents.values()),
-            "stages": sum(int(row.get("stages", 0)) for row in documents.values()),
-            "evictions": sum(int(row.get("evictions", 0)) for row in documents.values()),
-            "attempt_stages": sum(int(row.get("attempt_stages", 0)) for row in documents.values()),
-            "attempt_evictions": sum(
-                int(row.get("attempt_evictions", 0)) for row in documents.values()
-            ),
-            # THE DURATIONS TRAVEL WITH THEIR COUNTS (cr-134). The fold carried the counts
-            # and dropped the milliseconds, so a multi-model placement's staged rung
-            # confessed "N stage(s) costing 0 ms". Attempt-scoped and cumulative both, so
-            # a reader can never take one for the other.
-            "attempt_staged_ms": round(
-                sum(float(row.get("attempt_staged_ms", 0.0)) for row in documents.values()), 2
-            ),
-            "attempt_evicted_ms": round(
-                sum(float(row.get("attempt_evicted_ms", 0.0)) for row in documents.values()), 2
-            ),
-            "staged_ms": round(
-                sum(float(row.get("staged_ms", 0.0)) for row in documents.values()), 2
-            ),
-            "evicted_ms": round(
-                sum(float(row.get("evicted_ms", 0.0)) for row in documents.values()), 2
-            ),
-            "attempt_activation_peak_bytes": max(
-                (int(row.get("attempt_activation_peak_bytes", 0)) for row in documents.values()),
-                default=0,
-            ),
-            "attempt_activation_peaks": activation_peaks,
-            "attempt_absolute_peak_bytes": max(
-                (int(row.get("attempt_absolute_peak_bytes", 0)) for row in documents.values()),
-                default=0,
-            ),
-            "allocator_delta_bytes": sum(
-                int(row.get("allocator_delta_bytes", 0)) for row in documents.values()
-            ),
-            "resident": resident,
-            "evicted": evicted,
-            "poisoned": self.poisoned,
-            "cross_model_eviction": False,
-            "models": documents,
-        }
+    def release(self, method: str, components: tuple[str, ...]) -> None:
+        self.planner.exit()
 
 
 #: The runtime modules a construction imports, named ONCE so `start` can warm
@@ -547,7 +342,6 @@ _CONSTRUCTION_MODULES = (
     "cozy_runtime.internal.planfacts",
     "cozy_runtime.internal.warm",
     "cozy_runtime.internal.probe",
-    "cozy_runtime.internal.residency",
     "cozy_runtime.internal.resolution",
 )
 
@@ -586,21 +380,21 @@ class Executor:
         self.host: Executor = host or self
         #: the construction key this generation was loaded under; "" on the host
         self.construction = construction
-        #: HOST ONLY: every loaded construction, the active one, and the LRU arbiter
+        #: HOST ONLY: every loaded construction and the active one
         self.constructions: dict[str, Executor] = {}
-        self.arbiter = ConstructionArbiter()
         self.active = ""
+        #: HOST ONLY: every memory decision of this process (made at device init)
+        self.planner: memory.Planner | None = None
         self.started = False
+        self.imported = False
         self.package_warmed = False
         #: rank 0 only: each follower's own start ledger, in rank order
         self.follower_stages: list[list[Any]] = []
-        #: the process-wide device ceiling the worker last assigned (load/activate)
-        self.authorized = 0
-        #: this generation's load reply and the constructions its load parked
+        #: this generation's load reply
         self.load_reply: dict[str, Any] = {}
-        self.load_parked: list[str] = []
         #: follower only: the attempt spool and allocator bytes at its first mirrored call
         self._run_entry: tuple[Path, int] | None = None
+        self._group_operation = 0
         #: follower only: the attention its processors held at that first call, and its kernels
         self._run_attention = ""
         self._run_served: tuple[str, ...] = ()
@@ -631,7 +425,9 @@ class Executor:
         self.device_kind = accel.host_backend_family()
         self.registry: Any = None
         self.backend: Any = None
-        self.residency: Any = None
+        #: this generation's name in the planner: the construction key, and the model's
+        #: parameter name inside a many-model construction
+        self.memory_key = ""
         self.model_executors: list[Executor] = []
         self.models: dict[str, Any] = {}
         self.group_components: dict[tuple[str, str], tuple[Any, Any]] = {}
@@ -641,7 +437,6 @@ class Executor:
         #: the many-model construction this per-model generation belongs to, if any
         self._group_parent: Executor | None = None
         self._group_model_key = ""
-        self._group_attempts: dict[str, Path] = {}
         self.surface_names: dict[str, Any] = {}
         self.discovered: Any = None
         self.ready = False
@@ -657,6 +452,7 @@ class Executor:
         self.device_facts: Any = None
         #: a follower's hold of rank 0's attention selection for the current attempt
         self._attention_hold = contextlib.ExitStack()
+        self._attention_sol: attention_sol.Selection | None = None
         self.facts: dict[str, Any] = {}
         self.schema_digests: dict[str, str] = {}
         #: request_id -> the record `prepare_request` resolved, run by `invoke`
@@ -700,11 +496,11 @@ class Executor:
             case RunJob():
                 return self.run_job(command)
             case Probe():
+                if command.end_attempt and self.host.planner is not None:
+                    self.host.planner.end()
                 return self.probe()
             case Vacate():
                 return self.vacate(residents=command.residents, ranks=command.ranks)
-            case Restore():
-                return self.restore(names=command.names)
             case Shutdown():
                 raise AssertionError("shutdown ends the command loop")
 
@@ -720,8 +516,9 @@ class Executor:
             "tensorfs_version": _distribution_version("tensorfs"),
             "executor_protocol_revision": EXECUTOR_PROTOCOL_REVISION,
             "native_interfaces": native_interfaces.stated(),
-            #: what the worker's memory manager may ask beyond the floor's commands
-            "memory": ["vacate_ranks"],
+            #: what the worker's memory policy may count on: rank-selective vacate, and a
+            #: process that plans its own memory inside the grant it is sent
+            "memory": sorted(EXECUTOR_MEMORY_CAPABILITIES),
             "pgid": os.getpgrp(),
             "no_new_privs": _proc_status("NoNewPrivs"),
             "oom_score_adj": Path("/proc/self/oom_score_adj").read_text().strip(),
@@ -794,12 +591,159 @@ class Executor:
                 "detail": "Torch CUDA was already initialized before Runtime's explicit "
                 "allocator boundary; package execution is refused",
             }
+        entries = _sealed_entries()
+        before = accel.device_memory(
+            entries[self.rank] if self.rank < len(entries) else "", self.device_kind
+        )
         accel.initialize(torch, self.device_kind)
         if self.world > 1 and self.device_kind == "cuda":
             torch.cuda.set_device(self.rank)
         accel.reset_peak(torch, self.device_kind)
         self._device_ready = True
+        if owner.planner is None:
+            owner.planner = memory.Planner(
+                torch,
+                self._rank_device(torch),
+                room=owner._ask_room,
+                host_room=owner._ask_host_room if self.world == 1 else None,
+                grouped=self.world > 1,
+                process_bytes=owner._process_bytes,
+                sharded=lambda key: tuple(key.rsplit("/", 1)) in owner.group_sharded,
+            )
+            if before.state == "measured":
+                owner.planner.measure_overhead(before.free_bytes, 0)
         return None
+
+    def _process_bytes(self) -> int | None:
+        """Fast NVML observation of this PID on its assigned device, never another rank's."""
+        entries = _sealed_entries()
+        if self.rank >= len(entries):
+            return None
+        entry, pid = entries[self.rank], os.getpid()
+        try:
+            row = accel.process_memories_by_device(
+                {pid}, self.device_kind, (entry,), allow_subprocess=False
+            )[entry][pid]
+        except (OSError, AttributeError):
+            return None
+        # NVML uses host PIDs. A namespace mismatch/absent row is not measured zero.
+        return row.bytes if row.state == "present" else None
+
+    def _ask_host_room(self, token: str, nbytes: int, release: bool = False) -> bool:
+        """A single-rank host copy reserves credit before allocation and releases it after."""
+        if self.world != 1:
+            return False
+        answer = self._durable(HostRoom(reservation=token, nbytes=nbytes, release=release), Answer)
+        if answer.code == "unknown_durable_request":
+            raise RuntimeFailure(
+                "worker lacks the current memory host-credit contract; update the machine Runtime",
+                code="worker_memory_upgrade_required",
+            )
+        return bool(answer.ok)
+
+    def _ask_room(self, free_wanted: int, grant_wanted: int, measured: bool) -> int | None:
+        """The planner asks the worker for bytes other tenants hold; the new grant, if any.
+        Only rank 0 speaks to the worker; a follower plans in the grant it was given."""
+        if (
+            self.rank != 0
+            or self.device_kind != "cuda"
+            or (self.planner is not None and self.planner.group_phase == "execute")
+            or (self.world > 1 and threading.current_thread() is not threading.main_thread())
+        ):
+            return None
+        answer = self._durable(
+            DeviceRoom(
+                free_bytes=free_wanted,
+                grant_bytes=grant_wanted,
+                measured=measured,
+                ranks=(0,),
+                rank_memory=self._rank_memory(),
+            ),
+            Room,
+        )
+        if answer.ok and answer.memory_grants:
+            self._grant(answer.authorized_device_limit_bytes, answer.memory_grants)
+            return answer.memory_grants[self.rank]
+        return None
+
+    def _ask_group_room(
+        self, statuses: list[OpReady], progress: dict[int, tuple[int, int]]
+    ) -> bool:
+        """Retry only after every failed rank gains its full shortfall, monotonically.
+
+        CUDA probes supply both readings. Worker NVML observations are not compared
+        against CUDA bytes, and fluctuating free memory cannot reuse an earlier gain.
+        """
+        group, planner = self.group, self.planner
+        if (
+            self.rank != 0
+            or group is None
+            or planner is None
+            or threading.current_thread() is not threading.main_thread()
+        ):
+            return False
+
+        def free_now() -> tuple[int, ...]:
+            # The router already owns all follower leases, and every abort was acknowledged.
+            # Do not reacquire group.hold here: it is intentionally non-reentrant.
+            replies = group.call(executor_commands.encode(Probe()))
+            return (
+                planner._driver()[0],
+                *(int(reply.get("device_free_bytes", -1)) for reply in replies),
+            )
+
+        def request(needs: tuple[RankRoom, ...]) -> tuple[int, ...] | None:
+            answer = self._durable(
+                DeviceRoom(
+                    free_bytes=max(need.free_bytes for need in needs),
+                    grant_bytes=max(need.grant_bytes for need in needs),
+                    measured=True,
+                    ranks=tuple(need.rank for need in needs),
+                    rank_needs=needs,
+                    rank_memory=self._rank_memory(),
+                ),
+                Room,
+            )
+            return answer.memory_grants if answer.ok else None
+
+        return planner.group_room(
+            statuses,
+            progress,
+            self.world,
+            free_now,
+            request,
+            lambda grants: self._grant(UNSET, grants),
+        )
+
+    @contextlib.contextmanager
+    def _group_host_room(self, statuses: list[OpReady]) -> Iterator[tuple[int, ...]]:
+        """Reserve every rank's backing before another prepare; release after drained peers."""
+        group = self.group
+        if (
+            self.rank != 0
+            or group is None
+            or len(statuses) != self.world
+            or sorted(status.rank for status in statuses) != list(range(self.world))
+            or {status.operation for status in statuses} != {group.operation_sequence}
+            or any(status.host_needed < 0 for status in statuses)
+        ):
+            raise GroupRefusal("invalid group host preparation vector")
+        credits = tuple(status.host_needed for status in sorted(statuses, key=lambda s: s.rank))
+        token = f"group-host-{statuses[0].operation}"
+        needed = sum(credits)
+        answer = self._durable(HostRoom(reservation=token, nbytes=needed), Answer)
+        if not answer.ok:
+            yield ()
+            return
+        try:
+            yield credits
+        finally:
+            # A broken group sent kill signals, but the promise cannot be returned while
+            # a follower may still allocate. close waits for every child. If it raises,
+            # Worker generation reap retains responsibility for this reservation token.
+            if group.broken:
+                group.close()
+            self._durable(HostRoom(reservation=token, nbytes=needed, release=True), Answer)
 
     def _rank_identity(self) -> dict[str, Any]:
         owner = self.host
@@ -886,6 +830,10 @@ class Executor:
             if refused is not None:
                 self.poisoned = f"join refused: {refused['code']}"
                 return refused
+        planner = self.host.planner
+        # Worker ownership excludes co-tenants. Unmanaged external activity can still
+        # affect this device-wide attribution estimate.
+        before = planner.checkpoint() if planner is not None else None
         try:
             self.pg = join_rank(torch, spec, _SEALED)
         except Exception as exc:
@@ -897,9 +845,80 @@ class Executor:
                 f"{type(exc).__name__}: {exc}"[:900],
                 "traceback": prepare_diagnostics.exception_trace(exc),
             }
+        if planner is not None and before is not None:
+            planner.measure_overhead(*before)
+            try:
+                self._startup_budget()
+            except memory.MemoryRefusal as exc:
+                self.poisoned = f"join refused: {exc.code}"
+                return self._refusal(exc.code, exc.message)
         return {"ok": True, "rank": self.rank, "world": self.world, "backend": spec.backend}
 
     def run(self, command: dict[str, Any]) -> dict[str, Any]:
+        operation = command.get("operation", 0)
+        if not operation:
+            return self._run_component(command)
+        if type(operation) is not int or operation != self._group_operation + 1:
+            return {
+                "ok": False,
+                "code": "gpu_divergence",
+                "detail": "group operation order changed",
+            }
+        self._group_operation = operation
+        peer = PreparedPeer(self.channel, operation, self.rank)
+        planner = self.host.planner
+        before = planner.group_phase if planner is not None else ""
+        if planner is not None:
+            planner.group_phase = "prepare"
+        try:
+            try:
+                try:
+                    credits = command.get("host_grants", ())
+                    if credits and (
+                        not isinstance(credits, (list, tuple))
+                        or len(credits) != self.world
+                        or any(type(value) is not int or value < 0 for value in credits)
+                    ):
+                        raise GroupRefusal("invalid operation host credit vector")
+                    with (
+                        planner.host_credit(credits[self.rank] if credits else None)
+                        if planner is not None
+                        else contextlib.nullcontext()
+                    ):
+                        reply = self._run_component(command, peer)
+                except Exception as exc:
+                    if peer.committed or peer.reported:
+                        raise
+                    peer.ready(mirror.preparation_status(planner, operation, self.rank, exc))
+                    raise GroupRefusal("an exceptional preparation was committed") from exc
+                if not peer.committed:
+                    # Validation, scope or input materialization failed before its gate.
+                    error = memory.MemoryRefusal(
+                        str(reply.get("code") or "group_preparation_failed"),
+                        str(reply.get("detail", "group preparation did not reach readiness")),
+                        int(reply.get("needed", 0)),
+                        int(reply.get("available", 0)),
+                        reusable=bool(reply.get("reusable", True)) and not bool(self.poisoned),
+                    )
+                    peer.ready(mirror.preparation_status(planner, operation, self.rank, error))
+                    raise GroupRefusal("a failed preparation was committed")
+                return {**reply, "operation": operation}
+            except PreparedAbort:
+                return {
+                    "ok": True,
+                    "operation": operation,
+                    "aborted": True,
+                    "memory": planner.facts() if planner is not None else {},
+                }
+        finally:
+            if planner is not None:
+                planner.group_phase = before
+
+    def _run_component(
+        self,
+        command: dict[str, Any],
+        peer: PreparedPeer | None = None,
+    ) -> dict[str, Any]:
         """Run a prepared sharded component, or one this rank hosts, under its leader's
         scope and execution modes. A hosted call's result returns through the spool."""
         if self.rank == 0:
@@ -927,8 +946,15 @@ class Executor:
         target = self.group_components.get(name)
         hosted = self.group_hosted.get(name) == self.rank
         spread = "method" in command
+        if peer is not None and (hosted or spread or name not in self.group_sharded):
+            return {
+                "ok": False,
+                "code": "group_preparation_invalid",
+                "detail": "a group transaction requires one sharded component",
+            }
         if target is None or not (hosted or spread or name in self.group_sharded):
-            self.poisoned = "mirrored call names no prepared sharded component"
+            if peer is None:
+                self.poisoned = "mirrored call names no prepared sharded component"
             return {
                 "ok": False,
                 "code": "gpu_divergence",
@@ -941,13 +967,18 @@ class Executor:
         models = {key[0]: model for key, (model, _root) in self.group_components.items()}
         started_us = execution_evidence.now_us()
         homes = any(rank == self.rank for rank in self.group_hosted.values())
+        planner = self.host.planner
         # A spread call rank 0 waits on over the group: a header always answers it.
         answered = False
         try:
+            run = wire.RunCommand.read(command)
+            if run.memory_grants:
+                self._grant(UNSET, run.memory_grants)
             spool = Path(command["spool"])
             if self._run_entry is None or self._run_entry[0] != spool:
-                accel.reset_peak(self.torch, self.device_kind)
-                self._run_entry = (spool, accel.allocated(self.torch, self.device_kind))
+                self._run_entry = (spool, 0)
+                if planner is not None:
+                    planner.begin(None)
                 held = attention.observed(
                     {f"{m}/{c}": root for (m, c), (_, root) in self.group_components.items()}
                 )
@@ -969,20 +1000,9 @@ class Executor:
                         (key, root) not in self.group_components for root in components
                     ):
                         raise GroupRefusal("mirrored scope names no prepared component")
-                    residency = models[key]._cozy_residency
-                    if residency is not None and self._group_attempts.get(key) != spool:
-                        # A rank that hosts a component holds a set rank 0's plan never
-                        # priced, so it may always make room: demand-pull when measured.
-                        residency.open_attempt(
-                            "component_staged" if homes else scope["placement"],
-                            scope["headroom_bytes"],
-                            scope["scope_headroom_bytes"],
-                            tuple(scope.get("measured_scopes") or ()),
-                        )
-                        self._group_attempts[key] = spool
-                    if spread and residency is not None and (homes or command.get("spare")):
+                    if planner is not None and spread and (homes or command.get("spare")):
                         # An optional call: taken on room alone, declined rather than evict.
-                        stack.enter_context(residency.sparing())
+                        stack.enter_context(planner.sparing())
                     stack.enter_context(models[key]._cozy_scope(scope["method"], components))
                     active[key] = components
                 if name[0] not in active or name[1] not in active[name[0]]:
@@ -1011,38 +1031,58 @@ class Executor:
                 )
                 if spread:
                     # A pure method call whose one tensor result goes straight to rank 0.
-                    output = getattr(component, str(command["method"]))(*args, **kwargs)
+                    op = getattr(component, "_cozy_op", None)
+                    method = str(command["method"])
+                    call = op(method) if op is not None else getattr(component, method)
+                    output = call(*args, **kwargs)
                     answered = True
                     wire.send_tensor(output, 0, self.pg)
                 elif hosted:
-                    plane = models[name[0]]._cozy_residency
-                    call = component.get_submodule(str(command.get("module", "")))
-                    try:
-                        output = call(*args, **kwargs)
-                    except accel.oom_error(self.torch, self.device_kind):
-                        # The call has no effect beside its result: free what the scope
-                        # does not hold and run it once more before refusing.
-                        if plane is None:
-                            raise
-                        plane.shed()
-                        accel.release_cached(self.torch, self.device_kind)
-                        output = call(*args, **kwargs)
+                    module = str(command.get("module", ""))
+                    owned = planner.held.get(f"{name[0]}/{name[1]}") if planner else None
+                    call = component.get_submodule(module)
+                    output = (
+                        planner.run(owned, f"hosted:{module}", call, args, kwargs)
+                        if planner is not None and owned is not None
+                        else call(*args, **kwargs)
+                    )
                     result = wire.marshal(
                         output, wire.TensorSpool(spool / str(command.get("results", "hosted")))
                     )
                 else:
-                    component(*args, **kwargs)
+                    if peer is None:
+                        component(*args, **kwargs)
+                    else:
+                        owned = planner.held.get(f"{name[0]}/{name[1]}") if planner else None
+
+                        def ready() -> None:
+                            peer.ready(
+                                mirror.preparation_status(planner, peer.operation, self.rank)
+                            )
+
+                        if planner is not None and owned is not None:
+                            with planner.gating(owned.key, ready):
+                                planner.run(owned, "forward", component, args, kwargs)
+                        else:
+                            ready()
+                            component(*args, **kwargs)
                 accel.synchronize(self.torch, self.device_kind)
             self._attempt_spool = spool
-            moved = sum(
-                max(int(models[key]._cozy_residency.document().get("allocator_delta_bytes", 0)), 0)
-                for key in active
-                if models[key]._cozy_residency is not None
-            )
-            working = max(
-                accel.peak_allocated(self.torch, self.device_kind) - self._run_entry[1] - moved, 0
-            )
+            working = planner.peak_allocated if planner is not None else 0
         except Exception as exc:
+            if peer is not None and not peer.committed:
+                status = mirror.preparation_status(planner, peer.operation, self.rank, exc)
+                # Planner.refusal may retain this same exception. Its traceback must not
+                # keep materialized follower inputs alive after the prepared round aborts.
+                exc.__traceback__ = None
+                return {
+                    "ok": False,
+                    "code": status.code,
+                    "detail": status.detail,
+                    "needed": status.needed,
+                    "available": status.available,
+                    "reusable": status.reusable,
+                }
             if spread and not answered:
                 declined = self._declines(exc)
                 with contextlib.suppress(Exception):
@@ -1058,15 +1098,27 @@ class Executor:
                         "component": list(name),
                         "sol_calls": {},
                         "working_peak_bytes": 0,
+                        "memory": planner.facts() if planner is not None else {},
                         "declined": declined,
                     }
             outcome = classify(exc)
-            self.poisoned = f"mirrored {name} failed: {outcome.code}"
+            reusable = (
+                isinstance(exc, memory.MemoryRefusal)
+                and exc.reusable
+                and planner is not None
+                and not planner.unusable
+            )
+            if not reusable:
+                self.poisoned = f"mirrored {name} failed: {outcome.code}"
             return {
                 "ok": False,
                 "code": outcome.code,
                 "detail": f"{type(exc).__name__}: {exc}"[:900],
+                "reusable": reusable,
+                "needed": exc.needed if isinstance(exc, memory.MemoryRefusal) else 0,
+                "available": exc.available if isinstance(exc, memory.MemoryRefusal) else 0,
                 "rank": self.rank,
+                "memory": planner.facts() if planner is not None else {},
             }
         return {
             "ok": True,
@@ -1074,6 +1126,7 @@ class Executor:
             "component": list(name),
             "sol_calls": sol_counts,
             "working_peak_bytes": working,
+            "memory": planner.facts() if planner is not None else {},
             **({"result": result} if hosted else {}),
             "evidence": execution_evidence.record(
                 self.rank,
@@ -1089,15 +1142,19 @@ class Executor:
         }
 
     def _declines(self, exc: Exception) -> str | None:
-        """Why a spread call is declined rather than failed: no room without evicting
-        (`device_spared`), or the device ran out inside the call."""
-        if isinstance(exc, ResidencyRefusal) and exc.code == "device_spared":
-            return exc.detail
-        if self.device_kind == "cuda" and isinstance(
-            exc, accel.oom_error(self.torch, self.device_kind)
+        """Why a spread call is declined rather than failed: no room without evicting, or
+        the device ran out inside the call (the planner already freed what it took)."""
+        if (
+            isinstance(exc, memory.MemoryRefusal)
+            and exc.reusable
+            and exc.code
+            in (
+                memory.SPARED,
+                "device_out_of_memory",
+                "host_shortfall",
+            )
         ):
-            accel.release_cached(self.torch, self.device_kind)
-            return f"device_out_of_memory: {exc}"[:300]
+            return f"{exc.code}: {exc.message}"[:300]
         return None
 
     def _group_refusal(self, exc: GroupRefusal, *, closing: bool = True) -> dict[str, Any]:
@@ -1108,10 +1165,12 @@ class Executor:
             self.group.close()
         return {"ok": False, "code": exc.code, "detail": exc.message[:900]}
 
-    def _install_group(self, torch: Any, model: Any, capacity: int = 0) -> dict[str, Any] | None:
+    def _install_group(
+        self, torch: Any, model: Any, grants: tuple[int, ...] = ()
+    ) -> dict[str, Any] | None:
         """Every rank shards its replica, takes its side of the mirror, and agrees which
-        follower keeps each placeable component that rank 0 has no room for. `capacity` is
-        the group's agreed settled capacity (`settled_capacity`)."""
+        follower hosts a placeable component. Shared granted totals choose candidate homes;
+        per-op preparation accounts for actual overhead and proves fit before execution."""
         if self.world <= 1:
             return None
         owner = self.host
@@ -1148,8 +1207,11 @@ class Executor:
                         bool(owner._attempt_request)
                         and _cancelled(owner.root, owner._attempt_request)
                     ),
+                    planner=owner.planner,
+                    room=owner._ask_group_room,
+                    host_room=owner._group_host_room,
                 )
-        hosted = mirror.hosting_plan(
+        hosted = memory.hosting_plan(
             placeable=tuple(getattr(type(model), "__placeable__", ())),
             sizes={
                 name: int(getattr(self.backend, "component_bytes", {}).get(name, 0))
@@ -1157,14 +1219,13 @@ class Executor:
             },
             sharded={name[1] for name in owner.group_sharded if name[0] == self._group_model_key},
             scopes=component_use(type(model)),
-            capacity=capacity,
-            world=self.world,
+            grants=grants,
         )
         for component_name, home in hosted.items():
             name = (self._group_model_key, component_name)
             owner.group_hosted[name] = home
-            if self.rank != home and self.residency is not None:
-                self.residency.host(component_name)
+            if self.rank != home and owner.planner is not None:
+                owner.planner.host(f"{name[0]}/{name[1]}")
             if self.rank == 0:
                 assert self.group is not None
                 mirror.host_component(
@@ -1182,7 +1243,7 @@ class Executor:
                 )
         # Every rank may take a spread call. A rank homing a placeable component takes one
         # only beside everything it holds (measured room), so it never gives up the
-        # component it hosts for a clip (`Executor.run`, `ComponentResidency.sparing`).
+        # component it hosts for a clip (`Executor.run`, `memory.Planner.sparing`).
         sparing = sorted(set(owner.group_hosted.values()))
         if self.rank == 0:
             assert self.group is not None
@@ -1221,29 +1282,26 @@ class Executor:
         """Preparation has its own spool; component calls need no request to warm."""
         from cozy_runtime.internal.warm import warm_generation
 
-        # Warm has no admitted request rung. Its declared component-use scopes must
-        # free unrelated weights before kernel and collective scratch is allocated.
-        # The mirror carries this same existing staged contract to every follower.
-        if self.residency is not None:
-            self.residency.open_attempt("component_staged", 0)
         owner = self.host
         owner._attempt_spool = (
             self.root / "warm" / hashlib.sha256(self._group_model_key.encode()).hexdigest()
         )
+        planner = owner.planner
+        if planner is not None:
+            planner.begin(None)
+        before = planner.checkpoint() if planner is not None else None
         try:
             return warm_generation(model, device=self._device(), cancel=lambda: bool(self.poisoned))
         finally:
             owner._attempt_spool = None
+            if planner is not None and before is not None:
+                planner.end()
+                # The kernels, handles and workspaces the first calls load stay: they are
+                # this process's overhead from here on.
+                planner.measure_overhead(*before)
 
     def _warm_package(self) -> str:
-        """Give the package its ONE chance to pay its deferred import cost off the lock.
-
-        A package's `__init__` is deliberately lazy, and that is right for every caller but
-        this one: deferred, the cost lands inside the construction, under the device lock,
-        on the far side of the vacate. A module-level `warmup()` is where a package says
-        what it would rather pay early. It takes no arguments, returns nothing, and MUST
-        NOT touch the device -- another tenant owns the card while this runs.
-        """
+        """Give the package its one warmup under device ownership, after code imports."""
         if self.package_warmed:
             return ""
         self.package_warmed = True
@@ -1264,18 +1322,26 @@ class Executor:
     # ------------------------------------------------------------ the process (proto-061)
 
     def start(self, command: Start) -> dict[str, Any]:
-        """Bring EVERY rank up before any construction: seal, group, torch, package, warmup.
+        """Import every rank, then initialize its device only when the Worker owns it.
 
         Rank 0 spawns its followers first and hands them this command, so every rank's
-        Torch, runtime and package imports and the package `warmup()` run in parallel; the
-        group then forms over the loopback store. Nothing here moves a weight byte. A
+        Torch, runtime and package imports run in parallel. An import-only start stops
+        there; an ordinary start initializes devices, runs package warmup and forms the
+        group over the loopback store. Nothing here moves a weight byte. A
         package whose interface binds no model on any entrypoint imports no Torch at all,
         which is what keeps a weightless package servable on a cardless runner (cl-013).
         Idempotent: a started process answers with what it started as.
         """
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
-        if self.started:
+        if not EXECUTOR_MEMORY_CAPABILITIES.issubset(command.memory_capabilities):
+            return {
+                "ok": False,
+                "code": "worker_memory_upgrade_required",
+                "detail": "the Worker must supply the current memory contract before startup; "
+                "update the machine Runtime",
+            }
+        if self.started or (command.import_only and self.imported):
             return self._start_reply([], reused=True)
         sealed_devices = _SEALED.get("CUDA_VISIBLE_DEVICES", "")
         if command.devices != sealed_devices:
@@ -1354,27 +1420,54 @@ class Executor:
 
                 self.torch = torch
                 stage("torch_import")
-                try:
-                    refused = self._initialize_device(torch)
-                except RuntimeError as exc:
-                    refused = {
-                        "ok": False,
-                        "code": "accelerator_unavailable",
-                        "detail": f"the sealed devices {_SEALED.get('CUDA_VISIBLE_DEVICES')!r} "
-                        f"could not be initialized: {exc}"[:900],
-                    }
-                if refused is not None:
-                    self.poisoned = f"start refused: {refused['code']}"
-                    return self._close_after(refused)
-                stage("cuda_init")
+                if not command.import_only:
+                    try:
+                        refused = self._initialize_device(torch)
+                    except RuntimeError as exc:
+                        refused = {
+                            "ok": False,
+                            "code": "accelerator_unavailable",
+                            "detail": f"the sealed devices {_SEALED.get('CUDA_VISIBLE_DEVICES')!r} "
+                            f"could not be initialized: {exc}"[:900],
+                        }
+                    if refused is not None:
+                        self.poisoned = f"start refused: {refused['code']}"
+                        return self._close_after(refused)
+                    self._grant(command.authorized_device_limit_bytes, command.memory_grants)
+                    planner = self.host.planner
+                    if planner is not None:
+                        planner.begin(None)
+                    self._startup_budget()
+                    stage("cuda_init")
                 for name in _CONSTRUCTION_MODULES:
                     importlib.import_module(name)
                 stage("runtime_imports")
             if self.discovered is None:
                 self._discover_provisioned(command.release())
             stage("package_import")
-            warmup_error = self._warm_package()
-            stage("package_warmup")
+            imported_torch = sys.modules.get("torch")
+            if (
+                command.import_only
+                and imported_torch is not None
+                and accel.initialized(imported_torch, self.device_kind)
+            ):
+                self.poisoned = "package import initialized a device before ownership"
+                return self._close_after(
+                    {
+                        "ok": False,
+                        "code": "cuda_initialized_before_runtime",
+                        "detail": self.poisoned,
+                    }
+                )
+            warmup_error = ""
+            if not command.import_only:
+                planner = self.host.planner
+                before = planner.checkpoint() if planner is not None else None
+                warmup_error = self._warm_package()
+                if planner is not None and before is not None:
+                    planner.measure_overhead(*before)
+                    self._startup_budget()
+                stage("package_warmup")
             if self.group is not None:
                 replies = self.group.collect("start")
                 self.follower_stages = [list(reply.get("stages") or []) for reply in replies]
@@ -1385,8 +1478,19 @@ class Executor:
                             f"{reply.get('detail', '')}"[:800],
                             code="group_unformed",
                         )
-                self.pg = self.group.form(self.torch, _SEALED)
-                stage("group_form")
+                if not command.import_only:
+                    planner = self.host.planner
+                    before = planner.checkpoint() if planner is not None else None
+                    self.pg = self.group.form(self.torch, _SEALED)
+                    if planner is not None and before is not None:
+                        planner.measure_overhead(*before)
+                        self._startup_budget()
+                    stage("group_form")
+        except memory.MemoryRefusal as exc:
+            self.poisoned = f"start refused: {exc.code}"
+            return self._close_after(
+                {**self._refusal(exc.code, exc.message), "shortfall": exc.shortfall}
+            )
         except GroupRefusal as exc:
             return self._group_refusal(exc)
         except Exception:
@@ -1394,7 +1498,8 @@ class Executor:
             if self.group is not None:
                 self.group.close()
             raise
-        self.started = True
+        self.imported = True
+        self.started = not command.import_only
         took_ms = (time.perf_counter() - started) * 1000
         self.boot = {
             "started_unix_ms": int(time.time() * 1000 - took_ms),
@@ -1403,23 +1508,41 @@ class Executor:
         }
         return self._start_reply(stages, warmup_error=warmup_error)
 
+    def _startup_budget(self) -> None:
+        """Context and warmup are process bytes too, before any model can be loaded."""
+        planner = self.host.planner
+        if planner is None:
+            return
+        planner.startup_budget(self._ask_room)
+
     def _start_reply(
         self, stages: list[tuple[str, float]], *, reused: bool = False, warmup_error: str = ""
     ) -> dict[str, Any]:
         total = free = -1
-        if self.torch is not None and accel.present(self.torch, self.device_kind):
-            memory = accel.allocation(self.torch, self.device_kind)
-            total, free = memory["driver_total_bytes"], memory["driver_free_bytes"]
+        if self._device_ready and self.torch is not None and self.device_kind == "cuda":
+            allocation = accel.allocation(self.torch, self.device_kind)
+            total, free = allocation["driver_total_bytes"], allocation["driver_free_bytes"]
+        facts = (
+            self.host.planner.facts()
+            if self.host.planner is not None
+            else {"allocated_bytes": 0, "reserved_bytes": 0, "overhead_bytes": 0}
+        )
+        ranks = self._rank_memory(refresh=self.started)
+        ranks[str(self.rank)] = facts
         return {
             "ok": True,
             "stages": stages,
             "reused": reused,
+            "imported": self.imported,
+            "started": self.started,
             "follower_pids": list(self.group.pids()) if self.group is not None else [],
             "follower_stages": self.follower_stages,
             "device_total_bytes": total,
             "device_free_bytes": free,
+            "memory": facts,
+            "rank_memory": ranks,
             "torch": self.torch is not None,
-            "warmed": not warmup_error,
+            "warmed": self.package_warmed and not warmup_error,
             "warmup_error": warmup_error,
             "rss_bytes": _rss(),
         }
@@ -1433,13 +1556,14 @@ class Executor:
         An optimization and never a verdict: the construction selects again for real."""
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
-        if not self.started or self.torch is None or self.device_kind != "cuda":
+        ready = self.imported if command.compile_only else self.started
+        if not ready or self.torch is None or self.device_kind != "cuda":
             return {"ok": True, "ranks": [], "skipped": "no started device process"}
         started = time.perf_counter()
         try:
             if self.group is not None and self.rank == 0:
                 self.group.broadcast(executor_commands.encode(command))
-            rows = [self._warm_rank()]
+            rows = [self._compile_rank() if command.compile_only else self._warm_rank()]
             if self.group is not None and self.rank == 0:
                 rows += [reply.get("rank_warm") or {} for reply in self.group.collect("warm")]
         except GroupRefusal as exc:
@@ -1447,12 +1571,39 @@ class Executor:
         if self.rank > 0:
             return {"ok": True, "rank_warm": rows[0]}
         took = (time.perf_counter() - started) * 1000
-        if "started_unix_ms" in self.boot:
+        if "started_unix_ms" in self.boot and not command.compile_only:
             # The boot record spans the warm too: `cozy run show` reads one executor boot.
             for name in ("fusion_compile", "attention_compile"):
                 self.boot["legs_ms"][name] = max(r.get("legs_ms", {}).get(name, 0.0) for r in rows)
             self.boot["ms"] = round(time.time() * 1000 - self.boot["started_unix_ms"], 1)
         return {"ok": True, "ranks": rows, "ms": round(took, 1)}
+
+    def _compile_rank(self) -> dict[str, Any]:
+        """Only recipes with explicit architecture inputs; launch checks wait for ownership."""
+        entries = _sealed_entries()
+        arch = accel.device_architecture(entries[self.rank], self.device_kind) if entries else None
+        if arch is None:
+            return {"rank": self.rank, "compile_only": True, "skipped": "architecture unreadable"}
+        classes = self._model_classes()
+        preferred = self._preferred_attention(classes, kind=self.device_kind, name="", sm=arch)
+        row: dict[str, object] = {
+            "rank": self.rank,
+            "compile_only": True,
+            "arch": arch,
+            "kernels": attention.prepare(arch, preferred),
+        }
+        if any(getattr(cls, "__fusion__", "refuse") in ("accept", "require") for cls in classes):
+            try:
+                fusion = importlib.import_module("cozy_runtime.internal.fusion")
+                store = kernel_cache.configured()
+                if store is None:
+                    row["fusion"] = "unavailable: no machine kernel store"
+                else:
+                    job = replace(fusion.job(arch), env={"CUDA_VISIBLE_DEVICES": ""})
+                    row["fusion"] = kernel_compile.submit(store, job).line()
+            except Exception as exc:
+                row["fusion"] = f"unavailable: {type(exc).__name__}: {exc}"[:300]
+        return row
 
     def _warm_rank(self) -> dict[str, Any]:
         from cozy_runtime.internal import fusion
@@ -1467,7 +1618,10 @@ class Executor:
             fused = fusion.expect(self._rank_device(self.torch))[:200]
             legs["fusion_compile"] = round((time.perf_counter() - mark) * 1000, 1)
         mark = time.perf_counter()
-        kernels = attention.expect(device, self._preferred_attention(classes, device))
+        kernels = attention.expect(
+            device,
+            self._preferred_attention(classes, kind=device.kind, name=device.name, sm=device.sm),
+        )
         # Launch checks' scratch goes back to the driver: the card may be another call's.
         accel.release_cached(self.torch, self.device_kind)
         legs["attention_compile"] = round((time.perf_counter() - mark) * 1000, 1)
@@ -1483,7 +1637,9 @@ class Executor:
         values = vars(module).values() if module is not None else ()
         return [v for v in values if isinstance(v, type) and issubclass(v, Model) and v != Model]
 
-    def _preferred_attention(self, classes: list[type[Model[Any]]], device: Any) -> list[str]:
+    def _preferred_attention(
+        self, classes: list[type[Model[Any]]], *, kind: str, name: str, sm: int
+    ) -> list[str]:
         """Each model class's stated preference, asked per declared component with the facts
         a site would carry. A class whose choice needs its constructed state says nothing."""
         order: list[str] = []
@@ -1495,9 +1651,9 @@ class Executor:
                 context = AttentionContext(
                     component,
                     "",
-                    device.kind,
-                    device.name,
-                    device.sm,
+                    kind,
+                    name,
+                    sm,
                     "bfloat16",
                     128,
                     self.world,
@@ -1545,12 +1701,11 @@ class Executor:
     def load(self, command: Load) -> dict[str, Any]:
         """Construct and fill ONE construction under its key; a loaded key answers again.
 
-        The worker names the key (its construction key) and assigns the process-wide
-        ceiling: `authorized_device_limit_bytes` bounds everything this process holds, so a
-        construction fits under it less what the others already hold, after parking the
-        least recently used of them if that is what makes room. A load refused before it
-        touched the process leaves the other constructions serving; one that allocated,
-        commanded followers or raised poisons the process.
+        The worker names the key (its construction key) and grants the process's device
+        bytes (`authorized_device_limit_bytes`); the fill places what fits beside what the
+        process already holds and leaves the rest on the store for its first op. A load
+        refused before it touched the process leaves the other constructions serving; one
+        that allocated, commanded followers or raised poisons the process.
         """
         if self.rank > 0:
             return self._follower_load(command)
@@ -1562,12 +1717,10 @@ class Executor:
         if not key:
             return self._refusal("construction_key_absent", "a load names its construction")
         loaded = self.constructions.get(key)
+        self._grant(command.authorized_device_limit_bytes, command.memory_grants)
         if loaded is not None:
             loaded._bind_parameters(command)
-            self.arbiter.touch(key)
             return self._load_reply(key, loaded, reused=True)
-        if command.authorized_device_limit_bytes is not UNSET:
-            self.authorized = command.authorized_device_limit_bytes
         child = self._construction_child(key)
         try:
             reply = child._prepare_first(command)
@@ -1596,10 +1749,71 @@ class Executor:
                 member.models.setdefault(name, model)
                 self.models.setdefault(name, model)
 
+    def _grant(self, grant: int | UnsetType, grants: tuple[int, ...] = ()) -> None:
+        """The worker's grant of this process's device bytes, where one arrived."""
+        owner = self.host
+        if grants:
+            if len(grants) != self.world or any(value < 0 for value in grants):
+                raise memory.MemoryRefusal(
+                    memory.SHORTFALL,
+                    "memory authorization must cover every rank with nonnegative bytes",
+                )
+            grant = grants[self.rank]
+            if owner.group is not None:
+                owner.group.memory_grants = grants
+        if not isinstance(grant, UnsetType):
+            if grant < 0:
+                raise memory.MemoryRefusal(memory.SHORTFALL, "device grant is negative", 0, grant)
+            if not grants and owner.group is not None:
+                owner.group.memory_grants = (int(grant),) * self.world
+            if owner.planner is not None:
+                owner.planner.grant = int(grant)
+                owner.planner._cap()
+
+    def _rank_memory(
+        self, *, refresh: bool = False, end_attempt: bool = False
+    ) -> dict[str, dict[str, int]]:
+        """Rank reports, never replicated leader facts. Refresh only between group calls."""
+        owner = self.host
+        group = owner.group
+        if refresh and group is not None and not group.broken:
+            with group.hold(range(1, group.degree)):
+                for reply in group.call(executor_commands.encode(Probe(end_attempt=end_attempt))):
+                    if not reply.get("ok"):
+                        raise GroupRefusal("a follower could not report its memory")
+        facts = dict(group.rank_memory) if group is not None else {}
+        if owner.planner is not None:
+            facts[str(self.rank)] = owner.planner.facts()
+        return facts
+
+    def _resident_bytes(self, key: str) -> int:
+        planner = self.planner
+        if planner is None:
+            return 0
+        return sum(
+            held.part.on(tiers.DEVICE)
+            for held in planner.held.values()
+            if held.construction.split("#", 1)[0] == key
+        )
+
+    def _placed(self) -> dict[str, dict[str, int]]:
+        """This generation's components on the device, and what of each is off it."""
+        planner = self.host.planner
+        resident: dict[str, int] = {}
+        evicted: dict[str, int] = {}
+        for held in planner.held.values() if planner is not None else ():
+            if held.construction != self.memory_key or held.hosted:
+                continue
+            on = held.part.on(tiers.DEVICE)
+            if on:
+                resident[held.part.name] = on
+            if held.part.nbytes > on:
+                evicted[held.part.name] = held.part.nbytes - on
+        return {"resident": resident, "evicted": evicted}
+
     def _register(self, key: str, child: Executor, reply: dict[str, Any]) -> None:
         child.load_reply = reply
         self.constructions[key] = child
-        self.arbiter.add(key, Construction(residency=child.residency, need=child._restore_need))
         self.discovered = child.discovered
         self.surface_names = dict(child.surface_names)
         self.torch = child.torch or self.torch
@@ -1607,13 +1821,14 @@ class Executor:
         self.ready = True
 
     def _load_reply(self, key: str, child: Executor, *, reused: bool) -> dict[str, Any]:
-        row = self.arbiter.rows[key]
         return {
             **child.load_reply,
+            "memory": self.planner.facts() if self.planner is not None else {},
+            "rank_memory": self._rank_memory(refresh=True),
             "construction": key,
             "reused": reused,
-            "parked": [] if reused else list(child.load_parked),
-            "resident_bytes": row.resident_bytes(),
+            "parked": [],
+            "resident_bytes": self._resident_bytes(key),
         }
 
     def _follower_load(self, command: Load) -> dict[str, Any]:
@@ -1647,104 +1862,18 @@ class Executor:
             self.poisoned = member.poisoned or f"load refused: {reply.get('code')}"
             return reply
         container.models.update(member.models)
-        container.residency = _CompositeResidency(
-            {
-                next(iter(item.models)): item.residency
-                for item in container.model_executors
-                if item.residency is not None
-            }
-        )
         container.ready = True  # prepared roots can receive their leader's warm calls
-        if key in self.constructions:
-            self.arbiter.rows[key].residency = container.residency
-        else:
+        if key not in self.constructions:
             self._register(key, container, reply)
         return reply
-
-    def _park(self, keys: list[str]) -> None:
-        """Park exactly these constructions (a follower obeying rank 0's decision)."""
-        for key in keys:
-            if key not in self.arbiter.rows:
-                raise GroupRefusal(
-                    f"{_gpu(0)} parked {key!r}, which {_gpu(self.rank)} never loaded"
-                )
-            self._synchronize()
-            self.arbiter.park(key)
-
-    def _make_room(self, exclude: str, need: int) -> list[str]:
-        """Park LRU constructions until `need` more bytes fit the ceiling and the card."""
-        torch, kind = self.torch, self.device_kind
-        if torch is None:
-            return []
-
-        def fits() -> bool:
-            memory = accel.allocation(torch, kind)
-            allocatable = memory["driver_free_bytes"] + max(
-                memory["reserved_bytes"] - memory["allocated_bytes"], 0
-            )
-            return memory["allocated_bytes"] + need <= self.authorized and allocatable >= need
-
-        self._synchronize()
-        parked = self.arbiter.make_room(exclude, fits)
-        if parked:
-            accel.release_cached(torch, kind)
-        if self.world > 1 or not fits():
-            # A group asks for every rank: a follower's card may be short where this one
-            # is not, and the worker frees each device of the lane until its tightest fits.
-            self._room(need)
-        return parked
-
-    def _room(self, need: int) -> None:
-        """Ask the worker for `need` allocatable bytes this process cannot free itself:
-        idle co-tenants of its devices give theirs back. Rank 0 only; followers answer to
-        rank 0."""
-        host = self.host
-        if host.rank != 0 or host.torch is None or host.device_kind != "cuda":
-            return
-        memory = accel.allocation(host.torch, host.device_kind)
-        slack = max(memory["reserved_bytes"] - memory["allocated_bytes"], 0)
-        answer = host._durable(DeviceRoom(free_bytes=need - slack), Room)
-        if answer.ok and not isinstance(answer.authorized_device_limit_bytes, UnsetType):
-            host.authorized = answer.authorized_device_limit_bytes
 
     def _synchronize(self) -> None:
         if self.torch is not None:
             accel.synchronize(self.torch, self.device_kind)
 
-    def _restore_need(self, names: tuple[str, ...]) -> int:
-        """Bytes to stage `names` back: their settled sum plus the widest one's fill
-        transient. An fp8 leaf is filled as its bf16 destination beside the encoded payload
-        before the swap, so `stage_bytes` (the component's fill peak) is what must fit
-        while it arrives - pricing only the settled bytes is how a restore OOMs."""
-        members = self.model_executors or [self]
-        prefixed = len(members) > 1
-        settled = transient = 0
-        for member in members:
-            backend = member.backend
-            if backend is None:
-                continue
-            prefix = (next(iter(member.models)) + "/") if prefixed and member.models else ""
-            for component in {*backend.components, *backend.parked}:
-                if prefix + component not in names:
-                    continue
-                peak = int(backend.stage_bytes(component))
-                resting = (
-                    int(backend.paging[component].working_bytes)
-                    if component in backend.paging
-                    else int(backend.component_memory[component].settled)
-                )
-                settled += resting
-                transient = max(transient, peak - resting)
-        return settled + transient
-
     def activate(self, command: Activate) -> dict[str, Any]:
-        """Make one loaded construction the resident, active one.
-
-        A resident construction activates in 0 ms. A parked one first parks least recently
-        used constructions until its whole parked set plus the widest component's fill
-        transient fits the ceiling and the card, then stages that set back. Every rank
-        parks and restores the same constructions: rank 0 decides and says which.
-        """
+        """Name the active construction. Its weights arrive with its ops, so nothing moves
+        here; every rank hears it so the group agrees which construction serves."""
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
         key = command.construction
@@ -1752,25 +1881,13 @@ class Executor:
             return self._refusal(
                 "construction_not_loaded", f"{key!r} is not loaded in this executor"
             )
-        if command.authorized_device_limit_bytes is not UNSET:
-            self.authorized = command.authorized_device_limit_bytes
+        self._grant(command.authorized_device_limit_bytes, command.memory_grants)
+        if command.begin_attempt and self.host.planner is not None:
+            self.host.planner.begin(None)
         started = time.perf_counter()
-        row = self.arbiter.rows[key]
-        restored: RestoreReport = {"restored": {}, "held": {}, "restored_bytes": 0}
         try:
-            if self.rank == 0:
-                parked = self._make_room(key, self.arbiter.need(key)) if row.parked else []
-                if self.group is not None:
-                    self.group.broadcast(
-                        executor_commands.encode(Activate(construction=key, park=tuple(parked)))
-                    )
-            else:
-                parked = list(command.park)
-                self._park(parked)
-            if row.parked is not None:
-                restored = self.arbiter.restore(key)
-                self._synchronize()
             if self.rank == 0 and self.group is not None:
+                self.group.broadcast(executor_commands.encode(command))
                 for reply in self.group.collect("activate"):
                     if not reply.get("ok"):
                         raise GroupRefusal(
@@ -1780,22 +1897,18 @@ class Executor:
                         )
         except GroupRefusal as exc:
             return self._group_refusal(exc, closing=False)
-        except ResidencyRefusal as exc:
-            self.poisoned = self.poisoned or f"activate: {exc.code}"
-            return {"ok": False, "code": exc.code, "detail": exc.detail[:900]}
-        self.arbiter.touch(key)
         self.active = key
         return {
             **self.probe(),
+            "rank_memory": self._rank_memory(),
             "ok": True,
             "construction": key,
-            "parked": parked,
-            "restored_bytes": int(restored.get("restored_bytes", 0)),
-            # what the block layer served for it: ~0 is a warm page cache
-            "read_bytes": int(restored.get("read_bytes", -1)),
-            "fill_ms": int(restored.get("fill_ms", 0)),
-            "held": dict(restored.get("held") or {}),
-            "resident_bytes": row.resident_bytes(),
+            "parked": [],
+            "restored_bytes": 0,
+            "read_bytes": -1,
+            "fill_ms": 0,
+            "held": {},
+            "resident_bytes": self._resident_bytes(key),
             "ms": round((time.perf_counter() - started) * 1000, 2),
         }
 
@@ -1812,11 +1925,10 @@ class Executor:
                 self.group.broadcast(executor_commands.encode(Unload(construction=key)))
             self._synchronize()
             before = accel.allocated(self.torch, self.device_kind) if self.torch else 0
-            self.arbiter.remove(key)
             members = child.model_executors or [child]
-            if child.residency is not None:
-                child.residency.vacate()
             for member in members:
+                if self.planner is not None and member.memory_key:
+                    self.planner.forget(member.memory_key)
                 if member.backend is not None:
                     member.backend.close()
             prefix = key + "#"
@@ -1830,7 +1942,7 @@ class Executor:
                 member.models.clear()
                 member.prepared.clear()
                 member.model_executors = []
-                member.backend = member.residency = member.registry = None
+                member.backend = member.registry = None
             del child, members, member
             if self.active == key:
                 self.active = ""
@@ -1848,9 +1960,6 @@ class Executor:
                         )
         except GroupRefusal as exc:
             return self._group_refusal(exc, closing=False)
-        except ResidencyRefusal as exc:
-            self.poisoned = self.poisoned or f"unload: {exc.code}"
-            return {"ok": False, "code": exc.code, "detail": exc.detail[:900]}
         self.ready = bool(self.constructions)
         return {
             **self.probe(),
@@ -1861,11 +1970,20 @@ class Executor:
 
     def residency_document(self) -> dict[str, Any]:
         free = -1
-        if self.torch is not None and accel.present(self.torch, self.device_kind):
+        if self._device_ready and self.torch is not None and self.device_kind == "cuda":
             free = accel.allocation(self.torch, self.device_kind)["driver_free_bytes"]
         return {
             "ok": True,
-            "constructions": self.arbiter.document(self.active),
+            "constructions": [
+                {
+                    "key": key,
+                    "state": "resident" if self._resident_bytes(key) else "parked",
+                    "resident_bytes": self._resident_bytes(key),
+                    "last_used_ns": 0,
+                    "active": key == self.active,
+                }
+                for key in sorted(self.constructions)
+            ],
             "active": self.active,
             "free_bytes": free,
         }
@@ -1998,6 +2116,7 @@ class Executor:
         except attention.AttentionRefusal as exc:
             return {"ok": False, "code": exc.code, "detail": str(exc)}
         authorized = command.authorized_device_limit_bytes
+        self.host._grant(authorized, command.memory_grants)
         if authorized is UNSET:
             # NO SELF-DERIVED CEILING (cr-025/cr-066): the worker assigns one before every
             # model-bearing prepare. An absent assignment is a worker defect, refused
@@ -2039,14 +2158,12 @@ class Executor:
             Checkpoint,
             FillRefusal,
             StreamingFillBackend,
-            complete_device_envelope,
             dtype_name,
             tensor_schema_of,
         )
         from cozy_runtime.internal.fusion_install import FusionRefusal, apply_fusion_plan
         from cozy_runtime.internal.planfacts import PlanFacts
         from cozy_runtime.internal.probe import qualified
-        from cozy_runtime.internal.residency import ComponentResidency
         from cozy_runtime.internal.resolution import (
             ConstructionFacts,
             PlanRefusal,
@@ -2259,149 +2376,24 @@ class Executor:
             custody=binding.custody,
         )
         stage("backend_ctor")
-        # THE ARITHMETIC, BEFORE THE FIRST BYTE (#574b). The binding declares its components'
-        # logical bytes from their headers; the header envelope prices the rows this plan
-        # fills and the selected route's native/decode overhead, and the larger destination
-        # count wins where the two have not met. Derived buffers are not priced until
-        # construction. This refusal runs before allocation instead of an OOM mid-fill.
-        declared = budgets.logical_weight_bytes
-        envelope = complete_device_envelope(backend.device_envelope(), declared)
-        destinations = int(envelope["base_bytes"])
-        overhead = int(envelope["fill_overhead_bytes"])
-        # THE PROCESS CEILING (proto-061). `authorized` bounds everything this process
-        # holds; the constructions already loaded are parked, least recently used first,
-        # until this one's destinations plus its widest fill transient fit beside the rest.
-        # Under a group rank 0 decides from the largest need any rank reported, and every
-        # rank parks the same constructions before measuring its own ceiling.
-        need = destinations + overhead
-        host = self.host
-        measured: dict[str, int] = {}
-
-        def local_ceiling() -> int:
-            memory = accel.allocation(torch, self.device_kind)
-            measured["allocatable"] = memory["driver_free_bytes"] + max(
-                memory["reserved_bytes"] - memory["allocated_bytes"], 0
-            )
-            # Rank 0's ceiling moves when the worker vacated co-tenants for it (`_room`).
-            ceiling = host.authorized if self.rank == 0 else authorized
-            measured["authorized"] = ceiling - memory["allocated_bytes"]
-            # THE RESIDENCE CEILING (cl-027 / cr-025 / cr-066): the worker's ASSIGNED
-            # limit less what this process already holds, verified against measured
-            # capacity, capped at the artifact's complete destination bytes; the APPLIED
-            # value is what the generation's digest carries. A staging generation re-reads
-            # the store after construction, so its GC-safe hold must outlive the first
-            # commit; that is `hold_lease`.
-            return residence_ceiling(
-                destinations=destinations,
-                authorized=measured["authorized"] - overhead,
-                allocatable=measured["allocatable"] - overhead,
-            )
-
+        planner = self.host.planner
+        if planner is not None:
+            # Residency follows use: every component stays on the store until an op of it
+            # runs, so one no call reaches never occupies the device.
+            backend.place = lambda name, peak: False
+        envelope: dict[str, Any] = dict(backend.device_envelope())
         try:
             if self.world > 1 and self.rank == 0:
                 assert self.group is not None
-                resident_budget, self.load_parked = self.group.agree_residence(
-                    model=self._group_model_key,
-                    plan=mine.document(),
-                    required=need,
-                    park=lambda most: host._make_room(self.construction, most),
-                    ceiling=local_ceiling,
-                )
+                self.group.agree_plan(model=self._group_model_key, plan=mine.document())
             elif self.world > 1:
-                resident_budget = receive_residence(
-                    self.channel,
-                    rank=self.rank,
-                    model=self._group_model_key,
-                    plan=mine.document(),
-                    required=need,
-                    park=host._park,
-                    ceiling=local_ceiling,
+                offer_plan(
+                    self.channel, rank=self.rank, model=self._group_model_key, plan=mine.document()
                 )
-            else:
-                self.load_parked = host._make_room(self.construction, need)
-                held[0] = self._device_bytes()
-                resident_budget = local_ceiling()
         except (GroupRefusal, SeamError) as exc:
             return self._group_refusal(
                 exc if isinstance(exc, GroupRefusal) else GroupRefusal(str(exc))
             )
-        except ResidencyRefusal as exc:
-            self.poisoned = f"park refused: {exc.code}"
-            return {"ok": False, "code": exc.code, "detail": exc.detail[:900]}
-        local_resident_ceiling = residence_ceiling(
-            destinations=destinations,
-            authorized=measured["authorized"] - overhead,
-            allocatable=measured["allocatable"] - overhead,
-        )
-        allocatable = measured["allocatable"]
-        authorized_here = measured["authorized"]
-        admissible = min(authorized_here, int(allocatable))
-        if resident_budget <= 0:
-            self._discard_unallocated(backend, held[0], "fill refused: device_shortfall")
-            return {
-                "ok": False,
-                "code": "device_shortfall",
-                "detail": (
-                    f"{authorized_here} B left of the {authorized} B the worker authorized "
-                    f"and {allocatable} B allocatable leave no residence ceiling — nothing "
-                    "of this construction can stay resident, so there is no plan to derive"
-                ),
-                "shortfall": {
-                    "resource": "vram",
-                    "scope": "component_generation",
-                    "needed_bytes": destinations,
-                    "available_bytes": admissible,
-                    "evidence_class": "measured",
-                },
-            }
-        # The ceiling is capped at `destinations`, an estimate that misses derived buffers
-        # when the stored bytes undercut the logical ones (an encoded checkpoint). Capped
-        # there, the card holds the whole construction, so the fill parks nothing (0).
-        backend.resident_budget = resident_budget if resident_budget < destinations else 0
-        backend.hold_lease = 0 < resident_budget < destinations
-        # ADMISSION prices the RESIDENT set, not every destination: a construction whose
-        # total exceeds the card but whose ceiling fits prepares and stages (cr-025 done-when).
-        resident_destinations = (
-            min(destinations, resident_budget) if resident_budget else destinations
-        )
-        required = resident_destinations + overhead
-        envelope = {
-            **envelope,
-            "resident_destination_bytes": resident_destinations,
-            "local_resident_ceiling_bytes": local_resident_ceiling,
-            "resident_budget_bytes": resident_budget,
-            "authorized_device_limit_bytes": authorized,
-            "required_bytes": required,
-        }
-        if required > admissible:
-            self._discard_unallocated(backend, held[0], "fill refused: device_shortfall")
-            return {
-                "ok": False,
-                "code": "device_shortfall",
-                "detail": (
-                    f"this fill will hold {required} B on the device "
-                    f"({resident_destinations} B of resident destinations under an "
-                    f"assigned ceiling of {resident_budget} B; "
-                    f"{envelope['destination_bytes']} B of logical destinations, "
-                    f"{envelope['derived_destination_bytes']} B of additional MCC-derived "
-                    "destinations, "
-                    f"{overhead} B of overlapping fill storage at its widest component) "
-                    f"against {authorized_here} B left of the {authorized} B process "
-                    f"ceiling and {allocatable} B allocatable - refused on the arithmetic, "
-                    "before a byte moved. The "
-                    f"binding declared {declared} B of logical destinations; the header "
-                    "independently prices stored encoding overhead"
-                ),
-                "envelope": envelope,
-                "logical_weight_bytes": declared,
-                "shortfall": {
-                    "resource": "vram",
-                    "scope": "component_generation",
-                    "needed_bytes": required,
-                    "available_bytes": admissible,
-                    "evidence_class": "measured",
-                },
-            }
         stage("admission")
         artifact = Artifact(
             reference.snapshot,
@@ -2536,7 +2528,7 @@ class Executor:
             # the backend's own OOM — which is asked of the accelerator boundary rather
             # than named here, so a second backend spells its allocator error once (#447).
             refusal = exc if isinstance(exc, FillRefusal) else None
-            if refusal is None and not accel.is_oom(torch, exc):
+            if refusal is None and not is_device_oom(exc):
                 raise
             # The generation is already rolled back, so the numbers that matter are the
             # HIGH-WATER marks beside the after state — "released 0 B" would be true and
@@ -2551,8 +2543,8 @@ class Executor:
             # is EVIDENCE — the allocator and driver as they stood when the fill failed.
             if backend.state != "poisoned":
                 backend.poison(())
-            memory = accel.allocation(torch, self.device_kind)
-            free, total = memory["driver_free_bytes"], memory["driver_total_bytes"]
+            allocation = accel.allocation(torch, self.device_kind)
+            free, total = allocation["driver_free_bytes"], allocation["driver_total_bytes"]
             code = "device_shortfall" if refusal is None else refusal.code
             self.poisoned = f"fill refused: {code}"
             reply: dict[str, Any] = {
@@ -2561,7 +2553,7 @@ class Executor:
                 "detail": str(exc).splitlines()[0][:400],
                 "state": backend.state,
                 "peak_allocator_bytes": accel.peak_allocated(torch, self.device_kind),
-                "allocator_bytes": memory["allocated_bytes"],
+                "allocator_bytes": allocation["allocated_bytes"],
                 "device_free_bytes": free,
                 "device_total_bytes": total,
                 "envelope": envelope,
@@ -2583,13 +2575,15 @@ class Executor:
         # ONE generation under EVERY parameter name the placement's bindings spell
         # (h3a-018): two entrypoints over one construction share the object.
         self.models = {name: model for name in binding.parameter_names()}
-        # THE COMPONENT-USE CONTRACT'S RUNTIME BODY, installed on the constructed
-        # generation. From here on, entering a declared scope admits and materializes its
-        # set before the body runs; the package cannot observe that it happened.
-        self.residency = ComponentResidency(
-            backend=backend, torch=torch, placement="all_resident", room=self._room
-        )
-        object.__setattr__(model, "_cozy_residency", self.residency)
+        # THE COMPONENT-USE CONTRACT'S RUNTIME BODY: from here on every component is the
+        # planner's, and entering a declared scope brings what it reads onto the device.
+        self.memory_key = self._group_model_key
+        if planner is not None:
+            for name, root in backend.components.items():
+                planner.adopt(self.memory_key, name, root, backend, tiers.DEVICE)
+            for name, root in backend.parked.items():
+                planner.adopt(self.memory_key, name, root, backend, tiers.DISK)
+            object.__setattr__(model, "_cozy_residency", _Scopes(planner, self.memory_key))
         record = registry.generations()[0].record
         # THE CONSTRUCTED GENERATION is what actually got filled, and since #549.1 it is
         # THE RESOLVED PLAN'S OWN DIGEST that says so. The plan digest binds the exact
@@ -2604,8 +2598,6 @@ class Executor:
         constructed_preimage = canonical.write(
             {
                 "plan_digest": plan.digest(),
-                # THE APPLIED CEILING, derived from the card (cl-027).
-                "resident_budget_bytes": resident_budget,
                 "execution_optimization": optimization.document() if optimization else None,
                 "execution_fusion": fused.identity_document() if fused is not None else None,
             }
@@ -2635,15 +2627,10 @@ class Executor:
                     )
                 # The CONSTRUCTION must be the same on every rank; the constructed digest
                 # folds the card's index and is rank-local, so what is compared beside it
-                # is what the fill committed and the ceiling it committed under.
+                # is what the fill committed. Where its bytes live is each rank's own.
                 theirs = dict(reply.get("facts") or {})
                 agreed: list[tuple[str, object, object]] = [
                     ("filled_bytes", record.filled_bytes, theirs.get("filled_bytes")),
-                    (
-                        "resident_budget_bytes",
-                        resident_budget,
-                        theirs.get("resident_budget_bytes"),
-                    ),
                 ]
                 for key, ours, other in agreed:
                     if other != ours:
@@ -2658,21 +2645,16 @@ class Executor:
             if refused is not None:
                 return refused
         self.facts = {}
+        # Every rank received the same vector. An older Worker supplies one conservative
+        # scalar for the whole group; never derive different homes from rank-local free RAM.
         refused = self._install_group(
             torch,
             model,
-            settled_capacity(resident_budget=resident_budget, fill_overhead=overhead),
+            command.memory_grants or (int(authorized),) * self.world,
         )
         if refused is not None:
             return refused
         stage("install")
-        # Warm-up may stage components one scope at a time even on a roomy card.
-        # Preserve what the construction actually fitted before those temporary moves:
-        # the worker must restore that set, not treat warm's last scope as a capacity floor.
-        constructed_resident = dict(backend.vram_charge)
-        # A component another rank hosts is not this rank's to hold, restore or price.
-        hosted = self.residency.hosted if self.residency is not None else frozenset()
-        construction_parked = sorted((set(backend.parked) | set(backend.paging)) - hosted)
         # THE AUTHOR'S ONE WARM MOMENT (cr-110, model-lifecycle.md): after the fill, its
         # verification, the execution plan, the residency install and the group mirror;
         # before this generation is Ready, so a placement is never DISPATCHABLE over a cold
@@ -2691,8 +2673,8 @@ class Executor:
                 backend.poison(())
                 self.poisoned = f"warm failed: {exc}"[:200]
                 cause = exc.__cause__
-                short = cause if isinstance(cause, ResidencyRefusal) else None
-                oom = cause is not None and accel.is_oom(torch, cause)
+                short = cause if isinstance(cause, memory.MemoryRefusal) else None
+                oom = cause is not None and is_device_oom(cause)
                 return {
                     "ok": False,
                     "code": short.code if short else "device_out_of_memory" if oom else exc.code,
@@ -2715,7 +2697,8 @@ class Executor:
                 }
         self.attention_defaults = attention.snapshot({**backend.components, **backend.parked})
         group_facts = dict(self.facts)
-        memory = accel.allocation(torch, self.device_kind)
+        allocation = accel.allocation(torch, self.device_kind)
+        placed = self._placed()
         self.ready = True
         self.facts = {
             # `sequence_parallel` rides here under a group ONLY: a plain executor's facts
@@ -2751,24 +2734,14 @@ class Executor:
             "warm_ms": round(warm_ms, 2),
             "filled": record.filled,
             "filled_bytes": record.filled_bytes,
-            "device_free_bytes": memory["driver_free_bytes"],
-            "device_total_bytes": memory["driver_total_bytes"],
-            "allocator_bytes": memory["allocated_bytes"],
-            "reserved_bytes": memory["reserved_bytes"],
-            "resident": dict(backend.vram_charge),
-            "constructed": constructed_resident,
-            "parked": construction_parked,
-            "paging": {name: layout.document() for name, layout in backend.paging.items()},
-            # WITH THEIR SIZES, like the residency document's `evicted`: a parked component
-            # is a component the next attempt may have to bring back, and a chooser that
-            # sees its name and not its bytes prices that stage-in at nothing.
-            "evicted": {
-                name: backend.component_bytes.get(name, 0)
-                for name in backend.parked
-                if name not in hosted
-            },
-            "resident_budget_bytes": resident_budget,
-            "authorized_device_limit_bytes": authorized,
+            "device_free_bytes": allocation["driver_free_bytes"],
+            "device_total_bytes": allocation["driver_total_bytes"],
+            "allocator_bytes": allocation["allocated_bytes"],
+            "reserved_bytes": allocation["reserved_bytes"],
+            "resident": placed["resident"],
+            "constructed": placed["resident"],
+            "parked": sorted(placed["evicted"]),
+            "evicted": placed["evicted"],
             "rss_bytes": _rss(),
             "pinned": dict(backend.pinned),
             # WHAT THIS GENERATION HOLDS OPEN (cr-103). `lease_acquire` was 1.9-3.4 s of
@@ -2812,6 +2785,7 @@ class Executor:
         return {
             "ok": True,
             "ready": True,
+            "memory": planner.facts() if planner is not None else {},
             "constructed_model_digest": self.constructed_model_digest,
             "entrypoints": sorted(self.surface_names),
             "plan": plan.seam_document(),
@@ -2881,6 +2855,7 @@ class Executor:
                     budgets=row.budgets,
                     devices=command.devices,
                     authorized_device_limit_bytes=authorized,
+                    memory_grants=command.memory_grants,
                     attention_pin=aggregate_pin
                     if attention.for_model(aggregate_pin, binding.parameter_names())
                     else "",
@@ -2891,7 +2866,6 @@ class Executor:
                 ),
                 optional_attention_scope=True,
             )
-            self.load_parked += child.load_parked
             if not reply.get("ok"):
                 self.poisoned = child.poisoned or (
                     f"model {parameter} refused: {reply.get('code', 'unknown')}"
@@ -2927,12 +2901,6 @@ class Executor:
                     "detail": f"prepared model object did not bind parameter {parameter!r}",
                 }
             self.models.update(child.models)
-        residencies = {
-            parameter: child.residency
-            for parameter, child, _ in children
-            if child.residency is not None
-        }
-        self.residency = _CompositeResidency(residencies)
 
         constructed = [
             {"parameter": parameter, "digest": str(reply["constructed_model_digest"])}
@@ -2966,11 +2934,6 @@ class Executor:
             f"{parameter}.{method}": [f"{parameter}/{component}" for component in components]
             for parameter, facts in facts_rows
             for method, components in (facts.get("declared_scopes") or {}).items()
-        }
-        paging = {
-            f"{parameter}/{component}": layout
-            for parameter, facts in facts_rows
-            for component, layout in (facts.get("paging") or {}).items()
         }
         pinned_rows = [facts.get("pinned") or {} for _, facts in facts_rows]
         # WHAT EACH MODEL PINNED, MERGED (cr-124). A group prepare has one boot note, so a
@@ -3054,7 +3017,6 @@ class Executor:
             },
             "parked": parked,
             "evicted": evicted,
-            "paging": paging,
             "declared_scopes": scopes,
             "rss_bytes": max(int(facts.get("rss_bytes", 0)) for _, facts in facts_rows),
             "pinned": {
@@ -3165,11 +3127,6 @@ class Executor:
         target = self._target(command, attempt=True)
         if isinstance(target, dict):
             return target
-        key = target.construction
-        row = self.arbiter.rows[key]
-        # A lane vacate parked the active construction; its admissions stage on demand.
-        row.parked = None
-        self.arbiter.touch(key)
         reply = target.invoke(command)
         self.attempts += 1
         self.poisoned = self.poisoned or target.poisoned
@@ -3301,18 +3258,22 @@ class Executor:
         # loss this lane may incur.
         progress = self._progress_sink(command.request_id)
 
-        # The attempt's PLACEMENT RUNG, fixed by the PlanChooser before durable acceptance
-        # and applied here. The executor decides nothing: it is handed a rung and obeys it,
-        # which is what keeps `all_resident` from quietly starting to swap.
-        if self.residency is not None:
-            self.residency.open_attempt(
-                command.placement,
-                command.headroom_bytes,
-                command.scope_headroom_bytes,
-                command.measured_scopes,
-            )
-        if torch is not None:
-            accel.reset_peak(torch, self.device_kind)
+        # The worker's grant of this process's device bytes; the planner decides the rest.
+        planner = self.host.planner
+        if planner is not None:
+            self._grant(command.memory_grant_bytes, command.memory_grants)
+            planner.begin(None)
+            if self.group is not None:
+                activated = self.host.activate(
+                    Activate(
+                        construction=self.construction,
+                        authorized_device_limit_bytes=command.memory_grant_bytes,
+                        memory_grants=command.memory_grants,
+                        begin_attempt=True,
+                    )
+                )
+                if not activated.get("ok"):
+                    return activated
         allocated_at_start = accel.allocated(torch, self.device_kind) if torch is not None else 0
         lease_acquired = time.perf_counter()
         started_wall = time.time()
@@ -3414,16 +3375,20 @@ class Executor:
             accel.synchronize(torch, self.device_kind)
         d2h_ms = (time.perf_counter() - d2h_started) * 1000
         released_us = execution_evidence.now_us()
-        peak_vram = accel.peak_allocated(torch, self.device_kind) if torch is not None else 0
-        residency_document = self.residency.document() if self.residency is not None else {}
-        peak_vram = max(peak_vram, int(residency_document.get("attempt_absolute_peak_bytes", 0)))
-        working_peak = _working_peak(peak_vram, allocated_at_start, residency_document)
-        if self.group is not None:
-            working_peak = max(working_peak, *self.group.working_peaks.values(), 0)
-        if torch is not None:
+        residency_document: dict[str, Any] = {}
+        facts: dict[str, int] = {}
+        if planner is not None:
+            residency_document = planner.document(self.construction)
             # An idle tenant holds its weights, not its last call's scratch: the cache goes
             # back to the card, where the next tenant the worker admits can use it.
-            accel.release_cached(torch, self.device_kind)
+            facts = planner.end()
+            if planner.unusable:
+                self.poisoned = self.host.poisoned = planner.unusable
+        rank_memory = self._rank_memory(refresh=True, end_attempt=True)
+        peak_vram = int(facts.get("peak_allocated_bytes", 0))
+        working_peak = int(facts.get("working_bytes", 0))
+        if self.group is not None:
+            working_peak = max(working_peak, *self.group.working_peaks.values(), 0)
         # step 3: the lease releases here, and nothing after this line touches the device.
         # DEVICE RELEASE IS THIS REPLY (cr-079): the handler registered its outputs as raw
         # host frames, so `device_lease_ms` is device time and the encode is the worker's.
@@ -3433,8 +3398,25 @@ class Executor:
         result_ref, outputs, oversize = _serialize_result(envelope, spool)
         # Only a failure inside the handler leaves package state unknown. A request refusal,
         # a cooperative cancel/deadline or a failed package call stops at a safe point and
-        # keeps the generation Ready.
-        if outcome.terminal == "failed" and record.entered and not record.failed_at_call:
+        # keeps the generation Ready only when the planner has restored reusable state.
+        # A typed OOM by itself establishes nothing about package state.
+        refusal = planner.refusal if planner is not None else None
+        if refusal is not None and outcome.code != refusal.code:
+            refusal = None
+        clean = (
+            planner is not None
+            and not planner.unusable
+            and (
+                (refusal is not None and refusal.reusable)
+                or planner.preparation_failure == outcome.code
+            )
+        )
+        if (
+            outcome.terminal == "failed"
+            and record.entered
+            and not record.failed_at_call
+            and not clean
+        ):
             self.poisoned = f"{outcome.terminal}/{outcome.code}"
         terminal = {
             "terminal": outcome.terminal,
@@ -3444,20 +3426,16 @@ class Executor:
             "fields": list(outcome.fields),
             "traceback": outcome.traceback,
         }
-        # THE RESIDENCY PLANE'S POISON IS THIS PROCESS'S POISON (#613). A mid-mutation
-        # failure or an accounting violation there can fire BEFORE handler entry (admission
-        # runs at scope enter), so the phase bit above cannot see it — and the transaction
-        # is the process, so the worker must replace it either way.
-        if self.residency is not None and self.residency.poisoned:
-            self.poisoned = self.poisoned or f"residency: {self.residency.poisoned[:200]}"
         # The BOUNDED observation tail and the O(1) time attribution cross the seam on every
         # path, success or fault. A failed attempt's log tail is the one triage most needs,
         # and cr-011 hoisted the record out of `invoke` precisely so it survives the failure.
-        shortfall = self.residency.last_shortfall if self.residency is not None else None
+        shortfall = refusal.shortfall if refusal is not None else None
         return {
             "ok": True,
             "shortfall": shortfall,
             "residency": residency_document,
+            "memory": facts,
+            "rank_memory": rank_memory,
             "observations": record.ring.rows(),
             "observation_caps": record.ring.caps(),
             "attribution": record.attribution.document(),
@@ -3499,10 +3477,8 @@ class Executor:
                 "device_lease_ms": round(lease_ms, 3),
                 "d2h_wait_ms": round(d2h_ms, 3),
                 "peak_vram_bytes": peak_vram,
-                "activation_peak_bytes": int(
-                    residency_document.get("attempt_activation_peak_bytes", 0)
-                ),
-                "activation_peaks": dict(residency_document.get("attempt_activation_peaks") or {}),
+                "activation_peak_bytes": working_peak,
+                "activation_peaks": {},
                 "allocated_at_start_bytes": allocated_at_start,
                 "working_peak_vram_bytes": working_peak,
                 "shape_cell": shape_cell(prepared.features.values),
@@ -3698,7 +3674,27 @@ class Executor:
         attempt (empty is the prepared one), holds it and answers what its sites now hold."""
         if command.adopt is not UNSET:
             return self._adopt_attention(command, command.adopt)
+        if command.sol_variants is not UNSET:
+            if self._attention_sol is None:
+                return {
+                    "ok": False,
+                    "code": "attention_gpu_divergence",
+                    "detail": "no Sol selection",
+                }
+            if attention_sol._SELECTION.get() is self._attention_sol:
+                return {
+                    "ok": False,
+                    "code": "attention_gpu_divergence",
+                    "detail": "Sol selection already committed",
+                }
+            try:
+                attention_sol.narrow(self._attention_sol, command.sol_variants)
+            except InvalidRequest as exc:
+                return {"ok": False, "code": exc.code, "detail": str(exc), "rank": self.rank}
+            self._attention_hold.enter_context(attention_sol.selected(self._attention_sol))
+            return {"ok": True, "rank": self.rank, "sol_variants": self._attention_sol.variants}
         self._attention_hold.close()
+        self._attention_sol = None
         if command.pin is UNSET:
             return {"ok": True, "rank": self.rank}
         target = self.constructions.get(command.construction)
@@ -3712,14 +3708,44 @@ class Executor:
                     target._attention_snapshot(), target._attention_roots(), swap, pin
                 )
             )
+            if "sol-attn" in held.totals():
+                if not command.sol_request:
+                    self._attention_hold.close()
+                    return {
+                        "ok": False,
+                        "code": "attention_selection_missing",
+                        "detail": "Sol requires request variant agreement",
+                        "rank": self.rank,
+                    }
+                self._attention_sol = attention_sol.capture(
+                    self.torch.device(self.device_kind, self.rank)
+                )
         except attention.AttentionRefusal as exc:
             return {"ok": False, "code": exc.code, "detail": str(exc)[:900], "rank": self.rank}
-        return {"ok": True, "rank": self.rank, "hosts": held.hosts}
+        return {
+            "ok": True,
+            "rank": self.rank,
+            "hosts": held.hosts,
+            "sol_variants": self._attention_sol.variants if self._attention_sol is not None else (),
+        }
 
-    def _followers_attention(self, pin: str | UnsetType = UNSET) -> list[dict[str, Any]]:
+    def _followers_attention(
+        self,
+        pin: str | UnsetType = UNSET,
+        *,
+        sol_request: bool = False,
+        sol_variants: attention_sol.Variants | UnsetType = UNSET,
+    ) -> list[dict[str, Any]]:
         assert self.group is not None
         self.group.broadcast(
-            executor_commands.encode(Attention(construction=self.construction, pin=pin))
+            executor_commands.encode(
+                Attention(
+                    construction=self.construction,
+                    pin=pin,
+                    sol_request=sol_request,
+                    sol_variants=sol_variants,
+                )
+            )
         )
         replies = self.group.collect("attention")
         for reply in (reply for reply in replies if not reply.get("ok")):
@@ -3733,18 +3759,55 @@ class Executor:
         after. Diffusers reads a processor's backend and parallel config on every call, so a
         group swaps per attempt as one process does; rank 0 refuses what a rank does not hold.
         """
-        if self.group is None:
-            yield
-            return
+        selection = (
+            attention_sol.capture(self.torch.device(self.device_kind, self.rank))
+            if "sol-attn" in applied.totals()
+            else None
+        )
         try:
-            held = {r["rank"]: r["hosts"] for r in self._followers_attention(pin=pin)}
+            replies = (
+                self._followers_attention(pin=pin, sol_request=selection is not None)
+                if self.group is not None
+                else []
+            )
+            held = {r["rank"]: r["hosts"] for r in replies}
             if diverged := sorted(r for r, hosts in held.items() if hosts != applied.hosts):
                 gpus = ", ".join(_gpu(rank) for rank in diverged)
                 detail = f"{gpus} do not hold {_gpu(0)}'s {applied.hosts}"[:900]
                 raise InvalidRequest(detail, code="attention_gpu_divergence")
-            yield
+            if selection is not None:
+                if any("sol_variants" not in reply for reply in replies):
+                    raise InvalidRequest(
+                        "A rank did not capture Sol variants", code="attention_gpu_divergence"
+                    )
+                choices = [
+                    msgspec.convert(reply["sol_variants"], type=tuple[tuple[int, bool], ...] | None)
+                    for reply in replies
+                ]
+                agreed = attention_sol.intersect([selection.variants, *choices])
+                attention_sol.narrow(selection, agreed)
+                if self.group is not None:
+                    acknowledgments = self._followers_attention(sol_variants=agreed)
+                    if any(
+                        "sol_variants" not in reply
+                        or msgspec.convert(
+                            reply["sol_variants"], type=tuple[tuple[int, bool], ...] | None
+                        )
+                        != agreed
+                        for reply in acknowledgments
+                    ):
+                        raise InvalidRequest(
+                            "A rank did not adopt Sol variants", code="attention_gpu_divergence"
+                        )
+            with (
+                attention_sol.selected(selection)
+                if selection is not None
+                else contextlib.nullcontext()
+            ):
+                yield
         finally:
-            self._followers_attention()
+            if self.group is not None:
+                self._followers_attention()
 
     @staticmethod
     def _capture_options(
@@ -4315,102 +4378,49 @@ class Executor:
         """FREE this process's device bytes for another tenant (cr-022), on `ranks` of a
         group (every rank when empty): only the cards the worker needs are given back.
 
-        The worker calls this between attempts, when a co-tenant's attempt or load does not
-        fit beside what this process holds. Every resident construction is parked; the
-        process stays, `restore` brings them back and an attempt's own admissions stage
-        whatever is still missing. Without `residents` only the allocator's cache goes back.
-        The reply is the probe's after-state plus what moved.
+        The worker calls this between attempts, when a co-tenant needs room beside what
+        this process holds. Every weight leaves the device (to host memory while it has
+        room, else to the store); the process stays, and each op brings back what it needs.
+        Without `residents` only the allocator's cache goes back. The reply is the probe's
+        after-state plus what moved, measured.
         """
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
         empty = {"freed": {}, "held": {}, "freed_bytes": 0}
-        if self.torch is None:
+        if self.torch is None or not self._device_ready:
             return {**self.probe(), "vacated": empty}
         chosen = set(ranks) if ranks else set(range(self.world))
         followers = sorted(rank for rank in chosen if 0 < rank < self.world)
         command = executor_commands.encode(Vacate(residents=residents))
-        if self.group is not None:
-            try:
+        sent: list[int] = []
+        failure: GroupRefusal | None = None
+        vacated: dict[str, Any] = dict(empty)
+        try:
+            if self.group is not None:
                 for rank in followers:
                     self.group.send_one(rank, command)
-            except GroupRefusal as exc:
-                return self._group_refusal(exc, closing=False)
-        reports: list[Any] = []
-        if 0 in chosen:
-            self._synchronize()
-            try:
-                victims = self.arbiter.victims(exclude="") if residents else []
-                reports = [self.arbiter.park(key) for key in victims]
-            except ResidencyRefusal as exc:
-                return {"ok": False, "code": exc.code, "detail": exc.detail[:900]}
-            accel.release_cached(self.torch, self.device_kind)
-        vacated = {
-            "freed": {k: v for report in reports for k, v in report.get("freed", {}).items()},
-            "held": {k: v for report in reports for k, v in report.get("held", {}).items()},
-            "freed_bytes": sum(int(report.get("freed_bytes", 0)) for report in reports),
-            "allocator_delta_bytes": sum(
-                int(report.get("allocator_delta_bytes", 0)) for report in reports
-            ),
-            "vacate_ms": round(sum(float(report.get("vacate_ms", 0)) for report in reports), 2),
-        }
-        if self.group is not None:
-            try:
-                for rank in followers:
+                    sent.append(rank)
+            if 0 in chosen and self.planner is not None:
+                started = time.perf_counter()
+                vacated = self.planner.vacate() if residents else self.planner.trim()
+                vacated["vacate_ms"] = round((time.perf_counter() - started) * 1000, 2)
+        except GroupRefusal as exc:
+            failure = exc
+        finally:
+            # A leader refusal must not strand follower replies on the next command.
+            for rank in sent:
+                assert self.group is not None
+                try:
                     reply = self.group.reply_one(rank, "vacate")
-                    if not reply.get("ok"):
-                        raise GroupRefusal(
-                            f"{_gpu(rank)} refused to vacate: {reply.get('code')}: "
-                            f"{reply.get('detail', '')}"[:600],
-                            code="group_broken",
+                    if not reply.get("ok") and not reply.get("reusable"):
+                        failure = failure or GroupRefusal(
+                            f"{_gpu(rank)} could not vacate: {reply.get('detail', '')}"[:600]
                         )
-            except GroupRefusal as exc:
-                return self._group_refusal(exc, closing=False)
-        return {**self.probe(), "vacated": vacated}
-
-    def restore(self, names: tuple[str, ...] = ()) -> dict[str, Any]:
-        """RE-FILL what a vacate took from the ACTIVE construction, when the card has room
-        (cr-097).
-
-        The worker calls this between attempts, under the same lane seat, BEFORE it prices
-        the attempt -- so the plan is chosen against the residency the tenant is entitled
-        to rather than against the hole a co-tenant left in it. It evicts nothing; a
-        component that does not fit is simply not restored.
-        """
-        if self.poisoned:
-            return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
-        empty = {"restored": {}, "held": {}, "restored_bytes": 0}
-        if self.torch is None or self.active not in self.constructions:
-            return {**self.probe(), "restored": empty}
-        if self.group is not None:
-            # EVERY RANK RESTORES (cr-068), for the reason every rank vacates: the ranks
-            # hold one plan between them and a partially restored group is not a plan.
-            try:
-                self.group.broadcast(executor_commands.encode(Restore(names=names)))
-            except GroupRefusal as exc:
-                return self._group_refusal(exc, closing=False)
-        try:
-            restored = self.arbiter.restore(self.active, names)
-        except ResidencyRefusal as exc:
-            return {"ok": False, "code": exc.code, "detail": exc.detail[:900]}
-        self._synchronize()
-        if self.group is not None:
-            try:
-                for reply in self.group.collect("restore"):
-                    if not reply.get("ok"):
-                        raise GroupRefusal(
-                            f"a follower refused to restore: {reply.get('code')}: "
-                            f"{reply.get('detail', '')}"[:600],
-                            code="group_broken",
-                        )
-            except GroupRefusal as exc:
-                return self._group_refusal(exc, closing=False)
-        return {**self.probe(), "restored": restored}
-
-    def _active_residency(self) -> dict[str, Any]:
-        child = self.constructions.get(self.active)
-        if child is None or child.residency is None:
-            return {}
-        return dict(child.residency.document())
+                except GroupRefusal as exc:
+                    failure = failure or exc
+        if failure is not None:
+            return self._group_refusal(failure, closing=False)
+        return {**self.probe(), "rank_memory": self._rank_memory(), "vacated": vacated}
 
     def process_incarnations(self) -> list[dict[str, Any]]:
         """The actual rank births, including a follower that vanished before this probe."""
@@ -4439,20 +4449,23 @@ class Executor:
         # A torch-bearing process with no card (a CPU executor, a gloo rank) has no device
         # numbers to report; readers take absent as unknown.
         device: dict[str, int] = {}
-        if self.device_kind != "mps" and accel.present(self.torch, self.device_kind):
-            memory = accel.allocation(self.torch, self.device_kind)
+        if self._device_ready and self.device_kind == "cuda":
+            allocation = accel.allocation(self.torch, self.device_kind)
             device = {
-                "device_free_bytes": memory["driver_free_bytes"],
-                "device_total_bytes": memory["driver_total_bytes"],
-                "allocator_bytes": memory["allocated_bytes"],
-                "reserved_bytes": memory["reserved_bytes"],
+                "device_free_bytes": allocation["driver_free_bytes"],
+                "device_total_bytes": allocation["driver_total_bytes"],
+                "allocator_bytes": allocation["allocated_bytes"],
+                "reserved_bytes": allocation["reserved_bytes"],
             }
+        planner = self.host.planner
         return {
             "ok": True,
             "torch": True,
             **device,
-            "residency": self._active_residency(),
-            "constructions": self.arbiter.document(self.active),
+            "residency": planner.document(self.active) if planner is not None else {},
+            "memory": planner.facts() if planner is not None else {},
+            "rank_memory": self._rank_memory(),
+            "constructions": self.residency_document()["constructions"],
             "rss_bytes": _rss(),
             "attempts": self.attempts,
             "processes": processes,
@@ -4487,6 +4500,8 @@ _MINIMAL_KEYS = frozenset(
         "oversize_result_bytes",
         "shortfall",
         "residency",
+        "memory",
+        "rank_memory",
         "adjustments",
         "observations",
         "observation_caps",
@@ -4577,6 +4592,8 @@ def _send_reply(channel: Channel, reply: dict[str, Any]) -> None:
             "oversize_result_bytes": reply.get("oversize_result_bytes"),
             "shortfall": reply.get("shortfall"),
             "residency": reply.get("residency") or {},
+            "memory": reply.get("memory") or {},
+            "rank_memory": reply.get("rank_memory") or {},
             "adjustments": reply.get("adjustments") or [],
             "observations": [],
             "observation_caps": {"dropped_for_frame": held, "minimal_reply": 1},

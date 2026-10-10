@@ -1,6 +1,7 @@
 """Native retained-artifact transfer, with actual TensorFS roots and HTTP object writes."""
 
 import hashlib
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -29,7 +30,9 @@ def test_native_artifact_inventory_upload_replay_and_exact_grant(tmp_path: Path)
         retention_id="sha256:" + "f" * 64,
     )
     held = workspace.retain("owner", source)
-    transfers = NativeArtifactTransfers(workspace, lambda: "owner", allow_private_egress=True)
+    transfers = NativeArtifactTransfers(
+        workspace, lambda: "owner", private_egress_allowed=lambda: True
+    )
     command = pb.NativeArtifactTransfer(
         effect_id="effect-one", source=source, manifest=held.manifest, command_id=1, limit=128
     )
@@ -87,7 +90,9 @@ def test_native_upload_lost_http_response_retries_same_bytes(tmp_path: Path) -> 
         retention_id="sha256:" + "e" * 64,
     )
     held = workspace.retain("owner", source)
-    transfers = NativeArtifactTransfers(workspace, lambda: "owner", allow_private_egress=True)
+    transfers = NativeArtifactTransfers(
+        workspace, lambda: "owner", private_egress_allowed=lambda: True
+    )
     command = pb.NativeArtifactTransfer(
         effect_id="lost-response", source=source, manifest=held.manifest, command_id=1, limit=128
     )
@@ -191,7 +196,9 @@ def test_byte_tree_upload_leases_only_the_object_it_sends(tmp_path: Path) -> Non
     unsent = hashlib.sha256(bodies["a"]).hexdigest()
     (workspace.store_root / "blobs" / unsent[:2] / unsent[2:4] / unsent).unlink()
     sent = hashlib.sha256(bodies["b"]).hexdigest()
-    transfers = NativeArtifactTransfers(workspace, lambda: "owner", allow_private_egress=True)
+    transfers = NativeArtifactTransfers(
+        workspace, lambda: "owner", private_egress_allowed=lambda: True
+    )
     sink = ObjectStore()
     with serving(sink) as url:
         command = pb.NativeArtifactTransfer(
@@ -237,7 +244,7 @@ def test_the_machine_connection_pages_and_uploads_a_retained_output(tmp_path: Pa
             workspace,
             authorize,
             Resolutions(),
-            allow_private_egress=True,
+            private_egress_allowed=lambda: True,
         )
 
     class Context:
@@ -270,9 +277,7 @@ def test_the_machine_connection_pages_and_uploads_a_retained_output(tmp_path: Pa
 
     # A machine whose own Hub is not local never uploads to a private address.
     class Production(WorkspaceRPC):
-        workspace_service = Service(
-            workspace, authorize, Resolutions()
-        )
+        workspace_service = Service(workspace, authorize, Resolutions())
 
     with serving(ObjectStore()) as url:
         call.request.command_id, call.request.grant.url = 3, url
@@ -295,3 +300,100 @@ def test_the_machine_connection_pages_and_uploads_a_retained_output(tmp_path: Pa
         assert "claim names another owner" in str(refused)
     else:
         raise AssertionError("another owner's claim moved a retained output")
+
+
+def test_cached_transfers_follow_current_hub_registration_and_revocation(tmp_path: Path) -> None:
+    """An offline-started Service uses current policy for each actual native HTTP upload."""
+    _store, workspace, receipt = produced(tmp_path)
+    source = pb.DerivedRetentionRequest(
+        weights_transaction_id=receipt.weights_transaction_id,
+        tensorfs_receipt_digest=documents.raw(receipt.tensorfs_receipt_digest),
+        retention_id="sha256:" + "c" * 64,
+    )
+    retained = workspace.retain("owner", source)
+    access = tmp_path / "hub-access.json"
+    worker = cast(
+        Worker,
+        SimpleNamespace(
+            options=SimpleNamespace(
+                publication_authority=None,
+                hubs=(),
+                hub_access_path=access,
+            )
+        ),
+    )
+    service = Service(
+        workspace,
+        lambda claim: "owner",
+        Resolutions(),
+        private_egress_allowed=lambda: machine_model_defaults.local_development(worker),
+    )
+    transfers = service.transfers("owner")
+    command = pb.NativeArtifactTransfer(
+        effect_id="late-hub",
+        source=source,
+        manifest=retained.manifest,
+        command_id=1,
+        limit=128,
+    )
+    inventory = transfers.execute(command)
+    assert inventory.objects and not inventory.safe_code
+    row = next(
+        row
+        for row in inventory.objects
+        if row.object_id != documents.spell(retained.manifest.digest)
+    )
+    sink = ObjectStore()
+    with serving(sink) as url:
+        command.command_id = 2
+        command.grant_revision = 1
+        command.server_time_unix = 100
+        command.grant.CopyFrom(
+            pb.WeightsUploadGrant(
+                object_id=row.object_id,
+                length=row.length,
+                url=url,
+                expires_at_unix=200,
+            )
+        )
+        assert transfers.execute(command).safe_code == "egress_scheme"
+        assert not sink.received.is_set()
+
+        def register(origin: str) -> None:
+            access.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "hubs": [
+                            {
+                                "origin": origin,
+                                "access_token": "owner-scoped-access",
+                                "expires_at": 4102444800,
+                            }
+                        ],
+                    }
+                )
+            )
+
+        register(url)
+        assert service.transfers("owner") is transfers  # Same cached object created offline.
+        command.command_id = 3
+        sent = transfers.execute(command)
+        assert sent.outcome == pb.WEIGHTS_UPLOAD_OUTCOME_UPLOADED and not sent.safe_code
+        assert sent.checksum_sha256 == row.object_id and len(sink.body) == row.length
+
+        # A remaining public Hub does not retain the removed loopback Hub's permission.
+        register("https://tensorhub.example")
+        sink.received.clear()
+        command.command_id = 4
+        assert transfers.execute(command).safe_code == "egress_scheme"
+        assert not sink.received.is_set()
+        # HTTPS private endpoints are also denied, before attempting a TLS connection.
+        command.grant.url = url.replace("http:", "https:")
+        assert transfers.execute(command).safe_code == "egress_blocked_address"
+        assert not sink.received.is_set()
+        access.unlink()
+        command.command_id = 5
+        command.grant.url = url
+        assert transfers.execute(command).safe_code == "egress_scheme"
+        assert not sink.received.is_set()

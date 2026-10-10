@@ -33,12 +33,12 @@ class Service:
         authorize: Callable[[pb.Claim], str],
         resolutions: machine_model_resolve.Resolutions,
         *,
-        allow_private_egress: bool = False,
+        private_egress_allowed: Callable[[], bool] = lambda: False,
     ):
         self.workspace, self.authorize = workspace, authorize
         self.resolutions = resolutions
         #: Uploads may reach private addresses only for a machine whose own Hub is local.
-        self.allow_private_egress = allow_private_egress
+        self.private_egress_allowed = private_egress_allowed
         self._transfers: dict[str, artifact_transfer.NativeArtifactTransfers] = {}
 
     def transfers(self, owner: str) -> artifact_transfer.NativeArtifactTransfers:
@@ -49,7 +49,7 @@ class Service:
             held = self._transfers[owner] = artifact_transfer.NativeArtifactTransfers(
                 self.workspace,
                 lambda: owner,
-                allow_private_egress=self.allow_private_egress,
+                private_egress_allowed=self.private_egress_allowed,
             )
         return held
 

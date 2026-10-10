@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -15,8 +16,8 @@ from cozy_runtime.internal.worker.child import ExecutorProtocolMismatch, require
 @pytest.mark.parametrize(
     "revision,version,accepted",
     [
-        (1, "9.8.7", True),
-        (2, "0.18.33", False),
+        (EXECUTOR_PROTOCOL_REVISION, "9.8.7", True),
+        (1, "0.18.86", False),
         (None, "0.18.33", False),
         (None, "0.18.20", False),
     ],
@@ -85,7 +86,7 @@ def test_protocol_rejects_malformed_or_unreviewed_hello() -> None:
         with pytest.raises(ExecutorProtocolMismatch):
             require_executor_protocol({"runtime_version": version})
     # Revision 1 without its stated native interfaces predates 0.18.51.
-    with pytest.raises(ExecutorProtocolMismatch, match=r"cozy-runtime>=0\.18\.51"):
+    with pytest.raises(ExecutorProtocolMismatch, match="current Runtime memory contract"):
         require_executor_protocol(
             {"executor_protocol_revision": EXECUTOR_PROTOCOL_REVISION, "runtime_version": "0.18.49"}
         )
@@ -109,3 +110,80 @@ assert first != second == fresh and len(walks) == 1, (len(walks), second == fres
 """
     done = subprocess.run([sys.executable, "-c", program], capture_output=True, text=True)
     assert done.returncode == 0, done.stderr[-2000:]
+
+
+@pytest.mark.parametrize("model_bearing", [False, True])
+def test_import_only_start_defers_warmup_and_device_initialization(
+    tmp_path: Path, model_bearing: bool
+) -> None:
+    python = os.environ.get("COZY_CPU_TEST_PYTHON") if model_bearing else sys.executable
+    if python is None:
+        pytest.skip("CPU Torch interpreter not selected")
+    (tmp_path / "import_start_fixture.py").write_text(
+        "from pathlib import Path\n"
+        "import msgspec\n"
+        "from cozy_runtime.author import App\n"
+        "app = App()\n"
+        "class Request(msgspec.Struct):\n    pass\n"
+        "class Result(msgspec.Struct):\n    pass\n"
+        "@app.entrypoint\n"
+        "def compute(payload: Request) -> Result:\n    return Result()\n"
+        "def warmup():\n    Path(__file__).with_suffix('.warmed').write_text('warm')\n"
+    )
+    program = """
+import socket, sys
+from pathlib import Path
+import msgspec
+from cozy_runtime.internal import executor_commands, package_interface
+from cozy_runtime.internal.discovery import discover_installed
+from cozy_runtime.internal.executor import Executor, _capture_seal
+from cozy_runtime.internal.executor_commands import Probe, Residency, Start, Vacate, Warm
+from cozy_runtime.internal.seam import Channel, EXECUTOR_MEMORY_CAPABILITIES
+root, model_bearing = Path(sys.argv[1]), sys.argv[2] == 'True'
+sys.path.insert(0, str(root))
+_capture_seal()
+body = package_interface.build(discover_installed('import_start_fixture:app'))
+if model_bearing:
+    body['entrypoints'][0]['models'] = [
+        {'path': 'compute.models.model', 'class': 'M', 'component_use': {}}
+    ]
+interface = root / 'interface.json'
+interface.write_bytes(package_interface.canonical_bytes(body))
+ours, theirs = socket.socketpair()
+executor = Executor(Channel(ours), root)
+try:
+    command = Start(application='import_start_fixture:app', package_interface=str(interface),
+                    import_only=True, memory_capabilities=tuple(EXECUTOR_MEMORY_CAPABILITIES))
+    assert executor_commands.decode(executor_commands.encode(command)) == command
+    assert not executor_commands.decode({'cmd': 'start'}).import_only
+    first = executor.handle(command)
+    assert first['ok'] and first['imported'] and not first['started'] and not first['warmed']
+    assert first['device_total_bytes'] == first['device_free_bytes'] == -1
+    assert first['memory'] == {'allocated_bytes': 0, 'reserved_bytes': 0, 'overhead_bytes': 0}
+    assert first['rank_memory'] == {'0': first['memory']}
+    assert not executor._device_ready and executor.planner is None
+    assert executor.handle(command)['reused']
+    assert executor.handle(Warm())['skipped'] == 'no started device process'
+    assert executor.handle(Probe())['ok']
+    assert executor.handle(Residency())['free_bytes'] == -1
+    assert executor.handle(Vacate())['vacated']['freed_bytes'] == 0
+    assert not (root / 'import_start_fixture.warmed').exists()
+    if model_bearing:
+        import torch
+        assert executor.torch is torch and not torch.cuda.is_initialized()
+    else:
+        started = executor.handle(msgspec.structs.replace(command, import_only=False))
+        assert started['started'] and started['warmed']
+        assert (root / 'import_start_fixture.warmed').read_text() == 'warm'
+finally:
+    executor.channel.close()
+    theirs.close()
+"""
+    done = subprocess.run(
+        [python, "-c", program, str(tmp_path), str(model_bearing)],
+        env={**os.environ, "CUDA_VISIBLE_DEVICES": "", "PYTHONDONTWRITEBYTECODE": "1"},
+        capture_output=True,
+        text=True,
+        timeout=60,  # fixture deadlock bound, not product policy
+    )
+    assert done.returncode == 0, done.stdout + done.stderr

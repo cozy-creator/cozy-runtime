@@ -27,7 +27,21 @@ func Main(log io.Writer) int {
 	g.inherited = inherited(environ)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	if err := Run(ctx, g, log); err != nil && !errors.Is(err, context.Canceled) {
+	if err := RunBootstrap(ctx, g, log); err != nil && !errors.Is(err, context.Canceled) {
+		fmt.Fprintln(log, "cozy-machine:", err)
+		return 1
+	}
+	return 0
+}
+
+func runGranted(g *Grant, log io.Writer) int {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	err := Run(ctx, g, log)
+	if err == nil {
+		return releasedAgentExit
+	}
+	if !errors.Is(err, context.Canceled) {
 		fmt.Fprintln(log, "cozy-machine:", err)
 		return 1
 	}
@@ -70,7 +84,7 @@ func startSSH(key string, log io.Writer) error {
 	if out, err := childOutput(exec.Command("/usr/bin/ssh-keygen", "-A"), true); err != nil {
 		return fmt.Errorf("ssh host keys: %v: %s", err, out)
 	}
-	sshd := exec.Command("/usr/sbin/sshd", "-D", "-e")
+	sshd := exec.Command("/usr/sbin/sshd", "-D", "-e", "-f", "/opt/cozy/dev/sshd_config")
 	sshd.Stdout, sshd.Stderr = log, log
 	if err := startChild(sshd); err != nil {
 		return fmt.Errorf("start sshd: %w", err)

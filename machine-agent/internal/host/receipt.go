@@ -128,6 +128,7 @@ func rewritePayload(raw []byte, workerPort int, observed *OwnerAuth, webrtc map[
 	if members["machine_version"], err = json.Marshal(build.Version); err != nil {
 		return nil, err
 	}
+	members["machine_capabilities"], _ = json.Marshal(build.Capabilities())
 	if observed == nil { // the Hub froze no auth document: the daemon's own key is no fact about this boot
 		delete(members, "observed_record_owner_auth")
 	} else if members["observed_record_owner_auth"], err = json.Marshal(observed); err != nil {

@@ -9,10 +9,25 @@ from __future__ import annotations
 
 from .workspace import Journal
 
+# Shared with Executions.retention_required; the machine projection spans every
+# namespace and includes child attempts and native work that executions omit.
+RETENTION_REQUIRED = "retention_waived=0 AND (state NOT IN ('succeeded','canceled') OR collected=0)"
+
 
 def install(db: Journal) -> None:
     """An additive public read contract; old views remain readable across Runtime upgrades."""
-    db.executescript("""
+    db.executescript(f"""
+    CREATE VIEW IF NOT EXISTS machine_software_update_v1 AS
+      SELECT execution_workspace_id AS workspace_id,
+        (EXISTS(SELECT 1 FROM executions) OR EXISTS(SELECT 1 FROM attempts)
+         OR EXISTS(SELECT 1 FROM native_calls)) AS accepted_work,
+        NOT (EXISTS(SELECT 1 FROM executions WHERE {RETENTION_REQUIRED})
+          OR EXISTS(SELECT 1 FROM attempts WHERE state IN ('accepted','running'))
+          OR EXISTS(SELECT 1 FROM native_calls WHERE state<>'released')
+          OR EXISTS(SELECT 1 FROM holds WHERE state<>'released')
+          OR EXISTS(SELECT 1 FROM weights WHERE state='intent')
+          OR EXISTS(SELECT 1 FROM input_tree_intakes WHERE state<>'released')) AS quiescent
+      FROM workspace_state;
     CREATE VIEW IF NOT EXISTS machine_workspace_v1 AS
       SELECT execution_workspace_id AS workspace_id FROM workspace_state;
     CREATE VIEW IF NOT EXISTS machine_runs_v1 AS

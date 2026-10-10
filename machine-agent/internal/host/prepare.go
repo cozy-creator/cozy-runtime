@@ -180,11 +180,20 @@ func (m *Machine) prepareLocalPackage(stream grpc.ServerStream) error {
 	call := &pb.PrepareLocalPackageCall{}
 	return m.prepare(stream, call, func(ctx context.Context, conn *grpc.ClientConn, emit func(*pb.PrepareEvent)) prepared {
 		selected := call.GetLocalPackageSet()
+		if call.Hub != "" {
+			peer, err := pb.NewRuntimePreparationClient(conn).ProtocolInfo(ctx, &pb.ProtocolInfoRequest{})
+			if err != nil {
+				return runtimeRefused(err, nil)
+			}
+			if peer.GetWireMinor() < 69 {
+				return refused(pb.CapabilityUnavailableCode, errors.New("this Runtime cannot select a scoped Hub for local package preparation; update the Runtime"), false)
+			}
+		}
 		if !operationID.MatchString(selected.GetOperationId()) || selected.GetPackage() == nil || len(selected.Files) == 0 ||
 			len(selected.Files) > pb.MaxLocalPackageFiles {
 			return refused("local_package_invalid", errors.New("the local package selection is invalid"), false)
 		}
-		request := &pb.PrepareLocalPackageRequest{OperationId: selected.OperationId, Package: selected.Package,
+		request := &pb.PrepareLocalPackageRequest{OperationId: selected.OperationId, Package: selected.Package, Hub: call.Hub,
 			SourceArchive: selected.SourceArchive, InstallRoot: m.layout.Installs, PythonRequires: selected.PythonRequires,
 			PythonVersion: selected.PythonVersion, DependencyRequirements: selected.DependencyRequirements}
 		dir := m.layout.Stage(selected.OperationId)

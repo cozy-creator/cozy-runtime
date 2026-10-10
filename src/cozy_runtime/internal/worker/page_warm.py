@@ -1,20 +1,9 @@
-"""Page-cache warm of a generation's PARKED components (h3a-018).
-
-A parked component is staged on its first declared use, from the store. The residency
-ledger on an H100 pod shows that stage at 23-33 GB/s from a warm page cache and at
-0.73 GB/s from the block layer -- 1.5 s against 55 s for one 40 GB DiT. The worker reads
-each parked component's stored bytes once, right after the prepare that parked it, through
-the SAME store stream the fill uses (`ReadLease.stream` over the component's complete read
-plan), into host buffers it drops. What it leaves behind is the page cache.
-
-No device byte moves, no lane lock is held, and nothing here decides anything: a component
-larger than the host's available memory is skipped BY THAT MEASUREMENT, with the two
-numbers, because reading it would only evict what a neighbour just warmed.
-"""
+"""Cancellable store-read mechanism; the machine memory policy admits the host footprint."""
 
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from typing import Required, TypedDict
 
 from cozy_runtime.internal import fill
@@ -28,20 +17,20 @@ class WarmReport(TypedDict, total=False):
     read_bytes: int
 
 
-def available_memory_bytes() -> int:
-    """`MemAvailable` from /proc/meminfo, or -1 where the kernel does not say."""
-    try:
-        with open("/proc/meminfo", "rb") as rows:
-            for row in rows:
-                if row.startswith(b"MemAvailable:"):
-                    return int(row.split()[1]) << 10
-    except (OSError, ValueError, IndexError):
-        return -1
-    return -1
+class _Superseded(Exception):
+    """A changed queue or demand preparation ended this speculative read."""
 
 
-def warm_component(store_root: str, manifest: str, component: str) -> WarmReport:
-    """Stream one component's stored bytes through the store, for the page cache alone."""
+def warm_component(
+    store_root: str,
+    manifest: str,
+    component: str,
+    *,
+    reserve: Callable[[int], bool],
+    release: Callable[[], None],
+    wanted: Callable[[], bool],
+) -> WarmReport:
+    """Stream one eligible component with bounded slots; every batch checks current demand."""
     checkpoint = fill.Checkpoint(store_root, manifest)
     table = checkpoint.header["components"].get(component) or {}
     traversal = [(component, str(key)) for key in table]
@@ -49,17 +38,31 @@ def warm_component(store_root: str, manifest: str, component: str) -> WarmReport
         return {"component": component, "skipped": "the checkpoint holds no rows for it"}
     plan = checkpoint.read_plan(traversal, fill.WINDOW_BYTES, (component,))
     need = int(plan.bytes)
-    available = available_memory_bytes()
-    if 0 <= available < need:
+    if not need:
+        return {"component": component, "bytes": 0, "ms": 0, "read_bytes": 0}
+    count = min(len(plan), fill.RING_SLOTS)
+    slots_bytes = fill.slot_bytes(fill.WINDOW_BYTES) * count
+    if not wanted() or not reserve(slots_bytes):
         return {
             "component": component,
-            "skipped": f"{need} B would not stay cached beside {available} B available",
+            "skipped": f"queue or host admission declined {slots_bytes} B of prefetch",
         }
-    slots = [bytearray(fill.slot_bytes(fill.WINDOW_BYTES)) for _ in range(fill.RING_SLOTS)]
-    before = fill.block_read_bytes()
-    started = time.perf_counter()
-    with checkpoint.acquire() as lease:
-        streamed = lease.stream(plan, slots, lambda batch: batch.release(), readers=fill.READERS)
+
+    def delivered(batch: fill.Batch) -> None:
+        batch.release()  # No device consumer: this slot may return immediately.
+        if not wanted():
+            raise _Superseded
+
+    try:
+        slots = [bytearray(fill.slot_bytes(fill.WINDOW_BYTES)) for _ in range(count)]
+        before = fill.block_read_bytes()
+        started = time.perf_counter()
+        with checkpoint.acquire() as lease:
+            streamed = lease.stream(plan, slots, delivered, readers=fill.READERS)
+    except _Superseded:
+        return {"component": component, "skipped": "queue changed or demand preparation started"}
+    finally:
+        release()
     took = (time.perf_counter() - started) * 1000
     after = fill.block_read_bytes()
     return {
