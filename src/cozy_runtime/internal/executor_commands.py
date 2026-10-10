@@ -56,6 +56,10 @@ class Join(Command, frozen=True, kw_only=True, tag="join"):
     abort: bool = False
     #: The group forms again after a call ran out of memory: device bytes to give back first.
     room: int = -1
+    #: The NCCL route rank 0 chose from the group's measured links; set before joining.
+    nccl: dict[str, str] = {}
+    #: Every GPU then times NCCL against its copy engines (`copy_engine.calibrate`).
+    calibrate: bool = False
 
 
 class Fork(Command, frozen=True, kw_only=True, tag="fork"):

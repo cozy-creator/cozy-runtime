@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import Any, TypedDict
 
 from cozy_runtime.internal.attention_registry import register
+from cozy_runtime.internal.parallel import copy_engine
 
 # Tensors, process groups, parallel configs and Diffusers' backend members are `Any`: neither
 # torch nor diffusers is installed in the check venv.
@@ -146,13 +147,20 @@ def exchange(
     query: Any, key: Any, value: Any, handle: Any, compute: Callable[[Any, Any, Any], Any]
 ) -> Any:
     """Sequence shards -> full sequence per head subset -> `compute` -> back, using Diffusers'
-    unequal-length exchange in both directions (packed H3 lengths do not divide)."""
+    unequal-length exchange in both directions (packed H3 lengths do not divide), or the
+    group's copy engines when it formed over them (`copy_engine`)."""
     from diffusers.models.attention_dispatch import (
         all_to_all_single_any_o_async,
         all_to_all_single_any_qkv_async,
         ulysses_anything_metadata,
     )
 
+    engines = copy_engine.for_group(handle)
+    if engines is not None:
+        result = _copy_engine_exchange(engines, query, key, value, handle, compute)
+        if result.shape != query.shape or result.dtype != query.dtype:
+            raise ValueError("Ulysses attention returned incompatible output")
+        return result
     metadata = ulysses_anything_metadata(query)
     waits = [all_to_all_single_any_qkv_async(t, handle, **metadata) for t in (query, key, value)]
     q, k, v = (wait() for wait in waits)
@@ -161,6 +169,43 @@ def exchange(
     if result.shape != query.shape or result.dtype != query.dtype:
         raise ValueError("Ulysses attention returned incompatible output")
     return result
+
+
+def _copy_engine_exchange(
+    engines: copy_engine.CopyEngineExchange,
+    query: Any,
+    key: Any,
+    value: Any,
+    handle: Any,
+    compute: Callable[[Any, Any, Any], Any],
+) -> Any:
+    """Diffusers' two exchanges with Q, K and V in one: GPU s holds `sizes[s]` rows of every
+    head and sends each GPU its head group; the output returns each GPU its rows."""
+    import torch
+    import torch.distributed as dist
+
+    batch, rows, heads, dim = (int(size) for size in query.shape)
+    world = engines.world
+    local = heads // world
+    gathered = torch.empty(world, dtype=torch.int64, device=query.device)
+    dist.all_gather_into_tensor(gathered, torch.tensor([rows], device=query.device), group=handle)
+    sizes = [int(size) for size in gathered.tolist()]
+
+    def heads_first(tensor: Any) -> Any:
+        # (B, S, W, H/W, D) -> (W, S, B, H/W, D): rows for GPU p are block p
+        grouped = tensor.reshape(batch, rows, world, local, dim).permute(2, 1, 0, 3, 4)
+        return grouped.reshape(world * rows, batch, local, dim).contiguous()
+
+    sent = [[sizes[s]] * world for s in range(world)]
+    q, k, v = (
+        part.permute(1, 0, 2, 3).contiguous()
+        for part in engines.all_to_all([heads_first(t) for t in (query, key, value)], sent)
+    )
+    output = compute(q, k, v)
+    back = [[sizes[p] for p in range(world)] for _ in range(world)]
+    (returned,) = engines.all_to_all([output.permute(1, 0, 2, 3).contiguous()], back)
+    merged = returned.reshape(world, rows, batch, local, dim).permute(2, 1, 0, 3, 4)
+    return merged.reshape(batch, rows, heads, dim).contiguous()
 
 
 def describe(seen: dict[str, set[str]], names: dict[str, str]) -> str:

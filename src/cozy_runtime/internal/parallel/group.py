@@ -38,12 +38,14 @@ NVLS_ENV = "NCCL_NVLS_ENABLE"
 
 @dataclass(frozen=True, slots=True)
 class RankSpec:
-    """What one rank needs to join: its rank, the world, rank 0's store port, the backend."""
+    """What one rank needs to join: its rank, the world, rank 0's store port, the backend,
+    and the NCCL route rank 0 chose from the group's measured links (`links.Links.nccl`)."""
 
     rank: int
     world: int
     port: int
     backend: str
+    nccl: Mapping[str, str] = field(default_factory=dict)
 
 
 class ChildProcess(Protocol):
@@ -193,6 +195,18 @@ def abortable(backend: str) -> None:
         os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "0"
 
 
+#: The NCCL names this process's group set from its measured links: Runtime-owned, so the
+#: seal's restore leaves them alone (an older machine still seals NCCL_P2P_LEVEL=NVL).
+ROUTED: dict[str, str] = {}
+
+
+def route(nccl: Mapping[str, str]) -> None:
+    """NCCL reads its route once, when this process's first communicator forms; every GPU of
+    the group writes the same values, chosen by rank 0, before it joins."""
+    ROUTED.update(nccl)
+    os.environ.update(nccl)
+
+
 def join_rank(torch: Any, spec: RankSpec, sealed: Mapping[str, str]) -> Any:
     """A follower joins rank 0's store and forms its half of the process group.
 
@@ -204,6 +218,7 @@ def join_rank(torch: Any, spec: RankSpec, sealed: Mapping[str, str]) -> Any:
 
     require_nvls_off(sealed, spec.backend)
     abortable(spec.backend)
+    route(spec.nccl)
     store = dist.TCPStore("127.0.0.1", spec.port, spec.world, is_master=False)
     dist.init_process_group(spec.backend, store=store, rank=spec.rank, world_size=spec.world)
     dist.barrier()
@@ -301,6 +316,8 @@ class RankGroup:
         self.store: Any = None
         self.port = 0
         self.pg: Any = None
+        #: the NCCL route every formation of this group uses (`links.Links.nccl`)
+        self.nccl: dict[str, str] = {}
         self.formed = False
         #: the first fault, latched: a broken group never heals, it is rebuilt
         self.broken = ""
@@ -520,25 +537,42 @@ class RankGroup:
             follower.memory = hello.memory
 
     def form(
-        self, torch: Any, sealed: Mapping[str, str], cells: Sequence[int] = (), room: int = -1
+        self,
+        torch: Any,
+        sealed: Mapping[str, str],
+        cells: Sequence[int] = (),
+        room: int = -1,
+        nccl: Mapping[str, str] | None = None,
+        formed: Callable[[Any], None] | None = None,
     ) -> Any:
         """Form the process group: the store on a kernel-chosen loopback port, every
         follower joining it, rank 0 joining last, one barrier as the proof. `cells`, one per
         follower in rank order, are their budget cells: each follows its `join`, then the
         socket its watcher reads (`interrupt`). `room` >= 0 forms it AGAIN after an
-        `interrupt`: every follower joins a new store and gives that many device bytes back."""
+        `interrupt`: every follower joins a new store and gives that many device bytes back.
+        `nccl` is the route every GPU forms under; `formed` runs on rank 0 right after the
+        barrier, while each follower runs its half before it answers the join."""
         dist = torch.distributed
 
         self.check_alive()
         require_nvls_off(sealed, self.backend)
         abortable(self.backend)
+        if nccl is not None:
+            self.nccl = dict(nccl)
+            route(self.nccl)
         if room >= 0 and dist.is_initialized():
             dist.destroy_process_group()
         self.store = dist.TCPStore(
             "127.0.0.1", 0, self.degree, is_master=True, wait_for_workers=False
         )
         self.port = int(self.store.port)
-        join = {"cmd": "join", "port": self.port, "backend": self.backend}
+        join = {
+            "cmd": "join",
+            "port": self.port,
+            "backend": self.backend,
+            "nccl": self.nccl,
+            "calibrate": formed is not None,
+        }
         for index, follower in enumerate(self.followers):
             if room >= 0:
                 self.send_one(follower.rank, {**join, "room": room})
@@ -558,6 +592,8 @@ class RankGroup:
         dist.init_process_group(self.backend, store=self.store, rank=0, world_size=self.degree)
         self.pg = dist.group.WORLD
         dist.barrier()
+        if formed is not None:
+            formed(self.pg)
         replies = self.collect("join")
         for follower, reply in zip(self.followers, replies, strict=True):
             if not reply.get("ok"):
