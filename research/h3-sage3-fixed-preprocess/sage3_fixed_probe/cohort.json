@@ -1,0 +1,17 @@
+{
+  "runtime_version": "0.23.4",
+  "dependencies": {
+    "tensorfs": "0.6.1",
+    "torch": "2.14.0",
+    "triton": "3.8.0"
+  },
+  "source_sha256": {
+    "internal/attention.py": "ae9d73a5dc5fffd3d6310d07558d994bdbe1c6e728bbb9858eb308040aaaa7d1",
+    "internal/attention_upstream.py": "a53013c5e268093f6ac6ef38619673cc571666121d5863894c5b0d0178ebd6a5",
+    "internal/attention_ulysses.py": "0423ec5a9fc46c5d8a82b0a4b9ca6ddf1bf87a96ce0f13ec09ed89bc08fc47dd",
+    "internal/kernel_sources.py": "4473f6d6484249db4830059d2fee04af2102bdf4b9460ff3554db69a2ce5fcdc",
+    "_kernels/_C.abi3.so": "06dd8828d620334912b97bc5bf1ef6ba363d4586ccab882b79b4e4a0d7d7e812"
+  },
+  "wheel_sha256": "7f787606f30e32398b7ac943e86890157d01816028aa2f2428823e4beb5fa0a3",
+  "status": "Frozen publicSDK for CPUcapture; no GPUqualification"
+}
