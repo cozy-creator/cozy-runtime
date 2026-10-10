@@ -28,6 +28,7 @@ from typing import Any, cast
 import msgspec
 import pytest
 
+from cozy_runtime.author import Model
 from cozy_runtime.internal import (
     attention,
     attention_upstream,
@@ -169,7 +170,7 @@ def test_a_kernel_whose_compile_failed_is_skipped_with_why_and_the_next_one_serv
 STEPS = """
 import msgspec
 import torch
-from cozy_runtime.author import App, Context, Telemetry
+from cozy_runtime.author import App, Context, Telemetry, InvalidRequest
 
 app = App()
 SITES, FINISH, HELD = [], [], []
@@ -177,6 +178,7 @@ SITES, FINISH, HELD = [], [], []
 
 class Request(msgspec.Struct):
     steps: int = 4
+    fail: bool = False
 
 
 class Result(msgspec.Struct):
@@ -194,12 +196,22 @@ def generate(ctx: Context, payload: Request, tel: Telemetry) -> Result:
         if step == 0 and FINISH:
             FINISH.pop()()
         on_step(step)
+    if payload.fail:
+        raise InvalidRequest("authored attention fixture failure")
     return Result(payload.steps)
 """
 
 
 @contextmanager
-def _host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[SimpleNamespace]:
+def _host(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    load_pin: str = "",
+    choose: Any = None,
+    extra_component: bool = False,
+    request_id: str = "first",
+) -> Iterator[SimpleNamespace]:
     """A real executor serving the STEPS package on two Wan attention sites, its selection
     made while `tiny` built (the construction passed over it). Every frame the executor sends
     its machine is collected, a compile wait's progress among them."""
@@ -227,34 +239,49 @@ def _host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[SimpleNam
         host = Executor(channel, tmp_path / "root")
         (tmp_path / "root").mkdir()
         assert host.start(msgspec.convert({**binding, "devices": ""}, Start))["ok"]
-        load = {"devices": "", "binding": binding, "budgets": {}, "construction": "a"}
+        load = {
+            "devices": "",
+            "binding": binding,
+            "budgets": {},
+            "construction": "a",
+        }
         assert host.load(msgspec.convert(load, Load))["ok"]
         assert host.activate(Activate(construction="a"))["ok"]
         construction, roots = host.constructions["a"], _sites()
+        if extra_component:
+            roots["vae"] = _sites()["dit"]
         construction.backend, construction.device_facts = SimpleNamespace(roots=roots), CPU
-        construction._reselect = partial(
-            construction._prepare_attention,
+        if load_pin:
+            construction.models["model"] = object.__new__(Model)
+        # The weightless package boots the actual host; these real CPU processor
+        # roots then enter the same initial-selection path as a weighted Load.
+        construction.attention = construction._load_attention(
             Binding(model_parameter_name="model"),
             roots,
-            "",
+            load_pin,
             CPU,
-            choose=_ladder("tiny", "sdpa"),
+            choose=choose if choose is not None else _ladder("tiny", "sdpa"),
+            request_id=request_id if load_pin else "",
         )
-        construction.attention = construction._reselect()
         construction.attention_defaults = attention.snapshot(roots)
         package = sys.modules["steps_fixture"]
         package.SITES[:] = list(cast(Iterable[object], roots["dit"]))
         package.FINISH[:] = [lambda: None]
         replies: list[dict[str, Any]] = []
 
-        def run(request_id: str, kernel: str = "") -> dict[str, Any]:
+        def run(
+            request_id: str,
+            kernel: str = "",
+            *,
+            fail: bool = False,
+        ) -> dict[str, Any]:
             """One request; its rank's attention record, or the prepare's refusal."""
             package.HELD.clear()
             prepared = host.serve_request(
                 PrepareRequest(
                     request_id=request_id,
                     entrypoint="generate",
-                    payload={},
+                    payload={"fail": fail},
                     attention_kernel=kernel,
                 )
             )
@@ -271,7 +298,12 @@ def _host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[SimpleNam
                     attention_kernel=kernel,
                 )
             )
-            assert reply["outcome"]["terminal"] == "succeeded", reply["outcome"]
+            if "outcome" not in reply:
+                assert reply["ok"] is False, reply
+                return reply
+            assert reply["outcome"]["terminal"] == ("refused" if fail else "succeeded"), reply[
+                "outcome"
+            ]
             replies.append(reply)
             [rank] = reply["execution"]["ranks"]
             return dict(rank["attention"])
@@ -283,6 +315,7 @@ def _host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[SimpleNam
             frames=frames,
             run=run,
             replies=replies,
+            binding=msgspec.convert(binding, Binding),
         )
     reader.join()
     sys.modules.pop("steps_fixture", None)
@@ -443,3 +476,254 @@ def test_an_override_whose_compile_fails_is_refused_with_the_compiles_reason(
 
 def _waiting(frames: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [f for f in frames if f.get("stage") == "waiting for tiny compile"]
+
+
+def test_first_load_pin_then_other_pin_and_unpinned_calls_restore_author_defaults(
+    store: kernel_cache.Store,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Actual request commands and CPU attention; a ready alternate is not imported first."""
+    _registry(tmp_path / "sources")
+    _built(store, kernel_sources.job(kernel_sources.PYTHON, 0))
+    choices: list[str] = []
+
+    def choose(context: Any) -> tuple[str, str]:
+        choices.append(context.component)
+        return ("tiny", "sdpa")
+
+    with _host(tmp_path, monkeypatch, load_pin="model/dit=sdpa", choose=choose) as host:
+        construction = host.construction
+        assert construction.attention.pin == "model/dit=sdpa"
+        assert construction._attention_load_pin == "model/dit=sdpa"
+        assert not choices  # First Load obeyed the override before the author ladder.
+        first = host.run("first", "model/dit=sdpa")
+        assert first["observed"] == "sdpa" and host.held == [SDPA_SITES] * 4
+        assert construction._attention_load_pin == ""
+        assert choices == ["dit", "dit"]
+        assert host.run("second", "tiny")["observed"] == "tiny"
+        assert host.held == [TINY_SITES] * 4
+        assert host.run("default")["observed"] == "tiny"
+        assert host.held == [TINY_SITES] * 4
+        assert host.run("failed", "sdpa", fail=True)["observed"] == "sdpa"
+        assert host.run("after-failure")["observed"] == "tiny"
+        assert host.held == [TINY_SITES] * 4
+        assert choices == ["dit", "dit"]  # Canonical defaults were established only once.
+
+
+def test_unavailable_defaults_do_not_defeat_a_complete_explicit_override(
+    store: kernel_cache.Store,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _registry(tmp_path / "sources")
+    _built(store, kernel_sources.job(kernel_sources.PYTHON, 0))
+    with _host(
+        tmp_path,
+        monkeypatch,
+        load_pin="model/dit=sdpa",
+        choose=lambda _: "flash-attn3",
+    ) as host:
+        assert host.run("first", "dit=sdpa")["observed"] == "sdpa"
+        assert host.held == [SDPA_SITES] * 4
+        assert host.run("different", "tiny")["observed"] == "tiny"
+        assert host.held == [TINY_SITES] * 4
+        assert host.construction._attention_load_pin == "model/dit=sdpa"
+        refused = host.run("unpin")
+        assert refused["ok"] is False and refused["code"] == "attention_kernel_unsupported"
+        assert not host.held  # The first pin never masquerades as an unpinned selection.
+
+
+def test_partial_override_cannot_inherit_first_load_pin_on_unforced_components(
+    store: kernel_cache.Store,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _host(
+        tmp_path,
+        monkeypatch,
+        load_pin="sdpa",
+        choose=lambda _: "flash-attn3",
+        extra_component=True,
+    ) as host:
+        assert host.run("first", "sdpa")["observed"] == "sdpa"
+        refused = host.run("partial", "dit=sdpa")
+        assert refused["ok"] is False and refused["code"] == "attention_kernel_unsupported"
+        assert not host.held
+        assert host.construction._attention_load_pin == "sdpa"
+
+
+def test_follower_adoption_distinguishes_initial_override_and_canonical_defaults(
+    store: kernel_cache.Store,
+    tmp_path: Path,
+) -> None:
+    from cozy_runtime.internal.executor_commands import Attention
+
+    roots = _sites()
+    applied = attention.select(CPU, roots, "sdpa")
+    follower = Executor(None, tmp_path, rank=1, world=2)  # type: ignore[arg-type]
+    follower.backend = SimpleNamespace(roots=roots)
+    follower.device_facts = CPU
+    follower.attention = applied
+    follower.constructions["a"] = follower
+    follower._group_model_key = ""
+    chosen = {"dit": "sdpa"}
+    first = follower.select_attention(
+        Attention(construction="a", model_key="", adopt=chosen, pin="sdpa")
+    )
+    assert first["ok"] and follower._attention_load_pin == "sdpa"
+    defaults = follower.select_attention(
+        Attention(construction="a", model_key="", adopt=chosen, pin="")
+    )
+    assert defaults["ok"] and follower._attention_load_pin == ""
+    assert follower.attention is not None and follower.attention.pin == ""
+
+
+def test_load_request_id_is_optional_and_round_trips() -> None:
+    from cozy_runtime.internal.executor_commands import decode, encode
+
+    legacy = decode({"cmd": "load", "construction": "legacy"})
+    assert isinstance(legacy, Load) and legacy.request_id == ""
+    assert "request_id" not in encode(legacy)
+    current = decode({"cmd": "load", "construction": "current", "request_id": "accepted"})
+    assert isinstance(current, Load) and current.request_id == "accepted"
+    assert encode(current)["request_id"] == "accepted"
+    from cozy_runtime.internal.executor_commands import ATTENTION_LOAD_REQUEST
+
+    assert ATTENTION_LOAD_REQUEST == "attention.load_request/1"
+
+
+def test_first_load_compile_cancel_preserves_unloaded_executor_and_shared_builder(
+    store: kernel_cache.Store,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import torch
+
+    _registry(tmp_path / "sources")
+    job = kernel_sources.job(kernel_sources.PYTHON, 0)
+    lock, builder = _held(store, job, MOVING)
+    with _host(tmp_path, monkeypatch) as host:
+        owner = host.construction.host
+        # Start of a model-bearing executor already imports Torch; use the real CPU
+        # backend here, before an initial Load is allowed to construct any model.
+        owner.torch, owner.device_kind = torch, "cpu"
+        before = dict(owner.constructions)
+        assert "attention.load_request/1" in owner.hello()["memory"]
+        monkeypatch.setattr(kernel_compile, "POLL_SECONDS", 3600.0)
+        reply: dict[str, Any] = {}
+        reset: list[bool] = []
+        command = Load(
+            construction="cold-first",
+            devices="",
+            attention_pin="tiny",
+            request_id="cold-pin",
+        )
+
+        def load() -> None:
+            original = kernel_compile.held.get()
+            reply.update(owner.load(command))
+            reset.append(kernel_compile.held.get() is original)
+
+        count = len(host.frames)
+        request = threading.Thread(target=load, daemon=True)
+        request.start()
+        while request.is_alive() and not _waiting(host.frames[count:]):
+            time.sleep(0.01)
+        assert request.is_alive() and not host.held, reply
+        pending = owner.root / "executor.cancel.pending"
+        pending.write_text("cold-pin")
+        canceled = time.monotonic()
+        pending.rename(owner.root / "executor.cancel")
+        request.join(5)
+        assert not request.is_alive() and time.monotonic() - canceled < 1.0
+        assert (reply["ok"], reply["code"], reply["terminal"]) == (
+            False,
+            "attention_load_preflight_canceled",
+            "canceled",
+        )
+        assert owner.started and not owner.poisoned and owner.constructions == before
+        assert reset == [True]
+        assert builder.poll() is None and kernel_compile.status(store, job).state == "compiling"
+        monkeypatch.setattr(kernel_compile, "POLL_SECONDS", 0.01)
+        _finisher(store, job, lock, builder)()
+        # Retry the canceled key through actual Load/Activate before serving a request.
+        # This CPU fixture is weightless, so its Load is unpinned; real attention roots
+        # then enter the same selection path used by a weighted Load (as in _host).
+        later = msgspec.structs.replace(
+            command, request_id="later", attention_pin="", binding=host.binding
+        )
+        assert owner.load(later)["ok"]
+        cold = owner.constructions["cold-first"]
+        assert cold is not host.construction
+        cold.torch = None  # Weightless CPU fixture, as in _host; no accelerator quiescence.
+        roots = _sites()
+        cold.backend, cold.device_facts = SimpleNamespace(roots=roots), CPU
+        cold.attention = cold._load_attention(Binding(), roots, "", CPU, choose=_ladder("sdpa"))
+        cold.attention_defaults = attention.snapshot(roots)
+        host.package.SITES[:] = list(cast(Iterable[object], roots["dit"]))
+        assert owner.activate(Activate(construction="cold-first"))["ok"]
+        assert host.run("later", "tiny")["observed"] == "tiny"
+        assert host.held == [TINY_SITES] * 4
+
+
+@pytest.mark.parametrize(
+    ("binding", "pin", "expected"),
+    [
+        (Binding(model_parameter_name="other", components=("dit",)), "model/dit=tiny", ("", False)),
+        (Binding(model_parameter_name="model", components=("vae",)), "model/dit=tiny", ("", False)),
+        (Binding(model_parameter_name="model", component="vae"), "dit=tiny", ("", False)),
+        (
+            Binding(model_parameter_name="model", components=("dit",)),
+            "model/dit=tiny",
+            ("model/dit=tiny", True),
+        ),
+        (
+            Binding(model_parameter_names=("alias", "model"), components=("dit",)),
+            "model/dit=tiny",
+            ("model/dit=tiny", True),
+        ),
+        (Binding(model_parameter_name="model"), "model/dit=tiny", ("model/dit=tiny", False)),
+        (Binding(model_parameter_name="model"), "tiny", ("tiny", True)),
+    ],
+)
+def test_request_load_pin_scopes_metadata_without_resolving_unrelated_kernels(
+    binding: Binding, pin: str, expected: tuple[str, bool]
+) -> None:
+    command = Load(construction="a", binding=binding, request_id="accepted", attention_pin=pin)
+    assert Executor._request_load_pin(command) == expected
+
+
+def test_unknown_component_metadata_defers_to_actual_attention_sites(
+    store: kernel_cache.Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # flash-attn3 cannot run on this CPU. An unrelated scope must not try to resolve it.
+    with _host(
+        tmp_path, monkeypatch, load_pin="model/vae=flash-attn3", choose=_ladder("sdpa")
+    ) as host:
+        assert host.construction.attention.pin == ""
+        assert host.construction._attention_load_pin == ""
+        assert host.run("default")["observed"] == "sdpa"
+        assert host.held == [SDPA_SITES] * 4
+
+
+def test_legacy_construction_pin_still_defines_its_prepared_default(
+    store: kernel_cache.Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with _host(
+        tmp_path, monkeypatch, load_pin="sdpa", request_id="", choose=lambda _: "flash-attn3"
+    ) as host:
+        assert host.construction._attention_load_pin == ""
+        assert host.run("legacy-unpinned")["observed"] == "sdpa"
+        assert host.held == [SDPA_SITES] * 4
+
+
+def test_initial_load_malformed_pin_is_a_typed_request_refusal(
+    store: kernel_cache.Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with _host(tmp_path, monkeypatch) as host:
+        owner = host.construction.host
+        before = dict(owner.constructions)
+        reply = owner.load(Load(construction="malformed", request_id="bad", attention_pin="dit="))
+        assert reply["code"] == "attention_kernel_unknown" and reply["origin"] == "request"
+        assert not owner.poisoned and owner.constructions == before

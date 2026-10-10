@@ -268,6 +268,9 @@ class GroupHardware(msgspec.Struct, frozen=True, kw_only=True):
 
 #: An executor capability: it applies `Load.pinned_bytes` before its weights register.
 LOAD_PINNED = "load_pinned/1"
+
+#: First-Load request pins remain temporary and their pre-construction waits are cancellable.
+ATTENTION_LOAD_REQUEST = "attention.load_request/1"
 #: An executor capability: it adopts the machine's sealed host layouts (`Load.sealed_tiers`).
 SEALED_TIERS = "host_tiers.sealed/1"
 #: An executor capability: it adopts a sealed host layout its machine is still filling, using
@@ -288,6 +291,8 @@ class Load(Command, frozen=True, kw_only=True, tag="load"):
     authorized_device_limit_bytes: int | UnsetType = UNSET
     sequence_parallel_degree: int = 1
     attention_pin: str = ""
+    #: Accepted request whose first Load must obey its cancel marker; empty for prewarm.
+    request_id: str = ""
     #: The one-model form. Executors before the typed commands index both keys directly, so a
     #: worker always writes them for one model; a many-model load writes neither.
     binding: Binding | UnsetType = UNSET

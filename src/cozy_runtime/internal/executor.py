@@ -151,6 +151,7 @@ from cozy_runtime.internal import weights as weight_stages
 from cozy_runtime.internal.config import restore_seal, seal_snapshot
 from cozy_runtime.internal.discovery import discover_distribution, discover_installed
 from cozy_runtime.internal.executor_commands import (
+    ATTENTION_LOAD_REQUEST,
     LOAD_PINNED,
     MAP,
     PROCESS_CAP,
@@ -627,6 +628,8 @@ class Executor:
         #: line, not a per-attempt record: the choice is a function of device and image.
         self.attention: attention.Applied | None = None
         self.attention_defaults = attention.Snapshot(())
+        # A request-selected first Load is temporary until author defaults are resolved.
+        self._attention_load_pin = ""
         #: this construction's selection, made again between requests (`_upgrade_attention`)
         self._reselect: Callable[[], attention.Applied] | None = None
         #: Device facts for this prepared generation, reused for per-request pin checks.
@@ -718,6 +721,7 @@ class Executor:
                 "import_only",
                 zygote.CAPABILITY,
                 "vacate_ranks",
+                ATTENTION_LOAD_REQUEST,
                 *(
                     [plane.CAPABILITY, STAGE_TURNS, LOAD_PINNED, PROCESS_CAP, RANK_CELLS, MAP]
                     if plane.available()
@@ -1710,6 +1714,20 @@ class Executor:
         if loaded is not None:
             loaded._bind_parameters(command)
             return self._load_reply(key, loaded, reused=True)
+        # A request pin may target another construction in the same run. Static binding
+        # metadata can rule it out; unknown component metadata waits for the real roots.
+        try:
+            load_pin, early_pin = self._request_load_pin(command)
+        except attention.AttentionRefusal as exc:
+            return {"ok": False, "code": exc.code, "detail": str(exc)[:900], "origin": "request"}
+        command = msgspec.structs.replace(command, attention_pin=load_pin)
+        # Resolve the requested compiled family before constructing/filling a model or
+        # sending a follower model Load. Cancellation here leaves this Start reusable.
+        began_preflight = time.perf_counter()
+        preflight = self._load_attention_preflight(command) if early_pin else None
+        if preflight is not None:
+            return preflight
+        preflight_ms = (time.perf_counter() - began_preflight) * 1000
         child = self._construction_child(key)
         # `stage/1`: the construction's warm scopes ask the worker for their turns.
         self.stage_turns = command.stages and self.world == 1
@@ -1727,8 +1745,80 @@ class Executor:
                 return {**reply, "poisoned": ""}
             self.poisoned = self.poisoned or child.poisoned
             return self._close_after({**reply, "poisoned": self.poisoned})
+        if early_pin and self.torch is not None:
+            facts = reply.get("facts")
+            if isinstance(facts, dict):
+                facts["stages"] = [("attention_preflight", preflight_ms), *facts.get("stages", [])]
+                facts["prepare_ms"] = float(facts.get("prepare_ms", 0)) + preflight_ms
         self._register(key, child, reply)
         return self._load_reply(key, child, reused=False)
+
+    @staticmethod
+    def _request_load_pin(command: Load) -> tuple[str, bool]:
+        """The request's relevant pin and whether metadata proves its early scope."""
+        pin = command.attention_pin
+        if not pin or not command.request_id:
+            return pin, bool(pin)
+        scope, _ = attention._pin_parts(pin)
+        if not scope:
+            return pin, True
+        rows = command.rows()
+        owner, qualified, component = scope.partition("/")
+        if qualified:
+            rows = tuple(row for row in rows if owner in row.binding.parameter_names())
+            if not rows:
+                return "", False
+        else:
+            component = scope
+        known = [
+            row.binding.components or ((row.binding.component,) if row.binding.component else ())
+            for row in rows
+        ]
+        if any(component in names for names in known):
+            return pin, True
+        return ("", False) if all(known) else (pin, False)
+
+    def _load_attention_preflight(self, command: Load) -> dict[str, Any] | None:
+        """Only this canceled boundary has not constructed or broadcast a model Load."""
+        if not command.attention_pin or self.torch is None:
+            return None
+        if command.request_id and _cancelled(self.root, command.request_id):
+            return {
+                "ok": False,
+                "code": "attention_load_preflight_canceled",
+                "terminal": "canceled",
+                "detail": "request canceled before model load",
+                "origin": "request",
+            }
+        from cozy_runtime.internal.encoding import measure_device
+
+        waits = Attribution()
+        held = (
+            kernel_compile.held.set(functools.partial(_held, self.root, command.request_id, waits))
+            if command.request_id
+            else None
+        )
+        try:
+            attention.admit(command.attention_pin, self.world)
+            _, name = attention._pin_parts(command.attention_pin)
+            device = measure_device(self.torch, self.rank if self.world > 1 else 0)
+            attention.pinned(name, device)
+            if command.request_id and _cancelled(self.root, command.request_id):
+                raise kernel_compile.Canceled("request canceled before model load")
+        except kernel_compile.Canceled as exc:
+            return {
+                "ok": False,
+                "code": "attention_load_preflight_canceled",
+                "terminal": "canceled",
+                "detail": str(exc),
+                "origin": "request",
+            }
+        except attention.AttentionRefusal as exc:
+            return {"ok": False, "code": exc.code, "detail": str(exc)[:900], "origin": "request"}
+        finally:
+            if held is not None:
+                kernel_compile.held.reset(held)
+        return None
 
     def _bind_parameters(self, command: Load) -> None:
         """A reload names the construction under every parameter its bindings now spell
@@ -2462,8 +2552,7 @@ class Executor:
             stage("execution_plan")
             # THE FASTEST KERNEL THIS DEVICE AND IMAGE SUPPORT, PINNED POST-FILL (cr-124),
             # per attention site and before any warm step (see `_prepare_attention`).
-            self._reselect = functools.partial(
-                self._prepare_attention,
+            applied = self._load_attention(
                 binding,
                 roots,
                 pin,
@@ -2472,10 +2561,22 @@ class Executor:
                 if type(model).choose_attention is not Model.choose_attention
                 else None,
                 optional_scope=optional_attention_scope,
+                request_id=command.request_id,
             )
-            applied = self._reselect()
             self.device_facts = device_facts
             stage("attention_pin")
+        except kernel_compile.Canceled as exc:
+            # A deferred scoped choice may wait after construction. Only the earlier
+            # preflight cancellation is safe for TensorD to retain as unloaded.
+            backend.poison(())
+            self.poisoned = "model load canceled"
+            return {
+                "ok": False,
+                "code": "cancelled",
+                "terminal": "canceled",
+                "detail": str(exc),
+                "origin": "request",
+            }
         except (AnimaOptimizationRefusal, FusionRefusal, attention.AttentionRefusal) as exc:
             backend.poison(())
             self.poisoned = f"execution plan refused: {exc.code}"
@@ -3104,8 +3205,8 @@ class Executor:
         # A pin is the run's: a call holding no site in its scope runs its own selection,
         # and the worker reports a run none of whose calls applied it.
         pin = requested if requested and self._attention_reaches(requested) else ""
-        self._upgrade_attention()
         try:
+            self._upgrade_attention(pin)
             swap = self._attention_plan(pin) if pin else None
             self._restore_attention()
         except attention.AttentionRefusal as exc:
@@ -3419,6 +3520,62 @@ class Executor:
         applied = attention.select(device, roots, local, degree=self.world, choose=choose)
         return replace(applied, pin=pin) if local else applied
 
+    def _load_attention(
+        self,
+        binding: Binding,
+        roots: Mapping[str, Any],
+        pin: str,
+        device: Any,
+        *,
+        choose: Any = None,
+        optional_scope: bool = False,
+        request_id: str = "",
+    ) -> attention.Applied:
+        """Import a first request's kernel without turning its override into author policy."""
+        if request_id and pin:
+            local = attention.for_model(pin, binding.parameter_names())
+            if not local or not attention.reaches(roots, local):
+                pin = ""
+        # Legacy explicit construction pins have no request identity and keep their old
+        # lifetime. TensorD's negotiated first-request Load supplies request_id.
+        reselect = functools.partial(
+            self._prepare_attention,
+            binding,
+            roots,
+            pin="" if request_id else pin,
+            device=device,
+            choose=choose,
+            optional_scope=optional_scope,
+        )
+        self._reselect = reselect
+        held = (
+            kernel_compile.held.set(functools.partial(_held, self.root, request_id, Attribution()))
+            if request_id
+            else None
+        )
+        try:
+            applied = reselect(pin=pin)
+        finally:
+            if held is not None:
+                kernel_compile.held.reset(held)
+        self._attention_load_pin = applied.pin if request_id else ""
+        return applied
+
+    def _load_pin_covered(self, pin: str) -> bool:
+        """A failed default restoration can only be deferred at entirely overridden sites."""
+        if not pin or not self._attention_load_pin:
+            return False
+        initial_scope, _ = attention._pin_parts(self._attention_load_pin)
+        current_scope, _ = attention._pin_parts(pin)
+        sites = [
+            component
+            for component, _, _, _ in attention._attention_records(self._attention_roots())
+            if attention._matches(component, initial_scope)
+        ]
+        return bool(sites) and all(
+            attention._matches(component, current_scope) for component in sites
+        )
+
     def _attention_snapshot(self) -> attention.Snapshot:
         return attention.Snapshot(
             tuple(
@@ -3471,27 +3628,41 @@ class Executor:
             return None
         return attention.plan(self._attention_device(pin), roots, pin, self.world)
 
-    def _upgrade_attention(self) -> bool:
+    def _upgrade_attention(self, pin: str = "") -> bool:
         """A RUN WITHOUT AN OVERRIDE NEVER WAITS FOR A COMPILE: at each step or stage boundary
         of one, and between requests, a kernel the selection passed over while it compiled is
         ready, so the construction selects again and serves it from the next step on (a run
         may mix kernels, owner ruling 2026-10-09); a group's followers take rank 0's kernels
         once no call holds them. Where a selection or a follower cannot, the prepared one
-        stays and is not tried again. Whether any construction selected again."""
+        stays and is not tried again. A first Load override first needs an independent author
+        selection: an unavailable one can be deferred only while every temporary site is
+        explicitly overridden. Whether any construction selected again."""
         upgraded = False
         for executor in self.model_executors or [self]:
             applied, again, device = executor.attention, executor._reselect, executor.device_facts
-            if applied is None or again is None or device is None or not applied.waiting:
+            pending_default = bool(executor._attention_load_pin)
+            if applied is None or again is None or device is None:
                 continue
-            if not attention.compiled(applied.waiting, device):
+            if not pending_default and (
+                not applied.waiting or not attention.compiled(applied.waiting, device)
+            ):
                 continue
             try:
                 fresh = again()
-            except Exception as exc:  # an upgrade is never worth a failed run
+            except Exception as exc:  # ordinary upgrades are optional; default restoration is not
                 print(
                     f"[attention] selecting again refused: {exc}"[:600], file=sys.stderr, flush=True
                 )
                 executor.attention_defaults.restore()
+                if pending_default:
+                    if executor._load_pin_covered(pin):
+                        continue
+                    if isinstance(exc, attention.AttentionRefusal):
+                        raise
+                    raise attention.AttentionRefusal(
+                        "attention_kernel_unavailable",
+                        f"author attention defaults refused: {exc}"[:600],
+                    ) from exc
                 executor.attention = replace(applied, waiting=())
                 continue
             if executor.group is not None:
@@ -3499,11 +3670,19 @@ class Executor:
                     if executor._agree_attention(fresh, poison=False):
                         executor.attention_defaults.restore()
                         executor._agree_attention(applied, poison=False)
+                        if pending_default:
+                            if executor._load_pin_covered(pin):
+                                continue
+                            raise attention.AttentionRefusal(
+                                "attention_gpu_divergence",
+                                "ranks could not restore author attention defaults",
+                            )
                         executor.attention = replace(applied, waiting=())
                         continue
             assert executor.backend is not None
             executor.attention = fresh
             executor.attention_defaults = attention.snapshot(dict(executor.backend.roots))
+            executor._attention_load_pin = ""
             upgraded = True
         return upgraded
 
@@ -3523,6 +3702,7 @@ class Executor:
                         construction=self.construction,
                         model_key=self._group_model_key,
                         adopt=chosen,
+                        pin=applied.pin,
                     )
                 )
             )
@@ -3573,9 +3753,15 @@ class Executor:
         except attention.AttentionRefusal as exc:
             return {"ok": False, "code": exc.code, "detail": str(exc)[:900], "rank": self.rank}
         target.attention_defaults = attention.snapshot(roots)
+        if command.pin is not UNSET:
+            target._attention_load_pin = command.pin
         hosts = attention.observed(roots).hosts
         if target.attention is not None:
-            target.attention = replace(target.attention, hosts=hosts)
+            target.attention = replace(
+                target.attention,
+                hosts=hosts,
+                pin=target.attention.pin if command.pin is UNSET else command.pin,
+            )
         return {"ok": True, "rank": self.rank, "hosts": hosts}
 
     def select_attention(self, command: Attention) -> dict[str, Any]:
