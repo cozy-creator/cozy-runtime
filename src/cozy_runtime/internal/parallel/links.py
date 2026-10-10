@@ -34,6 +34,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
+from cozy_runtime.internal import spawn
 from cozy_runtime.internal.parallel import copy_engine, group
 
 #: Bytes each pair copies per measurement: large enough that link setup and launch latency
@@ -41,6 +42,7 @@ from cozy_runtime.internal.parallel import copy_engine, group
 _BYTES = 64 << 20
 _CHUNK = 8 << 20
 _REPEATS = 3
+_FOLLOWER = ("-m", "cozy_runtime.internal.parallel.links", "--follower")
 
 
 @dataclass(frozen=True, slots=True)
@@ -409,24 +411,19 @@ def main(argv: Sequence[str]) -> int:
 
     _measure(torch, count, emit)
     if all(pair.direct for pair in pairs):
-        # Followers are this process's children, as an executor's are its rank 0's.
+        # Followers launch as an executor's do (its trampoline, its seal), as children.
         port = _free_port()
+        seam, unused = os.pipe()
         followers = [
-            subprocess.Popen(
-                [
-                    sys.executable,
-                    "-I",
-                    "-m",
-                    "cozy_runtime.internal.parallel.links",
-                    "--follower",
-                    str(rank),
-                    str(count),
-                    str(port),
-                ],
-                stdout=subprocess.DEVNULL,
+            spawn.spawn_follower(
+                python=sys.executable,
+                module_argv=[*_FOLLOWER, str(rank), str(count), str(port)],
+                env=os.environ,
+                inherit_fd=unused,
             )
             for rank in range(1, count)
         ]
+        os.close(seam)
         print(json.dumps({"group": _group(torch, 0, count, port)}), flush=True)
         for follower in followers:
             follower.wait()
