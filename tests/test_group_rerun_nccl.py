@@ -163,7 +163,7 @@ def test_the_h3_dit_forms_over_its_measured_route_and_matches_one_gpu(
             torch,
             SEAL,
             nccl=leader.transport.nccl,
-            formed=leader._calibrated if measured.all_direct else None,
+            formed=leader._calibrated if measured.copy_engines else None,
         )
         assert leader._install_group(torch, model) is None
         leader._attempt_spool = tmp_path / "attempt"
@@ -172,7 +172,7 @@ def test_the_h3_dit_forms_over_its_measured_route_and_matches_one_gpu(
         record = leader.transport.document()
         print(json.dumps(record))
         assert [(p["a"], p["b"]) for p in record["pairs"]] == [(0, 1), (1, 0)] and record["reason"]
-        if measured.all_direct:
+        if measured.copy_engines:
             assert record["calibration"]["copy_engine_exact"] == 1.0, record
             assert record["route"] == (
                 "copy-engine"

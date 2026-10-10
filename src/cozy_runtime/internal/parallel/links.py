@@ -7,6 +7,13 @@ through host memory 11 GB/s, NCCL's peer-memory kernels across that bridge 3.3 G
 nothing here is inferred: once per machine boot a child process copies a buffer over every
 ordered pair, directly (copy engines, verified) and staged through pinned host memory, and
 the group forms over the result. The child owns those device contexts, not the executor.
+
+A copy within one process proves little about the paths between processes: on one A5000
+host every pair copied directly, yet NCCL's peer path between follower processes failed
+(`ncclProxyClientGetFd`). So when every pair is direct, the probe then forms a group of its
+own processes, as an executor forms one, and runs NCCL over peer memory and a copy-engine
+exchange through symmetric memory; a group that errs or stops making progress keeps the
+conservative route.
 """
 
 from __future__ import annotations
@@ -15,6 +22,9 @@ import fcntl
 import hashlib
 import json
 import os
+import selectors
+import signal
+import socket
 import subprocess
 import sys
 import time
@@ -23,6 +33,8 @@ from dataclasses import asdict, dataclass, field
 from functools import partial
 from pathlib import Path
 from typing import Any
+
+from cozy_runtime.internal.parallel import copy_engine, group
 
 #: Bytes each pair copies per measurement: large enough that link setup and launch latency
 #: do not decide it, small enough that a whole group measures in about a second.
@@ -51,19 +63,30 @@ class Pair:
 
 @dataclass(frozen=True, slots=True)
 class Links:
-    """Every ordered pair of a group's GPUs, and the NCCL setting the group forms under."""
+    """Every ordered pair of a group's GPUs, what a group of processes over them managed, and
+    the NCCL setting the group forms under."""
 
     pairs: tuple[Pair, ...] = ()
+    #: the process probe: `nccl_peer`, `copy_engines` (bools), `detail` and timings
+    processes: Mapping[str, Any] = field(default_factory=dict)
     reason: str = ""
 
     @property
     def all_direct(self) -> bool:
         return bool(self.pairs) and all(pair.direct for pair in self.pairs)
 
+    @property
+    def peer_route(self) -> bool:
+        return self.all_direct and bool(self.processes.get("nccl_peer"))
+
+    @property
+    def copy_engines(self) -> bool:
+        return self.peer_route and bool(self.processes.get("copy_engines"))
+
     def nccl(self) -> dict[str, str]:
-        """NCCL's peer memory on every pair that measured direct-and-faster, else only over
-        NVLink (where NCCL's own kernels are fastest) with host memory between the rest."""
-        return {"NCCL_P2P_LEVEL": "SYS" if self.all_direct else "NVL"}
+        """NCCL's peer memory where every pair measured direct-and-faster and a group of
+        processes formed over it, else only over NVLink, with host memory between the rest."""
+        return {"NCCL_P2P_LEVEL": "SYS" if self.peer_route else "NVL"}
 
     def why(self, number: Mapping[int, int] | None = None) -> str:
         """Why the group takes its route; GPUs by `number` (position -> nvidia-smi number)."""
@@ -71,6 +94,10 @@ class Links:
             return self.reason
         slow = [pair for pair in self.pairs if not pair.direct]
         if not slow:
+            if not self.peer_route:
+                return f"peer memory between processes failed: {self.processes.get('detail', '')}"
+            if not self.copy_engines:
+                return f"copy engines between processes failed: {self.processes.get('detail', '')}"
             return "every GPU pair copies directly faster than through host memory"
         pair = slow[0]
         cause = (
@@ -87,11 +114,16 @@ class Links:
         )
 
     def document(self) -> dict[str, Any]:
-        return {"pairs": [asdict(pair) for pair in self.pairs], "reason": self.why()}
+        return {
+            "pairs": [asdict(pair) for pair in self.pairs],
+            "processes": dict(self.processes),
+            "reason": self.why(),
+        }
 
     @classmethod
     def read(cls, document: Mapping[str, Any]) -> Links:
-        return cls(tuple(Pair(**row) for row in document.get("pairs", ())), "")
+        pairs = tuple(Pair(**row) for row in document.get("pairs", ()))
+        return cls(pairs, dict(document.get("processes") or {}), "")
 
 
 def _gbps(nbytes: int, seconds: float) -> float:
@@ -234,28 +266,96 @@ def measured(directory: Path | None, devices: str, count: int) -> Links:
 
 
 def _probe(devices: str, count: int) -> Links:
+    """Run the probe child, reading its lines as they come. It may wedge only in the process
+    group (inside NCCL); that phase gets four times what the child took to start and measure
+    its first pair (torch import, CUDA, a copy), and is ended as a whole if it says nothing."""
     environment = {**os.environ, "CUDA_VISIBLE_DEVICES": devices}
-    child = subprocess.run(
+    began = time.monotonic()
+    child = subprocess.Popen(
         [sys.executable, "-I", "-m", "cozy_runtime.internal.parallel.links", str(count)],
         env=environment,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        check=False,
+        start_new_session=True,
     )
-    pairs = []
-    for line in child.stdout.splitlines():
-        if line.startswith("{"):
-            pairs.append(Pair(**json.loads(line)))
-    if len(pairs) != count * (count - 1) or child.returncode != 0:
-        tail = (child.stderr or "").strip().splitlines()[-1:] or [f"exit {child.returncode}"]
+    assert child.stdout is not None
+    pairs: list[Pair] = []
+    processes: dict[str, Any] = {}
+    window: float | None = None
+    watch = selectors.DefaultSelector()
+    watch.register(child.stdout, selectors.EVENT_READ)
+    while child.poll() is None or watch.select(0):
+        ready = watch.select(None if window is None else max(window - time.monotonic(), 0))
+        if not ready:
+            os.killpg(child.pid, signal.SIGKILL)
+            processes = {
+                "nccl_peer": False,
+                "copy_engines": False,
+                "detail": "a group of probe processes stopped making progress in NCCL",
+            }
+            break
+        line = child.stdout.readline()
+        if not line:
+            break
+        row = json.loads(line) if line.startswith("{") else {}
+        if "group" in row:
+            processes = row["group"]
+        elif row:
+            pairs.append(Pair(**row))
+            if len(pairs) == 1:
+                started = time.monotonic() - began
+            if len(pairs) == count * (count - 1):
+                window = time.monotonic() + 4 * started
+    child.wait()
+    stderr = child.stderr.read() if child.stderr else ""
+    if len(pairs) != count * (count - 1):
+        tail = stderr.strip().splitlines()[-1:] or [f"exit {child.returncode}"]
         broken = next((pair for pair in pairs if not pair.verified and pair.peer), None)
         reason = (
             f"GPU {broken.src} to GPU {broken.dst}: {broken.detail}"
             if broken
             else f"the link probe ended early: {tail[0][:200]}"
         )
-        return Links(tuple(pairs) if broken else (), reason)
-    return Links(tuple(pairs))
+        return Links(tuple(pairs) if broken else (), {}, reason)
+    return Links(tuple(pairs), processes)
+
+
+def _group(torch: Any, rank: int, world: int, port: int) -> dict[str, Any]:
+    """One process of the probe's own group: NCCL over peer memory, then the copy engines
+    through symmetric memory, each checked against the other's bytes."""
+    from torch.distributed import _symmetric_memory as symm
+
+    dist = torch.distributed
+    group.route({"NCCL_P2P_LEVEL": "SYS"})
+    device = torch.device("cuda", rank)
+    torch.cuda.set_device(device)
+    store = dist.TCPStore("127.0.0.1", port, world, is_master=rank == 0)
+    dist.init_process_group("nccl", store=store, rank=rank, world_size=world, device_id=device)
+    report: dict[str, Any] = {"nccl_peer": False, "copy_engines": False, "detail": ""}
+    try:
+        rows = (_CHUNK // 2 // 1024) // world * world
+        send = torch.full((rows, 1024), float(rank + 1), dtype=torch.bfloat16, device=device)
+        received = torch.empty_like(send)
+        began = time.perf_counter()
+        dist.all_to_all_single(received, send)
+        torch.cuda.synchronize()
+        expected = torch.arange(1, world + 1, dtype=torch.bfloat16, device=device)
+        expected = expected.repeat_interleave(rows // world)[:, None].expand(rows, 1024)
+        report["nccl_peer"] = bool(torch.equal(received, expected))
+        report["nccl_ms"] = round((time.perf_counter() - began) * 1000, 1)
+        exchange = copy_engine.CopyEngineExchange(torch, symm, dist.group.WORLD, rank, world)
+        matrix = [[rows // world] * world for _ in range(world)]
+        report["copy_engines"] = bool(torch.equal(exchange.all_to_all([send], matrix)[0], expected))
+    except Exception as exc:  # its first line is why the group keeps the conservative route
+        report["detail"] = f"{type(exc).__name__}: {str(exc).strip().splitlines()[0][:300]}"
+    agreed = torch.tensor([report["nccl_peer"], report["copy_engines"]], dtype=torch.int32).to(
+        device
+    )
+    dist.all_reduce(agreed, op=dist.ReduceOp.MIN)
+    report["nccl_peer"], report["copy_engines"] = (bool(value) for value in agreed.tolist())
+    dist.destroy_process_group()
+    return report
 
 
 @dataclass(slots=True)
@@ -296,13 +396,47 @@ class Transport:
 def main(argv: Sequence[str]) -> int:
     import torch
 
+    if argv[0] == "--follower":
+        rank, world, port = (int(value) for value in argv[1:4])
+        _group(torch, rank, world, port)
+        return 0
     count = int(argv[0])
+    pairs: list[Pair] = []
 
     def emit(pair: Pair) -> None:
+        pairs.append(pair)
         print(json.dumps(asdict(pair)), flush=True)
 
     _measure(torch, count, emit)
+    if all(pair.direct for pair in pairs):
+        # Followers are this process's children, as an executor's are its rank 0's.
+        port = _free_port()
+        followers = [
+            subprocess.Popen(
+                [
+                    sys.executable,
+                    "-I",
+                    "-m",
+                    "cozy_runtime.internal.parallel.links",
+                    "--follower",
+                    str(rank),
+                    str(count),
+                    str(port),
+                ],
+                stdout=subprocess.DEVNULL,
+            )
+            for rank in range(1, count)
+        ]
+        print(json.dumps({"group": _group(torch, 0, count, port)}), flush=True)
+        for follower in followers:
+            follower.wait()
     return 0
+
+
+def _free_port() -> int:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return int(probe.getsockname()[1])
 
 
 if __name__ == "__main__":
