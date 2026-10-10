@@ -125,6 +125,7 @@ from cozy_runtime.author._services import CheckpointConflict, ProgressFrame
 from cozy_runtime.internal import (
     accel,
     attention,
+    attention_producer,
     attention_sol,
     attention_ulysses,
     budget_cell,
@@ -655,6 +656,7 @@ class Executor:
         self.device_facts: Any = None
         #: a follower's hold of rank 0's attention selection for the current attempt
         self._attention_hold = contextlib.ExitStack()
+        self._producer_hold: tuple[str, attention_producer.RequestState] | None = None
         self.facts: dict[str, Any] = {}
         self.schema_digests: dict[str, str] = {}
         #: request_id -> the record `prepare_request` resolved, run by `invoke`
@@ -1137,7 +1139,14 @@ class Executor:
                         self.torch.autocast(device_type=kind, dtype=getattr(self.torch, dtype))
                     )
                 stack.enter_context(wire.attention_context(command))
-                sol_counts = stack.enter_context(attention_sol.observing())
+                producer_state = None
+                if self._producer_hold is not None:
+                    construction, held_state = self._producer_hold
+                    if name[0].startswith(construction + "#"):
+                        producer_state = held_state
+                sol_counts = stack.enter_context(
+                    attention_sol.observing(producer_state=producer_state)
+                )
                 served = stack.enter_context(attention_ulysses.observing())
                 args, kwargs = wire.run_call(
                     command,
@@ -1917,6 +1926,9 @@ class Executor:
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
         key = command.construction
+        if self._producer_hold is not None and self._producer_hold[0] == key:
+            self._attention_hold.close()
+            self._producer_hold = None
         child = self.constructions.pop(key, None)
         if child is None:
             return {"ok": True, "construction": key, "freed_bytes": 0, "absent": True}
@@ -3655,6 +3667,7 @@ class Executor:
         if command.adopt is not UNSET:
             return self._adopt_attention(command, command.adopt)
         self._attention_hold.close()
+        self._producer_hold = None
         if command.pin is UNSET:
             return {"ok": True, "rank": self.rank}
         target = self.constructions.get(command.construction)
@@ -3670,6 +3683,12 @@ class Executor:
             )
         except attention.AttentionRefusal as exc:
             return {"ok": False, "code": exc.code, "detail": str(exc)[:900], "rank": self.rank}
+        # The actual selected recipe, not merely a nonempty CLI pin, owns this
+        # request's state. The existing restore/new-selection finally closes it.
+        if attention_producer.CP_NAMES.intersection(held.totals()):
+            state = attention_producer.RequestState()
+            self._producer_hold = (command.construction, state)
+            self._attention_hold.callback(state.clear)
         return {"ok": True, "rank": self.rank, "hosts": held.hosts}
 
     def _followers_attention(self, pin: str | UnsetType = UNSET) -> list[dict[str, Any]]:

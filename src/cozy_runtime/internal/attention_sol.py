@@ -32,7 +32,10 @@ from importlib import import_module
 from inspect import Parameter, Signature, signature
 from pathlib import Path
 from types import MethodType
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from cozy_runtime.internal.attention_producer import RequestState
 
 from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT, AttentionLayout
 from cozy_runtime.author._observations import Scalar
@@ -58,6 +61,7 @@ NAMES = frozenset(
         "kitchen-sol-fp4-lowmem",
         "kitchen-sol-producer-fast-shared-qkv",
         "kitchen-sol-producer-fp4-lowmem-shared-qkv",
+        "kitchen-sol-producer-fp4-fixed-means-shared-qkv",
     }
 )
 _COUNTS: ContextVar[dict[str, int] | None] = ContextVar("cozy_sol_counts", default=None)
@@ -74,6 +78,7 @@ def observing(
     *,
     ranks: dict[int, dict[str, int]] | None = None,
     kernels: list[dict[str, Scalar]] | None = None,
+    producer_state: RequestState | None = None,
 ) -> Iterator[dict[str, int]]:
     """Count successful calls in this request, restoring any outer observation. `kernels`
     receives one row per kernel this request started building or resolved."""
@@ -84,7 +89,7 @@ def observing(
     from cozy_runtime.internal.attention_producer import request_scope
 
     try:
-        with request_scope():
+        with request_scope(producer_state):
             yield counts
     finally:
         _COUNTS.reset(token)
@@ -131,6 +136,8 @@ def bind_dense(call: Callable[..., Any], identity: str) -> None:
 
 
 def dense_identity(kernel: str = "sol-attn") -> str:
+    if kernel == "kitchen-sol-producer-fp4-fixed-means-shared-qkv":
+        return "sageattention3-fp4-fixed-means; sparse-prefix=kitchen-int8"
     if kernel in {"kitchen-sol-fp4-lowmem", "kitchen-sol-producer-fp4-lowmem-shared-qkv"}:
         return "sageattention3-fp4-global-lowmem; sparse-prefix=kitchen-int8"
     if kernel in {"kitchen-sol", "kitchen-sol-producer-fast-shared-qkv"}:

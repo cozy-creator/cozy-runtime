@@ -288,6 +288,20 @@ PINNABLE += (
         why="Explicit global-mean NVFP4 control; all-dense FP4 is not the approved H3 default.",
     ),
     Candidate(
+        name="sageattention3-fp4-fixed-means",
+        backend="_cozy_sage3_fp4_fixed_means",
+        local=upstream.SAGE3_FIXED_MEANS,
+        min_sm=120,
+        max_sm=120,
+        sms=frozenset({120}),
+        dtypes=frozenset({"bfloat16"}),
+        max_head_dim=128,
+        head_dims=frozenset({128}),
+        artifact="sageattn3",
+        import_name="sageattn3",
+        why="Explicit fixed head-independent means; upstream BF16 correction and FP4 attention.",
+    ),
+    Candidate(
         name="kitchen-sol",
         backend="_cozy_kitchen_sol_int8",
         local=attention_kitchen_sol.KITCHEN_SOL,
@@ -321,9 +335,11 @@ PINNABLE += (
             backend="_cozy_" + name.replace("-", "_"),
             local=attention_producer.LOCALS[name],
             min_sm=120 if name in attention_producer.FP4_LOWMEM else 80,
-            max_sm=121,
+            max_sm=120 if name in attention_producer.FIXED_MEANS else 121,
             sms=(
-                frozenset({120, 121})
+                frozenset({120})
+                if name in attention_producer.FIXED_MEANS
+                else frozenset({120, 121})
                 if name in attention_producer.FP4_LOWMEM
                 else frozenset(a * 10 + b for a, b in upstream.KITCHEN_SMS)
             ),
@@ -509,7 +525,11 @@ def _resolve(candidate: Candidate, device: DeviceFacts, wait: bool = True) -> Re
     _registry()
     artifact: dict[str, str] | None
     if candidate.name in attention_kitchen_sol.FP4:
-        dense = BY_NAME["sageattention3-fp4-global-lowmem"]
+        dense = BY_NAME[
+            "sageattention3-fp4-fixed-means"
+            if candidate.name in attention_producer.FIXED_MEANS
+            else "sageattention3-fp4-global-lowmem"
+        ]
         artifacts = _compile_dependencies((candidate, dense), device, wait)
         dense_artifact = _resolve(dense, device, wait).artifact or {}
         artifact = {

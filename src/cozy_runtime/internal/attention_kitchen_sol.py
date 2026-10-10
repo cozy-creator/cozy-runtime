@@ -9,7 +9,13 @@ from cozy_runtime.internal import attention_sol, attention_ulysses, attention_up
 from cozy_runtime.internal.attention_ulysses import Local, Options
 
 NAMES = frozenset({"kitchen-sol", "kitchen-sol-fp4-lowmem"})
-FP4 = frozenset({"kitchen-sol-fp4-lowmem", "kitchen-sol-producer-fp4-lowmem-shared-qkv"})
+FP4 = frozenset(
+    {
+        "kitchen-sol-fp4-lowmem",
+        "kitchen-sol-producer-fp4-lowmem-shared-qkv",
+        "kitchen-sol-producer-fp4-fixed-means-shared-qkv",
+    }
+)
 
 
 def validate_device(device: Any) -> None:
@@ -47,6 +53,17 @@ def dense_fp4_lowmem(*, query: Any, key: Any, value: Any, scale: float | None) -
     return attention_ulysses._call(
         "_cozy_sage3_fp4_global_lowmem",
         attention_upstream.SAGE3_GLOBAL_LOWMEM,
+        query,
+        key,
+        value,
+        Options(attn_mask=None, dropout_p=0.0, is_causal=False, scale=scale, enable_gqa=False),
+    )
+
+
+def dense_fp4_fixed_means(*, query: Any, key: Any, value: Any, scale: float | None) -> Any:
+    return attention_ulysses._call(
+        "_cozy_sage3_fp4_fixed_means",
+        attention_upstream.SAGE3_FIXED_MEANS,
         query,
         key,
         value,
