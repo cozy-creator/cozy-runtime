@@ -130,8 +130,11 @@ def test_real_h3_processor_can_restore_its_original_backend_without_reconstructi
         with pytest.raises(ValueError, match="invocation-scoped"):
             attn(hidden)
         assert attention.BY_NAME[name] not in attention.CANDIDATES
-        with pytest.raises(attention.AttentionRefusal, match="context parallelism"):
+        if name in producer.CP_NAMES:
             attention.admit(name, 4)
+        else:
+            with pytest.raises(attention.AttentionRefusal, match="context parallelism"):
+                attention.admit(name, 4)
     attn.processor._attention_backend = attention._member(attention.BY_NAME["sdpa"])
     torch.testing.assert_close(attn(hidden, rotary), expected, rtol=0, atol=0)
 

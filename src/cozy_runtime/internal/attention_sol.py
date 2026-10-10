@@ -32,7 +32,10 @@ from importlib import import_module
 from inspect import Parameter, Signature, signature
 from pathlib import Path
 from types import MethodType
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from cozy_runtime.internal.attention_producer import RequestState
 
 from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT, AttentionLayout
 from cozy_runtime.author._observations import Scalar
@@ -75,6 +78,7 @@ def observing(
     *,
     ranks: dict[int, dict[str, int]] | None = None,
     kernels: list[dict[str, Scalar]] | None = None,
+    producer_state: RequestState | None = None,
 ) -> Iterator[dict[str, int]]:
     """Count successful calls in this request, restoring any outer observation. `kernels`
     receives one row per kernel this request started building or resolved."""
@@ -85,7 +89,7 @@ def observing(
     from cozy_runtime.internal.attention_producer import request_scope
 
     try:
-        with request_scope():
+        with request_scope(producer_state):
             yield counts
     finally:
         _COUNTS.reset(token)

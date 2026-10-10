@@ -32,8 +32,8 @@ def test_experiment_is_explicit_sm120_bf16_head128_only() -> None:
         assert attention._admits(candidate, "bfloat16", 128)
         assert not attention._admits(candidate, "float16", 128)
         assert not attention._admits(candidate, "bfloat16", 64)
-    with pytest.raises(attention.AttentionRefusal, match="context parallelism"):
-        attention.admit(HYBRID, 4)
+    for degree in (1, 2, 4, 7, 8):
+        attention.admit(HYBRID, degree)
 
 
 def test_h3_default_preferences_do_not_select_the_experiment() -> None:

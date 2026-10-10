@@ -43,40 +43,50 @@ FP4_LOWMEM = frozenset(
     }
 )
 FIXED_MEANS = frozenset({"kitchen-sol-producer-fp4-fixed-means-shared-qkv"})
+CP_NAMES = FIXED_MEANS
 BACKENDS = {"_cozy_" + name.replace("-", "_"): name for name in NAMES}
 CHUNK = 4096
 
 
 @dataclass
 class RequestState:
-    statistics: dict[tuple[str, str], tuple[int, tuple[int, ...], Any, Any]] = field(
+    statistics: dict[tuple[object, ...], tuple[int, tuple[int, ...], Any, Any]] = field(
         default_factory=dict
     )
     # One rotary presentation is shared by all blocks of the current step.
     rope: tuple[Any, Any, Any] | None = None
+    parallel_rotary: dict[object, tuple[Any, Any]] = field(default_factory=dict)
+    replay_inputs: dict[tuple[object, ...], tuple[int, tuple[int, ...], Any, Any]] = field(
+        default_factory=dict
+    )
+
+    def clear(self) -> None:
+        self.statistics.clear()
+        self.parallel_rotary.clear()
+        self.replay_inputs.clear()
+        backend = sys.modules.get("comfy_kitchen.backends.cuda")
+        cached = getattr(backend, "_ROPE_FAB_CACHE", {})
+        if self.rope is not None:
+            for key, (reference, _packed) in list(cached.items()):
+                if reference() is self.rope[2]:
+                    cached.pop(key, None)
+        self.rope = None
 
 
 _STATE: ContextVar[RequestState | None] = ContextVar("cozy_h3_producer", default=None)
 
 
 @contextmanager
-def request_scope() -> Iterator[RequestState]:
-    state = RequestState()
+def request_scope(state: RequestState | None = None) -> Iterator[RequestState]:
+    """Own one invocation, or borrow the follower's existing attempt state for one call."""
+    owned = state is None
+    state = RequestState() if state is None else state
     token = _STATE.set(state)
     try:
         yield state
     finally:
-        state.statistics.clear()
-        # Upstream holds its packed rotary presentation in a one-entry weak-key
-        # cache. Remove only our own entry, so no invocation GPU buffer survives
-        # into Runtime's quiescence accounting or a later request.
-        backend = sys.modules.get("comfy_kitchen.backends.cuda")
-        cached = getattr(backend, "_ROPE_FAB_CACHE", {})
-        if state.rope is not None:
-            for key, (reference, _packed) in list(cached.items()):
-                if reference() is state.rope[2]:
-                    cached.pop(key, None)
-        state.rope = None
+        if owned:
+            state.clear()
         _STATE.reset(token)
 
 
@@ -170,12 +180,28 @@ def rope_presentation(rotary: tuple[Any, Any], tokens: int, state: RequestState)
 
 
 def previous_statistics(
-    state: RequestState, key: tuple[str, str], step: int, geometry: tuple[int, ...], reuse: bool
+    state: RequestState,
+    key: tuple[object, ...],
+    step: int,
+    geometry: tuple[int, ...],
+    reuse: bool,
+    *,
+    replay_safe: bool = False,
 ) -> tuple[Any, Any]:
+    # Only the opt-in CP recipe changes replay semantics. A later projection or
+    # another rank may fail after this site succeeded; retry its original inputs.
+    held = state.replay_inputs.get(key) if replay_safe else None
+    if held is not None and held[:2] == (step, geometry):
+        return held[2], held[3]
     prior = state.statistics.pop(key, None)
-    if reuse and prior is not None and prior[:2] == (step - 1, geometry):
-        return prior[2], prior[3]
-    return None, None
+    inputs = (
+        prior[2:]
+        if reuse and prior is not None and prior[:2] == (step - 1, geometry)
+        else (None, None)
+    )
+    if replay_safe:
+        state.replay_inputs[key] = (step, geometry, *inputs)
+    return inputs
 
 
 def sparse_step(layout: AttentionLayout, site: attention_sol.Site) -> bool:
@@ -216,13 +242,19 @@ class Processor:
         layout, site, state = _ACTIVE_LAYOUT.get(), attention_sol._SITE.get(), _STATE.get()
         if layout is None or site is None or state is None:
             raise ValueError("H3 producer requires model layout and invocation-scoped state")
-        if getattr(self._parallel_config, "context_parallel_config", None) is not None:
-            raise ValueError("H3 chunked producer currently requires one GPU")
+        parallel = getattr(self._parallel_config, "context_parallel_config", None) is not None
+        if parallel and name not in CP_NAMES:
+            raise ValueError("This H3 chunked producer requires one GPU")
         if attention_mask is not None:
             raise ValueError("H3 producer serves unmasked noncausal attention only")
-        key = site.component, site.path
+        key = (
+            (site.component, site.path, id(attn))
+            if name in CP_NAMES
+            else (site.component, site.path)
+        )
         if not sparse_step(layout, site):
             state.statistics.pop(key, None)
+            state.replay_inputs.pop(key, None)
             return self.original(attn, hidden_states, rotary_emb, attention_mask)
         if rotary_emb is None or hidden_states.shape[0] != 1:
             raise ValueError("H3 producer requires batch1 and rotary tables")
@@ -246,37 +278,30 @@ class Processor:
         if capability not in admitted:
             raise ValueError(f"{name} does not support device capability {capability}")
         tokens = layout.live_tokens
-        if hidden_states.shape[1] != tokens:
+        if not parallel and hidden_states.shape[1] != tokens:
             raise ValueError("single-GPU producer expects an unpadded live H3 document")
         if attn.norm_q.eps != attn.norm_k.eps:
             raise ValueError("Kitchen producer requires matching Q/K RMSNorm epsilon")
-        geometry = (tokens, attn.heads, layout.protected_prefix)
-        prior_mean, prior_scale = previous_statistics(
-            state, key, layout.step, geometry, name in REUSE
-        )
-        reuse = prior_mean is not None
-        freqs = rope_presentation(rotary_emb, tokens, state)
-        kitchen = import_module("comfy_kitchen")
         shared_counts: dict[str, int] = {}
-        output, mean, scale = kitchen.sol_attn_chunked(
-            lambda: qkv_chunks(
-                attn, hidden_states, tokens, shared=name in SHARED_QKV, counts=shared_counts
-            ),
-            tokens,
-            attn.heads,
-            freqs,
-            (attn.norm_q.weight, attn.norm_k.weight),
-            kmean=prior_mean,
-            vscale=prior_scale,
-            tau=1.0,
-            scale=128**-0.5,
-            rope_eps=attn.norm_q.eps,
-            sink_blocks=[0, -(-layout.protected_prefix // 64)],
-            sink_q=[0, -(-layout.protected_prefix // 64)],
-            token_aug=0,
-        )
-        if name in REUSE:
-            state.statistics[key] = (layout.step, geometry, mean, scale)
+        if parallel:
+            output, reuse = _parallel_produce(
+                attn, hidden_states, self._parallel_config, name, layout, state, key, shared_counts
+            )
+        else:
+            freqs = rope_presentation(rotary_emb, tokens, state)
+            output, reuse = _produce(
+                attn,
+                layout,
+                state,
+                key,
+                name,
+                attn.heads,
+                (tokens, attn.heads, layout.protected_prefix),
+                freqs,
+                lambda: qkv_chunks(
+                    attn, hidden_states, tokens, shared=name in SHARED_QKV, counts=shared_counts
+                ),
+            )
         statistics = "previous-step" if reuse else "current-call"
         shared_detail = ""
         if name in SHARED_QKV:
@@ -292,6 +317,156 @@ class Processor:
         if layout.protected_prefix:
             attention_sol._count("dense_prefix")
         return attn.to_out[1](attn.to_out[0](output.flatten(2, 3)))
+
+
+def _produce(
+    attn: Any,
+    layout: AttentionLayout,
+    state: RequestState,
+    key: tuple[object, ...],
+    name: str,
+    heads: int,
+    geometry: tuple[int, ...],
+    freqs: Any,
+    chunks: Any,
+) -> tuple[Any, bool]:
+    prior_mean, prior_scale = previous_statistics(
+        state, key, layout.step, geometry, name in REUSE, replay_safe=name in CP_NAMES
+    )
+    output, mean, scale = import_module("comfy_kitchen").sol_attn_chunked(
+        chunks,
+        layout.live_tokens,
+        heads,
+        freqs,
+        (attn.norm_q.weight, attn.norm_k.weight),
+        kmean=prior_mean,
+        vscale=prior_scale,
+        tau=1.0,
+        scale=128**-0.5,
+        rope_eps=attn.norm_q.eps,
+        sink_blocks=[0, -(-layout.protected_prefix // 64)],
+        sink_q=[0, -(-layout.protected_prefix // 64)],
+        token_aug=0,
+    )
+    if name in REUSE:
+        state.statistics[key] = (layout.step, geometry, mean, scale)
+    return output, prior_mean is not None
+
+
+def _project_qkv(
+    attn: Any, hidden: Any, tokens: int, counts: dict[str, int] | None = None
+) -> tuple[Any, Any, Any]:
+    """Assemble local raw QKV once, with bounded projection chunks and original hooks."""
+    packed = None
+    offset = 0
+    for chunk in qkv_chunks(attn, hidden, tokens, shared=True, counts=counts):
+        if packed is None:
+            packed = chunk.new_empty((tokens, chunk.shape[-1]))
+        packed[offset : offset + chunk.shape[0]].copy_(chunk)
+        offset += chunk.shape[0]
+    if packed is None or offset != tokens:
+        raise ValueError("H3 CP projection did not cover the local token shard")
+    query, key, value = packed.reshape(1, tokens, 3, attn.heads, 128).unbind(2)
+    return query, key, value
+
+
+def _parallel_produce(
+    attn: Any,
+    hidden: Any,
+    config: Any,
+    name: str,
+    layout: AttentionLayout,
+    state: RequestState,
+    key: tuple[object, ...],
+    counts: dict[str, int],
+) -> tuple[Any, bool]:
+    import torch
+    import torch.distributed as dist
+
+    handle = attention_ulysses.group(config)
+    degree, rank = dist.get_world_size(handle), dist.get_rank(handle)
+    tokens = layout.live_tokens
+    expected = tokens // degree + int(rank < tokens % degree)
+    if hidden.shape[1] != expected or attn.heads % degree:
+        raise ValueError("H3 producer requires the actual unequal token shard and divisible heads")
+    rotary_key = getattr(attn, "_cozy_producer_rotary_key", None)
+    rotary = state.parallel_rotary.get(rotary_key)
+    if rotary is None or rotary[0].shape[0] != tokens:
+        raise ValueError("H3 CP producer requires this component's full pre-split rotary tables")
+    freqs = rope_presentation(rotary, tokens, state)
+    query, key_tensor, value = _project_qkv(attn, hidden, expected, counts)
+    heads = attn.heads // degree
+    reuse = False
+
+    def compute(q: Any, k: Any, v: Any) -> Any:
+        nonlocal reuse
+
+        def chunks() -> Iterator[Any]:
+            for start in range(0, tokens, CHUNK):
+                yield torch.cat(
+                    [x[:, start : start + CHUNK].flatten(2, 3) for x in (q, k, v)], dim=-1
+                ).squeeze(0)
+
+        output, reuse = _produce(
+            attn,
+            layout,
+            state,
+            key,
+            name,
+            heads,
+            (tokens, heads, layout.protected_prefix, degree, rank),
+            freqs,
+            chunks,
+        )
+        return output
+
+    return attention_ulysses.exchange(query, key_tensor, value, handle, compute), reuse
+
+
+def install_parallel_rotary(component: Any) -> None:
+    """Retain H3's replicated RoPE before Diffusers' subsequently installed split hook.
+
+    The hook returns its output unchanged. Only an active sparse call using the
+    opt-in CP recipe retains tensors, under the current request and component key.
+    """
+    try:
+        from diffusers.models.transformers.transformer_minimax_h3 import MiniMaxH3Transformer3DModel
+    except ModuleNotFoundError as exc:
+        if exc.name != "diffusers.models.transformers.transformer_minimax_h3":
+            raise
+        return  # H3 is optional; older Diffusers CP models keep their existing path.
+    if not isinstance(component, MiniMaxH3Transformer3DModel):
+        return
+    from diffusers.hooks.hooks import HookRegistry, ModelHook
+
+    rope = component.rope
+    registry = HookRegistry.check_if_exists_or_initialize(rope)
+    if registry.get_hook("cozy_cp_producer_rotary") is not None:
+        return
+    key = object()
+    modules = tuple(block.attn for block in component.transformer_blocks)
+    for module in modules:
+        module._cozy_producer_rotary_key = key
+
+    class RetainRotary(ModelHook):  # type: ignore[misc]  # optional untyped Diffusers hook API
+        def post_forward(self, module: Any, output: Any) -> Any:
+            state, layout = _STATE.get(), _ACTIVE_LAYOUT.get()
+            if state is None or layout is None or layout.step < layout.dense_until_step:
+                return output
+            backends = (getattr(m.processor, "_attention_backend", None) for m in modules)
+            names = (BACKENDS.get(str(getattr(backend, "value", backend))) for backend in backends)
+            active = any(name is not None and name in CP_NAMES for name in names)
+            if active:
+                if (
+                    not isinstance(output, tuple)
+                    or len(output) != 2
+                    or output[0].shape[0] != layout.live_tokens
+                ):
+                    raise ValueError("H3 full rotary presentation changed before context splitting")
+                state.parallel_rotary[key] = output
+            return output
+
+    registry.register_hook(RetainRotary(), "cozy_cp_producer_rotary")
 
 
 def validate(module: Any) -> None:
@@ -373,7 +548,7 @@ FP4_FIXED_MEANS_LOCAL = Local(
     lambda *_: (
         "dense=sageattn3.nvfp4_fixed_means(upstream_bf16_correction); sparse=instance-producer"
     ),
-    head_local=False,
+    head_local=True,
 )
 LOCALS = {
     "kitchen-sol-producer-fp4-fixed-means-shared-qkv": FP4_FIXED_MEANS_LOCAL,

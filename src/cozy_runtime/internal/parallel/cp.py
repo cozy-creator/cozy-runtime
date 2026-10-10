@@ -237,6 +237,9 @@ def _install_on_component(component: Any, *, degree: int, comms: CpComms) -> Non
         processor = getattr(module, "processor", None)
         if processor is not None and hasattr(processor, "_parallel_config"):
             processor._parallel_config = config
+    from cozy_runtime.internal.attention_producer import install_parallel_rotary
+
+    install_parallel_rotary(component)
     apply_context_parallel(component, cp_config, getattr(component, _CP_PLAN_ATTR))
 
 
