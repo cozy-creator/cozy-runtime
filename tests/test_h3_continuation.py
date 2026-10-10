@@ -125,72 +125,79 @@ def test_streaming_tail_comes_from_delivered_end_not_sample_padding(prefix: int)
 
 
 @pytest.mark.parametrize("frames", [22, 39, 56])
-def test_native_context_layout_preserves_refs_and_every_scheduler_step(frames: int) -> None:
+def test_context_is_the_frozen_head_of_one_window(frames: int) -> None:
+    """One copy: the tail's video latents are the target's first latents, held at the anchors'
+    level for every step; its audio stays condition rows ending at the head's end tick."""
     from diffusers import MiniMaxH3Scheduler
     from diffusers.modular_pipelines.minimax_h3 import MiniMaxH3ImageReference
     from diffusers.modular_pipelines.minimax_h3.before_denoise import (
         MiniMaxH3Ref2VAPrepareLayoutStep,
+        patchify_video_latents,
     )
     from diffusers.modular_pipelines.minimax_h3.denoise import MiniMaxH3LoopSchedulerStep
+
+    from cozy_runtime.models.minimax_h3.official import _freeze_context_prefix
 
     ctx = context(frames)
     latent_frames = 5 * ((frames - 5) // 17) + 2
     ticks = (frames * 5 + 2) // 3
-    refs = [
-        MiniMaxH3ImageReference(image=np.zeros((32, 64, 3), dtype=np.uint8)),
-        ContextReferenceLayout(),
-    ]
-    conditions = [torch.zeros(1, 24, 1, 2, 4), torch.zeros(1, 24, latent_frames, 2, 4)]
+    refs = [MiniMaxH3ImageReference(image=np.zeros((32, 64, 3), dtype=np.uint8)), ContextReferenceLayout()]
+    conditions = [torch.zeros(1, 24, 1, 2, 4)]
     audios = [torch.zeros(2 * ticks, 32)]
     packed = MiniMaxH3Ref2VAPrepareLayoutStep.build_ref2va_packed_sequence(
         torch.ones(3, dtype=torch.long), refs, conditions, audios, 20, 2, 4, 120, (1, 2, 2), 2, 2, 0
     )
     positions, _tags, video, audio, text, cv, ca = packed
+    assert cv == 2  # the image only: the context adds no video rows
     before = positions.clone()
-    state = SimpleNamespace(
-        position_ids=positions,
-        video_indices=video,
-        audio_indices=audio,
-        text_indices=text,
-        condition_latents=conditions,
-        audio_condition_latents=audios,
-        num_condition_video_rows=cv,
-        num_condition_audio_rows=ca,
-    )
-    align_context_rows(state, ctx, (1, 2, 2))
-    assert torch.equal(positions[video[:2]], before[video[:2]])
-    assert torch.equal(positions[video[cv:]], before[video[cv:]])
-    assert torch.equal(positions[text], before[text])
-    origin = positions[video[cv], 0]
-    offsets = []
-    cursor = 0
-    for i in range(latent_frames):
-        offsets.extend([cursor * 5 / 3] * 2)
-        cursor += (1, 4, 4, 4, 4)[i % 5]
-    assert torch.allclose(
-        positions[video[2:cv], 0],
-        origin + torch.tensor(offsets, dtype=torch.float64),
-        rtol=0,
-        atol=1e-12,
-    )
-    assert torch.equal(
-        positions[audio[:ca], 0], origin + torch.arange(ticks, dtype=torch.float64).repeat(2)
-    )
     sched = MiniMaxH3Scheduler(shift=12.0)
     audio_sched = MiniMaxH3Scheduler(shift=3.0)
     sched.set_timesteps(9)
     audio_sched.set_timesteps(9)
-    state.latents = torch.ones(len(video), 96)
-    state.audio_latents = torch.ones(len(audio), 32)
-    state.noise_pred = torch.full((1, len(video), 96), 0.25)
-    state.audio_noise_pred = torch.full((1, len(audio), 32), 0.25)
-    state.audio_timesteps = audio_sched.timesteps
+    state = PipelineState()
+    for key, value in dict(
+        position_ids=positions,
+        video_indices=video,
+        audio_indices=audio,
+        text_indices=text,
+        audio_condition_latents=audios,
+        num_condition_video_rows=cv,
+        num_condition_audio_rows=ca,
+        latents=torch.ones(len(video), 96),
+        audio_latents=torch.ones(len(audio), 32),
+        noise_pred=torch.full((1, len(video), 96), 0.25),
+        audio_noise_pred=torch.full((1, len(audio), 32), 0.25),
+        timesteps=sched.timesteps,
+        audio_timesteps=audio_sched.timesteps,
+        generator=torch.Generator().manual_seed(7),
+    ).items():
+        state.set(key, value)
+    align_context_rows(state, ctx)
+    assert torch.equal(positions[video], before[video])
+    assert torch.equal(positions[text], before[text])
+    origin = positions[video[cv], 0]
+    assert torch.equal(
+        positions[audio[:ca], 0], origin + torch.arange(ticks, dtype=torch.float64).repeat(2)
+    )
+    pipe = SimpleNamespace(scheduler=sched, keyframe_noise_aug=0.999, patch_size=(1, 2, 2))
+    frozen = _freeze_context_prefix(pipe, state, ctx)
+    assert frozen == latent_frames * 2
+    head = state.latents[cv : cv + frozen].clone()
+    noise = torch.randn(ctx.video_latents.shape, generator=torch.Generator().manual_seed(7))
+    expected = patchify_video_latents(0.999 * ctx.video_latents + 0.001 * noise, (1, 2, 2))
+    assert torch.allclose(head, expected, atol=1e-6)
+    plan = [unique[index] for unique, index in state.row_timestep_plan]
+    assert all(bool(torch.all(p[video[: cv + frozen]] == max(float(t), 0.999)))
+               for p, t in zip(plan, sched.timesteps, strict=True))
+    assert all(bool(torch.all(p[video[cv + frozen :]] == float(t)))
+               for p, t in zip(plan, sched.timesteps, strict=True))
     components = SimpleNamespace(scheduler=sched, audio_scheduler=audio_sched)
+    block = SimpleNamespace(**state.values)
     for index, timestep in enumerate(sched.timesteps):
-        MiniMaxH3LoopSchedulerStep()(components, state, i=index, t=timestep)
-        assert torch.equal(state.latents[:cv], torch.ones(cv, 96))
-        assert torch.equal(state.audio_latents[:ca], torch.ones(ca, 32))
-    assert not torch.equal(state.latents[cv:], torch.ones_like(state.latents[cv:]))
+        MiniMaxH3LoopSchedulerStep()(components, block, i=index, t=timestep)
+        assert torch.equal(block.latents[: cv + frozen], torch.cat([torch.ones(cv, 96), head]))
+        assert torch.equal(block.audio_latents[:ca], torch.ones(ca, 32))
+    assert not torch.equal(block.latents[cv + frozen :], torch.ones_like(block.latents[cv + frozen :]))
 
 
 def test_export_encodes_only_the_named_windows_of_the_landed_tail() -> None:

@@ -236,9 +236,10 @@ class AVContext:
 
 @dataclass(frozen=True)
 class ContextReferenceLayout:
-    """Private packed-layout metadata, appended only after public reference encoding."""
+    """The completed tail's soundtrack as private reference rows, appended after the public
+    references. Its video is no reference: it is the target window's frozen prefix."""
 
-    kind: str = "video"
+    kind: str = "audio"
     has_audio: bool = True
 
 
@@ -310,37 +311,24 @@ def decode_context(data: bytes) -> AVContext:
         ) from exc
 
 
-def align_context_rows(state: Any, context: AVContext, patch_size: tuple[int, int, int]) -> None:
-    """Place the hidden AV condition at the target head, retaining all public references.
+def align_context_rows(state: Any, context: AVContext) -> None:
+    """Place the tail's audio condition at the target head, ending where its video ends.
 
-    It is encoded as the final internal video/audio condition after text encoding,
-    so it consumes neither a Picture/Video label nor a Qwen vision-token block.
-    The native scheduler already keeps these condition rows fixed on every step.
+    The target window begins with the tail's own video latents, frozen; its audio
+    is regenerated over that prefix and trimmed, guided by these fixed condition rows. Audio
+    has one rotary tick per 1/40 second; its latent grid rounds up, as native target audio
+    does, so the final tick may contain encoder padding.
     """
-    _, patch_h, patch_w = patch_size
-    latent = state.condition_latents[-1]
-    frames, height, width = (int(x) for x in latent.shape[2:])
-    expected_latents = 5 * ((context.frame_count - 5) // 17) + 2
-    if frames != expected_latents:
-        _refuse("context VAE temporal grid differs from its frame clock")
-    video_count = frames * (height // patch_h) * (width // patch_w)
     audio_count = int(state.audio_condition_latents[-1].shape[0])
     if (
         audio_count != 2 * ((context.frame_count * 5 + 2) // 3)
-        or video_count > state.num_condition_video_rows
+        or audio_count > state.num_condition_audio_rows
     ):
         _refuse("context packed geometry is inconsistent")
-    video_rows = state.video_indices[
-        state.num_condition_video_rows - video_count : state.num_condition_video_rows
-    ]
     audio_rows = state.audio_indices[
         state.num_condition_audio_rows - audio_count : state.num_condition_audio_rows
     ]
-    target_start = state.video_indices[state.num_condition_video_rows]
-    origin = state.position_ids[target_start, 0].clone()
-    state.position_ids[video_rows, 0] += origin - state.position_ids[video_rows[0], 0].clone()
-    # Audio has one rotary tick per 1/40 second. Its latent grid rounds up,
-    # just as native target audio does; the final tick may contain encoder padding.
+    origin = state.position_ids[state.video_indices[state.num_condition_video_rows], 0].clone()
     ticks = audio_count // 2
     end_tick = (context.frame_count * 5 + 2) // 3
     desired_start = origin + end_tick - ticks
