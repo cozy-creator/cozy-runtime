@@ -22,6 +22,25 @@ DENSE = "sageattention3-fp4-fixed-means"
 HYBRID = "kitchen-sol-producer-fp4-fixed-means-shared-qkv"
 
 
+@pytest.mark.parametrize("degree", [1, 2, 4, 7, 8])
+def test_explicit_dense_selector_installs_on_real_diffusers_sites(degree: int) -> None:
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("diffusers")
+    from diffusers.models.transformers.transformer_minimax_h3 import MiniMaxH3Attention
+
+    # Actual small projection modules with the real H3 head geometry. No CUDA launch:
+    # Ready is the kernel-resolution result, whose numerical half is run5247 evidence.
+    site = MiniMaxH3Attention(hidden_size=8, heads=56, dim_head=128).to(torch.bfloat16)
+    roots = {"fl2va_dit": torch.nn.ModuleList([site])}
+    candidate = attention.BY_NAME[DENSE]
+    resolved = attention.Ready(candidate, attention._member(candidate))
+    device = DeviceFacts("cuda", "RTX 5090", 120, "", "", index=0)
+    selected = attention.install([resolved], roots, degree=degree, device=device)
+    assert selected.hosts == {"fl2va_dit": {DENSE: 1}}
+    assert attention.observed(roots).hosts == selected.hosts
+    assert not isinstance(site.processor, attention_producer.Processor)
+
+
 def test_experiment_is_explicit_sm120_bf16_head128_only() -> None:
     for name in (DENSE, HYBRID):
         candidate = attention.BY_NAME[name]
