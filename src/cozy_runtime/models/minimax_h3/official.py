@@ -43,6 +43,10 @@ from diffusers.modular_pipelines.minimax_h3 import (
     MiniMaxH3ImageReference,
     MiniMaxH3VideoReference,
 )
+from diffusers.modular_pipelines.minimax_h3.before_denoise import (
+    MiniMaxH3SetTimestepsStep,
+    patchify_video_latents,
+)
 from diffusers.modular_pipelines.minimax_h3.modular_pipeline import (
     align_num_frames,
     audio_latent_num_frames,
@@ -50,6 +54,7 @@ from diffusers.modular_pipelines.minimax_h3.modular_pipeline import (
     video_latent_num_frames,
 )
 from diffusers.modular_pipelines.modular_pipeline import PipelineState
+from diffusers.utils.torch_utils import randn_tensor
 from torch.nn.utils.weight_norm import WeightNorm
 from torch.utils._pytree import keystr, tree_flatten_with_path
 from transformers import (
@@ -82,6 +87,7 @@ from .adaln_pruned import AdaLNPrunedMiniMaxH3Transformer
 from .conditioner import FinalHiddenState, PresentationLength, build_text_conditioner
 from .continuation import (
     CONTEXT_FRAMES,
+    SEAM_FRAMES,
     AVContext,
     CompletedTail,
     ContextReferenceLayout,
@@ -199,6 +205,53 @@ def _attention_layout(state: Any, step: int, *, sol_dense_steps: int = 10) -> At
         dense_until_step=sol_dense_steps,
         dense_paths=_DENSE_ATTENTION_PATHS,
     )
+
+
+def _freeze_context_prefix(pipe: Any, state: Any, context: AVContext) -> int:
+    """The completed tail's video latents ARE the target window's first latents (one copy):
+    noised to the anchors' level and held there for every step, as FL2VA holds its keyframes.
+
+    The official loop only holds leading video rows, and the target's first rows follow the
+    reference rows, so the frozen prefix extends that count; the per-row timesteps are rebuilt
+    from it. Returns the frozen row count, restored before decode.
+    """
+    device = state.latents.device
+    latents = context.video_latents.to(device)
+    noise = randn_tensor(
+        latents.shape, generator=state.generator, device=device, dtype=torch.float32
+    )
+    noised = pipe.scheduler.scale_noise(latents, pipe.keyframe_noise_aug, noise)
+    rows = patchify_video_latents(noised, tuple(pipe.patch_size))
+    start = int(state.num_condition_video_rows)
+    target = state.latents[start : start + rows.shape[0]]
+    if target.shape != rows.shape:
+        raise InvalidRequest(
+            "continuation context does not tile the target window's head", code="h3_continuation"
+        )
+    target.copy_(rows.to(target.dtype))
+    held = start + int(rows.shape[0])
+    state.set("num_condition_video_rows", held)
+    state.set(
+        "row_timestep_plan",
+        [
+            tuple(
+                tensor.to(device)
+                for tensor in MiniMaxH3SetTimestepsStep.build_row_timesteps(
+                    state.video_indices,
+                    state.audio_indices,
+                    held,
+                    state.num_condition_audio_rows,
+                    state.text_indices.numel(),
+                    float(timestep),
+                    float(audio_timestep),
+                    max(float(timestep), pipe.keyframe_noise_aug),
+                    1.0,
+                )
+            )
+            for timestep, audio_timestep in zip(state.timesteps, state.audio_timesteps, strict=True)
+        ],
+    )
+    return int(rows.shape[0])
 
 
 def frames_for(duration_s: int) -> int:
@@ -1328,8 +1381,8 @@ class OfficialH3Pipeline:
                 )
             context = scratch.get("continuation_context")
             if context is not None:
-                # `condition_media` appends the completed tail after the public references.
-                video.append(context.video_latents)
+                # `condition_media` appends the completed tail's soundtrack after the public
+                # references; its video is the target's own prefix and adds no rows.
                 audio.append(context.audio_latents)
                 references.append(ContextReferenceLayout())
             scratch.set("normalized_references", references)
@@ -1418,7 +1471,6 @@ class OfficialH3Pipeline:
             self._run(task, "vae_encoder", state, component="video_vae")
         context = state.get("continuation_context")
         if context is not None:
-            state.set("condition_latents", [*state.condition_latents, context.video_latents])
             state.set(
                 "audio_condition_latents", [*state.audio_condition_latents, context.audio_latents]
             )
@@ -1641,8 +1693,10 @@ class OfficialH3Pipeline:
                 )
 
         context = state.get("continuation_context")
+        frozen = 0
         if context is not None:
-            align_context_rows(state, context, tuple(scoped.patch_size))
+            align_context_rows(state, context)
+            frozen = _freeze_context_prefix(scoped, state, context)
 
         # The receipt names the schedule the official blocks actually built, proven
         # against the plan by exact float32 equality of both modality vectors.
@@ -1679,6 +1733,9 @@ class OfficialH3Pipeline:
             # step k is in every later latent, and the first offending stage is still named.
             checks.settle()
         loop.set_block_state(state, block_state)
+        if frozen:
+            # The VAE decodes the whole window from latent 0, where its causal grid starts.
+            state.set("num_condition_video_rows", state.num_condition_video_rows - frozen)
         self._run_with(task, scoped, "denoise.after_denoise", state)
         return facts
 
@@ -1722,7 +1779,9 @@ class OfficialH3Pipeline:
         pixel_std = torch.tensor(components.pixel_std, device=device).view(1, -1, 1, 1, 1)
         frames = 0
         delivery = state.get("continuation_delivery")
-        tail = CompletedTail(delivery) if delivery is not None else None
+        context = state.get("continuation_context")
+        seam = None if context is None else context.seam_rgb
+        tail = CompletedTail(delivery, seam) if delivery is not None else None
         with torch.no_grad():
             chunks = vae.decode_chunks(state.latents * latents_std + latents_mean)
             while True:
@@ -1781,6 +1840,7 @@ class OfficialH3Pipeline:
                 encoding.condition_latents[0].detach().float().cpu().contiguous(),
                 encoding.audio_condition_latents[0].detach().float().cpu().contiguous(),
             )
+        seam = raw.frames[-SEAM_FRAMES:].reshape(-1, 3).mean(axis=0) / 255
         return AVContext(
             encoded,
             int(raw.frames.shape[1]),
@@ -1788,6 +1848,7 @@ class OfficialH3Pipeline:
             raw.source_end_frame,
             provenance,
             max(encoded),
+            seam_rgb=(float(seam[0]), float(seam[1]), float(seam[2])),
         )
 
     def _run(self, task: Task, name: str, state: Any, *, component: str | None = None) -> None:

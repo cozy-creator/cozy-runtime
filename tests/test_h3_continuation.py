@@ -23,6 +23,7 @@ from diffusers.modular_pipelines.modular_pipeline import PipelineState  # noqa: 
 
 from cozy_runtime.author import InvalidRequest  # noqa: E402
 from cozy_runtime.models.minimax_h3.continuation import (  # noqa: E402
+    SEAM_FRAMES,
     AVContext,
     CompletedTail,
     ContextReferenceLayout,
@@ -51,6 +52,7 @@ def context(frames: int = 56, end: int = 262, windows: tuple[int, ...] = (22, 39
 def test_delivery_clock_charges_context_without_delivering_it(prefix: int, sampled: int) -> None:
     plan = plan_continuation(240, context_frames=prefix)
     assert plan.sample_frames == sampled
+    assert plan.held_frames == sampled  # the context is the window's head, held once
     assert plan.delivery_end - plan.delivery_start == 240
     start, end = audio_sample_range(plan.delivery_start, plan.delivery_end, 32000)
     assert end - start == 320000
@@ -124,14 +126,59 @@ def test_streaming_tail_comes_from_delivered_end_not_sample_padding(prefix: int)
     assert tail.frames[-1, 0, 0, 0] != round((plan.sample_frames - 1) / 400 * 255)
 
 
+def test_delivered_frames_continue_the_predecessors_colour_at_the_seam() -> None:
+    """The decoded head reads 0.40 where the predecessor delivered 0.41 (G 0.30 vs 0.33):
+    every delivered frame shifts by that difference, the head is never delivered, and a
+    context from an older producer (no seam colour) changes nothing."""
+    plan = plan_continuation(120, context_frames=56)
+
+    def stream(seam: tuple[float, float, float] | None) -> tuple[CompletedTail, torch.Tensor]:
+        collector = CompletedTail(plan, seam)
+        parts = []
+        for first in range(0, plan.sample_frames, 13):  # chunks straddle the head's end
+            count = min(13, plan.sample_frames - first)
+            chunk = torch.empty(count, 3, 4, 8)
+            chunk[:, 0], chunk[:, 1], chunk[:, 2] = 0.40, 0.30, 0.20
+            chunk[:, :, 0, 0] = torch.arange(first, first + count).float()[:, None] / 1000
+            parts.append(collector.push(chunk))
+        collector.finish()
+        return collector, torch.cat(parts)
+
+    collector, delivered = stream((0.41, 0.33, 0.20))
+    assert len(delivered) == 120 and SEAM_FRAMES == 8
+    # One of each frame's 32 pixels carries its index: the head's last eight are frames 48-55.
+    head = torch.tensor([0.40, 0.30, 0.20]) * 31 / 32 + torch.arange(48, 56).float().mean() / 32000
+    assert torch.allclose(collector.offset, torch.tensor([0.41, 0.33, 0.20]) - head, atol=1e-6)
+    base = torch.tensor([0.40, 0.30, 0.20])
+    assert torch.allclose(delivered[:, :, 1:, 1:].mean(dim=(0, 2, 3)), base + collector.offset)
+    assert torch.allclose(delivered[0, :, 0, 0], 0.056 + collector.offset, atol=1e-6)
+    untouched, plain = stream(None)
+    assert untouched.offset is None and torch.equal(plain[:, :, 1:, 1:], torch.tensor(
+        [0.40, 0.30, 0.20]).view(1, 3, 1, 1).expand(120, 3, 3, 7))
+
+
+def test_seam_colour_survives_the_carrier_and_selection() -> None:
+    ctx = AVContext(
+        context().windows, 32, 64, 262, "model-and-inference-v1", 56, seam_rgb=(0.4, 0.3, 0.2)
+    )
+    decoded = decode_context(encode_context(ctx))
+    assert decoded.seam_rgb == (0.4, 0.3, 0.2) and decoded.select(22).seam_rgb == (0.4, 0.3, 0.2)
+    assert decode_context(encode_context(context())).seam_rgb is None
+
+
 @pytest.mark.parametrize("frames", [22, 39, 56])
-def test_native_context_layout_preserves_refs_and_every_scheduler_step(frames: int) -> None:
+def test_context_is_the_frozen_head_of_one_window(frames: int) -> None:
+    """One copy: the tail's video latents are the target's first latents, held at the anchors'
+    level for every step; its audio stays condition rows ending at the head's end tick."""
     from diffusers import MiniMaxH3Scheduler
     from diffusers.modular_pipelines.minimax_h3 import MiniMaxH3ImageReference
     from diffusers.modular_pipelines.minimax_h3.before_denoise import (
         MiniMaxH3Ref2VAPrepareLayoutStep,
+        patchify_video_latents,
     )
     from diffusers.modular_pipelines.minimax_h3.denoise import MiniMaxH3LoopSchedulerStep
+
+    from cozy_runtime.models.minimax_h3.official import _freeze_context_prefix
 
     ctx = context(frames)
     latent_frames = 5 * ((frames - 5) // 17) + 2
@@ -140,57 +187,63 @@ def test_native_context_layout_preserves_refs_and_every_scheduler_step(frames: i
         MiniMaxH3ImageReference(image=np.zeros((32, 64, 3), dtype=np.uint8)),
         ContextReferenceLayout(),
     ]
-    conditions = [torch.zeros(1, 24, 1, 2, 4), torch.zeros(1, 24, latent_frames, 2, 4)]
+    conditions = [torch.zeros(1, 24, 1, 2, 4)]
     audios = [torch.zeros(2 * ticks, 32)]
     packed = MiniMaxH3Ref2VAPrepareLayoutStep.build_ref2va_packed_sequence(
         torch.ones(3, dtype=torch.long), refs, conditions, audios, 20, 2, 4, 120, (1, 2, 2), 2, 2, 0
     )
     positions, _tags, video, audio, text, cv, ca = packed
+    assert cv == 2  # the image only: the context adds no video rows
     before = positions.clone()
-    state = SimpleNamespace(
-        position_ids=positions,
-        video_indices=video,
-        audio_indices=audio,
-        text_indices=text,
-        condition_latents=conditions,
-        audio_condition_latents=audios,
-        num_condition_video_rows=cv,
-        num_condition_audio_rows=ca,
-    )
-    align_context_rows(state, ctx, (1, 2, 2))
-    assert torch.equal(positions[video[:2]], before[video[:2]])
-    assert torch.equal(positions[video[cv:]], before[video[cv:]])
-    assert torch.equal(positions[text], before[text])
-    origin = positions[video[cv], 0]
-    offsets = []
-    cursor = 0
-    for i in range(latent_frames):
-        offsets.extend([cursor * 5 / 3] * 2)
-        cursor += (1, 4, 4, 4, 4)[i % 5]
-    assert torch.allclose(
-        positions[video[2:cv], 0],
-        origin + torch.tensor(offsets, dtype=torch.float64),
-        rtol=0,
-        atol=1e-12,
-    )
-    assert torch.equal(
-        positions[audio[:ca], 0], origin + torch.arange(ticks, dtype=torch.float64).repeat(2)
-    )
     sched = MiniMaxH3Scheduler(shift=12.0)
     audio_sched = MiniMaxH3Scheduler(shift=3.0)
     sched.set_timesteps(9)
     audio_sched.set_timesteps(9)
-    state.latents = torch.ones(len(video), 96)
-    state.audio_latents = torch.ones(len(audio), 32)
-    state.noise_pred = torch.full((1, len(video), 96), 0.25)
-    state.audio_noise_pred = torch.full((1, len(audio), 32), 0.25)
-    state.audio_timesteps = audio_sched.timesteps
+    state = PipelineState()
+    for key, value in dict(
+        position_ids=positions,
+        video_indices=video,
+        audio_indices=audio,
+        text_indices=text,
+        audio_condition_latents=audios,
+        num_condition_video_rows=cv,
+        num_condition_audio_rows=ca,
+        latents=torch.ones(len(video), 96),
+        audio_latents=torch.ones(len(audio), 32),
+        noise_pred=torch.full((1, len(video), 96), 0.25),
+        audio_noise_pred=torch.full((1, len(audio), 32), 0.25),
+        timesteps=sched.timesteps,
+        audio_timesteps=audio_sched.timesteps,
+        generator=torch.Generator().manual_seed(7),
+    ).items():
+        state.set(key, value)
+    align_context_rows(state, ctx)
+    assert torch.equal(positions[video], before[video])
+    assert torch.equal(positions[text], before[text])
+    origin = positions[video[cv], 0]
+    assert torch.equal(
+        positions[audio[:ca], 0], origin + torch.arange(ticks, dtype=torch.float64).repeat(2)
+    )
+    pipe = SimpleNamespace(scheduler=sched, keyframe_noise_aug=0.999, patch_size=(1, 2, 2))
+    frozen = _freeze_context_prefix(pipe, state, ctx)
+    assert frozen == latent_frames * 2
+    head = state.latents[cv : cv + frozen].clone()
+    noise = torch.randn(ctx.video_latents.shape, generator=torch.Generator().manual_seed(7))
+    expected = patchify_video_latents(0.999 * ctx.video_latents + 0.001 * noise, (1, 2, 2))
+    assert torch.allclose(head, expected, atol=1e-6)
+    plan = [unique[index] for unique, index in state.row_timestep_plan]
+    assert all(bool(torch.all(p[video[: cv + frozen]] == max(float(t), 0.999)))
+               for p, t in zip(plan, sched.timesteps, strict=True))
+    assert all(bool(torch.all(p[video[cv + frozen :]] == float(t)))
+               for p, t in zip(plan, sched.timesteps, strict=True))
     components = SimpleNamespace(scheduler=sched, audio_scheduler=audio_sched)
+    block = SimpleNamespace(**state.values)
     for index, timestep in enumerate(sched.timesteps):
-        MiniMaxH3LoopSchedulerStep()(components, state, i=index, t=timestep)
-        assert torch.equal(state.latents[:cv], torch.ones(cv, 96))
-        assert torch.equal(state.audio_latents[:ca], torch.ones(ca, 32))
-    assert not torch.equal(state.latents[cv:], torch.ones_like(state.latents[cv:]))
+        MiniMaxH3LoopSchedulerStep()(components, block, i=index, t=timestep)
+        assert torch.equal(block.latents[: cv + frozen], torch.cat([torch.ones(cv, 96), head]))
+        assert torch.equal(block.audio_latents[:ca], torch.ones(ca, 32))
+    generated = block.latents[cv + frozen :]
+    assert not torch.equal(generated, torch.ones_like(generated))
 
 
 def test_export_encodes_only_the_named_windows_of_the_landed_tail() -> None:
