@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import importlib.metadata
 import inspect
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -204,6 +205,11 @@ def run(seed: int) -> dict[str, Any]:
             for n in ["cozy-runtime", "tensorfs", "torch", "triton"]
         },
         "device": torch.cuda.get_device_name(),
+        "device_uuid": str(getattr(torch.cuda.get_device_properties(), "uuid", "")),
+        "current_device_index": torch.cuda.current_device(),
+        "visible_gpu_count": torch.cuda.device_count(),
+        "pid": os.getpid(),
+        "driver": accel.driver_version(),
         "capability": [9, 0],
         "shape": [1, N, H, D],
         "registered_dense": dense.name,
