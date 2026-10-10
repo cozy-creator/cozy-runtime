@@ -191,8 +191,9 @@ from cozy_runtime.internal.executor_commands import (
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.lora_composition import bind as bind_adapters
 from cozy_runtime.internal.lora_contract import read as read_adapter_graph
-from cozy_runtime.internal.parallel import cp, mirror, wire
+from cozy_runtime.internal.parallel import copy_engine, cp, links, mirror, wire
 from cozy_runtime.internal.parallel.group import (
+    ROUTED,
     RankGroup,
     RankSpec,
     abort_process_group,
@@ -257,7 +258,11 @@ def _env_changes() -> tuple[str, ...]:
     imposition moved without leaking paths or future secret-bearing values into a terminal.
     """
     current = seal_snapshot()
-    return tuple(name for name in sorted(_SEALED) if current.get(name, "") != _SEALED[name])
+    return tuple(
+        name
+        for name in sorted(_SEALED)
+        if current.get(name, "") != _SEALED[name] and name not in ROUTED
+    )
 
 
 def _sealed_entries() -> tuple[str, ...]:
@@ -267,6 +272,18 @@ def _sealed_entries() -> tuple[str, ...]:
         for entry in _SEALED.get("CUDA_VISIBLE_DEVICES", "").split(",")
         if entry.strip()
     )
+
+
+def _links_directory() -> Path | None:
+    """Measured links live beside the kernels: one machine's, kept across its executors."""
+    own = _SEALED.get(kernel_cache.OWN_ENV, "").strip()
+    return Path(own) / "links" if own and Path(own).is_absolute() else None
+
+
+def _gpu_numbers(degree: int) -> list[int]:
+    """The group's GPUs as nvidia-smi numbers them, from the seal's entries."""
+    entries = _sealed_entries()[:degree]
+    return [execution_evidence.identify(entry)["gpu"] for entry in entries]
 
 
 def _gpu(rank: int) -> str:
@@ -582,6 +599,8 @@ class Executor:
         self.pg: Any = None
         #: HOST ONLY: the group's handle as every installed component reads it (`CpComms`)
         self.comms: cp.CpComms | None = None
+        #: rank 0 only: the measured links and route this group formed over
+        self.transport: links.Transport | None = None
         #: a follower's watcher aborted its collectives; cleared when the group forms again
         self._interrupted = threading.Event()
         #: a follower's stage methods of the group call that last ran out of memory
@@ -867,9 +886,11 @@ class Executor:
                 )
                 ranks.append({**row, "attention": {**row["attention"], "requested": pin}})
         facts = self.facts
+        transport = self.host.transport
         return {
             "degree": self.world,
             "ranks": ranks,
+            **({"transport": transport.document()} if transport is not None else {}),
             # per spread method: the calls each rank ran, and why a rank declined
             "spread": dict(self.group.spread_log) if self.group is not None else {},
             "executor": dict(self.host.boot),
@@ -924,6 +945,7 @@ class Executor:
             world=self.world,
             port=command.port,
             backend=command.backend or "nccl",
+            nccl=dict(command.nccl),
         )
         if spec.backend == "nccl":
             # This rank's card becomes current HERE, through the one init boundary: the
@@ -947,12 +969,26 @@ class Executor:
         if self.comms is not None:
             self.comms.pg = self.pg
         reply = {"ok": True, "rank": self.rank, "world": self.world, "backend": spec.backend}
+        if command.calibrate:
+            exchange, reply["calibration"] = copy_engine.calibrate(
+                torch, self.pg, self.rank, self.world
+            )
+            copy_engine.install(exchange, self.pg)
         if command.room >= 0:
             try:
                 reply["freed"] = self._group_room(command.room, self._rerun_methods)
             except ResidencyRefusal as exc:
                 return {"ok": False, "code": exc.code, "detail": str(exc)[:900]}
         return reply
+
+    def _calibrated(self, pg: Any) -> None:
+        """Rank 0's half of the formation's calibration: NCCL against the copy engines."""
+        assert self.transport is not None
+        exchange, self.transport.calibration = copy_engine.calibrate(
+            self.torch, pg, 0, self.world
+        )
+        copy_engine.install(exchange, pg)
+        self.transport.route = "copy-engine" if exchange is not None else "nccl"
 
     def _watch_abort(self, watcher: socket.socket) -> None:
         """A follower's collectives end when rank 0 says so (`RankGroup.interrupt`): its main
@@ -981,7 +1017,11 @@ class Executor:
         assert self.group is not None and self.torch is not None
         weights = self.host.weights
         gave = self._group_room(need, [m for _, m, _ in weights.open] if weights else ())
-        self.host.pg = self.group.form(self.torch, _SEALED, room=need)
+        transport = self.host.transport
+        recalibrate = transport is not None and transport.links.all_direct
+        self.host.pg = self.group.form(
+            self.torch, _SEALED, room=need, formed=self.host._calibrated if recalibrate else None
+        )
         if self.host.comms is not None:
             self.host.comms.pg = self.host.pg
         return gave + self.group.gave
@@ -1520,9 +1560,22 @@ class Executor:
                             code="group_unformed",
                         )
                 if not command.import_only:
+                    measured = links.measured(
+                        _links_directory(), _SEALED.get("CUDA_VISIBLE_DEVICES", ""), degree
+                    )
+                    stage("group_links")
+                    self.transport = links.Transport(
+                        degree, _gpu_numbers(degree), "nccl", measured.nccl(), measured
+                    )
                     cells = self._rank_cells() if command.rank_cells else []
                     try:
-                        self.pg = self.group.form(self.torch, _SEALED, cells)
+                        self.pg = self.group.form(
+                            self.torch,
+                            _SEALED,
+                            cells,
+                            nccl=self.transport.nccl,
+                            formed=self._calibrated if measured.all_direct else None,
+                        )
                     finally:
                         for fd in cells:
                             os.close(fd)
