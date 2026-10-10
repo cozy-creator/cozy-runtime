@@ -73,7 +73,7 @@ def test_sdk_seeded_bind_refills_its_base_before_one_forward(
             {"value": control},
             down,
             up,
-            generator=torch.Generator().manual_seed(zlib.crc32(names[0].encode())),
+            seed=zlib.crc32(names[0].encode()),
         )
         expected = torch.nn.functional.linear(value, control) + 1
     calls, refills = [], []
@@ -90,14 +90,14 @@ def test_sdk_seeded_bind_refills_its_base_before_one_forward(
         lora_bake, "_bf16_either" if fault == "rounding" else "bake", fail_after_sdk_work
     )
 
-    def refill(_component: Any, held: Region) -> None:
+    def refill(_component: Any, held: list[Region]) -> None:
         # Native refill is the only I/O boundary here. The actual _restore is called and
         # only this region's owned source bytes/bake flags change, never Python state/RNG.
-        assert held is region and held.dirty
+        assert held == [region] and region.dirty
         refills.append(1)
         with torch.utils._python_dispatch._disable_current_modes():
             tensor.copy_(base)
-        source._unbaked(held)
+        source._unbaked(region)
 
     monkeypatch.setattr(weights, "refill", refill)
     outer = None

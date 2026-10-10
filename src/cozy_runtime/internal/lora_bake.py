@@ -5,22 +5,35 @@ row chunk at a time, so nothing larger than a chunk exists twice. Plain floats r
 their dtype. `fp8-rowwise/1` and `mxfp8/1` re-encode E4M3; the rounding is chosen because a
 delta below half a grid step vanishes under nearest rounding. `Stats` is what a quality gate
 reads: how much of the delta survived and how much rounding error the bake added.
+
+On a GPU, `bake` is one fused Triton kernel per weight (`_bake_kernel`): it reads each stored
+byte once, adds the rank-r product computed in its tile, rounds and writes the byte back, with
+counter-based noise (one stream per weight, by element index). The eager row-chunk functions
+are its reference on CPU and what `Stats` measures.
 """
 
 from __future__ import annotations
 
 import math
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Literal
 
 from cozy_runtime.internal.encoding import E4M3_MAX, E8M0_BIAS, MX_BLOCK
+
+try:
+    import triton
+    import triton.language as tl
+except ImportError:  # a host without Triton bakes eagerly
+    triton = None
 
 Strategy = Literal["bake", "per_step"]
 
 #: Names this module's bake to other executors: the same factors and scales baked by the same
 #: rule are the same bytes (one seed per weight). Changed whenever the bytes a bake writes do.
-VARIANT = "cozy.lora-bake/1"
+VARIANT = "cozy.lora-bake/2"
 Rounding = Literal["nearest", "stochastic", "feedback"]
 ROUNDINGS: tuple[Rounding, ...] = ("nearest", "stochastic", "feedback")
 #: A rowwise row's scale after a bake: unchanged, what its new maximum needs, or that moved
@@ -375,13 +388,19 @@ def bake(
     down: Any,
     up: Any,
     *,
-    generator: Any = None,
+    seed: int,
     stats: Stats | None = None,
 ) -> None:
     """Bake `up @ down` into one stored weight by its roles: plain floats, `fp8-rowwise/1`
     (E4M3 data, f32 row scale) or `mxfp8/1` (E4M3 data, E8M0 block grid). bf16 and E4M3 round
     stochastically, scales kept: nearest returns a small delta to where it was, and loses
-    most of a LoRA's effect on fp8 (MEASURE.md, cozy-machine #26)."""
+    most of a LoRA's effect on fp8 (MEASURE.md, cozy-machine #26). `seed` names the weight's
+    noise. A GPU bakes fused unless `stats` are asked for (the eager reference measures them)."""
+    device = next(iter(stored.values())).device
+    if stats is None and device.type == "cuda" and FUSED_ERROR is None:
+        fused(torch, stored, down, up, seed)
+        return
+    generator = torch.Generator(device=device).manual_seed(seed & SEED_MASK)
     if set(stored) == {"value"}:
         weight = stored["value"]
         rounding: Rounding = "stochastic" if weight.dtype == torch.bfloat16 else "nearest"
@@ -422,3 +441,138 @@ def accumulate(torch: Any, x: Any, out: Any, down: Any, up: Any, alpha: float) -
     flat, rows = out.view(-1, out.shape[-1]), x.reshape(-1, x.shape[-1])
     low = torch.nn.functional.linear(rows, down.to(rows.dtype))
     flat.addmm_(low.to(flat.dtype), up.to(flat.dtype).t(), alpha=alpha)
+
+
+# ----------------------------------------------------------------------------- fused bake
+
+#: Stored forms the fused kernel bakes (`bakeable`): bf16 (stochastic), f16 and f32 (nearest),
+#: `fp8-rowwise/1` and `mxfp8/1` (E4M3, stochastic, scales kept).
+BF16, F16, F32, ROWWISE, MX = range(5)
+#: A seed is 31 bits: one Triton signature for every weight.
+SEED_MASK = 0x7FFFFFFF
+_TILE = 64
+_INNER = 16
+#: Why this process bakes eagerly on its GPU, or None (`warm`).
+FUSED_ERROR: str | None = None if triton is not None else "triton does not import"
+
+
+def form(roles: dict[str, str]) -> int:
+    """The fused kernel's form of a `bakeable` stored weight (role -> TensorFS dtype)."""
+    if set(roles) == {"value"}:
+        return {"bf16": BF16, "f16": F16, "f32": F32}[roles["value"]]
+    return ROWWISE if roles["scale"] == "f32" else MX
+
+
+def fused(torch: Any, stored: dict[str, Any], down: Any, up: Any, seed: int) -> None:
+    """`bake`, one kernel launch: each tile adds its `up @ down` (f32) to the decoded stored
+    values and rounds them back in place."""
+    if "value" in stored:
+        data = scale = stored["value"]
+        kind = {torch.bfloat16: BF16, torch.float16: F16, torch.float32: F32}[data.dtype]
+    else:
+        data, scale = stored["data"].view(torch.uint8), stored["scale"]
+        kind = ROWWISE if scale.dtype == torch.float32 else MX
+        scale = scale.reshape(-1) if kind == ROWWISE else scale.view(torch.uint8)
+    if not data.is_contiguous():
+        raise ValueError("a fused bake writes a contiguous [out, in] weight")
+    rows, cols = data.shape
+    factors = (up.to(torch.float32).contiguous(), down.to(torch.float32).contiguous())
+    grid = (triton.cdiv(rows, _TILE), triton.cdiv(cols, _TILE))
+    _bake_kernel[grid](
+        data, scale, *factors, rows, cols, down.shape[0], seed & SEED_MASK,
+        FORM=kind, TILE=_TILE, INNER=_INNER,
+    )  # fmt: skip
+
+
+def warm(torch: Any, device: Any, forms: Iterable[int]) -> None:
+    """Compile the fused bake of each stored form for `device` now (at load), so no request
+    compiles it. A kernel that does not build leaves this process baking eagerly, recorded in
+    `FUSED_ERROR`."""
+    global FUSED_ERROR
+    if FUSED_ERROR is not None:
+        return
+    zeros = partial(torch.zeros, device=device)
+    for kind in sorted(set(forms)):
+        if kind in (ROWWISE, MX):
+            scale = zeros(1) + 1 if kind == ROWWISE else zeros((1, 1), dtype=torch.uint8) + 127
+            stored = {"data": zeros((1, 32), dtype=torch.float8_e4m3fn), "scale": scale}
+        else:
+            dtype = (torch.bfloat16, torch.float16, torch.float32)[kind]
+            stored = {"value": zeros((1, 32), dtype=dtype)}
+        try:
+            fused(torch, stored, zeros((1, 32)), zeros((1, 1)), 0)
+        except Exception as exc:
+            FUSED_ERROR = f"{type(exc).__name__}: {exc}".splitlines()[0][:300]
+            return
+
+
+#: Never specialized on a value or an address's alignment: one compiled kernel per form serves
+#: every weight wherever it lies.
+_VALUES, _ADDRESSES = ["rows", "cols", "rank", "seed"], ["data", "scale", "up", "down"]
+
+if triton is not None:
+
+    @triton.jit
+    def _decode_e4m3(code):  # type: ignore[no-untyped-def]
+        """E4M3 bytes (int32) -> f32; the two reserved codes saturate to their signed maximum."""
+        field = (code >> 3) & 15
+        mantissa = (code & 7).to(tl.float32)
+        normal = (mantissa + 8.0) * ((field + 117) << 23).to(tl.float32, bitcast=True)
+        magnitude = tl.where(field == 0, mantissa * 0.001953125, normal)
+        magnitude = tl.where((code & 127) == 127, 448.0, magnitude)
+        return tl.where(code > 127, -magnitude, magnitude)
+
+    @triton.jit
+    def _stochastic_e4m3(payload, noise):  # type: ignore[no-untyped-def]
+        """f32 payload -> E4M3 bytes (int32), saturating at 448. 20 random bits are added below
+        the three kept mantissa bits and the rest truncated: a value rounds up with the
+        probability of the distance it covered. Below 2^-6 the grid steps by 2^-9, the normal
+        grid of [2^-6, 2^-5) lowered by 2^-6: such a value is lifted into it and lowered back."""
+        magnitude = tl.minimum(tl.abs(payload), 448.0)
+        small = magnitude < 0.015625
+        lifted = tl.where(small, magnitude + 0.015625, magnitude)
+        kept = ((lifted.to(tl.uint32, bitcast=True) + (noise >> 12)) >> 20).to(tl.int32)
+        code = kept - tl.where(small, 968, 960)  # (f32 exponent - 120) << 3 | mantissa
+        return tl.where(payload < 0, code | 128, code)
+
+    @triton.jit(  # type: ignore[untyped-decorator]
+        do_not_specialize=_VALUES, do_not_specialize_on_alignment=_ADDRESSES
+    )
+    def _bake_kernel(  # type: ignore[no-untyped-def]
+        data, scale, up, down, rows, cols, rank, seed,
+        FORM: tl.constexpr, TILE: tl.constexpr, INNER: tl.constexpr,
+    ):  # fmt: skip
+        row = (tl.program_id(0) * TILE + tl.arange(0, TILE)).to(tl.int64)
+        col = (tl.program_id(1) * TILE + tl.arange(0, TILE)).to(tl.int64)
+        delta = tl.zeros((TILE, TILE), dtype=tl.float32)
+        for start in range(0, rank, INNER):
+            inner = start + tl.arange(0, INNER)
+            a = tl.load(
+                up + row[:, None] * rank + inner[None, :],
+                mask=(row[:, None] < rows) & (inner[None, :] < rank),
+                other=0.0,
+            )
+            b = tl.load(
+                down + inner[:, None] * cols + col[None, :],
+                mask=(inner[:, None] < rank) & (col[None, :] < cols),
+                other=0.0,
+            )
+            delta += tl.dot(a, b, input_precision="ieee")
+        at = row[:, None] * cols + col[None, :]
+        inside = (row[:, None] < rows) & (col[None, :] < cols)
+        noise = tl.randint(seed, at.to(tl.uint32))
+        if FORM >= 3:  # E4M3: ROWWISE (3) or MX (4)
+            if FORM == 3:
+                unit = tl.load(scale + row, mask=row < rows, other=1.0)[:, None]
+            else:
+                byte = tl.load(scale + row[:, None] * (cols // 32) + col[None, :] // 32, inside, 1)
+                unit = (tl.maximum(byte.to(tl.int32), 1) << 23).to(tl.float32, bitcast=True)
+            code = tl.load(data + at, mask=inside, other=0).to(tl.int32)
+            payload = _decode_e4m3(code) + delta / unit
+            tl.store(data + at, _stochastic_e4m3(payload, noise).to(tl.uint8), mask=inside)
+        else:
+            value = tl.load(data + at, mask=inside, other=0.0).to(tl.float32) + delta
+            if FORM == 0:  # BF16
+                kept = (value.to(tl.uint32, bitcast=True) + (noise >> 16)) >> 16 << 16
+                value = kept.to(tl.float32, bitcast=True)
+            tl.store(data + at, value.to(data.dtype.element_ty), mask=inside)

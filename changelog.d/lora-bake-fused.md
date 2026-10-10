@@ -1,0 +1,1 @@
+A GPU LoRA bake is one fused Triton kernel per weight (compiled at load, `modes.lora_bake`), timed by CUDA events instead of a device sync per region. A forward that first wants a DiT baked bakes its whole resident set before its first block; one that finds it baked for another overlay refills every stale region in one placement. Baked bytes are variant `cozy.lora-bake/2`.
