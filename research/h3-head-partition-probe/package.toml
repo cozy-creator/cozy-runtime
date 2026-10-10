@@ -1,0 +1,2 @@
+[application]
+object = "head_partition_probe:app"
