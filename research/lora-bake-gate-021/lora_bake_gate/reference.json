@@ -1,6 +1,0 @@
-{
-  "source": "cozy_runtime/internal/lora_bake.py",
-  "donor_wheel_sha256": "bde257fe239fdbecab61d0618a544ae08c266b20915f37a7f323210548052310",
-  "module_sha256": "393ab911808dc9a4621805bf5d5cbcc23ace45610a463ca1670f3be075134051",
-  "purpose": "Immutable original-helper reference for an equivalence test, never a serving fallback"
-}

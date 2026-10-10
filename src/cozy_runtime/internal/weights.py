@@ -1039,15 +1039,17 @@ class Weights:
                 self._release_shared(component, [i for i in dropped if i in component.shared])
                 self.plane.drop(component.ws, self.index, dropped)
 
-    def refill(self, component: Component, region: Region) -> None:
-        """Drop a region's resident bytes (it is unleased): its next placement copies the
+    def refill(self, component: Component, regions: Sequence[Region]) -> None:
+        """Drop regions' resident bytes (they are unleased): their next placement copies the
         unmodified host bytes again. Bytes mapped from the machine's custody are let go."""
-        unbind(region)
+        for region in regions:
+            unbind(region)
         self.quiesce()
-        if region.index in component.shared:
-            self._release_shared(component, [region.index])
-        else:
-            self.plane.drop(component.ws, self.index, [region.index])
+        self._release_shared(component, [r.index for r in regions if r.index in component.shared])
+        own = [r for r in regions if r.index not in component.shared]
+        if own:
+            self.plane.drop(component.ws, self.index, [r.index for r in own])
+        for region in own:
             _unbaked(region)
 
     def revoke(self, layout: str, regions: Collection[int] = ()) -> int:
@@ -1280,7 +1282,7 @@ class Weights:
             disk_read_bytes=held.host.disk_read_bytes,
             sealed_bytes=held.host.sealed_bytes,
             lora_baked=int(BAKED[0]),
-            lora_bake_ms=round(BAKED[1], 1),
+            lora_bake_ms=round(_bake_ms(), 1),
             lora_attached=int(BAKED[2]),
             late=sum(row.late for row in stages),
             stall_ns=sum(row.stall_ns for row in stages),
@@ -1320,11 +1322,11 @@ class _HostSpan:
 
 def bind(
     torch: ModuleType, region: Region, lease: Lease | _HostSpan, *, refill: bool = False
-) -> None:
+) -> bool:
     """Point the region's destinations at the lease's bytes: its home while resident, its place
     in the stage's ring while streamed. Views are cached by address (ring placements repeat
     with the window); decoded tensors and derived leaf roles are recomputed whenever the bytes
-    moved or were streamed in again."""
+    moved or were streamed in again. Returns whether it baked resident bytes (`_bake`)."""
     address = int(lease.ptr)
     views = region.views.get(address)
     if views is None:
@@ -1350,11 +1352,13 @@ def bind(
                 value = torch.nn.Parameter(tensor, requires_grad=False)
                 views.writes[i] = (table, name, tensor, value)
             table[name] = value
-    if region.bakes:
-        _bake(torch, region, views.parts, lease.ring_offset is None, refill)
+    baked = bool(region.bakes) and _bake(
+        torch, region, views.parts, lease.ring_offset is None, refill
+    )
     if region.transforms and (moved or lease.ring_offset is not None):
         region.derived = _transform(torch, region, views.parts)
     region.bound = address
+    return baked
 
 
 _UNBOUND: dict[int, type] = {}
@@ -1775,7 +1779,7 @@ def _bake(
     parts: list[dict[str, Tensor]],
     home: bool,
     refill: bool,
-) -> None:
+) -> bool:
     """Add each LoRA'd linear's delta into the region's bytes before any decode reads them;
     its update then skips. Resident bytes are baked the first time they are placed. A
     streamed copy is a fresh copy of the stored bytes at every acquire (each cursor position
@@ -1785,46 +1789,72 @@ def _bake(
     Resident bytes holding a delta the coming forward does not want (a base forward of a DiT
     baked for its turbo overlay, or another overlay), or left half baked by a failure, raise
     `_Stale` where the caller can refill them (`refill`, a block's own lease); elsewhere the
-    read sees the bytes as they are."""
+    read sees the bytes as they are. Returns whether it baked resident bytes now."""
     keys = [_bake_key(bake) for bake in region.bakes]
     some = region.bake and any(key is not None for row in keys for key in row)
-    if home and region.attached:
-        # Baked bytes from the machine's custody: this forward's own when its bake would be
-        # the same variant, else stale like a local bake it does not want. A placement ahead
-        # of its forward (no hook serves yet) leaves the question to that forward.
-        if some and _variant(region, keys) == region.attached:
-            region.baked_with, region.variant, region.attached = keys, region.attached, ""
-            BAKED[2] += len(region.bakes)
-        elif refill:
-            raise _Stale(region.index)
-    if not home:
-        if some:
+    if home and region.attached and some and _variant(region, keys) == region.attached:
+        # Baked bytes from the machine's custody, this forward's own: its bake would be the
+        # same variant. A placement ahead of its forward leaves the question to that forward.
+        region.baked_with, region.variant, region.attached = keys, region.attached, ""
+        BAKED[2] += len(region.bakes)
+    if home and refill and _stale(region, keys):
+        raise _Stale(region.index)
+    now = home and some and not region.baked
+    if now:
+        region.dirty = True  # until every weight is baked
+    if now or (some and not home):
+        with _timed(torch, parts):
             BAKED[0] += _apply(torch, region, parts, keys)
-        baked = some
-    else:
-        if refill and (region.dirty or (region.baked and keys != region.baked_with)):
-            raise _Stale(region.index)
-        if some and not region.baked:
-            region.dirty = True  # until every weight is baked
-            began = time.perf_counter()
-            BAKED[0] += _apply(torch, region, parts, keys)
-            if stored_device(parts[0]).type == "cuda":
-                torch.cuda.synchronize(stored_device(parts[0]))
-            BAKED[1] += (time.perf_counter() - began) * 1000
-            region.baked, region.baked_with, region.dirty = True, keys, False
-            region.variant = _variant(region, keys)
-        baked = region.baked and keys == region.baked_with
+    if now:
+        region.baked, region.baked_with, region.dirty = True, keys, False
+        region.variant = _variant(region, keys)
+    baked = region.baked and keys == region.baked_with if home else some
     for bake, (graph, *hooks) in zip(region.bakes, keys, strict=True):
         if bake.layer is not None:
             bake.layer._cozy_baked = baked and graph is not None
         for hook, key in zip(bake.hooks, hooks, strict=True):
             hook._cozy_baked = baked and key is not None
+    return now
 
 
-#: This process's bakes (one plane per process): weights baked, the milliseconds its resident
-#: bakes took (a streamed copy's bake is not timed: that would stall its stream), and weights
-#: whose baked bytes came from the machine's custody.
+def _stale(region: Region, keys: list[tuple[object, ...]]) -> bool:
+    """Whether a forward that bakes `keys` finds the region's resident bytes holding a delta it
+    does not want, or half of one. Baked bytes from the machine's custody are its own only when
+    its bake would be their variant."""
+    if region.attached:
+        some = region.bake and any(key is not None for row in keys for key in row)
+        return not (some and _variant(region, keys) == region.attached)
+    return region.dirty or (region.baked and keys != region.baked_with)
+
+
+@contextmanager
+def _timed(torch: ModuleType, parts: list[dict[str, Tensor]]) -> Iterator[None]:
+    """Count a bake's milliseconds into `BAKED`. On a GPU, events around it on its stream are
+    read when facts are (`_bake_ms`): timing never waits for the queue."""
+    if stored_device(parts[0]).type != "cuda":
+        began = time.perf_counter()
+        yield
+        BAKED[1] += (time.perf_counter() - began) * 1000
+        return
+    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    start.record()
+    yield
+    end.record()
+    _TIMED.append((start, end))
+
+
+def _bake_ms() -> float:
+    """`BAKED`'s milliseconds, with every bake the GPU has finished since the last read."""
+    while _TIMED and _TIMED[0][1].query():
+        start, end = _TIMED.popleft()
+        BAKED[1] += start.elapsed_time(end)
+    return BAKED[1]
+
+
+#: This process's bakes (one plane per process): weights baked, the GPU milliseconds the bakes
+#: took (resident and streamed), and weights whose baked bytes came from the machine's custody.
 BAKED: list[float] = [0, 0.0, 0]
+_TIMED: deque[tuple[Any, Any]] = deque()
 
 
 def _in_use(weights: Weights) -> set[str]:
@@ -1897,18 +1927,13 @@ def _apply(
         if not downs:
             continue
         count += 1
-        stored = parts[bake.weight]
         kind = downs[0].dtype
-        name = region.weights[bake.weight].row.name
-        generator = torch.Generator(device=stored_device(stored)).manual_seed(
-            zlib.crc32(name.encode())
-        )
         lora_bake.bake(
             torch,
-            stored,
+            parts[bake.weight],
             torch.cat([d.to(kind) for d in downs]),
             torch.cat([u.to(kind) for u in ups], dim=1),
-            generator=generator,
+            seed=zlib.crc32(region.weights[bake.weight].row.name.encode()),
         )
     return count
 
@@ -2600,6 +2625,17 @@ class PlaneBackend:
             region.bakes = _lora_layers(root, region)
             region.bake = _bakes_here(weights, component, region)
             region.locate = weights.content
+        forms = {
+            lora_bake.form({role: dtype for role, (_, dtype, _) in weight.parts.items()})
+            for region in regions
+            if region.bake
+            for weight in (region.weights[bake.weight] for bake in region.bakes)
+        }
+        if forms:  # its kernel builds now, at load: a request never compiles it
+            lora_bake.warm(self.torch, weights.device, forms)
+            weights.modes["lora_bake"] = (
+                "fused" if lora_bake.FUSED_ERROR is None else f"eager ({lora_bake.FUSED_ERROR})"
+            )
         if not fine:
             weights.attach(component)
         return component
@@ -3668,7 +3704,9 @@ class WeightResidency:
                         # The plane's bind and bake are its own math, outside the block's
                         # recovery: a bake that fails leaves the region dirty, and it refills.
                         with self._quiet():
-                            bind(torch, region, lease, refill=True)
+                            baked = bind(torch, region, lease, refill=True)
+                            if baked and region.index in component.resident:
+                                self._bake_resident(component)
                         weights.running.append(component.key)
                         weights.last = component.key
                         try:
@@ -3769,15 +3807,44 @@ class WeightResidency:
 
     def _restore(self, component: Component, region: Region) -> None:
         """Give a block the stored bytes again (its resident ones hold a delta its forward
-        does not want, or half of one): the open stages' cursors close (one may hold the
-        region in place), the region drops, and the stages are placed again from this block."""
+        does not want, or half of one), and with it every region of the component the same
+        forward would find so (a switch between a DiT's turbo and base forwards): one refill
+        and one placement, not one per block. The open stages' cursors close (one may hold a
+        region in place), the regions drop, and the stages are placed again from this block,
+        which bakes the resident set for this forward when it wants that."""
         weights = self.weights
         opened = [row for _, _, row in weights.opened().values()]
         for row in opened:
             close_cursor(row)
-        weights.refill(component, region)
+        stale = [
+            other
+            for other in component.regions
+            if other is region
+            or (
+                other is not component.common
+                and other.bakes
+                and _stale(other, [_bake_key(bake) for bake in other.bakes])
+            )
+        ]
+        weights.refill(component, stale)
         if opened:
             self._place(weights.applied, {component.key: region.index})
+
+    def _bake_resident(self, component: Component) -> None:
+        """A forward baked one of the component's stage-resident regions: bake the rest of the
+        set now, back to back before its block runs, rather than one per block through the
+        pass (a DiT's first turbo forward)."""
+        weights = self.weights
+        stream = weights.stream()
+        for index in component.resident:
+            region = component.regions[index]
+            if not region.bake or region.baked or region.bound is None:
+                continue
+            lease = weights.plane.acquire(component.ws, weights.index, index, stream)
+            try:
+                bind(weights.torch, region, lease)
+            finally:
+                lease.release()
 
     def _make_room(self, need: int, resume: Mapping[str, int] = {}, op: str = "") -> None:
         """Activations first: unmap `need` bytes of weights, idle ones first, then re-place the

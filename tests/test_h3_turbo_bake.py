@@ -165,6 +165,13 @@ def test_a_turbo_forward_bakes_and_a_base_forward_finds_the_bytes_refilled(
         assert all(r.bake is (device == "cuda") for r in baking)
         residency = WeightResidency(weights, backend.components, {"run": ("fl2va_dit",)})
         inputs = _inputs(device)
+        # What every LoRA'd linear finds when it runs: a switch between turbo and base bakes
+        # or refills the whole DiT before its first block, never one block at a time.
+        seen: set[tuple[bool, ...]] = set()
+        for path, _ in overlay.lora_sites():
+            dit.get_submodule(path).register_forward_pre_hook(
+                lambda *_: seen.add(tuple(r.baked for r in baking))
+            )
 
         def forward(model: Any, turbo: bool) -> tuple[list[Any], list[bool]]:
             selector = {ATTENTION_KWARG: TURBO_BANK, OVERLAY_KWARG: overlay} if turbo else {}
@@ -183,11 +190,13 @@ def test_a_turbo_forward_bakes_and_a_base_forward_finds_the_bytes_refilled(
         base_ref, _ = forward(reference, False)
         cuda = device == "cuda"
         for turbo in (True, False, True, False):
+            seen.clear()
             got, baked = forward(dit, turbo)
             want = turbo_ref if turbo else base_ref
             for g, w in zip(got, want, strict=True):
                 torch.testing.assert_close(g, w, rtol=1e-4, atol=1e-5)
             assert baked == [cuda and turbo] * len(hooks)
+            assert seen == {(cuda and turbo,) * len(baking)}
         assert not torch.equal(turbo_ref[0], base_ref[0])
     finally:
         backend.close()
