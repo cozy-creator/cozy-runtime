@@ -286,7 +286,7 @@ wheels = [
 ]
 
 [[package]]
-name = "h3-sage3-collective-probe"
+name = "h3-sage3-collective-2gpu-probe"
 version = "0.0.1"
 source = { editable = "." }
 dependencies = [

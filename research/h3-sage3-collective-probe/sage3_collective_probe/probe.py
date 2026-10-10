@@ -13,7 +13,7 @@ from pathlib import Path
 from . import fixed_means
 from .metrics import compared, operand_layout
 
-TOKENS, HEADS, DIM, DEGREE = 109225, 56, 128, 4
+TOKENS, HEADS, DIM, DEGREE = 109225, 56, 128, 2
 API_SHA = "9aec83f8d7165e3b563ba4fc91f6ca5e09b07ef3445b6db5d1105912e35dfb90"
 
 
@@ -46,7 +46,7 @@ def validate_rank_identities(rows):
             for row in rows
         )
     ):
-        raise RuntimeError("Probe requires four distinct granted SM120 ranks on its public SDK")
+        raise RuntimeError("Probe requires two distinct granted SM120 ranks on its public SDK")
 
 
 def capture(torch, api, values, candidate):
@@ -96,6 +96,111 @@ def time_call(torch, dist, handle, call):
     elapsed = time.perf_counter() - wall
     del value
     return {"cuda_ms": float(start.elapsed_time(stop)), "wall_ms": elapsed * 1000}
+
+
+def sensitivity_control(torch, api, handle, rank, seed):
+    """Two real two-rank exchanges with fourteen local heads; not four-rank transport.
+
+    Reproduce run5228's input generation (three contiguous draws from one generator),
+    while preserving all56heads/full109225tokens. No timing is reported for this control.
+    """
+    from cozy_runtime.internal import attention_ulysses
+
+    torch.cuda.reset_peak_memory_stats()
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    full = tuple(
+        torch.randn(1, TOKENS, HEADS, DIM, dtype=torch.bfloat16, device="cuda", generator=generator)
+        for _ in range(3)
+    )
+    start, stop = token_bounds(rank)
+    variants = []
+    for name, candidate in (("public", False), ("fixed_means", True)):
+        reference = capture(torch, api, full, candidate)
+        rounds = []
+        outputs = []
+        for offset in (0, 28):
+            hs, he = offset + rank * 14, offset + (rank + 1) * 14
+            local = tuple(x[:, start:stop, offset : offset + 28] for x in full)
+            observed = {}
+
+            def compute(
+                q,
+                k,
+                v,
+                *,
+                hs=hs,
+                he=he,
+                candidate=candidate,
+                reference=reference,
+                observed=observed,
+            ):
+                observed["received_layouts"] = [operand_layout(x) for x in (q, k, v)]
+                observed["qkv"] = {
+                    key: nhd_metric(torch, value, original[:, :, hs:he])
+                    for key, value, original in zip(("q", "k", "v"), (q, k, v), full, strict=True)
+                }
+                actual = capture(torch, api, (q, k, v), candidate)
+                observed["head_stages_vs_full"] = {
+                    key: compared(torch, value[0], reference[key][0, hs:he])
+                    for key, value in actual.items()
+                }
+                return actual["output"].transpose(1, 2).contiguous()
+
+            output = attention_ulysses.exchange(*local, handle, compute)
+            outputs.append(output)
+            rounds.append(
+                {"input_head_range": [offset, offset + 28], "rank_head_range": [hs, he], **observed}
+            )
+            del compute, output, local
+        reconstructed = torch.cat(outputs, dim=2)
+        output_metric = nhd_metric(
+            torch, reconstructed, reference["output"].transpose(1, 2)[:, start:stop]
+        )
+        variants.append(
+            {
+                "variant": name,
+                "rounds": rounds,
+                "output_vs_full_token_shard": output_metric,
+                "partition_exact": exact(output_metric)
+                and all(
+                    exact(metric)
+                    for row in rounds
+                    for metric in [*row["qkv"].values(), *row["head_stages_vs_full"].values()]
+                ),
+            }
+        )
+        del reconstructed, outputs, reference
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    unchanged = {}
+    for key, value in zip(("q", "k", "v"), full, strict=True):
+        regenerated = torch.randn(
+            value.shape, dtype=value.dtype, device=value.device, generator=generator
+        )
+        unchanged[key] = nhd_metric(torch, value, regenerated)
+        del regenerated
+    transport_and_inputs_exact = all(exact(x) for x in unchanged.values()) and all(
+        exact(metric)
+        for variant in variants
+        for row in variant["rounds"]
+        for metric in row["qkv"].values()
+    )
+    public_arithmetic_differs = not exact(variants[0]["output_vs_full_token_shard"]) or any(
+        not exact(metric)
+        for row in variants[0]["rounds"]
+        for metric in row["head_stages_vs_full"].values()
+    )
+    return {
+        "scope": "two real ranks, two28head batches, fourteen local heads; not four-rank coverage",
+        "fixture": "run5228 contiguous QKV draws; public mismatch is observed, not assumed",
+        "seed": seed,
+        "variants": variants,
+        "input_unchanged": unchanged,
+        "candidate_partition_exact": variants[1]["partition_exact"]
+        and all(exact(x) for x in unchanged.values()),
+        "transport_and_inputs_exact": transport_and_inputs_exact,
+        "public_difference_observed": transport_and_inputs_exact and public_arithmetic_differs,
+        "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
+    }
 
 
 def run(seed, handle):
@@ -153,7 +258,7 @@ def run(seed, handle):
         hs, he = rank * (HEADS // degree), (rank + 1) * (HEADS // degree)
         transport = {}
 
-        def identity(q, k, v):
+        def identity(q, k, v, *, full=full):
             transport["received_layouts"] = [operand_layout(x) for x in (q, k, v)]
             transport["qkv"] = {
                 name: nhd_metric(torch, x, ref[:, :, hs:he])
@@ -248,7 +353,7 @@ def run(seed, handle):
                             torch,
                             dist,
                             handle,
-                            lambda callback=callback: attention_ulysses.exchange(
+                            lambda callback=callback, local=local: attention_ulysses.exchange(
                                 *local, handle, callback
                             ),
                         ),
@@ -259,7 +364,12 @@ def run(seed, handle):
                         "variant": name,
                         "repetition": repetition,
                         "scope": "full_head_reference_no_collective",
-                        **time_call(torch, dist, handle, lambda callback=callback: callback(*full)),
+                        **time_call(
+                            torch,
+                            dist,
+                            handle,
+                            lambda callback=callback, full=full: callback(*full),
+                        ),
                     }
                 )
         regenerated = torch.randn(
@@ -270,6 +380,10 @@ def run(seed, handle):
         )
         input_unchanged = compared(torch, packed[0], regenerated[0])
         del regenerated
+        input_layouts = [operand_layout(x) for x in local]
+        primary_peak = torch.cuda.max_memory_allocated()
+        del packed, full, local, identity
+        sensitivity = sensitivity_control(torch, api, handle, rank, seed)
         report = {
             **identity_fields,
             "rank": rank,
@@ -282,13 +396,15 @@ def run(seed, handle):
             "group_global_ranks": dist.get_process_group_ranks(handle),
             "token_range": [start, stop],
             "head_range": [hs, he],
-            "input_layouts": [operand_layout(x) for x in local],
-            "packed_max_element_index": packed.numel() - 1,
+            "input_layouts": input_layouts,
+            "packed_max_element_index": TOKENS * HEADS * 3 * DIM - 1,
             "transport": transport,
             "input_unchanged": input_unchanged,
             "variants": variants,
             "timings": times,
-            "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
+            "sensitivity_control": sensitivity,
+            "primary_peak_allocated_bytes": primary_peak,
+            "peak_allocated_bytes": max(primary_peak, sensitivity["peak_allocated_bytes"]),
             "total_device_bytes": total,
             "elapsed_seconds": time.perf_counter() - begin,
             "source_sha256": {
@@ -309,8 +425,11 @@ def run(seed, handle):
             "candidate_partition_exact": all(
                 r["variants"][1]["partition_exact"] and exact(r["input_unchanged"]) for r in reports
             ),
+            "candidate_sensitivity_control_exact": all(
+                r["sensitivity_control"]["candidate_partition_exact"] for r in reports
+            ),
             "limits": [
-                "Fixed activations and real four-GPU Ulysses only; no H3 sampling or video claim.",
+                "Fixed activations and real two-GPU Ulysses only; no H3 sampling or video claim.",
                 "Three warm timing samples check regression; no default or generation-speed claim.",
             ],
         }

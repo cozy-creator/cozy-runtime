@@ -1,35 +1,31 @@
-# Four-GPU Ulysses correctness probe — preparation checkpoint
+# Two-GPU Ulysses correctness probe
 
-This research package is **not GPU-qualified**. Four-process CPU Gloo and ordinary CLI
-lock/capture/describe checks have passed. The exact same publicRuntime0.23.5/TensorFS0.6.1
-capture environment also passed the four-process CPU exchange. Paid execution requires
-the root owner’s explicit rental and run authorization.
+This research-only package preserves full [1,109225,56,128] BF16 activations and uses
+exactly two Runtime-granted RTX5090 ranks. The default rung and sequence_parallel
+both require2. The frozen four-GPU version remains at source0dfd6c29 and the separate
+h3-sage3-collective-correctness-20261010 output directory.
 
-It declares exactly four RTX 5090 GPUs through one Model rung and sequence_parallel(4),
-using the existing 133KB diagnostic checkpoint. Runtime mirrors the component forward and
-installs its explicit process group. The component generates fixed BF16 [1,109225,56,128]
-Q/K/V, takes unequal token shards [27307,27306,27306,27306], and calls the actual public
-Runtime attention_ulysses.exchange. An identity callback checks QKV head ownership and O
-inverse redistribution before attention. Full-head computation is a reference control;
-partitioned attention receives only each rank's14heads. Repeated exchanges, intermediate
-checks, candidate-versus-public differences, and three warm regression timing samples are
-recorded separately. No videos, H3 weights, attention-default changes, or promotion.
+Primary control: packed Q/K/V with a2,348,774,400element span, token splits54613/54612,
+28heads per actual exchanged callback, full-reference intermediate/output comparisons,
+repeat/inverse/input-immutability controls. A research-local copy of the reviewed int64
+fixed-means module preserves upstream BF16 matmul correction. Public Runtime0.23.5 and
+TensorFS0.6.1 are unchanged. Three warm timing samples compare only this ordinary
+single-pass two-GPU path; these are regression checks, not video generation times.
 
-The research-local fixed_means.py is copied unchanged from Runtime source checkpoint
-2f0a2ca7. Its input addressing uses int64 before stride multiplication. The full packed
-input spans2,348,774,400elements, exceeding signed int32. The public Runtime remains0.23.5;
-this package neither installs a private Runtime nor monkeypatches upstream modules.
+Sensitivity control: prior run5228's contiguous three-QKV generation, seed581204, showed
+an upstream difference at14heads per group but not at28. On these same two GPUs, two
+real exchanges of28input-head batches produce14local heads per callback and reconstruct
+all56heads. This is explicitly a two-pass numerical sensitivity control, not four-rank
+transport, and reports the observed mismatch rather than requiring it. Full geometry,
+precision, and seed are fixed. No seed search, videos, sampling, or quality-mode study.
 
-Execution prerequisites and retained limits:
+The133KB diagnostic checkpoint's ten tensors provide normal model admission; they are
+not used as activation operands. Required override:
 
-- ModelMixin/empty split-plan installation, explicit group binding and ten-tensor census
-  passed the CPU gate; the CLI interface declares only the dit component and exact4GPU rung.
-- CPU permutation gate passed on four processes at129/132tokens, using Runtime CpComms
-  and the actual unequal Diffusers QKV/O helpers. This does not qualify CUDA/full-shape attention.
-- Independent source reviews cover bounded memory, callbacks and failure propagation;
-  the actual report validates four distinct UUIDs/PIDs and all rank identities.
-- The invocation must pin `model.model=paul/attention-kernel-benchmark-20260916#sha256:61dc0e651cf6ab7744213611b6ee1cb4a4ba0b8dac5da8f165d950c2c91a04ca`.
-  Exact full geometry and seed remain unchanged; an8-minute caller deadline bounds the run.
-- Root grants any rental and the exclusive GPU invocation. No smaller replacement shape.
+    model.model=paul/attention-kernel-benchmark-20260916#sha256:61dc0e651cf6ab7744213611b6ee1cb4a4ba0b8dac5da8f165d950c2c91a04ca
 
-The earlier video/layout package is preserved separately and is not part of this request.
+The report validates distinct GPUUUIDs/PIDs and complete rank coverage, retains transport
+mismatch details before skipping attention, measures actual peak allocation, and reports
+primary and sensitivity-control outcomes separately. A normal CLI --timeout=8m --await
+invocation bounds work. Root owns rentals and must authorize execution after finalCPU,
+capture/describe, checkpoint-fit, and independent review proof. No defaults change.

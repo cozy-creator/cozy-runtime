@@ -47,7 +47,7 @@ def build(config: Config) -> Pipeline:
     return Pipeline()
 
 
-@sequence_parallel(degrees=(4,))
+@sequence_parallel(degrees=(2,))
 class ProbeModel(Model[Pipeline]):
     pipe: Pipeline
 

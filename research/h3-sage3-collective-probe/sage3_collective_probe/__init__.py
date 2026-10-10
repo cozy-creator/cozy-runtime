@@ -1,4 +1,4 @@
-"""Actual Runtime four-rank Ulysses correctness check, without video inference."""
+"""Actual Runtime two-rank Ulysses correctness check, without video inference."""
 
 from typing import Annotated
 
@@ -24,7 +24,7 @@ class Result(msgspec.Struct):
         "model": [
             {
                 "gpu": "RTX 5090",
-                "gpus": 4,
+                "gpus": 2,
                 "lane": "paul/attention-kernel-benchmark-20260916@1/model",
             }
         ]

@@ -10,7 +10,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from sage3_collective_probe.model import Pipeline, ProbeModel
-from sage3_collective_probe.probe import token_bounds
+from sage3_collective_probe.probe import DEGREE, HEADS, token_bounds
 
 from cozy_runtime.author._loader import census
 from cozy_runtime.internal import attention_ulysses
@@ -23,16 +23,16 @@ def worker(rank, rendezvous, folder):
         "cpu:gloo",
         init_method="file://" + rendezvous,
         rank=rank,
-        world_size=4,
+        world_size=DEGREE,
         timeout=datetime.timedelta(seconds=60),
     )
     handle = dist.new_group(
-        ranks=[0, 1, 2, 3], backend="cpu:gloo", timeout=datetime.timedelta(seconds=60)
+        ranks=list(range(DEGREE)), backend="cpu:gloo", timeout=datetime.timedelta(seconds=60)
     )
     pipe = Pipeline()
     model = ProbeModel.for_test(pipe=pipe)
     assert install_context_parallel(
-        model, degree=4, comms=CpComms(handle, rank, torch.device("cpu"))
+        model, degree=DEGREE, comms=CpComms(handle, rank, torch.device("cpu"))
     ) == ("pipe.dit",)
     assert attention_ulysses.group(pipe.dit._parallel_config) == handle
     assert len(census(pipe).destinations) == 10 and census(pipe).components == ("dit",)
@@ -48,11 +48,13 @@ def worker(rank, rendezvous, folder):
         def identity(q, k, v, *, observation=observation, full=full):
             observation["shape"] = list(q.shape)
             observation["strides"] = [list(x.stride()) for x in (q, k, v)]
-            observation["head_range"] = [14 * rank, 14 * (rank + 1)]
+            observation["head_range"] = [(HEADS // DEGREE) * rank, (HEADS // DEGREE) * (rank + 1)]
             for actual, expected in zip((q, k, v), full, strict=True):
                 assert torch.equal(
                     actual.view(torch.uint8),
-                    expected[:, :, 14 * rank : 14 * (rank + 1)].contiguous().view(torch.uint8),
+                    expected[:, :, (HEADS // DEGREE) * rank : (HEADS // DEGREE) * (rank + 1)]
+                    .contiguous()
+                    .view(torch.uint8),
                 )
             return q.clone()
 
@@ -60,6 +62,19 @@ def worker(rank, rendezvous, folder):
         assert torch.equal(out.view(torch.uint8), local[0].contiguous().view(torch.uint8))
         again = attention_ulysses.exchange(*local, handle, identity)
         assert torch.equal(out.view(torch.uint8), again.view(torch.uint8))
+        pieces = []
+        for offset in (0, 28):
+            hs, he = offset + rank * 14, offset + (rank + 1) * 14
+            part = tuple(x[:, start:stop, offset : offset + 28] for x in full)
+
+            def half_identity(q, k, v, *, full=full, hs=hs, he=he, n=n):
+                assert q.shape == (1, n, 14, 128)
+                for actual, expected in zip((q, k, v), full, strict=True):
+                    assert torch.equal(actual, expected[:, :, hs:he])
+                return q.clone()
+
+            pieces.append(attention_ulysses.exchange(*part, handle, half_identity))
+        assert torch.equal(torch.cat(pieces, dim=2), local[0])
         results.append(
             {
                 "tokens": n,
@@ -68,6 +83,7 @@ def worker(rank, rendezvous, folder):
                 "callback": observation,
                 "qkv_and_inverse_bytes_equal": True,
                 "repeat_bytes_equal": True,
+                "two_pass_14head_inverse_bytes_equal": True,
             }
         )
     Path(folder, f"rank-{rank}.json").write_text(
@@ -90,8 +106,10 @@ if __name__ == "__main__":
     folder = parser.parse_args().out
     folder.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="ulysses-gloo-") as temp:
-        mp.spawn(worker, args=(str(Path(temp, "rendezvous")), str(folder)), nprocs=4, join=True)
-    rows = [json.loads((folder / f"rank-{r}.json").read_text()) for r in range(4)]
+        mp.spawn(
+            worker, args=(str(Path(temp, "rendezvous")), str(folder)), nprocs=DEGREE, join=True
+        )
+    rows = [json.loads((folder / f"rank-{r}.json").read_text()) for r in range(DEGREE)]
     result = {
         "passed": True,
         "ranks": rows,
@@ -99,8 +117,8 @@ if __name__ == "__main__":
         "runtime_exchange_sha256": hashlib.sha256(
             Path(inspect.getfile(attention_ulysses)).read_bytes()
         ).hexdigest(),
-        "full_shape_token_counts": [token_bounds(r)[1] - token_bounds(r)[0] for r in range(4)],
-        "limits": "Four-process Gloo permutation passed; CUDA/full-shape attention unqualified",
+        "full_shape_token_counts": [token_bounds(r)[1] - token_bounds(r)[0] for r in range(DEGREE)],
+        "limits": "Two-process Gloo permutation passed; CUDA/full-shape attention unqualified",
     }
     (folder / "summary.json").write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result))
