@@ -1,0 +1,1 @@
+Add explicit `sageattention-fixed-kmean` and `sol-attn-sage2-fixed-kmean` Hopper BF16-input recipes. They preserve Sage2 INT8 Q/K and FP8 P/V while using one fixed K-mean reduction for dense attention and the BF16 CuTe sparse protected prefix. Automatic preferences are unchanged.
