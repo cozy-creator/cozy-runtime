@@ -30,6 +30,35 @@ func maintain(root string, p *runtimeProcess, op string, args []string) (string,
 }
 func maintainWithAgent(root string, p *runtimeProcess, op string, args []string, runningAgent string) (string, error) {
 	switch op {
+	case "update-stage":
+		if len(args) != 1 {
+			return "", errors.New("update staging requires one transaction")
+		}
+		var request pairTransaction
+		if err := json.Unmarshal([]byte(args[0]), &request); err != nil {
+			return "", err
+		}
+		grant := &Grant{Root: root, StoreRoot: request.Store, Lifetime: request.Lifetime, agentSelection: request.Agent}
+		m := &Machine{grant: grant, layout: NewLayout(grant), log: os.Stderr}
+		unlock, err := lockStartupWorker(root)
+		if err != nil {
+			return "", err
+		}
+		defer unlock()
+		var state softwareState
+		if err := m.startupPython(context.Background(), &state, "inspect", m.layout.Store); err != nil {
+			return "", err
+		}
+		status := startupStatus{Workspace: state.Workspace, Pinned: request.Pin}
+		if raw, err := os.ReadFile(m.startupPath("status.json")); err == nil {
+			if err := json.Unmarshal(raw, &status); err != nil {
+				return "", err
+			}
+		}
+		if err := m.stagePair(context.Background(), request.Before, request.After, request.Candidate, request.Previous, status, request.Pin); err != nil {
+			return "", err
+		}
+		return "staged", nil
 	case "update-prepare":
 		if p != nil && !p.exited() || len(args) != 1 {
 			return "", errors.New("update preparation requires a stopped Runtime")
@@ -53,14 +82,17 @@ func maintainWithAgent(root string, p *runtimeProcess, op string, args []string,
 		if err := m.startupPython(context.Background(), &state, "inspect", m.layout.Store); err != nil {
 			return "", err
 		}
-		if !state.Quiescent {
-			return "", errors.New("Runtime quiescence required for explicit software changes")
-		}
 		var status startupStatus
 		if raw, err := os.ReadFile(m.startupPath("status.json")); err == nil {
 			if err := json.Unmarshal(raw, &status); err != nil {
 				return "", err
 			}
+		}
+		if status.State == "staged" {
+			if err := m.activateStaged(context.Background(), status); err != nil {
+				return "", err
+			}
+			return "boot_pending", nil
 		}
 		status.Workspace = state.Workspace
 		mode := "auto"

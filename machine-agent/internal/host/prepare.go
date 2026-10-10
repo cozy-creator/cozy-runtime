@@ -71,6 +71,9 @@ func (m *Machine) prepare(stream grpc.ServerStream, message proto.Message,
 	if err := admitWork(client, "preparation"); err != nil {
 		return err
 	}
+	if m.updating() {
+		return status.Error(codes.Unavailable, "machine_runtime_update: preparation admission is closed")
+	}
 	ctx := stream.Context()
 	if err := m.requireRuntimeRange(ctx); err != nil {
 		return err

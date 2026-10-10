@@ -141,10 +141,118 @@ type startupStatus struct {
 	Pinned           bool              `json:"pinned,omitempty"`
 	PreviouslyPinned bool              `json:"previously_pinned,omitempty"`
 	State            string            `json:"state"` // installing | succeeded | rolled_back | skipped
+	Overlay          string            `json:"overlay,omitempty"`
+	Candidate        []startupWheel    `json:"candidate,omitempty"`
 	Detail           string            `json:"detail,omitempty"`
 	Before, After    pairVersions
 	Previous         []startupWheel `json:"previous,omitempty"`
 	Failed           []pairVersions `json:"failed,omitempty"`
+}
+
+// stagePair prepares an immutable candidate overlay while the current Runtime keeps serving.
+// It never touches opt/cozy/python or changes the selected application.
+func (m *Machine) stagePair(ctx context.Context, verified, next pairVersions, candidate, previous []string, status startupStatus, pinned bool) error {
+	if !samePair(candidate, next) || !samePair(previous, verified) {
+		return errors.New("update pair is incomplete")
+	}
+	var private []string
+	var identities []startupWheel
+	for _, path := range candidate {
+		digest, err := hashFile(path)
+		if err != nil {
+			return err
+		}
+		copy, err := m.startupCopyWheel(path, "candidate", digest)
+		if err != nil {
+			return err
+		}
+		private = append(private, copy)
+		identities = append(identities, startupWheel{File: filepath.Base(copy), SHA256: digest, Version: wheelVersion(filepath.Base(copy))})
+	}
+	kept, err := m.startupPrevious(previous)
+	if err != nil {
+		return err
+	}
+	additions, err := m.stageDependencies(ctx, private)
+	if err != nil {
+		return err
+	}
+	complete := append([]string{}, private...)
+	for _, wheel := range additions {
+		complete = append(complete, wheel.Path)
+	}
+	if err := os.RemoveAll(m.startupPath("overlay")); err != nil {
+		return err
+	}
+	overlay, err := os.MkdirTemp(m.startupPath(), "overlay-")
+	if err != nil {
+		return err
+	}
+	args := append([]string{"pip", "install", "--no-config", "--offline", "--no-deps", "--target", overlay, "--python", filepath.Join(m.layout.Root, "opt/cozy/python/bin/python")}, complete...)
+	cmd := exec.CommandContext(ctx, filepath.Join(m.layout.Root, "usr/local/bin/uv"), args...)
+	cmd.Env = []string{"PATH=/usr/bin:/bin", "HOME=" + filepath.Join(m.layout.Root, "tmp")}
+	if _, err := progressChildOutput(cmd, true); err != nil {
+		return fmt.Errorf("candidate staging failed: %w", err)
+	}
+	probed, err := m.startupVerify(ctx, overlay)
+	if err != nil || probed != next {
+		return fmt.Errorf("candidate failed native/dependency preflight: %v", err)
+	}
+	status.Dependencies = additions
+	status.Candidate = identities
+	status.Overlay = overlay
+	status.State, status.Before, status.After, status.Previous = "staged", verified, next, kept
+	status.Pinned = pinned
+	if err := m.startupSave(status); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (m *Machine) activateStaged(ctx context.Context, status startupStatus) error {
+	if status.State != "staged" || status.Overlay == "" || len(status.Candidate) != 2 {
+		return errors.New("no staged Runtime candidate awaits activation")
+	}
+	var candidate []string
+	for _, wheel := range status.Candidate {
+		path := m.startupPath("candidate", wheel.File)
+		if got, err := hashFile(path); err != nil || got != wheel.SHA256 {
+			return errors.New("staged candidate wheel changed")
+		}
+		candidate = append(candidate, path)
+	}
+	var complete = append([]string{}, candidate...)
+	for _, wheel := range status.Dependencies {
+		complete = append(complete, wheel.Path)
+	}
+	if status.PolicyAfter == nil {
+		if err := m.snapshotPolicy(&status, nil); err != nil {
+			return err
+		}
+	}
+	m.preparePolicyEntry(&status)
+	status.State = "installing"
+	if err := m.startupSave(status); err != nil {
+		return err
+	}
+	if err := installPair(m.layout.Root, complete); err != nil {
+		return err
+	}
+	probed, err := m.startupVerify(ctx)
+	if err != nil || probed != status.After {
+		return fmt.Errorf("installed pair differs from staged pair: %v", err)
+	}
+	if err := selectPair(m.layout.Root, candidate); err != nil {
+		return err
+	}
+	status.State = "boot_pending"
+	if err := m.startupSave(status); err != nil {
+		return err
+	}
+	if m.grant != nil {
+		m.grant.startupPending = true
+	}
+	return nil
 }
 
 func (m *Machine) startupPath(names ...string) string {

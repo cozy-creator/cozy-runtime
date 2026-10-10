@@ -416,14 +416,26 @@ func (m *Machine) runUpdate(request updateRequest, status updateStatus) {
 		}
 	}
 	m.saveUpdate(status)
+	payload, _ := json.Marshal(pairTransaction{Before: status.From, After: status.To, Candidate: candidate, Previous: previous, Store: m.layout.Store, Lifetime: m.grant.Lifetime, Pin: status.Pinned, Agent: request.Agent})
+	status.State = "staging"
+	m.saveUpdate(status)
+	answer, err := m.launcher.maintain("update-stage", []string{string(payload)})
+	if err != nil || answer != "staged" {
+		if err == nil {
+			err = errors.New("candidate staging did not finish")
+		}
+		fail("failed", err)
+		return
+	}
+	status.State = "staged"
+	m.saveUpdate(status)
 	if err := m.quiesce(ctx); err != nil {
 		fail("failed", err)
 		return
 	}
 	status.State = "installing"
 	m.saveUpdate(status)
-	payload, _ := json.Marshal(pairTransaction{Before: status.From, After: status.To, Candidate: candidate, Previous: previous, Store: m.layout.Store, Lifetime: m.grant.Lifetime, Pin: status.Pinned, Agent: request.Agent})
-	answer, err := m.launcher.maintain("update-prepare", []string{string(payload)})
+	answer, err = m.launcher.maintain("update-prepare", []string{string(payload)})
 	if err != nil || answer != "boot_pending" {
 		if err == nil {
 			err = errors.New("candidate installation rolled back")
