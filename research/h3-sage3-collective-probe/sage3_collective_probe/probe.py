@@ -198,7 +198,7 @@ def run(seed, handle):
             "fixed_means": fixed_means.forward,
         }
         times = []
-        for name, callback in callbacks.items():
+        for callback in callbacks.values():
             warm = attention_ulysses.exchange(*local, handle, callback)
             del warm
         for repetition in range(3):
@@ -262,7 +262,7 @@ def run(seed, handle):
             "ranks": reports,
             "candidate_partition_exact": all(r["variants"][1]["partition_exact"] for r in reports),
             "limits": [
-                "Fixed generated activations and real four-GPU Ulysses only; no H3 sampling or video claim.",
-                "Three warm timing samples check regression; no default promotion or generation-speed claim.",
+                "Fixed activations and real four-GPU Ulysses only; no H3 sampling or video claim.",
+                "Three warm timing samples check regression; no default or generation-speed claim.",
             ],
         }
