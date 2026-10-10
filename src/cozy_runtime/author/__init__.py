@@ -132,6 +132,13 @@ from cozy_runtime.author._model import (
     uses_components,
 )
 from cozy_runtime.author._model_reader import WeightsReader, WeightsView
+from cozy_runtime.author._retry import (
+    is_declared_pure,
+    original_forward,
+    pure,
+    read_whole,
+    retry_state,
+)
 from cozy_runtime.author._script import ScriptContext, script_app
 from cozy_runtime.author._services import (
     JOB_ONLY,
@@ -312,12 +319,17 @@ __all__ = [
     "expect_attention",
     "invocable",
     "invoke",
+    "is_declared_pure",
+    "original_forward",
     "placeable",
     "prefetch",
     "prepare",
     "publish_release",
+    "pure",
+    "read_whole",
     "register_adapter",
     "registered_adapters",
+    "retry_state",
     "script_app",
     "sequence_parallel",
     "spread",

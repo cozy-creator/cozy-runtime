@@ -19,6 +19,7 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import math
 import os
 import re
 from collections.abc import Iterable, Mapping
@@ -130,6 +131,9 @@ class WorkerHostConfig:
     """Worker-only Hub capability; never inherited by a job executor."""
     object_storage_hosts: tuple[str, ...] = ()
     layout: host_paths.Layout = field(default_factory=host_paths.Layout)
+    gpu_budget: tuple[tuple[int, int], ...] = ()
+    """`gpu.budget` from the machine's runtime.yaml: (ordinal, bytes), ordinal -1 for every
+    GPU. Empty when unset: each GPU's measured free memory is the limit."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -480,6 +484,7 @@ def read_worker_host_config(
         control_public_key_ed25519_b64url=public_key_text,
         media_token_sha256=tuple(str(item) for item in token_hashes),
         layout=layout,
+        gpu_budget=read_gpu_budget(layout.runtime_settings),
         child_base_env=tuple(
             sorted(
                 (name, value) for name, value in env.items() if name in WORKER_CHILD_PLATFORM_ENV
@@ -490,6 +495,87 @@ def read_worker_host_config(
         os.environ.pop("COZY_STORAGE_ADMISSION_FD", None)
     _worker_host_read = True
     return parsed
+
+
+_SIZE = re.compile(r"([0-9]*\.?[0-9]+(?:e[+-]?[0-9]+)?)\s*([kmgt]?)(i?)b?", re.IGNORECASE)
+
+
+def parse_size(value: object) -> int | None:
+    """Bytes from `3221225472`, `3GiB`, `3Gi` (IEC), `3GB`, `3G` (SI) or `1.5e9`; None when it
+    is not a size."""
+    if isinstance(value, bool):
+        return None
+    match = _SIZE.fullmatch(str(value).strip())
+    if match is None:
+        return None
+    base = 1024 if match[3] else 1000
+    size = float(match[1]) * base ** " KMGT".index(match[2].upper() or " ")
+    return int(size) if math.isfinite(size) and size >= 1 else None
+
+
+def parse_gpu_budget(value: object) -> tuple[tuple[int, int], ...]:
+    """A size for every GPU, or an ordinal map. Invalid limits never become unlimited."""
+    if value is None:
+        return ()
+    if isinstance(value, dict) and not value:
+        raise ConfigError(
+            "gpu.budget",
+            "An explicit GPU budget is empty",
+            "Set a positive size or omit gpu.budget.",
+        )
+    items = value.items() if isinstance(value, dict) else [(-1, value)]
+    found: list[tuple[int, int]] = []
+    for ordinal, size in items:
+        parsed = parse_size(size)
+        key = str(ordinal).strip()
+        if parsed is None or not re.fullmatch(r"-?\d+", key) or int(key) < -1:
+            raise ConfigError(
+                "gpu.budget",
+                f"Invalid GPU budget at ordinal {ordinal!r}: {size!r}",
+                "Use a positive byte size such as 3GiB, or an ordinal-to-size mapping; "
+                "omit gpu.budget to leave it unconfigured.",
+            )
+        found.append((int(key), parsed))
+    return tuple(sorted(found))
+
+
+def _yaml_mapping(text: str) -> dict[str, object]:
+    """The block-mapping subset of YAML Creator writes: nested `key: value` lines."""
+    root: dict[str, object] = {}
+    stack: list[tuple[int, dict[str, object]]] = [(-1, root)]
+    for raw in text.splitlines():
+        line = raw.split(" #", 1)[0].rstrip()
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip())
+        key, _, value = line.strip().partition(":")
+        while indent <= stack[-1][0]:
+            stack.pop()
+        key, value = key.strip().strip("'\""), value.strip()
+        if value.startswith("{") and value.endswith("}"):
+            pairs = (item.partition(":") for item in value[1:-1].split(","))
+            stack[-1][1][key] = {
+                k.strip().strip("'\""): v.strip().strip("'\"") for k, _, v in pairs if k.strip()
+            }
+        elif value:
+            stack[-1][1][key] = value.strip("'\"")
+        else:
+            child: dict[str, object] = {}
+            stack[-1][1][key] = child
+            stack.append((indent, child))
+    return root
+
+
+def read_gpu_budget(path: Path) -> tuple[tuple[int, int], ...]:
+    """`gpu.budget` from the machine's runtime.yaml, read once at Worker start."""
+    try:
+        text = path.read_text()
+    except (FileNotFoundError, NotADirectoryError):
+        return ()
+    gpu = _yaml_mapping(text).get("gpu")
+    if gpu is not None and not isinstance(gpu, dict):
+        raise ConfigError("gpu", "GPU settings must be a mapping", "Set gpu.budget: <size>.")
+    return parse_gpu_budget(gpu.get("budget")) if isinstance(gpu, dict) else ()
 
 
 def _machine_publication_authority(path: Path, worker_id: str) -> tuple[str, str]:

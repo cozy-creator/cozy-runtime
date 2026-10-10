@@ -86,13 +86,33 @@ class LaneRow:
     supervision: child.ExecutorSupervision | None = None
     #: the lane clock at this tenant's latest admission or load: LRU victim order
     last_used: int = 0
-    #: ordinal -> what this tenant holds there beyond its process's context, as the driver
-    #: measured its own loads, restores and calls (`memory.py`); cleared when it is evicted
+    #: ordinal -> what this tenant holds there (its overhead plus its allocator reserve), as
+    #: its executor last reported it (`memory.Machine`)
     held: dict[int, int] = field(default_factory=dict)
-    #: (entrypoint, shape cell) -> ordinal -> the most it held there during a successful call
-    peak: dict[tuple[str, str], dict[int, int]] = field(default_factory=dict)
-    #: ordinals an eviction emptied since the tenant last restored or ran: what it restores
-    emptied: set[int] = field(default_factory=set)
+    #: ordinal -> its process's non-allocator bytes there: context, modules, communicators
+    overhead: dict[int, int] = field(default_factory=dict)
+    #: (entrypoint, shape cell) -> the most it held on one device during a call of it
+    peak: dict[tuple[str, str], int] = field(default_factory=dict)
+    #: Latest successful construction preparation, a retention-cost hint rather than a fit.
+    load_seconds: float | None = None
+    memory_generation: tuple[int, int] | None = None
+    # Executor-reported component tiers; missing facts never authorize prefetch.
+    disk: dict[str, int] = field(default_factory=dict)
+    disk_epoch: dict[str, int] = field(default_factory=dict)
+    disk_revision: dict[str, int] = field(default_factory=dict)
+
+    def sync_memory_generation(self) -> None:
+        """Footprints and measured peaks belong to the process, never its replacement."""
+        current = self.supervision.current if self.supervision is not None else None
+        generation = (current.pid, current.epoch) if current is not None else None
+        if generation != self.memory_generation:
+            self.disk.clear()
+            self.disk_epoch.clear()
+            self.disk_revision.clear()
+            self.held.clear()
+            self.overhead.clear()
+            self.peak.clear()
+            self.memory_generation = generation
 
     def resident_bytes(self) -> int:
         return sum(self.ledger.resident.values())

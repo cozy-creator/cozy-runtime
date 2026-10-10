@@ -36,7 +36,7 @@ class Shutdown(Command, frozen=True, kw_only=True, tag="shutdown"):
 
 
 class Probe(Command, frozen=True, kw_only=True, tag="probe"):
-    pass
+    end_attempt: bool = False
 
 
 class Residency(Command, frozen=True, kw_only=True, tag="residency"):
@@ -75,6 +75,8 @@ class Unload(Command, frozen=True, kw_only=True, tag="unload"):
 class Activate(Command, frozen=True, kw_only=True, tag="activate"):
     construction: str
     authorized_device_limit_bytes: int | UnsetType = UNSET
+    memory_grants: tuple[int, ...] = ()
+    begin_attempt: bool = False
     #: A follower's half: the constructions rank 0 parked to make room.
     park: tuple[str, ...] = ()
 
@@ -100,6 +102,10 @@ class Start(Command, frozen=True, kw_only=True, tag="start"):
     sequence_parallel_degree: int = 1
     application: str = ""
     package_interface: str = ""
+    #: Speculative startup imports code without creating a device context or warming it.
+    import_only: bool = False
+    authorized_device_limit_bytes: int | UnsetType = UNSET
+    memory_grants: tuple[int, ...] = ()
 
     def release(self) -> Release:
         return Release(application=self.application, package_interface=self.package_interface)
@@ -179,6 +185,8 @@ class Load(Command, frozen=True, kw_only=True, tag="load"):
     construction: str
     devices: str = ""
     authorized_device_limit_bytes: int | UnsetType = UNSET
+    #: Per-rank total footprints; the scalar above remains the legacy minimum.
+    memory_grants: tuple[int, ...] = ()
     sequence_parallel_degree: int = 1
     attention_pin: str = ""
     #: The one-model form. Executors before the typed commands index both keys directly, so a
@@ -250,6 +258,9 @@ class Invoke(_Run, frozen=True, kw_only=True, tag="invoke"):
     entrypoint: str
     construction: str = ""
     attention_kernel: str = ""
+    #: Absent on older workers; zero explicitly grants no device bytes.
+    memory_grant_bytes: int | UnsetType = UNSET
+    memory_grants: tuple[int, ...] = ()
     placement: str = "all_resident"
     headroom_bytes: int = 0
     scope_headroom_bytes: dict[str, int] = {}

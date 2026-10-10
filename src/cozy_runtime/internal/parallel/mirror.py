@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import weakref
 from collections import deque
 from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
@@ -15,11 +16,18 @@ from typing import Any
 import msgspec
 
 from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT
-from cozy_runtime.author._errors import Cancelled
+from cozy_runtime.author._errors import Cancelled, classify
 from cozy_runtime.author._model import remote_scope
-from cozy_runtime.internal import attention_sol, execution_evidence
+from cozy_runtime.internal import attention_sol, execution_evidence, memory
 from cozy_runtime.internal.parallel import cp, wire
-from cozy_runtime.internal.parallel.group import RankGroup, SpreadLog
+from cozy_runtime.internal.parallel.group import (
+    OpReady,
+    PreparationRefusal,
+    PreparedAbort,
+    PreparedGroup,
+    RankGroup,
+    SpreadLog,
+)
 from cozy_runtime.internal.parallel.plan import GroupRefusal
 
 
@@ -31,6 +39,8 @@ def mirror_component(
     group: RankGroup,
     spool: Callable[[], Path | None],
     cancelled: Callable[[], bool] = lambda: False,
+    planner: memory.Planner | None = None,
+    room: Callable[[list[OpReady]], bool] | None = None,
 ) -> None:
     """Wrap the module call outside all torch and diffusers hooks.
 
@@ -52,24 +62,159 @@ def mirror_component(
         if cp.in_gated_call():
             return call(*args, **kwargs)
         command, payloads = _command(name, prepared, group, spool, args, kwargs, cancelled)
+        key = f"{name[0]}/{name[1]}"
+        owned = planner.held.get(key) if planner is not None else None
         try:
             # Every follower joins the collective: none may be answering an overlapped call.
             with group.hold(range(1, group.degree)):
-                try:
-                    group.broadcast(msgspec.to_builtins(command))
-                    with cp.gated_call():
-                        result = call(*args, **kwargs)
-                    for follower, frame in zip(group.followers, group.collect("run"), strict=True):
-                        reply = _accept(name, group, follower.rank, frame)
-                        attention_sol.record_rank(follower.rank, reply.sol_calls)
-                    return result
-                except BaseException:
-                    group._break(f"mirrored component {name!r} failed")
-                    raise
+                if any(
+                    "prepare_commit" not in group.memory_capabilities.get(rank, ())
+                    for rank in range(1, group.degree)
+                ):
+                    if planner is not None:
+                        planner.preparation_failure = "group_preparation_failed"
+                    raise PreparationRefusal(
+                        "a follower does not support pre-collective preparation"
+                    )
+                while True:
+                    transaction = PreparedGroup(
+                        group,
+                        msgspec.to_builtins(
+                            msgspec.structs.replace(command, memory_grants=group.memory_grants)
+                        ),
+                    )
+
+                    def ready(current: PreparedGroup = transaction) -> None:
+                        if not current.ready(
+                            preparation_status(planner, current.operation, 0),
+                            lambda: _check_cancelled(cancelled, name),
+                        ):
+                            raise PreparedAbort()
+
+                    try:
+                        with cp.gated_call():
+                            if planner is not None and owned is not None:
+                                with planner.gating(key, ready):
+                                    result = planner.run(owned, "forward", call, args, kwargs)
+                            else:
+                                ready()
+                                result = call(*args, **kwargs)
+                    except BaseException as exc:
+                        if transaction.committed or group.broken:
+                            group._break(f"mirrored component {name!r} failed after commit")
+                            raise
+                        if not transaction.statuses:
+                            transaction.ready(
+                                preparation_status(planner, transaction.operation, 0, exc)
+                            )
+                        exc.__traceback__ = None
+                        transaction.abort()
+                        failed = [status for status in transaction.statuses if not status.ok]
+                        if any(not status.reusable for status in failed):
+                            group._break(f"{name!r}: preparation left a rank unusable")
+                            raise GroupRefusal(group.broken) from None
+                        if (
+                            failed
+                            and room is not None
+                            and all(
+                                status.code in (memory.SHORTFALL, "device_out_of_memory")
+                                for status in failed
+                            )
+                            and room(transaction.statuses)
+                        ):
+                            continue
+                        if isinstance(exc, Cancelled):
+                            raise
+                        refused = (
+                            failed[0]
+                            if failed
+                            else preparation_status(planner, transaction.operation, 0, exc)
+                        )
+                        detail = (
+                            f"{name!r}: rank {refused.rank} refused before collective entry: "
+                            f"{refused.detail}"
+                        )
+                        failure: PreparationRefusal | memory.MemoryRefusal
+                        if refused.code in (
+                            memory.SHORTFALL,
+                            "device_out_of_memory",
+                            "host_shortfall",
+                        ):
+                            failure = memory.MemoryRefusal(
+                                refused.code,
+                                detail,
+                                refused.needed,
+                                refused.available,
+                            )
+                            if refused.code == "host_shortfall":
+                                failure.shortfall["resource"] = "ram"
+                            if planner is not None:
+                                planner.refusal = failure
+                        else:
+                            failure = PreparationRefusal(
+                                detail,
+                                code=refused.code or "group_preparation_failed",
+                            )
+                        if planner is not None:
+                            planner.preparation_failure = failure.code
+                        raise failure from None
+                    finally:
+                        if not transaction.committed:
+                            transaction.abort()
+                    try:
+                        for follower, frame in zip(
+                            group.followers, group.collect("run"), strict=True
+                        ):
+                            reply = _accept(name, group, follower.rank, frame)
+                            attention_sol.record_rank(follower.rank, reply.sol_calls)
+                        return result
+                    except BaseException:
+                        group._break(f"mirrored component {name!r} failed after commit")
+                        raise
         finally:
             payloads.clear()
 
+    mirrored.__dict__["__cozy_group_router__"] = weakref.ref(mirrored)
     component._call_impl = mirrored
+
+
+def _check_cancelled(cancelled: Callable[[], bool], name: tuple[str, str]) -> None:
+    if cancelled():
+        raise Cancelled(f"the attempt was cancelled before committing {name!r}")
+
+
+def preparation_status(
+    planner: memory.Planner | None,
+    operation: int,
+    rank: int,
+    error: BaseException | None = None,
+) -> OpReady:
+    """A prepared rank's control-plane report; no CUDA allocation is needed to send it."""
+    facts = planner.facts() if planner is not None else {}
+    numbers = planner.preparation_bytes(error) if planner is not None else {}
+    code = classify(error).code if error is not None else ""
+    if code in ("group_broken", "group_unformed", "gpu_divergence"):
+        # A scope/input refusal before commit did not break the communicator. Protocol
+        # failures take the explicit group._break path instead of this reusable outcome.
+        code = "group_preparation_failed"
+    if error is not None and memory.is_oom(error):
+        code = "device_out_of_memory"
+    return OpReady(
+        operation=operation,
+        rank=rank,
+        ok=error is None,
+        code=code,
+        detail=str(error)[:900] if error is not None else "",
+        reusable=not (planner is not None and planner.unusable)
+        and bool(getattr(error, "reusable", True)),
+        needed=numbers.get("needed", 0),
+        available=numbers.get("available", 0),
+        free_bytes=numbers.get("free_bytes", 0),
+        grant_bytes=numbers.get("grant_bytes", 0),
+        free_wanted=numbers.get("free_wanted", 0),
+        grant_wanted=numbers.get("grant_wanted", 0),
+        memory=facts,
+    )
 
 
 def host_component(
@@ -116,10 +261,6 @@ def _hosted(
             except BaseException:
                 group._break(f"hosted component {name!r} failed")
                 raise
-            residency = prepared[name][0]._cozy_residency
-            if residency is not None:
-                (scope,) = command.scopes
-                residency.observe_remote(scope.method, reply.working_peak_bytes)
             return wire.unmarshal(reply.result, results, device=device)
         finally:
             payloads.clear()
@@ -149,7 +290,8 @@ def install_spread(
     followers = tuple(range(1, group.degree))
 
     def spread(method: str, arguments: Iterator[tuple[Any, ...]], spare: bool) -> Iterator[Any]:
-        local = getattr(component, method)
+        op = getattr(component, "_cozy_op", None)
+        local = op(method) if op is not None else getattr(component, method)
         if prepared[name][0]._cozy_active is None:
             # Outside a component scope no follower may stage it: run here.
             yield from (local(*args) for args in arguments)
@@ -179,7 +321,7 @@ def install_spread(
                 log = group.spread_log.setdefault(
                     f"{name[1]}.{method}", {"calls": {}, "declined": {}, "spare": spare}
                 )
-                _round(batch, taken, finished, queue, declined, log, method, spare)
+                _round(batch, taken, finished, queue, declined, log, method, spare, local)
             finally:
                 group.give(taken)
             while emitted in finished:
@@ -195,6 +337,7 @@ def install_spread(
         log: SpreadLog,
         method: str,
         spare: bool,
+        local: Callable[..., object],
     ) -> None:
         sent: list[tuple[int, int, tuple[Any, ...], wire.TensorSpool]] = []
         calls: dict[str, int] = log["calls"]
@@ -207,7 +350,7 @@ def install_spread(
                 spread = msgspec.structs.replace(command, method=method, p2p=True, spare=spare)
                 group.send_one(rank, msgspec.to_builtins(spread))
             index, args = batch[0]
-            finished[index] = getattr(component, method)(*args)
+            finished[index] = local(*args)
             calls["0"] = calls.get("0", 0) + 1
             for rank, index, args, _payloads in sent:
                 result = wire.recv_tensor(rank, group.pg, device)
@@ -280,39 +423,6 @@ class GroupPlacement:
         return carried
 
 
-def hosting_plan(
-    *,
-    placeable: tuple[str, ...],
-    sizes: Mapping[str, int],
-    sharded: set[str],
-    scopes: Mapping[str, tuple[str, ...]],
-    capacity: int,
-    world: int,
-) -> dict[str, int]:
-    """Placeable component -> the follower that keeps it resident, largest first.
-
-    Only when rank 0 cannot hold every component: a follower hosts one if it fits beside
-    that rank's largest sharded scope. `sizes` are settled bytes, so `capacity` is what a
-    rank holds after its fill, not the fill ceiling. Every rank derives the same answer from
-    the same agreed sizes and capacity, so no command carries it. H3 on an H100: the 51.5 GB
-    text encoder beside a 21 GB DiT shard, where rank 0 re-staged it for every request.
-    """
-    if world < 2 or sum(sizes.values()) <= capacity:
-        return {}
-    shard = max(
-        (sum(sizes.get(n, 0) for n in names if n in sharded) for names in scopes.values()),
-        default=0,
-    )
-    room = {follower: capacity - shard for follower in range(1, world)}
-    hosted: dict[str, int] = {}
-    for name in sorted(placeable, key=lambda n: (-sizes.get(n, 0), n)):
-        follower = max(room, key=lambda r: (room[r], -r))
-        if name in sizes and name not in sharded and sizes[name] <= room[follower]:
-            hosted[name] = follower
-            room[follower] -= sizes[name]
-    return hosted
-
-
 def _command(
     name: tuple[str, str],
     prepared: Mapping[tuple[str, str], tuple[Any, Any]],
@@ -358,28 +468,14 @@ def _command(
         for key, (_model, root) in prepared.items()
         if key[0] in active and key[1] in active[key[0]][1]
     }
-    scopes = []
-    for key, (method, components) in active.items():
-        residency = models[key]._cozy_residency
-        scopes.append(
-            wire.Scope(key, method, components)
-            if residency is None
-            else wire.Scope(
-                key,
-                method,
-                components,
-                placement=residency.placement,
-                headroom_bytes=residency.headroom,
-                scope_headroom_bytes=residency.scope_headrooms,
-                measured_scopes=sorted(residency.measured),
-            )
-        )
+    scopes = [wire.Scope(key, method, components) for key, (method, components) in active.items()]
     payloads = wire.TensorSpool(directory / payloads_dir, references)
     command = wire.RunCommand(
         component=name,
         spool=str(directory),
         payloads=payloads_dir,
         scopes=tuple(scopes),
+        memory_grants=group.memory_grants,
         grad_enabled=torch.is_grad_enabled(),
         inference_mode=torch.is_inference_mode_enabled(),
         autocast={

@@ -25,10 +25,10 @@ component answers a request.
 ledger and unwinds nothing on a failure path: a fill that fails after a byte moved poisons
 the generation, the worker replaces the executor process (cr-024), and external reclaim
 frees the card — se-002 banked the 90.8 GiB refill at ~3 s warm, which is cheaper and more
-honest than any incremental unwind. The ONE piece of arithmetic that survives is ADMISSION:
-`price_envelope`/`complete_device_envelope` say whether the plan fits measured capacity
-before the first allocation, and the executor refuses on it. Nothing here charges, releases,
-clamps or reconciles a counter after that.
+honest than any incremental unwind. This plane decides nothing about memory: `place` (the
+memory planner's answer) says which components the first fill puts on the device, and the
+planner moves units between device, host and store afterwards through `load`, `load_unit`,
+`drop` and `drop_unit`.
 
 **Leases outlive the copy.** A pinned slot is reusable only after the CUDA event recorded
 on the stream that consumed it. Returning a slot with a live copy is a typed refusal, not
@@ -83,7 +83,6 @@ from cozy_runtime.internal.encoding import (
     DeviceFacts,
     Encoded,
     LeafProvider,
-    Provider,
     RolePart,
     Selection,
     aliases,
@@ -94,7 +93,6 @@ from cozy_runtime.internal.encoding import (
     measure_runtime,
 )
 from cozy_runtime.internal.forensics import FillForensics, distinct_storage_bytes
-from cozy_runtime.internal.paging import BlockLayout, PageUnit, partition
 from cozy_runtime.internal.planfacts import PlanFacts
 from cozy_runtime.internal.probe import QualificationResult, observed_capability_records, qualify
 from cozy_runtime.internal.resolution import (
@@ -103,13 +101,15 @@ from cozy_runtime.internal.resolution import (
     TensorResolution,
     script_plan,
 )
+from cozy_runtime.internal.tiers import Unit
 
 # Every `Any` below is a torch module, tensor, event or device: torch is absent from the
 # check venv.
 
 if TYPE_CHECKING:
-    from tensorfs import Batch, ReadPlan, Tensor
+    from tensorfs import Batch as Batch
     from tensorfs import ReadLease as ReadLease
+    from tensorfs import ReadPlan, Tensor
     from tensorfs import Store as Store
 
 # ------------------------------------------------------------------------- refusals
@@ -252,11 +252,6 @@ class ComponentMemory:
     def overhead(self) -> int:
         return max(self.peak - self.base, 0)
 
-    def admission(self, headroom: int) -> int:
-        # Fill scratch and forward scratch are different phases. Already-live input
-        # activations are accounted by the caller's measured allocator free space.
-        return max(self.peak, self.settled + headroom)
-
 
 class MoveRow(TypedDict):
     component: str
@@ -381,11 +376,6 @@ class DeviceEnvelope(TypedDict):
     authorized_device_limit_bytes: NotRequired[int]
 
 
-class CompleteEnvelope(DeviceEnvelope):
-    construction_destination_bytes: int
-    derived_destination_bytes: int
-
-
 def price_envelope(
     rows: Sequence[tuple[str, int, int, str, int, int]], decode_scratch_bytes: int
 ) -> DeviceEnvelope:
@@ -448,21 +438,6 @@ def _component_memory(cell: ComponentEnvelope) -> ComponentMemory:
         native_scratch=cell["native_scratch"],
         decode=cell["decode_envelope"],
     )
-
-
-def complete_device_envelope(
-    header: DeviceEnvelope, construction_destination_bytes: int
-) -> CompleteEnvelope:
-    """Include the MCC's derived buffers without charging parked native components."""
-    derived = max(construction_destination_bytes - header["destination_bytes"], 0)
-    base = header["base_bytes"] + derived
-    return {
-        **header,
-        "construction_destination_bytes": construction_destination_bytes,
-        "derived_destination_bytes": derived,
-        "base_bytes": base,
-        "required_bytes": base + header["fill_overhead_bytes"],
-    }
 
 
 # ------------------------------------------------------------------- the TensorFS reader
@@ -890,44 +865,6 @@ def servability(rows: Sequence[PlanRow], answer: ResolvedModelPlan | PlanRefusal
     return Servability(False, by_alias, {}, answer.detail, "plan_unresolved")
 
 
-def servability_for_script(
-    rows: Sequence[PlanRow],
-    *,
-    release: str,
-    providers: Mapping[str, tuple[Provider, ...]],
-    capabilities: Capabilities,
-    device: DeviceFacts,
-    store: str = "synthetic",
-    snapshot: str = "synthetic",
-    objective: str = "latency",
-    encoded_leaves: str = "accept",
-) -> Servability:
-    """The honesty answer for a DRIVER SCRIPT: resolve a `script_plan`, then derive.
-
-    Header work only — no tensor bytes move — through the same `resolve()` the executor
-    uses, so what a script prints as servable is what a worker would execute.
-    """
-    try:
-        answer: ResolvedModelPlan | PlanRefusal = script_plan(
-            rows=rows,
-            components=sorted({row.component for row in rows}),
-            release=release,
-            store=store,
-            snapshot=snapshot,
-            providers=providers,
-            capabilities=capabilities,
-            device=device,
-            runtime=measure_runtime(torch_module(), release),
-            facts=PlanFacts(),
-            objective=objective,
-            encoded_leaves=encoded_leaves,
-            dtype_name=dtype_name,
-        )
-    except PlanRefusal as exc:
-        answer = exc
-    return servability(rows, answer)
-
-
 def tensor_schema_of(rows: Sequence[PlanRow]) -> dict[str, TensorSpec]:
     """The checkpoint tensor schema the loader matches the code against.
 
@@ -991,9 +928,6 @@ class LeafReplacement:
     original: Any
     owner: Any
     attribute: str
-    freed_bytes: int
-    """Device bytes the float destination gave back. The other half of the VRAM claim: a
-    replacement that freed nothing bought nothing, whatever the payload cost."""
 
 
 class StagingRing:
@@ -1032,6 +966,9 @@ class StagingRing:
         self.fence = fence
         self.in_flight_peak = 0
         self.stream = torch.cuda.Stream(device=device)
+        # Destinations may reuse blocks the compute stream freed with its kernels still
+        # queued: nothing is written until that work is done.
+        self.stream.wait_stream(torch.cuda.current_stream(device))
         self.buffers: list[Any] = []
         self.views: list[memoryview] = []
         pinned, locked = True, 0
@@ -1100,8 +1037,8 @@ class StagingRing:
         self.torch.cuda.current_stream(self.device).wait_stream(self.stream)
 
     def close(self) -> None:
-        """Drop the pinned slots. No counter to settle — the ring reports facts."""
-        self.inflight.clear()
+        """Release slots only after their copies, including a failed partial batch, finish."""
+        self.finish()
         self.buffers.clear()
         self.views.clear()
 
@@ -1284,16 +1221,13 @@ class StreamingFillBackend:
         self.expected: dict[str, frozenset[str]] = {}
         self.components: dict[str, Any] = {}
         #: components this generation OWNS but is not holding on device right now. Their
-        #: modules live on `meta`, so re-staging is a reservation plus a fill, never a copy
-        #: back from a host tier that does not exist (§3.2: eviction FREES).
+        #: modules live on `meta`, so a refill is a reservation plus a fill.
         self.parked: dict[str, Any] = {}
-        self.vram_charge: dict[str, int] = {}
         #: One accounting authority keeps the float construction peak distinct from the
         #: settled encoded tree. Eviction never overwrites the bytes needed to restore it.
         self.component_memory: dict[str, ComponentMemory] = {}
-        #: cr-008b: a STAGED plan re-reads the store after construction, so the GC-safe hold
-        #: must outlive the first commit. It is released by `close()` with the generation.
-        self.hold_lease = False
+        #: Whether the first fill puts a component on the device: the memory planner's answer.
+        self.place: Callable[[str, int], bool] = lambda name, peak: True
         self.stage_log: list[StageEvent] = []
         #: DERIVED tensor values per component, captured once at construction. A
         #: non-persistent buffer is a pure function of config that no checkpoint supplies,
@@ -1307,12 +1241,9 @@ class StreamingFillBackend:
         #: an all-resident plan means. This is the DEPLOYMENT's declared budget, deliberately
         #: not a measurement: construction must be reproducible, and the attempt-time ladder
         #: is where measured free VRAM decides things (cr-008b).
-        self.resident_budget = 0
-        self.paging: dict[str, BlockLayout] = {}
-        self.paging_hooks: list[Any] = []
-        self.paging_specs: dict[str, TensorSpec] = {}
-        self.paging_plans: dict[str, ReadPlan] = {}
-        self.page_resident: dict[str, PageUnit] = {}
+        self.specs: dict[str, TensorSpec] = {}
+        self.unit_plans: dict[str, ReadPlan] = {}
+        self.unit_fill = False
         self.stats: FillStats = {"windows": 0, "waits": 0}
         #: Why this generation was poisoned and what the allocator held at that instant.
         #: Empty until a failure lands; the refusal reply carries it as evidence. Nothing
@@ -1664,14 +1595,11 @@ class StreamingFillBackend:
                 native[:6],
             )
         roots = dict(_members(obj))
-        self.paging_specs = {
-            destination.key: destination.spec for destination in walked.destinations
-        }
+        self.specs = {destination.key: destination.spec for destination in walked.destinations}
         started = time.perf_counter_ns()
         self._mark(
             "materialize_begin", walked_components=list(walked.components), roots=sorted(roots)
         )
-        held = 0
         header_memory = self.device_envelope()["components"]
         with placing():
             for name in walked.components:
@@ -1685,51 +1613,19 @@ class StreamingFillBackend:
                     else ComponentMemory()
                 )
                 memory.destinations = size
-                # Captured BEFORE the park decision: a parked component is staged in later
-                # and its derived tables have to survive to be restored, which they cannot
-                # if the capture happens only on the resident branch.
+                # Captured before placement: a component left on the store is filled later and
+                # its derived tables have to survive to be restored.
                 derived = self.derived[name] = _derived_values(member)
-                if (
-                    self.resident_budget
-                    and size > self.resident_budget
-                    and not any(
-                        key.startswith(f"{name}.") and resolution.route != "verbatim"
-                        for key, resolution in self.resolved.items()
-                    )
-                ):
-                    try:
-                        layout = partition(member)
-                    except ValueError as exc:
-                        raise _refuse(
-                            "leaf_schema", f"{name}: unsafe paging layout: {exc}", [name]
-                        ) from exc
-                    if layout is not None:
-                        self.paging[name] = layout
-                        self.hold_lease = True
-                if self.resident_budget and held + memory.base > self.resident_budget:
-                    # PARKED, not dropped. Its tensor schema is built and its destinations are
-                    # known; what it does not have is device bytes, and `stage()` supplies
-                    # those on first declared use. A construction that silently skipped it
-                    # would be a different model.
+                if not self.place(name, memory.peak):
                     self.parked[name] = member
                     self.stage_log.append({"component": name, "action": "park", "bytes": size})
                     continue
-                held += memory.base
-                want = size
-                self.vram_charge[name] = want
-                # A `to_empty` that runs out of device memory halfway leaves the half it
-                # moved held by the module. Nothing here frees it: the prepare that owns
-                # this construction is poisoned by the raise and the process is replaced,
-                # which is the one reclaim that cannot miss a byte (#613).
+                # A `to_empty` that runs out of device memory halfway poisons the prepare that
+                # owns this construction, and the process is replaced (#613).
                 member.to_empty(device=self.device, recurse=True)
                 _restore_derived(member, derived)
                 self.components[name] = member
-                self._mark(
-                    "component_reserved",
-                    component=name,
-                    priced=want,
-                    derived_restored=len(derived),
-                )
+                self._mark("component_reserved", component=name, derived_restored=len(derived))
             # Inside the placement window too: censusing a REAL module detaches every
             # tensor, and a detach on cuda is exactly the "real allocation during
             # construction" the derive guard exists to catch in author code.
@@ -1774,7 +1670,6 @@ class StreamingFillBackend:
         for parts in self.scratch.values():
             scratch += distinct_storage_bytes(parts.values())
         return {
-            "charge": dict(self.vram_charge),
             "component_bytes": dict(self.component_bytes),
             "held": held,
             "held_total": sum(held.values()),
@@ -1795,11 +1690,6 @@ class StreamingFillBackend:
     @property
     def component_bytes(self) -> dict[str, int]:
         return {name: memory.settled for name, memory in self.component_memory.items()}
-
-    def stage_bytes(self, name: str, headroom: int = 0) -> int:
-        if name in self.paging:
-            return self.paging[name].working_bytes + headroom
-        return self.component_memory[name].admission(headroom)
 
     def device_envelope(self) -> DeviceEnvelope:
         """Header costs for the selected implementation; the module census adds derived buffers."""
@@ -2059,10 +1949,6 @@ class StreamingFillBackend:
                 }
             finally:
                 ring.close()
-                # The lease is released AFTER the fence, explicitly. A hold that outlives
-                # the process is the store's to reap; a hold dropped before the copies land
-                # is a read against bytes the GC may already consider free.
-                self.release_lease()
         self.stats["stream_ms"] = (time.perf_counter_ns() - started) // 1_000_000
         # The tfs-018-comparable leg: reserve device destinations, read, copy, fence. It
         # deliberately EXCLUDES the meta construction, which those arms have no analogue
@@ -2117,8 +2003,7 @@ class StreamingFillBackend:
                 )
             self.census_keys[name] = frozenset(present)
             after = sum(int(t.numel() * t.element_size()) for _, t in _tensors(member))
-            charged = self.vram_charge.get(name, 0)
-            self.vram_charge[name] = after
+            charged = self.component_memory[name].settled
             self.component_memory[name].resident = after
             self.stage_log.append(
                 {
@@ -2131,57 +2016,24 @@ class StreamingFillBackend:
             )
             del self.stage_log[:-64]
 
-    def release_lease(self) -> None:
-        """Give the hold back. Idempotent: a poison and a commit may both reach here.
-
-        A STAGING generation keeps it: re-staging an evicted component reads the store
-        again, and reading objects the GC may already consider free is the one thing a hold
-        exists to prevent. `close()` is where a held lease ends.
-        """
-        if self.hold_lease:
-            return
-        self.leases.release()
-
     def close(self) -> None:
-        """End the generation's hold. Called when the executor tears the generation down."""
-        for hook in self.paging_hooks:
-            hook.remove()
-        self.paging_hooks.clear()
-        self.hold_lease = False
-        self.release_lease()
+        """End the generation's read leases after every fill/move has completed."""
+        self.leases.release()
 
     # -- component staging (cr-008b) ---------------------------------------------
 
-    def evict(self, name: str) -> int:
-        """FREE one component's device bytes. Returns what came back.
-
-        Eviction is demand-pull and it FREES — there is no demote-copy and no host
-        residence tier (§3.2). Re-staging is an ordinary cr-005 fill from the page-cached
-        CAS mapping, which is both simpler and, on a warm page cache, faster than a D2H
-        copy plus an H2D copy would be. The module is moved to `meta` rather than dropped,
-        so its tensor schema survives and the restage is a reservation, not a construction.
-        """
-        if name in self.paging:
-            if name in self.page_resident:
-                raise _refuse(
-                    "leaf_schema", "cannot evict a component during a block forward", [name]
-                )
-            if name not in self.components:
-                return 0
-            self._park_page(self.paging[name].common)
-            self.parked[name] = self.components.pop(name)
-            return self.vram_charge.pop(name, 0)
+    def drop(self, name: str) -> None:
+        """Send one component's bytes back to the store: its tree goes to `meta`, so its schema
+        survives and a refill is a reservation, not a construction. References are dropped,
+        never resized away: a view held elsewhere keeps its storage alive."""
         member = self.components.pop(name, None)
         if member is None:
-            return 0
-        charged = self.vram_charge.pop(name, 0)
+            return
         with placing():
-            self._free_storages(t for _, t in _tensors(member))
             member.to_empty(device=self.torch.device("meta"), recurse=True)
             rows = [r for r in self.replaced.values() if r.contract_key.startswith(f"{name}.")]
             for row in rows:
-                # The original weight storage was retired by _decode; bias may alias the
-                # encoded leaf, whose storage was just freed. Keep topology, never bytes.
+                # Keep the float topology the refill rebuilds its leaves from, never bytes.
                 row.original.to_empty(device=self.torch.device("meta"), recurse=True)
                 setattr(row.owner, row.attribute, row.original)
                 self.replaced.pop(row.contract_key)
@@ -2192,22 +2044,31 @@ class StreamingFillBackend:
                     | {row.contract_key for row in rows}
                 )
         self.parked[name] = member
-        self.stage_log.append({"component": name, "action": "evict", "bytes": charged})
+        self.stage_log.append(
+            {"component": name, "action": "evict", "bytes": self.component_memory[name].settled}
+        )
         del self.stage_log[:-64]
-        return charged
 
-    def stage(self, name: str) -> StageRow | None:
-        """Re-reserve and RE-FILL one evicted component. The same transaction, scoped.
-
-        A paged component fills only its common unit and reports no stage legs (None).
+    def load(self, name: str) -> StageRow:
+        """Re-reserve and RE-FILL one component from the store. The same transaction, scoped.
 
         Every refusal the whole-generation path has fires here too, because it IS that
         path: `fill` validates each destination against the stored row, `_stream` splices
         the store's batches, and the completion events fence before the component is
-        observable. A staged component that half-arrives POISONS the generation through
-        the residency plane and the process is replaced; it is never served and never
-        unwound in-process (#613).
+        observable. A load that fails leaves the component whole on the store again; the
+        memory planner decides what the failure means.
         """
+        try:
+            return self._load(name)
+        except BaseException:
+            self._abandon()
+            member = self.parked.pop(name, None)
+            if member is not None:
+                self.components[name] = member
+            self.drop(name)
+            raise
+
+    def _load(self, name: str) -> StageRow:
         member = self.parked.get(name)
         if member is None:
             raise _refuse(
@@ -2216,26 +2077,13 @@ class StreamingFillBackend:
                 f"{', '.join(sorted(self.parked)) or 'none'}) — staging moves bytes for a "
                 "component the construction already built, never for a new one",
             )
-        if name in self.paging:
-            common = self.paging[name].common
-            self.parked.pop(name)
-            self._fill_page(name, common)
-            self.components[name] = member
-            self.vram_charge[name] = common.nbytes
-            return None
         started = time.perf_counter_ns()
         memory = self.component_memory[name]
-        want = memory.destinations
-        # NO UNWIND PAST THIS LINE. A stage that fails after reserving, or after the first
-        # batch lands, raises; the residency plane poisons the generation and the process
-        # is replaced (#613). Freeing the half that arrived would be an in-process rollback
-        # engine, which is exactly what this hardcut deletes.
         with placing():
             member.to_empty(device=self.device, recurse=True)
             _restore_derived(member, self.derived.get(name, {}))
             fresh = census(_Holder({name: member}))
         reserved = time.perf_counter_ns()
-        self.vram_charge[name] = want
         objects = len(self._acquire(name).objects)
         leased = time.perf_counter_ns()
         # OUT OF `parked` BEFORE THE FILL. `fill` skips a parked component's destinations —
@@ -2246,8 +2094,7 @@ class StreamingFillBackend:
         # wrong. Measured exactly that — a black image from a "successful" 43 ms stage of
         # 4.78 GiB, a rate no disk can produce.
         self.parked.pop(name, None)
-        # Own the tree before _leaf_site validates replacements. It is not observable
-        # until the scope admission commits; a failure poisons the executor generation.
+        # Own the tree before _leaf_site validates replacements.
         self.components[name] = member
         for destination in fresh.destinations:
             self.fill(destination.key, destination.spec, fresh.live[destination.key])
@@ -2304,62 +2151,74 @@ class StreamingFillBackend:
         del self.stage_log[:-64]
         return row
 
-    def _fill_page(self, name: str, unit: PageUnit) -> None:
-        """Reserve only this unit, then use the ordinary validated TensorFS fill transaction."""
+    def transient(self, name: str) -> int:
+        memory = self.component_memory.get(name)
+        return memory.overhead if memory is not None else 0
+
+    def unit_loads(self, name: str, keys: frozenset[str]) -> bool:
+        """Units of `name` can each be filled alone: every tensor is stored verbatim, and the
+        units' destinations are exactly the component's."""
+        return keys == self.expected.get(name) and all(
+            self.resolved[key].route == "verbatim" for key in keys if key in self.resolved
+        )
+
+    def load_unit(self, name: str, unit: Unit) -> None:
+        """Reserve only this unit, then fill it through the ordinary validated transaction."""
         if self.enqueued:
             raise _refuse("incomplete_fill", "another fill is already pending", [name])
+        if not set(unit.live(name)) <= self.expected.get(name, frozenset()):
+            raise _refuse("incomplete_fill", "unit destinations changed", [name, unit.path])
+        member = self.parked.pop(name, None)
+        if member is not None:
+            self.components[name] = member
+        try:
+            self._fill_unit(name, unit)
+        except BaseException:
+            # A failed fill leaves nothing half-placed: the unit goes back to meta and the
+            # memory planner decides what the failure means.
+            self._abandon()
+            self.drop_unit(unit)
+            if member is not None:
+                self.parked[name] = self.components.pop(name)
+            raise
+
+    def _fill_unit(self, name: str, unit: Unit) -> None:
         with placing():
-            owners = {id(module) for _, module in unit.owners}
-            for _, module in unit.owners:
+            owners = unit.owners()
+            for _, module in owners:
                 module.to_empty(device=self.device, recurse=False)
             _restore_derived(
                 self.components.get(name),
                 {
                     key: value
                     for key, value in self.derived.get(name, {}).items()
-                    if id(key[0]) in owners
+                    if any(key[0] is module for _, module in owners)
                 },
             )
             live = unit.live(name)
-        expected = {f"{name}.{key}" for key in unit.keys}
-        if set(live) != expected or not expected <= self.expected.get(name, frozenset()):
-            raise _refuse("incomplete_fill", "paging unit destinations changed", [name, unit.path])
         for key, tensor in live.items():
-            spec = self.paging_specs[key]
+            spec = self.specs[key]
             if tuple(tensor.shape) != spec.shape:
-                raise _refuse("length_mismatch", f"{key}: paging destination shape changed", [key])
+                raise _refuse("length_mismatch", f"{key}: unit destination shape changed", [key])
             self.fill(key, spec, tensor)
         if live:
-            self._commit_enqueued()
+            self.unit_fill = True
+            try:
+                self._commit_enqueued()
+            finally:
+                self.unit_fill = False
         self.state = "ready"
 
-    def _park_page(self, unit: PageUnit) -> None:
+    def _abandon(self) -> None:
+        """Forget a fill that failed part way: its queue and its scratch."""
+        self.enqueued.clear()
+        self._drop_scratch()
+        self.unit_fill = False
+
+    def drop_unit(self, unit: Unit) -> None:
         with placing():
-            for _, module in unit.owners:
-                self._free_storages(
-                    tensor
-                    for _, tensor in (
-                        *module.named_parameters(recurse=False),
-                        *module.named_buffers(recurse=False),
-                    )
-                )
+            for _, module in unit.owners():
                 module.to_empty(device=self.torch.device("meta"), recurse=False)
-
-    def stage_page(self, name: str, unit: PageUnit) -> None:
-        if name not in self.components or name in self.page_resident:
-            raise _refuse(
-                "leaf_schema", "paging requires one admitted component and no live block", [name]
-            )
-        self._fill_page(name, unit)
-        self.page_resident[name] = unit
-        self.vram_charge[name] += unit.nbytes
-
-    def evict_page(self, name: str, unit: PageUnit) -> None:
-        if self.page_resident.get(name) is not unit:
-            raise _refuse("leaf_schema", "paging eviction does not name the live block", [name])
-        self._park_page(unit)
-        self.page_resident.pop(name)
-        self.vram_charge[name] -= unit.nbytes
 
     def poison(self, keys: Sequence[str]) -> None:
         """Abort the new generation: mark it poisoned and free NOTHING (#613).
@@ -2375,8 +2234,7 @@ class StreamingFillBackend:
         how many destinations were in flight, and the read lease's end — a hold kept for a
         generation that no longer exists would be the store's reaper's problem.
         """
-        self.hold_lease = False
-        self.release_lease()
+        self.leases.release()
         self.poison_report = {
             "keys_in_flight": len(keys),
             "enqueued": len(self.enqueued),
@@ -2389,34 +2247,17 @@ class StreamingFillBackend:
             self.forensics.dump("poison")
         self.state = "poisoned"
 
-    def _free_storages(self, tensors: Any) -> int:
-        """Free the backing allocation of every distinct storage, once. Views share it, so
-        a set of storage identities is the unit that can be freed exactly once."""
-        seen: set[int] = set()
-        freed = 0
-        for tensor in tensors:
-            try:
-                storage = tensor.untyped_storage()
-            except Exception:
-                continue
-            token = storage.data_ptr()
-            if token in seen or token == 0:
-                continue
-            seen.add(token)
-            freed += storage.nbytes()
-            storage.resize_(0)
-        return freed
-
     # -- the decode leg (cr-006) --------------------------------------------------
 
-    def _decode(self, pending: list[PlanRow]) -> int:
+    def _decode(self, pending: list[PlanRow], flat: dict[str, Any]) -> int:
         """Turn every landed role set into its logical tensor, then free the scratch.
 
         Called only behind `ring.drain(0)`, so every H2D for these roles has completed.
         The provider writes into the destination the census reserved — there is no moment
         where a decoded tensor exists outside a priced component.
 
-        Returns the scratch bytes released, so the caller's rolling window stays exact.
+        Returns the bytes no longer owned by scratch. Other tensor views may retain their
+        storage: dropping our references never invalidates someone else's view.
         """
         if not pending:
             return 0
@@ -2452,20 +2293,19 @@ class StreamingFillBackend:
             spent.append(parts)
             self.decoded["tensors"] += 1
             self.decoded["bytes"] += row.stored_nbytes
-        # THE DECODE'S OWN FENCE, before its scratch goes back to the allocator. `decode`
-        # ENQUEUES kernels on this stream and returns; `resize_(0)` frees the block those
-        # kernels are still reading, and the very next role's H2D on the ring's stream —
-        # which is where the scratch was allocated, so it is that pool the block returns to
-        # — writes over it. An e4m3 byte of 0xff IS NaN, so the damage arrives as a handful
-        # of NaN elements rather than as a fault: measured on the real fp8 UNet at 2 of 6
-        # stage-ins, 9 to 13 tensors of 1,680 with 9 to 16 NaN elements each, and never on
-        # a whole-generation fill (a fresh allocator does not hand the block straight back).
-        # A package without an output-integrity floor SERVES that (se-008).
-        self.torch.cuda.current_stream().synchronize()
+        # Decode kernels run on compute while roles were allocated on the ring stream.
+        # Fence compute before dropping either their role references or byte views.
+        self.torch.cuda.current_stream(self.device).synchronize()
         for parts in spent:
-            freed += self._free_storages(parts.values())
+            freed += distinct_storage_bytes(parts.values())
+            parts.clear()
         for parts in retired:
-            self._free_storages(parts.values())
+            parts.clear()
+        for row in pending:
+            for part in row.encoded.parts:
+                flat.pop(row.role_what(part.role), None)
+            if isinstance(self.selected[row.key].provider, LeafProvider):
+                self.enqueued.pop(row.key, None)
         pending.clear()
         self.decoded["flushes"] += 1
         self.decoded["ms"] += (time.perf_counter_ns() - started) // 1_000_000
@@ -2479,13 +2319,9 @@ class StreamingFillBackend:
         Returns what is now RETIRED — the float destination whose storage the leaf made
         redundant, plus any role buffer the leaf transformed rather than kept (the mxfp8
         leaf swizzles its scale grid once at fill and holds the swizzled one). The caller
-        frees them behind the decode's own fence, which is exactly as load-bearing here as
-        it is on the decode path: `to_blocked` ENQUEUES kernels that read the grid, and
-        resizing its storage to zero before they run hands the next H2D that block.
-
-        The float destination is freed rather than dropped, for cr-005's finding-3 reason:
-        a dropped reference frees nothing while the exception's frames, the census's `live`
-        map, or `enqueued` still hold one — and here `enqueued` certainly does.
+        drops those references behind the decode's fence: `to_blocked` enqueues kernels
+        that read the old scale grid. The census or an outside view may retain the float
+        destination; its actual allocator bytes remain charged until that owner releases it.
         """
         destination = self.enqueued[row.key]
         owner, replaced, attribute = self._leaf_site(row.key, row, destination)
@@ -2524,42 +2360,20 @@ class StreamingFillBackend:
             attribute=attribute,
             role_keys=tuple(sorted(f"{module_path}.{role}" for role in leaf.roles())),
             stored_bytes=row.stored_nbytes,
-            freed_bytes=int(destination.numel() * destination.element_size()),
         )
         with placing():
             replaced.to_empty(device=self.torch.device("meta"), recurse=True)
         return retired
 
     def _drop_scratch(self) -> int:
-        """Give back every scratch buffer a failed stream left behind. Positive act."""
-        freed = 0
-        for parts in self.scratch.values():
-            freed += self._free_storages(parts.values())
+        """Drop this plane's scratch references after the caller has fenced their users."""
+        freed = distinct_storage_bytes(
+            tensor for parts in self.scratch.values() for tensor in parts.values()
+        )
         self.scratch.clear()
         return freed
 
     # -- the unload/release path -------------------------------------------------
-
-    def release(self, component: str) -> int:
-        """Component release RETURNS VRAM. Release makes bytes evictable and this plane's
-        baseline backend frees them outright (§3.2: device eviction FREES, never copies to
-        host). Returns the allocator's own delta, never arithmetic."""
-        member = self.components.pop(component, None)
-        if member is None:
-            raise _refuse(
-                "destination_absent",
-                f"{component!r} is not a component this generation holds",
-                [component],
-            )
-        before = accel.allocated(self.torch, self.kind, self.device)
-        with placing():
-            self._free_storages(t for _, t in _tensors(member))
-            member.to_empty(device=self.torch.device("meta"), recurse=True)
-        for key in [k for k in self.enqueued if k.split(".")[0] == component]:
-            del self.enqueued[key]
-        accel.release_cached(self.torch, self.kind)
-        self.vram_charge.pop(component, None)
-        return before - accel.allocated(self.torch, self.kind, self.device)
 
     # -- the stream ---------------------------------------------------------------
 
@@ -2654,24 +2468,31 @@ class StreamingFillBackend:
             """
             start = cursor[0]
             done: list[PlanRow] = []
-            with torch.cuda.stream(ring.stream):
-                for item in batch.items():
-                    what = str(item["what"])
-                    source = int(item["off"])
-                    length = int(item["len"])
-                    target = start + source - base[what]
-                    slot_for(what)[target : target + length].copy_(
-                        ring.buffers[batch.slot][source : source + length], non_blocking=True
-                    )
-                    remaining[what] -= length
-                    if remaining[what] == 0:
-                        row = owner[what]
-                        if self.selected[row.key].provider.route != "verbatim" and all(
-                            remaining[row.role_what(p.role)] == 0 for p in row.encoded.parts
-                        ):
-                            done.append(row)
-                event = torch.cuda.Event()
-                event.record(ring.stream)
+            try:
+                with torch.cuda.stream(ring.stream):
+                    for item in batch.items():
+                        what = str(item["what"])
+                        source = int(item["off"])
+                        length = int(item["len"])
+                        target = start + source - base[what]
+                        slot_for(what)[target : target + length].copy_(
+                            ring.buffers[batch.slot][source : source + length], non_blocking=True
+                        )
+                        remaining[what] -= length
+                        if remaining[what] == 0:
+                            row = owner[what]
+                            if self.selected[row.key].provider.route != "verbatim" and all(
+                                remaining[row.role_what(p.role)] == 0 for p in row.encoded.parts
+                            ):
+                                done.append(row)
+                    event = torch.cuda.Event()
+                    event.record(ring.stream)
+            except BaseException:
+                # No completion event owns this partial batch yet. Fence before returning
+                # its slot to the native reader, which may reuse it as soon as we raise.
+                ring.stream.synchronize()
+                batch.release()
+                raise
             cursor[0] = start + int(batch.nbytes)
             ring.hold(event, batch)
             batches[0] += 1
@@ -2685,7 +2506,7 @@ class StreamingFillBackend:
                 # whole ring — which is why it is triggered by a byte budget and not per
                 # tensor: 743 fences would cost more than the scratch it saves.
                 ring.drain(0)
-                held[0] -= self._decode(pending)
+                held[0] -= self._decode(pending, flat)
                 self._mark(
                     "decode_flush",
                     component=current[0],
@@ -2697,18 +2518,18 @@ class StreamingFillBackend:
         stats: dict[str, object] = {}
         for component, group in by_component.items():
             traversal = [(row.component, row.name) for row in group]
-            if component in self.paging:
-                complete = self.paging_plans.get(component)
+            if self.unit_fill:
+                complete = self.unit_plans.get(component)
                 if complete is None:
                     complete_traversal = [
                         (component, self.plan[key].name)
-                        for key in self.paging_specs
+                        for key in self.specs
                         if key in self.plan and self.plan[key].component == component
                     ]
                     complete = self.checkpoints[component].read_plan(
                         complete_traversal, self.window_bytes, (component,)
                     )
-                    self.paging_plans[component] = complete
+                    self.unit_plans[component] = complete
                 # Native selection keeps its windows and order after the complete
                 # constructor/header traversal has passed validation.
                 plan = complete.select(
@@ -2801,8 +2622,13 @@ class StreamingFillBackend:
                 # begins. It is ALSO the decode's fence: a provider reading scratch whose
                 # H2D has not completed reads whatever the allocator last left there.
                 ring.drain(0)
-                held[0] -= self._decode(pending)
+                held[0] -= self._decode(pending, flat)
             finally:
+                # A callback or decoder may have raised after submitting only part of a
+                # batch. Both copy and compute must finish before any scratch is released.
+                ring.finish()
+                torch.cuda.current_stream(self.device).synchronize()
+                flat.clear()
                 dropped = self._drop_scratch()
                 self._mark(
                     "component_stream_end",

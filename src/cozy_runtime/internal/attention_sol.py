@@ -36,6 +36,7 @@ from typing import Any
 
 from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT, AttentionLayout
 from cozy_runtime.author._observations import Scalar
+from cozy_runtime.author._retry import pure
 from cozy_runtime.internal import config, kernel_cache, kernel_compile
 from cozy_runtime.internal.attention_ulysses import Local
 
@@ -178,7 +179,7 @@ def install_site(module: Any, component: str, path: str) -> None:
         [Parameter(self_name, Parameter.POSITIONAL_ONLY), *original_signature.parameters.values()],
         return_annotation=original_signature.return_annotation,
     )
-    wrapper = MethodType(scoped_forward, module)
+    wrapper = MethodType(pure(scoped_forward), module)
     module.forward = wrapper
     try:
         module._cozy_sol_site = _InstalledSite(site, wrapper, call, bound, had_forward, prior)

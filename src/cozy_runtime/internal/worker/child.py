@@ -35,13 +35,14 @@ import sys
 import threading
 import time
 import traceback
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from cozy_runtime import __version__ as RUNTIME_VERSION
-from cozy_runtime.author._executor_requests import Handler, respond
+from cozy_runtime.author._executor_requests import Handler
+from cozy_runtime.author._executor_requests import respond as answer_request
 from cozy_runtime.internal import accel, executor_commands, jit_cache, liveness, proctree, spawn
 from cozy_runtime.internal.child_env import (
     ALLOWLIST,
@@ -49,15 +50,28 @@ from cozy_runtime.internal.child_env import (
     FLASH_ATTENTION_CACHE_ENABLED_ENV,
 )
 from cozy_runtime.internal.executor_commands import Command, Hello
+from cozy_runtime.internal.executor_replies import rank_memory_facts
 from cozy_runtime.internal.seam import (
     EXECUTOR_PROTOCOL_REVISION,
     Channel,
     SeamError,
+    _scan,
     listener,
 )
 from cozy_runtime.internal.worker.plan import PreparedModel
 
 _LOG = logging.getLogger(__name__)
+
+
+def respond(
+    frame: Mapping[str, object], handler: Handler | None
+) -> tuple[dict[str, object], socket.socket | None]:
+    """Preserve the seam's credential check before interpreting optional byte counters."""
+    _scan(dict(frame))
+    if frame.get("kind") == "device_room" and "rank_memory" in frame:
+        frame = {**frame, "rank_memory": rank_memory_facts(frame["rank_memory"])}
+    return answer_request(frame, handler)
+
 
 #: How often the worker LOOKS while a spawned executor is dialling back. A sampling
 #: cadence, not a bound: `spawn` waits while the child is alive, and this only says how
@@ -708,10 +722,25 @@ class ExecutorSupervision:
                 temporary.unlink(missing_ok=True)
 
     @contextlib.contextmanager
-    def hold(self, expected: Executor) -> Any:
+    def hold(self, expected: Executor) -> Iterator[bool]:
         """Keep one exact executor current across an acceptance commit."""
         with self._lifecycle:
             yield self.current is expected and expected.alive() and not self._closed
+
+    @contextlib.contextmanager
+    def try_hold(self, expected: Executor) -> Iterator[bool | None]:
+        """An ownership commit must not wait for lifecycle I/O while holding Worker control.
+
+        None means busy; False means acquired but the expected generation is no longer
+        owned. The caller may wait outside its other locks, then recheck every fence.
+        """
+        if not self._lifecycle.acquire(blocking=False):
+            yield None
+            return
+        try:
+            yield self.current is expected and expected.alive() and not self._closed
+        finally:
+            self._lifecycle.release()
 
     # ------------------------------------------------------------------ spawn
 

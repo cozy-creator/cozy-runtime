@@ -54,6 +54,7 @@ from cozy_runtime.author._executor_requests import (
     CheckpointReceipt,
     DeviceRoom,
     Handler,
+    HostRoom,
     Publish,
     Published,
     Reply,
@@ -192,12 +193,12 @@ GROUP_FAULT_CODES = frozenset(
     }
 )
 
-#: The device-capacity codes a FAILED attempt can carry (cr-097). Their peak is a
+#: The memory-capacity codes a FAILED attempt can carry (cr-097). Their peak is a
 #: truncated lower bound and may never calibrate; the picture they died under is recorded
 #: instead, as a refusal-grade fact. `device_shortfall` is the runtime's own pre-mutation
 #: refusal and `device_out_of_memory` is the allocator's surprise past it — both say the
 #: same thing about the next attempt under the same picture.
-DEVICE_SHORTFALL_CODES = frozenset({"device_out_of_memory", "device_shortfall"})
+DEVICE_SHORTFALL_CODES = frozenset({"device_out_of_memory", "device_shortfall", "host_shortfall"})
 
 _TERMINAL = {
     "succeeded": (STATUS.OUTCOME_STATUS_SUCCEEDED, CAUSE.CAUSE_CODE_UNSPECIFIED),
@@ -325,8 +326,9 @@ class AttemptRecord:
     spec: dict[str, Any]
     grant: grants.BoundGrant = dataclasses_field(default_factory=grants.BoundGrant)
     plan: AttemptPlan | None = None
-    #: the memory manager made room for this call's measured need on every device
-    room: bool = True
+    #: None is legacy/weightless; zero is an explicit allocation ceiling.
+    memory_grant: int | None = None
+    memory_grants: tuple[int, ...] = ()
     declared: DeclaredBinding | None = None
     #: what THIS worker's prepare resolved for that binding — never what it declared
     prepared_model: PreparedModel | None = None
@@ -882,10 +884,14 @@ class AttemptEngine:
             raise AttemptRefusal(
                 code,
                 reply.detail[:1024],
-                cause=CAUSE.CAUSE_CODE_INVALID_REQUEST
+                cause=CAUSE.CAUSE_CODE_CONSTRAINT_INFEASIBLE
+                if code in {"device_shortfall", "host_shortfall"}
+                else CAUSE.CAUSE_CODE_INVALID_REQUEST
                 if reply.origin in ("request", "author")
                 else CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
-                origin=_ORIGIN.get(reply.origin, ORIGIN.CAUSE_ORIGIN_EXECUTOR),
+                origin=ORIGIN.CAUSE_ORIGIN_RUNTIME
+                if code in {"device_shortfall", "host_shortfall"}
+                else _ORIGIN.get(reply.origin, ORIGIN.CAUSE_ORIGIN_EXECUTOR),
             )
         return PreparedRequest(
             request_id=f"{attempt.request_id}#{attempt.attempt}",
@@ -1093,7 +1099,12 @@ class AttemptEngine:
                     type(exc).__name__,
                 )
 
-    def _accept_job(self, attempt: AttemptRecord) -> None:
+    def _accept_job(
+        self,
+        attempt: AttemptRecord,
+        *,
+        commit: Callable[[Callable[[], None]], bool] | None = None,
+    ) -> bool:
         """BOUNDED ACCEPT-THEN-PREPARE — the ONE mode difference from serving (cr-009).
 
         Serving never accepts-then-cold-loads: a warm generation is the whole point of a
@@ -1156,59 +1167,70 @@ class AttemptEngine:
 
         opened = slot.ledger.snapshot()
         self._hold_job_models(attempt, binding, descriptor_id)
-        attempt.opened = opened
-
         plan_digest = plan.digest()
+
+        def finish() -> None:
+            attempt.opened = opened
+            self.records.append(
+                "accepted",
+                {
+                    "request_id": attempt.request_id,
+                    "attempt": attempt.attempt,
+                    "worker_boot_id": self.boot_id,
+                    "instance_id": self.instance_id,
+                    "attempt_kind": "job",
+                    "invocation_spec_digest": documents.spell(attempt.digest),
+                    "plan_digest": plan_digest,
+                    "job_descriptor_id": descriptor_id,
+                    "installation_id": binding.installation_id,
+                    "grant_epoch": attempt.grant.credential_epoch,
+                    "executor_epoch": attempt.executor_epoch,
+                    "executor_pid": attempt.executor_pid,
+                    "placement_id": attempt.placement_id,
+                    "input_trees": ",".join(sorted(attempt.trees)),
+                },
+            )
+            self._accepted(attempt)
+
+        accepted = False
         try:
-            with supervision.hold(executor) as owned:
-                if not owned:
-                    raise AttemptRefusal(
-                        "executor_replaced_before_acceptance",
-                        "the job executor changed before its acceptance could be committed",
-                        cause=CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
-                    )
-                self.records.append(
-                    "accepted",
-                    {
-                        "request_id": attempt.request_id,
-                        "attempt": attempt.attempt,
-                        "worker_boot_id": self.boot_id,
-                        "instance_id": self.instance_id,
-                        "attempt_kind": "job",
-                        "invocation_spec_digest": documents.spell(attempt.digest),
-                        "plan_digest": plan_digest,
-                        "job_descriptor_id": descriptor_id,
-                        "installation_id": binding.installation_id,
-                        "grant_epoch": attempt.grant.credential_epoch,
-                        "executor_epoch": attempt.executor_epoch,
-                        "executor_pid": attempt.executor_pid,
-                        "placement_id": attempt.placement_id,
-                        "input_trees": ",".join(sorted(attempt.trees)),
-                    },
-                )
-        except Exception:
-            self._release_job_models(attempt)
-            raise
-        self._accepted(attempt)
+            if commit is not None:
+                accepted = commit(finish)
+            else:
+                with supervision.hold(executor) as owned:
+                    if not owned:
+                        raise AttemptRefusal(
+                            "executor_replaced_before_acceptance",
+                            "the job executor changed before its acceptance could be committed",
+                            cause=CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
+                        )
+                    finish()
+                    accepted = True
+            return accepted
+        finally:
+            if not accepted:
+                self._release_job_models(attempt)
 
     def prepare_and_accept(
-        self, attempt: AttemptRecord, *, before_plan: Callable[[], None] | None = None
-    ) -> None:
-        """Stage and enter in one step: the path of an attempt whose lane has no queue ahead
-        of it (a job, or a caller that holds the device already)."""
+        self,
+        attempt: AttemptRecord,
+        *,
+        before_plan: Callable[[], None] | None = None,
+        commit: Callable[[Callable[[], None]], bool] | None = None,
+    ) -> bool:
+        """Prepare outside Worker control; only the caller's commit callback holds it."""
         if attempt.spec.get("job") is not None:
-            self._accept_job(attempt)
-            return
-        self.stage(attempt)
-        if not self.claim_staged(attempt):
-            raise AttemptRefusal(
-                "attempt_left_queue",
-                "the staged attempt was cancelled before it could enter the device",
-                cause=CAUSE.CAUSE_CODE_LOCAL_SAFETY,
-            )
-        self.enter(attempt, before_plan=before_plan)
+            return self._accept_job(attempt, commit=commit)
+        if not self.stage(attempt, commit=commit) or not self.claim_staged(attempt):
+            return False  # Cancellation owns the terminal if it won the staged claim.
+        return self.enter(attempt, before_plan=before_plan, commit=commit)
 
-    def stage(self, attempt: AttemptRecord) -> None:
+    def stage(
+        self,
+        attempt: AttemptRecord,
+        *,
+        commit: Callable[[Callable[[], None]], bool] | None = None,
+    ) -> bool:
         """QUEUE ADMISSION (proto-026, proto-061 G): validate -> fetch -> hydrate -> journal.
 
         Everything an attempt needs that is not the device happens here, while the lane's
@@ -1233,21 +1255,28 @@ class AttemptEngine:
         # unreachable input is a refusal the RecordOwner can read, never an accepted attempt
         # that dies on a thread. It happens off the device, beside the running attempt.
         self._hydrate_inputs(attempt)
-        self.records.append(
-            "accepted",
-            {
-                "request_id": attempt.request_id,
-                "attempt": attempt.attempt,
-                "worker_boot_id": self.boot_id,
-                "instance_id": self.instance_id,
-                "invocation_spec_digest": documents.spell(attempt.digest),
-                "grant_epoch": attempt.grant.credential_epoch,
-                "placement_id": attempt.placement_id,
-                "lane_id": attempt.lane_id,
-                "entrypoint_binding_digest": serving["entrypoint_binding_digest"],
-            },
-        )
-        self._accepted(attempt, "staged")
+
+        def finish() -> None:
+            self.records.append(
+                "accepted",
+                {
+                    "request_id": attempt.request_id,
+                    "attempt": attempt.attempt,
+                    "worker_boot_id": self.boot_id,
+                    "instance_id": self.instance_id,
+                    "invocation_spec_digest": documents.spell(attempt.digest),
+                    "grant_epoch": attempt.grant.credential_epoch,
+                    "placement_id": attempt.placement_id,
+                    "lane_id": attempt.lane_id,
+                    "entrypoint_binding_digest": serving["entrypoint_binding_digest"],
+                },
+            )
+            self._accepted(attempt, "staged")
+
+        if commit is not None:
+            return commit(finish)
+        finish()
+        return True
 
     def _resolve_declared_binding(self, attempt: AttemptRecord) -> DeclaredBinding:
         """Validate queued work against its declaration, before any model is loaded.
@@ -1297,8 +1326,12 @@ class AttemptEngine:
             return True
 
     def enter(
-        self, attempt: AttemptRecord, *, before_plan: Callable[[], None] | None = None
-    ) -> None:
+        self,
+        attempt: AttemptRecord,
+        *,
+        before_plan: Callable[[], None] | None = None,
+        commit: Callable[[Callable[[], None]], bool] | None = None,
+    ) -> bool:
         """DEVICE ENTRY for a claimed staged attempt, under the lane's device lock: bind the
         executor, resolve the request in it, choose the plan, journal the binding.
 
@@ -1359,22 +1392,30 @@ class AttemptEngine:
         attempt.prepared = prepared
         if before_plan is not None:
             before_plan()
-        try:
-            plan = slot.chooser.choose(declared, loaded.prepared_model, prepared, fits=attempt.room)
-        except PlanRefusal as exc:
-            raise AttemptRefusal(
-                exc.code, exc.detail, cause=CAUSE.CAUSE_CODE_CONSTRAINT_INFEASIBLE
-            ) from exc
-        attempt.plan = plan
-        attempt.opened = slot.ledger.snapshot()
 
-        with supervision.hold(executor) as owned:
-            if not owned:
+        def finish() -> None:
+            # Preparation was against this exact construction, not a subsequently loaded
+            # replacement. Re-resolve against the slot the Worker just rebound under control.
+            current = self._resolve_declared_binding(attempt)
+            if (
+                current != declared
+                or executor.loaded.get(declared.construction_key()) is not loaded
+                or plan_id not in executor.ready_bindings
+                or executor.poisoned
+            ):
                 raise AttemptRefusal(
-                    "executor_replaced_before_entry",
-                    "the prepared executor changed before device entry could be committed",
+                    "construction_changed_before_entry",
+                    "the prepared binding or construction changed before device entry",
                     cause=CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
                 )
+            try:
+                plan = slot.chooser.choose(declared, loaded.prepared_model, prepared)
+            except PlanRefusal as exc:
+                raise AttemptRefusal(
+                    exc.code, exc.detail, cause=CAUSE.CAUSE_CODE_CONSTRAINT_INFEASIBLE
+                ) from exc
+            attempt.plan = plan
+            attempt.opened = slot.ledger.snapshot()
             self.records.append(
                 "entered",
                 {
@@ -1388,7 +1429,19 @@ class AttemptEngine:
                     "executor_pid": attempt.executor_pid,
                 },
             )
-        attempt.state = "accepted"
+            attempt.state = "accepted"
+
+        if commit is not None:
+            return commit(finish)
+        with supervision.hold(executor) as owned:
+            if not owned:
+                raise AttemptRefusal(
+                    "executor_replaced_before_entry",
+                    "the prepared executor changed before device entry could be committed",
+                    cause=CAUSE.CAUSE_CODE_EXECUTOR_FAULT,
+                )
+            finish()
+            return True
 
     # ------------------------------------------------------------------ execute
 
@@ -1603,6 +1656,12 @@ class AttemptEngine:
                 return self.publish(attempt, request)
             case Checkpoint():
                 return self.checkpoint_exchange(attempt, request)
+            case HostRoom():
+                return (
+                    self.room(attempt)(request)
+                    if self.room is not None
+                    else refuse("host_shortfall", "this job has no host reservation broker")
+                )
             case DeviceRoom():
                 return refuse("no_durable_exchange", "a job's executor is granted no device room")
             case TreeMember():
@@ -1858,6 +1917,10 @@ class AttemptEngine:
             entrypoint=attempt.declared.entrypoint,
             deadline_s=seconds,
             spool=str(spool),
+            memory_grant_bytes=msgspec.UNSET
+            if attempt.memory_grant is None
+            else attempt.memory_grant,
+            memory_grants=attempt.memory_grants,
             placement=attempt.plan.placement,
             headroom_bytes=attempt.plan.headroom_bytes,
             scope_headroom_bytes=dict(attempt.plan.scope_headroom_bytes),
@@ -1897,14 +1960,8 @@ class AttemptEngine:
             )
         attempt.attention_applied = reply.attention_applied
         attempt.capture_result = reply.capture
-        # What this attempt's kernel allocated ON TOP of the resident weights. Recorded from
-        # whatever came back, success or fault: a failed attempt's activation peak is
-        # exactly the number an operator needs, and dropping it on the failure path would
-        # leave the ledger blind in the one case that matters.
-        # THIS attempt's transitions, not the generation's history. Reading the cumulative
-        # counters made every attempt after the first staged one claim its activation basis
-        # had moved, on attempts that never touched a component.
-        cell = attempt.plan.shape_cell if attempt.plan else ""
+        # What this attempt's ops took beyond their weights. Recorded from whatever came back,
+        # success or fault: a failed attempt's peak is exactly the number an operator needs.
         executor = attempt.executor
         if executor is None:
             self.absorb(attempt, reply, apply_ledger=False)
@@ -1916,19 +1973,7 @@ class AttemptEngine:
             with supervision.hold(executor) as owned:
                 self.absorb(attempt, reply, apply_ledger=owned)
                 if owned:
-                    moved = bool(
-                        attempt.residency.get("attempt_stages")
-                        or attempt.residency.get("attempt_evictions")
-                    )
-                    terminal = reply.outcome.terminal if reply.outcome else ""
-                    ledger = self.ledger_for(attempt)
-                    ledger.observe_attempt(
-                        reply.metrics,
-                        resident_moved=moved,
-                        cell=cell,
-                        succeeded=terminal == "succeeded",
-                    )
-                    terminal = reply.outcome.terminal if reply.outcome else ""
+                    self.ledger_for(attempt).observe_attempt(reply.metrics)
                 else:
                     attempt.confess(
                         "unavailable",
@@ -2097,7 +2142,7 @@ class AttemptEngine:
             grants.abort_outputs(spool)
         origin = _ORIGIN[outcome.origin]
         shortfall = reply.shortfall
-        if shortfall is not None:
+        if shortfall is not None or outcome.code == "host_shortfall":
             # A capacity fact reached the handler as an exception, so the author-error
             # classifier saw an author error. It is not one: the runtime could not admit a
             # declared component set, which is CONSTRAINT_INFEASIBLE from the RUNTIME, and
@@ -2197,21 +2242,13 @@ class AttemptEngine:
             # exactly this and holds the remainder to zero.
             if apply_ledger:
                 self.ledger_for(attempt).observe_residency(attempt.residency)
-            if residency.get("attempt_stages"):
-                # ATTEMPT-SCOPED THROUGHOUT (cr-134). `staged_ms`/`evicted_ms` are the
-                # generation's whole history across every request it has served; only the
-                # `attempt_` counters were zeroed for this one. Reading a count from one
-                # scope beside a duration from the other reported 6 stages costing 31220.3
-                # ms on a run whose six stages cost 5542.85 ms, and that number became the
-                # case for changing residency policy.
+            if residency.get("attempt_evictions"):
                 attempt.confess(
                     "degraded",
                     f"served on the {residency.get('placement')} rung: "
-                    f"{residency['attempt_stages']} component stage(s) costing "
-                    f"{residency.get('attempt_staged_ms', 0)} ms and "
-                    f"{residency.get('attempt_evictions', 0)} eviction(s) costing "
-                    f"{residency.get('attempt_evicted_ms', 0)} ms - the weights did not all "
-                    "fit at once and the runtime moved them rather than refusing",
+                    f"{residency.get('attempt_stages', 0)} unit stage(s), "
+                    f"{residency['attempt_evictions']} eviction(s), "
+                    f"{residency.get('attempt_moved_bytes', 0)} B moved during the attempt",
                 )
         shortfall = reply.shortfall
         if shortfall is not None:

@@ -33,6 +33,7 @@ import pytest
 import signed_claims
 from cozy_runtime import canonical_json
 from cozy_runtime.author import ConformanceError
+from cozy_runtime.author._executor_requests import DeviceRoom, Room
 from cozy_runtime.internal import accel, child_env, package_interface, proctree
 from cozy_runtime.internal.call_intent import canonical_intent
 from cozy_runtime.internal.config import Credentials, RuntimeConfig
@@ -404,6 +405,10 @@ class Machine:
         self.worker.engine.history[attempt.key()] = attempt
         self.worker.engine.live[name] = attempt
         self.worker.execution(OWNER, name)
+        # This fixture promises the parent is already running. Wait for its real
+        # execution unit to publish root admission before simulating its child call.
+        self.tick()
+        assert name in self.worker.gpu.roots
 
     def device_job(self, name: str) -> None:
         state = pb.DesiredWorkerState(
@@ -834,6 +839,9 @@ def test_a_submitted_exact_width_is_the_group_and_leaves_the_rest_free(
     machine cannot form is refused typed."""
     downloaded = machine.hold_activations(monkeypatch)
     machine.serving("A", "h3", gpus=2)
+    # Submission starts an asynchronous unit. Establish A's demand before B arrives;
+    # an already granted group keeps its cards regardless of another root's priority.
+    machine.await_granted("A")
     machine.serving("B", "h3", gpus=2)
     machine.serving("C", "h3", gpus=3)
     machine.serving("D", "h3", gpus=8)
@@ -1150,10 +1158,10 @@ def test_memory_pressure_vacates_idle_co_tenants_on_every_rank_device_and_kills_
     machine: Machine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Darkness 1513: the group's attempt freed only its lead card, and rank 3 refused
-    `device_shortfall` beside an idle Qwen on card 3. A group short of room takes idle
-    co-tenants off EVERY rank's card, tightest first and LRU-first on each; it arbitrates
-    for `all_resident`, never stopping at a staged rung it would fit by evicting itself.
-    Their processes stay, and the caller is never its own victim."""
+    `device_shortfall` beside an idle Qwen on card 3. Idle co-tenants leave EVERY rank's
+    card, least recently used first on each, before a call of a shape never measured, and
+    whenever a call asks for room. Their processes stay, and the caller is never its own
+    victim."""
     shot, by_lane = _warm_shot(machine, monkeypatch)
     worker = machine.worker
     before = machine.executors()
@@ -1163,14 +1171,13 @@ def test_memory_pressure_vacates_idle_co_tenants_on_every_rank_device_and_kills_
     def vacated() -> list[str]:
         return [e.step.split("'")[1] for e in worker.activity if " vacated " in e.step]
 
-    # The shot's shape was never measured, so it has every card of its group: every
-    # rank's idle neighbour goes, least recently used first.
-    machine.free["0"] = GiB // 2  # type: ignore[attr-defined]
+    # Every card of the group is short: each one's idle neighbour must go.
+    for card in "0123":
+        machine.free[card] = GiB // 2  # type: ignore[attr-defined]
     hosted = worker.hosted[h3]
     group = worker._lane_of(h3)
     row = group.row(h3)
     digest = next(iter(hosted.bindings))
-    row.ledger.observe_device_free(GiB // 2, 80 * GiB)
     slot = AttemptSlot(
         supervision=hosted.supervision,
         ledger=row.ledger,
@@ -1182,13 +1189,21 @@ def test_memory_pressure_vacates_idle_co_tenants_on_every_rank_device_and_kills_
     attempt = AttemptRecord(
         shot, 2, b"", {"serving": {"entrypoint_binding_digest": digest}}, placement_id=h3
     )
+    # The shot's shape was never measured, so every idle neighbour on every card of its
+    # group gives its weights back first, least recently used first.
     with group.device:
         worker._arbitrate_residency(attempt, slot)
     assert vacated() == [q0, q1, q2]
+    assert attempt.memory_grant is not None and attempt.memory_grant > 0
+    # Asked again mid-call, the group finds nothing idle left to take: nothing more moves.
+    with group.device:
+        answer = worker._room(group, h3)(DeviceRoom(free_bytes=GiB, grant_bytes=0))
+    assert isinstance(answer, Room) and answer.ok
+    assert vacated() == [q0, q1, q2]
     # Qwen on card 1 needs room: the idle H3 group is its only co-tenant there
-    machine.free.pop("0")  # type: ignore[attr-defined]
+    machine.free.clear()  # type: ignore[attr-defined]
     machine.free["1"] = GiB  # type: ignore[attr-defined]
-    worker.memory.make_room(worker._lane_of(q1), q1, None, "a reference")
+    worker._room(worker._lane_of(q1), q1)(DeviceRoom(free_bytes=2 * GiB))
     assert vacated() == [q0, q1, q2, h3]
     assert machine.executors() == before, "vacated, not killed: every process is the same"
     assert all(
