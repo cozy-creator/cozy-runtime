@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import copy
 import csv
 import hashlib
 import io
@@ -45,6 +46,7 @@ def main() -> None:
         raise SystemExit("Donor must be the exact public 0.23.2 native wheel")
     with zipfile.ZipFile(io.BytesIO(donor)) as archive:
         files = {name: archive.read(name) for name in archive.namelist()}
+        entries = {entry.filename: entry for entry in archive.infolist()}
     info = "cozy_runtime-0.23.2.dist-info"
     # Verify every original RECORD entry before retaining its bytes.
     for name, digest, size in csv.reader(io.StringIO(files[f"{info}/RECORD"].decode())):
@@ -84,7 +86,13 @@ def main() -> None:
     changed = {name for name in updated if updated[name] != files[name]}
     assert changed == expected
     new_info = f"cozy_runtime-{version}.dist-info"
-    renamed = {name.replace(info + "/", new_info + "/"): value for name, value in updated.items()}
+    data, new_data = "cozy_runtime-0.23.2.data", f"cozy_runtime-{version}.data"
+
+    def renamed_path(name: str) -> str:
+        return name.replace(info + "/", new_info + "/").replace(data + "/", new_data + "/")
+
+    renamed = {renamed_path(name): value for name, value in updated.items()}
+    original_names = {renamed_path(name): name for name in files}
     record = io.StringIO()
     writer = csv.writer(record, lineterminator="\n")
     for name, value in sorted(renamed.items()):
@@ -95,9 +103,8 @@ def main() -> None:
     output = args.out / f"cozy_runtime-{version}-cp312-abi3-manylinux_2_28_x86_64.whl"
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
         for name, value in sorted(renamed.items()):
-            entry = zipfile.ZipInfo(name, date_time=(2026, 10, 9, 0, 0, 0))
-            entry.compress_type = zipfile.ZIP_DEFLATED
-            entry.external_attr = 0o644 << 16
+            entry = copy.copy(entries[original_names[name]])
+            entry.filename = name
             archive.writestr(entry, value)
     report = {
         "wheel": str(output.resolve()),
@@ -112,6 +119,8 @@ def main() -> None:
         "serving_modules_changed": list(MODULES),
         "all_other_payloads_identical": True,
         "dependencies_identical": True,
+        "zip_attributes_preserved": True,
+        "wheel_data_directory_matches_version": True,
         "native_sha256": sha(files["cozy_runtime/_kernels/_C.abi3.so"]),
         "source_overlay": str(staging.resolve()),
         "source_sha256": {name: sha(updated[name]) for name in MODULES},
