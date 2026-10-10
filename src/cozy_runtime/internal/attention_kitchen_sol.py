@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from importlib import import_module
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Unpack
 
 if TYPE_CHECKING:
-    from torch import Tensor
+    from cozy_runtime.internal.attention_ulysses import PartialOptions
+
+    from torch import Tensor, device as Device
 
 from cozy_runtime.internal import attention_sol, attention_ulysses, attention_upstream
 from cozy_runtime.internal.attention_ulysses import Local, Options
@@ -21,14 +23,16 @@ FP4 = frozenset(
 )
 
 
-def validate_device(device: Any) -> None:
+def validate_device(device: Device) -> None:
     torch = import_module("torch")
     capability = torch.cuda.get_device_capability(device) if device.type == "cuda" else None
     if capability not in attention_upstream.KITCHEN_SMS:
         raise ValueError(f"Kitchen Sol does not support device capability {capability}")
 
 
-def sparse(query: Any, key: Any, value: Any, scale: float | None, sink_tokens: int) -> Any:
+def sparse(
+    query: Tensor, key: Tensor, value: Tensor, scale: float | None, sink_tokens: int
+) -> Tensor:
     kitchen = import_module("comfy_kitchen")
     tensors = (x if x.stride(-1) == 1 else x.contiguous() for x in (query, key, value))
     return kitchen.sol_attn(
@@ -41,7 +45,7 @@ def sparse(query: Any, key: Any, value: Any, scale: float | None, sink_tokens: i
     )
 
 
-def dense_kitchen(*, query: Any, key: Any, value: Any, scale: float | None) -> Any:
+def dense_kitchen(*, query: Tensor, key: Tensor, value: Tensor, scale: float | None) -> Tensor:
     return attention_ulysses._call(
         "_cozy_kitchen_int8",
         attention_upstream.KITCHEN,
@@ -52,7 +56,7 @@ def dense_kitchen(*, query: Any, key: Any, value: Any, scale: float | None) -> A
     )
 
 
-def dense_fp4_lowmem(*, query: Any, key: Any, value: Any, scale: float | None) -> Any:
+def dense_fp4_lowmem(*, query: Tensor, key: Tensor, value: Tensor, scale: float | None) -> Tensor:
     return attention_ulysses._call(
         "_cozy_sage3_fp4_global_lowmem",
         attention_upstream.SAGE3_GLOBAL_LOWMEM,
@@ -76,7 +80,7 @@ def dense_fp4_fixed_means(
     )
 
 
-def forward(query: Any, key: Any, value: Any, **options: Any) -> Any:
+def forward(query: Tensor, key: Tensor, value: Tensor, **options: Unpack[PartialOptions]) -> Tensor:
     return attention_sol._attention(
         query,
         key,
@@ -88,7 +92,9 @@ def forward(query: Any, key: Any, value: Any, **options: Any) -> Any:
     )
 
 
-def forward_fp4_lowmem(query: Any, key: Any, value: Any, **options: Any) -> Any:
+def forward_fp4_lowmem(
+    query: Tensor, key: Tensor, value: Tensor, **options: Unpack[PartialOptions]
+) -> Tensor:
     return attention_sol._attention(
         query,
         key,

@@ -1,1 +1,3 @@
 Static package inspection now reads declared wheel metadata directly, without running importlib discovery hooks. Operation hashing shares a pure reader with the execution path. Application JSON no longer makes the author surface depend on execution internals, and parallel transport environment setup goes through the existing configuration authority.
+
+Attention, Ulysses, sparse-producer and LoRA adapter signatures now name their tensor, device, process-group, generator and processor types instead of spreading Any. Optional dependencies remain type-only imports; kernel arithmetic and transport calls are unchanged.
