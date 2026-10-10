@@ -22,7 +22,7 @@ from torch.multiprocessing.spawn import spawn
 from cozy_runtime.internal import attention, attention_ulysses
 from cozy_runtime.internal.encoding import DeviceFacts
 from cozy_runtime.internal.parallel import copy_engine
-from cozy_runtime.internal.parallel.cp import _GroupMesh
+from cozy_runtime.internal.parallel.cp import CpComms, _GroupMesh
 
 
 def rank_main(
@@ -53,7 +53,7 @@ def rank_main(
             rank,
             degree,
             device,
-            mesh=cast(Any, _GroupMesh(dist.group.WORLD, degree, rank)),
+            mesh=cast(Any, _GroupMesh(CpComms(dist.group.WORLD, rank, device), degree, rank)),
         )
         facts = DeviceFacts("cpu", "CPU", 0, "", "", 0)
         if cuda:
