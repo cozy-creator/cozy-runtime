@@ -29,10 +29,20 @@ from cozy_runtime.internal.encoding import leaves
 from cozy_runtime.internal.encoding.leaves import PreQuantized
 
 NAMES = frozenset(
-    {"kitchen-sol-producer-fast-shared-qkv", "kitchen-sol-producer-fp4-lowmem-shared-qkv"}
+    {
+        "kitchen-sol-producer-fast-shared-qkv",
+        "kitchen-sol-producer-fp4-lowmem-shared-qkv",
+        "kitchen-sol-producer-fp4-fixed-means-shared-qkv",
+    }
 )
 REUSE = SHARED_QKV = NAMES
-FP4_LOWMEM = frozenset({"kitchen-sol-producer-fp4-lowmem-shared-qkv"})
+FP4_LOWMEM = frozenset(
+    {
+        "kitchen-sol-producer-fp4-lowmem-shared-qkv",
+        "kitchen-sol-producer-fp4-fixed-means-shared-qkv",
+    }
+)
+FIXED_MEANS = frozenset({"kitchen-sol-producer-fp4-fixed-means-shared-qkv"})
 BACKENDS = {"_cozy_" + name.replace("-", "_"): name for name in NAMES}
 CHUNK = 4096
 
@@ -226,7 +236,13 @@ class Processor:
             if operand.device.type == "cuda"
             else None
         )
-        admitted = ((12, 0), (12, 1)) if name in FP4_LOWMEM else attention_upstream.KITCHEN_SMS
+        admitted = (
+            ((12, 0),)
+            if name in FIXED_MEANS
+            else ((12, 0), (12, 1))
+            if name in FP4_LOWMEM
+            else attention_upstream.KITCHEN_SMS
+        )
         if capability not in admitted:
             raise ValueError(f"{name} does not support device capability {capability}")
         tokens = layout.live_tokens
@@ -328,6 +344,18 @@ def materialized_fp4_lowmem(query: Any, key: Any, value: Any, **options: Any) ->
     )
 
 
+def materialized_fp4_fixed_means(query: Any, key: Any, value: Any, **options: Any) -> Any:
+    return attention_sol._attention(
+        query,
+        key,
+        value,
+        **options,
+        sparse=_missing_processor,
+        dense=attention_kitchen_sol.dense_fp4_fixed_means,
+        validate_device=attention_kitchen_sol.validate_device,
+    )
+
+
 FAST_LOCAL = Local(
     materialized_kitchen,
     lambda *_: "dense=comfy_kitchen.int8; sparse=instance-producer",
@@ -340,7 +368,15 @@ FP4_LOWMEM_LOCAL = Local(
     ),
     head_local=False,
 )
+FP4_FIXED_MEANS_LOCAL = Local(
+    materialized_fp4_fixed_means,
+    lambda *_: (
+        "dense=sageattn3.nvfp4_fixed_means(upstream_bf16_correction); sparse=instance-producer"
+    ),
+    head_local=False,
+)
 LOCALS = {
+    "kitchen-sol-producer-fp4-fixed-means-shared-qkv": FP4_FIXED_MEANS_LOCAL,
     "kitchen-sol-producer-fast-shared-qkv": FAST_LOCAL,
     "kitchen-sol-producer-fp4-lowmem-shared-qkv": FP4_LOWMEM_LOCAL,
 }
