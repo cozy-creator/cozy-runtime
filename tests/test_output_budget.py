@@ -181,7 +181,15 @@ def test_worker_command_keeps_intermediate_room_for_a_small_final_report(tmp_pat
         b"",
         spec_for(7, 11),
         declared=DeclaredBinding("", "report", "", "", "", ""),
-        plan=AttemptPlan("", "", "", "cpu", 0, 0, "", ""),
+        plan=AttemptPlan(
+            delivery="",
+            materialization="",
+            compute_dtype="",
+            placement="cpu",
+            reserved_vram_bytes=0,
+            entrypoint_binding_digest="",
+            decision_explanation="",
+        ),
     )
     command = AttemptEngine._command(
         cast(AttemptEngine, SimpleNamespace(attention_pin="")), parent, "report#1", tmp_path, 30

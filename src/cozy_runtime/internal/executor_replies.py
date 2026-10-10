@@ -8,6 +8,7 @@ newer executor adds is ignored.
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from typing import Literal
 
 import msgspec
@@ -120,6 +121,10 @@ class AttemptReply(msgspec.Struct, frozen=True, kw_only=True):
     #: Sealed environment names the package changed; the executor restored them.
     env_changed: tuple[str, ...] = ()
     residency: dict[str, Json] = {}
+    #: This process's device bytes after the attempt (`memory.Planner.facts`).
+    memory: dict[str, int] = {}
+    #: Actual rank reports; absent ranks are unknown, never copies of rank zero.
+    rank_memory: dict[str, dict[str, int]] = {}
     #: Undecoded here: the worker reads each row alone, so an unreadable row costs itself,
     #: never the reply and its result.
     observations: tuple[object, ...] = ()
@@ -173,6 +178,8 @@ _ADVISORY: dict[type, frozenset[str]] = {
             "quiescent",
             "env_changed",
             "residency",
+            "memory",
+            "rank_memory",
             "observations",
             "observation_caps",
             "attribution",
@@ -190,9 +197,37 @@ _ADVISORY: dict[type, frozenset[str]] = {
 }
 
 
+def memory_facts(value: object) -> dict[str, int]:
+    """Read independent counters: an unreadable additive member costs only itself."""
+    if not isinstance(value, Mapping):
+        return {}
+    return {
+        key: counter
+        for key, counter in value.items()
+        if isinstance(key, str) and type(counter) is int
+    }
+
+
+def rank_memory_facts(value: object) -> dict[str, dict[str, int]]:
+    """Rank reports are independent too; an unreadable rank never erases its peers."""
+    if not isinstance(value, Mapping):
+        return {}
+    return {
+        rank: counters
+        for rank, facts in value.items()
+        if isinstance(rank, str) and (counters := memory_facts(facts))
+    }
+
+
 def decode[R: (AttemptReply, PreparedReply)](frame: object, into: type[R]) -> R:
     """The reply a frame states. An unreadable advisory member costs itself, with one warning;
     a malformed load-bearing one is the executor's refusal, named."""
+    if into is AttemptReply and isinstance(frame, Mapping):
+        frame = {
+            **frame,
+            "memory": memory_facts(frame.get("memory")),
+            "rank_memory": rank_memory_facts(frame.get("rank_memory")),
+        }
     try:
         reply, dropped = tolerant.read(frame, into, _ADVISORY[into])
     except msgspec.ValidationError as exc:

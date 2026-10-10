@@ -64,16 +64,11 @@ _Envelope = _Tensor | _Component | _Tuple | _Output
 
 
 class Scope(msgspec.Struct, frozen=True):
-    """One component scope active on the leader, as a follower re-enters it. The residency
-    facts are present exactly when the leader's model has a residency plane."""
+    """One component scope active on the leader, as a follower re-enters it."""
 
     model: str
     method: str
     components: tuple[str, ...]
-    placement: str | msgspec.UnsetType = msgspec.UNSET
-    headroom_bytes: int | msgspec.UnsetType = msgspec.UNSET
-    scope_headroom_bytes: dict[str, int] | msgspec.UnsetType = msgspec.UNSET
-    measured_scopes: list[str] | msgspec.UnsetType = msgspec.UNSET
 
 
 class RunCommand(msgspec.Struct, frozen=True, tag_field="cmd", tag="run"):
@@ -97,6 +92,11 @@ class RunCommand(msgspec.Struct, frozen=True, tag_field="cmd", tag="run"):
     method: str | msgspec.UnsetType = msgspec.UNSET
     p2p: bool | msgspec.UnsetType = msgspec.UNSET
     spare: bool | msgspec.UnsetType = msgspec.UNSET
+    memory_grants: tuple[int, ...] = ()
+    #: Operation-scoped host backing, reserved in aggregate before placement retry.
+    host_grants: tuple[int, ...] = ()
+    #: A sharded preparation transaction. Zero is the legacy/hosted/spread path.
+    operation: int = 0
 
     @classmethod
     def read(cls, command: Mapping[str, object]) -> RunCommand:
@@ -286,6 +286,9 @@ class RunReply(msgspec.Struct, frozen=True):
     ok: bool
     code: str = ""
     detail: str = ""
+    reusable: bool = False
+    needed: int = 0
+    available: int = 0
     #: Sol attention calls by kind, on a sharded forward
     sol_calls: dict[str, int] = {}
     working_peak_bytes: int = 0

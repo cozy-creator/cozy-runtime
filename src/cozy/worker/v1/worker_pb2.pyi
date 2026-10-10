@@ -711,7 +711,7 @@ class MachineSubmissionClosure(_message.Message):
     def __init__(self, submission_id: _Optional[str] = ..., request_id: _Optional[str] = ..., execution_workspace_id: _Optional[str] = ..., receipt: _Optional[_Union[MachineExecutionReceipt, _Mapping]] = ...) -> None: ...
 
 class MachineExecutionSubmit(_message.Message):
-    __slots__ = ("claim", "submission_id", "capture_digest", "capture_canonical_bytes", "offer", "prepared_state", "payload_canonical_bytes", "publication_authorization_id", "expected_execution_workspace_id", "source_credentials", "release_root", "owner_memo", "account")
+    __slots__ = ("claim", "submission_id", "capture_digest", "capture_canonical_bytes", "offer", "prepared_state", "payload_canonical_bytes", "publication_authorization_id", "expected_execution_workspace_id", "source_credentials", "release_root", "owner_memo", "account", "hub")
     CLAIM_FIELD_NUMBER: _ClassVar[int]
     SUBMISSION_ID_FIELD_NUMBER: _ClassVar[int]
     CAPTURE_DIGEST_FIELD_NUMBER: _ClassVar[int]
@@ -725,6 +725,7 @@ class MachineExecutionSubmit(_message.Message):
     RELEASE_ROOT_FIELD_NUMBER: _ClassVar[int]
     OWNER_MEMO_FIELD_NUMBER: _ClassVar[int]
     ACCOUNT_FIELD_NUMBER: _ClassVar[int]
+    HUB_FIELD_NUMBER: _ClassVar[int]
     claim: Claim
     submission_id: str
     capture_digest: bytes
@@ -738,7 +739,8 @@ class MachineExecutionSubmit(_message.Message):
     release_root: ReleaseRoot
     owner_memo: bool
     account: str
-    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., submission_id: _Optional[str] = ..., capture_digest: _Optional[bytes] = ..., capture_canonical_bytes: _Optional[bytes] = ..., offer: _Optional[_Union[AttemptOffer, _Mapping]] = ..., prepared_state: _Optional[_Union[DesiredWorkerState, _Mapping]] = ..., payload_canonical_bytes: _Optional[bytes] = ..., publication_authorization_id: _Optional[str] = ..., expected_execution_workspace_id: _Optional[str] = ..., source_credentials: _Optional[_Iterable[_Union[SourceCredential, _Mapping]]] = ..., release_root: _Optional[_Union[ReleaseRoot, _Mapping]] = ..., owner_memo: bool = ..., account: _Optional[str] = ...) -> None: ...
+    hub: str
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., submission_id: _Optional[str] = ..., capture_digest: _Optional[bytes] = ..., capture_canonical_bytes: _Optional[bytes] = ..., offer: _Optional[_Union[AttemptOffer, _Mapping]] = ..., prepared_state: _Optional[_Union[DesiredWorkerState, _Mapping]] = ..., payload_canonical_bytes: _Optional[bytes] = ..., publication_authorization_id: _Optional[str] = ..., expected_execution_workspace_id: _Optional[str] = ..., source_credentials: _Optional[_Iterable[_Union[SourceCredential, _Mapping]]] = ..., release_root: _Optional[_Union[ReleaseRoot, _Mapping]] = ..., owner_memo: bool = ..., account: _Optional[str] = ..., hub: _Optional[str] = ...) -> None: ...
 
 class ReleaseRoot(_message.Message):
     __slots__ = ("package", "release", "entrypoint", "models", "inputs", "input_access", "deadline_unix_ms", "attention_kernel", "capture", "job", "weights_destination", "publication_grant", "installation_id", "owner", "hub")
@@ -1279,12 +1281,14 @@ class PreparePackageSetCall(_message.Message):
     def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., package_set: _Optional[_Union[DesiredPackageSet, _Mapping]] = ..., application: _Optional[str] = ..., model_slot_paths: _Optional[_Iterable[str]] = ..., image_inventory: _Optional[_Union[ImageInventory, _Mapping]] = ..., locked_requirements: _Optional[bytes] = ..., python_requires: _Optional[str] = ..., python_version: _Optional[str] = ..., package_interface: _Optional[bytes] = ..., hub: _Optional[str] = ...) -> None: ...
 
 class PrepareLocalPackageCall(_message.Message):
-    __slots__ = ("claim", "local_package_set")
+    __slots__ = ("claim", "local_package_set", "hub")
     CLAIM_FIELD_NUMBER: _ClassVar[int]
     LOCAL_PACKAGE_SET_FIELD_NUMBER: _ClassVar[int]
+    HUB_FIELD_NUMBER: _ClassVar[int]
     claim: Claim
     local_package_set: DesiredLocalPackageSet
-    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., local_package_set: _Optional[_Union[DesiredLocalPackageSet, _Mapping]] = ...) -> None: ...
+    hub: str
+    def __init__(self, claim: _Optional[_Union[Claim, _Mapping]] = ..., local_package_set: _Optional[_Union[DesiredLocalPackageSet, _Mapping]] = ..., hub: _Optional[str] = ...) -> None: ...
 
 class PreparePrivatePlacementCall(_message.Message):
     __slots__ = ("claim", "private_placement_set")
@@ -1667,7 +1671,7 @@ class PreparePackageSetResult(_message.Message):
     def __init__(self, placement_set: _Optional[_Union[DesiredPlacementSet, _Mapping]] = ..., installed_package: _Optional[_Union[InstalledPackage, _Mapping]] = ...) -> None: ...
 
 class PrepareLocalPackageRequest(_message.Message):
-    __slots__ = ("operation_id", "package", "files", "install_root", "dependency_requirements", "python_requires", "python_version", "source_archive")
+    __slots__ = ("operation_id", "package", "files", "install_root", "dependency_requirements", "python_requires", "python_version", "source_archive", "hub")
     OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
     PACKAGE_FIELD_NUMBER: _ClassVar[int]
     FILES_FIELD_NUMBER: _ClassVar[int]
@@ -1676,6 +1680,7 @@ class PrepareLocalPackageRequest(_message.Message):
     PYTHON_REQUIRES_FIELD_NUMBER: _ClassVar[int]
     PYTHON_VERSION_FIELD_NUMBER: _ClassVar[int]
     SOURCE_ARCHIVE_FIELD_NUMBER: _ClassVar[int]
+    HUB_FIELD_NUMBER: _ClassVar[int]
     operation_id: str
     package: DevelopmentPackage
     files: _containers.RepeatedCompositeFieldContainer[LocalPackageFile]
@@ -1684,7 +1689,8 @@ class PrepareLocalPackageRequest(_message.Message):
     python_requires: str
     python_version: str
     source_archive: str
-    def __init__(self, operation_id: _Optional[str] = ..., package: _Optional[_Union[DevelopmentPackage, _Mapping]] = ..., files: _Optional[_Iterable[_Union[LocalPackageFile, _Mapping]]] = ..., install_root: _Optional[str] = ..., dependency_requirements: _Optional[bytes] = ..., python_requires: _Optional[str] = ..., python_version: _Optional[str] = ..., source_archive: _Optional[str] = ...) -> None: ...
+    hub: str
+    def __init__(self, operation_id: _Optional[str] = ..., package: _Optional[_Union[DevelopmentPackage, _Mapping]] = ..., files: _Optional[_Iterable[_Union[LocalPackageFile, _Mapping]]] = ..., install_root: _Optional[str] = ..., dependency_requirements: _Optional[bytes] = ..., python_requires: _Optional[str] = ..., python_version: _Optional[str] = ..., source_archive: _Optional[str] = ..., hub: _Optional[str] = ...) -> None: ...
 
 class LocalPackageFile(_message.Message):
     __slots__ = ("digest", "filename", "length", "path")

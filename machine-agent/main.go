@@ -12,19 +12,23 @@ import (
 )
 
 func main() {
+	if host.RequestPlaneProcess(os.Args[0]) {
+		os.Exit(host.RunRequestPlane(os.Stderr))
+	}
 	if host.GuardianProcess(os.Args[0]) {
 		os.Exit(host.RunGuardian(os.Args))
 	}
 	if len(os.Args) >= 2 && (os.Args[1] == "version" || os.Args[1] == "--version") {
 		revision, dirty := build.Revision()
 		answer := struct {
-			Name             string `json:"name"`
-			Version          string `json:"version"`
-			Revision         string `json:"revision"`
-			Dirty            bool   `json:"dirty"`
-			WireMinor        uint32 `json:"wire_minor"`
-			MinimumWireMinor uint32 `json:"minimum_wire_minor"`
-		}{"cozy-machine", build.Version, revision, dirty, pb.WireMinor, pb.MinCompatibleWireMinor}
+			Name             string   `json:"name"`
+			Version          string   `json:"version"`
+			Revision         string   `json:"revision"`
+			Dirty            bool     `json:"dirty"`
+			WireMinor        uint32   `json:"wire_minor"`
+			MinimumWireMinor uint32   `json:"minimum_wire_minor"`
+			Capabilities     []string `json:"capabilities"`
+		}{"cozy-machine", build.Version, revision, dirty, pb.WireMinor, pb.MinCompatibleWireMinor, build.Capabilities()}
 		if err := json.NewEncoder(os.Stdout).Encode(answer); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)

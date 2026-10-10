@@ -206,8 +206,13 @@ def same_origin(a: str, b: str) -> bool:
 
 def registration(worker: Worker, origin: str) -> PublicationAuthority | None:
     """Read this machine's current scoped access, including a renewed delegated token."""
+    if not origin:
+        default = worker.options.publication_authority
+        if default is None:
+            return None
+        origin = default.origin
     for held in authorities(worker):
-        if not origin or same_origin(held.origin, origin):
+        if same_origin(held.origin, origin):
             if held.access_token:
                 with worker.hub_access_lock:
                     principal = worker.hub_access_principals.setdefault(

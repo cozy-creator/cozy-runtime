@@ -28,10 +28,37 @@ class _Request(msgspec.Struct, frozen=True, kw_only=True, tag_field="kind"):
     pass
 
 
+class RankRoom(msgspec.Struct, frozen=True, kw_only=True):
+    rank: int
+    free_bytes: int
+    grant_bytes: int
+    measured: bool = False
+
+
 class DeviceRoom(_Request, frozen=True, kw_only=True, tag="device_room"):
-    """Idle co-tenants of the executor's devices give `free_bytes` back."""
+    """Idle co-tenants of the executor's devices give room back until the driver has
+    `free_bytes` free and the executor may hold `grant_bytes` in all (0: no such need).
+    `measured`: the need is a measurement, so idle processes may end for it."""
 
     free_bytes: int
+    grant_bytes: int = 0
+    measured: bool = False
+    ranks: tuple[int, ...] = ()
+    #: Fresh facts from ranks that have reported; other ranks remain unknown.
+    rank_memory: dict[str, dict[str, int]] = {}
+    rank_needs: tuple[RankRoom, ...] = ()
+
+
+class HostRoom(_Request, frozen=True, kw_only=True, tag="host_room"):
+    """Reserve a pending host allocation, then release its promise once the copy completes.
+
+    The Worker namespaces tokens by executor generation. The reply is an ordinary Answer;
+    a peer without this capability refuses, allowing only a legal store fallback.
+    """
+
+    reservation: str
+    nbytes: int = 0
+    release: bool = False
 
 
 class ChildEvents(_Request, frozen=True, kw_only=True, tag="child_events"):
@@ -132,6 +159,7 @@ class WriterAdopt(_Writer, frozen=True, kw_only=True, tag="adopt"):
 
 type _Tagged = (
     DeviceRoom
+    | HostRoom
     | ChildEvents
     | Checkpoint
     | ChildCall
@@ -174,6 +202,9 @@ class Handoff(Answer, frozen=True, kw_only=True):
 
 class Room(Answer, frozen=True, kw_only=True):
     authorized_device_limit_bytes: int | UnsetType = UNSET
+    #: Per-rank total footprints. Absent on workers predating rank-local grants.
+    memory_grants: tuple[int, ...] = ()
+    memory_free: tuple[int, ...] = ()
 
 
 class CheckpointReceipt(Answer, frozen=True, kw_only=True):

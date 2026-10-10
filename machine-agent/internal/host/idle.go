@@ -254,11 +254,15 @@ func (r *restarts) clear() error {
 	return nil
 }
 func (r *restarts) fail(err error) {
+	var refusal *launchRefusal
+	if !errors.As(err, &refusal) {
+		r.exited(err)
+		return
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.blocked = true
 	r.detail = err.Error()
-	var refusal *launchRefusal
 	if errors.As(err, &refusal) {
 		r.safeCode = refusal.code
 	}

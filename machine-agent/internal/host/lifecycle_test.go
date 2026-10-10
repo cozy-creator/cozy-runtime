@@ -87,15 +87,15 @@ func TestMachineLockRejectsConcurrentAgentButNotRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	if second, err := lockMachine(root); err == nil {
-		second()
+		second.close()
 		t.Fatal("two agents acquired same machine")
 	}
-	unlock()
+	unlock.close()
 	unlock, err = lockMachine(root)
 	if err != nil {
 		t.Fatal(err)
 	}
-	unlock()
+	unlock.close()
 }
 
 func TestStandaloneGrantNeedsNoHub(t *testing.T) {
@@ -104,7 +104,7 @@ func TestStandaloneGrantNeedsNoHub(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if g.HubOrigin != "" || g.WorkerToken != "" || len(g.Hubs) != 0 {
+	if g.HubOrigin != "" || g.WorkerToken != "" {
 		t.Fatal("local grant acquired Hub authority")
 	}
 }

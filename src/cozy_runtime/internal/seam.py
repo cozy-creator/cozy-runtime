@@ -39,7 +39,15 @@ from typing import Any, NoReturn
 #: Worker/executor command-and-reply compatibility, independent of SDK package
 #: version or source build. Compatible additive fields keep this revision; only
 #: an incompatible change to required commands/semantics raises it.
-EXECUTOR_PROTOCOL_REVISION = 1
+EXECUTOR_PROTOCOL_REVISION = 2
+
+#: Revision 2 requires planner grants, aggregate host credits and prepared group calls.
+EXECUTOR_MEMORY_CAPABILITIES = frozenset(
+    {
+        "plan", "rank_memory", "prepare_commit", "import_only", "vacate_ranks", "host_room",
+        "group_host_credit", "process_memory",
+    }
+)
 
 #: Frames are control. 64 KiB is generous for a payload document and small enough that a
 #: caller trying to move tensors or media through here fails immediately.

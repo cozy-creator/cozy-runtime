@@ -67,6 +67,7 @@ from cozy_runtime.author._decode import (
     MediaDecoder,
     Mixed,
 )
+from cozy_runtime.author._decode_mode import select_decode_mode
 from cozy_runtime.author._defaults import Clamp, Overlay, Recipe, decode_request
 from cozy_runtime.author._demand import RequestFeatures
 from cozy_runtime.author._describe import assert_declaration_shape, describe
@@ -132,6 +133,13 @@ from cozy_runtime.author._model import (
     uses_components,
 )
 from cozy_runtime.author._model_reader import WeightsReader, WeightsView
+from cozy_runtime.author._retry import (
+    is_declared_pure,
+    original_forward,
+    pure,
+    read_whole,
+    retry_state,
+)
 from cozy_runtime.author._script import ScriptContext, script_app
 from cozy_runtime.author._services import (
     JOB_ONLY,
@@ -312,13 +320,19 @@ __all__ = [
     "expect_attention",
     "invocable",
     "invoke",
+    "is_declared_pure",
+    "original_forward",
     "placeable",
     "prefetch",
     "prepare",
     "publish_release",
+    "pure",
+    "read_whole",
     "register_adapter",
     "registered_adapters",
+    "retry_state",
     "script_app",
+    "select_decode_mode",
     "sequence_parallel",
     "spread",
     "upload_checkpoint",

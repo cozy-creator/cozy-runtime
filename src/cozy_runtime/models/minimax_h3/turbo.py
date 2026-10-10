@@ -23,7 +23,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from cozy_runtime.author import ConformanceError
+from cozy_runtime.author import ConformanceError, read_whole
 
 #: The forward-call selector: `attention_kwargs={ATTENTION_KWARG: TURBO_BANK}` names the bank
 #: one DiT forward serves. Absent, the forward is the base's, whatever overlay is attached.
@@ -72,7 +72,8 @@ class LoRAFactors(nn.Module):  # type: ignore[misc]
 
 
 class _LoRAHook:
-    """A permanent consumer hook, inactive for base forwards."""
+    """A permanent consumer hook, inactive for base forwards. It adds its update to the
+    output the forward just made, so a forward run again is updated again, once."""
 
     __slots__ = ("owner", "path")
 
@@ -187,6 +188,9 @@ class TurboOverlay(nn.Module):  # type: ignore[misc]
         final_table_dtype: torch.dtype,
     ) -> None:
         super().__init__()
+        # The trunk DiT reads these tables and heads directly, never through this module's
+        # forward: they stay whole on the device while a method declaring them runs.
+        read_whole(self)
         scale = alpha / rank
 
         def factors(in_features: int, out_features: int) -> LoRAFactors:
@@ -214,6 +218,7 @@ class TurboOverlay(nn.Module):  # type: ignore[misc]
         index = torch.full((len(table_timesteps), 3), -1, dtype=torch.int64)
         for table_row, (timestep_row, modality_tag) in enumerate(table_block_keys):
             index[timestep_row, modality_tag] = table_row
+        self.register_buffer("table_coverage", index >= 0, persistent=False)
         self.schedule = schedule
         self.register_buffer(
             "timesteps", torch.tensor(tuple(table_timesteps), dtype=torch.float32), persistent=False

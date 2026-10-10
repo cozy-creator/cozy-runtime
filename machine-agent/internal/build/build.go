@@ -31,3 +31,8 @@ func Revision() (string, bool) {
 	}
 	return revision[:min(len(revision), 12)], dirty
 }
+
+// Capabilities name implemented agent contracts, independently of release numbers.
+func Capabilities() []string {
+	return []string{"hub-access/1", "runtime-update/1", "machine-bootstrap/1"}
+}
