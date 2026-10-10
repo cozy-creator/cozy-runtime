@@ -50,7 +50,7 @@ def main() -> None:
         return
     assert torch.cuda.is_available() and not torch.cuda.is_initialized()
     if mode == "preload":
-        # This is the actual start import list, before any package import
+        # This is the actual preconstruct import list, before any package import
         # or admitted device boundary. No replacement kernel/allocator is used.
         for module in _CONSTRUCTION_MODULES:
             importlib.import_module(module)

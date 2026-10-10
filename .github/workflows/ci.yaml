@@ -1,43 +1,56 @@
 name: ci
-on:
-  pull_request:
-    paths-ignore: ["**.md", "docs/**", "changelog.d/**"]
-  push:
-    branches: [master]
-    paths-ignore: ["**.md", "docs/**", "changelog.d/**"]
-  workflow_dispatch:
-concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+on: [push, pull_request]
 jobs:
+  # BUILD + LINT + TYPES + BOUNDARY SCANS. Nothing here asserts that a source file contains
+  # a particular string, and nothing here is a behaviour test — that is the `end-to-end` job.
   checks:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v7
-        with:
-          save-cache: ${{ github.ref == 'refs/heads/master' }}
       - run: uv python install 3.12
-      - run: uv sync --locked
+      - run: uv sync
       - run: >-
           uv run python -c "import sys, sysconfig;
           assert sys.implementation.name == 'cpython' and sys.version_info[:2] == (3, 12)
           and sysconfig.get_config_var('Py_GIL_DISABLED') != 1"
       - run: uv run ruff check .
-      - run: uv run ruff format --check .
+      # Formatting is a DETERMINISM check: one canonical rendering of the tree, so a diff is
+      # only ever a change of meaning. The generated `worker_pb2*` bindings are excluded in
+      # pyproject's `extend-exclude` — protoc's output is a copied artifact.
       - run: uv run mypy
-      - run: uv run python checks/architecture.py
-      - name: Reproducible wheel
+      - run: uv run ruff format --check .
+      - name: Reproduce the CPython 3.12 Runtime wheel
         run: |
           set -euo pipefail
-          a=$(mktemp -d); b=$(mktemp -d)
+          a=$(mktemp -d)
+          b=$(mktemp -d)
           SOURCE_DATE_EPOCH=946684800 uv build --wheel --out-dir "$a"
           SOURCE_DATE_EPOCH=946684800 uv build --wheel --out-dir "$b"
           cmp "$a"/*.whl "$b"/*.whl
+      # AST import/dependency scans over the package boundaries, plus the frozen ES6 number
+      # vectors replayed through the real RFC 8785 writer.
+      - run: uv run python checks/architecture.py
+      # THE FUSED KERNELS ARE BUILT, NOT COMPILED AT BOOT (h3a-015): the worker image's
+      # build stage runs `fusion_build` for its architecture. This proves, with no GPU,
+      # that two builds of the sm90 artifact agree byte for byte and that every entry's key
+      # is the one the runtime loader recomputes from the kernel sources.
       - run: uv run --with "triton==3.8.0" python -m cozy_runtime.internal.fusion_build --check --arch 90
+
+  # THE BEHAVIOUR GATE: two real runs against a real build, no mocks. The public CLI is
+  # installed from a freshly built wheel into a venv that has nothing else, then describes,
+  # replays the descriptor byte-for-byte, serves a request through the invocation kernel,
+  # walks the exit-code matrix, and runs a job through the real two-process worker.
+  end-to-end:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v7
+      - run: uv python install 3.12
+      - run: uv sync
       - run: uv run pytest
-      - name: Primary handoff under real supervised processes
+      - name: Prove primary handoff with real supervised processes
         run: |
           sudo systemd-run --wait --pipe --collect \
             --unit="cozy-runtime-handoff-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
@@ -45,3 +58,107 @@ jobs:
             --property=Delegate=yes --working-directory="$PWD" \
             --setenv="PATH=$PATH" --setenv="HOME=$HOME" \
             .venv/bin/python -c 'import sys; sys.path.insert(0, "tests"); from test_end_to_end import NO_EXECUTOR; assert not NO_EXECUTOR, NO_EXECUTOR; import pytest; raise SystemExit(pytest.main(["tests/test_primary_handoff.py", "-q", "-rs"]))'
+
+  # Real CPU rank execution, separate from the torch-free base checks. The native
+  # staging case names its CUDA requirement and skips on this runner.
+  context-parallel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      # The UID proof must execute Python without traversing the runner's private
+      # temporary directory, where setup-uv installs interpreters by default.
+      UV_PYTHON_INSTALL_DIR: /tmp/cozy-runtime-ci-python
+    steps:
+      - uses: actions/checkout@v4
+      - run: install -d -m 0755 "$UV_PYTHON_INSTALL_DIR"
+      - uses: astral-sh/setup-uv@v7
+      - run: uv python install 3.12
+      - run: uv sync --locked
+      - run: uv pip install --python .venv/bin/python --index https://download.pytorch.org/whl/cpu "torch==2.14.0"
+      - run: uv pip install --python .venv/bin/python "diffusers==0.40.0" "accelerate==1.14.0" "transformers==5.16.1"
+      - run: .venv/bin/python -c "import torch; assert torch.version.cuda is None"
+      - run: >-
+          .venv/bin/python -m pytest tests/test_parallel_calls.py tests/test_attention_sol.py
+          tests/test_h3_group_warm_fixture.py
+          tests/test_job_source_derivation.py tests/test_construction_dtype.py
+          tests/test_h3_conditioner_lifecycle.py tests/test_gpu_job_device.py
+          tests/test_prepare_diagnostics.py
+          tests/test_encoded_leaf_dtype.py
+          tests/test_h3_sol_prefix.py tests/test_h3_sol_turbo.py
+          tests/test_end_to_end.py::test_real_modeled_package_prepare_can_be_acquired_before_model_selection -q -rs
+      - name: Cross the real pod executor UID boundary during warmup
+        run: |
+          # Install a real wheel into a traversable environment: an editable venv
+          # can retain references to the runner's private checkout or package cache.
+          proof_root=$(mktemp -d /tmp/cozy-runtime-uid.XXXXXX)
+          trap 'sudo rm -rf "$proof_root"' EXIT
+          chmod 0755 "$proof_root"
+          uv build --wheel --out-dir "$proof_root/wheels"
+          uv venv --python 3.12 "$proof_root/.venv"
+          UV_LINK_MODE=copy uv pip install --python "$proof_root/.venv/bin/python" "$proof_root"/wheels/*.whl pytest
+          UV_LINK_MODE=copy uv pip install --python "$proof_root/.venv/bin/python" --index https://download.pytorch.org/whl/cpu "torch==2.14.0"
+          cp -a tests "$proof_root/"
+          cd "$proof_root"
+          sudo -E .venv/bin/python -m pytest tests/test_warm_isolation.py -q -rs
+
+  # THE VENDORED-DRIFT GATE (#536d). `src/cozy/worker/v1/` is a COPY of another repo's
+  # generated output, and a copy is only a copy while somebody compares the bytes.
+  #
+  # The checker is worker-protocol's own `scripts/vendored-diff.sh`, invoked rather than
+  # reimplemented: a drift checker with its own drifting generator would be its own
+  # punchline. It regenerates from the .proto with the pinned toolchain and byte-compares
+  # against what is vendored here.
+  #
+  # PINNED, not floating: `WORKER_PROTOCOL_SHA` is the protocol commit these bytes were
+  # generated from. Bumping it and re-copying `gen/python/cozy` over `src/cozy` is one
+  # change, and this job is what refuses the half of it that was forgotten.
+  drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # SELF-ARMING, not skipped-by-default. worker-protocol-v2 is a private sibling and
+      # `github.token` is scoped to THIS repository, so the byte-diff needs a read
+      # credential only the owner can mint. Rather than sit red forever or hide behind a
+      # hand-flipped variable, the job detects the credential and runs the moment it
+      # exists — and says loudly, in the run's annotations, when it does not.
+      - id: credential
+        run: |
+          if [ -n "${{ secrets.WORKER_PROTOCOL_TOKEN }}" ]; then
+            echo "present=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=no" >> "$GITHUB_OUTPUT"
+            echo "::warning title=vendored-drift check not run::WORKER_PROTOCOL_TOKEN is not set, so cozy-creator/worker-protocol-v2 cannot be checked out and the byte-for-byte vendored-drift check did not run. Release validation must retain a recorded local drift check."
+          fi
+      # ONE upstream pin: the commit the SOURCE manifests record (test_canonical_corpus
+      # asserts the bindings and the corpus agree on it). A second SHA spelled here went
+      # stale for four wire minors while the job was disarmed — a pin nobody compares is
+      # not a pin.
+      - id: pin
+        if: steps.credential.outputs.present == 'yes'
+        run: |
+          sha=$(sed -n 's/^commit=//p' src/cozy/worker/v1/SOURCE)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - if: steps.credential.outputs.present == 'yes'
+        uses: actions/checkout@v4
+        with:
+          repository: cozy-creator/worker-protocol-v2
+          ref: ${{ steps.pin.outputs.sha }}
+          path: .worker-protocol
+          token: ${{ secrets.WORKER_PROTOCOL_TOKEN }}
+      - if: steps.credential.outputs.present == 'yes'
+        uses: astral-sh/setup-uv@v7
+      - if: steps.credential.outputs.present == 'yes'
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - if: steps.credential.outputs.present == 'yes'
+        run: .worker-protocol/scripts/vendored-diff.sh src
+      # The vendored fixture corpus is the same kind of copy as the bindings: byte-compare
+      # it against the checkout at the pinned commit (xs-020).
+      - if: steps.credential.outputs.present == 'yes'
+        run: |
+          diff -r .worker-protocol/fixtures/canonical tests/testdata/worker-protocol/canonical
+          diff -r .worker-protocol/fixtures/red tests/testdata/worker-protocol/red
+          diff .worker-protocol/fixtures/MANIFEST.json tests/testdata/worker-protocol/MANIFEST.json

@@ -36,7 +36,7 @@ except LaunchRefusal as exc:
 try:
     claim=pb.Claim(record_owner_epoch=epoch,record_owner_id=owner,worker_id='fence-proof',
         worker_boot_id=boot,
-        wire_minor=37 if mode=='legacy' else 60 if mode=='previous' else WIRE_MINOR)
+        wire_minor=37 if mode=='legacy' else 59 if mode=='wire59' else WIRE_MINOR)
     transcript=documents.canonical_bytes(pb.ClaimProof(record_owner_epoch=epoch,
         worker_boot_id=boot,worker_id='fence-proof',worker_tls_certificate_digest=b'\xaa'*32))
     claim.proof=key.sign(transcript) if mode!='forged' else bytes(64)
@@ -155,9 +155,9 @@ def test_unfinished_counter_stage_cannot_reset_or_strand_resume(tmp_path: Path) 
     assert _run(tmp_path, "same")["stream"] == 2
 
 
-def test_previous_minor_owner_remains_compatible_with_current_worker(tmp_path: Path) -> None:
+def test_wire59_owner_remains_compatible_with_wire60_worker(tmp_path: Path) -> None:
     assert _run(tmp_path, "first")["accepted"]
-    older = _run(tmp_path, "previous")
+    older = _run(tmp_path, "wire59")
     assert older["accepted"] and older["stream"] == 2
     assert not older["dispatch_open"]  # skew does not bypass SnapshotAck
     assert _run(tmp_path, "same")["stream"] == 3

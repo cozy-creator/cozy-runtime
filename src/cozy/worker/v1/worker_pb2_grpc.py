@@ -549,6 +549,11 @@ class RuntimePreparationStub(object):
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WorkspaceActivationCall.SerializeToString,
                 response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WorkspaceImportResult.FromString,
                 _registered_method=True)
+        self.CheckPackageSetCompatibility = channel.unary_unary(
+                '/cozy.worker.v1.RuntimePreparation/CheckPackageSetCompatibility',
+                request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePackageSetRequest.SerializeToString,
+                response_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.CheckPackageSetCompatibilityResult.FromString,
+                _registered_method=True)
         self.PreparePackageSet = channel.unary_unary(
                 '/cozy.worker.v1.RuntimePreparation/PreparePackageSet',
                 request_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePackageSetRequest.SerializeToString,
@@ -717,6 +722,12 @@ class RuntimePreparationServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def CheckPackageSetCompatibility(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def PreparePackageSet(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -866,6 +877,11 @@ def add_RuntimePreparationServicer_to_server(servicer, server):
                     servicer.ActivateWorkspaceImport,
                     request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WorkspaceActivationCall.FromString,
                     response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.WorkspaceImportResult.SerializeToString,
+            ),
+            'CheckPackageSetCompatibility': grpc.unary_unary_rpc_method_handler(
+                    servicer.CheckPackageSetCompatibility,
+                    request_deserializer=cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePackageSetRequest.FromString,
+                    response_serializer=cozy_dot_worker_dot_v1_dot_worker__pb2.CheckPackageSetCompatibilityResult.SerializeToString,
             ),
             'PreparePackageSet': grpc.unary_unary_rpc_method_handler(
                     servicer.PreparePackageSet,
@@ -1340,6 +1356,33 @@ class RuntimePreparation(object):
             '/cozy.worker.v1.RuntimePreparation/ActivateWorkspaceImport',
             cozy_dot_worker_dot_v1_dot_worker__pb2.WorkspaceActivationCall.SerializeToString,
             cozy_dot_worker_dot_v1_dot_worker__pb2.WorkspaceImportResult.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def CheckPackageSetCompatibility(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cozy.worker.v1.RuntimePreparation/CheckPackageSetCompatibility',
+            cozy_dot_worker_dot_v1_dot_worker__pb2.PreparePackageSetRequest.SerializeToString,
+            cozy_dot_worker_dot_v1_dot_worker__pb2.CheckPackageSetCompatibilityResult.FromString,
             options,
             channel_credentials,
             insecure,

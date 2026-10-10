@@ -214,6 +214,7 @@ def test_native_artifact_receipt_and_independent_loopback_retention_survive_orig
         None,
         None,
         None,
+        None,
         derived_retainer=lambda req, release: derived_retention.change(
             req, tensorfs_root=root, release=release
         ),

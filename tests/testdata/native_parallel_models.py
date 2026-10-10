@@ -37,7 +37,7 @@ from cozy_runtime.internal.seam import RESULT_DOCUMENT, Channel
 from cozy_runtime.internal.weights_sink import weights_transaction_id
 from cozy_runtime.internal.worker.ledger import Ledger
 from cozy_runtime.internal.worker.plan import PlanChooser, PreparedModel, PreparedRequest
-from cozy_runtime.internal.worker.session import executor_load_command
+from cozy_runtime.internal.worker.session import executor_prepare_command
 
 PACKAGE = Path(__file__).parent / "dual_model_package"
 sys.path.insert(0, str(PACKAGE))
@@ -244,11 +244,7 @@ def follower(args: Any) -> None:
             "rank": self.rank,
             "active": {key: model._cozy_active for key, model in models.items()},
             "models": sorted(models),
-            "filled": [
-                member.facts.get("filled_bytes")
-                for construction in self.constructions.values()
-                for member in construction.model_executors
-            ],
+            "filled": [child.facts.get("filled_bytes") for child in self.model_executors],
             "warm_observations": {
                 key: model.pipe.warm_observations
                 for key, model in models.items()
@@ -294,9 +290,8 @@ def leader(root: Path, degree: int, backend: str = "cpu") -> None:
         },
     )
     binding = next(iter(staged.declared_bindings.values()))
-    command = executor_load_command(
+    command = executor_prepare_command(
         binding,
-        construction=binding.construction_key(),
         devices=os.environ.get("CUDA_VISIBLE_DEVICES", ""),
         sequence_parallel_degree=degree,
         authorized_device_limit_bytes=2 << 30,
@@ -313,7 +308,6 @@ def leader(root: Path, degree: int, backend: str = "cpu") -> None:
     # Thread caps are sealed process inputs; set them before leader and followers snapshot the seal.
     os.environ.update({"OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"})
     executor = Executor(Channel(ours), root / "executor", world=degree)
-    host = executor
     if backend == "cpu":
         install_cpu_transport()
     executor.device_kind = cast(Any, backend)
@@ -339,21 +333,8 @@ def leader(root: Path, degree: int, backend: str = "cpu") -> None:
             group.dial_back(
                 __import__("cozy_runtime.internal.executor", fromlist=["_SEALED"])._SEALED
             )
-        started = executor.start(
-            {
-                "devices": command["devices"],
-                "sequence_parallel_degree": degree,
-                "application": binding.application,
-                "package_interface": binding.interface_path,
-                "development_project": binding.development_project,
-            }
-        )
-        assert started.get("ok"), started
-        reply = executor.load(command)
+        reply = executor.prepare(command)
         assert reply.get("ok"), reply
-        activated = executor.activate({"construction": command["construction"]})
-        assert activated.get("ok"), activated
-        host, executor = executor, executor.constructions[executor.active]
         assert len(executor.model_executors) == 2
         assert set(executor.models) == {"base", "overlay"}
         assert all(child.facts["filled_bytes"] > 0 for child in executor.model_executors)
@@ -373,7 +354,7 @@ def leader(root: Path, degree: int, backend: str = "cpu") -> None:
         request_id = "native-multi-model-invocation"
         if degree > 1:
             for changed_pin in ("base/dit=flash-attn3", "absent/dit=sdpa"):
-                refused = host.serve_request(
+                refused = executor.prepare_request(
                     {
                         "request_id": "changed-pin",
                         "entrypoint": "generate",
@@ -384,7 +365,7 @@ def leader(root: Path, degree: int, backend: str = "cpu") -> None:
                 assert refused["code"] == "attention_kernel_frozen", refused
                 assert "changed-pin" not in executor.prepared
                 assert not executor.poisoned
-        request = host.serve_request(
+        request = executor.prepare_request(
             {
                 "request_id": request_id,
                 "entrypoint": "generate",
@@ -409,7 +390,7 @@ def leader(root: Path, degree: int, backend: str = "cpu") -> None:
         assert {name: row["routes"] for name, row in deliveries.items()} == {
             name: row["delivery"]["routes"] for name, row in reply["facts"]["models"].items()
         }
-        served = host.serve_invoke(
+        served = executor.invoke(
             {
                 "request_id": request_id,
                 "entrypoint": "generate",
@@ -431,7 +412,7 @@ def leader(root: Path, degree: int, backend: str = "cpu") -> None:
             rel_tol=2e-5,
             abs_tol=2e-6,
         ), result
-        host._attempt_spool = root / "attempt"
+        executor._attempt_spool = root / "attempt"
         scope_headrooms = {"base.sample": 11, "overlay.sample": 17}
         executor.residency.open_attempt("all_resident", 0, scope_headrooms)
         device = next(executor.models["base"].pipe.components["dit"].parameters()).device
@@ -470,15 +451,15 @@ def leader(root: Path, degree: int, backend: str = "cpu") -> None:
                         )
         if backend == "cuda":
             torch.cuda.synchronize()
-        vacated = host.vacate()
+        vacated = executor.vacate()
         assert vacated["ok"], vacated
         assert set(vacated["vacated"]["freed"]) == {"base/dit", "overlay/projection"}, vacated
-        restored = host.restore(names=("overlay/projection",))
+        restored = executor.restore(names=("overlay/projection",))
         assert restored["ok"], restored
         assert restored["restored"]["restored"] == {"overlay/projection": 16}, restored
         assert restored["restored"]["held"] == {}, restored
         assert set(executor.residency.document()["resident"]) == {"overlay/projection"}
-        restored = host.restore(names=("base/dit",))
+        restored = executor.restore(names=("base/dit",))
         assert restored["ok"] and set(restored["restored"]["restored"]) == {"base/dit"}, restored
         got = executor.models["base"].sample(
             executor.models["overlay"], values, lambda: callbacks.append(2)
@@ -503,10 +484,9 @@ def leader(root: Path, degree: int, backend: str = "cpu") -> None:
     finally:
         if group is not None:
             group.close()
-        for construction in host.constructions.values():
-            for child in construction.model_executors:
-                if child.backend is not None:
-                    child.backend.close()
+        for child in executor.model_executors:
+            if child.backend is not None:
+                child.backend.close()
         ours.close()
         theirs.close()
 

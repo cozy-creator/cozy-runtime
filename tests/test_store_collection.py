@@ -34,6 +34,7 @@ def test_loopback_collection_is_fixed_store_and_defers_while_readers_are_live(
             None,
             None,
             None,
+            None,
             store_collector=lambda: store_gc.collect(Path(store.root)),
         ),
         server,

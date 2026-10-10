@@ -670,12 +670,26 @@ class Executions:
             and cause.get("code") == pb.CAUSE_CODE_EXECUTOR_INVALIDATED
             and cause.get("origin") == pb.CAUSE_ORIGIN_EXECUTOR
         )
+        # A retained local offer can outlive an admission-epoch change during
+        # restart/preparation. Re-offer under the current epoch; never weaken
+        # the lane's stale-offer fence or retry arbitrary admission refusals.
+        stale_admission = (
+            body.get("status") == pb.OUTCOME_STATUS_REFUSED
+            and cause.get("code") == pb.CAUSE_CODE_ADMISSION_EPOCH_STALE
+            and cause.get("origin") == pb.CAUSE_ORIGIN_WORKER
+        )
         if (
             row["desired"] != "run"
             or row["ordinal"] >= row["max_attempts"]
-            or body.get("status") not in (pb.OUTCOME_STATUS_FAILED, pb.OUTCOME_STATUS_ABANDONED)
-            or cause.get("code")
-            not in (pb.CAUSE_CODE_EXECUTOR_FAULT, pb.CAUSE_CODE_EXECUTOR_INVALIDATED)
+            or (
+                not stale_admission
+                and (
+                    body.get("status")
+                    not in (pb.OUTCOME_STATUS_FAILED, pb.OUTCOME_STATUS_ABANDONED)
+                    or cause.get("code")
+                    not in (pb.CAUSE_CODE_EXECUTOR_FAULT, pb.CAUSE_CODE_EXECUTOR_INVALIDATED)
+                )
+            )
             or (
                 not executor_loss
                 and cause.get("origin") not in (pb.CAUSE_ORIGIN_WORKER, pb.CAUSE_ORIGIN_RUNTIME)

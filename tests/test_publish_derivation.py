@@ -29,19 +29,14 @@ import pytest
 from cozy_runtime.author import App, ConformanceError, Context, Model, WeightsOutput
 from cozy_runtime.author._describe import describe
 from cozy_runtime.author._loader import Loader
-from cozy_runtime.internal import (
-    canonical,
-    package_environment,
-    package_interface,
-    static_interface,
-)
+from cozy_runtime.internal import canonical, package_environment, package_interface
 from cozy_runtime.internal.discovery import Discovered
 from cozy_runtime.internal.worker.package_prepare import (
     PreparationRefusal,
+    check_package_set_compatibility,
     prepare_package_set,
 )
 from cozy_runtime.protocol import worker_pb2 as pb
-from cozy_runtime.protocol import worker_pb2_grpc as pb_grpc
 
 ROOT = Path(__file__).resolve().parent.parent
 PACKAGE = ROOT / "examples" / "marco-polo"
@@ -290,7 +285,6 @@ def test_pod_prep_requires_the_request_facts(tmp_path: Path) -> None:
         slots: list[str] | None = None,
         inventory: pb.ImageInventory | None = None,
         locked: bytes = lock,
-        interface: bytes = b"{}",
     ) -> pb.PreparePackageSetResult:
         return prepare_package_set(
             pb.PreparePackageSetRequest(
@@ -300,12 +294,12 @@ def test_pod_prep_requires_the_request_facts(tmp_path: Path) -> None:
                 model_slot_paths=slots or [],
                 image_inventory=inventory or _inventory(),
                 locked_requirements=locked,
-                package_interface=interface,
             ),
             artifact_cache=tmp_path / "artifacts",
             tensorfs_root=tmp_path / "store",
             install_root=tmp_path / "environment",
             python=Path(sys.executable),
+            describe=lambda installed, distribution: b"{}",
             verified=lambda _digest, _length, _path: None,
         )
 
@@ -336,10 +330,6 @@ def test_pod_prep_requires_the_request_facts(tmp_path: Path) -> None:
             + b"\n"
         )
     assert no_pin.value.code == "package_prepare_project_pin_missing"
-
-    with pytest.raises(PreparationRefusal) as no_interface:
-        prep(interface=b"")
-    assert no_interface.value.code == "package_prepare_interface_missing"
 
 
 class _SimpleIndex:
@@ -411,8 +401,8 @@ def test_pod_prepares_from_the_exact_export_and_refuses_a_disagreement() -> None
     * the pod materializes its venv from the export alone — PyPI for a registry dependency,
       the org-shaped loopback index for the release's own wheels, every artifact matched
       against a hash the export names;
-    * the interface is the release's own document from the wire (proto-061 C): nothing is
-      described and no executor is spawned, and the request's application fact cross-checks it;
+    * the interface is DERIVED from that install (an actual import in the venv's own
+      interpreter), and the request's application fact cross-checks it;
     * a wrong application fact refuses typed; a wrong hash refuses at install, which is the
       dependency-confusion guard doing its job.
     """
@@ -452,7 +442,25 @@ def test_pod_prepares_from_the_exact_export_and_refuses_a_disagreement() -> None
                 ]
             ).encode()
 
-            interface = package_interface.canonical_bytes(static_interface.build(PACKAGE))
+            def describe_real(
+                selected: package_environment.InstalledEnvironment, distribution: str
+            ) -> bytes:
+                command = (
+                    "from cozy_runtime.internal import package_interface; "
+                    "from cozy_runtime.internal.discovery import discover_distribution; "
+                    f"found=discover_distribution({distribution!r}); "
+                    "print(package_interface.canonical_bytes("
+                    "package_interface.build(found)).decode())"
+                )
+                rendered = subprocess.run(
+                    [str(selected.python), "-I", "-c", command],
+                    cwd="/",
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                assert rendered.returncode == 0, rendered.stderr
+                return rendered.stdout.strip().encode()
 
             def prep(application: str, export_bytes: bytes) -> pb.PreparePackageSetResult:
                 return prepare_package_set(
@@ -463,12 +471,12 @@ def test_pod_prepares_from_the_exact_export_and_refuses_a_disagreement() -> None
                         model_slot_paths=[],
                         image_inventory=_inventory(),
                         locked_requirements=export_bytes,
-                        package_interface=interface,
                     ),
                     artifact_cache=root / "artifacts",
                     tensorfs_root=root / "store",
                     install_root=root / "environments",
                     python=image_python,
+                    describe=describe_real,
                     verified=lambda _digest, _length, _path: None,
                 )
 
@@ -500,12 +508,28 @@ def test_pod_prepares_from_the_exact_export_and_refuses_a_disagreement() -> None
             # The hard guard, observed live: preparing a package never loads derive.
             assert "cozy_runtime.internal.derive" not in sys.modules
 
-            # The staged interface IS the wire document, byte for byte.
-            staged = root / "artifacts" / placement["package_interface"]["digest"][7:]
-            assert staged.read_bytes() == interface
-            # proto-061 C: the metadata-only compatibility RPC no longer exists.
-            assert not hasattr(pb_grpc.RuntimePreparationServicer, "CheckPackageSetCompatibility")
-            assert not hasattr(pb, "CheckPackageSetCompatibilityResult")
+            # THE CHECK MUST NOT BE STRICTER THAN THE PREPARATION IT GUARDS. This set
+            # selects no model, and the host runs the compatibility check before every
+            # PreparePackageSet. It handed the derive child an empty slot set, which
+            # refuses `derive_request_invalid: slots is a non-empty array` -- so a set
+            # `prepare_package_set` accepts right above was refused on the pod, naming a
+            # request shape rather than the absent selection. It reuses the generation
+            # the preparation just built, so there is nothing left to fit and nothing to
+            # install.
+            verdict = check_package_set_compatibility(
+                pb.PreparePackageSetRequest(
+                    download_delegation=_download_set("paul/marco-polo", release),
+                    install_root=str(root / "environments"),
+                    application="marco_polo_package:app",
+                    model_slot_paths=[],
+                    image_inventory=_inventory(),
+                    locked_requirements=export,
+                ),
+                tensorfs_root=root / "store",
+                install_root=root / "environments",
+                python=image_python,
+            )
+            assert verdict.refusal_code == "" and verdict.refusal_detail == ""
 
             # A local controller can run a different CPython than the release.
             # Its preinstalled SDK must never supply this published wheel closure.
@@ -520,7 +544,6 @@ def test_pod_prepares_from_the_exact_export_and_refuses_a_disagreement() -> None
                     locked_requirements=export,
                     python_requires=">=3.12",
                     python_version=selected.version,
-                    package_interface=interface,
                 )
                 held: list[package_environment.InstalledEnvironment] = []
                 for _ in range(2):
@@ -531,6 +554,7 @@ def test_pod_prepares_from_the_exact_export_and_refuses_a_disagreement() -> None
                         install_root=local_root,
                         python=image_python,
                         preinstalled_python=image_python,
+                        describe=describe_real,
                         verified=lambda _digest, _length, _path: None,
                         materialized=held.append,
                     )

@@ -529,30 +529,31 @@ def test_cli_and_local_worker_share_one_managed_interpreter_root(
     selected = main.dispatch("python-ensure", [">=3.13", "3.13.10"], Options(json=True), config)
     assert selected.document is not None
 
-    def prepare(request: pb.PreparePackageSetRequest, **kwargs: Any) -> pb.PreparePackageSetResult:
+    def check(
+        request: pb.PreparePackageSetRequest, **kwargs: Any
+    ) -> pb.CheckPackageSetCompatibilityResult:
         python, _ = package_prepare._select_python(
             kwargs["python"], ">=3.13", "3.13.10", root=kwargs["python_root"]
         )
         assert p.Interpreter(python, "3.13.10", "cp313").document() == selected.document
-        raise package_prepare.PreparationRefusal("selected", "interpreter")
+        return pb.CheckPackageSetCompatibilityResult()
 
-    monkeypatch.setattr(package_prepare, "prepare_package_set", prepare)
+    monkeypatch.setattr(package_prepare, "check_package_set_compatibility", check)
     worker = SimpleNamespace(
         config=config,
         preparation_lock=nullcontext(),
         base=observed,
-        verified_artifacts=None,
         options=SimpleNamespace(
             tensorfs_root=str(tmp_path / "tfs"),
             install_root=str(install_root),
-            artifact_cache=str(tmp_path / "artifacts"),
-            environment_python=None,
             python=sys.executable,
         ),
         stop=threading.Event(),
         note=lambda *a: None,
     )
-    with pytest.raises(package_prepare.PreparationRefusal, match="selected"):
-        Worker._prepare_published(cast(Worker, worker), pb.PreparePackageSetRequest())
+    result = Worker.check_package_set_compatibility(
+        cast(Worker, worker), pb.PreparePackageSetRequest()
+    )
+    assert not result.refusal_code
     assert calls == [config.managed_python_root / "managed"]
     assert not (install_root / "python").exists()

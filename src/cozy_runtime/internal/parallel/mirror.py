@@ -89,10 +89,6 @@ def mirror_component(
                             code=str(reply.get("code") or "group_broken"),
                         )
                     attention_sol.record_rank(reply["rank"], reply["sol_calls"])
-                    rank = int(reply["rank"])
-                    group.working_peaks[rank] = max(
-                        group.working_peaks.get(rank, 0), int(reply.get("working_peak_bytes", 0))
-                    )
                 return result
             except BaseException:
                 group._break(f"mirrored component {name!r} failed")

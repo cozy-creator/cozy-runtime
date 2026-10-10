@@ -36,7 +36,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from cozy_runtime import __version__ as RUNTIME_VERSION
 from cozy_runtime.internal import accel, jit_cache, liveness, proctree, spawn
 from cozy_runtime.internal.child_env import (
     EXECUTOR_SCOPE_ENV,
@@ -104,35 +103,6 @@ class ExecutorGone(Exception):
         self.status = status
 
 
-class ExecutorRuntimeMismatch(ExecutorGone):
-    """The executor imported another cozy-runtime than this worker's: their private
-    command protocol is not versioned, so the spawn is refused before any command."""
-
-    code = "executor_runtime_mismatch"
-
-
-def require_same_runtime(hello: dict[str, Any]) -> None:
-    executor = hello.get("runtime_version") or "unknown (its hello predates the handshake)"
-    if executor != RUNTIME_VERSION:
-        raise ExecutorRuntimeMismatch(
-            f"executor_runtime_mismatch: the executor at {hello.get('python_executable')} runs "
-            f"cozy-runtime {executor}; this worker runs {RUNTIME_VERSION}"
-        )
-
-
-@dataclass(slots=True)
-class LoadedConstruction:
-    """One construction the executor built: what it resolved and whom it serves."""
-
-    key: str
-    prepared_model: PreparedModel
-    #: every model parameter name it is bound under (h3a-018)
-    parameters: frozenset[str]
-    #: the entrypoint bindings it serves
-    bindings: frozenset[str]
-    facts: dict[str, Any] = field(default_factory=dict)
-
-
 @dataclass(slots=True)
 class Executor:
     """One epoch: a pid, a seam, and the facts it reported."""
@@ -151,15 +121,12 @@ class Executor:
     launch_python: str = ""
     environment_content_digest: str = ""
     hello: dict[str, Any] = field(default_factory=dict)
-    #: the bindings this process is DISPATCHABLE for: started, package imported; their
-    #: constructions load on the attempt path
     ready_bindings: set[str] = field(default_factory=set)
-    #: the `start` reply once every rank is up; empty until then
-    started: dict[str, Any] = field(default_factory=dict)
-    #: every construction built in this process (resident or parked), by construction key
-    loaded: dict[str, LoadedConstruction] = field(default_factory=dict)
-    #: the construction key the executor last activated
-    active: str = ""
+    construction_key: str = ""
+    #: Every model parameter name the prepared generation is bound under (h3a-018): a
+    #: binding this process can serve without another fill spells one of these.
+    parameters: frozenset[str] = frozenset()
+    prepared_model: PreparedModel | None = None
     reserved_for_job: bool = False
     poisoned: str = ""
     spawned_at: float = 0.0
@@ -173,11 +140,6 @@ class Executor:
     @property
     def pid(self) -> int:
         return self.process.pid
-
-    def loaded_bindings(self) -> set[str]:
-        """Dispatchable bindings whose construction is built in this process."""
-        built = {digest for row in self.loaded.values() for digest in row.bindings}
-        return built & self.ready_bindings
 
     def alive(self) -> bool:
         # Observation must not reap.  Keeping an exited direct child as a zombie until
@@ -915,7 +877,6 @@ class ExecutorSupervision:
                     f"{spawned.seal_digest}; received pid {executor.hello.get('pid')}, "
                     f"parent {executor.hello.get('ppid')}"
                 )
-            require_same_runtime(executor.hello)
             executor.ready_at = time.perf_counter()
             exit_published = self._start_exit_watcher(executor)
             self.current = executor

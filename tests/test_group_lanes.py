@@ -41,7 +41,7 @@ from cozy_runtime.internal.worker.session import (
     Tenant,
     Worker,
     WorkerOptions,
-    executor_load_command,
+    executor_prepare_command,
 )
 from cozy_runtime.protocol import documents as documents_
 from cozy_runtime.protocol import worker_pb2 as pb
@@ -88,8 +88,8 @@ def test_fuse_and_split_are_typed_and_bump_the_revision() -> None:
     assert lanes_.by_id["lane-0+1"] is fused and "lane-0" not in lanes_.by_id
     assert lanes_.holder_of(1) is fused and lanes_.revision == 1
     assert lanes_.envelope.ordinals == (0, 1, 2), "the job's envelope lane is untouched"
-    # a group is ONE device seat and ONE staged seat regardless of K (per-lane constants)
-    assert (lanes.LANE_RUNNING, lanes.LANE_STAGED) == (1, 1)
+    # a group is ONE seat regardless of K (cr-066's per-lane constant, K-independent)
+    assert lanes.LANE_SEATS == 1
     with pytest.raises(lanes.LaneRefusal) as nested:
         lanes_.fuse((1, 2))
     assert nested.value.code == "device_pin_infeasible" and "held by group" in nested.value.detail
@@ -232,7 +232,7 @@ def test_a_pin_wider_than_every_declared_degree_runs_at_the_largest_that_fits() 
 def test_per_device_rows_and_the_min_ceiling() -> None:
     """A group's ledger holds one `DeviceFacts` row per device and prices against the MIN:
     the lane's reading is the tightest card's, an unreadable card makes the lane
-    unreadable, and the process ceiling every rank is handed is the MIN capacity."""
+    unreadable, and `authorize` hands every rank the MIN headroom."""
     lanes_ = lanes.LaneSet.from_envelope("0,1,2", worker_pid=os.getpid())
     group = lanes_.fuse((0, 1))
     assert lanes.fold_memory({0: MEASURED[0], 1: MEASURED[1]}) == accel.DeviceMemory(
@@ -247,7 +247,8 @@ def test_per_device_rows_and_the_min_ceiling() -> None:
     assert ledger.device_free == 4 * GiB and ledger.device_total == 8 * GiB
     assert sorted(ledger.rows()["devices"]) == ["0", "1"]
     assert ledger.rows()["devices"]["0"]["free"] == 6 * GiB
-    assert lanes.fold_memory({0: MEASURED[0], 1: MEASURED[1]}).total_bytes == 8 * GiB
+    granted = group.authorize("g", lanes.fold_memory({0: MEASURED[0], 1: MEASURED[1]}).free_bytes)
+    assert granted == 4 * GiB and ledger.authorized_device_limit_bytes == 4 * GiB
     # The chooser consumes the already-folded ledger; it needs no second copy of degree.
     assert group.row("g").chooser.ledger is ledger
     # a generation change clears the rows with everything else
@@ -404,7 +405,7 @@ def test_a_group_is_one_seat_and_the_wire_says_so() -> None:
             )
             worker.lanes.lanes[0].placements.add("p0")
             worker.lanes.lanes[1].placements.add("p1")
-            assert worker.available_attempt_slots() == 4
+            assert worker.available_attempt_slots() == 2
             before = worker.observed_state()
             assert [row["lane_id"] for row in worker.lane_documents()] == ["lane-0", "lane-1"]
             assert _lane_rows(before) == worker.lane_documents()
@@ -420,13 +421,13 @@ def test_a_group_is_one_seat_and_the_wire_says_so() -> None:
             group = worker.lanes.fuse((0, 1))
             group.placements.add("p0")
             primary.lane_id = group.lane_id
-            assert worker.available_attempt_slots() == 2
+            assert worker.available_attempt_slots() == 1
             documents = worker.lane_documents()
             assert documents == [
                 {
                     "lane_id": "lane-0+1",
                     "device_ordinals": [0, 1],
-                    "available_attempt_slots": 2,
+                    "available_attempt_slots": 1,
                     "placement_ids": ["p0"],
                     "resident_placement_ids": [],
                 }
@@ -436,26 +437,15 @@ def test_a_group_is_one_seat_and_the_wire_says_so() -> None:
             held.lane_id = group.lane_id
             held.state = "running"
             worker.engine.history[held.key()] = held
-            assert worker.available_attempt_slots() == 1, "one on the device across K"
-            staged = AttemptRecord(request_id="s", attempt=1, digest=b"", spec={})
-            staged.placement_id = "p0"
-            staged.lane_id = group.lane_id
-            staged.state = "staged"
-            worker.engine.history[staged.key()] = staged
-            assert worker.available_attempt_slots() == 0, "and one staged behind it"
+            assert worker.available_attempt_slots() == 0, "one attempt at a time across K"
             taken = worker.observed_state()
             assert _lane_rows(taken) == [dict(documents[0], available_attempt_slots=0)]
             assert taken.available_attempt_slots == 0
-            queued = {row.request_id: row for row in taken.held_attempts}
-            assert queued["s"].state == pb.AttemptState.ATTEMPT_STATE_QUEUED
-            assert queued["s"].executor_epoch == 0 and queued["s"].lane_id == group.lane_id
-            assert queued["r"].state == pb.AttemptState.ATTEMPT_STATE_RUNNING
             del worker.engine.history[held.key()]
-            del worker.engine.history[staged.key()]
             assert lane_wire.lanes_on_wire(worker.fence.wire_minor)
             observed = worker.observed_state()
             assert _lane_rows(observed) == documents
-            assert observed.available_attempt_slots == 2
+            assert observed.available_attempt_slots == 1
             (status,) = observed.placements
             assert status.device_lane_id == "lane-0+1"
             assert worker.admission_epoch == epoch, "fusing by hand bumps nothing; assign does"
@@ -548,31 +538,31 @@ def test_a_two_lane_snapshot_body_names_each_lane_and_sums_them() -> None:
                 {
                     "lane_id": "lane-0",
                     "device_ordinals": [0],
-                    "available_attempt_slots": 2,
+                    "available_attempt_slots": 1,
                     "placement_ids": ["p0"],
                     "resident_placement_ids": [],
                 },
                 {
                     "lane_id": "lane-1",
                     "device_ordinals": [1],
-                    "available_attempt_slots": 2,
+                    "available_attempt_slots": 1,
                     "placement_ids": ["p1"],
                     "resident_placement_ids": [],
                 },
             ]
-            assert body.available_attempt_slots == 4
+            assert body.available_attempt_slots == 2
             canonical_bytes, digest = documents_.identity(body)
             document = documents_.read(canonical_bytes, pb.WorkerSnapshotBody)
             assert document["format"] == "cozy.worker.v1.WorkerSnapshotBody/1"
             assert document["lanes"] == [
                 {
-                    "available_attempt_slots": 2,
+                    "available_attempt_slots": 1,
                     "device_ordinals": [0],
                     "lane_id": "lane-0",
                     "placement_ids": ["p0"],
                 },
                 {
-                    "available_attempt_slots": 2,
+                    "available_attempt_slots": 1,
                     "device_ordinals": [1],
                     "lane_id": "lane-1",
                     "placement_ids": ["p1"],
@@ -611,7 +601,7 @@ def test_a_two_lane_snapshot_body_names_each_lane_and_sums_them() -> None:
                 {
                     "lane_id": "lane-0",
                     "device_ordinals": [0],
-                    "available_attempt_slots": 2,
+                    "available_attempt_slots": 1,
                     "placement_ids": ["p0"],
                     "resident_placement_ids": [],
                 }
@@ -656,29 +646,17 @@ def test_device_pins_are_read_as_sent() -> None:
     assert [lane.lane_id for lane in lane_set.lanes] == ["lane-0", "lane-1"]
 
 
-def test_the_load_command_carries_the_degree_only_above_one() -> None:
-    """A plain executor's load is byte-identical: the degree rides only when > 1."""
+def test_the_prepare_command_carries_the_degree_only_above_one() -> None:
+    """A plain executor's prepare is byte-identical: the degree rides only when > 1."""
     binding = _binding()
-    key = binding.construction_key()
-    plain = executor_load_command(
-        binding, construction=key, devices="0", authorized_device_limit_bytes=7
-    )
-    one = executor_load_command(
-        binding,
-        construction=key,
-        devices="0",
-        authorized_device_limit_bytes=7,
-        sequence_parallel_degree=1,
+    plain = executor_prepare_command(binding, devices="0", authorized_device_limit_bytes=7)
+    one = executor_prepare_command(
+        binding, devices="0", authorized_device_limit_bytes=7, sequence_parallel_degree=1
     )
     assert canonical.write(plain) == canonical.write(one)
     assert "sequence_parallel_degree" not in plain
-    assert plain["cmd"] == "load" and plain["construction"] == key
-    group = executor_load_command(
-        binding,
-        construction=key,
-        devices="0,1",
-        authorized_device_limit_bytes=7,
-        sequence_parallel_degree=2,
+    group = executor_prepare_command(
+        binding, devices="0,1", authorized_device_limit_bytes=7, sequence_parallel_degree=2
     )
     assert group["sequence_parallel_degree"] == 2 and group["devices"] == "0,1"
 
@@ -791,12 +769,17 @@ def test_the_authors_degrees_reach_the_interface_and_its_fixed_point() -> None:
 # ------------------------------------------------------------------- the seal (real)
 
 
-def _weightless_start(body: dict[str, Any], interface: Path, **extra: Any) -> dict[str, Any]:
+def _weightless_prepare(body: dict[str, Any], interface: Path, **extra: Any) -> dict[str, Any]:
     return {
-        "cmd": "start",
-        "application": str(body["application"]),
-        "package_interface": str(interface),
-        "development_project": str(PACKAGE),
+        "cmd": "prepare",
+        "binding": {
+            "application": str(body["application"]),
+            "package_interface": str(interface),
+            "development_project": str(PACKAGE),
+            "model_class": "",
+        },
+        "budgets": {},
+        "authorized_device_limit_bytes": 0,
         **extra,
     }
 
@@ -812,13 +795,13 @@ def test_package_describe_executor_is_replaced_when_its_placement_takes_a_group(
         try:
             single = lanes.DeviceLane("lane-0", (0,), "0", worker_pid=os.getpid())
             described = worker.supervision.spawn(imposed=worker.imposed(single))
-            assert not described.ready_bindings and not described.loaded
+            assert not described.ready_bindings and described.prepared_model is None
             assert described.hello["sealed"]["CUDA_VISIBLE_DEVICES"] == "0"
             group = worker.lanes.fuse((0, 1))
             tenant = Tenant(
                 _placement("candidate"), worker.supervision, {}, {}, {}, group, "candidate"
             )
-            prepared = worker._own_executor(tenant)
+            prepared = worker._own_executor(tenant, [])
             assert not isinstance(prepared, str), prepared
             assert prepared is not described, (
                 "the package-describe process retained its single-GPU seal"
@@ -826,7 +809,9 @@ def test_package_describe_executor_is_replaced_when_its_placement_takes_a_group(
             assert not described.alive()
             assert prepared.hello["sealed"]["CUDA_VISIBLE_DEVICES"] == "0,1"
             assert worker.supervision.devices == group.entries
-            assert worker._own_executor(tenant) is prepared, "unchanged seals should still reuse"
+            assert worker._own_executor(tenant, []) is prepared, (
+                "unchanged seals should still reuse"
+            )
         finally:
             worker.supervision.close()
 
@@ -836,7 +821,7 @@ def test_an_executor_sealed_to_two_ordinals_and_its_reclaim_over_both() -> None:
     """THE K-DEVICE SEAL, read from the child's own `/proc` environment: a group lane's
     executor carries `CUDA_VISIBLE_DEVICES=0,1` and `NCCL_NVLS_ENABLE=0`; a device lane's
     carries no NVLS row. The degree is checked against the seal before any weight moves;
-    a weightless package refuses to shard; degree 1 is a plain start. Retirement
+    a weightless construction refuses to shard; degree 1 is a plain prepare. Retirement
     proves absence for EVERY device of the lane: two rows, one per entry, beside the merged
     proof — and the card that does not exist is UNREADABLE, never absent by omission."""
     with _workspace() as root:
@@ -869,7 +854,7 @@ def test_an_executor_sealed_to_two_ordinals_and_its_reclaim_over_both() -> None:
             assert executor.hello["sealed"]["CUDA_VISIBLE_DEVICES"] == "0,1"
             assert executor.hello["rank"] == 0 and executor.hello["world"] == 1
             assert worker.supervision.devices == ("0", "1")
-            command = _weightless_start(body, interface, devices="0,1")
+            command = _weightless_prepare(body, interface, devices="0,1")
             # the seal fences the devices before the degree is even read
             other = executor.call({**command, "devices": "0"}, timeout=60.0)
             assert other["code"] == "env_seal_broken", other
@@ -882,7 +867,7 @@ def test_an_executor_sealed_to_two_ordinals_and_its_reclaim_over_both() -> None:
         assert evidence.devices["1"].state == "unreadable", (
             "the second card does not exist here: the driver's honest answer, never absent"
         )
-        # degree checks, each on a fresh executor (a refused start poisons its epoch)
+        # degree checks, each on a fresh executor (a refused prepare poisons its epoch)
         for extra, code in (
             ({"sequence_parallel_degree": 3}, "sequence_parallel_degree_mismatch"),
             ({"sequence_parallel_degree": 2}, "sequence_parallel_unsupported"),
@@ -890,7 +875,7 @@ def test_an_executor_sealed_to_two_ordinals_and_its_reclaim_over_both() -> None:
             executor = worker.supervision.spawn(imposed=worker.imposed(group))
             try:
                 reply = executor.call(
-                    _weightless_start(body, interface, devices="0,1", **extra), timeout=60.0
+                    _weightless_prepare(body, interface, devices="0,1", **extra), timeout=60.0
                 )
                 assert reply["code"] == code, reply
                 if code == "sequence_parallel_degree_mismatch":
@@ -903,7 +888,7 @@ def test_an_executor_sealed_to_two_ordinals_and_its_reclaim_over_both() -> None:
 @needs_executor
 def test_degree_one_is_a_plain_executor() -> None:
     """A degenerate group on one card is byte-identical in behaviour to a plain executor:
-    the same weightless start with `sequence_parallel_degree: 1` and without it answers
+    the same weightless prepare with `sequence_parallel_degree: 1` and without it answers
     the same reply (timing aside), and neither spawns a rank."""
     with _workspace() as root:
         config = _config(root / "home")
@@ -922,7 +907,7 @@ def test_degree_one_is_a_plain_executor() -> None:
             executor = worker.supervision.spawn(imposed=worker.imposed(worker.lanes.lanes[0]))
             try:
                 reply = executor.call(
-                    _weightless_start(body, interface, devices="0", **extra), timeout=120.0
+                    _weightless_prepare(body, interface, devices="0", **extra), timeout=120.0
                 )
                 assert reply["ok"], reply
                 children = subprocess.run(
@@ -935,13 +920,12 @@ def test_degree_one_is_a_plain_executor() -> None:
         worker.supervision.close()
 
     def stable(reply: dict[str, Any]) -> dict[str, Any]:
-        return {
-            **{k: v for k, v in reply.items() if k not in ("stages", "rss_bytes")},
-            "stages": [name for name, _ms in reply["stages"]],
-        }
+        facts = {k: v for k, v in reply.get("facts", {}).items() if not k.endswith("_ms")}
+        facts.pop("rss_bytes", None)
+        return {**{k: v for k, v in reply.items() if k != "facts"}, "facts": facts}
 
     assert stable(replies[0]) == stable(replies[1])
-    assert replies[1]["follower_pids"] == [] and not replies[1]["torch"]
+    assert "sequence_parallel" not in replies[1].get("facts", {})
 
 
 # ---------------------------------------------------------------------- gloo (torch)
@@ -1008,8 +992,7 @@ def test_a_gloo_group_forms_on_a_kernel_chosen_port_and_agrees_or_refuses(
         assert torch.distributed.get_world_size() == 3 and torch.distributed.get_rank() == 0
         # the followers answered `join` only after their own barrier: the group is whole
         command = {
-            "cmd": "load",
-            "construction": "fixture",
+            "cmd": "prepare",
             "devices": "0,1,2",
             "sequence_parallel_degree": 3,
             "authorized_device_limit_bytes": 1,
@@ -1021,9 +1004,16 @@ def test_a_gloo_group_forms_on_a_kernel_chosen_port_and_agrees_or_refuses(
             },
             "budgets": {},
         }
+        plan = GroupPlan(
+            degree=3,
+            devices=("0", "1", "2"),
+            plan_digest="sha256:" + "a" * 64,
+            authorized_device_limit_bytes=1,
+        )
+        assert GroupPlan.read(plan.document()) == plan
         # the hardware half disagrees: refused BEFORE torch is imported on the follower
-        divergent = {"degree": 3, "devices": ["0", "1", "7"]}
-        replies = group.call({**command, "group": divergent})
+        divergent = dataclasses.replace(plan, devices=("0", "1", "7"))
+        replies = group.call({**command, "group": {"plan": divergent.document()}})
         assert [r["code"] for r in replies] == ["rank_divergence"] * 2, replies
         assert "rank 0 broadcast degree 3 over ['0', '1', '7']" in replies[0]["detail"]
         assert replies[0]["rank"] == 1 and replies[1]["rank"] == 2

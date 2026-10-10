@@ -60,13 +60,13 @@ def supervisor(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[dict[str, objec
         host.shutdown(socket.SHUT_RDWR)
 
 
-Preparer = Callable[[pb.PreparePackageSetRequest], pb.PreparePackageSetResult]
+Compatibility = Callable[[pb.PreparePackageSetRequest], pb.CheckPackageSetCompatibilityResult]
 
 
-def prepare(request: pb.PreparePackageSetRequest, handler: Preparer) -> grpc.RpcError:
+def check(request: pb.PreparePackageSetRequest, handler: Compatibility) -> grpc.RpcError:
     server = grpc.server(ThreadPoolExecutor(max_workers=2))
     rpc.add_RuntimePreparationServicer_to_server(
-        _PreparationServicer(handler, None, None, None),
+        _PreparationServicer(handler, None, None, None, None),
         server,
     )
     port = server.add_insecure_port("127.0.0.1:0")
@@ -75,7 +75,7 @@ def prepare(request: pb.PreparePackageSetRequest, handler: Preparer) -> grpc.Rpc
         with grpc.insecure_channel(f"127.0.0.1:{port}") as channel:
             client = rpc.RuntimePreparationStub(channel)
             with pytest.raises(grpc.RpcError) as failure:
-                client.PreparePackageSet(request, timeout=10)
+                client.CheckPackageSetCompatibility(request, timeout=10)
             return failure.value
     finally:
         server.stop(None).wait()
@@ -90,12 +90,12 @@ def test_capacity_refusal_reaches_the_host_with_its_budget(
 ) -> None:
     supervisor.append(CAPACITY)
 
-    def preparer(_: pb.PreparePackageSetRequest) -> pb.PreparePackageSetResult:
+    def compatibility(_: pb.PreparePackageSetRequest) -> pb.CheckPackageSetCompatibilityResult:
         with storage.admit(storage.Write(tmp_path, 6012954214, 20000)):
             pytest.fail("refused write ran")
         raise AssertionError("unreachable")
 
-    failure = prepare(pb.PreparePackageSetRequest(), preparer)
+    failure = check(pb.PreparePackageSetRequest(), compatibility)
     assert failure.code() == grpc.StatusCode.INTERNAL
     assert failure.details() == (
         "StorageRefusal: supervisor refused Runtime disk write: "
@@ -110,7 +110,7 @@ def test_wheel_transfer_failure_is_not_called_a_disk_refusal(
 ) -> None:
     supervisor.append(WHEEL)
 
-    def preparer(_: pb.PreparePackageSetRequest) -> pb.PreparePackageSetResult:
+    def compatibility(_: pb.PreparePackageSetRequest) -> pb.CheckPackageSetCompatibilityResult:
         storage.fetch_wheel(
             "locked-" + "0" * 64,
             "torch-2.14.0-cp312-cp312-manylinux_2_28_x86_64.whl",
@@ -119,7 +119,7 @@ def test_wheel_transfer_failure_is_not_called_a_disk_refusal(
         )
         raise AssertionError("unreachable")
 
-    failure = prepare(pb.PreparePackageSetRequest(), preparer)
+    failure = check(pb.PreparePackageSetRequest(), compatibility)
     assert failure.details() == (
         "StorageRefusal: supervisor refused locked wheel "
         "torch-2.14.0-cp312-cp312-manylinux_2_28_x86_64.whl: " + str(WHEEL["reason"])

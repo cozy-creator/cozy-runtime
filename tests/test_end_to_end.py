@@ -562,7 +562,7 @@ def generate(ctx: Context, payload: Request, model: Weights) -> Result:
     )
     acquired = acquirer.acquire(placement)
     assert acquired.bindings == {}
-    assert acquired.manifests == 0 and acquired.documents == 1
+    assert acquired.model_objects == 0 and acquired.documents == 1
     assert acquired.installed == installed[0]
     (tmp_path / "prepared-code.json").write_bytes(
         prepared.placement_set.placement_set_canonical_bytes
@@ -665,7 +665,7 @@ def generate(ctx: Context, payload: Request, model: Weights) -> Result:
             installed_environment=installed[0],
         ).acquire(bound)
         assert {binding.entrypoint for binding in selected.bindings.values()} == {"generate"}
-        assert selected.manifests == 1
+        assert selected.model_objects == (6 if model_source == "mixed" else 3)
         (tmp_path / "prepared-model.json").write_bytes(
             modeled.placement_set.placement_set_canonical_bytes
         )

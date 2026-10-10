@@ -12,7 +12,6 @@ KINDS = (
     "ownership",
     "placement_set",
     "accepted",
-    "entered",
     "outcome",
     "closed",
     "epoch",
@@ -65,10 +64,6 @@ class WorkerRecords:
             body = record.body
             if record.kind == "accepted":
                 table[(body["request_id"], body["attempt"])] = {"state": "accepted", **body}
-            elif record.kind == "entered":
-                key = (body["request_id"], body["attempt"])
-                if key in table:
-                    table[key].update(body)
             elif record.kind == "outcome":
                 key = (body["request_id"], body["attempt"])
                 table.setdefault(key, {"state": "unassigned", **body}).update(

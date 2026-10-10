@@ -70,96 +70,6 @@ class EnvironmentRefusal(Exception):
         self.detail = detail
 
 
-# The worker and its executor speak one private protocol, so a package environment runs
-# the worker's own SDK, never the Runtime its lock happened to pin.
-WORKER_SDK_DISTRIBUTIONS = ("cozy-runtime", "tensorfs")
-
-
-def worker_sdk(python: Path) -> dict[str, dict[str, str]]:
-    """The worker's regular-installed SDK distributions: version and RECORD digest.
-
-    An editable (source-tree) install has no copyable RECORD closure; it is omitted, the
-    lock's row stays, and the executor handshake refuses the resulting version mismatch.
-    """
-    from cozy_runtime.internal import _installed_dependencies
-
-    site, _ = _installed_dependencies._source_site(python, current_system_sdk=True)
-    found: dict[str, dict[str, str]] = {}
-    for info in sorted(site.glob("*.dist-info")):
-        metadata = info / "METADATA"
-        if info.is_symlink() or not metadata.is_file():
-            continue
-        headers = BytesParser().parsebytes(metadata.read_bytes(), headersonly=True)
-        name = _name(str(headers.get("Name", "")))
-        if name not in WORKER_SDK_DISTRIBUTIONS:
-            continue
-        direct = info / "direct_url.json"
-        if direct.is_file():
-            try:
-                editable = json.loads(direct.read_text()).get("dir_info", {}).get("editable")
-            except (ValueError, UnicodeError, AttributeError) as exc:
-                raise EnvironmentRefusal(
-                    "package_environment_worker_sdk_invalid", str(direct)
-                ) from exc
-            if editable:
-                continue
-        if name in found:
-            raise EnvironmentRefusal("package_environment_worker_sdk_ambiguous", name)
-        found[name] = {
-            "record": _hash_file(info / "RECORD"),
-            "version": str(headers.get("Version", "")),
-        }
-    return found
-
-
-def _substitute_worker_sdk(
-    staging: Path,
-    source: Path,
-    sdk: Mapping[str, Mapping[str, str]],
-    pinned: Mapping[str, str],
-    base: base_observation.Observation,
-) -> None:
-    """Copy the worker's SDK into a staged locked environment after checking the declared
-    ranges of every installed distribution (not the lock's exact pin) admit it."""
-    from cozy_runtime.internal import _installed_dependencies, package_requirements
-
-    site = next(staging.glob("lib/python*/site-packages"))
-    markers = _marker_environment(base)
-    for info in sorted(site.glob("*.dist-info")):
-        headers = BytesParser().parsebytes((info / "METADATA").read_bytes(), headersonly=True)
-        owner = _name(str(headers.get("Name", "")))
-        for row in headers.get_all("Requires-Dist", []):
-            try:
-                requirement = Requirement(row)
-            except InvalidRequirement as exc:
-                raise EnvironmentRefusal("package_environment_record_invalid", row) from exc
-            name = _name(requirement.name)
-            if name not in sdk or (
-                requirement.marker is not None
-                and not requirement.marker.evaluate({**markers, "extra": ""})
-            ):
-                continue
-            version = sdk[name]["version"]
-            if requirement.specifier and not requirement.specifier.contains(
-                Version(version), prereleases=True
-            ):
-                raise package_requirements.WorkerSdkOutOfRange(
-                    owner, requirement, version, pinned[name]
-                )
-    manifest = _installed_dependencies.snapshot(
-        source, staging, set(), included=set(sdk), current_system_sdk=True
-    )
-    _installed_dependencies.verify_files(staging, manifest)
-    copied = {
-        row["distribution"]: row["version"]
-        for row in canonical.parse_canonical(manifest)["distributions"]
-    }
-    if copied != {name: facts["version"] for name, facts in sdk.items()}:
-        raise EnvironmentRefusal(
-            "package_environment_worker_sdk_changed", f"observed {dict(sdk)} copied {copied}"
-        )
-
-
 def observe_base(python: Path = Path(sys.executable)) -> base_observation.Observation:
     try:
         return base_observation.from_python(python)
@@ -884,7 +794,6 @@ def materialize_locked(
     base: base_observation.Observation | None = None,
     dependency_python: Path | None = None,
     dependency_cache: Path | None = None,
-    sdk_python: Path | None = None,
 ) -> InstalledEnvironment:
     """Materialize one venv from the release's exact hash-pinned export (xs-017).
 
@@ -892,8 +801,6 @@ def materialize_locked(
     hash; indexes have no authority over bytes. A shared uv cache reuses immutable artifacts.
     Private metadata closure is checked before import, including on reuse. A captured local
     SDK closure is copied into the generation and becomes part of its content identity.
-    The worker's own SDK (`sdk_python`, default this interpreter) replaces the lock's
-    cozy-runtime/tensorfs rows and is part of the content identity.
     """
 
     from cozy_runtime.internal import package_requirements
@@ -908,10 +815,6 @@ def materialize_locked(
     _require_observed_interpreter(python, observed)
     if dependency_python is not None:
         _require_same_interpreter(python, dependency_python)
-    sdk_source = Path(sys.executable) if sdk_python is None else sdk_python
-    locked_names = {row.name: row.version for row in install_rows}
-    sdk = {name: facts for name, facts in worker_sdk(sdk_source).items() if name in locked_names}
-    install_rows = [row for row in install_rows if row.name not in sdk]
     uv = _uv_binary()
     current_uv = _observed_uv_version(uv)
     if current_uv != observed.uv_version:
@@ -920,9 +823,7 @@ def materialize_locked(
             f"observed={observed.uv_version} current={current_uv}",
         )
     content_bytes = canonical.write(
-        _locked_content_identity(
-            locked.digest, observed.interpreter_identity, observed.uv_version, sdk
-        )
+        _locked_content_identity(locked.digest, observed.interpreter_identity, observed.uv_version)
     )
     content_digest = _sha(content_bytes)
     receipt_bytes = canonical.write(
@@ -981,14 +882,12 @@ def materialize_locked(
                 dependencies=copy_dependencies if dependency_python is not None else None,
                 cache_root=dependency_cache,
             )
-            if sdk:
-                _substitute_worker_sdk(staging, sdk_source, sdk, locked_names, observed)
             if dependency_python is not None:
                 from cozy_runtime.internal import _installed_dependencies
 
                 _installed_dependencies.verify_files(staging, manifest)
                 identity = _locked_content_identity(
-                    locked.digest, observed.interpreter_identity, observed.uv_version, sdk
+                    locked.digest, observed.interpreter_identity, observed.uv_version
                 )
                 identity["dependency_snapshot"] = {
                     "digest": _sha(manifest),
@@ -1308,20 +1207,14 @@ def read_dependency_requirements(raw: bytes) -> LockedRequirements:
 
 
 def _locked_content_identity(
-    locked_digest: str,
-    interpreter: Mapping[str, str],
-    uv_version: str,
-    sdk: Mapping[str, Mapping[str, str]] | None = None,
+    locked_digest: str, interpreter: Mapping[str, str], uv_version: str
 ) -> dict[str, Any]:
-    identity: dict[str, Any] = {
+    return {
         "format": LOCKED_CONTENT_FORMAT,
         "interpreter": dict(interpreter),
         "locked_requirements_digest": locked_digest,
         "uv_version": uv_version,
     }
-    if sdk:
-        identity["worker_sdk"] = {name: dict(facts) for name, facts in sorted(sdk.items())}
-    return identity
 
 
 def _locked_receipt(
@@ -2539,7 +2432,7 @@ def _content_matches_receipt(identity: object, receipt: Mapping[str, Any]) -> bo
         ref = receipt.get("locked_requirements")
         return (
             isinstance(identity, dict)
-            and set(identity) - {"dependency_snapshot", "worker_sdk"}
+            and set(identity) - {"dependency_snapshot"}
             == {"format", "interpreter", "locked_requirements_digest", "uv_version"}
             and identity.get("format") == LOCKED_CONTENT_FORMAT
             and isinstance(identity.get("interpreter"), dict)

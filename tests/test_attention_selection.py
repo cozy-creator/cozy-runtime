@@ -42,7 +42,7 @@ from cozy_runtime.internal.encoding import DeviceFacts
 from cozy_runtime.internal.local import LocalRequest, development_source_digest, run_slice
 from cozy_runtime.internal.worker.attempts import AttemptRecord
 from cozy_runtime.internal.worker.plan import DeclaredBinding, ModelBinding
-from cozy_runtime.internal.worker.session import WorkerOptions, executor_load_command
+from cozy_runtime.internal.worker.session import WorkerOptions, executor_prepare_command
 from test_end_to_end import NO_EXECUTOR
 
 PACKAGE = Path(__file__).resolve().parent.parent / "examples" / "marco-polo"
@@ -932,9 +932,7 @@ def _binding(models: int = 1) -> DeclaredBinding:
 def test_a_serving_prepare_carries_no_pin_at_all() -> None:
     """PRODUCTION IS KNOB-FREE. The override is absent by default and the serving prepare is
     byte-identical to what it was before cr-125 — the key is not present, not empty."""
-    served = executor_load_command(
-        _binding(), construction="c", devices="0", authorized_device_limit_bytes=7
-    )
+    served = executor_prepare_command(_binding(), devices="0", authorized_device_limit_bytes=7)
     assert "attention_pin" not in served
     # And nothing can put one there from a `serve` launch: the flag set is CLOSED and does
     # not carry it, so the guard is the absence of a way to say it rather than a condition.
@@ -945,17 +943,12 @@ def test_a_serving_prepare_carries_no_pin_at_all() -> None:
 def test_a_pinned_prepare_names_one_kernel_for_every_model_of_the_construction() -> None:
     """The pin rides the ONE prepare funnel, and a group takes it whole: two models of one
     construction cannot serve two different execution paths and still be one measurement."""
-    single = executor_load_command(
-        _binding(),
-        construction="c",
-        devices="0",
-        authorized_device_limit_bytes=7,
-        attention_pin="sageattention",
+    single = executor_prepare_command(
+        _binding(), devices="0", authorized_device_limit_bytes=7, attention_pin="sageattention"
     )
     assert single["attention_pin"] == "sageattention"
-    group = executor_load_command(
+    group = executor_prepare_command(
         _binding(models=2),
-        construction="c",
         devices="0",
         authorized_device_limit_bytes=7,
         attention_pin="sageattention",

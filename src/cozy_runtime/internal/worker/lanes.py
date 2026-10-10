@@ -13,11 +13,11 @@ byte-identical on the wire to the worker before lanes existed. The ENVELOPE lane
 whole envelope as one group lane with one seat: it is the shape a job takes (cr-018's
 door), never a serving placement's.
 
-Residence ceilings are ASSIGNED by the worker, not derived in the executor (cr-025's
-`authorized_device_limit_bytes`): a process ceiling is the lane's measured capacity less
-what its co-tenants hold, and loads on a lane are serialized by its device lock, so two
-executors on one device cannot both be handed the same headroom. Every input is a
-measurement; nothing here is configured.
+Residence ceilings are ASSIGNED here, not derived in the executor (cr-025's
+`authorized_device_limit_bytes`): the worker measures the lane's free device bytes and
+subtracts what other executors on the lane were authorized but have not yet settled, so
+two executors preparing on one device cannot both be handed the same headroom. Every
+input is a measurement; nothing here is configured.
 
 Two model-bearing placements on ONE lane share it by RESIDENCY ARBITRATION, never by
 concurrency (cr-022, the owner's "one gets to use it first, then the next gets to use it
@@ -30,10 +30,9 @@ attempt through the ordinary demand-pull admission. No timer and no idleness clo
 decides anything here; a tenant that fits beside its neighbours is never moved.
 
 A GROUP lane is a lane whose `ordinals` has d > 1 entries (cr-068): ONE executor sealed to
-all d devices, one device seat and one staged, one ledger with one `DeviceFacts` row per
-device. The RecordOwner PINS a model-bearing placement to K ordinals; the worker runs it
-at the largest declared sequence-parallel degree d <= K (or on one device when none fits),
-FUSES d empty device
+all d devices, one seat, one ledger with one `DeviceFacts` row per device. The RecordOwner
+PINS a model-bearing placement to K ordinals; the worker runs it at the largest declared
+sequence-parallel degree d <= K (or on one device when none fits), FUSES d empty device
 lanes into one, leaves the other K-d as device lanes and records a note saying so. The lane
 stays a group while its placement holds it and SPLITS back when the placement leaves.
 `revision` moves on every fuse and split, which is the worker's cue to bump
@@ -54,20 +53,17 @@ from cozy_runtime.internal.worker.attempts import AttemptRecord, Released
 from cozy_runtime.internal.worker.ledger import DeviceFacts, Ledger
 from cozy_runtime.internal.worker.plan import PlanChooser
 
-#: The seats one serving lane advertises: ONE attempt on the device (#451/law 8) and ONE
-#: staged behind it (proto-061 G). The staged attempt is accepted, hydrated and journaled
-#: while the device runs the one ahead of it, and enters the device the moment that one
-#: releases — so the device never waits on an offer round trip or an input download. It is
-#: on the wire as QUEUED (proto-026): bound to no executor and no plan until device entry.
-#: A job lane stages nothing (one bounded attempt per build) and advertises LANE_RUNNING.
+#: The seats one lane advertises. ONE, by #451/law 8: a lane is a physical device (or one
+#: group of devices under one attempt), and a second held attempt on it could only wait in a
+#: state the wire cannot spell. This is the structural fact `ADMISSION_WINDOW` used to hold
+#: for the whole worker; the worker-level count is now the SUM over its lanes.
 #:
-#: A seat is held from the offer's hold to DEVICE RELEASE (cr-079 D3) — the executor's
-#: reply — and not through the ack. The post phase (encode, write, outcome, hold to ack) is
-#: bounded structurally instead: while more than LANE_RELEASED released attempts on a lane
-#: are unacknowledged the lane advertises nothing, so an owner that stops acking idles its
-#: own device rather than growing this worker's held set.
-LANE_RUNNING = 1
-LANE_STAGED = 1
+#: THE SEAT IS THE DEVICE SEAT (cr-079 D3): it is held from the offer's hold to DEVICE
+#: RELEASE — the executor's reply — and not through the ack. The post phase (encode, write,
+#: outcome, hold to ack) is bounded structurally instead: one released attempt per lane may
+#: be unacknowledged while the device takes its next occupant, so an owner that stops
+#: acking idles its own device rather than growing this worker's held set.
+LANE_SEATS = 1
 LANE_RELEASED = 1
 
 #: The lane name a job's executor is sealed under: the whole envelope, one seat.
@@ -102,6 +98,9 @@ class LaneRow:
 
     ledger: Ledger
     chooser: PlanChooser
+    #: the ceiling this generation was ASSIGNED for its prepare and has not yet settled
+    #: under a construction reply; -1 is nothing outstanding
+    outstanding: int = -1
     #: TRUE for a slot whose executor holds device memory (a model-bearing placement); a
     #: weightless executor never reaches the device and prices nothing on it
     model_bearing: bool = False
@@ -148,10 +147,6 @@ class DeviceLane:
         self.rows: dict[str, LaneRow] = {}
         #: placement ids assigned to this lane, whether or not they are dispatchable yet
         self.placements: set[str] = set()
-        #: STAGING (proto-061 G): serving offers, in arrival order, to be accepted beside
-        #: the device. Never takes `device`: staging touches no executor.
-        self.stage: queue.Queue[AttemptRecord | None] = queue.Queue()
-        #: the DEVICE queue: staged attempts, job offers and executor deaths, in order
         self.work: queue.Queue[AttemptRecord | ExecutorDeath | None] = queue.Queue()
         #: the POST PHASE (cr-079): released attempts, one thread per lane, in release
         #: order. It never takes `device`: everything it reads left the executor at release.
@@ -232,8 +227,8 @@ class DeviceLane:
 
     def holding(self) -> list[tuple[str, LaneRow]]:
         """Every slot whose executor holds device bytes NOW: a model-bearing row with
-        resident components and a live, unpoisoned executor. A row mid-load (no
-        construction facts yet) holds nothing the driver has settled."""
+        resident components and a live, unpoisoned executor. A row mid-prepare (outstanding
+        authorization, no construction facts yet) holds nothing the driver has settled."""
         return [
             (key, row)
             for key, row in self.rows.items()
@@ -261,6 +256,36 @@ class DeviceLane:
         lane whose executor holds device bytes now, sorted — `holding()` as a SET of names.
         Membership only; the bytes stay on the row."""
         return sorted(key for key, _row in self.holding() if key in self.placements)
+
+    # ------------------------------------------------------------- assigned ceilings
+
+    def authorize(self, slot: str, measured_free: int) -> int:
+        """ASSIGN `slot`'s residence ceiling from the lane's MEASURED free bytes.
+
+        `measured_free` is the driver's view of the lane's device right now, which already
+        counts every executor whose fill has settled. What it cannot see is a ceiling this
+        lane handed out that has not settled yet — an executor mid-prepare — so those are
+        subtracted, and the same headroom can never be authorized twice. The executor still
+        measures its own allocatable and takes the smaller of the two (cr-025: predictions
+        authorize, observations verify).
+        """
+        outstanding = sum(
+            row.outstanding for key, row in self.rows.items() if key != slot and row.outstanding > 0
+        )
+        granted = max(int(measured_free) - outstanding, 0)
+        row = self.row(slot)
+        row.outstanding = granted
+        row.ledger.authorized_device_limit_bytes = granted
+        return granted
+
+    def settle(self, slot: str) -> None:
+        """The prepare under this slot's authorization replied: the driver sees it now."""
+        row = self.rows.get(slot)
+        if row is not None:
+            row.outstanding = -1
+
+    def outstanding_bytes(self) -> int:
+        return sum(row.outstanding for row in self.rows.values() if row.outstanding > 0)
 
     def summary(self) -> dict[str, object]:
         return {
@@ -459,8 +484,9 @@ class LaneSet:
         step, over its CANDIDATE lanes — the pinned lane, or every device lane of a
         one-device envelope — and every number is the driver's:
 
-        1. a lane holding no other model-bearing placement whose measured free bytes cover
-           the declared weight bytes — the placement has the device to itself (cr-066);
+        1. a lane holding no other model-bearing placement whose measured free bytes, less
+           the ceilings the lane has outstanding, cover the declared weight bytes — the
+           placement has the device to itself (cr-066);
         2. a lane whose measured headroom still covers the declared bytes BESIDE its
            tenants — co-residency, no swap will ever be needed unless the measurements
            move (cr-022's co-fit arm);
@@ -571,7 +597,7 @@ class LaneSet:
             readable.append((lane, memory))
 
         def headroom(lane: DeviceLane, memory: DeviceMemory) -> int:
-            return memory.free_bytes
+            return memory.free_bytes - lane.outstanding_bytes()
 
         alone = [
             lane

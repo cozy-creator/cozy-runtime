@@ -183,7 +183,7 @@ def rig(tmp_path: Path) -> Iterator[Rig]:
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
     pb_grpc.add_RuntimePreparationServicer_to_server(
         _PreparationServicer(
-            None, None, None, None, weights_checkpoint_validator=exchange.validate_checkpoint
+            None, None, None, None, None, weights_checkpoint_validator=exchange.validate_checkpoint
         ),
         server,
     )

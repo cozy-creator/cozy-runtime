@@ -22,7 +22,7 @@ from typing import Any, Protocol
 
 from cozy_runtime.internal import liveness, spawn
 from cozy_runtime.internal.config import inherited_environment
-from cozy_runtime.internal.parallel.plan import GroupPlan, GroupRefusal, RankDivergence
+from cozy_runtime.internal.parallel.plan import GroupRefusal, RankDivergence
 from cozy_runtime.internal.seam import Channel, SeamError
 
 #: NCCL reads this once, at communicator creation. NVLink SHARP multicast needs a privilege
@@ -121,53 +121,18 @@ def join_rank(torch: Any, spec: RankSpec, sealed: Mapping[str, str]) -> Any:
     return dist.group.WORLD
 
 
-def receive_residence(
-    channel: Channel,
-    *,
-    rank: int,
-    model: str,
-    plan: dict[str, Any],
-    required: int,
-    park: Callable[[list[str]], None],
-    ceiling: Callable[[], int],
-) -> int:
-    """A follower's half of `RankGroup.agree_residence`.
-
-    Offer this rank's plan and need, park what rank 0 parked, offer the ceiling measured
-    after that, and accept only a matching, no-larger group ceiling.
-    """
-    channel.send(
-        {
-            "reply": "resident_budget",
-            "rank": rank,
-            "model": model,
-            "plan": plan,
-            "required": required,
-        }
-    )
-    decision = channel.recv(timeout=None)
-    parked = (decision or {}).get("park")
-    if (
-        decision is None
-        or set(decision) != {"cmd", "model", "park"}
-        or decision.get("cmd") != "resident_budget"
-        or decision.get("model") != model
-        or not isinstance(parked, list)
-        or not all(isinstance(key, str) for key in parked)
-    ):
-        raise RankDivergence(rank, "parked_constructions", "invalid group parking decision")
-    park(parked)
-    local = ceiling()
-    channel.send({"reply": "resident_ceiling", "rank": rank, "model": model, "ceiling": local})
+def receive_resident_budget(channel: Channel, *, rank: int, model: str, ceiling: int) -> int:
+    """Offer this rank's safe limit and accept only a matching, no-larger group limit."""
+    channel.send({"reply": "resident_budget", "rank": rank, "model": model, "ceiling": ceiling})
     decision = channel.recv(timeout=None)
     shared = (decision or {}).get("ceiling")
     if (
         decision is None
         or set(decision) != {"cmd", "model", "ceiling"}
-        or decision.get("cmd") != "resident_ceiling"
+        or decision.get("cmd") != "resident_budget"
         or decision.get("model") != model
         or type(shared) is not int
-        or not 0 <= shared <= local
+        or not 0 <= shared <= ceiling
     ):
         raise RankDivergence(rank, "resident_budget_bytes", "invalid group residence ceiling")
     return shared
@@ -207,8 +172,6 @@ class RankGroup:
         self.formed = False
         #: the first fault, latched: a broken group never heals, it is rebuilt
         self.broken = ""
-        #: per follower rank, the largest working peak its mirrored calls reported this attempt
-        self.working_peaks: dict[int, int] = {}
         self._readers: list[threading.Thread] = []
 
     # ------------------------------------------------------------------ lifecycle
@@ -369,62 +332,26 @@ class RankGroup:
                 if frame is None:
                     raise GroupRefusal(f"{self.verdict()} during {name!r}", code="group_broken")
                 if frame.get("reply") != name:
-                    refused = (
-                        f": {frame.get('code')}: {frame.get('detail', '')}"[:600]
-                        if frame.get("ok") is False
-                        else ""
-                    )
-                    self._break(
-                        f"rank {follower.rank} answered {frame.get('reply')!r} to {name!r}{refused}"
-                    )
+                    self._break(f"rank {follower.rank} answered {frame.get('reply')!r} to {name!r}")
                     raise GroupRefusal(self.broken, code="group_broken")
                 replies.append(frame)
                 break
         return replies
 
-    def agree_residence(
-        self,
-        *,
-        model: str,
-        plan: dict[str, Any],
-        required: int,
-        park: Callable[[int], list[str]],
-        ceiling: Callable[[], int],
-    ) -> tuple[int, list[str]]:
-        """Agree the plan, the constructions to park, and the ceiling, before any fill.
+    def agree_resident_budget(self, *, model: str, ceiling: int) -> int:
+        """Agree the smallest measured ceiling before any rank starts filling.
 
-        Every rank resolved on its own card; each offer carries its plan and the bytes it
-        needs. A plan that differs is divergence, refused before a destination exists. Rank
-        0 parks for the largest need any rank reported and every rank parks the same
-        constructions; each then measures its own ceiling and the group fills under the
-        smallest. The control seam also observes an early load failure or rank death,
-        without parking the leader in a device collective.
+        Qualification and CUDA initialization consume different amounts on each card.
+        These local measurements bound the group plan; they are not model identities.
+        The existing control seam also observes an early prepare failure or rank death,
+        without parking the leader in a new device collective.
         """
-        need = int(required)
-        mine = GroupPlan.read(plan)
-        for follower, offer in zip(self.followers, self.collect("resident_budget"), strict=True):
-            offered = offer.get("required")
-            if (
-                set(offer) != {"reply", "rank", "model", "plan", "required"}
-                or offer.get("rank") != follower.rank
-                or offer.get("model") != model
-                or type(offered) is not int
-                or offered < 0
-            ):
-                raise RankDivergence(follower.rank, "resident_budget", "invalid rank offer")
-            try:
-                theirs = GroupPlan.read(dict(offer["plan"]))
-            except (KeyError, TypeError, ValueError) as exc:
-                raise RankDivergence(follower.rank, "plan", f"unreadable plan: {exc}") from exc
-            theirs.assert_agrees(mine, rank=follower.rank)
-            need = max(need, offered)
-        parked = park(need)
-        self.broadcast({"cmd": "resident_budget", "model": model, "park": parked})
-        shared = ceiling()
-        for follower, reply in zip(self.followers, self.collect("resident_ceiling"), strict=True):
+        shared = ceiling
+        for follower, reply in zip(self.followers, self.collect("resident_budget"), strict=True):
             offered = reply.get("ceiling")
             if (
                 set(reply) != {"reply", "rank", "model", "ceiling"}
+                or type(reply.get("rank")) is not int
                 or reply.get("rank") != follower.rank
                 or reply.get("model") != model
                 or type(offered) is not int
@@ -434,8 +361,8 @@ class RankGroup:
                     follower.rank, "resident_budget_bytes", "invalid rank residence ceiling"
                 )
             shared = min(shared, offered)
-        self.broadcast({"cmd": "resident_ceiling", "model": model, "ceiling": shared})
-        return shared, parked
+        self.broadcast({"cmd": "resident_budget", "model": model, "ceiling": shared})
+        return shared
 
     def call(self, command: dict[str, Any]) -> list[dict[str, Any]]:
         self.broadcast(command)

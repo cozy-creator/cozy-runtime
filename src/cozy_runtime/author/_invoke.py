@@ -46,7 +46,7 @@ from cozy_runtime.author._assets import (
 )
 from cozy_runtime.author._calls import _Broker, _current
 from cozy_runtime.author._context import AdapterRef, Context, Device
-from cozy_runtime.author._decode import DEFAULT_DECODE_LIMITS, MediaDecoder, image_decoded_bytes
+from cozy_runtime.author._decode import DEFAULT_DECODE_LIMITS, MediaDecoder
 from cozy_runtime.author._defaults import Clamp, Overlay, Recipe, resolve
 from cozy_runtime.author._demand import RequestFeatures, normalize
 from cozy_runtime.author._describe import check
@@ -977,54 +977,6 @@ def assets_in(value: object, _seen: set[int] | None = None) -> list[Asset]:
     return found
 
 
-def _check_result_bounds(surface: Surface, result: object, attempt: Attempt) -> None:
-    """Every returned asset meets its result field's AssetBound, whether this attempt
-    saved it or forwarded a child's grant: the child's own bound proves nothing here."""
-    for item in asset_inputs(result):
-        asset, bound = item.asset, item.bound
-        if bound is None:
-            continue
-        where = f"{surface.name}.{item.input_id}"
-        if bound.media_types and asset.media_type not in bound.media_types:
-            raise OutputError(
-                f"{where} is {asset.media_type}, outside its declared media types "
-                f"{list(bound.media_types)}",
-                code="result_bound",
-                fields=[item.input_id],
-            )
-        if bound.max_bytes is not None and asset.size_bytes > bound.max_bytes:
-            raise OutputError(
-                f"{where} is {asset.size_bytes} B, over its declared {bound.max_bytes}-byte bound",
-                code="result_bound",
-                fields=[item.input_id],
-            )
-        if bound.max_decoded_bytes is None:
-            continue
-        frame = attempt.frames.get(asset.ref)
-        if frame is not None:
-            decoded = frame.raw_bytes
-        elif isinstance(asset, ImageAsset) and asset._local is not None:
-            try:
-                decoded = image_decoded_bytes(asset._local)
-            except Exception as exc:
-                raise OutputError(
-                    f"{where} image header cannot be read to check its decoded bound",
-                    code="result_decoded_bound",
-                    fields=[item.input_id],
-                ) from exc
-        else:
-            # Encoded audio/video carry no cheap decoded-size probe; their producer's
-            # decode path still enforces the field bound at consumption.
-            continue
-        if decoded > bound.max_decoded_bytes:
-            raise OutputError(
-                f"{where} decodes to {decoded} B, over its captured decoded bound of "
-                f"{bound.max_decoded_bytes} B",
-                code="result_decoded_bound",
-                fields=[item.input_id],
-            )
-
-
 def _validate_result(
     surface: Surface, result: object, attempt: Attempt, *, grant_token: object | None = None
 ) -> None:
@@ -1076,8 +1028,6 @@ def _validate_result(
                 f"output handle {asset.ref!r} is returned twice", code="duplicate_handle"
             )
         returned.append(asset.ref)
-
-    _check_result_bounds(surface, result, attempt)
 
     unreturned = sorted(pending_handles - set(returned))
     if unreturned:

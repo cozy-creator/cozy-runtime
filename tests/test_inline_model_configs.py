@@ -14,7 +14,7 @@ from tensorfs.derived import Derivation, Source, Target
 
 from cozy_runtime.author import Config, ConformanceError
 from cozy_runtime.internal import canonical, model_config
-from cozy_runtime.internal.worker.package_prepare import _selected_models
+from cozy_runtime.internal.worker.package_prepare import _compatibility_models
 from cozy_runtime.internal.worker.session import _placement_profile
 from cozy_runtime.protocol import documents
 from test_derived_config_runtime import _released_source
@@ -201,14 +201,8 @@ def _prepared_config(store: Any, manifest: str) -> bytes:
         "model": "example/model",
         "manifest": manifest,
     }
-    selected = _selected_models(
-        "example/package",
-        [selection],
-        Path(store.root),
-        lambda *_args: None,
-        construction_slots={"generate.models.model"},
-    )
-    return bytes(selected["generate.models.model"]["config_bytes"])
+    selected = _compatibility_models([selection], tensorfs_root=Path(store.root))
+    return bytes(selected["generate.models.model"]["config"])
 
 
 def test_the_retired_contracts_leave_the_constructor_document_untouched() -> None:
