@@ -6,11 +6,12 @@ import importlib.util
 import json
 import zipfile
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
 
-def helper(name):
+def helper(name: str) -> ModuleType:
     path = Path(__file__).parents[1] / "research/h3-request-profile" / f"{name}.py"
     spec = importlib.util.spec_from_file_location(f"h3_{name}", path)
     assert spec and spec.loader
@@ -19,7 +20,7 @@ def helper(name):
     return module
 
 
-def wheels(directory, h3_version):
+def wheels(directory: Path, h3_version: str) -> dict[str, Path]:
     result = {}
     for name, version in (
         ("minimax-h3", h3_version),
@@ -36,7 +37,7 @@ def wheels(directory, h3_version):
     return result
 
 
-def test_capture_requires_current_h3_and_retains_explicit_wheel_sources(tmp_path):
+def test_capture_requires_current_h3_and_retains_explicit_wheel_sources(tmp_path: Path) -> None:
     destination = tmp_path / "current"
     sources = wheels(tmp_path, "1.26.3")
     helper("prepare_capture").prepare(destination, sources)
@@ -49,14 +50,14 @@ def test_capture_requires_current_h3_and_retains_explicit_wheel_sources(tmp_path
         assert len(provenance[name]["sha256"]) == 64
 
 
-def test_capture_refuses_old_h3_before_creating_snapshot(tmp_path):
+def test_capture_refuses_old_h3_before_creating_snapshot(tmp_path: Path) -> None:
     destination = tmp_path / "old"
     with pytest.raises(ValueError, match="benchmark package cohort"):
         helper("prepare_capture").prepare(destination, wheels(tmp_path, "1.26.2"))
     assert not destination.exists()
 
 
-def test_unprofiled_receipt_keeps_handler_timing_without_inventing_trace_steps():
+def test_unprofiled_receipt_keeps_handler_timing_without_inventing_trace_steps() -> None:
     summary = {
         "profile_enabled": False,
         "trace_collection": "disabled; unprofiled full request",
@@ -71,7 +72,9 @@ def test_unprofiled_receipt_keeps_handler_timing_without_inventing_trace_steps()
 
 
 @pytest.mark.parametrize("flag", [{}, {"profile_enabled": True}])
-def test_missing_profiled_steps_still_refuses_instead_of_becoming_unprofiled(flag):
+def test_missing_profiled_steps_still_refuses_instead_of_becoming_unprofiled(
+    flag: dict[str, object],
+) -> None:
     with pytest.raises(KeyError, match="profiled_step_indices"):
         helper("phase_receipt").receipt({}, {"render_call": {}, **flag})
 
@@ -86,6 +89,6 @@ def test_missing_profiled_steps_still_refuses_instead_of_becoming_unprofiled(fla
         {"profiled_step_indices": [True]},
     ],
 )
-def test_contradictory_or_malformed_trace_receipts_refuse(fields):
+def test_contradictory_or_malformed_trace_receipts_refuse(fields: dict[str, object]) -> None:
     with pytest.raises(ValueError):
         helper("phase_receipt").receipt({}, {"render_call": {}, **fields})

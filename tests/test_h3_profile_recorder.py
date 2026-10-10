@@ -5,15 +5,17 @@ from __future__ import annotations
 import gzip
 import importlib.util
 import json
+from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
+from typing import Any, NoReturn, cast
 
 import pytest
 
 torch = pytest.importorskip("torch")
 
 
-def recorder():
+def recorder() -> ModuleType:
     path = (
         Path(__file__).parents[1] / "research/h3-request-profile/h3_request_profile/instrument.py"
     )
@@ -24,22 +26,23 @@ def recorder():
     return module
 
 
-class Transformer(torch.nn.Module):
-    def __init__(self):
+class Transformer(torch.nn.Module):  # type: ignore[name-defined, misc]
+    """Real optional Torch base, absent from the torch-free mypy environment."""
+    def __init__(self) -> None:
         super().__init__()
         self.block = torch.nn.Module()
         self.block.to_q = torch.nn.Linear(8, 8)
 
-    def forward(self, value):
+    def forward(self, value: Any) -> Any:
         return self.block.to_q(value).relu()
 
 
 @pytest.mark.parametrize("detailed", [False, True])
-def test_bounded_real_cpu_trace_keeps_request_outputs_and_removes_hooks(detailed):
+def test_bounded_real_cpu_trace_keeps_request_outputs_and_removes_hooks(detailed: bool) -> None:
     module, model = recorder(), Transformer()
     value = torch.ones(2, 8)
 
-    def render():
+    def render() -> Any:
         output = value
         for _ in range(8):
             output = model(output)
@@ -65,10 +68,10 @@ def test_bounded_real_cpu_trace_keeps_request_outputs_and_removes_hooks(detailed
     assert not model.block.to_q._forward_pre_hooks and not model.block.to_q._forward_hooks
 
 
-def test_failure_also_removes_observer_hooks():
+def test_failure_also_removes_observer_hooks() -> None:
     module, model = recorder(), Transformer()
 
-    def fail():
+    def fail() -> NoReturn:
         model(torch.ones(2, 8))
         raise ValueError("authored failure")
 
@@ -78,14 +81,14 @@ def test_failure_also_removes_observer_hooks():
     assert not model.block.to_q._forward_pre_hooks and not model.block.to_q._forward_hooks
 
 
-def test_whole_render_counters_and_existing_attribution_include_non_denoise_work():
+def test_whole_render_counters_and_existing_attribution_include_non_denoise_work() -> None:
     from cozy_runtime.author._observations import Attribution
 
     module, model = recorder(), Transformer()
     attribution = Attribution()
     counters = {"h2d_bytes": 10, "evictions": 1}
 
-    def render():
+    def render() -> Any:
         counters["h2d_bytes"] += 100  # before any observed transformer call
         attribution.stage("condition_text", 2.5)
         output = torch.ones(2, 8)
@@ -115,12 +118,12 @@ def test_whole_render_counters_and_existing_attribution_include_non_denoise_work
     assert 0 < whole["wall_ms"] <= whole["profiler_context_wall_ms"]
 
 
-def test_output_observer_forwards_event_identity_and_records_finalize_tail():
+def test_output_observer_forwards_event_identity_and_records_finalize_tail() -> None:
     module = recorder()
     events = [object(), object(), object()]
     saved = object()
 
-    def sink(source):
+    def sink(source: Iterable[object]) -> object:
         assert list(source) == events
         return saved
 
@@ -134,10 +137,10 @@ def test_output_observer_forwards_event_identity_and_records_finalize_tail():
     assert 0 <= row["after_source_eof_finalize_probe_ms"] <= row["wall_ms"]
 
 
-def test_output_observer_keeps_source_failures_and_does_not_invent_eof():
+def test_output_observer_keeps_source_failures_and_does_not_invent_eof() -> None:
     module = recorder()
 
-    def broken():
+    def broken() -> Iterator[object]:
         yield object()
         raise ValueError("bad media")
 
@@ -148,7 +151,7 @@ def test_output_observer_keeps_source_failures_and_does_not_invent_eof():
     assert observed.sinks[0]["after_source_eof_finalize_probe_ms"] is None
 
 
-def test_registered_handler_survives_public_export_proxy_replacement(monkeypatch):
+def test_registered_handler_survives_public_export_proxy_replacement(monkeypatch: pytest.MonkeyPatch) -> None:
     import sys
 
     from cozy_runtime.author import App
@@ -156,10 +159,10 @@ def test_registered_handler_survives_public_export_proxy_replacement(monkeypatch
     module, app = recorder(), App()
 
     @app.entrypoint(name="fl2va")
-    def original():
+    def original() -> int:
         return 7
 
-    def managed_proxy():
+    def managed_proxy() -> NoReturn:
         raise AssertionError("a diagnostic renderer must not submit a child instead")
 
     monkeypatch.setitem(sys.modules, "h3", SimpleNamespace(app=app, fl2va=managed_proxy))
@@ -172,12 +175,12 @@ def test_registered_handler_survives_public_export_proxy_replacement(monkeypatch
 
 @pytest.mark.parametrize("step_count,dense_steps", [(8, 4), (30, 10)])
 def test_continuous_trace_covers_preparation_all_steps_and_decode_without_math_change(
-    step_count,
-    dense_steps,
-):
+    step_count: int,
+    dense_steps: int,
+) -> None:
     module, model = recorder(), Transformer()
 
-    def render():
+    def render() -> Any:
         with torch.profiler.record_function("phase.text_encoder"):
             value = torch.ones(2, 8).sin()
         for _ in range(step_count):
@@ -213,7 +216,7 @@ def test_continuous_trace_covers_preparation_all_steps_and_decode_without_math_c
     assert not model._forward_hooks and not model._forward_pre_hooks
 
 
-def test_full_trace_refuses_tensor_retaining_detail_mode():
+def test_full_trace_refuses_tensor_retaining_detail_mode() -> None:
     module, model = recorder(), Transformer()
     with pytest.raises(ValueError, match="shape/memory recording off"):
         module.record_request(
@@ -227,14 +230,14 @@ def test_full_trace_refuses_tensor_retaining_detail_mode():
         )
 
 
-def test_file_backed_continuous_trace_retains_tree_without_changing_outputs(tmp_path):
+def test_file_backed_continuous_trace_retains_tree_without_changing_outputs(tmp_path: Path) -> None:
     from cozy_runtime.author import Outputs
     from cozy_runtime.author.fakes import fake_attempt
 
     module, model = recorder(), Transformer()
     out = Outputs(fake_attempt(spool=tmp_path / "spool", max_output_bytes=8 << 20))
 
-    def render():
+    def render() -> Any:
         value = torch.ones(2, 8)
         for _ in range(8):
             value = model(value)
@@ -261,7 +264,7 @@ def test_file_backed_continuous_trace_retains_tree_without_changing_outputs(tmp_
     assert all(f"h3.step.{i}.{'dense' if i < 4 else 'sparse_eligible'}" in names for i in range(8))
 
 
-def test_old_output_grant_refuses_before_gpu_or_render_work(tmp_path):
+def test_old_output_grant_refuses_before_gpu_or_render_work(tmp_path: Path) -> None:
     from cozy_runtime.author import Outputs
     from cozy_runtime.author.fakes import fake_attempt
 
@@ -270,7 +273,7 @@ def test_old_output_grant_refuses_before_gpu_or_render_work(tmp_path):
         recorder().profile_request(None, 4, None, outputs=out, telemetry=None)
 
 
-def test_manual_ranges_preserve_real_telemetry_and_have_native_thread_identity(tmp_path):
+def test_manual_ranges_preserve_real_telemetry_and_have_native_thread_identity(tmp_path: Path) -> None:
     import os
     import threading
 
@@ -280,11 +283,13 @@ def test_manual_ranges_preserve_real_telemetry_and_have_native_thread_identity(t
     module = recorder()
     attempt = fake_attempt(spool=tmp_path / "spool")
     target = Telemetry(attempt, fake_context())
-    ranges = []
+    ranges: list[dict[str, Any]] = []
     observed = module.ObservedTelemetry(target, ranges)
     with observed.stage("condition_text", overall_range=(0.0, 1.0)):
         observed.metric("test", 1.0)
-    assert "condition_text" in attempt.attribution.document()["stages"]
+    stages = attempt.attribution.document()["stages"]
+    assert isinstance(stages, dict)
+    assert "condition_text" in stages
     assert len(ranges) == 1
     row = ranges[0]
     assert row["label"] == "h3.phase.condition_text"
@@ -299,11 +304,11 @@ def test_manual_ranges_preserve_real_telemetry_and_have_native_thread_identity(t
     assert 0 < row["start_unix_ns"] <= row["end_unix_ns"]
 
 
-def test_manual_mode_does_not_attach_projection_hooks_and_keeps_cpu_output():
+def test_manual_mode_does_not_attach_projection_hooks_and_keeps_cpu_output() -> None:
     module, model = recorder(), Transformer()
     source = torch.ones(2, 8)
 
-    def render():
+    def render() -> Any:
         assert not model.block.to_q._forward_pre_hooks and not model.block.to_q._forward_hooks
         value = source
         for _ in range(8):
@@ -332,7 +337,7 @@ def test_manual_mode_does_not_attach_projection_hooks_and_keeps_cpu_output():
     assert not model._forward_pre_hooks and not model._forward_hooks
 
 
-def test_model_census_records_actual_classes_and_fusion_report_without_hooks():
+def test_model_census_records_actual_classes_and_fusion_report_without_hooks() -> None:
     module, model = recorder(), Transformer()
     model._cozy_fusion_report = {"applied": ["ffn"], "unsupported": []}
     facts = module.model_census(model)
@@ -344,14 +349,15 @@ def test_model_census_records_actual_classes_and_fusion_report_without_hooks():
     assert not model.block.to_q._forward_pre_hooks and not model.block.to_q._forward_hooks
 
 
-def test_bake_observer_preserves_arguments_result_failure_and_restores_original(monkeypatch):
+def test_bake_observer_preserves_arguments_result_failure_and_restores_original(monkeypatch: pytest.MonkeyPatch) -> None:
     from cozy_runtime.internal import lora_bake
 
-    module, ranges = recorder(), []
+    module = recorder()
+    ranges: list[dict[str, Any]] = []
     argument, value = object(), object()
-    calls = []
+    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
 
-    def original(*args, **kwargs):
+    def original(*args: object, **kwargs: object) -> object:
         calls.append((args, kwargs))
         if kwargs.get("fail"):
             raise ValueError("bake failed")
@@ -359,9 +365,10 @@ def test_bake_observer_preserves_arguments_result_failure_and_restores_original(
 
     monkeypatch.setattr(lora_bake, "bake", original)
     with module.observe_bakes(ranges):
-        assert lora_bake.bake(argument, mode="unchanged") is value
+        observed_bake = cast(Callable[..., object], lora_bake.bake)
+        assert observed_bake(argument, mode="unchanged") is value
         with pytest.raises(ValueError, match="bake failed"):
-            lora_bake.bake(argument, fail=True)
+            observed_bake(argument, fail=True)
     assert lora_bake.bake is original
     assert calls == [((argument,), {"mode": "unchanged"}), ((argument,), {"fail": True})]
     assert len(ranges) == 2

@@ -7,11 +7,12 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
 
-def summarizer():
+def summarizer() -> ModuleType:
     path = Path(__file__).parents[1] / "research/h3-request-profile/trace_summary.py"
     spec = importlib.util.spec_from_file_location("h3_trace_summary", path)
     assert spec and spec.loader
@@ -20,7 +21,10 @@ def summarizer():
     return module
 
 
-def event(name, category, start, duration, *, device=0, stream=7, **args):
+def event(
+    name: str, category: str, start: float, duration: float,
+    *, device: int = 0, stream: int = 7, **args: object,
+) -> dict[str, object]:
     return {
         "name": name,
         "cat": category,
@@ -33,7 +37,7 @@ def event(name, category, start, duration, *, device=0, stream=7, **args):
     }
 
 
-def test_union_keeps_devices_streams_and_host_launches_separate():
+def test_union_keeps_devices_streams_and_host_launches_separate() -> None:
     module = summarizer()
     events = [
         event("kernel A", "kernel", 10, 10),
@@ -66,7 +70,9 @@ def test_union_keeps_devices_streams_and_host_launches_separate():
 
 
 @pytest.mark.parametrize("compressed,wrapped", [(False, True), (True, True), (False, False)])
-def test_reads_standard_object_or_array_with_optional_gzip(tmp_path, compressed, wrapped):
+def test_reads_standard_object_or_array_with_optional_gzip(
+    tmp_path: Path, compressed: bool, wrapped: bool,
+) -> None:
     module = summarizer()
     events = [event("kernel λ", "kernel", 101, 3)]
     document = {"metadata_before": [1, 2], "traceEvents": events, "displayTimeUnit": "ms"}
@@ -78,10 +84,10 @@ def test_reads_standard_object_or_array_with_optional_gzip(tmp_path, compressed,
     assert module.summarize(iter(result))["device_activity"][0]["first_start_us"] == 101
 
 
-def test_streamed_numbers_and_strings_cross_read_boundaries():
+def test_streamed_numbers_and_strings_cross_read_boundaries() -> None:
     class TinyReads(io.StringIO):
-        def read(self, size=-1):
-            return super().read(min(size, 1))
+        def read(self, size: int | None = -1) -> str:
+            return super().read(1 if size is None else min(size, 1))
 
     reader = summarizer().JSONStream(TinyReads(' 123456,"hello λ" '))
     assert reader.value() == 123456
@@ -89,7 +95,7 @@ def test_streamed_numbers_and_strings_cross_read_boundaries():
     assert reader.value() == "hello λ"
 
 
-def test_invalid_durations_and_non_duration_phases_are_visible(tmp_path):
+def test_invalid_durations_and_non_duration_phases_are_visible(tmp_path: Path) -> None:
     module = summarizer()
     bad = event("bad", "kernel", 1, -1)
     result = module.summarize(iter([bad, {"ph": "s", "name": "flow"}]))
@@ -102,7 +108,7 @@ def test_invalid_durations_and_non_duration_phases_are_visible(tmp_path):
         list(module.trace_events(path))
 
 
-def test_actual_cpu_chrome_trace_keeps_host_work_without_inventing_device_work(tmp_path):
+def test_actual_cpu_chrome_trace_keeps_host_work_without_inventing_device_work(tmp_path: Path) -> None:
     torch = pytest.importorskip("torch")
     module = summarizer()
     with (
@@ -119,7 +125,7 @@ def test_actual_cpu_chrome_trace_keeps_host_work_without_inventing_device_work(t
     assert not result["device_activity"] and not result["host_launch_activity"]
 
 
-def test_multiple_segments_exclude_export_pauses_and_retain_time_base(tmp_path):
+def test_multiple_segments_exclude_export_pauses_and_retain_time_base(tmp_path: Path) -> None:
     module = summarizer()
     paths = []
     for index, start in enumerate((10, 1010)):

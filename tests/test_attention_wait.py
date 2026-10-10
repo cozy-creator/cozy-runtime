@@ -18,12 +18,12 @@ import socket
 import sys
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import msgspec
 import pytest
@@ -243,7 +243,7 @@ def _host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[SimpleNam
         construction.attention = construction._reselect()
         construction.attention_defaults = attention.snapshot(roots)
         package = sys.modules["steps_fixture"]
-        package.SITES[:] = list(roots["dit"])
+        package.SITES[:] = list(cast(Iterable[object], roots["dit"]))
         package.FINISH[:] = [lambda: None]
 
         def run(request_id: str, kernel: str = "") -> dict[str, Any]:
