@@ -3088,14 +3088,15 @@ class WeightResidency:
             component.resident = ()
             component.spared = True
         weights.drain()
+        # Dropped regions stay mapped as the plane's idle cache until its budget leaves them
+        # no room: the plane keeps what the running component streams in, torch the rest.
+        weights._apply(min(weights.applied, max(weights.window(), weights.floor())))
+        self._place(weights.applied, running)
         after = max(plane.stats(weights.plane).device(weights.index).committed, 0)
         if after >= before:
             return False
         weights.oom_retries += 1
         weights.last_retry = None
-        # the plane keeps what the running component streams in; torch takes the rest
-        weights._apply(min(weights.applied, max(weights.window(), weights.floor())))
-        self._place(weights.applied, running)
         return True
 
     def _unspare(self, component: Component) -> None:
