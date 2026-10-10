@@ -89,6 +89,30 @@ class CopyEngineExchange:
         self.handle.barrier(channel=0)
         issued = torch.cuda.Event()
         issued.record(current)
+        # The receive buffers are scratch: a group GPU journals every block's writes into
+        # storage it did not make (`weights.Journal`), and cloning these whole buffers per
+        # block cost 70 s a denoise step (H100 NVL, H3). Their copies bypass Python dispatch.
+        with torch._C._DisableTorchDispatch():
+            self._issue(sends, matrix, widths, received, issued, current)
+        self.handle.barrier(channel=1)
+        out, base = [], 0
+        for tensor, width in zip(sends, widths, strict=True):
+            region = self.buffer[base : base + received[rank] * width]
+            out.append(region.view(tensor.dtype).reshape(-1, *tensor.shape[1:]).clone())
+            base += received[rank] * width
+        return out
+
+    def _issue(
+        self,
+        sends: Sequence[Any],
+        matrix: Sequence[Sequence[int]],
+        widths: Sequence[int],
+        received: Sequence[int],
+        issued: Any,
+        current: Any,
+    ) -> None:
+        """One copy-engine copy per tensor per peer, each peer on its own stream."""
+        torch, world, rank = self.torch, self.world, self.rank
         for step in range(world):
             peer = (rank + step) % world
             rows = matrix[rank][peer]
@@ -107,13 +131,6 @@ class CopyEngineExchange:
                         )
                     base += received[peer] * width
             current.wait_stream(stream)
-        self.handle.barrier(channel=1)
-        out, base = [], 0
-        for tensor, width in zip(sends, widths, strict=True):
-            region = self.buffer[base : base + received[rank] * width]
-            out.append(region.view(tensor.dtype).reshape(-1, *tensor.shape[1:]).clone())
-            base += received[rank] * width
-        return out
 
 
 #: Bytes each GPU sends in the calibration: the size class of one Ulysses exchange.
