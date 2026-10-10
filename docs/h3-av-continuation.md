@@ -68,12 +68,16 @@ is not a model compatibility fence.
 
 `OfficialH3Pipeline.start_ref2va` accepts optional `context`, `delivery` and
 `expected_context_provenance`. With no delivery/context its old path remains unchanged.
-Persistent user references are encoded normally. The private temporal condition is
-added after text and public-reference VAE encoding, so it is not a new numbered
-Picture/Video/Audio reference. Pre-encoded context tensors and private layout metadata
-supply its rows; their times are aligned
-to the target prefix. Native scheduling holds those condition rows fixed. This is the
-Director-style guide path, not a claim that target-prefix pixels are hard-copied.
+Persistent user references are encoded normally. The context is held ONCE (owner,
+2026-10-10): its video latents are the target window's first latents, noised to the
+anchors' 0.999 and held there like condition rows, so a 12 s segment after 56 frames holds
+288 + 56 = 345 frames, not 345 + 56 (`ContinuationPlan.held_frames`). Its soundtrack stays
+a private audio condition aligned to the window's head, and the window's audio is
+regenerated and trimmed. The VAE round trip of the frozen head reads about 1.3 levels dark
+(official VAE, sample or posterior mean alike), so the delivered frames are shifted by the
+difference between the predecessor's seam colour (`AVContext.seam_rgb`) and the decoded
+head's last frames. Seam runs 5285/5287: step -2.2/-1.9/-1.8 without, -0.7/-0.8/-0.6 with
+the anchor, within neighbouring frame-to-frame steps; 24-27% faster segments.
 
 The video decoder streams only the new delivery window and retains a ring of its last56
 RGB8 frames. Audio uses integer frame-to-sample boundaries.

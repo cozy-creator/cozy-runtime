@@ -64,6 +64,11 @@ class ContinuationPlan:
         return frames + (5 - frames) % 17
 
     @property
+    def held_frames(self) -> int:
+        """The frames the DiT holds: one window whose head is the frozen context."""
+        return self.sample_frames
+
+    @property
     def delivery_start(self) -> int:
         return self.prefix_frames
 

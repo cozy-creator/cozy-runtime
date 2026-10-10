@@ -52,6 +52,7 @@ def context(frames: int = 56, end: int = 262, windows: tuple[int, ...] = (22, 39
 def test_delivery_clock_charges_context_without_delivering_it(prefix: int, sampled: int) -> None:
     plan = plan_continuation(240, context_frames=prefix)
     assert plan.sample_frames == sampled
+    assert plan.held_frames == sampled  # the context is the window's head, held once
     assert plan.delivery_end - plan.delivery_start == 240
     start, end = audio_sample_range(plan.delivery_start, plan.delivery_end, 32000)
     assert end - start == 320000
