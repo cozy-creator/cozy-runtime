@@ -1,0 +1,2 @@
+[application]
+object = "rowwise_partition_probe:app"
