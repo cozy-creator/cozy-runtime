@@ -1,6 +1,6 @@
 """Actual Runtime two-rank Ulysses correctness check, without video inference."""
 
-from typing import Annotated
+from typing import Annotated, Literal
 
 import msgspec
 
@@ -13,6 +13,7 @@ app = App()
 
 class Request(msgspec.Struct):
     seed: int = 581204
+    check: Literal["projections", "attention"] = "projections"
 
 
 class Result(msgspec.Struct):
@@ -34,7 +35,7 @@ class Result(msgspec.Struct):
 def verify(payload: Request, model: ProbeModel, ctx: Context, out: Outputs) -> Result:
     import json
 
-    report = model.verify(payload.seed)
+    report = model.verify(payload.seed, payload.check)
     return Result(
         out.save_bytes(json.dumps(report, allow_nan=False).encode(), media_type="application/json")
     )

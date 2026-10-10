@@ -43,7 +43,7 @@ class ProbeComponent(ModelMixin):
         self.norm_q = torch.nn.RMSNorm(128, dtype=torch.bfloat16)
         self.norm_k = torch.nn.RMSNorm(128, dtype=torch.bfloat16)
 
-    def forward(self, seed: int):
+    def forward(self, seed: int, check: str = "projections"):
         from cozy_runtime.internal.attention_ulysses import group
         from cozy_runtime.internal.parallel.cp import in_gated_call
 
@@ -52,6 +52,25 @@ class ProbeComponent(ModelMixin):
         if not in_gated_call():
             raise RuntimeError("This diagnostic requires the Runtime mirrored call gate")
         handle = group(self._parallel_config)
+        if check == "attention":
+            from .probe import INPUT_WIDTH, TOKENS, projections
+            from .processor_timing import run as time_processors
+
+            with torch.inference_mode():
+                hidden = torch.randn(
+                    1,
+                    TOKENS,
+                    INPUT_WIDTH,
+                    dtype=torch.bfloat16,
+                    device="cuda",
+                    generator=torch.Generator(device="cuda").manual_seed(seed),
+                )
+                attn, owner = projections(torch, "baked", seed + 100)
+                report = time_processors(torch, handle, self._parallel_config, hidden, attn, seed)
+                del owner, attn, hidden
+            return report_tensor(report)
+        if check != "projections":
+            raise ValueError("Unknown correctness check")
         return report_tensor(run(seed, handle))
 
 
@@ -73,5 +92,5 @@ class ProbeModel(Model[Pipeline]):
         self.pipe = loader.construct(Pipeline, factory=build)
 
     @uses_components("dit")
-    def verify(self, seed: int) -> Any:
-        return read_report(self.pipe.dit(seed))
+    def verify(self, seed: int, check: str = "projections") -> Any:
+        return read_report(self.pipe.dit(seed, check))
