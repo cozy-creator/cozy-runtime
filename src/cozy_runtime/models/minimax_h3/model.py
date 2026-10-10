@@ -121,11 +121,8 @@ class H3Model(Model[OfficialH3Pipeline], encoded_leaves="accept", fusion="accept
     def choose_attention(self, context: AttentionContext) -> tuple[str, ...] | None:
         if context.component not in DIT_COMPONENTS:
             return None
-        from cozy_runtime.internal.kernel_sources import reviewed_kitchen_wheel_compatible
-
-        # Hardware/site/degree eligibility and the reviewed wheel's actual ABI tags
-        # both apply. Unqualified platform source builds remain explicit choices.
-        if "kitchen-sol-fp4-lowmem" in context.eligible and reviewed_kitchen_wheel_compatible():
+        # Runtime applies platform/build eligibility while walking this preference.
+        if "kitchen-sol-fp4-lowmem" in context.eligible:
             return BLACKWELL_DIT_ATTENTION
         if "sol-attn-sage2-fixed-kmean" in context.eligible:
             return HOPPER_DIT_ATTENTION

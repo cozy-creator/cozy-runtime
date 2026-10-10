@@ -889,6 +889,7 @@ class Executor:
                     impl,
                     attention.evidence(choices.totals() if choices else ()),
                     segments,
+                    choices.fallbacks if choices else (),
                 ),
             )
         ]
@@ -997,9 +998,7 @@ class Executor:
     def _calibrated(self, pg: Any) -> None:
         """Rank 0's half of the formation's calibration: NCCL against the copy engines."""
         assert self.transport is not None
-        exchange, self.transport.calibration = copy_engine.calibrate(
-            self.torch, pg, 0, self.world
-        )
+        exchange, self.transport.calibration = copy_engine.calibrate(self.torch, pg, 0, self.world)
         copy_engine.install(exchange, pg)
         self.transport.route = "copy-engine" if exchange is not None else "nccl"
 
@@ -3244,7 +3243,7 @@ class Executor:
                 segments.append(_segment("", 0, served_attention, started_us))
             if not self._upgrade_attention():
                 return
-            later.append(attention.observed(self._attention_roots()))
+            later.append(self._attention_selection(attention.observed(self._attention_roots())))
             row = _segment(frame.stage, steps.get(frame.stage, 0), later[-1])
             if row["observed"] != segments[-1]["observed"] or row["dense"] != segments[-1]["dense"]:
                 segments.append(row)
@@ -3263,6 +3262,7 @@ class Executor:
                 attention_sol.observing(ranks=sol_rank_counts, kernels=sol_kernels) as sol_counts,
                 attention_ulysses.observing() as served_impls,
             ):
+                served_attention = self._attention_selection(served_attention)
                 capture = self._capture_session(command, surface)
                 with capture if capture is not None else contextlib.nullcontext():
                     envelope, outcome, record = run_prepared(
@@ -3527,6 +3527,26 @@ class Executor:
                 roots[prefix + name] = root
         return roots
 
+    def _attention_selection(self, observed: attention.Applied) -> attention.Applied:
+        """Attach preparation reasons only to the choices this request actually holds.
+
+        A scoped pin can replace one component while other components still fall back.
+        A later successful compile does not erase a reason from an earlier run segment.
+        """
+        scope, pin = attention._pin_parts(observed.pin)
+        fallbacks: list[execution_evidence.AttentionFallback] = []
+        for executor in self.model_executors or [self]:
+            if executor.attention is None:
+                continue
+            prefix = "+".join(sorted(executor.models)) + "/" if executor.models else ""
+            for row in executor.attention.fallbacks:
+                component = prefix + row["component"]
+                if pin and attention._matches(component, scope):
+                    continue
+                if row["selected"] in observed.hosts.get(component, {}):
+                    fallbacks.append({**row, "component": component})
+        return replace(observed, fallbacks=tuple(fallbacks))
+
     def _attention_reaches(self, pin: str) -> bool:
         try:
             return attention.reaches(self._attention_roots(), pin)
@@ -3779,6 +3799,10 @@ class Executor:
                     pin=choices.pin,
                     dense_reference=_dense((kernel,)),
                 )
+
+        if name == "attention.selected":
+            for row in choices.fallbacks:
+                record.emit("confession", "attention.fallback", row["selected"], **row)
 
     def _execution_observation(self, choices: attention.Applied | None = None) -> dict[str, Any]:
         from cozy_runtime import __version__
