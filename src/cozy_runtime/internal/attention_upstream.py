@@ -499,6 +499,37 @@ def sage3_fp4_global_lowmem(query: Any, key: Any, value: Any, **options: Any) ->
     )
 
 
+def sage3_fp4_fixed_means(
+    query: Any,
+    key: Any,
+    value: Any,
+    *,
+    attn_mask: Any = None,
+    dropout_p: float = 0.0,
+    is_causal: bool = False,
+    scale: float | None = None,
+    enable_gqa: bool = False,
+) -> Any:
+    """Opt-in fixed means/centering, preserving Sage3's BF16 matmul correction."""
+    _options("sageattention3-fp4-fixed-means", attn_mask, dropout_p, scale)
+    _cuda_inputs(
+        query,
+        key,
+        value,
+        enable_gqa,
+        name="sageattention3-fp4-fixed-means",
+        admitted=((12, 0),),
+        dims=(128,),
+        bf16=True,
+    )
+    if is_causal or enable_gqa or query.shape != key.shape:
+        raise ValueError("fixed Sage3 means require noncausal equal Q/K/V geometry")
+    if scale is not None and not math.isclose(scale, 128**-0.5, rel_tol=1e-6):
+        raise ValueError("fixed Sage3 means require the head128 softmax scale")
+    result = import_module("cozy_runtime.internal.attention_sage3_fixed").forward(query, key, value)
+    return _output(result, query)
+
+
 def _sage3_global_owned(q: Any, k: Any, v: Any, *, is_causal: bool) -> Any:
     import torch
 
@@ -592,4 +623,9 @@ SAGE3 = Local(sage3_fp4, _named("sageattn3.sageattn3_blackwell(nvfp4, per_block_
 SAGE3_GLOBAL_LOWMEM = Local(
     sage3_fp4_global_lowmem,
     _named("sageattn3.nvfp4_global_head_mean(short_owned_lifetimes, direct_bthd)"),
+)
+
+SAGE3_FIXED_MEANS = Local(
+    sage3_fp4_fixed_means,
+    _named("sageattn3.nvfp4_fixed_means(upstream_bf16_correction)"),
 )
