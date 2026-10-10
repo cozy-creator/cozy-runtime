@@ -356,7 +356,25 @@ def _produce(
 def _project_qkv(
     attn: Any, hidden: Any, tokens: int, counts: dict[str, int] | None = None
 ) -> tuple[Any, Any, Any]:
-    """Assemble local raw QKV once, with bounded projection chunks and original hooks."""
+    """Project a local shard with one shared quantization and no QKV packing copy.
+
+    Original module calls retain residency and Turbo hooks. The LoRA hook already
+    owns its fixed-row arithmetic. Other projection semantics keep the prior chunk path.
+    """
+    if len(hidden.shape) != 3 or hidden.shape[0] != 1 or hidden.shape[1] != tokens or tokens < 1:
+        raise ValueError("H3 CP projection requires the complete nonempty local token shard")
+    if not isinstance(hidden, PreQuantized) and not shared_qkv_refusal(attn):
+        import torch
+
+        payload, scale = leaves.quantize_activation_rowwise(torch, hidden)
+        operand = PreQuantized(payload, scale, tuple(hidden.shape))
+        if counts is not None:
+            counts["shared"] = counts.get("shared", 0) + 1
+        query, key, value = (
+            projection(hidden, prequantized=operand).reshape(1, tokens, attn.heads, 128)
+            for projection in (attn.to_q, attn.to_k, attn.to_v)
+        )
+        return query, key, value
     packed = None
     offset = 0
     for chunk in qkv_chunks(attn, hidden, tokens, shared=True, counts=counts):
