@@ -30,6 +30,8 @@ from cozy_runtime.internal.worker.workspace import (
 from cozy_runtime.protocol import documents
 from cozy_runtime.protocol import worker_pb2 as pb
 
+from .machine_public_reads import RETENTION_REQUIRED
+
 SCHEMA7 = """
 ALTER TABLE workspace_state ADD COLUMN execution_workspace_id TEXT NOT NULL DEFAULT '';
 UPDATE workspace_state SET execution_workspace_id=lower(hex(randomblob(16)));
@@ -555,6 +557,26 @@ class Executions:
                 ):
                     raise WorkspaceRefusal("execution submission identity changed")
                 return self._receipt(db, row, workspace_id)
+            if (
+                owner == "cozy-local-client"
+                and db.execute(
+                    f"""SELECT 1 FROM executions WHERE owner<>? AND {RETENTION_REQUIRED}
+                UNION ALL SELECT 1 FROM attempts WHERE owner<>? AND state IN ('accepted','running')
+                UNION ALL SELECT 1 FROM native_calls WHERE owner<>? AND state<>'released'
+                UNION ALL SELECT 1 FROM holds WHERE owner<>? AND state<>'released'
+                UNION ALL SELECT 1 FROM weights WHERE owner<>? AND state='intent'
+                UNION ALL SELECT 1 FROM input_tree_intakes WHERE owner<>? AND state<>'released'
+                LIMIT 1""",
+                    (owner,) * 6,
+                ).fetchone()
+                is not None
+            ):
+                raise ExecutionWorkspaceRefusal(
+                    "execution_foreign_namespace_retained",
+                    "this journal retains work or custody under another record namespace; "
+                    "finish or release it through its original owner "
+                    "before new machine submissions",
+                )
             self._require_submission_open(db, owner, submission_id, offer.request_id)
             if db.execute(
                 "SELECT 1 FROM attempts WHERE owner=? AND request=?", (owner, offer.request_id)
@@ -1388,9 +1410,7 @@ class Executions:
         with self.workspace.locked() as db:
             return (
                 db.execute(
-                    "SELECT 1 FROM executions WHERE owner=? AND "
-                    "retention_waived=0 AND "
-                    "(state NOT IN ('succeeded','canceled') OR collected=0) LIMIT 1",
+                    f"SELECT 1 FROM executions WHERE owner=? AND {RETENTION_REQUIRED} LIMIT 1",
                     (owner,),
                 ).fetchone()
                 is not None

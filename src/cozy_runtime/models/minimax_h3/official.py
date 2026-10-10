@@ -74,6 +74,9 @@ from cozy_runtime.author import (
     attention_scope,
     canonical_json,
     expect_attention,
+    is_declared_pure,
+    pure,
+    retry_state,
     spread,
 )
 
@@ -651,33 +654,38 @@ def _inspectable(tensor: Any) -> bool:
 
 
 class ResidentWeights:
-    """Finite-weight verdicts that live exactly as long as the bytes they describe.
+    """Finite-weight verdicts that live exactly as long as the weights they describe.
 
-    Weights are immutable once filled, so their scan runs once per fill rather than once
-    per request (h3a-016). A verdict is keyed on the storage object itself, held weakly:
-    eviction frees the storage and its verdict with it, and a re-stage fills a fresh
-    storage that has none. The fill writes in place, which bumps the tensor's version
-    counter, so a paged block refilled into a storage that was resized rather than
-    replaced is rescanned too. Nothing here holds a strong reference to a weight.
+    Weights are immutable once filled, so their scan runs once per byte-identical load
+    rather than once per request (h3a-016). A verdict is keyed on the Parameter object
+    itself, held weakly: the memory planner moves a weight between device and host by
+    rebinding its data, which keeps both the Parameter and its bytes, so the verdict holds;
+    a fill from the store makes new Parameters, which are scanned again. Nothing here holds
+    a strong reference to a weight.
     """
 
     def __init__(self) -> None:
-        self._verdicts: weakref.WeakKeyDictionary[Any, tuple[int, int, int]] = (
-            weakref.WeakKeyDictionary()
-        )
+        #: id of a live weight -> the shape, dtype and write count it was verified at; its
+        #: entry leaves when the weight is collected, before its id can name another object
+        self._verdicts: dict[int, tuple[tuple[int, ...], str, int]] = {}
 
     @staticmethod
-    def _fill(tensor: Any) -> tuple[Any, tuple[int, int, int]]:
-        storage = tensor.untyped_storage()
-        return storage, (storage.data_ptr(), storage.nbytes(), tensor._version)
+    def _fill(tensor: Any) -> tuple[tuple[int, ...], str, int]:
+        """A write in place bumps the version; moving the data between device and host keeps
+        it. An inference tensor keeps no version: its writes are its own."""
+        try:
+            version = int(tensor._version)
+        except RuntimeError:
+            version = -1
+        return tuple(tensor.shape), str(tensor.dtype), version
 
     def verified(self, tensor: Any) -> bool:
-        storage, fill = self._fill(tensor)
-        return self._verdicts.get(storage) == fill
+        return self._verdicts.get(id(tensor)) == self._fill(tensor)
 
     def record(self, tensor: Any) -> None:
-        storage, fill = self._fill(tensor)
-        self._verdicts[storage] = fill
+        if id(tensor) not in self._verdicts:
+            weakref.finalize(tensor, self._verdicts.pop, id(tensor), None)
+        self._verdicts[id(tensor)] = self._fill(tensor)
 
 
 @dataclass(frozen=True, slots=True)
@@ -893,6 +901,24 @@ class NumericalChecks:
         """
         handles: list[Any] = []
         step = 0
+        base = getattr(module, "_cozy_retry_state", None)
+        contract_names = (
+            "_cozy_retry_state", "_cozy_retry_tensors", "_cozy_retry_generators",
+            "_cozy_retry_hooks", "_cozy_retry_forwards", "_cozy_retry_plain_args",
+        )
+        previous = {name: vars(module)[name] for name in contract_names if name in vars(module)}
+
+        def save() -> tuple[Any, int, int]:
+            return None if base is None else base[0](), step, len(self._pending)
+
+        def restore(state: tuple[Any, int, int]) -> None:
+            nonlocal step
+            underlying, step, pending = state
+            if base is not None:
+                base[1](underlying)
+            # These hooks only append new observations; existing entries and their
+            # reduction tensors are read-only. Drop the failed attempt's additions.
+            del self._pending[pending:]
 
         def before(_module: Any, args: Any, kwargs: Any) -> None:
             self.tensors(
@@ -916,6 +942,18 @@ class NumericalChecks:
         try:
             handles.append(module.register_forward_pre_hook(before, with_kwargs=True))
             handles.append(module.register_forward_hook(after, with_kwargs=True, always_call=True))
+            # Extend an explicit component contract. Unknown component bodies and
+            # their hooks do not become retryable merely because we observe them.
+            if base is not None or is_declared_pure(module):
+                if base is None:
+                    module.__dict__["_cozy_retry_plain_args"] = True
+                retry_state(
+                    module, save, restore,
+                    tensors=getattr(module, "_cozy_retry_tensors", lambda: ()),
+                    generators=getattr(module, "_cozy_retry_generators", lambda: ()),
+                    hooks=(*getattr(module, "_cozy_retry_hooks", ()), before, after),
+                    forwards=getattr(module, "_cozy_retry_forwards", ()),
+                )
             yield
         except BaseException:
             self._pending.clear()
@@ -923,6 +961,9 @@ class NumericalChecks:
         finally:
             for handle in handles:
                 handle.remove()
+            for name in contract_names:
+                vars(module).pop(name, None)
+            vars(module).update(previous)
         self.settle()
 
 
@@ -1053,6 +1094,34 @@ def _settle_intake(state: Any) -> None:
             statement.result()
 
 
+def _declare_audio_retry_state(audio_vae: Any) -> None:
+    """Own legacy WeightNorm's recomputed attributes, not its immutable parameters.
+
+    The H3 audio graph otherwise reads persistent state and input tensors. Each hook
+    replaces ``weight`` with a fresh result from weight_g/weight_v; restoring the old
+    binding also handles a first call after phase cleanup removed it entirely.
+    """
+    hooks = [
+        (module, hook) for module in audio_vae.modules()
+        for hook in module._forward_pre_hooks.values() if isinstance(hook, WeightNorm)
+    ]
+    sites = [(module, hook.name) for module, hook in hooks]
+
+    def save() -> list[tuple[Any, str, bool, Any]]:
+        return [
+            (module, name, name in vars(module), vars(module).get(name)) for module, name in sites
+        ]
+
+    def restore(state: list[tuple[Any, str, bool, Any]]) -> None:
+        for module, name, existed, value in state:
+            if existed:
+                vars(module)[name] = value
+            else:
+                vars(module).pop(name, None)
+
+    retry_state(audio_vae, save, restore, hooks=(hook for _, hook in hooks))
+
+
 @contextmanager
 def _audio_weight_norm_scope(audio_vae: Any) -> Iterator[None]:
     """Release only legacy WeightNorm's recomputable, unregistered attributes."""
@@ -1085,7 +1154,11 @@ class OfficialH3Pipeline:
         video_vae = _apply_video_vae_dtype(
             TileBatchedVideoVAE.from_config(_section(mapping, "video_vae")), config
         )
+        # H3 video encode/decode keep temporal overlaps and tile outputs local to
+        # each call. Unlike Qwen's causal VAE, this graph owns no feature-cache state.
+        pure(video_vae)
         audio_vae = AutoencoderKLMiniMaxH3Audio.from_config(_section(mapping, "audio_vae")).eval()
+        _declare_audio_retry_state(audio_vae)
         for trunk in _TRUNKS:
             _validate_model_contract(pipes[trunk], dits[trunk], video_vae, audio_vae)
         tokenizer, processor = _processor()
@@ -1992,6 +2065,7 @@ def _dit_specs(
 def _build_dit(config: Mapping[str, Any], structure: str, layout: TableLayout | None) -> Any:
     if structure == "full":
         transformer = MiniMaxH3Transformer3DModel.from_config(dict(config))
+        pure(transformer)
     else:
         if layout is None:
             raise ConformanceError(

@@ -286,6 +286,9 @@ def test_a_journal_another_runtime_wrote_converges_and_keeps_its_rows(
     workspace = Workspace(tmp_path / "store")
     accepted(workspace, "before")
     with sqlite3.connect(workspace.directory / "journal.sqlite3") as db:
+        # Old journals had neither these derived views nor the removed schema.
+        for (name,) in db.execute("SELECT name FROM sqlite_schema WHERE type='view'").fetchall():
+            db.execute('DROP VIEW "' + name.replace('"', '""') + '"')
         db.execute("DROP TABLE holds")
         db.execute("ALTER TABLE executions DROP COLUMN owner_memo")
         db.execute("CREATE TABLE newer_runtime (id TEXT PRIMARY KEY) STRICT")
@@ -306,6 +309,8 @@ def test_a_journal_missing_a_required_column_refuses_by_name(tmp_path: Path) -> 
     with workspace.locked():
         pass
     with sqlite3.connect(workspace.directory / "journal.sqlite3") as db:
+        for (name,) in db.execute("SELECT name FROM sqlite_schema WHERE type='view'").fetchall():
+            db.execute('DROP VIEW "' + name.replace('"', '""') + '"')
         db.execute("ALTER TABLE attempts DROP COLUMN spec")
         db.execute("PRAGMA user_version=13")
     with (

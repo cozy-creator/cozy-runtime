@@ -455,6 +455,7 @@ def test_scoped_access_renews_without_machine_registration_and_revokes_per_hub(
             hub_access_principals={},
         ),
     )
+    assert machine_model_resolve.registration(worker, "") is None
     authority = machine_model_resolve.registration(worker, origin)
     assert authority is not None
     assert authority.worker_id == authority.worker_token == ""

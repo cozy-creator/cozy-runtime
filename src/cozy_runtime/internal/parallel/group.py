@@ -19,11 +19,12 @@ import threading
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
-from typing import Annotated, Any, Protocol, TypedDict
+from typing import Any, Literal, Protocol, TypedDict
 
 import msgspec
 
-from cozy_runtime.internal import execution_evidence, liveness, spawn
+from cozy_runtime.author._errors import RuntimeFailure
+from cozy_runtime.internal import execution_evidence, executor_replies, liveness, spawn
 from cozy_runtime.internal.config import inherited_environment
 from cozy_runtime.internal.parallel.plan import GpuDivergence, GroupPlan, GroupRefusal
 from cozy_runtime.internal.seam import Channel, SeamError
@@ -70,6 +71,7 @@ class Frame(msgspec.Struct, frozen=True):
     ok: bool | None = None
     code: str | None = None
     detail: str = ""
+    reusable: bool = False
 
 
 class _Hello(msgspec.Struct, frozen=True):
@@ -78,40 +80,152 @@ class _Hello(msgspec.Struct, frozen=True):
     rank: int
     world: int
     sealed: dict[str, str]
+    memory: tuple[str, ...] = ()
 
 
-_Bytes = Annotated[int, msgspec.Meta(ge=0)]
+class OpReady(msgspec.Struct, frozen=True, kw_only=True):
+    operation: int
+    rank: int
+    ok: bool
+    code: str = ""
+    detail: str = ""
+    reusable: bool = True
+    needed: int = 0
+    available: int = 0
+    free_bytes: int = 0
+    grant_bytes: int = 0
+    free_wanted: int = 0
+    grant_wanted: int = 0
+    memory: dict[str, int] = {}
+    host_needed: int = 0
+    host_remaining: int = 0
 
 
-class _Offer(msgspec.Struct, frozen=True, tag_field="reply", tag="resident_budget"):
-    """A follower's plan and the bytes it needs, for `agree_residence`."""
+class OpDecision(msgspec.Struct, frozen=True, tag_field="cmd", tag="op_decision"):
+    operation: int
+    action: Literal["commit", "abort"]
+
+
+class PreparedAbort(BaseException):
+    """Internal control flow: no authored operation was entered."""
+
+
+class PreparationRefusal(RuntimeFailure):
+    """Every rank stopped before its authored operation. The group remains usable."""
+
+    default_code = "group_preparation_failed"
+
+
+class PreparedPeer:
+    """A follower keeps its prepared frame alive while its control socket waits for commit."""
+
+    def __init__(self, channel: Channel, operation: int, rank: int) -> None:
+        self.channel, self.operation, self.rank = channel, operation, rank
+        self.committed = False
+        self.reported = False
+
+    def ready(self, status: OpReady) -> None:
+        if self.reported or (status.operation, status.rank) != (self.operation, self.rank):
+            raise GroupRefusal("duplicate or mismatched group preparation")
+        self.reported = True
+        self.channel.send({"reply": "op_ready", **msgspec.to_builtins(status)})
+        raw = self.channel.recv(timeout=None)
+        try:
+            decision = msgspec.convert(raw, OpDecision)
+        except msgspec.ValidationError as exc:
+            raise GroupRefusal(f"invalid group preparation decision: {exc}") from exc
+        if decision.operation != self.operation:
+            raise GroupRefusal("group preparation decision names another operation")
+        if decision.action == "abort":
+            raise PreparedAbort()
+        if not status.ok:
+            raise GroupRefusal("a refused preparation was committed")
+        self.committed = True
+
+
+class PreparedGroup:
+    """One control-socket transaction; the caller owns every follower's command lease."""
+
+    def __init__(self, group: RankGroup, command: Mapping[str, object]) -> None:
+        self.group = group
+        group.operation_sequence += 1
+        self.operation = group.operation_sequence
+        self.committed = self.aborted = False
+        self.statuses: list[OpReady] = []
+        try:
+            group.broadcast({**command, "operation": self.operation})
+        except BaseException:
+            group._break("could not deliver group preparation to every rank")
+            raise
+
+    def ready(self, local: OpReady, check: Callable[[], None] = lambda: None) -> bool:
+        if self.statuses:
+            raise GroupRefusal("group preparation was decided twice")
+        if (local.operation, local.rank) != (self.operation, 0):
+            self.group._break("leader readiness names another operation")
+            raise GroupRefusal(self.group.broken)
+        self.statuses = [local]
+        for follower, frame in zip(
+            self.group.followers, self.group.collect("op_ready"), strict=True
+        ):
+            try:
+                status = msgspec.convert(
+                    {**frame, "memory": executor_replies.memory_facts(frame.get("memory"))}, OpReady
+                )
+            except msgspec.ValidationError as exc:
+                self.group._break(f"malformed group readiness: {exc}")
+                raise GroupRefusal(self.group.broken) from exc
+            if (status.operation, status.rank) != (self.operation, follower.rank):
+                self.group._break("a rank answered readiness for another operation")
+                raise GroupRefusal(self.group.broken)
+            self.statuses.append(status)
+        if not all(status.ok for status in self.statuses):
+            return False
+        check()
+        # From the first send onward a rank may enter a collective. A partial commit
+        # therefore breaks the group; it can never become a reusable preparation refusal.
+        self.committed = True
+        try:
+            self.group.broadcast(msgspec.to_builtins(OpDecision(self.operation, "commit")))
+        except BaseException:
+            self.group._break("group commit could not reach every rank")
+            raise
+        return True
+
+    def abort(self) -> None:
+        if self.aborted or self.committed or self.group.broken:
+            return
+        try:
+            # If the leader failed before reaching its own gate, followers are still
+            # preparing. Queue abort now; each consumes it only after reporting readiness.
+            self.group.broadcast(msgspec.to_builtins(OpDecision(self.operation, "abort")))
+            if not self.statuses:
+                self.group.collect("op_ready")
+            for reply in self.group.collect("run"):
+                if (
+                    not reply.get("ok")
+                    or reply.get("operation") != self.operation
+                    or not reply.get("aborted")
+                ):
+                    raise GroupRefusal("a rank did not abort its prepared operation")
+            self.aborted = True
+        except BaseException:
+            self.group._break("group preparation could not be aborted cleanly")
+            raise
+
+
+class _Offer(msgspec.Struct, frozen=True, tag_field="reply", tag="plan_offer"):
+    """A follower's plan, for `agree_plan`."""
 
     rank: int
     model: str
     plan: GroupPlan
-    required: _Bytes
 
 
-class _Parking(msgspec.Struct, frozen=True, tag_field="cmd", tag="resident_budget"):
-    """Rank 0's answer to the offers: the constructions every rank parks."""
-
-    model: str
-    park: list[str]
-
-
-class _Measured(msgspec.Struct, frozen=True, tag_field="reply", tag="resident_ceiling"):
-    """A follower's ceiling, measured after it parked."""
-
-    rank: int
-    model: str
-    ceiling: _Bytes
-
-
-class _Ceiling(msgspec.Struct, frozen=True, tag_field="cmd", tag="resident_ceiling"):
-    """The group's ceiling: the smallest any rank measured."""
+class _Agreed(msgspec.Struct, frozen=True, tag_field="cmd", tag="plan_agreed"):
+    """Rank 0's verdict: every rank resolved the same plan, so every rank may fill."""
 
     model: str
-    ceiling: _Bytes
 
 
 class SpreadLog(TypedDict):
@@ -200,36 +314,15 @@ def _decode[T](
         raise GpuDivergence(gpu, field_name, f"{what}: {exc}") from exc
 
 
-def receive_residence(
-    channel: Channel,
-    *,
-    rank: int,
-    model: str,
-    plan: Mapping[str, object],
-    required: int,
-    park: Callable[[list[str]], None],
-    ceiling: Callable[[], int],
-) -> int:
-    """A follower's half of `RankGroup.agree_residence`.
-
-    Offer this rank's plan and need, park what rank 0 parked, offer the ceiling measured
-    after that, and accept only a matching, no-larger group ceiling.
-    """
-    offer = _Offer(rank, model, GroupPlan.read(plan), required)
+def offer_plan(channel: Channel, *, rank: int, model: str, plan: Mapping[str, object]) -> None:
+    """A follower's half of `RankGroup.agree_plan`: offer this rank's plan and fill only
+    once rank 0 found every plan equal to its own."""
+    offer = _Offer(rank, model, GroupPlan.read(plan))
     gpu = execution_evidence.gpu_name(offer.plan.devices, rank)
     channel.send(msgspec.to_builtins(offer))
-    what = "invalid group parking decision"
-    parking = _decode(channel.recv(timeout=None), _Parking, gpu, "parked_constructions", what)
-    if parking.model != model:
-        raise GpuDivergence(gpu, "parked_constructions", f"{what} for {parking.model!r}")
-    park(parking.park)
-    local = ceiling()
-    channel.send(msgspec.to_builtins(_Measured(rank, model, local)))
-    what = "invalid group residence ceiling"
-    shared = _decode(channel.recv(timeout=None), _Ceiling, gpu, "resident_budget_bytes", what)
-    if shared.model != model or shared.ceiling > local:
-        raise GpuDivergence(gpu, "resident_budget_bytes", what)
-    return shared.ceiling
+    agreed = _decode(channel.recv(timeout=None), _Agreed, gpu, "plan", "invalid plan agreement")
+    if agreed.model != model:
+        raise GpuDivergence(gpu, "plan", f"invalid plan agreement for {agreed.model!r}")
 
 
 class RankGroup:
@@ -271,6 +364,11 @@ class RankGroup:
         self.broken = ""
         #: per follower rank, the largest working peak its mirrored calls reported this attempt
         self.working_peaks: dict[int, int] = {}
+        #: Rank-local authorizations and the latest facts each rank actually reported.
+        self.memory_grants: tuple[int, ...] = ()
+        self.rank_memory: dict[str, dict[str, int]] = {}
+        self.operation_sequence = 0
+        self.memory_capabilities: dict[int, tuple[str, ...]] = {}
         #: per follower rank, its `execution_evidence` record folded over this attempt's calls
         self.rank_records: dict[int, execution_evidence.RankEvidence] = {}
         #: per spread method this attempt
@@ -338,11 +436,15 @@ class RankGroup:
                 break
             if head.event == "progress":
                 if self.forward is not None:
-                    with contextlib.suppress(SeamError):
+                    with contextlib.suppress(SeamError, OSError):
                         self.forward({**frame, "name": f"{follower.gpu}:{head.name}"})
                 continue
+            if "memory" in frame:
+                self.rank_memory[str(follower.rank)] = executor_replies.memory_facts(
+                    frame["memory"]
+                )
             follower.replies.put((head, frame))
-            if head.reply == "run" and not head.ok:
+            if head.reply == "run" and not head.ok and not head.reusable:
                 self._break(
                     f"{follower.gpu} failed its part of the call: {head.code}: {head.detail}"[:600]
                 )
@@ -393,6 +495,7 @@ class RankGroup:
                     f"not {follower.rank} of {self.degree}",
                     code="group_unformed",
                 )
+            self.memory_capabilities[follower.rank] = hello.memory
             if hello.sealed != dict(sealed):
                 raise GroupRefusal(
                     f"{follower.gpu} dialled back under a different seal "
@@ -433,7 +536,7 @@ class RankGroup:
         for follower in self.followers:
             try:
                 follower.channel.send(dict(command))
-            except SeamError as exc:
+            except (SeamError, OSError) as exc:
                 raise GroupRefusal(
                     f"{follower.gpu} cannot be commanded: {exc}", code="group_broken"
                 ) from exc
@@ -491,7 +594,7 @@ class RankGroup:
         self.check_alive()
         try:
             self.followers[rank - 1].channel.send(dict(command))
-        except SeamError as exc:
+        except (SeamError, OSError) as exc:
             raise GroupRefusal(
                 f"{self.gpu(rank)} cannot be commanded: {exc}", code="group_broken"
             ) from exc
@@ -520,50 +623,16 @@ class RankGroup:
                 raise GroupRefusal(self.broken, code="group_broken")
             return body
 
-    def agree_residence(
-        self,
-        *,
-        model: str,
-        plan: Mapping[str, object],
-        required: int,
-        park: Callable[[int], list[str]],
-        ceiling: Callable[[], int],
-    ) -> tuple[int, list[str]]:
-        """Agree the plan, the constructions to park, and the ceiling, before any fill.
-
-        Every rank resolved on its own card; each offer carries its plan and the bytes it
-        needs. A plan that differs is divergence, refused before a destination exists. Rank
-        0 parks for the largest need any rank reported and every rank parks the same
-        constructions; each then measures its own ceiling and the group fills under the
-        smallest. The control seam also observes an early load failure or rank death,
-        without parking the leader in a device collective.
-        """
-        need = int(required)
+    def agree_plan(self, *, model: str, plan: Mapping[str, object]) -> None:
+        """Every rank resolved on its own card; a plan that differs is divergence, refused
+        before a destination exists. Where each rank's weights live is its own."""
         mine = GroupPlan.read(plan)
-        for follower, reply in zip(self.followers, self.collect("resident_budget"), strict=True):
-            offer = _decode(reply, _Offer, follower.gpu, "resident_budget", "invalid GPU offer")
+        for follower, reply in zip(self.followers, self.collect("plan_offer"), strict=True):
+            offer = _decode(reply, _Offer, follower.gpu, "plan", "invalid GPU offer")
             if (offer.rank, offer.model) != (follower.rank, model):
-                raise GpuDivergence(follower.gpu, "resident_budget", "invalid GPU offer")
+                raise GpuDivergence(follower.gpu, "plan", "invalid GPU offer")
             offer.plan.assert_agrees(mine, rank=follower.rank)
-            need = max(need, offer.required)
-        parked = park(need)
-        self.broadcast(msgspec.to_builtins(_Parking(model, parked)))
-        shared = ceiling()
-        for follower, reply in zip(self.followers, self.collect("resident_ceiling"), strict=True):
-            measured = _decode(
-                reply,
-                _Measured,
-                follower.gpu,
-                "resident_budget_bytes",
-                "invalid GPU residence ceiling",
-            )
-            if (measured.rank, measured.model) != (follower.rank, model):
-                raise GpuDivergence(
-                    follower.gpu, "resident_budget_bytes", "invalid GPU residence ceiling"
-                )
-            shared = min(shared, measured.ceiling)
-        self.broadcast(msgspec.to_builtins(_Ceiling(model, shared)))
-        return shared, parked
+        self.broadcast(msgspec.to_builtins(_Agreed(model)))
 
     def call(self, command: Mapping[str, object]) -> list[dict[str, Any]]:
         self.broadcast(command)

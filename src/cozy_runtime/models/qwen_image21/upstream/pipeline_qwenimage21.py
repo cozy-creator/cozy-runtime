@@ -18,6 +18,7 @@ from typing import Any, Callable
 
 import numpy as np
 import torch
+from cozy_runtime.author import pure
 from PIL import Image as PILImage
 from transformers import Qwen3VLForConditionalGeneration, Qwen3VLProcessor
 
@@ -155,6 +156,11 @@ def calculate_dimensions(target_area, ratio):
     height = round(height / 32) * 32
 
     return width, height, None
+
+
+@pure
+def _pre_norm_hidden_state(module, args, output):
+    return args[0]
 
 
 class QwenImage21Pipeline(DiffusionPipeline, QwenImageLoraLoaderMixin):
@@ -303,9 +309,9 @@ class QwenImage21Pipeline(DiffusionPipeline, QwenImageLoraLoaderMixin):
         # TODO: replace this with `tie_last_hidden_states=False` in the text encoder's config, which
         # huggingface/transformers#48087 adds, once that ships in a stable transformers release (5.18).
         text_model = getattr(self.text_encoder.model, "language_model", self.text_encoder.model)
-        handle = text_model.norm.register_forward_hook(lambda module, args, output: args[0])
+        handle = text_model.norm.register_forward_hook(_pre_norm_hidden_state)
         try:
-            outputs = self.text_encoder.model(**forward_kwargs)
+            outputs = self.text_encoder(**forward_kwargs)
         finally:
             handle.remove()
         hidden_states = outputs.hidden_states[-1]
@@ -500,6 +506,9 @@ class QwenImage21Pipeline(DiffusionPipeline, QwenImageLoraLoaderMixin):
     @property
     def interrupt(self):
         return self._interrupt
+
+    def _make_kv_cache(self, num_blocks: int) -> QwenImage21KVCache:
+        return QwenImage21KVCache(num_blocks)
 
     @torch.no_grad()
     @replace_example_docstring(EXAMPLE_DOC_STRING)
@@ -749,8 +758,8 @@ class QwenImage21Pipeline(DiffusionPipeline, QwenImageLoraLoaderMixin):
         # prefills them and later steps only recompute the target image's tokens.
         num_blocks = len(self.transformer.transformer_blocks)
         cache_enabled = use_kv_cache and self.transformer.config.causal_condition
-        cond_cache = QwenImage21KVCache(num_blocks) if cache_enabled else None
-        neg_cache = QwenImage21KVCache(num_blocks) if cache_enabled and do_true_cfg else None
+        cond_cache = self._make_kv_cache(num_blocks) if cache_enabled else None
+        neg_cache = self._make_kv_cache(num_blocks) if cache_enabled and do_true_cfg else None
 
         # 5. Denoising loop
         self.scheduler.set_begin_index(0)

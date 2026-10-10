@@ -44,6 +44,8 @@ var (
 
 // Source is a machine's outputs and the keys that may read them.
 type Source interface {
+	// RefreshKeys checks authoritative access before admitting a new session.
+	RefreshKeys(context.Context) error
 	Open(run uint64, output string, index int) (Snapshot, error)
 	// Entries answers the entries after `after`, waiting at the tail; at or past the terminal
 	// entry it answers the terminal entry again.

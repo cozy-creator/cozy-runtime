@@ -16,6 +16,7 @@ from cozy_runtime.internal import canonical, prepare_diagnostics
 from cozy_runtime.internal.package_environment import EnvironmentRefusal
 from cozy_runtime.internal.worker import (
     machine_capture,
+    machine_model_resolve,
     machine_reads,
     machine_release_roots,
     triage,
@@ -190,12 +191,19 @@ class MachineExecutionRPC:
             inputs[0].url = "data:application/json;base64," + base64.b64encode(payload).decode()
             executions = self.worker.executions
             owner = self.worker.authorize_workspace(request.claim)
-            # Held before acceptance so no source call runs without them; never journaled.
-            self.worker.machine_sources.hold(owner, offered.request_id, request.source_credentials)
             if executions.owns(owner, offered.request_id):
                 # Reconcile lost acceptance replies from the durable record itself,
                 # even after the worker's in-memory prepared registry disappeared.
                 prepared = executions.preparation(owner, offered.request_id)
+                # Reconciliation uses the scope accepted in the journal, even after
+                # that Hub's bearer expires. It never selects a new current grant.
+                hub = request.hub
+                own = self.worker.options.publication_authority
+                if own is not None and machine_model_resolve.same_origin(hub, own.origin):
+                    hub = ""
+                held_hub = str(prepared.get("hub", ""))
+                if hub != held_hub and not machine_model_resolve.same_origin(hub, held_hub):
+                    raise WorkspaceRefusal("execution submission changed its Hub scope")
                 if prepared.get("state") != machine_capture.state_identity(request.prepared_state):
                     raise WorkspaceRefusal("execution submission changed its prepared state")
                 receipt = executions.submit(
@@ -208,6 +216,9 @@ class MachineExecutionRPC:
                     preparation=canonical.write(prepared),
                     publication_authorization_id=request.publication_authorization_id,
                     owner_memo=request.owner_memo,
+                )
+                self.worker.machine_sources.hold(
+                    owner, offered.request_id, request.source_credentials
                 )
             else:
                 preparation = machine_capture.verify(self.worker, request)
@@ -222,6 +233,7 @@ class MachineExecutionRPC:
                     publication_authorization_id=request.publication_authorization_id,
                     arguments=value,
                     owner_memo=request.owner_memo,
+                    source_credentials=request.source_credentials,
                 )
             self.worker.machine_sources.declare(owner, offered.request_id)
             return pb.MachineExecutionReceipt(**dataclasses.asdict(receipt))

@@ -36,7 +36,7 @@ class Shutdown(Command, frozen=True, kw_only=True, tag="shutdown"):
 
 
 class Probe(Command, frozen=True, kw_only=True, tag="probe"):
-    pass
+    end_attempt: bool = False
 
 
 class Residency(Command, frozen=True, kw_only=True, tag="residency"):
@@ -44,7 +44,7 @@ class Residency(Command, frozen=True, kw_only=True, tag="residency"):
 
 
 class Warm(Command, frozen=True, kw_only=True, tag="warm"):
-    pass
+    compile_only: bool = False
 
 
 class Join(Command, frozen=True, kw_only=True, tag="join"):
@@ -64,10 +64,6 @@ class Vacate(Command, frozen=True, kw_only=True, tag="vacate"):
     ranks: tuple[int, ...] = ()
 
 
-class Restore(Command, frozen=True, kw_only=True, tag="restore"):
-    names: tuple[str, ...] = ()
-
-
 class Unload(Command, frozen=True, kw_only=True, tag="unload"):
     construction: str
 
@@ -75,6 +71,8 @@ class Unload(Command, frozen=True, kw_only=True, tag="unload"):
 class Activate(Command, frozen=True, kw_only=True, tag="activate"):
     construction: str
     authorized_device_limit_bytes: int | UnsetType = UNSET
+    memory_grants: tuple[int, ...] = ()
+    begin_attempt: bool = False
     #: A follower's half: the constructions rank 0 parked to make room.
     park: tuple[str, ...] = ()
 
@@ -86,6 +84,10 @@ class Attention(Command, frozen=True, kw_only=True, tag="attention"):
     pin: str | UnsetType = UNSET
     model_key: str | None = None
     adopt: dict[str, str] | UnsetType = UNSET
+    #: A Sol request requires capture and explicit semantic-choice acknowledgement.
+    sol_request: bool = False
+    #: Intersected logical Sol layouts; None means all lengths, () means dense-only.
+    sol_variants: tuple[tuple[int, bool], ...] | UnsetType | None = UNSET
 
 
 class Release(msgspec.Struct, frozen=True, kw_only=True):
@@ -100,6 +102,12 @@ class Start(Command, frozen=True, kw_only=True, tag="start"):
     sequence_parallel_degree: int = 1
     application: str = ""
     package_interface: str = ""
+    #: Speculative startup imports code without creating a device context or warming it.
+    import_only: bool = False
+    #: Both peers affirm these semantics before any CUDA or package initialization.
+    memory_capabilities: tuple[str, ...] = ()
+    authorized_device_limit_bytes: int | UnsetType = UNSET
+    memory_grants: tuple[int, ...] = ()
 
     def release(self) -> Release:
         return Release(application=self.application, package_interface=self.package_interface)
@@ -179,6 +187,8 @@ class Load(Command, frozen=True, kw_only=True, tag="load"):
     construction: str
     devices: str = ""
     authorized_device_limit_bytes: int | UnsetType = UNSET
+    #: Per-rank total footprints; the scalar above remains the legacy minimum.
+    memory_grants: tuple[int, ...] = ()
     sequence_parallel_degree: int = 1
     attention_pin: str = ""
     #: The one-model form. Executors before the typed commands index both keys directly, so a
@@ -250,10 +260,10 @@ class Invoke(_Run, frozen=True, kw_only=True, tag="invoke"):
     entrypoint: str
     construction: str = ""
     attention_kernel: str = ""
+    #: Absent on older workers; zero explicitly grants no device bytes.
+    memory_grant_bytes: int | UnsetType = UNSET
+    memory_grants: tuple[int, ...] = ()
     placement: str = "all_resident"
-    headroom_bytes: int = 0
-    scope_headroom_bytes: dict[str, int] = {}
-    measured_scopes: tuple[str, ...] = ()
 
 
 class ModelManifest(msgspec.Struct, frozen=True, kw_only=True, rename={"class_key": "class"}):
@@ -308,7 +318,6 @@ type KnownCommand = (
     | Join
     | DescribeInstalled
     | Vacate
-    | Restore
     | Unload
     | Activate
     | Attention

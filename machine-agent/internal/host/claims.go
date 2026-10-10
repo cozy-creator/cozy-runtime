@@ -25,6 +25,7 @@ const (
 )
 
 type claims struct {
+	authority        *rentalAuthority
 	workerID, bootID string
 	leafDigest       []byte
 	mu               sync.Mutex
@@ -49,6 +50,16 @@ func newClaims(workerID, bootID string, leafDigest []byte, authorized []ed25519.
 	c.claim = &pb.Claim{RecordOwnerEpoch: runtimeOwnerEpoch, RecordOwnerId: runtimeOwnerID, WorkerId: workerID,
 		WorkerBootId: bootID, WireMinor: pb.WireMinor, Proof: ed25519.Sign(own, proof)}
 	return c, nil
+}
+
+func (c *claims) useOwn(own ed25519.PrivateKey) error {
+	c.own = own
+	proof, err := c.transcript(runtimeOwnerEpoch)
+	if err != nil {
+		return err
+	}
+	c.claim = &pb.Claim{RecordOwnerEpoch: runtimeOwnerEpoch, RecordOwnerId: runtimeOwnerID, WorkerId: c.workerID, WorkerBootId: c.bootID, WireMinor: pb.WireMinor, Proof: ed25519.Sign(own, proof)}
+	return nil
 }
 
 // ownKey is the public half the Runtime verifies the daemon's Claim against.
