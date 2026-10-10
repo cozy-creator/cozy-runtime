@@ -303,3 +303,33 @@ def test_an_unreadable_meter_is_absent_and_never_a_zero(monkeypatch: pytest.Monk
 
 
 # ------------------------------------------------------- the file, over a real run
+
+
+def test_parked_replica_does_not_hold_idle_but_its_real_revival_and_units_do() -> None:
+    with _short_tmp() as root:
+        worker = Worker(
+            *claimable(_config(root / "home"), WorkerOptions(root=root / "worker")),
+            InMemoryControlHost(),
+        )
+        name = "machine-reclaimed"
+        placement = Placement(
+            pb.Placement(placement_id=name), b"", serving=pb.SERVING_STATE_ACTIVATING
+        )
+        done = threading.Event()
+        try:
+            worker.hosted[name] = HostedPlacement(placement, worker.supervision)
+            worker._dead_replicas[name] = object()  # type: ignore[assignment]
+            assert activity.holding(worker) == []
+            worker._activating.add(name)
+            assert activity.holding(worker) == [f"activating:{name}"]
+            worker._activating.clear()
+            worker.supervisor.spawn("revive:replica", lambda unit: unit.wait_for(done.is_set))
+            assert activity.holding(worker) == ["unit:revive:replica"]
+            with worker.preparation_lock:
+                assert "preparation_lock" in activity.holding(worker)
+        finally:
+            done.set()
+            worker.supervisor.poke("revive:replica")
+            worker._dead_replicas.clear()
+            worker.hosted.clear()
+            worker.shutdown()

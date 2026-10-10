@@ -111,37 +111,22 @@ class H3Model(Model[OfficialH3Pipeline], encoded_leaves="accept", fusion="accept
         return DIT_ATTENTION if context.component in DIT_COMPONENTS else None
 
     def warm(self, ctx: Context) -> None:
-        """One dry DiT forward per entrypoint DiT this device ADMITS, before serving.
+        """One dry forward of the reference-to-video DiT, before serving.
 
-        Both DiTs are offered, because one construction carries both entrypoints and a
-        switch between them must not pay a first call either (h3a-018). The runtime has
-        already applied the fused glue and loaded its cubins for this device by the time
-        `warm` runs (h3a-015, `fusion="accept"` above); the dry forward is what pays their
-        first launches, the rotary tables and the projections' first GEMM plans.
-
-        Offered, not required. Warm uses the same staged component-use admission as a
-        request: unrelated completed components are evicted before each DiT runs. A
-        parked DiT can therefore warm if its own scope fits. A measured device_shortfall
-        remains optional and is recorded and skipped; it is not a requirement to fit
-        both DiTs simultaneously. Later requests select their own placement rung from
-        the actual post-warm resident set. Warming a parked DiT may add checkpoint I/O.
+        It serves `ref2va` and `long_form`; the first-frame DiT pays its first launches on
+        its first call instead. Components come onto the device only when an op of them
+        runs, so a DiT no call reaches never occupies it. The runtime has already applied
+        the fused glue and loaded its cubins for this device by the time `warm` runs
+        (h3a-015); the dry forward pays their first launches, the rotary tables and the
+        projections' first GEMM plans. A measured `device_shortfall` is recorded and skipped.
         """
-        warmers: dict[Task, Callable[[], None]] = {
-            "fl2va": self.warm_fl2va,
-            "ref2va": self.warm_ref2va,
-        }
-        for warm_one in warmers.values():
-            ctx.raise_if_cancelled()
-            try:
-                warm_one()
-            except Exception as exc:
-                if getattr(exc, "code", "") != "device_shortfall":
-                    raise
-                print(
-                    f"[minimax-h3] {warm_one.__name__} not applied: {exc}",
-                    file=sys.stderr,
-                    flush=True,
-                )
+        ctx.raise_if_cancelled()
+        try:
+            self.warm_ref2va()
+        except Exception as exc:
+            if getattr(exc, "code", "") != "device_shortfall":
+                raise
+            print(f"[minimax-h3] warm_ref2va not applied: {exc}", file=sys.stderr, flush=True)
 
     @uses_components("fl2va_dit")
     def warm_fl2va(self) -> None:

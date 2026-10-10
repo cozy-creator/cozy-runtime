@@ -19,10 +19,9 @@ import contextvars
 import functools
 import inspect
 import json
-import logging
 import threading
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import AbstractContextManager, ExitStack, contextmanager
+from contextlib import AbstractContextManager, ExitStack
 from dataclasses import dataclass, field
 from typing import (
     Any,
@@ -41,7 +40,6 @@ from cozy_runtime.author._errors import (
     CapabilityError,
     ConformanceError,
     InvalidRequest,
-    _is_device_oom,
 )
 from cozy_runtime.author._loader import (
     Artifact,
@@ -54,8 +52,6 @@ from cozy_runtime.author._loader import (
     Scheduler,
     loading,
 )
-
-_LOG = logging.getLogger(__name__)
 
 PipelineT = TypeVar("PipelineT", covariant=True)
 P = ParamSpec("P")
@@ -213,17 +209,15 @@ class _Scope(Protocol):
 
 
 class Residency(Protocol):
-    """The runtime's component-use ADMISSION, installed on a constructed generation.
+    """The runtime's side of a declared scope, installed on a constructed generation.
 
-    Declared here because the contract has one home; implemented nowhere in this package,
-    because admission, materialization, event fencing and eviction all need a device and
-    this package is torch-free by construction. cozy-runtime supplies the body
-    (`internal/residency.py`); a promoted Varena adapter would supply a different one and the
-    package above would not be able to tell.
+    Declared here because the contract has one home; implemented by cozy-runtime's memory
+    planner (`internal/memory.py`), because every decision about device memory needs a
+    device and this package is torch-free by construction.
 
-    `admit` runs BEFORE method entry and either makes the declared set materialized or
-    refuses typed. `release` runs after the body returns, records the event fence, and makes
-    the leases EVICTABLE — it never forces eviction and never imposes a global scope order.
+    `admit` runs BEFORE method entry: what the method reads outside its components' own
+    forwards is on the device when its body starts, or it refuses typed. `release` runs
+    after the body returns and moves nothing.
     """
 
     def admit(self, method: str, components: tuple[str, ...]) -> None: ...
@@ -390,40 +384,6 @@ def placeable(*names: str) -> Callable[[type[ModelT]], type[ModelT]]:
     return decorate
 
 
-# STOPGAP until memory v3, which deletes it: a device OOM in a scope holding only diffusers'
-# image `AutoencoderKL` (SDXL's decode: one call, one returned frame) frees what the scope
-# does not hold and runs the same call once more tiled. Nothing else is retried: a video
-# VAE's decode streams chunks to its caller, and a second run would deliver them twice.
-def _tiles_after_oom(model: Any, components: tuple[str, ...], exc: Exception) -> list[Any]:
-    plane: Any = model._cozy_residency
-    held = plane.backend.components if plane is not None and _is_device_oom(exc) else {}
-    modules = [held.get(name) for name in components]
-    image_vaes = all(
-        any(k.__name__ == "AutoencoderKL" and k.__module__.startswith("diffusers.") for k in
-            type(m).__mro__)
-        for m in modules
-    )
-    return modules if modules and image_vaes else []
-
-
-@contextmanager
-def _tiled_retry(model: Any, method: str, modules: list[Any]) -> Iterator[None]:
-    plane: Any = model._cozy_residency
-    plane.shed()
-    if plane.torch is not None and plane.kind == "cuda":
-        plane.torch.cuda.empty_cache()
-    plane.backend.stage_log.append({"method": method, "action": "decode retried tiled after OOM"})
-    _LOG.warning("%s: decode retried tiled after OOM", method)
-    untiled = [m for m in modules if not getattr(m, "use_tiling", False)]
-    for module in untiled:
-        module.enable_tiling()
-    try:
-        yield
-    finally:
-        for module in untiled:
-            module.disable_tiling()
-
-
 def _is_async(fn: Callable[..., object]) -> bool:
     return inspect.iscoroutinefunction(inspect.unwrap(fn))
 
@@ -434,15 +394,7 @@ def _sync_wrapper[M: _ScopedModel, **P, R](
     @functools.wraps(fn)
     def wrapper(self: M, /, *args: P.args, **kwargs: P.kwargs) -> R:
         with self._cozy_scope(fn.__name__, components):
-            tiles: list[Any] = []
-            try:
-                result = fn(self, *args, **kwargs)
-            except Exception as exc:
-                if not (tiles := _tiles_after_oom(self, components, exc)):
-                    raise
-            if tiles:  # outside `except`, so the failed call's frames and tensors are gone
-                with _tiled_retry(self, fn.__name__, tiles):
-                    result = fn(self, *args, **kwargs)
+            result = fn(self, *args, **kwargs)
             _refuse_lazy(fn.__name__, result)
             return result
 
@@ -457,15 +409,7 @@ def _async_wrapper[M: _ScopedModel, **P, R](
     @functools.wraps(fn)
     async def wrapper(self: M, /, *args: P.args, **kwargs: P.kwargs) -> object:
         with self._cozy_scope(fn.__name__, components):
-            tiles: list[Any] = []
-            try:
-                result = await fn(self, *args, **kwargs)  # type: ignore[misc]
-            except Exception as exc:
-                if not (tiles := _tiles_after_oom(self, components, exc)):
-                    raise
-            if tiles:
-                with _tiled_retry(self, fn.__name__, tiles):
-                    result = await fn(self, *args, **kwargs)  # type: ignore[misc]
+            result = await fn(self, *args, **kwargs)  # type: ignore[misc]
             _refuse_lazy(fn.__name__, result)
             return result
 

@@ -21,6 +21,7 @@ dependencies = [
     "packaging>=24",
     "pillow>=12",
     "protobuf>=6.31",
+    "pyyaml>=6.0",
 ]
 
 [dependency-groups]

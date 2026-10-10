@@ -6,7 +6,9 @@ import pytest
 
 
 def _conditioner(torch: Any, device: str) -> Any:
-    from transformers import Qwen3VLConfig, Qwen3VLForConditionalGeneration
+    from transformers import Qwen3VLConfig
+
+    from cozy_runtime.models.qwen3_vl import Qwen3VLHiddenStateModel
 
     config = Qwen3VLConfig(
         text_config={
@@ -35,7 +37,7 @@ def _conditioner(torch: Any, device: str) -> Any:
         vision_start_token_id=2,
         vision_end_token_id=4,
     )
-    return Qwen3VLForConditionalGeneration(config).eval().to(device)
+    return Qwen3VLHiddenStateModel(config).eval().to(device)
 
 
 def _inputs(torch: Any, model: Any, *, image: bool) -> dict[str, Any]:
