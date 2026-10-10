@@ -585,6 +585,7 @@ SAGE = _sage(
 )
 #: FP16 P/V at upstream's default (and most accurate) FP32 accumulation; BF16 V is cast to FP16.
 SAGE_FP16PV = _sage({90: ("sageattn_qk_int8_pv_fp16_cuda", "per_thread", "fp32")})
+SAGE_SM90_PER_WARP = _sage({90: ("sageattn_qk_int8_pv_fp8_cuda_sm90", "per_warp", "fp32+fp32")})
 KITCHEN = Local(kitchen_int8, _named("comfy_kitchen.int8_attention"))
 FLASHINFER = Local(flashinfer_mixed, _named("cute_dsl_fmha_ragged_prefill jit, e4m3 V per-head"))
 SAGE3 = Local(sage3_fp4, _named("sageattn3.sageattn3_blackwell(nvfp4, per_block_mean)"))

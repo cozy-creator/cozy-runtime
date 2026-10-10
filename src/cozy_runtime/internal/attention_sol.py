@@ -58,6 +58,9 @@ NAMES = frozenset(
         "kitchen-sol-fp4-lowmem",
         "kitchen-sol-producer-fast-shared-qkv",
         "kitchen-sol-producer-fp4-lowmem-shared-qkv",
+        "kitchen-sol-producer-sage2-shared-qkv",
+        "kitchen-sol-producer-sage2-per-warp-shared-qkv",
+        "kitchen-sol-producer-sage2-fp16pv-shared-qkv",
     }
 )
 _COUNTS: ContextVar[dict[str, int] | None] = ContextVar("cozy_sol_counts", default=None)
@@ -131,6 +134,10 @@ def bind_dense(call: Callable[..., Any], identity: str) -> None:
 
 
 def dense_identity(kernel: str = "sol-attn") -> str:
+    from cozy_runtime.internal.attention_producer import SAGE2_DENSE
+
+    if kernel in SAGE2_DENSE:
+        return SAGE2_DENSE[kernel][0] + "; sparse-prefix=kitchen-int8"
     if kernel in {"kitchen-sol-fp4-lowmem", "kitchen-sol-producer-fp4-lowmem-shared-qkv"}:
         return "sageattention3-fp4-global-lowmem; sparse-prefix=kitchen-int8"
     if kernel in {"kitchen-sol", "kitchen-sol-producer-fast-shared-qkv"}:

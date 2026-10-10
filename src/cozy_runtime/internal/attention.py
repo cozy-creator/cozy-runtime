@@ -210,6 +210,40 @@ PINNABLE: tuple[Candidate, ...] = (
             "budget refuses an FP8-P/V-class answer."
         ),
     ),
+    *(
+        Candidate(
+            name=name,
+            backend="_cozy_" + name.replace("-", "_"),
+            local=local,
+            min_sm=90,
+            max_sm=90,
+            sms=frozenset({90}),
+            dtypes=_HALF,
+            max_head_dim=128,
+            # All three explicit variants use one module build, so a warmed
+            # executor can change request pins without replacing imported code.
+            artifact="sageattention-full",
+            import_name="sageattention",
+            why=why,
+        )
+        for name, local, why in (
+            (
+                "sageattention-hopper-8bit-accurate",
+                upstream.SAGE,
+                "Explicit H100: per-thread INT8 Q/K, FP8 P/V, buffered FP32 accumulation.",
+            ),
+            (
+                "sageattention-hopper-8bit-per-warp",
+                upstream.SAGE_SM90_PER_WARP,
+                "Explicit H100 alternate: per-warp INT8 Q/K, FP8 P/V, same buffered FP32 accumulation.",
+            ),
+            (
+                "sageattention-hopper-mixed8-16",
+                upstream.SAGE_FP16PV,
+                "Explicit H100: per-thread INT8 Q/K, FP16 P/V, FP32 accumulation; generic SM80 family compiled for SM90.",
+            ),
+        )
+    ),
     Candidate(
         name="kitchen-int8",
         backend="_cozy_kitchen_int8",
@@ -320,13 +354,9 @@ PINNABLE += (
             name=name,
             backend="_cozy_" + name.replace("-", "_"),
             local=attention_producer.LOCALS[name],
-            min_sm=120 if name in attention_producer.FP4_LOWMEM else 80,
-            max_sm=121,
-            sms=(
-                frozenset({120, 121})
-                if name in attention_producer.FP4_LOWMEM
-                else frozenset(a * 10 + b for a, b in upstream.KITCHEN_SMS)
-            ),
+            min_sm=min(a * 10 + b for a, b in attention_producer.capabilities(name)),
+            max_sm=max(a * 10 + b for a, b in attention_producer.capabilities(name)),
+            sms=frozenset(a * 10 + b for a, b in attention_producer.capabilities(name)),
             dtypes=frozenset({"bfloat16"}),
             max_head_dim=128,
             head_dims=frozenset({128}),
@@ -508,8 +538,15 @@ def _resolve(candidate: Candidate, device: DeviceFacts, wait: bool = True) -> Re
         raise _BROKEN[(candidate.name, device)]
     _registry()
     artifact: dict[str, str] | None
-    if candidate.name in attention_kitchen_sol.FP4:
-        dense = BY_NAME["sageattention3-fp4-global-lowmem"]
+    if (
+        candidate.name in attention_kitchen_sol.FP4
+        or candidate.name in attention_producer.SAGE2_DENSE
+    ):
+        dense = BY_NAME[
+            attention_producer.SAGE2_DENSE[candidate.name][0]
+            if candidate.name in attention_producer.SAGE2_DENSE
+            else "sageattention3-fp4-global-lowmem"
+        ]
         artifacts = _compile_dependencies((candidate, dense), device, wait)
         dense_artifact = _resolve(dense, device, wait).artifact or {}
         artifact = {

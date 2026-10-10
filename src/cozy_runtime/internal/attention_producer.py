@@ -24,17 +24,40 @@ from cozy_runtime.internal import (
     attention_ulysses,
     attention_upstream,
 )
-from cozy_runtime.internal.attention_ulysses import Local
+from cozy_runtime.internal.attention_ulysses import Local, Options
 from cozy_runtime.internal.encoding import leaves
 from cozy_runtime.internal.encoding.leaves import PreQuantized
 
-NAMES = frozenset(
-    {"kitchen-sol-producer-fast-shared-qkv", "kitchen-sol-producer-fp4-lowmem-shared-qkv"}
+SAGE2_DENSE = {
+    "kitchen-sol-producer-sage2-shared-qkv": (
+        "sageattention-hopper-8bit-accurate",
+        attention_upstream.SAGE,
+    ),
+    "kitchen-sol-producer-sage2-per-warp-shared-qkv": (
+        "sageattention-hopper-8bit-per-warp",
+        attention_upstream.SAGE_SM90_PER_WARP,
+    ),
+    "kitchen-sol-producer-sage2-fp16pv-shared-qkv": (
+        "sageattention-hopper-mixed8-16",
+        attention_upstream.SAGE_FP16PV,
+    ),
+}
+NAMES = (
+    frozenset(
+        {"kitchen-sol-producer-fast-shared-qkv", "kitchen-sol-producer-fp4-lowmem-shared-qkv"}
+    )
+    | SAGE2_DENSE.keys()
 )
 REUSE = SHARED_QKV = NAMES
 FP4_LOWMEM = frozenset({"kitchen-sol-producer-fp4-lowmem-shared-qkv"})
 BACKENDS = {"_cozy_" + name.replace("-", "_"): name for name in NAMES}
 CHUNK = 4096
+
+
+def capabilities(name: str) -> tuple[tuple[int, int], ...]:
+    if name in SAGE2_DENSE:
+        return ((9, 0),)
+    return ((12, 0), (12, 1)) if name in FP4_LOWMEM else attention_upstream.KITCHEN_SMS
 
 
 @dataclass
@@ -226,7 +249,7 @@ class Processor:
             if operand.device.type == "cuda"
             else None
         )
-        admitted = ((12, 0), (12, 1)) if name in FP4_LOWMEM else attention_upstream.KITCHEN_SMS
+        admitted = capabilities(name)
         if capability not in admitted:
             raise ValueError(f"{name} does not support device capability {capability}")
         tokens = layout.live_tokens
@@ -328,6 +351,38 @@ def materialized_fp4_lowmem(query: Any, key: Any, value: Any, **options: Any) ->
     )
 
 
+def sage2_local(name: str) -> Local:
+    """An explicit dense recipe; the producer's sparse path is unchanged."""
+    dense_name, local = SAGE2_DENSE[name]
+
+    def dense(*, query: Any, key: Any, value: Any, scale: float | None) -> Any:
+        return attention_ulysses._call(
+            dense_name,
+            local,
+            query,
+            key,
+            value,
+            Options(attn_mask=None, dropout_p=0.0, is_causal=False, scale=scale, enable_gqa=False),
+        )
+
+    def forward(query: Any, key: Any, value: Any, **options: Any) -> Any:
+        return attention_sol._attention(
+            query,
+            key,
+            value,
+            **options,
+            sparse=_missing_processor,
+            dense=dense,
+            validate_device=attention_kitchen_sol.validate_device,
+        )
+
+    return Local(
+        forward,
+        lambda *_: f"dense={dense_name}; sparse=instance-producer",
+        head_local=False,
+    )
+
+
 FAST_LOCAL = Local(
     materialized_kitchen,
     lambda *_: "dense=comfy_kitchen.int8; sparse=instance-producer",
@@ -343,4 +398,5 @@ FP4_LOWMEM_LOCAL = Local(
 LOCALS = {
     "kitchen-sol-producer-fast-shared-qkv": FAST_LOCAL,
     "kitchen-sol-producer-fp4-lowmem-shared-qkv": FP4_LOWMEM_LOCAL,
+    **{name: sage2_local(name) for name in SAGE2_DENSE},
 }
