@@ -87,6 +87,7 @@ from .adaln_pruned import AdaLNPrunedMiniMaxH3Transformer
 from .conditioner import FinalHiddenState, PresentationLength, build_text_conditioner
 from .continuation import (
     CONTEXT_FRAMES,
+    SEAM_FRAMES,
     AVContext,
     CompletedTail,
     ContextReferenceLayout,
@@ -216,7 +217,9 @@ def _freeze_context_prefix(pipe: Any, state: Any, context: AVContext) -> int:
     """
     device = state.latents.device
     latents = context.video_latents.to(device)
-    noise = randn_tensor(latents.shape, generator=state.generator, device=device, dtype=torch.float32)
+    noise = randn_tensor(
+        latents.shape, generator=state.generator, device=device, dtype=torch.float32
+    )
     noised = pipe.scheduler.scale_noise(latents, pipe.keyframe_noise_aug, noise)
     rows = patchify_video_latents(noised, tuple(pipe.patch_size))
     start = int(state.num_condition_video_rows)
@@ -1776,7 +1779,9 @@ class OfficialH3Pipeline:
         pixel_std = torch.tensor(components.pixel_std, device=device).view(1, -1, 1, 1, 1)
         frames = 0
         delivery = state.get("continuation_delivery")
-        tail = CompletedTail(delivery) if delivery is not None else None
+        context = state.get("continuation_context")
+        seam = None if context is None else context.seam_rgb
+        tail = CompletedTail(delivery, seam) if delivery is not None else None
         with torch.no_grad():
             chunks = vae.decode_chunks(state.latents * latents_std + latents_mean)
             while True:
@@ -1835,6 +1840,7 @@ class OfficialH3Pipeline:
                 encoding.condition_latents[0].detach().float().cpu().contiguous(),
                 encoding.audio_condition_latents[0].detach().float().cpu().contiguous(),
             )
+        seam = raw.frames[-SEAM_FRAMES:].reshape(-1, 3).mean(axis=0) / 255
         return AVContext(
             encoded,
             int(raw.frames.shape[1]),
@@ -1842,6 +1848,7 @@ class OfficialH3Pipeline:
             raw.source_end_frame,
             provenance,
             max(encoded),
+            seam_rgb=(float(seam[0]), float(seam[1]), float(seam[2])),
         )
 
     def _run(self, task: Task, name: str, state: Any, *, component: str | None = None) -> None:

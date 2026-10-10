@@ -24,6 +24,8 @@ MAX_CONTEXT_FRAMES = 56
 MAX_CONTEXT_BYTES = 64 << 20
 MAX_CONTEXT_PIXELS = 1344 * 768
 CONTEXT_SCHEMA = "cozy.minimax-h3.av-context/2"
+#: Frames on each side of a seam whose mean colour anchors the continuation (`seam_rgb`).
+SEAM_FRAMES = 8
 
 
 def _refuse(message: str) -> NoReturn:
@@ -158,6 +160,9 @@ class AVContext:
     provenance: str
     frame_count: int = MAX_CONTEXT_FRAMES
     sample_rate: int = 32000
+    #: Mean RGB in [0, 1] of the delivered tail's last `SEAM_FRAMES`, the colour a successor's
+    #: first frames continue; None from a producer that predates it.
+    seam_rgb: tuple[float, float, float] | None = None
 
     def __post_init__(self) -> None:
         self.validate()
@@ -231,6 +236,7 @@ class AVContext:
             self.provenance,
             frames,
             self.sample_rate,
+            self.seam_rgb,
         )
 
 
@@ -260,6 +266,7 @@ def encode_context(context: AVContext) -> bytes:
             "frame_count": str(context.frame_count),
             "source_end_frame": str(context.source_end_frame),
             "provenance": context.provenance,
+            **({} if context.seam_rgb is None else {"seam_rgb": json.dumps(context.seam_rgb)}),
         },
     )
     if len(data) > MAX_CONTEXT_BYTES:
@@ -302,6 +309,7 @@ def decode_context(data: bytes) -> AVContext:
             metadata["provenance"],
             int(metadata["frame_count"]),
             int(metadata["sample_rate"]),
+            _seam_rgb(metadata.get("seam_rgb")),
         )
     except InvalidRequest:
         raise
@@ -309,6 +317,15 @@ def decode_context(data: bytes) -> AVContext:
         raise InvalidRequest(
             "invalid completed H3 AV context", code="h3_continuation", fields=["context"]
         ) from exc
+
+
+def _seam_rgb(value: str | None) -> tuple[float, float, float] | None:
+    if value is None:
+        return None
+    rgb = json.loads(value)
+    if not (isinstance(rgb, list) and len(rgb) == 3 and all(0 <= float(c) <= 1 for c in rgb)):
+        _refuse("context seam colour is invalid")
+    return (float(rgb[0]), float(rgb[1]), float(rgb[2]))
 
 
 def align_context_rows(state: Any, context: AVContext) -> None:
@@ -339,22 +356,48 @@ def align_context_rows(state: Any, context: AVContext) -> None:
 
 class CompletedTail:
     """The delivery window of a streamed decode. The consumer lands the delivered frames as
-    RGB8 for its output; the context tail is read back from that buffer, not copied twice."""
+    RGB8 for its output; the context tail is read back from that buffer, not copied twice.
 
-    def __init__(self, plan: ContinuationPlan) -> None:
+    With `seam_rgb` (the predecessor's delivered colour at the seam), the delivered frames
+    are shifted by the per-channel difference between it and the decoded head's last
+    `SEAM_FRAMES`: the VAE round trip of the frozen context head (`_freeze_context_prefix`)
+    darkens it by about two levels, the new frames continue that head, and the shift keeps
+    a chain of segments from stepping, or darkening, at every seam.
+    """
+
+    def __init__(
+        self, plan: ContinuationPlan, seam_rgb: tuple[float, float, float] | None = None
+    ) -> None:
         self.plan = plan
+        self.seam_rgb = seam_rgb
         self.seen = 0
         self.delivered = 0
         self.complete = False
+        self._head: torch.Tensor | None = None
+        self._head_pixels = 0
+        self.offset: torch.Tensor | None = None
 
     def push(self, chunk: torch.Tensor) -> torch.Tensor:
         if self.complete or chunk.ndim != 4 or chunk.shape[1] != 3:
             _refuse("continuation decode stream is invalid")
-        start = max(0, self.plan.delivery_start - self.seen)
-        end = min(int(chunk.shape[0]), self.plan.delivery_end - self.seen)
+        seen = self.seen
+        start = max(0, self.plan.delivery_start - seen)
+        end = min(int(chunk.shape[0]), self.plan.delivery_end - seen)
         self.seen += int(chunk.shape[0])
+        if self.seam_rgb is not None:
+            low = max(0, self.plan.delivery_start - SEAM_FRAMES - seen)
+            high = min(int(chunk.shape[0]), self.plan.delivery_start - seen)
+            if high > low:
+                sums = chunk[low:high].float().clamp(0, 1).sum(dim=(0, 2, 3))
+                self._head = sums if self._head is None else self._head + sums
+                self._head_pixels += (high - low) * int(chunk.shape[2]) * int(chunk.shape[3])
         selected = chunk[start : max(start, end)]
         self.delivered += int(selected.shape[0])
+        if selected.shape[0] and self._head is not None:
+            if self.offset is None:
+                seam = torch.tensor(self.seam_rgb, dtype=torch.float32, device=chunk.device)
+                self.offset = seam - self._head / self._head_pixels
+            selected = selected + self.offset.to(selected.dtype).view(1, 3, 1, 1)
         return selected
 
     def finish(self) -> None:

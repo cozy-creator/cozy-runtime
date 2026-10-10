@@ -23,6 +23,7 @@ from diffusers.modular_pipelines.modular_pipeline import PipelineState  # noqa: 
 
 from cozy_runtime.author import InvalidRequest  # noqa: E402
 from cozy_runtime.models.minimax_h3.continuation import (  # noqa: E402
+    SEAM_FRAMES,
     AVContext,
     CompletedTail,
     ContextReferenceLayout,
@@ -124,6 +125,46 @@ def test_streaming_tail_comes_from_delivered_end_not_sample_padding(prefix: int)
     assert tail.frames[-1, 0, 0, 0] != round((plan.sample_frames - 1) / 400 * 255)
 
 
+def test_delivered_frames_continue_the_predecessors_colour_at_the_seam() -> None:
+    """The decoded head reads 0.40 where the predecessor delivered 0.41 (G 0.30 vs 0.33):
+    every delivered frame shifts by that difference, the head is never delivered, and a
+    context from an older producer (no seam colour) changes nothing."""
+    plan = plan_continuation(120, context_frames=56)
+
+    def stream(seam: tuple[float, float, float] | None) -> tuple[CompletedTail, torch.Tensor]:
+        collector = CompletedTail(plan, seam)
+        parts = []
+        for first in range(0, plan.sample_frames, 13):  # chunks straddle the head's end
+            count = min(13, plan.sample_frames - first)
+            chunk = torch.empty(count, 3, 4, 8)
+            chunk[:, 0], chunk[:, 1], chunk[:, 2] = 0.40, 0.30, 0.20
+            chunk[:, :, 0, 0] = torch.arange(first, first + count).float()[:, None] / 1000
+            parts.append(collector.push(chunk))
+        collector.finish()
+        return collector, torch.cat(parts)
+
+    collector, delivered = stream((0.41, 0.33, 0.20))
+    assert len(delivered) == 120 and SEAM_FRAMES == 8
+    # One of each frame's 32 pixels carries its index: the head's last eight are frames 48-55.
+    head = torch.tensor([0.40, 0.30, 0.20]) * 31 / 32 + torch.arange(48, 56).float().mean() / 32000
+    assert torch.allclose(collector.offset, torch.tensor([0.41, 0.33, 0.20]) - head, atol=1e-6)
+    base = torch.tensor([0.40, 0.30, 0.20])
+    assert torch.allclose(delivered[:, :, 1:, 1:].mean(dim=(0, 2, 3)), base + collector.offset)
+    assert torch.allclose(delivered[0, :, 0, 0], 0.056 + collector.offset, atol=1e-6)
+    untouched, plain = stream(None)
+    assert untouched.offset is None and torch.equal(plain[:, :, 1:, 1:], torch.tensor(
+        [0.40, 0.30, 0.20]).view(1, 3, 1, 1).expand(120, 3, 3, 7))
+
+
+def test_seam_colour_survives_the_carrier_and_selection() -> None:
+    ctx = AVContext(
+        context().windows, 32, 64, 262, "model-and-inference-v1", 56, seam_rgb=(0.4, 0.3, 0.2)
+    )
+    decoded = decode_context(encode_context(ctx))
+    assert decoded.seam_rgb == (0.4, 0.3, 0.2) and decoded.select(22).seam_rgb == (0.4, 0.3, 0.2)
+    assert decode_context(encode_context(context())).seam_rgb is None
+
+
 @pytest.mark.parametrize("frames", [22, 39, 56])
 def test_context_is_the_frozen_head_of_one_window(frames: int) -> None:
     """One copy: the tail's video latents are the target's first latents, held at the anchors'
@@ -141,7 +182,10 @@ def test_context_is_the_frozen_head_of_one_window(frames: int) -> None:
     ctx = context(frames)
     latent_frames = 5 * ((frames - 5) // 17) + 2
     ticks = (frames * 5 + 2) // 3
-    refs = [MiniMaxH3ImageReference(image=np.zeros((32, 64, 3), dtype=np.uint8)), ContextReferenceLayout()]
+    refs = [
+        MiniMaxH3ImageReference(image=np.zeros((32, 64, 3), dtype=np.uint8)),
+        ContextReferenceLayout(),
+    ]
     conditions = [torch.zeros(1, 24, 1, 2, 4)]
     audios = [torch.zeros(2 * ticks, 32)]
     packed = MiniMaxH3Ref2VAPrepareLayoutStep.build_ref2va_packed_sequence(
@@ -197,7 +241,8 @@ def test_context_is_the_frozen_head_of_one_window(frames: int) -> None:
         MiniMaxH3LoopSchedulerStep()(components, block, i=index, t=timestep)
         assert torch.equal(block.latents[: cv + frozen], torch.cat([torch.ones(cv, 96), head]))
         assert torch.equal(block.audio_latents[:ca], torch.ones(ca, 32))
-    assert not torch.equal(block.latents[cv + frozen :], torch.ones_like(block.latents[cv + frozen :]))
+    generated = block.latents[cv + frozen :]
+    assert not torch.equal(generated, torch.ones_like(generated))
 
 
 def test_export_encodes_only_the_named_windows_of_the_landed_tail() -> None:
