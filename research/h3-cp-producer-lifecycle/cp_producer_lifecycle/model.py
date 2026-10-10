@@ -31,6 +31,10 @@ def tensor_hash(value: torch.Tensor) -> str:
 
 
 def stats_hash(pair: tuple[Any, Any]) -> list[str]:
+    if any(value.dtype != torch.float32 or value.shape != (1, 128) for value in pair):
+        raise RuntimeError("producer statistics must be one head of FP32 channels")
+    if not torch.isfinite(torch.stack(pair)).all():
+        raise RuntimeError("producer statistics must be finite")
     return [tensor_hash(value) for value in pair]
 
 
