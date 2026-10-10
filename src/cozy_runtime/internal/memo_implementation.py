@@ -97,5 +97,5 @@ def _native_identity(name: str) -> str | None:
             distribution.read_text("direct_url.json"),
             sys.implementation.cache_tag,
         )
-    except importlib.metadata.PackageNotFoundError:
+    except (importlib.metadata.PackageNotFoundError, OSError, TypeError, ValueError):
         return None

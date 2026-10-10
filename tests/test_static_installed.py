@@ -305,3 +305,26 @@ def test_a_changed_function_changes_only_its_own_identity(tmp_path: Path) -> Non
     )
     assert after["first"] == before["first"]
     assert after["second"] != before["second"]
+
+
+def test_imported_memo_metadata_failure_keeps_typed_unavailability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cozy_runtime.author import MemoDistribution
+    from cozy_runtime.internal.memo_implementation import describe
+
+    class BrokenDistribution:
+        version = "1.0"
+
+        def read_text(self, name: str) -> str:
+            raise OSError("metadata disappeared")
+
+    monkeypatch.setattr(importlib.metadata, "distribution", lambda _: BrokenDistribution())
+
+    def work(value: int) -> int:
+        return value * 2
+
+    setattr(work, "_cozy_memo_declaration", ("", (MemoDistribution("native-helper"),)))
+    assert describe(work) == {
+        "operation_identity_unavailable": "operation_native_identity_unavailable"
+    }
