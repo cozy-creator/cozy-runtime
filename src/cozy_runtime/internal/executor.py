@@ -641,6 +641,9 @@ class Executor:
         self.discovered: Any = None
         self.ready = False
         self.poisoned = ""
+        #: the current attempt's handler outcome, the stage it last reported and its record:
+        #: the reason an attempt whose tail raised still answers with (`unsettled`)
+        self.handled: tuple[Outcome, str, AuthorAttempt] | None = None
         self.constructed_model_digest = ""
         #: What the runtime pinned on this generation's attention sites (cr-124). One BOOT
         #: line, not a per-attempt record: the choice is a function of device and image.
@@ -695,9 +698,17 @@ class Executor:
             case PrepareRequest():
                 return self.serve_request(command)
             case Invoke():
-                return self._settled(self.serve_invoke(command))
+                try:
+                    return self._settled(self.serve_invoke(command))
+                except Exception as exc:
+                    key = command.construction or self.active
+                    return self.unsettled(self.constructions.get(key, self), exc)
             case RunJob():
-                return self._settled(self.run_job(command))
+                self.handled = None
+                try:
+                    return self._settled(self.run_job(command))
+                except Exception as exc:
+                    return self.unsettled(self, exc)
             case Probe():
                 if command.collect:
                     gc.collect()
@@ -3012,6 +3023,7 @@ class Executor:
         target = self._target(command, attempt=True)
         if isinstance(target, dict):
             return target
+        target.handled = None
         # Every attempt carries its grant; none (-1: an older Worker, or no reading) derives
         # from the driver, so a cut to 0 never outlives the attempt that follows it.
         if self.weights is not None and (
@@ -3203,10 +3215,13 @@ class Executor:
         segments: list[dict[str, Any]] = []
         later: list[attention.Applied] = []
         steps: dict[str, int] = {}
+        stage = [""]  # the last stage this attempt itself reported
         handler = threading.get_ident()
 
         def boundary(frame: Any) -> None:
             progress(frame)
+            if isinstance(frame, ProgressFrame) and frame.call_request is None and frame.stage:
+                stage[0] = frame.stage
             if not isinstance(frame, ProgressFrame) or threading.get_ident() != handler:
                 return
             if frame.position is not None:
@@ -3269,6 +3284,7 @@ class Executor:
             if record is None:
                 record = AuthorAttempt(command.request_id, spool, 0, sink=progress)
         assert record is not None
+        self.handled = (outcome, stage[0], record)
         stage_memo.ENGINE.close(record.emit)
         if later:
             # The override put back the run's first selection; the construction keeps its last.
@@ -3365,7 +3381,9 @@ class Executor:
             and not record.failed_at_call
             and outcome.code not in CAPACITY_CODES
         ):
-            self.poisoned = f"{outcome.terminal}/{outcome.code}"
+            self.poisoned = f"{outcome.terminal}/{outcome.code}" + (
+                f" in {stage[0]}" if stage[0] else ""
+            )
         terminal = {
             "terminal": outcome.terminal,
             "origin": outcome.origin,
@@ -3953,6 +3971,7 @@ class Executor:
                 activity=self._activity_sink(command.request_id),
             ),
         )
+        self.handled = (outcome, "", record)
         handler_ms = (time.perf_counter() - started) * 1000
         peak_vram = 0
         if self.torch is not None:
@@ -4889,6 +4908,35 @@ class Executor:
             "device_total_bytes": memory["driver_total_bytes"],
             "allocator_bytes": memory["allocated_bytes"],
             "reserved_bytes": memory["reserved_bytes"],
+        }
+
+    def unsettled(self, target: Executor, exc: Exception) -> dict[str, Any]:
+        """An attempt that raised outside its handler. A CUDA fault is sticky, so the tail's
+        first sync raises it again: the process cannot serve another attempt, and the reply
+        names the handler's own failure (else this one) and the stage it happened in."""
+        later = classify(exc)
+        first, stage, record = target.handled or (later, "", None)
+        first = first if first.terminal == "failed" else later
+        where = f" in {stage}" if stage else ""
+        message = first.message + where + ("" if first is later else f"; then {later.message}")
+        self.poisoned = target.poisoned = (
+            self.poisoned or target.poisoned or f"{first.code}{where}: {first.message}"[:300]
+        )
+        return {
+            "ok": True,
+            "outcome": {
+                "terminal": "failed",
+                "origin": first.origin,
+                "code": first.code,
+                "message": message[:2048],
+                "fields": list(first.fields),
+                "traceback": first.traceback or later.traceback,
+            },
+            "observations": record.ring.rows() if record is not None else [],
+            "quiescent": False,
+            "poisoned": self.poisoned,
+            "outputs": [],
+            "frames": [],
         }
 
     def _settled(self, reply: dict[str, Any]) -> dict[str, Any]:
