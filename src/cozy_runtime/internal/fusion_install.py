@@ -248,6 +248,9 @@ if not DIFFUSERS_ABSENT:
                 self.norm2.eps,
                 fp8=self._fusion_ff_fp8,
             )
+            # Both fused results own new storage; the attention branch is no longer
+            # read and need not stay live throughout the following FFN.
+            del attn_output
             # `ff.net` is [SwiGLU, Dropout(0.0), Linear]; the identity dropout is skipped so
             # the fused SwiGLU can hand the out projection its fp8 operand directly.
             ff_output = self.ff.net[2](self.ff.net[0](normed))
