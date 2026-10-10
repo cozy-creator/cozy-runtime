@@ -1,0 +1,1 @@
+Bundles TensorD 0.5.10: an invoke the executor refuses carries its own code and detail instead of an empty `executor_poisoned`, and an executor that ended on its own adds its exit status or signal to the reason (tensord#212).
