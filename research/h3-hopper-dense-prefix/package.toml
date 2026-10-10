@@ -1,0 +1,2 @@
+[application]
+object = "dense_prefix:app"
