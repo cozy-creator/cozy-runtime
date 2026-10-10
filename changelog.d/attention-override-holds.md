@@ -1,0 +1,1 @@
+A request's `--attention-kernel` holds its kernel for every step (per-step re-selection is for runs without an override) and, when that kernel is still compiling, waits for its build with run progress `waiting for <kernel> compile` and the build's fraction, naming the kernel asked for rather than its artifact; a failed build refuses the request with the build's reason.
