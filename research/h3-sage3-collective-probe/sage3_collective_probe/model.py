@@ -1,6 +1,6 @@
 """Tiny checkpoint admits a real Runtime group; its weights are not probe operands."""
 
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 from diffusers.models.modeling_utils import ModelMixin
@@ -12,7 +12,7 @@ class ProbeComponent(ModelMixin):
     # Runtime installs the real ParallelConfig and mirrors this root's forward.
     # No input split hook is needed: forward creates its own full deterministic data
     # and explicitly takes this rank's unequal token shard before Ulysses exchange.
-    _cp_plan = {"": {}}
+    _cp_plan: ClassVar[dict] = {"": {}}
     num_attention_heads = 56
 
     def __init__(self):

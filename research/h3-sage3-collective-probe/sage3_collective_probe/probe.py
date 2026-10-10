@@ -156,7 +156,7 @@ def run(seed, handle):
             del direct
             stages = {}
 
-            def compute(q, k, v):
+            def compute(q, k, v, *, candidate=candidate, stages=stages, reference=reference):
                 actual = capture(torch, api, (q, k, v), candidate)
                 for key in actual:
                     stages[key] = compared(torch, actual[key][0], reference[key][0, hs:he])
@@ -191,7 +191,7 @@ def run(seed, handle):
             else:
                 previous_full_output = full_output
             variants.append(row)
-            del reference, full_output
+            del compute, reference, full_output
         del previous_full_output
         callbacks = {
             "public": lambda q, k, v: baseline(q, k, v, scale=DIM**-0.5),
@@ -213,7 +213,9 @@ def run(seed, handle):
                             torch,
                             dist,
                             handle,
-                            lambda: attention_ulysses.exchange(*local, handle, callback),
+                            lambda callback=callback: attention_ulysses.exchange(
+                                *local, handle, callback
+                            ),
                         ),
                     }
                 )
@@ -222,7 +224,7 @@ def run(seed, handle):
                         "variant": name,
                         "repetition": repetition,
                         "scope": "full_head_reference_no_collective",
-                        **time_call(torch, dist, handle, lambda: callback(*full)),
+                        **time_call(torch, dist, handle, lambda callback=callback: callback(*full)),
                     }
                 )
         report = {
