@@ -13,7 +13,10 @@ import math
 from collections.abc import Callable, Collection
 from importlib import import_module
 from types import ModuleType
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from torch import Tensor
 
 from cozy_runtime.internal import attention_fp8
 from cozy_runtime.internal.attention_ulysses import Local, Options
@@ -500,16 +503,16 @@ def sage3_fp4_global_lowmem(query: Any, key: Any, value: Any, **options: Any) ->
 
 
 def sage3_fp4_fixed_means(
-    query: Any,
-    key: Any,
-    value: Any,
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
     *,
-    attn_mask: Any = None,
+    attn_mask: object = None,
     dropout_p: float = 0.0,
     is_causal: bool = False,
     scale: float | None = None,
     enable_gqa: bool = False,
-) -> Any:
+) -> Tensor:
     """Opt-in fixed means/centering, preserving Sage3's BF16 matmul correction."""
     _options("sageattention3-fp4-fixed-means", attn_mask, dropout_p, scale)
     _cuda_inputs(

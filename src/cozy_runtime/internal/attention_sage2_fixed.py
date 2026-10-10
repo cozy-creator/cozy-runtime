@@ -8,7 +8,11 @@ upstream's full-head mean. The same callable serves dense steps and protected qu
 from __future__ import annotations
 
 from importlib import import_module
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from torch import Tensor
+    from torch import device as TorchDevice
 
 from cozy_runtime.internal import attention_sol, attention_ulysses, attention_upstream
 from cozy_runtime.internal.attention_ulysses import Local, Options
@@ -18,7 +22,7 @@ SOL_NAME = "sol-attn-sage2-fixed-kmean"
 IMPLEMENTATION = "sageattn_qk_int8_pv_fp8_cuda_sm90(per_thread, fp32+fp32, fixed_kmean)"
 
 
-def _shape(query: Any, key: Any, value: Any) -> None:
+def _shape(query: Tensor, key: Tensor, value: Tensor) -> None:
     if any(t.ndim != 4 for t in (query, key, value)):
         raise ValueError("Fixed-Kmean Sage2 requires B/N/H/D tensors")
     if (
@@ -32,23 +36,23 @@ def _shape(query: Any, key: Any, value: Any) -> None:
         raise ValueError("Fixed-Kmean Sage2 requires B1, equal Q/KV heads, D128 and nonempty rows")
 
 
-def validate_device(device: Any) -> None:
+def validate_device(device: TorchDevice) -> None:
     torch = import_module("torch")
     if device.type != "cuda" or torch.cuda.get_device_capability(device) != (9, 0):
         raise ValueError("Fixed-Kmean Sage2 serves Hopper SM90 only")
 
 
 def forward(
-    query: Any,
-    key: Any,
-    value: Any,
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
     *,
-    attn_mask: Any = None,
+    attn_mask: object = None,
     dropout_p: float = 0.0,
     is_causal: bool = False,
     scale: float | None = None,
     enable_gqa: bool = False,
-) -> Any:
+) -> Tensor:
     import torch
 
     attention_upstream._options(DENSE_NAME, attn_mask, dropout_p, scale)
@@ -101,7 +105,7 @@ def forward(
 DENSE = Local(forward, lambda *_: IMPLEMENTATION)
 
 
-def dense(*, query: Any, key: Any, value: Any, scale: float | None) -> Any:
+def dense(*, query: Tensor, key: Tensor, value: Tensor, scale: float | None) -> Tensor:
     return attention_ulysses._call(
         "_cozy_sage2_fixed_kmean",
         DENSE,
@@ -112,7 +116,7 @@ def dense(*, query: Any, key: Any, value: Any, scale: float | None) -> Any:
     )
 
 
-def sparse_forward(query: Any, key: Any, value: Any, **options: Any) -> Any:
+def sparse_forward(query: Tensor, key: Tensor, value: Tensor, **options: Any) -> Tensor:
     # No replacement sparse math: the existing CuTe kernel and model layout stay authoritative.
     return attention_sol._attention(
         query,

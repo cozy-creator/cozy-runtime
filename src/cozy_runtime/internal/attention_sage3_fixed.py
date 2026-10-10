@@ -8,7 +8,11 @@ from __future__ import annotations
 
 import functools
 from importlib import import_module
-from typing import Any
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from torch import Tensor
+    from triton.runtime.jit import JITFunction
 
 TOKEN_TILE = 256
 CHANNEL_TILE = 32
@@ -16,7 +20,7 @@ CENTER_TILE = 16
 
 
 @functools.cache
-def _kernels() -> tuple[Any, Any, Any]:
+def _kernels() -> tuple[JITFunction, JITFunction, JITFunction]:
     import triton
     import triton.language as tl
 
@@ -127,7 +131,9 @@ def _kernels() -> tuple[Any, Any, Any]:
     return partial_mean, finish_mean, center_and_correct
 
 
-def fixed_preprocess(q: Any, k: Any, v: Any, *, fixed_correction: bool = False) -> dict[str, Any]:
+def fixed_preprocess(
+    q: Tensor, k: Tensor, v: Tensor, *, fixed_correction: bool = False
+) -> dict[str, Tensor]:
     """B1/BF16/NHD/D128 to owned contiguous HND values and explicit BF16 means."""
     import torch
     import triton
@@ -220,7 +226,7 @@ def fixed_preprocess(q: Any, k: Any, v: Any, *, fixed_correction: bool = False) 
     return {"q": outputs[0], "k": outputs[1], "v": outputs[2], "qm": qm, "km": km, "delta": delta}
 
 
-def forward(q: Any, k: Any, v: Any, *, fixed_correction: bool = False) -> Any:
+def forward(q: Tensor, k: Tensor, v: Tensor, *, fixed_correction: bool = False) -> Tensor:
     """Preserve the public quantizers/attention and short centered-buffer lifetimes."""
     api = import_module("sageattn3.api")
     tokens = q.shape[1]

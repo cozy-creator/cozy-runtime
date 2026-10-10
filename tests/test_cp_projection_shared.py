@@ -9,7 +9,10 @@ import pytest
 torch = pytest.importorskip("torch")
 pytest.importorskip("diffusers")
 from cozy_runtime.internal import attention_producer as producer  # noqa: E402
-from cozy_runtime.internal.encoding.leaves import PreQuantized, quantize_activation_rowwise  # noqa: E402
+from cozy_runtime.internal.encoding.leaves import (  # noqa: E402
+    PreQuantized,
+    quantize_activation_rowwise,
+)
 from test_shared_qkv_activation import projections  # noqa: E402
 
 

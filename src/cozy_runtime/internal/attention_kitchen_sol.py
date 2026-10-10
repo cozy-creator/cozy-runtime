@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from importlib import import_module
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from torch import Tensor
 
 from cozy_runtime.internal import attention_sol, attention_ulysses, attention_upstream
 from cozy_runtime.internal.attention_ulysses import Local, Options
@@ -60,7 +63,9 @@ def dense_fp4_lowmem(*, query: Any, key: Any, value: Any, scale: float | None) -
     )
 
 
-def dense_fp4_fixed_means(*, query: Any, key: Any, value: Any, scale: float | None) -> Any:
+def dense_fp4_fixed_means(
+    *, query: Tensor, key: Tensor, value: Tensor, scale: float | None
+) -> Tensor:
     return attention_ulysses._call(
         "_cozy_sage3_fp4_fixed_means",
         attention_upstream.SAGE3_FIXED_MEANS,

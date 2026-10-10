@@ -1,17 +1,30 @@
-# Opt-in H3 CP producer integration — preparation
+# Opt-in H3 attention across GPU partitions
 
-The raw Kitchen producer fixture (run5249, public Runtime0.23.5/TensorFS0.6.1, twoRTX5090s) produced exact full56/head28 outputs, bootstrap/previous-step statistics, transport and repeats. It did not execute H3 projections, module hooks or the real model's split rotary presentation.
+These recipes keep attention reductions and request state consistent when Ulysses changes the number of GPU partitions. They are explicit selections; H3's automatic preferences and its Turbo 4 dense + 4 sparse schedule are unchanged.
 
-This isolated task will compose CP support into the existing explicit fixed-mean producer recipe from PR1290. Current published attention defaults and single-GPU producer behavior stay unchanged.
+| Hardware | Dense selection | Dense + sparse selection |
+|---|---|---|
+| RTX 5090 / SM120 | `sageattention3-fp4-fixed-means` | `kitchen-sol-producer-fp4-fixed-means-shared-qkv` |
+| H100 / SM90 | `sageattention-fixed-kmean` | `sol-attn-sage2-fixed-kmean` |
 
-Required boundaries: keep full H3 rotary tables per request and component BEFORE the Diffusers CP split hook, without a per-block all-gather; project raw local QKV through the original modules and hooks; use actual Ulysses to obtain global rows/local heads; invoke existing Kitchen sol_attn_chunked with global4096-row chunks, original RMS/RoPE/prefix/margin and per-rank prior statistics; inverse output then original projection. Clear request state and preserve replay input statistics.
+For example, select the RTX hybrid on an ordinary request with `--attention-kernel=base_model/fl2va_dit=kitchen-sol-producer-fp4-fixed-means-shared-qkv`. Select the Hopper hybrid with `--attention-kernel=base_model/fl2va_dit=sol-attn-sage2-fixed-kmean`. The request's model layout supplies the dense/sparse schedule; a kernel selection does not change the number of denoising steps.
 
-CPU hook-order/group-lifecycle tests and a bounded ordinary-CLI integration probe must cover the real projection boundary, including encoded operands and LoRA. Raw-QKV identity alone is not a full-model or speed qualification. No defaults are switched by this preparation, and no GPU request is authorized here.
+## RTX producer path
 
-The implemented opt-in name is `kitchen-sol-producer-fp4-fixed-means-shared-qkv`; no additional selector is introduced. Its single-GPU and multi-GPU paths use the same existing Kitchen producer. The published default producer recipes remain context-parallel-ineligible and the H3 preference lists are unchanged.
+Dense attention uses SageAttention3 NVFP4 with fixed Q/K mean reductions and the upstream BF16 correction. Sparse attention uses the existing Kitchen INT8 producer, including its RMSNorm, RoPE, protected prefix, scale margin and previous-step statistics.
 
-Full rotary ownership uses an opaque component token and a Diffusers ModelHook registered before the CP split hook. It retains references only during an active sparse opt-in call; ordinary PyTorch forward hooks would see already-split output and are not used. The real two-process Gloo check verifies full129-row tables against local65/64-row views, same storage, two components, nesting and next-request cleanup.
+The multi-GPU path projects each local token shard through the original modules and LoRA hooks. Eligible FP8 projections share one activation quantization across the three original Q/K/V calls, without an additional packed output buffer. Existing fallback semantics remain for other projection types and hooks. Ulysses exchanges the projected tensors into complete token sequences for each rank's head group; Kitchen consumes global 4096-row chunks, and the inverse exchange restores local token ownership before the output projection.
 
-Follower state is owned by the existing Attention selection hold for the whole attempt, selected from actual held recipes even with an empty CLI pin. Each mirrored RunCommand borrows that state. Restore, new selection, refusal and matching-construction unload clear it. The new recipe retains the original per-site statistics inputs for same-step retries; this behavior is confined to the opt-in recipe and does not silently merge the older public producer replay proposal.
+A Diffusers hook retains each component's complete rotary tables before the context-parallel split. It holds references only during the sparse request and avoids a per-block rotary all-gather. Followers borrow producer state from the existing attention-selection hold for the attempt. Restore, new selection, refusal and matching-construction unload clear it; same-step retries reuse the original statistics inputs.
 
-Validation includes actual follower RunCommands at steps4/5, later-call OOM replay, fresh next-attempt step6, actual RankGroup/follower-process restoration after body failure/cancellation, and source typing. Local projection assembly is `_project_qkv`: original modules/encoded operands/LoRA hooks, bounded chunks copied into one local packed buffer, then Q/K/V views for exchange. The separate GPU projection and lifecycle fixtures remain required before a serving or performance qualification.
+## Hopper path
+
+SageAttention2 keeps its INT8 Q/K and FP8 P/V arithmetic, with a fixed K-mean reduction. The hybrid uses that same dense implementation for both dense steps and the protected prefix of BF16 CuTe sparse steps. CuTe's sparse arithmetic is unchanged. The fixed reduction matched the tested head partitions in isolated H100 tests; full-video Hopper qualification remains pending.
+
+## Evidence and limits
+
+An earlier private build of the RTX implementation produced byte-identical delivered MP4 files for one 15-second Turbo input across actual one-GPU run 5315 and two-GPU runs 5307/5308. All 362 decoded RGB frames and decoded audio samples also matched. This was a retrospective comparison across different hosts and drivers, so its timings are not a controlled speed comparison. Only the single-GPU run retained pre-encoding diagnostics; equality of every intermediate tensor is not established.
+
+Separate GPU probes covered dense reductions, sparse statistics, FP8 projections with inactive/baked/unbaked LoRA, real two-rank exchange, retries and request cleanup. The faster shared-projection candidate reduced complete sparse-attention time from 213.09 ms to 195.46 ms in three paired samples on the tested two-5090 host. That is an attention-operation measurement, not a full-video speed claim.
+
+The current integration preserves newer Runtime copy-engine routing and int64 quantizer offsets. Earlier private RTX evidence does not qualify this integrated head or a newly selected transport. CPU/source checks, actual transport receipts and any integrated GPU evidence must be reported separately. These results do not establish universal determinism across kernels, inputs or GPU counts, nor unchanged quality against the older approved clip with a different prompt.

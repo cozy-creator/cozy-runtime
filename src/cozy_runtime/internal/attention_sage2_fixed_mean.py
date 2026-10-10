@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from torch import Tensor
 
 import triton
 import triton.language as tl
@@ -61,7 +64,7 @@ def finish_mean(  # type: ignore[no-untyped-def]
     tl.store(M + head * D + channel, mean.to(tl.bfloat16), mask=channel < D)
 
 
-def mean(k: Any) -> Any:
+def mean(k: Tensor) -> Tensor:
     import torch
 
     if k.ndim != 4 or k.shape[0] != 1 or k.shape[-1] != 128:

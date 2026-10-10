@@ -15,7 +15,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from importlib import import_module
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT, AttentionLayout
 from cozy_runtime.internal import (
@@ -27,6 +27,12 @@ from cozy_runtime.internal import (
 from cozy_runtime.internal.attention_ulysses import Local
 from cozy_runtime.internal.encoding import leaves
 from cozy_runtime.internal.encoding.leaves import PreQuantized
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from diffusers.models.transformers.transformer_minimax_h3 import MiniMaxH3Attention
+    from torch import Tensor
 
 NAMES = frozenset(
     {
@@ -50,15 +56,15 @@ CHUNK = 4096
 
 @dataclass
 class RequestState:
-    statistics: dict[tuple[object, ...], tuple[int, tuple[int, ...], Any, Any]] = field(
-        default_factory=dict
-    )
+    statistics: dict[
+        tuple[object, ...], tuple[int, tuple[int, ...], Tensor | None, Tensor | None]
+    ] = field(default_factory=dict)
     # One rotary presentation is shared by all blocks of the current step.
-    rope: tuple[Any, Any, Any] | None = None
-    parallel_rotary: dict[object, tuple[Any, Any]] = field(default_factory=dict)
-    replay_inputs: dict[tuple[object, ...], tuple[int, tuple[int, ...], Any, Any]] = field(
-        default_factory=dict
-    )
+    rope: tuple[Tensor, Tensor, Tensor] | None = None
+    parallel_rotary: dict[object, tuple[Tensor, Tensor]] = field(default_factory=dict)
+    replay_inputs: dict[
+        tuple[object, ...], tuple[int, tuple[int, ...], Tensor | None, Tensor | None]
+    ] = field(default_factory=dict)
 
     def clear(self) -> None:
         self.statistics.clear()
@@ -187,7 +193,7 @@ def previous_statistics(
     reuse: bool,
     *,
     replay_safe: bool = False,
-) -> tuple[Any, Any]:
+) -> tuple[Tensor | None, Tensor | None]:
     # Only the opt-in CP recipe changes replay semantics. A later projection or
     # another rank may fail after this site succeeded; retry its original inputs.
     held = state.replay_inputs.get(key) if replay_safe else None
@@ -320,16 +326,16 @@ class Processor:
 
 
 def _produce(
-    attn: Any,
+    attn: MiniMaxH3Attention,
     layout: AttentionLayout,
     state: RequestState,
     key: tuple[object, ...],
     name: str,
     heads: int,
     geometry: tuple[int, ...],
-    freqs: Any,
-    chunks: Any,
-) -> tuple[Any, bool]:
+    freqs: Tensor,
+    chunks: Callable[[], Iterator[Tensor]],
+) -> tuple[Tensor, bool]:
     prior_mean, prior_scale = previous_statistics(
         state, key, layout.step, geometry, name in REUSE, replay_safe=name in CP_NAMES
     )
@@ -354,8 +360,11 @@ def _produce(
 
 
 def _project_qkv(
-    attn: Any, hidden: Any, tokens: int, counts: dict[str, int] | None = None
-) -> tuple[Any, Any, Any]:
+    attn: MiniMaxH3Attention,
+    hidden: Tensor | PreQuantized,
+    tokens: int,
+    counts: dict[str, int] | None = None,
+) -> tuple[Tensor, Tensor, Tensor]:
     """Project a local shard with one shared quantization and no QKV packing copy.
 
     Original module calls retain residency and Turbo hooks. The LoRA hook already
@@ -389,15 +398,15 @@ def _project_qkv(
 
 
 def _parallel_produce(
-    attn: Any,
-    hidden: Any,
-    config: Any,
+    attn: MiniMaxH3Attention,
+    hidden: Tensor | PreQuantized,
+    config: object,
     name: str,
     layout: AttentionLayout,
     state: RequestState,
     key: tuple[object, ...],
     counts: dict[str, int],
-) -> tuple[Any, bool]:
+) -> tuple[Tensor, bool]:
     import torch
     import torch.distributed as dist
 
@@ -416,10 +425,10 @@ def _parallel_produce(
     heads = attn.heads // degree
     reuse = False
 
-    def compute(q: Any, k: Any, v: Any) -> Any:
+    def compute(q: Tensor, k: Tensor, v: Tensor) -> Tensor:
         nonlocal reuse
 
-        def chunks() -> Iterator[Any]:
+        def chunks() -> Iterator[Tensor]:
             for start in range(0, tokens, CHUNK):
                 yield torch.cat(
                     [x[:, start : start + CHUNK].flatten(2, 3) for x in (q, k, v)], dim=-1
@@ -441,7 +450,7 @@ def _parallel_produce(
     return attention_ulysses.exchange(query, key_tensor, value, handle, compute), reuse
 
 
-def install_parallel_rotary(component: Any) -> None:
+def install_parallel_rotary(component: object) -> None:
     """Retain H3's replicated RoPE before Diffusers' subsequently installed split hook.
 
     The hook returns its output unchanged. Only an active sparse call using the
@@ -467,7 +476,7 @@ def install_parallel_rotary(component: Any) -> None:
         module._cozy_producer_rotary_key = key
 
     class RetainRotary(ModelHook):  # type: ignore[misc]  # optional untyped Diffusers hook API
-        def post_forward(self, module: Any, output: Any) -> Any:
+        def post_forward(self, module: object, output: object) -> object:
             state, layout = _STATE.get(), _ACTIVE_LAYOUT.get()
             if state is None or layout is None or layout.step < layout.dense_until_step:
                 return output
@@ -537,7 +546,9 @@ def materialized_fp4_lowmem(query: Any, key: Any, value: Any, **options: Any) ->
     )
 
 
-def materialized_fp4_fixed_means(query: Any, key: Any, value: Any, **options: Any) -> Any:
+def materialized_fp4_fixed_means(
+    query: Tensor, key: Tensor, value: Tensor, **options: Any
+) -> Tensor:
     return attention_sol._attention(
         query,
         key,
