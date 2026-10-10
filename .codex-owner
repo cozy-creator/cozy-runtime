@@ -1,0 +1,4 @@
+owner=/root/reaudit_creator_resume
+purpose=CPU-only host pressure relief
+branch=fix/host-pressure-relief-20260929
+base=0596c2050cd5f378164ef8d73d7c722cd3d98501
