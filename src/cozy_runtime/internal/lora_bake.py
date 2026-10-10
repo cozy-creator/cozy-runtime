@@ -8,18 +8,22 @@ reads: how much of the delta survived and how much rounding error the bake added
 
 On a GPU, `bake` is one fused Triton kernel per weight (`_bake_kernel`): it reads each stored
 byte once, adds the rank-r product computed in its tile, rounds and writes the byte back, with
-counter-based noise (one stream per weight, by element index). The eager row-chunk functions
-are its reference on CPU and what `Stats` measures.
+counter-based noise (one stream per weight, by element index). The kernel is compiled and
+checked in a child process (`warm`); this process only loads it from Triton's cache. The eager
+row-chunk functions are its reference on CPU, what `Stats` measures, and what a GPU bakes with
+when the child failed.
 """
 
 from __future__ import annotations
 
+import json
 import math
+import subprocess
+import sys
+import tempfile
 import time
-from collections.abc import Iterable
 from dataclasses import dataclass
-from functools import partial
-from typing import Any, Literal
+from typing import IO, Any, Literal
 
 from cozy_runtime.internal.encoding import E4M3_MAX, E8M0_BIAS, MX_BLOCK
 
@@ -397,7 +401,7 @@ def bake(
     most of a LoRA's effect on fp8 (MEASURE.md, cozy-machine #26). `seed` names the weight's
     noise. A GPU bakes fused unless `stats` are asked for (the eager reference measures them)."""
     device = next(iter(stored.values())).device
-    if stats is None and device.type == "cuda" and FUSED_ERROR is None:
+    if stats is None and device.type == "cuda" and _ready(device.index or 0):
         fused(torch, stored, down, up, seed)
         return
     generator = torch.Generator(device=device).manual_seed(seed & SEED_MASK)
@@ -452,15 +456,17 @@ BF16, F16, F32, ROWWISE, MX = range(5)
 SEED_MASK = 0x7FFFFFFF
 _TILE = 64
 _INNER = 16
-#: Why this process bakes eagerly on its GPU, or None (`warm`).
+#: Why this process bakes eagerly on its GPU, or None; whether a GPU here bakes (`warm`); whether
+#: its kernels are built and checked; the child building them and the file holding its output.
 FUSED_ERROR: str | None = None if triton is not None else "triton does not import"
-
-
-def form(roles: dict[str, str]) -> int:
-    """The fused kernel's form of a `bakeable` stored weight (role -> TensorFS dtype)."""
-    if set(roles) == {"value"}:
-        return {"bf16": BF16, "f16": F16, "f32": F32}[roles["value"]]
-    return ROWWISE if roles["scale"] == "f32" else MX
+_TRIED = _BUILT = False
+_BUILD: tuple[subprocess.Popen[bytes], IO[bytes]] | None = None
+_CHECK = (
+    "import json, sys; boot = json.loads(sys.argv[1]); sys.path[:] = boot['path']\n"
+    "import torch\n"
+    "from cozy_runtime.internal import lora_bake\n"
+    "lora_bake.check(torch, torch.device('cuda', boot['device']))\n"
+)
 
 
 def fused(torch: Any, stored: dict[str, Any], down: Any, up: Any, seed: int) -> None:
@@ -484,26 +490,73 @@ def fused(torch: Any, stored: dict[str, Any], down: Any, up: Any, seed: int) -> 
     )  # fmt: skip
 
 
-def warm(torch: Any, device: Any, forms: Iterable[int]) -> None:
-    """Compile the fused bake of each stored form for `device` now (at load), so no request
-    compiles it. A kernel that does not build leaves this process baking eagerly, recorded in
-    `FUSED_ERROR`."""
-    global FUSED_ERROR
-    if FUSED_ERROR is not None:
-        return
-    zeros = partial(torch.zeros, device=device)
-    for kind in sorted(set(forms)):
+def warm(device: int) -> None:
+    """Start building every fused form for GPU `device`, and checking its numbers (`check`), in
+    a child process under this one's interpreter and import path, once per process at load.
+    This process then only loads the kernels from Triton's cache: it never runs a compiler, so
+    one that crashes ends the child, and this process bakes eagerly with its reason."""
+    global _BUILD, _TRIED
+    _TRIED = True
+    if FUSED_ERROR is None and not _BUILT and _BUILD is None:
+        log = tempfile.TemporaryFile()  # noqa: SIM115 - read and closed with the build (`_ready`)
+        boot = json.dumps({"path": sys.path, "device": device})
+        command = [sys.executable, "-I", "-c", _CHECK, boot]
+        _BUILD = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log, stderr=log), log
+
+
+def _ready(device: int, wait: bool = True) -> bool:
+    """Whether this process bakes fused: the build `warm` started (now, when none did) ended
+    well. Waits for it unless `wait` is False."""
+    global FUSED_ERROR, _BUILT, _BUILD
+    if FUSED_ERROR is None and not _BUILT:
+        warm(device)
+        assert _BUILD is not None
+        child, log = _BUILD
+        if child.poll() is None and not wait:
+            return False
+        code = child.wait()
+        log.seek(0)
+        said = log.read().decode(errors="replace").strip().splitlines()
+        log.close()
+        _BUILD, _BUILT = None, code == 0
+        if code:
+            how = f"killed by signal {-code}" if code < 0 else f"exit {code}"
+            FUSED_ERROR = f"bake kernel build {how}" + (f": {said[-1]}" if said else "")[:300]
+    return FUSED_ERROR is None
+
+
+def mode() -> dict[str, str]:
+    """How this process bakes on its GPU, once a build has ended (`modes.lora_bake`)."""
+    if _BUILD is not None:
+        _ready(0, wait=False)
+    if _BUILT:
+        return {"lora_bake": "fused"}
+    return {"lora_bake": f"eager ({FUSED_ERROR})"} if FUSED_ERROR and _TRIED else {}
+
+
+def check(torch: Any, device: Any) -> None:
+    """Bake every form on `device` where the result is exact (0.25 + 24 * +-1/32 is 1.0 or
+    -0.5, over partial tiles and two inner steps): one stored value off it is a broken kernel."""
+    rows, cols, rank = 70, 96, 24
+    up = torch.full((rows, rank), 1 / 32, device=device)
+    up[1::2] = -1 / 32
+    down = torch.ones((rank, cols), device=device)
+    want = torch.tensor([1.0, -0.5], device=device).repeat(rows // 2)[:, None].expand(rows, cols)
+    for kind in range(5):
         if kind in (ROWWISE, MX):
-            scale = zeros(1) + 1 if kind == ROWWISE else zeros((1, 1), dtype=torch.uint8) + 127
-            stored = {"data": zeros((1, 32), dtype=torch.float8_e4m3fn), "scale": scale}
+            data = torch.full((rows, cols), 0.5, device=device).to(torch.float8_e4m3fn)
+            scale = torch.full((rows,), 0.5, device=device)
+            if kind == MX:  # an exponent byte 2^-1 per block of 32 columns
+                scale = torch.full((rows, cols // 32), E8M0_BIAS - 1, device=device).byte()
+            stored = {"data": data, "scale": scale}
         else:
             dtype = (torch.bfloat16, torch.float16, torch.float32)[kind]
-            stored = {"value": zeros((1, 32), dtype=dtype)}
-        try:
-            fused(torch, stored, zeros((1, 32)), zeros((1, 1)), 0)
-        except Exception as exc:
-            FUSED_ERROR = f"{type(exc).__name__}: {exc}".splitlines()[0][:300]
-            return
+            stored = {"value": torch.full((rows, cols), 0.25, dtype=dtype, device=device)}
+        fused(torch, stored, down, up, kind)
+        got = stored["value"].float() if "value" in stored else decode_e4m3(torch, data) * 0.5
+        if not torch.equal(got, want):
+            wrong = int((got != want).sum())
+            raise RuntimeError(f"the fused bake of form {kind} stored {wrong} values off the grid")
 
 
 #: Never specialized on a value or an address's alignment: one compiled kernel per form serves

@@ -1297,7 +1297,7 @@ class Weights:
             squeezed=dict(self.squeezes),
             paged_out=self.paged_out[0],
             paged_out_bytes=self.paged_out[1],
-            modes=dict(self.modes),
+            modes={**self.modes, **lora_bake.mode()},
         )
 
 
@@ -2625,17 +2625,8 @@ class PlaneBackend:
             region.bakes = _lora_layers(root, region)
             region.bake = _bakes_here(weights, component, region)
             region.locate = weights.content
-        forms = {
-            lora_bake.form({role: dtype for role, (_, dtype, _) in weight.parts.items()})
-            for region in regions
-            if region.bake
-            for weight in (region.weights[bake.weight] for bake in region.bakes)
-        }
-        if forms:  # its kernel builds now, at load: a request never compiles it
-            lora_bake.warm(self.torch, weights.device, forms)
-            weights.modes["lora_bake"] = (
-                "fused" if lora_bake.FUSED_ERROR is None else f"eager ({lora_bake.FUSED_ERROR})"
-            )
+        if any(region.bake for region in regions):  # its kernels build at load, in a child
+            lora_bake.warm(weights.device.index or 0)
         if not fine:
             weights.attach(component)
         return component
