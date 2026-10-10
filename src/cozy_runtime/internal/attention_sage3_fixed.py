@@ -35,8 +35,9 @@ def _kernels() -> tuple[Any, Any, Any]:
         BT: tl.constexpr,
         BC: tl.constexpr,
     ):
-        head, channel_tile, tile = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-        token = tile * BT + tl.arange(0, BT)
+        head = tl.program_id(0).to(tl.int64)
+        channel_tile, tile = tl.program_id(1), tl.program_id(2)
+        token = (tile * BT + tl.arange(0, BT)).to(tl.int64)
         channel = channel_tile * BC + tl.arange(0, BC)
         values = tl.load(
             X + token[:, None] * stride_t + head * stride_h + channel[None, :],
@@ -56,7 +57,8 @@ def _kernels() -> tuple[Any, Any, Any]:
         REDUCE: tl.constexpr,
         BC: tl.constexpr,
     ):
-        head, channel_tile = tl.program_id(0), tl.program_id(1)
+        head = tl.program_id(0).to(tl.int64)
+        channel_tile = tl.program_id(1)
         tile = tl.arange(0, REDUCE)
         channel = channel_tile * BC + tl.arange(0, BC)
         partial = tl.load(
@@ -93,8 +95,9 @@ def _kernels() -> tuple[Any, Any, Any]:
         BT: tl.constexpr,
         FIXED_CORRECTION: tl.constexpr,
     ):
-        head, tile = tl.program_id(0), tl.program_id(1)
-        token = tile * BT + tl.arange(0, BT)
+        head = tl.program_id(0).to(tl.int64)
+        tile = tl.program_id(1)
+        token = (tile * BT + tl.arange(0, BT)).to(tl.int64)
         channel = tl.arange(0, D)
         source_q = token[:, None] * qt + head * qh + channel[None, :]
         source_k = token[:, None] * kt + head * kh + channel[None, :]
