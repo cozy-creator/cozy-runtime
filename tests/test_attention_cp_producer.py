@@ -5,7 +5,7 @@ from __future__ import annotations
 import socket
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import msgspec
 import pytest
@@ -96,7 +96,7 @@ def test_real_follower_commands_share_attempt_state_and_restore_clears(tmp_path:
             args=[step],
             kwargs={"fail": fail},
         )
-        return follower.run(msgspec.json.decode(msgspec.json.encode(command)))
+        return cast(dict[str, Any], follower.run(msgspec.json.decode(msgspec.json.encode(command))))
 
     try:
         first = call(4)
@@ -112,14 +112,16 @@ def test_real_follower_commands_share_attempt_state_and_restore_clears(tmp_path:
         assert follower._producer_hold is not None and state.statistics
         assert follower.select_attention(Attention(construction="proof"))["ok"]
         assert not state.statistics and not state.replay_inputs and not state.parallel_rotary
-        assert follower._producer_hold is None
+        cleared = follower._producer_hold
+        assert cleared is None
         assert follower.select_attention(Attention(construction="proof", pin=""))["ok"]
         assert follower._producer_hold is not None
         fresh = follower._producer_hold[1]
         assert fresh is not state and not fresh.statistics
         assert call(6)["ok"] and root.inputs[-1] == (None, None)
         refused = follower.select_attention(Attention(construction="proof", pin="unknown-kernel"))
-        assert not refused["ok"] and not fresh.statistics and follower._producer_hold is None
+        cleared = follower._producer_hold
+        assert not refused["ok"] and not fresh.statistics and cleared is None
         assert follower.select_attention(Attention(construction="proof", pin=""))["ok"]
         assert follower._producer_hold is not None
         fresh = follower._producer_hold[1]
