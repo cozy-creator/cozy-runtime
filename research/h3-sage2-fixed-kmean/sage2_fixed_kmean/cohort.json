@@ -1,0 +1,15 @@
+{
+  "runtime_version": "0.23.4+dev.sage2variants.47c69bfc.422c01ec",
+  "tensorfs_version": "0.6.1",
+  "wheel_sha256": "41b783d0b215f749faded231259e9cf81e371872ddd925275a453beb73fb074f",
+  "source_sha256": {
+    "internal/attention.py": "2fe73d01a2b97f186802d1b2db6344855789000f047425957c0bb4d1edf7e09d",
+    "internal/attention_producer.py": "a868496e993d4ca612ff2e81cf3b8ed0a85f2c6b6b83ffd8506c0b636d56494d",
+    "internal/attention_sol.py": "2c5295238a1d9bea68e292a79084ae47d0375bb992a9af3a42f88f7fd01a7ca7",
+    "internal/attention_upstream.py": "07fa3733ce9bd94921735ca4377b946c78905dd4ad74d52dad1aa5aaa1800cc5",
+    "internal/attention_ulysses.py": "0423ec5a9fc46c5d8a82b0a4b9ca6ddf1bf87a96ce0f13ec09ed89bc08fc47dd",
+    "internal/kernel_sources.py": "4473f6d6484249db4830059d2fee04af2102bdf4b9460ff3554db69a2ce5fcdc",
+    "_kernels/_C.abi3.so": "06dd8828d620334912b97bc5bf1ef6ba363d4586ccab882b79b4e4a0d7d7e812"
+  },
+  "status": "Research fixture frozen to reviewed candidate; no GPU qualification implied."
+}
