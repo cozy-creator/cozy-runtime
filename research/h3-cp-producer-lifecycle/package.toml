@@ -1,0 +1,2 @@
+[application]
+object = "cp_producer_lifecycle:app"

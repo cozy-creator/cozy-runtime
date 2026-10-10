@@ -1,3 +1,13 @@
 # H3 CP producer lifecycle fixture
 
-Work in progress. This research fixture will mint a small real-H3 attention checkpoint through an ordinary CPU job and exercise the opt-in CP producer through normal model invocations. It does not render videos or change defaults. Production source is frozen separately at a5487b93.
+This research package mints a 262,656-byte checkpoint containing the six bias-free BF16 tensors of one genuine MiniMax-H3 attention module (128 hidden channels, two 128-channel heads). Its component inherits the real H3 type and uses the actual Runtime selector, full-RoPE retainer, Diffusers split/gather hooks and mirrored calls. It does not instantiate a full DiT or render video.
+
+The CPU `mint` job declares a 1MiB `WeightsOutput` and writes through `Context.output`/TensorFS derivation. Run it through normal Cozy CLI with `--upload-to`; select its returned immutable checkpoint in `verify`. The private capture pins the combined SDK from production a5487b93, preserving public0.23.5 native extension and TensorD0.5.4. Generated wheels/captures are retained in campaign outputs, not committed here.
+
+On one two-RTX5090 lease, submit two sequential `verify` requests with the exact selector `kitchen-sol-producer-fp4-fixed-means-shared-qkv`, the same capture/model digest and inputs `input-4.json`, then `input-6.json`. Each Invoke makes three separate component calls: steps4/5/replay5, then6/7/replay7. First-call state must be empty on both ranks; later calls must reuse the preceding call's statistics; replay must preserve the original prior pair and return identical outputs/statistics. The second request starts6 so a leaked last-step5 state would be eligible and caught.
+
+`validate_pair.py FIRST_REPORT SECOND_REPORT --runtime EXACT_PRIVATE_VERSION --out SUMMARY` requires unchanged rank PIDs, UUIDs and Python generation prefixes across requests, distinct GPUs, SM120, exact selector, one-head FP32 stats, full4225×96 RoPE, local2113/2112 rows and matching gathered outputs. These are lifecycle assertions, not whole-H3 determinism or FP8/LoRA/performance claims. The separate projection probe owns those arithmetic measurements.
+
+CPU checks cover native mint/census and actual Diffusers root uint8-report hook, pair-validator rejection controls, and a real two-process Gloo hook path with SDPA at130 tokens. Gloo cannot all-gather uneven output sizes in Diffusers' output hook, so that CPU control is explicitly even. The GPU fixture remains uneven4225; earlier production tests separately prove uneven full-RoPE retention and actual Ulysses exchange. No collectives are mocked or replaced.
+
+The first public CPU mint attempt5260 was refused before execution because the local worker replaced requested Runtime0.23.5 with its active0.21.7. The local worker is unchanged. Use the private carrier's CPU mint on the explicitly updated diagnostic lease instead; no local upgrade or dependency waiver is required.

@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "h3-cp-producer-lifecycle"
+version = "0.0.1"
+requires-python = ">=3.12,<3.13"
+dependencies = ["cozy-runtime[minimax-h3]==0.23.5+dev.h20853f571161ca4709e0abd1d7ed67509a312b286b732d257e497e75e7d76576", "tensorfs==0.6.1", "torch==2.14.0", "triton==3.8.0", "diffusers==0.41.0.dev0"]
+
+[project.entry-points."cozy.application"]
+default = "cp_producer_lifecycle:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["cp_producer_lifecycle"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.uv]
+override-dependencies = ["diffusers==0.41.0.dev0"]
+
+[tool.uv.sources]
+diffusers = {path = ".cozy-dependencies/git/diffusers/diffusers-0.41.0.dev0-0103ccb9e6f5a-py3-none-any.whl"}
+cozy-runtime = {path = "wheels/cozy_runtime-0.23.5+dev.h20853f571161ca4709e0abd1d7ed67509a312b286b732d257e497e75e7d76576-cp312-abi3-manylinux_2_28_x86_64.whl"}
