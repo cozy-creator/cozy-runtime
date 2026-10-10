@@ -15,13 +15,17 @@ from diffusers.models.transformers.transformer_minimax_h3 import MiniMaxH3Attent
 
 from cozy_runtime.internal import attention, attention_producer  # noqa: E402
 from cozy_runtime.internal.encoding import DeviceFacts  # noqa: E402
-from cozy_runtime.models.minimax_h3.model import BLACKWELL_DIT_ATTENTION, H3Model  # noqa: E402
+from cozy_runtime.models.minimax_h3.model import (  # noqa: E402
+    BLACKWELL_DIT_ATTENTION,
+    HOPPER_DIT_ATTENTION,
+    H3Model,
+)
 
 
 def roots() -> dict[str, Any]:
     return {
         "fl2va_dit": torch.nn.ModuleList(
-            [MiniMaxH3Attention(hidden_size=256, heads=2, dim_head=128).to(torch.bfloat16)]
+            [MiniMaxH3Attention(hidden_size=256, heads=8, dim_head=128).to(torch.bfloat16)]
         )
     }
 
@@ -32,14 +36,19 @@ def ready() -> list[attention.Ready]:
     return [
         attention.Ready(attention.BY_NAME[name], attention._member(attention.BY_NAME[name]))
         for name in dict.fromkeys(
-            (*BLACKWELL_DIT_ATTENTION, "kitchen-sol-producer-fast-shared-qkv", "kitchen-sol")
+            (
+                *BLACKWELL_DIT_ATTENTION,
+                *HOPPER_DIT_ATTENTION,
+                "kitchen-sol-producer-fast-shared-qkv",
+                "kitchen-sol",
+            )
         )
     ]
 
 
 @pytest.mark.parametrize("sm", [80, 86, 89, 90, 100, 103, 120, 121])
 @pytest.mark.parametrize("degree", [1, 2, 4, 8])
-def test_blackwell_chooses_hybrid_and_other_hardware_retains_its_policy(
+def test_qualified_architectures_choose_fixed_hybrids_and_others_retain_fallbacks(
     sm: int, degree: int
 ) -> None:
     modules = roots()
@@ -48,7 +57,11 @@ def test_blackwell_chooses_hybrid_and_other_hardware_retains_its_policy(
     selected = attention.install(
         ready(), modules, degree=degree, device=device, choose=model.choose_attention
     )
-    if sm in {120, 121}:
+    if sm == 120:
+        expected = "kitchen-sol-producer-fp4-fixed-means-shared-qkv"
+    elif sm == 90:
+        expected = "sol-attn-sage2-fixed-kmean"
+    elif sm == 121:
         expected = (
             "kitchen-sol-producer-fp4-lowmem-shared-qkv"
             if degree == 1
@@ -59,8 +72,55 @@ def test_blackwell_chooses_hybrid_and_other_hardware_retains_its_policy(
     assert selected.hosts == {"fl2va_dit": {expected: 1}}
     assert attention.observed(modules).hosts == selected.hosts
     assert isinstance(modules["fl2va_dit"][0].processor, attention_producer.Processor) == (
-        degree == 1 and sm in {120, 121}
+        sm == 120 or (degree == 1 and sm == 121)
     )
+
+
+@pytest.mark.parametrize("sm", [90, 120])
+@pytest.mark.parametrize("degree", [1, 2, 4, 8])
+def test_cold_fixed_recipe_keeps_existing_ready_fallback(sm: int, degree: int) -> None:
+    unavailable = {
+        "sol-attn-sage2-fixed-kmean",
+        "kitchen-sol-producer-fp4-fixed-means-shared-qkv",
+    }
+    device = DeviceFacts("cuda", f"sm{sm}", sm, "", "", 0)
+    selected = attention.install(
+        [entry for entry in ready() if entry.name not in unavailable],
+        roots(),
+        degree=degree,
+        device=device,
+        choose=object.__new__(H3Model).choose_attention,
+    )
+    expected = (
+        "sol-attn"
+        if sm == 90
+        else (
+            "kitchen-sol-producer-fp4-lowmem-shared-qkv"
+            if degree == 1
+            else "kitchen-sol-fp4-lowmem"
+        )
+    )
+    assert selected.hosts == {"fl2va_dit": {expected: 1}}
+
+
+@pytest.mark.parametrize(
+    "sm,kernel",
+    [
+        (90, "sol-attn"),
+        (90, "sageattention"),
+        (120, "kitchen-sol-fp4-lowmem"),
+        (120, "kitchen-sol-producer-fp4-lowmem-shared-qkv"),
+    ],
+)
+def test_legacy_explicit_recipe_still_wins(sm: int, kernel: str) -> None:
+    selected = attention.install(
+        ready(),
+        roots(),
+        "fl2va_dit=" + kernel,
+        device=DeviceFacts("cuda", f"sm{sm}", sm, "", "", 0),
+        choose=object.__new__(H3Model).choose_attention,
+    )
+    assert selected.hosts == {"fl2va_dit": {kernel: 1}}
 
 
 def test_explicit_dense_override_wins_and_restores_the_approved_default() -> None:
@@ -165,6 +225,11 @@ def test_nonmatching_wheel_keeps_existing_default_but_allows_explicit_recipe(
 @pytest.mark.parametrize(
     "kernel,dense",
     [
+        (
+            "kitchen-sol-producer-fp4-fixed-means-shared-qkv",
+            "sageattention3-fp4-fixed-means; sparse-prefix=kitchen-int8",
+        ),
+        ("sol-attn-sage2-fixed-kmean", "sageattention-fixed-kmean"),
         (
             "kitchen-sol-producer-fp4-lowmem-shared-qkv",
             "sageattention3-fp4-global-lowmem; sparse-prefix=kitchen-int8",

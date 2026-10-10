@@ -1,6 +1,6 @@
-# Opt-in H3 attention across GPU partitions
+# H3 attention across GPU partitions
 
-These recipes keep attention reductions and request state consistent when Ulysses changes the number of GPU partitions. They are explicit selections; H3's automatic preferences and its Turbo 4 dense + 4 sparse schedule are unchanged.
+These recipes keep attention reductions and request state consistent when Ulysses changes the number of GPU partitions. H3 prefers the eligible, ready hybrid on SM90 and SM120. The approved kernel families, Turbo's 4 dense + 4 sparse schedule, and regular generation's 10 dense + 20 sparse schedule are unchanged. Generic attention selection for other models is unchanged.
 
 | Hardware | Dense selection | Dense + sparse selection |
 |---|---|---|
@@ -19,7 +19,20 @@ A Diffusers hook retains each component's complete rotary tables before the cont
 
 ## Hopper path
 
-SageAttention2 keeps its INT8 Q/K and FP8 P/V arithmetic, with a fixed K-mean reduction. The hybrid uses that same dense implementation for both dense steps and the protected prefix of BF16 CuTe sparse steps. CuTe's sparse arithmetic is unchanged. The fixed reduction matched the tested head partitions in isolated H100 tests; full-video Hopper qualification remains pending.
+SageAttention2 keeps its INT8 Q/K and FP8 P/V arithmetic, with a fixed K-mean reduction. The hybrid uses that same dense implementation for both dense steps and the protected prefix of BF16 CuTe sparse steps. CuTe's sparse arithmetic is unchanged. The fixed reduction matched the tested head partitions in isolated H100 tests; the bounded full-video result below covers actual one/two-GPU execution.
+
+## Readiness and fallback
+
+Preferences are ordered choices, not new hardware admissions. The fixed Hopper
+hybrid remains SM90-only; the fixed Sage3/Kitchen producer remains SM120-only.
+SM121 and other hardware retain their existing eligible fallbacks. Explicit
+request pins still win, including older recipes. All-dense FP4 is not promoted.
+
+Automatic selection may serve a later ready recipe while a preferred kernel is
+compiling or unavailable. A preference alone therefore does not establish
+byte-identical cold-start results. The full GPU proof used explicit recipe pins;
+CPU tests cover ordinary no-pin selection when ready, fallback, override and
+restore at degrees 1, 2, 4 and 8.
 
 ## Evidence and limits
 
@@ -42,10 +55,19 @@ decode** on that H100. The observed cumulative allocation peak increased by
 also changed: one comparison had relative L2 error 0.001352 and maximum absolute
 difference 0.0002022 versus the baseline. This records numerical differences; it does
 not establish unchanged perceived quality. These are decoder measurements for
-one saved latent, and the integrated full-video one/two-GPU check is still pending.
+one saved latent. Subsequent full-video checks are recorded below.
+
+Integrated source `40efdc79` with Runtime `0.23.12+dev.h3partition.40efdc79`,
+TensorD `0.5.10` and TensorFS `0.6.1` passed actual one/two-GPU full-video checks
+for the same nominal 15-second Turbo input, seed 581204. H100 runs 5342/5343 and
+RTX 5090 runs 5341/5344 each produced identical MP4 bytes, all 362 decoded RGB
+frames, all decoded PCM, pre-encoding RGB/audio hashes and sampler schedules.
+The H100 pair used its direct-link route; the RTX pair used host-staged transfers
+without peer access. The subsequent preference promotion changes no kernel math.
+This is one input at degrees one and two, not a proof for every seed or GPU count.
 
 An earlier private build of the RTX implementation produced byte-identical delivered MP4 files for one 15-second Turbo input across actual one-GPU run 5315 and two-GPU runs 5307/5308. All 362 decoded RGB frames and decoded audio samples also matched. This was a retrospective comparison across different hosts and drivers, so its timings are not a controlled speed comparison. Only the single-GPU run retained pre-encoding diagnostics; equality of every intermediate tensor is not established.
 
 Separate GPU probes covered dense reductions, sparse statistics, FP8 projections with inactive/baked/unbaked LoRA, real two-rank exchange, retries and request cleanup. The faster shared-projection candidate reduced complete sparse-attention time from 213.09 ms to 195.46 ms in three paired samples on the tested two-5090 host. That is an attention-operation measurement, not a full-video speed claim.
 
-The current integration preserves newer Runtime copy-engine routing and int64 quantizer offsets. Earlier private RTX evidence does not qualify this integrated head or a newly selected transport. CPU/source checks, actual transport receipts and any integrated GPU evidence must be reported separately. These results do not establish universal determinism across kernels, inputs or GPU counts, nor unchanged quality against the older approved clip with a different prompt.
+The integration preserves newer Runtime copy-engine routing and int64 quantizer offsets. Earlier private RTX evidence remains attached to its original source; the final integrated runs above qualify their own source and observed transports. These results do not establish universal determinism across kernels, inputs or GPU counts, nor unchanged quality against the older approved clip with a different prompt.

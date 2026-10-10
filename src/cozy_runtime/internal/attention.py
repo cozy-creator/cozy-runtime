@@ -272,7 +272,7 @@ PINNABLE: tuple[Candidate, ...] = (
     ),
 )
 
-# Explicit Hopper controls; neither is in automatic or H3 default preference lists.
+# H3 prefers the eligible Hopper hybrid; generic automatic selection is unchanged.
 PINNABLE += (
     Candidate(
         name=attention_sage2_fixed.DENSE_NAME,

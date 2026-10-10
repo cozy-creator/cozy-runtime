@@ -41,7 +41,7 @@ def test_explicit_dense_selector_installs_on_real_diffusers_sites(degree: int) -
     assert not isinstance(site.processor, attention_producer.Processor)
 
 
-def test_experiment_is_explicit_sm120_bf16_head128_only() -> None:
+def test_fixed_recipe_stays_sm120_bf16_head128_only() -> None:
     for name in (DENSE, HYBRID):
         candidate = attention.BY_NAME[name]
         assert candidate not in attention.CANDIDATES
@@ -55,7 +55,7 @@ def test_experiment_is_explicit_sm120_bf16_head128_only() -> None:
         attention.admit(HYBRID, degree)
 
 
-def test_h3_default_preferences_do_not_select_the_experiment() -> None:
+def test_h3_prefers_the_qualified_hybrid_without_promoting_all_dense() -> None:
     from cozy_runtime.internal.kernel_sources import reviewed_kitchen_wheel_compatible
     from cozy_runtime.models.minimax_h3.model import (
         BLACKWELL_DIT_ATTENTION,
@@ -63,7 +63,7 @@ def test_h3_default_preferences_do_not_select_the_experiment() -> None:
         H3Model,
     )
 
-    assert HYBRID not in BLACKWELL_DIT_ATTENTION and DENSE not in BLACKWELL_DIT_ATTENTION
+    assert BLACKWELL_DIT_ATTENTION[0] == HYBRID and DENSE not in BLACKWELL_DIT_ATTENTION
     assert DIT_ATTENTION == ("sol-attn", "sageattention", "flash-attn3", "sdpa")
     context = AttentionContext(
         "fl2va_dit",

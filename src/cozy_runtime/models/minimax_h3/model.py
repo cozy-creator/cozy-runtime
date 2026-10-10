@@ -39,7 +39,9 @@ from .turbo import ATTENTION_KWARG, OVERLAY_KWARG, TURBO_BANK
 #: SageAttention2 INT8 Q/K + FP8 P/V, then FA3 BF16, then SDPA. FA3 FP8 garbles H3 output
 #: (H100 Ulysses-4 runs 1240-1252) and is never preferred. The VAEs keep Runtime's ranking.
 DIT_ATTENTION: tuple[str, ...] = ("sol-attn", "sageattention", "flash-attn3", "sdpa")
+HOPPER_DIT_ATTENTION: tuple[str, ...] = ("sol-attn-sage2-fixed-kmean", *DIT_ATTENTION)
 BLACKWELL_DIT_ATTENTION: tuple[str, ...] = (
+    "kitchen-sol-producer-fp4-fixed-means-shared-qkv",
     "kitchen-sol-producer-fp4-lowmem-shared-qkv",
     "kitchen-sol-fp4-lowmem",
     *DIT_ATTENTION,
@@ -125,6 +127,8 @@ class H3Model(Model[OfficialH3Pipeline], encoded_leaves="accept", fusion="accept
         # both apply. Unqualified platform source builds remain explicit choices.
         if "kitchen-sol-fp4-lowmem" in context.eligible and reviewed_kitchen_wheel_compatible():
             return BLACKWELL_DIT_ATTENTION
+        if "sol-attn-sage2-fixed-kmean" in context.eligible:
+            return HOPPER_DIT_ATTENTION
         return DIT_ATTENTION
 
     # Published interfaces (paul/minimax-h3) name these two scopes in `component_use`; they
