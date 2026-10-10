@@ -47,8 +47,9 @@ def _triton_kernels() -> Any:
 
         @triton.jit  # type: ignore[untyped-decorator]
         def _amax(x_ptr, amax_ptr, seq, heads, CHUNK: tl.constexpr, DIM: tl.constexpr):  # type: ignore[no-untyped-def]
-            head = tl.program_id(0)
-            rows = tl.program_id(1) * CHUNK + tl.arange(0, CHUNK)
+            # int64 element offsets: a (seq, heads, dim) tensor may pass 2**31 elements.
+            head = tl.program_id(0).to(tl.int64)
+            rows = tl.program_id(1).to(tl.int64) * CHUNK + tl.arange(0, CHUNK)
             cols = tl.arange(0, DIM)
             batch = head // heads
             offsets = ((batch * seq + rows)[:, None] * heads + head % heads) * DIM + cols[None, :]
@@ -57,8 +58,8 @@ def _triton_kernels() -> Any:
 
         @triton.jit  # type: ignore[untyped-decorator]
         def _cast(x_ptr, out_ptr, amax_ptr, seq, heads, CHUNK: tl.constexpr, DIM: tl.constexpr):  # type: ignore[no-untyped-def]
-            head = tl.program_id(0)
-            rows = tl.program_id(1) * CHUNK + tl.arange(0, CHUNK)
+            head = tl.program_id(0).to(tl.int64)
+            rows = tl.program_id(1).to(tl.int64) * CHUNK + tl.arange(0, CHUNK)
             cols = tl.arange(0, DIM)
             batch = head // heads
             offsets = ((batch * seq + rows)[:, None] * heads + head % heads) * DIM + cols[None, :]

@@ -86,7 +86,9 @@ def _triton_rowwise_kernel() -> Any:
         def _kernel(  # type: ignore[no-untyped-def]
             x_ptr, out_ptr, scale_ptr, columns, stride_x, stride_out, BLOCK: tl.constexpr
         ):
-            row = tl.program_id(0)
+            # int64: `row * stride` passes 2**31 elements at H3's 15 s + 56-frame continuation
+            # (~155k rows into the 14336-wide FFN out projection) and wrapped to a negative offset.
+            row = tl.program_id(0).to(tl.int64)
             offsets = tl.arange(0, BLOCK)
             amax = tl.zeros((BLOCK,), dtype=tl.float32)
             for start in range(0, columns, BLOCK):

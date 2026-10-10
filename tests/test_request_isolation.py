@@ -23,15 +23,17 @@ from cozy_runtime.internal.seam import Channel
 MODULE = "request_isolation_fixture"
 SOURCE = """
 import os
+import shutil
 
 import msgspec
-from cozy_runtime.author import App, Context, InvalidRequest
+from cozy_runtime.author import App, Context, InvalidRequest, Telemetry
 
 app = App()
 
 
 class Request(msgspec.Struct):
     mode: str = "ok"
+    spool: str = ""
 
 
 class Result(msgspec.Struct):
@@ -43,7 +45,7 @@ def contract_failure() -> None:
 
 
 @app.entrypoint
-def generate(ctx: Context, payload: Request) -> Result:
+def generate(ctx: Context, payload: Request, tel: Telemetry) -> Result:
     if payload.mode == "refuse":
         raise InvalidRequest("the handler refused this request", code="mode_refused")
     if payload.mode == "cancel":
@@ -54,6 +56,9 @@ def generate(ctx: Context, payload: Request) -> Result:
         contract_failure()
     if payload.mode == "env":
         os.environ["OMP_NUM_THREADS"] = "7"
+    if payload.mode == "tail":
+        with tel.stage("export"):
+            shutil.rmtree(payload.spool)  # the Runtime's own tail then cannot write the result
     return Result(7)
 """
 
@@ -116,6 +121,36 @@ def test_handler_refusals_and_cancels_keep_the_generation_ready(
 
     failed = _serve(executor, "failed", "fail")
     assert failed["outcome"]["terminal"] == "failed" and failed["poisoned"]
+
+
+def test_an_attempt_whose_tail_raises_names_its_cause_and_stage(
+    host: tuple[Executor, dict[str, Any]],
+) -> None:
+    """A tail that raises (a faulted device's first sync) once answered with no outcome and no
+    poison: runs 5313/5318/5319 ended `executor_poisoned: ; ... (poisoned: )`."""
+    executor, load = host
+    assert executor.load(msgspec.convert({**load, "construction": "a"}, Load))["ok"]
+    assert executor.activate(Activate(construction="a"))["ok"]
+    spool = executor.root / "tail"
+    spool.mkdir()
+    assert executor.serve_request(
+        PrepareRequest(
+            request_id="tail", entrypoint="generate", payload={"mode": "tail", "spool": str(spool)}
+        )
+    )["ok"]
+    reply = executor.handle(
+        Invoke(request_id="tail", entrypoint="generate", spool=str(spool), deadline_s=30)
+    )
+    outcome = reply["outcome"]
+    assert (outcome["terminal"], outcome["code"]) == ("failed", "unhandled_exception"), reply
+    assert outcome["message"].startswith("FileNotFoundError: ")
+    assert outcome["message"].endswith(" in export")
+    assert reply["poisoned"].startswith("unhandled_exception in export: FileNotFoundError")
+    assert reply["quiescent"] is False and executor.poisoned == reply["poisoned"]
+    after = executor.serve_request(
+        PrepareRequest(request_id="after", entrypoint="generate", payload={})
+    )
+    assert (after["code"], after["detail"]) == ("poisoned_generation", reply["poisoned"])
 
 
 def test_a_refused_load_leaves_loaded_constructions_serving(
