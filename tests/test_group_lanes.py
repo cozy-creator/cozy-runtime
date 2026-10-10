@@ -578,10 +578,13 @@ def test_an_executor_sealed_to_two_ordinals_and_its_reclaim_over_both() -> None:
         assert evidence is not None
         assert evidence.members == (executor.pid,)
         assert sorted(evidence.devices) == ["0", "1"], evidence
-        assert evidence.devices["0"].state == "absent", evidence
-        assert evidence.devices["1"].state == "unreadable", (
-            "the second card does not exist here: the driver's honest answer, never absent"
-        )
+        for ordinal in ("0", "1"):
+            measured = accel.device_memory(ordinal, "cuda").state == "measured"
+            assert evidence.devices[ordinal].state == ("absent" if measured else "unreadable"), (
+                "a readable device proves the retired PID absent; an unavailable device "
+                "must remain unreadable",
+                evidence,
+            )
         # degree checks, each on a fresh executor (a refused start poisons its epoch)
         for extra, code in (
             ({"sequence_parallel_degree": 3}, "sequence_parallel_degree_mismatch"),
