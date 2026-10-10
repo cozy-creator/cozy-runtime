@@ -1,0 +1,1 @@
+Bundles TensorD 0.5.4: a published release's Hub callee is named `<org>/<name>` from its lock again, never from its wheel URL, so model choices addressed to it (long_form's `generate_image`) reach it after Hub v0.19.0's file-door move (tensord#193, run 5234).
