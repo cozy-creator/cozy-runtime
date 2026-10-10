@@ -22,7 +22,7 @@ import sys
 import uuid
 import zipfile
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from email.parser import BytesParser
 from pathlib import Path, PurePosixPath
 from typing import Any, cast
@@ -996,7 +996,7 @@ def _install_locked_bounded(
     cache_root: Path | None = None,
 ) -> None:
     observed = observe_base(python)
-    inspected = fetch_locked_wheels(rows, staging.parent, observed)
+    inspected = fetch_locked_wheels(rows, staging.parent, observed, cache_root=cache_root)
     with storage_admission.admit(_wheel_write_bound(staging.parent, inspected)):
         _install_with_uv(
             uv, python, staging, inspected, dependencies=dependencies, cache_root=cache_root
@@ -1010,9 +1010,11 @@ def fetch_locked_wheels(
     *,
     cache_root: Path | None = None,
 ) -> list[_Inspected]:
-    """Fetch exact dependency artifacts through the existing bounded storage owner."""
+    """Reuse exact machine archives before asking the bounded storage owner to fetch."""
     inspected: list[_Inspected] = []
     operation = _locked_operation(rows)
+    if cache_root is not None:
+        _require_dependency_cache_root(cache_root)
     for row in rows:
         if not row.url or len(row.hashes) != 1:
             raise EnvironmentRefusal(
@@ -1021,16 +1023,21 @@ def fetch_locked_wheels(
             )
         filename = unquote(Path(urlsplit(row.url).path).name)
         expected = root / ".stage" / operation / "wheels" / filename
-        if storage_admission.enabled():
+        cached = (
+            cache_root / ".stage" / row.hashes[0].removeprefix("sha256:") / filename
+            if cache_root is not None
+            else None
+        )
+        if cached is not None and cached.exists():
+            expected = cached
+            path, length = _fetch_local_locked_wheel(cached, row)
+        elif storage_admission.enabled():
             path, length = storage_admission.fetch_wheel(
                 operation, filename, row.hashes[0], row.url
             )
         else:
-            # Local package install roots differ. Retain each exact archive only once
-            # under the machine cache, independently of the project's full closure.
-            if cache_root is not None:
-                _require_dependency_cache_root(cache_root)
-                expected = cache_root / ".stage" / row.hashes[0].removeprefix("sha256:") / filename
+            if cached is not None:
+                expected = cached
             path, length = _fetch_local_locked_wheel(expected, row)
         if path != expected:
             raise EnvironmentRefusal(
@@ -1049,8 +1056,28 @@ def fetch_locked_wheels(
             raise EnvironmentRefusal(
                 "package_environment_wheel_invalid", "wheel differs from exact lock"
             )
+        if cached is not None and path != cached:
+            _retain_locked_archive(path, cached, row)
+            item = replace(item, path=cached)
         inspected.append(item)
     return inspected
+
+
+def _retain_locked_archive(source: Path, cached: Path, row: LockedRow) -> None:
+    """Retain one verified carrier independently of its disposable Host operation."""
+    # The install and dependency roots share the worker filesystem. A retained
+    # hardlink adds names, not a second payload; the existing storage owner admits
+    # those directory entries before they are created.
+    with storage_admission.admit(storage_admission.Write(cached.parent.parent, 128 << 10, 4)):
+        cached.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            os.link(source, cached)
+        except FileExistsError:
+            _fetch_local_locked_wheel(cached, row)
+        except OSError as exc:
+            raise EnvironmentRefusal("package_environment_archive_cache_failed", str(cached)) from exc
+        else:
+            _fsync_dir(cached.parent)
 
 
 def _fetch_local_locked_wheel(path: Path, row: LockedRow) -> tuple[Path, int]:
