@@ -35,6 +35,34 @@ def test_the_fused_bake_holds_under_tritons_interpreter() -> None:
     assert run.returncode == 0 and " passed" in run.stdout, run.stdout[-4000:] + run.stderr
 
 
+@pytest.mark.parametrize(
+    ("script", "ended"),
+    [
+        ("raise SystemExit('no device')", "exit 1: no device"),
+        ("import os; os.abort()", "killed by signal 6"),
+    ],
+)
+def test_a_build_that_fails_or_crashes_ends_only_its_child(
+    monkeypatch: pytest.MonkeyPatch, script: str, ended: str
+) -> None:
+    """The kernels compile in a child: whatever ends it, this process bakes eagerly and says why."""
+    if INTERPRETED:
+        pytest.skip("the launcher's")
+    pytest.importorskip("triton")
+    fresh = {"FUSED_ERROR": None, "_TRIED": False, "_BUILT": False, "_BUILD": None}
+    for name, value in fresh.items():
+        monkeypatch.setattr(lora_bake, name, value)
+    monkeypatch.setattr(lora_bake, "_CHECK", script)
+    lora_bake.warm(0)
+    assert not lora_bake._ready(0)
+    assert lora_bake.mode() == {"lora_bake": f"eager (bake kernel build {ended})"}
+    weight, down, up = _layer(1)
+    stored, eager = {"value": weight.to(torch.bfloat16)}, {"value": weight.to(torch.bfloat16)}
+    lora_bake.bake(torch, stored, down, up, seed=4)
+    lora_bake.bake(torch, eager, down, up, seed=4, stats=lora_bake.Stats())
+    assert torch.equal(stored["value"], eager["value"])
+
+
 def _layer(seed: int) -> tuple[Any, Any, Any]:
     generator = torch.Generator().manual_seed(seed)
     weight = torch.randn(ROWS, COLS, generator=generator) * 0.05
@@ -131,6 +159,11 @@ def test_values_on_the_grid_are_fixed_points_and_a_seed_names_the_bytes(form: in
         lora_bake.fused(torch, copy, down, up, seed)
     assert torch.equal(_bytes(first), _bytes(again))
     assert torch.equal(_bytes(first), _bytes(other)) == (form in (lora_bake.F16, lora_bake.F32))
+
+
+@interpreted
+def test_the_build_check_passes_a_correct_kernel() -> None:
+    lora_bake.check(torch, torch.device("cpu"))
 
 
 @interpreted
