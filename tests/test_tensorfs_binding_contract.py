@@ -79,7 +79,7 @@ CALLED: dict[str, str] = {
     "fit": (
         "(requirements: 'Sequence[TensorRequirement]', header: 'bytes', *, custody: 'str', "
         "encoded_leaves: 'bool', device: 'str | None' = None, "
-        "observations: 'bytes | None' = None) -> 'dict[str, object]'"
+        "observations: 'bytes | None' = None) -> 'FitResult'"
     ),
     "plan": "(header, traversal, components=None, window=Ellipsis)",
     "parse_header": "(data: 'bytes', closure: 'Closure | None' = None) -> 'Header'",
@@ -275,6 +275,21 @@ def test_every_entry_point_cozy_runtime_calls_keeps_its_frozen_signature() -> No
         )
         + "\nFix the call site FIRST; re-freeze only once the caller agrees."
     )
+
+
+def test_fit_result_keeps_the_mapping_contract_the_weight_plane_consumes() -> None:
+    """0.6.1's FitResult is a TypedDict; the existing caller converts it with dict()."""
+    from test_tensorfs_requirement_dtypes import HEADERS
+
+    verdict = tensorfs.fit(
+        [tensorfs.TensorRequirement("unet", "weight", [1], "f32")],
+        HEADERS["f32"],
+        custody="canonical",
+        encoded_leaves=False,
+    )
+    assert isinstance(verdict, dict)
+    consumed = dict(verdict)
+    assert consumed == verdict and consumed["ok"]
 
 
 def test_optional_bindings_keep_their_signature_where_the_installed_tensorfs_has_them() -> None:
