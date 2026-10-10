@@ -74,6 +74,9 @@ Picture/Video/Audio reference. Pre-encoded context tensors and private layout me
 supply its rows; their times are aligned
 to the target prefix. Native scheduling holds those condition rows fixed. This is the
 Director-style guide path, not a claim that target-prefix pixels are hard-copied.
+The window regenerating the context frames beside their condition rows is intended, not
+duplication: single-copy (context as the window's frozen head) was tested and rejected by
+the owner on 2026-10-10.
 
 The video decoder streams only the new delivery window and retains a ring of its last56
 RGB8 frames. Audio uses integer frame-to-sample boundaries.

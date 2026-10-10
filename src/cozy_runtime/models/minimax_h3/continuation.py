@@ -39,6 +39,11 @@ def audio_sample_range(start: int, end: int, sample_rate: int) -> tuple[int, int
     return start * sample_rate // FPS, end * sample_rate // FPS
 
 
+# Intended design: the denoise window is new frames + context on the 17n+5 grid (12 s:
+# 288 + 56 -> 345; the 362 check applies to this window), and the same context frames are
+# ALSO passed as a reference video (17 clean condition latents), as in MiniMax fl2va and
+# Director's guide mode. Not duplication to remove: single-copy was tested and rejected
+# by the owner (2026-10-10, tag archive/h3-single-copy-context-20261010).
 @dataclass(frozen=True)
 class ContinuationPlan:
     delivered_frames: int
