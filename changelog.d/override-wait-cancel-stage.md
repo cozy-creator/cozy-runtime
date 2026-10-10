@@ -1,1 +1,2 @@
 A cancel during an `--attention-kernel` request's compile wait ends the request at once as canceled (the wait sleeps on the cancel marker, which inotify sees land); the build goes on for later requests. The wait is the run's stage `waiting for <kernel> compile`, with its duration, in the run's stage timeline.
+Bundles TensorD 0.5.3: a request canceled during that wait settles CANCELED (tensord#189), and rented machines expire only when unused (TensorD 0.5.2).
