@@ -320,13 +320,9 @@ PINNABLE += (
             name=name,
             backend="_cozy_" + name.replace("-", "_"),
             local=attention_producer.LOCALS[name],
-            min_sm=120 if name in attention_producer.FP4_LOWMEM else 80,
-            max_sm=121,
-            sms=(
-                frozenset({120, 121})
-                if name in attention_producer.FP4_LOWMEM
-                else frozenset(a * 10 + b for a, b in upstream.KITCHEN_SMS)
-            ),
+            min_sm=min(a * 10 + b for a, b in attention_producer.capabilities(name)),
+            max_sm=max(a * 10 + b for a, b in attention_producer.capabilities(name)),
+            sms=frozenset(a * 10 + b for a, b in attention_producer.capabilities(name)),
             dtypes=frozenset({"bfloat16"}),
             max_head_dim=128,
             head_dims=frozenset({128}),
@@ -508,8 +504,12 @@ def _resolve(candidate: Candidate, device: DeviceFacts, wait: bool = True) -> Re
         raise _BROKEN[(candidate.name, device)]
     _registry()
     artifact: dict[str, str] | None
-    if candidate.name in attention_kitchen_sol.FP4:
-        dense = BY_NAME["sageattention3-fp4-global-lowmem"]
+    if candidate.name in attention_kitchen_sol.FP4 | attention_producer.SAGE2:
+        dense = BY_NAME[
+            "sageattention"
+            if candidate.name in attention_producer.SAGE2
+            else "sageattention3-fp4-global-lowmem"
+        ]
         artifacts = _compile_dependencies((candidate, dense), device, wait)
         dense_artifact = _resolve(dense, device, wait).artifact or {}
         artifact = {
