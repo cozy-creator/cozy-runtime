@@ -12,8 +12,10 @@ measured it faster than NCCL; the result is the same bytes either way.
 
 from __future__ import annotations
 
+import contextlib
 import math
-from collections.abc import Sequence
+import os
+from collections.abc import Iterator, Sequence
 from typing import Any
 
 #: The exchange the group formed with, by process group; absent: NCCL.
@@ -28,6 +30,24 @@ def install(exchange: CopyEngineExchange | None, handle: Any) -> None:
     _BY_GROUP.clear()
     if exchange is not None:
         _BY_GROUP[id(handle)] = exchange
+
+
+@contextlib.contextmanager
+def _socket_directory() -> Iterator[None]:
+    """Symmetric memory passes its handles over a unix socket named `$TMPDIR/symm_mem-<pid>`
+    on every GPU alike; an executor's scratch path is too long for a socket name (108 bytes),
+    so the rendezvous names it in the first short directory every process here shares."""
+    previous = os.environ.get("TMPDIR")
+    os.environ["TMPDIR"] = next(
+        (path for path in ("/tmp", "/dev/shm") if os.access(path, os.W_OK | os.X_OK)), "/tmp"
+    )
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("TMPDIR", None)
+        else:
+            os.environ["TMPDIR"] = previous
 
 
 class CopyEngineExchange:
@@ -53,7 +73,8 @@ class CopyEngineExchange:
             torch.cuda.current_stream(self.device).synchronize()
         self.peers, self.handle, self.buffer = [], None, None
         self.buffer = self.symm.empty(size, dtype=torch.uint8, device=self.device)
-        self.handle = self.symm.rendezvous(self.buffer, self.pg.group_name)
+        with _socket_directory():
+            self.handle = self.symm.rendezvous(self.buffer, self.pg.group_name)
         self.peers = [self.handle.get_buffer(p, (size,), torch.uint8) for p in range(self.world)]
 
     def all_to_all(self, sends: Sequence[Any], matrix: Sequence[Sequence[int]]) -> list[Any]:
@@ -129,10 +150,8 @@ def calibrate(
     exchange.buffer = None
     sent = send.numel() * send.element_size() * (world - 1) / world
     timings: dict[str, float] = {}
-    for name, run in (
-        ("nccl", lambda: dist.all_to_all_single(received, send, group=pg)),
-        ("copy_engine", lambda: exchange.all_to_all([send], matrix)),
-    ):
+
+    def timed(run: Any) -> float:
         run()
         torch.cuda.synchronize()
         dist.barrier(group=pg)
@@ -143,8 +162,15 @@ def calibrate(
         ended.record()
         ended.synchronize()
         seconds = everyone(max(began.elapsed_time(ended) / 3000, 1e-9), dist.ReduceOp.MAX)
-        timings[f"{name}_gbps"] = round(sent / seconds / 1e9, 2)
-    exact = torch.equal(received, exchange.all_to_all([send], matrix)[0])
+        return float(round(sent / seconds / 1e9, 2))
+
+    timings["nccl_gbps"] = timed(lambda: dist.all_to_all_single(received, send, group=pg))
+    try:
+        timings["copy_engine_gbps"] = timed(lambda: exchange.all_to_all([send], matrix))
+        exact = torch.equal(received, exchange.all_to_all([send], matrix)[0])
+    except Exception:  # the whole group then keeps NCCL, every GPU alike
+        exact = False
+        timings["copy_engine_gbps"] = 0.0
     timings["copy_engine_exact"] = everyone(1.0 if exact else 0.0, dist.ReduceOp.MIN)
     if timings["copy_engine_exact"] < 1.0 or timings["copy_engine_gbps"] <= timings["nccl_gbps"]:
         torch.cuda.synchronize()
