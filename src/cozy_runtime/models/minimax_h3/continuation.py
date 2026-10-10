@@ -24,8 +24,6 @@ MAX_CONTEXT_FRAMES = 56
 MAX_CONTEXT_BYTES = 64 << 20
 MAX_CONTEXT_PIXELS = 1344 * 768
 CONTEXT_SCHEMA = "cozy.minimax-h3.av-context/2"
-#: Frames on each side of a seam whose mean colour anchors the continuation (`seam_rgb`).
-SEAM_FRAMES = 8
 
 
 def _refuse(message: str) -> NoReturn:
@@ -62,11 +60,6 @@ class ContinuationPlan:
     def sample_frames(self) -> int:
         frames = self.delivered_frames + self.prefix_frames
         return frames + (5 - frames) % 17
-
-    @property
-    def held_frames(self) -> int:
-        """The frames the DiT holds: one window whose head is the frozen context."""
-        return self.sample_frames
 
     @property
     def delivery_start(self) -> int:
@@ -165,9 +158,6 @@ class AVContext:
     provenance: str
     frame_count: int = MAX_CONTEXT_FRAMES
     sample_rate: int = 32000
-    #: Mean RGB in [0, 1] of the delivered tail's last `SEAM_FRAMES`, the colour a successor's
-    #: first frames continue; None from a producer that predates it.
-    seam_rgb: tuple[float, float, float] | None = None
 
     def __post_init__(self) -> None:
         self.validate()
@@ -241,16 +231,14 @@ class AVContext:
             self.provenance,
             frames,
             self.sample_rate,
-            self.seam_rgb,
         )
 
 
 @dataclass(frozen=True)
 class ContextReferenceLayout:
-    """The completed tail's soundtrack as private reference rows, appended after the public
-    references. Its video is no reference: it is the target window's frozen prefix."""
+    """Private packed-layout metadata, appended only after public reference encoding."""
 
-    kind: str = "audio"
+    kind: str = "video"
     has_audio: bool = True
 
 
@@ -271,7 +259,6 @@ def encode_context(context: AVContext) -> bytes:
             "frame_count": str(context.frame_count),
             "source_end_frame": str(context.source_end_frame),
             "provenance": context.provenance,
-            **({} if context.seam_rgb is None else {"seam_rgb": json.dumps(context.seam_rgb)}),
         },
     )
     if len(data) > MAX_CONTEXT_BYTES:
@@ -314,7 +301,6 @@ def decode_context(data: bytes) -> AVContext:
             metadata["provenance"],
             int(metadata["frame_count"]),
             int(metadata["sample_rate"]),
-            _seam_rgb(metadata.get("seam_rgb")),
         )
     except InvalidRequest:
         raise
@@ -324,33 +310,37 @@ def decode_context(data: bytes) -> AVContext:
         ) from exc
 
 
-def _seam_rgb(value: str | None) -> tuple[float, float, float] | None:
-    if value is None:
-        return None
-    rgb = json.loads(value)
-    if not (isinstance(rgb, list) and len(rgb) == 3 and all(0 <= float(c) <= 1 for c in rgb)):
-        _refuse("context seam colour is invalid")
-    return (float(rgb[0]), float(rgb[1]), float(rgb[2]))
+def align_context_rows(state: Any, context: AVContext, patch_size: tuple[int, int, int]) -> None:
+    """Place the hidden AV condition at the target head, retaining all public references.
 
-
-def align_context_rows(state: Any, context: AVContext) -> None:
-    """Place the tail's audio condition at the target head, ending where its video ends.
-
-    The target window begins with the tail's own video latents, frozen; its audio
-    is regenerated over that prefix and trimmed, guided by these fixed condition rows. Audio
-    has one rotary tick per 1/40 second; its latent grid rounds up, as native target audio
-    does, so the final tick may contain encoder padding.
+    It is encoded as the final internal video/audio condition after text encoding,
+    so it consumes neither a Picture/Video label nor a Qwen vision-token block.
+    The native scheduler already keeps these condition rows fixed on every step.
     """
+    _, patch_h, patch_w = patch_size
+    latent = state.condition_latents[-1]
+    frames, height, width = (int(x) for x in latent.shape[2:])
+    expected_latents = 5 * ((context.frame_count - 5) // 17) + 2
+    if frames != expected_latents:
+        _refuse("context VAE temporal grid differs from its frame clock")
+    video_count = frames * (height // patch_h) * (width // patch_w)
     audio_count = int(state.audio_condition_latents[-1].shape[0])
     if (
         audio_count != 2 * ((context.frame_count * 5 + 2) // 3)
-        or audio_count > state.num_condition_audio_rows
+        or video_count > state.num_condition_video_rows
     ):
         _refuse("context packed geometry is inconsistent")
+    video_rows = state.video_indices[
+        state.num_condition_video_rows - video_count : state.num_condition_video_rows
+    ]
     audio_rows = state.audio_indices[
         state.num_condition_audio_rows - audio_count : state.num_condition_audio_rows
     ]
-    origin = state.position_ids[state.video_indices[state.num_condition_video_rows], 0].clone()
+    target_start = state.video_indices[state.num_condition_video_rows]
+    origin = state.position_ids[target_start, 0].clone()
+    state.position_ids[video_rows, 0] += origin - state.position_ids[video_rows[0], 0].clone()
+    # Audio has one rotary tick per 1/40 second. Its latent grid rounds up,
+    # just as native target audio does; the final tick may contain encoder padding.
     ticks = audio_count // 2
     end_tick = (context.frame_count * 5 + 2) // 3
     desired_start = origin + end_tick - ticks
@@ -361,48 +351,22 @@ def align_context_rows(state: Any, context: AVContext) -> None:
 
 class CompletedTail:
     """The delivery window of a streamed decode. The consumer lands the delivered frames as
-    RGB8 for its output; the context tail is read back from that buffer, not copied twice.
+    RGB8 for its output; the context tail is read back from that buffer, not copied twice."""
 
-    With `seam_rgb` (the predecessor's delivered colour at the seam), the delivered frames
-    are shifted by the per-channel difference between it and the decoded head's last
-    `SEAM_FRAMES`: the VAE round trip of the frozen context head (`_freeze_context_prefix`)
-    darkens it by about two levels, the new frames continue that head, and the shift keeps
-    a chain of segments from stepping, or darkening, at every seam.
-    """
-
-    def __init__(
-        self, plan: ContinuationPlan, seam_rgb: tuple[float, float, float] | None = None
-    ) -> None:
+    def __init__(self, plan: ContinuationPlan) -> None:
         self.plan = plan
-        self.seam_rgb = seam_rgb
         self.seen = 0
         self.delivered = 0
         self.complete = False
-        self._head: torch.Tensor | None = None
-        self._head_pixels = 0
-        self.offset: torch.Tensor | None = None
 
     def push(self, chunk: torch.Tensor) -> torch.Tensor:
         if self.complete or chunk.ndim != 4 or chunk.shape[1] != 3:
             _refuse("continuation decode stream is invalid")
-        seen = self.seen
-        start = max(0, self.plan.delivery_start - seen)
-        end = min(int(chunk.shape[0]), self.plan.delivery_end - seen)
+        start = max(0, self.plan.delivery_start - self.seen)
+        end = min(int(chunk.shape[0]), self.plan.delivery_end - self.seen)
         self.seen += int(chunk.shape[0])
-        if self.seam_rgb is not None:
-            low = max(0, self.plan.delivery_start - SEAM_FRAMES - seen)
-            high = min(int(chunk.shape[0]), self.plan.delivery_start - seen)
-            if high > low:
-                sums = chunk[low:high].float().clamp(0, 1).sum(dim=(0, 2, 3))
-                self._head = sums if self._head is None else self._head + sums
-                self._head_pixels += (high - low) * int(chunk.shape[2]) * int(chunk.shape[3])
         selected = chunk[start : max(start, end)]
         self.delivered += int(selected.shape[0])
-        if selected.shape[0] and self._head is not None:
-            if self.offset is None:
-                seam = torch.tensor(self.seam_rgb, dtype=torch.float32, device=chunk.device)
-                self.offset = seam - self._head / self._head_pixels
-            selected = selected + self.offset.to(selected.dtype).view(1, 3, 1, 1)
         return selected
 
     def finish(self) -> None:
