@@ -92,8 +92,22 @@ def run(torch, handle, parallel_config, hidden, attn_projections, seed):
     if hidden.device.type != "cuda" or torch.cuda.get_device_capability() != (12, 0):
         raise ValueError("This bounded fixture requires the assigned Blackwell CUDA device")
     free, total = torch.cuda.mem_get_info()
-    if free + torch.cuda.memory_reserved() - torch.cuda.memory_allocated() < 28 << 30:
-        raise ValueError("Complete-processor comparison needs28GiB free/reusable headroom")
+    reserved, allocated = torch.cuda.memory_reserved(), torch.cuda.memory_allocated()
+    admission = {
+        "stage": "after caller-owned full hidden and projection weights",
+        "free_bytes": free,
+        "total_bytes": total,
+        "reserved_bytes": reserved,
+        "allocated_bytes": allocated,
+        "available_additional_bytes": free + reserved - allocated,
+        "required_additional_bytes": 22 << 30,
+        "conservative_additional_tensor_estimate_bytes": 18_306_126_739,
+    }
+    # Source liveness sums ~17.05GiB, deliberately including nonoverlapping
+    # stages;22GiB leaves ~4.95GiB for unmodeled workspaces/fragmentation. The
+    # caller's already-live ~1.25GiB fixture does not need allocating again.
+    if admission["available_additional_bytes"] < admission["required_additional_bytes"]:
+        raise ValueError(f"Complete-processor comparison lacks additional headroom: {admission}")
     for name in ("to_q", "to_k", "to_v", "to_out"):
         projection = getattr(attn_projections, name)
         hooks = tuple(projection._forward_hooks.values())
@@ -227,6 +241,7 @@ def run(torch, handle, parallel_config, hidden, attn_projections, seed):
                 "quantizer_before": quantizer_before,
                 "quantizer_after": quantizer_route(leaves),
                 "total_device_bytes": total,
+                "memory_admission": admission,
                 "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
                 "kernel_artifacts": {name: selection.artifact for name, selection in ready.items()},
                 "source_sha256": {
