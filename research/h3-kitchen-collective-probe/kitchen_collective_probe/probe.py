@@ -225,6 +225,14 @@ def run(seed, handle):
                     torch, output[:, : prefix_stop - start], reference[0][:, start:prefix_stop]
                 )
             )
+            suffix_start = min(stop, max(start, PREFIX))
+            suffix_metric = (
+                None
+                if suffix_start == stop
+                else nhd_metric(
+                    torch, output[:, suffix_start - start :], reference[0][:, suffix_start:stop]
+                )
+            )
             repeat = attention_ulysses.exchange(*local, handle, compute)
             repeats = {
                 "output": nhd_metric(torch, repeat, output),
@@ -276,6 +284,8 @@ def run(seed, handle):
             ]
             if prefix_metric is not None:
                 metrics.append(prefix_metric)
+            if suffix_metric is not None:
+                metrics.append(suffix_metric)
             steps.append(
                 {
                     "step": step,
@@ -289,6 +299,8 @@ def run(seed, handle):
                     "inverse_output_vs_full_token_shard": output_metric,
                     "protected_prefix_local_rows": [start, prefix_stop],
                     "protected_prefix_output": prefix_metric,
+                    "suffix_global_rows": [suffix_start, stop],
+                    "suffix_output": suffix_metric,
                     "same_prior_repeat": repeats,
                     "input_unchanged": custody,
                     "timings": times,
