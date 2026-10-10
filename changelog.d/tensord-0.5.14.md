@@ -1,0 +1,1 @@
+Bundles TensorD 0.5.14: #220: one editable tree per local package, synced by changed file (capability `live-source/1`; the old tar and wheels manifests still install); a callee slot a run names no model for takes its declared default.
