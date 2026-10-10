@@ -38,6 +38,7 @@ from cozy_runtime.internal import (
     accel,
     attention_kitchen_sol,
     attention_producer,
+    attention_sage2_fixed,
     attention_sol,
     attention_ulysses,
     execution_evidence,
@@ -268,6 +269,38 @@ PINNABLE: tuple[Candidate, ...] = (
         artifact=kernel_sources.PYTHON,
         import_name="sol_attn",
         why="Explicit sparse experiment on its CuTe routes; eager model layout.",
+    ),
+)
+
+# Explicit Hopper controls; neither is in automatic or H3 default preference lists.
+PINNABLE += (
+    Candidate(
+        name=attention_sage2_fixed.DENSE_NAME,
+        backend="_cozy_sage2_fixed_kmean",
+        local=attention_sage2_fixed.DENSE,
+        min_sm=90,
+        max_sm=90,
+        sms=frozenset({90}),
+        dtypes=frozenset({"bfloat16"}),
+        max_head_dim=128,
+        head_dims=frozenset({128}),
+        artifact="sageattention",
+        import_name="sageattention",
+        why="Explicit Hopper INT8 Q/K + FP8 P/V control with a fixed K token-reduction tree.",
+    ),
+    Candidate(
+        name=attention_sage2_fixed.SOL_NAME,
+        backend="_cozy_sol_sage2_fixed_kmean",
+        local=attention_sage2_fixed.SOL,
+        min_sm=90,
+        max_sm=90,
+        sms=frozenset({90}),
+        dtypes=frozenset({"bfloat16"}),
+        max_head_dim=128,
+        head_dims=frozenset({128}),
+        artifact=kernel_sources.PYTHON,
+        import_name="sol_attn",
+        why="Explicit BF16 CuTe Sol with fixed-Kmean Sage2 dense steps and protected prefix.",
     ),
 )
 
@@ -524,7 +557,15 @@ def _resolve(candidate: Candidate, device: DeviceFacts, wait: bool = True) -> Re
         raise _BROKEN[(candidate.name, device)]
     _registry()
     artifact: dict[str, str] | None
-    if candidate.name in attention_kitchen_sol.FP4:
+    if candidate.name == attention_sage2_fixed.SOL_NAME:
+        dense = BY_NAME[attention_sage2_fixed.DENSE_NAME]
+        artifacts = _compile_dependencies((candidate, dense), device, wait)
+        dense_artifact = _resolve(dense, device, wait).artifact or {}
+        artifact = {
+            **(artifacts[candidate.name] or {}),
+            **{f"dense_{key}": value for key, value in dense_artifact.items()},
+        }
+    elif candidate.name in attention_kitchen_sol.FP4:
         dense = BY_NAME[
             "sageattention3-fp4-fixed-means"
             if candidate.name in attention_producer.FIXED_MEANS
@@ -563,7 +604,7 @@ def _resolve(candidate: Candidate, device: DeviceFacts, wait: bool = True) -> Re
                 )
         if candidate.local in (upstream.FA3, upstream.FA3_FP8):
             upstream.bind_fa3(module, (artifact or {}).get("key", "environment"))
-    if candidate.name == "sol-attn":
+    if candidate.name in {"sol-attn", attention_sage2_fixed.SOL_NAME}:
         _sol_route(device)
         if device.kind == "cuda":
             attention_sol.submit_card(device.index)
@@ -582,7 +623,9 @@ def _resolve(candidate: Candidate, device: DeviceFacts, wait: bool = True) -> Re
 
 def _expected(live_tokens: int, module: Any) -> None:
     """A model's early length statement reaches Sol when a Sol site serves `module`."""
-    if "sol-attn" not in observed({"": module}).totals():
+    if not {"sol-attn", attention_sage2_fixed.SOL_NAME}.intersection(
+        observed({"": module}).totals()
+    ):
         return
     import torch
 
