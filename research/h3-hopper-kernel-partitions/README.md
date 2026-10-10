@@ -4,4 +4,4 @@ Research-only ordinary Cozy CLI application. This refresh retains the fixed-Kmea
 
 No quality videos or serving/default changes. Each check will have an independent bounded request and report actual backend identity, repeats, input custody, precision differences and warm timing. Unsupported hardware or an unserved sparse kernel refuses the check instead of silently changing the recipe. Parent owns all paid actions; this source is not GPU-qualified.
 
-The public package pin is 0.23.8/TensorFS0.6.1; exact consumed source and binary identities are recorded as evidence, not arbitrary runtime hash admission gates. The original PR1291 source/capture stays frozen.
+The public package pin is 0.23.7/TensorFS0.6.1; exact consumed source and binary identities are recorded as evidence, not arbitrary runtime hash admission gates. The original PR1291 source/capture stays frozen.
