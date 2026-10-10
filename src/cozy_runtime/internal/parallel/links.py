@@ -238,9 +238,13 @@ def _measure(torch: Any, count: int, emit: Any) -> None:
             )
 
 
+#: What the probe measures; a probe that measures more is not answered by an older one's file.
+_PROBE = "links/2"
+
+
 def _key(devices: str) -> str:
-    """This boot, driver and device list: the links do not change while all three hold."""
-    parts = [devices]
+    """This boot, driver, device list and probe: the links do not change while all hold."""
+    parts = [_PROBE, devices]
     for path in ("/proc/sys/kernel/random/boot_id", "/proc/driver/nvidia/version"):
         try:
             parts.append(Path(path).read_text().strip())
