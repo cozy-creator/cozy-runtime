@@ -1,0 +1,1 @@
+Bundles TensorD 0.5.15: #222 + #223 (capability `live-source/2`): a local-source manifest names its uv indexes, used only to resolve an unlocked project; a locked project installs with no index; `locals` rebuilds edited path dependencies. TensorFS crates stay v0.7.3.
