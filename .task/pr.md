@@ -1,0 +1,3 @@
+Release 0.18.25 includes the published serving-only dependency preparation fix from #600. Captured dependencies can retain exact code before model selection while advertising zero executable bindings. No numerical, native-kernel, or protocol changes.
+
+Validation on the integrated source: 22 focused tests, including actual Worker installation/description and sealed receipt reuse, negative acquisition controls, and fail-on-public 0.18.24 proof; full mypy (486 files); Ruff; 21 architecture fences. Verified native development wheel reuses byte-identical public 0.18.24 extension after checking all native build inputs. Public artifact publication and real rented H3 composition remain separate gates.
