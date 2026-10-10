@@ -33,6 +33,8 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import AbstractContextManager
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from importlib import import_module
 from pathlib import Path
@@ -61,6 +63,10 @@ class CompileFailed(Exception):
     def __init__(self, code: str, detail: str) -> None:
         super().__init__(detail)
         self.code = code
+
+
+class Canceled(Exception):
+    """The request a wait served was canceled: the wait ends, and the build goes on."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,6 +118,19 @@ POLL_SECONDS = 0.5
 #: Told the state a wait reads, each sample, named for its waiter: an executor reports it to
 #: its machine as the run's progress.
 waiting: Callable[[State], None] | None = None
+
+
+def _sleep(seconds: float) -> bool:
+    time.sleep(seconds)
+    return False
+
+
+#: How a request's executor holds each compile wait it makes, named for its waiter: around the
+#: wait, giving the sleep its polls take, which wakes at the request's cancel and says whether
+#: it came. The wait then ends `Canceled`, and its build goes on for later requests.
+held: ContextVar[Callable[[str], AbstractContextManager[Callable[[float], bool]]]] = ContextVar(
+    "cozy_compile_held", default=lambda waiter: contextlib.nullcontext(_sleep)
+)
 
 
 def status(store: kernel_cache.Store, job: Job) -> State:
@@ -167,22 +186,27 @@ def wait(store: kernel_cache.Store, job: Job, waiter: str = "") -> State:
     alone (`liveness`): while any build on this machine moves, the wait goes on; when they have
     all stopped, against their own pace, it ends `failed` for this machine run, and the
     builder's owner ends the builder by the same rule. `waiting` hears each sample under
-    `waiter`'s name (the kernel a request asked for), else the artifact's."""
+    `waiter`'s name (the kernel a request asked for), else the artifact's; `held` holds it."""
     state = submit(store, job)
+    if state.state != "compiling":
+        return state
+    name = waiter or state.kernel
     pace, sampled = liveness.Pace(), float("-inf")
-    while state.state == "compiling":
-        now = time.monotonic()
-        if now - sampled >= liveness.SAMPLE_SECONDS:
-            sampled = now
-            if waiting is not None:
-                waiting(replace(state, kernel=waiter or state.kernel))
-            pace.observe(_activity(store), now)
-            if pace.wedged(liveness.noise_floor(), now):
-                verdict = pace.verdict(liveness.noise_floor(), now)
-                _record_failure(job.key, "compile_stalled", verdict)
-                return status(store, job)
-        time.sleep(POLL_SECONDS)
-        state = submit(store, job)
+    with held.get()(name) as sleep:
+        while state.state == "compiling":
+            now = time.monotonic()
+            if now - sampled >= liveness.SAMPLE_SECONDS:
+                sampled = now
+                if waiting is not None:
+                    waiting(replace(state, kernel=name))
+                pace.observe(_activity(store), now)
+                if pace.wedged(liveness.noise_floor(), now):
+                    verdict = pace.verdict(liveness.noise_floor(), now)
+                    _record_failure(job.key, "compile_stalled", verdict)
+                    return status(store, job)
+            if sleep(POLL_SECONDS):
+                raise Canceled(f"canceled waiting for {name} to compile; the compile goes on")
+            state = submit(store, job)
     return state
 
 

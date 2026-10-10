@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import ctypes
 import dataclasses
 import functools
 import gc
@@ -51,6 +52,7 @@ import math
 import os
 import platform
 import resource
+import select
 import socket
 import sys
 import threading
@@ -117,6 +119,7 @@ from cozy_runtime.author._invoke import (
     run_prepared,
 )
 from cozy_runtime.author._model import Model, _derive_model, component_use
+from cozy_runtime.author._observations import Attribution
 from cozy_runtime.author._services import Attempt as AuthorAttempt
 from cozy_runtime.author._services import CheckpointConflict, ProgressFrame
 from cozy_runtime.internal import (
@@ -318,6 +321,39 @@ def _cancelled(root: Path, request_id: str) -> bool:
         return (root / "executor.cancel").read_text() == request_id
     except (OSError, UnicodeError):
         return False
+
+
+_LIBC = ctypes.CDLL(None, use_errno=True)
+_IN_MOVED_TO = 0x80
+
+
+@contextlib.contextmanager
+def _held(
+    root: Path, request_id: str, waits: Attribution, waiter: str
+) -> Iterator[Callable[[float], bool]]:
+    """A compile wait of this request's preparation (`kernel_compile.held`): a stage of its
+    record, whose polls sleep until the worker's cancel marker (`_cancelled`) lands naming it,
+    which inotify sees at its rename into `root`. Without a watch, each poll reads it."""
+    fd = _LIBC.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
+    if fd >= 0 and _LIBC.inotify_add_watch(fd, os.fsencode(root), _IN_MOVED_TO) < 0:
+        os.close(fd)
+        fd = -1
+
+    def sleep(seconds: float) -> bool:
+        if not _cancelled(root, request_id):
+            if fd < 0:
+                time.sleep(seconds)
+            elif select.select([fd], [], [], seconds)[0]:
+                os.read(fd, 1 << 16)
+        return _cancelled(root, request_id)
+
+    started = time.perf_counter()
+    try:
+        yield sleep
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        waits.stage(f"waiting for {waiter} compile", (time.perf_counter() - started) * 1000)
 
 
 def _distribution_version(name: str) -> str:
@@ -2985,7 +3021,11 @@ class Executor:
             }
         registration = self.discovered.app.get(command.entrypoint)
         pin = command.attention_kernel
+        waits = Attribution()
         if pin and self._attention_reaches(pin):
+            held = kernel_compile.held.set(
+                functools.partial(_held, self.root, command.request_id, waits)
+            )
             try:
                 self._attention_plan(pin)
             except attention.AttentionRefusal as exc:
@@ -2995,6 +3035,16 @@ class Executor:
                     "detail": str(exc)[:900],
                     "origin": "request",
                 }
+            except kernel_compile.Canceled as exc:
+                return {
+                    "ok": False,
+                    "code": "cancelled",
+                    "terminal": "canceled",
+                    "detail": str(exc),
+                    "origin": "request",
+                }
+            finally:
+                kernel_compile.held.reset(held)
         try:
             self._capture_options(command, registration.surface)
             prepared = prepare(registration, command.payload, input_metadata=command.input_metadata)
@@ -3008,7 +3058,7 @@ class Executor:
                 "origin": outcome.origin,
                 "fields": list(outcome.fields),
             }
-        self.prepared[command.request_id] = prepared
+        self.prepared[command.request_id] = replace(prepared, stages=waits.stages)
         # A prepared request the worker never dispatched (a refusal after the plan, a
         # cancel while it queued) would otherwise be retained for the generation's life.
         for stale in list(self.prepared)[: -PREPARED_HELD or None]:
