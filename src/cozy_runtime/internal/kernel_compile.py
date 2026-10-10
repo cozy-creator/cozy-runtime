@@ -33,7 +33,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from importlib import import_module
 from pathlib import Path
 from typing import Any
@@ -109,7 +109,8 @@ _STARTED: dict[str, tuple[subprocess.Popen[bytes], threading.Thread]] = {}
 _GUARD = threading.Lock()
 #: How often a wait reads the state it waits on: resolution, never a verdict.
 POLL_SECONDS = 0.5
-#: Told the state a wait reads, each sample: an executor reports it to its machine.
+#: Told the state a wait reads, each sample, named for its waiter: an executor reports it to
+#: its machine as the run's progress.
 waiting: Callable[[State], None] | None = None
 
 
@@ -161,11 +162,12 @@ def submit(store: kernel_cache.Store, job: Job) -> State:
     return current if current.state != "pending" else State(job.key.kernel, "compiling")
 
 
-def wait(store: kernel_cache.Store, job: Job) -> State:
+def wait(store: kernel_cache.Store, job: Job, waiter: str = "") -> State:
     """`submit`, then its build's end: `ready`, or `failed` and why. Judged by measured progress
     alone (`liveness`): while any build on this machine moves, the wait goes on; when they have
     all stopped, against their own pace, it ends `failed` for this machine run, and the
-    builder's owner ends the builder by the same rule."""
+    builder's owner ends the builder by the same rule. `waiting` hears each sample under
+    `waiter`'s name (the kernel a request asked for), else the artifact's."""
     state = submit(store, job)
     pace, sampled = liveness.Pace(), float("-inf")
     while state.state == "compiling":
@@ -173,7 +175,7 @@ def wait(store: kernel_cache.Store, job: Job) -> State:
         if now - sampled >= liveness.SAMPLE_SECONDS:
             sampled = now
             if waiting is not None:
-                waiting(state)
+                waiting(replace(state, kernel=waiter or state.kernel))
             pace.observe(_activity(store), now)
             if pace.wedged(liveness.noise_floor(), now):
                 verdict = pace.verdict(liveness.noise_floor(), now)

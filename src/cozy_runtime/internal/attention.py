@@ -5,14 +5,16 @@ Every kernel is a Runtime-local forward (`attention_upstream`, `attention_sol`) 
 that is not part of torch is compiled on this machine for this card (`kernel_sources`,
 `kernel_compile`) and serves once its artifact is published: selection checks the device's
 architecture, the site's dtype, head dimension and context-parallel support, and that the
-kernel is compiled, imports and launches. A run never waits for a compile: a kernel still
-compiling is skipped, the site serves the best one ready (SDPA always is), and the selection
-records it (`Applied.waiting`) so the construction selects again once it is ready
-(`compiled`): at the run's next step or stage boundary, and so for the rest of that run (a
-run may mix kernels, owner ruling 2026-10-09). One whose compile failed this machine run is
-skipped with why, and the chain falls through. Explicit pins and model choices wait, and
-refuse an unsupported or failed kernel. Automatic selection preserves attention activation
-precision; quantizing those activations requires an explicit backend choice.
+kernel is compiled, imports and launches. A run without an override never waits for a
+compile: a kernel still compiling is skipped, the site serves the best one ready (SDPA always
+is), and the selection records it (`Applied.waiting`) so the construction selects again once
+it is ready (`compiled`): at the run's next step or stage boundary, and so for the rest of
+that run (a run may mix kernels, owner ruling 2026-10-09). One whose compile failed this
+machine run is skipped with why, and the chain falls through. A request's override
+(`--attention-kernel`, `plan`) and a model's explicit choice are the opposite: they wait for
+their own kernel's build, hold it for every step, and refuse an unsupported or failed kernel
+(owner ruling 2026-10-10). Automatic selection preserves attention activation precision;
+quantizing those activations requires an explicit backend choice.
 """
 
 from __future__ import annotations
@@ -406,7 +408,11 @@ def _compiled(candidate: Candidate, device: DeviceFacts, wait: bool) -> dict[str
             "attention_kernel_absent", f"{candidate.name}: no machine kernel store to compile into"
         )
     job = _job(candidate, device)
-    state = (kernel_compile.wait if wait else kernel_compile.submit)(store, job)
+    state = (
+        kernel_compile.wait(store, job, candidate.name)
+        if wait
+        else kernel_compile.submit(store, job)
+    )
     _STATES[candidate.name] = state
     if state.state != "ready":
         raise AttentionRefusal(

@@ -8,10 +8,10 @@ the key an executor computes, by the same functions. For each distinct card arch
 starts every artifact of `LADDER` the card admits at once, through the compile manager, niced:
 the machine's compile ledger admits their compiler jobs within its CPUs and memory
 (`kernel_compile.compiler_job`); Sol's card objects start once its sources are in. A request
-finds each one ready or building and never waits for one: it serves the best kernel ready
-(`attention`), and no executor builds a key twice. This process holds no device memory. It
-prints one JSON line per artifact as it ends and a last one, and exits nonzero when one
-failed.
+finds each one ready or building and, without an override, never waits for one: it serves the
+best kernel ready (`attention`), and no executor builds a key twice. This process holds no
+device memory. It prints one JSON line per artifact as it ends and a last one, and exits
+nonzero when one failed.
 """
 
 from __future__ import annotations

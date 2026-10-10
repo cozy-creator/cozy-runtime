@@ -3109,7 +3109,7 @@ class Executor:
             if frame.position is not None:
                 steps[frame.stage] = frame.position
             if pin or served_attention is None:
-                return
+                return  # an override holds its kernel for every step
             if not segments:
                 segments.append(_segment("", 0, served_attention, started_us))
             if not self._upgrade_attention():
@@ -3422,12 +3422,12 @@ class Executor:
         return attention.plan(self._attention_device(pin), roots, pin, self.world)
 
     def _upgrade_attention(self) -> bool:
-        """A RUN NEVER WAITS FOR A COMPILE: at each step or stage boundary of a run, and
-        between requests, a kernel the selection passed over while it compiled is ready, so
-        the construction selects again and serves it from the next step on (a run may mix
-        kernels, owner ruling 2026-10-09); a group's followers take rank 0's kernels once no
-        call holds them. Where a selection or a follower cannot, the prepared one stays and
-        is not tried again. Whether any construction selected again."""
+        """A RUN WITHOUT AN OVERRIDE NEVER WAITS FOR A COMPILE: at each step or stage boundary
+        of one, and between requests, a kernel the selection passed over while it compiled is
+        ready, so the construction selects again and serves it from the next step on (a run
+        may mix kernels, owner ruling 2026-10-09); a group's followers take rank 0's kernels
+        once no call holds them. Where a selection or a follower cannot, the prepared one
+        stays and is not tried again. Whether any construction selected again."""
         upgraded = False
         for executor in self.model_executors or [self]:
             applied, again, device = executor.attention, executor._reselect, executor.device_facts
@@ -5127,7 +5127,7 @@ def _compiling(channel: Channel, state: kernel_compile.State) -> None:
                 "event": "progress",
                 "request_id": "",
                 "kind": "progress",
-                "stage": f"compiling {state.kernel}",
+                "stage": f"waiting for {state.kernel} compile",
                 "stage_fraction": state.progress,
                 "advance": 0,
             }
