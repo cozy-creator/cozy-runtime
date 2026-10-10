@@ -31,6 +31,24 @@ def exact(metric):
     return metric["bytes_equal"] and metric["nonfinite_elements"] == 0
 
 
+def validate_rank_identities(rows):
+    if (
+        len(rows) != DEGREE
+        or sorted(row["rank"] for row in rows) != list(range(DEGREE))
+        or len({row["uuid"] for row in rows}) != DEGREE
+        or len({row["pid"] for row in rows}) != DEGREE
+        or any(
+            row["world_size"] != DEGREE
+            or row["group_global_ranks"] != list(range(DEGREE))
+            or row["sm"] != [12, 0]
+            or row["runtime"] != "0.23.5"
+            or row["tensorfs"] != "0.6.1"
+            for row in rows
+        )
+    ):
+        raise RuntimeError("Probe requires four distinct granted SM120 ranks on its public SDK")
+
+
 def capture(torch, api, values, candidate):
     tokens = values[0].shape[1]
     if candidate:
@@ -88,10 +106,19 @@ def run(seed, handle):
     from cozy_runtime.internal.encoding import DeviceFacts
 
     rank, degree = dist.get_rank(handle), dist.get_world_size(handle)
-    if degree != DEGREE or torch.cuda.get_device_capability() != (12, 0):
-        raise RuntimeError("Exactly four granted SM120 GPUs are required")
-    if importlib.metadata.version("cozy-runtime") != "0.23.5":
-        raise RuntimeError("Probe was prepared for public Runtime0.23.5")
+    identity_fields = {
+        "rank": rank,
+        "world_size": degree,
+        "pid": os.getpid(),
+        "uuid": str(torch.cuda.get_device_properties(torch.cuda.current_device()).uuid),
+        "sm": list(torch.cuda.get_device_capability()),
+        "runtime": importlib.metadata.version("cozy-runtime"),
+        "tensorfs": importlib.metadata.version("tensorfs"),
+        "group_global_ranks": dist.get_process_group_ranks(handle),
+    }
+    identities = [None] * degree
+    dist.all_gather_object(identities, identity_fields, group=handle)
+    validate_rank_identities(identities)
     device = DeviceFacts(
         "cuda",
         torch.cuda.get_device_name(),
@@ -143,9 +170,17 @@ def run(seed, handle):
         agreed = torch.tensor([int(transport["passed"])], device="cuda")
         dist.all_reduce(agreed, op=dist.ReduceOp.MIN, group=handle)
         if not agreed.item():
-            raise RuntimeError(
-                "QKV redistribution/inverse is not byte-exact; attention comparison refused"
+            refused = [None] * degree
+            dist.all_gather_object(
+                refused, {**identity_fields, "transport": transport}, group=handle
             )
+            return {
+                "seed": seed,
+                "shape": [1, TOKENS, HEADS, DIM],
+                "candidate_partition_exact": False,
+                "attention_skipped": "QKV redistribution/inverse is not byte-exact",
+                "ranks": refused,
+            }
         variants = []
         previous_full_output = None
         for name, candidate in (("public", False), ("fixed_means", True)):
@@ -227,7 +262,16 @@ def run(seed, handle):
                         **time_call(torch, dist, handle, lambda callback=callback: callback(*full)),
                     }
                 )
+        regenerated = torch.randn(
+            packed.shape,
+            dtype=torch.bfloat16,
+            device="cuda",
+            generator=torch.Generator(device="cuda").manual_seed(seed),
+        )
+        input_unchanged = compared(torch, packed[0], regenerated[0])
+        del regenerated
         report = {
+            **identity_fields,
             "rank": rank,
             "world_size": degree,
             "pid": os.getpid(),
@@ -241,6 +285,7 @@ def run(seed, handle):
             "input_layouts": [operand_layout(x) for x in local],
             "packed_max_element_index": packed.numel() - 1,
             "transport": transport,
+            "input_unchanged": input_unchanged,
             "variants": variants,
             "timings": times,
             "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
@@ -260,7 +305,10 @@ def run(seed, handle):
             "seed": seed,
             "shape": [1, TOKENS, HEADS, DIM],
             "ranks": reports,
-            "candidate_partition_exact": all(r["variants"][1]["partition_exact"] for r in reports),
+            "rank_identity_validated": True,
+            "candidate_partition_exact": all(
+                r["variants"][1]["partition_exact"] and exact(r["input_unchanged"]) for r in reports
+            ),
             "limits": [
                 "Fixed activations and real four-GPU Ulysses only; no H3 sampling or video claim.",
                 "Three warm timing samples check regression; no default or generation-speed claim.",

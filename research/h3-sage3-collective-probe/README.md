@@ -1,7 +1,9 @@
 # Four-GPU Ulysses correctness probe — preparation checkpoint
 
-This research package is **not GPU-qualified or ready to rent**. CPU integration tests,
-normal CLI lock/capture/describe and independent review remain pending.
+This research package is **not GPU-qualified**. Four-process CPU Gloo and ordinary CLI
+lock/capture/describe checks have passed. The exact same publicRuntime0.23.5/TensorFS0.6.1
+capture environment also passed the four-process CPU exchange. Paid execution requires
+the root owner’s explicit rental and run authorization.
 
 It declares exactly four RTX 5090 GPUs through one Model rung and sequence_parallel(4),
 using the existing 133KB diagnostic checkpoint. Runtime mirrors the component forward and
@@ -18,13 +20,16 @@ The research-local fixed_means.py is copied unchanged from Runtime source checkp
 input spans2,348,774,400elements, exceeding signed int32. The public Runtime remains0.23.5;
 this package neither installs a private Runtime nor monkeypatches upstream modules.
 
-Before execution:
+Execution prerequisites and retained limits:
 
-- Verify ModelMixin/mirroring/empty split-plan integration through the ordinary CLI.
-- Exercise actual unequal Diffusers exchange over CPU Gloo with deterministic elementwise
-  data, including inverse and rank coverage. This proves permutation only, not CUDA attention.
-- Complete bounded memory/source/callback peer review; preserve all four actual GPU UUIDs.
-- Capture the package and pin the exact diagnostic checkpoint through normal CLI.
+- ModelMixin/empty split-plan installation, explicit group binding and ten-tensor census
+  passed the CPU gate; the CLI interface declares only the dit component and exact4GPU rung.
+- CPU permutation gate passed on four processes at129/132tokens, using Runtime CpComms
+  and the actual unequal Diffusers QKV/O helpers. This does not qualify CUDA/full-shape attention.
+- Independent source reviews cover bounded memory, callbacks and failure propagation;
+  the actual report validates four distinct UUIDs/PIDs and all rank identities.
+- The invocation must pin `model.model=paul/attention-kernel-benchmark-20260916#sha256:61dc0e651cf6ab7744213611b6ee1cb4a4ba0b8dac5da8f165d950c2c91a04ca`.
+  Exact full geometry and seed remain unchanged; an8-minute caller deadline bounds the run.
 - Root grants any rental and the exclusive GPU invocation. No smaller replacement shape.
 
 The earlier video/layout package is preserved separately and is not part of this request.
