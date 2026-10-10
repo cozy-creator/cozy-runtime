@@ -83,6 +83,8 @@ def test_hybrid_dense_steps_and_prefix_use_the_same_fixed_local(monkeypatch: Any
 
 
 def test_hopper_prefers_fixed_hybrid_without_changing_generic_or_blackwell_policy() -> None:
+    pytest.importorskip("torch")
+    pytest.importorskip("diffusers")
     from cozy_runtime.models.minimax_h3.model import (
         BLACKWELL_DIT_ATTENTION,
         DIT_ATTENTION,

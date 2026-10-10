@@ -1,6 +1,9 @@
 """H3 audio decode scopes one real Torch setting and keeps the official block path."""
 
+from __future__ import annotations
+
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -13,6 +16,9 @@ from diffusers.modular_pipelines.minimax_h3.decoders import (  # noqa: E402
 from diffusers.modular_pipelines.modular_pipeline import PipelineState  # noqa: E402
 
 from cozy_runtime.models.minimax_h3.official import OfficialH3Pipeline  # noqa: E402
+
+if TYPE_CHECKING:
+    from torch import Tensor
 
 
 def _settings() -> tuple[object, ...]:
@@ -32,7 +38,9 @@ def _settings() -> tuple[object, ...]:
 
 @pytest.mark.parametrize("previous", [False, True])
 @pytest.mark.parametrize("fails", [False, True])
-def test_only_determinism_changes_and_restores_after_decode(previous: bool, fails: bool) -> None:
+def test_only_determinism_changes_and_restores_after_decode(
+    previous: bool, fails: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
     cudnn = torch.backends.cudnn
     with cudnn.flags(
         enabled=False,
@@ -54,7 +62,8 @@ def test_only_determinism_changes_and_restores_after_decode(previous: bool, fail
             if fails:
                 raise ValueError("decoder failed")
 
-        pipe = SimpleNamespace(_run=run)
+        pipe = object.__new__(OfficialH3Pipeline)
+        monkeypatch.setattr(pipe, "_run", run)
         if fails:
             with pytest.raises(ValueError, match="decoder failed"):
                 OfficialH3Pipeline.decode_audio(pipe, "fl2va_turbo", state)
@@ -67,18 +76,17 @@ def test_only_determinism_changes_and_restores_after_decode(previous: bool, fail
 
 
 def test_existing_official_audio_block_keeps_normalization_and_layout() -> None:
-    class AudioVAE(torch.nn.Module):
-        device = torch.device("cpu")
-        config = SimpleNamespace(latents_mean=[1.0] * 32, latents_std=[2.0] * 32)
-
-        def decode(self, latents: object, *, return_dict: bool) -> tuple[object]:
-            assert torch.backends.cudnn.deterministic is True
-            assert return_dict is False
-            assert torch.equal(latents, normalized * 2 + 1)
-            return (latents[:, :1, :],)
+    def decode(latents: Tensor, *, return_dict: bool) -> tuple[Tensor]:
+        assert torch.backends.cudnn.deterministic is True
+        assert return_dict is False
+        assert torch.equal(latents, normalized * 2 + 1)
+        return (latents[:, :1, :],)
 
     normalized = torch.arange(2 * 32 * 3, dtype=torch.float32).reshape(2, 32, 3)
-    vae = AudioVAE()
+    vae = torch.nn.Module()
+    vae.device = torch.device("cpu")
+    vae.config = SimpleNamespace(latents_mean=[1.0] * 32, latents_std=[2.0] * 32)
+    vae.decode = decode
     pipe = object.__new__(OfficialH3Pipeline)
     pipe.components = {"audio_vae": vae}
     pipe._pipes = {"t2va_turbo": SimpleNamespace(audio_vae=vae, audio_sampling_rate=32000)}

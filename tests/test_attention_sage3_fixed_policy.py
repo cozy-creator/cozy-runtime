@@ -1,4 +1,4 @@
-"""Opt-in routing checks; no local GPU or promotion of the experimental recipe."""
+"""Routing and admission checks; no local GPU is required."""
 
 from __future__ import annotations
 
@@ -51,11 +51,18 @@ def test_fixed_recipe_stays_sm120_bf16_head128_only() -> None:
         assert attention._admits(candidate, "bfloat16", 128)
         assert not attention._admits(candidate, "float16", 128)
         assert not attention._admits(candidate, "bfloat16", 64)
+
+
+def test_fixed_recipe_supports_context_parallel_diffusers_registry() -> None:
+    pytest.importorskip("torch")
+    pytest.importorskip("diffusers")
     for degree in (1, 2, 4, 7, 8):
         attention.admit(HYBRID, degree)
 
 
 def test_h3_prefers_the_qualified_hybrid_without_promoting_all_dense() -> None:
+    pytest.importorskip("torch")
+    pytest.importorskip("diffusers")
     from cozy_runtime.internal.kernel_sources import reviewed_kitchen_wheel_compatible
     from cozy_runtime.models.minimax_h3.model import (
         BLACKWELL_DIT_ATTENTION,
@@ -121,12 +128,10 @@ def test_dense_adapter_preserves_operands_scale_and_upstream_correction(monkeypa
 
 
 def test_source_does_not_modify_h3_schedule_or_default_table() -> None:
-    import inspect
     from pathlib import Path
 
-    from cozy_runtime.models.minimax_h3 import model
-
-    tree = ast.parse(Path(inspect.getfile(model)).read_text())
+    model = Path(__file__).resolve().parents[1] / "src/cozy_runtime/models/minimax_h3/model.py"
+    tree = ast.parse(model.read_text())
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef) and node.name in (
             "sample_fl2va_turbo",
