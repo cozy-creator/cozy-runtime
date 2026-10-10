@@ -499,11 +499,13 @@ def test_first_load_pin_then_other_pin_and_unpinned_calls_restore_author_default
         assert not choices  # First Load obeyed the override before the author ladder.
         first = host.run("first", "model/dit=sdpa")
         assert first["observed"] == "sdpa" and host.held == [SDPA_SITES] * 4
-        assert construction._attention_load_pin == ""
-        assert choices == ["dit", "dit"]
+        assert construction._attention_load_pin == "model/dit=sdpa"
+        assert not choices  # A complete override never needs the unrelated default.
         assert host.run("second", "tiny")["observed"] == "tiny"
         assert host.held == [TINY_SITES] * 4
+        assert not choices
         assert host.run("default")["observed"] == "tiny"
+        assert construction._attention_load_pin == ""
         assert host.held == [TINY_SITES] * 4
         assert host.run("failed", "sdpa", fail=True)["observed"] == "sdpa"
         assert host.run("after-failure")["observed"] == "tiny"
@@ -727,3 +729,43 @@ def test_initial_load_malformed_pin_is_a_typed_request_refusal(
         reply = owner.load(Load(construction="malformed", request_id="bad", attention_pin="dit="))
         assert reply["code"] == "attention_kernel_unknown" and reply["origin"] == "request"
         assert not owner.poisoned and owner.constructions == before
+
+
+def test_complete_override_skips_a_cold_explicit_default_and_unpin_wait_is_cancellable(
+    store: kernel_cache.Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _registry(tmp_path / "sources")
+    job = kernel_sources.job(kernel_sources.PYTHON, 0)
+    lock, builder = _held(store, job, MOVING)
+    try:
+        with _host(tmp_path, monkeypatch, load_pin="sdpa", choose=lambda _: "tiny") as host:
+            # The unrelated explicit default is genuinely compiling. The forced request
+            # completes without asking its author policy to resolve that kernel.
+            assert host.run("forced", "sdpa")["observed"] == "sdpa"
+            assert kernel_compile.status(store, job).state == "compiling"
+            reply: dict[str, Any] = {}
+            before = len(host.frames)
+            request = threading.Thread(target=lambda: reply.update(host.run("unpin")), daemon=True)
+            request.start()
+            while request.is_alive() and not _waiting(host.frames[before:]):
+                time.sleep(0.01)
+            assert request.is_alive(), reply
+            owner = host.construction.host
+            pending = owner.root / "executor.cancel.pending"
+            pending.write_text("unpin")
+            began = time.monotonic()
+            pending.rename(owner.root / "executor.cancel")
+            request.join(5)
+            assert not request.is_alive() and time.monotonic() - began < 1
+            assert reply["terminal"] == "canceled" and not owner.poisoned
+            assert builder.poll() is None and host.construction._attention_load_pin == "sdpa"
+            assert host.run("forced-again", "sdpa")["observed"] == "sdpa"
+            _finisher(store, job, lock, builder)()
+            lock = -1
+            assert host.run("default-ready")["observed"] == "tiny"
+            assert host.construction._attention_load_pin == ""
+    finally:
+        if lock >= 0:
+            os.close(lock)
+            builder.kill()
+            builder.wait()

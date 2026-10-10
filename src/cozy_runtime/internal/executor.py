@@ -3123,12 +3123,19 @@ class Executor:
         registration = self.discovered.app.get(command.entrypoint)
         pin = command.attention_kernel
         waits = Attribution()
-        if pin and self._attention_reaches(pin):
+        reaches = bool(pin and self._attention_reaches(pin))
+        pending_defaults = any(
+            executor._attention_load_pin for executor in self.model_executors or [self]
+        )
+        if reaches or pending_defaults:
             held = kernel_compile.held.set(
                 functools.partial(_held, self.root, command.request_id, waits)
             )
             try:
-                self._attention_plan(pin)
+                if pending_defaults:
+                    self._upgrade_attention(pin if reaches else "")
+                if reaches:
+                    self._attention_plan(pin)
             except attention.AttentionRefusal as exc:
                 return {
                     "ok": False,
@@ -3641,6 +3648,10 @@ class Executor:
         for executor in self.model_executors or [self]:
             applied, again, device = executor.attention, executor._reselect, executor.device_facts
             pending_default = bool(executor._attention_load_pin)
+            # A complete override needs no canonical default yet. In particular, an
+            # author's explicit default may still be compiling in a different family.
+            if pending_default and executor._load_pin_covered(pin):
+                continue
             if applied is None or again is None or device is None:
                 continue
             if not pending_default and (
@@ -3649,6 +3660,9 @@ class Executor:
                 continue
             try:
                 fresh = again()
+            except kernel_compile.Canceled:
+                executor.attention_defaults.restore()
+                raise
             except Exception as exc:  # ordinary upgrades are optional; default restoration is not
                 print(
                     f"[attention] selecting again refused: {exc}"[:600], file=sys.stderr, flush=True
