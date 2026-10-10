@@ -1,7 +1,8 @@
 Research diagnostic for the H100 audio difference between runs 5331 and 5332.
 
 Add `audio_boundary.py` to the frozen local H3 package and point its application
-entrypoint at `audio_boundary:app`. The original H3 functions remain registered.
+entrypoint at `audio_boundary:app`. This separate research app exposes only the
+diagnostic; the captured `h3.py` and published H3 functions are unchanged.
 The new callable uses the same text-only preparation, conditioning and full
 eight-step Turbo method, with the same four-dense/four-sparse schedule. It omits
 video decode and encoding, so its duration is not a video generation benchmark.

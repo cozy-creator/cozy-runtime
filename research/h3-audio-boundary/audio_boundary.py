@@ -18,10 +18,10 @@ import h3
 import msgspec
 import torch
 
-from cozy_runtime.author import AssetBound, Context, FileAsset, Outputs, Telemetry
+from cozy_runtime.author import App, AssetBound, Context, FileAsset, Outputs, Telemetry
 from cozy_runtime.models.minimax_h3.model import H3TurboBase, H3TurboLoRA
 
-app = h3.app
+app = App()
 
 
 class AudioBoundaryOutput(msgspec.Struct):
