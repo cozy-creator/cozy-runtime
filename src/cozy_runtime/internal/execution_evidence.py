@@ -47,6 +47,13 @@ class RuntimeGPU(TypedDict):
     pci_bus_id: str
 
 
+class AttentionFallback(TypedDict):
+    component: str
+    preferred: str
+    selected: str
+    reason: str
+
+
 class Boot(TypedDict):
     """`Applied.document()`, the boot record as it crosses the executor seam (cr-124). A
     group's `merge` keys `artifacts` by model parameter, then kernel."""
@@ -57,6 +64,7 @@ class Boot(TypedDict):
     pin: str
     artifacts: NotRequired[dict[str, object]]
     skipped: NotRequired[dict[str, str]]
+    fallbacks: NotRequired[list[AttentionFallback]]
     line: str
 
 
@@ -68,6 +76,7 @@ class RankAttention(TypedDict):
     impl: str
     kernels: NotRequired[list[dict[str, object]]]
     segments: NotRequired[list[dict[str, object]]]
+    fallbacks: NotRequired[list[AttentionFallback]]
 
 
 class RankEvidence(TypedDict):
@@ -104,12 +113,15 @@ def attention(
     impl: str = "",
     kernels: Sequence[Mapping[str, Any]] = (),
     segments: Sequence[Mapping[str, Any]] = (),
+    fallbacks: Sequence[AttentionFallback] = (),
 ) -> RankAttention:
     row = RankAttention(requested=requested, observed=observed, impl=impl)
     if kernels:
         row["kernels"] = [dict(kernel) for kernel in kernels]
     if segments:
         row["segments"] = [dict(segment) for segment in segments]
+    if fallbacks:
+        row["fallbacks"] = list(fallbacks)
     return row
 
 

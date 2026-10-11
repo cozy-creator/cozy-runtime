@@ -70,6 +70,8 @@ def test_qualified_architectures_choose_fixed_hybrids_and_others_retain_fallback
     else:
         expected = "sol-attn" if sm in {89, 90, 100} else "sdpa"
     assert selected.hosts == {"fl2va_dit": {expected: 1}}
+    if sm in {90, 120}:
+        assert not selected.fallbacks
     assert attention.observed(modules).hosts == selected.hosts
     assert isinstance(modules["fl2va_dit"][0].processor, attention_producer.Processor) == (
         sm == 120 or (degree == 1 and sm == 121)
@@ -210,6 +212,20 @@ def test_nonmatching_wheel_keeps_existing_default_but_allows_explicit_recipe(
         model = object.__new__(H3Model)
         selected = attention.install(ready(), roots(), device=device, choose=model.choose_attention)
         assert selected.hosts == {"fl2va_dit": {"sol-attn": 1}}
+        assert not selected.fallbacks
+        other_package = attention.install(
+            ready(),
+            roots(),
+            device=device,
+            choose=lambda context: ("kitchen-sol-fp4-lowmem", "sdpa"),
+        )
+        assert other_package.hosts == {"fl2va_dit": {"kitchen-sol-fp4-lowmem": 1}}
+        assert not other_package.fallbacks
+        explicit_model = attention.install(
+            ready(), roots(), device=device, choose=lambda context: "kitchen-sol-fp4-lowmem"
+        )
+        assert explicit_model.hosts == {"fl2va_dit": {"kitchen-sol-fp4-lowmem": 1}}
+        assert not explicit_model.fallbacks
         explicit = attention.install(
             ready(),
             roots(),

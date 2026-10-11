@@ -28,3 +28,5 @@ class AttentionContext:
     eligible: tuple[str, ...]
     recommended: str
     recommendation_reason: str
+    #: Eligible kernels with a compatible Runtime-provided wheel. Others may build from source.
+    prebuilt: tuple[str, ...] = ()

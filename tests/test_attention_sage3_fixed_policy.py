@@ -63,7 +63,6 @@ def test_fixed_recipe_supports_context_parallel_diffusers_registry() -> None:
 def test_h3_prefers_the_qualified_hybrid_without_promoting_all_dense() -> None:
     pytest.importorskip("torch")
     pytest.importorskip("diffusers")
-    from cozy_runtime.internal.kernel_sources import reviewed_kitchen_wheel_compatible
     from cozy_runtime.models.minimax_h3.model import (
         BLACKWELL_DIT_ATTENTION,
         DIT_ATTENTION,
@@ -84,10 +83,10 @@ def test_h3_prefers_the_qualified_hybrid_without_promoting_all_dense() -> None:
         (HYBRID, DENSE, "kitchen-sol-fp4-lowmem"),
         "sdpa",
         "",
+        prebuilt=(HYBRID, "kitchen-sol-fp4-lowmem"),
     )
     model = object.__new__(H3Model)
-    expected = BLACKWELL_DIT_ATTENTION if reviewed_kitchen_wheel_compatible() else DIT_ATTENTION
-    assert model.choose_attention(context) == expected
+    assert model.choose_attention(context) == BLACKWELL_DIT_ATTENTION
 
 
 def test_hybrid_changes_only_dense_callback_and_keeps_producer_policy(monkeypatch: Any) -> None:

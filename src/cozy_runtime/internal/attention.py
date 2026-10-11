@@ -1020,6 +1020,8 @@ class Applied:
     skipped: dict[str, str] | None = None
     #: kernels this selection passed over while they compiled: ready, they are selected again
     waiting: tuple[str, ...] = ()
+    #: Selection-time reasons; later compile progress must not rewrite why a fallback ran.
+    fallbacks: tuple[execution_evidence.AttentionFallback, ...] = ()
 
     def joined(self, later: Applied) -> Applied:
         """This selection and one that served after it in the same run: every kernel each
@@ -1028,7 +1030,10 @@ class Applied:
         for component, kernels in later.hosts.items():
             hosts.setdefault(component, {}).update(kernels)
         artifacts = {**(self.artifacts or {}), **(later.artifacts or {})}
-        return replace(self, hosts=hosts, artifacts=artifacts or None)
+        fallbacks = self.fallbacks + tuple(
+            row for row in later.fallbacks if row not in self.fallbacks
+        )
+        return replace(self, hosts=hosts, artifacts=artifacts or None, fallbacks=fallbacks)
 
     def totals(self) -> dict[str, int]:
         out: dict[str, int] = {}
@@ -1045,11 +1050,12 @@ class Applied:
             self.pin,
             self.artifacts or {},
             self.skipped or {},
+            self.fallbacks,
         )
 
     def line(self) -> str:
         """The ONE line a pod prints at boot. It is the whole per-run attention record."""
-        return line(self.totals(), self.hosts, list(self.offered), self.pin, self.skipped or {})
+        return self.document()["line"]
 
 
 def line(
@@ -1080,6 +1086,7 @@ def _boot(
     pin: str,
     artifacts: Mapping[str, object],
     skipped: dict[str, str],
+    fallbacks: Sequence[execution_evidence.AttentionFallback] = (),
 ) -> execution_evidence.Boot:
     # RENDERED HERE, not by the worker: one renderer for the one line, in the module that
     # knows what it means.
@@ -1090,6 +1097,13 @@ def _boot(
         pin=pin,
         line=line(kernels, hosts, offered, pin, skipped),
     )
+    if fallbacks:
+        boot["fallbacks"] = list(fallbacks)
+        boot["line"] += "; " + "; ".join(
+            f"{row['component']}: selected {row['selected']} instead of "
+            f"{row['preferred']}: {row['reason']}"
+            for row in fallbacks
+        )
     if artifacts:
         boot["artifacts"] = dict(artifacts)
     if skipped:
@@ -1106,6 +1120,7 @@ def merge(documents: Mapping[str, object]) -> execution_evidence.Boot | None:
     pins: set[str] = set()
     artifacts: dict[str, object] = {}
     skipped: dict[str, str] = {}
+    fallbacks: list[execution_evidence.AttentionFallback] = []
     for parameter, document in documents.items():
         if not document:
             continue
@@ -1126,10 +1141,14 @@ def merge(documents: Mapping[str, object]) -> execution_evidence.Boot | None:
             artifacts[parameter] = row["artifacts"]
         if "skipped" in row:
             skipped.update(row["skipped"])
+        fallbacks.extend(
+            {**held, "component": f"{parameter}/{held['component']}"}
+            for held in row.get("fallbacks", ())
+        )
     if not kernels:
         return None
     pin = "+".join(sorted(pins))
-    return _boot(kernels, hosts, offered, pin, artifacts, skipped)
+    return _boot(kernels, hosts, offered, pin, artifacts, skipped, fallbacks)
 
 
 def _pin_parts(pin: str) -> tuple[str, str]:
@@ -1277,6 +1296,7 @@ def install(
     matched = False
     eligible_sites: dict[tuple[str, int], tuple[str, ...]] = {}
     sol_order: tuple[str, ...] | None = None
+    fallbacks: list[execution_evidence.AttentionFallback] = []
     for component, path, module, processor in _attention_records(roots):
         dtype, head_dim = _dtype(module), _head_dim(module)
         forced = bool(name and _matches(component, scope))
@@ -1329,6 +1349,7 @@ def install(
             raise detail
         entry = offered[0]
         preferred = forced or isinstance(processor, ClassicSdpa)
+        preference: Sequence[str] = ()
         if choose is not None and not forced:
             assert device is not None
             key = (dtype, head_dim)
@@ -1351,9 +1372,16 @@ def install(
                 eligible,
                 entry.name,
                 entry.candidate.why,
+                prebuilt=tuple(
+                    name
+                    for name in eligible
+                    if BY_NAME[name].import_name == "comfy_kitchen"
+                    and kernel_sources.reviewed_kitchen_wheel_compatible()
+                ),
             )
             selection = choose(context)
             if isinstance(selection, (tuple, list)):
+                preference = selection
                 found = _preferred(selection, device, dtype, head_dim, degree, resolved, refused)
                 preferred = preferred or found is not None
                 entry = found or entry
@@ -1378,6 +1406,23 @@ def install(
                 if _admits(candidate, dtype, head_dim)
             ]
             entry = _preferred(above, device, dtype, head_dim, degree, resolved, refused) or entry
+            if not preference:
+                preference = above
+        for preferred_name in preference:
+            if preferred_name == entry.name:
+                break
+            fallback_reason = refused.get(preferred_name) or refused.get(
+                f"{preferred_name} at {dtype or 'unknown'}/{head_dim or 'unknown'}"
+            )
+            if fallback_reason:
+                fallback = execution_evidence.AttentionFallback(
+                    component=component,
+                    preferred=preferred_name,
+                    selected=entry.name,
+                    reason=fallback_reason,
+                )
+                if fallback not in fallbacks:
+                    fallbacks.append(fallback)
         assignments.append((component, path, module, processor, entry))
         hosts.setdefault(component, {})
         hosts[component][entry.name] = hosts[component].get(entry.name, 0) + 1
@@ -1399,7 +1444,9 @@ def install(
         skipped.update(refused)
     artifacts = {name: entry.artifact for name, entry in resolved.items() if entry.artifact}
     waiting = tuple(sorted(n for n, state in _STATES.items() if state.state == "compiling"))
-    return Applied(hosts, tuple(resolved), pin, artifacts or None, waiting=waiting)
+    return Applied(
+        hosts, tuple(resolved), pin, artifacts or None, refused or None, waiting, tuple(fallbacks)
+    )
 
 
 def _install_sites(records: Sequence[tuple[Ready, str, str, Any]]) -> None:
