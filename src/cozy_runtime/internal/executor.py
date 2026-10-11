@@ -785,7 +785,7 @@ class Executor:
             if command.application
             else discover_distribution(command.distribution, seconds=None)
         )
-        body = package_interface.build(discovered)
+        body = package_interface.build(discovered, installed=True)
         raw = package_interface.canonical_bytes(body)
         with output.open("xb") as stream:
             stream.write(raw)

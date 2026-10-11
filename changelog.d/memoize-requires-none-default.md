@@ -1,0 +1,1 @@
+Describe refuses `Memoize(requires=[...])` naming a parameter without a None default (declare `seed: int | None = None` and draw the seed in the function), since clients fill an omitted plain `int` seed and every request would be memoized. Installed releases still describe under the rules they were published with.

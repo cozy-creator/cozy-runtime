@@ -19,7 +19,7 @@ from cozy_runtime.author import App, Context, Memoize, invocable
 class Request(msgspec.Struct, kw_only=True):
     prompt: str
     seed: int | None = None
-    count: int = msgspec.field(name="wire_count", default=1)
+    count: int | None = msgspec.field(name="wire_count", default=None)
 
 class Result(msgspec.Struct):
     value: str
@@ -116,6 +116,18 @@ def test_static_and_imported_describe_state_the_same_memo_condition(tmp_path: Pa
             'sdk.Memoize(requires=["prompt"])',
             r'memoize requires "prompt", a required parameter of measure',
         ),
+        (
+            "seed: int | None = None) -> Result",
+            "seed: int = 1005) -> Result",
+            r'memoize requires "seed", so generate must default it to None: declare '
+            r"`seed: int \| None = None` and draw the seed in the function when it's None",
+        ),
+        (
+            "default=None)\n\nclass Result",
+            "default=1)\n\nclass Result",
+            r'memoize requires "wire_count", so measure must default it to None: declare '
+            r"`wire_count: int \| None = None`",
+        ),
     ],
 )
 def test_memo_condition_names_an_optional_parameter(
@@ -144,3 +156,27 @@ def test_reader_requires_memoize_for_a_memo_condition(tmp_path: Path) -> None:
     job["invocable"]["memoize"] = False
     with pytest.raises(ConformanceError, match="memo_requires needs memoize"):
         package_interface.read_bytes(canonical.write(document))
+
+
+def test_installed_release_keeps_a_concrete_default_memo_condition(tmp_path: Path) -> None:
+    """A release published before the None-default rule still installs (paul/sdxl 2.7.0)."""
+    source = SOURCE.replace("seed: int | None = None) -> Result", "seed: int = 1005) -> Result")
+    root = project(tmp_path, source)
+    with pytest.raises(ConformanceError, match="must default it to None"):
+        static_interface.build(root)
+    imported = package_interface.build(discover(root), installed=True)
+    assert declarations(imported)["generate"]["memo_requires"] == ["seed"]
+    site = tmp_path / "venv" / "lib" / "python3.12" / "site-packages"
+    metadata = site / "memo_fixture-0.1.0.dist-info"
+    metadata.mkdir(parents=True)
+    (tmp_path / "venv" / "bin").mkdir()
+    (tmp_path / "venv" / "bin" / "python").touch()
+    (tmp_path / "venv" / "pyvenv.cfg").write_text("home = /unused\n")
+    (metadata / "METADATA").write_text("Name: memo-fixture\nVersion: 0.1.0\n")
+    (metadata / "entry_points.txt").write_text("[cozy.application]\ndefault = memo_fixture:app\n")
+    (metadata / "RECORD").write_text("memo_fixture.py,,\n")
+    (site / "memo_fixture.py").write_text(source)
+    body = static_interface.build_installed(
+        "memo-fixture", environment_python=tmp_path / "venv" / "bin" / "python"
+    )
+    assert declarations(body)["generate"]["memo_requires"] == ["seed"]

@@ -152,24 +152,30 @@ class PackageInterface(msgspec.Struct, frozen=True, kw_only=True):
 # ------------------------------------------------------------------------ the document
 
 
-def build(found: Discovered) -> dict[str, Json]:
+def build(found: Discovered, *, installed: bool = False) -> dict[str, Json]:
     """Derive one package interface from the frozen (imported) application."""
     docs = [(surface.kind, _callable(surface)) for surface in found.surfaces if not surface.hidden]
-    return assemble(found.application, docs, found.bindings)
+    return assemble(found.application, docs, found.bindings, installed=installed)
 
 
 def assemble(
     application: str,
     docs: Sequence[tuple[Kind, dict[str, Json]]],
     bindings: Mapping[str, Mapping[str, object]],
+    *,
+    installed: bool = False,
 ) -> dict[str, Json]:
-    """One package interface from its callable documents, whichever reader produced them."""
+    """One package interface from its callable documents, whichever reader produced them.
+
+    `installed` describes a published wheel, so it holds that release to the rules it was
+    published under."""
     for _, doc in docs:
         declared = doc.get("invocable")
         if isinstance(declared, dict) and "memo_requires" in declared:
             invocable_interface.check_memo_requires(
                 msgspec.convert(declared, invocable_interface.Invocable, strict=True),
                 doc["request"],
+                authoring=not installed,
             )
     entrypoints: list[Json] = [doc for kind, doc in docs if kind == "entrypoint"]
     jobs: list[Json] = [doc for kind, doc in docs if kind == "job"]
