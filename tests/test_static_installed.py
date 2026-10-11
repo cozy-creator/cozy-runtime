@@ -324,7 +324,7 @@ def test_imported_memo_metadata_failure_keeps_typed_unavailability(
     def work(value: int) -> int:
         return value * 2
 
-    setattr(work, "_cozy_memo_declaration", ("", (MemoDistribution("native-helper"),)))
+    work.__dict__["_cozy_memo_declaration"] = ("", (MemoDistribution("native-helper"),))
     assert describe(work) == {
         "operation_identity_unavailable": "operation_native_identity_unavailable"
     }
