@@ -1,0 +1,1 @@
+Bundles TensorD 0.5.18: #228: a live local package's memoized calls are keyed by its file digests, so its own memo answers a repeated call (fixes a regression in 0.5.14+). TensorFS crates stay v0.7.3.
