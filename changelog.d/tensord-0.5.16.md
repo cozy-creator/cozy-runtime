@@ -1,0 +1,1 @@
+Bundles TensorD 0.5.16: #226: three accept loops pause and keep accepting when out of file descriptors instead of exiting or spinning; the weight socket no longer exits on an accept error (which took the weight server down). TensorFS crates stay v0.7.3.
