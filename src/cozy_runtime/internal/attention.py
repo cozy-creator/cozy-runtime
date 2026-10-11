@@ -1100,7 +1100,7 @@ def _boot(
     if fallbacks:
         boot["fallbacks"] = list(fallbacks)
         boot["line"] += "; " + "; ".join(
-            f"{row['component']}: using {row['selected']} instead of "
+            f"{row['component']}: selected {row['selected']} instead of "
             f"{row['preferred']}: {row['reason']}"
             for row in fallbacks
         )
@@ -1416,15 +1416,15 @@ def install(
         for preferred_name in preference:
             if preferred_name == entry.name:
                 break
-            reason = refused.get(preferred_name) or refused.get(
+            fallback_reason = refused.get(preferred_name) or refused.get(
                 f"{preferred_name} at {dtype or 'unknown'}/{head_dim or 'unknown'}"
             )
-            if reason:
+            if fallback_reason:
                 fallback = execution_evidence.AttentionFallback(
                     component=component,
                     preferred=preferred_name,
                     selected=entry.name,
-                    reason=reason,
+                    reason=fallback_reason,
                 )
                 if fallback not in fallbacks:
                     fallbacks.append(fallback)
