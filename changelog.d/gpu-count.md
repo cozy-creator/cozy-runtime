@@ -1,0 +1,1 @@
+Bundle TensorD 0.5.16: package code and machine capacity choose default GPU parallelism; explicit request counts reserve exact disjoint groups, independent of weight selection. CPU orchestration can hold a requested group for child GPU calls.
