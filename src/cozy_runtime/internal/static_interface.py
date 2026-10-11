@@ -1326,7 +1326,7 @@ def _build(
     app = reader.lookup(entry, attribute, entry.tree)
     if isinstance(app, Assigned) and _is_script_call(reader, app):
         return package_interface.assemble(
-            application, [("job", _script_doc(reader, app))], bindings
+            application, [("job", _script_doc(reader, app))], bindings, installed=installed
         )
     if not (isinstance(app, Assigned) and _is_app_call(reader, app)):
         raise StaticRefusal(
@@ -1351,7 +1351,9 @@ def _build(
             if identity is not None:
                 declared["operation_identity"] = identity
         docs[registration.name] = registration.kind, doc
-    return package_interface.assemble(application, list(docs.values()), bindings)
+    return package_interface.assemble(
+        application, list(docs.values()), bindings, installed=installed
+    )
 
 
 def _operation_identity(reader: Reader, registration: Registration) -> str | None:

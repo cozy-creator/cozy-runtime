@@ -9,7 +9,8 @@ from ._errors import ConformanceError
 @dataclass(frozen=True, slots=True, init=False)
 class Memoize:
     """`memoize=True`, but a request is memoizable only when it explicitly provides each
-    optional parameter named in `requires`; omitting one (or sending null) just runs it."""
+    optional parameter named in `requires`; omitting one (or sending null) just runs it.
+    Each named parameter defaults to None (`seed: int | None = None`)."""
 
     requires: tuple[str, ...]
 

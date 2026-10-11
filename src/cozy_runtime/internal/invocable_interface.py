@@ -172,18 +172,18 @@ def from_types(
     }
 
 
-def check_memo_requires(value: Invocable, request: object) -> None:
-    """Each memo condition names an optional request parameter a caller may omit."""
+def check_memo_requires(value: Invocable, request: object, *, authoring: bool = False) -> None:
+    """Each memo condition names an optional request parameter a caller may omit.
+
+    Authoring also requires a None default: a client may fill an omitted concrete field (the
+    CLI seeds a plain `int` seed), which would memoize every request. Readers accept older
+    interfaces declared before that rule."""
     if value.memo_requires is msgspec.UNSET:
         return
     if not value.memoize:
         raise ConformanceError("memo_requires needs memoize", code="invocable_memoize")
-    fields = request.get("fields", []) if isinstance(request, dict) else []
-    optional = {
-        field.get("name")
-        for field in fields
-        if isinstance(field, dict) and field.get("wire") in ("optional", "omissible")
-    }
+    rows = request.get("fields", []) if isinstance(request, dict) else []
+    fields = {field.get("name"): field for field in rows if isinstance(field, dict)}
     for name in value.memo_requires:
         if name not in value.parameters:
             raise ConformanceError(
@@ -191,12 +191,27 @@ def check_memo_requires(value: Invocable, request: object) -> None:
                 f"(parameters: {', '.join(value.parameters)})",
                 code="invocable_memoize",
             )
-        if name not in optional:
+        field = fields.get(name, {})
+        if field.get("wire") not in ("optional", "omissible"):
             raise ConformanceError(
                 f'memoize requires "{name}", a required parameter of {value.export}: only an '
                 "optional parameter (one with a default) can be omitted",
                 code="invocable_memoize",
             )
+        if authoring and not ("default" in field and field["default"] is None):
+            raise ConformanceError(
+                f'memoize requires "{name}", so {value.export} must default it to None: '
+                f"declare `{name}: {_hint(field.get('type'))} | None = None` and draw the "
+                f"{name} in the function when it's None",
+                code="invocable_memoize",
+            )
+
+
+def _hint(node: object) -> str:
+    if isinstance(node, dict) and isinstance(node.get("union"), list):
+        members = [member for member in node["union"] if member != "null"]
+        node = members[0] if len(members) == 1 else node
+    return node if isinstance(node, str) else "T"
 
 
 def _identifier(value: object) -> bool:
