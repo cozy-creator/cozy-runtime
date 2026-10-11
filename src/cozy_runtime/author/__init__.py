@@ -119,7 +119,7 @@ from cozy_runtime.author._markers import (
     Preflight,
     Shape,
 )
-from cozy_runtime.author._memo import MemoDistribution, MemoResource
+from cozy_runtime.author._memo import MemoDistribution, Memoize, MemoResource
 from cozy_runtime.author._model import (
     AdapterCompatibility,
     ConstructionIdentity,
@@ -253,6 +253,7 @@ __all__ = [
     "MediaDecoder",
     "MemoDistribution",
     "MemoResource",
+    "Memoize",
     "Mixed",
     "Model",
     "ModelArtifact",

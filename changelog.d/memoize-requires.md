@@ -1,0 +1,1 @@
+`memoize=Memoize(requires=("seed",))` memoizes a callable only for requests that explicitly provide each named optional parameter; the package interface states it as `memo_requires` beside `"memoize": true`, and describe refuses a name that is not an optional parameter.

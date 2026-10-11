@@ -27,6 +27,11 @@ algorithms, configuration tables or behavior-affecting global state. Arguments s
 carry varying values; a memoized function must remain deterministic for its inputs.
 The system does not infer arbitrary dynamic Python dependencies.
 
+`memoize=Memoize(requires=("seed",))` (a list also works) memoizes only requests that
+explicitly provide each named optional parameter; a request that omits one, or sends
+null, runs normally without lookup or storage. The interface keeps `"memoize": true`
+and adds `"memo_requires": ["seed"]`.
+
 An operation without a declared version, or whose source is unavailable, executes
 normally without a completed-result shortcut. Runtime reports that reason. This is
 not an installation or invocation refusal. Partial-work recovery still belongs to the

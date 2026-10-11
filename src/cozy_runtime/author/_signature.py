@@ -39,6 +39,7 @@ from cozy_runtime.author._markers import (
     ImagePreparation,
     _PreflightMarker,
 )
+from cozy_runtime.author._memo import Memoize
 from cozy_runtime.author._model import Model, component_use
 from cozy_runtime.author._model_defaults import DefaultLadder, check_model_arguments
 from cozy_runtime.author._services import SERVICES, Secrets, Settings
@@ -246,7 +247,7 @@ class Surface:
     """DECLARED but NOT PUBLISHED (#572d). Hidden callables stay in the local registry but
     are absent from the package interface, so no binding is staged and no request reaches them."""
     invocable: bool = False
-    memoize: bool = False
+    memoize: Memoize | None = None
     model_defaults: Mapping[str, DefaultLadder] = field(default_factory=dict)
     model_components: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     """Model argument -> the components this callable runs; an absent argument runs all."""
@@ -357,7 +358,7 @@ def analyze(
     internal: bool = False,
     accelerator: bool | None = None,
     invocable: bool = False,
-    memoize: bool = False,
+    memoize: Memoize | None = None,
     model_defaults: Mapping[str, DefaultLadder] | None = None,
     model_components: Mapping[str, tuple[str, ...]] | None = None,
 ) -> Surface:

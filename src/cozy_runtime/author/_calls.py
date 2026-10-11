@@ -35,7 +35,7 @@ from cozy_runtime.author._executor_requests import (
     GpuRelease,
     ModelPrefetch,
 )
-from cozy_runtime.author._memo import MemoDependency
+from cozy_runtime.author._memo import MemoDependency, Memoize, memo_policy
 from cozy_runtime.author._memo import declare as declare_memo
 from cozy_runtime.author._model_defaults import DefaultLadder, model_components, model_defaults
 from cozy_runtime.author._services import Telemetry, _progress_scope, _ProgressScope
@@ -65,7 +65,7 @@ class _Export:
     implementation: Callable[..., object]
     module: str
     name: str
-    memoize: bool = False
+    memoize: Memoize | None = None
     defaults: Mapping[str, DefaultLadder] = field(default_factory=dict)
     components: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
@@ -75,7 +75,7 @@ def invocable[**P, R](
     fn: Callable[Concatenate[Context, P], Awaitable[R]],
     /,
     *,
-    memoize: bool = False,
+    memoize: bool | Memoize = False,
     memo_version: str | None = None,
     memo_dependencies: tuple[MemoDependency, ...] = (),
     defaults: Mapping[str, Sequence[Mapping[str, str | int]]] | None = None,
@@ -86,7 +86,7 @@ def invocable[**P, R](
 @overload
 def invocable[**P, R](
     *,
-    memoize: bool = False,
+    memoize: bool | Memoize = False,
     memo_version: str | None = None,
     memo_dependencies: tuple[MemoDependency, ...] = (),
     defaults: Mapping[str, Sequence[Mapping[str, str | int]]] | None = None,
@@ -98,7 +98,7 @@ def invocable[**P, R](
     fn: Callable[Concatenate[Context, P], Awaitable[R]] | None = None,
     /,
     *,
-    memoize: bool = False,
+    memoize: bool | Memoize = False,
     memo_version: str | None = None,
     memo_dependencies: tuple[MemoDependency, ...] = (),
     defaults: Mapping[str, Sequence[Mapping[str, str | int]]] | None = None,
@@ -122,11 +122,10 @@ def invocable[**P, R](
     affects the result; source changes invalidate reuse without a manual version
     bump. Optional ``memo_version`` salts behavior outside those sources, such as
     native algorithms or data tables. Unavailable source disables reuse, not execution.
+    ``memoize=Memoize(requires=("seed",))`` memoizes only requests that explicitly provide
+    each named optional parameter; any other request runs without lookup or storage.
     """
-    if type(memoize) is not bool:
-        raise ConformanceError(
-            "invocable memoization declaration must be a boolean", code="invocable_memoize"
-        )
+    policy = memo_policy(memoize)
     if fn is None:
         return lambda target: invocable(
             target,
@@ -140,12 +139,14 @@ def invocable[**P, R](
         raise ConformanceError(
             "an invocable must be a module-level async function", code="invocable_signature"
         )
-    declare_memo(fn, memoize=memoize, version=memo_version, dependencies=memo_dependencies)
+    declare_memo(
+        fn, memoize=policy is not None, version=memo_version, dependencies=memo_dependencies
+    )
     export = _Export(
         fn,
         fn.__module__,
         fn.__name__,
-        memoize,
+        policy,
         model_defaults(defaults),
         model_components(components),
     )
