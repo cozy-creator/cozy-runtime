@@ -1237,17 +1237,6 @@ def _preferred(
             continue
         if name in refused:
             continue
-        # Automatic Kitchen recipes require the reviewed platform wheel. Explicit
-        # model choices and request pins still resolve their own source builds.
-        if (
-            candidate.import_name == "comfy_kitchen"
-            and not kernel_sources.reviewed_kitchen_wheel_compatible()
-        ):
-            refused[name] = (
-                "no reviewed Kitchen wheel matches this Python/platform; "
-                "source builds require an explicit kernel choice"
-            )
-            continue
         entry = resolved.get(name)
         if entry is not None:
             if (
@@ -1383,6 +1372,12 @@ def install(
                 eligible,
                 entry.name,
                 entry.candidate.why,
+                prebuilt=tuple(
+                    name
+                    for name in eligible
+                    if BY_NAME[name].import_name == "comfy_kitchen"
+                    and kernel_sources.reviewed_kitchen_wheel_compatible()
+                ),
             )
             selection = choose(context)
             if isinstance(selection, (tuple, list)):

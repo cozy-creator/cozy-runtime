@@ -83,6 +83,7 @@ def test_h3_prefers_the_qualified_hybrid_without_promoting_all_dense() -> None:
         (HYBRID, DENSE, "kitchen-sol-fp4-lowmem"),
         "sdpa",
         "",
+        prebuilt=(HYBRID, "kitchen-sol-fp4-lowmem"),
     )
     model = object.__new__(H3Model)
     assert model.choose_attention(context) == BLACKWELL_DIT_ATTENTION

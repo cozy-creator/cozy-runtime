@@ -212,8 +212,15 @@ def test_nonmatching_wheel_keeps_existing_default_but_allows_explicit_recipe(
         model = object.__new__(H3Model)
         selected = attention.install(ready(), roots(), device=device, choose=model.choose_attention)
         assert selected.hosts == {"fl2va_dit": {"sol-attn": 1}}
-        assert selected.fallbacks
-        assert all("no reviewed Kitchen wheel" in row["reason"] for row in selected.fallbacks)
+        assert not selected.fallbacks
+        other_package = attention.install(
+            ready(),
+            roots(),
+            device=device,
+            choose=lambda context: ("kitchen-sol-fp4-lowmem", "sdpa"),
+        )
+        assert other_package.hosts == {"fl2va_dit": {"kitchen-sol-fp4-lowmem": 1}}
+        assert not other_package.fallbacks
         explicit_model = attention.install(
             ready(), roots(), device=device, choose=lambda context: "kitchen-sol-fp4-lowmem"
         )
