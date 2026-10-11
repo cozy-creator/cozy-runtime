@@ -1,0 +1,1 @@
+Bundles TensorD 0.5.19: #230: a memoized function run directly (a top-level run) consults and fills the machine memo, and a run's outcome and its calls say how the memo answered them; `Memoize(requires=[…])` conditions. TensorFS crates stay v0.7.3.
