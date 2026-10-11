@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -27,7 +28,13 @@ from test_kernel_compile import _held, _registry
 # Imported fixture retains the real private kernel store and builder subprocess setup.
 __all__ = ["store"]
 
+requires_attention_dependencies = pytest.mark.skipif(
+    any(importlib.util.find_spec(name) is None for name in ("torch", "diffusers")),
+    reason="real attention execution requires Torch and Diffusers",
+)
 
+
+@requires_attention_dependencies
 def test_cold_reason_survives_compile_completion_and_next_request_is_clean(
     store: kernel_cache.Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -69,6 +76,7 @@ def test_cold_reason_survives_compile_completion_and_next_request_is_clean(
         builder.wait()
 
 
+@requires_attention_dependencies
 def test_explicit_pin_is_not_mislabeled_as_an_automatic_fallback(
     store: kernel_cache.Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -89,6 +97,7 @@ def test_explicit_pin_is_not_mislabeled_as_an_automatic_fallback(
         builder.wait()
 
 
+@requires_attention_dependencies
 def test_failed_build_retains_actual_failure_reason(
     store: kernel_cache.Store, tmp_path: Path
 ) -> None:
@@ -122,6 +131,7 @@ def test_scoped_pin_does_not_hide_other_components_or_invent_a_served_kernel(
     ).fallbacks
 
 
+@requires_attention_dependencies
 def test_explicit_compiling_pin_still_waits_and_never_falls_back(
     store: kernel_cache.Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
