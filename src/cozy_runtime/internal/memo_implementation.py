@@ -2,41 +2,24 @@
 
 from __future__ import annotations
 
-import ast
-import copy
 import hashlib
 import importlib.metadata
 import importlib.resources
 import importlib.util
 import inspect
-import json
 import sys
 import textwrap
 from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 
-import msgspec
-
 from cozy_runtime.author._memo import MemoDependency, MemoDistribution, MemoResource
 
-MAX_SOURCE_BYTES = 1 << 20
-
-
-class _Archive(msgspec.Struct, frozen=True):
-    hash: str = ""
-    hashes: dict[str, str] = {}
-
-
-class _Vcs(msgspec.Struct, frozen=True):
-    commit_id: str = ""
-
-
-class _DirectUrl(msgspec.Struct, frozen=True):
-    """PEP 610 `direct_url.json`: exactly one of the three origins is present."""
-
-    archive_info: _Archive | None = None
-    vcs_info: _Vcs | None = None
-    dir_info: dict[str, object] | None = None
+from cozy_runtime.internal.memo_identity import (
+    MAX_SOURCE_BYTES,
+    definitions_identity,
+    distribution_identity,
+    normalized,
+)
 
 
 def describe(fn: Callable[..., object]) -> dict[str, str]:
@@ -86,23 +69,12 @@ def describe(fn: Callable[..., object]) -> dict[str, str]:
                     source = stream.read(MAX_SOURCE_BYTES + 1)
                 if len(source) > MAX_SOURCE_BYTES:
                     raise ValueError("helper source exceeds bound")
-                definitions.append((dependency, _normalized(source)))
+                definitions.append((dependency, normalized(source)))
             else:
                 definitions.append(_definition(dependency))
     except (ImportError, OSError, TypeError, ValueError, SyntaxError):
         return {"operation_identity_unavailable": "operation_source_unavailable"}
     return {"operation_identity": definitions_identity(version, definitions)}
-
-
-def definitions_identity(version: str, definitions: list[tuple[str, str]]) -> str:
-    """The operation identity of a callable's definitions, however they were read."""
-    document = json.dumps(
-        {"operation_version": version, "definitions": definitions},
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=True,
-    ).encode()
-    return "sha256:" + hashlib.sha256(document).hexdigest()
 
 
 def _definition(fn: Callable[..., object]) -> tuple[str, str]:
@@ -112,73 +84,18 @@ def _definition(fn: Callable[..., object]) -> tuple[str, str]:
     source = textwrap.dedent(inspect.getsource(fn))
     if len(source.encode()) > MAX_SOURCE_BYTES:
         raise ValueError("operation source exceeds bound")
-    return (fn.__module__ + "." + fn.__qualname__, _normalized(source, callable_only=True))
-
-
-def _normalized(source: str | bytes, *, callable_only: bool = False) -> str:
-    node = ast.parse(source)
-    if callable_only:
-        if len(node.body) != 1 or not isinstance(
-            node.body[0], (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
-        ):
-            raise ValueError("operation source is not one definition")
-        return normalized_definition(node.body[0])
-    return ast.dump(node, annotate_fields=True, include_attributes=False)
-
-
-def normalized_definition(node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) -> str:
-    """One definition as its own module, decorators dropped: its behavior, not its placement."""
-    bare = copy.copy(node)
-    bare.decorator_list = []
-    module = ast.Module(body=[bare], type_ignores=[])
-    return ast.dump(module, annotate_fields=True, include_attributes=False)
+    return (fn.__module__ + "." + fn.__qualname__, normalized(source, callable_only=True))
 
 
 def _native_identity(name: str) -> str | None:
     """Cheap explicit native metadata; never enumerate RECORD or hash binaries."""
     try:
-        return distribution_identity(importlib.metadata.distribution(name))
-    except importlib.metadata.PackageNotFoundError:
-        return None
-
-
-def distribution_identity(distribution: importlib.metadata.Distribution) -> str | None:
-    """An installed distribution's build as metadata states it, read from its files only."""
-    try:
-        version = distribution.version
-        wheel = distribution.read_text("WHEEL")
-        if not version or not wheel:
-            return None
-        tags = sorted(line for line in wheel.splitlines() if line.startswith(("Tag:", "Build:")))
-        if not tags:
-            return None
-        provenance: dict[str, object] = {}
-        direct = distribution.read_text("direct_url.json")
-        if direct:
-            source = msgspec.json.decode(direct, type=_DirectUrl)
-            archive, vcs = source.archive_info, source.vcs_info
-            if source.dir_info is not None or (vcs is None and archive is None):
-                return None
-            # uv may record a local immutable wheel with archive_info={}.
-            # Its version and wheel tags still supply the declared native build
-            # contract; include archive hashes when the installer retains them.
-            if archive is not None and archive.hashes:
-                provenance["archive_hashes"] = archive.hashes
-            elif archive is not None and archive.hash:
-                provenance["archive_hash"] = archive.hash
-            if vcs is not None:
-                if not vcs.commit_id:
-                    return None
-                provenance["commit"] = vcs.commit_id
-        return json.dumps(
-            {
-                "version": version,
-                "wheel": tags,
-                "build": provenance,
-                "abi": sys.implementation.cache_tag,
-            },
-            sort_keys=True,
-            separators=(",", ":"),
+        distribution = importlib.metadata.distribution(name)
+        return distribution_identity(
+            distribution.version,
+            distribution.read_text("WHEEL"),
+            distribution.read_text("direct_url.json"),
+            sys.implementation.cache_tag,
         )
     except (importlib.metadata.PackageNotFoundError, OSError, TypeError, ValueError):
         return None

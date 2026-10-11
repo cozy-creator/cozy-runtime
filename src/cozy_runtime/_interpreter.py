@@ -6,6 +6,9 @@ import sysconfig
 from pathlib import Path
 
 
+CACHE_TAG = sys.implementation.cache_tag
+
+
 def supported_minors() -> tuple[str, ...]:
     policy = json.loads(Path(__file__).with_name("python-window.json").read_text())
     return tuple(policy["minors"])

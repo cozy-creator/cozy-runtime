@@ -15,7 +15,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from importlib import import_module
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Never, Unpack
 
 from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT, AttentionLayout
 from cozy_runtime.internal import (
@@ -29,9 +29,17 @@ from cozy_runtime.internal.encoding import leaves
 from cozy_runtime.internal.encoding.leaves import PreQuantized
 
 if TYPE_CHECKING:
+    from cozy_runtime.internal.attention_ulysses import PartialOptions
+
     from collections.abc import Callable
 
-    from diffusers.models.transformers.transformer_minimax_h3 import MiniMaxH3Attention
+    from diffusers.models.attention_dispatch import AttentionBackendName
+    from diffusers.models._modeling_parallel import ParallelConfig
+    from diffusers.models.transformers.transformer_minimax_h3 import (
+        MiniMaxH3Attention,
+        MiniMaxH3AttnProcessor,
+        FusedMiniMaxH3AttnProcessor,
+    )
     from torch import Tensor
 
 NAMES = frozenset(
@@ -96,11 +104,11 @@ def request_scope(state: RequestState | None = None) -> Iterator[RequestState]:
         _STATE.reset(token)
 
 
-def _missing_processor(*args: Any) -> Any:
+def _missing_processor(*args: object) -> Never:
     raise ValueError("Kitchen producer requires its H3 instance processor before QKV projection")
 
 
-def rows(value: Any, start: int, stop: int) -> Any:
+def rows(value: Tensor | PreQuantized, start: int, stop: int) -> Tensor | PreQuantized:
     """View-only rows: preserve encoded payload/scales, never requantize an activation."""
     if isinstance(value, PreQuantized):
         if len(value.shape) != 3 or value.shape[0] != 1:
@@ -111,7 +119,7 @@ def rows(value: Any, start: int, stop: int) -> Any:
     return value[:, start:stop]
 
 
-def shared_qkv_refusal(attn: Any) -> str:
+def shared_qkv_refusal(attn: MiniMaxH3Attention) -> str:
     """Only known tensor-preserving hooks may share the positional operand's codes.
 
     WeightResidency wraps forward rather than registering a pre-hook. Calling the
@@ -134,13 +142,13 @@ def shared_qkv_refusal(attn: Any) -> str:
 
 
 def qkv_chunks(
-    attn: Any,
-    hidden: Any,
+    attn: MiniMaxH3Attention,
+    hidden: Tensor | PreQuantized,
     tokens: int,
     *,
     shared: bool = False,
     counts: dict[str, int] | None = None,
-) -> Iterator[Any]:
+) -> Iterator[Tensor]:
     import torch
 
     refusal = shared_qkv_refusal(attn) if shared else "disabled"
@@ -166,7 +174,7 @@ def qkv_chunks(
         ).squeeze(0)
 
 
-def rope_presentation(rotary: tuple[Any, Any], tokens: int, state: RequestState) -> Any:
+def rope_presentation(rotary: tuple[Tensor, Tensor], tokens: int, state: RequestState) -> Tensor:
     import torch
 
     cos, sin = rotary
@@ -219,28 +227,32 @@ def sparse_step(layout: AttentionLayout, site: attention_sol.Site) -> bool:
 class Processor:
     """A wrapper installed on one H3 instance; restoring its backend restores original execution."""
 
-    def __init__(self, original: Any) -> None:
+    def __init__(self, original: MiniMaxH3AttnProcessor | FusedMiniMaxH3AttnProcessor) -> None:
         self.original = original
 
     @property
-    def _attention_backend(self) -> Any:
+    def _attention_backend(self) -> AttentionBackendName | str | None:
         return self.original._attention_backend
 
     @_attention_backend.setter
-    def _attention_backend(self, value: Any) -> None:
+    def _attention_backend(self, value: AttentionBackendName | str | None) -> None:
         self.original._attention_backend = value
 
     @property
-    def _parallel_config(self) -> Any:
+    def _parallel_config(self) -> ParallelConfig | None:
         return self.original._parallel_config
 
     @_parallel_config.setter
-    def _parallel_config(self, value: Any) -> None:
+    def _parallel_config(self, value: ParallelConfig | None) -> None:
         self.original._parallel_config = value
 
     def __call__(
-        self, attn: Any, hidden_states: Any, rotary_emb: Any = None, attention_mask: Any = None
-    ) -> Any:
+        self,
+        attn: MiniMaxH3Attention,
+        hidden_states: Tensor | PreQuantized,
+        rotary_emb: tuple[Tensor, Tensor] | None = None,
+        attention_mask: Tensor | None = None,
+    ) -> Tensor:
         backend = getattr(self._attention_backend, "value", str(self._attention_backend))
         name = BACKENDS.get(backend)
         if name is None:
@@ -496,7 +508,7 @@ def install_parallel_rotary(component: object) -> None:
     registry.register_hook(RetainRotary(), "cozy_cp_producer_rotary")
 
 
-def validate(module: Any) -> None:
+def validate(module: object) -> None:
     from diffusers.models.transformers.transformer_minimax_h3 import MiniMaxH3Attention
 
     if not isinstance(module, MiniMaxH3Attention) or module.fused_projections:
@@ -516,13 +528,15 @@ def validate(module: Any) -> None:
                 raise ValueError("Kitchen producer cannot replay an unknown projection hook")
 
 
-def install(module: Any) -> None:
+def install(module: MiniMaxH3Attention) -> None:
     validate(module)
     if not isinstance(module.processor, Processor):
         module.set_processor(Processor(module.processor))
 
 
-def materialized_kitchen(query: Any, key: Any, value: Any, **options: Any) -> Any:
+def materialized_kitchen(
+    query: Tensor, key: Tensor, value: Tensor, **options: Unpack[PartialOptions]
+) -> Tensor:
     return attention_sol._attention(
         query,
         key,
@@ -534,7 +548,9 @@ def materialized_kitchen(query: Any, key: Any, value: Any, **options: Any) -> An
     )
 
 
-def materialized_fp4_lowmem(query: Any, key: Any, value: Any, **options: Any) -> Any:
+def materialized_fp4_lowmem(
+    query: Tensor, key: Tensor, value: Tensor, **options: Unpack[PartialOptions]
+) -> Tensor:
     return attention_sol._attention(
         query,
         key,
@@ -547,7 +563,7 @@ def materialized_fp4_lowmem(query: Any, key: Any, value: Any, **options: Any) ->
 
 
 def materialized_fp4_fixed_means(
-    query: Tensor, key: Tensor, value: Tensor, **options: Any
+    query: Tensor, key: Tensor, value: Tensor, **options: Unpack[PartialOptions]
 ) -> Tensor:
     return attention_sol._attention(
         query,

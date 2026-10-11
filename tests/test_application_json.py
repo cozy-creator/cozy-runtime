@@ -8,7 +8,7 @@ import pytest
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author import App, Invocation, attempt
-from cozy_runtime.internal import application_json
+from cozy_runtime import _application_json as application_json
 from cozy_runtime.internal.executor import _serialize_result
 
 

@@ -13,15 +13,17 @@ import math
 from collections.abc import Callable, Collection
 from importlib import import_module
 from types import ModuleType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Unpack
 
 if TYPE_CHECKING:
+    from cozy_runtime.internal.attention_ulysses import PartialOptions
+
     from torch import Tensor
 
 from cozy_runtime.internal import attention_fp8
 from cozy_runtime.internal.attention_ulysses import Local, Options
 
-# Tensors and torch's SDPA backend enum are `Any`: torch is not installed in the check venv.
+# Optional dependencies are named under TYPE_CHECKING so base imports stay Torch-free.
 
 #: The loaded FlashAttention-3 snapshot (`kernels` loads it under a generated module name)
 #: and the build variant it came from.
@@ -35,7 +37,12 @@ def bind_fa3(module: ModuleType, variant: str) -> None:
 
 
 def _options(
-    name: str, attn_mask: Any, dropout_p: float, scale: float | None, *, masks: bool = False
+    name: str,
+    attn_mask: Tensor | None,
+    dropout_p: float,
+    scale: float | None,
+    *,
+    masks: bool = False,
 ) -> None:
     if dropout_p != 0.0:
         raise ValueError(f"{name} is an inference kernel and does not support dropout")
@@ -45,12 +52,12 @@ def _options(
         raise ValueError("attention scale must be finite")
 
 
-def _heads(query: Any, key: Any, enable_gqa: bool) -> None:
+def _heads(query: Tensor, key: Tensor, enable_gqa: bool) -> None:
     if query.shape[2] != key.shape[2] and not enable_gqa:
         raise ValueError("unequal Q/KV head counts require enable_gqa=True")
 
 
-def _output(output: Any, query: Any) -> Any:
+def _output(output: Tensor, query: Tensor) -> Tensor:
     import torch
 
     if (
@@ -63,7 +70,7 @@ def _output(output: Any, query: Any) -> Any:
     return output
 
 
-def _first(output: Any) -> Any:
+def _first(output: Tensor | tuple[Tensor, ...] | list[Tensor]) -> Tensor:
     return output[0] if isinstance(output, (tuple, list)) else output
 
 
@@ -71,16 +78,16 @@ def _first(output: Any) -> Any:
 
 
 def sdpa(
-    query: Any,
-    key: Any,
-    value: Any,
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
     *,
-    attn_mask: Any = None,
+    attn_mask: Tensor | None = None,
     dropout_p: float = 0.0,
     is_causal: bool = False,
     scale: float | None = None,
     enable_gqa: bool = False,
-) -> Any:
+) -> Tensor:
     """`scaled_dot_product_attention` with Diffusers' native semantics, 2D key masks included."""
     import torch
 
@@ -104,7 +111,7 @@ def sdpa(
     ).transpose(1, 2)
 
 
-def sdpa_impl(query: Any, key: Any, value: Any, options: Options) -> str:
+def sdpa_impl(query: Tensor, key: Tensor, value: Tensor, options: Options) -> str:
     """The backend torch's SDPA dispatcher picks for exactly these operands."""
     import torch
     from torch.nn.attention import SDPBackend
@@ -124,7 +131,7 @@ def sdpa_impl(query: Any, key: Any, value: Any, options: Options) -> str:
         enable_gqa=options["enable_gqa"],
     )
     backend = SDPBackend(choice)
-    names: dict[Any, str] = {
+    names: dict[SDPBackend, str] = {
         SDPBackend.CUDNN_ATTENTION: "cudnn",
         SDPBackend.FLASH_ATTENTION: "flash",
         SDPBackend.EFFICIENT_ATTENTION: "efficient",
@@ -134,16 +141,16 @@ def sdpa_impl(query: Any, key: Any, value: Any, options: Options) -> str:
 
 
 def cudnn(
-    query: Any,
-    key: Any,
-    value: Any,
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
     *,
-    attn_mask: Any = None,
+    attn_mask: Tensor | None = None,
     dropout_p: float = 0.0,
     is_causal: bool = False,
     scale: float | None = None,
     enable_gqa: bool = False,
-) -> Any:
+) -> Tensor:
     """SDPA restricted to torch's cuDNN backend: an identity check of `sdpa` on Hopper."""
     from torch.nn.attention import SDPBackend, sdpa_kernel
 
@@ -170,16 +177,16 @@ def _fa3() -> ModuleType:
 
 
 def fa3(
-    query: Any,
-    key: Any,
-    value: Any,
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
     *,
-    attn_mask: Any = None,
+    attn_mask: Tensor | None = None,
     dropout_p: float = 0.0,
     is_causal: bool = False,
     scale: float | None = None,
     enable_gqa: bool = False,
-) -> Any:
+) -> Tensor:
     """FlashAttention-3 BF16/FP16 forward, one KV split, as Diffusers' FA3 entry calls it."""
     _options("flash-attn3", attn_mask, dropout_p, scale)
     _heads(query, key, enable_gqa)
@@ -191,16 +198,16 @@ def fa3(
 
 
 def fa3_fp8(
-    query: Any,
-    key: Any,
-    value: Any,
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
     *,
-    attn_mask: Any = None,
+    attn_mask: Tensor | None = None,
     dropout_p: float = 0.0,
     is_causal: bool = False,
     scale: float | None = None,
     enable_gqa: bool = False,
-) -> Any:
+) -> Tensor:
     """FA3's e4m3 forward from the same snapshot: per-(batch, head) amax quantisation per
     call, the descales handed to the kernel, BF16/FP16 output from the kernel itself. Every
     scale reduces within one head, so it is head-local under Ulysses."""
@@ -213,7 +220,9 @@ def fa3_fp8(
     )
 
 
-def _e4m3(query: Any, key: Any, value: Any) -> tuple[Any, Any, Any, dict[str, Any]]:
+def _e4m3(
+    query: Tensor, key: Tensor, value: Tensor
+) -> tuple[Tensor, Tensor, Tensor, dict[str, Tensor]]:
     """Per-(batch, head) e4m3 Q/K/V and the `*_descale` keywords FA3 and FA4 take. Their
     descales are per KV head, so a grouped query (one scale per Q head) is refused."""
     if query.shape[2] != key.shape[2]:
@@ -223,16 +232,16 @@ def _e4m3(query: Any, key: Any, value: Any) -> tuple[Any, Any, Any, dict[str, An
 
 
 def fa4(
-    query: Any,
-    key: Any,
-    value: Any,
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
     *,
-    attn_mask: Any = None,
+    attn_mask: Tensor | None = None,
     dropout_p: float = 0.0,
     is_causal: bool = False,
     scale: float | None = None,
     enable_gqa: bool = False,
-) -> Any:
+) -> Tensor:
     """FlashAttention-4's CuTe-DSL forward (`flash_attn.cute`); it compiles for the card on
     first use, which preparation's probe absorbs."""
     _options("flash-attn4", attn_mask, dropout_p, scale)
@@ -242,16 +251,16 @@ def fa4(
 
 
 def fa4_fp8(
-    query: Any,
-    key: Any,
-    value: Any,
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
     *,
-    attn_mask: Any = None,
+    attn_mask: Tensor | None = None,
     dropout_p: float = 0.0,
     is_causal: bool = False,
     scale: float | None = None,
     enable_gqa: bool = False,
-) -> Any:
+) -> Tensor:
     """FlashAttention-4's SM100 e4m3 forward with FA3's per-(batch, head) descales; the kernel
     returns BF16. The public `flash_attn_func` takes no descales, so this calls the forward it
     wraps, as upstream's own FP8 benchmark does. Every scale is per head: head-local."""
@@ -276,7 +285,7 @@ def _sage(modes: dict[int, tuple[str, str, str]]) -> Local:
     INT8 Q/K with smoothed K; `entry` fixes the P/V precision. Its scales reduce within one
     head."""
 
-    def mode(query: Any) -> tuple[str, str, str]:
+    def mode(query: Tensor) -> tuple[str, str, str]:
         import torch
 
         if query.device.type != "cuda":
@@ -289,16 +298,16 @@ def _sage(modes: dict[int, tuple[str, str, str]]) -> Local:
         return found
 
     def forward(
-        query: Any,
-        key: Any,
-        value: Any,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
         *,
-        attn_mask: Any = None,
+        attn_mask: Tensor | None = None,
         dropout_p: float = 0.0,
         is_causal: bool = False,
         scale: float | None = None,
         enable_gqa: bool = False,
-    ) -> Any:
+    ) -> Tensor:
         _options("sageattention", attn_mask, dropout_p, scale)
         _heads(query, key, enable_gqa)
         entry, granularity, accumulation = mode(query)
@@ -314,7 +323,7 @@ def _sage(modes: dict[int, tuple[str, str, str]]) -> Local:
             smooth_k=True,
         )
 
-    def impl(query: Any, *_: Any) -> str:
+    def impl(query: Tensor, *_: object) -> str:
         entry, granularity, accumulation = mode(query)
         return f"{entry}({granularity}, {accumulation}, smooth_k)"
 
@@ -326,9 +335,9 @@ KITCHEN_SMS = ((8, 0), (8, 6), (8, 7), (8, 9), (9, 0), (10, 0), (10, 3), (11, 0)
 
 
 def _cuda_inputs(
-    query: Any,
-    key: Any,
-    value: Any,
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
     enable_gqa: bool,
     *,
     name: str,
@@ -373,16 +382,16 @@ def _cuda_inputs(
 
 
 def kitchen_int8(
-    query: Any,
-    key: Any,
-    value: Any,
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
     *,
-    attn_mask: Any = None,
+    attn_mask: Tensor | None = None,
     dropout_p: float = 0.0,
     is_causal: bool = False,
     scale: float | None = None,
     enable_gqa: bool = False,
-) -> Any:
+) -> Tensor:
     """Comfy Kitchen INT8 Q/K/V with unsigned INT8 P and FP32 softmax; masks preserved.
     Rotation, key shift and scales are per batch/head, so it is head-local under Ulysses."""
     if is_causal:
@@ -398,16 +407,16 @@ def kitchen_int8(
 
 
 def flashinfer_mixed(
-    query: Any,
-    key: Any,
-    value: Any,
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
     *,
-    attn_mask: Any = None,
+    attn_mask: Tensor | None = None,
     dropout_p: float = 0.0,
     is_causal: bool = False,
     scale: float | None = None,
     enable_gqa: bool = False,
-) -> Any:
+) -> Tensor:
     """Blackwell CuTe FMHA: BF16 Q/K, E4M3 V/P, BF16 output. Its V scale is one scalar over
     every head, so V is quantised per (batch, head), the kernel's scale stays 1 and each head's
     descale multiplies that head's output (attention is linear in V): head-local, and no host
@@ -471,16 +480,16 @@ def flashinfer_mixed(
 
 
 def sage3_fp4(
-    query: Any,
-    key: Any,
-    value: Any,
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
     *,
-    attn_mask: Any = None,
+    attn_mask: Tensor | None = None,
     dropout_p: float = 0.0,
     is_causal: bool = False,
     scale: float | None = None,
     enable_gqa: bool = False,
-) -> Any:
+) -> Tensor:
     """Upstream per-block-mean Sage3; explicit opt-in, never the H3 default."""
     return _sage3_fp4(
         query,
@@ -495,7 +504,9 @@ def sage3_fp4(
     )
 
 
-def sage3_fp4_global_lowmem(query: Any, key: Any, value: Any, **options: Any) -> Any:
+def sage3_fp4_global_lowmem(
+    query: Tensor, key: Tensor, value: Tensor, **options: Unpack[PartialOptions]
+) -> Tensor:
     """The same global-mean arithmetic with shorter owned-buffer lifetimes."""
     return _sage3_fp4(
         query, key, value, per_block_mean=False, release_intermediates=True, **options
@@ -507,7 +518,7 @@ def sage3_fp4_fixed_means(
     key: Tensor,
     value: Tensor,
     *,
-    attn_mask: object = None,
+    attn_mask: Tensor | None = None,
     dropout_p: float = 0.0,
     is_causal: bool = False,
     scale: float | None = None,
@@ -533,7 +544,7 @@ def sage3_fp4_fixed_means(
     return _output(result, query)
 
 
-def _sage3_global_owned(q: Any, k: Any, v: Any, *, is_causal: bool) -> Any:
+def _sage3_global_owned(q: Tensor, k: Tensor, v: Tensor, *, is_causal: bool) -> Tensor:
     import torch
 
     api = import_module("sageattn3.api")
@@ -560,18 +571,18 @@ def _sage3_global_owned(q: Any, k: Any, v: Any, *, is_causal: bool) -> Any:
 
 
 def _sage3_fp4(
-    query: Any,
-    key: Any,
-    value: Any,
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
     *,
     per_block_mean: bool,
     release_intermediates: bool = False,
-    attn_mask: Any = None,
+    attn_mask: Tensor | None = None,
     dropout_p: float = 0.0,
     is_causal: bool = False,
     scale: float | None = None,
     enable_gqa: bool = False,
-) -> Any:
+) -> Tensor:
     import torch
 
     _options("sageattention3-fp4", attn_mask, dropout_p, scale)

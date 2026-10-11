@@ -2,6 +2,7 @@
 
 import base64
 import hashlib
+import importlib.metadata
 import json
 import shutil
 import subprocess
@@ -258,10 +259,16 @@ def identities(document: dict[str, Any]) -> dict[str, object]:
 
 def test_an_installed_memoized_callable_carries_the_identity_its_import_would(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The static identity is `describe`'s: one key whether a machine reads or imports it.
     A declaration the reader cannot follow carries none (its machine uses the package)."""
     python = memo_environment(tmp_path)
+
+    def no_discovery_hooks(*args: object, **kwargs: object) -> None:
+        raise AssertionError("static inspection must not execute installed distribution finders")
+
+    monkeypatch.setattr(importlib.metadata, "distributions", no_discovery_hooks)
     found = identities(static_interface.build_installed("memo-app", environment_python=python))
     # The environment's own packages first, then this Runtime: describe() imports the App.
     site = next((python.parent.parent / "lib").glob("python*/site-packages"))
@@ -298,3 +305,26 @@ def test_a_changed_function_changes_only_its_own_identity(tmp_path: Path) -> Non
     )
     assert after["first"] == before["first"]
     assert after["second"] != before["second"]
+
+
+def test_imported_memo_metadata_failure_keeps_typed_unavailability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cozy_runtime.author import MemoDistribution
+    from cozy_runtime.internal.memo_implementation import describe
+
+    class BrokenDistribution:
+        version = "1.0"
+
+        def read_text(self, name: str) -> str:
+            raise OSError("metadata disappeared")
+
+    monkeypatch.setattr(importlib.metadata, "distribution", lambda _: BrokenDistribution())
+
+    def work(value: int) -> int:
+        return value * 2
+
+    work.__dict__["_cozy_memo_declaration"] = ("", (MemoDistribution("native-helper"),))
+    assert describe(work) == {
+        "operation_identity_unavailable": "operation_native_identity_unavailable"
+    }

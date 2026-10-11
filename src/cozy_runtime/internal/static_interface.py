@@ -26,7 +26,6 @@ import csv
 import email.parser
 import enum
 import hashlib
-import importlib.metadata
 import json
 import os
 import re
@@ -44,10 +43,10 @@ import msgspec
 import cozy_runtime
 import cozy_runtime.internal.invocable_interface as invocable_interface
 import cozy_runtime.internal.locked_sources as locked
-import cozy_runtime.internal.memo_implementation as memo_implementation
+import cozy_runtime.internal.memo_identity as memo_identity
 import cozy_runtime.internal.package_interface as package_interface
 import cozy_runtime.internal.static_invocable as static_invocable
-from cozy_runtime import author
+from cozy_runtime import _interpreter, author
 from cozy_runtime.author._markers import MODEL_DEFAULT, PREFLIGHT
 from cozy_runtime.author._model import Model
 from cozy_runtime.author._model_defaults import (
@@ -1371,7 +1370,7 @@ def _operation_identity(reader: Reader, registration: Registration) -> str | Non
             return None
         fn = registration.fn
         definitions = [
-            (f"{registration.module.name}.{fn.name}", memo_implementation.normalized_definition(fn))
+            (f"{registration.module.name}.{fn.name}", memo_identity.normalized_definition(fn))
         ]
         for module, node in dependencies:
             definition = _memo_dependency(reader, module, node)
@@ -1380,16 +1379,16 @@ def _operation_identity(reader: Reader, registration: Registration) -> str | Non
             definitions.append(definition)
     except (StaticRefusal, OSError, SyntaxError, UnicodeDecodeError, ValueError):
         return None
-    return memo_implementation.definitions_identity(version, definitions)
+    return memo_identity.definitions_identity(version, definitions)
 
 
 def _memo_dependency(reader: Reader, module: Module, node: ast.expr) -> tuple[str, str] | None:
     """One declared memo dependency as `describe` names and hashes it, or None."""
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         path = _installed_source(reader, node.value.split("."))
-        if path is None or path.stat().st_size > memo_implementation.MAX_SOURCE_BYTES:
+        if path is None or path.stat().st_size > memo_identity.MAX_SOURCE_BYTES:
             return None
-        return node.value, memo_implementation._normalized(path.read_bytes())
+        return node.value, memo_identity.normalized(path.read_bytes())
     if isinstance(node, ast.Call):
         found = reader.resolve(module, node.func)
         arguments = [reader.fold(module, a) for a in node.args] + [
@@ -1400,10 +1399,8 @@ def _memo_dependency(reader: Reader, module: Module, node: ast.expr) -> tuple[st
         if found.key == "author.MemoDistribution" and len(arguments) == 1:
             name = typing.cast(str, arguments[0])
             # Each environment root once: the reader names its site-packages more than one way.
-            paths = list(dict.fromkeys(str(root.resolve()) for root in reader.roots))
-            matches = list(importlib.metadata.distributions(name=name, path=paths))
-            built = (
-                memo_implementation.distribution_identity(matches[0]) if len(matches) == 1 else None
+            built = memo_identity.installed_distribution_identity(
+                name, reader.roots, _interpreter.CACHE_TAG
             )
             return None if built is None else ("distribution:" + name, built)
         if found.key == "author.MemoResource" and len(arguments) == 2:
@@ -1419,7 +1416,7 @@ def _memo_dependency(reader: Reader, module: Module, node: ast.expr) -> tuple[st
         return None
     found = reader.resolve(module, node)
     if isinstance(found, Definition):
-        return f"{found.module.name}.{found.node.name}", memo_implementation.normalized_definition(
+        return f"{found.module.name}.{found.node.name}", memo_identity.normalized_definition(
             found.node
         )
     return None

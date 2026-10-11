@@ -14,19 +14,31 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Any, TypedDict
+from typing import TYPE_CHECKING, TypedDict
+
+if TYPE_CHECKING:
+    from diffusers.models.attention_dispatch import AttentionBackendName
+    from torch import Tensor
+    from torch.distributed import ProcessGroup
+
+    class PartialOptions(TypedDict, total=False):
+        """Forwarding adapters may omit options and use the concrete kernel's defaults."""
+
+        attn_mask: Tensor | None
+        dropout_p: float
+        is_causal: bool
+        scale: float | None
+        enable_gqa: bool
+
 
 from cozy_runtime.internal.attention_registry import register
 from cozy_runtime.internal.parallel import copy_engine
-
-# Tensors, process groups, parallel configs and Diffusers' backend members are `Any`: neither
-# torch nor diffusers is installed in the check venv.
 
 
 class Options(TypedDict):
     """The keyword options every `Local.forward` takes; `attn_mask` is a tensor or None."""
 
-    attn_mask: Any
+    attn_mask: Tensor | None
     dropout_p: float
     is_causal: bool
     scale: float | None
@@ -42,14 +54,14 @@ class Local:
     implementation serving those operands, e.g. the SDPA backend torch dispatches.
     """
 
-    forward: Callable[..., Any]
+    forward: Callable[..., Tensor]
     impl: Callable[..., str]
     head_local: bool = True
 
 
 #: backend -> implementations served in the observed scope on this rank
 _SEEN: ContextVar[dict[str, set[str]] | None] = ContextVar("cozy_attention_seen", default=None)
-_MEMBERS: dict[str, Any] = {}
+_MEMBERS: dict[str, AttentionBackendName] = {}
 
 
 @contextmanager
@@ -63,7 +75,7 @@ def observing() -> Iterator[dict[str, set[str]]]:
         _SEEN.reset(token)
 
 
-def member(backend: str, local: Local) -> Any:
+def member(backend: str, local: Local) -> AttentionBackendName:
     """The Diffusers member for `backend`, registered once per process."""
     found = _MEMBERS.get(backend)
     if found is None:
@@ -74,19 +86,19 @@ def member(backend: str, local: Local) -> Any:
     return found
 
 
-def _dispatch(backend: str, local: Local) -> Callable[..., Any]:
+def _dispatch(backend: str, local: Local) -> Callable[..., Tensor]:
     def attention(
-        query: Any,
-        key: Any,
-        value: Any,
-        attn_mask: Any = None,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        attn_mask: Tensor | None = None,
         dropout_p: float = 0.0,
         is_causal: bool = False,
         scale: float | None = None,
         enable_gqa: bool = False,
         return_lse: bool = False,
-        _parallel_config: Any = None,
-    ) -> Any:
+        _parallel_config: object = None,
+    ) -> Tensor:
         if return_lse:
             raise ValueError(f"{backend} does not return log-sum-exp")
         options = Options(
@@ -115,7 +127,9 @@ def _dispatch(backend: str, local: Local) -> Callable[..., Any]:
     return attention
 
 
-def _call(backend: str, local: Local, query: Any, key: Any, value: Any, options: Options) -> Any:
+def _call(
+    backend: str, local: Local, query: Tensor, key: Tensor, value: Tensor, options: Options
+) -> Tensor:
     import torch
 
     seen = _SEEN.get()
@@ -124,7 +138,7 @@ def _call(backend: str, local: Local, query: Any, key: Any, value: Any, options:
     return local.forward(query, key, value, **options)
 
 
-def group(config: Any) -> Any:
+def group(config: object) -> ProcessGroup:
     """The process group of Runtime's initialized Ulysses configuration; ring is refused."""
     import torch.distributed as dist
     from diffusers.models._modeling_parallel import ParallelConfig
@@ -144,8 +158,12 @@ def group(config: Any) -> Any:
 
 
 def exchange(
-    query: Any, key: Any, value: Any, handle: Any, compute: Callable[[Any, Any, Any], Any]
-) -> Any:
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    handle: ProcessGroup,
+    compute: Callable[[Tensor, Tensor, Tensor], Tensor],
+) -> Tensor:
     """Sequence shards -> full sequence per head subset -> `compute` -> back, using Diffusers'
     unequal-length exchange in both directions (packed H3 lengths do not divide), or the
     group's copy engines when it formed over them (`copy_engine`)."""
@@ -173,12 +191,12 @@ def exchange(
 
 def _copy_engine_exchange(
     engines: copy_engine.CopyEngineExchange,
-    query: Any,
-    key: Any,
-    value: Any,
-    handle: Any,
-    compute: Callable[[Any, Any, Any], Any],
-) -> Any:
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    handle: ProcessGroup,
+    compute: Callable[[Tensor, Tensor, Tensor], Tensor],
+) -> Tensor:
     """Diffusers' two exchanges with Q, K and V in one: GPU s holds `sizes[s]` rows of every
     head and sends each GPU its head group; the output returns each GPU its rows."""
     import torch
@@ -191,7 +209,7 @@ def _copy_engine_exchange(
     dist.all_gather_into_tensor(gathered, torch.tensor([rows], device=query.device), group=handle)
     sizes = [int(size) for size in gathered.tolist()]
 
-    def heads_first(tensor: Any) -> Any:
+    def heads_first(tensor: Tensor) -> Tensor:
         # (B, S, W, H/W, D) -> (W, S, B, H/W, D): rows for GPU p are block p
         grouped = tensor.reshape(batch, rows, world, local, dim).permute(2, 1, 0, 3, 4)
         return grouped.reshape(world * rows, batch, local, dim).contiguous()

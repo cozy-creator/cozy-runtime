@@ -16,8 +16,9 @@ a credential value or a path. Behaviour switches are flags, parsed by the CLI, n
 
 from __future__ import annotations
 
+import contextlib
 import os
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -145,6 +146,31 @@ def replace_environment(environment: Mapping[str, str]) -> None:
     """This process's whole environment becomes `environment`: a forked executor's own seal."""
     os.environ.clear()
     os.environ.update(environment)
+
+
+def update_environment(values: Mapping[str, str]) -> None:
+    """Apply Runtime-owned transport settings before forming a communicator."""
+    os.environ.update(values)
+
+
+@contextlib.contextmanager
+def short_socket_directory() -> Iterator[None]:
+    """Use a shared short path for symmetric-memory rendezvous, restoring the seal after it.
+
+    CUDA IPC names its Unix socket under TMPDIR; executor scratch paths can exceed the
+    socket name limit. This changes the transport's pathname, never configuration policy.
+    """
+    previous = os.environ.get("TMPDIR")
+    os.environ["TMPDIR"] = next(
+        (path for path in ("/tmp", "/dev/shm") if os.access(path, os.W_OK | os.X_OK)), "/tmp"
+    )
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("TMPDIR", None)
+        else:
+            os.environ["TMPDIR"] = previous
 
 
 def hide_gpus() -> None:

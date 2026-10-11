@@ -24,7 +24,7 @@ from typing import Annotated, Any, Protocol, TypedDict
 import msgspec
 
 from cozy_runtime.internal import execution_evidence, liveness, spawn
-from cozy_runtime.internal.config import inherited_environment
+from cozy_runtime.internal.config import inherited_environment, update_environment
 from cozy_runtime.internal.parallel.plan import GpuDivergence, GroupPlan, GroupRefusal
 from cozy_runtime.internal.seam import Channel, SeamError
 
@@ -192,7 +192,7 @@ def abortable(backend: str) -> None:
     default handling), and `_abort_process_group` asks for it off. Read when the
     communicator is made, and this is its only switch."""
     if "nccl" in backend:
-        os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "0"
+        update_environment({"TORCH_NCCL_ASYNC_ERROR_HANDLING": "0"})
 
 
 #: The NCCL names this process's group set from its measured links: Runtime-owned, so the
@@ -204,7 +204,7 @@ def route(nccl: Mapping[str, str]) -> None:
     """NCCL reads its route once, when this process's first communicator forms; every GPU of
     the group writes the same values, chosen by rank 0, before it joins."""
     ROUTED.update(nccl)
-    os.environ.update(nccl)
+    update_environment(nccl)
 
 
 def join_rank(torch: Any, spec: RankSpec, sealed: Mapping[str, str]) -> Any:

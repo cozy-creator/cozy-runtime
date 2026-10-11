@@ -23,7 +23,11 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass
-from typing import IO, Any, Literal
+from types import ModuleType
+from typing import IO, TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from torch import Generator, Tensor, device as Device
 
 from cozy_runtime.internal.encoding import E4M3_MAX, E8M0_BIAS, MX_BLOCK
 
@@ -109,7 +113,7 @@ def _db(signal: float, noise: float) -> float:
     return 10 * math.log10(signal / noise) if signal > 0 else -math.inf
 
 
-def _magnitudes(torch: Any, device: Any) -> Any:
+def _magnitudes(torch: ModuleType, device: Device) -> Tensor:
     """E4M3's 127 magnitudes by code: man * 2^-9 below exponent 1, else (1 + man/8) * 2^(exp-7)."""
     code = torch.arange(127, device=device)
     exponent, mantissa = code >> 3, (code & 7).to(torch.float32)
@@ -117,7 +121,7 @@ def _magnitudes(torch: Any, device: Any) -> Any:
     return torch.where(exponent == 0, mantissa * 2.0**-9, normal)
 
 
-def decode_e4m3(torch: Any, data: Any) -> Any:
+def decode_e4m3(torch: ModuleType, data: Tensor) -> Tensor:
     decoded = data.view(torch.uint8).view(torch.float8_e4m3fn).float()
     # This codec saturates the two reserved NaN codes to their signed maxima.
     # Keep their original signs (and signed zero) after the native conversion.
@@ -125,7 +129,7 @@ def decode_e4m3(torch: Any, data: Any) -> Any:
     return fixed.copysign_(decoded)
 
 
-def _floor_code(torch: Any, mags: Any, magnitude: Any) -> tuple[Any, Any]:
+def _floor_code(torch: ModuleType, mags: Tensor, magnitude: Tensor) -> tuple[Tensor, Tensor]:
     """The code at or below each magnitude, and how far towards the next one it sits (0..1)."""
     low = (torch.searchsorted(mags, magnitude, right=True) - 1).clamp(0, 126)
     high = (low + 1).clamp(max=126)
@@ -133,7 +137,7 @@ def _floor_code(torch: Any, mags: Any, magnitude: Any) -> tuple[Any, Any]:
     return low, torch.where(gap > 0, (magnitude - mags[low]) / gap, torch.zeros_like(gap))
 
 
-def _nearest(torch: Any, mags: Any, values: Any) -> Any:
+def _nearest(torch: ModuleType, mags: Tensor, values: Tensor) -> Tensor:
     """Signed values -> E4M3 bytes, ties to the even code, saturating at 448."""
     low, fraction = _floor_code(torch, mags, values.abs().clamp(max=E4M3_MAX))
     up = (fraction > 0.5) | ((fraction == 0.5) & (low % 2 == 1))
@@ -141,13 +145,13 @@ def _nearest(torch: Any, mags: Any, values: Any) -> Any:
 
 
 def encode_e4m3(
-    torch: Any,
-    values: Any,
+    torch: ModuleType,
+    values: Tensor,
     rounding: Rounding = "nearest",
-    generator: Any = None,
+    generator: Generator | None = None,
     *,
-    magnitudes: Any = None,
-) -> Any:
+    magnitudes: Tensor | None = None,
+) -> Tensor:
     """`[rows, cols]` f32 in payload units -> E4M3 bytes.
 
     `stochastic` rounds up with the probability of the distance covered, so the expected
@@ -182,12 +186,17 @@ def _chunks(rows: int, cols: int) -> list[tuple[int, int]]:
     return [(start, min(start + step, rows)) for start in range(0, rows, step)]
 
 
-def _delta(up: Any, down_fp32: Any, alpha: float, start: int, stop: int) -> Any:
+def _delta(up: Tensor, down_fp32: Tensor, alpha: float, start: int, stop: int) -> Tensor:
     return (up[start:stop].float() @ down_fp32) * alpha
 
 
 def _account(
-    stats: Stats | None, base: Any, delta: Any, stored: Any, saturated: Any, down: Any
+    stats: Stats | None,
+    base: Tensor,
+    delta: Tensor,
+    stored: Tensor,
+    saturated: Tensor,
+    down: Tensor,
 ) -> None:
     if stats is None:
         return
@@ -204,14 +213,14 @@ def _account(
 
 
 def bake_plain(
-    torch: Any,
-    weight: Any,
-    down: Any,
-    up: Any,
+    torch: ModuleType,
+    weight: Tensor,
+    down: Tensor,
+    up: Tensor,
     alpha: float,
     *,
     rounding: Rounding = "nearest",
-    generator: Any = None,
+    generator: Generator | None = None,
     stats: Stats | None = None,
 ) -> None:
     """`weight += alpha * up @ down`, computed in f32 and rounded once to its dtype.
@@ -235,7 +244,7 @@ def bake_plain(
     _finish(torch, weight, stats, began)
 
 
-def _bf16_either(torch: Any, values: Any, generator: Any) -> Any:
+def _bf16_either(torch: ModuleType, values: Tensor, generator: Generator | None) -> Tensor:
     """f32 -> one of its two bf16 neighbours (as f32), the farther one with the probability
     of the distance covered."""
     toward_zero = values.contiguous().view(torch.int32) & -65536
@@ -247,16 +256,16 @@ def _bf16_either(torch: Any, values: Any, generator: Any) -> Any:
 
 
 def bake_rowwise(
-    torch: Any,
-    data: Any,
-    scale: Any,
-    down: Any,
-    up: Any,
+    torch: ModuleType,
+    data: Tensor,
+    scale: Tensor,
+    down: Tensor,
+    up: Tensor,
     alpha: float,
     *,
     rounding: Rounding = "nearest",
     grid: Grid = "refit",
-    generator: Any = None,
+    generator: Generator | None = None,
     stats: Stats | None = None,
 ) -> None:
     """Bake into `fp8-rowwise/1`: `data` `[out, in]` E4M3, `scale` one f32 per output row.
@@ -293,16 +302,16 @@ def bake_rowwise(
 
 
 def bake_mx(
-    torch: Any,
-    data: Any,
-    scale: Any,
-    down: Any,
-    up: Any,
+    torch: ModuleType,
+    data: Tensor,
+    scale: Tensor,
+    down: Tensor,
+    up: Tensor,
     alpha: float,
     *,
     rounding: Rounding = "nearest",
     refit: bool = True,
-    generator: Any = None,
+    generator: Generator | None = None,
     stats: Stats | None = None,
 ) -> None:
     """Bake into `mxfp8/1`: `data` `[out, in]` E4M3, `scale` `[out, in/32]` E8M0 bytes
@@ -355,18 +364,18 @@ def bake_mx(
     _finish(torch, data, stats, began)
 
 
-def _mx_error(torch: Any, target: Any, byte: Any, magnitudes: Any) -> Any:
+def _mx_error(torch: ModuleType, target: Tensor, byte: Tensor, magnitudes: Tensor) -> Tensor:
     """Each block's squared error stored to nearest under exponent byte `byte`."""
     mult = _exp2(torch, byte - E8M0_BIAS).unsqueeze(-1)
     code = _nearest(torch, magnitudes, target / mult)
     return (decode_e4m3(torch, code) * mult - target).square().sum(dim=-1)
 
 
-def _exp2(torch: Any, exponent: Any) -> Any:
+def _exp2(torch: ModuleType, exponent: Tensor) -> Tensor:
     return torch.ldexp(torch.ones_like(exponent, dtype=torch.float32), exponent)
 
 
-def _finish(torch: Any, tensor: Any, stats: Stats | None, began: float) -> None:
+def _finish(torch: ModuleType, tensor: Tensor, stats: Stats | None, began: float) -> None:
     if stats is None:
         return
     if tensor.is_cuda:
@@ -387,10 +396,10 @@ def bakeable(roles: dict[str, str]) -> bool:
 
 
 def bake(
-    torch: Any,
-    stored: dict[str, Any],
-    down: Any,
-    up: Any,
+    torch: ModuleType,
+    stored: dict[str, Tensor],
+    down: Tensor,
+    up: Tensor,
     *,
     seed: int,
     stats: Stats | None = None,
@@ -439,7 +448,9 @@ def bake(
         )
 
 
-def accumulate(torch: Any, x: Any, out: Any, down: Any, up: Any, alpha: float) -> None:
+def accumulate(
+    torch: ModuleType, x: Tensor, out: Tensor, down: Tensor, up: Tensor, alpha: float
+) -> None:
     """`out += alpha * (x @ down.T) @ up.T` in two GEMMs: the up projection adds into the
     base output, so no `[rows, out]` update is ever allocated."""
     flat, rows = out.view(-1, out.shape[-1]), x.reshape(-1, x.shape[-1])
@@ -469,7 +480,9 @@ _CHECK = (
 )
 
 
-def fused(torch: Any, stored: dict[str, Any], down: Any, up: Any, seed: int) -> None:
+def fused(
+    torch: ModuleType, stored: dict[str, Tensor], down: Tensor, up: Tensor, seed: int
+) -> None:
     """`bake`, one kernel launch: each tile adds its `up @ down` (f32) to the decoded stored
     values and rounds them back in place."""
     if "value" in stored:
@@ -534,7 +547,7 @@ def mode() -> dict[str, str]:
     return {"lora_bake": f"eager ({FUSED_ERROR})"} if FUSED_ERROR and _TRIED else {}
 
 
-def check(torch: Any, device: Any) -> None:
+def check(torch: ModuleType, device: Device) -> None:
     """Bake every form on `device` where the result is exact (0.25 + 24 * +-1/32 is 1.0 or
     -0.5, over partial tiles and two inner steps): one stored value off it is a broken kernel."""
     rows, cols, rank = 70, 96, 24
