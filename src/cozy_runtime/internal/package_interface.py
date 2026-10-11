@@ -164,6 +164,13 @@ def assemble(
     bindings: Mapping[str, Mapping[str, object]],
 ) -> dict[str, Json]:
     """One package interface from its callable documents, whichever reader produced them."""
+    for _, doc in docs:
+        declared = doc.get("invocable")
+        if isinstance(declared, dict) and "memo_requires" in declared:
+            invocable_interface.check_memo_requires(
+                msgspec.convert(declared, invocable_interface.Invocable, strict=True),
+                doc["request"],
+            )
     entrypoints: list[Json] = [doc for kind, doc in docs if kind == "entrypoint"]
     jobs: list[Json] = [doc for kind, doc in docs if kind == "job"]
     body: dict[str, Json] = {

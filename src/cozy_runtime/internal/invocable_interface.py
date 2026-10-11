@@ -13,7 +13,7 @@ from typing import Any, get_args, get_origin
 
 import msgspec
 
-from cozy_runtime.author import ConformanceError, Surface
+from cozy_runtime.author import ConformanceError, Memoize, Surface
 from cozy_runtime.author._artifacts import ModelArtifact
 from cozy_runtime.author._walker import is_struct, strip
 from cozy_runtime.internal import canonical, schema
@@ -71,7 +71,7 @@ def serving_metadata(
     export: str,
     context: str,
     capabilities: Sequence[str],
-    memoize: bool = False,
+    memoize: Memoize | None = None,
 ) -> dict[str, Any]:
     """Caller names over the existing serving wire schema; never change its handler."""
     return from_types(
@@ -100,7 +100,7 @@ def from_types(
     context: str,
     parameters: Sequence[str],
     parameter_defaults: Mapping[str, object],
-    memoize: bool,
+    memoize: Memoize | None,
     capabilities: Sequence[str],
     serving: bool = False,
 ) -> dict[str, Any]:
@@ -166,9 +166,37 @@ def from_types(
         "defaults": defaults,
         "type_names": names,
         "enum_members": enums,
-        "memoize": memoize,
+        "memoize": memoize is not None,
         "capabilities": sorted(capabilities),
+        **({"memo_requires": list(memoize.requires)} if memoize and memoize.requires else {}),
     }
+
+
+def check_memo_requires(value: Invocable, request: object) -> None:
+    """Each memo condition names an optional request parameter a caller may omit."""
+    if value.memo_requires is msgspec.UNSET:
+        return
+    if not value.memoize:
+        raise ConformanceError("memo_requires needs memoize", code="invocable_memoize")
+    fields = request.get("fields", []) if isinstance(request, dict) else []
+    optional = {
+        field.get("name")
+        for field in fields
+        if isinstance(field, dict) and field.get("wire") in ("optional", "omissible")
+    }
+    for name in value.memo_requires:
+        if name not in value.parameters:
+            raise ConformanceError(
+                f'memoize requires "{name}", which is not a parameter of {value.export} '
+                f"(parameters: {', '.join(value.parameters)})",
+                code="invocable_memoize",
+            )
+        if name not in optional:
+            raise ConformanceError(
+                f'memoize requires "{name}", a required parameter of {value.export}: only an '
+                "optional parameter (one with a default) can be omitted",
+                code="invocable_memoize",
+            )
 
 
 def _identifier(value: object) -> bool:
@@ -218,6 +246,8 @@ class Invocable(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
     enum_members: dict[str, tuple[str, ...]]
     memoize: bool
     capabilities: tuple[str, ...]
+    memo_requires: tuple[str, ...] | msgspec.UnsetType = msgspec.UNSET
+    """Optional parameters a request must explicitly provide to be memoizable."""
     operation_identity: str | msgspec.UnsetType = msgspec.UNSET
     operation_identity_unavailable: str | msgspec.UnsetType = msgspec.UNSET
 
@@ -274,6 +304,7 @@ def validate(value: Invocable, request: object, result: object, *, kind: str = "
         raise ConformanceError(
             "invocable parameters differ from request fields", code="invocable_interface"
         )
+    check_memo_requires(value, request)
     nodes: dict[str, Any] = {}
 
     def walk(node: Any, path: str) -> None:

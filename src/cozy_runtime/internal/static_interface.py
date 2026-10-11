@@ -48,6 +48,7 @@ import cozy_runtime.internal.package_interface as package_interface
 import cozy_runtime.internal.static_invocable as static_invocable
 from cozy_runtime import _interpreter, author
 from cozy_runtime.author._markers import MODEL_DEFAULT, PREFLIGHT
+from cozy_runtime.author._memo import memo_policy
 from cozy_runtime.author._model import Model
 from cozy_runtime.author._model_defaults import (
     DefaultLadder,
@@ -218,6 +219,7 @@ _AUTHOR_VALUES = (
     "WeightsOutput",
     "Bound",
     "Shape",
+    "Memoize",
     "data_values",
 )
 
@@ -1192,7 +1194,7 @@ class Registration:
     publishes: bool
     weights: tuple[author.WeightsOutput, ...]
     invocable: bool = False
-    memoize: bool = False
+    memoize: author.Memoize | None = None
     model_defaults: Mapping[str, DefaultLadder] = field(default_factory=dict)
     internal: bool = False
     accelerator: bool | None = None
@@ -1542,7 +1544,8 @@ def _registration(
     decorator: ast.expr | None = None,
 ) -> Registration | None:
     function_module = module
-    invocable, memoize = False, False
+    invocable = False
+    memoize: author.Memoize | None = None
     default_models: dict[str, DefaultLadder] = {}
     used_components: dict[str, tuple[str, ...]] = {}
     memo_declaration: list[tuple[str, Module, ast.expr]] = []
@@ -1581,11 +1584,7 @@ def _registration(
                 if keyword.arg == "components":
                     used_components = model_components(value)
                     continue
-                if type(value) is not bool:
-                    reader.refuse(
-                        function_module, keyword.value, "invocable memoize must be a boolean"
-                    )
-                memoize = value
+                memoize = _memoize(reader, function_module, keyword.value, value)
     if invocable:
         for export in fn.decorator_list:
             target = export.func if isinstance(export, ast.Call) else export
@@ -1660,9 +1659,7 @@ def _registration(
         elif keyword.arg == "publishes":
             publishes = bool(value)
         elif keyword.arg == "memoize":
-            if type(value) is not bool:
-                reader.refuse(module, keyword.value, "entrypoint memoize must be a boolean")
-            memoize = value
+            memoize = _memoize(reader, module, keyword.value, value)
         elif keyword.arg == "weights":
             assert isinstance(value, tuple)
             weights = tuple(value)
@@ -1685,6 +1682,14 @@ def _registration(
         tuple(memo_declaration),
         used_components,
     )
+
+
+def _memoize(
+    reader: Reader, module: Module, node: ast.expr, value: object
+) -> author.Memoize | None:
+    if isinstance(value, (bool, author.Memoize)):
+        return memo_policy(value)
+    reader.refuse(module, node, "memoize must be a boolean or Memoize")
 
 
 def _parameter_annotation(

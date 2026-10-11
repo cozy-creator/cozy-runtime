@@ -24,7 +24,7 @@ from typing import ParamSpec, TypeVar, overload
 from cozy_runtime.author._calls import _export
 from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._markers import Bound
-from cozy_runtime.author._memo import MemoDependency
+from cozy_runtime.author._memo import MemoDependency, Memoize, memo_policy
 from cozy_runtime.author._memo import declare as declare_memo
 from cozy_runtime.author._model_defaults import DefaultLadder, model_components, model_defaults
 from cozy_runtime.author._signature import Kind, Surface, analyze
@@ -48,7 +48,7 @@ class Registration:
     kind: Kind
     fn: Callable[..., object]
     invocable: bool = False
-    memoize: bool = False
+    memoize: Memoize | None = None
     model_defaults: Mapping[str, DefaultLadder] = field(default_factory=dict)
     model_components: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     publishes: bool = False
@@ -114,7 +114,7 @@ class App:
         *,
         defaults: Mapping[str, Sequence[Mapping[str, str | int]]] | None = None,
         components: Mapping[str, Sequence[str]] | None = None,
-        memoize: bool = False,
+        memoize: bool | Memoize = False,
         memo_version: str | None = None,
         memo_dependencies: tuple[MemoDependency, ...] = (),
         internal: bool = False,
@@ -132,7 +132,7 @@ class App:
         components: Mapping[str, Sequence[str]] | None = None,
         hidden: bool = False,
         internal: bool = False,
-        memoize: bool = False,
+        memoize: bool | Memoize = False,
         memo_version: str | None = None,
         memo_dependencies: tuple[MemoDependency, ...] = (),
     ) -> Callable[[Callable[P, R]], Callable[P, R]]: ...
@@ -149,7 +149,7 @@ class App:
         components: Mapping[str, Sequence[str]] | None = None,
         hidden: bool = False,
         internal: bool = False,
-        memoize: bool = False,
+        memoize: bool | Memoize = False,
         memo_version: str | None = None,
         memo_dependencies: tuple[MemoDependency, ...] = (),
     ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
@@ -164,12 +164,11 @@ class App:
         `memoize=True` explicitly admits deterministic measurement results to the managed
         operation cache. Optional `memo_dependencies` and `memo_version` declare
         result-affecting helpers/resources/native builds just as for `invocable`.
-        Ordinary generation remains nonmemoized by default.
+        `memoize=Memoize(requires=("seed",))` memoizes only requests that explicitly provide
+        each named optional parameter. Ordinary generation remains nonmemoized by default.
 
         `components={"model": ("dit", "vae")}` names the components of each Model argument
         this callable runs, so a machine fetches those first; absent means all."""
-        if type(memoize) is not bool:
-            raise RegistrationError("entrypoint memoize must be a boolean")
         return self._register(
             "entrypoint",
             fn,
@@ -274,13 +273,14 @@ class App:
         emits_media: bool = False,
         hidden: bool = False,
         internal: bool = False,
-        memoize: bool = False,
+        memoize: bool | Memoize = False,
         memo_version: str | None = None,
         memo_dependencies: tuple[MemoDependency, ...] = (),
         defaults: Mapping[str, Sequence[Mapping[str, str | int]]] | None = None,
         components: Mapping[str, Sequence[str]] | None = None,
         accelerator: bool | None = None,
     ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
+        policy = memo_policy(memoize)
         if type(internal) is not bool:
             raise RegistrationError("internal must be a boolean")
         if accelerator is not None and type(accelerator) is not bool:
@@ -311,9 +311,10 @@ class App:
                     "declare components once, on invocable or App registration",
                     code="model_components",
                 )
+            memo = export.memoize if export is not None else policy
             declare_memo(
                 export.implementation if export is not None else target,
-                memoize=export.memoize if export is not None else memoize,
+                memoize=memo is not None,
                 version=memo_version,
                 dependencies=memo_dependencies,
             )
@@ -322,7 +323,7 @@ class App:
                 kind=kind,
                 fn=export.implementation if export is not None else target,
                 invocable=export is not None,
-                memoize=export.memoize if export is not None else memoize,
+                memoize=memo,
                 model_defaults=declared_defaults or (export.defaults if export is not None else {}),
                 model_components=declared_components
                 or (export.components if export is not None else {}),

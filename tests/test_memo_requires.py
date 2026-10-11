@@ -1,0 +1,146 @@
+"""`Memoize(requires=...)`: both describe paths state the same memo condition."""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from cozy_runtime.author import ConformanceError, Memoize
+from cozy_runtime.internal import canonical, interface_wheel, package_interface, static_interface
+from cozy_runtime.internal.discovery import discover
+
+SOURCE = """import msgspec
+import cozy_runtime.author as sdk
+from cozy_runtime.author import App, Context, Memoize, invocable
+
+class Request(msgspec.Struct, kw_only=True):
+    prompt: str
+    seed: int | None = None
+    count: int = msgspec.field(name="wire_count", default=1)
+
+class Result(msgspec.Struct):
+    value: str
+
+app = App()
+
+@app.entrypoint(memoize=sdk.Memoize(requires=["wire_count"]))
+def measure(ctx: Context, payload: Request) -> Result:
+    raise RuntimeError("never executed")
+
+@invocable(memoize=Memoize(requires=("seed", "seed")))
+async def generate(ctx: Context, *, prompt: str, seed: int | None = None) -> Result:
+    raise RuntimeError("never executed")
+
+@invocable(memoize=True)
+async def plain(ctx: Context, *, prompt: str, seed: int | None = None) -> Result:
+    raise RuntimeError("never executed")
+
+@invocable(memoize=Memoize())
+async def unconditional(ctx: Context, *, prompt: str, seed: int | None = None) -> Result:
+    raise RuntimeError("never executed")
+
+app.job(generate)
+app.job(plain)
+app.job(unconditional)
+"""
+
+
+def project(tmp_path: Path, source: str = SOURCE) -> Path:
+    sys.modules.pop("memo_fixture", None)
+    root = tmp_path / "source"
+    root.mkdir()
+    (root / "pyproject.toml").write_text('[project]\nname="memo-fixture"\nversion="0.1.0"\n')
+    (root / "package.toml").write_text('[application]\nobject="memo_fixture:app"\n')
+    (root / "memo_fixture.py").write_text(source)
+    return root
+
+
+def declarations(document: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    rows = [*document["entrypoints"], *document["jobs"]]
+    return {row["name"]: row["invocable"] for row in rows}
+
+
+def test_static_and_imported_describe_state_the_same_memo_condition(tmp_path: Path) -> None:
+    root = project(tmp_path)
+    static = static_interface.build(root)
+    imported = package_interface.source_facts(package_interface.build(discover(root)))
+    assert package_interface.canonical_bytes(static) == package_interface.canonical_bytes(imported)
+    rows = declarations(static)
+    assert rows["generate"] == {
+        "module": "memo_fixture",
+        "export": "generate",
+        "context": "ctx",
+        "parameters": ["prompt", "seed"],
+        "defaults": {"request/seed": None},
+        "type_names": {"request": "generateRequest", "result": "Result"},
+        "enum_members": {},
+        "memoize": True,
+        "capabilities": [],
+        "memo_requires": ["seed"],
+    }
+    assert rows["measure"]["parameters"] == ["prompt", "seed", "wire_count"]
+    assert rows["measure"]["memoize"] is True
+    assert rows["measure"]["memo_requires"] == ["wire_count"]
+    for name in ("plain", "unconditional"):
+        assert rows[name]["memoize"] is True and "memo_requires" not in rows[name]
+    raw = package_interface.canonical_bytes(static)
+    assert package_interface.read_bytes(raw) == static
+    interface_wheel.generate(raw)
+
+
+@pytest.mark.parametrize(
+    ("before", "after", "message"),
+    [
+        (
+            'Memoize(requires=("seed", "seed"))',
+            'Memoize(requires=("sed",))',
+            r'memoize requires "sed", which is not a parameter of generate '
+            r"\(parameters: prompt, seed\)",
+        ),
+        (
+            'Memoize(requires=("seed", "seed"))',
+            'Memoize(requires=["prompt"])',
+            r'memoize requires "prompt", a required parameter of generate',
+        ),
+        (
+            'sdk.Memoize(requires=["wire_count"])',
+            'sdk.Memoize(requires=["count"])',
+            r'memoize requires "count", which is not a parameter of measure '
+            r"\(parameters: prompt, seed, wire_count\)",
+        ),
+        (
+            'sdk.Memoize(requires=["wire_count"])',
+            'sdk.Memoize(requires=["prompt"])',
+            r'memoize requires "prompt", a required parameter of measure',
+        ),
+    ],
+)
+def test_memo_condition_names_an_optional_parameter(
+    tmp_path: Path, before: str, after: str, message: str
+) -> None:
+    root = project(tmp_path, SOURCE.replace(before, after))
+    for describe in (static_interface.build, lambda root: package_interface.build(discover(root))):
+        with pytest.raises(ConformanceError, match=message) as caught:
+            describe(root)
+        assert caught.value.code == "invocable_memoize"
+
+
+def test_malformed_memo_conditions_refuse() -> None:
+    assert Memoize(requires=["seed", "steps", "seed"]).requires == ("seed", "steps")
+    assert Memoize() == Memoize(requires=[])
+    for requires in ("seed", ("",), (1,)):
+        with pytest.raises(ConformanceError, match="non-empty parameter names"):
+            Memoize(requires=requires)  # type: ignore[arg-type]
+
+
+def test_reader_requires_memoize_for_a_memo_condition(tmp_path: Path) -> None:
+    document = canonical.parse_canonical(
+        package_interface.canonical_bytes(static_interface.build(project(tmp_path)))
+    )
+    job = next(row for row in document["jobs"] if row["name"] == "generate")
+    job["invocable"]["memoize"] = False
+    with pytest.raises(ConformanceError, match="memo_requires needs memoize"):
+        package_interface.read_bytes(canonical.write(document))
