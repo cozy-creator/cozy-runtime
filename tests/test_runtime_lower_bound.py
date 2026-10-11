@@ -1,7 +1,8 @@
 """A synced project locked to Runtime 0.18.67 that declares `>=0.18.67` runs this machine's
 Runtime; an installation an older installer froze at 0.18.67 is rebuilt as a new generation.
 
-Real: PyPI's cozy-runtime releases, uv, the product installer. The lock is made once, the way
+Real: fixed PyPI SDK releases, uv, the product installer. A fixed machine SDK keeps a release
+published during the test from racing uv's cached index. The lock is made once, the way
 the project locked on 0.18.67's release day, and cached; PyPI unreachable on a cold cache is a
 skip. The executor seam over such an installation is `test_cross_version_seam`.
 """
@@ -9,7 +10,6 @@ skip. The executor seam over such an installation is `test_cross_version_seam`.
 from __future__ import annotations
 
 import datetime
-import importlib.metadata
 import io
 import json
 import os
@@ -23,12 +23,12 @@ from pathlib import Path
 
 import msgspec
 import pytest
-from packaging.version import Version
 
 from cozy_runtime.internal import package_installation
 from cozy_runtime.internal.config import package_install_environment
 
 LOCKED = "0.18.67"
+MACHINE_SDK = {"cozy-runtime": "0.23.18", "tensorfs": "0.6.1"}
 CACHE = (
     Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
     / "cozy-runtime-tests"
@@ -115,15 +115,20 @@ def _runtime(python: Path) -> str:
     ).stdout.strip()
 
 
+@pytest.fixture
+def machine_runtime(monkeypatch: pytest.MonkeyPatch) -> str:
+    monkeypatch.setattr(package_installation, "machine_sdk", lambda: MACHINE_SDK.copy())
+    return MACHINE_SDK["cozy-runtime"]
+
+
 def test_a_lower_bound_installs_the_machines_runtime_and_a_frozen_one_is_rebuilt(
-    tmp_path: Path,
+    tmp_path: Path, machine_runtime: str,
 ) -> None:
     project = tmp_path / "project"
     _source(project)
     archive = tmp_path / "source.tar"
     _archive(project, archive)
-    mine, published = importlib.metadata.version("cozy-runtime"), _published().releases
-    expected = mine if mine in published else max(published, key=Version)
+    expected = machine_runtime
     root = tmp_path / "installs"
 
     installed = package_installation.install(
@@ -172,7 +177,9 @@ def test_a_lower_bound_installs_the_machines_runtime_and_a_frozen_one_is_rebuilt
     assert package_installation.refresh(root, "legacy").generation == rebuilt.generation
 
 
-def test_a_published_installation_follows_the_machines_runtime(tmp_path: Path) -> None:
+def test_a_published_installation_follows_the_machines_runtime(
+    tmp_path: Path, machine_runtime: str,
+) -> None:
     """A published release's installation keeps its lock. Built on a machine that ran another
     Runtime (it was updated since), installing it again rebuilds its SDK as a new generation
     at this machine's Runtime; the rest of the lock stays as installed."""
@@ -184,8 +191,7 @@ def test_a_published_installation_follows_the_machines_runtime(tmp_path: Path) -
         capture_output=True,
         check=True,
     ).stdout
-    mine, published = importlib.metadata.version("cozy-runtime"), _published().releases
-    expected = mine if mine in published else max(published, key=Version)
+    expected = machine_runtime
     root = tmp_path / "installs"
 
     def install() -> package_installation.InstalledEnvironment:
