@@ -509,9 +509,7 @@ class _VideoStreamDecoder:
         self._time_base: Fraction | None = None
         self.frame_count = 0
         rate = stream.average_rate
-        self._nominal_frame_rate = (
-            _positive_fraction(rate, "video average rate") if rate else None
-        )
+        self._nominal_frame_rate = _positive_fraction(rate, "video average rate") if rate else None
         ratio = stream.sample_aspect_ratio
         # PyAV 19 represents unspecified ratios as a falsy AVRational rather
         # than None. The unspecified pixel aspect ratio means square pixels.
