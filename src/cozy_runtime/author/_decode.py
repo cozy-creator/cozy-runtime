@@ -15,6 +15,7 @@ from collections.abc import Callable, Iterator
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from fractions import Fraction
+from numbers import Integral
 from pathlib import Path
 from typing import Any, BinaryIO, Literal, Protocol, TypeVar
 
@@ -1419,6 +1420,14 @@ def _fraction(value: object, what: str) -> Fraction:
     try:
         if isinstance(value, Fraction):
             return value
+        # PyAV has exposed AVRatios as both ``fractions.Fraction`` and a small
+        # rational object with integer numerator/denominator attributes across
+        # supported releases.  Preserve that ratio exactly instead of routing
+        # it through float conversion.
+        numerator = getattr(value, "numerator", None)
+        denominator = getattr(value, "denominator", None)
+        if isinstance(numerator, Integral) and isinstance(denominator, Integral):
+            return Fraction(int(numerator), int(denominator))
         if isinstance(value, int | float | str):
             return Fraction(value)
         raise TypeError(type(value).__name__)
