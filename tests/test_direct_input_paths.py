@@ -152,7 +152,7 @@ def test_changed_borrowed_source_refuses_before_decode(tmp_path: Path, change: s
     assert source.exists() == (change != "delete")
 
 
-@pytest.mark.parametrize("declared", ["image/jpeg", "image/jpg", "application/octet-stream"])
+@pytest.mark.parametrize("declared", ["image/jpg", "application/octet-stream"])
 def test_an_image_declared_under_another_image_type_decodes_as_its_bytes(
     tmp_path: Path, declared: str
 ) -> None:

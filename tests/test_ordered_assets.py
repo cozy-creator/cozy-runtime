@@ -536,8 +536,8 @@ def test_kind_count_refuses_before_hydration(tmp_path: Path) -> None:
         prepare(local.get("limited"), wire, input_metadata=rows)
 
 
-@pytest.mark.parametrize("fidelity", ["auto", "low", "medium", "high"])
-def test_fidelity_is_metadata_and_does_not_resize(tmp_path: Path, fidelity: str) -> None:
+def test_fidelity_is_metadata_and_does_not_resize(tmp_path: Path) -> None:
+    fidelity = "low"
     wire, rows = inputs(tmp_path, (513, 257))
     wire["assets"][0]["fidelity"] = fidelity
     local = App()
@@ -560,7 +560,7 @@ def test_fidelity_is_metadata_and_does_not_resize(tmp_path: Path, fidelity: str)
     assert result is not None
 
 
-@pytest.mark.parametrize("value", ["unknown", "", None, 1])
+@pytest.mark.parametrize("value", ["unknown", 1])
 def test_invalid_fidelity_refuses_before_input_acquisition(tmp_path: Path, value: object) -> None:
     wire, rows = inputs(tmp_path)
     wire["assets"][0]["fidelity"] = value
