@@ -174,6 +174,8 @@ def test_latent_carrier_rejects_geometry_and_preserves_conditioning() -> None:
         encode_latents(replace(value, video=torch.zeros(1, 24, 37, 3, 4)))
     with pytest.raises(InvalidRequest):
         decode_latents(b"not a tensor carrier")
+    with pytest.raises(InvalidRequest, match="invalid H3 latent carrier"):
+        decode_latents(encode_latents(value)[:-8])
 
 
 def test_standard_resize_preserves_time_and_aspect_with_exact_output_canvas() -> None:

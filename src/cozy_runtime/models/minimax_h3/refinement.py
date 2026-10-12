@@ -14,6 +14,7 @@ from importlib import import_module
 from typing import Any, Literal, cast
 
 import torch
+from safetensors import SafetensorError
 from safetensors.torch import load, save
 
 from cozy_runtime.author import InvalidRequest
@@ -98,7 +99,7 @@ class H3Latents:
         for condition in self.audio_conditions:
             if condition.ndim != 2 or condition.shape[-1] != 32:
                 refuse("audio conditioning must be packed 32-channel rows")
-        if any(r.kind not in ("image", "video", "audio") for r in self.references):
+        if any(r.kind not in ("image", "video", "audio") or type(r.has_audio) is not bool for r in self.references):
             refuse("retained reference modality is invalid")
         if self.task == "fl2va":
             if (
@@ -245,7 +246,7 @@ def decode_latents(data: bytes) -> H3Latents:
             metadata["checkpoint"],
             int(metadata["sample_rate"]),
         )
-    except (ValueError, TypeError, KeyError, RuntimeError) as exc:
+    except (ValueError, TypeError, KeyError, RuntimeError, SafetensorError) as exc:
         raise InvalidRequest(f"invalid H3 latent carrier: {exc}", code="h3_refinement") from exc
     value.validate()
     return value
