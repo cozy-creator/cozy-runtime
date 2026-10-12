@@ -122,9 +122,10 @@ class Invocation:
     its content digest and sniffed its bytes, all BEFORE acceptance. An `Asset` field whose
     input_id is absent here never hydrates and refuses typed — same law as `trees`, one
     modality over: the grant IS the read capability, and a ref is never a location."""
-    max_input_bytes: int = 64 << 20
-    """The DEPLOYMENT's per-input ceiling, the floor under every field's own `AssetBound`.
-    A field with no bound takes this one, so "unbounded" is not spellable."""
+    max_input_bytes: int | None = 64 << 20
+    """An explicit deployment ceiling narrows every field's own `AssetBound`.
+    None honors each installed field's declared bound, with 64 MiB for fields that
+    declare none. A larger field never widens an undeclared sibling's allowance."""
     scratch: Path | None = None
     """The RUN's scratch tree — the same directory across attempts of one run, which is what
     makes `Scratch.checkpoint_dir(key=)` resumable rather than merely named (§2)."""
@@ -752,7 +753,7 @@ def _check_input(
     asset: Asset,
     granted: InputMetadata,
     bound: AssetBound | None,
-    cap: int,
+    cap: int | None,
     expected_order: int,
 ) -> None:
     """The typed gate every input passes before the entrypoint exists to it.
@@ -784,7 +785,9 @@ def _check_input(
             code="asset_media_type",
             fields=[granted.input_id],
         )
-    limit = min(bound.max_bytes, cap) if bound is not None and bound.max_bytes else cap
+    declared = bound.max_bytes if bound is not None else None
+    ceiling = cap if cap is not None else declared or 64 << 20
+    limit = min(declared, ceiling) if declared else ceiling
     if limit and granted.length > limit:
         raise InvalidRequest(
             f"input {granted.input_id!r} is {granted.length} B and this field admits "

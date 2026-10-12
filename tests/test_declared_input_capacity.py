@@ -50,6 +50,7 @@ def job(payload: Request) -> Result:
         (1, 128 << 20, None, False),
         (128 << 20, 128 << 20, None, False),
         (128 << 20, 1, 32 << 20, False),
+        (128 << 20, 1, 0, False),
         (128 << 20, 1, 256 << 20, True),
     ],
 )

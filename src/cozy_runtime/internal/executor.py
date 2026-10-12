@@ -3284,7 +3284,10 @@ class Executor:
                             # hostile one, and there is no netns or seccomp under it.
                             trees=_trees(command),
                             assets=_granted_inputs(command),
-                            max_input_bytes=command.max_input_bytes or 64 << 20,
+                            max_input_bytes=(
+                                None if command.max_input_bytes is None
+                                else command.max_input_bytes or 64 << 20
+                            ),
                             max_output_bytes=command.max_output_bytes,
                             publish=self._publish,
                         ),
@@ -3996,7 +3999,10 @@ class Executor:
                 models=job_models,
                 trees=_trees(command),
                 assets=_granted_inputs(command),
-                max_input_bytes=command.max_input_bytes or 64 << 20,
+                max_input_bytes=(
+                    None if command.max_input_bytes is None
+                    else command.max_input_bytes or 64 << 20
+                ),
                 max_output_bytes=command.max_output_bytes,
                 scratch=scratch,
                 checkpoints=durable_checkpoint,

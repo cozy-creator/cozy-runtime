@@ -378,6 +378,7 @@ class _Run(_Attempt, frozen=True, kw_only=True):
     #: Retained input trees by reference: (root, digest).
     trees: dict[str, tuple[str, str]] = {}
     max_output_bytes: int = MAX_OUTPUT_BYTES
+    #: None honors installed per-field bounds; zero retains the older default ceiling.
     max_input_bytes: int | None = None
 
 
