@@ -1625,6 +1625,10 @@ class OfficialH3Pipeline:
                 "max_duration": _CEILING_S,
             },
         )
+        if refine_steps is not None:
+            # Artifact tensors land on CPU. Upstream moves latent/layout inputs, but
+            # expects text embeddings to have been produced on the DiT device already.
+            state.set("prompt_embeds", state.prompt_embeds.to(scoped._execution_device))
         # The selected upstream workflow owns the ordered preparation steps.
         # Text-only requests have no keyframe tensors to encode or concatenate.
         for name in blocks:
