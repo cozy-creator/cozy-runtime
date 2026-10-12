@@ -52,8 +52,10 @@ def run(body: dict[str, Any], *, expect: int = 0) -> dict[str, Any]:
 
 def test_cli_image_handoff_and_raw_paths(tmp_path: Path) -> None:
     source = tmp_path / "large.jpg"
-    Image.frombytes("RGB", (512, 512), random.Random(7).randbytes(512 * 512 * 3)).save(
-        source, quality=95
+    exif = Image.Exif()
+    exif[274] = 6
+    Image.frombytes("RGB", (512, 384), random.Random(7).randbytes(512 * 384 * 3)).save(
+        source, quality=95, exif=exif
     )
     before = source.read_bytes()
     body = request(source)
@@ -73,6 +75,13 @@ def test_cli_image_handoff_and_raw_paths(tmp_path: Path) -> None:
     )
     actual = decode_image_path(derivative, DEFAULT_DECODE_LIMITS, _Budget(1 << 20))
     assert actual == expected
+    assert (actual.width, actual.height) == (48, 64)
+    assert (
+        decode_image_path(
+            derivative, DEFAULT_DECODE_LIMITS, _Budget(1 << 20), ImagePreparation(max_edge=64)
+        )
+        == actual
+    )
     assert source.read_bytes() == before
 
     # Raw paths retain the caller's path, including symlinks.
