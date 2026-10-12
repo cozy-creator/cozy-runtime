@@ -1275,7 +1275,12 @@ class Telemetry(_Bound):
     def _child_progress(self, payload: Mapping[str, Any], scope: _ProgressScope) -> None:
         """Relay measured child coordinates without making child completion parent completion."""
         self._attempt.check_open("Telemetry.child_progress")
-        stage = self._stage_name(payload.get("stage"))
+        stage_name = payload.get("stage")
+        # Machine preparation can name several checkpoints in one stage. Bound its
+        # display text without dropping the child's progress or accepting control text.
+        if isinstance(stage_name, str) and stage_name.isprintable():
+            stage_name = stage_name[:120]
+        stage = self._stage_name(stage_name)
         if stage is None:
             return
         fraction = (

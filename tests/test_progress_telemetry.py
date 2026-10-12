@@ -26,6 +26,7 @@ def test_invalid_or_regressing_progress_is_omitted_and_diagnosed(tmp_path: Path)
     telemetry.progress(0.6, stage="denoising", overall_fraction=0.6)
     telemetry.progress(float("nan"), stage="denoising", overall_fraction=float("nan"))
     telemetry.progress(0.8, stage="")
+    telemetry.progress(0.8, stage="x" * 121)
 
     frames = [row for row in emitted if isinstance(row, ProgressFrame)]
     assert [(row.stage_fraction, row.overall_fraction) for row in frames] == [

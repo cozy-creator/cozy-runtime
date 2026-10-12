@@ -123,3 +123,48 @@ def test_child_progress_uses_its_reserved_scope_and_deduplicates_polls(tmp_path:
         broker._observe(second, msgspec.structs.replace(update, child_request_id="child-2"))
         assert frames[-1].stage == "Shot 3 of 7 / denoise"
         assert frames[-1].overall_fraction == 0.5
+
+    # A machine can name several checkpoints and components in one download stage.
+    # Every byte update must relay the child's identity, which lets the machine attach
+    # its current byte counters to the parent's progress frame.
+    stage = (
+        "downloading paul/minimax-h3@1.0.0-rc.3 fp8-pruned "
+        "(text_encoder, ref2va_dit, video_vae, audio_vae) and "
+        "paul/minimax-h3-turbo-lora@1.0.0-audit.1 pdd8 (ref2va_turbo)"
+    )
+    count = len(frames)
+    for sequence, done in ((11, 5_000_000_000), (12, 6_000_000_000)):
+        broker._observe(
+            second,
+            CallState(
+                ok=True,
+                child_request_id="child-2",
+                progress=CallProgress(
+                    sequence=sequence,
+                    payload={
+                        "stage": stage,
+                        "bytes_done": done,
+                        "bytes_total": 54_423_037_664,
+                        "call_request": "child-2",
+                        "call_attempt": 2,
+                    },
+                ),
+            ),
+        )
+    relayed = frames[count:]
+    assert len(relayed) == 2
+    assert all(isinstance(row, ProgressFrame) for row in relayed)
+    assert [(row.stage, row.call_request, row.call_attempt) for row in relayed] == [
+        (("Shot 3 of 7 / " + stage)[:120], "child-2", 2),
+        (("Shot 3 of 7 / " + stage)[:120], "child-2", 2),
+    ]
+    count = len(frames)
+    broker._observe(
+        second,
+        CallState(
+            ok=True,
+            child_request_id="child-2",
+            progress=CallProgress(sequence=13, payload={"stage": stage + "\n"}),
+        ),
+    )
+    assert not any(isinstance(row, ProgressFrame) for row in frames[count:])
