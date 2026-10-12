@@ -18,8 +18,23 @@ class Recipe:
 
 
 def huggingface_recipe(repository: str, revision: str) -> Recipe | None:
+    from cozy_runtime.models.birefnet import ingestion as birefnet
     from cozy_runtime.models.qwen_image21 import ingestion as qwen
 
+    if repository.lower() == birefnet.REPOSITORY.lower():
+        if revision != birefnet.REVISION:
+            raise UnsupportedInput(
+                "BiRefNet ingestion requires its reviewed immutable revision " + birefnet.REVISION,
+                code="model_ingestion_revision",
+            )
+        return Recipe(
+            "birefnet/original/1",
+            birefnet.REPOSITORY,
+            birefnet.REVISION,
+            "as-is/1",
+            ("model.safetensors",),
+            dict(birefnet.FILES),
+        )
     if repository.lower() != qwen.REPOSITORY.lower():
         return None
     if revision != qwen.REVISION:

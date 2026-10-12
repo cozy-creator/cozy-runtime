@@ -78,6 +78,28 @@ def test_qwen_configuration_rejects_changed_metadata_before_use(tmp_path: Path) 
         configuration(tmp_path)
 
 
+def test_birefnet_cli_uses_native_identity_ingest_and_its_complete_model_config() -> None:
+    command = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "cozy_runtime.cli.main",
+            "--json",
+            "model-ingestion-plan",
+            "ZhengPeng7/BiRefNet",
+            "e2bf8e4460fc8fa32bba5ea4d94b3233d367b0e4",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    recipe = json.loads(command.stdout)["recipe"]
+    assert recipe["carriers"] == ["model.safetensors"]
+    assert recipe["profile"] == "as-is/1"
+    assert recipe["name"] == "birefnet/original/1"
+    assert set(recipe["metadata"]) == {"config.json"}
+
+
 def test_preparation_binds_real_native_source_and_refuses_wrong_census(tmp_path: Path) -> None:
     store = tensorfs.Store.init(tmp_path / "store")
     source = _source(store, "control")
