@@ -5,10 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    from tensorfs.derived import SourceInspection
+from typing import Any
 
 REPOSITORY = "ZhengPeng7/BiRefNet"
 REVISION = "e2bf8e4460fc8fa32bba5ea4d94b3233d367b0e4"
@@ -18,7 +15,7 @@ FILES = {
 
 
 def preparation(
-    inspection: SourceInspection, root: Path
+    inspection: Any, root: Path
 ) -> tuple[dict[str, Any], tuple[tuple[str, str], ...], dict[str, bytes]]:
     """Keep native weights unchanged and attach their model-owned constructor config."""
     raw = (root / "config.json").read_bytes()
