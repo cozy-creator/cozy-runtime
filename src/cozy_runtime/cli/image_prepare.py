@@ -30,13 +30,12 @@ from cozy_runtime.author._decode import (
     DEFAULT_DECODE_LIMITS,
     IMAGE_SOURCE_MAX_BYTES,
     IMAGE_WORKING_MAX_BYTES,
-    _av,
     _Budget,
     decode_image_path,
     image_source_geometry,
     image_target_size,
 )
-from cozy_runtime.author._errors import AuthorError, CapabilityError
+from cozy_runtime.author._errors import AuthorError
 from cozy_runtime.author._image_profile import image_preparation_profile
 from cozy_runtime.author._markers import IMAGE_PREPARATION_PROFILE, ImagePreparation
 from cozy_runtime.author._media import KIND_MEDIA, SNIFF_BYTES, sniff
@@ -66,11 +65,7 @@ def profile(args: list[str]) -> Result:
         raise CliError(
             "usage", "image-preparation-profile takes no arguments", "use --json", Exit.usage
         )
-    try:
-        codec = _av()
-    except CapabilityError:
-        codec = None
-    return Result(document=image_preparation_profile(codec))
+    return Result(document=image_preparation_profile())
 
 
 def _request() -> _Request:
@@ -135,10 +130,6 @@ def _prepare(request: _Request) -> Result:
     geometry = image_source_geometry(source, DEFAULT_DECODE_LIMITS, policy)
     if image_target_size(*geometry, policy) == geometry:
         # Raw fallback keeps normal Runtime validation; do not decode small images twice.
-        return _raw(source, source_length, source_mime, request.max_bytes)
-    try:
-        _av()
-    except CapabilityError:
         return _raw(source, source_length, source_mime, request.max_bytes)
     carrier = next(
         (mime for mime in ("image/webp", "image/png") if mime in request.media_types), ""

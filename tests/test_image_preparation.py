@@ -30,8 +30,6 @@ from cozy_runtime.author._decode import (
     DecodedImage,
     MediaDecodeError,
     _Budget,
-    _decode_image_frame,
-    _jpeg_rotation,
     decode_image_path,
     image_target_size,
 )
@@ -53,7 +51,7 @@ def decode(path: Path, preparation: ImagePreparation | None = None) -> DecodedIm
     )
 
 
-@pytest.mark.parametrize("orientation", [1, 3, 6, 8])
+@pytest.mark.parametrize("orientation", [1, 2, 3, 4, 5, 6, 7, 8])
 def test_preparation_lossless_handoff_and_idempotence(tmp_path: Path, orientation: int) -> None:
     source = tmp_path / "photo.jpg"
     image = Image.linear_gradient("L").resize((1001, 733)).convert("RGB")
@@ -63,7 +61,7 @@ def test_preparation_lossless_handoff_and_idempotence(tmp_path: Path, orientatio
     original = source.read_bytes()
     preparation = ImagePreparation(max_edge=333, max_pixels=100_000)
     prepared = decode(source, preparation)
-    expected = (243, 333) if orientation in (6, 8) else (333, 243)
+    expected = (243, 333) if orientation in (5, 6, 7, 8) else (333, 243)
     assert (prepared.width, prepared.height) == expected
     for extension, encode in (("png", encode_png), ("webp", encode_webp)):
         derivative = tmp_path / f"prepared.{extension}"
@@ -85,27 +83,6 @@ def test_preparation_accepts_any_codec_release(
     monkeypatch.setattr(av, "__version__", "99.0.0")
     prepared = decode(source, ImagePreparation(max_edge=300))
     assert (prepared.width, prepared.height) == (300, 200)
-
-
-def test_jpeg_orientation_reads_only_bounded_header_segments(tmp_path: Path) -> None:
-    source = tmp_path / "orientation.jpg"
-    exif = Image.Exif()
-    exif[274] = 6
-    Image.linear_gradient("L").resize((1024, 768)).save(source, quality=100, exif=exif)
-
-    class HeaderReader(io.BytesIO):
-        count = 0
-
-        def read(self, size: int | None = -1) -> bytes:
-            assert size is not None and 0 <= size <= 65535
-            data = super().read(size)
-            self.count += len(data)
-            return data
-
-    encoded = source.read_bytes()
-    reader = HeaderReader(encoded)
-    assert _jpeg_rotation(reader) == -90
-    assert reader.count < 1024 < len(encoded)
 
 
 def test_source_limits_refuse_before_pixel_decode(tmp_path: Path) -> None:
@@ -181,13 +158,6 @@ def test_source_pixels_do_not_hide_behind_small_prepared_output(tmp_path: Path) 
     Image.new("RGB", (512, 512)).save(photo)
     with pytest.raises(MediaDecodeError, match="pixel"):
         decode_image_path(photo, limits, _Budget(limits.max_decoded_bytes), prep)
-    # Real small native frame: the second check must hold even if a codec were
-    # to expose geometry different from its initial header.
-    frame = av.VideoFrame(512, 512, "rgb24")
-    with pytest.raises(MediaDecodeError, match="pixel"):
-        _decode_image_frame(
-            frame, limits, _Budget(limits.max_decoded_bytes), rotation=0, preparation=prep
-        )
 
 
 @pytest.mark.parametrize("named_alias", [False, True])
@@ -229,8 +199,8 @@ def render(
     }
 
 
-@pytest.mark.parametrize("format", ["PNG", "WEBP"])
-@pytest.mark.parametrize("orientation", [None, 1, 3, 6, 8])
+@pytest.mark.parametrize("format", ["JPEG", "PNG", "WEBP"])
+@pytest.mark.parametrize("orientation", [None, 1, 2, 3, 4, 5, 6, 7, 8])
 def test_exif_image_orientation_survives_pyav_side_data(
     tmp_path: Path, format: str, orientation: int | None
 ) -> None:
@@ -252,14 +222,33 @@ def test_exif_image_orientation_survives_pyav_side_data(
     assert source.read_bytes() == original
 
 
-@pytest.mark.parametrize("format", ["PNG", "WEBP"])
-@pytest.mark.parametrize("orientation", [2, 4, 5, 7])
-def test_exif_image_mirrors_keep_the_explicit_refusal(
-    tmp_path: Path, format: str, orientation: int
-) -> None:
-    source = tmp_path / ("mirror." + format.lower())
-    exif = Image.Exif()
-    exif[274] = orientation
-    Image.new("RGB", (7, 5)).save(source, format=format, exif=exif, lossless=True)
-    with pytest.raises(MediaDecodeError, match="mirror transform"):
+@pytest.mark.parametrize("format", ["GIF", "PNG", "WEBP", "TIFF"])
+def test_still_image_refuses_animation(tmp_path: Path, format: str) -> None:
+    source = tmp_path / ("animated." + format.lower())
+    Image.new("RGB", (7, 5), "red").save(
+        source,
+        format=format,
+        save_all=True,
+        append_images=[Image.new("RGB", (7, 5), "blue")],
+        duration=100,
+    )
+    with pytest.raises(MediaDecodeError) as error:
         decode(source)
+    assert error.value.code == "animated_image"
+
+
+def test_still_image_refuses_truncated_pixels(tmp_path: Path) -> None:
+    source = tmp_path / "truncated.png"
+    encoded = io.BytesIO()
+    Image.frombytes("RGB", (7, 5), bytes(range(105))).save(encoded, format="PNG")
+    source.write_bytes(encoded.getvalue()[:45])
+    with pytest.raises(MediaDecodeError):
+        decode(source)
+
+
+def test_still_image_retained_budget_precedes_pixel_decode(tmp_path: Path) -> None:
+    source = tmp_path / "image.png"
+    Image.new("RGB", (7, 5)).save(source)
+    source.write_bytes(source.read_bytes()[:45])  # Header fits, but pixel loading would fail.
+    with pytest.raises(MediaDecodeError, match="decoded"):
+        decode_image_path(source, DEFAULT_DECODE_LIMITS, _Budget(104))
