@@ -134,14 +134,23 @@ def test_child_progress_uses_its_reserved_scope_and_deduplicates_polls(tmp_path:
     )
     count = len(frames)
     for sequence, done in ((11, 5_000_000_000), (12, 6_000_000_000)):
-        broker._observe(second, CallState(
-            ok=True,
-            child_request_id="child-2",
-            progress=CallProgress(sequence=sequence, payload={
-                "stage": stage, "bytes_done": done, "bytes_total": 54_423_037_664,
-                "call_request": "child-2", "call_attempt": 2,
-            }),
-        ))
+        broker._observe(
+            second,
+            CallState(
+                ok=True,
+                child_request_id="child-2",
+                progress=CallProgress(
+                    sequence=sequence,
+                    payload={
+                        "stage": stage,
+                        "bytes_done": done,
+                        "bytes_total": 54_423_037_664,
+                        "call_request": "child-2",
+                        "call_attempt": 2,
+                    },
+                ),
+            ),
+        )
     relayed = frames[count:]
     assert len(relayed) == 2
     assert all(isinstance(row, ProgressFrame) for row in relayed)
@@ -150,9 +159,12 @@ def test_child_progress_uses_its_reserved_scope_and_deduplicates_polls(tmp_path:
         (("Shot 3 of 7 / " + stage)[:120], "child-2", 2),
     ]
     count = len(frames)
-    broker._observe(second, CallState(
-        ok=True,
-        child_request_id="child-2",
-        progress=CallProgress(sequence=13, payload={"stage": stage + "\n"}),
-    ))
+    broker._observe(
+        second,
+        CallState(
+            ok=True,
+            child_request_id="child-2",
+            progress=CallProgress(sequence=13, payload={"stage": stage + "\n"}),
+        ),
+    )
     assert not any(isinstance(row, ProgressFrame) for row in frames[count:])
