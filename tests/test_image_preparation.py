@@ -12,7 +12,7 @@ from typing import Annotated
 import av
 import msgspec
 import pytest
-from PIL import Image
+from PIL import Image, ImageOps
 
 from cozy_runtime.author import (
     App,
@@ -227,3 +227,39 @@ def render(
         "profile": "image-fit/1",
         "max_edge": 512,
     }
+
+
+@pytest.mark.parametrize("format", ["PNG", "WEBP"])
+@pytest.mark.parametrize("orientation", [None, 1, 3, 6, 8])
+def test_exif_image_orientation_survives_pyav_side_data(
+    tmp_path: Path, format: str, orientation: int | None
+) -> None:
+    # PyAV 18.1 raises while constructing frame.side_data when FFmpeg exposes
+    # EXIF (type 31), even if its orientation is 1 or there is no orientation tag.
+    source = tmp_path / ("exif." + format.lower())
+    image = Image.frombytes("RGB", (7, 5), bytes(range(105)))
+    exif = Image.Exif()
+    exif[305] = "synthetic orientation regression"
+    if orientation is not None:
+        exif[274] = orientation
+    image.save(source, format=format, exif=exif, lossless=True)
+    original = source.read_bytes()
+    with Image.open(source) as saved:
+        expected = ImageOps.exif_transpose(saved).convert("RGB")
+    decoded = decode(source)
+    assert (decoded.width, decoded.height) == expected.size
+    assert decoded.rgb == expected.tobytes()
+    assert source.read_bytes() == original
+
+
+@pytest.mark.parametrize("format", ["PNG", "WEBP"])
+@pytest.mark.parametrize("orientation", [2, 4, 5, 7])
+def test_exif_image_mirrors_keep_the_explicit_refusal(
+    tmp_path: Path, format: str, orientation: int
+) -> None:
+    source = tmp_path / ("mirror." + format.lower())
+    exif = Image.Exif()
+    exif[274] = orientation
+    Image.new("RGB", (7, 5)).save(source, format=format, exif=exif, lossless=True)
+    with pytest.raises(MediaDecodeError, match="mirror transform"):
+        decode(source)
