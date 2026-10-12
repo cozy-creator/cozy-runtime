@@ -1,8 +1,9 @@
 """Retained H3 conditioning and the real upstream refinement loop, on CPU."""
+
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 
@@ -14,30 +15,70 @@ from diffusers.modular_pipelines.minimax_h3.modular_pipeline import audio_latent
 from cozy_runtime.author import InvalidRequest  # noqa: E402
 from cozy_runtime.models.minimax_h3.official import OfficialH3Pipeline, canonical_timestep_plan  # noqa: E402
 from cozy_runtime.models.minimax_h3.refinement import (  # noqa: E402
-    H3Latents, ReferenceLayout, capture_latents, decode_latents, encode_latents,
-    refinement_state, resize_video_chunk,
+    H3Latents,
+    ReferenceLayout,
+    capture_latents,
+    decode_latents,
+    encode_latents,
+    refinement_state,
+    resize_video_chunk,
 )
 
 
-def artifact(task: str, anchored: bool = False) -> H3Latents:
+def artifact(task: Literal["fl2va", "ref2va"], anchored: bool = False) -> H3Latents:
     generator = torch.Generator().manual_seed(42)
-    random = lambda shape: torch.randn(shape, generator=generator)
+
+    def random(shape: tuple[int, ...]) -> Any:
+        return torch.randn(shape, generator=generator)
+
     conditions = (random((1, 24, 1, 2, 4)),) if task == "ref2va" or anchored else ()
     return H3Latents(
-        random((1, 24, 37, 2, 4)), random((2, 32, audio_latent_num_frames(124))),
-        random((1, 2, 124 * 32000 // 24)), random((1, 3, 8)), torch.ones(3, dtype=torch.long),
-        conditions, (), (ReferenceLayout("image"),) if task == "ref2va" else (),
-        ("first",) if anchored else (), task, 124, 42, "model@1.0.0/original",  # type: ignore[arg-type]
+        random((1, 24, 37, 2, 4)),
+        random((2, 32, audio_latent_num_frames(124))),
+        random((1, 2, 124 * 32000 // 24)),
+        random((1, 3, 8)),
+        torch.ones(3, dtype=torch.long),
+        conditions,
+        (),
+        (ReferenceLayout("image"),) if task == "ref2va" else (),
+        ("first",) if anchored else (),
+        task,
+        124,
+        42,
+        "model@1.0.0/original",
     )
 
 
-def pipeline(task: str) -> OfficialH3Pipeline:
-    dit = MiniMaxH3Transformer3DModel(
-        num_attention_heads=1, attention_head_dim=8, hidden_size=8, num_layers=2,
-        num_refiner_layers=1, ffn_dim=16, in_channels=24, audio_in_channels=32,
-        patch_size=(1, 2, 2), text_dim=8, freq_dim=8, time_embed_hidden_dim=8,
-        time_embed_dim=8, rope_freq_dim=1,
+def pipeline(task: str, pruned: bool) -> OfficialH3Pipeline:
+    from cozy_runtime.models.minimax_h3.adaln_pruned import AdaLNPrunedMiniMaxH3Transformer
+
+    timesteps, rows = canonical_timestep_plan(task).table_layout()
+    constructor = AdaLNPrunedMiniMaxH3Transformer if pruned else MiniMaxH3Transformer3DModel
+    tables: dict[str, Any] = {"table_timesteps": timesteps, "table_block_keys": rows} if pruned else {}
+    dit = constructor(
+        **tables,
+        num_attention_heads=1,
+        attention_head_dim=8,
+        hidden_size=8,
+        num_layers=2,
+        num_refiner_layers=1,
+        ffn_dim=16,
+        in_channels=24,
+        audio_in_channels=32,
+        patch_size=(1, 2, 2),
+        text_dim=8,
+        freq_dim=8,
+        time_embed_hidden_dim=8,
+        time_embed_dim=8,
+        rope_freq_dim=1,
     ).eval()
+    if pruned:
+        with torch.no_grad():
+            for table in (
+                dit.norm_out.table,
+                *(b.adaln_proj.table for b in dit.transformer_blocks),
+            ):
+                table.normal_(0, 0.1)
     workflows = [task, "t2va"] if task == "fl2va" else [task]
     pipe = object.__new__(OfficialH3Pipeline)
     pipe.components = {f"{task}_dit": dit}
@@ -45,19 +86,34 @@ def pipeline(task: str) -> OfficialH3Pipeline:
     pipe._pipes = {}
     for name, blocks in pipe._blocks.items():
         upstream = MiniMaxH3ModularPipeline(blocks=blocks)
-        upstream.register_components(**{"transformer_ref" if task == "ref2va" else "transformer": dit})
+        upstream.register_components(
+            **{"transformer_ref" if task == "ref2va" else "transformer": dit}
+        )
         pipe._pipes[name] = upstream
-    pipe._plans = {task: canonical_timestep_plan(task)}  # type: ignore[dict-item,arg-type]
+    pipe._plans = {task: canonical_timestep_plan(task)}  # type: ignore[dict-item]
     pipe._dit_specs = {task: (None, None, None)}  # type: ignore[dict-item]
     return pipe
 
 
 @pytest.mark.parametrize("task,anchored", [("fl2va", False), ("fl2va", True), ("ref2va", False)])
-def test_retained_generation_refines_with_real_upstream_blocks_and_keeps_audio(task: Any, anchored: bool) -> None:
+@pytest.mark.parametrize("pruned", [False, True])
+def test_retained_generation_refines_with_real_upstream_blocks_and_keeps_audio(
+    task: Any, anchored: bool, pruned: bool
+) -> None:
     initial = artifact(task, anchored)
     restored = decode_latents(encode_latents(initial))
-    original = encode_latents(restored)
-    pipe = pipeline(task)
+    original = [
+        t.clone()
+        for t in (
+            restored.video,
+            restored.audio,
+            restored.waveform,
+            restored.prompt_embeds,
+            restored.text_token_tags,
+            *restored.conditions,
+        )
+    ]
+    pipe = pipeline(task, pruned)
     state = refinement_state(restored, torch.Generator().manual_seed(77))
     calls: list[tuple[Any, Any]] = []
 
@@ -65,7 +121,12 @@ def test_retained_generation_refines_with_real_upstream_blocks_and_keeps_audio(t
         tags, timesteps = kwargs["token_tags"], kwargs["timestep"]
         actual = timesteps[kwargs["timestep_indices"]]
         assert torch.all(actual[tags == 2] == 1), "refinement must treat retained audio as clean"
-        calls.append((kwargs["hidden_states"].detach().clone(), kwargs["audio_hidden_states"].detach().clone()))
+        calls.append(
+            (
+                kwargs["hidden_states"].detach().clone(),
+                kwargs["audio_hidden_states"].detach().clone(),
+            )
+        )
 
     hook = pipe.components[f"{task}_dit"].register_forward_pre_hook(inspect_audio, with_kwargs=True)
     prior_threads = torch.get_num_threads()
@@ -83,7 +144,21 @@ def test_retained_generation_refines_with_real_upstream_blocks_and_keeps_audio(t
     assert torch.equal(pipe.decode_audio(task, state), initial.waveform)
     assert state.latents.shape == initial.video.shape and torch.isfinite(state.latents).all()
     assert not torch.equal(state.latents, initial.video)
-    assert encode_latents(restored) == original, "refining must not mutate a reusable baseline"
+    assert all(
+        torch.equal(actual, expected)
+        for actual, expected in zip(
+            (
+                restored.video,
+                restored.audio,
+                restored.waveform,
+                restored.prompt_embeds,
+                restored.text_token_tags,
+                *restored.conditions,
+            ),
+            original,
+            strict=True,
+        )
+    ), "refining must not mutate a reusable baseline"
     saved = capture_latents(task, state, checkpoint=initial.checkpoint, seed=77)
     assert torch.equal(decode_latents(encode_latents(saved)).waveform, initial.waveform)
 
