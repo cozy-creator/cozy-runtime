@@ -171,9 +171,9 @@ class Context:
 
         Call it after awaiting the last GPU call. The request's GPU lease ends at once;
         the request keeps running. A GPU call still in flight keeps its GPUs until it
-        returns. A GPU call awaited later is a new demand that waits in line at this
-        request's original priority and never takes GPUs back from whoever got them
-        meanwhile. Idempotent. Where there is no lease to end (a request with no GPU
+        returns. A GPU call awaited later queues to acquire GPUs again and never
+        takes GPUs back from whoever got them meanwhile. Idempotent. Where there is
+        no lease to end (a request with no GPU
         calls, or a GPU handler, whose GPUs end when it returns) it does nothing.
         """
         if self._release_gpus is not None:
