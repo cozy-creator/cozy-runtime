@@ -26,7 +26,7 @@ dev = [
     "ruff>=0.16",
     # Model-bound Runtime tests exercise the real compiled storage boundary.
     "tensorfs>=0.6.1,<0.7",
-    "av>=18.1,<19",
+    "av>=18.1",
     # CI partitions this unchanged suite across independent delegated runners.
     "pytest-split>=0.11.0",
 ]
