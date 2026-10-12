@@ -15,13 +15,14 @@ from collections.abc import Callable, Iterator
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from fractions import Fraction
+from numbers import Integral
 from pathlib import Path
 from typing import Any, BinaryIO, Literal, Protocol, TypeVar
 
 from PIL.Image import DecompressionBombError, Resampling, Transpose
-from PIL.ImageOps import exif_transpose
 from PIL.Image import frombytes as pil_frombytes
 from PIL.Image import open as pil_open
+from PIL.ImageOps import exif_transpose
 
 from cozy_runtime.author import _color
 from cozy_runtime.author._assets import Asset, AudioAsset, Image, ImageAsset, VideoAsset
@@ -508,14 +509,12 @@ class _VideoStreamDecoder:
         self._time_base: Fraction | None = None
         self.frame_count = 0
         rate = stream.average_rate
-        self._nominal_frame_rate = (
-            _positive_fraction(rate, "video average rate") if rate is not None else None
-        )
+        self._nominal_frame_rate = _positive_fraction(rate, "video average rate") if rate else None
         ratio = stream.sample_aspect_ratio
+        # PyAV 19 represents unspecified ratios as a falsy AVRational rather
+        # than None. The unspecified pixel aspect ratio means square pixels.
         self._pixel_aspect_ratio = (
-            _positive_fraction(ratio, "video pixel aspect ratio")
-            if ratio is not None
-            else Fraction(1, 1)
+            _positive_fraction(ratio, "video pixel aspect ratio") if ratio else Fraction(1, 1)
         )
 
         context = stream.codec_context
@@ -1325,7 +1324,7 @@ def _valid_audio_samples(frame: Any, samples: int, rate: int) -> int:
     if duration is None or int(duration) <= 0:
         return samples
     time_base = frame.time_base
-    if time_base is None:
+    if not time_base:
         return samples
     exact_base = _positive_fraction(time_base, "audio frame time base")
     if exact_base != Fraction(1, rate):
@@ -1357,7 +1356,9 @@ _PURE_DISPLAY_MATRICES = {
 
 def _display_rotation(frame: Any) -> int:
     try:
-        matrices = [side for side in frame.side_data if side.type.name == "DISPLAYMATRIX"]
+        # Both PyAV 18 and 19 support typed lookup; iteration changed from values
+        # to keys in 19 when SideDataContainer adopted the Mapping contract.
+        matrix = frame.side_data.get("DISPLAYMATRIX")
     except ValueError as exc:
         # PyAV 18.1 cannot represent some FFmpeg side-data enums (notably EXIF display
         # transforms). Accepting only frame.rotation would silently discard mirror state.
@@ -1365,16 +1366,14 @@ def _display_rotation(frame: Any) -> int:
             "display transform cannot be inspected without losing orientation",
             code="media_rotation",
         ) from exc
-    if not matrices:
+    if matrix is None:
         if int(frame.rotation):
             raise MediaDecodeError(
                 "frame reports rotation without an inspectable display matrix",
                 code="media_rotation",
             )
         return 0
-    if len(matrices) != 1:
-        raise MediaDecodeError("frame has multiple display matrices", code="media_rotation")
-    raw = bytes(matrices[0])
+    raw = bytes(matrix)
     if len(raw) != 36:
         raise MediaDecodeError("display matrix has an invalid size", code="media_rotation")
     rotation = _PURE_DISPLAY_MATRICES.get(struct.unpack("=9i", raw))
@@ -1419,6 +1418,14 @@ def _fraction(value: object, what: str) -> Fraction:
     try:
         if isinstance(value, Fraction):
             return value
+        # PyAV has exposed AVRatios as both ``fractions.Fraction`` and a small
+        # rational object with integer numerator/denominator attributes across
+        # supported releases.  Preserve that ratio exactly instead of routing
+        # it through float conversion.
+        numerator = getattr(value, "numerator", None)
+        denominator = getattr(value, "denominator", None)
+        if isinstance(numerator, Integral) and isinstance(denominator, Integral):
+            return Fraction(int(numerator), int(denominator))
         if isinstance(value, int | float | str):
             return Fraction(value)
         raise TypeError(type(value).__name__)
