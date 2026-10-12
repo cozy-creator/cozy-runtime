@@ -18,7 +18,8 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any, BinaryIO, Literal, Protocol, TypeVar
 
-from PIL.Image import Transpose
+from PIL.Image import DecompressionBombError, Resampling, Transpose
+from PIL.ImageOps import exif_transpose
 from PIL.Image import frombytes as pil_frombytes
 from PIL.Image import open as pil_open
 
@@ -1127,7 +1128,7 @@ class MediaDecoder:
             )
         if asset._read_guard is not None:
             asset._read_guard()
-        av = _av()
+        av = None if expected is ImageAsset else _av()
         budget = _Budget(
             min(asset._max_decoded_bytes, self._limits.max_decoded_bytes),
             parent=self._budget if retained else None,
@@ -1190,7 +1191,7 @@ def image_decoded_bytes(path: Path) -> int:
 
 
 def image_source_geometry(
-    path: Path, limits: DecodeLimits, preparation: ImagePreparation
+    path: Path, limits: DecodeLimits, preparation: ImagePreparation | None
 ) -> tuple[int, int]:
     """Header-only refusal before the codec opens or decodes a full frame."""
     if path.stat().st_size > IMAGE_SOURCE_MAX_BYTES:
@@ -1214,83 +1215,43 @@ def image_source_geometry(
 def decode_image_path(
     path: Path, limits: DecodeLimits, budget: _Budget, preparation: ImagePreparation | None = None
 ) -> DecodedImage:
-    """One exact decoder core for a verified Runtime input or authorized local helper.
+    """Decode still images with Pillow; CLI preparation and Runtime use the same core.
 
-    It receives no grant authority. MediaDecoder still performs its attempt checks;
-    the neutral CLI helper owns its separately authorized local input and limits.
+    Resource ceilings are application policy. Pillow owns image formats, EXIF
+    orientation (including mirrors), RGB conversion and resampling.
     """
-    source_geometry = (
-        image_source_geometry(path, limits, preparation) if preparation is not None else None
-    )
-    with path.open("rb") as source:
-        jpeg = source.read(2) == b"\xff\xd8"
-        source.seek(0)
-        rotation = _jpeg_rotation(source) if jpeg else None
-    av = _av()
-    with av.open(str(path), mode="r") as container:
-        streams = list(container.streams.video)
-        if len(streams) != 1:
-            _required_stream("image", len(streams))
-        stream = streams[0]
-        _set_decoder_option(stream.codec_context, "err_detect", "explode")
-        _set_decoder_option(stream.codec_context, "max_pixels", limits.max_pixels_per_frame)
-        stream.codec_context.thread_count = 1
-        width = int(stream.codec_context.width or 0)
-        height = int(stream.codec_context.height or 0)
-        if width > 0 and height > 0:
-            _check_pixels(width, height, limits)
-            if source_geometry is not None and (width, height) != source_geometry:
-                raise MediaDecodeError(
-                    "image header and codec geometry disagree", code="media_geometry"
-                )
-        decoded: DecodedImage | None = None
-        for frame in container.decode(stream):
-            if (
-                source_geometry is not None
-                and (int(frame.width), int(frame.height)) != source_geometry
-            ):
-                raise MediaDecodeError(
-                    "image decoded geometry differs from its header", code="media_geometry"
-                )
-            if decoded is not None:
+    try:
+        source_geometry = image_source_geometry(path, limits, preparation)
+        with pil_open(path) as image:
+            if image.size != source_geometry:
+                raise MediaDecodeError("image header geometry changed", code="media_geometry")
+            if getattr(image, "n_frames", 1) != 1:
                 raise MediaDecodeError(
                     "image asset contains more than one frame", code="animated_image"
                 )
-            decoded = _decode_image_frame(
-                frame, limits, budget, rotation=rotation, preparation=preparation
-            )
-        if decoded is None:
-            raise MediaDecodeError("image stream decoded no frame", code="media_empty")
-        return decoded
-
-
-def _decode_image_frame(
-    frame: Any,
-    limits: DecodeLimits,
-    budget: _Budget,
-    *,
-    rotation: int | None,
-    preparation: ImagePreparation | None = None,
-) -> DecodedImage:
-    if frame.is_corrupt:
-        raise MediaDecodeError("image decoder marked the frame corrupt", code="media_corrupt")
-    _check_pixels(int(frame.width), int(frame.height), limits)
-    rotation = _display_rotation(frame) if rotation is None else rotation
-    width, height = image_target_size(int(frame.width), int(frame.height), preparation)
-    budget.claim(width * height * 3, "image RGB")
-    if (width, height) != (int(frame.width), int(frame.height)):
-        av = _av()
-        interpolation = (
-            av.video.reformatter.Interpolation.LANCZOS
-            | av.video.reformatter.Interpolation.ACCURATE_RND
-            | av.video.reformatter.Interpolation.BITEXACT
-        )
-        frame = frame.reformat(
-            width=width, height=height, format="rgb24", interpolation=interpolation, threads=1
-        )
-    rgb = _tight_rgb(frame)
-    rgb, width, height = _rotate_rgb(rgb, width, height, rotation)
-    return DecodedImage(width=width, height=height, rgb=rgb)
+            width, height = image_target_size(*source_geometry, preparation)
+            budget.claim(width * height * 3, "image RGB")
+            # in_place avoids an extra full-size copy for the common upright case.
+            exif_transpose(image, in_place=True)
+            rgb = image.convert("RGB")
+            size = image_target_size(*rgb.size, preparation)
+            if rgb.size != size:
+                rgb = rgb.resize(size, Resampling.LANCZOS)
+            return DecodedImage(rgb.width, rgb.height, rgb.tobytes())
+    except MediaDecodeError:
+        raise
+    except DecompressionBombError as exc:
+        raise MediaDecodeError(str(exc), code="pixels_per_frame_limit") from exc
+    except OSError as exc:
+        if exc.errno is not None:
+            raise  # Filesystem failures retain the caller's materialization error boundary.
+        raise MediaDecodeError(
+            f"image could not be decoded: {_safe_error(exc)}", code="media_malformed"
+        ) from exc
+    except (ValueError, SyntaxError) as exc:
+        raise MediaDecodeError(
+            f"image could not be decoded: {_safe_error(exc)}", code="media_malformed"
+        ) from exc
 
 
 def _tight_rgb(
@@ -1384,81 +1345,6 @@ def _require_finite_f32(data: bytes) -> None:
     values.frombytes(data)
     if not math.isfinite(sum(values)):
         raise MediaDecodeError("audio PCM contains NaN or infinity", code="audio_format")
-
-
-def _jpeg_rotation(source: BinaryIO | bytes) -> int:
-    """Read bounded JPEG EXIF segments without snapshotting compressed input."""
-    stream = io.BytesIO(source) if isinstance(source, bytes) else source
-    stream.seek(0, io.SEEK_END)
-    size = stream.tell()
-    stream.seek(2)
-    found: list[int] = []
-    while stream.tell() < size:
-        if stream.read(1) != b"\xff":
-            break
-        marker_bytes = stream.read(1)
-        while marker_bytes == b"\xff":
-            marker_bytes = stream.read(1)
-        if not marker_bytes:
-            raise MediaDecodeError("JPEG marker is truncated", code="media_malformed")
-        marker = marker_bytes[0]
-        if marker in (0xD9, 0xDA):
-            break
-        if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
-            continue
-        length_bytes = stream.read(2)
-        if len(length_bytes) != 2:
-            raise MediaDecodeError("JPEG segment length is truncated", code="media_malformed")
-        length = int.from_bytes(length_bytes, "big") - 2
-        if length < 0 or stream.tell() + length > size:
-            raise MediaDecodeError("JPEG segment crosses the input", code="media_malformed")
-        if marker == 0xE1:
-            payload = stream.read(length)
-            if payload.startswith(b"Exif\x00\x00"):
-                orientation = _tiff_orientation(payload[6:])
-                if orientation is not None:
-                    found.append(orientation)
-        else:
-            stream.seek(length, io.SEEK_CUR)
-    if len(found) > 1:
-        raise MediaDecodeError("JPEG carries multiple EXIF orientations", code="media_rotation")
-    orientation = found[0] if found else 1
-    rotations = {1: 0, 3: 180, 6: -90, 8: 90}
-    if orientation not in rotations:
-        raise MediaDecodeError(
-            f"JPEG EXIF orientation {orientation} contains a mirror transform",
-            code="media_rotation",
-        )
-    return rotations[orientation]
-
-
-def _tiff_orientation(tiff: bytes) -> int | None:
-    if len(tiff) < 8 or tiff[:2] not in {b"II", b"MM"}:
-        raise MediaDecodeError("EXIF TIFF header is malformed", code="media_malformed")
-    byteorder: Literal["little", "big"] = "little" if tiff[:2] == b"II" else "big"
-    if int.from_bytes(tiff[2:4], byteorder) != 42:
-        raise MediaDecodeError("EXIF TIFF magic is invalid", code="media_malformed")
-    ifd = int.from_bytes(tiff[4:8], byteorder)
-    if ifd + 2 > len(tiff):
-        raise MediaDecodeError("EXIF IFD offset crosses the segment", code="media_malformed")
-    count = int.from_bytes(tiff[ifd : ifd + 2], byteorder)
-    end = ifd + 2 + count * 12
-    if end > len(tiff):
-        raise MediaDecodeError("EXIF IFD entries are truncated", code="media_malformed")
-    values: list[int] = []
-    for index in range(count):
-        entry = tiff[ifd + 2 + index * 12 : ifd + 14 + index * 12]
-        tag = int.from_bytes(entry[:2], byteorder)
-        if tag != 0x0112:
-            continue
-        kind = int.from_bytes(entry[2:4], byteorder)
-        items = int.from_bytes(entry[4:8], byteorder)
-        if kind != 3 or items != 1:
-            raise MediaDecodeError("EXIF orientation has an invalid type", code="media_malformed")
-        values.append(int.from_bytes(entry[8:10], byteorder))
-    if len(values) > 1:
-        raise MediaDecodeError("EXIF IFD repeats the orientation tag", code="media_rotation")
-    return values[0] if values else None
 
 
 _PURE_DISPLAY_MATRICES = {

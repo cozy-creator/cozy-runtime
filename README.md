@@ -489,7 +489,9 @@ Pictures = Annotated[
 ]
 ```
 
-These example caps are package policy. Preparation preserves aspect ratio and never
+These example caps are package policy. Still images use Pillow decoding,
+`ImageOps.exif_transpose` (including mirrored orientations), RGB conversion and Lanczos
+resampling. Audio and video retain PyAV. Preparation preserves aspect ratio and never
 upscales. Creator can run the shared Runtime helper before upload; Runtime applies the
 same transform to originals sent by other clients. Small inputs keep their original
 carrier. Oversized inputs use one fast lossless encoding, or the original if it is
@@ -499,8 +501,10 @@ memo keys while decoding to identical pixels.
 
 The helper checks source byte/pixel limits before decoding and uses an isolated 2 GiB
 address-space limit. That process limit is never applied to a GPU executor. The
-`image-fit/1` profile qualifies the shared codec closure; missing local capability
-leaves preparation to Runtime. Fidelity remains an independent package-interpreted hint.
+`image-fit/1` declares the geometry policy. Derivative filenames hash freshly
+produced carrier bytes, so cached images are reused only when the actual output matches.
+Missing local capability leaves preparation to Runtime. Fidelity remains an independent
+package-interpreted hint.
 
 A package that prepares, binds, or fills a model selects `cozy-runtime[model-execution]`.
 That Runtime capability owns `tensorfs>=0.2,<1` from PyPI; package code does not declare
