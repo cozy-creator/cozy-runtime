@@ -65,9 +65,9 @@ def account(monkeypatch: pytest.MonkeyPatch, *, cached: int = 0, trim: bool = Tr
         memory["reserved_bytes"] -= slack
         memory["driver_free_bytes"] += slack
 
-    def shrink(need: int, protected_floor: int) -> int:
-        state.trimmed.append((need, protected_floor))
-        freed = min(need + weight_policy.MARGIN, state.committed - protected_floor) if trim else 0
+    def shrink(need: int, keep: int = 0) -> int:
+        state.trimmed.append((need, keep))
+        freed = min(need + weight_policy.MARGIN, state.committed - keep) if trim else 0
         state.committed -= freed
         memory["driver_free_bytes"] += freed
         return freed
@@ -93,12 +93,14 @@ def test_cached_segments_go_back_first_and_the_ask_stays_inside_the_cap(
     assert all(0 < n <= state.weights.cap - state.held() for n in state.asks)
 
 
-def test_idle_maps_go_back_down_to_the_open_stages_floor(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_maps_not_in_use_go_back_past_the_open_stages_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A planning floor counts regions no kernel reads now: only what is in use stays (the
+    plane cannot unmap a leased region), never a floor."""
     state = account(monkeypatch)
-    floor = state.weights.floor()
     state.weights.room_before("denoise")
-    assert state.trimmed == [(40 * MIB, floor)] and state.unparked == [True]
-    assert state.committed >= floor
+    assert state.trimmed == [(40 * MIB, 0)] and state.unparked == [True]
     assert state.held() <= state.weights.cap
     assert all(0 < n <= state.weights.cap - state.held() for n in state.asks)
 
