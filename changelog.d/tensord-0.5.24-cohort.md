@@ -1,0 +1,1 @@
+Bundle TensorD 0.5.24 with native TensorFS 0.7.6: a room grant is held + free − floor, a streamed host window reserves its room before allocation, null frame fields read as absent, failed installs quote 64 KiB of uv's stderr; TensorFS re-asks a TLS verdict from an already verified origin and reports a full disk as `CAPACITY_EXHAUSTED`.
