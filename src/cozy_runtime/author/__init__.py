@@ -16,7 +16,7 @@ touches, minus the codec plane (cr-017). Per-service fakes live in `cozy_runtime
 from cozy_runtime import canonical_json
 from cozy_runtime.author._activity import ThreadPoolExecutor
 from cozy_runtime.author._app import App, Registration, RegistrationError
-from cozy_runtime.author._artifacts import ModelArtifact, ObjectRef, SourceArtifact
+from cozy_runtime.author._artifacts import ModelArtifact, ObjectRef
 from cozy_runtime.author._assets import (
     Asset,
     AssetInfo,
@@ -288,7 +288,6 @@ __all__ = [
     "Secrets",
     "Settings",
     "Shape",
-    "SourceArtifact",
     "Surface",
     "Telemetry",
     "TensorSpec",

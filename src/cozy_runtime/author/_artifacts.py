@@ -57,30 +57,3 @@ class ModelArtifact(msgspec.Struct, frozen=True):
                 "model artifact requires exact producer, output and native receipt provenance",
                 code="model_artifact",
             )
-
-
-class SourceArtifact(msgspec.Struct, frozen=True):
-    """Exact retained raw source bytes. Identity never grants access by itself.
-
-    The native source receipt preserves original producer history while each
-    request and memo entry acquire independent byte-tree custody.
-    """
-
-    producer_request_id: str
-    output_slot: str
-    manifest: ObjectRef
-    tensorfs_receipt_digest: str
-
-    def __post_init__(self) -> None:
-        if (
-            not isinstance(self.producer_request_id, str)
-            or _REQUEST.fullmatch(self.producer_request_id) is None
-            or self.output_slot != "source"
-            or not isinstance(self.manifest, ObjectRef)
-            or not isinstance(self.tensorfs_receipt_digest, str)
-            or _DIGEST.fullmatch(self.tensorfs_receipt_digest) is None
-        ):
-            raise ConformanceError(
-                "source artifact requires exact producer and native byte-tree receipt",
-                code="source_artifact",
-            )

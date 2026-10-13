@@ -23,7 +23,7 @@ from cozy_runtime.author._executor_requests import (
 from cozy_runtime.author._executor_requests import decode as decode_request
 from cozy_runtime.author.fakes import fake_context
 from cozy_runtime.author.publication import CheckpointRef
-from cozy_runtime.internal import native_interfaces, source_interfaces
+from cozy_runtime.internal import effect_interfaces, native_interfaces
 from cozy_runtime.internal.executor import Executor
 from cozy_runtime.internal.executor_commands import CallInterface
 from cozy_runtime.internal.seam import Channel
@@ -44,7 +44,7 @@ def test_native_rows_bind_per_operation(tmp_path: Path) -> None:
     broker = _broker(tmp_path, listed)
     bindings = broker.bindings  # type: ignore[attr-defined]
     # An operation this Runtime lacks cannot be called from here, so its row is ignored.
-    assert (source_interfaces.MODULE, "not_an_operation") not in bindings
+    assert (effect_interfaces.MODULE, "not_an_operation") not in bindings
     # One the worker did not list is refused alone, naming the rental update.
     assert not any(b.unavailable for key, b in bindings.items() if key[1] != rows[0]["export"])
     broker.bind(fake_context(request_id="parent"))  # type: ignore[attr-defined]
