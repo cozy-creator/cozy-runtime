@@ -28,6 +28,7 @@ from __future__ import annotations
 import re
 import sys
 import threading
+import weakref
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field, fields
@@ -37,9 +38,11 @@ from typing import Any, Literal, cast
 from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._loader import (
     CONSTRUCTION,
+    FILLED,
     Artifact,
     Census,
     Loader,
+    _members,
     canonical_dtype,
     census,
     loading,
@@ -322,14 +325,20 @@ def _check_inplace(name: str, args: tuple[object, ...], seen: Observations) -> N
         return
     seen.mutations.setdefault(id(target), []).append(name)
     seen.holds.append(target)
+    if name in _PURE_WRITE:
+        return
     # A value transform is initialization until the fill can have written the destination:
     # on a constructor temporary (the audio VAE's Kaiser-sinc filter normalizes before it
     # becomes a buffer), or inside the factory call that registered it (timm's
     # `_trunc_normal_` is `uniform_`, `erfinv_`, `mul_`, `add_`, `clamp_`). Once that call
-    # returns, the same op transforms checkpoint values and remains storage territory.
+    # returns, the same op transforms checkpoint values and remains storage territory, as
+    # it does on every weight-plane tensor the fill installed in a placeholder's stead.
     held, construction = seen.registered.get(id(target), (None, None))
-    initializing = construction is not None and construction is CONSTRUCTION.get()
-    if name in _PURE_WRITE or held is not target or initializing:
+    if seen.filled.get(id(target)) is target:
+        construction = None
+    elif held is not target:
+        return
+    if construction is not None and construction is CONSTRUCTION.get():
         return
     raise ConstructionFault(
         f"in-place weight transform `{name}`",
@@ -350,10 +359,26 @@ class Observations:
     mutations: dict[int, list[str]] = field(default_factory=dict)
     holds: list[object] = field(default_factory=list)
     registered: dict[int, tuple[object, object | None]] = field(default_factory=dict)
+    #: The plane's tensors the fill installed, held weakly: the plane unmaps them at will.
+    filled: weakref.WeakValueDictionary[int, object] = field(
+        default_factory=weakref.WeakValueDictionary
+    )
 
     def register(self, destination: object) -> None:
         """A checkpoint destination, and the factory call (if any) that registered it."""
         self.registered[id(destination)] = (destination, CONSTRUCTION.get())
+
+    def fill(self, obj: object) -> None:
+        """Every parameter and persistent buffer of the components the fill just wrote."""
+        nn = torch_module().nn
+        for _, member in _members(obj):
+            for module in member.modules() if isinstance(member, nn.Module) else ():
+                for tensor in module._parameters.values():
+                    if tensor is not None:
+                        self.filled[id(tensor)] = tensor
+                for name, tensor in module._buffers.items():
+                    if tensor is not None and name not in module._non_persistent_buffers_set:
+                        self.filled[id(tensor)] = tensor
 
 
 _PLACEMENT = threading.local()
@@ -529,6 +554,7 @@ def serving_substrate(variant: str, seen: Observations) -> Iterator[_Capability]
         stack.callback(setattr, nn.Module, "register_parameter", original)
         nn.Module.register_buffer = register_buffer
         stack.callback(setattr, nn.Module, "register_buffer", original_buffer)
+        stack.callback(FILLED.reset, FILLED.set(seen.fill))
         stack.enter_context(refuse_compile())
         stack.enter_context(_capability(cap))
         stack.enter_context(_guard_mode(seen))

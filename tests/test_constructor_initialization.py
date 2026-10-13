@@ -2,7 +2,8 @@
 
 timm initializes in plain Python (`uniform_`, `erfinv_`, `mul_`, `add_`, `clamp_`), so each op
 after the first reads the destination: before the fill inside the factory call that
-registered it, and checkpoint values once that call returns.
+registered it, and checkpoint values once that call returns, including the weight plane's own
+tensors the fill installed.
 """
 
 from __future__ import annotations
@@ -89,7 +90,7 @@ class Reinitialized(Initialized):
         loader.construct(Graph, factory=lambda c: (timm_trunc_normal_(weight), Graph(c))[1])
 
 
-def serve(tmp_path: Path) -> tuple[Initialized, Any, Any]:
+def serve(tmp_path: Path, cls: type[Initialized] = Initialized) -> tuple[Initialized, Any, Any]:
     """The executor's prepare on a CPU executor."""
     value = torch.randn(HIDDEN, HIDDEN, generator=torch.Generator().manual_seed(5)) / HIDDEN**0.5
     checkpoint = store_component(tmp_path, "net", {"weight": value})
@@ -105,12 +106,12 @@ def serve(tmp_path: Path) -> tuple[Initialized, Any, Any]:
     )
     artifact = Artifact(checkpoint.manifest_id, tensor_schema_of(rows), Config({}))
     try:
-        model = registry.acquire("run.models.model", Initialized, artifact)
+        model = registry.acquire("run.models.model", cls, artifact)
     except Exception:
         backend.close()
         raise
     residency = WeightResidency(
-        weights, backend.components, component_use(Initialized), refine=backend.refine
+        weights, backend.components, component_use(cls), refine=backend.refine
     )
     object.__setattr__(model, "_cozy_residency", residency)
     return model, backend, value.half()
@@ -135,4 +136,13 @@ def test_a_write_after_its_construction_returns_stays_refused(
     registry = ModelRegistry(release="p/1", substrate=lambda: substrate("cpu", Observations()))
     with pytest.raises(ConstructionFault, match="in-place weight transform") as refused:
         registry.acquire("run.models.model", cls, ARTIFACT, mode="derive")
+    assert classify(refused.value).code == "construction_fault"
+
+
+@pytest.mark.parametrize("cls", [Transformed, Reinitialized])
+def test_a_write_to_a_weight_plane_tensor_is_refused(
+    tmp_path: Path, cls: type[Initialized]
+) -> None:
+    with pytest.raises(ConstructionFault, match="in-place weight transform") as refused:
+        serve(tmp_path, cls)
     assert classify(refused.value).code == "construction_fault"

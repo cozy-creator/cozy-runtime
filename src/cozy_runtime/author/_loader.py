@@ -47,6 +47,10 @@ Custody = Literal["canonical", "local"]
 #: destination it registered initializes rather than transforms checkpoint values (§1.1).
 CONSTRUCTION: ContextVar[object | None] = ContextVar("construction", default=None)
 
+#: Told each object the fill wrote. The weight plane installs its own tensors in place of the
+#: construction's placeholders, and those are the checkpoint destinations from then on (§1.1).
+FILLED: ContextVar[Callable[[object], None] | None] = ContextVar("filled", default=None)
+
 
 # ---------------------------------------------------------------------- tensor schema
 
@@ -881,6 +885,8 @@ class Loader:
         except Exception:
             self._backend.poison(done)
             raise
+        if (filled := FILLED.get()) is not None:
+            filled(obj)
         return len(done), total
 
 
