@@ -53,14 +53,16 @@ SMALL = 256
 
 
 def partition(root: Module, limit: int | None = None) -> BlockLayout | None:
-    """Use declared indivisible blocks; never guess an arbitrary ModuleList's semantics.
+    """Use declared indivisible blocks (instances of a declared class or of any subclass of
+    one); never guess an arbitrary ModuleList's semantics.
 
     With `limit`, the units are instead the largest module subtrees of at most `limit` bytes
     anywhere in the component (a single larger leaf stays whole, and so does a LoRA'd linear
     with its factors: they are baked into it when its bytes are placed). The weights of the modules
-    that had to be split stay in `common`, and so does a subtree under `limit // SMALL`: a
-    region costs 2 MiB of the budget however little it holds, and weights that small (norm
-    scales) are what fused kernels read without calling their module. That is the sub-block
+    that had to be split stay in `common`, and so do a subtree under `limit // SMALL` (a
+    region costs 2 MiB of the budget however little it holds, and weights that small, norm
+    scales, are what fused kernels read without calling their module) and a module nothing
+    calls (`_container`). That is the sub-block
     grain a budget below the block floor needs (proving-cpu.md C2: SDXL at 1 GiB); every
     unit's own forward is its hook, and a weight read any other way is mapped for that op
     (`weights.Weights.reading`).
@@ -77,7 +79,13 @@ def partition(root: Module, limit: int | None = None) -> BlockLayout | None:
     ):
         raise ValueError("no-split module declarations must contain class names")
     modules = list(root.named_modules(remove_duplicate=False))
-    declared = [path for path, module in modules if path and type(module).__name__ in classes]
+    # A declared class names its subclasses too (SeedVR2's VAE declares diffusers'
+    # `ResnetBlock2D` and builds `ResnetBlock3D(ResnetBlock2D)`: run 5439).
+    declared = [
+        path
+        for path, module in modules
+        if path and any(kind.__name__ in classes for kind in type(module).__mro__)
+    ]
     # The innermost declared instances are the blocks: an outer declared container (SDXL's
     # CrossAttnUpBlock2D around its resnets and transformer blocks) keeps only its own
     # weights, which fall to `common`.
@@ -130,13 +138,15 @@ def _split(root: Module, path: str, limit: int) -> list[str]:
     ]
     whole = _bytes(module) <= limit or hasattr(module, "lora_A")
     if not children or (path and whole and not _container(module)):
-        return [path] if _bytes(module) >= limit // SMALL else []
+        unit = _bytes(module) >= limit // SMALL and not _container(module)
+        return [path] if unit else []
     return [unit for child in children for unit in _split(root, child, limit)]
 
 
 def _container(module: Module) -> bool:
-    """A ModuleList or ModuleDict: never called itself (its owner calls its members), so it
-    can never be a unit, whose module call is what binds it."""
+    """A module without a forward of its own (a ModuleList, a holder of factors its owner
+    reads, as H3's turbo LoRA's): never called itself, so it can never be a unit, whose
+    module call is what binds it. Its own weights stay in `common`."""
     return getattr(type(module).forward, "__name__", "") == "_forward_unimplemented"
 
 

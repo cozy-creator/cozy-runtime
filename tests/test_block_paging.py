@@ -75,6 +75,34 @@ def test_nested_declarations_page_the_innermost_blocks() -> None:
     assert layout.total_bytes == 5 * 80 and layout.common.nbytes == 2 * 80
 
 
+def test_a_subclass_of_a_declared_block_is_a_block() -> None:
+    """Run 5439: SeedVR2's VAE inherits diffusers' `_no_split_modules = ["ResnetBlock2D"]` and
+    builds `ResnetBlock3D(ResnetBlock2D)`; matched by name alone, the whole VAE was one region
+    and nothing knew it was in use while its decode ran out of memory."""
+    torch = pytest.importorskip("torch")
+
+    class ResnetBlock2D(torch.nn.Module):  # type: ignore[name-defined,misc]  # optional real Torch
+        def __init__(self) -> None:
+            super().__init__()
+            self.conv = torch.nn.Linear(4, 4, device="meta")
+
+    class ResnetBlock3D(ResnetBlock2D):
+        pass
+
+    class Vae(torch.nn.Module):  # type: ignore[name-defined,misc]  # optional real Torch
+        _no_split_modules = ("ResnetBlock2D",)
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.conv_in = torch.nn.Linear(4, 4, device="meta")
+            self.resnets = torch.nn.ModuleList([ResnetBlock3D(), ResnetBlock2D()])
+
+    layout = partition(Vae())
+    assert layout is not None
+    assert [block.path for block in layout.blocks] == ["resnets.0", "resnets.1"]
+    assert set(layout.common.keys) == {"conv_in.weight", "conv_in.bias"}
+
+
 def test_at_the_sub_block_grain_a_module_too_small_for_a_region_stays_in_common() -> None:
     """Run 2744: split into regions of at most 16 MiB, Anima's attention left each 256-byte
     norm scale a region of its own, bound only inside the norm's forward. The fused kernel
@@ -107,6 +135,29 @@ def test_at_the_sub_block_grain_a_module_too_small_for_a_region_stays_in_common(
     assert set(layout.common.keys) == {
         f"blocks.{index}.{name}.weight" for index in range(2) for name in ("norm_q", "norm_k")
     }
+
+
+def test_at_the_sub_block_grain_a_module_nothing_calls_is_never_a_unit() -> None:
+    """H3's turbo LoRA holds factors the DiT's hooks read and never calls: as units they were
+    bound only inside a forward that never runs, each costing a 2 MiB region. They stay in
+    `common`; a projection that is called is a unit."""
+    torch = pytest.importorskip("torch")
+
+    class Factors(torch.nn.Module):  # type: ignore[name-defined,misc]  # optional real Torch
+        def __init__(self) -> None:
+            super().__init__()
+            self.down = torch.nn.Parameter(torch.empty(64, 64, device="meta"))
+
+    class Overlay(torch.nn.Module):  # type: ignore[name-defined,misc]  # optional real Torch
+        def __init__(self) -> None:
+            super().__init__()
+            self.sites = torch.nn.ModuleList([Factors(), Factors()])
+            self.head = torch.nn.Linear(64, 64, bias=False, device="meta")
+
+    layout = partition(Overlay(), 64 * 64 * 4)
+    assert layout is not None
+    assert [block.path for block in layout.blocks] == ["head"]
+    assert set(layout.common.keys) == {"sites.0.down", "sites.1.down"}
 
 
 def test_module_lists_without_a_declared_forward_boundary_are_not_guessed() -> None:
