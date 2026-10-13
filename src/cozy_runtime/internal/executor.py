@@ -69,6 +69,7 @@ from msgspec import UNSET, UnsetType
 from cozy_runtime import __version__ as RUNTIME_VERSION
 from cozy_runtime.author._activity import settles
 from cozy_runtime.author._assets import GrantedInput
+from cozy_runtime.author._calls import _Broker, _CallType
 from cozy_runtime.author._capture import ActivationCapture
 from cozy_runtime.author._context import AdapterRef, Device
 from cozy_runtime.author._demand import shape_cell
@@ -241,6 +242,10 @@ PREPARED_HELD = 8
 #: The environment as it was when this process started, restricted to the sealed names.
 #: Captured before any import that could initialize CUDA.
 _SEALED: dict[str, str] = {}
+
+
+#: Each callable an attempt may call, by (module, export).
+type CallBindings = dict[tuple[str, str], _CallType]
 
 
 def _capture_seal() -> None:
@@ -630,7 +635,7 @@ class Executor:
         self.discovered: Any = None
         #: HOST ONLY: what its attempts may call (`Start.call_interfaces`), and their bindings
         self.call_interfaces: tuple[CallInterface, ...] = ()
-        self._bound_calls: tuple[tuple[CallInterface, ...], dict[Any, Any]] | None = None
+        self._bound_calls: tuple[tuple[CallInterface, ...], CallBindings] | None = None
         self.ready = False
         self.poisoned = ""
         #: the current attempt's handler outcome, the stage it last reported and its record:
@@ -4050,17 +4055,13 @@ class Executor:
     def _call_broker(self, request_id: str, rows: tuple[CallInterface, ...]) -> Any:
         """This attempt's broker over `rows`, bound once per executor (a served package's
         attempts share its Start's rows)."""
-        from cozy_runtime.author._calls import _Broker
-
         if not rows:
             return None
         if self._bound_calls is None or self._bound_calls[0] is not rows:
             self._bound_calls = (rows, self._call_bindings(rows))
         return _Broker(request_id, self._bound_calls[1], self._durable, self._child_events)
 
-    def _call_bindings(self, rows: tuple[CallInterface, ...]) -> dict[tuple[str, str], Any]:
-        from cozy_runtime.author._calls import _CallType
-
+    def _call_bindings(self, rows: tuple[CallInterface, ...]) -> CallBindings:
         if len(rows) > 256:
             raise CapabilityError(
                 "call interface inventory exceeds its bound", code="child_interface"
