@@ -247,6 +247,8 @@ class Component:
     last_passes: int = 0
     residence: weight_policy.Residence | None = None
     cursor: Cursor | None = None
+    #: the cursor's schedule: `order` from the block it started at
+    schedule: list[int] = field(default_factory=list)
     #: the common region's lease for the running stage
     lease: Lease | None = None
     #: gave its weights back to another component's activations for the rest of the stage:
@@ -3509,11 +3511,12 @@ class WeightResidency:
             if residence.streamed and component.observed:
                 order = component.order
                 start = order.index(resume[key]) if key in resume else 0
+                component.schedule = order[start:] + order[:start]
                 try:
                     component.cursor = weights.plane.stream(
                         component.ws,
                         weights.index,
-                        order[start:] + order[:start],
+                        component.schedule,
                         residence.window,
                         repeat=0,
                         priority=plane.STREAMED + clock,
@@ -3697,12 +3700,12 @@ class WeightResidency:
         return run
 
     def _acquire(self, component: Component, index: int, stream: int) -> Lease:
-        """The block's lease: from the stage's cursor (a departure from its order skips ahead
-        or demand-fills, never raises), else resident access. A demand fill ranks above every
-        earlier streamed block and below the stage's prefix, so the least recently used
-        block is the one it can displace."""
+        """The block's lease: from the stage's cursor when the block is due within its window
+        (an earlier departure skips ahead), else resident access or a demand fill. A demand
+        fill ranks above every earlier streamed block and below the stage's prefix, so the
+        least recently used block is the one it can displace."""
         weights = self.weights
-        if component.cursor is not None:
+        if component.cursor is not None and _due(component, component.cursor, index):
             lease: Lease = component.cursor.acquire(index, stream)
         else:
             priority = None if index in component.resident else plane.STREAMED + weights.tick()
@@ -4106,6 +4109,24 @@ def _unpaid(
         resident=(*(kept[p] for p in paid.resident), *attached),
         streamed=tuple(kept[p] for p in paid.streamed),
     )
+
+
+def _due(component: Component, cursor: Cursor, index: int) -> bool:
+    """Whether block `index` comes before the cursor's window has passed. The cursor serves a
+    block further ahead by skipping every position before it, copying each and handing it on
+    unread: a module called again right after itself (SeedVR2's shared-weight projections,
+    once for video and once for text) skipped a whole pass each time, 300 GB of copies in one
+    17-frame window (run 5540)."""
+    schedule, home = component.schedule, cursor.home
+    position, streamed = cursor.position, 0
+    for step in range(len(schedule)):
+        at = (position + step) % len(schedule)
+        if schedule[at] == index:
+            return True
+        streamed += not home[at]
+        if streamed > cursor.window:
+            return False
+    return False
 
 
 def _end_leases(component: Component) -> None:
