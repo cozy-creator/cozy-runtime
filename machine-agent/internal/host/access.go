@@ -8,10 +8,14 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -68,7 +72,7 @@ func (m *Machine) serveHubAccess(w http.ResponseWriter, r *http.Request) {
 				w.WriteHeader(http.StatusConflict)
 				_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]string{
 					"code":    "hub_access_principal_conflict",
-					"message": "this machine already holds access for another account at this Hub; renew access for the original account",
+					"message": "this machine holds another account at this Hub; remove its access with DELETE /v1/hubs/access once accepted work is complete",
 				}})
 				return
 			}
@@ -90,7 +94,7 @@ func (m *Machine) serveHubAccess(w http.ResponseWriter, r *http.Request) {
 		err = writeAtomic(m.accessPath(), raw, 0600)
 	}
 	if err == nil {
-		err = projectHubAccess(m.grant.Hubs, file, m.layout)
+		err = projectHubAccess(file, m.layout)
 	}
 	if err != nil {
 		http.Error(w, "cannot retain the Hub access grant", http.StatusServiceUnavailable)
@@ -177,9 +181,8 @@ func readHubAccess(path string) (hubAccessFile, error) {
 }
 
 func validateHubAccess(a hubAccess, now time.Time) error {
-	origin, err := url.Parse(a.Origin)
-	if err != nil || origin.Host == "" || origin.User != nil || origin.RawQuery != "" || origin.Fragment != "" || origin.Path != "" && origin.Path != "/" || origin.Scheme != "https" && !(origin.Scheme == "http" && (origin.Hostname() == "localhost" || origin.Hostname() == "127.0.0.1" || origin.Hostname() == "::1")) {
-		return fmt.Errorf("Hub origin must be an HTTPS origin or loopback HTTP origin")
+	if err := validateHubOrigin(a.Origin); err != nil {
+		return err
 	}
 	if a.Token == "" || len(a.Token) > 32<<10 || strings.TrimSpace(a.Token) != a.Token || strings.ContainsAny(a.Token, "\r\n") {
 		return fmt.Errorf("Hub access token is invalid")
@@ -206,40 +209,15 @@ func validateHubAccess(a hubAccess, now time.Time) error {
 
 // projectHubAccess writes the Runtime's hot-readable grant document. State is the
 // restartable configuration source; this projection never contains user login tokens.
-func projectHubAccess(legacy []HubGrant, access hubAccessFile, layout Layout) error {
+func projectHubAccess(access hubAccessFile, layout Layout) error {
 	var doc struct {
 		Version int               `json:"version"`
 		Hubs    []json.RawMessage `json:"hubs"`
 	}
 	doc.Version = 1
-	doc.Hubs = make([]json.RawMessage, 0, len(legacy)+len(access.Hubs))
-	replaced := map[string]bool{}
-	for _, a := range access.Hubs {
-		replaced[hubOriginKey(a.Origin)] = true
-	}
-	for i, h := range legacy {
-		if replaced[hubOriginKey(h.Origin)] {
-			continue
-		}
-		row := map[string]any{"origin": h.Origin, "worker_id": h.WorkerID, "worker_token": h.WorkerToken, "object_storage_hosts": h.ObjectHosts}
-		if h.PublicOrigin != "" {
-			row["public_origin"] = h.PublicOrigin
-		}
-		if len(h.CA) > 0 {
-			name := fmt.Sprintf("hub-ca-%d.crt", i+1)
-			if err := writeAtomic(layout.boot(name), pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: h.CA}), 0600); err != nil {
-				return err
-			}
-			row["ca"] = name
-		}
-		raw, err := json.Marshal(row)
-		if err != nil {
-			return err
-		}
-		doc.Hubs = append(doc.Hubs, raw)
-	}
-	// Rebuild from launch grants and the durable access configuration, never append
-	// to an earlier projection: refresh and restarts cannot accumulate stale tokens.
+	doc.Hubs = make([]json.RawMessage, 0, len(access.Hubs))
+	// Rebuild solely from scoped durable access; retired registration grants
+	// must never reappear after reset or restart.
 	for _, a := range access.Hubs {
 		row := map[string]any{"origin": a.Origin, "access_token": a.Token, "expires_at": a.ExpiresAt, "object_storage_hosts": []string{}}
 		if hosts := a.Environment["TENSORHUB_OBJECT_STORAGE_HOSTS"]; hosts != "" {
@@ -271,4 +249,68 @@ func projectHubAccess(legacy []HubGrant, access hubAccessFile, layout Layout) er
 		return err
 	}
 	return writeAtomic(layout.boot("machine-hubs.json"), raw, 0600)
+}
+
+func validateHubOrigin(value string) error {
+	origin, err := url.Parse(value)
+	if err != nil || origin.Host == "" || origin.User != nil || origin.RawQuery != "" || origin.Fragment != "" || origin.Path != "" && origin.Path != "/" || origin.Scheme != "https" && !(origin.Scheme == "http" && (origin.Hostname() == "localhost" || origin.Hostname() == "127.0.0.1" || origin.Hostname() == "::1")) {
+		return fmt.Errorf("Hub origin must be an HTTPS origin or loopback HTTP origin")
+	}
+
+	return nil
+}
+
+// Explicit owner removal never invalidates access beneath accepted work. The
+// Runtime closes admission before this callback changes either retained copy.
+func (m *Machine) serveForgetHubAccess(w http.ResponseWriter, r *http.Request) {
+	token, _ := strings.CutPrefix(r.Header.Get("Authorization"), "Cozy-Cap ")
+	grant, err := capability.Verify(token, m.grant.WorkerID, m.claims.authorizedKeys(), time.Now(), "")
+	if err != nil || !grant.Permits(hubAccessAction) {
+		http.Error(w, "a hub-access capability is required", http.StatusForbidden)
+		return
+	}
+	var request struct {
+		Origin string `json:"origin"`
+	}
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10))
+	if decoder.Decode(&request) != nil || decoder.Decode(new(any)) != io.EOF || validateHubOrigin(request.Origin) != nil {
+		http.Error(w, "send one valid Hub origin", http.StatusBadRequest)
+		return
+	}
+	if !m.launcherReady() || m.launcher == nil {
+		http.Error(w, "machine_starting: maintenance is not ready", http.StatusServiceUnavailable)
+		return
+	}
+	err = m.mutateIdleRuntime(r.Context(), func() error {
+		m.accessMu.Lock()
+		defer m.accessMu.Unlock()
+		file, err := readHubAccess(m.accessPath())
+		if err != nil {
+			return err
+		}
+		file.Hubs = slices.DeleteFunc(file.Hubs, func(a hubAccess) bool { return hubOriginKey(a.Origin) == hubOriginKey(request.Origin) })
+		raw, err := json.Marshal(file)
+		if err != nil {
+			return err
+		}
+		if err := writeAtomic(m.accessPath(), raw, 0600); err != nil {
+			return err
+		}
+		return projectHubAccess(file, m.layout)
+	})
+	if err != nil {
+		code, httpStatus := "hub_access_reset_failed", http.StatusServiceUnavailable
+		message := status.Convert(err).Message()
+		if status.Code(err) == codes.FailedPrecondition {
+			prefix, _, _ := strings.Cut(message, ":")
+			if prefix == "machine_busy" || prefix == "quiescence_unavailable" {
+				code, httpStatus = prefix, http.StatusConflict
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(httpStatus)
+		_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]string{"code": code, "message": message}})
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
