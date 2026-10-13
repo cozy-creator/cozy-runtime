@@ -130,6 +130,44 @@ def test_any_result_structure_round_trips() -> None:
     assert torch.equal(first[0], second[0]) and second[1][0].dtype == torch.bool
 
 
+def test_scalar_and_empty_results_hit_as_they_missed() -> None:
+    class Scalars(Model[object]):
+        runs = 0
+
+        @uses_components("vae", memoize=True)
+        def score(self, n: int) -> tuple[Any, Any]:
+            type(self).runs += 1
+            return torch.tensor(7.0 * n), torch.zeros(0, 3)
+
+    model = Scalars.for_test()
+    object.__setattr__(model, "_cozy_memo", _model()._cozy_memo)
+    first, second = model.score(1), model.score(1)
+    assert Scalars.runs == 1
+    assert second[0].shape == () and float(second[0]) == 7.0
+    assert second[1].shape == first[1].shape == (0, 3)
+
+
+def test_paletted_images_run_unmarked_instead_of_sharing_a_key() -> None:
+    class Palettes(Model[object]):
+        runs = 0
+
+        @uses_components("vae", memoize=True)
+        def colour(self, image: Any) -> Any:
+            type(self).runs += 1
+            return image.convert("RGB")
+
+    def paletted(rgb: tuple[int, int, int]) -> Image.Image:
+        image = Image.new("P", (2, 2), 0)
+        image.putpalette([*rgb] * 256)
+        return image
+
+    model = Palettes.for_test()
+    object.__setattr__(model, "_cozy_memo", _model()._cozy_memo)
+    assert model.colour(paletted((255, 0, 0))).getpixel((0, 0)) == (255, 0, 0)
+    assert model.colour(paletted((0, 0, 255))).getpixel((0, 0)) == (0, 0, 255)
+    assert Palettes.runs == 2
+
+
 def test_weights_and_numerics_scope_the_key() -> None:
     engine = stage_memo.Engine()
     same = _model("w1", engine)
