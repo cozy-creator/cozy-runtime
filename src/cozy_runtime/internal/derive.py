@@ -34,7 +34,9 @@ from dataclasses import dataclass, field, fields
 from types import ModuleType
 from typing import Any, Literal, cast
 
+from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._loader import (
+    CONSTRUCTION,
     Artifact,
     Census,
     Loader,
@@ -63,12 +65,13 @@ class DeriveError(Exception):
     def __init__(self, construct: str, message: str, *, site: str = "") -> None:
         super().__init__(f"{construct}: {message}" + (f"\n  at {site}" if site else ""))
         self.construct = construct
-        self.message = message
         self.site = site
 
 
-class ConstructionFault(DeriveError):
+class ConstructionFault(DeriveError, ConformanceError):
     """The author's construction is not derivable, and the fix is in the package."""
+
+    default_code = "construction_fault"
 
 
 class HarnessGap(DeriveError):
@@ -319,11 +322,14 @@ def _check_inplace(name: str, args: tuple[object, ...], seen: Observations) -> N
         return
     seen.mutations.setdefault(id(target), []).append(name)
     seen.holds.append(target)
-    # A value transform on a local constructor temporary is ordinary
-    # initialization: the audio VAE's Kaiser-sinc filter normalizes before it
-    # becomes a persistent buffer. Once a tensor is a checkpoint destination, the
-    # same op is a load-time transform and remains storage territory.
-    if name in _PURE_WRITE or seen.registered.get(id(target)) is not target:
+    # A value transform is initialization until the fill can have written the destination:
+    # on a constructor temporary (the audio VAE's Kaiser-sinc filter normalizes before it
+    # becomes a buffer), or inside the factory call that registered it (timm's
+    # `_trunc_normal_` is `uniform_`, `erfinv_`, `mul_`, `add_`, `clamp_`). Once that call
+    # returns, the same op transforms checkpoint values and remains storage territory.
+    held, construction = seen.registered.get(id(target), (None, None))
+    initializing = construction is not None and construction is CONSTRUCTION.get()
+    if name in _PURE_WRITE or held is not target or initializing:
         return
     raise ConstructionFault(
         f"in-place weight transform `{name}`",
@@ -343,7 +349,11 @@ class Observations:
     real_allocations: list[tuple[str, str]] = field(default_factory=list)
     mutations: dict[int, list[str]] = field(default_factory=dict)
     holds: list[object] = field(default_factory=list)
-    registered: dict[int, object] = field(default_factory=dict)
+    registered: dict[int, tuple[object, object | None]] = field(default_factory=dict)
+
+    def register(self, destination: object) -> None:
+        """A checkpoint destination, and the factory call (if any) that registered it."""
+        self.registered[id(destination)] = (destination, CONSTRUCTION.get())
 
 
 _PLACEMENT = threading.local()
@@ -434,13 +444,13 @@ def _track_registrations(seen: Observations) -> Iterator[None]:
         parameter(module, name, value)
         held = module._parameters.get(name)
         if isinstance(held, torch.Tensor):
-            seen.registered[id(held)] = held
+            seen.register(held)
 
     def register_buffer(module: Any, name: str, value: Any, persistent: bool = True) -> None:
         buffer(module, name, value, persistent=persistent)
         held = module._buffers.get(name)
         if persistent and isinstance(held, torch.Tensor):
-            seen.registered[id(held)] = held
+            seen.register(held)
 
     nn.Module.register_parameter = register_parameter
     nn.Module.register_buffer = register_buffer
@@ -503,14 +513,13 @@ def serving_substrate(variant: str, seen: Observations) -> Iterator[_Capability]
         # the fence is on WHO moves bytes, not on what (see `placing`).
         with placing():
             module._parameters[name] = type(held)(held.to("meta"), requires_grad=held.requires_grad)
-        held = module._parameters[name]
-        seen.registered[id(held)] = held
+        seen.register(module._parameters[name])
 
     def register_buffer(module: Any, name: str, value: Any, persistent: bool = True) -> None:
         original_buffer(module, name, value, persistent=persistent)
         held = module._buffers.get(name)
         if persistent and isinstance(held, torch.Tensor):
-            seen.registered[id(held)] = held
+            seen.register(held)
 
     swap = torch.__future__.get_swap_module_params_on_conversion()
     with ExitStack() as stack:
@@ -690,7 +699,6 @@ def _load_typed(model: Any, loader: Any) -> None:
     the package must stop asking, while a custom op merely LACKS one and the harness (or
     the package's own `torch.library` registration) can supply it.
     """
-    from cozy_runtime.author._errors import ConformanceError
     from cozy_runtime.internal.sandbox import FenceViolation
 
     try:

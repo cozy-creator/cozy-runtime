@@ -1,0 +1,1 @@
+Constructor weight initialization (timm `trunc_normal_` and kin) no longer refuses as a load()-time weight transform: in-place writes are allowed inside the factory call that registered the destination, writes after it returns still refuse, and the refusal now reports code `construction_fault` instead of `unhandled_exception`.
