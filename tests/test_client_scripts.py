@@ -22,7 +22,7 @@ from cozy_runtime.author._model import _derive_model
 from cozy_runtime.author._script_types import _ScriptSource
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.executor import Executor
-from cozy_runtime.internal.executor_commands import JobBudget, ModelManifest, RunJob
+from cozy_runtime.internal.executor_commands import JobBudget, RunJob
 from cozy_runtime.internal.seam import Channel
 from native_weights import NativeExecution
 from test_weights_resume_native import _committed
@@ -305,18 +305,12 @@ def test_script_asset_bound_folds_constant_arithmetic(
             "unhandled_exception",
             "in explode",
         ),
-        (
-            "from script_models import Probe\ndef main(*, source: Probe):\n    source.decode()\n",
-            "model_derive_only",
-            "in _cozy_require_ready",
-        ),
     ],
 )
 def test_script_job_failure_reply_carries_its_cause_and_traceback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: str, code: str, frame: str
 ) -> None:
-    """Scripts are jobs: a raising main reaches the reply with its frames, and a model it
-    receives is an identity it cannot run, said as such rather than as a readiness race."""
+    """A raising job script reaches the reply with its frames."""
     script = f"failing_script_{code}"
     project = tmp_path / "project"
     project.mkdir()
@@ -325,13 +319,6 @@ def test_script_job_failure_reply_carries_its_cause_and_traceback(
         f'from cozy_runtime.author import script_app\napp = script_app("{script}")\n'
     )
     (project / f"{script}.py").write_text(body)
-    (project / "script_models.py").write_text(
-        "from cozy_runtime.author import Loader, Model, uses_components\n"
-        "class Probe(Model[object]):\n"
-        "    def load(self, loader: Loader) -> None: pass\n"
-        "    @uses_components('vae')\n"
-        "    def decode(self) -> None: pass\n"
-    )
     monkeypatch.syspath_prepend(str(project))
     found = discover(project)
     left, right = socket.socketpair()
@@ -347,7 +334,6 @@ def test_script_job_failure_reply_carries_its_cause_and_traceback(
         executor = Executor(Channel(left), tmp_path)
         executor.discovered = found
         executor.surface_names = {surface.name: surface for surface in found.surfaces}
-        manifest = ModelManifest(class_key="Probe", manifest="sha256:" + "0" * 64, length=1)
         reply = executor.run_job(
             RunJob(
                 job="main",
@@ -358,7 +344,6 @@ def test_script_job_failure_reply_carries_its_cause_and_traceback(
                 application="",
                 package_interface="",
                 budget=JobBudget(gpu_count=0),
-                models={"source": manifest} if "Probe" in body else {},
             )
         )
         left.shutdown(socket.SHUT_WR)
@@ -366,5 +351,3 @@ def test_script_job_failure_reply_carries_its_cause_and_traceback(
     outcome = reply["outcome"]
     assert (outcome["terminal"], outcome["code"]) == ("failed", code), outcome
     assert f'{script}.py", line' in outcome["traceback"] and frame in outcome["traceback"]
-    if code == "model_derive_only":
-        assert "entrypoint" in outcome["message"]

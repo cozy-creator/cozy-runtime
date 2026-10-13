@@ -702,9 +702,9 @@ class Model[PipelineT]:
         if not self._cozy_ready:
             if self._cozy_derive_only:
                 raise CapabilityError(
-                    f"{type(self).__name__}.{what}: a job or script receives this model's "
-                    "identity only, never a running model; call the package's entrypoint "
-                    "function to run it",
+                    f"{type(self).__name__}.{what}: a job receives this model's identity "
+                    "only, never a running model; run it in an entrypoint (or a script's "
+                    "main) or call one",
                     code="model_derive_only",
                 )
             raise CapabilityError(

@@ -184,6 +184,22 @@ class MemoSettings(msgspec.Struct, frozen=True, kw_only=True):
     entry_bytes: int = 0
 
 
+class CallInterface(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
+    """One callable dependency an attempt may call, and how this executor binds it."""
+
+    module: str
+    export: str
+    interface_digest: str = ""
+    interface_document: Json = None
+    interface_path: str = ""
+    native_effect: bool = False
+    request_fields: tuple[str, ...] | None = None
+    unavailable: str = ""
+    builtin: str = ""
+    self_call: bool = msgspec.field(default=False, name="self")
+    kind: Literal["entrypoint", "job"] = "job"
+
+
 class Start(Command, frozen=True, kw_only=True, tag="start"):
     devices: str = ""
     sequence_parallel_degree: int = 1
@@ -197,6 +213,9 @@ class Start(Command, frozen=True, kw_only=True, tag="start"):
     #: The owner keeps one budget cell per GPU of a group (`RANK_CELLS`): rank 0 creates each
     #: follower's at formation, hands it to its owner (`BudgetCell.rank`) and to the follower.
     rank_cells: bool = False
+    #: The callables its attempts may call: their proxies are installed before the package is
+    #: imported, and every attempt gets the call broker over them, as a job's does.
+    call_interfaces: tuple[CallInterface, ...] = ()
 
     def release(self) -> Release:
         return Release(application=self.application, package_interface=self.package_interface)
@@ -424,22 +443,6 @@ class JobBudget(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
     gpu_rate_micro_usd_per_hour: int = 0
     gpu_count: int = 0
     cap_micro_usd: int = 0
-
-
-class CallInterface(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
-    """One callable dependency the job may call, and how this executor binds it."""
-
-    module: str
-    export: str
-    interface_digest: str = ""
-    interface_document: Json = None
-    interface_path: str = ""
-    native_effect: bool = False
-    request_fields: tuple[str, ...] | None = None
-    unavailable: str = ""
-    builtin: str = ""
-    self_call: bool = msgspec.field(default=False, name="self")
-    kind: Literal["entrypoint", "job"] = "job"
 
 
 class RunJob(_Run, frozen=True, kw_only=True, tag="run_job"):

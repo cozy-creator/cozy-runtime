@@ -628,6 +628,9 @@ class Executor:
         self._group_attempts: dict[str, Path] = {}
         self.surface_names: dict[str, Any] = {}
         self.discovered: Any = None
+        #: HOST ONLY: what its attempts may call (`Start.call_interfaces`), and their bindings
+        self.call_interfaces: tuple[CallInterface, ...] = ()
+        self._bound_calls: tuple[tuple[CallInterface, ...], dict[Any, Any]] | None = None
         self.ready = False
         self.poisoned = ""
         #: the current attempt's handler outcome, the stage it last reported and its record:
@@ -1539,6 +1542,8 @@ class Executor:
                         importlib.import_module(name)
                     stage("runtime_imports")
             if self.discovered is None:
+                self._install_call_proxies(command.call_interfaces)
+                self.call_interfaces = command.call_interfaces
                 self._discover_provisioned(command.release())
                 stage("package_import")
             compiles = (
@@ -3228,6 +3233,9 @@ class Executor:
                             ),
                             max_output_bytes=command.max_output_bytes,
                             publish=self._publish,
+                            calls=self.host._call_broker(
+                                command.request_id, self.host.call_interfaces
+                            ),
                         ),
                     )
                 if capture is not None and outcome.terminal == "succeeded":
@@ -4033,10 +4041,19 @@ class Executor:
                 imported.__dict__[export] = proxy
 
     def _call_broker(self, request_id: str, rows: tuple[CallInterface, ...]) -> Any:
-        from cozy_runtime.author._calls import _Broker, _CallType
+        """This attempt's broker over `rows`, bound once per executor (a served package's
+        attempts share its Start's rows)."""
+        from cozy_runtime.author._calls import _Broker
 
         if not rows:
             return None
+        if self._bound_calls is None or self._bound_calls[0] is not rows:
+            self._bound_calls = (rows, self._call_bindings(rows))
+        return _Broker(request_id, self._bound_calls[1], self._durable, self._child_events)
+
+    def _call_bindings(self, rows: tuple[CallInterface, ...]) -> dict[tuple[str, str], Any]:
+        from cozy_runtime.author._calls import _CallType
+
         if len(rows) > 256:
             raise CapabilityError(
                 "call interface inventory exceeds its bound", code="child_interface"
@@ -4145,7 +4162,7 @@ class Executor:
                 bindings[(module, export)] = binding
         for module, export in own.keys() - bindings.keys():
             bindings[(module, export)] = native_interfaces.unserved(module, export)
-        return _Broker(request_id, bindings, self._durable, self._child_events)
+        return bindings
 
     def _publish(self, request: Publish) -> Published:
         """One product onto the run's output log, durable before this returns."""

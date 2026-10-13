@@ -206,7 +206,6 @@ def _media_decode_bounds(surface: Surface) -> None:
     """
     if "media_decode" not in surface.capabilities:
         return
-    reached = 0
     fields = (
         [
             (node.path, asset_kinds(node.annotation), node.marker(AssetBound))
@@ -220,13 +219,8 @@ def _media_decode_bounds(surface: Surface) -> None:
             (binding.parameter, frozenset({cls.kind}), bound) for cls, bound in binding.kinds
         )
     for path, kinds, bound in fields:
-        if "tree" in kinds:
-            # Tree.member supplies an explicit per-member decoded-byte bound.
-            reached += 1
-        kinds = kinds & {"image", "video", "audio"}
-        if not kinds:
+        if not kinds & {"image", "video", "audio"}:
             continue
-        reached += 1
         if not isinstance(bound, AssetBound) or bound.max_decoded_bytes is None:
             raise ConformanceError(
                 f"{surface.name}.{path} is decoded by MediaDecoder but declares no "
@@ -242,14 +236,6 @@ def _media_decode_bounds(surface: Surface) -> None:
                 code="asset_decode_limit",
                 fields=[path],
             )
-    if not reached and surface.kind != "job":
-        # Jobs can decode bounded outputs produced by their managed children. Those
-        # capabilities are granted on child completion, not declared as parent inputs.
-        raise ConformanceError(
-            f"{surface.name} requests MediaDecoder but its payload contains no image, video "
-            "or audio asset field",
-            code="unused_capability",
-        )
     try:
         require_decoder_dependency()
     except CapabilityError as exc:
