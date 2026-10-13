@@ -1,0 +1,1 @@
+Decode valid PyAV18/19 video clocks and display side data consistently, including unspecified aspect ratios. Preserve audio timing and validated display rotation. Bundle TensorD0.5.20 through its standard release tag.
