@@ -26,6 +26,7 @@ import time
 from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Literal, NoReturn, Protocol, TypeVar, cast, final, runtime_checkable
@@ -41,6 +42,10 @@ V = TypeVar("V")
 
 Mode = Literal["derive", "serve"]
 Custody = Literal["canonical", "local"]
+
+#: The factory call executing on this context, if any. It precedes the fill, so a write to a
+#: destination it registered initializes rather than transforms checkpoint values (§1.1).
+CONSTRUCTION: ContextVar[object | None] = ContextVar("construction", default=None)
 
 
 # ---------------------------------------------------------------------- tensor schema
@@ -740,6 +745,7 @@ class Loader:
                 else {key: spec.dtype for key, spec in self._artifact.tensor_schema.items()},
                 bound=self._backend.bound,
             )
+        construction = CONSTRUCTION.set(object())
         try:
             obj = factory(config)
         except Exception as exc:
@@ -748,6 +754,8 @@ class Loader:
                     f"{self._artifact.unnormalized}; {type(exc).__name__}: {exc}"
                 ) from exc
             raise
+        finally:
+            CONSTRUCTION.reset(construction)
         _legs.append(("factory", round((time.perf_counter() - _t0) * 1000, 1)))
         _t0 = time.perf_counter()
         if not isinstance(obj, t):
