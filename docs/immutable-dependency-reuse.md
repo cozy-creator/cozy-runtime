@@ -94,7 +94,7 @@ its original full-copy path, and did not create the supplied cache directory.
 Neither a version floor nor a remote protocol change is required for the cache.
 
 Runtime PR469 and Creator PR530 are source changes under review; cr-175 tracks
-delivery. No shared SDK, installed CLI, daemon, rental or public release was
+delivery. No shared SDK, installed CLI, Calcifer, rental or public release was
 modified by this work. The cache is disposable; automatic cache space policy is
 not introduced here.
 
