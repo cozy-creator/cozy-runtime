@@ -1,54 +1,15 @@
-# Sources in local scripts
+# Provider sources
 
-Ordinary `async def main(ctx)` scripts can await three fixed native operations:
+A run's code does not fetch Hugging Face or Civitai sources: its executor refuses to dial (cr-012).
+A machine fetches, verifies, converts and keeps a source itself, so it is resumable, shared by
+every run on that machine, and normalized at ingest:
 
-```python
-from cozy_runtime.author.sources import (
-    download_huggingface,
-    download_civitai,
-    convert_cozytensors,
-)
-```
+- As a model input: `cozy run <org/package/function> model.<slot>=hf://<org>/<repo>@<revision>`
+  (or `civitai://<version>`), with `--source-profile <slot>=<profile>` to pick the layout, on a
+  named machine (`--rental=<name>`). The function receives a `Model`.
+- As a checkpoint: `cozy model upload hf://<org>/<repo>@<revision> <org/name> --rental=<name>`
+  makes it on that machine and uploads it; later lanes are `cozy run <conversion function> …`
+  on the same machine.
 
-`download_huggingface(repository, *, revision, profiles=(), carriers=())` requires
-an immutable 40-character revision. One unambiguous carrier is selected automatically.
-For a repository containing several models, select reviewed TensorFS profiles or explicit
-carrier names. Native selection expands each selected index to its required shards.
-
-`download_civitai(version, *, file="")` uses the provider's primary SafeTensors file
-when unambiguous, or the explicitly selected file. TensorFS pins raw SHA-256 and exact
-byte length; the provider's rounded size is not a byte identity.
-
-Both return a `SourceArtifact`: an exact retained ordinary-file tree. Downloads finish
-with the bytes verified and retained. Credentials come from the private deployment's
-configured provider credentials; scripts do not pass tokens, delivery URLs, or Store paths.
-
-`convert_cozytensors(source, *, profiles=(...))` converts reviewed profiles of one source
-into one normal `ModelArtifact` whose components are the union of theirs (overlapping
-component or config names refuse). The native converter owns source-header
-validation, tensor transformations, and partial journals. Model results use a real native
-metadata inheritance transaction and receipt without copying tensor payloads.
-
-Each script starts from the beginning. A completed operation is skipped only after its
-compatible result acquires independent recipient custody. Parameters, content, Runtime
-implementation, native core and extension bytes participate in compatibility. Private
-worker registry overrides also bind their exact bytes. Changing a parent script alone
-can retain source/conversion results; changing the executing converter invalidates them.
-Provider locations and credentials do not identify raw content.
-
-Interrupted downloads retain a verified contiguous prefix. Fresh compatible calls can
-independently adopt stopped progress. Conversion adoption snapshots already-fsynced native
-tensor groups before continuing missing operations; the native snapshot never executes an
-unfinished transform. Script stacks and arbitrary Python lines are not checkpointed.
-
-Stopping or pausing execution retains partial work. Permanent cleanup follows the
-execution's release (`retain_work=false`), which frees its source access and producer roots.
-A memo entry has its own root,
-so cleanup of one script cannot remove another recipient's work. Process death also stops
-the native subprocess; its durable native checkpoints remain resumable.
-
-These source builtins are available to unpublished package jobs on local or rented machines
-through the same Runtime/TensorFS code. They do not publish workflows or private memo rows
-to Tensorhub. Dynamic provider resolution is refused inside a memoized package parent,
-since otherwise the parent could skip resolution; conversion of an explicit SourceArtifact
-remains a pure operation. Ordinary client `main` has no such enclosing memoization.
+`cozy_runtime.author.sources` (`download_huggingface`, `download_civitai`, `source_files`,
+`convert_cozytensors`) runs on no current machine; a call is refused naming these two routes.
