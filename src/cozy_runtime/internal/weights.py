@@ -2815,23 +2815,6 @@ def _restore_derived(held: Mapping[tuple[Module, str], Tensor], device: Device) 
 # -------------------------------------------------------------------------- the stages
 
 
-class StageExit(msgspec.Struct, frozen=True, kw_only=True):
-    """One stage's measured facts at scope exit, for the scheduler's cost book (W4)."""
-
-    method: str
-    components: tuple[str, ...]
-    passes: dict[str, int]
-    wall_ns: int
-    #: torch's peak above its bytes at stage entry: activations and decode scratch
-    growth_bytes: int
-    #: the plane's streaming facts for this stage: late copies, the GPU wait on them, bytes
-    late: int
-    stall_ns: int
-    streamed_bytes: int
-    resident_blocks: dict[str, int]
-    window: dict[str, int]
-
-
 class WeightResidency:
     """The author `Residency` on the plane: `admit`/`release` per component-use scope (a
     stage), one wrapper per block. Installed on a constructed generation as
@@ -2866,13 +2849,6 @@ class WeightResidency:
         #: torch's room and its cache drops so far, at the open entry's start
         self.pressure = (0, 0)
         self.derived_at_open = 0
-        #: The scheduler's turn (W4, `stage/1`): called before a stage plans, returns the
-        #: plane budget TensorD granted for it, or None to keep the current one; and its
-        #: sink for each stage's measured facts at exit.
-        self.turn: Callable[[str, tuple[str, ...]], int | None] | None = None
-        self.exit: Callable[[StageExit], None] | None = None
-        self.entered_ns = 0
-        self.stage_mark = (0, 0, 0)
         #: stages of each method in this attempt, and the most any attempt has run: a method
         #: entered again and again (a denoise step per stage) is cyclic like a multi-pass one
         self.entries: dict[str, int] = {}
@@ -2942,10 +2918,6 @@ class WeightResidency:
             name for name in components if name in self.components and name not in self.hosted
         )
         weights = self.weights
-        if self.turn is not None:
-            granted = self.turn(method, components)
-            if granted is not None:
-                weights.set_budget(granted)
         self.entries[method] = self.entries.get(method, 0) + 1
         self.repeats[method] = max(self.repeats.get(method, 0), self.entries[method])
         weights.hold_host()
@@ -2953,7 +2925,6 @@ class WeightResidency:
         weights.room_before(method)
         if weights.host_only:  # everything is bound in place already; no device to measure
             self.active = (method, local)
-            self.entered_ns = time.perf_counter_ns()
             return
         if self.parked == (method, local, weights.budget):
             # The same stage again: its plan, leases and cursors carry on.
@@ -3191,9 +3162,6 @@ class WeightResidency:
         self.baseline = accel.allocated(weights.torch, weights.kind)
         self.pressure = (weights.allocatable(), weights.retries())
         accel.reset_peak(weights.torch, weights.kind)
-        self.entered_ns = time.perf_counter_ns()
-        if self.exit is not None:
-            self.stage_mark = _stage_totals(weights, method)
 
     def release(self, method: str, components: tuple[str, ...]) -> None:
         try:
@@ -3244,31 +3212,6 @@ class WeightResidency:
             item = peak // max(self.batch.pop(method, 1), 1)
             self.per_item[method] = max(self.per_item.get(method, 0), item)
         self.baseline = -1
-        if self.exit is not None:
-            late, stall, streamed = (
-                now - then
-                for now, then in zip(_stage_totals(weights, method), self.stage_mark, strict=True)
-            )
-            placed = {name: self.components[name] for name in local}
-            self.exit(
-                StageExit(
-                    method=method,
-                    components=local,
-                    passes={name: c.last_passes for name, c in placed.items()},
-                    wall_ns=time.perf_counter_ns() - self.entered_ns,
-                    growth_bytes=peak,
-                    late=late,
-                    stall_ns=stall,
-                    streamed_bytes=streamed,
-                    resident_blocks={
-                        name: len(c.residence.resident) if c.residence else 0
-                        for name, c in placed.items()
-                    },
-                    window={
-                        name: c.residence.window if c.residence else 0 for name, c in placed.items()
-                    },
-                )
-            )
 
     def map_ahead(self) -> tuple[int, bool]:
         """Map every component's resident set now, as one stage of all of them would place
@@ -4180,20 +4123,6 @@ def _costs(
         }
         out[key] = weight_policy.Costs(compute=compute, link_bps=link)
     return out
-
-
-def _stage_totals(weights: Weights, tag: str) -> tuple[int, int, int]:
-    """The plane's cumulative (late, stall ns, streamed bytes) for stages tagged `tag`."""
-    rows = [
-        row
-        for row in plane.stats(weights.plane).stages
-        if row.tag == tag and row.device == weights.index
-    ]
-    return (
-        sum(row.late for row in rows),
-        sum(row.stall_ns for row in rows),
-        sum(row.streamed_bytes for row in rows),
-    )
 
 
 def _device_pool(exc: BaseException) -> bool:

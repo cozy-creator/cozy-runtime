@@ -67,14 +67,13 @@ import msgspec
 from msgspec import UNSET, UnsetType
 
 from cozy_runtime import __version__ as RUNTIME_VERSION
-from cozy_runtime.author._activity import blocked, settles
+from cozy_runtime.author._activity import settles
 from cozy_runtime.author._assets import GrantedInput
 from cozy_runtime.author._capture import ActivationCapture
 from cozy_runtime.author._context import AdapterRef, Device
 from cozy_runtime.author._demand import shape_cell
 from cozy_runtime.author._errors import (
     DEVICE_OOM,
-    Cancelled,
     CapabilityError,
     InvalidRequest,
     Outcome,
@@ -106,9 +105,6 @@ from cozy_runtime.author._executor_requests import (
     SharedRegion,
     SourceBytes,
     Staged,
-    StageEnter,
-    StageExit,
-    StageGo,
     Tier,
 )
 from cozy_runtime.author._executor_requests import encode as encode_request
@@ -149,7 +145,6 @@ from cozy_runtime.internal import (
     weight_policy,
     zygote,
 )
-from cozy_runtime.internal import weights as weight_stages
 from cozy_runtime.internal.config import restore_seal, seal_snapshot
 from cozy_runtime.internal.discovery import discover_distribution, discover_installed
 from cozy_runtime.internal.executor_commands import (
@@ -216,7 +211,6 @@ from cozy_runtime.internal.seam import (
     SeamError,
     connect,
 )
-from cozy_runtime.internal.stages import STAGE_TURNS
 from cozy_runtime.internal.weights import (
     INDIVISIBLE,
     DeviceTiers,
@@ -666,8 +660,6 @@ class Executor:
         self.attempts = 0
         #: the DURABLE exchange counter (cr-009). Worker-answered, never sheddable.
         self._exchange = 0
-        #: HOST ONLY: the load in progress asks the worker for a turn per scope (`stage/1`)
-        self.stage_turns = False
         #: one exchange at a time: a publish from a joining thread and a child poll from the
         #: event loop share the seam, and each answer belongs to its own request.
         self._durable_lock = threading.Lock()
@@ -753,7 +745,7 @@ class Executor:
                 zygote.CAPABILITY,
                 "vacate_ranks",
                 *(
-                    [plane.CAPABILITY, STAGE_TURNS, LOAD_PINNED, PROCESS_CAP, RANK_CELLS, MAP]
+                    [plane.CAPABILITY, LOAD_PINNED, PROCESS_CAP, RANK_CELLS, MAP]
                     if plane.available()
                     else []
                 ),
@@ -1785,16 +1777,12 @@ class Executor:
             loaded._bind_parameters(command)
             return self._load_reply(key, loaded, reused=True)
         child = self._construction_child(key)
-        # `stage/1`: the construction's warm scopes ask the worker for their turns.
-        self.stage_turns = command.stages and self.world == 1
         try:
             reply = child._prepare_first(command)
         except Exception:
             self.poisoned = self.poisoned or child.poisoned or "load raised"
             self._close_after({})
             raise
-        finally:
-            self.stage_turns = False
         if not reply.get("ok"):
             if not child.poisoned:
                 # Refused before touching the process: its other constructions keep serving.
@@ -3063,8 +3051,7 @@ class Executor:
             self.weights.seed_squeezed(command.squeezed_bytes)
             if not isinstance(command.device_weights, UnsetType):
                 self._device_weights(command.device_weights)
-        with self._turns(target.residency, command.stages and self.world == 1):
-            reply = target.invoke(command)
+        reply = target.invoke(command)
         self.attempts += 1
         self.poisoned = self.poisoned or target.poisoned
         reply["poisoned"] = self.poisoned
@@ -4434,56 +4421,6 @@ class Executor:
         """The worker's nudge socket for this attempt's calls; None from an older worker."""
         answer = self._durable(ChildEvents(), Handoff)
         return answer.descriptor if answer.ok else None
-
-    @contextlib.contextmanager
-    def _turns(
-        self, residency: WeightResidency | _CompositeResidency | None, on: bool
-    ) -> Iterator[None]:
-        """`stage/1`: while on, each component-use scope of `residency` asks the worker for its
-        turn before it plans and reports what it measured at its exit."""
-        rows = (
-            []
-            if residency is None or not on
-            else list(residency.rows.values())
-            if isinstance(residency, _CompositeResidency)
-            else [residency]
-        )
-        for row in rows:
-            row.turn, row.exit = self._stage_enter, self._stage_exit
-        try:
-            yield
-        finally:
-            for row in rows:
-                row.turn = row.exit = None
-
-    def _stage_enter(self, method: str, components: tuple[str, ...]) -> int | None:
-        """Wait for this scope's turn: the plane budget the worker granted, or None to keep the
-        current one. A refusal is the scope's failure, with the worker's numbers."""
-        with blocked():
-            answer = self._durable(StageEnter(method=method, components=tuple(components)), StageGo)
-        if answer.ok:
-            return answer.budget_bytes if answer.budget_bytes >= 0 else None
-        if answer.code == "cancelled":
-            raise Cancelled(answer.detail or f"{method}() was cancelled waiting for its turn")
-        raise ResidencyRefusal(answer.code or "stage_refused", f"{method}(): {answer.detail}")
-
-    def _stage_exit(self, stage: weight_stages.StageExit) -> None:
-        """Report the scope's facts. A budget in the answer applies now: past its last stage,
-        with a call waiting that lacks room, this executor unmaps its weights (they stay
-        pinned) and says so; the worker keeps the turn until then, so the next one measures
-        the room it really has."""
-        left = StageExit(
-            method=stage.method,
-            components=stage.components,
-            passes=max(stage.passes.values(), default=1),
-            wall_ns=stage.wall_ns,
-            growth_bytes=stage.growth_bytes,
-            stall_ns=stage.stall_ns,
-        )
-        answer = self._durable(left, StageGo)
-        if answer.ok and answer.budget_bytes >= 0:
-            self.budget(Budget(vram_bytes=answer.budget_bytes))
-            self._durable(msgspec.structs.replace(left, yielded=True), StageGo)
 
     def _durable[A: Answer](self, request: Request, into: type[A]) -> A:
         """One DURABLE mid-attempt exchange. Blocks until the worker answers.

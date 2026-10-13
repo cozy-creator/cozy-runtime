@@ -1,4 +1,4 @@
-"""Stage graphs and streaming arithmetic, driven with recorded real-run facts.
+"""Streaming arithmetic, driven with recorded real-run facts.
 
 Every size, time and rate comes from `testdata/stage-costs/recorded.json`: Runtime receipts of
 the six-job SDXL/Anima benchmark on the RTX 4070 Laptop, H3 fp8 runs on 1/2/4 H100 SXM, Qwen-
@@ -14,64 +14,11 @@ from pathlib import Path
 
 import pytest
 
-from cozy_runtime.author import Model, uses_components
-from cozy_runtime.author._model import component_use
 from cozy_runtime.internal import weight_policy
-from cozy_runtime.internal.stages import StageKind, StageSample, observed_graph, static_graph
 
 FX = json.loads((Path(__file__).parent / "testdata/stage-costs/recorded.json").read_text())
 LAPTOP, H100 = FX["machines"]["rtx4070_laptop"], FX["machines"]["h100_sxm"]
 SDXL, ANIMA, H3, QWEN = FX["sdxl"], FX["anima"], FX["h3"], FX["qwen_image_2"]
-
-
-# --------------------------------------------------------------------------- the cost book
-
-
-class Sdxlish(Model[object]):
-    """SDXL's scope shape (`packages/sdxl`): encode x1-2, denoise per step, decode."""
-
-    @uses_components("text_encoder", "text_encoder_2")
-    def encode(self, text: str) -> str:
-        return text
-
-    @uses_components("unet")
-    def denoise(self, step: int) -> int:
-        return step
-
-    @uses_components("vae")
-    def decode(self, latents: int) -> int:
-        return latents
-
-
-def test_the_graph_is_inferred_from_the_scopes_a_package_already_declares() -> None:
-    use = {"Sdxlish": component_use(Sdxlish)}
-    declared = (c for names in use["Sdxlish"].values() for c in names)
-    opaque = static_graph("sdxl/generate", SDXL["cell"], "sdxl", declared)
-    assert not opaque.observed and len(opaque.stages) == 1
-    assert set(opaque.stages[0].kind.components) == {
-        "text_encoder",
-        "text_encoder_2",
-        "unet",
-        "vae",
-    }
-
-    model = Sdxlish.for_test()
-    for text in ("a lighthouse at dusk", ""):  # prompt, then the negative when guidance > 1
-        model.encode(text)
-    for step in range(SDXL["steps"]):
-        model.denoise(step)
-    model.decode(0)
-    samples = [
-        StageSample(kind=StageKind("Sdxlish", call.method, call.components))
-        for call in model.harness.calls
-    ]
-    graph = observed_graph("sdxl/generate", SDXL["cell"], samples)
-    assert [(s.kind.method, s.calls) for s in graph.stages] == [
-        ("encode", 2),
-        ("denoise", SDXL["steps"]),
-        ("decode", 1),
-    ]
-    assert graph.stages[0].kind.components == use["Sdxlish"]["encode"]
 
 
 # --------------------------------------------------------------------------- the cost model
