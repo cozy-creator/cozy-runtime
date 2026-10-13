@@ -407,7 +407,7 @@ def bake(
     """Bake `up @ down` into one stored weight by its roles: plain floats, `fp8-rowwise/1`
     (E4M3 data, f32 row scale) or `mxfp8/1` (E4M3 data, E8M0 block grid). bf16 and E4M3 round
     stochastically, scales kept: nearest returns a small delta to where it was, and loses
-    most of a LoRA's effect on fp8 (MEASURE.md, cozy-machine #26). `seed` names the weight's
+    most of a LoRA's effect on fp8 (MEASURE.md, TensorD #26). `seed` names the weight's
     noise. A GPU bakes fused unless `stats` are asked for (the eager reference measures them)."""
     device = next(iter(stored.values())).device
     if stats is None and device.type == "cuda" and _ready(device.index or 0):

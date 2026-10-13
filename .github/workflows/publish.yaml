@@ -133,7 +133,7 @@ jobs:
           uv run python scripts/stamp-build-provenance.py "$COZY_RUNTIME_BUILD_COMMIT"
           uv build --out-dir dist
       # TensorD itself is public; only private TensorFS source needs additional read access.
-      - name: Bundle the pinned cozy-machine into the Linux wheel
+      - name: Bundle the pinned tensord into the Linux wheel
         working-directory: source
         env:
           CARGO_NET_GIT_FETCH_WITH_CLI: 'true'

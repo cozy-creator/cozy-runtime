@@ -55,7 +55,7 @@ class GpuTier(Weights):
 def test_a_pinned_budget_given_with_the_load_bounds_the_fill_from_its_first_byte(
     tmp_path: Path,
 ) -> None:
-    """The Rust machine's pilot pinned SDXL whole (7.13 GB) and only then cut it to the 4 GiB
+    """TensorD's pilot pinned SDXL whole (7.13 GB) and only then cut it to the 4 GiB
     it sent after Load. The budget now comes with the Load (`Load.pinned_bytes`), applied
     before the weight set registers: a prefix fills inside it, and nothing is pinned past it
     and punched back. Without one, the executor sizes its own tier from the host."""

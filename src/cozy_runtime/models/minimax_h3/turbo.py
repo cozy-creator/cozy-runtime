@@ -35,7 +35,7 @@ LORA_FAMILIES = ("to_q", "to_k", "to_v", "to_out.0", "ff.net.0.proj", "ff.net.2"
 #: The family the producer bakes into the turbo tables; refused on the overlay by name.
 TABLED_FAMILY = "adaln_proj.linear"
 #: Rows per LoRA GEMM. Fixed, so a row's update never depends on how many rows a rank holds
-#: (Ulysses), and large enough that kernel launches stop mattering (cozy-machine #26: 256-row
+#: (Ulysses), and large enough that kernel launches stop mattering (TensorD #26: 256-row
 #: chunks cost 7.6% of a dense step on an RTX PRO 6000, one GEMM pair per site 3.3%).
 _LORA_ROW_CHUNK = 4096
 #: Fix the FP32 projection's GEMM shape across Ulysses sequence partitions.

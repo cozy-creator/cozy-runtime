@@ -1,6 +1,6 @@
 # Machine and Runtime roles
 
-TensorD (the Rust `cozy-machine` executable) owns accepted runs, preparation,
+TensorD (the Rust `tensord` executable) owns accepted runs, preparation,
 scheduling, machine-wide memory policy, storage lifetime, process supervision and its
 durable journal. Local and remote clients reach its `cozy.machine.v1` API. Runtime
 supplies the Python author API and executors that construct models and run package code.

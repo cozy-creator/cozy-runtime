@@ -118,7 +118,7 @@ class ProcessExitObserver:
 
     Waiting on the pidfd reports exit without reaping the child.  The unreaped zombie keeps
     its numeric PID pinned until executor retirement also proves driver absence, which is the
-    lifecycle ordering required by the Rust machine's executor retirement.
+    lifecycle ordering required by TensorD's executor retirement.
     """
 
     process: ProcessIdentity

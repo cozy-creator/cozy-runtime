@@ -5,16 +5,16 @@ TensorD-launched executors, and the package CLI. TensorD makes model weights ava
 those executors and coordinates machine budgets, storage lifetime and process lifecycle.
 TensorFS is a library used inside both TensorD and Runtime.
 
-The Linux x86-64 wheel (glibc 2.28+) also installs TensorD's `cozy-machine` executable.
+The Linux x86-64 wheel (glibc 2.28+) also installs TensorD's `tensord` executable.
 Worker images and `cozy machine install` take it from there:
 
 ```sh
 uv pip install cozy-runtime
-cozy-machine version --json
+tensord version --json
 ```
 
 It is built from [TensorD](https://github.com/cozy-creator/tensord) at the revision recorded
-in `cozy-machine.pin`. `task machine` bundles it into `dist`'s Linux wheel
+in `tensord.pin`. `task machine` bundles it into `dist`'s Linux wheel
 (`MACHINE=<checkout>` builds a local checkout); the publish workflow runs the same task.
 The pure Python wheel and source distribution carry no machine executable.
 See [Publishing Runtime](docs/releases.md) for explicit source and approved-prebuilt releases.
@@ -91,7 +91,7 @@ the entrypoint, a frozen `RuntimeConfig` passed explicitly thereafter. Second re
 
 ## The executor and the machine
 
-    TensorD (cozy-machine) ──control + descriptors──▶ Runtime executor (Python/PyTorch)
+    TensorD ──control + descriptors──▶ Runtime executor (Python/PyTorch)
 
 TensorD uses TensorFS to obtain verified stored weights and prepare/retain shared CPU
 buffers. Runtime constructs the model, plans its weight layout and uses TensorFS's local
@@ -398,7 +398,7 @@ a raise is a typed construction failure (`warm_failed`, naming the exception) th
 placement OFFLINE. Its wall time is the `warm` leg of the prepare, on the fill's boot record.
 There is no entrypoint-level warm pass and no `ctx.boot_warmup`.
 
-A local package's captured wheels are uploaded to the Rust machine and installed into a
+A local package's captured wheels are uploaded to TensorD and installed into a
 generation through its package installer. The executor imports that installed environment.
 Header-declared model assets travel in the CozyTensors runtime closure and reach package
 construction only through Loader's bounded read-only asset capability; a temporary private
@@ -552,7 +552,7 @@ qualification gaps. No dtype or inference backend is substituted to make a model
 An unpublished package runs from captured source without a Tensorhub package release.
 A local script is the single-file form; editable describes an installation mode.
 On a rental, an editable checkout is not mounted or watched. Creator builds one exact
-ephemeral project wheel and dependency-wheel set. The Rust machine bounds the upload, verifies
+ephemeral project wheel and dependency-wheel set. TensorD bounds the upload, verifies
 each wheel's digest and length, then invokes its captured-package installer to build an installed
 generation. The Python executor receives the installed environment and Runtime grants rather
 than controller credentials or a watched source checkout.
