@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import base64
 import csv
+import configparser
+import fcntl
 import errno
 import hashlib
 import json
@@ -48,6 +50,8 @@ RECEIPT_FORMAT = "cozy.runtime.EnvironmentReceipt/1"
 LOCKED_RECEIPT_FORMAT = "cozy.runtime.LockedEnvironmentReceipt/1"
 LOCKED_CONTENT_FORMAT = "cozy.runtime.LockedPackageEnvironment/1"
 CONTENT_IDENTITY_NAME = "package-environment-content.json"
+DEPENDENCY_SNAPSHOT_NAME = "installed-dependencies.json"
+MAX_DEPENDENCY_MANIFEST_BYTES = 64 << 20
 MAX_WHEEL_BYTES = 2 << 30
 MAX_WHEEL_MEMBERS = 100_000
 MAX_WHEEL_EXPANDED_BYTES = 8 << 30
@@ -380,6 +384,7 @@ def materialize(
     *,
     python: Path = Path(sys.executable),
     base: base_observation.Observation | None = None,
+    dependency_python: Path | None = None,
 ) -> InstalledEnvironment:
     """Verify exact wheels and atomically publish one ordinary uv virtual environment.
 
@@ -399,6 +404,8 @@ def materialize(
 
     _require_digest(source.environment_digest, "environment_digest")
     _require_digest(source.project_wheel_digest, "project_wheel_digest")
+    if dependency_python is not None:
+        return _materialize_dependency_snapshot(source, root, python, dependency_python, base)
     observed = base or observe_base(python)
     wheels = _verify_inventory(source, observed, venv_precedence=True)
     uv = _uv_binary()
@@ -2080,3 +2087,243 @@ def _fsync_dir(path: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _dependency_record(info: Path) -> list[tuple[str, str, str]]:
+    record = info / "RECORD"
+    if not record.is_file() or record.is_symlink() or record.stat().st_size > MAX_METADATA_BYTES:
+        raise EnvironmentRefusal("package_environment_dependency_record_invalid", str(info))
+    try:
+        rows = list(csv.reader(record.read_text().splitlines()))
+    except (UnicodeError, csv.Error) as exc:
+        raise EnvironmentRefusal("package_environment_dependency_record_invalid", str(info)) from exc
+    if len(rows) > MAX_WHEEL_MEMBERS or any(len(row) != 3 for row in rows):
+        raise EnvironmentRefusal("package_environment_dependency_record_invalid", str(info))
+    return [(row[0], row[1], row[2]) for row in rows]
+
+
+def _dependency_entrypoints(info: Path) -> dict[str, str]:
+    path = info / "entry_points.txt"
+    if not path.exists():
+        return {}
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_METADATA_BYTES:
+        raise EnvironmentRefusal("package_environment_dependency_entrypoint_invalid", str(path))
+    parser = configparser.ConfigParser(interpolation=None)
+    parser.optionxform = str
+    try:
+        parser.read_string(path.read_text())
+    except (UnicodeError, configparser.Error) as exc:
+        raise EnvironmentRefusal("package_environment_dependency_entrypoint_invalid", str(path)) from exc
+    output: dict[str, str] = {}
+    for group in ("console_scripts", "gui_scripts"):
+        if group not in parser:
+            continue
+        for name, target in parser[group].items():
+            if not re.fullmatch(r"[A-Za-z0-9_.-]+", name) or not re.fullmatch(
+                r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*:[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*(?:\s*\[[A-Za-z0-9_, .-]+\])?", target
+            ):
+                raise EnvironmentRefusal("package_environment_dependency_entrypoint_invalid", str(path))
+            if name in output and output[name] != target:
+                raise EnvironmentRefusal("package_environment_dependency_entrypoint_invalid", name)
+            output[name] = target.split("[", 1)[0].strip()
+    return output
+
+
+def _copy_dependency_file(source: Path, target: Path, expected: str, size: str) -> None:
+    info = source.lstat()
+    if not stat.S_ISREG(info.st_mode):
+        raise EnvironmentRefusal("package_environment_dependency_member_unsupported", str(source))
+    if size and (not size.isdecimal() or int(size) != info.st_size):
+        raise EnvironmentRefusal("package_environment_dependency_member_changed", str(source))
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        if not target.is_file() or _hash_file(target) != _hash_file(source):
+            raise EnvironmentRefusal("package_environment_dependency_member_collision", str(target))
+        return
+    with source.open("rb") as incoming, target.open("xb") as outgoing:
+        before = os.fstat(incoming.fileno())
+        try:
+            fcntl.ioctl(outgoing.fileno(), 0x40049409, incoming.fileno())  # Linux FICLONE.
+        except OSError as exc:
+            if exc.errno not in {errno.EXDEV, errno.EINVAL, errno.ENOTTY, errno.EOPNOTSUPP, errno.ENOSYS}:
+                raise
+            shutil.copyfileobj(incoming, outgoing, 1 << 20)
+        outgoing.flush()
+        os.fsync(outgoing.fileno())
+        after = os.fstat(incoming.fileno())
+    if (before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+        after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns
+    ):
+        raise EnvironmentRefusal("package_environment_dependency_member_changed", str(source))
+    if expected:
+        algorithm, separator, encoded = expected.partition("=")
+        if not separator or algorithm not in {"sha256", "sha384", "sha512"}:
+            raise EnvironmentRefusal("package_environment_dependency_hash_unsupported", str(source))
+        digest = hashlib.new(algorithm)
+        with target.open("rb") as copied:
+            while chunk := copied.read(1 << 20):
+                digest.update(chunk)
+        if base64.urlsafe_b64encode(digest.digest()).rstrip(b"=").decode() != encoded:
+            raise EnvironmentRefusal("package_environment_dependency_member_changed", str(source))
+    target.chmod(0o755 if info.st_mode & 0o111 else 0o644)
+
+
+def _dependency_snapshot(source_python: Path, staging: Path, excluded: set[str]) -> bytes:
+    layout = _interpreter_layout(source_python)
+    prefix = source_python.parent.parent
+    source_site = Path(layout["purelib"])
+    if layout["prefix"] != str(prefix) or not source_site.is_relative_to(prefix):
+        raise EnvironmentRefusal("package_environment_dependency_source_invalid", str(source_python))
+    target_site = staging / source_site.relative_to(prefix)
+    distributions: list[dict[str, Any]] = []
+    copied: set[Path] = set()
+    for info in sorted(source_site.glob("*.dist-info")):
+        if info.is_symlink() or not info.is_dir():
+            raise EnvironmentRefusal("package_environment_dependency_record_invalid", str(info))
+        metadata = info / "METADATA"
+        if not metadata.is_file() or metadata.is_symlink() or metadata.stat().st_size > MAX_METADATA_BYTES:
+            raise EnvironmentRefusal("package_environment_dependency_record_invalid", str(info))
+        headers = BytesParser().parsebytes(metadata.read_bytes(), headersonly=True)
+        name, version = _name(str(headers.get("Name", ""))), str(headers.get("Version", ""))
+        if not normalized_distribution(name) or not valid_wheel_version(version):
+            raise EnvironmentRefusal("package_environment_dependency_record_invalid", str(info))
+        if name in excluded:
+            continue
+        direct = info / "direct_url.json"
+        if direct.is_file():
+            try:
+                value = json.loads(direct.read_text())
+            except (ValueError, UnicodeError) as exc:
+                raise EnvironmentRefusal("package_environment_dependency_record_invalid", str(direct)) from exc
+            if isinstance(value, dict) and value.get("dir_info", {}).get("editable"):
+                raise EnvironmentRefusal("package_environment_dependency_editable", name)
+        launchers = _dependency_entrypoints(info)
+        rows = _dependency_record(info)
+        paths: list[str] = []
+        for relative, digest, length in rows:
+            member = source_site / relative
+            if not relative or "\x00" in relative or PurePosixPath(relative).is_absolute():
+                raise EnvironmentRefusal("package_environment_dependency_member_unsupported", relative)
+            resolved = member.resolve()
+            if not resolved.is_relative_to(prefix) or member.is_symlink():
+                raise EnvironmentRefusal("package_environment_dependency_member_unsupported", relative)
+            if member.suffix == ".pth" or "__editable__" in member.name:
+                raise EnvironmentRefusal("package_environment_dependency_editable", name)
+            if not member.exists() and member.suffix == ".pyc":
+                continue
+            if not member.is_file():
+                raise EnvironmentRefusal("package_environment_dependency_member_missing", relative)
+            destination = staging / resolved.relative_to(prefix)
+            if resolved.parent == prefix / "bin":
+                if resolved.name in launchers:
+                    continue
+                with member.open("rb") as stream:
+                    if stream.read(4) != b"\x7fELF":
+                        raise EnvironmentRefusal("package_environment_dependency_launcher_unsupported", relative)
+            _copy_dependency_file(member, destination, digest, length)
+            copied.add(destination)
+            paths.append(str(destination.relative_to(staging)))
+        distributions.append({"distribution": name, "version": version, "files": sorted(paths)})
+        if len(distributions) > MAX_PACKAGE_WHEELS or len(copied) > MAX_WHEEL_MEMBERS:
+            raise EnvironmentRefusal("package_environment_dependency_snapshot_oversized", str(source_site))
+    # Rewrite all installed launchers, including captured project wheels. The shell/Python
+    # wrapper is relative to its own bin directory, so atomic rename cannot break it.
+    for info in sorted(target_site.glob("*.dist-info")):
+        rows = _dependency_record(info)
+        entries = _dependency_entrypoints(info)
+        for name, target in entries.items():
+            module, attribute = target.split(":", 1)
+            body = ("#!/bin/sh\n'''exec' \"${0%/*}/python\" \"$0\" \"$@\"\n' '''\n"
+                    "import sys\nfrom importlib import import_module\n"
+                    f"entry = import_module({module!r})\n"
+                    f"for name in {attribute.split('.')!r}:\n    entry = getattr(entry, name)\n"
+                    "sys.exit(entry())\n")
+            path = staging / "bin" / name
+            path.write_text(body)
+            path.chmod(0o755)
+            copied.add(path)
+        existing = {relative for relative, _, _ in rows}
+        for name in entries:
+            existing.add(os.path.relpath(staging / "bin" / name, target_site))
+        record = info / "RECORD"
+        with record.open("w", newline="") as output:
+            writer = csv.writer(output)
+            for relative in sorted(existing):
+                path = (target_site / relative).resolve()
+                if not path.is_relative_to(staging) or not path.is_file():
+                    continue
+                if path == record:
+                    writer.writerow((relative, "", ""))
+                else:
+                    encoded = base64.urlsafe_b64encode(bytes.fromhex(_hash_file(path).removeprefix("sha256:"))).rstrip(b"=").decode()
+                    writer.writerow((relative, "sha256=" + encoded, path.stat().st_size))
+        if record in copied:
+            copied.add(record)
+    manifest = canonical.write({
+        "format": "cozy.runtime.InstalledDependencySnapshot/1",
+        "distributions": distributions,
+        "files": [{"path": str(path.relative_to(staging)), "digest": _hash_file(path),
+                   "length": path.stat().st_size} for path in sorted(copied)],
+    })
+    if len(manifest) > MAX_DEPENDENCY_MANIFEST_BYTES:
+        raise EnvironmentRefusal("package_environment_dependency_snapshot_oversized", str(source_site))
+    return manifest
+
+
+def _materialize_dependency_snapshot(
+    source: Input, root: Path, python: Path, dependency_python: Path,
+    base: base_observation.Observation | None,
+) -> InstalledEnvironment:
+    observed = base or observe_base(dependency_python)
+    wheels = _verify_inventory(source, observed, venv_precedence=True)
+    inspected = _verify_grants(source, wheels, observed)
+    _verify_python_requirements(inspected, observed)  # No online boot-install in this path.
+    uv = _uv_binary()
+    if _observed_uv_version(uv) != observed.uv_version:
+        raise EnvironmentRefusal("package_environment_uv_changed", observed.uv_version)
+    _require_owned_root(root)
+    _remove_dead_staging(root)
+    contents, receipts = root / "contents", root / "receipts"
+    contents.mkdir(parents=True, exist_ok=True, mode=0o711)
+    receipts.mkdir(parents=True, exist_ok=True, mode=0o700)
+    staging = root / f".environment-staging-{os.getpid()}-{uuid.uuid4().hex}"
+    try:
+        _install_with_uv(uv, python, staging, inspected)
+        manifest = _dependency_snapshot(dependency_python, staging, {wheel.distribution for wheel in wheels})
+        identity = _content_identity(wheels, observed.interpreter_identity, observed.uv_version)
+        identity["dependency_snapshot"] = {"digest": _sha(manifest), "length": len(manifest)}
+        content_bytes = canonical.write(identity)
+        content_digest = _sha(content_bytes)
+        receipt_bytes = canonical.write(_receipt(source, wheels, content_digest))
+        receipt_digest = _sha(receipt_bytes)
+        final = contents / content_digest.removeprefix("sha256:")
+        _write_once(staging / DEPENDENCY_SNAPSHOT_NAME, manifest)
+        _write_once(staging / CONTENT_IDENTITY_NAME, content_bytes)
+        _make_read_only(staging)
+        _fsync_dir(staging)
+        reused = final.exists()
+        if reused:
+            _remove_tree(staging)
+        else:
+            os.rename(staging, final)
+            final.chmod(0o555)
+            _fsync_dir(contents)
+        _publish_receipt(receipts / f"{receipt_digest.removeprefix('sha256:')}.json", receipt_bytes, receipts)
+        installed = open_generation(root, receipt_digest=receipt_digest,
+                                    environment_digest=source.environment_digest, python=python,
+                                    reused=reused)
+        actual = observe_base(installed.python)
+        _verify_python_requirements(inspected, actual)
+        snapshot = canonical.parse_canonical(manifest)
+        assert isinstance(snapshot, dict)
+        for row in cast(list[dict[str, str]], snapshot["distributions"]):
+            if actual.distribution_versions.get(row["distribution"]) != row["version"]:
+                raise EnvironmentRefusal("package_environment_dependency_snapshot_mismatch", row["distribution"])
+        return installed
+    except EnvironmentRefusal:
+        raise
+    except OSError as exc:
+        raise EnvironmentRefusal("package_environment_dependency_snapshot_io", str(exc)) from exc
+    finally:
+        if staging.exists():
+            _remove_tree(staging)
