@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import struct
 import time
+from fractions import Fraction
 from pathlib import Path
 
 import msgspec
@@ -106,12 +107,10 @@ def test_effective_checkpoint_and_source_keep_exact_admitted_base(tmp_path: Path
 
         contexts = [
             AVContext(
-                {22: (torch.zeros(1, 24, 7, 2, 4), torch.zeros(74, 32))},
-                32,
-                64,
-                56,
+                torch.zeros(1, 24, 7, 2, 4),
+                torch.zeros(80, 32),
+                Fraction(0),
                 json.dumps({"model_manifest": selected.checkpoint_ref, "turbo_lora_manifest": ""}),
-                22,
             )
             for selected in (model, other)
         ]
