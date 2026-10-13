@@ -23,6 +23,7 @@ from cozy_runtime.author import (
     WeightsOutput,
     invocable,
 )
+from cozy_runtime.models.birefnet import ingestion as birefnet
 
 from . import facade
 
@@ -214,7 +215,6 @@ app.job(
     memo_version="prepare-model/1",
     memo_dependencies=(
         "cozy_runtime.models.birefnet.ingestion",
-        "cozy_runtime.models.qwen_image21.ingestion",
         "tensorfs.derived",
         MemoDistribution("tensorfs"),
         MemoDistribution("msgspec"),
@@ -228,17 +228,13 @@ async def prepare_model(
     recipe: str,
 ) -> ModelArtifact:
     """Attach reviewed model-owned metadata to an exact native source census."""
-    if recipe not in {"qwen-image-2.1/original/1", "birefnet/original/1"}:
+    if recipe != "birefnet/original/1":
         raise UnsupportedInput("Unknown model preparation recipe", code="model_ingestion_recipe")
     from tensorfs.derived import Config, Derivation, Target, derive
 
-    from cozy_runtime.models.birefnet.ingestion import preparation as prepare_birefnet
-    from cozy_runtime.models.qwen_image21.ingestion import preparation as prepare_qwen
-
     capability = ctx.tensorfs_source(source)
     inspection = capability.inspect()
-    prepare = prepare_birefnet if recipe == "birefnet/original/1" else prepare_qwen
-    config, order, files = prepare(inspection, metadata.path)
+    config, order, files = birefnet.preparation(inspection, metadata.path)
     definition = Derivation(
         sources={"source": capability},
         targets={c: Target(source="source", source_component=c) for c in inspection.components},

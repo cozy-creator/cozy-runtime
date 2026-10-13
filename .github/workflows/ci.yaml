@@ -37,7 +37,7 @@ jobs:
       - if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
         run: >-
           uv run mypy --follow-imports=silent
-          --exclude 'src/cozy_runtime/models/qwen_image21/upstream|^tests/testdata/'
+          --exclude '^tests/testdata/'
       - if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
         run: uv run python checks/architecture.py
       - name: Reproducible wheel

@@ -31,37 +31,13 @@ from cozy_runtime.author._model import _derive_model
 from cozy_runtime.author.sources import ingest_huggingface
 from cozy_runtime.derive.operations import QuantizationSource, app
 from cozy_runtime.internal import source_interfaces
-from cozy_runtime.models.qwen_image21.ingestion import REPOSITORY, REVISION, configuration
+from cozy_runtime.models.birefnet.ingestion import REPOSITORY, REVISION
 from durable_seam import wire
 from native_weights import NativeExecution
 from test_quantize_artifact_native import _source
 
 
-def test_ingestion_cli_reports_reviewed_full_metadata_without_inference() -> None:
-    command = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "cozy_runtime.cli.main",
-            "--json",
-            "model-ingestion-plan",
-            REPOSITORY,
-            REVISION,
-        ],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    recipe = json.loads(command.stdout)["recipe"]
-    assert recipe["profile"] == "hf/qwen/qwen-image-2.1/original/1"
-    assert set(recipe["metadata"]) >= {
-        "processor/tokenizer.json",
-        "transformer/config.json",
-        "LICENSE",
-    }
-    assert all(
-        row["length"] > 0 and len(row["sha256"]) == 64 for row in recipe["metadata"].values()
-    )
+def test_ingestion_refuses_unreviewed_pins() -> None:
     for repository, revision, code in (
         (REPOSITORY, "0" * 40, "model_ingestion_revision"),
         ("unreviewed/model", REVISION, "model_ingestion_recipe_unavailable"),
@@ -69,13 +45,6 @@ def test_ingestion_cli_reports_reviewed_full_metadata_without_inference() -> Non
         with pytest.raises(UnsupportedInput) as error:
             asyncio.run(ingest_huggingface(repository, revision=revision))
         assert error.value.code == code
-
-
-def test_qwen_configuration_rejects_changed_metadata_before_use(tmp_path: Path) -> None:
-    (tmp_path / "transformer").mkdir()
-    (tmp_path / "transformer/config.json").write_bytes(b"{}")
-    with pytest.raises(ValueError, match="Unreviewed Qwen metadata"):
-        configuration(tmp_path)
 
 
 def test_birefnet_cli_uses_native_identity_ingest_and_its_complete_model_config() -> None:
@@ -105,6 +74,23 @@ def test_preparation_binds_real_native_source_and_refuses_wrong_census(tmp_path:
     source = _source(store, "control")
     metadata = tmp_path / "metadata"
     metadata.mkdir()
+    config = {
+        "_name_or_path": REPOSITORY,
+        "architectures": ["BiRefNet"],
+        "auto_map": {
+            "AutoConfig": "BiRefNet_config.BiRefNetConfig",
+            "AutoModelForImageSegmentation": "birefnet.BiRefNet",
+        },
+        "custom_pipelines": {
+            "image-segmentation": {
+                "pt": ["AutoModelForImageSegmentation"],
+                "tf": [],
+                "type": "image",
+            }
+        },
+        "bb_pretrained": False,
+    }
+    (metadata / "config.json").write_text(json.dumps(config, indent=2))
     digest = "sha256:" + "a1" * 32
     with NativeExecution(
         store, tmp_path / "execution", "prepare", {"source": source}, {"model": 8 << 20}
@@ -115,7 +101,7 @@ def test_preparation_binds_real_native_source_and_refuses_wrong_census(tmp_path:
             {
                 "source": msgspec.to_builtins(source),
                 "metadata": digest,
-                "recipe": "qwen-image-2.1/original/1",
+                "recipe": "birefnet/original/1",
             },
             Invocation(
                 "prepare",
@@ -129,7 +115,7 @@ def test_preparation_binds_real_native_source_and_refuses_wrong_census(tmp_path:
             ),
         )
     assert result is None and outcome.terminal == "failed"
-    assert "exact original source tensor census" in str(outcome)
+    assert "BiRefNet source tensor keys do not match" in str(outcome)
 
 
 class _Empty(msgspec.Struct):

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from cozy_runtime.author import UnsupportedInput
+from cozy_runtime.models.birefnet import ingestion as birefnet
 
 
 @dataclass(frozen=True)
@@ -18,41 +19,20 @@ class Recipe:
 
 
 def huggingface_recipe(repository: str, revision: str) -> Recipe | None:
-    from cozy_runtime.models.birefnet import ingestion as birefnet
-    from cozy_runtime.models.qwen_image21 import ingestion as qwen
-
-    if repository.lower() == birefnet.REPOSITORY.lower():
-        if revision != birefnet.REVISION:
-            raise UnsupportedInput(
-                "BiRefNet ingestion requires its reviewed immutable revision " + birefnet.REVISION,
-                code="model_ingestion_revision",
-            )
-        return Recipe(
-            "birefnet/original/1",
-            birefnet.REPOSITORY,
-            birefnet.REVISION,
-            "as-is/1",
-            ("model.safetensors",),
-            dict(birefnet.FILES),
-        )
-    if repository.lower() != qwen.REPOSITORY.lower():
+    if repository.lower() != birefnet.REPOSITORY.lower():
         return None
-    if revision != qwen.REVISION:
+    if revision != birefnet.REVISION:
         raise UnsupportedInput(
-            "Qwen ingestion requires its reviewed immutable revision " + qwen.REVISION,
+            "BiRefNet ingestion requires its reviewed immutable revision " + birefnet.REVISION,
             code="model_ingestion_revision",
         )
     return Recipe(
-        "qwen-image-2.1/original/1",
-        qwen.REPOSITORY,
-        qwen.REVISION,
-        "hf/qwen/qwen-image-2.1/original/1",
-        (
-            "transformer/diffusion_pytorch_model.safetensors.index.json",
-            "text_encoder/model.safetensors.index.json",
-            "vae/diffusion_pytorch_model.safetensors",
-        ),
-        dict(qwen.FILES),
+        "birefnet/original/1",
+        birefnet.REPOSITORY,
+        birefnet.REVISION,
+        "as-is/1",
+        ("model.safetensors",),
+        dict(birefnet.FILES),
     )
 
 
