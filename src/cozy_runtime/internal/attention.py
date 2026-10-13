@@ -940,7 +940,7 @@ def _site_records(roots: Mapping[str, object]) -> Iterator[tuple[str, str, Any, 
             yield record
 
 
-def _unmanaged_reason(component: str, path: str, processor: Any) -> str:
+def _unmanaged_reason(component: str, path: str, processor: object) -> str:
     return (
         f"{component}/{path} uses {type(processor).__name__}, which has no per-site "
         "attention backend selection"
