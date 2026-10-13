@@ -1676,6 +1676,8 @@ def test_a_group_gpus_denoise_keeps_a_resident_set_after_a_one_pass_warm_up(card
     layout: weight_policy.Layout = model.residency.components["stack"].layout
     weights.set_budget(layout.common + (BLOCKS // 2 + 2) * layout.largest)
     staged("warm", 1)
+    # The warm-up's first launches (library workspaces) are not the denoise's activations.
+    weights.activation.clear()
     denoised = staged("denoise", 3)
     kept = weights.facts().streamed["stack"].resident_blocks
     assert 0 < kept < BLOCKS, kept
