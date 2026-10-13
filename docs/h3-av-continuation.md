@@ -46,4 +46,4 @@ predecessor's picture ends one frame early when its grid rounds the sound down (
 `align_context_rows`. `OfficialH3Pipeline.start_ref2va` takes `context`, `delivery` and
 `expected_context_provenance`; `export_context(state, provenance=...)` returns the
 successor's carry after denoise, before decode. Contexts always come from the first,
-native-canvas pass; a refinement or upscale of the delivered video never feeds a successor.
+native-canvas pass; an upscale of the delivered video never feeds a successor.

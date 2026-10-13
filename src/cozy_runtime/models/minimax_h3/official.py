@@ -1611,7 +1611,6 @@ class OfficialH3Pipeline:
         cancel: Callable[[], None],
         checks: NumericalChecks | None = None,
         sol_dense_steps: int = 10,
-        refine_steps: int | None = None,
     ) -> ScheduleFacts:
         _validate_sol_dense_steps(sol_dense_steps)
         _settle_intake(state)
@@ -1625,10 +1624,6 @@ class OfficialH3Pipeline:
                 "max_duration": _CEILING_S,
             },
         )
-        if refine_steps is not None:
-            # Artifact tensors land on CPU. Upstream moves latent/layout inputs, but
-            # expects text embeddings to have been produced on the DiT device already.
-            state.set("prompt_embeds", state.prompt_embeds.to(scoped._execution_device))
         # The selected upstream workflow owns the ordered preparation steps.
         # Text-only requests have no keyframe tensors to encode or concatenate.
         for name in blocks:
@@ -1660,45 +1655,12 @@ class OfficialH3Pipeline:
         facts = ScheduleFacts.of(plan, schedule)
         loop = blocks["denoise.denoise"]
         block_state = loop.get_block_state(state)
-        start = 0
-        locked_audio = None
-        if refine_steps is not None:
-            from diffusers.modular_pipelines.minimax_h3.before_denoise import MiniMaxH3SetTimestepsStep
-            from diffusers.utils.torch_utils import randn_tensor
-
-            if _BANK[task] is not None or schedule.transformer_evaluations != 30 or type(refine_steps) is not int or not 1 <= refine_steps <= 10:
-                raise InvalidRequest("H3 refinement uses 1..10 final evaluations of the standard 30-step plan", code="h3_refinement")
-            start = schedule.transformer_evaluations - refine_steps
-            target = block_state.latents[block_state.num_condition_video_rows:]
-            noise = randn_tensor(target.shape, generator=state.generator, device=target.device, dtype=target.dtype)
-            target.copy_(scoped.scheduler.scale_noise(target, block_state.timesteps[start], noise))
-            scoped.scheduler.set_begin_index(start)
-            scoped.audio_scheduler.set_begin_index(start)
-            # Original generated audio is now clean conditioning. Keep its rows at t=1
-            # and restore them after each upstream joint update; final decode reuses PCM.
-            locked_audio = block_state.audio_latents.clone()
-            block_state.row_timestep_plan = [
-                tuple(t.to(target.device) for t in MiniMaxH3SetTimestepsStep.build_row_timesteps(
-                    block_state.denoiser_input_fields["video_indices"],
-                    block_state.denoiser_input_fields["audio_indices"],
-                    block_state.num_condition_video_rows, block_state.num_condition_audio_rows,
-                    block_state.denoiser_input_fields["text_indices"].numel(),
-                    float(timestep), 1.0, max(float(timestep), scoped.keyframe_noise_aug), 1.0,
-                )) for timestep in block_state.timesteps
-            ]
-            video_sigmas = schedule.video_sigmas[start:]
-            facts = ScheduleFacts(plan.digest, refine_steps, refine_steps + 1,
-                _float32_digest(video_sigmas), _float32_digest((0.0,) * (refine_steps + 1)),
-                _float32_digest(schedule.video_timesteps[start:]), _float32_digest((1.0,) * refine_steps))
-        for index in range(start, len(block_state.timesteps)):
-            timestep = block_state.timesteps[index]
+        for index, timestep in enumerate(block_state.timesteps):
             cancel()
             with attention_scope(
                 _attention_layout(block_state, index, sol_dense_steps=sol_dense_steps)
             ):
                 _, block_state = loop.loop_step(scoped, block_state, i=index, t=timestep)
-            if locked_audio is not None:
-                block_state.audio_latents.copy_(locked_audio)
             if checks is not None:
                 checks.tensors(
                     f"{_DIT_COMPONENT[_TRUNK[task]]}.updated.{index}",
@@ -1709,7 +1671,7 @@ class OfficialH3Pipeline:
                     required=True,
                     defer=True,
                 )
-            on_step(index - start)
+            on_step(index)
         if checks is not None:
             # One read for every step's inputs, predictions and updates, before any decode.
             # Waiting loses nothing: the official update is an affine blend of the current
@@ -1721,9 +1683,6 @@ class OfficialH3Pipeline:
         return facts
 
     def decode_audio(self, task: Task, state: Any) -> Any:
-        if state.get("preserved_audio") is not None:
-            state.set("audio", state.preserved_audio)
-            return state.audio
         # Repeated BigVGAN decodes can differ on the same input even
         # with benchmarking disabled. Scope only algorithm determinism to this
         # serial component call; preserve TF32, dtype and every other backend setting.
