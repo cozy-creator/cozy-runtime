@@ -1,0 +1,1 @@
+Bundle TensorD 0.5.25: the agent is `tensord`; the request's attention pin reaches the Runtime at Load and a pin needing another kernel build runs on a fresh executor; cancelling a preparing run stops its downloads, provider fetches and installs (landed bytes stay), and an install that stops moving fails `package_installation_stalled`.
