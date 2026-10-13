@@ -8,7 +8,7 @@ if git ls-remote "$repository" HEAD >/dev/null 2>&1; then
   exit 0
 fi
 if [[ -z "${TENSORFS_KEY:-}" ]]; then
-  echo '::error::Hosted source mode cannot read private TensorFS. Provide existing TensorFS read access via TENSORFS_READ_KEY, or build with local authenticated Git and select mode=prebuilt with approved hashes. TensorD is public and needs no COZY_MACHINE_READ_KEY.' >&2
+  echo '::error::Hosted source mode cannot read private TensorFS. Provide existing TensorFS read access via TENSORFS_READ_KEY, or build with local authenticated Git and select mode=prebuilt with approved hashes. TensorD is public and needs no read key.' >&2
   exit 1
 fi
 mkdir -m 700 -p ~/.ssh
