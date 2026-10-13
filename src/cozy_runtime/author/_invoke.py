@@ -348,6 +348,7 @@ def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> Invoc
     _hydrate(overlay.payload, inv, prepared.asset_bounds, record)
 
     attempt = record
+    attempt.outputs = surface.outputs
     attempt.rows.extend(overlay.rows)
     ctx = Context(inv.request_id, inv.deadline, inv.device, inv.cancel, inv.adapters)
     handles = ExitStack()
