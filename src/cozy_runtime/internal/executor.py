@@ -4383,14 +4383,16 @@ class Executor:
         body.pop("memfd", None)
         shared = request.fds if isinstance(request, DeviceTier) else ()
         body.pop("fds", None)
-        with self._durable_lock:
-            self._exchange += 1
-            exchange = f"{body['kind']}#{self._exchange}"
+        # One exchange at a time on the channel the host and its constructions share.
+        host = self.host
+        with host._durable_lock:
+            host._exchange += 1
+            exchange = f"{body['kind']}#{host._exchange}"
             if sending >= 0:
                 body["descriptor"] = True
             if shared:
                 body["descriptors"] = len(shared)
-            self.channel.send({"event": "request", "seq": self._exchange, **body})
+            self.channel.send({"event": "request", "seq": host._exchange, **body})
             if sending >= 0:
                 self.channel.send_memfd(sending)
             for fd in shared:
@@ -4398,7 +4400,7 @@ class Executor:
             frame = self.channel.recv()
             if frame is None:
                 raise SeamError("seam_closed", f"the worker closed during {exchange}")
-            if frame.get("event") != "answer" or frame.get("seq") != self._exchange:
+            if frame.get("event") != "answer" or frame.get("seq") != host._exchange:
                 raise SeamError(
                     "seam_out_of_order",
                     f"expected the answer to {exchange}, got {frame.get('event')!r}",
