@@ -23,10 +23,15 @@ from cozy_runtime.internal import fill
 
 
 class StorageRefusal(Exception):
-    code = "insufficient_storage"
-
-    def __init__(self, detail: str, facts: dict[str, int] | None = None) -> None:
+    def __init__(
+        self,
+        detail: str,
+        facts: dict[str, int] | None = None,
+        *,
+        code: str = "insufficient_storage",
+    ) -> None:
         super().__init__(detail)
+        self.code = code
         self.facts = facts or {}
         counts = ", ".join(
             f"{key}={value}" for key, value in sorted(self.facts.items()) if type(value) is int
@@ -149,7 +154,15 @@ def admit(*writes: Write) -> Iterator[None]:
 
 
 @contextmanager
-def _exchange(body: bytes, directories: tuple[Path, ...] = ()) -> Iterator[dict[str, object]]:
+def _exchange(
+    body: bytes,
+    directories: tuple[Path, ...] = (),
+    *,
+    failure: tuple[str, str] = (
+        "storage_admission_unavailable",
+        "supervisor could not assess Runtime disk write",
+    ),
+) -> Iterator[dict[str, object]]:
     if _channel is None or _held.get():
         raise StorageRefusal("supervisor storage channel is unavailable or already held")
     if len(body) > 4096:
@@ -193,9 +206,17 @@ def _exchange(body: bytes, directories: tuple[Path, ...] = ()) -> Iterator[dict[
             answer = json.loads(raw)
             if not isinstance(answer, dict) or answer.get("ok") is not True:
                 facts = answer.get("facts", {}) if isinstance(answer, dict) else {}
-                raise StorageRefusal("supervisor refused Runtime disk write", facts)
+                if isinstance(facts, dict) and facts:
+                    raise StorageRefusal(
+                        "supervisor refused Runtime disk write",
+                        facts,
+                        code="insufficient_storage",
+                    )
+                raise StorageRefusal(failure[1], code=failure[0])
         except (OSError, ValueError) as exc:
-            raise StorageRefusal("supervisor storage admission is unavailable") from exc
+            raise StorageRefusal(
+                "supervisor storage admission is unavailable", code="storage_admission_unavailable"
+            ) from exc
         yield answer
 
 
@@ -205,7 +226,10 @@ def fetch_wheel(operation: str, filename: str, digest: str, url: str) -> tuple[P
         {"operation": operation, "filename": filename, "digest": digest, "url": url},
         separators=(",", ":"),
     ).encode()
-    with _exchange(body) as answer:
+    with _exchange(
+        body,
+        failure=("wheel_download_failed", "supervisor could not download the locked wheel"),
+    ) as answer:
         path, length = answer.get("path"), answer.get("length")
         if not isinstance(path, str) or type(length) is not int or not 0 < length <= 2 << 30:
             raise StorageRefusal("supervisor returned an invalid wheel file")
@@ -214,5 +238,8 @@ def fetch_wheel(operation: str, filename: str, digest: str, url: str) -> tuple[P
 
 def release_wheels(operation: str) -> None:
     """A completed immutable install releases its existing wheel staging operation."""
-    with _exchange(json.dumps({"operation": operation, "release": True}).encode()):
+    with _exchange(
+        json.dumps({"operation": operation, "release": True}).encode(),
+        failure=("wheel_release_failed", "supervisor could not release locked wheel staging"),
+    ):
         pass

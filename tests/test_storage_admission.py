@@ -51,7 +51,55 @@ def test_refusal_happens_before_any_file_write(channel: socket.socket, tmp_path:
     thread.join(2)
     assert not thread.is_alive()
     assert refused.value.facts["available"] == 90
+    assert refused.value.code == "insufficient_storage"
     assert not target.exists()
+
+
+@pytest.mark.parametrize("kind", ["admit", "download", "release"])
+def test_factless_bridge_failures_name_the_operation(
+    channel: socket.socket, tmp_path: Path, kind: str
+) -> None:
+    def host() -> None:
+        _, conn = operation(channel)
+        with conn:
+            conn.sendall(b'{"ok":false,"error":"https://example.com/?secret=hidden"}\n')
+
+    thread = threading.Thread(target=host)
+    thread.start()
+    with pytest.raises(storage.StorageRefusal) as refused:
+        if kind == "admit":
+            with storage.admit(storage.Write(tmp_path, 100, 1)):
+                pytest.fail("unconfirmed write ran")
+        elif kind == "download":
+            storage.fetch_wheel("locked-" + "0" * 64, "example.whl", "sha256:" + "0" * 64, "https://example.com/?secret=hidden")
+        else:
+            storage.release_wheels("locked-" + "0" * 64)
+    thread.join(2)
+    assert not thread.is_alive()
+    assert refused.value.code == {
+        "admit": "storage_admission_unavailable",
+        "download": "wheel_download_failed",
+        "release": "wheel_release_failed",
+    }[kind]
+    assert refused.value.facts == {}
+    assert "https" not in str(refused.value)
+    assert "hidden" not in str(refused.value)
+
+
+def test_wheel_capacity_refusal_retains_measured_facts(channel: socket.socket) -> None:
+    def host() -> None:
+        _, conn = operation(channel)
+        with conn:
+            conn.sendall(b'{"ok":false,"facts":{"available":90,"required":100}}\n')
+
+    thread = threading.Thread(target=host)
+    thread.start()
+    with pytest.raises(storage.StorageRefusal) as refused:
+        storage.fetch_wheel("locked-" + "0" * 64, "example.whl", "sha256:" + "0" * 64, "https://example.com/wheel")
+    thread.join(2)
+    assert not thread.is_alive()
+    assert refused.value.code == "insufficient_storage"
+    assert refused.value.facts == {"available": 90, "required": 100}
 
 
 def test_exception_releases_only_after_work_finishes(
