@@ -1700,9 +1700,11 @@ class Executor:
         return {"ok": True, "ranks": [], "skipped": "compiles start with the process"}
 
     def _model_classes(self) -> list[type[Model[Any]]]:
-        module = getattr(self.discovered, "module", None)
-        values = vars(module).values() if module is not None else ()
-        return [v for v in values if isinstance(v, type) and issubclass(v, Model) and v != Model]
+        """The classes the package's Model slots declare, wherever they are defined (a
+        script's come from its libraries, not its entry module)."""
+        surfaces = getattr(self.discovered, "surfaces", ())
+        slots = [slot for surface in surfaces for slot in surface.model_bindings]
+        return list(dict.fromkeys(slot.model_class for slot in slots))
 
     def _expect_fusion(self, *, isolated: bool) -> str:
         """Start the fused glue's compile for each sealed card's architecture, read from the
@@ -2255,7 +2257,11 @@ class Executor:
         qualified_pair = (qualification.capabilities, qualification.result)
         stage("qualify")
         objective = binding.objective or "latency"
-        model_cls = getattr(self.discovered.module, binding.model_class)
+        model_cls = next(
+            cls
+            for cls in self._model_classes()
+            if cls.__name__ == binding.model_class
+        )
         if callable(getattr(model_cls, "warm", None)) and model_cls not in _WARM_NOTED:
             _WARM_NOTED.add(model_cls)
             print(
