@@ -98,9 +98,11 @@ def script_app(module: str) -> App:
     types: dict[str, Any] = {}
     payload_types: dict[str, Any] = {}
     execution_context = False
+    where = "tool.cozy declarations are"
     try:
         models, weights, accelerator = declarations(raw)
         for parameter in parameters:
+            where = f"main parameter {parameter.arg!r} is"
             if parameter.arg == "ctx":
                 if parameter.annotation is not None:
                     value = annotation(parameter.annotation, tree)
@@ -117,6 +119,7 @@ def script_app(module: str) -> App:
             if _classify(parameter.arg, value, "script main").role not in {"model", "service"}:
                 raise ValueError("script parameter must declare a model or service")
             types[parameter.arg] = value
+        where = "main declarations are"
         if set(models) - {
             name
             for name, value in types.items()
@@ -125,11 +128,11 @@ def script_app(module: str) -> App:
             raise ValueError("model default names an undeclared model parameter")
         if weights and not execution_context:
             raise ValueError("model outputs require ctx: Context")
+        where = "main return type is"
         returned = annotation(definition.returns, tree) if definition.returns else type(None)
     except Exception as exc:
         raise ConformanceError(
-            "script main types or tool.cozy declarations are invalid",
-            code="script_main_signature",
+            f"script {where} invalid: {exc}", code="script_main_signature"
         ) from exc
     result_type = (
         msgspec.defstruct("_ScriptResult", [("value", returned)], module=__name__)

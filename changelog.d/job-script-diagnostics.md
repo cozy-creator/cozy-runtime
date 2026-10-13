@@ -1,0 +1,1 @@
+Scripts fold `AssetBound` arithmetic (`1 << 30`) with the static reader's evaluator and name the failing parameter; job replies carry the traceback; `Telemetry.log` accepts fields named `name`/`kind`/`value`/`message`; a derive-only model refuses with `model_derive_only`; the executor enables `faulthandler` so a segfault leaves its Python stack.

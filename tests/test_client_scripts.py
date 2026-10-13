@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import importlib
+import socket
+import threading
 import time
+import typing
 from pathlib import Path
 
 import pytest
 
 from cozy_runtime.author import (
+    AssetBound,
     ConformanceError,
     Invocation,
     ModelArtifact,
@@ -16,6 +20,10 @@ from cozy_runtime.author import (
 )
 from cozy_runtime.author._model import _derive_model
 from cozy_runtime.author._script_types import _ScriptSource
+from cozy_runtime.internal.discovery import discover
+from cozy_runtime.internal.executor import Executor
+from cozy_runtime.internal.executor_commands import JobBudget, ModelManifest, RunJob
+from cozy_runtime.internal.seam import Channel
 from native_weights import NativeExecution
 from test_weights_resume_native import _committed
 
@@ -267,3 +275,96 @@ def test_script_injected_contract_refuses_before_execution(
     monkeypatch.syspath_prepend(str(tmp_path))
     with pytest.raises(ConformanceError, match="script"):
         script_app("bad_capability_script")
+
+
+def test_script_asset_bound_folds_constant_arithmetic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    header = "from typing import Annotated\nfrom cozy_runtime.author import AssetBound, FileAsset\n"
+    (tmp_path / "bounded_script.py").write_text(
+        header + "def main(*, report: Annotated[FileAsset, "
+        "AssetBound(max_bytes=1 << 30, max_decoded_bytes=2 << 30)]): pass\n"
+    )
+    (tmp_path / "unbounded_script.py").write_text(
+        header + "def main(*, report: Annotated[FileAsset, "
+        "AssetBound(max_bytes=1 << 30, max_decoded_bytes=limit())]): pass\n"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    request = script_app("bounded_script").get("main").fn.__annotations__["_script_request"]
+    report = typing.get_type_hints(request, include_extras=True)["report"]
+    assert report.__metadata__ == (AssetBound(max_bytes=1 << 30, max_decoded_bytes=2 << 30),)
+    with pytest.raises(ConformanceError, match="'report'.*AssetBound\\(max_decoded_bytes=\\)"):
+        script_app("unbounded_script")
+
+
+@pytest.mark.parametrize(
+    ("body", "code", "frame"),
+    [
+        (
+            "def explode():\n    raise ValueError('boom')\ndef main():\n    explode()\n",
+            "unhandled_exception",
+            "in explode",
+        ),
+        (
+            "from script_models import Probe\ndef main(*, source: Probe):\n    source.decode()\n",
+            "model_derive_only",
+            "in _cozy_require_ready",
+        ),
+    ],
+)
+def test_script_job_failure_reply_carries_its_cause_and_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: str, code: str, frame: str
+) -> None:
+    """Scripts are jobs: a raising main reaches the reply with its frames, and a model it
+    receives is an identity it cannot run, said as such rather than as a readiness race."""
+    script = f"failing_script_{code}"
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "package.toml").write_text(f'[application]\nobject="{script}_entry:app"\n')
+    (project / f"{script}_entry.py").write_text(
+        f'from cozy_runtime.author import script_app\napp = script_app("{script}")\n'
+    )
+    (project / f"{script}.py").write_text(body)
+    (project / "script_models.py").write_text(
+        "from cozy_runtime.author import Loader, Model, uses_components\n"
+        "class Probe(Model[object]):\n"
+        "    def load(self, loader: Loader) -> None: pass\n"
+        "    @uses_components('vae')\n"
+        "    def decode(self) -> None: pass\n"
+    )
+    monkeypatch.syspath_prepend(str(project))
+    found = discover(project)
+    left, right = socket.socketpair()
+    with left, right:
+        peer = Channel(right)
+
+        def drain() -> None:
+            while peer.recv() is not None:
+                pass
+
+        reader = threading.Thread(target=drain, daemon=True)
+        reader.start()
+        executor = Executor(Channel(left), tmp_path)
+        executor.discovered = found
+        executor.surface_names = {surface.name: surface for surface in found.surfaces}
+        manifest = ModelManifest(class_key="Probe", manifest="sha256:" + "0" * 64, length=1)
+        reply = executor.run_job(
+            RunJob(
+                job="main",
+                request_id=script,
+                payload={},
+                deadline_s=10,
+                spool=str(tmp_path / "spool"),
+                application="",
+                package_interface="",
+                budget=JobBudget(gpu_count=0),
+                models={"source": manifest} if "Probe" in body else {},
+            )
+        )
+        left.shutdown(socket.SHUT_WR)
+        reader.join(timeout=5)
+    outcome = reply["outcome"]
+    assert (outcome["terminal"], outcome["code"]) == ("failed", code), outcome
+    assert f'{script}.py", line' in outcome["traceback"] and frame in outcome["traceback"]
+    if code == "model_derive_only":
+        assert "entrypoint" in outcome["message"]

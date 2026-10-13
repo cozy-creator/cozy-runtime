@@ -42,6 +42,7 @@ import argparse
 import contextlib
 import ctypes
 import dataclasses
+import faulthandler
 import functools
 import gc
 import hashlib
@@ -4052,6 +4053,7 @@ class Executor:
                 "code": outcome.code,
                 "message": outcome.message[:2048],
                 "fields": list(outcome.fields),
+                "traceback": outcome.traceback,
             },
             # A torch-free job holds no stream, so quiescence is a STRUCTURAL fact rather
             # than a device query: there is nothing that could still be moving.
@@ -5273,6 +5275,7 @@ def _remember_distributions() -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    faulthandler.enable(all_threads=True)
     parser = argparse.ArgumentParser(description="cozy-runtime device executor")
     parser.add_argument("--socket", default="")
     parser.add_argument("--root", required=True)

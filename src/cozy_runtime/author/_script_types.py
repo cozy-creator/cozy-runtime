@@ -11,6 +11,7 @@ from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._loader import Loader
 from cozy_runtime.author._markers import AssetBound
 from cozy_runtime.author._model import Model
+from cozy_runtime.author._script_metadata import fold_constant
 
 
 class _ScriptSource(Model[object]):
@@ -42,16 +43,19 @@ def annotation(node: ast.expr, tree: ast.Module) -> Any:
     if isinstance(node, ast.Attribute) and not node.attr.startswith("_"):
         return getattr(annotation(node.value, tree), node.attr)
     if isinstance(node, ast.Call) and annotation(node.func, tree) is AssetBound:
-        names = [keyword.arg for keyword in node.keywords]
-        if None not in names and len(set(names)) == len(names):
-            return AssetBound(
-                *(ast.literal_eval(arg) for arg in node.args),
-                **{
-                    keyword.arg: ast.literal_eval(keyword.value)
-                    for keyword in node.keywords
-                    if keyword.arg is not None
-                },
-            )
+
+        def bound(part: ast.expr, field: str) -> Any:
+            try:
+                return fold_constant(part, lambda inner: annotation(inner, tree))
+            except Exception as exc:
+                raise ValueError(f"AssetBound({field}) is not a constant: {exc}") from exc
+
+        if any(keyword.arg is None for keyword in node.keywords):
+            raise ValueError("AssetBound takes no ** splat")
+        return AssetBound(
+            *(bound(arg, f"#{index}") for index, arg in enumerate(node.args, 1)),
+            **{k.arg: bound(k.value, f"{k.arg}=") for k in node.keywords if k.arg is not None},
+        )
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
         return annotation(node.left, tree) | annotation(node.right, tree)
     if isinstance(node, ast.Subscript):

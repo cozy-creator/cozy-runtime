@@ -205,7 +205,7 @@ class Attempt:
         if not self.ring.subject:
             self.ring.subject = self.request_id
 
-    def emit(self, kind: str, name: str, value: Scalar = None, **fields: Scalar) -> Observation:
+    def emit(self, kind: str, name: str, value: Scalar = None, /, **fields: Scalar) -> Observation:
         """One RETAINED record: the bounded ring, its emit-boundary checks, then the lane."""
         with self._recording:
             observation = self.ring.emit(cast("Any", kind), name, value, **fields)
@@ -1252,7 +1252,7 @@ class Telemetry(_Bound):
 
         return on_step
 
-    def log(self, message: str, *, level: str = "info", **fields: Scalar) -> None:
+    def log(self, message: str, /, *, level: str = "info", **fields: Scalar) -> None:
         self._attempt.check_open("Telemetry.log")
         self._attempt.emit("log", message, level, **fields)
 
