@@ -176,7 +176,7 @@ class EventRing:
     def __iter__(self) -> Iterator[Observation]:
         return iter(self.events)
 
-    def emit(self, kind: Kind, name: str, value: Scalar = None, **fields: Scalar) -> Observation:
+    def emit(self, kind: Kind, name: str, value: Scalar = None, /, **fields: Scalar) -> Observation:
         """Validate, bound, stamp and admit ONE record. Refusals are counted and raised."""
         try:
             observation = self._build(kind, name, value, fields)

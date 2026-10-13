@@ -506,6 +506,7 @@ class Model[PipelineT]:
     authority. Model-scoped because it is construction identity."""
 
     _cozy_ready = False
+    _cozy_derive_only = False
     _cozy_loading = False
     _cozy_active: tuple[str, tuple[str, ...]] | None = None
     _cozy_harness: ModelTestHarness | None = None
@@ -699,6 +700,13 @@ class Model[PipelineT]:
 
     def _cozy_require_ready(self, what: str) -> None:
         if not self._cozy_ready:
+            if self._cozy_derive_only:
+                raise CapabilityError(
+                    f"{type(self).__name__}.{what}: a job or script receives this model's "
+                    "identity only, never a running model; call the package's entrypoint "
+                    "function to run it",
+                    code="model_derive_only",
+                )
             raise CapabilityError(
                 f"{type(self).__name__}.{what}: no generation is Ready — construction is "
                 "transactional and nothing is observable before it completes (§1.1)",
@@ -763,8 +771,8 @@ def _derive_model[M: Model[Any]](cls: type[M], checkpoint_ref: str) -> M:
     `AttributeError` that names it. Nothing is intercepted to say so — a `__getattribute__`
     that tested a derive-only flag on EVERY attribute read of EVERY model, serving ones
     included, bought a nicer message for the one case at the cost of a branch on the other
-    million, and `object.__setattr__` walked around it anyway. `load`/`for_request` refuse
-    through the ordinary `not_ready` gate, because no generation is Ready here.
+    million, and `object.__setattr__` walked around it anyway. `for_request` and component
+    methods refuse `model_derive_only` from the `not_ready` gate, because no generation is Ready.
     """
     if not checkpoint_ref.startswith("sha256:") or len(checkpoint_ref) != 71:
         raise ConformanceError(
@@ -785,6 +793,7 @@ def _derive_model[M: Model[Any]](cls: type[M], checkpoint_ref: str) -> M:
         )
     model = object.__new__(cls)
     object.__setattr__(model, "checkpoint_ref", checkpoint_ref)
+    object.__setattr__(model, "_cozy_derive_only", True)
     return model
 
 

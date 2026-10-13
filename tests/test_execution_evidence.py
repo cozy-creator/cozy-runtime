@@ -44,6 +44,7 @@ def generate(ctx: Context, payload: Request, tel: Telemetry) -> Result:
         tel.log("evidence row", index=index)
     tel.log("delivery", complete=True, delivered=payload.steps)
     tel.log("unreadable", shape=[1, 2])
+    tel.log("clash", message="m", name="a", kind="b", value=1)
     fields = {f"k{i}": i for i in range(10)}
     tel.log("m" * 300, seed=2**60, loss=float("nan"), scale=numpy.float32(0.5), **fields)
     tel.metric("loss", float("inf"))
@@ -142,6 +143,14 @@ def test_an_attempt_records_its_rank_setup_and_every_step(executor: Executor) ->
     assert len(ends) == 4 and ends == sorted(ends)
     assert condition["ended_unix_ms"] <= ends[0] <= rank["end_us"] // 1000
     assert sum(ms for _end, ms in denoise["series"]) == pytest.approx(denoise["total_ms"], abs=0.01)
+
+
+def test_a_log_field_may_share_a_name_with_the_record_it_lands_in(executor: Executor) -> None:
+    reply = _invoke(executor, "clash")
+    assert reply["outcome"]["terminal"] == "succeeded", reply["outcome"]
+    [row] = [row for row in reply["observations"] if row["name"] == "clash"]
+    assert (row["kind"], row["value"]) == ("log", "info")
+    assert row["fields"] == {"message": "m", "name": "a", "kind": "b", "value": 1}
 
 
 def test_a_reply_too_large_for_one_frame_sheds_telemetry_and_keeps_its_result(

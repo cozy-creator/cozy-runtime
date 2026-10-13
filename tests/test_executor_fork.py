@@ -122,6 +122,45 @@ def zygote(tmp_path: Path) -> Iterator[tuple[subprocess.Popen[bytes], Channel, d
         process.wait()
 
 
+def test_a_segfaulting_executor_leaves_its_python_stack(tmp_path: Path) -> None:
+    (tmp_path / "segvapp.py").write_text(APP)
+    sys.path.insert(0, str(tmp_path))
+    try:
+        interface = package_interface.build(discover_installed("segvapp:app"))
+    finally:
+        sys.path.remove(str(tmp_path))
+        sys.modules.pop("segvapp", None)
+    (tmp_path / "interface.json").write_text(json.dumps(interface))
+    (tmp_path / "segvapp.py").write_text("import ctypes\nctypes.string_at(0)\n" + APP)
+    (tmp_path / "root").mkdir()
+    listener = _listener(tmp_path / "s.sock")
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            *("-m", "cozy_runtime.internal.executor"),
+            *("--socket", str(tmp_path / "s.sock"), "--root", str(tmp_path / "root")),
+        ],
+        env=_environment(tmp_path),
+        stderr=subprocess.PIPE,
+    )
+    try:
+        channel, _ = _accept(listener)
+        channel.send(
+            {
+                "cmd": "start",
+                "devices": "",
+                "application": "segvapp:app",
+                "package_interface": str(tmp_path / "interface.json"),
+            }
+        )
+        _, stderr = process.communicate(timeout=120)
+    finally:
+        process.kill()
+        process.wait()
+    assert process.returncode == -signal.SIGSEGV
+    assert b"Fatal Python error: Segmentation fault" in stderr and b"Current thread" in stderr
+
+
 def _fork(tmp_path: Path, channel: Channel, name: str, threads: str = "1") -> dict[str, Any]:
     root = tmp_path / name
     root.mkdir()

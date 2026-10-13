@@ -43,6 +43,10 @@ def project(root: Path, code: str) -> Path:
         "def main(*, out: Outputs) -> Annotated[ImageAsset, "
         "AssetBound(media_types=('image/png',))]:\n"
         "    raise RuntimeError('body')\n",
+        "from typing import Annotated\n"
+        "from cozy_runtime.author import AssetBound, ImageAsset\n"
+        "def main(*, image: Annotated[ImageAsset, AssetBound(max_bytes=1 << 30, "
+        "max_decoded_bytes=2**30 + 16 * 1024 * 1024)]): pass\n",
         "# /// script\n# [tool.cozy.weights]\n# checkpoint=4096\n# [tool.cozy.models]\n"
         "# source='owner/model'\n# ///\n"
         "from cozy_runtime.author import Context, Model, ModelArtifact, Telemetry\n"

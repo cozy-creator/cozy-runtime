@@ -204,10 +204,15 @@ def test_a_job_model_is_a_plain_manifest_record() -> None:
     with pytest.raises(AttributeError, match="pipeline"):
         _ = job_model.pipeline
 
-    # And no generation is Ready, which is what refuses the serving surface.
+    # No generation is Ready: the serving surface and component methods say it is an identity.
+    for call in (lambda: job_model.for_request(_ctx()), job_model.denoise):
+        with pytest.raises(CapabilityError) as derive_only:
+            call()
+        assert derive_only.value.code == "model_derive_only"
     with pytest.raises(CapabilityError) as not_ready:
-        job_model.for_request(_ctx())
+        object.__new__(Denoiser).denoise()
     assert not_ready.value.code == "not_ready"
+    assert _generation().denoise() == "denoised"
 
 
 def test_a_saved_output_becomes_a_granted_input(tmp_path: Path) -> None:
