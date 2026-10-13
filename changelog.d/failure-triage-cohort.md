@@ -1,0 +1,1 @@
+Bundle TensorD 0.5.23: failure triage keeps 64 KiB of stderr, names the software that ran and the author's traceback on a poisoned call; one maker per model source. Carries Runtime's failure-naming fixes (streamed media, job/script tracebacks, in-place weight initialization) and 0.23.28's root GPU allocations.
