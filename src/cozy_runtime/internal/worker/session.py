@@ -412,6 +412,44 @@ class Tenant:
 
 
 @dataclass(slots=True)
+class Warmup:
+    """ONE slot's owned executor and the device-free half already warmed on it (cr-150).
+
+    cr-104 established that a construction's expensive prologue — Torch, the runtime's
+    construction modules, the package and the package's own `warmup()` — holds no device
+    lock and moves no byte. This is that prologue's RESULT, banked per slot by
+    `_own_and_warm` and spent by `_prepare_generation`, so that a pod's placements can warm
+    together instead of each waiting for the one in front to finish filling.
+
+    `executor` and `latch` are the two outcomes of owning the process; a warmup that could
+    not run leaves neither behind, and the prepare does the whole thing itself.
+    """
+
+    construction_key: str
+    binding_set: frozenset[str]
+    executor: child.Executor | None = None
+    latch: str = ""
+
+
+def _reuses(
+    executor: child.Executor | None, construction_key: str, binding_set: frozenset[str]
+) -> bool:
+    """Does this live executor ALREADY hold the generation a prepare would build?
+
+    Read by the prepare, which acts on it, and by the warm pre-pass, which skips a slot it
+    is true for — one predicate so the two cannot answer it differently.
+    """
+    return bool(
+        executor is not None
+        and executor.alive()
+        and not executor.poisoned
+        and executor.construction_key == construction_key
+        and executor.prepared_binding_set == binding_set
+        and executor.prepared_model is not None
+    )
+
+
+@dataclass(slots=True)
 class OwnershipFence:
     """WHO may drive this worker, and on WHICH stream (02 §0/§4).
 
@@ -1049,6 +1087,12 @@ class Worker:
         #: worker assigned it; an attempt takes its own placement's lane seat and no other.
         self.hosted: dict[str, HostedPlacement] = {}
         self.pending_hosted: list[dict[str, Any]] = []
+        #: Hosted placements STAGED for the accepted revision and awaiting their first
+        #: prepare. Staging is device-free, so it happens before any placement fills
+        #: (cr-150): everything in here has an executor to warm alongside the primary's.
+        self.staged_hosted: list[HostedPlacement] = []
+        #: What `_own_and_warm` banked per slot, spent by that slot's `_prepare_generation`.
+        self.warmups: dict[str, Warmup] = {}
         #: Job mode has no placement, so it carries its own dispatchability edge (cr-009).
         self.job_ready = False
         #: An activation failure LATCHES for the accepted revision (§8): non-empty means the
@@ -3035,9 +3079,14 @@ class Worker:
             f"{len(candidate.entrypoints)} binding(s) resolved, "
             f"posture={pb.Posture.Name(self.accepted.posture)}",
         )
+        # EVERY PLACEMENT'S DEVICE-FREE HALF, THEN THE FILLS (cr-150). Staging the hosted
+        # placements first costs nothing on the card and buys the whole overlap: their
+        # executors exist before the primary fills, so `prepare_executor` can warm all of
+        # them at once. The fills below are as serial as they have always been.
+        self._stage_pending_hosted(revision)
         self.activate_executor()
         if self._placement_dispatchable(candidate.placement_id):
-            self._reconcile_hosted(revision)
+            self._activate_staged_hosted(revision)
 
     def _retire_hosted(self, keep: set[str]) -> None:
         """Remove only placements absent from the complete desired set."""
@@ -3069,12 +3118,33 @@ class Worker:
                     continue
             hosted.supervision.close()
             del self.hosted[placement_id]
+            self.warmups.pop(placement_id, None)
+            self.staged_hosted = [
+                staged
+                for staged in self.staged_hosted
+                if staged.placement.placement_id != placement_id
+            ]
             self._release_lane(placement_id)
             self.bump_admission(f"placement {placement_id!r} removed")
 
     def _reconcile_hosted(self, revision: int) -> None:
         """Converge the additional placements without disturbing the primary one."""
 
+        self._stage_pending_hosted(revision)
+        self._own_and_warm(self._staged_tenants())
+        self._activate_staged_hosted(revision)
+
+    def _stage_pending_hosted(self, revision: int) -> None:
+        """Fetch, install, resolve and PLACE every additional placement — no card touched.
+
+        Split out of the old `_activate_hosted` (cr-150). None of this holds a device lock
+        or moves a byte, so it runs BEFORE any placement of the generation fills rather than
+        after the primary's: every placement then has an executor that can warm alongside
+        the others. What it costs is that a hosted placement's lane is now chosen against a
+        card the primary has not filled yet; over-commitment on a shared lane is what
+        `_make_room`'s residency arbitration exists to answer, and on a one-lane worker
+        there is nothing to choose.
+        """
         if revision != self.accepted.accepted_desired_state_revision:
             return
         desired = {
@@ -3102,8 +3172,25 @@ class Worker:
                 supervision=self._new_placement_supervision(placement_id),
             )
             self.hosted[placement_id] = hosted
-            self._activate_hosted(hosted, revision)
+            if self._stage_hosted(hosted, revision):
+                self.staged_hosted.append(hosted)
         self.pending_hosted = []
+
+    def _staged_tenants(self) -> list[Tenant]:
+        """The staged-and-unprepared hosted placements, as the prepare reads them."""
+        return [self._tenant(hosted.placement.placement_id) for hosted in self.staged_hosted]
+
+    def _activate_staged_hosted(self, revision: int) -> None:
+        """FILL each staged hosted placement, one at a time, in the order it was staged.
+
+        The device half is exactly as serial as it has always been: `_prepare_generation`
+        takes its lane's device lock for the fill and nothing here overlaps two of them.
+        Only the warmups that ran before this point overlapped.
+        """
+        while self.staged_hosted:
+            if revision != self.accepted.accepted_desired_state_revision:
+                return
+            self._prepare_hosted_executor(self.staged_hosted.pop(0))
         if (
             self.placement is not None
             and self._placement_dispatchable(self.placement.placement_id)
@@ -3115,14 +3202,19 @@ class Worker:
             self.accepted.converged_revision = revision
         self._settle()
 
-    def _activate_hosted(self, hosted: HostedPlacement, revision: int) -> None:
-        """Acquire, place and activate one hosted placement in its own uv environment."""
+    def _stage_hosted(self, hosted: HostedPlacement, revision: int) -> bool:
+        """Acquire and place one hosted placement in its own uv environment. Staged?
 
+        The prepare is NOT here (cr-150): a placement that returns True is STAGED and its
+        fill is `_activate_staged_hosted`'s, after every placement of the generation has
+        warmed. False means it refused before the card was ever in question, latched on its
+        own placement, with the others left exactly where they are.
+        """
         placement = hosted.placement
         placement.materialization = pb.MaterializationState.MATERIALIZATION_STATE_MATERIALIZING
         acquired = self._acquire(placement, revision)
         if acquired is None or revision != self.accepted.accepted_desired_state_revision:
-            return
+            return False
         bindings = dict(acquired.bindings)
         if not bindings:
             # A placement with nothing to serve. Model-bearing hosted placements are admitted
@@ -3145,7 +3237,7 @@ class Worker:
                 f"{hosted.latched}",
             )
             self._settle()
-            return
+            return False
         installed = acquired.installed
         if installed is not None:
             hosted.supervision.use_environment(str(installed.python), installed.content_digest)
@@ -3156,9 +3248,9 @@ class Worker:
             placement.materialization = pb.MaterializationState.MATERIALIZATION_STATE_FAILED
             hosted.latched = "device_lane_infeasible"
             self._settle()
-            return
+            return False
         placement.materialization = pb.MaterializationState.MATERIALIZATION_STATE_STAGED
-        self._prepare_hosted_executor(hosted)
+        return True
 
     def _prepare_hosted_executor(self, hosted: HostedPlacement) -> None:
         """ACTIVATE one hosted placement through the generation prepare the primary uses.
@@ -3684,7 +3776,9 @@ class Worker:
         # prepare that produced it.
         self.failed_bindings.clear()
         self.set_serving(pb.ServingState.SERVING_STATE_ACTIVATING)
-        latch, reused = self._prepare_generation(self._tenant(self.placement.placement_id))
+        primary = self._tenant(self.placement.placement_id)
+        self._own_and_warm([primary, *self._staged_tenants()])
+        latch, reused = self._prepare_generation(primary)
         if latch:
             self.latched = latch
             if (
@@ -3749,8 +3843,12 @@ class Worker:
 
         Returns `(latch, reused)`: an empty latch means at least one binding is ready;
         `reused` means the live generation already held this construction and nothing was
-        prepared. A model-bearing prepare holds the lane's DEVICE lock: an attempt on a
-        co-tenant cannot be on the card while this prepare vacates it or fills beside it.
+        prepared. A model-bearing prepare holds the lane's DEVICE lock FOR ITS FILL HALF
+        ONLY (cr-104): an attempt on a co-tenant cannot be on the card while this prepare
+        vacates it or fills beside it, but the half before that — owning the process,
+        importing Torch and the package, running the package's own `warmup()` — takes no
+        lock and touches no device memory. `_own_and_warm` may already have run it, in
+        which case this spends the banked `Warmup` rather than repeating it (cr-150).
         """
         by_construction: dict[str, list[DeclaredBinding]] = {}
         for binding in tenant.bindings.values():
@@ -3785,14 +3883,9 @@ class Worker:
         construction_key, group = next(iter(by_construction.items()))
         binding_set = frozenset(binding.entrypoint_binding_digest for binding in group)
         executor = tenant.supervision.current
-        if (
-            executor is not None
-            and executor.alive()
-            and not executor.poisoned
-            and executor.construction_key == construction_key
-            and executor.prepared_binding_set == binding_set
-            and executor.prepared_model is not None
-        ):
+        if _reuses(executor, construction_key, binding_set):
+            # `_reuses` is the whole of the condition; these restate what it promises.
+            assert executor is not None and executor.prepared_model is not None
             executor.ready_bindings.clear()
             for binding in group:
                 executor.ready_bindings.add(binding.entrypoint_binding_digest)
@@ -3806,22 +3899,128 @@ class Worker:
                 return "", True
             return "logical model digest mismatch", False
 
-        first = group[0]
         # THE CARD IS TAKEN LATE (cr-104). Owning the process and warming its device-free
         # half hold no device bytes and need no lock; only the half that MOVES bytes does.
         # Held for the whole prepare, the lock kept a co-tenant off a card that the tenant
         # taking it would not touch for another 4-20 s of Torch, runtime and package
         # imports -- and `_make_room` had already vacated that co-tenant to get there, so
         # the card was emptied and then left idle for the length of an import.
+        warm = self.warmups.pop(tenant.slot, None)
+        if warm is None or (warm.construction_key, warm.binding_set) != (
+            construction_key,
+            binding_set,
+        ):
+            # No pre-pass ran for this slot, or it warmed a construction this prepare is no
+            # longer doing. Own and warm here, exactly as the single serial walk always did.
+            warm = self._warm(tenant, group, construction_key, binding_set)
+        if warm.executor is None:
+            return warm.latch, False
+        lock = contextlib.nullcontext() if group[0].weightless else tenant.lane.device
+        with lock:
+            return self._prepare_construction(
+                tenant, group, construction_key, binding_set, warm.executor
+            )
+
+    def _own_and_warm(self, tenants: list[Tenant]) -> None:
+        """OWN EVERY EXECUTOR, THEN WARM EVERY DEVICE-FREE HALF AT ONCE (cr-150).
+
+        cr-104 took the card late; this stops the halves that do not need it from queueing.
+        Measured on a rented L40, a pod serving two models spent 12.2 s importing Torch, the
+        runtime's construction modules, the package and running the package's own `warmup()`
+        for one placement, then 11.8 s doing the same for the other, one after the other,
+        out of a 47 s cold boot. Those two prologues have nothing to say to each other.
+
+        What stays serial is everything that touches the card. The SPAWNS run one at a time
+        under each lane's device lock — a replacement kills a process holding device bytes —
+        and the FILLS run one at a time under it in `_prepare_generation`, in the order the
+        placements were staged. Two prepares are never on the card together.
+
+        Every failure here is a MISSED SAVING, never a refusal: a slot whose warmup raises,
+        or whose executor is lost, has its prepare do the whole thing itself and type its own
+        refusal under the lock. One placement's warmup cannot fail another's activation.
+        """
+        self.warmups.clear()
+        halves: list[tuple[Tenant, child.Executor, DeclaredBinding]] = []
+        for tenant in tenants:
+            found = self._warmable(tenant)
+            if found is None:
+                continue
+            group, construction_key, binding_set = found
+            first = group[0]
+            lock = contextlib.nullcontext() if first.weightless else tenant.lane.device
+            with lock:
+                owned = self._own_executor(tenant, group)
+            if isinstance(owned, str):
+                self.warmups[tenant.slot] = Warmup(construction_key, binding_set, latch=owned)
+                continue
+            self.warmups[tenant.slot] = Warmup(construction_key, binding_set, executor=owned)
+            if not first.weightless:
+                halves.append((tenant, owned, first))
+        threads = [
+            threading.Thread(
+                target=self._warm_half,
+                args=half,
+                name=f"warm-{half[0].slot}"[:15],
+                daemon=True,
+            )
+            for half in halves
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+    def _warmable(self, tenant: Tenant) -> tuple[list[DeclaredBinding], str, frozenset[str]] | None:
+        """This tenant's ONE construction, when a fresh one is what its prepare will do.
+
+        Nothing is decided here that `_prepare_generation` does not decide again on its own:
+        a tenant with no single construction, and one whose live executor already holds the
+        construction the prepare will find, are both left entirely to it.
+        """
+        by_construction: dict[str, list[DeclaredBinding]] = {}
+        for binding in tenant.bindings.values():
+            by_construction.setdefault(binding.construction_key(), []).append(binding)
+        if len(by_construction) != 1:
+            return None
+        construction_key, group = next(iter(by_construction.items()))
+        binding_set = frozenset(binding.entrypoint_binding_digest for binding in group)
+        if _reuses(tenant.supervision.current, construction_key, binding_set):
+            return None
+        return group, construction_key, binding_set
+
+    def _warm(
+        self,
+        tenant: Tenant,
+        group: list[DeclaredBinding],
+        construction_key: str,
+        binding_set: frozenset[str],
+    ) -> Warmup:
+        """Own one tenant's executor and warm its device-free half, here on this thread."""
+        first = group[0]
         lock = contextlib.nullcontext() if first.weightless else tenant.lane.device
         with lock:
             owned = self._own_executor(tenant, group)
         if isinstance(owned, str):
-            return owned, False
+            return Warmup(construction_key, binding_set, latch=owned)
         if not first.weightless:
-            self._preconstruct(tenant, owned, first)
-        with lock:
-            return self._prepare_construction(tenant, group, construction_key, binding_set, owned)
+            self._warm_half(tenant, owned, first)
+        return Warmup(construction_key, binding_set, executor=owned)
+
+    def _warm_half(self, tenant: Tenant, executor: child.Executor, first: DeclaredBinding) -> None:
+        """`_preconstruct` with EVERY defect contained: a saving, never a refusal (cr-150).
+
+        `_preconstruct` already returns nothing and latches nothing; this keeps that true
+        when it runs on its own thread, where a raised exception would otherwise be lost
+        rather than reported, and keeps one slot's bad warmup off every other slot.
+        """
+        try:
+            self._preconstruct(tenant, executor, first)
+        except Exception as exc:
+            self.note(
+                "boot",
+                f"{tenant.slot!r}: the device-free warmup did not run "
+                f"({type(exc).__name__}: {exc}); its prepare pays for it under the lock"[:256],
+            )
 
     def _own_executor(self, tenant: Tenant, group: list[DeclaredBinding]) -> child.Executor | str:
         """Spawn, keep or replace this tenant's executor. Returns it, or a latch string.

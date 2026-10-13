@@ -767,8 +767,17 @@ def fence_supervised_worker_lanes() -> list[str]:
     `SessionState._lane` is the one answer: it turns any lane death into
     `WORKER_PHASE_FAILED`, which every owner already reads, and closes a non-persistent
     host's stream so a one-shot run EXITS. This fence says no thread may be started around
-    it — `target=` in the session is a `self._lane(...)` call or it is a hole.
+    it — `target=` in the session is a `self._lane(...)` call or it is one of the JOINED
+    helpers below, or it is a hole.
+
+    THE JOINED EXEMPTION (cr-150). A thread whose starter joins it before returning is not a
+    lane: it produces no terminal, nobody waits on it over the wire, and its caller carries
+    on whether it worked or not. Making such a thread's death `WORKER_PHASE_FAILED` would be
+    the opposite of correct for the one case that exists — a device-free warmup, whose every
+    failure is a missed saving and never a refusal. Each name here must be a method that
+    contains every exception itself AND be joined on the line that starts it.
     """
+    joined = frozenset({"_warm_half"})
     bad: list[str] = []
     path = ROOT / SESSION
     tree = ast.parse(path.read_text())
@@ -784,7 +793,7 @@ def fence_supervised_worker_lanes() -> list[str]:
             isinstance(target, ast.Call)
             and isinstance(target.func, ast.Attribute)
             and target.func.attr == "_lane"
-        )
+        ) or (isinstance(target, ast.Attribute) and target.attr in joined)
         if not supervised:
             bad.append(
                 f"{SESSION}:{node.lineno}: a worker lane is started outside `self._lane(...)` "

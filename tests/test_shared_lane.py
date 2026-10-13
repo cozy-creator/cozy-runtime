@@ -35,9 +35,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable, Iterator
+import time
+from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar, NamedTuple
 
 import pytest
 
@@ -160,16 +161,54 @@ def write_tenant_store(root: Path, *, blocks: int, scale: int = 1) -> TenantStor
     return TenantStore(root=store, weight_bytes=weight_bytes, config=config)
 
 
+class Stores(Mapping[str, TenantStore]):
+    """Two tenant releases: one the card holds two of, one it does not (beside a neighbour).
+
+    Written ON FIRST USE. `large` is 48 blocks — a couple of gigabytes of synthetic
+    checkpoint through `tfs` — and an arm that only needs the small one has no business
+    paying for it.
+    """
+
+    SIZES: ClassVar[dict[str, dict[str, int]]] = {
+        "small": {"blocks": 2, "scale": 4},
+        "large": {"blocks": 48},
+    }
+
+    def __init__(self, base: Path) -> None:
+        self.base = base
+        self.written: dict[str, TenantStore] = {}
+
+    def __getitem__(self, name: str) -> TenantStore:
+        if name not in self.written:
+            self.written[name] = write_tenant_store(self.base / name, **self.SIZES[name])
+        return self.written[name]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.SIZES)
+
+    def __len__(self) -> int:
+        return len(self.SIZES)
+
+
 @pytest.fixture(scope="module")
-def stores(tmp_path_factory: pytest.TempPathFactory) -> dict[str, TenantStore]:
-    """Two tenant releases: one the card holds two of, one it does not (beside a neighbour)."""
+def stores(tmp_path_factory: pytest.TempPathFactory) -> Stores:
     if NO_TENANT:
         pytest.skip(NO_TENANT)
-    base = tmp_path_factory.mktemp("tenant")
-    return {
-        "small": write_tenant_store(base / "small", blocks=2, scale=4),
-        "large": write_tenant_store(base / "large", blocks=48),
-    }
+    return Stores(tmp_path_factory.mktemp("tenant"))
+
+
+class Note(NamedTuple):
+    """One line the worker narrated, and WHEN the harness heard it.
+
+    The clock is the test's, never the worker's: `at` is read the instant `note` is called,
+    so a note that reports its own duration (`... in 12225 ms`) describes the closed
+    interval `[at - duration, at]` of real time. That is the only way an arm can ask
+    whether two pieces of the worker's activity happened AT ONCE.
+    """
+
+    kind: str
+    step: str
+    at: float
 
 
 def _config(home: Path) -> RuntimeConfig:
@@ -474,7 +513,7 @@ class TwoTenantOwner(LocalRecordOwner):
 
 def _drive(
     store: TenantStore, turns: list[Turn], root: Path, package: Path = PACKAGE
-) -> tuple[TwoTenantOwner, Worker, list[tuple[str, str]]]:
+) -> tuple[TwoTenantOwner, Worker, list[Note]]:
     """Two placements of `corpus/tenant` on the one-card worker, `turns` dispatched in order."""
     config = _config(root / "home")
     found = discover(package)
@@ -521,11 +560,11 @@ def _drive(
     )
     worker = Worker(config, options, owner.host)
     holder.append(worker)
-    notes: list[tuple[str, str]] = []
+    notes: list[Note] = []
     narrate = worker.note
 
     def note(kind: str, step: str) -> None:
-        notes.append((kind, step))
+        notes.append(Note(kind, step, time.perf_counter()))
         narrate(kind, step)
 
     worker.note = note  # type: ignore[method-assign]
@@ -543,7 +582,7 @@ def _turn(placement_id: str, request_id: str, seed: int) -> Turn:
     )
 
 
-def _vacates(notes: list[tuple[str, str]]) -> list[tuple[str, str, int, int, int]]:
+def _vacates(notes: list[Note]) -> list[tuple[str, str, int, int, int]]:
     """(victim, for-whom, freed, driver free before, driver free after) per vacate note."""
     found = []
     # The duration is part of the line and part of the pattern: half of a model swap is
@@ -553,24 +592,24 @@ def _vacates(notes: list[tuple[str, str]]) -> list[tuple[str, str, int, int, int
         r"lane-0: '([^']+)' \(epoch \d+ pid \d+\) vacated (\d+) B in [\d.]+ ms for "
         r"'([^']+)' on .*?the driver reports (\d+) -> (\d+) B free"
     )
-    for kind, step in notes:
-        if kind != "residency":
+    for note in notes:
+        if note.kind != "residency":
             continue
-        match = pattern.search(step)
+        match = pattern.search(note.step)
         if match:
             victim, freed, whom, before, after = match.groups()
             found.append((victim, whom, int(freed), int(before), int(after)))
     return found
 
 
-def _restores(notes: list[tuple[str, str]]) -> list[str]:
+def _restores(notes: list[Note]) -> list[str]:
     """Every restore note, so the arm that produces one can check what it REPORTS.
 
     A swap is a vacate and a re-fill, and until cr-100 neither reported a duration — the
     cost of alternating two models on one card was inferred from a CONSTRUCTION's fill leg,
     which is a different act under different conditions.
     """
-    return [step for kind, step in notes if kind == "residency" and " restored " in step]
+    return [note.step for note in notes if note.kind == "residency" and " restored " in note.step]
 
 
 # --------------------------------------------------------------------------- the co-fit arm
@@ -578,7 +617,7 @@ def _restores(notes: list[tuple[str, str]]) -> list[str]:
 
 @needs_tenant
 def test_two_tenants_that_fit_hold_the_card_together_and_nothing_moves(
-    stores: dict[str, TenantStore],
+    stores: Stores,
 ) -> None:
     """THE CO-FIT ARM. Two small tenants on lane 0: both prepare resident, three attempts
     alternate between them, no vacate is ever issued, both rows keep their weights, and the
@@ -598,10 +637,87 @@ def test_two_tenants_that_fit_hold_the_card_together_and_nothing_moves(
             assert sum(row["resident"].values()) >= store.weight_bytes * 0.99, (slot, row)
             assert row["evicted"] == {}, (slot, row)
     assert worker.lanes.lanes[0].placements == {"plc-p", "plc-q"}
-    assigned = [step for kind, step in notes if kind == "materialization" and "assigned" in step]
+    assigned = [
+        note.step for note in notes if note.kind == "materialization" and "assigned" in note.step
+    ]
     assert any(
         "'plc-q' assigned to lane-0" in step and "shares the device" in step for step in assigned
     ), assigned
+
+
+# --------------------------------------------------------------------------- the overlap arm
+
+
+_WARMED = re.compile(r"'([^']+)': preconstruct warmed epoch \d+ in ([\d.]+) ms OFF the lane lock")
+_FILLED = re.compile(r"'([^']+)' prepared \d+ binding\(s\) in ([\d.]+) ms — ")
+
+
+def _spans(notes: list[Note], pattern: re.Pattern[str]) -> dict[str, tuple[float, float]]:
+    """Per slot, the REAL-TIME interval a self-timing note describes.
+
+    The worker reports each of these when it finishes and says how long it took, so the
+    interval is `[heard - reported, heard]`. Nothing here is instrumentation added for the
+    test: both lines are what an operator reads out of the pod's own activity.
+    """
+    spans: dict[str, tuple[float, float]] = {}
+    for note in notes:
+        match = pattern.search(note.step)
+        if match:
+            spans[match.group(1)] = (note.at - float(match.group(2)) / 1000, note.at)
+    return spans
+
+
+@needs_tenant
+def test_two_placements_warm_their_device_free_halves_at_once(
+    stores: Stores,
+) -> None:
+    """THE OVERLAP ARM (cr-150). Two model-bearing placements boot on one worker. Each one's
+    device-free half — Torch, the runtime's construction modules, the package and the
+    package's own `warmup()` — holds no device lock and moves no byte (cr-104), so the two
+    of them run AT ONCE; each one's fill holds the lane's device lock, so those two never do.
+
+    Both facts are read off the worker's own activity, from lines that already existed
+    before this change and already report their own duration. `preconstruct warmed ... in N
+    ms` and `prepared K binding(s) in M ms` each name an interval of real time; the arm
+    asserts that the first pair INTERSECTS and the second pair does not. Under the old shape
+    — one serial walk per placement — the warm pair could not intersect, which is what makes
+    this an assertion about the effect rather than about the call.
+    """
+    store = stores["small"]
+    turns = [_turn("plc-p", "p-1", 1), _turn("plc-q", "q-1", 2)]
+    with _workspace() as root:
+        owner, _worker, notes = _drive(store, turns, root)
+    assert owner.ended == "terminal", (owner.ended, owner.error, owner.refusals)
+    assert [turn.outcome["status"] for turn in owner.turns] == [1, 1], [
+        turn.outcome for turn in owner.turns
+    ]
+    warms = _spans(notes, _WARMED)
+    fills = _spans(notes, _FILLED)
+    assert set(warms) == {"plc-p", "plc-q"}, [note.step for note in notes]
+    assert set(fills) == {"plc-p", "plc-q"}, [note.step for note in notes]
+    (p_start, p_end), (q_start, q_end) = warms["plc-p"], warms["plc-q"]
+    overlap = min(p_end, q_end) - max(p_start, q_start)
+    shorter = min(p_end - p_start, q_end - q_start)
+    # THE ACTIVATION WALL both halves live inside: the first thing either placement did to
+    # its executor, to the last byte either of them filled.
+    wall = max(p_end, q_end, *(end for _s, end in fills.values())) - min(p_start, q_start)
+    print(
+        f"[cr-150] warm plc-p {p_end - p_start:.1f} s, plc-q {q_end - q_start:.1f} s, "
+        f"overlap {overlap:.1f} s; fills "
+        + ", ".join(f"{slot} {end - start:.1f} s" for slot, (start, end) in sorted(fills.items()))
+        + f"; activation wall {wall:.1f} s",
+        file=sys.stderr,
+        flush=True,
+    )
+    # THE HALVES OVERLAP. Not "a thread was started" — the two placements were inside their
+    # own device-free halves at the same time, for most of the shorter one. A serial walk
+    # scores exactly zero here; the half is what the fraction guards against, so that a
+    # sliver of accidental intersection could never pass for concurrency.
+    assert overlap >= shorter / 2, (warms, overlap, shorter)
+    # AND THE FILLS DO NOT. Only the half that holds nothing overlaps; the lane's device
+    # lock still means one prepare on the card at a time.
+    (f_p, f_q) = fills["plc-p"], fills["plc-q"]
+    assert min(f_p[1], f_q[1]) <= max(f_p[0], f_q[0]), fills
 
 
 # --------------------------------------------------------------------------- the swap arm
@@ -609,7 +725,7 @@ def test_two_tenants_that_fit_hold_the_card_together_and_nothing_moves(
 
 @needs_tenant
 def test_two_tenants_that_do_not_fit_take_turns_on_the_card(
-    stores: dict[str, TenantStore],
+    stores: Stores,
 ) -> None:
     """THE SWAP ARM — the owner's words made a proof. Beside a neighbour that leaves the
     card room for ONE tenant, an attempt for P finds Q resident: Q vacates (the driver's
@@ -690,15 +806,15 @@ def test_two_tenants_that_do_not_fit_take_turns_on_the_card(
     warmed = re.compile(r"'([^']+)': preconstruct warmed epoch \d+ in [\d.]+ ms OFF the lane lock")
     vacated_for = re.compile(r"vacated \d+ B in [\d.]+ ms for '([^']+)'")
     sequence: list[tuple[str, str]] = []
-    for _kind, step in notes:
-        warm = warmed.search(step)
+    for note in notes:
+        warm = warmed.search(note.step)
         if warm:
             sequence.append(("warmed", warm.group(1)))
             continue
-        vacate = vacated_for.search(step)
+        vacate = vacated_for.search(note.step)
         if vacate:
             sequence.append(("vacated-for", vacate.group(1)))
-    assert [row for row in sequence if row[0] == "warmed"], [step for _k, step in notes]
+    assert [row for row in sequence if row[0] == "warmed"], [note.step for note in notes]
     for index, (event, slot) in enumerate(sequence):
         if event != "vacated-for":
             continue
@@ -753,8 +869,8 @@ def test_two_tenants_that_do_not_fit_take_turns_on_the_card(
     for turn in owner.turns[1:]:
         notes_for = turn.rows[turn.placement_id]["baseline_notes"]
         assert any("declared residency transition" in note for note in notes_for), notes_for
-    assert all("ledger_unreconciled" not in step for _kind, step in notes), [
-        step for _kind, step in notes if "ledger_unreconciled" in step
+    assert all("ledger_unreconciled" not in note.step for note in notes), [
+        note.step for note in notes if "ledger_unreconciled" in note.step
     ]
 
 
@@ -763,7 +879,7 @@ def test_two_tenants_that_do_not_fit_take_turns_on_the_card(
 
 @needs_tenant
 def test_a_second_tenant_takes_another_lane_when_one_has_room(
-    stores: dict[str, TenantStore],
+    stores: Stores,
 ) -> None:
     """DIFFERENT LANES (cr-066's item, lifted here). On a two-lane worker the primary
     tenant prepares for real on lane 0; a second model-bearing placement is assigned to
