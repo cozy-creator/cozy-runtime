@@ -298,9 +298,11 @@ declares none, site-packages is never a root, and a sibling package supplies TYP
 own callables are its own, never scanned as registrations (cr-117).
 
 A generated SCRIPT app — Creator's `app = script_app("<module>")` adapter — is read the same
-way: the adapter's one job is fixed, so all that varies is whether the script has a valid
-`main`, and `author/_script.py`'s `script_signature` is the ONE definition of that shape, run
-by the adapter and the reader over the same parsed tree.
+way. It registers the script's one `main` as a package author would: served (an entrypoint,
+constructed Model slots) when it runs Model slots, else a job; `[tool.cozy.models]` is its
+default ladder. `author/_script_metadata.py` is the ONE definition of that shape, run by the
+adapter and the reader over the same parsed tree. Every attempt, served or job, may call
+children: the executor's Start carries the call interfaces.
 
 The reader is also what the DEVELOPMENT placement is built from (the worker session's own
 staging): it supervises and does not execute, so it reads the source and takes its model

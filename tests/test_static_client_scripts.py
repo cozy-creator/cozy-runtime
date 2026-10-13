@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import typing
 from pathlib import Path
 
 import pytest
@@ -48,7 +49,7 @@ def project(root: Path, code: str) -> Path:
         "def main(*, image: Annotated[ImageAsset, AssetBound(max_bytes=1 << 30, "
         "max_decoded_bytes=2**30 + 16 * 1024 * 1024)]): pass\n",
         "# /// script\n# [tool.cozy.weights]\n# checkpoint=4096\n# [tool.cozy.models]\n"
-        "# source='owner/model'\n# ///\n"
+        "# source='owner/model@1.0/bf16'\n# ///\n"
         "from cozy_runtime.author import Context, Model, ModelArtifact, Telemetry\n"
         "def main(ctx: Context, *, source: Model[object],\n"
         "         tel: Telemetry) -> ModelArtifact:\n"
@@ -71,6 +72,55 @@ def test_static_main_equals_execution_adapter(tmp_path: Path, body: str) -> None
         sys.modules.update(previous)
     actual = static_interface.build(root)
     assert package_interface.canonical_bytes(actual) == package_interface.canonical_bytes(expected)
+
+
+@pytest.mark.parametrize(
+    ("metadata", "ladder"),
+    [
+        ("", None),
+        (
+            "# /// script\n# [tool.cozy.models]\n# model = 'acme/probe@1.0/fp8'\n# ///\n",
+            [{"gpu": "*", "lane": "acme/probe@1.0/fp8"}],
+        ),
+        (
+            "# /// script\n# [tool.cozy.models]\n"
+            "# model = [{gpu = 'H100', lane = 'probe@1.0/fp8'},\n"
+            "#          {gpu = '*', lane = 'probe@1.0/bf16'}]\n# ///\n",
+            [{"gpu": "H100", "lane": "probe@1.0/fp8"}, {"gpu": "*", "lane": "probe@1.0/bf16"}],
+        ),
+    ],
+)
+def test_a_script_that_runs_a_model_slot_is_served_with_its_default_ladder(
+    tmp_path: Path, metadata: str, ladder: list[dict[str, str]] | None
+) -> None:
+    root = project(
+        tmp_path,
+        metadata + "from script_models import Probe\n"
+        "from cozy_runtime.author import Outputs\n"
+        "async def main(ctx, *, model: Probe, out: Outputs) -> int:\n"
+        "    return model.decode()\n",
+    )
+    (root / "script_models.py").write_text(
+        "from cozy_runtime.author import Loader, Model, uses_components\n"
+        "class Probe(Model[object]):\n"
+        "    def load(self, loader: Loader) -> None: pass\n"
+        "    @uses_components('vae')\n"
+        "    def decode(self) -> int: return 1\n"
+    )
+    modules = ("cozy_script", "cozy_script_entry", "script_models")
+    previous = {name: sys.modules.pop(name) for name in modules if name in sys.modules}
+    try:
+        expected = package_interface.build(discover(root))
+    finally:
+        for name in modules:
+            sys.modules.pop(name, None)
+        sys.modules.update(previous)
+    actual = static_interface.build(root)
+    assert package_interface.canonical_bytes(actual) == package_interface.canonical_bytes(expected)
+    assert actual["jobs"] == []
+    (main,) = typing.cast(list[dict[str, typing.Any]], actual["entrypoints"])
+    assert main["invocable"]["module"] == "cozy_script" and main["invocable"]["export"] == "main"
+    assert main["models"][0].get("default_ladder") == ladder
 
 
 def test_captured_model_source_and_pth_are_never_executed(tmp_path: Path) -> None:
@@ -105,9 +155,9 @@ def test_captured_model_source_and_pth_are_never_executed(tmp_path: Path) -> Non
         f"import pathlib; pathlib.Path({str(marker)!r}).touch()\n{library}\n"
     )
     document = static_interface.build(root, environment_python=binary)
-    jobs = document["jobs"]
-    assert isinstance(jobs, list) and isinstance(jobs[0], dict)
-    models = jobs[0]["models"]
+    served = document["entrypoints"]
+    assert document["jobs"] == [] and isinstance(served, list) and isinstance(served[0], dict)
+    models = served[0]["models"]
     assert isinstance(models, list) and isinstance(models[0], dict)
     model = models[0]
     assert model["class"] == "Probe"

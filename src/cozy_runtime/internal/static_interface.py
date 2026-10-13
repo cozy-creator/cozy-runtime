@@ -63,7 +63,7 @@ from cozy_runtime.author._script_metadata import (
     fold_constant,
     main_definition,
 )
-from cozy_runtime.author._services import SERVICES
+from cozy_runtime.author._services import JOB_ONLY, SERVICES
 from cozy_runtime.author._signature import AssetsBinding, _classify, assets_binding, assets_payload
 from cozy_runtime.author._walker import is_struct
 from cozy_runtime.internal.bindings import read_table
@@ -1273,7 +1273,7 @@ def _build(
     app = reader.lookup(entry, attribute, entry.tree)
     if isinstance(app, Assigned) and _is_script_call(reader, app):
         return package_interface.assemble(
-            application, [("job", _script_doc(reader, app))], bindings, installed=installed
+            application, [_script_doc(reader, app)], bindings, installed=installed
         )
     if not (isinstance(app, Assigned) and _is_app_call(reader, app)):
         raise StaticRefusal(
@@ -1848,7 +1848,7 @@ def _script_annotation(reader: Reader, module: Module, node: ast.expr) -> ast.ex
     return node
 
 
-def _script_doc(reader: Reader, app: Assigned) -> dict[str, Json]:
+def _script_doc(reader: Reader, app: Assigned) -> tuple[package_interface.Kind, dict[str, Json]]:
     call = app.value
     assert isinstance(call, ast.Call)
     if (
@@ -1867,13 +1867,15 @@ def _script_doc(reader: Reader, app: Assigned) -> dict[str, Json]:
     except author.ConformanceError as exc:
         reader.refuse(module, module.tree.body[0] if module.tree.body else call, str(exc))
     try:
-        defaults, weights, accelerator = declarations(module.source.encode())
-    except (ValueError, TypeError) as exc:
+        declared, weights, accelerator = declarations(module.source.encode())
+        defaults = model_defaults(declared)
+    except (ValueError, TypeError, author.ConformanceError) as exc:
         reader.refuse(module, fn, f"invalid script metadata: {exc}")
     models: list[dict[str, Json]] = []
     payload_fields: list[tuple[str, type]] = []
     model_names: set[str] = set()
     services: set[str] = set()
+    sources = False
     native_context = False
     for arg in [*fn.args.posonlyargs, *fn.args.args, *fn.args.kwonlyargs]:
         if arg.arg == "ctx":
@@ -1896,6 +1898,7 @@ def _script_doc(reader: Reader, app: Assigned) -> dict[str, Json]:
                 if isinstance(node, ast.Subscript):
                     reader.translate(module, node.slice)
                 spec = ModelSpec("_ScriptSource", "refuse", "refuse", (), {})
+                sources = True
             else:
                 service = next(
                     (key for key, cls in SERVICES.items() if found.key == "author." + cls.__name__),
@@ -1935,10 +1938,10 @@ def _script_doc(reader: Reader, app: Assigned) -> dict[str, Json]:
                 spec.fusion,
                 spec.components,
                 spec.sequence_parallel,
+                defaults=defaults.get(arg.arg, ()),
             )
         )
-    if set(defaults) - model_names:
-        reader.refuse(module, fn, "script model default names an undeclared model")
+    check_model_arguments(defaults, sorted(model_names))
     if "weights_read" in services and not models:
         reader.refuse(module, fn, "script WeightsReader requires a model input")
     if weights and not native_context:
@@ -1955,14 +1958,27 @@ def _script_doc(reader: Reader, app: Assigned) -> dict[str, Json]:
         if returned is not type(None)
         else msgspec.defstruct("_ScriptCompleted", [])
     )
-    return package_interface.callable_doc(
+    # The adapter's choice, read the same way: Model slots it runs are served.
+    job = bool(weights) or sources or bool(services & JOB_ONLY) or not models
+    payload = msgspec.defstruct("_ScriptRequest", payload_fields)
+    doc = package_interface.callable_doc(
         name="main",
-        kind="job",
-        payload_type=msgspec.defstruct("_ScriptRequest", payload_fields),
+        kind="job" if job else "entrypoint",
+        payload_type=payload,
         result_type=result,
         models=models,
         assets=None,
         publishes=False,
         weights_outputs=weights,
-        accelerator=accelerator,
+        accelerator=accelerator if job else None,
     )
+    if not job:
+        doc["invocable"] = invocable_interface.serving_metadata(
+            payload,
+            result,
+            module=module.name,
+            export="main",
+            context="_script_context",
+            capabilities=sorted(services | {"telemetry"}),
+        )
+    return ("job" if job else "entrypoint"), doc

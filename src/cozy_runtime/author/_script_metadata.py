@@ -10,6 +10,7 @@ from typing import Any
 
 from cozy_runtime.author._assets import Asset, Tree
 from cozy_runtime.author._errors import ConformanceError
+from cozy_runtime.author._model_defaults import model_defaults
 from cozy_runtime.author._walker import strip
 from cozy_runtime.author._weights import WeightsOutput
 
@@ -121,9 +122,13 @@ def main_definition(tree: ast.Module) -> ast.FunctionDef | ast.AsyncFunctionDef:
     return definition
 
 
-def declarations(raw: bytes) -> tuple[dict[str, str], tuple[WeightsOutput, ...], bool]:
-    """A script's `[tool.cozy]` models, weights outputs and accelerator. A script composes
-    package calls on CPU unless it declares `accelerator = true`."""
+type Rungs = list[dict[str, Any]]
+
+
+def declarations(raw: bytes) -> tuple[dict[str, Rungs], tuple[WeightsOutput, ...], bool]:
+    """A script's `[tool.cozy]`: its model default ladders (a lane string is one `*` rung), its
+    weights outputs and accelerator. A script without Model slots composes on CPU unless it
+    declares `accelerator = true`."""
     block: list[str] = []
     opened = found = False
     for line in raw.decode("utf-8").splitlines():
@@ -148,13 +153,15 @@ def declarations(raw: bytes) -> tuple[dict[str, str], tuple[WeightsOutput, ...],
     accelerator = cozy.get("accelerator", False)
     if type(accelerator) is not bool:
         raise ValueError("script accelerator must be a boolean")
-    models = cozy.get("models", {})
+    declared = cozy.get("models", {})
+    if not isinstance(declared, dict):
+        raise ValueError("script models must map parameter names to default ladders")
+    models = {
+        name: [{"gpu": "*", "lane": value}] if isinstance(value, str) else value
+        for name, value in declared.items()
+    }
+    model_defaults(models)
     weights = cozy.get("weights", {})
-    if not isinstance(models, dict) or any(
-        not name.isidentifier() or not isinstance(value, str) or not value
-        for name, value in models.items()
-    ):
-        raise ValueError("script models must map parameter names to default references")
     if (
         not isinstance(weights, dict)
         or len(weights) > 16
