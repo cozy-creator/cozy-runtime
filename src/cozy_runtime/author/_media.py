@@ -62,7 +62,7 @@ SNIFF_BYTES = 32
 
 #: media type -> the filename suffix a DIGEST-NAMED output takes (`<sha256>.<ext>`). This
 #: is the one table cozy-creator's `resultfiles.Extension` also spells, and the two must
-#: stay equal: the worker names the file under a directory grant, the daemon looks for
+#: stay equal: the worker names the file under a directory grant, Calcifer looks for
 #: exactly that name at the terminal. An unlisted type gets no guessed suffix.
 EXTENSIONS: dict[str, str] = {
     "image/png": ".png",

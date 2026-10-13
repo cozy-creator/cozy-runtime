@@ -31,7 +31,7 @@ WHAT THIS CANNOT COVER, stated so nobody mistakes the coverage for more than it 
   `files` wants `list[tuple[str, str, int, str]]` or that a `str` now means a path. A Rust
   parameter that keeps its name and changes its meaning passes this test.
 - **The other two mechanisms.** cozy-runtime also reaches tensorfs through the `tfs` CLI's
-  TEXT stdout (pod-supervisor, the daemon, the hub) and through vendored artifacts. Neither
+  TEXT stdout (pod-supervisor, Calcifer, the hub) and through vendored artifacts. Neither
   is a Python signature and neither is checked here (xs-024 §1B, §1C).
 - **Anything the runtime does not call.** ~110 exports, ~34 exercised. A change to the
   other two thirds is invisible here, correctly.
