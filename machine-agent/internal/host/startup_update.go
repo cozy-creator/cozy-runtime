@@ -306,17 +306,16 @@ func (m *Machine) startupUpdate(ctx context.Context) error {
 	}
 	defer unlock()
 	if status.State == "installing" || status.State == "boot_pending" {
-		// Metadata identifies the installation independently of the health probe.
-		// A later explicit installation supersedes this transaction even if off.
+		// uv replaces distributions separately. Before, After, and their mixed
+		// pairs can all be interrupted states, including partly written payloads
+		// or additive dependencies while metadata still reports Before. Only a
+		// version outside this transaction proves a foreign installation. A later
+		// update through this engine owns its own journal, even for the same pair.
 		if installed, err := m.installedPair(); err == nil {
-			if installed != status.After {
+			foreignRuntime := installed.Runtime != status.Before.Runtime && installed.Runtime != status.After.Runtime
+			foreignTensorFS := installed.TensorFS != status.Before.TensorFS && installed.TensorFS != status.After.TensorFS
+			if foreignRuntime || foreignTensorFS {
 				status.State = "superseded"
-				if installed == status.Before {
-					status.State = "rolled_back"
-					if !slices.Contains(status.Failed, status.After) {
-						status.Failed = append(status.Failed, status.After)
-					}
-				}
 				if err := m.startupSave(status); err != nil {
 					fmt.Fprintln(m.log, "cozy machine: recovery report:", err)
 				}
@@ -528,7 +527,7 @@ func (m *Machine) preparePair(ctx context.Context, verified, next pairVersions, 
 
 // Only the existing privileged launcher can commit or repair its private update
 // journal after the public agent has dropped privilege.
-func startupMaintenance(root, operation string, workspace string) error {
+func startupMaintenance(root, operation, workspace, detail string) error {
 	m := &Machine{layout: NewLayout(&Grant{Root: root}), log: io.Discard}
 	raw, err := os.ReadFile(m.startupPath("status.json"))
 	var status startupStatus
@@ -542,7 +541,11 @@ func startupMaintenance(root, operation string, workspace string) error {
 		if status.State != "installing" && status.State != "boot_pending" {
 			return errors.New("no interrupted update awaits rollback")
 		}
-		status.Detail = "candidate failed authenticated Runtime startup"
+		if detail != "" {
+			status.Detail = detail
+		} else if status.Detail == "" {
+			status.Detail = "candidate failed authenticated Runtime startup"
+		}
 		return m.startupRollback(context.Background(), status)
 	}
 	if status.State != "boot_pending" {

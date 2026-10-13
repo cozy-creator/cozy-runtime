@@ -1,8 +1,10 @@
 package host
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/cozy-creator/cozy-runtime/machine-agent/internal/build"
 	pb "github.com/cozy-creator/cozy-runtime/machine-agent/protocol/cozy/worker/v1"
@@ -152,27 +154,26 @@ func TestStartupCandidateDoesNotTrustMutableStageOrFollowTargetSymlink(t *testin
 }
 
 func TestStaleStartupJournalNeverReplacesExplicitInstallation(t *testing.T) {
-	for _, installed := range []string{"0.18.85", "0.18.99"} {
-		t.Run(installed, func(t *testing.T) {
+	for _, installed := range []pairVersions{
+		{Runtime: "0.18.99", TensorFS: "0.3.78"},
+		{Runtime: "0.18.85", TensorFS: "0.3.99"},
+	} {
+		t.Run(installed.Runtime+"/"+installed.TensorFS, func(t *testing.T) {
 			m := &Machine{grant: &Grant{}, layout: NewLayout(&Grant{Root: t.TempDir()}), log: io.Discard}
-			status := startupStatus{State: "installing", Before: pairVersions{Runtime: "0.18.85", TensorFS: "0.3.78"}, After: pairVersions{Runtime: "0.18.86", TensorFS: "0.3.78"}}
-			if err := m.startupSave(status); err != nil {
+			state := startupStatus{State: "installing", Before: pairVersions{Runtime: "0.18.85", TensorFS: "0.3.78"}, After: pairVersions{Runtime: "0.18.86", TensorFS: "0.3.78"}}
+			if err := m.startupSave(state); err != nil {
 				t.Fatal(err)
 			}
-			executable(t, filepath.Join(m.layout.Root, "opt/cozy/python/bin/python"), "printf '"+installed+"\\n0.3.78\\n'")
+			executable(t, filepath.Join(m.layout.Root, "opt/cozy/python/bin/python"), fmt.Sprintf("printf '%s\\n%s\\n'", installed.Runtime, installed.TensorFS))
 			if err := m.startupUpdate(context.Background()); err != nil {
 				t.Fatal(err)
 			}
 			raw, _ := os.ReadFile(m.startupPath("status.json"))
-			if err := json.Unmarshal(raw, &status); err != nil {
+			if err := json.Unmarshal(raw, &state); err != nil {
 				t.Fatal(err)
 			}
-			expected := "superseded"
-			if installed == "0.18.85" {
-				expected = "rolled_back"
-			}
-			if status.State != expected {
-				t.Fatalf("stale journal: %+v", status)
+			if state.State != "superseded" {
+				t.Fatalf("stale journal: %+v", state)
 			}
 		})
 	}
@@ -308,12 +309,27 @@ func TestAutomaticAndExplicitUpdatesShareRecoveryAndCommit(t *testing.T) {
 			if err := m.preparePair(context.Background(), before, after, candidate, previous, state, explicit); err != nil {
 				t.Fatal(err)
 			}
-			m.launcher = &directLauncher{root: root}
+			m.launcher = &rollbackObservationLauncher{directLauncher{root: root}}
 			m.tfs = &tensorFS{bin: filepath.Join(root, "missing-tfs")}
 			m.restarts = &restarts{}
-			if err := m.rollbackStartup(context.Background()); err != nil {
+			cause := errors.New("initialize TensorFS Store: permission denied at fixture-store")
+			var rollbackLog bytes.Buffer
+			m.log = &rollbackLog
+			m.grant.bootstrap = &bootstrapChild{Pending: true}
+			m.updates.status = &updateStatus{Operation: "fixture-update", State: "installing"}
+			if err := m.rollbackStartup(context.Background(), cause); err != nil {
 				t.Fatalf("repair service lost on relaunch failure: %v", err)
 			}
+			raw, _ = os.ReadFile(m.startupPath("status.json"))
+			var recovered startupStatus
+			if json.Unmarshal(raw, &recovered) != nil || recovered.Detail != cause.Error() || !strings.Contains(rollbackLog.String(), cause.Error()) {
+				t.Fatalf("rollback discarded startup failure: %s %s", raw, rollbackLog.String())
+			}
+			m.openUpdates() // replacement request plane must retain the specific terminal error
+			if m.updates.status.State != "rolled_back" || m.updates.status.Error != cause.Error() {
+				t.Fatalf("replacement lost rollback cause: %+v", m.updates.status)
+			}
+			m.grant.bootstrap = nil
 			if m.startupPending() || m.restarts.gone() || m.restarts.due(time.Now()) {
 				t.Fatal("rollback relaunch did not retain paced repair service")
 			}
@@ -516,4 +532,112 @@ func TestCurrentPairStillNeedsTransactionForDifferentApplication(t *testing.T) {
 	if !m.applicationMatchesBundle() {
 		t.Fatal("identical current application needs no replacement")
 	}
+}
+
+// Distribution metadata is not an atomic pair commit: uv can be interrupted
+// before either metadata replacement, between them, or after both. Even the
+// original versions can accompany partly installed payloads or dependencies.
+func TestInterruptedPairRecoversEveryOwnedInstallationState(t *testing.T) {
+	before := pairVersions{Runtime: "0.18.85", TensorFS: "0.3.77"}
+	after := pairVersions{Runtime: "0.18.86", TensorFS: "0.3.78"}
+	for _, row := range []struct {
+		name             string
+		installed, after pairVersions
+	}{
+		{"before", before, after},
+		{"runtime-first", pairVersions{Runtime: after.Runtime, TensorFS: before.TensorFS}, after},
+		{"tensorfs-first", pairVersions{Runtime: before.Runtime, TensorFS: after.TensorFS}, after},
+		{"after", after, after},
+		{"application-and-dependencies-only", before, before},
+	} {
+		for _, phase := range []string{"installing", "boot_pending"} {
+			t.Run(row.name+"/"+phase, func(t *testing.T) {
+				root := t.TempDir()
+				m := &Machine{grant: &Grant{}, layout: NewLayout(&Grant{Root: root}), log: io.Discard}
+				var previous []string
+				for _, name := range []string{"cozy_runtime-0.18.85-py3-none-any.whl", "tensorfs-0.3.77-py3-none-any.whl"} {
+					path := filepath.Join(root, name)
+					if err := os.WriteFile(path, []byte("retained test wheel"), 0600); err != nil {
+						t.Fatal(err)
+					}
+					previous = append(previous, path)
+				}
+				kept, err := m.startupPrevious(previous)
+				if err != nil {
+					t.Fatal(err)
+				}
+				state := startupStatus{State: phase, Before: before, After: row.after, Previous: kept,
+					Dependencies: []dependencyWheel{{Name: "owned-dependency", Version: "1.0"}}}
+				state.PolicyBefore = []byte(`{"startup_update":"auto","agent":"bundled"}`)
+				state.PolicyAfter = &softwarePolicy{"off", "explicit"}
+				state.EntryBefore, state.EntryAfter = "/previous-agent", "/candidate-agent"
+				currentPolicy, _ := json.Marshal(state.PolicyAfter)
+				if err := os.MkdirAll(filepath.Dir(policyPath(root)), 0755); err != nil {
+					t.Fatal(err)
+				}
+				if err := writeAtomic(policyPath(root), currentPolicy, 0644); err != nil {
+					t.Fatal(err)
+				}
+				if err := writeAgentEntry(root, state.EntryAfter); err != nil {
+					t.Fatal(err)
+				}
+				if err := m.startupSave(state); err != nil {
+					t.Fatal(err)
+				}
+				log := filepath.Join(root, "installer.log")
+				// These are inert shell doubles, never Python or a Runtime process.
+				executable(t, filepath.Join(root, "usr/local/bin/uv"), fmt.Sprintf("echo \"$1 $2\" >> %q", log))
+				executable(t, filepath.Join(root, "opt/cozy/python/bin/python"), fmt.Sprintf(`
+case "$4" in
+ probe) echo '{"runtime":"%s","tensorfs":"%s"}' ;;
+ removable-dependencies) echo '["owned-dependency"]' ;;
+ *) printf '%s\n%s\n' ;;
+esac`, before.Runtime, before.TensorFS, row.installed.Runtime, row.installed.TensorFS))
+				if got, err := m.installedPair(); err != nil || got != row.installed {
+					t.Fatalf("metadata double: %+v %v", got, err)
+				}
+				answer, err := maintainWithAgent(root, nil, "startup-prepare", []string{"persistent", m.layout.Store}, "")
+				if err != nil || answer != "rolled_back" {
+					t.Fatalf("fresh recovery did not request application restoration: %q %v", answer, err)
+				}
+				answer, err = maintainWithAgent(root, nil, "startup-prepare", []string{"persistent", m.layout.Store}, "")
+				if err != nil || answer != "" {
+					t.Fatalf("historical rollback overrode a later bootstrap: %q %v", answer, err)
+				}
+				raw, err := os.ReadFile(m.startupPath("status.json"))
+				if err != nil || json.Unmarshal(raw, &state) != nil || state.State != "rolled_back" {
+					t.Fatalf("incomplete transaction escaped recovery: %s (%v)", raw, err)
+				}
+				if len(state.Failed) != 1 || state.Failed[0] != row.after {
+					t.Fatalf("failed candidate was not remembered: %+v", state.Failed)
+				}
+				selected, err := keptPair(root)
+				if err != nil || !samePair(selected, before) {
+					t.Fatalf("retained pair not restored: %v %v", selected, err)
+				}
+				policy, err := readPolicyBytes(root)
+				if err != nil || string(policy) != string(state.PolicyBefore) {
+					t.Fatalf("policy not restored: %s %v", policy, err)
+				}
+				entry, err := os.Readlink(filepath.Join(root, "usr/local/bin/cozy-machine"))
+				if err != nil || entry != state.EntryBefore {
+					t.Fatalf("application entry not restored: %s %v", entry, err)
+				}
+				raw, err = os.ReadFile(log)
+				if err != nil || string(raw) != "pip install\npip uninstall\n" {
+					t.Fatalf("pair and owned dependencies not restored: %q (%v)", raw, err)
+				}
+			})
+		}
+	}
+}
+
+// Keep the test process alive while exercising real rollback journal/status writes.
+type rollbackObservationLauncher struct{ directLauncher }
+
+func (l *rollbackObservationLauncher) maintain(op string, args []string) (string, error) {
+	if op == "agent-replace" {
+		return "", nil
+	}
+	return l.directLauncher.maintain(op, args)
 }

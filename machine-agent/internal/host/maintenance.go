@@ -90,8 +90,19 @@ func maintainWithAgent(root string, p *runtimeProcess, op string, args []string,
 		}
 		grant := &Grant{Root: root, Lifetime: args[0], StoreRoot: args[1], agentBefore: previousAgent}
 		m := &Machine{grant: grant, layout: NewLayout(grant), log: os.Stderr}
+		recovering := m.transactionPending()
 		if err := m.startupUpdate(context.Background()); err != nil {
 			return "", err
+		}
+		// Only recovery performed by this preparation may replace the initial
+		// request plane with the retained application. A historical rollback
+		// must not override a later explicit bootstrap selection.
+		if recovering {
+			var status startupStatus
+			raw, err := os.ReadFile(m.startupPath("status.json"))
+			if err == nil && json.Unmarshal(raw, &status) == nil && status.State == "rolled_back" {
+				return "rolled_back", nil
+			}
 		}
 		if m.startupPending() {
 			return "boot_pending", nil
@@ -101,12 +112,19 @@ func maintainWithAgent(root string, p *runtimeProcess, op string, args []string,
 		if p == nil || p.exited() || len(args) != 2 || args[0] != p.incarnation {
 			return "", errors.New("startup commit requires the live Runtime incarnation")
 		}
-		return "", startupMaintenance(root, op, args[1])
+		return "", startupMaintenance(root, op, args[1], "")
 	case "startup-rollback":
 		if p != nil && !p.exited() {
 			return "", errors.New("startup rollback requires a stopped candidate")
 		}
-		return "", startupMaintenance(root, op, "")
+		if len(args) > 1 {
+			return "", errors.New("startup rollback accepts one failure detail")
+		}
+		detail := ""
+		if len(args) == 1 {
+			detail = args[0]
+		}
+		return "", startupMaintenance(root, op, "", detail)
 	case "capabilities":
 		return probeRuntimeCapabilities(filepath.Join(root, "opt/cozy/bin/cozy-runtime-worker"))
 	case "restart":
