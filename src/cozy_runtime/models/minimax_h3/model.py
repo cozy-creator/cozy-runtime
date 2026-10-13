@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from functools import partial
 from typing import Any, Literal
 
@@ -20,7 +20,6 @@ from cozy_runtime.author import (
     uses_components,
 )
 
-from .continuation import AVContext
 from .official import (
     NumericalChecks,
     OfficialH3Pipeline,
@@ -207,16 +206,6 @@ class H3Model(Model[OfficialH3Pipeline], encoded_leaves="accept", fusion="accept
             facts = self.pipe.denoise(task, state, on_step=on_step, cancel=cancel,
                                       checks=checks, refine_steps=steps)
         return state, facts
-
-    @uses_components("video_vae", "audio_vae")
-    def export_completed_av_tail(
-        self, state: Any, *, frames: Any, windows: Sequence[int], provenance: str
-    ) -> AVContext:
-        """Encode the named context windows of the delivered tail while both native VAE
-        components are resident. `frames` are the delivered RGB8 frames as landed."""
-        return self.pipe.export_completed_av_tail(
-            state, frames=frames, windows=windows, provenance=provenance
-        )
 
     @uses_components("video_vae")
     def condition_fl2va_media(self, task: Task, state: Any, *, checks: NumericalChecks) -> None:
