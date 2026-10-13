@@ -4045,7 +4045,7 @@ class Executor:
         own = native_interfaces.bindings()
         for row in rows:
             interface, module, export = row.interface_digest, row.module, row.export
-            if row.native_source or row.native_effect:
+            if row.native_effect:
                 # Admission is per operation: the worker judged this one against what this
                 # Runtime stated at hello. One this Runtime lacks cannot be called from here.
                 native = own.get((module, export))

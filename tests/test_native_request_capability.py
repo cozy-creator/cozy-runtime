@@ -12,7 +12,7 @@ import pytest
 from cozy_runtime import canonical_json
 from cozy_runtime.author import CapabilityError
 from cozy_runtime.author.fakes import fake_context
-from cozy_runtime.internal import native_interfaces, source_interfaces
+from cozy_runtime.internal import effect_interfaces, native_interfaces
 from cozy_runtime.internal.executor import Executor
 from cozy_runtime.internal.executor_commands import CallInterface
 from cozy_runtime.internal.seam import Channel
@@ -32,7 +32,7 @@ def _broker(tmp_path: Path, rows: list[dict[str, Any]]) -> Any:
 
 def _rows() -> list[dict[str, Any]]:
     stated = {"native_interfaces": native_interfaces.stated()}
-    return [r for r in native_interfaces.rows(stated) if r["module"] == source_interfaces.MODULE]
+    return [r for r in native_interfaces.rows(stated) if r["module"] == effect_interfaces.MODULE]
 
 
 def _served(without: dict[str, str]) -> list[dict[str, Any]]:
@@ -48,24 +48,24 @@ def _served(without: dict[str, str]) -> list[dict[str, Any]]:
 
 def _payload(broker: Any, export: str, arguments: dict[str, Any]) -> dict[str, Any]:
     payload: dict[str, Any] = canonical_json.decode(
-        broker.reserve(source_interfaces.MODULE, export, arguments).payload
+        broker.reserve(effect_interfaces.MODULE, export, arguments).payload
     )
     return payload
 
 
 def test_sdk_omits_a_defaulted_option_an_older_runtime_does_not_serve(tmp_path: Path) -> None:
-    arguments = {"repository": "org/model", "revision": "a" * 40}
-    current = _payload(_broker(tmp_path, _rows()), "download_huggingface", arguments)
-    assert current["files"] == []
-    older = _broker(tmp_path, _served({"download_huggingface": "files"}))
-    assert "files" not in _payload(older, "download_huggingface", arguments)
-    with pytest.raises(CapabilityError, match="does not support files") as refused:
+    arguments = {"destination": "org/model", "release": "1.0.0", "lanes": {}}
+    current = _payload(_broker(tmp_path, _rows()), "publish_release", arguments)
+    assert current["expected_revision"] is None
+    older = _broker(tmp_path, _served({"publish_release": "expected_revision"}))
+    assert "expected_revision" not in _payload(older, "publish_release", arguments)
+    with pytest.raises(CapabilityError, match="does not support expected_revision") as refused:
         older.reserve(
-            source_interfaces.MODULE,
-            "download_huggingface",
-            {**arguments, "files": ("config.json",)},
+            effect_interfaces.MODULE, "publish_release", {**arguments, "expected_revision": 3}
         )
     assert UPDATE in str(refused.value) and refused.value.code == "child_capability_unavailable"
     # A Runtime that does not advertise its fields receives the full request.
     unstated = [{k: v for k, v in row.items() if k != "request_fields"} for row in _served({})]
-    assert _payload(_broker(tmp_path, unstated), "download_huggingface", arguments)["files"] == []
+    assert "expected_revision" in _payload(
+        _broker(tmp_path, unstated), "publish_release", arguments
+    )

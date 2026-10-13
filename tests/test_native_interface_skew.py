@@ -4,33 +4,36 @@ from __future__ import annotations
 
 import msgspec
 
-from cozy_runtime.author import Tree
-from cozy_runtime.internal import native_interfaces, schema, source_interfaces
+from cozy_runtime.author import ObjectRef
+from cozy_runtime.author.publication import CheckpointRef
+from cozy_runtime.internal import effect_interfaces, native_interfaces, schema
 
 
 class _Older(msgspec.Struct, frozen=True):
-    repository: str
-    revision: str
+    destination: str
+    release: str
+    lanes: dict[str, CheckpointRef]
 
 
-class _NewerOptional(msgspec.Struct, frozen=True):
-    repository: str
-    revision: str
+class _NewerOptional(_Older, frozen=True):
     mirror: str = ""
 
 
-class _NewerRequired(msgspec.Struct, frozen=True):
-    repository: str
-    revision: str
+class _NewerRequired(_Older, frozen=True):
     mirror: str
 
 
-class _WithoutRevision(msgspec.Struct, frozen=True):
-    repository: str
+class _WithoutRelease(msgspec.Struct, frozen=True):
+    destination: str
+    lanes: dict[str, CheckpointRef]
 
 
-class _Files(msgspec.Struct, frozen=True):
-    files: Tree
+class _Checkpoint(msgspec.Struct, frozen=True):
+    destination: str
+    checkpoint: str
+    manifest: ObjectRef
+    publication: str
+    observation: str
     listing: str
 
 
@@ -39,13 +42,13 @@ def _stating(
     request: type[msgspec.Struct] | None = None,
     result: type[msgspec.Struct] | None = None,
 ) -> dict[str, object]:
-    """A hello stating `download_huggingface` / `source_files` rendered from these types."""
+    """A hello stating `publish_release` / `upload_checkpoint` rendered from these types."""
     stated = native_interfaces.stated()
-    operations = stated[source_interfaces.MODULE]["operations"]
+    operations = stated[effect_interfaces.MODULE]["operations"]
     if request is not None:
-        operations["download_huggingface"]["request"] = schema.render(request)
+        operations["publish_release"]["request"] = schema.render(request)
     if result is not None:
-        operations["source_files"]["result"] = schema.render(result)
+        operations["upload_checkpoint"]["result"] = schema.render(result)
     return {"native_interfaces": stated, "runtime_version": version}
 
 
@@ -56,38 +59,31 @@ def _unavailable(hello: dict[str, object], export: str) -> str:
 
 def test_additive_optional_fields_are_admitted_in_both_directions() -> None:
     assert not any("unavailable" in row for row in native_interfaces.rows({}))
-    assert not _unavailable(_stating("0.18.1", _Older), "download_huggingface")
-    assert not _unavailable(_stating("99.0.0", _NewerOptional), "download_huggingface")
+    assert not _unavailable(_stating("0.18.1", _Older), "publish_release")
+    assert not _unavailable(_stating("99.0.0", _NewerOptional), "publish_release")
 
 
 def test_required_fields_are_enforced_naming_the_side_to_update() -> None:
-    newer = _unavailable(_stating("99.0.0", _NewerRequired), "download_huggingface")
+    newer = _unavailable(_stating("99.0.0", _NewerRequired), "publish_release")
     assert "request mirror is not read" in newer and "cozy rental update" in newer
-    older = _unavailable(_stating("0.18.1", _WithoutRevision), "download_huggingface")
-    assert "request revision is not sent" in older
+    older = _unavailable(_stating("0.18.1", _WithoutRelease), "publish_release")
+    assert "request release is not sent" in older
     assert "publish the package against cozy-runtime>=" in older
     # The refusal is confined to that operation.
-    rows = native_interfaces.rows(_stating("0.18.1", _WithoutRevision))
-    assert [row["export"] for row in rows if "unavailable" in row] == ["download_huggingface"]
+    rows = native_interfaces.rows(_stating("0.18.1", _WithoutRelease))
+    assert [row["export"] for row in rows if "unavailable" in row] == ["publish_release"]
 
 
 def test_results_need_what_the_executor_requires() -> None:
-    refused = _unavailable(_stating("0.18.1", result=_Files), "source_files")
-    assert "result listing is not produced" in refused and "result files" not in refused
+    refused = _unavailable(_stating("0.18.1", result=_Checkpoint), "upload_checkpoint")
+    assert "result listing is not produced" in refused and "result destination" not in refused
 
 
 def test_an_operation_this_worker_lacks_is_refused_alone() -> None:
     hello = _stating("99.0.0")
-    operations = hello["native_interfaces"][source_interfaces.MODULE]["operations"]  # type: ignore[index]
-    operations["download_dataset"] = operations["download_huggingface"]
+    operations = hello["native_interfaces"][effect_interfaces.MODULE]["operations"]  # type: ignore[index]
+    operations["publish_dataset"] = operations["publish_release"]
     rows = native_interfaces.rows(hello)
     (refused,) = [row for row in rows if "unavailable" in row]
-    assert refused["export"] == "download_dataset"
+    assert refused["export"] == "publish_dataset"
     assert "cozy rental update" in str(refused["unavailable"])
-
-
-def test_a_source_operation_no_machine_runs_names_the_ways_sources_enter() -> None:
-    refused = native_interfaces.unserved(source_interfaces.MODULE, "download_huggingface")
-    assert "model.<slot>=hf://" in refused.unavailable
-    assert "cozy model upload" in refused.unavailable
-    assert "cozy rental update" not in refused.unavailable

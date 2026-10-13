@@ -10,12 +10,10 @@ manifest outputs keep their separate TensorFS weights capacity contract.
 Encoding and final publication validate the same aggregate again. The executor's
 working allowance is at least the existing 256 MiB so a small final report can
 still consume larger intermediate work. Its reply cannot raise that allowance;
-final publication caps it by the exact output grant. Native `Outputs.commit`
-reads the recorded parent invocation instead of taking a budget from the script.
-Its authored pending-file commits share that budget. Selecting a native Tree
+final publication caps it by the exact output grant. Selecting a native Tree
 member is an input capability and does not charge a second spool copy.
 
-Received child-result bytes and native intermediate file commits use the larger
+Received child-result bytes use the larger
 of the existing 256 MiB allowance and the parent's declared aggregate, cumulatively
 over the attempt. A small final report does not imply that preceding work is small.
 Final returned outputs still obey their exact declared bounds. Root input intake

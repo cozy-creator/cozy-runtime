@@ -34,13 +34,3 @@ def huggingface_recipe(repository: str, revision: str) -> Recipe | None:
         ("model.safetensors",),
         dict(birefnet.FILES),
     )
-
-
-def require_recipe(repository: str, revision: str) -> Recipe:
-    recipe = huggingface_recipe(repository, revision)
-    if recipe is None:
-        raise UnsupportedInput(
-            f"No reviewed complete-model ingestion recipe for {repository}",
-            code="model_ingestion_recipe_unavailable",
-        )
-    return recipe

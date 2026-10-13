@@ -874,12 +874,6 @@ class Outputs(_Bound):
     def save_bytes(self, data: bytes, *, media_type: str) -> FileAsset:
         return self._register(data, FileAsset, media_type)
 
-    async def commit(self, pending: FileAsset) -> FileAsset:
-        """Complete an owned pending file now, for reading or forwarding to another call."""
-        from cozy_runtime.author._output_commit import commit
-
-        return await commit(self._attempt, pending)
-
     def save_tree(self, path: Path | str) -> Tree:
         """Snapshot regular files now; native retention commits after the handler returns."""
         self._attempt.check_open("Outputs.save_tree")

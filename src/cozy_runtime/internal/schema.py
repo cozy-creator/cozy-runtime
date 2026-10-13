@@ -21,7 +21,7 @@ from typing import Literal, get_args, get_origin
 
 import msgspec
 
-from cozy_runtime.author._artifacts import ModelArtifact, SourceArtifact
+from cozy_runtime.author._artifacts import ModelArtifact
 from cozy_runtime.author._assets import Asset, AudioAsset, FileAsset, ImageAsset, Tree, VideoAsset
 from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._markers import AssetBound, _ModelDefaultMarker
@@ -110,8 +110,6 @@ def _render_bare(
 ) -> Json:
     if tp is ModelArtifact:
         return {"input": "model"}
-    if tp is SourceArtifact:
-        return {"input": "source"}
     if (name := _PRIMITIVES.get(tp)) is not None:
         return name
     origin = get_origin(tp)

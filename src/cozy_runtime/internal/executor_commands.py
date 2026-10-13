@@ -434,7 +434,6 @@ class CallInterface(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=Tru
     interface_digest: str = ""
     interface_document: Json = None
     interface_path: str = ""
-    native_source: bool = False
     native_effect: bool = False
     request_fields: tuple[str, ...] | None = None
     unavailable: str = ""
