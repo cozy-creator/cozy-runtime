@@ -302,9 +302,6 @@ class Load(Command, frozen=True, kw_only=True, tag="load"):
     model_key: str | UnsetType = UNSET
     #: The owner retains shared CPU weight buffers (`HostTier` exchanges).
     host_tier: bool = False
-    #: The worker grants a turn per component-use scope (`stage/1`): `StageEnter` before each
-    #: scope plans, `StageExit` after it. Older workers never set it.
-    stages: bool = False
     #: The pinned host tier's budget (`LOAD_PINNED`), applied before any weight set registers,
     #: so a fill never pins past it; -1: none, the executor sizes its tier from the host.
     pinned_bytes: int = -1
@@ -388,8 +385,6 @@ class Invoke(_Run, frozen=True, kw_only=True, tag="invoke"):
     attention_kernel: str = ""
     #: The weight plane's device budget for this attempt; -1: the executor derives it.
     plane_budget_bytes: int = -1
-    #: Each component-use scope asks for its turn (`stage/1`, as `Load.stages`).
-    stages: bool = False
     #: The process's device cap for this attempt (`PROCESS_CAP`); -1: none
     cap_bytes: int = -1
     #: Per GPU of a group, its own cap for this attempt (index = rank, `RANK_CELLS`)

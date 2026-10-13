@@ -1,1 +1,0 @@
-A stage turn belongs to a call's outermost open scope. A scope opened inside another of the same call (H3 turbo's LoRA sampler inside its base model's) no longer ends the turn at its exit, and can no longer be answered with a budget that unmaps the outer scope's weights.
