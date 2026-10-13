@@ -22,9 +22,10 @@ head: 15 s first = 362 frames, then 14 s + 22 carried = 362 sampled, 340 deliver
 ## Sound
 
 The last 40 audio ticks (24 frames, exactly one second at 40 Hz, whatever the picture
-window). They are placed on the new clip's timeline to end exactly where they ended on the
-predecessor's: at the picture join plus the predecessor's sound offset, the fraction of a
-tick by which its audio grid (`round(5f/3)` ticks) overshoots or falls short of its frames.
+window), ending on the first whole tick at or after the predecessor's picture end (its
+last sampled tick at most: H3's `round(5f/3)` grid can fall a third short). They are placed
+on the new clip's timeline to end exactly where they ended on the predecessor's: at the
+picture join plus that offset, within a third of a tick.
 Rotary positions are float, so the sound is in true time. With a picture carry it overlaps
 the regenerated head; alone it sits immediately before the target start, so no video frame
 is sampled for it.
