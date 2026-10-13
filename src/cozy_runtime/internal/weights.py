@@ -381,7 +381,6 @@ class Weights:
         #: the owner's cap on this process's device bytes (context, torch's reserved bytes and
         #: the plane's maps); -1: none
         self.cap = -1
-        self._torch_limited = False
         self.total = (
             0 if self.host_only else int(torch.cuda.get_device_properties(device).total_memory)
         )
@@ -430,19 +429,25 @@ class Weights:
         self.limit_torch()
 
     def limit_torch(self) -> None:
-        """Hold torch's allocator to what the cap leaves beside the context and the plane."""
-        if self.host_only or (self.cap < 0 and not self._torch_limited):
+        """Hold torch's allocator to what the driver has free above the floor now, and to what
+        the cap leaves beside the context and the plane. A cap is no promise the card still
+        has the room: the driver keeps its own memory (fault buffers, page tables) from what
+        is free, and with none left its library faulted (run 5422: SIGSEGV in libcuda after
+        NV_ERR_NO_MEMORY, the laptop's free at 10 MB). Torch then runs out of memory at the
+        limit and the plane makes room, before the driver does."""
+        if self.host_only:
             return
-        fraction = 1.0
+        memory = accel.allocation(self.torch, self.kind)
+        reserved = memory["reserved_bytes"]
+        allowed = reserved + memory["driver_free_bytes"] - self.floor_free
         if self.cap >= 0:
             committed = max(plane.stats(self.plane).device(self.index).committed, 0)
-            allowed = self.cap - max(self.context_bytes, 0) - committed
-            fraction = min(max(allowed, 0) / max(self.total, 1), 1.0)
-            # A lowered cap stops new segments; the idle ones torch keeps go back now.
-            if int(self.torch.cuda.memory_reserved(self.device)) > allowed:
-                accel.release_cached(self.torch, self.kind)
+            allowed = min(allowed, self.cap - max(self.context_bytes, 0) - committed)
+        if reserved > allowed:
+            # A lowered limit stops new segments; the idle ones torch keeps go back now.
+            accel.release_cached(self.torch, self.kind)
+        fraction = min(max(allowed, 0) / max(self.total, 1), 1.0)
         self.torch.cuda.set_per_process_memory_fraction(fraction, self.device)
-        self._torch_limited = self.cap >= 0
 
     def set_floor(self, floor: int) -> None:
         """The owner's physical free floor on this GPU; -1 leaves only a display's own."""

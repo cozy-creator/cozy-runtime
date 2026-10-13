@@ -1337,6 +1337,29 @@ def test_an_op_out_of_memory_spares_the_components_not_in_use(
     residency.unpark()
 
 
+@on_gpu
+def test_torch_is_held_above_the_drivers_floor_without_a_cap(card: Any) -> None:
+    """Run 5422 (8 GB laptop): with the card at 10 MB free the driver could not allocate its
+    own fault buffers (NV_ERR_NO_MEMORY) and libcuda faulted the executor. Torch is held to
+    what the driver has free above the floor, cap or none: past it, torch runs out of memory
+    (which the plane recovers from), never the driver."""
+    weights = card.weights
+    torch.cuda.empty_cache()
+    free, _ = torch.cuda.mem_get_info()
+    weights.set_floor(free - (64 << 20))
+    try:
+        weights.limit_torch()
+        with pytest.raises(torch.OutOfMemoryError):
+            torch.empty(256 << 20, dtype=torch.uint8, device="cuda")
+        small = torch.empty(16 << 20, dtype=torch.uint8, device="cuda")
+        del small
+    finally:
+        weights.set_floor(-1)
+        weights.limit_torch()
+        torch.cuda.empty_cache()
+    torch.empty(256 << 20, dtype=torch.uint8, device="cuda")
+
+
 class Flat(Stack):
     """A component that declares no blocks, as SeedVR2's NaDiT declares none."""
 
