@@ -166,15 +166,17 @@ class Context:
         return self._tensorfs_adopt(receipt)
 
     def release_gpus(self) -> None:
-        """Say this request is done with GPUs, so the next request's GPU work starts now
-        while this one finishes its CPU and network work (assembly, encoding, uploads).
+        """Say this request is done with GPUs for a long while, so the next request's GPU
+        work starts now while this one finishes its CPU and network work.
 
-        Call it after awaiting the last GPU call. The request's GPU lease ends at once;
-        the request keeps running. A GPU call still in flight keeps its GPUs until it
-        returns. A GPU call awaited later queues to acquire GPUs again and never
-        takes GPUs back from whoever got them meanwhile. Idempotent. Where there is
-        no lease to end (a request with no GPU
-        calls, or a GPU handler, whose GPUs end when it returns) it does nothing.
+        A request holds its GPUs from its first GPU call until it ends, across the gaps
+        between its calls. Call this before a long CPU-only stretch, usually the end
+        (assembly, encoding, uploads), after awaiting the last GPU call. Its GPUs go to the
+        oldest waiting request; the request keeps running. A GPU call still in flight keeps
+        its GPUs until it returns. A GPU call awaited later waits in line at this request's
+        original priority (its acceptance) and never takes GPUs back from whoever got them
+        meanwhile. Idempotent. Where there is no allocation to end (a request with no GPU
+        calls, a nested job, or a GPU handler, whose GPU ends when it returns) it does nothing.
         """
         if self._release_gpus is not None:
             self._release_gpus()
