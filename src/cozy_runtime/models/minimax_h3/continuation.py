@@ -15,6 +15,7 @@ Reference: NikoDemon80/ComfyUI-H3-Motion-Context and AIMixer/ComfyUI_MiniMaxH3_D
 from __future__ import annotations
 
 import json
+import math
 import struct
 from dataclasses import dataclass
 from fractions import Fraction
@@ -114,22 +115,25 @@ class ContinuationPlan:
         return self.delivery_end - self.prefix_frames
 
     @property
+    def sound_end(self) -> Fraction:
+        """Where the delivered sound ends, in ticks: at the picture's end, or, when the
+        successor carries it, on the first whole tick at or after it (the last sampled one
+        at most), so the carried second is whole ticks within a third of the join."""
+        picture = TICKS_PER_FRAME * self.delivery_end
+        if not self.successor.audio:
+            return picture
+        return Fraction(min(audio_ticks(self.sample_frames), math.ceil(picture)))
+
+    @property
     def exit_offset(self) -> Fraction:
         """Where the carried second of sound ends past the picture join, in ticks."""
-        if not self.successor.audio:
-            return Fraction(0)
-        return audio_ticks(self.sample_frames) - TICKS_PER_FRAME * self.delivery_end
+        return self.sound_end - TICKS_PER_FRAME * self.delivery_end
 
     def audio_samples(self, entry: Fraction, sample_rate: int) -> tuple[int, int]:
         """The delivered sound: from where the predecessor's ended (`entry` ticks past the
-        picture join, carried sound only) to the end of this segment's own sound when a
-        successor carries it, else to the picture's end."""
+        picture join, carried sound only) to `sound_end`."""
         start = TICKS_PER_FRAME * self.prefix_frames + (entry if self.carried.audio else 0)
-        end = (
-            audio_ticks(self.sample_frames)
-            if self.successor.audio
-            else TICKS_PER_FRAME * self.delivery_end
-        )
+        end = self.sound_end
         if start < 0:
             _refuse("carried sound ends before this segment begins")
         per_tick = Fraction(sample_rate, 40)
@@ -194,7 +198,7 @@ class AVContext:
         if (
             not isinstance(offset, Fraction)
             or 3 % offset.denominator
-            or not -Fraction(1, 3) <= offset <= Fraction(4, 3)
+            or not -Fraction(1, 3) <= offset <= Fraction(1, 3)
             or (self.audio is None and offset)
         ):
             _refuse("context sound offset is off the frame/tick grid")
@@ -236,7 +240,8 @@ def export_context(
     if carry.audio:
         if tuple(audio.shape) != (2, 32, audio_ticks(plan.sample_frames)):
             _refuse("sampled audio latents differ from the segment's clock")
-        tail = audio[:, :, -AUDIO_TICKS:].permute(0, 2, 1).reshape(-1, 32)
+        end = int(plan.sound_end)
+        tail = audio[:, :, end - AUDIO_TICKS : end].permute(0, 2, 1).reshape(-1, 32)
         rows = tail.detach().float().cpu().contiguous()
     return AVContext(window, rows, plan.exit_offset, provenance)
 
