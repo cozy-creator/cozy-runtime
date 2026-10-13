@@ -43,7 +43,6 @@ from cozy_runtime.internal.encoding import DeviceFacts
 from cozy_runtime.internal.executor import Executor
 from cozy_runtime.internal.executor_commands import (
     Activate,
-    Binding,
     Invoke,
     Load,
     PrepareRequest,
@@ -233,12 +232,7 @@ def _host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[SimpleNam
         construction, roots = host.constructions["a"], _sites()
         construction.backend, construction.device_facts = SimpleNamespace(roots=roots), CPU
         construction._reselect = partial(
-            construction._prepare_attention,
-            Binding(model_parameter_name="model"),
-            roots,
-            "",
-            CPU,
-            choose=_ladder("tiny", "sdpa"),
+            attention.select, CPU, roots, choose=_ladder("tiny", "sdpa")
         )
         construction.attention = construction._reselect()
         construction.attention_defaults = attention.snapshot(roots)
@@ -415,11 +409,12 @@ def test_a_cancel_ends_an_override_waiting_for_its_compile_at_once_and_the_build
         assert host.held == [TINY_SITES] * 4
 
 
-def test_an_override_whose_compile_fails_is_refused_with_the_compiles_reason(
+def test_an_override_whose_compile_fails_falls_back_with_the_compiles_reason(
     store: kernel_cache.Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A kernel whose build fails while the request waits refuses the request; one this
-    hardware cannot serve refuses it at once. Neither runs on another kernel."""
+    """A kernel whose build fails while the request waits cannot run here: the request runs
+    on the prepared kernel and its evidence says why. One this hardware cannot serve falls
+    back at once. Neither fails the run, and neither is silent."""
     _registry(tmp_path / "sources", corrupt=True)
     job = kernel_sources.job(kernel_sources.PYTHON, 0)
     lock, builder = _held(store, job, MOVING)
@@ -429,16 +424,18 @@ def test_an_override_whose_compile_fails_is_refused_with_the_compiles_reason(
         request.start()
         while request.is_alive() and not _waiting(host.frames):
             time.sleep(kernel_compile.POLL_SECONDS)
-        assert request.is_alive(), reply
         os.close(lock)  # the build ends; this machine's builder takes the key and fails it
         builder.kill()
         builder.wait()
         request.join()
-        assert not reply["ok"] and reply["code"] == "attention_kernel_failed", reply
-        assert "compile_source_mismatch" in reply["detail"], reply
+        (fallback,) = reply["fallbacks"]
+        assert (fallback["preferred"], fallback["selected"]) == ("tiny", "sdpa"), reply
+        assert "compile_source_mismatch" in fallback["reason"], reply
+        assert host.held[-1] == SDPA_SITES
         unsupported = host.run("unsupported", "flash-attn3")
-        assert unsupported["code"] == "attention_kernel_unsupported", unsupported
-        assert not host.held
+        assert unsupported["fallbacks"][0]["preferred"] == "flash-attn3", unsupported
+        assert "sm90" in unsupported["fallbacks"][0]["reason"], unsupported
+        assert host.held[-1] == SDPA_SITES
 
 
 def _waiting(frames: list[dict[str, Any]]) -> list[dict[str, Any]]:

@@ -158,10 +158,9 @@ def test_a_refused_load_leaves_loaded_constructions_serving(
 ) -> None:
     executor, load = host
     assert executor.load(msgspec.convert({**load, "construction": "a"}, Load))["ok"]
-    refused = executor.load(
-        msgspec.convert({**load, "construction": "b", "attention_pin": "sdpa"}, Load)
-    )
-    assert refused["code"] == "attention_kernel_unsupported", refused
+    model = {**load["binding"], "model_class": f"{MODULE}:Model"}
+    refused = executor.load(msgspec.convert({**load, "construction": "b", "binding": model}, Load))
+    assert refused["code"] == "model_sources_ungranted", refused
     assert not executor.poisoned and "b" not in executor.constructions
     assert executor.activate(Activate(construction="a"))["ok"]
     assert _serve(executor, "after", "ok")["outcome"]["terminal"] == "succeeded"

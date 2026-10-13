@@ -493,7 +493,8 @@ def test_classic_attention_sites_are_managed_observed_and_bit_identical() -> Non
     with torch.no_grad():
         after = (roots["unet"](sample, 10, text).sample, roots["vae"](image).sample)
     assert all(torch.equal(old, new) for old, new in zip(before, after, strict=True))
-    assert attention.check(device, roots, "unet=sdpa").name == "sdpa"
+    planned = attention.plan(device, roots, "unet=sdpa")
+    assert planned.entry is not None and planned.entry.name == "sdpa" and not planned.fallbacks
 
     processors = [processor for _, _, processor in attention._sites(roots)]
     attention.select(device, roots)

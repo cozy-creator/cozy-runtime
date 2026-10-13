@@ -148,6 +148,7 @@ from cozy_runtime.internal import (
 from cozy_runtime.internal.config import restore_seal, seal_snapshot
 from cozy_runtime.internal.discovery import discover_distribution, discover_installed
 from cozy_runtime.internal.executor_commands import (
+    LOAD_ATTENTION_PIN,
     LOAD_PINNED,
     MAP,
     PROCESS_CAP,
@@ -510,15 +511,6 @@ _CONSTRUCTION_MODULES = (
 )
 
 
-def _local_attention_pin(pin: str, parameters: tuple[str, ...]) -> str:
-    scope, _ = attention._pin_parts(pin)
-    if "/" in scope and scope.split("/", 1)[0] not in parameters:
-        raise attention.AttentionRefusal(
-            "attention_kernel_unsupported", f"{pin} matches no model in {list(parameters)}"
-        )
-    return attention.for_model(pin, parameters)
-
-
 def _dense(kernels: Iterable[str]) -> str:
     """The dense reference the Sol kernels among `kernels` recompute rows with."""
     sparse = sorted(attention_sol.NAMES.intersection(kernels))
@@ -744,6 +736,7 @@ class Executor:
                 "import_only",
                 zygote.CAPABILITY,
                 "vacate_ranks",
+                LOAD_ATTENTION_PIN,
                 *(
                     [plane.CAPABILITY, LOAD_PINNED, PROCESS_CAP, RANK_CELLS, MAP]
                     if plane.available()
@@ -1868,7 +1861,7 @@ class Executor:
         member = container._construction_child(key)
         member._group_parent = container
         container.model_executors.append(member)
-        reply = member._prepare_first(command, optional_attention_scope=True)
+        reply = member._prepare_first(command)
         if not reply.get("ok"):
             self.poisoned = member.poisoned or f"load refused: {reply.get('code')}"
             return reply
@@ -1989,9 +1982,7 @@ class Executor:
         weights = self.host.weights
         return max(weights.facts().committed_bytes, 0) if weights is not None else 0
 
-    def _prepare_first(
-        self, command: Load, *, optional_attention_scope: bool = False
-    ) -> dict[str, Any]:
+    def _prepare_first(self, command: Load) -> dict[str, Any]:
         """Construct and fill one construction (or one model of a many-model one)."""
         if self.poisoned:
             return {
@@ -2086,24 +2077,8 @@ class Executor:
             _mark[0] = now
 
         self._stages = stages
-        pin = command.attention_pin
         if not binding.model_class:
-            if pin:
-                # A PIN IS NEVER SILENTLY IGNORED (cr-125). A weightless binding constructs
-                # nothing and therefore holds no attention site, so there is nowhere to put
-                # the kernel that was named — and a run that reported success while serving
-                # no pin at all is the same lie as one that quietly served another kernel.
-                return {
-                    "ok": False,
-                    "code": "attention_kernel_unsupported",
-                    "detail": f"{pin} was pinned on a binding that declares no model; a "
-                    "weightless package holds no attention site and a pin is never ignored",
-                }
             return self._prepare_weightless(binding, started)
-        try:
-            attention.admit(_local_attention_pin(pin, binding.parameter_names()), self.world)
-        except attention.AttentionRefusal as exc:
-            return {"ok": False, "code": exc.code, "detail": str(exc)}
         authorized = command.authorized_device_limit_bytes
         if authorized is UNSET:
             # NO SELF-DERIVED CEILING (cr-025/cr-066): the worker assigns one before every
@@ -2210,6 +2185,9 @@ class Executor:
         # lane's devices, so there is nothing to select here and no index to carry.
         device_index = self.rank if self.world > 1 else 0
         device_facts = measure_device(torch, device_index)
+        # The request this executor loads for pins a kernel: its build is imported first.
+        if command.attention_pin:
+            attention.reserve(command.attention_pin, device_facts)
         stage("measure_device")
         hardware_variant = binding.variant
         if not hardware_variant:
@@ -2526,17 +2504,15 @@ class Executor:
             roots = backend.roots
             stage("execution_plan")
             # THE FASTEST KERNEL THIS DEVICE AND IMAGE SUPPORT, PINNED POST-FILL (cr-124),
-            # per attention site and before any warm step (see `_prepare_attention`).
+            # per attention site and before any warm step (`attention.select`).
             self._reselect = functools.partial(
-                self._prepare_attention,
-                binding,
-                roots,
-                pin,
+                attention.select,
                 device_facts,
+                roots,
+                degree=self.world,
                 choose=model.choose_attention
                 if type(model).choose_attention is not Model.choose_attention
                 else None,
-                optional_scope=optional_attention_scope,
             )
             applied = self._reselect()
             self.device_facts = device_facts
@@ -2728,21 +2704,6 @@ class Executor:
                 "detail": "the prepare carries no authorized_device_limit_bytes; the worker "
                 "assigns the residence ceiling and this executor derives none",
             }
-        aggregate_pin = command.attention_pin
-        try:
-            scope, _ = attention._pin_parts(aggregate_pin)
-            attention.admit(aggregate_pin, self.world)
-        except attention.AttentionRefusal as exc:
-            return {"ok": False, "code": exc.code, "detail": str(exc)}
-        declared_parameters = tuple(
-            dict.fromkeys(name for row in rows for name in row.binding.parameter_names())
-        )
-        if "/" in scope and scope.split("/", 1)[0] not in declared_parameters:
-            return {
-                "ok": False,
-                "code": "attention_kernel_unsupported",
-                "detail": f"{aggregate_pin} matches no model in {list(declared_parameters)}",
-            }
 
         # ONE authorization for the PROCESS: each model fits under what everything already
         # loaded left of it, measured by this process's own allocator before its fill.
@@ -2764,15 +2725,11 @@ class Executor:
                     budgets=row.budgets,
                     models=UNSET,
                     group=UNSET,
-                    attention_pin=aggregate_pin
-                    if attention.for_model(aggregate_pin, binding.parameter_names())
-                    else "",
                     model_key=f"{self.construction}#{binding.model_binding_path}"
                     if self.world > 1
                     else UNSET,
                     sequence_parallel_degree=max(self.world, 1),
                 ),
-                optional_attention_scope=True,
             )
             if not reply.get("ok"):
                 self.poisoned = child.poisoned or (
@@ -2788,15 +2745,6 @@ class Executor:
             name[0].startswith(self.construction + "#") for name in self.host.group_sharded
         ):
             return self._group_refusal(GroupRefusal("the model set contains no sharded component"))
-        if aggregate_pin and not any(
-            child.attention and child.attention.pin for _, child, _ in children
-        ):
-            self.poisoned = "attention override matches no component"
-            return {
-                "ok": False,
-                "code": "attention_kernel_unsupported",
-                "detail": f"{aggregate_pin} matches no attention component",
-            }
         self.model_executors = [child for _, child, _ in children]
         self.torch = children[-1][1].torch
         self.models = {}
@@ -3274,7 +3222,8 @@ class Executor:
                             trees=_trees(command),
                             assets=_granted_inputs(command),
                             max_input_bytes=(
-                                None if command.max_input_bytes is None
+                                None
+                                if command.max_input_bytes is None
                                 else command.max_input_bytes or 64 << 20
                             ),
                             max_output_bytes=command.max_output_bytes,
@@ -3416,7 +3365,10 @@ class Executor:
             "position": record.position,
             "outcome": terminal,
             "execution_observation": self._execution_observation(served_attention),
-            "attention_applied": bool(pin),
+            # A pin is applied where its kernel served; one that fell back everywhere is not.
+            "attention_applied": bool(pin)
+            and attention._pin_parts(pin)[1]
+            in (served_attention.totals() if served_attention else {}),
             "execution": self._execution(
                 requested,
                 served_attention,
@@ -3468,32 +3420,6 @@ class Executor:
 
     # ------------------------------------------------------- the per-request attention pin
 
-    def _prepare_attention(
-        self,
-        binding: Binding,
-        roots: Mapping[str, Any],
-        pin: str,
-        device: Any,
-        *,
-        choose: Any = None,
-        optional_scope: bool = False,
-    ) -> attention.Applied:
-        """Select locally while preserving the caller's explicit qualified pin."""
-        local = _local_attention_pin(pin, binding.parameter_names())
-        scope, _ = attention._pin_parts(local)
-        if (
-            optional_scope
-            and "/" not in attention._pin_parts(pin)[0]
-            and scope
-            and not any(
-                attention._matches(component, scope)
-                for component, _, _, _ in attention._attention_records(roots)
-            )
-        ):
-            local = ""
-        applied = attention.select(device, roots, local, degree=self.world, choose=choose)
-        return replace(applied, pin=pin) if local else applied
-
     def _attention_snapshot(self) -> attention.Snapshot:
         return attention.Snapshot(
             tuple(
@@ -3537,7 +3463,7 @@ class Executor:
                     continue
                 if row["selected"] in observed.hosts.get(component, {}):
                     fallbacks.append({**row, "component": component})
-        return replace(observed, fallbacks=tuple(fallbacks))
+        return replace(observed, fallbacks=observed.fallbacks + tuple(fallbacks))
 
     def _attention_reaches(self, pin: str) -> bool:
         try:
@@ -3989,8 +3915,7 @@ class Executor:
                 trees=_trees(command),
                 assets=_granted_inputs(command),
                 max_input_bytes=(
-                    None if command.max_input_bytes is None
-                    else command.max_input_bytes or 64 << 20
+                    None if command.max_input_bytes is None else command.max_input_bytes or 64 << 20
                 ),
                 max_output_bytes=command.max_output_bytes,
                 scratch=scratch,
