@@ -435,6 +435,9 @@ class Scale(torch.nn.Module):  # type: ignore[misc,name-defined]
         super().__init__()
         self.weight = torch.nn.Parameter(torch.empty(width, dtype=torch.float16))
 
+    def forward(self, x: Any) -> Any:
+        return x * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
+
 
 class SiblingBlock(Block):
     """Reads its sub-modules' weights itself: a norm scale, and a whole projection."""
@@ -1387,6 +1390,43 @@ def test_a_component_without_blocks_streams_inside_an_owners_cap(tmp_path: Path)
     assert facts.oom_retries > retries
     assert peak + context <= cap
     assert exact
+
+
+class Twice(Block):
+    """Its projection called twice in a row, as SeedVR2 calls a shared-weight projection once
+    for video and once for text."""
+
+    def forward(self, x: Any) -> Any:
+        return x + torch.tanh(self.out(torch.tanh(self.proj(self.proj(x * self.norm)))))
+
+
+class FlatTwice(Flat):
+    def __init__(self) -> None:
+        super().__init__()
+        self.blocks = torch.nn.ModuleList([Twice() for _ in range(BLOCKS)])
+
+
+@on_gpu
+def test_a_module_called_again_right_after_itself_streams_once(tmp_path: Path) -> None:
+    """Run 5540: SeedVR2's shared-weight projections are called twice in a row. The cursor
+    served the second call by skipping a whole pass, copying every block and handing it on
+    unread: 300 GB of copies in one 17-frame window. A block not due within the cursor's
+    window is filled on demand instead, and the stream copies each pass about once."""
+    weights = Weights(torch, torch.device("cuda", 0), "cuda")
+    weights.set_budget(1 << 30, pinned=1 << 30)
+    model = load(weights, write_checkpoint(tmp_path)[0], "twice", factory=FlatTwice)
+    layout: weight_policy.Layout = model.residency.components["stack"].layout
+    x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
+    resident = run(model, x)
+    model.residency.unpark()
+    weights.set_budget(layout.common + 4 * layout.largest)
+    run(model, x, passes=2)  # the order is learned, then streamed
+    before = weights.facts().h2d_bytes
+    streamed = run(model, x)
+    assert weights.facts().streamed["stack"].resident_blocks < len(layout.blocks)
+    per_pass = (weights.facts().h2d_bytes - before) / 3
+    assert per_pass < 2 * layout.total, per_pass / layout.total
+    assert same(resident, streamed)
 
 
 @on_gpu
