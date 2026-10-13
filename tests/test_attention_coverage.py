@@ -88,7 +88,7 @@ def test_default_keeps_legacy_untouched_and_does_not_report_a_selection() -> Non
     assert attention.observed({"legacy": legacy}).totals() == {}
 
 
-@pytest.mark.parametrize("operation", ["select", "install", "check", "plan"])
+@pytest.mark.parametrize("operation", ["select", "install"])
 def test_mixed_scope_explicit_pin_refuses_partial_coverage(operation: str) -> None:
     legacy, mixed = _modules()
     before = mixed["managed"].processor._attention_backend
@@ -100,6 +100,15 @@ def test_mixed_scope_explicit_pin_refuses_partial_coverage(operation: str) -> No
             getattr(attention, operation)(_device(), roots, "mixed=sdpa")
     assert not hasattr(legacy.processor, "_attention_backend")
     assert mixed["managed"].processor._attention_backend is before
+
+
+def test_a_request_pin_takes_the_sites_it_can_and_says_why_not_the_rest() -> None:
+    legacy, mixed = _modules()
+    swap = attention.plan(_device(), {"mixed": mixed}, "mixed=sdpa")
+    assert len(swap.sites) == 1
+    (row,) = swap.fallbacks
+    assert row["preferred"] == "sdpa" and "per-site" in row["reason"]
+    assert not hasattr(legacy.processor, "_attention_backend")
 
 
 def test_author_sees_empty_choices_for_legacy_and_cannot_force_it() -> None:
@@ -129,5 +138,5 @@ def test_scoped_pin_does_not_require_control_of_an_unselected_legacy_component()
     applied = attention.select(_device(), roots, "dit=sdpa")
     assert applied.hosts == {"dit": {"sdpa": 1}}
     assert not hasattr(legacy.processor, "_attention_backend")
-    with pytest.raises(attention.AttentionRefusal, match="per-site"):
-        attention.plan(_device(), roots, "vae=sdpa")
+    unmanaged = attention.plan(_device(), roots, "vae=sdpa")
+    assert unmanaged.entry is None and "per-site" in unmanaged.fallbacks[0]["reason"]

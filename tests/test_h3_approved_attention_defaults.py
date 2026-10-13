@@ -184,8 +184,9 @@ def test_unsupported_recipe_is_reported_and_generic_policy_stays_supported(sm: i
 
 def test_explicit_fp4_on_hopper_and_producer_on_multiple_gpus_refuse() -> None:
     device = DeviceFacts(kind="cuda", name="H100", sm=90, driver="", configuration="", index=0)
-    with pytest.raises(attention.AttentionRefusal, match="serves SM"):
-        attention.check(device, roots(), "kitchen-sol-fp4-lowmem")
+    swap = attention.plan(device, roots(), "kitchen-sol-fp4-lowmem")
+    assert swap.entry is None and swap.fallbacks
+    assert all("serves SM" in row["reason"] for row in swap.fallbacks)
     with pytest.raises(attention.AttentionRefusal, match="context parallelism"):
         attention.admit("kitchen-sol-producer-fast-shared-qkv", 4)
 

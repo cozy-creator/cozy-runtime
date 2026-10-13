@@ -275,6 +275,9 @@ class Recipe:
     unit_bytes: int = 4 << 30
     #: Recipe-specific, pinned build tools; staged ahead of ambient packages and keyed by SHA.
     build_deps: tuple[str, ...] = ()
+    #: recipes whose kernels this build also holds under the same module: imported first, it
+    #: serves them too, so one process never needs both
+    serves: tuple[str, ...] = ()
 
 
 #: The cards upstream SageAttention builds its SM89 and SM80 kernel families for.
@@ -331,7 +334,14 @@ RECIPES: dict[str, Recipe] = {
                 )
             },
         ),
-        Recipe("sageattention-full", "setup", ("sageattention",), env=_SAGE, extensions=4),
+        Recipe(
+            "sageattention-full",
+            "setup",
+            ("sageattention",),
+            env=_SAGE,
+            extensions=4,
+            serves=("sageattention",),
+        ),
         Recipe(
             "sageattn3",
             "setup",
@@ -406,6 +416,7 @@ RECIPES: dict[str, Recipe] = {
             place={"flash-attention-cutlass": "csrc/cutlass"},
             env={f"FLASH_ATTENTION_DISABLE_{part}": "TRUE" for part in _FA3_OFF},
             unit_bytes=5 << 30,
+            serves=("flash-attn3",),
             replace=(
                 (
                     "hopper/setup.py",

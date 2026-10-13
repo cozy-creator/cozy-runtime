@@ -160,14 +160,26 @@ def test_model_scope_and_restore_use_actual_executor_roots(
     assert _choices(all_roots) == ("_cozy_sdpa",) * (2 * model_count)
 
 
-def test_scoped_pin_preserves_compiled_and_parallel_fences() -> None:
+def test_a_pin_falls_back_visibly_where_its_kernel_cannot_run() -> None:
+    """A compiled module keeps the kernel it was compiled with, and a kernel this card cannot
+    run keeps the prepared one: the request records why instead of failing or silently
+    serving another kernel."""
     roots = _roots()
+    attention.select(_device(), roots)
     roots["dit"][0]._compiled_call_impl = lambda: None
-    with pytest.raises(attention.AttentionRefusal) as exc:
-        attention.plan(_device(), roots, "dit=sdpa")
-    assert exc.value.code == "attention_kernel_frozen"
-    attention.plan(_device(), roots, "vae=sdpa")
-    attention.plan(_device(), roots, "vae=sdpa", 2)  # a group swaps per request too
+    swap = attention.plan(_device(), roots, "dit=cudnn")
+    assert swap.entry is None and not swap.sites
+    (row,) = swap.fallbacks
+    assert (row["component"], row["preferred"], row["selected"]) == ("dit", "cudnn", "sdpa")
+    assert "compiled" in row["reason"]
+    applied = swap.apply()
+    assert applied.fallbacks == swap.fallbacks
+    assert "vae" not in {r["component"] for r in swap.fallbacks}
+    assert "dit: selected sdpa instead of cudnn" in applied.line()
+    card = attention.plan(_device(), roots, "vae=flash-attn3")
+    assert card.entry is None and "sm90" in card.fallbacks[0]["reason"]
+    assert len(attention.plan(_device(), roots, "vae=sdpa").sites) == 1
+    assert len(attention.plan(_device(), roots, "vae=sdpa", 2).sites) == 1  # a group too
 
 
 def test_a_compiled_construction_serves_the_pin_it_was_prepared_with(tmp_path: Path) -> None:
@@ -179,9 +191,30 @@ def test_a_compiled_construction_serves_the_pin_it_was_prepared_with(tmp_path: P
     executor.device_facts = _device()
     executor.backend = SimpleNamespace(roots=roots)
     assert executor._attention_plan("dit=sdpa") is None
-    with pytest.raises(attention.AttentionRefusal, match="before compilation") as refused:
-        executor._attention_plan("dit=flash-attn3")
-    assert refused.value.code == "attention_kernel_frozen"
+    other = executor._attention_plan("dit=flash-attn3")
+    assert other is not None and other.entry is None
+    assert "compiled" in other.fallbacks[0]["reason"]
+
+
+def test_a_pinned_build_is_imported_first_and_serves_the_default_too(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One process imports one build of a module. A pin known at load reserves its build,
+    which also holds the default kernel's; a pin needing another build than the one imported
+    is a fresh executor's (the machine starts one), never a refusal of the run."""
+    hopper = _cuda(90)
+    fa3, fp8 = attention.BY_NAME["flash-attn3"], attention.BY_NAME["flash-attn3-fp8"]
+    monkeypatch.setattr(attention, "_BUILDS", {})
+    attention.reserve("dit=flash-attn3-fp8", hopper)
+    assert attention._build(fa3) == attention._build(fp8) == "flash-attn3-full"
+    attention.reserve("sageattention-fp16pv", hopper)
+    assert attention._build(attention.BY_NAME["sageattention"]) == "sageattention-full"
+    monkeypatch.setattr(attention, "_BUILDS", {fa3.import_name: fa3.artifact})
+    assert attention._build(fa3) == "flash-attn3"
+    with pytest.raises(attention.AttentionRefusal) as needs:
+        attention.plan(hopper, _roots(), "dit=flash-attn3-fp8")
+    assert needs.value.code == "attention_kernel_needs_executor"
+    assert "flash-attn3-full" in str(needs.value)
 
 
 def test_registration_is_idempotent_local_and_dispatches_real_cpu_attention() -> None:

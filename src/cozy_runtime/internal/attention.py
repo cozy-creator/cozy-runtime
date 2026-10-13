@@ -23,7 +23,7 @@ import site
 import sys
 from collections import deque
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
 from importlib import import_module, util
 from pathlib import Path
@@ -427,15 +427,47 @@ _STATES: dict[str, kernel_compile.State] = {}
 #: raised stays refused for it.
 _READY: dict[tuple[str, DeviceFacts], Ready] = {}
 _BROKEN: dict[tuple[str, DeviceFacts], AttentionRefusal] = {}
+#: module -> the build this process imports it from, fixed by the first import or by `reserve`:
+#: a process holds one build of a module, so a kernel another build serves needs another one.
+_BUILDS: dict[str, str] = {}
+
+
+def _build(candidate: Candidate) -> str:
+    """The build serving CANDIDATE here: its own, or the module's build when that one holds
+    its kernels too; another build is a fresh executor's (`attention_kernel_needs_executor`)."""
+    build = _BUILDS.get(candidate.import_name, candidate.artifact)
+    if build == candidate.artifact or candidate.artifact in kernel_sources.RECIPES[build].serves:
+        return build
+    raise AttentionRefusal(
+        "attention_kernel_needs_executor",
+        f"{candidate.name} needs the {candidate.artifact} build of {candidate.import_name}; "
+        f"this executor imports {build}",
+    )
+
+
+def reserve(pin: str, device: DeviceFacts) -> None:
+    """A request pin known at load: its kernel's build becomes its module's for this process
+    before any default selection imports another, and starts compiling. Never refuses: the
+    request's own plan reports a kernel that cannot serve."""
+    try:
+        candidate = BY_NAME.get(_pin_parts(pin)[1])
+    except AttentionRefusal:
+        return
+    if candidate is None or not candidate.artifact or candidate.import_name in _BUILDS:
+        return
+    _BUILDS[candidate.import_name] = candidate.artifact
+    store = kernel_cache.configured()
+    if store is not None and not _device_admits(candidate, device):
+        with suppress(AttentionRefusal):
+            kernel_compile.submit(store, _job(candidate, device))
 
 
 def _job(candidate: Candidate, device: DeviceFacts) -> kernel_compile.Job:
+    build = _build(candidate)
     try:
-        return kernel_sources.job(candidate.artifact, device.sm)
+        return kernel_sources.job(build, device.sm)
     except kernel_sources.Absent as exc:
-        _STATES[candidate.name] = kernel_compile.State(
-            candidate.artifact, "absent", detail=str(exc)
-        )
+        _STATES[candidate.name] = kernel_compile.State(build, "absent", detail=str(exc))
         raise AttentionRefusal("attention_kernel_absent", f"{candidate.name}: {exc}") from exc
 
 
@@ -444,6 +476,7 @@ def _compiled(candidate: Candidate, device: DeviceFacts, wait: bool) -> dict[str
     when `wait`, or refuse with its state: `failed` for this machine run, `absent`, or
     `compiling` for a caller that only asks. A package environment that carries the module
     itself serves it, as its pinned version always has."""
+    _build(candidate)  # another build imported here refuses before any store or compile
     store = kernel_cache.configured()
     found = util.find_spec(candidate.import_name.split(".")[0])
     origin = str(found.origin or "") if found is not None else ""
@@ -469,12 +502,11 @@ def _compiled(candidate: Candidate, device: DeviceFacts, wait: bool) -> dict[str
         )
     tree = Path(state.path) / kernel_cache.SITE
     if built and not origin.startswith(str(tree)):
-        # One process imports one build of a module: another variant needs a fresh executor.
         raise AttentionRefusal(
-            "attention_kernel_unavailable",
-            f"{candidate.name}: this executor runs {origin}, another build of "
-            f"{candidate.import_name}; a fresh executor serves it",
+            "attention_kernel_needs_executor",
+            f"{candidate.name}: this executor imports {candidate.import_name} from {origin}",
         )
+    _BUILDS[candidate.import_name] = job.key.kernel
     site.addsitedir(str(tree))
     return {"artifact": job.key.kernel, "key": job.key.digest[:16], "compile_ms": str(state.ms)}
 
@@ -761,10 +793,7 @@ def available(device: DeviceFacts, skipped: dict[str, str] | None = None) -> lis
 
 def pinned(name: str, device: DeviceFacts) -> list[Ready]:
     """The single kernel the execution-path override names, or a typed refusal (cr-125).
-
-    A pin does not fall back. That is the whole point: a run that silently served another
-    kernel would make the A/B it was asked for meaningless.
-    """
+    A request's `plan` turns a refusal into a visible fallback, never a silent one."""
     candidate = BY_NAME.get(name)
     if candidate is None:
         raise AttentionRefusal(
@@ -1525,7 +1554,7 @@ def override(
             for component, path, module in swap.modules
             if getattr(module, "_cozy_sol_site", None) is None
         ]
-        if swap is not None and swap.entry.name in attention_sol.NAMES
+        if swap is not None and swap.entry is not None and swap.entry.name in attention_sol.NAMES
         else []
     )
     temporary_processors = (
@@ -1534,7 +1563,9 @@ def override(
             for _component, _path, module in swap.modules
             if not isinstance(module.processor, attention_producer.Processor)
         ]
-        if swap is not None and swap.entry.name in attention_producer.NAMES
+        if swap is not None
+        and swap.entry is not None
+        and swap.entry.name in attention_producer.NAMES
         else []
     )
     try:
@@ -1546,6 +1577,7 @@ def override(
             replace(
                 facts,
                 artifacts={**(facts.artifacts or {}), **(applied.artifacts or {})} or None,
+                fallbacks=applied.fallbacks,
             )
             if applied is not None
             else facts
@@ -1585,22 +1617,30 @@ def _baked_in(roots: Mapping[str, object]) -> str:
 class Swap:
     """A validated per-request attention backend change, applied atomically."""
 
-    entry: Ready
+    #: the pinned kernel, none when no site in scope can run it
+    entry: Ready | None
     sites: tuple[tuple[str, Any], ...]
     pin: str = ""
     modules: tuple[tuple[str, str, Any], ...] = ()
+    #: sites in scope that keep their prepared kernel, and why the pin could not run there
+    fallbacks: tuple[execution_evidence.AttentionFallback, ...] = ()
 
     def apply(self) -> Applied:
         hosts: dict[str, dict[str, int]] = {}
+        entry = self.entry
+        if entry is None:
+            return Applied(hosts, (), self.pin, fallbacks=self.fallbacks)
         _install_sites(
-            [(self.entry, component, path, module) for component, path, module in self.modules]
+            [(entry, component, path, module) for component, path, module in self.modules]
         )
         for component, processor in self.sites:
-            processor._attention_backend = self.entry.member
+            processor._attention_backend = entry.member
             hosts.setdefault(component, {})
-            hosts[component][self.entry.name] = hosts[component].get(self.entry.name, 0) + 1
-        artifacts = {self.entry.name: self.entry.artifact} if self.entry.artifact else None
-        return Applied(hosts, (self.entry.name,), self.pin or self.entry.name, artifacts)
+            hosts[component][entry.name] = hosts[component].get(entry.name, 0) + 1
+        artifacts = {entry.name: entry.artifact} if entry.artifact else None
+        return Applied(
+            hosts, (entry.name,), self.pin or entry.name, artifacts, fallbacks=self.fallbacks
+        )
 
 
 def _is_selected(defaults: Snapshot, roots: Mapping[str, object], pin: str) -> bool:
@@ -1639,64 +1679,75 @@ def admit(pin: str, degree: int) -> None:
             )
 
 
-def check(
-    device: DeviceFacts, roots: Mapping[str, object], name: str, degree: int = 1
-) -> Candidate:
-    """Refuse a request pin these sites, this device or this group degree cannot serve."""
-    admit(name, degree)
+def plan(device: DeviceFacts, roots: Mapping[str, object], name: str, degree: int = 1) -> Swap:
+    """A request pin on every site in its scope its kernel can run. A site it cannot (this
+    card, this shape, the group degree, a failed build, a compiled module) keeps its prepared
+    kernel, recorded with why: a pin falls back visibly, never silently. An unknown kernel,
+    a pin that reaches nothing and a build another executor must import refuse."""
+    admit(name, 1)
     scope, backend = _pin_parts(name)
     candidate = BY_NAME[backend]
     selected = {component: root for component, root in roots.items() if _matches(component, scope)}
-    blocked = _baked_in(selected)
-    if blocked:
-        raise AttentionRefusal(
-            "attention_kernel_frozen",
-            f"{name} cannot be pinned per request: {blocked}. "
-            "Prepare a new generation with this choice in the model attention policy "
-            "before compilation",
-        )
-    unsupported = _device_admits(candidate, device)
-    if unsupported:
-        raise AttentionRefusal("attention_kernel_unsupported", unsupported)
-    sites = 0
-    for component, path, module, processor in _attention_records(selected):
-        if not hasattr(processor, "_attention_backend"):
-            raise AttentionRefusal(
-                "attention_kernel_unsupported", _unmanaged_reason(component, path, processor)
-            )
-        if candidate.name in attention_producer.NAMES:
-            try:
-                attention_producer.validate(module)
-            except ValueError as exc:
-                raise AttentionRefusal("attention_kernel_unsupported", str(exc)) from exc
-        dtype, head_dim = _dtype(module), _head_dim(module)
-        if not _admits(candidate, dtype, head_dim):
-            raise _site_refusal(candidate.name, component, dtype, head_dim)
-        sites += 1
-    if not sites:
+    records = list(_attention_records(selected))
+    if not records:
         raise AttentionRefusal(
             "attention_kernel_unsupported", f"{name} matches no diffusers attention site"
         )
-    return candidate
-
-
-def plan(device: DeviceFacts, roots: Mapping[str, object], name: str, degree: int = 1) -> Swap:
-    candidate = check(device, roots, name, degree)
-    scope, _ = _pin_parts(name)
-    entry = pinned(candidate.name, device)[0]
-    if entry.name == "sol-attn" and not attention_sol.dense_identity():
+    held = observed(selected).hosts
+    why = _baked_in(selected)
+    why = why and f"{why}; a compiled module keeps the kernel it was compiled with"
+    entry = None
+    if not why and degree > 1:
+        _registry()
+        if not _context_parallel(_member(candidate)):
+            why = f"{backend} cannot shard sequence-parallel degree {degree}"
+    if not why:
+        try:
+            entry = pinned(backend, device)[0]
+        except AttentionRefusal as exc:
+            if exc.code in ("attention_kernel_unknown", "attention_kernel_needs_executor"):
+                raise
+            why = str(exc)
+    if entry is not None and entry.name == "sol-attn" and not attention_sol.dense_identity():
         _bind_sol_dense(_sol_dense((), device, {}, {}))
-    records = [
-        (component, path, module, processor)
-        for component, path, module, processor in _site_records(roots)
-        if _matches(component, scope)
-    ]
-    return Swap(
-        entry,
-        tuple((c, p) for c, _, _, p in records),
-        name,
-        tuple((c, path, m) for c, path, m, _ in records),
-    )
+    sites: list[tuple[str, Any]] = []
+    modules: list[tuple[str, str, Any]] = []
+    fallbacks: list[execution_evidence.AttentionFallback] = []
+    for component, path, module, processor in records:
+        reason = why or _site_reason(candidate, component, path, module, processor)
+        if reason:
+            row = execution_evidence.AttentionFallback(
+                component=component,
+                preferred=backend,
+                selected="+".join(sorted(held.get(component) or ())) or "its own attention",
+                reason=reason[:600],
+            )
+            if row not in fallbacks:
+                fallbacks.append(row)
+            continue
+        sites.append((component, processor))
+        modules.append((component, path, module))
+    return Swap(entry if sites else None, tuple(sites), name, tuple(modules), tuple(fallbacks))
+
+
+def _site_reason(
+    candidate: Candidate, component: str, path: str, module: Any, processor: Any
+) -> str:
+    """Why CANDIDATE cannot run this site, or empty."""
+    if not hasattr(processor, "_attention_backend"):
+        return _unmanaged_reason(component, path, processor)
+    if candidate.name in attention_producer.NAMES:
+        try:
+            attention_producer.validate(module)
+        except ValueError as exc:
+            return str(exc)
+    dtype, head_dim = _dtype(module), _head_dim(module)
+    if not _admits(candidate, dtype, head_dim):
+        return (
+            f"{candidate.name} does not serve {dtype or 'unknown'} activations at head "
+            f"dimension {head_dim or 'unknown'}"
+        )
+    return ""
 
 
 def select(
