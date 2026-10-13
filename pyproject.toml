@@ -82,7 +82,6 @@ mypy_path = "src:checks:tests:examples/marco-polo:tests/testdata/static_describe
 # The `extends` fixture imports its DEPENDENCY's modules, which is the whole point of it
 # (cr-117). The rich fixture is that dependency, so mypy is pointed at it rather than
 # told to ignore the import.
-exclude = "src/cozy_runtime/models/qwen_image21/upstream"
 strict = true
 warn_unreachable = true
 disallow_any_generics = true
@@ -140,15 +139,6 @@ module = ["cozy_runtime.internal.derive"]
 warn_unused_ignores = false
 
 [project.optional-dependencies]
-qwen-image21 = [
-    "diffusers>=0.40.0",
-    "transformers>=5.17",
-    "torch>=2.13",
-    "torchvision>=0.28",
-    "numpy>=1.26",
-    "safetensors>=0.8",
-    "tokenizers>=0.23.1",
-]
 # Builtins are imported only on explicit use. Worker images keep ownership of the
 # compatible Torch/CUDA family; this extra does not pin a CUDA wheel or index.
 minimax-h3 = [
@@ -186,7 +176,6 @@ adapters = [
 [tool.ruff]
 line-length = 100
 src = ["src", "checks", "tests", "examples", "scripts"]
-extend-exclude = ["src/cozy_runtime/models/qwen_image21/upstream"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
@@ -195,13 +184,3 @@ select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 # These aliases are reflected at runtime through typing.get_origin/get_args. PEP 695's
 # TypeAliasType is deliberately not transparent and would change the package contract.
 "src/cozy_runtime/author/_markers.py" = ["UP040"]
-
-# Upstream architecture is attributed, import-relocated source, not handwritten typed SDK code.
-[[tool.mypy.overrides]]
-module = ["cozy_runtime.models.qwen_image21.upstream.*"]
-follow_imports = "skip"
-ignore_errors = true
-
-[[tool.mypy.overrides]]
-module = ["cozy_runtime.models.qwen_image21.model"]
-disallow_subclassing_any = false
