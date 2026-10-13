@@ -1,0 +1,1 @@
+Leaving a decoded media stream early now just closes it; errors raised by an author's event generator in `save_video_stream`/`save_video_concat` propagate unchanged (only encoder failures are `output_encode`), and only PyAV/FFmpeg decode errors are `media_malformed`.

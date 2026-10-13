@@ -777,17 +777,18 @@ class StreamingMP4Encoder:
                 acodec.layout = "mono" if audio_channels == 1 else "stereo"
                 acodec.format = "fltp"
                 acodec.bit_rate = _AAC_BIT_RATE
+            if copy is None:
+                # Open both encoders and write the header here, as the first encode and mux
+                # would, so the encode thread (x264, mux) and the caller (AAC) never share them.
+                for stream in (self._video, self._audio):
+                    if stream is not None:
+                        stream.codec_context.open(strict=False)
+                self._container.start_encoding()
         except Exception:
             self._raw.close()
             path.unlink(missing_ok=True)
             raise
         if copy is None:
-            # Open both encoders and write the header here, as the first encode and mux
-            # would, so the encode thread (x264, mux) and the caller (AAC) never share them.
-            for stream in (self._video, self._audio):
-                if stream is not None:
-                    stream.codec_context.open(strict=False)
-            self._container.start_encoding()
             self._worker = threading.Thread(target=self._drain, name="mp4-encode", daemon=True)
             self._worker.start()
 

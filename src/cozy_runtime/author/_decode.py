@@ -653,8 +653,8 @@ AssetT = TypeVar("AssetT", ImageAsset, AudioAsset, VideoAsset)
 class DecodedMediaStream(Iterator[DecodedMediaEvent]):
     """One context-managed, single-consumer stream over verified media bytes.
 
-    PyAV, packets and the attempt-spool path remain private. A successful context must be
-    consumed to exhaustion so truncation and final decoder state are always checked.
+    PyAV, packets and the attempt-spool path remain private. Reading to the end checks
+    truncation and final decoder state; leaving the context early only closes it.
     """
 
     __slots__ = (
@@ -667,7 +667,6 @@ class DecodedMediaStream(Iterator[DecodedMediaEvent]):
         "_container",
         "_entered",
         "_events",
-        "_exhausted",
         "_extra_containers",
         "_extra_sources",
         "_limits",
@@ -706,7 +705,6 @@ class DecodedMediaStream(Iterator[DecodedMediaEvent]):
         self._extra_sources: list[BinaryIO] = []
         self._entered = False
         self._closed = False
-        self._exhausted = False
 
     def __enter__(self) -> DecodedMediaStream:
         if self._entered:
@@ -736,13 +734,16 @@ class DecodedMediaStream(Iterator[DecodedMediaEvent]):
                 f"verified input bytes could not be opened: {_safe_error(exc)}",
                 fields=[self._asset._input_id] if self._asset._input_id else (),
             ) from exc
-        except Exception as exc:
+        except self._av.FFmpegError as exc:
             self._close()
             raise MediaDecodeError(
                 f"media container could not be opened: {_safe_error(exc)}",
                 code="media_malformed",
                 fields=[self._asset._input_id] if self._asset._input_id else (),
             ) from exc
+        except BaseException:
+            self._close()
+            raise
 
     def __iter__(self) -> DecodedMediaStream:
         return self
@@ -761,11 +762,7 @@ class DecodedMediaStream(Iterator[DecodedMediaEvent]):
             event = next(self._events)
             self._asset._check_file()
             return event
-        except RuntimeFailure:
-            self._close()
-            raise
         except StopIteration:
-            self._exhausted = True
             self._close()
             self._asset._check_file()
             raise
@@ -779,25 +776,20 @@ class DecodedMediaStream(Iterator[DecodedMediaEvent]):
                 f"verified input bytes could not be read: {_safe_error(exc)}",
                 fields=[self._asset._input_id] if self._asset._input_id else (),
             ) from exc
-        except Exception as exc:
+        except self._av.FFmpegError as exc:
             self._close()
             raise MediaDecodeError(
                 f"media container could not be decoded: {_safe_error(exc)}",
                 code="media_malformed",
                 fields=[self._asset._input_id] if self._asset._input_id else (),
             ) from exc
+        except BaseException:
+            self._close()
+            raise
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
-        incomplete = exc_type is None and not self._exhausted
         self._close()
         self._asset._check_file()
-        if incomplete:
-            error = MediaDecodeError(
-                "decoded media stream exited before every event was consumed",
-                code="media_stream_incomplete",
-            )
-            _attribute(error, self._asset)
-            raise error
 
     def _close(self) -> None:
         if self._closed:
@@ -984,7 +976,7 @@ class MediaDecoder:
                 f"verified input bytes could not be read: {_safe_error(exc)}",
                 fields=[asset._input_id] if asset._input_id else (),
             ) from exc
-        except Exception as exc:
+        except av.FFmpegError as exc:
             raise MediaDecodeError(
                 f"audio container could not be decoded: {_safe_error(exc)}",
                 code="media_malformed",
@@ -1028,7 +1020,7 @@ class MediaDecoder:
                 f"verified input bytes could not be read: {_safe_error(exc)}",
                 fields=[asset._input_id] if asset._input_id else (),
             ) from exc
-        except Exception as exc:
+        except av.FFmpegError as exc:
             raise MediaDecodeError(
                 f"video container could not be decoded: {_safe_error(exc)}",
                 code="media_malformed",

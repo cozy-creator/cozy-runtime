@@ -352,6 +352,23 @@ def settle_frame(attempt: Attempt, handle: str) -> Asset:
 # --------------------------------------------------------------------------- services
 
 
+class _AuthorEvents(Iterator[DecodedMediaEvent]):
+    """An author's media events. What their iterator raises is the author's, never the encoder's."""
+
+    __slots__ = ("_events", "raised")
+
+    def __init__(self, events: Iterable[DecodedMediaEvent]) -> None:
+        self._events = iter(events)
+        self.raised: Exception | None = None
+
+    def __next__(self) -> DecodedMediaEvent:
+        try:
+            return next(self._events)
+        except Exception as exc:
+            self.raised = exc
+            raise
+
+
 class Outputs(_Bound):
     """Transactional outputs (``out``). Save registers a bounded pending handle.
 
@@ -449,7 +466,7 @@ class Outputs(_Bound):
         """Consume one canonical event stream into one bounded, probed, atomic MP4."""
         self._attempt.check_open("Outputs.save_video_stream")
         _codec.require_encoder()
-        source = iter(events)
+        source = _AuthorEvents(events)
         try:
             header = next(source)
         except StopIteration:
@@ -514,6 +531,7 @@ class Outputs(_Bound):
                 color_range=video_format.color_range,
             ),
             audio_format,
+            source,
             feed,
         )
 
@@ -547,7 +565,7 @@ class Outputs(_Bound):
             video._check_file()
             paths.append(video._local)
         copy = _codec.plan_video_copy(tuple(paths))
-        source = iter(soundtrack(copy.frames))
+        source = _AuthorEvents(soundtrack(copy.frames))
         header = next(source, None)
         if (
             not isinstance(header, DecodedMediaHeader)
@@ -592,6 +610,7 @@ class Outputs(_Bound):
                 color_range=copy.color_range,
             ),
             audio_format,
+            source,
             feed,
             copy,
         )
@@ -655,10 +674,12 @@ class Outputs(_Bound):
         self,
         video: dict[str, Any],
         audio_format: DecodedAudioFormat | None,
+        source: _AuthorEvents,
         feed: Callable[[_codec.StreamingMP4Encoder], int],
         copy: _codec.VideoCopy | None = None,
     ) -> SavedVideo:
-        """Write, probe and atomically register one MP4; `feed` returns its audio samples."""
+        """Write, probe and atomically register one MP4; `feed` writes `source` and returns
+        its audio samples. Only encoder failures become `output_encode`."""
         handle = self._attempt.next_handle(VideoAsset.kind)
         tail = handle.rsplit("/", 1)[-1]
         temporary = self._attempt.spool / f".video-{tail}.partial"
@@ -759,9 +780,9 @@ class Outputs(_Bound):
                 ),
                 submitted_audio_samples=audio_samples,
             )
-        except AuthorError:
-            raise
         except Exception as exc:
+            if isinstance(exc, AuthorError) or exc is source.raised:
+                raise
             raise OutputError(
                 f"streaming video encode failed: {type(exc).__name__}: {exc}",
                 code="output_encode",
