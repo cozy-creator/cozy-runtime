@@ -1,0 +1,1 @@
+An `out.publish(...)` to an output the function's result does not declare warns (run log and a Python warning) and drops that product instead of failing the run; the name is checked in-process against the result's asset fields, so a CPU test of the package sees it, and a machine refusing the name drops it the same way.

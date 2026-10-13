@@ -12,7 +12,7 @@ import inspect
 import math
 import types
 import typing
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence, Set
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal, get_args, get_origin
 
@@ -253,6 +253,12 @@ class Surface:
     """Model argument -> the components this callable runs; an absent argument runs all."""
 
     @property
+    def outputs(self) -> frozenset[str]:
+        """The result fields `Outputs.publish` may name, dotted, as the machine reads the
+        result schema: an asset takes one product, a list of assets grows by one."""
+        return frozenset(_asset_fields(self.result_type, ""))
+
+    @property
     def assets_binding(self) -> AssetsBinding | None:
         return next(
             (assets_binding(p.name, p.annotation) for p in self.params if p.role == "assets"), None
@@ -282,6 +288,28 @@ class Surface:
                 )
             )
         return tuple(bindings)
+
+
+_PUBLISHABLE = (ImageAsset, AudioAsset, VideoAsset, FileAsset)
+_LISTS = (list, Sequence, set, frozenset, Set)
+
+
+def _asset_fields(tp: object, prefix: str, seen: frozenset[type] = frozenset()) -> Iterator[str]:
+    """A required struct's asset and asset-list fields; an optional one renders as a union."""
+    base, _ = strip(tp)
+    if not isinstance(base, type) or not is_struct(base) or base in seen:
+        return
+    for row in msgspec.structs.fields(base):
+        name = prefix + row.encode_name
+        item, _ = strip(row.type)
+        origin, args = get_origin(item), get_args(item)
+        listed = (origin in _LISTS and len(args) == 1) or (origin is tuple and args[1:] == (...,))
+        if listed:
+            item, _ = strip(args[0])
+        if isinstance(item, type) and issubclass(item, _PUBLISHABLE):
+            yield name
+        elif not listed:
+            yield from _asset_fields(item, name + ".", seen | {base})
 
 
 def _hints(fn: Callable[..., object]) -> Mapping[str, object]:
