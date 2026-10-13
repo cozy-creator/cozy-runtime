@@ -1543,9 +1543,10 @@ class Executor:
                     stage("runtime_imports")
             if self.discovered is None:
                 self._install_call_proxies(command.call_interfaces)
-                self.call_interfaces = command.call_interfaces
                 self._discover_provisioned(command.release())
                 stage("package_import")
+            # A fork's own Start names them again; its import-only parent installed them.
+            self.call_interfaces = command.call_interfaces or self.call_interfaces
             compiles = (
                 self._expect_fusion(isolated=command.import_only)
                 if model_bearing and self.rank == 0 and not imported
