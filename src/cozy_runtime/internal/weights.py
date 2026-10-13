@@ -527,7 +527,7 @@ class Weights:
             if held > self.cap:
                 for residency in list(self.residencies):
                     residency.unpark()
-                self.shrink(held - self.cap, self.floor())
+                self.shrink(held - self.cap)
                 self.drain()
                 memory, held = self._held()
         slack = max(memory["reserved_bytes"] - memory["allocated_bytes"], 0)
@@ -674,18 +674,27 @@ class Weights:
             for t in region.derived
         )
 
-    def shrink(self, need: int, floor: int) -> int:
-        """OOM at a block boundary: give torch `need` more bytes by unmapping plane bytes. The
-        cut is from what is mapped, which a budget larger than the model never reaches, and
-        it holds until the Worker's next grant."""
-        mapped = max(plane.stats(self.plane).device(self.index).committed, 0)
-        target = max(min(self.applied, mapped) - need - weight_policy.MARGIN, floor)
+    def shrink(self, need: int, keep: int = 0) -> int:
+        """Out of memory: give torch `need` more bytes by unmapping plane bytes, least recently
+        used first, as far as what is in use (leased, held by a cursor, a ring) and never below
+        `keep`: never a planning floor, which counts regions no kernel reads now. The cut is
+        from what is mapped, which a budget larger than the model never reaches; the plane
+        holds it until the Worker's next grant, and a stage planned later never below the open
+        stages' floor."""
+        target = max(min(self.applied, self._committed()) - need - weight_policy.MARGIN, keep)
         if target >= self.applied:
             return 0
         self.oom_retries += 1
+        freed = self._apply(target)
+        # What the plane could not unmap is in use: the budget holds it, so the next map has
+        # exactly the room torch leaves (`grow`), not a deficit.
+        self._apply(max(self.applied, self._committed()))
         if self.budget >= 0:
-            self.budget = min(self.budget, target)
-        return self._apply(target)
+            self.budget = min(self.budget, max(self.applied, self.floor()))
+        return freed
+
+    def _committed(self) -> int:
+        return max(plane.stats(self.plane).device(self.index).committed, 0)
 
     def opened(self) -> dict[str, tuple[WeightResidency, str, Component]]:
         """Every open stage's components by weight set: their slot's residency and method."""
@@ -720,10 +729,9 @@ class Weights:
 
     def make_room(self, need: int, operands: Sequence[object], op: str = "") -> None:
         """An op ran out of device memory (outside every block, or inside one whose ops
-        recover one by one): unmap `need` bytes of weights, idle ones first. When the open
-        stages' floor leaves nothing to unmap, their components that are not in use give
-        theirs back (`_spare`): every one but those the op reads, those with a block in its
-        forward, and the one whose block ran last. An operand that is itself a weight must
+        recover one by one): unmap `need` bytes of weights nothing uses now, least recently
+        used first; when that gives nothing back, the open stages' components not in use give
+        theirs back (`WeightResidency._make_room`). An operand that is itself a weight must
         still be mapped after."""
         read = [
             (component.key, region, region.bound)
@@ -742,26 +750,16 @@ class Weights:
                 )
 
         accel.release_cached(self.torch, self.kind)
-        before = self.allocatable()
-        try:
-            if self.running:
-                # Inside a block: nothing is re-placed under its lease. Other weights leave,
-                # least recently used first; their blocks map them again as they run.
-                self.shrink(need, self.floor())
-                self.drain()
-            elif self.open:
-                self.open[-1][0]._make_room(need, op=op)
-            else:
-                self.shrink(need, 0)
-            mapped()
+        if self.open:
+            # Inside a block nothing is re-placed under its lease (None): other weights leave,
+            # and their blocks map them again as they run.
+            reads = {key for key, _, _ in read}
+            self.open[-1][0]._make_room(need, None if self.running else {}, op, reads)
+        else:
+            before = self.allocatable()
+            self.shrink(need)
             self.progressed(before, need, op)
-        except ResidencyRefusal as exc:
-            keep = {*self.running, self.last, *(key for key, _, _ in read)}
-            if exc.code != INDIVISIBLE or not self.open:
-                raise
-            if not self.open[-1][0]._spare(keep, None if self.running else {}):
-                raise
-            mapped()
+        mapped()
 
     def allocatable(self) -> int:
         """Device bytes torch can allocate now: its headroom plus its own idle cache."""
@@ -2430,7 +2428,7 @@ class PlaneBackend:
         old = self.components[name]
         self.weights.close(old)
         keys = [key for key in self.enqueued if self.plan[key].component == name]
-        component = self._register(name, old.root, keys, fine=True)
+        component = self._register(name, old.root, keys, refine=True)
         self.components[name] = component
         self.weights.register(component)
         return component
@@ -2454,9 +2452,14 @@ class PlaneBackend:
         self, name: str, root: Module, keys: list[str], *, fine: bool = False
     ) -> _Prepared:
         """Partition the component into regions (common, then each block or sub-block unit)
-        and plan its read: everything its weight set's layout is made of."""
+        and plan its read: everything its weight set's layout is made of. A component that
+        declares no blocks is paged at the sub-block grain: as one region nothing below its
+        whole size could hold it (run 5424, SeedVR2's 6.4 GB DiT on an 8 GB card)."""
         try:
             layout = partition(root, REGION_LIMIT if fine else None)
+            if layout is None and not fine:
+                layout = partition(root, REGION_LIMIT)
+                fine = layout is not None
         except ValueError:
             layout = None  # storage shared across units: one region, not streamable
         units = [unit.path for unit in layout.blocks] if layout is not None else []
@@ -2494,7 +2497,7 @@ class PlaneBackend:
             regions=tuple(tuple(group) for group in ids),
             parts=tuple(parts),
         )
-        return _Prepared(keys, units, kept, checkpoint, plan, ids, digest, sealed_plan)
+        return _Prepared(keys, units, kept, checkpoint, plan, ids, digest, sealed_plan, fine)
 
     def _register(
         self,
@@ -2502,18 +2505,18 @@ class PlaneBackend:
         root: Module,
         keys: list[str],
         *,
-        fine: bool = False,
+        refine: bool = False,
         prepared: _Prepared | None = None,
     ) -> Component:
         """Register the component's layout as one weight set and bind every stored part to
-        its destinations."""
-        layout = prepared or self._prepare_layout(name, root, keys, fine=fine)
+        its destinations; `refine`: again, at the sub-block grain."""
+        layout = prepared or self._prepare_layout(name, root, keys, fine=refine)
         units, kept, checkpoint, plan = layout.units, layout.kept, layout.checkpoint, layout.plan
         ids, digest, key = layout.ids, layout.digest, layout.sealed.name
         weights = self.weights
         # Standalone checkpoints can reread their explicit Store for a finer layout.
         # Managed checkpoints ask TensorD for the finer shared CPU layout instead.
-        tiers = None if fine and checkpoint.store is not None else self.tiers
+        tiers = None if refine and checkpoint.store is not None else self.tiers
         with store_refusals(f"registering {name}"):
             held = None
             if tiers is not None and tiers.seal is not None:
@@ -2612,9 +2615,9 @@ class PlaneBackend:
             layout=weight_policy.Layout(
                 common=common.span if common else 0,
                 blocks=tuple(region.span for region in blocks),
-                fine=None if fine else _fine(root),
+                fine=None if layout.fine else _fine(root),
             ),
-            fine=fine,
+            fine=layout.fine,
             staging=(layout.sealed, tiers)
             if sealed and tiers is not None and tiers.stage
             else None,
@@ -2627,7 +2630,7 @@ class PlaneBackend:
             region.locate = weights.content
         if any(region.bake for region in regions):  # its kernels build at load, in a child
             lora_bake.warm(weights.device.index or 0)
-        if not fine:
+        if not refine:
             weights.attach(component)
         return component
 
@@ -2683,6 +2686,8 @@ class _Prepared:
     ids: list[list[str]]
     digest: str
     sealed: SealedPlan
+    #: regions of at most `REGION_LIMIT` bytes
+    fine: bool
 
 
 class _Span(msgspec.Struct, frozen=True):
@@ -3739,7 +3744,7 @@ class WeightResidency:
         for component in opened:
             close_cursor(component)
         if opened:
-            self._place(self.weights.applied, resume)
+            self._place(max(self.weights.applied, self.weights.floor()), resume)
 
     def _restore(self, component: Component, region: Region) -> None:
         """Give a block the stored bytes again (its resident ones hold a delta its forward
@@ -3764,7 +3769,7 @@ class WeightResidency:
         ]
         weights.refill(component, stale)
         if opened:
-            self._place(weights.applied, {component.key: region.index})
+            self._place(max(weights.applied, weights.floor()), {component.key: region.index})
 
     def _bake_resident(self, component: Component) -> None:
         """A forward baked one of the component's stage-resident regions: bake the rest of the
@@ -3782,22 +3787,38 @@ class WeightResidency:
             finally:
                 lease.release()
 
-    def _make_room(self, need: int, resume: Mapping[str, int] = {}, op: str = "") -> None:
-        """Activations first: unmap `need` bytes of weights, idle ones first, then re-place the
-        open stages (a block that runs again resumes its component's cursor: `resume`)."""
+    def _make_room(
+        self,
+        need: int,
+        resume: Mapping[str, int] | None = {},
+        op: str = "",
+        reads: Collection[str] = (),
+    ) -> None:
+        """Activations first: unmap `need` bytes of weights nothing uses now, least recently
+        used first, then re-place the open stages (a block that runs again resumes its
+        component's cursor: `resume`; None: inside a block's forward, nothing is re-placed
+        under its lease). When that gives nothing back, the components not in use give theirs
+        back (`_spare`): every one but those with a block in its forward, those the op
+        `reads` and the block that runs again; the one whose block ran last goes only when
+        nothing else is left to give."""
         weights = self.weights
-        opened = [component for _, _, component in weights.opened().values()]
         method = weights.open[-1][1] if weights.open else ""
         before = weights.allocatable()
-        for component in opened:
-            close_cursor(component)
-        weights.shrink(need, weights.floor())
-        if opened:
-            self._place(weights.applied, resume)
+        if resume is None:
+            weights.shrink(need)
+            weights.drain()
+        else:
+            opened = [component for _, _, component in weights.opened().values()]
+            for component in opened:
+                close_cursor(component)
+            weights.shrink(need)
+            if opened:
+                self._place(max(weights.applied, weights.floor()), resume)
         try:
             weights.progressed(before, need, op or f"{method}()")
         except ResidencyRefusal:
-            if not self._spare(resume, resume):
+            certain = {*weights.running, *reads, *(resume or {})}
+            if not (self._spare({*certain, weights.last}, resume) or self._spare(certain, resume)):
                 raise
 
     def _spare(self, keep: Collection[str], resume: Mapping[str, int] | None) -> bool:
@@ -3807,11 +3828,11 @@ class WeightResidency:
         in `keep` give theirs back: leases released, regions unbound and unmapped. A read of
         one meanwhile maps it for that op (`Weights.reading`), and its next block maps its
         common again (`_unspare`). The open stages are re-placed with `resume` (None: a block
-        is in its forward, and nothing is re-placed under its lease). False when nothing is
-        kept (nothing is known to be in use) or nobody else held anything."""
+        is in its forward, and nothing is re-placed under its lease). With nothing in `keep`
+        known to be in use, every one gives back. False when nobody else held anything."""
         weights = self.weights
         opened = weights.opened()
-        if weights.host_only or not any(key in opened for key in keep):
+        if weights.host_only:
             return False
         idle = [
             component
@@ -3840,7 +3861,7 @@ class WeightResidency:
         # no room: the plane keeps what the running component streams in, torch the rest.
         weights._apply(min(weights.applied, max(weights.window(), weights.floor())))
         if resume is not None:
-            self._place(weights.applied, resume)
+            self._place(max(weights.applied, weights.floor()), resume)
         after = max(plane.stats(weights.plane).device(weights.index).committed, 0)
         if after >= before:
             return False

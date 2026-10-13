@@ -1334,6 +1334,85 @@ def test_an_op_out_of_memory_spares_the_components_not_in_use(
     residency.unpark()
 
 
+class Flat(Stack):
+    """A component that declares no blocks, as SeedVR2's NaDiT declares none."""
+
+    _no_split_modules = None
+
+
+@on_gpu
+def test_a_component_without_blocks_streams_inside_an_owners_cap(tmp_path: Path) -> None:
+    """Run 5424: SeedVR2's 6.4 GB DiT declares no blocks, so it was one region on an 8 GB card,
+    leased for its whole stage; nothing could unmap it, and the first activation that did not
+    fit beside it was refused. A component without blocks pages at the sub-block grain: its
+    ops between regions (`x * norm`, `tanh`) run out of memory at the cap, its weights leave
+    for them, and it computes the same bits inside the cap."""
+    weights = Weights(torch, torch.device("cuda", 0), "cuda")
+    weights.set_budget(-1, pinned=1 << 30)
+    model = load(weights, write_checkpoint(tmp_path)[0], "flat", factory=Flat)
+    component = model.residency.components["stack"]
+    assert component.fine and len(component.blocks) == 2 * BLOCKS
+    x = torch.randn(1 << 15, HIDDEN, device="cuda", dtype=torch.float16)  # 128 MiB each
+
+    def recovered(x: Any) -> list[Any]:
+        with weights.recovering():
+            return run(model, x, passes=1)
+
+    torch.cuda.reset_peak_memory_stats()
+    live = torch.cuda.memory_allocated()
+    uncapped = recovered(x)
+    measured = torch.cuda.max_memory_allocated() - live
+    model.residency.unpark()
+    weights.set_budget(0)
+    torch.cuda.empty_cache()
+    weights.measure_context()
+    context = max(weights.context_bytes, 0)
+    # Room for the activations and a margin, not for the weights beside them as well.
+    cap = context + torch.cuda.memory_reserved() + measured + weight_policy.MARGIN
+    assert component.layout.total > weight_policy.MARGIN
+    weights.activation.clear()  # unmeasured: the stage keeps every weight it can
+    retries = weights.facts().oom_retries
+    torch.cuda.reset_peak_memory_stats()
+    weights.set_cap(cap)
+    try:
+        weights.set_budget(-1)
+        capped = recovered(x)
+        peak = torch.cuda.max_memory_reserved()
+        facts = weights.facts()
+    finally:
+        weights.set_cap(-1)
+    exact = same(uncapped, capped)
+    del x, uncapped, capped
+    torch.cuda.empty_cache()
+    assert facts.oom_retries > retries
+    assert peak + context <= cap
+    assert exact
+
+
+@on_gpu
+def test_a_stage_with_no_component_known_in_use_spares_them_all(tmp_path: Path) -> None:
+    """Run 5439: no block of the stage had run, so nothing was known to be in use, and the
+    stage's components kept their weights while an op could not get memory. Not knowing which
+    is in use, every one the op does not read gives its weights back; a read maps them again
+    for that op, and the results are the same bits."""
+    weights, residency, modules = scoped(tmp_path)
+    scope = ("encoder", "stack")
+    x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
+    encoder, stack = residency.components["encoder"], residency.components["stack"]
+    residency.admit("run", scope)
+    try:
+        with torch.inference_mode():
+            reference = modules["stack"](modules["encoder"](x))
+            mapped = weights.facts().committed_bytes
+            assert residency._spare({"another construction/vae"}, {})
+            assert encoder.spared and stack.spared
+            assert weights.facts().committed_bytes < mapped
+            assert torch.equal(modules["stack"](modules["encoder"](x)), reference)
+    finally:
+        residency.release("run", scope)
+    residency.unpark()
+
+
 @on_card
 def test_an_idle_construction_gives_room_and_returns_from_the_pinned_tier(card: Any) -> None:
     weights = card.weights
