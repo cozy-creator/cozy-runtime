@@ -1,8 +1,15 @@
-"""Bounded, completed-segment H3 AV context and exact delivered-frame clocks.
+"""H3 segment continuation: the previous segment's sampled AV latents, carried across a join.
 
-Reference: AIMixer/ComfyUI_MiniMaxH3_Director@4b4fe6e1a7e68b17f4a36c8b3e942667defab61f
-and yolain/ComfyUI-Easy-Media@ed20432dcb744895c94c8b5b0eed90f36234a55b.
-This is model-local data/math, not a filesystem or mid-denoise checkpoint service.
+A segment carries a picture window and/or one second of sound, sliced from its predecessor's
+denoised latents: no decode, no re-encode. A picture window is whole VAE cycles ending at the
+predecessor's last sampled frame, so its tokens keep their 1/4/4/4/4 phase. They are condition
+rows on the target head, which is regenerated and cut: the owner's double form (2026-10-10),
+in the denoise window and as a reference, never one copy (tag
+archive/h3-single-copy-context-20261010). The sound is the predecessor's last 40 audio ticks,
+placed on this clip's timeline exactly where they ended on the predecessor's.
+
+Reference: NikoDemon80/ComfyUI-H3-Motion-Context and AIMixer/ComfyUI_MiniMaxH3_Director
+(latent tails, cycle-aligned windows, a 24-frame sound window ending at the join).
 """
 
 from __future__ import annotations
@@ -10,302 +17,267 @@ from __future__ import annotations
 import json
 import struct
 from dataclasses import dataclass
+from fractions import Fraction
 from typing import Any, NoReturn, cast
 
-import numpy as np
 import torch
 from safetensors.torch import load, save
 
 from cozy_runtime.author import InvalidRequest
 
 FPS = 24
+#: Audio latents run at 40 Hz: a video frame is 5/3 of an audio tick.
+TICKS_PER_FRAME = Fraction(5, 3)
+#: Picture windows of whole VAE cycles (17k + 5 frames).
 CONTEXT_FRAMES = (22, 39, 56)
-MAX_CONTEXT_FRAMES = 56
-MAX_CONTEXT_BYTES = 64 << 20
+#: One second of sound, 24 frames: exactly 40 ticks, whatever the picture window.
+AUDIO_TICKS = 40
+MAX_FRAMES = 362
+MAX_CONTEXT_BYTES = 16 << 20
 MAX_CONTEXT_PIXELS = 1344 * 768
-CONTEXT_SCHEMA = "cozy.minimax-h3.av-context/2"
+CONTEXT_SCHEMA = "cozy.minimax-h3.av-context/3"
 
 
 def _refuse(message: str) -> NoReturn:
     raise InvalidRequest(message, code="h3_continuation", fields=["context"])
 
 
-def audio_sample_range(start: int, end: int, sample_rate: int) -> tuple[int, int]:
-    """Half-open audio interval on the absolute frame clock; never round each clip."""
-    if type(start) is not int or type(end) is not int or start < 0 or end < start:
-        _refuse("context frame interval is invalid")
-    if sample_rate != 32000:
-        _refuse("H3 continuation requires its native 32000 Hz audio clock")
-    return start * sample_rate // FPS, end * sample_rate // FPS
+def video_tokens(frames: int) -> int:
+    """Video latents of a `17k + 5` frame run."""
+    return 5 * ((frames - 5) // 17) + 2
 
 
-# Intended design: the denoise window is new frames + context on the 17n+5 grid (12 s:
-# 288 + 56 -> 345; the 362 check applies to this window), and the same context frames are
-# ALSO passed as a reference video (17 clean condition latents), as in MiniMax fl2va and
-# Director's guide mode. Not duplication to remove: single-copy was tested and rejected
-# by the owner (2026-10-10, tag archive/h3-single-copy-context-20261010).
+def audio_ticks(frames: int) -> int:
+    """H3's audio latents for `frames`: 5/3 a frame, rounded to the nearest tick."""
+    return (5 * frames + 1) // 3
+
+
 @dataclass(frozen=True)
-class ContinuationPlan:
-    delivered_frames: int
-    prefix_frames: int = 0
+class Carry:
+    """What a segment takes from its predecessor: a picture window and/or a second of sound."""
+
+    frames: int = 0
+    audio: bool = False
 
     def __post_init__(self) -> None:
-        if type(self.delivered_frames) is not int or not 120 <= self.delivered_frames <= 360:
-            _refuse("continuation must deliver between 120 and 360 new frames (5-15 seconds)")
-        if type(self.prefix_frames) is not int or self.prefix_frames not in (0, *CONTEXT_FRAMES):
-            _refuse("continuation context must contain 22, 39 or 56 frames")
-        if self.sample_frames > 362:
+        if type(self.frames) is not int or self.frames not in (0, *CONTEXT_FRAMES):
+            _refuse("a carried picture window is 0, 22, 39 or 56 frames")
+        if type(self.audio) is not bool:
+            _refuse("carried sound is a boolean")
+
+    def __bool__(self) -> bool:
+        return bool(self.frames or self.audio)
+
+
+@dataclass(frozen=True)
+class ContinuationPlan:
+    """One segment's clocks. It samples its carried picture window plus `seconds` on the
+    `17n + 5` grid (snapped up, as `frames_for` does) and cuts the regenerated head. Its
+    picture ends at the last sampled frame, where a successor's picture window must end;
+    a successor carrying sound alone needs the sound to reach the join, so the picture
+    then ends on the last frame the sound covers (one frame earlier when the grid rounds
+    the sound down)."""
+
+    seconds: int
+    carried: Carry = Carry()
+    successor: Carry = Carry()
+
+    def __post_init__(self) -> None:
+        if type(self.seconds) is not int or not 5 <= self.seconds <= 15:
+            _refuse("a segment delivers 5-15 new seconds")
+        if self.sample_frames > MAX_FRAMES:
             _refuse(
-                f"{self.delivered_frames} new frames plus {self.prefix_frames} context frames "
-                f"requires {self.sample_frames} sampled frames, above the qualified 362-frame "
-                "envelope; shorten the segment"
+                f"{self.seconds} s plus {self.prefix_frames} carried frames samples "
+                f"{self.sample_frames} frames, above the {MAX_FRAMES}-frame envelope; "
+                "shorten the segment"
             )
 
     @property
+    def prefix_frames(self) -> int:
+        return self.carried.frames
+
+    @property
     def sample_frames(self) -> int:
-        frames = self.delivered_frames + self.prefix_frames
+        frames = self.prefix_frames + FPS * self.seconds
         return frames + (5 - frames) % 17
 
     @property
-    def delivery_start(self) -> int:
-        return self.prefix_frames
-
-    @property
     def delivery_end(self) -> int:
-        return self.prefix_frames + self.delivered_frames
-
-
-def plan_continuation(delivered_frames: int, *, context_frames: int = 0) -> ContinuationPlan:
-    return ContinuationPlan(delivered_frames, context_frames)
-
-
-@dataclass(frozen=True)
-class DeliveredAVWindow:
-    frames: Any  # uint8 CPU ndarray, [frames,height,width,RGB]
-    audio: Any  # float32 CPU tensor, [stereo,samples]
-    sample_rate: int
-    source_start_frame: int
-    source_end_frame: int
-    provenance: str
-
-    def __post_init__(self) -> None:
-        self.validate()
-
-    def validate(self) -> None:
-        if not isinstance(self.frames, np.ndarray) or self.frames.dtype != np.uint8:
-            _refuse("context video must be uint8 RGB pixels")
-        if self.frames.ndim != 4 or self.frames.shape[-1] != 3:
-            _refuse("context video must have shape [frames,height,width,3]")
-        n, height, width, _ = self.frames.shape
-        if n not in CONTEXT_FRAMES or min(height, width) < 32 or height % 32 or width % 32:
-            _refuse("context frame count or 32-pixel canvas stride is invalid")
-        if height * width > MAX_CONTEXT_PIXELS:
-            _refuse("context canvas exceeds the qualified H3 canvas area")
-        if type(self.source_start_frame) is not int or type(self.source_end_frame) is not int:
-            _refuse("context source frame clock must use integer frames")
-        if self.source_end_frame - self.source_start_frame != n or self.source_end_frame > 362:
-            _refuse("context source frame interval does not match its video")
-        start, end = audio_sample_range(
-            self.source_start_frame, self.source_end_frame, self.sample_rate
-        )
-        if (
-            not isinstance(self.audio, torch.Tensor)
-            or self.audio.device.type != "cpu"
-            or self.audio.dtype != torch.float32
-            or self.audio.ndim != 2
-            or tuple(self.audio.shape) != (2, end - start)
-            or not bool(torch.isfinite(self.audio).all())
-        ):
-            _refuse("context audio must be finite float32 stereo at its exact frame interval")
-        if (
-            not isinstance(self.provenance, str)
-            or not self.provenance
-            or len(self.provenance.encode("utf-8")) > 16384
-        ):
-            _refuse("context requires bounded renderer provenance")
+        if self.successor.audio and not self.successor.frames:
+            return min(self.sample_frames, 3 * audio_ticks(self.sample_frames) // 5)
+        return self.sample_frames
 
     @property
-    def frame_count(self) -> int:
-        return int(self.frames.shape[0])
+    def delivered_frames(self) -> int:
+        return self.delivery_end - self.prefix_frames
 
-    def select(self, frames: int) -> DeliveredAVWindow:
-        self.validate()
-        if type(frames) is not int or frames not in CONTEXT_FRAMES or frames > self.frame_count:
-            _refuse("requested continuation window is absent from the completed tail")
-        start_frame = self.source_end_frame - frames
-        old_start, _ = audio_sample_range(
-            self.source_start_frame, self.source_end_frame, self.sample_rate
+    @property
+    def exit_offset(self) -> Fraction:
+        """Where the carried second of sound ends past the picture join, in ticks."""
+        if not self.successor.audio:
+            return Fraction(0)
+        return audio_ticks(self.sample_frames) - TICKS_PER_FRAME * self.delivery_end
+
+    def audio_samples(self, entry: Fraction, sample_rate: int) -> tuple[int, int]:
+        """The delivered sound: from where the predecessor's ended (`entry` ticks past the
+        picture join, carried sound only) to the end of this segment's own sound when a
+        successor carries it, else to the picture's end."""
+        start = TICKS_PER_FRAME * self.prefix_frames + (entry if self.carried.audio else 0)
+        end = (
+            audio_ticks(self.sample_frames)
+            if self.successor.audio
+            else TICKS_PER_FRAME * self.delivery_end
         )
-        start, end = audio_sample_range(start_frame, self.source_end_frame, self.sample_rate)
-        return DeliveredAVWindow(
-            self.frames[-frames:].copy(),
-            self.audio[:, start - old_start : end - old_start].clone(),
-            self.sample_rate,
-            start_frame,
-            self.source_end_frame,
-            self.provenance,
-        )
+        if start < 0:
+            _refuse("carried sound ends before this segment begins")
+        per_tick = Fraction(sample_rate, 40)
+        return round(start * per_tick), round(end * per_tick)
 
 
 @dataclass(frozen=True)
 class AVContext:
-    """Native normalized AV windows, independently encoded from delivered RGB/audio.
+    """A successor's carry in the model's normalized space: the last picture window
+    `(1, 24, tokens, h, w)` and/or the last second of sound as packed channel-major audio
+    rows `(80, 32)`, ending `audio_offset` ticks past the picture join."""
 
-    A shorter causal VAE window is not a suffix of a longer window's latents, and the audio
-    grid's phase is window-local, so every window a successor may select is its own
-    encoding. A producer encodes only the windows its caller names.
-    """
-
-    windows: dict[int, tuple[torch.Tensor, torch.Tensor]]
-    height: int
-    width: int
-    source_end_frame: int
+    video: torch.Tensor | None
+    audio: torch.Tensor | None
+    audio_offset: Fraction
     provenance: str
-    frame_count: int = MAX_CONTEXT_FRAMES
-    sample_rate: int = 32000
 
     def __post_init__(self) -> None:
         self.validate()
 
     @property
-    def source_start_frame(self) -> int:
-        return self.source_end_frame - self.frame_count
+    def carry(self) -> Carry:
+        tokens = None if self.video is None else int(self.video.shape[2])
+        frames = next((n for n in CONTEXT_FRAMES if video_tokens(n) == tokens), 0)
+        return Carry(frames, self.audio is not None)
 
     @property
-    def video_latents(self) -> torch.Tensor:
-        return self.windows[self.frame_count][0]
-
-    @property
-    def audio_latents(self) -> torch.Tensor:
-        return self.windows[self.frame_count][1]
+    def canvas(self) -> tuple[int, int] | None:
+        """The picture's (height, width) in pixels."""
+        if self.video is None:
+            return None
+        return int(self.video.shape[3]) * 16, int(self.video.shape[4]) * 16
 
     def validate(self) -> None:
+        if self.video is None and self.audio is None:
+            _refuse("context carries neither picture nor sound")
+        for tensor in (self.video, self.audio):
+            if tensor is not None and (
+                not isinstance(tensor, torch.Tensor)
+                or tensor.device.type != "cpu"
+                or tensor.dtype != torch.float32
+                or not bool(torch.isfinite(tensor).all())
+            ):
+                _refuse("context must hold finite float32 CPU latents")
+        if self.video is not None:
+            shape = tuple(self.video.shape)
+            canvas = self.canvas
+            if (
+                len(shape) != 5
+                or shape[:2] != (1, 24)
+                or shape[2] not in {video_tokens(n) for n in CONTEXT_FRAMES}
+                or canvas is None
+                or min(canvas) < 32
+                or canvas[0] % 32
+                or canvas[1] % 32
+                or canvas[0] * canvas[1] > MAX_CONTEXT_PIXELS
+            ):
+                _refuse("context picture is outside the qualified H3 window or canvas")
+        if self.audio is not None and tuple(self.audio.shape) != (2 * AUDIO_TICKS, 32):
+            _refuse("context sound must be one second of packed stereo audio latents")
+        offset = self.audio_offset
         if (
-            type(self.frame_count) is not int
-            or not isinstance(self.windows, dict)
-            or self.frame_count not in self.windows
-            or not set(self.windows) <= set(CONTEXT_FRAMES)
-            or any(type(n) is not int for n in self.windows)
+            not isinstance(offset, Fraction)
+            or 3 % offset.denominator
+            or not -Fraction(1, 3) <= offset <= Fraction(4, 3)
+            or (self.audio is None and offset)
         ):
-            _refuse("context must contain its selected independently encoded AV window")
-        if (
-            type(self.height) is not int
-            or type(self.width) is not int
-            or min(self.height, self.width) < 32
-            or self.height % 32
-            or self.width % 32
-            or self.height * self.width > MAX_CONTEXT_PIXELS
-        ):
-            _refuse("context canvas is outside the qualified H3 geometry")
-        if type(self.source_end_frame) is not int or not 56 <= self.source_end_frame <= 362:
-            _refuse("context source frame clock is invalid")
-        audio_sample_range(self.source_end_frame - 56, self.source_end_frame, self.sample_rate)
+            _refuse("context sound offset is off the frame/tick grid")
         if (
             not isinstance(self.provenance, str)
             or not self.provenance
             or len(self.provenance.encode("utf-8")) > 16384
         ):
             _refuse("context requires bounded renderer provenance")
-        for n, pair in self.windows.items():
-            if not isinstance(pair, tuple) or len(pair) != 2:
-                _refuse("context AV window is invalid")
-            video, audio = pair
-            shapes = (
-                (1, 24, 5 * ((n - 5) // 17) + 2, self.height // 16, self.width // 16),
-                (2 * ((n * 5 + 2) // 3), 32),
-            )
-            for tensor, shape in zip((video, audio), shapes, strict=True):
-                if (
-                    not isinstance(tensor, torch.Tensor)
-                    or tensor.device.type != "cpu"
-                    or tensor.dtype != torch.float32
-                    or tuple(tensor.shape) != shape
-                    or not bool(torch.isfinite(tensor).all())
-                ):
-                    _refuse("context must contain finite native float32 AV conditioning tensors")
-
-    def select(self, frames: int) -> AVContext:
-        self.validate()
-        if type(frames) is not int or frames not in self.windows:
-            _refuse("requested continuation window is absent from the completed tail")
-        return AVContext(
-            self.windows,
-            self.height,
-            self.width,
-            self.source_end_frame,
-            self.provenance,
-            frames,
-            self.sample_rate,
-        )
 
 
 @dataclass(frozen=True)
 class ContextReferenceLayout:
-    """Private packed-layout metadata, appended only after public reference encoding."""
+    """Private packed-layout entry for the carried latents, after every public reference."""
 
-    kind: str = "video"
-    has_audio: bool = True
+    kind: str
+    has_audio: bool
+
+    @classmethod
+    def of(cls, context: AVContext) -> ContextReferenceLayout:
+        return cls("audio" if context.video is None else "video", context.audio is not None)
+
+
+def export_context(
+    video: torch.Tensor, audio: torch.Tensor, plan: ContinuationPlan, provenance: str
+) -> AVContext | None:
+    """The successor's carry, sliced from this segment's denoised latents: video
+    `(1, 24, T, h, w)` and audio `(2, 32, N)`, both normalized."""
+    carry = plan.successor
+    if not carry:
+        return None
+    window = rows = None
+    if carry.frames:
+        tokens = video_tokens(carry.frames)
+        total = int(video.shape[2])
+        if total != video_tokens(plan.sample_frames) or (total - tokens) % 5:
+            _refuse("picture window is not whole VAE cycles at the sampled end")
+        window = video[:, :, total - tokens :].detach().float().cpu().contiguous()
+    if carry.audio:
+        if tuple(audio.shape) != (2, 32, audio_ticks(plan.sample_frames)):
+            _refuse("sampled audio latents differ from the segment's clock")
+        tail = audio[:, :, -AUDIO_TICKS:].permute(0, 2, 1).reshape(-1, 32)
+        rows = tail.detach().float().cpu().contiguous()
+    return AVContext(window, rows, plan.exit_offset, provenance)
 
 
 def encode_context(context: AVContext) -> bytes:
     context.validate()
     tensors = {
-        f"{kind}_{n}": tensor.contiguous()
-        for n, pair in context.windows.items()
-        for kind, tensor in zip(("video", "audio"), pair, strict=True)
+        name: tensor
+        for name, tensor in (("video", context.video), ("audio", context.audio))
+        if tensor is not None
     }
-    data = save(
-        tensors,
-        metadata={
-            "schema": CONTEXT_SCHEMA,
-            "sample_rate": str(context.sample_rate),
-            "height": str(context.height),
-            "width": str(context.width),
-            "frame_count": str(context.frame_count),
-            "source_end_frame": str(context.source_end_frame),
-            "provenance": context.provenance,
-        },
-    )
+    metadata = {
+        "schema": CONTEXT_SCHEMA,
+        "audio_offset": str(context.audio_offset),
+        "provenance": context.provenance,
+    }
+    data = save(tensors, metadata=metadata)
     if len(data) > MAX_CONTEXT_BYTES:
-        _refuse("encoded context exceeds its 64 MiB bound")
+        _refuse("encoded context exceeds its 16 MiB bound")
     return cast(bytes, data)
 
 
 def decode_context(data: bytes) -> AVContext:
     if not isinstance(data, bytes) or not 8 <= len(data) <= MAX_CONTEXT_BYTES:
-        _refuse("context carrier is absent or exceeds its 64 MiB bound")
+        _refuse("context carrier is absent or exceeds its 16 MiB bound")
     length = struct.unpack("<Q", data[:8])[0]
     if not 2 <= length <= min(65536, len(data) - 8):
         _refuse("context header is invalid or exceeds its bound")
     try:
-        header = json.loads(data[8 : 8 + length])
-        metadata = header.get("__metadata__", {})
-        present = [n for n in CONTEXT_FRAMES if f"video_{n}" in header]
-        if (
-            not present
-            or not {
-                "schema",
-                "sample_rate",
-                "height",
-                "width",
-                "frame_count",
-                "source_end_frame",
-                "provenance",
-            }
-            <= set(metadata)
-            or metadata["schema"] != CONTEXT_SCHEMA
+        metadata = json.loads(data[8 : 8 + length]).get("__metadata__", {})
+        if metadata.get("schema") != CONTEXT_SCHEMA or not {"audio_offset", "provenance"} <= set(
+            metadata
         ):
             _refuse("context schema or fields do not match")
         # Bounded, uncompressed safetensors validates offsets before allocation.
         tensors = load(data)
+        if not tensors.keys() <= {"video", "audio"}:
+            _refuse("context holds unexpected tensors")
         return AVContext(
-            {n: (tensors[f"video_{n}"], tensors[f"audio_{n}"]) for n in present},
-            int(metadata["height"]),
-            int(metadata["width"]),
-            int(metadata["source_end_frame"]),
+            tensors.get("video"),
+            tensors.get("audio"),
+            Fraction(metadata["audio_offset"]),
             metadata["provenance"],
-            int(metadata["frame_count"]),
-            int(metadata["sample_rate"]),
         )
     except InvalidRequest:
         raise
@@ -316,91 +288,56 @@ def decode_context(data: bytes) -> AVContext:
 
 
 def align_context_rows(state: Any, context: AVContext, patch_size: tuple[int, int, int]) -> None:
-    """Place the hidden AV condition at the target head, retaining all public references.
+    """Put the carried rows, the last condition rows, on this clip's timeline.
 
-    It is encoded as the final internal video/audio condition after text encoding,
-    so it consumes neither a Picture/Video label nor a Qwen vision-token block.
-    The native scheduler already keeps these condition rows fixed on every step.
+    The picture tokens sit on the target head they condition, in phase. The sound ends at
+    the picture join plus its offset, on fractional rotary positions where the grids
+    disagree, so it continues exactly where it stopped. The native scheduler keeps both
+    fixed on every step.
     """
-    _, patch_h, patch_w = patch_size
-    latent = state.condition_latents[-1]
-    frames, height, width = (int(x) for x in latent.shape[2:])
-    expected_latents = 5 * ((context.frame_count - 5) // 17) + 2
-    if frames != expected_latents:
-        _refuse("context VAE temporal grid differs from its frame clock")
-    video_count = frames * (height // patch_h) * (width // patch_w)
-    audio_count = int(state.audio_condition_latents[-1].shape[0])
-    if (
-        audio_count != 2 * ((context.frame_count * 5 + 2) // 3)
-        or video_count > state.num_condition_video_rows
-    ):
-        _refuse("context packed geometry is inconsistent")
-    video_rows = state.video_indices[
-        state.num_condition_video_rows - video_count : state.num_condition_video_rows
-    ]
-    audio_rows = state.audio_indices[
-        state.num_condition_audio_rows - audio_count : state.num_condition_audio_rows
-    ]
-    target_start = state.video_indices[state.num_condition_video_rows]
-    origin = state.position_ids[target_start, 0].clone()
-    state.position_ids[video_rows, 0] += origin - state.position_ids[video_rows[0], 0].clone()
-    # Audio has one rotary tick per 1/40 second. Its latent grid rounds up,
-    # just as native target audio does; the final tick may contain encoder padding.
-    ticks = audio_count // 2
-    end_tick = (context.frame_count * 5 + 2) // 3
-    desired_start = origin + end_tick - ticks
-    state.position_ids[audio_rows, 0] += (
-        desired_start - state.position_ids[audio_rows[0], 0].clone()
-    )
+    origin = state.position_ids[state.video_indices[state.num_condition_video_rows], 0].clone()
+    if context.video is not None:
+        _, patch_h, patch_w = patch_size
+        _, _, frames, height, width = (int(n) for n in context.video.shape)
+        count = frames * (height // patch_h) * (width // patch_w)
+        if count > state.num_condition_video_rows:
+            _refuse("context packed picture geometry is inconsistent")
+        rows = state.video_indices[
+            state.num_condition_video_rows - count : state.num_condition_video_rows
+        ]
+        state.position_ids[rows, 0] += origin - state.position_ids[rows[0], 0].clone()
+    if context.audio is not None:
+        count = int(context.audio.shape[0])
+        if count > state.num_condition_audio_rows:
+            _refuse("context packed sound geometry is inconsistent")
+        rows = state.audio_indices[
+            state.num_condition_audio_rows - count : state.num_condition_audio_rows
+        ]
+        ticks = TICKS_PER_FRAME * context.carry.frames + context.audio_offset - AUDIO_TICKS
+        state.position_ids[rows, 0] += (
+            origin + float(ticks) - state.position_ids[rows[0], 0].clone()
+        )
 
 
-class CompletedTail:
-    """The delivery window of a streamed decode. The consumer lands the delivered frames as
-    RGB8 for its output; the context tail is read back from that buffer, not copied twice."""
+class DeliveredFrames:
+    """A streamed decode's delivered picture: frames `[prefix, delivery_end)` of the sample."""
 
     def __init__(self, plan: ContinuationPlan) -> None:
         self.plan = plan
         self.seen = 0
         self.delivered = 0
-        self.complete = False
 
     def push(self, chunk: torch.Tensor) -> torch.Tensor:
-        if self.complete or chunk.ndim != 4 or chunk.shape[1] != 3:
+        if chunk.ndim != 4 or chunk.shape[1] != 3:
             _refuse("continuation decode stream is invalid")
-        start = max(0, self.plan.delivery_start - self.seen)
+        start = max(0, self.plan.prefix_frames - self.seen)
         end = min(int(chunk.shape[0]), self.plan.delivery_end - self.seen)
         self.seen += int(chunk.shape[0])
         selected = chunk[start : max(start, end)]
         self.delivered += int(selected.shape[0])
         return selected
 
-    def finish(self) -> None:
+    def finish(self) -> int:
         if self.seen != self.plan.sample_frames or self.delivered != self.plan.delivered_frames:
             _refuse("completed continuation decode differs from its sampled/delivered frame plan")
-        self.complete = True
-
-    def export(
-        self, frames: torch.Tensor, audio: torch.Tensor, sample_rate: int, provenance: str
-    ) -> DeliveredAVWindow:
-        """`frames` are every delivered frame as landed: uint8 CPU `[delivered, H, W, 3]`."""
-        if (
-            not self.complete
-            or not isinstance(frames, torch.Tensor)
-            or frames.dtype != torch.uint8
-            or frames.device.type != "cpu"
-            or len(frames) != self.plan.delivered_frames
-        ):
-            _refuse("continuation is not a completed decoded segment")
-        end_frame = self.plan.delivery_end
-        start_frame = end_frame - MAX_CONTEXT_FRAMES
-        start, end = audio_sample_range(start_frame, end_frame, sample_rate)
-        if audio.ndim != 2 or audio.shape[0] != 2 or audio.shape[1] < end:
-            _refuse("completed audio does not cover the delivered continuation window")
-        return DeliveredAVWindow(
-            frames[-MAX_CONTEXT_FRAMES:].numpy().copy(),
-            audio[:, start:end].float().cpu().clone(),
-            sample_rate,
-            start_frame,
-            end_frame,
-            provenance,
-        )
+        return self.delivered
