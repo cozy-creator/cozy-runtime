@@ -88,7 +88,8 @@ def test_a_sound_only_successor_ends_the_picture_on_the_last_frame_its_sound_cov
     # 362 frames is 603.33 ticks; the grid rounds to 603, so frame 362 has no sound.
     assert audio_ticks(362) == 603
     assert ContinuationPlan(15, successor=SOUND).delivery_end == 361
-    assert ContinuationPlan(15, successor=SOUND).exit_offset == Fraction(4, 3)
+    assert ContinuationPlan(15, successor=SOUND).exit_offset == Fraction(1, 3)
+    assert ContinuationPlan(15, successor=SOUND).sound_end == 602
     assert ContinuationPlan(15, successor=BOTH).delivery_end == 362
     assert ContinuationPlan(15, successor=BOTH).exit_offset == Fraction(-1, 3)
     assert ContinuationPlan(14, successor=SOUND).exit_offset == 0  # 345 frames: 575 ticks
@@ -117,8 +118,8 @@ def test_joined_sound_is_continuous_and_never_drifts_from_the_picture(carries: l
         )
         sound += end - start
         picture += plan.delivered_frames
-        # Within a frame at every join, exact (to rounding) where no sound continues.
-        assert abs(sound - picture * Fraction(RATE, 24)) <= RATE / 24
+        # Within a third of a tick at every join, exact (to rounding) where no sound continues.
+        assert abs(sound - picture * Fraction(RATE, 24)) <= Fraction(RATE, 120) + 1
         entry = plan.exit_offset
     assert abs(sound - picture * Fraction(RATE, 24)) <= len(plans)
 
@@ -149,7 +150,7 @@ def test_context_refuses_what_no_segment_produces() -> None:
     with pytest.raises(InvalidRequest, match="offset"):
         context(SOUND, Fraction(1, 2))
     with pytest.raises(InvalidRequest, match="offset"):
-        context(SOUND, Fraction(5, 3))
+        context(SOUND, Fraction(2, 3))
     with pytest.raises(InvalidRequest, match="finite"):
         context(SOUND, value=float("nan"))
     with pytest.raises(InvalidRequest, match="window"):
@@ -162,7 +163,7 @@ def test_export_slices_the_successors_carry_from_the_unpacked_denoised_latents(
 ) -> None:
     """The real after-denoise unpack, then the export: the picture is the last whole cycles of
     the sampled video latents and the sound the last 40 ticks, as packed rows."""
-    plan = ContinuationPlan(5, successor=successor)
+    plan = ContinuationPlan(15, successor=successor)  # 362 frames, 603.33 ticks rounded to 603
     frames, ticks = video_tokens(plan.sample_frames), audio_ticks(plan.sample_frames)
     video = torch.arange(24 * frames * 2 * 4, dtype=torch.float32).reshape(1, 24, frames, 2, 4)
     audio = torch.arange(2 * 32 * ticks, dtype=torch.float32).reshape(2, 32, ticks)
@@ -190,15 +191,17 @@ def test_export_slices_the_successors_carry_from_the_unpacked_denoised_latents(
         assert torch.equal(carried.video, video[:, :, -tokens:])
         assert (frames - tokens) % 5 == 0
     if successor.audio:
+        end = int(plan.sound_end)
         assert torch.equal(
-            carried.audio, audio[:, :, -AUDIO_TICKS:].permute(0, 2, 1).reshape(-1, 32)
+            carried.audio,
+            audio[:, :, end - AUDIO_TICKS : end].permute(0, 2, 1).reshape(-1, 32),
         )
         assert carried.audio_offset == plan.exit_offset
     assert export_context(state.latents, state.audio_latents, ContinuationPlan(5), "r") is None
 
 
 @pytest.mark.parametrize(
-    "carry,offset", [(BOTH, Fraction(-1, 3)), (SOUND, Fraction(4, 3)), (Carry(39), Fraction(0))]
+    "carry,offset", [(BOTH, Fraction(-1, 3)), (SOUND, Fraction(1, 3)), (Carry(39), Fraction(0))]
 )
 def test_carried_rows_land_on_this_clips_timeline_and_stay_fixed(
     carry: Carry, offset: Fraction
@@ -315,7 +318,9 @@ def test_streamed_decode_delivers_the_plans_picture_and_sound() -> None:
     plan = ContinuationPlan(5, BOTH, SOUND)
     sound, full = decode(plan, context(BOTH, Fraction(-1, 3)))
     start, end = plan.audio_samples(Fraction(-1, 3), RATE)
-    assert start == round((Fraction(110, 3) - Fraction(1, 3)) * 800) and end == full.shape[-1]
+    # 158 frames: 263 ticks; the picture ends at 157 (261.67 ticks), the sound at tick 262.
+    assert start == round((Fraction(110, 3) - Fraction(1, 3)) * 800)
+    assert end == 262 * 800 == full.shape[-1] - 800
     assert torch.equal(sound, full[..., start:end])
     sound, full = decode(ContinuationPlan(15), None)  # 362 frames, 603 ticks
     assert sound.shape[-1] == round(Fraction(362 * RATE, 24)) == full.shape[-1] + 267
