@@ -335,8 +335,8 @@ def test_streamed_decode_delivers_the_plans_picture_and_sound() -> None:
 
 
 def test_prefix_noise_labels_carried_tokens_with_schedule_levels_tapering_to_the_anchor() -> None:
-    """Far tokens ride the target head's own noise at the next level, the last four step down
-    the schedule to the anchor; only schedule or anchor timesteps, so pruned tables cover it."""
+    """Far tokens ride the target head's own noise at the evaluation's level, the last four stay
+    at the anchor; only the evaluation's own timestep or the anchor, as the PDD bank requires."""
     carried = context(PICTURE)
     refs = [
         MiniMaxH3ImageReference(image=np.zeros((32, 64, 3), dtype=np.uint8)),
@@ -384,10 +384,8 @@ def test_prefix_noise_labels_carried_tokens_with_schedule_levels_tapering_to_the
         labels = unique[inverse][video[rows]]
         assert set(labels.tolist()) <= allowed
         anchor = torch.tensor(0.999).item()
-        ahead = [
-            sched.timesteps[index + k].item() if index + k < 8 else anchor for k in (1, 2, 3, 4)
-        ]
-        assert labels.reshape(7, 2)[:, 0].tolist() == [*ahead[:1] * 3, *ahead[1:], anchor]
+        level = min(sched.timesteps[index].item(), anchor)
+        assert labels.reshape(7, 2)[:, 0].tolist() == [level] * 3 + [anchor] * 4
         weight = labels[:, None]
         assert torch.allclose(
             state.latents[rows], weight * latents[rows] + (1 - weight) * latents[cv : cv + 14]

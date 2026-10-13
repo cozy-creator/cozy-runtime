@@ -337,9 +337,10 @@ def align_context_rows(state: Any, context: AVContext, patch_size: tuple[int, in
 class PrefixNoise:
     """Schedule-matched noise on the carried picture (MAINodes' "Drift Control", re-derived for
     condition rows). Before each evaluation, tokens far from the seam ride the sampler's own
-    noise (the target head's initial draw) at the schedule's next level; the last
-    `TAPER_TOKENS` take later levels, down to the anchor at the seam, which stays exact. Every
-    label is a schedule or anchor timestep, so AdaLN-pruned tables cover it. Sound stays hard."""
+    noise (the target head's initial draw) at the evaluation's level; the last `TAPER_TOKENS`
+    stay at the anchor. A forward may only carry its own evaluation's timesteps and the
+    anchors (the PDD bank refuses others, run 5497), so there is no next-level taper. Sound
+    stays hard."""
 
     def __init__(
         self, state: Any, context: AVContext, patch_size: tuple[int, int, int], anchor: float
@@ -353,17 +354,12 @@ class PrefixNoise:
         self.clean = state.latents[self.rows].clone()
         self.noise = state.latents[end : end + tokens * per].clone()
         self.positions = state.denoiser_input_fields["video_indices"][self.rows]
-        taper = min(TAPER_TOKENS, tokens)
-        ahead = [1] * (tokens - taper) + list(range(2, taper + 1))
+        far = tokens - min(TAPER_TOKENS, tokens)
         steps = state.timesteps.float()
         self.labels = [
-            torch.cat(
-                [
-                    steps[i + k : i + k + 1] if i + k < len(steps) else steps.new_tensor([anchor])
-                    for k in ahead
-                ]
-                + [steps.new_tensor([anchor])]
-            ).repeat_interleave(per)
+            torch.cat([steps[i : i + 1].repeat(far), steps.new_full((tokens - far,), anchor)])
+            .clamp(max=anchor)
+            .repeat_interleave(per)
             for i in range(len(steps))
         ]
 
