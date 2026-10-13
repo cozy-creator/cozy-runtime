@@ -1,0 +1,1 @@
+A load()-time in-place transform of a weight the fill already wrote now refuses with `construction_fault` on serving executors too: the weight plane's own tensors, which replace the construction's placeholders, count as checkpoint destinations (they were silently written on CPU executors).
