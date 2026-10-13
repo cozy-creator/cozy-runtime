@@ -26,9 +26,10 @@ window), ending on the first whole tick at or after the predecessor's picture en
 last sampled tick at most: H3's `round(5f/3)` grid can fall a third short). They are placed
 on the new clip's timeline to end exactly where they ended on the predecessor's: at the
 picture join plus that offset, within a third of a tick.
-Rotary positions are float, so the sound is in true time. With a picture carry it overlaps
-the regenerated head; alone it sits immediately before the target start, so no video frame
-is sampled for it.
+Rotary positions are float, so the sound is in true time. It always overlaps a regenerated,
+cut head: the picture window's, or for sound alone a one-second head. Placed immediately
+before the target start instead, H3 read it as a reference to imitate and did not continue it
+(run 5485, join 4: 20 dB quieter, NCC at cover-band level).
 
 Each segment delivers sound from where its predecessor's ended to the end of its own (when
 its successor carries sound) or to its picture end. Concatenated, the soundtrack is

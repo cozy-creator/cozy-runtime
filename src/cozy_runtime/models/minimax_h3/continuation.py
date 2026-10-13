@@ -32,6 +32,7 @@ TICKS_PER_FRAME = Fraction(5, 3)
 #: Picture windows of whole VAE cycles (17k + 5 frames).
 CONTEXT_FRAMES = (22, 39, 56)
 #: One second of sound, 24 frames: exactly 40 ticks, whatever the picture window.
+AUDIO_FRAMES = 24
 AUDIO_TICKS = 40
 MAX_FRAMES = 362
 MAX_CONTEXT_BYTES = 16 << 20
@@ -69,11 +70,18 @@ class Carry:
     def __bool__(self) -> bool:
         return bool(self.frames or self.audio)
 
+    @property
+    def head_frames(self) -> int:
+        """The regenerated, cut head this carry needs: the picture window, or one second for
+        sound alone. Before the target start H3 reads carried sound as a reference to imitate
+        (run 5485: 20 dB quieter, not continued); over the head it is this clip's own sound."""
+        return self.frames or (AUDIO_FRAMES if self.audio else 0)
+
 
 @dataclass(frozen=True)
 class ContinuationPlan:
-    """One segment's clocks. It samples its carried picture window plus `seconds` on the
-    `17n + 5` grid (snapped up, as `frames_for` does) and cuts the regenerated head. Its
+    """One segment's clocks. It samples its carry's head plus `seconds` on the `17n + 5` grid
+    (snapped up, as `frames_for` does) and cuts the regenerated head. Its
     picture ends at the last sampled frame, where a successor's picture window must end;
     a successor carrying sound alone needs the sound to reach the join, so the picture
     then ends on the last frame the sound covers (one frame earlier when the grid rounds
@@ -95,7 +103,7 @@ class ContinuationPlan:
 
     @property
     def prefix_frames(self) -> int:
-        return self.carried.frames
+        return self.carried.head_frames
 
     @property
     def sample_frames(self) -> int:
@@ -318,7 +326,7 @@ def align_context_rows(state: Any, context: AVContext, patch_size: tuple[int, in
         rows = state.audio_indices[
             state.num_condition_audio_rows - count : state.num_condition_audio_rows
         ]
-        ticks = TICKS_PER_FRAME * context.carry.frames + context.audio_offset - AUDIO_TICKS
+        ticks = TICKS_PER_FRAME * context.carry.head_frames + context.audio_offset - AUDIO_TICKS
         state.position_ids[rows, 0] += (
             origin + float(ticks) - state.position_ids[rows[0], 0].clone()
         )
