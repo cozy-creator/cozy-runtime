@@ -1386,15 +1386,16 @@ def test_a_component_without_blocks_streams_inside_an_owners_cap(tmp_path: Path)
 
     torch.cuda.reset_peak_memory_stats()
     live = torch.cuda.memory_allocated()
-    uncapped = recovered(x)
+    uncapped = [t.cpu() for t in recovered(x)]  # off the card: its bytes are no room
     measured = torch.cuda.max_memory_allocated() - live
     model.residency.unpark()
     weights.set_budget(0)
     torch.cuda.empty_cache()
     weights.measure_context()
     context = max(weights.context_bytes, 0)
-    # Room for the activations and a margin, not for the weights beside them as well.
-    cap = context + torch.cuda.memory_reserved() + measured + weight_policy.MARGIN
+    # Room for the activations and a margin, not for the weights beside them as well (what
+    # torch holds live, not its cache: earlier tests' segments are no room).
+    cap = context + torch.cuda.memory_allocated() + measured + weight_policy.MARGIN
     assert component.layout.total > weight_policy.MARGIN
     weights.activation.clear()  # unmeasured: the stage keeps every weight it can
     retries = weights.facts().oom_retries
@@ -1402,17 +1403,18 @@ def test_a_component_without_blocks_streams_inside_an_owners_cap(tmp_path: Path)
     weights.set_cap(cap)
     try:
         weights.set_budget(-1)
-        capped = recovered(x)
+        capped = [t.cpu() for t in recovered(x)]
         peak = torch.cuda.max_memory_reserved()
         facts = weights.facts()
     finally:
         weights.set_cap(-1)
-    exact = same(uncapped, capped)
-    del x, uncapped, capped
+    del x
     torch.cuda.empty_cache()
-    assert facts.oom_retries > retries
+    # It gave weights back for its activations: unmapped on an out-of-memory, or streamed.
+    gave = facts.oom_retries > retries or facts.committed_bytes < component.layout.total
+    assert gave and facts.modes["stack.grain"] == "sub-block"
     assert peak + context <= cap
-    assert exact
+    assert same(uncapped, capped)
 
 
 class Twice(Block):
