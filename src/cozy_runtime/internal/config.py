@@ -119,10 +119,11 @@ def seal_snapshot(environ: Mapping[str, str] | None = None) -> dict[str, str]:
     snapshots the seal before CUDA init and compares it after, which is how a late
     imposition is CAUGHT rather than silently ignored (the allocator reads its environment
     once). It exposes exactly the reviewed allowlist names — credentials are not among
-    them, because the ERASE pass removed them from any child environment.
+    them, because the ERASE pass removed them from any child environment. An absent name is
+    left out, so a set-but-empty `CUDA_VISIBLE_DEVICES` (no GPU) stays distinct from unset.
     """
     env = os.environ if environ is None else environ
-    return {name: env.get(name, "") for name in sorted(child_env.ALLOWLIST)}
+    return {name: env[name] for name in sorted(child_env.ALLOWLIST) if name in env}
 
 
 def sees_no_gpu(environ: Mapping[str, str] | None = None) -> bool:
@@ -134,9 +135,9 @@ def sees_no_gpu(environ: Mapping[str, str] | None = None) -> bool:
 
 
 def restore_seal(sealed: Mapping[str, str], names: Iterable[str]) -> None:
-    """Re-impose sealed values in this process; an empty sealed value means unset."""
+    """Re-impose sealed values in this process; a name absent from the seal is unset."""
     for name in names:
-        if sealed.get(name, ""):
+        if name in sealed:
             os.environ[name] = sealed[name]
         else:
             os.environ.pop(name, None)

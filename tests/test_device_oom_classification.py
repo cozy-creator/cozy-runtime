@@ -37,6 +37,9 @@ def test_torch_device_oom_is_still_recognized() -> None:
     torch = pytest.importorskip("torch")
     exc = torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 2.00 GiB")
     assert classify(exc).code == DEVICE_OOM
+    assert classify(torch.OutOfMemoryError()).code == DEVICE_OOM, (
+        "an empty message still classifies"
+    )
 
 
 def test_a_driver_call_out_of_device_memory_is_a_device_oom() -> None:

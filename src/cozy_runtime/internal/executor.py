@@ -261,8 +261,8 @@ def _env_changes() -> tuple[str, ...]:
     current = seal_snapshot()
     return tuple(
         name
-        for name in sorted(_SEALED)
-        if current.get(name, "") != _SEALED[name] and name not in ROUTED
+        for name in sorted(_SEALED.keys() | current.keys())
+        if current.get(name) != _SEALED.get(name) and name not in ROUTED
     )
 
 
@@ -329,8 +329,9 @@ def _restore_seal() -> tuple[str, ...]:
 
 
 def _env_document() -> dict[str, Any]:
-    """The seal holds for every reply; names package code changed are reported."""
-    return {"env_intact": True, "env_changed": list(_restore_seal())}
+    """The seal holds for every reply once re-imposed; names package code changed are reported."""
+    changed = _restore_seal()
+    return {"env_intact": not _env_changes(), "env_changed": list(changed)}
 
 
 def _cancelled(root: Path, request_id: str) -> bool:

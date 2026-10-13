@@ -44,4 +44,4 @@ def test_the_seal_report_keeps_the_name_an_older_machine_imposes() -> None:
     refuses the executor when it is missing: the report names it, whatever its value."""
     reported = config.seal_snapshot({"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"})
     assert reported["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"
-    assert config.seal_snapshot({})["PYTORCH_CUDA_ALLOC_CONF"] == ""
+    assert "PYTORCH_CUDA_ALLOC_CONF" not in config.seal_snapshot({})

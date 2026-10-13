@@ -131,6 +131,33 @@ def test_compile_moves_the_seal_when_the_jit_scope_is_not_imposed(restore_env: N
     assert "TORCHINDUCTOR_CACHE_DIR" not in os.environ, "the executor restores its seal"
 
 
+@pytest.mark.parametrize("moved", ["0", None])
+def test_an_empty_device_seal_is_restored_empty_not_unset(
+    moved: str | None, restore_env: None
+) -> None:
+    """A CPU executor's seal is `CUDA_VISIBLE_DEVICES=""` (no GPU), which unset would not be:
+    code that overwrites or removes it is reported, and the empty value comes back."""
+    from cozy_runtime.internal import config, executor
+
+    for name in child_env.ALLOWLIST:
+        os.environ.pop(name, None)
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    executor._SEALED.clear()
+    executor._capture_seal()
+    assert executor._env_document() == {"env_intact": True, "env_changed": []}
+
+    if moved is None:
+        del os.environ["CUDA_VISIBLE_DEVICES"]
+    else:
+        os.environ["CUDA_VISIBLE_DEVICES"] = moved
+    assert executor._env_document() == {
+        "env_intact": True,
+        "env_changed": ["CUDA_VISIBLE_DEVICES"],
+    }
+    assert os.environ.get("CUDA_VISIBLE_DEVICES") == ""
+    assert config.sees_no_gpu()
+
+
 def test_only_the_wrapping_spelling_renames_destinations() -> None:
     """The other half of the "or": which spellings move a checkpoint key, and which do not."""
     import torch
@@ -190,8 +217,6 @@ def test_construction_refuses_compile_and_names_itself() -> None:
     assert in_place.value.construct == "torch.compile"
     # ...and the patch is undone on the way out, so invocation is unfenced.
     torch.compile(lambda x: x)
-
-
 
 
 def test_construction_refuses_both_compile_spellings() -> None:

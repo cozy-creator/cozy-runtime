@@ -204,9 +204,8 @@ def classify(exc: BaseException | None) -> Outcome:
     if isinstance(exc, AuthorError):
         return Outcome("failed", "author", exc.code, exc.message, exc.fields, _trace(exc))
     if is_device_oom(exc):
-        return Outcome(
-            "failed", "runtime", DEVICE_OOM, str(exc).splitlines()[0][:400], (), _trace(exc)
-        )
+        first = str(exc).partition("\n")[0][:400] or "the device ran out of memory"
+        return Outcome("failed", "runtime", DEVICE_OOM, first, (), _trace(exc))
     return Outcome(
         "failed",
         "author",

@@ -94,7 +94,7 @@ class Tensor(Protocol):
 
     def detach(self) -> Tensor: ...
     def contiguous(self) -> Tensor: ...
-    def reshape(self, *shape: int) -> Tensor: ...
+    def reshape(self, shape: Sequence[int]) -> Tensor: ...
     def view(self, dtype: object) -> Tensor: ...
     def cpu(self) -> Tensor: ...
     def numpy(self) -> np.ndarray[tuple[int, ...], np.dtype[np.generic]]: ...
@@ -114,7 +114,7 @@ def _raw(leaf: Leaf, torch: ModuleType) -> memoryview:
         return memoryview(np.ascontiguousarray(leaf)).cast("B")
     if isinstance(leaf, Image.Image):
         return memoryview(leaf.tobytes())
-    flat = leaf.detach().contiguous().reshape(-1).view(torch.uint8).cpu().numpy()
+    flat = leaf.detach().contiguous().reshape((-1,)).view(torch.uint8).cpu().numpy()
     return memoryview(flat)
 
 
@@ -150,6 +150,8 @@ def _flatten(
             raise Unmemoizable(f"dtype {tensor.dtype}")
         return ["t", leaf(tensor.contiguous())]
     if isinstance(value, Image.Image):
+        if value.mode in ("P", "PA"):
+            raise Unmemoizable("paletted image: its bytes are indices, not colours")
         return ["pil", value.mode, list(value.size), leaf(value)]
     if isinstance(value, np.ndarray):
         return ["np", value.dtype.str, list(value.shape), leaf(value)]
@@ -257,7 +259,7 @@ class Entry:
                 if len(data)
                 else torch.empty(0, dtype=dtype)
             )
-            tensors[name] = flat.reshape(*row.shape).to(self.meta.devices[name], copy=True)
+            tensors[name] = flat.reshape(tuple(row.shape)).to(self.meta.devices[name], copy=True)
         return _rebuild(self.meta.structure, tensors)
 
 
