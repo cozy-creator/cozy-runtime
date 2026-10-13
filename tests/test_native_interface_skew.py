@@ -84,3 +84,10 @@ def test_an_operation_this_worker_lacks_is_refused_alone() -> None:
     (refused,) = [row for row in rows if "unavailable" in row]
     assert refused["export"] == "download_dataset"
     assert "cozy rental update" in str(refused["unavailable"])
+
+
+def test_a_source_operation_no_machine_runs_names_the_ways_sources_enter() -> None:
+    refused = native_interfaces.unserved(source_interfaces.MODULE, "download_huggingface")
+    assert "model.<slot>=hf://" in refused.unavailable
+    assert "cozy model upload" in refused.unavailable
+    assert "cozy rental update" not in refused.unavailable

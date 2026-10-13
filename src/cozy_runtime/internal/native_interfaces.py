@@ -44,6 +44,12 @@ _SERVICES = {
 }
 
 UPDATE_RENTAL = "run `cozy rental update <rental>`"
+# A machine fetches and converts provider sources itself, outside any run's code.
+SOURCES_ON_MACHINE = (
+    "a provider source enters a run as a model input (`model.<slot>=hf://<org>/<repo>@<revision>`, "
+    "with `--source-profile <slot>=<profile>` for its layout), or as a checkpoint made with "
+    "`cozy model upload <source> <org/name> --rental=<machine>`"
+)
 
 
 def stated() -> dict[str, Json]:
@@ -65,10 +71,13 @@ def bindings() -> dict[tuple[str, str], _CallType]:
 
 def unserved(module: str, export: str) -> _CallType:
     """This Runtime's own operation, refused because the worker did not offer it."""
-    detail = (
-        f'native operation "{export}" is not offered by this machine\'s Runtime '
-        f"(executor needs it); {UPDATE_RENTAL}"
-    )
+    if module == source_interfaces.MODULE:
+        detail = f'"{export}" does not run inside a run on this machine: {SOURCES_ON_MACHINE}'
+    else:
+        detail = (
+            f'native operation "{export}" is not offered by this machine\'s Runtime '
+            f"(executor needs it); {UPDATE_RENTAL}"
+        )
     return dataclasses.replace(bindings()[(module, export)], unavailable=detail)
 
 
