@@ -2,7 +2,7 @@
 
 Real: two `tensorfs.plane` device planes (an executor and its replacement), the executor's
 own durable exchange over a seam socketpair with exported CUDA fds, and a custody stand-in
-that does what cozy-machine's does: keep the fds, hand duplicates out. The replacement copies
+that does what TensorD's does: keep the fds, hand duplicates out. The replacement copies
 no byte to the GPU, computes bit-identically, and after a revoke fills its own copy again.
 """
 
@@ -31,7 +31,7 @@ pytestmark = [
 
 
 class Custody:
-    """cozy-machine's `ResidentCustody` in miniature: (layout, variant) -> (regions, fds), and
+    """TensorD's `ResidentCustody` in miniature: (layout, variant) -> (regions, fds), and
     one lease socket per offer kept or attachment, whose other end the executor holds. An ask
     for variant "*" is answered with the layout's baked variant offered last."""
 

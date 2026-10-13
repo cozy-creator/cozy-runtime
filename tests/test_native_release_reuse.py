@@ -247,4 +247,4 @@ def test_source_archive_and_portable_wheel_build_without_private_files(
     (wheel,) = out.glob("*.whl")
     assert wheel.name.endswith("-py3-none-any.whl")
     with zipfile.ZipFile(wheel) as archive:
-        assert not any(".data/scripts/cozy-machine" in name for name in archive.namelist())
+        assert not any(".data/scripts/tensord" in name for name in archive.namelist())

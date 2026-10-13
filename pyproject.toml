@@ -48,7 +48,7 @@ addopts = "-q -p no:cacheprovider"
 # hatchling — the toolchain-free default producing the py3-none-any wheel and the sdist —
 # and, only when COZY_RUNTIME_BUILD_KERNELS=1, to scikit-build-core, which compiles
 # `native/` into `cozy_runtime/_kernels/_C.abi3.so` and tags the wheel cp312-abi3.
-# `task machine` adds the pinned cozy-machine executable to that wheel.
+# `task machine` adds the pinned tensord executable to that wheel.
 requires = ["hatchling"]
 build-backend = "dual_build_backend"
 backend-path = ["scripts"]
