@@ -15,12 +15,23 @@ TEXT_TOKENS = 77
 BATCH = 2  # classifier-free guidance: the shape the pipeline actually runs
 
 
-def build(layers: int | None = None, device: str = "cuda", dtype: Any = torch.float16) -> Any:
+def build(
+    layers: int | None = None,
+    transformer_layers: list[int] | None = None,
+    device: str = "cuda",
+    dtype: Any = torch.float16,
+) -> Any:
+    """The real SDXL UNet config. `layers`/`transformer_layers` shrink the DEPTH only —
+    every block type, channel width and resolution stays exactly SDXL's, which is what the
+    channels_last question is about. Use them only when 5 GiB of fp16 weights will not fit
+    beside another tenant, and say so in the measurement's conditions."""
     from diffusers import UNet2DConditionModel
 
     cfg = {k: v for k, v in CONFIG.items() if not k.startswith("_")}
     if layers is not None:
         cfg["layers_per_block"] = layers
+    if transformer_layers is not None:
+        cfg["transformer_layers_per_block"] = transformer_layers
     with torch.device("meta"):
         model = UNet2DConditionModel.from_config(cfg)
     model = model.to(dtype).to_empty(device=device)

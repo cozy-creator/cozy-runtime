@@ -95,13 +95,21 @@ def main() -> None:
     ap.add_argument("--reps", type=int, default=15)
     ap.add_argument("--inner", type=int, default=2)
     ap.add_argument("--epoch", type=int, default=1)
+    ap.add_argument("--layers", type=int, default=None)
+    ap.add_argument("--tlayers", default="")
     ap.add_argument("--compile", action="store_true")
     args = ap.parse_args()
 
     print(ab.device_note())
     print(f"SDXL UNet2DConditionModel, fp16, batch {args.batch}, latent {args.latent_hw}^2, warm")
 
-    model = sdxl_model.build()
+    tlayers = [int(v) for v in args.tlayers.split(",")] if args.tlayers else None
+    if args.layers or tlayers:
+        print(
+            f"  REDUCED DEPTH: layers_per_block={args.layers} "
+            f"transformer_layers_per_block={tlayers}"
+        )
+    model = sdxl_model.build(layers=args.layers, transformer_layers=tlayers)
     torch.cuda.empty_cache()
     kwargs = sdxl_model.inputs(latent_hw=args.latent_hw, batch=args.batch)
     from diffusers.models.attention_processor import Attention

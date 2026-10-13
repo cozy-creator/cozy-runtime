@@ -72,7 +72,9 @@ def apply_fused_plan(model: Any, via: str = "raw", strict: bool = True) -> None:
     from cozy_runtime.internal import anima_optimization as plan
 
     if via == "op":
-        from cozy_runtime._kernels.ops import rms_rope_split_half as fn
+        from cozy_runtime._kernels.ops import operator
+
+        fn = operator()
     else:
         from cozy_runtime._kernels import rms_rope_split_half as fn
 
