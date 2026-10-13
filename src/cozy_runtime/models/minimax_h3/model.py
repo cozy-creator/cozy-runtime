@@ -33,7 +33,6 @@ from .official import (
     build_h3_turbo_lora,
 )
 from .turbo import ATTENTION_KWARG, OVERLAY_KWARG, TURBO_BANK
-from .refinement import H3Latents, refinement_state, resize_video_chunk
 
 #: Every H3 DiT's attention preference (Paul, 2026-09-27, h3a-060): Sol's sparse steps, then
 #: SageAttention2 INT8 Q/K + FP8 P/V, then FA3 BF16, then SDPA. FA3 FP8 garbles H3 output
@@ -163,7 +162,6 @@ class H3Model(Model[OfficialH3Pipeline], encoded_leaves="accept", fusion="accept
         *,
         on_chunk: Callable[[Any], None],
         checks: NumericalChecks | None = None,
-        output_size: tuple[int, int] | None = None,
     ) -> int:
         """Hand every decoded temporal chunk to `on_chunk` inside the VAE's component scope;
         a generator would run its body after the scope had closed."""
@@ -173,39 +171,9 @@ class H3Model(Model[OfficialH3Pipeline], encoded_leaves="accept", fusion="accept
         def observed(chunk: Any) -> None:
             if checks is not None:
                 checks.tensors("decode_video", [("video", chunk)])
-            on_chunk(chunk if output_size is None else resize_video_chunk(chunk, output_size))
+            on_chunk(chunk)
 
         return self.pipe.decode_video_chunks(task, state, observed)
-
-    @uses_components("fl2va_dit")
-    def refine_fl2va(
-        self, value: H3Latents, *, generator: Any, on_step: Any, cancel: Any,
-        checks: NumericalChecks, steps: int = 2,
-    ) -> tuple[Any, ScheduleFacts]:
-        return self._refine("fl2va", value, generator=generator, on_step=on_step,
-                            cancel=cancel, checks=checks, steps=steps)
-
-    @uses_components("ref2va_dit")
-    def refine_ref2va(
-        self, value: H3Latents, *, generator: Any, on_step: Any, cancel: Any,
-        checks: NumericalChecks, steps: int = 2,
-    ) -> tuple[Any, ScheduleFacts]:
-        return self._refine("ref2va", value, generator=generator, on_step=on_step,
-                            cancel=cancel, checks=checks, steps=steps)
-
-    def _refine(
-        self, task: Task, value: H3Latents, *, generator: Any, on_step: Any,
-        cancel: Any, checks: NumericalChecks, steps: int,
-    ) -> tuple[Any, ScheduleFacts]:
-        if task != value.task:
-            raise ValueError("refinement trunk differs from retained generation")
-        state = refinement_state(value, generator)
-        root = self.pipe.components[f"{task}_dit"]
-        checks.component(f"{task}_dit", root)
-        with checks.forwards(root, f"{task}_dit"):
-            facts = self.pipe.denoise(task, state, on_step=on_step, cancel=cancel,
-                                      checks=checks, refine_steps=steps)
-        return state, facts
 
     @uses_components("video_vae")
     def condition_fl2va_media(self, task: Task, state: Any, *, checks: NumericalChecks) -> None:
