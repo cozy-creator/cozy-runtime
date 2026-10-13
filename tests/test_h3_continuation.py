@@ -24,6 +24,7 @@ from diffusers.modular_pipelines.minimax_h3 import (  # noqa: E402
 )
 from diffusers.modular_pipelines.minimax_h3.before_denoise import (  # noqa: E402
     MiniMaxH3Ref2VAPrepareLayoutStep,
+    MiniMaxH3SetTimestepsStep,
     patchify_video_latents,
 )
 from diffusers.modular_pipelines.minimax_h3.decoders import (  # noqa: E402
@@ -41,6 +42,7 @@ from cozy_runtime.models.minimax_h3.continuation import (  # noqa: E402
     Carry,
     ContextReferenceLayout,
     ContinuationPlan,
+    PrefixNoise,
     align_context_rows,
     audio_ticks,
     decode_context,
@@ -321,3 +323,68 @@ def test_streamed_decode_delivers_the_plans_picture_and_sound() -> None:
     assert sound.shape[-1] == round(Fraction(362 * RATE, 24)) == full.shape[-1] + 267
     assert torch.equal(sound[..., : full.shape[-1]], full)
     assert not sound[..., full.shape[-1] :].any()
+
+
+def test_prefix_noise_labels_carried_tokens_with_schedule_levels_tapering_to_the_anchor() -> None:
+    """Far tokens ride the target head's own noise at the next level, the last four step down
+    the schedule to the anchor; only schedule or anchor timesteps, so pruned tables cover it."""
+    carried = context(PICTURE)
+    refs = [
+        MiniMaxH3ImageReference(image=np.zeros((32, 64, 3), dtype=np.uint8)),
+        ContextReferenceLayout.of(carried),
+    ]
+    packed = MiniMaxH3Ref2VAPrepareLayoutStep.build_ref2va_packed_sequence(
+        torch.ones(3, dtype=torch.long),
+        refs,
+        [torch.zeros(1, 24, 1, 2, 4), carried.video],
+        [],
+        20,
+        2,
+        4,
+        120,
+        (1, 2, 2),
+        2,
+        2,
+        0,
+    )
+    _positions, _tags, video, audio, text, cv, ca = packed
+    sched = MiniMaxH3Scheduler(shift=12.0)
+    sched.set_timesteps(9)
+    plan = [
+        tuple(
+            MiniMaxH3SetTimestepsStep.build_row_timesteps(
+                video, audio, cv, ca, len(text), float(t), float(t), max(float(t), 0.999), 1.0
+            )
+        )
+        for t in sched.timesteps
+    ]
+    latents = torch.randn(len(video), 96)
+    state = SimpleNamespace(
+        latents=latents.clone(),
+        num_condition_video_rows=cv,
+        timesteps=sched.timesteps,
+        row_timestep_plan=list(plan),
+        denoiser_input_fields={"video_indices": video},
+    )
+    prefix = PrefixNoise(state, carried, (1, 2, 2), 0.999)
+    allowed = {*sched.timesteps.tolist(), torch.tensor(0.999).item()}
+    rows = slice(cv - 14, cv)
+    for index in range(len(sched.timesteps)):
+        prefix.apply(state, index)
+        unique, inverse = state.row_timestep_plan[index]
+        labels = unique[inverse][video[rows]]
+        assert set(labels.tolist()) <= allowed
+        anchor = torch.tensor(0.999).item()
+        ahead = [
+            sched.timesteps[index + k].item() if index + k < 8 else anchor for k in (1, 2, 3, 4)
+        ]
+        assert labels.reshape(7, 2)[:, 0].tolist() == [*ahead[:1] * 3, *ahead[1:], anchor]
+        weight = labels[:, None]
+        assert torch.allclose(
+            state.latents[rows], weight * latents[rows] + (1 - weight) * latents[cv : cv + 14]
+        )
+        others = torch.ones(len(unique[inverse]), dtype=torch.bool)
+        others[video[rows]] = False
+        before_unique, before_inverse = plan[index]
+        assert torch.equal(unique[inverse][others], before_unique[before_inverse][others])
+    assert torch.equal(state.latents[cv:], latents[cv:])

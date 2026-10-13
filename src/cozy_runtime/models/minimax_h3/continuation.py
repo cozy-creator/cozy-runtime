@@ -33,6 +33,8 @@ CONTEXT_FRAMES = (22, 39, 56)
 #: One second of sound, 24 frames: exactly 40 ticks, whatever the picture window.
 AUDIO_TICKS = 40
 MAX_FRAMES = 362
+#: Carried picture tokens that step from the schedule's next level down to the anchor.
+TAPER_TOKENS = 4
 MAX_CONTEXT_BYTES = 16 << 20
 MAX_CONTEXT_PIXELS = 1344 * 768
 CONTEXT_SCHEMA = "cozy.minimax-h3.av-context/3"
@@ -317,6 +319,49 @@ def align_context_rows(state: Any, context: AVContext, patch_size: tuple[int, in
         state.position_ids[rows, 0] += (
             origin + float(ticks) - state.position_ids[rows[0], 0].clone()
         )
+
+
+class PrefixNoise:
+    """Schedule-matched noise on the carried picture (MAINodes' "Drift Control", re-derived for
+    condition rows). Before each evaluation, tokens far from the seam ride the sampler's own
+    noise (the target head's initial draw) at the schedule's next level; the last
+    `TAPER_TOKENS` take later levels, down to the anchor at the seam, which stays exact. Every
+    label is a schedule or anchor timestep, so AdaLN-pruned tables cover it. Sound stays hard."""
+
+    def __init__(
+        self, state: Any, context: AVContext, patch_size: tuple[int, int, int], anchor: float
+    ) -> None:
+        assert context.video is not None
+        _, patch_h, patch_w = patch_size
+        _, _, tokens, height, width = (int(n) for n in context.video.shape)
+        per = (height // patch_h) * (width // patch_w)
+        end = int(state.num_condition_video_rows)
+        self.rows = slice(end - tokens * per, end)
+        self.clean = state.latents[self.rows].clone()
+        self.noise = state.latents[end : end + tokens * per].clone()
+        self.positions = state.denoiser_input_fields["video_indices"][self.rows]
+        taper = min(TAPER_TOKENS, tokens)
+        ahead = [1] * (tokens - taper) + list(range(2, taper + 1))
+        steps = state.timesteps.float()
+        self.labels = [
+            torch.cat(
+                [
+                    steps[i + k : i + k + 1] if i + k < len(steps) else steps.new_tensor([anchor])
+                    for k in ahead
+                ]
+                + [steps.new_tensor([anchor])]
+            ).repeat_interleave(per)
+            for i in range(len(steps))
+        ]
+
+    def apply(self, state: Any, index: int) -> None:
+        labels = self.labels[index].to(self.clean.device)
+        weight = labels[:, None].to(self.clean.dtype)
+        state.latents[self.rows] = weight * self.clean + (1 - weight) * self.noise
+        unique, inverse = state.row_timestep_plan[index]
+        rows = unique[inverse].clone()
+        rows[self.positions] = labels.to(rows.device, rows.dtype)
+        state.row_timestep_plan[index] = tuple(torch.unique(rows, sorted=True, return_inverse=True))
 
 
 class DeliveredFrames:

@@ -85,6 +85,7 @@ from .continuation import (
     ContextReferenceLayout,
     ContinuationPlan,
     DeliveredFrames,
+    PrefixNoise,
     align_context_rows,
     export_context,
 )
@@ -1660,6 +1661,13 @@ class OfficialH3Pipeline:
         facts = ScheduleFacts.of(plan, schedule)
         loop = blocks["denoise.denoise"]
         block_state = loop.get_block_state(state)
+        prefix = (
+            None
+            if context is None or context.video is None
+            else PrefixNoise(
+                block_state, context, tuple(scoped.patch_size), scoped.keyframe_noise_aug
+            )
+        )
         start = 0
         locked_audio = None
         if refine_steps is not None:
@@ -1693,6 +1701,8 @@ class OfficialH3Pipeline:
         for index in range(start, len(block_state.timesteps)):
             timestep = block_state.timesteps[index]
             cancel()
+            if prefix is not None:
+                prefix.apply(block_state, index)
             with attention_scope(
                 _attention_layout(block_state, index, sol_dense_steps=sol_dense_steps)
             ):
