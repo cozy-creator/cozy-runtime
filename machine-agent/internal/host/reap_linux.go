@@ -9,6 +9,10 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// A Runtime wheel can replace the installed agent pathname during startup.
+// Its guardian must still execute this process's inode, preserving their private IPC.
+func guardianExecutable() (string, error) { return "/proc/self/exe", nil }
+
 // The guardian is the subreaper of the Runtime's process tree: an executor orphaned by a
 // Runtime that died is adopted and reaped here.
 func adoptOrphans() {

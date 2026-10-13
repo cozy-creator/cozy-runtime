@@ -86,8 +86,11 @@ The existing machine and Runtime-root locks protect admission. Every owner's
 unfinished or uncollected run in the public journal defers an update; unreadable
 history also defers it. The boot ID, certificate and execution journal are
 preserved. An unavailable index or incompatible candidate leaves the verified
-installed pair in service. Machine-agent executables advance through fresh
-worker images; this mechanism does not replace a running agent binary.
+installed pair in service. When the image launcher points to the wheel-owned
+`opt/cozy/python/bin/cozy-machine`, installing a Runtime wheel also stages its
+bundled agent for the next boot. The already-running agent and its guardian keep
+the same executing binary inode; no immediate self-replacement is attempted.
+Fresh worker images likewise start the bundled agent directly.
 
 The launcher retains hashed rollback wheels and a fsynced transaction under
 `var/lib/cozy/startup-update`, outside the unprivileged agent's writable state.

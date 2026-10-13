@@ -230,7 +230,7 @@ type guardianLauncher struct {
 }
 
 func startGuardian(runtimePath, root string, env []string, out io.Writer) (*guardianLauncher, error) {
-	self, err := os.Executable()
+	self, err := guardianExecutable()
 	if err != nil {
 		return nil, err
 	}
