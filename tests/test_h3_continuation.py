@@ -71,7 +71,7 @@ def chain(seconds: list[int], carries: list[Carry]) -> list[ContinuationPlan]:
         (15, Carry(), 362, 362),
         (14, PICTURE, 362, 340),
         (10, PICTURE, 277, 255),
-        (15, SOUND, 362, 362),
+        (14, SOUND, 362, 338),
     ],
 )
 def test_a_segment_delivers_its_whole_sample_after_the_regenerated_head(
@@ -82,6 +82,10 @@ def test_a_segment_delivers_its_whole_sample_after_the_regenerated_head(
     assert plan.delivered_frames >= 24 * seconds
     with pytest.raises(InvalidRequest, match="362"):
         ContinuationPlan(15, PICTURE)
+    # Sound alone rides a one-second head: before the target start H3 imitates it instead.
+    assert (Carry().head_frames, SOUND.head_frames, BOTH.head_frames) == (0, 24, 22)
+    with pytest.raises(InvalidRequest, match="362"):
+        ContinuationPlan(15, SOUND)
     with pytest.raises(InvalidRequest):
         Carry(32)
 
@@ -243,7 +247,7 @@ def test_carried_rows_land_on_this_clips_timeline_and_stay_fixed(
         assert torch.allclose(positions[video[2:cv], 0], expected, rtol=0, atol=1e-12)
         assert torch.equal(positions[video[2:cv], 0], positions[video[cv : cv + 2 * tokens], 0])
     if carried.audio is not None:
-        end = origin + float(Fraction(5, 3) * carry.frames + offset)
+        end = origin + float(Fraction(5, 3) * carry.head_frames + offset)
         ticks = torch.arange(AUDIO_TICKS, dtype=torch.float64).repeat(2)
         assert torch.allclose(
             positions[audio[:ca], 0], end - AUDIO_TICKS + ticks, rtol=0, atol=1e-9
