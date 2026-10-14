@@ -610,11 +610,12 @@ def _validate(interface: PackageInterface, source: str) -> None:
             if not item.name or item.name in names:
                 _invalid(source, f"{path}.name", "must be non-empty and unique")
             names.add(item.name)
-            for field in ("publishes", "accelerator"):
-                if (kind == "job") != (getattr(item, field) is not msgspec.UNSET):
-                    _invalid(source, f"{path}.{field}", "is required exactly on jobs")
-            if kind != "job" and item.weights_outputs is not msgspec.UNSET:
-                _invalid(source, path, "only jobs declare weights outputs")
+            if (kind == "job") != (item.publishes is not msgspec.UNSET):
+                _invalid(source, f"{path}.publishes", "is required exactly on jobs")
+            if kind != "job" and (
+                item.accelerator is not msgspec.UNSET or item.weights_outputs is not msgspec.UNSET
+            ):
+                _invalid(source, path, "only jobs declare accelerator or weights outputs")
             _schema(item.request, source, f"{path}.request")
             _schema(item.result, source, f"{path}.result")
             if item.assets is not msgspec.UNSET:

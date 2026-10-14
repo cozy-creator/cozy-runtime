@@ -1,1 +1,0 @@
-Every job declares its body's device: `app.job(..., accelerator=True|False)`, and a script that runs as a job `[tool.cozy] accelerator = true|false`. An undeclared job refuses at registration and static describe, and a package interface whose job carries no `accelerator` is invalid. Nothing infers the device from dependencies; TensorD and the CLI read this one field.

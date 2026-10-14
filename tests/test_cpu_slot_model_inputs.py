@@ -1,6 +1,5 @@
-"""A script job declares its accelerator the same way to the static and the imported reader (an
-undeclared one refuses in both), and a CPU script that reaches for CUDA is told which declaration
-it is missing."""
+"""A script job's accelerator, declared or not, reaches the static and the imported reader the same
+way, and a CPU script that reaches for CUDA is told which declaration it is missing."""
 
 from __future__ import annotations
 
@@ -11,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from cozy_runtime.author import ConformanceError, Invocation, attempt, describe, script_app
+from cozy_runtime.author import Invocation, attempt, describe, script_app
 from cozy_runtime.internal import package_interface, static_interface
 from cozy_runtime.internal.discovery import discover
 
@@ -28,24 +27,22 @@ def _script(tmp_path: Path, name: str, metadata: str, body: str) -> Path:
     return project
 
 
-@pytest.mark.parametrize("declared", [False, True])
-def test_a_script_declares_its_accelerator_in_both_readers(tmp_path: Path, declared: bool) -> None:
+@pytest.mark.parametrize("declared", [None, False, True])
+def test_a_script_declares_its_accelerator_in_both_readers(
+    tmp_path: Path, declared: bool | None
+) -> None:
     name = "accel_script_" + str(declared).lower()
-    metadata = f"# /// script\n# [tool.cozy]\n# accelerator = {str(declared).lower()}\n# ///\n"
+    metadata = (
+        ""
+        if declared is None
+        else f"# /// script\n# [tool.cozy]\n# accelerator = {str(declared).lower()}\n# ///\n"
+    )
     project = _script(tmp_path, name, metadata, "def main():\n    pass\n")
     sys.modules.pop(name, None)
     static = static_interface.build(project)
     imported = package_interface.build(discover(project))
     assert package_interface.canonical_bytes(static) == package_interface.canonical_bytes(imported)
-    assert static["jobs"][0]["accelerator"] is declared
-
-
-def test_an_undeclared_script_job_refuses_in_both_readers(tmp_path: Path) -> None:
-    project = _script(tmp_path, "accel_script_undeclared", "", "def main():\n    pass\n")
-    sys.modules.pop("accel_script_undeclared", None)
-    for read in (static_interface.build, lambda root: discover(root)):
-        with pytest.raises(ConformanceError, match="script runs as a job and declares no"):
-            read(project)
+    assert static["jobs"][0].get("accelerator") is declared
 
 
 def test_a_cpu_script_that_uses_cuda_names_the_declaration(

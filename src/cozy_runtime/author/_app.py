@@ -34,13 +34,6 @@ P = ParamSpec("P")
 R = TypeVar("R")
 
 
-def undeclared_accelerator(job: str) -> str:
-    return (
-        f"job {job!r} declares no accelerator: register it with app.job(..., accelerator=True) "
-        "if its body computes on a GPU, accelerator=False if it runs on CPU"
-    )
-
-
 class RegistrationError(ConformanceError):
     """A duplicate or otherwise invalid registration. Refuses at import, not at serve."""
 
@@ -66,8 +59,8 @@ class Registration:
     internal: bool = False
     """Managed children from this installed package revision only; never a root request."""
     accelerator: bool | None = None
-    """A job's own execution device, required on every job: True computes on an accelerator,
-    False on CPU. None on an entrypoint, whose model slots decide."""
+    """A job's own execution device: True requires a GPU, False runs on CPU, None (undeclared)
+    takes the machine's GPU when it has one. None on an entrypoint, whose model slots decide."""
     hidden: bool = False
     """This surface is DECLARED but NOT PUBLISHED (#572d). A hidden entrypoint stays in the
     local registry but is absent from the package interface, so no deployment stages a binding and
@@ -249,8 +242,8 @@ class App:
         derived from the signature exactly as it is for an entrypoint. There is no
         JobContext, no second kernel and no serving loop.
         `internal=True` retains this job for same-package managed child calls only.
-        `accelerator=` is required: the job body's own execution device, True a GPU and False
-        a CPU. Nothing infers it, so an undeclared job refuses here, before anything runs.
+        `accelerator=` is the job body's own execution device: True requires a GPU, False runs
+        on CPU, and undeclared takes the machine's GPU when it has one, else CPU.
         """
         return self._register(
             "job",
@@ -304,8 +297,6 @@ class App:
                     "registration is immutable (§1.0)"
                 )
             registered = name or target.__name__
-            if kind == "job" and accelerator is None:
-                raise RegistrationError(undeclared_accelerator(registered))
             if registered in self._registry:
                 raise RegistrationError(
                     f"duplicate registration {registered!r}: names are unique per app"
