@@ -182,7 +182,9 @@ class Metrics(msgspec.Struct, frozen=True, kw_only=True):
     handler_ms: float = 0.0
     device_lease_ms: float = 0.0
     d2h_wait_ms: float = 0.0
+    #: torch's high-water marks over the attempt: live tensors, and the segments it reserved
     peak_vram_bytes: int = 0
+    peak_reserved_bytes: int = 0
     activation_peak_bytes: int = 0
     activation_peaks: dict[str, int] = {}
     allocated_at_start_bytes: int = -1
