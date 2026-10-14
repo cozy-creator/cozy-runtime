@@ -167,6 +167,7 @@ def test_a_follower_attempt_holds_states_until_its_holder_closes_them(
     held: dict[str, Any] = {}
     with _request(held):
         first = producer.request_state()
+    assert isinstance(first, State)
     with _request(held):
         assert producer.request_state() is first and not first.closed
     _close(held)
