@@ -32,7 +32,7 @@ class Request(msgspec.Struct):
 class Result(msgspec.Struct):
     device: str
     values: list[float]
-@app.job
+@app.job(accelerator=True)
 def compute(payload: Request, ctx: Context) -> Result:
     if ctx.device.type == "cpu":
         return Result("cpu", [])

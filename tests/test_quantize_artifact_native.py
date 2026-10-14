@@ -171,7 +171,7 @@ def _run(
     threshold: float | None = None,
 ) -> tuple[ModelArtifact | None, Outcome, Attempt]:
     app = App()
-    app.job(quantize, weights=(WeightsOutput("model", BOUND),))
+    app.job(quantize, weights=(WeightsOutput("model", BOUND),), accelerator=False)
     describe(app)
     with host:
         result, outcome, record = attempt(

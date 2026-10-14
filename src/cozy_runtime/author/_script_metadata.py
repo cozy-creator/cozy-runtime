@@ -125,10 +125,18 @@ def main_definition(tree: ast.Module) -> ast.FunctionDef | ast.AsyncFunctionDef:
 type Rungs = list[dict[str, Any]]
 
 
-def declarations(raw: bytes) -> tuple[dict[str, Rungs], tuple[WeightsOutput, ...], bool]:
+UNDECLARED_ACCELERATOR = (
+    "this script runs as a job and declares no accelerator: add `accelerator = true` under "
+    "[tool.cozy] in its `# /// script` block if it computes on a GPU, `accelerator = false` "
+    "if it runs on CPU"
+)
+
+
+def declarations(
+    raw: bytes,
+) -> tuple[dict[str, Rungs], tuple[WeightsOutput, ...], bool | None]:
     """A script's `[tool.cozy]`: its model default ladders (a lane string is one `*` rung), its
-    weights outputs and accelerator. A script without Model slots composes on CPU unless it
-    declares `accelerator = true`."""
+    weights outputs and accelerator (None undeclared; a script that runs as a job must)."""
     block: list[str] = []
     opened = found = False
     for line in raw.decode("utf-8").splitlines():
@@ -150,8 +158,8 @@ def declarations(raw: bytes) -> tuple[dict[str, Rungs], tuple[WeightsOutput, ...
     cozy = tool.get("cozy", {})
     if not isinstance(cozy, dict) or set(cozy) - {"models", "weights", "accelerator"}:
         raise ValueError("script tool.cozy accepts models, weights and accelerator only")
-    accelerator = cozy.get("accelerator", False)
-    if type(accelerator) is not bool:
+    accelerator = cozy.get("accelerator")
+    if accelerator is not None and type(accelerator) is not bool:
         raise ValueError("script accelerator must be a boolean")
     declared = cozy.get("models", {})
     if not isinstance(declared, dict):

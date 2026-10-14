@@ -69,7 +69,7 @@ def test_effective_checkpoint_and_source_keep_exact_admitted_base(tmp_path: Path
     assert other.checkpoint_ref == negative.manifest.digest
     assert model._cozy_selection_ref == other._cozy_selection_ref == base.manifest.digest
     app = App()
-    app.job(inspect_adapted)
+    app.job(inspect_adapted, accelerator=False)
     describe(app)
     try:
         # Real native source custody contains the admitted base and its effective view.

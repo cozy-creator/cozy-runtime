@@ -33,7 +33,11 @@ app = App()
 BOUND = 32768
 
 
-@app.job(name="native-quantization", weights=(WeightsOutput("model", max_new_bytes=BOUND),))
+@app.job(
+    name="native-quantization",
+    weights=(WeightsOutput("model", max_new_bytes=BOUND),),
+    accelerator=False,
+)
 def native_quantization(
     ctx: Context,
     source: QuantizationSource,

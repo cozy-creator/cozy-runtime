@@ -58,8 +58,8 @@ def project(tmp_path: Path, source: str = OPERATIONS) -> Path:
         "app = App()\n"
         "BYTES = 1 << 20\n"
         'app.job(operations.quantize, name="quantize-artifact", '
-        'weights=(WeightsOutput("model", BYTES),))\n'
-        'app.job(name="precompute-adaln")(operations.precompute)\n'
+        'weights=(WeightsOutput("model", BYTES),), accelerator=False)\n'
+        'app.job(name="precompute-adaln", accelerator=False)(operations.precompute)\n'
     )
     (package / "operations.py").write_text(source)
     return root
@@ -201,7 +201,7 @@ def test_app_decorator_can_register_an_invocable_without_running_it(tmp_path: Pa
     (root / "ast_operations/__init__.py").write_text("""
 from cozy_runtime.author import App, Context, ModelArtifact, invocable
 app = App()
-@app.job(name="prepare")
+@app.job(name="prepare", accelerator=False)
 @invocable(memoize=True)
 async def prepare(ctx: Context, *, model: ModelArtifact) -> ModelArtifact:
     raise AssertionError("never execute")

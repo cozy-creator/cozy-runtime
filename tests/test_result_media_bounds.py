@@ -37,7 +37,7 @@ class Result(msgspec.Struct):
 async def segment(ctx: Context, *, request: Request, out: Outputs) -> Result:
     raise RuntimeError("source only")
 app = App()
-app.job(segment, emits_media=True)
+app.job(segment, emits_media=True, accelerator=False)
 """
 
 
@@ -135,7 +135,7 @@ class Request(msgspec.Struct):
     prompt: str
 class Result(msgspec.Struct):
     width: int
-@app.job
+@app.job(accelerator=False)
 async def compose(ctx: Context, payload: Request, media: MediaDecoder) -> Result:
     raise RuntimeError("discovery only")
 """
@@ -160,7 +160,7 @@ class Request(msgspec.Struct):
     image: ImageAsset
 class Result(msgspec.Struct):
     width: int
-@app.job
+@app.job(accelerator=False)
 async def compose(ctx: Context, payload: Request, media: MediaDecoder) -> Result:
     raise RuntimeError("discovery only")
 """)

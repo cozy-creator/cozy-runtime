@@ -37,7 +37,7 @@ class Result(msgspec.Struct):
 app = App()
 
 
-@app.job
+@app.job(accelerator=False)
 def paint(payload: Request, out: Outputs) -> Result:
     image, mask = out.save_image(PIXELS), out.save_image(PIXELS)
     out.publish("previews", image)

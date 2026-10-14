@@ -44,7 +44,7 @@ def project(tmp_path: Path, *, invocable: bool, components: str = "{'model': ('d
         + declared
         + "@app.entrypoint\ndef everything(payload: Request, model: Demo) -> Result:\n"
         "    return Result(1)\n"
-        "@app.job(components={'model': ('vae', 'text_encoder')})\n"
+        "@app.job(components={'model': ('vae', 'text_encoder')}, accelerator=False)\n"
         "def bake(payload: Request, model: Demo) -> Result:\n    return Result(1)\n"
     )
     return root

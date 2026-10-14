@@ -73,7 +73,7 @@ def test_lane_words_are_not_selection_leaks() -> None:
     def build(output_id: str, release: str) -> dict[str, object]:
         app = App()
 
-        @app.job(weights=(WeightsOutput(output_id, max_new_bytes=1 << 20),))
+        @app.job(weights=(WeightsOutput(output_id, max_new_bytes=1 << 20),), accelerator=False)
         def produce(payload: Request, denoiser: Denoiser, ctx: Context) -> Reply:
             return Reply(text="ok")
 

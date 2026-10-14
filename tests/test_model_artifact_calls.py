@@ -58,7 +58,7 @@ async def echo(ctx: Context, *, value: ModelArtifact) -> ModelArtifact:
 
 def test_injected_model_refuses_as_model_before_reserving_a_child() -> None:
     app = App()
-    app.job(consume)
+    app.job(consume, accelerator=False)
     surface = describe(app)[0]
     assert isinstance(surface.payload_type, type) and issubclass(
         surface.payload_type, msgspec.Struct
@@ -112,7 +112,7 @@ def test_author_native_creation_call_returns_its_model_artifact(tmp_path: Path) 
     store = tensorfs.Store.init(tmp_path / "store")
     host = NativeExecution(store, tmp_path, "request", {}, {"result": 2048})
     app = App()
-    app.job(produce, weights=(WeightsOutput("result", 2048),))
+    app.job(produce, weights=(WeightsOutput("result", 2048),), accelerator=False)
     describe(app)
     result, outcome, _ = attempt(
         app.get("produce"),
@@ -133,8 +133,8 @@ def test_author_native_creation_call_returns_its_model_artifact(tmp_path: Path) 
 
 def test_model_proxy_is_an_exact_artifact_and_dispatch_checks_bound_model(tmp_path: Path) -> None:
     app = App()
-    app.job(consume)
-    app.job(echo)
+    app.job(consume, accelerator=False)
+    app.job(echo, accelerator=False)
     found = Discovered(app, __name__ + ":app", tmp_path, sys.modules[__name__], describe(app), {})
     raw = package_interface.canonical_bytes(package_interface.build(found))
     metadata = package_interface.read_bytes(raw)

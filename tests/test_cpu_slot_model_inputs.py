@@ -1,5 +1,6 @@
-"""A script declares its accelerator the same way to the static and the imported reader, and a
-CPU script that reaches for CUDA is told which declaration it is missing."""
+"""A script job declares its accelerator the same way to the static and the imported reader (an
+undeclared one refuses in both), and a CPU script that reaches for CUDA is told which declaration
+it is missing."""
 
 from __future__ import annotations
 
@@ -10,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from cozy_runtime.author import Invocation, attempt, describe, script_app
+from cozy_runtime.author import ConformanceError, Invocation, attempt, describe, script_app
 from cozy_runtime.internal import package_interface, static_interface
 from cozy_runtime.internal.discovery import discover
 
@@ -27,14 +28,10 @@ def _script(tmp_path: Path, name: str, metadata: str, body: str) -> Path:
     return project
 
 
-@pytest.mark.parametrize(
-    ("metadata", "declared"),
-    [("", False), ("# /// script\n# [tool.cozy]\n# accelerator = true\n# ///\n", True)],
-)
-def test_a_script_declares_its_accelerator_in_both_readers(
-    tmp_path: Path, metadata: str, declared: bool
-) -> None:
+@pytest.mark.parametrize("declared", [False, True])
+def test_a_script_declares_its_accelerator_in_both_readers(tmp_path: Path, declared: bool) -> None:
     name = "accel_script_" + str(declared).lower()
+    metadata = f"# /// script\n# [tool.cozy]\n# accelerator = {str(declared).lower()}\n# ///\n"
     project = _script(tmp_path, name, metadata, "def main():\n    pass\n")
     sys.modules.pop(name, None)
     static = static_interface.build(project)
@@ -43,11 +40,20 @@ def test_a_script_declares_its_accelerator_in_both_readers(
     assert static["jobs"][0]["accelerator"] is declared
 
 
+def test_an_undeclared_script_job_refuses_in_both_readers(tmp_path: Path) -> None:
+    project = _script(tmp_path, "accel_script_undeclared", "", "def main():\n    pass\n")
+    sys.modules.pop("accel_script_undeclared", None)
+    for read in (static_interface.build, lambda root: discover(root)):
+        with pytest.raises(ConformanceError, match="script runs as a job and declares no"):
+            read(project)
+
+
 def test_a_cpu_script_that_uses_cuda_names_the_declaration(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # torch's own words when a process with no visible device asks for CUDA.
     (tmp_path / "cuda_script.py").write_text(
+        "# /// script\n# [tool.cozy]\n# accelerator = false\n# ///\n"
         "def main():\n    raise RuntimeError('No CUDA GPUs are available')\n"
     )
     monkeypatch.syspath_prepend(str(tmp_path))

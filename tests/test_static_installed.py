@@ -29,7 +29,7 @@ class Result(msgspec.Struct, frozen=True):
 @invocable(memoize=True)
 async def double(ctx: Context, *, value: int) -> Result:
     return Result(value * 2)
-app.job(double)
+app.job(double, accelerator=False)
 """
 
 
@@ -216,9 +216,9 @@ async def second(ctx: Context, *, value: int) -> Result:
 @invocable(memoize=True, memo_dependencies=(MemoDistribution("msgspec" if True else "numpy"),))
 async def computed(ctx: Context, *, value: int) -> Result:
     return Result(value)
-app.job(first)
-app.job(second)
-app.job(computed)
+app.job(first, accelerator=False)
+app.job(second, accelerator=False)
+app.job(computed, accelerator=False)
 """
 
 

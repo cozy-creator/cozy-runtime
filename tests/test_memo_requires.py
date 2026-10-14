@@ -42,9 +42,9 @@ async def plain(ctx: Context, *, prompt: str, seed: int | None = None) -> Result
 async def unconditional(ctx: Context, *, prompt: str, seed: int | None = None) -> Result:
     raise RuntimeError("never executed")
 
-app.job(generate)
-app.job(plain)
-app.job(unconditional)
+app.job(generate, accelerator=False)
+app.job(plain, accelerator=False)
+app.job(unconditional, accelerator=False)
 """
 
 
