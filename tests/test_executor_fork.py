@@ -300,7 +300,7 @@ def test_an_import_only_fusion_compile_leaves_no_thread_behind(
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
     monkeypatch.setenv("PYTHONPATH", str(SOURCE))
     before = set(os.listdir("/proc/self/task"))
-    line = fork_parent.expect_fusion(["0"])
+    line = fork_parent.expect_fusion(["0"], True, [])
     assert line.startswith("fusion compile started by child")
     assert set(os.listdir("/proc/self/task")) == before
     (child,) = fork_parent._COMPILERS

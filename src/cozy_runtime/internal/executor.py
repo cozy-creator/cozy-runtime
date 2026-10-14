@@ -69,6 +69,7 @@ from msgspec import UNSET, UnsetType
 from cozy_runtime import __version__ as RUNTIME_VERSION
 from cozy_runtime.author._activity import settles
 from cozy_runtime.author._assets import GrantedInput
+from cozy_runtime.author._attention import _close as close_producer_states
 from cozy_runtime.author._calls import _Broker, _CallType
 from cozy_runtime.author._capture import ActivationCapture
 from cozy_runtime.author._context import AdapterRef, Device
@@ -120,6 +121,8 @@ from cozy_runtime.author._model import Model, _derive_model, component_use
 from cozy_runtime.author._observations import Attribution
 from cozy_runtime.author._services import Attempt as AuthorAttempt
 from cozy_runtime.author._services import CheckpointConflict, ProgressFrame
+from cozy_runtime.author.kernels import _SETS as KERNEL_SETS
+from cozy_runtime.author.kernels import Plan
 from cozy_runtime.internal import (
     accel,
     attention,
@@ -512,13 +515,22 @@ _CONSTRUCTION_MODULES = (
     "cozy_runtime.internal.probe",
     "cozy_runtime.internal.weights",
     "cozy_runtime.internal.resolution",
+    "cozy_runtime.internal.triton_kernels",
 )
+
+
+class _PlanRefusal(RuntimeError):
+    """A model's execution plan refused its construction."""
+
+    def __init__(self, code: str, detail: str) -> None:
+        super().__init__(detail)
+        self.code = code
 
 
 def _dense(kernels: Iterable[str]) -> str:
     """The dense reference the Sol kernels among `kernels` recompute rows with."""
-    sparse = sorted(attention_sol.NAMES.intersection(kernels))
-    return ", ".join(dict.fromkeys(attention_sol.dense_identity(name) for name in sparse))
+    sparse = attention.sparse_names(kernels)
+    return ", ".join(dict.fromkeys(attention.dense_identity(name) for name in sparse))
 
 
 def _segment(stage: str, step: int, held: attention.Applied, at_us: int = 0) -> dict[str, Any]:
@@ -651,7 +663,9 @@ class Executor:
         self.device_facts: Any = None
         #: a follower's hold of rank 0's attention selection for the current attempt
         self._attention_hold = contextlib.ExitStack()
-        self._producer_hold: tuple[str, attention_producer.RequestState] | None = None
+        self._producer_hold: (
+            tuple[str, attention_producer.RequestState | None, dict[str, Any]] | None
+        ) = None
         self.facts: dict[str, Any] = {}
         self.schema_digests: dict[str, str] = {}
         #: request_id -> the record `prepare_request` resolved, run by `invoke`
@@ -1132,13 +1146,13 @@ class Executor:
                         self.torch.autocast(device_type=kind, dtype=getattr(self.torch, dtype))
                     )
                 stack.enter_context(wire.attention_context(command))
-                producer_state = None
+                producer_state, states = None, None
                 if self._producer_hold is not None:
-                    construction, held_state = self._producer_hold
+                    construction, held_state, held_store = self._producer_hold
                     if name[0].startswith(construction + "#"):
-                        producer_state = held_state
+                        producer_state, states = held_state, held_store
                 sol_counts = stack.enter_context(
-                    attention_sol.observing(producer_state=producer_state)
+                    attention_sol.observing(producer_state=producer_state, held=states)
                 )
                 served = stack.enter_context(attention_ulysses.observing())
                 args, kwargs = wire.run_call(
@@ -1711,24 +1725,66 @@ class Executor:
         return list(dict.fromkeys(slot.model_class for slot in slots))
 
     def _expect_fusion(self, *, isolated: bool) -> str:
-        """Start the fused glue's compile for each sealed card's architecture, read from the
-        driver's management library: no device context, so it runs beside the wait for the
-        grant and the weights (h3a-087). Construction takes the build once it is ready.
-        `isolated` (an import-only start, which may be forked): both run in a child."""
-        if not any(
+        """Start the fused glue's and the package's kernels' compiles for each sealed card's
+        architecture, read from the driver's management library: no device context, so they
+        run beside the wait for the grant and the weights (h3a-087). Construction takes each
+        build once it is ready. `isolated` (an import-only start, which may be forked): they
+        start in a child."""
+        fused = any(
             getattr(cls, "__fusion__", "refuse") in ("accept", "require")
             for cls in self._model_classes()
-        ):
+        )
+        sets = sorted(KERNEL_SETS)
+        if not fused and not sets:
             return ""
         try:
             entries = _sealed_entries()
             if isolated:
-                return zygote.expect_fusion(entries)
-            fusion = importlib.import_module("cozy_runtime.internal.fusion")
+                modules = {
+                    entry.kernel.fn.__module__
+                    for name in sets
+                    for entry in KERNEL_SETS[name].entries
+                }
+                return zygote.expect_fusion(entries, fused, sorted(modules))
             archs = sorted({accel.device_capability(entry) for entry in entries} - {0})
-            return "; ".join(f"fusion sm{arch} {fusion.expect(arch)}" for arch in archs)
+            built = importlib.import_module("cozy_runtime.internal.triton_kernels")
+            lines = [
+                f"{name} sm{arch} {built.expect(KERNEL_SETS[name], arch)}"
+                for name in sets
+                for arch in archs
+            ]
+            if fused:
+                fusion = importlib.import_module("cozy_runtime.internal.fusion")
+                lines += [f"fusion sm{arch} {fusion.expect(arch)}" for arch in archs]
+            return "; ".join(lines)
         except Exception as exc:  # an optimization, never the start's verdict
-            return f"fusion compile not started: {type(exc).__name__}: {exc}"[:300]
+            return f"kernel compiles not started: {type(exc).__name__}: {exc}"[:300]
+
+    def _execution_plan(self, model: Model[Any], torch: Any) -> str:
+        """The model's own execution plan on its filled components, on this GPU: its
+        identity, "" when it installs none. A raise refuses the construction, typed."""
+        if type(model).execution_plan is Model.execution_plan:
+            return ""
+        device = self._rank_device(torch)
+        # Imported past the device boundary, as every kernel integration is.
+        built = importlib.import_module("cozy_runtime.internal.triton_kernels")
+        try:
+            identity = model.execution_plan(
+                Plan(device, functools.partial(built.load, device=device))
+            )
+        except Exception as exc:
+            code = getattr(exc, "code", "")
+            raise _PlanRefusal(
+                code if isinstance(code, str) and code else "execution_plan_failed",
+                f"{type(model).__name__}.execution_plan: {type(exc).__name__}: {exc}",
+            ) from exc
+        if not isinstance(identity, str):
+            raise _PlanRefusal(
+                "execution_plan_failed",
+                f"{type(model).__name__}.execution_plan returned {type(identity).__name__}, "
+                "not its identity string",
+            )
+        return identity
 
     def _close_after(self, reply: dict[str, Any]) -> dict[str, Any]:
         """A refusal after followers were commanded leaves them mid-protocol: the process
@@ -2508,6 +2564,7 @@ class Executor:
                 if consent in ("accept", "require")
                 else None
             )
+            planned = self._execution_plan(model, torch)
             roots = backend.roots
             stage("execution_plan")
             # THE FASTEST KERNEL THIS DEVICE AND IMAGE SUPPORT, PINNED POST-FILL (cr-124),
@@ -2524,7 +2581,7 @@ class Executor:
             applied = self._reselect()
             self.device_facts = device_facts
             stage("attention_pin")
-        except (FusionRefusal, attention.AttentionRefusal) as exc:
+        except (FusionRefusal, attention.AttentionRefusal, _PlanRefusal) as exc:
             backend.poison(())
             self.poisoned = f"execution plan refused: {exc.code}"
             return {"ok": False, "code": exc.code, "detail": str(exc)[:900]}
@@ -2549,7 +2606,7 @@ class Executor:
             device=device_facts,
             world=self.world,
             sealed=_SEALED,
-            fusion=fused.identity_document() if fused is not None else None,
+            fusion=fused.identity_document() if fused is not None else planned or None,
         )
         record = registry.generations()[0].record
         self.plan = plan
@@ -2558,6 +2615,7 @@ class Executor:
             {
                 "plan_digest": plan.digest(),
                 "execution_fusion": fused.identity_document() if fused is not None else None,
+                **({"execution_plan": planned} if planned else {}),
             }
         )
         self.constructed_model_digest = (
@@ -2603,7 +2661,7 @@ class Executor:
         # No warm step: a call waits on every load, so a dry render only delays it. Its first
         # stage maps the weights and pays the first launches (the ledger re-baselines once).
         weights.measure_context()
-        if attention_sol.NAMES.intersection(applied.totals()):
+        if attention.sparse_names(applied.totals()):
             frozen = attention._baked_in(dict(backend.roots))
             if frozen:
                 backend.poison(())
@@ -2627,6 +2685,7 @@ class Executor:
             "qualification": qualification.document(),
             "substrate_census": list(record.weightless),
             "execution_fusion": fused.document() if fused is not None else None,
+            "execution_plan": planned,
             "filled": record.filled,
             "filled_bytes": record.filled_bytes,
             "device_free_bytes": memory["driver_free_bytes"],
@@ -3253,7 +3312,7 @@ class Executor:
                 served_attention = served_attention.joined(held) if served_attention else held
         if served_attention is not None:
             self._emit_attention(record, served_attention, "attention.selected")
-            sparse_kernels = sorted(attention_sol.NAMES.intersection(served_attention.totals()))
+            sparse_kernels = attention.sparse_names(served_attention.totals())
             if sparse_kernels:
                 sparse_name = "+".join(sparse_kernels)
                 record.emit(
@@ -3628,12 +3687,15 @@ class Executor:
             )
         except attention.AttentionRefusal as exc:
             return {"ok": False, "code": exc.code, "detail": str(exc)[:900], "rank": self.rank}
-        # The actual selected recipe, not merely a nonempty CLI pin, owns this
-        # request's state. The existing restore/new-selection finally closes it.
+        # One attempt's producer states live across its mirrored calls; the restore or the
+        # next selection closes them. The built-in recipe's only when it is selected.
+        state = None
         if attention_producer.CP_NAMES.intersection(held.totals()):
             state = attention_producer.RequestState()
-            self._producer_hold = (command.construction, state)
             self._attention_hold.callback(state.clear)
+        store: dict[str, Any] = {}
+        self._attention_hold.callback(close_producer_states, store)
+        self._producer_hold = (command.construction, state, store)
         return {"ok": True, "rank": self.rank, "hosts": held.hosts}
 
     def _followers_attention(self, pin: str | UnsetType = UNSET) -> list[dict[str, Any]]:

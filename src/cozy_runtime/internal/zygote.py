@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import gc
+import json
 import os
 import subprocess
 import sys
@@ -46,15 +47,15 @@ def driverless(torch: Any, devices: int) -> Iterator[None]:
 _COMPILERS: list[subprocess.Popen[bytes]] = []
 
 
-def expect_fusion(entries: Sequence[str]) -> str:
-    """Start the fused glue's compile for the sealed cards in a child that lives until the
-    compile ends: NVML (which leaves a driver thread on current drivers) and the compile's
-    watcher thread live there, so this process stays forkable. The compile and its key are
-    the ones `fusion.expect` starts in-process; construction takes the build once ready."""
+def expect_fusion(entries: Sequence[str], fused: bool, modules: Sequence[str]) -> str:
+    """Start the fused glue's and the package's kernels' compiles for the sealed cards in a
+    child that lives until they end: NVML (which leaves a driver thread on current drivers)
+    and the compiles' watcher threads live there, so this process stays forkable. It imports
+    the package's kernel `modules`; the compiles and keys are the ones `fusion.expect` and
+    `triton_kernels.expect` start in-process; construction takes each build once ready."""
     reap()
-    child = subprocess.Popen(
-        [sys.executable, "-I", "-c", _EXPECT, *entries], stdin=subprocess.DEVNULL
-    )
+    plan = json.dumps({"entries": list(entries), "fused": fused, "modules": list(modules)})
+    child = subprocess.Popen([sys.executable, "-I", "-c", _EXPECT, plan], stdin=subprocess.DEVNULL)
     _COMPILERS.append(child)
     return f"fusion compile started by child {child.pid}"
 
@@ -65,12 +66,22 @@ def reap() -> None:
 
 
 _EXPECT = """
-import sys, threading
-from cozy_runtime.internal import accel, config, fusion, kernel_cache
+import json, sys, threading
+from importlib import import_module
+from cozy_runtime.author.kernels import _SETS
+from cozy_runtime.internal import accel, config, kernel_cache, triton_kernels
 kernel_cache.configure(kernel_cache.from_sealed(config.inherited_environment()))
-archs = sorted({accel.device_capability(entry) for entry in sys.argv[1:]} - {0})
+plan = json.loads(sys.argv[1])
+for module in plan["modules"]:
+    import_module(module)
+archs = sorted({accel.device_capability(entry) for entry in plan["entries"]} - {0})
 for arch in archs:
-    print(f"[fusion] sm{arch} {fusion.expect(arch)}", file=sys.stderr, flush=True)
+    for name, kernels in sorted(_SETS.items()):
+        line = triton_kernels.expect(kernels, arch)
+        print(f"[kernels] {name} sm{arch} {line}", file=sys.stderr, flush=True)
+    if plan["fused"]:
+        fusion = import_module("cozy_runtime.internal.fusion")
+        print(f"[fusion] sm{arch} {fusion.expect(arch)}", file=sys.stderr, flush=True)
 for thread in threading.enumerate():
     if thread is not threading.main_thread():
         thread.join()

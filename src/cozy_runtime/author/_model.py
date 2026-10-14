@@ -56,6 +56,7 @@ from cozy_runtime.author._loader import (
 )
 from cozy_runtime.author._memo import MemoDependency, declare
 from cozy_runtime.author._stage_memo import StageMemo, memoized
+from cozy_runtime.author.kernels import Plan
 
 _LOG = logging.getLogger(__name__)
 
@@ -578,6 +579,15 @@ class Model[PipelineT]:
         of FP8 checkpoint storage. Developer request overrides take precedence.
         """
         return None
+
+    def execution_plan(self, plan: Plan) -> str:
+        """Install this model's execution plan on its filled components: its own fused
+        kernels, glue and hooks. Runtime calls it once per construction on every GPU, after
+        the fill and before attention selection and sequence parallelism, outside the
+        construction guards: it may load and launch the package's kernels (`plan.load`).
+        Returns the installed plan's identity ("" for none), which enters the constructed
+        generation's identity. A raise refuses the construction, typed by its `code`."""
+        return ""
 
     def unload(self, loader: Loader) -> None:
         """Release declared state. The runtime drains before calling this."""

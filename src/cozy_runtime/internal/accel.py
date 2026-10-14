@@ -24,13 +24,13 @@ import re
 import subprocess
 import sys
 import threading
-from collections.abc import Iterator
-from contextlib import contextmanager, suppress
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Literal, cast
+from typing import Any, Literal
 
+from cozy_runtime.author.kernels import readable as readable
 from cozy_runtime.internal.config import inherited_environment, sees_no_gpu
 
 #: The #450 law, imposed on every MPS executor's sealed environment: enabling the fallback
@@ -387,21 +387,6 @@ def synchronize(torch: Any, kind: str) -> None:
         raise AcceleratorUnsupported("mps", "synchronize")
     if kind == "cuda":
         torch.cuda.synchronize()
-
-
-@contextmanager
-def readable[*Ts](*tensors: *Ts) -> Iterator[tuple[*Ts]]:
-    """The operands of a kernel launched outside torch's dispatch (Triton, the compiled
-    extension), which reads them by pointer. A weight with no plane bytes bound is a stand-in
-    with nothing behind its pointer: its plane maps and holds it for the launch, or refuses
-    (`weights.Unbound.reading`). Every such launch goes through here, so none is handed one."""
-    standins = [t for t in tensors if hasattr(type(t), "reading")]
-    if not standins:
-        yield tensors
-        return
-    reading = getattr(type(standins[0]), "reading")  # noqa: B009
-    with reading(standins, "a kernel launch") as read:
-        yield cast("tuple[*Ts]", tuple(read.operand(t) for t in tensors))
 
 
 def drain(torch: Any, kind: str) -> None:

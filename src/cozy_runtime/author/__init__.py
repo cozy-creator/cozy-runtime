@@ -4,7 +4,8 @@ Structural fence (cozy-runtime.md §7, boundaries.md): this package may import s
 typing libraries and the pure canonical-JSON facade only. It cannot import
 cozy_runtime.internal, cozy_runtime.cli, the
 worker protocol, TensorFS, Varena or any RecordOwner; it cannot read environment or config;
-it names no device, allocator, compile or ingest surface. `checks/architecture.py` proves it.
+it names no allocator or ingest surface, and a package's own kernels are declarations the
+runtime compiles and hands back (`author.kernels`). `checks/architecture.py` proves it.
 
 A handler's SIGNATURE is its capability declaration: `Context` says where it runs, and
 everything it DOES rides a typed service parameter it named. A `Model` has two lifecycle
@@ -28,9 +29,15 @@ from cozy_runtime.author._assets import (
     Tree,
     VideoAsset,
 )
-from cozy_runtime.author._attention import AttentionContext
+from cozy_runtime.author._attention import (
+    AttentionContext,
+    AttentionProducer,
+    ProducerCall,
+    register_attention,
+)
 from cozy_runtime.author._attention_scope import (
     AttentionLayout,
+    active_attention_layout,
     attention_scope,
     expect_attention,
 )
@@ -196,6 +203,7 @@ __all__ = [
     "Assets",
     "AttentionContext",
     "AttentionLayout",
+    "AttentionProducer",
     "AudioAsset",
     "AuthorError",
     "Backend",
@@ -273,6 +281,7 @@ __all__ = [
     "Preflight",
     "PreflightViolation",
     "PreparedRequest",
+    "ProducerCall",
     "Recipe",
     "Registration",
     "RegistrationError",
@@ -301,6 +310,7 @@ __all__ = [
     "WeightsReceipt",
     "WeightsView",
     "assert_declaration_shape",
+    "active_attention_layout",
     "attach_assessment",
     "attempt",
     "attention_scope",
@@ -318,6 +328,7 @@ __all__ = [
     "prepare",
     "publish_release",
     "register_adapter",
+    "register_attention",
     "registered_adapters",
     "script_app",
     "sequence_parallel",
