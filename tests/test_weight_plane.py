@@ -841,6 +841,38 @@ def test_a_process_cap_holds_torch_and_the_plane_inside_it(card: Any) -> None:
     assert exact
 
 
+@on_gpu
+def test_an_op_with_no_room_left_moves_the_tensors_the_process_holds_to_host(card: Any) -> None:
+    """Run 5686, qwen-image-2 at 1 MP on an RTX 3070: the VAE decode kept a copy of every
+    convolution's input in its feature cache, 6.6 GiB of torch's own tensors, and a
+    convolution was refused with the plane already down to 6 MB. Tensors an op does not read
+    move to page-locked host memory in place: the stage computes the same bits, and each held
+    tensor is still the same CUDA tensor with the same values, read over the bus."""
+    weights = card.weights
+    model = load(weights, card.checkpoint, "spill")
+    x = torch.randn(1 << 15, HIDDEN, device="cuda", dtype=torch.float16)  # 128 MiB
+    reference = run(model, x, passes=1)
+    model.residency.unpark()
+    weights.set_budget(0)
+    held = [torch.full((32 << 20,), float(i), device="cuda") for i in range(8)]  # 1 GiB
+    torch.cuda.empty_cache()
+    weights.measure_context()
+    # Room for the input, the held tensors and the weights' floor: none for activations.
+    cap = max(weights.context_bytes, 0) + torch.cuda.memory_reserved() + tight(model)
+    moved = weights.facts().spilled_bytes
+    weights.set_cap(cap + weight_policy.MARGIN)
+    try:
+        weights.set_budget(-1)
+        with weights.recovering():  # as the executor runs every call
+            capped = run(model, x, passes=1)
+        facts = weights.facts()
+    finally:
+        weights.set_cap(-1)
+    assert same(reference, capped)
+    assert facts.spilled_bytes - moved >= 128 << 20
+    assert all(t.is_cuda and bool((t == i).all()) for i, t in enumerate(held))
+
+
 def test_decoded_copies_count_in_a_stages_budget(tmp_path: Path) -> None:
     """A weight the card cannot run as stored (fp8 before sm89) is decoded into a float copy
     when its region binds. That copy is torch's memory beside the plane's stored bytes, so a
