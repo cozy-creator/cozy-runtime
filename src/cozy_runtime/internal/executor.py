@@ -664,7 +664,7 @@ class Executor:
         #: a follower's hold of rank 0's attention selection for the current attempt
         self._attention_hold = contextlib.ExitStack()
         self._producer_hold: (
-            tuple[str, attention_producer.RequestState | None, dict[str, Any]] | None
+            tuple[str, attention_producer.RequestState | None, dict[str, object]] | None
         ) = None
         self.facts: dict[str, Any] = {}
         self.schema_digests: dict[str, str] = {}
@@ -1760,7 +1760,7 @@ class Executor:
         except Exception as exc:  # an optimization, never the start's verdict
             return f"kernel compiles not started: {type(exc).__name__}: {exc}"[:300]
 
-    def _execution_plan(self, model: Model[Any], torch: Any) -> str:
+    def _execution_plan(self, model: Model[object], torch: object) -> str:
         """The model's own execution plan on its filled components, on this GPU: its
         identity, "" when it installs none. A raise refuses the construction, typed."""
         if type(model).execution_plan is Model.execution_plan:
@@ -3693,7 +3693,7 @@ class Executor:
         if attention_producer.CP_NAMES.intersection(held.totals()):
             state = attention_producer.RequestState()
             self._attention_hold.callback(state.clear)
-        store: dict[str, Any] = {}
+        store: dict[str, object] = {}
         self._attention_hold.callback(close_producer_states, store)
         self._producer_hold = (command.construction, state, store)
         return {"ok": True, "rank": self.rank, "hosts": held.hosts}

@@ -10,7 +10,8 @@ processor restores the site exactly.
 from __future__ import annotations
 
 import sys
-from typing import Any
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Protocol
 
 from cozy_runtime.author._attention import AttentionProducer, ProducerCall
 from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT
@@ -18,13 +19,26 @@ from cozy_runtime.author.kernels import PreQuantized
 from cozy_runtime.internal import attention_sol, attention_ulysses
 from cozy_runtime.internal.encoding import leaves
 
+if TYPE_CHECKING:
+    from torch import Tensor
+    from torch.nn import Module
+
+
+class _Processor(Protocol):
+    """A Diffusers attention processor: its backend and parallel config, and its call."""
+
+    _attention_backend: object
+    _parallel_config: object
+
+    def __call__(self, attn: Module, *args: object, **kwargs: object) -> Tensor: ...
+
 
 class Processor:
     """A site's processor while a producer may serve it."""
 
     def __init__(
         self,
-        original: Any,
+        original: _Processor,
         producer: AttentionProducer,
         backend: str,
         kernel: str,
@@ -39,22 +53,22 @@ class Processor:
         self.path = path
 
     @property
-    def _attention_backend(self) -> Any:
+    def _attention_backend(self) -> object:
         return self.original._attention_backend
 
     @_attention_backend.setter
-    def _attention_backend(self, value: Any) -> None:
+    def _attention_backend(self, value: object) -> None:
         self.original._attention_backend = value
 
     @property
-    def _parallel_config(self) -> Any:
+    def _parallel_config(self) -> object:
         return self.original._parallel_config
 
     @_parallel_config.setter
-    def _parallel_config(self, value: Any) -> None:
+    def _parallel_config(self, value: object) -> None:
         self.original._parallel_config = value
 
-    def __call__(self, attn: Any, *args: Any, **kwargs: Any) -> Any:
+    def __call__(self, attn: Module, *args: object, **kwargs: object) -> Tensor:
         selected = self._attention_backend
         if getattr(selected, "value", str(selected)) != self.backend:
             return self.original(attn, *args, **kwargs)
@@ -70,7 +84,12 @@ class Processor:
             else None
         )
 
-        def exchange(query: Any, key: Any, value: Any, compute: Any) -> Any:
+        def exchange(
+            query: Tensor,
+            key: Tensor,
+            value: Tensor,
+            compute: Callable[[Tensor, Tensor, Tensor], Tensor],
+        ) -> Tensor:
             if group is None:
                 raise ValueError(f"{self.producer.name}: no Ulysses group to exchange over")
             return attention_ulysses.exchange(query, key, value, group, compute)
@@ -81,6 +100,9 @@ class Processor:
             if layout.protected_prefix:
                 attention_sol._count("dense_prefix")
 
+        def original(*call_args: object, **call_kwargs: object) -> Tensor:
+            return self.original(attn, *call_args, **call_kwargs)
+
         call = ProducerCall(
             module=attn,
             component=self.component,
@@ -89,15 +111,16 @@ class Processor:
             kernel=sys.modules.get(self.kernel),
             state=state,
             group=group,
-            original=lambda *a, **k: self.original(attn, *a, **k),
+            original=original,
             quantize=_quantize,
             exchange=exchange,
             served=served,
         )
-        return self.producer.produce(call, *args, **kwargs)
+        result: Tensor = self.producer.produce(call, *args, **kwargs)
+        return result
 
 
-def _quantize(x: Any) -> PreQuantized:
+def _quantize(x: Tensor) -> PreQuantized:
     import torch
 
     payload, scale = leaves.quantize_activation_rowwise(torch, x)
@@ -105,7 +128,12 @@ def _quantize(x: Any) -> PreQuantized:
 
 
 def install(
-    module: Any, producer: AttentionProducer, backend: str, kernel: str, component: str, path: str
+    module: Module,
+    producer: AttentionProducer,
+    backend: str,
+    kernel: str,
+    component: str,
+    path: str,
 ) -> None:
     """Wrap `module`'s processor for `producer`, once; another producer's wrapper is replaced.
     `kernel` names the base's module, which resolving the base imported."""

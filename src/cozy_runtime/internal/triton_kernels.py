@@ -16,10 +16,13 @@ Executor-only: torch and Triton are imported at the top, guarded; their absence 
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from importlib import import_module
 from pathlib import Path
 from typing import Any
+
+import msgspec
+from msgspec import Struct
 
 from cozy_runtime.author.kernels import (
     KernelsUnavailable,
@@ -35,7 +38,7 @@ from cozy_runtime.internal.accel import driver_version
 try:
     import torch
     import triton
-    from triton.backends.compiler import GPUTarget
+    from triton.backends.compiler import BaseBackend, GPUTarget
     from triton.backends.nvidia import driver as _cuda_driver
     from triton.compiler import ASTSource
     from triton.compiler.compiler import (
@@ -45,6 +48,7 @@ try:
     )
     from triton.runtime.build import _get_cache_manager
     from triton.runtime.cache import get_cache_key, get_cache_manager
+    from triton.runtime.jit import JITFunction
 except ImportError as _absent:  # pragma: no cover - exercised by the typed refusal
     TRITON_ABSENT = f"torch and triton do not import ({_absent})"
 else:
@@ -58,21 +62,21 @@ def _require_triton() -> None:
         raise KernelsUnavailable("kernels_absent", TRITON_ABSENT)
 
 
-def _source(entry: TritonEntry) -> Any:
+def _source(entry: TritonEntry) -> ASTSource:
     """The exact `ASTSource` an entry compiles from: builder and loader share it."""
     fn = entry.kernel
     attrs = {(fn.arg_names.index(name),): [["tt.divisibility", 16]] for name in entry.aligned}
     return ASTSource(fn, dict(entry.signature), constexprs=dict(entry.constexprs), attrs=attrs)
 
 
-def _backend(arch: int) -> Any:
+def _backend(arch: int) -> BaseBackend:
     """One compiler backend per architecture: constructing one runs `ptxas --version`."""
     if arch not in _BACKENDS:
         _BACKENDS[arch] = make_backend(GPUTarget("cuda", arch, WARP_SIZE))
     return _BACKENDS[arch]
 
 
-_BACKENDS: dict[int, Any] = {}
+_BACKENDS: dict[int, BaseBackend] = {}
 
 
 def _cache_key(entry: TritonEntry, arch: int) -> str:
@@ -96,25 +100,32 @@ def _launcher_key() -> str:
     return str(_get_cache_manager(source, config=options).key)
 
 
-def _document(entry: TritonEntry) -> dict[str, object]:
-    return {
-        "module": entry.kernel.fn.__module__,
-        "name": entry.kernel.__name__,
-        "signature": dict(entry.signature),
-        "constexprs": dict(entry.constexprs),
-        "aligned": list(entry.aligned),
-        "num_warps": entry.num_warps,
-    }
+class _Kernel(Struct, frozen=True):
+    """One entry as the out-of-process builder reads it: the kernel by module and name."""
 
+    module: str
+    name: str
+    signature: dict[str, str]
+    constexprs: dict[str, int]
+    aligned: tuple[str, ...]
+    num_warps: int
 
-def _entry(document: Mapping[str, Any]) -> TritonEntry:
-    return TritonEntry(
-        getattr(import_module(document["module"]), document["name"]),
-        document["signature"],
-        document["constexprs"],
-        tuple(document["aligned"]),
-        int(document["num_warps"]),
-    )
+    @classmethod
+    def of(cls, entry: TritonEntry) -> _Kernel:
+        kernel = entry.kernel
+        signature, constexprs = dict(entry.signature), dict(entry.constexprs)
+        return cls(
+            kernel.fn.__module__,
+            kernel.__name__,
+            signature,
+            constexprs,
+            entry.aligned,
+            entry.num_warps,
+        )
+
+    def entry(self) -> TritonEntry:
+        kernel = getattr(import_module(self.module), self.name)
+        return TritonEntry(kernel, self.signature, self.constexprs, self.aligned, self.num_warps)
 
 
 def job(kernels: TritonKernels, arch: int) -> kernel_compile.Job:
@@ -132,7 +143,7 @@ def job(kernels: TritonKernels, arch: int) -> kernel_compile.Job:
     spec = {
         "arch": arch,
         "entries": entries,
-        "kernels": [_document(entry) for entry in kernels.entries],
+        "kernels": [msgspec.to_builtins(_Kernel.of(entry)) for entry in kernels.entries],
     }
     return kernel_compile.Job("triton", kernel_cache.Key.of(kernels.name, inputs), spec)
 
@@ -145,7 +156,7 @@ def build(
     entry marks the cache filled."""
     _require_triton()
     arch, entries = int(spec["arch"]), spec["entries"]
-    todo = [_entry(document) for document in spec["kernels"]]
+    todo = [msgspec.convert(row, _Kernel).entry() for row in spec["kernels"]]
     for done, entry in enumerate(todo, 1):
         compiled = triton.compile(
             _source(entry),
@@ -185,10 +196,12 @@ class _Launcher:
     real bytes behind it first (`readable`): a norm scale read from a sibling module may be a
     weight the plane has not mapped."""
 
-    def __init__(self, arch: int, compiled: dict[str, Any], names: dict[str, tuple[str, ...]]):
+    def __init__(
+        self, arch: int, compiled: dict[str, CompiledKernel], names: dict[str, tuple[str, ...]]
+    ) -> None:
         self.arch, self.compiled, self.names = arch, compiled, names
 
-    def __call__(self, kernel: Any, grid: tuple[int, ...], *args: object) -> None:
+    def __call__(self, kernel: JITFunction, grid: tuple[int, ...], *args: object) -> None:
         params = kernel.arg_names
         constexprs = {name: args[params.index(name)] for name in self.names[kernel.__name__]}
         found = self.compiled.get(entry_key(kernel.__name__, constexprs))
@@ -209,7 +222,7 @@ class _Launcher:
 _LOADED: dict[tuple[str, int], _Launcher] = {}
 
 
-def load(kernels: TritonKernels, *, device: Any) -> Launch:
+def load(kernels: TritonKernels, *, device: object) -> Launch:
     """`kernels` compiled for `device`, loaded onto it from Triton's cache; never a compile
     here. Waits for the key's live build by its measured progress; a build that ended without
     publishing is typed. Idempotent per (process, set, device)."""
@@ -226,7 +239,7 @@ def load(kernels: TritonKernels, *, device: Any) -> Launch:
     state = kernel_compile.wait(store, found, kernels.name)
     if state.state != "ready":
         raise KernelsUnavailable("kernels_failed", f"{kernels.name} sm{arch}: {state.line()}")
-    compiled: dict[str, Any] = {}
+    compiled: dict[str, CompiledKernel] = {}
     names: dict[str, tuple[str, ...]] = {}
     for entry in kernels.entries:
         digest = found.spec["entries"][entry.key]
