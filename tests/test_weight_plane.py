@@ -759,9 +759,11 @@ def test_the_next_stage_fills_while_this_one_runs(card: Any, tmp_path: Path) -> 
     residency.open_attempt()
     expected = stage("denoise", "other", stage("encode", "stack", x))
     spans = {n: sum(r.span for r in c.regions) for n, c in residency.components.items()}
+    residency.map_ahead()  # a warm between calls is no stage of the next request
     weights.set_budget(0)  # another tenant's switch: every weight left the GPU
     weights.set_budget(1 << 30)
     residency.open_attempt()
+    assert [method for method, _ in residency.sequence] == ["encode", "denoise"]
     residency.admit("encode", ("stack",))
     try:
         committed = plane.stats(weights.plane).device(weights.index).committed

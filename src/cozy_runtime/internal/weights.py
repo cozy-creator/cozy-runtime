@@ -2937,7 +2937,7 @@ class WeightResidency:
         weights = self.weights
         self.entries[method] = self.entries.get(method, 0) + 1
         self.repeats[method] = max(self.repeats.get(method, 0), self.entries[method])
-        if self.entries[method] == 1:
+        if self.entries[method] == 1 and method != MAPPING:  # a warm between calls is no stage
             self.entering.append((method, local))
         weights.hold_host()
         self._clear(method, local)
