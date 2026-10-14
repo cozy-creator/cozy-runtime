@@ -130,7 +130,7 @@ def test_builtin_interface_is_static_and_matches_its_actual_app() -> None:
         assert str(metadata.pop("operation_identity")).startswith("sha256:")
     assert package_interface.canonical_bytes(static) == package_interface.canonical_bytes(actual)
     jobs = static["jobs"]
-    assert isinstance(jobs, list) and {row["name"] for row in jobs} == {"quantize", "prepare_model"}
+    assert isinstance(jobs, list) and [row["name"] for row in jobs] == ["quantize"]
     row = next(row for row in jobs if row["name"] == "quantize")
     assert isinstance(row, dict) and row["name"] == "quantize"
     assert row["weights_outputs"] == [

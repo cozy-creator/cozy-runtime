@@ -26,6 +26,7 @@ from tensorfs import Store  # noqa: E402
 from tensorfs.derived import Config as NativeConfig  # noqa: E402
 from tensorfs.derived import Derivation, Part, Target, Tensor  # noqa: E402
 
+from cozy_runtime import _kernels  # noqa: E402
 from cozy_runtime.author._activity import asides  # noqa: E402
 from cozy_runtime.author._loader import census  # noqa: E402
 from cozy_runtime.internal import accel, image_vae, paging, plane, weight_policy  # noqa: E402
@@ -452,8 +453,8 @@ class SiblingBlock(Block):
 
 
 class FusedBlock(torch.nn.Module):  # type: ignore[misc,name-defined]
-    """A Cosmos self-attention as Anima runs it: the Runtime's fused processor, which hands
-    the head norms' scales to our compiled kernel (read by pointer, outside torch)."""
+    """A self-attention whose head norms' scales our compiled RMSNorm + RoPE kernel reads by
+    pointer, outside torch (Anima's fused plan)."""
 
     heads = HEADS
 
@@ -467,12 +468,15 @@ class FusedBlock(torch.nn.Module):  # type: ignore[misc,name-defined]
         self.norm_q, self.norm_k = Scale(HIDDEN // HEADS), Scale(HIDDEN // HEADS)
 
     def forward(self, x: Any) -> Any:
-        from cozy_runtime import _kernels
-        from cozy_runtime.internal.anima_optimization import _FusedSelfAttention, _RopeMatrix
-
-        fused = _FusedSelfAttention(torch, _kernels, _RopeMatrix(torch))
+        q, k, v = (
+            getattr(self, name)(x[None]).unflatten(2, (self.heads, -1)).transpose(1, 2)
+            for name in ("to_q", "to_k", "to_v")
+        )
         turn = torch.eye(2, device=x.device).expand(1, 1, x.shape[0], 64, 2, 2).contiguous()
-        return x + torch.tanh(fused(self, x[None], image_rotary_emb=turn)[0])
+        with accel.readable(self.norm_q.weight, self.norm_k.weight) as (q_scale, k_scale):
+            q, k = _kernels.rms_rope_split_half(q, k, turn, q_scale, k_scale, self.norm_q.eps)
+        out = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        return x + torch.tanh(self.to_out[0](out.transpose(1, 2).flatten(2, 3))[0])
 
 
 def stack_of(
@@ -548,7 +552,6 @@ def test_a_kernel_launched_outside_torch_never_reads_an_unmapped_weight(
     `common`; and were one its own region after all (the second case), the launch maps it
     first (`accel.readable`) and never faults the device."""
     pytest.importorskip("cozy_runtime._kernels._C")
-    pytest.importorskip("diffusers")
     own_region = small != paging.SMALL
     monkeypatch.setattr(paging, "SMALL", small)
     weights = Weights(torch, torch.device("cuda", 0), "cuda")

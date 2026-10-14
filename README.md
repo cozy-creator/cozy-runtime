@@ -185,26 +185,13 @@ numerics. A method drawing from the default RNG refuses `memo_rng`. Results go t
 executor's LRU, and to the machine's disk tier only when small and measured costly to
 produce (`memo:` in runtime.yaml; tracker design `pipeline-memoization.md`).
 
-**Anima's CUDA optimization is an exact post-fill plan.** Runtime recognizes only
-`anima:AnimaModel` with Diffusers `0.40.0` and the exact Anima Base 1.0 Cosmos config. After
-TensorFS has filled the ordinary module tree, it installs fused RMSNorm + split-half RoPE,
-direct split-half RoPE matrix production, `addcmul` residuals, native RMSNorm and a
-latent-sized zero padding mask. The installation
-compares the state-dict tensor schema and every parameter/buffer storage address before and after;
-its source/dependency digest enters constructed-generation identity. Any source, class or
-config drift refuses typed.
-
 Runtime is ONE PyPI package with two wheel files per release: the pure `py3-none-any`
 wheel, and a `cp312-abi3` linux/x86 wheel carrying the same code plus the compiled CUDA
 kernels at `cozy_runtime._kernels` (`COZY_RUNTIME_BUILD_KERNELS=1` selects that build;
-the default `uv build` stays toolchain-free). The `native/` sources ship only the fused
-operations Runtime actually uses, and adding future Cozy-owned kernels extends this one
-reviewed boundary. Runtime uses these fused Anima CUDA kernels only for Torch 2.13.0
-built with CUDA 13.0 when CUDA is available. CPU, missing-CUDA, other Torch/CUDA pairs,
-and wheels without the native extension keep the ordinary eager implementation. A
-candidate CUDA image runs a hand-run comparison of eager and optimized real CUDA blocks
-at Anima's native token width, checks determinism and storage identity, and measures the
-block speedup.
+the default `uv build` stays toolchain-free). The `native/` sources ship generic fused
+operations (today one: RMSNorm + split-half RoPE); packages decide where they run. The
+anima package installs it in its own post-fill plan and runs eager wherever the extension,
+CUDA or its reviewed Torch/CUDA pair is missing.
 
 `scripts/build-kernel-wheel.sh` is that second wheel's ONE recipe, run by `publish.yaml`
 and by hand alike. It builds inside `manylinux_2_28_x86_64` with CUDA 13.0 and lets

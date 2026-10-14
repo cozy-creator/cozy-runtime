@@ -504,7 +504,6 @@ _CONSTRUCTION_MODULES = (
     "cozy_runtime.author",
     "cozy_runtime.author._loader",
     "cozy_runtime.author._model",
-    "cozy_runtime.internal.anima_optimization",
     "cozy_runtime.internal.derive",
     "cozy_runtime.internal.encoding",
     "cozy_runtime.internal.fill",
@@ -2123,10 +2122,6 @@ class Executor:
         from cozy_runtime.author import ModelRegistry
         from cozy_runtime.author._loader import Artifact, Config, ModelFitRefused
         from cozy_runtime.author._model import component_use
-        from cozy_runtime.internal.anima_optimization import (
-            AnimaOptimizationRefusal,
-            apply_anima_execution_plan,
-        )
         from cozy_runtime.internal.derive import Observations, serving_substrate
         from cozy_runtime.internal.encoding import launch_providers, measure_device, measure_runtime
         from cozy_runtime.internal.fill import Checkpoint, FillRefusal, dtype_name, tensor_schema_of
@@ -2501,11 +2496,6 @@ class Executor:
             backend.close()
             return {"ok": False, "code": exc.code, "detail": str(exc).splitlines()[0][:900]}
         try:
-            optimization, optimization_refusal = apply_anima_execution_plan(
-                model,
-                application=binding.application,
-                model_class=f"{model_cls.__module__}:{model_cls.__qualname__}",
-            )
             # THE FUSED GLUE (h3a-015), under the class's `fusion=` consent only.
             consent = str(getattr(model_cls, "__fusion__", "refuse"))
             fused = (
@@ -2534,7 +2524,7 @@ class Executor:
             applied = self._reselect()
             self.device_facts = device_facts
             stage("attention_pin")
-        except (AnimaOptimizationRefusal, FusionRefusal, attention.AttentionRefusal) as exc:
+        except (FusionRefusal, attention.AttentionRefusal) as exc:
             backend.poison(())
             self.poisoned = f"execution plan refused: {exc.code}"
             return {"ok": False, "code": exc.code, "detail": str(exc)[:900]}
@@ -2567,7 +2557,6 @@ class Executor:
         constructed_preimage = canonical.write(
             {
                 "plan_digest": plan.digest(),
-                "execution_optimization": optimization.document() if optimization else None,
                 "execution_fusion": fused.identity_document() if fused is not None else None,
             }
         )
@@ -2637,7 +2626,6 @@ class Executor:
             "stages": list(stages) + [(f"construct.{name}", ms) for name, ms in record.stage_ms],
             "qualification": qualification.document(),
             "substrate_census": list(record.weightless),
-            "execution_optimization_refusal": optimization_refusal,
             "execution_fusion": fused.document() if fused is not None else None,
             "filled": record.filled,
             "filled_bytes": record.filled_bytes,
@@ -2677,7 +2665,6 @@ class Executor:
             "fit": record.fit,
             "plan": plan.seam_document(),
             "delivery": plan.wire_document(),
-            "execution_optimization": optimization.document() if optimization else None,
             "attention": applied.document() if applied is not None else None,
         }
         return {

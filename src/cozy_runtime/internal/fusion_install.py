@@ -1,6 +1,6 @@
 """The substitution map for the fused glue (h3a-015): supported Diffusers H3 modules -> fused ones.
 
-Applied after fill, like `anima_optimization.py`: parameters, buffers, state-dict keys and
+Applied after fill: parameters, buffers, state-dict keys and
 storage identity are invariants (re-censused after the swap). Compatibility is the callable
 and module topology contract consumed by the plan, not upstream source formatting or
 annotations. Numerical agreement is exercised against supported Diffusers releases.
