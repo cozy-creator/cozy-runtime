@@ -3347,6 +3347,7 @@ class Executor:
         d2h_ms = (time.perf_counter() - d2h_started) * 1000
         released_us = execution_evidence.now_us()
         peak_vram = accel.peak_allocated(torch, self.device_kind) if torch is not None else 0
+        peak_reserved = accel.peak_reserved(torch, self.device_kind) if torch is not None else 0
         residency_document = self.residency.document() if self.residency is not None else {}
         working_peak = _working_peak(peak_vram, allocated_at_start, residency_document)
         if self.group is not None:
@@ -3441,6 +3442,7 @@ class Executor:
                 "device_lease_ms": round(lease_ms, 3),
                 "d2h_wait_ms": round(d2h_ms, 3),
                 "peak_vram_bytes": peak_vram,
+                "peak_reserved_bytes": peak_reserved,
                 "activation_peak_bytes": int(
                     residency_document.get("attempt_activation_peak_bytes", 0)
                 ),
@@ -3971,10 +3973,11 @@ class Executor:
         )
         self.handled = (outcome, "", record)
         handler_ms = (time.perf_counter() - started) * 1000
-        peak_vram = 0
+        peak_vram = peak_reserved = 0
         if self.torch is not None:
             accel.synchronize(self.torch, self.device_kind)
             peak_vram = accel.peak_allocated(self.torch, self.device_kind)
+            peak_reserved = accel.peak_reserved(self.torch, self.device_kind)
         self.attempts += 1
         result_ref, outputs, oversize = _serialize_result(envelope, spool)
         if (
@@ -4020,6 +4023,7 @@ class Executor:
                 "device_lease_ms": round(handler_ms, 3),
                 "d2h_wait_ms": 0.0,
                 "peak_vram_bytes": peak_vram,
+                "peak_reserved_bytes": peak_reserved,
                 "allocated_at_start_bytes": 0,
                 "rss_at_end_bytes": _rss(),
                 "started_unix": started_wall,
