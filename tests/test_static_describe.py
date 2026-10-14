@@ -183,7 +183,7 @@ def test_a_callers_signature_reads_its_callee_packages_types_from_the_locked_sou
         "async def inspect(ctx: Context, *, count: int) -> Result:\n"
         "    return Result([str(count)])\n"
         "app = App()\n"
-        "app.job(inspect)\n",
+        "app.job(inspect, accelerator=False)\n",
         "dependencies = []\n",
     )
     package(
@@ -196,7 +196,7 @@ def test_a_callers_signature_reads_its_callee_packages_types_from_the_locked_sou
         "async def run(ctx: Context, *, count: int) -> Result:\n"
         "    return await inspect(count=count)\n"
         "app = App()\n"
-        "app.job(run)\n",
+        "app.job(run, accelerator=False)\n",
         'dependencies = ["labelled-child"]\n'
         '[tool.uv.sources]\nlabelled-child = { path = "child" }\n',
     )
@@ -252,7 +252,7 @@ def test_a_published_callees_types_are_read_from_the_wheel_its_lock_pins(tmp_pat
         "async def inspect(ctx: Context, *, count: int) -> Result:\n"
         "    return Result([str(count)])\n"
         "app = App()\n"
-        "app.job(inspect)\n",
+        "app.job(inspect, accelerator=False)\n",
     )
     (index / "simple" / "labelled-remote" / "index.html").write_text(
         f'<a href="/files/{filename}#sha256={digest}">{filename}</a>\n'
@@ -277,7 +277,7 @@ def test_a_published_callees_types_are_read_from_the_wheel_its_lock_pins(tmp_pat
             "async def run(ctx: Context, *, count: int) -> Result:\n"
             "    return await inspect(count=count)\n"
             "app = App()\n"
-            "app.job(run)\n"
+            "app.job(run, accelerator=False)\n"
         )
         _run(uv, "lock", "--no-progress", cwd=project)
         assert f"sha256:{digest}" in (project / "uv.lock").read_text()
@@ -432,13 +432,13 @@ def test_explicit_registration_by_call_matches_decorators(tmp_path: Path) -> Non
         tmp_path,
         {
             "__init__.py": (
-                "@app.job(publishes=True)\ndef gate(",
+                "@app.job(publishes=True, accelerator=False)\ndef gate(",
                 "def gate(",
             )
         },
     )
     init = project / "rich_package" / "__init__.py"
-    init.write_text(init.read_text() + "\n\napp.job(gate, publishes=True)\n")
+    init.write_text(init.read_text() + "\n\napp.job(gate, publishes=True, accelerator=False)\n")
     assert _static(project) == _static(RICH)
 
 
@@ -459,7 +459,7 @@ class Request(msgspec.Struct):
     seeds: list[int] = msgspec.field(default_factory=seeds)
 class Result(msgspec.Struct):
     size: int
-@app.job
+@app.job(accelerator=False)
 def render(payload: Request) -> Result:
     return Result(payload.size)
 @app.entrypoint

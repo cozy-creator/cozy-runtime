@@ -59,14 +59,14 @@ def test_broker_serializes_verified_nested_media_and_refuses_unhydrated_forgery(
     media.write_bytes(raw)
     digest = "sha256:" + hashlib.sha256(raw).hexdigest()
     child = App()
-    child.job(score)
+    child.job(score, accelerator=False)
     surface = describe(child)[0]
     assert isinstance(surface.payload_type, type) and issubclass(
         surface.payload_type, msgspec.Struct
     )
     parent = App()
 
-    @parent.job
+    @parent.job(accelerator=False)
     async def main(ctx: Context, payload: ParentInput) -> DigestResult:
         asset = ImageAsset(digest) if payload.forge else payload.image
         # Generated client interfaces omit injected capabilities; this fixture shares
@@ -176,14 +176,14 @@ def test_broker_forwards_only_this_attempts_verified_tree(tmp_path: Path, forwar
     (corpus / "sample.txt").write_bytes(content)
     digest = "sha256:" + "ab" * 32
     child = App()
-    child.job(score_tree)
+    child.job(score_tree, accelerator=False)
     surface = describe(child)[0]
     assert isinstance(surface.payload_type, type) and issubclass(
         surface.payload_type, msgspec.Struct
     )
     parent = App()
 
-    @parent.job
+    @parent.job(accelerator=False)
     async def main(ctx: Context, payload: TreeInput) -> DigestResult:
         tree = payload.corpus
         if payload.forwarding == "unhydrated":

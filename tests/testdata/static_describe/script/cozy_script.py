@@ -1,3 +1,7 @@
+# /// script
+# [tool.cozy]
+# accelerator = false
+# ///
 """An ordinary client script: Creator snapshots it and generates the entry beside it."""
 
 from pathlib import Path

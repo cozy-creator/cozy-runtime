@@ -26,10 +26,14 @@ def convert(payload: Request) -> Result:
 async def tables(ctx: Context, *, n: int) -> Result:
     return Result(n)
 app.job(tables, accelerator=True)
-@app.job
+"""
+UNDECLARED = (
+    SOURCE
+    + """@app.job
 def undeclared(payload: Request) -> Result:
     return Result(payload.n)
 """
+)
 
 
 def project(tmp_path: Path, source: str = SOURCE) -> Path:
@@ -51,7 +55,15 @@ def test_job_accelerator_is_identical_for_static_and_imported_discovery(tmp_path
     jobs = {job["name"]: job for job in package_interface.read_bytes(raw)["jobs"]}
     assert jobs["convert"]["accelerator"] is False
     assert jobs["tables"]["accelerator"] is True
-    assert "accelerator" not in jobs["undeclared"]
+
+
+def test_an_undeclared_job_refuses_in_both_readers(tmp_path: Path) -> None:
+    root = project(tmp_path, UNDECLARED)
+    message = "job 'undeclared' declares no accelerator"
+    with pytest.raises(ConformanceError, match=message):
+        static_interface.build(root)
+    with pytest.raises(ConformanceError, match=message):
+        discover(root)
 
 
 @pytest.mark.parametrize("value", ['"cpu"', "0"])
@@ -63,9 +75,14 @@ def test_job_accelerator_requires_a_boolean_in_both_readers(tmp_path: Path, valu
         discover(root)
 
 
-@pytest.mark.parametrize("value", ["false", 0, None])
-def test_interface_reader_rejects_nonboolean_accelerator(tmp_path: Path, value: object) -> None:
+@pytest.mark.parametrize("value", ["false", 0, None, ...])
+def test_interface_reader_rejects_a_job_without_a_boolean_accelerator(
+    tmp_path: Path, value: object
+) -> None:
     document = static_interface.build(project(tmp_path))
-    document["jobs"][0]["accelerator"] = value
+    if value is ...:
+        del document["jobs"][0]["accelerator"]
+    else:
+        document["jobs"][0]["accelerator"] = value
     with pytest.raises(ConformanceError, match="accelerator"):
         package_interface.read_bytes(canonical_json.encode(document))

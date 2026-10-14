@@ -62,7 +62,7 @@ async def invalid_default(ctx: Context, *, values: list[int] = []) -> Result:  #
 
 def described() -> tuple[App, bytes]:
     app = App()
-    app.job(transform)
+    app.job(transform, accelerator=False)
     found = Discovered(
         app, __name__ + ":app", Path(__file__).parent, sys.modules[__name__], describe(app), {}
     )
@@ -125,7 +125,7 @@ def test_unportable_invocable_signature_refuses_before_execution(
     fn: Callable[..., Awaitable[Result]],
 ) -> None:
     app = App()
-    app.job(invocable(fn))
+    app.job(invocable(fn), accelerator=False)
     with pytest.raises(ConformanceError):
         describe(app)
 
@@ -206,7 +206,7 @@ def test_ordinary_main_reserves_self_call_with_implicit_attempt_lifetime(tmp_pat
 
     app = App()
 
-    @app.job
+    @app.job(accelerator=False)
     async def wrapper(ctx: Context, payload: Empty) -> Result:
         main()
         return Result("parent", Detail(0))
@@ -257,7 +257,7 @@ def test_implicit_operation_call_observes_actual_parent_cancellation(tmp_path: P
         cancelled = True
         transform(text="canceled")
 
-    @app.job
+    @app.job(accelerator=False)
     def wrapper(ctx: Context, payload: Empty) -> Result:
         main()
         raise AssertionError("canceled attempt reserved another child")

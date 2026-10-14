@@ -28,6 +28,7 @@ from cozy_runtime.author._executor_requests import Answer, ModelPrefetch, Reques
 from cozy_runtime.internal import call_types, static_interface
 from cozy_runtime.internal.executor import Executor
 from cozy_runtime.internal.executor_commands import CallInterface
+from cpu_script import cpu
 from durable_seam import seam, wire
 
 SOURCE = """from __future__ import annotations
@@ -43,7 +44,7 @@ async def select(ctx: Context) -> Selection:
     raise AssertionError("the implementation executes in its child attempt")
 
 app = App()
-app.job(select)
+app.job(select, accelerator=False)
 """
 
 
@@ -62,7 +63,7 @@ def installed(
             "@invocable()\nasync def select(ctx: Context)",
             "class Payload(msgspec.Struct):\n    pass\n\n"
             "def select(ctx: Context, payload: Payload)",
-        ).replace("app.job(select)", "app.entrypoint(select)")
+        ).replace("app.job(select, accelerator=False)", "app.entrypoint(select)")
     (tmp_path / f"{module}.py").write_text(source)
     importlib.invalidate_caches()
     document = static_interface.build(tmp_path)
@@ -75,7 +76,9 @@ def installed(
 
 @pytest.mark.parametrize("kind", ["job", "entrypoint"])
 def test_installed_proxy_prefetch_keeps_its_admitted_public_identity(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
 ) -> None:
     imported, rows, engine = installed(tmp_path, monkeypatch, kind=kind)
     received: list[ModelPrefetch] = []
@@ -90,7 +93,8 @@ def test_installed_proxy_prefetch_keeps_its_admitted_public_identity(
         engine._install_call_proxies(rows)
         broker = engine._call_broker("parent", rows)
         assert (imported.select.__module__, imported.select.__name__) == (
-            rows[0].module, rows[0].export,
+            rows[0].module,
+            rows[0].export,
         )
         assert (imported.select.__module__, imported.select.__name__) in broker.bindings
         assert imported.__cozy_bindings__["select"].python_result is imported.Selection
@@ -103,15 +107,18 @@ def test_installed_proxy_prefetch_keeps_its_admitted_public_identity(
     module = "prefetch_installed_client"
     monkeypatch.delitem(sys.modules, module, raising=False)
     (tmp_path / f"{module}.py").write_text(
-        "from installed_selection import Selection, select\n"
-        "from cozy_runtime.author import prefetch\n"
-        "async def main() -> Selection:\n"
-        "    prefetch(select)\n"
-        "    return Selection(None, True)\n"
+        cpu(
+            "from installed_selection import Selection, select\n"
+            "from cozy_runtime.author import prefetch\n"
+            "async def main() -> Selection:\n"
+            "    prefetch(select)\n"
+            "    return Selection(None, True)\n"
+        )
     )
     app = script_app(module)
     result, outcome, _ = attempt(
-        app.get("main"), {},
+        app.get("main"),
+        {},
         Invocation("parent", tmp_path / "prefetch-result", time.monotonic() + 30, calls=broker),
     )
     assert outcome.terminal == "succeeded", outcome
@@ -135,9 +142,11 @@ def test_plain_script_returns_installed_public_struct_after_managed_call(
     binding = imported.__cozy_bindings__["select"]
     assert binding.python_result is imported.Selection
     (tmp_path / "selection_client.py").write_text(
-        "from installed_selection import Selection, select\n"
-        "async def main() -> Selection:\n"
-        "    return await select()\n"
+        cpu(
+            "from installed_selection import Selection, select\n"
+            "async def main() -> Selection:\n"
+            "    return await select()\n"
+        )
     )
     monkeypatch.delitem(sys.modules, "selection_client", raising=False)
     artifact: dict[str, Any] = {

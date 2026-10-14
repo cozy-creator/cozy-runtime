@@ -24,6 +24,7 @@ from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.executor import Executor
 from cozy_runtime.internal.executor_commands import JobBudget, RunJob
 from cozy_runtime.internal.seam import Channel
+from cpu_script import cpu
 from native_weights import NativeExecution
 from test_weights_resume_native import _committed
 
@@ -44,7 +45,7 @@ def test_plain_main_executes_only_inside_attempt(
         code += "    ctx.raise_if_cancelled()\n    ctx.log('preparing')\n"
         code += "    ctx.progress(0.5, stage='prepare')\n"
     code += f"    Path({str(ran)!r}).write_text('completed')\n"
-    (tmp_path / (module + ".py")).write_text(code)
+    (tmp_path / (module + ".py")).write_text(cpu(code))
     monkeypatch.syspath_prepend(str(tmp_path))
     importlib.invalidate_caches()
     app = script_app(module)
@@ -67,15 +68,17 @@ def test_plain_main_receives_declared_execution_context(
     imported = tmp_path / "imported"
     deadline = time.monotonic() + 5
     (tmp_path / (module + ".py")).write_text(
-        "from pathlib import Path\n"
-        "from cozy_runtime.author import Context, Context as ExecutionContext\n"
-        f"Path({str(imported)!r}).touch()\n"
-        f"{'async ' if asynchronous else ''}def main({parameter}) -> str:\n"
-        "    assert isinstance(ctx, Context)\n"
-        "    assert ctx.request_id == 'typed-script'\n"
-        f"    assert ctx.deadline == {deadline!r}\n"
-        "    ctx.raise_if_cancelled()\n"
-        "    return str(ctx.device)\n"
+        cpu(
+            "from pathlib import Path\n"
+            "from cozy_runtime.author import Context, Context as ExecutionContext\n"
+            f"Path({str(imported)!r}).touch()\n"
+            f"{'async ' if asynchronous else ''}def main({parameter}) -> str:\n"
+            "    assert isinstance(ctx, Context)\n"
+            "    assert ctx.request_id == 'typed-script'\n"
+            f"    assert ctx.deadline == {deadline!r}\n"
+            "    ctx.raise_if_cancelled()\n"
+            "    return str(ctx.device)\n"
+        )
     )
     monkeypatch.syspath_prepend(str(tmp_path))
     app = script_app(module)
@@ -114,7 +117,7 @@ def test_nested_generator_does_not_change_main_execution(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     (tmp_path / "nested_generator_script.py").write_text(
-        "def main():\n    def values():\n        yield 7\n    assert list(values()) == [7]\n"
+        cpu("def main():\n    def values():\n        yield 7\n    assert list(values()) == [7]\n")
     )
     monkeypatch.syspath_prepend(str(tmp_path))
     app = script_app("nested_generator_script")
@@ -128,11 +131,13 @@ def test_returned_generator_is_not_reported_as_completed_work(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     (tmp_path / "returned_generator_script.py").write_text(
-        "def work():\n"
-        "    raise ValueError('quality gate')\n"
-        "    yield 7\n"
-        "def main():\n"
-        "    return work()\n"
+        cpu(
+            "def work():\n"
+            "    raise ValueError('quality gate')\n"
+            "    yield 7\n"
+            "def main():\n"
+            "    return work()\n"
+        )
     )
     monkeypatch.syspath_prepend(str(tmp_path))
     app = script_app("returned_generator_script")
@@ -150,7 +155,9 @@ def test_script_exit_is_an_author_outcome(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exit_code: object, expected: str
 ) -> None:
     module = f"exit_script_{expected}_{type(exit_code).__name__}"
-    (tmp_path / (module + ".py")).write_text(f"def main():\n    raise SystemExit({exit_code!r})\n")
+    (tmp_path / (module + ".py")).write_text(
+        cpu(f"def main():\n    raise SystemExit({exit_code!r})\n")
+    )
     monkeypatch.syspath_prepend(str(tmp_path))
     app = script_app(module)
     _, outcome, _ = attempt(
@@ -164,7 +171,7 @@ def test_script_observes_cancellation_before_import(
 ) -> None:
     marker = tmp_path / "side_effect"
     (tmp_path / "canceled_script.py").write_text(
-        f"from pathlib import Path\nPath({str(marker)!r}).touch()\ndef main(): pass\n"
+        cpu(f"from pathlib import Path\nPath({str(marker)!r}).touch()\ndef main(): pass\n")
     )
     monkeypatch.syspath_prepend(str(tmp_path))
     app = script_app("canceled_script")
@@ -185,20 +192,22 @@ def test_plain_main_uses_real_native_weights_and_returns_artifact(
     source = source_receipt.artifact.manifest.digest
     module = "native_inheritance_script_" + str(with_context)
     (tmp_path / (module + ".py")).write_text(
-        "# /// script\n# [tool.cozy.weights]\n# checkpoint = 2048\n# ///\n"
-        "from cozy_runtime.author import Context, Model, ModelArtifact, Telemetry\n"
-        "from tensorfs.derived import Derivation, Target\n"
-        f"def main({'ctx: Context, ' if with_context else ''}*, "
-        "source: Model[object], tel: Telemetry) -> ModelArtifact:\n"
-        '    tel.log("inheriting")\n'
-        "    with ctx.tensorfs_source(source) as capability:\n"
-        "        view = capability.inspect()\n"
-        "    assert sum(len(rows) for rows in view.components.values()) == 1\n"
-        '    with ctx.output("checkpoint").open(Derivation({"source":view.source},\n'
-        '        {"model":Target(source="source",source_component="model")},\n'
-        '        {}, (("model","weight"),))) as transaction:\n'
-        "        tel.progress(1.0)\n"
-        "        return ctx.adopt_model(transaction.commit())\n"
+        cpu(
+            "# /// script\n# [tool.cozy.weights]\n# checkpoint = 2048\n# ///\n"
+            "from cozy_runtime.author import Context, Model, ModelArtifact, Telemetry\n"
+            "from tensorfs.derived import Derivation, Target\n"
+            f"def main({'ctx: Context, ' if with_context else ''}*, "
+            "source: Model[object], tel: Telemetry) -> ModelArtifact:\n"
+            '    tel.log("inheriting")\n'
+            "    with ctx.tensorfs_source(source) as capability:\n"
+            "        view = capability.inspect()\n"
+            "    assert sum(len(rows) for rows in view.components.values()) == 1\n"
+            '    with ctx.output("checkpoint").open(Derivation({"source":view.source},\n'
+            '        {"model":Target(source="source",source_component="model")},\n'
+            '        {}, (("model","weight"),))) as transaction:\n'
+            "        tel.progress(1.0)\n"
+            "        return ctx.adopt_model(transaction.commit())\n"
+        )
     )
     monkeypatch.syspath_prepend(str(tmp_path))
     if not with_context:
@@ -236,10 +245,12 @@ def test_plain_main_saves_and_returns_real_media(
 ) -> None:
     module = "image_script"
     (tmp_path / (module + ".py")).write_text(
-        "from cozy_runtime.author import ImageAsset, ImageFrame, Outputs, Telemetry\n"
-        "async def main(*, out: Outputs, tel: Telemetry) -> ImageAsset:\n"
-        '    tel.log("saving")\n'
-        '    return out.save_image(ImageFrame(2, 2, b"\\xff\\x00\\x00" * 4), format="png")\n'
+        cpu(
+            "from cozy_runtime.author import ImageAsset, ImageFrame, Outputs, Telemetry\n"
+            "async def main(*, out: Outputs, tel: Telemetry) -> ImageAsset:\n"
+            '    tel.log("saving")\n'
+            '    return out.save_image(ImageFrame(2, 2, b"\\xff\\x00\\x00" * 4), format="png")\n'
+        )
     )
     monkeypatch.syspath_prepend(str(tmp_path))
     app = script_app(module)
@@ -282,12 +293,16 @@ def test_script_asset_bound_folds_constant_arithmetic(
 ) -> None:
     header = "from typing import Annotated\nfrom cozy_runtime.author import AssetBound, FileAsset\n"
     (tmp_path / "bounded_script.py").write_text(
-        header + "def main(*, report: Annotated[FileAsset, "
-        "AssetBound(max_bytes=1 << 30, max_decoded_bytes=2 << 30)]): pass\n"
+        cpu(
+            header + "def main(*, report: Annotated[FileAsset, "
+            "AssetBound(max_bytes=1 << 30, max_decoded_bytes=2 << 30)]): pass\n"
+        )
     )
     (tmp_path / "unbounded_script.py").write_text(
-        header + "def main(*, report: Annotated[FileAsset, "
-        "AssetBound(max_bytes=1 << 30, max_decoded_bytes=limit())]): pass\n"
+        cpu(
+            header + "def main(*, report: Annotated[FileAsset, "
+            "AssetBound(max_bytes=1 << 30, max_decoded_bytes=limit())]): pass\n"
+        )
     )
     monkeypatch.syspath_prepend(str(tmp_path))
     request = script_app("bounded_script").get("main").fn.__annotations__["_script_request"]
@@ -318,7 +333,7 @@ def test_script_job_failure_reply_carries_its_cause_and_traceback(
     (project / f"{script}_entry.py").write_text(
         f'from cozy_runtime.author import script_app\napp = script_app("{script}")\n'
     )
-    (project / f"{script}.py").write_text(body)
+    (project / f"{script}.py").write_text(cpu(body))
     monkeypatch.syspath_prepend(str(project))
     found = discover(project)
     left, right = socket.socketpair()

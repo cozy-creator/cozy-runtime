@@ -1,12 +1,15 @@
 """Current author output budgets and static interface parity."""
 
 from __future__ import annotations
+
 import sys
 import time
 from pathlib import Path
 from typing import Annotated, Any
+
 import msgspec
 import pytest
+
 from cozy_runtime.author import App, AssetBound, Invocation, Outputs, Tree, attempt
 from cozy_runtime.internal import output_budget, package_interface, static_interface
 from cozy_runtime.internal.discovery import discover
@@ -65,7 +68,7 @@ class Result(msgspec.Struct):
     video: Annotated[Tree, AssetBound(max_bytes=268435456)]
     prefix: Annotated[Tree, AssetBound(max_bytes=268435456)]
 app = App()
-@app.job
+@app.job(accelerator=False)
 def assemble(payload: Request, media: MediaDecoder) -> Result:
     raise RuntimeError("describe only")
 """)
@@ -81,7 +84,7 @@ def test_lower_aggregate_stops_the_author_before_a_second_large_copy(tmp_path: P
     (source / "payload").write_bytes(b"01234567")
     app = App()
 
-    @app.job
+    @app.job(accelerator=False)
     def write(payload: Request, out: Outputs) -> Pair:
         return Pair(out.save_tree(source), out.save_tree(source))
 

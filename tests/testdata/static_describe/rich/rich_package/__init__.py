@@ -51,6 +51,7 @@ def draft(payload: RenderRequest, model: RenderModel) -> RenderResult:
 @app.job(
     name="quantize",
     weights=tuple(WeightsOutput(lane, max_new_bytes=LANE_BYTES) for lane in LANE_ENCODINGS),
+    accelerator=False,
 )
 def quantize(
     ctx: Context,
@@ -61,6 +62,6 @@ def quantize(
     raise NotImplementedError
 
 
-@app.job(publishes=True)
+@app.job(publishes=True, accelerator=False)
 def gate(payload: GateRequest, out: Outputs, tel: Telemetry) -> GateResult:
     raise NotImplementedError

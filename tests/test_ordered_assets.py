@@ -113,7 +113,7 @@ async def child(ctx: Context, *, assets: Pictures) -> Result:
     )
 
 
-app.job(child)
+app.job(child, accelerator=False)
 
 
 def inputs(
@@ -391,7 +391,7 @@ async def decoded_child(ctx: Context, *, assets: SimplePictures) -> Result:
 
 
 decoded_app = App()
-decoded_app.job(decoded_child)
+decoded_app.job(decoded_child, accelerator=False)
 
 
 def test_decoded_assets_are_lazy_real_images_with_one_attempt_budget(tmp_path: Path) -> None:

@@ -39,7 +39,7 @@ async def twice(ctx: Context, *, value: int) -> Result:
     return Result(value * 2)
 
 
-app.job(twice)
+app.job(twice, accelerator=False)
 """
 
 

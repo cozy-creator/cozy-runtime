@@ -28,7 +28,7 @@ def segment(payload: Request) -> Result:
 @invocable
 async def child(ctx: Context, *, n: int) -> Result:
     return Result(n)
-app.job(child, internal=True)
+app.job(child, internal=True, accelerator=False)
 @app.entrypoint(hidden=True)
 def unfinished(payload: Request) -> Result:
     return Result(payload.n)

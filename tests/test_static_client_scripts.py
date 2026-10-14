@@ -15,6 +15,7 @@ from cozy_runtime.cli.main import parse
 from cozy_runtime.internal import package_interface, static_interface
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.static_interface import StaticRefusal
+from cpu_script import cpu
 
 
 def project(root: Path, code: str) -> Path:
@@ -23,7 +24,7 @@ def project(root: Path, code: str) -> Path:
     (root / "cozy_script_entry.py").write_text(
         'from cozy_runtime.author import script_app\napp = script_app("cozy_script")\n'
     )
-    (root / "cozy_script.py").write_text(code)
+    (root / "cozy_script.py").write_text(cpu(code))
     return root
 
 
