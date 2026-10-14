@@ -121,6 +121,7 @@ from cozy_runtime.author._model import Model, _derive_model, component_use
 from cozy_runtime.author._observations import Attribution
 from cozy_runtime.author._services import Attempt as AuthorAttempt
 from cozy_runtime.author._services import CheckpointConflict, ProgressFrame
+from cozy_runtime.author._split import install as install_pieces
 from cozy_runtime.author.kernels import _SETS as KERNEL_SETS
 from cozy_runtime.author.kernels import Launch, Plan
 from cozy_runtime.internal import (
@@ -208,6 +209,7 @@ from cozy_runtime.internal.parallel.plan import (
     GroupRefusal,
     rank_invariant_digest,
 )
+from cozy_runtime.internal.pieces import Pieces
 from cozy_runtime.internal.seam import (
     EXECUTOR_PROTOCOL_REVISION,
     RESULT_DOCUMENT,
@@ -2388,6 +2390,8 @@ class Executor:
                 host.weights = Weights(torch, self._rank_device(torch), self.device_kind)
                 host.weights.adopt_context(host.device_context)
                 settles(host.weights.quiesce)
+                if not host.weights.host_only:
+                    install_pieces(Pieces(host.weights))
                 # One GPU of a group: its blocks hold the group's collectives, so they
                 # recover from an out-of-memory op by op, never by running a block again.
                 host.weights.grouped = self.world > 1
