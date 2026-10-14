@@ -261,11 +261,12 @@ def test_a_failed_op_recovers_without_replaying_its_python_forward(
     assert len(trace["room"]) == 1 and not trace["residency"].poisoned
 
 
-@pytest.mark.parametrize("effect", ["mutable", "rng", "custom"])
+@pytest.mark.parametrize("effect", ["mutable", "copy", "rng", "custom"])
 def test_a_failed_op_runs_again_from_what_it_read(effect: str, monkeypatch: Any) -> None:
     """An op that fails after it ran (the harshest case: a real OOM fails before writing)
     runs again from the tensors it writes into and the generator state it drew from. A
-    pointwise op allocates nothing, so it can only fail before it writes: it is not copied."""
+    pointwise op allocates nothing, so it can only fail before it writes: it is not copied.
+    The copy is an allocation too, and recovers like the op (run 6021)."""
     weights, _region, trace = wrapped(StatefulBlock("counter"), monkeypatch)
     value = torch.zeros(2)
     generator = torch.Generator().manual_seed(17)
@@ -284,12 +285,16 @@ def test_a_failed_op_runs_again_from_what_it_read(effect: str, monkeypatch: Any)
             return once(value)
 
         failed = FailAfterOp(None)
-    elif effect == "mutable":
+    elif effect in ("mutable", "copy"):
 
         def operation() -> Any:
             return value.index_put_((torch.arange(2),), torch.ones(2), accumulate=True)
 
-        failed = FailAfterOp(torch.ops.aten.index_put_.default)
+        failed = FailAfterOp(
+            torch.ops.aten.index_put_.default
+            if effect == "mutable"
+            else torch.ops.aten.clone.default
+        )
     else:
 
         def operation() -> Any:
@@ -303,7 +308,7 @@ def test_a_failed_op_runs_again_from_what_it_read(effect: str, monkeypatch: Any)
         assert calls == [1, 1] and torch.equal(out, torch.ones(2))
     else:
         assert failed.calls == 2
-    if effect == "mutable":
+    if effect in ("mutable", "copy"):
         assert torch.equal(value, torch.ones(2)), "applied once"
     if effect == "rng":
         assert torch.equal(out, torch.rand(2, generator=control)), "the same draw"
