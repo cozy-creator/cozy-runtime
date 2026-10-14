@@ -1640,18 +1640,20 @@ def _recovery_type(torch: ModuleType) -> type:
             journal = self.journal
             drawn = _generators(torch, func, args, kwargs) if seeded in func.tags else []
             states = [(g, g.get_state()) for g in drawn]
-            written: list[tuple[Tensor, Tensor]] = []
+            targets: list[Tensor] = []
             if func._schema.is_mutable:
                 targets = list(_tensor_operands(tuple(_written(func, args, kwargs))))
-                if journal is not None:
-                    journal.before_write(targets)
-                if pointwise not in func.tags:
-                    written = [(t, t.clone()) for t in targets]
             if journal is not None:
                 journal.draws(states)
             refused = False
+            written: list[tuple[Tensor, Tensor]] | None = None
             while True:
                 try:
+                    if written is None:  # the copies are allocations too: they recover first
+                        if journal is not None:
+                            journal.before_write(targets)
+                        copied = pointwise not in func.tags
+                        written = [(t, t.clone()) for t in targets] if copied else []
                     out = func(*args, **kwargs)
                     if journal is not None:
                         journal.made(out)
@@ -1662,7 +1664,7 @@ def _recovery_type(torch: ModuleType) -> type:
                 # what it read: its generators and the tensors it writes into, as they were
                 for generator, state in states:
                     generator.set_state(state)
-                for target, first in written:
+                for target, first in written or ():
                     target.copy_(first)
                 self.weights.make_room(need, (*args, *kwargs.values()), str(func))
 
