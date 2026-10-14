@@ -491,19 +491,19 @@ def reset_peak(torch: Any, kind: str) -> None:
         torch.cuda.reset_peak_memory_stats()
 
 
-def hold_peak(torch: Any, kind: str) -> None:
+def hold_peak(torch: ModuleType, kind: str) -> None:
     """Keep the high-water marks so far for `peak_allocated`/`peak_reserved` and zero torch's:
     what runs next is measured on its own (`section_peak`)."""
     _HELD[:] = [peak_allocated(torch, kind), peak_reserved(torch, kind)]
     torch.cuda.reset_peak_memory_stats()
 
 
-def drop_peak(torch: Any, kind: str) -> None:
+def drop_peak(torch: ModuleType, kind: str) -> None:
     """Forget the high-water mark since `hold_peak`: that section failed."""
     torch.cuda.reset_peak_memory_stats()
 
 
-def section_peak(torch: Any, kind: str) -> int:
+def section_peak(torch: ModuleType, kind: str) -> int:
     """The high-water mark since `hold_peak`."""
     return int(torch.cuda.max_memory_allocated())
 
