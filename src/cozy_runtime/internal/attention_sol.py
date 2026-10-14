@@ -85,7 +85,7 @@ def observing(
     ranks: dict[int, dict[str, int]] | None = None,
     kernels: list[dict[str, Scalar]] | None = None,
     producer_state: RequestState | None = None,
-    held: dict[str, Any] | None = None,
+    held: dict[str, object] | None = None,
 ) -> Iterator[dict[str, int]]:
     """Count successful calls in this request, restoring any outer observation. `kernels`
     receives one row per kernel this request started building or resolved. The request's
