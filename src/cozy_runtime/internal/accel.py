@@ -482,11 +482,11 @@ def allocated(torch: Any, kind: str, device: Any = None) -> int:
 _HELD = [0, 0]
 
 
-def reserved(torch: Any, kind: str, device: Any = None) -> int:
+def reserved(torch: ModuleType, kind: str) -> int:
     """The allocator's reserved bytes ALONE: live tensors plus its idle cache."""
     if kind == "mps":
         raise AcceleratorUnsupported("mps", "reserved")
-    return int(torch.cuda.memory_reserved(device))
+    return int(torch.cuda.memory_reserved())
 
 
 def reset_peak(torch: Any, kind: str) -> None:
