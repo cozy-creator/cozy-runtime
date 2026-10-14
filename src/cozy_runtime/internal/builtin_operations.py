@@ -14,7 +14,7 @@ from cozy_runtime.internal.package_interface import canonical_bytes
 
 NAME = "cozy-runtime-operations"
 MODULE = "cozy_runtime.derive.operations"
-EXPORTS = ("quantize", "prepare_model")
+EXPORTS = ("quantize",)
 APPLICATION = MODULE + ":app"
 FLOOR = "0.16.8"
 WHEEL = (

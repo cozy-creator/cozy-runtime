@@ -18,7 +18,6 @@ BUILT = (
     "version",
 )
 PRIVATE = (
-    "model-ingestion-plan",
     "image-prepare",
     "image-preparation-profile",
     "python-interpreters",
@@ -139,10 +138,6 @@ def parse(argv: Sequence[str]) -> tuple[str | None, list[str], Options, bool]:
 
 
 def dispatch(verb: str, args: list[str], opts: Options, config: RuntimeConfig) -> Result:
-    if verb == "model-ingestion-plan":
-        from cozy_runtime.cli import model_ingestion
-
-        return model_ingestion.run(args, opts)
     if opts.builtin and (
         verb != "describe"
         or opts.distribution

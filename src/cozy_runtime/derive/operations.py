@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from typing import TYPE_CHECKING, Annotated, Literal
+from typing import TYPE_CHECKING, Literal
 
 import msgspec
 
@@ -11,19 +11,16 @@ from cozy_runtime import canonical_json
 from cozy_runtime.author import (
     MAX_WEIGHTS_NEW_BYTES,
     App,
-    AssetBound,
     Context,
     Loader,
     MemoDistribution,
     Model,
     ModelArtifact,
     Telemetry,
-    Tree,
     UnsupportedInput,
     WeightsOutput,
     invocable,
 )
-from cozy_runtime.models.birefnet import ingestion as birefnet
 
 from . import facade
 
@@ -208,48 +205,3 @@ app.job(
     weights=(WeightsOutput("model", max_new_bytes=MAX_QUANTIZED_BYTES),),
     accelerator=False,
 )
-
-
-@invocable(
-    memoize=True,
-    memo_version="prepare-model/1",
-    memo_dependencies=(
-        "cozy_runtime.models.birefnet.ingestion",
-        "tensorfs.derived",
-        MemoDistribution("tensorfs"),
-        MemoDistribution("msgspec"),
-    ),
-)
-async def prepare_model(
-    ctx: Context,
-    *,
-    source: QuantizationSource,
-    metadata: Annotated[Tree, AssetBound(max_bytes=64 << 20)],
-    recipe: str,
-) -> ModelArtifact:
-    """Attach reviewed model-owned metadata to an exact native source census."""
-    if recipe != "birefnet/original/1":
-        raise UnsupportedInput("Unknown model preparation recipe", code="model_ingestion_recipe")
-    from tensorfs.derived import Config, Derivation, Target, derive
-
-    capability = ctx.tensorfs_source(source)
-    inspection = capability.inspect()
-    config, order, files = birefnet.preparation(inspection, metadata.path)
-    definition = Derivation(
-        sources={"source": capability},
-        targets={c: Target(source="source", source_component=c) for c in inspection.components},
-        configs={"model": Config("add")},
-        order=order,
-        files=files,
-    )
-    with derive(ctx.output("model"), definition) as transaction:
-        if transaction.receipt is not None:
-            return ctx.adopt_model(transaction.receipt)
-        ctx.raise_if_cancelled()
-        if "model" not in set(transaction.completed_configs()):
-            transaction.add_config("model", canonical_json.encode(config))
-            transaction.checkpoint()
-        return ctx.adopt_model(transaction.commit())
-
-
-app.job(prepare_model, weights=(WeightsOutput("model", max_new_bytes=8 << 20),), accelerator=False)

@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from cozy_runtime.author._calls import _export
-from cozy_runtime.derive.operations import prepare_model, quantize
+from cozy_runtime.derive.operations import quantize
 from cozy_runtime.internal.memo_implementation import describe
 
 
@@ -23,9 +23,8 @@ def identity(fn: Callable[..., object]) -> dict[str, str]:
 def test_derivation_native_version_invalidates(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, distribution_name: str
 ) -> None:
-    functions = (quantize,) if distribution_name == "numpy" else (quantize, prepare_model)
-    original = [identity(fn) for fn in functions]
-    assert all(row.get("operation_identity") for row in original), original
+    original = identity(quantize)
+    assert original.get("operation_identity"), original
     installed = importlib.metadata.distribution(distribution_name)
     metadata = installed.read_text("METADATA")
     wheel = installed.read_text("WHEEL")
@@ -37,6 +36,6 @@ def test_derivation_native_version_invalidates(
     )
     (shadow / "WHEEL").write_text(wheel)
     monkeypatch.syspath_prepend(str(tmp_path))
-    changed = [identity(fn) for fn in functions]
-    assert all(row.get("operation_identity") for row in changed), changed
-    assert all(first != second for first, second in zip(original, changed, strict=True))
+    changed = identity(quantize)
+    assert changed.get("operation_identity"), changed
+    assert original != changed
