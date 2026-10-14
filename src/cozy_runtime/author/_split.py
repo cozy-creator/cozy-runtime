@@ -15,6 +15,8 @@ from cozy_runtime.author._errors import is_device_oom
 
 #: The refusal an op ends with when the device cannot give it the bytes it needs at once.
 EXCEEDS = "operation_exceeds_device"
+#: An op not measured yet runs in pieces of at most 1/FIRST of its input.
+FIRST = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,16 +62,17 @@ def install(runtime: Pieces | None) -> None:
 def split(fn: Callable[[Any], Any], x: Any, *cuts: Cut) -> Any:
     """`fn(x)`, with `fn` a tensor-to-tensor op whose result on a window of `x` along `cuts`
     is that window of its whole result (up to `overlap`). The Runtime runs it whole when the
-    device can hold it, else in the fewest pieces that fit; a piece that still runs out of
-    memory runs again at half the size. Without a Runtime that manages device memory (a CPU
-    executor, a test) it runs whole."""
+    device can hold it, else in the fewest pieces that fit, from the bytes per element its
+    first call measured; a piece that still runs out of memory runs again at half the size.
+    Without a Runtime that manages device memory (a CPU executor, a test) it runs whole."""
     runtime = _RUNTIME
     if runtime is None or not cuts:
         return fn(x)
     shape = tuple(int(n) for n in x.shape)
     key = _key(fn, shape, cuts, x.dtype)
     ratio, room = runtime.room(key)
-    windows = _windows(shape, cuts, room / ratio if ratio else math.inf)
+    # Unmeasured, it runs in pieces small enough to fit almost anywhere, and measures.
+    windows = _windows(shape, cuts, room / ratio if ratio else math.prod(shape) / FIRST)
     while True:
         try:
             out = _run(fn, x, cuts, windows, runtime, key, ratio or 0.0)
