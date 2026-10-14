@@ -13,10 +13,11 @@ if TYPE_CHECKING:
 from cozy_runtime.internal import attention_sol, attention_ulysses, attention_upstream
 from cozy_runtime.internal.attention_ulysses import Local, Options
 
-NAMES = frozenset({"kitchen-sol", "kitchen-sol-fp4-lowmem"})
+NAMES = frozenset({"kitchen-sol", "kitchen-sol-fp4-lowmem", "kitchen-sol-fp4-fixed-means"})
 FP4 = frozenset(
     {
         "kitchen-sol-fp4-lowmem",
+        "kitchen-sol-fp4-fixed-means",
         "kitchen-sol-producer-fp4-lowmem-shared-qkv",
         "kitchen-sol-producer-fp4-fixed-means-shared-qkv",
     }
@@ -107,11 +108,33 @@ def forward_fp4_lowmem(
     )
 
 
+def forward_fp4_fixed_means(
+    query: Tensor, key: Tensor, value: Tensor, **options: Unpack[PartialOptions]
+) -> Tensor:
+    return attention_sol._attention(
+        query,
+        key,
+        value,
+        **options,
+        sparse=sparse,
+        dense=dense_fp4_fixed_means,
+        prefix_dense=dense_kitchen,
+        validate_device=validate_device,
+    )
+
+
 KITCHEN_SOL = Local(forward, lambda *_: "comfy_kitchen.sol_attn(int8, tau=1, current-call stats)")
 KITCHEN_SOL_FP4_LOWMEM = Local(
     forward_fp4_lowmem,
     lambda *_: (
         "dense=sageattn3.nvfp4_global_head_mean(short_owned_lifetimes); "
+        "sparse=comfy_kitchen.sol_attn(int8)"
+    ),
+)
+KITCHEN_SOL_FP4_FIXED_MEANS = Local(
+    forward_fp4_fixed_means,
+    lambda *_: (
+        "dense=sageattn3.nvfp4_fixed_means(upstream_bf16_correction); "
         "sparse=comfy_kitchen.sol_attn(int8)"
     ),
 )

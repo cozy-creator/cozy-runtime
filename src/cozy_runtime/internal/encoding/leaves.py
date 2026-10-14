@@ -25,7 +25,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from cozy_runtime.internal.accel import readable
+from cozy_runtime.author.kernels import PreQuantized as PreQuantized
+from cozy_runtime.author.kernels import readable
 from cozy_runtime.internal.encoding.formats import (
     E4M3_MAX,
     E8M0_BIAS,
@@ -39,21 +40,6 @@ from cozy_runtime.internal.encoding.formats import (
 #: The activation scale's floor, and the same policy `ROW_SCALE_FLOOR` states for weights:
 #: a row of exact zeros has amax 0, and dividing by it poisons a whole output row with NaN.
 ACT_SCALE_FLOOR = 1e-12
-
-
-@dataclass(frozen=True, slots=True)
-class PreQuantized:
-    """An activation already in the rowwise leaf's operand geometry (h3a-015).
-
-    A fused glue kernel that holds the row in registers quantizes it there instead of
-    writing bf16 for the leaf to read back; the leaf then skips `quantize_activation_rowwise`
-    and feeds the payload and per-row scale straight to the GEMM. `shape` is the bf16
-    activation's, so the leaf's output reshape is the same expression either way.
-    """
-
-    payload: Any
-    scale: Any
-    shape: tuple[int, ...]
 
 
 def _triton_rowwise_kernel() -> Any:

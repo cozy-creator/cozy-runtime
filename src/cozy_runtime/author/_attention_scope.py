@@ -56,6 +56,11 @@ def attention_scope(layout: AttentionLayout) -> Iterator[None]:
         _ACTIVE_LAYOUT.reset(token)
 
 
+def active_attention_layout() -> AttentionLayout | None:
+    """The layout the model supplied for the inference call in progress, or None."""
+    return _ACTIVE_LAYOUT.get()
+
+
 #: What the runtime does with an early length statement; the executor's attention installs it.
 _EXPECTED: list[Callable[[int, Any], None]] = []
 
