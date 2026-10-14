@@ -149,7 +149,7 @@ def test_exhausted_recovery_reports_its_capacity_and_leaves_the_state_it_found(
     exactly as if the failed one never ran."""
     control, current = StatefulBlock(effect), StatefulBlock(effect)
     weights, _region, trace = wrapped(current, monkeypatch)
-    monkeypatch.setattr(weights, "shrink", lambda _need, _floor: 0)
+    monkeypatch.setattr(weights, "shrink", lambda _need, _keep=0: 0)
     failed = FailAfterOp(torch.ops.aten.linear.default)
     value = torch.tensor([[0.25, -0.5]])
     before = value.clone()
@@ -170,7 +170,7 @@ def test_exhausted_functional_op_without_a_python_body_keeps_its_contract(
 ) -> None:
     module = StatefulBlock("counter")
     weights, _region, trace = wrapped(module, monkeypatch)
-    monkeypatch.setattr(weights, "shrink", lambda _need, _floor: 0)
+    monkeypatch.setattr(weights, "shrink", lambda _need, _keep=0: 0)
     value = torch.tensor([[0.25, -0.5]])
     weight = torch.eye(2)
     failed = FailAfterOp(torch.ops.aten.linear.default)
@@ -203,7 +203,7 @@ def test_exhausted_sdk_decoder_body_keeps_its_resumable_output_only_contract(
         expected = image_vae.Decode(vae, latent, band=100).run().sample
     conv = vae.decoder.conv_in
     weights, _region, trace = wrapped(conv, monkeypatch, root=vae)
-    monkeypatch.setattr(weights, "shrink", lambda _need, _floor: 0)
+    monkeypatch.setattr(weights, "shrink", lambda _need, _keep=0: 0)
     within = trace["residency"]._within("model")
     calls = []
 
@@ -239,7 +239,7 @@ def test_an_executor_capacity_failure_keeps_its_generation_serving(
     target = runner.constructions["a"]
     module = StatefulBlock("buffer")
     weights, _region, trace = wrapped(module, monkeypatch)
-    monkeypatch.setattr(weights, "shrink", lambda _need, _floor: 0)
+    monkeypatch.setattr(weights, "shrink", lambda _need, _keep=0: 0)
     value = torch.tensor([[0.25, -0.5]])
 
     def fail_in_handler() -> None:
