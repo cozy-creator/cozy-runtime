@@ -60,9 +60,9 @@ def install(runtime: Pieces | None) -> None:
 def split(fn: Callable[[Any], Any], x: Any, *cuts: Cut) -> Any:
     """`fn(x)`, with `fn` a tensor-to-tensor op whose result on a window of `x` along `cuts`
     is that window of its whole result (up to `overlap`). The Runtime runs it whole when the
-    device can hold it, else in the fewest pieces that fit; one that still runs out of memory
-    runs again in twice as many. Without a Runtime that manages device memory (a CPU executor,
-    a test) it runs whole."""
+    device can hold it, else in the fewest pieces that fit; a piece that still runs out of
+    memory runs again at half the size. Without a Runtime that manages device memory (a CPU
+    executor, a test) it runs whole."""
     runtime = _RUNTIME
     if runtime is None or not cuts:
         return fn(x)
