@@ -26,9 +26,9 @@ from tensorfs import Store  # noqa: E402
 from tensorfs.derived import Config as NativeConfig  # noqa: E402
 from tensorfs.derived import Derivation, Part, Target, Tensor  # noqa: E402
 
-from cozy_runtime import _kernels  # noqa: E402
 from cozy_runtime.author._activity import asides  # noqa: E402
 from cozy_runtime.author._loader import census  # noqa: E402
+from cozy_runtime.author.kernels import rms_rope_split_half  # noqa: E402
 from cozy_runtime.internal import accel, image_vae, paging, plane, weight_policy  # noqa: E402
 from cozy_runtime.internal import weights as weights_module  # noqa: E402
 from cozy_runtime.internal.derive import Observations, serving_substrate  # noqa: E402
@@ -341,17 +341,19 @@ def test_a_kernel_launch_is_never_handed_a_weight_with_no_bytes() -> None:
     """A Triton kernel reads its operands by pointer. One that is a weight with no plane
     bytes bound, which nothing here can map (no stage owns it), is refused before the launch;
     every other operand passes through untouched."""
-    from cozy_runtime.internal import fusion
+    from cozy_runtime.internal.triton_kernels import _Launcher
     from cozy_runtime.internal.weights import ResidencyRefusal, unbound
 
     launched: list[tuple[Any, ...]] = []
-    kernel: Any = {(4, 1, 1): lambda *args: launched.append(args)}
+    compiled: Any = {"scale[]": {(4, 1, 1): lambda *args: launched.append(args)}}
+    kernel = SimpleNamespace(__name__="scale", arg_names=["x_ptr", "n", "eps"])
+    launch = _Launcher(89, compiled, {"scale": ()})
     scale = torch.ones(8)
-    fusion._Launch(kernel)[(4, 1, 1)](scale, 8, 1e-6)
+    launch(kernel, (4, 1, 1), scale, 8, 1e-6)
     assert len(launched) == 1 and launched[0][0] is scale and launched[0][1:] == (8, 1e-6)
     standin = unbound(torch, torch.nn.Parameter(torch.empty(8)), torch.device("cpu"))
     with pytest.raises(ResidencyRefusal, match="no plane bytes") as refused:
-        fusion._Launch(kernel)[(4, 1, 1)](scale, standin, 8)
+        launch(kernel, (4, 1, 1), scale, standin, 8)
     assert refused.value.code == "weight_unbound" and len(launched) == 1
 
 
@@ -470,8 +472,9 @@ class FusedBlock(torch.nn.Module):  # type: ignore[misc,name-defined]
             for name in ("to_q", "to_k", "to_v")
         )
         turn = torch.eye(2, device=x.device).expand(1, 1, x.shape[0], 64, 2, 2).contiguous()
-        with accel.readable(self.norm_q.weight, self.norm_k.weight) as (q_scale, k_scale):
-            q, k = _kernels.rms_rope_split_half(q, k, turn, q_scale, k_scale, self.norm_q.eps)
+        q, k = rms_rope_split_half(
+            q, k, turn, self.norm_q.weight, self.norm_k.weight, self.norm_q.eps
+        )
         out = torch.nn.functional.scaled_dot_product_attention(q, k, v)
         return x + torch.tanh(self.to_out[0](out.transpose(1, 2).flatten(2, 3))[0])
 
@@ -547,7 +550,7 @@ def test_a_kernel_launched_outside_torch_never_reads_an_unmapped_weight(
     handed its head norms' scales to our compiled kernel while no plane bytes were bound to
     them, and the kernel read a pointer with nothing mapped behind it. The scales stay in
     `common`; and were one its own region after all (the second case), the launch maps it
-    first (`accel.readable`) and never faults the device."""
+    first (`author.kernels.readable`) and never faults the device."""
     pytest.importorskip("cozy_runtime._kernels._C")
     own_region = small != paging.SMALL
     monkeypatch.setattr(paging, "SMALL", small)

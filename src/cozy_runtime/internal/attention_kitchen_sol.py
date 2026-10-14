@@ -14,14 +14,7 @@ from cozy_runtime.internal import attention_sol, attention_ulysses, attention_up
 from cozy_runtime.internal.attention_ulysses import Local, Options
 
 NAMES = frozenset({"kitchen-sol", "kitchen-sol-fp4-lowmem", "kitchen-sol-fp4-fixed-means"})
-FP4 = frozenset(
-    {
-        "kitchen-sol-fp4-lowmem",
-        "kitchen-sol-fp4-fixed-means",
-        "kitchen-sol-producer-fp4-lowmem-shared-qkv",
-        "kitchen-sol-producer-fp4-fixed-means-shared-qkv",
-    }
-)
+FP4 = frozenset({"kitchen-sol-fp4-lowmem", "kitchen-sol-fp4-fixed-means"})
 
 
 def validate_device(device: Device) -> None:

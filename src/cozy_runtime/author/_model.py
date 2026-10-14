@@ -114,20 +114,6 @@ ENCODED_LEAVES: Mapping[str, str] = {
     "linear op may be replaced by a module whose weight is the stored role set",
 }
 
-#: The second class keyword, same shape and same reason (h3a-015): the runtime's fused glue
-#: plan replaces a known module's FORWARD with a fused kernel of the same arithmetic. It
-#: moves no tensor, but a package that reads a module's class name or an intermediate the
-#: fused chain no longer materializes would notice, and only the author knows it does not.
-FUSION: Mapping[str, str] = {
-    "refuse": "the runtime runs every module's own forward; no fused plan is installed",
-    "accept": "this package's code depends on no module's class identity and on no "
-    "intermediate between a norm and the GEMM it feeds, so the runtime MAY substitute its "
-    "fused glue kernels for the modules it has exact-source matches for — a device without "
-    "the built kernels serves the eager forward and the prepare records why",
-    "require": "the same consent, and this package will not serve without it: a device "
-    "whose fused kernels are absent or stale refuses the placement typed",
-}
-
 #: Keyword names an author-facing model method may not declare. Every one of them names a
 #: residency, placement or conversion decision the runtime owns (§1.1/§7).
 EXCLUDED_KEYWORDS: Mapping[str, str] = {
@@ -493,11 +479,6 @@ class Model[PipelineT]:
     survives leaf replacement, and reading its silence as "yes" would be the runtime
     deciding a question only the author can answer."""
 
-    __fusion__: str = "refuse"
-    """The class's `fusion=` declaration (h3a-015), defaulted the same way for the same
-    reason: silence is not consent to a substituted forward. Nothing defaults to
-    `require` — a requirement is only ever spelled out."""
-
     __adapter_compatibility__: tuple[AdapterCompatibility, ...] = ()
     """Closed generic adapter declarations; empty means overlays are refused."""
 
@@ -525,8 +506,9 @@ class Model[PipelineT]:
     """Runtime-installed: where `memoize=True` methods look before their scope opens."""
 
     def __init_subclass__(cls, /, **keywords: str) -> None:
-        """The class-keyword plane is exactly `encoded_leaves` and `fusion` (model-code-fit
-        §1, h3a-015): two closed consents about what the runtime may substitute.
+        """The class-keyword plane is exactly `encoded_leaves` (model-code-fit §1): the
+        closed consent about what the runtime may substitute. A package's own fused plan is
+        its `execution_plan`.
 
         Anything else refuses typed: the open stamp vocabulary (`task=`, `objective=`),
         `structure=` and `self_loading=` are deleted (D1), and a keyword the runtime does not
@@ -535,7 +517,6 @@ class Model[PipelineT]:
         super().__init_subclass__()
         for keyword, vocabulary, attribute in (
             ("encoded_leaves", ENCODED_LEAVES, "__encoded_leaves__"),
-            ("fusion", FUSION, "__fusion__"),
         ):
             if keyword in keywords:
                 value = keywords.pop(keyword)
@@ -549,8 +530,8 @@ class Model[PipelineT]:
         if keywords:
             names = ", ".join(f"{key}=…" for key in keywords)
             raise ConformanceError(
-                f"class {cls.__name__}({names}): a Model class carries exactly two keywords, "
-                "encoded_leaves and fusion — stamps, task=, objective= and structure= are "
+                f"class {cls.__name__}({names}): a Model class carries exactly one keyword, "
+                "encoded_leaves — fusion=, stamps, task=, objective= and structure= are "
                 "deleted (model-code-fit D1); a semantic twin is a component name or a config "
                 "fact",
                 code="class_keyword",

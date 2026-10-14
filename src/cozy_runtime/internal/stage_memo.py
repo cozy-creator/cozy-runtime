@@ -728,7 +728,7 @@ def install(
     device: object,
     world: int,
     sealed: Mapping[str, str],
-    fusion: object,
+    plan: str | None,
 ) -> None:
     """Give one constructed generation its memo, once per load. `headers` maps each component
     to the checkpoint header it fills from; `assets` is the header carrying assets and configs.
@@ -747,7 +747,7 @@ def install(
             device,
             world,
             sealed,
-            fusion,
+            plan,
         )
     except Exception as exc:  # the memo is an optimization: this load serves without it
         _LOG.warning("stage memo off for %s: %s", type(model).__qualname__, exc)
@@ -766,7 +766,7 @@ def _generation(
     device: object,
     world: int,
     sealed: Mapping[str, str],
-    fusion: object,
+    plan: str | None,
 ) -> GenerationMemo:
     kind, sm, gpu = (getattr(device, name) for name in ("kind", "sm", "name"))
     numerical = fingerprint(
@@ -797,6 +797,6 @@ def _generation(
         environment=environment(type(model).__module__),
         components={name: weights(name) for name in roots},
         assets=_hash([assets.get("assets"), assets.get("configs")]),
-        device=_hash([numerical, str(gpu), fusion, world]),
+        device=_hash([numerical, str(gpu), plan, world]),
         sites={name: tuple(found) for name, found in processors.items()},
     )

@@ -38,8 +38,6 @@ if TYPE_CHECKING:
     from torch import Tensor, device as Device
     from torch.nn import Module
 
-    from cozy_runtime.internal.attention_producer import RequestState
-
 from cozy_runtime.author._attention import _request
 from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT, AttentionLayout
 from cozy_runtime.author._observations import Scalar
@@ -65,9 +63,6 @@ NAMES = frozenset(
         "kitchen-sol",
         "kitchen-sol-fp4-lowmem",
         "kitchen-sol-fp4-fixed-means",
-        "kitchen-sol-producer-fast-shared-qkv",
-        "kitchen-sol-producer-fp4-lowmem-shared-qkv",
-        "kitchen-sol-producer-fp4-fixed-means-shared-qkv",
     }
 )
 _COUNTS: ContextVar[dict[str, int] | None] = ContextVar("cozy_sol_counts", default=None)
@@ -84,7 +79,6 @@ def observing(
     *,
     ranks: dict[int, dict[str, int]] | None = None,
     kernels: list[dict[str, Scalar]] | None = None,
-    producer_state: RequestState | None = None,
     held: dict[str, object] | None = None,
 ) -> Iterator[dict[str, int]]:
     """Count successful calls in this request, restoring any outer observation. `kernels`
@@ -94,10 +88,8 @@ def observing(
     token = _COUNTS.set(counts)
     rank_token = _RANK_COUNTS.set(ranks)
     kernel_token = _KERNEL_ROWS.set(kernels)
-    from cozy_runtime.internal.attention_producer import request_scope
-
     try:
-        with request_scope(producer_state), _request(held):
+        with _request(held):
             yield counts
     finally:
         _COUNTS.reset(token)
@@ -144,13 +136,13 @@ def bind_dense(call: Callable[..., Tensor], identity: str) -> None:
 
 
 def dense_identity(kernel: str = "sol-attn") -> str:
-    if kernel in {"kitchen-sol-fp4-fixed-means", "kitchen-sol-producer-fp4-fixed-means-shared-qkv"}:
+    if kernel == "kitchen-sol-fp4-fixed-means":
         return "sageattention3-fp4-fixed-means; sparse-prefix=kitchen-int8"
     if kernel == "sol-attn-sage2-fixed-kmean":
         return "sageattention-fixed-kmean"
-    if kernel in {"kitchen-sol-fp4-lowmem", "kitchen-sol-producer-fp4-lowmem-shared-qkv"}:
+    if kernel == "kitchen-sol-fp4-lowmem":
         return "sageattention3-fp4-global-lowmem; sparse-prefix=kitchen-int8"
-    if kernel in {"kitchen-sol", "kitchen-sol-producer-fast-shared-qkv"}:
+    if kernel == "kitchen-sol":
         return "kitchen-int8"
     return _DENSE_IDENTITY
 

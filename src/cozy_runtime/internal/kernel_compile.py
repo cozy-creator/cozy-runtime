@@ -49,7 +49,6 @@ BUILDERS = {
     "setup": "cozy_runtime.internal.kernel_sources:build_setup",
     "python": "cozy_runtime.internal.kernel_sources:build_python",
     "sol": "cozy_runtime.internal.attention_sol:build",
-    "fusion": "cozy_runtime.internal.fusion:build",
     "triton": "cozy_runtime.internal.triton_kernels:build",
 }
 _BOOT = (

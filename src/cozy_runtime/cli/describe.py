@@ -175,7 +175,6 @@ def _schema_view(doc: Mapping[str, Json], body: Mapping[str, Json], kind: str) -
         lines.append(
             f"model {slot['path']} -> {slot['class']}  "
             f"encoded_leaves: {slot.get('encoded_leaves', 'refuse')}"
-            + (f"  fusion: {slot['fusion']}" if "fusion" in slot else "")
             + (f"  runs: {runs}" if runs else "")
         )
         components = slot["component_use"]

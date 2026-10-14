@@ -37,7 +37,6 @@ from cozy_runtime.author._attention_scope import _EXPECTED
 from cozy_runtime.internal import (
     accel,
     attention_kitchen_sol,
-    attention_producer,
     attention_sage2_fixed,
     attention_sol,
     attention_ulysses,
@@ -379,29 +378,6 @@ PINNABLE += (
         import_name="comfy_kitchen",
         why="Fixed-means NVFP4 dense plus Kitchen INT8 Sol; head-local for Ulysses.",
     ),
-    *(
-        Candidate(
-            name=name,
-            backend="_cozy_" + name.replace("-", "_"),
-            local=attention_producer.LOCALS[name],
-            min_sm=120 if name in attention_producer.FP4_LOWMEM else 80,
-            max_sm=120 if name in attention_producer.FIXED_MEANS else 121,
-            sms=(
-                frozenset({120})
-                if name in attention_producer.FIXED_MEANS
-                else frozenset({120, 121})
-                if name in attention_producer.FP4_LOWMEM
-                else frozenset(a * 10 + b for a, b in upstream.KITCHEN_SMS)
-            ),
-            dtypes=frozenset({"bfloat16"}),
-            max_head_dim=128,
-            head_dims=frozenset({128}),
-            artifact="comfy-kitchen",
-            import_name="comfy_kitchen",
-            why="H3 single-GPU shared-QKV producer; invocation-local previous-step statistics.",
-        )
-        for name in sorted(attention_producer.NAMES)
-    ),
 )
 
 BY_NAME: dict[str, Candidate] = {c.name: c for c in (*CANDIDATES, *PINNABLE)}
@@ -679,7 +655,7 @@ def _resolve(candidate: Candidate, device: DeviceFacts, wait: bool = True) -> Re
     elif candidate.name in attention_kitchen_sol.FP4:
         dense = BY_NAME[
             "sageattention3-fp4-fixed-means"
-            if candidate.name in attention_producer.FIXED_MEANS | {"kitchen-sol-fp4-fixed-means"}
+            if candidate.name == "kitchen-sol-fp4-fixed-means"
             else "sageattention3-fp4-global-lowmem"
         ]
         artifacts = _compile_dependencies((candidate, dense), device, wait)
@@ -692,7 +668,7 @@ def _resolve(candidate: Candidate, device: DeviceFacts, wait: bool = True) -> Re
         artifact = _compiled(candidate, device, wait) if candidate.artifact else None
     if candidate.import_name:
         module = _import(candidate)
-        if candidate.name in attention_kitchen_sol.NAMES | attention_producer.NAMES:
+        if candidate.name in attention_kitchen_sol.NAMES:
             import torch
 
             target = torch.device("cuda", device.index)
@@ -705,13 +681,6 @@ def _resolve(candidate: Candidate, device: DeviceFacts, wait: bool = True) -> Re
                 raise AttentionRefusal(
                     "attention_kernel_absent",
                     f"{candidate.name}: Kitchen dense INT8 is unavailable",
-                )
-            if candidate.name in attention_producer.NAMES and not callable(
-                getattr(module, "sol_attn_chunked", None)
-            ):
-                raise AttentionRefusal(
-                    "attention_kernel_absent",
-                    f"{candidate.name}: Kitchen lacks its chunked producer",
                 )
         if candidate.local in (upstream.FA3, upstream.FA3_FP8):
             upstream.bind_fa3(module, (artifact or {}).get("key", "environment"))
@@ -1566,8 +1535,6 @@ def _install_sites(records: Sequence[tuple[Ready, str, str, Any]]) -> None:
         producer = entry.candidate.producer
         if producer is not None:
             producer.validate(module)
-        elif entry.name in attention_producer.NAMES:
-            attention_producer.validate(module)
     added: list[tuple[str, str, Any]] = []
     processors: list[tuple[Any, Any]] = []
     try:
@@ -1583,9 +1550,6 @@ def _install_sites(records: Sequence[tuple[Ready, str, str, Any]]) -> None:
                 processors.append((module, module.processor))
                 kernel = entry.candidate.import_name
                 producers.install(module, producer, entry.candidate.backend, kernel, local, path)
-            elif entry.name in attention_producer.NAMES:
-                processors.append((module, module.processor))
-                attention_producer.install(module)
     except BaseException:
         for module, processor in reversed(processors):
             module.set_processor(processor)
@@ -1650,12 +1614,6 @@ def override(
     temporary_processors = (
         [(module, module.processor) for _component, _path, module in swap.modules]
         if swap is not None and entry is not None and entry.candidate.producer is not None
-        else [
-            (module, module.processor)
-            for _component, _path, module in swap.modules
-            if not isinstance(module.processor, attention_producer.Processor)
-        ]
-        if swap is not None and entry is not None and entry.name in attention_producer.NAMES
         else []
     )
     try:
@@ -1826,16 +1784,9 @@ def _site_reason(
     """Why CANDIDATE cannot run this site, or empty."""
     if not hasattr(processor, "_attention_backend"):
         return _unmanaged_reason(component, path, processor)
-    validate = (
-        candidate.producer.validate
-        if candidate.producer is not None
-        else attention_producer.validate
-        if candidate.name in attention_producer.NAMES
-        else None
-    )
-    if validate is not None:
+    if candidate.producer is not None:
         try:
-            validate(module)
+            candidate.producer.validate(module)
         except ValueError as exc:
             return str(exc)
     dtype, head_dim = _dtype(module), _head_dim(module)

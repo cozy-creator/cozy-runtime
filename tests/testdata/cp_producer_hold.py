@@ -8,13 +8,26 @@ from types import SimpleNamespace
 import torch
 from diffusers.models.transformers.transformer_minimax_h3 import MiniMaxH3Attention
 
+from cozy_runtime.author import AttentionProducer, register_attention
 from cozy_runtime.internal import attention
 from cozy_runtime.internal.executor import Executor, _capture_seal
-from cozy_runtime.internal.executor_commands import decode
+from cozy_runtime.internal.executor_commands import Attention, decode
 from cozy_runtime.internal.seam import Channel
 
 
-def main():
+class State:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _never(call: object, *args: object, **kwargs: object) -> object:
+    raise AssertionError("no attention call reaches a producer here")
+
+
+def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--rank-fd", type=int, required=True)
     parser.add_argument("--leader", type=int)
@@ -31,9 +44,18 @@ def main():
     )
     root = torch.nn.Module()
     root.attn = MiniMaxH3Attention(hidden_size=256, heads=2, dim_head=128)
-    root.attn.processor._attention_backend = attention._member(
-        attention.BY_NAME["kitchen-sol-producer-fp4-fixed-means-shared-qkv"]
+    name = "test-cp-producer"
+    register_attention(
+        AttentionProducer(
+            name,
+            "kitchen-sol-fp4-fixed-means",
+            _never,
+            lambda module: None,
+            state=State,
+            context_parallel=True,
+        )
     )
+    root.attn.processor._attention_backend = attention._member(attention.known()[name])
     target.backend = SimpleNamespace(roots={"dit": root})
     target.attention_defaults = attention.snapshot(target.backend.roots)
     follower.constructions["proof"] = target
@@ -45,18 +67,20 @@ def main():
         if kind == "hello":
             reply = follower.hello()
         elif kind == "attention":
-            reply = follower.select_attention(decode(command))
+            attention_command = decode(command)
+            assert isinstance(attention_command, Attention)
+            reply = follower.select_attention(attention_command)
         elif kind == "state-seed":
             assert follower._producer_hold is not None
-            previous = follower._producer_hold[1]
-            previous.statistics[("dit", "site")] = (4, (129,), object(), object())
+            previous = State()
+            follower._producer_hold[1][name] = previous
             reply = {"ok": True, "rank": args.rank}
         elif kind == "state-read":
             reply = {
                 "ok": True,
                 "rank": args.rank,
                 "live": follower._producer_hold is not None,
-                "cleared": previous is not None and not previous.statistics,
+                "closed": previous is not None and previous.closed,
             }
         else:
             raise AssertionError(kind)

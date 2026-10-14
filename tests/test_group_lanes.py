@@ -57,7 +57,6 @@ def _slot_document(slot: ModelBinding) -> dict[str, object]:
         slot.path,
         slot.class_key,
         slot.encoded_leaves,
-        slot.fusion,
         slot.components,
         slot.sequence_parallel,
     )

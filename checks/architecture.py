@@ -891,7 +891,7 @@ def fence_one_address_predicate() -> list[str]:
 #: `dict[str, Any]` record's missing key, 2026-09-28). Records are decoded once, at their
 #: boundary, into typed structs; this count under `internal/` may only fall. Lower it in
 #: the change that removes some.
-ANY_CEILING = 757
+ANY_CEILING = 682
 
 
 def any_references(tree: ast.AST) -> int:

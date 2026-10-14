@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from torch import Tensor
 
-from cozy_runtime.internal.accel import readable
+from cozy_runtime.author.kernels import readable
 
 # Triton launch objects remain dynamic; tensor signatures name their optional dependency.
 

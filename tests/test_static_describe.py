@@ -94,7 +94,6 @@ def test_rich_fixture_spells_the_whole_vocabulary() -> None:
         '"input": "tree"',
         '"asset": "file"',
         '"encoded_leaves": "accept"',
-        '"fusion": "accept"',
         '"sequence_parallel": {"degrees": [2, 4]}',
         '"component_use": {"encode": ["text_encoder"], "render": ["dit", "vae"]}',
         '"normalization_worst_relative_frobenius"',
@@ -572,7 +571,7 @@ def test_torch_free_venv_describes_refuses_and_conforms(torch_free: Path, tmp_pa
     document = json.loads(extending.stdout)
     slot = document["entrypoints"][0]["models"][0]
     assert slot["class"] == "ProbeModel" and slot["encoded_leaves"] == "accept"
-    assert slot["fusion"] == "accept" and slot["sequence_parallel"] == {"degrees": [2, 4]}
+    assert "fusion" not in slot and slot["sequence_parallel"] == {"degrees": [2, 4]}
     assert slot["component_use"]["probe"] == ["vae"]
     assert '"literal": [30, 40, 50]' in json.dumps(document), "the dependency's data asset too"
     _run(uv, "pip", "install", "--python", str(python), "--no-deps", str(EXTENDS))

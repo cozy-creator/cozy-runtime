@@ -43,25 +43,25 @@ def driverless(torch: Any, devices: int) -> Iterator[None]:
         torch.cuda.is_available, torch.cuda.device_count = saved
 
 
-#: Fused-glue compiles this process started in a child, reaped when they end.
+#: Kernel compiles this process started in a child, reaped when they end.
 _COMPILERS: list[subprocess.Popen[bytes]] = []
 
 
-def expect_fusion(entries: Sequence[str], fused: bool, modules: Sequence[str]) -> str:
-    """Start the fused glue's and the package's kernels' compiles for the sealed cards in a
-    child that lives until they end: NVML (which leaves a driver thread on current drivers)
-    and the compiles' watcher threads live there, so this process stays forkable. It imports
-    the package's kernel `modules`; the compiles and keys are the ones `fusion.expect` and
-    `triton_kernels.expect` start in-process; construction takes each build once ready."""
+def expect_kernels(entries: Sequence[str], modules: Sequence[str]) -> str:
+    """Start the package's kernels' compiles for the sealed cards in a child that lives until
+    they end: NVML (which leaves a driver thread on current drivers) and the compiles' watcher
+    threads live there, so this process stays forkable. It imports the package's kernel
+    `modules`; the compiles and keys are the ones `triton_kernels.expect` starts in-process;
+    construction takes each build once ready."""
     reap()
-    plan = json.dumps({"entries": list(entries), "fused": fused, "modules": list(modules)})
+    plan = json.dumps({"entries": list(entries), "modules": list(modules)})
     child = subprocess.Popen([sys.executable, "-I", "-c", _EXPECT, plan], stdin=subprocess.DEVNULL)
     _COMPILERS.append(child)
-    return f"fusion compile started by child {child.pid}"
+    return f"kernel compiles started by child {child.pid}"
 
 
 def reap() -> None:
-    """Reap fused-glue compile children that have ended."""
+    """Reap kernel compile children that have ended."""
     _COMPILERS[:] = [child for child in _COMPILERS if child.poll() is None]
 
 
@@ -79,9 +79,6 @@ for arch in archs:
     for name, kernels in sorted(_SETS.items()):
         line = triton_kernels.expect(kernels, arch)
         print(f"[kernels] {name} sm{arch} {line}", file=sys.stderr, flush=True)
-    if plan["fused"]:
-        fusion = import_module("cozy_runtime.internal.fusion")
-        print(f"[fusion] sm{arch} {fusion.expect(arch)}", file=sys.stderr, flush=True)
 for thread in threading.enumerate():
     if thread is not threading.main_thread():
         thread.join()

@@ -217,10 +217,6 @@ class ModelBinding:
     def encoded_leaves(self) -> str:
         return str(getattr(self.model_class, "__encoded_leaves__", "refuse"))
 
-    @property
-    def fusion(self) -> str:
-        return str(getattr(self.model_class, "__fusion__", "refuse"))
-
 
 @dataclass(frozen=True, slots=True)
 class Surface:

@@ -30,7 +30,6 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, Literal
 
-from cozy_runtime.author.kernels import readable as readable
 from cozy_runtime.internal.config import inherited_environment, sees_no_gpu
 
 #: The #450 law, imposed on every MPS executor's sealed environment: enabling the fallback

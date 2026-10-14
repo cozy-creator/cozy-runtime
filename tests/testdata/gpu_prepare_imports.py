@@ -27,7 +27,7 @@ def main() -> None:
 
         class CheckBoundary(importlib.abc.MetaPathFinder):
             def find_spec(self, fullname: str, path: object, target: object = None) -> None:
-                if fullname == "cozy_runtime.internal.fusion_install":
+                if fullname == "cozy_runtime.internal.triton_kernels":
                     assert executor._device_ready, "kernel import preceded Runtime device boundary"
                     raise ReachedKernelImport()
 

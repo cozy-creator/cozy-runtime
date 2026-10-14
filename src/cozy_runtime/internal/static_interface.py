@@ -295,7 +295,6 @@ _INVOCABLE_KEYWORDS = frozenset(
 class ModelSpec:
     name: str
     encoded_leaves: str
-    fusion: str
     sequence_parallel: tuple[int, ...]
     components: dict[str, tuple[str, ...]]
 
@@ -909,7 +908,7 @@ class Reader:
         key = (module.path, node.name)
         if key in self.models:
             return self.models[key]
-        encoded_leaves, fusion = "refuse", "refuse"
+        encoded_leaves = "refuse"
         degrees: tuple[int, ...] = ()
         components: dict[str, tuple[str, ...]] = {}
         for base in node.bases:
@@ -917,15 +916,13 @@ class Reader:
             found = self.resolve(module, target)
             if isinstance(found, Definition) and isinstance(found.node, ast.ClassDef):
                 parent = self.model(found.module, found.node)
-                encoded_leaves, fusion = parent.encoded_leaves, parent.fusion
+                encoded_leaves = parent.encoded_leaves
                 degrees = parent.sequence_parallel
                 components.update(parent.components)
         for keyword in node.keywords:
             value = self.fold(module, keyword.value)
             if keyword.arg == "encoded_leaves" and value in author._model.ENCODED_LEAVES:
                 encoded_leaves = str(value)
-            elif keyword.arg == "fusion" and value in author._model.FUSION:
-                fusion = str(value)
             else:
                 self.refuse(module, keyword, "a Model class keyword outside the closed set")
         for decorator in node.decorator_list:
@@ -951,7 +948,7 @@ class Reader:
                 if isinstance(found, Vocab) and found.key == "author.uses_components":
                     names = tuple(str(self.fold(module, arg)) for arg in decorator.args)
                     components[stmt.name] = names
-        spec = ModelSpec(node.name, encoded_leaves, fusion, degrees, components)
+        spec = ModelSpec(node.name, encoded_leaves, degrees, components)
         self.models[key] = spec
         return spec
 
@@ -1729,7 +1726,6 @@ def _callable(reader: Reader, registration: Registration) -> dict[str, Json]:
                         f"{registration.name}.models.{arg.arg}",
                         spec.name,
                         spec.encoded_leaves,
-                        spec.fusion,
                         spec.components,
                         spec.sequence_parallel,
                         defaults=registration.model_defaults.get(arg.arg, ()),
@@ -1897,7 +1893,7 @@ def _script_doc(reader: Reader, app: Assigned) -> tuple[package_interface.Kind, 
             if found.key == "author.Model":
                 if isinstance(node, ast.Subscript):
                     reader.translate(module, node.slice)
-                spec = ModelSpec("_ScriptSource", "refuse", "refuse", (), {})
+                spec = ModelSpec("_ScriptSource", "refuse", (), {})
                 sources = True
             else:
                 service = next(
@@ -1935,7 +1931,6 @@ def _script_doc(reader: Reader, app: Assigned) -> tuple[package_interface.Kind, 
                 f"main.models.{arg.arg}",
                 spec.name,
                 spec.encoded_leaves,
-                spec.fusion,
                 spec.components,
                 spec.sequence_parallel,
                 defaults=defaults.get(arg.arg, ()),

@@ -291,7 +291,7 @@ def test_children_die_with_their_parent(
         pytest.fail(f"forked child {forked['pid']} outlived its parent")
 
 
-def test_an_import_only_fusion_compile_leaves_no_thread_behind(
+def test_an_import_only_kernel_compile_leaves_no_thread_behind(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """NVML leaves a driver thread (driver 580) and a compile has a watcher thread: an
@@ -300,8 +300,8 @@ def test_an_import_only_fusion_compile_leaves_no_thread_behind(
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
     monkeypatch.setenv("PYTHONPATH", str(SOURCE))
     before = set(os.listdir("/proc/self/task"))
-    line = fork_parent.expect_fusion(["0"], True, [])
-    assert line.startswith("fusion compile started by child")
+    line = fork_parent.expect_kernels(["0"], [])
+    assert line.startswith("kernel compiles started by child")
     assert set(os.listdir("/proc/self/task")) == before
     (child,) = fork_parent._COMPILERS
     assert child.wait(timeout=120) == 0

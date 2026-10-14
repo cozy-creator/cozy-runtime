@@ -11,14 +11,14 @@ import pytest
 from cozy_runtime.internal import (
     attention,
     attention_kitchen_sol,
-    attention_producer,
     attention_sol,
+    producers,
 )
 from cozy_runtime.internal import attention_upstream as upstream
 from cozy_runtime.internal.encoding import DeviceFacts
 
 DENSE = "sageattention3-fp4-fixed-means"
-HYBRID = "kitchen-sol-producer-fp4-fixed-means-shared-qkv"
+HYBRID = "kitchen-sol-fp4-fixed-means"
 
 
 @pytest.mark.parametrize("degree", [1, 2, 4, 7, 8])
@@ -37,7 +37,7 @@ def test_explicit_dense_selector_installs_on_real_diffusers_sites(degree: int) -
     selected = attention.install([resolved], roots, degree=degree, device=device)
     assert selected.hosts == {"fl2va_dit": {DENSE: 1}}
     assert attention.observed(roots).hosts == selected.hosts
-    assert not isinstance(site.processor, attention_producer.Processor)
+    assert not isinstance(site.processor, producers.Processor)
 
 
 def test_fixed_recipe_stays_sm120_bf16_head128_only() -> None:
@@ -59,7 +59,7 @@ def test_fixed_recipe_supports_context_parallel_diffusers_registry() -> None:
         attention.admit(HYBRID, degree)
 
 
-def test_hybrid_changes_only_dense_callback_and_keeps_producer_policy(monkeypatch: Any) -> None:
+def test_hybrid_changes_only_dense_callback_and_keeps_kitchen_sparse(monkeypatch: Any) -> None:
     seen = {}
 
     def boundary(*args: Any, **options: Any) -> str:
@@ -67,11 +67,10 @@ def test_hybrid_changes_only_dense_callback_and_keeps_producer_policy(monkeypatc
         return "value"
 
     monkeypatch.setattr(attention_sol, "_attention", boundary)
-    assert attention_producer.materialized_fp4_fixed_means(1, 2, 3) == "value"
+    assert attention_kitchen_sol.forward_fp4_fixed_means(1, 2, 3) == "value"
     assert seen["dense"] is attention_kitchen_sol.dense_fp4_fixed_means
-    assert seen["sparse"] is attention_producer._missing_processor
-    assert HYBRID in attention_producer.REUSE and HYBRID in attention_producer.SHARED_QKV
-    assert attention_producer.CHUNK == 4096
+    assert seen["sparse"] is attention_kitchen_sol.sparse
+    assert seen["prefix_dense"] is attention_kitchen_sol.dense_kitchen
     assert attention_sol.dense_identity(HYBRID) == DENSE + "; sparse-prefix=kitchen-int8"
 
 

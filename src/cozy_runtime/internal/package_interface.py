@@ -19,7 +19,7 @@ import msgspec
 from cozy_runtime.author import ConformanceError, Surface, WeightsOutput
 from cozy_runtime.author._markers import IMAGE_PREPARATION_PROFILE
 from cozy_runtime.author._media import KIND_MEDIA
-from cozy_runtime.author._model import ENCODED_LEAVES, FUSION
+from cozy_runtime.author._model import ENCODED_LEAVES
 from cozy_runtime.author._model_defaults import DefaultLadder, default_ladder
 from cozy_runtime.author._signature import AssetInputValue, AssetsBinding
 from cozy_runtime.internal import canonical, invocable_interface, schema
@@ -79,7 +79,6 @@ class ModelSlot(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
     class_name: str = msgspec.field(name="class")
     component_use: dict[str, tuple[str, ...]]
     encoded_leaves: str = "refuse"
-    fusion: str = "refuse"
     default_ladder: tuple[LadderRung, ...] | msgspec.UnsetType = msgspec.UNSET
     sequence_parallel: SequenceParallel | msgspec.UnsetType = msgspec.UNSET
     #: the components this callable runs; unset means all of them
@@ -208,7 +207,6 @@ def _callable(surface: Surface) -> dict[str, Json]:
                 binding.path,
                 binding.class_key,
                 binding.encoded_leaves,
-                binding.fusion,
                 binding.components,
                 binding.sequence_parallel,
                 defaults=surface.model_defaults.get(binding.param, ()),
@@ -303,7 +301,6 @@ def model_slot(
     path: str,
     class_name: str,
     encoded_leaves: str,
-    fusion: str,
     components: Mapping[str, Sequence[str]],
     sequence_parallel: Sequence[int],
     *,
@@ -347,9 +344,6 @@ def model_slot(
         # The author's opt-in to a group lane (cr-068): the degrees the class's attention
         # shards at. Closed and optional; a slot without it is never sharded.
         doc["sequence_parallel"] = {"degrees": list(sequence_parallel)}
-    if fusion != "refuse":
-        # The fused-glue consent (h3a-015); the conservative default is the absent key.
-        doc["fusion"] = fusion
     return doc
 
 
@@ -637,12 +631,8 @@ def _validate(interface: PackageInterface, source: str) -> None:
 
 
 def _model_slot(slot: ModelSlot, name: str, source: str, path: str) -> None:
-    for consent, value, vocabulary in (
-        ("encoded_leaves", slot.encoded_leaves, ENCODED_LEAVES),
-        ("fusion", slot.fusion, FUSION),
-    ):
-        if value not in vocabulary:
-            _invalid(source, f"{path}.{consent}", "must be " + " or ".join(vocabulary))
+    if slot.encoded_leaves not in ENCODED_LEAVES:
+        _invalid(source, f"{path}.encoded_leaves", "must be " + " or ".join(ENCODED_LEAVES))
     degrees = () if slot.sequence_parallel is msgspec.UNSET else slot.sequence_parallel.degrees
     if slot.sequence_parallel is not msgspec.UNSET and (
         not degrees or list(degrees) != sorted(set(degrees))

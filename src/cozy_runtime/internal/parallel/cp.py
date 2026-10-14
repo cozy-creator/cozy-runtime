@@ -9,6 +9,7 @@ installing CP; existing accelerate wrappers on sharded components are refused.
 from __future__ import annotations
 
 import contextlib
+import re
 import threading
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -187,16 +188,12 @@ def _install_on_component(component: Any, *, degree: int, comms: CpComms) -> Non
         )
         from diffusers.models.attention_processor import Attention
 
-        attention_root = _attention_root(component)
+        attention_modules = _sharded_modules(component)
     except Exception as exc:  # version drift must be typed
         raise ContextParallelUnavailable(
             f"diffusers CP surface unavailable: {type(exc).__name__}: {exc}"
         ) from exc
     attention_classes: tuple[type, ...] = (Attention, AttentionModuleMixin)
-    # H3 builds its full packed sequence after token_refiner, then shards it at
-    # transformer_blocks.0. Giving the replicated refiner a CP config incorrectly
-    # concatenates degree copies of its text sequence inside attention. The pruned
-    # and turbo components inherit this same architecture and split boundary.
     # `ulysses_anything` is unconditional at degree > 1. H3 packs one sequence whose length
     # is whatever the caller packed -- 37,763 / 73,439 / 106,932 / 109,308 rows measured --
     # and diffusers' plain sharder asserts "Tensor size along dimension to be sharded must
@@ -207,7 +204,7 @@ def _install_on_component(component: Any, *, degree: int, comms: CpComms) -> Non
     # ring 1 -- and ring attention is never installed here.
     cp_config = ContextParallelConfig(ulysses_degree=int(degree), ulysses_anything=True)
     config = ParallelConfig(context_parallel_config=cp_config)
-    for module in attention_root.modules():
+    for module in attention_modules:
         if not isinstance(module, attention_classes):
             continue
         processor = getattr(module, "processor", None)
@@ -231,35 +228,36 @@ def _install_on_component(component: Any, *, degree: int, comms: CpComms) -> Non
     mesh = _GroupMesh(comms, int(degree), int(comms.rank))
     config.setup(int(comms.rank), int(degree), device, mesh=mesh)
     component._parallel_config = config
-    for module in attention_root.modules():
+    for module in attention_modules:
         if not isinstance(module, attention_classes):
             continue
         processor = getattr(module, "processor", None)
         if processor is not None and hasattr(processor, "_parallel_config"):
             processor._parallel_config = config
-    from cozy_runtime.internal.attention_producer import install_parallel_rotary
-
-    install_parallel_rotary(component)
     apply_context_parallel(component, cp_config, getattr(component, _CP_PLAN_ATTR))
 
 
-def _attention_root(component: Any) -> Any:
-    try:
-        from diffusers.models.transformers.transformer_minimax_h3 import (
-            MiniMaxH3Transformer3DModel,
-        )
-    except ModuleNotFoundError as exc:
-        if exc.name != "diffusers.models.transformers.transformer_minimax_h3":
-            raise
-        # Older Diffusers packages do not define H3. Their other architectures
-        # still use their existing CP path; absence of this optional model is not
-        # absence of context parallelism.
-        return component
-    return (
-        component.transformer_blocks
-        if isinstance(component, MiniMaxH3Transformer3DModel)
-        else component
-    )
+def _sharded_modules(component: Any) -> list[Any]:
+    """The modules that run on sharded tensors: those under each `_cp_plan` entry that splits
+    a module's INPUTS (`blocks.0`/`blocks.*` name the list), or the whole component when the
+    plan splits its own. A module before the split sees the replicated sequence: H3 shards
+    its packed sequence at `transformer_blocks.0`, after `token_refiner`, whose attention given
+    a CP config would concatenate degree copies of its text."""
+    from diffusers.models._modeling_parallel import ContextParallelInput
+
+    roots: dict[int, Any] = {}
+    for key, inputs in getattr(component, _CP_PLAN_ATTR).items():
+        if isinstance(inputs, dict) and any(
+            isinstance(value, ContextParallelInput) and not value.split_output
+            for value in inputs.values()
+        ):
+            path = re.sub(r"(^|\.)(0|\*)$", "", key)
+            root = component.get_submodule(path) if path else component
+            roots[id(root)] = root
+    modules: dict[int, Any] = {}
+    for root in roots.values() or (component,):
+        modules.update((id(module), module) for module in root.modules())
+    return list(modules.values())
 
 
 def _refuse_if_forward_wrapped(components: list[tuple[str, Any]]) -> None:

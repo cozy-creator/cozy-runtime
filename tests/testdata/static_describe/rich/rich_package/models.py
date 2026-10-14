@@ -27,7 +27,7 @@ class BaseModel(Model[Pipeline], encoded_leaves="accept"):
 
 
 @sequence_parallel(degrees=(2, 4))
-class RenderModel(BaseModel, fusion="accept"):
+class RenderModel(BaseModel):
     @uses_components("dit", "vae")
     def render(self, state: Any, *, on_step: Any) -> Any:
         return None

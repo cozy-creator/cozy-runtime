@@ -256,7 +256,7 @@ sequence, and a CLOSED vocabulary — `msgspec.Struct` classes with their
 `tag`/`tag_field`/`kw_only` keywords and `msgspec.field(name=…)`, `Annotated` carrying
 `msgspec.Meta`/`AssetBound`/`ModelDefault`/`Preflight`, `Literal`, `Enum`/`IntEnum`/`StrEnum`,
 unions, `list`/`tuple`/`dict`/`Sequence`/`Mapping`/`Set`, the asset classes, `Assets[...]` with
-`AssetLimits`, `Tree`, `ModelArtifact`, `Model` subclasses (`encoded_leaves=`/`fusion=`,
+`AssetLimits`, `Tree`, `ModelArtifact`, `Model` subclasses (`encoded_leaves=`,
 `@sequence_parallel`, `@uses_components`), and `@app.entrypoint`/`@app.job` with literal
 keywords and `WeightsOutput(...)` tuples. Explicit function registrations and async
 `@invocable` exports use the same schema builders, with their declared capabilities and
@@ -358,7 +358,7 @@ describe disagrees with them. `package_interface_digest` is SHA-256 over those c
     uv run --locked cozy-runtime --conformance describe   # + import the app here; equal or refuse
     uv run python checks/architecture.py # AST import/dependency scans over the boundaries
     uv run pytest                        # the end-to-end suite: two real runs, no mocks
-    uv run --group diffusers pytest tests/test_fusion.py   # + the Diffusers integrations
+    uv run --group diffusers pytest tests/test_package_extensions.py   # + the Diffusers integrations
 
 ### Per-package uv environments
 

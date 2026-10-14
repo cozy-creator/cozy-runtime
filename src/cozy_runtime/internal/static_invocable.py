@@ -66,7 +66,6 @@ def build(reader: Reader, registration: Registration) -> dict[str, Json]:
                     f"{registration.name}.models.{arg.arg}",
                     model.name,
                     model.encoded_leaves,
-                    model.fusion,
                     model.components,
                     model.sequence_parallel,
                     defaults=registration.model_defaults.get(arg.arg, ()),

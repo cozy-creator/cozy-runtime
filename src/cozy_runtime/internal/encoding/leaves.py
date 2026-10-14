@@ -25,8 +25,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from cozy_runtime.author.kernels import PreQuantized as PreQuantized
-from cozy_runtime.author.kernels import readable
+from cozy_runtime.author.kernels import PreQuantized, readable
 from cozy_runtime.internal.encoding.formats import (
     E4M3_MAX,
     E8M0_BIAS,

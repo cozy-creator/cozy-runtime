@@ -271,7 +271,7 @@ def test_install_keys_each_component_and_never_fails_a_load() -> None:
             device=device,
             world=1,
             sealed={},
-            fusion=None,
+            plan=None,
         )
 
     model = Encoder.for_test()
