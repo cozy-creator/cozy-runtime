@@ -1,0 +1,1 @@
+A block whose component moves to the sub-block grain while the block is under way (a stage placed again at its block floor from inside that block) runs at the new grain instead of acquiring from the weight set the move closed: run 5894's `tensorfs.plane.Closed`. A spared component stays spared until its common region is leased again.
