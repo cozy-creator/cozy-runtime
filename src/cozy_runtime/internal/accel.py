@@ -477,12 +477,35 @@ def allocated(torch: Any, kind: str, device: Any = None) -> int:
     return int(torch.cuda.memory_allocated(device))
 
 
+#: The high-water marks (allocated, reserved) kept across a section measured on its own
+#: (`hold_peak`): the attempt around it still sees them.
+_HELD = [0, 0]
+
+
 def reset_peak(torch: Any, kind: str) -> None:
     """Zero the high-water mark, so the next `peak_allocated` measures ONE attempt."""
     if kind == "mps":
         raise AcceleratorUnsupported("mps", "reset_peak")
+    _HELD[:] = [0, 0]
     if kind == "cuda":
         torch.cuda.reset_peak_memory_stats()
+
+
+def hold_peak(torch: Any, kind: str) -> None:
+    """Keep the high-water marks so far for `peak_allocated`/`peak_reserved` and zero torch's:
+    what runs next is measured on its own (`section_peak`)."""
+    _HELD[:] = [peak_allocated(torch, kind), peak_reserved(torch, kind)]
+    torch.cuda.reset_peak_memory_stats()
+
+
+def drop_peak(torch: Any, kind: str) -> None:
+    """Forget the high-water mark since `hold_peak`: that section failed."""
+    torch.cuda.reset_peak_memory_stats()
+
+
+def section_peak(torch: Any, kind: str) -> int:
+    """The high-water mark since `hold_peak`."""
+    return int(torch.cuda.max_memory_allocated())
 
 
 def peak_allocated(torch: Any, kind: str) -> int:
@@ -490,7 +513,7 @@ def peak_allocated(torch: Any, kind: str) -> int:
     attempt's activations from, which the live figure structurally cannot give."""
     if kind == "mps":
         raise AcceleratorUnsupported("mps", "peak_allocated")
-    return int(torch.cuda.max_memory_allocated())
+    return max(int(torch.cuda.max_memory_allocated()), _HELD[0])
 
 
 def peak_reserved(torch: Any, kind: str) -> int:
@@ -498,7 +521,7 @@ def peak_reserved(torch: Any, kind: str) -> int:
     the segments torch held for them, which is what a stage takes from the device."""
     if kind == "mps":
         raise AcceleratorUnsupported("mps", "peak_reserved")
-    return int(torch.cuda.max_memory_reserved())
+    return max(int(torch.cuda.max_memory_reserved()), _HELD[1])
 
 
 #: This process's own cache releases that returned something, by the function that asked:
