@@ -27,7 +27,9 @@ from cozy_runtime.author import (  # noqa: E402
 from cozy_runtime.author import kernels as author_kernels  # noqa: E402
 from cozy_runtime.author._attention import _PRODUCERS, _close, _request  # noqa: E402
 from cozy_runtime.author.kernels import (  # noqa: E402
+    ROWWISE_FP8,
     KernelsUnavailable,
+    PreQuantized,
     TritonEntry,
     TritonKernels,
 )
@@ -37,6 +39,10 @@ from cozy_runtime.internal import (  # noqa: E402
     kernel_cache,
     kernel_compile,
     triton_kernels,
+)
+from cozy_runtime.internal.encoding.leaves import (  # noqa: E402
+    RowwiseNativeLeaf,
+    quantize_activation_rowwise,
 )
 
 BASE = "kitchen-sol-fp4-fixed-means"
@@ -204,3 +210,22 @@ def test_a_kernel_set_builds_at_boot_and_launches_without_compiling(
         assert torch.equal(out, x * factor)
     with pytest.raises(KernelsUnavailable, match="not compiled"):
         launch(_scale_kernel, (3,), x, torch.empty_like(x), 300, 5, 128)
+
+
+def test_a_shared_operand_gives_the_leaf_its_own_bits_and_hooks_the_tensor() -> None:
+    """A fused kernel's `PreQuantized` operand is the rowwise leaf's own quantization: the
+    GEMM sees the same bits, and a forward hook still receives the original tensor."""
+    torch.manual_seed(931)
+    weight = torch.randn(128, 64, dtype=torch.bfloat16) * 0.1
+    data, scale = quantize_activation_rowwise(torch, weight)
+    linear = torch.nn.Linear(64, 128, bias=False, dtype=torch.bfloat16)
+    leaf = RowwiseNativeLeaf("fp8-rowwise/1").leaf(
+        torch, {"data": data, "scale": scale}, linear, torch.bfloat16
+    )
+    seen: list[Any] = []
+    leaf.register_forward_hook(lambda _module, args, _out: seen.append(args[0]))
+    hidden = torch.randn(1, 5, 64, dtype=torch.bfloat16)
+    operand = PreQuantized(*quantize_activation_rowwise(torch, hidden), tuple(hidden.shape))
+    assert leaf.provider == ROWWISE_FP8
+    assert torch.equal(leaf(hidden, prequantized=operand), leaf(hidden))
+    assert len(seen) == 2 and all(tensor is hidden for tensor in seen)
