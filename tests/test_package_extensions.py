@@ -72,6 +72,10 @@ class State:
         self.closed = True
 
 
+def _closed(state: object) -> bool:
+    return isinstance(state, State) and state.closed
+
+
 def _produce(call: ProducerCall, hidden: Any, rotary: Any = None, mask: Any = None) -> Any:
     call.state.calls.append(f"{call.component}/{call.path}@{call.layout.step}")
     call.served("test-producer")
@@ -167,11 +171,10 @@ def test_a_follower_attempt_holds_states_until_its_holder_closes_them(
     held: dict[str, Any] = {}
     with _request(held):
         first = producer.request_state()
-    assert isinstance(first, State)
     with _request(held):
-        assert producer.request_state() is first and not first.closed
+        assert producer.request_state() is first and not _closed(first)
     _close(held)
-    assert first.closed and not held and producer.request_state() is None
+    assert _closed(first) and not held and producer.request_state() is None
 
 
 def test_a_kernel_set_is_keyed_by_its_sources_and_entries() -> None:

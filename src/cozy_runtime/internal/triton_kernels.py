@@ -227,10 +227,10 @@ def load(kernels: TritonKernels, *, device: object) -> Launch:
     here. Waits for the key's live build by its measured progress; a build that ended without
     publishing is typed. Idempotent per (process, set, device)."""
     _require_triton()
-    device = torch.device(device)
-    if device.type != "cuda":
-        raise KernelsUnavailable("kernels_absent", f"{kernels.name} serves CUDA, not {device}")
-    index = device.index or 0
+    target = torch.device(device)
+    if target.type != "cuda":
+        raise KernelsUnavailable("kernels_absent", f"{kernels.name} serves CUDA, not {target}")
+    index = target.index or 0
     if (kernels.name, index) in _LOADED:
         return _LOADED[(kernels.name, index)]
     major, minor = torch.cuda.get_device_capability(index)
