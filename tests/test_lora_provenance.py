@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import json
 import struct
 import time
-from fractions import Fraction
 from pathlib import Path
 
 import msgspec
@@ -96,27 +94,5 @@ def test_effective_checkpoint_and_source_keep_exact_admitted_base(tmp_path: Path
             assert refused.code == "model_artifact_binding"
             with pytest.raises(Exception, match="granted|admitted|bound"):
                 execution.client.source(other.checkpoint_ref)
-        # H3's completed context carries the renderer's checkpoint identity. The native
-        # context codec must preserve distinct effective model selections for both stacks.
-        pytest.importorskip("diffusers")
-        from cozy_runtime.models.minimax_h3.continuation import (
-            AVContext,
-            decode_context,
-            encode_context,
-        )
-
-        contexts = [
-            AVContext(
-                torch.zeros(1, 24, 7, 2, 4),
-                torch.zeros(80, 32),
-                Fraction(0),
-                json.dumps({"model_manifest": selected.checkpoint_ref, "turbo_lora_manifest": ""}),
-            )
-            for selected in (model, other)
-        ]
-        preserved = [decode_context(encode_context(context)).provenance for context in contexts]
-        assert preserved[0] != preserved[1]
-        assert json.loads(preserved[0])["model_manifest"] == positive.manifest.digest
-        assert json.loads(preserved[1])["model_manifest"] == negative.manifest.digest
     finally:
         registry.unload_all()

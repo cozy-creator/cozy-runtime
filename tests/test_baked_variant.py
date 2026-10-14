@@ -1,10 +1,11 @@
 """Baked LoRA bytes are a variant of a layout the machine keeps beside its stored bytes
 (`weights.attach/1`): a replacement executor maps them, copies nothing to the GPU and bakes
 nothing. Real planes, the executor's own exchange, and the custody stand-in of
-`test_device_tier`. A prepared PEFT graph, and H3's turbo overlay through its hooks."""
+`test_device_tier`. A prepared PEFT graph, and a model's consumer overlay through its hooks."""
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -21,16 +22,12 @@ from cozy_runtime.author import Artifact, Config, Loader  # noqa: E402
 from cozy_runtime.internal import accel, lora_composition, plane  # noqa: E402
 from cozy_runtime.internal.fill import Checkpoint, tensor_schema_of  # noqa: E402
 from cozy_runtime.internal.weights import PlaneBackend, WeightResidency, Weights  # noqa: E402
-from cozy_runtime.models.minimax_h3.turbo import (  # noqa: E402
-    ATTENTION_KWARG,
-    OVERLAY_KWARG,
-    TURBO_BANK,
-)
 from test_device_tier import Custody, executor_with  # noqa: E402
-from test_h3_turbo_bake import _dit, _inputs, _overlay  # noqa: E402
 from test_lora_bake_plane import Pipeline, expected  # noqa: E402
 from test_lora_composition import Value, compose, fixture, model  # noqa: E402
+from test_lora_consumer_bake import _dit, _inputs, _overlay  # noqa: E402
 from test_lora_peft import TinyModel  # noqa: E402
+from testdata.consumer_lora import armed  # noqa: E402
 
 pytestmark = [
     pytest.mark.skipif(not plane.sharing(), reason="a TensorFS that shares GPU regions"),
@@ -142,8 +139,8 @@ def _stored(store: Any, root: Path, name: str, module: Any) -> Checkpoint:
     )
 
 
-def test_a_replacement_attaches_blocks_baked_with_h3s_turbo_overlay(tmp_path: Path) -> None:
-    """H3's shape: the overlay is a weight set of its own and the DiT's hooks bake its factors
+def test_a_replacement_attaches_blocks_baked_with_a_consumer_overlay(tmp_path: Path) -> None:
+    """A turbo overlay's shape: a weight set of its own whose factors the DiT's hooks bake
     into the DiT's blocks. Those blocks are named by the overlay's layout and scale, so the
     replacement maps them baked; a base forward refills them with the stored bytes."""
     torch.manual_seed(26)
@@ -153,7 +150,7 @@ def test_a_replacement_attaches_blocks_baked_with_h3s_turbo_overlay(tmp_path: Pa
             parameter.normal_(0, 0.1)
     store = tensorfs.Store.init(tmp_path / "store")
     dit_at = _stored(store, tmp_path, "fl2va_dit", reference)
-    lora_at = _stored(store, tmp_path, "fl2va_turbo", overlay)
+    lora_at = _stored(store, tmp_path, "fl2va_overlay", overlay)
     reference, overlay = reference.to("cuda"), overlay.to("cuda")
     inputs = _inputs("cuda")
     backends: list[Any] = []
@@ -164,17 +161,17 @@ def test_a_replacement_attaches_blocks_baked_with_h3s_turbo_overlay(tmp_path: Pa
 
     class Lora:
         def __init__(self, config: Config) -> None:
-            self.components = {"fl2va_turbo": _overlay("cpu")}
+            self.components = {"fl2va_overlay": _overlay("cpu")}
 
-    def forward(model: Any, selector: dict[str, Any]) -> list[Any]:
-        with torch.no_grad():
-            return [t.float() for t in model(**inputs, attention_kwargs=selector)]
+    def forward(model: Any, adapter: Any) -> list[Any]:
+        with torch.no_grad(), nullcontext() if adapter is None else armed(model, adapter):
+            return [t.float() for t in model(**inputs)]
 
     def served(weights: Weights) -> Any:
         dit_backend, dit = construct(weights, dit_at, "fl2va_dit", Dit)
-        lora_backend, lora = construct(weights, lora_at, "fl2va_turbo", Lora)
+        lora_backend, lora = construct(weights, lora_at, "fl2va_overlay", Lora)
         backends.extend([dit_backend, lora_backend])
-        names = ("fl2va_dit", "fl2va_turbo")
+        names = ("fl2va_dit", "fl2va_overlay")
         components = {**dit_backend.components, **lora_backend.components}
         residency = WeightResidency(weights, components, {"run": names})
         blocks = [r for r in components["fl2va_dit"].regions if r.bakes]
@@ -182,15 +179,14 @@ def test_a_replacement_attaches_blocks_baked_with_h3s_turbo_overlay(tmp_path: Pa
         def run(turbo: bool) -> list[Any]:
             residency.admit("run", names)
             try:
-                selector = {ATTENTION_KWARG: TURBO_BANK, OVERLAY_KWARG: lora} if turbo else {}
-                return forward(dit, selector)
+                return forward(dit, lora if turbo else None)
             finally:
                 residency.release("run", names)
 
         return SimpleNamespace(run=run, blocks=blocks, layout=components["fl2va_dit"].ws.digest)
 
-    turbo_ref = forward(reference, {ATTENTION_KWARG: TURBO_BANK, OVERLAY_KWARG: overlay})
-    base_ref = forward(reference, {})
+    turbo_ref = forward(reference, overlay)
+    base_ref = forward(reference, None)
     custody = Custody()
     try:
         filler, _ = executor_with(custody, tmp_path / "a")

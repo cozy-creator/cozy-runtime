@@ -428,8 +428,16 @@ def test_repeated_group_pin_requires_every_scoped_prepared_site() -> None:
     assert not attention._is_selected(defaults, roots, "base/dit=sdpa")
 
 
-def _h3_roots(dtype: str) -> dict[str, Any]:
-    """Real Diffusers attention sites under H3's component names, 128-dimension heads."""
+#: A DiT-only attention preference, as a package's `choose_attention` states one (H3's).
+DIT_PREFERENCE = ("sol-attn", "sageattention", "flash-attn3", "sdpa")
+
+
+def prefer_for_dits(context: AttentionContext) -> tuple[str, ...] | None:
+    return DIT_PREFERENCE if context.component.endswith("_dit") else None
+
+
+def _dit_roots(dtype: str) -> dict[str, Any]:
+    """Real Diffusers attention sites under two DiTs' and two VAEs' names, 128-dim heads."""
     torch = pytest.importorskip("torch")
     from diffusers.models.transformers.transformer_wan import WanAttention, WanAttnProcessor
 
@@ -447,41 +455,25 @@ def _cuda(sm: int) -> DeviceFacts:
     return DeviceFacts(kind="cuda", name=f"sm{sm}", sm=sm, driver="", configuration="", index=0)
 
 
-def test_h3_preserves_other_device_preferences_and_never_defaults_dense_fp8() -> None:
-    pytest.importorskip("torch")
-    pytest.importorskip("diffusers")
-    from cozy_runtime.models.minimax_h3.model import DIT_ATTENTION, H3Model, H3TurboBase
-
-    assert DIT_ATTENTION == ("sol-attn", "sageattention", "flash-attn3", "sdpa")
+def test_no_device_defaults_to_dense_fp8() -> None:
     fp8 = {"flash-attn3-fp8", "flashinfer-bf16-fp8"}
-    assert not fp8 & set(DIT_ATTENTION)
     for device in (_device(), _cuda(90), _cuda(100)):
         assert not fp8 & {candidate.name for candidate in attention.for_device(device)}
-    for model_type in (H3Model, H3TurboBase):
-        model = object.__new__(model_type)
-        for component in ("fl2va_dit", "ref2va_dit", "audio_vae", "video_vae", "text_encoder"):
-            context = AttentionContext(
-                component, "0", "cuda", "H100", 90, "bfloat16", 128, 4, (), "flash-attn3", ""
-            )
-            expected = DIT_ATTENTION if component.endswith("_dit") else None
-            assert model.choose_attention(context) == expected
 
 
 @pytest.mark.parametrize(("sm", "served"), [(90, "flash-attn3"), (100, "sdpa")])
-def test_h3_dits_fall_through_when_sol_and_sage_cannot_serve(sm: int, served: str) -> None:
+def test_dits_fall_through_when_sol_and_sage_cannot_serve(sm: int, served: str) -> None:
     """sm90 with Sol and Sage not compiled here walks to FA3; sm100, where FA3's hopper build
     has no device code, walks to SDPA. Each earlier preference says why it was skipped."""
     pytest.importorskip("torch")
     pytest.importorskip("diffusers")
-    from cozy_runtime.models.minimax_h3.model import H3Model
-
-    roots = _h3_roots("bfloat16")
+    roots = _dit_roots("bfloat16")
     skipped: dict[str, str] = {}
     applied = attention.install(
         _ready(*[c.name for c in attention.for_device(_cuda(sm))]),
         roots,
         device=_cuda(sm),
-        choose=object.__new__(H3Model).choose_attention,
+        choose=prefer_for_dits,
         skipped=skipped,
     )
     assert applied.hosts == {name: {served: 1} for name in roots}
@@ -491,14 +483,10 @@ def test_h3_dits_fall_through_when_sol_and_sage_cannot_serve(sm: int, served: st
     assert not {name for name in skipped if "fp8" in name}
 
 
-def test_h3_preference_records_skips_through_real_cpu_selection() -> None:
+def test_a_preference_records_skips_through_real_cpu_selection() -> None:
     pytest.importorskip("torch")
     pytest.importorskip("diffusers")
-    from cozy_runtime.models.minimax_h3.model import H3Model
-
-    applied = attention.select(
-        _device(), _h3_roots("float32"), choose=object.__new__(H3Model).choose_attention
-    )
+    applied = attention.select(_device(), _dit_roots("float32"), choose=prefer_for_dits)
     assert applied.totals() == {"sdpa": 4}
     assert applied.skipped is not None
     assert {"sol-attn", "sageattention", "flash-attn3"} <= set(applied.skipped)
@@ -509,23 +497,22 @@ def test_h3_preference_records_skips_through_real_cpu_selection() -> None:
     ("offered", "dense"),
     [(("sageattention", "flash-attn3"), "sageattention"), (("flash-attn3",), "flash-attn3")],
 )
-def test_sol_recomputes_dense_rows_with_the_next_h3_preference(
+def test_sol_recomputes_dense_rows_with_the_next_preference(
     offered: tuple[str, ...], dense: str
 ) -> None:
-    """Sol's dense steps, prefix and paths run on the kernel after it in H3's preference, not
-    the ranked floor (run 1565: SDPA at 35 s/step where Sage takes ~24 s). An unready Sage is
-    recorded as skipped, so a later request boundary re-selects onto it."""
+    """Sol's dense steps, prefix and paths run on the kernel after it in the model's
+    preference, not the ranked floor (run 1565: SDPA at 35 s/step where Sage takes ~24 s). An
+    unready Sage is recorded as skipped, so a later request boundary re-selects onto it."""
     pytest.importorskip("torch")
     pytest.importorskip("diffusers")
     from cozy_runtime.internal import attention_sol
-    from cozy_runtime.models.minimax_h3.model import H3Model
 
     skipped: dict[str, str] = {}
     applied = attention.install(
         _ready("sol-attn", *offered, "sdpa"),
-        _h3_roots("bfloat16"),
+        _dit_roots("bfloat16"),
         device=_cuda(90),
-        choose=object.__new__(H3Model).choose_attention,
+        choose=prefer_for_dits,
         skipped=skipped,
     )
     assert applied.hosts["ref2va_dit"] == {"sol-attn": 1}
@@ -533,27 +520,26 @@ def test_sol_recomputes_dense_rows_with_the_next_h3_preference(
     assert ("sageattention" in skipped) == (dense != "sageattention")
 
 
-def test_a_pin_overrides_the_h3_preference() -> None:
+def test_a_pin_overrides_the_preference() -> None:
     pytest.importorskip("torch")
     pytest.importorskip("diffusers")
-    from cozy_runtime.models.minimax_h3.model import H3Model
-
-    policy = object.__new__(H3Model)
     consulted: list[str] = []
 
     def choose(context: AttentionContext) -> Any:
         consulted.append(context.component)
-        return policy.choose_attention(context)
+        return prefer_for_dits(context)
 
     ready = _ready("flash-attn3", "sdpa")
     scoped = attention.install(
-        ready, _h3_roots("bfloat16"), "ref2va_dit=sdpa", device=_cuda(90), choose=choose
+        ready, _dit_roots("bfloat16"), "ref2va_dit=sdpa", device=_cuda(90), choose=choose
     )
     assert scoped.hosts["ref2va_dit"] == {"sdpa": 1}
     assert scoped.hosts["fl2va_dit"] == {"flash-attn3": 1}
     assert "ref2va_dit" not in consulted
     consulted.clear()
-    whole = attention.install(ready, _h3_roots("bfloat16"), "sdpa", device=_cuda(90), choose=choose)
+    whole = attention.install(
+        ready, _dit_roots("bfloat16"), "sdpa", device=_cuda(90), choose=choose
+    )
     assert whole.totals() == {"sdpa": 4} and not consulted
 
 

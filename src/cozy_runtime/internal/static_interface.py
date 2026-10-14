@@ -4,7 +4,7 @@ INVARIANT (decision #713 — package code is UNTRUSTED): this module never impor
 compiles or evaluates a package module. No `importlib`, no `sys.path`, no `exec`/`eval`/
 `compile`, no annotation evaluation, no module top level. It reads text, parses it with
 `ast`, follows the package's own module-scope import graph (plus cozy-runtime's own source
-for `cozy_runtime.derive.*` and `cozy_runtime.models.*`), folds constants with a shared
+for `cozy_runtime.derive.*`), folds constants with a shared
 evaluator over literal and arithmetic nodes and values of the package's committed JSON assets
 (`author.data_values`), and translates every interface-bearing declaration into real types built
 from the CLOSED author vocabulary — `msgspec.defstruct`, `enum.Enum`, `typing.Literal`/
@@ -92,8 +92,8 @@ class Module:
     tree: ast.Module
     is_package: bool
     trusted: bool
-    """cozy-runtime's own derive/model-library source: followed for types and constants,
-    never scanned for registrations."""
+    """cozy-runtime's own derive source: followed for types and constants, never scanned
+    for registrations."""
     bindings: dict[str, ast.stmt] = field(default_factory=dict)
 
     @property
@@ -169,7 +169,7 @@ _VOCAB_MODULES = {
     "enum": "enum",
     "cozy_runtime.author": "author",
 }
-_TRUSTED_ROOTS = ("cozy_runtime.derive", "cozy_runtime.models")
+_TRUSTED_ROOTS = ("cozy_runtime.derive",)
 
 
 def _trusted_module(name: str) -> bool:

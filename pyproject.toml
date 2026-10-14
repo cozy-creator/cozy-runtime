@@ -30,6 +30,18 @@ dev = [
     # CI partitions this unchanged suite across independent delegated runners.
     "pytest-split>=0.11.0",
 ]
+# The Diffusers integrations (fused glue, attention producers, Ulysses CP, LoRA composition)
+# and their tests: `uv run --group diffusers pytest ...`. Packages declare their own.
+diffusers = [
+    "peft>=0.20,<0.21",
+    "diffusers>=0.40.0",
+    "transformers>=5.16.1",
+    "torch>=2.13",
+    "torchvision>=0.28",
+    "numpy>=1.26",
+    "safetensors>=0.8.0",
+    "tokenizers>=0.23.1",
+]
 
 [project.scripts]
 cozy-runtime = "cozy_runtime.cli.main:main"
@@ -62,9 +74,8 @@ packages = ["src/cozy_runtime"]
 
 [tool.uv]
 package = true
-# The historical SDXL development corpus and MiniMax H3 keep independently locked
-# dependency cohorts; their published requirements describe minimum versions only.
-conflicts = [[{ extra = "corpus" }, { extra = "minimax-h3" }]]
+# The historical SDXL development corpus keeps its own locked dependency cohort.
+conflicts = [[{ extra = "corpus" }, { group = "diffusers" }]]
 
 # Read only on the COZY_RUNTIME_BUILD_KERNELS=1 wheel build; the root CMakeLists.txt is
 # the reviewed kernels build (static cudart, abi3, the upstream fleet arch policy).
@@ -139,18 +150,6 @@ module = ["cozy_runtime.internal.derive"]
 warn_unused_ignores = false
 
 [project.optional-dependencies]
-# Builtins are imported only on explicit use. Worker images keep ownership of the
-# compatible Torch/CUDA family; this extra does not pin a CUDA wheel or index.
-minimax-h3 = [
-    "peft>=0.20,<0.21",
-    "diffusers>=0.40.0",
-    "transformers>=5.16.1",
-    "torch>=2.13",
-    "torchvision>=0.28",
-    "numpy>=1.26",
-    "safetensors>=0.8.0",
-    "tokenizers>=0.23.1",
-]
 assessment = ["cozy-eval>=0.7"]
 # The derivation harness and the serving executor. Corpus venvs install this.
 derive = ["torch>=2.13"]

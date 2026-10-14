@@ -42,8 +42,8 @@ from testdata.parallel_calls import (  # noqa: E402
     collective_model,
     h3_batch,
     h3_model,
-    h3_turbo_inputs,
     hosted_model,
+    lora_forward,
     plane_residency,
     prepared,
     spread_model,
@@ -131,16 +131,7 @@ def test_leader_calls_real_follower_executors_twice(tmp_path: Path, degree: int,
         with torch.no_grad():
             batches = [h3_batch(), h3_batch(mixed_lengths=True)]
             expected = [
-                (
-                    batch,
-                    model.dit(
-                        **(
-                            h3_turbo_inputs(batch, model.turbo_overlay)
-                            if kind == "h3-lora"
-                            else batch
-                        )
-                    ),
-                )
+                (batch, lora_forward(model, batch) if kind == "h3-lora" else model.dit(**batch))
                 for batch in batches
             ]
     spool = tmp_path / "attempt-a"
@@ -154,8 +145,6 @@ def test_leader_calls_real_follower_executors_twice(tmp_path: Path, degree: int,
         if is_h3
         else {"block": model.block, "overlay": model.overlay, "spare": model.spare}
     )
-    if kind == "h3-lora":
-        roots["turbo_overlay"] = model.turbo_overlay
     leader.backend = prepared(roots)
     try:
         group.spawn()
@@ -540,9 +529,9 @@ def test_a_placeable_component_runs_on_its_follower(tmp_path: Path, degree: int)
 
 
 @pytest.mark.parametrize("degree", [2, 4])
-def test_h3_vae_clips_spread_over_the_group_equal_one_rank(tmp_path: Path, degree: int) -> None:
-    """Each temporal clip decodes on some rank from its own latent window; rank 0 cross-fades
-    them in order. Encode clips spread the same way. Both must equal a single-rank run."""
+def test_codec_clips_spread_over_the_group_equal_one_rank(tmp_path: Path, degree: int) -> None:
+    """Each temporal clip decodes on some rank from its own latent window; rank 0 joins them
+    in order. Encode clips spread the same way. Both must equal a single-rank run."""
     pytest.importorskip("diffusers")
     fixture = Path(__file__).parent / "testdata" / "parallel_calls.py"
 
@@ -559,7 +548,7 @@ def test_h3_vae_clips_spread_over_the_group_equal_one_rank(tmp_path: Path, degre
     # 33 latent frames are 7 clips: rounds of `degree`, the last one partial.
     z = torch.randn(1, 4, 33, 2, 3, generator=torch.Generator().manual_seed(5))
     expected = model.decode(z)
-    # 56 frames pad to four 17-frame encode clips, as a 56-frame continuation window does.
+    # 56 frames are four encode clips of at most 17 frames.
     x = torch.rand(1, 3, 56, *expected.shape[-2:], generator=torch.Generator().manual_seed(6))
     moments = model.encode(x)
     ours, theirs = socket.socketpair()

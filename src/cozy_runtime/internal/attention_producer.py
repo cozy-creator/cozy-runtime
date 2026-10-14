@@ -27,6 +27,7 @@ from cozy_runtime.internal import (
 from cozy_runtime.internal.attention_ulysses import Local
 from cozy_runtime.internal.encoding import leaves
 from cozy_runtime.internal.encoding.leaves import PreQuantized
+from cozy_runtime.internal.weights import LoRASource
 
 if TYPE_CHECKING:
     from cozy_runtime.internal.attention_ulysses import PartialOptions
@@ -120,14 +121,13 @@ def rows(value: Tensor | PreQuantized, start: int, stop: int) -> Tensor | PreQua
 
 
 def shared_qkv_refusal(attn: MiniMaxH3Attention) -> str:
-    """Only known tensor-preserving hooks may share the positional operand's codes.
+    """Only known tensor-preserving hooks may share the positional operand's codes: a
+    model's LoRA hook reads the original tensor operand and adds into the output.
 
     WeightResidency wraps forward rather than registering a pre-hook. Calling the
     original modules below keeps its acquire/bind/bake/release boundary intact.
     """
     from torch.nn.modules import module as torch_module
-
-    from cozy_runtime.models.minimax_h3.turbo import _LoRAHook
 
     if torch_module._global_forward_pre_hooks or torch_module._global_forward_hooks:
         return "global-projection-hook"
@@ -136,7 +136,7 @@ def shared_qkv_refusal(attn: MiniMaxH3Attention) -> str:
             return "non-rowwise-leaf"
         if projection._forward_pre_hooks:
             return "projection-pre-hook"
-        if any(not isinstance(hook, _LoRAHook) for hook in projection._forward_hooks.values()):
+        if any(not isinstance(hook, LoRASource) for hook in projection._forward_hooks.values()):
             return "unknown-projection-hook"
     return ""
 
@@ -522,9 +522,9 @@ def validate(module: object) -> None:
         raise ValueError("Kitchen producer does not replace an unknown H3 processor")
     for projection in (module.to_q, module.to_k, module.to_v):
         # Weight-plane hooks are pre-existing Runtime custody; author forward hooks must
-        # explicitly support replay/chunks. Turbo's hook does and keeps fixed4096 rows.
+        # explicitly support replay/chunks. A model's LoRA hook adds a row-local update.
         for hook in projection._forward_hooks.values():
-            if type(hook).__name__ != "_LoRAHook":
+            if not isinstance(hook, LoRASource):
                 raise ValueError("Kitchen producer cannot replay an unknown projection hook")
 
 

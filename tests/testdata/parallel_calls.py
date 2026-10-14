@@ -20,10 +20,10 @@ from tensorfs.derived import Config as NativeConfig
 from tensorfs.derived import Derivation, Part, Target, Tensor
 from transformers.modeling_outputs import BaseModelOutputWithPast
 
-from cozy_runtime.author import Model, placeable, uses_components
+from cozy_runtime.author import AdapterRef, Model, placeable, spread, uses_components
 from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT, AttentionLayout, attention_scope
 from cozy_runtime.author._loader import census
-from cozy_runtime.internal import attention, plane
+from cozy_runtime.internal import attention, lora_composition, lora_contract, plane
 from cozy_runtime.internal.encoding import SPEC_PLAIN, DeviceFacts
 from cozy_runtime.internal.executor import Executor, _capture_seal, answer
 from cozy_runtime.internal.executor_commands import decode
@@ -33,7 +33,6 @@ from cozy_runtime.internal.seam import Channel
 from cozy_runtime.internal.weight_policy import Layout
 from cozy_runtime.internal.weights import PlaneBackend, WeightResidency, Weights
 from cozy_runtime.internal.weights_sink import weights_transaction_id
-from cozy_runtime.models.minimax_h3.vae_tiles import TileBatchedVideoVAE
 
 
 class Collective(torch.nn.Module):  # type: ignore[misc]  # torch is optional in the base checking env
@@ -266,60 +265,29 @@ class H3Infer(H3Calls):
 
 
 class H3LoRACalls(H3Calls):
-    turbo_overlay: torch.nn.Module
-
-    @uses_components("dit", "turbo_overlay")
+    @uses_components("dit")
     def compute(
         self, batch: dict[str, object], expected: tuple[torch.Tensor, torch.Tensor]
     ) -> tuple[torch.Tensor, torch.Tensor]:
         with torch.no_grad():
-            result = self.dit(**h3_turbo_inputs(batch, self.turbo_overlay))
+            result = lora_forward(self, batch)
         torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-6)
-        assert self.dit._arming is None
-        assert self.dit.proj_out.base_layer._armed is None
-        assert self.dit.audio_proj_out.base_layer._armed is None
-        return cast("tuple[torch.Tensor, torch.Tensor]", result)
+        return result
 
 
-def h3_turbo_inputs(batch: dict[str, object], overlay: torch.nn.Module) -> dict[str, object]:
-    from cozy_runtime.models.minimax_h3.turbo import ATTENTION_KWARG, OVERLAY_KWARG, TURBO_BANK
-
+def lora_forward(model: H3Calls, batch: dict[str, object]) -> tuple[Any, Any]:
+    """The DiT under its request LoRA. Text/video share the video sigma; audio uses its paired
+    sigma."""
     tags = cast("torch.Tensor", batch["token_tags"])
-    # Text/video share the video sigma; audio uses its paired sigma. No terminal
-    # origin is evaluated here, matching the ordinary H3 Turbo forward contract.
-    return {
+    inputs = {
         **batch,
         "timestep": torch.tensor([0.75, 0.25]),
         "timestep_indices": torch.where(tags == 2, 1, 0),
-        "attention_kwargs": {ATTENTION_KWARG: TURBO_BANK, OVERLAY_KWARG: overlay},
     }
+    return cast("tuple[Any, Any]", model.dit(**inputs))
 
 
 def h3_lora_model(dit: torch.nn.Module) -> H3LoRACalls:
-    from cozy_runtime.author import AdapterRef
-    from cozy_runtime.internal import lora_composition, lora_contract
-    from cozy_runtime.models.minimax_h3.turbo import TurboOverlay, TurboSchedule
-
-    dit.install_lora_consumers()
-    overlay = TurboOverlay(
-        hidden_size=16,
-        inner_dim=56 * 16,
-        ffn_dim=32,
-        num_layers=2,
-        num_refiner_layers=1,
-        video_out=2,
-        audio_out=2,
-        rank=1,
-        alpha=1,
-        schedule=TurboSchedule((0.75, 0.0), (0.25, 0.0)),
-        table_timesteps=(0.0, 0.25, 0.75),
-        table_block_keys=[(row, tag) for row in range(3) for tag in range(3)],
-        block_table_dtype=torch.float32,
-        final_table_dtype=torch.float32,
-    ).eval()
-    with torch.no_grad():
-        for parameter in overlay.parameters():
-            parameter.normal_(0, 0.1)
     paths = (
         "proj_in",
         "audio_proj_in",
@@ -352,17 +320,15 @@ def h3_lora_model(dit: torch.nn.Module) -> H3LoRACalls:
             layer = dit.get_submodule(row.target)
             layer.lora_A[row.adapter].weight.normal_(0, 0.1)
             layer.lora_B[row.adapter].weight.normal_(0, 0.1)
-    return H3LoRACalls.for_test(dit=dit, text_encoder=torch.nn.Linear(4, 4), turbo_overlay=overlay)
+    return H3LoRACalls.for_test(dit=dit, text_encoder=torch.nn.Linear(4, 4))
 
 
 def h3_model(*, adapters: bool = False) -> H3Calls:
-    from cozy_runtime.models.minimax_h3.adaln_pruned import AdaLNPrunedMiniMaxH3Transformer
+    from diffusers import MiniMaxH3Transformer3DModel
 
     torch.manual_seed(231)
-    # The served AdaLN-pruned DiT with H3's 56 heads, so every declared degree divides them.
-    dit = AdaLNPrunedMiniMaxH3Transformer(
-        table_timesteps=(0.0, 0.25, 0.75),
-        table_block_keys=[(row, tag) for row in range(3) for tag in range(3)],
+    # Diffusers' MiniMax-H3 DiT with H3's 56 heads, so every declared degree divides them.
+    dit = MiniMaxH3Transformer3DModel(
         num_attention_heads=56,
         attention_head_dim=16,
         hidden_size=16,
@@ -378,9 +344,6 @@ def h3_model(*, adapters: bool = False) -> H3Calls:
         time_embed_dim=8,
         rope_freq_dim=2,
     ).eval()
-    with torch.no_grad():
-        for table in (dit.norm_out.table, *(b.adaln_proj.table for b in dit.transformer_blocks)):
-            table.normal_()
     # Runtime's own selection: its SDPA runs through the Ulysses wrapper on sharded sites.
     attention.install(attention.available(DeviceFacts("cpu", "CPU", 0, "", "", 0)), {"dit": dit})
 
@@ -427,41 +390,47 @@ def hosted_model() -> HostedCalls:
     return HostedCalls.for_test(dit=base.dit, text_encoder=Conditioner(), vae=torch.nn.Linear(2, 2))
 
 
+class Clips(torch.nn.Module):  # type: ignore[misc]
+    """A video codec's temporal clips: each a pure call `author.spread` offers the group."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.up = torch.nn.Conv3d(4, 3, 3, padding=1)
+        self.down = torch.nn.Conv3d(3, 4, 3, padding=1)
+
+    def decode_clip(self, z: Any) -> Any:
+        return self.up(z)
+
+    def encode_clip(self, x: Any) -> Any:
+        return self.down(x)
+
+    def decode(self, z: Any) -> Any:
+        clips = ((clip,) for clip in z.split(5, dim=2))
+        return torch.cat(list(spread(self, "decode_clip", clips)), dim=2)
+
+    def encode(self, x: Any) -> Any:
+        clips = ((clip,) for clip in x.split(17, dim=2))
+        return torch.cat(list(spread(self, "encode_clip", clips)), dim=2)
+
+
 class SpreadCalls(H3Calls):
     vae: Any
 
     @uses_components("vae")
     def decode(self, z: Any) -> Any:
         with torch.no_grad():
-            return torch.cat(list(self.vae.decode_chunks(z)), dim=2)
+            return self.vae.decode(z)
 
     @uses_components("vae")
     def encode(self, x: Any) -> Any:
         with torch.no_grad():
-            return self.vae.encode(x, return_dict=False)[0].parameters
-
-
-def tiny_vae() -> Any:
-    """H3's video VAE at a few thousand parameters: the same temporal clips and cross-fade."""
-    torch.manual_seed(3)
-    return TileBatchedVideoVAE(
-        latent_channels=4,
-        block_out_channels=(8,) * 6,
-        layers_per_block=1,
-        norm_num_groups=4,
-        decoder_num_layers=1,
-        decoder_num_attention_heads=2,
-        decoder_attention_head_dim=8,
-        decoder_num_register_tokens=1,
-        decoder_ffn_mult=1,
-        latents_mean=(0.0,) * 4,
-        latents_std=(1.0,) * 4,
-    ).eval()
+            return self.vae.encode(x)
 
 
 def spread_model() -> SpreadCalls:
     base = h3_model()
-    return SpreadCalls.for_test(dit=base.dit, text_encoder=base.text_encoder, vae=tiny_vae())
+    torch.manual_seed(3)
+    return SpreadCalls.for_test(dit=base.dit, text_encoder=base.text_encoder, vae=Clips().eval())
 
 
 def h3_batch(*, mixed_lengths: bool = False) -> dict[str, Any]:
@@ -562,8 +531,6 @@ def main() -> None:
         if args.h3
         else {"block": model.block, "overlay": model.overlay, "spare": model.spare}
     )
-    if args.h3_lora:
-        roots["turbo_overlay"] = model.turbo_overlay
     executor.backend = prepared(roots, HOSTED_SIZES if args.hosted else None)
     executor.torch = torch
     executor.ready = True

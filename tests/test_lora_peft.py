@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -14,6 +15,7 @@ import tensorfs
 
 from cozy_runtime.author import (
     AdapterCompatibility,
+    AdapterRef,
     Artifact,
     Config,
     Loader,
@@ -24,12 +26,14 @@ from cozy_runtime.author import (
 from cozy_runtime.author._loader import census
 from cozy_runtime.internal import lora_composition
 from cozy_runtime.internal.fill import Checkpoint, tensor_schema_of
+from cozy_runtime.internal.lora_contract import FORMAT, Graph, Linear
 from native_weights import NativeExecution
 from test_lora_composition import compose, fixture, header
 
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("peft")
+from testdata.consumer_lora import armed, install, overlay_for  # noqa: E402
 
 
 class Pipeline:
@@ -151,97 +155,42 @@ def test_graph_cannot_bypass_a_models_adapter_opt_in(tmp_path: Path) -> None:
         )
 
 
-def test_extra_peft_preserves_real_h3_turbo_residual_and_selectable_heads() -> None:
-    pytest.importorskip("diffusers")
-    from types import SimpleNamespace
-    from cozy_runtime.author import AdapterRef
-    from cozy_runtime.internal.lora_contract import FORMAT, Graph, Linear
-    from cozy_runtime.models.minimax_h3.adaln_pruned import AdaLNPrunedMiniMaxH3Transformer
-    from cozy_runtime.models.minimax_h3.turbo import TurboOverlay, TurboSchedule
-
+def test_extra_peft_preserves_a_models_consumer_lora_residual() -> None:
+    """A request LoRA's PEFT layer wraps a linear that a model's consumer hook adapts: the hook
+    still adds inside `base_layer`, PEFT adds its own term, and neither changes the base."""
     torch.manual_seed(419)
-    times = (0.0, 0.25, 0.75)
-    keys = [(row, tag) for row in range(3) for tag in range(3)]
-    dit = AdaLNPrunedMiniMaxH3Transformer(
-        table_timesteps=times,
-        table_block_keys=keys,
-        num_attention_heads=2,
-        attention_head_dim=8,
-        hidden_size=16,
-        num_layers=1,
-        num_refiner_layers=1,
-        ffn_dim=32,
-        in_channels=2,
-        audio_in_channels=2,
-        patch_size=(1, 1, 1),
-        text_dim=4,
-        freq_dim=8,
-        time_embed_hidden_dim=16,
-        time_embed_dim=8,
-        rope_freq_dim=2,
-    ).eval()
-    dit.install_lora_consumers()
-    overlay = TurboOverlay(
-        hidden_size=16,
-        inner_dim=16,
-        ffn_dim=32,
-        num_layers=1,
-        num_refiner_layers=1,
-        video_out=2,
-        audio_out=2,
-        rank=1,
-        alpha=1,
-        schedule=TurboSchedule((0.75, 0.0), (0.25, 0.0)),
-        table_timesteps=times,
-        table_block_keys=keys,
-        block_table_dtype=torch.float32,
-        final_table_dtype=torch.float32,
-    )
+    root = torch.nn.Sequential(torch.nn.Linear(16, 16))
+    install(root, ["0"])
+    overlay = overlay_for(root, ["0"], rank=1, scale=1.0)
     with torch.no_grad():
         for parameter in overlay.parameters():
             parameter.fill_(0.125)
-    paths = ("transformer_blocks.0.attn.to_q", "proj_out", "audio_proj_out")
-    originals = {
-        path: {key: value.clone() for key, value in dit.get_submodule(path).state_dict().items()}
-        for path in paths
-    }
+    original = {key: value.clone() for key, value in root[0].state_dict().items()}
     graph = Graph(
         FORMAT,
-        tuple(Linear("ref2va_dit", path, "adapter_0", 1, 1.0, 0.5, "f32") for path in paths),
-        (AdapterRef("sha256:" + "12" * 32, 0.5, "lora", "ref2va_dit", "adapter"),),
+        (Linear("dit", "0", "adapter_0", 1, 1.0, 0.5, "f32"),),
+        (AdapterRef("sha256:" + "12" * 32, 0.5, "lora", "dit", "adapter"),),
     )
-    lora_composition.composer(graph)(SimpleNamespace(components={"ref2va_dit": dit}))
+    lora_composition.composer(graph)(SimpleNamespace(components={"dit": root}))
+    layer = root[0]
     with torch.no_grad():
-        for path in paths:
-            layer = dit.get_submodule(path)
-            layer.lora_A["adapter_0"].weight.fill_(0.25)
-            layer.lora_B["adapter_0"].weight.fill_(-0.5)
+        layer.lora_A["adapter_0"].weight.fill_(0.25)
+        layer.lora_B["adapter_0"].weight.fill_(-0.5)
     x = torch.randn(7, 16)
-    q = dit.transformer_blocks[0].attn.to_q
-    plain = torch.nn.functional.linear(
-        x, originals[paths[0]]["weight"], originals[paths[0]].get("bias")
-    )
+    plain = torch.nn.functional.linear(x, original["weight"], original["bias"])
+    factors = overlay.factors("0")
 
     def extra(layer: PeftLinear) -> Tensor:
         return layer.lora_B["adapter_0"](layer.lora_A["adapter_0"](x)) * 0.5
 
     with torch.no_grad():
-        assert torch.equal(q(x), plain + extra(q))
-        dit._engage(overlay, 0)
-        turbo = plain.clone()
-        overlay.get_submodule(paths[0]).accumulate(x, turbo)
-        assert torch.equal(q(x), turbo + extra(q))
-        for path in ("proj_out", "audio_proj_out"):
-            layer = dit.get_submodule(path)
-            expected = getattr(overlay, path)(x, 0) + extra(layer)
-            assert torch.equal(layer(x), expected)
-        dit._release()
-        assert torch.equal(q(x), plain + extra(q))
-        assert dit._arming is None
-        for path in paths:
-            layer = dit.get_submodule(path)
-            for key, before in originals[path].items():
-                assert torch.equal(layer.base_layer.state_dict()[key], before)
-        assert dit.proj_out.base_layer._armed is None
-        assert dit.audio_proj_out.base_layer._armed is None
+        assert torch.equal(layer(x), plain + extra(layer))
+        with armed(root, overlay):
+            adapted = plain + torch.nn.functional.linear(
+                torch.nn.functional.linear(x, factors.lora_down), factors.lora_up
+            )
+            assert torch.equal(layer(x), adapted + extra(layer))
+        assert torch.equal(layer(x), plain + extra(layer))
+        for key, before in original.items():
+            assert torch.equal(layer.base_layer.state_dict()[key], before)
     assert not torch.cuda.is_initialized()

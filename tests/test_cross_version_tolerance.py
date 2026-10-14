@@ -9,7 +9,7 @@ from pathlib import Path
 import msgspec
 import pytest
 
-from cozy_runtime.author import CapabilityError, ConformanceError, FileAsset
+from cozy_runtime.author import CapabilityError, FileAsset
 from cozy_runtime.author._artifacts import ModelArtifact
 from cozy_runtime.author._call_results import decode
 from cozy_runtime.author._capture import ExecutionObservation
@@ -27,7 +27,6 @@ from cozy_runtime.internal import effect_interfaces, native_interfaces
 from cozy_runtime.internal.executor import Executor
 from cozy_runtime.internal.executor_commands import CallInterface
 from cozy_runtime.internal.seam import Channel
-from cozy_runtime.models.minimax_h3.table_layout import TableLayout
 
 
 def _broker(tmp_path: Path, rows: list[dict[str, object]]) -> object:
@@ -161,26 +160,3 @@ def test_durable_requests_and_answers_cross_older_and_newer_peers(tmp_path: Path
             "content_digest": digest,
             "length": 3,
         }
-
-
-def test_h3_table_labels_from_other_writers_ignore_extras_and_default_optionals() -> None:
-    t = (1.0).hex()
-    layout = TableLayout.parse(
-        {
-            "final_normalization": [{"timestep": t, "writer": "future"}],
-            "block_modulation": [
-                {"index": 0, "timestep": t, "modality_tag": 0, "modality": "video"},
-                {"timestep": t, "modality": "text"},
-                {"timestep": t, "modality_tag": 2, "note": 1},
-            ],
-            "provenance": {"tool": "future"},
-        }
-    )
-    assert layout.block_keys == ((0, 0), (0, 1), (0, 2))
-    with pytest.raises(ConformanceError, match="modalities"):
-        TableLayout.parse(
-            {
-                "final_normalization": [{"timestep": t}],
-                "block_modulation": [{"timestep": t, "modality_tag": 0, "modality": "audio"}],
-            }
-        )

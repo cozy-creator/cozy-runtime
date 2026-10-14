@@ -15,7 +15,7 @@ from cozy_runtime.author._attention_scope import AttentionLayout, attention_scop
 from cozy_runtime.internal import attention, attention_sol  # noqa: E402
 from cozy_runtime.internal import attention_producer as producer  # noqa: E402
 from cozy_runtime.internal.encoding.leaves import PreQuantized  # noqa: E402
-from cozy_runtime.models.minimax_h3.turbo import LoRAFactors, _LoRAHook  # noqa: E402
+from testdata.consumer_lora import Arming, Hook, Overlay  # noqa: E402
 
 
 def module() -> Any:
@@ -34,21 +34,19 @@ def test_carrier_rows_are_views_of_original_payload_and_scales() -> None:
 
 
 @pytest.mark.parametrize("baked", [False, True])
-def test_original_projection_modules_keep_fixed_chunk_turbo_hooks(baked: bool) -> None:
+def test_original_projection_modules_keep_fixed_chunk_lora_hooks(baked: bool) -> None:
     count = producer.CHUNK + 65
     hidden = torch.ones(1, count, 8, dtype=torch.bfloat16)
-    factors = LoRAFactors(8, 128, 2, 0.25)
+    arming = Arming()
+    arming.overlay = Overlay({"projection": (8, 128)}, 2, 0.25)
     with torch.no_grad():
-        factors.lora_down.fill_(0.125)
-        factors.lora_up.fill_(0.125)
-    owner = SimpleNamespace(
-        _arming=SimpleNamespace(overlay=SimpleNamespace(get_submodule=lambda _: factors))
-    )
+        for parameter in arming.overlay.parameters():
+            parameter.fill_(0.125)
     projections = [torch.nn.Linear(8, 128, bias=False, dtype=torch.bfloat16) for _ in range(3)]
     with torch.no_grad():
         for projection in projections:
             projection.weight.zero_()
-            hook = _LoRAHook(owner, "projection")
+            hook = Hook(arming, "projection")
             hook._cozy_baked = baked
             projection.register_forward_hook(hook)
         expected = torch.cat([projection(hidden) for projection in projections], dim=-1).squeeze(0)
@@ -145,6 +143,7 @@ def test_unknown_projection_hooks_and_sparse_cpu_execution_refuse() -> None:
     with pytest.raises(ValueError, match="unknown projection hook"):
         producer.install(attn)
     handle.remove()
+    attn.to_q.register_forward_hook(Hook(Arming(), "projection"))  # a model's LoRA hook
     producer.install(attn)
     attn.processor._attention_backend = next(iter(producer.BACKENDS))
     attention_sol.install_site(attn, "dit", "transformer_blocks.2.attn")
