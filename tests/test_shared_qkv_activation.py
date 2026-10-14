@@ -1,4 +1,4 @@
-"""Real CPU encoded GEMMs and Turbo hooks; GPU agreement is a separate gate."""
+"""Real CPU encoded GEMMs and model LoRA hooks; GPU agreement is a separate gate."""
 
 from __future__ import annotations
 
@@ -16,18 +16,19 @@ from cozy_runtime.internal.encoding.leaves import (  # noqa: E402
     RowwiseNativeLeaf,
     quantize_activation_rowwise,
 )
-from cozy_runtime.models.minimax_h3.turbo import LoRAFactors, _LoRAHook  # noqa: E402
+from testdata.consumer_lora import Arming, Hook, Overlay  # noqa: E402
 
 
-def projections(state: str) -> tuple[Any, list[Any], Any]:
+def projections(state: str) -> tuple[Any, list[Any]]:
     torch.manual_seed(931)
-    factors = LoRAFactors(64, 128, 4, 0.25)
+    overlay = Overlay({"projection": (64, 128)}, 4, 0.25)
+    factors = overlay.factors("projection")
     with torch.no_grad():
         factors.lora_down.normal_(std=0.05)
         factors.lora_up.normal_(std=0.05)
-    owner = SimpleNamespace(_arming=None)
+    arming = Arming()
     if state != "inactive":
-        owner._arming = SimpleNamespace(overlay=SimpleNamespace(get_submodule=lambda _: factors))
+        arming.overlay = overlay
     sites, hooks = [], []
     for _ in range(3):
         weight = torch.randn(128, 64, dtype=torch.bfloat16) * 0.1
@@ -38,12 +39,12 @@ def projections(state: str) -> tuple[Any, list[Any], Any]:
         leaf = RowwiseNativeLeaf("fp8-rowwise/1").leaf(
             torch, {"data": data, "scale": scale}, original, torch.bfloat16
         )
-        hook = _LoRAHook(owner, "projection")
+        hook = Hook(arming, "projection")
         hook._cozy_baked = state == "baked"
         leaf.register_forward_hook(hook)
         sites.append(leaf)
         hooks.append(hook)
-    return SimpleNamespace(to_q=sites[0], to_k=sites[1], to_v=sites[2]), hooks, owner
+    return SimpleNamespace(to_q=sites[0], to_k=sites[1], to_v=sites[2]), hooks
 
 
 def run(attn: Any, hidden: Any, shared: bool) -> tuple[Any, dict[str, int], int]:
@@ -63,7 +64,7 @@ def run(attn: Any, hidden: Any, shared: bool) -> tuple[Any, dict[str, int], int]
 
 @pytest.mark.parametrize("state", ["inactive", "baked", "unbaked"])
 def test_shared_quantization_preserves_real_encoded_gemm_and_lora_bits(state: str) -> None:
-    attn, hooks, _ = projections(state)
+    attn, hooks = projections(state)
     hidden = torch.randn(1, producer.CHUNK + 65, 64, dtype=torch.bfloat16)
     expected, _, before = run(attn, hidden, False)
     actual, counts, after = run(attn, hidden, True)
@@ -74,7 +75,7 @@ def test_shared_quantization_preserves_real_encoded_gemm_and_lora_bits(state: st
 
 
 def test_shared_operand_keeps_forward_custody_wrapper_and_rebound_roles() -> None:
-    attn, _, _ = projections("unbaked")
+    attn, _ = projections("unbaked")
     hidden = torch.randn(1, 65, 64, dtype=torch.bfloat16)
     visits = []
     for name in ("to_q", "to_k", "to_v"):
@@ -99,7 +100,7 @@ def test_shared_operand_keeps_forward_custody_wrapper_and_rebound_roles() -> Non
 
 @pytest.mark.parametrize("kind", ["pre", "post", "float"])
 def test_semantic_hooks_and_nonencoded_sites_decline_without_changing_output(kind: str) -> None:
-    attn, _, _ = projections("unbaked")
+    attn, _ = projections("unbaked")
     if kind == "pre":
         attn.to_q.register_forward_pre_hook(lambda module, args: (args[0] * 0.5,))
     elif kind == "post":
@@ -119,7 +120,7 @@ def test_semantic_hooks_and_nonencoded_sites_decline_without_changing_output(kin
 
 
 def test_existing_quantized_carrier_is_reused_without_another_quantization() -> None:
-    attn, _, _ = projections("inactive")
+    attn, _ = projections("inactive")
     hidden = torch.randn(1, 65, 64, dtype=torch.bfloat16)
     data, scale = quantize_activation_rowwise(torch, hidden)
     operand = PreQuantized(data, scale, tuple(hidden.shape))
@@ -130,7 +131,7 @@ def test_existing_quantized_carrier_is_reused_without_another_quantization() -> 
 
 
 def test_global_input_hook_declines_shared_operand_and_keeps_its_effect() -> None:
-    attn, _, _ = projections("inactive")
+    attn, _ = projections("inactive")
     hidden = torch.randn(1, 65, 64, dtype=torch.bfloat16)
     handle = torch.nn.modules.module.register_module_forward_pre_hook(
         lambda module, args: (args[0] * 0.5,)

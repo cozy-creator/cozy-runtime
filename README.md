@@ -358,6 +358,7 @@ describe disagrees with them. `package_interface_digest` is SHA-256 over those c
     uv run --locked cozy-runtime --conformance describe   # + import the app here; equal or refuse
     uv run python checks/architecture.py # AST import/dependency scans over the boundaries
     uv run pytest                        # the end-to-end suite: two real runs, no mocks
+    uv run --group diffusers pytest tests/test_fusion.py   # + the Diffusers integrations
 
 ### Per-package uv environments
 

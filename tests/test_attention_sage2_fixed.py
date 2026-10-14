@@ -80,19 +80,3 @@ def test_hybrid_dense_steps_and_prefix_use_the_same_fixed_local(monkeypatch: Any
     finally:
         sol._SITE.reset(site)
     assert calls == [(19, 19), (3, 19)]
-
-
-def test_hopper_prefers_fixed_hybrid_without_changing_generic_or_blackwell_policy() -> None:
-    pytest.importorskip("torch")
-    pytest.importorskip("diffusers")
-    from cozy_runtime.models.minimax_h3.model import (
-        BLACKWELL_DIT_ATTENTION,
-        DIT_ATTENTION,
-        HOPPER_DIT_ATTENTION,
-    )
-
-    assert DIT_ATTENTION == ("sol-attn", "sageattention", "flash-attn3", "sdpa")
-    assert fixed.DENSE_NAME not in BLACKWELL_DIT_ATTENTION
-    assert fixed.SOL_NAME not in BLACKWELL_DIT_ATTENTION
-    assert (fixed.SOL_NAME, *DIT_ATTENTION) == HOPPER_DIT_ATTENTION
-    assert fixed.DENSE_NAME not in HOPPER_DIT_ATTENTION

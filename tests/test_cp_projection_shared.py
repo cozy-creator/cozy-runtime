@@ -1,4 +1,4 @@
-"""Real encoded CPU modules and Turbo hooks; GPU speed is a separate qualification."""
+"""Real encoded CPU modules and model LoRA hooks; GPU speed is a separate qualification."""
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ def bits_equal(a: Any, b: Any) -> bool:
 
 @pytest.mark.parametrize("state", ["inactive", "baked", "unbaked"])
 def test_full_shared_projection_keeps_lora_and_ragged_partition_bits(state: str) -> None:
-    attn, hooks, _ = projections(state)
+    attn, hooks = projections(state)
     attn.heads = 1
     hidden = torch.randn(1, producer.CHUNK + 65, 64, dtype=torch.bfloat16)
     before = hidden.clone()
@@ -56,7 +56,7 @@ def test_full_shared_projection_keeps_lora_and_ragged_partition_bits(state: str)
 
 
 def test_shared_projection_quantizes_once_without_concatenating_outputs() -> None:
-    attn, _, _ = projections("unbaked")
+    attn, _ = projections("unbaked")
     attn.heads = 1
     hidden = torch.randn(1, producer.CHUNK + 65, 64, dtype=torch.bfloat16)
     with (
@@ -72,7 +72,7 @@ def test_shared_projection_quantizes_once_without_concatenating_outputs() -> Non
 
 @pytest.mark.parametrize("kind", ["pre", "post", "float", "prequantized"])
 def test_unshared_semantics_keep_the_original_chunk_path(kind: str) -> None:
-    attn, _, _ = projections("inactive")
+    attn, _ = projections("inactive")
     attn.heads = 1
     hidden = torch.randn(1, producer.CHUNK + 65, 64, dtype=torch.bfloat16)
     if kind == "pre":
@@ -100,7 +100,7 @@ def test_unshared_semantics_keep_the_original_chunk_path(kind: str) -> None:
 
 
 def test_projection_keeps_original_forward_custody_and_refuses_partial_shards() -> None:
-    attn, _, _ = projections("unbaked")
+    attn, _ = projections("unbaked")
     attn.heads = 1
     hidden = torch.randn(1, 129, 64, dtype=torch.bfloat16)
     visits = []

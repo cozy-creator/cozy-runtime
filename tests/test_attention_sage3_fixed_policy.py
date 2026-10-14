@@ -8,7 +8,6 @@ from typing import Any
 
 import pytest
 
-from cozy_runtime.author import AttentionContext
 from cozy_runtime.internal import (
     attention,
     attention_kitchen_sol,
@@ -60,35 +59,6 @@ def test_fixed_recipe_supports_context_parallel_diffusers_registry() -> None:
         attention.admit(HYBRID, degree)
 
 
-def test_h3_prefers_the_qualified_hybrid_without_promoting_all_dense() -> None:
-    pytest.importorskip("torch")
-    pytest.importorskip("diffusers")
-    from cozy_runtime.models.minimax_h3.model import (
-        BLACKWELL_DIT_ATTENTION,
-        DIT_ATTENTION,
-        H3Model,
-    )
-
-    assert BLACKWELL_DIT_ATTENTION[0] == HYBRID and DENSE not in BLACKWELL_DIT_ATTENTION
-    assert DIT_ATTENTION == ("sol-attn", "sageattention", "flash-attn3", "sdpa")
-    context = AttentionContext(
-        "fl2va_dit",
-        "block",
-        "cuda",
-        "fixture",
-        120,
-        "bfloat16",
-        128,
-        1,
-        (HYBRID, DENSE, "kitchen-sol-fp4-lowmem"),
-        "sdpa",
-        "",
-        prebuilt=(HYBRID, "kitchen-sol-fp4-lowmem"),
-    )
-    model = object.__new__(H3Model)
-    assert model.choose_attention(context) == BLACKWELL_DIT_ATTENTION
-
-
 def test_hybrid_changes_only_dense_callback_and_keeps_producer_policy(monkeypatch: Any) -> None:
     seen = {}
 
@@ -124,24 +94,6 @@ def test_dense_adapter_preserves_operands_scale_and_upstream_correction(monkeypa
     for options in ({"is_causal": True}, {"enable_gqa": True}, {"scale": 1.0}):
         with pytest.raises(ValueError):
             upstream.sage3_fp4_fixed_means(q, k, v, **options)
-
-
-def test_source_does_not_modify_h3_schedule_or_default_table() -> None:
-    from pathlib import Path
-
-    model = Path(__file__).resolve().parents[1] / "src/cozy_runtime/models/minimax_h3/model.py"
-    tree = ast.parse(model.read_text())
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef) and node.name in (
-            "sample_fl2va_turbo",
-            "sample_ref2va_turbo",
-        ):
-            defaults = {
-                arg.arg: ast.literal_eval(default)
-                for arg, default in zip(node.args.kwonlyargs, node.args.kw_defaults, strict=True)
-                if default is not None and arg.arg == "sol_dense_steps"
-            }
-            assert defaults["sol_dense_steps"] == 4
 
 
 def test_full_packed_virtual_offsets_are_widened_before_stride_products() -> None:

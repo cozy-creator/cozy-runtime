@@ -316,15 +316,12 @@ def test_an_unbound_weight_is_parked_as_packages_know_it() -> None:
     streaming (not on the card) and failed. A weight with no plane bytes bound has a zero-byte
     storage, which is how packages already tell a parked weight; its shape, dtype and device
     stay facts."""
-    pytest.importorskip("diffusers")
     from cozy_runtime.internal.weights import unbound
-    from cozy_runtime.models.minimax_h3.official import _inspectable
 
     held = torch.nn.Parameter(torch.empty(4, 8, dtype=torch.bfloat16), requires_grad=False)
     standin = unbound(torch, held, torch.device("cpu"))
     assert standin.untyped_storage().nbytes() == 0 and standin.numel() == 32
     assert (standin.shape, standin.dtype, standin.device.type) == (held.shape, held.dtype, "cpu")
-    assert not _inspectable(standin) and _inspectable(held)
     assert standin.to(torch.float32).untyped_storage().nbytes() == 0
     # Run 2793: inside an out-of-memory retry `Tensor.to` reaches the stand-in whole (not as
     # the copy it decomposes into); the plane retyping one there mapped it, and recursed.
@@ -1496,31 +1493,39 @@ def test_an_idle_construction_gives_room_and_returns_from_the_pinned_tier(card: 
     assert same(a, again) and same(a, b)
 
 
-# ------------------------------------------------- H3: a DiT, a request LoRA, the turbo overlay
+# --------------------------------------- a DiT, a request LoRA, a model's consumer overlay
 
-H3_HIDDEN, H3_LAYERS, H3_RANK = 512, 16, 8
-H3_TIMES = (0.0, 0.25, 0.75)
-H3_KEYS = [(row, tag) for row in range(3) for tag in range(3)]
+DIT_HIDDEN, DIT_LAYERS, DIT_RANK = 512, 16, 8
+#: The overlay's linears: two under the request LoRA's PEFT layers, one that only it adapts.
+OVERLAY_SITES = {
+    f"transformer_blocks.{block}.{site}": dims
+    for block in range(DIT_LAYERS)
+    for site, dims in (
+        ("attn.to_q", (DIT_HIDDEN, DIT_HIDDEN)),
+        ("attn.to_v", (DIT_HIDDEN, DIT_HIDDEN)),
+        ("ff.net.2", (4 * DIT_HIDDEN, DIT_HIDDEN)),
+    )
+}
 
 
-def h3_dit() -> Any:
-    """MiniMax-H3's real AdaLN-pruned DiT, small, with a request LoRA composed as `--lora`
-    composes it: PEFT layers over its attention and output projections."""
+def lora_dit() -> Any:
+    """Diffusers' MiniMax-H3 DiT, small, with a model's consumer hooks and a request LoRA
+    composed as `--lora` composes it: PEFT layers over its attention and output projections."""
     pytest.importorskip("peft")
+    from diffusers import MiniMaxH3Transformer3DModel
+
     from cozy_runtime.author import AdapterRef
     from cozy_runtime.internal.lora_composition import composer
     from cozy_runtime.internal.lora_contract import FORMAT, Graph, Linear
-    from cozy_runtime.models.minimax_h3.adaln_pruned import AdaLNPrunedMiniMaxH3Transformer
+    from testdata.consumer_lora import install
 
-    dit: Any = AdaLNPrunedMiniMaxH3Transformer(
-        table_timesteps=H3_TIMES,
-        table_block_keys=H3_KEYS,
+    dit: Any = MiniMaxH3Transformer3DModel(
         num_attention_heads=4,
-        attention_head_dim=H3_HIDDEN // 4,
-        hidden_size=H3_HIDDEN,
-        num_layers=H3_LAYERS,
+        attention_head_dim=DIT_HIDDEN // 4,
+        hidden_size=DIT_HIDDEN,
+        num_layers=DIT_LAYERS,
         num_refiner_layers=1,
-        ffn_dim=4 * H3_HIDDEN,
+        ffn_dim=4 * DIT_HIDDEN,
         in_channels=2,
         audio_in_channels=2,
         patch_size=(1, 1, 1),
@@ -1530,48 +1535,29 @@ def h3_dit() -> Any:
         time_embed_dim=8,
         rope_freq_dim=1,
     )
-    dit.eval().install_lora_consumers()
+    install(dit.eval(), OVERLAY_SITES)
     paths = [
         f"transformer_blocks.{block}.{site}"
-        for block in range(H3_LAYERS)
+        for block in range(DIT_LAYERS)
         for site in ("attn.to_q", "attn.to_out.0", "ff.net.2")
     ]
     graph = Graph(
         FORMAT,
-        tuple(Linear("fl2va_dit", path, "wushu", H3_RANK, 8.0, 0.8, "f16") for path in paths),
+        tuple(Linear("fl2va_dit", path, "wushu", DIT_RANK, 8.0, 0.8, "f16") for path in paths),
         (AdapterRef("sha256:" + "12" * 32, 0.8, "lora", "fl2va_dit", "adapter"),),
     )
     composer(graph)(SimpleNamespace(components={"fl2va_dit": dit}))
     return dit.to(torch.float16)
 
 
-def h3_turbo() -> Any:
-    """H3's turbo LoRA: its own model slot, whose factors the DiT's blocks read through hooks."""
-    from cozy_runtime.models.minimax_h3.turbo import TurboOverlay, TurboSchedule
+def consumer_overlay() -> Any:
+    """The model's consumer LoRA: its own model slot, whose factors the DiT's hooks read."""
+    from testdata.consumer_lora import Overlay
 
-    return (
-        TurboOverlay(
-            hidden_size=H3_HIDDEN,
-            inner_dim=H3_HIDDEN,
-            ffn_dim=4 * H3_HIDDEN,
-            num_layers=H3_LAYERS,
-            num_refiner_layers=1,
-            video_out=2,
-            audio_out=2,
-            rank=H3_RANK,
-            alpha=8,
-            schedule=TurboSchedule((0.75, 0.0), (0.25, 0.0)),
-            table_timesteps=H3_TIMES,
-            table_block_keys=H3_KEYS,
-            block_table_dtype=torch.float16,
-            final_table_dtype=torch.float16,
-        )
-        .eval()
-        .to(torch.float16)
-    )
+    return Overlay(OVERLAY_SITES, DIT_RANK, 1.0).eval().to(torch.float16)
 
 
-def h3_inputs(device: str) -> dict[str, Any]:
+def dit_inputs(device: str) -> dict[str, Any]:
     from diffusers.modular_pipelines.minimax_h3.before_denoise import MiniMaxH3PrepareLayoutStep
 
     position, tags, video, audio, text, _, _ = MiniMaxH3PrepareLayoutStep.build_packed_sequence(
@@ -1606,12 +1592,12 @@ def h3_inputs(device: str) -> dict[str, Any]:
     }
 
 
-def h3_models(weights: Weights, root: Path, key: str) -> tuple[Any, Any]:
-    """The DiT with its request LoRA and the turbo LoRA: two model slots on one plane."""
+def lora_models(weights: Weights, root: Path, key: str) -> tuple[Any, Any]:
+    """The DiT with its request LoRA and the consumer overlay: two model slots on one plane."""
     slots = []
     for name, factory, scope in (
-        ("fl2va_dit", h3_dit, "sample_fl2va_turbo"),
-        ("fl2va_turbo", h3_turbo, "sample_fl2va"),
+        ("fl2va_dit", lora_dit, "sample_adapted"),
+        ("fl2va_overlay", consumer_overlay, "sample_fl2va"),
     ):
         torch.manual_seed(292)
         values = {k: torch.randn(v.shape) * 0.05 for k, v in factory().state_dict().items()}
@@ -1623,55 +1609,57 @@ def h3_models(weights: Weights, root: Path, key: str) -> tuple[Any, Any]:
     return slots[0], slots[1]
 
 
-def h3_denoise(weights: Weights, dit: Any, turbo: Any, inputs: dict[str, Any], between: Any) -> Any:
-    """Three evaluations of the DiT under the turbo bank, as H3's `sample_fl2va_turbo` nests
-    its scopes: the base's stage, the turbo LoRA's inside it, package arithmetic between."""
-    from cozy_runtime.models.minimax_h3.turbo import ATTENTION_KWARG, OVERLAY_KWARG, TURBO_BANK
+def lora_denoise(
+    weights: Weights, dit: Any, adapter: Any, inputs: dict[str, Any], between: Any
+) -> Any:
+    """Three evaluations of the DiT with the overlay armed, its scopes nested as a package's
+    adapted sampler nests them: the base's stage, the overlay's inside it, package arithmetic
+    between."""
+    from testdata.consumer_lora import armed
 
-    selector = {ATTENTION_KWARG: TURBO_BANK, OVERLAY_KWARG: turbo.stack}
     video, audio = inputs["hidden_states"], inputs["audio_hidden_states"]
-    dit.residency.admit("sample_fl2va_turbo", ("fl2va_dit",))
+    dit.residency.admit("sample_adapted", ("fl2va_dit",))
     try:
-        turbo.residency.admit("sample_fl2va", ("fl2va_turbo",))
+        adapter.residency.admit("sample_fl2va", ("fl2va_overlay",))
         try:
-            with weights.recovering(), torch.inference_mode():
+            with weights.recovering(), torch.inference_mode(), armed(dit.stack, adapter.stack):
                 for step in range(3):
                     held = between(step)
                     moved = dit.stack(
-                        **{**inputs, "hidden_states": video, "audio_hidden_states": audio},
-                        attention_kwargs=selector,
+                        **{**inputs, "hidden_states": video, "audio_hidden_states": audio}
                     )
                     video, audio = video + moved[0] * 0.25, audio + moved[1] * 0.25
                     del held
                 return video, audio
         finally:
-            turbo.residency.release("sample_fl2va", ("fl2va_turbo",))
+            adapter.residency.release("sample_fl2va", ("fl2va_overlay",))
     finally:
-        dit.residency.release("sample_fl2va_turbo", ("fl2va_dit",))
+        dit.residency.release("sample_adapted", ("fl2va_dit",))
 
 
-def test_h3_with_its_loras_computes_on_the_pinned_tier(tmp_path: Path) -> None:
+def test_a_dit_with_its_loras_computes_on_the_pinned_tier(tmp_path: Path) -> None:
     """The fixture is the real thing: on a CPU executor (weights bound in place) the DiT with
-    a request LoRA under the turbo bank computes what the same modules compute unmanaged."""
+    a request LoRA and the consumer overlay armed computes what the same modules compute
+    unmanaged."""
     weights = Weights(torch, torch.device("cpu"), "cpu")
     weights.set_budget(-1, pinned=1 << 30)
-    dit, turbo = h3_models(weights, tmp_path, "host")
-    inputs = h3_inputs("cpu")
-    got = h3_denoise(weights, dit, turbo, inputs, lambda step: None)
+    dit, adapter = lora_models(weights, tmp_path, "host")
+    inputs = dit_inputs("cpu")
+    got = lora_denoise(weights, dit, adapter, inputs, lambda step: None)
     plain = []
-    for factory in (h3_dit, h3_turbo):
+    for factory in (lora_dit, consumer_overlay):
         torch.manual_seed(292)
         module = factory()
         module.load_state_dict(
             {k: (torch.randn(v.shape) * 0.05).half() for k, v in module.state_dict().items()}
         )
         plain.append(module)
-    plain_dit, plain_turbo = plain
+    plain_dit, plain_overlay = plain
     unmanaged = SimpleNamespace(admit=lambda *_: None, release=lambda *_: None)
-    want = h3_denoise(
+    want = lora_denoise(
         weights,
         SimpleNamespace(stack=plain_dit, residency=unmanaged),
-        SimpleNamespace(stack=plain_turbo, residency=unmanaged),
+        SimpleNamespace(stack=plain_overlay, residency=unmanaged),
         inputs,
         lambda step: None,
     )
@@ -1680,20 +1668,20 @@ def test_h3_with_its_loras_computes_on_the_pinned_tier(tmp_path: Path) -> None:
 
 
 @on_card
-def test_h3_with_its_loras_pages_instead_of_running_out(tmp_path: Path) -> None:
-    """Run 2549: H3's DiT with a request LoRA under the turbo LoRA ran out of device memory.
+def test_a_dit_with_its_loras_pages_instead_of_running_out(tmp_path: Path) -> None:
+    """Run 2549: H3's DiT with a request LoRA under its turbo LoRA ran out of device memory.
     Here its weights get a budget far below their size, and mid-denoise another allocation
     takes the room its activations had. It still computes the fully resident run's bits: the
-    turbo LoRA's stage shares the DiT's budget, blocks stream, and the allocation that fails
+    overlay's stage shares the DiT's budget, blocks stream, and the allocation that fails
     unmaps weights and runs again."""
     weights = Weights(torch, torch.device("cuda", 0), "cuda")
     weights.set_budget(-1, pinned=1 << 30)
-    dit, turbo = h3_models(weights, tmp_path, "h3")
-    inputs = h3_inputs("cuda")
+    dit, adapter = lora_models(weights, tmp_path, "dit")
+    inputs = dit_inputs("cuda")
     layout: weight_policy.Layout = dit.residency.components["fl2va_dit"].layout
-    overlay = turbo.residency.components["fl2va_turbo"].layout.total
+    overlay = adapter.residency.components["fl2va_overlay"].layout.total
     weights.set_budget(1 << 30)
-    resident, peak = h3_reference(weights, dit, turbo, inputs)
+    resident, peak = lora_reference(weights, dit, adapter, inputs)
     assert weights.facts().streamed["fl2va_dit"].resident_blocks == len(layout.blocks)
 
     spare = 6 * layout.largest  # what an out-of-memory retry can still unmap
@@ -1701,7 +1689,7 @@ def test_h3_with_its_loras_pages_instead_of_running_out(tmp_path: Path) -> None:
     assert weights.budget < (layout.total + overlay) // 2
     was = weights.facts()
     try:
-        paged = h3_denoise(weights, dit, turbo, inputs, squeezing(1, peak))
+        paged = lora_denoise(weights, dit, adapter, inputs, squeezing(1, peak))
     finally:
         torch.cuda.empty_cache()
     now = weights.facts()
@@ -1712,35 +1700,35 @@ def test_h3_with_its_loras_pages_instead_of_running_out(tmp_path: Path) -> None:
 
 
 @on_card
-def test_h3_with_its_loras_at_the_sub_block_grain_is_bit_exact(
+def test_a_dit_with_its_loras_at_the_sub_block_grain_is_bit_exact(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """H3's DiT (its LoRA consumers, the turbo bank's factors read from its blocks) with its
+    """The DiT (its LoRA consumers, the overlay's factors read from its blocks) with its
     blocks split into their projections computes the resident run's bits."""
     monkeypatch.setattr(weights_module, "REGION_LIMIT", 1 << 20)
     weights = Weights(torch, torch.device("cuda", 0), "cuda")
     weights.set_budget(-1, pinned=1 << 30)
-    dit, turbo = h3_models(weights, tmp_path, "h3-fine")
-    inputs = h3_inputs("cuda")
+    dit, adapter = lora_models(weights, tmp_path, "dit-fine")
+    inputs = dit_inputs("cuda")
     weights.set_budget(1 << 30)
-    resident, _ = h3_reference(weights, dit, turbo, inputs)
-    turbo.residency.unpark()
+    resident, _ = lora_reference(weights, dit, adapter, inputs)
+    adapter.residency.unpark()
     layout = refined(dit, "fl2va_dit")
-    overlay = turbo.residency.components["fl2va_turbo"].layout.total
+    overlay = adapter.residency.components["fl2va_overlay"].layout.total
     weights.set_budget(layout.common + overlay + 3 * layout.largest)
     try:
-        paged = h3_denoise(weights, dit, turbo, inputs, lambda step: None)
+        paged = lora_denoise(weights, dit, adapter, inputs, lambda step: None)
     finally:
         torch.cuda.empty_cache()
     assert weights.facts().streamed["fl2va_dit"].resident_blocks < len(layout.blocks)
     assert same(list(resident), list(paged))
 
 
-def h3_reference(weights: Weights, dit: Any, turbo: Any, inputs: dict[str, Any]) -> Any:
+def lora_reference(weights: Weights, dit: Any, adapter: Any, inputs: dict[str, Any]) -> Any:
     """The fully resident denoise and its activation peak."""
     torch.cuda.reset_peak_memory_stats()
     before = torch.cuda.memory_allocated()
-    resident = h3_denoise(weights, dit, turbo, inputs, lambda step: None)
+    resident = lora_denoise(weights, dit, adapter, inputs, lambda step: None)
     return resident, torch.cuda.max_memory_allocated() - before
 
 
@@ -1765,20 +1753,20 @@ def test_one_gpu_of_a_group_never_runs_a_block_twice(tmp_path: Path) -> None:
     measured; an op that still runs out of memory unmaps idle weights and that op runs again."""
     weights = Weights(torch, torch.device("cuda", 0), "cuda")
     weights.set_budget(-1, pinned=1 << 30)
-    dit, turbo = h3_models(weights, tmp_path, "h3")
+    dit, adapter = lora_models(weights, tmp_path, "dit")
     (tmp_path / "idle").mkdir()
     idle = load(weights, write_checkpoint(tmp_path / "idle")[0], "idle")
-    inputs = h3_inputs("cuda")
+    inputs = dit_inputs("cuda")
     layout: weight_policy.Layout = dit.residency.components["fl2va_dit"].layout
     weights.set_budget(1 << 30)
-    resident, peak = h3_reference(weights, dit, turbo, inputs)
+    resident, peak = lora_reference(weights, dit, adapter, inputs)
     calls = {"block": 0}
     block = dit.stack.transformer_blocks[0].attn
     block.register_forward_hook(lambda *_: calls.__setitem__("block", calls["block"] + 1))
 
     weights.grouped = True
     weights.activation.clear()  # a fresh executor's first request: nothing measured
-    grown = h3_denoise(weights, dit, turbo, inputs, lambda step: None)
+    grown = lora_denoise(weights, dit, adapter, inputs, lambda step: None)
     assert same(list(resident), list(grown)) and calls["block"] == 3
     assert weights.facts().streamed["fl2va_dit"].resident_blocks == len(layout.blocks)
     assert weights.facts().h2d_bytes > 0  # the first pass streamed every block
@@ -1788,7 +1776,7 @@ def test_one_gpu_of_a_group_never_runs_a_block_twice(tmp_path: Path) -> None:
     held = weights.resident_bytes(idle.residency.components["stack"])
     retries = weights.facts().oom_retries
     try:
-        squeezed = h3_denoise(weights, dit, turbo, inputs, squeezing(1, peak))
+        squeezed = lora_denoise(weights, dit, adapter, inputs, squeezing(1, peak))
     finally:
         torch.cuda.empty_cache()
     assert weights.facts().oom_retries > retries

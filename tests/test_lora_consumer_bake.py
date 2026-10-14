@@ -1,7 +1,7 @@
-"""H3's turbo overlay baked on the weight plane: a turbo forward bakes the overlay's factors into
-the DiT's resident block bytes and its consumer hooks add nothing; a base forward on the same
-DiT finds those bytes refilled from the unmodified host copy first. A CPU executor (no bake)
-computes the same forwards per step."""
+"""A model's consumer LoRA (an overlay in its own slot, read through hooks) baked on the weight
+plane: an armed forward bakes the overlay's factors into the DiT's resident block bytes and its
+hooks add nothing; a base forward on the same DiT finds those bytes refilled from the unmodified
+host copy first. A CPU executor (no bake) computes the same forwards per step."""
 
 from __future__ import annotations
 
@@ -18,18 +18,20 @@ from cozy_runtime.internal.weights import LoRASource, PlaneBackend, WeightReside
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("diffusers")
+import tensorfs  # noqa: E402
+from diffusers import MiniMaxH3Transformer3DModel  # noqa: E402
+from diffusers.modular_pipelines.minimax_h3.before_denoise import (  # noqa: E402
+    MiniMaxH3PrepareLayoutStep,
+)
+
+from test_lora_composition import Value, model  # noqa: E402
+from testdata.consumer_lora import armed, block_linears, install, overlay_for  # noqa: E402
 
 DEVICES = ["cpu"] + (["cuda"] if accel.present(torch, "cuda") and plane.available() else [])
-TIMES = (0.0, 0.25, 0.75)
-KEYS = [(row, tag) for row in range(3) for tag in range(3)]
 
 
 def _dit() -> Any:
-    from cozy_runtime.models.minimax_h3.adaln_pruned import AdaLNPrunedMiniMaxH3Transformer
-
-    dit = AdaLNPrunedMiniMaxH3Transformer(
-        table_timesteps=TIMES,
-        table_block_keys=KEYS,
+    dit = MiniMaxH3Transformer3DModel(
         num_attention_heads=2,
         attention_head_dim=8,
         hidden_size=16,
@@ -45,43 +47,20 @@ def _dit() -> Any:
         time_embed_dim=8,
         rope_freq_dim=1,
     ).eval()
-    dit.install_lora_consumers()
+    install(dit, block_linears(dit))
     return dit
 
 
 def _overlay(device: str) -> Any:
-    from cozy_runtime.models.minimax_h3.turbo import TurboOverlay, TurboSchedule
-
-    overlay = TurboOverlay(
-        hidden_size=16,
-        inner_dim=16,
-        ffn_dim=32,
-        num_layers=2,
-        num_refiner_layers=1,
-        video_out=2,
-        audio_out=2,
-        rank=2,
-        alpha=2,
-        schedule=TurboSchedule((0.75, 0.0), (0.25, 0.0)),
-        table_timesteps=TIMES,
-        table_block_keys=KEYS,
-        block_table_dtype=torch.float32,
-        final_table_dtype=torch.float32,
-    ).eval()
+    dit = _dit()
+    overlay = overlay_for(dit, block_linears(dit), rank=2, scale=1.0).eval()
     with torch.no_grad():
         for parameter in overlay.parameters():
             parameter.normal_(0, 0.1)
-        for _, site in overlay.lora_sites():
-            site.lora_down.data = site.lora_down.data.float()
-            site.lora_up.data = site.lora_up.data.float()
     return overlay.to(device)
 
 
 def _checkpoint(tmp_path: Path, dit: Any) -> Checkpoint:
-    import tensorfs
-
-    from test_lora_composition import Value, model
-
     store = tensorfs.Store.init(tmp_path / "store")
     tensors = {
         key: Value(tuple(value.shape), tuple(value.float().flatten().tolist()))
@@ -92,8 +71,6 @@ def _checkpoint(tmp_path: Path, dit: Any) -> Checkpoint:
 
 
 def _inputs(device: str) -> dict[str, Any]:
-    from diffusers.modular_pipelines.minimax_h3.before_denoise import MiniMaxH3PrepareLayoutStep
-
     position, tags, video, audio, text, _, _ = MiniMaxH3PrepareLayoutStep.build_packed_sequence(
         text_token_tags=torch.ones(3, dtype=torch.long),
         num_latent_frames=2,
@@ -123,11 +100,9 @@ def _inputs(device: str) -> dict[str, Any]:
 
 
 @pytest.mark.parametrize("device", DEVICES)
-def test_a_turbo_forward_bakes_and_a_base_forward_finds_the_bytes_refilled(
+def test_an_armed_forward_bakes_and_a_base_forward_finds_the_bytes_refilled(
     tmp_path: Path, device: str
 ) -> None:
-    from cozy_runtime.models.minimax_h3.turbo import ATTENTION_KWARG, OVERLAY_KWARG, TURBO_BANK
-
     torch.manual_seed(26)
     reference = _dit()
     with torch.no_grad():
@@ -142,12 +117,12 @@ def test_a_turbo_forward_bakes_and_a_base_forward_finds_the_bytes_refilled(
     )
     weights.set_budget(-1, pinned=64 << 20)
     backend = PlaneBackend.for_script(
-        {"fl2va_dit": checkpoint}, rows, weights=weights, construction="turbo", release="turbo/1"
+        {"fl2va_dit": checkpoint}, rows, weights=weights, construction="lora", release="lora/1"
     )
 
     class Pipeline:
         def __init__(self, config: Config) -> None:
-            # Built for real: its non-persistent buffers (rope, tables' indexes) keep the
+            # Built for real: its non-persistent buffers (rope) keep the
             # values construction computed; the plane binds every weight.
             self.components = {"fl2va_dit": _dit()}
 
@@ -165,38 +140,41 @@ def test_a_turbo_forward_bakes_and_a_base_forward_finds_the_bytes_refilled(
         assert all(r.bake is (device == "cuda") for r in baking)
         residency = WeightResidency(weights, backend.components, {"run": ("fl2va_dit",)})
         inputs = _inputs(device)
-        # What every LoRA'd linear finds when it runs: a switch between turbo and base bakes
+        # What every LoRA'd linear finds when it runs: a switch between armed and base bakes
         # or refills the whole DiT before its first block, never one block at a time.
         seen: set[tuple[bool, ...]] = set()
-        for path, _ in overlay.lora_sites():
+        for path in block_linears(dit):
             dit.get_submodule(path).register_forward_pre_hook(
                 lambda *_: seen.add(tuple(r.baked for r in baking))
             )
 
-        def forward(model: Any, turbo: bool) -> tuple[list[Any], list[bool]]:
-            selector = {ATTENTION_KWARG: TURBO_BANK, OVERLAY_KWARG: overlay} if turbo else {}
+        def forward(model: Any, adapted: bool) -> tuple[list[Any], list[bool]]:
             served = model is dit
             if served:
                 residency.admit("run", ("fl2va_dit",))
             try:
                 with torch.no_grad():
-                    out = model(**inputs, attention_kwargs=selector)
+                    if adapted:
+                        with armed(model, overlay):
+                            out = model(**inputs)
+                    else:
+                        out = model(**inputs)
                 return [t.float() for t in out], [h._cozy_baked for h in hooks]
             finally:
                 if served:
                     residency.release("run", ("fl2va_dit",))
 
-        turbo_ref, _ = forward(reference, True)
+        adapted_ref, _ = forward(reference, True)
         base_ref, _ = forward(reference, False)
         cuda = device == "cuda"
-        for turbo in (True, False, True, False):
+        for adapted in (True, False, True, False):
             seen.clear()
-            got, baked = forward(dit, turbo)
-            want = turbo_ref if turbo else base_ref
+            got, baked = forward(dit, adapted)
+            want = adapted_ref if adapted else base_ref
             for g, w in zip(got, want, strict=True):
                 torch.testing.assert_close(g, w, rtol=1e-4, atol=1e-5)
-            assert baked == [cuda and turbo] * len(hooks)
-            assert seen == {(cuda and turbo,) * len(baking)}
-        assert not torch.equal(turbo_ref[0], base_ref[0])
+            assert baked == [cuda and adapted] * len(hooks)
+            assert seen == {(cuda and adapted,) * len(baking)}
+        assert not torch.equal(adapted_ref[0], base_ref[0])
     finally:
         backend.close()
