@@ -1,0 +1,1 @@
+A job declares its body's device with `app.job(..., accelerator=True|False)`, a script that runs as a job with `[tool.cozy] accelerator = true|false`. True requires a GPU, False runs on CPU, and an undeclared job takes the machine's GPU when it has one, else runs on CPU. Nothing infers the device from dependencies; TensorD and the CLI read this one field.

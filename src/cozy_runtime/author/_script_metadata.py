@@ -125,18 +125,11 @@ def main_definition(tree: ast.Module) -> ast.FunctionDef | ast.AsyncFunctionDef:
 type Rungs = list[dict[str, Any]]
 
 
-UNDECLARED_ACCELERATOR = (
-    "this script runs as a job and declares no accelerator: add `accelerator = true` under "
-    "[tool.cozy] in its `# /// script` block if it computes on a GPU, `accelerator = false` "
-    "if it runs on CPU"
-)
-
-
 def declarations(
     raw: bytes,
 ) -> tuple[dict[str, Rungs], tuple[WeightsOutput, ...], bool | None]:
     """A script's `[tool.cozy]`: its model default ladders (a lane string is one `*` rung), its
-    weights outputs and accelerator (None undeclared; a script that runs as a job must)."""
+    weights outputs and accelerator (None undeclared: the machine's GPU when it has one)."""
     block: list[str] = []
     opened = found = False
     for line in raw.decode("utf-8").splitlines():

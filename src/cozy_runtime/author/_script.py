@@ -15,12 +15,7 @@ import msgspec
 from cozy_runtime.author._app import App
 from cozy_runtime.author._context import Context
 from cozy_runtime.author._errors import ConformanceError
-from cozy_runtime.author._script_metadata import (
-    UNDECLARED_ACCELERATOR,
-    byte_parameter,
-    declarations,
-    main_definition,
-)
+from cozy_runtime.author._script_metadata import byte_parameter, declarations, main_definition
 from cozy_runtime.author._script_types import _ScriptSource, annotation, parameter_type
 from cozy_runtime.author._services import JOB_ONLY, Telemetry
 from cozy_runtime.author._signature import _classify
@@ -152,8 +147,6 @@ def script_app(module: str) -> App:
         or any(param.capability in JOB_ONLY for param in params)
         or not any(param.role == "model" for param in params)
     )
-    if job and accelerator is None:
-        raise ConformanceError(UNDECLARED_ACCELERATOR, code="script_main_signature")
     app = App()
 
     def main(**injected: Any) -> Any:

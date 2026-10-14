@@ -47,7 +47,6 @@ import cozy_runtime.internal.memo_identity as memo_identity
 import cozy_runtime.internal.package_interface as package_interface
 import cozy_runtime.internal.static_invocable as static_invocable
 from cozy_runtime import _interpreter, author
-from cozy_runtime.author._app import undeclared_accelerator
 from cozy_runtime.author._markers import MODEL_DEFAULT, PREFLIGHT
 from cozy_runtime.author._memo import memo_policy
 from cozy_runtime.author._model import Model
@@ -58,7 +57,6 @@ from cozy_runtime.author._model_defaults import (
     model_defaults,
 )
 from cozy_runtime.author._script_metadata import (
-    UNDECLARED_ACCELERATOR,
     Unfolded,
     byte_parameter,
     declarations,
@@ -1613,8 +1611,6 @@ def _registration(
             weights = tuple(value)
     if hidden and internal:
         reader.refuse(module, fn, "an internal callable cannot also be hidden")
-    if method == "job" and accelerator is None:
-        reader.refuse(module, fn, undeclared_accelerator(name))
     if hidden:
         return None
     return Registration(
@@ -1959,8 +1955,6 @@ def _script_doc(reader: Reader, app: Assigned) -> tuple[package_interface.Kind, 
     )
     # The adapter's choice, read the same way: Model slots it runs are served.
     job = bool(weights) or sources or bool(services & JOB_ONLY) or not models
-    if job and accelerator is None:
-        reader.refuse(module, fn, UNDECLARED_ACCELERATOR)
     payload = msgspec.defstruct("_ScriptRequest", payload_fields)
     doc = package_interface.callable_doc(
         name="main",
