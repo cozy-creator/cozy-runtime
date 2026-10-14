@@ -736,6 +736,36 @@ def test_an_activation_estimate_larger_than_the_card_never_refuses_the_stage(car
     assert same(run(model, x), reference)
 
 
+@on_gpu
+def test_an_earlier_stages_idle_cache_is_neither_kept_nor_counted(card: Any) -> None:
+    """SeedVR2 run 5937: a VAE decode left torch 5.5 GiB of idle cache; the transformer's next
+    stage was planned in what the driver had beside it (a 0.5 GiB budget), and the cache counted
+    as its activations. Before a stage plans, torch's idle cache beyond the stage's activations
+    goes back to the driver; what is still cached at its entry is no activation of its own."""
+    weights = card.weights
+    model = load(weights, card.checkpoint, "cached")
+    x = torch.ones(4, HIDDEN, device="cuda", dtype=torch.float16)
+
+    def stage(method: str, freed: int) -> None:
+        model.residency.admit(method, ("stack",))
+        with torch.inference_mode():
+            model.stack(x)
+            torch.empty(freed, dtype=torch.uint8, device="cuda")  # an activation, freed
+        model.residency.release(method, ("stack",))
+
+    def idle() -> int:
+        return torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+
+    stage("decode", 512 << 20)
+    weights.seed_activations({"encode": 1 << 30})  # room for its cache: it stays
+    stage("encode", 0)
+    assert idle() >= 512 << 20
+    assert model.residency.peaks["encode"] < weight_policy.MARGIN, "the cache was not its own"
+    model.residency.admit("denoise", ("stack",))
+    assert idle() < 512 << 20, "nothing measured for the stage: its plan has the room"
+    model.residency.release("denoise", ("stack",))
+
+
 @on_card
 def test_a_bind_that_runs_out_of_device_memory_plans_again_in_what_is_left(card: Any) -> None:
     """Run 2932: on a card without fp8, binding a stage's resident set decodes each weight

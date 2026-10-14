@@ -87,6 +87,39 @@ print("ran")
 """
 )
 
+#: Idle weights are mapped and the card has `argv[3]` MiB left (0: nothing else is held) when a
+#: convolution runs for the first time. Prints the workspace it ran with and the plane's bytes.
+STARVED = (
+    """
+import sys
+from pathlib import Path
+import torch
+sys.path.insert(0, sys.argv[1])
+import test_weight_plane as twp
+from cozy_runtime.internal import plane
+from cozy_runtime.internal.weights import Weights
+dev = torch.device("cuda", 0)
+"""
+    + FILL
+    + """
+weights = Weights(torch, dev, "cuda")
+weights.set_budget(-1, pinned=1 << 30)
+model = twp.load(weights, twp.write_checkpoint(Path(sys.argv[2]))[0], "starved")
+twp.run(model, torch.ones(4, twp.HIDDEN, device=dev, dtype=torch.float16), passes=1)
+x = torch.randn(1, 64, 5, 128, 256, device=dev, dtype=torch.float16)
+w = torch.randn(64, 64, 3, 3, 3, device=dev, dtype=torch.float16)
+mapped = plane.stats(weights.plane).device(0).committed
+torch.cuda.empty_cache()  # cuDNN takes a workspace from torch's cache before the driver
+ballast = fill(int(sys.argv[3]) << 20) if int(sys.argv[3]) else []
+torch.cuda.reset_peak_memory_stats(dev)
+before = torch.cuda.memory_allocated(dev)
+with weights.recovering(), torch.inference_mode():
+    y = torch.nn.functional.conv3d(x, w, padding=1)
+workspace = torch.cuda.max_memory_allocated(dev) - before - y.nbytes
+print(workspace, mapped, plane.stats(weights.plane).device(0).committed)
+"""
+)
+
 
 def fresh(script: str, *args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
@@ -126,3 +159,22 @@ def test_a_library_refusal_is_given_room_once_and_then_is_its_own_failure() -> N
         _room_for(RuntimeError("shape mismatch"), False)
     oom = RuntimeError("CUDA error: out of memory")
     assert _room_for(oom, True) == (0, True), "out of memory is always answered"
+
+
+@on_card
+@pytest.mark.skipif(not plane.available(), reason="a TensorFS with the weight plane")
+def test_a_convolution_on_a_full_card_runs_the_kernel_it_runs_with_room(tmp_path: Path) -> None:
+    """cuDNN catches a refused workspace and falls back to a convolution that needs none (on
+    an RTX 4060 Ti, implicit_convolveNd_sgemm: 4-7x slower for SeedVR2's VAE), and torch keeps
+    that choice for the shape as long as the process lives. Idle weights give the workspace
+    room before cuDNN's next try: the card has room for the output, not for both."""
+    here = str(Path(__file__).parent)
+    roomy = fresh(STARVED, here, str(tmp_path / "roomy"), "0")
+    full = fresh(STARVED, here, str(tmp_path / "full"), "40")
+    assert roomy.returncode == 0 and full.returncode == 0, (roomy.stderr + full.stderr)[-1600:]
+    wanted = int(roomy.stdout.split()[-3])
+    if wanted <= 0:
+        pytest.skip("this card's cuDNN runs the convolution without a workspace")
+    workspace, mapped, kept = map(int, full.stdout.split()[-3:])
+    assert workspace > 0, (roomy.stdout, full.stdout)
+    assert kept < mapped, "the workspace came from idle weights"
