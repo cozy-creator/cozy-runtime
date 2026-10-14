@@ -1053,6 +1053,68 @@ def test_the_owner_lowers_a_running_process_cap_at_its_next_block(card: Any) -> 
     assert same(reference, outputs)
 
 
+class Bare(torch.nn.Module):  # type: ignore[misc,name-defined]
+    """Blocks and nothing else: no `common`, so its stage holds no lease between blocks."""
+
+    _no_split_modules = ("Block",)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.blocks = torch.nn.ModuleList([Block() for _ in range(BLOCKS)])
+
+    def forward(self, x: Any) -> Any:
+        for block in self.blocks:
+            x = block(x)
+        return x
+
+
+@on_card
+def test_a_block_whose_component_moves_to_the_sub_block_grain_under_it_runs_at_that_grain(
+    tmp_path: Path,
+) -> None:
+    """Run 5894, `tensorfs.plane.Closed`: a stage that held no lease between blocks was placed
+    again from inside a block, at its block floor, and moved the component to the sub-block
+    grain. That closed the weight set the block had chosen, and its acquire read it. The block
+    runs at the grain the component has now instead, with the same bits."""
+    from cozy_runtime.internal import budget_cell
+
+    weights = Weights(torch, torch.device("cuda", 0), "cuda")
+    weights.set_budget(-1, pinned=1 << 30)
+    generator = torch.Generator().manual_seed(11)
+    values: dict[str, Any] = {}
+    for index in range(BLOCKS):
+        for name in ("proj", "out"):
+            values[f"blocks.{index}.{name}.weight"] = (
+                torch.randn(HIDDEN, HIDDEN, generator=generator) / HIDDEN**0.5
+            )
+        values[f"blocks.{index}.norm"] = torch.rand(HIDDEN, generator=generator) + 0.5
+    model = load(weights, store_component(tmp_path, "stack", values), "regrain", factory=Bare)
+    layout: weight_policy.Layout = model.residency.components["stack"].layout
+    assert model.residency.components["stack"].common is None and layout.fine is not None
+    x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
+    weights.set_budget(1 << 30)
+    reference = run(model, x)
+    cell, fd = budget_cell.Cell.create()
+    worker = budget_cell.Cell(fd)
+    os.close(fd)
+    weights.cell = cell
+    model.residency.admit("run", ("stack",))
+    try:
+        with torch.inference_mode():
+            outputs = [model.stack(x)]
+            # One block at a time: the next block applies it before its acquire, and moves on.
+            ticket = worker.ask(layout.common + layout.largest)
+            outputs += [model.stack(x), model.stack(x)]
+    finally:
+        model.residency.release("run", ("stack",))
+        weights.cell = None
+        worker.answered(ticket)
+        cell.close()
+        worker.close()
+    assert model.residency.components["stack"].fine
+    assert same(reference, outputs)
+
+
 class WritingBlock(Block):
     """A block that writes its result into its input (a VAE's in-place activations)."""
 

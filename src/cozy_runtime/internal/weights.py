@@ -168,6 +168,10 @@ class _Stale(Exception):
     """A region's resident bytes hold a delta the forward about to read does not want."""
 
 
+class _Regrained(Exception):
+    """A block's component moved to another grain under it: its weight set is closed."""
+
+
 @dataclass(slots=True)
 class Region:
     index: int
@@ -3629,8 +3633,9 @@ class WeightResidency:
         )
 
     def _refine(self, key: str) -> bool:
-        """Move the weight set `key` to the sub-block grain, if it still can: at a stage's
-        start, never inside one (its slot's leases pin the coarse regions)."""
+        """Move the weight set `key` to the sub-block grain, if it still can: never while a
+        lease or cursor holds its coarse regions. A block that chose the old grain runs at the
+        new one (`_regrained`)."""
         name = next((n for n, c in self.components.items() if c.key == key), "")
         component = self.components.get(name)
         if component is None or self.refine is None or not self._refinable(component):
@@ -3673,6 +3678,11 @@ class WeightResidency:
                 if effects is None and not weights.host_only:
                     region.effects = journal.effects()
                 return out
+            except _Regrained:
+                # Placed again from inside its own attempt, the component moved to another
+                # grain and closed the weight set this block chose (run 5894): rewound, the
+                # block runs at the grain the component has now.
+                return self._regrained(component, region, forward)(*args, **kwargs)
             except self._poisoned_error as exc:
                 raise self._poison(exc) from exc
 
@@ -3697,13 +3707,15 @@ class WeightResidency:
                 self._squeezing()
             if weights.growing and component.passes == 2 > passes:
                 self._grow()
-            if component.spared:
-                self._unspare(component)
             versions = _versions(args, kwargs)
             # a library's refusal is answered once: by its op when ops recover one by one
             refused = weights.grouped or region.effects is None or region.effects.writes
             refusals = 0
             while True:
+                if self.components.get(component.name) is not component:
+                    raise _Regrained
+                if component.spared:
+                    self._unspare(component)
                 stream = weights.stream()
                 try:
                     lease = self._acquire(component, region.index, stream)
@@ -3779,6 +3791,15 @@ class WeightResidency:
                 )
 
         return run
+
+    def _regrained(
+        self, component: Component, region: Region, forward: Callable[..., object]
+    ) -> Callable[..., object]:
+        """The forward a block runs at its component's grain now: through its module's region
+        there, or, when that grain splits the module, its own forward, whose parts are hooked."""
+        current = self.components[component.name]
+        again = next((r for r in current.blocks if r.module is region.module), None)
+        return forward if again is None else self._block(current, again, forward)
 
     def _acquire(self, component: Component, index: int, stream: int) -> Lease:
         """The block's lease: from the stage's cursor when the block is due within its window
@@ -3959,7 +3980,6 @@ class WeightResidency:
         """A spared component runs again within its stage: its common region is leased and
         bound for the rest of the stage, and its blocks join the stage's plan."""
         weights = self.weights
-        component.spared = False
         if component.common is not None and component.lease is None:
             component.lease = self._acquire_common(
                 weights.open[-1][1] if weights.open else "",
@@ -3969,6 +3989,7 @@ class WeightResidency:
             )
             bind(weights.torch, component.common, component.lease)
             component.resident = (component.common.index,)
+        component.spared = False  # only once its common is leased: a failed lease leaves it spared
 
     def _observe(self, component: Component, index: int) -> None:
         """Count passes and learn the blocks' execution order from a stage's first pass."""
