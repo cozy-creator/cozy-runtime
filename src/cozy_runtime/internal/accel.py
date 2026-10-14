@@ -482,6 +482,13 @@ def allocated(torch: Any, kind: str, device: Any = None) -> int:
 _HELD = [0, 0]
 
 
+def reserved(torch: Any, kind: str, device: Any = None) -> int:
+    """The allocator's reserved bytes ALONE: live tensors plus its idle cache."""
+    if kind == "mps":
+        raise AcceleratorUnsupported("mps", "reserved")
+    return int(torch.cuda.memory_reserved(device))
+
+
 def reset_peak(torch: Any, kind: str) -> None:
     """Zero the high-water mark, so the next `peak_allocated` measures ONE attempt."""
     if kind == "mps":

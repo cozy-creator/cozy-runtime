@@ -358,6 +358,10 @@ class Weights:
         self.last = ""
         #: a read outside a module's forward is being mapped (`reading`)
         self.mapping = False
+        #: the plane is placing or giving room: an allocator refusal inside is its own to answer
+        self.placing = False
+        #: the bytes of the last allocator refusal `refused` unmapped weights for
+        self.given = 0
         #: a group's stage whose activations are not measured yet runs its first pass at the
         #: floor, and is placed again at its second with what that pass measured
         self.growing = False
@@ -395,6 +399,7 @@ class Weights:
         self.floor_free = self.display_floor
         if not self.host_only:
             self.measure_context()
+            _observe_refusals(torch, self)
 
     def tick(self) -> int:
         self.clock += 1
@@ -762,11 +767,48 @@ class Weights:
             # and their blocks map them again as they run.
             reads = {key for key, _, _ in read}
             self.open[-1][0]._make_room(need, None if self.running else {}, op, reads)
-        else:
+        elif not self.answered(need):
             before = self.allocatable()
             self.shrink(need)
             self.progressed(before, need, op)
         mapped()
+
+    def refused(self, need: int) -> None:
+        """torch's allocator refused `need` bytes. A caller that catches that never reaches a
+        block's recovery: cuDNN tries its next convolution algorithm, down to one that needs
+        no workspace (4-7x slower for SeedVR2's VAE convolutions on an RTX 4060 Ti), and torch
+        keeps that choice for the shape as long as the process lives. So the room is made
+        before that next attempt: torch's limit follows the driver again, and what the driver
+        lacks comes from weights nothing reads now (activations first). A refusal that reaches
+        the caller is still the recovery's."""
+        if self.placing:
+            return
+        self.placing = True
+        try:
+            self.limit_torch()
+            short = (
+                need + weight_policy.MARGIN - self.headroom(accel.allocation(self.torch, self.kind))
+            )
+            self.given = need if short > 0 and self.shrink(short) else 0
+            self.drain()
+        finally:
+            self.placing = False
+
+    def answered(self, need: int) -> bool:
+        """The allocator's refusal of `need` bytes that reached the caller already had its
+        room (`refused`): the op runs again without a second unmapping."""
+        given, self.given = self.given, 0
+        return given >= need and self.allocatable() >= need
+
+    def trim_cache(self, method: str) -> None:
+        """Before a stage plans: torch's idle cache beyond what the stage's activations need
+        goes back to the driver, for its weights. Kept, an earlier stage's (a VAE decode's
+        5 GiB) holds the room the next one streams its transformer through."""
+        if self.host_only:
+            return
+        idle = accel.reserved(self.torch, self.kind) - accel.allocated(self.torch, self.kind)
+        if idle > self.activation.get(method, 0) + weight_policy.MARGIN:
+            accel.release_cached(self.torch, self.kind)
 
     def allocatable(self) -> int:
         """Device bytes torch can allocate now: its headroom plus its own idle cache."""
@@ -1488,6 +1530,28 @@ class Read:
         tensor = cast("Tensor", out)
         address = int(tensor.data_ptr()) if tensor.numel() else 0
         return tensor.clone() if any(a <= address < b for a, b in self.spans) else out
+
+
+#: the CUDA planes of this process, which torch's one out-of-memory observer answers for
+_REFUSALS: weakref.WeakSet[Weights] = weakref.WeakSet()
+_observing = False
+
+
+def _observe_refusals(torch: ModuleType, weights: Weights) -> None:
+    global _observing
+    _REFUSALS.add(weights)
+    if _observing:
+        return
+    _observing = True
+
+    def refused(device: int, need: int, _limit: int, _free: int) -> None:
+        # Called inside torch's allocator, right before it raises: nothing may escape it.
+        with suppress(Exception):
+            for held in list(_REFUSALS):
+                if held.index == device:
+                    held.refused(need)
+
+    torch._C._cuda_attach_out_of_memory_observer(refused)
 
 
 def _recovery_type(torch: ModuleType) -> type:
@@ -2858,6 +2922,8 @@ class WeightResidency:
         self.per_item: dict[str, int] = {}
         self.batch: dict[str, int] = {}
         self.baseline = -1
+        #: torch's idle cache at the entry's start: segments an earlier stage reserved
+        self.cached = 0
         #: torch's room and its cache drops so far, at the open entry's start
         self.pressure = (0, 0)
         self.derived_at_open = 0
@@ -2953,6 +3019,7 @@ class WeightResidency:
         self.active = (method, local)
         weights.open.append((self, method, local))
         try:
+            weights.trim_cache(method)
             budget = weights.stage_budget(method)
             if method not in weights.activation:
                 # Activations first, and these are not measured yet: the open stages' own
@@ -3038,6 +3105,14 @@ class WeightResidency:
         above `budget` and never below a two-block streaming window. When binding runs out
         of device memory (it decodes and converts weights into torch's bytes, and torch may
         hold more than the budget knew), plan again in what is left. Returns the budget used."""
+        weights = self.weights
+        placing, weights.placing = weights.placing, True
+        try:
+            return self._placed(budget, resume)
+        finally:
+            weights.placing = placing
+
+    def _placed(self, budget: int, resume: Mapping[str, int]) -> int:
         weights = self.weights
         method = weights.open[-1][1]
         weights.quiesce()  # a plan unmaps: other components' sets, this one's stale regions
@@ -3172,6 +3247,7 @@ class WeightResidency:
             if self.components[name].fine:  # the run's record of how tight its memory was
                 weights.modes[f"{name}.grain"] = "sub-block"
         self.baseline = accel.allocated(weights.torch, weights.kind)
+        self.cached = accel.reserved(weights.torch, weights.kind) - self.baseline
         self.pressure = (weights.allocatable(), weights.retries())
         accel.reset_peak(weights.torch, weights.kind)
 
@@ -3210,7 +3286,7 @@ class WeightResidency:
             # segments torch reserved for them, whichever is more (a cap counts the segments).
             peak = max(
                 accel.peak_allocated(weights.torch, weights.kind) - self.baseline,
-                accel.peak_reserved(weights.torch, weights.kind) - self.baseline,
+                accel.peak_reserved(weights.torch, weights.kind) - self.baseline - self.cached,
                 0,
             )
             self.peaks[method] = max(self.peaks.get(method, 0), peak)
@@ -3811,6 +3887,8 @@ class WeightResidency:
         nothing else is left to give."""
         weights = self.weights
         method = weights.open[-1][1] if weights.open else ""
+        if weights.answered(need):
+            return
         before = weights.allocatable()
         if resume is None:
             weights.shrink(need)
