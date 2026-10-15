@@ -7,7 +7,8 @@ holds is copied to page-locked host memory the GPU addresses directly (unified a
 and the storage is repointed there. Every tensor over it stays a CUDA tensor, read and
 written over the bus from then on, so whatever holds one is unchanged and nothing has to bring
 it back; its device bytes go back to torch. Least recently used first (`touch`), the op's
-own operands last.
+own operands last. Only a stage under pressure keeps that order: from its first spill or host
+result until its host blocks are gone, so a stage with room pays nothing per op.
 
 Locking new pages runs at about 1.6 GB/s, most of a spill's cost: a block no tensor holds any
 more stays locked for the next spill or host map of its size, until the stage closes.
@@ -43,6 +44,9 @@ HELD: dict[int, int] = {}
 USED: dict[int, tuple[int, weakref.ref[Tensor]]] = {}
 FORGET = 1 << 16
 _CLOCK = [0]
+#: whether ops are noted (`touch`): from a stage's first spill or host result until its host
+#: blocks are all gone (`release`)
+PRESSED = [False]
 
 
 def _size(nbytes: int) -> int:
@@ -84,7 +88,11 @@ class _Host:
 
 
 def release(torch: ModuleType) -> None:
-    """Free blocks go back to the host: a closed stage keeps none locked."""
+    """Free blocks go back to the host: a closed stage keeps none locked. Once no tensor is in
+    host memory, ops are no longer noted."""
+    if not HELD:
+        PRESSED[0] = False
+        USED.clear()
     if not _FREE:
         return
     cudart = torch.cuda.cudart()
@@ -110,6 +118,8 @@ def stored(values: Iterable[object]) -> Iterator[Tensor]:
 
 def touch(values: Iterable[object]) -> None:
     """An op read or made `values`: their device storages are the last to move."""
+    if not PRESSED[0]:
+        return
     clock = _CLOCK[0] = _CLOCK[0] + 1
     for value in stored(values):
         storage = value.untyped_storage()
@@ -127,6 +137,7 @@ def hosted(value: object) -> bool:
 
 def empty(torch: ModuleType, device: Device, like: Tensor) -> Tensor:
     """A CUDA tensor of `like`'s shape, strides and dtype whose bytes are a host block."""
+    PRESSED[0] = True
     span = 1 + sum((n - 1) * s for n, s in zip(like.shape, like.stride(), strict=True))
     nbytes = span * like.element_size() if like.numel() else 0
     raw = torch.as_tensor(_Host(torch, nbytes), device=device)
@@ -139,6 +150,7 @@ def spill(
     """Move this process's tensors on `device` to host memory, least recently used first,
     until `need` device bytes came back, the storages `operands` read last, at most `room`
     bytes. Returns the bytes moved."""
+    PRESSED[0] = True
     started = time.perf_counter_ns()
     torch.cuda.synchronize(device)
     segments = sorted(
