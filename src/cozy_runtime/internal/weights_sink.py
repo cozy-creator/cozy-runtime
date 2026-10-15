@@ -21,7 +21,6 @@ from cozy_runtime.author._errors import CapabilityError
 from cozy_runtime.author._weights import (
     WeightsReceipt,
 )
-from cozy_runtime.internal import weights_receipts
 
 if TYPE_CHECKING:
     import tensorfs
@@ -76,39 +75,6 @@ def lookup(store: tensorfs.Store, transaction_id: str) -> DerivedLookup:
 def same_receipt(left: Mapping[str, object], right: Mapping[str, object]) -> bool:
     """Compare adoption identity; record authoritative native facts, not peer observations."""
     return native_receipt(left) == native_receipt(right)
-
-
-def work_fingerprint(
-    spec: Mapping[str, object],
-    numerical: bytes,
-    *,
-    operation_identity: str = "",
-) -> str:
-    """Bind native partial work to what determines its output: the operation (its
-    declared version and source identity, else its job declaration), the actual inputs,
-    and the numerical policy.
-
-    Installation ids, attempt/custody clocks and SDK inventories never define it, so
-    interrupted work resumes after a Runtime upgrade or a reinstall of the same release.
-    """
-    job = spec.get("job")
-    if not isinstance(job, Mapping) or len(numerical) != 32:
-        raise CapabilityError(
-            "weights work has no selected job or numerical policy", code="weights_work_identity"
-        )
-    facts = {
-        "operation": operation_identity or {"job_descriptor_id": job["job_descriptor_id"]},
-        "payload_digest": spec["payload_digest"],
-        "inputs": spec.get("inputs", []),
-        "outputs": spec.get("outputs", []),
-        "numerical_environment_digest": weights_receipts.spell(numerical),
-    }
-    return (
-        "sha256:"
-        + hashlib.sha256(
-            b"cozy.runtime.derived-work/1\0" + canonical_json.encode(facts)
-        ).hexdigest()
-    )
 
 
 def exchange_file(spool: Path, output_slot: str, kind: str) -> Path:

@@ -14,8 +14,7 @@ from tensorfs.records import DeclarationTargets
 
 from cozy_runtime.author._errors import CapabilityError
 from cozy_runtime.internal import storage_admission as storage
-from cozy_runtime.internal.weights_writer import WriterBroker
-from weights_channel import open_output
+from weights_channel import WriterBroker, open_output
 
 
 def test_parent_writer_checks_admission_before_creating_native_writer(

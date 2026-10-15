@@ -17,6 +17,7 @@ from typing import Any, Concatenate, ParamSpec, TypeVar, cast, overload
 
 import msgspec
 
+from cozy_runtime import _application_json as application_json
 from cozy_runtime import canonical_json
 from cozy_runtime.author._artifacts import ModelArtifact
 from cozy_runtime.author._assets import Asset, Assets, Tree, asset_dec_hook
@@ -41,7 +42,6 @@ from cozy_runtime.author._model import Model
 from cozy_runtime.author._model_defaults import DefaultLadder, model_components, model_defaults
 from cozy_runtime.author._services import Telemetry, _progress_scope, _ProgressScope
 from cozy_runtime.author._weights import Weights
-from cozy_runtime import _application_json as application_json
 
 _LOG = logging.getLogger(__name__)
 
@@ -248,6 +248,9 @@ class _CallType:
     served_fields: frozenset[str] | None = None
     #: Why the serving Runtime cannot serve this operation; "" when it can.
     unavailable: str = ""
+    #: A callable bound from its own code: its model slots, which a direct caller passes
+    #: beside its request fields and the call carries as `{payload, models}`.
+    models: frozenset[str] | None = None
 
 
 RUNTIME_UPDATE = (
@@ -389,6 +392,12 @@ class _Broker:
             raise CapabilityError(binding.unavailable, code="child_capability_unavailable")
         if len(self.calls) >= MAX_ACTIVE_CALLS:
             raise CapabilityError("active package call bound exceeded", code="child_fanout")
+        if binding.models is not None:
+            slots = binding.models
+            arguments = {
+                "payload": {k: v for k, v in arguments.items() if k not in slots},
+                "models": {k: v for k, v in arguments.items() if k in slots},
+            }
         if self.next_index > MAX_CALL_INDEX:
             raise CapabilityError("package call index is exhausted", code="child_index_exhausted")
         try:

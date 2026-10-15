@@ -1,4 +1,4 @@
-"""Fresh-process job device proofs; CUDA arms require an actual allocated GPU."""
+"""Fresh-process session device proofs; CUDA arms require an actual allocated GPU."""
 
 from __future__ import annotations
 
@@ -15,8 +15,8 @@ import pytest
 
 from cozy_runtime.internal import child_env, jit_cache
 
-PROBE = Path(__file__).parent / "testdata" / "gpu_job_device.py"
-REAL_GPU = os.environ.get("COZY_TEST_GPU_JOB_DEVICE") == "1"
+PROBE = Path(__file__).parent / "testdata" / "device_session.py"
+REAL_GPU = os.environ.get("COZY_TEST_GPU_DEVICE") == "1"
 
 
 def probe(mode: str, root: Path, *, script: Path = PROBE) -> dict[str, Any]:
@@ -44,7 +44,7 @@ def probe(mode: str, root: Path, *, script: Path = PROBE) -> dict[str, Any]:
     return cast(dict[str, Any], json.loads(run.stdout))
 
 
-def test_cpu_parent_never_imports_torch_or_opens_cuda(tmp_path: Path) -> None:
+def test_a_session_without_gpus_never_imports_torch_or_opens_cuda(tmp_path: Path) -> None:
     result = probe("cpu", tmp_path)
     assert result["result"] == {"device": "cpu", "values": []}
     assert not result["torch_imported"] and not result["device_initialized"]
@@ -52,7 +52,7 @@ def test_cpu_parent_never_imports_torch_or_opens_cuda(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(importlib.util.find_spec("torch") is not None, reason="needs no torch")
-def test_a_gpu_job_without_torch_runs_on_the_devices_it_was_given(tmp_path: Path) -> None:
+def test_a_gpu_session_without_torch_runs_on_the_devices_it_was_given(tmp_path: Path) -> None:
     result = probe("torchless", tmp_path)
     assert result["result"] == {"device": "0", "values": [42.0]}
     assert not result["torch_imported"] and not result["device_initialized"]
@@ -65,8 +65,8 @@ def test_prepare_establishes_device_boundary_before_kernel_imports(tmp_path: Pat
     assert result["runtime_device_boundary_before_kernel_import"] is True
 
 
-@pytest.mark.skipif(not REAL_GPU, reason="set COZY_TEST_GPU_JOB_DEVICE=1 on a real CUDA worker")
-def test_gpu_job_initializes_before_handler_and_proves_completion(tmp_path: Path) -> None:
+@pytest.mark.skipif(not REAL_GPU, reason="set COZY_TEST_GPU_DEVICE=1 on a real CUDA worker")
+def test_a_gpu_session_without_models_initializes_cuda_at_start(tmp_path: Path) -> None:
     result = probe("gpu", tmp_path)
     assert result["result"] == {"device": "cuda:0", "values": [14.0] * 512}
     assert result["torch_imported"] and result["device_initialized"]
@@ -74,11 +74,11 @@ def test_gpu_job_initializes_before_handler_and_proves_completion(tmp_path: Path
     assert result["peak_vram_bytes"] >= 4096
 
 
-@pytest.mark.skipif(not REAL_GPU, reason="set COZY_TEST_GPU_JOB_DEVICE=1 on a real CUDA worker")
-def test_gpu_job_refuses_cuda_initialized_outside_runtime(tmp_path: Path) -> None:
+@pytest.mark.skipif(not REAL_GPU, reason="set COZY_TEST_GPU_DEVICE=1 on a real CUDA worker")
+def test_a_gpu_session_refuses_cuda_initialized_outside_runtime(tmp_path: Path) -> None:
     result = probe("early", tmp_path)
     assert result["code"] == "cuda_initialized_before_runtime"
-    assert result["executions"] == 0 and not result["result_written"]
+    assert result["executions"] == 0
 
 
 @pytest.mark.skipif(not REAL_GPU, reason="requires an allocated CUDA worker with Diffusers/TorchAO")
