@@ -428,3 +428,64 @@ def encode_fp8_rowwise(key: str, values: np.ndarray) -> Encoded:
         energy=acc.energy,
         max_abs_err=acc.max_abs,
     )
+
+
+# ------------------------------------------------------------------- int8 convrot256
+
+#: ConvRot's rotation group: one orthonormal Hadamard rotation per 256 input channels.
+CONVROT_GROUP = 256
+INT8_MAX = 127.0
+
+
+def hadamard256(values: np.ndarray) -> np.ndarray:
+    """Each 256-group of `[rows, K]` times the regular Hadamard H4⊗H4⊗H4⊗H4, entries ±1 and
+    UNNORMALIZED (orthonormal is this / 16). H4 = [[1,1,1,-1],[1,1,-1,1],[1,-1,1,1],[-1,1,1,1]]
+    is symmetric, so H is its own transpose and H·H = 256·I. Additions only: an integer input
+    stays an exact integer, which is what makes the decode below exact."""
+    rows, cols = values.shape
+    work = values.reshape(-1, 4, 4, 4, 4)
+    for axis in range(1, 5):
+        a, b, c, d = (np.take(work, i, axis=axis) for i in range(4))
+        work = np.stack((a + b + c - d, a + b - c + d, a - b + c + d, b + c + d - a), axis=axis)
+    return work.reshape(rows, cols)
+
+
+def decode_int8_convrot256(payload: np.ndarray, scale: np.ndarray) -> np.ndarray:
+    """`int8-convrot256/1`'s value law, exactly: `scale[i] * (data[i] · H)[j] / 16` in f64.
+    The Hadamard sum of int8 is an exact integer and every factor after it is exact in f64,
+    so the only rounding is the caller's one cast into the logical dtype."""
+    sums = hadamard256(payload.astype(np.int32)).astype(np.float64)
+    return sums * scale.astype(np.float64)[:, None] / 16.0
+
+
+def encode_int8_convrot256(key: str, values: np.ndarray) -> Encoded:
+    """`int8-convrot256/1`: each row rotated by the orthonormal Hadamard per 256 input
+    channels (ComfyUI's ConvRot), then symmetric per-output-row int8: `scale = rowmax|Wh|/127`
+    (f32, floor 1e-12) and RNE `clip(rint(Wh / scale), ±127)`. The rotation spreads a row's
+    outliers across its group, which is what keeps the per-token int8 activations that pair
+    with it accurate; the leaf rotates each activation by the same H."""
+    rows, cols = _require_2d(key, values, CONVROT_GROUP)
+    payload = np.empty((rows, cols), dtype=np.int8)
+    row_scale = np.empty((rows,), dtype=np.float32)
+    acc = _Accum()
+    for sl in row_chunks(rows, cols, CACHE_ELEMENTS):
+        v = np.ascontiguousarray(values[sl], dtype=np.float32)
+        rotated = hadamard256(v.astype(np.float64)) / 16.0
+        amax = np.abs(rotated).max(axis=-1)
+        scale = np.maximum(amax / INT8_MAX, 1e-12).astype(np.float32)
+        q = np.rint(rotated / scale.astype(np.float64)[:, None])
+        acc.sat += int(np.count_nonzero(np.abs(q) > INT8_MAX))
+        q = np.clip(q, -INT8_MAX, INT8_MAX).astype(np.int8)
+        acc.add(v, decode_int8_convrot256(q, scale))
+        payload[sl] = q
+        row_scale[sl] = scale
+    return Encoded(
+        payload_dtype="I8",
+        payload_shape=[rows, cols],
+        payload=payload.tobytes(),
+        companions=[Companion(".weight_scale", "F32", [rows], row_scale.tobytes())],
+        saturated=acc.sat,
+        sse=acc.sse,
+        energy=acc.energy,
+        max_abs_err=acc.max_abs,
+    )
