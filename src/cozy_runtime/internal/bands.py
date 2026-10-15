@@ -7,19 +7,17 @@ rows or a norm over channels. A group norm gathers its statistics over every ban
 float32. Ops that mix rows (attention, matmuls) are never cut. Nothing here knows a model: the
 rows an op needs follow from the op and its arguments.
 
-A row-local op whose result is a large map is not computed when called: its result (`Rows`)
-computes any band of its rows on demand, from its inputs' rows. What reads it in rows (a
-convolution, a group norm, another row-local op) runs band by band, so a chain of them runs on
-band-sized temporaries a cache holds, never on full-size ones. Any other op reads it whole,
-computed then. A write into what a pending result reads computes that result first; none
-outlives the call.
-
-An op runs in bands, too, when an operand lives in host memory (a spill, or an earlier band's
-result: each band reads its rows over the bus once, where a kernel would read them again and
-again), or when it ran out of device memory whole. A result goes on the device when it fits
-there with idle weights unmapped and the least recently used tensors in host memory, else into
-host memory. A convolution right after the zero padding it reads skips the taps that meet only
-that padding: a lone frame through a causal 3D convolution is a 2D one.
+An op takes this path when it ran out of device memory whole, or an operand lives in host
+memory (a spill, or an earlier band's result: each band reads its rows over the bus once, where
+a kernel would read them again and again). A row-local op (and a group norm's apply) on that
+path is not computed when called: its result (`Rows`) computes any band of its rows on demand,
+from its inputs' rows. What reads it in rows (a convolution, another row-local op) runs band by
+band, so the chain runs on band-sized temporaries, never on full-size ones; any other op reads
+it whole, computed then. A write into what a pending result reads computes that result first;
+none outlives the block or call that made it. Other ops run in bands, their result on the
+device when it fits there with idle weights unmapped and the least recently used tensors in
+host memory, else in host memory. A convolution right after the zero padding it reads skips
+the taps that meet only that padding: a lone frame through a causal 3D convolution is a 2D one.
 """
 
 from __future__ import annotations
@@ -38,9 +36,6 @@ if TYPE_CHECKING:
 
     from cozy_runtime.internal.weights import Weights
 
-#: A row-local op's result of at least this many bytes, four dims or more, is computed by its
-#: reader (`Rows`).
-LAZY = 32 << 20
 #: Elements of a result's band when a chain computes into it: band-sized temporaries a cache holds.
 BAND = 1 << 22
 #: Source reads per row past which a chain's pending inputs are computed first.
@@ -139,6 +134,7 @@ class Bands:
             **dict.fromkeys(views, self._view),
         }
         self.lazy = {self._rows, self._pad, self._upsample, self._view}
+        self.copies = {aten.clone, aten.contiguous}
 
     def run(
         self, func: Any, args: tuple[Any, ...], kwargs: dict[str, Any], short: bool = False
@@ -164,13 +160,7 @@ class Bands:
             return NotImplemented  # a view of a computed tensor is a view
         if pending and rule == self._rows and self._same(func, args, kwargs):
             return args[0]  # a cast to its own dtype: its operand, still pending
-        lazy = rule in self.lazy
         if not (short or hosted or pending):
-            big = max(map(_bytes, tensors), default=0) >= LAZY // 8
-            if (lazy or rule == self._norm) and big:
-                plan = rule(func, args, kwargs)
-                if plan is not None and plan.out.dim() >= 4 and _bytes(plan.out) >= LAZY:
-                    return self._defer(func, plan, args, kwargs)
             if packet in self.pads:
                 return self._remember(func, args, kwargs)
             plan = None
@@ -186,7 +176,8 @@ class Bands:
         plan = plan or rule(func, args, kwargs)
         if plan is None:
             return NotImplemented
-        if lazy or (plan.gather is not None and plan.out.dim() >= 4):
+        # A copy is made now (a cache keeps it); any other row op, and a norm's apply, wait.
+        if (rule in self.lazy and packet not in self.copies) or plan.gather is not None:
             return self._defer(func, plan, args, kwargs)
         self.rewrites += 1
         out = self._banded(plan, (*args, *kwargs.values()))
@@ -194,6 +185,8 @@ class Bands:
 
     def _same(self, func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> bool:
         """Whether the op returns its first operand itself (a cast to its own dtype)."""
+        if not isinstance(args[0], self.torch.Tensor):
+            return False
         first = self.torch.empty_strided(
             args[0].shape, args[0].stride(), dtype=args[0].dtype, device="meta"
         )
