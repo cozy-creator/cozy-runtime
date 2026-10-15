@@ -134,8 +134,9 @@ def collect(children: set[int]) -> set[int]:
     return reaped
 
 
-def fork(environment: Mapping[str, str], child: Callable[[], int]) -> int:
-    """The child's pid. The child seals itself, runs `child` and exits; it never returns."""
+def fork(environment: Mapping[str, str], child: Callable[[], int], *, group: bool = True) -> int:
+    """The child's pid. The child seals itself, runs `child` and exits; it never returns.
+    `group`: it leads its own process group; a group's follower stays in its leader's."""
     gc.collect()
     gc.freeze()  # imported objects stay shared: the collector never writes their pages
     parent = os.getpid()
@@ -144,7 +145,8 @@ def fork(environment: Mapping[str, str], child: Callable[[], int]) -> int:
         return pid
     code = int(Exit.internal)
     try:
-        os.setpgid(0, 0)
+        if group:
+            os.setpgid(0, 0)
         proctree.arm_parent_death()
         if os.getppid() != parent:
             os._exit(int(Exit.structural))

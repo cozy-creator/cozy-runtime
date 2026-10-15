@@ -14,6 +14,7 @@ from __future__ import annotations
 import dataclasses
 import os
 import signal
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -339,6 +340,25 @@ def test_a_follower_death_breaks_the_group_loudly(tmp_path: Path) -> None:
             group.check_alive()
     finally:
         group.close()
+
+
+@needs_torch
+def test_an_imported_rank_0_forks_its_followers(tmp_path: Path) -> None:
+    """A rank 0 whose imports are done and that holds no thread or device forks its
+    followers instead of spawning them, so they start with torch, the Runtime and the
+    package already imported (run 6351: rank 0 waited 6.6 s on spawned followers'
+    imports). In a fresh process, as rank 0 is: its followers are its children in its
+    process group, answer as their own ranks under its seal and form the group."""
+    fixture = Path(__file__).parent / "testdata" / "fork_followers.py"
+    done = subprocess.run(
+        [sys.executable, str(fixture), str(tmp_path)],
+        env={**os.environ, "CUDA_VISIBLE_DEVICES": "4,5,6", "OMP_NUM_THREADS": "1"},
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert done.stdout.strip() == "forked 2 followers, formed 3", done.stdout
 
 
 @needs_torch
