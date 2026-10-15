@@ -20,8 +20,9 @@ offers a provider for a digest only if that digest is in the set AND still in th
 The old spelling read digests OUT of `tensorfs.seed_digests()` by ALIAS, which meant a new,
 semantically different spec filed under `mxfp8/1` would have INHERITED this file's decoder
 the moment the registry grew it. Transcribing the digests is the cost of making that
-impossible: a registry change that moves a digest now breaks selection loudly at launch
-(`spec_unreviewed`) instead of decoding unreviewed bytes. Alias is display, and only display.
+impossible: a digest the installed registry lacks gets no provider (one warning at launch),
+and its bytes refuse at bind instead of being decoded unreviewed. Alias is display, and only
+display.
 
 **The decode target is the CENSUS's dtype, and the census cannot express an encoding.**
 A derived `LogicalTensor` names a destination and nothing else — no parts, no scale_of, no
@@ -131,10 +132,8 @@ def digests_of(alias: str) -> tuple[str, ...]:
 # "reviewed" means the exact vector object this spec digest names was decoded bit-for-bit,
 # not that somebody read the prose.
 #
-# A digest that leaves the registry, or a registry that files a NEW digest under one of
-# these aliases, changes this file's answer LOUDLY: the first case refuses `spec_unreviewed`
-# at launch, the second acquires no provider at all. Both are the intended behaviour; the
-# alias-keyed spelling had neither.
+# A digest the installed registry lacks (an older TensorFS) is warned once at launch and serves
+# nothing; a registry that files a NEW digest under one of these aliases acquires no provider.
 
 #: `plain/1` — one `value` role carrying the logical bytes verbatim.
 SPEC_PLAIN = "sha256:1fb882a7e46d0aff520f9d8a28cefd643954c19371737443101ba3c5fcc3613f"
