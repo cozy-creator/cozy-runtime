@@ -21,7 +21,7 @@ class RetableResult(msgspec.Struct, frozen=True):
     tables: ModelArtifact
 
 
-@invocable
+@invocable(memo_version="h3-lane/1")
 async def bf16_full(ctx: Context, *, source: Weights[Any], tel: Telemetry) -> ModelArtifact:
     raise NotImplementedError
 

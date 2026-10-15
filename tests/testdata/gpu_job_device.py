@@ -26,7 +26,7 @@ class Request(msgspec.Struct):
 class Result(msgspec.Struct):
     device: str
     values: list[float]
-@app.job
+@app.entrypoint
 def compute(payload: Request, ctx: Context) -> Result:
     return Result(os.environ.get("CUDA_VISIBLE_DEVICES", ""), [42.0])
 """

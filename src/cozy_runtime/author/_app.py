@@ -208,7 +208,6 @@ class App:
             memo = export.memoize if export is not None else policy
             declare_memo(
                 export.implementation if export is not None else target,
-                memoize=memo is not None,
                 version=memo_version,
                 dependencies=memo_dependencies,
             )

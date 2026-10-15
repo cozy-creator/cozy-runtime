@@ -59,14 +59,11 @@ type MemoDependency = Callable[..., object] | str | MemoResource | MemoDistribut
 def declare(
     fn: Callable[..., object],
     *,
-    memoize: bool,
     version: str | None,
     dependencies: tuple[MemoDependency, ...],
 ) -> None:
-    if version is not None and (not memoize or not isinstance(version, str) or len(version) > 128):
-        raise ConformanceError(
-            "memo_version needs memoize=True and a bounded version", code="invocable_memoize"
-        )
+    if version is not None and (not isinstance(version, str) or len(version) > 128):
+        raise ConformanceError("memo_version must be a bounded string", code="invocable_memoize")
     if (
         not isinstance(dependencies, tuple)
         or len(dependencies) > 64
@@ -74,12 +71,8 @@ def declare(
             not callable(item) and not isinstance(item, (str, MemoResource, MemoDistribution))
             for item in dependencies
         )
-        or (dependencies and not memoize)
     ):
-        raise ConformanceError(
-            "memo_dependencies needs memoize=True and bounded dependencies",
-            code="invocable_memoize",
-        )
+        raise ConformanceError("memo_dependencies must be bounded", code="invocable_memoize")
     if version is not None or dependencies:
         declaration = (version or "", dependencies)
         previous = getattr(fn, "_cozy_memo_declaration", declaration)

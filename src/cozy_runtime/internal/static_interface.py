@@ -1312,7 +1312,11 @@ def _build(
             )
         doc = _callable(reader, registration)
         declared = doc.get("invocable")
-        if installed and registration.memoize and isinstance(declared, dict):
+        if (
+            installed
+            and (registration.memoize or registration.weights)
+            and isinstance(declared, dict)
+        ):
             identity = _operation_identity(reader, registration)
             if identity is not None:
                 declared["operation_identity"] = identity
