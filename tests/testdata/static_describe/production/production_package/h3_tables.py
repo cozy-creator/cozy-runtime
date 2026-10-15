@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 import msgspec
 
@@ -22,12 +22,12 @@ class RetableResult(msgspec.Struct, frozen=True):
 
 
 @invocable
-async def bf16_full(ctx: Context, *, source: Weights, tel: Telemetry) -> ModelArtifact:
+async def bf16_full(ctx: Context, *, source: Weights[Any], tel: Telemetry) -> ModelArtifact:
     raise NotImplementedError
 
 
 @invocable
-async def bf16_pruned(ctx: Context, *, source: Weights, tel: Telemetry) -> ModelArtifact:
+async def bf16_pruned(ctx: Context, *, source: Weights[Any], tel: Telemetry) -> ModelArtifact:
     raise NotImplementedError
 
 
@@ -35,7 +35,7 @@ async def bf16_pruned(ctx: Context, *, source: Weights, tel: Telemetry) -> Model
 async def fp8_pruned(
     ctx: Context,
     *,
-    source: Weights,
+    source: Weights[Any],
     max_relative_frobenius: float | None = None,
     tel: Telemetry,
 ) -> ModelArtifact:
@@ -46,7 +46,7 @@ async def fp8_pruned(
 async def mxfp8_pruned(
     ctx: Context,
     *,
-    source: Weights,
+    source: Weights[Any],
     max_relative_frobenius: float | None = None,
     tel: Telemetry,
 ) -> ModelArtifact:
@@ -57,7 +57,7 @@ async def mxfp8_pruned(
 async def fp8(
     ctx: Context,
     *,
-    source: Weights,
+    source: Weights[Any],
     max_relative_frobenius: float | None = None,
     tel: Telemetry,
 ) -> ModelArtifact:
@@ -68,7 +68,7 @@ async def fp8(
 async def mxfp8(
     ctx: Context,
     *,
-    source: Weights,
+    source: Weights[Any],
     max_relative_frobenius: float | None = None,
     tel: Telemetry,
 ) -> ModelArtifact:
@@ -76,38 +76,40 @@ async def mxfp8(
 
 
 @invocable
-async def retable(ctx: Context, *, pruned: Weights, full: Weights, tel: Telemetry) -> RetableResult:
+async def retable(
+    ctx: Context, *, pruned: Weights[Any], full: Weights[Any], tel: Telemetry
+) -> RetableResult:
     raise NotImplementedError
 
 
 @invocable
-async def select_adaln_weights(ctx: Context, *, source: Weights, task: Task) -> Selection:
+async def select_adaln_weights(ctx: Context, *, source: Weights[Any], task: Task) -> Selection:
     raise NotImplementedError
 
 
 @invocable
 async def compute_adaln_tables(
-    ctx: Context, *, source: Weights, task: Task, plan_digest: str, tel: Telemetry
+    ctx: Context, *, source: Weights[Any], task: Task, plan_digest: str, tel: Telemetry
 ) -> ModelArtifact:
     raise NotImplementedError
 
 
 @invocable
 async def apply_adaln(
-    ctx: Context, *, source: Weights, fl2va: Weights, ref2va: Weights
+    ctx: Context, *, source: Weights[Any], fl2va: Weights[Any], ref2va: Weights[Any]
 ) -> ModelArtifact:
     raise NotImplementedError
 
 
 @invocable
 async def retable_adaln(
-    ctx: Context, *, source: Weights, fl2va: Weights, ref2va: Weights
+    ctx: Context, *, source: Weights[Any], fl2va: Weights[Any], ref2va: Weights[Any]
 ) -> ModelArtifact:
     raise NotImplementedError
 
 
 @invocable
 async def turbo_lora(
-    ctx: Context, *, adapters: Weights, base: Weights, tel: Telemetry
+    ctx: Context, *, adapters: Weights[Any], base: Weights[Any], tel: Telemetry
 ) -> ModelArtifact:
     raise NotImplementedError
