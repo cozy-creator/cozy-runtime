@@ -138,3 +138,38 @@ def test_leaf_matches_its_exact_weight() -> None:
             assert got.shape == (3, 40, 64) and got.dtype == dtype
             error = (got.double().cpu() - reference).norm() / reference.norm()
             assert error < 0.02, (device, dtype, float(error))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the int8 op runs on a CUDA card")
+def test_native_op_is_built_by_the_compile_manager_and_keeps_the_law(tmp_path: Path) -> None:
+    """The op as a pod gets it: the machine's compile manager builds `cozy-int8` for this card
+    from the pinned sources, the leaf loads it, and every path (GEMV rows, the GEMM, a bias,
+    fp16 and bf16, an unaligned view) agrees with the eager W8A8 law."""
+    from cozy_runtime.internal import int8_linear, kernel_cache, kernel_compile, kernel_sources
+
+    store = kernel_cache.Store(tmp_path / "kernels")
+    kernel_cache.configure(store)
+    major, minor = torch.cuda.get_device_capability(0)
+    state = kernel_compile.wait(store, kernel_sources.job(int8_linear.OP, major * 10 + minor))
+    assert state.state == "ready", state.line()
+    assert int8_linear.native(torch, 0) is not None
+    generator = torch.Generator().manual_seed(11)
+    for rows, out_features, in_features in (
+        (1, 1024, 4096),
+        (3, 768, 512),
+        (77, 1280, 2048),
+        (300, 4096, 1280),
+    ):
+        values = torch.randn(out_features, in_features, generator=generator).numpy() * 0.02
+        encoded = encode_int8_convrot256("w", values)
+        data = torch.frombuffer(bytearray(encoded.payload), dtype=torch.int8)
+        data = data.reshape(out_features, in_features).cuda()
+        scale = torch.frombuffer(bytearray(encoded.companions[0].raw), dtype=torch.float32).cuda()
+        for dtype in (torch.bfloat16, torch.float16):
+            x = torch.randn(1, rows + 1, in_features, generator=generator).to("cuda", dtype)[:, 1:]
+            bias = torch.randn(out_features, generator=generator).to("cuda", dtype)
+            got = int8_linear.linear(torch, x, data, scale, bias, dtype)
+            want = int8_linear.eager(torch, x, data, scale, torch.float32) + bias.float()
+            assert got.shape == (1, rows, out_features) and got.dtype == dtype
+            error = float((got.float() - want).norm() / want.norm())
+            assert error < 0.01, (rows, out_features, in_features, dtype, error)
