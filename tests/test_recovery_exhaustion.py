@@ -9,7 +9,7 @@ from typing import Any
 import msgspec
 import pytest
 
-from cozy_runtime.internal import image_vae, lora_bake, weight_policy
+from cozy_runtime.internal import lora_bake, weight_policy
 from cozy_runtime.internal import weights as source
 from cozy_runtime.internal.encoding import SPEC_PLAIN, Encoded, RolePart
 from cozy_runtime.internal.executor import Executor
@@ -185,48 +185,6 @@ def test_exhausted_functional_op_without_a_python_body_keeps_its_contract(
     assert module.calls == 0 and failed.calls == 1
     with weights.recovering(), torch.inference_mode():
         assert torch.equal(torch.nn.functional.linear(value, weight), value)
-
-
-def test_exhausted_sdk_decoder_body_keeps_its_resumable_output_only_contract(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    diffusers = pytest.importorskip("diffusers")
-    torch.manual_seed(74)
-    vae = diffusers.AutoencoderKL(
-        down_block_types=("DownEncoderBlock2D",) * 2,
-        up_block_types=("UpDecoderBlock2D",) * 2,
-        block_out_channels=(8, 8),
-        norm_num_groups=4,
-    ).eval()
-    latent = torch.randn(1, 4, 2, 3)
-    with torch.inference_mode():
-        expected = image_vae.Decode(vae, latent, band=100).run().sample
-    conv = vae.decoder.conv_in
-    weights, _region, trace = wrapped(conv, monkeypatch, root=vae)
-    monkeypatch.setattr(weights, "shrink", lambda _need, _keep=0: 0)
-    within = trace["residency"]._within("model")
-    calls = []
-
-    def fail_once(module: Any, body: Any) -> Any:
-        if module is not conv:
-            return within(module, body)
-
-        def pass_body() -> Any:
-            out = body()
-            calls.append(1)
-            if len(calls) == 1:
-                raise torch.OutOfMemoryError("SDK output-only pass failed after its writes")
-            return out
-
-        return within(module, pass_body)
-
-    decode = image_vae.Decode(vae, latent, band=100)
-    with torch.inference_mode():
-        with pytest.raises(ResidencyRefusal) as failure:
-            decode.run(fail_once)
-        assert failure.value.code == INDIVISIBLE and not trace["residency"].poisoned
-        assert torch.equal(decode.run(fail_once).sample, expected)
-    assert calls == [1, 1] and trace["acquired"] == trace["released"] == 2
 
 
 def test_an_executor_capacity_failure_keeps_its_generation_serving(

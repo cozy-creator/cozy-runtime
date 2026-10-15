@@ -29,7 +29,7 @@ from tensorfs.derived import Derivation, Part, Target, Tensor  # noqa: E402
 from cozy_runtime.author._activity import asides  # noqa: E402
 from cozy_runtime.author._loader import census  # noqa: E402
 from cozy_runtime.author.kernels import rms_rope_split_half  # noqa: E402
-from cozy_runtime.internal import accel, image_vae, paging, plane, weight_policy  # noqa: E402
+from cozy_runtime.internal import accel, paging, plane, weight_policy  # noqa: E402
 from cozy_runtime.internal import weights as weights_module  # noqa: E402
 from cozy_runtime.internal.derive import Observations, serving_substrate  # noqa: E402
 from cozy_runtime.internal.encoding import SPEC_PLAIN  # noqa: E402
@@ -1995,6 +1995,7 @@ def plane_vae(weights: Weights, root: Path, factory: Any) -> tuple[Any, Any]:
 
 def decode(model: Any, z: Any, cap: int = -1) -> Any:
     weights = model.residency.weights
+    weights.modes.clear()  # as every call starts
     if cap >= 0:
         weights.set_cap(cap)
     model.residency.admit("run", ("vae",))
@@ -2018,58 +2019,31 @@ def room(weights: Weights, nbytes: int) -> int:
 @on_gpu
 def test_an_image_decode_short_of_memory_is_still_the_untiled_image(tmp_path: Path) -> None:
     """Run 4281 (SDXL in 1.5 GiB) fell back to a blended tiled decode 30 dB from its control.
-    The decode is now exact in row bands: with room its maps stay on the card; under a cap too
-    small for them they live in host memory. Either way the image is diffusers' untiled one to
-    fp16 rounding. The cap is the process's own: the card is never filled."""
+    Diffusers' own decode runs as it is: with room, untouched; under a cap too small for its
+    maps, an op that runs out runs in bands of rows with its result in host memory, and the
+    ops after it read those rows over the bus once each. Either way the image is the untiled
+    one to fp16 rounding. The cap is the process's own: the card is never filled."""
     weights = Weights(torch, torch.device("cuda", 0), "cuda")
     weights.set_budget(-1, pinned=1 << 30)
     model, plain = plane_vae(weights, tmp_path / "vae", kl_vae)
     z = torch.randn(1, 4, 256, 256, device="cuda", dtype=torch.float16)  # 512x512 pixels
     with torch.inference_mode():
         reference = plain.decode(z).sample
-        exact = image_vae.Decode(plain, z)
     del plain
     roomy = decode(model, z)
-    assert weights.modes["vae.decode"] == f"chunked {exact.rows}"
-    short = decode(model, z, room(weights, exact.peak(True)))
-    assert weights.modes["vae.decode"] == f"chunked {exact.rows} host"
+    assert "bands" not in weights.modes
+    short = decode(model, z, room(weights, 96 << 20))
+    assert "host memory" in weights.modes["bands"]
     for image in (roomy, short):
         torch.testing.assert_close(image, reference, atol=1e-2, rtol=0)
 
 
 @on_gpu
-def test_a_driver_out_of_memory_in_a_host_map_decode_makes_room_and_runs_again(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Run 4297 (Anima in 1.25 GiB): on a full card the driver could not make the decode's copy
-    streams, an error that is not torch's OutOfMemoryError, and the run failed. Room is made
-    and the decode runs again; the image is still the untiled one."""
-    weights = Weights(torch, torch.device("cuda", 0), "cuda")
-    weights.set_budget(-1, pinned=1 << 30)
-    model, plain = plane_vae(weights, tmp_path / "vae", kl_vae)
-    z = torch.randn(1, 4, 256, 256, device="cuda", dtype=torch.float16)
-    with torch.inference_mode():
-        reference = plain.decode(z).sample
-        exact = image_vae.Decode(plain, z)
-    del plain
-    made, full = image_vae.streams, [torch.AcceleratorError("CUDA error: out of memory")]
-
-    def streams(*args: Any) -> Any:
-        if full:
-            raise full.pop()
-        return made(*args)
-
-    monkeypatch.setattr(image_vae, "streams", streams)
-    image = decode(model, z, room(weights, exact.peak(True)))
-    assert not full and weights.modes["vae.decode"] == f"chunked {exact.rows} host"
-    torch.testing.assert_close(image, reference, atol=1e-2, rtol=0)
-
-
-@on_gpu
 def test_a_qwen_image_vae_decodes_exactly_on_the_plane(tmp_path: Path) -> None:
-    """Anima's VAE (diffusers' AutoencoderKLQwenImage) with tiling on, as the published package
-    constructs it: the plane decodes it in row bands whatever the package asked, on one kernel
-    tap per causal convolution. The image is the stock untiled decode's, to fp16."""
+    """Anima's VAE (diffusers' AutoencoderKLQwenImage) decodes a lone frame through causal 3D
+    convolutions, two of each one's three taps on zero padding: each runs as the 2D
+    convolution of the tap that meets the frame. With room and short of it, the image is the
+    stock decode's to fp16."""
     diffusers = pytest.importorskip("diffusers")
     torch.manual_seed(5)
 
@@ -2080,14 +2054,14 @@ def test_a_qwen_image_vae_decodes_exactly_on_the_plane(tmp_path: Path) -> None:
     weights.set_budget(1 << 30, pinned=1 << 30)
     model, plain = plane_vae(weights, tmp_path / "vae", vae)
     z = torch.randn(1, 16, 1, 64, 64, device="cuda", dtype=torch.float16)
-    model.stack.enable_tiling()
-    image = decode(model, z)
-    assert weights.modes["vae.decode"].startswith("chunked ")
-    assert image.shape == (1, 3, 1, 512, 512)
     with torch.inference_mode():
         reference = plain.decode(z).sample
-    # a 2D kernel and other band shapes: the image moves by a few fp16 ulps
-    torch.testing.assert_close(image, reference, atol=1e-2, rtol=0)
+    del plain
+    images = [decode(model, z), decode(model, z, room(weights, 48 << 20))]
+    assert "host memory" in weights.modes["bands"]
+    for image in images:
+        assert image.shape == (1, 3, 1, 512, 512)
+        torch.testing.assert_close(image, reference, atol=1e-2, rtol=0)
 
 
 @on_card
@@ -2128,11 +2102,11 @@ def test_a_decode_unmaps_idle_weights_only_for_the_room_it_needs(card: Any, tmp_
     was, mapped = weights.facts(), weights.resident_bytes(stack)
     assert mapped > 0
     image = squeezed(latents[0])
-    assert weights.modes["vae.decode"].startswith("chunked ")
     assert weights.facts().evictions == was.evictions and weights.resident_bytes(stack) >= mapped
     torch.testing.assert_close(image, references[0], atol=1e-2, rtol=0)
+    weights.modes.clear()
     image = squeezed(latents[1], left=8 << 20)
-    assert not weights.modes["vae.decode"].endswith(" host")
+    assert "host memory" not in weights.modes.get("bands", "")
     assert weights.resident_bytes(stack) < mapped
     torch.testing.assert_close(image, references[1], atol=1e-2, rtol=0)
 
@@ -2187,5 +2161,4 @@ def test_a_decode_takes_no_room_from_its_stages_floor(card: Any, tmp_path: Path)
     finally:
         denoiser.residency.release("render", ("stack",))
         torch.cuda.empty_cache()
-    assert weights.modes["vae.decode"].startswith("chunked ")
     torch.testing.assert_close(image, reference, atol=1e-2, rtol=0)

@@ -42,9 +42,9 @@ from cozy_runtime.author._executor_requests import DeviceTierAnswer, SealedPlan,
 from cozy_runtime.author._loader import Census, TensorLike, TensorSpec, _members
 from cozy_runtime.internal import (
     accel,
+    bands,
     budget_cell,
     canonical,
-    image_vae,
     lora_bake,
     plane,
     proctree,
@@ -405,6 +405,8 @@ class Weights:
         )
         self.owner_floor = -1
         self.floor_free = self.display_floor
+        #: ops run in bands of rows when their operands live in host memory or they run out
+        self.bands = None if self.host_only else bands.Bands(self)
         if not self.host_only:
             self.measure_context()
             _observe_refusals(torch, self)
@@ -832,10 +834,7 @@ class Weights:
         if self.kind != "cuda" or self.grouped:
             return False
         want = need + weight_policy.MARGIN
-        room = self._lockable()
-        if 0 <= room < want and self.pinned_applied > 0:
-            self._pin(max(self.pinned_applied - 2 * (want - room), 0))
-            room = self._lockable()
+        room = self.lockable(want)
         device = self.torch.device("cuda", self.index)
         with self.torch.utils._python_dispatch._disable_current_modes():
             moved = spill.spill(self.torch, device, want, operands, want if room < 0 else room)
@@ -847,13 +846,41 @@ class Weights:
         )
         return moved > 0
 
+    def lockable(self, want: int) -> int:
+        """Host bytes this process may lock for `want` (a spill, a banded op's result): half
+        of what the host has free, the pinned tier's weights, which the page cache and disk
+        hold too, giving way first. -1: unreadable."""
+        room = self._lockable()
+        if 0 <= room < want and self.pinned_applied > 0:
+            self._pin(max(self.pinned_applied - 2 * (want - room), 0))
+            room = self._lockable()
+        return room
+
     def _lockable(self) -> int:
-        """Host bytes a spill may lock: half of what the host has free. -1: unreadable."""
+        """Half of what the host has free. -1: unreadable."""
         try:
             available = proctree.host_memory().available
         except proctree.ProcessTreeUnsupported:
             return -1
         return available // 2 if available >= 0 else -1
+
+    def activation_room(self) -> tuple[int, int]:
+        """What torch can allocate now, and the mapped weight bytes no open stage holds: the
+        room an op's own tensors may have, idle weights unmapped first (`free_for`)."""
+        if self.open:
+            residency, _, local = self.open[-1]
+            return residency.room(local)
+        device = plane.stats(self.plane).device(self.index)
+        movable = device.committed - device.leased_bytes - device.held_bytes
+        return self.allocatable(), max(movable, 0)
+
+    def free_for(self, need: int) -> None:
+        """Activations first: idle weights unmap until torch can allocate `need` bytes, as far
+        as `activation_room` counts them."""
+        free, movable = self.activation_room()
+        if need > free and movable > 0:
+            mapped = plane.stats(self.plane).device(self.index).committed
+            self.shrink(need - free, max(mapped - movable, self.floor()))
 
     def allocatable(self) -> int:
         """Device bytes torch can allocate now: its headroom plus its own idle cache."""
@@ -1637,7 +1664,24 @@ def _recovery_type(torch: ModuleType) -> type:
             self, func: Any, types: Any, args: tuple[Any, ...] = (), kwargs: Any = None
         ) -> Any:
             kwargs = kwargs or {}
+            out = self._run(func, args, kwargs)
+            spill.touch(_tensor_operands((*args, *kwargs.values(), out)))
+            if self.journal is not None:
+                self.journal.made(out)
+            return out
+
+        def _run(self, func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
             journal = self.journal
+            banded = self.weights.bands
+            if banded is not None:
+                try:
+                    out = banded.run(func, args, kwargs)
+                except Exception as exc:
+                    if not is_device_oom(exc):
+                        raise
+                    out = NotImplemented  # it recovers as any op does, below
+                if out is not NotImplemented:
+                    return out
             drawn = _generators(torch, func, args, kwargs) if seeded in func.tags else []
             states = [(g, g.get_state()) for g in drawn]
             targets: list[Tensor] = []
@@ -1654,10 +1698,7 @@ def _recovery_type(torch: ModuleType) -> type:
                             journal.before_write(targets)
                         copied = pointwise not in func.tags
                         written = [(t, t.clone()) for t in targets] if copied else []
-                    out = func(*args, **kwargs)
-                    if journal is not None:
-                        journal.made(out)
-                    return out
+                    return func(*args, **kwargs)
                 except Exception as exc:
                     need, refused = _room_for(exc, refused)
                 # outside `except`, so the failed op's frames are gone; it runs again from
@@ -1666,6 +1707,15 @@ def _recovery_type(torch: ModuleType) -> type:
                     generator.set_state(state)
                 for target, first in written or ():
                     target.copy_(first)
+                if banded is not None:
+                    try:  # out of memory whole: in bands of rows when it can be
+                        out = banded.run(func, args, kwargs, short=True)
+                    except Exception as exc:
+                        if not is_device_oom(exc):
+                            raise
+                        out = NotImplemented  # still out at its finest: room is made
+                    if out is not NotImplemented:
+                        return out
                 self.weights.make_room(need, (*args, *kwargs.values()), str(func))
 
     return Recovery
@@ -1675,13 +1725,16 @@ def _recovery_type(torch: ModuleType) -> type:
 class Effects:
     """What a block's forward changes outside itself, as its first run showed: whether it
     writes into tensors that existed before it (its inputs, its buffers, anything held
-    elsewhere), and the generators its seeded ops draw from. A forward that changes nothing
-    else runs again unobserved after an out-of-memory; one that writes runs observed, its
-    writes journaled; the generators are put back either way. Python attributes it changes
-    (a counter on the module) are not seen."""
+    elsewhere), the generators its seeded ops draw from, and whether the bands rewrote an op
+    of it (`Bands.rewrites`: a convolution past its padding's zeros, an op cut in rows). A
+    forward that changes nothing else runs again unobserved after an out-of-memory; one that
+    writes runs observed, its writes journaled; the generators are put back either way; one
+    the bands rewrote keeps its ops' recovery, which rewrites them. Python attributes it
+    changes (a counter on the module) are not seen."""
 
     writes: bool
     generators: tuple[Any, ...]
+    banded: bool = False
 
 
 @dataclass(slots=True)
@@ -1737,8 +1790,8 @@ class Journal:
         self.made_here.clear()
         self.first.clear()
 
-    def effects(self) -> Effects:
-        return Effects(self.wrote or bool(self.kept), tuple(self.drawn.values()))
+    def effects(self, banded: bool = False) -> Effects:
+        return Effects(self.wrote or bool(self.kept), tuple(self.drawn.values()), banded)
 
 
 _JOURNALING: dict[int, type] = {}
@@ -3010,9 +3063,6 @@ class WeightResidency:
         weights.residencies.add(self)
         for component in self.components.values():
             self._hook(component)
-            vae: Any = component.root
-            if image_vae.exact(vae):
-                vae.decode = self._decode(component.name, vae.decode)
 
     def _hook(self, component: Component) -> None:
         """One wrapper per block region: its module's forward acquires and releases it. A CPU
@@ -3383,7 +3433,10 @@ class WeightResidency:
             # The stage's transient activations go back to the driver: kept in torch's cache
             # they would hold the next stage's weights out (run 5908: a text encoder refused
             # for 1.2 GB beside a decode's 7.4 GB of idle cache) and every other tenant's.
+            # Host blocks no tensor holds any more are the host's again.
             accel.release_cached(weights.torch, weights.kind)
+            if weights.kind == "cuda":
+                spill.release(weights.torch)
 
     def map_ahead(self) -> tuple[int, bool]:
         """Map every component's resident set now, as one stage of all of them would place
@@ -3742,11 +3795,14 @@ class WeightResidency:
                 if (
                     effects is not None
                     and not effects.writes
+                    and not effects.banded
                     and not weights.grouped
                     and not region.tight
+                    and not _hosts(args, kwargs)
                 ):
                     # Writes nothing that existed before it: it runs unobserved, and only
-                    # the generators it draws from are kept for a second run.
+                    # the generators it draws from are kept for a second run. Inputs in
+                    # host memory are read in bands, by the ops' recovery.
                     kept = [(g, g.get_state()) for g in effects.generators]
 
                     def rewind() -> None:
@@ -3758,10 +3814,12 @@ class WeightResidency:
                 # Its first run, a block that writes into tensors it did not make, or one
                 # GPU of a group: its ops recover one by one, journaled.
                 journal = Journal()
+                rewrites = weights.bands.rewrites if weights.bands is not None else 0
                 with weights.recovering(journal):
                     out = rewound(journal.rewind, *args, **kwargs)
                 if effects is None and not weights.host_only:
-                    region.effects = journal.effects()
+                    banded = weights.bands is not None and weights.bands.rewrites > rewrites
+                    region.effects = journal.effects(banded)
                 return out
             except _Regrained:
                 # Placed again from inside its own attempt, the component moved to another
@@ -4108,66 +4166,6 @@ class WeightResidency:
         if index not in component.seen:
             component.seen.append(index)
 
-    def _decode(self, name: str, decode: Callable[..., Any]) -> Callable[..., Any]:
-        """An image VAE's decode, exact in row bands (`image_vae.Decode`) on a partition that
-        never depends on memory: memory decides only where its maps live. Idle weights unmap
-        for its maps and bands first (activations first); short of that room, or out of memory
-        part way, its maps live in host memory, and a failed step runs again from its input.
-        Out of device memory on host maps (a driver call included), room is made and it runs again.
-        The mode is recorded in the run's outputs."""
-        weights = self.weights
-
-        def run(z: Tensor, *args: object, **kwargs: object) -> object:
-            exact = image_vae.plan(self.components[name].root, z, *args, **kwargs)
-            if exact is None:
-                return decode(z, *args, **kwargs)
-            if weights.host_only:  # its weights are bound whole: no room to make
-                return exact.run()
-            if self.active is not None:
-                weights.adaptive.add(self.active[0])
-            free, evictable = self.room((name,))
-            need = exact.peak(host=False)
-            host = need > self._room_for_decode(name, free, evictable, min(need, free + evictable))
-            while True:
-                try:
-                    out = exact.run(self._within(name), host)
-                    break
-                except Exception as exc:
-                    oom = is_device_oom(exc)
-                    refused = isinstance(exc, ResidencyRefusal) and exc.code == INDIVISIBLE
-                    if not oom and (host or not refused):
-                        raise
-                    need = _requested(exc) if host else -1
-                # outside `except`, so the failed step's frames are gone
-                accel.release_cached(weights.torch, weights.kind)
-                if need >= 0:
-                    # Already on host maps: weights unmap and idle tenants leave, then the
-                    # failed step runs again from its input; a retry that gains nothing ends
-                    # it by its own name.
-                    weights.make_room(need, (), f"{name}.decode")
-                host = True
-            weights.modes[f"{name}.decode"] = f"chunked {exact.rows}" + (" host" if host else "")
-            # The decode's transient activations go back to the driver: kept in torch's
-            # cache they shrink the next grant, and the weights the decode unmapped come
-            # back into exactly that room.
-            accel.release_cached(weights.torch, weights.kind)
-            return out
-
-        return run
-
-    def _within(self, name: str) -> image_vae.Within:
-        """Run a body with a module's weights bound once for all of it: through the block's
-        own hook when the module is a block region; as it is otherwise (common weights, or a
-        module whose block regions the body binds itself)."""
-        component = self.components[name]
-        regions = {id(region.module): region for region in component.blocks}
-
-        def within(module: object, body: Callable[[], Any]) -> Any:
-            region = regions.get(id(module))
-            return body() if region is None else self._block(component, region, body)()
-
-        return within
-
     def unpark(self) -> None:
         """Close a repeating stage left open: another stage, an attempt's end, or a budget
         change comes first."""
@@ -4199,18 +4197,6 @@ class WeightResidency:
                 weights.plane.prioritise(component.ws, weights.index, None, priority=idle)
         if failure is not None:
             raise failure
-
-    def _room_for_decode(self, name: str, free: int, evictable: int, need: int) -> int:
-        """Activations first: idle weights leave before a decode needs their room, since a
-        decode run short of memory takes slower convolutions. Never what the open stages hold
-        (it may still be filling) and never their floor: a component that streams has little
-        resident, and its next block needs its ring. Returns what is free after."""
-        if need <= free or evictable <= 0:
-            return free
-        weights = self.weights
-        mapped = plane.stats(weights.plane).device(weights.index).committed
-        weights.shrink(need - free, max(mapped - evictable, weights.floor()))
-        return self.room((name,))[0]
 
     def _drop(self, components: Sequence[Component]) -> None:
         weights = self.weights
@@ -4380,6 +4366,16 @@ def _device_pool(exc: BaseException) -> bool:
     if pool is not None:
         return bool(pool == "device")
     return str(exc).startswith("budget exceeded in device")
+
+
+def _hosts(args: tuple[Any, ...], kwargs: Mapping[str, Any]) -> bool:
+    """Whether a tensor input (one level deep) lives in host memory."""
+    return bool(spill.HELD) and any(
+        spill.hosted(item)
+        for value in (*args, *kwargs.values())
+        for item in (value if isinstance(value, (tuple, list)) else (value,))
+        if type(item).__name__ in ("Tensor", "Parameter")
+    )
 
 
 def _versions(args: tuple[Any, ...], kwargs: Mapping[str, Any]) -> tuple[int, ...]:
