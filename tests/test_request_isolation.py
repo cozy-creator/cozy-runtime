@@ -52,6 +52,9 @@ def generate(ctx: Context, payload: Request, tel: Telemetry) -> Result:
         ctx.raise_if_cancelled()
     if payload.mode == "fail":
         raise RuntimeError("handler state is now unknown")
+    if payload.mode == "long":
+        progress = "\\n".join(f"Downloading part {n} of 400" for n in range(400))
+        raise RuntimeError(f"{progress}\\nthe cause, on the last line")
     if payload.mode == "contract":
         contract_failure()
     if payload.mode == "env":
@@ -121,6 +124,18 @@ def test_handler_refusals_and_cancels_keep_the_generation_ready(
 
     failed = _serve(executor, "failed", "fail")
     assert failed["outcome"]["terminal"] == "failed" and failed["poisoned"]
+
+
+def test_a_long_failure_keeps_its_cause_on_its_last_line(
+    host: tuple[Executor, dict[str, Any]],
+) -> None:
+    executor, load = host
+    assert executor.load(msgspec.convert({**load, "construction": "a"}, Load))["ok"]
+    assert executor.activate(Activate(construction="a"))["ok"]
+    message = _serve(executor, "long", "long")["outcome"]["message"]
+    assert len(message) <= 2048 and " [...] " in message, message
+    assert message.startswith("RuntimeError: Downloading part 0 of 400"), message
+    assert message.endswith("the cause, on the last line"), message
 
 
 def test_an_attempt_whose_tail_raises_names_its_cause_and_stage(

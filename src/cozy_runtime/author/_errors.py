@@ -100,6 +100,15 @@ Terminal = Literal["succeeded", "refused", "failed", "canceled"]
 Origin = Literal["author", "request", "runtime"]
 
 
+def ends(text: str, limit: int) -> str:
+    """`text` within `limit` chars: whole, or its head and tail around a marker. A failure's
+    first line names the operation and its last lines the cause."""
+    if len(text) <= limit:
+        return text
+    head = limit // 4
+    return f"{text[:head]} [...] {text[len(text) - (limit - head - 7):]}"
+
+
 @dataclass(frozen=True, slots=True)
 class Outcome:
     """What ONE attempt reports at the invocation boundary — neutral FACTS only (§2).
