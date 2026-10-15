@@ -66,7 +66,7 @@ def test_static_main_equals_execution_adapter(tmp_path: Path, body: str) -> None
     modules = ("cozy_script", "cozy_script_entry")
     previous = {name: sys.modules.pop(name) for name in modules if name in sys.modules}
     try:
-        expected = package_interface.build(discover(root))
+        expected = package_interface.source_facts(package_interface.build(discover(root)))
     finally:
         for name in modules:
             sys.modules.pop(name, None)
@@ -111,7 +111,7 @@ def test_a_script_that_runs_a_model_slot_is_served_with_its_default_ladder(
     modules = ("cozy_script", "cozy_script_entry", "script_models")
     previous = {name: sys.modules.pop(name) for name in modules if name in sys.modules}
     try:
-        expected = package_interface.build(discover(root))
+        expected = package_interface.source_facts(package_interface.build(discover(root)))
     finally:
         for name in modules:
             sys.modules.pop(name, None)
@@ -142,7 +142,7 @@ def test_a_script_reads_raw_weights_of_a_declared_layout(tmp_path: Path) -> None
     modules = ("cozy_script", "cozy_script_entry", "script_models")
     previous = {name: sys.modules.pop(name) for name in modules if name in sys.modules}
     try:
-        expected = package_interface.build(discover(root))
+        expected = package_interface.source_facts(package_interface.build(discover(root)))
     finally:
         for name in modules:
             sys.modules.pop(name, None)
