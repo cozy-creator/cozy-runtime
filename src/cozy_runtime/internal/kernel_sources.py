@@ -436,8 +436,14 @@ RECIPES: dict[str, Recipe] = {
         ),
         Recipe("comfy-kitchen", "setup", ("comfy-kitchen",), build_deps=("nanobind",)),
         # `torch.ops.cozy.int8_*` (`int8_linear`): the Runtime's own sources and CUTLASS's
-        # headers; its CUTLASS 3.x units peak near 3 GB each.
-        Recipe("cozy-int8", "setup", ("cozy-int8-src", "cutlass"), place={"cutlass": "cutlass"}),
+        # headers. Its CUTLASS 3.x unit peaks at 6.2 GB (cicc, sm90), the mma.sync one at 2.6.
+        Recipe(
+            "cozy-int8",
+            "setup",
+            ("cozy-int8-src", "cutlass"),
+            place={"cutlass": "cutlass"},
+            unit_bytes=7 << 30,
+        ),
         Recipe(PYTHON, "python"),
     )
 }

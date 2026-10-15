@@ -162,7 +162,7 @@ def linear(
                     x, data, scale, bias, out_dtype, convrot=True, convrot_groupsize=CONVROT_GROUP
                 )
     out = eager(torch, x, data, scale, out_dtype)
-    return out if bias is None else out + bias
+    return out if bias is None else out + bias.to(out.dtype)
 
 
 def eager(torch: ModuleType, x: Tensor, data: Tensor, scale: Tensor, out_dtype: Tensor) -> Tensor:
