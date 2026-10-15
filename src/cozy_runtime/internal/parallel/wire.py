@@ -1,6 +1,7 @@
 """Transport sharded component arguments as JSON control and tensor snapshots.
 
-Tensor bytes live in the call's shared spool. Followers read the exact dtype and
+A mirrored call's tensors cross over the group's own collectives (`Broadcast`); a call to
+one follower's tensors live in the call's shared spool. Followers take the exact dtype and
 shape onto their own device. Values are snapshots; aliases, generators, callbacks
 and other Python state are not transported. A module can cross only as the identity
 of a prepared component root whose owning scope is active on every rank.
@@ -35,7 +36,7 @@ class UncrossableArgument(GroupRefusal):
 
 
 class _Tensor(msgspec.Struct, frozen=True, tag_field=_TAG, tag="tensor"):
-    """A tensor's bytes in the spool file `v`, with the exact dtype and shape."""
+    """A tensor's bytes: the spool file `v`, or the `v`th broadcast of the call."""
 
     v: str
     dtype: str
@@ -92,6 +93,8 @@ class RunCommand(msgspec.Struct, frozen=True, tag_field="cmd", tag="run"):
     method: str | msgspec.UnsetType = msgspec.UNSET
     p2p: bool | msgspec.UnsetType = msgspec.UNSET
     spare: bool | msgspec.UnsetType = msgspec.UNSET
+    #: the tensors cross by `Broadcast`, after this command, rather than the spool
+    broadcast: bool = False
 
     @classmethod
     def read(cls, command: Mapping[str, object]) -> RunCommand:
@@ -151,7 +154,75 @@ class TensorSpool:
         self.written = 0
 
 
-def marshal(value: object, spool: TensorSpool, *, path: str = "") -> Json:
+class Broadcast:
+    """One mirrored call's tensors, sent over the group's collectives straight from GPU 0's
+    memory to every follower's, in the order `marshal` met them, after the command: no byte
+    crosses the host or a file (a 15 s H3 step's inputs are ~125 MB)."""
+
+    def __init__(self, components: Mapping[tuple[str, str], Any] | None = None) -> None:
+        self.tensors: list[Any] = []
+        self.components = dict(components or {})
+        self.component_names = {id(root): key for key, root in self.components.items()}
+
+    def write(self, tensor: Any) -> str:
+        self.tensors.append(tensor)
+        return str(len(self.tensors) - 1)
+
+    def send(self, pg: Any, device: Any) -> None:
+        """GPU 0's side, over the group as it is formed now (a rerun forms it again)."""
+        import torch
+
+        with torch.utils._python_dispatch._disable_current_modes():
+            for tensor in self.tensors:
+                if tensor.numel():
+                    value = tensor.detach().resolve_conj().resolve_neg()
+                    value = value if device is None else value.to(device)
+                    torch.distributed.broadcast(_bytes(value.contiguous()), src=0, group=pg)
+
+    def receive(self, command: Mapping[str, object], pg: Any, device: Any) -> Broadcast:
+        """A follower's side: every tensor the command names, in GPU 0's order, onto `device`."""
+        import torch
+
+        run = RunCommand.read(command)
+        specs = sorted((int(t.v), t.dtype, t.shape) for t in _tensors([run.args, run.kwargs]))
+        with torch.utils._python_dispatch._disable_current_modes():
+            for index, (at, dtype, shape) in enumerate(specs):
+                kind = getattr(torch, dtype, None)
+                if at != index or not isinstance(kind, torch.dtype):
+                    raise UncrossableArgument(f"malformed broadcast tensor {at} ({dtype})")
+                tensor = torch.empty(shape, dtype=kind, device=device)
+                if tensor.numel():
+                    torch.distributed.broadcast(_bytes(tensor), src=0, group=pg)
+                self.tensors.append(tensor)
+        return self
+
+    def read(self, name: str, dtype: str, shape: list[int], device: Any) -> Any:
+        return self.tensors[int(name)]
+
+    def clear(self) -> None:
+        self.tensors.clear()
+
+
+def _bytes(tensor: Any) -> Any:
+    import torch
+
+    return tensor.reshape(-1).view(torch.uint8)
+
+
+def _tensors(value: Json) -> Iterator[_Tensor]:
+    """The tensor envelopes in wire data (a frame's dict keys may arrive in any order)."""
+    if isinstance(value, list):
+        for item in value:
+            yield from _tensors(item)
+    elif isinstance(value, dict):
+        if value.get(_TAG) == "tensor":
+            yield msgspec.convert(value, _Tensor)
+        else:
+            for item in value.values():
+                yield from _tensors(item)
+
+
+def marshal(value: object, spool: TensorSpool | Broadcast, *, path: str = "") -> Json:
     """One call argument -> JSON-native tagged data, or refuse by name."""
     import torch
 
@@ -200,7 +271,7 @@ def marshal(value: object, spool: TensorSpool, *, path: str = "") -> Json:
     )
 
 
-def unmarshal(value: Json, spool: TensorSpool, *, device: Any) -> object:
+def unmarshal(value: Json, spool: TensorSpool | Broadcast, *, device: Any) -> object:
     """Wire data -> the argument, on THIS rank's device."""
     if isinstance(value, list):
         return [unmarshal(v, spool, device=device) for v in value]
@@ -292,7 +363,7 @@ class RunReply(msgspec.Struct, frozen=True):
 
 
 def run_call(
-    command: Mapping[str, object], spool: TensorSpool, *, device: Any
+    command: Mapping[str, object], spool: TensorSpool | Broadcast, *, device: Any
 ) -> tuple[tuple[object, ...], dict[str, object]]:
     """A follower's side of a `RunCommand`: its arguments on THIS rank's device."""
     run = RunCommand.read(command)

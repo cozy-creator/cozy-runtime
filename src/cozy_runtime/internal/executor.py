@@ -1150,7 +1150,13 @@ class Executor:
                 served = stack.enter_context(attention_ulysses.observing())
                 args, kwargs = wire.run_call(
                     command,
-                    wire.TensorSpool(spool / str(command.get("payloads", "ranks")), references),
+                    wire.Broadcast(references).receive(
+                        command, self.pg, self._rank_device(self.torch)
+                    )
+                    if command.get("broadcast")
+                    else wire.TensorSpool(
+                        spool / str(command.get("payloads", "ranks")), references
+                    ),
                     device=self._rank_device(self.torch),
                 )
                 if spread:
@@ -1318,6 +1324,7 @@ class Executor:
                     ),
                     rerun=owner._group_rerun,
                     journaled=owner._call_journal,
+                    device=self._rank_device(torch),
                 )
         hosted = mirror.hosting_plan(
             placeable=tuple(getattr(type(model), "__placeable__", ())),
