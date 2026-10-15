@@ -49,6 +49,7 @@ from urllib.parse import urlparse
 from packaging.tags import sys_tags
 from packaging.utils import parse_wheel_filename
 
+from cozy_runtime._cpus import cpus
 from cozy_runtime.internal import accel, config, egress, kernel_cache, kernel_compile
 
 ROOT = Path("/opt/cozy/kernel-sources")
@@ -766,7 +767,7 @@ def build_setup(
             )
         )
         nvcc.chmod(0o755)
-        jobs = kernel_compile.cpus()
+        jobs = cpus()
         environment.update(
             {
                 # Upstream's own knobs: extensions at once, and ninja jobs within each.
