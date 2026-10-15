@@ -16,8 +16,8 @@ from cozy_runtime.author._app import App
 from cozy_runtime.author._context import Context
 from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._script_metadata import byte_parameter, declarations, main_definition
-from cozy_runtime.author._script_types import _ScriptSource, annotation, parameter_type
-from cozy_runtime.author._services import JOB_ONLY, Telemetry
+from cozy_runtime.author._script_types import annotation
+from cozy_runtime.author._services import Telemetry
 from cozy_runtime.author._signature import _classify
 
 
@@ -112,12 +112,13 @@ def script_app(module: str) -> App:
                 continue
             if parameter.annotation is None:
                 raise ValueError("injected parameters need a type")
-            value = parameter_type(parameter.annotation, tree)
+            value = annotation(parameter.annotation, tree)
             if byte_parameter(value):
                 payload_types[parameter.arg] = value
                 continue
-            if _classify(parameter.arg, value, "script main").role not in {"model", "service"}:
-                raise ValueError("script parameter must declare a model or service")
+            role = _classify(parameter.arg, value, "script main").role
+            if role not in {"model", "weights", "service"}:
+                raise ValueError("script parameter must declare a model, Weights or service")
             types[parameter.arg] = value
         where = "main declarations are"
         if weights and not execution_context:
@@ -136,16 +137,8 @@ def script_app(module: str) -> App:
     telemetry_name = next(
         (name for name, value in types.items() if value is Telemetry), "_script_telemetry"
     )
-    params = [_classify(name, value, "script main") for name, value in types.items()]
-    emits_media = any(param.capability == "save" for param in params)
-    # Like a package author choosing app.entrypoint or app.job: a script that runs Model slots
-    # is served (constructed models); one that reads sources, writes weights or uses job
-    # services is a job, as is one with no Model slot.
-    job = (
-        bool(weights)
-        or _ScriptSource in types.values()
-        or any(param.capability in JOB_ONLY for param in params)
-        or not any(param.role == "model" for param in params)
+    emits_media = any(
+        _classify(name, value, "script main").capability == "save" for name, value in types.items()
     )
     app = App()
 
@@ -189,11 +182,11 @@ def script_app(module: str) -> App:
                     "script exited with a nonzero status", code="script_exit"
                 ) from exc
         except (RuntimeError, AssertionError) as exc:
-            if not accelerator and _cuda_unavailable(exc):
+            if accelerator is False and _cuda_unavailable(exc):
                 raise ConformanceError(
-                    f"this script used CUDA on a CPU slot ({exc}); declare "
-                    "`accelerator = true` under [tool.cozy] in its script metadata",
-                    code="job_needs_accelerator",
+                    f"this script used CUDA but declares `accelerator = false` ({exc}); "
+                    "remove that line from its [tool.cozy] metadata",
+                    code="cpu_script_used_cuda",
                 ) from exc
             raise
         ctx.raise_if_cancelled()
@@ -220,10 +213,7 @@ def script_app(module: str) -> App:
         ],
         return_annotation=result_type,
     )
-    if job:
-        app.job(
-            main, weights=weights, emits_media=emits_media, accelerator=accelerator, defaults=models
-        )
-    else:
-        app.entrypoint(main, defaults=models)
+    app.entrypoint(
+        main, weights=weights, emits_media=emits_media, accelerator=accelerator, defaults=models
+    )
     return app

@@ -6,7 +6,7 @@ import ast
 import operator
 import tomllib
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Literal
 
 from cozy_runtime.author._assets import Asset, Tree
 from cozy_runtime.author._errors import ConformanceError
@@ -127,9 +127,9 @@ type Rungs = list[dict[str, Any]]
 
 def declarations(
     raw: bytes,
-) -> tuple[dict[str, Rungs], tuple[WeightsOutput, ...], bool | None]:
+) -> tuple[dict[str, Rungs], tuple[WeightsOutput, ...], Literal[False] | None]:
     """A script's `[tool.cozy]`: its model default ladders (a lane string is one `*` rung), its
-    weights outputs and accelerator (None undeclared: the machine's GPU when it has one)."""
+    weights outputs and `accelerator = false` (absent: the machine's GPU when it has one)."""
     block: list[str] = []
     opened = found = False
     for line in raw.decode("utf-8").splitlines():
@@ -152,8 +152,8 @@ def declarations(
     if not isinstance(cozy, dict) or set(cozy) - {"models", "weights", "accelerator"}:
         raise ValueError("script tool.cozy accepts models, weights and accelerator only")
     accelerator = cozy.get("accelerator")
-    if accelerator is not None and type(accelerator) is not bool:
-        raise ValueError("script accelerator must be a boolean")
+    if accelerator is not None and accelerator is not False:
+        raise ValueError("script accelerator is false or absent")
     declared = cozy.get("models", {})
     if not isinstance(declared, dict):
         raise ValueError("script models must map parameter names to default ladders")

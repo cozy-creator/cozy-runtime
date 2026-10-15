@@ -18,7 +18,6 @@ import os
 import shutil
 import stat
 import threading
-import time
 import warnings
 from collections.abc import Buffer, Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -26,7 +25,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
-from typing import Any, Literal, NoReturn, Protocol, TypeVar, cast, runtime_checkable
+from typing import Any, Literal, Protocol, TypeVar, cast, runtime_checkable
 
 from cozy_runtime.author import _codec
 from cozy_runtime.author._activity import settle, work_clock
@@ -51,7 +50,6 @@ from cozy_runtime.author._decode import (
 )
 from cozy_runtime.author._errors import AuthorError, CapabilityError, OutputError
 from cozy_runtime.author._executor_requests import Publish, Published, PublishPart
-from cozy_runtime.author._model_reader import WeightsReader
 from cozy_runtime.author._observations import Attribution, EventRing, Observation, Scalar
 
 T = TypeVar("T")
@@ -1610,273 +1608,6 @@ class Secrets[S]:
         self.value = value
 
 
-# ----------------------------------------------------------------------- job services
-
-
-@dataclass(frozen=True, slots=True)
-class CheckpointDeclaration:
-    """One attempt DECLARED a checkpoint, and the declaration is recorded.
-
-    NOT A DURABILITY RECEIPT, and the name is the fix (#553a). The type this replaces was
-    called `CheckpointReceipt` and carried a `receipt_id`, which is what a caller reads when
-    it decides the bytes survive an executor kill. Nothing stores the bytes: the worker
-    keeps a process-local metadata row and the protocol's `JobCheckpointRequest.artifact`
-    field goes out empty, so the only true fact in the exchange is that an attempt said it
-    had a checkpoint, with this digest, at this length. That fact is what this carries.
-
-    `replayed` says the identity was already recorded and this call added nothing.
-    """
-
-    declaration_id: str
-    operation_key: str
-    logical_key: str
-    content_digest: str
-    length: int
-    replayed: bool = False
-
-
-class CheckpointConflict(CapabilityError):
-    """One logical/operation key, two different contents. Never a replacement (§2)."""
-
-    default_code = "checkpoint_conflict"
-
-
-class CheckpointSinkUnbuilt(CapabilityError):
-    """`Checkpoints.save()` is HARD-DISABLED: checkpoint use of TensorFS derivation is absent.
-
-    The dependency is named because it is the whole answer — #552 adopted ONE ARTIFACT
-    TRANSACTION, in which Runtime's TensorFS derivation writes TensorFS objects and returns a
-    durable receipt. Model outputs now have that transaction; checkpoints do not yet have
-    the separate immutable-operation identity and lifecycle needed to reuse it. `declare()`
-    is what remains true in the meantime.
-    """
-
-    default_code = "checkpoint_sink_unbuilt"
-
-
-@dataclass(frozen=True, slots=True)
-class CheckpointSave:
-    """What the runtime is asked to make durable. Bytes stay in the attempt's own spool."""
-
-    operation_key: str
-    logical_key: str
-    content_digest: str
-    length: int
-    path: Path
-
-
-@dataclass(frozen=True, slots=True)
-class BudgetFacts:
-    """The cost-governor facts for ONE job attempt, from the TYPED CONFIG CHANNEL (§2).
-
-    Cost facts are not filesystem state and the GPU rate never arrives through environment:
-    the deployment config plane owns these values and they are digest-pinned into the
-    execution spec like any other setting.
-    """
-
-    gpu_rate_usd_per_hour: float = 0.0
-    gpu_count: int = 0
-    cap_usd: float = 0.0
-    started_monotonic: float = 0.0
-
-
-class BudgetExhausted(CapabilityError):
-    """The attempt reached its declared spend cap. A FACT, never a retry command."""
-
-    default_code = "budget_exhausted"
-
-
-class Scratch(_Bound):
-    """Job service (§2) — bounded working storage for ONE run.
-
-    `checkpoint_dir(key=)` is keyed on the RUN, not the attempt: a retried attempt of the
-    same run is handed back the SAME tree, which is what makes resume real rather than a
-    naming convention. `mktemp()` and `materialize_blob()` are attempt-scoped and die with
-    the attempt spool.
-    """
-
-    __slots__ = ("_root",)
-
-    def __init__(self, attempt: Attempt, root: Path | None = None) -> None:
-        super().__init__(attempt)
-        self._root = root
-
-    def _base(self, what: str) -> Path:
-        self._attempt.check_open(what)
-        if self._root is None:
-            raise CapabilityError(
-                f"{what}: no scratch is granted to this attempt — Scratch is a JOB service, "
-                "and the runtime allocates its tree per run before the body starts",
-                code="scratch_unavailable",
-            )
-        return self._root
-
-    def checkpoint_dir(self, *, key: str) -> Path:
-        """The SAME directory for the same (run, key) across attempts. Resumable by
-        construction — a retried attempt reads what the killed one left."""
-        base = self._base("Scratch.checkpoint_dir")
-        if not key or "/" in key or key.startswith("."):
-            raise CapabilityError(
-                f"scratch key {key!r} is not a bare name: a key is a flat label, never a path",
-                code="scratch_key",
-            )
-        target = base / "checkpoints" / key
-        target.mkdir(parents=True, exist_ok=True)
-        return target
-
-    def mktemp(self, suffix: str = "") -> Path:
-        """An attempt-scoped temporary path. Dies with the attempt; never resumable."""
-        base = self._base("Scratch.mktemp")
-        target = base / "tmp"
-        target.mkdir(parents=True, exist_ok=True)
-        return target / f"{self._attempt.next_handle('scratch').rsplit('/', 1)[-1]}{suffix}"
-
-    def materialize_blob(self, data: bytes, *, name: str = "") -> Path:
-        """Put bytes on the filesystem for a library that only takes a path."""
-        target = self.mktemp() if not name else self._base("Scratch.materialize_blob") / name
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(data)
-        return target
-
-
-class Checkpoints(_Bound):
-    """Job service (§2) — checkpoint DECLARATIONS. `save()` is hard-disabled (#553a).
-
-    What this service could honestly do and what it CLAIMED to do had come apart. The claim
-    was that `save()` made bytes durable and returned only once they were. The mechanism was
-    a metadata row: the worker records (run, attempt, operation key, logical key, content
-    digest, length) in process memory and the RecordOwner stores a copy, while the
-    protocol's `JobCheckpointRequest.artifact` field — the only place bytes could ride — goes
-    out empty and no component anywhere copies or stores them. A killed executor took every
-    checkpoint with it, and the receipt said otherwise.
-
-    So the identity, the idempotency and the CONFLICT rule are all real and all kept — they
-    are properties of the declaration, and repeating one adds nothing while the same keys
-    with different bytes stay a conflict, never a replacement. The DURABILITY is the part
-    that was not real, and `save()` now refuses `checkpoint_sink_unbuilt` naming the
-    checkpoint integration with TensorFS derivation #552. When that integration exists, `save()`
-    gets a body again and the acceptance test is the one #553a names: kill executor and
-    worker, recover BYTES by receipt, never a process record.
-    """
-
-    __slots__ = ("_sink",)
-
-    def __init__(
-        self,
-        attempt: Attempt,
-        sink: Callable[[CheckpointSave], CheckpointDeclaration] | None = None,
-    ) -> None:
-        super().__init__(attempt)
-        self._sink = sink
-
-    def declare(
-        self, logical_key: str, data: bytes | Path, *, operation_key: str = ""
-    ) -> CheckpointDeclaration:
-        """Record that this attempt HAS a checkpoint: its keys, digest and length.
-
-        Everything this returns is true. The bytes stay exactly where the caller put them —
-        the attempt spool, or the run's `Scratch.checkpoint_dir(key=)` tree, which is what
-        actually survives into the next attempt today.
-        """
-        self._attempt.check_open("Checkpoints.declare")
-        if self._sink is None:
-            raise CapabilityError(
-                "no durable checkpoint exchange is installed for this attempt: Checkpoints is "
-                "a JOB service and its exchange is the worker's, never a local file write",
-                code="checkpoints_unavailable",
-            )
-        if not logical_key:
-            raise CapabilityError("a checkpoint needs a logical key", code="checkpoint_key")
-        blob = Path(data) if isinstance(data, Path) else None
-        if blob is None:
-            assert isinstance(data, bytes)
-            blob = self._attempt.spool / f"ckpt-{self._attempt.next_handle('ckpt')[-4:]}"
-            blob.write_bytes(data)
-        raw = blob.read_bytes()
-        return self._sink(
-            CheckpointSave(
-                operation_key=operation_key or logical_key,
-                logical_key=logical_key,
-                # SHA-256, the one identity spelling the platform uses for content (law 1),
-                # so the declaration the RecordOwner holds is addressable by the same digest.
-                content_digest="sha256:" + hashlib.sha256(raw).hexdigest(),
-                length=len(raw),
-                path=blob,
-            )
-        )
-
-    def save(self, logical_key: str, data: bytes | Path, *, operation_key: str = "") -> NoReturn:
-        """HARD-DISABLED. Refuses `checkpoint_sink_unbuilt` — see the class docstring.
-
-        `NoReturn` is the point: there is no value this can hand back, so no caller can be
-        holding a receipt for bytes nobody stored. `declare()` is the honest half.
-        """
-        del data, operation_key
-        self._attempt.check_open("Checkpoints.save")
-        raise CheckpointSinkUnbuilt(
-            f"{logical_key or '<unkeyed>'}: Checkpoints.save() is disabled because the "
-            "checkpoint-to-TensorFS derivation lifecycle is unbuilt — model outputs have a durable "
-            "transaction, but checkpoint identity/adoption is still absent. Use "
-            "Checkpoints.declare() for the fact that IS true (an attempt declared this "
-            "checkpoint), and Scratch.checkpoint_dir(key=) for bytes a retried attempt of "
-            "the same run can read back."
-        )
-
-
-class Budget(_Bound):
-    """Job service (§2) — the attempt's spend envelope, as its own service.
-
-    Cost facts are NOT filesystem state and the GPU rate is not an environment variable:
-    everything here comes from the typed config channel. It reports facts and raises when
-    the declared cap is reached; it never decides retryability and never prices anything.
-    """
-
-    __slots__ = ("_facts",)
-
-    def __init__(self, attempt: Attempt, facts: BudgetFacts | None = None) -> None:
-        super().__init__(attempt)
-        self._facts = facts
-
-    def _read(self) -> BudgetFacts:
-        self._attempt.check_open("Budget")
-        if self._facts is None:
-            raise CapabilityError(
-                "no budget is granted to this attempt: Budget is a JOB service and its facts "
-                "arrive on the typed config channel, never from the environment",
-                code="budget_unavailable",
-            )
-        return self._facts
-
-    @property
-    def gpu_rate_usd_per_hour(self) -> float:
-        return self._read().gpu_rate_usd_per_hour
-
-    @property
-    def cap_usd(self) -> float:
-        return self._read().cap_usd
-
-    def elapsed_s(self) -> float:
-        facts = self._read()
-        return max(0.0, time.monotonic() - facts.started_monotonic)
-
-    def spent_usd(self) -> float:
-        """GPU-seconds x rate x devices. The one arithmetic, in the one place."""
-        facts = self._read()
-        return self.elapsed_s() / 3600.0 * facts.gpu_rate_usd_per_hour * max(facts.gpu_count, 1)
-
-    def remaining_usd(self) -> float:
-        return self._read().cap_usd - self.spent_usd()
-
-    def raise_if_exhausted(self) -> None:
-        """THE spend spelling, mirroring `ctx.raise_if_cancelled()`."""
-        facts = self._read()
-        if facts.cap_usd and self.spent_usd() >= facts.cap_usd:
-            raise BudgetExhausted(
-                f"the attempt spent {self.spent_usd():.4f} USD of a {facts.cap_usd:.4f} USD "
-                f"cap after {self.elapsed_s():.1f} s on {max(facts.gpu_count, 1)} device(s)"
-            )
-
-
 #: capability name -> service type. The ONE table injection and derivation share, so a
 #: capability cannot exist without an injectable service or vice versa.
 SERVICES: Mapping[str, type] = {
@@ -1886,23 +1617,8 @@ SERVICES: Mapping[str, type] = {
     "egress": Egress,
     "settings": Settings,
     "secrets": Secrets,
-    "scratch": Scratch,
-    "checkpoints": Checkpoints,
-    "budget": Budget,
     "media_decode": MediaDecoder,
-    "weights_read": WeightsReader,
 }
-
-#: The one service set a JOB may request and a serving entrypoint may not (§2). A job runs
-#: to completion and owns durable working state; a request handler owns neither.
-JOB_ONLY: frozenset[str] = frozenset(
-    {"scratch", "checkpoints", "budget", "weights", "weights_read"}
-)
-
-#: The mirror: SERVING-ONLY surface. `adjust` writes the caller-visible adjustments envelope,
-#: which is a fact about serving one request; a run-to-completion job has no caller to
-#: confess to and no envelope to write into.
-SERVING_ONLY: frozenset[str] = frozenset({"adjust"})
 
 #: capability name -> why NOTHING can grant it yet. A capability with no grant path refuses
 #: at BUILD, naming what has to land, rather than passing describe and deploy and failing on

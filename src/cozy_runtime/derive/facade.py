@@ -24,10 +24,10 @@ from tensorfs.derived import Derivation, SourceInspection, Target, derive
 
 from cozy_runtime.author import (
     Context,
-    Model,
     ModelArtifact,
     Telemetry,
     UnsupportedInput,
+    Weights,
 )
 
 if TYPE_CHECKING:
@@ -136,7 +136,7 @@ def plan(
 
 
 def quantize(
-    source: Model[Any] | SourceInspection,
+    source: Weights[Any] | SourceInspection,
     plan: QuantizePlan,
     /,
     *,
@@ -146,14 +146,14 @@ def quantize(
 ) -> QuantizeResult:
     """Run one lane end-to-end and commit it, tier-1 tripwire inside.
 
-    ``source`` is the granted source Model (constructed or derive-only) or the
-    native source inspection already fetched from it — both reach the same tensors.
+    ``source`` is a granted ``Weights`` argument or the native source inspection
+    already fetched from it — both reach the same tensors.
     """
     return _quantize(source, plan, ctx=ctx, tel=tel, output=output)[0]
 
 
 def quantize_artifact(
-    source: Model[Any] | SourceInspection,
+    source: Weights[Any] | SourceInspection,
     plan: QuantizePlan,
     /,
     *,
@@ -188,7 +188,7 @@ def _artifact_result(
 
 
 def _quantize(
-    source: Model[Any] | SourceInspection,
+    source: Weights[Any] | SourceInspection,
     plan: QuantizePlan,
     /,
     *,

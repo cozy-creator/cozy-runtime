@@ -23,6 +23,7 @@ environment, protocol or network), so it lives beside the types it enforces and
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 from collections.abc import Callable, Coroutine, Mapping, Sequence
 from contextlib import ExitStack
@@ -65,28 +66,22 @@ from cozy_runtime.author._executor_requests import Publish, Published
 from cozy_runtime.author._markers import AssetBound
 from cozy_runtime.author._media import KIND_MEDIA, admits
 from cozy_runtime.author._model import Model
-from cozy_runtime.author._model_reader import ReadValues, WeightsReader
 from cozy_runtime.author._observations import Observation, Track
 from cozy_runtime.author._services import (
     MAX_OUTPUT_BYTES,
     AdjustmentRow,
     Adjustments,
     Attempt,
-    Budget,
-    BudgetFacts,
-    CheckpointDeclaration,
-    Checkpoints,
-    CheckpointSave,
     Egress,
     Outputs,
     ProgressFrame,
-    Scratch,
     Secrets,
     Settings,
     Telemetry,
 )
 from cozy_runtime.author._signature import Param, Surface
 from cozy_runtime.author._walker import field_values, strip, unwrap_optional, walk
+from cozy_runtime.author._weights import ReadValues, Weights
 from cozy_runtime.author.publication import upload_checkpoint
 
 if TYPE_CHECKING:
@@ -126,15 +121,8 @@ class Invocation:
     """An explicit deployment ceiling narrows every field's own `AssetBound`.
     None honors each installed field's declared bound, with 64 MiB for fields that
     declare none. A larger field never widens an undeclared sibling's allowance."""
-    scratch: Path | None = None
-    """The RUN's scratch tree — the same directory across attempts of one run, which is what
-    makes `Scratch.checkpoint_dir(key=)` resumable rather than merely named (§2)."""
-    checkpoints: Callable[[CheckpointSave], CheckpointDeclaration] | None = None
-    """The checkpoint DECLARATION exchange. Distinct from the lossy progress lane on
-    purpose: the lossy lane has no authority over a recorded fact. It carries no bytes —
-    see `Checkpoints` (#553a)."""
-    budget: BudgetFacts | None = None
-    """Cost-governor facts from the typed config channel. Never read from environment."""
+    sources: Mapping[str, Weights[Any]] = field(default_factory=dict)
+    """`Weights[M]` parameter -> its raw checkpoint, read through this attempt's source."""
     weights_values: ReadValues | None = None
     tensorfs_source: Callable[[str], SourceCapability] | None = None
     tensorfs_output: Callable[[str, Derivation], DerivedTransaction] | None = None
@@ -272,15 +260,15 @@ def _bind_tensorfs(
         record.check_open("Context TensorFS capability")
         ctx.raise_if_cancelled()
 
-    def source(model: Model[object]) -> SourceCapability:
+    def source(weights: Weights[Any]) -> SourceCapability:
         current()
         if source_reader is None or not any(
-            model is candidate for candidate in inv.models.values()
+            weights is candidate for candidate in inv.sources.values()
         ):
             raise CapabilityError(
-                "source is not an admitted model input", code="weights_source_ungranted"
+                "source is not an admitted Weights input", code="weights_source_ungranted"
             )
-        capability = source_reader(model.checkpoint_ref)
+        capability = source_reader(weights.checkpoint_ref)
         handles.callback(capability.close)
 
         def inspect(components: Sequence[str], configs: Sequence[str]) -> Any:
@@ -331,6 +319,9 @@ def _bind_tensorfs(
         return receipt_adopter(receipt)
 
     ctx._tensorfs_source, ctx._tensorfs_output, ctx._tensorfs_adopt = source, output, adopt
+    for weights in inv.sources.values():
+        weights._bind(functools.partial(source, weights), inv.weights_values)
+        handles.callback(weights._bind, None, None)
 
 
 def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> InvocationResult:
@@ -899,7 +890,7 @@ def _inject(
             kwargs[param.name] = getattr(overlay.payload, param.name)
         elif param.role == "preflight":
             kwargs[param.name] = facts
-        elif param.role == "model":
+        elif param.role in ("model", "weights"):
             model = _model(param, inv)
             artifact = getattr(overlay.payload, param.name, None) if surface.invocable else None
             if artifact is not None and (
@@ -925,7 +916,7 @@ def _inject(
 
 
 def _model(param: Param, inv: Invocation) -> object:
-    model = inv.models.get(param.name)
+    model = (inv.sources if param.role == "weights" else inv.models).get(param.name)
     if model is None:
         raise InvalidRequest(
             f"no model bound for parameter {param.name!r}: bindings state selection "
@@ -952,16 +943,6 @@ def _service(
             return Settings(_settings_value(param.arg, inv.settings, "settings"))
         case "secrets":
             return Secrets(_settings_value(param.arg, inv.secrets, "secrets"))
-        case "scratch":
-            return Scratch(attempt, inv.scratch)
-        case "checkpoints":
-            return Checkpoints(attempt, inv.checkpoints)
-        case "budget":
-            return Budget(attempt, inv.budget)
-        case "weights_read":
-            return WeightsReader(
-                attempt, inv.models, ctx.tensorfs_source, inv.cancel, inv.weights_values
-            )
     raise ConformanceError(f"no injector for capability {param.capability!r}")
 
 
