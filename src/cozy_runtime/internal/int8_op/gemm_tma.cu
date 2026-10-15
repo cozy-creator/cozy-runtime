@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // The int8 GEMM on TMA cards, CUTLASS 3.x with the dequant in an EVT epilogue,
 // D = out(acc * scales[m] * w_scale[n] + bias[n]); COZY_SM picks the card's table.
-// Hopper (90): warp-specialized wgmma; the tiles are vLLM's `scaled_mm_sm90_int8_dispatch.cuh`
-// (Apache-2.0) plus the cooperative 128x256 and 256x128. Datacenter Blackwell (100): tcgen05,
-// one-SM and two-SM tiles after SGLang's `convrot_int8` (Apache-2.0).
+// Hopper (90): warp-specialized wgmma, tiles after vLLM's `scaled_mm_sm90_int8_dispatch.cuh`
+// (Apache-2.0). Datacenter Blackwell (100): tcgen05, one-SM and two-SM tiles after SGLang's
+// `convrot_int8` (Apache-2.0).
 #include <cuda.h>
 
 // CUTLASS asks the runtime for the driver's tensor-map encoder on every TMA descriptor; ask
@@ -37,6 +37,7 @@ inline CUresult encode_tiled(CUtensorMap* map, CUtensorMapDataType type, cuuint3
 #include <cutlass/gemm/kernel/gemm_universal.hpp>
 #include <cutlass/util/packed_stride.hpp>
 
+#include <algorithm>
 #include <atomic>
 
 #include "int8.h"
@@ -148,32 +149,22 @@ int choose(int M, int N, int K) {
     return M >= 256 && (K <= 8192 || M <= 2048) ? 1 : 0;
 }
 #else
+// Measured on an H100 SXM at our shapes against vLLM's table (`scaled_mm_sm90_int8_dispatch`,
+// whose 128x128 2x1-cluster ping-pong is 0) and cooperative wide tiles: no cluster is as fast
+// below ~4k rows and its launch costs the host ~2 us less.
 template <typename Out>
 const Fn<Out> kConfigs[] = {
-    // 0-4: vLLM's table (default, M128, M64, M32 N >= 8192, M32 N < 8192)
-    &TmaGemm<Out, Shape<_128, _128, _128>, Shape<_2, _1, _1>, Pingpong>::run,
-    &TmaGemm<Out, Shape<_64, _128, _128>, Shape<_2, _1, _1>, Pingpong>::run,
-    &TmaGemm<Out, Shape<_64, _64, _256>, Shape<_1, _1, _1>, Basic>::run,
-    &TmaGemm<Out, Shape<_64, _128, _256>, Shape<_1, _4, _1>, Basic>::run,
-    &TmaGemm<Out, Shape<_64, _64, _256>, Shape<_1, _8, _1>, Basic>::run,
-    // 5-6: cooperative wide tiles
-    &TmaGemm<Out, Shape<_128, _256, _128>, Shape<_2, _1, _1>, Cooperative>::run,
-    &TmaGemm<Out, Shape<_256, _128, _128>, Shape<_2, _1, _1>, Cooperative>::run,
-    // 7-8: SGLang's small-M tiles
-    &TmaGemm<Out, Shape<_64, _64, _128>, Shape<_2, _1, _1>, Basic>::run,
-    &TmaGemm<Out, Shape<_64, _128, _128>, Shape<_2, _1, _1>, Basic>::run,
-    // 9-11: without a cluster, whose launch costs the host ~3 us
-    &TmaGemm<Out, Shape<_128, _128, _128>, Shape<_1, _1, _1>, Pingpong>::run,
-    &TmaGemm<Out, Shape<_128, _256, _128>, Shape<_1, _1, _1>, Cooperative>::run,
-    &TmaGemm<Out, Shape<_64, _128, _128>, Shape<_1, _1, _1>, Pingpong>::run,
+    &TmaGemm<Out, Shape<_128, _128, _128>, Shape<_2, _1, _1>, Pingpong>::run,     // 0
+    &TmaGemm<Out, Shape<_64, _64, _256>, Shape<_1, _1, _1>, Basic>::run,          // 1
+    &TmaGemm<Out, Shape<_128, _128, _128>, Shape<_1, _1, _1>, Pingpong>::run,     // 2
+    &TmaGemm<Out, Shape<_128, _256, _128>, Shape<_1, _1, _1>, Cooperative>::run,  // 3
 };
-constexpr int kTmaConfigs = 12;
+constexpr int kTmaConfigs = 4;
 
-int choose(int M, int N, int) {
-    if (M <= 32) return N >= 8192 ? 3 : 4;
-    if (M <= 64) return 2;
+int choose(int M, int N, int K) {
     if (M <= 128) return 1;
-    return 0;
+    if (K >= 4 * N && K >= 5120) return 3;
+    return M >= 4096 && std::min(N, K) >= 3072 ? 0 : 2;
 }
 #endif
 
