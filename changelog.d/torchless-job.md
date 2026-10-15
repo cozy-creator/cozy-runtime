@@ -1,0 +1,1 @@
+A job whose environment has no torch never imports torch: an undeclared job that TensorD 0.5.30 gives the machine's GPU runs on the visible devices it was given (run 6132: a torch-free script failed with `ModuleNotFoundError: torch` on every GPU machine under 0.24.0).
