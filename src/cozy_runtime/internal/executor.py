@@ -22,7 +22,7 @@ Its whole surface is the seam (`internal/seam.py`), and its whole vocabulary is:
     prepare_request  resolve ONE request (decode, normalize, preflight) and retain it, so
               TensorD prices a plan against the record the handler will actually run
     invoke    run ONE PREPARED attempt through the author invocation kernel and report its facts
-    run_job   run ONE @app.job to completion through the SAME kernel, with job services
+    run_job   run ONE function whose models are all Weights, without a session (U4 deletes it)
     probe     device/host memory facts, for TensorD's ledger reconciliation
     shutdown  cooperative exit
 
