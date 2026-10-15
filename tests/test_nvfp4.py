@@ -33,6 +33,13 @@ def weight(rows: int, cols: int, seed: int) -> np.ndarray:
     return values
 
 
+def test_the_leaf_is_a_leaf_provider() -> None:
+    from cozy_runtime.internal.encoding import LeafProvider, Nvfp4NativeLeaf
+
+    # Qualification runs a native oracle only for a LeafProvider; a missing member skips it.
+    assert isinstance(Nvfp4NativeLeaf(SPEC_NVFP4), LeafProvider)
+
+
 def test_chunked_encode_uses_the_tensor_amax() -> None:
     values = weight(32, 64, 3)
     whole = encode_nvfp4("w", values)
