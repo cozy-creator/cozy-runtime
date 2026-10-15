@@ -45,7 +45,6 @@ from cozy_runtime.internal.weights import (  # noqa: E402
 )
 from cozy_runtime.internal.weights_sink import weights_transaction_id  # noqa: E402
 
-pytestmark = pytest.mark.skipif(not plane.available(), reason="a TensorFS with the weight plane")
 # These tests fill the card to its last megabytes: never on one a desktop is drawn on.
 on_card = pytest.mark.skipif(
     not accel.present(torch, "cuda") or accel.drives_display(0),

@@ -61,7 +61,6 @@ def test_dtype_view_is_read_only_and_missing_supplied_key_refuses() -> None:
     assert Config({}).tensor_dtype("linear.weight", default="f32") == "f32"
 
 
-@pytest.mark.skipif(not plane.available(), reason="a TensorFS with the weight plane")
 @pytest.mark.parametrize("dtype,width", [("f32", 4), ("f16", 2)])
 def test_native_checkpoint_registers_the_dtype_selected_constructor(
     tmp_path: Path,

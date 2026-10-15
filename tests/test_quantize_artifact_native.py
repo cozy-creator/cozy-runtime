@@ -33,7 +33,6 @@ from cozy_runtime.derive import plan, quantize_artifact
 from cozy_runtime.derive import safetensors_io as st
 from cozy_runtime.derive.microscale import encode_fp8_rowwise, encode_mxfp8
 from cozy_runtime.derive.quantization import prepare_source_quantization, quantization_additions
-from cozy_runtime.internal import plane
 from cozy_runtime.internal.encoding import TORCH_DTYPES
 from cozy_runtime.internal.fill import Checkpoint
 from cozy_runtime.internal.weights import PlaneBackend
@@ -358,8 +357,6 @@ def test_quantized_encoding_keeps_the_source_precision_contract(
 
 def test_fp16_quantized_native_header_enters_fp16_fill(tmp_path: Path) -> None:
     torch = pytest.importorskip("torch")
-    if not plane.available():
-        pytest.skip("a TensorFS with the weight plane")
     store = tensorfs.Store.init(tmp_path / "store")
     source = _source(store, "unet", "f16")
     result, outcome, _ = _run(

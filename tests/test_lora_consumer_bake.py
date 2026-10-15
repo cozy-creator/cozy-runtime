@@ -12,7 +12,7 @@ from typing import Any
 import pytest
 
 from cozy_runtime.author import Artifact, Config, Loader
-from cozy_runtime.internal import accel, plane
+from cozy_runtime.internal import accel
 from cozy_runtime.internal.fill import Checkpoint, tensor_schema_of
 from cozy_runtime.internal.weights import LoRASource, PlaneBackend, WeightResidency, Weights
 
@@ -27,7 +27,7 @@ from diffusers.modular_pipelines.minimax_h3.before_denoise import (  # noqa: E40
 from test_lora_composition import Value, model  # noqa: E402
 from testdata.consumer_lora import armed, block_linears, install, overlay_for  # noqa: E402
 
-DEVICES = ["cpu"] + (["cuda"] if accel.present(torch, "cuda") and plane.available() else [])
+DEVICES = ["cpu"] + (["cuda"] if accel.present(torch, "cuda") else [])
 
 
 def _dit() -> Any:

@@ -19,7 +19,7 @@ pytest.importorskip("diffusers.modular_pipelines.minimax_h3")
 import tensorfs  # noqa: E402
 
 from cozy_runtime.author import Artifact, Config, Loader  # noqa: E402
-from cozy_runtime.internal import accel, lora_composition, plane  # noqa: E402
+from cozy_runtime.internal import accel, lora_composition  # noqa: E402
 from cozy_runtime.internal.fill import Checkpoint, tensor_schema_of  # noqa: E402
 from cozy_runtime.internal.weights import PlaneBackend, WeightResidency, Weights  # noqa: E402
 from test_device_tier import Custody, executor_with  # noqa: E402
@@ -29,10 +29,7 @@ from test_lora_consumer_bake import _dit, _inputs, _overlay  # noqa: E402
 from test_lora_peft import TinyModel  # noqa: E402
 from testdata.consumer_lora import armed  # noqa: E402
 
-pytestmark = [
-    pytest.mark.skipif(not plane.sharing(), reason="a TensorFS that shares GPU regions"),
-    pytest.mark.skipif(not accel.present(torch, "cuda"), reason="a CUDA card"),
-]
+pytestmark = pytest.mark.skipif(not accel.present(torch, "cuda"), reason="a CUDA card")
 
 
 def construct(weights: Weights, checkpoint: Checkpoint, name: str, pipeline: Any) -> Any:

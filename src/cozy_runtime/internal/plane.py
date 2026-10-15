@@ -11,20 +11,14 @@ from __future__ import annotations
 import ctypes
 import fcntl
 import os
-from types import ModuleType
 from typing import TYPE_CHECKING, Final
+
+import msgspec
+from tensorfs import plane as _plane
 
 if TYPE_CHECKING:
     from tensorfs import ReadLease, Store
     from tensorfs.plane import Plane, Source
-
-import msgspec
-
-_plane: ModuleType | None
-try:
-    from tensorfs import plane as _plane
-except ImportError:  # an older TensorFS: the executor offers no `weight_plane/1`
-    _plane = None
 
 #: The executor capability TensorD negotiates on (`hello.memory`).
 CAPABILITY = "weight_plane/1"
@@ -154,16 +148,6 @@ class Event(msgspec.Struct, frozen=True, kw_only=True):
     detail: str = ""
 
 
-def available() -> bool:
-    return _plane is not None
-
-
-def sharing() -> bool:
-    """This TensorFS can export and attach GPU regions (whether the GPU can is the plane's
-    `device_sharing(ordinal)`)."""
-    return _plane is not None and hasattr(_plane.Plane, "export_device")
-
-
 #: Linux `fcntl` seals, by number (python-build-standalone may lack the names).
 _GET_SEALS, _ADD_SEALS = 1034, 1033
 #: seal, shrink, grow, write: what a plan memfd carries
@@ -171,21 +155,6 @@ _SEALS = 0x8 | 0x4 | 0x2 | 0x1
 #: a sealed layout: shrink, grow and sealing itself, and write or future write (its filler may
 #: still be unmapping; no other mapping or write can ever change a byte)
 _LAYOUT_SEALS, _WRITE_SEALS = 0x1 | 0x2 | 0x4, 0x8 | 0x10
-
-
-def sealed_available() -> bool:
-    """This TensorFS adopts sealed host layouts (`Plane.register_sealed`)."""
-    return _plane is not None and hasattr(_plane.Plane, "register_sealed")
-
-
-def sealed_holes() -> bool:
-    """This TensorFS takes a layout staged in part, reading its holes from object files."""
-    return sealed_available() and getattr(_plane, "SEALED_HOLES", False) is True
-
-
-def sealed_filling() -> bool:
-    """This TensorFS adopts a sealed layout still filling, waiting per region."""
-    return sealed_available() and getattr(_plane, "SEALED_WHILE_FILLING", False) is True
 
 
 def is_sealed(fd: int) -> bool:
@@ -218,8 +187,6 @@ def sealed_memfd(name: str, body: bytes) -> int:
 def open_plane(device: int | None) -> Plane:
     """Open this executor's TensorFS plane for its selected GPU. `None` opens only a CPU
     tier, with no CUDA context; a plane is local execution machinery, not a daemon RPC."""
-    if _plane is None:
-        raise Unavailable("this TensorFS build carries no weight plane")
     try:
         opened: Plane = _plane.Plane(devices=[] if device is None else [device])
         return opened
@@ -242,23 +209,16 @@ def events(plane: Plane) -> list[Event]:
 
 def hold_tier(fd: int) -> int:
     """Retain a shared CPU buffer by descriptor for the execution owner: while it holds
-    this claim, executor eviction or close cannot free the buffer's RAM. A
-    TensorFS before claims keeps the descriptor as it is."""
-    hold = getattr(_plane, "hold_tier", None)
-    return int(hold(fd)) if hold is not None else os.dup(fd)
+    this claim, executor eviction or close cannot free the buffer's RAM."""
+    return int(_plane.hold_tier(fd))
 
 
 def release_tier(hold: int) -> None:
     """End `hold_tier`: frees every region no executor claims, and closes the descriptor."""
-    release = getattr(_plane, "release_tier", None)
-    if release is not None:
-        release(hold)
-    else:
-        os.close(hold)
+    _plane.release_tier(hold)
 
 
 def error(name: str) -> type[BaseException]:
     """The plane's typed error class `name` (`Shortfall`, `BudgetExceeded`, ...)."""
-    assert _plane is not None
     found: type[BaseException] = getattr(_plane, name)
     return found

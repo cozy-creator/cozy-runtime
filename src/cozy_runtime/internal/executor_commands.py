@@ -127,12 +127,6 @@ class Revoke(Command, frozen=True, kw_only=True, tag="revoke"):
     regions: tuple[int, ...] = ()
 
 
-class Prefetch(Command, frozen=True, kw_only=True, tag="prefetch"):
-    """Fill one loaded construction's host tier now, before its attempt holds the device."""
-
-    construction: str
-
-
 class Map(Command, frozen=True, kw_only=True, tag="map"):
     """Map one loaded construction's weights onto the GPU now, inside `cap_bytes`, as its
     first stages would (`MAP`): nothing runs, and they stay mapped as after a call."""
@@ -335,8 +329,6 @@ class Load(Command, frozen=True, kw_only=True, tag="load"):
     #: A follower's half: rank 0's hardware plan and, in a many-model load, which model.
     group: GroupHardware | UnsetType = UNSET
     model_key: str | UnsetType = UNSET
-    #: The owner retains shared CPU weight buffers (`HostTier` exchanges).
-    host_tier: bool = False
     #: The pinned host tier's budget (`LOAD_PINNED`), applied before any weight set registers,
     #: so a fill never pins past it; -1: none, the executor sizes its tier from the host.
     pinned_bytes: int = -1
@@ -458,7 +450,6 @@ type KnownCommand = (
     | Budget
     | Share
     | Revoke
-    | Prefetch
     | Map
     | Unload
     | Activate

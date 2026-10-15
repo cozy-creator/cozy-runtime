@@ -1303,14 +1303,6 @@ class Weights:
         for region in component.regions:
             bind(self.torch, region, _HostSpan(component.mapping, region))
 
-    def prefetch(self, construction: str) -> int:
-        """Fill the pinned tier with `construction`'s regions, now; returns the bytes asked."""
-        return sum(
-            self._fill(component)
-            for component in self.components.values()
-            if component.key.startswith(construction + "/")
-        )
-
     def _fill(self, component: Component) -> int:
         """Want the component pinned, as many regions as the tier holds: the tier is optional,
         so one larger than it pins a prefix and the rest reads from disk."""
@@ -2550,10 +2542,6 @@ class PlaneBackend:
                 ],
                 key=str(id(self)),  # one model of a many-model load: its part of the pass
             )
-        if self.tiers is not None and self.tiers.prefetch is not None and prepared:
-            # Every component's sealed layout starts filling now, and fills while the ones
-            # before it register: each ask below waits only for its own.
-            self.tiers.prefetch([layout.sealed for layout in prepared.values()])
         for name, layout in prepared.items():
             component = self._register(name, self.roots[name], layout.keys, prepared=layout)
             self.components[name] = component
@@ -2718,7 +2706,7 @@ class PlaneBackend:
         its destinations; `refine`: again, at the sub-block grain."""
         layout = prepared or self._prepare_layout(name, root, keys, fine=refine)
         units, kept, checkpoint, plan = layout.units, layout.kept, layout.checkpoint, layout.plan
-        ids, digest, key = layout.ids, layout.digest, layout.sealed.name
+        ids, key = layout.ids, layout.sealed.name
         weights = self.weights
         # Standalone checkpoints can reread their explicit Store for a finer layout.
         # Managed checkpoints ask TensorD for the finer shared CPU layout instead.
@@ -2727,11 +2715,7 @@ class PlaneBackend:
         here = weights.fetch is None or weights.fetch.present(manifest, refs)
         staged: list[int] = []
         with store_refusals(f"registering {name}"):
-            held = None
-            if tiers is not None and tiers.seal is not None:
-                held = tiers.seal(layout.sealed)
-            elif tiers is not None:
-                held = tiers.ask(key, digest)
+            held = tiers.seal(layout.sealed) if tiers is not None else None
             sealed = held is not None and plane.is_sealed(held)
             files: list[tuple[str, int, int]] = []
             if sealed and tiers is not None and tiers.files:
@@ -2769,10 +2753,6 @@ class PlaneBackend:
             if ws is None:
                 held, sealed = None, False
                 ws = weights.plane.register(key, self._source(name, checkpoint, refs), plan, ids)
-        if tiers is not None:
-            if held is None:
-                tiers.offer(key, digest, ws.host_fd)
-            tiers.share(key, digest, ws.host_fd)
         spans = msgspec.convert(ws.regions, list[_Span])
         placed = {row.what: row for row in msgspec.convert(ws.parts, list[_Placed])}
         sites = _sites(root, name)
@@ -2872,20 +2852,11 @@ class DeviceTiers:
 
 @dataclass(frozen=True, slots=True)
 class HostTiers:
-    """Exchange CPU weight buffers, distinct from stored files and GPU allocations.
+    """The machine's sealed CPU layouts (TensorD prepares and keeps them through TensorFS),
+    distinct from stored files and GPU allocations."""
 
-    `ask` returns a matching memfd from TensorD or rank zero, or None. `offer` hands the
-    owner a buffer this executor filled; `share` passes it from rank zero to followers.
-    The sealed-layout callbacks ask TensorD to prepare/retain CPU buffers using TensorFS.
-    """
-
-    ask: Callable[[str, str], int | None]
-    offer: Callable[[str, str, int], None]
-    share: Callable[[str, str, int], None] = lambda name, layout, memfd: None
-    #: TensorD's sealed CPU layout for a plan (`SealedTier`), asked instead of `ask`
-    seal: Callable[[SealedPlan], int | None] | None = None
-    #: ask TensorD to fill the components' shared CPU layouts (`SealedPrefetch`)
-    prefetch: Callable[[list[SealedPlan]], None] | None = None
+    #: TensorD's sealed CPU layout for a plan (`SealedTier`); None: it keeps none
+    seal: Callable[[SealedPlan], int | None]
     #: stage more regions of a layout staged in part (`SealedStage`): those staged or staging
     stage: Callable[[SealedPlan, list[int]], list[int]] | None = None
     #: the verified object files behind a plan, `(sha256, length, fd)` per object of the list

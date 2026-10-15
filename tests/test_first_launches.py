@@ -13,7 +13,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from cozy_runtime.internal import accel, plane, weight_policy  # noqa: E402
+from cozy_runtime.internal import accel, weight_policy  # noqa: E402
 from cozy_runtime.internal.weights import _room_for  # noqa: E402
 
 on_card = pytest.mark.skipif(not accel.present(torch, "cuda"), reason="a CUDA card")
@@ -134,7 +134,6 @@ def test_a_started_device_runs_its_first_library_calls_on_a_full_card() -> None:
 
 
 @on_card
-@pytest.mark.skipif(not plane.available(), reason="a TensorFS with the weight plane")
 @pytest.mark.parametrize("left", [2, 8])
 def test_a_library_refused_inside_a_stage_runs_again_once_weights_made_room(
     tmp_path: Path, left: int
@@ -162,7 +161,6 @@ def test_a_library_refusal_is_given_room_once_and_then_is_its_own_failure() -> N
 
 
 @on_card
-@pytest.mark.skipif(not plane.available(), reason="a TensorFS with the weight plane")
 def test_a_convolution_on_a_full_card_runs_the_kernel_it_runs_with_room(tmp_path: Path) -> None:
     """cuDNN catches a refused workspace and falls back to a convolution that needs none (on
     an RTX 4060 Ti, implicit_convolveNd_sgemm: 4-7x slower for SeedVR2's VAE), and torch keeps

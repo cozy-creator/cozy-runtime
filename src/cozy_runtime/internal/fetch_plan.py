@@ -20,7 +20,7 @@ it refuses ends the run `model_fetch_failed` (`machine_disk_full` for a full dis
 from __future__ import annotations
 
 import threading
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
 import tensorfs
@@ -45,30 +45,29 @@ _BATCH = 1024
 _WINDOW = 4 << 20
 
 
-def objects(plan: ReadPlan) -> list[Ref]:
-    """The objects `plan` reads, in its read order, each once."""
-    return list(
-        dict.fromkeys(
-            (item["object"].removeprefix("sha256:"), item["object_length"])
-            for item in plan.items()
-            if item["source"] == "object"
-        )
-    )
+def _items(plan: ReadPlan) -> Iterator[tuple[str, Ref]]:
+    """Each object `plan` reads, with the `<component>/<tensor>` it reads into."""
+    for item in plan.items():
+        if item["source"] == "object":
+            ref = (item["object"].removeprefix("sha256:"), item["object_length"])
+            yield item["what"].rpartition("#")[0], ref
 
 
-def component_objects(header: bytes, component: str, keys: Sequence[str]) -> list[Ref]:
-    """The objects of `keys` (header order) of one component."""
-    return objects(tensorfs.plan(header, [(component, key) for key in keys], [component], _WINDOW))
+def component_objects(
+    header: bytes, component: str, keys: Sequence[str], start: int = 0
+) -> list[Ref]:
+    """The objects of one component's tensors `keys[start:]` (`keys`: all, header order)."""
+    plan = tensorfs.plan(header, [(component, key) for key in keys], [component], _WINDOW)
+    wanted = {f"{component}/{key}" for key in keys[start:]}
+    return list(dict.fromkeys(ref for what, ref in _items(plan) if what in wanted))
 
 
 def region_objects(plan: ReadPlan, regions: Sequence[Sequence[str]]) -> list[list[Ref]]:
     """Each region's objects (`regions` lists `<component>/<tensor>` ids), in read order."""
     index = {name: number for number, names in enumerate(regions) for name in names}
     found: list[dict[Ref, None]] = [{} for _ in regions]
-    for item in plan.items():
-        if item["source"] == "object":
-            ref = (item["object"].removeprefix("sha256:"), item["object_length"])
-            found[index[item["what"].rpartition("#")[0]]][ref] = None
+    for what, ref in _items(plan):
+        found[index[what]][ref] = None
     return [list(refs) for refs in found]
 
 
@@ -176,7 +175,7 @@ class Fetches:
             return True
         try:
             return all(channel.present(manifest, _wire(refs)))
-        except tensorfs.errors.Refusal as exc:
+        except (tensorfs.errors.Refusal, OSError) as exc:
             return self._unfetchable(manifest, exc)
 
     def wait(self, manifest: str, refs: Sequence[Ref]) -> None:
@@ -188,7 +187,7 @@ class Fetches:
             if not all(channel.present(manifest, _wire(refs))):
                 self._progress(*self._landed(channel))
                 channel.wait(manifest, _wire(refs))
-        except tensorfs.errors.Refusal as exc:
+        except (tensorfs.errors.Refusal, OSError) as exc:
             if not self._unfetchable(manifest, exc):
                 raise failure(manifest, refs, exc) from None
 
@@ -215,7 +214,7 @@ class Fetches:
         try:
             for start in range(0, len(refs), _BATCH):
                 channel.schedule(manifest, _wire(refs[start : start + _BATCH]), rank)
-        except tensorfs.errors.Refusal as exc:
+        except (tensorfs.errors.Refusal, OSError) as exc:
             if not self._unfetchable(manifest, exc):
                 raise
 
@@ -225,7 +224,7 @@ class Fetches:
         if _code(exc) == "SOURCE_NOT_ALLOWED":
             self._whole.add(manifest)
             return True
-        return "fetch channel closed" in str(exc)
+        return isinstance(exc, OSError) or "fetch channel closed" in str(exc)
 
     def _landed(self, channel: Fetch) -> tuple[str, float]:
         """`waiting for weights (done/total)` over the planned bytes."""
@@ -257,7 +256,7 @@ def source(
         if component not in started and key in table.get(component, {}):
             started.add(component)
             keys = list(table[component])
-            fetches.ahead(manifest, component_objects(header, component, keys[keys.index(key) :]))
+            fetches.ahead(manifest, component_objects(header, component, keys, keys.index(key)))
         opened.read_part_into(component, key, role, offset, into)
 
     return SourceCapability(

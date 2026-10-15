@@ -8,13 +8,10 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from cozy_runtime.internal import accel, plane  # noqa: E402
+from cozy_runtime.internal import accel  # noqa: E402
 from cozy_runtime.internal.weights import Weights  # noqa: E402
 
-pytestmark = [
-    pytest.mark.skipif(not plane.available(), reason="a TensorFS with the weight plane"),
-    pytest.mark.skipif(not accel.present(torch, "cuda"), reason="a CUDA card"),
-]
+pytestmark = pytest.mark.skipif(not accel.present(torch, "cuda"), reason="a CUDA card")
 MIB = 1 << 20
 
 

@@ -97,7 +97,6 @@ from cozy_runtime.author._executor_requests import (
     DeviceTierAnswer,
     FetchChannel,
     Handoff,
-    HostTier,
     ModelSource,
     ObjectFiles,
     ObjectFilesAnswer,
@@ -106,7 +105,6 @@ from cozy_runtime.author._executor_requests import (
     Request,
     Room,
     SealedPlan,
-    SealedPrefetch,
     SealedStage,
     SealedTier,
     SharedRegion,
@@ -183,7 +181,6 @@ from cozy_runtime.internal.executor_commands import (
     Load,
     Map,
     ModelLoad,
-    Prefetch,
     PrepareRequest,
     Probe,
     Release,
@@ -538,7 +535,7 @@ _WARM_NOTED: set[type] = set()
 
 #: The requests rank 0 relays to the machine for a follower (`_relay`).
 _RELAYED = frozenset(
-    {"sealed_tier", "sealed_prefetch", "sealed_stage", "object_files", "model_source"}
+    {"sealed_tier", "sealed_stage", "object_files", "model_source"}
 )
 
 #: The runtime modules a construction imports, named ONCE so `start` can warm
@@ -775,8 +772,6 @@ class Executor:
                 return self.share()
             case Revoke():
                 return self.revoke(command)
-            case Prefetch():
-                return self.prefetch(command)
             case Map():
                 return self.map(command)
             case Shutdown():
@@ -801,15 +796,15 @@ class Executor:
                 zygote.CAPABILITY,
                 "vacate_ranks",
                 LOAD_ATTENTION_PIN,
-                *(
-                    [plane.CAPABILITY, LOAD_PINNED, PROCESS_CAP, RANK_CELLS, MAP]
-                    if plane.available()
-                    else []
-                ),
-                *(plane.SHARING if plane.sharing() else ()),
-                *([SEALED_TIERS] if plane.sealed_available() else []),
-                *([SEALED_FILLING] if plane.sealed_filling() else []),
-                *([SEALED_STAGED] if plane.sealed_holes() else []),
+                plane.CAPABILITY,
+                LOAD_PINNED,
+                PROCESS_CAP,
+                RANK_CELLS,
+                MAP,
+                *plane.SHARING,
+                SEALED_TIERS,
+                SEALED_FILLING,
+                SEALED_STAGED,
             ],
             "memo": [stage_memo.CAPABILITY],
             "pgid": os.getpgrp(),
@@ -2520,7 +2515,7 @@ class Executor:
         weights.fetch = host.fetch
         # TensorD retains exported GPU allocation handles. Runtime's plane attaches those
         # allocations here and can later export its own filled regions for reuse.
-        sharing = command.device_weights and self.world == 1 and plane.sharing()
+        sharing = command.device_weights and self.world == 1
         weights.sharing = (
             DeviceTiers(ask=self._ask_device, offer=self._offer_device) if sharing else None
         )
@@ -2543,9 +2538,7 @@ class Executor:
             device_facts=device_facts,
             custody=binding.custody,
             tiers=self._tiers(
-                command.host_tier,
-                command.sealed_tiers,
-                staged=command.staged_tiers and not weights.host_only,
+                command.sealed_tiers, staged=command.staged_tiers and not weights.host_only
             ),
         )
         scopes = fetch_plan.in_definition_order(model_cls, component_use(model_cls))
@@ -3117,16 +3110,19 @@ class Executor:
         if self.fetch is not None:
             # The attempt re-asserts what it reads, on its own channel, in the order this
             # process learned: a no-op for objects already here, and every fetch stays owned
-            # by a live call. Nothing carries over from an earlier call.
-            self.fetch.end()
+            # by a live call. The channel it replaces goes only after (nothing on the wire
+            # stops), and nothing of an earlier call carries over.
             groups = [
                 group
                 for member in target.model_executors or [target]
                 if member.residency is not None
                 for group in member.residency.fetch_plan()
             ]
+            self.fetch.begin()
             if groups:
                 self.fetch.schedule(groups)
+            else:
+                self.fetch.end()
         return target.prepare_request(command)
 
     def serve_invoke(self, command: Invoke) -> dict[str, Any]:
@@ -4058,70 +4054,18 @@ class Executor:
         """One product onto the run's output log, durable before this returns."""
         return self._durable(request, Published)
 
-    def _tiers(self, worker: bool, sealed: bool = False, staged: bool = False) -> HostTiers | None:
-        """Where this rank's pinned tiers come from. Sealed: every rank asks the machine for
-        its layouts (a follower through rank 0, `_relay`), and the machine hands K ranks one
-        copy. Otherwise a follower adopts its leader's, and rank 0 asks and offers the
-        worker's tiers when it keeps them and shares every tier with its followers. `staged`:
-        a GPU executor, whose layouts may be staged in part (a CPU one computes on them)."""
-        host = self.host
-        if self.rank > 0 and not sealed:
-            return HostTiers(ask=self._leader_tier, offer=lambda *_: None)
-        worker = worker and self.rank == 0
-        if not worker and not sealed and self.group is None:
+    def _tiers(self, sealed: bool, staged: bool = False) -> HostTiers | None:
+        """The machine's sealed layouts: every rank asks for its own (a follower through rank
+        0, `_relay`), and the machine keeps one copy for all. `staged`: a GPU executor's,
+        staged in part (a CPU one computes on them). None: the machine keeps none."""
+        if not sealed:
             return None
-        # With a TensorFS that reads holes from object files, the machine stages only the
-        # regions this executor streams (`host_tiers.staged/1`).
-        staged = staged and sealed and plane.sealed_holes()
+        host = self.host
         return HostTiers(
-            ask=host._ask_tier if worker else lambda *_: None,
-            offer=host._offer_tier if worker else lambda *_: None,
-            share=(lambda *_: None) if sealed else self._share_tier,
-            seal=((lambda p: host._seal_tier(p, ())) if staged else host._seal_tier)
-            if sealed
-            else None,
-            prefetch=host._prefetch_tiers if sealed else None,
+            seal=(lambda p: host._seal_tier(p, ())) if staged else host._seal_tier,
             stage=host._stage_tier if staged else None,
             files=host._object_files if staged else None,
         )
-
-    def _share_tier(self, name: str, layout: str, memfd: int) -> None:
-        """Rank 0 hands one registered tier to every follower, in registration order."""
-        if self.group is None:
-            return
-        for follower in self.group.followers:
-            self.group.send_one(
-                follower.rank, {"event": "tier", "name": name, "layout": layout, "held": True}
-            )
-            self.group.memfd_to(follower.rank, memfd)
-
-    def _leader_tier(self, name: str, layout: str) -> int | None:
-        """A follower's tier: the one rank 0 registered for exactly this weight set."""
-        frame = self.channel.recv()
-        if (
-            frame is None
-            or frame.get("event") != "tier"
-            or (frame.get("name"), frame.get("layout")) != (name, layout)
-        ):
-            raise GroupRefusal(f"{_gpu(self.rank)} expected rank 0's tier for {name!r}")
-        return self.channel.recv_memfd() if frame.get("held") is True else None
-
-    def _ask_tier(self, name: str, layout: str) -> int | None:
-        """The pinned host tier the worker keeps for exactly this weight set's layout."""
-        answer = self._durable(HostTier(name=name, layout=layout), Tier)
-        return answer.descriptor if answer.ok and answer.held and answer.descriptor >= 0 else None
-
-    def _prefetch_tiers(self, plans: list[SealedPlan]) -> None:
-        """Start the machine filling every component's layout now (an older one refuses)."""
-        body = canonical.write([msgspec.to_builtins(plan) for plan in plans])
-        memfd = plane.sealed_memfd("cozy-sealed-plans", body)
-        try:
-            request = SealedPrefetch(
-                sha256=hashlib.sha256(body).hexdigest(), length=len(body), memfd=memfd
-            )
-            self._durable(request, Answer)
-        finally:
-            os.close(memfd)
 
     def _fetch_channel(self) -> int:
         """A fresh fetch channel for the running call (`FetchChannel`); -1: none given."""
@@ -4281,10 +4225,6 @@ class Executor:
         cell.close()
         return None
 
-    def _offer_tier(self, name: str, layout: str, memfd: int) -> None:
-        """Hand the worker a tier this process filled, so its bytes outlive the process."""
-        self._durable(HostTier(name=name, layout=layout, offer=True, memfd=memfd), Answer)
-
     def _child_events(self) -> int | None:
         """The worker's nudge socket for this attempt's calls; None from an older worker."""
         answer = self._durable(ChildEvents(), Handoff)
@@ -4300,10 +4240,7 @@ class Executor:
         body = encode_request(request)
         sending = (
             request.memfd
-            if (isinstance(request, HostTier) and request.offer)
-            or isinstance(
-                request, BudgetCell | SealedTier | SealedPrefetch | SealedStage | ObjectFiles
-            )
+            if isinstance(request, BudgetCell | SealedTier | SealedStage | ObjectFiles)
             else -1
         )
         body.pop("memfd", None)
@@ -4569,7 +4506,7 @@ class Executor:
             return
         if not on:
             weights.sharing = None
-        elif weights.sharing is None and self.world == 1 and plane.sharing():
+        elif weights.sharing is None and self.world == 1:
             weights.sharing = DeviceTiers(ask=self._ask_device, offer=self._offer_device)
 
     def revoke(self, command: Revoke) -> dict[str, Any]:
@@ -4635,24 +4572,6 @@ class Executor:
             os.close(answer.lease_fd)
             answer = msgspec.structs.replace(answer, lease_fd=-1)
         return answer
-
-    def prefetch(self, command: Prefetch) -> dict[str, Any]:
-        """Request CPU-tier fill/pinning for an existing construction through this plane.
-        This differs from the author's known-next-call hint sent to TensorD."""
-        if self.poisoned:
-            return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
-
-        def own() -> int:
-            child = self.constructions.get(command.construction)
-            if self.weights is None or child is None:
-                return 0
-            members = child.model_executors or [child]
-            return sum(self.weights.prefetch(member._group_model_key) for member in members)
-
-        filling, refused = self._followers(self._plane_ranks(), command, "prefetch", own)
-        if refused:
-            return refused
-        return {"ok": True, "filling_bytes": filling}
 
     def map(self, command: Map) -> dict[str, Any]:
         """Map one loaded construction's weights onto this GPU now, inside the owner's cap:
@@ -5040,7 +4959,6 @@ _FOLLOWER_COMMANDS = frozenset(
         "vacate",
         "restore",
         "budget",
-        "prefetch",
         "probe",
         "shutdown",
     }

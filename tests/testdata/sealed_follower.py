@@ -31,7 +31,7 @@ def adopt(executor: Any, root: Path, manifest: str, construction: str) -> dict[s
         sourced=lambda name: executor._model_source(manifest, name),
     )
     weights = Weights(torch, torch.device("cpu"), "cpu")
-    model = load(weights, checkpoint, construction, tiers=executor._tiers(False, True))
+    model = load(weights, checkpoint, construction, tiers=executor._tiers(True))
     x = torch.rand(4, HIDDEN, generator=torch.Generator().manual_seed(3)).half()
     coarse = run(model, x, passes=1)[0]
     sealed = model.residency.components["stack"].sealed
@@ -44,7 +44,6 @@ def adopt(executor: Any, root: Path, manifest: str, construction: str) -> dict[s
         "sealed": [sealed, model.residency.components["stack"].sealed],
         "refined": refined,
         "outputs": [digest(coarse), digest(run(model, x, passes=1)[0])],
-        "refused": executor._ask_tier("stack", "layout") is None,
     }
 
 

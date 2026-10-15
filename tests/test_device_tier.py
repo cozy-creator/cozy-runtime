@@ -18,16 +18,13 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from cozy_runtime.internal import accel, plane  # noqa: E402
+from cozy_runtime.internal import accel  # noqa: E402
 from cozy_runtime.internal.executor import Executor  # noqa: E402
 from cozy_runtime.internal.seam import Channel  # noqa: E402
 from cozy_runtime.internal.weights import DeviceTiers, Weights  # noqa: E402
 from test_weight_plane import BLOCKS, HIDDEN, load, run, same, tight, write_checkpoint  # noqa: E402
 
-pytestmark = [
-    pytest.mark.skipif(not plane.sharing(), reason="a TensorFS that shares GPU regions"),
-    pytest.mark.skipif(not accel.present(torch, "cuda"), reason="a CUDA card"),
-]
+pytestmark = pytest.mark.skipif(not accel.present(torch, "cuda"), reason="a CUDA card")
 
 
 class Custody:

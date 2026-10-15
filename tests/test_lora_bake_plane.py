@@ -13,7 +13,7 @@ import pytest
 import tensorfs
 
 from cozy_runtime.author import Artifact, Config, Loader
-from cozy_runtime.internal import accel, lora_composition, plane
+from cozy_runtime.internal import accel, lora_composition
 from cozy_runtime.internal.fill import Checkpoint, tensor_schema_of
 from cozy_runtime.internal.weights import PlaneBackend, WeightResidency, Weights
 from test_lora_composition import compose, fixture, header
@@ -22,7 +22,7 @@ from test_lora_peft import TinyModel
 torch = pytest.importorskip("torch")
 pytest.importorskip("peft")
 
-DEVICES = ["cpu"] + (["cuda"] if accel.present(torch, "cuda") and plane.available() else [])
+DEVICES = ["cpu"] + (["cuda"] if accel.present(torch, "cuda") else [])
 
 
 class Pipeline:

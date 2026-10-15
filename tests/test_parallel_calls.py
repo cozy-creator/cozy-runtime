@@ -30,7 +30,7 @@ from cozy_runtime.internal import (  # noqa: E402
 )
 from cozy_runtime.internal.config import seal_snapshot  # noqa: E402
 from cozy_runtime.internal.executor import Executor  # noqa: E402
-from cozy_runtime.internal.executor_commands import Budget, Prefetch  # noqa: E402
+from cozy_runtime.internal.executor_commands import Budget  # noqa: E402
 from cozy_runtime.internal.parallel import cp, mirror, wire  # noqa: E402
 from cozy_runtime.internal.parallel.group import RankGroup  # noqa: E402
 from cozy_runtime.internal.parallel.mirror import mirror_component  # noqa: E402
@@ -108,8 +108,6 @@ def test_leader_calls_real_follower_executors_twice(tmp_path: Path, degree: int,
         pytest.importorskip("diffusers")
     if kind == "h3-lora":
         pytest.importorskip("peft")
-    if kind == "staged" and not plane.available():
-        pytest.skip("a TensorFS with the weight plane")
     fixture = Path(__file__).parent / "testdata" / "parallel_calls.py"
 
     def launch(module_argv: list[str], fd: int) -> spawn.Child:
@@ -424,8 +422,6 @@ def test_the_plane_budget_reaches_the_followers_that_answer_it(
     """Run 2566: GPU 0 sent the plane's `budget` to a follower that refused the command, and
     the group broke. Every follower of this Runtime answers it. One from before the plane
     does not say `weight_plane/1` in its hello, so it is never sent it, and the group serves."""
-    if not plane.available():
-        pytest.skip("a TensorFS with the weight plane")
     fixture = Path(__file__).parent / "testdata" / "parallel_calls.py"
     env = {**os.environ, "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"}
 
@@ -466,7 +462,6 @@ def test_the_plane_budget_reaches_the_followers_that_answer_it(
         else:
             assert follower["pinned_budget_bytes"] == reply["plane"]["pinned_budget_bytes"]
             assert follower["pinned_budget_bytes"] > 0
-        assert leader.prefetch(Prefetch(construction="parallel-test"))["ok"]
         assert not group.broken
     finally:
         group.close()

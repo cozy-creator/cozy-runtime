@@ -23,7 +23,7 @@ bounds on access and resource use, alongside the data/descriptors it supplies.
 
 TensorD launches `cozy_runtime.internal.executor` through the private bounded JSON/descriptor
 channel. The executor imports the selected package, constructs and invokes it, and reports
-measured resource use. The private channel's existing names (`ModelSource`, `HostTier`,
+measured resource use. The private channel's existing names (`ModelSource`, `FetchChannel`,
 `SealedTier`, `DeviceTier`, and budget grants) describe particular data/access exchanges.
 
 A `Load` constructing new model-bearing state must offer `model_sources`; otherwise it

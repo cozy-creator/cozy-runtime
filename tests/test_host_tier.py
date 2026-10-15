@@ -22,8 +22,6 @@ from cozy_runtime.internal.seam import Channel, SeamError  # noqa: E402
 from cozy_runtime.internal.weights import Weights  # noqa: E402
 from test_weight_plane import load, write_checkpoint  # noqa: E402
 
-pytestmark = pytest.mark.skipif(not plane.available(), reason="a TensorFS with the weight plane")
-
 
 def test_the_seam_carries_only_memfds_as_tiers(tmp_path: Path) -> None:
     left, right = socket.socketpair()

@@ -150,18 +150,6 @@ class WriterAdopt(_Writer, frozen=True, kw_only=True, tag="adopt"):
     length: int
 
 
-class HostTier(_Request, frozen=True, kw_only=True, tag="host_tier"):
-    """One shared CPU weight buffer retained across executors. `offer` sends TensorD a
-    memfd; an ask receives the matching retained layout (`Tier` plus a memfd when held).
-    Runtime maps/pins the buffer through TensorFS; this exchange carries no GPU tensor."""
-
-    name: str
-    layout: str
-    offer: bool = False
-    #: the memfd the worker received with an offer; never on the wire
-    memfd: int = -1
-
-
 class SharedRegion(msgspec.Struct, frozen=True, kw_only=True):
     """One plane region of shared GPU memory: its chunks' bytes, in address order. One fd per
     chunk crosses the seam after the frame, in the same order."""
@@ -262,17 +250,6 @@ class FetchChannel(_Request, frozen=True, kw_only=True, tag="fetch_channel"):
     or credential, and ends with the call."""
 
 
-class SealedPrefetch(_Request, frozen=True, kw_only=True, tag="sealed_prefetch"):
-    """Every component's `SealedPlan` of one construction at once (a canonical JSON list in a
-    sealed memfd after the request): TensorD starts filling their CPU buffers, and each later
-    `SealedTier` ask waits only for its own. An older machine refuses; nothing changes."""
-
-    sha256: str
-    length: Annotated[int, msgspec.Meta(ge=0)]
-    #: the plans' memfd; never on the wire
-    memfd: int = -1
-
-
 class BudgetCell(_Request, frozen=True, kw_only=True, tag="budget_cell"):
     """The executor's plane budget cell (`internal/budget_cell.py`; its memfd follows this
     request): the Worker lowers a running call's budget through it, at a block boundary."""
@@ -286,10 +263,8 @@ class BudgetCell(_Request, frozen=True, kw_only=True, tag="budget_cell"):
 
 type _Tagged = (
     DeviceRoom
-    | HostTier
     | DeviceTier
     | SealedTier
-    | SealedPrefetch
     | SealedStage
     | ObjectFiles
     | ModelSource
@@ -337,7 +312,8 @@ class Handoff(Answer, frozen=True, kw_only=True):
 
 
 class Tier(Answer, frozen=True, kw_only=True):
-    """The worker's answer to a `HostTier` ask; one memfd follows when `held`."""
+    """The machine's answer to a sealed layout ask (`SealedTier`); one memfd follows when
+    `held`."""
 
     held: bool = False
     descriptor: int = -1
@@ -535,8 +511,8 @@ def respond(
     frame: Mapping[str, object], handler: Handler | None, received: int | None = None
 ) -> tuple[dict[str, object], socket.socket | int | None]:
     """The answer frame to one request frame, and the capability that follows it. `received`
-    is the memfd that came with the request (a `HostTier` offer); it goes to the handler or
-    is closed."""
+    is the memfd that came with the request (a `BudgetCell`); it goes to the handler or is
+    closed."""
     reply: Reply
     request: Request | None = None
     if handler is None:
@@ -546,7 +522,7 @@ def respond(
             request = decode(frame)
         except CapabilityError as exc:
             reply = refuse(exc.code, exc.message)
-    if isinstance(request, HostTier | BudgetCell):
+    if isinstance(request, BudgetCell):
         # The descriptor is only ever the one that arrived: a number on the wire is not.
         request = msgspec.structs.replace(request, memfd=-1 if received is None else received)
     elif isinstance(request, DeviceTier):
@@ -558,7 +534,7 @@ def respond(
         try:
             reply = handler(request)
         except Exception as exc:  # answered, so the executor's exchange stays in step
-            if isinstance(request, HostTier | BudgetCell) and request.memfd >= 0:
+            if isinstance(request, BudgetCell) and request.memfd >= 0:
                 with contextlib.suppress(OSError):
                     os.close(request.memfd)
             reply = refuse("request_failed", f"{type(exc).__name__}: {exc}"[:400])

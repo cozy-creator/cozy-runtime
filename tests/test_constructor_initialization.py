@@ -20,7 +20,6 @@ from cozy_runtime.author import Loader, Model, ModelRegistry, uses_components  #
 from cozy_runtime.author._errors import classify  # noqa: E402
 from cozy_runtime.author._loader import Artifact, Config  # noqa: E402
 from cozy_runtime.author._model import component_use  # noqa: E402
-from cozy_runtime.internal import plane  # noqa: E402
 from cozy_runtime.internal.derive import (  # noqa: E402
     ConstructionFault,
     Observations,
@@ -31,8 +30,6 @@ from cozy_runtime.internal.derive import (  # noqa: E402
 from cozy_runtime.internal.fill import tensor_schema_of  # noqa: E402
 from cozy_runtime.internal.weights import PlaneBackend, WeightResidency, Weights  # noqa: E402
 from test_weight_plane import store_component  # noqa: E402
-
-pytestmark = pytest.mark.skipif(not plane.available(), reason="a TensorFS with the weight plane")
 
 HIDDEN = 64
 ARTIFACT = Artifact("sha256:" + "0" * 64, {}, Config({}))
