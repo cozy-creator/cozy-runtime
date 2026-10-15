@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import platform
 import subprocess
+import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -542,29 +543,22 @@ NAMED_SEAMS: dict[str, tuple[str, str]] = {
 # ------------------------------------------------------------------------ the launch table
 
 
-class SpecUnreviewed(Exception):
-    """A provider in this build declares a spec digest the compiled registry does not carry.
-
-    Loud at LAUNCH, by construction (#549.4). The alternative — silently dropping the
-    provider — is how a registry bump turns into an `encoding_unqualified` on a production
-    artifact three deploys later, with nothing pointing at the bump.
-    """
+#: Spec digests already reported as absent from this process's TensorFS registry.
+_ABSENT: set[str] = set()
 
 
 def launch_providers() -> dict[str, tuple[Provider, ...]]:
     """The LAUNCH TIER provider set: spec digest -> the ORDERED CANDIDATES for that digest.
 
     **Built from `reviewed_specs`, not from aliases** (#549.4). Each provider names the exact
-    digests it was reviewed against; this function inverts that into digest -> providers and
-    checks every declared digest against the compiled registry. Two consequences, both the
-    point:
+    digests it was reviewed against; this function inverts that into digest -> providers. A
+    NEW digest the registry files under an existing alias therefore acquires no provider: a
+    semantically different `mxfp8/1` is never decoded by `cozy.mxfp8.dequant/1` on the
+    strength of its display name.
 
-    * a NEW digest the registry files under an existing alias acquires NO PROVIDER. Under
-      the alias-keyed spelling it inherited the sibling's decoder — a semantically different
-      `mxfp8/1` would have been decoded by `cozy.mxfp8.dequant/1` on the strength of its
-      display name.
-    * a digest that LEAVES the registry raises `SpecUnreviewed` here, at launch, naming the
-      provider and the digest, instead of quietly unregistering a route.
+    A reviewed digest the installed TensorFS does not carry (an older TensorFS than this
+    Runtime's newest encoding) is skipped with one warning: executors launch, and bytes in
+    that encoding are refused at bind (`unknown_encoding`), so a lane falls back to another.
 
     The order within a digest is REGISTRATION order and it decides NOTHING. Selection among
     candidates is `resolution.py`'s joint plan decision over records that exist only where a
@@ -572,7 +566,6 @@ def launch_providers() -> dict[str, tuple[Provider, ...]]:
     """
     known = registry_digests()
     out: dict[str, list[Provider]] = {}
-    declared: list[tuple[str, str]] = []
     builds: tuple[Callable[[str], Provider], ...] = (
         Verbatim,
         ScaledScalarDequant,
@@ -588,20 +581,15 @@ def launch_providers() -> dict[str, tuple[Provider, ...]]:
         # `provider.encoding` a fact rather than a lookup.
         probe = build("")
         for digest in sorted(probe.reviewed_specs):
-            declared.append((probe.name, digest))
-            if digest not in known:
-                continue
-            out.setdefault(digest, []).append(build(digest))
-    missing = [(name, digest) for name, digest in declared if digest not in known]
-    if missing:
-        raise SpecUnreviewed(
-            "this build declares spec digests the compiled registry does not carry: "
-            + " | ".join(f"{name} -> {digest}" for name, digest in sorted(missing))
-            + ". A provider's reviewed digest set is its claim about which physical byte "
-            "contracts it was read against; a registry that moved one has changed what "
-            "those bytes mean, and inferring the replacement by ALIAS is exactly the "
-            "substitution #549.4 forbids"
-        )
+            if digest in known:
+                out.setdefault(digest, []).append(build(digest))
+            elif digest not in _ABSENT:
+                _ABSENT.add(digest)
+                print(
+                    f"[encoding] the installed TensorFS registry carries no spec {digest}: "
+                    f"{probe.name} and every other provider of it are not served",
+                    file=sys.stderr,
+                )
     return {digest: tuple(candidates) for digest, candidates in out.items()}
 
 

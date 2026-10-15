@@ -43,6 +43,9 @@ def test_producer_round_trip_and_scale_floor() -> None:
         encode_int8_convrot256("w", weight(4, 320, 1))
 
 
+@pytest.mark.skipif(
+    ENCODING not in dict(tensorfs.seed_digests()), reason="TensorFS before 0.9.2 lacks the spec"
+)
 def test_include_recipe_encodes_exactly_its_weights(tmp_path: Path) -> None:
     def row(shape: tuple[int, int], seed: int) -> tuple[str, tuple[int, ...], bytes]:
         return "bf16", shape, st.from_f32(weight(*shape, seed), "BF16")
