@@ -29,8 +29,8 @@ LEVELS_MAX = 448.0 * 6.0
 SCALE_FLOOR = 1e-30
 #: Up to this many rows a product is bandwidth-bound: W4A16 reads the fewest bytes on any card.
 DECODE_ROWS = 16
-#: The GEMV's tile: 32 output rows by 256 input columns (128 bytes of each packed row).
-GEMV_N, GEMV_K = 32, 256
+#: The GEMV's tile: 64 output rows by 256 input columns (128 bytes of each packed row).
+GEMV_N, GEMV_K = 64, 256
 
 _MAJOR: dict[int, int] = {}
 
@@ -46,38 +46,48 @@ def _kernels() -> tuple[object, object, object] | None:
         import triton.language as tl
 
         @triton.jit  # type: ignore[untyped-decorator]
-        def _decode(
-            w_ptr, s_ptr, rn, k0, N, K, col_tiles, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr
-        ):  # type: ignore[no-untyped-def]
-            """`[BLOCK_N, BLOCK_K]` f32 weights at (rn, k0), the second level not yet applied."""
-            rj = tl.arange(0, BLOCK_K // 2)
-            rb = tl.arange(0, BLOCK_K // 16)
-            n_ok = rn[:, None] < N
-            packed = tl.load(
-                w_ptr + rn[:, None].to(tl.int64) * (K // 2) + (k0 // 2 + rj)[None, :],
-                mask=n_ok & ((k0 // 2 + rj)[None, :] < K // 2),
-                other=0,
-            ).to(tl.int32)
-            # Element 2k is the LOW nibble (ModelOpt's order, the stored one).
-            codes = tl.join(packed & 0xF, packed >> 4).reshape(BLOCK_N, BLOCK_K)
-            mag = (codes & 7).to(tl.float32)
-            value = tl.where(mag < 4, mag * 0.5, tl.where(mag < 6, mag - 2.0, mag * 2.0 - 8.0))
-            value = tl.where(mag == 7, 6.0, value)
-            value = tl.where(codes >= 8, -value, value)
-            # The block scales sit in cuBLASLt's 128x4 tiles (`leaves.to_blocked`).
-            c = k0 // 16 + rb
+        def _e2m1(code):  # type: ignore[no-untyped-def]
+            """E2M1 nibbles -> f32, built as bits: 1.m x 2^(e-1), the e=0 code being 0 or 0.5."""
+            exponent = (code >> 1) & 3
+            mantissa = code & 1
+            bits = tl.where(
+                exponent == 0, mantissa * 0x3F000000, ((exponent + 126) << 23) | (mantissa << 22)
+            )
+            return (bits | ((code & 8) << 28)).to(tl.float32, bitcast=True)
+
+        @triton.jit  # type: ignore[untyped-decorator]
+        def _scales(s_ptr, rn, k0, N, K, col_tiles, BLOCK_K: tl.constexpr):  # type: ignore[no-untyped-def]
+            """`[BLOCK_N, BLOCK_K/16]` f32 block scales; they sit in cuBLASLt's 128x4 tiles."""
+            c = k0 // 16 + tl.arange(0, BLOCK_K // 16)
             tile = (rn[:, None] // 128) * col_tiles + c[None, :] // 4
             offset = (
                 (tile * 32 + rn[:, None] % 32) * 16 + (rn[:, None] % 128) // 32 * 4 + c[None, :] % 4
             )
-            byte = tl.load(s_ptr + offset, mask=n_ok & (c[None, :] < K // 16), other=0).to(tl.int32)
+            ok = (rn[:, None] < N) & (c[None, :] < K // 16)
+            byte = tl.load(s_ptr + offset, mask=ok, other=0).to(tl.int32)
             exponent = (byte >> 3) & 0xF
-            mantissa = (byte & 7).to(tl.float32)
-            scale = tl.where(
-                exponent == 0,
-                mantissa * 0.001953125,
-                (mantissa + 8.0) * tl.exp2((exponent - 10).to(tl.float32)),
-            )
+            mantissa = byte & 7
+            normal = (((exponent + 120) << 23) | (mantissa << 20)).to(tl.float32, bitcast=True)
+            return tl.where(exponent == 0, mantissa.to(tl.float32) * 0.001953125, normal)
+
+        @triton.jit  # type: ignore[untyped-decorator]
+        def _packed(w_ptr, rn, k0, N, K, BLOCK_K: tl.constexpr):  # type: ignore[no-untyped-def]
+            """`[BLOCK_N, BLOCK_K/2]` packed bytes; element 2k is the LOW nibble (ModelOpt's)."""
+            rj = tl.arange(0, BLOCK_K // 2)
+            return tl.load(
+                w_ptr + rn[:, None].to(tl.int64) * (K // 2) + (k0 // 2 + rj)[None, :],
+                mask=(rn[:, None] < N) & ((k0 // 2 + rj)[None, :] < K // 2),
+                other=0,
+            ).to(tl.int32)
+
+        @triton.jit  # type: ignore[untyped-decorator]
+        def _decode(  # type: ignore[no-untyped-def]
+            w_ptr, s_ptr, rn, k0, N, K, col_tiles, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr
+        ):
+            """`[BLOCK_N, BLOCK_K]` f32 weights at (rn, k0), the second level not yet applied."""
+            packed = _packed(w_ptr, rn, k0, N, K, BLOCK_K)
+            value = tl.join(_e2m1(packed & 0xF), _e2m1(packed >> 4)).reshape(BLOCK_N, BLOCK_K)
+            scale = _scales(s_ptr, rn, k0, N, K, col_tiles, BLOCK_K)
             return (value.reshape(BLOCK_N, BLOCK_K // 16, 16) * scale[:, :, None]).reshape(
                 BLOCK_N, BLOCK_K
             )
@@ -136,15 +146,20 @@ def _kernels() -> tuple[object, object, object] | None:
             BLOCK_K: tl.constexpr,
             SPLIT: tl.constexpr,
         ):
-            """One row: a multiply-reduce in registers, no tensor-core layout round trip."""
+            """One row: even and odd columns against the low and high nibbles, reduced per 16-block,
+            then scaled once per block. No interleave and no tensor-core layout round trip."""
             rn = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
-            rk = tl.arange(0, BLOCK_K)
+            rj = tl.arange(0, BLOCK_K // 2)
             start = tl.program_id(1) * span
             acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
             for k0 in range(start, tl.minimum(start + span, K), BLOCK_K):
-                x = tl.load(x_ptr + k0 + rk, mask=(k0 + rk) < K, other=0.0).to(tl.float32)
-                weight = _decode(w_ptr, s_ptr, rn, k0, N, K, col_tiles, BLOCK_N, BLOCK_K)
-                acc += tl.sum(weight * x[None, :], axis=1)
+                even = k0 + 2 * rj
+                x_even = tl.load(x_ptr + even, mask=even < K, other=0.0).to(tl.float32)
+                x_odd = tl.load(x_ptr + even + 1, mask=even + 1 < K, other=0.0).to(tl.float32)
+                packed = _packed(w_ptr, rn, k0, N, K, BLOCK_K)
+                part = _e2m1(packed & 0xF) * x_even[None, :] + _e2m1(packed >> 4) * x_odd[None, :]
+                blocks = tl.sum(part.reshape(BLOCK_N, BLOCK_K // 16, 8), axis=2)
+                acc += tl.sum(blocks * _scales(s_ptr, rn, k0, N, K, col_tiles, BLOCK_K), axis=1)
             acc *= tl.load(two_ptr)
             if SPLIT:
                 tl.atomic_add(out_ptr + rn, acc, mask=rn < N)
@@ -245,9 +260,9 @@ def matmul(
             with readable(weight, blocked_scale, scale_2) as (weight, blocked_scale, scale_2):
                 scales, tiles = blocked_scale.view(torch.uint8), int(blocked_scale.shape[1]) // 4
                 if rows <= DECODE_ROWS:
-                    # Split K until the card has ~2 programs per SM: a decode GEMV is bandwidth.
+                    # Split K until the card has ~4 programs per SM: a decode GEMV is bandwidth.
                     columns = -(-rows_out // GEMV_N)
-                    split = max(1, min(cols // GEMV_K, -(-2 * _sms(torch, index) // columns)))
+                    split = max(1, min(cols // GEMV_K, -(-4 * _sms(torch, index) // columns)))
                     span = -(-cols // (split * GEMV_K)) * GEMV_K
                     acc = (
                         torch.zeros(rows, rows_out, dtype=torch.float32, device=x.device)
@@ -269,7 +284,7 @@ def matmul(
                             BLOCK_N=GEMV_N,
                             BLOCK_K=GEMV_K,
                             SPLIT=split > 1,
-                            num_warps=4,
+                            num_warps=8,
                         )
                     else:
                         gemv[grid](  # type: ignore[index]
