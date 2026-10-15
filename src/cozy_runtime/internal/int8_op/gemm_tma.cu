@@ -172,7 +172,8 @@ constexpr int kTmaConfigs = 4;
 
 int choose(int M, int N, int K) {
     if (M <= 128) return 1;
-    if (K >= 4 * N && K >= 5120) return 3;
+    // 16k+ rows (H3's 52k, SeedVR2's 16k): the cooperative 128x256, 1.1-1.45x the 128x128 there.
+    if (M >= 16384 || (K >= 4 * N && K >= 5120)) return 3;
     return M >= 4096 && std::min(N, K) >= 3072 ? 0 : 2;
 }
 #endif
