@@ -27,7 +27,11 @@ nvcc = [
     "-U__CUDA_NO_HALF_CONVERSIONS__",
     "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
     "-U__CUDA_NO_HALF2_OPERATORS__",
+    "-Xcompiler=-fvisibility=hidden,-fno-gnu-unique",
 ]
+# Its CUTLASS instantiations may match another library's in this process (comfy-kitchen's
+# serves until this builds): hidden, never unique, bound to itself, nothing of it is shared.
+isolated = ["-fvisibility=hidden", "-fno-gnu-unique"]
 setup(
     name="cozy-int8",
     version="1",
@@ -36,7 +40,8 @@ setup(
             "cozy_int8",
             ["op.cpp", "rotate.cu", "gemm_tma.cu" if tma else "gemm_sm80.cu"],
             include_dirs=[f"{cutlass}/include", f"{cutlass}/tools/util/include"],
-            extra_compile_args={"cxx": ["-O3", "-std=c++20"], "nvcc": nvcc},
+            extra_compile_args={"cxx": ["-O3", "-std=c++20", *isolated], "nvcc": nvcc},
+            extra_link_args=["-Wl,-Bsymbolic"],
         )
     ],
     cmdclass={"build_ext": BuildExtension},
