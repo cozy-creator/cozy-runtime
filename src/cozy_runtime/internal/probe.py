@@ -1,9 +1,8 @@
 """cr-006 — the per-device qualification suite that MINTS capability records.
 
-§3.2's cost placement, made concrete: this runs ONCE per (accelerator model, device
-configuration, driver, runtime build, encoding rule) tuple, at prepare time, and its
-result is a persisted typed fact. A worker landing on a known tuple skips the suite
-entirely; a local rig probes once and persists. Per request there is only arithmetic.
+§3.2's cost placement, made concrete: this runs ONCE per (card architecture, torch minor,
+Runtime source), at a release gate, and its result ships as a typed table (`qualified`). Per
+request there is only arithmetic.
 
 Four things happen per (encoding, IMPLEMENTATION, output dtype), in this order, and a
 failure at any one leaves NO record — which is what "fail-closed" means when the table is
@@ -38,32 +37,17 @@ because "mxfp8 works here" is not a fact — "this implementation of mxfp8 works
 The suite QUALIFIES a fixed kernel set; it does not search one. Its seconds are returned as
 an observation.
 
-**The result is KEPT, and this module's first paragraph is now true (cr-103).** It said the
-suite runs once per tuple and persists; the last paragraph said "a new Runtime process
-probes again", and the code did the second thing — 3.2-6.1 s of every model-bearing
-prepare, re-measuring facts about a card and a build that had not moved. `qualified` stores
-one document per `qualification_key` and reuses it when every term of that key matches, so
-the second model on a warm pod pays none of it. It is a CACHE OF A MEASUREMENT, never a
-substitute for one: the key carries the whole device identity (`DeviceFacts` — "every field
-is stable for the life of the machine, which is what lets a probe result be keyed by it"),
-the runtime identity (whose `source_digest` covers this very file, so an edit to a decode
-or to the suite invalidates every document that measured the old one), the exact provider
-implementation digests, and the output dtypes the suite was run over. Anything a stored
-document could be wrong about is a term of the key, and a stored document that does not
-match its own key is discarded.
+**The result is release data** (`qualification`): one table per card architecture, torch
+minor and Runtime source, measured by the release gates and shipped in the wheel.
 """
 
 from __future__ import annotations
 
 import base64
-import contextlib
 import hashlib
-import json
 import math
-import os
 import time
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -1019,32 +1003,16 @@ def qualify(
         runtime = measure_runtime(torch, release)
     target = torch.device("cuda" if device.kind == "cuda" else "cpu")
     started = time.perf_counter_ns()
-    observations: list[Observation] = []
-    for encoding in sorted(providers):
-        for provider in providers[encoding]:
-            for name in output_dtypes:
-                dtype = getattr(torch, name)
-                if provider.route != "verbatim" and not dtype.is_floating_point:
-                    # A decoded-float route has nothing to say about an integer destination,
-                    # and neither has a native leaf: `_scaled_mm` emits floats. DERIVED from
-                    # the dtype rather than listed — the registry's fp8 specs declare float
-                    # logical dtypes and a checkpoint's index buffers are plain/1 anyway, so
-                    # this skip removes a record that could never be selected rather than
-                    # hiding one that could.
-                    continue
-                observations.append(
-                    Observation(
-                        encoding_spec_id=encoding,
-                        implementation=provider.name,
-                        implementation_digest=implementation_digest(provider),
-                        implementation_revision=provider.code_revision,
-                        device_predicate=device.predicate,
-                        output_dtype=name,
-                        geometry_class=geometry_class(BENCH_SHAPE),
-                        delivery_route=provider.route,
-                        evidence=_evidence(torch, provider, device, target, dtype),
-                    )
-                )
+    observations = [
+        make_observation(
+            encoding,
+            provider,
+            device,
+            name,
+            settled(provider, device) or _evidence(torch, provider, target, getattr(torch, name)),
+        )
+        for encoding, provider, name in cells(providers, output_dtypes)
+    ]
     result = QualificationResult(
         tuple_key=device.tuple_key(),
         device=device,
@@ -1054,27 +1022,11 @@ def qualify(
         suite_ms=(time.perf_counter_ns() - started) // 1_000_000,
         observations=observations,
     )
-    return _table(result), result
+    return admission_table(result), result
 
 
-def _evidence(
-    torch: Any, provider: Provider, device: DeviceFacts, target: Any, dtype: Any
-) -> Evidence:
-    """One (implementation, output dtype)'s evidence. Only a PASSED one mints a record."""
-    if provider.route == "verbatim":
-        return VerbatimEvidence(
-            note="no decode: the stored bytes ARE the logical bytes, and the fill plane's "
-            "source-comparison proves them byte for byte"
-        )
-    if not device.satisfies(provider.device_predicate):
-        # THE PROVIDER'S OWN FLOOR, honoured before its oracle runs. Qualifying a leaf on a
-        # card whose kernel it does not claim would either fail confusingly or — worse —
-        # pass, and mint a record whose predicate says this card because `device.predicate`
-        # is where records get theirs.
-        return UnmeasuredEvidence(
-            note=f"{provider.name} declares the floor {provider.device_predicate} and this "
-            f"device is {device.predicate}; its suite is not run and it mints no record"
-        )
+def _evidence(torch: Any, provider: Provider, target: Any, dtype: Any) -> Evidence:
+    """One measured (implementation, output dtype)'s evidence. Only a PASSED one mints a record."""
     if isinstance(provider, LeafProvider) and provider.suite in NATIVE_SUITES:
         agreement = _native_agreement(torch, provider, target, dtype)
         if not agreement.passed:
@@ -1109,7 +1061,52 @@ def _evidence(
     )
 
 
-def _table(result: QualificationResult) -> Capabilities:
+def settled(provider: Provider, device: DeviceFacts) -> Evidence | None:
+    """Evidence nothing has to measure: a verbatim route, or a card below the provider's floor."""
+    if provider.route == "verbatim":
+        return VerbatimEvidence(
+            note="no decode: the stored bytes ARE the logical bytes, and the fill plane's "
+            "source-comparison proves them byte for byte"
+        )
+    if not device.satisfies(provider.device_predicate):
+        # Qualifying a leaf on a card whose kernel it does not claim would mint a record whose
+        # predicate says this card.
+        return UnmeasuredEvidence(
+            note=f"{provider.name} declares the floor {provider.device_predicate} and this "
+            f"device is {device.predicate}; its suite is not run and it mints no record"
+        )
+    return None
+
+
+def cells(
+    providers: Mapping[str, tuple[Provider, ...]], output_dtypes: Sequence[str]
+) -> Iterator[tuple[str, Provider, str]]:
+    """Every (encoding, implementation, output dtype) the suite answers. A decoded or native
+    route has nothing to say about an integer destination."""
+    for encoding in sorted(providers):
+        for provider in providers[encoding]:
+            for name in output_dtypes:
+                if provider.route == "verbatim" or name.startswith(("float", "bfloat")):
+                    yield encoding, provider, name
+
+
+def make_observation(
+    encoding: str, provider: Provider, device: DeviceFacts, dtype: str, evidence: Evidence
+) -> Observation:
+    return Observation(
+        encoding_spec_id=encoding,
+        implementation=provider.name,
+        implementation_digest=implementation_digest(provider),
+        implementation_revision=provider.code_revision,
+        device_predicate=device.predicate,
+        output_dtype=dtype,
+        geometry_class=geometry_class(BENCH_SHAPE),
+        delivery_route=provider.route,
+        evidence=evidence,
+    )
+
+
+def admission_table(result: QualificationResult) -> Capabilities:
     """Observations -> the admission table. A FAILED observation mints no record."""
     return Capabilities(
         [
@@ -1160,187 +1157,6 @@ def leaf_speedups(result: QualificationResult) -> dict[str, float]:
         name = f"{observation.implementation}@{observation.output_dtype}"
         worst[name] = min(worst.get(name, speedup), speedup)
     return dict(sorted(worst.items()))
-
-
-#: Bumped when a stored document's MEANING changes in a way no other term of the key
-#: catches. Every other term is derived from what was measured, so this exists for the one
-#: case they cannot cover: a change to what this file does with a document it reads back.
-QUALIFICATION_FORMAT = 1
-
-#: How many stored qualifications one cache directory keeps. A document is ~11-33 KB and a
-#: key changes only when the card, the build, the providers or the dtypes do, so this is
-#: not a working-set bound — it is a floor under unbounded growth on a rig that upgrades
-#: its driver every week.
-QUALIFICATION_KEEP = 64
-
-
-@dataclass(frozen=True, slots=True)
-class Qualification:
-    """One admission table, and WHERE IT CAME FROM.
-
-    The provenance is not decoration. A cache whose firing nobody can see is a cache
-    nobody can prove fired, and the whole claim of this change is that it fires on the
-    second prepare — so `source` rides the prepare facts and the worker prints it.
-    """
-
-    capabilities: Capabilities
-    result: QualificationResult
-    key: str
-    measured: bool
-    note: str = ""
-
-    def document(self) -> dict[str, str | int | dict[str, float]]:
-        return {
-            "key": self.key,
-            "source": "measured" if self.measured else "reused",
-            "suite_ms": self.result.suite_ms,
-            "observations": len(self.result.observations),
-            "leaf_speedup_x": leaf_speedups(self.result),
-            "note": self.note,
-        }
-
-
-class StoredQualification(msgspec.Struct, frozen=True):
-    """One cache file: a result, filed under the key it was measured for."""
-
-    key: str
-    result: QualificationResult
-
-
-def qualification_key(
-    providers: Mapping[str, tuple[Provider, ...]],
-    device: DeviceFacts,
-    output_dtypes: Sequence[str],
-    *,
-    runtime: RuntimeIdentity,
-) -> str:
-    """Everything a qualification result depends on, and nothing that it does not.
-
-    * **the device**, whole. `DeviceFacts` exists to be the thing a probe result is keyed
-      by — card, index, NVML configuration (power cap and MIG profile), the REAL driver,
-      the CUDA runtime torch was built against, and the OS/arch. Two "same model" cards at
-      different power caps are not the same measurement subject.
-    * **the runtime**, whole. `source_digest` is over `encoding/`, `instruments.py`,
-      `probe.py` and `resolution.py` as installed, so editing a decode, a leaf forward or
-      this suite changes the key. `torch_build` and `release` ride with it.
-    * **the providers**, by `implementation_digest` — name, route, floor, oracle, roles,
-      code revision and reviewed spec set. An implementation whose arithmetic changed is a
-      different implementation and gets a different key.
-    * **the output dtypes**, because the suite runs per dtype and a document measured over
-      `["bfloat16"]` has nothing to say about a `float16` destination. The match is exact
-      rather than by superset: reusing a wider document would mint records for dtypes this
-      construction never asked about, and a narrower one would silently qualify nothing.
-
-    NOT in the key: free VRAM, host load, the clock, the manifest, the model, the package.
-    None of them can change what the suite measures, and putting any of them in would make
-    the cache miss forever, which is the failure mode that looks exactly like working.
-    """
-    return canonical.digest(
-        {
-            "format": QUALIFICATION_FORMAT,
-            "device": device.document(),
-            "runtime": runtime.document(),
-            "providers": {
-                spec: sorted(implementation_digest(one) for one in group)
-                for spec, group in providers.items()
-            },
-            "output_dtypes": list(output_dtypes),
-        }
-    )
-
-
-def qualified(
-    torch: Any,
-    providers: Mapping[str, tuple[Provider, ...]],
-    device: DeviceFacts,
-    output_dtypes: Sequence[str],
-    *,
-    release: str,
-    runtime: RuntimeIdentity | None = None,
-    cache: str = "",
-) -> Qualification:
-    """The admission table for these inputs, measured once per key and kept.
-
-    `cache` is a DIRECTORY, not a switch: unset means nowhere to keep a result, and the
-    served code path is identical either way — the suite runs, the same table comes back,
-    and nothing is stored. Every filesystem failure is the same outcome as an empty cache,
-    named in `note` and never raised: a rig whose cache directory is unwritable must still
-    serve, and it must not serve a table it did not obtain.
-
-    A stored document is USED only when it carries its own key and that key is the one
-    these inputs produce. The table is then rebuilt from the stored observations by the
-    same `_table` the measured path uses, so a reused qualification and a measured one are
-    the same function of the same evidence.
-    """
-    if runtime is None:
-        runtime = measure_runtime(torch, release)
-    key = qualification_key(providers, device, output_dtypes, runtime=runtime)
-    stored, note = _read_qualification(cache, key)
-    if stored is not None:
-        return Qualification(_table(stored), stored, key, measured=False, note=note)
-    capabilities, result = qualify(
-        torch, providers, device, output_dtypes, release=release, runtime=runtime
-    )
-    # A MISS ALWAYS WRITES, including a miss caused by a document that was there and was
-    # not usable. Reusing the read's reason as the write's would leave a corrupt or
-    # mis-filed document in place forever, so a rig that hit one once would re-measure on
-    # every prepare for the life of the key with nothing said about why.
-    kept = _write_qualification(cache, key, result)
-    return Qualification(
-        capabilities,
-        result,
-        key,
-        measured=True,
-        note="; ".join(dict.fromkeys(part for part in (note, kept) if part)),
-    )
-
-
-def _read_qualification(cache: str, key: str) -> tuple[QualificationResult | None, str]:
-    """The stored result for this key, or nothing and the reason there is nothing."""
-    if not cache:
-        return None, "no cache directory"
-    try:
-        # stdlib JSON both ways: a failed native route can measure a NaN or infinite
-        # deviation, which `msgspec.json` would write as null and then refuse to read back.
-        raw = json.loads((Path(cache) / f"{key}.json").read_bytes())
-        stored = msgspec.convert(raw, StoredQualification)
-    except FileNotFoundError:
-        return None, ""
-    except (OSError, ValueError, msgspec.ValidationError) as exc:
-        return None, f"unreadable: {type(exc).__name__}: {exc}"
-    if stored.key != key:
-        # A document that does not carry the key it is filed under is not evidence about
-        # these inputs, whatever it is evidence about.
-        return None, "stored document does not carry its own key"
-    return stored.result, ""
-
-
-def _write_qualification(cache: str, key: str, result: QualificationResult) -> str:
-    """Keep this measurement for the next process. Returns why it was not kept, or ""."""
-    if not cache:
-        return "no cache directory"
-    directory = Path(cache)
-    temporary = directory / f".{key}.{os.getpid()}"
-    try:
-        directory.mkdir(parents=True, exist_ok=True)
-        temporary.write_text(json.dumps(msgspec.to_builtins(StoredQualification(key, result))))
-        temporary.chmod(0o600)
-        os.replace(temporary, directory / f"{key}.json")
-        _prune_qualifications(directory)
-    except (OSError, ValueError) as exc:
-        with contextlib.suppress(OSError):
-            temporary.unlink()
-        return f"not kept: {type(exc).__name__}"
-    return ""
-
-
-def _prune_qualifications(directory: Path) -> None:
-    """Keep the newest `QUALIFICATION_KEEP` documents. Best effort, never fatal."""
-    with contextlib.suppress(OSError):
-        stored = sorted(directory.glob("*.json"), key=lambda one: one.stat().st_mtime)
-        for old in stored[: max(len(stored) - QUALIFICATION_KEEP, 0)]:
-            with contextlib.suppress(OSError):
-                old.unlink()
 
 
 class UnreportableObservation(Exception):
