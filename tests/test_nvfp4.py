@@ -78,10 +78,7 @@ def test_one_lane_carries_nvfp4_beside_int8(tmp_path: Path) -> None:
     assert parsed["components"]["transformer"]["proj_out.weight"]["encoding"] != SPEC_NVFP4
 
 
-torch: Any = pytest.importorskip("torch")
-
-
-def roles(values: np.ndarray, device: str) -> dict[str, Any]:
+def roles(torch: Any, values: np.ndarray, device: str) -> dict[str, Any]:
     rows, cols = values.shape
     encoded = encode_nvfp4("w", values)
     scale, scale_2 = encoded.companions
@@ -100,6 +97,7 @@ def roles(values: np.ndarray, device: str) -> dict[str, Any]:
 
 
 def test_decode_is_the_spec_law_and_the_mined_vectors() -> None:
+    torch = pytest.importorskip("torch")
     from cozy_runtime.internal import probe
     from cozy_runtime.internal.encoding import Nvfp4Dequant
 
@@ -111,6 +109,7 @@ def test_decode_is_the_spec_law_and_the_mined_vectors() -> None:
 
 
 def test_blocked_scales_round_trip() -> None:
+    torch = pytest.importorskip("torch")
     from cozy_runtime.internal.encoding.leaves import from_blocked, to_blocked
 
     grid = torch.randint(0, 126, (200, 12), dtype=torch.uint8)
@@ -118,6 +117,7 @@ def test_blocked_scales_round_trip() -> None:
 
 
 def test_leaf_matches_its_exact_weight() -> None:
+    torch = pytest.importorskip("torch")
     from cozy_runtime.internal import probe
     from cozy_runtime.internal.encoding import Nvfp4NativeLeaf
 
@@ -126,7 +126,7 @@ def test_leaf_matches_its_exact_weight() -> None:
     devices = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
     leaf_provider = Nvfp4NativeLeaf(SPEC_NVFP4)
     for device in devices:
-        parts = roles(values, device)
+        parts = roles(torch, values, device)
         exact = probe._exact_weight(torch, leaf_provider, parts).cpu()
         reference = x @ exact.t()
         for dtype in (torch.float32, torch.bfloat16):
