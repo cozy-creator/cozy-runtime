@@ -53,6 +53,7 @@ def mirror_component(
     cancelled: Callable[[], bool] = lambda: False,
     rerun: Callable[[int], int] | None = None,
     journaled: Callable[[], contextlib.AbstractContextManager[Any]] = contextlib.nullcontext,
+    device: Any = None,
 ) -> None:
     """Wrap the module call outside all torch and diffusers hooks.
 
@@ -80,7 +81,9 @@ def mirror_component(
     def mirrored(*args: Any, **kwargs: Any) -> Any:
         if cp.in_gated_call():
             return call(*args, **kwargs)
-        command, payloads = _command(name, prepared, group, spool, args, kwargs, cancelled)
+        command, payloads = _command(
+            name, prepared, group, spool, args, kwargs, cancelled, broadcast=True
+        )
         try:
             # Every follower joins the collective: none may be answering an overlapped call.
             with group.hold(range(1, group.degree)):
@@ -95,6 +98,8 @@ def mirror_component(
                             group.watched(name[1], journal.progress if journal else lambda: 0),
                         ):
                             try:
+                                assert isinstance(payloads, wire.Broadcast)
+                                payloads.send(group.pg, device)
                                 with cp.gated_call():
                                     result = call(*args, **kwargs)
                             except Exception as exc:
@@ -403,15 +408,17 @@ def _command(
     payloads_dir: str = "ranks",
     *,
     only: bool = False,
-) -> tuple[wire.RunCommand, wire.TensorSpool]:
+    broadcast: bool = False,
+) -> tuple[wire.RunCommand, wire.TensorSpool | wire.Broadcast]:
     """The `run` command for one component call under the leader's active scopes.
 
     Scope admission has already happened on the leader. Followers receive that same
     complete scope, including any overlay weights used by component hooks, and the same
     autocast. A call made inside a remote scope carries that scope alone. `only`: the call
     touches its own component and nothing else (a hosted module call, a spread method), so
-    the follower admits just that component under the scope's method. A cancelled attempt
-    raises here, before any rank is commanded.
+    the follower admits just that component under the scope's method. `broadcast`: the call
+    goes to every follower, and its tensors cross by `wire.Broadcast` once the command is
+    out. A cancelled attempt raises here, before any rank is commanded.
     """
     import torch
 
@@ -438,7 +445,11 @@ def _command(
         if key[0] in active and key[1] in active[key[0]][1]
     }
     scopes = [wire.Scope(key, method, components) for key, (method, components) in active.items()]
-    payloads = wire.TensorSpool(directory / payloads_dir, references)
+    payloads = (
+        wire.Broadcast(references)
+        if broadcast
+        else wire.TensorSpool(directory / payloads_dir, references)
+    )
     command = wire.RunCommand(
         component=name,
         spool=str(directory),
@@ -454,6 +465,7 @@ def _command(
         attention_layout=_ACTIVE_LAYOUT.get(),
         args=[wire.marshal(a, payloads, path=f"args[{i}]") for i, a in enumerate(args)],
         kwargs={k: wire.marshal(v, payloads, path=k) for k, v in kwargs.items()},
+        broadcast=broadcast,
     )
     return command, payloads
 
