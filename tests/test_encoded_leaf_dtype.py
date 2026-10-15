@@ -66,7 +66,7 @@ class EncodedLeafDtypeTest(unittest.TestCase):
         with torch.autocast("cpu", dtype=torch.bfloat16):
             out = leaf(x)
         self.assertEqual(out.dtype, torch.bfloat16)
-        torch.testing.assert_close(out.float(), expected, rtol=0.05, atol=0.02)
+        self.assertLess(float((out.float() - expected).norm() / expected.norm()), 0.03)
         self.assertEqual(leaf(x.half()).dtype, torch.float16)
 
     @unittest.skipUnless(accel.present(torch, "cuda"), "requires a real CUDA FP8 device")
