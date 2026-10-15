@@ -365,7 +365,8 @@ class RankGroup:
         )
 
     def spawn(self) -> None:
-        """Start ranks 1..K-1. Returns as soon as the processes exist; nothing is joined."""
+        """Start ranks 1..K-1. Returns as soon as the processes exist; nothing is joined. Every
+        follower is launched before any reader thread starts, so a launch may fork."""
         for rank in range(1, self.degree):
             ours, theirs = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
             try:
@@ -375,12 +376,15 @@ class RankGroup:
                 process = self._launch(argv, theirs.fileno())
             finally:
                 theirs.close()
-            follower = Follower(
-                rank=rank, process=process, channel=Channel(ours), gpu=self.gpu(rank)
+            self.followers.append(
+                Follower(rank=rank, process=process, channel=Channel(ours), gpu=self.gpu(rank))
             )
-            self.followers.append(follower)
+        for follower in self.followers:
             reader = threading.Thread(
-                target=self._read, args=(follower,), name=f"rank{rank}-reader", daemon=True
+                target=self._read,
+                args=(follower,),
+                name=f"rank{follower.rank}-reader",
+                daemon=True,
             )
             reader.start()
             self._readers.append(reader)
