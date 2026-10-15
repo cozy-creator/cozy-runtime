@@ -30,7 +30,7 @@ from cozy_runtime.author._executor_requests import SealedPlan  # noqa: E402
 from cozy_runtime.internal import canonical, plane, spawn  # noqa: E402
 from cozy_runtime.internal.executor import Executor  # noqa: E402
 from cozy_runtime.internal.executor_commands import Binding, Load  # noqa: E402
-from cozy_runtime.internal.fill import Checkpoint, FillRefusal  # noqa: E402
+from cozy_runtime.internal.fill import Checkpoint  # noqa: E402
 from cozy_runtime.internal.parallel.group import RankGroup  # noqa: E402
 from cozy_runtime.internal.seam import Channel  # noqa: E402
 from cozy_runtime.internal.weights import HostTiers, Weights  # noqa: E402
@@ -240,7 +240,6 @@ def test_an_executor_computes_on_the_machines_sealed_layout_and_reads_no_store(
         held = plane.stats(weights.plane).host
         assert held.fill_bytes == 0 and held.disk_read_bytes >= 0
         assert held.sealed_bytes >= component.ws.nbytes // 2, held
-        assert model.backend.stats["leases"]["acquisitions"] == 0  # no store lease at all
 
         # A GPU executor's tier (no device here): pinned inside the machine's budget only.
         budget = 64 << 20
@@ -293,8 +292,6 @@ def test_with_model_sources_an_executor_opens_no_store(tmp_path: Path) -> None:
         )
         assert checkpoint.store is None and checkpoint.header_bytes == stored.header_bytes
         assert checkpoint.model_assets() == stored.model_assets()
-        with pytest.raises(FillRefusal, match="reads no store"):
-            checkpoint.acquire()
         weights = Weights(torch, torch.device("cpu"), "cpu")
         model = load(weights, checkpoint, "sourced", tiers=session.tiers)
         assert model.backend.components["stack"].sealed and machine.sourced >= 1
@@ -305,7 +302,6 @@ def test_with_model_sources_an_executor_opens_no_store(tmp_path: Path) -> None:
         with torch.inference_mode():
             expected = reference(x)
         assert same(run(model, x, passes=1), [expected])
-        assert model.backend.stats["leases"]["acquisitions"] == 0
 
         # Register the real CPU construction to exercise the executor's reuse branch.
         # CUDA construction admission is separate; reuse must retain these same grants
@@ -376,7 +372,7 @@ def test_a_groups_follower_asks_the_machine_through_rank_0_and_opens_no_store(
             expected = hashlib.sha256(reference(x).numpy().tobytes()).hexdigest()
         reply = group.reply_one(1, "adopt")
         assert reply["ok"] and not group.broken, (reply, group.broken)
-        assert reply["store"] is False and reply["leases"] == 0
+        assert reply["store"] is False
         assert reply["assets"] == len(stored.model_assets())
         assert reply["sealed"] == [True, True] and reply["refined"] is True
         assert reply["outputs"] == [expected, expected]
@@ -413,7 +409,6 @@ def test_a_layout_staged_in_part_pins_only_what_was_staged_and_reads_no_store(
             ticket.wait()
         tier = plane.stats(gpu.plane).host
         assert tier.used == 0 and tier.fill_bytes == 0, tier  # holes: nothing here to pin
-        assert model.backend.stats["leases"]["acquisitions"] == 0
 
         # Streaming blocks are asked for as stages plan them; this machine has no room left.
         plan, tiers = component.staging

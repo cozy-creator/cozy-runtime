@@ -145,8 +145,6 @@ def test_granted_checkpoint_reads_header_config_and_assets_over_executor_channel
         assert checkpoint.rows("unet") == standalone.rows("unet")
         assert checkpoint.model_assets() == {"tokenizer/vocab.txt": _ASSET}
         assert machine.sourced == 2
-        with pytest.raises(fill.FillRefusal, match="reads no store"):
-            checkpoint.acquire()
         with pytest.raises(TypeError, match="sourced"):
             fill.Checkpoint(manifest)  # type: ignore[call-arg]
     finally:

@@ -65,10 +65,10 @@ from cozy_runtime.internal.encoding import (
     measure_runtime,
 )
 from cozy_runtime.internal.executor_replies import PlaneFacts, Streamed
+from cozy_runtime.internal.fetch_plan import Fetches, Group, Ref, region_objects, stage_components
 from cozy_runtime.internal.fill import (
     Checkpoint,
     PlanRow,
-    ReadLeases,
     _refuse,
     dtype_name,
     servability,
@@ -279,6 +279,11 @@ class Component:
     #: copy from the object files; the stream's regions are asked for as stages plan them)
     staging: tuple[SealedPlan, HostTiers] | None = None
     staged: set[int] = field(default_factory=set)
+    #: its checkpoint, each region's objects (by plane index), and the regions whose objects
+    #: are known here: a region is read only once they landed (`WeightResidency._arrive`)
+    manifest: str = ""
+    objects: list[list[Ref]] = field(default_factory=list)
+    landed: set[int] = field(default_factory=set)
 
     def __post_init__(self) -> None:
         self.numbers = {region.index: i for i, region in enumerate(self.blocks)}
@@ -384,6 +389,8 @@ class Weights:
         self.context_bytes = -1
         #: the machine's custody of GPU weights (`weights.attach/1`); None: every region private
         self.sharing: DeviceTiers | None = None
+        #: the call's fetch channel: readers wait on their objects there; None: all are here
+        self.fetch: Fetches | None = None
         #: the machine keeps baked variants beside stored bytes (its answers say so)
         self.variants = False
         #: how LoRA'd linears are served: baked into their weights (owner, 2026-10-04: the
@@ -1273,6 +1280,8 @@ class Weights:
         implicitly) and bound in place, the pages shared with every executor of the layout."""
         if self.pinned < 0:
             self._pin(sum(c.ws.nbytes for c in self.components.values()))
+        if self.fetch is not None:
+            self.fetch.wait(component.manifest, _ordered(component.objects))
         try:
             ticket = self.plane.want(
                 component.ws, plane.PINNED, None, priority=self.tick(), pin=True
@@ -2225,10 +2234,9 @@ class PlaneBackend:
         self.custody = custody
         self.device = weights.device
         self.kind = weights.kind
-        #: Explicit Store-backed checkpoints use these verified local leases. Managed
-        #: checkpoints instead use TensorD's buffers/object descriptors, without a local Store.
-        self.leases = ReadLeases(self.checkpoints)
-        self.sources: dict[str, Source] = {}
+        #: the components in the order its stages first use them (`fetch_plan`): the order
+        #: their weights are fetched in
+        self.order: tuple[str, ...] = ()
         self.state = "open"
         self.expected: dict[str, frozenset[str]] = {}
         #: component -> stored tensors the code does not build: named in its read plan,
@@ -2373,15 +2381,8 @@ class PlaneBackend:
         return frozenset(self.checkpoints)
 
     def expect(self, sets: Mapping[str, Sequence[str]]) -> None:
-        """Completeness sets, and the verified read leases: a corrupt artifact refuses here,
-        before construction."""
+        """Completeness sets: a destination the census never reaches refuses the commit."""
         self.expected = {name: frozenset(keys) for name, keys in sets.items()}
-        if self.tiers is None or self.tiers.seal is None:
-            # With sealed tiers the machine verified every byte it filled; a weight set it
-            # holds none of takes its lease when it registers.
-            for name in sets:
-                self.leases.acquire(name)
-        self.stats["leases"] = self.leases.document()
 
     def fit(self, walked: Census, *, encoded_leaves: str) -> Mapping[str, object] | None:
         """`tensorfs.fit` over the serving census, per checkpoint the census reads."""
@@ -2537,6 +2538,18 @@ class PlaneBackend:
             for name, root in self.roots.items()
             if (keys := [key for key in order if self.plan[key].component == name])
         }
+        fetch = self.weights.fetch
+        if fetch is not None:
+            # The Load pass: only what the code builds, in the order its stages use it.
+            first = [name for name in self.order if name in prepared]
+            rest = sorted(set(prepared) - set(first), key=lambda n: prepared[n].plan.bytes)
+            fetch.schedule(
+                [
+                    (prepared[n].checkpoint.manifest_id, _ordered(prepared[n].objects))
+                    for n in first + rest
+                ],
+                key=str(id(self)),  # one model of a many-model load: its part of the pass
+            )
         if self.tiers is not None and self.tiers.prefetch is not None and prepared:
             # Every component's sealed layout starts filling now, and fills while the ones
             # before it register: each ask below waits only for its own.
@@ -2556,8 +2569,6 @@ class PlaneBackend:
     def close(self) -> None:
         self.weights.forget(self.construction)
         self.components.clear()
-        self.sources.clear()
-        self.leases.release()
 
     # -- construction internals
 
@@ -2625,20 +2636,20 @@ class PlaneBackend:
         self.weights.register(component)
         return component
 
-    def _source(self, name: str, checkpoint: Checkpoint) -> Source:
-        """The manifest's one store source, made by its first weight set that reads it."""
-        source = self.sources.get(checkpoint.manifest_id)
-        if source is None:
-            if checkpoint.store is None:
-                raise _refuse(
-                    "store_unusable",
-                    f"{name}: the machine served no layout for this weight set, and this "
-                    "executor reads no store",
-                )
-            source = self.sources[checkpoint.manifest_id] = plane.source(
-                self.weights.plane, checkpoint.store, self.leases.take(name)
+    def _source(self, name: str, checkpoint: Checkpoint, refs: Sequence[Ref]) -> Source:
+        """A weight set's own store source, leased over the objects it reads once they are
+        here: an explicit Store's path (tests, tools). A managed executor reads no store."""
+        if checkpoint.store is None:
+            raise _refuse(
+                "store_unusable",
+                f"{name}: the machine served no layout for this weight set, and this "
+                "executor reads no store",
             )
-        return source
+        if self.weights.fetch is not None:
+            self.weights.fetch.wait(checkpoint.manifest_id, refs)
+        with store_refusals(f"leasing {name}"):
+            lease = checkpoint.store.acquire(checkpoint.manifest_id, sorted(refs))
+        return plane.source(self.weights.plane, checkpoint.store, lease)
 
     def _prepare_layout(
         self, name: str, root: Module, keys: list[str], *, fine: bool = False
@@ -2689,7 +2700,10 @@ class PlaneBackend:
             regions=tuple(tuple(group) for group in ids),
             parts=tuple(parts),
         )
-        return _Prepared(keys, units, kept, checkpoint, plan, ids, digest, sealed_plan, fine)
+        objects = region_objects(plan, ids)
+        return _Prepared(
+            keys, units, kept, checkpoint, plan, ids, digest, sealed_plan, fine, objects
+        )
 
     def _register(
         self,
@@ -2709,6 +2723,9 @@ class PlaneBackend:
         # Standalone checkpoints can reread their explicit Store for a finer layout.
         # Managed checkpoints ask TensorD for the finer shared CPU layout instead.
         tiers = None if refine and checkpoint.store is not None else self.tiers
+        manifest, refs = checkpoint.manifest_id, _ordered(layout.objects)
+        here = weights.fetch is None or weights.fetch.present(manifest, refs)
+        staged: list[int] = []
         with store_refusals(f"registering {name}"):
             held = None
             if tiers is not None and tiers.seal is not None:
@@ -2716,12 +2733,18 @@ class PlaneBackend:
             elif tiers is not None:
                 held = tiers.ask(key, digest)
             sealed = held is not None and plane.is_sealed(held)
-            # A layout staged in part: its holes copy from the verified object files.
-            files = (
-                tiers.files(layout.sealed, _objects(plan))
-                if sealed and tiers is not None and tiers.files
-                else []
-            )
+            files: list[tuple[str, int, int]] = []
+            if sealed and tiers is not None and tiers.files:
+                if not here and tiers.stage is not None:
+                    # An absent object has no file: the machine stages every region, in
+                    # order, as its objects land, and each is used once Ready.
+                    staged = tiers.stage(layout.sealed, list(range(len(ids))))
+                if len(staged) < len(ids):
+                    # The holes copy from the verified object files, once they are here.
+                    if not here and weights.fetch is not None:
+                        weights.fetch.wait(manifest, refs)
+                        here = True
+                    files = tiers.files(layout.sealed, _objects(plan))
             try:
                 if sealed:
                     assert held is not None
@@ -2732,7 +2755,7 @@ class PlaneBackend:
                     ws = weights.plane.register_sealed(key, plan, ids, held, **handed)
                 else:
                     ws = weights.plane.register(
-                        key, self._source(name, checkpoint), plan, ids, host_fd=held
+                        key, self._source(name, checkpoint, refs), plan, ids, host_fd=held
                     )
             except plane.error("Invalid"):
                 if held is None:
@@ -2745,7 +2768,7 @@ class PlaneBackend:
                     os.close(fd)  # the plane duplicated each
             if ws is None:
                 held, sealed = None, False
-                ws = weights.plane.register(key, self._source(name, checkpoint), plan, ids)
+                ws = weights.plane.register(key, self._source(name, checkpoint, refs), plan, ids)
         if tiers is not None:
             if held is None:
                 tiers.offer(key, digest, ws.host_fd)
@@ -2813,6 +2836,11 @@ class PlaneBackend:
             staging=(layout.sealed, tiers)
             if sealed and tiers is not None and tiers.stage
             else None,
+            staged=set(staged),
+            manifest=manifest,
+            objects=layout.objects,
+            # a store source waited for every object before its lease
+            landed=set(range(len(regions))) if here or not sealed else set(),
         )
         for region in regions:
             for table, attr, standin in region.unbound:
@@ -2880,6 +2908,8 @@ class _Prepared:
     sealed: SealedPlan
     #: regions of at most `REGION_LIMIT` bytes
     fine: bool
+    #: each region's objects, in read order
+    objects: list[list[Ref]]
 
 
 class _Span(msgspec.Struct, frozen=True):
@@ -3030,8 +3060,10 @@ class WeightResidency:
         self.refine = refine
         #: component -> (module, had its own `forward`, that forward) per hooked region
         self.hooks: dict[str, list[tuple[Module, bool, Callable[..., object]]]] = {}
-        #: method -> the components it declares (`component_use`)
+        #: method -> the components it declares (`component_use`), in definition order
         self.scopes = dict(scopes or {})
+        #: methods in the order this process first entered them: the stage order it learned
+        self.stages: list[str] = []
         self.hosted: frozenset[str] = frozenset()
         self.active: tuple[str, tuple[str, ...]] | None = None
         self.spare = False
@@ -3114,6 +3146,8 @@ class WeightResidency:
             name for name in components if name in self.components and name not in self.hosted
         )
         weights = self.weights
+        if method not in self.stages:
+            self.stages.append(method)
         self.entries[method] = self.entries.get(method, 0) + 1
         self.repeats[method] = max(self.repeats.get(method, 0), self.entries[method])
         weights.hold_host()
@@ -3207,6 +3241,7 @@ class WeightResidency:
         the room each gives, before that is reported."""
         weights = self.weights
         assert component.common is not None
+        self._arrive(component, component.common.index)
         span, asked = component.common.span, False
         while True:
             try:
@@ -3959,6 +3994,7 @@ class WeightResidency:
         fill ranks above every earlier streamed block and below the stage's prefix, so the
         least recently used block is the one it can displace."""
         weights = self.weights
+        self._arrive(component, index)
         if component.cursor is not None and _due(component, component.cursor, index):
             lease: Lease = component.cursor.acquire(index, stream)
         else:
@@ -3968,6 +4004,28 @@ class WeightResidency:
             )
         weights.drain()  # what this fill displaced is unbound at once, in every weight set
         return lease
+
+    def _arrive(self, component: Component, index: int) -> None:
+        """A region is read only once its objects are here: the paging fill waits on them,
+        raised to Now, and never fetches anything itself."""
+        fetch = self.weights.fetch
+        if fetch is not None and index not in component.landed:
+            fetch.wait(component.manifest, component.objects[index])
+            component.landed.add(index)
+
+    def fetch_plan(self) -> list[Group]:
+        """Its components in the stage order learned here (definition order before that),
+        each one's regions in execution order: the plan an attempt re-asserts."""
+        stages = [*self.stages, *(m for m in self.scopes if m not in self.stages)]
+        names = stage_components(stages, self.scopes)
+        names += [name for name in self.components if name not in names]
+        groups: list[Group] = []
+        for name in names:
+            c = self.components[name]
+            blocks = c.order or [region.index for region in c.blocks]
+            first = [c.common.index] if c.common is not None else []
+            groups.append((c.manifest, _ordered(c.objects, [*first, *blocks])))
+        return groups
 
     def _lease(self, component: Component, region: Region, op: str) -> Lease:
         """A region's lease for an op that reads it outside its forward (`Weights.reading`)."""
@@ -4240,6 +4298,12 @@ class WeightResidency:
             raise ResidencyRefusal(
                 "residency_poisoned", f"{what}() against a poisoned weight plane: {self.poisoned}"
             )
+
+
+def _ordered(regions: Sequence[Sequence[Ref]], order: Iterable[int] | None = None) -> list[Ref]:
+    """The objects of `regions` in `order` (default: address order), each once."""
+    picked = range(len(regions)) if order is None else order
+    return list(dict.fromkeys(ref for index in picked for ref in regions[index]))
 
 
 def _objects(plan: ReadPlan) -> list[tuple[str, int]]:

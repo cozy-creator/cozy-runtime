@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any, BinaryIO, NamedTuple, Protocol, cast
 
 import msgspec
 import tensorfs
-from tensorfs.derived import Source, serve_derived, serve_derived_replay, serve_source
+from tensorfs.derived import serve_derived, serve_derived_replay, serve_source
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author._errors import CapabilityError
@@ -117,7 +117,6 @@ def _exchange_file(attempt: WriterAttempt, slot: str, kind: str) -> Path:
 type Recorder = Callable[[WriterAttempt, str, "WriterBinding", Mapping[str, object]], None]
 
 
-
 def _facts(info: os.stat_result) -> tuple[int, ...]:
     return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
 
@@ -140,7 +139,6 @@ def _read(path: Path, length: int, maximum: int) -> Iterator[BinaryIO]:
             raise CapabilityError(
                 "writer input changed during consumption", code="weights_writer_file"
             )
-
 
 
 @dataclass(frozen=True)
@@ -265,22 +263,10 @@ class WriterBroker:
                         "writer payload is pending", code="weights_writer_payload_pending"
                     )
 
-        @contextlib.contextmanager
-        def admit() -> Iterator[None]:
-            current()  # Refuse nested inspection before waiting on the native disk exclusion.
-            with storage_admission.admit(storage_admission.native_write(self.store_root)):
-                current()
-                yield
-
         def serve() -> None:
             try:
-                serve_source(
-                    self.store(),
-                    Source(manifest, length),
-                    server.detach(),
-                    check_current=current,
-                    admit_io=admit,
-                )
+                # The native owner takes its own disk exclusion.
+                serve_source(self.store(), server.detach(), manifest, length, check_current=current)
             except Exception:
                 logging.getLogger(__name__).debug(
                     "source channel closed with refusal", exc_info=True

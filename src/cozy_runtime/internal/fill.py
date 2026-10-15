@@ -12,11 +12,8 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
-import os
-import threading
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
-from pathlib import Path
 from types import ModuleType
 from typing import TYPE_CHECKING
 
@@ -26,29 +23,18 @@ from cozy_runtime.author._loader import (
     TensorSpec,
     canonical_dtype,
 )
-from cozy_runtime.internal.derive import torch_module
 from cozy_runtime.internal.encoding import (
     TORCH_DTYPES,
-    Capabilities,
-    DeviceFacts,
     Encoded,
-    Provider,
     RolePart,
     aliases,
-    measure_runtime,
 )
-from cozy_runtime.internal.planfacts import PlanFacts
-from cozy_runtime.internal.resolution import (
-    PlanRefusal,
-    ResolvedModelPlan,
-    script_plan,
-)
+from cozy_runtime.internal.resolution import PlanRefusal, ResolvedModelPlan
 
 # Every `Any` below is a torch module, tensor, event or device: torch is absent from the
 # check venv.
 
 if TYPE_CHECKING:
-    from tensorfs import ReadLease as ReadLease
     from tensorfs import ReadPlan, Tensor
     from tensorfs import Store as Store
 
@@ -145,64 +131,12 @@ def _refuse(code: str, message: str, fields: Sequence[str] = ()) -> FillRefusal:
     return FillRefusal(message, code=code, fields=fields)
 
 
-# ------------------------------------------------------------------- admission arithmetic
-
-
 # ------------------------------------------------------------------- the TensorFS reader
 
 
 def tensorfs_module() -> ModuleType:
     """Load TensorFS lazily for storage components that keep module imports lightweight."""
     return tensorfs
-
-
-def capabilities() -> frozenset[str]:
-    """The features this process's TensorFS build names (`tensorfs.CAPABILITIES`, e.g.
-    "ensure/1", "deliver/1"); an older build names none. Detected by name, never by version."""
-    return frozenset(getattr(tensorfs, "CAPABILITIES", ()))
-
-
-_stores: dict[tuple[int, str], Store] = {}
-_stores_lock = threading.Lock()
-
-
-def store(root: str | Path) -> Store:
-    """The process's ONE TensorFS Store handle for `root`.
-
-    TensorFS keeps its trust index and catalog connection alive only while a handle to the
-    root lives, so a fresh `Store.open` per call re-validated and re-loaded the catalog every
-    time. Keyed by pid: a forked child never shares its parent's SQLite connection.
-    """
-    key = (os.getpid(), os.path.abspath(root))
-    with _stores_lock:
-        held = _stores.get(key)
-        if held is None:
-            held = _stores[key] = tensorfs.Store.open(key[1])
-        return held
-
-
-def ensure_store(root: str | Path) -> Store:
-    """`store(root)`, first creating the Store when its catalog is absent."""
-    path = os.path.abspath(root)
-    if not os.path.isfile(os.path.join(path, "tensorfs.sqlite")):
-        created: Store = tensorfs.Store.ensure(path)
-        with _stores_lock:
-            _stores[(os.getpid(), path)] = created
-        return created
-    return store(path)
-
-
-def open_store(root: Path) -> Store:
-    """The process's Store handle for one caller-prepared root, refusals in fill vocabulary."""
-
-    try:
-        return store(root)
-    except Exception as exc:
-        raise _refuse(
-            "store_unusable",
-            f"{root}: not a usable TensorFS store — {type(exc).__name__}: {exc}; "
-            "have the Store owner ensure it before launching Runtime",
-        ) from exc
 
 
 #: How a TensorFS refusal is spoken in THIS plane's vocabulary. Closed and explicit: a code
@@ -261,24 +195,6 @@ def store_refusals(what: str) -> Iterator[None]:
             code,
             f"{what}: TensorFS refused {exc.code} - {getattr(exc, 'detail', exc)}",
         ) from exc
-
-
-def block_read_bytes() -> int:
-    """Bytes THIS process has actually pulled from the block layer, or -1 (cr-100).
-
-    The one cheap way to tell a warm page-cache read from a cold one: page faults on the
-    mapped CAS objects are charged here, cache hits are not. Observation only, and it is
-    allowed to be unavailable -- every non-Linux host reports -1 rather than a zero that
-    would read as "warm".
-    """
-    try:
-        with open("/proc/self/io", "rb") as rows:
-            for row in rows:
-                if row.startswith(b"read_bytes:"):
-                    return int(row.split(b":")[1])
-    except (OSError, ValueError):
-        return -1
-    return -1
 
 
 @dataclass(frozen=True, slots=True)
@@ -480,18 +396,6 @@ class Checkpoint:
                 self.header_bytes, list(traversal), list(components), window=window_bytes
             )
 
-    def acquire(self) -> ReadLease:
-        """A verified read lease over this snapshot's CozyTensors runtime closure."""
-        if self.store is None:
-            raise _refuse(
-                "store_unusable",
-                f"{self.manifest_id[:23]}: served by the machine, which holds its weights; "
-                "this executor reads no store",
-            )
-        with store_refusals(f"acquiring a lease on {self.manifest_id[:23]}"):
-            lease = self.store.acquire_cozytensors(self.manifest_id)
-        return lease
-
     def model_assets(self) -> dict[str, bytes]:
         """Read the header-declared model files through one verified lease over their own
         objects: never the whole closure (SDXL's is 2,602 objects, a descriptor each)."""
@@ -520,21 +424,6 @@ class Checkpoint:
                 for name in names
             }
         return assets
-
-
-def logical_weight_bytes(store: Store, snapshots: Mapping[str, str]) -> dict[str, int]:
-    """Each constructed component's LOGICAL bytes, from the header of the snapshot it fills
-    from: what its destinations hold. An encoded checkpoint stores fewer bytes than that
-    (fp8 SDXL: 4.71 GB stored, 6.94 GB logical), so the stored closure never prices one. A
-    component its header lacks has no entry; model-code-fit judges that mismatch."""
-    checkpoints = {
-        snapshot: Checkpoint.from_store(store, snapshot) for snapshot in set(snapshots.values())
-    }
-    return {
-        component: sum(row.nbytes for row in checkpoints[snapshot].rows(component))
-        for component, snapshot in snapshots.items()
-        if checkpoints[snapshot].has(component)
-    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -599,44 +488,6 @@ def servability(rows: Sequence[PlanRow], answer: ResolvedModelPlan | PlanRefusal
     return Servability(False, by_alias, {}, answer.detail, "plan_unresolved")
 
 
-def servability_for_script(
-    rows: Sequence[PlanRow],
-    *,
-    release: str,
-    providers: Mapping[str, tuple[Provider, ...]],
-    capabilities: Capabilities,
-    device: DeviceFacts,
-    store: str = "synthetic",
-    snapshot: str = "synthetic",
-    objective: str = "latency",
-    encoded_leaves: str = "accept",
-) -> Servability:
-    """The honesty answer for a DRIVER SCRIPT: resolve a `script_plan`, then derive.
-
-    Header work only — no tensor bytes move — through the same `resolve()` the executor
-    uses, so what a script prints as servable is what a worker would execute.
-    """
-    try:
-        answer: ResolvedModelPlan | PlanRefusal = script_plan(
-            rows=rows,
-            components=sorted({row.component for row in rows}),
-            release=release,
-            store=store,
-            snapshot=snapshot,
-            providers=providers,
-            capabilities=capabilities,
-            device=device,
-            runtime=measure_runtime(torch_module(), release),
-            facts=PlanFacts(),
-            objective=objective,
-            encoded_leaves=encoded_leaves,
-            dtype_name=dtype_name,
-        )
-    except PlanRefusal as exc:
-        answer = exc
-    return servability(rows, answer)
-
-
 def tensor_schema_of(rows: Sequence[PlanRow]) -> dict[str, TensorSpec]:
     """The checkpoint tensor schema the loader matches the code against.
 
@@ -649,93 +500,6 @@ def tensor_schema_of(rows: Sequence[PlanRow]) -> dict[str, TensorSpec]:
         row.key: TensorSpec(row.shape, dtype_name(row.dtype), row.encoded.alias, row.nbytes)
         for row in rows
     }
-
-
-# -------------------------------------------------------------------------- backend
-
-
-class ReadLeases:
-    """Every verified read lease one generation holds, keyed by WHAT A LEASE COVERS.
-
-    A lease is a hold on a SNAPSHOT. The fill plane asks for one per COMPONENT, and the
-    components of a single-snapshot model all read from the same snapshot — so a map keyed
-    by component name made the identical hold be taken once per component. Measured on
-    sdxl: four acquisitions of the same 2,602-object lease, 1091/1104/1160/1257 ms, and
-    10,408 pinned file descriptors for 2,602 distinct objects — against the FD_HEADROOM
-    admission `acquire_cozytensors` performs on its way in (cr-102/cr-103).
-
-    It lives here, apart from the backend, because the backend's constructor measures a
-    device and runs the qualification suite: lease bookkeeping that could only be exercised
-    behind those could only be proved by a fill on a card, and this is arithmetic over a
-    real store that a test can drive directly. A component-per-snapshot binding (cr-008b)
-    still takes one lease per distinct snapshot, which is the point — the key is the
-    snapshot, not the model.
-    """
-
-    def __init__(self, checkpoints: Mapping[str, Checkpoint]) -> None:
-        self.checkpoints = checkpoints
-        self.held: dict[str, ReadLease] = {}
-        #: How many times this generation went to the store. The EFFECT the keying has to
-        #: show, reported rather than asserted about the code: one per distinct manifest.
-        self.acquisitions = 0
-        #: HIGH-WATER, like `pinned`: what was held at the peak, not what is held now. A
-        #: full-resident generation releases at its first commit, so a live count read
-        #: from the prepare facts is always zero and says nothing about the descriptors
-        #: this fill actually spent against FD_HEADROOM.
-        self.peak = {"objects": 0, "bytes": 0}
-
-    def acquire(self, component: str) -> ReadLease:
-        """The lease covering this component's manifest, taken once and reused."""
-        checkpoint = self.checkpoints.get(component)
-        if checkpoint is None:
-            raise _refuse(
-                "destination_absent",
-                f"no checkpoint is bound for component {component!r} (bound: "
-                f"{', '.join(sorted(self.checkpoints)) or 'none'})",
-            )
-        manifest = checkpoint.manifest_id
-        lease = self.held.get(manifest)
-        if lease is None or not lease.live:
-            lease = self.held[manifest] = checkpoint.acquire()
-            self.acquisitions += 1
-            self.peak = {
-                "objects": max(self.peak["objects"], self._objects()),
-                "bytes": max(self.peak["bytes"], self._bytes()),
-            }
-        return lease
-
-    def take(self, component: str) -> ReadLease:
-        """The lease for this component's manifest, handed over: a plane weight set consumes
-        its lease, so the next component of the same manifest takes a fresh one."""
-        lease = self.acquire(component)
-        del self.held[self.checkpoints[component].manifest_id]
-        return lease
-
-    def _objects(self) -> int:
-        return sum(len(one.objects) for one in self.held.values())
-
-    def _bytes(self) -> int:
-        return sum(int(one.bytes) for one in self.held.values())
-
-    def release(self) -> None:
-        """Give every hold back. Idempotent: a poison and a commit may both reach here."""
-        held, self.held = self.held, {}
-        for lease in held.values():
-            if lease.live:
-                lease.release()
-
-    def document(self) -> dict[str, int]:
-        """What this generation leased, in the units the FD_HEADROOM admission is spent in.
-
-        `leases` is what is held right now; `objects` and `bytes` are the peak, because a
-        commit releases and a report of the after state would say a fill leased nothing.
-        """
-        return {
-            "leases": len(self.held),
-            "acquisitions": self.acquisitions,
-            "objects": max(self.peak["objects"], self._objects()),
-            "bytes": max(self.peak["bytes"], self._bytes()),
-        }
 
 
 # ------------------------------------------------------------------------- helpers

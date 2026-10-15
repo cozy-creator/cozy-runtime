@@ -65,6 +65,7 @@ from typing import Any
 
 import msgspec
 from msgspec import UNSET, UnsetType
+from tensorfs.derived import SourceCapability
 
 from cozy_runtime import __version__ as RUNTIME_VERSION
 from cozy_runtime.author import describe
@@ -94,6 +95,7 @@ from cozy_runtime.author._executor_requests import (
     DeviceRoom,
     DeviceTier,
     DeviceTierAnswer,
+    FetchChannel,
     Handoff,
     HostTier,
     ModelSource,
@@ -139,6 +141,7 @@ from cozy_runtime.internal import (
     child_env,
     execution_evidence,
     executor_commands,
+    fetch_plan,
     kernel_cache,
     kernel_compile,
     model_config,
@@ -614,6 +617,14 @@ class Executor:
         #: plane (`self.weights`), whose priorities are the LRU across them.
         self.constructions: dict[str, Executor] = {}
         self.weights: Weights | None = None
+        #: HOST ONLY, rank 0: what this process asks TensorFS to fetch, when and in what order
+        self.fetch = (
+            fetch_plan.Fetches(self._fetch_channel, self._fetch_progress)
+            if host is None and rank == 0
+            else None
+        )
+        #: HOST ONLY: each `Weights[M]` slot's declared components, by `<fn>.models.<param>`
+        self.source_components: dict[str, tuple[str, ...]] = {}
         self.active = ""
         self.started = False
         #: torch, the Runtime and the package are imported (`Start.import_only`); no device yet
@@ -1532,6 +1543,19 @@ class Executor:
                 "code": "sequence_parallel_unsupported",
                 "detail": "a group runs constructed models",
             }
+        self.source_components = {
+            slot.path: slot.components
+            for entry in interface.entrypoints
+            for slot in entry.models
+            if slot.weights and isinstance(slot.components, tuple)
+        }
+        if self.fetch is not None and command.constructions:
+            # The Start pass, before torch and the package: the imports, kernel compiles
+            # and warmup run while the weights download.
+            self.fetch.begin()
+            self.fetch.schedule(
+                fetch_plan.at_start(command.constructions, lambda m: self._model_source(m, ""))
+            )
         started = time.perf_counter()
         stages: list[tuple[str, float]] = []
         _mark = [started]
@@ -1911,6 +1935,8 @@ class Executor:
             loaded._bind_parameters(command)
             return self._load_reply(key, loaded, reused=True)
         child = self._construction_child(key)
+        if self.fetch is not None:
+            self.fetch.begin()  # the Load pass replaces the Start pass
         try:
             reply = child._prepare_first(command)
         except Exception:
@@ -2491,6 +2517,7 @@ class Executor:
             except plane.Unavailable as exc:
                 return {"ok": False, "code": "weight_plane_unavailable", "detail": str(exc)}
         weights = host.weights
+        weights.fetch = host.fetch
         # TensorD retains exported GPU allocation handles. Runtime's plane attaches those
         # allocations here and can later export its own filled regions for reuse.
         sharing = command.device_weights and self.world == 1 and plane.sharing()
@@ -2521,6 +2548,8 @@ class Executor:
                 staged=command.staged_tiers and not weights.host_only,
             ),
         )
+        scopes = fetch_plan.in_definition_order(model_cls, component_use(model_cls))
+        backend.order = tuple(fetch_plan.stage_components(scopes, scopes))
         stage("backend_ctor")
         # THE GROUP AGREES ITS PLAN before any rank registers a byte (cr-068). Budgets are
         # the Worker's, per device, so the ceiling the ranks share is the one it assigned.
@@ -2584,12 +2613,10 @@ class Executor:
             substrate=lambda: serving_substrate(hardware_variant, seen),
         )
         try:
-            # `expect` takes the verified read leases: a corrupt artifact refuses here,
-            # before construction.
             backend.expect(
                 {name: tuple(r.key for r in checkpoints[name].rows(name)) for name in present}
             )
-            stage("lease_acquire")
+            stage("expect")
             adapter_rows = tuple(
                 AdapterRef(
                     ref=row.model_id or row.ref,
@@ -2654,9 +2681,7 @@ class Executor:
         self.models = {name: model for name in binding.parameter_names()}
         # THE COMPONENT-USE CONTRACT'S RUNTIME BODY: from here on a declared scope is a
         # stage on the plane, and each block runs inside one acquire/release.
-        self.residency = WeightResidency(
-            weights, backend.components, component_use(model_cls), refine=backend.refine
-        )
+        self.residency = WeightResidency(weights, backend.components, scopes, refine=backend.refine)
         object.__setattr__(model, "_cozy_residency", self.residency)
         stage_memo.install(
             model,
@@ -2768,7 +2793,6 @@ class Executor:
             "plane": msgspec.to_builtins(weights.facts()),
             "authorized_device_limit_bytes": authorized,
             "rss_bytes": _rss(),
-            "leases": backend.leases.document(),
             "gpu_name": accel.device_identity(torch, self.device_kind)["name"],
             "device_driver": device_facts.driver,
             "torch_version": torch.__version__,
@@ -3090,6 +3114,19 @@ class Executor:
         target = self._target(command, attempt=False)
         if isinstance(target, dict):
             return target
+        if self.fetch is not None:
+            # The attempt re-asserts what it reads, on its own channel, in the order this
+            # process learned: a no-op for objects already here, and every fetch stays owned
+            # by a live call. Nothing carries over from an earlier call.
+            self.fetch.end()
+            groups = [
+                group
+                for member in target.model_executors or [target]
+                if member.residency is not None
+                for group in member.residency.fetch_plan()
+            ]
+            if groups:
+                self.fetch.schedule(groups)
         return target.prepare_request(command)
 
     def serve_invoke(self, command: Invoke) -> dict[str, Any]:
@@ -3123,7 +3160,11 @@ class Executor:
             self.weights.seed_squeezed(command.squeezed_bytes)
             if not isinstance(command.device_weights, UnsetType):
                 self._device_weights(command.device_weights)
-        reply = target.invoke(command)
+        try:
+            reply = target.invoke(command)
+        finally:
+            if self.fetch is not None:
+                self.fetch.end()
         self.attempts += 1
         self.poisoned = self.poisoned or target.poisoned
         reply["poisoned"] = self.poisoned
@@ -3359,7 +3400,7 @@ class Executor:
                             max_output_bytes=command.max_output_bytes,
                             sources=sources,
                             weights_values=read_values_into,
-                            tensorfs_source=storage.source if sources else None,
+                            tensorfs_source=self._sources(storage, command) if sources else None,
                             tensorfs_output=storage.open_output if command.weights else None,
                             tensorfs_adopt=storage.adopt_model if command.weights else None,
                             publish=self._publish,
@@ -4081,6 +4122,42 @@ class Executor:
             self._durable(request, Answer)
         finally:
             os.close(memfd)
+
+    def _fetch_channel(self) -> int:
+        """A fresh fetch channel for the running call (`FetchChannel`); -1: none given."""
+        answer = self._durable(FetchChannel(), Handoff)
+        return answer.descriptor if answer.ok and answer.descriptor >= 0 else -1
+
+    def _fetch_progress(self, line: str, fraction: float) -> None:
+        """A wait on weights not here yet, told to the machine as the running request's stage."""
+        with contextlib.suppress(SeamError):
+            self.channel.send(
+                {"event": "progress", "request_id": "", "kind": "progress", "stage": line}
+                | {"stage_fraction": fraction, "advance": 0}
+            )
+
+    def _sources(
+        self, storage: ExecutionStorage, command: Invoke
+    ) -> Callable[[str], SourceCapability]:
+        """The attempt's `Weights[M]` sources, each wanting its declared components ahead of
+        its reads on the attempt's fetch channel."""
+        host = self.host
+        declared: dict[str, tuple[str, ...]] = {}
+        for param, manifest in command.sources.items():
+            path = f"{command.entrypoint}.models.{param}"
+            declared[manifest] = (
+                *declared.get(manifest, ()),
+                *host.source_components.get(path, ()),
+            )
+
+        def opened(manifest: str) -> SourceCapability:
+            capability = storage.source(manifest)
+            if host.fetch is None:
+                return capability
+            header = host._model_source(manifest, "")
+            return fetch_plan.source(host.fetch, capability, header, declared.get(manifest, ()))
+
+        return opened
 
     def _model_source(self, manifest: str, name: str) -> bytes:
         """One model file from the machine (`ModelSource`): the header (`name` empty) or one

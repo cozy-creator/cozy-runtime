@@ -256,6 +256,12 @@ class ModelSource(_Request, frozen=True, kw_only=True, tag="model_source"):
     name: str = ""
 
 
+class FetchChannel(_Request, frozen=True, kw_only=True, tag="fetch_channel"):
+    """A fresh fetch channel for the running call (`tensorfs.fetch`): a `Handoff` answers, one
+    connected socket following. It names only the call's selected checkpoints, never a hub
+    or credential, and ends with the call."""
+
+
 class SealedPrefetch(_Request, frozen=True, kw_only=True, tag="sealed_prefetch"):
     """Every component's `SealedPlan` of one construction at once (a canonical JSON list in a
     sealed memfd after the request): TensorD starts filling their CPU buffers, and each later
@@ -287,6 +293,7 @@ type _Tagged = (
     | SealedStage
     | ObjectFiles
     | ModelSource
+    | FetchChannel
     | BudgetCell
     | ChildEvents
     | ChildCall

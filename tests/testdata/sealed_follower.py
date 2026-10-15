@@ -43,7 +43,6 @@ def adopt(executor: Any, root: Path, manifest: str, construction: str) -> dict[s
         "assets": len(checkpoint.model_assets()),
         "sealed": [sealed, model.residency.components["stack"].sealed],
         "refined": refined,
-        "leases": model.backend.stats["leases"]["acquisitions"],
         "outputs": [digest(coarse), digest(run(model, x, passes=1)[0])],
         "refused": executor._ask_tier("stack", "layout") is None,
     }
