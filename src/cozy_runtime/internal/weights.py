@@ -3165,18 +3165,20 @@ class WeightResidency:
         try:
             weights.trim_cache(method)
             budget = weights.stage_budget(method)
+            # One GPU of a group keeps only a streaming window for a stage's first pass (its
+            # blocks cannot run again after an out-of-memory), then grows by what it measured.
+            weights.growing = weights.grouped and method not in weights.activation
             if method not in weights.activation:
                 # Activations first, and these are not measured yet: the open stages' own
                 # weights are all the plane keeps; every other byte stays torch's until it is.
-                # One GPU of a group keeps only a streaming window for the first pass (its
-                # blocks cannot run again after an out-of-memory), then grows by what it measured.
                 own = [_paid(c, c.planned)[0] for _, _, c in weights.opened().values()]
-                weights.growing = weights.grouped
                 keep = sum(o.common + 2 * o.largest if weights.grouped else o.total for o in own)
-                if weights.cap >= 0 and not weights.grouped:
+                if weights.cap >= 0:
                     # Under an owner's cap other stages' weights stay mapped too (keep hot): an
                     # activation that then lacks room is an out-of-memory at the cap, and the
-                    # plane unmaps the least recently used to run it. Without one, they leave.
+                    # plane unmaps the least recently used to run it (a group GPU's op by op).
+                    # Without one, they leave. A group's first decode unmapped its DiT, which
+                    # the next segment read back: 51 GiB, 1.3-2.0 s on 2x H100 (6719, 6772).
                     keep += max(plane.stats(weights.plane).device(weights.index).committed, 0)
                 # a window of two blocks: one more than the floor, so nothing refines
                 budget = min(budget, keep)
@@ -3630,9 +3632,12 @@ class WeightResidency:
         def stage(
             layouts: Mapping[str, weight_policy.Layout],
         ) -> dict[str, weight_policy.Residence]:
+            room = budget
+            if weights.growing:  # a group's first pass: the budget past its window keeps hot
+                room = min(budget, sum(o.common + 2 * o.largest for o in layouts.values()))
             return weight_policy.stage(
                 layouts,
-                budget,
+                room,
                 orders={
                     key: [at[key][n] for n in map(c.numbers.__getitem__, c.order) if n in at[key]]
                     for key, c in components.items()
@@ -3988,13 +3993,16 @@ class WeightResidency:
         """The block's lease: from the stage's cursor when the block is due within its window
         (an earlier departure skips ahead), else resident access or a demand fill. A demand
         fill ranks above every earlier streamed block and below the stage's prefix, so the
-        least recently used block is the one it can displace."""
+        least recently used block is the one it can displace. On a group's first pass it
+        ranks below every idle weight too: the pass streams through its own window, and other
+        stages' weights stay mapped (keep hot)."""
         weights = self.weights
         self._arrive(component, index)
         if component.cursor is not None and _due(component, component.cursor, index):
             lease: Lease = component.cursor.acquire(index, stream)
         else:
-            priority = None if index in component.resident else plane.STREAMED + weights.tick()
+            streamed = -plane.STREAMED if weights.growing else plane.STREAMED
+            priority = None if index in component.resident else streamed + weights.tick()
             lease = weights.plane.acquire(
                 component.ws, weights.index, index, stream, priority=priority
             )
