@@ -65,7 +65,8 @@ def test_one_lane_carries_nvfp4_beside_int8(tmp_path: Path) -> None:
     parsed = header(store, artifact)
     q_proj = parsed["components"]["text_encoder"]["layers.0.q_proj.weight"]
     assert q_proj["encoding"] == dict(tensorfs.seed_digests())["int8-convrot256/1"]
-    assert dict(tensorfs.seed_digests())[ENCODING] == SPEC_NVFP4
+    # The base role set, first of the four the alias files.
+    assert [d for a, d in tensorfs.seed_digests() if a == ENCODING][0] == SPEC_NVFP4
     ff = parsed["components"]["transformer"]["blocks.0.ff.weight"]
     parts = ff["parts"]
     assert ff["encoding"] == SPEC_NVFP4
