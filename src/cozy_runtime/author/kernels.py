@@ -73,17 +73,25 @@ class TritonKernels:
 
     Declare it at module scope (`GLUE = TritonKernels("my-package-glue", [...])`); the kernels
     must be module-level functions, which the out-of-process build imports by name. The name
-    keys the build in the machine's kernel store.
+    keys the build in the machine's kernel store. `origin`: a module whose import declares
+    the set, when that is not the kernels' own (a set Runtime builds from a declaration).
     """
 
-    def __init__(self, name: str, entries: Iterable[TritonEntry]) -> None:
+    def __init__(self, name: str, entries: Iterable[TritonEntry], *, origin: str = "") -> None:
         if _NAME.fullmatch(name) is None:
             raise ValueError(f"kernel set name {name!r} must match {_NAME.pattern}")
         self.name = name
+        self.origin = origin
         self.entries = tuple(entries)
         if len({entry.key for entry in self.entries}) != len(self.entries):
             raise ValueError(f"{name} declares one entry twice")
         _SETS[name] = self
+
+    @property
+    def modules(self) -> frozenset[str]:
+        """What a process imports to hold this set: its kernels' modules and its origin."""
+        found = {entry.kernel.fn.__module__ for entry in self.entries}
+        return frozenset(found | {self.origin} if self.origin else found)
 
     @property
     def identity(self) -> str:
@@ -106,6 +114,12 @@ class Plan:
     load: Callable[[TritonKernels], Launch]
     """Wait for this machine's build of the set for `device` (started when the executor did)
     and return its launcher. Raises `KernelsUnavailable`."""
+    when_ready: Callable[[TritonKernels, Callable[[Launch], None]], bool] | None = None
+    """`install(launch)` now when the build is done (True), else at the start of the first
+    request after it is (False): a construction serves while its kernels compile, and a run
+    never waits for one. A group installs now. Raises `KernelsUnavailable` as `load` does;
+    a deferred install that fails leaves the construction as it was. None: `load`, then
+    install."""
 
 
 @dataclass(frozen=True, slots=True)
