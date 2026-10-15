@@ -81,24 +81,9 @@ def _conformance(project: Path, static: Mapping[str, Json]) -> str:
 
 def _list(body: Mapping[str, Json]) -> Result:
     rows: list[tuple[str, str]] = []
-    for kind in ("entrypoints", "jobs"):
-        entries = body[kind]
-        assert isinstance(entries, list)
-        for doc in entries:
-            assert isinstance(doc, dict)
-            rows.append((str(doc["name"]), _one_line(doc, kind[:-1])))
-            if kind == "jobs":
-                # THE ID A RecordOwner DISPATCHES BY. It is derived, never stored in the
-                # document (a digest inside a source-stable surface has no clock a reader
-                # can name), so the only way anyone else gets it is by re-deriving the
-                # canonical form — which cozy-creator was doing in Go. Printing it here is
-                # what deletes that second implementation (cl-004).
-                rows.append(
-                    (
-                        f"{doc['name']}.job_descriptor_id",
-                        package_interface.job_descriptor_id(body, str(doc["name"])),
-                    )
-                )
+    for doc in _as_list(body["entrypoints"]):
+        assert isinstance(doc, dict)
+        rows.append((str(doc["name"]), _one_line(doc)))
     counts = package_interface.counts(body)
     # Empty states are definitive, and aggregates ride the listing.
     rows.append(("counts", " · ".join(_plural(n, k) for k, n in counts.items())))
@@ -112,19 +97,18 @@ def _list(body: Mapping[str, Json]) -> Result:
 
 
 def _plural(count: int, kind: str) -> str:
-    """Empty states are definitive — "0 jobs", never a blank."""
+    """Empty states are definitive — "0 functions", never a blank."""
     word = kind.replace("_", " ")
     return f"{count} {word if count != 1 else word[:-1]}"
 
 
-def _one_line(doc: Mapping[str, Json], kind: str) -> str:
+def _one_line(doc: Mapping[str, Json]) -> str:
     request = doc["request"]
     result = doc["result"]
     assert isinstance(request, dict) and isinstance(result, dict)
     slots = doc.get("models", [])
     assert isinstance(slots, list)
     parts = [
-        kind,
         f"{len(_as_list(request['fields']))} request fields",
         "model artifact result"
         if result.get("input") == "model"
@@ -132,19 +116,20 @@ def _one_line(doc: Mapping[str, Json], kind: str) -> str:
     ]
     if slots:
         parts.append(f"{len(slots)} model binding{'s' if len(slots) != 1 else ''}")
+    if doc.get("weights_outputs"):
+        parts.append("writes weights")
+    if doc.get("accelerator") is False:
+        parts.append("CPU only")
     return " · ".join(parts)
 
 
 def _one(body: Mapping[str, Json], function: str) -> Result:
-    entrypoints = body["entrypoints"]
-    jobs = body["jobs"]
-    assert isinstance(entrypoints, list) and isinstance(jobs, list)
-    for kind, docs in (("entrypoint", entrypoints), ("job", jobs)):
-        for doc in docs:
-            assert isinstance(doc, dict)
-            if doc["name"] == function:
-                return _schema_view(doc, body, kind)
-    known = sorted(str(d["name"]) for d in [*entrypoints, *jobs] if isinstance(d, dict))
+    entrypoints = _as_list(body["entrypoints"])
+    for doc in entrypoints:
+        assert isinstance(doc, dict)
+        if doc["name"] == function:
+            return _schema_view(doc, body)
+    known = sorted(str(d["name"]) for d in entrypoints if isinstance(d, dict))
     raise CliError(
         "not_found",
         f"no registered callable named {function!r}",
@@ -154,17 +139,16 @@ def _one(body: Mapping[str, Json], function: str) -> Result:
     )
 
 
-def _schema_view(doc: Mapping[str, Json], body: Mapping[str, Json], kind: str) -> Result:
-    rows: list[tuple[str, str]] = [("function", f"{doc['name']} ({kind})")]
-    view: dict[str, Json] = dict(doc)
-    if kind == "job":
-        # DERIVED here, and only here. It may not enter the published interface — a
-        # `sha256:` inside a source-stable surface leaves a reader no way to know which
-        # clock it came from — but a RecordOwner dispatches by it, so a verb that would not
-        # say it forces every consumer to re-derive the canonical form (cl-004 measured one
-        # doing exactly that, in Go).
-        view["job_descriptor_id"] = package_interface.job_descriptor_id(body, str(doc["name"]))
-        rows.append(("job_descriptor_id", str(view["job_descriptor_id"])))
+def _schema_view(doc: Mapping[str, Json], body: Mapping[str, Json]) -> Result:
+    # The operation identity is derived here, never stored in the source-stable interface.
+    view: dict[str, Json] = {
+        **doc,
+        "descriptor_id": package_interface.descriptor_id(body, str(doc["name"])),
+    }
+    rows: list[tuple[str, str]] = [
+        ("function", str(doc["name"])),
+        ("descriptor_id", str(view["descriptor_id"])),
+    ]
     lines: list[str] = ["request:"]
     lines += _fields(doc["request"])
     lines.append("result:")
@@ -173,7 +157,7 @@ def _schema_view(doc: Mapping[str, Json], body: Mapping[str, Json], kind: str) -
         assert isinstance(slot, dict)
         runs = ", ".join(map(str, _as_list(slot.get("components", []))))
         lines.append(
-            f"model {slot['path']} -> {slot['class']}  "
+            f"{'weights' if slot.get('weights') else 'model'} {slot['path']} -> {slot['class']}  "
             f"encoded_leaves: {slot.get('encoded_leaves', 'refuse')}"
             + (f"  runs: {runs}" if runs else "")
         )

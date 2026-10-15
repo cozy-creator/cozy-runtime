@@ -28,21 +28,12 @@ from cozy_runtime.internal.canonical import Json
 if TYPE_CHECKING:
     from cozy_runtime.internal.discovery import Discovered
 
-Kind = Literal["entrypoint", "job"]
-
 SCHEMA = "cozy.package.interface/1"
 DIGEST_KEY = "package_interface_digest"
 FILENAME = "metadata/package-interface.json"
 
 #: The top-level fields every interface carries. Readers ignore additional fields.
-TOP_LEVEL_KEYS = frozenset(
-    {
-        "format",
-        "application",
-        "entrypoints",
-        "jobs",
-    }
-)
+TOP_LEVEL_KEYS = frozenset({"format", "application", "entrypoints"})
 
 
 class StalePackageInterface(ConformanceError):
@@ -83,6 +74,8 @@ class ModelSlot(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
     sequence_parallel: SequenceParallel | msgspec.UnsetType = msgspec.UNSET
     #: the components this callable runs; unset means all of them
     components: tuple[str, ...] | msgspec.UnsetType = msgspec.UNSET
+    #: a `Weights[M]` argument: raw checkpoint data, never constructed
+    weights: bool = False
 
     @property
     def parameter(self) -> str:
@@ -124,7 +117,8 @@ class CallableDoc(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True)
     models: Annotated[tuple[ModelSlot, ...], msgspec.Meta(max_length=16)] = ()
     assets: AssetsSlot | msgspec.UnsetType = msgspec.UNSET
     invocable: invocable_interface.Invocable | msgspec.UnsetType = msgspec.UNSET
-    publishes: bool | msgspec.UnsetType = msgspec.UNSET
+    publishes: bool = False
+    #: written only as false: CPU only. Absent: the machine's GPU when it has one.
     accelerator: bool | msgspec.UnsetType = msgspec.UNSET
     weights_outputs: (
         Annotated[tuple[WeightsOutputDeclaration, ...], msgspec.Meta(min_length=1, max_length=16)]
@@ -136,16 +130,9 @@ class PackageInterface(msgspec.Struct, frozen=True, kw_only=True):
     format: str
     application: Annotated[str, msgspec.Meta(min_length=1)]
     entrypoints: tuple[CallableDoc, ...]
-    jobs: tuple[CallableDoc, ...]
 
-    def callables(self) -> tuple[tuple[Kind, CallableDoc], ...]:
-        return (
-            *(("entrypoint", entry) for entry in self.entrypoints),
-            *(("job", entry) for entry in self.jobs),
-        )
-
-    def job(self, name: str) -> CallableDoc | None:
-        return next((entry for entry in self.jobs if entry.name == name), None)
+    def function(self, name: str) -> CallableDoc | None:
+        return next((entry for entry in self.entrypoints if entry.name == name), None)
 
 
 # ------------------------------------------------------------------------ the document
@@ -153,13 +140,13 @@ class PackageInterface(msgspec.Struct, frozen=True, kw_only=True):
 
 def build(found: Discovered, *, installed: bool = False) -> dict[str, Json]:
     """Derive one package interface from the frozen (imported) application."""
-    docs = [(surface.kind, _callable(surface)) for surface in found.surfaces if not surface.hidden]
+    docs = [_callable(surface) for surface in found.surfaces if not surface.hidden]
     return assemble(found.application, docs, found.bindings, installed=installed)
 
 
 def assemble(
     application: str,
-    docs: Sequence[tuple[Kind, dict[str, Json]]],
+    docs: Sequence[dict[str, Json]],
     bindings: Mapping[str, Mapping[str, object]],
     *,
     installed: bool = False,
@@ -168,7 +155,7 @@ def assemble(
 
     `installed` describes a published wheel, so it holds that release to the rules it was
     published under."""
-    for _, doc in docs:
+    for doc in docs:
         declared = doc.get("invocable")
         if isinstance(declared, dict) and "memo_requires" in declared:
             invocable_interface.check_memo_requires(
@@ -176,13 +163,10 @@ def assemble(
                 doc["request"],
                 authoring=not installed,
             )
-    entrypoints: list[Json] = [doc for kind, doc in docs if kind == "entrypoint"]
-    jobs: list[Json] = [doc for kind, doc in docs if kind == "job"]
     body: dict[str, Json] = {
         "format": SCHEMA,
         "application": application,
-        "entrypoints": sorted(entrypoints, key=_by_name),
-        "jobs": sorted(jobs, key=_by_name),
+        "entrypoints": sorted(docs, key=_by_name),
     }
     assert set(body) == TOP_LEVEL_KEYS, sorted(set(body) ^ TOP_LEVEL_KEYS)
     _fixed_point(body, _binding_values(bindings))
@@ -199,7 +183,6 @@ def _by_name(doc: Json) -> str:
 def _callable(surface: Surface) -> dict[str, Json]:
     doc = callable_doc(
         name=surface.name,
-        kind=surface.kind,
         payload_type=surface.payload_type,
         result_type=surface.result_type,
         models=[
@@ -211,6 +194,7 @@ def _callable(surface: Surface) -> dict[str, Json]:
                 binding.sequence_parallel,
                 defaults=surface.model_defaults.get(binding.param, ()),
                 uses=surface.model_components.get(binding.param, ()),
+                weights=binding.weights,
             )
             for binding in surface.model_bindings
         ],
@@ -220,17 +204,15 @@ def _callable(surface: Surface) -> dict[str, Json]:
         internal=surface.internal,
         accelerator=surface.accelerator,
     )
-    if surface.invocable or surface.kind == "entrypoint":
-        doc["invocable"] = invocable_interface.metadata(surface)
-        if surface.invocable and surface.kind == "entrypoint":
-            invocable_interface.project_serving_models(doc)
+    doc["invocable"] = invocable_interface.metadata(surface)
+    if surface.invocable:
+        invocable_interface.project_serving_models(doc)
     return doc
 
 
 def callable_doc(
     *,
     name: str,
-    kind: Kind,
     payload_type: object,
     result_type: object,
     models: Sequence[dict[str, Json]],
@@ -238,7 +220,7 @@ def callable_doc(
     publishes: bool,
     weights_outputs: Sequence[WeightsOutput],
     internal: bool = False,
-    accelerator: bool | None = None,
+    accelerator: bool = True,
 ) -> dict[str, Json]:
     """One callable's document from plain facts — the import and static readers meet here."""
     doc: dict[str, Json] = {
@@ -280,20 +262,19 @@ def callable_doc(
         if assets.decoded:
             slot["view"] = "decoded"
         doc["assets"] = slot
-    if kind == "job":
-        doc["publishes"] = publishes
-        if accelerator is not None:
-            doc["accelerator"] = accelerator
-        if weights_outputs:
-            outputs: list[Json] = []
-            for output in sorted(weights_outputs, key=lambda row: row.name):
-                declared: dict[str, Json] = {
-                    "output_id": output.name,
-                    "mime_type": "application/vnd.cozy.model-manifest",
-                    "max_bytes": output.max_new_bytes,
-                }
-                outputs.append(declared)
-            doc["weights_outputs"] = outputs
+    if publishes:
+        doc["publishes"] = True
+    if not accelerator:
+        doc["accelerator"] = False
+    if weights_outputs:
+        doc["weights_outputs"] = [
+            {
+                "output_id": output.name,
+                "mime_type": "application/vnd.cozy.model-manifest",
+                "max_bytes": output.max_new_bytes,
+            }
+            for output in sorted(weights_outputs, key=lambda row: row.name)
+        ]
     return doc
 
 
@@ -306,11 +287,13 @@ def model_slot(
     *,
     defaults: DefaultLadder = (),
     uses: Sequence[str] = (),
+    weights: bool = False,
 ) -> dict[str, Json]:
     """One model slot. The PATH is the binding point, the CLASS carries `encoded_leaves`,
     and the per-public-method component sets are the ComponentUseContracts. Optional authored
     defaults are unresolved source metadata; exact artifact selection remains dispatch-owned.
-    `uses` names the components the callable runs (`components`); empty means all."""
+    `uses` names the components the callable runs (`components`); empty means all. A
+    `weights` slot is raw checkpoint data, so `uses` names its checkpoint components."""
     doc: dict[str, Json] = {
         "path": path,
         "class": class_name,
@@ -332,7 +315,7 @@ def model_slot(
         ]
     if uses:
         unknown = sorted(set(uses) - {name for names in components.values() for name in names})
-        if unknown:
+        if unknown and not weights:
             raise ConformanceError(
                 f"{path}: components names {', '.join(unknown)}, which no "
                 f"@uses_components method of {class_name} declares",
@@ -344,6 +327,8 @@ def model_slot(
         # The author's opt-in to a group lane (cr-068): the degrees the class's attention
         # shards at. Closed and optional; a slot without it is never sharded.
         doc["sequence_parallel"] = {"degrees": list(sequence_parallel)}
+    if weights:
+        doc["weights"] = True
     return doc
 
 
@@ -399,7 +384,7 @@ def _fixed_point(value: Json, bindings: frozenset[str], path: str = "") -> None:
     if isinstance(value, Mapping):
         for key, item in value.items():
             if key == "operation_identity" and re.fullmatch(
-                r"\.(?:entrypoints|jobs)\[\d+\]\.invocable", path
+                r"\.entrypoints\[\d+\]\.invocable", path
             ):
                 # This belongs to the deterministic operation cache, not package
                 # installation admission or source snapshot identity.
@@ -407,7 +392,7 @@ def _fixed_point(value: Json, bindings: frozenset[str], path: str = "") -> None:
                     raise ConformanceError("invalid operation memo identity", code="fixed_point")
                 continue
             if key == "default_ladder" and re.fullmatch(
-                r"\.(?:entrypoints|jobs)\[\d+\]\.models\[\d+\]", path
+                r"\.entrypoints\[\d+\]\.models\[\d+\]", path
             ):
                 default_ladder(item)
                 continue
@@ -458,29 +443,22 @@ def package_interface_digest(doc: Mapping[str, Json]) -> str:
     return canonical.digest(dict(doc))
 
 
-def job_descriptor_id(body: Mapping[str, Json], name: str) -> str:
-    """`job_descriptor_id` — sha256 of ONE job's exact callable, schemas, effects, resource
-    caps and publication contract (README §4).
+def descriptor_id(body: Mapping[str, Json], name: str) -> str:
+    """sha256 of ONE function's exact interface entry: its operation identity.
 
-    DERIVED, never stored in the document: a digest of a subject that lives on this same
-    clock is still a digest, and `_fixed_point` refuses one anywhere in the body — for the
-    good reason that a reader who finds a `sha256:` string in a source-stable surface has no
-    way to know which clock it came from. The runner computes it when it needs it, from the
-    document, and every environment of one release computes the same one.
+    Derived, never stored: `_fixed_point` refuses a digest inside the source-stable body.
     """
-    jobs = body.get("jobs", [])
-    assert isinstance(jobs, list)
-    for entry in jobs:
+    entries = body.get("entrypoints", [])
+    assert isinstance(entries, list)
+    for entry in entries:
         assert isinstance(entry, dict)
         if entry["name"] == name:
             encoded = canonical.write(entry)
-            return (
-                "sha256:" + hashlib.sha256(b"cozy.runtime.job-descriptor\0" + encoded).hexdigest()
-            )
+            return "sha256:" + hashlib.sha256(b"cozy.runtime.descriptor\0" + encoded).hexdigest()
     raise ConformanceError(
-        f"this release registers no job named {name!r}: it has "
-        f"{', '.join(str(j['name']) for j in jobs if isinstance(j, dict)) or 'no jobs'}",
-        code="unknown_job",
+        f"this release registers no function named {name!r}: it has "
+        f"{', '.join(str(e['name']) for e in entries if isinstance(e, dict)) or 'none'}",
+        code="unknown_function",
     )
 
 
@@ -500,7 +478,7 @@ def source_facts(doc: Mapping[str, Json]) -> dict[str, Json]:
 
     return {
         key: [callable_facts(entry) for entry in value]
-        if key in ("entrypoints", "jobs") and isinstance(value, list)
+        if key == "entrypoints" and isinstance(value, list)
         else value
         for key, value in doc.items()
     }
@@ -602,32 +580,30 @@ def publish(path: Path, raw: bytes) -> None:
 
 def _validate(interface: PackageInterface, source: str) -> None:
     """The cross-field rules the struct types cannot state. One current grammar, no legacy."""
-    for kind, entries in (("entrypoint", interface.entrypoints), ("job", interface.jobs)):
-        collection = kind + "s"
-        names: set[str] = set()
-        for index, item in enumerate(entries):
-            path = f"{collection}[{index}]"
-            if not item.name or item.name in names:
-                _invalid(source, f"{path}.name", "must be non-empty and unique")
-            names.add(item.name)
-            if (kind == "job") != (item.publishes is not msgspec.UNSET):
-                _invalid(source, f"{path}.publishes", "is required exactly on jobs")
-            if kind != "job" and (
-                item.accelerator is not msgspec.UNSET or item.weights_outputs is not msgspec.UNSET
-            ):
-                _invalid(source, path, "only jobs declare accelerator or weights outputs")
-            _schema(item.request, source, f"{path}.request")
-            _schema(item.result, source, f"{path}.result")
-            if item.assets is not msgspec.UNSET:
-                _assets_slot(item.assets, item.request, source, f"{path}.assets")
-            if item.invocable is not msgspec.UNSET:
-                invocable_interface.validate(item.invocable, item.request, item.result, kind=kind)
-            for model_index, slot in enumerate(item.models):
-                _model_slot(slot, item.name, source, f"{path}.models[{model_index}]")
-            outputs = () if item.weights_outputs is msgspec.UNSET else item.weights_outputs
-            output_ids = [output.output_id for output in outputs]
-            if len(set(output_ids)) != len(output_ids):
-                _invalid(source, f"{path}.weights_outputs", "output ids must be unique")
+    names: set[str] = set()
+    for index, item in enumerate(interface.entrypoints):
+        path = f"entrypoints[{index}]"
+        if not item.name or item.name in names:
+            _invalid(source, f"{path}.name", "must be non-empty and unique")
+        names.add(item.name)
+        if item.accelerator is True:
+            _invalid(source, f"{path}.accelerator", "is written only as false")
+        _schema(item.request, source, f"{path}.request")
+        _schema(item.result, source, f"{path}.result")
+        if item.assets is not msgspec.UNSET:
+            _assets_slot(item.assets, item.request, source, f"{path}.assets")
+        outputs = () if item.weights_outputs is msgspec.UNSET else item.weights_outputs
+        if item.invocable is not msgspec.UNSET:
+            invocable_interface.validate(item.invocable, item.request, item.result)
+            if item.invocable.memoize and (outputs or item.publishes):
+                _invalid(
+                    source, path, "a function that writes weights or publishes is not memoized"
+                )
+        for model_index, slot in enumerate(item.models):
+            _model_slot(slot, item.name, source, f"{path}.models[{model_index}]")
+        output_ids = [output.output_id for output in outputs]
+        if len(set(output_ids)) != len(output_ids):
+            _invalid(source, f"{path}.weights_outputs", "output ids must be unique")
 
 
 def _model_slot(slot: ModelSlot, name: str, source: str, path: str) -> None:
@@ -646,7 +622,10 @@ def _model_slot(slot: ModelSlot, name: str, source: str, path: str) -> None:
     if slot.components is not msgspec.UNSET and (
         not slot.components
         or len(set(slot.components)) != len(slot.components)
-        or not set(slot.components) <= {c for names in slot.component_use.values() for c in names}
+        or not (
+            slot.weights
+            or set(slot.components) <= {c for names in slot.component_use.values() for c in names}
+        )
     ):
         _invalid(source, f"{path}.components", "must be non-empty, unique and within component_use")
     prefix = f"{name}.models."
@@ -806,16 +785,11 @@ ASSET_BOUND_KEYS = frozenset({"max_bytes", "max_decoded_bytes", "media_types"})
 def counts(body: Mapping[str, Json]) -> dict[str, int]:
     """Aggregates ride the listing, so no follow-up call is needed."""
     entrypoints = body.get("entrypoints", [])
-    jobs = body.get("jobs", [])
-    assert isinstance(entrypoints, list) and isinstance(jobs, list)
+    assert isinstance(entrypoints, list)
     slots = 0
-    for doc in [*entrypoints, *jobs]:
+    for doc in entrypoints:
         assert isinstance(doc, dict)
         models = doc.get("models", [])
         assert isinstance(models, list)
         slots += len(models)
-    return {
-        "entrypoints": len(entrypoints),
-        "jobs": len(jobs),
-        "model_bindings": slots,
-    }
+    return {"functions": len(entrypoints), "model_bindings": slots}

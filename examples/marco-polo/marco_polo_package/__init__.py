@@ -24,6 +24,6 @@ def marco(payload: MarcoRequest) -> PoloResponse:
     return PoloResponse(message="polo")
 
 
-@app.job(accelerator=False)
-def marco_job(payload: MarcoRequest) -> PoloResponse:
+@app.entrypoint(accelerator=False)
+def marco_cpu(payload: MarcoRequest) -> PoloResponse:
     return PoloResponse(message="polo")

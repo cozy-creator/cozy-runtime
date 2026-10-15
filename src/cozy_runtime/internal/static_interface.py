@@ -63,7 +63,7 @@ from cozy_runtime.author._script_metadata import (
     fold_constant,
     main_definition,
 )
-from cozy_runtime.author._services import JOB_ONLY, SERVICES
+from cozy_runtime.author._services import SERVICES
 from cozy_runtime.author._signature import AssetsBinding, _classify, assets_binding, assets_payload
 from cozy_runtime.author._walker import is_struct
 from cozy_runtime.internal.bindings import read_table
@@ -78,7 +78,13 @@ class StaticRefusal(author.ConformanceError):
     default_code = "static_unresolvable"
 
 
-Code = Literal["static_unresolvable", "static_computed", "static_unsupported", "static_module"]
+Code = Literal[
+    "static_unresolvable",
+    "static_computed",
+    "static_unsupported",
+    "static_module",
+    "memoized_writer",
+]
 
 
 # ------------------------------------------------------------------------- the modules
@@ -268,18 +274,9 @@ _ENTRYPOINT_KEYWORDS = frozenset(
         "defaults",
         "components",
         "internal",
-    }
-)
-_JOB_KEYWORDS = frozenset(
-    {
-        "name",
         "publishes",
         "emits_media",
         "weights",
-        "demand",
-        "defaults",
-        "components",
-        "internal",
         "accelerator",
     }
 )
@@ -297,6 +294,10 @@ class ModelSpec:
     encoded_leaves: str
     sequence_parallel: tuple[int, ...]
     components: dict[str, tuple[str, ...]]
+
+
+#: Bare `Weights` (or `Weights[Model]`): raw checkpoint data of no declared layout.
+_ANY_LAYOUT = ModelSpec(Model.__name__, Model.__encoded_leaves__, (), {})
 
 
 class Reader:
@@ -952,10 +953,32 @@ class Reader:
         self.models[key] = spec
         return spec
 
-    def model_annotation(self, module: Module, node: ast.expr) -> ModelSpec | None:
-        if not isinstance(node, (ast.Name, ast.Attribute)):
+    def model_annotation(self, module: Module, node: ast.expr) -> tuple[ModelSpec, bool] | None:
+        """A model slot's class and whether it is `Weights[M]` (raw), or None."""
+        target = node.value if isinstance(node, ast.Subscript) else node
+        if not isinstance(target, (ast.Name, ast.Attribute)):
             return None
-        found = self.resolve(module, node)
+        found = self.resolve(module, target)
+        if isinstance(found, Vocab) and found.key == "author.Weights":
+            if not isinstance(node, ast.Subscript):
+                return _ANY_LAYOUT, True
+            layout = (
+                self.resolve(module, node.slice)
+                if isinstance(node.slice, (ast.Name, ast.Attribute))
+                else None
+            )
+            if isinstance(layout, Vocab) and layout.key == "author.Model":
+                return _ANY_LAYOUT, True
+            spec = self._model_class(layout)
+            if spec is None:
+                self.refuse(module, node, "Weights[M] needs a Model class M")
+            return spec, True
+        if isinstance(node, ast.Subscript):
+            return None
+        spec = self._model_class(found)
+        return None if spec is None else (spec, False)
+
+    def _model_class(self, found: Resolved | None) -> ModelSpec | None:
         if (
             isinstance(found, Definition)
             and isinstance(found.node, ast.ClassDef)
@@ -1133,7 +1156,6 @@ def read_application(project: Path) -> str:
 class Registration:
     module: Module
     fn: ast.FunctionDef | ast.AsyncFunctionDef
-    kind: package_interface.Kind
     name: str
     publishes: bool
     weights: tuple[author.WeightsOutput, ...]
@@ -1141,7 +1163,7 @@ class Registration:
     memoize: author.Memoize | None = None
     model_defaults: Mapping[str, DefaultLadder] = field(default_factory=dict)
     internal: bool = False
-    accelerator: bool | None = None
+    accelerator: bool = True
     #: `memo_version=` / `memo_dependencies=` as written, and the module they are read in.
     memo_declaration: tuple[tuple[str, Module, ast.expr], ...] = ()
     model_components: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
@@ -1279,7 +1301,7 @@ def _build(
             f"{reader.spell(entry.path)}",
             code="not_an_app",
         )
-    docs: dict[str, tuple[package_interface.Kind, dict[str, Json]]] = {}
+    docs: dict[str, dict[str, Json]] = {}
     for registration in _registrations(reader, reader.reachable(entry), app):
         if registration.name in docs:
             reader.refuse(
@@ -1294,7 +1316,7 @@ def _build(
             identity = _operation_identity(reader, registration)
             if identity is not None:
                 declared["operation_identity"] = identity
-        docs[registration.name] = registration.kind, doc
+        docs[registration.name] = doc
     return package_interface.assemble(
         application, list(docs.values()), bindings, installed=installed
     )
@@ -1468,7 +1490,7 @@ def _is_invocable(reader: Reader, module: Module, target: ast.expr) -> bool:
 
 
 def _app_method(reader: Reader, module: Module, target: ast.expr, app: Assigned) -> str | None:
-    if not isinstance(target, ast.Attribute) or target.attr not in ("entrypoint", "job"):
+    if not isinstance(target, ast.Attribute) or target.attr != "entrypoint":
         return None
     try:
         receiver = reader.resolve(module, target.value)
@@ -1542,15 +1564,14 @@ def _registration(
                     "static_unsupported",
                 )
     module = declaration or module
-    allowed = _ENTRYPOINT_KEYWORDS if method == "entrypoint" else _JOB_KEYWORDS
     name = fn.name
-    publishes = False
+    publishes = emits_media = False
     internal = False
-    accelerator: bool | None = None
+    accelerator = True
     hidden = False
     weights: tuple[author.WeightsOutput, ...] = ()
     for keyword in keywords:
-        if keyword.arg not in allowed:
+        if keyword.arg not in _ENTRYPOINT_KEYWORDS:
             reader.refuse(
                 module,
                 keyword,
@@ -1599,11 +1620,13 @@ def _registration(
                 reader.refuse(module, keyword.value, "internal must be a boolean")
             internal = value
         elif keyword.arg == "accelerator":
-            if type(value) is not bool:
-                reader.refuse(module, keyword.value, "accelerator must be a boolean")
-            accelerator = value
+            if value is not False:
+                reader.refuse(module, keyword.value, "accelerator=False is the only value")
+            accelerator = False
         elif keyword.arg == "publishes":
             publishes = bool(value)
+        elif keyword.arg == "emits_media":
+            emits_media = bool(value)
         elif keyword.arg == "memoize":
             memoize = _memoize(reader, module, keyword.value, value)
         elif keyword.arg == "weights":
@@ -1611,12 +1634,15 @@ def _registration(
             weights = tuple(value)
     if hidden and internal:
         reader.refuse(module, fn, "an internal callable cannot also be hidden")
+    if memoize and (weights or publishes or emits_media):
+        reader.refuse(
+            module, fn, "memoize on a function that writes weights or publishes", "memoized_writer"
+        )
     if hidden:
         return None
     return Registration(
         function_module,
         fn,
-        typing.cast(package_interface.Kind, method),
         name,
         publishes,
         weights,
@@ -1686,6 +1712,22 @@ def _callable(reader: Reader, registration: Registration) -> dict[str, Json]:
         if arg.annotation is None:
             reader.refuse(module, arg, "an unannotated handler parameter")
         annotation_module, node, found = _parameter_annotation(reader, module, arg.annotation)
+        slot = reader.model_annotation(annotation_module, node)
+        if slot is not None:
+            spec, weights = slot
+            models.append(
+                package_interface.model_slot(
+                    f"{registration.name}.models.{arg.arg}",
+                    spec.name,
+                    spec.encoded_leaves,
+                    spec.components,
+                    spec.sequence_parallel,
+                    defaults=registration.model_defaults.get(arg.arg, ()),
+                    uses=registration.model_components.get(arg.arg, ()),
+                    weights=weights,
+                )
+            )
+            continue
         if isinstance(found, Vocab):
             vocab_name = found.key.partition(".")[2]
             if found.key in ("author.Context", "author.Preflight") or vocab_name in (
@@ -1717,25 +1759,13 @@ def _callable(reader: Reader, registration: Registration) -> dict[str, Json]:
                     capabilities.append("media_decode")
                 continue
 
-        if isinstance(found, Definition) and isinstance(found.node, ast.ClassDef):
-            kind = reader.class_kind(found.module, found.node)
-            if kind == "model":
-                spec = reader.model(found.module, found.node)
-                models.append(
-                    package_interface.model_slot(
-                        f"{registration.name}.models.{arg.arg}",
-                        spec.name,
-                        spec.encoded_leaves,
-                        spec.components,
-                        spec.sequence_parallel,
-                        defaults=registration.model_defaults.get(arg.arg, ()),
-                        uses=registration.model_components.get(arg.arg, ()),
-                    )
-                )
-                continue
-            if kind == "struct":
-                payloads.append(reader.translate(module, arg.annotation))
-                continue
+        if (
+            isinstance(found, Definition)
+            and isinstance(found.node, ast.ClassDef)
+            and reader.class_kind(found.module, found.node) == "struct"
+        ):
+            payloads.append(reader.translate(module, arg.annotation))
+            continue
         reader.refuse(module, arg.annotation, f"parameter {arg.arg}: not an author surface type")
     parameters = [str(slot["path"]).rsplit(".", 1)[-1] for slot in models]
     check_model_arguments(registration.model_defaults, parameters)
@@ -1758,7 +1788,6 @@ def _callable(reader: Reader, registration: Registration) -> dict[str, Json]:
         )
     doc = package_interface.callable_doc(
         name=registration.name,
-        kind=registration.kind,
         payload_type=payload,
         result_type=result,
         models=models,
@@ -1768,16 +1797,17 @@ def _callable(reader: Reader, registration: Registration) -> dict[str, Json]:
         internal=registration.internal,
         accelerator=registration.accelerator,
     )
-    if registration.kind == "entrypoint":
-        doc["invocable"] = invocable_interface.serving_metadata(
-            payload,
-            result,
-            module=module.name,
-            export=fn.name,
-            context=contexts[0] if contexts else "",
-            capabilities=sorted(capabilities),
-            memoize=registration.memoize,
-        )
+    if registration.weights:
+        capabilities.append("weights")
+    doc["invocable"] = invocable_interface.serving_metadata(
+        payload,
+        result,
+        module=module.name,
+        export=fn.name,
+        context=contexts[0] if contexts else "",
+        capabilities=sorted(capabilities),
+        memoize=registration.memoize,
+    )
     return doc
 
 
@@ -1844,7 +1874,7 @@ def _script_annotation(reader: Reader, module: Module, node: ast.expr) -> ast.ex
     return node
 
 
-def _script_doc(reader: Reader, app: Assigned) -> tuple[package_interface.Kind, dict[str, Json]]:
+def _script_doc(reader: Reader, app: Assigned) -> dict[str, Json]:
     call = app.value
     assert isinstance(call, ast.Call)
     if (
@@ -1871,7 +1901,6 @@ def _script_doc(reader: Reader, app: Assigned) -> tuple[package_interface.Kind, 
     payload_fields: list[tuple[str, type]] = []
     model_names: set[str] = set()
     services: set[str] = set()
-    sources = False
     native_context = False
     for arg in [*fn.args.posonlyargs, *fn.args.args, *fn.args.kwonlyargs]:
         if arg.arg == "ctx":
@@ -1886,36 +1915,27 @@ def _script_doc(reader: Reader, app: Assigned) -> tuple[package_interface.Kind, 
         if arg.annotation is None:
             reader.refuse(module, arg, "script injected parameters require a type")
         node = _script_annotation(reader, module, arg.annotation)
-        target = node.value if isinstance(node, ast.Subscript) else node
-        found = reader.resolve(module, target)
-        spec: ModelSpec | None = None
-        if isinstance(found, Vocab):
-            if found.key == "author.Model":
-                if isinstance(node, ast.Subscript):
+        slot = reader.model_annotation(module, node)
+        if slot is None:
+            target = node.value if isinstance(node, ast.Subscript) else node
+            found = reader.resolve(module, target)
+            service = next(
+                (
+                    key
+                    for key, cls in SERVICES.items()
+                    if isinstance(found, Vocab) and found.key == "author." + cls.__name__
+                ),
+                None,
+            )
+            if service is not None:
+                if service in services:
+                    reader.refuse(module, arg, "script requests a service twice")
+                if service in ("settings", "secrets"):
+                    if not isinstance(node, ast.Subscript):
+                        reader.refuse(module, arg, "script typed service needs its schema")
                     reader.translate(module, node.slice)
-                spec = ModelSpec("_ScriptSource", "refuse", (), {})
-                sources = True
-            else:
-                service = next(
-                    (key for key, cls in SERVICES.items() if found.key == "author." + cls.__name__),
-                    None,
-                )
-                if service is not None:
-                    if service in services:
-                        reader.refuse(module, arg, "script requests a service twice")
-                    if service in ("settings", "secrets"):
-                        if not isinstance(node, ast.Subscript):
-                            reader.refuse(module, arg, "script typed service needs its schema")
-                        reader.translate(module, node.slice)
-                    services.add(service)
-                    continue
-        if (
-            isinstance(found, Definition)
-            and isinstance(found.node, ast.ClassDef)
-            and reader.class_kind(found.module, found.node) == "model"
-        ):
-            spec = reader.model(found.module, found.node)
-        if spec is None:
+                services.add(service)
+                continue
             translated = reader.translate(module, node)
             if byte_parameter(translated):
                 payload_fields.append((arg.arg, typing.cast(type, translated)))
@@ -1923,8 +1943,9 @@ def _script_doc(reader: Reader, app: Assigned) -> tuple[package_interface.Kind, 
             reader.refuse(
                 module,
                 arg,
-                "script parameters must be declared models or services, or typed assets",
+                "script parameters must be declared models, Weights or services, or typed assets",
             )
+        spec, raw = slot
         model_names.add(arg.arg)
         models.append(
             package_interface.model_slot(
@@ -1934,11 +1955,10 @@ def _script_doc(reader: Reader, app: Assigned) -> tuple[package_interface.Kind, 
                 spec.components,
                 spec.sequence_parallel,
                 defaults=defaults.get(arg.arg, ()),
+                weights=raw,
             )
         )
     check_model_arguments(defaults, sorted(model_names))
-    if "weights_read" in services and not models:
-        reader.refuse(module, fn, "script WeightsReader requires a model input")
     if weights and not native_context:
         reader.refuse(module, fn, "script model outputs require ctx: Context")
     if weights and "save" in services:
@@ -1953,27 +1973,23 @@ def _script_doc(reader: Reader, app: Assigned) -> tuple[package_interface.Kind, 
         if returned is not type(None)
         else msgspec.defstruct("_ScriptCompleted", [])
     )
-    # The adapter's choice, read the same way: Model slots it runs are served.
-    job = bool(weights) or sources or bool(services & JOB_ONLY) or not models
     payload = msgspec.defstruct("_ScriptRequest", payload_fields)
     doc = package_interface.callable_doc(
         name="main",
-        kind="job" if job else "entrypoint",
         payload_type=payload,
         result_type=result,
         models=models,
         assets=None,
         publishes=False,
         weights_outputs=weights,
-        accelerator=accelerator if job else None,
+        accelerator=accelerator is None,
     )
-    if not job:
-        doc["invocable"] = invocable_interface.serving_metadata(
-            payload,
-            result,
-            module=module.name,
-            export="main",
-            context="_script_context",
-            capabilities=sorted(services | {"telemetry"}),
-        )
-    return ("job" if job else "entrypoint"), doc
+    doc["invocable"] = invocable_interface.serving_metadata(
+        payload,
+        result,
+        module=module.name,
+        export="main",
+        context="_script_context",
+        capabilities=sorted(services | {"telemetry"} | ({"weights"} if weights else set())),
+    )
+    return doc

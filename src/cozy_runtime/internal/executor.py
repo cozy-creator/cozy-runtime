@@ -78,6 +78,7 @@ from cozy_runtime.author._demand import shape_cell
 from cozy_runtime.author._errors import (
     DEVICE_OOM,
     CapabilityError,
+    ConformanceError,
     InvalidRequest,
     Outcome,
     classify,
@@ -86,8 +87,6 @@ from cozy_runtime.author._errors import (
 from cozy_runtime.author._executor_requests import (
     Answer,
     BudgetCell,
-    Checkpoint,
-    CheckpointReceipt,
     ChildEvents,
     DeviceRoom,
     DeviceTier,
@@ -118,11 +117,12 @@ from cozy_runtime.author._invoke import (
     prepare,
     run_prepared,
 )
-from cozy_runtime.author._model import Model, _derive_model, component_use
+from cozy_runtime.author._model import Model, component_use
 from cozy_runtime.author._observations import Attribution
 from cozy_runtime.author._services import Attempt as AuthorAttempt
-from cozy_runtime.author._services import CheckpointConflict, ProgressFrame
+from cozy_runtime.author._services import ProgressFrame
 from cozy_runtime.author._split import install as install_pieces
+from cozy_runtime.author._weights import Weights as RawWeights
 from cozy_runtime.author.kernels import _SETS as KERNEL_SETS
 from cozy_runtime.author.kernels import Launch, Plan
 from cozy_runtime.internal import (
@@ -193,6 +193,7 @@ from cozy_runtime.internal.executor_commands import (
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.lora_composition import bind as bind_adapters
 from cozy_runtime.internal.lora_contract import read as read_adapter_graph
+from cozy_runtime.internal.model_values import read_values_into
 from cozy_runtime.internal.parallel import copy_engine, cp, links, mirror, wire
 from cozy_runtime.internal.parallel.group import (
     ROUTED,
@@ -3775,23 +3776,29 @@ class Executor:
 
     # ------------------------------------------------------------------ job
 
-    def _job_models(self, surface: Any, command: RunJob) -> dict[str, Any]:
-        """Create typed Manifest-only Model instances; construct/load no package state."""
+    def _job_sources(self, surface: Any, command: RunJob) -> dict[str, RawWeights[Any]]:
+        """The `Weights` arguments of a function run without a session."""
         declared = {binding.param: binding for binding in surface.model_bindings}
+        constructed = sorted(name for name, binding in declared.items() if not binding.weights)
+        if constructed:
+            raise CapabilityError(
+                f"{surface.name} constructs {constructed}; RunJob runs Weights arguments only",
+                code="job_model_binding_mismatch",
+            )
         rows = command.models
         if not set(declared) <= set(rows):
             raise CapabilityError(
-                f"job declares Model parameters {sorted(declared) or 'none'} and the worker "
+                f"{surface.name} declares Weights {sorted(declared) or 'none'} and the worker "
                 f"passed {sorted(rows)}",
                 code="job_model_binding_mismatch",
             )
         payload = command.payload if isinstance(command.payload, Mapping) else {}
-        models: dict[str, Any] = {}
+        sources: dict[str, RawWeights[Any]] = {}
         for parameter in sorted(declared):
             row, binding = rows[parameter], declared[parameter]
             if row.class_key != binding.class_key:
                 raise CapabilityError(
-                    f"job Model parameter {parameter!r} changed its interface class",
+                    f"Weights parameter {parameter!r} changed its interface class",
                     code="job_model_class_mismatch",
                 )
             if surface.invocable and (artifact := payload.get(parameter)) is not None:
@@ -3805,25 +3812,17 @@ class Executor:
                         "model call artifact differs from its admitted native input",
                         code="model_artifact_binding",
                     )
-            models[parameter] = _derive_model(binding.model_class, row.manifest)
-        return models
+            try:
+                sources[parameter] = RawWeights(row.manifest)
+            except ConformanceError as exc:
+                raise CapabilityError(str(exc), code=exc.code) from exc
+        return sources
 
     def run_job(self, command: RunJob) -> dict[str, Any]:
-        """ONE `@app.job`, run to completion through the SAME invocation kernel (cr-009).
+        """One function whose models are all `Weights`, run once without a session.
 
-        Everything structural about a job is here and it is short, which is the point: a job
-        is not a second runtime, it is the one attempt kernel with a different service set
-        and no serving loop underneath it. The three differences from `invoke`, out loud:
-
-        1. **No prepared generation is required.** The admitted slot's device count
-           determines accelerator initialization. A CPU job, or one whose environment has no
-           Torch, imports no Torch and opens no CUDA context (its GPU is only the visible
-           devices TensorD set); a GPU transform can use its device without constructing an
-           inference model. A job Model remains a derive-only Manifest capability.
-        2. **Job services are injected**: a resumable Scratch tree keyed on the RUN, the
-           durable checkpoint exchange, and the typed budget facts.
-        3. **Quiescence is proven by what exists.** A torch-free job has no stream that
-           could still be moving, so the proof is structural rather than a device query.
+        The admitted slot's device count decides accelerator initialization: a CPU run, or
+        one whose environment has no Torch, imports no Torch and opens no CUDA context.
         """
         if command.capture is not None:
             return {
@@ -3860,29 +3859,20 @@ class Executor:
                 }
         name = command.job
         surface = self.surface_names.get(name)
-        if surface is None or surface.kind != "job":
+        if surface is None:
             return {
                 "ok": False,
                 "code": "unknown_job",
-                "detail": f"{name!r} is not a registered @app.job of this release (it has "
-                f"{sorted(s.name for s in self.surface_names.values() if s.kind == 'job')})",
+                "detail": f"{name!r} is not a registered function of this release (it has "
+                f"{sorted(self.surface_names)})",
             }
         registration = self.discovered.app.get(name)
         spool = Path(command.spool)
-        scratch = Path(command.scratch) if command.scratch else None
-        if scratch is not None:
-            scratch.mkdir(parents=True, exist_ok=True)
 
         try:
-            job_models = self._job_models(surface, command)
+            sources = self._job_sources(surface, command)
         except CapabilityError as exc:
             return {"ok": False, "code": exc.code, "detail": str(exc)[:1024]}
-
-        weights_values = None
-        if "weights_read" in surface.capabilities:
-            from cozy_runtime.internal.model_values import read_values_into
-
-            weights_values = read_values_into
 
         tensorfs_source = tensorfs_output = tensorfs_adopt = None
         # The owner grants writer channels explicitly. Installing Store APIs grants nothing;
@@ -3898,39 +3888,6 @@ class Executor:
             tensorfs_source = execution_storage.source
             tensorfs_output = execution_storage.open_output
             tensorfs_adopt = execution_storage.adopt_model
-
-        from cozy_runtime.author._services import (
-            BudgetFacts,
-            CheckpointDeclaration,
-            CheckpointSave,
-        )
-
-        def durable_checkpoint(save: CheckpointSave) -> CheckpointDeclaration:
-            """Block until the worker has JOURNALED the declaration. Never the lossy lane.
-
-            What comes back is a recorded declaration id, not a durability receipt: this
-            frame carries keys, a digest and a length, and the bytes stay in the spool
-            (#553a).
-            """
-            answer = self._durable(
-                Checkpoint(
-                    operation_key=save.operation_key,
-                    logical_key=save.logical_key,
-                    content_digest=save.content_digest,
-                    length=save.length,
-                ),
-                CheckpointReceipt,
-            )
-            if not answer.ok:
-                raise CheckpointConflict(f"{save.logical_key}: {answer.detail}", code=answer.code)
-            return CheckpointDeclaration(
-                declaration_id=answer.receipt_id,
-                operation_key=save.operation_key,
-                logical_key=save.logical_key,
-                content_digest=save.content_digest,
-                length=save.length,
-                replayed=answer.replayed,
-            )
 
         started = time.perf_counter()
         started_wall = time.time()
@@ -3948,25 +3905,17 @@ class Executor:
                 publish=self._publish,
                 device=self._device() if self.torch is not None else Device(),
                 cancel=lambda: _cancelled(self.root, command.request_id),
-                models=job_models,
+                sources=sources,
                 trees=_trees(command),
                 assets=_granted_inputs(command),
                 max_input_bytes=(
                     None if command.max_input_bytes is None else command.max_input_bytes or 64 << 20
                 ),
                 max_output_bytes=command.max_output_bytes,
-                scratch=scratch,
-                checkpoints=durable_checkpoint,
-                weights_values=weights_values,
+                weights_values=read_values_into if sources else None,
                 tensorfs_source=tensorfs_source,
                 tensorfs_output=tensorfs_output,
                 tensorfs_adopt=tensorfs_adopt,
-                budget=BudgetFacts(
-                    gpu_rate_usd_per_hour=budget.gpu_rate_micro_usd_per_hour / 1e6,
-                    gpu_count=budget.gpu_count,
-                    cap_usd=budget.cap_micro_usd / 1e6,
-                    started_monotonic=time.monotonic(),
-                ),
                 progress=self._progress_sink(command.request_id),
                 activity=self._activity_sink(command.request_id),
             ),
@@ -4132,9 +4081,7 @@ class Executor:
                     (
                         surface
                         for surface in self.discovered.surfaces
-                        if (surface.invocable or surface.kind == "entrypoint")
-                        and surface.fn.__module__ == module
-                        and surface.fn.__name__ == export
+                        if surface.fn.__module__ == module and surface.fn.__name__ == export
                     ),
                     None,
                 )
@@ -4156,7 +4103,6 @@ class Executor:
                 if declared is not None:
                     surface = Registration(
                         name=export,
-                        kind=row.kind,
                         fn=declared.implementation,
                         invocable=True,
                         memoize=declared.memoize,

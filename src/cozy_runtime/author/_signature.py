@@ -44,10 +44,9 @@ from cozy_runtime.author._model import Model, component_use
 from cozy_runtime.author._model_defaults import DefaultLadder, check_model_arguments
 from cozy_runtime.author._services import SERVICES, Secrets, Settings
 from cozy_runtime.author._walker import is_struct, strip
-from cozy_runtime.author._weights import WeightsOutput
+from cozy_runtime.author._weights import WeightsOutput, weights_class
 
-Role = Literal["context", "payload", "wire", "assets", "preflight", "model", "service"]
-Kind = Literal["entrypoint", "job"]
+Role = Literal["context", "payload", "wire", "assets", "preflight", "model", "weights", "service"]
 
 _PARAMETERIZED = {"settings": Settings, "secrets": Secrets}
 
@@ -206,6 +205,8 @@ class ModelBinding:
     components: Mapping[str, tuple[str, ...]]
     sequence_parallel: tuple[int, ...] = ()
     """`@sequence_parallel(degrees=...)` on the class: the degrees it shards at (cr-068)."""
+    weights: bool = False
+    """A `Weights[M]` argument: raw checkpoint data, never constructed."""
 
     @property
     def class_key(self) -> str:
@@ -223,7 +224,6 @@ class Surface:
     """One registered callable's derived surface. cr-003's package interface consumes this."""
 
     name: str
-    kind: Kind
     fn: Callable[..., object]
     is_async: bool
     params: tuple[Param, ...]
@@ -233,12 +233,12 @@ class Surface:
     publishes: bool = False
     emits_media: bool = False
     weights_outputs: tuple[WeightsOutput, ...] = ()
-    """What a JOB body may write, as its own declaration. Grants mint off the declaration,
-    never off the kind (§2) — a job that declares neither cannot be granted a destination."""
+    """The TensorFS model outputs this function writes; grants mint off this declaration."""
     demand_bound: Bound | None = None
     preflight: PreflightSpec | None = None
     internal: bool = False
-    accelerator: bool | None = None
+    accelerator: bool = True
+    """False: CPU only, never opens CUDA. True: the machine's GPU when it has one."""
     hidden: bool = False
     """DECLARED but NOT PUBLISHED (#572d). Hidden callables stay in the local registry but
     are absent from the package interface, so no binding is staged and no request reaches them."""
@@ -262,28 +262,26 @@ class Surface:
 
     @property
     def model_params(self) -> tuple[str, ...]:
+        """The constructed model arguments."""
         return tuple(p.name for p in self.params if p.role == "model")
 
     @property
     def model_bindings(self) -> tuple[ModelBinding, ...]:
-        """The slots this callable declares, each with its own independent admission."""
-        bindings = []
-        for p in self.params:
-            annotation = p.annotation
-            if p.role != "model" or not isinstance(annotation, type):
-                continue
-            if not issubclass(annotation, Model):
-                continue
-            bindings.append(
-                ModelBinding(
-                    path=f"{self.name}.models.{p.name}",
-                    param=p.name,
-                    model_class=annotation,
-                    components=component_use(annotation),
-                    sequence_parallel=tuple(annotation.__sequence_parallel__),
-                )
+        """Every model slot, constructed or `Weights[M]`, each independently admitted."""
+        return tuple(
+            ModelBinding(
+                path=f"{self.name}.models.{p.name}",
+                param=p.name,
+                model_class=p.annotation,
+                components=component_use(p.annotation),
+                sequence_parallel=tuple(p.annotation.__sequence_parallel__),
+                weights=p.role == "weights",
             )
-        return tuple(bindings)
+            for p in self.params
+            if p.role in ("model", "weights")
+            and isinstance(p.annotation, type)
+            and issubclass(p.annotation, Model)
+        )
 
 
 _PUBLISHABLE = (ImageAsset, AudioAsset, VideoAsset, FileAsset)
@@ -328,6 +326,14 @@ def _classify(name: str, annotation: object, where: str) -> Param:
         return Param(name, "preflight", base)
     if base is Context:
         return Param(name, "context", base)
+    if (layout := weights_class(base)) is not None:
+        if markers:
+            raise ConformanceError(
+                f"{where}: weights parameter {name} carries {markers[0]!r}",
+                code="empty_marker_plane",
+                fields=[name],
+            )
+        return Param(name, "weights", layout)
     origin = get_origin(base)
     if base is Assets or origin is Assets:
         binding = assets_binding(name, annotation)
@@ -372,7 +378,6 @@ def analyze(
     fn: Callable[..., object],
     *,
     name: str,
-    kind: Kind,
     publishes: bool = False,
     emits_media: bool = False,
     weights_outputs: tuple[WeightsOutput, ...] = (),
@@ -380,7 +385,7 @@ def analyze(
     preflight: Callable[..., object] | None = None,
     hidden: bool = False,
     internal: bool = False,
-    accelerator: bool | None = None,
+    accelerator: bool = True,
     invocable: bool = False,
     memoize: Memoize | None = None,
     model_defaults: Mapping[str, DefaultLadder] | None = None,
@@ -457,6 +462,7 @@ def analyze(
                     )
                 )
                 or get_origin(base) in (Settings, Secrets)
+                or weights_class(base) is not None
             )
             if not injected:
                 if parameter.kind is not parameter.KEYWORD_ONLY:
@@ -481,7 +487,9 @@ def analyze(
                 raise ConformanceError(
                     "injected invocable parameters cannot have defaults", code="injected_default"
                 )
-            if isinstance(base, type) and issubclass(base, Model):
+            if weights_class(base) is not None or (
+                isinstance(base, type) and issubclass(base, Model)
+            ):
                 # Ordinary top-level invocation may use the owner's frozen model
                 # binding. A managed caller may supply an exact produced artifact
                 # override, which the owner also binds through that same model lane.
@@ -554,12 +562,11 @@ def analyze(
             preflight, payloads[0].annotation, assets_params[0] if assets_params else None
         )
 
-    models = [p.name for p in params if p.role == "model"]
+    models = [p.name for p in params if p.role in ("model", "weights")]
     check_model_arguments(model_defaults or {}, models)
     check_model_arguments(model_components or {}, models, what="components")
     return Surface(
         name=name,
-        kind=kind,
         fn=fn,
         is_async=inspect.iscoroutinefunction(fn),
         params=tuple(params),
@@ -683,7 +690,11 @@ def analyze_preflight(
         )
     for pname in positional:
         base, _ = strip(hints.get(pname, object))
-        if base is Context or (isinstance(base, type) and issubclass(base, (Model,))):
+        if (
+            base is Context
+            or weights_class(base) is not None
+            or (isinstance(base, type) and issubclass(base, Model))
+        ):
             raise ConformanceError(
                 f"preflight {where}: parameter {pname} reaches {base!r} — a preflight has "
                 "no Context, Model, device, network, output or secret access",
