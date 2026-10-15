@@ -286,12 +286,6 @@ def _sealed_entries() -> tuple[str, ...]:
     )
 
 
-def _links_directory() -> Path | None:
-    """Measured links live beside the kernels: one machine's, kept across its executors."""
-    own = _SEALED.get(kernel_cache.OWN_ENV, "").strip()
-    return Path(own) / "links" if own and Path(own).is_absolute() else None
-
-
 def _gpu_numbers(degree: int) -> list[int]:
     """The group's GPUs as nvidia-smi numbers them, from the seal's entries."""
     entries = _sealed_entries()[:degree]
@@ -1646,9 +1640,7 @@ class Executor:
                             code="group_unformed",
                         )
                 if not command.import_only:
-                    measured = links.measured(
-                        _links_directory(), _SEALED.get("CUDA_VISIBLE_DEVICES", ""), degree
-                    )
+                    measured = links.measured(links.directory(_SEALED), _sealed_entries()[:degree])
                     stage("group_links")
                     self.transport = links.Transport(
                         degree, _gpu_numbers(degree), "nccl", measured.nccl(), measured

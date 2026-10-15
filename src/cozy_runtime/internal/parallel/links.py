@@ -7,6 +7,8 @@ through host memory 11 GB/s, NCCL's peer-memory kernels across that bridge 3.3 G
 nothing here is inferred: once per machine boot a child process copies a buffer over every
 ordered pair, directly (copy engines, verified) and staged through pinned host memory, and
 the group forms over the result. The child owns those device contexts, not the executor.
+The machine measures all its GPUs as it starts (`machine_kernels`), beside the downloads, so a
+group of any of them reads its pairs; a group start measures only what that left unanswered.
 
 A copy within one process proves little about the paths between processes: on one A5000
 host every pair copied directly, yet NCCL's peer path between follower processes failed
@@ -27,14 +29,15 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from functools import partial
 from pathlib import Path
 from typing import Any
 
-from cozy_runtime.internal import spawn
+from cozy_runtime.internal import kernel_cache, liveness, proctree, spawn
 from cozy_runtime.internal.config import inherited_environment
 from cozy_runtime.internal.parallel import copy_engine, group
 
@@ -43,7 +46,12 @@ from cozy_runtime.internal.parallel import copy_engine, group
 _BYTES = 64 << 20
 _CHUNK = 8 << 20
 _REPEATS = 3
-_FOLLOWER = ("-m", "cozy_runtime.internal.parallel.links", "--follower")
+#: The probe's processes run this module from the parent's own path (an image interpreter may
+#: carry an older Runtime than the one that started them).
+_CHILD = (
+    "import json, sys; sys.path[:] = json.loads(sys.argv.pop(1)); "
+    "from cozy_runtime.internal.parallel.links import main; raise SystemExit(main(sys.argv[1:]))"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,17 +139,36 @@ class Links:
             f"GPU {number.get(pair.src, pair.src)} to GPU {number.get(pair.dst, pair.dst)} {cause}"
         )
 
-    def document(self) -> dict[str, Any]:
+    def document(self, devices: Sequence[str]) -> dict[str, Any]:
         return {
+            "devices": list(devices),
             "pairs": [asdict(pair) for pair in self.pairs],
             "processes": dict(self.processes),
-            "reason": self.why(),
+            "reason": self.reason,
         }
 
     @classmethod
-    def read(cls, document: Mapping[str, Any]) -> Links:
-        pairs = tuple(Pair(**row) for row in document.get("pairs", ()))
-        return cls(pairs, dict(document.get("processes") or {}), "")
+    def among(cls, document: Mapping[str, Any], devices: Sequence[str]) -> Links | None:
+        """The pairs of `devices`, in their order, from a measurement of a set holding them all.
+        None where that measurement's process group did not try the route these would take."""
+        position = {entry: index for index, entry in enumerate(document["devices"])}
+        if not set(devices) <= position.keys():
+            return None
+        at = {position[entry]: index for index, entry in enumerate(devices)}
+        pairs = tuple(
+            replace(pair, src=at[pair.src], dst=at[pair.dst])
+            for row in document["pairs"]
+            if (pair := Pair(**row)).src in at and pair.dst in at
+        )
+        links = cls(pairs, dict(document["processes"]), document["reason"])
+        if links.reason or not links.all_peers:
+            return links
+        return links if links.processes.get("level") == links.level else None
+
+    @property
+    def level(self) -> str:
+        """The NCCL level a probe's process group forms at over these pairs."""
+        return "SYS" if self.all_direct else "NVL"
 
 
 def _gbps(nbytes: int, seconds: float) -> float:
@@ -240,12 +267,18 @@ def _measure(torch: Any, count: int, emit: Any) -> None:
 
 
 #: What the probe measures; a probe that measures more is not answered by an older one's file.
-_PROBE = "links/2"
+_PROBE = "links/3"
 
 
-def _key(devices: str) -> str:
-    """This boot, driver, device list and probe: the links do not change while all hold."""
-    parts = [_PROBE, devices]
+def directory(sealed: Mapping[str, str]) -> Path | None:
+    """Measured links live beside the kernels: the machine's, kept across its executors."""
+    own = sealed.get(kernel_cache.OWN_ENV, "").strip()
+    return Path(own) / "links" if own and Path(own).is_absolute() else None
+
+
+def _boot() -> str:
+    """This boot, driver and probe: the links do not change while all hold."""
+    parts = [_PROBE]
     for path in ("/proc/sys/kernel/random/boot_id", "/proc/driver/nvidia/version"):
         try:
             parts.append(Path(path).read_text().strip())
@@ -254,50 +287,71 @@ def _key(devices: str) -> str:
     return hashlib.sha256("\0".join(parts).encode()).hexdigest()[:32]
 
 
-def measured(directory: Path | None, devices: str, count: int) -> Links:
-    """The group's links: kept for this boot under `directory`, else measured now in a child
-    process. A probe that dies or wedges leaves its pairs unmeasured, and the group takes
+def measured(directory: Path | None, devices: Sequence[str]) -> Links:
+    """The links between `devices` (`CUDA_VISIBLE_DEVICES` entries, in group order): read from
+    this boot's measurement of a set holding them all, else measured now in a child process
+    and kept. A probe that dies or wedges leaves its pairs unmeasured, and the group takes
     the conservative route, saying why."""
-    if count < 2:
+    if len(devices) < 2:
         return Links()
-    path = None if directory is None else directory / f"{_key(devices)}-{count}.json"
-    lock = None
+    if directory is None:
+        return _probe(devices)
+    boot = _boot()
     try:
-        if path is not None:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            lock = open(path.with_suffix(".lock"), "a+")  # noqa: SIM115
+        directory.mkdir(parents=True, exist_ok=True)
+        with open(directory / f"{boot}.lock", "a+") as lock:
+            # Held by a measurement in flight, which ends by its own progress (`_probe`).
             fcntl.flock(lock, fcntl.LOCK_EX)
-            if path.exists():
-                return Links.read(json.loads(path.read_text()))
-            marker = path.with_suffix(".measuring")
+            for path in sorted(directory.glob(f"{boot}-*.json")):
+                links = Links.among(json.loads(path.read_text()), devices)
+                if links is not None:
+                    return links
+            marker = directory / f"{boot}.measuring"
             if marker.exists():
                 return Links(reason="the link probe of this boot did not finish")
-            marker.write_text(str(os.getpid()))
-        links = _probe(devices, count)
-        if path is not None and links.pairs:
-            temporary = path.with_suffix(".tmp")
-            temporary.write_text(json.dumps(links.document()))
-            temporary.replace(path)
-            path.with_suffix(".measuring").unlink(missing_ok=True)
-        return links
+            marker.write_text(",".join(devices))
+            links = _probe(devices)
+            if links.pairs:
+                name = hashlib.sha256(",".join(devices).encode()).hexdigest()[:16]
+                temporary = directory / f"{boot}-{name}.tmp"
+                temporary.write_text(json.dumps(links.document(devices)))
+                temporary.replace(temporary.with_suffix(".json"))
+                marker.unlink()
+            return links
     except OSError as exc:
         return Links(reason=f"the links could not be measured: {exc}")
-    finally:
-        if lock is not None:
-            lock.close()
 
 
-def _probe(devices: str, count: int) -> Links:
-    """Run the probe child, reading its lines as they come. It may wedge only in the process
-    group (inside NCCL); that phase gets four times what the child took to start and measure
-    its first pair (torch import, CUDA, a copy), and is ended as a whole if it says nothing."""
-    environment = {**inherited_environment(), "CUDA_VISIBLE_DEVICES": devices}
+def _burn(pid: int) -> int | None:
+    """The probe's progress: CPU and bytes of its process and every descendant."""
+    try:
+        burns = [liveness.burn(member) for member in (pid, *proctree.descendants(pid))]
+    except proctree.ProcessTreeUnsupported:
+        return None
+    readable = [burn for burn in burns if burn is not None]
+    return sum(readable) if readable else None
+
+
+def _probe(devices: Sequence[str]) -> Links:
+    """Run the probe child, reading its lines as they come. Until its pairs are in, it is
+    judged by its progress (`liveness`); the process group (inside NCCL, which spins) gets
+    four times what the child took to start and measure its first pair, and is ended as a
+    whole if it says nothing."""
+    count = len(devices)
+    # The group lane's NCCL law (`group.NVLS_ENV`), which a machine's own boot does not carry.
+    environment = {
+        **inherited_environment(),
+        "CUDA_VISIBLE_DEVICES": ",".join(devices),
+        group.NVLS_ENV: "0",
+    }
     began = time.monotonic()
+    # A file, not a pipe: a child blocked on a full pipe would look wedged.
+    errors = tempfile.TemporaryFile("w+")  # noqa: SIM115
     child = subprocess.Popen(
-        [sys.executable, "-I", "-m", "cozy_runtime.internal.parallel.links", str(count)],
+        [sys.executable, "-I", "-c", _CHILD, json.dumps(sys.path), str(count)],
         env=environment,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=errors,
         text=True,
         start_new_session=True,
     )
@@ -305,17 +359,26 @@ def _probe(devices: str, count: int) -> Links:
     pairs: list[Pair] = []
     processes: dict[str, Any] = {}
     window: float | None = None
+    pace, sampled, stalled = liveness.Pace(), float("-inf"), ""
     watch = selectors.DefaultSelector()
     watch.register(child.stdout, selectors.EVENT_READ)
     while child.poll() is None or watch.select(0):
-        ready = watch.select(None if window is None else max(window - time.monotonic(), 0))
-        if not ready:
+        now = time.monotonic()
+        if window is None and now - sampled >= liveness.SAMPLE_SECONDS:
+            sampled, burn = now, _burn(child.pid)
+            pace.observe(None if burn is None else (len(pairs), burn), now)
+            if pace.wedged(liveness.noise_floor(), now):
+                stalled = f"the link probe stopped: {pace.verdict(liveness.noise_floor(), now)}"
+                os.killpg(child.pid, signal.SIGKILL)
+                break
+        if not watch.select(liveness.SAMPLE_SECONDS if window is None else max(window - now, 0)):
+            if window is None:
+                continue
             os.killpg(child.pid, signal.SIGKILL)
-            processes = {
-                "nccl_peer": False,
-                "copy_engines": False,
-                "detail": "a group of probe processes stopped making progress in NCCL",
-            }
+            processes = _unformed(
+                Links(tuple(pairs)).level,
+                "a group of probe processes stopped making progress in NCCL",
+            )
             break
         line = child.stdout.readline()
         if not line:
@@ -330,17 +393,24 @@ def _probe(devices: str, count: int) -> Links:
             if len(pairs) == count * (count - 1):
                 window = time.monotonic() + 4 * started
     child.wait()
-    stderr = child.stderr.read() if child.stderr else ""
+    with errors:
+        errors.seek(0)
+        tail = errors.read().strip().splitlines()[-1:] or [f"exit {child.returncode}"]
     if len(pairs) != count * (count - 1):
-        tail = stderr.strip().splitlines()[-1:] or [f"exit {child.returncode}"]
         broken = next((pair for pair in pairs if not pair.verified and pair.peer), None)
         reason = (
             f"GPU {broken.src} to GPU {broken.dst}: {broken.detail}"
             if broken
-            else f"the link probe ended early: {tail[0][:200]}"
+            else stalled or f"the link probe ended early: {tail[0][:200]}"
         )
         return Links(tuple(pairs) if broken else (), {}, reason)
+    if not processes and (links := Links(tuple(pairs))).all_peers:
+        processes = _unformed(links.level, f"the probe's process group ended: {tail[0][:200]}")
     return Links(tuple(pairs), processes)
+
+
+def _unformed(level: str, detail: str) -> dict[str, Any]:
+    return {"nccl_peer": False, "copy_engines": False, "level": level, "detail": detail}
 
 
 def _group(torch: Any, rank: int, world: int, port: int, level: str) -> dict[str, Any]:
@@ -354,7 +424,7 @@ def _group(torch: Any, rank: int, world: int, port: int, level: str) -> dict[str
     torch.cuda.set_device(device)
     store = dist.TCPStore("127.0.0.1", port, world, is_master=rank == 0)
     dist.init_process_group("nccl", store=store, rank=rank, world_size=world, device_id=device)
-    report: dict[str, Any] = {"nccl_peer": False, "copy_engines": False, "detail": ""}
+    report = _unformed(level, "")
     try:
         rows = (_CHUNK // 2 // 1024) // world * world
         send = torch.full((rows, 1024), float(rank + 1), dtype=torch.bfloat16, device=device)
@@ -430,16 +500,19 @@ def main(argv: Sequence[str]) -> int:
         print(json.dumps(asdict(pair)), flush=True)
 
     _measure(torch, count, emit)
-    if pairs and all(pair.peer and pair.verified for pair in pairs):
+    if (links := Links(tuple(pairs))).all_peers:
         # NCCL forms at the level the group would take; the copy engines are tried either way.
-        level = "SYS" if all(pair.direct for pair in pairs) else "NVL"
+        level = links.level
         # Followers launch as an executor's do (its trampoline, its seal), as children.
         port = _free_port()
         seam, unused = os.pipe()
         followers = [
             spawn.spawn_follower(
                 python=sys.executable,
-                module_argv=[*_FOLLOWER, str(rank), str(count), str(port), level],
+                module_argv=[
+                    *("-c", _CHILD, json.dumps(sys.path), "--follower"),
+                    *(str(rank), str(count), str(port), level),
+                ],
                 env=inherited_environment(),
                 inherit_fd=unused,
             )
