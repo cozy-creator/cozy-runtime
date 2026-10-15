@@ -39,6 +39,15 @@ def test_the_wrapper_reproduces_one_process_at_degree(tmp_path: Path, degree: in
         assert any(impl in str(row["impl"]) for impl in ("flash", "efficient", "math")), row
 
 
+@pytest.mark.parametrize("degree", [2, 4])
+def test_the_exchange_runs_under_a_package_calls_recovery(tmp_path: Path, degree: int) -> None:
+    # A group GPU runs every op of its call under recovery: the exchange's collective results
+    # are wrappers with no bytes of their own, which no op may read a storage of (run 6349).
+    for row in _ranks(tmp_path, degree, "--recovery"):
+        assert row["wrapped_ops"] > 0, row
+        assert row["byte_equal"] and row["rel_l2_to_degree1"] == 0.0, row
+
+
 def test_a_rank_local_wrapper_is_caught(tmp_path: Path) -> None:
     for row in _ranks(tmp_path, 2, "--rows", "67", "--heads", "4", "--plant"):
         assert not row["byte_equal"] and float(row["rel_l2_to_degree1"]) > 0.1, row
