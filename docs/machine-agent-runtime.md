@@ -36,10 +36,10 @@ access uses the supplied CPU buffers/object descriptors and the executor weight 
 store path. Reusing an already loaded construction retains its existing grants and opens
 no store. Weightless loads do not require this offer.
 
-Jobs receive source/output channels only when TensorD sets `RunJob.weights`.
-Installing a full TensorFS wheel does not supply that authority. Jobs without storage
-still run; `ctx.tensorfs_source(model)` and `ctx.output(slot)` refuse only when called
-without their respective grant. Output commit, checkpoint and handle-close semantics
+An attempt reads `Weights[M]` sources only through `Invoke.sources` and writes weights outputs
+only through `Invoke.weights`. Installing a full TensorFS wheel does not supply that authority.
+`ctx.tensorfs_source(source)` and `ctx.output(slot)` refuse only when called without their
+respective grant. Output commit, checkpoint and handle-close semantics
 remain TensorFS's existing transaction contract.
 
 Standalone callers and tests can explicitly open their own store and use the internal

@@ -34,9 +34,9 @@ from cozy_runtime.internal.encoding.formats import (
     SPEC_ROWWISE_KEEPDIM,
 )
 from cozy_runtime.internal.model_values import read_values_into
-from cozy_runtime.internal.weights_writer import MODEL_PREFIX, ExecutionStorage, WriterBroker
+from cozy_runtime.internal.weights_writer import ExecutionStorage
 from durable_seam import seam
-from weights_channel import broker_lane
+from weights_channel import MODEL_PREFIX, WriterBroker, broker_lane
 
 
 def model(

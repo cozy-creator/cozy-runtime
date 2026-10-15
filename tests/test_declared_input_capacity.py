@@ -1,26 +1,19 @@
-"""Large granted artifacts honor installed field bounds in both executor call paths."""
+"""Large granted artifacts honor installed field bounds."""
 
 from __future__ import annotations
 
 import hashlib
 import json
-import socket
 import sys
-import threading
 from pathlib import Path
-from typing import Any
 
-import msgspec
 import pytest
 
 from cozy_runtime.author._assets import InputMetadata, file_state
-from cozy_runtime.internal import package_interface
 from cozy_runtime.internal.discovery import discover
-from cozy_runtime.internal.executor import Executor
-from cozy_runtime.internal.executor_commands import (
-    Activate, InputFile, Invoke, JobBudget, Load, PrepareRequest, RunJob, Start,
-)
-from cozy_runtime.internal.seam import RESULT_DOCUMENT, Channel
+from cozy_runtime.internal.executor_commands import InputFile
+from cozy_runtime.internal.seam import RESULT_DOCUMENT
+from session import session
 
 MODULE = "declared_input_capacity_fixture"
 SOURCE = """
@@ -33,16 +26,12 @@ class Request(msgspec.Struct):
     ordinary: FileAsset
 class Result(msgspec.Struct):
     lengths: list[int]
-@app.entrypoint
+@app.entrypoint(accelerator=False)
 def read(payload: Request) -> Result:
     return Result([len(payload.declared.read_bytes()), len(payload.ordinary.read_bytes())])
-@app.entrypoint(accelerator=False)
-def job(payload: Request) -> Result:
-    return read(payload)
 """
 
 
-@pytest.mark.parametrize("kind", ["invoke", "job"])
 @pytest.mark.parametrize(
     ("declared", "ordinary", "cap", "accepted"),
     [
@@ -55,15 +44,12 @@ def job(payload: Request) -> Result:
     ],
 )
 def test_installed_field_capacity_and_explicit_ceiling(
-    tmp_path: Path, kind: str, declared: int, ordinary: int, cap: int | None, accepted: bool,
+    tmp_path: Path, declared: int, ordinary: int, cap: int | None, accepted: bool,
 ) -> None:
     project = tmp_path / "project"
     project.mkdir()
     (project / f"{MODULE}.py").write_text(SOURCE)
     (project / "package.toml").write_text(f'[application]\nobject="{MODULE}:app"\n')
-    found = discover(project)
-    interface = tmp_path / "package-interface.json"
-    interface.write_bytes(package_interface.canonical_bytes(package_interface.build(found)))
     inputs: dict[str, InputFile] = {}
     for name, size in (("declared", declared), ("ordinary", ordinary)):
         source = tmp_path / name
@@ -76,55 +62,22 @@ def test_installed_field_capacity_and_explicit_ceiling(
             length=size, order=0, file_state=file_state(source),
         )
     payload = {name: value.digest for name, value in inputs.items()}
-    root = tmp_path / "root"
-    root.mkdir()
-    spool = root / "spool"
-    binding = {"application": f"{MODULE}:app", "package_interface": str(interface)}
-    left, right = socket.socketpair()
-    with left, right:
-        peer = Channel(right)
-
-        def drain() -> None:
-            while peer.recv() is not None:
-                pass
-
-        reader = threading.Thread(target=drain, daemon=True)
-        reader.start()
-        host = Executor(Channel(left), root)
-        common: dict[str, Any] = {
-            "request_id": "capacity", "spool": str(spool), "deadline_s": 30,
-            "inputs": inputs,
-        }
-        # Omit the field exactly as existing workers do; a present ceiling remains policy.
-        if cap is not None:
-            common["max_input_bytes"] = cap
-        if kind == "job":
-            host.discovered = found
-            host.surface_names = {surface.name: surface for surface in found.surfaces}
-            reply = host.run_job(msgspec.convert(
-                {**common, **binding, "job": "job", "payload": payload,
-                 "budget": JobBudget(gpu_count=0)}, RunJob,
-            ))
-        else:
-            assert host.start(msgspec.convert({**binding, "devices": ""}, Start))["ok"]
-            assert host.load(msgspec.convert(
-                {"devices": "", "binding": binding, "budgets": {}, "construction": "a"},
-                Load,
-            ))["ok"]
-            assert host.activate(Activate(construction="a"))["ok"]
-            prepared = host.serve_request(PrepareRequest(
-                request_id="capacity", entrypoint="read", payload=payload,
-                input_metadata={name: InputMetadata(
-                    input_id=name, media_type=value.media_type, digest=value.digest,
-                    length=value.length, order=value.order,
-                ) for name, value in inputs.items()},
-            ))
-            assert prepared["ok"], prepared
-            spool.mkdir(exist_ok=True)
-            reply = host.serve_invoke(msgspec.convert({**common, "entrypoint": "read"}, Invoke))
-        left.shutdown(socket.SHUT_WR)
-        reader.join(timeout=5)
-        assert not reader.is_alive()
+    spool = tmp_path / "root" / "capacity"
+    (tmp_path / "root").mkdir()
+    # Omit the field exactly as existing workers do; a present ceiling remains policy.
+    ceiling = {} if cap is None else {"max_input_bytes": cap}
+    with session(tmp_path / "root", discover(project)) as host:
+        reply = host.run(
+            "read",
+            payload,
+            spool,
+            input_metadata={name: InputMetadata(
+                input_id=name, media_type=value.media_type, digest=value.digest,
+                length=value.length, order=value.order,
+            ) for name, value in inputs.items()},
+            inputs=inputs,
+            **ceiling,
+        )
     sys.modules.pop(MODULE, None)
     if accepted:
         assert reply["outcome"]["terminal"] == "succeeded", reply["outcome"]

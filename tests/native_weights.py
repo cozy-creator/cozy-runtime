@@ -30,13 +30,8 @@ from cozy_runtime.author._executor_requests import (
     respond,
 )
 from cozy_runtime.internal.seam import Channel
-from cozy_runtime.internal.weights_writer import (
-    MODEL_PREFIX,
-    ExecutionStorage,
-    WriterAttempt,
-    WriterBinding,
-    WriterBroker,
-)
+from cozy_runtime.internal.weights_writer import ExecutionStorage
+from weights_channel import MODEL_PREFIX, WriterAttempt, WriterBinding, WriterBroker
 
 
 class NativeExecution:
@@ -58,7 +53,6 @@ class NativeExecution:
             for slot, maximum in outputs.items()
         ]
         spec = {
-            "job": {"job_descriptor_id": "14" * 32},
             "payload_digest": "sha256:" + "12" * 32,
             "inputs": [
                 {

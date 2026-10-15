@@ -197,10 +197,20 @@ class CallInterface(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=Tru
     unavailable: str = ""
     builtin: str = ""
     self_call: bool = msgspec.field(default=False, name="self")
-    kind: Literal["entrypoint", "job"] = "job"
+
+
+class Construction(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
+    """One constructed model slot a session will load: its checkpoint and declared components."""
+
+    #: `<fn>.models.<param>`
+    path: str
+    manifest: _MANIFEST
+    #: the slot's `components=`; empty is every component
+    components: tuple[str, ...] = ()
 
 
 class Start(Command, frozen=True, kw_only=True, tag="start"):
+    #: The session's GPUs; empty runs on the CPU and never opens CUDA (`accelerator=False`).
     devices: str = ""
     sequence_parallel_degree: int = 1
     application: str = ""
@@ -214,8 +224,10 @@ class Start(Command, frozen=True, kw_only=True, tag="start"):
     #: follower's at formation, hands it to its owner (`BudgetCell.rank`) and to the follower.
     rank_cells: bool = False
     #: The callables its attempts may call: their proxies are installed before the package is
-    #: imported, and every attempt gets the call broker over them, as a job's does.
+    #: imported, and every attempt gets the call broker over them.
     call_interfaces: tuple[CallInterface, ...] = ()
+    #: What its loads will construct, known before anything heavy is imported.
+    constructions: tuple[Construction, ...] = ()
 
     def release(self) -> Release:
         return Release(application=self.application, package_interface=self.package_interface)
@@ -391,7 +403,8 @@ class PrepareRequest(_Attempt, frozen=True, kw_only=True, tag="prepare_request")
     input_metadata: dict[str, InputMetadata] = {}
 
 
-class _Run(_Attempt, frozen=True, kw_only=True):
+class Invoke(_Attempt, frozen=True, kw_only=True, tag="invoke"):
+    entrypoint: str
     spool: str
     deadline_s: float | None
     inputs: dict[str, InputFile] = {}
@@ -400,10 +413,6 @@ class _Run(_Attempt, frozen=True, kw_only=True):
     max_output_bytes: int = MAX_OUTPUT_BYTES
     #: None honors installed per-field bounds; zero retains the older default ceiling.
     max_input_bytes: int | None = None
-
-
-class Invoke(_Run, frozen=True, kw_only=True, tag="invoke"):
-    entrypoint: str
     construction: str = ""
     attention_kernel: str = ""
     #: The weight plane's device budget for this attempt; -1: the executor derives it.
@@ -429,35 +438,10 @@ class Invoke(_Run, frozen=True, kw_only=True, tag="invoke"):
     headroom_bytes: int = 0
     scope_headroom_bytes: dict[str, int] = {}
     measured_scopes: tuple[str, ...] = ()
-
-
-class ModelManifest(msgspec.Struct, frozen=True, kw_only=True, rename={"class_key": "class"}):
-    """One job Model parameter: a derive-only Manifest capability."""
-
-    class_key: str
-    manifest: _MANIFEST
-    length: Annotated[int, msgspec.Meta(gt=0)]
-
-
-class JobBudget(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
-    gpu_rate_micro_usd_per_hour: int = 0
-    gpu_count: int = 0
-    cap_micro_usd: int = 0
-
-
-class RunJob(_Run, frozen=True, kw_only=True, tag="run_job"):
-    job: str
-    payload: Json
-    application: str
-    package_interface: str
-    scratch: str = ""
-    models: dict[str, ModelManifest] = {}
-    call_interfaces: tuple[CallInterface, ...] = ()
-    publish_to: str = ""
-    budget: JobBudget = JobBudget()
-    #: The owner grants source/output writer channels. The installed TensorFS build never
-    #: supplies this authority; absent channels refuse only operations that require them.
-    weights: bool = False
+    #: Each `Weights[M]` parameter's checkpoint, read through the owner's source channel.
+    sources: dict[str, _MANIFEST] = {}
+    #: The weights outputs this attempt may write, and each one's granted new bytes.
+    weights: dict[str, int] = {}
 
 
 type KnownCommand = (
@@ -483,7 +467,6 @@ type KnownCommand = (
     | Load
     | PrepareRequest
     | Invoke
-    | RunJob
 )
 
 

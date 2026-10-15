@@ -14,9 +14,8 @@ from tensorfs.derived import Derivation, Part, Target, Tensor
 from tensorfs.records import DeclarationTargets
 
 from cozy_runtime.internal import storage_admission as storage
-from cozy_runtime.internal.weights_writer import WriterBroker
 from test_storage_admission import operation
-from weights_channel import open_output
+from weights_channel import WriterBroker, open_output
 
 
 @pytest.mark.parametrize("finish", ["part", "cancel", "producer_error"])

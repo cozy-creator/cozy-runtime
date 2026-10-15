@@ -1,4 +1,4 @@
-"""The executor's reply to one attempt (`invoke` or `run_job`), decoded once by the worker.
+"""The executor's reply to one attempt (`invoke`), decoded once by the worker.
 
 A refusal carries only `ok: false`, `code` and `detail`; a run carries the rest. Every field
 has a default, so a reply from an executor pinned to an older Runtime decodes, and a field a
