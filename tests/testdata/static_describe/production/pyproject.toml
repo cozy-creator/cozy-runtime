@@ -1,0 +1,17 @@
+[build-system]
+requires = ["uv_build>=0.12.7,<0.13"]
+build-backend = "uv_build"
+
+[project]
+name = "production-package"
+version = "0.1.0"
+description = "The 26 production registration shapes, one module per package, after xs-040"
+requires-python = ">=3.12,<3.13"
+dependencies = ["cozy-runtime>=0.1,<1", "msgspec>=0.19"]
+
+[project.entry-points."cozy.application"]
+default = "production_package:app"
+
+[tool.uv.build-backend]
+module-name = "production_package"
+module-root = ""

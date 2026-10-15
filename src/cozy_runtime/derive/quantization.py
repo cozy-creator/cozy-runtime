@@ -25,7 +25,6 @@ from tensorfs.derived import Config, DerivedTransaction, Part, SourceInspection,
 
 from cozy_runtime.author import (
     Context,
-    Model,
     Telemetry,
     UnsupportedInput,
     _numeric,
@@ -60,13 +59,6 @@ _ENCODINGS: dict[str, _Encoding] = {
 #: RNE fp32->bf16 keeps every element within amax * 2^-8 (8-bit significand, half-ulp).
 #: The normalization's own tier-1 bound — enforced on every cut, stats recorded (#695).
 BF16_ROUND_TRIP_BOUND = 2.0**-8
-
-
-class QuantizationSource(Model[object]):
-    """Exact TensorFS Manifest input. The job reads it only through its scoped TensorFS handle."""
-
-    def load(self, loader: Any) -> None:
-        del loader
 
 
 class QuantizationTensor(msgspec.Struct, forbid_unknown_fields=True):

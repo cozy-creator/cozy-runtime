@@ -488,7 +488,6 @@ class Model[PipelineT]:
     authority. Model-scoped because it is construction identity."""
 
     _cozy_ready = False
-    _cozy_derive_only = False
     _cozy_loading = False
     _cozy_active: tuple[str, tuple[str, ...]] | None = None
     _cozy_harness: ModelTestHarness | None = None
@@ -498,7 +497,7 @@ class Model[PipelineT]:
     _cozy_caches: tuple[DerivedCache, ...] = ()
     _cozy_adapters: tuple[AdapterRef, ...] = ()
     _cozy_residency: Residency | None = None
-    """Runtime-installed. Absent under `for_test` and in derive mode, which is the whole
+    """Runtime-installed. Absent under `for_test`, which is the whole
     reason a scope works without one: a test double has no bytes to stage."""
     _cozy_placement: Placement | None = None
     """Runtime-installed on the first GPU of a group that hosts a component on another."""
@@ -691,13 +690,6 @@ class Model[PipelineT]:
 
     def _cozy_require_ready(self, what: str) -> None:
         if not self._cozy_ready:
-            if self._cozy_derive_only:
-                raise CapabilityError(
-                    f"{type(self).__name__}.{what}: a job receives this model's identity "
-                    "only, never a running model; run it in an entrypoint (or a script's "
-                    "main) or call one",
-                    code="model_derive_only",
-                )
             raise CapabilityError(
                 f"{type(self).__name__}.{what}: no generation is Ready — construction is "
                 "transactional and nothing is observable before it completes (§1.1)",
@@ -752,40 +744,6 @@ def _declared_state(cls: type) -> tuple[str, ...]:
             if not name.startswith("_") and name not in names:
                 names.append(name)
     return tuple(names)
-
-
-def _derive_model[M: Model[Any]](cls: type[M], checkpoint_ref: str) -> M:
-    """A PLAIN RECORD carrying one exact Manifest identity, typed as the author's class.
-
-    No construction runs, so the instance carries `checkpoint_ref` and nothing else: a
-    component the load never built is simply absent, and reading one raises the ordinary
-    `AttributeError` that names it. Nothing is intercepted to say so — a `__getattribute__`
-    that tested a derive-only flag on EVERY attribute read of EVERY model, serving ones
-    included, bought a nicer message for the one case at the cost of a branch on the other
-    million, and `object.__setattr__` walked around it anyway. `for_request` and component
-    methods refuse `model_derive_only` from the `not_ready` gate, because no generation is Ready.
-    """
-    if not checkpoint_ref.startswith("sha256:") or len(checkpoint_ref) != 71:
-        raise ConformanceError(
-            "derive-only Model requires one lowercase sha256 Manifest identity",
-            code="derive_model_manifest_invalid",
-        )
-    try:
-        raw = bytes.fromhex(checkpoint_ref[7:])
-    except ValueError as exc:
-        raise ConformanceError(
-            "derive-only Model Manifest identity is malformed",
-            code="derive_model_manifest_invalid",
-        ) from exc
-    if len(raw) != 32 or checkpoint_ref != "sha256:" + raw.hex():
-        raise ConformanceError(
-            "derive-only Model Manifest identity is not canonical",
-            code="derive_model_manifest_invalid",
-        )
-    model = object.__new__(cls)
-    object.__setattr__(model, "checkpoint_ref", checkpoint_ref)
-    object.__setattr__(model, "_cozy_derive_only", True)
-    return model
 
 
 @final

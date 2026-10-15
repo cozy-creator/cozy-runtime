@@ -1,4 +1,4 @@
-"""The app: two entrypoints (one hidden), two jobs (weights outputs, publication)."""
+"""The app: four functions (one hidden; one writes weights, one publishes)."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from cozy_runtime.author import (
     Outputs,
     Preflight,
     Telemetry,
+    Weights,
     WeightsOutput,
 )
 
@@ -48,7 +49,7 @@ def draft(payload: RenderRequest, model: RenderModel) -> RenderResult:
     raise NotImplementedError
 
 
-@app.job(
+@app.entrypoint(
     name="quantize",
     weights=tuple(WeightsOutput(lane, max_new_bytes=LANE_BYTES) for lane in LANE_ENCODINGS),
     accelerator=False,
@@ -56,12 +57,12 @@ def draft(payload: RenderRequest, model: RenderModel) -> RenderResult:
 def quantize(
     ctx: Context,
     payload: QuantizeRequest,
-    source: SourceModel,
+    source: Weights[SourceModel],
     tel: Telemetry,
 ) -> QuantizedLanes:
     raise NotImplementedError
 
 
-@app.job(publishes=True, accelerator=False)
+@app.entrypoint(publishes=True, accelerator=False)
 def gate(payload: GateRequest, out: Outputs, tel: Telemetry) -> GateResult:
     raise NotImplementedError

@@ -5,20 +5,11 @@ from __future__ import annotations
 import ast
 import builtins
 import importlib
-from typing import Any, get_origin
+from typing import Any
 
 from cozy_runtime.author._errors import ConformanceError
-from cozy_runtime.author._loader import Loader
 from cozy_runtime.author._markers import AssetBound
-from cozy_runtime.author._model import Model
 from cozy_runtime.author._script_metadata import fold_constant
-
-
-class _ScriptSource(Model[object]):
-    """A derive-only source; inspecting its manifest does not construct inference."""
-
-    def load(self, loader: Loader) -> None:
-        pass
 
 
 def annotation(node: ast.expr, tree: ast.Module) -> Any:
@@ -67,8 +58,3 @@ def annotation(node: ast.expr, tree: ast.Module) -> Any:
         "script annotations must use imported types, not script expressions or local classes",
         code="script_main_signature",
     )
-
-
-def parameter_type(node: ast.expr, tree: ast.Module) -> Any:
-    value = annotation(node, tree)
-    return _ScriptSource if value is Model or get_origin(value) is Model else value

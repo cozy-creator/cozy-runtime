@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import typing
 import zipfile
 from collections.abc import Iterator
 from pathlib import Path
@@ -34,6 +35,7 @@ ROOT = Path(__file__).resolve().parent.parent
 RICH = ROOT / "tests" / "testdata" / "static_describe" / "rich"
 SCRIPT = ROOT / "tests" / "testdata" / "static_describe" / "script"
 EXTENDS = ROOT / "tests" / "testdata" / "static_describe" / "extends"
+PRODUCTION = ROOT / "tests" / "testdata" / "static_describe" / "production"
 MARCO = ROOT / "examples" / "marco-polo"
 TIMEOUT = 600
 
@@ -64,16 +66,21 @@ def _run(*argv: str, cwd: Path | str = "/", expect: int = 0) -> subprocess.Compl
     return result
 
 
-@pytest.mark.parametrize("project", [RICH, MARCO, SCRIPT], ids=["rich", "marco-polo", "script"])
+@pytest.mark.parametrize(
+    "project",
+    [RICH, MARCO, SCRIPT, PRODUCTION],
+    ids=["rich", "marco-polo", "script", "production"],
+)
 def test_source_reading_equals_imported_app(project: Path) -> None:
     assert _static(project) == _imported(project)
 
 
 def test_generated_script_app_is_read_not_imported() -> None:
-    """Creator generates `app = script_app("cozy_script")`; the adapter's one job is
-    fixed, so the surface is fixed and only the script's `main` needs reading."""
+    """Creator generates `app = script_app("cozy_script")`; the adapter is fixed, so only
+    the script's `main` needs reading."""
     doc = static_interface.build(SCRIPT)
-    assert doc["entrypoints"] == [] and [j["name"] for j in doc["jobs"]] == ["main"]
+    (main,) = typing.cast(list[dict[str, typing.Any]], doc["entrypoints"])
+    assert main["name"] == "main" and main["accelerator"] is False and "jobs" not in doc
 
 
 def test_rich_fixture_spells_the_whole_vocabulary() -> None:
@@ -103,8 +110,8 @@ def test_rich_fixture_spells_the_whole_vocabulary() -> None:
         '"parameter": "stills"',
     ):
         assert construct in text, construct
-    assert [e["name"] for e in doc["entrypoints"]] == ["render"], "hidden stays unpublished"
-    assert [j["name"] for j in doc["jobs"]] == ["gate", "quantize"]
+    names = [e["name"] for e in doc["entrypoints"]]
+    assert names == ["gate", "quantize", "render"], "hidden stays unpublished"
 
 
 def _variant(tmp_path: Path, edits: dict[str, tuple[str, str]]) -> Path:
@@ -183,7 +190,7 @@ def test_a_callers_signature_reads_its_callee_packages_types_from_the_locked_sou
         "async def inspect(ctx: Context, *, count: int) -> Result:\n"
         "    return Result([str(count)])\n"
         "app = App()\n"
-        "app.job(inspect, accelerator=False)\n",
+        "app.entrypoint(inspect, accelerator=False)\n",
         "dependencies = []\n",
     )
     package(
@@ -196,15 +203,15 @@ def test_a_callers_signature_reads_its_callee_packages_types_from_the_locked_sou
         "async def run(ctx: Context, *, count: int) -> Result:\n"
         "    return await inspect(count=count)\n"
         "app = App()\n"
-        "app.job(run, accelerator=False)\n",
+        "app.entrypoint(run, accelerator=False)\n",
         'dependencies = ["labelled-child"]\n'
         '[tool.uv.sources]\nlabelled-child = { path = "child" }\n',
     )
     _run(uv, "lock", "--offline", "--no-progress", cwd=project)
     document = static_interface.build(project)
-    (job,) = document["jobs"]
-    assert job["name"] == "run" and "Result" in json.dumps(job)
-    assert '"labels"' in json.dumps(job) and '"fidelity"' in json.dumps(job)
+    (run,) = document["entrypoints"]
+    assert run["name"] == "run" and "Result" in json.dumps(run)
+    assert '"labels"' in json.dumps(run) and '"fidelity"' in json.dumps(run)
 
     (project / "uv.lock").unlink()
     refusal = _refusal(project)
@@ -252,7 +259,7 @@ def test_a_published_callees_types_are_read_from_the_wheel_its_lock_pins(tmp_pat
         "async def inspect(ctx: Context, *, count: int) -> Result:\n"
         "    return Result([str(count)])\n"
         "app = App()\n"
-        "app.job(inspect, accelerator=False)\n",
+        "app.entrypoint(inspect, accelerator=False)\n",
     )
     (index / "simple" / "labelled-remote" / "index.html").write_text(
         f'<a href="/files/{filename}#sha256={digest}">{filename}</a>\n'
@@ -277,13 +284,13 @@ def test_a_published_callees_types_are_read_from_the_wheel_its_lock_pins(tmp_pat
             "async def run(ctx: Context, *, count: int) -> Result:\n"
             "    return await inspect(count=count)\n"
             "app = App()\n"
-            "app.job(run, accelerator=False)\n"
+            "app.entrypoint(run, accelerator=False)\n"
         )
         _run(uv, "lock", "--no-progress", cwd=project)
         assert f"sha256:{digest}" in (project / "uv.lock").read_text()
-        (job,) = static_interface.build(project)["jobs"]
-        assert job["name"] == "run" and '"labels"' in json.dumps(job)
-        assert '"fidelity"' in json.dumps(job)
+        (run,) = static_interface.build(project)["entrypoints"]
+        assert run["name"] == "run" and '"labels"' in json.dumps(run)
+        assert '"fidelity"' in json.dumps(run)
 
         (index / "files" / filename).write_bytes(b"not the pinned wheel")
         refusal = _refusal(project)
@@ -432,13 +439,15 @@ def test_explicit_registration_by_call_matches_decorators(tmp_path: Path) -> Non
         tmp_path,
         {
             "__init__.py": (
-                "@app.job(publishes=True, accelerator=False)\ndef gate(",
+                "@app.entrypoint(publishes=True, accelerator=False)\ndef gate(",
                 "def gate(",
             )
         },
     )
     init = project / "rich_package" / "__init__.py"
-    init.write_text(init.read_text() + "\n\napp.job(gate, publishes=True, accelerator=False)\n")
+    init.write_text(
+        init.read_text() + "\n\napp.entrypoint(gate, publishes=True, accelerator=False)\n"
+    )
     assert _static(project) == _static(RICH)
 
 
@@ -459,7 +468,7 @@ class Request(msgspec.Struct):
     seeds: list[int] = msgspec.field(default_factory=seeds)
 class Result(msgspec.Struct):
     size: int
-@app.job(accelerator=False)
+@app.entrypoint(accelerator=False)
 def render(payload: Request) -> Result:
     return Result(payload.size)
 @app.entrypoint
@@ -469,7 +478,7 @@ def preview(payload: Request) -> Result:
 
 
 def test_every_callable_publishes_its_field_defaults(tmp_path: Path) -> None:
-    """A job's author defaults reach clients on its request fields, exactly as a serving one's."""
+    """Author defaults reach clients on every function's request fields."""
     project = tmp_path / "defaults"
     project.mkdir()
     (project / "pyproject.toml").write_text('[project]\nname="defaults"\nversion="0.1.0"\n')
@@ -484,8 +493,7 @@ def test_every_callable_publishes_its_field_defaults(tmp_path: Path) -> None:
             "describe",
         ).stdout
     )
-    for kind in ("jobs", "entrypoints"):
-        (entry,) = described[kind]
+    for entry in described["entrypoints"]:
         fields = {field["name"]: field for field in entry["request"]["fields"]}
         assert "default" not in fields["prompt"]
         assert {name: fields[name].get("default") for name in fields if name != "prompt"} == {
@@ -512,7 +520,7 @@ def torch_free() -> Iterator[Path]:
         _run(uv, "build", "--wheel", "--out-dir", str(root / "dist"), str(RICH))
         _run(uv, "venv", "--python", sys.executable, str(root / "venv"))
         runtime = next((root / "dist").glob("cozy_runtime-*.whl"))
-        # numpy is for the ORACLE only: the fixture's job result names
+        # numpy is for the ORACLE only: the fixture's quantize result names
         # `cozy_runtime.derive.QuantizeResult`, and importing that module needs numpy. The
         # static reader parses the same file and never imports it.
         _run(

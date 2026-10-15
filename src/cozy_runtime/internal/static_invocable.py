@@ -13,7 +13,7 @@ from cozy_runtime import author
 from cozy_runtime.author._assets import Assets
 from cozy_runtime.author._describe import assert_declaration_shape
 from cozy_runtime.author._model_defaults import check_model_arguments
-from cozy_runtime.author._services import JOB_ONLY, SERVICES, SERVING_ONLY, UNGRANTABLE
+from cozy_runtime.author._services import SERVICES, UNGRANTABLE
 from cozy_runtime.author._signature import _classify, _wire_default, _wire_type, assets_binding
 from cozy_runtime.author._walker import is_struct, strip
 from cozy_runtime.internal.canonical import Json
@@ -57,8 +57,9 @@ def build(reader: Reader, registration: Registration) -> dict[str, Json]:
         if arg.annotation is None:
             reader.refuse(module, arg, "an unannotated invocable parameter")
         annotation = arg.annotation
-        model = reader.model_annotation(module, annotation)
-        if model is not None:
+        found = reader.model_annotation(module, annotation)
+        if found is not None:
+            model, weights = found
             if arg.arg in defaults:
                 reader.refuse(module, arg, "a model injection cannot have a default")
             models.append(
@@ -70,6 +71,7 @@ def build(reader: Reader, registration: Registration) -> dict[str, Json]:
                     model.sequence_parallel,
                     defaults=registration.model_defaults.get(arg.arg, ()),
                     uses=registration.model_components.get(arg.arg, ()),
+                    weights=weights,
                 )
             )
             fields.append((arg.arg, author.ModelArtifact | None, None))
@@ -122,11 +124,8 @@ def build(reader: Reader, registration: Registration) -> dict[str, Json]:
         reader.refuse(module, fn, "an invocable must have exactly one Context, first")
     if len(capabilities) != len(set(capabilities)):
         reader.refuse(module, fn, "an injected service is requested twice")
-    forbidden = (SERVING_ONLY if registration.kind == "job" else JOB_ONLY) | set(UNGRANTABLE)
-    if set(capabilities) & forbidden:
-        reader.refuse(
-            module, fn, "invocable requests a capability unavailable to its callable kind"
-        )
+    if set(capabilities) & set(UNGRANTABLE):
+        reader.refuse(module, fn, "invocable requests a capability nothing can grant")
     payload = msgspec.defstruct(
         f"{fn.name}Request",
         fields,
@@ -146,7 +145,6 @@ def build(reader: Reader, registration: Registration) -> dict[str, Json]:
     assert_declaration_shape(result)
     doc = package_interface.callable_doc(
         name=registration.name,
-        kind=registration.kind,
         payload_type=payload,
         result_type=result,
         models=models,
@@ -172,12 +170,10 @@ def build(reader: Reader, registration: Registration) -> dict[str, Json]:
         capabilities=capabilities,
     )
     doc["invocable"] = cast(Json, metadata)
-    if registration.kind == "entrypoint":
-        invocable_interface.project_serving_models(doc)
+    invocable_interface.project_serving_models(doc)
     invocable_interface.validate(
         msgspec.convert(doc["invocable"], invocable_interface.Invocable, strict=True),
         doc["request"],
         doc["result"],
-        kind=registration.kind,
     )
     return doc

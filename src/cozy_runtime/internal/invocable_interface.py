@@ -29,7 +29,7 @@ def metadata(surface: Surface) -> dict[str, Any]:
 
 
 def _metadata(surface: Surface) -> dict[str, Any]:
-    if surface.kind == "entrypoint" and not surface.invocable:
+    if not surface.invocable:
         return serving_metadata(
             surface.payload_type,
             surface.result_type,
@@ -42,7 +42,7 @@ def _metadata(surface: Surface) -> dict[str, Any]:
     parameters = [
         parameter.name
         for parameter in surface.params
-        if parameter.role in ("wire", "model", "assets")
+        if parameter.role in ("wire", "model", "weights", "assets")
     ]
     signature = inspect.signature(surface.fn)
     defaults = {
@@ -267,7 +267,7 @@ class Invocable(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
     operation_identity_unavailable: str | msgspec.UnsetType = msgspec.UNSET
 
 
-def validate(value: Invocable, request: object, result: object, *, kind: str = "job") -> None:
+def validate(value: Invocable, request: object, result: object) -> None:
     """Validate every token the pure generator can turn into Python source."""
     outcomes = (value.operation_identity is not msgspec.UNSET) + (
         value.operation_identity_unavailable is not msgspec.UNSET
@@ -292,7 +292,7 @@ def validate(value: Invocable, request: object, result: object, *, kind: str = "
     if (
         not all(_identifier(part) for part in value.module.split("."))
         or not _identifier(value.export)
-        or not (_identifier(value.context) or (kind == "entrypoint" and value.context == ""))
+        or not (_identifier(value.context) or value.context == "")
     ):
         raise ConformanceError(
             "invocable export is not a Python module function", code="invocable_interface"
@@ -337,18 +337,12 @@ def validate(value: Invocable, request: object, result: object, *, kind: str = "
             elif "union" in node:
                 for index, member in enumerate(node["union"]):
                     walk(member, path + f"/union/{index}")
-            elif kind == "entrypoint" and "map" in node:
+            elif "map" in node:
                 walk(node["map"]["key"], path + "/map/key")
                 walk(node["map"]["value"], path + "/map/value")
-            elif kind == "entrypoint" and "tuple" in node:
+            elif "tuple" in node:
                 for index, member in enumerate(node["tuple"]):
                     walk(member, path + f"/tuple/{index}")
-            elif kind == "entrypoint" and "opaque" in node:
-                pass
-            elif "opaque" in node or "map" in node or "tuple" in node:
-                raise ConformanceError(
-                    "invocable schema is not a supported wire type", code="invocable_interface"
-                )
 
     walk(request, "request")
     walk(result, "result")
@@ -380,9 +374,7 @@ def validate(value: Invocable, request: object, result: object, *, kind: str = "
                 "invocable enumeration names differ from its values", code="invocable_interface"
             )
     for path, default in value.defaults.items():
-        allowed = (
-            (str, int, float, bool, list, dict) if kind == "entrypoint" else (str, int, float, bool)
-        )
+        allowed = (str, int, float, bool, list, dict)
         empty_sequence = (
             default in ([], ()) and isinstance(nodes.get(path), dict) and "list" in nodes[path]
         )

@@ -12,12 +12,10 @@ from cozy_runtime.author import (
     MAX_WEIGHTS_NEW_BYTES,
     App,
     Context,
-    Loader,
-    MemoDistribution,
-    Model,
     ModelArtifact,
     Telemetry,
     UnsupportedInput,
+    Weights,
     WeightsOutput,
     invocable,
 )
@@ -28,13 +26,6 @@ if TYPE_CHECKING:
     from tensorfs.derived import SourceInspection
 
     from .quantization import ArtifactQuantizationPlan
-
-
-class QuantizationSource(Model[object]):
-    """Manifest-only builtin input; numerical libraries are unnecessary to bind it."""
-
-    def load(self, loader: Loader) -> None:
-        del loader
 
 
 class QuantizationPlan(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
@@ -158,25 +149,11 @@ def _selection(structure: SourceInspection, plan: QuantizationPlan) -> ArtifactQ
     return selection
 
 
-@invocable(
-    memoize=True,
-    memo_version="quantize/1",
-    memo_dependencies=(
-        _selection,
-        "cozy_runtime.derive.facade",
-        "cozy_runtime.derive.quantization",
-        "cozy_runtime.derive.microscale",
-        "cozy_runtime.derive.safetensors_io",
-        "tensorfs.derived",
-        MemoDistribution("tensorfs"),
-        MemoDistribution("numpy"),
-        MemoDistribution("msgspec"),
-    ),
-)
+@invocable
 async def quantize(
     ctx: Context,
     *,
-    source: QuantizationSource,
+    source: Weights,
     plan: QuantizationPlan,
     encoding: str,
     tel: Telemetry,
@@ -200,7 +177,7 @@ async def quantize(
     return facade._artifact_result(result, receipt, tel, "model")
 
 
-app.job(
+app.entrypoint(
     quantize,
     weights=(WeightsOutput("model", max_new_bytes=MAX_QUANTIZED_BYTES),),
     accelerator=False,

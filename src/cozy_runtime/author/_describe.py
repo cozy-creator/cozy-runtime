@@ -23,7 +23,7 @@ from cozy_runtime.author._demand import FeatureSpec, feature_specs
 from cozy_runtime.author._errors import CapabilityError, ConformanceError
 from cozy_runtime.author._markers import AssetBound
 from cozy_runtime.author._model import EXCLUDED_KEYWORDS, Model
-from cozy_runtime.author._services import JOB_ONLY, SERVING_ONLY, UNGRANTABLE
+from cozy_runtime.author._services import UNGRANTABLE
 from cozy_runtime.author._signature import ModelBinding, Surface
 from cozy_runtime.author._walker import walk
 from cozy_runtime.author._weights import MAX_WEIGHTS_OUTPUTS
@@ -71,83 +71,44 @@ def _grantable(surface: Surface) -> None:
         )
 
 
-def _separation(surface: Surface) -> None:
-    """The STRUCTURAL separation between a job and a serving entrypoint (§2, cr-009).
-
-    A job runs to completion: no streams, no slots, no warm state, and no caller sitting on
-    the other end of a request. The separation is not a review rule — the serving surface is
-    UNSPELLABLE from a job and the job surface is unspellable from an entrypoint, so a
-    mis-declared callable refuses at BUILD with the same verdict class as a schema violation.
-    """
-    job = surface.kind == "job"
-    forbidden = SERVING_ONLY if job else JOB_ONLY
-    reached = sorted(surface.capabilities & forbidden)
-    if reached:
+def _writes(surface: Surface) -> None:
+    """What a function writes is its own declaration, and grants mint off it (§2)."""
+    writer = bool(surface.weights_outputs or surface.publishes or surface.emits_media)
+    if writer and surface.memoize:
         raise ConformanceError(
-            f"{surface.name}: a {surface.kind} requests {', '.join(reached)} — "
-            + (
-                "that service writes the caller-visible adjustments envelope, and a "
-                "run-to-completion job has no caller to confess to (§2)"
-                if job
-                else "Scratch, Checkpoints and Budget are JOB services: durable working "
-                "state and a spend envelope belong to a bounded attempt, never to a "
-                "request handler on a warm serving loop (§2)"
-            ),
-            code="job_serving_separation",
-        )
-    if job and surface.preflight is not None:
-        raise ConformanceError(
-            f"{surface.name}: a job declares a preflight hook — preflight is the SERVING "
-            "pre-admission hook (it builds a schedule for a request that has not been "
-            "admitted); a job is submitted, accepted once, and runs to completion (§2)",
-            code="job_serving_separation",
-        )
-    if job and surface.demand_bound is not None:
-        raise ConformanceError(
-            f"{surface.name}: a job declares demand=Bound(…) — a demand envelope is a SERVING "
-            "admission fact used to route requests to warm capacity; job placement is derived "
-            "from its selected model lane and measured execution facts (§1.2/§2)",
-            code="job_serving_separation",
-        )
-    if not job and (surface.publishes or surface.emits_media):
-        raise ConformanceError(
-            f"{surface.name}: publishes=/emits_media= on an entrypoint — a publication "
-            "declaration is a JOB fact; an entrypoint's outputs ride its result (§2)",
-            code="job_serving_separation",
+            f"{surface.name}: memoize on a function that declares weights=, publishes= or "
+            "emits_media= — a writer's repeat is answered by TensorFS derivation replay and "
+            "its destination, never by the memo",
+            code="memoized_writer",
         )
     if (surface.publishes or surface.emits_media) and "save" not in surface.capabilities:
         raise ConformanceError(
             f"{surface.name}: declares publishes/emits_media but its signature names no "
-            "Outputs — grants mint off the DECLARATION, so a declaration the body cannot "
-            "act on would grant a destination nothing can write (§2)",
+            "Outputs — a declaration the body cannot act on would grant a destination "
+            "nothing can write",
             code="publication_declaration",
         )
-    if "weights_read" in surface.capabilities and not surface.model_bindings:
+    names = [output.name for output in surface.weights_outputs]
+    if len(names) > MAX_WEIGHTS_OUTPUTS:
         raise ConformanceError(
-            f"{surface.name}: WeightsReader requires exact typed model inputs",
-            code="weights_source_absent",
-        )
-    weights_names = [output.name for output in surface.weights_outputs]
-    if len(weights_names) > MAX_WEIGHTS_OUTPUTS:
-        raise ConformanceError(
-            f"{surface.name}: declares {len(weights_names)} weights outputs; "
+            f"{surface.name}: declares {len(names)} weights outputs; "
             f"the bound is {MAX_WEIGHTS_OUTPUTS}",
             code="weights_output_bound",
         )
-    if len(set(weights_names)) != len(weights_names):
+    if len(set(names)) != len(names):
         raise ConformanceError(
             f"{surface.name}: weights output names are not unique",
             code="weights_output_duplicate",
         )
-    if surface.weights_outputs and not any(param.role == "context" for param in surface.params):
+    if names and not any(param.role == "context" for param in surface.params):
         raise ConformanceError(
             f"{surface.name}: declares weights outputs but its signature has no Context",
             code="weights_sink_declaration",
         )
-    if surface.weights_outputs and ("save" in surface.capabilities or surface.publishes):
+    if names and ("save" in surface.capabilities or surface.publishes):
         raise ConformanceError(
-            f"{surface.name}: a model-producing job cannot mix TensorFS outputs with the retired "
-            "Outputs/publishes path",
+            f"{surface.name}: a model-producing function cannot mix TensorFS outputs with "
+            "Outputs/publishes",
             code="mixed_weights_outputs",
         )
 
@@ -163,7 +124,7 @@ def check(surface: Surface) -> Surface:
         )
     specs = feature_specs(surface.payload_type)
     _grantable(surface)
-    _separation(surface)
+    _writes(surface)
     _media_decode_bounds(surface)
 
     if surface.preflight is not None:
@@ -192,7 +153,8 @@ def check(surface: Surface) -> Surface:
             )
         _two_producers(surface, specs)
     for binding in surface.model_bindings:
-        _check_model(binding)
+        if not binding.weights:
+            _check_model(binding)
     return surface
 
 

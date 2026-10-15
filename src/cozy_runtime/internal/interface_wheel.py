@@ -19,13 +19,11 @@ def generate(interface: bytes) -> dict[str, bytes]:
     """Generate code without importing the package or its implementation dependencies."""
     document = package_interface.parse(interface, source="interface generator")
     digest = "sha256:" + hashlib.sha256(interface).hexdigest()
-    modules: dict[str, list[tuple[package_interface.Kind, CallableDoc, Invocable]]] = defaultdict(
-        list
-    )
-    for kind, entry in document.callables():
+    modules: dict[str, list[tuple[CallableDoc, Invocable]]] = defaultdict(list)
+    for entry in document.entrypoints:
         invocable = entry.invocable
         if invocable is not msgspec.UNSET and not entry.internal:
-            modules[invocable.module].append((kind, entry, invocable))
+            modules[invocable.module].append((entry, invocable))
     if not modules:
         raise ConformanceError(
             "package declares no invocable exports", code="interface_exports_absent"
@@ -49,14 +47,9 @@ def generate(interface: bytes) -> dict[str, bytes]:
     return files
 
 
-def _module(
-    module: str,
-    entries: list[tuple[package_interface.Kind, CallableDoc, Invocable]],
-    digest: str,
-) -> str:
+def _module(module: str, entries: list[tuple[CallableDoc, Invocable]], digest: str) -> str:
     imports = [
         "from __future__ import annotations",
-        "from collections.abc import Awaitable",
         "from typing import Annotated, Any, Literal, cast",
         "from enum import Enum",
         "import msgspec",
@@ -65,16 +58,14 @@ def _module(
         "ImageAsset, AudioAsset, VideoAsset, FileAsset, Tree",
         "from cozy_runtime.author import ModelArtifact",
         "from cozy_runtime.author._calls import _CallType, _invoke_proxy",
+        "from cozy_runtime.author import ActivationCapture, PendingCall",
         "",
     ]
-    if any(kind == "entrypoint" for kind, _, _ in entries):
-        imports.append("from cozy_runtime.author import ActivationCapture, PendingCall")
     declarations: dict[str, tuple[bytes, str]] = {}
     functions: list[str] = []
     bindings: list[str] = []
     exports: set[str] = set()
-    for kind, entry, metadata in sorted(entries, key=lambda item: item[2].export):
-        serving = kind == "entrypoint"
+    for entry, metadata in sorted(entries, key=lambda item: item[1].export):
         defaults, names, enums = metadata.defaults, metadata.type_names, metadata.enum_members
 
         def expression(
@@ -210,9 +201,7 @@ def _module(
                 "interface repeats a Python export", code="interface_name_conflict"
             )
         exports.add(export)
-        parameters: list[str] = []
-        if metadata.parameters or serving:
-            parameters.append("*")
+        parameters: list[str] = ["*"]
         request = entry.request
         assert isinstance(request, dict) and isinstance(request["fields"], list)
         fields = {field["name"]: field for field in request["fields"] if isinstance(field, dict)}
@@ -275,45 +264,41 @@ def _module(
                 + arguments
                 + ".items() if value is not msgspec.UNSET}"
             )
-        options = ""
-        returned = f"Awaitable[{result_name}]"
-        if serving:
-            model_names = [slot.parameter for slot in entry.models]
-            all_names = [*metadata.parameters, *model_names, "capture"]
-            if len(set(all_names)) != len(all_names):
-                raise ConformanceError(
-                    "serving request fields collide with model slots or capture options",
-                    code="interface_name_conflict",
-                )
-            # Model arguments override injected slots. None leaves selection to the
-            # host, which knows both owner bindings and the callee's authored defaults.
-            model_overrides = [f"{name}: ModelArtifact | None = None" for name in model_names]
-            parameters += model_overrides
-            parameters.append("capture: ActivationCapture | None = None")
-            models_name, call_name = f"__cozy_{export}Models", f"__cozy_{export}Call"
-            model_fields = [f"    {field}" for field in model_overrides]
-            _declare(
-                declarations,
-                models_name,
-                f"class {models_name}(msgspec.Struct, kw_only=True, frozen=True):\n"
-                + "\n".join(model_fields or ["    pass"])
-                + "\n",
+        model_names = [slot.parameter for slot in entry.models]
+        all_names = [*metadata.parameters, *model_names, "capture"]
+        if len(set(all_names)) != len(all_names):
+            raise ConformanceError(
+                "request fields collide with model slots or capture options",
+                code="interface_name_conflict",
             )
-            _declare(
-                declarations,
-                call_name,
-                f"class {call_name}(msgspec.Struct, kw_only=True, frozen=True):\n"
-                f"    payload: {request_name}\n    models: {models_name}\n",
-            )
-            models = "{" + ", ".join(f"{name!r}: {name}" for name in model_names) + "}"
-            arguments = "{'payload': " + arguments + ", 'models': " + models + "}"
-            request_name = call_name
-            options = ", capture=capture"
-            returned = f"PendingCall[{result_name}]"
+        # Model arguments override injected slots. None leaves selection to the
+        # host, which knows both owner bindings and the callee's authored defaults.
+        model_overrides = [f"{name}: ModelArtifact | None = None" for name in model_names]
+        parameters += model_overrides
+        parameters.append("capture: ActivationCapture | None = None")
+        models_name, call_name = f"__cozy_{export}Models", f"__cozy_{export}Call"
+        model_fields = [f"    {field}" for field in model_overrides]
+        _declare(
+            declarations,
+            models_name,
+            f"class {models_name}(msgspec.Struct, kw_only=True, frozen=True):\n"
+            + "\n".join(model_fields or ["    pass"])
+            + "\n",
+        )
+        _declare(
+            declarations,
+            call_name,
+            f"class {call_name}(msgspec.Struct, kw_only=True, frozen=True):\n"
+            f"    payload: {request_name}\n    models: {models_name}\n",
+        )
+        models = "{" + ", ".join(f"{name!r}: {name}" for name in model_names) + "}"
+        arguments = "{'payload': " + arguments + ", 'models': " + models + "}"
+        request_name = call_name
+        returned = f"PendingCall[{result_name}]"
         functions.append(
             f"def {export}({', '.join(parameters)}) -> {returned}:\n"
             f"    return cast({returned}, "
-            f"_invoke_proxy({module!r}, {export!r}, {arguments}{options}))\n"
+            f"_invoke_proxy({module!r}, {export!r}, {arguments}, capture=capture))\n"
         )
         bindings.append(
             f"    {export!r}: _CallType({digest!r}, {module!r}, {export!r}, "
