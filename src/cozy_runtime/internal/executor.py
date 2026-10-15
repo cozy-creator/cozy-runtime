@@ -492,6 +492,10 @@ class _CompositeResidency:
         for row in self.rows.values():
             row.unpark()
 
+    def restore(self) -> None:
+        for row in self.rows.values():
+            row.restore()
+
     def vacate(self) -> dict[str, Any]:
         freed = sum(int(row.vacate()["freed_bytes"]) for row in self.rows.values())
         return {"freed": {}, "held": {}, "freed_bytes": freed}
@@ -3462,6 +3466,13 @@ class Executor:
             self.residency.unpark()  # a repeating stage closes with its attempt
         if torch is not None:
             accel.drain(torch, self.device_kind)
+        if self.residency is not None:
+            # Weights the attempt's activations took map again on the plane's copy streams:
+            # keeping hot is never the attempt's verdict.
+            try:
+                self.residency.restore()
+            except Exception as exc:
+                record.emit("confession", "weights.restore", f"{type(exc).__name__}: {exc}"[:300])
         d2h_ms = (time.perf_counter() - d2h_started) * 1000
         released_us = execution_evidence.now_us()
         peak_vram = accel.peak_allocated(torch, self.device_kind) if torch is not None else 0
