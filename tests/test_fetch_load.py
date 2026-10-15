@@ -131,7 +131,8 @@ def test_load_asks_for_what_the_code_builds_in_stage_and_learned_block_order(
 def test_a_fill_waits_on_its_objects_and_never_fetches_them_itself(tmp_path: Path) -> None:
     with served(tmp_path) as (hub, store):
         gated = objects_of(store, hub.manifest, "denoiser")[-1][0]
-        hub.held, lines = {gated}, []
+        lines: list[str] = []
+        hub.held = {gated}
         hub.gate.clear()
         planner = fetches(hub, store, lines)
         loaded: list[SimpleNamespace] = []
