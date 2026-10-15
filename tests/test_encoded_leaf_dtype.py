@@ -61,9 +61,9 @@ class EncodedLeafDtypeTest(unittest.TestCase):
             torch, {"data": data, "scale": scale}, original, torch.float16
         )
         x = torch.randn(4, 256, generator=generator)
+        expected = original.to(torch.float32)(x)
         with torch.autocast("cpu", dtype=torch.bfloat16):
             out = leaf(x)
-            expected = original.to(torch.float32)(x)
         self.assertEqual(out.dtype, torch.bfloat16)
         torch.testing.assert_close(out.float(), expected, rtol=0.05, atol=0.02)
         self.assertEqual(leaf(x.half()).dtype, torch.float16)
