@@ -225,7 +225,8 @@ def test_leader_calls_real_follower_executors_twice(tmp_path: Path, degree: int,
                     state.result, (state.value + 1) * degree + degree * (degree - 1) // 2
                 )
             assert not cp.in_gated_call()
-            assert not list((spool / "ranks").iterdir())
+            # A mirrored call's inputs cross over the group's collectives, never the spool.
+            assert not (spool / "ranks").exists()
             # Every follower reports its own process, interval and attention for the attempt.
             records = group.rank_records
             assert sorted(records) == list(range(1, degree))
