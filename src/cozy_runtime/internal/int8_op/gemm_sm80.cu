@@ -3,7 +3,7 @@
 // mma.sync with the dequant in an EVT epilogue, D = out(acc * scales[m] * w_scale[n] +
 // bias[n]). Tile table, shape tree and lean banded stream-K swizzle are comfy-kitchen's
 // (`cutlass_gemm_int8.cu`, `cutlass_gemm_common.cuh`, v0.2.37, Apache-2.0, Copyright (c) 2025
-// Comfy Org), fitted on Ada and RTX 50 cards; only the tiles that tree selects are kept.
+// Comfy Org), fitted on Ada and RTX 50 cards, plus vLLM's sm89 64x64 tile (Apache-2.0).
 // clang-format off: visitors.hpp needs the GEMM headers first
 #include <cutlass/cutlass.h>
 #include <cutlass/gemm/device/gemm_universal_adapter.h>
@@ -208,18 +208,13 @@ const Fn<Out> kConfigs[] = {
     &Sm80Gemm<Out, 16, 128, 64, 16, 64, 64, 4, Identity>::run,   // 3
     &Sm80Gemm<Out, 128, 128, 64, 64, 64, 64, 4, Banded>::run,    // 4
     &Sm80Gemm<Out, 128, 256, 64, 64, 64, 64, 3, Banded>::run,    // 5
-    // 6-11: vLLM's c2x sm89 int8 tiles (SGLang's sm89 table shares them), for the sweep
-    &Sm80Gemm<Out, 128, 128, 64, 64, 64, 64, 5, Identity>::run,  // 6
-    &Sm80Gemm<Out, 256, 128, 64, 64, 64, 64, 3, Identity>::run,  // 7
-    &Sm80Gemm<Out, 64, 128, 128, 64, 64, 64, 3, Identity>::run,  // 8
-    &Sm80Gemm<Out, 64, 64, 128, 32, 64, 64, 5, Identity>::run,   // 9
-    &Sm80Gemm<Out, 32, 128, 128, 32, 64, 64, 4, Identity>::run,  // 10
-    &Sm80Gemm<Out, 16, 64, 128, 16, 64, 64, 5, Identity>::run,   // 11
+    &Sm80Gemm<Out, 64, 64, 128, 32, 64, 64, 5, Identity>::run,   // 6: vLLM's sm89 M64 tile
 };
-constexpr int kSm80Configs = 12;
+constexpr int kSm80Configs = 7;
 
 // comfy-kitchen's fitted tree (its configs 0, 1, 2, 6, 12, 13 are ours 0-5), wave guard and
-// L2 reroute.
+// L2 reroute; up to 128 rows vLLM's 64x64 tile, measured as fast on a 4090 and an RTX 5090
+// as kitchen's stream-K, which clears its workspace with an extra launch every call.
 int tree(int m, int n, int k) {
     const int64_t mn = int64_t(m) * n;
     if (n <= 24832) {
@@ -235,6 +230,8 @@ int tree(int m, int n, int k) {
 }
 
 int choose(int m, int n, int k, int sms) {
+    if (m <= 16) return 3;
+    if (m <= 128) return 6;
     int config = tree(m, n, k);
     if (config != 0 && config != 1) return config;
     // At ~2k rows the tree's 128x256 can leave a 2.1-wave grid where 128x128 wins.

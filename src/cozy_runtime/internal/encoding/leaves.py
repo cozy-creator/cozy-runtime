@@ -297,7 +297,12 @@ def _int8_leaf_class(torch: Any) -> Any:
 
     class Int8ConvRotLinear(_leaf_class(torch)):  # type: ignore[misc]
         def forward(self, x: Any, *, prequantized: PreQuantized | None = None) -> Any:
-            return int8_linear.linear(torch, x, self.data, self.scale, self.bias, self.out_dtype)
+            out_dtype = self.out_dtype
+            if torch.is_autocast_enabled(x.device.type):
+                # As the replaced `nn.Linear` does: from and to the autocast dtype.
+                out_dtype = torch.get_autocast_dtype(x.device.type)
+                x = x.to(out_dtype)
+            return int8_linear.linear(torch, x, self.data, self.scale, self.bias, out_dtype)
 
     _int8_leaf_class._cached = Int8ConvRotLinear  # type: ignore[attr-defined]
     return Int8ConvRotLinear
