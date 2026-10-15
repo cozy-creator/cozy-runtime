@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Any, get_args, get_type_hints
 import msgspec
 
 from cozy_runtime.author._activity import asides
+from cozy_runtime.author._diag_profile import profiled
 from cozy_runtime.author._app import Registration
 from cozy_runtime.author._artifacts import ModelArtifact
 from cozy_runtime.author._assets import (
@@ -424,7 +425,7 @@ def run_prepared(
         record.emit("stage", name, round(ms, 3))
 
     try:
-        with asides(aside):
+        with asides(aside), profiled(inv.request_id):
             return invoke(prepared, inv, record), SUCCEEDED, record
     except (KeyboardInterrupt, SystemExit):
         raise
