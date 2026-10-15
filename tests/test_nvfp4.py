@@ -9,11 +9,16 @@ import numpy as np
 import pytest
 import tensorfs
 
-from cozy_runtime.author import Weights
+from cozy_runtime.author._model import _derive_model
 from cozy_runtime.author.fakes import fake_attempt, fake_telemetry
 from cozy_runtime.derive import safetensors_io as st
 from cozy_runtime.derive.microscale import encode_nvfp4
-from cozy_runtime.derive.operations import EncodingRule, QuantizationPlan, quantize_into
+from cozy_runtime.derive.operations import (
+    EncodingRule,
+    QuantizationPlan,
+    QuantizationSource,
+    quantize_into,
+)
 from cozy_runtime.internal.encoding import SPEC_NVFP4
 from native_weights import NativeExecution
 from test_derive_quantize_facade import BOUND, header, mint
@@ -57,7 +62,7 @@ def test_one_lane_carries_nvfp4_beside_int8(tmp_path: Path) -> None:
         artifact = quantize_into(
             owner.context(),
             fake_telemetry(fake_attempt("nvfp4")),
-            source=Weights(source.manifest.digest),
+            source=_derive_model(QuantizationSource, source.manifest.digest),
             plan=plan,
             encoding="int8-convrot256/1",
             output="model",
