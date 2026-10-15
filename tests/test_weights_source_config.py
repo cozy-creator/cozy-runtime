@@ -11,12 +11,11 @@ from tensorfs.derived import SourceCapability
 
 from cozy_runtime.author import CapabilityError
 from cozy_runtime.author._executor_requests import Opened, WriterSource
-from cozy_runtime.internal.weights_writer import ExecutionStorage, WriterBroker
-from cozy_runtime.internal.weights_writer import MODEL_PREFIX
+from cozy_runtime.internal.weights_writer import ExecutionStorage
 from durable_seam import seam
 from test_derived_config_runtime import _released_source
 from test_model_runtime_closure import _CONFIG
-from weights_channel import broker_lane
+from weights_channel import MODEL_PREFIX, WriterBroker, broker_lane
 
 
 def test_native_source_fd_uses_exact_grant_and_is_fenced_with_attempt(tmp_path: Path) -> None:

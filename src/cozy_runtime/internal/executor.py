@@ -22,7 +22,6 @@ Its whole surface is the seam (`internal/seam.py`), and its whole vocabulary is:
     prepare_request  resolve ONE request (decode, normalize, preflight) and retain it, so
               TensorD prices a plan against the record the handler will actually run
     invoke    run ONE PREPARED attempt through the author invocation kernel and report its facts
-    run_job   run ONE function whose models are all Weights, without a session (U4 deletes it)
     probe     device/host memory facts, for TensorD's ledger reconciliation
     shutdown  cooperative exit
 
@@ -68,10 +67,13 @@ import msgspec
 from msgspec import UNSET, UnsetType
 
 from cozy_runtime import __version__ as RUNTIME_VERSION
+from cozy_runtime.author import describe
 from cozy_runtime.author._activity import settles
+from cozy_runtime.author._app import Registration
+from cozy_runtime.author._artifacts import ModelArtifact
 from cozy_runtime.author._assets import GrantedInput
 from cozy_runtime.author._attention import _close as close_producer_states
-from cozy_runtime.author._calls import _Broker, _CallType
+from cozy_runtime.author._calls import _Broker, _CallType, _export
 from cozy_runtime.author._capture import ActivationCapture
 from cozy_runtime.author._context import AdapterRef, Device
 from cozy_runtime.author._demand import shape_cell
@@ -113,7 +115,6 @@ from cozy_runtime.author._executor_requests import encode as encode_request
 from cozy_runtime.author._invoke import (
     Invocation,
     PreparedRequest,
-    attempt,
     prepare,
     run_prepared,
 )
@@ -121,17 +122,18 @@ from cozy_runtime.author._model import Model, component_use
 from cozy_runtime.author._observations import Attribution
 from cozy_runtime.author._services import Attempt as AuthorAttempt
 from cozy_runtime.author._services import ProgressFrame
-from cozy_runtime.author._signature import Surface
 from cozy_runtime.author._split import install as install_pieces
 from cozy_runtime.author._weights import Weights as RawWeights
 from cozy_runtime.author.kernels import _SETS as KERNEL_SETS
 from cozy_runtime.author.kernels import Launch, Plan
+from cozy_runtime.derive.operations import app as builtin_operations_app
 from cozy_runtime.internal import (
     accel,
     attention,
     attention_sol,
     attention_ulysses,
     budget_cell,
+    builtin_operations,
     canonical,
     child_env,
     execution_evidence,
@@ -183,7 +185,6 @@ from cozy_runtime.internal.executor_commands import (
     Residency,
     Restore,
     Revoke,
-    RunJob,
     Share,
     Shutdown,
     Start,
@@ -230,6 +231,7 @@ from cozy_runtime.internal.weights import (
     Weights,
     journaling,
 )
+from cozy_runtime.internal.weights_writer import ExecutionStorage
 
 #: The native inline-result door: a small typed result rides
 #: the terminal envelope and skips the file-store round trip. Larger than this REFUSES at
@@ -415,12 +417,12 @@ def _deadline(seconds: float | None) -> float:
     return math.inf if seconds is None else time.monotonic() + seconds
 
 
-def _granted_inputs(command: Invoke | RunJob) -> dict[str, GrantedInput]:
-    """Verified input paths, projected identically into either execution lane."""
+def _granted_inputs(command: Invoke) -> dict[str, GrantedInput]:
+    """Verified input paths in the attempt's spool."""
     return {input_id: row.granted(input_id) for input_id, row in command.inputs.items()}
 
 
-def _trees(command: Invoke | RunJob) -> dict[str, tuple[Path, str]]:
+def _trees(command: Invoke) -> dict[str, tuple[Path, str]]:
     return {ref: (Path(root), digest) for ref, (root, digest) in command.trees.items()}
 
 
@@ -432,6 +434,38 @@ def _working_peak(peak: int, at_entry: int, residency: Mapping[str, Any]) -> int
     if "plane" in residency and scoped > 0:
         return scoped
     return max(int(peak) - int(at_entry), scoped, 0)
+
+
+def _serving(interface: str, module: str, export: str, surface: Any) -> _CallType:
+    """A callable bound from its own code, called as every function is: `{payload, models}`.
+    Its direct caller passes the model slots beside the request fields (`_CallType.models`)."""
+    slots = frozenset(binding.param for binding in surface.model_bindings)
+    request, result = surface.payload_type, surface.result_type
+    if not all(isinstance(t, type) and issubclass(t, msgspec.Struct) for t in (request, result)):
+        raise CapabilityError("callable types are not structured", code="child_interface")
+    fields = msgspec.structs.fields(request)
+    if any(field.name in slots for field in fields):
+        request = msgspec.defstruct(
+            request.__name__,
+            # An invocable's defaults are immutable scalars (`_wire_default`), never factories.
+            [(f.name, f.type, f.default) for f in fields if f.name not in slots],
+            module=module,
+            kw_only=True,
+            frozen=True,
+            forbid_unknown_fields=True,
+        )
+    artifact: Any = ModelArtifact | None
+    models = msgspec.defstruct(
+        f"{export}Models",
+        [(slot, artifact, None) for slot in sorted(slots)],
+        module=module,
+        kw_only=True,
+        frozen=True,
+    )
+    call = msgspec.defstruct(
+        f"{export}Call", [("payload", request), ("models", models)], module=module, frozen=True
+    )
+    return _CallType(interface, module, export, call, result, models=slots)
 
 
 # --------------------------------------------------------------------------- state
@@ -712,12 +746,6 @@ class Executor:
                 except Exception as exc:
                     key = command.construction or self.active
                     return self.unsettled(self.constructions.get(key, self), exc)
-            case RunJob():
-                self.handled = None
-                try:
-                    return self._settled(self.run_job(command))
-                except Exception as exc:
-                    return self.unsettled(self, exc)
             case Probe():
                 if command.collect:
                     gc.collect()
@@ -1432,8 +1460,9 @@ class Executor:
         Rank 0 spawns its followers first and hands them this command, so every rank's
         Torch, runtime and package imports and the package `warmup()` run in parallel; the
         group then forms over the loopback store. Nothing here moves a weight byte. A
-        package whose interface binds no model on any entrypoint imports no Torch at all,
-        which is what keeps a weightless package servable on a cardless runner (cl-013).
+        session with GPUs initializes them here, constructed models or not; a session
+        without (`accelerator=False`), or whose environment has no Torch, imports none and
+        never opens CUDA.
         Idempotent: a started process answers with what it started as.
 
         `import_only` (a prespawn, before the GPU grant) stops after the imports: no device
@@ -1470,28 +1499,27 @@ class Executor:
             }
         _restore_seal()
         try:
-            interface = package_interface.read_bytes(
+            interface = package_interface.parse(
                 Path(command.package_interface).read_bytes(), command.package_interface
             )
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, ConformanceError) as exc:
             self.poisoned = "start without a readable package interface"
             return {
                 "ok": False,
                 "code": "package_prepare_path_invalid",
                 "detail": f"the start names no readable PackageInterface: {exc}"[:900],
             }
-        entrypoints = interface.get("entrypoints") or []
-        model_bearing = (
-            any(isinstance(doc, dict) and doc.get("models") for doc in entrypoints)
-            if isinstance(entrypoints, list)
-            else False
+        # Run 6132: an environment without torch runs on the devices it was given, untouched.
+        device = bool(command.devices) and importlib.util.find_spec("torch") is not None
+        constructs = device and any(
+            not slot.weights for entry in interface.entrypoints for slot in entry.models
         )
-        if degree > 1 and not model_bearing:
+        if degree > 1 and not constructs:
             self.poisoned = "sequence-parallel construction unsupported"
             return {
                 "ok": False,
                 "code": "sequence_parallel_unsupported",
-                "detail": "a group requires a model-bearing package",
+                "detail": "a group runs constructed models",
             }
         started = time.perf_counter()
         stages: list[tuple[str, float]] = []
@@ -1523,7 +1551,7 @@ class Executor:
                     self.group.dial_back(_SEALED)
                 self.group.broadcast(executor_commands.encode(command))
                 stage("followers_spawned")
-            if model_bearing:
+            if device:
                 import torch
 
                 if command.import_only:
@@ -1550,7 +1578,7 @@ class Executor:
                         self.poisoned = f"start refused: {refused['code']}"
                         return self._close_after(refused)
                     stage("cuda_init")
-                if not imported:
+                if constructs and not imported:
                     for name in _CONSTRUCTION_MODULES:
                         importlib.import_module(name)
                     stage("runtime_imports")
@@ -1562,11 +1590,11 @@ class Executor:
             self.call_interfaces = command.call_interfaces or self.call_interfaces
             compiles = (
                 self._expect_kernels(isolated=command.import_only)
-                if model_bearing and self.rank == 0 and not imported
+                if constructs and self.rank == 0 and not imported
                 else ""
             )
             if command.import_only:
-                if model_bearing and accel.initialized(torch, self.device_kind):
+                if device and accel.initialized(torch, self.device_kind):
                     self.poisoned = "the package import initialized a device before its grant"
                     return self._close_after(
                         self._refusal("cuda_initialized_before_runtime", self.poisoned)
@@ -2064,7 +2092,7 @@ class Executor:
             }
         # THE DEGREE (cr-068): the process started at K; every load names the same K, and a
         # mismatch refuses before any weight moves. Degree 1 (or absent) is a plain
-        # executor, whatever the seal's width - a job's envelope lane.
+        # executor, whatever the seal's width.
         degree = command.sequence_parallel_degree or 1
         if degree != max(self.world, 1) or (degree > 1 and degree != len(_sealed_entries())):
             self.poisoned = "sequence-parallel degree mismatch"
@@ -3222,6 +3250,11 @@ class Executor:
         capture = None
         capture_result: dict[str, Any] | None = None
         record: AuthorAttempt | None = None
+        # Weights grants are the attempt's own: its sources and outputs end with it.
+        sources: dict[str, RawWeights[Any]] = {
+            name: RawWeights(manifest) for name, manifest in command.sources.items()
+        }
+        storage = ExecutionStorage(spool, self._durable, command.weights)
         stage_memo.ENGINE.open(self._durable, spool)
         try:
             with (
@@ -3261,6 +3294,11 @@ class Executor:
                                 else command.max_input_bytes or 64 << 20
                             ),
                             max_output_bytes=command.max_output_bytes,
+                            sources=sources,
+                            weights_values=read_values_into,
+                            tensorfs_source=storage.source if sources else None,
+                            tensorfs_output=storage.open_output if command.weights else None,
+                            tensorfs_adopt=storage.adopt_model if command.weights else None,
                             publish=self._publish,
                             calls=self.host._call_broker(
                                 command.request_id, self.host.call_interfaces
@@ -3775,212 +3813,6 @@ class Executor:
             "kernel_symbol": ",".join(sorted(choices.totals())) if choices is not None else "",
         }
 
-    # ------------------------------------------------------------------ job
-
-    def _job_sources(self, surface: Surface, command: RunJob) -> dict[str, RawWeights[Any]]:
-        """The `Weights` arguments of a function run without a session."""
-        declared = {binding.param: binding for binding in surface.model_bindings}
-        constructed = sorted(name for name, binding in declared.items() if not binding.weights)
-        if constructed:
-            raise CapabilityError(
-                f"{surface.name} constructs {constructed}; RunJob runs Weights arguments only",
-                code="job_model_binding_mismatch",
-            )
-        rows = command.models
-        if not set(declared) <= set(rows):
-            raise CapabilityError(
-                f"{surface.name} declares Weights {sorted(declared) or 'none'} and the worker "
-                f"passed {sorted(rows)}",
-                code="job_model_binding_mismatch",
-            )
-        payload = command.payload if isinstance(command.payload, Mapping) else {}
-        sources: dict[str, RawWeights[Any]] = {}
-        for parameter in sorted(declared):
-            row, binding = rows[parameter], declared[parameter]
-            if row.class_key != binding.class_key:
-                raise CapabilityError(
-                    f"Weights parameter {parameter!r} changed its interface class",
-                    code="job_model_class_mismatch",
-                )
-            if surface.invocable and (artifact := payload.get(parameter)) is not None:
-                expected = artifact.get("manifest") if isinstance(artifact, Mapping) else None
-                if (
-                    not isinstance(expected, Mapping)
-                    or expected.get("digest") != row.manifest
-                    or expected.get("length") != row.length
-                ):
-                    raise CapabilityError(
-                        "model call artifact differs from its admitted native input",
-                        code="model_artifact_binding",
-                    )
-            try:
-                sources[parameter] = RawWeights(row.manifest)
-            except ConformanceError as exc:
-                raise CapabilityError(str(exc), code=exc.code) from exc
-        return sources
-
-    def run_job(self, command: RunJob) -> dict[str, Any]:
-        """One function whose models are all `Weights`, run once without a session.
-
-        The admitted slot's device count decides accelerator initialization: a CPU run, or
-        one whose environment has no Torch, imports no Torch and opens no CUDA context.
-        """
-        if command.capture is not None:
-            return {
-                "ok": False,
-                "code": "capture_mode",
-                "detail": "activation capture requires an ordinary serving invocation",
-                "terminal": "refused",
-                "origin": "request",
-            }
-        if self.poisoned:
-            return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
-        budget = command.budget
-        if budget.gpu_count > 0 and importlib.util.find_spec("torch") is not None:
-            import torch
-
-            self.torch = torch
-            refused = self._initialize_device(torch)
-            if refused is not None:
-                return refused
-        if self.discovered is None:
-            try:
-                self._install_call_proxies(command.call_interfaces)
-                self._discover_provisioned(
-                    Release(
-                        application=command.application,
-                        package_interface=command.package_interface,
-                    )
-                )
-            except Exception as exc:
-                return {
-                    "ok": False,
-                    "code": "job_release_undiscoverable",
-                    "detail": f"{type(exc).__name__}: {exc}"[:1024],
-                }
-        name = command.job
-        surface = self.surface_names.get(name)
-        if surface is None:
-            return {
-                "ok": False,
-                "code": "unknown_job",
-                "detail": f"{name!r} is not a registered function of this release (it has "
-                f"{sorted(self.surface_names)})",
-            }
-        registration = self.discovered.app.get(name)
-        spool = Path(command.spool)
-
-        try:
-            sources = self._job_sources(surface, command)
-        except CapabilityError as exc:
-            return {"ok": False, "code": exc.code, "detail": str(exc)[:1024]}
-
-        tensorfs_source = tensorfs_output = tensorfs_adopt = None
-        # The owner grants writer channels explicitly. Installing Store APIs grants nothing;
-        # a job without channels can still run and refuses only a storage operation it asks for.
-        if command.weights:
-            from cozy_runtime.internal.weights_writer import ExecutionStorage
-
-            execution_storage = ExecutionStorage(
-                spool,
-                self._durable,
-                {output.name: output.max_new_bytes for output in surface.weights_outputs},
-            )
-            tensorfs_source = execution_storage.source
-            tensorfs_output = execution_storage.open_output
-            tensorfs_adopt = execution_storage.adopt_model
-
-        started = time.perf_counter()
-        started_wall = time.time()
-        if self.torch is not None:
-            accel.reset_peak(self.torch, self.device_kind)
-        envelope, outcome, record = attempt(
-            registration,
-            command.payload,
-            Invocation(
-                request_id=command.request_id,
-                spool=spool,
-                deadline=_deadline(command.deadline_s),
-                calls=self._call_broker(command.request_id, command.call_interfaces),
-                publish_to=command.publish_to,
-                publish=self._publish,
-                device=self._device() if self.torch is not None else Device(),
-                cancel=lambda: _cancelled(self.root, command.request_id),
-                sources=sources,
-                trees=_trees(command),
-                assets=_granted_inputs(command),
-                max_input_bytes=(
-                    None if command.max_input_bytes is None else command.max_input_bytes or 64 << 20
-                ),
-                max_output_bytes=command.max_output_bytes,
-                weights_values=read_values_into if sources else None,
-                tensorfs_source=tensorfs_source,
-                tensorfs_output=tensorfs_output,
-                tensorfs_adopt=tensorfs_adopt,
-                progress=self._progress_sink(command.request_id),
-                activity=self._activity_sink(command.request_id),
-            ),
-        )
-        self.handled = (outcome, "", record)
-        handler_ms = (time.perf_counter() - started) * 1000
-        peak_vram = peak_reserved = 0
-        if self.torch is not None:
-            accel.synchronize(self.torch, self.device_kind)
-            peak_vram = accel.peak_allocated(self.torch, self.device_kind)
-            peak_reserved = accel.peak_reserved(self.torch, self.device_kind)
-        self.attempts += 1
-        result_ref, outputs, oversize = _serialize_result(envelope, spool)
-        if (
-            outcome.terminal == "failed"
-            and record.entered
-            and not record.failed_at_call
-            and outcome.code not in CAPACITY_CODES
-        ):
-            self.poisoned = f"{outcome.terminal}/{outcome.code}"
-        return {
-            "ok": True,
-            "kind": "job",
-            "shortfall": None,
-            "residency": {},
-            "execution_observation": self._execution_observation(),
-            "observations": record.ring.rows(),
-            "observation_caps": {**record.ring.caps(), "metrics_dropped": record.metrics_dropped},
-            "attribution": record.attribution.document(),
-            "position": record.position,
-            "outcome": {
-                "terminal": outcome.terminal,
-                "origin": outcome.origin,
-                "code": outcome.code,
-                "message": outcome.message[:2048],
-                "fields": list(outcome.fields),
-                "traceback": outcome.traceback,
-            },
-            # A torch-free job holds no stream, so quiescence is a STRUCTURAL fact rather
-            # than a device query: there is nothing that could still be moving.
-            "quiescent": self._quiescent() if self.torch is not None else True,
-            **_env_document(),
-            "poisoned": self.poisoned,
-            "outputs": outputs,
-            "frames": [frame.row() for frame in record.frames.values()],
-            "max_output_bytes": record.max_output_bytes,
-            "result_ref": result_ref,
-            "result_schema_digest": self._result_schema_digest(surface),
-            "adjustments": [],
-            "ignored": list(record.ignored),
-            "oversize_result_bytes": oversize,
-            "metrics": {
-                "handler_ms": round(handler_ms, 3),
-                "device_lease_ms": round(handler_ms, 3),
-                "d2h_wait_ms": 0.0,
-                "peak_vram_bytes": peak_vram,
-                "peak_reserved_bytes": peak_reserved,
-                "allocated_at_start_bytes": 0,
-                "rss_at_end_bytes": _rss(),
-                "started_unix": started_wall,
-                "gpu_count": 1 if self.torch is not None else 0,
-            },
-        }
-
     def _install_call_proxies(self, rows: tuple[CallInterface, ...]) -> None:
         """Expose managed dependency imports before importing a private workflow.
 
@@ -4053,32 +3885,15 @@ class Executor:
                     native = dataclasses.replace(native, unavailable=row.unavailable[:1024])
                 bindings[(module, export)] = native
             elif row.builtin:
-                from cozy_runtime.internal import builtin_operations
-
                 if row.builtin != "operations":
                     raise CapabilityError("unknown Runtime builtin", code="child_interface")
                 builtin_operations.validate_binding(interface, module, export)
-                from cozy_runtime.author import describe
-                from cozy_runtime.derive.operations import app
-
-                describe(app)
-                builtin_surface = app.get(export).surface
-                request_type, result_type = (
-                    builtin_surface.payload_type,
-                    builtin_surface.result_type,
-                )
-                if not (
-                    isinstance(request_type, type)
-                    and issubclass(request_type, msgspec.Struct)
-                    and isinstance(result_type, type)
-                    and issubclass(result_type, msgspec.Struct)
-                ):
-                    raise CapabilityError("Runtime builtin types changed", code="child_interface")
-                binding = _CallType(interface, module, export, request_type, result_type)
-                bindings[(module, export)] = binding
+                describe(builtin_operations_app)
+                builtin = builtin_operations_app.get(export).surface
+                bindings[(module, export)] = _serving(interface, module, export, builtin)
             elif row.self_call:
                 assert self.discovered is not None
-                surface = next(
+                own_surface = next(
                     (
                         surface
                         for surface in self.discovered.surfaces
@@ -4086,41 +3901,25 @@ class Executor:
                     ),
                     None,
                 )
-                if surface is None:
+                if own_surface is None:
                     raise CapabilityError(
                         "self call is not a registered App export", code="child_interface"
                     )
-                binding = _CallType(
-                    interface, module, export, surface.payload_type, surface.result_type
-                )
-                bindings[(module, export)] = binding
+                bindings[(module, export)] = _serving(interface, module, export, own_surface)
             else:
                 imported = importlib.import_module(module)
-                from cozy_runtime.author._app import Registration
-                from cozy_runtime.author._calls import _export
-
                 function = getattr(imported, export, None)
                 declared = _export(function) if callable(function) else None
                 if declared is not None:
-                    surface = Registration(
+                    registration = Registration(
                         name=export,
                         fn=declared.implementation,
                         invocable=True,
                         memoize=declared.memoize,
                         model_defaults=declared.defaults,
                         model_components=declared.components,
-                    ).surface
-                    request_type, result_type = surface.payload_type, surface.result_type
-                    if not (
-                        isinstance(request_type, type)
-                        and issubclass(request_type, msgspec.Struct)
-                        and isinstance(result_type, type)
-                        and issubclass(result_type, msgspec.Struct)
-                    ):
-                        raise CapabilityError(
-                            "invocable types are not structured", code="child_interface"
-                        )
-                    binding = _CallType("", module, export, request_type, result_type)
+                    )
+                    binding = _serving("", module, export, registration.surface)
                 else:
                     generated_binding = getattr(imported, "__cozy_bindings__", {}).get(export)
                     if not isinstance(generated_binding, _CallType):
@@ -4128,8 +3927,6 @@ class Executor:
                             "installed export is not invocable", code="child_interface"
                         )
                     binding = generated_binding
-                # Source-preserving caller wheels retain ordinary @invocable job
-                # wrappers, whose lookup is by their exact module/export pair.
                 prior = bindings.get((module, export))
                 if prior is not None and prior != binding:
                     raise CapabilityError("ambiguous managed export", code="child_interface")
@@ -5156,7 +4953,7 @@ def main(argv: list[str] | None = None) -> int:
     kernel_cache.configure(kernel_cache.from_sealed(_SEALED))
     # cr-042: the executor's ONE network fence, installed BEFORE the seam dials so the
     # AF_UNIX exemption is exercised on every boot rather than asserted. It refuses
-    # Python-level egress from package and job code; it is not a kernel bound and
+    # Python-level egress from package code; it is not a kernel bound and
     # `sandbox.refuse_network` says exactly which adversary that leaves.
     sandbox.refuse_network(
         "the executor is handed verified files in its attempt spool and never an address "

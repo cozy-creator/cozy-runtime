@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import importlib
-import socket
-import threading
 import time
 import typing
 from pathlib import Path
@@ -20,11 +18,9 @@ from cozy_runtime.author import (
     script_app,
 )
 from cozy_runtime.internal.discovery import discover
-from cozy_runtime.internal.executor import Executor
-from cozy_runtime.internal.executor_commands import JobBudget, RunJob
-from cozy_runtime.internal.seam import Channel
 from cpu_script import cpu
 from native_weights import NativeExecution
+from session import session
 from test_weights_resume_native import _committed
 
 
@@ -335,34 +331,8 @@ def test_script_failure_reply_carries_its_cause_and_traceback(
     )
     (project / f"{script}.py").write_text(cpu(body))
     monkeypatch.syspath_prepend(str(project))
-    found = discover(project)
-    left, right = socket.socketpair()
-    with left, right:
-        peer = Channel(right)
-
-        def drain() -> None:
-            while peer.recv() is not None:
-                pass
-
-        reader = threading.Thread(target=drain, daemon=True)
-        reader.start()
-        executor = Executor(Channel(left), tmp_path)
-        executor.discovered = found
-        executor.surface_names = {surface.name: surface for surface in found.surfaces}
-        reply = executor.run_job(
-            RunJob(
-                job="main",
-                request_id=script,
-                payload={},
-                deadline_s=10,
-                spool=str(tmp_path / "spool"),
-                application="",
-                package_interface="",
-                budget=JobBudget(gpu_count=0),
-            )
-        )
-        left.shutdown(socket.SHUT_WR)
-        reader.join(timeout=5)
+    with session(tmp_path, discover(project)) as host:
+        reply = host.run("main", {}, tmp_path / script)
     outcome = reply["outcome"]
     assert (outcome["terminal"], outcome["code"]) == ("failed", code), outcome
     assert f'{script}.py", line' in outcome["traceback"] and frame in outcome["traceback"]

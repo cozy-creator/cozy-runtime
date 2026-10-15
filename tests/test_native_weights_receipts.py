@@ -18,14 +18,9 @@ from tensorfs.derived import Derivation, Part, Target, Tensor
 from cozy_runtime import canonical_json
 from cozy_runtime.author._errors import CapabilityError
 from cozy_runtime.internal import weights_receipts, weights_sink
-from cozy_runtime.internal.weights_writer import (
-    ExecutionStorage,
-    WriterAttempt,
-    WriterBinding,
-    WriterBroker,
-)
+from cozy_runtime.internal.weights_writer import ExecutionStorage
 from durable_seam import seam
-from weights_channel import broker_lane
+from weights_channel import WriterAttempt, WriterBinding, WriterBroker, broker_lane
 
 
 def native_exchange(root: Path) -> None:

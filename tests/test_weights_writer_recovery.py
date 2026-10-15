@@ -15,8 +15,7 @@ from tensorfs.records import DeclarationTargets
 
 from cozy_runtime.author._errors import CapabilityError
 from cozy_runtime.author._executor_requests import Request, WriterOutput, decode, encode
-from cozy_runtime.internal.weights_writer import MODEL_PREFIX, WriterBroker
-from weights_channel import open_output
+from weights_channel import MODEL_PREFIX, WriterBroker, open_output
 
 
 def test_parent_broker_resumes_native_roles_and_rejects_child_fingerprint_or_head(
