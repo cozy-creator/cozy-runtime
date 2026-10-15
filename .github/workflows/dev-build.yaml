@@ -1,0 +1,183 @@
+name: dev-build
+# Builds publish.yaml's release files for any ref and runs one targeted test command, off the dev box:
+#   gh workflow run dev-build.yaml -R cozy-creator/cozy-runtime -f ref=<sha> [-f build=pure|none]
+#     [-f tensord_ref=<ref>] [-f tensorfs_ref=<ref>] [-f test='uv run pytest -q tests/test_x.py']
+# The artifact is cozy-runtime-<sha>[-tensord-<sha>][-tensorfs-<sha>]. The files carry the ref's
+# pyproject version; the commit is stamped in cozy_runtime._build_provenance.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or SHA to build
+        type: string
+        default: master
+      build:
+        description: "wheels: sdist, pure wheel and the Linux wheel with kernels and tensord; pure: sdist and pure wheel; none: tests only"
+        type: string
+        default: wheels
+      test:
+        description: Targeted test command, run with bash at the ref in a delegated cgroup; empty runs none
+        type: string
+        default: ''
+      tensord_ref:
+        description: TensorD branch, tag or SHA replacing tensord.pin; empty keeps the pin
+        type: string
+        default: ''
+      tensorfs_ref:
+        description: TensorFS branch, tag or SHA replacing TensorD's Cargo.toml pin; empty keeps it
+        type: string
+        default: ''
+      runner:
+        description: Runner label
+        type: string
+        default: ubuntu-latest
+      nonce:
+        description: Caller's id, shown in the run name so the caller can find its run
+        type: string
+        default: ''
+run-name: dev-build ${{ inputs.ref }} ${{ inputs.build }} ${{ inputs.tensord_ref }} ${{ inputs.tensorfs_ref }} ${{ inputs.nonce }}
+
+permissions:
+  contents: read
+
+jobs:
+  dev:
+    runs-on: ${{ inputs.runner }}
+    # Hang bound, not a work budget: a native-input change adds the CUDA kernel build.
+    timeout-minutes: 60
+    env:
+      WHEELS: ${{ inputs.build == 'wheels' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          # The native reuse proof compares against its donor's source commit.
+          fetch-depth: 0
+          path: source
+      - id: pin
+        working-directory: source
+        env:
+          TENSORD_REF: ${{ inputs.tensord_ref }}
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "tensord=${TENSORD_REF:-$(cat tensord.pin)}" >> "$GITHUB_OUTPUT"
+      - uses: astral-sh/setup-uv@v7
+      - uses: arduino/setup-task@v2
+        with:
+          repo-token: ${{ github.token }}
+      - run: uv python install 3.12
+      - name: TensorFS read access for the TensorD build
+        if: env.WHEELS == 'true'
+        env:
+          TENSORFS_KEY: ${{ secrets.TENSORFS_READ_KEY }}
+        run: bash source/scripts/prepare-release-source-access.sh
+      - if: env.WHEELS == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: cozy-creator/tensord
+          ref: ${{ steps.pin.outputs.tensord }}
+          path: tensord
+      - id: tensord
+        if: env.WHEELS == 'true' && inputs.tensord_ref != ''
+        run: echo "suffix=-tensord-$(git -C tensord rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      # A dev TensorFS: pin its commit and commit locally, since the release build stamps a clean HEAD.
+      - id: tensorfs
+        if: env.WHEELS == 'true' && inputs.tensorfs_ref != ''
+        working-directory: tensord
+        env:
+          REF: ${{ inputs.tensorfs_ref }}
+        run: |
+          set -eu
+          sha=$REF
+          [[ $sha =~ ^[0-9a-f]{40}$ ]] || sha=$(git ls-remote https://github.com/cozy-creator/tensorfs.git "$REF" "$REF^{}" | sort -k2 | tail -1 | cut -f1)
+          [[ $sha =~ ^[0-9a-f]{40}$ ]] || { echo "::error::TensorFS ref $REF not found"; exit 1; }
+          sed -i -E "/cozy-creator\/tensorfs\.git/ s/(tag|branch|rev) = \"[^\"]*\"/rev = \"$sha\"/" Cargo.toml
+          CARGO_NET_GIT_FETCH_WITH_CLI=true cargo fetch
+          git -c user.name=dev-build -c user.email=dev-build@invalid commit -qam "dev-build: TensorFS $sha"
+          echo "suffix=-tensorfs-$sha" >> "$GITHUB_OUTPUT"
+      - if: env.WHEELS == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tensord -> target
+      - run: uv sync --locked
+        working-directory: source
+      # From here to the machine check: publish.yaml's build job, step for step.
+      - name: Fetch the pinned public native donor
+        if: env.WHEELS == 'true'
+        run: |
+          uv run --no-project --python 3.12 python - <<'PY'
+          import hashlib, json, os, pathlib, urllib.parse, urllib.request
+          filename = "cozy_runtime-0.18.86-cp312-abi3-manylinux_2_28_x86_64.whl"
+          expected = "d47d42187e8121a832fe69a8fa3faa676bd462d44f8c6c103685cfdb336ab7db"
+          with urllib.request.urlopen("https://pypi.org/pypi/cozy-runtime/0.18.86/json", timeout=30) as response:
+              metadata = json.load(response)
+          rows = [row for row in metadata["urls"] if row["filename"] == filename]
+          if len(rows) != 1 or rows[0]["digests"]["sha256"] != expected:
+              raise SystemExit("PyPI native donor differs from its reviewed release pin")
+          url = urllib.parse.urlsplit(rows[0]["url"])
+          if url.scheme != "https" or url.netloc != "files.pythonhosted.org":
+              raise SystemExit("native donor URL is outside the public PyPI file origin")
+          path = pathlib.Path(os.environ["RUNNER_TEMP"]) / filename
+          with urllib.request.urlopen(rows[0]["url"], timeout=60) as response, path.open("wb") as output:
+              while chunk := response.read(1 << 20):
+                  output.write(chunk)
+          with path.open("rb") as source:
+              if hashlib.file_digest(source, "sha256").hexdigest() != expected:
+                  raise SystemExit("downloaded native donor failed its pinned SHA-256")
+          PY
+      # Runs on the still-clean checkout: reuse refuses a dirty tree, and stamping dirties it.
+      - name: Reuse unchanged native inputs or build the kernels wheel
+        if: env.WHEELS == 'true'
+        working-directory: source
+        run: |
+          set +e
+          uv run --script scripts/build-dev-wheel.py \
+            --native-wheel "$RUNNER_TEMP/cozy_runtime-0.18.86-cp312-abi3-manylinux_2_28_x86_64.whl" \
+            --native-sha256 d47d42187e8121a832fe69a8fa3faa676bd462d44f8c6c103685cfdb336ab7db \
+            --release-commit "${{ steps.pin.outputs.sha }}" --reuse-or-build --out dist
+          status=$?
+          set -e
+          if [ "$status" -eq 3 ]; then
+            scripts/build-kernel-wheel.sh --out dist --commit "${{ steps.pin.outputs.sha }}"
+          elif [ "$status" -ne 0 ]; then
+            exit "$status"
+          fi
+      - name: Build (sdist + pure-py wheel)
+        if: inputs.build != 'none'
+        working-directory: source
+        env:
+          COZY_RUNTIME_BUILD_COMMIT: ${{ steps.pin.outputs.sha }}
+        run: |
+          uv run python scripts/stamp-build-provenance.py "$COZY_RUNTIME_BUILD_COMMIT"
+          uv build --out-dir dist
+      - name: Bundle tensord into the Linux wheel
+        if: env.WHEELS == 'true'
+        working-directory: source
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+        run: CARGO_BUILD_JOBS=$(nproc) task machine MACHINE="$GITHUB_WORKSPACE/tensord"
+      - name: Verify wheel selection and the installed machine command
+        if: env.WHEELS == 'true'
+        working-directory: source
+        run: uv run --script scripts/verify-machine-wheels.py --dist dist
+      - if: inputs.build != 'none'
+        uses: actions/upload-artifact@v4
+        with:
+          name: cozy-runtime-${{ steps.pin.outputs.sha }}${{ steps.tensord.outputs.suffix }}${{ steps.tensorfs.outputs.suffix }}
+          path: source/dist/
+          if-no-files-found: error
+          retention-days: 7
+      # ci.yaml's isolation: Runtime's executor containment needs a delegated cgroup subtree.
+      - if: inputs.test != ''
+        working-directory: source
+        env:
+          TEST: ${{ inputs.test }}
+        run: |
+          sudo systemd-run --wait --pipe --collect \
+            --unit="cozy-runtime-dev-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --uid="$(id -u)" --gid="$(id -g)" \
+            --property=Delegate=yes --working-directory="$PWD" \
+            --setenv="PATH=$PATH" --setenv="HOME=$HOME" \
+            --setenv="UV_CACHE_DIR=$UV_CACHE_DIR" \
+            --setenv="UV_PYTHON_INSTALL_DIR=$(uv python dir)" \
+            bash -euo pipefail -c "$TEST"
