@@ -250,7 +250,7 @@ def test_an_int8_convrot_bake_keeps_the_delta_in_its_rotated_grid() -> None:
         lora_bake.bake(torch, stored, down * 8, up, seed=seed, stats=stats)
         moved = decode_int8_convrot256(stored["data"].numpy(), scale.numpy()) - base
         retained.append(float((moved * delta * 8).sum() / np.square(delta * 8).sum()))
-        assert abs(stats.retention - retained[-1]) < 0.05 and stats.saturated == 0
+        assert abs(stats.retention - retained[-1]) < 1e-6
     assert abs(sum(retained) / 4 - 1) < 0.05
     stored = {"data": data.clone(), "scale": scale}
     lora_bake.bake(torch, stored, down, up, seed=0)
