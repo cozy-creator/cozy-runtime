@@ -289,6 +289,20 @@ def _leaf_class(torch: Any) -> Any:
     return EncodedLinear
 
 
+def _int8_leaf_class(torch: Any) -> Any:
+    """`EncodedLinear` whose forward is one `int8_linear.linear` call, the bias in its epilogue."""
+    cached = getattr(_int8_leaf_class, "_cached", None)
+    if cached is not None:
+        return cached
+
+    class Int8ConvRotLinear(_leaf_class(torch)):  # type: ignore[misc]
+        def forward(self, x: Any, *, prequantized: PreQuantized | None = None) -> Any:
+            return int8_linear.linear(torch, x, self.data, self.scale, self.bias, self.out_dtype)
+
+    _int8_leaf_class._cached = Int8ConvRotLinear  # type: ignore[attr-defined]
+    return Int8ConvRotLinear
+
+
 def _leaf_geometry(replaced: Any, data: Any) -> tuple[int, int, Any]:
     """`(in_features, out_features, bias)` of the module being stood in for.
 
@@ -660,22 +674,18 @@ class Int8ConvRotNativeLeaf:
     def fill_scratch_bytes(self, parts: Mapping[str, RolePart]) -> int:
         return 0
 
-    @staticmethod
-    def _forward(leaf: Tensor, x: Tensor, out_dtype: Tensor) -> Tensor:
-        import torch
-
-        return int8_linear.matmul(torch, x, leaf.data, leaf.scale, out_dtype)
-
     def leaf(
         self, torch: ModuleType, parts: Mapping[str, Tensor], replaced: Tensor, out_dtype: Tensor
     ) -> Tensor:
         if torch.cuda.is_available():
-            # Starts the kernel's build beside the weight fill; the first calls run eager.
+            # Asks for the op (built at boot) beside the weight fill; until it lands the
+            # reviewed comfy-kitchen binary serves, else the eager int8 GEMM.
+            int8_linear.native(torch, torch.cuda.current_device())
             int8_linear.kitchen(torch, torch.cuda.current_device())
         data = parts["data"]
         in_features, out_features, bias = _leaf_geometry(replaced, data)
-        return _leaf_class(torch)(
-            Int8ConvRotNativeLeaf._forward,
+        return _int8_leaf_class(torch)(
+            None,
             {"data": data, "scale": parts["scale"]},
             bias,
             out_dtype,

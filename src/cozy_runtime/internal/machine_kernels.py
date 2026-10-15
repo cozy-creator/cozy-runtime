@@ -1,5 +1,5 @@
 """The machine's kernels, compiled at machine start on the cards present, best first, while
-weights download.
+weights download: the attention ladder and the int8 linear op.
 
 The machine launches `python -m cozy_runtime.internal.machine_kernels` once per installed
 generation, under that generation's own seal: its interpreter and torch, every card of the
@@ -38,6 +38,8 @@ from cozy_runtime.internal.encoding import DeviceFacts
 #: SageAttention2, FA3 BF16; SDPA needs no compile). Models without a preference use the
 #: ranked table, whose only compiled kernel is FA3.
 LADDER: tuple[str, ...] = ("sol-attn", "sageattention", "flash-attn3")
+#: The int8 linear every 8-bit lane serves (`int8_linear`), on every int8 tensor-core card.
+INT8 = "cozy-int8"
 
 
 def cards(devices: str) -> dict[int, str]:
@@ -71,6 +73,14 @@ def ladder(present: Mapping[int, str]) -> list[kernel_compile.Job]:
             # Upstream's setup.py builds for the cards it sees: this one.
             job = dataclasses.replace(job, env={"CUDA_VISIBLE_DEVICES": device})
             jobs.setdefault(job.key.digest, job)
+        if sm >= 80:
+            try:
+                job = kernel_sources.job(INT8, sm)
+            except kernel_sources.Absent:
+                continue
+            jobs.setdefault(
+                job.key.digest, dataclasses.replace(job, env={"CUDA_VISIBLE_DEVICES": device})
+            )
     return list(jobs.values())
 
 
