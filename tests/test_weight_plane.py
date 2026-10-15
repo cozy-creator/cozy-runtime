@@ -1957,6 +1957,47 @@ def test_a_group_gpus_denoise_keeps_a_resident_set_after_a_one_pass_warm_up(card
     assert same(resident, denoised)
 
 
+@on_gpu
+def test_a_group_gpus_first_decode_keeps_its_denoisers_weights_under_a_cap(
+    tmp_path: Path,
+) -> None:
+    """Runs 6719 and 6772 (H3 on 2x H100): a group GPU's first decode, its activations not
+    measured yet, kept only its own streaming window and unmapped the DiT, which the next
+    segment read back whole (51 GiB, 1.3-2.0 s). Under the owner's cap the decode streams
+    through its own window and the denoiser stays mapped: its next stage misses nothing."""
+    weights = Weights(torch, torch.device("cuda", 0), "cuda")
+    weights.set_budget(-1, pinned=1 << 30)
+    (tmp_path / "dit").mkdir()
+    (tmp_path / "vae").mkdir()
+    dit = load(weights, write_checkpoint(tmp_path / "dit")[0], "dit")
+    vae = load(weights, write_checkpoint(tmp_path / "vae")[0], "vae")
+    x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
+
+    def staged(model: Any, method: str, passes: int) -> list[Any]:
+        model.residency.admit(method, ("stack",))
+        try:
+            with torch.inference_mode():
+                return [model.stack(x) for _ in range(passes)]
+        finally:
+            model.residency.release(method, ("stack",))
+
+    weights.grouped = True
+    weights.set_cap(room(weights, 1 << 30))
+    try:
+        reference = staged(dit, "denoise", 3)  # streams its first pass, then grows
+        denoiser = dit.residency.components["stack"]
+        held = weights.resident_bytes(denoiser)
+        assert held > 0
+        staged(vae, "decode", 1)
+        assert weights.resident_bytes(denoiser) == held
+        misses = weights.facts().misses
+        assert same(staged(dit, "denoise", 1), reference[:1])
+        assert weights.facts().misses == misses
+    finally:
+        weights.set_cap(-1)
+        torch.cuda.empty_cache()
+
+
 @on_card
 def test_an_op_outside_every_block_runs_again_after_weights_leave(card: Any) -> None:
     """Package arithmetic between component calls allocates too: when it cannot, idle and

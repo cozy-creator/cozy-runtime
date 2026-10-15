@@ -615,6 +615,8 @@ class Executor:
         #: a follower's last mirrored call that succeeded: rewound if the group runs it again
         #: because another GPU failed it (`join` with `room`), dropped at its next call
         self._last_journal: Journal | None = None
+        #: the per-GPU caps the group's planes were last given (`budget`)
+        self.rank_caps: tuple[int, ...] = ()
         self._device_ready = False
         self._startup_reported = False
         #: a follower's budget cell from rank 0 (`RANK_CELLS`), for its weight plane
@@ -3068,11 +3070,12 @@ class Executor:
             return target
         target.handled = None
         # Every attempt carries its grant; none (-1: an older Worker, or no reading) derives
-        # from the driver, so a cut to 0 never outlives the attempt that follows it.
+        # from the driver, so a cut to 0 never outlives the attempt that follows it. Only a
+        # grant that changed reaches the group's GPUs.
         if self.weights is not None and (
             command.plane_budget_bytes != self.weights.budget
             or command.cap_bytes != self.weights.cap
-            or command.rank_caps
+            or command.rank_caps != self.rank_caps
             or command.floor_bytes != self.weights.owner_floor
         ):
             granted = self.budget(
@@ -4724,6 +4727,7 @@ class Executor:
         freed, refused = self._followers(self._plane_ranks(), command, "budget", own)
         if refused:
             return refused
+        self.rank_caps = command.rank_caps
         return {"ok": True, "freed_bytes": freed, "plane": self._plane_facts()}
 
     def share(self) -> dict[str, Any]:
