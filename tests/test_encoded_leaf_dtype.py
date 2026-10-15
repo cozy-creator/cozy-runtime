@@ -57,6 +57,7 @@ class EncodedLeafDtypeTest(unittest.TestCase):
         data = torch.frombuffer(bytearray(encoded.payload), dtype=torch.int8).reshape(16, 256)
         scale = torch.frombuffer(bytearray(encoded.companions[0].raw), dtype=torch.float32)
         original = torch.nn.Linear(256, 16, dtype=torch.float16)
+        original.weight.data.copy_(weight)
         leaf = Int8ConvRotNativeLeaf("int8-convrot256/1").leaf(
             torch, {"data": data, "scale": scale}, original, torch.float16
         )
