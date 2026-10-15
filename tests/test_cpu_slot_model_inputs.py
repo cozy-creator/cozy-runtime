@@ -1,5 +1,5 @@
-"""A script job's accelerator, declared or not, reaches the static and the imported reader the same
-way, and a CPU script that reaches for CUDA is told which declaration it is missing."""
+"""A script's `accelerator = false`, declared or not, reaches both readers the same way, and a CPU
+script that reaches for CUDA is told which declaration stops it."""
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ def _script(tmp_path: Path, name: str, metadata: str, body: str) -> Path:
     return project
 
 
-@pytest.mark.parametrize("declared", [None, False, True])
+@pytest.mark.parametrize("declared", [None, False])
 def test_a_script_declares_its_accelerator_in_both_readers(
     tmp_path: Path, declared: bool | None
 ) -> None:
@@ -42,7 +42,7 @@ def test_a_script_declares_its_accelerator_in_both_readers(
     static = static_interface.build(project)
     imported = package_interface.build(discover(project))
     assert package_interface.canonical_bytes(static) == package_interface.canonical_bytes(imported)
-    assert static["jobs"][0].get("accelerator") is declared
+    assert static["entrypoints"][0].get("accelerator") is declared
 
 
 def test_a_cpu_script_that_uses_cuda_names_the_declaration(
@@ -60,5 +60,5 @@ def test_a_cpu_script_that_uses_cuda_names_the_declaration(
     _, outcome, _ = attempt(
         app.get("main"), {}, Invocation("cuda", tmp_path / "out", time.monotonic() + 5)
     )
-    assert outcome.terminal == "failed" and outcome.code == "job_needs_accelerator", outcome
-    assert "accelerator = true" in outcome.message and "[tool.cozy]" in outcome.message
+    assert outcome.terminal == "failed" and outcome.code == "cpu_script_used_cuda", outcome
+    assert "accelerator = false" in outcome.message and "[tool.cozy]" in outcome.message

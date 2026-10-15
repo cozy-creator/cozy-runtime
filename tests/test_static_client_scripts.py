@@ -51,8 +51,8 @@ def project(root: Path, code: str) -> Path:
         "max_decoded_bytes=2**30 + 16 * 1024 * 1024)]): pass\n",
         "# /// script\n# [tool.cozy.weights]\n# checkpoint=4096\n# [tool.cozy.models]\n"
         "# source='owner/model@1.0/bf16'\n# ///\n"
-        "from cozy_runtime.author import Context, Model, ModelArtifact, Telemetry\n"
-        "def main(ctx: Context, *, source: Model[object],\n"
+        "from cozy_runtime.author import Context, ModelArtifact, Telemetry, Weights\n"
+        "def main(ctx: Context, *, source: Weights,\n"
         "         tel: Telemetry) -> ModelArtifact:\n"
         "    raise RuntimeError('body')\n",
         "# /// script\n# [tool.cozy.weights]\n# checkpoint=4096\n# ///\n"
@@ -118,10 +118,41 @@ def test_a_script_that_runs_a_model_slot_is_served_with_its_default_ladder(
         sys.modules.update(previous)
     actual = static_interface.build(root)
     assert package_interface.canonical_bytes(actual) == package_interface.canonical_bytes(expected)
-    assert actual["jobs"] == []
     (main,) = typing.cast(list[dict[str, typing.Any]], actual["entrypoints"])
     assert main["invocable"]["module"] == "cozy_script" and main["invocable"]["export"] == "main"
     assert main["models"][0].get("default_ladder") == ladder
+
+
+def test_a_script_reads_raw_weights_of_a_declared_layout(tmp_path: Path) -> None:
+    root = project(
+        tmp_path,
+        "# /// script\n# [tool.cozy.weights]\n# lane=4096\n# ///\n"
+        "from script_models import Probe\n"
+        "from cozy_runtime.author import Context, ModelArtifact, Weights\n"
+        "def main(ctx: Context, *, source: Weights[Probe]) -> ModelArtifact:\n"
+        "    raise RuntimeError('body')\n",
+    )
+    (root / "script_models.py").write_text(
+        "from cozy_runtime.author import Loader, Model, uses_components\n"
+        "class Probe(Model[object]):\n"
+        "    def load(self, loader: Loader) -> None: pass\n"
+        "    @uses_components('vae')\n"
+        "    def decode(self) -> int: return 1\n"
+    )
+    modules = ("cozy_script", "cozy_script_entry", "script_models")
+    previous = {name: sys.modules.pop(name) for name in modules if name in sys.modules}
+    try:
+        expected = package_interface.build(discover(root))
+    finally:
+        for name in modules:
+            sys.modules.pop(name, None)
+        sys.modules.update(previous)
+    actual = static_interface.build(root)
+    assert package_interface.canonical_bytes(actual) == package_interface.canonical_bytes(expected)
+    (main,) = typing.cast(list[dict[str, typing.Any]], actual["entrypoints"])
+    (slot,) = main["models"]
+    assert slot["class"] == "Probe" and slot["weights"] is True
+    assert main["weights_outputs"][0]["output_id"] == "lane"
 
 
 def test_captured_model_source_and_pth_are_never_executed(tmp_path: Path) -> None:
@@ -157,7 +188,7 @@ def test_captured_model_source_and_pth_are_never_executed(tmp_path: Path) -> Non
     )
     document = static_interface.build(root, environment_python=binary)
     served = document["entrypoints"]
-    assert document["jobs"] == [] and isinstance(served, list) and isinstance(served[0], dict)
+    assert isinstance(served, list) and isinstance(served[0], dict)
     models = served[0]["models"]
     assert isinstance(models, list) and isinstance(models[0], dict)
     model = models[0]
@@ -207,8 +238,8 @@ def test_captured_model_source_and_pth_are_never_executed(tmp_path: Path) -> Non
         "# /// script\n# [tool.cozy.weights]\n# checkpoint=1\n# ///\ndef main(): pass\n",
         "from cozy_runtime.author import WeightsSink\ndef main(*, weights: WeightsSink): pass\n",
         "# /// script\n# [tool.cozy.weights]\n# checkpoint=4096\n# ///\n"
-        "from cozy_runtime.author import Context, WeightsReader\n"
-        "def main(ctx: Context, *, source: WeightsReader): pass\n",
+        "from cozy_runtime.author import Context, Model\n"
+        "def main(ctx: Context, *, source: Model[object]): pass\n",
         "# /// script\n# [tool.cozy.weights]\n# checkpoint=4096\n# ///\n"
         "from cozy_runtime.author import Context, Outputs\n"
         "def main(ctx: Context, *, out: Outputs): pass\n",

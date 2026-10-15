@@ -16,7 +16,7 @@ OPERATIONS = """
 from typing import Literal
 import msgspec
 from cozy_runtime.author import (
-    Context, ModelArtifact, Model, Telemetry, invocable, uses_components,
+    Context, ModelArtifact, Model, Telemetry, Weights, invocable, uses_components,
 )
 
 raise AssertionError("the static reader must never execute this module")
@@ -34,8 +34,8 @@ class Result(msgspec.Struct, frozen=True):
     detail: Detail
     accepted: bool = msgspec.field(default=True)
 
-@invocable(memoize=True)
-async def quantize(ctx: Context, *, source: Source, encoding: Literal["fp8", "mxfp8"],
+@invocable
+async def quantize(ctx: Context, *, source: Weights[Source], encoding: Literal["fp8", "mxfp8"],
     threshold: float | None = None, tel: Telemetry) -> Result:
     raise AssertionError("implementation must never execute")
 
@@ -57,9 +57,9 @@ def project(tmp_path: Path, source: str = OPERATIONS) -> Path:
         "from . import operations\n"
         "app = App()\n"
         "BYTES = 1 << 20\n"
-        'app.job(operations.quantize, name="quantize-artifact", '
+        'app.entrypoint(operations.quantize, name="quantize-artifact", '
         'weights=(WeightsOutput("model", BYTES),), accelerator=False)\n'
-        'app.job(name="precompute-adaln", accelerator=False)(operations.precompute)\n'
+        'app.entrypoint(name="precompute-adaln", accelerator=False)(operations.precompute)\n'
     )
     (package / "operations.py").write_text(source)
     return root
@@ -71,25 +71,25 @@ def test_static_invocable_preserves_managed_names_defaults_models_and_capabiliti
     document = static_interface.build(project(tmp_path))
     raw = package_interface.canonical_bytes(document)
     assert package_interface.canonical_bytes(package_interface.read_bytes(raw)) == raw
-    jobs = {row["name"]: row for row in cast(list[dict[str, Any]], document["jobs"])}
-    assert sorted(jobs) == ["precompute-adaln", "quantize-artifact"]
-    quantize = jobs["quantize-artifact"]
+    rows = {row["name"]: row for row in cast(list[dict[str, Any]], document["entrypoints"])}
+    assert sorted(rows) == ["precompute-adaln", "quantize-artifact"]
+    quantize = rows["quantize-artifact"]
     assert quantize["models"] == [
         {
             "path": "quantize-artifact.models.source",
             "class": "Source",
             "encoded_leaves": "accept",
             "component_use": {"tensors": ["transformer"]},
+            "weights": True,
         }
     ]
     export = quantize["invocable"]
     assert export["module"] == "ast_operations.operations" and export["export"] == "quantize"
-    assert export["memoize"] is True
+    assert export["memoize"] is False
     assert export["context"] == "ctx"
-    assert export["parameters"] == ["source", "encoding", "threshold"]
+    assert export["parameters"] == ["encoding", "threshold"]
     assert export["capabilities"] == ["telemetry", "weights"]
     assert export["defaults"] == {
-        "request/source": None,
         "request/threshold": None,
         "result/detail/note": "original",
         "result/accepted": True,
@@ -100,7 +100,7 @@ def test_static_invocable_preserves_managed_names_defaults_models_and_capabiliti
         "result/detail": "Detail",
     }
     assert quantize["weights_outputs"][0]["max_bytes"] == 1 << 20
-    orchestration = jobs["precompute-adaln"]
+    orchestration = rows["precompute-adaln"]
     assert orchestration["result"] == {"input": "model"}
     assert "models" not in orchestration
     assert orchestration["invocable"]["defaults"] == {
@@ -165,9 +165,9 @@ def test_declared_tensorfs_output_is_a_capability_without_a_weights_sink_paramet
 ) -> None:
     source = OPERATIONS
     document = static_interface.build(project(tmp_path, source))
-    jobs = {row["name"]: row for row in cast(list[dict[str, Any]], document["jobs"])}
-    assert jobs["quantize-artifact"]["invocable"]["capabilities"] == ["telemetry", "weights"]
-    assert jobs["quantize-artifact"]["weights_outputs"][0]["output_id"] == "model"
+    rows = {row["name"]: row for row in cast(list[dict[str, Any]], document["entrypoints"])}
+    assert rows["quantize-artifact"]["invocable"]["capabilities"] == ["telemetry", "weights"]
+    assert rows["quantize-artifact"]["weights_outputs"][0]["output_id"] == "model"
 
 
 @pytest.mark.parametrize(
@@ -201,11 +201,11 @@ def test_app_decorator_can_register_an_invocable_without_running_it(tmp_path: Pa
     (root / "ast_operations/__init__.py").write_text("""
 from cozy_runtime.author import App, Context, ModelArtifact, invocable
 app = App()
-@app.job(name="prepare", accelerator=False)
+@app.entrypoint(name="prepare", accelerator=False)
 @invocable(memoize=True)
 async def prepare(ctx: Context, *, model: ModelArtifact) -> ModelArtifact:
     raise AssertionError("never execute")
 """)
     document = static_interface.build(root)
-    job = cast(list[dict[str, Any]], document["jobs"])[0]
-    assert job["name"] == "prepare" and job["invocable"]["memoize"] is True
+    prepare = cast(list[dict[str, Any]], document["entrypoints"])[0]
+    assert prepare["name"] == "prepare" and prepare["invocable"]["memoize"] is True

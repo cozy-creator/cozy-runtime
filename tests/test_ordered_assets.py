@@ -113,7 +113,7 @@ async def child(ctx: Context, *, assets: Pictures) -> Result:
     )
 
 
-app.job(child, accelerator=False)
+app.entrypoint(child, accelerator=False)
 
 
 def inputs(
@@ -229,11 +229,11 @@ def test_assets_descriptor_and_generated_interface_keep_explicit_parameter(tmp_p
     found = Discovered(app, __name__ + ":app", tmp_path, sys.modules[__name__], describe(app), {})
     raw = package_interface.canonical_bytes(package_interface.build(found))
     body = package_interface.read_bytes(raw)
-    entry = body["entrypoints"][0]
+    entries = {entry["name"]: entry for entry in body["entrypoints"]}
+    entry = entries["collect"]
     assert entry["assets"]["parameter"] == "assets"
     assert entry["assets"]["kinds"][0]["max_decoded_bytes"] == 1024
-    call = body["jobs"][0]
-    assert call["invocable"]["parameters"] == ["assets"]
+    assert entries["child"]["invocable"]["parameters"] == ["assets"]
     generated = interface_wheel.generate(raw)
     assert any(
         b"assets: Assets[" in value for key, value in generated.items() if key.endswith(".py")
@@ -391,7 +391,7 @@ async def decoded_child(ctx: Context, *, assets: SimplePictures) -> Result:
 
 
 decoded_app = App()
-decoded_app.job(decoded_child, accelerator=False)
+decoded_app.entrypoint(decoded_child, accelerator=False)
 
 
 def test_decoded_assets_are_lazy_real_images_with_one_attempt_budget(tmp_path: Path) -> None:
@@ -492,7 +492,7 @@ def test_decoded_descriptor_and_generated_client_preserve_the_value_type(tmp_pat
         {},
     )
     document = package_interface.build(found)
-    slot = document["jobs"][0]["assets"]
+    slot = document["entrypoints"][0]["assets"]
     assert slot["view"] == "decoded"
     assert slot["kinds"][0]["max_decoded_bytes"] == 2 * 1024**3
     raw = package_interface.canonical_bytes(document)
@@ -504,7 +504,7 @@ def test_decoded_descriptor_and_generated_client_preserve_the_value_type(tmp_pat
             compile(value, key, "exec")
     for invalid_view in ("raw", "pixels", None, 1):
         invalid = json.loads(json.dumps(document))
-        invalid["jobs"][0]["assets"]["view"] = invalid_view
+        invalid["entrypoints"][0]["assets"]["view"] = invalid_view
         with pytest.raises(ConformanceError):
             package_interface.read_bytes(json.dumps(invalid).encode())
 

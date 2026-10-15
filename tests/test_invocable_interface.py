@@ -62,7 +62,7 @@ async def invalid_default(ctx: Context, *, values: list[int] = []) -> Result:  #
 
 def described() -> tuple[App, bytes]:
     app = App()
-    app.job(transform, accelerator=False)
+    app.entrypoint(transform, accelerator=False)
     found = Discovered(
         app, __name__ + ":app", Path(__file__).parent, sys.modules[__name__], describe(app), {}
     )
@@ -82,7 +82,7 @@ def test_invocable_dispatch_uses_private_body_and_export_requires_owner(tmp_path
     )
     assert outcome.terminal == "succeeded"
     assert result is not None and result.result == Result("hihi", Detail(4))
-    descriptor = package_interface.read_bytes(raw)["jobs"][0]
+    descriptor = package_interface.read_bytes(raw)["entrypoints"][0]
     assert descriptor["invocable"]["defaults"] == {"request/count": 2}
     assert descriptor["invocable"]["memoize"] is True
     assert descriptor["invocable"]["type_names"]["result/detail"] == "Detail"
@@ -93,7 +93,7 @@ def test_legacy_memo_declaration_refuses_instead_of_silently_disabling_cache() -
         cast(Any, invocable)(reusable=True)
     _, raw = described()
     document = canonical.parse_canonical(raw)
-    declaration = document["jobs"][0]["invocable"]
+    declaration = document["entrypoints"][0]["invocable"]
     declaration["reusable"] = declaration.pop("memoize")
     with pytest.raises(ConformanceError, match="missing required field `memoize`"):
         package_interface.read_bytes(canonical.write(document))
@@ -102,7 +102,7 @@ def test_legacy_memo_declaration_refuses_instead_of_silently_disabling_cache() -
 def test_additive_invocable_metadata_from_another_runtime_still_generates() -> None:
     _, raw = described()
     document = canonical.parse_canonical(raw)
-    declaration = document["jobs"][0]["invocable"]
+    declaration = document["entrypoints"][0]["invocable"]
     declaration["future_hint"] = {"added_by": "a newer Runtime"}
     declaration["type_names"]["request/removed"] = "Removed"
     declaration["defaults"]["request/removed"] = 3
@@ -125,7 +125,7 @@ def test_unportable_invocable_signature_refuses_before_execution(
     fn: Callable[..., Awaitable[Result]],
 ) -> None:
     app = App()
-    app.job(invocable(fn), accelerator=False)
+    app.entrypoint(invocable(fn), accelerator=False)
     with pytest.raises(ConformanceError):
         describe(app)
 
@@ -153,7 +153,7 @@ assert not inspect.iscoroutinefunction(m.transform)
 assert typing.get_type_hints(m.transform)['return'].__args__[0] is m.Result
 assert typing.get_type_hints(m.Result)['detail'] is m.Detail
 from cozy_runtime.author import CapabilityError
-assert list(inspect.signature(m.transform).parameters)==['text','count']
+assert list(inspect.signature(m.transform).parameters)==['text','count','capture']
 try:m.transform(text='hello')
 except CapabilityError as e:assert e.code=='child_broker_absent'
 else:raise AssertionError('generated proxy executed without its RecordOwner')
@@ -206,7 +206,7 @@ def test_ordinary_main_reserves_self_call_with_implicit_attempt_lifetime(tmp_pat
 
     app = App()
 
-    @app.job(accelerator=False)
+    @app.entrypoint(accelerator=False)
     async def wrapper(ctx: Context, payload: Empty) -> Result:
         main()
         return Result("parent", Detail(0))
@@ -257,7 +257,7 @@ def test_implicit_operation_call_observes_actual_parent_cancellation(tmp_path: P
         cancelled = True
         transform(text="canceled")
 
-    @app.job(accelerator=False)
+    @app.entrypoint(accelerator=False)
     def wrapper(ctx: Context, payload: Empty) -> Result:
         main()
         raise AssertionError("canceled attempt reserved another child")

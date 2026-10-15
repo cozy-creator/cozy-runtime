@@ -27,7 +27,7 @@ async def inspect_images(
 
 
 app = App()
-app.job(inspect_images, accelerator=False)
+app.entrypoint(inspect_images, accelerator=False)
 ```
 
 `assets["first"]` requires an occurrence labelled `first`.

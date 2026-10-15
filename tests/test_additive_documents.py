@@ -16,8 +16,7 @@ def _interface() -> bytes:
         {
             "application": "additive_fixture:app",
             "format": package_interface.SCHEMA,
-            "entrypoints": [],
-            "jobs": [
+            "entrypoints": [
                 {
                     "name": "main",
                     "request": {
@@ -25,7 +24,6 @@ def _interface() -> bytes:
                         "doc": "an additive schema attribute",
                     },
                     "result": {"fields": []},
-                    "publishes": False,
                     "timeout_hint": 30,
                 }
             ],
@@ -36,14 +34,14 @@ def _interface() -> bytes:
 
 def test_missing_required_interface_fields_still_refuse() -> None:
     body = json.loads(_interface())
-    del body["jobs"][0]["result"]
+    del body["entrypoints"][0]["result"]
     with pytest.raises(
         package_interface.StalePackageInterface, match="missing required field `result`"
     ):
         package_interface.read_bytes(canonical.write(body))
-    del body["jobs"]
+    del body["entrypoints"]
     with pytest.raises(
-        package_interface.StalePackageInterface, match="missing required field `jobs`"
+        package_interface.StalePackageInterface, match="missing required field `entrypoints`"
     ):
         package_interface.read_bytes(canonical.write(body))
 

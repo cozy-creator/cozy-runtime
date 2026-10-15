@@ -1,4 +1,4 @@
-"""Real native inputs, scoped broker reads, and banked format reconstruction."""
+"""`Weights` reads real native inputs through scoped broker reads, with banked reconstruction."""
 
 from __future__ import annotations
 
@@ -7,15 +7,17 @@ import hashlib
 import importlib.util
 import io
 import json
+import time
+from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import pytest
 import tensorfs
 
-from cozy_runtime.author import Cancelled, CapabilityError, WeightsReader
+from cozy_runtime.author import Cancelled, CapabilityError, Context, Invocation, Surface, Weights
 from cozy_runtime.author._executor_requests import (
     Answer,
     Reply,
@@ -23,9 +25,8 @@ from cozy_runtime.author._executor_requests import (
     WriterSource,
     decode,
 )
-from cozy_runtime.author._model import _derive_model
+from cozy_runtime.author._invoke import _bind_tensorfs
 from cozy_runtime.author._services import Attempt
-from cozy_runtime.derive.quantization import QuantizationSource
 from cozy_runtime.internal.encoding.formats import (
     SPEC_MXFP8,
     SPEC_PLAIN,
@@ -109,13 +110,9 @@ def vector(name: str, encoding: str) -> tuple[dict[str, Any], np.ndarray]:
 def reader(
     tmp_path: Path, store: Any, references: dict[str, tuple[str, int]]
 ) -> tuple[
-    WeightsReader,
-    dict[str, QuantizationSource],
-    WriterBroker,
-    SimpleNamespace,
-    Attempt,
-    list[Request],
+    dict[str, Weights[Any]], WriterBroker, SimpleNamespace, Attempt, ExitStack, list[Request]
 ]:
+    """`Weights` bound to one attempt exactly as an invocation binds them."""
     spool = tmp_path / "spool"
     spool.mkdir(exist_ok=True)
     record = SimpleNamespace(
@@ -142,16 +139,21 @@ def reader(
         return handle(request)
 
     client = ExecutionStorage(spool, seam(recorded), {})
-    models = {name: _derive_model(QuantizationSource, ref[0]) for name, ref in references.items()}
+    sources: dict[str, Weights[Any]] = {name: Weights(ref[0]) for name, ref in references.items()}
     attempt = Attempt(record.request_id, spool)
-    service = WeightsReader(
-        attempt,
-        models,
-        lambda source: client.source(source.checkpoint_ref),
-        lambda: bool(record.canceling),
-        read_values_into,
+    deadline = time.monotonic() + 600
+    ctx = Context(record.request_id, deadline, _cancel=lambda: bool(record.canceling))
+    inv = Invocation(
+        record.request_id,
+        spool,
+        deadline,
+        sources=sources,
+        tensorfs_source=client.source,
+        weights_values=read_values_into,
     )
-    return service, models, broker, record, attempt, frames
+    handles = ExitStack()
+    _bind_tensorfs(ctx, attempt, inv, cast(Surface, SimpleNamespace(weights_outputs=())), handles)
+    return sources, broker, record, attempt, handles, frames
 
 
 @pytest.mark.parametrize("changed_role", ["data", "scale"])
@@ -179,38 +181,39 @@ def test_inherited_identity_and_changed_scale_use_native_read_custody(
         changed["roles"]["data"] = {**data, "bytes": bytes(payload)}
         changed_expected.flat[0] = np.frombuffer(scale["bytes"], dtype="<f4")[0]
     candidate = model(store, "candidate", {"changed": changed}, original)
-    service, models, broker, _, attempt, frames = reader(
+    sources, broker, _, attempt, handles, frames = reader(
         tmp_path, store, {"reference": original, "candidate": candidate}
     )
-    with service.open(models["reference"]) as ref, service.open(models["candidate"]) as cand:
-        assert ref.components() == ("model",)
-        assert ref.keys("model") == ("inherited", "changed")
-        assert ref.identity("model", "inherited") == cand.identity("model", "inherited")
-        assert all(isinstance(frame, WriterSource) for frame in frames)
-        assert ref.identity("model", "changed") != cand.identity("model", "changed")
-        for role, facts in encoded["roles"].items():
-            original_part = bytearray(len(facts["bytes"]))
-            changed_part = bytearray(len(changed["roles"][role]["bytes"]))
-            ref.read_part_into("model", "changed", role, 0, original_part)
-            cand.read_part_into("model", "changed", role, 0, changed_part)
-            assert original_part == facts["bytes"]
-            assert changed_part == changed["roles"][role]["bytes"]
-        if importlib.util.find_spec("torch") is not None:
-            left = np.empty(expected.shape, dtype=np.float32)
-            right = np.empty_like(left)
-            ref.read_values_into("model", "changed", 0, left)
-            cand.read_values_into("model", "changed", 0, right)
-            np.testing.assert_array_equal(left.view(np.uint32), expected.view(np.uint32))
-            np.testing.assert_array_equal(right, changed_expected)
+    ref, cand = sources["reference"], sources["candidate"]
+    assert ref.components() == ("model",)
+    assert ref.keys("model") == ("inherited", "changed")
+    assert ref.identity("model", "inherited") == cand.identity("model", "inherited")
+    assert all(isinstance(frame, WriterSource) for frame in frames)
+    assert ref.identity("model", "changed") != cand.identity("model", "changed")
+    for role, facts in encoded["roles"].items():
+        original_part = bytearray(len(facts["bytes"]))
+        changed_part = bytearray(len(changed["roles"][role]["bytes"]))
+        ref.read_into("model", "changed", role, 0, original_part)
+        cand.read_into("model", "changed", role, 0, changed_part)
+        assert original_part == facts["bytes"]
+        assert changed_part == changed["roles"][role]["bytes"]
+    if importlib.util.find_spec("torch") is not None:
+        left = np.empty(expected.shape, dtype=np.float32)
+        right = np.empty_like(left)
+        ref.read_values_into("model", "changed", 0, left)
+        cand.read_values_into("model", "changed", 0, right)
+        np.testing.assert_array_equal(left.view(np.uint32), expected.view(np.uint32))
+        np.testing.assert_array_equal(right, changed_expected)
+    attempt.closed = True
+    with pytest.raises(CapabilityError) as escaped:
+        ref.identity("model", "inherited")
+    assert escaped.value.code == "escaped_handle"
+    handles.close()
     broker.close()
     assert not broker.sources
-    with pytest.raises(CapabilityError):
+    with pytest.raises(CapabilityError) as unbound:
         ref.identity("model", "inherited")
-    with pytest.raises(CapabilityError):
-        service.open(_derive_model(QuantizationSource, original[0]))
-    attempt.closed = True
-    with pytest.raises(CapabilityError):
-        service.open(models["reference"])
+    assert unbound.value.code == "weights_source_ungranted"
 
 
 @pytest.mark.parametrize(
@@ -228,8 +231,9 @@ def test_logical_ranges_match_banked_format_vectors(
     store = tensorfs.Store.init(tmp_path / "store")
     row, expected = vector(filename, encoding)
     reference = model(store, filename, {"weight": row})
-    service, models, _, _, _, _ = reader(tmp_path, store, {"source": reference})
-    with service.open(models["source"]) as view:
+    sources, _, _, _, handles, _ = reader(tmp_path, store, {"source": reference})
+    view = sources["source"]
+    with handles:
         for offset, count in [(0, expected.size), (3, 71), (31, 35), (expected.size - 3, 3)]:
             target = np.empty(count, dtype=np.float32)
             view.read_values_into("model", "weight", offset, target)
@@ -256,8 +260,9 @@ def test_plain_bf16_fp16_and_scalar_reads(tmp_path: Path) -> None:
             "scalar": plain(np.array(3.5, dtype=np.float32)),
         },
     )
-    service, models, _, _, _, _ = reader(tmp_path, store, {"source": reference})
-    with service.open(models["source"]) as view:
+    sources, _, _, _, handles, _ = reader(tmp_path, store, {"source": reference})
+    view = sources["source"]
+    with handles:
         for key in ("bf16", "fp16"):
             output = np.empty(4, dtype=np.float32)
             view.read_values_into("model", key, 0, output)
@@ -270,8 +275,13 @@ def test_plain_bf16_fp16_and_scalar_reads(tmp_path: Path) -> None:
 def test_foreign_stale_canceled_and_released_views_refuse(tmp_path: Path) -> None:
     store = tensorfs.Store.init(tmp_path / "store")
     reference = model(store, "scope", {"weight": plain(np.arange(16, dtype=np.float32))})
-    service, models, broker, record, _, _ = reader(tmp_path, store, {"source": reference})
-    view = service.open(models["source"])
+    sources, broker, record, _, _, _ = reader(tmp_path, store, {"source": reference})
+    view = sources["source"]
+    record.spec["inputs"][0]["length"] += 1
+    with pytest.raises(tensorfs.errors.Refusal):
+        view.components()
+    record.spec["inputs"][0]["length"] -= 1
+    assert view.components() == ("model",)
     assert len(broker.sources) == 1
     with pytest.raises(CapabilityError) as retired:
         decode({"kind": "weights_writer", "operation": "check", "view_id": "foreign"})
@@ -279,20 +289,16 @@ def test_foreign_stale_canceled_and_released_views_refuse(tmp_path: Path) -> Non
     assert len(broker.sources) == 1
     ungranted = broker.handle(record, WriterSource(manifest="sha256:" + "ff" * 32))
     assert isinstance(ungranted, Answer) and not ungranted.ok
-    record.spec["inputs"][0]["length"] += 1
-    with pytest.raises(tensorfs.errors.Refusal):
-        service.open(models["source"])
-    record.spec["inputs"][0]["length"] -= 1
     record.canceling = "requested"
     broker.close_attempt(record)
     assert not broker.sources
     with pytest.raises(Cancelled):
         view.identity("model", "weight")
-    record.canceling = ""
-    view = service.open(models["source"])
+    again, broker, record, _, _, _ = reader(tmp_path, store, {"source": reference})
+    again["source"].components()
     broker.close_attempt(record)
     with pytest.raises((EOFError, OSError, tensorfs.errors.Refusal)):
-        view.read_part_into("model", "weight", "value", 0, bytearray(4))
+        again["source"].read_into("model", "weight", "value", 0, bytearray(4))
 
 
 def test_ragged_mxfp8_and_partial_final_block(tmp_path: Path) -> None:
@@ -308,8 +314,9 @@ def test_ragged_mxfp8_and_partial_final_block(tmp_path: Path) -> None:
     }
     expected = np.array([1] * 32 + [2] * 3 + [0.5] * 32 + [4] * 3, dtype=np.float32)
     ref = model(store, "ragged", {"weight": row})
-    service, models, _, _, _, _ = reader(tmp_path, store, {"source": ref})
-    with service.open(models["source"]) as view:
+    sources, _, _, _, handles, _ = reader(tmp_path, store, {"source": ref})
+    view = sources["source"]
+    with handles:
         for offset, count in [(0, 70), (31, 8), (67, 3)]:
             target = np.empty(count, dtype=np.float32)
             view.read_values_into("model", "weight", offset, target)
@@ -319,7 +326,7 @@ def test_ragged_mxfp8_and_partial_final_block(tmp_path: Path) -> None:
 def test_missing_or_corrupt_native_header_cannot_open_a_view(tmp_path: Path) -> None:
     store = tensorfs.Store.init(tmp_path / "store")
     ref = model(store, "corrupt", {"weight": plain(np.arange(16, dtype=np.float32))})
-    service, models, broker, _, _, _ = reader(tmp_path, store, {"source": ref})
+    sources, broker, _, _, _, _ = reader(tmp_path, store, {"source": ref})
     header = store.manifest(ref[0])["header"]
     assert header is not None
     files = [
@@ -332,12 +339,12 @@ def test_missing_or_corrupt_native_header_cannot_open_a_view(tmp_path: Path) -> 
     path.chmod(0o600)
     path.write_bytes(header[:-1] + bytes([header[-1] ^ 1]))
     with pytest.raises(tensorfs.errors.Refusal):
-        service.open(models["source"])
+        sources["source"].components()
     broker.close()
     assert not broker.sources
     assert not path.exists(), "native verification must quarantine the corrupt header"
     with pytest.raises(tensorfs.errors.Refusal):
-        service.open(models["source"])
+        sources["source"].components()
     broker.close()
     assert not broker.sources
 
@@ -345,31 +352,33 @@ def test_missing_or_corrupt_native_header_cannot_open_a_view(tmp_path: Path) -> 
 def test_source_descriptor_is_bound_to_the_accepted_digest(tmp_path: Path) -> None:
     store = tensorfs.Store.init(tmp_path / "store")
     reference = model(store, "digest-bound", {"weight": plain(np.arange(16, dtype=np.float32))})
-    service, models, broker, record, _, _ = reader(tmp_path, store, {"source": reference})
-    view = service.open(models["source"])
+    sources, broker, record, _, handles, _ = reader(tmp_path, store, {"source": reference})
+    view = sources["source"]
     view.identity("model", "weight")
     record.digest = b"\x32" * 32
     try:
         with pytest.raises(tensorfs.errors.Refusal) as refused:
-            view.read_part_into("model", "weight", "value", 0, bytearray(4))
+            view.read_into("model", "weight", "value", 0, bytearray(4))
         assert refused.value.code == "weights_writer_closed"
     finally:
-        view.close()
+        handles.close()
         broker.close()
 
 
 def test_source_handle_limit_refuses_before_exhausting_worker_descriptors(tmp_path: Path) -> None:
     store = tensorfs.Store.init(tmp_path / "store")
     reference = model(store, "bounded-handles", {"weight": plain(np.arange(16, dtype=np.float32))})
-    service, models, broker, _, _, _ = reader(tmp_path, store, {"source": reference})
-    views = [service.open(models["source"]) for _ in range(16)]
+    sources, broker, _, _, handles, _ = reader(
+        tmp_path, store, {f"source{index}": reference for index in range(17)}
+    )
     try:
+        for index in range(16):
+            sources[f"source{index}"].components()
         with pytest.raises(CapabilityError) as refused:
-            service.open(models["source"])
+            sources["source16"].components()
         assert refused.value.code == "weights_reader_bounds"
-        assert sum(len(sources) for sources in broker.sources.values()) == 16
+        assert sum(len(opened) for opened in broker.sources.values()) == 16
     finally:
-        for view in views:
-            view.close()
+        handles.close()
         broker.close()
     assert not broker.sources

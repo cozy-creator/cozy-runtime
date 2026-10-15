@@ -1,4 +1,4 @@
-"""The author-facing surface — the ONLY cozy-runtime package/job code imports.
+"""The author-facing surface — the ONLY cozy-runtime package code imports.
 
 Structural fence (cozy-runtime.md §7, boundaries.md): this package may import schema and
 typing libraries and the pure canonical-JSON facade only. It cannot import

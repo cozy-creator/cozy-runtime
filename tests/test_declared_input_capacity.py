@@ -36,7 +36,7 @@ class Result(msgspec.Struct):
 @app.entrypoint
 def read(payload: Request) -> Result:
     return Result([len(payload.declared.read_bytes()), len(payload.ordinary.read_bytes())])
-@app.job(accelerator=False)
+@app.entrypoint(accelerator=False)
 def job(payload: Request) -> Result:
     return read(payload)
 """

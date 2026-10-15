@@ -175,7 +175,7 @@ class Context:
         its GPUs until it returns. A GPU call awaited later waits in line at this request's
         original priority (its acceptance) and never takes GPUs back from whoever got them
         meanwhile. Idempotent. Where there is no allocation to end (a request with no GPU
-        calls, a nested job, or a GPU handler, whose GPU ends when it returns) it does nothing.
+        calls, a child call, or a GPU handler, whose GPU ends when it returns) it does nothing.
         """
         if self._release_gpus is not None:
             self._release_gpus()

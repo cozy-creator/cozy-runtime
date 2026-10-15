@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import msgspec
 
@@ -153,7 +153,7 @@ def _selection(structure: SourceInspection, plan: QuantizationPlan) -> ArtifactQ
 async def quantize(
     ctx: Context,
     *,
-    source: Weights,
+    source: Weights[Any],
     plan: QuantizationPlan,
     encoding: str,
     tel: Telemetry,

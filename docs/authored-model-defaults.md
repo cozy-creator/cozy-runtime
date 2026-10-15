@@ -35,7 +35,7 @@ Existing synchronous entrypoints can use the same declaration directly:
 def ref2va(payload: Request, model: H3Model) -> VideoResult: ...
 ```
 
-`app.job` also accepts the same keyword. Declare defaults on only one registration layer;
+Declare defaults on only one registration layer;
 putting nonempty defaults on both `invocable` and its App registration refuses. The package
 can share one literal ladder constant between its functions. Model references are metadata,
 never executor-side lookups. A ladder admits 1 through 32 GPU selectors, with an optional

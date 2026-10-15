@@ -68,7 +68,7 @@ class Result(msgspec.Struct):
     video: Annotated[Tree, AssetBound(max_bytes=268435456)]
     prefix: Annotated[Tree, AssetBound(max_bytes=268435456)]
 app = App()
-@app.job(accelerator=False)
+@app.entrypoint(accelerator=False)
 def assemble(payload: Request, media: MediaDecoder) -> Result:
     raise RuntimeError("describe only")
 """)
@@ -84,7 +84,7 @@ def test_lower_aggregate_stops_the_author_before_a_second_large_copy(tmp_path: P
     (source / "payload").write_bytes(b"01234567")
     app = App()
 
-    @app.job(accelerator=False)
+    @app.entrypoint(accelerator=False)
     def write(payload: Request, out: Outputs) -> Pair:
         return Pair(out.save_tree(source), out.save_tree(source))
 

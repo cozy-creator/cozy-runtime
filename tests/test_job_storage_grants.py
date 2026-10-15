@@ -1,4 +1,4 @@
-"""Installed full TensorFS does not give a managed job source or output authority."""
+"""Installed full TensorFS does not give a function source or output authority."""
 
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ class Request(msgspec.Struct):
     use_output: bool
 class Result(msgspec.Struct):
     code: str
-@app.job(accelerator=False, weights=(WeightsOutput("model", max_new_bytes=4096),))
+@app.entrypoint(accelerator=False, weights=(WeightsOutput("model", max_new_bytes=4096),))
 def compute(payload: Request, ctx: Context) -> Result:
     if not payload.use_output:
         return Result("no-storage-needed")

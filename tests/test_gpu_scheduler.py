@@ -23,7 +23,6 @@ def test_mixed_degree_declarations_are_refused_when_the_interface_is_built() -> 
     with pytest.raises(ConformanceError) as refused:
         package_interface.callable_doc(
             name="marco",
-            kind="entrypoint",
             payload_type=dict,
             result_type=dict,
             models=[{**slot, "sequence_parallel": {"degrees": [2, 4]}}, slot],

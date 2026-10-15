@@ -28,7 +28,6 @@ class _Result(msgspec.Struct):
 def _surface() -> Surface:
     return Surface(
         name="assemble",
-        kind="entrypoint",
         fn=lambda: None,
         is_async=False,
         params=(),

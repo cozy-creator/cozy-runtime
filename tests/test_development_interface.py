@@ -39,18 +39,18 @@ async def twice(ctx: Context, *, value: int) -> Result:
     return Result(value * 2)
 
 
-app.job(twice, accelerator=False)
+app.entrypoint(twice, accelerator=False)
 """
 
 
 def test_conformance_compares_what_a_source_reading_can_know(tmp_path: Path) -> None:
-    """The import states a memoized job's installed operation identity; source never can."""
+    """The import states a memoized function's installed operation identity; source never can."""
     (tmp_path / "package.toml").write_text('[application]\nobject = "memo_conformance:app"\n')
     (tmp_path / "memo_conformance.py").write_text(PACKAGE)
     static = static_interface.build(tmp_path)
     imported = package_interface.build(discover(tmp_path))
-    job = imported["jobs"][0]["invocable"]
-    assert job["memoize"] and job["operation_identity"].startswith("sha256:")
+    twice = next(row for row in imported["entrypoints"] if row["name"] == "twice")["invocable"]
+    assert twice["memoize"] and twice["operation_identity"].startswith("sha256:")
     with pytest.raises(package_interface.StalePackageInterface, match="operation_identity"):
         package_interface.compare(static, imported, ("source", "import"))
     package_interface.compare(
