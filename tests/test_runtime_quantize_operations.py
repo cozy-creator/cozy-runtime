@@ -125,7 +125,11 @@ def test_builtin_interface_is_static_and_matches_its_actual_app() -> None:
             {},
         )
     )
-    assert package_interface.canonical_bytes(static) == package_interface.canonical_bytes(actual)
+    source = package_interface.source_facts(actual)
+    assert package_interface.canonical_bytes(static) == package_interface.canonical_bytes(source)
+    # Not memoized, but a writer: its identity keys TensorFS derivation replay.
+    (installed,) = typing.cast(list[dict[str, Any]], actual["entrypoints"])
+    assert installed["invocable"]["operation_identity"].startswith("sha256:")
     (row,) = typing.cast(list[dict[str, Any]], static["entrypoints"])
     assert row["name"] == "quantize" and row["accelerator"] is False
     assert row["models"][0]["weights"] is True

@@ -41,7 +41,8 @@ TIMEOUT = 600
 
 
 def _imported(project: Path) -> bytes:
-    return package_interface.canonical_bytes(package_interface.build(discover(project)))
+    built = package_interface.build(discover(project))
+    return package_interface.canonical_bytes(package_interface.source_facts(built))
 
 
 def _static(project: Path) -> bytes:

@@ -319,8 +319,13 @@ def uses_components(
             )
         _check_signature(fn)
         wrapper = _async_wrapper(fn, components) if _is_async(fn) else _sync_wrapper(fn, components)
-        if memoize or memo_version is not None or memo_dependencies:
-            declare(fn, memoize=memoize, version=memo_version, dependencies=memo_dependencies)
+        if not memoize and (memo_version is not None or memo_dependencies):
+            raise ConformanceError(
+                "a stage's memo_version and memo_dependencies need memoize=True",
+                code="invocable_memoize",
+            )
+        if memoize:
+            declare(fn, version=memo_version, dependencies=memo_dependencies)
             wrapper = memoized(fn, wrapper, components, is_async=_is_async(fn))
         declared: _Declared = cast("_Declared", wrapper)
         declared.__uses_components__ = components

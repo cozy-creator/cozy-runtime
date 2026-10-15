@@ -7,6 +7,7 @@ from typing import Annotated, Any
 from cozy_runtime.author import (
     AssetBound,
     Context,
+    MemoDistribution,
     ModelArtifact,
     Telemetry,
     Tree,
@@ -42,7 +43,7 @@ async def describer_normalize(
     raise NotImplementedError
 
 
-@invocable
+@invocable(memo_dependencies=("cozy_runtime.derive.facade", MemoDistribution("tensorfs")))
 async def sdxl_fp8(
     ctx: Context,
     *,
