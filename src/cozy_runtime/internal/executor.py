@@ -84,6 +84,7 @@ from cozy_runtime.author._errors import (
     InvalidRequest,
     Outcome,
     classify,
+    ends,
     is_device_oom,
 )
 from cozy_runtime.author._executor_requests import (
@@ -3189,7 +3190,7 @@ class Executor:
             return {
                 "ok": False,
                 "code": outcome.code,
-                "detail": outcome.message[:1024],
+                "detail": ends(outcome.message, 1024),
                 "terminal": outcome.terminal,
                 "origin": outcome.origin,
                 "fields": list(outcome.fields),
@@ -3479,7 +3480,7 @@ class Executor:
             "terminal": outcome.terminal,
             "origin": outcome.origin,
             "code": outcome.code,
-            "message": outcome.message[:2048],
+            "message": ends(outcome.message, 2048),
             "fields": list(outcome.fields),
             "traceback": outcome.traceback,
         }
@@ -4709,7 +4710,7 @@ class Executor:
                 "terminal": "failed",
                 "origin": first.origin,
                 "code": first.code,
-                "message": message[:2048],
+                "message": ends(message, 2048),
                 "fields": list(first.fields),
                 "traceback": first.traceback or later.traceback,
             },
