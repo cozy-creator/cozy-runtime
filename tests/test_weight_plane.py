@@ -37,6 +37,7 @@ from cozy_runtime.internal.fill import Checkpoint  # noqa: E402
 from cozy_runtime.internal.weights import (  # noqa: E402
     INDIVISIBLE,
     HostTiers,
+    Journal,
     PlaneBackend,
     ResidencyRefusal,
     WeightResidency,
@@ -2036,6 +2037,36 @@ def test_an_image_decode_short_of_memory_is_still_the_untiled_image(tmp_path: Pa
     assert "host memory" in weights.modes["bands"]
     for image in (roomy, short):
         torch.testing.assert_close(image, reference, atol=1e-2, rtol=0)
+
+
+@on_gpu
+def test_a_banded_result_out_of_memory_inside_a_nested_recovery_lives_in_host_memory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Run 6191 (qwen-image-2 at 4 MP): a block's recovery runs inside the call's. A banded
+    op's result, which the room said would fit, ran out of memory, and the call's recovery,
+    taking the bands' own allocation for the package's op, refused it. The bands' ops reach
+    no mode: the result goes to host memory and the image is the untiled one."""
+    weights = Weights(torch, torch.device("cuda", 0), "cuda")
+    weights.set_budget(-1, pinned=1 << 30)
+    model, plain = plane_vae(weights, tmp_path / "vae", kl_vae)
+    z = torch.randn(1, 4, 256, 256, device="cuda", dtype=torch.float16)
+    with torch.inference_mode():
+        reference = plain.decode(z).sample
+    del plain
+    monkeypatch.setattr(weights, "activation_room", lambda: (1 << 40, 0))  # every result fits
+    weights.modes.clear()
+    weights.set_cap(room(weights, 96 << 20))
+    model.residency.admit("run", ("vae",))
+    try:
+        with weights.recovering(), weights.recovering(Journal()), torch.inference_mode():
+            image = model.stack.decode(z).sample
+    finally:
+        model.residency.release("run", ("vae",))
+        weights.set_cap(-1)
+        torch.cuda.empty_cache()
+    assert "host memory" in weights.modes["bands"]
+    torch.testing.assert_close(image, reference, atol=1e-2, rtol=0)
 
 
 @on_gpu
