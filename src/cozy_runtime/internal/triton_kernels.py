@@ -261,3 +261,18 @@ def load(kernels: TritonKernels, *, device: object) -> Launch:
         names[entry.kernel.__name__] = tuple(sorted(entry.constexprs))
     launcher = _LOADED[(kernels.name, index)] = _Launcher(arch, compiled, names)
     return launcher
+
+
+def ready(kernels: TritonKernels, *, device: object) -> Launch | None:
+    """`load`, when this machine's build of `kernels` for `device` is done; None while it
+    compiles (started here when nobody had). Never waits."""
+    _require_triton()
+    target = torch.device(device)
+    if target.type != "cuda":
+        raise KernelsUnavailable("kernels_absent", f"{kernels.name} serves CUDA, not {target}")
+    if (kernels.name, target.index or 0) in _LOADED:
+        return _LOADED[(kernels.name, target.index or 0)]
+    major, minor = torch.cuda.get_device_capability(target.index or 0)
+    if kernel_compile.submit(_store(), job(kernels, major * 10 + minor)).state == "compiling":
+        return None
+    return load(kernels, device=device)

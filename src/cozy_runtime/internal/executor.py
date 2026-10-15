@@ -124,7 +124,7 @@ from cozy_runtime.author._services import Attempt as AuthorAttempt
 from cozy_runtime.author._services import CheckpointConflict, ProgressFrame
 from cozy_runtime.author._split import install as install_pieces
 from cozy_runtime.author.kernels import _SETS as KERNEL_SETS
-from cozy_runtime.author.kernels import Launch, Plan
+from cozy_runtime.author.kernels import Launch, Plan, TritonKernels
 from cozy_runtime.internal import (
     accel,
     attention,
@@ -659,6 +659,8 @@ class Executor:
         self.attention_defaults = attention.Snapshot(())
         #: this construction's selection, made again between requests (`_upgrade_attention`)
         self._reselect: Callable[[], attention.Applied] | None = None
+        #: kernel installs waiting for their build (`Plan.when_ready`), tried between requests
+        self._installs: list[tuple[Callable[[], Launch | None], Callable[[Launch], None]]] = []
         #: Device facts for this prepared generation, reused for per-request pin checks.
         self.device_facts: Any = None
         #: a follower's hold of rank 0's attention selection for the current attempt
@@ -1728,11 +1730,7 @@ class Executor:
         try:
             entries = _sealed_entries()
             if isolated:
-                modules = {
-                    entry.kernel.fn.__module__
-                    for name in sets
-                    for entry in KERNEL_SETS[name].entries
-                }
+                modules = set().union(*(KERNEL_SETS[name].modules for name in sets))
                 return zygote.expect_kernels(entries, sorted(modules))
             archs = sorted({accel.device_capability(entry) for entry in entries} - {0})
             built = importlib.import_module("cozy_runtime.internal.triton_kernels")
@@ -1745,15 +1743,32 @@ class Executor:
             return f"kernel compiles not started: {type(exc).__name__}: {exc}"[:300]
 
     def _execution_plan(
-        self, model: Model[object], torch: object, load: Callable[..., Launch]
+        self,
+        model: Model[object],
+        torch: object,
+        load: Callable[..., Launch],
+        ready: Callable[..., Launch | None],
     ) -> str:
         """The model's own execution plan on its filled components, on this GPU: its
         identity, "" when it installs none. A raise refuses the construction, typed."""
         if type(model).execution_plan is Model.execution_plan:
             return ""
         device = self._rank_device(torch)
+
+        def when_ready(kernels: TritonKernels, install: Callable[[Launch], None]) -> bool:
+            launch = (
+                load(kernels, device=device) if self.world > 1 else ready(kernels, device=device)
+            )
+            if launch is None:
+                self._installs.append((functools.partial(ready, kernels, device=device), install))
+                return False
+            install(launch)
+            return True
+
         try:
-            identity = model.execution_plan(Plan(device, functools.partial(load, device=device)))
+            identity = model.execution_plan(
+                Plan(device, functools.partial(load, device=device), when_ready)
+            )
         except Exception as exc:
             code = getattr(exc, "code", "")
             raise _PlanRefusal(
@@ -2172,6 +2187,7 @@ class Executor:
             resolve,
         )
         from cozy_runtime.internal.triton_kernels import load as load_kernels
+        from cozy_runtime.internal.triton_kernels import ready as kernels_ready
 
         stage("runtime_imports")
         _restore_seal()
@@ -2535,7 +2551,7 @@ class Executor:
             return {"ok": False, "code": exc.code, "detail": str(exc).splitlines()[0][:900]}
         try:
             # THE MODEL'S OWN EXECUTION PLAN: its fused kernels, glue and hooks.
-            planned = self._execution_plan(model, torch, load_kernels)
+            planned = self._execution_plan(model, torch, load_kernels, kernels_ready)
             roots = backend.roots
             stage("execution_plan")
             # THE FASTEST KERNEL THIS DEVICE AND IMAGE SUPPORT, PINNED POST-FILL (cr-124),
@@ -3150,6 +3166,7 @@ class Executor:
         # and the worker reports a run none of whose calls applied it.
         pin = requested if requested and self._attention_reaches(requested) else ""
         self._upgrade_attention()
+        self._install_ready_kernels()
         try:
             swap = self._attention_plan(pin) if pin else None
             self._restore_attention()
@@ -3528,6 +3545,21 @@ class Executor:
         ):
             return None
         return attention.plan(self._attention_device(pin), roots, pin, self.world)
+
+    def _install_ready_kernels(self) -> None:
+        """Between requests: each execution plan's install whose kernels finished compiling
+        since (`Plan.when_ready`). One that fails leaves its construction serving as it was."""
+        for executor in self.model_executors or [self]:
+            waiting, executor._installs = executor._installs, []
+            for ready, install in waiting:
+                try:
+                    launch = ready()
+                    if launch is None:
+                        executor._installs.append((ready, install))
+                    else:
+                        install(launch)
+                except Exception as exc:  # an upgrade is never worth a failed run
+                    print(f"[kernels] deferred install refused: {exc}"[:600], file=sys.stderr)
 
     def _upgrade_attention(self) -> bool:
         """A RUN WITHOUT AN OVERRIDE NEVER WAITS FOR A COMPILE: at each step or stage boundary

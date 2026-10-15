@@ -31,6 +31,17 @@ sequence parallelism, outside the construction guards. Install fused forwards an
 here; return the plan's identity (`""` for none), which enters the generation's identity
 and the prepare's `execution_plan` fact. A raise refuses the construction with its `code`.
 
+## Fused DiT blocks — `cozy_runtime.fusion`
+
+A package declares its single-stream adaLN block once, at module scope (`DiTBlock`: block class,
+widths, norms, a `modulation(block, arguments)` hook giving per-token adaLN rows, gate
+activation, attention arguments, `Rope` layout, `GatedMLP`), and installs it in its plan:
+`return fusion.install(plan, BLOCK, transformer)`. Runtime owns the Triton kernels (norm +
+modulate, gated residual + norm + modulate, gated residual, SwiGLU, per-head RMSNorm + RoPE),
+compiles them at executor boot and substitutes the fused forward; every GEMM stays the model's
+module. Eager serves until the build is loaded (`Plan.when_ready`), and wherever the layout,
+dtype or device does not match. qwen-image-2 is the reference user.
+
 ## Attention producers — `AttentionProducer`, `register_attention`
 
 A package's own attention call, selectable by name (`choose_attention`, `--attention-kernel`)
