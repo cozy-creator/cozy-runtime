@@ -12,6 +12,7 @@ from cozy_runtime.derive import quantization
 from cozy_runtime.internal.encoding import (
     SPEC_INT8_CONVROT256,
     SPEC_MXFP8,
+    SPEC_NVFP4,
     SPEC_PLAIN,
     SPEC_ROWWISE,
     SPEC_ROWWISE_KEEPDIM,
@@ -45,6 +46,7 @@ def test_every_provider_is_reviewed_against_the_exact_tensorfs_03_seed() -> None
         SPEC_SCALED_SCALAR_WEIGHT_ONLY,
         SPEC_MXFP8,
         SPEC_INT8_CONVROT256,
+        SPEC_NVFP4,
     }
     # TensorFS before 0.9.2 carries no int8-convrot256/1; that one provider is then not served.
     assert reviewed - {SPEC_INT8_CONVROT256} <= set(seeds)
@@ -54,6 +56,7 @@ def test_every_provider_is_reviewed_against_the_exact_tensorfs_03_seed() -> None
         SPEC_ROWWISE,
         SPEC_MXFP8,
         SPEC_INT8_CONVROT256,
+        SPEC_NVFP4,
     }
 
     providers = launch_providers()
@@ -63,8 +66,11 @@ def test_every_provider_is_reviewed_against_the_exact_tensorfs_03_seed() -> None
         for implementations in providers.values()
         for provider in implementations
     )
+    # nvfp4's three other role sets (input_scale, pre_quant_scale) have no mined vectors.
     unsupported = {
-        digest for digest, alias in seeds.items() if alias in {"svdq-microscale/1", "nvfp4-w4a4/1"}
+        digest
+        for digest, alias in seeds.items()
+        if alias == "svdq-microscale/1" or (alias == "nvfp4-w4a4/1" and digest != SPEC_NVFP4)
     }
     assert unsupported and unsupported.isdisjoint(providers)
 
@@ -79,6 +85,7 @@ def test_reviewed_roles_and_vector_bytes_did_not_move() -> None:
         SPEC_SCALED_SCALAR_WEIGHT_ONLY: ({"data", "weight_scale"}, {"input_scale"}),
         SPEC_MXFP8: ({"data", "scale"}, set()),
         SPEC_INT8_CONVROT256: ({"data", "scale"}, set()),
+        SPEC_NVFP4: ({"weight", "weight_scale", "weight_scale_2"}, set()),
     }
     for digest, implementations in providers.items():
         required, optional = expected_roles[digest]

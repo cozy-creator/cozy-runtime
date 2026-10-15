@@ -223,7 +223,7 @@ def _require_2d(key: str, values: np.ndarray, block: int) -> tuple[int, int]:
 NVFP4_BLOCK = 16
 
 
-def encode_nvfp4(key: str, values: np.ndarray) -> Encoded:
+def encode_nvfp4(key: str, values: np.ndarray, amax: float | None = None) -> Encoded:
     """The two-level NVFP4 scheme, in the border's `nvfp4-w4a4/1` base-variant layout.
 
     REFERENCE. The scheme is NVIDIA's NVFP4 as exported by TensorRT Model Optimizer and
@@ -244,7 +244,8 @@ def encode_nvfp4(key: str, values: np.ndarray) -> Encoded:
     """
     rows, cols = _require_2d(key, values, NVFP4_BLOCK)
     nb = cols // NVFP4_BLOCK
-    amax = float(np.max(np.abs(values))) if values.size else 0.0
+    if amax is None:  # a whole tensor; a row chunk is handed its tensor's amax
+        amax = float(np.max(np.abs(values))) if values.size else 0.0
     if not np.isfinite(amax):
         raise UnsupportedInput(f"{key!r} contains a non-finite weight — refuse, never encode")
     # An all-zero tensor has no scale to derive; 1.0 reproduces it exactly and keeps the
