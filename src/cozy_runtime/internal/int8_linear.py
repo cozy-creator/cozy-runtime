@@ -73,6 +73,7 @@ def kitchen(torch: ModuleType, index: int) -> ModuleType | None:
                 raise kernel_sources.Absent(f"comfy-kitchen sm{sm}: {built.line()}")
             site.addsitedir(str(Path(built.path) / kernel_cache.SITE))
         state.module = import_module("comfy_kitchen.backends.cuda")
+        print(f"[int8] comfy-kitchen CUTLASS int8 GEMM serves sm{sm}", file=sys.stderr)
     except Exception as exc:  # the eager path serves this process; said once
         state.final = f"{type(exc).__name__}: {exc}"[:300]
         print(f"[int8] eager int8 GEMM for this executor: {state.final}", file=sys.stderr)
