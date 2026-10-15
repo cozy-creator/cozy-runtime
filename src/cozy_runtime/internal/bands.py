@@ -234,6 +234,17 @@ class Bands:
             if rows.sources & written:
                 rows.whole()
 
+    def mark(self) -> set[int]:
+        """The pending results now (`forget`)."""
+        return set(self.live)
+
+    def forget(self, kept: set[int] | None) -> None:
+        """Results left pending since `mark` are dropped: a failed attempt made them."""
+        for key in [k for k in self.live if k not in (kept or ())]:
+            rows = self.live.pop(key)()
+            if rows is not None:
+                rows.plan = rows.base = None
+
     def _pending(self) -> list[Any]:
         return [rows for ref in list(self.live.values()) if (rows := ref()) is not None]
 
@@ -699,6 +710,8 @@ def _rows_type(torch: Any) -> type:
             return self.whole().__cuda_array_interface__
 
         def whole(self) -> Any:
+            if self.value is None and self.plan is None and self.base is None:
+                raise RuntimeError("a pending result of a failed attempt was read")
             if self.value is None:
                 with torch.utils._python_dispatch._disable_current_modes():
                     if self.base is not None:  # a view: the view of its base, computed

@@ -1682,9 +1682,13 @@ def _recovery_type(torch: ModuleType) -> type:
         def _run(self, func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
             journal = self.journal
             banded = self.weights.bands
+            # The bands' own ops (meta shapes, band reads) reach no mode: an enclosing
+            # recovery (a block's inside the call's) would take them for the package's.
+            quiet = torch.utils._python_dispatch._disable_current_modes
             if banded is not None:
                 try:
-                    out = banded.run(func, args, kwargs)
+                    with quiet():
+                        out = banded.run(func, args, kwargs)
                 except Exception as exc:
                     if not is_device_oom(exc):
                         raise
@@ -1718,7 +1722,8 @@ def _recovery_type(torch: ModuleType) -> type:
                     target.copy_(first)
                 if banded is not None:
                     try:  # out of memory whole: in bands of rows when it can be
-                        out = banded.run(func, args, kwargs, short=True)
+                        with quiet():
+                            out = banded.run(func, args, kwargs, short=True)
                     except Exception as exc:
                         if not is_device_oom(exc):
                             raise
@@ -3893,7 +3898,8 @@ class WeightResidency:
                         f"{component.name}.{region.path}",
                     )
                     continue
-                need, stale = 0, False
+                need, stale, done = 0, False, False
+                kept_pending = weights.bands.mark() if weights.bands is not None else None
                 try:
                     try:
                         # The plane's bind and bake are its own math, outside the block's
@@ -3910,6 +3916,7 @@ class WeightResidency:
                                 if weights.bands is not None and weights.bands.live:
                                     # a pending result may read this region's weights
                                     weights.bands.settle()
+                                done = True
                                 return out
                         finally:
                             weights.running.pop()
@@ -3919,6 +3926,9 @@ class WeightResidency:
                         need, refused = _room_for(exc, refused)
                         need = need or region.span
                 finally:
+                    if not done and weights.bands is not None:
+                        # what a failed attempt left pending reads what it rewinds or unbinds
+                        weights.bands.forget(kept_pending)
                     # Outside its lease only a stage-resident region stays bound: any other
                     # read finds the stand-in (`Weights.reading`), never a stale address.
                     if region.index not in component.resident:

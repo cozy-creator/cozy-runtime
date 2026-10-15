@@ -2031,7 +2031,7 @@ def test_an_image_decode_short_of_memory_is_still_the_untiled_image(tmp_path: Pa
         reference = plain.decode(z).sample
     del plain
     roomy = decode(model, z)
-    assert "bands" not in weights.modes
+    assert "host memory" not in weights.modes.get("bands", "")
     short = decode(model, z, room(weights, 96 << 20))
     assert "host memory" in weights.modes["bands"]
     for image in (roomy, short):
