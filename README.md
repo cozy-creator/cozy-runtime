@@ -337,6 +337,9 @@ refuses `component_unbound`.
 Known-next calls can [prepare their models in the background](docs/model-prefetch.md)
 with `prefetch(callee, models={...})` while another model runs, and a request done with its
 GPUs can [release them early](docs/gpu-release.md) with `ctx.release_gpus()`.
+Independent items go as one call each, awaited together (`asyncio.gather`): TensorD runs a
+request's calls on every GPU it holds, an idle GPU before a busy one and one call per GPU at a
+time, and keeps each executor warm for the request's later calls.
 The existing `package.toml [bindings."<callable>.models.<param>"]` remains the explicit local
 development binding; it is not copied into a package's published default.
 Each `WeightsOutput` declares only its name and new-byte ceiling;
