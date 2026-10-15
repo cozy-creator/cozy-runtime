@@ -38,19 +38,26 @@ class QuantizationSource(Model[object]):
         del loader
 
 
+class EncodingRule(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+    """Selected weights whose `component.key` matches `pattern` take `encoding`."""
+
+    pattern: str
+    encoding: str
+
+
 class QuantizationPlan(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     """Closed selection and source compatibility policy for generic quantization.
 
     `keys` names exact weights in every component; `include` instead selects the weights
     whose `component.key` matches one of its fnmatch patterns, each of which must match one.
-    Every other tensor keeps its source bytes. `encodings` are `(pattern, encoding)` pairs: a
-    selected weight matching a pattern (the first that does) takes that encoding instead of
-    the lane's, so one lane can carry, say, an nvfp4 DiT beside an int8 text encoder."""
+    Every other tensor keeps its source bytes. A selected weight matching an `encodings` rule
+    (the first that does) takes that rule's encoding instead of the lane's, so one lane can
+    carry, say, an nvfp4 DiT beside an int8 text encoder."""
 
     components: tuple[str, ...]
     keys: tuple[str, ...] = ()
     include: tuple[str, ...] = ()
-    encodings: tuple[tuple[str, str], ...] = ()
+    encodings: tuple[EncodingRule, ...] = ()
     selected_schema_digest: str | None = None
     source_order_digests: tuple[str, ...] = ()
     output_precision: Literal["normalize-f32-to-bf16", "preserve"] = "normalize-f32-to-bf16"
@@ -87,8 +94,8 @@ def _selection(
         or len(set(plan.source_order_digests)) != len(plan.source_order_digests)
         or (plan.keys and plan.include)
         or len(set(plan.include)) != len(plan.include)
-        or len({pattern for pattern, _ in plan.encodings}) != len(plan.encodings)
-        or any(name not in _ENCODINGS for _, name in plan.encodings)
+        or len({rule.pattern for rule in plan.encodings}) != len(plan.encodings)
+        or any(rule.encoding not in _ENCODINGS for rule in plan.encodings)
     ):
         raise UnsupportedInput(
             "quantization plan has invalid or repeated selections", code="quantization_plan"
@@ -136,15 +143,16 @@ def _selection(
     def encoding_of(component: str, key: str) -> str | None:
         name = f"{component}.{key}"
         return next(
-            (enc for pattern, enc in plan.encodings if fnmatch.fnmatchcase(name, pattern)), None
+            (rule.encoding for rule in plan.encodings if fnmatch.fnmatchcase(name, rule.pattern)),
+            None,
         )
 
     if plan.encodings and not pairs:
         raise UnsupportedInput("per-weight encodings need a selection", code="quantization_plan")
     unused = [
-        pattern
-        for pattern, _ in plan.encodings
-        if not any(fnmatch.fnmatchcase(f"{c}.{k}", pattern) for c, k in pairs)
+        rule.pattern
+        for rule in plan.encodings
+        if not any(fnmatch.fnmatchcase(f"{c}.{k}", rule.pattern) for c, k in pairs)
     ]
     if unused:
         raise UnsupportedInput(

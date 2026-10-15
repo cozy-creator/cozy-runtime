@@ -13,7 +13,7 @@ from cozy_runtime.author import Weights
 from cozy_runtime.author.fakes import fake_attempt, fake_telemetry
 from cozy_runtime.derive import safetensors_io as st
 from cozy_runtime.derive.microscale import encode_nvfp4
-from cozy_runtime.derive.operations import QuantizationPlan, quantize_into
+from cozy_runtime.derive.operations import EncodingRule, QuantizationPlan, quantize_into
 from cozy_runtime.internal.encoding import SPEC_NVFP4
 from native_weights import NativeExecution
 from test_derive_quantize_facade import BOUND, header, mint
@@ -50,7 +50,7 @@ def test_one_lane_carries_nvfp4_beside_int8(tmp_path: Path) -> None:
     plan = QuantizationPlan(
         components=("transformer", "text_encoder"),
         include=("transformer.blocks.*.weight", "text_encoder.layers.*.weight"),
-        encodings=(("transformer.*", ENCODING),),
+        encodings=(EncodingRule("transformer.*", ENCODING),),
         output_precision="preserve",
     )
     with NativeExecution(store, tmp_path, "nvfp4", {"source": source}, {"model": BOUND}) as owner:
