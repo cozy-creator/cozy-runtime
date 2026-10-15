@@ -103,6 +103,8 @@ class Bands:
             **dict.fromkeys((aten.group_norm, aten.native_group_norm), self._norm),
             **dict.fromkeys(rows, self._rows),
         }
+        #: each op seen, as `_kind` read it
+        self.kinds: dict[Any, tuple[Rule | None, bool, bool]] = {}
 
     def run(
         self, func: Any, args: tuple[Any, ...], kwargs: dict[str, Any], short: bool = False
@@ -110,35 +112,50 @@ class Bands:
         """`func(*args, **kwargs)` in bands, or NotImplemented: the op runs as it is. `short`:
         it just ran out of device memory whole."""
         last, self.last = self.last, None
-        packet = func.overloadpacket
-        rule = self.rules.get(packet)
-        if rule is None and self.pointwise in func.tags:
-            rule = self._rows
-        if rule is None or func._schema.is_mutable or self.seeded in func.tags:
+        kind = self.kinds.get(func)
+        if kind is None:
+            kind = self.kinds[func] = self._kind(func)
+        rule, padding, conv = kind
+        if rule is None:
             return NotImplemented
+        skips = conv and last is not None and args[0] is last.padded
+        if not (short or padding or skips or spill.HELD):
+            return NotImplemented  # whole, with room, nothing in host memory: as it is
         tensors = _tensors((args, kwargs))
         if any(hasattr(t, "__tensor_flatten__") for t in tensors):
             return NotImplemented  # a wrapper's ops are its own (a collective's, a DTensor)
         hosted = bool(spill.HELD) and any(map(spill.hosted, tensors))
-        if packet in self.pads and not (short or hosted):
-            return self._remember(func, args, kwargs)
-        plan = None
-        if packet in self.convs and last is not None and args[0] is last.padded:
-            plan = self._conv(func, args, kwargs, last)
-        if plan is None:
-            if not (short or hosted):
-                return NotImplemented
-            plan = rule(func, args, kwargs)
+        # The bands' own ops (meta shapes, band reads, a result's allocation) reach no mode: a
+        # recovery around the one that runs this would take them for the package's, and its
+        # refusal for a band's out-of-memory.
+        with self.torch.utils._python_dispatch._disable_current_modes():
+            if padding and not (short or hosted):
+                return self._remember(func, args, kwargs)
+            plan = self._conv(func, args, kwargs, last) if skips else None
             if plan is None:
-                return NotImplemented
-        self.rewrites += 1
-        if short or hosted:
-            out = self._banded(plan, (*args, *kwargs.values()))
-        else:  # a convolution skipping taps, with room for it whole
-            out = plan.band(0, int(plan.out.shape[plan.axis]))
-        if packet in self.pads:
-            self._zeros(func, out, args, kwargs)
-        return out if plan.finish is None else plan.finish(out)
+                if not (short or hosted):
+                    return NotImplemented
+                plan = rule(func, args, kwargs)
+                if plan is None:
+                    return NotImplemented
+            self.rewrites += 1
+            if short or hosted:
+                out = self._banded(plan, (*args, *kwargs.values()))
+            else:  # a convolution skipping taps, with room for it whole
+                out = plan.band(0, int(plan.out.shape[plan.axis]))
+            if padding:
+                self._zeros(func, out, args, kwargs)
+            return out if plan.finish is None else plan.finish(out)
+
+    def _kind(self, func: Any) -> tuple[Rule | None, bool, bool]:
+        """An op's rule (None: it never runs in bands), whether it pads, whether it convolves."""
+        packet = func.overloadpacket
+        rule = self.rules.get(packet)
+        if rule is None and self.pointwise in func.tags:
+            rule = self._rows
+        if func._schema.is_mutable or self.seeded in func.tags:
+            rule = None
+        return rule, packet in self.pads, packet in self.convs
 
     # -- placing and running bands
 

@@ -359,7 +359,6 @@ class Weights:
         #: (H3's turbo LoRA inside its DiT's) is placed with it, inside the one budget.
         self.open: list[tuple[WeightResidency, str, tuple[str, ...]]] = []
         self.residencies: weakref.WeakSet[WeightResidency] = weakref.WeakSet()
-        self._recovery: type | None = None
         #: one GPU of a group: a block's forward holds collectives the other GPUs are already
         #: in, so it can never run again; its ops recover one by one instead
         self.grouped = False
@@ -748,13 +747,12 @@ class Weights:
         """Run the caller's torch ops with out-of-memory recovery: an op that cannot allocate
         unmaps weights and runs again (a seeded op from its generator's state before it).
         With a `journal`, every write into a tensor that existed before is kept first, so the
-        whole call can be rewound and run again."""
+        whole call can be rewound and run again. Inside this plane's recovery it adds no
+        dispatch layer (`_noting`)."""
         if self.host_only:
             yield journal
             return
-        if self._recovery is None:
-            self._recovery = _recovery_type(self.torch)
-        with self._recovery(self, journal):
+        with _noting(self.torch, self, journal):
             yield journal
 
     def make_room(self, need: int, operands: Sequence[object], op: str = "") -> None:
@@ -1651,70 +1649,119 @@ def _observe_refusals(torch: ModuleType, weights: Weights) -> None:
     torch._C._cuda_attach_out_of_memory_observer(refused)
 
 
-def _recovery_type(torch: ModuleType) -> type:
+_OPS: dict[int, type] = {}
+
+
+class _Ops(Protocol):
+    weights: Weights | None
+    journals: list[Journal]
+
+
+def _innermost(torch: ModuleType) -> _Ops | None:
+    """The process's dispatch mode (`_ops_type`) when it is the innermost one."""
+    mode = torch.utils._python_dispatch._get_current_dispatch_mode()
+    return cast("_Ops", mode) if type(mode) is _OPS.get(id(torch)) else None
+
+
+@contextmanager
+def _noting(torch: ModuleType, weights: Weights | None, journal: Journal | None) -> Iterator[None]:
+    """Torch ops in this context recover (with `weights`) and are noted in `journal`. Directly
+    inside the process's dispatch mode (`_ops_type`), this joins it: every op still passes one
+    Python layer. A group GPU's block op passed three (the invoke's recovery, the call's
+    journal, the block's): +29 us per op, 0.16-0.5 s of CPU per H3 forward."""
+    kind = _OPS.get(id(torch))
+    if kind is None:
+        kind = _OPS[id(torch)] = _ops_type(torch)
+    mode = _innermost(torch)
+    if mode is None or weights not in (None, mode.weights):
+        with kind(weights), _noting(torch, None, journal):
+            yield
+        return
+    if journal is not None:
+        mode.journals.append(journal)
+    try:
+        yield
+    finally:
+        if journal is not None:
+            mode.journals.remove(journal)
+
+
+def _ops_type(torch: ModuleType) -> type:
     mode: type = torch.utils._python_dispatch.TorchDispatchMode
     seeded = torch.Tag.nondeterministic_seeded
     pointwise = torch.Tag.pointwise
+    #: op -> whether it draws from a generator, writes in place, is pointwise
+    traits: dict[Any, tuple[bool, bool, bool]] = {}
 
-    class Recovery(mode):  # type: ignore[misc]
-        """Every torch op: one that runs out of device memory runs again after weights were
-        unmapped for it (retry the op, never the run). A seeded op runs again from the
-        generator state it started from, one that writes in place from a copy of what it
-        writes into: never for a pointwise op, which allocates nothing and so fails before
-        it writes (a whole video's `div_` was copied, doubling it). With a journal, writes
-        into tensors that existed before are kept first, and the generators seeded ops draw
-        from are noted."""
+    class Ops(mode):  # type: ignore[misc]
+        """Every torch op, in one dispatch layer. With `weights`, one that runs out of device
+        memory runs again after weights were unmapped for it (retry the op, never the run): a
+        seeded op from the generator state it started from, one that writes in place from a
+        copy of what it writes into (never a pointwise op, which allocates nothing and so
+        fails before it writes: a whole video's `div_` was copied, doubling it). Each open
+        journal (a group call's, a block's) keeps what it writes into first and notes what it
+        makes and the generators it draws from; a call's journal also marks device progress."""
 
-        def __init__(self, weights: Weights, journal: Journal | None) -> None:
+        def __init__(self, weights: Weights | None) -> None:
             super().__init__()
             self.weights = weights
-            self.journal = journal
+            self.journals: list[Journal] = []
 
         def __torch_dispatch__(
             self, func: Any, types: Any, args: tuple[Any, ...] = (), kwargs: Any = None
         ) -> Any:
             kwargs = kwargs or {}
             out = self._run(func, args, kwargs)
-            spill.touch((*args, *kwargs.values(), out))
-            if self.journal is not None:
-                self.journal.made(out)
+            if spill.PRESSED[0]:
+                spill.touch((*args, *kwargs.values(), out))
+            for journal in self.journals:
+                journal.made(out)
+                if journal.marking:
+                    journal.ops += 1
+                    if journal.ops % MARK_EVERY == 0 and torch.cuda.is_initialized():
+                        mark = torch.cuda.Event()
+                        mark.record()
+                        journal.marks.append(mark)
             return out
 
         def _run(self, func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
-            journal = self.journal
-            banded = self.weights.bands
-            # The bands' own ops (meta shapes, band reads, a result's allocation) reach no
-            # mode: a recovery around this one (the call's, around a block's) would take
-            # them for the package's, and its refusal for a band's out-of-memory.
-            quiet = torch.utils._python_dispatch._disable_current_modes
+            weights, journals = self.weights, self.journals
+            banded = weights.bands if weights is not None else None
             if banded is not None:
                 try:
-                    with quiet():
-                        out = banded.run(func, args, kwargs)
+                    out = banded.run(func, args, kwargs)
                 except Exception as exc:
                     if not is_device_oom(exc):
                         raise
                     out = NotImplemented  # it recovers as any op does, below
                 if out is not NotImplemented:
                     return out
-            drawn = _generators(torch, func, args, kwargs) if seeded in func.tags else []
-            states = [(g, g.get_state()) for g in drawn]
+            known = traits.get(func)
+            if known is None:
+                tags = func.tags
+                known = traits[func] = (seeded in tags, func._schema.is_mutable, pointwise in tags)
+            draws, writes, pure = known
+            states: list[tuple[Any, Any]] = []
+            if draws:
+                states = [(g, g.get_state()) for g in _generators(torch, func, args, kwargs)]
+                for journal in journals:
+                    journal.draws(states)
             targets: list[Tensor] = []
-            if func._schema.is_mutable:
+            if writes:
                 targets = list(_tensor_operands(tuple(_written(func, args, kwargs))))
-            if journal is not None:
-                journal.draws(states)
             refused = False
             written: list[tuple[Tensor, Tensor]] | None = None
             while True:
                 try:
                     if written is None:  # the copies are allocations too: they recover first
-                        if journal is not None:
+                        for journal in journals if targets else ():
                             journal.before_write(targets)
-                        copied = pointwise not in func.tags
+                        copied = weights is not None and not pure
                         written = [(t, t.clone()) for t in targets] if copied else []
                     return func(*args, **kwargs)
                 except Exception as exc:
+                    if weights is None:
+                        raise
                     need, refused = _room_for(exc, refused)
                 # outside `except`, so the failed op's frames are gone; it runs again from
                 # what it read: its generators and the tensors it writes into, as they were
@@ -1724,17 +1771,16 @@ def _recovery_type(torch: ModuleType) -> type:
                     target.copy_(first)
                 if banded is not None:
                     try:  # out of memory whole: in bands of rows when it can be
-                        with quiet():
-                            out = banded.run(func, args, kwargs, short=True)
+                        out = banded.run(func, args, kwargs, short=True)
                     except Exception as exc:
                         if not is_device_oom(exc):
                             raise
                         out = NotImplemented  # still out at its finest: room is made
                     if out is not NotImplemented:
                         return out
-                self.weights.make_room(need, (*args, *kwargs.values()), str(func))
+                weights.make_room(need, (*args, *kwargs.values()), str(func))
 
-    return Recovery
+    return Ops
 
 
 @dataclass(frozen=True, slots=True)
@@ -1767,6 +1813,7 @@ class Journal:
     drawn: dict[int, Any] = field(default_factory=dict)
     #: device progress of a journaled call (`journaling`): an event recorded every
     #: `MARK_EVERY` ops on a GPU, and how many of them the device has finished
+    marking: bool = False
     ops: int = 0
     marks: deque[Any] = field(default_factory=deque)
     done: int = 0
@@ -1810,7 +1857,6 @@ class Journal:
         return Effects(self.wrote or bool(self.kept), tuple(self.drawn.values()), banded)
 
 
-_JOURNALING: dict[int, type] = {}
 #: how often a journaled call marks its device progress, in ops (an event costs microseconds)
 MARK_EVERY = 32
 
@@ -1819,44 +1865,18 @@ MARK_EVERY = 32
 def journaling(torch: ModuleType, journal: Journal) -> Iterator[Journal]:
     """Every torch op in this context writes into `journal`: the storages it makes, the first
     content of every other storage it writes into, the generator state a seeded op draws
-    from. One GPU of a group keeps one for a whole call, so the call can be rewound when any
-    GPU of the group fails it (`mirror.mirror_component`). On any device."""
-    kind = _JOURNALING.get(id(torch))
-    if kind is None:
-        kind = _JOURNALING[id(torch)] = _journaling_type(torch)
-    with kind(journal):
+    from, and the device progress its ops make (`Journal.progress`). One GPU of a group keeps
+    one for a whole call, so the call can be rewound when any GPU of the group fails it
+    (`mirror.mirror_component`); its blocks keep none of their own. On any device."""
+    journal.marking = True
+    with _noting(torch, None, journal):
         yield journal
 
 
-def _journaling_type(torch: ModuleType) -> type:
-    mode: type = torch.utils._python_dispatch.TorchDispatchMode
-    seeded = torch.Tag.nondeterministic_seeded
-
-    class Journaling(mode):  # type: ignore[misc]
-        def __init__(self, journal: Journal) -> None:
-            super().__init__()
-            self.journal = journal
-
-        def __torch_dispatch__(
-            self, func: Any, types: Any, args: tuple[Any, ...] = (), kwargs: Any = None
-        ) -> Any:
-            kwargs = kwargs or {}
-            if seeded in func.tags:
-                drawn = _generators(torch, func, args, kwargs)
-                self.journal.draws([(g, g.get_state()) for g in drawn])
-            if func._schema.is_mutable:
-                self.journal.before_write(_tensor_operands(tuple(_written(func, args, kwargs))))
-            out = func(*args, **kwargs)
-            journal = self.journal
-            journal.made(out)
-            journal.ops += 1
-            if journal.ops % MARK_EVERY == 0 and torch.cuda.is_initialized():
-                mark = torch.cuda.Event()
-                mark.record()
-                journal.marks.append(mark)
-            return out
-
-    return Journaling
+def _in_call(torch: ModuleType) -> bool:
+    """Whether ops run in a group call's journal now (`journaling`)."""
+    mode = _innermost(torch)
+    return mode is not None and any(j.marking for j in mode.journals)
 
 
 def _generators(
@@ -3819,8 +3839,12 @@ class WeightResidency:
 
                     with self._quiet():
                         return rewound(rewind, *args, **kwargs)
+                if weights.grouped and _in_call(torch):
+                    # One GPU of a group in its call: the call's journal rewinds what the
+                    # block changes, and its ops recover one by one in the call's mode.
+                    return rewound(lambda: None, *args, **kwargs)
                 # Its first run, a block that writes into tensors it did not make, or one
-                # GPU of a group: its ops recover one by one, journaled.
+                # GPU of a group outside its call: its ops recover one by one, journaled.
                 journal = Journal()
                 rewrites = weights.bands.rewrites if weights.bands is not None else 0
                 with weights.recovering(journal):
