@@ -233,15 +233,17 @@ __global__ void __launch_bounds__(kGemvThreads) gemv_kernel(
 }
 
 template <typename T>
-void rotate_quantize_as(const T* x, int8_t* q, float* scales, int M, int K, cudaStream_t s) {
+cudaError_t rotate_quantize_as(const T* x, int8_t* q, float* scales, int M, int K,
+                               cudaStream_t s) {
     const int tiles = (K + kTile - 1) / kTile;
     const int rows = std::max(1, std::min(M, 8 / tiles));
     rotate_quantize_kernel<T>
         <<<(M + rows - 1) / rows, dim3(32 * tiles, rows), 0, s>>>(x, q, scales, M, K);
+    return cudaGetLastError();
 }
 
 template <typename T, typename Out>
-void gemv_as(const T* x, const int8_t* w, const float* ws, const Out* bias, Out* out, int M,
+cudaError_t gemv_as(const T* x, const int8_t* w, const float* ws, const Out* bias, Out* out, int M,
              int N, int K, int sms, cudaStream_t s) {
     const int blocks = std::min((N + kGemvWarps - 1) / kGemvWarps, sms * 4);
     const size_t smem = size_t(M) * K;
@@ -251,31 +253,30 @@ void gemv_as(const T* x, const int8_t* w, const float* ws, const Out* bias, Out*
         case 3: gemv_kernel<T, Out, 3><<<blocks, kGemvThreads, smem, s>>>(x, w, ws, bias, out, N, K); break;
         default: gemv_kernel<T, Out, 4><<<blocks, kGemvThreads, smem, s>>>(x, w, ws, bias, out, N, K); break;
     }
+    return cudaGetLastError();
 }
 
 }  // namespace
 
-void rotate_quantize(const void* x, bool x_half, int8_t* q, float* scales, int M, int K,
-                     cudaStream_t stream) {
-    if (x_half)
-        rotate_quantize_as(static_cast<const __half*>(x), q, scales, M, K, stream);
-    else
-        rotate_quantize_as(static_cast<const __nv_bfloat16*>(x), q, scales, M, K, stream);
+cudaError_t rotate_quantize(const void* x, bool x_half, int8_t* q, float* scales, int M, int K,
+                            cudaStream_t stream) {
+    return x_half ? rotate_quantize_as(static_cast<const __half*>(x), q, scales, M, K, stream)
+                  : rotate_quantize_as(static_cast<const __nv_bfloat16*>(x), q, scales, M, K,
+                                       stream);
 }
 
-bool gemv(const void* x, bool x_half, const int8_t* w, const float* w_scale, const void* bias,
-          void* out, bool out_half, int M, int N, int K, int sms, cudaStream_t stream) {
-    if (M < 1 || M > kGemvRows || size_t(M) * K > 48 * 1024) return false;
-    if (x_half && out_half)
-        gemv_as(static_cast<const __half*>(x), w, w_scale, static_cast<const __half*>(bias),
-                static_cast<__half*>(out), M, N, K, sms, stream);
-    else if (!x_half && !out_half)
-        gemv_as(static_cast<const __nv_bfloat16*>(x), w, w_scale,
-                static_cast<const __nv_bfloat16*>(bias), static_cast<__nv_bfloat16*>(out), M, N,
-                K, sms, stream);
-    else
-        return false;
-    return true;
+cudaError_t gemv(const void* x, bool x_half, const int8_t* w, const float* w_scale,
+                 const void* bias, void* out, bool out_half, int M, int N, int K, int sms,
+                 cudaStream_t stream) {
+    if (M < 1 || M > kGemvRows || size_t(M) * K > 48 * 1024 || x_half != out_half)
+        return cudaErrorNotSupported;
+    if (x_half)
+        return gemv_as(static_cast<const __half*>(x), w, w_scale,
+                       static_cast<const __half*>(bias), static_cast<__half*>(out), M, N, K, sms,
+                       stream);
+    return gemv_as(static_cast<const __nv_bfloat16*>(x), w, w_scale,
+                   static_cast<const __nv_bfloat16*>(bias), static_cast<__nv_bfloat16*>(out), M,
+                   N, K, sms, stream);
 }
 
 }  // namespace cozy_int8

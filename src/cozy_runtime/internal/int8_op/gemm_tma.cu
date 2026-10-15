@@ -96,17 +96,21 @@ struct TmaGemm {
                                                         CollectiveMainloop, CollectiveEpilogue>;
     using Gemm = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
 
-    static bool run(const int8_t* q, const int8_t* w, const float* xs, const float* ws,
-                    const Out* bias, Out* out, int M, int N, int K, int sms, cudaStream_t s) {
+    // The adapter's launch, keeping its error: the shared-memory opt-in once per card, then one
+    // `cudaLaunchKernelEx` with the cluster and the programmatic dependency on the rotate kernel
+    // before it (`rotate.cu`).
+    static cudaError_t run(const int8_t* q, const int8_t* w, const float* xs, const float* ws,
+                           const Out* bias, Out* out, int M, int N, int K, int sms,
+                           cudaStream_t s) {
         static std::atomic<uint64_t> configured{0};
         int device = 0;
         cudaGetDevice(&device);
         const uint64_t bit = uint64_t(1) << (device & 63);
         if (!(configured.load(std::memory_order_relaxed) & bit)) {
-            if (cudaFuncSetAttribute(cutlass::device_kernel<Kernel>,
-                                     cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                     Kernel::SharedStorageSize) != cudaSuccess)
-                return false;
+            const cudaError_t e = cudaFuncSetAttribute(cutlass::device_kernel<Kernel>,
+                                                       cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                       Kernel::SharedStorageSize);
+            if (e != cudaSuccess) return e;
             configured.fetch_or(bit);
         }
         using StrideA = typename Kernel::StrideA;
@@ -122,16 +126,22 @@ struct TmaGemm {
         args.epilogue.thread = {{xs}, {{ws}, {}, {}}, {bias}, {}};
         args.hw_info.device_id = device;
         args.hw_info.sm_count = sms;
-        if (Gemm::can_implement(args) != cutlass::Status::kSuccess) return false;
+        if (!Kernel::can_implement(args)) return cudaErrorNotSupported;
         auto params = Kernel::to_underlying_arguments(args, nullptr);
-        // A programmatic dependent of the rotate kernel before it (`rotate.cu`).
-        return Gemm::run(params, s, nullptr, true) == cutlass::Status::kSuccess;
+        cudaLaunchAttribute attributes[2];
+        attributes[0].id = cudaLaunchAttributeClusterDimension;
+        attributes[0].val.clusterDim = {unsigned(size<0>(Cluster{})), unsigned(size<1>(Cluster{})), 1};
+        attributes[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attributes[1].val.programmaticStreamSerializationAllowed = 1;
+        cudaLaunchConfig_t config{Kernel::get_grid_shape(params), Kernel::get_block_shape(),
+                                  size_t(Kernel::SharedStorageSize), s, attributes, 2};
+        return cudaLaunchKernelEx(&config, cutlass::device_kernel<Kernel>, params);
     }
 };
 
 template <typename Out>
-using Fn = bool (*)(const int8_t*, const int8_t*, const float*, const float*, const Out*, Out*,
-                    int, int, int, int, cudaStream_t);
+using Fn = cudaError_t (*)(const int8_t*, const int8_t*, const float*, const float*, const Out*,
+                           Out*, int, int, int, int, cudaStream_t);
 
 #if COZY_SM == 100
 // Measured on a B200 at our shapes (SGLang's 128x128 and 128x256 one-SM tiles ran 10-20% below
@@ -168,19 +178,20 @@ int choose(int M, int N, int K) {
 #endif
 
 template <typename Out>
-bool run_as(const int8_t* q, const int8_t* w, const float* xs, const float* ws, const void* bias,
-            void* out, int M, int N, int K, int sms, int config, cudaStream_t s) {
+cudaError_t run_as(const int8_t* q, const int8_t* w, const float* xs, const float* ws,
+                   const void* bias, void* out, int M, int N, int K, int sms, int config,
+                   cudaStream_t s) {
     if (config < 0) config = choose(M, N, K);
-    if (config >= kTmaConfigs) return false;
+    if (config >= kTmaConfigs) return cudaErrorNotSupported;
     return kConfigs<Out>[config](q, w, xs, ws, static_cast<const Out*>(bias),
                                  static_cast<Out*>(out), M, N, K, sms, s);
 }
 
 }  // namespace
 
-bool gemm(const int8_t* q, const int8_t* w, const float* scales, const float* w_scale,
-          const void* bias, void* out, bool out_half, int M, int N, int K, int sms, int config,
-          Workspace, cudaStream_t stream) {
+cudaError_t gemm(const int8_t* q, const int8_t* w, const float* scales, const float* w_scale,
+                 const void* bias, void* out, bool out_half, int M, int N, int K, int sms,
+                 int config, Workspace, cudaStream_t stream) {
     return out_half ? run_as<cutlass::half_t>(q, w, scales, w_scale, bias, out, M, N, K, sms,
                                               config, stream)
                     : run_as<cutlass::bfloat16_t>(q, w, scales, w_scale, bias, out, M, N, K, sms,
