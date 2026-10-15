@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
-from cozy_runtime.internal import accel, plane, weight_policy
+from cozy_runtime.internal import accel, weight_policy
 
 if TYPE_CHECKING:
     from cozy_runtime.internal.weights import Weights
@@ -21,28 +21,15 @@ class Pieces:
         self.ratio: dict[str, float] = {}
 
     def room(self, key: str) -> tuple[float | None, int]:
-        free, movable = self._room()
+        free, movable = self.weights.activation_room()
         return self.ratio.get(key), max(free + movable - weight_policy.MARGIN, 0)
-
-    def _room(self) -> tuple[int, int]:
-        """What torch can allocate now, and the mapped weight bytes no open stage holds."""
-        weights = self.weights
-        if weights.open:
-            residency, _, local = weights.open[-1]
-            return residency.room(local)
-        device = plane.stats(weights.plane).device(weights.index)
-        movable = device.committed - device.leased_bytes - device.held_bytes
-        return weights.allocatable(), max(movable, 0)
 
     @contextmanager
     def piece(self, key: str, elements: int, need: int) -> Iterator[None]:
         weights = self.weights
         torch, kind = weights.torch, weights.kind
         accel.hold_peak(torch, kind)
-        free, movable = self._room()
-        if need > free and movable > 0:
-            mapped = plane.stats(weights.plane).device(weights.index).committed
-            weights.shrink(need - free, max(mapped - movable, weights.floor()))
+        weights.free_for(need)
         base = accel.allocated(torch, kind)
         try:
             yield

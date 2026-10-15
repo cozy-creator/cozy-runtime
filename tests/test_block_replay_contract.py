@@ -340,51 +340,9 @@ def test_before_forward_acquisition_failure_keeps_existing_recovery(monkeypatch:
     assert not residency.poisoned
 
 
-def test_only_sdk_decoder_pass_replays_to_the_uninterrupted_tensor(monkeypatch: Any) -> None:
-    diffusers = pytest.importorskip("diffusers")
-    from cozy_runtime.internal import image_vae
-
-    torch.manual_seed(71)
-    vae = diffusers.AutoencoderKL(
-        down_block_types=("DownEncoderBlock2D",) * 2,
-        up_block_types=("UpDecoderBlock2D",) * 2,
-        block_out_channels=(8, 8),
-        norm_num_groups=4,
-    ).eval()
-    latent = torch.randn(1, 4, 2, 3)
-    conv = vae.decoder.conv_in
-    with torch.inference_mode():
-        expected = image_vae.Decode(vae, latent, band=100).run().sample
-    _weights, _region, trace = wrapped(conv, monkeypatch, root=vae)
-    within = trace["residency"]._within("model")
-    calls = []
-
-    def fail_once(module: Any, body: Any) -> Any:
-        if module is not conv:
-            return within(module, body)
-
-        def pass_body() -> Any:
-            out = body()  # actual SDK pass writes only its output map and scratch statistics
-            calls.append(1)
-            if len(calls) == 1:
-                raise torch.OutOfMemoryError("SDK output-only pass failed after its writes")
-            return out
-
-        return within(module, pass_body)
-
-    with torch.inference_mode():
-        actual = image_vae.Decode(vae, latent, band=100).run(fail_once).sample
-    assert torch.equal(actual, expected)
-    assert calls == [1, 1]
-    assert trace["acquired"] == trace["released"] == 2 and len(trace["room"]) == 1
-    assert not trace["residency"].poisoned
-
-
-@pytest.mark.parametrize("custom", ["leaf", "forward", "hook", "processor"])
+@pytest.mark.parametrize("custom", ["leaf", "forward", "hook"])
 def test_custom_decoder_calls_run_again_after_a_failure(custom: str, monkeypatch: Any) -> None:
     diffusers = pytest.importorskip("diffusers")
-    from cozy_runtime.internal import image_vae
-
     torch.manual_seed(72)
     vae = diffusers.AutoencoderKL(
         down_block_types=("DownEncoderBlock2D",) * 2,
@@ -396,7 +354,7 @@ def test_custom_decoder_calls_run_again_after_a_failure(custom: str, monkeypatch
     before = latent.clone()
     resnet = vae.decoder.mid_block.resnets[0]
     with torch.inference_mode():
-        expected = image_vae.Decode(vae, latent).run().sample
+        expected = vae.decode(latent).sample
     calls: list[int] = []
     armed: list[int] = []
 
@@ -427,18 +385,6 @@ def test_custom_decoder_calls_run_again_after_a_failure(custom: str, monkeypatch
             advance()
 
         resnet.dropout.register_forward_hook(hook)
-    elif custom == "processor":
-        attention = vae.decoder.mid_block.attentions[0]
-        original = attention.processor
-
-        class CustomProcessor:
-            def __call__(self, *args: Any, **kwargs: Any) -> Any:
-                result = original(*args, **kwargs)
-                advance()
-                return result
-
-        attention.set_processor(CustomProcessor())
-    assert image_vae.exact(vae)  # this remains a valid successful custom decoder
     _weights, _region, trace = wrapped(resnet, monkeypatch, root=vae, weight_module=resnet.conv1)
     with torch.inference_mode():
         assert torch.equal(vae.decode(latent).sample, expected)

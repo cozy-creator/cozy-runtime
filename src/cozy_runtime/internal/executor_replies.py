@@ -178,7 +178,7 @@ class PlaneFacts(msgspec.Struct, frozen=True, kw_only=True):
     #: their bytes (`spill`)
     spilled: int = 0
     spilled_bytes: int = 0
-    #: The decode mode and CFG layout each stage chose, e.g. {"vae.decode": "chunked 32 host"}
+    #: What memory made the call do, e.g. {"bands": "12 ops, 805306368 B of results in host memory"}
     modes: dict[str, str] = {}
 
 
