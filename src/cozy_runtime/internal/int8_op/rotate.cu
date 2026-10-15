@@ -130,11 +130,22 @@ __device__ __forceinline__ float warp_max(float v) {
 
 __device__ __forceinline__ float row_scale(float amax) { return fmaxf(amax / 127.f, 1e-12f); }
 
+// Hopper and B200 launch the GEMM as a programmatic dependent of this kernel: it starts its
+// prologue as soon as every block here has begun, and waits for this grid before reading.
+#if COZY_SM == 90 || COZY_SM == 100
+constexpr bool kDependentGemm = true;
+#else
+constexpr bool kDependentGemm = false;
+#endif
+
 // blockDim (32 * tiles, rows): each warp holds one tile of its row in registers across the one
 // barrier, where the row's warps exchange their maxima.
 template <typename T>
 __global__ void __launch_bounds__(1024) rotate_quantize_kernel(
     const T* __restrict__ x, int8_t* __restrict__ q, float* __restrict__ scales, int M, int K) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    if constexpr (kDependentGemm) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
     __shared__ float partial[32];
     const int tiles = blockDim.x >> 5, tile = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int row = blockIdx.x * blockDim.y + threadIdx.y;

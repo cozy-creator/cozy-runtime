@@ -2,8 +2,7 @@
 // The int8 GEMM on TMA cards, CUTLASS 3.x with the dequant in an EVT epilogue,
 // D = out(acc * scales[m] * w_scale[n] + bias[n]); COZY_SM picks the card's table.
 // Hopper (90): warp-specialized wgmma, tiles after vLLM's `scaled_mm_sm90_int8_dispatch.cuh`
-// (Apache-2.0). Datacenter Blackwell (100): tcgen05, one-SM and two-SM tiles after SGLang's
-// `convrot_int8` (Apache-2.0).
+// (Apache-2.0). Datacenter Blackwell (100): tcgen05, after SGLang's `convrot_int8` (Apache-2.0).
 #include <cuda.h>
 
 // CUTLASS asks the runtime for the driver's tensor-map encoder on every TMA descriptor; ask
@@ -125,7 +124,8 @@ struct TmaGemm {
         args.hw_info.sm_count = sms;
         if (Gemm::can_implement(args) != cutlass::Status::kSuccess) return false;
         auto params = Kernel::to_underlying_arguments(args, nullptr);
-        return Gemm::run(params, s) == cutlass::Status::kSuccess;
+        // A programmatic dependent of the rotate kernel before it (`rotate.cu`).
+        return Gemm::run(params, s, nullptr, true) == cutlass::Status::kSuccess;
     }
 };
 
@@ -134,19 +134,18 @@ using Fn = bool (*)(const int8_t*, const int8_t*, const float*, const float*, co
                     int, int, int, int, cudaStream_t);
 
 #if COZY_SM == 100
+// Measured on a B200 at our shapes (SGLang's 128x128 and 128x256 one-SM tiles ran 10-20% below
+// the two-SM 256x256): small problems take the cluster-free 64x128.
 template <typename Out>
 const Fn<Out> kConfigs[] = {
-    &TmaGemm<Out, Shape<_128, _128, _128>, Shape<_2, _1, _1>, OneSm>::run,  // 0
-    &TmaGemm<Out, Shape<_128, _256, _128>, Shape<_2, _1, _1>, OneSm>::run,  // 1
-    &TmaGemm<Out, Shape<_256, _128, _128>, Shape<_2, _1, _1>, TwoSm>::run,  // 2
-    &TmaGemm<Out, Shape<_256, _256, _128>, Shape<_2, _1, _1>, TwoSm>::run,  // 3
-    &TmaGemm<Out, Shape<_64, _128, _128>, Shape<_1, _1, _1>, OneSm>::run,   // 4
+    &TmaGemm<Out, Shape<_256, _256, _128>, Shape<_2, _1, _1>, TwoSm>::run,  // 0
+    &TmaGemm<Out, Shape<_256, _128, _128>, Shape<_2, _1, _1>, TwoSm>::run,  // 1
+    &TmaGemm<Out, Shape<_64, _128, _128>, Shape<_1, _1, _1>, OneSm>::run,   // 2
 };
-constexpr int kTmaConfigs = 5;
+constexpr int kTmaConfigs = 3;
 
 int choose(int M, int N, int K) {
-    if (M <= 64) return 4;
-    return M >= 256 && (K <= 8192 || M <= 2048) ? 1 : 0;
+    return M <= 128 || int64_t(N) * K <= (4 << 20) ? 2 : 0;
 }
 #else
 // Measured on an H100 SXM at our shapes against vLLM's table (`scaled_mm_sm90_int8_dispatch`,
