@@ -8,7 +8,7 @@ same typed `encoder_unavailable` refusal this release always had.
 Determinism is a pinned property, not a hope: every encoder runs with fixed settings, a
 fixed thread count and `fflags +bitexact` on the container, so one (input, wheel version,
 settings, x264 threads) tuple produces one byte sequence, held across machines by the
-locked wheel. x264's thread count is `x264_threads()`: the host's CPU count under
+locked wheel. x264's thread count is `x264_threads()`: the CPUs this process may use, under
 `X264_THREAD_CEILING`. Frame-threaded x264 restricts motion search to what earlier threads
 have finished, so the bitstream — and therefore the DECODED pixels of a lossy codec — is a
 function of the thread count. The ceiling is what makes that a plan fact rather than
@@ -43,6 +43,7 @@ from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
+from cozy_runtime._cpus import cpus
 from cozy_runtime.author import _color
 from cozy_runtime.author._errors import OutputError
 
@@ -80,8 +81,8 @@ _ENCODE_QUEUE_FRAMES = 16
 
 
 def x264_threads() -> int:
-    """The x264 thread count on THIS host: its CPU count, under the ceiling."""
-    return max(1, min(X264_THREAD_CEILING, os.cpu_count() or 1))
+    """The x264 thread count on THIS host: the CPUs this process may use, under the ceiling."""
+    return min(X264_THREAD_CEILING, cpus())
 
 
 @dataclass(frozen=True, slots=True)

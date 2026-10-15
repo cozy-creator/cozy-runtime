@@ -10,19 +10,18 @@ from __future__ import annotations
 import contextlib
 import functools
 import math
-import os
 import tempfile
 import threading
 from collections import deque
 from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from pathlib import Path
 from typing import IO, Any, NamedTuple
 
 import msgspec
 import numpy as np
 from tensorfs.derived import Config, DerivedTransaction, Part, SourceInspection, Target, Tensor
 
+from cozy_runtime._cpus import cpus
 from cozy_runtime.author import (
     Context,
     Telemetry,
@@ -574,7 +573,7 @@ def _in_order(
     pending = iter(items)
     try:
         for _ in items:
-            while len(window) <= _cpu_budget() and (item := next(pending, None)) is not None:
+            while len(window) <= cpus() and (item := next(pending, None)) is not None:
                 window.append(_pool().submit(produce, item, stop))
             yield window.popleft().result()
     finally:
@@ -588,24 +587,7 @@ def _in_order(
 @functools.cache
 def _pool() -> ThreadPoolExecutor:
     """One process-wide encoder pool: callers that shard their own work share its bound."""
-    return ThreadPoolExecutor(_cpu_budget(), thread_name_prefix="cozy-quantize")
-
-
-@functools.cache
-def _cpu_budget() -> int:
-    """CPUs this process may use: its affinity, capped by any cgroup v2 quota above it."""
-    count = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count()
-    with contextlib.suppress(OSError, IndexError, ValueError):
-        root = Path("/sys/fs/cgroup")
-        own = root / Path("/proc/self/cgroup").read_text().split("::", 1)[1].strip().lstrip("/")
-        for directory in (own, *own.parents):
-            if not directory.is_relative_to(root):
-                break
-            with contextlib.suppress(OSError, ValueError):
-                quota, period = (directory / "cpu.max").read_text().split()
-                if quota != "max":
-                    count = min(count or 1, -(-int(quota) // int(period)))
-    return max(1, count or 1)
+    return ThreadPoolExecutor(cpus(), thread_name_prefix="cozy-quantize")
 
 
 def _artifact_plan(raw: bytes) -> ArtifactQuantizationPlan:

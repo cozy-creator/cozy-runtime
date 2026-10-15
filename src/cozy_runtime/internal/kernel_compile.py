@@ -40,6 +40,7 @@ from importlib import import_module
 from pathlib import Path
 from typing import Any
 
+from cozy_runtime._cpus import cpus
 from cozy_runtime.internal import config, kernel_cache, liveness, proctree
 
 #: kind -> the `module:function` a builder runs: `build(spec, staging, report) -> facts`. The
@@ -351,15 +352,6 @@ def _record_failure(
 
 
 # --------------------------------------------------------------------- the builder process
-
-
-def cpus() -> int:
-    """Every CPU this process may use: its affinity and its cgroup's quota."""
-    count = len(os.sched_getaffinity(0))
-    quota = _read("/sys/fs/cgroup/cpu.max").split()
-    if len(quota) == 2 and quota[0].isdigit() and quota[1].isdigit() and int(quota[1]):
-        count = min(count, -(-int(quota[0]) // int(quota[1])))
-    return count
 
 
 def available_memory() -> int:
