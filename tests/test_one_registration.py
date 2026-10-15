@@ -28,6 +28,7 @@ from cozy_runtime.author import (
     invocable,
 )
 from cozy_runtime.internal import package_interface, static_interface
+from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.package_interface import StalePackageInterface
 from cozy_runtime.internal.static_interface import StaticRefusal
 
@@ -71,6 +72,11 @@ def test_production_registrations_are_one_entrypoints_list() -> None:
     assert sdxl["component_use"]["denoise"] == ["unet"]
     dit, vae = entries["seedvr2_normalize"]["models"]
     assert dit["class"] == vae["class"] == "Model" and dit["component_use"] == {}
+    # A writer's operation identity keys derivation replay; only an installed reading states it.
+    imported = _entries(package_interface.build(discover(PRODUCTION)))
+    for name, entry in imported.items():
+        identity = entry["invocable"].get("operation_identity")
+        assert (identity is None) == (name in ORCHESTRATORS), name
     ids = {package_interface.descriptor_id(doc, name) for name in entries}
     assert len(ids) == 26
     assert package_interface.parse(package_interface.canonical_bytes(doc)).function("fp8")

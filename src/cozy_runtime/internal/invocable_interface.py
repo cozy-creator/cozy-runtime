@@ -21,7 +21,8 @@ from cozy_runtime.internal import canonical, schema
 
 def metadata(surface: Surface) -> dict[str, Any]:
     result = _metadata(surface)
-    if surface.memoize:
+    # A writer's identity keys TensorFS derivation replay, as a memoized result's keys the memo.
+    if surface.memoize or surface.weights_outputs:
         from cozy_runtime.internal.memo_implementation import describe
 
         result.update(describe(surface.fn))
@@ -272,9 +273,9 @@ def validate(value: Invocable, request: object, result: object) -> None:
     outcomes = (value.operation_identity is not msgspec.UNSET) + (
         value.operation_identity_unavailable is not msgspec.UNSET
     )
-    if outcomes > int(value.memoize):
+    if outcomes > 1:
         raise ConformanceError(
-            "operation identity requires one memoized identity outcome", code="invocable_interface"
+            "operation identity has one outcome at most", code="invocable_interface"
         )
     if value.operation_identity is not msgspec.UNSET and (
         re.fullmatch(r"sha256:[0-9a-f]{64}", value.operation_identity) is None

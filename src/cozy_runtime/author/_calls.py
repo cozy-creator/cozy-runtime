@@ -141,9 +141,7 @@ def invocable[**P, R](
         raise ConformanceError(
             "an invocable must be a module-level async function", code="invocable_signature"
         )
-    declare_memo(
-        fn, memoize=policy is not None, version=memo_version, dependencies=memo_dependencies
-    )
+    declare_memo(fn, version=memo_version, dependencies=memo_dependencies)
     export = _Export(
         fn,
         fn.__module__,

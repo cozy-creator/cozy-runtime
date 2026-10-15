@@ -12,6 +12,7 @@ from cozy_runtime.author import (
     MAX_WEIGHTS_NEW_BYTES,
     App,
     Context,
+    MemoDistribution,
     ModelArtifact,
     Telemetry,
     UnsupportedInput,
@@ -149,7 +150,20 @@ def _selection(structure: SourceInspection, plan: QuantizationPlan) -> ArtifactQ
     return selection
 
 
-@invocable
+@invocable(
+    memo_version="quantize/1",
+    memo_dependencies=(
+        _selection,
+        "cozy_runtime.derive.facade",
+        "cozy_runtime.derive.quantization",
+        "cozy_runtime.derive.microscale",
+        "cozy_runtime.derive.safetensors_io",
+        "tensorfs.derived",
+        MemoDistribution("tensorfs"),
+        MemoDistribution("numpy"),
+        MemoDistribution("msgspec"),
+    ),
+)
 async def quantize(
     ctx: Context,
     *,
