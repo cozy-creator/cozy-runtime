@@ -99,6 +99,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: tensord -> target
+          cache-on-failure: true
       - run: uv sync --locked
         working-directory: source
       # From here to the machine check: publish.yaml's build job, step for step.
