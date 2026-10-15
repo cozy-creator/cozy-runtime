@@ -35,6 +35,7 @@ from cozy_runtime.internal import accel, canonical
 from cozy_runtime.internal.encoding.formats import (
     MX_BLOCK,
     Encoded,
+    Int8ConvRotDequant,
     MicroScaledDequant,
     Provider,
     RowwiseDequant,
@@ -44,7 +45,11 @@ from cozy_runtime.internal.encoding.formats import (
     refuse,
     registry_digests,
 )
-from cozy_runtime.internal.encoding.leaves import MicroScaledNativeLeaf, RowwiseNativeLeaf
+from cozy_runtime.internal.encoding.leaves import (
+    Int8ConvRotNativeLeaf,
+    MicroScaledNativeLeaf,
+    RowwiseNativeLeaf,
+)
 
 # `torch: Any` is the torch module, which the check venv does not carry.
 
@@ -575,6 +580,8 @@ def launch_providers() -> dict[str, tuple[Provider, ...]]:
         RowwiseNativeLeaf,
         MicroScaledDequant,
         MicroScaledNativeLeaf,
+        Int8ConvRotDequant,
+        Int8ConvRotNativeLeaf,
     )
     for build in builds:
         # The provider is instantiated once per digest it reviewed, which is what makes

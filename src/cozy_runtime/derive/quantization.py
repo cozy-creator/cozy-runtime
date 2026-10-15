@@ -1,4 +1,4 @@
-"""Carrier-free FP8 and MXFP8 model derivations.
+"""Carrier-free FP8, MXFP8 and INT8 model derivations.
 
 The worker receives one exact TensorFS Manifest capability and returns another through
 TensorFS scoped derivation handles. It receives no Store or filesystem access.
@@ -31,27 +31,56 @@ from cozy_runtime.author import (
 
 from . import safetensors_io as st
 from .microscale import (
+    CONVROT_GROUP,
     Encoded,
     encode_fp8_rowwise,
+    encode_int8_convrot256,
     encode_mxfp8,
 )
 
 
 class _Encoding(NamedTuple):
-    """The encoder and its maximum reconstruction error as a multiple of tensor amax."""
+    """The encoder, its maximum reconstruction error as a multiple of tensor amax, the
+    data role's carrier, the column multiple it needs, and its scale role's shape."""
 
     round_trip_bound: float
     encode: Callable[[str, np.ndarray], Encoded]
+    payload: str
+    data_dtype: str
+    block: int
+    scale: Callable[[int, int], tuple[str, tuple[int, ...]]]
+
+
+def _row_scale(rows: int, cols: int) -> tuple[str, tuple[int, ...]]:
+    return "f32", (rows,)
 
 
 _ENCODINGS: dict[str, _Encoding] = {
     "mxfp8/1": _Encoding(
         round_trip_bound=2.0**-3,
         encode=encode_mxfp8,
+        payload="F8_E4M3",
+        data_dtype="f8_e4m3fn",
+        block=32,
+        scale=lambda rows, cols: ("u8", (rows, cols // 32)),
     ),
     "fp8-rowwise/1": _Encoding(
         round_trip_bound=2.0**-3,
         encode=encode_fp8_rowwise,
+        payload="F8_E4M3",
+        data_dtype="f8_e4m3fn",
+        block=32,
+        scale=_row_scale,
+    ),
+    # Measured worst on Qwen-Image-2.1 and Qwen3-VL weights is far inside this; the bound is
+    # a tripwire for a broken encoder, not a quality gate.
+    "int8-convrot256/1": _Encoding(
+        round_trip_bound=2.0**-4,
+        encode=encode_int8_convrot256,
+        payload="I8",
+        data_dtype="i8",
+        block=CONVROT_GROUP,
+        scale=_row_scale,
     ),
 }
 
@@ -123,6 +152,7 @@ _ARTIFACT_SPECS = {
     # Tensor always carries the immutable spec identity.
     "fp8-rowwise/1": "sha256:c4be0120fb4548306b134f6ee07eb2545a363bc140a005af1ef6543c790cf890",
     "mxfp8/1": "sha256:7e9b1ad8f2e5ddd236a4d4303042d632a96eadef4f25d44eb0fb63124cec7cfd",
+    "int8-convrot256/1": "sha256:ac25d323baebfdf1fd0ce3fdfd9f26400ce57914fdc442d0ade8cb187aef183f",
 }
 PLAIN_SPEC = "sha256:1fb882a7e46d0aff520f9d8a28cefd643954c19371737443101ba3c5fcc3613f"
 _MAX_ARTIFACT_PLAN_BYTES = 8 << 20
@@ -199,10 +229,16 @@ def prepare_bf16(
     return Bf16Plan(components, list(structure.configs), order, tensors, kept)
 
 
+def column_block(encoding: str | None) -> int:
+    """The column multiple an encoding's tensors need; 32 serves both fp8 encodings."""
+    found = _ENCODINGS.get(encoding or "")
+    return found.block if found is not None else 32
+
+
 def prepare_source_quantization(
-    structure: SourceInspection, *, components: tuple[str, ...]
+    structure: SourceInspection, *, components: tuple[str, ...], block: int = 32
 ) -> ArtifactQuantizationPlan:
-    """Select plain rank-2 weights that both row-wise encodings can represent."""
+    """Select plain rank-2 weights whose columns are a multiple of the encoding's `block`."""
     rows = list(source_rows(structure))
     missing = sorted(set(components) - {component for component, _, _ in rows})
     if missing:
@@ -214,7 +250,7 @@ def prepare_source_quantization(
             or not key.endswith(".weight")
             or tensor.logical_dtype not in {"f16", "bf16", "f32"}
             or len(tensor.shape) != 2
-            or tensor.shape[1] % 32
+            or tensor.shape[1] % block
         ):
             continue
         selected.append(
@@ -504,11 +540,8 @@ def _encode_tensor(
     source_component: str,
 ) -> _Encoded:
     encoder = _ENCODINGS[encoding]
-    scale_expected = (
-        ("U8", [tensor.shape[0], tensor.shape[1] // 32])
-        if encoding == "mxfp8/1"
-        else ("F32", [tensor.shape[0]])
-    )
+    scale_dtype, scale_shape = encoder.scale(*tensor.shape)
+    scale_expected = (scale_dtype.upper(), list(scale_shape))
     amax = max_error = sse = energy = 0.0
     read = rows = saturated = 0
     scales: list[bytes] = []
@@ -531,7 +564,7 @@ def _encode_tensor(
             scale = encoded.companions[0]
             count = values.shape[0]
             if (
-                encoded.payload_dtype != "F8_E4M3"
+                encoded.payload_dtype != encoder.payload
                 or encoded.payload_shape != [count, tensor.shape[1]]
                 or (scale.dtype, scale.shape)
                 != (scale_expected[0], [count, *scale_expected[1][1:]])
@@ -639,20 +672,17 @@ def _artifact_tensor(
     target_logical_dtype: str | None = None,
 ) -> Tensor:
     rows, cols = tensor.shape
-    if encoding == "mxfp8/1":
-        if cols % 32:
-            raise UnsupportedInput(
-                f"{tensor.component}.{tensor.key} has {cols} columns, not an MXFP8 block multiple"
-            )
-        parts = {
-            "data": Part("f8_e4m3fn", (rows, cols)),
-            "scale": Part("u8", (rows, cols // 32)),
-        }
-    else:
-        parts = {
-            "data": Part("f8_e4m3fn", (rows, cols)),
-            "scale": Part("f32", (rows,)),
-        }
+    encoder = _ENCODINGS[encoding]
+    if cols % encoder.block:
+        raise UnsupportedInput(
+            f"{tensor.component}.{tensor.key} has {cols} columns, not a multiple of "
+            f"{encoding}'s {encoder.block}"
+        )
+    scale_dtype, scale_shape = encoder.scale(rows, cols)
+    parts = {
+        "data": Part(encoder.data_dtype, (rows, cols)),
+        "scale": Part(scale_dtype, scale_shape),
+    }
     return Tensor(
         logical_dtype=target_logical_dtype or tensor.logical_dtype,
         shape=tensor.shape,

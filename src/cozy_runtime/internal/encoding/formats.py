@@ -47,6 +47,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from types import ModuleType
 from typing import Any, Protocol, runtime_checkable
 
 from cozy_runtime.author._loader import TORCH_DTYPES as _TORCH_DTYPES
@@ -159,6 +160,10 @@ SPEC_SCALED_SCALAR_WEIGHT_ONLY = (
 #: `mxfp8/1` — E4M3 elements, one E8M0 byte per 32-element block along the last axis.
 SPEC_MXFP8 = "sha256:7e9b1ad8f2e5ddd236a4d4303042d632a96eadef4f25d44eb0fb63124cec7cfd"
 
+#: `int8-convrot256/1` — int8 rows of each weight rotated by the orthonormal regular Hadamard per
+#: 256 input channels (ComfyUI's ConvRot), one f32 scale per output row.
+SPEC_INT8_CONVROT256 = "sha256:ac25d323baebfdf1fd0ce3fdfd9f26400ce57914fdc442d0ade8cb187aef183f"
+
 #: Reviewed digest -> (vendored fixture filename, exact vector-byte digest) from that nested spec.
 #: Qualification checks both before executing a case. `plain/1`'s route decodes nothing, so it
 #: has no entry — its evidence is the fill plane's byte-identity proof.
@@ -182,6 +187,10 @@ SPEC_VECTORS: dict[str, tuple[str, str]] = {
     SPEC_MXFP8: (
         "mxfp8.json",
         "sha256:9950f32248a14b37267c17d8d8e1fd9c8a281c8291183ee390908e2f00326a22",
+    ),
+    SPEC_INT8_CONVROT256: (
+        "int8-convrot256.json",
+        "sha256:351ee32c9c7e1e01a1b61a39d6bd7f11399636a2e763c76a35d97bde4c6f8201",
     ),
 }
 
@@ -245,6 +254,9 @@ class Encoded:
 
 
 # ------------------------------------------------------------------------ the providers
+
+#: A torch tensor, spelled once: torch is absent from the check venv.
+type Tensor = Any
 
 
 class Provider(Protocol):
@@ -319,7 +331,9 @@ class Provider(Protocol):
         """
         ...
 
-    def decode(self, torch: Any, parts: Mapping[str, Any], destination: Any) -> None: ...
+    def decode(
+        self, torch: ModuleType, parts: Mapping[str, Tensor], destination: Tensor
+    ) -> None: ...
 
 
 @runtime_checkable
@@ -412,7 +426,7 @@ class Verbatim:
         # Any rank, any extent: a verbatim copy has no arithmetic to have a geometry.
         return ""
 
-    def decode(self, torch: Any, parts: Mapping[str, Any], destination: Any) -> None:
+    def decode(self, torch: ModuleType, parts: Mapping[str, Tensor], destination: Tensor) -> None:
         raise AssertionError("a verbatim role is streamed straight into its destination")
 
 
@@ -484,7 +498,7 @@ class ScaledScalarDequant:
         # header is checked against the spec by TensorFS, so this route adds nothing.
         return ""
 
-    def decode(self, torch: Any, parts: Mapping[str, Any], destination: Any) -> None:
+    def decode(self, torch: ModuleType, parts: Mapping[str, Tensor], destination: Tensor) -> None:
         data = parts["data"]
         weight_scale = parts["weight_scale"]
         # The scale is a rank-0 f32. Multiplying in the DESTINATION dtype rather than in
@@ -627,7 +641,7 @@ class MicroScaledDequant:
         mult = bits.view(torch.float32).to(dtype)
         return torch.where(scale == E8M0_NAN, torch.full_like(mult, float("nan")), mult)
 
-    def decode(self, torch: Any, parts: Mapping[str, Any], destination: Any) -> None:
+    def decode(self, torch: ModuleType, parts: Mapping[str, Tensor], destination: Tensor) -> None:
         data = parts["data"]
         scale = parts["scale"]
         dtype = destination.dtype
@@ -733,7 +747,7 @@ class RowwiseDequant:
         # Rank 2 is the spec's own. A row scale has no block structure, so no K constraint.
         return _rank2(shape)
 
-    def decode(self, torch: Any, parts: Mapping[str, Any], destination: Any) -> None:
+    def decode(self, torch: ModuleType, parts: Mapping[str, Tensor], destination: Tensor) -> None:
         data = parts["data"]
         scale = parts["scale"]
         rows = int(destination.shape[0])
@@ -756,4 +770,82 @@ class RowwiseDequant:
             stop = min(start + stride, rows)
             block = payload[start:stop].to(torch.float32)
             block.mul_(rowscale[start:stop])
+            destination[start:stop].copy_(block)
+
+
+#: ConvRot's group: the regular Hadamard H4⊗H4⊗H4⊗H4 rotates each 256 input channels.
+CONVROT_GROUP = 256
+
+
+def hadamard256(torch: ModuleType, values: Tensor) -> Tensor:
+    """`[..., K]` -> each 256-group times the UNNORMALIZED regular Hadamard (entries ±1),
+    in four 4-point stages of additions: integers stay exact. H is symmetric, H·H = 256·I."""
+    shape = values.shape
+    work = values.reshape(-1, 4, 4, 4, 4)
+    for axis in range(1, 5):
+        a, b, c, d = work.unbind(axis)
+        work = torch.stack((a + b + c - d, a + b - c + d, a - b + c + d, b + c + d - a), axis)
+    return work.reshape(shape)
+
+
+@dataclass(frozen=True, slots=True)
+class Int8ConvRotDequant:
+    """`int8-convrot256/1` -> float, weight-only: `value = scale[i] * (data[i] · H) / 16`.
+
+    The spec's own law: the Hadamard sum of int8 is an exact integer (int32 here), it is
+    multiplied by the f32 scale in f32 and by 1/16 exactly, then cast once into the
+    destination. Row chunks bound the int32/f32 transient like `RowwiseDequant`'s."""
+
+    encoding: str
+
+    @property
+    def name(self) -> str:
+        return "cozy.int8-convrot256.dequant/1"
+
+    @property
+    def route(self) -> str:
+        return "decoded_float"
+
+    @property
+    def device_predicate(self) -> str:
+        return "any"
+
+    @property
+    def reviewed_specs(self) -> frozenset[str]:
+        return frozenset({SPEC_INT8_CONVROT256})
+
+    @property
+    def code_revision(self) -> str:
+        return "1"
+
+    @property
+    def suite(self) -> str:
+        return "int8-convrot256-decode"
+
+    @property
+    def required(self) -> frozenset[str]:
+        return frozenset({"data", "scale"})
+
+    @property
+    def optional(self) -> frozenset[str]:
+        return frozenset()
+
+    def supports(self, shape: Sequence[int]) -> str:
+        rank = _rank2(shape)
+        if rank or int(shape[1]) % CONVROT_GROUP == 0:
+            return rank
+        return (
+            f"int8-convrot256 rotates whole {CONVROT_GROUP}-column groups; "
+            f"this tensor has {shape[1]} columns"
+        )
+
+    def decode(self, torch: ModuleType, parts: Mapping[str, Tensor], destination: Tensor) -> None:
+        rows, cols = int(destination.shape[0]), int(destination.shape[1])
+        payload = parts["data"].view(rows, cols)
+        scale = parts["scale"].to(torch.float32).reshape(rows, 1)
+        stride = max(1, _CHUNK_BYTES // max(cols * 4, 1))
+        for start in range(0, rows, stride):
+            stop = min(start + stride, rows)
+            block = hadamard256(torch, payload[start:stop].to(torch.int32)).to(torch.float32)
+            block.mul_(scale[start:stop]).mul_(0.0625)
             destination[start:stop].copy_(block)

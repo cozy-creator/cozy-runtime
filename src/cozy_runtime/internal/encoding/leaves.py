@@ -23,15 +23,20 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from types import ModuleType
 from typing import Any
 
 from cozy_runtime.author.kernels import PreQuantized, readable
+from cozy_runtime.internal import int8_linear
 from cozy_runtime.internal.encoding.formats import (
     E4M3_MAX,
     E8M0_BIAS,
     MX_BLOCK,
+    SPEC_INT8_CONVROT256,
+    Int8ConvRotDequant,
     MicroScaledDequant,
     RolePart,
+    Tensor,
     _rank2,
     refuse,
 )
@@ -567,6 +572,104 @@ class MicroScaledNativeLeaf:
         return _leaf_class(torch)(
             MicroScaledNativeLeaf._forward,
             {"data": data, "scale": blocked},
+            bias,
+            out_dtype,
+            self.name,
+            self.encoding,
+            in_features,
+            out_features,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class Int8ConvRotNativeLeaf:
+    """`int8-convrot256/1` ENCODED GEMM: W8A8 on the int8 tensor cores (`int8_linear`).
+
+    The weight rows were rotated by the orthonormal Hadamard per 256 input channels before
+    they were quantized, so each activation row is rotated by the same H at dispatch and
+    quantized per token; the rotation cancels in the product. On Qwen-Image-2.1's real
+    activations that rotation cuts the per-linear error of W8A8 from 1.7-4.4% to 0.5-1.4%
+    (weight-only int8: 0.5-1.0%). On consumer cards int8 runs at 2x their fp8 rate with fp32
+    accumulation and 3-4x their bf16 rate, so this is the fast lane there.
+    """
+
+    encoding: str
+
+    @property
+    def name(self) -> str:
+        return "cozy.int8-convrot256.native-leaf/1"
+
+    @property
+    def route(self) -> str:
+        return "encoded_gemm"
+
+    @property
+    def device_predicate(self) -> str:
+        return "cuda.sm80+"
+
+    @property
+    def reviewed_specs(self) -> frozenset[str]:
+        return frozenset({SPEC_INT8_CONVROT256})
+
+    @property
+    def code_revision(self) -> str:
+        return "1"
+
+    @property
+    def suite(self) -> str:
+        return "int8-convrot256-native"
+
+    @property
+    def required(self) -> frozenset[str]:
+        return frozenset({"data", "scale"})
+
+    @property
+    def optional(self) -> frozenset[str]:
+        return frozenset()
+
+    @property
+    def output_dtype_rule(self) -> str:
+        return "contract"
+
+    def supports(self, shape: Sequence[int]) -> str:
+        """The decode's group law, and cuBLASLt's 8-aligned N for the eager int8 GEMM."""
+        why = Int8ConvRotDequant("").supports(shape)
+        if why or int(shape[0]) % 8 == 0:
+            return why
+        return f"the int8 GEMM needs N divisible by 8 and this tensor has {shape[0]} rows"
+
+    def decode(self, torch: ModuleType, parts: Mapping[str, Tensor], destination: Tensor) -> None:
+        raise AssertionError(
+            "an encoded_gemm provider REPLACES the leaf; it never writes a float "
+            "destination — see LeafProvider.leaf"
+        )
+
+    def resident_bytes(self, parts: Mapping[str, RolePart]) -> int:
+        return sum(p.nbytes for p in parts.values())
+
+    def resident_bits_per_element(self, parts: Mapping[str, RolePart], numel: int) -> float:
+        return 8.0 * self.resident_bytes(parts) / max(numel, 1)
+
+    def fill_scratch_bytes(self, parts: Mapping[str, RolePart]) -> int:
+        return 0
+
+    @staticmethod
+    def _forward(leaf: Tensor, x: Tensor) -> Tensor:
+        import torch
+
+        return int8_linear.matmul(torch, x, leaf.data, leaf.scale, leaf.out_dtype)
+
+    def leaf(
+        self, torch: ModuleType, parts: Mapping[str, Tensor], replaced: Tensor, out_dtype: Tensor
+    ) -> Tensor:
+        if torch.cuda.is_available():
+            # Starts the kernel's build beside the weight fill; the first calls run eager.
+            int8_linear.kitchen(torch, torch.cuda.current_device())
+        data = parts["data"]
+        in_features, out_features, bias = _leaf_geometry(replaced, data)
+        return _leaf_class(torch)(
+            Int8ConvRotNativeLeaf._forward,
+            {"data": data, "scale": parts["scale"]},
             bias,
             out_dtype,
             self.name,
