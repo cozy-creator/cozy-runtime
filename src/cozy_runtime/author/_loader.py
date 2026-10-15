@@ -398,13 +398,11 @@ class ModelFitRefused(ConformanceError):
 class ModelAssets:
     """Verified read-only model files embedded in one CozyTensors artifact.
 
-    Names are header paths, never config values. Reads are bounded and return immutable bytes
-    straight from the checkpoint; there is no filesystem view. A path-only constructor is fed
+    Names are header paths, never config values. Reads return immutable bytes straight from
+    the checkpoint, whatever their size; there is no filesystem view. A path-only constructor is fed
     the parsed bytes instead (e.g. a tokenizer's vocab dict and merges list): model loading
     writes nothing, and a derivation's sandbox refuses any write.
     """
-
-    MAX_BYTES = 64 << 20
 
     def __init__(self, values: Mapping[str, bytes], guard: Callable[[str], None]) -> None:
         self._values = {str(name): bytes(value) for name, value in values.items()}
@@ -416,14 +414,7 @@ class ModelAssets:
 
     def read(self, name: str) -> bytes:
         self._guard("loader.assets.read")
-        raw = self._get(name)
-        if len(raw) > self.MAX_BYTES:
-            raise CapabilityError(
-                f"model asset {name!r} is {len(raw)} B; the bounded Loader limit is "
-                f"{self.MAX_BYTES} B",
-                code="model_asset_too_large",
-            )
-        return raw
+        return self._get(name)
 
     def open(self, name: str) -> io.BytesIO:
         """An in-memory binary stream over the same immutable verified bytes."""

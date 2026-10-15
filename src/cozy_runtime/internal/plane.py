@@ -167,7 +167,7 @@ def is_sealed(fd: int) -> bool:
 
 
 def sealed_memfd(name: str, body: bytes) -> int:
-    """`body` in a new memfd, sealed: what crosses beside a request too large for a frame."""
+    """`body` in a new memfd, sealed: a document that crosses beside its request."""
     # libc's own: python-build-standalone's old glibc build lacks `os.memfd_create`.
     # MFD_CLOEXEC | MFD_ALLOW_SEALING
     fd: int = ctypes.CDLL(None, use_errno=True).memfd_create(name.encode(), 0x1 | 0x2)

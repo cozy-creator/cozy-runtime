@@ -37,16 +37,17 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, NoReturn
 
+from cozy_runtime.internal.canonical import DOC_MAX_BYTES
+
 #: Worker/executor command-and-reply compatibility, independent of SDK package
 #: version or source build. Compatible additive fields keep this revision; only
 #: an incompatible change to required commands/semantics raises it.
 EXECUTOR_PROTOCOL_REVISION = 1
 
-#: Not a size rule: the most one length prefix may make a reader allocate, shared with
-#: TensorD (`protocol::MAX_FRAME`). Load replies grow with their checkpoint (an as-is text
-#: encoder's ignored keys passed the old 64 KiB cap) and stay far below it, so it refuses
-#: only a corrupt or hostile prefix.
-MAX_FRAME = 256 << 20
+#: Not a size rule: the most one length prefix may make a reader allocate (the documents'
+#: guard, shared with TensorD's `protocol::MAX_FRAME`). It refuses only a corrupt or hostile
+#: prefix.
+MAX_FRAME = DOC_MAX_BYTES
 
 #: 4-byte big-endian unsigned frame-length prefix. Fixed width so the reader always knows
 #: exactly how many header bytes to collect before it commits to anything.
