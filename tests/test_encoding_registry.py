@@ -9,6 +9,7 @@ import tensorfs
 
 from cozy_runtime.derive import quantization
 from cozy_runtime.internal.encoding import (
+    SPEC_INT8_CONVROT256,
     SPEC_MXFP8,
     SPEC_PLAIN,
     SPEC_ROWWISE,
@@ -41,11 +42,16 @@ def test_every_provider_is_reviewed_against_the_exact_tensorfs_03_seed() -> None
         SPEC_SCALED_SCALAR,
         SPEC_SCALED_SCALAR_WEIGHT_ONLY,
         SPEC_MXFP8,
+        SPEC_INT8_CONVROT256,
     }
     assert reviewed <= set(seeds)
     assert RETIRED.isdisjoint(seeds)
     assert quantization.PLAIN_SPEC == SPEC_PLAIN
-    assert set(quantization._ARTIFACT_SPECS.values()) == {SPEC_ROWWISE, SPEC_MXFP8}
+    assert set(quantization._ARTIFACT_SPECS.values()) == {
+        SPEC_ROWWISE,
+        SPEC_MXFP8,
+        SPEC_INT8_CONVROT256,
+    }
 
     providers = launch_providers()
     assert set(providers) == reviewed
@@ -69,6 +75,7 @@ def test_reviewed_roles_and_vector_bytes_did_not_move() -> None:
         SPEC_SCALED_SCALAR: ({"data", "weight_scale"}, {"input_scale"}),
         SPEC_SCALED_SCALAR_WEIGHT_ONLY: ({"data", "weight_scale"}, {"input_scale"}),
         SPEC_MXFP8: ({"data", "scale"}, set()),
+        SPEC_INT8_CONVROT256: ({"data", "scale"}, set()),
     }
     for digest, implementations in providers.items():
         required, optional = expected_roles[digest]
