@@ -22,9 +22,9 @@ bindings. Model evaluation uses the same native source metadata/transport, with 
 `ctx.output(slot)` and `ctx.adopt_model(native_receipt)`; algorithms use TensorFS
 declarations, source inspection and writer handles directly.
 
-The existing executor control lane remains bounded at 64 KiB. File descriptors
-cross through that accepted executor's existing local channel. Tensor/config bytes
-and larger native metadata belong to scoped TensorFS handles, not Runtime files.
+File descriptors cross through the accepted executor's existing local channel.
+Tensor/config bytes and larger native metadata belong to scoped TensorFS handles, not
+Runtime files.
 Socket shutdown must interrupt blocked reads on cancellation/replacement. Observer
 disconnect or reconnect generation does not revoke an accepted local attempt.
 

@@ -1,4 +1,4 @@
-"""The worker <-> device-executor seam: CONTROL, not data, byte-accounted.
+"""The worker <-> device-executor seam: length-framed JSON, byte-accounted.
 
 One `SOCK_STREAM` unix socket carries length-framed canonical-JSON commands and replies:
 a fixed 4-byte big-endian length prefix, then exactly that many body bytes (#448). A byte
@@ -8,11 +8,10 @@ silently truncates an over-buffer message, the wedge defect class of cr-007).
 
 Three properties are structural rather than reviewed:
 
-* **Control, not data.** Every frame is capped (`MAX_FRAME`) and the declared length is
-  refused BEFORE the body is read or allocated. Every wire byte in both directions is
-  counted. Output bytes never cross this seam — they land in the attempt spool the
-  worker brokered, and the worker reads them from there, which is also what keeps
-  the executor's writable storage to exactly that spool (§3.1).
+* **No size rule.** A frame is as large as its structure; `MAX_FRAME` only refuses a corrupt
+  or hostile length prefix, before any body byte is read. Every wire byte in both directions
+  is counted. Output bytes never cross this seam — they land in the attempt spool the worker
+  brokered, which keeps the executor's writable storage to exactly that spool (§3.1).
 * **No credentials cross it.** `send` refuses a frame carrying a key from `SECRET_KEYS`, so a
   grant token or worker JWT reaching the executor is a typed refusal at the boundary and not
   a code-review rule. The executor holds no RecordOwner, storage or billing credential.
@@ -43,9 +42,11 @@ from typing import Any, NoReturn
 #: an incompatible change to required commands/semantics raises it.
 EXECUTOR_PROTOCOL_REVISION = 1
 
-#: Frames are control. 64 KiB is generous for a payload document and small enough that a
-#: caller trying to move tensors or media through here fails immediately.
-MAX_FRAME = 64 * 1024
+#: Not a size rule: the most one length prefix may make a reader allocate, shared with
+#: TensorD (`protocol::MAX_FRAME`). Load replies grow with their checkpoint (an as-is text
+#: encoder's ignored keys passed the old 64 KiB cap) and stay far below it, so it refuses
+#: only a corrupt or hostile prefix.
+MAX_FRAME = 256 << 20
 
 #: 4-byte big-endian unsigned frame-length prefix. Fixed width so the reader always knows
 #: exactly how many header bytes to collect before it commits to anything.
@@ -55,11 +56,9 @@ HEADER = struct.Struct("!I")
 #: worker (§3.1); the executor cannot leak what it was never handed.
 SECRET_KEYS = frozenset({"token", "credential", "authorization", "secret", "jwt"})
 
-#: The attempt-spool file the executor writes its serialized typed result into. The public
-#: contract admits an inline result up to 4 MiB and this frame admits 64 KiB, so the bytes
-#: take the same road the output blobs already take — the brokered spool — and only their
-#: digest and length cross here. The WORKER names the file, so no path ever comes off
-#: the child (cr-007).
+#: The attempt-spool file the executor writes its serialized typed result into: the bytes
+#: take the road the output blobs take, and only their digest and length cross here. The
+#: WORKER names the file, so no path ever comes off the child (cr-007).
 RESULT_DOCUMENT = "result.canonical"
 
 #: Peer-gone errnos: ECONNRESET, EPIPE, ENOTCONN.
@@ -112,11 +111,7 @@ class Channel:
         data = json.dumps(message, separators=(",", ":"), sort_keys=True).encode()
         if len(data) > MAX_FRAME:
             self.refusals.append("frame_too_large")
-            raise SeamError(
-                "frame_too_large",
-                f"{len(data)} B over the {MAX_FRAME} B control cap — the seam carries "
-                "control, not data (bytes go through the brokered attempt spool)",
-            )
+            raise SeamError("frame_too_large", f"{len(data)} B over the {MAX_FRAME} B guard")
         with self.sending:
             self.sock.sendall(HEADER.pack(len(data)) + data)
             self.sent_bytes += HEADER.size + len(data)
@@ -287,8 +282,8 @@ class Channel:
             self.refusals.append("frame_over_cap")
             raise SeamError(
                 "frame_over_cap",
-                f"declared {length} B against the {MAX_FRAME} B control cap — refused "
-                "before allocation; the channel is not recoverable past a lying header",
+                f"declared {length} B against the {MAX_FRAME} B guard — refused before "
+                "allocation; the channel is not recoverable past a lying header",
             )
         body = self._read_exact(length, boundary=False, stall_timeout=timeout, deadline=deadline)
         assert body is not None  # boundary=False never yields None
@@ -325,7 +320,7 @@ class Channel:
                 read_timeout = remaining if read_timeout is None else min(read_timeout, remaining)
             self.sock.settimeout(read_timeout)
             try:
-                chunk = self.sock.recv(want - len(buf))
+                chunk = self.sock.recv(min(want - len(buf), 1 << 20))
             except TimeoutError:
                 if deadline is not None and time.monotonic() >= deadline:
                     raise SeamError(
