@@ -682,10 +682,12 @@ class Int8ConvRotNativeLeaf:
     def leaf(
         self, torch: ModuleType, parts: Mapping[str, Tensor], replaced: Tensor, out_dtype: Tensor
     ) -> Tensor:
-        if torch.cuda.is_available():
-            # Asks for the op (built at boot) beside the weight fill; until it lands the
-            # reviewed comfy-kitchen binary serves, else the eager int8 GEMM.
-            int8_linear.native(torch, torch.cuda.current_device())
+        if (
+            torch.cuda.is_available()
+            and int8_linear.native(torch, torch.cuda.current_device()) is None
+        ):
+            # The op is built at boot; until it lands the reviewed comfy-kitchen binary serves
+            # (its build starts here, beside the weight fill), else the eager int8 GEMM.
             int8_linear.kitchen(torch, torch.cuda.current_device())
         data = parts["data"]
         in_features, out_features, bias = _leaf_geometry(replaced, data)
