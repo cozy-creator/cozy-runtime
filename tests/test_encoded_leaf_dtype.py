@@ -10,8 +10,13 @@ try:
 except ImportError as exc:
     raise unittest.SkipTest("the Torch/Diffusers integration environment is required") from exc
 
+from cozy_runtime.derive.microscale import encode_int8_convrot256
 from cozy_runtime.internal import accel
-from cozy_runtime.internal.encoding.leaves import RowwiseNativeLeaf, quantize_activation_rowwise
+from cozy_runtime.internal.encoding.leaves import (
+    Int8ConvRotNativeLeaf,
+    RowwiseNativeLeaf,
+    quantize_activation_rowwise,
+)
 
 
 class EncodedLeafDtypeTest(unittest.TestCase):
@@ -42,6 +47,26 @@ class EncodedLeafDtypeTest(unittest.TestCase):
                 self.assertEqual(get_parameter_dtype(leaf), dtype)
                 torch.testing.assert_close(leaf.data.float(), payload.float())
                 torch.testing.assert_close(leaf.scale, scales)
+
+    def test_under_autocast_a_leaf_computes_and_returns_the_autocast_dtype(self) -> None:
+        """As the `nn.Linear` it replaced: an f16-stored weight under bf16 autocast takes a
+        bf16 operand and returns bf16, bias included, so no f32 creeps into the stream."""
+        generator = torch.Generator().manual_seed(5)
+        weight = torch.randn(16, 256, generator=generator) * 0.05
+        encoded = encode_int8_convrot256("w", weight.numpy())
+        data = torch.frombuffer(bytearray(encoded.payload), dtype=torch.int8).reshape(16, 256)
+        scale = torch.frombuffer(bytearray(encoded.companions[0].raw), dtype=torch.float32)
+        original = torch.nn.Linear(256, 16, dtype=torch.float16)
+        leaf = Int8ConvRotNativeLeaf("int8-convrot256/1").leaf(
+            torch, {"data": data, "scale": scale}, original, torch.float16
+        )
+        x = torch.randn(4, 256, generator=generator)
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            out = leaf(x)
+            expected = original.to(torch.float32)(x)
+        self.assertEqual(out.dtype, torch.bfloat16)
+        torch.testing.assert_close(out.float(), expected, rtol=0.05, atol=0.02)
+        self.assertEqual(leaf(x.half()).dtype, torch.float16)
 
     @unittest.skipUnless(accel.present(torch, "cuda"), "requires a real CUDA FP8 device")
     def test_upstream_cast_preserves_nonunit_scaled_gpu_forward(self) -> None:

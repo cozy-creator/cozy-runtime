@@ -266,9 +266,16 @@ def _leaf_class(torch: Any) -> Any:
 
         def forward(self, x: Any, *, prequantized: PreQuantized | None = None) -> Any:
             # Semantic hooks still see the original positional float operand.
-            out = self._cozy_forward(self, x if prequantized is None else prequantized)
+            if prequantized is None and torch.is_autocast_enabled(x.device.type):
+                # As the replaced `nn.Linear` does under autocast: compute from, and return,
+                # the autocast dtype, whatever the stored weight's logical dtype is.
+                dtype = torch.get_autocast_dtype(x.device.type)
+                out = self._cozy_forward(self, x.to(dtype), dtype)
+            else:
+                operand = x if prequantized is None else prequantized
+                out = self._cozy_forward(self, operand, self.out_dtype)
             if self.bias is not None:
-                out = out + self.bias
+                out = out + self.bias.to(out.dtype)
             return out
 
         def extra_repr(self) -> str:
@@ -389,7 +396,7 @@ class RowwiseNativeLeaf:
         return 0
 
     @staticmethod
-    def _forward(leaf: Any, x: Any) -> Any:
+    def _forward(leaf: Any, x: Any, out_dtype: Any) -> Any:
         import torch
 
         payload, scale = leaf.data, leaf.scale
@@ -403,7 +410,7 @@ class RowwiseNativeLeaf:
             payload.t(),
             scale_a=xs,
             scale_b=scale.to(torch.float32).reshape(1, -1),
-            out_dtype=leaf.out_dtype,
+            out_dtype=out_dtype,
             use_fast_accum=True,
         )
         return out.reshape(*x.shape[:-1], -1)
@@ -541,7 +548,7 @@ class MicroScaledNativeLeaf:
         return 3 * rows * cols
 
     @staticmethod
-    def _forward(leaf: Any, x: Any) -> Any:
+    def _forward(leaf: Any, x: Any, out_dtype: Any) -> Any:
         import torch
 
         xq, xbytes = quantize_activation_mx(torch, x)
@@ -550,7 +557,7 @@ class MicroScaledNativeLeaf:
             leaf.data.t(),
             scale_a=to_blocked(torch, xbytes).view(torch.float8_e8m0fnu),
             scale_b=leaf.scale,
-            out_dtype=leaf.out_dtype,
+            out_dtype=out_dtype,
         )
         return out.reshape(*x.shape[:-1], -1)
 
@@ -654,10 +661,10 @@ class Int8ConvRotNativeLeaf:
         return 0
 
     @staticmethod
-    def _forward(leaf: Tensor, x: Tensor) -> Tensor:
+    def _forward(leaf: Tensor, x: Tensor, out_dtype: Tensor) -> Tensor:
         import torch
 
-        return int8_linear.matmul(torch, x, leaf.data, leaf.scale, leaf.out_dtype)
+        return int8_linear.matmul(torch, x, leaf.data, leaf.scale, out_dtype)
 
     def leaf(
         self, torch: ModuleType, parts: Mapping[str, Tensor], replaced: Tensor, out_dtype: Tensor
