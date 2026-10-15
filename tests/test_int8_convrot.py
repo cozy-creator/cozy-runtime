@@ -132,8 +132,8 @@ def test_leaf_matches_its_exact_weight() -> None:
     devices = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
     for device in devices:
         for dtype in (torch.float32, torch.bfloat16):
-            got = int8_linear.matmul(
-                torch, x.to(device, dtype), data.to(device), scale.to(device), dtype
+            got = int8_linear.linear(
+                torch, x.to(device, dtype), data.to(device), scale.to(device), None, dtype
             )
             assert got.shape == (3, 40, 64) and got.dtype == dtype
             error = (got.double().cpu() - reference).norm() / reference.norm()

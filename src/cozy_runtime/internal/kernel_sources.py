@@ -435,6 +435,9 @@ RECIPES: dict[str, Recipe] = {
             ),
         ),
         Recipe("comfy-kitchen", "setup", ("comfy-kitchen",), build_deps=("nanobind",)),
+        # `torch.ops.cozy.int8_*` (`int8_linear`): the Runtime's own sources and CUTLASS's
+        # headers; its CUTLASS 3.x units peak near 3 GB each.
+        Recipe("cozy-int8", "setup", ("cozy-int8-src", "cutlass"), place={"cutlass": "cutlass"}),
         Recipe(PYTHON, "python"),
     )
 }
@@ -526,6 +529,7 @@ def job(name: str, sm: int, root: Path | None = None) -> kernel_compile.Job:
     """The exact artifact `name` is on a card of capability `sm` in this environment."""
     recipe = RECIPES[name]
     sources, why = registry(root) if root is not None else (_pinned_sources(), "")
+    sources = {**{own: _own(own) for own in OWN}, **sources}
     inputs: dict[str, Any]
     wheel = sources.get(KITCHEN_WHEEL) if name == "comfy-kitchen" else None
     if _compatible_kitchen_wheel(wheel):
@@ -596,6 +600,20 @@ def _filename(pin: Pin) -> str:
     return name
 
 
+#: The Runtime's own kernel sources, shipped in its wheel: name -> package directory.
+OWN = {"cozy-int8-src": Path(__file__).parent / "int8_op"}
+
+
+@functools.cache
+def _own(name: str) -> Source:
+    """An in-tree source, keyed by the digest of its files: an edit is a new artifact."""
+    root = OWN[name]
+    digest = hashlib.sha256()
+    for path in sorted(p for p in root.rglob("*") if p.is_file() and "__pycache__" not in p.parts):
+        digest.update(path.relative_to(root).as_posix().encode() + b"\0" + path.read_bytes())
+    return Source(name, "0", str(root), digest.hexdigest())
+
+
 def _pinned_sources() -> dict[str, Source]:
     """No I/O: cache replay uses the Runtime pins even when archives/index are absent."""
     store = kernel_cache.configured() or kernel_cache.from_sealed(config.inherited_environment())
@@ -660,7 +678,9 @@ def _digest(path: Path) -> str:
 def _tree(source: Mapping[str, Any]) -> Path:
     """The part of a source a worker image carries, unpacked (`fetch`)."""
     named = str(source.get("file") or "")
-    return Path(named if named.endswith(".tree") else f"{source.get('preseed') or '-'}.tree")
+    if named.endswith(".tree") or Path(named).is_dir():
+        return Path(named)
+    return Path(f"{source.get('preseed') or '-'}.tree")
 
 
 def _extract(source: Mapping[str, Any], into: Path) -> Path:
@@ -776,6 +796,8 @@ def build_setup(
                 "PYTORCH_NVCC": str(nvcc),
                 "PYTHONPATH": os.pathsep.join([str(deps), *sys.path]),
                 "PYTHONNOUSERSITE": "1",
+                # The card it builds for, for a build that names its target itself.
+                "COZY_KERNEL_SM": str(spec.get("sm", 0)),
                 **recipe.env,
             }
         )

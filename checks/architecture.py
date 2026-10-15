@@ -616,7 +616,9 @@ def fence_torch_free_import() -> list[str]:
     cloned package stays inspectable and the base package installs without a 3 GB wheel.
     """
     bad = []
-    for path in py_files():
+    # A build script beside kernel sources (`internal/int8_op/setup.py`) is in no package:
+    # nothing imports it, and it builds against torch by design.
+    for path in (p for p in py_files() if (p.parent / "__init__.py").exists()):
         tree = ast.parse(path.read_text())
         for node in ast.walk(tree):
             if not isinstance(node, (ast.Import, ast.ImportFrom)):
