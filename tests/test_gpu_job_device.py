@@ -29,6 +29,8 @@ def probe(mode: str, root: Path, *, script: Path = PROBE) -> dict[str, Any]:
         pod_scope=str(root.resolve()),
     )
     visible = "" if mode in {"cpu", "cpu-order"} else os.environ.get("CUDA_VISIBLE_DEVICES", "0")
+    if mode == "torchless":
+        visible = "0"  # what TensorD sets for the GPU it gave; no CUDA is touched
     env = {name: value for name, value in os.environ.items() if not child_env.erased(name)}
     env.update(child_env.project_child_env({"CUDA_VISIBLE_DEVICES": visible, **cache.environment}))
     run = subprocess.run(
@@ -47,6 +49,14 @@ def test_cpu_parent_never_imports_torch_or_opens_cuda(tmp_path: Path) -> None:
     assert result["result"] == {"device": "cpu", "values": []}
     assert not result["torch_imported"] and not result["device_initialized"]
     assert result["quiescent"] and result["gpu_count"] == 0
+
+
+@pytest.mark.skipif(importlib.util.find_spec("torch") is not None, reason="needs no torch")
+def test_a_gpu_job_without_torch_runs_on_the_devices_it_was_given(tmp_path: Path) -> None:
+    result = probe("torchless", tmp_path)
+    assert result["result"] == {"device": "0", "values": [42.0]}
+    assert not result["torch_imported"] and not result["device_initialized"]
+    assert result["quiescent"] and result["gpu_count"] == 0  # it opened no device
 
 
 def test_prepare_establishes_device_boundary_before_kernel_imports(tmp_path: Path) -> None:

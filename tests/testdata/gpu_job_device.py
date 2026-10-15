@@ -15,15 +15,34 @@ from cozy_runtime.internal.executor import Executor
 from cozy_runtime.internal.executor_commands import JobBudget, RunJob
 from cozy_runtime.internal.seam import RESULT_DOCUMENT, Channel, SeamError
 
+# Run 6132: an undeclared job holds the machine's GPU, but its environment has no torch.
+TORCHLESS = """
+import os
+import msgspec
+from cozy_runtime.author import App, Context
+app = App()
+class Request(msgspec.Struct):
+    pass
+class Result(msgspec.Struct):
+    device: str
+    values: list[float]
+@app.job
+def compute(payload: Request, ctx: Context) -> Result:
+    return Result(os.environ.get("CUDA_VISIBLE_DEVICES", ""), [42.0])
+"""
+
 
 def main() -> None:
     mode, directory = sys.argv[1:]
-    assert mode in {"cpu", "gpu", "early"}
+    assert mode in {"cpu", "gpu", "early", "torchless"}
     root = Path(directory)
     root.mkdir(parents=True, exist_ok=True)
     project = root / "project"
     project.mkdir()
-    (project / "device_job.py").write_text("""
+    (project / "device_job.py").write_text(
+        TORCHLESS
+        if mode == "torchless"
+        else """
 import msgspec
 from cozy_runtime.author import App, Context
 app = App()
@@ -41,7 +60,8 @@ def compute(payload: Request, ctx: Context) -> Result:
     values = torch.full((512,), 7.0, device=str(ctx.device)) * 2
     assert values.device.type == "cuda"
     return Result(str(values.device), values.cpu().tolist())
-""")
+"""
+    )
     (project / "package.toml").write_text('[application]\nobject="device_job:app"\n')
     found = discover(project)
     if mode == "early":

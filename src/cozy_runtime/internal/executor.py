@@ -48,6 +48,7 @@ import gc
 import hashlib
 import importlib
 import importlib.metadata
+import importlib.util
 import json
 import math
 import os
@@ -3815,8 +3816,9 @@ class Executor:
         and no serving loop underneath it. The three differences from `invoke`, out loud:
 
         1. **No prepared generation is required.** The admitted slot's device count
-           determines accelerator initialization. A CPU job imports no Torch and opens no
-           CUDA context; a GPU transform can use its device without constructing an
+           determines accelerator initialization. A CPU job, or one whose environment has no
+           Torch, imports no Torch and opens no CUDA context (its GPU is only the visible
+           devices TensorD set); a GPU transform can use its device without constructing an
            inference model. A job Model remains a derive-only Manifest capability.
         2. **Job services are injected**: a resumable Scratch tree keyed on the RUN, the
            durable checkpoint exchange, and the typed budget facts.
@@ -3834,7 +3836,7 @@ class Executor:
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
         budget = command.budget
-        if budget.gpu_count > 0:
+        if budget.gpu_count > 0 and importlib.util.find_spec("torch") is not None:
             import torch
 
             self.torch = torch
