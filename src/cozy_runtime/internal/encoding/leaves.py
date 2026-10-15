@@ -699,12 +699,14 @@ class Int8ConvRotNativeLeaf:
 
 @dataclass(frozen=True, slots=True)
 class Nvfp4NativeLeaf:
-    """`nvfp4-w4a4/1` ENCODED GEMM: W4A4 on Blackwell's FP4 tensor cores (`nvfp4_linear`).
+    """`nvfp4-w4a4/1` ENCODED GEMM: the stored E2M1 payload and E4M3 block scales stay resident
+    (0.56 bytes per weight) and are multiplied as they are (`nvfp4_linear`).
 
-    The stored E2M1 payload and its E4M3 block scales go to cuBLASLt as they are; each activation is
-    quantized to NVFP4 at dispatch against its own tensor amax. On real FLUX.3 Klein activations the
-    W4A4 product is 5-10% from bf16 per linear (int8-convrot: 0.5-1.2%), for half int8's bytes and
-    1.0-1.3x its GEMM rate on an RTX 5090.
+    On Blackwell a product of more than 16 rows is W4A4 on the FP4 tensor cores: each activation is
+    quantized at dispatch against its own tensor amax, and on real FLUX.3 Klein activations that is
+    5-10% from bf16 per linear (int8-convrot: 0.5-1.2%) at 1.3-1.5x the int8 leaf's rate on an RTX
+    5090. Every other product, and every one before Blackwell, is W4A16: Triton decodes the weight
+    in registers onto the bf16 tensor cores, which is the bandwidth-bound decode loop of an LM.
     """
 
     encoding: str
@@ -719,7 +721,7 @@ class Nvfp4NativeLeaf:
 
     @property
     def device_predicate(self) -> str:
-        return "cuda.sm100+"
+        return "cuda.sm80+"
 
     @property
     def reviewed_specs(self) -> frozenset[str]:
@@ -740,6 +742,10 @@ class Nvfp4NativeLeaf:
     @property
     def optional(self) -> frozenset[str]:
         return frozenset()
+
+    @property
+    def output_dtype_rule(self) -> str:
+        return "contract"
 
     def supports(self, shape: Sequence[int]) -> str:
         """The decode's block law, and cuBLASLt's FP4 GEMM: K divisible by 32, N by 8."""
