@@ -38,17 +38,19 @@ def test_chunked_encode_uses_the_tensor_amax() -> None:
     assert encode_nvfp4("w", values[:16]).companions[1].raw != whole.companions[1].raw
 
 
-def test_recipe_writes_the_three_roles(tmp_path: Path) -> None:
+def test_one_lane_carries_nvfp4_beside_int8(tmp_path: Path) -> None:
     def row(shape: tuple[int, int], seed: int) -> tuple[str, tuple[int, ...], bytes]:
         return "bf16", shape, st.from_f32(weight(*shape, seed), "BF16")
 
     rows = {
-        "transformer": {"blocks.0.ff.weight": row((48, 64), 1), "proj_out.weight": row((8, 64), 2)}
+        "transformer": {"blocks.0.ff.weight": row((48, 64), 1), "proj_out.weight": row((8, 64), 2)},
+        "text_encoder": {"layers.0.q_proj.weight": row((16, 256), 3)},
     }
     store, source = mint(tmp_path, rows)
     plan = QuantizationPlan(
-        components=("transformer",),
-        include=("transformer.blocks.*.weight",),
+        components=("transformer", "text_encoder"),
+        include=("transformer.blocks.*.weight", "text_encoder.layers.*.weight"),
+        encodings=(("transformer.*", ENCODING),),
         output_precision="preserve",
     )
     with NativeExecution(store, tmp_path, "nvfp4", {"source": source}, {"model": BOUND}) as owner:
@@ -57,10 +59,12 @@ def test_recipe_writes_the_three_roles(tmp_path: Path) -> None:
             fake_telemetry(fake_attempt("nvfp4")),
             source=Weights(source.manifest.digest),
             plan=plan,
-            encoding=ENCODING,
+            encoding="int8-convrot256/1",
             output="model",
         )
     parsed = header(store, artifact)
+    q_proj = parsed["components"]["text_encoder"]["layers.0.q_proj.weight"]
+    assert q_proj["encoding"] == dict(tensorfs.seed_digests())["int8-convrot256/1"]
     assert dict(tensorfs.seed_digests())[ENCODING] == SPEC_NVFP4
     ff = parsed["components"]["transformer"]["blocks.0.ff.weight"]
     parts = ff["parts"]
