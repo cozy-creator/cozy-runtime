@@ -2021,9 +2021,10 @@ def room(weights: Weights, nbytes: int) -> int:
 def test_an_image_decode_short_of_memory_is_still_the_untiled_image(tmp_path: Path) -> None:
     """Run 4281 (SDXL in 1.5 GiB) fell back to a blended tiled decode 30 dB from its control.
     Diffusers' own decode runs as it is: with room, untouched; under a cap too small for its
-    maps, an op that runs out runs in bands of rows with its result in host memory, and the
-    ops after it read those rows over the bus once each. Either way the image is the untiled
-    one to fp16 rounding. The cap is the process's own: the card is never filled."""
+    maps, an op that runs out runs in bands of rows, its result on the card when the tensors
+    used least recently can move to host memory, else in host memory, and the ops after it
+    read host rows over the bus once each. Either way the image is the untiled one to fp16
+    rounding. The cap is the process's own: the card is never filled."""
     weights = Weights(torch, torch.device("cuda", 0), "cuda")
     weights.set_budget(-1, pinned=1 << 30)
     model, plain = plane_vae(weights, tmp_path / "vae", kl_vae)
@@ -2034,7 +2035,7 @@ def test_an_image_decode_short_of_memory_is_still_the_untiled_image(tmp_path: Pa
     roomy = decode(model, z)
     assert "bands" not in weights.modes
     short = decode(model, z, room(weights, 96 << 20))
-    assert "host memory" in weights.modes["bands"]
+    assert "bands" in weights.modes  # it ran out, and ops ran in bands
     for image in (roomy, short):
         torch.testing.assert_close(image, reference, atol=1e-2, rtol=0)
 
