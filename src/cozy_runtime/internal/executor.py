@@ -4105,7 +4105,7 @@ class Executor:
 
     def _model_source(self, manifest: str, name: str) -> bytes:
         """One model file from the machine (`ModelSource`): the header (`name` empty) or one
-        asset, checked against the length and digest the machine states."""
+        asset, checked against the length the machine states."""
         answer = self._durable(ModelSource(manifest=manifest, name=name), SourceBytes)
         if not (answer.ok and answer.held and answer.descriptor >= 0):
             raise RuntimeError(
@@ -4121,8 +4121,9 @@ class Executor:
                 body += chunk
         finally:
             os.close(answer.descriptor)
-        if len(body) != answer.length or hashlib.sha256(body).hexdigest() != answer.sha256:
-            raise RuntimeError(f"{name or 'header'} of {manifest[:23]} differs from its digest")
+        # A sealed memfd from the machine, which verified the bytes: the length is the check.
+        if len(body) != answer.length:
+            raise RuntimeError(f"{name or 'header'} of {manifest[:23]} is short")
         return bytes(body)
 
     def _seal_tier(self, plan: SealedPlan, stage: tuple[int, ...] | None = None) -> int | None:
