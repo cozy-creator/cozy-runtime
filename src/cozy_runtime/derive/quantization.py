@@ -563,7 +563,7 @@ def quantize_component_into(
             tel.log(
                 "quantized tensor",
                 level="info",
-                encoding=encoding,
+                encoding=name,
                 component=target_component,
                 key=tensor.key,
                 done=done,
