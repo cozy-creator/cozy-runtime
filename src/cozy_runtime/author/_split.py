@@ -1,7 +1,5 @@
-"""An op a package lets run in pieces: the package says how it splits (`Cut`), the Runtime
-says how finely, from the bytes the op measured per input element and what the device has
-free for it (idle weights unmap first). Whole when it fits: a larger card runs fewer pieces
-of the same request, and none of the package's code names a size."""
+"""`split`: the package says how an op cuts (`Cut`); the Runtime says how finely, from the
+op's measured bytes per element and the device's free memory."""
 
 from __future__ import annotations
 
@@ -21,11 +19,9 @@ FIRST = 8
 
 @dataclass(frozen=True, slots=True)
 class Cut:
-    """A dimension `fn` may be cut along. `dim` indexes its input and its output alike; the
-    output's is `scale` times the input's (8 for a latent decode, 1/8 for its encode). Pieces
-    start on multiples of `align` input elements and neighbours share `overlap` of them, which
-    the output cross-fades; with none the pieces join exactly (a batch, a frame axis that
-    carries no state)."""
+    """A dimension of input and output `fn` may be cut along. The output extent is `scale` times
+    the input's; pieces start on multiples of `align` and neighbours share `overlap` elements,
+    cross-faded in the output (none: pieces join exactly)."""
 
     dim: int
     scale: float = 1.0
@@ -34,20 +30,19 @@ class Cut:
 
 
 class Pieces(Protocol):
-    """The Runtime's side of `split`, one per executor process."""
+    """The Runtime's side of `split`."""
 
     def room(self, key: str) -> tuple[float | None, int]:
-        """The peak bytes per input element `key` measured (None before its first run), and
-        the device bytes one piece may take now."""
+        """Measured peak bytes per input element (None until measured), and the bytes one
+        piece may take now."""
         ...
 
     def piece(self, key: str, elements: int, need: int) -> AbstractContextManager[None]:
-        """One piece of `elements` input elements: room for `need` bytes first, its peak
-        measured and kept for `key`."""
+        """Make room for `need` bytes, run one piece and keep its measured peak."""
         ...
 
     def ran(self, name: str, pieces: int) -> None:
-        """The op `name` ran in `pieces` pieces: the run's record of how tight memory was."""
+        """Record that `name` ran in `pieces` pieces."""
         ...
 
 
@@ -60,18 +55,16 @@ def install(runtime: Pieces | None) -> None:
 
 
 def split(fn: Callable[[Any], Any], x: Any, *cuts: Cut) -> Any:
-    """`fn(x)`, with `fn` a tensor-to-tensor op whose result on a window of `x` along `cuts`
-    is that window of its whole result (up to `overlap`). The Runtime runs it whole when the
-    device can hold it, else in the fewest pieces that fit, from the bytes per element its
-    first call measured; a piece that still runs out of memory runs again at half the size.
-    Without a Runtime that manages device memory (a CPU executor, a test) it runs whole."""
+    """`fn(x)` in the fewest pieces along `cuts` that fit the device; `fn` maps each window of
+    `x` to that window of its result. A piece that runs out of memory runs again at half the
+    size. Without a managing Runtime it runs whole."""
     runtime = _RUNTIME
     if runtime is None or not cuts:
         return fn(x)
     shape = tuple(int(n) for n in x.shape)
     key = _key(fn, shape, cuts, x.dtype)
     ratio, room = runtime.room(key)
-    # Unmeasured, it runs in pieces small enough to fit almost anywhere, and measures.
+    # Unmeasured: small pieces, measured as they run.
     windows = _windows(shape, cuts, room / ratio if ratio else math.prod(shape) / FIRST)
     while True:
         try:
@@ -91,7 +84,7 @@ type Window = tuple[tuple[int, int], ...]
 def _key(
     fn: Callable[[Any], Any], shape: tuple[int, ...], cuts: tuple[Cut, ...], dtype: Any
 ) -> str:
-    """Bytes per element follow the op and every extent it is not cut along."""
+    """Bytes per element depend on the op and its uncut extents."""
     cut = {c.dim % len(shape) for c in cuts}
     rest = tuple(n if i not in cut else -1 for i, n in enumerate(shape))
     return f"{_name(fn)}{rest}:{dtype}"
@@ -106,8 +99,7 @@ def _short(exc: BaseException) -> bool:
 
 
 def _spans(length: int, cut: Cut, count: int) -> list[tuple[int, int]]:
-    """About `count` spans covering `length`: aligned starts, `overlap` shared, none shorter
-    than an overlap past it."""
+    """About `count` aligned spans covering `length`, neighbours sharing `overlap`."""
     step = max(-(-max(length - cut.overlap, 1) // count), cut.overlap, 1)
     step = -(-step // cut.align) * cut.align
     starts = range(0, max(length - cut.overlap, 1), step)
@@ -115,8 +107,7 @@ def _spans(length: int, cut: Cut, count: int) -> list[tuple[int, int]]:
 
 
 def _windows(shape: tuple[int, ...], cuts: tuple[Cut, ...], most: float) -> list[Window]:
-    """The fewest windows with at most `most` elements each where the cuts allow, the longest
-    pieces cut first."""
+    """The fewest windows of at most `most` elements, longest axis cut first."""
     lengths = [shape[c.dim] for c in cuts]
     counts = [1] * len(cuts)
     spans = [_spans(n, c, 1) for n, c in zip(lengths, cuts, strict=True)]
@@ -152,7 +143,7 @@ def _longest(spans: Sequence[tuple[int, int]]) -> int:
 def _largest(
     shape: tuple[int, ...], cuts: tuple[Cut, ...], spans: Sequence[Sequence[tuple[int, int]]]
 ) -> int:
-    """Elements in the largest window, from each cut's spans."""
+    """Elements in the largest window."""
     rest = math.prod(shape) // math.prod(shape[c.dim] for c in cuts)
     return rest * math.prod(_longest(s) for s in spans)
 
@@ -213,7 +204,7 @@ def _run(
 
 
 def _ramp(length: int, overlap: int, start: bool, end: bool) -> list[float]:
-    """1 inside, a cosine rise over the `overlap` a neighbour shares at either end."""
+    """1 inside, a cosine ramp over a shared `overlap` at either end."""
     weight = [1.0] * length
     span = max(0, min(overlap, length - 1))
     if span:
