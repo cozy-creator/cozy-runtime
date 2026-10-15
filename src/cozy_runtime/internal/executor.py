@@ -2758,8 +2758,6 @@ class Executor:
             "ready": True,
             "constructed_model_digest": self.constructed_model_digest,
             "entrypoints": sorted(self.surface_names),
-            "plan": plan.seam_document(),
-            "delivery": self.facts["delivery"],
             "facts": self.facts,
         }
 
@@ -2885,13 +2883,12 @@ class Executor:
         )
         routes: dict[str, int] = {}
         kernels: dict[str, int] = {}
-        for _, _, reply in children:
-            delivery = reply.get("delivery") or {}
+        deliveries = {parameter: facts.get("delivery") or {} for parameter, facts in facts_rows}
+        for delivery in deliveries.values():
             for name, count in (delivery.get("routes") or {}).items():
                 routes[str(name)] = routes.get(str(name), 0) + int(count)
             for name, count in (delivery.get("kernels") or {}).items():
                 kernels[str(name)] = kernels.get(str(name), 0) + int(count)
-        deliveries = {parameter: reply["delivery"] for parameter, _, reply in children}
         materializations = {row.get("materialization", "") for row in deliveries.values()}
         delivery = {
             "variant": ", ".join(
@@ -2912,9 +2909,7 @@ class Executor:
             ),
             "routes": routes,
             "kernels": kernels,
-            "calibrated": all(
-                bool(reply.get("delivery", {}).get("calibrated")) for _, _, reply in children
-            ),
+            "calibrated": all(bool(row.get("calibrated")) for row in deliveries.values()),
             "objective": ", ".join(
                 sorted({str(row.get("objective", "")) for row in deliveries.values()})
             ),
@@ -2957,16 +2952,6 @@ class Executor:
             "torch_version": str(last.get("torch_version", "")),
             "cuda_version": str(last.get("cuda_version", "")),
             "custody": "joint",
-            "ignored_extra_keys": [
-                f"{parameter}/{key}"
-                for parameter, facts in facts_rows
-                for key in facts.get("ignored_extra_keys", [])
-            ],
-            "ignored_extra_warnings": [
-                f"{parameter}: {line}"
-                for parameter, facts in facts_rows
-                for line in facts.get("ignored_extra_warnings", [])
-            ],
             "delivery": delivery,
             "models": {parameter: facts for parameter, facts in facts_rows},
         }
@@ -2976,7 +2961,6 @@ class Executor:
             "ready": True,
             "constructed_model_digest": self.constructed_model_digest,
             "entrypoints": sorted(self.surface_names),
-            "delivery": delivery,
             "facts": self.facts,
         }
 
@@ -3026,7 +3010,6 @@ class Executor:
             "weightless": True,
             "constructed_model_digest": "",
             "entrypoints": sorted(self.surface_names),
-            "delivery": {},
             "facts": self.facts,
         }
 
@@ -5014,126 +4997,23 @@ class Executor:
         }
 
 
-#: Telemetry a reply can lose to fit one frame; the worker reads each as optional.
-_SHEDDABLE = ("execution", "attribution")
-
-#: The keys the minimal reply below actually carries. A reply whose own keys are a subset
-#: of these loses nothing by being reduced; anything else would be silently mutilated.
-_MINIMAL_KEYS = frozenset(
-    {
-        "reply",
-        "ok",
-        "code",
-        "detail",
-        "outcome",
-        "execution_observation",
-        "capture",
-        "quiescent",
-        "env_intact",
-        "env_changed",
-        "poisoned",
-        "metrics",
-        "outputs",
-        "result_ref",
-        "result_schema_digest",
-        "oversize_result_bytes",
-        "shortfall",
-        "residency",
-        "adjustments",
-        "observations",
-        "observation_caps",
-        "terminal",
-        "origin",
-        "fields",
-    }
-)
+#: Telemetry the worker reads as optional: what a reply loses when an author's key reads as
+#: a credential (`tel.log(..., token=1)`) and the seam refuses the frame.
+_TELEMETRY = ("observations", "execution", "attribution")
 
 
 def _send_reply(channel: Channel, reply: dict[str, Any]) -> None:
-    """Put ONE reply on the seam, and MAKE IT FIT.
-
-    The observation ring's own budget is 128 KiB and one control frame is 64 KiB, so a tail
-    the emit boundary bounded correctly can still produce a reply the seam refuses. That
-    refusal used to fire HERE, outside every handler, killing the executor — and the attempt
-    lost its real terminal to an ABANDONED that named the death instead of the refusal.
-    Reproduced from job-001's shape: a body that narrates a border and then refuses at the
-    host-fit point sends 134,743 B over a 65,536 B cap.
-
-    The TAIL is the only part of a reply that can grow, so the tail is what gives way, and
-    what it gave up is a NUMBER on `observation_caps` — the same rule the ring already
-    follows. A reply that does not fit even empty ships the OUTCOME, which is the one thing
-    a RecordOwner cannot reconstruct from anywhere else.
-
-    AND THE FALLBACK NEVER CLAIMS SUCCESS. It was written for INVOKE and used for every
-    command, and it copied `ok` through while dropping every key that makes an ok reply
-    mean anything — so an oversized PREPARE reply arrived as `{"ok": True}` with no
-    construction digest, no plan and no facts, and the worker read a key that was not
-    there. That KeyError killed the control stream AFTER the fill had put 90.84 GiB on the
-    card; the client reconnected, the placement was re-accepted, and prepare ran a SECOND
-    time in the SAME executor — 90.84 + 48.18 GiB on a 139.81 GiB card, which is the whole
-    of the "the fill allocates 63% more than it accounts for" gap (#574b). The fill plane
-    was never wrong. A reply this path had to mutilate is a REFUSAL that names itself, so
-    the caller takes the refusal branch instead of reading a success that is not one.
-    """
-    held = len(reply.get("observations") or ())
-    rows = list(reply.get("observations") or ())
-    # Telemetry the worker reads as optional goes next, before any result is refused.
-    shed = [key for key in _SHEDDABLE if key in reply]
-    while True:
-        try:
-            channel.send(reply)
-            return
-        except SeamError as exc:
-            # A telemetry key the seam reads as a credential sheds the same way.
-            if exc.code not in ("frame_too_large", "credential_at_seam") or not (rows or shed):
-                break
-            caps = dict(reply.get("observation_caps") or {})
-            if rows:
-                rows = rows[(len(rows) + 1) // 2 :]
-                reply["observations"] = rows
-                caps["dropped_for_frame"] = held - len(rows)
-            else:
-                key = shed.pop()
-                del reply[key]
-                caps[f"dropped_{key}_for_frame"] = 1
-            reply["observation_caps"] = caps
-    reduced = not reply.get("ok") or set(reply) <= _MINIMAL_KEYS
-    channel.send(
-        {
-            "reply": reply.get("reply"),
-            "ok": reply.get("ok") if reduced else False,
-            "code": reply.get("code") if reduced else "reply_too_large",
-            "detail": str(reply.get("detail", ""))[:512]
-            if reduced
-            else (
-                f"the {reply.get('reply')!r} reply does not fit one control frame and the "
-                f"keys it declares ({', '.join(sorted(set(reply) - _MINIMAL_KEYS))[:200]}) "
-                "cannot be dropped without inventing a success. It refuses instead: a "
-                "RecordOwner acting on a reply that lost its own contents is worse than one "
-                "told the reply could not be sent"
-            ),
-            "outcome": reply.get("outcome"),
-            "quiescent": reply.get("quiescent"),
-            "env_intact": reply.get("env_intact"),
-            "env_changed": reply.get("env_changed") or [],
-            "poisoned": reply.get("poisoned"),
-            **(
-                {"traceback": "\n".join(prepare_diagnostics.activity_lines(reply["traceback"]))}
-                if reply.get("reply") in _TRACED_COMMANDS and reply.get("traceback")
-                else {}
-            ),
-            "metrics": reply.get("metrics"),
-            "outputs": reply.get("outputs") or [],
-            "result_ref": reply.get("result_ref"),
-            "result_schema_digest": reply.get("result_schema_digest"),
-            "oversize_result_bytes": reply.get("oversize_result_bytes"),
-            "shortfall": reply.get("shortfall"),
-            "residency": reply.get("residency") or {},
-            "adjustments": reply.get("adjustments") or [],
-            "observations": [],
-            "observation_caps": {"dropped_for_frame": held, "minimal_reply": 1},
-        }
-    )
+    """Put ONE reply on the seam. Telemetry never costs a reply its outcome."""
+    try:
+        channel.send(reply)
+    except SeamError as exc:
+        if exc.code != "credential_at_seam" or not any(key in reply for key in _TELEMETRY):
+            raise
+        dropped = {f"dropped_{key}_for_credential": 1 for key in _TELEMETRY if key in reply}
+        for key in _TELEMETRY:
+            reply.pop(key, None)
+        reply["observation_caps"] = {**(reply.get("observation_caps") or {}), **dropped}
+        channel.send(reply)
 
 
 def _serialize_result(
@@ -5153,12 +5033,10 @@ def _serialize_result(
     into the grant: two outputs arriving in a different order must still land in their own
     destinations, and position cannot express that.
 
-    Returns `(result_ref, outputs, oversize_bytes)`. The BYTES land in the attempt spool and
-    only their digest and length ride the reply: the public door admits 4 MiB inline and one
-    control frame admits 64 KiB, so a result between the two was an executor fault instead of
-    a served result until the bytes moved to the spool the worker already brokers.
-    `oversize_bytes` is non-zero when the canonical result exceeds the inline door, which
-    cr-007 REFUSES rather than papering over with a receipt for bytes nobody wrote.
+    Returns `(result_ref, outputs, oversize_bytes)`. The BYTES land in the attempt spool the
+    worker brokers and only their digest and length ride the reply. `oversize_bytes` is
+    non-zero when the canonical result exceeds the 4 MiB inline door, which cr-007 REFUSES
+    rather than papering over with a receipt for bytes nobody wrote.
     """
     import msgspec
 

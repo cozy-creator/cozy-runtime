@@ -216,8 +216,8 @@ class SealedPlan(msgspec.Struct, frozen=True, kw_only=True):
 
 class SealedTier(_Request, frozen=True, kw_only=True, tag="sealed_tier"):
     """One weight set's sealed CPU layout, prepared through TensorFS and retained by TensorD
-    across executors. The canonical `SealedPlan` follows in a sealed memfd (a plan is
-    larger than a control frame); `Tier` answers, the layout's memfd following when `held`."""
+    across executors. The canonical `SealedPlan` follows in a sealed memfd; `Tier` answers,
+    the layout's memfd following when `held`."""
 
     manifest: str
     name: str
@@ -360,8 +360,8 @@ class Staged(Answer, frozen=True, kw_only=True):
 
 class ObjectFilesAnswer(Answer, frozen=True, kw_only=True):
     """The machine's answer to `ObjectFiles`: the read-only fds follow, one per object of the
-    plan in SHA-256 order. The list itself would not fit a control frame (SDXL's UNet: about
-    1,700 objects), so the answer names its digest: SHA-256 of `<sha256>:<length>\n` lines."""
+    plan in SHA-256 order (SDXL's UNet: about 1,700), and the answer names the list by its
+    digest: SHA-256 of `<sha256>:<length>\n` lines."""
 
     objects_sha256: str = ""
     #: the fds that followed the answer; never on the wire
