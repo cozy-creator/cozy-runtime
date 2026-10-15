@@ -159,6 +159,10 @@ class Fetches:
         if old is not None:
             old.close()
 
+    def available(self) -> bool:
+        """Whether this call has a channel (asking for one when it holds none)."""
+        return self._current(ask=True) is not None
+
     def ahead(self, manifest: str, refs: Sequence[Ref]) -> None:
         """Want `refs` after everything already planned (a raw source's look-ahead)."""
         channel = self._current(ask=True)

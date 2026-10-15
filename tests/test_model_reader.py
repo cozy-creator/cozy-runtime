@@ -359,7 +359,7 @@ def test_source_descriptor_is_bound_to_the_accepted_digest(tmp_path: Path) -> No
     try:
         with pytest.raises(tensorfs.errors.Refusal) as refused:
             view.read_into("model", "weight", "value", 0, bytearray(4))
-        assert refused.value.code == "weights_writer_closed"
+        assert refused.value.code == "LEASE_REVOKED"  # the owner's check ended the channel
     finally:
         handles.close()
         broker.close()

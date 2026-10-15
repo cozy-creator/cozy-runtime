@@ -142,6 +142,8 @@ class Hub:
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.server.daemon_threads = True
+        # A canceled fetch closes its connection under an answer being written.
+        self.server.handle_error = lambda request, address: None  # type: ignore[method-assign]
         self.origin = f"http://127.0.0.1:{self.server.server_port}"
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()

@@ -4096,7 +4096,7 @@ class Executor:
 
         def opened(manifest: str) -> SourceCapability:
             capability = storage.source(manifest)
-            if host.fetch is None:
+            if host.fetch is None or not host.fetch.available():
                 return capability
             header = host._model_source(manifest, "")
             return fetch_plan.source(host.fetch, capability, header, declared.get(manifest, ()))
