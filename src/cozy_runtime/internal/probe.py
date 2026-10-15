@@ -65,6 +65,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 import msgspec
@@ -86,6 +87,7 @@ from cozy_runtime.internal.encoding import (
     implementation_digest,
     measure_runtime,
 )
+from cozy_runtime.internal.encoding.formats import Tensor, hadamard256
 from cozy_runtime.internal.instruments import quantize_rowwise
 
 # `torch`, `device`, `dtype` and tensor values are `Any`: the check venv carries no torch.
@@ -411,6 +413,41 @@ def _numerics_rowwise(torch: Any, provider: Provider, device: Any, dtype: Any) -
     )
 
 
+def _numerics_int8_convrot(
+    torch: ModuleType, provider: Provider, device: Tensor, dtype: Tensor
+) -> Sweep:
+    """Every int8 value in every Hadamard position, against 256 power-of-two row scales.
+
+    Row `r` holds all 255 values -127..127 rotated by `r`, so every value meets every row of
+    H, and a decoder that skips the rotation, rotates the wrong axis or mis-strides the scale
+    is wrong almost everywhere. With power-of-two scales the integer Hadamard sum times the
+    scale is exact in f32, so the destination's one RNE cast is the whole budget: the decode
+    must equal the f64 truth cast once into the dtype, bit for bit.
+    """
+    rows = cols = 256
+    columns = torch.arange(cols).reshape(1, cols)
+    data = ((columns + torch.arange(rows).reshape(rows, 1)) % 255 - 127).to(torch.int8)
+    exponents = torch.tensor([(r % 60) - 30 for r in range(rows)], dtype=torch.float64)
+    scale = torch.pow(2.0, exponents)
+    truth = hadamard256(torch, data.double()) * scale.reshape(rows, 1) / 16
+    destination = torch.empty(rows, cols, dtype=dtype, device=device)
+    provider.decode(
+        torch, {"data": data.to(device), "scale": scale.float().to(device)}, destination
+    )
+    got = destination.double().cpu()
+    error = (got - truth).abs()
+    relative = error / truth.abs().clamp(min=1e-300)
+    exact = bool((destination.cpu() == truth.to(dtype)).all())
+    return Sweep(
+        patterns=rows * cols,
+        max_abs_error=float(error.max()),
+        max_rel_error=float(relative.max()),
+        tolerance=_eps(torch, dtype),
+        nan_preserved=True,
+        passed=exact,
+    )
+
+
 def _domain_sweep(
     torch: Any, dtype: Any, got: Sequence[float], scales: Sequence[tuple[float, str]]
 ) -> Sweep:
@@ -586,6 +623,11 @@ def _weight_roles(torch: Any, provider: Provider, device: Any) -> tuple[Any, dic
             "data": payload.clamp(-448.0, 448.0).to(torch.float8_e4m3fn),
             "scale": byte.to(torch.uint8),
         }
+    if provider.suite in ("int8-convrot256-decode", "int8-convrot256-native"):
+        rotated = hadamard256(torch, weight.double()) / 16
+        scale = (rotated.abs().amax(dim=-1) / 127.0).clamp(min=1e-12).float()
+        payload = torch.round(rotated / scale.double().unsqueeze(-1)).clamp(-127, 127)
+        return weight, {"data": payload.to(torch.int8), "scale": scale}
     if provider.suite == "fp8-scalar-decode":
         amax = weight.abs().max().clamp(min=1e-12)
         scale = (amax / 448.0).to(torch.float32)
@@ -606,6 +648,8 @@ def _exact_weight(torch: Any, provider: Provider, roles: Mapping[str, Any]) -> A
     data = roles["data"].double()
     if provider.suite in ("fp8-rowwise-decode", "fp8-rowwise-native"):
         return data * roles["scale"].double().reshape(int(data.shape[0]), 1)
+    if provider.suite in ("int8-convrot256-decode", "int8-convrot256-native"):
+        return hadamard256(torch, data) * roles["scale"].double().reshape(-1, 1) / 16
     if provider.suite in ("mxfp8-decode", "mxfp8-native"):
         rows, cols = int(data.shape[0]), int(data.shape[1])
         mult = torch.pow(2.0, roles["scale"].double() - 127.0)
@@ -934,10 +978,11 @@ DECODE_SUITES: dict[str, Callable[[Any, Provider, Any, Any], Sweep]] = {
     "fp8-scalar-decode": _numerics,
     "mxfp8-decode": _numerics_mx,
     "fp8-rowwise-decode": _numerics_rowwise,
+    "int8-convrot256-decode": _numerics_int8_convrot,
 }
 
 #: Native leaves' oracle is their own GEMM against arithmetic (`_native_agreement`).
-NATIVE_SUITES = frozenset({"fp8-rowwise-native", "mxfp8-native"})
+NATIVE_SUITES = frozenset({"fp8-rowwise-native", "mxfp8-native", "int8-convrot256-native"})
 
 
 def qualify(

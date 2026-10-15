@@ -202,6 +202,7 @@ def _quantize(
     from .quantization import (
         ArtifactQuantizationRequest,
         bf16_targets,
+        column_block,
         inherited_configs,
         prepare_bf16,
         prepare_source_quantization,
@@ -229,7 +230,9 @@ def _quantize(
         selected: set[tuple[str, str]] = set()
         targets = bf16_targets(bf16, source="source")
     else:
-        artifact = selection or prepare_source_quantization(structure, components=plan.components)
+        artifact = selection or prepare_source_quantization(
+            structure, components=plan.components, block=column_block(plan.encoding)
+        )
         selected = {(tensor.component, tensor.key) for tensor in artifact.tensors}
         targets = bf16_targets(bf16, source="source", excluded=selected)
         for component in artifact.components:
