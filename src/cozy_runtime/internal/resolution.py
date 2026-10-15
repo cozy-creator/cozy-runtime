@@ -470,25 +470,21 @@ class ResolvedModelPlan:
         )
 
     def seam_document(self) -> dict[str, object]:
-        """The plan as ONE CONTROL FRAME — everything but the per-destination census.
+        """The plan as a load reply carries it — everything but the per-destination census.
 
         `document()` carries a row per destination because a plan's identity is per-tensor
-        and a reader on disk wants all of it. The executor/worker seam is a 64 KiB CONTROL
-        frame, and 2,651 destinations is about a megabyte: on H3 the prepare reply could not
-        be sent at all, and what the worker got instead was a mutilated success (#574b).
-
-        A control frame carries the DIGEST and the COUNTS; the rows stay where they are
-        written whole. The digest is over the full document either way, so nothing about
-        identity is weakened by not shipping the body of it down a control seam.
+        and a reader on disk wants all of it; 2,651 destinations is about a megabyte that no
+        reader of the reply wants. The reply carries the DIGEST and the COUNTS, and the digest
+        is over the full document, so identity is not weakened by leaving the rows out.
         """
         whole = self.document()
         del whole["tensors"], whole["walk"]
         whole["tensors_count"] = len(self.tensors)
         whole["walk_count"] = len(self.walk)
         whole["census_elided"] = (
-            "the per-destination rows and the resolution walk are not on this seam: a "
-            "control frame is 64 KiB and this plan resolves "
-            f"{len(self.tensors)} destinations. `plan_digest` is over the WHOLE document"
+            "the per-destination rows and the resolution walk are not on this seam: this "
+            f"plan resolves {len(self.tensors)} destinations. `plan_digest` is over the "
+            "WHOLE document"
         )
         return whole
 

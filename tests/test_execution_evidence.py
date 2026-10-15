@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import socket
 import sys
+import threading
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -18,7 +19,7 @@ from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.executor import _SEALED, Executor, _send_reply
 from cozy_runtime.internal.executor_commands import Activate, Invoke, Load, PrepareRequest, Start
 from cozy_runtime.internal.executor_replies import AttemptReply
-from cozy_runtime.internal.seam import MAX_FRAME, Channel
+from cozy_runtime.internal.seam import Channel
 
 MODULE = "execution_evidence_fixture"
 SOURCE = """
@@ -153,26 +154,37 @@ def test_a_log_field_may_share_a_name_with_the_record_it_lands_in(executor: Exec
     assert row["fields"] == {"message": "m", "name": "a", "kind": "b", "value": 1}
 
 
-def test_a_reply_too_large_for_one_frame_sheds_telemetry_and_keeps_its_result(
+def test_a_reply_of_several_mib_crosses_the_seam_whole(executor: Executor) -> None:
+    """A frame has no size rule: 8 MiB of attribution, which the old 64 KiB frame shed (and
+    refused the reply past it), crosses the real seam whole beside the result."""
+    reply = _invoke(executor, "large")
+    reply["attribution"]["padding"] = "x" * (8 << 20)
+    left, right = socket.socketpair()
+    with left, right:
+        sending = threading.Thread(target=_send_reply, args=(Channel(left), reply))
+        sending.start()
+        received = Channel(right).recv(timeout=60)
+        sending.join()
+    assert received is not None and received["attribution"]["padding"] == "x" * (8 << 20)
+    kept = executor_replies.decode(received, AttemptReply)
+    assert kept.ok and kept.outcome is not None and kept.outcome.terminal == "succeeded", kept
+    assert reply["result_ref"] and msgspec.to_builtins(kept.result_ref) == reply["result_ref"]
+
+
+def test_a_telemetry_key_read_as_a_credential_costs_the_reply_only_its_telemetry(
     executor: Executor,
 ) -> None:
-    """A reply over one frame looped forever once one observation row was left, and its
-    fallback wrote nulls and `minimal_reply: True` into members the worker typed str/bool/int,
-    so the worker read `executor_reply_malformed` and lost the outcome. Through the real seam,
-    telemetry is shed and the result arrives; an irreducible reply arrives as its own refusal."""
-    reply = _invoke(executor, "oversize")
-    reply["attribution"] = {"padding": "x" * (MAX_FRAME + 1)}
-    irreducible = {**reply, "frames": [{"handle": "x" * (MAX_FRAME + 1)}]}
+    """`tel.log(..., token=1)`: the seam refuses a frame carrying a credential-named key, so
+    the reply goes without its telemetry, counted, and keeps its result."""
+    reply = _invoke(executor, "credential")
+    reply["observations"][0]["fields"] = {"token": 1}
     left, right = socket.socketpair()
     with left, right:
         _send_reply(Channel(left), reply)
         kept = executor_replies.decode(Channel(right).recv(), AttemptReply)
-        _send_reply(Channel(left), irreducible)
-        refused = executor_replies.decode(Channel(right).recv(), AttemptReply)
     assert kept.ok and kept.outcome is not None and kept.outcome.terminal == "succeeded", kept
-    assert kept.observation_caps["dropped_attribution_for_frame"] == 1 and not kept.attribution
-    assert (refused.ok, refused.code) == (False, "reply_too_large"), refused
-    assert refused.observation_caps["minimal_reply"] == 1
+    assert not kept.observations and not kept.attribution and not kept.execution
+    assert kept.observation_caps["dropped_observations_for_credential"] == 1
 
 
 def test_the_request_pin_is_what_every_rank_reports_as_requested() -> None:
