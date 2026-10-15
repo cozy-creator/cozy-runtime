@@ -848,9 +848,15 @@ class Weights:
 
     def lockable(self, want: int) -> int:
         """Host bytes this process may lock for `want` (a spill, a banded op's result): half
-        of what the host has free, the pinned tier's weights, which the page cache and disk
-        hold too, giving way first. -1: unreadable."""
+        of what the host has free. A free locked block of its size is taken as it is; short of
+        room, free blocks go back to the host first, then the pinned tier's weights, which the
+        page cache and disk hold too. -1: unreadable."""
+        if spill.reusable(want):
+            return want
         room = self._lockable()
+        if 0 <= room < want and self.kind == "cuda":
+            spill.release(self.torch)
+            room = self._lockable()
         if 0 <= room < want and self.pinned_applied > 0:
             self._pin(max(self.pinned_applied - 2 * (want - room), 0))
             room = self._lockable()
