@@ -163,9 +163,11 @@ struct Sm80Gemm {
     using Gemm = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
     static constexpr bool kStreamK = !std::is_same_v<Swizzle, Identity>;
 
-    static bool run(const int8_t* q, const int8_t* w, const float* xs, const float* ws,
-                    const Out* bias, Out* out, int M, int N, int K, Workspace workspace,
-                    cudaStream_t s) {
+    // CUTLASS's adapter, without its swallowed launch error: occupancy and the shared-memory
+    // opt-in once per card, then the kernel, whose error the caller gets.
+    static cudaError_t run(const int8_t* q, const int8_t* w, const float* xs, const float* ws,
+                           const Out* bias, Out* out, int M, int N, int K, int sms,
+                           Workspace workspace, cudaStream_t s) {
         typename EVT::Arguments callbacks{
             {{{{}, {const_cast<float*>(xs), 0.f, {_1{}, _0{}, M}}, {}},
               {const_cast<float*>(ws), 0.f, {_0{}, _1{}, N}},
@@ -186,19 +188,38 @@ struct Sm80Gemm {
                     const_cast<int8_t*>(q), const_cast<int8_t*>(w), nullptr, nullptr,
                     int64_t(M) * K, int64_t(N) * K, 0, 0, K, K, 0, 0);
         }();
-        Gemm gemm;
-        if (gemm.can_implement(args) != cutlass::Status::kSuccess) return false;
-        const size_t bytes = Gemm::get_workspace_size(args);
+        if (Kernel::can_implement(args) != cutlass::Status::kSuccess) return cudaErrorNotSupported;
+        constexpr int smem = int(sizeof(typename Kernel::SharedStorage));
+        static int occupancy[64] = {};
+        int device = 0;
+        cudaGetDevice(&device);
+        int& blocks = occupancy[device & 63];
+        if (blocks == 0) {
+            if (smem >= (48 << 10)) {
+                const cudaError_t e = cudaFuncSetAttribute(
+                    cutlass::Kernel2<Kernel>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+                if (e != cudaSuccess) return e;
+            }
+            const cudaError_t e = cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(
+                &blocks, cutlass::Kernel2<Kernel>, Kernel::kThreadCount, smem,
+                cudaOccupancyDisableCachingOverride);
+            if (e != cudaSuccess) return e;
+        }
+        typename Kernel::Params params(args, sms, blocks);
+        const size_t bytes = params.get_workspace_size();
         void* scratch = bytes ? workspace.allocate(bytes, workspace.context) : nullptr;
-        if (bytes && scratch == nullptr) return false;
-        if (gemm.initialize(args, scratch, s) != cutlass::Status::kSuccess) return false;
-        return gemm.run(s) == cutlass::Status::kSuccess;
+        if (params.init_workspace(scratch, s) != cutlass::Status::kSuccess) {
+            const cudaError_t e = cudaGetLastError();
+            return e != cudaSuccess ? e : cudaErrorUnknown;
+        }
+        cutlass::Kernel2<Kernel><<<params.get_grid_dims(), Kernel::kThreadCount, smem, s>>>(params);
+        return cudaGetLastError();
     }
 };
 
 template <typename Out>
-using Fn = bool (*)(const int8_t*, const int8_t*, const float*, const float*, const Out*, Out*,
-                    int, int, int, Workspace, cudaStream_t);
+using Fn = cudaError_t (*)(const int8_t*, const int8_t*, const float*, const float*, const Out*,
+                           Out*, int, int, int, int, Workspace, cudaStream_t);
 
 template <typename Out>
 const Fn<Out> kConfigs[] = {
@@ -248,20 +269,20 @@ int choose(int m, int n, int k, int sms) {
 }
 
 template <typename Out>
-bool run_as(const int8_t* q, const int8_t* w, const float* xs, const float* ws, const void* bias,
-            void* out, int M, int N, int K, int sms, int config, Workspace workspace,
-            cudaStream_t s) {
+cudaError_t run_as(const int8_t* q, const int8_t* w, const float* xs, const float* ws,
+                   const void* bias, void* out, int M, int N, int K, int sms, int config,
+                   Workspace workspace, cudaStream_t s) {
     if (config < 0) config = choose(M, N, K, sms);
-    if (config >= kSm80Configs) return false;
+    if (config >= kSm80Configs) return cudaErrorNotSupported;
     return kConfigs<Out>[config](q, w, xs, ws, static_cast<const Out*>(bias),
-                                 static_cast<Out*>(out), M, N, K, workspace, s);
+                                 static_cast<Out*>(out), M, N, K, sms, workspace, s);
 }
 
 }  // namespace
 
-bool gemm(const int8_t* q, const int8_t* w, const float* scales, const float* w_scale,
-          const void* bias, void* out, bool out_half, int M, int N, int K, int sms, int config,
-          Workspace workspace, cudaStream_t stream) {
+cudaError_t gemm(const int8_t* q, const int8_t* w, const float* scales, const float* w_scale,
+                 const void* bias, void* out, bool out_half, int M, int N, int K, int sms,
+                 int config, Workspace workspace, cudaStream_t stream) {
     return out_half ? run_as<cutlass::half_t>(q, w, scales, w_scale, bias, out, M, N, K, sms,
                                               config, workspace, stream)
                     : run_as<cutlass::bfloat16_t>(q, w, scales, w_scale, bias, out, M, N, K, sms,
