@@ -492,13 +492,13 @@ class Weights:
             return 0
         return int(self.torch._C._cuda_memoryStats(self.index).get("num_alloc_retries", 0))
 
-    def page_out(self, keep: Collection[str]) -> bool:
+    def page_out(self, keep: Collection[str], need: int = -1) -> bool:
         """Give torch the device bytes of one component no stage uses now (none in `keep`): the
         one with the fewest bytes to copy back, any that holds baked bytes (a bake to restore)
-        after the rest. Its own bytes leave the plane and its budget. Bytes mapped from the
-        machine's custody are let go and the machine is asked for them (`DeviceRoom`: it drops
-        a holding nobody maps, and this process's cap rises into that room). False: nothing
-        to give."""
+        after the rest; with a `need`, only that many, its last blocks first. Its own bytes
+        leave the plane and its budget. Bytes mapped from the machine's custody are let go and
+        the machine is asked for them (`DeviceRoom`: it drops a holding nobody maps, and this
+        process's cap rises into that room). False: nothing to give."""
         asks = self.room is not None and self.cap >= 0
         idle = [
             (any(region.baked for region in c.regions), self.resident_bytes(c), key)
@@ -509,16 +509,29 @@ class Weights:
         if not idle:
             return False
         component = self.components[min(idle)[2]]
+        regions = component.regions
+        if need >= 0 and not component.shared:
+            # Its last blocks first: the stage that next reads it begins with its first.
+            regions, given = [], 0
+            for region in reversed(
+                [component.regions[i] for i in component.order] or component.blocks
+            ):
+                if given >= need:
+                    break
+                if region.bound is not None:
+                    regions.append(region)
+                    given += region.span
+            regions = regions or component.regions
         self.quiesce()
         close_cursor(component)
         before = max(plane.stats(self.plane).device(self.index).committed, 0)
         try:
             shared = self._release_shared(component, sorted(component.shared))
-            own = int(self.plane.drop(component.ws, self.index, None))
+            own = int(self.plane.drop(component.ws, self.index, [r.index for r in regions]))
         except plane.error("LeaseViolation"):
             self.drain()  # something reads it after all: what did leave is unbound
             return False
-        for region in component.regions:
+        for region in regions:
             unbind(region)
             _unbaked(region)
         if own:
@@ -3171,15 +3184,17 @@ class WeightResidency:
 
     def _clear(self, method: str, local: Sequence[str]) -> None:
         """Before an entry of `method`: while torch has no more room than an entry of it is
-        known to squeeze in (`Weights.squeezed`), components no stage uses now leave the
-        device, the cheapest to restore first. They fill again when their own stage opens."""
+        known to squeeze in (`Weights.squeezed`), components no stage uses now give it the
+        bytes it lacks, the cheapest to restore first. They fill again when their own stage
+        opens, or once the attempt ends (`restore`)."""
         weights = self.weights
         bound = weights.squeezed.get(method)
         if bound is None or weights.host_only or weights.grouped:
             return
         keep = {self.components[name].key for name in local} | _in_use(weights)
-        while weights.allocatable() <= bound + weight_policy.MARGIN and weights.page_out(keep):
-            pass
+        while (need := bound + weight_policy.MARGIN - weights.allocatable()) >= 0:
+            if not weights.page_out(keep, need + weight_policy.MARGIN):
+                break
 
     def _squeezing(self) -> None:
         """At an outer block boundary inside a stage: torch dropped its whole cache more than
@@ -3551,6 +3566,31 @@ class WeightResidency:
         movable = device.committed - device.leased_bytes - device.held_bytes - own
         return free, max(movable, 0)
 
+    def restore(self) -> None:
+        """After an attempt: what its stages placed resident and then gave to activations maps
+        again (keep hot), in the background, into the room the device has now, in the order the
+        stages read it. Nothing is evicted for it; the next stage waits only for what has not
+        arrived yet."""
+        weights = self.weights
+        if weights.host_only or weights.grouped or weights.open or self.parked is not None:
+            return
+        weights.drain()
+        weights._apply(max(weights.applied, weights.stage_budget(MAPPING)))
+        weights.plan_inputs.pop(MAPPING, None)
+        gone = [
+            (component, index)
+            for name in dict.fromkeys(n for names in self.scopes.values() for n in names)
+            if name not in self.hosted and (component := self.components.get(name)) is not None
+            for index in component.resident
+            if component.regions[index].bound is None
+        ]
+        for component, index in gone:
+            try:  # the lowest priority: it takes only room nothing else holds
+                weights.plane.want(component.ws, weights.index, [index], priority=0)
+            except self._capacity:
+                break
+        weights.limit_torch()
+
     def document(self) -> dict[str, Any]:
         weights = self.weights
         return {
@@ -3665,8 +3705,21 @@ class WeightResidency:
         placed = {key: _unpaid(components[key], kept[key], r) for key, r in paid.items()}
         if self.spare and need > budget:
             raise ResidencyRefusal("device_spared", f"{method}() declined: needs {need} B")
-        weights._apply(budget)
         clock = weights.tick()
+        for key, residence in placed.items():
+            # The budget's trim takes other components' idle regions, never the sets this
+            # stage is about to want: they rank first already.
+            component = components[key]
+            weights.plane.prioritise(
+                component.ws,
+                weights.index,
+                [
+                    *([component.common.index] if component.common is not None else ()),
+                    *(component.blocks[i].index for i in residence.resident),
+                ],
+                priority=plane.PREFIX + clock,
+            )
+        weights._apply(budget)
         for key, residence in placed.items():
             component = components[key]
             close_cursor(component)
