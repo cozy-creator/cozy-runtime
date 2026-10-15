@@ -18,6 +18,7 @@ diffusers = pytest.importorskip("diffusers")
 
 from torch.utils._python_dispatch import TorchDispatchMode  # noqa: E402
 
+from cozy_runtime.internal import bands  # noqa: E402
 from cozy_runtime.internal.bands import Bands  # noqa: E402
 
 
@@ -202,3 +203,67 @@ def test_joins_repeats_and_copies_band_along_other_dims(room: int) -> None:
 
     _, ran = banded(call, room)
     assert {"aten.cat", "aten.repeat_interleave", "aten.contiguous"} <= set(ran)
+
+
+@pytest.fixture
+def small(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every map of four dims counts as large and a band holds a few rows: the decodes below
+    run as chains their convolutions and norms compute band by band."""
+    monkeypatch.setattr(bands, "LAZY", 1)
+    monkeypatch.setattr(bands, "BAND", 3000)
+
+
+@pytest.mark.usefixtures("small")
+@pytest.mark.parametrize("vae", ["kl", "qwen"])
+def test_chains_of_row_ops_run_in_the_bands_of_what_reads_them(vae: str) -> None:
+    """With room: norms, activations, casts, paddings and upsampling are pending until a
+    convolution reads them band by band; the image is the stock one."""
+    model = kl() if vae == "kl" else qwen()
+    z = torch.randn(1, 4, 9, 7) if vae == "kl" else torch.randn(1, 16, 1, 6, 5)
+    _, ran = banded(lambda: model.decode(z).sample, 1 << 30, short=False)
+    assert "aten.silu" in ran
+
+
+@pytest.mark.usefixtures("small")
+def test_qwen_image21_chains_run_in_bands() -> None:
+    kind = getattr(diffusers, "AutoencoderKLQwenImage21", None)
+    if kind is None:
+        pytest.skip("this diffusers has no AutoencoderKLQwenImage21")
+    torch.manual_seed(13)
+    vae = kind(
+        base_dim=16,
+        decoder_base_dim=16,
+        z_dim=8,
+        dim_mult=[1, 2, 2],
+        num_res_blocks=1,
+        temperal_downsample=[False, True],
+        latents_mean=[0.0] * 8,
+        latents_std=[1.0] * 8,
+    ).eval()
+    z = torch.randn(1, 8, 1, 5, 3)
+    _, ran = banded(lambda: vae.decoder(vae.post_quant_conv(z), first_chunk=True), 1 << 30, False)
+    assert {"aten.squeeze", "aten.pad", "aten.linalg_vector_norm"} <= set(ran)
+
+
+@pytest.mark.usefixtures("small")
+def test_a_write_into_what_a_pending_result_reads_computes_it_first() -> None:
+    x = torch.randn(1, 2, 7, 5)
+    with torch.inference_mode():
+        expected = torch.nn.functional.silu(x * 2)
+        with Short(1 << 30, short=False):
+            pending = torch.nn.functional.silu(x * 2)
+            assert type(pending).__name__ == "Rows"
+            x.add_(1)
+        assert torch.equal(pending + 0, expected)
+
+
+@pytest.mark.usefixtures("small")
+def test_a_write_through_a_view_of_a_pending_result_reaches_it() -> None:
+    x = torch.randn(1, 2, 1, 7, 5)
+    with torch.inference_mode(), Short(1 << 30, short=False):
+        pending = x * 2
+        view = pending.squeeze(2)
+        assert type(view).__name__ == "Rows"
+        view.add_(1)
+        whole = pending + 0
+    assert torch.equal(whole, x * 2 + 1)

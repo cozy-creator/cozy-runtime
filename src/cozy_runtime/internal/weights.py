@@ -405,8 +405,10 @@ class Weights:
         )
         self.owner_floor = -1
         self.floor_free = self.display_floor
-        #: ops run in bands of rows when their operands live in host memory or they run out
+        #: ops run in bands of rows when their operands live in host memory or they run out;
+        #: `recovering` contexts open
         self.bands = None if self.host_only else bands.Bands(self)
+        self.depth = 0
         if not self.host_only:
             self.measure_context()
             _observe_refusals(torch, self)
@@ -740,14 +742,21 @@ class Weights:
         """Run the caller's torch ops with out-of-memory recovery: an op that cannot allocate
         unmaps weights and runs again (a seeded op from its generator's state before it).
         With a `journal`, every write into a tensor that existed before is kept first, so the
-        whole call can be rewound and run again."""
+        whole call can be rewound and run again. No result leaves the outermost one pending
+        (`Bands.settle`)."""
         if self.host_only:
             yield journal
             return
         if self._recovery is None:
             self._recovery = _recovery_type(self.torch)
-        with self._recovery(self, journal):
-            yield journal
+        self.depth += 1
+        try:
+            with self._recovery(self, journal):
+                yield journal
+                if self.depth == 1 and self.bands is not None:
+                    self.bands.settle()
+        finally:
+            self.depth -= 1
 
     def make_room(self, need: int, operands: Sequence[object], op: str = "") -> None:
         """An op ran out of device memory (outside every block, or inside one whose ops
@@ -1895,10 +1904,11 @@ def _tensor_operands(operands: Sequence[object]) -> Iterator[Tensor]:
 
 
 def _pointers(operands: Sequence[object]) -> Iterator[int]:
-    """Device addresses of an op's tensor operands (one level deep)."""
+    """Device addresses of an op's tensor operands (one level deep); none for one with no
+    storage of its own (a pending result)."""
     for value in operands:
         for item in value if isinstance(value, (tuple, list)) else (value,):
-            if getattr(item, "is_cuda", False) and type(item).__name__ != "Unbound":
+            if getattr(item, "is_cuda", False) and type(item).__name__ not in ("Unbound", "Rows"):
                 yield int(item.data_ptr())
 
 
@@ -3802,7 +3812,10 @@ class WeightResidency:
                 ):
                     # Writes nothing that existed before it: it runs unobserved, and only
                     # the generators it draws from are kept for a second run. Inputs in
-                    # host memory are read in bands, by the ops' recovery.
+                    # host memory are read in bands, by the ops' recovery; no pending result
+                    # is left for an op the recovery never sees.
+                    if weights.bands is not None and weights.bands.live:
+                        weights.bands.settle()
                     kept = [(g, g.get_state()) for g in effects.generators]
 
                     def rewind() -> None:

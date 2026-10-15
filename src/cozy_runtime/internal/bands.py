@@ -1,26 +1,33 @@
-"""Ops the device cannot run whole run in bands of rows, exactly: no tiles, no blending.
+"""Large maps computed in bands of rows, exactly: no tiles, no blending.
 
 An op's output rows need a known span of each input's rows: a convolution's reach (kernel,
 stride, dilation; zeros only past the input's edges), a nearest upsampling's source rows, a
-padding's shifted rows, the same rows for a pointwise op, a cast or a norm over channels. A
-group norm gathers its statistics over every band first, in float32, then normalizes band by
-band. Ops that mix rows (attention, matmuls) are never cut.
+padding's shifted rows, the same rows for a pointwise op, a cast, a copy, a view that keeps the
+rows or a norm over channels. A group norm gathers its statistics over every band first, in
+float32. Ops that mix rows (attention, matmuls) are never cut. Nothing here knows a model: the
+rows an op needs follow from the op and its arguments.
 
-An op runs in bands when an operand lives in host memory (a spill, or an earlier band's
+A row-local op whose result is a large map is not computed when called: its result (`Rows`)
+computes any band of its rows on demand, from its inputs' rows. What reads it in rows (a
+convolution, a group norm, another row-local op) runs band by band, so a chain of them runs on
+band-sized temporaries a cache holds, never on full-size ones. Any other op reads it whole,
+computed then. A write into what a pending result reads computes that result first; none
+outlives the call.
+
+An op runs in bands, too, when an operand lives in host memory (a spill, or an earlier band's
 result: each band reads its rows over the bus once, where a kernel would read them again and
-again), or when it ran out of device memory whole. Its result goes on the device when it fits
-there with idle weights unmapped, else into host memory; the band height follows the room
-left. Nothing here knows a model: the rows an op needs follow from the op and its arguments.
-
-A convolution right after the zero padding it reads skips the taps that meet only that
-padding: a lone frame through a causal 3D convolution is a 2D one.
+again), or when it ran out of device memory whole. A result goes on the device when it fits
+there with idle weights unmapped and the least recently used tensors in host memory, else into
+host memory. A convolution right after the zero padding it reads skips the taps that meet only
+that padding: a lone frame through a causal 3D convolution is a 2D one.
 """
 
 from __future__ import annotations
 
+import weakref
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
 
 from cozy_runtime.author._errors import is_device_oom
@@ -31,6 +38,14 @@ if TYPE_CHECKING:
 
     from cozy_runtime.internal.weights import Weights
 
+#: A row-local op's result of at least this many bytes, four dims or more, is computed by its
+#: reader (`Rows`).
+LAZY = 32 << 20
+#: Elements of a result's band when a chain computes into it: band-sized temporaries a cache holds.
+BAND = 1 << 22
+#: Source reads per row past which a chain's pending inputs are computed first.
+READS = 4
+
 type Rule = Callable[[Any, tuple[Any, ...], dict[str, Any]], "Plan | None"]
 
 
@@ -39,7 +54,8 @@ class Plan:
     """An op as rows of its result (`out`, a meta tensor) along `axis`: `band(a, b)` computes
     rows [a, b), which start on multiples of `align`; one row takes `per_row` device bytes
     while it computes. `gather(rows)` reads what every band needs first (a norm's
-    statistics); `finish` makes the op's own result from the filled tensor."""
+    statistics); `finish` makes the op's own result from the filled tensor. `sources`: the
+    tensors its bands read."""
 
     out: Any
     axis: int
@@ -48,6 +64,7 @@ class Plan:
     align: int = 1
     gather: Callable[[int], None] | None = None
     finish: Callable[[Any], Any] | None = None
+    sources: list[Any] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +84,9 @@ class Bands:
         torch = self.torch = weights.torch
         self.aten = aten = torch.ops.aten
         self.pointwise, self.seeded = torch.Tag.pointwise, torch.Tag.nondeterministic_seeded
+        self.Rows = _rows_type(torch)
+        #: pending results by id, computed when the call ends or a write reaches what they read
+        self.live: dict[int, weakref.ref[Any]] = {}
         self.last: _Zeros | None = None
         #: two streams bands alternate on, made before any weight maps: on a full card the
         #: driver cannot make one (run 4297: `cuStreamCreateWithPriority`)
@@ -96,53 +116,133 @@ class Bands:
             aten.repeat_interleave,
             aten.cat,
         )
+        views = (
+            aten.view,
+            aten._unsafe_view,
+            aten.reshape,
+            aten.expand,
+            aten.expand_as,
+            aten.squeeze,
+            aten.unsqueeze,
+            aten.permute,
+            aten.select,
+            aten.slice,
+            aten.alias,
+            aten.detach,
+        )
         self.rules: dict[Any, Rule] = {
             **dict.fromkeys(self.convs, self._conv),
             **dict.fromkeys(self.pads, self._pad),
             **dict.fromkeys(ups, self._upsample),
             **dict.fromkeys((aten.group_norm, aten.native_group_norm), self._norm),
             **dict.fromkeys(rows, self._rows),
+            **dict.fromkeys(views, self._view),
         }
+        self.lazy = {self._rows, self._pad, self._upsample, self._view}
 
     def run(
         self, func: Any, args: tuple[Any, ...], kwargs: dict[str, Any], short: bool = False
     ) -> Any:
-        """`func(*args, **kwargs)` in bands, or NotImplemented: the op runs as it is. `short`:
+        """`func(*args, **kwargs)` as rows, or NotImplemented: the op runs as it is. `short`:
         it just ran out of device memory whole."""
         last, self.last = self.last, None
+        if func._schema.is_mutable:
+            self._before_write(func, args, kwargs)
+            return NotImplemented
         packet = func.overloadpacket
+        if packet == self.aten.dropout and not _arg(func, args, kwargs, "train"):
+            return args[0]  # as the op does: its input, still pending if it is
         rule = self.rules.get(packet)
         if rule is None and self.pointwise in func.tags:
             rule = self._rows
-        if rule is None or func._schema.is_mutable or self.seeded in func.tags:
+        if rule is None or self.seeded in func.tags:
             return NotImplemented
-        hosted = bool(spill.HELD) and any(map(spill.hosted, _tensors((args, kwargs))))
-        if packet in self.pads and not (short or hosted):
-            return self._remember(func, args, kwargs)
+        tensors = _tensors((args, kwargs), self.torch.Tensor)
+        pending = any(isinstance(t, self.Rows) and t.value is None for t in tensors)
+        hosted = bool(spill.HELD) and any(map(spill.hosted, tensors))
+        if rule == self._view and not pending:
+            return NotImplemented  # a view of a computed tensor is a view
+        if pending and rule == self._rows and self._same(func, args, kwargs):
+            return args[0]  # a cast to its own dtype: its operand, still pending
+        lazy = rule in self.lazy
+        if not (short or hosted or pending):
+            big = max(map(_bytes, tensors), default=0) >= LAZY // 8
+            if (lazy or rule == self._norm) and big:
+                plan = rule(func, args, kwargs)
+                if plan is not None and plan.out.dim() >= 4 and _bytes(plan.out) >= LAZY:
+                    return self._defer(func, plan, args, kwargs)
+            if packet in self.pads:
+                return self._remember(func, args, kwargs)
+            plan = None
+            if packet in self.convs and last is not None and args[0] is last.padded:
+                plan = self._conv(func, args, kwargs, last)  # a convolution skipping taps
+            if plan is None:
+                return NotImplemented
+            self.rewrites += 1
+            return plan.band(0, int(plan.out.shape[plan.axis]))
         plan = None
         if packet in self.convs and last is not None and args[0] is last.padded:
             plan = self._conv(func, args, kwargs, last)
+        plan = plan or rule(func, args, kwargs)
         if plan is None:
-            if not (short or hosted):
-                return NotImplemented
-            plan = rule(func, args, kwargs)
-            if plan is None:
-                return NotImplemented
+            return NotImplemented
+        if lazy or (plan.gather is not None and plan.out.dim() >= 4):
+            return self._defer(func, plan, args, kwargs)
         self.rewrites += 1
-        if short or hosted:
-            out = self._banded(plan, (*args, *kwargs.values()))
-        else:  # a convolution skipping taps, with room for it whole
-            out = plan.band(0, int(plan.out.shape[plan.axis]))
-        if packet in self.pads:
-            self._zeros(func, out, args, kwargs)
+        out = self._banded(plan, (*args, *kwargs.values()))
         return out if plan.finish is None else plan.finish(out)
+
+    def _same(self, func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> bool:
+        """Whether the op returns its first operand itself (a cast to its own dtype)."""
+        first = self.torch.empty_strided(
+            args[0].shape, args[0].stride(), dtype=args[0].dtype, device="meta"
+        )
+        try:
+            return func(first, *args[1:], **kwargs) is first
+        except Exception:
+            return False
+
+    def settle(self) -> None:
+        """Every pending result computed: what reads it next may be anything."""
+        for rows in self._pending():
+            rows.whole()
+
+    # -- pending results
+
+    def _defer(self, func: Any, plan: Plan, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+        """The op's result pending (`Rows`); a group norm's statistics gathered first. A chain
+        whose rows would read its sources too often is computed up to here first."""
+        self.rewrites += 1
+        operands = _tensors((args, kwargs), self.torch.Tensor)
+        if sum(getattr(t, "reads", 1) for t in operands if _spans(t, plan.out, plan.axis)) > READS:
+            for t in operands:
+                if isinstance(t, self.Rows):
+                    t.whole()
+        if plan.gather is not None:
+            self._gather(plan, _band_rows(plan.out, plan.axis, plan.align))
+        rows = self.Rows(self, plan, operands)
+        if func.overloadpacket in self.pads:
+            self._zeros(func, rows, args, kwargs)
+        return rows if plan.finish is None else plan.finish(rows)
+
+    def _before_write(self, func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
+        """A write into a tensor a pending result reads: that result is computed first."""
+        if not self.live:
+            return
+        written = {_address(t) for t in _written(func, args, kwargs)} - {-1}
+        for rows in self._pending():
+            if rows.sources & written:
+                rows.whole()
+
+    def _pending(self) -> list[Any]:
+        return [rows for ref in list(self.live.values()) if (rows := ref()) is not None]
 
     # -- placing and running bands
 
     def _banded(self, plan: Plan, operands: Any) -> Any:
         """The op in bands, its result on the device when it fits there: idle weights unmap
         and the tensors used least recently move to host memory first (`spill`); else in
-        host memory."""
+        host memory. A result a pending chain computes into goes in cache-sized bands."""
         torch, weights = self.torch, self.weights
         meta, axis = plan.out, plan.axis
         height = int(meta.shape[axis])
@@ -155,6 +255,8 @@ class Bands:
         on_device = least <= room or not self._hostable(nbytes)
         # two bands in flight (`_on`)
         rows = (room - (nbytes if on_device else 0)) // max(2 * plan.per_row, 1)
+        if any(isinstance(t, self.Rows) and t.value is None for t in plan.sources):
+            rows = min(rows, _band_rows(meta, axis, plan.align))
         rows = max(plan.align, min(height, rows) // plan.align * plan.align)
         out = None
         if on_device:
@@ -174,14 +276,7 @@ class Bands:
             self.hosted += nbytes
         hosted = f", {self.hosted} B of results in host memory" if self.hosted else ""
         weights.modes["bands"] = f"{self.ops} ops{hosted}"
-        while plan.gather is not None:  # statistics first, at a height memory allows
-            try:
-                plan.gather(rows)
-                break
-            except Exception as exc:
-                if not is_device_oom(exc) or rows <= plan.align:
-                    raise
-                rows = max(plan.align, rows // 2 // plan.align * plan.align)
+        rows = self._gather(plan, rows)
         # Bands alternate between two streams: one's rows cross the bus while the other's
         # compute. Each band's tensors live and die on its own stream.
         main: Any = torch.cuda.current_stream(weights.device) if self.streams else None
@@ -205,6 +300,18 @@ class Bands:
                 main.wait_stream(stream)
         return out
 
+    def _gather(self, plan: Plan, rows: int) -> int:
+        """A norm's statistics, at a band height memory allows; the height that did."""
+        while plan.gather is not None:
+            try:
+                plan.gather(rows)
+                plan.gather = None
+            except Exception as exc:
+                if not is_device_oom(exc) or rows <= plan.align:
+                    raise
+                rows = max(plan.align, rows // 2 // plan.align * plan.align)
+        return rows
+
     def _on(self, turn: int) -> AbstractContextManager[Any]:
         if not self.streams:
             return nullcontext()
@@ -218,13 +325,21 @@ class Bands:
         return lockable < 0 or nbytes <= lockable
 
     def _take(self, x: Any, dim: int, lo: int, hi: int, fill: float = 0.0) -> Any:
-        """Rows [lo, hi) of `x` along `dim` on the device, `fill` past its edges. A host
-        block's rows are copied once; a device tensor's are a view unless padded."""
+        """Rows [lo, hi) of `x` along `dim` on the device, `fill` past its edges: a pending
+        result's computed now; a host block's copied once; a device tensor's a view unless
+        padded."""
         n = int(x.shape[dim])
         start, stop = min(max(lo, 0), n), max(min(hi, n), 0)
-        rows = x.narrow(dim, start, max(stop - start, 0))
-        if spill.hosted(x):
-            rows = rows.clone(memory_format=self.torch.contiguous_format)
+        if isinstance(x, self.Rows) and x.value is None:
+            if dim != x.dim() - 2:
+                x = x.whole()  # its rows are another dim's
+        if isinstance(x, self.Rows) and x.value is None:
+            rows = x.rows(start, stop)
+        else:
+            x = x.value if isinstance(x, self.Rows) else x
+            rows = x.narrow(dim, start, max(stop - start, 0))
+            if spill.hosted(x):
+                rows = rows.clone(memory_format=self.torch.contiguous_format)
         if start - lo or hi - stop:
             pad = [0, 0] * (x.dim() - 1 - dim) + [start - lo, hi - stop]
             rows = self.aten.constant_pad_nd(rows, pad, fill)
@@ -232,15 +347,20 @@ class Bands:
 
     def _narrowed(self, value: Any, out: Any, axis: int, a: int, b: int) -> Any:
         """`value` as the band [a, b) of `out` reads it: a tensor spanning `out`'s rows
-        (aligned from the right, as broadcasting does) narrowed; anything else whole."""
+        (aligned from the right, as broadcasting does) narrowed; any other whole."""
         if isinstance(value, (list, tuple)):
             return type(value)(self._narrowed(v, out, axis, a, b) for v in value)
-        if not isinstance(value, self.torch.Tensor) or not _spans(value, out, axis):
+        if not isinstance(value, self.torch.Tensor):
             return value
+        if not _spans(value, out, axis):
+            return value.whole() if isinstance(value, self.Rows) else value
         return self._take(value, value.dim() - (out.dim() - axis), a, b)
 
-    def _meta(self, func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
-        """The op's result as a meta tensor; None when it is not one new tensor."""
+    def _meta(
+        self, func: Any, args: tuple[Any, ...], kwargs: dict[str, Any], views: bool = False
+    ) -> Any:
+        """The op's result as a meta tensor; None when it is not one new tensor (a view, with
+        `views`, is one)."""
         made: list[Any] = []
 
         def meta(value: Any) -> Any:
@@ -259,8 +379,10 @@ class Bands:
             out = func(*meta(args), **{k: meta(v) for k, v in kwargs.items()})
         except Exception:  # no meta kernel, or arguments it refuses: the op runs as it is
             return None
-        if not isinstance(out, self.torch.Tensor) or out._is_view() or any(out is m for m in made):
-            return None  # no one tensor, or an alias of an operand: never cut
+        if not isinstance(out, self.torch.Tensor) or any(out is m for m in made):
+            return None  # no one tensor, or an operand itself
+        if out._is_view() and not views:
+            return None  # an alias of an operand is never cut
         return out
 
     # -- rules: an op's output rows from its inputs' rows
@@ -278,19 +400,19 @@ class Bands:
                 return None
         dims = _arg(func, args, kwargs, "dim")
         if dims is not None:
-            rank = _tensors(args[:1])[0].dim()
+            rank = _tensors(args[:1], self.torch.Tensor)[0].dim()
             dims = [dims] if isinstance(dims, int) else list(dims)
             if not dims or any(d % rank >= rank - 2 for d in dims):
                 return None
         out = self._meta(func, args, kwargs)
-        if not isinstance(out, self.torch.Tensor) or out.dim() < 2:
+        if out is None or out.dim() < 2:
             return None
         axis = out.dim() - 2
         height = int(out.shape[axis])
         if height < 2:
             return None
-        spanning = [t for t in _tensors((args, kwargs)) if _spans(t, out, axis)]
-        per_row = (_bytes(out) + sum(map(_bytes, spanning))) // height
+        sources = [t for t in _tensors((args, kwargs), self.torch.Tensor) if _spans(t, out, axis)]
+        per_row = (_bytes(out) + sum(map(_bytes, sources))) // height
 
         def band(a: int, b: int) -> Any:
             return func(
@@ -298,7 +420,31 @@ class Bands:
                 **{k: self._narrowed(v, out, axis, a, b) for k, v in kwargs.items()},
             )
 
-        return Plan(out, axis, band, per_row)
+        return Plan(out, axis, band, per_row, sources=sources)
+
+    def _view(self, func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Plan | None:
+        """A view of a pending result that keeps its rows (the same extent and stride as the
+        second-to-last dim on both sides): each band is the view of the result's band."""
+        x = args[0]
+        out = self._meta(func, args, kwargs, views=True)
+        if out is None or out.dim() < 2 or x.dim() < 2:
+            return None
+        if out.shape[-2] != x.shape[-2] or out.stride()[-2] != x.stride()[-2]:
+            return None
+        axis, packet = out.dim() - 2, func.overloadpacket
+        sized = packet in (self.aten.view, self.aten._unsafe_view, self.aten.reshape)
+
+        def band(a: int, b: int) -> Any:
+            rows = x.rows(a, b)
+            if sized or packet in (self.aten.expand, self.aten.expand_as):
+                shape = list(out.shape)
+                shape[axis] = b - a
+                return rows.reshape(shape) if sized else rows.expand(shape)
+            return func(rows, *args[1:], **kwargs)
+
+        rows = Plan(out, axis, band, _bytes(out) // max(int(out.shape[axis]), 1), sources=[x])
+        rows.finish = lambda pending: pending.based(x, func, args, kwargs)
+        return rows
 
     def _upsample(self, func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Plan | None:
         """Nearest (or nearest-exact) upsampling by a whole factor `r` along the rows: output
@@ -323,7 +469,8 @@ class Bands:
             values[names[0]] = self._take(x, axis, a // ratio, -(-b // ratio))
             return func(**values)
 
-        return Plan(out, axis, band, (_bytes(out) + _bytes(x)) // height, align=ratio)
+        per_row = (_bytes(out) + _bytes(x)) // height
+        return Plan(out, axis, band, per_row, align=ratio, sources=[x])
 
     def _pad(self, func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Plan | None:
         """A constant padding: output rows [a, b) are input rows [a - top, b - top), the
@@ -342,7 +489,8 @@ class Bands:
             rows = self._take(x, axis, a - top, b - top, value)
             return self.aten.constant_pad_nd(rows, rest, value)
 
-        return Plan(out, axis, band, (_bytes(out) + _bytes(x)) // max(int(out.shape[axis]), 1))
+        per_row = (_bytes(out) + _bytes(x)) // max(int(out.shape[axis]), 1)
+        return Plan(out, axis, band, per_row, sources=[x])
 
     def _padding(
         self, func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]
@@ -373,7 +521,7 @@ class Bands:
         """A convolution's output rows [a, b) read input rows [a*s - p, (b-1)*s - p + d*(k-1)
         + 1), zeros past the edges. Right after a zero padding (`zeros`) it reads the
         padding's source, the padding folded into its own and the taps that meet only zeros
-        dropped; None when no tap drops."""
+        dropped; None when no tap or dim drops."""
         spec = _conv_spec(func, args, kwargs)
         if spec is None:
             return None
@@ -428,7 +576,7 @@ class Bands:
             return y
 
         per_row = (2 * _bytes(out) + _bytes(x) * s) // max(int(out.shape[axis]), 1)
-        return Plan(out, axis, band, per_row)
+        return Plan(out, axis, band, per_row, sources=[x])
 
     def _norm(self, func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Plan | None:
         """A group norm: per image and group, mean and variance over every band in float32
@@ -482,7 +630,80 @@ class Bands:
             return result, mean.to(x.dtype), rstd.to(x.dtype)
 
         per_row = (2 * _bytes(x) + 4 * x.numel()) // max(height, 1)
-        return Plan(out, axis, band, per_row, gather=gather, finish=finish)
+        return Plan(out, axis, band, per_row, gather=gather, finish=finish, sources=[x])
+
+
+def _rows_type(torch: Any) -> type:
+    """`Rows` over this torch: a wrapper tensor with no storage of its own."""
+
+    class Rows(torch.Tensor):  # type: ignore[misc,name-defined]
+        """A pending result: `rows(a, b)` computes its rows [a, b); `whole()` all of them,
+        once. A view of one keeps its base (`based`), so writes through it reach the base."""
+
+        @staticmethod
+        def __new__(cls, owner: Bands, plan: Plan, operands: list[Any]) -> Any:
+            meta = plan.out
+            pending = torch.Tensor._make_wrapper_subclass(
+                cls,
+                meta.shape,
+                strides=meta.stride(),
+                dtype=meta.dtype,
+                device=owner.weights.device,
+            )
+            pending.owner, pending.plan, pending.value, pending.base = owner, plan, None, None
+            pending.reads = sum(getattr(t, "reads", 1) for t in plan.sources)
+            pending.sources = set()
+            for t in operands:
+                pending.sources |= getattr(t, "sources", None) or {_address(t)}
+            key = id(pending)
+            owner.live[key] = weakref.ref(pending, lambda _: owner.live.pop(key, None))
+            return pending
+
+        @classmethod
+        def __torch_dispatch__(
+            cls, func: Any, types: Any, args: tuple[Any, ...] = (), kwargs: Any = None
+        ) -> Any:
+            # An op the bands did not take: its pending operands are computed first.
+            def whole(value: Any) -> Any:
+                return value.whole() if isinstance(value, cls) else value
+
+            tree_map = torch.utils._pytree.tree_map
+            return func(*tree_map(whole, args), **tree_map(whole, kwargs or {}))
+
+        def rows(self, a: int, b: int) -> Any:
+            if self.value is not None:
+                return self.owner._take(self.value, self.dim() - 2, a, b)
+            plan = self.plan
+            lo, hi = a // plan.align * plan.align, -(-b // plan.align) * plan.align
+            hi = min(hi, int(self.shape[plan.axis]))
+            band = plan.band(lo, hi)
+            return band if (lo, hi) == (a, b) else band.narrow(plan.axis, a - lo, b - a)
+
+        def based(self, base: Any, func: Any, args: tuple[Any, ...], kwargs: Any) -> Any:
+            self.base = (base, func, args, kwargs)
+            return self
+
+        def whole(self) -> Any:
+            if self.value is None:
+                with torch.utils._python_dispatch._disable_current_modes():
+                    if self.base is not None:  # a view: the view of its base, computed
+                        base, func, args, kwargs = self.base
+                        self.value = func(base.whole(), *args[1:], **kwargs)
+                    else:
+                        owner, plan = self.owner, self.plan
+                        self.value = owner._banded(plan, plan.sources)
+                self.plan = self.base = None
+                self.reads, self.sources = 1, {_address(self.value)}
+                self.owner.live.pop(id(self), None)
+            return self.value
+
+    return Rows
+
+
+def _band_rows(out: Any, axis: int, align: int) -> int:
+    """Rows of `out` in a band of about `BAND` elements: a cache holds a chain's temporaries."""
+    per_row = max(int(out.numel()) // max(int(out.shape[axis]), 1), 1)
+    return max(align, BAND // per_row // align * align)
 
 
 def _arg(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any], name: str) -> Any:
@@ -495,6 +716,23 @@ def _arg(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any], name: str) ->
                 return kwargs[name]
             return argument.default_value if argument.has_default_value() else None
     return kwargs.get(name)
+
+
+def _written(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> list[Any]:
+    """The tensors an op writes into (`Tensor(a!)` in its schema)."""
+    return [
+        args[i] if i < len(args) else kwargs.get(argument.name)
+        for i, argument in enumerate(func._schema.arguments)
+        if argument.alias_info is not None and argument.alias_info.is_write
+    ]
+
+
+def _address(value: Any) -> int:
+    """The address of a tensor's storage; -1 for one with none."""
+    try:
+        return int(value.untyped_storage().data_ptr())
+    except (AttributeError, RuntimeError):
+        return -1
 
 
 def _conv_spec(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[Any, ...] | None:
@@ -556,7 +794,7 @@ def _spans(value: Any, out: Any, axis: int) -> bool:
     return dim >= 0 and bool(value.shape[dim] == out.shape[axis])
 
 
-def _tensors(value: Any) -> list[Tensor]:
+def _tensors(value: Any, kind: type) -> list[Tensor]:
     found: list[Tensor] = []
     stack = [value]
     while stack:
@@ -565,7 +803,7 @@ def _tensors(value: Any) -> list[Tensor]:
             stack.extend(item)
         elif isinstance(item, dict):
             stack.extend(item.values())
-        elif type(item).__name__ in ("Tensor", "Parameter"):
+        elif isinstance(item, kind):
             found.append(item)
     return found
 
