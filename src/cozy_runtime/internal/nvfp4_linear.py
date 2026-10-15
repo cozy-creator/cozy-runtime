@@ -50,7 +50,11 @@ def matmul(
     amax = flat.abs().amax().float()
     tensor_scale = (amax / LEVELS_MAX).clamp(min=SCALE_FLOOR).reshape(1)
     with readable(weight, blocked_scale, scale_2) as (weight, blocked_scale, scale_2):
-        payload, block = module.quantize_nvfp4(flat, tensor_scale, 0.0, rows % NVFP4_BLOCK != 0)
+        # hi_first=False: element 2k in the LOW nibble, the stored weight's (ModelOpt's) order.
+        # Kitchen's default packs the other way; a K-wise dot product only needs both to agree.
+        payload, block = module.quantize_nvfp4(
+            flat, tensor_scale, 0.0, rows % NVFP4_BLOCK != 0, False
+        )
         out = module.scaled_mm_nvfp4(
             payload, weight, tensor_scale, scale_2, block, blocked_scale, out_dtype=out_dtype
         )
