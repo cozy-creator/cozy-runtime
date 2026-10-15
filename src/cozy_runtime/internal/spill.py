@@ -45,12 +45,21 @@ FORGET = 1 << 16
 _CLOCK = [0]
 
 
+def _size(nbytes: int) -> int:
+    return -(-max(nbytes, 1) // GRAIN) * GRAIN
+
+
+def reusable(nbytes: int) -> bool:
+    """Whether a free block can take `nbytes` without locking more."""
+    return bool(_FREE.get(_size(nbytes)))
+
+
 class _Host:
     """A host block: page-locked memory, as CUDA addresses it. Locked anew only when no free
     block has its size; freed, it waits for the next one."""
 
     def __init__(self, torch: ModuleType, nbytes: int) -> None:
-        self.size = -(-max(nbytes, 1) // GRAIN) * GRAIN
+        self.size = _size(nbytes)
         free = _FREE.get(self.size)
         if free:
             self.data = free.pop()
