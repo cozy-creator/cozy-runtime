@@ -29,7 +29,7 @@ from tensorfs.derived import Derivation, Part, Target, Tensor  # noqa: E402
 from cozy_runtime.author._activity import asides  # noqa: E402
 from cozy_runtime.author._loader import census  # noqa: E402
 from cozy_runtime.author.kernels import rms_rope_split_half  # noqa: E402
-from cozy_runtime.internal import accel, paging, plane, weight_policy  # noqa: E402
+from cozy_runtime.internal import accel, paging, plane, spill, weight_policy  # noqa: E402
 from cozy_runtime.internal import weights as weights_module  # noqa: E402
 from cozy_runtime.internal.derive import Observations, serving_substrate  # noqa: E402
 from cozy_runtime.internal.encoding import SPEC_PLAIN  # noqa: E402
@@ -848,11 +848,15 @@ def test_an_op_with_no_room_left_moves_the_tensors_the_process_holds_to_host(car
     convolution's input in its feature cache, 6.6 GiB of torch's own tensors, and a
     convolution was refused with the plane already down to 6 MB. Tensors an op does not read
     move to page-locked host memory in place: the stage computes the same bits, and each held
-    tensor is still the same CUDA tensor with the same values, read over the bus."""
+    tensor is still the same CUDA tensor with the same values, read over the bus. Ops note
+    what they read for the spill's order only under pressure: a run with room pays nothing."""
     weights = card.weights
     model = load(weights, card.checkpoint, "spill")
     x = torch.randn(1 << 15, HIDDEN, device="cuda", dtype=torch.float16)  # 128 MiB
-    reference = run(model, x, passes=1)
+    spill.release(torch)
+    with weights.recovering():
+        reference = run(model, x, passes=1)
+    assert not spill.PRESSED[0] and not spill.USED, "a run with room notes no op"
     model.residency.unpark()
     weights.set_budget(0)
     held = [torch.full((32 << 20,), float(i), device="cuda") for i in range(8)]  # 1 GiB
@@ -872,6 +876,12 @@ def test_an_op_with_no_room_left_moves_the_tensors_the_process_holds_to_host(car
     assert same(reference, capped)
     assert facts.spilled_bytes - moved >= 128 << 20
     assert all(t.is_cuda and bool((t == i).all()) for i, t in enumerate(held))
+    assert spill.PRESSED[0] and spill.USED, "after a spill, ops are noted for the next one"
+    del held, capped, reference
+    gc.collect()
+    spill.release(torch)
+    assert not spill.HELD, "every moved tensor is gone"
+    assert not spill.PRESSED[0] and not spill.USED, "no host block left: no op is noted"
 
 
 def test_decoded_copies_count_in_a_stages_budget(tmp_path: Path) -> None:
