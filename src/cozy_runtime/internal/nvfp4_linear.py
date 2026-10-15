@@ -35,9 +35,9 @@ GEMV_N, GEMV_K = 32, 256
 _MAJOR: dict[int, int] = {}
 
 
-def _kernels() -> tuple[object, object] | None:
-    """The Triton W4A16 kernels, compiled once, lazily: a split-K GEMV for decode-sized M and a
-    dequantizer for the rest. None where Triton is absent."""
+def _kernels() -> tuple[object, object, object] | None:
+    """The Triton W4A16 kernels, compiled once, lazily: split-K GEMVs for decode-sized M (one
+    row, and up to 16 on the tensor cores) and a dequantizer for the rest. None without Triton."""
     cached = getattr(_kernels, "_cached", "unset")
     if cached != "unset":
         return cached  # type: ignore[return-value]
@@ -122,6 +122,36 @@ def _kernels() -> tuple[object, object] | None:
                 tl.store(where, acc.to(out_ptr.dtype.element_ty), mask=ok)
 
         @triton.jit  # type: ignore[untyped-decorator]
+        def _gemv1(  # type: ignore[no-untyped-def]
+            x_ptr,
+            w_ptr,
+            s_ptr,
+            two_ptr,
+            out_ptr,
+            N,
+            K,
+            col_tiles,
+            span,
+            BLOCK_N: tl.constexpr,
+            BLOCK_K: tl.constexpr,
+            SPLIT: tl.constexpr,
+        ):
+            """One row: a multiply-reduce in registers, no tensor-core layout round trip."""
+            rn = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+            rk = tl.arange(0, BLOCK_K)
+            start = tl.program_id(1) * span
+            acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+            for k0 in range(start, tl.minimum(start + span, K), BLOCK_K):
+                x = tl.load(x_ptr + k0 + rk, mask=(k0 + rk) < K, other=0.0).to(tl.float32)
+                weight = _decode(w_ptr, s_ptr, rn, k0, N, K, col_tiles, BLOCK_N, BLOCK_K)
+                acc += tl.sum(weight * x[None, :], axis=1)
+            acc *= tl.load(two_ptr)
+            if SPLIT:
+                tl.atomic_add(out_ptr + rn, acc, mask=rn < N)
+            else:
+                tl.store(out_ptr + rn, acc.to(out_ptr.dtype.element_ty), mask=rn < N)
+
+        @triton.jit  # type: ignore[untyped-decorator]
         def _dequant(  # type: ignore[no-untyped-def]
             w_ptr,
             s_ptr,
@@ -145,7 +175,7 @@ def _kernels() -> tuple[object, object] | None:
                 mask=(rn[:, None] < N) & ((k0 + rk)[None, :] < K),
             )
 
-        kernels: tuple[object, object] | None = (_gemv, _dequant)
+        kernels: tuple[object, object, object] | None = (_gemv, _gemv1, _dequant)
     except Exception:
         kernels = None
     _kernels._cached = kernels  # type: ignore[attr-defined]
@@ -211,7 +241,7 @@ def matmul(
             return out[:rows].reshape(*x.shape[:-1], rows_out)
         kernels = _kernels()
         if kernels is not None:
-            gemv, dequant = kernels
+            gemv, gemv1, dequant = kernels
             with readable(weight, blocked_scale, scale_2) as (weight, blocked_scale, scale_2):
                 scales, tiles = blocked_scale.view(torch.uint8), int(blocked_scale.shape[1]) // 4
                 if rows <= DECODE_ROWS:
@@ -224,24 +254,42 @@ def matmul(
                         if split > 1
                         else torch.empty(rows, rows_out, dtype=out_dtype, device=x.device)
                     )
-                    gemv[(columns, -(-cols // span))](  # type: ignore[index]
-                        flat,
-                        weight,
-                        scales,
-                        scale_2,
-                        acc,
-                        rows,
-                        rows_out,
-                        cols,
-                        flat.stride(0),
-                        tiles,
-                        span,
-                        BLOCK_M=16,
-                        BLOCK_N=GEMV_N,
-                        BLOCK_K=GEMV_K,
-                        SPLIT=split > 1,
-                        num_warps=4,
-                    )
+                    grid = (columns, -(-cols // span))
+                    if rows == 1:
+                        gemv1[grid](  # type: ignore[index]
+                            flat,
+                            weight,
+                            scales,
+                            scale_2,
+                            acc,
+                            rows_out,
+                            cols,
+                            tiles,
+                            span,
+                            BLOCK_N=GEMV_N,
+                            BLOCK_K=GEMV_K,
+                            SPLIT=split > 1,
+                            num_warps=4,
+                        )
+                    else:
+                        gemv[grid](  # type: ignore[index]
+                            flat,
+                            weight,
+                            scales,
+                            scale_2,
+                            acc,
+                            rows,
+                            rows_out,
+                            cols,
+                            flat.stride(0),
+                            tiles,
+                            span,
+                            BLOCK_M=16,
+                            BLOCK_N=GEMV_N,
+                            BLOCK_K=GEMV_K,
+                            SPLIT=split > 1,
+                            num_warps=4,
+                        )
                     return acc.to(out_dtype).reshape(*x.shape[:-1], rows_out)
                 decoded = torch.empty(rows_out, cols, dtype=x.dtype, device=x.device)
                 dequant[(-(-rows_out // 64), -(-cols // 128))](  # type: ignore[index]
