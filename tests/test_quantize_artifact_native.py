@@ -47,7 +47,7 @@ BOUND = 1 << 20
 async def quantize(
     ctx: Context,
     *,
-    source: Weights,
+    source: Weights[Any],
     component: str,
     encoding: str,
     tel: Telemetry,

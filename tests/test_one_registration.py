@@ -84,7 +84,7 @@ class _Image(msgspec.Struct):
     image: ImageAsset
 
 
-async def _derive(ctx: Context, *, source: Weights) -> ModelArtifact:
+async def _derive(ctx: Context, *, source: Weights[typing.Any]) -> ModelArtifact:
     raise NotImplementedError
 
 

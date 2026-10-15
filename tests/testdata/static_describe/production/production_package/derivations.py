@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Any
 
 from cozy_runtime.author import (
     AssetBound,
@@ -21,8 +21,8 @@ from .models import AnimaModel, BackgroundRemovalModel, SdxlModel
 async def seedvr2_normalize(
     ctx: Context,
     *,
-    dit: Weights,
-    vae: Weights,
+    dit: Weights[Any],
+    vae: Weights[Any],
     conditioning: Annotated[Tree, AssetBound(max_bytes=2 << 20)],
 ) -> ModelArtifact:
     raise NotImplementedError
@@ -36,7 +36,9 @@ async def birefnet_normalize(
 
 
 @invocable
-async def describer_normalize(ctx: Context, *, source: Weights, tel: Telemetry) -> ModelArtifact:
+async def describer_normalize(
+    ctx: Context, *, source: Weights[Any], tel: Telemetry
+) -> ModelArtifact:
     raise NotImplementedError
 
 
