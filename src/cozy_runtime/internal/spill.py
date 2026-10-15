@@ -89,6 +89,8 @@ def touch(tensors: Iterable[Tensor]) -> None:
     """An op read or made `tensors`: their storages are the last to move."""
     clock = _CLOCK[0] = _CLOCK[0] + 1
     for value in tensors:
+        if getattr(value, "pending", False):  # a pending result has no storage yet
+            continue
         try:
             storage = value.untyped_storage()
         except RuntimeError:  # a sparse or wrapper tensor has no storage of its own
@@ -102,7 +104,7 @@ def touch(tensors: Iterable[Tensor]) -> None:
 
 def hosted(value: Tensor) -> bool:
     """Whether `value`'s bytes are in a host block."""
-    if not HELD:
+    if not HELD or getattr(value, "pending", False):
         return False
     try:
         return value.untyped_storage().data_ptr() in HELD

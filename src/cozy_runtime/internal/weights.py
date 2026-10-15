@@ -1886,7 +1886,7 @@ def _storage(value: object) -> int:
     """The address that names a tensor's storage; -1 for one with none to name (a wrapper
     subclass, a weight's unbound stand-in), which no journal keeps."""
     pointer = getattr(value, "untyped_storage", None)
-    if pointer is None:
+    if pointer is None or getattr(value, "pending", False):
         return -1
     try:
         return int(pointer().data_ptr())
@@ -3906,7 +3906,11 @@ class WeightResidency:
                         weights.last = component.key
                         try:
                             with weights.recovering() if quiet and region.tight else nullcontext():
-                                return forward(*args, **kwargs)
+                                out = forward(*args, **kwargs)
+                                if weights.bands is not None and weights.bands.live:
+                                    # a pending result may read this region's weights
+                                    weights.bands.settle()
+                                return out
                         finally:
                             weights.running.pop()
                     except _Stale:
@@ -4188,9 +4192,12 @@ class WeightResidency:
             self._close(local)
 
     def _close(self, local: Sequence[str]) -> None:
-        """End the stage for `local`: cursors closed, common leases released, and every region
-        at idle priority, still mapped and bound (least recently used goes first)."""
+        """End the stage for `local`: pending results computed, cursors closed, common leases
+        released, and every region at idle priority, still mapped and bound (least recently
+        used goes first)."""
         weights = self.weights
+        if weights.bands is not None and weights.bands.live:
+            weights.bands.settle()
         idle = weights.tick()
         failure: BaseException | None = None
         for name in local:

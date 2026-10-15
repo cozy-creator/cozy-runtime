@@ -638,7 +638,12 @@ def _rows_type(torch: Any) -> type:
 
     class Rows(torch.Tensor):  # type: ignore[misc,name-defined]
         """A pending result: `rows(a, b)` computes its rows [a, b); `whole()` all of them,
-        once. A view of one keeps its base (`based`), so writes through it reach the base."""
+        once. A view of one keeps its base (`based`), so writes through it reach the base.
+        Code that reads its storage (a kernel handed its pointer) gets it computed."""
+
+        @property
+        def pending(self) -> bool:
+            return self.value is None
 
         @staticmethod
         def __new__(cls, owner: Bands, plan: Plan, operands: list[Any]) -> Any:
@@ -682,6 +687,16 @@ def _rows_type(torch: Any) -> type:
         def based(self, base: Any, func: Any, args: tuple[Any, ...], kwargs: Any) -> Any:
             self.base = (base, func, args, kwargs)
             return self
+
+        def data_ptr(self) -> int:
+            return int(self.whole().data_ptr())
+
+        def untyped_storage(self) -> Any:
+            return self.whole().untyped_storage()
+
+        @property
+        def __cuda_array_interface__(self) -> Any:  # type: ignore[override]
+            return self.whole().__cuda_array_interface__
 
         def whole(self) -> Any:
             if self.value is None:
@@ -728,7 +743,9 @@ def _written(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> list[A
 
 
 def _address(value: Any) -> int:
-    """The address of a tensor's storage; -1 for one with none."""
+    """The address of a tensor's storage; -1 for one with none, or pending."""
+    if getattr(value, "pending", False):
+        return -1
     try:
         return int(value.untyped_storage().data_ptr())
     except (AttributeError, RuntimeError):
