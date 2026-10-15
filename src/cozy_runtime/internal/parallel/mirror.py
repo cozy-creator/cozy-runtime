@@ -68,8 +68,9 @@ def mirror_component(
     GPU gives that many device bytes back and the group forms again; it answers the bytes
     that came back) the whole call runs again on every GPU, from the same inputs. It runs
     again once on the failed attempt's own memory alone, and after that only while a rerun
-    gave memory back. Before it does, every GPU puts back what the failed attempt's blocks
-    changed (`journaled`: this GPU's call journal, `Weights.call_journal`).
+    gave memory back. Before it does, and when the call fails for good, every GPU puts back
+    what the failed attempt's blocks changed (`journaled`: this GPU's call journal,
+    `weights.journaling`).
     """
     if component._compiled_call_impl is not None:
         raise cp.ContextParallelUnavailable(
@@ -105,6 +106,8 @@ def mirror_component(
                             except Exception as exc:
                                 need = out_of_memory(exc) if group.rerunnable else None
                                 if need is None and not group.interrupted:
+                                    if journal is not None:  # the state its blocks found
+                                        journal.rewind()
                                     raise
                                 # GPU 0 ran out, or a follower did and ended GPU 0's collective.
                                 short += [(group.gpu(0), need)] if need is not None else []
