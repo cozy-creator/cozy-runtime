@@ -9,11 +9,12 @@ import numpy as np
 import pytest
 import tensorfs
 
-from cozy_runtime.author import UnsupportedInput, Weights
+from cozy_runtime.author import UnsupportedInput
+from cozy_runtime.author._model import _derive_model
 from cozy_runtime.author.fakes import fake_attempt, fake_telemetry
 from cozy_runtime.derive import safetensors_io as st
 from cozy_runtime.derive.microscale import decode_int8_convrot256, encode_int8_convrot256
-from cozy_runtime.derive.operations import QuantizationPlan, quantize_into
+from cozy_runtime.derive.operations import QuantizationPlan, QuantizationSource, quantize_into
 from cozy_runtime.internal.encoding import SPEC_INT8_CONVROT256
 from native_weights import NativeExecution
 from test_derive_quantize_facade import BOUND, header, mint
@@ -69,7 +70,7 @@ def test_include_recipe_encodes_exactly_its_weights(tmp_path: Path) -> None:
         artifact = quantize_into(
             ctx,
             fake_telemetry(fake_attempt("int8")),
-            source=Weights(source.manifest.digest),
+            source=_derive_model(QuantizationSource, source.manifest.digest),
             plan=plan,
             encoding=ENCODING,
             output="model",
@@ -97,7 +98,7 @@ def test_include_recipe_encodes_exactly_its_weights(tmp_path: Path) -> None:
         quantize_into(
             owner.context(),
             fake_telemetry(fake_attempt("typo")),
-            source=Weights(source.manifest.digest),
+            source=_derive_model(QuantizationSource, source.manifest.digest),
             plan=typo,
             encoding=ENCODING,
             output="model",
