@@ -1544,9 +1544,10 @@ class Executor:
             for slot in entry.models
             if slot.weights and isinstance(slot.components, tuple)
         }
-        if self.fetch is not None and command.constructions:
+        if self.fetch is not None and command.constructions and not command.import_only:
             # The Start pass, before torch and the package: the imports, kernel compiles
-            # and warmup run while the weights download.
+            # and warmup run while the weights download. Never in an import-only parent: a
+            # channel's reader thread would leave it unforkable.
             self.fetch.begin()
             self.fetch.schedule(
                 fetch_plan.at_start(command.constructions, lambda m: self._model_source(m, ""))
