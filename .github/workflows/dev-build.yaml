@@ -156,7 +156,10 @@ jobs:
         working-directory: source
         env:
           CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
-        run: CARGO_BUILD_JOBS=$(nproc) task machine MACHINE="$GITHUB_WORKSPACE/tensord"
+        # rust-cache prunes the container's toolchain (target/manylinux/rustup) to a broken stub.
+        run: |
+          rm -rf "$GITHUB_WORKSPACE/tensord/target/manylinux/rustup"
+          CARGO_BUILD_JOBS=$(nproc) task machine MACHINE="$GITHUB_WORKSPACE/tensord"
       - name: Verify wheel selection and the installed machine command
         if: env.WHEELS == 'true'
         working-directory: source
