@@ -147,12 +147,13 @@ from cozy_runtime.internal import (
     prepare_diagnostics,
     proctree,
     sandbox,
+    spawn,
     stage_memo,
     tolerant,
     weight_policy,
     zygote,
 )
-from cozy_runtime.internal.config import restore_seal, seal_snapshot
+from cozy_runtime.internal.config import inherited_environment, restore_seal, seal_snapshot
 from cozy_runtime.internal.discovery import discover_distribution, discover_installed
 from cozy_runtime.internal.executor_commands import (
     LOAD_ATTENTION_PIN,
@@ -1554,6 +1555,7 @@ class Executor:
                         forward=self.channel.send,
                         relay=self._relay,
                         devices=_sealed_entries(),
+                        launch=self._follower,
                     )
                 if not self.group.followers:
                     self.group.spawn()
@@ -1613,6 +1615,7 @@ class Executor:
                 stage("package_warmup")
             if self.group is not None:
                 replies = self.group.collect("start")
+                stage("group_start")
                 self.follower_stages = [list(reply.get("stages") or []) for reply in replies]
                 for follower, reply in zip(self.group.followers, replies, strict=True):
                     if not reply.get("ok"):
@@ -1691,6 +1694,41 @@ class Executor:
         pid = zygote.fork(command.environment, functools.partial(self._forked, command, started))
         self.forked.add(pid)
         return {"ok": True, "pid": pid}
+
+    def _follower(self, module_argv: list[str], rank_fd: int) -> spawn.Child:
+        """A follower rank forked from this process when its imports are done and it holds no
+        thread or device (`zygote`): it starts with torch, the Runtime and the package already
+        imported, which a spawned one pays again (run 6351: 6.6 s of rank 0 waiting on them).
+        Otherwise it is spawned."""
+        assert self.group is not None
+        if not self.imported or zygote.unsafe(sys.modules.get("torch")):
+            return self.group._spawn_follower(module_argv, rank_fd)
+        rank, world = (int(module_argv[module_argv.index(f) + 1]) for f in ("--rank", "--world"))
+        siblings = [follower.channel for follower in self.group.followers]
+
+        def follower() -> int:
+            self.channel.sock.close()
+            for sibling in siblings:
+                sibling.sock.close()
+            stdin = os.open(os.devnull, os.O_RDONLY)
+            os.dup2(stdin, 0)
+            os.close(stdin)
+            channel = Channel(socket.socket(socket.AF_UNIX, socket.SOCK_STREAM, fileno=rank_fd))
+            child = Executor(
+                channel,
+                self.root,
+                fill_forensics_dir=_SEALED.get(child_env.FILL_FORENSICS_DIR, "").strip(),
+                rank=rank,
+                world=world,
+            )
+            child.imported = True
+            child.discovered = self.discovered
+            child.surface_names = dict(self.surface_names)
+            return serve(child, channel)
+
+        pid = zygote.fork(inherited_environment(), follower, group=False)
+        gc.unfreeze()  # rank 0 serves on: its own heap is collected as before
+        return spawn.Child(pid)
 
     def _forked(self, command: Fork, started: float) -> int:
         """In the child: an executor on its own seam, keeping this process's imports."""
