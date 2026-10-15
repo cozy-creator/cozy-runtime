@@ -43,11 +43,14 @@ class QuantizationPlan(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
 
     `keys` names exact weights in every component; `include` instead selects the weights
     whose `component.key` matches one of its fnmatch patterns, each of which must match one.
-    Every other tensor keeps its source bytes."""
+    Every other tensor keeps its source bytes. `encodings` are `(pattern, encoding)` pairs: a
+    selected weight matching a pattern (the first that does) takes that encoding instead of
+    the lane's, so one lane can carry, say, an nvfp4 DiT beside an int8 text encoder."""
 
     components: tuple[str, ...]
     keys: tuple[str, ...] = ()
     include: tuple[str, ...] = ()
+    encodings: tuple[tuple[str, str], ...] = ()
     selected_schema_digest: str | None = None
     source_order_digests: tuple[str, ...] = ()
     output_precision: Literal["normalize-f32-to-bf16", "preserve"] = "normalize-f32-to-bf16"
@@ -60,12 +63,14 @@ app = App()
 
 
 def _selection(
-    structure: SourceInspection, plan: QuantizationPlan, block: int = 32
+    structure: SourceInspection, plan: QuantizationPlan, encoding: str | None = None
 ) -> ArtifactQuantizationPlan:
     from .quantization import (
+        _ENCODINGS,
         PLAIN_SPEC,
         ArtifactQuantizationPlan,
         QuantizationTensor,
+        column_block,
         prepare_source_quantization,
         source_parts,
         source_rows,
@@ -82,6 +87,8 @@ def _selection(
         or len(set(plan.source_order_digests)) != len(plan.source_order_digests)
         or (plan.keys and plan.include)
         or len(set(plan.include)) != len(plan.include)
+        or len({pattern for pattern, _ in plan.encodings}) != len(plan.encodings)
+        or any(name not in _ENCODINGS for _, name in plan.encodings)
     ):
         raise UnsupportedInput(
             "quantization plan has invalid or repeated selections", code="quantization_plan"
@@ -125,10 +132,31 @@ def _selection(
         pairs = matched
     else:
         pairs = [(component, key) for component in plan.components for key in plan.keys]
+
+    def encoding_of(component: str, key: str) -> str | None:
+        name = f"{component}.{key}"
+        return next(
+            (enc for pattern, enc in plan.encodings if fnmatch.fnmatchcase(name, pattern)), None
+        )
+
+    if plan.encodings and not pairs:
+        raise UnsupportedInput("per-weight encodings need a selection", code="quantization_plan")
+    unused = [
+        pattern
+        for pattern, _ in plan.encodings
+        if not any(fnmatch.fnmatchcase(f"{c}.{k}", pattern) for c, k in pairs)
+    ]
+    if unused:
+        raise UnsupportedInput(
+            f"quantization encoding patterns match no selected weight: {unused}",
+            code="quantization_plan",
+        )
     if pairs:
         selected: list[QuantizationTensor] = []
         for component, key in pairs:
             row = by_key.get((component, key))
+            chosen = encoding_of(component, key)
+            block = column_block(chosen or encoding)
             if row is None or (
                 not key.endswith(".weight")
                 or row.logical_dtype not in {"f16", "bf16", "f32"}
@@ -142,13 +170,21 @@ def _selection(
                     code="quantization_source",
                 )
             selected.append(
-                QuantizationTensor(component, key, row.logical_dtype, (row.shape[0], row.shape[1]))
+                QuantizationTensor(
+                    component,
+                    key,
+                    row.logical_dtype,
+                    (row.shape[0], row.shape[1]),
+                    encoding=chosen,
+                )
             )
         selection = ArtifactQuantizationPlan(
             list(plan.components), list(structure.configs), list(by_key), selected
         )
     else:
-        selection = prepare_source_quantization(structure, components=plan.components, block=block)
+        selection = prepare_source_quantization(
+            structure, components=plan.components, block=column_block(encoding)
+        )
         selection.tensors.sort(key=lambda row: plan.components.index(row.component))
     schema = []
     for item in selection.tensors:
@@ -233,12 +269,10 @@ def quantize_into(
 ) -> ModelArtifact:
     """`quantize`'s lane, written into the CALLING job's weights output `output`: a package's
     own lane job (`cozy model quantize --int8` runs one) is this with its recipe as `plan`."""
-    from .quantization import column_block
-
     ctx.raise_if_cancelled()
     intent = facade.plan(plan.components, encoding, max_relative_frobenius=max_relative_frobenius)
     structure = ctx.tensorfs_source(source).inspect()
-    selected = _selection(structure, plan, column_block(encoding))
+    selected = _selection(structure, plan, encoding)
     result, receipt = facade._quantize(
         source,
         intent,

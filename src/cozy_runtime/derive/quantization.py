@@ -142,6 +142,8 @@ class QuantizationTensor(msgspec.Struct, forbid_unknown_fields=True):
     logical_dtype: str
     shape: tuple[int, int]
     source_role: str = "value"
+    #: This weight's own encoding, when it is not the lane's.
+    encoding: str | None = None
 
 
 class ArtifactQuantizationPlan(msgspec.Struct, forbid_unknown_fields=True):
@@ -447,7 +449,7 @@ def quantization_additions(
         raise UnsupportedInput(f"quantization plan has no component {component!r}")
     return {
         tensor.key: _artifact_tensor(
-            encoding,
+            tensor.encoding or encoding,
             tensor,
             target_logical_dtype=target_logical_dtype,
         )
@@ -475,8 +477,9 @@ def quantize_component_into(
     one tensor at a time and in plan order, exactly as a serial encoder would.
     """
     _validate_request(payload)
-    encoder = _ENCODINGS.get(encoding)
-    if encoder is None:
+    if encoding not in _ENCODINGS or any(
+        tensor.encoding not in (None, *_ENCODINGS) for tensor in plan.tensors
+    ):
         raise UnsupportedInput(f"unsupported quantization encoding {encoding!r}")
     if component not in plan.components:
         raise UnsupportedInput(f"quantization plan has no component {component!r}")
@@ -490,14 +493,23 @@ def quantize_component_into(
     completed = completed_parts(transaction)
     reused = 0
 
-    roles = encoder.roles()
+    def encoding_of(tensor: QuantizationTensor) -> str:
+        return tensor.encoding or encoding
 
     def finished(tensor: QuantizationTensor) -> bool:
+        roles = _ENCODINGS[encoding_of(tensor)].roles()
         return all((target_component, tensor.key, role) in completed for role in roles)
 
-    encode = functools.partial(
-        _encode_tensor, transaction, encoding, source=source, source_component=source_component
-    )
+    def encode(tensor: QuantizationTensor, stop: threading.Event) -> _Encoded:
+        return _encode_tensor(
+            transaction,
+            encoding_of(tensor),
+            tensor,
+            stop,
+            source=source,
+            source_component=source_component,
+        )
+
     results = _in_order([tensor for tensor in tensors if not finished(tensor)], encode)
     with contextlib.closing(results):
         for done, tensor in enumerate(tensors, 1):
@@ -507,16 +519,18 @@ def quantize_component_into(
                 tel.progress(done / total, stage=f"{encoding}-{target_component}")
                 continue
             result = next(results)
+            name = encoding_of(tensor)
+            roles = _ENCODINGS[name].roles()
             with result.spill as spill:
-                bound = result.amax * encoder.round_trip_bound
+                bound = result.amax * _ENCODINGS[name].round_trip_bound
                 if not _numeric.within(result.max_error, bound):
                     raise UnsupportedInput(
                         f"{source_component}.{tensor.key}: round-trip error "
-                        f"{result.max_error:.4g} exceeds the {encoding} bound {bound:.4g}",
+                        f"{result.max_error:.4g} exceeds the {name} bound {bound:.4g}",
                         code="quantization_tripwire",
                     )
                 if result.rows != tensor.shape[0]:
-                    raise UnsupportedInput(f"{encoding} changed its declared TensorFS geometry")
+                    raise UnsupportedInput(f"{name} changed its declared TensorFS geometry")
                 relative = math.sqrt(result.sse / result.energy) if result.energy > 0 else 0.0
                 if payload.max_relative_frobenius is not None and not _numeric.within(
                     relative, payload.max_relative_frobenius
@@ -731,6 +745,7 @@ def _artifact_plan(raw: bytes) -> ArtifactQuantizationPlan:
             or not tensor.key.endswith(".weight")
             or tensor.logical_dtype not in {"bf16", "f16", "f32"}
             or tensor.source_role != "value"
+            or tensor.encoding not in (None, *_ENCODINGS)
             or rows <= 0
             or cols <= 0
         ):
