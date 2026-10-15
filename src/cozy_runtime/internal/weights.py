@@ -1618,11 +1618,13 @@ class Read:
         """The op's result, without a view into bytes that leave with the op's leases."""
         if isinstance(out, (tuple, list)):
             return type(out)(self.kept(item) for item in out)
-        if not getattr(out, "is_cuda", False):
-            return out
-        tensor = cast("Tensor", out)
-        address = int(tensor.data_ptr()) if tensor.numel() else 0
-        return tensor.clone() if any(a <= address < b for a, b in self.spans) else out
+        viewed = any(
+            a <= int(tensor.data_ptr()) < b
+            for tensor in spill.stored((out,))
+            if tensor.is_cuda and tensor.numel()
+            for a, b in self.spans
+        )
+        return cast("Tensor", out).clone() if viewed else out
 
 
 #: the CUDA planes of this process, which torch's one out-of-memory observer answers for
@@ -1671,7 +1673,7 @@ def _recovery_type(torch: ModuleType) -> type:
         ) -> Any:
             kwargs = kwargs or {}
             out = self._run(func, args, kwargs)
-            spill.touch(_tensor_operands((*args, *kwargs.values(), out)))
+            spill.touch((*args, *kwargs.values(), out))
             if self.journal is not None:
                 self.journal.made(out)
             return out
@@ -1776,15 +1778,15 @@ class Journal:
         return self.done
 
     def made(self, out: object) -> None:
-        for value in _tensor_operands((out,)):
-            self.made_here.add(_storage(value))
+        for value in spill.stored((out,)):
+            self.made_here.add(int(value.untyped_storage().data_ptr()))
 
     def before_write(self, written: Iterable[object]) -> None:
-        for value in _tensor_operands(tuple(written)):
-            key = _storage(value)
-            if key < 0 or key in self.made_here or key in self.kept:
-                continue
+        for value in spill.stored(tuple(written)):
             storage = value.untyped_storage()
+            key = int(storage.data_ptr())
+            if key in self.made_here or key in self.kept:
+                continue
             self.kept[key] = (storage, storage.clone())
             self.wrote = True
 
@@ -1885,18 +1887,6 @@ def _written(func: Any, args: tuple[object, ...], kwargs: Mapping[str, object]) 
             yield args[index] if index < len(args) else kwargs.get(argument.name)
 
 
-def _storage(value: object) -> int:
-    """The address that names a tensor's storage; -1 for one with none to name (a wrapper
-    subclass, a weight's unbound stand-in), which no journal keeps."""
-    pointer = getattr(value, "untyped_storage", None)
-    if pointer is None:
-        return -1
-    try:
-        return int(pointer().data_ptr())
-    except RuntimeError:
-        return -1
-
-
 def _tensor_operands(operands: Sequence[object]) -> Iterator[Tensor]:
     """Tensor arguments/results of Torch ops, including one level of tensor sequences.
     The structural check keeps this module importable without importing Torch itself."""
@@ -1908,10 +1898,9 @@ def _tensor_operands(operands: Sequence[object]) -> Iterator[Tensor]:
 
 def _pointers(operands: Sequence[object]) -> Iterator[int]:
     """Device addresses of an op's tensor operands (one level deep)."""
-    for value in operands:
-        for item in value if isinstance(value, (tuple, list)) else (value,):
-            if getattr(item, "is_cuda", False) and type(item).__name__ != "Unbound":
-                yield int(item.data_ptr())
+    for tensor in spill.stored(operands):
+        if tensor.is_cuda:
+            yield int(tensor.data_ptr())
 
 
 def _unbaked(region: Region) -> None:
