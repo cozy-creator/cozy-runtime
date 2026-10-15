@@ -121,6 +121,7 @@ from cozy_runtime.author._model import Model, component_use
 from cozy_runtime.author._observations import Attribution
 from cozy_runtime.author._services import Attempt as AuthorAttempt
 from cozy_runtime.author._services import ProgressFrame
+from cozy_runtime.author._signature import Surface
 from cozy_runtime.author._split import install as install_pieces
 from cozy_runtime.author._weights import Weights as RawWeights
 from cozy_runtime.author.kernels import _SETS as KERNEL_SETS
@@ -3776,7 +3777,7 @@ class Executor:
 
     # ------------------------------------------------------------------ job
 
-    def _job_sources(self, surface: Any, command: RunJob) -> dict[str, RawWeights[Any]]:
+    def _job_sources(self, surface: Surface, command: RunJob) -> dict[str, RawWeights[Any]]:
         """The `Weights` arguments of a function run without a session."""
         declared = {binding.param: binding for binding in surface.model_bindings}
         constructed = sorted(name for name, binding in declared.items() if not binding.weights)
