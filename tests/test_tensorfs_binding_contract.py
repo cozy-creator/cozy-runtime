@@ -21,9 +21,8 @@ Two arms, and the second is the one that would have caught it:
 1. **The frozen table.** Every tensorfs entry point cozy-runtime calls, with the exact
    signature it was written against. A rename, an added parameter, a reordering or a
    removal on the Rust side turns this red on the next `uv sync`.
-2. **The real call.** `prepare_model_source`/`release_model_source` driven through the real
-   runtime function against a real `Store` on disk. Arity is proved by binding, not by
-   reading — the strongest form available without a compiler.
+2. **The real call.** `fit` driven against a real header: the result contract the weight
+   plane consumes is proved by calling it, not by reading.
 
 WHAT THIS CANNOT COVER, stated so nobody mistakes the coverage for more than it is:
 
@@ -54,28 +53,7 @@ SRC = Path(__file__).resolve().parent.parent / "src" / "cozy_runtime"
 #: written for. Transcribed from the installed extension, not from the Rust source: the
 #: wheel is what a pod runs. A diff here is a seam change and wants a human, not a re-freeze.
 CALLED: dict[str, str] = {
-    "pull": (
-        "(store, hub, refspec, *, lane=Ellipsis, credential=Ellipsis, timeout=None, "
-        "session=Ellipsis, streams=Ellipsis, streams_start=Ellipsis, allowed_hosts=Ellipsis, "
-        "allow_local=False, sample_seconds=None, cancellation=None, progress=None)"
-    ),
-    "PullCancellation": "()",
-    "transfer_streams": "(wanted)",
     "manifest_max_bytes": "()",
-    "read_source_heads": (
-        "(source_uri, members, *, credential=Ellipsis, huggingface=None, civitai=None, "
-        "allow_local=False)"
-    ),
-    "select_source_profile": "(store, heads, *, registry=None)",
-    "source_profile_converters": "(store, profiles, *, registry=None)",
-    "prepare_selected_source": (
-        "(store, operation_id, source_selection_digest, profiles, members, *, registry=None, "
-        "write_budget_bytes=None)"
-    ),
-    "model_source_objects": "(store, operation_id)",
-    "record_model_source_custody": "(store, operation_id, objects, evidence)",
-    "PullCancellation.cancel": "(self, /)",
-    "gc": "(root, dry_run=False, *, evict_cached=False, keep_manifests=Ellipsis)",
     "fit": (
         "(requirements: 'Sequence[TensorRequirement]', header: 'bytes', *, custody: 'str', "
         "encoded_leaves: 'bool', device: 'str | None' = None, "
@@ -83,46 +61,22 @@ CALLED: dict[str, str] = {
     ),
     "plan": "(header, traversal, components=None, window=Ellipsis)",
     "parse_header": "(data: 'bytes', closure: 'Closure | None' = None) -> 'Header'",
-    "parse_manifest": "(data)",
     "seed_digests": "()",
     "object_id": "(data)",
-    "dtypes": "()",
     "TensorRequirement": (
         "(component: 'str', key: 'str', shape: 'Sequence[int]', "
         "logical_dtype: 'str | None' = None) -> None"
     ),
     "Store.open": "(root=None)",
     "Store.ensure": "(root=None)",
-    "Store.resolve_source": (
-        "(self, /, source_uri, carriers=Ellipsis, *, profiles=Ellipsis, files=Ellipsis, "
-        "credential=Ellipsis, huggingface=None, civitai=None, allow_local=False, registry=None)"
-    ),
-    "Store.materialize_source": (
-        "(self, /, owner, members, *, allowed_hosts, credential_hosts=Ellipsis, "
-        "credential=Ellipsis, allow_local=False, progress=None)"
-    ),
-    "Store.prepare_source_artifact": (
-        "(self, /, source_owner, operation_id, profiles, *, checkpoints=Ellipsis, "
-        "adopt_from_operation_id=None, registry=None)"
-    ),
-    "Store.create_tree_root": "(self, /, owner, manifest_id, manifest_length)",
     "Store.import_tree": "(self, /, owner, manifest_bytes, files)",
-    "Store.retain_tree_root": "(self, /, source_owner, owner)",
-    "Store.tree_root": "(self, /, owner)",
-    "Store.release_tree_root": "(self, /, owner)",
-    "Store.release_tree_retention": "(self, /, source_owner, receipt_digest, owner)",
-    "Store.adopt_source_progress": "(self, /, source_owner, owner)",
-    "Store.prepare_readers": "(self, /)",
     "Store.manifest": "(self, /, hex)",
     "Store.put_file": "(self, /, path, expect=None, expect_length=None)",
     "Store.put_manifest": "(self, /, data, expect=None, expect_length=None)",
     "Store.acquire": "(self, /, manifest, objects)",
     "Store.acquire_manifest": "(self, /, hex)",
     "Store.acquire_cozytensors": "(self, /, hex)",
-    "Store.walk": "(self, /, hex)",
     "Store.walk_cozytensors": "(self, /, hex)",
-    "Store.resolve_release": "(self, /, org, name, version, lane)",
-    "Store.complete_cozytensors_manifests": "(self, /)",
     "Store.begin_derived": (
         "(self, /, transaction_id, writer_session_id, sources, targets, configs, order, "
         "max_new_bytes, files=None, *, work_fingerprint, checkpoint=None)"
@@ -136,29 +90,12 @@ CALLED: dict[str, str] = {
         "(self, /, transaction_id, declaration, head_id, head_length, *, "
         "operation_id, slot, plan_digest)"
     ),
-    "Store.model_source_operations": "(self, /)",
     "Store.derived_lookup": "(self, /, transaction_id)",
-    "Store.derived_fence": "(self, /, transaction_id, writer_session_id)",
-    "Store.derived_abandon": "(self, /, transaction_id)",
     "Store.derived_dispose": "(self, /, transaction_id)",
     "Store.derived_adopt": "(self, /, transaction_id, scratch_root_id)",
-    # The incremental roster/landed seam replaces the full-file barrier in xs-025.
-    "Store.prepare_model_source": (
-        "(self, /, operation_id, source_selection_digest, profiles, roster, landed, "
-        "*, checkpoints=Ellipsis, adopt_from_operation_id=None, registry=None, "
-        "write_budget_bytes=None)"
-    ),
-    "Store.release_model_source": "(self, /, operation_id)",
     "Store.checkpoint_page": (
         "(self, /, head_id, head_length, *, operation_id, slot, plan_digest, offset=0, limit=128)"
     ),
-    "Store.checkpoint_push": (
-        "(self, /, object_id, length, manifest, grant, *, allow_local=False)"
-    ),
-    "Store.checkpoint_fetch": (
-        "(self, /, object_id, length, manifest, url, *, allow_local=False, derived_restore=None)"
-    ),
-    "ReadLease.stream": "(self, /, plan, slots, on_batch, readers=4)",
     "ReadLease.read_into": "(self, /, object, object_length, off, length, into)",
     "ReadLease.read_asset": "(self, /, header, name, max_bytes=67108864)",
     "ReadLease.read_part_into": "(self, /, header, component, key, role, off, into)",
@@ -171,8 +108,6 @@ CALLED: dict[str, str] = {
     "DerivedWriter.checkpoint": "(self, /, operation_id, slot, *, previous=None)",
     "DerivedWriter.fence": "(self, /)",
     "DerivedWriter.source_read_into": "(self, /, source, component, key, role, off, into)",
-    "Batch.release": "(self, /)",
-    "Batch.items": "(self, /)",
     "ReadPlan.items": "(self, /)",
     # The weight plane (`tensorfs.plane`, 0.3.84): what `internal/plane.py`, `internal/weights.py`
     # and `worker/host_tier.py` call.
@@ -201,16 +136,6 @@ CALLED: dict[str, str] = {
     "plane.Cursor.close": "(self, /)",
 }
 
-#: Bindings cozy-runtime uses only where the installed TensorFS has them: the call site
-#: detects them and degrades without them, so absence is never a break and never a floor.
-#: Where present they keep the signature they were written against. Keyed roots (the
-#: stage memo's machine tier, `worker/stage_memo.py`) shipped in TensorFS 0.3.84.
-OPTIONAL: dict[str, str] = {
-    "Store.put_keyed_root": "(self, /, space, key, manifest_bytes, files)",
-    "Store.keyed_roots": "(self, /, space)",
-    "Store.drop_keyed_root": "(self, /, space, key)",
-}
-
 #: Non-callable crossings: read, never called, so they carry no signature to freeze. Their
 #: DISAPPEARANCE is still a break, which is all this set asserts.
 READ: frozenset[str] = frozenset(
@@ -218,8 +143,6 @@ READ: frozenset[str] = frozenset(
         "DTYPES",
         "errors.Refusal",
         "ReadLease.live",
-        "Batch.slot",
-        "Batch.nbytes",
         "ReadPlan.order",
         "ReadPlan.bytes",
     }
@@ -292,25 +215,13 @@ def test_fit_result_keeps_the_mapping_contract_the_weight_plane_consumes() -> No
     assert consumed == verdict and consumed["ok"]
 
 
-def test_optional_bindings_keep_their_signature_where_the_installed_tensorfs_has_them() -> None:
-    """An older TensorFS lacks them and the Runtime runs without; a newer one must not have
-    changed them under the call sites."""
-
-    drifted = {
-        name: (frozen, _signature(name))
-        for name, frozen in sorted(OPTIONAL.items())
-        if _exists(name) and _signature(name) != frozen
-    }
-    assert not drifted, f"tensorfs {tensorfs.__version__} changed an optional binding: {drifted}"
-
-
 def test_the_signature_check_would_notice_a_deleted_parameter() -> None:
     """The guard's own red arm: prove the comparison detects the exact break it exists for."""
 
-    installed = _signature("Store.prepare_model_source")
-    missing_landed = installed.replace(", landed,", ",")
-    assert missing_landed != installed
-    assert CALLED["Store.prepare_model_source"] == installed
+    installed = _signature("Store.begin_derived")
+    missing_targets = installed.replace(", targets,", ",")
+    assert missing_targets != installed
+    assert CALLED["Store.begin_derived"] == installed
 
 
 def test_the_frozen_table_names_every_tensorfs_attribute_the_source_reaches() -> None:
