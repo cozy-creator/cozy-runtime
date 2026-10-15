@@ -94,29 +94,35 @@ def release(torch: ModuleType) -> None:
     _FREE.clear()
 
 
-def touch(tensors: Iterable[Tensor]) -> None:
-    """An op read or made `tensors`: their storages are the last to move."""
+def stored(values: Iterable[object]) -> Iterator[Tensor]:
+    """The tensors among `values` (one level of sequences) whose storage holds their bytes: a
+    plain strided tensor, or a traceable wrapper's inner ones (an AsyncCollectiveTensor, a
+    DTensor). A wrapper's own storage has no bytes (run 6349: `data_ptr` raises on it), nor
+    has another subclass's (a weight's unbound stand-in), a meta or a sparse tensor's."""
+    for value in values:
+        for item in value if isinstance(value, (tuple, list)) else (value,):
+            if type(item).__name__ in ("Tensor", "Parameter"):
+                if not item.is_meta and str(item.layout) == "torch.strided":
+                    yield cast("Tensor", item)
+            elif (flatten := getattr(item, "__tensor_flatten__", None)) is not None:
+                yield from stored([getattr(item, name) for name in flatten()[0]])
+
+
+def touch(values: Iterable[object]) -> None:
+    """An op read or made `values`: their device storages are the last to move."""
     clock = _CLOCK[0] = _CLOCK[0] + 1
-    for value in tensors:
-        try:
-            storage = value.untyped_storage()
-        except RuntimeError:  # a sparse or wrapper tensor has no storage of its own
-            continue
-        if storage.nbytes() >= SMALLEST:
+    for value in stored(values):
+        storage = value.untyped_storage()
+        if value.is_cuda and storage.nbytes() >= SMALLEST:
             USED[storage.data_ptr()] = (clock, weakref.ref(value))
     if len(USED) > FORGET:
         for key in [k for k, (at, _) in USED.items() if at < clock - FORGET]:
             del USED[key]
 
 
-def hosted(value: Tensor) -> bool:
+def hosted(value: object) -> bool:
     """Whether `value`'s bytes are in a host block."""
-    if not HELD:
-        return False
-    try:
-        return value.untyped_storage().data_ptr() in HELD
-    except RuntimeError:  # a sparse or wrapper tensor has no storage of its own
-        return False
+    return bool(HELD) and any(t.untyped_storage().data_ptr() in HELD for t in stored((value,)))
 
 
 def empty(torch: ModuleType, device: Device, like: Tensor) -> Tensor:
@@ -141,7 +147,7 @@ def spill(
         if s["device"] == device.index
     )
     starts = [start for start, _ in segments]
-    read = {int(t.untyped_storage().data_ptr()) for t in _tensors(operands)}
+    read = {int(t.untyped_storage().data_ptr()) for t in stored(operands) if t.is_cuda}
     found: dict[int, UntypedStorage] = {}
 
     def add(values: Iterable[object]) -> int:
@@ -188,10 +194,3 @@ def _move(torch: ModuleType, device: Device, storage: UntypedStorage) -> int:
     alias = torch.as_tensor(host, device=device)
     storage._swap_data_ptr_(alias.untyped_storage())
     return nbytes
-
-
-def _tensors(operands: Iterable[object]) -> Iterator[Tensor]:
-    for value in operands:
-        for item in value if isinstance(value, (tuple, list)) else (value,):
-            if type(item).__name__ in ("Tensor", "Parameter") and getattr(item, "is_cuda", False):
-                yield cast("Tensor", item)
