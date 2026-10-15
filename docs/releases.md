@@ -53,3 +53,15 @@ or retry an already published version to test automation.
 
 See [tracker #348](https://github.com/cozy-creator/tracker/issues/348) for the source/prebuilt
 entrypoint repair and its rehearsal evidence.
+
+## Qualification tables
+
+The decode qualification ships as data (`internal/qualification_tables`), one table per card
+architecture and torch minor, valid while `IDENTITY_SOURCES` are unchanged. When a release
+changes them, measure every gate card's table on the candidate before tagging:
+
+```sh
+python -m cozy_runtime.cli.qualify src/cozy_runtime/internal/qualification_tables
+```
+
+A card without a current table measures what it is asked once per machine and keeps it.
