@@ -61,8 +61,7 @@ def test_the_copy_engines_move_the_bytes_nccl_moves(tmp_path: Path) -> None:
     # exchange returns exactly NCCL's attention output on every GPU, and none of its peer
     # copies reaches Python dispatch. Only where this host's measured links allow it.
     degree = torch.cuda.device_count()
-    devices = ",".join(str(index) for index in range(degree))
-    measured = links.measured(None, devices, degree)
+    measured = links.measured(None, [str(index) for index in range(degree)])
     if not measured.copy_engines:
         pytest.skip(f"this host's links keep NCCL: {measured.why()}")
     env = {

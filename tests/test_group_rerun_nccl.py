@@ -155,7 +155,7 @@ def test_the_h3_dit_forms_over_its_measured_route_and_matches_one_gpu(
     with torch.no_grad():
         alone = model.dit(**batch)
     leader.backend = prepared({"dit": model.dit, "text_encoder": model.text_encoder})
-    measured = links.measured(tmp_path / "links", "0,1", 2)
+    measured = links.measured(tmp_path / "links", ["0", "1"])
     leader.transport = links.Transport(2, [0, 1], "nccl", measured.nccl(), measured)
     try:
         group.spawn()
