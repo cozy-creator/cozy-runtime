@@ -80,7 +80,7 @@ conflicts = [[{ extra = "corpus" }, { group = "diffusers" }]]
 # TensorFS 0.10 is unreleased: its master, exactly, until the cohort publishes it (never a test
 # publish). Workflows read it with TENSORFS_READ_KEY. The release replaces this with the version.
 [tool.uv.sources]
-tensorfs = { git = "https://github.com/cozy-creator/tensorfs.git", rev = "9eda816a99fadafd6b432eb7a3f0cc45f0a701d8" }
+tensorfs = { git = "https://github.com/cozy-creator/tensorfs.git", rev = "edf7df05e101c9bee09831528d34ccb2d31a18b8" }
 
 # Read only on the COZY_RUNTIME_BUILD_KERNELS=1 wheel build; the root CMakeLists.txt is
 # the reviewed kernels build (static cudart, abi3, the upstream fleet arch policy).

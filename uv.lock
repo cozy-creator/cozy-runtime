@@ -466,8 +466,8 @@ requires-dist = [
     { name = "packaging", specifier = ">=24" },
     { name = "peft", marker = "extra == 'adapters'", specifier = ">=0.20,<0.21" },
     { name = "pillow", specifier = ">=12" },
-    { name = "tensorfs", git = "https://github.com/cozy-creator/tensorfs.git?rev=9eda816a99fadafd6b432eb7a3f0cc45f0a701d8" },
-    { name = "tensorfs", marker = "extra == 'model-execution'", git = "https://github.com/cozy-creator/tensorfs.git?rev=9eda816a99fadafd6b432eb7a3f0cc45f0a701d8" },
+    { name = "tensorfs", git = "https://github.com/cozy-creator/tensorfs.git?rev=edf7df05e101c9bee09831528d34ccb2d31a18b8" },
+    { name = "tensorfs", marker = "extra == 'model-execution'", git = "https://github.com/cozy-creator/tensorfs.git?rev=edf7df05e101c9bee09831528d34ccb2d31a18b8" },
     { name = "tokenizers", marker = "extra == 'adapters'", specifier = ">=0.23.1" },
     { name = "torch", marker = "extra == 'adapters'", specifier = ">=2.13" },
     { name = "torch", marker = "extra == 'corpus'", specifier = ">=2.13" },
@@ -485,7 +485,7 @@ dev = [
     { name = "pytest", specifier = ">=8.4" },
     { name = "pytest-split", specifier = ">=0.11.0" },
     { name = "ruff", specifier = ">=0.16" },
-    { name = "tensorfs", git = "https://github.com/cozy-creator/tensorfs.git?rev=9eda816a99fadafd6b432eb7a3f0cc45f0a701d8" },
+    { name = "tensorfs", git = "https://github.com/cozy-creator/tensorfs.git?rev=edf7df05e101c9bee09831528d34ccb2d31a18b8" },
 ]
 diffusers = [
     { name = "diffusers", specifier = ">=0.40.0" },
@@ -1768,7 +1768,7 @@ wheels = [
 [[package]]
 name = "tensorfs"
 version = "0.9.0"
-source = { git = "https://github.com/cozy-creator/tensorfs.git?rev=9eda816a99fadafd6b432eb7a3f0cc45f0a701d8#9eda816a99fadafd6b432eb7a3f0cc45f0a701d8" }
+source = { git = "https://github.com/cozy-creator/tensorfs.git?rev=edf7df05e101c9bee09831528d34ccb2d31a18b8#edf7df05e101c9bee09831528d34ccb2d31a18b8" }
 
 [[package]]
 name = "tokenizers"
