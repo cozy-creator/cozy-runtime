@@ -27,12 +27,7 @@ from cozy_runtime.author._executor_requests import (
 )
 from cozy_runtime.author._invoke import _bind_tensorfs
 from cozy_runtime.author._services import Attempt
-from cozy_runtime.internal.encoding.formats import (
-    SPEC_MXFP8,
-    SPEC_PLAIN,
-    SPEC_ROWWISE,
-    SPEC_ROWWISE_KEEPDIM,
-)
+from cozy_runtime.internal.encoding.formats import SPEC_PLAIN, SPEC_ROWWISE, SPEC_ROWWISE_KEEPDIM
 from cozy_runtime.internal.model_values import read_values_into
 from cozy_runtime.internal.weights_writer import ExecutionStorage
 from durable_seam import seam
@@ -221,7 +216,6 @@ def test_inherited_identity_and_changed_scale_use_native_read_custody(
     [
         ("fp8-rowwise.json", SPEC_ROWWISE),
         ("fp8-rowwise-keepdim.json", SPEC_ROWWISE_KEEPDIM),
-        ("mxfp8.json", SPEC_MXFP8),
     ],
 )
 def test_logical_ranges_match_banked_format_vectors(
@@ -299,28 +293,6 @@ def test_foreign_stale_canceled_and_released_views_refuse(tmp_path: Path) -> Non
     broker.close_attempt(record)
     with pytest.raises((EOFError, OSError, tensorfs.errors.Refusal)):
         again["source"].read_into("model", "weight", "value", 0, bytearray(4))
-
-
-def test_ragged_mxfp8_and_partial_final_block(tmp_path: Path) -> None:
-    pytest.importorskip("torch", reason="encoded reconstruction uses the optional Torch decoder")
-    store = tensorfs.Store.init(tmp_path / "store")
-    row = {
-        "logical": {"dtype": "f32", "shape": [2, 35]},
-        "encoding": SPEC_MXFP8,
-        "roles": {
-            "data": {"dtype": "f8_e4m3fn", "shape": [2, 35], "bytes": bytes([0x38]) * 70},
-            "scale": {"dtype": "u8", "shape": [2, 2], "bytes": bytes([127, 128, 126, 129])},
-        },
-    }
-    expected = np.array([1] * 32 + [2] * 3 + [0.5] * 32 + [4] * 3, dtype=np.float32)
-    ref = model(store, "ragged", {"weight": row})
-    sources, _, _, _, handles, _ = reader(tmp_path, store, {"source": ref})
-    view = sources["source"]
-    with handles:
-        for offset, count in [(0, 70), (31, 8), (67, 3)]:
-            target = np.empty(count, dtype=np.float32)
-            view.read_values_into("model", "weight", offset, target)
-            np.testing.assert_array_equal(target, expected[offset : offset + count])
 
 
 def test_missing_or_corrupt_native_header_cannot_open_a_view(tmp_path: Path) -> None:

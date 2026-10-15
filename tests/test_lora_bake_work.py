@@ -24,11 +24,8 @@ def _inputs() -> tuple[Any, Any, Any]:
 def _stored(kind: str, weight: Any) -> tuple[Any, Any]:
     if kind == "plain":
         return weight.to(torch.bfloat16), None
-    if kind == "rowwise":
-        scale = (weight.abs().amax(dim=1) / 448).clamp(min=1e-12)
-        return (weight / scale[:, None]).to(torch.float8_e4m3fn), scale
-    scale = torch.full((8, 2), 118, dtype=torch.uint8)
-    return (weight * 512).to(torch.float8_e4m3fn), scale
+    scale = (weight.abs().amax(dim=1) / 448).clamp(min=1e-12)
+    return (weight / scale[:, None]).to(torch.float8_e4m3fn), scale
 
 
 def _bake(
@@ -48,15 +45,13 @@ def _bake(
     }
     if kind == "plain":
         lora_bake.bake_plain(torch, data, down, up, 0.75, **kwargs)
-    elif kind == "rowwise":
+    else:
         lora_bake.bake_rowwise(
             torch, data, scale, down, up, 0.75, grid="refit" if refit else "keep", **kwargs
         )
-    else:
-        lora_bake.bake_mx(torch, data, scale, down, up, 0.75, refit=refit, **kwargs)
 
 
-@pytest.mark.parametrize("kind", ["plain", "rowwise", "mx"])
+@pytest.mark.parametrize("kind", ["plain", "rowwise"])
 @pytest.mark.parametrize("rounding", ["nearest", "stochastic", "feedback"])
 @pytest.mark.parametrize("refit", [False, True])
 def test_statistics_do_not_change_stored_bytes_or_rng_sequence(
@@ -77,7 +72,7 @@ def test_statistics_do_not_change_stored_bytes_or_rng_sequence(
     assert stats.weight_energy > 0 and stats.delta_energy > 0
 
 
-@pytest.mark.parametrize("kind", ["plain", "rowwise", "mx"])
+@pytest.mark.parametrize("kind", ["plain", "rowwise"])
 @pytest.mark.parametrize("want_stats", [False, True])
 def test_only_requested_diagnostics_and_one_call_scoped_factor_cast(
     monkeypatch: pytest.MonkeyPatch, kind: str, want_stats: bool

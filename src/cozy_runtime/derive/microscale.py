@@ -1,4 +1,4 @@
-"""The numeric core of the microscaling quant kinds: E2M1/E4M3/E8M0 arithmetic in numpy.
+"""The numeric core of the 8- and 4-bit quant kinds: E2M1/E4M3/int8 arithmetic in numpy.
 
 Every encoder here is INTEGER-DETERMINISTIC — table lookups, comparisons and float32
 arithmetic with no reduction order that a device can reorder — so two runs on two hosts
@@ -8,16 +8,16 @@ digest depends on which card produced it cannot be pinned by a recipe.
 
 The element tables are TABLES, not formulas, and they are written to match the border's
 reference decoders exactly (`tensorfs crates/tensorfs-core/src/bin/tfs/conform.rs`:
-`f32_from_e4m3fn`, `f32_from_e2m1`, `f32_from_e8m0`). Producer and reader agree by
-construction rather than by both being "an implementation of the spec".
+`f32_from_e4m3fn`, `f32_from_e2m1`). Producer and reader agree by construction rather than
+by both being "an implementation of the spec".
 
-THE SCALE-SELECTION RULE (#513/#517's defect class, replanted for fp4)
-----------------------------------------------------------------------
-#517 root-caused 1.02 dB of the mxfp8 gap to a scale rule that was POSITIONAL — the OCP
-floor exponent — rather than chosen. Its own largest element clamped in every dense
-block. The same trap is one line wide in nvfp4, because the two-level scheme divides by a
-per-block E4M3 scale that a round-to-nearest cast can round DOWN, at which point the
-block's max lands above E2M1's 6.0 and saturates.
+THE SCALE-SELECTION RULE (#513/#517's defect class)
+---------------------------------------------------
+#517 root-caused 1.02 dB of a block-scaled format's gap to a scale rule that was POSITIONAL
+rather than chosen: its own largest element clamped in every dense block. The trap is one
+line wide in nvfp4, because the two-level scheme divides by a per-block E4M3 scale that a
+round-to-nearest cast can round DOWN, at which point the block's max lands above E2M1's 6.0
+and saturates.
 
 So the rule here is CHOSEN ERROR-MINIMIZING, never positional:
 
@@ -318,85 +318,12 @@ def encode_nvfp4(key: str, values: np.ndarray) -> Encoded:
     )
 
 
-# ----------------------------------------------------------------------------- mxfp8
-
-MXFP8_BLOCK = 32
-
-
-def encode_mxfp8(key: str, values: np.ndarray) -> Encoded:
-    """OCP MXFP8 in `mxfp8/1`: E4M3 elements, one E8M0 byte per 32-element block.
-
-    The exponent rule is #517's: both admissible exponents are quantized THROUGH the
-    stored representation and the smaller squared error wins, ties to the lower. This is
-    the ONE implementation of the rule since #549.10 retired the torch duplicate — integer
-    arithmetic so the mixed kind does not need a GPU host to emit an mxfp8 tensor.
-    """
-    rows, cols = _require_2d(key, values, MXFP8_BLOCK)
-    nb = cols // MXFP8_BLOCK
-    payload = np.empty((rows, cols), dtype=np.uint8)
-    scales = np.empty((rows, nb), dtype=np.uint8)
-    acc = _Accum()
-    for sl in row_chunks(rows, cols, CACHE_ELEMENTS):
-        blk = np.ascontiguousarray(values[sl], dtype=np.float32).reshape(-1, nb, MXFP8_BLOCK)
-        bamax = _block_amax(blk)
-        with np.errstate(divide="ignore"):
-            e_lo = np.where(bamax > 0, np.floor(np.log2(bamax.astype(np.float64))) - 8.0, -127.0)
-        byte_lo = np.clip(e_lo + 127.0, 0.0, 254.0)
-        byte_hi = np.where(bamax > 0, np.clip(byte_lo + 1.0, 0.0, 254.0), byte_lo)
-        enc, recon, sse = _mxfp8_candidate(blk, byte_lo)
-        enc_hi, recon_hi, sse_hi = _mxfp8_candidate(blk, byte_hi)
-        take = sse_hi < sse  # strict: a tie keeps the LOWER exponent
-        chosen = np.where(take, byte_hi, byte_lo)
-        np.copyto(enc, enc_hi, where=take[..., None])
-        np.copyto(recon, recon_hi, where=take[..., None])
-        scale = np.power(np.float32(2.0), (chosen - 127.0).astype(np.float32))
-        # Only a block whose largest element exceeds the E4M3 range can saturate.
-        over = bamax / scale > E4M3_MAX
-        if over.any():
-            acc.sat += int(np.count_nonzero(np.abs(blk[over]) / scale[over][:, None] > E4M3_MAX))
-        acc.add(blk.reshape(-1, cols), recon.reshape(-1, cols))
-        payload[sl] = enc.reshape(-1, cols)
-        scales[sl] = chosen.astype(np.uint8)
-
-    return Encoded(
-        payload_dtype="F8_E4M3",
-        payload_shape=[rows, cols],
-        payload=payload.tobytes(),
-        companions=[Companion(".weight_scale", "U8", [rows, nb], scales.tobytes())],
-        saturated=acc.sat,
-        sse=acc.sse,
-        energy=acc.energy,
-        max_abs_err=acc.max_abs,
-    )
-
-
-def _block_amax(blk: np.ndarray) -> np.ndarray:
-    """max |x| over the last axis by halving: exact, and far cheaper than a short-axis reduce."""
-    m = np.abs(blk)
-    while m.shape[-1] > 1:
-        m = np.maximum(m[..., : m.shape[-1] // 2], m[..., m.shape[-1] // 2 :])
-    return m[..., 0]
-
-
-def _mxfp8_candidate(blk: np.ndarray, exponent: np.ndarray) -> tuple[np.ndarray, ...]:
-    """One candidate exponent per block, quantized THROUGH the stored representation."""
-    scale = np.power(np.float32(2.0), (exponent - 127.0).astype(np.float32))[..., None]
-    scaled = blk / scale
-    np.clip(scaled, -E4M3_MAX, E4M3_MAX, out=scaled)
-    enc = _e4m3_signed(scaled, np.abs(scaled))
-    recon = E4M3_DECODE32.take(enc, mode="clip")
-    recon *= scale
-    diff = (recon - blk).astype(np.float64)
-    return enc, recon, np.sum(np.square(diff, out=diff), axis=-1)
-
-
 # ---------------------------------------------------------------------- fp8 rowwise
 
 
 def encode_fp8_rowwise(key: str, values: np.ndarray) -> Encoded:
     """`fp8-rowwise/1`, rank-1 scale variant: continuous per-output-row f32 scale
-    `clamp(rowmax|v|/448, min 1e-12)`, RNE payload, clamp BEFORE the cast. Bit-for-bit
-    the runtime's `quantize_rowwise` reference, restated in numpy."""
+    `clamp(rowmax|v|/448, min 1e-12)`, RNE payload, clamp BEFORE the cast."""
     rows, cols = _require_2d(key, values, 1)
     payload = np.empty((rows, cols), dtype=np.uint8)
     row_scale = np.empty((rows,), dtype=np.float32)

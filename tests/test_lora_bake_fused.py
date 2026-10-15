@@ -77,11 +77,6 @@ def _stored(form: int, weight: Any) -> tuple[dict[str, Any], Any]:
         scale = (weight.abs().amax(dim=1) / 448).clamp(min=1e-12)
         data = (weight / scale[:, None]).to(torch.float8_e4m3fn)
         return {"data": data, "scale": scale}, scale[:, None].double()
-    if form == lora_bake.MX:
-        grid = torch.randint(115, 121, (ROWS, COLS // 32), dtype=torch.uint8)
-        unit = torch.ldexp(torch.ones(grid.shape), grid.int() - 127).repeat_interleave(32, dim=1)
-        data = (weight / unit).clamp(-448, 448).to(torch.float8_e4m3fn)
-        return {"data": data, "scale": grid}, unit.double()
     dtype = (torch.bfloat16, torch.float16, torch.float32)[form]
     return {"value": weight.to(dtype)}, torch.ones(())
 
@@ -111,7 +106,7 @@ def _step(form: int, target: Any, unit: Any) -> Any:
 
 
 @interpreted
-@pytest.mark.parametrize("form", [lora_bake.BF16, lora_bake.ROWWISE, lora_bake.MX])
+@pytest.mark.parametrize("form", [lora_bake.BF16, lora_bake.ROWWISE])
 def test_a_fused_stochastic_bake_stores_a_neighbour_without_bias(form: int) -> None:
     weight, down, up = _layer(3)
     stored, unit = _stored(form, weight)
@@ -146,7 +141,7 @@ def test_a_fused_nearest_bake_is_the_eager_one(form: int) -> None:
 
 
 @interpreted
-@pytest.mark.parametrize("form", list(range(5)))
+@pytest.mark.parametrize("form", [lora_bake.BF16, lora_bake.F16, lora_bake.F32, lora_bake.ROWWISE])
 def test_values_on_the_grid_are_fixed_points_and_a_seed_names_the_bytes(form: int) -> None:
     weight, down, up = _layer(7)
     stored, _ = _stored(form, weight)

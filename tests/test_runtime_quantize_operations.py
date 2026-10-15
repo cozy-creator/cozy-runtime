@@ -75,8 +75,7 @@ def _shared(
         )
 
 
-@pytest.mark.parametrize("encoding", ["fp8-rowwise/1", "mxfp8/1"])
-def test_shared_operation_resumes_complete_native_groups(tmp_path: Path, encoding: str) -> None:
+def test_shared_operation_resumes_complete_native_groups(tmp_path: Path) -> None:
     store = tensorfs.Store.init(tmp_path / "store")
     source = _source(store, "control")
     plan = QuantizationPlan(("control",))
@@ -92,14 +91,13 @@ def test_shared_operation_resumes_complete_native_groups(tmp_path: Path, encodin
         store,
         source,
         plan,
-        encoding,
         request="resume",
         canceled=canceled,
         checkpoint=stop,
     )
     assert result is None and outcome.terminal == "canceled" and len(checkpoints) == 1
     result, outcome, record = _shared(
-        tmp_path / "resumed", store, source, plan, encoding, request="resume", epoch=2
+        tmp_path / "resumed", store, source, plan, request="resume", epoch=2
     )
     assert outcome.terminal == "succeeded" and result is not None
     facts = next(
@@ -107,7 +105,7 @@ def test_shared_operation_resumes_complete_native_groups(tmp_path: Path, encodin
     )
     assert isinstance(facts, dict) and facts["reused_keys"] == 1
     assert facts["source_bytes_read_this_run"] == 1024
-    clean, outcome, _ = _shared(tmp_path / "clean", store, source, plan, encoding)
+    clean, outcome, _ = _shared(tmp_path / "clean", store, source, plan)
     assert outcome.terminal == "succeeded" and clean is not None
     assert clean.result.manifest == result.result.manifest
 
@@ -144,19 +142,16 @@ def test_builtin_interface_is_static_and_matches_its_actual_app() -> None:
 
 
 @pytest.mark.parametrize("component,dtype", [("unet", "f16"), ("transformer", "bf16")])
-@pytest.mark.parametrize("encoding", ["fp8-rowwise/1", "mxfp8/1"])
 def test_shared_native_operation_preserves_existing_family_results(
-    tmp_path: Path, component: str, dtype: str, encoding: str
+    tmp_path: Path, component: str, dtype: str
 ) -> None:
     store = tensorfs.Store.init(tmp_path / "store")
     source = _source(store, component, dtype)
     original, outcome, _ = _run(
-        tmp_path / "legacy", _host(store, "legacy", source), source, component, encoding
+        tmp_path / "legacy", _host(store, "legacy", source), source, component, "fp8-rowwise/1"
     )
     assert outcome.terminal == "succeeded" and original is not None
-    result, outcome, _ = _shared(
-        tmp_path / "shared", store, source, QuantizationPlan((component,)), encoding
-    )
+    result, outcome, _ = _shared(tmp_path / "shared", store, source, QuantizationPlan((component,)))
     assert outcome.terminal == "succeeded", outcome
     assert result is not None and result.result.manifest == original.manifest
 

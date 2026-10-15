@@ -35,14 +35,13 @@ def test_native_decode_keeps_every_code_bit_and_signed_reserved_value(layout: st
         assert torch.equal(data, before)
 
 
-@pytest.mark.parametrize("kind", ["rowwise", "mx"])
 @pytest.mark.parametrize("statistics", [False, True])
 def test_encoding_table_is_built_once_per_bake_and_not_retained(
-    monkeypatch: pytest.MonkeyPatch, kind: str, statistics: bool
+    monkeypatch: pytest.MonkeyPatch, statistics: bool
 ) -> None:
     monkeypatch.setattr(lora_bake, "CHUNK_ELEMENTS", 3 * 64)
     data = torch.ones((8, 64), dtype=torch.float8_e4m3fn)
-    scale = torch.ones(8) if kind == "rowwise" else torch.full((8, 2), 127, dtype=torch.uint8)
+    scale = torch.ones(8)
     down, up = torch.ones((4, 64)), torch.ones((8, 4))
     original = lora_bake._magnitudes
     held: list[weakref.ReferenceType[Any]] = []
@@ -53,6 +52,6 @@ def test_encoding_table_is_built_once_per_bake_and_not_retained(
         return table
 
     monkeypatch.setattr(lora_bake, "_magnitudes", counted)
-    function = lora_bake.bake_rowwise if kind == "rowwise" else lora_bake.bake_mx
-    function(torch, data, scale, down, up, 0.25, stats=lora_bake.Stats() if statistics else None)
+    stats = lora_bake.Stats() if statistics else None
+    lora_bake.bake_rowwise(torch, data, scale, down, up, 0.25, stats=stats)
     assert len(held) == 1 and held[0]() is None

@@ -1,4 +1,4 @@
-"""Carrier-free structural derivation: FP8/MXFP8 encoding, safetensors IO, identity.
+"""Carrier-free structural derivation: FP8/INT8 encoding, safetensors IO, identity.
 
 Packages import these modules directly
 (``cozy_runtime.derive.quantization``) or just the cr-076 facade re-exported here

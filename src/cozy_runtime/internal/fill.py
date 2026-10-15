@@ -84,10 +84,9 @@ REFUSALS = frozenset(
         # decoder does not account for the roles (a runtime gap, READER side), and this one
         # says the stored bytes are not the encoding they claim (DATA side, rebuild the
         # artifact). Collapsing them would print the wrong remedy, which is the exact cost
-        # `worker/refusal.py` exists to avoid (#503b). It becomes producible with mxfp8: a
-        # block scale is the first role whose geometry is DERIVED (`ceil_div(cols, 32)`)
-        # rather than fixed, so "the right roles at the wrong shape" is a state that can
-        # exist for the first time.
+        # `worker/refusal.py` exists to avoid (#503b). A spec whose role geometry is DERIVED
+        # (a block scale's `ceil_div(cols, block)`) rather than fixed is where "the right
+        # roles at the wrong shape" can exist.
         "carrier_geometry",
         # #549.4 and #549.5, spoken here for the same reason cr-006's other codes are:
         # one refusal table. `spec_unreviewed` says the registry knows this exact spec

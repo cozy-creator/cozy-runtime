@@ -1,0 +1,1 @@
+`mxfp8/1` is gone: its quantizer, decode floor, sm120 encoded-GEMM leaf, LoRA bake, model-value reader and qualification suites. A checkpoint citing its spec refuses at bind (`spec_unreviewed`). `fp8-rowwise/1` and `int8-convrot256/1` remain.

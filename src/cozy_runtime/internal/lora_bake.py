@@ -2,8 +2,8 @@
 
 A bake is decode -> add `alpha * up @ down` -> round back to the stored representation, one
 row chunk at a time, so nothing larger than a chunk exists twice. Plain floats round once to
-their dtype. `fp8-rowwise/1` and `mxfp8/1` re-encode E4M3, `int8-convrot256/1` its int8 grid
-in the rotated basis; the rounding is chosen because a delta below half a grid step vanishes
+their dtype. `fp8-rowwise/1` re-encodes E4M3, `int8-convrot256/1` its int8 grid in the
+rotated basis; the rounding is chosen because a delta below half a grid step vanishes
 under nearest rounding. `Stats` is what a quality gate reads: how much of the delta survived
 and how much rounding error the bake added.
 
@@ -30,7 +30,7 @@ from typing import IO, TYPE_CHECKING, Literal
 if TYPE_CHECKING:
     from torch import Generator, Tensor, device as Device
 
-from cozy_runtime.internal.encoding import E4M3_MAX, E8M0_BIAS, MX_BLOCK
+from cozy_runtime.internal.encoding import E4M3_MAX
 from cozy_runtime.internal.encoding.formats import hadamard256
 
 try:
@@ -53,8 +53,8 @@ GRIDS: tuple[Grid, ...] = ("keep", "refit", "regrid")
 #: Elements decoded at once (8 MiB of f32): a bake's working memory stays well below a
 #: block's activations, so it runs inside the room a stage already has.
 CHUNK_ELEMENTS = 1 << 21
-#: Columns an error-feedback run carries its rounding error across (an mxfp8 block).
-FEEDBACK_RUN = MX_BLOCK
+#: Columns an error-feedback run carries its rounding error across.
+FEEDBACK_RUN = 32
 ROW_SCALE_FLOOR = 1e-12
 #: Halfway to the step above 448 that E4M3 lacks: past it a value is clamped, not rounded.
 SATURATION = 464.0
@@ -303,69 +303,6 @@ def bake_rowwise(
     _finish(torch, data, stats, began)
 
 
-def bake_mx(
-    torch: ModuleType,
-    data: Tensor,
-    scale: Tensor,
-    down: Tensor,
-    up: Tensor,
-    alpha: float,
-    *,
-    rounding: Rounding = "nearest",
-    refit: bool = True,
-    generator: Generator | None = None,
-    stats: Stats | None = None,
-) -> None:
-    """Bake into `mxfp8/1`: `data` `[out, in]` E4M3, `scale` `[out, in/32]` E8M0 bytes
-    (2^(b-127) per block of 32 columns), the stored row-major grid.
-
-    `refit` chooses each block's exponent again as the encoder does: the floor exponent or
-    one above it, whichever stores the block with less squared error under nearest
-    rounding. A block whose delta is small keeps the exponent it sits on.
-    """
-    began = time.perf_counter()
-    raw, grid = data.view(torch.uint8), scale.view(torch.uint8)
-    cols = int(data.shape[1])
-    down_fp32 = down.float()
-    magnitudes = _magnitudes(torch, data.device)
-    for start, stop in _chunks(*data.shape):
-        rows = stop - start
-        old = _exp2(torch, grid[start:stop].to(torch.int32) - E8M0_BIAS).unsqueeze(-1)
-        base = decode_e4m3(torch, raw[start:stop]).view(rows, -1, MX_BLOCK) * old
-        delta = _delta(up, down_fp32, alpha, start, stop).view(rows, -1, MX_BLOCK)
-        target = base + delta
-        byte = grid[start:stop].to(torch.int32)
-        if refit:
-            amax = target.abs().amax(dim=-1)
-            lowest = torch.full_like(amax, -127.0, dtype=torch.float64)
-            floor = torch.where(amax > 0, torch.floor(torch.log2(amax.double())) - 8, lowest)
-            low = (floor + E8M0_BIAS).clamp(0, 254).to(torch.int32)
-            high = (low + 1).clamp(max=254)
-            byte = torch.where(
-                _mx_error(torch, target, high, magnitudes)
-                < _mx_error(torch, target, low, magnitudes),
-                high,
-                low,
-            )
-        mult = _exp2(torch, byte - E8M0_BIAS).unsqueeze(-1)
-        payload = (target / mult).view(rows, cols)
-        code = encode_e4m3(torch, payload, rounding, generator, magnitudes=magnitudes)
-        if stats is not None:
-            stored = decode_e4m3(torch, code).view(rows, -1, MX_BLOCK) * mult
-        raw[start:stop].copy_(code)
-        grid[start:stop].copy_(byte.to(torch.uint8))
-        if stats is not None:
-            _account(
-                stats,
-                base.view(rows, cols),
-                delta.view(rows, cols),
-                stored.view(rows, cols),
-                (payload.abs() > SATURATION).sum(),
-                down_fp32,
-            )
-    _finish(torch, data, stats, began)
-
-
 def rotate_factor(torch: ModuleType, down: Tensor) -> Tensor:
     """`down` (`[rank, in]`) in an `int8-convrot256/1` weight's basis: each 256 input channels
     times the orthonormal Hadamard, so `up @ rotated` is the delta of the stored rotated rows."""
@@ -409,17 +346,6 @@ def bake_int8_convrot(
     _finish(torch, data, stats, began)
 
 
-def _mx_error(torch: ModuleType, target: Tensor, byte: Tensor, magnitudes: Tensor) -> Tensor:
-    """Each block's squared error stored to nearest under exponent byte `byte`."""
-    mult = _exp2(torch, byte - E8M0_BIAS).unsqueeze(-1)
-    code = _nearest(torch, magnitudes, target / mult)
-    return (decode_e4m3(torch, code) * mult - target).square().sum(dim=-1)
-
-
-def _exp2(torch: ModuleType, exponent: Tensor) -> Tensor:
-    return torch.ldexp(torch.ones_like(exponent, dtype=torch.float32), exponent)
-
-
 def _finish(torch: ModuleType, tensor: Tensor, stats: Stats | None, began: float) -> None:
     if stats is None:
         return
@@ -433,13 +359,7 @@ def bakeable(roles: dict[str, str]) -> bool:
     """Whether a stored weight (role -> TensorFS dtype) takes `bake`."""
     if set(roles) == {"value"}:
         return roles["value"] in ("bf16", "f16", "f32")
-    if roles == {"data": "i8", "scale": "f32"}:
-        return True
-    return (
-        set(roles) == {"data", "scale"}
-        and roles["data"] == "f8_e4m3fn"
-        and roles["scale"] in ("f32", "u8")
-    )
+    return roles in ({"data": "i8", "scale": "f32"}, {"data": "f8_e4m3fn", "scale": "f32"})
 
 
 def bake(
@@ -452,11 +372,11 @@ def bake(
     stats: Stats | None = None,
 ) -> None:
     """Bake `up @ down` into one stored weight by its roles: plain floats, `fp8-rowwise/1`
-    (E4M3 data, f32 row scale), `mxfp8/1` (E4M3 data, E8M0 block grid) or `int8-convrot256/1`
-    (int8 data, f32 row scale). bf16, E4M3 and int8 round stochastically, scales kept:
-    nearest returns a small delta to where it was, and loses most of a LoRA's effect on fp8
-    (MEASURE.md, TensorD #26). `seed` names the weight's noise. A GPU bakes fused unless
-    `stats` are asked for (the eager reference measures them)."""
+    (E4M3 data, f32 row scale) or `int8-convrot256/1` (int8 data, f32 row scale). bf16, E4M3
+    and int8 round stochastically, scales kept: nearest returns a small delta to where it was,
+    and loses most of a LoRA's effect on fp8 (MEASURE.md, TensorD #26). `seed` names the
+    weight's noise. A GPU bakes fused unless `stats` are asked for (the eager reference
+    measures them)."""
     device = next(iter(stored.values())).device
     if stats is None and device.type == "cuda" and _ready(device.index or 0):
         fused(torch, stored, down, up, seed)
@@ -480,7 +400,7 @@ def bake(
             generator=generator,
             stats=stats,
         )
-    elif stored["scale"].dtype == torch.float32:
+    else:
         bake_rowwise(
             torch,
             stored["data"],
@@ -490,19 +410,6 @@ def bake(
             1.0,
             rounding="stochastic",
             grid="keep",
-            generator=generator,
-            stats=stats,
-        )
-    else:
-        bake_mx(
-            torch,
-            stored["data"],
-            stored["scale"],
-            down,
-            up,
-            1.0,
-            rounding="stochastic",
-            refit=False,
             generator=generator,
             stats=stats,
         )
@@ -521,9 +428,9 @@ def accumulate(
 # ----------------------------------------------------------------------------- fused bake
 
 #: Stored forms the fused kernel bakes (`bakeable`): bf16 (stochastic), f16 and f32 (nearest),
-#: `fp8-rowwise/1` and `mxfp8/1` (E4M3, stochastic, scales kept), `int8-convrot256/1` (int8 of
-#: the rotated rows, stochastic, scale kept; `fused` rotates `down`).
-BF16, F16, F32, ROWWISE, MX, INT8 = range(6)
+#: `fp8-rowwise/1` (E4M3, stochastic, scale kept), `int8-convrot256/1` (int8 of the rotated
+#: rows, stochastic, scale kept; `fused` rotates `down`).
+BF16, F16, F32, ROWWISE, INT8 = range(5)
 #: A seed is 31 bits: one Triton signature for every weight.
 SEED_MASK = 0x7FFFFFFF
 _TILE = 64
@@ -553,9 +460,7 @@ def fused(
         data, scale, kind = stored["data"], stored["scale"].reshape(-1), INT8
         down = rotate_factor(torch, down)
     else:
-        data, scale = stored["data"].view(torch.uint8), stored["scale"]
-        kind = ROWWISE if scale.dtype == torch.float32 else MX
-        scale = scale.reshape(-1) if kind == ROWWISE else scale.view(torch.uint8)
+        data, scale, kind = stored["data"].view(torch.uint8), stored["scale"].reshape(-1), ROWWISE
     if not data.is_contiguous():
         raise ValueError("a fused bake writes a contiguous [out, in] weight")
     rows, cols = data.shape
@@ -619,13 +524,10 @@ def check(torch: ModuleType, device: Device) -> None:
     up[1::2] = -1 / 32
     down = torch.ones((rank, cols), device=device)
     want = torch.tensor([1.0, -0.5], device=device).repeat(rows // 2)[:, None].expand(rows, cols)
-    for kind in range(5):
-        if kind in (ROWWISE, MX):
+    for kind in (BF16, F16, F32, ROWWISE):
+        if kind == ROWWISE:
             data = torch.full((rows, cols), 0.5, device=device).to(torch.float8_e4m3fn)
-            scale = torch.full((rows,), 0.5, device=device)
-            if kind == MX:  # an exponent byte 2^-1 per block of 32 columns
-                scale = torch.full((rows, cols // 32), E8M0_BIAS - 1, device=device).byte()
-            stored = {"data": data, "scale": scale}
+            stored = {"data": data, "scale": torch.full((rows,), 0.5, device=device)}
         else:
             dtype = (torch.bfloat16, torch.float16, torch.float32)[kind]
             stored = {"value": torch.full((rows, cols), 0.25, dtype=dtype, device=device)}
@@ -700,19 +602,15 @@ if triton is not None:
         at = row[:, None] * cols + col[None, :]
         inside = (row[:, None] < rows) & (col[None, :] < cols)
         noise = tl.randint(seed, at.to(tl.uint32))
-        if FORM == 5:  # INT8: the rotated rows' int8 grid, one f32 scale per row
+        if FORM == 4:  # INT8: the rotated rows' int8 grid, one f32 scale per row
             unit = tl.load(scale + row, mask=row < rows, other=1.0)[:, None]
             code = tl.load(data + at, mask=inside, other=0).to(tl.float32)
             draw = tl.rand(seed, at.to(tl.uint32))
             stored = tl.floor(code + delta / unit + draw)
             stored = tl.minimum(tl.maximum(stored, -127.0), 127.0)
             tl.store(data + at, stored.to(tl.int8), mask=inside)
-        elif FORM >= 3:  # E4M3: ROWWISE (3) or MX (4)
-            if FORM == 3:
-                unit = tl.load(scale + row, mask=row < rows, other=1.0)[:, None]
-            else:
-                byte = tl.load(scale + row[:, None] * (cols // 32) + col[None, :] // 32, inside, 1)
-                unit = (tl.maximum(byte.to(tl.int32), 1) << 23).to(tl.float32, bitcast=True)
+        elif FORM == 3:  # ROWWISE: E4M3, one f32 scale per row
+            unit = tl.load(scale + row, mask=row < rows, other=1.0)[:, None]
             code = tl.load(data + at, mask=inside, other=0).to(tl.int32)
             payload = _decode_e4m3(code) + delta / unit
             tl.store(data + at, _stochastic_e4m3(payload, noise).to(tl.uint8), mask=inside)

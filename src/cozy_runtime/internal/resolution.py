@@ -953,8 +953,8 @@ def _prefer(by_route: Mapping[str, Selection], policy: str) -> Selection:
 def _reason(selection: Selection, found: TensorCandidates, policy: str) -> str:
     """WHY this tensor got this route, in one sentence, recorded IN the plan.
 
-    #549.5's ragged-K case is the one that made this mandatory: a plan that quietly resolves
-    a `mxfp8/1` tensor to the decode floor while its 743 neighbours take the leaf is CORRECT
+    #549.5's geometry case is the one that made this mandatory: a plan that quietly resolves
+    one tensor to the decode floor while its 743 neighbours take the leaf is CORRECT
     and completely opaque, and an operator looking at a footprint number that did not move
     has nowhere to look.
     """

@@ -34,10 +34,8 @@ from typing import Any, NoReturn
 
 from cozy_runtime.internal import accel, canonical
 from cozy_runtime.internal.encoding.formats import (
-    MX_BLOCK,
     Encoded,
     Int8ConvRotDequant,
-    MicroScaledDequant,
     Provider,
     RowwiseDequant,
     ScaledScalarDequant,
@@ -48,7 +46,6 @@ from cozy_runtime.internal.encoding.formats import (
 )
 from cozy_runtime.internal.encoding.leaves import (
     Int8ConvRotNativeLeaf,
-    MicroScaledNativeLeaf,
     RowwiseNativeLeaf,
 )
 
@@ -243,7 +240,6 @@ IDENTITY_SOURCES = (
     "internal/encoding/formats.py",
     "internal/encoding/leaves.py",
     "internal/encoding/selection.py",
-    "internal/instruments.py",
     "internal/probe.py",
     "internal/resolution.py",
 )
@@ -280,14 +276,12 @@ def measure_runtime(torch: Any, release: str) -> RuntimeIdentity:
 def geometry_class(shape: Sequence[int]) -> str:
     """The COARSE geometry a measurement was taken at, recorded on every record (#549.9).
 
-    It is EVIDENCE, not a filter. A record says "this was measured on whole-32-block rank-2
-    geometry", and `Provider.supports` is what actually gates a tensor — filtering admission
-    on this string as well would refuse the decode floor for a ragged tensor, which is the
-    one route that handles one.
+    It is EVIDENCE, not a filter. A record says "this was measured on rank-2 geometry whose K
+    is a multiple of 32", and `Provider.supports` is what actually gates a tensor.
     """
     if len(shape) != 2:
         return f"rank{len(shape)}"
-    return "rank2.block32" if int(shape[1]) % MX_BLOCK == 0 else "rank2.ragged32"
+    return "rank2.block32" if int(shape[1]) % 32 == 0 else "rank2.ragged32"
 
 
 # ------------------------------------------------------------------- capability records
@@ -521,11 +515,10 @@ NAMED_SEAMS: dict[str, tuple[str, str]] = {
         "encoded-provider leg; on sm89 the qualified route is decoded_float, which this "
         "runtime serves",
     ),
-    # `fp8-rowwise/1` and `mxfp8/1` LEFT THIS TABLE when their encoded-GEMM leaves were
-    # built. A seam entry means "this runtime recognises the bytes and executes none of
-    # them"; both now have TWO providers each, a decode floor and an encoded leaf, and the
-    # honest answer for a device that serves neither is the candidate list the refusal
-    # prints. sm100 (B200) stays UNMEASURED: no card was rented, so no record and no floor.
+    # `fp8-rowwise/1` LEFT THIS TABLE when its encoded-GEMM leaf was built. A seam entry
+    # means "this runtime recognises the bytes and executes none of them"; it now has TWO
+    # providers, a decode floor and an encoded leaf, and the honest answer for a device that
+    # serves neither is the candidate list the refusal prints.
     "nvfp4-w4a4/1": (
         "cuda.sm100+",
         "the v1 SVDQuant/W4A4 native stack, ported as providers with its layout contracts "
@@ -553,8 +546,8 @@ def launch_providers() -> dict[str, tuple[Provider, ...]]:
     **Built from `reviewed_specs`, not from aliases** (#549.4). Each provider names the exact
     digests it was reviewed against; this function inverts that into digest -> providers. A
     NEW digest the registry files under an existing alias therefore acquires no provider: a
-    semantically different `mxfp8/1` is never decoded by `cozy.mxfp8.dequant/1` on the
-    strength of its display name.
+    semantically different `fp8-rowwise/1` is never decoded by `cozy.fp8-rowwise.dequant/1`
+    on the strength of its display name.
 
     A reviewed digest the installed TensorFS does not carry (an older TensorFS than this
     Runtime's newest encoding) is skipped with one warning: executors launch, and bytes in
@@ -571,8 +564,6 @@ def launch_providers() -> dict[str, tuple[Provider, ...]]:
         ScaledScalarDequant,
         RowwiseDequant,
         RowwiseNativeLeaf,
-        MicroScaledDequant,
-        MicroScaledNativeLeaf,
         Int8ConvRotDequant,
         Int8ConvRotNativeLeaf,
     )
@@ -633,9 +624,9 @@ class Selection:
     encoded: Encoded
     reason: str = ""
     """WHY this provider, in one sentence, carried into the resolved plan. A plan that says
-    `decoded_float` where a leaf exists has to be able to say why — #549.5's ragged-K case is
-    exactly that, and a plan whose label is honest but whose reason is missing is half a
-    fix."""
+    `decoded_float` where a leaf exists has to be able to say why — a geometry the leaf
+    refuses (#549.5) is exactly that, and a plan whose label is honest but whose reason is
+    missing is half a fix."""
 
 
 @dataclass(frozen=True, slots=True)

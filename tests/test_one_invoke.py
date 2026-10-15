@@ -58,7 +58,8 @@ async def calls_child(ctx: Context, *, artifact: ModelArtifact) -> Count:
 app.entrypoint(calls_child, accelerator=False)
 @invocable
 async def calls_quantize(ctx: Context, *, artifact: ModelArtifact) -> ModelArtifact:
-    return await quantize(source=artifact, plan=QuantizationPlan(("unet",)), encoding="mxfp8/1")
+    plan = QuantizationPlan(("unet",))
+    return await quantize(source=artifact, plan=plan, encoding="fp8-rowwise/1")
 app.entrypoint(calls_quantize, accelerator=False)
 """
 
@@ -113,7 +114,7 @@ def test_a_writers_output_lands_only_through_its_grant(tmp_path: Path, granted: 
         host.handler = broker_lane(owner.broker, owner.attempt)
         reply = host.run(
             "quantize",
-            {"plan": msgspec.to_builtins(QuantizationPlan(("unet",))), "encoding": "mxfp8/1"},
+            {"plan": msgspec.to_builtins(QuantizationPlan(("unet",))), "encoding": "fp8-rowwise/1"},
             owner.spool,
             sources={"source": source.manifest.digest},
             weights=outputs if granted else {},
@@ -139,7 +140,7 @@ def test_a_writers_output_lands_only_through_its_grant(tmp_path: Path, granted: 
             {"module": QUANTIZE, "export": "quantize", "builtin": "operations"},
             {
                 "plan": json.loads(msgspec.json.encode(QuantizationPlan(("unet",)))),
-                "encoding": "mxfp8/1",
+                "encoding": "fp8-rowwise/1",
             },
         ),
     ],

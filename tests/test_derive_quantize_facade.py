@@ -191,7 +191,7 @@ def read_value(
             return bytes(data)
 
 
-@pytest.mark.parametrize("encoding", [None, "fp8-rowwise/1", "mxfp8/1"])
+@pytest.mark.parametrize("encoding", [None, "fp8-rowwise/1"])
 def test_facade_and_native_helper_composition_produce_identical_artifacts(
     tmp_path: Path, encoding: str | None
 ) -> None:
@@ -207,7 +207,7 @@ def test_facade_and_native_helper_composition_produce_identical_artifacts(
 
 def test_model_and_native_inspection_reach_the_same_tensors(tmp_path: Path) -> None:
     store, source = mint(tmp_path, sdxl_rows())
-    spec = plan(("unet",), "mxfp8/1", max_relative_frobenius=0.25)
+    spec = plan(("unet",), "fp8-rowwise/1", max_relative_frobenius=0.25)
     by_model, first = run(tmp_path, store, source, spec, name="model")
     by_view, second = run(tmp_path, store, source, spec, name="view", inspected=True)
     assert first.manifest == second.manifest
@@ -235,7 +235,7 @@ def test_tripwire_and_nonfinite_values_refuse_before_native_commit(tmp_path: Pat
                 root,
                 store,
                 source,
-                plan(("unet",), "mxfp8/1", max_relative_frobenius=threshold),
+                plan(("unet",), "fp8-rowwise/1", max_relative_frobenius=threshold),
                 observed=observed,
             )
         assert refused.value.code == code
@@ -246,10 +246,10 @@ def test_tripwire_and_nonfinite_values_refuse_before_native_commit(tmp_path: Pat
             assert store.derived_lookup(transaction)["state"] != "committed"
     invalid: tuple[Callable[[], QuantizePlan], ...] = (
         lambda: plan(("unet",)),
-        lambda: plan((), "mxfp8/1"),
+        lambda: plan((), "fp8-rowwise/1"),
         lambda: plan(("unet",), "int3/0"),
-        lambda: plan(("unet",), "mxfp8/1", max_relative_frobenius=-1),
-        lambda: plan(("unet",), "mxfp8/1", keep=("unet",)),
+        lambda: plan(("unet",), "fp8-rowwise/1", max_relative_frobenius=-1),
+        lambda: plan(("unet",), "fp8-rowwise/1", keep=("unet",)),
         lambda: plan(keep=("vae", "vae")),
         lambda: plan(bf16_sources=()),
         lambda: plan(bf16_sources=("f16", "f16")),
@@ -263,7 +263,7 @@ def test_tripwire_and_nonfinite_values_refuse_before_native_commit(tmp_path: Pat
 
 def test_native_replay_returns_prior_identity_with_zero_payload_work(tmp_path: Path) -> None:
     store, source = mint(tmp_path, sdxl_rows())
-    spec = plan(("unet",), "mxfp8/1")
+    spec = plan(("unet",), "fp8-rowwise/1")
     first, first_artifact = run(tmp_path, store, source, spec)
     replay, replay_artifact = run(tmp_path, store, source, spec, epoch=2)
     assert first is not None and replay is not None
@@ -357,10 +357,10 @@ def test_explicit_fp16_bf16_preparation_commits_exact_bytes_and_replays(tmp_path
     assert (replay.source_bytes_read_this_run, replay.new_bytes_written_this_run) == (0, 0)
 
 
-@pytest.mark.parametrize("encoding", ["fp8-rowwise/1", "mxfp8/1"])
 def test_explicit_fp16_selection_keeps_quantized_parts_and_changes_logical_dtype(
-    tmp_path: Path, encoding: str
+    tmp_path: Path,
 ) -> None:
+    encoding = "fp8-rowwise/1"
     values = np.arange(256, dtype="<f2").reshape(8, 32) / 256
     store, source = mint(tmp_path, {"adapter": {"a.weight": ("f16", (8, 32), values.tobytes())}})
     _, original = run(tmp_path, store, source, plan(("adapter",), encoding), name="fp16")

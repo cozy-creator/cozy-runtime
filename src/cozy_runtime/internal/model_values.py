@@ -9,12 +9,9 @@ from tensorfs.derived import SourceCapability, SourceInspection
 
 from cozy_runtime.author._errors import CapabilityError
 from cozy_runtime.internal.encoding.formats import (
-    MX_BLOCK,
-    SPEC_MXFP8,
     SPEC_PLAIN,
     SPEC_ROWWISE,
     SPEC_ROWWISE_KEEPDIM,
-    MicroScaledDequant,
     RowwiseDequant,
 )
 
@@ -61,7 +58,7 @@ def read_values_into(
                 raw, tensor.logical_dtype.upper(), [length]
             )
         return
-    if tensor.encoding not in {SPEC_MXFP8, SPEC_ROWWISE, SPEC_ROWWISE_KEEPDIM}:
+    if tensor.encoding not in {SPEC_ROWWISE, SPEC_ROWWISE_KEEPDIM}:
         raise CapabilityError(
             "encoding has no reviewed model reader", code="weights_reader_encoding"
         )
@@ -74,16 +71,11 @@ def read_values_into(
             "encoded model reads require Torch in the callable environment",
             code="weights_reader_decoder_unavailable",
         ) from None
-    provider = (
-        MicroScaledDequant(tensor.encoding)
-        if tensor.encoding == SPEC_MXFP8
-        else RowwiseDequant(tensor.encoding)
-    )
-    if tensor.encoding not in provider.reviewed_specs or provider.supports(tuple(tensor.shape)):
+    provider = RowwiseDequant(tensor.encoding)
+    if provider.supports(tuple(tensor.shape)):
         raise CapabilityError("encoding geometry is not reviewed", code="weights_reader_encoding")
     target = torch.from_numpy(destination)
     columns = tensor.shape[1]
-    blocks = (columns + MX_BLOCK - 1) // MX_BLOCK
     consumed = 0
     while consumed < count:
         position = offset + consumed
@@ -91,50 +83,17 @@ def read_values_into(
         remaining = count - consumed
         whole_rows = min(remaining // columns, _ELEMENTS // columns) if column == 0 else 0
         rows = max(whole_rows, 1)
-        wanted = rows * columns if whole_rows else min(remaining, columns - column, _ELEMENTS)
-        if whole_rows:
-            first_column, width = 0, columns
-            data_offset, data_count = position, wanted
-            scale_offset = row * blocks if tensor.encoding == SPEC_MXFP8 else row * 4
-            scale_count = rows * blocks if tensor.encoding == SPEC_MXFP8 else rows * 4
-            output = target[consumed : consumed + wanted].reshape(rows, columns)
-        else:
-            first_column = (
-                column // MX_BLOCK * MX_BLOCK if tensor.encoding == SPEC_MXFP8 else column
-            )
-            last_column = (
-                min(columns, (column + wanted + MX_BLOCK - 1) // MX_BLOCK * MX_BLOCK)
-                if tensor.encoding == SPEC_MXFP8
-                else column + wanted
-            )
-            width = last_column - first_column
-            data_offset, data_count = row * columns + first_column, width
-            scale_offset = (
-                row * blocks + first_column // MX_BLOCK
-                if tensor.encoding == SPEC_MXFP8
-                else row * 4
-            )
-            scale_count = (width + MX_BLOCK - 1) // MX_BLOCK if tensor.encoding == SPEC_MXFP8 else 4
-            output = torch.empty((1, width), dtype=torch.float32, device="cpu")
-        payload = _part(source, component, key, "data", data_offset, data_count)
-        scale = _part(source, component, key, "scale", scale_offset, scale_count)
+        width = columns if whole_rows else min(remaining, columns - column, _ELEMENTS)
+        payload = _part(source, component, key, "data", position, rows * width)
+        scale = _part(source, component, key, "scale", row * 4, rows * 4)
         data_tensor = (
             torch.frombuffer(payload, dtype=torch.uint8)
             .view(torch.float8_e4m3fn)
             .reshape(rows, width)
         )
-        scale_tensor = torch.frombuffer(
-            scale, dtype=torch.uint8 if tensor.encoding == SPEC_MXFP8 else torch.float32
-        )
-        scale_tensor = (
-            scale_tensor.reshape(rows, -1)
-            if tensor.encoding == SPEC_MXFP8
-            else scale_tensor.reshape(rows)
-        )
+        scale_tensor = torch.frombuffer(scale, dtype=torch.float32).reshape(rows)
+        output = target[consumed : consumed + rows * width].reshape(rows, width)
         # Arithmetic and special values are the serving decoder's, selected by exact
         # reviewed spec digest. Only the bounded source-range slicing is new here.
         provider.decode(torch, {"data": data_tensor, "scale": scale_tensor}, output)
-        if not whole_rows:
-            start = column - first_column
-            target[consumed : consumed + wanted].copy_(output.reshape(-1)[start : start + wanted])
-        consumed += wanted
+        consumed += rows * width

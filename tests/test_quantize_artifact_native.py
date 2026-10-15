@@ -31,7 +31,7 @@ from cozy_runtime.author._loader import TensorSpec
 from cozy_runtime.author._services import Attempt
 from cozy_runtime.derive import plan, quantize_artifact
 from cozy_runtime.derive import safetensors_io as st
-from cozy_runtime.derive.microscale import encode_fp8_rowwise, encode_mxfp8
+from cozy_runtime.derive.microscale import encode_fp8_rowwise
 from cozy_runtime.derive.quantization import prepare_source_quantization, quantization_additions
 from cozy_runtime.internal.encoding import TORCH_DTYPES
 from cozy_runtime.internal.fill import Checkpoint
@@ -40,6 +40,7 @@ from cozy_runtime.internal.weights import Weights as PlaneWeights
 from native_weights import NativeExecution
 
 BOUND = 1 << 20
+ENCODING = "fp8-rowwise/1"
 
 
 @invocable
@@ -105,9 +106,8 @@ def _source(
         return host.client.adopt_model(writer.commit())
 
 
-@pytest.mark.parametrize("encoding,payload_bytes", [("fp8-rowwise/1", 544), ("mxfp8/1", 528)])
 def test_two_durable_quantization_groups_skip_source_reads_and_payload_writes(
-    tmp_path: Path, encoding: str, payload_bytes: int
+    tmp_path: Path,
 ) -> None:
     store = tensorfs.Store.init(tmp_path / "store")
     source = _source(store, "unet", keys=("z.weight", "a.weight", "b.weight", "bias"))
@@ -123,7 +123,7 @@ def test_two_durable_quantization_groups_skip_source_reads_and_payload_writes(
         _host(store, "two-groups", source, checkpoint=stop_after_two),
         source,
         "unet",
-        encoding,
+        ENCODING,
         cancelled=cancelled,
     )
     assert partial is None and outcome.terminal == "canceled" and len(checkpoints) == 2
@@ -132,7 +132,7 @@ def test_two_durable_quantization_groups_skip_source_reads_and_payload_writes(
         _host(store, "two-groups", source, epoch=2),
         source,
         "unet",
-        encoding,
+        ENCODING,
     )
     assert outcome.terminal == "succeeded" and resumed is not None
     measured = next(
@@ -141,13 +141,13 @@ def test_two_durable_quantization_groups_skip_source_reads_and_payload_writes(
     assert isinstance(measured, dict)
     assert measured["reused_keys"] == 2
     assert measured["source_bytes_read_this_run"] == 1024
-    assert measured["new_bytes_written_this_run"] == payload_bytes
+    assert measured["new_bytes_written_this_run"] == 544
     clean, outcome, _ = _run(
         tmp_path / "clean",
         _host(store, "clean-three-groups", source),
         source,
         "unet",
-        encoding,
+        ENCODING,
     )
     assert outcome.terminal == "succeeded" and clean is not None
     assert clean.manifest == resumed.manifest
@@ -192,11 +192,9 @@ def _run(
 
 
 @pytest.mark.parametrize("component", ["unet", "transformer"])
-@pytest.mark.parametrize("encoding", ["fp8-rowwise/1", "mxfp8/1"])
 def test_managed_quantization_recovers_groups_and_returns_stable_artifact(
     tmp_path: Path,
     component: str,
-    encoding: str,
 ) -> None:
     store = tensorfs.Store.init(tmp_path / "store")
     source = _source(store, component)
@@ -205,7 +203,7 @@ def test_managed_quantization_recovers_groups_and_returns_stable_artifact(
         _host(store, "uninterrupted", source),
         source,
         component,
-        encoding,
+        ENCODING,
     )
     assert outcome.terminal == "succeeded", outcome
     assert isinstance(uninterrupted, ModelArtifact)
@@ -221,7 +219,7 @@ def test_managed_quantization_recovers_groups_and_returns_stable_artifact(
         _host(store, "resume", source, checkpoint=checkpoint),
         source,
         component,
-        encoding,
+        ENCODING,
         cancelled=cancelled,
     )
     assert partial is None and outcome.terminal == "canceled", outcome
@@ -232,7 +230,7 @@ def test_managed_quantization_recovers_groups_and_returns_stable_artifact(
         _host(store, "resume", source, epoch=2),
         source,
         component,
-        encoding,
+        ENCODING,
     )
     assert outcome.terminal == "succeeded", outcome
     assert isinstance(resumed, ModelArtifact)
@@ -253,24 +251,20 @@ def test_managed_quantization_recovers_groups_and_returns_stable_artifact(
         _host(store, "resume", source, epoch=3),
         source,
         component,
-        encoding,
+        ENCODING,
     )
     assert outcome.terminal == "succeeded", outcome
     assert replay == resumed
 
 
-@pytest.mark.parametrize("encoding", ["fp8-rowwise/1", "mxfp8/1"])
-def test_half_written_group_recomputes_and_inherits_unchanged_parts(
-    tmp_path: Path,
-    encoding: str,
-) -> None:
+def test_half_written_group_recomputes_and_inherits_unchanged_parts(tmp_path: Path) -> None:
     store = tensorfs.Store.init(tmp_path / "store")
     source = _source(store, "unet")
     host = _host(store, "partial-group", source)
     with host.client.source(source.manifest.digest) as capability:
         structure = capability.inspect()
     selected = prepare_source_quantization(structure, components=("unet",))
-    additions = quantization_additions(encoding, selected, "unet", target_logical_dtype="bf16")
+    additions = quantization_additions(ENCODING, selected, "unet", target_logical_dtype="bf16")
     writer = host.client.open_output(
         "model",
         Derivation(
@@ -293,9 +287,7 @@ def test_half_written_group_recomputes_and_inherits_unchanged_parts(
     raw = bytearray(1024)
     writer.source_read_into("source", "unet", first.key, "value", 0, memoryview(raw))
     values = st.to_f32(raw, "BF16", list(first.shape))
-    encoded = (encode_fp8_rowwise if encoding == "fp8-rowwise/1" else encode_mxfp8)(
-        first.key, values
-    )
+    encoded = encode_fp8_rowwise(first.key, values)
     writer.add_part("unet", first.key, "data", io.BytesIO(encoded.payload))
     # Persist only the data role. A restarted kernel must not regard half a tensor as done.
     writer.checkpoint()
@@ -306,7 +298,7 @@ def test_half_written_group_recomputes_and_inherits_unchanged_parts(
         _host(store, "partial-group", source, epoch=2),
         source,
         "unet",
-        encoding,
+        ENCODING,
     )
     assert outcome.terminal == "succeeded", outcome
     assert isinstance(resumed, ModelArtifact)
@@ -321,7 +313,7 @@ def test_half_written_group_recomputes_and_inherits_unchanged_parts(
         _host(store, "complete", source),
         source,
         "unet",
-        encoding,
+        ENCODING,
     )
     assert outcome.terminal == "succeeded", outcome
     assert isinstance(complete, ModelArtifact)
@@ -335,14 +327,13 @@ def test_half_written_group_recomputes_and_inherits_unchanged_parts(
 
 
 @pytest.mark.parametrize("source_dtype", ["f16", "bf16", "f32"])
-@pytest.mark.parametrize("encoding", ["fp8-rowwise/1", "mxfp8/1"])
 def test_quantized_encoding_keeps_the_source_precision_contract(
-    tmp_path: Path, source_dtype: str, encoding: str
+    tmp_path: Path, source_dtype: str
 ) -> None:
     store = tensorfs.Store.init(tmp_path / "store")
     source = _source(store, "unet", source_dtype)
     result, outcome, _ = _run(
-        tmp_path / "quantize", _host(store, "quantize", source), source, "unet", encoding
+        tmp_path / "quantize", _host(store, "quantize", source), source, "unet", ENCODING
     )
     assert outcome.terminal == "succeeded", outcome
     assert result is not None

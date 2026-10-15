@@ -34,7 +34,6 @@ import tensorfs
 from cozy_runtime.derive import plan
 from cozy_runtime.internal import canonical
 from cozy_runtime.internal.encoding import (
-    SPEC_MXFP8,
     SPEC_ROWWISE,
     SPEC_ROWWISE_KEEPDIM,
     SPEC_VECTORS,
@@ -127,10 +126,9 @@ def test_one_record_per_encoding_and_device() -> None:
 
 
 def test_a_failed_observation_is_never_reported() -> None:
-    """The recorded probe carries a real failure: mxfp8 decoded to float16, whose range
-    cannot hold the MX domain (442 normal and 420 subnormal elements wrong). The encoding is
-    still reported for the dtypes that DID pass, and float16 is not among them -- so the
-    dtype set a record names is exactly the reportable passing set, never the attempted one.
+    """The recorded probe carries real failures. An encoding is still reported for the dtypes
+    that DID pass, so the dtype set a record names is exactly the reportable passing set,
+    never the attempted one.
     """
     result = probe_result()
     assert [o for o in result.observations if not o.evidence.passed], (
@@ -143,10 +141,6 @@ def test_a_failed_observation_is_never_reported() -> None:
             for o in result.observations
             if (o.encoding_spec_id, o.device_predicate) == pair and _reportable(o)
         }
-    mxfp8 = _mxfp8(result)
-    reported = {r["encoding"]: r for r in observed_capability_records(result)["records"]}
-    assert "float16" not in _note_dtypes(reported[mxfp8]), "float16 mxfp8 decode FAILED here"
-    assert "bfloat16" in _note_dtypes(reported[mxfp8])
 
 
 def test_only_evidence_that_actually_ran_crosses_the_boundary() -> None:
@@ -184,13 +178,6 @@ def _reportable(observation: Observation) -> bool:
     if isinstance(evidence, VerbatimEvidence):
         return True
     return isinstance(evidence, DecodeEvidence) and not evidence.spec_vectors.skipped
-
-
-def _mxfp8(result: QualificationResult) -> str:
-    for observation in result.observations:
-        if "mxfp8" in observation.implementation:
-            return observation.encoding_spec_id
-    raise AssertionError("the recording carries an mxfp8 observation")
 
 
 def _also_ran(result: QualificationResult, pair: tuple[str, str]) -> bool:
@@ -276,7 +263,7 @@ def test_the_mined_cases_actually_run_against_the_shipped_decoder() -> None:
 def test_a_float16_fp8_lane_fits_the_card_its_decode_qualified_on(tmp_path: Path) -> None:
     """Run 1312: an fp8-rowwise SDXL lane on an RTX 3090 refused `encoding_unqualified ...
     no qualification observation on cuda.sm86 (qualified on: cpu)`. SDXL fills float16 and
-    the rowwise and mxfp8 documents mine f32 and bf16 cases, so filtering the mined cases by
+    the rowwise documents mine f32 and bf16 cases, so filtering the mined cases by
     the requested dtype skipped the vector check, `_reportable` dropped the skip, and TensorFS
     received no record. The decode floors are `any`: the real suite runs here on CPU, and its
     observations are keyed to sm86 because the decode arithmetic is the card's."""
@@ -298,7 +285,7 @@ def test_a_float16_fp8_lane_fits_the_card_its_decode_qualified_on(tmp_path: Path
     )
     document = observed_capability_records(result)
     reported = {r["encoding"] for r in document["records"]}
-    assert {SPEC_ROWWISE, SPEC_ROWWISE_KEEPDIM, SPEC_MXFP8} <= reported
+    assert {SPEC_ROWWISE, SPEC_ROWWISE_KEEPDIM} <= reported
 
     verdict = tensorfs.fit(
         [tensorfs.TensorRequirement("unet", "a.weight", [8, 32], None)],

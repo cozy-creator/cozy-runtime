@@ -12,7 +12,6 @@ from cozy_runtime.derive.microscale import (
     e4m3_decode,
     encode_fp8_rowwise,
     encode_int8_convrot256,
-    encode_mxfp8,
 )
 from cozy_runtime.internal import lora_bake
 
@@ -36,20 +35,8 @@ def _rowwise(values: np.ndarray) -> tuple[Any, Any]:
     return data.view(torch.float8_e4m3fn), scale
 
 
-def _mx(values: np.ndarray) -> tuple[Any, Any]:
-    encoded = encode_mxfp8("w", values)
-    data = torch.frombuffer(bytearray(encoded.payload), dtype=torch.uint8).view(ROWS, COLS)
-    scale = torch.frombuffer(bytearray(encoded.companions[0].raw), dtype=torch.uint8)
-    return data.view(torch.float8_e4m3fn), scale.view(ROWS, COLS // 32)
-
-
 def _decoded_rowwise(data: Any, scale: Any) -> Any:
     return e4m3_decode(data.view(torch.uint8).numpy()) * scale.numpy()[:, None]
-
-
-def _decoded_mx(data: Any, scale: Any) -> Any:
-    mult = np.power(np.float32(2), scale.numpy().astype(np.float32) - 127).repeat(32, axis=1)
-    return e4m3_decode(data.view(torch.uint8).numpy()) * mult
 
 
 @pytest.mark.parametrize("rounding", lora_bake.ROUNDINGS)
@@ -60,10 +47,6 @@ def test_a_zero_strength_bake_changes_no_byte(rounding: lora_bake.Rounding, refi
     before = data.view(torch.uint8).clone(), scale.clone()
     grid: lora_bake.Grid = "refit" if refit else "keep"
     lora_bake.bake_rowwise(torch, data, scale, down, up, 0.0, rounding=rounding, grid=grid)
-    assert torch.equal(data.view(torch.uint8), before[0]) and torch.equal(scale, before[1])
-    data, scale = _mx(values)
-    before = data.view(torch.uint8).clone(), scale.clone()
-    lora_bake.bake_mx(torch, data, scale, down, up, 0.0, rounding=rounding, refit=refit)
     assert torch.equal(data.view(torch.uint8), before[0]) and torch.equal(scale, before[1])
 
 
@@ -81,12 +64,10 @@ def test_a_nearest_refit_bake_is_the_lane_encoder_on_the_merged_weight() -> None
     assert stats.saturated == 0 and stats.layers == 1 and stats.elements == ROWS * COLS
     assert stats.error_energy == pytest.approx(want.sse, rel=1e-4)
 
-    data, scale = _mx(values)
-    merged = _decoded_mx(data, scale) + delta
-    lora_bake.bake_mx(torch, data, scale, down, up, 0.75)
-    want = encode_mxfp8("w", merged)
-    assert data.view(torch.uint8).numpy().tobytes() == want.payload
-    assert scale.numpy().tobytes() == want.companions[0].raw
+
+def test_only_a_row_scaled_e4m3_weight_is_bakeable() -> None:
+    assert lora_bake.bakeable({"data": "f8_e4m3fn", "scale": "f32"})
+    assert not lora_bake.bakeable({"data": "f8_e4m3fn", "scale": "u8"})
 
 
 def test_nearest_on_the_kept_grid_loses_a_delta_below_half_a_step() -> None:

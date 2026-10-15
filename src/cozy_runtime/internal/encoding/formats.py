@@ -18,7 +18,7 @@ an `input_scale`, 50 `mlp.fc2` without).
 `reviewed_specs` is a frozenset of exact spec digests, spelled here, and `launch_providers`
 offers a provider for a digest only if that digest is in the set AND still in the registry.
 The old spelling read digests OUT of `tensorfs.seed_digests()` by ALIAS, which meant a new,
-semantically different spec filed under `mxfp8/1` would have INHERITED this file's decoder
+semantically different spec filed under `fp8-rowwise/1` would have INHERITED this file's decoder
 the moment the registry grew it. Transcribing the digests is the cost of making that
 impossible: a digest the installed registry lacks gets no provider (one warning at launch),
 and its bytes refuse at bind instead of being decoded unreviewed. Alias is display, and only
@@ -37,11 +37,9 @@ evidence, never permission — v1's `DTYPE_MIN_SM` fell OPEN on an unknown card 
 plausible wrong output.
 
 **Geometry is preflighted, PURELY, before anything is allocated** (#549.5). Every provider
-answers `supports(shape)` with "" or with the sentence saying why not. TensorFS admits a
-ragged MXFP8 tail, this module's decode handles one, and the native MX leaf cannot — the
-tensor cores read whole 32-blocks. Before #549.5 nothing asked until the leaf was being
-built with the component resident. Now plan resolution asks first, and a tensor whose
-geometry the leaf refuses resolves to the decode floor with the reason recorded IN the plan.
+answers `supports(shape)` with "" or with the sentence saying why not. Plan resolution asks
+before a component is resident, and a tensor whose geometry the leaf refuses resolves to the
+decode floor with the reason recorded IN the plan.
 """
 
 from __future__ import annotations
@@ -156,9 +154,6 @@ SPEC_SCALED_SCALAR_WEIGHT_ONLY = (
     "sha256:7bede606ac5329020c2653eb04663b0d94d6c778e60234479509eddcce38240c"
 )
 
-#: `mxfp8/1` — E4M3 elements, one E8M0 byte per 32-element block along the last axis.
-SPEC_MXFP8 = "sha256:7e9b1ad8f2e5ddd236a4d4303042d632a96eadef4f25d44eb0fb63124cec7cfd"
-
 #: `int8-convrot256/1` — int8 rows of each weight rotated by the orthonormal regular Hadamard per
 #: 256 input channels (ComfyUI's ConvRot), one f32 scale per output row.
 SPEC_INT8_CONVROT256 = "sha256:ac25d323baebfdf1fd0ce3fdfd9f26400ce57914fdc442d0ade8cb187aef183f"
@@ -182,10 +177,6 @@ SPEC_VECTORS: dict[str, tuple[str, str]] = {
     SPEC_SCALED_SCALAR_WEIGHT_ONLY: (
         "fp8-scaled-scalar-weight-only.json",
         "sha256:2326cbd4a1ccaac484792bba04f07e19bc59d61fd913cbe5a4a9a66e469a9374",
-    ),
-    SPEC_MXFP8: (
-        "mxfp8.json",
-        "sha256:9950f32248a14b37267c17d8d8e1fd9c8a281c8291183ee390908e2f00326a22",
     ),
     SPEC_INT8_CONVROT256: (
         "int8-convrot256.json",
@@ -370,7 +361,7 @@ class LeafProvider(Provider, Protocol):
 
 
 def _rank2(shape: Sequence[int]) -> str:
-    """The one geometry law every fp8/mx GEMM route shares: two outer dimensions."""
+    """The one geometry law every scaled GEMM route shares: two outer dimensions."""
     if len(shape) != 2:
         return (
             f"a scaled GEMM has two outer dimensions and this tensor is rank {len(shape)} "
@@ -507,28 +498,9 @@ class ScaledScalarDequant:
         destination.mul_(weight_scale.to(destination.dtype).reshape(()))
 
 
-#: The OCP microscaling block: one shared power-of-two scale per this many elements along
-#: the LAST axis. Transcribed from the registry's `mxfp8/1` spec relation
-#: (`ceil_div(axis 1, by 32)`) and from nothing else.
-MX_BLOCK = 32
-
-#: E8M0's bias: a scale byte `b` denotes exactly `2**(b - 127)`.
-E8M0_BIAS = 127
-
-#: E8M0's ONE non-numeric code point. The registry entry's prose says only "scale byte b
-#: means 2^(b-127)", which at `b = 255` reads as `2**128`; the encoding's own NORMATIVE
-#: decoder — the conform corpus this spec is qualified against — returns NaN there, which
-#: is OCP's reading. Prose and reference disagree and the REFERENCE wins (#511c).
-E8M0_NAN = 255
-
 #: E4M3's largest finite magnitude. The cast to `float8_e4m3fn` DOES NOT SATURATE — an
 #: unclamped 449 becomes NaN, not 448 — so every path that rounds into e4m3 clamps FIRST.
 E4M3_MAX = 448.0
-
-#: How far past 448 a value may sit and still be explained by the three roundings between
-#: `rowmax|V|` and `payload * mult / s`. Beyond it the row scale genuinely failed to cover
-#: its row, which is a different fact and is counted separately.
-SATURATION_MARGIN = 1.0 + 2.0**-10
 
 #: The floor under a derived row scale. A row of exact zeros has amax 0, and a zero scale
 #: is a division by zero that would poison an entire output row with NaN. Spelled as a
@@ -542,133 +514,6 @@ ROW_SCALE_FLOOR = 1e-12
 #: same order as one streamed region. A decode that held a full-width f32 copy of a 4 GiB
 #: weight would be a second residency the ledger never granted.
 _CHUNK_BYTES = 16 << 20
-
-
-@dataclass(frozen=True, slots=True)
-class MicroScaledDequant:
-    """`mxfp8/1` -> float, weight-only: `value = data * 2**(scale - 127)` per 32-block.
-
-    The registry's spec is the whole contract and is transcribed from it: E4M3 elements in
-    a `data` role shaped exactly like the logical tensor, and one E8M0 exponent byte per
-    32-element block along the LAST axis in a `scale` role shaped `[rows, ceil(cols/32)]`.
-    Rank is 2 because the spec says `logical_rank: 2`.
-
-    **This route is THE RAGGED-TAIL FLOOR** (#549.5). `ceil_div` admits a last block shorter
-    than 32, TensorFS accepts one, and the encoded-GEMM leaf cannot consume one — so the
-    slow path below is not a curiosity, it is the qualified route a ragged tensor resolves
-    to, by plan, with the reason recorded. See `MicroScaledNativeLeaf.supports`.
-
-    **Why the multiply lands in the DESTINATION dtype.** The alternative — promote the
-    PAYLOAD to f32, multiply, cast down — allocates a second full-width copy of every
-    weight, which this plane prices as decode scratch and would then be carrying
-    unledgered. It is also unnecessary: an e4m3 element is exact in bf16 and f32 (4
-    significant bits into 8 or 24), the block multiplier is an exact power of two, so the
-    product carries ONE rounding and the measured error over the whole format domain is
-    ZERO. The multiplier grid itself is 1/32 of the weight, so `_multiplier` builds it in
-    f32 and narrows once — negligible bytes, one exact code path.
-
-    What f16 cannot do is hold the multiplier: `2**(b-127)` leaves f16's range below
-    b = 103, so a block whose PRODUCT would be representable decodes as zero. That is not
-    papered over — `probe.py` measures the full domain per output dtype, f16 mints no
-    record, and an f16 mxfp8 destination refuses `encoding_unqualified` rather than being
-    served silently wrong.
-    """
-
-    encoding: str
-
-    @property
-    def name(self) -> str:
-        return "cozy.mxfp8.dequant/1"
-
-    @property
-    def route(self) -> str:
-        return "decoded_float"
-
-    @property
-    def device_predicate(self) -> str:
-        # A cast plus a broadcast multiply — no matmul, no block-scale kernel. Available
-        # wherever torch carries the e4m3 dtype. The sm120 floor belongs to the ENCODED-GEMM
-        # LEAF, which is a different provider under this same digest.
-        return "any"
-
-    @property
-    def reviewed_specs(self) -> frozenset[str]:
-        return frozenset({SPEC_MXFP8})
-
-    @property
-    def code_revision(self) -> str:
-        return "1"
-
-    @property
-    def suite(self) -> str:
-        return "mxfp8-decode"
-
-    @property
-    def required(self) -> frozenset[str]:
-        return frozenset({"data", "scale"})
-
-    @property
-    def optional(self) -> frozenset[str]:
-        return frozenset()
-
-    def supports(self, shape: Sequence[int]) -> str:
-        # Rank 2 is the spec's own `logical_rank`. RAGGED IS FINE HERE and that is the whole
-        # point of stating it: this route is what a ragged tensor falls to.
-        return _rank2(shape)
-
-    @staticmethod
-    def _multiplier(torch: Any, scale: Any, dtype: Any) -> Any:
-        """One E8M0 byte grid -> the block multipliers, BY BIT CONSTRUCTION.
-
-        An E8M0 byte IS an IEEE binary32 exponent field: `b` in 1..254 denotes exactly the
-        f32 whose bit pattern is `b << 23`, mantissa zero. So the multiplier is built, not
-        computed — no `exp2`, no `pow`, nothing whose accuracy is a property of the backend's
-        math library. Measured on an L40S, `torch.exp2` over the same domain is correct in
-        bf16 and off by up to 2.3 ULP in f32 for the smallest scale bytes, which failed 46 of
-        65,536 pairs against a two-rounding budget. Loosening the budget to admit it would
-        have been the wrong repair — the decode's error should be ZERO.
-
-        Two code points are not exponents and are placed by hand: `b = 0` denotes `2**-127`,
-        one binade below f32's smallest NORMAL, so it is the subnormal `1 << 22`; and
-        `b = 255` is E8M0's NaN, which `b << 23` would spell as a signed infinity.
-        """
-        bits = scale.to(torch.int32) << 23
-        bits = torch.where(scale == 0, torch.full_like(bits, 1 << 22), bits)
-        # f32 first, in one code path, because its exponent range covers the whole byte
-        # domain exactly; narrowing to the destination is then a single exact conversion
-        # wherever the destination can hold the value, and 0 or inf where it cannot.
-        mult = bits.view(torch.float32).to(dtype)
-        return torch.where(scale == E8M0_NAN, torch.full_like(mult, float("nan")), mult)
-
-    def decode(self, torch: ModuleType, parts: Mapping[str, Tensor], destination: Tensor) -> None:
-        data = parts["data"]
-        scale = parts["scale"]
-        dtype = destination.dtype
-        rows, cols = int(destination.shape[0]), int(destination.shape[1])
-        blocks = int(scale.shape[-1])
-        if dtype == torch.float16:
-            # f16's exponent range cannot hold every block scale (2**-31 narrows to 0), so
-            # the product is formed in f32, where it is exact, and rounded once.
-            wide = data.view(destination.shape).to(torch.float32)
-            mult = self._multiplier(torch, scale, torch.float32)
-            destination.copy_(wide * mult.repeat_interleave(MX_BLOCK, dim=-1)[..., :cols])
-            return
-        mult = self._multiplier(torch, scale, dtype)
-        if cols == blocks * MX_BLOCK and destination.is_contiguous():
-            # THE PATH EVERY WHOLE-BLOCK ARTIFACT TAKES. A 3-D view over both sides
-            # broadcasts the block scale with no intermediate at all: no repeat, no f32
-            # copy, one kernel.
-            view = destination.view(rows, blocks, MX_BLOCK)
-            view.copy_(data.view(rows, blocks, MX_BLOCK).to(dtype))
-            view.mul_(mult.unsqueeze(-1))
-            return
-        # The RAGGED tail and the non-contiguous destination, both handled by widening the
-        # multiplier instead of viewing the weight. It costs one destination-sized temporary
-        # and is written as the slow path on purpose: a 3-D view cannot span a partial block
-        # or a strided slice, and quietly taking the fast path anyway would mis-stride the
-        # scales.
-        destination.copy_(data.view(destination.shape).to(dtype))
-        destination.mul_(mult.repeat_interleave(MX_BLOCK, dim=-1)[..., :cols])
 
 
 @dataclass(frozen=True, slots=True)
@@ -718,7 +563,7 @@ class RowwiseDequant:
 
     @property
     def device_predicate(self) -> str:
-        # A cast and a broadcast multiply, exactly like the other two decode routes.
+        # A cast and a broadcast multiply, exactly like the other decode routes.
         return "any"
 
     @property
@@ -759,11 +604,10 @@ class RowwiseDequant:
             return
         # ONE ROUNDING, IN ROW CHUNKS. The product has to be formed in f32 (see the class
         # docstring), and forming it whole would allocate a full-width f32 copy of every
-        # weight — the second full copy `MicroScaledDequant` refuses to make, and one the
-        # ledger never granted because it is an allocator transient rather than decode
-        # scratch. Chunking by ROWS bounds that transient without changing a single
-        # arithmetic step: each row's scale applies to its own row and nothing else, so a
-        # row-block boundary is not a boundary the arithmetic can see.
+        # weight, a second copy the ledger never granted because it is an allocator transient
+        # rather than decode scratch. Chunking by ROWS bounds that transient without changing
+        # a single arithmetic step: each row's scale applies to its own row and nothing else,
+        # so a row-block boundary is not a boundary the arithmetic can see.
         stride = max(1, _CHUNK_BYTES // max(int(destination.shape[1]) * 4, 1))
         for start in range(0, rows, stride):
             stop = min(start + stride, rows)

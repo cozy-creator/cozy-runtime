@@ -1,4 +1,4 @@
-"""Carrier-free FP8, MXFP8 and INT8 model derivations.
+"""Carrier-free FP8 and INT8 model derivations.
 
 The worker receives one exact TensorFS Manifest capability and returns another through
 TensorFS scoped derivation handles. It receives no Store or filesystem access.
@@ -35,7 +35,6 @@ from .microscale import (
     Encoded,
     encode_fp8_rowwise,
     encode_int8_convrot256,
-    encode_mxfp8,
 )
 
 
@@ -56,14 +55,6 @@ def _row_scale(rows: int, cols: int) -> tuple[str, tuple[int, ...]]:
 
 
 _ENCODINGS: dict[str, _Encoding] = {
-    "mxfp8/1": _Encoding(
-        round_trip_bound=2.0**-3,
-        encode=encode_mxfp8,
-        payload="F8_E4M3",
-        data_dtype="f8_e4m3fn",
-        block=32,
-        scale=lambda rows, cols: ("u8", (rows, cols // 32)),
-    ),
     "fp8-rowwise/1": _Encoding(
         round_trip_bound=2.0**-3,
         encode=encode_fp8_rowwise,
@@ -151,7 +142,6 @@ _ARTIFACT_SPECS = {
     # TensorFS 0.3's exact, vector-backed platform specs. Aliases are display;
     # Tensor always carries the immutable spec identity.
     "fp8-rowwise/1": "sha256:c4be0120fb4548306b134f6ee07eb2545a363bc140a005af1ef6543c790cf890",
-    "mxfp8/1": "sha256:7e9b1ad8f2e5ddd236a4d4303042d632a96eadef4f25d44eb0fb63124cec7cfd",
     "int8-convrot256/1": "sha256:ac25d323baebfdf1fd0ce3fdfd9f26400ce57914fdc442d0ade8cb187aef183f",
 }
 PLAIN_SPEC = "sha256:1fb882a7e46d0aff520f9d8a28cefd643954c19371737443101ba3c5fcc3613f"
@@ -230,7 +220,7 @@ def prepare_bf16(
 
 
 def column_block(encoding: str | None) -> int:
-    """The column multiple an encoding's tensors need; 32 serves both fp8 encodings."""
+    """The column multiple an encoding's tensors need; 32 is fp8-rowwise's."""
     found = _ENCODINGS.get(encoding or "")
     return found.block if found is not None else 32
 

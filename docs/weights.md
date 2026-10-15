@@ -23,7 +23,7 @@ inherited tensors keep their identity; it grants no access.
 
 `read_into(component, key, role, byte_offset, buffer)` reads encoded bytes;
 `read_values_into(component, key, element_offset, float32_buffer)` reconstructs a flat logical
-range (plain BF16/FP16/F32, FP8-rowwise and MXFP8; the encoded ones need Torch). Buffers are
+range (plain BF16/FP16/F32 and FP8-rowwise; the encoded one needs Torch). Buffers are
 writable, contiguous and at most 64 MiB. Saturation at quantization time is not recoverable from
 stored values.
 
