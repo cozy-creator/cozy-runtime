@@ -259,6 +259,26 @@ def matmul(
             gemv, gemv1, dequant = kernels
             with readable(weight, blocked_scale, scale_2) as (weight, blocked_scale, scale_2):
                 scales, tiles = blocked_scale.view(torch.uint8), int(blocked_scale.shape[1]) // 4
+                if rows == 1:
+                    # One decoded token: the launch, not the kernel, is the cost (a split's
+                    # f32 scratch and cast are two more launches), so one program per 32 rows.
+                    out = torch.empty(1, rows_out, dtype=out_dtype, device=x.device)
+                    gemv1[(-(-rows_out // 32), 1)](  # type: ignore[index]
+                        flat,
+                        weight,
+                        scales,
+                        scale_2,
+                        out,
+                        rows_out,
+                        cols,
+                        tiles,
+                        cols,
+                        BLOCK_N=32,
+                        BLOCK_K=GEMV_K,
+                        SPLIT=False,
+                        num_warps=8,
+                    )
+                    return out.reshape(*x.shape[:-1], rows_out)
                 if rows <= DECODE_ROWS:
                     # Split K until the card has ~4 programs per SM: a decode GEMV is bandwidth.
                     columns = -(-rows_out // GEMV_N)
@@ -270,41 +290,24 @@ def matmul(
                         else torch.empty(rows, rows_out, dtype=out_dtype, device=x.device)
                     )
                     grid = (columns, -(-cols // span))
-                    if rows == 1:
-                        gemv1[grid](  # type: ignore[index]
-                            flat,
-                            weight,
-                            scales,
-                            scale_2,
-                            acc,
-                            rows_out,
-                            cols,
-                            tiles,
-                            span,
-                            BLOCK_N=GEMV_N,
-                            BLOCK_K=GEMV_K,
-                            SPLIT=split > 1,
-                            num_warps=8,
-                        )
-                    else:
-                        gemv[grid](  # type: ignore[index]
-                            flat,
-                            weight,
-                            scales,
-                            scale_2,
-                            acc,
-                            rows,
-                            rows_out,
-                            cols,
-                            flat.stride(0),
-                            tiles,
-                            span,
-                            BLOCK_M=16,
-                            BLOCK_N=GEMV_N,
-                            BLOCK_K=GEMV_K,
-                            SPLIT=split > 1,
-                            num_warps=4,
-                        )
+                    gemv[grid](  # type: ignore[index]
+                        flat,
+                        weight,
+                        scales,
+                        scale_2,
+                        acc,
+                        rows,
+                        rows_out,
+                        cols,
+                        flat.stride(0),
+                        tiles,
+                        span,
+                        BLOCK_M=16,
+                        BLOCK_N=GEMV_N,
+                        BLOCK_K=GEMV_K,
+                        SPLIT=split > 1,
+                        num_warps=4,
+                    )
                     return acc.to(out_dtype).reshape(*x.shape[:-1], rows_out)
                 decoded = torch.empty(rows_out, cols, dtype=x.dtype, device=x.device)
                 dequant[(-(-rows_out // 64), -(-cols // 128))](  # type: ignore[index]
