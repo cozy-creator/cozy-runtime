@@ -106,7 +106,7 @@ def test_installed_cli_describes_and_refuses(installed_cli: str) -> None:
     assert first.stdout == second.stdout
     described = json.loads(first.stdout)
     assert described["application"] == "marco_polo_package:app"
-    assert all("resources" not in job for job in described["jobs"])
+    assert all("resources" not in entry for entry in described["entrypoints"])
 
     # Hardware declarations were a second, author-written placement authority. The hardcut is
     # observable from the installed public wheel: neither the value nor the decorator argument
@@ -115,8 +115,7 @@ def test_installed_cli_describes_and_refuses(installed_cli: str) -> None:
         str(Path(installed_cli).with_name("python")),
         "-c",
         "import inspect; import cozy_runtime.author as a; "
-        "assert not hasattr(a, 'Resources'); "
-        "assert 'resources' not in inspect.signature(a.App.job).parameters; "
+        "assert not hasattr(a, 'Resources') and not hasattr(a.App, 'job'); "
         "assert 'resources' not in inspect.signature(a.App.entrypoint).parameters",
         cwd="/",
     )
@@ -125,7 +124,7 @@ def test_installed_cli_describes_and_refuses(installed_cli: str) -> None:
         "-c",
         "import json; from cozy_runtime.internal import canonical, package_interface; "
         f"body=json.loads({first.stdout!r}); "
-        "body['jobs'][0]['resources']={'gpu_count': 1}; "
+        "body['entrypoints'][0]['resources']={'gpu_count': 1}; "
         "package_interface.read_bytes(canonical.write(body))",
         cwd="/",
     )

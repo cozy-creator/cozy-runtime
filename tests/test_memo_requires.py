@@ -42,9 +42,9 @@ async def plain(ctx: Context, *, prompt: str, seed: int | None = None) -> Result
 async def unconditional(ctx: Context, *, prompt: str, seed: int | None = None) -> Result:
     raise RuntimeError("never executed")
 
-app.job(generate, accelerator=False)
-app.job(plain, accelerator=False)
-app.job(unconditional, accelerator=False)
+app.entrypoint(generate, accelerator=False)
+app.entrypoint(plain, accelerator=False)
+app.entrypoint(unconditional, accelerator=False)
 """
 
 
@@ -59,8 +59,7 @@ def project(tmp_path: Path, source: str = SOURCE) -> Path:
 
 
 def declarations(document: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    rows = [*document["entrypoints"], *document["jobs"]]
-    return {row["name"]: row["invocable"] for row in rows}
+    return {row["name"]: row["invocable"] for row in document["entrypoints"]}
 
 
 def test_static_and_imported_describe_state_the_same_memo_condition(tmp_path: Path) -> None:
@@ -152,8 +151,8 @@ def test_reader_requires_memoize_for_a_memo_condition(tmp_path: Path) -> None:
     document = canonical.parse_canonical(
         package_interface.canonical_bytes(static_interface.build(project(tmp_path)))
     )
-    job = next(row for row in document["jobs"] if row["name"] == "generate")
-    job["invocable"]["memoize"] = False
+    generate = next(row for row in document["entrypoints"] if row["name"] == "generate")
+    generate["invocable"]["memoize"] = False
     with pytest.raises(ConformanceError, match="memo_requires needs memoize"):
         package_interface.read_bytes(canonical.write(document))
 

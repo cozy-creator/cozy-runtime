@@ -209,7 +209,7 @@ class NativeExecution:
         return Context(
             self.attempt.request_id,
             math.inf,
-            _tensorfs_source=lambda model: self.client.source(model.checkpoint_ref),
+            _tensorfs_source=lambda weights: self.client.source(weights.checkpoint_ref),
             _tensorfs_output=lambda slot: OutputCapability(
                 lambda definition: open_output(slot, definition)
             ),

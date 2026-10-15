@@ -29,7 +29,7 @@ class Result(msgspec.Struct, frozen=True):
 @invocable(memoize=True)
 async def double(ctx: Context, *, value: int) -> Result:
     return Result(value * 2)
-app.job(double, accelerator=False)
+app.entrypoint(double, accelerator=False)
 """
 
 
@@ -53,8 +53,8 @@ def test_describe_exact_installed_wheel_without_package_toml_or_imports(tmp_path
     python, _ = installed(tmp_path)
     body = static_interface.build_installed("Example.App", environment_python=python)
     assert body["application"] == "example_app:app"
-    assert body["jobs"][0]["name"] == "double"
-    assert body["jobs"][0]["invocable"]["memoize"] is True
+    assert body["entrypoints"][0]["name"] == "double"
+    assert body["entrypoints"][0]["invocable"]["memoize"] is True
 
 
 def test_installed_description_reads_only_the_wheels_own_modules(
@@ -77,7 +77,7 @@ def test_installed_description_reads_only_the_wheels_own_modules(
 
     monkeypatch.setattr(static_interface.Reader, "_load", spy)
     body = static_interface.build_installed("example-app", environment_python=python)
-    assert body["jobs"][0]["name"] == "double"
+    assert body["entrypoints"][0]["name"] == "double"
     assert "example_app" in loaded
     assert not [name for name in loaded if name.startswith("heavy")]
 
@@ -172,7 +172,7 @@ def test_an_app_installed_by_any_uv_link_mode_is_described(tmp_path: Path, mode:
 
     body = static_interface.build_installed("example-app", environment_python=python)
     assert body["application"] == "example_app:app"
-    assert body["jobs"][0]["name"] == "double"
+    assert body["entrypoints"][0]["name"] == "double"
 
     # A caller described beside it reads the callee's types through the same links.
     caller = tmp_path / "caller"
@@ -216,9 +216,9 @@ async def second(ctx: Context, *, value: int) -> Result:
 @invocable(memoize=True, memo_dependencies=(MemoDistribution("msgspec" if True else "numpy"),))
 async def computed(ctx: Context, *, value: int) -> Result:
     return Result(value)
-app.job(first, accelerator=False)
-app.job(second, accelerator=False)
-app.job(computed, accelerator=False)
+app.entrypoint(first, accelerator=False)
+app.entrypoint(second, accelerator=False)
+app.entrypoint(computed, accelerator=False)
 """
 
 
@@ -254,7 +254,9 @@ def memo_environment(tmp_path: Path, second_body: str = "value * 2") -> Path:
 
 
 def identities(document: dict[str, Any]) -> dict[str, object]:
-    return {job["name"]: job["invocable"].get("operation_identity") for job in document["jobs"]}
+    return {
+        row["name"]: row["invocable"].get("operation_identity") for row in document["entrypoints"]
+    }
 
 
 def test_an_installed_memoized_callable_carries_the_identity_its_import_would(
@@ -285,10 +287,10 @@ def test_an_installed_memoized_callable_carries_the_identity_its_import_would(
     assert found["computed"] is None
     # A source reading carries no installed fact.
     assert all(
-        "operation_identity" not in job["invocable"]
-        for job in package_interface.source_facts(
+        "operation_identity" not in row["invocable"]
+        for row in package_interface.source_facts(
             static_interface.build_installed("memo-app", environment_python=python)
-        )["jobs"]
+        )["entrypoints"]
     )
 
 

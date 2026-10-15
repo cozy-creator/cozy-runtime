@@ -28,7 +28,7 @@ class Result(msgspec.Struct):
     evidence_json: str
 
 
-@app.job(accelerator=True)
+@app.entrypoint
 def verify(payload: Request, ctx: Context) -> Result:
     import torch
 

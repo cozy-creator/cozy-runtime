@@ -18,10 +18,9 @@ from cozy_runtime.author import (
     App,
     Context,
     Invocation,
-    Loader,
-    Model,
     ModelArtifact,
     Telemetry,
+    Weights,
     WeightsOutput,
     attempt,
     describe,
@@ -29,7 +28,6 @@ from cozy_runtime.author import (
 )
 from cozy_runtime.author._errors import Outcome
 from cozy_runtime.author._loader import TensorSpec
-from cozy_runtime.author._model import _derive_model
 from cozy_runtime.author._services import Attempt
 from cozy_runtime.derive import plan, quantize_artifact
 from cozy_runtime.derive import safetensors_io as st
@@ -38,22 +36,18 @@ from cozy_runtime.derive.quantization import prepare_source_quantization, quanti
 from cozy_runtime.internal import plane
 from cozy_runtime.internal.encoding import TORCH_DTYPES
 from cozy_runtime.internal.fill import Checkpoint
-from cozy_runtime.internal.weights import PlaneBackend, Weights
+from cozy_runtime.internal.weights import PlaneBackend
+from cozy_runtime.internal.weights import Weights as PlaneWeights
 from native_weights import NativeExecution
 
 BOUND = 1 << 20
 
 
-class Source(Model[object]):
-    def load(self, loader: Loader) -> None:
-        raise AssertionError("quantization must not construct inference")
-
-
-@invocable(memoize=True)
+@invocable
 async def quantize(
     ctx: Context,
     *,
-    source: Source,
+    source: Weights,
     component: str,
     encoding: str,
     tel: Telemetry,
@@ -171,7 +165,7 @@ def _run(
     threshold: float | None = None,
 ) -> tuple[ModelArtifact | None, Outcome, Attempt]:
     app = App()
-    app.job(quantize, weights=(WeightsOutput("model", BOUND),), accelerator=False)
+    app.entrypoint(quantize, weights=(WeightsOutput("model", BOUND),), accelerator=False)
     describe(app)
     with host:
         result, outcome, record = attempt(
@@ -186,7 +180,7 @@ def _run(
                 host.attempt.request_id,
                 root,
                 math.inf,  # no stopwatch: a test attempt ends on its own outcome
-                models={"source": _derive_model(Source, source.manifest.digest)},
+                sources={"source": Weights(source.manifest.digest)},
                 tensorfs_source=host.client.source,
                 tensorfs_output=host.client.open_output,
                 tensorfs_adopt=host.client.adopt_model,
@@ -378,7 +372,7 @@ def test_fp16_quantized_native_header_enters_fp16_fill(tmp_path: Path) -> None:
         {"unet": checkpoint},
         rows,
         # The host tier alone: the fill's validation needs no card.
-        weights=Weights(torch, torch.device("cpu"), "cpu"),
+        weights=PlaneWeights(torch, torch.device("cpu"), "cpu"),
         construction="fp16-contract",
         release="fp16-contract-proof",
         encoded_leaves="refuse",

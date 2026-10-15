@@ -15,9 +15,9 @@ from cozy_runtime.author._call_results import decode
 from cozy_runtime.author._capture import ExecutionObservation
 from cozy_runtime.author._executor_requests import (
     Answer,
-    Checkpoint,
-    CheckpointReceipt,
     ChildCall,
+    Publish,
+    Published,
     respond,
 )
 from cozy_runtime.author._executor_requests import decode as decode_request
@@ -131,10 +131,10 @@ def test_child_result_asset_records_ignore_advisory_fields(tmp_path: Path) -> No
 
 def test_durable_requests_and_answers_cross_older_and_newer_peers(tmp_path: Path) -> None:
     digest = "sha256:" + "0" * 64
-    checkpoint = Checkpoint(operation_key="op", logical_key="k", content_digest=digest, length=3)
-    # An older executor's frames: a checkpoint path, no capture or label, a future field.
-    older = {**msgspec.to_builtins(checkpoint), "path": "/spool/k", "future": 1}
-    assert decode_request(older) == checkpoint
+    publish = Publish(output="video", asset_ref="r", asset_kind="video", digest=digest)
+    # An older executor's frames: no capture or label, a future field.
+    older = {**msgspec.to_builtins(publish), "future": 1}
+    assert decode_request(older) == publish
     call = {"kind": "child_call", "call_index": 0, "module": "m", "export": "e", "payload": "{}"}
     assert decode_request(call) == ChildCall(call_index=0, module="m", export="e", payload="{}")
     # A newer executor's kind is refused alone, answered under its own sequence number.
@@ -147,16 +147,20 @@ def test_durable_requests_and_answers_cross_older_and_newer_peers(tmp_path: Path
     left, right = socket.socketpair()
     with left, right:
         worker = Channel(right)
-        worker.send({"event": "answer", "seq": 1, "ok": True, "receipt_id": "r", "future": 1})
-        received = Executor(Channel(left), tmp_path)._durable(checkpoint, CheckpointReceipt)
-        assert received == CheckpointReceipt(ok=True, receipt_id="r")
+        worker.send({"event": "answer", "seq": 1, "ok": True, "sequence": 4, "future": 1})
+        received = Executor(Channel(left), tmp_path)._durable(publish, Published)
+        assert received == Published(ok=True, sequence=4)
         # Every key an older worker indexes is written.
         assert worker.recv() == {
             "event": "request",
             "seq": 1,
-            "kind": "checkpoint",
-            "operation_key": "op",
-            "logical_key": "k",
-            "content_digest": digest,
-            "length": 3,
+            "kind": "publish",
+            "output": "video",
+            "label": "",
+            "asset_ref": "r",
+            "asset_kind": "video",
+            "media_type": "",
+            "size_bytes": 0,
+            "digest": digest,
+            "parts": [],
         }

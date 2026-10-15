@@ -43,13 +43,6 @@ class ChildEvents(_Request, frozen=True, kw_only=True, tag="child_events"):
     """The socket the worker nudges when one of this attempt's calls moves."""
 
 
-class Checkpoint(_Request, frozen=True, kw_only=True, tag="checkpoint"):
-    operation_key: str
-    logical_key: str
-    content_digest: str
-    length: int
-
-
 class ChildCall(_Request, frozen=True, kw_only=True, tag="child_call"):
     call_index: Annotated[int, msgspec.Meta(ge=0, le=MAX_CALL_INDEX)]
     module: str
@@ -296,7 +289,6 @@ type _Tagged = (
     | ModelSource
     | BudgetCell
     | ChildEvents
-    | Checkpoint
     | ChildCall
     | ChildPoll
     | ChildCancel
@@ -395,11 +387,6 @@ class Room(Answer, frozen=True, kw_only=True):
     authorized_device_limit_bytes: int | UnsetType = UNSET
     #: The process cap once room was made (`process_cap/1`); -1 keeps the one it has
     cap_bytes: int = -1
-
-
-class CheckpointReceipt(Answer, frozen=True, kw_only=True):
-    receipt_id: str = ""
-    replayed: bool = False
 
 
 class CallProgress(msgspec.Struct, frozen=True, kw_only=True):

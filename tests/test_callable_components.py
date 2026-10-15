@@ -44,7 +44,7 @@ def project(tmp_path: Path, *, invocable: bool, components: str = "{'model': ('d
         + declared
         + "@app.entrypoint\ndef everything(payload: Request, model: Demo) -> Result:\n"
         "    return Result(1)\n"
-        "@app.job(components={'model': ('vae', 'text_encoder')}, accelerator=False)\n"
+        "@app.entrypoint(components={'model': ('vae', 'text_encoder')}, accelerator=False)\n"
         "def bake(payload: Request, model: Demo) -> Result:\n    return Result(1)\n"
     )
     return root
@@ -61,7 +61,7 @@ def imported(root: Path) -> dict[str, Any]:
 
 
 def slots(body: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    return {row["name"]: row["models"][0] for row in (*body["entrypoints"], *body["jobs"])}
+    return {row["name"]: row["models"][0] for row in body["entrypoints"]}
 
 
 @pytest.mark.parametrize("managed", [False, True], ids=["app_sync", "invocable_async"])

@@ -1,4 +1,4 @@
-"""Carrier-free FP8 and MXFP8 model derivation jobs.
+"""Carrier-free FP8 and MXFP8 model derivations.
 
 The worker receives one exact TensorFS Manifest capability and returns another through
 TensorFS scoped derivation handles. It receives no Store or filesystem access.

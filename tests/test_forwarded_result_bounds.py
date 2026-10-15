@@ -48,7 +48,7 @@ def _result(decoded: int, media: str = "image/png") -> type:
 
 def _forwarding_parent(tmp_path: Path, result_type: type) -> tuple[Any, Any, list[str]]:
     child = App()
-    child.job(produce_image, accelerator=False)
+    child.entrypoint(produce_image, accelerator=False)
     surface = describe(child)[0]
     parent = App()
 
@@ -56,7 +56,7 @@ def _forwarding_parent(tmp_path: Path, result_type: type) -> tuple[Any, Any, lis
         return result_type((await cast(Any, produce_image)()).image)
 
     main.__annotations__["return"] = result_type
-    parent.job(main, accelerator=False)
+    parent.entrypoint(main, accelerator=False)
     response: dict[str, Any] = {}
     kinds: list[str] = []
 
@@ -148,7 +148,7 @@ def test_saved_image_meets_its_result_decoded_bound(tmp_path: Path, decoded: int
         return result_type(out.save_image(ImageFrame(2, 2, b"\xff\x00\x00" * 4), format="png"))
 
     main.__annotations__["return"] = result_type
-    app.job(main, accelerator=False)
+    app.entrypoint(main, accelerator=False)
     result, outcome, _ = attempt(
         app.get("main"), {}, Invocation("saved", tmp_path / "out", time.monotonic() + 30)
     )

@@ -28,7 +28,7 @@ def segment(payload: Request) -> Result:
 @invocable
 async def child(ctx: Context, *, n: int) -> Result:
     return Result(n)
-app.job(child, internal=True, accelerator=False)
+app.entrypoint(child, internal=True, accelerator=False)
 @app.entrypoint(hidden=True)
 def unfinished(payload: Request) -> Result:
     return Result(payload.n)
@@ -52,10 +52,10 @@ def test_internal_interface_is_identical_for_static_and_imported_discovery(tmp_p
     raw = package_interface.canonical_bytes(static)
     assert raw == package_interface.canonical_bytes(imported)
     document = package_interface.read_bytes(raw)
-    assert [entry["name"] for entry in document["entrypoints"]] == ["public", "segment"]
-    assert document["entrypoints"][1]["internal"] is True
-    assert "internal" not in document["entrypoints"][0]
-    assert document["jobs"][0]["internal"] is True
+    entries = {entry["name"]: entry for entry in document["entrypoints"]}
+    assert list(entries) == ["child", "public", "segment"]
+    assert entries["segment"]["internal"] is True and entries["child"]["internal"] is True
+    assert "internal" not in entries["public"]
     generated = interface_wheel.generate(raw)["internal_fixture/__init__.py"].decode()
     assert "def public(" in generated
     assert "def segment(" not in generated and "def child(" not in generated

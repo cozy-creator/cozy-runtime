@@ -273,7 +273,10 @@ def _bind_tensorfs(
 
         def inspect(components: Sequence[str], configs: Sequence[str]) -> Any:
             current()
-            return capability.inspect(components=components, configs=configs)
+            try:
+                return capability.inspect(components=components, configs=configs)
+            finally:
+                current()
 
         def read_part(component: str, key: str, role: str, offset: int, into: object) -> None:
             current()

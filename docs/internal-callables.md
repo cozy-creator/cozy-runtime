@@ -1,11 +1,8 @@
 # Internal package callables
 
-`@app.entrypoint(internal=True)` and `@app.job(internal=True)` retain executable
-metadata and model bindings while restricting invocation to managed children of
-the same installed package revision. Managed child dispatch currently requires a
-job parent; this flag does not add serving-parent orchestration. An internal
-callable cannot be a root
-request or a call from another package revision.
+`@app.entrypoint(internal=True)` retains executable metadata and model bindings while
+restricting invocation to managed children of the same installed package revision. An internal
+callable cannot be a root request or a call from another package revision.
 
 The package interface retains the callable with optional `internal: true`.
 Public discovery filters those entries, while installation and same-package

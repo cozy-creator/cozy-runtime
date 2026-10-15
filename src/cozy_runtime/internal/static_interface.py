@@ -967,7 +967,7 @@ class Reader:
                 if isinstance(node.slice, (ast.Name, ast.Attribute))
                 else None
             )
-            if isinstance(layout, Vocab) and layout.key == "author.Model":
+            if isinstance(layout, Vocab) and layout.key in ("author.Model", "typing.Any"):
                 return _ANY_LAYOUT, True
             spec = self._model_class(layout)
             if spec is None:

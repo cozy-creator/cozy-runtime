@@ -15,7 +15,7 @@ from pathlib import Path
 import msgspec
 import pytest
 
-from cozy_runtime.author import App, ConformanceError, Context, Model, WeightsOutput
+from cozy_runtime.author import App, ConformanceError, Context, Model, Weights, WeightsOutput
 from cozy_runtime.author._describe import describe
 from cozy_runtime.author._loader import Loader
 from cozy_runtime.internal import canonical, package_interface
@@ -73,8 +73,10 @@ def test_lane_words_are_not_selection_leaks() -> None:
     def build(output_id: str, release: str) -> dict[str, object]:
         app = App()
 
-        @app.job(weights=(WeightsOutput(output_id, max_new_bytes=1 << 20),), accelerator=False)
-        def produce(payload: Request, denoiser: Denoiser, ctx: Context) -> Reply:
+        @app.entrypoint(
+            weights=(WeightsOutput(output_id, max_new_bytes=1 << 20),), accelerator=False
+        )
+        def produce(payload: Request, denoiser: Weights[Denoiser], ctx: Context) -> Reply:
             return Reply(text="ok")
 
         found = Discovered(
@@ -88,7 +90,7 @@ def test_lane_words_are_not_selection_leaks() -> None:
         return package_interface.build(found)
 
     body = build("bf16", "1.0.0")
-    assert body["jobs"][0]["weights_outputs"][0]["output_id"] == "bf16"  # type: ignore[index]
+    assert body["entrypoints"][0]["weights_outputs"][0]["output_id"] == "bf16"  # type: ignore[index]
 
     with pytest.raises(ConformanceError) as leaked_release:
         build("ev-003", "ev-003")

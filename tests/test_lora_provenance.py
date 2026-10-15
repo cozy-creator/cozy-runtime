@@ -16,6 +16,7 @@ from cozy_runtime.author import (
     Context,
     Invocation,
     ModelRegistry,
+    Weights,
     attempt,
     describe,
     invocable,
@@ -36,7 +37,7 @@ class Identity(msgspec.Struct):
 
 
 @invocable
-async def inspect_adapted(ctx: Context, *, model: TinyModel) -> Identity:
+async def inspect_adapted(ctx: Context, *, model: Weights[TinyModel]) -> Identity:
     raw = bytearray(4)
     with ctx.tensorfs_source(model) as source:
         source.read_part_into("transformer", "proj.lora_A.adapter_0.weight", "value", 0, raw)
@@ -69,11 +70,11 @@ def test_effective_checkpoint_and_source_keep_exact_admitted_base(tmp_path: Path
     assert other.checkpoint_ref == negative.manifest.digest
     assert model._cozy_selection_ref == other._cozy_selection_ref == base.manifest.digest
     app = App()
-    app.job(inspect_adapted, accelerator=False)
+    app.entrypoint(inspect_adapted, accelerator=False)
     describe(app)
     try:
-        # Real native source custody contains the admitted base and its effective view.
-        # The other view is physically present in CAS but is outside this input closure.
+        # Real native source custody contains the admitted base and its effective view, read
+        # raw. The other view is physically present in CAS but is outside this input closure.
         with NativeExecution(
             store, tmp_path, "inspect", {"base": base, "composed": positive}, {}
         ) as execution:
@@ -81,11 +82,11 @@ def test_effective_checkpoint_and_source_keep_exact_admitted_base(tmp_path: Path
                 "inspect",
                 tmp_path / "spool",
                 time.monotonic() + 30,
-                models={"model": model},
+                sources={"model": Weights(model.checkpoint_ref)},
                 tensorfs_source=execution.client.source,
             )
             result, outcome, _ = attempt(
-                app.get("inspect_adapted"), {"model": msgspec.to_builtins(base)}, invocation
+                app.get("inspect_adapted"), {"model": msgspec.to_builtins(positive)}, invocation
             )
             assert outcome.terminal == "succeeded", outcome
             assert result is not None and result.result == Identity(positive.manifest.digest, 1.0)

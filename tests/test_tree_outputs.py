@@ -32,7 +32,7 @@ def test_tree_snapshot_and_result_serialization(tmp_path: Path, bad: str) -> Non
         (source / "escape").symlink_to(tmp_path)
     app = App()
 
-    @app.job(accelerator=False)
+    @app.entrypoint(accelerator=False)
     def main(payload: Request, out: Outputs) -> Result:
         tree = out.save_tree(source)
         (source / "capture.json").write_text("changed after snapshot")

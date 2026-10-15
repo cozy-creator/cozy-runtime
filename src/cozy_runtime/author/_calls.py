@@ -37,8 +37,10 @@ from cozy_runtime.author._executor_requests import (
 )
 from cozy_runtime.author._memo import MemoDependency, Memoize, memo_policy
 from cozy_runtime.author._memo import declare as declare_memo
+from cozy_runtime.author._model import Model
 from cozy_runtime.author._model_defaults import DefaultLadder, model_components, model_defaults
 from cozy_runtime.author._services import Telemetry, _progress_scope, _ProgressScope
+from cozy_runtime.author._weights import Weights
 from cozy_runtime import _application_json as application_json
 
 _LOG = logging.getLogger(__name__)
@@ -394,9 +396,7 @@ class _Broker:
         try:
 
             def asset_value(value: object) -> object:
-                from cozy_runtime.author._model import Model
-
-                if isinstance(value, Model):
+                if isinstance(value, (Model, Weights)):
                     raise CapabilityError(
                         "managed model calls require a retained ModelArtifact from conversion "
                         "or derivation; an injected Model belongs to this attempt. Retain it "

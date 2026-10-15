@@ -55,7 +55,7 @@ def test_application_values_keep_strict_structural_and_finite_number_bounds() ->
 def test_typed_job_result_spool_preserves_exact_seed_and_float_kind(tmp_path: Path) -> None:
     app = App()
 
-    @app.job(accelerator=False)
+    @app.entrypoint(accelerator=False)
     def echo(payload: SpoolRequest) -> SpoolValue:
         return SpoolValue((1 << 64) - 1, 1.0)
 

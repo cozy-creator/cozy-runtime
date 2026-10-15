@@ -44,12 +44,12 @@ async def select(ctx: Context) -> Selection:
     raise AssertionError("the implementation executes in its child attempt")
 
 app = App()
-app.job(select, accelerator=False)
+app.entrypoint(select, accelerator=False)
 """
 
 
 def installed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, kind: str = "job"
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, kind: str = "invocable"
 ) -> tuple[ModuleType, tuple[CallInterface, ...], Executor]:
     module = "installed_selection"
     monkeypatch.delitem(sys.modules, module, raising=False)
@@ -58,12 +58,12 @@ def installed(
     (tmp_path / "pyproject.toml").write_text('[project]\nname="selection"\nversion="1.0.0"\n')
     (tmp_path / "package.toml").write_text('[application]\nobject="installed_selection:app"\n')
     source = SOURCE
-    if kind == "entrypoint":
+    if kind == "plain":
         source = source.replace(
             "@invocable()\nasync def select(ctx: Context)",
             "class Payload(msgspec.Struct):\n    pass\n\n"
             "def select(ctx: Context, payload: Payload)",
-        ).replace("app.job(select, accelerator=False)", "app.entrypoint(select)")
+        ).replace("app.entrypoint(select, accelerator=False)", "app.entrypoint(select)")
     (tmp_path / f"{module}.py").write_text(source)
     importlib.invalidate_caches()
     document = static_interface.build(tmp_path)
@@ -74,7 +74,7 @@ def installed(
     return imported, rows, engine
 
 
-@pytest.mark.parametrize("kind", ["job", "entrypoint"])
+@pytest.mark.parametrize("kind", ["invocable", "plain"])
 def test_installed_proxy_prefetch_keeps_its_admitted_public_identity(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
