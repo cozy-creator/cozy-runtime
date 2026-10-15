@@ -158,7 +158,7 @@ def test_defaults_do_not_open_other_fixed_point_locations(tmp_path: Path) -> Non
     body["entrypoints"][0]["default_ladder"] = LADDER
     with pytest.raises(ConformanceError):
         package_interface.assemble(
-            str(body["application"]), [("entrypoint", body["entrypoints"][0])], {}
+            str(body["application"]), [body["entrypoints"][0]], {}
         )
     # A reader ignores fields another Runtime wrote; only the author surface refuses.
     read = package_interface.read_bytes(package_interface.canonical_bytes(body))
@@ -210,7 +210,7 @@ def test_gpu_count_requires_the_models_declared_group() -> None:
 
     def slot(sequence_parallel: list[int]) -> Any:
         return package_interface.model_slot(
-            "run.models.model", "Demo", "refuse", "refuse", {}, sequence_parallel, defaults=defaults
+            "run.models.model", "Demo", "refuse", {}, sequence_parallel, defaults=defaults
         )
 
     assert slot([2, 4])["default_ladder"][0]["gpus"] == 2
