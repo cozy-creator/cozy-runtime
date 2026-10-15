@@ -235,3 +235,12 @@ def test_a_machine_measures_only_what_its_table_lacks_and_keeps_both(
     assert len(both.capabilities.records) == len(first.capabilities.records) + len(
         second.capabilities.records
     )
+
+
+def test_every_shipped_table_is_filed_under_its_own_name() -> None:
+    shipped = sorted(qualification.SHIPPED.glob("*.json"))
+    assert shipped
+    for path in shipped:
+        table = qualification._read(path)
+        assert table is not None, path
+        assert f"{qualification.table_name(table.device, table.runtime)}.json" == path.name
