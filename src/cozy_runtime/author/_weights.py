@@ -164,11 +164,11 @@ def _float32(value: Any) -> memoryview:
 
 
 def weights_class(annotation: object) -> type[Model[Any]] | None:
-    """`M` of a `Weights[M]` annotation (`Model` for bare `Weights`), else None."""
+    """`M` of a `Weights[M]` annotation (`Model` for `Weights` or `Weights[Any]`), else None."""
     if annotation is not Weights and get_origin(annotation) is not Weights:
         return None
     args = get_args(annotation)
-    cls = args[0] if args else Model
+    cls = Model if not args or args[0] is Any else get_origin(args[0]) or args[0]
     if not (isinstance(cls, type) and issubclass(cls, Model)):
         raise ConformanceError(f"Weights[{cls!r}]: M must be a Model class", code="weights_class")
     return cls

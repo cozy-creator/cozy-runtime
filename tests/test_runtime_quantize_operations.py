@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import sys
+import typing
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -14,13 +15,18 @@ import pytest
 import tensorfs
 
 from cozy_runtime import canonical_json
-from cozy_runtime.author import Invocation, ModelArtifact, UnsupportedInput, attempt, describe
+from cozy_runtime.author import (
+    Invocation,
+    ModelArtifact,
+    UnsupportedInput,
+    Weights,
+    attempt,
+    describe,
+)
 from cozy_runtime.author._errors import Outcome
 from cozy_runtime.author._invoke import InvocationResult
-from cozy_runtime.author._model import _derive_model
 from cozy_runtime.author._services import Attempt
 from cozy_runtime.derive.operations import MAX_QUANTIZED_BYTES, QuantizationPlan, _selection, app
-from cozy_runtime.derive.quantization import QuantizationSource
 from cozy_runtime.internal import package_interface, static_interface
 from cozy_runtime.internal.discovery import Discovered
 from native_weights import NativeExecution
@@ -60,7 +66,7 @@ def _shared(
                 host.attempt.request_id,
                 root,
                 math.inf,  # no stopwatch: a test attempt ends on its own outcome
-                models={"source": _derive_model(QuantizationSource, source.manifest.digest)},
+                sources={"source": Weights(source.manifest.digest)},
                 tensorfs_source=host.client.source,
                 tensorfs_output=host.client.open_output,
                 tensorfs_adopt=host.client.adopt_model,
@@ -119,20 +125,10 @@ def test_builtin_interface_is_static_and_matches_its_actual_app() -> None:
             {},
         )
     )
-    # The installed environment supplies the implementation/native identity;
-    # the static client contract deliberately cannot supply that identity.
-    actual_jobs = actual["jobs"]
-    assert isinstance(actual_jobs, list)
-    for declaration in actual_jobs:
-        assert isinstance(declaration, dict)
-        metadata = declaration["invocable"]
-        assert isinstance(metadata, dict)
-        assert str(metadata.pop("operation_identity")).startswith("sha256:")
     assert package_interface.canonical_bytes(static) == package_interface.canonical_bytes(actual)
-    jobs = static["jobs"]
-    assert isinstance(jobs, list) and [row["name"] for row in jobs] == ["quantize"]
-    row = next(row for row in jobs if row["name"] == "quantize")
-    assert isinstance(row, dict) and row["name"] == "quantize"
+    (row,) = typing.cast(list[dict[str, Any]], static["entrypoints"])
+    assert row["name"] == "quantize" and row["accelerator"] is False
+    assert row["models"][0]["weights"] is True
     assert row["weights_outputs"] == [
         {
             "output_id": "model",
@@ -140,7 +136,7 @@ def test_builtin_interface_is_static_and_matches_its_actual_app() -> None:
             "max_bytes": MAX_QUANTIZED_BYTES,
         }
     ]
-    assert row["invocable"]["memoize"] is True
+    assert row["invocable"]["memoize"] is False
 
 
 @pytest.mark.parametrize("component,dtype", [("unet", "f16"), ("transformer", "bf16")])

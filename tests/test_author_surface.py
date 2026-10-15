@@ -44,6 +44,7 @@ from cozy_runtime.author import (
     InvalidRequest,
     Model,
     ModelRegistry,
+    Weights,
     decode_request,
     uses_components,
 )
@@ -55,7 +56,7 @@ from cozy_runtime.author._loader import (
     Scheduler,
     census,
 )
-from cozy_runtime.author._model import _derive_model, _public_methods
+from cozy_runtime.author._model import _public_methods
 from cozy_runtime.author.fakes import (
     fake_attempt,
     fake_input,
@@ -192,23 +193,13 @@ def test_a_declared_scope_still_leases_and_still_fences() -> None:
     assert frozen.value.code == "persistent_allocation"
 
 
-def test_a_job_model_is_a_plain_manifest_record() -> None:
-    """A derive-only job Model carries one Manifest identity and constructs nothing."""
-    job_model = _derive_model(Denoiser, MANIFEST)
-
-    assert isinstance(job_model, Denoiser)
-    assert job_model.checkpoint_ref == MANIFEST
-
-    # No construction ran, so the component is ABSENT — the ordinary Python answer, named
-    # by the ordinary Python error, with no interception installed to say it differently.
-    with pytest.raises(AttributeError, match="pipeline"):
-        _ = job_model.pipeline
-
-    # No generation is Ready: the serving surface and component methods say it is an identity.
-    for call in (lambda: job_model.for_request(_ctx()), job_model.denoise):
-        with pytest.raises(CapabilityError) as derive_only:
-            call()
-        assert derive_only.value.code == "model_derive_only"
+def test_weights_are_a_manifest_identity_never_a_model() -> None:
+    """`Weights[M]` carries one Manifest identity; nothing is constructed or readable unbound."""
+    weights: Weights[Denoiser] = Weights(MANIFEST)
+    assert weights.checkpoint_ref == MANIFEST and not isinstance(weights, Model)
+    with pytest.raises(CapabilityError) as unbound:
+        weights.keys("unet")
+    assert unbound.value.code == "weights_source_ungranted"
     with pytest.raises(CapabilityError) as not_ready:
         object.__new__(Denoiser).denoise()
     assert not_ready.value.code == "not_ready"
@@ -277,10 +268,10 @@ def test_a_model_may_not_name_an_artifact_identifier() -> None:
         Denoiser.for_test(checkpoint_ref="hf:org/model@v2")
     assert scheme.value.code == "identifier_in_code"
 
-    # And the derive-only door takes a Manifest digest, never a name.
+    # And raw weights take a Manifest digest, never a name.
     with pytest.raises(ConformanceError) as derived:
-        _derive_model(Denoiser, "stabilityai/stable-diffusion-xl-base-1.0")
-    assert derived.value.code == "derive_model_manifest_invalid"
+        Weights("stabilityai/stable-diffusion-xl-base-1.0")
+    assert derived.value.code == "weights_manifest_invalid"
 
 
 # --------------------------------------------------------------------------- warm

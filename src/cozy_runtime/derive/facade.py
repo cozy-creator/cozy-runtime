@@ -53,7 +53,7 @@ class QuantizePlan(msgspec.Struct, frozen=True):
 
 
 class QuantizeResult(msgspec.Struct):
-    """What one committed lane reports — directly returnable from a job body."""
+    """What one committed lane reports — directly returnable from a function body."""
 
     output: str
     weights_transaction_id: str

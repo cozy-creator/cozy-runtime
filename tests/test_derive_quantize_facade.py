@@ -12,14 +12,12 @@ import pytest
 import tensorfs
 from tensorfs.derived import Config, Derivation, Part, Target, Tensor
 
-from cozy_runtime.author import ModelArtifact, UnsupportedInput
-from cozy_runtime.author._model import _derive_model
+from cozy_runtime.author import ModelArtifact, UnsupportedInput, Weights
 from cozy_runtime.author.fakes import fake_attempt, fake_telemetry
 from cozy_runtime.derive import QuantizePlan, QuantizeResult, plan, quantize
 from cozy_runtime.derive import safetensors_io as st
 from cozy_runtime.derive.quantization import (
     ArtifactQuantizationRequest,
-    QuantizationSource,
     bf16_targets,
     inherited_configs,
     prepare_bf16,
@@ -102,7 +100,7 @@ def run(
     compose: bool = False,
     observed: list[NativeExecution] | None = None,
 ) -> tuple[QuantizeResult | None, ModelArtifact]:
-    model = _derive_model(QuantizationSource, source.manifest.digest)
+    model: Weights[Any] = Weights(source.manifest.digest)
     with NativeExecution(
         store, root, name, {"source": source}, {"model": BOUND}, epoch=epoch
     ) as owner:

@@ -1,4 +1,4 @@
-"""A job's own execution device reaches the package interface from either reader."""
+"""`accelerator=False`, the only accelerator value, reaches the interface from either reader."""
 
 from __future__ import annotations
 
@@ -19,14 +19,14 @@ class Request(msgspec.Struct):
     n: int
 class Result(msgspec.Struct):
     value: int
-@app.job(accelerator=False)
+@app.entrypoint(accelerator=False)
 def convert(payload: Request) -> Result:
     return Result(payload.n)
 @invocable
 async def tables(ctx: Context, *, n: int) -> Result:
     return Result(n)
-app.job(tables, accelerator=True)
-@app.job
+app.entrypoint(tables)
+@app.entrypoint
 def undeclared(payload: Request) -> Result:
     return Result(payload.n)
 """
@@ -42,30 +42,29 @@ def project(tmp_path: Path, source: str = SOURCE) -> Path:
     return root
 
 
-def test_job_accelerator_is_identical_for_static_and_imported_discovery(tmp_path: Path) -> None:
+def test_accelerator_is_identical_for_static_and_imported_discovery(tmp_path: Path) -> None:
     root = project(tmp_path)
     static = static_interface.build(root)
     imported = package_interface.build(discover(root))
     raw = package_interface.canonical_bytes(static)
     assert raw == package_interface.canonical_bytes(imported)
-    jobs = {job["name"]: job for job in package_interface.read_bytes(raw)["jobs"]}
-    assert jobs["convert"]["accelerator"] is False
-    assert jobs["tables"]["accelerator"] is True
-    assert "accelerator" not in jobs["undeclared"]
+    entries = {entry["name"]: entry for entry in package_interface.read_bytes(raw)["entrypoints"]}
+    assert entries["convert"]["accelerator"] is False
+    assert "accelerator" not in entries["tables"] and "accelerator" not in entries["undeclared"]
 
 
-@pytest.mark.parametrize("value", ['"cpu"', "0"])
-def test_job_accelerator_requires_a_boolean_in_both_readers(tmp_path: Path, value: str) -> None:
+@pytest.mark.parametrize("value", ['"cpu"', "0", "True"])
+def test_accelerator_false_is_the_only_value_in_both_readers(tmp_path: Path, value: str) -> None:
     root = project(tmp_path, SOURCE.replace("accelerator=False", "accelerator=" + value))
-    with pytest.raises(ConformanceError, match="accelerator must be a boolean"):
+    with pytest.raises(ConformanceError, match="accelerator=False is the only value"):
         static_interface.build(root)
-    with pytest.raises(ConformanceError, match="accelerator must be a boolean"):
+    with pytest.raises(ConformanceError, match="accelerator=False is the only value"):
         discover(root)
 
 
-@pytest.mark.parametrize("value", ["false", 0, None])
-def test_interface_reader_rejects_nonboolean_accelerator(tmp_path: Path, value: object) -> None:
+@pytest.mark.parametrize("value", ["false", 0, None, True])
+def test_interface_reader_rejects_any_accelerator_but_false(tmp_path: Path, value: object) -> None:
     document = static_interface.build(project(tmp_path))
-    document["jobs"][0]["accelerator"] = value
+    document["entrypoints"][0]["accelerator"] = value
     with pytest.raises(ConformanceError, match="accelerator"):
         package_interface.read_bytes(canonical_json.encode(document))

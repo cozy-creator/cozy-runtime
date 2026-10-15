@@ -49,7 +49,7 @@ def test_effect_reservations_use_existing_parent_index_and_refuse_unknown_inputs
         "producer", "model", ObjectRef("sha256:" + "1" * 64, 100), "sha256:" + "2" * 64
     )
 
-    @app.job(accelerator=False)
+    @app.entrypoint(accelerator=False)
     async def script(ctx: Context, payload: Empty) -> Empty:
         upload_checkpoint(model, destination="alice/model")
         publish_release(destination="alice/model", release="v1", lanes={})
@@ -79,7 +79,7 @@ def test_assessment_refuses_files_without_received_custody(tmp_path: Path) -> No
         "alice/model", digest, ObjectRef(digest, 100), "upload", "acknowledged"
     )
 
-    @app.job(accelerator=False)
+    @app.entrypoint(accelerator=False)
     async def script(ctx: Context, payload: Empty) -> Empty:
         await attach_assessment(checkpoint, report=FileAsset(digest), workloads=FileAsset(digest))
         return Empty()

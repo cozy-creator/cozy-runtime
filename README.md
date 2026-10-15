@@ -79,7 +79,7 @@ For labelled model-ready input media, see [Ordered media inputs](docs/assets.md)
 -> preflight -> hydrate -> invoke -> validate -> finalize. It is pure surface semantics —
 no device, config, environment, protocol or network — so it lives beside the types it
 enforces, and `internal` depends on `author`, never the reverse. Every door (an entrypoint
-or a job attempt) is a user experience over that one function, and the per-service fakes
+or a CPU attempt) is a user experience over that one function, and the per-service fakes
 in `cozy_runtime.author.fakes` are capability adapters over it rather than a parallel
 runtime.
 
@@ -149,7 +149,7 @@ publication service are retired; see the machine API for current control and
 custody behavior.
 
 **The executor's network claim is Python-deep and says so.** `internal/executor.py:main`
-installs `sandbox.refuse_network`, so package or job code that dials is refused typed at
+installs `sandbox.refuse_network`, so package code that dials is refused typed at
 the first `NETWORK_EVENTS` spelling. That bounds a BUGGY package (law 15's same-tenant
 rung). It is not a kernel bound: the executor runs in the machine's network namespace
 with no seccomp filter, and a C extension or `ctypes` reaches `connect(2)` underneath the
@@ -257,7 +257,7 @@ sequence, and a CLOSED vocabulary — `msgspec.Struct` classes with their
 `msgspec.Meta`/`AssetBound`/`ModelDefault`/`Preflight`, `Literal`, `Enum`/`IntEnum`/`StrEnum`,
 unions, `list`/`tuple`/`dict`/`Sequence`/`Mapping`/`Set`, the asset classes, `Assets[...]` with
 `AssetLimits`, `Tree`, `ModelArtifact`, `Model` subclasses (`encoded_leaves=`,
-`@sequence_parallel`, `@uses_components`), and `@app.entrypoint`/`@app.job` with literal
+`@sequence_parallel`, `@uses_components`), `Weights[M]`, and `@app.entrypoint` with literal
 keywords and `WeightsOutput(...)` tuples. Explicit function registrations and async
 `@invocable` exports use the same schema builders, with their declared capabilities and
 immutable defaults. A value the package owns as DATA rather than as
@@ -285,11 +285,11 @@ declares none, site-packages is never a root, and a sibling package supplies TYP
 own callables are its own, never scanned as registrations (cr-117).
 
 A generated SCRIPT app — Creator's `app = script_app("<module>")` adapter — is read the same
-way. It registers the script's one `main` as a package author would: served (an entrypoint,
-constructed Model slots) when it runs Model slots, else a job; `[tool.cozy.models]` is its
-default ladder. `author/_script_metadata.py` is the ONE definition of that shape, run by the
-adapter and the reader over the same parsed tree. Every attempt, served or job, may call
-children: the executor's Start carries the call interfaces.
+way. It registers the script's one `main` as an entrypoint; `[tool.cozy.models]` is its
+default ladder and `[tool.cozy] accelerator = false` keeps it on CPU.
+`author/_script_metadata.py` is the ONE definition of that shape, run by the adapter and the
+reader over the same parsed tree. Every attempt may call children: the executor's Start
+carries the call interfaces.
 
 The reader is also what the DEVELOPMENT placement is built from (the worker session's own
 staging): it supervises and does not execute, so it reads the source and takes its model
@@ -302,12 +302,15 @@ the running interpreter is the package's own locked environment (its distributio
 pyproject's version, resolves there), because importing package code is running it. That is
 the check a package's own CI runs from its locked venv; publish runs the static reader alone.
 
-`internal/package_interface.py` is the schema home for `PackageInterface`/`JobDescriptor`: only
+`internal/package_interface.py` is the schema home for `PackageInterface`: only
 the launch and invocation facts with current readers. It carries no Runtime-global service
 inventory, diagnostics, config UI metadata, or tensor requirements, and
 `_fixed_point` proves over the built document that no release digest, build timestamp,
-machine path or mutable binding reached it. A slot is `{path, class, component_use,
-encoded_leaves}`. Deleted members are simply unknown fields; there is no legacy decoder or
+machine path or mutable binding reached it. The document has one `entrypoints` list; an entry
+writes `publishes`, `internal` and `weights_outputs` when set and `accelerator` only as
+`false`, and its memo flag rides `invocable.memoize`. A slot is `{path, class, component_use,
+encoded_leaves}`, plus `weights: true` for a `Weights[M]` argument. `descriptor_id` (sha256 of
+one entry) is derived by `cozy-runtime describe <function>`, never stored. Deleted members are simply unknown fields; there is no legacy decoder or
 empty-value compatibility shim.
 Packages declare no GPU count or VRAM floor. Authored default ladders associate GPU selectors
 with preferred model lanes. Actual resource demand comes from the selected lane's tensor
@@ -315,8 +318,11 @@ schema/encoding, qualification measurements and the worker's observed machine; t
 owns placement. The
 interface reader rejects the retired `resources` key as an unknown field; format `/1` has one
 current grammar and no compatibility decoder.
-An ordinary `@app.job` may opt into source-first model production without introducing another
-workflow language. A slot's capability is its class annotation (cr-077). Authors may attach
+Any function may produce models without another workflow language. A slot's capability is its
+annotation (cr-077): `model: M` is constructed in a warm session; `source: Weights[M]` (bare
+`Weights`: any layout) is the raw checkpoint, never constructed, read through
+`components()`/`tensor()`/`read_into()`/`read_values_into()` or handed to
+`ctx.tensorfs_source` and `derive.quantize_artifact`. Authors may attach
 an ordered model default ladder through `@invocable(defaults={"model": [...]})` or
 `@app.entrypoint(defaults={"model": [...]})`; both publish the same per-slot `default_ladder`
 metadata. Each rung names a GPU selector and a `[org/]model@release/lane` reference, and
@@ -336,7 +342,7 @@ development binding; it is not copied into a package's published default.
 Each `WeightsOutput` declares only its name and new-byte ceiling;
 the produced CozyTensors header is the sole tensor-schema and encoding authority. The
 executor still receives only verified model capabilities, never the foreign source credential or
-destination authority. Multiple transformations are ordinary code inside one bounded job—there is
+destination authority. Multiple transformations are ordinary code inside one bounded function—there is
 no `model_productions` graph, compatibility reader, or second scheduler.
 `internal/canonical.py` is the RFC 8785 writer — tensorfs (tfs-013) owns the rules, and
 `checks/architecture.py`'s `canonical-numbers` fence replays it over the frozen ES6 vector
@@ -552,19 +558,17 @@ package installs and type-checks without model execution, exactly as it does wit
 fill without the reader is a typed `reader_unavailable` refusal naming the install, never an
 `ImportError` escaping a request.
 
-`examples/marco-polo` is the weightless reference package — one entrypoint, one job, no model
-— and it is what the end-to-end suite builds, installs and runs.
+`examples/marco-polo` is the weightless reference package — two functions, one CPU-only, no
+model — and it is what the end-to-end suite builds, installs and runs.
 
-**Jobs (cr-009).** A job is an attempt class on the same machinery, not a second runtime:
-`@app.job` over the one invocation kernel, the same worker/executor split, the same
-records, the same output transaction. What differs is stated out loud and is short — a
-`JobDirective`/`JobExecutionSpec` instead of the serving pair, BOUNDED ACCEPT-THEN-PREPARE
-(serving never accepts-then-cold-loads; a job has nothing to be warm for), the job
-services (`Scratch`, `Checkpoints`, `Budget`) and typed input `Tree` fields whose path rides
-the value. `corpus/job/` is the live
-project: a structural census over the real 6.9 GB cozytensors store, read-only.
+**One registration (xs-040).** `@app.entrypoint` is the only registration and every keyword
+works on every function: `weights=`, `publishes=`/`emits_media=`, `accelerator=False` (absent
+means the machine's GPU when it has one), `preflight=`, `demand=`, `defaults=`,
+`components=`, `memoize=`, `hidden=`, `internal=`. A writer (`weights=`, `publishes=`,
+`emits_media=`) is never memoized (`memoized_writer`); TensorFS derivation replay answers a
+repeat. `corpus/job/` is a structural census over the real 6.9 GB cozytensors store, read-only.
 
-Model-producing jobs declare `WeightsOutput` slots and use `Context.tensorfs_source`,
+Model-producing functions declare `WeightsOutput` slots and use `Context.tensorfs_source`,
 `Context.output`, and `Context.adopt_model`. TensorFS owns the typed `Derivation`, `Target`,
 `Tensor`, `Part`, and `Config` declarations and the source/output handles. Inspection keeps
 the source header's construction order. Native validation locks exact sources, geometry,
@@ -583,5 +587,6 @@ partial and committed bytes survive process loss for authorized recovery.
 
 Plain PEP 723 producers that declare `[tool.cozy.weights]` use an explicit `ctx: Context`
 parameter. Ordinary client scripts can keep their lightweight `ScriptContext` for composing
-managed calls. `WeightsReader` provides logical float32 reconstruction over the same TensorFS source handle;
-its geometry, encoded identities, byte reads and lease lifetime are all TensorFS-owned.
+managed calls. `Weights.read_values_into` provides logical float32 reconstruction over the same
+TensorFS source handle; its geometry, encoded identities, byte reads and lease lifetime are all
+TensorFS-owned.

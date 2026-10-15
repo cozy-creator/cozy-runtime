@@ -17,31 +17,30 @@ from test_model_reader import model, plain, reader
 from test_storage_admission import operation
 
 
-@pytest.mark.parametrize("phase", ["open", "read"])
 @pytest.mark.parametrize("allowed", [True, False])
 def test_native_reader_metadata_admission_has_no_spool(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str, allowed: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, allowed: bool
 ) -> None:
     store = tensorfs.Store.init(tmp_path / "store")
     ref = model(store, "admission", {"weight": plain(np.arange(16, dtype=np.float32))})
-    service, models, broker, _, _, _ = reader(tmp_path, store, {"source": ref})
+    sources, broker, _, _, handles, _ = reader(tmp_path, store, {"source": ref})
     broker.store_root = tmp_path / "store"
-    view = service.open(models["source"]) if phase == "read" else None
+    view = sources["source"]
     host, client = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-    released = threading.Event()
     failures: list[BaseException] = []
     seen: list[dict[str, Any]] = []
 
     def controller() -> None:
+        # The first access inspects the source, then leases it: one admission each.
         try:
-            rows, conn = operation(host)
-            seen.extend(rows)
-            with conn:
-                conn.sendall(
-                    b'{"ok":true}\n' if allowed else b'{"ok":false,"facts":{"available":0}}\n'
-                )
-                assert conn.recv(1) == b""
-            released.set()
+            for _ in range(2 if allowed else 1):
+                rows, conn = operation(host)
+                seen.extend(rows)
+                with conn:
+                    conn.sendall(
+                        b'{"ok":true}\n' if allowed else b'{"ok":false,"facts":{"available":0}}\n'
+                    )
+                    assert conn.recv(1) == b""
         except BaseException as exc:
             failures.append(exc)
 
@@ -49,24 +48,15 @@ def test_native_reader_metadata_admission_has_no_spool(
         monkeypatch.setattr(storage, "_channel", client)
         server = threading.Thread(target=controller, daemon=True)
         server.start()
-
-        def execute() -> None:
-            if phase == "open":
-                service.open(models["source"]).close()
-            else:
-                assert view is not None
-                target = bytearray(16)
-                view.read_part_into("model", "weight", "value", 0, target)
-                assert target == np.arange(4, dtype=np.float32).tobytes()
-                view.close()
-
         if allowed:
-            execute()
+            target = bytearray(16)
+            view.read_into("model", "weight", "value", 0, target)
+            assert target == np.arange(4, dtype=np.float32).tobytes()
         else:
             with pytest.raises(tensorfs.errors.Refusal) as refused:
-                execute()
+                view.components()
             assert refused.value.code == "insufficient_storage"
-        assert released.wait(3)
+        handles.close()
         server.join(3)
         assert not server.is_alive() and not failures
     broker.close()
@@ -80,8 +70,8 @@ def test_cancel_can_close_source_while_metadata_admission_waits(
 ) -> None:
     store = tensorfs.Store.init(tmp_path / "store")
     ref = model(store, "cancel", {"weight": plain(np.arange(16, dtype=np.float32))})
-    service, models, broker, record, _, _ = reader(tmp_path, store, {"source": ref})
-    view = service.open(models["source"])
+    sources, broker, record, _, _, _ = reader(tmp_path, store, {"source": ref})
+    view = sources["source"]
     host, client = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     asked, allow = threading.Event(), threading.Event()
     errors: list[BaseException] = []
@@ -96,7 +86,7 @@ def test_cancel_can_close_source_while_metadata_admission_waits(
 
     def read() -> None:
         try:
-            view.read_part_into("model", "weight", "value", 0, bytearray(4))
+            view.read_into("model", "weight", "value", 0, bytearray(4))
         except BaseException as exc:
             errors.append(exc)
 
@@ -134,15 +124,17 @@ def test_payload_reads_on_an_existing_native_lease_require_no_disk_grant(
 ) -> None:
     store = tensorfs.Store.init(tmp_path / "store")
     reference = model(store, "resident-read", {"weight": plain(np.arange(16, dtype=np.float32))})
-    service, models, broker, _, _, _ = reader(tmp_path, store, {"source": reference})
-    with service.open(models["source"]) as view:
+    sources, broker, _, _, handles, _ = reader(tmp_path, store, {"source": reference})
+    with handles:
+        view = sources["source"]
+        view.components()
 
         def refuse(*args: Any) -> Any:
             raise AssertionError("resident read requested a disk write grant")
 
         monkeypatch.setattr(storage, "acquire", refuse)
         output = bytearray(64)
-        view.read_part_into("model", "weight", "value", 0, output)
+        view.read_into("model", "weight", "value", 0, output)
         assert output == np.arange(16, dtype=np.float32).tobytes()
     broker.close()
     assert list((tmp_path / "spool").iterdir()) == []

@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 from types import ModuleType
 
+import msgspec
 import pytest
 from PIL import Image
 
@@ -37,7 +38,7 @@ class Result(msgspec.Struct):
 async def segment(ctx: Context, *, request: Request, out: Outputs) -> Result:
     raise RuntimeError("source only")
 app = App()
-app.job(segment, emits_media=True, accelerator=False)
+app.entrypoint(segment, emits_media=True, accelerator=False)
 """
 
 
@@ -63,7 +64,7 @@ def test_returned_image_keeps_bounds_and_request_interface_identity(
     request_fields = request["fields"]
     assert isinstance(request_fields, list)
     assert request_fields[0]["asset_bound"] == {"max_bytes": 1000}
-    result_schema = interface["jobs"][0]["result"]
+    result_schema = interface["entrypoints"][0]["result"]
     assert result_schema["fields"][0]["asset_bound"]["max_decoded_bytes"] == 36
     executor = object.__new__(Executor)
     executor.schema_digests = {}
@@ -78,7 +79,8 @@ def test_returned_image_keeps_bounds_and_request_interface_identity(
         exec(compile(code, "generated_native_result_media.py", "exec"), module.__dict__)
         binding = module.__dict__["__cozy_bindings__"]["segment"]
         result_type = binding.result
-        assert schema.render(binding.request) == interface["jobs"][0]["request"]
+        payload = next(f for f in msgspec.structs.fields(binding.request) if f.name == "payload")
+        assert schema.render(payload.type) == interface["entrypoints"][0]["request"]
     image = tmp_path / "frame.png"
     Image.new("RGB", (4, 3), "red").save(image)
     data = image.read_bytes()
@@ -126,7 +128,7 @@ def test_returned_image_keeps_bounds_and_request_interface_identity(
         decoder.decode_image(asset)  # type: ignore[arg-type]
 
 
-def test_generated_only_job_can_request_decoder_without_payload_assets(tmp_path: Path) -> None:
+def test_generated_only_function_can_request_decoder_without_payload_assets(tmp_path: Path) -> None:
     """Generated child results supply decode capabilities after the parent starts."""
     source = """import msgspec
 from cozy_runtime.author import App, Context, MediaDecoder
@@ -135,7 +137,7 @@ class Request(msgspec.Struct):
     prompt: str
 class Result(msgspec.Struct):
     width: int
-@app.job(accelerator=False)
+@app.entrypoint(accelerator=False)
 async def compose(ctx: Context, payload: Request, media: MediaDecoder) -> Result:
     raise RuntimeError("discovery only")
 """
@@ -146,10 +148,10 @@ async def compose(ctx: Context, payload: Request, media: MediaDecoder) -> Result
     assert package_interface.canonical_bytes(imported) == package_interface.canonical_bytes(
         static_interface.build(tmp_path)
     )
-    assert imported["jobs"][0]["name"] == "compose"
+    assert imported["entrypoints"][0]["name"] == "compose"
 
 
-def test_generated_job_does_not_waive_explicit_input_decode_bounds(tmp_path: Path) -> None:
+def test_generated_function_does_not_waive_explicit_input_decode_bounds(tmp_path: Path) -> None:
     from cozy_runtime.author import ConformanceError
 
     (tmp_path / "package.toml").write_text('[application]\nobject="unbounded_decode:app"\n')
@@ -160,7 +162,7 @@ class Request(msgspec.Struct):
     image: ImageAsset
 class Result(msgspec.Struct):
     width: int
-@app.job(accelerator=False)
+@app.entrypoint(accelerator=False)
 async def compose(ctx: Context, payload: Request, media: MediaDecoder) -> Result:
     raise RuntimeError("discovery only")
 """)

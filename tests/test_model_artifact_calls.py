@@ -20,13 +20,13 @@ from cozy_runtime.author import (
     Model,
     ModelArtifact,
     ObjectRef,
+    Weights,
     WeightsOutput,
     attempt,
     describe,
     invocable,
 )
 from cozy_runtime.author._calls import _Broker, _CallType
-from cozy_runtime.author._model import _derive_model
 from cozy_runtime.author.fakes import fake_context
 from cozy_runtime.cli import describe as describe_cli
 from cozy_runtime.cli.io import Options
@@ -38,7 +38,7 @@ from native_weights import NativeExecution
 
 class Source(Model[object]):
     def load(self, loader: Loader) -> None:
-        raise AssertionError("a derive-only Model must not be loaded")
+        raise AssertionError("Weights[Source] is never constructed")
 
 
 class Result(msgspec.Struct):
@@ -46,7 +46,7 @@ class Result(msgspec.Struct):
 
 
 @invocable(memoize=True)
-async def consume(ctx: Context, *, source: Source) -> Result:
+async def consume(ctx: Context, *, source: Weights[Source]) -> Result:
     ctx.raise_if_cancelled()
     return Result(source.checkpoint_ref)
 
@@ -58,7 +58,7 @@ async def echo(ctx: Context, *, value: ModelArtifact) -> ModelArtifact:
 
 def test_injected_model_refuses_as_model_before_reserving_a_child() -> None:
     app = App()
-    app.job(consume, accelerator=False)
+    app.entrypoint(consume, accelerator=False)
     surface = describe(app)[0]
     assert isinstance(surface.payload_type, type) and issubclass(
         surface.payload_type, msgspec.Struct
@@ -89,7 +89,7 @@ def test_injected_model_refuses_as_model_before_reserving_a_child() -> None:
     assert call.index == 0 and json.loads(call.payload)["source"] == msgspec.to_builtins(artifact)
 
 
-@invocable(memoize=True)
+@invocable
 async def produce(ctx: Context) -> ModelArtifact:
     plain = next(digest for alias, digest in tensorfs.seed_digests() if alias == "plain/1")
     with ctx.output("result").open(
@@ -112,7 +112,7 @@ def test_author_native_creation_call_returns_its_model_artifact(tmp_path: Path) 
     store = tensorfs.Store.init(tmp_path / "store")
     host = NativeExecution(store, tmp_path, "request", {}, {"result": 2048})
     app = App()
-    app.job(produce, weights=(WeightsOutput("result", 2048),), accelerator=False)
+    app.entrypoint(produce, weights=(WeightsOutput("result", 2048),), accelerator=False)
     describe(app)
     result, outcome, _ = attempt(
         app.get("produce"),
@@ -133,15 +133,16 @@ def test_author_native_creation_call_returns_its_model_artifact(tmp_path: Path) 
 
 def test_model_proxy_is_an_exact_artifact_and_dispatch_checks_bound_model(tmp_path: Path) -> None:
     app = App()
-    app.job(consume, accelerator=False)
-    app.job(echo, accelerator=False)
+    app.entrypoint(consume, accelerator=False)
+    app.entrypoint(echo, accelerator=False)
     found = Discovered(app, __name__ + ":app", tmp_path, sys.modules[__name__], describe(app), {})
     raw = package_interface.canonical_bytes(package_interface.build(found))
     metadata = package_interface.read_bytes(raw)
-    consuming = next(row for row in metadata["jobs"] if row["name"] == "consume")
-    assert consuming["invocable"]["parameters"] == ["source"]
-    assert consuming["request"]["fields"][0]["type"] == {"union": ["null", {"input": "model"}]}
-    assert next(row for row in metadata["jobs"] if row["name"] == "echo")["result"] == {
+    consuming = next(row for row in metadata["entrypoints"] if row["name"] == "consume")
+    # The raw argument is a model slot of the call's `models`, not a request field.
+    assert consuming["invocable"]["parameters"] == [] and consuming["request"]["fields"] == []
+    assert consuming["models"][0]["weights"] is True
+    assert next(row for row in metadata["entrypoints"] if row["name"] == "echo")["result"] == {
         "input": "model"
     }
     interface_path = tmp_path / "package-interface.json"
@@ -166,7 +167,7 @@ def test_model_proxy_is_an_exact_artifact_and_dispatch_checks_bound_model(tmp_pa
         "consumer",
         tmp_path / "valid",
         time.monotonic() + 5,
-        models={"source": _derive_model(Source, artifact.manifest.digest)},
+        sources={"source": Weights(artifact.manifest.digest)},
     )
     result, outcome, _ = attempt(
         app.get("consume"), {"source": msgspec.to_builtins(artifact)}, invocation

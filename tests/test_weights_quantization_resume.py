@@ -14,42 +14,12 @@ import pytest
 import tensorfs
 from tensorfs.derived import Derivation, OutputCapability
 
-from cozy_runtime.author import (
-    App,
-    Context,
-    ModelArtifact,
-    ObjectRef,
-    Telemetry,
-    UnsupportedInput,
-    WeightsOutput,
-)
-from cozy_runtime.author._model import _derive_model
+from cozy_runtime.author import ModelArtifact, ObjectRef, UnsupportedInput, Weights
 from cozy_runtime.author.fakes import fake_attempt, fake_telemetry
 from cozy_runtime.derive import QuantizeResult, plan, quantize
-from cozy_runtime.derive.quantization import ArtifactQuantizationRequest, QuantizationSource
 from native_weights import NativeExecution
 
-app = App()
 BOUND = 32768
-
-
-@app.job(
-    name="native-quantization",
-    weights=(WeightsOutput("model", max_new_bytes=BOUND),),
-    accelerator=False,
-)
-def native_quantization(
-    ctx: Context,
-    source: QuantizationSource,
-    payload: ArtifactQuantizationRequest,
-    tel: Telemetry,
-) -> QuantizeResult:
-    return quantize(
-        source,
-        plan(("model",), "fp8-rowwise/1", max_relative_frobenius=payload.max_relative_frobenius),
-        ctx=ctx,
-        tel=tel,
-    )
 
 
 def _source(root: Path) -> tuple[tensorfs.Store, str, str, int]:
@@ -163,7 +133,7 @@ def _run(
                 lambda definition: open_native(slot, definition)
             )
             result = quantize(
-                _derive_model(QuantizationSource, source),
+                Weights(source),
                 plan(("model",), "fp8-rowwise/1", max_relative_frobenius=threshold),
                 ctx=ctx,
                 tel=fake_telemetry(fake_attempt("quantize")),

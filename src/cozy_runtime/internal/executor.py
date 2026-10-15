@@ -1711,10 +1711,10 @@ class Executor:
         return {"ok": True, "ranks": [], "skipped": "compiles start with the process"}
 
     def _model_classes(self) -> list[type[Model[Any]]]:
-        """The classes the package's Model slots declare, wherever they are defined (a
-        script's come from its libraries, not its entry module)."""
+        """The classes the package's constructed Model slots declare, wherever they are
+        defined (a script's come from its libraries, not its entry module)."""
         surfaces = getattr(self.discovered, "surfaces", ())
-        slots = [slot for surface in surfaces for slot in surface.model_bindings]
+        slots = [s for surface in surfaces for s in surface.model_bindings if not s.weights]
         return list(dict.fromkeys(slot.model_class for slot in slots))
 
     def _expect_kernels(self, *, isolated: bool) -> str:
