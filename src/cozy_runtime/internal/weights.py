@@ -1673,9 +1673,14 @@ def _recovery_type(torch: ModuleType) -> type:
         def _run(self, func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
             journal = self.journal
             banded = self.weights.bands
+            # The bands' own ops (meta shapes, band reads, a result's allocation) reach no
+            # mode: a recovery around this one (the call's, around a block's) would take
+            # them for the package's, and its refusal for a band's out-of-memory.
+            quiet = torch.utils._python_dispatch._disable_current_modes
             if banded is not None:
                 try:
-                    out = banded.run(func, args, kwargs)
+                    with quiet():
+                        out = banded.run(func, args, kwargs)
                 except Exception as exc:
                     if not is_device_oom(exc):
                         raise
@@ -1709,7 +1714,8 @@ def _recovery_type(torch: ModuleType) -> type:
                     target.copy_(first)
                 if banded is not None:
                     try:  # out of memory whole: in bands of rows when it can be
-                        out = banded.run(func, args, kwargs, short=True)
+                        with quiet():
+                            out = banded.run(func, args, kwargs, short=True)
                     except Exception as exc:
                         if not is_device_oom(exc):
                             raise
