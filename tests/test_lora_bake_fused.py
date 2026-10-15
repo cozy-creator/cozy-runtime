@@ -176,3 +176,37 @@ def test_the_reserved_codes_decode_to_their_signed_maximum() -> None:
     for code, stays in ((0x7F, 0x7E), (0xFF, 0xFE), (0x80, 0)):
         expected[codes == code] = stays
     assert torch.equal(stored["data"].view(torch.uint8), expected)
+
+
+@interpreted
+def test_a_fused_int8_convrot_bake_stores_a_rotated_neighbour_without_bias() -> None:
+    """The fused int8 form rounds each rotated payload to one of its two integer neighbours,
+    unbiased, as the eager bake does; a seed names the bytes and a zero delta changes none."""
+    generator = torch.Generator().manual_seed(9)
+    weight = torch.randn(ROWS, 256, generator=generator) * 0.05
+    down = torch.randn(RANK, 256, generator=generator) * 0.05
+    up = torch.randn(ROWS, RANK, generator=generator) * 0.05
+    rotated = lora_bake.rotate_factor(torch, weight)
+    scale = (rotated.abs().amax(dim=1) / 127).clamp(min=1e-12)
+    data = torch.round(rotated / scale[:, None]).clamp(-127, 127).to(torch.int8)
+    payload = data.double() + (up.double() @ lora_bake.rotate_factor(torch, down).double()) / (
+        scale[:, None].double()
+    )
+    payload = payload.clamp(-127, 127)  # beyond the grid an element saturates
+    zero = data.clone()
+    lora_bake.fused(torch, {"data": zero, "scale": scale}, down * 0, up, 1)
+    assert torch.equal(zero, data)
+    bias, first = [], None
+    for seed in range(4):
+        fused, eager = data.clone(), data.clone()
+        lora_bake.fused(torch, {"data": fused, "scale": scale}, down, up, seed)
+        stats = lora_bake.Stats()
+        lora_bake.bake(torch, {"data": eager, "scale": scale}, down, up, seed=seed, stats=stats)
+        for got in (fused, eager):
+            assert ((got.double() - payload).abs() < 1 + 1e-6).all()
+        bias.append(float((fused.double() - payload).mean()))
+        first = fused if first is None else first
+    again = data.clone()
+    lora_bake.fused(torch, {"data": again, "scale": scale}, down, up, 0)
+    assert torch.equal(again, first)
+    assert abs(sum(bias) / len(bias)) < 0.01

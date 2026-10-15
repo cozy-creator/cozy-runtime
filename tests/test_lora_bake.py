@@ -7,7 +7,13 @@ from typing import Any
 import numpy as np
 import pytest
 
-from cozy_runtime.derive.microscale import e4m3_decode, encode_fp8_rowwise, encode_mxfp8
+from cozy_runtime.derive.microscale import (
+    decode_int8_convrot256,
+    e4m3_decode,
+    encode_fp8_rowwise,
+    encode_int8_convrot256,
+    encode_mxfp8,
+)
 from cozy_runtime.internal import lora_bake
 
 torch = pytest.importorskip("torch")
@@ -217,3 +223,37 @@ def test_a_request_serves_its_loras_per_step_only_when_it_says_so() -> None:
     assert lora_mode(Plain, {"prompt": "a", "lora_mode": "fast"})[1] == "bake"
     wire = {"prompt": "a", "lora_mode": "per_step"}
     assert lora_mode(Declares, wire) == (wire, "bake")
+
+
+def _int8(values: np.ndarray) -> tuple[Any, Any]:
+    encoded = encode_int8_convrot256("w", values)
+    data = torch.frombuffer(bytearray(encoded.payload), dtype=torch.int8).view(ROWS, COLS)
+    scale = torch.frombuffer(bytearray(encoded.companions[0].raw), dtype=torch.float32)
+    return data.clone(), scale.clone()
+
+
+def test_an_int8_convrot_bake_keeps_the_delta_in_its_rotated_grid() -> None:
+    """Stochastic rounding of the rotated rows keeps the LoRA in expectation; a zero delta is a
+    fixed point; the stored weight decodes to the merged one within the lane's own error."""
+    values, down, up = _layer(11)
+    assert lora_bake.bakeable({"data": "i8", "scale": "f32"})
+    data, scale = _int8(values)
+    zero = {"data": data.clone(), "scale": scale}
+    lora_bake.bake(torch, zero, down * 0, up, seed=3, stats=lora_bake.Stats())
+    assert torch.equal(zero["data"], data)
+    delta = (up.double() @ down.double()).numpy()
+    target = values + delta
+    base = decode_int8_convrot256(data.numpy(), scale.numpy())
+    retained = []
+    for seed in range(4):
+        stored, stats = {"data": data.clone(), "scale": scale}, lora_bake.Stats()
+        lora_bake.bake(torch, stored, down * 8, up, seed=seed, stats=stats)
+        moved = decode_int8_convrot256(stored["data"].numpy(), scale.numpy()) - base
+        retained.append(float((moved * delta * 8).sum() / np.square(delta * 8).sum()))
+        assert abs(stats.retention - retained[-1]) < 0.05 and stats.saturated == 0
+    assert abs(sum(retained) / 4 - 1) < 0.05
+    stored = {"data": data.clone(), "scale": scale}
+    lora_bake.bake(torch, stored, down, up, seed=0)
+    merged = decode_int8_convrot256(stored["data"].numpy(), scale.numpy())
+    lane = encode_int8_convrot256("w", target.astype(np.float32)).relative_frobenius()
+    assert np.linalg.norm(merged - target) / np.linalg.norm(target) < 2 * lane + 0.01
