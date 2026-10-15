@@ -98,6 +98,7 @@ def _kernels() -> tuple[object, object] | None:
             BLOCK_M: tl.constexpr,
             BLOCK_N: tl.constexpr,
             BLOCK_K: tl.constexpr,
+            SPLIT: tl.constexpr,
         ):
             rm = tl.arange(0, BLOCK_M)
             rn = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -113,11 +114,12 @@ def _kernels() -> tuple[object, object] | None:
                 weight = _decode(w_ptr, s_ptr, rn, k0, N, K, col_tiles, BLOCK_N, BLOCK_K)
                 acc += tl.dot(x, tl.trans(weight.to(x.dtype)))
             acc *= tl.load(two_ptr)
-            tl.atomic_add(
-                out_ptr + rm[:, None] * N + rn[None, :],
-                acc,
-                mask=(rm[:, None] < M) & (rn[None, :] < N),
-            )
+            where = out_ptr + rm[:, None] * N + rn[None, :]
+            ok = (rm[:, None] < M) & (rn[None, :] < N)
+            if SPLIT:
+                tl.atomic_add(where, acc, mask=ok)
+            else:
+                tl.store(where, acc.to(out_ptr.dtype.element_ty), mask=ok)
 
         @triton.jit  # type: ignore[untyped-decorator]
         def _dequant(  # type: ignore[no-untyped-def]
@@ -213,11 +215,15 @@ def matmul(
             with readable(weight, blocked_scale, scale_2) as (weight, blocked_scale, scale_2):
                 scales, tiles = blocked_scale.view(torch.uint8), int(blocked_scale.shape[1]) // 4
                 if rows <= DECODE_ROWS:
-                    # Split K until the card has ~4 programs per SM: a decode GEMV is bandwidth.
+                    # Split K until the card has ~2 programs per SM: a decode GEMV is bandwidth.
                     columns = -(-rows_out // GEMV_N)
-                    split = max(1, min(cols // GEMV_K, -(-4 * _sms(torch, index) // columns)))
+                    split = max(1, min(cols // GEMV_K, -(-2 * _sms(torch, index) // columns)))
                     span = -(-cols // (split * GEMV_K)) * GEMV_K
-                    acc = torch.zeros(rows, rows_out, dtype=torch.float32, device=x.device)
+                    acc = (
+                        torch.zeros(rows, rows_out, dtype=torch.float32, device=x.device)
+                        if split > 1
+                        else torch.empty(rows, rows_out, dtype=out_dtype, device=x.device)
+                    )
                     gemv[(columns, -(-cols // span))](  # type: ignore[index]
                         flat,
                         weight,
@@ -233,6 +239,7 @@ def matmul(
                         BLOCK_M=16,
                         BLOCK_N=GEMV_N,
                         BLOCK_K=GEMV_K,
+                        SPLIT=split > 1,
                         num_warps=4,
                     )
                     return acc.to(out_dtype).reshape(*x.shape[:-1], rows_out)
