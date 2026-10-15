@@ -566,7 +566,7 @@ works on every function: `weights=`, `publishes=`/`emits_media=`, `accelerator=F
 means the machine's GPU when it has one), `preflight=`, `demand=`, `defaults=`,
 `components=`, `memoize=`, `hidden=`, `internal=`. A writer (`weights=`, `publishes=`,
 `emits_media=`) is never memoized (`memoized_writer`); TensorFS derivation replay answers a
-repeat. `corpus/job/` is a structural census over the real 6.9 GB cozytensors store, read-only.
+repeat.
 
 Model-producing functions declare `WeightsOutput` slots and use `Context.tensorfs_source`,
 `Context.output`, and `Context.adopt_model`. TensorFS owns the typed `Derivation`, `Target`,
