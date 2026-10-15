@@ -72,7 +72,7 @@ class EnvironmentResult(msgspec.Struct):
     delegated_handler_symbols: dict[str, list[str]]
 
 
-@app.job
+@app.entrypoint(accelerator=False)
 def environment(payload: EnvironmentInput, ctx: Context) -> EnvironmentResult:
     """CPU receipt proves direct implementation binding despite job-only public-export proxies."""
     if ctx.device.type != "cpu":

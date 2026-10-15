@@ -1,0 +1,5 @@
+`@app.entrypoint` is the only registration (xs-040): `app.job`, the job/serving separation and the `Scratch`, `Checkpoints` and `Budget` services are gone, and every keyword (`weights=`, `publishes=`, `emits_media=`, `accelerator=False`, `preflight=`, `demand=`, `defaults=`, `components=`, `memoize=`, `hidden=`, `internal=`) works on every function. `accelerator=False` is the only value; absent means the machine's GPU when it has one. Scripts are always entrypoints.
+
+`Weights[M]` (bare `Weights` or `Weights[Any]`: any layout) is a raw checkpoint argument, never constructed. It reads through `components()`, `keys()`, `tensor()`, `identity()`, `read_into()` and `read_values_into()`, and is the source for `ctx.tensorfs_source` and `derive.quantize_artifact`. It replaces derive-only models, `QuantizationSource` and `WeightsReader`.
+
+The package interface has one `entrypoints` list. `accelerator` is written only as `false`, `publishes` only as `true`, and a `Weights` slot carries `"weights": true`. A function that writes weights or publishes cannot memoize (`memoized_writer`). `cozy-runtime describe <function>` prints `descriptor_id`, formerly `job_descriptor_id`.

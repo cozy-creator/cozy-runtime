@@ -65,7 +65,7 @@ def verify(directory: Path) -> dict[str, object]:
     app = App()
     sizes = {}
 
-    @app.job
+    @app.entrypoint
     def retain(payload: Request, out: Outputs) -> Result:
         nonlocal sizes
         tree, sizes = recorder.retain_trace_file(raw, out.save_tree)
