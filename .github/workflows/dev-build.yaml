@@ -66,8 +66,7 @@ jobs:
         with:
           repo-token: ${{ github.token }}
       - run: uv python install 3.12
-      - name: TensorFS read access for the TensorD build
-        if: env.WHEELS == 'true'
+      - name: TensorFS read access (the TensorD build, and a git source until 0.10 is published)
         env:
           TENSORFS_KEY: ${{ secrets.TENSORFS_READ_KEY }}
         run: bash source/scripts/prepare-release-source-access.sh

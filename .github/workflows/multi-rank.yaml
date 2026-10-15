@@ -20,6 +20,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v7
       - run: uv python install 3.12
+      - name: TensorFS read access (a git source until 0.10 is published)
+        env:
+          TENSORFS_KEY: ${{ secrets.TENSORFS_READ_KEY }}
+        run: bash scripts/prepare-release-source-access.sh
       - run: uv sync --locked
       - run: uv pip install --python .venv/bin/python --index https://download.pytorch.org/whl/cpu "torch==2.14.0"
       - run: uv pip install --python .venv/bin/python "diffusers==0.40.0"

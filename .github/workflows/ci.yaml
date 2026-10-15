@@ -22,6 +22,10 @@ jobs:
         with:
           save-cache: ${{ github.ref == 'refs/heads/master' }}
       - run: uv python install 3.12
+      - name: TensorFS read access (a git source until 0.10 is published)
+        env:
+          TENSORFS_KEY: ${{ secrets.TENSORFS_READ_KEY }}
+        run: bash scripts/prepare-release-source-access.sh
       - id: sync
         run: uv sync --locked
       - if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
@@ -67,6 +71,10 @@ jobs:
         with:
           save-cache: ${{ github.ref == 'refs/heads/master' && matrix.group == 1 }}
       - run: uv python install 3.12
+      - name: TensorFS read access (a git source until 0.10 is published)
+        env:
+          TENSORFS_KEY: ${{ secrets.TENSORFS_READ_KEY }}
+        run: bash scripts/prepare-release-source-access.sh
       - run: uv sync --locked
       - name: Full test suite shard under delegated processes
         env:
