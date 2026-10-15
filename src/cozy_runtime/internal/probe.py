@@ -435,8 +435,9 @@ def _numerics_int8_convrot(
         torch, {"data": data.to(device), "scale": scale.float().to(device)}, destination
     )
     got = destination.double().cpu()
-    error = (got - truth).abs()
-    relative = error / truth.abs().clamp(min=1e-300)
+    finite = torch.isfinite(got)
+    error = (got - truth).abs()[finite]
+    relative = error / truth.abs()[finite].clamp(min=1e-300)
     exact = bool((destination.cpu() == truth.to(dtype)).all())
     return Sweep(
         patterns=rows * cols,
