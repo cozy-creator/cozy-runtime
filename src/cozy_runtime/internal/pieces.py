@@ -1,6 +1,6 @@
 """The Runtime's side of `author.split`: how finely an op runs, from the peak bytes per input
-element it measured in this process and what the device has free for it, idle weights
-unmapped first (activations first)."""
+element it measured in this process and what the device has free for it beside the weights its
+model keeps whole (`Weights.activation_room`)."""
 
 from __future__ import annotations
 
@@ -21,7 +21,10 @@ class Pieces:
         self.ratio: dict[str, float] = {}
 
     def room(self, key: str) -> tuple[float | None, int]:
-        free, movable = self.weights.activation_room()
+        weights = self.weights
+        if weights.open:  # it fits itself to the room it finds from now on
+            weights.adaptive.add(weights.open[-1][1])
+        free, movable = weights.activation_room(whole=True)
         return self.ratio.get(key), max(free + movable - weight_policy.MARGIN, 0)
 
     @contextmanager
@@ -29,7 +32,7 @@ class Pieces:
         weights = self.weights
         torch, kind = weights.torch, weights.kind
         accel.hold_peak(torch, kind)
-        weights.free_for(need)
+        weights.free_for(need, whole=True)
         base = accel.allocated(torch, kind)
         try:
             yield

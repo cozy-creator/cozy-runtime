@@ -15,9 +15,10 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from cozy_runtime.author._loader import census  # noqa: E402
-from cozy_runtime.internal import accel, plane  # noqa: E402
+from cozy_runtime.internal import accel, plane, weight_policy  # noqa: E402
 from cozy_runtime.internal import weights as weights_module  # noqa: E402
 from cozy_runtime.internal.derive import Observations, serving_substrate  # noqa: E402
+from cozy_runtime.internal.pieces import Pieces  # noqa: E402
 from cozy_runtime.internal.weights import PlaneBackend, WeightResidency, Weights  # noqa: E402
 from test_device_tier import Custody, executor_with  # noqa: E402
 from test_weight_plane import (  # noqa: E402
@@ -310,4 +311,42 @@ def test_weights_a_stage_gave_to_activations_map_again_once_the_attempt_ends(
         assert weights.resident_bytes(other) == idle
         assert same(run(model, x, passes=1), expected)
     finally:
+        model.backend.close()
+
+
+def test_an_op_cut_into_pieces_leaves_its_models_whole_components_mapped(tmp_path: Path) -> None:
+    """SeedVR2's encode: more pieces cost less than the transformer read back each window. The
+    room for its pieces leaves out a component of its model placed whole, and its stage then
+    fits itself to the room it finds: an activation estimate larger than the card no longer
+    unmaps that component."""
+    weights = Weights(torch, torch.device("cuda", 0), "cuda")
+    weights.set_budget(-1, pinned=1 << 30)
+    weights.set_cap(4 << 30)
+    model = pair(weights, tmp_path)
+    try:
+        x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
+        expected_rest, expected = other_stage(model, x), run(model, x, passes=1)
+        stack, other = (model.backend.components[n] for n in ("stack", "other"))
+        own, idle = weights.resident_bytes(stack), weights.resident_bytes(other)
+        assert "other" in model.residency.whole()
+        capped(weights, own + idle)
+
+        model.residency.admit("run", ("stack",))
+        try:
+            free, movable = weights.activation_room()
+            assert movable >= idle, "any other op may have it"
+            _, room = Pieces(weights).room("op")
+            assert room <= free + movable - idle - weight_policy.MARGIN
+        finally:
+            model.residency.release("run", ("stack",))
+        assert "run" in weights.adaptive
+
+        weights.seed_activations({"run": 2 * weights.cap})
+        copied = weights.facts().h2d_bytes
+        assert same(run(model, x, passes=1), expected)
+        assert weights.resident_bytes(other) == idle
+        assert same(other_stage(model, x), expected_rest)
+        assert weights.facts().h2d_bytes == copied, "nothing was read back"
+    finally:
+        torch.cuda.set_per_process_memory_fraction(1.0, 0)
         model.backend.close()
