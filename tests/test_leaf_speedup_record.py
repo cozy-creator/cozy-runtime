@@ -13,7 +13,7 @@ from pathlib import Path
 
 import msgspec
 
-from cozy_runtime.internal import probe
+from cozy_runtime.internal import probe, qualification
 from cozy_runtime.internal.encoding import (
     SPEC_ROWWISE,
     SPEC_ROWWISE_KEEPDIM,
@@ -63,7 +63,7 @@ def rekeyed() -> QualificationResult:
 def test_the_probe_mints_the_leaf_speedup_onto_the_record_and_nothing_else() -> None:
     """Every passed encoded-GEMM observation carries its bench; every decode route carries
     NOT MEASURED, spelled -1.0 exactly as the two axes beside it spell it."""
-    table = probe._table(rekeyed())
+    table = probe.admission_table(rekeyed())
     leaves = [r for r in table.records if r.delivery_route == "encoded_gemm"]
     assert {r.leaf_speedup_x for r in leaves} == {0.6122, 0.7683}, leaves
     assert leaves and all(r.document()["leaf_speedup_x"] == r.leaf_speedup_x for r in leaves)
@@ -75,7 +75,9 @@ def test_the_qualification_document_names_the_worst_leaf_speedup_per_implementat
     """One implementation measured under two spec digests reports the WORSE of the two: the
     number the boot tail prints is the one an operator would want to be alarmed by."""
     result = recorded()
-    document = probe.Qualification(probe._table(result), result, "key", measured=False).document()
+    document = qualification.Qualification(
+        probe.admission_table(result), result, "key", "kept"
+    ).document()
     assert document["leaf_speedup_x"] == {f"{LEAF}@bfloat16": 0.6122}
     # A document with no passed leaf carries an empty map, not a missing key.
     floors_only = msgspec.structs.replace(

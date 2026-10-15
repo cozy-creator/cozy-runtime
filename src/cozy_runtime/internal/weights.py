@@ -77,7 +77,8 @@ from cozy_runtime.internal.fill import (
 )
 from cozy_runtime.internal.paging import partition
 from cozy_runtime.internal.planfacts import PlanFacts
-from cozy_runtime.internal.probe import QualificationResult, observed_capability_records, qualify
+from cozy_runtime.internal.probe import QualificationResult, observed_capability_records
+from cozy_runtime.internal.qualification import qualified
 from cozy_runtime.internal.resolution import ResolvedModelPlan, TensorResolution, script_plan
 
 if TYPE_CHECKING:
@@ -2303,7 +2304,7 @@ class PlaneBackend:
         torch = weights.torch
         facts = measure_device(torch, weights.index)
         providers = launch_providers()
-        qualified = qualify(
+        qualification = qualified(
             torch,
             providers,
             facts,
@@ -2318,7 +2319,7 @@ class PlaneBackend:
             snapshot=next(iter(checkpoints.values())).manifest_id,
             snapshots={name: book.manifest_id for name, book in checkpoints.items()},
             providers=providers,
-            capabilities=qualified[0],
+            capabilities=qualification.capabilities,
             device=facts,
             runtime=measure_runtime(torch, release),
             facts=PlanFacts(),
@@ -2332,7 +2333,7 @@ class PlaneBackend:
             plan=plan,
             weights=weights,
             construction=construction,
-            qualified=qualified,
+            qualified=(qualification.capabilities, qualification.result),
             device_facts=facts,
             tiers=tiers,
         )

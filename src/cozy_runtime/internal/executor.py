@@ -300,7 +300,7 @@ def _qualification_cache() -> str:
     the worker through it — and the worker already keeps node-local caches under it. This
     is a path, not a switch: an unset or relative value means nowhere to keep a result and
     the suite simply runs, which is what every executor did before cr-103. The directory
-    is not created here; `probe.qualified` makes it when it has something to keep.
+    is not created here; `qualification.qualified` makes it when it has something to keep.
     """
     home = _SEALED.get("COZY_HOME", "").strip()
     if not home or not Path(home).is_absolute():
@@ -2221,7 +2221,7 @@ class Executor:
         from cozy_runtime.internal.encoding import launch_providers, measure_device, measure_runtime
         from cozy_runtime.internal.fill import Checkpoint, FillRefusal, dtype_name, tensor_schema_of
         from cozy_runtime.internal.planfacts import PlanFacts
-        from cozy_runtime.internal.probe import qualified
+        from cozy_runtime.internal.qualification import qualified
         from cozy_runtime.internal.resolution import (
             ConstructionFacts,
             PlanRefusal,
