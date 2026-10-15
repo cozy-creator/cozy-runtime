@@ -344,8 +344,8 @@ class Weights:
         self.squeezes: dict[str, int] = {}
         #: components given back to make torch room (`page_out`), and their bytes
         self.paged_out = [0, 0]
-        #: methods whose stage fits itself to the room it finds (an image VAE's decode maps):
-        #: their activations never size a grant
+        #: methods whose stage fits itself to the room it finds (it runs its ops in `split`
+        #: pieces): their activations never size a grant, nor take a model's whole weights
         self.adaptive: set[str] = set()
         self.oom_retries = 0
         self.modes: dict[str, str] = {}
@@ -566,7 +566,8 @@ class Weights:
                 self.drain()
                 memory, held = self._held()
         slack = max(memory["reserved_bytes"] - memory["allocated_bytes"], 0)
-        need = self.activation.get(method, 0) - slack
+        # an adaptive stage fits itself to the room it finds: it asks for none
+        need = 0 if method in self.adaptive else self.activation.get(method, 0) - slack
         if held > self.cap:
             # Still over: the owner raises the cap into the room it makes (never a negative ask).
             self.room(max(need, 0) + weight_policy.MARGIN)
@@ -661,10 +662,14 @@ class Weights:
         held = committed + decoded
         available = self.headroom(memory) + held
         # Activations first, but never below the open stages' floor while that fits: an
-        # estimate that left a stage no room for its own weights would refuse it for size. An
-        # adaptive stage then keeps its maps in host memory; any other recovers from its
-        # out-of-memory by unmapping.
-        budget = max(weight_policy.plane_budget(available, growth), min(self.window(), available))
+        # estimate that left a stage no room for its own weights would refuse it for size, and
+        # it recovers from its out-of-memory by unmapping. An adaptive stage keeps its own
+        # weights and its model's components placed whole: its pieces fit beside them.
+        keep = self.window()
+        if method in self.adaptive and self.open:
+            residency, _, local = self.open[-1]
+            keep = max(keep, residency.kept(local))
+        budget = max(weight_policy.plane_budget(available, growth), min(keep, available))
         self.plan_inputs[method] = {
             "driver_free": memory["driver_free_bytes"],
             "reserved": memory["reserved_bytes"],
@@ -883,20 +888,25 @@ class Weights:
             return -1
         return available // 2 if available >= 0 else -1
 
-    def activation_room(self) -> tuple[int, int]:
+    def activation_room(self, whole: bool = False) -> tuple[int, int]:
         """What torch can allocate now, and the mapped weight bytes no open stage holds: the
-        room an op's own tensors may have, idle weights unmapped first (`free_for`)."""
+        room an op's own tensors may have, idle weights unmapped first (`free_for`). `whole`:
+        an op cut into pieces (`split`), and more pieces cost less than a model's weights read
+        back every time its stages come round, so the open model's components placed whole
+        are held too."""
         if self.open:
             residency, _, local = self.open[-1]
+            if whole:
+                local = (*local, *residency.whole())
             return residency.room(local)
         device = plane.stats(self.plane).device(self.index)
         movable = device.committed - device.leased_bytes - device.held_bytes
         return self.allocatable(), max(movable, 0)
 
-    def free_for(self, need: int) -> None:
+    def free_for(self, need: int, whole: bool = False) -> None:
         """Activations first: idle weights unmap until torch can allocate `need` bytes, as far
         as `activation_room` counts them."""
-        free, movable = self.activation_room()
+        free, movable = self.activation_room(whole)
         if need > free and movable > 0:
             mapped = plane.stats(self.plane).device(self.index).committed
             self.shrink(need - free, max(mapped - movable, self.floor()))
@@ -3189,7 +3199,7 @@ class WeightResidency:
         opens, or once the attempt ends (`restore`)."""
         weights = self.weights
         bound = weights.squeezed.get(method)
-        if bound is None or weights.host_only or weights.grouped:
+        if bound is None or weights.host_only or weights.grouped or method in weights.adaptive:
             return
         keep = {self.components[name].key for name in local} | _in_use(weights)
         while (need := bound + weight_policy.MARGIN - weights.allocatable()) >= 0:
@@ -3205,6 +3215,8 @@ class WeightResidency:
         repeating stage uses (`_in_use`), so never one `_spare` gave back."""
         weights = self.weights
         if self.active is None or self.baseline < 0 or weights.grouped or weights.mapping:
+            return
+        if self.active[0] in weights.adaptive:
             return
         room, dropped = self.pressure
         if weights.retries() - dropped <= 1:
@@ -3566,6 +3578,25 @@ class WeightResidency:
         movable = device.committed - device.leased_bytes - device.held_bytes - own
         return free, max(movable, 0)
 
+    def whole(self) -> list[str]:
+        """Its components a stage last placed whole: none of their blocks streams."""
+        return [
+            name
+            for name, c in self.components.items()
+            if c.residence is not None and not c.residence.streamed
+        ]
+
+    def kept(self, local: Sequence[str]) -> int:
+        """What an adaptive stage of `local` keeps on the device: those components whole, and
+        the resident sets of the model's other components placed whole."""
+        own = sum(self.components[name].planned.total for name in local)
+        return own + sum(
+            self.components[name].regions[index].span
+            for name in self.whole()
+            if name not in local
+            for index in self.components[name].resident
+        )
+
     def restore(self) -> None:
         """After an attempt: what its stages placed resident and then gave to activations maps
         again (keep hot), in the background, into the room the device has now, in the order the
@@ -3605,8 +3636,8 @@ class WeightResidency:
                 if self.active
                 else None
             ),
-            # what a grant must leave for activations: an adaptive stage (an image VAE's
-            # decode) fits itself to the room it finds, so its peak never sizes one
+            # what a grant must leave for activations: an adaptive stage (ops cut into
+            # pieces) fits itself to the room it finds, so its peak never sizes one
             "attempt_activation_peak_bytes": max(
                 (v for m, v in self.peaks.items() if m not in weights.adaptive),
                 default=max(self.peaks.values(), default=0),

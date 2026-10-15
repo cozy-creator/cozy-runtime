@@ -49,7 +49,7 @@ def account(monkeypatch: pytest.MonkeyPatch, *, cached: int = 0, trim: bool = Tr
     own.torch = ModuleType("allocator_observations")
     own.plane = plane.open_plane(None)
     own.index, own.context_bytes, own.floor_free = 0, context, 256 * MIB
-    own.activation = {"denoise": 512 * MIB}
+    own.activation, own.adaptive = {"denoise": 512 * MIB}, set()
     own.residencies = weakref.WeakSet()
     # Its unpark callback is the only residency I/O this accounting test observes.
     residency = WeightResidency.__new__(WeightResidency)
