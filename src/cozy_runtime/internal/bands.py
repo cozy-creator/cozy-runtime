@@ -116,7 +116,10 @@ class Bands:
             rule = self._rows
         if rule is None or func._schema.is_mutable or self.seeded in func.tags:
             return NotImplemented
-        hosted = bool(spill.HELD) and any(map(spill.hosted, _tensors((args, kwargs))))
+        tensors = _tensors((args, kwargs))
+        if any(hasattr(t, "__tensor_flatten__") for t in tensors):
+            return NotImplemented  # a wrapper's ops are its own (a collective's, a DTensor)
+        hosted = bool(spill.HELD) and any(map(spill.hosted, tensors))
         if packet in self.pads and not (short or hosted):
             return self._remember(func, args, kwargs)
         plan = None
@@ -565,7 +568,7 @@ def _tensors(value: Any) -> list[Tensor]:
             stack.extend(item)
         elif isinstance(item, dict):
             stack.extend(item.values())
-        elif type(item).__name__ in ("Tensor", "Parameter"):
+        elif hasattr(item, "untyped_storage"):
             found.append(item)
     return found
 
