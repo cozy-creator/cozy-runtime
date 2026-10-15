@@ -19,6 +19,9 @@ nvcc = [
     "--expt-relaxed-constexpr",
     "-DNDEBUG",
     f"-DCOZY_SM={sm}",
+    # The GEMM waits on its rotate kernel by grid dependency (programmatic launch).
+    "-DCUTLASS_ENABLE_GDC_FOR_SM90",
+    "-DCUTLASS_ENABLE_GDC_FOR_SM100",
     f"-gencode=arch=compute_{arch},code=sm_{arch}",
     "-U__CUDA_NO_HALF_OPERATORS__",
     "-U__CUDA_NO_HALF_CONVERSIONS__",
