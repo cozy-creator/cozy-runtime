@@ -179,7 +179,13 @@ def test_native_exact_selection_binds_geometry_and_construction_order(tmp_path: 
     order = canonical_json.digest(
         [[component, key] for component, rows in structure.components.items() for key in rows]
     )
-    plan = QuantizationPlan(("control",), ("a.weight",), schema, (order,), "preserve")
+    plan = QuantizationPlan(
+        ("control",),
+        ("a.weight",),
+        selected_schema_digest=schema,
+        source_order_digests=(order,),
+        output_precision="preserve",
+    )
     result, outcome, _ = _shared(tmp_path / "preserve", store, source, plan)
     assert outcome.terminal == "succeeded", outcome
     assert result is not None

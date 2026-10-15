@@ -158,6 +158,11 @@ SPEC_SCALED_SCALAR_WEIGHT_ONLY = (
 #: 256 input channels (ComfyUI's ConvRot), one f32 scale per output row.
 SPEC_INT8_CONVROT256 = "sha256:ac25d323baebfdf1fd0ce3fdfd9f26400ce57914fdc442d0ade8cb187aef183f"
 
+#: `nvfp4-w4a4/1`, the base role set (NVIDIA ModelOpt's NVFP4): `weight` u8 `[out, in/2]` with
+#: element 2k in the LOW nibble, `weight_scale` E4M3 `[out, in/16]`, `weight_scale_2` f32 scalar.
+#: `value = e2m1(nibble) * e4m3(weight_scale) * weight_scale_2`, in f32, then the logical cast.
+SPEC_NVFP4 = "sha256:f2e718c521634876830f9c2647bddfbbccafc744decc88adb345d33d73bf5b1a"
+
 #: Reviewed digest -> (vendored fixture filename, exact vector-byte digest) from that nested spec.
 #: Qualification checks both before executing a case. `plain/1`'s route decodes nothing, so it
 #: has no entry — its evidence is the fill plane's byte-identity proof.
@@ -181,6 +186,10 @@ SPEC_VECTORS: dict[str, tuple[str, str]] = {
     SPEC_INT8_CONVROT256: (
         "int8-convrot256.json",
         "sha256:351ee32c9c7e1e01a1b61a39d6bd7f11399636a2e763c76a35d97bde4c6f8201",
+    ),
+    SPEC_NVFP4: (
+        "nvfp4-w4a4.json",
+        "sha256:ffc364c5657cd5620662a11aa454706f3a942906b1f1e83344f7eb3febfd4c5d",
     ),
 }
 
@@ -692,3 +701,94 @@ class Int8ConvRotDequant:
             block = hadamard256(torch, payload[start:stop].to(torch.int32)).to(torch.float32)
             block.mul_(scale[start:stop]).mul_(0.0625)
             destination[start:stop].copy_(block)
+
+
+#: NVFP4's block: one E4M3 scale per 16 elements along the input axis.
+NVFP4_BLOCK = 16
+
+#: E2M1 by nibble: bit 3 is the sign, bits 0-2 index the magnitudes.
+E2M1_VALUES = (
+    0.0,
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+    6.0,
+    -0.0,
+    -0.5,
+    -1.0,
+    -1.5,
+    -2.0,
+    -3.0,
+    -4.0,
+    -6.0,
+)
+
+
+def nvfp4_values(torch: ModuleType, weight: Tensor, scale: Tensor, scale_2: Tensor) -> Tensor:
+    """`nvfp4-w4a4/1` rows -> f32: `(e2m1 * e4m3) * scale_2`, the reference decoder's order."""
+    rows, cols = int(weight.shape[0]), int(weight.shape[1]) * 2
+    codes = torch.stack((weight & 0x0F, weight >> 4), dim=-1).reshape(rows, cols)
+    lut = torch.tensor(E2M1_VALUES, dtype=torch.float32, device=weight.device)
+    blocks = lut[codes.long()].view(rows, cols // NVFP4_BLOCK, NVFP4_BLOCK)
+    blocks.mul_(scale.to(torch.float32).view(rows, cols // NVFP4_BLOCK, 1))
+    return blocks.view(rows, cols).mul_(scale_2.to(torch.float32).reshape(()))
+
+
+@dataclass(frozen=True, slots=True)
+class Nvfp4Dequant:
+    """`nvfp4-w4a4/1` -> float, weight-only: the decode floor on every device. Row chunks bound
+    the f32 transient like `RowwiseDequant`'s."""
+
+    encoding: str
+
+    @property
+    def name(self) -> str:
+        return "cozy.nvfp4.dequant/1"
+
+    @property
+    def route(self) -> str:
+        return "decoded_float"
+
+    @property
+    def device_predicate(self) -> str:
+        return "any"
+
+    @property
+    def reviewed_specs(self) -> frozenset[str]:
+        return frozenset({SPEC_NVFP4})
+
+    @property
+    def code_revision(self) -> str:
+        return "1"
+
+    @property
+    def suite(self) -> str:
+        return "nvfp4-decode"
+
+    @property
+    def required(self) -> frozenset[str]:
+        return frozenset({"weight", "weight_scale", "weight_scale_2"})
+
+    @property
+    def optional(self) -> frozenset[str]:
+        return frozenset()
+
+    def supports(self, shape: Sequence[int]) -> str:
+        rank = _rank2(shape)
+        if rank or int(shape[1]) % NVFP4_BLOCK == 0:
+            return rank
+        return f"nvfp4 scales whole {NVFP4_BLOCK}-column blocks; this tensor has {shape[1]} columns"
+
+    def decode(self, torch: ModuleType, parts: Mapping[str, Tensor], destination: Tensor) -> None:
+        rows, cols = int(destination.shape[0]), int(destination.shape[1])
+        weight = parts["weight"].view(rows, cols // 2)
+        scale = parts["weight_scale"].view(rows, cols // NVFP4_BLOCK)
+        stride = max(1, _CHUNK_BYTES // max(cols * 8, 1))
+        for start in range(0, rows, stride):
+            stop = min(start + stride, rows)
+            destination[start:stop].copy_(
+                nvfp4_values(torch, weight[start:stop], scale[start:stop], parts["weight_scale_2"])
+            )

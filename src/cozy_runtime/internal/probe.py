@@ -54,6 +54,7 @@ from typing import Any
 import msgspec
 
 from cozy_runtime.author._numeric import within, worst
+from cozy_runtime.derive.microscale import encode_nvfp4
 from cozy_runtime.internal import accel, canonical
 from cozy_runtime.internal.encoding import (
     SPEC_VECTORS,
@@ -69,7 +70,7 @@ from cozy_runtime.internal.encoding import (
     implementation_digest,
     measure_runtime,
 )
-from cozy_runtime.internal.encoding.formats import Tensor, hadamard256
+from cozy_runtime.internal.encoding.formats import E2M1_VALUES, NVFP4_BLOCK, Tensor, hadamard256
 
 # `torch`, `device`, `dtype` and tensor values are `Any`: the check venv carries no torch.
 
@@ -372,6 +373,48 @@ def _numerics_int8_convrot(
     )
 
 
+def _numerics_nvfp4(torch: ModuleType, provider: Provider, device: Tensor, dtype: Tensor) -> Sweep:
+    """Every byte pattern (both nibbles of every E2M1 value) against every finite positive E4M3
+    block scale, at a power-of-two second level.
+
+    Row `r` stores all 256 bytes under block scale code `r + 1`, so a decoder that reads the
+    nibbles the wrong way round, mis-strides the block scales or drops the second level is wrong
+    almost everywhere. An E2M1 value times an E4M3 scale times a power of two is exact in f32, so
+    the destination's one RNE cast is the whole budget: bit for bit against the f64 truth.
+    """
+    rows, cols = 126, 512
+    weight = torch.arange(256, dtype=torch.int32).repeat(rows, 1).to(torch.uint8)
+    codes = torch.arange(1, rows + 1, dtype=torch.int32).to(torch.uint8)
+    weight_scale = codes.reshape(rows, 1).repeat(1, cols // NVFP4_BLOCK).view(torch.float8_e4m3fn)
+    scale_2 = torch.tensor(0.125, dtype=torch.float32)
+    lut = torch.tensor(E2M1_VALUES, dtype=torch.float64)
+    nibbles = torch.stack((weight & 0x0F, weight >> 4), dim=-1).reshape(rows, cols).long()
+    blocks = weight_scale.double().repeat_interleave(NVFP4_BLOCK, dim=1)
+    truth = lut[nibbles] * blocks * 0.125
+    destination = torch.empty(rows, cols, dtype=dtype, device=device)
+    provider.decode(
+        torch,
+        {
+            "weight": weight.to(device),
+            "weight_scale": weight_scale.to(device),
+            "weight_scale_2": scale_2.to(device),
+        },
+        destination,
+    )
+    got = destination.double().cpu()
+    error = (got - truth).abs()
+    relative = error / truth.abs().clamp(min=1e-300)
+    exact = bool((destination.cpu() == truth.to(dtype)).all())
+    return Sweep(
+        patterns=rows * cols,
+        max_abs_error=float(error.max()),
+        max_rel_error=float(relative.max()),
+        tolerance=_eps(torch, dtype),
+        nan_preserved=True,
+        passed=exact,
+    )
+
+
 def _domain_sweep(
     torch: Any, dtype: Any, got: Sequence[float], scales: Sequence[tuple[float, str]]
 ) -> Sweep:
@@ -546,6 +589,21 @@ def _weight_roles(torch: Any, provider: Provider, device: Any) -> tuple[Any, dic
         scale = (rotated.abs().amax(dim=-1) / 127.0).clamp(min=1e-12).float()
         payload = torch.round(rotated / scale.double().unsqueeze(-1)).clamp(-127, 127)
         return weight, {"data": payload.to(torch.int8), "scale": scale}
+    if provider.suite in ("nvfp4-decode", "nvfp4-native"):
+        encoded = encode_nvfp4("probe", weight.cpu().numpy())
+        scale, scale_2 = encoded.companions
+        return weight, {
+            "weight": torch.frombuffer(bytearray(encoded.payload), dtype=torch.uint8)
+            .reshape(rows, cols // 2)
+            .to(device),
+            "weight_scale": torch.frombuffer(bytearray(scale.raw), dtype=torch.uint8)
+            .reshape(rows, cols // NVFP4_BLOCK)
+            .view(torch.float8_e4m3fn)
+            .to(device),
+            "weight_scale_2": torch.frombuffer(bytearray(scale_2.raw), dtype=torch.float32)
+            .reshape(())
+            .to(device),
+        }
     if provider.suite == "fp8-scalar-decode":
         amax = weight.abs().max().clamp(min=1e-12)
         scale = (amax / 448.0).to(torch.float32)
@@ -563,6 +621,14 @@ def _exact_weight(torch: Any, provider: Provider, roles: Mapping[str, Any]) -> A
     element and a power-of-two or f32 scale multiply without rounding in f64 — so what the
     deviation below measures is entirely the route's own.
     """
+    if provider.suite in ("nvfp4-decode", "nvfp4-native"):
+        packed = roles["weight"].cpu()
+        rows, cols = int(packed.shape[0]), 2 * int(packed.shape[1])
+        nibbles = torch.stack((packed & 0x0F, packed >> 4), dim=-1).reshape(rows, cols).long()
+        lut = torch.tensor(E2M1_VALUES, dtype=torch.float64)
+        blocks = roles["weight_scale"].cpu().double().repeat_interleave(NVFP4_BLOCK, dim=1)
+        exact = lut[nibbles] * blocks * roles["weight_scale_2"].cpu().double()
+        return exact.to(roles["weight"].device)
     data = roles["data"].double()
     if provider.suite in ("fp8-rowwise-decode", "fp8-rowwise-native"):
         return data * roles["scale"].double().reshape(int(data.shape[0]), 1)
@@ -891,10 +957,11 @@ DECODE_SUITES: dict[str, Callable[[Any, Provider, Any, Any], Sweep]] = {
     "fp8-scalar-decode": _numerics,
     "fp8-rowwise-decode": _numerics_rowwise,
     "int8-convrot256-decode": _numerics_int8_convrot,
+    "nvfp4-decode": _numerics_nvfp4,
 }
 
 #: Native leaves' oracle is their own GEMM against arithmetic (`_native_agreement`).
-NATIVE_SUITES = frozenset({"fp8-rowwise-native", "int8-convrot256-native"})
+NATIVE_SUITES = frozenset({"fp8-rowwise-native", "int8-convrot256-native", "nvfp4-native"})
 
 
 def qualify(

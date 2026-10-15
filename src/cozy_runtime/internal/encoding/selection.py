@@ -36,6 +36,7 @@ from cozy_runtime.internal import accel, canonical
 from cozy_runtime.internal.encoding.formats import (
     Encoded,
     Int8ConvRotDequant,
+    Nvfp4Dequant,
     Provider,
     RowwiseDequant,
     ScaledScalarDequant,
@@ -46,6 +47,7 @@ from cozy_runtime.internal.encoding.formats import (
 )
 from cozy_runtime.internal.encoding.leaves import (
     Int8ConvRotNativeLeaf,
+    Nvfp4NativeLeaf,
     RowwiseNativeLeaf,
 )
 
@@ -515,19 +517,13 @@ NAMED_SEAMS: dict[str, tuple[str, str]] = {
         "encoded-provider leg; on sm89 the qualified route is decoded_float, which this "
         "runtime serves",
     ),
-    # `fp8-rowwise/1` LEFT THIS TABLE when its encoded-GEMM leaf was built. A seam entry
-    # means "this runtime recognises the bytes and executes none of them"; it now has TWO
-    # providers, a decode floor and an encoded leaf, and the honest answer for a device that
-    # serves neither is the candidate list the refusal prints.
-    "nvfp4-w4a4/1": (
-        "cuda.sm100+",
-        "the v1 SVDQuant/W4A4 native stack, ported as providers with its layout contracts "
-        "already registered as encoding rules; sequences with its consuming lane's tier. "
-        "PAUSED behind #549's plan-identity gates — no new provider lands until they do",
-    ),
+    # `fp8-rowwise/1` and `nvfp4-w4a4/1` LEFT THIS TABLE when their encoded-GEMM leaves were
+    # built. A seam entry means "this runtime recognises the bytes and executes none of
+    # them"; each now has TWO providers, a decode floor and an encoded leaf, and the honest
+    # answer for a device that serves neither is the candidate list the refusal prints.
     "svdq-microscale/1": (
         "cuda.sm100+",
-        "svdq micro-scale, same port as nvfp4-w4a4/1; its wscale geometry is PROVISIONAL "
+        "svdq micro-scale; its wscale geometry is PROVISIONAL "
         "pending producer-mined confirmation (tfs-008)",
     ),
 }
@@ -566,6 +562,8 @@ def launch_providers() -> dict[str, tuple[Provider, ...]]:
         RowwiseNativeLeaf,
         Int8ConvRotDequant,
         Int8ConvRotNativeLeaf,
+        Nvfp4Dequant,
+        Nvfp4NativeLeaf,
     )
     for build in builds:
         # The provider is instantiated once per digest it reviewed, which is what makes
