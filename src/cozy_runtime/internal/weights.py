@@ -3580,11 +3580,11 @@ class WeightResidency:
         return free, max(movable, 0)
 
     def whole(self) -> list[str]:
-        """Its components a stage last placed whole: none of their blocks streams."""
+        """Its components a stage last placed whole here: none of their blocks streams."""
         return [
             name
             for name, c in self.components.items()
-            if c.residence is not None and not c.residence.streamed
+            if name not in self.hosted and c.residence is not None and not c.residence.streamed
         ]
 
     def kept(self, local: Sequence[str]) -> int:
@@ -3599,20 +3599,22 @@ class WeightResidency:
         )
 
     def restore(self) -> None:
-        """After an attempt: what its stages placed resident and then gave to activations maps
-        again (keep hot), in the background, into the room the device has now, in the order the
-        stages read it. Nothing is evicted for it; the next stage waits only for what has not
-        arrived yet."""
+        """After an attempt: the components its stages placed whole and then gave to activations
+        map again (keep hot), in the background, into the room the device has now, in the order
+        the stages read them. Nothing is evicted for them; the next stage waits only for what has
+        not arrived yet. A streamed component's prefix stays where its stage left it: the next
+        request would evict it again (an 8 GB card copied 16 GB more per request)."""
         weights = self.weights
         if weights.host_only or weights.grouped or weights.open or self.parked is not None:
             return
         weights.drain()
         weights._apply(max(weights.applied, weights.stage_budget(MAPPING)))
         weights.plan_inputs.pop(MAPPING, None)
+        whole = set(self.whole())
         gone = [
             (component, index)
             for name in dict.fromkeys(n for names in self.scopes.values() for n in names)
-            if name not in self.hosted and (component := self.components.get(name)) is not None
+            if name in whole and (component := self.components.get(name)) is not None
             for index in component.resident
             if component.regions[index].bound is None
         ]
