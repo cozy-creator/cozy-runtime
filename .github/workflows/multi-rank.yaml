@@ -1,0 +1,28 @@
+name: multi-rank
+# Required on every PR to master and release/*: gloo ranks on CPU run the Ulysses exchange,
+# alone and under the modes a group GPU's package call runs its ops under (run 6349: every
+# multi-GPU run failed on a collective's wrapper tensor while single-GPU gates passed).
+on:
+  pull_request:
+    branches: [master, "release/**"]
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  multi-rank:
+    runs-on: ubuntu-latest
+    # Hang bound, not a work budget.
+    timeout-minutes: 15
+    env:
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v7
+      - run: uv python install 3.12
+      - run: uv sync --locked
+      - run: uv pip install --python .venv/bin/python --index https://download.pytorch.org/whl/cpu "torch==2.14.0"
+      - run: uv pip install --python .venv/bin/python "diffusers==0.40.0"
+      # The tests skip without torch or diffusers: missing, the job must fail instead.
+      - run: .venv/bin/python -c "import diffusers, torch; assert torch.version.cuda is None"
+      - run: .venv/bin/python -m pytest -q -rs tests/test_attention_ulysses.py
