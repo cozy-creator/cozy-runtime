@@ -37,7 +37,10 @@ INT_MAX = (1 << 53) - 1
 INT_MIN = -INT_MAX
 
 DEPTH_MAX = 32
-DOC_MAX_BYTES = 8 * 1024 * 1024
+#: Not a size rule: the most one document (or seam frame, `seam.MAX_FRAME`) may make a reader
+#: allocate, shared with TensorD's `protocol::MAX_FRAME`. Plan identities and sealed plans grow
+#: with their checkpoint; the old 8 MiB refused a load past about 30,000 tensors.
+DOC_MAX_BYTES = 256 << 20
 
 #: The one digest spelling, shared with tensorfs's `ids::prefixed`.
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -73,7 +76,7 @@ def _write(value: Json, *, application: bool) -> bytes:
     _emit(value, out, 0, application=application)
     data = "".join(out).encode("utf-8")
     if len(data) > DOC_MAX_BYTES:
-        raise CanonicalError("size_cap", f"{len(data)} bytes exceeds cap {DOC_MAX_BYTES}")
+        raise CanonicalError("size_cap", f"{len(data)} bytes over the {DOC_MAX_BYTES} B guard")
     return data
 
 
@@ -232,7 +235,7 @@ def parse_application(data: bytes) -> Json:
 
 def _parse(data: bytes, *, application: bool) -> Json:
     if len(data) > DOC_MAX_BYTES:
-        raise CanonicalError("size_cap", f"{len(data)} bytes exceeds cap {DOC_MAX_BYTES}")
+        raise CanonicalError("size_cap", f"{len(data)} bytes over the {DOC_MAX_BYTES} B guard")
     try:
         return json.loads(
             data.decode("utf-8"),

@@ -516,7 +516,13 @@ class Checkpoint:
             self.store.acquire(self.manifest_id, segments) as lease,
         ):
             assets = {
-                name: bytes(lease.read_asset(self.header_bytes, name, max_bytes=64 << 20))
+                name: bytes(
+                    lease.read_asset(
+                        self.header_bytes,
+                        name,
+                        max_bytes=int(self.header["assets"][name]["logical_length"]),
+                    )
+                )
                 for name in names
             }
         return assets
