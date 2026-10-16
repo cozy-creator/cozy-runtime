@@ -16,8 +16,7 @@ from typing import TYPE_CHECKING, Protocol
 from cozy_runtime.author._attention import AttentionProducer, ProducerCall
 from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT
 from cozy_runtime.author.kernels import PreQuantized
-from cozy_runtime.internal import attention_sol, attention_ulysses
-from cozy_runtime.internal.encoding import leaves
+from cozy_runtime.internal import attention_sol, attention_ulysses, fp8_linear
 
 if TYPE_CHECKING:
     from torch import Tensor
@@ -123,8 +122,7 @@ class Processor:
 def _quantize(x: Tensor) -> PreQuantized:
     import torch
 
-    payload, scale = leaves.quantize_activation_rowwise(torch, x)
-    return PreQuantized(payload, scale, tuple(x.shape))
+    return fp8_linear.quantize(torch, x)
 
 
 def install(

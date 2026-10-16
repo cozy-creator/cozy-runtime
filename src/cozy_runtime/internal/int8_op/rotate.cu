@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-// The activation side of int8-convrot256: each 256-group of a row times the regular Hadamard
-// H4 x H4 x H4 x H4 (`formats.hadamard256`) / 16, quantized per row to int8, optionally after
-// its producer's norm, modulation and activation (`Prologue`), in the same pass. With
-// M <= kGemvRows, `gemv` does the same in every block and multiplies against the weight rows
-// in the same launch.
+// The activation side of the 8-bit linears, each row in one pass, optionally after its
+// producer's norm, modulation and activation (`Prologue`): int8-convrot256 multiplies each
+// 256-group by the regular Hadamard H4 x H4 x H4 x H4 (`formats.hadamard256`) / 16 and
+// quantizes the row to int8; fp8-rowwise quantizes it to E4M3. With M <= kGemvRows, `gemv`
+// does the int8 pass in every block and multiplies against the weight rows in the same launch.
 //
 // Register layout after SGLang's `convrot_int8` (Apache-2.0): a warp holds a 1024-value tile,
 // 8 lanes per group and 32 values per lane. In-group index bits 0, 1, 2, 4, 6 are the register
@@ -14,6 +14,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 
 #include <algorithm>
 
@@ -70,16 +71,21 @@ __device__ __forceinline__ void stage_split(float (&v)[kLaneValues]) {
     }
 }
 
-// Tile `tile` of `row` as f32 in the register layout; a group past K reads zeros.
+// Where this lane's run j of tile `tile` starts in its row; the run is in the row when that is
+// under K (K % 8 == 0).
+__device__ __forceinline__ int run_start(int tile, int j) {
+    const int lane = threadIdx.x & 31;
+    return (tile * 4 + (lane >> 3)) * 256 + run_offset(lane & 7, j);
+}
+
+// Tile `tile` of `row` as f32 in the register layout; a run past K reads zeros.
 template <typename T>
 __device__ __forceinline__ void load_tile(const T* row, int tile, int K, float (&v)[kLaneValues]) {
-    const int lane = threadIdx.x & 31, q = lane & 7;
-    const int group = tile * 4 + (lane >> 3);
-    const T* base = row + group * 256;
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
         uint4 raw = make_uint4(0, 0, 0, 0);
-        if (group * 256 < K) raw = __ldg(reinterpret_cast<const uint4*>(base + run_offset(q, j)));
+        const int at = run_start(tile, j);
+        if (at < K) raw = __ldg(reinterpret_cast<const uint4*>(row + at));
         const T* e = reinterpret_cast<const T*>(&raw);
 #pragma unroll
         for (int i = 0; i < 8; ++i) v[8 * j + i] = as_float(e[i]);
@@ -123,13 +129,43 @@ __device__ __forceinline__ uint2 pack8(const float* v, float inverse) {
 // The tile's int8 values into `row_out` (global or shared memory).
 __device__ __forceinline__ void store_tile(int8_t* row_out, int tile, int K,
                                            const float (&v)[kLaneValues], float inverse) {
-    const int lane = threadIdx.x & 31, q = lane & 7;
-    const int group = tile * 4 + (lane >> 3);
-    if (group * 256 >= K) return;
 #pragma unroll
-    for (int j = 0; j < 4; ++j)
-        *reinterpret_cast<uint2*>(row_out + group * 256 + run_offset(q, j)) =
-            pack8(v + 8 * j, inverse);
+    for (int j = 0; j < 4; ++j) {
+        const int at = run_start(tile, j);
+        if (at < K) *reinterpret_cast<uint2*>(row_out + at) = pack8(v + 8 * j, inverse);
+    }
+}
+
+// `v / scale` by its reciprocal `r` and one correction step: the rounded quotient, without the
+// IEEE divide's cost per element (which bounded the pass at under half of B300's bandwidth).
+__device__ __forceinline__ float quotient(float v, float scale, float r) {
+    const float q = v * r;
+    return fmaf(fmaf(-q, scale, v), r, q);
+}
+
+// Two values as E4M3 bytes, `v / scale` rounded to nearest even and saturated: the eager leaf's
+// divide, clamp and cast.
+__device__ __forceinline__ uint32_t fp8x2(float a, float b, float scale, float r) {
+    return __nv_cvt_float2_to_fp8x2(make_float2(quotient(a, scale, r), quotient(b, scale, r)),
+                                    __NV_SATFINITE, __NV_E4M3);
+}
+
+// The tile's E4M3 values into `row_out`.
+__device__ __forceinline__ void store_fp8(uint8_t* row_out, int tile, int K,
+                                          const float (&v)[kLaneValues], float scale) {
+    const float r = 1.f / scale;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int at = run_start(tile, j);
+        if (at >= K) continue;
+        const float* e = v + 8 * j;
+        uint32_t w[2];
+#pragma unroll
+        for (int h = 0; h < 2; ++h)
+            w[h] = fp8x2(e[4 * h], e[4 * h + 1], scale, r) |
+                   fp8x2(e[4 * h + 2], e[4 * h + 3], scale, r) << 16;
+        *reinterpret_cast<uint2*>(row_out + at) = make_uint2(w[0], w[1]);
+    }
 }
 
 __device__ __forceinline__ float warp_max(float v) {
@@ -159,9 +195,10 @@ __device__ __forceinline__ float row_sum(float v, float* slots, int tiles) {
 template <typename T>
 __device__ __forceinline__ void apply_prologue(const Prologue& p, int row, int tile, int K,
                                                float (&v)[kLaneValues], float* slots) {
-    const int lane = threadIdx.x & 31, tiles = blockDim.x >> 5;
-    const int group = tile * 4 + (lane >> 3);
-    const bool valid = group * 256 < K;
+    const int tiles = blockDim.x >> 5;
+    bool valid[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) valid[j] = run_start(tile, j) < K;
     if (p.norm != kNormNone) {
         float mean = 0.f;
         if (p.norm == kNormLayer) {
@@ -173,12 +210,12 @@ __device__ __forceinline__ void apply_prologue(const Prologue& p, int row, int t
         float squares = 0.f;
 #pragma unroll
         for (int r = 0; r < kLaneValues; ++r) {
-            const float d = valid ? v[r] - mean : 0.f;
+            const float d = valid[r >> 3] ? v[r] - mean : 0.f;
             squares += d * d;
         }
         const float rstd = rsqrtf(row_sum(squares, slots + 32, tiles) / float(K) + p.eps);
 #pragma unroll
-        for (int r = 0; r < kLaneValues; ++r) v[r] = valid ? (v[r] - mean) * rstd : 0.f;
+        for (int r = 0; r < kLaneValues; ++r) v[r] = valid[r >> 3] ? (v[r] - mean) * rstd : 0.f;
     }
     if (p.scale != nullptr || p.shift != nullptr) {
         const int64_t entry = row / p.rows_per_entry;
@@ -206,9 +243,10 @@ __device__ __forceinline__ void apply_prologue(const Prologue& p, int row, int t
     }
 }
 
-// Hopper and B200 launch the GEMM as a programmatic dependent of this kernel: it starts its
-// prologue as soon as every block here has begun, and waits for this grid before reading.
-#if COZY_SM == 90 || COZY_SM == 100
+// The TMA GEMMs (Hopper, datacenter Blackwell, RTX 50's fp8) launch as programmatic dependents
+// of this kernel: they start their prologue as soon as every block here has begun, and wait
+// for this grid before reading.
+#if COZY_SM == 90 || COZY_SM == 100 || COZY_SM == 103 || COZY_SM == 120
 constexpr bool kDependentGemm = true;
 #else
 constexpr bool kDependentGemm = false;
@@ -216,9 +254,9 @@ constexpr bool kDependentGemm = false;
 
 // blockDim (32 * tiles, rows): each warp holds one tile of its row in registers across the
 // barriers, where the row's warps exchange their sums (a prologue's norm) and maxima.
-template <typename T, bool kPrologue>
-__global__ void __launch_bounds__(1024) rotate_quantize_kernel(
-    const T* __restrict__ x, int8_t* __restrict__ q, float* __restrict__ scales, int M, int K,
+template <typename T, bool kPrologue, bool kFp8>
+__global__ void __launch_bounds__(1024) quantize_kernel(
+    const T* __restrict__ x, void* __restrict__ q, float* __restrict__ scales, int M, int K,
     const Prologue prologue) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     if constexpr (kDependentGemm) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
@@ -231,14 +269,24 @@ __global__ void __launch_bounds__(1024) rotate_quantize_kernel(
     float amax = 0.f;
     load_tile(x + int64_t(live ? row : 0) * K, tile, live ? K : 0, v);
     if constexpr (kPrologue) apply_prologue<T>(prologue, live ? row : 0, tile, K, v, partial + 32);
-    rotate_values(v, amax);
+    if constexpr (kFp8) {
+#pragma unroll
+        for (int r = 0; r < kLaneValues; ++r) amax = fmaxf(amax, fabsf(v[r]));
+    } else {
+        rotate_values(v, amax);
+    }
     amax = warp_max(amax);
     if (lane == 0) partial[threadIdx.y * tiles + tile] = amax;
     __syncthreads();
-    const float scale = row_scale(warp_max(lane < tiles ? partial[threadIdx.y * tiles + lane] : 0.f));
+    amax = warp_max(lane < tiles ? partial[threadIdx.y * tiles + lane] : 0.f);
+    // fp8: eager's `amax / 448` as torch runs it on CUDA, a multiply by the f32 reciprocal.
+    const float scale = kFp8 ? fmaxf(amax * (1.f / 448.f), 1e-12f) : row_scale(amax);
     if (!live) return;
     if (threadIdx.x == 0) scales[row] = scale;
-    store_tile(q + int64_t(row) * K, tile, K, v, 1.f / scale);
+    if constexpr (kFp8)
+        store_fp8(static_cast<uint8_t*>(q) + int64_t(row) * K, tile, K, v, scale);
+    else
+        store_tile(static_cast<int8_t*>(q) + int64_t(row) * K, tile, K, v, 1.f / scale);
 }
 
 __device__ __forceinline__ int dot16(const int4& a, const int4& b, int acc) {
@@ -311,18 +359,19 @@ __global__ void __launch_bounds__(kGemvThreads) gemv_kernel(
     }
 }
 
-template <typename T>
-cudaError_t rotate_quantize_as(const T* x, int8_t* q, float* scales, int M, int K,
-                               const Prologue& prologue, cudaStream_t s) {
+template <typename T, bool kFp8>
+cudaError_t quantize_as(const void* x, void* q, float* scales, int M, int K,
+                        const Prologue& prologue, cudaStream_t s) {
     const int tiles = (K + kTile - 1) / kTile;
     const int rows = std::max(1, std::min(M, 8 / tiles));
     const dim3 grid((M + rows - 1) / rows), block(32 * tiles, rows);
     const bool any = prologue.norm != kNormNone || prologue.scale != nullptr ||
                      prologue.shift != nullptr || prologue.activation != kActNone;
+    const T* rows_in = static_cast<const T*>(x);
     if (any)
-        rotate_quantize_kernel<T, true><<<grid, block, 0, s>>>(x, q, scales, M, K, prologue);
+        quantize_kernel<T, true, kFp8><<<grid, block, 0, s>>>(rows_in, q, scales, M, K, prologue);
     else
-        rotate_quantize_kernel<T, false><<<grid, block, 0, s>>>(x, q, scales, M, K, prologue);
+        quantize_kernel<T, false, kFp8><<<grid, block, 0, s>>>(rows_in, q, scales, M, K, prologue);
     return cudaGetLastError();
 }
 
@@ -344,10 +393,14 @@ cudaError_t gemv_as(const T* x, const int8_t* w, const float* ws, const Out* bia
 
 cudaError_t rotate_quantize(const void* x, bool x_half, int8_t* q, float* scales, int M, int K,
                             const Prologue& prologue, cudaStream_t stream) {
-    return x_half ? rotate_quantize_as(static_cast<const __half*>(x), q, scales, M, K, prologue,
-                                       stream)
-                  : rotate_quantize_as(static_cast<const __nv_bfloat16*>(x), q, scales, M, K,
-                                       prologue, stream);
+    return (x_half ? quantize_as<__half, false> : quantize_as<__nv_bfloat16, false>)(
+        x, q, scales, M, K, prologue, stream);
+}
+
+cudaError_t fp8_quantize(const void* x, bool x_half, void* q, float* scales, int M, int K,
+                         const Prologue& prologue, cudaStream_t stream) {
+    return (x_half ? quantize_as<__half, true> : quantize_as<__nv_bfloat16, true>)(
+        x, q, scales, M, K, prologue, stream);
 }
 
 cudaError_t gemv(const void* x, bool x_half, const int8_t* w, const float* w_scale,

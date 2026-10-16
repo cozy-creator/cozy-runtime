@@ -1,0 +1,4 @@
+`fp8-rowwise/1` is one native op, `torch.ops.cozy.fp8_linear`, in the 8-bit library compiled at boot (recipe `cozy-int8`). One kernel quantizes each activation row to E4M3, matching the eager law bit for bit. A CUTLASS GEMM then applies both row scales and the bias in its epilogue: tcgen05 on B200 and B300, wgmma on Hopper, sm120's TMA mma on RTX 50, and cuBLASLt `_scaled_mm` on sm89.
+- On a B300 the GEMM runs 2.6–2.9 PF at the large DiT shapes (cuBLASLt 2.0–2.2), and the whole linear 1.4–1.7× bf16. Anima's fp8 lane denoises in 2.49 s against bf16's 2.74 s.
+- H100 matches cuBLASLt (H3 1.1–1.3 PF); the whole linear is 1.5–1.7× bf16.
+- The Triton quantizer is removed; torch ops serve until the op lands. A run whose card cannot build the library warns `8-bit op unavailable, slower kernels served`.
