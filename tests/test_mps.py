@@ -362,6 +362,8 @@ def test_sdxl_on_the_apple_gpu(tmp_path: Path, size: int) -> None:
     origins = [
         {"hub": "https://tensorhub.com", "ref": f"{SDXL}@1.0.0", "lane": closure["lane"]}
         | {"manifest": manifest, "manifest_length": closure["manifest"]["length"]}
+        # what the Hub's grant names as its object hosts: its presigned reads are R2's
+        | {"allowed_hosts": ["tensorhub.com", ".r2.cloudflarestorage.com"]}
     ]
     store = Store.init(tmp_path / "store")
     with served(tmp_path, discover_installed("sdxl:app"), store, origins) as machine:
