@@ -50,6 +50,7 @@ def account(monkeypatch: pytest.MonkeyPatch, *, cached: int = 0, trim: bool = Tr
     own.plane = plane.open_plane(None)
     own.index, own.context_bytes, own.floor_free = 0, context, 256 * MIB
     own.activation, own.adaptive = {"denoise": 512 * MIB}, {}
+    own.pool = None  # a discrete GPU: no unified plane
     own.residencies = weakref.WeakSet()
     # Its unpark callback is the only residency I/O this accounting test observes.
     residency = WeightResidency.__new__(WeightResidency)
