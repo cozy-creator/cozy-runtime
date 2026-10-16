@@ -399,6 +399,7 @@ def test_sdxl_on_the_apple_gpu(tmp_path: Path, size: int) -> None:
         warm = time.perf_counter() - started
     assert (first["width"], first["height"]) == (size, size)
     OUT.mkdir(parents=True, exist_ok=True)
+    (OUT / "sdxl-frames.json").write_text(json.dumps(machine.frames, default=str))
     for name, answer in (("fox", first), ("lighthouse", second)):
         (OUT / f"sdxl-{name}.webp").write_bytes(Path(answer["_image_path"]).read_bytes())
     _record(
@@ -594,7 +595,7 @@ class Machine:
         )[:6000]
         self.plane = self.executor._plane_facts() or {}
         result = dict(json.loads((spool / RESULT_DOCUMENT).read_bytes()))
-        images = sorted(spool.rglob("*.webp"))
+        images = sorted(spool.glob("image-*"))
         if images:
             result["_image_path"] = str(images[0])
         return result
