@@ -68,6 +68,7 @@ from msgspec import UNSET, UnsetType
 from tensorfs.derived import SourceCapability
 
 from cozy_runtime import __version__ as RUNTIME_VERSION
+from cozy_runtime import graphs
 from cozy_runtime.author import describe
 from cozy_runtime.author._activity import settles
 from cozy_runtime.author._app import Registration
@@ -120,7 +121,7 @@ from cozy_runtime.author._invoke import (
     prepare,
     run_prepared,
 )
-from cozy_runtime.author._model import Model, component_use
+from cozy_runtime.author._model import WARNINGS, Model, component_use
 from cozy_runtime.author._observations import Attribution
 from cozy_runtime.author._services import Attempt as AuthorAttempt
 from cozy_runtime.author._services import ProgressFrame
@@ -2715,6 +2716,8 @@ class Executor:
         # stage on the plane, and each block runs inside one acquire/release.
         self.residency = WeightResidency(weights, backend.components, scopes, refine=backend.refine)
         object.__setattr__(model, "_cozy_residency", self.residency)
+        # Its components' calls replay CUDA graphs once recorded (`graphs`), unless uncaptured.
+        graphs.install(model, {name: c.root for name, c in self.residency.components.items()})
         stage_memo.install(
             model,
             torch=torch,
@@ -3501,6 +3504,9 @@ class Executor:
                     "warn",
                     **dataclasses.asdict(missing),
                 )
+            for message, raised in WARNINGS:
+                record.emit("log", message, "warn", **raised)
+        WARNINGS.clear()
         stage_memo.ENGINE.close(record.emit)
         if later:
             # The override put back the run's first selection; the construction keeps its last.

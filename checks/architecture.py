@@ -61,8 +61,9 @@ PACKAGE_FENCES: dict[str, tuple[str, ...]] = {
     "fusion": ("cozy_runtime.internal", "cozy_runtime.cli", "worker_protocol", "tensorfs"),
     # LM decode: static cache and CUDA-graphed steps; placement through the author protocol.
     "lm": ("cozy_runtime.internal", "cozy_runtime.cli", "worker_protocol", "tensorfs"),
-    # CUDA graphs over plane-held weights: the one capture recipe.
-    "graphs": ("cozy_runtime.internal", "cozy_runtime.cli", "worker_protocol", "tensorfs"),
+    # CUDA graphs over plane-held weights, which the executor installs on every component; a
+    # replay reports the attention it serves into the run's evidence.
+    "graphs": ("cozy_runtime.cli", "worker_protocol", "tensorfs"),
     # The activation probe (cr-075): a public mechanism surface shaped like `derive` — job
     # code and the runtime verb both build on it; it never reaches the worker planes.
     "probe": ("cozy_runtime.internal", "cozy_runtime.cli", "worker_protocol", "tensorfs"),

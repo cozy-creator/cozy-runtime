@@ -33,7 +33,7 @@ from typing import Any
 
 from cozy_runtime.author._model import PLACED, RELEASERS
 from cozy_runtime.author.kernels import KernelsUnavailable, Launch, Plan, TritonKernels
-from cozy_runtime.graphs import capture, say
+from cozy_runtime.graphs import BYPASS, capture, say
 from cozy_runtime.lm import _kernels
 
 try:
@@ -116,51 +116,66 @@ def generate(
             type(model).__name__, f"[lm] {type(model).__name__} decodes through Transformers: {why}"
         )
         return _transformers(model, inputs, max_new_tokens, stops, filler, presence_penalty)
-    with torch.inference_mode():
-        ids = inputs["input_ids"]
-        prompt, cuda = int(ids.shape[1]), ids.is_cuda
-        # Prompts within one window step share a session (its buffers and graphs).
-        capacity = -(-(prompt + max_new_tokens) // MIN_WINDOW) * MIN_WINDOW
-        key = (
-            int(ids.shape[0]),
-            capacity,
-            max_new_tokens,
-            len(stops),
-            presence_penalty,
-            ids.device,
-        )
-        decode = _SESSIONS.get(model)
-        if decode is None or decode.key != key:
-            decode = _SESSIONS[model] = _Decode(model, key, presence_penalty)
-        decode.begin(inputs, stops, filler)
-        placed = PLACED.get(model)
-        if placed is None:  # a module Runtime does not place: its tensors stay where they are
-            decode.prefill()
-            return decode.run(graphs=cuda, layout=())
-        residency, name = placed
-        blocks = _READS.get(model)
-        if blocks is None:
-            # The first call: its first step runs through the paging hooks, which record the
-            # blocks a step reads; later calls hold them before their prefill.
-            decode.prefill()
-            with residency.recording() as read:
-                decode.first()
-            blocks = _READS[model] = frozenset(read.get(name, ()))
-            with residency.held(name, blocks) as held:
-                if held:
-                    return decode.run(graphs=True, layout=residency.layout(name, blocks))
-        else:
-            with residency.held(name, blocks) as held:
-                if held:
-                    decode.prefill()
-                    return decode.run(graphs=True, layout=residency.layout(name, blocks))
-        # They do not all fit at home beside what this stage holds: Transformers' own loop
-        # streams them, which a static cache's recovery copies would only slow down.
-        say(
-            f"held:{type(model).__name__}",
-            f"[lm] {type(model).__name__}: no graphs, decode set does not fit",
-        )
-        return _transformers(model, inputs, max_new_tokens, stops, filler, presence_penalty)
+    token = BYPASS.set(True)  # the component's calls are this loop's, its graphs its own
+    try:
+        with torch.inference_mode():
+            return _generate(model, inputs, max_new_tokens, stops, filler, presence_penalty)
+    finally:
+        BYPASS.reset(token)
+
+
+def _generate(
+    model: Any,
+    inputs: Mapping[str, Any],
+    max_new_tokens: int,
+    stops: list[int],
+    filler: int,
+    presence_penalty: float,
+) -> Any:
+    ids = inputs["input_ids"]
+    prompt, cuda = int(ids.shape[1]), ids.is_cuda
+    # Prompts within one window step share a session (its buffers and graphs).
+    capacity = -(-(prompt + max_new_tokens) // MIN_WINDOW) * MIN_WINDOW
+    key = (
+        int(ids.shape[0]),
+        capacity,
+        max_new_tokens,
+        len(stops),
+        presence_penalty,
+        ids.device,
+    )
+    decode = _SESSIONS.get(model)
+    if decode is None or decode.key != key:
+        decode = _SESSIONS[model] = _Decode(model, key, presence_penalty)
+    decode.begin(inputs, stops, filler)
+    placed = PLACED.get(model)
+    if placed is None:  # a module Runtime does not place: its tensors stay where they are
+        decode.prefill()
+        return decode.run(graphs=cuda, layout=())
+    residency, name = placed
+    blocks = _READS.get(model)
+    if blocks is None:
+        # The first call: its first step runs through the paging hooks, which record the
+        # blocks a step reads; later calls hold them before their prefill.
+        decode.prefill()
+        with residency.recording() as read:
+            decode.first()
+        blocks = _READS[model] = frozenset(read.get(name, ()))
+        with residency.held(name, blocks) as held:
+            if held:
+                return decode.run(graphs=True, layout=residency.layout(name, blocks))
+    else:
+        with residency.held(name, blocks) as held:
+            if held:
+                decode.prefill()
+                return decode.run(graphs=True, layout=residency.layout(name, blocks))
+    # They do not all fit at home beside what this stage holds: Transformers' own loop
+    # streams them, which a static cache's recovery copies would only slow down.
+    say(
+        f"held:{type(model).__name__}",
+        f"[lm] {type(model).__name__}: no graphs, decode set does not fit",
+    )
+    return _transformers(model, inputs, max_new_tokens, stops, filler, presence_penalty)
 
 
 def install(plan: Plan, model: Any) -> str:

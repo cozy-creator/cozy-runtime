@@ -24,6 +24,7 @@ from typing import Any
 import msgspec
 from msgspec import Struct
 
+from cozy_runtime.author._model import LANDED
 from cozy_runtime.author.kernels import (
     KernelsUnavailable,
     Launch,
@@ -272,7 +273,11 @@ def ready(kernels: TritonKernels, *, device: object) -> Launch | None:
         raise KernelsUnavailable("kernels_absent", f"{kernels.name} serves CUDA, not {target}")
     if (kernels.name, target.index or 0) in _LOADED:
         return _LOADED[(kernels.name, target.index or 0)]
+    if torch.cuda.is_current_stream_capturing():  # a load would end the graph being recorded
+        return None
     major, minor = torch.cuda.get_device_capability(target.index or 0)
     if kernel_compile.submit(_store(), job(kernels, major * 10 + minor)).state == "compiling":
         return None
-    return load(kernels, device=device)
+    launch = load(kernels, device=device)
+    LANDED[0] += 1
+    return launch

@@ -28,7 +28,7 @@ import weakref
 import zlib
 from collections import deque
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
-from contextlib import contextmanager, nullcontext, suppress
+from contextlib import ExitStack, contextmanager, nullcontext, suppress
 from dataclasses import dataclass, field, replace
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
@@ -3139,9 +3139,13 @@ class WeightResidency:
         self._quiet = weights.torch.utils._python_dispatch._disable_current_modes
         #: block modules run while `recording`, by component
         self.read: dict[str, set[Module]] | None = None
+        self.attempts = 0
         #: an on-demand model's: asks for its weights as a stage begins (`Fetches.want`)
         self.wanted: Callable[[], None] | None = None
         self._modes = weights.torch._C._len_torch_dispatch_stack
+        #: `held` scopes the open stage keeps (`hold_stage`): (held, layout) by component
+        self.stage_holds: dict[str, tuple[bool, tuple[object, ...]]] = {}
+        self._stage_stack = ExitStack()
         weights.residencies.add(self)
         for name, component in self.components.items():
             PLACED[component.root] = (self, name)
@@ -3180,6 +3184,7 @@ class WeightResidency:
         self.entries.clear()
         self.last_shortfall = None
         self.derived_at_open = self._derived()
+        self.attempts += 1
 
     def serve_lora(self, strategy: lora_bake.Strategy) -> None:
         """A request's LoRA serving (`lora_mode`): baked, or per step."""
@@ -3413,6 +3418,10 @@ class WeightResidency:
         return lowered, asked
 
     def _left(self) -> None:
+        if self.stage_holds:
+            self.stage_holds = {}
+            stack, self._stage_stack = self._stage_stack, ExitStack()
+            stack.close()
         if self.active is not None:
             with suppress(ValueError):
                 self.weights.open.remove((self, *self.active))
@@ -3752,6 +3761,15 @@ class WeightResidency:
 
     def note(self, key: str, value: str) -> None:
         self.weights.modes[key] = value
+
+    def hold_stage(self, name: str, blocks: Collection[Module]) -> tuple[bool, tuple[object, ...]]:
+        """`held` for the rest of the open stage, entered once per component: whether it holds,
+        and the layout it holds them at."""
+        found = self.stage_holds.get(name)
+        if found is None:
+            held = self._stage_stack.enter_context(self.held(name, blocks))
+            found = self.stage_holds[name] = (held, self.layout(name, blocks) if held else ())
+        return found
 
     def layout(self, name: str, blocks: Collection[Module]) -> tuple[object, ...]:
         component = self.components.get(name)
