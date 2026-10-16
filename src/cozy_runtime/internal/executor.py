@@ -68,6 +68,7 @@ import msgspec
 from msgspec import UNSET, UnsetType
 
 from cozy_runtime import __version__ as RUNTIME_VERSION
+from cozy_runtime import graphs
 from cozy_runtime.author._activity import settles
 from cozy_runtime.author._assets import GrantedInput
 from cozy_runtime.author._attention import _close as close_producer_states
@@ -119,7 +120,7 @@ from cozy_runtime.author._invoke import (
     prepare,
     run_prepared,
 )
-from cozy_runtime.author._model import Model, _derive_model, component_use
+from cozy_runtime.author._model import WARNINGS, Model, _derive_model, component_use
 from cozy_runtime.author._observations import Attribution
 from cozy_runtime.author._services import Attempt as AuthorAttempt
 from cozy_runtime.author._services import CheckpointConflict, ProgressFrame
@@ -2624,6 +2625,8 @@ class Executor:
             weights, backend.components, component_use(model_cls), refine=backend.refine
         )
         object.__setattr__(model, "_cozy_residency", self.residency)
+        # Its components' calls replay CUDA graphs once recorded (`graphs`), unless uncaptured.
+        graphs.install(model, {name: c.root for name, c in self.residency.components.items()})
         stage_memo.install(
             model,
             torch=torch,
@@ -3315,6 +3318,10 @@ class Executor:
                 record = AuthorAttempt(command.request_id, spool, 0, sink=progress)
         assert record is not None
         self.handled = (outcome, stage[0], record)
+        if self.rank == 0:
+            for message, raised in WARNINGS:
+                record.emit("log", message, "warn", **raised)
+        WARNINGS.clear()
         stage_memo.ENGINE.close(record.emit)
         if later:
             # The override put back the run's first selection; the construction keeps its last.
