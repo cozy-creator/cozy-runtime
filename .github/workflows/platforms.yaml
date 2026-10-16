@@ -2,8 +2,10 @@ name: platforms
 # A published Runtime on every desktop platform, Linux x86_64 as the control: does it install
 # (TensorFS has only a linux-x86_64 wheel, so elsewhere it builds from the sdist), which modules
 # import, do the CLI verbs run, and on macOS what MPS serves (SDXL-width UNet, VAE, attention vs
-# CPU fp32). Manual only: macOS bills 10x and Windows 2x.
+# CPU fp32). `mps` runs this ref's Apple-GPU tests on macos-15 (`sdxl`: the SDXL spike too).
+# Manual only: macOS bills 10x and Windows 2x.
 #   gh workflow run platforms.yaml -R cozy-creator/cozy-runtime --ref <branch> [-f os='["macos-15"]'] [-f runtime=0.25.1]
+#   gh workflow run platforms.yaml -R cozy-creator/cozy-runtime --ref <branch> -f os='[]' -f mps=true [-f sdxl=true]
 on:
   workflow_dispatch:
     inputs:
@@ -16,15 +18,24 @@ on:
         type: string
         default: 0.25.1
       tensorfs_ref:
-        description: TensorFS branch, tag or SHA built from source and installed first; empty takes PyPI's
+        description: TensorFS branch, tag or SHA built from source and installed first; empty takes PyPI's (mps builds cross-platform-probe)
         type: string
         default: ''
+      mps:
+        description: This ref's Apple-GPU tests on macos-15
+        type: boolean
+        default: false
+      sdxl:
+        description: With mps, the SDXL spike (fidika/sdxl from tensorhub.com, ~7 GB)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 jobs:
   probe:
+    if: inputs.os != '[]'
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     # Hang bound, not a work budget.
@@ -126,5 +137,76 @@ jobs:
             tensorfs.txt
             probe.txt
             wheels.txt
+          if-no-files-found: ignore
+          retention-days: 30
+
+  mps:
+    if: inputs.mps
+    name: mps (macos-15)
+    runs-on: macos-15
+    # Hang bound, not a work budget: a cold TensorFS build and the SDXL download fit well inside.
+    timeout-minutes: 75
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v7
+
+      - name: Machine
+        run: |
+          sysctl -n machdep.cpu.brand_string hw.memsize hw.ncpu
+          sw_vers
+          df -h .
+
+      - uses: actions/checkout@v4
+        with:
+          repository: cozy-creator/tensorfs
+          ref: ${{ inputs.tensorfs_ref || 'cross-platform-probe' }}
+          ssh-key: ${{ secrets.TENSORFS_READ_KEY }}
+          path: .tensorfs
+
+      - id: tensorfs
+        run: echo "sha=$(git -C .tensorfs rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v4
+        id: wheel
+        with:
+          path: .tensorfs-wheel
+          key: tensorfs-macos-arm64-${{ steps.tensorfs.outputs.sha }}
+
+      - if: steps.wheel.outputs.cache-hit != 'true'
+        uses: dtolnay/rust-toolchain@1.91.1
+
+      - name: TensorFS wheel
+        if: steps.wheel.outputs.cache-hit != 'true'
+        run: uv build --wheel --out-dir .tensorfs-wheel .tensorfs
+
+      - name: Venv
+        run: |
+          uv venv --python 3.12 .venv
+          uv pip install --python .venv/bin/python .tensorfs-wheel/*.whl
+          uv pip install --python .venv/bin/python -e '.[adapters,media]' 'torch>=2.14' torchvision \
+            'diffusers>=0.40.0' 'transformers>=5.16.1' 'peft>=0.20,<0.21' safetensors tokenizers pytest
+
+      - name: The published SDXL package
+        if: inputs.sdxl
+        run: |
+          curl -fsS -X POST https://tensorhub.com/v1/packages/fidika/sdxl/download -d '{}' > plan.json
+          read -r url name < <(.venv/bin/python -c 'import json; w = next(d for d in json.load(open("plan.json"))["downloads"] if d["kind"] == "project_wheel"); print(w["url"], w["path"])')
+          curl -fsS -o "$name" "$url"
+          uv pip install --python .venv/bin/python "./$name"
+
+      - name: Tests
+        run: |
+          .venv/bin/python -m pytest -q -rs -s --real-gpu tests/test_unified_plane.py tests/test_mps.py \
+            ${{ !inputs.sdxl && '-k "not sdxl"' || '' }}
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mps-results
+          path: ${{ runner.temp }}/mps-results
           if-no-files-found: ignore
           retention-days: 30

@@ -82,6 +82,8 @@ from cozy_runtime.internal.planfacts import PlanFacts
 from cozy_runtime.internal.probe import QualificationResult, observed_capability_records
 from cozy_runtime.internal.qualification import qualified
 from cozy_runtime.internal.resolution import ResolvedModelPlan, TensorResolution, script_plan
+from cozy_runtime.internal.unified_plane import Lease as UnifiedLease
+from cozy_runtime.internal.unified_plane import UnifiedPlane
 
 if TYPE_CHECKING:
     from tensorfs import ReadPlan
@@ -152,6 +154,8 @@ class Views:
 
     writes: list[tuple[Table, str, Tensor, Tensor]]
     parts: list[dict[str, Tensor]]
+    #: views over a unified plane's region tensor keep its memory: they go with the binding
+    owned: bool = False
 
 
 @dataclass(slots=True)
@@ -337,8 +341,14 @@ class Weights:
         self.kind = kind
         self.index = int(device.index or 0)
         #: no device in the plane: a CPU executor, whose pinned tier IS its device memory
-        self.host_only = device.type != "cuda"
-        self.plane = plane.open_plane(None if self.host_only else self.index)
+        self.host_only = device.type == "cpu"
+        #: one pool (Apple GPUs): the page cache is the host tier and regions are torch tensors
+        self.unified = accel.memory_class(kind) == "unified"
+        self.plane = (
+            UnifiedPlane(torch, device)
+            if self.unified
+            else plane.open_plane(None if self.host_only else self.index)
+        )
         #: TensorD's budgets; -1: none given, each stage derives one from the driver
         self.budget = -1
         self.pinned = -1
@@ -412,13 +422,17 @@ class Weights:
         #: the plane's maps); -1: none
         self.cap = -1
         self.total = (
-            0 if self.host_only else int(torch.cuda.get_device_properties(device).total_memory)
+            0
+            if self.host_only
+            else accel.allocation(torch, kind)["driver_total_bytes"]
+            if self.unified
+            else int(torch.cuda.get_device_properties(device).total_memory)
         )
         #: physical free bytes this process leaves on its GPU: a display's own floor, raised to
         #: the owner's (`owner_floor`, -1: none given)
         self.display_floor = (
             0
-            if self.host_only
+            if self.host_only or self.unified  # a unified budget leaves the system its share
             else weight_policy.free_floor(self.total, accel.drives_display(self.index))
         )
         self.owner_floor = -1
@@ -427,6 +441,7 @@ class Weights:
         self.bands = None if self.host_only else bands.Bands(self)
         if not self.host_only:
             self.measure_context()
+        if kind == "cuda":
             _observe_refusals(torch, self)
 
     def tick(self) -> int:
@@ -434,7 +449,24 @@ class Weights:
         return self.clock
 
     def stream(self) -> int:
+        if self.kind != "cuda":
+            return 0  # one command queue
         return int(self.torch._C._cuda_getCurrentRawStream(self.index))
+
+    def memory(self) -> dict[str, int]:
+        """`accel.allocation`, with a unified plane's regions taken out of torch's figures:
+        they are torch tensors there, and the plane counts them as its own (`committed`)."""
+        memory = accel.allocation(self.torch, self.kind)
+        if self.unified:
+            for name in ("allocated_bytes", "reserved_bytes"):
+                memory[name] = max(memory[name] - self.plane.committed, 0)
+        return memory
+
+    def synchronize(self) -> None:
+        if self.kind == "cuda":
+            self.torch.cuda.synchronize(self.device)
+        elif not self.host_only:
+            accel.synchronize(self.torch, self.kind)
 
     # -- budgets
 
@@ -467,10 +499,11 @@ class Weights:
         has the room: the driver keeps its own memory (fault buffers, page tables) from what
         is free, and with none left its library faulted (run 5422: SIGSEGV in libcuda after
         NV_ERR_NO_MEMORY, the laptop's free at 10 MB). Torch then runs out of memory at the
-        limit and the plane makes room, before the driver does."""
-        if self.host_only:
+        limit and the plane makes room, before the driver does. Unified memory keeps torch's
+        own limit: past the budget the system pages, which is slower, not a failure."""
+        if self.host_only or self.unified:
             return
-        memory = accel.allocation(self.torch, self.kind)
+        memory = self.memory()
         reserved = memory["reserved_bytes"]
         allowed = reserved + memory["driver_free_bytes"] - self.floor_free
         if self.cap >= 0:
@@ -506,7 +539,7 @@ class Weights:
         """Times torch dropped its whole cache to place one allocation, since the process began.
         Read at every block boundary of a stage: the allocator's own counters, without the
         flattened copy `torch.cuda.memory_stats` makes of them."""
-        if self.host_only:
+        if self.kind != "cuda":
             return 0
         return int(self.torch._C._cuda_memoryStats(self.index).get("num_alloc_retries", 0))
 
@@ -559,7 +592,7 @@ class Weights:
             self._apply(min(self.applied, max(before - own, 0)))
             self.limit_torch()
         if shared and self.room is not None:
-            free = accel.allocation(self.torch, self.kind)["driver_free_bytes"] - self.floor_free
+            free = self.memory()["driver_free_bytes"] - self.floor_free
             self.room(max(free, 0) + shared - weight_policy.MARGIN)
         self.paged_out[0] += 1
         self.paged_out[1] += own + shared
@@ -599,7 +632,7 @@ class Weights:
     def _held(self) -> tuple[Mapping[str, int], int]:
         """Torch's allocation figures, and what this process holds on the device: its context,
         torch's reserved segments and the plane's maps."""
-        memory = accel.allocation(self.torch, self.kind)
+        memory = self.memory()
         committed = max(plane.stats(self.plane).device(self.index).committed, 0)
         return memory, max(self.context_bytes, 0) + memory["reserved_bytes"] + committed
 
@@ -645,8 +678,7 @@ class Weights:
         what a kernel reads, and bound weights are read past them (a stage's resident set,
         code outside block forwards): unmapping under a queued kernel faults the device's
         MMU, which on a GPU that drives a display can hang the whole machine."""
-        if not self.host_only:
-            self.torch.cuda.synchronize(self.device)
+        self.synchronize()
 
     def vacate(self) -> int:
         """Unmap every unleased weight (an older Worker's `Vacate`) without fixing a budget:
@@ -672,7 +704,7 @@ class Weights:
     def driver_budget(self, method: str) -> int:
         """What the driver has free beside this process's weights, inside its cap and above its
         floor, less the activation growth this method measured (activations first)."""
-        memory = accel.allocation(self.torch, self.kind)
+        memory = self.memory()
         committed = max(plane.stats(self.plane).device(self.index).committed, 0)
         # torch reuses its own cached segments first; only growth beyond them needs the driver
         slack = max(memory["reserved_bytes"] - memory["allocated_bytes"], 0)
@@ -719,7 +751,7 @@ class Weights:
         unmapping. False when the device has no such room."""
         if self.host_only:
             return False
-        free = self.headroom(accel.allocation(self.torch, self.kind))
+        free = self.headroom(self.memory())
         if free < need + weight_policy.MARGIN:
             return False
         self._apply(self.applied + need + weight_policy.MARGIN)
@@ -839,9 +871,7 @@ class Weights:
         self.placing = True
         try:
             self.limit_torch()
-            short = (
-                need + weight_policy.MARGIN - self.headroom(accel.allocation(self.torch, self.kind))
-            )
+            short = need + weight_policy.MARGIN - self.headroom(self.memory())
             self.given = need if short > 0 and self.shrink(short) else 0
             self.drain()
         finally:
@@ -862,7 +892,7 @@ class Weights:
         again (45 ms on an RTX 5090, seconds on a host whose driver maps slowly, runs 9466-9479)."""
         if self.host_only:
             return
-        memory = accel.allocation(self.torch, self.kind)
+        memory = self.memory()
         idle = memory["reserved_bytes"] - memory["allocated_bytes"]
         if idle <= self.activation.get(method, 0) + weight_policy.MARGIN:
             return
@@ -906,7 +936,7 @@ class Weights:
 
     def ledger(self) -> str:
         """The device as its driver and this process count it."""
-        memory = accel.allocation(self.torch, self.kind)
+        memory = self.memory()
         device = plane.stats(self.plane).device(self.index)
         free, total = memory["driver_free_bytes"], memory["driver_total_bytes"]
         held = max(self.context_bytes, 0) + memory["reserved_bytes"] + max(device.committed, 0)
@@ -989,7 +1019,7 @@ class Weights:
 
     def allocatable(self) -> int:
         """Device bytes torch can allocate now: its headroom plus its own idle cache."""
-        memory = accel.allocation(self.torch, self.kind)
+        memory = self.memory()
         return self.headroom(memory) + max(memory["reserved_bytes"] - memory["allocated_bytes"], 0)
 
     def progressed(self, before: int, need: int, op: str = "") -> None:
@@ -1002,11 +1032,11 @@ class Weights:
         self.limit_torch()
         after = self.allocatable()
         retry = (op, after)
-        fresh = self.headroom(accel.allocation(self.torch, self.kind))
+        fresh = self.headroom(self.memory())
         if after <= before and self.room is not None:
             self.room(need + weight_policy.MARGIN)
             after = self.allocatable()
-            fresh = self.headroom(accel.allocation(self.torch, self.kind))
+            fresh = self.headroom(self.memory())
             retry = (op, after)
         repeat, self.last_retry = retry == self.last_retry, retry
         if after <= before and (fresh < need + weight_policy.MARGIN or repeat):
@@ -1102,7 +1132,7 @@ class Weights:
         device_id = self._uuid()
         row = accel.process_memories_by_device({pid}, self.kind, (device_id,))[device_id][pid]
         if row.state == "present":
-            reserved = accel.allocation(self.torch, self.kind)["reserved_bytes"]
+            reserved = self.memory()["reserved_bytes"]
             device = plane.stats(self.plane).device(self.index)
             # Shared regions (exported or attached) are the machine's to count, once: the
             # driver charges one to whichever process it picks, never this one's context.
@@ -1448,7 +1478,7 @@ class Weights:
         except plane.error("LeaseViolation"):
             # device copies still read its pinned tier (the plane's own stream): a rare
             # close (refine, unload) waits for the device, then closes
-            self.torch.cuda.synchronize(self.device)
+            self.synchronize()
             self.plane.set_vram_budget(self.index, self.applied)
             component.ws.close()
         _end_leases(component)  # after the close released every shared region
@@ -1465,7 +1495,13 @@ class Weights:
             )
         stages = [row for row in held.stages if row.device == self.index]
         copied = device.host_copy_bytes + device.bounce_copy_bytes + device.disk_copy_bytes
-        reserved = -1 if self.host_only else int(self.torch.cuda.memory_reserved(self.device))
+        reserved = (
+            -1
+            if self.host_only
+            else self.memory()["reserved_bytes"]
+            if self.unified
+            else int(self.torch.cuda.memory_reserved(self.device))
+        )
         # This process's own count (per-process NVML only refines the context in it); an
         # unmeasured context counts nothing rather than hiding the rest.
         process = (
@@ -1478,7 +1514,7 @@ class Weights:
         def gbps(nbytes: int, ns: int) -> float:
             return round(nbytes / ns, 3) if ns else 0.0
 
-        allocator = {} if self.host_only else self.torch.cuda.memory_stats(self.device)
+        allocator = {} if self.kind != "cuda" else self.torch.cuda.memory_stats(self.device)
         return PlaneFacts(
             budget_bytes=device.budget,
             committed_bytes=device.committed,
@@ -1554,7 +1590,11 @@ class _HostSpan:
 
 
 def bind(
-    torch: ModuleType, region: Region, lease: Lease | _HostSpan, *, refill: bool = False
+    torch: ModuleType,
+    region: Region,
+    lease: Lease | UnifiedLease | _HostSpan,
+    *,
+    refill: bool = False,
 ) -> bool:
     """Point the region's destinations at the lease's bytes: its home while resident, its place
     in the stage's ring while streamed. Views are cached by address (ring placements repeat
@@ -1565,7 +1605,10 @@ def bind(
     if views is None:
         if len(region.views) > weight_policy.MAX_WINDOW:
             del region.views[next(a for a in region.views if a != region.bound)]
-        views = region.views[address] = _views(torch, region, torch.from_dlpack(lease.view()))
+        view = lease.view()  # DLPack, or a unified plane's own tensor
+        base = view if isinstance(view, torch.Tensor) else torch.from_dlpack(view)
+        owned = isinstance(lease, UnifiedLease)
+        views = region.views[address] = _views(torch, region, base, owned)
     moved = region.bound != address
     if moved:
         for i, (table, name, tensor, value) in enumerate(views.writes):
@@ -1996,6 +2039,8 @@ def _generators(
     if device.type == "cuda":
         index = device.index if device.index is not None else torch.cuda.current_device()
         return [torch.cuda.default_generators[index]]
+    if device.type == "mps":
+        return [torch.mps._get_default_mps_generator()]
     return [torch.default_generator]
 
 
@@ -2034,6 +2079,8 @@ def unbind(region: Region) -> None:
         table[name] = standin if dtype == standin.dtype else _retyped(standin, dtype)
     region.derived = []
     region.bound = None
+    if any(views.owned for views in region.views.values()):
+        region.views = {a: views for a, views in region.views.items() if not views.owned}
 
 
 def _drop_copies(region: Region) -> None:
@@ -2260,7 +2307,7 @@ def stored_device(stored: dict[str, Tensor]) -> Any:
     return next(iter(stored.values())).device
 
 
-def _views(torch: ModuleType, region: Region, base: Tensor) -> Views:
+def _views(torch: ModuleType, region: Region, base: Tensor, owned: bool = False) -> Views:
     writes: list[tuple[Table, str, Tensor, Tensor]] = []
     parts: list[dict[str, Tensor]] = []
     for weight in region.weights:
@@ -2282,7 +2329,7 @@ def _views(torch: ModuleType, region: Region, base: Tensor) -> Views:
                 for role, tensor in typed.items()
                 if role not in weight.derived_roles
             )
-    return Views(writes, parts)
+    return Views(writes, parts, owned)
 
 
 def _transform(torch: ModuleType, region: Region, parts: list[dict[str, Tensor]]) -> list[Tensor]:
@@ -2751,10 +2798,15 @@ class PlaneBackend:
         self.weights.register(component)
         return component
 
-    def _source(self, name: str, checkpoint: Checkpoint, refs: Sequence[Ref]) -> Source:
+    def _source(
+        self, name: str, checkpoint: Checkpoint, refs: Sequence[Ref], layout: _Prepared
+    ) -> Source:
         """A weight set's own store source, leased over the objects it reads once they are
-        here: an explicit Store's path (tests, tools). A managed executor reads no store."""
-        if checkpoint.store is None:
+        here: an explicit Store's path (tests, tools). A managed executor reads no store; on
+        unified memory it reads the machine's verified object files, whose pages are the host
+        tier."""
+        files = self.tiers.files if self.tiers is not None and self.weights.unified else None
+        if checkpoint.store is None and files is None:
             raise _refuse(
                 "store_unusable",
                 f"{name}: the machine served no layout for this weight set, and this "
@@ -2762,6 +2814,16 @@ class PlaneBackend:
             )
         if self.weights.fetch is not None:
             self.weights.fetch.wait(checkpoint.manifest_id, refs)
+        if checkpoint.store is None and files is not None:
+            handed = files(layout.sealed, _objects(layout.plan))
+            if not handed:
+                raise _refuse("store_unusable", f"{name}: the machine served no object files")
+            try:
+                source: Source = self.weights.plane.files_source(handed, checkpoint.header)
+                return source
+            finally:
+                for _, _, fd in handed:
+                    os.close(fd)
         with store_refusals(f"leasing {name}"):
             lease = checkpoint.store.acquire(checkpoint.manifest_id, sorted(refs))
         return plane.source(self.weights.plane, checkpoint.store, lease)
@@ -2866,7 +2928,7 @@ class PlaneBackend:
                     ws = weights.plane.register_sealed(key, plan, ids, held, **handed)
                 else:
                     ws = weights.plane.register(
-                        key, self._source(name, checkpoint, refs), plan, ids, host_fd=held
+                        key, self._source(name, checkpoint, refs, layout), plan, ids, host_fd=held
                     )
             except plane.error("Invalid"):
                 if held is None:
@@ -2879,7 +2941,9 @@ class PlaneBackend:
                     os.close(fd)  # the plane duplicated each
             if ws is None:
                 held, sealed = None, False
-                ws = weights.plane.register(key, self._source(name, checkpoint, refs), plan, ids)
+                ws = weights.plane.register(
+                    key, self._source(name, checkpoint, refs, layout), plan, ids
+                )
         spans = msgspec.convert(ws.regions, list[_Span])
         placed = {row.what: row for row in msgspec.convert(ws.parts, list[_Placed])}
         sites = _sites(root, name)
@@ -3706,7 +3770,7 @@ class WeightResidency:
         everything mapped but what is leased or held, and what `components` keep resident
         (theirs is the stage's own set, just wanted)."""
         weights = self.weights
-        memory = accel.allocation(weights.torch, weights.kind)
+        memory = weights.memory()
         free = weights.headroom(memory) + max(
             memory["reserved_bytes"] - memory["allocated_bytes"], 0
         )

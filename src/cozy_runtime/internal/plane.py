@@ -8,13 +8,15 @@ budgets; TensorFS implements the operations. Facts Runtime reads back are typed 
 
 from __future__ import annotations
 
-import ctypes
 import fcntl
 import os
+import sys
 from typing import TYPE_CHECKING, Final
 
 import msgspec
 from tensorfs import plane as _plane
+
+from cozy_runtime.internal import seam
 
 if TYPE_CHECKING:
     from tensorfs import ReadLease, Store
@@ -167,17 +169,15 @@ def is_sealed(fd: int) -> bool:
 
 
 def sealed_memfd(name: str, body: bytes) -> int:
-    """`body` in a new memfd, sealed: a document that crosses beside its request."""
-    # libc's own: python-build-standalone's old glibc build lacks `os.memfd_create`.
-    # MFD_CLOEXEC | MFD_ALLOW_SEALING
-    fd: int = ctypes.CDLL(None, use_errno=True).memfd_create(name.encode(), 0x1 | 0x2)
-    if fd < 0:
-        raise OSError(ctypes.get_errno(), "memfd_create")
+    """`body` in a new memfd, sealed: a document that crosses beside its request. macOS has
+    no memfd and no seals: there it is an unlinked file, which no path names."""
+    fd = seam.anonymous(name, sealing=True)
     try:
         view = memoryview(body)
         while view:
             view = view[os.write(fd, view) :]
-        fcntl.fcntl(fd, _ADD_SEALS, _SEALS)
+        if sys.platform == "linux":
+            fcntl.fcntl(fd, _ADD_SEALS, _SEALS)
     except BaseException:
         os.close(fd)
         raise

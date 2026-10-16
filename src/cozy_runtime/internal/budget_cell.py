@@ -14,16 +14,16 @@ capability writes one.
 
 from __future__ import annotations
 
-import ctypes
 import mmap
 import os
 import struct
+
+from cozy_runtime.internal import seam
 
 #: asked, wanted, done, applied
 _LAYOUT = struct.Struct("<qqqq")
 #: `wanted` at or below this is a process cap of `CAP - wanted` bytes
 CAP = -2
-_MFD_CLOEXEC = 1
 
 
 class Cell:
@@ -35,10 +35,7 @@ class Cell:
     @classmethod
     def create(cls) -> tuple[Cell, int]:
         """A fresh cell and its memfd (the caller hands the fd on, then closes it)."""
-        # libc's own: python-build-standalone's old glibc build lacks `os.memfd_create`
-        fd = ctypes.CDLL(None, use_errno=True).memfd_create(b"cozy-budget-cell", _MFD_CLOEXEC)
-        if fd < 0:
-            raise OSError(ctypes.get_errno(), "memfd_create")
+        fd = seam.anonymous("cozy-budget-cell")
         os.ftruncate(fd, _LAYOUT.size)
         return cls(fd), fd
 
