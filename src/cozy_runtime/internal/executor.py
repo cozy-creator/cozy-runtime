@@ -3448,6 +3448,8 @@ class Executor:
                 record.emit(
                     "confession", "attention.sol.kernel", fields.pop("source"), rank=0, **fields
                 )
+            for row in attention.failures(served_attention.totals(), sol_kernels):
+                record.emit("log", "attention kernel failed, a fallback served", "warn", **row)
         # Nothing was swapped, so the restore left the sites exactly as the entry walk read them.
         restored = (
             served_attention

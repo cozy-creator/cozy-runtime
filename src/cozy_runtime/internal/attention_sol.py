@@ -388,13 +388,39 @@ def compile_variant(route: str, blocks: int = 0, full: bool = False) -> bytes:
     else:
         operator = upstream.forward if route == "sm100" else upstream.make_kernel()
         scalars = (0, 0)  # the sink's first and last block
-    compiled = cute.compile(
-        operator, *arguments, _SCALE, *scalars, stream=cuda.CUstream(0), options=OPTIONS
-    )
+    with _architecture_answers():
+        compiled = cute.compile(
+            operator, *arguments, _SCALE, *scalars, stream=cuda.CUstream(0), options=OPTIONS
+        )
     with tempfile.TemporaryDirectory(prefix="cozy-kernel-") as scratch:
         path = Path(scratch) / "kernel.o"
         compiled.export_to_c(object_file_path=str(path), function_name=FUNCTION)
         return path.read_bytes()
+
+
+@contextmanager
+def _architecture_answers() -> Iterator[None]:
+    """CuTe-DSL asks the driver one device fact while tracing: a launch with
+    `min_blocks_per_mp > 1` (SM100's) sizes its shared-memory carveout from the card's shared
+    memory per SM. A GPU-less build has no driver to ask (`CUDA_ERROR_NOT_INITIALIZED`), and the
+    target fixes the answer: the DSL's own per-block capacity plus the 1 KiB a block reserves."""
+    helpers = import_module("cutlass.base_dsl.runtime.cuda")
+    dsl = import_module("cutlass.cutlass_dsl")
+    asked = helpers.get_device_attribute
+    attributes = helpers.cuda.CUdevice_attribute
+    per_sm = attributes.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR
+
+    def answer(attribute: Any, device_id: int = 0) -> Any:
+        if attribute != per_sm:
+            return asked(attribute, device_id)
+        arch = dsl.CuTeDSL._get_dsl().get_arch_enum()
+        return dsl.SMEM_CAPACITY_MAP[f"sm_{arch.major}{arch.minor}"] + 1024
+
+    helpers.get_device_attribute = answer
+    try:
+        yield
+    finally:
+        helpers.get_device_attribute = asked
 
 
 def build(spec: dict[str, Any], staging: Path, report: Callable[..., None]) -> dict[str, object]:
