@@ -243,11 +243,12 @@ def _entries() -> list[TritonEntry]:
     weight = {"w_ptr": "*u8", "s_ptr": "*u8", "two_ptr": "*fp32", "x_ptr": "*bf16"}
 
     def signature(kernel: triton.JITFunction, **types: str) -> dict[str, str]:
+        # Constexprs by the kernel's own annotations: N and K are runtime sizes.
         return {
-            name: types.get(name)
-            or weight.get(name)
-            or ("constexpr" if name.isupper() else "*bf16" if name.endswith("_ptr") else "i32")
-            for name in kernel.arg_names
+            p.name: types.get(p.name)
+            or weight.get(p.name)
+            or ("constexpr" if p.is_constexpr else "*bf16" if p.name.endswith("_ptr") else "i32")
+            for p in kernel.params
         }
 
     entries = [
