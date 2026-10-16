@@ -847,6 +847,53 @@ class Weights:
         if idle > self.activation.get(method, 0) + weight_policy.MARGIN:
             accel.release_cached(self.torch, self.kind)
 
+    def within_device(self, budget: int) -> int:
+        """A map was refused at `budget`: torch, another process or the machine's custody holds
+        what it counted on. The budget held to what the device gives the plane now beside the
+        stage's activations (torch's idle cache back first), so the plane's idle chunks go back
+        and its least recently used regions leave; never below the open stages' floor: past
+        it, weights stream from host. The request's record keeps the device as it was at the
+        first refusal."""
+        self.modes.setdefault("short of device memory", self.ledger())
+        accel.release_cached(self.torch, self.kind)
+        memory, held = self._held()
+        free = memory["driver_free_bytes"] - self.floor_free
+        if self.cap >= 0:
+            free = min(free, self.cap - held)
+        method = self.open[-1][1] if self.open else ""
+        # an adaptive stage fits its activations to the room it finds: it asks for none
+        growth = 0 if method in self.adaptive else self.activation.get(method, 0)
+        given = weight_policy.plane_budget(self._committed() + free, growth)
+        return min(budget, max(given, self.floor()))
+
+    def reclaim(self, need: int, asked: bool) -> tuple[bool, bool]:
+        """Room for `need` bytes the budget cannot give, each source only once those before
+        gave none: a component no stage uses (the machine's custody too), the owner (asked
+        once), this process's tensors moved to host memory. Whether any gave room, and whether
+        the owner was asked."""
+        self.modes.setdefault("short of device memory", self.ledger())
+        if self.page_out(_in_use(self), need + weight_policy.MARGIN):
+            return True, asked
+        if not asked and self.room is not None and self.cap >= 0:
+            self.room(need + weight_policy.MARGIN)
+            return True, True
+        return self.spill(need, ()), asked
+
+    def ledger(self) -> str:
+        """The device as its driver and this process count it."""
+        memory = accel.allocation(self.torch, self.kind)
+        device = plane.stats(self.plane).device(self.index)
+        free, total = memory["driver_free_bytes"], memory["driver_total_bytes"]
+        held = max(self.context_bytes, 0) + memory["reserved_bytes"] + max(device.committed, 0)
+        return (
+            f"driver {free} B free of {total}; this process {held} (context {self.context_bytes}, "
+            f"torch {memory['reserved_bytes']} reserved, {memory['allocated_bytes']} allocated, "
+            f"{self.decoded()} of them decoded weights; plane {device.committed} of its "
+            f"{device.budget} budget, {device.leased_bytes + device.held_bytes} leased); "
+            f"{device.shared_bytes} mapped from the machine; cap {self.cap}; elsewhere "
+            f"{total - free - held}"
+        )
+
     def spill(self, need: int, operands: Sequence[object]) -> bool:
         """The last room an op is given: this process's own tensors move to page-locked host
         memory (`spill`), the op's operands last, never more than half of what the host has
@@ -3236,9 +3283,9 @@ class WeightResidency:
         self.pressure = (weights.allocatable(), weights.retries())
 
     def _acquire_common(self, method: str, component: Component, budget: int, stream: Any) -> Any:
-        """The stage's common region's lease; short of device memory, the owner is asked for
-        room once, then this process's own tensors move to host memory, the plane growing into
-        the room each gives, before that is reported."""
+        """The stage's common region's lease; short of device memory, the plane is held to
+        what the device gives, then room comes back (`reclaim`), the plane growing into it,
+        before that is reported."""
         weights = self.weights
         assert component.common is not None
         span, asked = component.common.span, False
@@ -3248,19 +3295,25 @@ class WeightResidency:
                     component.ws, weights.index, component.common.index, stream
                 )
             except self._capacity as exc:
-                if not asked and weights.room is not None and weights.cap >= 0:
-                    asked = True
-                    weights.room(span + weight_policy.MARGIN)
-                elif not weights.spill(span, ()):
-                    raise self._shortfall(method, span, budget, str(exc)) from None
+                lowered = weights.within_device(budget)
+                if lowered < budget:
+                    budget = lowered
+                    weights._apply(budget)
+                    continue
+                gave, asked = weights.reclaim(span, asked)
+                if not gave:
+                    raise self._shortfall(
+                        method, span, budget, f"{exc}; {weights.ledger()}"
+                    ) from None
                 weights.grow(span)
 
     def _place(self, budget: int, resume: Mapping[str, int] = {}) -> int:
-        """`_plan` the open stages in `budget`. When the driver itself has less (another
-        process, or torch's idle cache, holds it), plan again inside what it has now, never
-        above `budget` and never below a two-block streaming window. When binding runs out
-        of device memory (it decodes and converts weights into torch's bytes, and torch may
-        hold more than the budget knew), plan again in what is left. Returns the budget used."""
+        """`_plan` the open stages in `budget`. When the device refuses a map (another process,
+        torch or the machine's custody holds what the budget counted on), plan again inside
+        what it gives now, never below the open stages' floor, and past that reclaim room
+        (`Weights.reclaim`). When binding runs out of device memory (it decodes and converts
+        weights into torch's bytes, and torch may hold more than the budget knew), plan again
+        in what is left. Returns the budget used."""
         weights = self.weights
         placing, weights.placing = weights.placing, True
         try:
@@ -3272,24 +3325,16 @@ class WeightResidency:
         weights = self.weights
         method = weights.open[-1][1]
         weights.quiesce()  # a plan unmaps: other components' sets, this one's stale regions
-        pooled = False
         asked = False
         while True:
             oom: tuple[int, str] | None = None
+            refused: tuple[int, str] | None = None
             try:
                 self._plan(budget, resume)
                 weights.limit_torch()
                 return budget
             except self._budget_error as exc:
-                if pooled or not _device_pool(exc):
-                    if not asked and weights.room is not None and weights.cap >= 0:
-                        asked = True
-                        weights.room(weight_policy.MARGIN)
-                    elif not weights.spill(weights.window(), ()):
-                        raise self._shortfall(method, 0, budget, str(exc)) from None
-                    budget = max(budget, weights.driver_budget(method))
-                    continue
-                pooled = True
+                refused = (int(getattr(exc, "requested", 0)), str(exc))
             except ResidencyRefusal as exc:
                 # Short when the plane placed the plan: the owner makes room once (its idle
                 # tenants leave), then this process's own tensors move to host memory, and the
@@ -3313,11 +3358,21 @@ class WeightResidency:
             if oom is not None:
                 budget, asked = self._after_bind(budget, method, *oom, asked=asked)
                 continue
-            accel.release_cached(weights.torch, weights.kind)
-            window = sum(
-                c.planned.common + 2 * c.planned.largest for _, _, c in weights.opened().values()
-            )
-            budget = min(budget, max(weights.driver_budget(method), window))
+            # A map the device refused: the plan is held to what it gives, then room comes back.
+            assert refused is not None
+            need, failed = refused
+            lowered = weights.within_device(budget)
+            if lowered < budget:
+                budget = lowered
+                continue
+            gave, asked = weights.reclaim(need, asked)
+            if not gave:
+                raise self._shortfall(
+                    method,
+                    max(weights.floor(), need),
+                    weights._committed() + weights.allocatable(),
+                    f"{failed}; {weights.ledger()}",
+                )
 
     def _after_bind(
         self, budget: int, method: str, need: int, failed: str, asked: bool = False
@@ -4582,15 +4637,6 @@ def _costs(
         }
         out[key] = weight_policy.Costs(compute=compute, link_bps=link)
     return out
-
-
-def _device_pool(exc: BaseException) -> bool:
-    """A `BudgetExceeded` from the driver itself (no memory left to map), not the budget.
-    The plane names the pool only in its message today (W1 R23)."""
-    pool = getattr(exc, "pool", None)
-    if pool is not None:
-        return bool(pool == "device")
-    return str(exc).startswith("budget exceeded in device")
 
 
 def _hosts(args: tuple[Any, ...], kwargs: Mapping[str, Any]) -> bool:
