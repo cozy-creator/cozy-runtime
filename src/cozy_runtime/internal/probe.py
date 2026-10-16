@@ -1141,8 +1141,8 @@ def settled(provider: Provider, device: DeviceFacts) -> Evidence | None:
         # Qualifying a leaf on a card whose kernel it does not claim would mint a record whose
         # predicate says this card.
         return UnmeasuredEvidence(
-            note=f"{provider.name} declares the floor {provider.device_predicate} and this "
-            f"device is {device.predicate}; its suite is not run and it mints no record"
+            note=f"its kernel needs {provider.device_predicate} and this device is "
+            f"{device.predicate}"
         )
     return None
 
@@ -1176,7 +1176,8 @@ def make_observation(
 
 
 def admission_table(result: QualificationResult) -> Capabilities:
-    """Observations -> the admission table. A FAILED observation mints no record."""
+    """Observations -> the admission table. A FAILED observation mints no record; its reason
+    is kept, so a tensor served by another route can say why."""
     return Capabilities(
         [
             CapabilityRecord(
@@ -1202,8 +1203,27 @@ def admission_table(result: QualificationResult) -> Capabilities:
             )
             for observation in result.observations
             if observation.evidence.passed
-        ]
+        ],
+        {
+            (o.encoding_spec_id, o.implementation_digest, o.output_dtype): _refusal(o.evidence)
+            for o in result.observations
+            if not o.evidence.passed
+        },
     )
+
+
+def _refusal(evidence: Evidence) -> str:
+    """Why a failed observation minted no record, in one clause."""
+    match evidence:
+        case NativeEvidence(numerics=numerics):
+            return numerics.kernel or (
+                f"its GEMM measured {numerics.deviation_rel:.3g} relative error against the "
+                f"{numerics.tolerance} bound (finite {numerics.finite}, out {numerics.out_dtype})"
+            )
+        case DecodeEvidence():
+            return "its decode failed the format oracle or the spec's vectors"
+        case _:
+            return evidence.note
 
 
 def _leaf_speedup(evidence: Evidence) -> float:
