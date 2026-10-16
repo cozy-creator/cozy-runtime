@@ -193,7 +193,7 @@ class _Capability:
 
     @property
     def major_minor(self) -> tuple[int, int]:
-        if self.variant == "cpu":
+        if self.variant in _NO_CUDA:
             return (0, 0)
         digits = self.variant.removeprefix("sm")
         if not digits.isdigit() or len(digits) < 2:
@@ -202,6 +202,10 @@ class _Capability:
                 f"{self.variant!r} is not an sm<major><minor> variant name",
             )
         return int(digits[:-1]), int(digits[-1])
+
+
+#: Hardware variants with no CUDA card: constructions there see none.
+_NO_CUDA = ("cpu", "mps")
 
 
 @contextmanager
@@ -220,7 +224,7 @@ def _capability(cap: _Capability) -> Iterator[None]:
 
         return answer
 
-    cuda = cap.variant != "cpu"
+    cuda = cap.variant not in _NO_CUDA
     torch.cuda.get_device_capability = mark(cap.major_minor)  # type: ignore[assignment]
     torch.cuda.get_device_name = mark(cap.variant)  # type: ignore[assignment]
     torch.cuda.is_available = mark(cuda, read=False)  # type: ignore[assignment]

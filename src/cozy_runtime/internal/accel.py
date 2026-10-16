@@ -3,23 +3,19 @@
 Backends are `cuda` and `mps`, period — the no-device-zoo rule of #422 stands; what #447
 amends is WHERE the branch lives. Every `if backend == "mps"` belongs HERE, not spread
 through lifecycle, fill and ledger paths. Enumerated implementations, no registration
-mechanism: an unimplemented (backend, operation) pair refuses TYPED, naming cr-021 as the
-lane that fills it.
+mechanism: an unimplemented (backend, operation) pair refuses TYPED.
 
 The surface is exactly the set of device operations the runtime actually performs, and no
 more: context init, the OOM primitive, the memory meters, the eviction fence, quiescence,
-device identity, the forced child-env law, the qualification gate. It grew to that set
-rather than being guessed at — every function here has a caller, because a half-populated
-boundary hands the cr-021 MPS lane the exact scatter #447 was written to prevent (#496c).
-
-`fill.py`'s stream/event machinery is CUDA IMPLEMENTATION CODE behind this boundary (the
-MPS lane lands its own fill path behind the same names), not a violation of it. Callers
-hand in their `torch` module; this module imports none.
+device identity, the memory class and its budget, the forced child-env law, the
+qualification gate. Callers hand in their `torch` module; this module imports none.
 """
 
 from __future__ import annotations
 
 import ctypes
+import os
+import platform
 import re
 import subprocess
 import sys
@@ -46,13 +42,12 @@ _NVML_ERROR_INSUFFICIENT_SIZE = 7
 
 
 class AcceleratorUnsupported(Exception):
-    """This (backend, operation) has no implementation yet — typed, with its lane."""
+    """This (backend, operation) has no implementation — typed."""
 
     def __init__(self, backend: str, operation: str) -> None:
-        lane = "cr-021" if backend == "mps" else "unplanned"
         super().__init__(
-            f"accel.{operation} has no {backend!r} implementation yet — {lane} owns it; "
-            "refusing typed beats silently serving through a path that was never measured"
+            f"accel.{operation} has no {backend!r} implementation; refusing typed beats "
+            "silently serving through a path that was never measured"
         )
         self.backend = backend
         self.operation = operation
@@ -383,16 +378,17 @@ def device_memory(device: str, kind: str) -> DeviceMemory:
 def synchronize(torch: Any, kind: str) -> None:
     """A device-order fence for `kind`. `cpu` is a no-op (host code is already ordered)."""
     if kind == "mps":
-        raise AcceleratorUnsupported("mps", "synchronize")
-    if kind == "cuda":
+        torch.mps.synchronize()
+    elif kind == "cuda":
         torch.cuda.synchronize()
 
 
 def drain(torch: Any, kind: str) -> None:
-    """Wait for the CURRENT stream only: the caller's own queued work, not other streams'."""
+    """Wait for the CURRENT stream only: the caller's own queued work, not other streams'.
+    MPS has one command queue per process: its drain is a synchronize."""
     if kind == "mps":
-        raise AcceleratorUnsupported("mps", "drain")
-    if kind == "cuda":
+        torch.mps.synchronize()
+    elif kind == "cuda":
         torch.cuda.current_stream().synchronize()
 
 
@@ -406,10 +402,10 @@ ALLOCATOR = "expandable_segments:True"
 def initialize(torch: Any, kind: str) -> None:
     """Bring the accelerator context up EAGERLY, so its cost is a measured prepare step
     rather than a surprise inside the first kernel. torch's allocator is configured first."""
-    if kind == "mps":
-        raise AcceleratorUnsupported("mps", "initialize")
     if sees_no_gpu():
         raise RuntimeError("this process sees no GPU (CUDA_VISIBLE_DEVICES is empty)")
+    if kind == "mps" and not torch.backends.mps.is_available():
+        raise RuntimeError("this Mac's torch has no usable MPS device")
     if kind == "cuda":
         torch._C._accelerator_setAllocatorSettings(ALLOCATOR)
         torch.cuda.init()
@@ -435,9 +431,8 @@ def first_launches(torch: ModuleType, kind: str) -> None:
 
 
 def initialized(torch: Any, kind: str) -> bool:
-    """Whether device initialization already escaped Runtime's explicit init boundary."""
-    if kind == "mps":
-        return False
+    """Whether device initialization already escaped Runtime's explicit init boundary. MPS
+    has no context to pick a device with: there is one GPU."""
     if kind == "cuda":
         return bool(torch.cuda.is_initialized())
     return False
@@ -445,10 +440,9 @@ def initialized(torch: Any, kind: str) -> bool:
 
 def oom_error(torch: Any, kind: str) -> type[BaseException]:
     """The OOM exception CLASS, for an `except` clause that must name the type before an
-    instance exists. An instance is classified by `author._errors.is_device_oom`."""
-    if kind == "mps":
-        raise AcceleratorUnsupported("mps", "oom_error")
-    cls = getattr(torch.cuda, "OutOfMemoryError", None)
+    instance exists. An instance is classified by `author._errors.is_device_oom`: MPS also
+    refuses a buffer larger than Metal allows as a plain RuntimeError."""
+    cls = getattr(torch, "OutOfMemoryError", None)
     if not isinstance(cls, type):  # pragma: no cover - a torch without the class
         raise AcceleratorUnsupported(kind, "oom_error")
     return cls
@@ -456,9 +450,16 @@ def oom_error(torch: Any, kind: str) -> type[BaseException]:
 
 def allocation(torch: Any, kind: str, device: Any = None) -> dict[str, int]:
     """The allocator's live numbers plus the driver's own view — the only number that sees
-    other processes. MPS lands here with driver_allocated vs recommended_max (#450)."""
+    other processes. On unified memory the device is this process's budget
+    (`unified_budget`) and the driver's figure counts this process's Metal buffers only."""
     if kind == "mps":
-        raise AcceleratorUnsupported("mps", "allocation")
+        driver, total = int(torch.mps.driver_allocated_memory()), unified_budget(torch)
+        return {
+            "allocated_bytes": int(torch.mps.current_allocated_memory()),
+            "reserved_bytes": driver,
+            "driver_free_bytes": max(total - driver, 0),
+            "driver_total_bytes": total,
+        }
     free, total = torch.cuda.mem_get_info(device)
     return {
         "allocated_bytes": int(torch.cuda.memory_allocated(device)),
@@ -473,7 +474,7 @@ def allocated(torch: Any, kind: str, device: Any = None) -> int:
     residency plane reads this on every stage and every eviction, and the driver query
     `allocation` also makes is far too expensive to ride along on that path."""
     if kind == "mps":
-        raise AcceleratorUnsupported("mps", "allocated")
+        return int(torch.mps.current_allocated_memory())
     return int(torch.cuda.memory_allocated(device))
 
 
@@ -485,14 +486,13 @@ _HELD = [0, 0]
 def reserved(torch: ModuleType, kind: str) -> int:
     """The allocator's reserved bytes ALONE: live tensors plus its idle cache."""
     if kind == "mps":
-        raise AcceleratorUnsupported("mps", "reserved")
+        return int(torch.mps.driver_allocated_memory())
     return int(torch.cuda.memory_reserved())
 
 
 def reset_peak(torch: Any, kind: str) -> None:
-    """Zero the high-water mark, so the next `peak_allocated` measures ONE attempt."""
-    if kind == "mps":
-        raise AcceleratorUnsupported("mps", "reset_peak")
+    """Zero the high-water mark, so the next `peak_allocated` measures ONE attempt. MPS keeps
+    no high-water mark: its peaks are the figures read when asked."""
     _HELD[:] = [0, 0]
     if kind == "cuda":
         torch.cuda.reset_peak_memory_stats()
@@ -502,16 +502,20 @@ def hold_peak(torch: ModuleType, kind: str) -> None:
     """Keep the high-water marks so far for `peak_allocated`/`peak_reserved` and zero torch's:
     what runs next is measured on its own (`section_peak`)."""
     _HELD[:] = [peak_allocated(torch, kind), peak_reserved(torch, kind)]
-    torch.cuda.reset_peak_memory_stats()
+    if kind == "cuda":
+        torch.cuda.reset_peak_memory_stats()
 
 
 def drop_peak(torch: ModuleType, kind: str) -> None:
     """Forget the high-water mark since `hold_peak`: that section failed."""
-    torch.cuda.reset_peak_memory_stats()
+    if kind == "cuda":
+        torch.cuda.reset_peak_memory_stats()
 
 
 def section_peak(torch: ModuleType, kind: str) -> int:
     """The high-water mark since `hold_peak`."""
+    if kind == "mps":
+        return allocated(torch, kind)
     return int(torch.cuda.max_memory_allocated())
 
 
@@ -519,7 +523,7 @@ def peak_allocated(torch: Any, kind: str) -> int:
     """The high-water mark since the last `reset_peak` — the number the ledger prices an
     attempt's activations from, which the live figure structurally cannot give."""
     if kind == "mps":
-        raise AcceleratorUnsupported("mps", "peak_allocated")
+        return max(allocated(torch, kind), _HELD[0])
     return max(int(torch.cuda.max_memory_allocated()), _HELD[0])
 
 
@@ -527,7 +531,7 @@ def peak_reserved(torch: Any, kind: str) -> int:
     """The allocator's reserved high-water mark since the last `reset_peak`: live tensors plus
     the segments torch held for them, which is what a stage takes from the device."""
     if kind == "mps":
-        raise AcceleratorUnsupported("mps", "peak_reserved")
+        return max(reserved(torch, kind), _HELD[1])
     return max(int(torch.cuda.max_memory_reserved()), _HELD[1])
 
 
@@ -539,12 +543,10 @@ RELEASED: dict[str, list[int]] = {}
 def release_cached(torch: Any, kind: str) -> None:
     """Return the caching allocator's UNUSED segments to the driver. Frees nothing the
     process still holds; it is what makes an eviction visible to other processes."""
-    if kind == "mps":
-        raise AcceleratorUnsupported("mps", "release_cached")
-    if kind == "cuda":
-        before = int(torch.cuda.memory_reserved())
-        torch.cuda.empty_cache()
-        if (freed := before - int(torch.cuda.memory_reserved())) > 0:
+    if kind in BACKENDS:
+        before = reserved(torch, kind)
+        (torch.mps if kind == "mps" else torch.cuda).empty_cache()
+        if (freed := before - reserved(torch, kind)) > 0:
             row = RELEASED.setdefault(sys._getframe(1).f_code.co_name, [0, 0])
             row[0] += 1
             row[1] += freed
@@ -555,7 +557,9 @@ def completion_event(torch: Any, kind: str) -> Any:
     The residency plane's eviction fence: bytes a kernel may still read are not evictable
     until this queries true."""
     if kind == "mps":
-        raise AcceleratorUnsupported("mps", "completion_event")
+        event = torch.mps.Event()
+        event.record()
+        return event
     event = torch.cuda.Event()
     event.record(torch.cuda.current_stream())
     return event
@@ -565,7 +569,7 @@ def streams_idle(torch: Any, kind: str) -> bool:
     """Whether the device has nothing outstanding. The device's OWN answer to quiescence,
     which is why a terminal may be recorded on it rather than on a timer."""
     if kind == "mps":
-        raise AcceleratorUnsupported("mps", "streams_idle")
+        return bool(completion_event(torch, kind).query())
     return bool(torch.cuda.current_stream().query() and torch.cuda.default_stream().query())
 
 
@@ -573,7 +577,7 @@ def present(torch: Any, kind: str) -> bool:
     """Whether THIS backend is actually usable in this process. `False` is a fact, not a
     refusal: a torch-bearing process with no card is a legitimate weightless executor."""
     if kind == "mps":
-        raise AcceleratorUnsupported("mps", "present")
+        return not sees_no_gpu() and bool(torch.backends.mps.is_available())
     return not sees_no_gpu() and bool(torch.cuda.is_available())
 
 
@@ -593,7 +597,13 @@ def device_identity(torch: Any, kind: str, index: int = 0) -> dict[str, Any]:
     the SELECTED device index. Both ride the key.
     """
     if kind == "mps":
-        raise AcceleratorUnsupported("mps", "device_identity")
+        # Apple's GPU is the chip's; its "driver" is the macOS release (bf16 needs 14).
+        return {
+            "name": apple_chip(),
+            "sm": 0,
+            "cuda_runtime": "",
+            "driver_api": f"macOS {platform.mac_ver()[0] or 'unreadable'}",
+        }
     major, minor = torch.cuda.get_device_capability(index)
     api = getattr(getattr(torch, "_C", None), "_cuda_getDriverVersion", None)
     return {
@@ -611,10 +621,7 @@ def host_backend_family() -> Literal["cuda", "mps"]:
     """The accelerator FAMILY this host could serve — `mps` on Apple silicon, else `cuda`.
     A platform fact, not a capability claim (present-but-unqualified, #446); cheap enough
     for the spawn path, unlike hostfacts' nvidia-smi measurement."""
-    import platform as _platform
-    import sys as _sys
-
-    if _sys.platform == "darwin" and _platform.machine() == "arm64":
+    if sys.platform == "darwin" and platform.machine() == "arm64":
         return "mps"
     return "cuda"
 
@@ -627,21 +634,104 @@ def child_env_law(kind: str) -> dict[str, str]:
 
 
 def qualification_gate(kind: str) -> None:
-    """Refuses qualification on a backend whose probe suite does not exist yet. cr-006's
-    suite is CUDA; the MPS suite must qualify the ACTUAL package graph, not one matmul
-    (#450), and lands with cr-021.
-
-    `cpu` PASSES, and it is the same reading `present` already takes: a torch-bearing
-    process with no card is a legitimate weightless executor, not a refusal, and cr-006's
-    decode arithmetic is the identical arithmetic there — the suite qualifies it honestly
-    and mints records predicated on `cpu`, which no CUDA fill can then satisfy. The whole
-    point of this gate is that a backend with no measured suite mints NO records rather
-    than inheriting someone else's, and that is a statement about `mps`, not about the
-    absence of an accelerator.
-    """
-    if kind == "cpu":
-        return
-    if kind not in BACKENDS:
+    """Refuses qualification on a backend with no probe suite. The decode suite is the same
+    arithmetic on every backend, so it qualifies `cuda`, `mps` and `cpu` alike and mints
+    records predicated on the device it ran on, which no other device's fill can satisfy."""
+    if kind != "cpu" and kind not in BACKENDS:
         raise AcceleratorUnsupported(kind, "qualification")
-    if kind == "mps":
-        raise AcceleratorUnsupported("mps", "qualification")
+
+
+# ------------------------------------------------------------------- memory classes
+
+#: What macOS and the user's other apps keep of a unified pool, beside Metal's own limit.
+HOST_RESERVE = 2 << 30
+
+
+def memory_class(kind: str) -> Literal["discrete", "unified"]:
+    """How the device's memory relates to the host's (design §6.2). `unified`: one pool, so
+    weights never page between a host and a device tier and "offload to CPU" frees nothing.
+    Apple GPUs are unified; CUDA cards are discrete here (coherent and integrated CUDA
+    machines are TensorD's to detect)."""
+    return "unified" if kind == "mps" else "discrete"
+
+
+def unified_budget(torch: ModuleType) -> int:
+    """The bytes one unified-memory process may hold: Metal's recommended working set, within
+    physical RAM less what the system keeps, and within what it holds plus what the system has
+    available now (shared mode follows memory pressure: past it, macOS swaps)."""
+    ram = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    held = int(torch.mps.driver_allocated_memory())
+    return max(
+        min(int(torch.mps.recommended_max_memory()), ram - HOST_RESERVE, held + _available()), 0
+    )
+
+
+class _VmStatistics64(ctypes.Structure):
+    """`vm_statistics64` (`<mach/vm_statistics.h>`), as `host_statistics64` fills it."""
+
+    _fields_ = (
+        ("free", ctypes.c_uint32),
+        ("active", ctypes.c_uint32),
+        ("inactive", ctypes.c_uint32),
+        ("wired", ctypes.c_uint32),
+        ("events", ctypes.c_uint64 * 9),
+        ("purgeable", ctypes.c_uint32),
+        ("speculative", ctypes.c_uint32),
+        ("compressor", ctypes.c_uint64 * 4),
+        ("pages", ctypes.c_uint32 * 4),
+        ("uncompressed", ctypes.c_uint64),
+    )
+
+
+_HOST_VM_INFO64 = 4
+_libc = ctypes.CDLL(None) if sys.platform == "darwin" else None
+
+
+def _available() -> int:
+    """Bytes macOS can give without paging: free, speculative, purgeable and inactive pages."""
+    assert _libc is not None
+    stats = _VmStatistics64()
+    count = ctypes.c_uint32(ctypes.sizeof(stats) // 4)
+    host = _libc.mach_host_self()
+    if _libc.host_statistics64(host, _HOST_VM_INFO64, ctypes.byref(stats), ctypes.byref(count)):
+        raise OSError("host_statistics64 refused")
+    pages = int(stats.free) + int(stats.speculative) + int(stats.purgeable) + int(stats.inactive)
+    return pages * os.sysconf("SC_PAGE_SIZE")
+
+
+def bf16_supported(kind: str) -> bool:
+    """Whether the backend computes bfloat16: MPS does from macOS 14 on."""
+    if kind != "mps":
+        return True
+    major = platform.mac_ver()[0].partition(".")[0]
+    return major.isdigit() and int(major) >= 14
+
+
+def apple_chip() -> str:
+    """The Apple chip's own name (`Apple M4 Pro`), or `apple` where sysctl says nothing."""
+    with suppress(OSError, subprocess.SubprocessError):
+        found = subprocess.run(
+            ["sysctl", "-n", "machdep.cpu.brand_string"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        if found:
+            return found
+    return "apple"
+
+
+#: What a backend serves without, and what serves instead: one run warning each.
+UNAVAILABLE: dict[str, tuple[tuple[str, str], ...]] = {
+    "mps": (
+        ("weight plane GPU and pinned tiers", "weights are read from the page cache"),
+        ("native CUDA kernels and Triton", "PyTorch's own MPS kernels"),
+        ("fp8 and nvfp4 lanes", "16-bit weights"),
+        ("custom attention kernels", "PyTorch SDPA"),
+    ),
+}
+
+
+def unavailable(kind: str) -> tuple[tuple[str, str], ...]:
+    """The features this backend turns off, each with what serves in its place."""
+    return UNAVAILABLE.get(kind, ())

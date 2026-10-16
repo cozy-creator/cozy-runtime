@@ -116,6 +116,8 @@ def sdpa_impl(query: Tensor, key: Tensor, value: Tensor, options: Options) -> st
     import torch
     from torch.nn.attention import SDPBackend
 
+    if query.is_mps:  # MPS has no backend choice: its SDPA is its own fused kernel
+        return "mps"
     q, k, v = (tensor.transpose(1, 2) for tensor in (query, key, value))
     mask = options["attn_mask"]
     if mask is not None and mask.ndim == 2:

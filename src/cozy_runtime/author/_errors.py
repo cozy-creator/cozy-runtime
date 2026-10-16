@@ -106,7 +106,7 @@ def ends(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     head = limit // 4
-    return f"{text[:head]} [...] {text[len(text) - (limit - head - 7):]}"
+    return f"{text[:head]} [...] {text[len(text) - (limit - head - 7) :]}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,8 +163,9 @@ DEVICE_OOM = "device_out_of_memory"
 
 def is_device_oom(exc: BaseException) -> bool:
     """A device allocation failure, recognized WITHOUT importing torch: torch's
-    `OutOfMemoryError`, an asynchronous `AcceleratorError` for cudaErrorMemoryAllocation, or
-    a cuBLAS/cuDNN workspace allocation that failed inside a library call.
+    `OutOfMemoryError`, an asynchronous `AcceleratorError` for cudaErrorMemoryAllocation, a
+    cuBLAS/cuDNN workspace allocation that failed inside a library call, or MPS's plain
+    RuntimeError for a pool past its limit or one buffer larger than Metal allows.
 
     This module is the author kernel's and it is deliberately dependency-free — the
     worker imports it and the worker has no torch. The identity is therefore structural:
@@ -182,6 +183,8 @@ def is_device_oom(exc: BaseException) -> bool:
             "CUDA error: out of memory",
             "CUBLAS_STATUS_ALLOC_FAILED",
             "CUDNN_STATUS_ALLOC_FAILED",
+            "MPS backend out of memory",
+            "Invalid buffer size",
         )
     )
 

@@ -26,12 +26,15 @@ from __future__ import annotations
 
 import array
 import contextlib
+import ctypes
 import fcntl
 import json
 import os
 import socket
 import stat
 import struct
+import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -258,6 +261,8 @@ class Channel:
                 valid = valid and len(data) % width == 0
             if not valid or len(received) != 1:
                 raise SeamError("seam_descriptor", "expected exactly one scoped capability")
+            if not hasattr(socket, "MSG_CMSG_CLOEXEC"):  # macOS: close-on-exec after the fact
+                os.set_inheritable(received[0], False)
             self.recv_bytes += 1
             return received.pop()
         except OSError as exc:
@@ -392,12 +397,30 @@ def _require_device(fd: int) -> None:
         raise SeamError("seam_descriptor", "a GPU allocation must be a driver descriptor")
 
 
+def anonymous(name: str, sealing: bool = False) -> int:
+    """A new close-on-exec in-memory file no path names: a memfd (`sealing`: one that may be
+    sealed), or on macOS, which has none, an unlinked file."""
+    if sys.platform != "linux":
+        fd, path = tempfile.mkstemp(prefix=f"{name}.")
+        os.unlink(path)
+        return fd
+    # libc's own: python-build-standalone's old glibc build lacks `os.memfd_create`.
+    # MFD_CLOEXEC, and MFD_ALLOW_SEALING when asked
+    flags = 0x1 | (0x2 if sealing else 0)
+    fd: int = ctypes.CDLL(None, use_errno=True).memfd_create(name.encode(), flags)
+    if fd < 0:
+        raise OSError(ctypes.get_errno(), "memfd_create")
+    return fd
+
+
 def _require_memfd(fd: int) -> None:
-    """A regular file the kernel names `/memfd:…`: an anonymous in-memory tier, never a path."""
+    """A regular file the kernel names `/memfd:…`: an anonymous in-memory tier, never a path.
+    macOS has no memfd: there an unlinked regular file, which no path names either."""
     try:
-        regular = stat.S_ISREG(os.fstat(fd).st_mode)
-        named = os.readlink(f"/proc/self/fd/{fd}")
+        found = os.fstat(fd)
+        named = os.readlink(f"/proc/self/fd/{fd}") if sys.platform == "linux" else ""
     except OSError as exc:
         raise SeamError("seam_descriptor", f"memfd unreadable: {exc}") from exc
-    if not regular or not named.startswith("/memfd:"):
+    anonymous = named.startswith("/memfd:") if sys.platform == "linux" else found.st_nlink == 0
+    if not stat.S_ISREG(found.st_mode) or not anonymous:
         raise SeamError("seam_descriptor", "capability must be a memfd")

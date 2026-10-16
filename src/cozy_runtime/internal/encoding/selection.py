@@ -95,8 +95,8 @@ class DeviceFacts:
 
     @property
     def predicate(self) -> str:
-        """The device CLASS a capability record names: `cuda.sm89`, `cpu`."""
-        return "cpu" if self.kind != "cuda" else f"cuda.sm{self.sm}"
+        """The device CLASS a capability record names: `cuda.sm89`, `mps`, `cpu`."""
+        return f"cuda.sm{self.sm}" if self.kind == "cuda" else self.kind
 
     def satisfies(self, predicate: str) -> bool:
         """Does this device meet a provider's declared floor?
@@ -107,8 +107,8 @@ class DeviceFacts:
         """
         if predicate == "any":
             return True
-        if predicate == "cpu":
-            return self.kind == "cpu"
+        if predicate in ("cpu", "mps"):
+            return self.kind == predicate
         if not predicate.startswith("cuda.sm") or self.kind != "cuda":
             return False
         floor = predicate.removeprefix("cuda.sm")
@@ -154,6 +154,15 @@ def measure_device(torch: Any, index: int = 0) -> DeviceFacts:
             "cpu", "cpu", 0, "", "default", index=0, cuda_runtime="", os_arch=os_arch
         )
     identity = accel.device_identity(torch, kind, index)
+    if kind == "mps":
+        return DeviceFacts(
+            kind=kind,
+            name=str(identity["name"]),
+            sm=0,
+            driver=str(identity["driver_api"]),
+            configuration=accel.memory_class(kind),
+            os_arch=os_arch,
+        )
     return DeviceFacts(
         kind=kind,
         name=str(identity["name"]),

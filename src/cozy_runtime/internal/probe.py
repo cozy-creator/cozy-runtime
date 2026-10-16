@@ -273,7 +273,7 @@ def _numerics(torch: Any, provider: Provider, device: Any, dtype: Any) -> Sweep:
     weight_scale = torch.tensor(scale_value, dtype=torch.float32, device=device)
     destination = torch.empty(16, 16, dtype=dtype, device=device)
     provider.decode(torch, {"data": data, "weight_scale": weight_scale}, destination)
-    got = destination.reshape(-1).double().cpu().tolist()
+    got = destination.reshape(-1).cpu().double().tolist()
     return _grade_scaled(_eps(torch, dtype), got, scale_value)
 
 
@@ -331,7 +331,7 @@ def _numerics_rowwise(torch: Any, provider: Provider, device: Any, dtype: Any) -
     )
     destination = torch.empty(rows, cols, dtype=dtype, device=device)
     provider.decode(torch, {"data": data, "scale": scale}, destination)
-    got = destination.double().cpu().reshape(-1).tolist()
+    got = destination.cpu().double().reshape(-1).tolist()
     return _domain_sweep(
         torch, dtype, got, [(math.ldexp(1.0, e), f"row scale 2**{e}") for e in exponents]
     )
@@ -358,7 +358,7 @@ def _numerics_int8_convrot(
     provider.decode(
         torch, {"data": data.to(device), "scale": scale.float().to(device)}, destination
     )
-    got = destination.double().cpu()
+    got = destination.cpu().double()
     finite = torch.isfinite(got)
     error = (got - truth).abs()[finite]
     relative = error / truth.abs()[finite].clamp(min=1e-300)
@@ -401,7 +401,7 @@ def _numerics_nvfp4(torch: ModuleType, provider: Provider, device: Tensor, dtype
         },
         destination,
     )
-    got = destination.double().cpu()
+    got = destination.cpu().double()
     error = (got - truth).abs()
     relative = error / truth.abs().clamp(min=1e-300)
     exact = bool((destination.cpu() == truth.to(dtype)).all())
@@ -629,12 +629,17 @@ def _exact_weight(torch: Any, provider: Provider, roles: Mapping[str, Any]) -> A
         blocks = roles["weight_scale"].cpu().double().repeat_interleave(NVFP4_BLOCK, dim=1)
         exact = lut[nibbles] * blocks * roles["weight_scale_2"].cpu().double()
         return exact.to(roles["weight"].device)
-    data = roles["data"].double()
+    data = _f64(roles["data"])
     if provider.suite in ("fp8-rowwise-decode", "fp8-rowwise-native"):
-        return data * roles["scale"].double().reshape(int(data.shape[0]), 1)
+        return data * _f64(roles["scale"]).reshape(int(data.shape[0]), 1)
     if provider.suite in ("int8-convrot256-decode", "int8-convrot256-native"):
-        return hadamard256(torch, data) * roles["scale"].double().reshape(-1, 1) / 16
-    return data * roles["weight_scale"].double()
+        return hadamard256(torch, data) * _f64(roles["scale"]).reshape(-1, 1) / 16
+    return data * _f64(roles["weight_scale"])
+
+
+def _f64(tensor: Tensor) -> Tensor:
+    """`tensor` in float64, where the device has it; MPS has none, so the host's."""
+    return (tensor.cpu() if tensor.device.type == "mps" else tensor).double()
 
 
 def _activation(torch: Any, device: Any, dtype: Any) -> Any:
@@ -647,11 +652,11 @@ def _activation(torch: Any, device: Any, dtype: Any) -> Any:
 def _reference_gemm(torch: Any, x: Any, weight: Any) -> Any:
     """`x @ W.t()` in f64. f32 would be measured through TF32 on every card that has it,
     which is a ~1e-3 error sitting under numbers this suite reports to 1e-6."""
-    return (x.double() @ weight.double().t()).double()
+    return (_f64(x) @ _f64(weight).t()).double()
 
 
 def _relative(torch: Any, got: Any, reference: Any) -> float:
-    delta = (got.double() - reference).norm()
+    delta = (_f64(got) - reference).norm()
     return float(delta / reference.norm().clamp(min=1e-30))
 
 
@@ -891,8 +896,8 @@ def _micro_bench(torch: Any, provider: Provider, device: Any, dtype: Any) -> Dec
     destination = torch.empty(rows, cols, dtype=dtype, device=device)
     _, parts = _weight_roles(torch, provider, device)
     provider.decode(torch, parts, destination)
-    # The fence goes through the accelerator boundary (#447): timing an MPS queue without
-    # its own synchronize would mint a fictional decode rate, so mps refuses typed there.
+    # The fence goes through the accelerator boundary (#447): a queue timed without its own
+    # synchronize would mint a fictional decode rate.
     accel.synchronize(torch, device.type)
     started = time.perf_counter_ns()
     for _ in range(BENCH_REPS):
@@ -995,7 +1000,7 @@ def qualify(
     accel.qualification_gate(device.kind)
     if runtime is None:
         runtime = measure_runtime(torch, release)
-    target = torch.device("cuda" if device.kind == "cuda" else "cpu")
+    target = torch.device(device.kind)
     started = time.perf_counter_ns()
     observations = [
         make_observation(
@@ -1003,7 +1008,7 @@ def qualify(
             provider,
             device,
             name,
-            settled(provider, device) or _evidence(torch, provider, target, getattr(torch, name)),
+            settled(provider, device) or _measured(torch, provider, target, getattr(torch, name)),
         )
         for encoding, provider, name in cells(providers, output_dtypes)
     ]
@@ -1017,6 +1022,17 @@ def qualify(
         observations=observations,
     )
     return admission_table(result), result
+
+
+def _measured(torch: ModuleType, provider: Provider, target: Tensor, dtype: Tensor) -> Evidence:
+    """`_evidence`, where a device that lacks a dtype the decode reads (MPS has no float8)
+    mints no record for it: the encoding refuses at bind naming why."""
+    try:
+        return _evidence(torch, provider, target, dtype)
+    except (TypeError, RuntimeError, NotImplementedError) as exc:
+        if target.type == "cuda":
+            raise
+        return UnmeasuredEvidence(note=f"{type(exc).__name__}: {exc}"[:300])
 
 
 def _evidence(torch: Any, provider: Provider, target: Any, dtype: Any) -> Evidence:

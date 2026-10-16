@@ -258,6 +258,9 @@ PREPARED_HELD = 8
 #: Captured before any import that could initialize CUDA.
 _SEALED: dict[str, str] = {}
 
+#: macOS's ceiling on a process's soft descriptor limit (`<sys/syslimits.h>`).
+_OPEN_MAX = 10240
+
 
 #: Each callable an attempt may call, by (module, export).
 type CallBindings = dict[tuple[str, str], _CallType]
@@ -399,11 +402,19 @@ def _distribution_version(name: str) -> str:
 
 
 def _proc_status(field: str) -> str:
-    with open("/proc/self/status") as handle:
+    """A `/proc/self/status` field; "" where the system has no `/proc` (macOS)."""
+    with contextlib.suppress(FileNotFoundError), open("/proc/self/status") as handle:
         for line in handle:
             if line.startswith(field + ":"):
                 return line.split(":", 1)[1].strip()
     return ""
+
+
+def _oom_score_adj() -> str:
+    try:
+        return Path("/proc/self/oom_score_adj").read_text().strip()
+    except FileNotFoundError:  # no /proc: macOS has no OOM killer score
+        return ""
 
 
 def _rss() -> int:
@@ -848,7 +859,7 @@ class Executor:
             "memo": [stage_memo.CAPABILITY],
             "pgid": os.getpgrp(),
             "no_new_privs": _proc_status("NoNewPrivs"),
-            "oom_score_adj": Path("/proc/self/oom_score_adj").read_text().strip(),
+            "oom_score_adj": _oom_score_adj(),
             "uid": os.getuid(),
             "euid": os.geteuid(),
             "sealed": dict(_SEALED),
@@ -1002,6 +1013,8 @@ class Executor:
     def _rank_device(self, torch: Any) -> Any:
         if self.device_kind == "cuda" and accel.present(torch, self.device_kind):
             return torch.device("cuda", self.rank if self.world > 1 else 0)
+        if self.device_kind == "mps" and accel.present(torch, self.device_kind):
+            return torch.device("mps")
         return torch.device("cpu")
 
     def join(self, command: Join) -> dict[str, Any]:
@@ -2395,6 +2408,8 @@ class Executor:
             attention.reserve(command.attention_pin, device_facts)
         stage("measure_device")
         hardware_variant = binding.variant
+        if not hardware_variant and device_facts.kind == "mps":
+            hardware_variant = "mps"
         if not hardware_variant:
             if device_facts.kind != "cuda" or device_facts.sm <= 0:
                 self.poisoned = "modeled accelerator unavailable"
@@ -2433,6 +2448,14 @@ class Executor:
         present = [name for name in names if checkpoints[name].has(name)]
         rows = [r for name in present for r in checkpoints[name].rows(name)]
         stage("checkpoint_headers")
+        if not accel.bf16_supported(self.device_kind) and any(
+            dtype_name(r.dtype) == "bfloat16" for r in rows
+        ):
+            return self._refusal(
+                "dtype_unsupported",
+                f"this lane stores bfloat16, which {device_facts.name} computes from macOS 14 "
+                f"on ({device_facts.driver} here): serve an f16 lane",
+            )
         # NVML is queried with the sealed device (#549.9): inside the seal, card zero IS the
         # lane's card, so a multi-GPU pod's records name the card the fill actually uses.
         runtime_identity = measure_runtime(torch, binding.release)
@@ -2583,7 +2606,9 @@ class Executor:
             qualified=qualified_pair,
             device_facts=device_facts,
             custody=binding.custody,
-            tiers=self._tiers(
+            tiers=HostTiers(seal=lambda _plan: None, files=self.host._object_files)
+            if weights.unified  # the page cache is its host tier: the machine keeps no layout
+            else self._tiers(
                 command.sealed_tiers, staged=command.staged_tiers and not weights.host_only
             ),
         )
@@ -3503,6 +3528,10 @@ class Executor:
                 for group in member.refused_leaves:
                     fields = dataclasses.asdict(group)
                     record.emit("log", "encoded leaf refused, served decoded", "warn", **fields)
+            for feature, instead in accel.unavailable(self.device_kind) if self.models else ():
+                record.emit(
+                    "log", f"{feature} unavailable on {self.device_kind}", "warn", instead=instead
+                )
             for missing in int8_linear.unavailable():
                 record.emit(
                     "log",
@@ -4283,10 +4312,14 @@ class Executor:
         """The verified object files behind `plan` (`ObjectFiles`), for its layout's holes:
         `(sha256, length, fd)` per object of `objects` (the plan's own, in SHA-256 order), the
         fds the caller's to close. None unless the machine's answer names that same list."""
-        # One descriptor per object (SDXL's UNet: about 1,700): lift the soft limit to the hard.
+        # One descriptor per object (SDXL's UNet: about 1,700): lift the soft limit to the hard,
+        # which macOS caps at OPEN_MAX.
         soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
         if soft != hard:
-            resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+            try:
+                resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+            except (ValueError, OSError):
+                resource.setrlimit(resource.RLIMIT_NOFILE, (min(hard, _OPEN_MAX), hard))
         body = canonical.write(msgspec.to_builtins(plan))
         memfd = plane.sealed_memfd("cozy-sealed-plan", body)
         try:
