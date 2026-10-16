@@ -100,8 +100,10 @@ type Origin = tuple[Weights, Component, Region, Table, str]
 
 #: The largest region at the sub-block grain (proving-cpu.md C2: SDXL runs at 1 GiB).
 REGION_LIMIT = 16 << 20
-_REQUESTED = re.compile(r"Tried to allocate ([0-9.]+) (B|KiB|MiB|GiB)")
+#: torch's out-of-memory message: CUDA's units are KiB/MiB/GiB, MPS's KB/MB/GB of 1024
+_REQUESTED = re.compile(r"Tried to allocate ([0-9.]+) (B|KiB|MiB|GiB|KB|MB|GB)")
 _UNITS = {"B": 1, "KiB": 1 << 10, "MiB": 1 << 20, "GiB": 1 << 30}
+_UNITS |= {"KB": _UNITS["KiB"], "MB": _UNITS["MiB"], "GB": _UNITS["GiB"]}
 #: The TensorFS planning window a weight set's read plan is cut into.
 READ_WINDOW = 4 << 20
 #: The stage `WeightResidency.map_ahead` opens: no package method has this name.

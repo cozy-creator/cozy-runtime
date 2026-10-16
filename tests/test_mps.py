@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 import msgspec
+import numpy as np
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -64,14 +65,22 @@ def test_the_accelerator_boundary_on_the_apple_gpu() -> None:
     accel.release_cached(torch, "mps")
     identity = accel.device_identity(torch, "mps")
     assert identity["name"].startswith("Apple") and identity["driver_api"].startswith("macOS")
-    # MPS refuses past its pool limit and past Metal's largest buffer with plain RuntimeErrors;
-    # both are a device out-of-memory to Runtime's recovery.
+    # MPS refuses one buffer larger than Metal allows, and a pool past its limit, with plain
+    # RuntimeErrors; both are a device out-of-memory to Runtime's recovery.
     refused: list[str] = []
-    for nbytes in (1 << 36, int(torch.mps.recommended_max_memory() * 1.9)):
-        with pytest.raises(RuntimeError) as raised:
-            torch.empty(nbytes, dtype=torch.uint8, device="mps")
-        assert is_device_oom(raised.value), raised.value
-        refused.append(f"{type(raised.value).__name__}: {str(raised.value)[:120]}")
+    with pytest.raises(RuntimeError) as raised:
+        torch.empty(1 << 36, dtype=torch.uint8, device="mps")
+    refused.append(str(raised.value)[:200])
+    torch.mps.set_per_process_memory_fraction(0.05)
+    try:
+        with pytest.raises(RuntimeError) as pool:
+            chunks = [torch.empty(256 << 20, dtype=torch.uint8, device="mps") for _ in range(64)]
+            del chunks
+    finally:
+        torch.mps.set_per_process_memory_fraction(1.7)  # torch's default high watermark
+        accel.release_cached(torch, "mps")
+    refused.append(f"{type(pool.value).__name__}: {str(pool.value)[:200]}")
+    assert is_device_oom(raised.value) and is_device_oom(pool.value), refused
     _record("oom", {"refusals": refused})
 
 
@@ -173,6 +182,149 @@ def test_a_model_serves_on_the_apple_gpu(tmp_path: Path, monkeypatch: pytest.Mon
         assert f"{feature} unavailable on mps" in warned
 
 
+PAGED = """
+import msgspec
+import torch
+from cozy_runtime.author import App, Loader, Model, uses_components
+
+WIDE = 2048
+
+
+class Stack(torch.nn.Module):
+    _no_split_modules = ("Linear",)
+
+    def __init__(self, blocks):
+        super().__init__()
+        self.blocks = torch.nn.ModuleList(
+            [torch.nn.Linear(WIDE, WIDE, bias=False, dtype=torch.float16) for _ in range(blocks)]
+        )
+
+    def forward(self, x):
+        for block in self.blocks:
+            x = torch.tanh(block(x))
+        return x
+
+
+class Graph:
+    def __init__(self, config):
+        self.components = {"encoder": Stack(8), "decoder": Stack(1)}
+
+
+class Pipe(Model[Graph]):
+    def load(self, loader: Loader) -> None:
+        self.graph = loader.construct(Graph, factory=Graph)
+
+    @uses_components("encoder")
+    def encode(self, x):
+        net = self.graph.components["encoder"]
+        return net(x.to(net.blocks[0].weight.device))
+
+    @uses_components("decoder")
+    def decode(self, x):
+        y = self.graph.components["decoder"](x)
+        torch.mps.synchronize()
+        return float(y.float().sum()), torch.mps.current_allocated_memory()
+
+
+class Ask(msgspec.Struct):
+    seed: int
+
+
+class Answer(msgspec.Struct):
+    value: float
+    allocated: int
+
+
+app = App()
+
+
+@app.entrypoint()
+def run(payload: Ask, model: Pipe) -> Answer:
+    x = torch.randn(64, 2048, generator=torch.Generator().manual_seed(payload.seed)).half()
+    value, allocated = model.decode(model.encode(x))
+    return Answer(value, allocated)
+"""
+
+
+def test_a_stage_pages_the_last_ones_weights_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unified memory pages as a discrete card does: the decoder's stage plans its own weights
+    only, so the encoder's 64 MiB leave the pool while it runs, and the next request reads
+    them back from the page cache."""
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "apple_paged.py").write_text(PAGED)
+    (project / "package.toml").write_text('[application]\nobject = "apple_paged:app"\n')
+    monkeypatch.syspath_prepend(str(project))
+    rng = np.random.default_rng(3)
+
+    def stack(blocks: int) -> dict[str, Any]:
+        return {
+            f"blocks.{i}.weight": (rng.normal(size=(2048, 2048)) / 45).astype(np.float16)
+            for i in range(blocks)
+        }
+
+    producer, manifest = write(tmp_path / "producer", {"encoder": stack(8), "decoder": stack(1)})
+    hub = Hub(producer, manifest)
+    try:
+        with served(tmp_path, discover(project), Store.init(tmp_path / "store"), hub.grant()) as m:
+            first = m.run(manifest, "Pipe", ["decoder", "encoder"], {"seed": 1}, "run")
+            again = m.attempt("run", {"seed": 2})
+    finally:
+        hub.close()
+        sys.modules.pop("apple_paged", None)
+    encoder = 8 * 2048 * 2048 * 2
+    assert first["allocated"] < encoder, first
+    assert again["allocated"] < encoder and again["value"] != first["value"]
+
+
+def test_weight_only_int8_against_fp16() -> None:
+    """The Mac's 8-bit lane is weight-only int8 only where it beats fp16: SDXL UNet linears at
+    a 1024px CFG batch, `_weight_int8pack_mm` against an fp16 GEMM, and the 256-wide rotation
+    a `convrot256` lane adds in front of it."""
+    hadamard = torch.ones(1, 1)
+    while hadamard.shape[0] < 256:
+        hadamard = torch.cat(
+            [torch.cat([hadamard, hadamard], 1), torch.cat([hadamard, -hadamard], 1)]
+        )
+    hadamard = (hadamard / 16).half().to("mps")
+    shapes = ((8192, 640, 640), (8192, 640, 5120), (2048, 1280, 1280), (2048, 1280, 10240))
+    rows = [_int8_row(m, k, n, hadamard) for m, k, n in (*shapes, (2048, 5120, 1280))]
+    _record("int8", {"rows": rows})
+
+
+def _int8_row(m: int, k: int, n: int, hadamard: Any) -> dict[str, Any]:
+    x = torch.randn(m, k, device="mps", dtype=torch.float16)
+    w = torch.randn(n, k, device="mps", dtype=torch.float16) * 0.02
+    scale = w.float().abs().amax(dim=1) / 127
+    q = torch.round(w.float() / scale[:, None]).clamp(-127, 127).to(torch.int8)
+    half = scale.half()
+    reference = x.float() @ (q.float() * scale[:, None]).t()
+    int8 = torch._weight_int8pack_mm(x, q, half)
+    rotate = (lambda: (x.view(m, k // 256, 256) @ hadamard).view(m, k)) if k % 256 == 0 else None
+    return {
+        "m": m,
+        "k": k,
+        "n": n,
+        "fp16_ms": _ms(lambda: x @ w.t()),
+        "int8_ms": _ms(lambda: torch._weight_int8pack_mm(x, q, half)),
+        "rotate_ms": _ms(rotate) if rotate else None,
+        "int8_rel": float((int8.float() - reference).norm() / reference.norm()),
+    }
+
+
+def _ms(fn: Any, reps: int = 20) -> float:
+    for _ in range(3):
+        fn()
+    torch.mps.synchronize()
+    started = time.perf_counter()
+    for _ in range(reps):
+        fn()
+    torch.mps.synchronize()
+    return round((time.perf_counter() - started) * 1000 / reps, 3)
+
+
 SDXL = "fidika/sdxl"
 
 
@@ -239,6 +391,7 @@ class Machine:
         body = package_interface.build(found, installed=found.project == Path("/"))
         self.interface.write_bytes(package_interface.canonical_bytes(body))
         self.frames: list[dict[str, Any]] = []
+        self.errors: list[str] = []
         self.plane: dict[str, Any] = {}
         ours, self.theirs = socket.socketpair()
         self.thread = threading.Thread(target=self.serve, args=(Channel(self.theirs),), daemon=True)
@@ -252,49 +405,59 @@ class Machine:
             if frame.get("event") != "request":
                 self.frames.append(frame)
                 continue
-            answer = {"event": "answer", "seq": frame["seq"]}
-            kind = frame["kind"]
-            if kind == "fetch_channel":
-                channel.send(answer | {"ok": True, "descriptor": True})
-                with socket.socket(fileno=self._channel()) as handed:
-                    channel.send_descriptor(handed)
-                continue
-            if kind == "model_source":
-                body = self.source(frame["manifest"], frame.get("name", ""))
-                fd = plane.sealed_memfd("model-source", body)
-                channel.send(
-                    answer
-                    | {"ok": True, "held": True, "descriptor": True, "length": len(body)}
-                    | {"sha256": hashlib.sha256(body).hexdigest()}
-                )
-                channel.send_memfd(fd)
-                os.close(fd)
-                continue
             memfd = channel.recv_memfd() if frame.get("descriptor") else -1
-            if kind == "object_files":
-                body = os.pread(memfd, frame["length"], 0)
-                os.close(memfd)
-                files = self.object_files(msgspec.convert(canonical.parse(body), SealedPlan))
-                listed = "".join(f"{sha}:{n}\n" for sha, n, _ in files).encode()
+            try:
+                self.answer(channel, frame, memfd)
+            except Exception as exc:  # answered, so the executor never waits on a dead machine
+                self.errors.append(f"{frame['kind']}: {type(exc).__name__}: {exc}")
                 channel.send(
-                    answer
-                    | {"ok": True, "objects_sha256": hashlib.sha256(listed).hexdigest()}
-                    | {"descriptors": len(files)}
+                    {"event": "answer", "seq": frame["seq"], "ok": False}
+                    | {"code": "request_failed", "detail": self.errors[-1][:400]}
                 )
-                for _, _, fd in files:
-                    channel._send_fd(fd, "object file")
-                    os.close(fd)
-                continue
+
+    def answer(self, channel: Channel, frame: dict[str, Any], memfd: int) -> None:
+        answer = {"event": "answer", "seq": frame["seq"]}
+        kind = frame["kind"]
+        if kind == "fetch_channel":
+            handed = socket.socket(fileno=self._channel())
+            channel.send(answer | {"ok": True, "descriptor": True})
+            with handed:
+                channel.send_descriptor(handed)
+        elif kind == "model_source":
+            body = self.source(frame["manifest"], frame.get("name", ""))
+            fd = plane.sealed_memfd("model-source", body)
+            channel.send(
+                answer
+                | {"ok": True, "held": True, "descriptor": True, "length": len(body)}
+                | {"sha256": hashlib.sha256(body).hexdigest()}
+            )
+            channel.send_memfd(fd)
+            os.close(fd)
+        elif kind == "object_files":
+            body = os.pread(memfd, frame["length"], 0)
+            os.close(memfd)
+            files = self.object_files(msgspec.convert(canonical.parse(body), SealedPlan))
+            listed = "".join(f"{sha}:{n}\n" for sha, n, _ in files).encode()
+            channel.send(
+                answer
+                | {"ok": True, "objects_sha256": hashlib.sha256(listed).hexdigest()}
+                | {"descriptors": len(files)}
+            )
+            for _, _, fd in files:
+                channel._send_fd(fd, "object file")
+                os.close(fd)
+        else:
             if memfd >= 0:
                 os.close(memfd)  # a budget cell: this machine keeps none
             channel.send(answer | {"ok": False, "code": "unknown_durable_request"})
 
+    def structure(self, manifest: str) -> None:
+        """Land the checkpoint's structure (manifest and header), as TensorD's prepare does."""
+        with Fetch.from_fd(self._channel()) as fetch:
+            fetch.wait(manifest, [])
+
     def source(self, manifest: str, name: str) -> bytes:
         header = self.store.manifest(manifest)["header"]
-        if header is None:  # its structure lands first, as TensorD's prepare does
-            with Fetch.from_fd(self._channel()) as fetch:
-                fetch.wait(manifest, [])
-            header = self.store.manifest(manifest)["header"]
         assert header is not None
         if not name:
             return bytes(header)
@@ -339,6 +502,7 @@ class Machine:
         entrypoint: str,
     ) -> dict[str, Any]:
         """Start, Load and Activate one construction, then one attempt."""
+        self.structure(manifest)
         path = f"{entrypoint}.models.model"
         start = {
             "application": self.application,
@@ -395,6 +559,7 @@ class Machine:
         self.ours.close()
         self.thread.join(timeout=30)
         self.theirs.close()
+        assert not self.errors, self.errors
 
 
 @pytest.fixture(autouse=True)

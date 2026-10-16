@@ -145,7 +145,7 @@ jobs:
     name: mps (macos-15)
     runs-on: macos-15
     # Hang bound, not a work budget: a cold TensorFS build and the SDXL download fit well inside.
-    timeout-minutes: 75
+    timeout-minutes: ${{ inputs.sdxl && 75 || 30 }}
     defaults:
       run:
         shell: bash
