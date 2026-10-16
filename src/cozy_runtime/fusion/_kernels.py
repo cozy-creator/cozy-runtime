@@ -3,7 +3,8 @@ between its GEMMs, one pass each (`cozy_runtime.fusion` declares where they appl
 
 Each kernel rounds to bf16 wherever eager bf16 arithmetic rounds (`_rb`, in the integer domain
 so the compiler cannot fold the round trip), so a fused block reproduces eager up to reduction
-order. Widths are constexprs: a layout's set compiles only the entries it declares.
+order; a q/k norm and RoPE the model computes in fp32 round once (`FP32`). Widths are
+constexprs: a layout's set compiles only the entries it declares.
 
 Adapted from MiniMax-H3's glue (itself from NVlabs/Sana `sol-engine`, Apache-2.0).
 """
@@ -42,9 +43,16 @@ if not TRITON_ABSENT:
         return (bits & -65536).to(tl.float32, bitcast=True)
 
     @triton.jit  # type: ignore[untyped-decorator]
+    def _round(x, FP32: tl.constexpr):  # type: ignore[no-untyped-def]
+        if FP32 == 0:
+            x = _rb(x)
+        return x
+
+    @triton.jit  # type: ignore[untyped-decorator]
     def norm_modulate_kernel(  # type: ignore[no-untyped-def]
         x_ptr,
         branch_ptr,
+        other_ptr,
         gate_ptr,
         hidden_ptr,
         out_ptr,
@@ -54,26 +62,29 @@ if not TRITON_ABSENT:
         index_ptr,
         n_cols,
         n_index,
-        stride_x,
         stride_table,
         eps,
         NORM: tl.constexpr,
         WEIGHT: tl.constexpr,
         SHIFT: tl.constexpr,
-        RESIDUAL: tl.constexpr,
+        BRANCHES: tl.constexpr,
         TANH: tl.constexpr,
         BLOCK: tl.constexpr,
     ):
-        # One row per program. RESIDUAL: `hidden = x + act(gate) * branch` first (written);
-        # then `norm(hidden) * (1 + scale) [+ shift]`. Table rows are per token (`index`).
+        # One row per program. BRANCHES: `hidden = x + act(gate) * (branch [+ other])` first
+        # (written); then `norm(hidden) * (1 + scale) [+ shift]`. Table rows are per token
+        # (`index`).
         row = tl.program_id(0).to(tl.int64)
         cols = tl.arange(0, BLOCK)
         mask = cols < n_cols
-        offset = row * stride_x + cols
+        offset = row * n_cols + cols
         table = tl.load(index_ptr + row % n_index).to(tl.int64) * stride_table + cols
         x = tl.load(x_ptr + offset, mask=mask, other=0.0).to(tl.float32)
-        if RESIDUAL:
+        if BRANCHES > 0:
             branch = tl.load(branch_ptr + offset, mask=mask, other=0.0).to(tl.float32)
+            if BRANCHES == 2:
+                other = tl.load(other_ptr + offset, mask=mask, other=0.0).to(tl.float32)
+                branch = _rb(branch + other)
             gate = tl.load(gate_ptr + table, mask=mask, other=0.0).to(tl.float32)
             if TANH:
                 gate = _rb(libdevice.tanh(gate))
@@ -130,11 +141,13 @@ if not TRITON_ABSENT:
         ROTARY: tl.constexpr,
         HEADS: tl.constexpr,
         INTERLEAVED: tl.constexpr,
+        FP32: tl.constexpr,
     ):
         # One program per (row, HEADS heads) of `[rows, heads, HEAD_DIM]`: per-head RMSNorm with
         # weight, then RoPE on the first ROTARY channels. INTERLEAVED pairs channel 2i with
         # 2i+1 (table column i); otherwise channel j pairs with j +/- ROTARY/2 (column j).
-        # The partner is re-read and re-normalized rather than shuffled across lanes.
+        # The partner is re-read and re-normalized rather than shuffled across lanes. FP32: the
+        # model computes this in fp32 and rounds once, at the end.
         row = tl.program_id(0).to(tl.int64)
         token = row % seq
         head = tl.program_id(1) * HEADS + tl.arange(0, HEADS)[:, None]
@@ -144,7 +157,7 @@ if not TRITON_ABSENT:
         x = tl.load(x_ptr + base + chan, mask=mask, other=0.0).to(tl.float32)
         inv = tl.math.rsqrt(tl.sum(x * x, axis=1)[:, None] / HEAD_DIM + eps)
         weight = tl.load(weight_ptr + chan).to(tl.float32)
-        normed = _rb(_rb(x * inv) * weight)
+        normed = _round(_round(x * inv, FP32) * weight, FP32)
         rotating = chan < ROTARY
         if INTERLEAVED:
             low = chan % 2 == 0
@@ -156,12 +169,12 @@ if not TRITON_ABSENT:
             column = chan
         paired = tl.load(x_ptr + base + partner, mask=mask & rotating, other=0.0).to(tl.float32)
         paired_weight = tl.load(weight_ptr + partner, mask=rotating, other=0.0).to(tl.float32)
-        paired = _rb(_rb(paired * inv) * paired_weight)
+        paired = _round(_round(paired * inv, FP32) * paired_weight, FP32)
         paired = tl.where(low, -paired, paired)
         table = token * stride_token + column * stride_channel
         cos = tl.load(cos_ptr + table, mask=rotating, other=1.0)
         sin = tl.load(sin_ptr + table, mask=rotating, other=0.0)
-        out = tl.where(rotating, _rb(normed * cos + paired * sin), normed)
+        out = tl.where(rotating, _round(normed * cos + paired * sin, FP32), normed)
         tl.store(out_ptr + base + chan, out.to(tl.bfloat16), mask=mask)
 
 
@@ -180,18 +193,18 @@ def _signature(kernel: Any, **types: str) -> dict[str, str]:
 
 
 def row_entry(
-    width: int, norm: int, *, weight: bool, shift: bool, residual: bool, tanh: bool
+    width: int, norm: int, *, weight: bool, shift: bool, branches: int, tanh: bool
 ) -> TritonEntry:
     constexprs = {
         "NORM": norm,
         "WEIGHT": int(weight and norm != NONE),
         "SHIFT": int(shift and norm != NONE),
-        "RESIDUAL": int(residual),
-        "TANH": int(tanh and residual),
+        "BRANCHES": branches,
+        "TANH": int(tanh and branches > 0),
         "BLOCK": _next_pow2(width),
     }
     signature = _signature(norm_modulate_kernel, index_ptr="*i64", eps="fp32")
-    # Row operands every launch aligns (`_aligned`); weights and per-token indexes may not be.
+    # Row operands every launch aligns (`_dense`); weights and per-token indexes may not be.
     aligned = tuple(
         n
         for n, t in signature.items()
@@ -206,12 +219,13 @@ def swiglu_entry() -> TritonEntry:
     return TritonEntry(swiglu_kernel, signature, {"BLOCK": SWIGLU_BLOCK}, aligned, _SWIGLU_WARPS)
 
 
-def rope_entry(head_dim: int, rotary: int, *, interleaved: bool) -> TritonEntry:
+def rope_entry(head_dim: int, rotary: int, *, interleaved: bool, fp32: bool) -> TritonEntry:
     constexprs = {
         "HEAD_DIM": head_dim,
         "ROTARY": rotary,
         "HEADS": ROPE_HEADS,
         "INTERLEAVED": int(interleaved),
+        "FP32": int(fp32),
     }
     signature = _signature(head_norm_rope_kernel, cos_ptr="*fp32", sin_ptr="*fp32", eps="fp32")
     return TritonEntry(
@@ -225,13 +239,20 @@ def rope_entry(head_dim: int, rotary: int, *, interleaved: bool) -> TritonEntry:
 def _aligned(t: Any) -> Any:
     """A row operand as the entries assume it (`tt.divisibility` 16): unit column stride, a
     16-byte aligned base and a row stride divisible by 16."""
-    if t.stride(-1) != 1 or t.data_ptr() % 16 or (t.dim() > 1 and t.stride(-2) % 16):
-        return t.contiguous()
-    return t
+    if t.stride(-1) != 1 or (t.dim() > 1 and t.stride(-2) % 16):
+        t = t.contiguous()
+    return t if t.data_ptr() % 16 == 0 else t.clone()
 
 
 def _rows(x: Any, width: int) -> Any:
+    """`[rows, width]` with any aligned row stride."""
     return _aligned(x.reshape(-1, width))
+
+
+def _dense(x: Any, width: int) -> Any:
+    """`[rows, width]`, contiguous: the row kernel addresses every operand at `row * width`."""
+    rows = x.reshape(-1, width)
+    return _aligned(rows if rows.is_contiguous() else rows.contiguous())
 
 
 def _tables(*tables: Any) -> list[Any]:
@@ -253,18 +274,21 @@ def norm_modulate(
     eps: float,
     *,
     branch: Any = None,
+    other: Any = None,
     gate: Any = None,
 ) -> tuple[Any, Any]:
-    """`entry`'s chain over rows of `x`: `(hidden, out)`. `hidden` is `x + act(gate) * branch`
-    (or `x` without a residual); `out` the modulated norm (None for a residual alone).
-    Tables are `[rows, width]` views (any row stride) read at `index[token]`."""
+    """`entry`'s chain over rows of `x`: `(hidden, out)`. `hidden` is `x + act(gate) * (branch
+    [+ other])` (or `x` without a residual); `out` the modulated norm (None for a residual
+    alone). Tables are `[rows, width]` views (any row stride) read at `index[token]`."""
     width = int(x.shape[-1])
-    rows = _rows(x, width)
+    rows = _dense(x, width)
     n = int(rows.shape[0])
-    residual = branch is not None
-    hidden = torch.empty_like(rows) if residual else rows
-    normed = entry.constexprs["NORM"] != NONE
+    c = entry.constexprs
+    hidden = torch.empty_like(rows) if c["BRANCHES"] else rows
+    normed = c["NORM"] != NONE
     out = torch.empty_like(rows) if normed else hidden
+    branch = _dense(branch, width) if c["BRANCHES"] else rows
+    other = _dense(other, width) if c["BRANCHES"] == 2 else branch
     tables = iter(_tables(gate, scale, shift))
     gate, scale, shift = (next(tables) if t is not None else None for t in (gate, scale, shift))
     first = scale if scale is not None else gate
@@ -272,7 +296,8 @@ def norm_modulate(
         norm_modulate_kernel,
         (n, 1, 1),
         rows,
-        _rows(branch, width) if residual else rows,
+        branch,
+        other,
         gate if gate is not None else first,
         hidden,
         out,
@@ -282,10 +307,9 @@ def norm_modulate(
         index,
         width,
         int(index.numel()),
-        int(rows.stride(0)),
         int(first.stride(0)),
         float(eps),
-        *(entry.constexprs[k] for k in ("NORM", "WEIGHT", "SHIFT", "RESIDUAL", "TANH", "BLOCK")),
+        *(c[k] for k in ("NORM", "WEIGHT", "SHIFT", "BRANCHES", "TANH", "BLOCK")),
     )
     return hidden.view_as(x), out.view_as(x) if normed else None
 
@@ -334,26 +358,25 @@ def head_norm_rope(
         stride_token,
         stride_channel,
         float(eps),
-        c["HEAD_DIM"],
-        c["ROTARY"],
-        c["HEADS"],
-        c["INTERLEAVED"],
+        *(c[k] for k in ("HEAD_DIM", "ROTARY", "HEADS", "INTERLEAVED", "FP32")),
     )
     return out.view(batch, seq, heads, head_dim)
 
 
-def rope_tables(value: Any, *, interleaved: bool) -> tuple[Any, Any, int, int]:
+def rope_tables(value: Any, *, interleaved: bool, rotary: int) -> tuple[Any, Any, int, int]:
     """A model's rotary operand as the kernel reads it: `(cos, sin, token stride, column
-    stride)` in fp32. Interleaved: complex `[seq, rotary/2]` or a `(cos, sin)` pair of
-    `[seq, rotary/2]`; split-half: a `(cos, sin)` pair of `[seq, rotary]`."""
+    stride)` in fp32. Interleaved: complex `[seq, rotary/2]`, or a `(cos, sin)` pair of
+    `[seq, rotary/2]` or of `[seq, rotary]` with each value repeated for its pair (Diffusers'
+    `repeat_interleave_real`); split-half: a `(cos, sin)` pair of `[seq, rotary]`."""
     if isinstance(value, torch.Tensor) and value.is_complex():
         pairs = torch.view_as_real(value.to(torch.complex64))
         pairs = pairs if pairs.stride(-1) == 1 and pairs.stride(-2) == 2 else pairs.contiguous()
         return pairs[..., 0], pairs[..., 1], int(pairs.stride(-3)), 2
     cos, sin = (t.float().contiguous() for t in value)
-    if interleaved and cos.shape != sin.shape:
+    if cos.shape != sin.shape:
         raise ValueError("rotary cos and sin differ in shape")
-    return cos, sin, int(cos.stride(-2)), 1
+    repeated = interleaved and int(cos.shape[-1]) == rotary
+    return cos, sin, int(cos.stride(-2)), 2 if repeated else 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -361,12 +384,12 @@ class Entries:
     """The entries one declared block layout launches."""
 
     first: TritonEntry
-    """norm1, modulated."""
-    second: TritonEntry
-    """The attention's gated residual, then norm2, modulated."""
+    """The first norm, modulated."""
     residual: TritonEntry
-    """The MLP's gated residual."""
+    """The last gated residual: the MLP's, or a parallel block's attention + MLP."""
     swiglu: TritonEntry
+    second: TritonEntry | None
+    """Sequential: the attention's gated residual, then the second norm, modulated."""
     rope: TritonEntry | None
 
     def all(self) -> tuple[TritonEntry, ...]:
@@ -384,14 +407,18 @@ def entries(
     shift: bool,
     tanh: bool,
     interleaved: bool,
+    fp32: bool,
+    parallel: bool,
 ) -> Entries:
-    def row(norm: int, residual: bool) -> TritonEntry:
-        return row_entry(width, norm, weight=weight, shift=shift, residual=residual, tanh=tanh)
+    def row(norm: int, branches: int) -> TritonEntry:
+        return row_entry(width, norm, weight=weight, shift=shift, branches=branches, tanh=tanh)
 
     return Entries(
-        row(norm, False),
-        row(norm, True),
-        row(NONE, True),
+        row(norm, 0),
+        row(NONE, 2 if parallel else 1),
         swiglu_entry(),
-        None if rotary is None else rope_entry(head_dim, rotary, interleaved=interleaved),
+        None if parallel else row(norm, 1),
+        None
+        if rotary is None
+        else rope_entry(head_dim, rotary, interleaved=interleaved, fp32=fp32),
     )
