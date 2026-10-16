@@ -255,6 +255,10 @@ class Residency(Protocol):
         """A fact about how this attempt executed, reported with its memory facts."""
         ...
 
+    def allocatable(self) -> int:
+        """Device bytes torch can allocate now without the plane unmapping a weight."""
+        ...
+
     #: How many attempts (requests) it has opened.
     attempts: int
 
