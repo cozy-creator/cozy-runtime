@@ -1,0 +1,1 @@
+nvfp4's Triton kernels build again: 0.25.0 typed their runtime sizes (N, K, M) as constexprs, so the executor's build of `cozy-nvfp4` failed and every nvfp4 linear ran its eager decode (an LM token ~50× slower). A test compiles every entry of the nvfp4 and LM kernel sets offline for sm89 and sm120.
