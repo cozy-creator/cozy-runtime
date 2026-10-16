@@ -3090,6 +3090,8 @@ class WeightResidency:
         self.per_item: dict[str, int] = {}
         self.batch: dict[str, int] = {}
         self.baseline = -1
+        #: out-of-memory recoveries in the open entry (`_make_room`)
+        self.entry_ooms = 0
         #: torch's idle cache at the entry's start: segments an earlier stage reserved
         self.cached = 0
         #: torch's room and its cache drops so far, at the open entry's start
@@ -3434,6 +3436,7 @@ class WeightResidency:
                 weights.modes[f"{name}.grain"] = "sub-block"
         self.baseline = accel.allocated(weights.torch, weights.kind)
         self.cached = accel.reserved(weights.torch, weights.kind) - self.baseline
+        self.entry_ooms = 0
         self.pressure = (weights.allocatable(), weights.retries())
         accel.reset_peak(weights.torch, weights.kind)
 
@@ -4200,8 +4203,8 @@ class WeightResidency:
         reads: Collection[str] = (),
         operands: Sequence[object] = (),
     ) -> None:
-        """Activations first: unmap `need` bytes of weights nothing uses now, least recently
-        used first, then re-place the open stages (a block that runs again resumes its
+        """Activations first: unmap the weights nothing uses now (at least `need` bytes), least
+        recently used first, then re-place the open stages (a block that runs again resumes its
         component's cursor: `resume`; None: inside a block's forward, nothing is re-placed
         under its lease). When that gives nothing back, the components not in use give theirs
         back (`_spare`): every one but those with a block in its forward, those the op
@@ -4213,14 +4216,19 @@ class WeightResidency:
         if weights.answered(need):
             return
         before = weights.allocatable()
+        # Out of memory again in one entry: its estimate was short and its growth is unknown,
+        # so every idle weight goes at once, not `need` at a time (an LM decode's per-token
+        # allocations ran out 137 times in one stage).
+        self.entry_ooms += 1
+        give = need if self.entry_ooms == 1 else max(need, weights.activation_room()[1])
         if resume is None:
-            weights.shrink(need)
+            weights.shrink(give)
             weights.drain()
         else:
             opened = [component for _, _, component in weights.opened().values()]
             for component in opened:
                 close_cursor(component)
-            weights.shrink(need)
+            weights.shrink(give)
             if opened:
                 self._place(max(weights.applied, weights.floor()), resume)
         try:
