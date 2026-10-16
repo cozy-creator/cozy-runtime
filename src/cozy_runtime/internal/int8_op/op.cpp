@@ -2,7 +2,9 @@
 // `torch.ops.cozy.int8_linear`: the int8-convrot256/1 linear as one torch op. One Python call
 // checks, allocates and launches: M <= 4 rows in one kernel (rotate, quantize, multiply), more
 // in two (rotate + quantize, then the GEMM with both scales and the bias in its epilogue).
-// `int8_quantize` and `int8_gemm` are its two halves, for producers that quantize elsewhere.
+// `int8_quantize` and `int8_gemm` are its two halves, for producers that quantize once for
+// several linears; `int8_quantize` also folds the producer's norm, modulation and activation
+// into the same pass (`cozy_int8::Prologue`).
 // A launch out of device memory raises torch's OutOfMemoryError, which Runtime recovers; a GEMM
 // tile that cannot run hands that call to cuBLASLt's int8 GEMM, said once.
 #include <ATen/core/Tensor.h>
@@ -145,7 +147,7 @@ Tensor int8_linear(const Tensor& x, const Tensor& data, const Tensor& scale,
     int8_t* q = buffer.mutable_data_ptr<int8_t>();
     float* scales = reinterpret_cast<float*>(q + scales_at);
     check(cozy_int8::rotate_quantize(flat.const_data_ptr(), x_half, q, scales, int(M), int(K),
-                                     stream),
+                                     {}, stream),
           "the rotation");
     const cudaError_t error = gemm(q, scales, data, scale, bias, out, M, -1, stream);
     if (error != cudaSuccess)
@@ -154,18 +156,50 @@ Tensor int8_linear(const Tensor& x, const Tensor& data, const Tensor& scale,
     return out;
 }
 
-std::tuple<Tensor, Tensor> int8_quantize(const Tensor& x) {
+// A modulation table as `[E, K]` rows the kernel reads 16 bytes at a time: E divides M.
+std::optional<Tensor> table(const std::optional<Tensor>& t, const Tensor& flat, const char* name) {
+    if (!t.has_value()) return t;
+    const int64_t M = flat.size(0), K = flat.size(1);
+    TORCH_CHECK(t->device() == flat.device() && t->scalar_type() == flat.scalar_type() &&
+                    t->size(-1) == K,
+                "int8_quantize: ", name, " must be a ", flat.scalar_type(), " table of ", K,
+                "-wide rows on the activation's device");
+    Tensor rows = t->reshape({-1, K});
+    TORCH_CHECK(rows.size(0) > 0 && M % rows.size(0) == 0, "int8_quantize: ", name, "'s ",
+                rows.size(0), " rows do not divide the activation's ", M);
+    if (rows.stride(1) != 1 || rows.stride(0) % 8 || !aligned(rows)) rows = rows.contiguous();
+    return aligned(rows) ? rows : rows.clone();
+}
+
+std::tuple<Tensor, Tensor> int8_quantize(const Tensor& x, const std::optional<Tensor>& scale,
+                                         const std::optional<Tensor>& shift, int64_t norm,
+                                         double eps, int64_t activation) {
     const c10::cuda::OptionalCUDAGuard guard(x.device());
     const Tensor flat = rows(x);
     const int64_t M = flat.size(0), K = flat.size(1);
+    TORCH_CHECK(norm >= cozy_int8::kNormNone && norm <= cozy_int8::kNormRms &&
+                    activation >= cozy_int8::kActNone && activation <= cozy_int8::kActGeluTanh,
+                "int8_quantize: norm ", norm, " / activation ", activation);
     Tensor q = at::empty({M, K}, flat.options().dtype(at::kChar));
     Tensor scales = at::empty({M}, flat.options().dtype(at::kFloat));
-    if (M > 0)
-        check(cozy_int8::rotate_quantize(flat.const_data_ptr(), is_half(flat.scalar_type()),
-                                         q.mutable_data_ptr<int8_t>(),
-                                         scales.mutable_data_ptr<float>(), int(M), int(K),
-                                         at::cuda::getCurrentCUDAStream(x.get_device()).stream()),
-              "the rotation");
+    if (M == 0) return {q, scales};
+    const auto s = table(scale, flat, "scale"), b = table(shift, flat, "shift");
+    TORCH_CHECK(!s || !b || s->size(0) == b->size(0), "int8_quantize: scale and shift differ");
+    const auto& any = s ? s : b;
+    cozy_int8::Prologue prologue;
+    prologue.scale = s ? s->const_data_ptr() : nullptr;
+    prologue.shift = b ? b->const_data_ptr() : nullptr;
+    prologue.scale_stride = s ? s->stride(0) : 0;
+    prologue.shift_stride = b ? b->stride(0) : 0;
+    prologue.rows_per_entry = any ? int(M / any->size(0)) : 1;
+    prologue.norm = int(norm);
+    prologue.eps = float(eps);
+    prologue.activation = int(activation);
+    check(cozy_int8::rotate_quantize(flat.const_data_ptr(), is_half(flat.scalar_type()),
+                                     q.mutable_data_ptr<int8_t>(), scales.mutable_data_ptr<float>(),
+                                     int(M), int(K), prologue,
+                                     at::cuda::getCurrentCUDAStream(x.get_device()).stream()),
+          "the rotation");
     return {q, scales};
 }
 
@@ -198,7 +232,8 @@ Tensor int8_gemm(const Tensor& q, const Tensor& scales, const Tensor& data, cons
 TORCH_LIBRARY_FRAGMENT(cozy, m) {
     m.def("int8_linear(Tensor x, Tensor data, Tensor scale, Tensor? bias, ScalarType out_dtype)"
           " -> Tensor");
-    m.def("int8_quantize(Tensor x) -> (Tensor, Tensor)");
+    m.def("int8_quantize(Tensor x, Tensor? scale=None, Tensor? shift=None, int norm=0, "
+          "float eps=0., int activation=0) -> (Tensor, Tensor)");
     m.def("int8_gemm(Tensor q, Tensor scales, Tensor data, Tensor scale, Tensor? bias, "
           "ScalarType out_dtype, int config=-1) -> Tensor");
 }
