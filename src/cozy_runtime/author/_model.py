@@ -255,6 +255,9 @@ class Residency(Protocol):
         """A fact about how this attempt executed, reported with its memory facts."""
         ...
 
+    #: How many attempts (requests) it has opened.
+    attempts: int
+
 
 #: A component's root module -> the residency that places it and the component's name, so a
 #: Runtime mechanism handed the module (`cozy_runtime.lm`) reaches its placement.
