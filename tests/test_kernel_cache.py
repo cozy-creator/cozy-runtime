@@ -19,7 +19,7 @@ from typing import Any
 
 import pytest
 
-from cozy_runtime.internal import accel, attention_sol, jit_cache, kernel_cache
+from cozy_runtime.internal import accel, attention_sol, jit_cache, kernel_cache, kernel_compile
 
 KEY_DOC = {"library": {"sol_attn_sources": "0" * 64}, "target": "sm_90a", "variant": {}}
 
@@ -197,7 +197,7 @@ def _object(code: str, tokens: int) -> dict[str, str]:
     env = {"CUTE_DSL_ARCH": "sm_90a", "CUDA_VISIBLE_DEVICES": ""}
     result = subprocess.run(
         [sys.executable, "-c", textwrap.dedent(code), str(tokens)],
-        env={**os.environ, **env},
+        env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path), **env},
         capture_output=True,
         text=True,
         check=True,
@@ -214,6 +214,20 @@ def test_sol_sm90_object_is_a_function_of_its_block_layout_and_needs_no_gpu() ->
     full = _object(_COMPILE, 4096)
     assert full["sha"] != first["sha"] and full["key"] != first["key"]
     assert _object(_COMPILE, 4032)["key"] != full["key"]
+
+
+@pytest.mark.parametrize("capability", sorted(attention_sol.ROUTES))
+def test_every_sol_route_compiles_without_a_gpu(
+    capability: tuple[int, int], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each card's object, through the compile manager's own GPU-less builder. SM100's launch
+    asks the driver for shared memory per SM (`min_blocks_per_mp=2`); its target answers."""
+    _site()
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    monkeypatch.setattr("tempfile.tempdir", None)
+    store = kernel_cache.Store(tmp_path / "u1")
+    state = kernel_compile.wait(store, attention_sol.job(4095, capability))
+    assert state.state == "ready", state.line()
 
 
 def test_one_sol_object_per_card_off_sm90() -> None:
@@ -350,7 +364,7 @@ def test_a_torch_nvrtc_kernel_compiles_once_per_installation(tmp_path: Path) -> 
     def run() -> Any:
         done = subprocess.run(
             [sys.executable, "-c", code],
-            env={**os.environ, **env},
+            env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path), **env},
             capture_output=True,
             text=True,
         )

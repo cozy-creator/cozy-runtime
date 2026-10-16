@@ -11,7 +11,13 @@ from pathlib import Path
 
 import pytest
 
-from cozy_runtime.internal import attention, execution_evidence, kernel_cache, kernel_sources
+from cozy_runtime.internal import (
+    attention,
+    execution_evidence,
+    kernel_cache,
+    kernel_compile,
+    kernel_sources,
+)
 from cozy_runtime.internal.executor import Executor
 from test_attention_wait import (
     CPU,
@@ -101,8 +107,6 @@ def test_explicit_pin_is_not_mislabeled_as_an_automatic_fallback(
 def test_failed_build_retains_actual_failure_reason(
     store: kernel_cache.Store, tmp_path: Path
 ) -> None:
-    from cozy_runtime.internal import kernel_compile
-
     _registry(tmp_path / "sources", corrupt=True)
     job = kernel_sources.job(kernel_sources.PYTHON, 0)
     state = kernel_compile.wait(store, job, "tiny")
@@ -112,6 +116,34 @@ def test_failed_build_retains_actual_failure_reason(
     assert fallback["preferred"] == "tiny" and fallback["selected"] == "sdpa"
     assert "compile_source_mismatch" in fallback["reason"]
     assert selected.waiting == ()
+
+
+@requires_attention_dependencies
+def test_a_kernel_that_failed_here_warns_in_every_run_its_fallback_serves(
+    store: kernel_cache.Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _registry(tmp_path / "sources", corrupt=True)
+    job = kernel_sources.job(kernel_sources.PYTHON, 0)
+    assert kernel_compile.wait(store, job, "tiny").state == "failed"
+    with _host(tmp_path, monkeypatch) as host:
+        assert host.run("failed")["observed"] == "sdpa"
+        [warning] = [r for r in host.replies[-1]["observations"] if r.get("value") == "warn"]
+        assert warning["name"] == "attention kernel failed, a fallback served"
+        assert warning["fields"]["kernel"] == "tiny"
+        assert "compile_source_mismatch" in warning["fields"]["reason"]
+
+
+def test_a_failed_sol_object_warns_once_per_reason(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(attention, "_STATES", {})
+    rows = [
+        {"source": "failed", "state": "failed: compile_failed: CUDA_ERROR_NOT_INITIALIZED"},
+        {"source": "failed", "state": "failed: compile_failed: CUDA_ERROR_NOT_INITIALIZED"},
+        {"source": "store", "tokens": 4096},
+    ]
+    assert attention.failures(["sol-attn"], rows) == [
+        {"kernel": "sol-attn sparse", "reason": rows[0]["state"]}
+    ]
+    assert attention.failures(["sol-attn"], rows[2:]) == []
 
 
 def test_scoped_pin_does_not_hide_other_components_or_invent_a_served_kernel(
