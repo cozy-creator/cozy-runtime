@@ -578,7 +578,9 @@ class _OnDemand:
 _WARM_NOTED: set[type] = set()
 
 #: The requests rank 0 relays to the machine for a follower (`_relay`).
-_RELAYED = frozenset({"sealed_tier", "sealed_stage", "object_files", "model_source"})
+_RELAYED = frozenset(
+    {"sealed_tier", "sealed_stage", "object_files", "model_source"}
+)
 
 #: The runtime modules a construction imports, named ONCE so `start` can warm
 #: exactly the set `_prepare_first` re-imports (cr-104). Warming a name this tuple omits
