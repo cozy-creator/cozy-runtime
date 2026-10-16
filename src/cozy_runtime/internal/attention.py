@@ -1105,6 +1105,9 @@ def _base(projection: object) -> object:
     return projection
 
 
+_FLOATS = frozenset({"float16", "bfloat16", "float32", "float64"})
+
+
 def _projection_dtype(projection: Any) -> str:
     """Encoded output contract, or an ordinary floating Linear's result dtype."""
     import torch
@@ -1115,16 +1118,21 @@ def _projection_dtype(projection: Any) -> str:
     if declared is None and type(projection) is torch.nn.Linear:
         declared = projection.weight.dtype
     name = str(declared).removeprefix("torch.")
-    return name if name in {"float16", "bfloat16", "float32", "float64"} else ""
+    return name if name in _FLOATS else ""
 
 
 def _dtype(module: Any) -> str:
-    """Infer attention activation precision from the active Q/K/V projection contracts.
+    """The site's attention activation precision: its own `activation_dtype` when it declares
+    one (a site that casts Q/K/V itself), else the active Q/K/V projection contracts.
 
     Never inspect unrelated norm parameters or encoded weight buffers. Unknown or
     disagreeing projection contracts admit only an unbounded dtype backend (SDPA).
     Floating Linear inference assumes no external autocast changes its output dtype.
     """
+    declared = getattr(module, "activation_dtype", None)
+    if declared is not None:
+        name = str(declared).removeprefix("torch.")
+        return name if name in _FLOATS else ""
     projections = _projections(module)
     dtypes = {_projection_dtype(projection) for projection in projections}
     return next(iter(dtypes)) if len(dtypes) == 1 and "" not in dtypes else ""

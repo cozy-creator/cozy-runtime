@@ -1,0 +1,2 @@
+- An attention site that casts its own operands declares `activation_dtype`, and selection admits kernels by it (SeedVR2's window attention gets FA3 on Hopper).
+- `split(..., per_element=)`: an op's own bytes-per-element estimate sizes its pieces until the Runtime has measured them, instead of 1/8 of the input.
