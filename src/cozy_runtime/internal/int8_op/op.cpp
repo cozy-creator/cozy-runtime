@@ -147,10 +147,10 @@ void fall_back(const Format& f, cudaError_t error, const Tensor& q, const Tensor
                      (long long)data.size(0), (long long)q.size(1), cudaGetErrorString(error));
     const int64_t M = q.size(0);
     if (fp8) {
-        Tensor value = at::_scaled_mm(q, data.t(), scales.view({M, 1}), scale.view({1, -1}), {},
-                                      {}, out.scalar_type(), true);
-        if (bias.has_value()) value.add_(*bias);
-        out.view({M, -1}).copy_(value);
+        Tensor rows = out.view({M, -1});
+        at::_scaled_mm_out(rows, q, data.t(), scales.view({M, 1}), scale.view({1, -1}), {}, {},
+                           out.scalar_type(), true);
+        if (bias.has_value()) rows.add_(*bias);
         return;
     }
     const Tensor rows = M > 16 ? q : at::constant_pad_nd(q, {0, 0, 0, 17 - M});

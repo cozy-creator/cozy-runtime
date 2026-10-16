@@ -27,20 +27,26 @@ int choose(int M, int N, int, int sms) {
     return filled(256) < 0.9 && filled(128) >= filled(256) ? 1 : 0;
 }
 #elif COZY_SM == 90
-// vLLM's `scaled_mm_sm90_fp8_dispatch.cuh` (Apache-2.0), and the int8 table's cooperative
-// 128x256 for 16k+ rows.
+// vLLM's `scaled_mm_sm90_fp8_dispatch.cuh` (Apache-2.0) up to 128 rows, then measured on an H100
+// SXM at our shapes against cuBLASLt's `_scaled_mm`: the 2x1-cluster cooperative 128x256 matches
+// it at H3's 52k rows (1.24-1.32 PF), the 1x2-cluster ping-pong leads the up projections, the
+// cluster-free cooperative the down projections.
 template <typename Out>
-const Fn kConfigs[4] = {
+const Fn kConfigs[6] = {
     &TmaGemm<E4M3, Out, Shape<_128, _128, _128>, Shape<_2, _1, _1>, Pingpong>::run,     // 0
     &TmaGemm<E4M3, Out, Shape<_64, _128, _128>, Shape<_2, _1, _1>, Pingpong>::run,      // 1
     &TmaGemm<E4M3, Out, Shape<_64, _64, _128>, Shape<_1, _8, _1>, Basic>::run,          // 2
     &TmaGemm<E4M3, Out, Shape<_128, _256, _128>, Shape<_1, _1, _1>, Cooperative>::run,  // 3
+    &TmaGemm<E4M3, Out, Shape<_128, _256, _128>, Shape<_2, _1, _1>, Cooperative>::run,  // 4
+    &TmaGemm<E4M3, Out, Shape<_128, _128, _128>, Shape<_1, _2, _1>, Pingpong>::run,     // 5
 };
 
-int choose(int M, int, int, int) {
+int choose(int M, int N, int K, int) {
     if (M <= 64) return 2;
     if (M <= 128) return 1;
-    return M >= 16384 ? 3 : 0;
+    if (M >= 16384) return 4;
+    if (K >= 4 * N && K >= 5120) return 3;
+    return N >= 2 * K ? 5 : 0;
 }
 #else
 // vLLM's sm120 tile (`scaled_mm_sm120_fp8_dispatch.cuh`, Apache-2.0); no clusters on RTX 50.
