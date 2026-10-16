@@ -9,11 +9,13 @@ card, so run it under the shared GPU lock.
 
 from __future__ import annotations
 
+import ctypes
 import gc
 import io
 import mmap
 import os
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -29,10 +31,11 @@ from tensorfs.derived import Derivation, Part, Target, Tensor  # noqa: E402
 from cozy_runtime.author._activity import asides  # noqa: E402
 from cozy_runtime.author._loader import census  # noqa: E402
 from cozy_runtime.author.kernels import rms_rope_split_half  # noqa: E402
+from cozy_runtime.derive.microscale import encode_fp8_rowwise  # noqa: E402
 from cozy_runtime.internal import accel, paging, plane, spill, weight_policy  # noqa: E402
 from cozy_runtime.internal import weights as weights_module  # noqa: E402
 from cozy_runtime.internal.derive import Observations, serving_substrate  # noqa: E402
-from cozy_runtime.internal.encoding import SPEC_PLAIN  # noqa: E402
+from cozy_runtime.internal.encoding import SPEC_PLAIN, SPEC_ROWWISE  # noqa: E402
 from cozy_runtime.internal.fill import Checkpoint  # noqa: E402
 from cozy_runtime.internal.weights import (  # noqa: E402
     INDIVISIBLE,
@@ -101,12 +104,23 @@ def write_checkpoint(root: Path) -> tuple[Checkpoint, dict[str, Any]]:
     return store_component(root, "stack", values), {k: v.half() for k, v in values.items()}
 
 
-def store_component(root: Path, name: str, values: dict[str, Any]) -> Checkpoint:
-    """`values` as one component's fp16 tensors in a real TensorFS store."""
-    tensors = {
-        key: Tensor("f16", tuple(value.shape), SPEC_PLAIN, {"value": Part("f16", value.shape)})
-        for key, value in values.items()
-    }
+def store_component(
+    root: Path, name: str, values: dict[str, Any], fp8: Collection[str] = ()
+) -> Checkpoint:
+    """`values` as one component's fp16 tensors in a real TensorFS store; those named in
+    `fp8` stored fp8-rowwise (data and a per-row scale)."""
+    parts: dict[str, dict[str, bytes]] = {}
+    tensors: dict[str, Tensor] = {}
+    for key, value in values.items():
+        shape = tuple(value.shape)
+        if key in fp8:
+            encoded = encode_fp8_rowwise(key, value.float().numpy())
+            parts[key] = {"data": encoded.payload, "scale": encoded.companions[0].raw}
+            roles = {"data": Part("f8_e4m3fn", shape), "scale": Part("f32", shape[:1])}
+            tensors[key] = Tensor("f16", shape, SPEC_ROWWISE, roles)
+        else:
+            parts[key] = {"value": value.half().numpy().tobytes()}
+            tensors[key] = Tensor("f16", shape, SPEC_PLAIN, {"value": Part("f16", shape)})
     store = Store.ensure(str(root / "store"))
     writer = store.begin_derived(
         weights_transaction_id("plane-test", "create", "sha256:" + "1" * 64, "model"),
@@ -119,8 +133,9 @@ def store_component(root: Path, name: str, values: dict[str, Any]) -> Checkpoint
         ).native_arguments(1 << 30),
         work_fingerprint="sha256:" + "2" * 64,
     )
-    for key, value in values.items():
-        writer.add_part(name, key, "value", io.BytesIO(value.half().numpy().tobytes()))
+    for key, roles in parts.items():
+        for role, data in roles.items():
+            writer.add_part(name, key, role, io.BytesIO(data))
     writer.add_config(name, io.BytesIO(b"{}"))
     receipt = writer.commit()
     return Checkpoint.from_store(store, "sha256:" + receipt["manifest"]["sha256"])
@@ -136,6 +151,7 @@ def load(
     name: str = "stack",
     factory: Any = None,
     scope: str = "run",
+    leaves: str = "accept",
 ) -> Any:
     """Construct on meta and register with the plane, as the executor's prepare does."""
     backend = PlaneBackend.for_script(
@@ -144,6 +160,7 @@ def load(
         weights=weights,
         construction=key,
         release="plane-test/1",
+        encoded_leaves=leaves,
         tiers=tiers,
     )
     # the serving substrate: parameters weightless, buffers no checkpoint supplies real
@@ -797,6 +814,71 @@ def test_a_bind_that_runs_out_of_device_memory_plans_again_in_what_is_left(card:
     assert weights.facts().oom_retries > retries
     assert weights.facts().streamed["stack"].resident_blocks < BLOCKS
     assert all(torch.equal(a, b) for a, b in zip(resident, squeezed, strict=True))
+
+
+@contextmanager
+def held_elsewhere(nbytes: int) -> Iterator[None]:
+    """`nbytes` of the card outside torch and the plane, through the driver itself: as
+    another process, or the machine's custody, holds them."""
+    cuda = ctypes.CDLL("libcuda.so.1")
+    pointer = ctypes.c_uint64()
+    assert cuda.cuMemAlloc_v2(ctypes.byref(pointer), ctypes.c_size_t(nbytes)) == 0
+    try:
+        yield
+    finally:
+        cuda.cuMemFree_v2(pointer)
+
+
+@on_card
+def test_a_map_the_device_refuses_unmaps_idle_weights_and_the_stage_runs(
+    card: Any, tmp_path: Path
+) -> None:
+    """Runs 9374 and 6972: a stage's map was refused by the device, not by the plane's
+    budget. That budget counted the float copies an idle component's decoded weights hold
+    (torch's bytes) as room to map into, while the rest of the card was taken. Each retry
+    planned in the same budget, moved those copies to host memory (every later step read
+    them over the bus: run 9461 ran 4x slower) and the stage failed with "needs 0 B". The
+    budget is held to what the device gives: the idle weights leave, the stage streams, and
+    it computes the same bits with no tensor moved to host."""
+    weights = card.weights
+    generator = torch.Generator().manual_seed(17)
+    tall = 3 * BLOCKS
+    values = {"embed": torch.rand(HIDDEN, generator=generator) + 0.5}
+    for index in range(tall):
+        for name in ("proj", "out"):
+            values[f"blocks.{index}.{name}.weight"] = (
+                torch.randn(HIDDEN, HIDDEN, generator=generator) / HIDDEN**0.5
+            )
+        values[f"blocks.{index}.norm"] = torch.rand(HIDDEN, generator=generator) + 0.5
+
+    class Tall(Stack):
+        def __init__(self) -> None:
+            super().__init__()
+            self.blocks.extend(Block() for _ in range(tall - BLOCKS))
+
+    stage = load(weights, store_component(tmp_path / "tall", "stack", values), "tall", factory=Tall)
+    eight = {k: v for k, v in values.items() if k == "embed" or int(k.split(".")[1]) < BLOCKS}
+    fp8 = {key for key in eight if key.endswith(".weight")}
+    idle = load(
+        weights, store_component(tmp_path / "fp8", "stack", eight, fp8), "fp8", leaves="refuse"
+    )
+    assert {idle.backend.resolved[f"stack.{key}"].route for key in fp8} == {"decoded_float"}
+    x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
+    weights.set_budget(1 << 30)
+    expected = run(stage, x, passes=1)
+    weights.vacate()
+    run(idle, x, passes=1)  # bound and idle: a float copy of every block's weights
+    assert weights.decoded() >= 2 * BLOCKS * HIDDEN * HIDDEN * 2 > weight_policy.MARGIN
+    weights.set_budget(-1)  # each stage's budget from what the driver has
+    torch.cuda.empty_cache()
+    free, _ = torch.cuda.mem_get_info()
+    moved = spill.MOVED[0]
+    weights.modes.clear()
+    with held_elsewhere(free - (128 << 20)):
+        got = run(stage, x, passes=1)
+    assert "short of device memory" in weights.modes, "the device refused no map"
+    assert spill.MOVED[0] == moved, "a tensor went to host memory instead"
+    assert same(expected, got)
 
 
 @on_card
