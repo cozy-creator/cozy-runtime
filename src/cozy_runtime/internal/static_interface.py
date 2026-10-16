@@ -1188,7 +1188,7 @@ def build_builtin(name: str) -> dict[str, Json]:
     # this reader instance's selected built-in module becomes an App root.
     selected = reader.module("cozy_runtime.derive.operations")
     reader.modules[selected.name] = replace(selected, trusted=False)
-    return _build(reader, application, {})
+    return _build(reader, application)
 
 
 def build_installed(distribution: str, *, environment_python: Path) -> dict[str, Json]:
