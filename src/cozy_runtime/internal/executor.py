@@ -84,6 +84,7 @@ from cozy_runtime.author._errors import (
     ConformanceError,
     InvalidRequest,
     Outcome,
+    RuntimeFailure,
     classify,
     ends,
     is_device_oom,
@@ -529,6 +530,31 @@ class _CompositeResidency:
         }
 
 
+class _OnDemand:
+    """An `on_demand=` model argument: built, and its weights fetched, when the function first
+    reads it. Until then the runtime's probes see no model, and a request that never reads it
+    builds and fetches nothing of it."""
+
+    def __init__(self, build: Callable[[], Any]) -> None:
+        self._build = build
+        self._model: Any = None
+        self._lock = threading.Lock()
+
+    @property
+    def _cozy_residency(self) -> Any:
+        return getattr(self._model, "_cozy_residency", None)
+
+    @property
+    def _cozy_active(self) -> Any:
+        return getattr(self._model, "_cozy_active", None)
+
+    def __getattr__(self, name: str) -> Any:
+        with self._lock:
+            if self._model is None:
+                self._model = self._build()
+        return getattr(self._model, name)
+
+
 #: Model classes that still define `warm` (packages built for an older Runtime), noted once each.
 _WARM_NOTED: set[type] = set()
 
@@ -621,6 +647,8 @@ class Executor:
         )
         #: HOST ONLY: each `Weights[M]` slot's declared components, by `<fn>.models.<param>`
         self.source_components: dict[str, tuple[str, ...]] = {}
+        #: HOST ONLY: the constructed slots built on first use (`on_demand=`), by the same path
+        self.on_demand: frozenset[str] = frozenset()
         self.active = ""
         self.started = False
         #: torch, the Runtime and the package are imported (`Start.import_only`); no device yet
@@ -1547,14 +1575,20 @@ class Executor:
             for slot in entry.models
             if slot.weights and isinstance(slot.components, tuple)
         }
-        if self.fetch is not None and command.constructions and not command.import_only:
+        # A group's GPUs construct in lockstep at its load: it builds every model there.
+        self.on_demand = frozenset(
+            slot.path
+            for entry in interface.entrypoints
+            for slot in entry.models
+            if slot.on_demand and degree == 1
+        )
+        eager = [row for row in command.constructions if row.path not in self.on_demand]
+        if self.fetch is not None and eager and not command.import_only:
             # The Start pass, before torch and the package: the imports, kernel compiles
             # and warmup run while the weights download. Never in an import-only parent: a
             # channel's reader thread would leave it unforkable.
             self.fetch.begin()
-            self.fetch.schedule(
-                fetch_plan.at_start(command.constructions, lambda m: self._model_source(m, ""))
-            )
+            self.fetch.schedule(fetch_plan.at_start(eager, lambda m: self._model_source(m, "")))
         started = time.perf_counter()
         stages: list[tuple[str, float]] = []
         _mark = [started]
@@ -2226,6 +2260,8 @@ class Executor:
         if command.models is not UNSET:
             return self._prepare_many(command, command.models)
         single = command.single()
+        if self._group_parent is None and self._deferred(single.binding):
+            return self._prepare_many(command, (single,))
         binding = single.binding
         self._group_model_key = f"{self.construction}#{binding.model_binding_path}"
         started = time.perf_counter()
@@ -2822,13 +2858,18 @@ class Executor:
             "facts": self.facts,
         }
 
+    def _deferred(self, binding: Binding) -> bool:
+        """Whether this model is built on first use (`on_demand=`)."""
+        return self.world == 1 and binding.model_binding_path in self.host.on_demand
+
     def _prepare_many(self, command: Load, rows: tuple[ModelLoad, ...]) -> dict[str, Any]:
-        """Prepare one complete bounded multi-model callable in this device process."""
-        if not 2 <= len(rows) <= 16:
+        """Prepare one complete bounded multi-model callable in this device process; an
+        on-demand model is built when the function first reads it (`_build_on_demand`)."""
+        if not 1 <= len(rows) <= 16:
             return {
                 "ok": False,
                 "code": "model_binding_set_invalid",
-                "detail": "models must be an array of 2 through 16 binding rows with budgets",
+                "detail": "models must be an array of 1 through 16 binding rows with budgets",
             }
         paths = [row.binding.model_binding_path for row in rows]
         parameters = [row.binding.model_parameter_name for row in rows]
@@ -2862,24 +2903,30 @@ class Executor:
             parameter = binding.model_parameter_name
             child = self._construction_child(self.construction)
             child._group_parent = self
-            reply = child._prepare_first(
-                # The command with one model in place of its set: everything the machine said
-                # about the load holds for each model (a field named one by one here was
-                # dropped twice: `model_sources`, then `device_weights`, so a construction
-                # of two models never attached the machine's GPU weights).
-                msgspec.structs.replace(
-                    command,
-                    construction=self.construction,
-                    binding=binding,
-                    budgets=row.budgets,
-                    models=UNSET,
-                    group=UNSET,
-                    model_key=f"{self.construction}#{binding.model_binding_path}"
-                    if self.world > 1
-                    else UNSET,
-                    sequence_parallel_degree=max(self.world, 1),
-                ),
+            # The command with one model in place of its set: everything the machine said
+            # about the load holds for each model (a field named one by one here was
+            # dropped twice: `model_sources`, then `device_weights`, so a construction
+            # of two models never attached the machine's GPU weights).
+            load = msgspec.structs.replace(
+                command,
+                construction=self.construction,
+                binding=binding,
+                budgets=row.budgets,
+                models=UNSET,
+                group=UNSET,
+                model_key=f"{self.construction}#{binding.model_binding_path}"
+                if self.world > 1
+                else UNSET,
+                sequence_parallel_degree=max(self.world, 1),
             )
+            if self._deferred(binding):
+                # Built inside the attempt that reads it, under that attempt's cap.
+                load = msgspec.structs.replace(load, cap_bytes=UNSET, rank_caps=())
+                build = functools.partial(self._build_on_demand, child, load)
+                child.models = dict.fromkeys(binding.parameter_names(), _OnDemand(build))
+                children.append((parameter, child, {}))
+                continue
+            reply = child._prepare_first(load)
             if not reply.get("ok"):
                 self.poisoned = child.poisoned or (
                     f"model {parameter} refused: {reply.get('code', 'unknown')}"
@@ -2894,8 +2941,11 @@ class Executor:
             name[0].startswith(self.construction + "#") for name in self.host.group_sharded
         ):
             return self._group_refusal(GroupRefusal("the model set contains no sharded component"))
+        built = [(parameter, child, reply) for parameter, child, reply in children if reply]
+        if self.discovered is None:
+            self._discover_provisioned(rows[0].binding)
         self.model_executors = [child for _, child, _ in children]
-        self.torch = children[-1][1].torch
+        self.torch = built[-1][1].torch if built else self.torch
         self.models = {}
         for parameter, child, _ in children:
             if parameter not in child.models or set(child.models) & set(self.models):
@@ -2915,7 +2965,7 @@ class Executor:
 
         constructed = [
             {"parameter": parameter, "digest": str(reply["constructed_model_digest"])}
-            for parameter, _, reply in children
+            for parameter, _, reply in built
         ]
         self.constructed_model_digest = (
             "sha256:"
@@ -2924,8 +2974,8 @@ class Executor:
             ).hexdigest()
         )
 
-        facts_rows = [(parameter, reply["facts"]) for parameter, _, reply in children]
-        last = facts_rows[-1][1]
+        facts_rows = [(parameter, reply["facts"]) for parameter, _, reply in built]
+        last = facts_rows[-1][1] if facts_rows else {}
         scopes = {
             f"{parameter}.{method}": [f"{parameter}/{component}" for component in components]
             for parameter, facts in facts_rows
@@ -3007,7 +3057,9 @@ class Executor:
             "layouts": layouts,
             "plane": self._plane_facts(),
             "declared_scopes": scopes,
-            "rss_bytes": max(int(facts.get("rss_bytes", 0)) for _, facts in facts_rows),
+            "rss_bytes": max(
+                (int(facts.get("rss_bytes", 0)) for _, facts in facts_rows), default=0
+            ),
             "attention": attention_fact,
             "gpu_name": str(last.get("gpu_name", "")),
             "torch_version": str(last.get("torch_version", "")),
@@ -3024,6 +3076,34 @@ class Executor:
             "entrypoints": sorted(self.surface_names),
             "facts": self.facts,
         }
+
+    def _build_on_demand(self, member: Executor, load: Load) -> Any:
+        """An on-demand model's first read: the load its construction deferred, run in the
+        attempt that reads it. From then on each pass wants its weights first when one of its
+        stages begins (`Fetches.want`), and a pass that never uses it asks for none of them."""
+        parameter = load.single().binding.model_parameter_name
+        weights = self.host.weights
+        if weights is not None:  # the attempt's own Degree 2 choice stands
+            load = msgspec.structs.replace(load, device_weights=weights.sharing is not None)
+        try:
+            reply = member._prepare_first(load)
+        except Exception:
+            self.poisoned = self.poisoned or member.poisoned or f"model {parameter} raised"
+            raise
+        if not reply.get("ok"):
+            self.poisoned = self.poisoned or member.poisoned
+            detail = f"model {parameter} refused: {reply.get('detail', '')}"
+            raise RuntimeFailure(detail[:900], code=str(reply.get("code") or "runtime_failure"))
+        member.load_reply = reply
+        self.torch = self.torch or member.torch
+        residency = member.residency
+        if residency is not None:
+            self.residency.rows[parameter] = residency
+            fetch = self.host.fetch
+            if fetch is not None:
+                key = str(id(member.backend))  # the key its Load pass scheduled under
+                residency.wanted = functools.partial(fetch.want, key, residency.fetch_plan)
+        return member.models[parameter]
 
     def _discover_provisioned(self, release: Release) -> None:
         """Import the installed release and bind its PackageInterface. No elapsed-time limit:
@@ -3108,7 +3188,8 @@ class Executor:
             groups = [
                 group
                 for member in target.model_executors or [target]
-                if member.residency is not None
+                # an on-demand model's waits for its first stage (`Fetches.want`)
+                if member.residency is not None and member.residency.wanted is None
                 for group in member.residency.fetch_plan()
             ]
             self.fetch.begin()

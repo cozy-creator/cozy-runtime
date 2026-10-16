@@ -3113,6 +3113,8 @@ class WeightResidency:
         self._quiet = weights.torch.utils._python_dispatch._disable_current_modes
         #: block modules run while `recording`, by component
         self.read: dict[str, set[Module]] | None = None
+        #: an on-demand model's: asks for its weights as a stage begins (`Fetches.want`)
+        self.wanted: Callable[[], None] | None = None
         weights.residencies.add(self)
         for name, component in self.components.items():
             PLACED[component.root] = (self, name)
@@ -3152,6 +3154,8 @@ class WeightResidency:
         self.weights.set_lora(strategy)
 
     def admit(self, method: str, components: tuple[str, ...]) -> None:
+        if self.wanted is not None:
+            self.wanted()
         self._require_clean(method)
         try:
             with self._quiet():  # the plane's own binds are not the package's ops

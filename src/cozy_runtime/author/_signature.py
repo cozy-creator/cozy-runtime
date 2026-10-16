@@ -247,6 +247,8 @@ class Surface:
     model_defaults: Mapping[str, DefaultLadder] = field(default_factory=dict)
     model_components: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     """Model argument -> the components this callable runs; an absent argument runs all."""
+    model_on_demand: tuple[str, ...] = ()
+    """Model arguments built, and their weights fetched, on first use (`on_demand=`)."""
 
     @property
     def outputs(self) -> frozenset[str]:
@@ -390,6 +392,7 @@ def analyze(
     memoize: Memoize | None = None,
     model_defaults: Mapping[str, DefaultLadder] | None = None,
     model_components: Mapping[str, tuple[str, ...]] | None = None,
+    model_on_demand: tuple[str, ...] = (),
 ) -> Surface:
     """Derive the whole surface from the signature. Every refusal here is a BUILD refusal."""
     where = f"{fn.__module__}:{fn.__qualname__}"
@@ -565,6 +568,8 @@ def analyze(
     models = [p.name for p in params if p.role in ("model", "weights")]
     check_model_arguments(model_defaults or {}, models)
     check_model_arguments(model_components or {}, models, what="components")
+    constructed = [p.name for p in params if p.role == "model"]
+    check_model_arguments(dict.fromkeys(model_on_demand), constructed, what="on_demand")
     return Surface(
         name=name,
         fn=fn,
@@ -586,6 +591,7 @@ def analyze(
         memoize=memoize,
         model_defaults=model_defaults or {},
         model_components=model_components or {},
+        model_on_demand=model_on_demand,
     )
 
 

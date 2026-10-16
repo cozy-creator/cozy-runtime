@@ -76,6 +76,8 @@ class ModelSlot(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
     components: tuple[str, ...] | msgspec.UnsetType = msgspec.UNSET
     #: a `Weights[M]` argument: raw checkpoint data, never constructed
     weights: bool = False
+    #: built, and its weights fetched, when the function first reads it (`on_demand=`)
+    on_demand: bool = False
 
     @property
     def parameter(self) -> str:
@@ -195,6 +197,7 @@ def _callable(surface: Surface) -> dict[str, Json]:
                 defaults=surface.model_defaults.get(binding.param, ()),
                 uses=surface.model_components.get(binding.param, ()),
                 weights=binding.weights,
+                on_demand=binding.param in surface.model_on_demand,
             )
             for binding in surface.model_bindings
         ],
@@ -288,6 +291,7 @@ def model_slot(
     defaults: DefaultLadder = (),
     uses: Sequence[str] = (),
     weights: bool = False,
+    on_demand: bool = False,
 ) -> dict[str, Json]:
     """One model slot. The PATH is the binding point, the CLASS carries `encoded_leaves`,
     and the per-public-method component sets are the ComponentUseContracts. Optional authored
@@ -329,6 +333,8 @@ def model_slot(
         doc["sequence_parallel"] = {"degrees": list(sequence_parallel)}
     if weights:
         doc["weights"] = True
+    if on_demand:
+        doc["on_demand"] = True
     return doc
 
 
