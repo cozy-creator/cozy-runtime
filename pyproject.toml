@@ -1,6 +1,6 @@
 [project]
 name = "cozy-runtime"
-version = "0.24.9"
+version = "0.25.0"
 description = "Cozy author surface and device executor"
 # The upstream Apache-2.0 LICENSE/NOTICE ride every wheel: the cp312-abi3 wheel carries
 # the derived native kernels, and shipping them from the pure wheel too keeps one manifest.
@@ -79,9 +79,6 @@ conflicts = [[{ extra = "corpus" }, { group = "diffusers" }]]
 
 # TensorFS 0.10 is unreleased: its master, exactly, until the cohort publishes it (never a test
 # publish). Workflows read it with TENSORFS_READ_KEY. The release replaces this with the version.
-[tool.uv.sources]
-tensorfs = { git = "https://github.com/cozy-creator/tensorfs.git", rev = "edf7df05e101c9bee09831528d34ccb2d31a18b8" }
-
 # Read only on the COZY_RUNTIME_BUILD_KERNELS=1 wheel build; the root CMakeLists.txt is
 # the reviewed kernels build (static cudart, abi3, the upstream fleet arch policy).
 [tool.scikit-build]
