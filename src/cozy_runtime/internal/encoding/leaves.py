@@ -284,17 +284,18 @@ def _int8_leaf_class(torch: ModuleType) -> type:
         def forward(
             self, x: Tensor | PreQuantized, *, prequantized: PreQuantized | None = None
         ) -> Tensor:
-            # A producer's prologue (`kernels.int8_rows`) hands the operand in place of x.
-            given = x if isinstance(x, PreQuantized) else prequantized
-            out_dtype, cast = self.out_dtype, x
-            device = (x if given is None else given.payload).device.type
-            if torch.is_autocast_enabled(device):
+            out_dtype = self.out_dtype
+            if isinstance(x, PreQuantized):
+                # A producer's prologue (`kernels.int8_rows`) hands the operand in place of x.
+                if torch.is_autocast_enabled(x.payload.device.type):
+                    out_dtype = torch.get_autocast_dtype(x.payload.device.type)
+                return int8_linear.gemm(torch, x, self.data, self.scale, self.bias, out_dtype)
+            cast = x
+            if torch.is_autocast_enabled(x.device.type):
                 # As the replaced `nn.Linear` does: from and to the autocast dtype.
-                out_dtype = torch.get_autocast_dtype(device)
-                cast = x if given is x else x.to(out_dtype)
-            if given is not None and given.provider == INT8_CONVROT:
-                prequantized = given
-            else:
+                out_dtype = torch.get_autocast_dtype(x.device.type)
+                cast = x.to(out_dtype)
+            if prequantized is None or prequantized.provider != INT8_CONVROT:
                 prequantized = shared_operand(
                     x, INT8_CONVROT, lambda: int8_linear.quantize(torch, cast)
                 )
@@ -305,10 +306,26 @@ def _int8_leaf_class(torch: ModuleType) -> type:
             return int8_linear.linear(torch, cast, self.data, self.scale, self.bias, out_dtype)
 
         def int8_prologue(
-            self, x: Tensor, consumers: tuple[object, ...], **parts: object
+            self,
+            x: Tensor,
+            consumers: tuple[object, ...],
+            norm: str | None,
+            eps: float,
+            scale: Tensor | None,
+            shift: Tensor | None,
+            activation: str | None,
         ) -> PreQuantized | None:
             """`kernels.int8_rows` for consumers led by this leaf."""
-            return int8_linear.prologue(torch, x, consumers, **parts)
+            return int8_linear.prologue(
+                torch,
+                x,
+                consumers,
+                norm=norm,
+                eps=eps,
+                scale=scale,
+                shift=shift,
+                activation=activation,
+            )
 
     _int8_leaf_class._cached = Int8ConvRotLinear  # type: ignore[attr-defined]
     return Int8ConvRotLinear

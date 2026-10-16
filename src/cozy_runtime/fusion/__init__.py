@@ -9,8 +9,7 @@ A single-stream adaLN block runs, per token row:
     x      = x + act(gate_mlp) * down(silu(gate(normed)) * up(normed))
 
 Eager, each line is several kernels; fused, four row kernels and one per q/k carry it, and
-every GEMM stays the model's own module; the encoded linears that read one normed input
-quantize it once (`kernels.quantize_once`). Declare the layout at module scope, so its kernels
+every GEMM stays the model's own module. Declare the layout at module scope, so its kernels
 compile on the executor's GPUs at boot, and install it in `Model.execution_plan`:
 
     BLOCK = fusion.DiTBlock(MyBlock, width=4096, head_dim=128, modulation=rows, ...)
@@ -33,13 +32,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from cozy_runtime.author.kernels import (
-    KernelsUnavailable,
-    Launch,
-    Plan,
-    TritonKernels,
-    quantize_once,
-)
+from cozy_runtime.author.kernels import KernelsUnavailable, Launch, Plan, TritonKernels
 from cozy_runtime.fusion import _kernels
 
 try:
@@ -302,8 +295,7 @@ def _block_forward(self: Any, *args: Any, **kwargs: Any) -> Any:
         for norm in site.qk:
             norm._cozy_rope = (launch, entries.rope, tables)
     try:
-        with quantize_once(normed):
-            attended = site.attention(normed, **call)
+        attended = site.attention(normed, **call)
     finally:
         for norm in site.qk:
             norm._cozy_rope = None
@@ -319,8 +311,7 @@ def _block_forward(self: Any, *args: Any, **kwargs: Any) -> Any:
         branch=attended,
         gate=rows.gate_msa,
     )
-    with quantize_once(normed):
-        mlp = site.down(_kernels.swiglu(launch, site.gate(normed), site.up(normed)))
+    mlp = site.down(_kernels.swiglu(launch, site.gate(normed), site.up(normed)))
     x, _ = _kernels.norm_modulate(
         launch,
         entries.residual,
