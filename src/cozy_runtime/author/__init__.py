@@ -30,6 +30,7 @@ from cozy_runtime.author._assets import (
     VideoAsset,
 )
 from cozy_runtime.author._attention import (
+    LIKE_PROJECTIONS,
     AttentionContext,
     AttentionProducer,
     ProducerCall,
@@ -174,6 +175,7 @@ from cozy_runtime.author.publication import (
 
 __all__ = [
     "DEFAULT_DECODE_LIMITS",
+    "LIKE_PROJECTIONS",
     "MAX_WEIGHTS_NEW_BYTES",
     "NEUTRAL_ERROR_SET",
     "ActivationCapture",
