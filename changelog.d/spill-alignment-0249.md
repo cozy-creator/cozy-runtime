@@ -1,0 +1,1 @@
+Runtime 0.24.9: spilled tensors keep cudaMalloc's 256-byte alignment, so a cuBLASLt workspace moved under memory pressure stays usable (H3 nvfp4 on a 5090 poisoned its executor with cuBLAS error 7, run 9141); an int8 or nvfp4 fast GEMM that raises falls back to the slower path for that call and the run gets a warning ("encoded GEMM failed, a slower path served").
