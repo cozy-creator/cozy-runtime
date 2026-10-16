@@ -876,7 +876,7 @@ def test_an_op_with_no_room_left_moves_the_tensors_the_process_holds_to_host(car
     assert facts.spilled_bytes - moved >= 128 << 20
     assert all(t.is_cuda and bool((t == i).all()) for i, t in enumerate(held))
     assert spill.PRESSED[0] and spill.USED, "after a spill, ops are noted for the next one"
-    del held, capped, reference
+    del x, held, capped, reference  # the input is a candidate too: no op reads it after the first
     gc.collect()
     spill.release(torch)
     assert not spill.HELD, "every moved tensor is gone"
