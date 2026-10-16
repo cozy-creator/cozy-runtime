@@ -59,8 +59,11 @@ except ImportError:  # pragma: no cover - the base package is torch-free
 #: Set while a mechanism runs its own graphs over a component (`cozy_runtime.lm`): its calls
 #: pass straight through.
 BYPASS: contextvars.ContextVar[bool] = contextvars.ContextVar("cozy_graphs_bypass", default=False)
-#: The first replay's largest relative L2 distance from the call run as written.
-TOLERANCE = 1e-3
+#: The first replay's largest relative L2 distance from the call run as written. A capture may
+#: take other kernels for the same math: CLIP-G's replay on an RTX 4090 starts exact at its
+#: embeddings and drifts 1e-3 per layer to 2.4e-2 at its 32nd; a replay reading wrong state
+#: is off from its first output.
+TOLERANCE = 5e-2
 #: A signature records only when its first call's launches took at least this share of its time
 #: (a GPU that outruns the launches gains nothing from a graph), and keeps its recording only
 #: when a replay takes at most `PAYS` of the call run as written.
@@ -259,10 +262,12 @@ def _dispatch(module: Any, call: Callable[..., Any], args: Any, kwargs: Any) -> 
         launched = time.perf_counter() - started
         torch.cuda.synchronize()
         took = time.perf_counter() - started
-        if launched < HOST_BOUND * took:
+        if not _clonable(out):
+            _chose(recorder, key, "its output", f"a {type(out).__name__}")
+        elif launched < HOST_BOUND * took:
             _chose(recorder, key, "GPU-bound", f"launched in {launched:.3f} of {took:.3f} s")
-            if placed:
-                placed[0].note(f"{placed[1]}.graphs", _facts(recorder))
+        if placed and key in recorder.failed:
+            placed[0].note(f"{placed[1]}.graphs", _facts(recorder))
         for name, blocks in read.items():
             recorder.blocks.setdefault(name, set()).update(blocks)
         return out
