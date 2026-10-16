@@ -59,8 +59,10 @@ except ImportError:  # pragma: no cover - the base package is torch-free
 #: Set while a mechanism runs its own graphs over a component (`cozy_runtime.lm`): its calls
 #: pass straight through.
 BYPASS: contextvars.ContextVar[bool] = contextvars.ContextVar("cozy_graphs_bypass", default=False)
-#: The first replay's largest relative L2 distance from the call run as written.
-TOLERANCE = 1e-3
+#: The first replay's largest relative L2 distance from the call run as written; where two calls
+#: run as written differ too (kernels reducing in no fixed order), up to `NOISE` times that
+#: distance, never past `NOISY` (a call reading state beside its arguments differs by more).
+TOLERANCE, NOISE, NOISY = 1e-3, 4.0, 5e-2
 #: A signature records only when its first call's launches took at least this share of its time
 #: (a GPU that outruns the launches gains nothing from a graph), and keeps its recording only
 #: when a replay takes at most `PAYS` of the call run as written.
@@ -320,27 +322,26 @@ def _record(
         graph, why = None, f"its output {type(outputs[0]).__name__} is not a tree of tensors"
     if graph is not None:
         graph.replay()
-        replayed = [
-            v.float() for v in pytree.tree_leaves(outputs[0]) if isinstance(v, torch.Tensor)
-        ]
+        replayed = _floats(outputs[0])
         written: list[Any] = []
         with attention_ulysses.observing() as served:
-            written_s = _seconds(
-                lambda: written.extend(pytree.tree_leaves(call(module, *cargs, **ckwargs)))
-            )
-        written = [v.float() for v in written if isinstance(v, torch.Tensor)]
-        error = max(
-            (
-                float((a - b).norm() / b.norm().clamp_min(1e-12))
-                for a, b in zip(replayed, written, strict=False)
-            ),
-            default=0.0,
-        )
+            written_s = _seconds(lambda: written.append(call(module, *cargs, **ckwargs)))
+        written = _floats(written[0])
+        error, noise = _distance(replayed, written), 0.0
+        if error > TOLERANCE and len(replayed) == len(written):
+            # kernels that reduce in no fixed order differ between two calls as written too
+            noise = _distance(_floats(call(module, *cargs, **ckwargs)), written)
         if LANDED[0] != landed:
             graph, why = None, ""  # a kernel landed meanwhile: the next call starts over
             _chose(recorder, key, "kernel landed", "")
-        elif len(replayed) != len(written) or not error <= TOLERANCE:
-            graph, why = None, f"its first replay is {error:.2e} from the call run as written"
+        elif len(replayed) != len(written) or error > max(TOLERANCE, min(NOISE * noise, NOISY)):
+            graph, why = (
+                None,
+                (
+                    f"its first replay is {error:.2e} from the call run as written, "
+                    f"{noise:.2e} between two such calls"
+                ),
+            )
         elif (replay_s := _seconds(graph.replay)) > PAYS * written_s:
             graph, why = None, ""  # as fast as written: not worth its memory
             _chose(
@@ -393,6 +394,18 @@ def _seconds(step: Callable[[], object]) -> float:
     return time.perf_counter() - started
 
 
+def _floats(out: Any) -> list[Any]:
+    return [v.float() for v in pytree.tree_leaves(out) if isinstance(v, torch.Tensor)]
+
+
+def _distance(a: list[Any], b: list[Any]) -> float:
+    """The largest relative L2 distance between corresponding tensors."""
+    return max(
+        (float((x - y).norm() / y.norm().clamp_min(1e-12)) for x, y in zip(a, b, strict=False)),
+        default=0.0,
+    )
+
+
 def _clonable(out: Any) -> bool:
     """Whether every leaf of `out` is a tensor or a plain value, so a replay can hand clones."""
     leaves, _ = pytree.tree_flatten(out)
@@ -424,4 +437,15 @@ def _signature(module: Any, leaves: list[Any], spec: Any) -> tuple[object, ...]:
     return tuple(key)
 
 
-__all__ = ["BYPASS", "HOST_BOUND", "PAYS", "TOLERANCE", "capture", "install", "release", "say"]
+__all__ = [
+    "BYPASS",
+    "HOST_BOUND",
+    "NOISE",
+    "NOISY",
+    "PAYS",
+    "TOLERANCE",
+    "capture",
+    "install",
+    "release",
+    "say",
+]
