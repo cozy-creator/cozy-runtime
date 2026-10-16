@@ -376,8 +376,9 @@ class Weights:
         #: components given back to make torch room (`page_out`), and their bytes
         self.paged_out = [0, 0]
         #: methods whose stage fits itself to the room it finds (it runs its ops in `split`
-        #: pieces): their activations never size a grant, nor take a model's whole weights
-        self.adaptive: set[str] = set()
+        #: pieces), and the room their smallest piece needs: all they ask a grant or a plan
+        #: for, and what a model's weights kept whole must leave them
+        self.adaptive: dict[str, int] = {}
         self.oom_retries = 0
         self.modes: dict[str, str] = {}
         #: the stages open now, outermost first. A stage another model slot enters inside one
@@ -621,8 +622,8 @@ class Weights:
                 self.drain()
                 memory, held = self._held()
         slack = max(memory["reserved_bytes"] - memory["allocated_bytes"], 0)
-        # an adaptive stage fits itself to the room it finds: it asks for none
-        need = 0 if method in self.adaptive else self.activation.get(method, 0) - slack
+        # an adaptive stage fits itself to the room it finds: it asks for its smallest piece
+        need = self.adaptive.get(method, self.activation.get(method, 0)) - slack
         if held > self.cap:
             # Still over: the owner raises the cap into the room it makes (never a negative ask).
             self.room(max(need, 0) + weight_policy.MARGIN)
@@ -651,11 +652,11 @@ class Weights:
         return max(free, 0)
 
     def sizing(self) -> int:
-        """The largest measured activations a grant must leave room for (adaptive stages
-        make their own room)."""
-        return max(
-            (v for m, v in self.activation.items() if m not in self.adaptive),
-            default=max(self.activation.values(), default=0),
+        """The largest measured activations a grant must leave room for: an adaptive stage
+        makes its own room, all but its smallest piece's."""
+        sized = (v for m, v in self.activation.items() if m not in self.adaptive)
+        return max((*sized, *self.adaptive.values()), default=0) or max(
+            self.activation.values(), default=0
         )
 
     def _apply(self, nbytes: int) -> int:
@@ -720,11 +721,13 @@ class Weights:
         # Activations first, but never below the open stages' floor while that fits: an
         # estimate that left a stage no room for its own weights would refuse it for size, and
         # it recovers from its out-of-memory by unmapping. An adaptive stage keeps its own
-        # weights and its model's components placed whole: its pieces fit beside them.
+        # weights and its model's components placed whole as far as its smallest piece still
+        # fits beside them: pieces cut no finer than that (SeedVR2's DiT, one latent frame).
         keep = self.window()
         if method in self.adaptive and self.open:
             residency, _, local = self.open[-1]
-            keep = max(keep, residency.kept(local))
+            least = self.adaptive[method] + weight_policy.MARGIN
+            keep = max(keep, min(residency.kept(local), available - least))
         budget = max(weight_policy.plane_budget(available, growth), min(keep, available))
         self.plan_inputs[method] = {
             "driver_free": memory["driver_free_bytes"],
@@ -920,8 +923,9 @@ class Weights:
         if self.cap >= 0:
             free = min(free, self.cap - held)
         method = self.open[-1][1] if self.open else ""
-        # an adaptive stage fits its activations to the room it finds: it asks for none
-        growth = 0 if method in self.adaptive else self.activation.get(method, 0)
+        # an adaptive stage fits its activations to the room it finds: it asks for its
+        # smallest piece
+        growth = self.adaptive.get(method, self.activation.get(method, 0))
         given = weight_policy.plane_budget(self._committed() + free, growth)
         return min(budget, max(given, self.floor()))
 
@@ -3991,11 +3995,11 @@ class WeightResidency:
                 else None
             ),
             # what a grant must leave for activations: an adaptive stage (ops cut into
-            # pieces) fits itself to the room it finds, so its peak never sizes one
+            # pieces) fits itself to the room it finds, so only its smallest piece sizes one
             "attempt_activation_peak_bytes": max(
-                (v for m, v in self.peaks.items() if m not in weights.adaptive),
-                default=max(self.peaks.values(), default=0),
-            ),
+                (weights.adaptive.get(m, v) for m, v in self.peaks.items()), default=0
+            )
+            or max(self.peaks.values(), default=0),
             "attempt_activation_peaks": dict(self.peaks),
             # torch bytes this attempt's bindings moved: decoded resident weights and derived
             # leaf roles kept or dropped, the ledger's declared transition
