@@ -738,6 +738,27 @@ def evidence(served: Iterable[str]) -> list[dict[str, Any]]:
     ]
 
 
+def failures(
+    served: Iterable[str], sol: Iterable[Mapping[str, object]] = ()
+) -> list[dict[str, str]]:
+    """The kernels a run's fallbacks served in place of, because they failed here (compile,
+    import or launch), once per kernel and why; `sol` is the run's Sol object rows, whose failed
+    object serves the dense reference. One still compiling, or ruled out by this card or shape,
+    is by design and is not here."""
+    names = set(served)
+    rows = {
+        (name, state.line())
+        for name, state in _STATES.items()
+        if state.state == "failed" and name not in names
+    }
+    rows |= {
+        (f"{attention_sol.KERNEL} sparse", str(row.get("state", "")))
+        for row in sol
+        if row.get("source") == "failed"
+    }
+    return [{"kernel": kernel, "reason": reason} for kernel, reason in sorted(rows)]
+
+
 def _sol_route(device: DeviceFacts) -> None:
     """Sol serves only its CuTe routes; upstream silently falls back to Triton without CuTe."""
     if device.kind == "cuda":

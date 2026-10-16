@@ -125,6 +125,20 @@ def test_a_failure_is_this_boots_and_the_next_boot_retries(
     assert kernel_compile.status(store, job).state == "pending"
 
 
+def test_a_failure_is_this_runtimes_and_another_runtime_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Runtime that may have fixed the builder compiles the key again in the same boot."""
+    root = _registry(tmp_path / "sources", corrupt=True)
+    store = kernel_cache.Store(tmp_path / "u1")
+    job = kernel_sources.job(kernel_sources.PYTHON, 89, root)
+    kernel_compile.submit(store, job)
+    assert _wait(store, job).state == "failed"
+    kernel_compile._STARTED[job.key.digest][0].wait()
+    monkeypatch.setattr(kernel_compile, "COMMIT", "a-later-build")
+    assert kernel_compile.status(store, job).state == "pending"
+
+
 def test_a_stale_builder_word_does_not_hold_the_key(tmp_path: Path) -> None:
     """A builder killed outright leaves its progress file; its lock died with it."""
     root = _registry(tmp_path / "sources")
