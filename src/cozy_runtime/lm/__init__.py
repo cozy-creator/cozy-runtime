@@ -169,6 +169,13 @@ def _generate(
 ) -> Any:
     try:
         tokens = _static(model, inputs, max_new_tokens, stops, filler, presence_penalty, draft)
+        if tokens is None and draft is not None:
+            # The head's weights and keys cost room the model's own decode set may need: the
+            # graphed decode without drafts beats Transformers' loop by far.
+            _SESSIONS.pop(model, None)
+            say(f"lm:{type(model).__name__}:undrafted", "[lm] drafting does not fit at home")
+            WARNINGS.append(("decoded without drafting", {"why": "the draft head does not fit"}))
+            tokens = _static(model, inputs, max_new_tokens, stops, filler, presence_penalty, None)
         if tokens is not None:
             return tokens
         why = "its decode set does not fit at home"

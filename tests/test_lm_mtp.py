@@ -15,6 +15,7 @@ torch = pytest.importorskip("torch")
 transformers = pytest.importorskip("transformers")
 
 from cozy_runtime import lm  # noqa: E402
+from cozy_runtime.author._model import WARNINGS  # noqa: E402
 from cozy_runtime.internal import kernel_cache, kernel_compile, triton_kernels  # noqa: E402
 from cozy_runtime.lm import _kernels  # noqa: E402
 
@@ -226,3 +227,27 @@ def test_a_verify_pass_steps_its_tokens_as_decode_does(
     for t in range(tokens):
         one = conv(x[..., _kernels.CONV + t :][..., :1].contiguous(), window, weight, None, "silu")
         assert torch.equal(got[..., _kernels.CONV + t], one[..., 0])
+
+
+def test_a_head_that_does_not_fit_decodes_without_drafting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Where the model's decode set fits at home only without the head (a 16 GB card holding
+    Klein and its upsampler), the graphed decode runs undrafted, not Transformers' loop."""
+    torch.manual_seed(5)
+    model = _qwen3_5()
+    ids = torch.randint(10, 44, (1, 30), device=DEVICE)
+    want = _reference(model, ids, 40, 0.0)
+    static = lm._static
+    monkeypatch.setattr(lm, "_static", lambda *a: None if a[-1] is not None else static(*a))
+    WARNINGS.clear()
+    got = lm.generate(
+        model,
+        {"input_ids": ids, "attention_mask": torch.ones_like(ids)},
+        max_new_tokens=40,
+        stop=STOP,
+        pad=0,
+        draft=_head(model),
+    )
+    assert torch.equal(got, want)
+    assert [message for message, _ in WARNINGS] == ["decoded without drafting"]
