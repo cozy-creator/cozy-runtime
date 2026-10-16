@@ -876,6 +876,9 @@ def test_an_op_with_no_room_left_moves_the_tensors_the_process_holds_to_host(car
     assert same(reference, capped)
     assert facts.spilled_bytes - moved >= 128 << 20
     assert all(t.is_cuda and bool((t == i).all()) for i, t in enumerate(held))
+    # cudaMalloc's alignment holds in host memory too: a moved cuBLASLt workspace off it is
+    # INVALID_VALUE (run 9141).
+    assert any(map(spill.hosted, held)) and all(t.data_ptr() % 256 == 0 for t in held)
     assert spill.PRESSED[0] and spill.USED, "after a spill, ops are noted for the next one"
     del held, capped, reference
     gc.collect()

@@ -26,6 +26,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+from cozy_runtime.author._errors import is_device_oom
 from cozy_runtime.author.kernels import INT8_CONVROT, PreQuantized, readable
 from cozy_runtime.internal import kernel_cache, kernel_compile, kernel_sources
 from cozy_runtime.internal.encoding.formats import CONVROT_GROUP, Tensor, hadamard256
@@ -80,6 +81,28 @@ def _built(
         state.final = f"{type(exc).__name__}: {exc}"[:300]
         print(f"[int8] no {name} for this executor: {state.final}", file=sys.stderr)
     return state.served
+
+
+#: Calls a fast op raised on, as run warnings `(message, fields)`: the executor puts each in the
+#: run it served and clears them.
+FAILED: list[tuple[str, dict[str, str | int]]] = []
+
+
+def failed(op: str, device: int, exc: Exception) -> None:
+    """`op` raised on this card: its caller serves a slower path for this one call, and the run
+    says so, once per reason. A device OOM raises: it is the memory manager's to answer."""
+    if is_device_oom(exc):
+        raise exc
+    reason = f"{type(exc).__name__}: {exc}"[:300]
+    row = (
+        "encoded GEMM failed, a slower path served",
+        {"op": op, "device": device, "reason": reason},
+    )
+    if row not in FAILED:
+        FAILED.append(row)
+        print(
+            f"[int8] {op} failed on cuda:{device}, a slower path serves: {reason}", file=sys.stderr
+        )
 
 
 def _store() -> kernel_cache.Store:
@@ -149,20 +172,23 @@ def linear(
     torch: ModuleType, x: Tensor, data: Tensor, scale: Tensor, bias: Tensor | None, out_dtype: Any
 ) -> Tensor:
     """`x @ W.T + bias` for one `int8-convrot256/1` weight: `data` int8 `[N, K]`, `scale` f32."""
-    op = _OPS.get(x.get_device())
-    if op is not None and x.dtype in _HALF:
-        return op(x, data, scale, bias, out_dtype)
-    if x.is_cuda and x.dtype in (torch.bfloat16, torch.float16):
-        index = x.device.index or 0
-        op = native(torch, index)
-        if op is not None:
+    index = x.get_device()
+    op = _OPS.get(index)
+    try:
+        if op is not None and x.dtype in _HALF:
             return op(x, data, scale, bias, out_dtype)
-        module = kitchen(torch, index)
-        if module is not None:
-            with readable(data, scale, bias) as (data, scale, bias):
-                return module.int8_linear(
-                    x, data, scale, bias, out_dtype, convrot=True, convrot_groupsize=CONVROT_GROUP
-                )
+        if x.is_cuda and x.dtype in (torch.bfloat16, torch.float16):
+            op = native(torch, index)
+            if op is not None:
+                return op(x, data, scale, bias, out_dtype)
+            module = kitchen(torch, index)
+            if module is not None:
+                with readable(data, scale, bias) as (d, s, b):
+                    return module.int8_linear(
+                        x, d, s, b, out_dtype, convrot=True, convrot_groupsize=CONVROT_GROUP
+                    )
+    except Exception as exc:  # eager serves this call
+        failed(OP if op is not None else ARTIFACT, index, exc)
     out = eager(torch, x, data, scale, out_dtype)
     return out if bias is None else out + bias.to(out.dtype)
 
@@ -174,7 +200,11 @@ def quantize(torch: ModuleType, x: Tensor) -> PreQuantized | None:
         return None
     if _OPS.get(x.get_device()) is None:
         return None
-    payload, scale = torch.ops.cozy.int8_quantize.default(x)
+    try:
+        payload, scale = torch.ops.cozy.int8_quantize.default(x)
+    except Exception as exc:
+        failed(OP, x.get_device(), exc)
+        return None
     return PreQuantized(payload, scale, tuple(x.shape), INT8_CONVROT)
 
 
@@ -211,9 +241,13 @@ def prologue(
             or module._forward_pre_hooks  # type: ignore[attr-defined]
         ):
             return None
-    payload, row_scale = torch.ops.cozy.int8_quantize.default(
-        x, scale, shift, NORMS[norm], eps, ACTIVATIONS[activation]
-    )
+    try:
+        payload, row_scale = torch.ops.cozy.int8_quantize.default(
+            x, scale, shift, NORMS[norm], eps, ACTIVATIONS[activation]
+        )
+    except Exception as exc:
+        failed(OP, x.get_device(), exc)
+        return None
     return PreQuantized(payload, row_scale, tuple(x.shape), INT8_CONVROT)
 
 
@@ -227,9 +261,14 @@ def gemm(
 ) -> Tensor:
     """The linear of a `quantize`d operand: the op's GEMM, both scales and the bias in its
     epilogue."""
-    out = torch.ops.cozy.int8_gemm.default(
-        operand.payload, operand.scale, data, scale, bias, out_dtype
-    )
+    try:
+        out = torch.ops.cozy.int8_gemm.default(
+            operand.payload, operand.scale, data, scale, bias, out_dtype
+        )
+    except Exception as exc:  # torch's int8 GEMM serves this call
+        failed(OP, operand.payload.get_device(), exc)
+        out = _product(torch, operand.payload, operand.scale, data, scale, out_dtype)
+        out = out if bias is None else out + bias.to(out.dtype)
     return out.view(*operand.shape[:-1], -1)
 
 
@@ -238,6 +277,19 @@ def eager(torch: ModuleType, x: Tensor, data: Tensor, scale: Tensor, out_dtype: 
     rotated = hadamard256(torch, x.reshape(-1, x.shape[-1]).float()).mul_(1.0 / 16)
     row_scale = (rotated.abs().amax(-1, keepdim=True) / 127.0).clamp_(min=1e-12)
     quantized = torch.round(rotated / row_scale).clamp_(-127, 127).to(torch.int8)
+    out = _product(torch, quantized, row_scale, data, scale, out_dtype)
+    return out.reshape(*x.shape[:-1], -1)
+
+
+def _product(
+    torch: ModuleType,
+    quantized: Tensor,
+    row_scale: Tensor,
+    data: Tensor,
+    scale: Tensor,
+    out_dtype: Tensor,
+) -> Tensor:
+    """`[M, K]` int8 rows times the weight in torch's int8 GEMM, both scales applied."""
     rows = int(quantized.shape[0])
     if quantized.is_cuda:
         # cuBLASLt's int8 GEMM takes more than 16 rows; the padding rows are zeros.
@@ -245,5 +297,5 @@ def eager(torch: ModuleType, x: Tensor, data: Tensor, scale: Tensor, out_dtype: 
         acc = torch._int_mm(padded, data.t())[:rows]
     else:
         acc = quantized.to(torch.int32) @ data.to(torch.int32).t()
-    out = acc.float().mul_(row_scale).mul_(scale.float().reshape(1, -1))
-    return out.to(out_dtype).reshape(*x.shape[:-1], -1)
+    out = acc.float().mul_(row_scale.reshape(-1, 1)).mul_(scale.float().reshape(1, -1))
+    return out.to(out_dtype)

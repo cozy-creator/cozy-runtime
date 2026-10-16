@@ -9,7 +9,8 @@
   per weight where bf16 reads 2, which is what an LM's token loop is bound by. Larger M decodes the
   weight once into a transient and takes the bf16 GEMM.
 * **Eager decode** where neither exists (CPU, no Triton, the kitchen build still running at large
-  M on Blackwell takes W4A16 instead), so no run waits for a compile.
+  M on Blackwell takes W4A16 instead), so no run waits for a compile. A W4A4 call that raises is
+  served by W4A16, and the run says so (`int8_linear.failed`).
 
 `torch` is the torch module: this module imports no torch.
 """
@@ -272,22 +273,19 @@ def matmul(
         if module is not None:
             amax = flat.abs().amax().float()
             tensor_scale = (amax / LEVELS_MAX).clamp(min=SCALE_FLOOR).reshape(1)
-            with readable(weight, blocked_scale, scale_2) as (weight, blocked_scale, scale_2):
-                # hi_first=False: element 2k in the LOW nibble, the stored weight's order.
-                # Kitchen's default packs the other way; a K-wise dot only needs both to agree.
-                payload, block = module.quantize_nvfp4(
-                    flat, tensor_scale, 0.0, rows % NVFP4_BLOCK != 0, False
-                )
-                out = module.scaled_mm_nvfp4(
-                    payload,
-                    weight,
-                    tensor_scale,
-                    scale_2,
-                    block,
-                    blocked_scale,
-                    out_dtype=out_dtype,
-                )
-            return out[:rows].reshape(*x.shape[:-1], rows_out)
+            try:
+                with readable(weight, blocked_scale, scale_2) as (w, scales, second):
+                    # hi_first=False: element 2k in the LOW nibble, the stored weight's order.
+                    # Kitchen's default packs the other way; a K-wise dot only needs both agree.
+                    payload, block = module.quantize_nvfp4(
+                        flat, tensor_scale, 0.0, rows % NVFP4_BLOCK != 0, False
+                    )
+                    out = module.scaled_mm_nvfp4(
+                        payload, w, tensor_scale, second, block, scales, out_dtype=out_dtype
+                    )
+                return out[:rows].reshape(*x.shape[:-1], rows_out)
+            except Exception as exc:  # W4A16 serves this call
+                int8_linear.failed("comfy-kitchen nvfp4", index, exc)
         kernels = _kernels()
         if kernels is not None:
             gemv, gemv1, gather, dequant = kernels

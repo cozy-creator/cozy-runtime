@@ -34,6 +34,9 @@ SMALLEST = 1 << 20
 _MAPPED = 3
 #: Host blocks are locked in multiples of this, so maps of about one size share them.
 GRAIN = 2 << 20
+#: cudaMalloc's alignment, which CUDA libraries take for granted (cuBLASLt answers INVALID_VALUE
+#: for a workspace off it: run 9141); torch's host allocator gives 64.
+ALIGN = 256
 #: [times tensors moved, their bytes, nanoseconds it took] since the process began
 MOVED = [0, 0, 0]
 #: locked blocks no tensor holds, by size; and the address of every block one holds -> its size
@@ -68,12 +71,14 @@ class _Host:
         if free:
             self.data = free.pop()
         else:
-            self.data = torch.empty(self.size, dtype=torch.uint8)
+            self.data = torch.empty(self.size + ALIGN, dtype=torch.uint8)
             cudart = torch.cuda.cudart()
             torch.cuda.check_error(
-                cudart.cudaHostRegister(self.data.data_ptr(), self.size, _MAPPED)
+                cudart.cudaHostRegister(self.data.data_ptr(), self.size + ALIGN, _MAPPED)
             )
-        pointer = self.data.data_ptr()
+        start = -self.data.data_ptr() % ALIGN
+        self.view = self.data[start : start + self.size]
+        pointer = self.view.data_ptr()
         HELD[pointer] = self.size
         self.__cuda_array_interface__ = {
             "shape": (nbytes,),
@@ -83,7 +88,7 @@ class _Host:
         }
 
     def __del__(self) -> None:
-        HELD.pop(self.data.data_ptr(), None)
+        HELD.pop(self.view.data_ptr(), None)
         _FREE.setdefault(self.size, []).append(self.data)
 
 
@@ -202,7 +207,7 @@ def spill(
 def _move(torch: ModuleType, device: Device, storage: UntypedStorage) -> int:
     nbytes = int(storage.nbytes())
     host = _Host(torch, nbytes)
-    host.data[:nbytes].copy_(torch.empty(0, dtype=torch.uint8, device=device).set_(storage))
+    host.view[:nbytes].copy_(torch.empty(0, dtype=torch.uint8, device=device).set_(storage))
     alias = torch.as_tensor(host, device=device)
     storage._swap_data_ptr_(alias.untyped_storage())
     return nbytes
