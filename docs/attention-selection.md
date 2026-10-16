@@ -20,6 +20,12 @@ class VideoModel(Model[object]):
         return None  # Keep Runtime's recommendation for other sites.
 ```
 
+A preference may name `LIKE_PROJECTIONS` (`cozy_runtime.author`): at each site, the
+attention kernel quantized like that site's Q/K/V projections, on the cards where it was
+measured faster than float attention (int8 leaves: `kitchen-int8` on sm86/sm89). Float
+projections expand to nothing, so one model keeps float attention on its bf16 lane and
+quantizes it on its int8 lane. The model consents; which encoding serves stays Runtime's.
+
 The immutable context contains component and module path, device kind/name/SM,
 attention activation dtype, head dimension, parallel degree, eligible names and
 the recommendation's evidence/reason. Activation dtype comes from active projection

@@ -11,6 +11,12 @@ from typing import Any
 from cozy_runtime.author._attention_scope import AttentionLayout
 from cozy_runtime.author.kernels import PreQuantized
 
+#: A preference entry (`Model.choose_attention`): the attention kernel quantized like this
+#: site's Q/K/V projections, where Runtime serves one on this card (int8 leaves: `kitchen-int8`
+#: on sm86/sm89); none for float projections. The model consents; which encoding serves stays
+#: Runtime's (`encoded_leaves`).
+LIKE_PROJECTIONS = "like-projections"
+
 
 @dataclass(frozen=True, slots=True)
 class AttentionContext:
