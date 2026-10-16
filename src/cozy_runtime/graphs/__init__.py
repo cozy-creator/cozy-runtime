@@ -258,6 +258,8 @@ def _dispatch(module: Any, call: Callable[..., Any], args: Any, kwargs: Any) -> 
         if launched < HOST_BOUND * (time.perf_counter() - started):
             recorder.failed.add(key)
             recorder.plain += 1
+            if placed:
+                placed[0].note(f"{placed[1]}.graphs", _facts(recorder))
         for name, blocks in read.items():
             recorder.blocks.setdefault(name, set()).update(blocks)
         return out
