@@ -20,8 +20,10 @@ A signature is the tensors' shapes, dtypes, devices and strides and every other 
 value; a recording also keys on the code each submodule runs (an attention kernel switch, a
 forward swapped between requests). A call with an argument
 that is not a tensor or a plain value (a cache object), with gradients, on a CPU, inside another
-capture, or under `BYPASS` (`cozy_runtime.lm` runs its own) runs as written, and so does one whose
-blocks do not all fit at home (a stage that streams) or whose capture fails (a run warning). The
+capture, or under `BYPASS` (`cozy_runtime.lm` runs its own) runs as written, and so does one in
+an attention layout's scope (sparse attention reads its step), under an activation capture,
+across GPUs (every GPU's peers must replay alike), whose blocks do not all fit at home (a stage
+that streams) or whose capture fails (a run warning). The
 plane drops every recording before it unmaps a weight for room (`release`).
 
 `capture(step, pool, stream)` is the recipe: on a side stream, in thread-local mode so the
@@ -39,7 +41,10 @@ import weakref
 from collections.abc import Callable, Mapping
 from typing import Any
 
+from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT
+from cozy_runtime.author._capture import _capture_clock
 from cozy_runtime.author._model import PLACED, RELEASERS, WARNINGS
+from cozy_runtime.internal import attention_ulysses
 
 try:
     import torch
@@ -95,16 +100,22 @@ def capture(step: Callable[[], object], pool: Any, stream: Any) -> tuple[Any, st
 
 
 class _Recording:
-    """One signature's graph, its static inputs and outputs, and the layout it was recorded at."""
+    """One signature's graph, its static inputs and outputs, the layout it was recorded at, and
+    the attention implementations it serves (a replay reports them as a call would)."""
 
-    def __init__(self, graph: Any, inputs: list[Any], outputs: Any, layout: object) -> None:
+    def __init__(
+        self, graph: Any, inputs: list[Any], outputs: Any, layout: object, served: Any
+    ) -> None:
         self.graph, self.inputs, self.outputs, self.layout = graph, inputs, outputs, layout
+        self.served = [(b, i) for b, impls in served.items() for i in impls]
 
     def __call__(self, leaves: list[Any]) -> Any:
         for static, value in zip(self.inputs, leaves, strict=True):
             if static is not None:
                 static.copy_(value)
         self.graph.replay()
+        for backend, implementation in self.served:
+            attention_ulysses.record(backend, implementation)
         return pytree.tree_map(
             lambda v: v.clone() if isinstance(v, torch.Tensor) else v, self.outputs
         )
@@ -192,6 +203,9 @@ def _dispatch(module: Any, call: Callable[..., Any], args: Any, kwargs: Any) -> 
         or not torch.cuda.is_available()
         or torch.is_grad_enabled()
         or torch.cuda.is_current_stream_capturing()
+        or _ACTIVE_LAYOUT.get() is not None
+        or _capture_clock.get() is not None
+        or (torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1)
     ):
         return call(module, *args, **kwargs)
     leaves, spec = pytree.tree_flatten((args, kwargs))
@@ -264,8 +278,9 @@ def _record(
     static = [s if s is not None else v for s, v in zip(inputs, leaves, strict=True)]
     cargs, ckwargs = pytree.tree_unflatten(static, spec)
     outputs: list[Any] = []
+    pool = recorder.pool
     graph, why = capture(
-        lambda: outputs.append(call(module, *cargs, **ckwargs)), recorder.pool, recorder.stream
+        lambda: outputs.append(call(module, *cargs, **ckwargs)), pool, recorder.stream
     )
     if graph is not None and not _clonable(outputs[0]):
         graph, why = None, f"its output {type(outputs[0]).__name__} is not a tree of tensors"
@@ -274,11 +289,9 @@ def _record(
         replayed = [
             v.float() for v in pytree.tree_leaves(outputs[0]) if isinstance(v, torch.Tensor)
         ]
-        written = [
-            v.float()
-            for v in pytree.tree_leaves(call(module, *cargs, **ckwargs))
-            if isinstance(v, torch.Tensor)
-        ]
+        with attention_ulysses.observing() as served:
+            out = call(module, *cargs, **ckwargs)
+        written = [v.float() for v in pytree.tree_leaves(out) if isinstance(v, torch.Tensor)]
         error = max(
             (
                 float((a - b).norm() / b.norm().clamp_min(1e-12))
@@ -301,8 +314,10 @@ def _record(
             ("a CUDA graph was not used", {"module": type(module).__name__, "why": why})
         )
         return None
-    recorder.pool_bytes += max(torch.cuda.memory_reserved() - reserved, 0)
-    entry = recorder.recordings[key] = _Recording(graph, inputs, outputs[0], layout)
+    entry = _Recording(graph, inputs, outputs[0], layout, served)
+    if recorder.pool is pool:  # else the plane released the pool for room meanwhile
+        recorder.pool_bytes += max(torch.cuda.memory_reserved() - reserved, 0)
+        recorder.recordings[key] = entry
     return entry
 
 
@@ -323,11 +338,14 @@ def _clonable(out: Any) -> bool:
 
 def _structure(module: Any) -> tuple[object, ...]:
     """Which code each submodule runs: its class, any forward set on the instance (SDXL's
-    hidiffusion swaps them between requests) and its attention processor (a kernel switch)."""
-    return tuple(
-        (id(type(m)), id(m.__dict__.get("forward")), id(getattr(m, "processor", None)))
-        for m in module.modules()
-    )
+    hidiffusion swaps them between requests), its attention processor and the kernel that
+    processor calls (a request's pin, or the compiled one replacing SDPA)."""
+    rows = []
+    for m in module.modules():
+        processor = getattr(m, "processor", None)
+        backend = getattr(processor, "_attention_backend", None)
+        rows.append((id(type(m)), id(m.__dict__.get("forward")), id(processor), backend))
+    return tuple(rows)
 
 
 def _signature(module: Any, leaves: list[Any], spec: Any) -> tuple[object, ...]:
