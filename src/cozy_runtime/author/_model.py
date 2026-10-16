@@ -1,11 +1,11 @@
-"""The `Model` boundary: role classes, the one class keyword, component-use scopes, the
+"""The `Model` boundary: role classes, the class keywords, component-use scopes, the
 construction transaction, and construction-identity coalescing.
 
 THE SIGNATURE IS THE SLOT (§1.1): a bare typed parameter (`model: Fl2VAModel`) is the whole
 declaration and its derived canonical path (`generate.models.model`) is the binding point.
 There is no slot object, no `artifacts=` dict, and the `Annotated` override-marker plane is
-EMPTY at launch. The CLASS carries exactly one keyword, `encoded_leaves`; there are no
-stamps, no `task=`/`objective=`/`structure=`, and no model or release name anywhere in code
+EMPTY at launch. The CLASS carries closed keywords (`encoded_leaves`, `min_bits`, `phase`); there
+are no stamps, no `task=`/`objective=`/`structure=`, and no model or release name anywhere in code
 (model-code-fit §1, D1). A semantic twin is a component name or a config fact.
 
 Construction identity is (package release, model class, exact artifact snapshot + immutable
@@ -114,6 +114,25 @@ ENCODED_LEAVES: Mapping[str, str] = {
     "no `.weight` read, no per-module dtype walk, no submodule rebuilt from one — so a "
     "linear op may be replaced by a module whose weight is the stored role set",
 }
+
+#: `min_bits=`: the lowest weight precision the machine's lane rules may pick by themselves.
+MIN_BITS: Mapping[int, str] = {
+    16: "16-bit unless the request asks for fewer bits",
+    8: "8-bit by default (the default)",
+    4: "4-bit for a decode slot, or when the 8-bit weights exceed the GPU budget",
+}
+
+#: `phase=`: what bounds the slot's time, so the lane rules know when bytes matter most.
+PHASES: Mapping[str, str] = {
+    "compute": "diffusion or prefill, bound by arithmetic (the default)",
+    "decode": "an LM's token loop, bound by weight bytes",
+}
+
+
+def closed(vocabulary: Collection[object], value: object) -> bool:
+    """`value` is one of `vocabulary`'s keys, of the key's own type (no `8.0`, no `True`)."""
+    return any(type(value) is type(key) and value == key for key in vocabulary)
+
 
 #: Keyword names an author-facing model method may not declare. Every one of them names a
 #: residency, placement or conversion decision the runtime owns (§1.1/§7).
@@ -558,6 +577,11 @@ class Model[PipelineT]:
     survives leaf replacement, and reading its silence as "yes" would be the runtime
     deciding a question only the author can answer."""
 
+    __min_bits__: int = 8
+    """`min_bits=`: the lowest weight precision the lane rules may pick (`MIN_BITS`)."""
+    __phase__: str = "compute"
+    """`phase=`: "decode" for an LM's token loop, else "compute" (`PHASES`)."""
+
     __adapter_compatibility__: tuple[AdapterCompatibility, ...] = ()
     """Closed generic adapter declarations; empty means overlays are refused."""
 
@@ -583,22 +607,26 @@ class Model[PipelineT]:
     _cozy_memo: StageMemo | None = None
     """Runtime-installed: where `memoize=True` methods look before their scope opens."""
 
-    def __init_subclass__(cls, /, **keywords: str) -> None:
-        """The class-keyword plane is exactly `encoded_leaves` (model-code-fit §1): the
-        closed consent about what the runtime may substitute. A package's own fused plan is
-        its `execution_plan`.
+    def __init_subclass__(cls, /, **keywords: object) -> None:
+        """The class-keyword plane: `encoded_leaves` (model-code-fit §1), the closed consent
+        about what the runtime may substitute, and the precision tolerances `min_bits` and
+        `phase` (xs-042). Each is inherited by subclasses. A package's own fused plan is its
+        `execution_plan`.
 
         Anything else refuses typed: the open stamp vocabulary (`task=`, `objective=`),
         `structure=` and `self_loading=` are deleted (D1), and a keyword the runtime does not
         read is not a fact anyone else would look for.
         """
         super().__init_subclass__()
-        for keyword, vocabulary, attribute in (
+        vocabularies: tuple[tuple[str, Mapping[Any, str], str], ...] = (
             ("encoded_leaves", ENCODED_LEAVES, "__encoded_leaves__"),
-        ):
+            ("min_bits", MIN_BITS, "__min_bits__"),
+            ("phase", PHASES, "__phase__"),
+        )
+        for keyword, vocabulary, attribute in vocabularies:
             if keyword in keywords:
                 value = keywords.pop(keyword)
-                if value not in vocabulary:
+                if not closed(vocabulary, value):
                     raise ConformanceError(
                         f"class {cls.__name__}({keyword}={value!r}): the vocabulary is CLOSED — "
                         + " | ".join(f"{k!r}: {why}" for k, why in vocabulary.items()),
@@ -608,8 +636,8 @@ class Model[PipelineT]:
         if keywords:
             names = ", ".join(f"{key}=…" for key in keywords)
             raise ConformanceError(
-                f"class {cls.__name__}({names}): a Model class carries exactly one keyword, "
-                "encoded_leaves — fusion=, stamps, task=, objective= and structure= are "
+                f"class {cls.__name__}({names}): a Model class carries encoded_leaves, "
+                "min_bits and phase — fusion=, stamps, task=, objective= and structure= are "
                 "deleted (model-code-fit D1); a semantic twin is a component name or a config "
                 "fact",
                 code="class_keyword",

@@ -103,7 +103,7 @@ def test_a_writers_output_lands_only_through_its_grant(tmp_path: Path, granted: 
     store = tensorfs.Store.init(tmp_path / "store")
     source = _source(store, "unet")
     module = sys.modules[app.get("quantize").fn.__module__]
-    builtin = Discovered(app, f"{module.__name__}:app", tmp_path, module, describe(app), {})
+    builtin = Discovered(app, f"{module.__name__}:app", tmp_path, module, describe(app))
     outputs = {"model": MAX_QUANTIZED_BYTES}
     with (
         NativeExecution(

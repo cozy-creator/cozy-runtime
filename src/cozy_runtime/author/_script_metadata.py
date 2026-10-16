@@ -122,14 +122,11 @@ def main_definition(tree: ast.Module) -> ast.FunctionDef | ast.AsyncFunctionDef:
     return definition
 
 
-type Rungs = list[dict[str, Any]]
-
-
 def declarations(
     raw: bytes,
-) -> tuple[dict[str, Rungs], tuple[WeightsOutput, ...], Literal[False] | None]:
-    """A script's `[tool.cozy]`: its model default ladders (a lane string is one `*` rung), its
-    weights outputs and `accelerator = false` (absent: the machine's GPU when it has one)."""
+) -> tuple[dict[str, str], tuple[WeightsOutput, ...], Literal[False] | None]:
+    """A script's `[tool.cozy]`: its model default releases, its weights outputs and
+    `accelerator = false` (absent: the machine's GPU when it has one)."""
     block: list[str] = []
     opened = found = False
     for line in raw.decode("utf-8").splitlines():
@@ -154,14 +151,7 @@ def declarations(
     accelerator = cozy.get("accelerator")
     if accelerator is not None and accelerator is not False:
         raise ValueError("script accelerator is false or absent")
-    declared = cozy.get("models", {})
-    if not isinstance(declared, dict):
-        raise ValueError("script models must map parameter names to default ladders")
-    models = {
-        name: [{"gpu": "*", "lane": value}] if isinstance(value, str) else value
-        for name, value in declared.items()
-    }
-    model_defaults(models)
+    models = model_defaults(cozy.get("models", {}))
     weights = cozy.get("weights", {})
     if (
         not isinstance(weights, dict)

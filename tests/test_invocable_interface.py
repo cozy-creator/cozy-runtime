@@ -64,7 +64,7 @@ def described() -> tuple[App, bytes]:
     app = App()
     app.entrypoint(transform, accelerator=False)
     found = Discovered(
-        app, __name__ + ":app", Path(__file__).parent, sys.modules[__name__], describe(app), {}
+        app, __name__ + ":app", Path(__file__).parent, sys.modules[__name__], describe(app)
     )
     return app, package_interface.canonical_bytes(package_interface.build(found))
 

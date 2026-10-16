@@ -64,16 +64,12 @@ warn_unreachable = true
 def _package_toml(pkg: str) -> str:
     return f"""[application]
 object = "{pkg}:app"
-
-# Default bindings only — package.toml is a default, never a source of truth.
-# [bindings."MyModel"]
-# model = "org/model@release"
 """
 
 
 _MODULE = '''"""__PKG__ — a cozy-runtime package.
 
-Code states capability; package.toml states selection. The SIGNATURE is the contract:
+The SIGNATURE is the contract:
 naming `out: Outputs` IS declaring the save capability, and a `model: MyModel` parameter
 is what derives `gpu`. Nothing else declares either.
 """

@@ -54,13 +54,7 @@ needs_torch = pytest.mark.skipif(bool(NO_TORCH), reason=NO_TORCH or "")
 
 
 def _slot_document(slot: ModelBinding) -> dict[str, object]:
-    return package_interface.model_slot(
-        slot.path,
-        slot.class_key,
-        slot.encoded_leaves,
-        slot.components,
-        slot.sequence_parallel,
-    )
+    return package_interface.model_slot(slot.path, package_interface.ModelSpec.of(slot.model_class))
 
 
 def test_the_authors_degrees_reach_the_interface_and_its_fixed_point() -> None:

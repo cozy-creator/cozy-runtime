@@ -77,9 +77,7 @@ def test_preparation_descriptor_is_argument_metadata(tmp_path: Path) -> None:
     ) -> PrepResult:
         return PrepResult(assets[0].width)
 
-    found = Discovered(
-        app, "image_preparation:app", tmp_path, sys.modules[__name__], describe(app), {}
-    )
+    found = Discovered(app, "image_preparation:app", tmp_path, sys.modules[__name__], describe(app))
     body = package_interface.build(found)
     encoded = json.dumps(body).encode()
     read = package_interface.read_bytes(encoded)
