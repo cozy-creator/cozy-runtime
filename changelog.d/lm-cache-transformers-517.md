@@ -1,0 +1,1 @@
+LM decode builds its static cache on Transformers 5.16–5.18 too, whose `get_layer_types_and_kwargs` returns one kwargs set for every layer (5.19 returns one per layer): `test_lm_mtp.py` and `test_lm_decode.py` pass on 5.16.1, 5.17.0 and 5.20.0.

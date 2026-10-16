@@ -843,6 +843,8 @@ class _StaticCache(Cache):  # type: ignore[misc]
     def __init__(self, text_config: Any, capacity: int, size: int) -> None:
         self.size = [size]
         types, kwargs = get_layer_types_and_kwargs(text_config)
+        if isinstance(kwargs, dict):  # Transformers before 5.19: one set for every layer
+            kwargs = [kwargs] * len(types)
         layers = [
             _Keys(self.size, capacity) if kind == "full_attention" else _State(**extra)
             for kind, extra in zip(types, kwargs, strict=True)
