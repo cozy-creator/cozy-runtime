@@ -20,6 +20,7 @@ from typing import Any
 import cozy_runtime
 import torch
 from diffusers import AutoencoderKL, UNet2DConditionModel
+from diffusers.utils import logging as diffusers_logging
 
 
 def leg(name: str, fn: Callable[[], Any]) -> Any:
@@ -86,7 +87,7 @@ def cli() -> None:
 
 
 def compare(name: str, ref: torch.Tensor, out: torch.Tensor) -> str:
-    a, b = ref.double().flatten(), out.double().cpu().flatten()
+    a, b = ref.double().flatten(), out.cpu().double().flatten()
     cos = torch.nn.functional.cosine_similarity(a, b, dim=0).item()
     rel = ((a - b).norm() / a.norm()).item()
     finite = bool(torch.isfinite(b).all())
@@ -215,6 +216,7 @@ def mps_facts() -> None:
 
 
 def main() -> None:
+    diffusers_logging.set_verbosity_error()
     print("python:", sys.version.split()[0], "platform:", platform.platform(), platform.machine())
     print("torch:", torch.__version__, "cuda build:", torch.version.cuda, "cuda.is_available:", torch.cuda.is_available())
     print("cpu count:", os.cpu_count())

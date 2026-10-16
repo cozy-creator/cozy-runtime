@@ -15,6 +15,10 @@ on:
         description: Published cozy-runtime version
         type: string
         default: 0.25.1
+      tensorfs_ref:
+        description: TensorFS branch, tag or SHA built from source and installed first; empty takes PyPI's
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -49,6 +53,19 @@ jobs:
           echo "PY=$PWD/$py" >> "$GITHUB_ENV"
           case "$RUNNER_OS" in macOS) echo "TORCH_BACKEND=" ;; *) echo "TORCH_BACKEND=--torch-backend=cpu" ;; esac >> "$GITHUB_ENV"
 
+      - uses: actions/checkout@v4
+        if: inputs.tensorfs_ref != ''
+        with:
+          repository: cozy-creator/tensorfs
+          ref: ${{ inputs.tensorfs_ref }}
+          ssh-key: ${{ secrets.TENSORFS_READ_KEY }}
+          path: .tensorfs
+
+      - name: TensorFS ${{ inputs.tensorfs_ref }} from source
+        if: inputs.tensorfs_ref != ''
+        continue-on-error: true
+        run: uv pip install --python "$PY" ./.tensorfs 2>&1 | tee tensorfs.txt; exit "${PIPESTATUS[0]}"
+
       - name: Install cozy-runtime ${{ inputs.runtime }}
         id: install
         continue-on-error: true
@@ -73,6 +90,7 @@ jobs:
 
       - name: Accelerator wheels
         run: |
+          set +e +o pipefail
           {
             for idx in cu130 cu128; do
               echo "== torch from $idx"
@@ -105,6 +123,7 @@ jobs:
           name: runtime-${{ matrix.os }}
           path: |
             install.txt
+            tensorfs.txt
             probe.txt
             wheels.txt
           if-no-files-found: ignore
