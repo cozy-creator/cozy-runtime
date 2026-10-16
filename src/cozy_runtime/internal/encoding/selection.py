@@ -396,8 +396,14 @@ OBJECTIVE_AXIS: dict[str, str] = {
 class Capabilities:
     """The fail-closed admission table. No default branch, no "unknown means allowed"."""
 
-    def __init__(self, records: Sequence[CapabilityRecord] = ()) -> None:
+    def __init__(
+        self,
+        records: Sequence[CapabilityRecord] = (),
+        refusals: Mapping[tuple[str, str, str], str] | None = None,
+    ) -> None:
         self.records = list(records)
+        #: (encoding, implementation digest, output dtype) -> why that cell minted no record
+        self.refusals = dict(refusals or {})
 
     def add(self, record: CapabilityRecord) -> None:
         self.records.append(record)
@@ -637,6 +643,17 @@ class Selection:
 
 
 @dataclass(frozen=True, slots=True)
+class Refusal:
+    """A leaf this device REFUSED for a tensor whose bytes and shape admit it: its qualification
+    failed, its kernel is unavailable here, or it raised. Never a by-design route: a geometry
+    the format rules out is `TensorCandidates.geometry_refused`, and a recipe's float layer is
+    stored plain."""
+
+    leaf: str
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
 class TensorCandidates:
     """Every route this tensor CAN take on this device, plus what refused the others.
 
@@ -657,6 +674,8 @@ class TensorCandidates:
     routes_offered: frozenset[str] = frozenset()
     """Every route this tensor's BYTES and SHAPE admit on some device, qualified here or
     not. `by_route` minus this is what this card did not qualify."""
+    refused: tuple[Refusal, ...] = ()
+    """The encoded leaves this card refused for this tensor, with why."""
 
 
 class Selector:
@@ -759,7 +778,19 @@ class Selector:
                 continue
             reason = self._reason(provider, record, among, geometry)
             best[provider.route] = Selection(provider, record, encoded, reason)
-        return TensorCandidates(key, encoded, output_dtype, best, tuple(geometry), "", offered)
+        refused = tuple(
+            Refusal(
+                provider.name,
+                self.capabilities.refusals.get(
+                    (encoded.encoding, digest, output_dtype), "no qualification record"
+                ),
+            )
+            for digest, provider in among.items()
+            if provider.route == "encoded_gemm" and "encoded_gemm" not in best
+        )
+        return TensorCandidates(
+            key, encoded, output_dtype, best, tuple(geometry), "", offered, refused
+        )
 
     def _reason(
         self,
