@@ -72,16 +72,11 @@ TOLERANCE = 5e-2
 HOST_BOUND, PAYS = 0.5, 0.9
 #: Requests in which a signature's capture may fail before it runs as written for good.
 TRIES = 4
-#: A call records only with this many times what it allocates run as written free beside the
-#: weights (`Residency.allocatable`): its pool takes about that, in the allocator's segments.
+#: A call records only with this many times what it takes at its peak, run as written, free
+#: beside the weights (`Residency.allocatable`): its pool takes about that.
 ROOM = 2
 _PLAIN = (type(None), bool, int, float, str)
 _SAID: set[str] = set()
-
-
-def allocated(device: Any = None) -> int:
-    """Bytes torch's allocator has handed out on `device` since the process began."""
-    return int(torch.cuda.memory_stats(device).get("allocated_bytes.all.allocated", 0))
 
 
 def say(key: str, line: str) -> None:
@@ -274,11 +269,12 @@ def _dispatch(module: Any, call: Callable[..., Any], args: Any, kwargs: Any) -> 
         # The first call of a signature: as written, through the hooks, which record its blocks.
         recorder.seen.add(key)
         torch.cuda.synchronize()
-        started, before = time.perf_counter(), allocated()
+        torch.cuda.empty_cache()  # what it reserves from here is what it takes at its peak
+        started, before = time.perf_counter(), torch.cuda.memory_reserved()
         with placed[0].recording() if placed else contextlib.nullcontext({}) as read:
             out = call(module, *args, **kwargs)
         launched = time.perf_counter() - started
-        recorder.need[key] = allocated() - before
+        recorder.need[key] = torch.cuda.memory_reserved() - before
         torch.cuda.synchronize()
         took = time.perf_counter() - started
         if not _clonable(out):
@@ -489,7 +485,6 @@ __all__ = [
     "ROOM",
     "TOLERANCE",
     "TRIES",
-    "allocated",
     "capture",
     "install",
     "release",
