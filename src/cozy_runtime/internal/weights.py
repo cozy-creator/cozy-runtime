@@ -20,6 +20,7 @@ the executor.
 
 from __future__ import annotations
 
+import functools
 import mmap
 import os
 import re
@@ -1840,7 +1841,7 @@ class Effects:
     banded: bool = False
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, eq=False)  # one is told from another by identity, never content
 class Journal:
     """One observed attempt of a block: the storages its ops made, the first content of every
     other storage they wrote into, and the generators its seeded ops drew from. `rewind`
@@ -4286,6 +4287,7 @@ class WeightResidency:
         weights = self.weights
         torch = weights.torch
 
+        @functools.wraps(forward)  # its signature: Transformers' `generate` reads it
         def call(*args: P.args, **kwargs: P.kwargs) -> R:
             mode = _innermost(torch)
             if mode is None or mode.weights is not weights or weights.grouped:

@@ -9,6 +9,7 @@ stream/acquisition/allocator accounting are CPU fixtures; no CUDA context is inv
 from __future__ import annotations
 
 import hashlib
+import inspect
 import sys
 from types import MethodType
 from typing import Any
@@ -173,6 +174,35 @@ def test_a_block_that_fails_after_changing_state_runs_again_from_it(
     }
     assert len(trace["room"]) == 1 and not trace["residency"].poisoned
     assert trace["acquired"] == trace["released"] == 3
+
+
+class Root(torch.nn.Module):  # type: ignore[misc,name-defined]
+    """A component whose own call reaches its block before any op of its own, then computes
+    on (SeedVR2's DiT)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.block = StatefulBlock("counter")
+
+    def forward(self, value: Any, *, pixel_values: Any = None) -> Any:
+        return self.block(value) + 1
+
+
+def test_a_components_call_keeps_its_signature_and_journals_beside_its_blocks(
+    monkeypatch: Any,
+) -> None:
+    """Run 9207: Transformers' `generate` checks its kwargs against `inspect.signature(
+    model.forward)`, which the call's recovery hid. Run 9210: the call's first journal and its
+    first block's held the same ops, and the block's exit took the call's out of the mode."""
+    root = Root()
+    weights, _region, trace = wrapped(root.block, monkeypatch, root=root)
+    assert inspect.signature(root.forward) == inspect.signature(Root.forward.__get__(root))
+    value = torch.tensor([[0.25, -0.5]])
+    with weights.recovering(), torch.inference_mode():
+        first, second = root(value), root(value)
+    effects = trace["residency"].components["model"].effects
+    assert effects is not None and not effects.writes
+    assert torch.equal(first, value + 2) and torch.equal(second, value + 3)
 
 
 def test_a_python_attribute_is_the_one_state_a_replay_does_not_put_back(monkeypatch: Any) -> None:
