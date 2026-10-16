@@ -257,7 +257,7 @@ sequence, and a CLOSED vocabulary — `msgspec.Struct` classes with their
 `msgspec.Meta`/`AssetBound`/`ModelDefault`/`Preflight`, `Literal`, `Enum`/`IntEnum`/`StrEnum`,
 unions, `list`/`tuple`/`dict`/`Sequence`/`Mapping`/`Set`, the asset classes, `Assets[...]` with
 `AssetLimits`, `Tree`, `ModelArtifact`, `Model` subclasses (`encoded_leaves=`,
-`@sequence_parallel`, `@uses_components`), `Weights[M]`, and `@app.entrypoint` with literal
+`min_bits=`, `phase=`, `@sequence_parallel`, `@uses_components`), `Weights[M]`, and `@app.entrypoint` with literal
 keywords and `WeightsOutput(...)` tuples. Explicit function registrations and async
 `@invocable` exports use the same schema builders, with their declared capabilities and
 immutable defaults. A value the package owns as DATA rather than as
@@ -285,8 +285,8 @@ declares none, site-packages is never a root, and a sibling package supplies TYP
 own callables are its own, never scanned as registrations (cr-117).
 
 A generated SCRIPT app — Creator's `app = script_app("<module>")` adapter — is read the same
-way. It registers the script's one `main` as an entrypoint; `[tool.cozy.models]` is its
-default ladder and `[tool.cozy] accelerator = false` keeps it on CPU.
+way. It registers the script's one `main` as an entrypoint; `[tool.cozy.models]` names its
+default releases and `[tool.cozy] accelerator = false` keeps it on CPU.
 `author/_script_metadata.py` is the ONE definition of that shape, run by the adapter and the
 reader over the same parsed tree. Every attempt may call children: the executor's Start
 carries the call interfaces.
@@ -306,14 +306,15 @@ the check a package's own CI runs from its locked venv; publish runs the static 
 the launch and invocation facts with current readers. It carries no Runtime-global service
 inventory, diagnostics, config UI metadata, or tensor requirements, and
 `_fixed_point` proves over the built document that no release digest, build timestamp,
-machine path or mutable binding reached it. The document has one `entrypoints` list; an entry
+machine path or mutable selection reached it. The document has one `entrypoints` list; an entry
 writes `publishes`, `internal` and `weights_outputs` when set and `accelerator` only as
 `false`, and its memo flag rides `invocable.memoize`. A slot is `{path, class, component_use,
-encoded_leaves}`, plus `weights: true` for a `Weights[M]` argument. `descriptor_id` (sha256 of
+encoded_leaves}`, plus `default`, `min_bits` and `phase` when declared and `weights: true` for a
+`Weights[M]` argument. `descriptor_id` (sha256 of
 one entry) is derived by `cozy-runtime describe <function>`, never stored. Deleted members are simply unknown fields; there is no legacy decoder or
 empty-value compatibility shim.
-Packages declare no GPU count or VRAM floor. Authored default ladders associate GPU selectors
-with preferred model lanes. Actual resource demand comes from the selected lane's tensor
+Packages declare no GPU count, VRAM floor or lane: the machine picks a slot's lane from its
+GPU, the request's `bits` and the slot's `min_bits`/`phase`. Actual resource demand comes from the selected lane's tensor
 schema/encoding, qualification measurements and the worker's observed machine; the RecordOwner
 owns placement. The
 interface reader rejects the retired `resources` key as an unknown field; format `/1` has one
@@ -322,13 +323,11 @@ Any function may produce models without another workflow language. A slot's capa
 annotation (cr-077): `model: M` is constructed in a warm session; `source: Weights[M]` (bare
 `Weights`: any layout) is the raw checkpoint, never constructed, read through
 `components()`/`tensor()`/`read_into()`/`read_values_into()` or handed to
-`ctx.tensorfs_source` and `derive.quantize_artifact`. Authors may attach
-an ordered model default ladder through `@invocable(defaults={"model": [...]})` or
-`@app.entrypoint(defaults={"model": [...]})`; both publish the same per-slot `default_ladder`
-metadata. Each rung names a GPU selector and a `[org/]model@release/lane` reference, and
-one slot's rungs share its model and release. Omitting the org names a model of the package's
-own account; the publishing Creator writes that account into the published interface. The invocation override wins over the owner's
-mutable Hub binding, which wins over the published default. Selection resolves before
+`ctx.tensorfs_source` and `derive.quantize_artifact`. Authors may name
+a slot's default release through `@invocable(defaults={"model": "sdxl@1.0.0"})` or
+`@app.entrypoint(defaults=...)`: `[org/]model@release`, never a lane. Omitting the org names a
+model of the package's own account; the publishing Creator writes that account into the
+published interface. A run's `model.<slot>=` wins over the default. Selection resolves before
 dispatch; the executor receives exact artifacts. See [authored defaults](docs/authored-model-defaults.md).
 The same decorators take `components={"model": ("dit", "vae")}`: the slot's `components` names
 the components that callable runs (absent means all), so a machine fetches those first. A
@@ -340,8 +339,6 @@ GPUs can [release them early](docs/gpu-release.md) with `ctx.release_gpus()`.
 Independent items go as one call each, awaited together (`asyncio.gather`): TensorD runs a
 request's calls on every GPU it holds, an idle GPU before a busy one and one call per GPU at a
 time, and keeps each executor warm for the request's later calls.
-The existing `package.toml [bindings."<callable>.models.<param>"]` remains the explicit local
-development binding; it is not copied into a package's published default.
 Each `WeightsOutput` declares only its name and new-byte ceiling;
 the produced CozyTensors header is the sole tensor-schema and encoding authority. The
 executor still receives only verified model capabilities, never the foreign source credential or

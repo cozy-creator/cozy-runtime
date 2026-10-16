@@ -135,7 +135,7 @@ def test_model_proxy_is_an_exact_artifact_and_dispatch_checks_bound_model(tmp_pa
     app = App()
     app.entrypoint(consume, accelerator=False)
     app.entrypoint(echo, accelerator=False)
-    found = Discovered(app, __name__ + ":app", tmp_path, sys.modules[__name__], describe(app), {})
+    found = Discovered(app, __name__ + ":app", tmp_path, sys.modules[__name__], describe(app))
     raw = package_interface.canonical_bytes(package_interface.build(found))
     metadata = package_interface.read_bytes(raw)
     consuming = next(row for row in metadata["entrypoints"] if row["name"] == "consume")

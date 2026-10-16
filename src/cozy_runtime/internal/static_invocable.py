@@ -65,11 +65,8 @@ def build(reader: Reader, registration: Registration) -> dict[str, Json]:
             models.append(
                 package_interface.model_slot(
                     f"{registration.name}.models.{arg.arg}",
-                    model.name,
-                    model.encoded_leaves,
-                    model.components,
-                    model.sequence_parallel,
-                    defaults=registration.model_defaults.get(arg.arg, ()),
+                    model,
+                    default=registration.model_defaults.get(arg.arg),
                     uses=registration.model_components.get(arg.arg, ()),
                     weights=weights,
                     on_demand=arg.arg in registration.model_on_demand,

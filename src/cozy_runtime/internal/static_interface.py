@@ -49,9 +49,8 @@ import cozy_runtime.internal.static_invocable as static_invocable
 from cozy_runtime import _interpreter, author
 from cozy_runtime.author._markers import MODEL_DEFAULT, PREFLIGHT
 from cozy_runtime.author._memo import memo_policy
-from cozy_runtime.author._model import Model
+from cozy_runtime.author._model import ENCODED_LEAVES, MIN_BITS, PHASES, Model, closed
 from cozy_runtime.author._model_defaults import (
-    DefaultLadder,
     check_model_arguments,
     model_components,
     model_defaults,
@@ -67,8 +66,8 @@ from cozy_runtime.author._script_metadata import (
 from cozy_runtime.author._services import SERVICES
 from cozy_runtime.author._signature import AssetsBinding, _classify, assets_binding, assets_payload
 from cozy_runtime.author._walker import is_struct
-from cozy_runtime.internal.bindings import read_table
 from cozy_runtime.internal.canonical import Json
+from cozy_runtime.internal.package_interface import ModelSpec
 
 CONSTRUCT_CHARS = 96
 
@@ -290,16 +289,8 @@ _INVOCABLE_KEYWORDS = frozenset(
 # -------------------------------------------------------------------------- the reader
 
 
-@dataclass(frozen=True, slots=True)
-class ModelSpec:
-    name: str
-    encoded_leaves: str
-    sequence_parallel: tuple[int, ...]
-    components: dict[str, tuple[str, ...]]
-
-
 #: Bare `Weights` (or `Weights[Model]`): raw checkpoint data of no declared layout.
-_ANY_LAYOUT = ModelSpec(Model.__name__, Model.__encoded_leaves__, (), {})
+_ANY_LAYOUT = ModelSpec(Model.__name__)
 
 
 class Reader:
@@ -911,21 +902,24 @@ class Reader:
         key = (module.path, node.name)
         if key in self.models:
             return self.models[key]
-        encoded_leaves = "refuse"
-        degrees: tuple[int, ...] = ()
+        spec = _ANY_LAYOUT
         components: dict[str, tuple[str, ...]] = {}
         for base in node.bases:
             target = base.value if isinstance(base, ast.Subscript) else base
             found = self.resolve(module, target)
             if isinstance(found, Definition) and isinstance(found.node, ast.ClassDef):
-                parent = self.model(found.module, found.node)
-                encoded_leaves = parent.encoded_leaves
-                degrees = parent.sequence_parallel
-                components.update(parent.components)
+                spec = self.model(found.module, found.node)
+                components.update(spec.components)
+        encoded_leaves, min_bits, phase = spec.encoded_leaves, spec.min_bits, spec.phase
+        degrees = spec.sequence_parallel
         for keyword in node.keywords:
             value = self.fold(module, keyword.value)
-            if keyword.arg == "encoded_leaves" and value in author._model.ENCODED_LEAVES:
-                encoded_leaves = str(value)
+            if keyword.arg == "encoded_leaves" and closed(ENCODED_LEAVES, value):
+                encoded_leaves = typing.cast(str, value)
+            elif keyword.arg == "min_bits" and closed(MIN_BITS, value):
+                min_bits = typing.cast(int, value)
+            elif keyword.arg == "phase" and closed(PHASES, value):
+                phase = typing.cast(str, value)
             else:
                 self.refuse(module, keyword, "a Model class keyword outside the closed set")
         for decorator in node.decorator_list:
@@ -951,7 +945,7 @@ class Reader:
                 if isinstance(found, Vocab) and found.key == "author.uses_components":
                     names = tuple(str(self.fold(module, arg)) for arg in decorator.args)
                     components[stmt.name] = names
-        spec = ModelSpec(node.name, encoded_leaves, degrees, components)
+        spec = ModelSpec(node.name, encoded_leaves, min_bits, phase, degrees, components)
         self.models[key] = spec
         return spec
 
@@ -1163,7 +1157,7 @@ class Registration:
     weights: tuple[author.WeightsOutput, ...]
     invocable: bool = False
     memoize: author.Memoize | None = None
-    model_defaults: Mapping[str, DefaultLadder] = field(default_factory=dict)
+    model_defaults: Mapping[str, str] = field(default_factory=dict)
     internal: bool = False
     accelerator: bool = True
     #: `memo_version=` / `memo_dependencies=` as written, and the module they are read in.
@@ -1181,7 +1175,7 @@ def build(project: Path, *, environment_python: Path | None = None) -> dict[str,
     pinned = locked.read(project)
     roots = (*environment_roots(environment_python, project=project), *pinned.roots)
     reader = Reader(project, dependency_roots=roots, wheels=pinned.wheels)
-    return _build(reader, application, read_table(project / "package.toml"))
+    return _build(reader, application)
 
 
 def build_builtin(name: str) -> dict[str, Json]:
@@ -1194,7 +1188,7 @@ def build_builtin(name: str) -> dict[str, Json]:
     # this reader instance's selected built-in module becomes an App root.
     selected = reader.module("cozy_runtime.derive.operations")
     reader.modules[selected.name] = replace(selected, trusted=False)
-    return _build(reader, application, {})
+    return _build(reader, application)
 
 
 def build_installed(distribution: str, *, environment_python: Path) -> dict[str, Json]:
@@ -1280,22 +1274,16 @@ def build_installed(distribution: str, *, environment_python: Path) -> dict[str,
         raise StaticRefusal(
             "installed App source is not owned by its wheel", code="static_distribution"
         )
-    return _build(reader, application, {}, installed=True)
+    return _build(reader, application, installed=True)
 
 
-def _build(
-    reader: Reader,
-    application: str,
-    bindings: Mapping[str, Mapping[str, object]],
-    *,
-    installed: bool = False,
-) -> dict[str, Json]:
+def _build(reader: Reader, application: str, *, installed: bool = False) -> dict[str, Json]:
     module_name, _, attribute = application.partition(":")
     entry = reader.application_module(module_name)
     app = reader.lookup(entry, attribute, entry.tree)
     if isinstance(app, Assigned) and _is_script_call(reader, app):
         return package_interface.assemble(
-            application, [_script_doc(reader, app)], bindings, installed=installed
+            application, [_script_doc(reader, app)], installed=installed
         )
     if not (isinstance(app, Assigned) and _is_app_call(reader, app)):
         raise StaticRefusal(
@@ -1324,9 +1312,7 @@ def _build(
             if identity is not None:
                 declared["operation_identity"] = identity
         docs[registration.name] = doc
-    return package_interface.assemble(
-        application, list(docs.values()), bindings, installed=installed
-    )
+    return package_interface.assemble(application, list(docs.values()), installed=installed)
 
 
 def _operation_identity(reader: Reader, registration: Registration) -> str | None:
@@ -1521,7 +1507,7 @@ def _registration(
     function_module = module
     invocable = False
     memoize: author.Memoize | None = None
-    default_models: dict[str, DefaultLadder] = {}
+    default_models: dict[str, str] = {}
     used_components: dict[str, tuple[str, ...]] = {}
     memo_declaration: list[tuple[str, Module, ast.expr]] = []
     for index, export in enumerate(fn.decorator_list):
@@ -1729,11 +1715,8 @@ def _callable(reader: Reader, registration: Registration) -> dict[str, Json]:
             models.append(
                 package_interface.model_slot(
                     f"{registration.name}.models.{arg.arg}",
-                    spec.name,
-                    spec.encoded_leaves,
-                    spec.components,
-                    spec.sequence_parallel,
-                    defaults=registration.model_defaults.get(arg.arg, ()),
+                    spec,
+                    default=registration.model_defaults.get(arg.arg),
                     uses=registration.model_components.get(arg.arg, ()),
                     weights=weights,
                     on_demand=arg.arg in registration.model_on_demand,
@@ -1909,8 +1892,7 @@ def _script_doc(reader: Reader, app: Assigned) -> dict[str, Json]:
     except author.ConformanceError as exc:
         reader.refuse(module, module.tree.body[0] if module.tree.body else call, str(exc))
     try:
-        declared, weights, accelerator = declarations(module.source.encode())
-        defaults = model_defaults(declared)
+        defaults, weights, accelerator = declarations(module.source.encode())
     except (ValueError, TypeError, author.ConformanceError) as exc:
         reader.refuse(module, fn, f"invalid script metadata: {exc}")
     models: list[dict[str, Json]] = []
@@ -1966,11 +1948,8 @@ def _script_doc(reader: Reader, app: Assigned) -> dict[str, Json]:
         models.append(
             package_interface.model_slot(
                 f"main.models.{arg.arg}",
-                spec.name,
-                spec.encoded_leaves,
-                spec.components,
-                spec.sequence_parallel,
-                defaults=defaults.get(arg.arg, ()),
+                spec,
+                default=defaults.get(arg.arg),
                 weights=raw,
             )
         )

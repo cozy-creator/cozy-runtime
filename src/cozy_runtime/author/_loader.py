@@ -340,7 +340,7 @@ class Artifact:
     """The RESOLVED binding a slot loads: one exact snapshot, its tensor schema and immutable
     config.
 
-    Selection produced this (package.toml default -> `--model` -> deploy binding); author
+    Selection produced this (the run's `model.<slot>=`, else the slot's default); author
     code never names any part of it. Nothing here is a compatibility claim: whether the
     code fits these bytes is a function of the census and the header (model-code-fit §3),
     and the backend answers it from the header it holds.

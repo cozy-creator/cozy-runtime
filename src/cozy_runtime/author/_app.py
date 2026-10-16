@@ -27,7 +27,6 @@ from cozy_runtime.author._markers import Bound
 from cozy_runtime.author._memo import MemoDependency, Memoize, memo_policy
 from cozy_runtime.author._memo import declare as declare_memo
 from cozy_runtime.author._model_defaults import (
-    DefaultLadder,
     model_components,
     model_defaults,
     model_on_demand,
@@ -53,7 +52,7 @@ class Registration:
     fn: Callable[..., object]
     invocable: bool = False
     memoize: Memoize | None = None
-    model_defaults: Mapping[str, DefaultLadder] = field(default_factory=dict)
+    model_defaults: Mapping[str, str] = field(default_factory=dict)
     model_components: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     model_on_demand: tuple[str, ...] = ()
     publishes: bool = False
@@ -112,7 +111,7 @@ class App:
         name: str | None = None,
         preflight: Callable[..., object] | None = None,
         demand: Bound | None = None,
-        defaults: Mapping[str, Sequence[Mapping[str, str | int]]] | None = None,
+        defaults: Mapping[str, str] | None = None,
         components: Mapping[str, Sequence[str]] | None = None,
         on_demand: Sequence[str] = (),
         hidden: bool = False,
@@ -134,7 +133,7 @@ class App:
         name: str | None = None,
         preflight: Callable[..., object] | None = None,
         demand: Bound | None = None,
-        defaults: Mapping[str, Sequence[Mapping[str, str | int]]] | None = None,
+        defaults: Mapping[str, str] | None = None,
         components: Mapping[str, Sequence[str]] | None = None,
         on_demand: Sequence[str] = (),
         hidden: bool = False,
@@ -156,7 +155,7 @@ class App:
         name: str | None = None,
         preflight: Callable[..., object] | None = None,
         demand: Bound | None = None,
-        defaults: Mapping[str, Sequence[Mapping[str, str | int]]] | None = None,
+        defaults: Mapping[str, str] | None = None,
         components: Mapping[str, Sequence[str]] | None = None,
         on_demand: Sequence[str] = (),
         hidden: bool = False,

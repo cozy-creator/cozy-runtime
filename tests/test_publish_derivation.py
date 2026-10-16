@@ -15,7 +15,7 @@ from pathlib import Path
 import msgspec
 import pytest
 
-from cozy_runtime.author import App, ConformanceError, Context, Model, Weights, WeightsOutput
+from cozy_runtime.author import App, ConformanceError, Model
 from cozy_runtime.author._describe import describe
 from cozy_runtime.author._loader import Loader
 from cozy_runtime.internal import canonical, package_interface
@@ -60,41 +60,8 @@ def _described(app: App) -> dict[str, object]:
         project=PACKAGE,
         module=sys.modules[__name__],
         surfaces=describe(app),
-        bindings={},
     )
     return package_interface.build(found)
-
-
-def test_lane_words_are_not_selection_leaks() -> None:
-    """cr-077: a weights output named after the lane it derives ("bf16") describes fine
-    beside a default binding whose lane says the same word; an interface string equal to
-    the binding's release remains a refused selection leak."""
-
-    def build(output_id: str, release: str) -> dict[str, object]:
-        app = App()
-
-        @app.entrypoint(
-            weights=(WeightsOutput(output_id, max_new_bytes=1 << 20),), accelerator=False
-        )
-        def produce(payload: Request, denoiser: Weights[Denoiser], ctx: Context) -> Reply:
-            return Reply(text="ok")
-
-        found = Discovered(
-            app=app,
-            application="profiled_package:app",
-            project=PACKAGE,
-            module=sys.modules[__name__],
-            surfaces=describe(app),
-            bindings={"Denoiser": {"model": "acme/sd", "release": release, "lane": "bf16"}},
-        )
-        return package_interface.build(found)
-
-    body = build("bf16", "1.0.0")
-    assert body["entrypoints"][0]["weights_outputs"][0]["output_id"] == "bf16"  # type: ignore[index]
-
-    with pytest.raises(ConformanceError) as leaked_release:
-        build("ev-003", "ev-003")
-    assert leaked_release.value.code == "fixed_point"
 
 
 def test_interface_slot_grammar_has_no_legacy_members() -> None:
@@ -128,8 +95,8 @@ def test_interface_slot_grammar_has_no_legacy_members() -> None:
     assert unknown.value.code == "malformed_package_interface"
 
 
-def test_model_class_carries_exactly_one_keyword() -> None:
-    """`encoded_leaves` is the whole class-keyword plane; a stamp refuses typed (D1)."""
+def test_model_class_keywords_are_closed() -> None:
+    """The class-keyword plane is closed; a stamp refuses typed (D1)."""
     with pytest.raises(ConformanceError) as stamped:
 
         class Stamped(Model[Pipeline], task="fl2va"):

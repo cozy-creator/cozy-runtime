@@ -21,7 +21,7 @@ import sys
 import threading
 import tomllib
 import traceback
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -53,14 +53,13 @@ class Discovered:
     project: Path
     module: ModuleType
     surfaces: tuple[Surface, ...]
-    bindings: Mapping[str, Mapping[str, object]]
 
 
 def discover(project: Path, *, seconds: float | None = IMPORT_SECONDS) -> Discovered:
     """Import the one configured export inside this environment and freeze it."""
     project = project.resolve()
     application = read_application(project)
-    return _discover(application, project, _bindings(project), seconds=seconds, add=project)
+    return _discover(application, project, seconds=seconds, add=project)
 
 
 def assert_locked_environment(project: Path) -> str:
@@ -106,7 +105,7 @@ def discover_installed(application: str, *, seconds: float | None = IMPORT_SECON
     or adding a host path would recreate the source/PYTHONPATH authority the fixed worker rejects.
     """
 
-    return _discover(application, Path("/"), {}, seconds=seconds, add=None)
+    return _discover(application, Path("/"), seconds=seconds, add=None)
 
 
 def discover_distribution(
@@ -128,16 +127,11 @@ def discover_distribution(
             "is required",
             code="application_entrypoint_count",
         )
-    return _discover(applications[0], Path("/"), {}, seconds=seconds, add=None)
+    return _discover(applications[0], Path("/"), seconds=seconds, add=None)
 
 
 def _discover(
-    application: str,
-    project: Path,
-    bindings: Mapping[str, Mapping[str, object]],
-    *,
-    seconds: float | None,
-    add: Path | None,
+    application: str, project: Path, *, seconds: float | None, add: Path | None
 ) -> Discovered:
     if application.count(":") != 1 or not all(part.strip() for part in application.split(":")):
         raise DiscoveryError(
@@ -163,7 +157,7 @@ def _discover(
             code="not_an_app",
         )
     surfaces = describe(app)  # duplicate names already refused at registration; this freezes
-    return Discovered(app, application, project, module, surfaces, bindings)
+    return Discovered(app, application, project, module, surfaces)
 
 
 def _import(module_name: str, application: str) -> ModuleType:
@@ -189,14 +183,6 @@ def _import(module_name: str, application: str) -> ModuleType:
             f"{type(exc).__name__}: {exc}\n\n{traceback.format_exc()}",
             code="import_failed",
         ) from exc
-
-
-def _bindings(project: Path) -> Mapping[str, Mapping[str, object]]:
-    """package.toml's binding table. NOT interface content — the fixed-point scan reads it
-    to prove no mutable binding leaked into the package interface."""
-    from cozy_runtime.internal.bindings import read_table
-
-    return read_table(project / "package.toml")
 
 
 @contextmanager

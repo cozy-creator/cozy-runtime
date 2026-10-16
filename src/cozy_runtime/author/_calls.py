@@ -39,7 +39,7 @@ from cozy_runtime.author._executor_requests import (
 from cozy_runtime.author._memo import MemoDependency, Memoize, memo_policy
 from cozy_runtime.author._memo import declare as declare_memo
 from cozy_runtime.author._model import Model
-from cozy_runtime.author._model_defaults import DefaultLadder, model_components, model_defaults
+from cozy_runtime.author._model_defaults import model_components, model_defaults
 from cozy_runtime.author._services import Telemetry, _progress_scope, _ProgressScope
 from cozy_runtime.author._weights import Weights
 
@@ -68,7 +68,7 @@ class _Export:
     module: str
     name: str
     memoize: Memoize | None = None
-    defaults: Mapping[str, DefaultLadder] = field(default_factory=dict)
+    defaults: Mapping[str, str] = field(default_factory=dict)
     components: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
 
@@ -80,7 +80,7 @@ def invocable[**P, R](
     memoize: bool | Memoize = False,
     memo_version: str | None = None,
     memo_dependencies: tuple[MemoDependency, ...] = (),
-    defaults: Mapping[str, Sequence[Mapping[str, str | int]]] | None = None,
+    defaults: Mapping[str, str] | None = None,
     components: Mapping[str, Sequence[str]] | None = None,
 ) -> Callable[P, PendingCall[R]]: ...
 
@@ -91,7 +91,7 @@ def invocable[**P, R](
     memoize: bool | Memoize = False,
     memo_version: str | None = None,
     memo_dependencies: tuple[MemoDependency, ...] = (),
-    defaults: Mapping[str, Sequence[Mapping[str, str | int]]] | None = None,
+    defaults: Mapping[str, str] | None = None,
     components: Mapping[str, Sequence[str]] | None = None,
 ) -> Callable[[Callable[Concatenate[Context, P], Awaitable[R]]], Callable[P, PendingCall[R]]]: ...
 
@@ -103,7 +103,7 @@ def invocable[**P, R](
     memoize: bool | Memoize = False,
     memo_version: str | None = None,
     memo_dependencies: tuple[MemoDependency, ...] = (),
-    defaults: Mapping[str, Sequence[Mapping[str, str | int]]] | None = None,
+    defaults: Mapping[str, str] | None = None,
     components: Mapping[str, Sequence[str]] | None = None,
 ) -> (
     Callable[P, PendingCall[R]]

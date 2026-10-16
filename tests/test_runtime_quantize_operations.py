@@ -120,7 +120,6 @@ def test_builtin_interface_is_static_and_matches_its_actual_app() -> None:
             Path(__file__).parent,
             module,
             describe(app),
-            {},
         )
     )
     source = package_interface.source_facts(actual)

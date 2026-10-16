@@ -912,8 +912,8 @@ def _model(param: Param, inv: Invocation) -> object:
     model = (inv.sources if param.role == "weights" else inv.models).get(param.name)
     if model is None:
         raise InvalidRequest(
-            f"no model bound for parameter {param.name!r}: bindings state selection "
-            "(package.toml / the deployment binding), code states capability",
+            f"no model bound for parameter {param.name!r}: the run names none and the slot "
+            "declares no default",
             code="unbound_model",
             fields=[param.name],
         )

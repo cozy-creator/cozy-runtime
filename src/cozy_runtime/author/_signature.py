@@ -41,7 +41,7 @@ from cozy_runtime.author._markers import (
 )
 from cozy_runtime.author._memo import Memoize
 from cozy_runtime.author._model import Model, component_use
-from cozy_runtime.author._model_defaults import DefaultLadder, check_model_arguments
+from cozy_runtime.author._model_defaults import check_model_arguments
 from cozy_runtime.author._services import SERVICES, Secrets, Settings
 from cozy_runtime.author._walker import is_struct, strip
 from cozy_runtime.author._weights import WeightsOutput, weights_class
@@ -211,7 +211,7 @@ class ModelBinding:
     @property
     def class_key(self) -> str:
         """The class name, for messages and for the publish memo's per-class seed. It is
-        NOT a binding key: `package.toml` binds slot paths only (model-code-fit §1)."""
+        NOT a binding key: runs bind slot paths only (model-code-fit §1)."""
         return self.model_class.__name__
 
     @property
@@ -244,7 +244,7 @@ class Surface:
     are absent from the package interface, so no binding is staged and no request reaches them."""
     invocable: bool = False
     memoize: Memoize | None = None
-    model_defaults: Mapping[str, DefaultLadder] = field(default_factory=dict)
+    model_defaults: Mapping[str, str] = field(default_factory=dict)
     model_components: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     """Model argument -> the components this callable runs; an absent argument runs all."""
     model_on_demand: tuple[str, ...] = ()
@@ -390,7 +390,7 @@ def analyze(
     accelerator: bool = True,
     invocable: bool = False,
     memoize: Memoize | None = None,
-    model_defaults: Mapping[str, DefaultLadder] | None = None,
+    model_defaults: Mapping[str, str] | None = None,
     model_components: Mapping[str, tuple[str, ...]] | None = None,
     model_on_demand: tuple[str, ...] = (),
 ) -> Surface:

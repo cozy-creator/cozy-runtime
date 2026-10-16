@@ -226,7 +226,7 @@ def test_assets_metadata_has_no_bytes_and_hydration_rechecks_it(tmp_path: Path) 
 
 
 def test_assets_descriptor_and_generated_interface_keep_explicit_parameter(tmp_path: Path) -> None:
-    found = Discovered(app, __name__ + ":app", tmp_path, sys.modules[__name__], describe(app), {})
+    found = Discovered(app, __name__ + ":app", tmp_path, sys.modules[__name__], describe(app))
     raw = package_interface.canonical_bytes(package_interface.build(found))
     body = package_interface.read_bytes(raw)
     entries = {entry["name"]: entry for entry in body["entrypoints"]}
@@ -489,7 +489,6 @@ def test_decoded_descriptor_and_generated_client_preserve_the_value_type(tmp_pat
         tmp_path,
         sys.modules[__name__],
         describe(decoded_app),
-        {},
     )
     document = package_interface.build(found)
     slot = document["entrypoints"][0]["assets"]
@@ -575,7 +574,7 @@ def test_count_metadata_comes_from_argument_and_conflicts_refuse(tmp_path: Path)
     def limited(payload: Request, assets: SimpleLimited) -> Result:
         raise AssertionError("describe only")
 
-    found = Discovered(local, "example:app", tmp_path, sys.modules[__name__], describe(local), {})
+    found = Discovered(local, "example:app", tmp_path, sys.modules[__name__], describe(local))
     doc = package_interface.build(found)
     entry = doc["entrypoints"][0]
     assert entry["assets"]["kinds"][0]["max_count"] == 2
