@@ -145,7 +145,8 @@ def _merge_approximation(
     )
 
 
-@triton.jit  # type: ignore[untyped-decorator]
+# Lengths are not specialized: preparation's small call builds the object every length runs.
+@triton.jit(do_not_specialize=["tokens", "blocks", "heads", "q_tiles", "k_tiles"])  # type: ignore[untyped-decorator]
 def _approximate_and_merge(  # type: ignore[no-untyped-def]
     Q,
     KC,
