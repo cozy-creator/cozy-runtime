@@ -547,12 +547,14 @@ class Weights:
         self.paged_out[1] += own + shared
         return True
 
-    def room_before(self, method: str) -> None:
+    def room_before(self, method: str, missing: int = 0) -> None:
         """Under a cap, before a stage plans: when other processes on the GPU leave less free
-        than this stage's measured activations need of what the cap grants, ask the owner to
-        make room first (`DeviceRoom`: idle tenants leave). Activations cannot shrink once
-        the stage runs; a stage never measured asks nothing. A process over its cap gives
-        back its own cached segments and idle maps first, then asks for the rest."""
+        than this stage's measured activations and its weights not on the device (`missing`)
+        need of what the cap grants, ask the owner to make room first (`DeviceRoom`: idle
+        tenants of any package or release leave, least recently used first). Otherwise the
+        stage would stream its weights through what the idle tenants left, every request. A
+        process over its cap gives back its own cached segments and idle maps first, then
+        asks for the rest."""
         if self.room is None or self.cap < 0 or self.host_only:
             return
         memory, held = self._held()
@@ -568,6 +570,7 @@ class Weights:
         slack = max(memory["reserved_bytes"] - memory["allocated_bytes"], 0)
         # an adaptive stage fits itself to the room it finds: it asks for none
         need = 0 if method in self.adaptive else self.activation.get(method, 0) - slack
+        need = max(need, 0) + missing
         if held > self.cap:
             # Still over: the owner raises the cap into the room it makes (never a negative ask).
             self.room(max(need, 0) + weight_policy.MARGIN)
@@ -3141,7 +3144,10 @@ class WeightResidency:
         self.repeats[method] = max(self.repeats.get(method, 0), self.entries[method])
         weights.hold_host()
         self._clear(method, local)
-        weights.room_before(method)
+        mine = [self.components[name] for name in local]
+        weights.room_before(
+            method, sum(max(c.planned.total - weights.resident_bytes(c), 0) for c in mine)
+        )
         if weights.host_only:  # everything is bound in place already; no device to measure
             self.active = (method, local)
             return
