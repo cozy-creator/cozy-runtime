@@ -802,6 +802,8 @@ class _Decode:
         if draft is not None:
             #: the draft head's own keys (its one attention layer), masked to the committed tokens
             self.dcache = Cache(layers=[_Keys(self.cache.size, self.capacity)])
+            # on the device from the start: a step sets it before the head first writes a key
+            self.dcache.layers[0].cumulative_length = self.length[0].clone()
             self.dmask = torch.full_like(self.mask, self.closed)
             self.rows = torch.arange(self.capacity, device=device)
             #: the state the model's head read for the token `ids` holds: the draft's input

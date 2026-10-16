@@ -353,7 +353,10 @@ cudaError_t rotate_quantize(const void* x, bool x_half, int8_t* q, float* scales
 cudaError_t gemv(const void* x, bool x_half, const int8_t* w, const float* w_scale,
                  const void* bias, void* out, bool out_half, int M, int N, int K, int sms,
                  cudaStream_t stream) {
-    if (M < 1 || M > kGemvRows || size_t(M) * K > 48 * 1024 || x_half != out_half)
+    // Its rows sit in shared memory beside the per-warp partial sums: within the 48 KiB a
+    // launch has without opting in, or the rotation and GEMM serve the call.
+    const size_t fixed = size_t(M) * (kGemvWarps + 1) * sizeof(float);
+    if (M < 1 || M > kGemvRows || size_t(M) * K + fixed > 48 * 1024 || x_half != out_half)
         return cudaErrorNotSupported;
     if (x_half)
         return gemv_as(static_cast<const __half*>(x), w, w_scale,
