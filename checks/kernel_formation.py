@@ -155,6 +155,7 @@ def main() -> int:
     failed: list[str] = []
     counts = {"formed": 0, "recalled": 0}
     pending: list[tuple[str, int, kernel_compile.Job]] = []
+    serial: list[tuple[str, int, kernel_compile.Job]] = []
     seen: set[str] = set()
 
     def fail(name: str, sm: int, detail: str) -> None:
@@ -190,7 +191,7 @@ def main() -> int:
             pending.append((name, sm, job))
         else:
             # Triton and Sol builders take no admission: one at a time, while those compile.
-            end(name, sm, job)
+            serial.append((name, sm, job))
 
     for found in TRITON:
         if not found.entries:
@@ -213,7 +214,7 @@ def main() -> int:
             continue
         for job in objects:
             start(_name(job), sm, job)
-    for name, sm, job in pending:
+    for name, sm, job in serial + pending:
         end(name, sm, job)
     print(
         f"{counts['formed']} formed, {counts['recalled']} recalled, {len(failed)} failed"

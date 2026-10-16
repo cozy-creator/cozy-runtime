@@ -61,6 +61,8 @@ _BOOT = (
     "from cozy_runtime.internal.kernel_compile import main; raise SystemExit(main(sys.argv[1:]))"
 )
 _PROGRESS = re.compile(rb"^\[(\d+)/(\d+)\]")
+#: A compiler's own failure lines: errors, `nvcc fatal`, a killed compiler, ninja's failed unit.
+_FAILURE = re.compile(rb"error|fatal|killed|^FAILED:", re.IGNORECASE)
 
 
 class CompileFailed(Exception):
@@ -497,7 +499,7 @@ def run(
             written[0] += len(line)
             tail.append(line)
             del tail[:-40]
-            if b"error" in line.lower() and len(errors) < 12:
+            if _FAILURE.search(line) and len(errors) < 12:
                 errors.append(line)
             found = _PROGRESS.match(line)
             if found and int(found.group(2)):

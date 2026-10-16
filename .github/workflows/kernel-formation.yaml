@@ -36,20 +36,17 @@ permissions:
 
 jobs:
   form:
-    runs-on: ubuntu-latest
-    # Hang bound, not a work budget: an empty cache compiles every kernel of the card.
-    timeout-minutes: 300
-    strategy:
-      fail-fast: false
-      matrix:
-        sm: [80, 86, 89, 90, 100, 103, 120, 121]
+    # Every card in one process: one image pull, one cache, and the compile manager admits
+    # compiler jobs within these 16 CPUs and 64 GB (2-core runners swap on CUTLASS units).
+    runs-on: linux-x64-16core
+    # Hang bound, not a work budget: an empty cache compiles every kernel of every card.
+    timeout-minutes: 240
     env:
       # What a pod compiles with: its toolchain, torch and pinned kernel sources.
       IMAGE: docker.io/tensorhub/worker:torch2.14.0-cu130-linux-x86
       # NVIDIA's libcuda link stub (cuda-driver-dev): Triton's launcher links and loads it.
       STUB: https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-driver-dev-13-0_13.0.96-1_amd64.deb
       STUB_SHA256: a9726490d4797965b56a2e1dedb2c4cffd3f3463e11435fa4c500b3d147af08a
-      CACHE: kernel-formation-sm${{ matrix.sm }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -59,9 +56,8 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
           path: source
-      - name: Room for the image and its builds, and libcuda's stub
+      - name: libcuda's stub
         run: |
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
           curl -fsSL "$STUB" -o stub.deb
           echo "$STUB_SHA256  stub.deb" | sha256sum --check --strict
           dpkg-deb -x stub.deb stub
@@ -71,16 +67,16 @@ jobs:
       - uses: actions/cache/restore@v4
         with:
           path: ledger
-          key: ${{ env.CACHE }}-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: ${{ env.CACHE }}-
-      - name: Form sm${{ matrix.sm }}
+          key: kernel-formation-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: kernel-formation-
+      - name: Form every kernel for every card
         run: |
           set +e
           docker run --rm -v "$PWD:/w" -e TRITON_LIBCUDA_PATH=/w/libcuda -e LD_LIBRARY_PATH=/w/libcuda \
             --entrypoint bash "$IMAGE" -euo pipefail -c '
               uv pip install --quiet --python /opt/cozy/python/bin/python /w/source
-              /opt/cozy/python/bin/python /w/tools/checks/kernel_formation.py \
-                --targets ${{ matrix.sm }} --ledger /w/ledger/formed.jsonl' | tee formation.log
+              /opt/cozy/python/bin/python /w/tools/checks/kernel_formation.py --ledger /w/ledger/formed.jsonl
+            ' | tee formation.log
           status=${PIPESTATUS[0]}
           grep -E '^(FAILED|[0-9]+ formed)' formation.log >> "$GITHUB_STEP_SUMMARY"
           exit "$status"
@@ -88,4 +84,4 @@ jobs:
         if: always()
         with:
           path: ledger
-          key: ${{ env.CACHE }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: kernel-formation-${{ github.run_id }}-${{ github.run_attempt }}
