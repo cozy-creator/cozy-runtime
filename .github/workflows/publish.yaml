@@ -219,9 +219,16 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+  # Every kernel the release builds on a machine compiles for every card it serves (0.25.0
+  # shipped nvfp4 kernels that never built: every nvfp4 layer took its slow path).
+  kernels:
+    uses: ./.github/workflows/kernel-formation.yaml
+    with:
+      ref: ${{ inputs.release_tag }}
+
   publish:
-    needs: [build, gated]
-    if: ${{ !cancelled() && !inputs.rehearsal && (needs.build.result == 'success' || needs.gated.result == 'success') }}
+    needs: [build, gated, kernels]
+    if: ${{ !cancelled() && !inputs.rehearsal && needs.kernels.result == 'success' && (needs.build.result == 'success' || needs.gated.result == 'success') }}
     runs-on: ubuntu-latest
     environment: pypi
     # Hang bound, not a work budget.
