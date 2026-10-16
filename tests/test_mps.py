@@ -226,14 +226,17 @@ class Pipe(Model[Graph]):
         return net(x.to(net.blocks[0].weight.device))
 
     @uses_components("decoder")
-    def decode(self, x):
+    def decode(self, x, scratch):
         y = self.graph.components["decoder"](x)
+        if scratch:  # activations the pool has room for only once idle weights leave
+            y = y + torch.ones(scratch // 2, dtype=torch.float16, device=y.device)[:1].float()
         torch.mps.synchronize()
         return float(y.float().sum()), torch.mps.current_allocated_memory()
 
 
 class Ask(msgspec.Struct):
     seed: int
+    scratch: int = 0
 
 
 class Answer(msgspec.Struct):
@@ -247,12 +250,12 @@ app = App()
 @app.entrypoint()
 def run(payload: Ask, model: Pipe) -> Answer:
     x = torch.randn(64, 2048, generator=torch.Generator().manual_seed(payload.seed)).half()
-    value, allocated = model.decode(model.encode(x))
+    value, allocated = model.decode(model.encode(x), payload.scratch)
     return Answer(value, allocated)
 """
 
 
-def test_a_stage_pages_the_last_ones_weights_out(
+def test_a_stage_pages_weights_out_and_recovers_from_running_out(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Unified memory pages as a discrete card does: an unmeasured decoder stage plans its own
@@ -277,6 +280,16 @@ def test_a_stage_pages_the_last_ones_weights_out(
         with served(tmp_path, discover(project), Store.init(tmp_path / "store"), hub.grant()) as m:
             first = m.run(manifest, "Pipe", ["decoder", "encoder"], {"seed": 1}, "run")
             again = m.attempt("run", {"seed": 2})
+            # MPS refuses past its limit with a plain RuntimeError: Runtime's recovery gives the
+            # idle encoder's weights back and runs the allocation again.
+            evictions = m.plane["evictions"]
+            accel.release_cached(torch, "mps")
+            limit = torch.mps.driver_allocated_memory() + (24 << 20)
+            torch.mps.set_per_process_memory_fraction(limit / torch.mps.recommended_max_memory())
+            try:
+                tight = m.attempt("run", {"seed": 3, "scratch": 40 << 20})
+            finally:
+                torch.mps.set_per_process_memory_fraction(1.7)  # torch's default
     finally:
         hub.close()
         sys.modules.pop("apple_paged", None)
@@ -285,7 +298,8 @@ def test_a_stage_pages_the_last_ones_weights_out(
     # The second request read the encoder back from the page cache; with room now measured
     # for each stage's activations, it keeps both components hot.
     assert again["value"] != first["value"]
-    assert m.plane["evictions"] > 0 and m.plane["disk_copy_bytes"] >= 2 * encoder, m.plane
+    assert evictions > 0 and again["allocated"] > encoder
+    assert tight["value"] != again["value"] and m.plane["evictions"] > evictions, m.plane
 
 
 def test_weight_only_int8_against_fp16() -> None:
@@ -471,7 +485,8 @@ class Machine:
         if not name:
             return bytes(header)
         with self.store.acquire_cozytensors(manifest) as lease:
-            return bytes(lease.read_asset(header, name, max_bytes=64 << 20))
+            asset = lease.read_asset(header, name, max_bytes=64 << 20)
+        return bytes(asset)
 
     def _channel(self) -> int:
         owner, executor_end = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)

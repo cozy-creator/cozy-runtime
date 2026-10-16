@@ -190,13 +190,24 @@ jobs:
           uv pip install --python .venv/bin/python -e '.[adapters,media]' 'torch>=2.14' torchvision \
             'diffusers>=0.40.0' 'transformers>=5.16.1' 'peft>=0.20,<0.21' safetensors tokenizers pytest
 
+      # Its shipped lock is linux-x86_64 only: its versions pin this install (but this ref's
+      # Runtime and the TensorFS built above).
       - name: The published SDXL package
         if: inputs.sdxl
         run: |
           curl -fsS -X POST https://tensorhub.com/v1/packages/fidika/sdxl/download -d '{}' > plan.json
-          read -r url name < <(.venv/bin/python -c 'import json; w = next(d for d in json.load(open("plan.json"))["downloads"] if d["kind"] == "project_wheel"); print(w["url"], w["path"])')
-          curl -fsS -o "$name" "$url"
-          uv pip install --python .venv/bin/python "./$name"
+          .venv/bin/python - <<'PY'
+          import base64, json, tomllib, urllib.request
+          plan = json.load(open("plan.json"))
+          wheel = next(d for d in plan["downloads"] if d["kind"] == "project_wheel")
+          urllib.request.urlretrieve(wheel["url"], wheel["path"])
+          lock = tomllib.loads(base64.b64decode(plan["uv_lock"]["canonical_bytes"]).decode())
+          pins = [f"{p['name']}=={p['version']}" for p in lock["package"]
+                  if p["name"] not in ("sdxl", "cozy-runtime", "tensorfs")]
+          open("pins.txt", "w").write("\n".join(pins) + "\n")
+          open("wheel.txt", "w").write(wheel["path"])
+          PY
+          uv pip install --python .venv/bin/python -c pins.txt "./$(cat wheel.txt)"
 
       - name: Tests
         run: |

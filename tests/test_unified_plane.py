@@ -37,6 +37,7 @@ REGIONS = [["c/tiny"], *[[f"c/blocks.{i}.weight"] for i in range(3)]]
 def registered(tmp_path: Path, device: str, files: bool = False) -> tuple[UnifiedPlane, Any]:
     store, manifest = write(tmp_path / "store", {"c": VALUES})
     header = store.manifest(manifest)["header"]
+    assert header is not None
     read = tensorfs.plan(header, [("c", key) for key in VALUES], ["c"], window=1 << 16)
     unified = UnifiedPlane(torch, torch.device(device))
     if files:
@@ -46,7 +47,7 @@ def registered(tmp_path: Path, device: str, files: bool = False) -> tuple[Unifie
             os.close(fd)
     else:
         lease = store.acquire(manifest, [(sha, n) for sha, n in _objects(read)])
-        source = plane.source(unified, store, lease)
+        source = unified.source(store, lease)
     return unified, unified.register("c", source, read, REGIONS)
 
 
@@ -76,7 +77,7 @@ def test_every_region_holds_the_stored_bytes(tmp_path: Path, device: str, files:
         key = part["what"].removeprefix("c/").removesuffix("#value")
         assert got == VALUES[key].tobytes(), key
         assert part["offset"] % 4096 == 0
-    assert unified.stats()["devices"][0]["committed"] == ws.nbytes
+    assert unified.committed == ws.nbytes
     ws.close()
 
 

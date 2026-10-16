@@ -87,7 +87,7 @@ from cozy_runtime.internal.unified_plane import UnifiedPlane
 
 if TYPE_CHECKING:
     from tensorfs import ReadPlan
-    from tensorfs.plane import Cursor, Lease, Source, Ticket, WeightSet
+    from tensorfs.plane import Cursor, Lease, Plane, Source, Ticket, WeightSet
     from torch import Tensor
     from torch import device as Device
     from torch import dtype as Dtype
@@ -344,11 +344,13 @@ class Weights:
         self.index = int(device.index or 0)
         #: no device in the plane: a CPU executor, whose pinned tier IS its device memory
         self.host_only = device.type == "cpu"
-        #: one pool (Apple GPUs): the page cache is the host tier and regions are torch tensors
+        #: one pool (Apple GPUs): the page cache is the host tier and regions are torch tensors,
+        #: through a plane that speaks the TensorFS plane's contract
         self.unified = accel.memory_class(kind) == "unified"
-        self.plane = (
-            UnifiedPlane(torch, device)
-            if self.unified
+        self.pool = UnifiedPlane(torch, device) if self.unified else None
+        self.plane: Plane = (
+            cast("Plane", self.pool)
+            if self.pool is not None
             else plane.open_plane(None if self.host_only else self.index)
         )
         #: TensorD's budgets; -1: none given, each stage derives one from the driver
@@ -459,9 +461,9 @@ class Weights:
         """`accel.allocation`, with a unified plane's regions taken out of torch's figures:
         they are torch tensors there, and the plane counts them as its own (`committed`)."""
         memory = accel.allocation(self.torch, self.kind)
-        if self.unified:
+        if self.pool is not None:
             for name in ("allocated_bytes", "reserved_bytes"):
-                memory[name] = max(memory[name] - self.plane.committed, 0)
+                memory[name] = max(memory[name] - self.pool.committed, 0)
         return memory
 
     def synchronize(self) -> None:
@@ -2807,7 +2809,8 @@ class PlaneBackend:
         here: an explicit Store's path (tests, tools). A managed executor reads no store; on
         unified memory it reads the machine's verified object files, whose pages are the host
         tier."""
-        files = self.tiers.files if self.tiers is not None and self.weights.unified else None
+        pool = self.weights.pool
+        files = self.tiers.files if self.tiers is not None and pool is not None else None
         if checkpoint.store is None and files is None:
             raise _refuse(
                 "store_unusable",
@@ -2816,13 +2819,13 @@ class PlaneBackend:
             )
         if self.weights.fetch is not None:
             self.weights.fetch.wait(checkpoint.manifest_id, refs)
-        if checkpoint.store is None and files is not None:
+        if checkpoint.store is None:
+            assert files is not None and pool is not None
             handed = files(layout.sealed, _objects(layout.plan))
             if not handed:
                 raise _refuse("store_unusable", f"{name}: the machine served no object files")
             try:
-                source: Source = self.weights.plane.files_source(handed, checkpoint.header)
-                return source
+                return cast("Source", pool.files_source(handed, checkpoint.header))
             finally:
                 for _, _, fd in handed:
                     os.close(fd)

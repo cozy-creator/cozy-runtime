@@ -18,10 +18,20 @@ from collections import deque
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from types import ModuleType
-from typing import Any
+from typing import TYPE_CHECKING
 
 import tensorfs
+from tensorfs import ReadLease, ReadPlan, Store
 from tensorfs import plane as _plane
+
+if TYPE_CHECKING:
+    from tensorfs.plane import Part, Region, Trim
+    from tensorfs.records import Header, ReadItem
+    from torch import Tensor
+    from torch import device as Device
+
+#: `stats()` and an event, as `tensorfs.plane` spells them (Runtime reads them typed)
+type Facts = dict[str, object]
 
 #: Every part starts on a page, so any dtype views it.
 ALIGN = 4096
@@ -34,19 +44,19 @@ def _aligned(n: int) -> int:
 class _Source:
     """Bytes of the plan's rows: objects by digest, inline parts from the parsed header."""
 
-    def __init__(self, header: Any) -> None:
+    def __init__(self, header: Header) -> None:
         self.components = header["components"]
 
-    def object(self, row: dict[str, Any], into: memoryview) -> None:
+    def object(self, row: ReadItem, into: memoryview) -> None:
         raise NotImplementedError
 
-    def read(self, row: dict[str, Any], within: int, into: memoryview) -> None:
+    def read(self, row: ReadItem, within: int, into: memoryview) -> None:
         if row["source"] == "object":
             self.object(row, into)
             return
         component, _, rest = row["what"].partition("/")
         key, _, role = rest.rpartition("#")
-        inline = self.components[component][key]["parts"][role]["inline"]
+        inline = self.components[component][key]["parts"][role]["inline"]  # type: ignore[typeddict-item]
         into[:] = inline[within : within + row["len"]]
 
     def close(self) -> None:
@@ -56,11 +66,14 @@ class _Source:
 class _LeaseSource(_Source):
     """An explicitly opened Store's read lease (standalone use)."""
 
-    def __init__(self, store: Any, lease: Any) -> None:
-        super().__init__(tensorfs.parse_header(store.manifest(lease.manifest)["header"]))
+    def __init__(self, store: Store, lease: ReadLease) -> None:
+        header = store.manifest(lease.manifest)["header"]
+        if header is None:
+            raise _plane.Invalid(f"{lease.manifest} has no cozytensors header")
+        super().__init__(tensorfs.parse_header(header))
         self.lease = lease
 
-    def object(self, row: dict[str, Any], into: memoryview) -> None:
+    def object(self, row: ReadItem, into: memoryview) -> None:
         self.lease.read_into(row["object"], row["object_length"], row["off"], row["len"], into)
 
     def close(self) -> None:
@@ -70,14 +83,14 @@ class _LeaseSource(_Source):
 class _FileSource(_Source):
     """The machine's verified object files, mapped read-only: their pages are the host tier."""
 
-    def __init__(self, files: Iterable[tuple[str, int, int]], header: Any) -> None:
+    def __init__(self, files: Iterable[tuple[str, int, int]], header: Header) -> None:
         super().__init__(header)
         self.maps = {
             sha.removeprefix("sha256:"): mmap.mmap(fd, length, access=mmap.ACCESS_READ)
             for sha, length, fd in files
         }
 
-    def object(self, row: dict[str, Any], into: memoryview) -> None:
+    def object(self, row: ReadItem, into: memoryview) -> None:
         mapped = self.maps[row["object"].removeprefix("sha256:")]
         with memoryview(mapped) as view:
             into[:] = view[row["off"] : row["off"] + row["len"]]
@@ -93,8 +106,8 @@ class _Region:
     offset: int
     span: int
     #: (plan row, offset in this region, offset in its part)
-    copies: list[tuple[dict[str, Any], int, int]] = field(default_factory=list)
-    tensor: Any = None
+    copies: list[tuple[ReadItem, int, int]] = field(default_factory=list)
+    tensor: Tensor | None = None
     priority: int = 0
     pinned: bool = False
     leases: int = 0
@@ -109,22 +122,22 @@ class WeightSet:
         plane: UnifiedPlane,
         name: str,
         source: _Source,
-        plan: Any,
+        plan: ReadPlan,
         regions: Sequence[Sequence[str]],
         serial: int,
     ) -> None:
         self.plane, self.name, self.source, self.serial = plane, name, source, serial
         self.digest = name
         member = {what: r for r, names in enumerate(regions) for what in names}
-        grouped: list[dict[str, list[dict[str, Any]]]] = [{} for _ in regions]
+        grouped: list[dict[str, list[ReadItem]]] = [{} for _ in regions]
         for row in plan.items():
             what = row["what"]
             r = member.get(what, member.get(what.partition("#")[0]))
             if r is None:
                 raise _plane.Invalid(f"{what} is in no region of {name}")
             grouped[r].setdefault(what, []).append(row)
-        self.regions: list[dict[str, int]] = []
-        self.parts: list[dict[str, Any]] = []
+        self.regions: list[Region] = []
+        self.parts: list[Part] = []
         self._regions: list[_Region] = []
         offset = 0
         for r, parts in enumerate(grouped):
@@ -169,14 +182,15 @@ class Ticket:
 class Lease:
     def __init__(self, plane: UnifiedPlane, ws: WeightSet, region: _Region) -> None:
         self.plane, self.ws, self._region = plane, ws, region
-        self.tensor = region.tensor
-        self.ptr = int(region.tensor.data_ptr())
+        assert region.tensor is not None  # leased while resident
+        self.tensor: Tensor = region.tensor
+        self.ptr = int(self.tensor.data_ptr())
         self.nbytes = region.span
         self.region = region.index
         self.ring_offset = None
         self.live = True
 
-    def view(self) -> Any:
+    def view(self) -> Tensor:
         """The region's bytes as a uint8 device tensor (not DLPack: MPS has none)."""
         return self.tensor
 
@@ -226,7 +240,7 @@ class Cursor:
         self.passes = self.position // max(len(self.order), 1)
         return lease
 
-    def ring_view(self) -> Any:
+    def ring_view(self) -> Tensor:
         raise _plane.Invalid("a unified plane streams without a ring")
 
     def close(self) -> None:
@@ -240,7 +254,7 @@ class UnifiedPlane:
     """`tensorfs.plane.Plane` for one unified-memory device (`device`): budgets, residency
     intent, leases, cursors, stats and events, over regions read from the page cache."""
 
-    def __init__(self, torch: ModuleType, device: Any) -> None:
+    def __init__(self, torch: ModuleType, device: Device) -> None:
         self.torch, self.device = torch, device
         self.lock = threading.RLock()
         self.devices = [(0, device.type)]
@@ -249,14 +263,14 @@ class UnifiedPlane:
         self.serial = 0
         self.counts = {"misses": 0, "evictions": 0, "evicted_bytes": 0, "fills": 0}
         self.fill_bytes = self.fill_ns = 0
-        self._events: list[dict[str, Any]] = []
+        self._events: list[Facts] = []
 
     # -- sources and weight sets
 
-    def source(self, store: Any, lease: Any) -> _Source:
+    def source(self, store: Store, lease: ReadLease) -> _Source:
         return _LeaseSource(store, lease)
 
-    def files_source(self, files: Iterable[tuple[str, int, int]], header: Any) -> _Source:
+    def files_source(self, files: Iterable[tuple[str, int, int]], header: Header) -> _Source:
         """The machine's verified object files (`(sha256, length, fd)`; the caller keeps the
         fds, the maps are this plane's) and the checkpoint's parsed header."""
         return _FileSource(files, header)
@@ -265,7 +279,7 @@ class UnifiedPlane:
         self,
         name: str,
         source: _Source,
-        plan: Any,
+        plan: ReadPlan,
         regions: Sequence[Sequence[str]],
         host_fd: int | None = None,
     ) -> WeightSet:
@@ -283,12 +297,12 @@ class UnifiedPlane:
 
     # -- budgets and residency
 
-    def set_vram_budget(self, device: int, nbytes: int) -> dict[str, Any]:
+    def set_vram_budget(self, device: int, nbytes: int) -> Trim:
         with self.lock:
             self.budget = max(int(nbytes), 0)
             return self._trim(self.committed - self.budget, None)
 
-    def set_pinned_budget(self, nbytes: int) -> dict[str, Any]:
+    def set_pinned_budget(self, nbytes: int) -> Trim:
         self.pinned_budget = int(nbytes)
         return {"freed": 0, "evicted": [], "over_budget_unreleasable": 0, "blockers": []}
 
@@ -377,7 +391,7 @@ class UnifiedPlane:
 
     # -- facts
 
-    def stats(self) -> dict[str, Any]:
+    def stats(self) -> Facts:
         with self.lock:
             regions = [(ws, r) for ws in self.sets.values() for r in ws._regions]
             leased = sum(r.span for _, r in regions if r.tensor is not None and r.leases)
@@ -418,7 +432,7 @@ class UnifiedPlane:
                 "poisoned": None,
             }
 
-    def events(self) -> list[dict[str, Any]]:
+    def events(self) -> list[Facts]:
         with self.lock:
             out, self._events = self._events, []
             return out
@@ -474,7 +488,7 @@ class UnifiedPlane:
         ]
         return sorted(found, key=lambda pair: (pair[1].priority, -pair[0].serial, -pair[1].index))
 
-    def _trim(self, excess: int, below: int | None) -> dict[str, Any]:
+    def _trim(self, excess: int, below: int | None) -> Trim:
         evicted: list[tuple[str, int]] = []
         freed = 0
         for ws, region in self._victims(below):

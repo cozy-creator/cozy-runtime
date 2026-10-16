@@ -637,7 +637,7 @@ def _exact_weight(torch: Any, provider: Provider, roles: Mapping[str, Any]) -> A
     return data * _f64(roles["weight_scale"])
 
 
-def _f64(tensor: Any) -> Any:
+def _f64(tensor: Tensor) -> Tensor:
     """`tensor` in float64, where the device has it; MPS has none, so the host's."""
     return (tensor.cpu() if tensor.device.type == "mps" else tensor).double()
 
@@ -1024,7 +1024,7 @@ def qualify(
     return admission_table(result), result
 
 
-def _measured(torch: Any, provider: Provider, target: Any, dtype: Any) -> Evidence:
+def _measured(torch: ModuleType, provider: Provider, target: Tensor, dtype: Tensor) -> Evidence:
     """`_evidence`, where a device that lacks a dtype the decode reads (MPS has no float8)
     mints no record for it: the encoding refuses at bind naming why."""
     try:

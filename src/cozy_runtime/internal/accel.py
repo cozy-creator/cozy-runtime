@@ -655,7 +655,7 @@ def memory_class(kind: str) -> Literal["discrete", "unified"]:
     return "unified" if kind == "mps" else "discrete"
 
 
-def unified_budget(torch: Any) -> int:
+def unified_budget(torch: ModuleType) -> int:
     """The bytes one unified-memory process may hold: Metal's recommended working set,
     within physical RAM less what the system keeps."""
     ram = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
