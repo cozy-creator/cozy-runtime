@@ -148,7 +148,7 @@ def _blocked_shape(rows: int, cols: int) -> tuple[int, int]:
     return -(-rows // 128) * 128, -(-cols // 4) * 4
 
 
-def to_blocked(torch: Any, scales: Any) -> Any:
+def to_blocked(torch: ModuleType, scales: Tensor) -> Tensor:
     """`[rows, cols]` block-scale bytes -> cuBLASLt's 128x4 blocked ("swizzled") layout.
 
     A silent-wrong-output hazard rather than an optimisation (#515d): a block-scaled GEMM checks
