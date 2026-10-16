@@ -33,6 +33,7 @@ from triton.backends.compiler import GPUTarget
 from cozy_runtime import fusion, lm
 from cozy_runtime.author.kernels import TritonKernels
 from cozy_runtime.internal import (
+    arch,
     attention,
     attention_sol,
     config,
@@ -43,7 +44,6 @@ from cozy_runtime.internal import (
     nvfp4_linear,
     triton_kernels,
 )
-from cozy_runtime.internal.encoding import DeviceFacts
 
 #: Every card the family rules serve, by compute capability.
 TARGETS = (80, 86, 89, 90, 100, 103, 120, 121)
@@ -88,12 +88,14 @@ TRITON = (nvfp4_linear.KERNELS, lm.KERNELS, *LAYOUTS)
 def kernels(sm: int) -> Iterator[tuple[str, Callable[[], kernel_compile.Job]]]:
     """What a card of capability `sm` builds, by name: its 8-bit op, the attention artifacts its
     candidates admit, and the Triton sets."""
-    yield machine_kernels.INT8, functools.partial(kernel_sources.job, machine_kernels.INT8, sm)
-    card = DeviceFacts("cuda", "", sm, "", "")
+    row = arch.row(sm)
+    yield machine_kernels.INT8, functools.partial(
+        kernel_sources.job, machine_kernels.INT8, sm, family=row.family
+    )
     artifacts = {
         c.artifact
         for c in attention.BY_NAME.values()
-        if c.artifact not in ("", kernel_sources.PYTHON) and not attention._device_admits(c, card)
+        if c.artifact not in ("", kernel_sources.PYTHON) and not attention._off_row(c, row)
     }
     for artifact in sorted(artifacts):
         yield artifact, functools.partial(kernel_sources.job, artifact, sm)
