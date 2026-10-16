@@ -23,14 +23,17 @@ class Pieces:
     def room(self, key: str) -> tuple[float | None, int]:
         weights = self.weights
         if weights.open:  # it fits itself to the room it finds from now on
-            weights.adaptive.add(weights.open[-1][1])
+            weights.adaptive.setdefault(weights.open[-1][1], 0)
         free, movable = weights.activation_room(whole=True)
         return self.ratio.get(key), max(free + movable - weight_policy.MARGIN, 0)
 
     @contextmanager
-    def piece(self, key: str, elements: int, need: int) -> Iterator[None]:
+    def piece(self, key: str, elements: int, need: int, least: int = 0) -> Iterator[None]:
         weights = self.weights
         torch, kind = weights.torch, weights.kind
+        if weights.open:  # its stage's weights leave this much beside them from now on
+            method = weights.open[-1][1]
+            weights.adaptive[method] = max(weights.adaptive.get(method, 0), least)
         accel.hold_peak(torch, kind)
         weights.free_for(need, whole=True)
         base = accel.allocated(torch, kind)
