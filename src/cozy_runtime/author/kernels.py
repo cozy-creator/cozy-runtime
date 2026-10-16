@@ -9,9 +9,10 @@ each key once, niced, out of process. `Model.execution_plan` receives a `Plan` w
 waits for that build and returns the launcher. A request never compiles, and a launch maps any
 weight operand the plane has not mapped (`readable`).
 
-Also public here: the operand an `fp8-rowwise` encoded leaf takes already quantized
-(`PreQuantized`), and the Runtime's compiled CUDA kernels (`rms_rope_split_half`), which ride
-its linux x86 cp312-abi3 wheel.
+Also public here: the operand an encoded leaf takes already quantized (`PreQuantized`), a scope
+in which the leaves that read one activation quantize it once (`quantize_once`), and the
+Runtime's compiled CUDA kernels (`rms_rope_split_half`), which ride its linux x86 cp312-abi3
+wheel.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ import hashlib
 import re
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from importlib.util import find_spec
 from typing import Any, cast
@@ -27,7 +29,8 @@ from typing import Any, cast
 from cozy_runtime import _kernels
 
 ROWWISE_FP8 = "cozy.fp8-rowwise.native-leaf/1"
-"""The `provider` of an encoded leaf whose forward takes a `PreQuantized` operand."""
+INT8_CONVROT = "cozy.int8-convrot256.native-leaf/1"
+"""The `provider`s of the encoded leaves whose forward takes a `PreQuantized` operand."""
 
 _NAME = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 
@@ -124,7 +127,7 @@ class Plan:
 
 @dataclass(frozen=True, slots=True)
 class PreQuantized:
-    """An activation already in the `fp8-rowwise` leaf's operand geometry (h3a-015).
+    """An activation already in an encoded leaf's operand geometry (h3a-015): `provider`'s.
 
     A fused kernel that holds a row in registers quantizes it there instead of writing bf16
     for the leaf to read back; the leaf then feeds the payload and per-row scale straight to
@@ -134,6 +137,45 @@ class PreQuantized:
     payload: Any
     scale: Any
     shape: tuple[int, ...]
+    provider: str = ROWWISE_FP8
+
+
+class _Shared:
+    __slots__ = ("operands", "tensor")
+
+    def __init__(self, tensor: Any) -> None:
+        self.tensor = tensor
+        self.operands: dict[str, PreQuantized | None] = {}
+
+
+_SHARED: ContextVar[tuple[_Shared, ...]] = ContextVar("cozy_quantize_once", default=())
+
+
+@contextmanager
+def quantize_once(*tensors: Any) -> Iterator[None]:
+    """Inside, the encoded leaves that take one of `tensors` (that object) as input quantize it
+    once between them, as a fused qkv GEMM would: q, k and v of one normed input, or an MLP's
+    gate and up. None is skipped. A tensor must not change in place inside the scope."""
+    shared = tuple(_Shared(t) for t in tensors if t is not None)
+    token = _SHARED.set(_SHARED.get() + shared)
+    try:
+        yield
+    finally:
+        _SHARED.reset(token)
+
+
+def shared_operand(
+    x: Any, provider: str, make: Callable[[], PreQuantized | None]
+) -> PreQuantized | None:
+    """`provider`'s operand for `x` inside a `quantize_once` scope that holds it, `make()` by the
+    first leaf to ask; None outside one, or when `make` declines (the leaf's own op then serves
+    it)."""
+    for shared in _SHARED.get():
+        if shared.tensor is x:
+            if provider not in shared.operands:
+                shared.operands[provider] = make()
+            return shared.operands[provider]
+    return None
 
 
 def native() -> str:
@@ -176,6 +218,7 @@ def rms_rope_split_half(
 
 
 __all__ = [
+    "INT8_CONVROT",
     "ROWWISE_FP8",
     "KernelsUnavailable",
     "Launch",
@@ -184,6 +227,8 @@ __all__ = [
     "TritonEntry",
     "TritonKernels",
     "native",
+    "quantize_once",
     "readable",
     "rms_rope_split_half",
+    "shared_operand",
 ]
