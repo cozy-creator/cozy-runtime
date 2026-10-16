@@ -85,6 +85,8 @@ class Candidate:
     shapes: frozenset[tuple[int, str]] = frozenset()
     #: a package's producer, served through its base backend (`known`)
     producer: AttentionProducer | None = None
+    #: keeps the operands' own precision; False quantizes them (8 or 4 bits)
+    exact: bool = True
 
 
 _HALF = frozenset({"bfloat16", "float16"})
@@ -124,6 +126,7 @@ CANDIDATES: tuple[Candidate, ...] = (
 PINNABLE: tuple[Candidate, ...] = (
     Candidate(
         name="flash-attn3-fp8",
+        exact=False,
         backend="_cozy_flash_attn3_fp8",
         local=upstream.FA3_FP8,
         min_sm=90,
@@ -140,6 +143,7 @@ PINNABLE: tuple[Candidate, ...] = (
     ),
     Candidate(
         name="flash-attn4-fp8",
+        exact=False,
         backend="_cozy_flash_attn4_fp8",
         local=upstream.FA4_FP8,
         min_sm=100,
@@ -150,9 +154,10 @@ PINNABLE: tuple[Candidate, ...] = (
         artifact=kernel_sources.PYTHON,
         import_name="flash_attn.cute",
         why=(
-            "Explicit experiment: FA4's SM100-only e4m3 forward with per-head descales. "
-            "Hopper's 0.31 (h3a-044) is its FP8 MMA accumulator; Blackwell accumulates in "
-            "FP32, so the dequantised-input control (0.027) is the expectation. Unmeasured."
+            "FA4's SM100 e4m3 forward, Q/K Hadamard-rotated, per-head descales. B200 on real "
+            "H3 Q/K/V (111k rows): 205 ms against cuDNN BF16's 267, 0.026-0.05 rel L2 to FP32; "
+            "without the rotation 0.2-0.4 on H3's blocks 45 and 49 (key channel outliers), "
+            "which H3 keeps exact. An explicit choice: it quantizes."
         ),
     ),
     Candidate(
@@ -182,6 +187,7 @@ PINNABLE: tuple[Candidate, ...] = (
     ),
     Candidate(
         name="sageattention",
+        exact=False,
         backend="_cozy_sage_int8_fp8",
         local=upstream.SAGE,
         min_sm=89,
@@ -199,6 +205,7 @@ PINNABLE: tuple[Candidate, ...] = (
     ),
     Candidate(
         name="sageattention-fp16pv",
+        exact=False,
         backend="_cozy_sage_fp16pv",
         local=upstream.SAGE_FP16PV,
         min_sm=90,
@@ -216,6 +223,7 @@ PINNABLE: tuple[Candidate, ...] = (
     ),
     Candidate(
         name="kitchen-int8",
+        exact=False,
         backend="_cozy_kitchen_int8",
         local=upstream.KITCHEN,
         min_sm=80,
@@ -229,6 +237,7 @@ PINNABLE: tuple[Candidate, ...] = (
     ),
     Candidate(
         name="flashinfer-bf16-fp8",
+        exact=False,
         backend="_cozy_flashinfer_bf16_fp8",
         local=upstream.FLASHINFER,
         min_sm=100,
@@ -243,6 +252,7 @@ PINNABLE: tuple[Candidate, ...] = (
     ),
     Candidate(
         name="sageattention3-fp4",
+        exact=False,
         backend="_cozy_sage3_fp4",
         local=upstream.SAGE3,
         min_sm=120,
@@ -279,6 +289,7 @@ PINNABLE: tuple[Candidate, ...] = (
 PINNABLE += (
     Candidate(
         name=attention_sage2_fixed.DENSE_NAME,
+        exact=False,
         backend="_cozy_sage2_fixed_kmean",
         local=attention_sage2_fixed.DENSE,
         min_sm=90,
@@ -311,6 +322,7 @@ PINNABLE += (
 PINNABLE += (
     Candidate(
         name="sageattention3-fp4-global-lowmem",
+        exact=False,
         backend="_cozy_sage3_fp4_global_lowmem",
         local=upstream.SAGE3_GLOBAL_LOWMEM,
         min_sm=120,
@@ -325,6 +337,7 @@ PINNABLE += (
     ),
     Candidate(
         name="sageattention3-fp4-fixed-means",
+        exact=False,
         backend="_cozy_sage3_fp4_fixed_means",
         local=upstream.SAGE3_FIXED_MEANS,
         min_sm=120,
@@ -777,14 +790,16 @@ def _sol_dense(
     device: DeviceFacts,
     resolved: dict[str, Ready],
     refused: dict[str, str],
-) -> Ready:
+) -> tuple[Ready, Ready | None]:
     """The kernel Sol recomputes dense rows with (its dense steps, protected prefix and dense
     paths): the first one after Sol in the model's preference that serves BF16 at head
-    dimension 128 on this rank, else the first ranked one. It runs locally after the Ulysses
+    dimension 128 on this rank, else the first ranked one; and when that one quantizes, the
+    next exact one, which the model's exact paths take. It runs locally after the Ulysses
     exchange, so it needs no context parallelism. One still compiling is passed over (run
     1565: SDPA served Sol's dense steps at 35 s where SageAttention takes about 24 s, the
     price of not waiting) and selected again once ready."""
     found = known()
+    dense: Ready | None = None
     for name in (*order, *(candidate.name for candidate in CANDIDATES)):
         candidate = found.get(name)
         if (
@@ -792,6 +807,7 @@ def _sol_dense(
             or sparse(candidate)
             or _device_admits(candidate, device)
             or not _admits(candidate, "bfloat16", 128)
+            or (dense is not None and not candidate.exact)
         ):
             continue
         if name not in resolved:
@@ -800,12 +816,24 @@ def _sol_dense(
             except Exception as exc:
                 refused.setdefault(name, f"{type(exc).__name__}: {exc}"[:300])
                 continue
-        return resolved[name]
+        if dense is not None:
+            return dense, resolved[name]
+        if candidate.exact:
+            return resolved[name], None
+        dense = resolved[name]
+    if dense is not None:
+        return dense, None
     raise AttentionRefusal("attention_kernel_absent", "Sol has no ready dense reference")
 
 
-def _bind_sol_dense(dense: Ready) -> None:
-    attention_sol.bind_dense(_registry()._backends[dense.member], dense.name)
+def _bind_sol_dense(chosen: tuple[Ready, Ready | None]) -> None:
+    dense, exact = chosen
+    backends = _registry()._backends
+    attention_sol.bind_dense(
+        backends[dense.member],
+        dense.name if exact is None else f"{dense.name}; exact={exact.name}",
+        None if exact is None else backends[exact.member],
+    )
 
 
 def _device_admits(candidate: Candidate, device: DeviceFacts) -> str:

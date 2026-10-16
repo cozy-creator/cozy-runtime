@@ -250,6 +250,23 @@ def fa4(
     return _first(cute.flash_attn_func(query, key, value, softmax_scale=scale, causal=is_causal))
 
 
+def _hadamard(t: Tensor) -> Tensor:
+    """`t` times the orthonormal Hadamard of its head dimension (a power of two)."""
+    import torch
+
+    found = _HADAMARD.get((t.shape[-1], t.dtype, t.device))
+    if found is None:
+        h = torch.ones(1, 1, dtype=torch.float32)
+        while h.shape[0] < t.shape[-1]:
+            h = torch.cat([torch.cat([h, h], 1), torch.cat([h, -h], 1)])
+        found = (h / math.sqrt(t.shape[-1])).to(t.device, t.dtype)
+        _HADAMARD[(t.shape[-1], t.dtype, t.device)] = found
+    return torch.matmul(t, found)
+
+
+_HADAMARD: dict[tuple[int, object, object], Tensor] = {}
+
+
 def fa4_fp8(
     query: Tensor,
     key: Tensor,
@@ -263,13 +280,20 @@ def fa4_fp8(
 ) -> Tensor:
     """FlashAttention-4's SM100 e4m3 forward with FA3's per-(batch, head) descales; the kernel
     returns BF16. The public `flash_attn_func` takes no descales, so this calls the forward it
-    wraps, as upstream's own FP8 benchmark does. Every scale is per head: head-local."""
+    wraps, as upstream's own FP8 benchmark does. Every scale is per head: head-local.
+
+    Q and K are rotated by one orthonormal Hadamard first. QK^T is unchanged, and a key
+    channel outlier spreads over the head before its per-head scale is taken: on H3's real
+    Q/K/V (B200, h3-b200-attention) 0.029 -> 0.026 rel L2 at block 25 and 0.26-0.41 -> 0.09-0.10
+    at block 49, for 1-2 ms of a 205 ms call."""
     import torch
 
     _options("flash-attn4-fp8", attn_mask, dropout_p, scale)
     if query.dtype != torch.bfloat16:
         raise ValueError("flash-attn4-fp8 returns BF16 and requires BF16 inputs")
-    q8, k8, v8, descales = _e4m3(query, key, value)
+    if query.shape[-1] & (query.shape[-1] - 1):
+        raise ValueError("flash-attn4-fp8 rotates Q/K by a Hadamard: head dimension 2^n")
+    q8, k8, v8, descales = _e4m3(_hadamard(query), _hadamard(key), value)
     interface = import_module("flash_attn.cute.interface")
     return _first(
         interface._flash_attn_fwd(q8, k8, v8, softmax_scale=scale, causal=is_causal, **descales)
