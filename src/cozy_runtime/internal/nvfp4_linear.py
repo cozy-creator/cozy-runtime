@@ -20,7 +20,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable
 from types import ModuleType
-from typing import Any
+from typing import TYPE_CHECKING
 
 from cozy_runtime.author.kernels import (
     KernelsUnavailable,
@@ -31,6 +31,9 @@ from cozy_runtime.author.kernels import (
 )
 from cozy_runtime.internal import int8_linear, triton_kernels
 from cozy_runtime.internal.encoding.formats import NVFP4_BLOCK, Tensor, nvfp4_values
+
+if TYPE_CHECKING:
+    from torch import device as Device
 
 #: The largest magnitude of the two levels: E4M3's 448 times E2M1's 6.
 LEVELS_MAX = 448.0 * 6.0
@@ -238,7 +241,7 @@ def _entries() -> list[TritonEntry]:
         return []
     weight = {"w_ptr": "*u8", "s_ptr": "*u8", "two_ptr": "*fp32", "x_ptr": "*bf16"}
 
-    def signature(kernel: Any, **types: str) -> dict[str, str]:
+    def signature(kernel: triton.JITFunction, **types: str) -> dict[str, str]:
         return {
             name: types.get(name)
             or weight.get(name)
@@ -288,7 +291,7 @@ POLL_SECONDS = 1.0
 _LAUNCH: dict[int, tuple[float, Launch | None]] = {}
 
 
-def _launcher(device: Any) -> Launch | None:
+def _launcher(device: Device) -> Launch | None:
     """This GPU's launcher once the executor start's build is loaded, else None (asked again
     after `POLL_SECONDS`): the caller then decodes eagerly."""
     index = device.index or 0
