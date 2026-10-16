@@ -26,7 +26,12 @@ from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._markers import Bound
 from cozy_runtime.author._memo import MemoDependency, Memoize, memo_policy
 from cozy_runtime.author._memo import declare as declare_memo
-from cozy_runtime.author._model_defaults import DefaultLadder, model_components, model_defaults
+from cozy_runtime.author._model_defaults import (
+    DefaultLadder,
+    model_components,
+    model_defaults,
+    model_on_demand,
+)
 from cozy_runtime.author._signature import Surface, analyze
 from cozy_runtime.author._weights import WeightsOutput
 
@@ -50,6 +55,7 @@ class Registration:
     memoize: Memoize | None = None
     model_defaults: Mapping[str, DefaultLadder] = field(default_factory=dict)
     model_components: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    model_on_demand: tuple[str, ...] = ()
     publishes: bool = False
     emits_media: bool = False
     weights_outputs: tuple[WeightsOutput, ...] = ()
@@ -85,6 +91,7 @@ class Registration:
                 memoize=self.memoize,
                 model_defaults=self.model_defaults,
                 model_components=self.model_components,
+                model_on_demand=self.model_on_demand,
             )
         return self._surface
 
@@ -107,6 +114,7 @@ class App:
         demand: Bound | None = None,
         defaults: Mapping[str, Sequence[Mapping[str, str | int]]] | None = None,
         components: Mapping[str, Sequence[str]] | None = None,
+        on_demand: Sequence[str] = (),
         hidden: bool = False,
         internal: bool = False,
         memoize: bool | Memoize = False,
@@ -128,6 +136,7 @@ class App:
         demand: Bound | None = None,
         defaults: Mapping[str, Sequence[Mapping[str, str | int]]] | None = None,
         components: Mapping[str, Sequence[str]] | None = None,
+        on_demand: Sequence[str] = (),
         hidden: bool = False,
         internal: bool = False,
         memoize: bool | Memoize = False,
@@ -149,6 +158,7 @@ class App:
         demand: Bound | None = None,
         defaults: Mapping[str, Sequence[Mapping[str, str | int]]] | None = None,
         components: Mapping[str, Sequence[str]] | None = None,
+        on_demand: Sequence[str] = (),
         hidden: bool = False,
         internal: bool = False,
         memoize: bool | Memoize = False,
@@ -170,7 +180,9 @@ class App:
         writer); `memo_dependencies`/`memo_version` declare what else decides the result, and
         `Memoize(requires=("seed",))` memoizes only requests that name each listed option.
         `components={"model": ("dit", "vae")}` names the components each model argument
-        uses, so a machine fetches those first; absent means all."""
+        uses, so a machine fetches those first; absent means all. `on_demand=("upsampler",)`
+        names the model arguments a request may leave unused: each is built, and its weights
+        fetched, when the function first reads it."""
         policy = memo_policy(memoize)
         if type(internal) is not bool:
             raise RegistrationError("internal must be a boolean")
@@ -183,6 +195,7 @@ class App:
             raise RegistrationError("an internal callable cannot also be hidden")
         declared_defaults = model_defaults(defaults)
         declared_components = model_components(components)
+        declared_on_demand = model_on_demand(on_demand)
 
         def decorate(target: Callable[P, R]) -> Callable[P, R]:
             if self._frozen:
@@ -219,6 +232,7 @@ class App:
                 model_defaults=declared_defaults or (export.defaults if export is not None else {}),
                 model_components=declared_components
                 or (export.components if export is not None else {}),
+                model_on_demand=declared_on_demand,
                 publishes=publishes,
                 emits_media=emits_media,
                 weights_outputs=weights,

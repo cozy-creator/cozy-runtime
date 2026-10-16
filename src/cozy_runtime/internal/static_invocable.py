@@ -72,6 +72,7 @@ def build(reader: Reader, registration: Registration) -> dict[str, Json]:
                     defaults=registration.model_defaults.get(arg.arg, ()),
                     uses=registration.model_components.get(arg.arg, ()),
                     weights=weights,
+                    on_demand=arg.arg in registration.model_on_demand,
                 )
             )
             fields.append((arg.arg, author.ModelArtifact | None, None))
@@ -158,6 +159,10 @@ def build(reader: Reader, registration: Registration) -> dict[str, Json]:
     slots = [str(slot["path"]).rsplit(".", 1)[-1] for slot in models]
     check_model_arguments(registration.model_defaults, slots)
     check_model_arguments(registration.model_components, slots, what="components")
+    constructed = [str(s["path"]).rsplit(".", 1)[-1] for s in models if not s.get("weights")]
+    check_model_arguments(
+        dict.fromkeys(registration.model_on_demand), constructed, what="on_demand"
+    )
     metadata = invocable_interface.from_types(
         payload,
         result,

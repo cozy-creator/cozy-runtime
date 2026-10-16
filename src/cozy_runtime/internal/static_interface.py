@@ -55,6 +55,7 @@ from cozy_runtime.author._model_defaults import (
     check_model_arguments,
     model_components,
     model_defaults,
+    model_on_demand,
 )
 from cozy_runtime.author._script_metadata import (
     Unfolded,
@@ -273,6 +274,7 @@ _ENTRYPOINT_KEYWORDS = frozenset(
         "memo_dependencies",
         "defaults",
         "components",
+        "on_demand",
         "internal",
         "publishes",
         "emits_media",
@@ -1167,6 +1169,7 @@ class Registration:
     #: `memo_version=` / `memo_dependencies=` as written, and the module they are read in.
     memo_declaration: tuple[tuple[str, Module, ast.expr], ...] = ()
     model_components: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    model_on_demand: tuple[str, ...] = ()
 
 
 def build(project: Path, *, environment_python: Path | None = None) -> dict[str, Json]:
@@ -1574,6 +1577,7 @@ def _registration(
     accelerator = True
     hidden = False
     weights: tuple[author.WeightsOutput, ...] = ()
+    on_demand: tuple[str, ...] = ()
     for keyword in keywords:
         if keyword.arg not in _ENTRYPOINT_KEYWORDS:
             reader.refuse(
@@ -1615,6 +1619,8 @@ def _registration(
                     module, keyword, "declare components once, on invocable or App registration"
                 )
             used_components = declared_components or used_components
+        elif keyword.arg == "on_demand":
+            on_demand = model_on_demand(value)
         elif keyword.arg == "name":
             name = str(value)
         elif keyword.arg == "hidden" and value is True:
@@ -1657,6 +1663,7 @@ def _registration(
         accelerator,
         tuple(memo_declaration),
         used_components,
+        on_demand,
     )
 
 
@@ -1729,6 +1736,7 @@ def _callable(reader: Reader, registration: Registration) -> dict[str, Json]:
                     defaults=registration.model_defaults.get(arg.arg, ()),
                     uses=registration.model_components.get(arg.arg, ()),
                     weights=weights,
+                    on_demand=arg.arg in registration.model_on_demand,
                 )
             )
             continue
@@ -1774,6 +1782,10 @@ def _callable(reader: Reader, registration: Registration) -> dict[str, Json]:
     parameters = [str(slot["path"]).rsplit(".", 1)[-1] for slot in models]
     check_model_arguments(registration.model_defaults, parameters)
     check_model_arguments(registration.model_components, parameters, what="components")
+    constructed = [str(s["path"]).rsplit(".", 1)[-1] for s in models if not s.get("weights")]
+    check_model_arguments(
+        dict.fromkeys(registration.model_on_demand), constructed, what="on_demand"
+    )
     if len(payloads) != 1:
         reader.refuse(
             module, fn, f"exactly one typed request struct is required, found {len(payloads)}"

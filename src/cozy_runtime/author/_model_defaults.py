@@ -135,6 +135,21 @@ def model_components(value: object) -> dict[str, tuple[str, ...]]:
     return out
 
 
+def model_on_demand(value: object) -> tuple[str, ...]:
+    """Copy an `on_demand=` declaration: the Model arguments built on first use."""
+    if value is None:
+        return ()
+    if (
+        not isinstance(value, (list, tuple))
+        or any(not isinstance(name, str) or not name.isidentifier() for name in value)
+        or len(set(value)) != len(value)
+    ):
+        raise ConformanceError(
+            "on_demand must be a sequence of unique Model argument names", code="model_on_demand"
+        )
+    return tuple(value)
+
+
 def check_model_arguments(
     declared: Mapping[str, object], parameters: Sequence[str], *, what: str = "defaults"
 ) -> None:

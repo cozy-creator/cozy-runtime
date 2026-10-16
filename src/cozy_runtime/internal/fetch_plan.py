@@ -12,6 +12,9 @@ its tickets, so unused components stop and ranks change):
 3. **PrepareRequest**: the attempt re-asserts the plan, with the stage and block order this
    process learned.
 
+An on-demand model (`on_demand=`) is in none of them: its plan goes first on the channel when
+a stage first uses it in a pass (`want`), and a request that never uses it fetches nothing of it.
+
 Every rank is `Next` (run order, rank); a reader that needs bytes now waits on them (`Now`).
 Runtime never downloads and never retries: the fetcher owns transport retries, and a fetch
 it refuses ends the run `model_fetch_failed` (`machine_disk_full` for a full disk).
@@ -134,6 +137,8 @@ class Fetches:
         self._rank = 0
         #: checkpoints the owner holds whole here (outside every grant): nothing to fetch
         self._whole: set[str] = set()
+        #: on-demand plans this pass wanted (`want`)
+        self._wanted: set[str] = set()
 
     @property
     def groups(self) -> list[Group]:
@@ -142,12 +147,25 @@ class Fetches:
 
     def begin(self) -> None:
         """A new pass (Start, Load, PrepareRequest): the plans it makes replace the last's."""
-        self._plans = {}
+        self._plans, self._wanted = {}, set()
 
     def schedule(self, groups: Sequence[Group], key: str = "") -> None:
         """Plan `groups` as `key`'s part of this pass, rank by position, on a fresh channel;
         then drop the channel it replaces, and with it what the last pass wanted."""
         self._plans[key] = list(groups)
+        self._replan()
+
+    def want(self, key: str, plan: Callable[[], Sequence[Group]]) -> None:
+        """An on-demand model's stage begins: once a pass, its plan goes first, as it is
+        needed now."""
+        if key in self._wanted:
+            return
+        self._wanted.add(key)
+        self._plans.pop(key, None)
+        self._plans = {key: list(plan()), **self._plans}
+        self._replan()
+
+    def _replan(self) -> None:
         planned = self.groups
         fd = self._ask()
         fresh = Fetch.from_fd(fd) if fd >= 0 else None
@@ -197,7 +215,7 @@ class Fetches:
 
     def end(self) -> None:
         """The attempt ended: its interest goes with its channel."""
-        self._plans = {}
+        self._plans, self._wanted = {}, set()
         with self._lock:
             old, self._channel, self._rank = self._channel, None, 0
         if old is not None:
