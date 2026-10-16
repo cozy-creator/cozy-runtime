@@ -30,7 +30,8 @@ class Card:
         return self.ratio, self.free
 
     @contextmanager
-    def piece(self, key: str, elements: int, need: int) -> Iterator[None]:
+    def piece(self, key: str, elements: int, need: int, least: int = 0) -> Iterator[None]:
+        self.least = least
         if elements > self.limit:
             raise torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 2.00 GiB")
         self.pieces.append(elements)
@@ -117,6 +118,16 @@ def test_an_unmeasured_op_with_its_own_estimate_starts_at_the_pieces_that_fit(ca
     assert device.pieces == [16 * 3]
 
 
+def test_each_piece_tells_the_runtime_what_the_finest_piece_needs(card: Any) -> None:
+    """The room a stage must keep beside its weights for an op that cannot cut finer: twelve
+    latent frames cut on time need one frame's bytes at least (SeedVR2's DiT at 1080p)."""
+    device = card(Card(limit=10**9, ratio=100.0, room=10**9))
+    split(lambda t: t, torch.zeros(12, 6, 10, 3), Cut(0))
+    assert device.pieces == [12 * 6 * 10 * 3] and device.least == 100 * 6 * 10 * 3
+    split(lambda t: t, torch.zeros(1, 3, 64, 48), Cut(-2, 0.5, overlap=12, align=2))
+    assert device.least < 100 * 3 * 64 * 48
+
+
 def test_a_measured_op_starts_at_the_pieces_that_fit(card: Any) -> None:
     """Bytes per element times the largest piece within the room: no failed attempt first."""
     device = card(Card(limit=10**9, ratio=100.0, room=100 * 2 * 4 * 36))
@@ -128,7 +139,7 @@ def test_a_measured_op_starts_at_the_pieces_that_fit(card: Any) -> None:
 def test_a_refusal_is_a_reason_to_cut_finer_and_other_failures_are_not(card: Any) -> None:
     class Refusing(Card):
         @contextmanager
-        def piece(self, key: str, elements: int, need: int) -> Iterator[None]:
+        def piece(self, key: str, elements: int, need: int, least: int = 0) -> Iterator[None]:
             if elements > self.limit:
                 raise RuntimeFailure("no room", code="operation_exceeds_device")
             self.pieces.append(elements)
