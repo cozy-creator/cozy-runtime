@@ -133,11 +133,7 @@ def _generate(
     presence_penalty: float,
 ) -> Any:
     try:
-        # Outside Runtime's per-op dispatch: its recovery would journal, spill or band the
-        # session's buffers, which its graphs read by address and later calls reuse. Room the
-        # step cannot get ends the static path, not the call.
-        with _disable_current_modes():
-            tokens = _static(model, inputs, max_new_tokens, stops, filler, presence_penalty)
+        tokens = _static(model, inputs, max_new_tokens, stops, filler, presence_penalty)
         if tokens is not None:
             return tokens
         why = "its decode set does not fit at home"
@@ -173,22 +169,28 @@ def _static(
         presence_penalty,
         ids.device,
     )
+    # Only the prefill's forward runs under Runtime's recovery, into a cache of its own. The
+    # recovery would journal, spill or band what an op writes, and the session's buffers are
+    # read by address by its graphs and kept for later calls: everything that writes them runs
+    # outside it, and room that a step cannot get ends the static path, not the call.
     decode = _SESSIONS.get(model)
     if decode is None or decode.key != key:
         _SESSIONS.pop(model, None)
         decode = _SESSIONS[model] = _Decode(model, key, presence_penalty)
-    decode.begin(inputs, stops, filler)
+    with _disable_current_modes():
+        decode.begin(inputs, stops, filler)
     placed = PLACED.get(model)
     if placed is None:  # a module Runtime does not place: its tensors stay where they are
         decode.prefill()
-        return decode.run(graphs=cuda, layout=(), room=None)
+        with _disable_current_modes():
+            return decode.run(graphs=cuda, layout=(), room=None)
     residency, name = placed
     blocks = _READS.get(model)
     if blocks is None:
         # The first call: its first step runs through the paging hooks, which record the
         # blocks a step reads; later calls hold them before their prefill.
         decode.prefill()
-        with residency.recording() as read:
+        with residency.recording() as read, _disable_current_modes():
             decode.first()
         blocks = _READS[model] = frozenset(read.get(name, ()))
     with residency.held(name, blocks) as held:
@@ -197,7 +199,8 @@ def _static(
         if not decode.made:
             decode.prefill()
         layout = residency.layout(name, blocks)
-        return decode.run(graphs=True, layout=layout, room=residency.allocatable)
+        with _disable_current_modes():
+            return decode.run(graphs=True, layout=layout, room=residency.allocatable)
 
 
 def install(plan: Plan, model: Any) -> str:
@@ -424,6 +427,26 @@ def _transformers(
     return out[:, prompt:]
 
 
+def _into(mine: Any, value: Any) -> Any:
+    """`value` (a cache layer's field) copied into `mine` in place where they match, so a graph
+    that reads `mine` reads it; else `value` itself."""
+    if isinstance(value, torch.Tensor):
+        same = isinstance(mine, torch.Tensor) and (mine.shape, mine.dtype, mine.device) == (
+            value.shape,
+            value.dtype,
+            value.device,
+        )
+        return mine.copy_(value) if same else value
+    if isinstance(value, list):
+        if isinstance(mine, list) and len(mine) == len(value):
+            return [_into(a, b) for a, b in zip(mine, value, strict=True)]
+        return value
+    if isinstance(value, dict):
+        held = mine if isinstance(mine, dict) else {}
+        return {key: _into(held.get(key), item) for key, item in value.items()}
+    return value
+
+
 def window(length: int, capacity: int) -> int:
     """The attention window for a sequence of `length`: the next power of two from `MIN_WINDOW`,
     at most the cache's `capacity`."""
@@ -580,18 +603,26 @@ class _Decode:
             kwargs["attention_mask"] = None
         if self.keep:
             kwargs["logits_to_keep"] = 1
+        fresh = _StaticCache(self.text, self.capacity, self.prompt)
         prepared = model.prepare_inputs_for_generation(
-            ids, past_key_values=self.cache, use_cache=True, is_first_iteration=True, **kwargs
+            ids, past_key_values=fresh, use_cache=True, is_first_iteration=True, **kwargs
         )
+        # Under the caller's recovery, which makes room op by op, into this call's own cache.
+        logits = model(**prepared, return_dict=True).logits[:, -1]
+        with _disable_current_modes():
+            self._settle(fresh, logits, mask, position)
+        if ids.is_cuda:
+            torch.cuda.current_stream().synchronize()
+        self.prefill_s = time.perf_counter() - started
 
-        def forward() -> Any:
-            self.cache.reset()
-            return model(**prepared, return_dict=True).logits[:, -1]
-
-        # Outside Runtime's per-op dispatch (the caller's), as a paging hook runs a block that
-        # writes nothing it did not make: held blocks have no hook (2.2k image tokens: 1.09 s
-        # under it, 0.49 s without, on a 4090).
-        logits = forward()
+    def _settle(self, fresh: Any, logits: Any, mask: Any, position: Any) -> None:
+        """The prefill's cache into the session's buffers, in place (its graphs read them by
+        address), and the decode's state at the prompt's end."""
+        for mine, theirs in zip(self.cache.layers, fresh.layers, strict=True):
+            for field, value in vars(theirs).items():
+                if field != "size":  # the window holder each cache shares with its layers
+                    setattr(mine, field, _into(getattr(mine, field, None), value))
+        ids = self.inputs["input_ids"]
         if position is not None:
             following = position[..., -1:] + 1
             if self.position is None or self.position.shape != following.shape:
@@ -612,9 +643,6 @@ class _Decode:
             self.seen.zero_()
         self.select(logits)
         self.made = 1
-        if ids.is_cuda:
-            torch.cuda.current_stream().synchronize()
-        self.prefill_s = time.perf_counter() - started
 
     def first(self) -> None:
         """The first step eagerly, through the paging hooks (they record what it reads)."""
