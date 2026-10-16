@@ -139,6 +139,34 @@ def test_leaf_matches_its_exact_weight() -> None:
             assert error < 0.02, (device, dtype, float(error))
 
 
+def test_a_gemm_that_raises_is_served_by_torch_and_the_run_says_so() -> None:
+    """Run 9141: a GEMM that raised ended its run and poisoned the executor. The op's GEMM of a
+    quantized operand that raises (here: no op for CPU tensors) is served by torch's int8 GEMM
+    at the eager path's exact law, and the run carries one warning per reason."""
+    from cozy_runtime.author._model import WARNINGS
+    from cozy_runtime.author.kernels import INT8_CONVROT, PreQuantized
+    from cozy_runtime.internal import int8_linear
+    from cozy_runtime.internal.encoding.formats import hadamard256
+
+    values = weight(64, 512, 5)
+    encoded = encode_int8_convrot256("w", values)
+    data = torch.frombuffer(bytearray(encoded.payload), dtype=torch.int8).reshape(64, 512)
+    scale = torch.frombuffer(bytearray(encoded.companions[0].raw), dtype=torch.float32)
+    x = torch.randn(40, 512, generator=torch.Generator().manual_seed(9))
+    rotated = hadamard256(torch, x).mul_(1.0 / 16)
+    row_scale = (rotated.abs().amax(-1) / 127.0).clamp_(min=1e-12)
+    payload = torch.round(rotated / row_scale[:, None]).clamp_(-127, 127).to(torch.int8)
+    operand = PreQuantized(payload, row_scale, tuple(x.shape), INT8_CONVROT)
+    WARNINGS.clear()
+    for _ in range(2):
+        got = int8_linear.gemm(torch, operand, data, scale, None, torch.float32)
+        assert torch.equal(got, int8_linear.eager(torch, x, data, scale, torch.float32))
+    [(message, fields)] = WARNINGS
+    assert message == "encoded GEMM failed, a slower path served"
+    assert fields["op"] == int8_linear.OP and fields["device"] == -1
+    WARNINGS.clear()
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the int8 op runs on a CUDA card")
 def test_native_op_is_built_by_the_compile_manager_and_keeps_the_law(tmp_path: Path) -> None:
     """The op as a pod gets it: the machine's compile manager builds `cozy-int8` for this card
