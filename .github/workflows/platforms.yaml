@@ -1,0 +1,111 @@
+name: platforms
+# A published Runtime on every desktop platform, Linux x86_64 as the control: does it install
+# (TensorFS has only a linux-x86_64 wheel, so elsewhere it builds from the sdist), which modules
+# import, do the CLI verbs run, and on macOS what MPS serves (SDXL-width UNet, VAE, attention vs
+# CPU fp32). Manual only: macOS bills 10x and Windows 2x.
+#   gh workflow run platforms.yaml -R cozy-creator/cozy-runtime --ref <branch> [-f os='["macos-15"]'] [-f runtime=0.25.1]
+on:
+  workflow_dispatch:
+    inputs:
+      os:
+        description: JSON list of runner labels
+        type: string
+        default: '["ubuntu-24.04", "ubuntu-24.04-arm", "macos-15", "windows-2025"]'
+      runtime:
+        description: Published cozy-runtime version
+        type: string
+        default: 0.25.1
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    # Hang bound, not a work budget.
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(inputs.os) }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/platforms
+
+      - uses: astral-sh/setup-uv@v7
+
+      # TensorFS builds from its sdist off linux-x86_64.
+      - uses: dtolnay/rust-toolchain@1.91.1
+
+      - name: Venv
+        run: |
+          uv venv --python 3.12 .venv
+          py=$(ls .venv/bin/python .venv/Scripts/python.exe 2>/dev/null | head -1)
+          echo "PY=$PWD/$py" >> "$GITHUB_ENV"
+          case "$RUNNER_OS" in macOS) echo "TORCH_BACKEND=" ;; *) echo "TORCH_BACKEND=--torch-backend=cpu" ;; esac >> "$GITHUB_ENV"
+
+      - name: Install cozy-runtime ${{ inputs.runtime }}
+        id: install
+        continue-on-error: true
+        run: uv pip install --python "$PY" "cozy-runtime==${{ inputs.runtime }}" 2>&1 | tee install.txt; exit "${PIPESTATUS[0]}"
+
+      # Without TensorFS the rest of the probe still says what imports.
+      - name: Install without TensorFS
+        if: steps.install.outcome != 'success'
+        run: uv pip install --python "$PY" --no-deps "cozy-runtime==${{ inputs.runtime }}" && uv pip install --python "$PY" cryptography msgspec numpy packaging pillow
+
+      - name: Torch and the Diffusers group
+        run: |
+          uv pip install --python "$PY" $TORCH_BACKEND 'torch>=2.13' torchvision \
+            'diffusers>=0.40.0' 'transformers>=5.16.1' 'peft>=0.20,<0.21' safetensors tokenizers av 2>&1 | tail -20
+
+      - name: Probe
+        id: probe
+        continue-on-error: true
+        run: |
+          cd "$RUNNER_TEMP"
+          "$PY" -u "$GITHUB_WORKSPACE/.github/platforms/probe.py" 2>&1 | tee "$GITHUB_WORKSPACE/probe.txt"; exit "${PIPESTATUS[0]}"
+
+      - name: Accelerator wheels
+        run: |
+          {
+            for idx in cu130 cu128; do
+              echo "== torch from $idx"
+              echo 'torch>=2.13' | uv pip compile - --python-version 3.12 --index-url "https://download.pytorch.org/whl/$idx" --no-header 2>&1 | grep -iE '^torch|error|no solution|not available|hint' | head -5
+            done
+            echo "== triton (PyPI)"
+            echo 'triton' | uv pip compile - --python-version 3.12 --no-header 2>&1 | grep -iE '^triton|error|no solution|hint' | head -5
+            if [ "$RUNNER_OS" = Windows ]; then
+              echo "== triton-windows"
+              uv pip install --python "$PY" triton-windows 2>&1 | tail -3
+              "$PY" -c 'import triton; print("triton-windows imports", triton.__version__)' 2>&1 | tail -3
+            fi
+          } 2>&1 | tee wheels.txt
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## ${{ matrix.os }}"
+            echo "install=${{ steps.install.outcome }} probe=${{ steps.probe.outcome }}"
+            echo '```'
+            grep -iE 'error|failed|could not' install.txt | head -20 || true
+            cat probe.txt wheels.txt 2>/dev/null | head -250
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: runtime-${{ matrix.os }}
+          path: |
+            install.txt
+            probe.txt
+            wheels.txt
+          if-no-files-found: ignore
+          retention-days: 30
