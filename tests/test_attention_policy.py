@@ -494,11 +494,14 @@ def test_a_preference_records_skips_through_real_cpu_selection() -> None:
 
 
 @pytest.mark.parametrize(
-    ("offered", "dense"),
-    [(("sageattention", "flash-attn3"), "sageattention"), (("flash-attn3",), "flash-attn3")],
+    ("offered", "dense", "identity"),
+    [
+        (("sageattention", "flash-attn3"), "sageattention", "sageattention; exact=flash-attn3"),
+        (("flash-attn3",), "flash-attn3", "flash-attn3"),
+    ],
 )
 def test_sol_recomputes_dense_rows_with_the_next_preference(
-    offered: tuple[str, ...], dense: str
+    offered: tuple[str, ...], dense: str, identity: str
 ) -> None:
     """Sol's dense steps, prefix and paths run on the kernel after it in the model's
     preference, not the ranked floor (run 1565: SDPA at 35 s/step where Sage takes ~24 s). An
@@ -516,7 +519,7 @@ def test_sol_recomputes_dense_rows_with_the_next_preference(
         skipped=skipped,
     )
     assert applied.hosts["ref2va_dit"] == {"sol-attn": 1}
-    assert attention_sol.dense_identity() == dense
+    assert attention_sol.dense_identity() == identity
     assert ("sageattention" in skipped) == (dense != "sageattention")
 
 
