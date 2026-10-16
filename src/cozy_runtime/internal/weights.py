@@ -3139,6 +3139,7 @@ class WeightResidency:
         self._quiet = weights.torch.utils._python_dispatch._disable_current_modes
         #: block modules run while `recording`, by component
         self.read: dict[str, set[Module]] | None = None
+        self.attempts = 0
         #: an on-demand model's: asks for its weights as a stage begins (`Fetches.want`)
         self.wanted: Callable[[], None] | None = None
         self._modes = weights.torch._C._len_torch_dispatch_stack
@@ -3183,6 +3184,7 @@ class WeightResidency:
         self.entries.clear()
         self.last_shortfall = None
         self.derived_at_open = self._derived()
+        self.attempts += 1
 
     def serve_lora(self, strategy: lora_bake.Strategy) -> None:
         """A request's LoRA serving (`lora_mode`): baked, or per step."""
