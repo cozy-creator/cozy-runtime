@@ -197,7 +197,7 @@ def _object(code: str, tokens: int) -> dict[str, str]:
     env = {"CUTE_DSL_ARCH": "sm_90a", "CUDA_VISIBLE_DEVICES": ""}
     result = subprocess.run(
         [sys.executable, "-c", textwrap.dedent(code), str(tokens)],
-        env={**os.environ, **env},
+        env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path), **env},
         capture_output=True,
         text=True,
         check=True,
@@ -364,7 +364,7 @@ def test_a_torch_nvrtc_kernel_compiles_once_per_installation(tmp_path: Path) -> 
     def run() -> Any:
         done = subprocess.run(
             [sys.executable, "-c", code],
-            env={**os.environ, **env},
+            env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path), **env},
             capture_output=True,
             text=True,
         )
