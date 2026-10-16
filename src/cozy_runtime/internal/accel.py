@@ -695,7 +695,7 @@ def _available() -> int:
     host = _libc.mach_host_self()
     if _libc.host_statistics64(host, _HOST_VM_INFO64, ctypes.byref(stats), ctypes.byref(count)):
         raise OSError("host_statistics64 refused")
-    pages = stats.free + stats.speculative + stats.purgeable + stats.inactive
+    pages = int(stats.free) + int(stats.speculative) + int(stats.purgeable) + int(stats.inactive)
     return pages * os.sysconf("SC_PAGE_SIZE")
 
 
