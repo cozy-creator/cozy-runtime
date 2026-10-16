@@ -49,6 +49,7 @@ from cozy_runtime.lm import _kernels
 
 try:
     import torch
+    from torch.overrides import TorchFunctionMode
     from torch.utils._python_dispatch import _disable_current_modes
     from transformers import LogitsProcessorList
     from transformers.cache_utils import (
@@ -59,7 +60,7 @@ try:
     )
 except ImportError as _absent:  # pragma: no cover - the base package has neither
     ABSENT = f"torch and transformers do not import ({_absent})"
-    StaticLayer = LinearAttentionLayer = Cache = object
+    StaticLayer = LinearAttentionLayer = Cache = TorchFunctionMode = object
 else:
     ABSENT = ""
 
@@ -252,7 +253,8 @@ class Draft(torch.nn.Module if not ABSENT else object):  # type: ignore[misc]
     """The multi-token-prediction head of a Qwen3.5 or Qwen3-Next checkpoint, its weights where
     the checkpoint keeps them (`mtp.*`): the `draft` `generate` takes. From a token's embedding
     and the hidden state the model's head read before it: the state the head reads for the token
-    after, and the next draft's hidden state. `space` is the model's modeling module."""
+    after, which the next draft takes as its hidden state (as vLLM's and SGLang's do). `space` is
+    the model's modeling module."""
 
     def __init__(self, config: Any, space: Any) -> None:
         super().__init__()
@@ -288,7 +290,7 @@ class Draft(torch.nn.Module if not ABSENT else object):  # type: ignore[misc]
             position_ids=text,
             past_key_values=cache,
         )
-        return mtp.norm(x), x
+        return mtp.norm(x)
 
 
 def install(plan: Plan, model: Any) -> str:
@@ -316,6 +318,8 @@ def install(plan: Plan, model: Any) -> str:
             current = getattr(space, name)
             if not getattr(current, "_cozy_slot", False):
                 setattr(space, name, _SLOTS[name](current, launch))
+        _STEPS[0] = launch
+        _SESSIONS.clear()  # their graphs recorded Transformers' path: the next call records anew
 
     try:
         if plan.when_ready is None:
@@ -413,8 +417,10 @@ def _recurrent_slot(original: Any, launch: Launch) -> Any:
                 (batch, 1, heads, _kernels.VALUE_DIM), dtype=bf16, device=query.device
             )
             _LAUNCHED[0] += 1
+            # The verify pass's kernel for one token, the state written over itself: a token
+            # then takes the same instructions in both, so a drafted one keeps decode's bits.
             launch(
-                _kernels.recurrent_step_kernel,
+                _kernels.recurrent_steps_kernel,
                 (batch * heads, _kernels.VALUE_DIM // _kernels.VALUE_BLOCK, 1),
                 query,
                 key,
@@ -422,14 +428,13 @@ def _recurrent_slot(original: Any, launch: Launch) -> Any:
                 g,
                 beta,
                 initial_state,
+                initial_state,
                 out,
                 heads,
-                query.stride(0),
-                query.stride(2),
-                key.stride(0),
-                key.stride(2),
-                value.stride(0),
-                value.stride(2),
+                1,
+                *query.stride()[:3],
+                *key.stride()[:3],
+                *value.stride()[:3],
                 float(width) ** 0.5,
                 _kernels.KEY_DIM,
                 _kernels.VALUE_DIM,
@@ -455,6 +460,9 @@ def _recurrent_slot(original: Any, launch: Launch) -> Any:
 _SLOTS = {"causal_conv1d_update": _conv_slot, "torch_recurrent_gated_delta_rule": _recurrent_slot}
 #: Launches the slots made in this process (Python runs once per capture, not per replay).
 _LAUNCHED = [0]
+#: The kernels' launcher once they serve: a verify pass's tokens then take one launch per layer.
+_STEPS: list[Launch | None] = [None]
+_PROFILED: set[Any] = set()
 
 
 def _unsupported(model: Any) -> str:
@@ -623,15 +631,32 @@ class _State(LinearAttentionLayer):  # type: ignore[misc]
 
 @contextmanager
 def _taking(model: Any) -> Iterator[list[Any]]:
-    """The hidden states `model`'s output head reads in the body, one per call."""
+    """The decoder's final states in the body, one per call: what the output head reads, at
+    every position of the call."""
     taken: list[Any] = []
-    handle = model.get_output_embeddings().register_forward_pre_hook(
-        lambda _module, args: taken.append(args[0])
+    handle = model.get_decoder().register_forward_hook(
+        lambda _module, _args, out: taken.append(out[0])
     )
     try:
         yield taken
     finally:
         handle.remove()
+
+
+class _RowByRow(TorchFunctionMode):  # type: ignore[misc]
+    """A verify pass's plain linears one row at a time, as decoding runs them: cuBLAS takes
+    another kernel for a few rows, whose sums differ in the last bit (Qwen3.5's `in_proj_a` and
+    `in_proj_b`), and a drafted token must keep decode's bits. It is faster for those, too."""
+
+    def __torch_function__(
+        self, func: Any, types: Any, args: tuple[Any, ...] = (), kwargs: Any = None
+    ) -> Any:
+        kwargs = kwargs or {}
+        x = args[0] if args else None
+        if func is torch.nn.functional.linear and x is not None and x.dim() > 1 and 1 < x.shape[-2] <= 16:
+            rows = [func(x[..., i : i + 1, :], *args[1:], **kwargs) for i in range(x.shape[-2])]
+            return torch.cat(rows, dim=-2)
+        return func(*args, **kwargs)
 
 
 class _Verify:
@@ -673,15 +698,46 @@ def _stepped_conv(space: Any, original: Any) -> Any:
         if _VERIFY.get() is None:
             return original(x, weight, bias, *args, **kwargs)
         activation = kwargs.get("activation", args[0] if args else None)
+        batch, channels, length = x.shape
         size = weight.shape[-1]
-        state = x[..., :size].clone()
-        outs = [
-            space.causal_conv1d_update(
-                x[..., t : t + 1].contiguous(), state, weight, bias, activation
+        # Channels innermost, as a decoded token's are, so the caller's views of the new tokens
+        # reach the recurrent kernels; it keeps only those.
+        out = x.new_empty(batch, length, channels).transpose(1, 2)
+        launch = _STEPS[0]
+        if (
+            launch is not None
+            and size == _kernels.CONV
+            and bias is None
+            and activation in ("silu", "swish")
+            and x.is_cuda
+            and x.dtype == weight.dtype == torch.bfloat16
+            and x.stride(-1) == 1
+            and tuple(weight.shape) == (channels, size)
+            and weight.is_contiguous()
+        ):
+            _LAUNCHED[0] += 1
+            launch(
+                _kernels.conv_steps_kernel,
+                (batch, -(-channels // _kernels.CONV_BLOCK), 1),
+                x,
+                weight,
+                out[..., size:],
+                channels,
+                length - size,
+                x.stride(0),
+                x.stride(1),
+                out.stride(0),
+                out.stride(2),
+                _kernels.CONV,
+                _kernels.CONV_BLOCK,
             )
-            for t in range(size, x.shape[-1])
-        ]
-        return torch.cat([x[..., :size], *outs], dim=-1)  # the caller keeps the new tokens'
+            return out
+        state = x[..., :size].clone()
+        for t in range(size, length):
+            out[..., t] = space.causal_conv1d_update(
+                x[..., t : t + 1].contiguous(), state, weight, bias, activation
+            )[..., 0]
+        return out
 
     conv._cozy_verify = True  # type: ignore[attr-defined]
     return conv
@@ -712,8 +768,52 @@ def _stepped_recurrence(space: Any, original: Any) -> Any:
                 use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
                 **kwargs,
             )
-        state, outs, states = initial_state.clone(), [], []
-        for t in range(query.shape[1]):
+        batch, tokens, heads, width = query.shape
+        states = initial_state.new_empty((tokens, *initial_state.shape))
+        launch = _STEPS[0]
+        if (
+            launch is not None
+            and use_qk_l2norm_in_kernel
+            and query.is_cuda
+            and width == _kernels.KEY_DIM
+            and tuple(key.shape) == tuple(query.shape)
+            and tuple(value.shape) == (batch, tokens, heads, _kernels.VALUE_DIM)
+            and query.dtype == key.dtype == value.dtype == beta.dtype == torch.bfloat16
+            and g.dtype == initial_state.dtype == torch.float32
+            and tuple(initial_state.shape) == (batch, heads, width, _kernels.VALUE_DIM)
+            and tuple(g.shape) == tuple(beta.shape) == (batch, tokens, heads)
+            and initial_state.is_contiguous()
+            and g.is_contiguous()
+            and beta.is_contiguous()
+            and query.stride(-1) == key.stride(-1) == value.stride(-1) == 1
+        ):
+            out = value.new_empty((batch, tokens, heads, _kernels.VALUE_DIM))
+            _LAUNCHED[0] += 1
+            launch(
+                _kernels.recurrent_steps_kernel,
+                (batch * heads, _kernels.VALUE_DIM // _kernels.VALUE_BLOCK, 1),
+                query,
+                key,
+                value,
+                g,
+                beta,
+                initial_state,
+                states,
+                out,
+                heads,
+                tokens,
+                *query.stride()[:3],
+                *key.stride()[:3],
+                *value.stride()[:3],
+                float(width) ** 0.5,
+                _kernels.KEY_DIM,
+                _kernels.VALUE_DIM,
+                _kernels.VALUE_BLOCK,
+            )
+            verify.recurrent.append((initial_state, states))
+            return out, states[-1]
+        state, outs = initial_state.clone(), []
+        for t in range(tokens):
             out, state = space.torch_recurrent_gated_delta_rule(
                 query[:, t : t + 1],
                 key[:, t : t + 1],
@@ -725,8 +825,8 @@ def _stepped_recurrence(space: Any, original: Any) -> Any:
                 use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             )
             outs.append(out)
-            states.append(state.clone())
-        verify.recurrent.append((initial_state, torch.stack(states)))
+            states[t].copy_(state)
+        verify.recurrent.append((initial_state, states))
         return torch.cat(outs, dim=1), state
 
     recurrence._cozy_verify = True  # type: ignore[attr-defined]
@@ -848,14 +948,32 @@ class _Decode:
         with _disable_current_modes():
             self._settle(fresh, logits, mask, position)
             if self.draft is not None:
-                last = taken[-1][:, -1:]
-                if self.hidden is None or self.hidden.shape != last.shape:
-                    self.hidden, self.graphs = torch.empty_like(last), {}
-                self.hidden.copy_(last)
-                self.dmask.fill_(self.closed)
+                self._drafted_prompt(taken[-1], ids, position)
         if ids.is_cuda:
             torch.cuda.current_stream().synchronize()
         self.prefill_s = time.perf_counter() - started
+
+    def _drafted_prompt(self, hidden: Any, ids: Any, position: Any) -> None:
+        """The head's keys for the prompt and the first token, as it attends to them while
+        drafting: slot j from token j and the model's state for the token before it, so drafts
+        read the whole context the head was trained on; and its state for the token after."""
+        tokens = torch.cat([ids[:, 1:], self.ids], dim=1)
+        slots = self.rows[: self.prompt + 1]
+        mask = self.dmask[..., : self.prompt + 1].expand(-1, -1, self.prompt, -1).clone()
+        mask.fill_(self.closed).masked_fill_((slots >= 1) & (slots <= slots[1:, None]), self.open)
+        if position is not None:
+            at = torch.cat([position[..., 1:], self.position], dim=-1)
+        else:
+            at = slots[None, 1:]
+        self.cache.window = self.prompt + 1
+        self.dcache.layers[0].cumulative_length.fill_(1)
+        embed = self.model.get_input_embeddings()
+        last = self.draft(embed(tokens), hidden, at, self.dcache, mask)[:, -1:]
+        if self.hidden is None or self.hidden.shape != last.shape:
+            self.hidden, self.graphs = torch.empty_like(last), {}
+        self.hidden.copy_(last)
+        self.dmask.fill_(self.closed)
+        self.dmask[..., 1 : self.prompt + 1] = self.open
 
     def _settle(self, fresh: Any, logits: Any, mask: Any, position: Any) -> None:
         """The prefill's cache into the session's buffers, in place (its graphs read them by
@@ -890,7 +1008,7 @@ class _Decode:
         """The first step eagerly, through the paging hooks (they record what it reads)."""
         started = time.perf_counter()
         if self.made < self.max_new_tokens and not bool(self.flag):
-            self.cache.window = window(self.prompt + self.made + self.per - 1, self.capacity)
+            self.cache.window = window(self.prompt + self.made + self.per, self.capacity)
             self._measured()
             self.made = int(self.n)
             if self.ids.is_cuda:
@@ -947,15 +1065,17 @@ class _Decode:
         span = depth + 1
         embed, head = model.get_input_embeddings(), model.get_output_embeddings()
         keys, rows = self.rows[:size], self.rows[:span]
-        # Drafts: the head's own keys from where the model's committed tokens end.
-        self.dcache.layers[0].cumulative_length.copy_(self.length[0])
+        # Drafts: the head's state for the token after `ids` is in hand; each later draft is the
+        # head on the one before, its keys after the committed ones.
+        self.dcache.layers[0].cumulative_length.copy_(self.length[0] + 1)
         token, hidden, seen, drafts = self.ids, self.hidden, self.seen, []
         for i in range(depth):
-            open_ = (keys >= self.length) & (keys <= self.length + i)
-            mask = torch.where(open_, self.open, self.dmask[..., :size])
-            at = self.position + i if self.position is not None else (self.length + i)[:, None]
-            normed, hidden = self.draft(embed(token), hidden, at, self.dcache, mask)
-            scores = head(normed)[:, -1].float()
+            if i:
+                open_ = (keys > self.length) & (keys <= self.length + i)
+                mask = torch.where(open_, self.open, self.dmask[..., :size])
+                at = self.position + i if self.position is not None else (self.length + i)[:, None]
+                hidden = self.draft(embed(token), hidden, at, self.dcache, mask)
+            scores = head(hidden)[:, -1].float()
             if seen is not None:
                 scores = scores - self.penalty * seen
             token = scores.argmax(-1, keepdim=True)
@@ -979,7 +1099,7 @@ class _Decode:
         verify = _Verify()
         reset = _VERIFY.set(verify)
         try:
-            with _taking(model) as taken:
+            with _taking(model) as taken, _RowByRow():
                 scores = model(**kwargs).logits[:, -span:].float()
         finally:
             _VERIFY.reset(reset)
@@ -999,21 +1119,31 @@ class _Decode:
         if self.seen is not None:
             self.seen.scatter_reduce_(1, tokens, valid.float()[None].expand_as(tokens), "amax")
         self.ids.copy_(tokens.gather(1, kept[:, None]))
-        self.hidden.copy_(taken[-1][:, -span:].index_select(1, kept))
+        # The head's keys for the committed tokens, each from the model's own state for the
+        # token before it (as vLLM's and SGLang's drafters keep them), and its state for the
+        # token after them: the next step's first draft.
+        self.dcache.layers[0].cumulative_length.copy_(self.length[0] + 1)
+        open_ = (keys > self.length) & (keys <= self.length + 1 + rows[:, None])
+        mask = torch.where(open_, self.open, self.dmask[..., :size])
+        at = (
+            self.position + 1 + rows
+            if self.position is not None
+            else (self.length + 1 + rows)[None]
+        )
+        states = self.draft(embed(tokens), taken[-1][:, -span:], at, self.dcache, mask)
+        self.hidden.copy_(states.index_select(1, kept))
         # Back to the kept tokens' end: keys past it are masked and overwritten later.
         ended = self.length + kept + 1
         for layer in self.cache.layers:
             if isinstance(layer, _Keys):
                 layer.cumulative_length.copy_(ended[0])
         for state, full in verify.conv:
-            state.copy_(full.index_select(-1, rows[: state.shape[-1]] + kept + 1))
+            state.copy_(full.index_select(-1, self.rows[: state.shape[-1]] + kept + 1))
         for state, states in verify.recurrent:
             state.copy_(states.index_select(0, kept)[0])
         every = self.rows[: self.capacity]
         self.mask.masked_fill_((every >= self.length) & (every < ended), self.open)
-        # The head's keys for the committed tokens it read: up to the last draft's input.
-        heads = torch.clamp(kept, max=depth - 1)
-        self.dmask.masked_fill_((every >= self.length) & (every <= self.length + heads), self.open)
+        self.dmask.masked_fill_((every > self.length) & (every <= ended), self.open)
         self.length.copy_(ended)
         self.n.add_(kept + 1)
         if self.position is not None:
@@ -1038,6 +1168,20 @@ class _Decode:
                 torch.cuda.empty_cache()
             self.pool, self.side = torch.cuda.graph_pool_handle(), torch.cuda.Stream()
         recorded = self.graphs
+        kind = (type(self.model).__name__, self.draft is not None)
+        if cuda and kind not in _PROFILED and self.max_new_tokens - self.made > 40:
+            _PROFILED.add(kind)
+            import torch.profiler as tp
+
+            torch.cuda.synchronize()
+            with tp.profile(activities=[tp.ProfilerActivity.CUDA]) as prof:
+                for _ in range(8):
+                    self.cache.window = window(self.prompt + self.made + self.per, self.capacity)
+                    self._advance()
+                    self.made += self.per
+                torch.cuda.synchronize()
+            table = prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=45, max_name_column_width=70)
+            print(f"[lmprof] {kind} 8 steps\n{table}", file=sys.stderr, flush=True)
         queued: deque[Any] = deque()
         # `made` bounds the tokens made so far from above (a drafted step makes 1 to `per`);
         # `counted` is what the host last read, a few steps late.
@@ -1047,7 +1191,7 @@ class _Decode:
             and (self.per > 1 or self.made < self.max_new_tokens)
             and not (self.made == 1 and bool(self.flag))
         ):
-            size = window(self.prompt + self.made + self.per - 1, self.capacity)
+            size = window(self.prompt + self.made + self.per, self.capacity)
             self.cache.window = size
             graph = recorded.get(size)
             if graph is None and graphs and self.need is not None and not self.failed:
