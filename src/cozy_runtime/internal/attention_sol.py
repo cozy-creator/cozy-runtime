@@ -268,11 +268,12 @@ def _validate_result(output: Tensor, query: Tensor) -> None:
 #: through `make_kernel`'s static route layout: 64-token blocks, grouped 64 at a time, the tail
 #: group's block count, and whether the last block is full. Every operand layout is dynamic,
 #: so its object is a function of (blocks, full), never of the exact count. The other routes'
-#: `make_kernel()` takes nothing: one object per card serves every length. SM103 (B300) runs
-#: SM100's kernel, compiled for its own target, through upstream's SM100 dispatch (`_DISPATCH`).
-ROUTES = {(8, 9): "sm89", (9, 0): "sm90", (10, 0): "sm100", (10, 3): "sm100", (12, 0): "sm120"}
-#: The capability upstream's dispatch knows a route by, where the card's own is not it.
-_DISPATCH = {(10, 3): (10, 0)}
+#: `make_kernel()` takes nothing: one object per card serves every length.
+ROUTES = {(8, 9): "sm89", (9, 0): "sm90", (12, 0): "sm120"}
+#: Datacenter Blackwell (B200, B300): Sol's route on FA4's block-sparse forward
+#: (`attention_sol_fa4`). Upstream's SM100 kernel ran its exact blocks at 0.55 PF on a B200,
+#: FA4 at 1.2 PF in BF16 and 1.72 PF in FP8 (h3a-093).
+FA4 = frozenset({(10, 0), (10, 3)})
 _BLOCK = 64
 #: Loaded objects by key digest; one serves every head count, batch and device (h3a-087).
 _KERNELS: dict[str, Loaded] = {}
@@ -295,11 +296,17 @@ def variant(tokens: int, capability: tuple[int, int]) -> dict[str, Any]:
     return {"blocks": -(-tokens // _BLOCK), "full": tokens % _BLOCK == 0}
 
 
-def _capability(device: Device) -> tuple[int, int] | None:
+def _card(device: Device) -> tuple[int, int] | None:
     if device.type != "cuda":
         return None
     found = tuple(import_module("torch").cuda.get_device_capability(device))
-    return (found[0], found[1]) if found in ROUTES else None
+    return (found[0], found[1]) if found in ROUTES or found in FA4 else None
+
+
+def _capability(device: Device) -> tuple[int, int] | None:
+    """A card whose sparse steps run upstream's own CuTe kernel, which compiles here."""
+    found = _card(device)
+    return found if found in ROUTES else None
 
 
 def target(capability: tuple[int, int]) -> str:
@@ -402,41 +409,14 @@ def compile_variant(route: str, blocks: int = 0, full: bool = False) -> bytes:
         tokens = blocks * _BLOCK if full else blocks * _BLOCK - 1
         operator, scalars = upstream.make_kernel(tokens, 1), (0,)  # the sink range, packed
     else:
-        operator = upstream.forward if route == "sm100" else upstream.make_kernel()
-        scalars = (0, 0)  # the sink's first and last block
-    with _architecture_answers():
-        compiled = cute.compile(
-            operator, *arguments, _SCALE, *scalars, stream=cuda.CUstream(0), options=OPTIONS
-        )
+        operator, scalars = upstream.make_kernel(), (0, 0)  # the sink's first and last block
+    compiled = cute.compile(
+        operator, *arguments, _SCALE, *scalars, stream=cuda.CUstream(0), options=OPTIONS
+    )
     with tempfile.TemporaryDirectory(prefix="cozy-kernel-") as scratch:
         path = Path(scratch) / "kernel.o"
         compiled.export_to_c(object_file_path=str(path), function_name=FUNCTION)
         return path.read_bytes()
-
-
-@contextmanager
-def _architecture_answers() -> Iterator[None]:
-    """CuTe-DSL asks the driver one device fact while tracing: a launch with
-    `min_blocks_per_mp > 1` (SM100's) sizes its shared-memory carveout from the card's shared
-    memory per SM. A GPU-less build has no driver to ask (`CUDA_ERROR_NOT_INITIALIZED`), and the
-    target fixes the answer: the DSL's own per-block capacity plus the 1 KiB a block reserves."""
-    helpers = import_module("cutlass.base_dsl.runtime.cuda")
-    dsl = import_module("cutlass.cutlass_dsl")
-    asked = helpers.get_device_attribute
-    attributes = helpers.cuda.CUdevice_attribute
-    per_sm = attributes.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR
-
-    def answer(attribute: Any, device_id: int = 0) -> Any:
-        if attribute != per_sm:
-            return asked(attribute, device_id)
-        arch = dsl.CuTeDSL._get_dsl().get_arch_enum()
-        return dsl.SMEM_CAPACITY_MAP[f"sm_{arch.major}{arch.minor}"] + 1024
-
-    helpers.get_device_attribute = answer
-    try:
-        yield
-    finally:
-        helpers.get_device_attribute = asked
 
 
 def build(spec: dict[str, Any], staging: Path, report: Callable[..., None]) -> dict[str, object]:
@@ -614,7 +594,7 @@ def _native(
     every KV block. This does not perform the wrapper's protected-query recomputation."""
     _pin_preprocess()
     batch, tokens, heads, _ = query.shape
-    arch = _dispatch(query.device)
+    arch = _arch(query.device)
     interface = import_module("sol_attn.interface")
     interface._compiled[(query.device.index, arch, batch, tokens, heads, 1)] = loaded
     return interface._sol_attn_cute(
@@ -702,8 +682,10 @@ def _attention(
         raise ValueError("Sol requires BF16 inference inputs on one device")
     if validate_device is not None:
         validate_device(query.device)
-    elif _capability(query.device) is None:
-        raise ValueError(f"Sol serves upstream's CuTe routes only: {sorted(ROUTES.values())}")
+    elif _card(query.device) is None:
+        raise ValueError(
+            f"Sol serves upstream's CuTe routes {sorted(ROUTES.values())} and FA4 on SM100/SM103"
+        )
     if scale is not None and not math.isfinite(scale):
         raise ValueError("attention scale must be finite")
     return _execute(
@@ -719,16 +701,18 @@ def _attention(
     )
 
 
-def _dispatch(device: Device | int) -> tuple[int, int]:
+def _arch(device: Device | int) -> tuple[int, int]:
     found = tuple(import_module("torch").cuda.get_device_capability(device))
-    capability = (found[0], found[1])
-    return _DISPATCH.get(capability, capability)
+    return (found[0], found[1])
 
 
 def backend(device: Device | int) -> str:
-    """The route upstream selects for this card's route: `cute_<sm>`, or its silent Triton
-    fallback."""
-    return str(import_module("sol_attn.interface")._backend_for_arch(_dispatch(device)))
+    """The route this card's sparse steps take: FA4's block-sparse forward on SM100/SM103, else
+    upstream's `cute_<sm>`, or its silent Triton fallback."""
+    arch = _arch(device)
+    if arch in FA4:
+        return "fa4_block_sparse"
+    return str(import_module("sol_attn.interface")._backend_for_arch(arch))
 
 
 SOL = Local(sol_attention, lambda query, *_: backend(query.device))
@@ -763,17 +747,35 @@ def _execute(
     if layout.live_tokens > query.shape[1]:
         raise ValueError("attention layout exceeds Q/K/V sequence length")
     q, k, v = (t[:, : layout.live_tokens] for t in (query, key, value))
+    fa4 = sparse is None and _card(query.device) in FA4
     loaded = None
-    if not dense_path and sparse is None:
+    if not dense_path and sparse is None and not fa4:
         # The dense steps run on the GPU while this length's variant compiles on the CPU.
         specialize(layout.live_tokens, query.device, layout.step)
         if layout.step >= layout.dense_until_step:
             loaded = _ready(layout.live_tokens, query.device, layout.step)
-    if dense_path or layout.step < layout.dense_until_step or (sparse is None and loaded is None):
+    if (
+        dense_path
+        or layout.step < layout.dense_until_step
+        or (sparse is None and not fa4 and loaded is None)
+    ):
         # A dense step, a dense path, or a sparse step whose variant failed to compile: the
         # dense reference serves it.
         live_output = dense(query=q, key=k, value=v, scale=scale)
         _count("dense_path" if dense_path else "dense_step")
+    elif fa4:
+        # The exact tiles take the dense rows' precision; the model's exact paths stay BF16.
+        # The protected prefix's query tiles attend every key inside the same call.
+        live_output = import_module("cozy_runtime.internal.attention_sol_fa4").sparse(
+            q.contiguous(),
+            k.contiguous(),
+            v.contiguous(),
+            scale,
+            layout.protected_prefix,
+            fp8=_EXACT is not None and dense is _dense,
+        )
+        _validate_result(live_output, q)
+        _count("sparse")
     else:
         if sparse is not None:
             live_output = sparse(q, k, v, scale, layout.protected_prefix)
