@@ -46,7 +46,7 @@ cudaError_t rotate_quantize(const void* x, bool x_half, int8_t* q, float* scales
                             const Prologue& prologue, cudaStream_t stream);
 
 // Each row of `x` [M, K] (after `prologue`) per-row E4M3, the fp8 leaf's law: `scales` [M] =
-// max(amax / 448, 1e-12), `q` [M, K] = x / scale rounded to nearest even, saturated.
+// max(amax * (1 / 448), 1e-12), `q` [M, K] = x / scale rounded to nearest even, saturated.
 // K % 16 == 0, K <= kMaxK.
 cudaError_t fp8_quantize(const void* x, bool x_half, void* q, float* scales, int M, int K,
                          const Prologue& prologue, cudaStream_t stream);

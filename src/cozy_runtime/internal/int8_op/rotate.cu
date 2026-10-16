@@ -271,7 +271,8 @@ __global__ void __launch_bounds__(1024) quantize_kernel(
     if (lane == 0) partial[threadIdx.y * tiles + tile] = amax;
     __syncthreads();
     amax = warp_max(lane < tiles ? partial[threadIdx.y * tiles + lane] : 0.f);
-    const float scale = kFp8 ? fmaxf(__fdiv_rn(amax, 448.f), 1e-12f) : row_scale(amax);
+    // fp8: eager's `amax / 448` as torch runs it on CUDA, a multiply by the f32 reciprocal.
+    const float scale = kFp8 ? fmaxf(amax * (1.f / 448.f), 1e-12f) : row_scale(amax);
     if (!live) return;
     if (threadIdx.x == 0) scales[row] = scale;
     if constexpr (kFp8)
