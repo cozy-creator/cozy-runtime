@@ -15,7 +15,8 @@ every compiler on the machine stopped burning CPU and writing output, against it
 observed pace. Each of its compiler jobs is admitted by the machine's compile ledger
 (`compiler_job`), within the CPUs and the memory each job is measured to take.
 A failure is recorded in the machine run's scratch scope (`TMPDIR`), which the next run starts
-without.
+without, and under this Runtime's build: another Runtime, which may have fixed the builder, tries
+the key again.
 """
 
 from __future__ import annotations
@@ -40,6 +41,8 @@ from importlib import import_module
 from pathlib import Path
 from typing import Any
 
+from cozy_runtime import __version__
+from cozy_runtime._build_provenance import COMMIT
 from cozy_runtime._cpus import cpus
 from cozy_runtime.internal import config, kernel_cache, liveness, proctree
 
@@ -331,9 +334,13 @@ def _failures() -> Path:
     return Path(tempfile.gettempdir()) / "cozy-kernel-failures"
 
 
+def _failed_path(key: kernel_cache.Key, scope: Path | None = None) -> Path:
+    return (scope or _failures()) / f"{key.kernel}-{key.digest}-{__version__}+{COMMIT}.json"
+
+
 def _failure(key: kernel_cache.Key, scope: Path | None = None) -> dict[str, Any] | None:
     try:
-        found = json.loads(((scope or _failures()) / f"{key.kernel}-{key.digest}.json").read_text())
+        found = json.loads(_failed_path(key, scope).read_text())
     except (OSError, ValueError):
         return None
     return found if isinstance(found, dict) else None
@@ -342,9 +349,8 @@ def _failure(key: kernel_cache.Key, scope: Path | None = None) -> dict[str, Any]
 def _record_failure(
     key: kernel_cache.Key, code: str, detail: str, scope: Path | None = None
 ) -> None:
-    directory = scope or _failures()
-    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-    path = directory / f"{key.kernel}-{key.digest}.json"
+    path = _failed_path(key, scope)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     scratch = path.with_suffix(f".{os.getpid()}")
     kept = detail if len(detail) <= 4000 else detail[:2000] + "\n...\n" + detail[-2000:]
     scratch.write_text(json.dumps({"code": code, "detail": kept}))
