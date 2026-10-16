@@ -1759,7 +1759,7 @@ class Read:
         viewed = any(
             a <= int(tensor.data_ptr()) < b
             for tensor in spill.stored((out,))
-            if tensor.is_cuda and tensor.numel()
+            if (tensor.is_cuda or tensor.is_mps) and tensor.numel()
             for a, b in self.spans
         )
         return cast("Tensor", out).clone() if viewed else out
@@ -2065,7 +2065,7 @@ def _tensor_operands(operands: Sequence[object]) -> Iterator[Tensor]:
 def _pointers(operands: Sequence[object]) -> Iterator[int]:
     """Device addresses of an op's tensor operands (one level deep)."""
     for tensor in spill.stored(operands):
-        if tensor.is_cuda:
+        if tensor.is_cuda or tensor.is_mps:
             yield int(tensor.data_ptr())
 
 
