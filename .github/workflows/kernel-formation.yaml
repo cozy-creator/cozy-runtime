@@ -1,0 +1,90 @@
+name: kernel-formation
+# Every native kernel Runtime builds on a machine compiles for every card it serves, with the CUDA
+# worker image's own toolchain and no GPU (checks/kernel_formation.py). publish.yaml requires it;
+# PRs that touch kernel sources run it. By hand, for any ref:
+#   gh workflow run kernel-formation.yaml -R cozy-creator/cozy-runtime -f ref=<tag|sha>
+# Each card's formed keys are cached: a kernel whose build inputs are unchanged is recalled.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or SHA whose kernels form
+        type: string
+        default: master
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        required: true
+  pull_request:
+    paths:
+      - src/cozy_runtime/internal/int8_op/**
+      - src/cozy_runtime/internal/kernel_*.py
+      - src/cozy_runtime/internal/machine_kernels.py
+      - src/cozy_runtime/internal/triton_kernels.py
+      - src/cozy_runtime/internal/nvfp4_linear.py
+      - src/cozy_runtime/internal/attention*.py
+      - src/cozy_runtime/author/kernels.py
+      - src/cozy_runtime/fusion/**
+      - src/cozy_runtime/lm/**
+      - checks/kernel_formation.py
+      - checks/formation/**
+      - .github/workflows/kernel-formation.yaml
+run-name: kernel-formation ${{ inputs.ref || github.head_ref }}
+
+permissions:
+  contents: read
+
+jobs:
+  form:
+    # Every card in one process: one image pull, one cache, and the compile manager admits
+    # compiler jobs within these 16 CPUs and 64 GB (2-core runners swap on CUTLASS units).
+    runs-on: linux-x64-16core
+    # Hang bound, not a work budget: an empty cache compiles every kernel of every card.
+    timeout-minutes: 240
+    env:
+      # What a pod compiles with: its toolchain, torch and pinned kernel sources.
+      IMAGE: docker.io/tensorhub/worker:torch2.14.0-cu130-linux-x86
+      # NVIDIA's libcuda link stub (cuda-driver-dev), where a pod's container toolkit puts the
+      # driver's: Triton's launcher, SageAttention's SM90 and SageAttention3 link it.
+      STUB: https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-driver-dev-13-0_13.0.96-1_amd64.deb
+      STUB_SHA256: a9726490d4797965b56a2e1dedb2c4cffd3f3463e11435fa4c500b3d147af08a
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: tools
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          path: source
+      - name: libcuda's stub
+        run: |
+          curl -fsSL "$STUB" -o stub.deb
+          echo "$STUB_SHA256  stub.deb" | sha256sum --check --strict
+          dpkg-deb -x stub.deb stub
+          mkdir libcuda
+          cp stub/usr/local/cuda-13.0/targets/x86_64-linux/lib/stubs/libcuda.so libcuda/
+          ln -s libcuda.so libcuda/libcuda.so.1
+      - uses: actions/cache/restore@v4
+        with:
+          path: ledger
+          key: kernel-formation-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: kernel-formation-
+      - name: Form every kernel for every card
+        run: |
+          set +e
+          docker run --rm -v "$PWD:/w" -e TRITON_LIBCUDA_PATH=/w/libcuda -e LIBRARY_PATH=/w/libcuda \
+            -e LD_LIBRARY_PATH=/w/libcuda \
+            --entrypoint bash "$IMAGE" -euo pipefail -c '
+              uv pip install --quiet --python /opt/cozy/python/bin/python /w/source
+              /opt/cozy/python/bin/python /w/tools/checks/kernel_formation.py --ledger /w/ledger/formed.jsonl
+            ' | tee formation.log
+          status=${PIPESTATUS[0]}
+          grep -E '^(FAILED|[0-9]+ formed)' formation.log >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: ledger
+          key: kernel-formation-${{ github.run_id }}-${{ github.run_attempt }}
