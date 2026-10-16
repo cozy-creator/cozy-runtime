@@ -348,15 +348,18 @@ def _build(
             .get("project", {})
             .get("dependencies", [])
         )
-        floating = any(canonicalize_name(row["name"]) == RUNTIME for row in lock.get("package", ()))
+        locked = {canonicalize_name(row["name"]) for row in lock.get("package", ())}
+        floating = RUNTIME in locked
         sync = ("sync", "--frozen", "--no-dev", "--no-python-downloads", "--project", str(source))
-        run(
-            *sync,
-            "--python",
-            str(python),
-            *("--no-install-package", RUNTIME) * floating,
-            cwd=source,
-        )
+        # The machine's own SDK replaces the lock's (`_select_sdk`): TensorFS too, which may
+        # have no wheel for this platform on the index (aarch64).
+        skipped = [
+            arg
+            for name in SDK
+            if floating and name in locked
+            for arg in ("--no-install-package", name)
+        ]
+        run(*sync, "--python", str(python), *skipped, cwd=source)
 
         def as_locked() -> None:
             run(*sync, "--python", str(python), "--inexact", cwd=source)
