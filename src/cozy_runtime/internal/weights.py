@@ -260,6 +260,15 @@ class Component:
     schedule: list[int] = field(default_factory=list)
     #: the common region's lease for the running stage
     lease: Lease | None = None
+    #: the stage's leases on its resident blocks, taken once where the plan binds them: a
+    #: block that finds its own here runs with it (no acquire per call); any unmapping lets
+    #: them go first (`let_go`)
+    holds: dict[int, Lease] = field(default_factory=dict)
+    hold_stream: int = 0
+    #: what its root module's own call changes outside itself (`WeightResidency._root`), and
+    #: whether one ran out of device memory outside its blocks
+    effects: Effects | None = None
+    tight: bool = False
     #: gave its weights back to another component's activations for the rest of the stage:
     #: none of its regions is leased or planned; its common maps again when it next runs
     spared: bool = False
@@ -417,7 +426,7 @@ class Weights:
         return self.clock
 
     def stream(self) -> int:
-        return int(self.torch.cuda.current_stream(self.device).cuda_stream)
+        return int(self.torch._C._cuda_getCurrentRawStream(self.index))
 
     # -- budgets
 
@@ -610,6 +619,8 @@ class Weights:
             return 0
         if nbytes < self.applied:
             self.quiesce()
+            for component in self.components.values():
+                let_go(component)
         trim = self.plane.set_vram_budget(self.index, nbytes)
         self.applied = nbytes
         self._evicted(trim.get("evicted", ()))
@@ -1519,7 +1530,7 @@ def bind(
     baked = bool(region.bakes) and _bake(
         torch, region, views.parts, lease.ring_offset is None, refill
     )
-    if region.transforms and (moved or lease.ring_offset is not None):
+    if (moved or lease.ring_offset is not None) and region.transforms:
         region.derived = _transform(torch, region, views.parts)
     region.bound = address
     return baked
@@ -1691,6 +1702,10 @@ def _recovery_type(torch: ModuleType) -> type:
             super().__init__()
             self.weights = weights
             self.journal = journal
+
+        @classmethod
+        def _should_skip_dynamo(cls) -> bool:
+            return False  # nothing compiles here: no Dynamo wrapper around every op
 
         def __torch_dispatch__(
             self, func: Any, types: Any, args: tuple[Any, ...] = (), kwargs: Any = None
@@ -1957,9 +1972,18 @@ def _drop_copies(region: Region) -> None:
         unbind(region)
 
 
+def let_go(component: Component) -> None:
+    """Release the stage's leases on the component's resident blocks; they stay bound, and
+    each block leases its own again until the next plan holds them."""
+    holds, component.holds = component.holds, {}
+    for lease in holds.values():
+        lease.release()
+
+
 def close_cursor(component: Component) -> None:
-    """Close the stage's cursor after dropping every view into its ring (one keeps the cursor
-    open)."""
+    """Let the stage's holds go (`let_go`) and close its cursor after dropping every view into
+    its ring (one keeps the cursor open)."""
+    let_go(component)
     cursor = component.cursor
     if cursor is None:
         return
@@ -3054,6 +3078,8 @@ class WeightResidency:
         self.refine = refine
         #: component -> (module, had its own `forward`, that forward) per hooked region
         self.hooks: dict[str, list[tuple[Module, bool, Callable[..., object]]]] = {}
+        #: component -> the same for its root module's own call (`_root`)
+        self.roots: dict[str, tuple[Module, bool, Callable[..., object]]] = {}
         #: method -> the components it declares (`component_use`)
         self.scopes = dict(scopes or {})
         self.hosted: frozenset[str] = frozenset()
@@ -3085,6 +3111,7 @@ class WeightResidency:
         self._capacity = (*self._shortfall_error, self._budget_error)
         self._poisoned_error = plane.error("Poisoned")
         self._quiet = weights.torch.utils._python_dispatch._disable_current_modes
+        self._modes = weights.torch._C._len_torch_dispatch_stack
         weights.residencies.add(self)
         for component in self.components.values():
             self._hook(component)
@@ -3099,9 +3126,14 @@ class WeightResidency:
             module = region.module
             rows.append((module, "forward" in module.__dict__, module.forward))
             module.forward = self._block(component, region, module.forward)
+        root = component.root
+        if all(region.module is not root for region in component.blocks):
+            self.roots[component.name] = (root, "forward" in root.__dict__, root.forward)
+            root.forward = self._root(component, root.forward)
 
     def _unhook(self, name: str) -> None:
-        for module, had, forward in self.hooks.pop(name, []):
+        root = self.roots.pop(name, None)
+        for module, had, forward in [*self.hooks.pop(name, []), *([root] if root else [])]:
             if had:
                 module.forward = forward
             else:
@@ -3458,14 +3490,11 @@ class WeightResidency:
             item = peak // max(self.batch.pop(method, 1), 1)
             self.per_item[method] = max(self.per_item.get(method, 0), item)
         self.baseline = -1
-        if self.parked is None and not weights.host_only:
-            # The stage's transient activations go back to the driver: kept in torch's cache
-            # they would hold the next stage's weights out (run 5908: a text encoder refused
-            # for 1.2 GB beside a decode's 7.4 GB of idle cache) and every other tenant's.
-            # Host blocks no tensor holds any more are the host's again.
-            accel.release_cached(weights.torch, weights.kind)
-            if weights.kind == "cuda":
-                spill.release(weights.torch)
+        if self.parked is None and weights.kind == "cuda":
+            # Host blocks no tensor holds any more are the host's again. Torch's idle device
+            # cache stays: the next stage's plan trims what its weights need (`trim_cache`,
+            # run 5908), and the machine asks for the rest when another tenant needs it.
+            spill.release(weights.torch)
 
     def map_ahead(self) -> tuple[int, bool]:
         """Map every component's resident set now, as one stage of all of them would place
@@ -3740,6 +3769,8 @@ class WeightResidency:
         if self.spare and need > budget:
             raise ResidencyRefusal("device_spared", f"{method}() declined: needs {need} B")
         clock = weights.tick()
+        for component in components.values():
+            let_go(component)  # every set this plan places may move: held again below
         for key, residence in placed.items():
             # The budget's trim takes other components' idle regions, never the sets this
             # stage is about to want: they rank first already.
@@ -3807,13 +3838,21 @@ class WeightResidency:
             component = components[key]
             # The resident set binds for the whole stage, ordered after its fills on the
             # compute stream: code that reads a resident weight outside its block's forward
-            # sees real bytes, exactly as when the component was simply on the device.
+            # sees real bytes, exactly as when the component was simply on the device. Its
+            # blocks' leases are held for the stage: a block then runs with no acquire.
+            common = component.common.index if component.common is not None else -1
+            component.hold_stream = stream
             for index in component.resident:
                 lease = weights.plane.acquire(component.ws, weights.index, index, stream)
                 try:
                     bind(weights.torch, component.regions[index], lease)
-                finally:
+                except BaseException:
                     lease.release()
+                    raise
+                if index == common:
+                    lease.release()
+                else:
+                    component.holds[index] = lease
             if residence.streamed and component.observed:
                 order = component.order
                 start = order.index(resume[key]) if key in resume else 0
@@ -3897,6 +3936,8 @@ class WeightResidency:
                         for generator, state in kept:
                             generator.set_state(state)
 
+                    if not self._modes():
+                        return rewound(rewind, *args, **kwargs)
                     with self._quiet():
                         return rewound(rewind, *args, **kwargs)
                 # Its first run, a block that writes into tensors it did not make, or one
@@ -3950,8 +3991,10 @@ class WeightResidency:
                 if component.spared:
                     self._unspare(component)
                 stream = weights.stream()
+                holds = component.holds
+                hold = holds.pop(region.index, None) if component.hold_stream == stream else None
                 try:
-                    lease = self._acquire(component, region.index, stream)
+                    lease = hold or self._acquire(component, region.index, stream)
                 except self._capacity:
                     # The plane refused the region for its own plan: grow its budget into
                     # the device's free room, then plan the stage afresh, and only then
@@ -3973,10 +4016,11 @@ class WeightResidency:
                     try:
                         # The plane's bind and bake are its own math, outside the block's
                         # recovery: a bake that fails leaves the region dirty, and it refills.
-                        with self._quiet():
-                            baked = bind(torch, region, lease, refill=True)
-                            if baked and region.index in component.resident:
-                                self._bake_resident(component)
+                        if region.bound != int(lease.ptr) or region.bakes:
+                            with self._quiet():
+                                baked = bind(torch, region, lease, refill=True)
+                                if baked and region.index in component.resident:
+                                    self._bake_resident(component)
                         weights.running.append(component.key)
                         weights.last = component.key
                         try:
@@ -3994,7 +4038,10 @@ class WeightResidency:
                     # read finds the stand-in (`Weights.reading`), never a stale address.
                     if region.index not in component.resident:
                         unbind(region)
-                    lease.release()
+                    if hold is not None and holds is component.holds:
+                        holds[region.index] = hold  # the stage's, until it lets go
+                    else:
+                        lease.release()
                 if stale:
                     self._restore(component, region)
                     continue
@@ -4031,6 +4078,57 @@ class WeightResidency:
 
         return run
 
+    def _root(self, component: Component, forward: Callable[..., Any]) -> Callable[..., Any]:
+        """The component's own call (`unet(...)`) inside the process's recovery recovers as
+        one: once its first call showed it changes nothing outside itself, it runs with no
+        dispatch layer, its ops between blocks paying none; one that then runs out of device
+        memory outside its blocks makes room and runs again from its start, its ops recovering
+        one by one from then on (`tight`). One that writes what it did not make, or reads host
+        memory, keeps per-op recovery. Anywhere else (no recovery, a group GPU) it is as it is."""
+        weights = self.weights
+        torch = weights.torch
+
+        def call(*args: Any, **kwargs: Any) -> Any:
+            mode: Any = torch.utils._python_dispatch._get_current_dispatch_mode()
+            if (
+                type(mode) is not weights._recovery
+                or mode.weights is not weights
+                or weights.grouped
+            ):
+                return forward(*args, **kwargs)
+            effects = component.effects
+            if effects is None:
+                journal = Journal()
+                rewrites = weights.bands.rewrites if weights.bands is not None else 0
+                with weights.recovering(journal):
+                    out = forward(*args, **kwargs)
+                banded = weights.bands is not None and weights.bands.rewrites > rewrites
+                learned = journal.effects(banded)
+                inner = (g for r in component.blocks if r.effects for g in r.effects.generators)
+                component.effects = replace(learned, generators=(*learned.generators, *inner))
+                return out
+            if effects.writes or effects.banded or component.tight or _hosts(args, kwargs):
+                return forward(*args, **kwargs)
+            kept = [(g, g.get_state()) for g in effects.generators]
+            versions, held = _versions(args, kwargs), _containers(args, kwargs)
+            try:
+                with self._quiet():
+                    return forward(*args, **kwargs)
+            except Exception as exc:
+                need = _room_for(exc, False)[0]
+                if _versions(args, kwargs) != versions:
+                    component.effects = None  # it changed its inputs: observed again
+                    raise
+            # outside `except`, so the failed call's frames (and their tensors) are gone
+            for generator, state in kept:
+                generator.set_state(state)
+            _put_back(held)
+            component.tight = True
+            weights.make_room(need, (*args, *kwargs.values()), f"{component.name}()")
+            return forward(*args, **kwargs)
+
+        return call
+
     def _regrained(
         self, component: Component, region: Region, forward: Callable[..., object]
     ) -> Callable[..., object]:
@@ -4050,9 +4148,19 @@ class WeightResidency:
             lease: Lease = component.cursor.acquire(index, stream)
         else:
             priority = None if index in component.resident else plane.STREAMED + weights.tick()
-            lease = weights.plane.acquire(
-                component.ws, weights.index, index, stream, priority=priority
-            )
+            try:
+                lease = weights.plane.acquire(
+                    component.ws, weights.index, index, stream, priority=priority
+                )
+            except self._capacity:
+                held = [c for c in weights.components.values() if c.holds]
+                if not held:
+                    raise
+                for other in held:  # a fill is never refused for the stages' holds
+                    let_go(other)
+                lease = weights.plane.acquire(
+                    component.ws, weights.index, index, stream, priority=priority
+                )
         weights.drain()  # what this fill displaced is unbound at once, in every weight set
         return lease
 
