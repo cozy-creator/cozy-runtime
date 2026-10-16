@@ -55,6 +55,18 @@ _PROTECTED = frozenset(_PROTECTED_IMPORT_ROOTS)
 _PROTECTED_PREFIXES = ("cuda-", "nvidia-")
 
 
+# The Linux CPUs package execution runs on, by `platform.machine()`.
+OS_ARCH = {
+    "x86_64": "linux/amd64",
+    "amd64": "linux/amd64",
+    "aarch64": "linux/arm64",
+    "arm64": "linux/arm64",
+}
+# What each spells as a PEP 508 `platform_machine` and an ELF `e_machine`.
+PLATFORM_MACHINE = {"linux/amd64": "x86_64", "linux/arm64": "aarch64"}
+ELF_MACHINE = {"linux/amd64": 62, "linux/arm64": 183}
+
+
 class ObservationRefusal(Exception):
     pass
 
@@ -100,9 +112,10 @@ def current() -> Observation:
     if sys.implementation.name != "cpython" or match is None:
         raise ObservationRefusal(f"unsupported Python implementation: {cache_tag or 'unknown'}")
     machine = platform.machine().lower()
-    if sys.platform != "linux" or machine not in {"amd64", "x86_64"}:
+    os_arch = OS_ARCH.get(machine)
+    if sys.platform != "linux" or os_arch is None:
         raise ObservationRefusal(
-            f"package execution requires Linux x86-64, got {sys.platform}/{machine}"
+            f"package execution requires Linux x86-64 or arm64, got {sys.platform}/{machine}"
         )
     libc_name, libc_version = platform.libc_ver()
     if libc_name != "glibc" or re.fullmatch(r"[0-9]+\.[0-9]+", libc_version) is None:
@@ -127,7 +140,7 @@ def current() -> Observation:
     return Observation(
         python_abi="cp" + match.group(1),
         python_full_version=platform.python_version(),
-        os_arch="linux/amd64",
+        os_arch=os_arch,
         libc="glibc" + libc_version,
         accelerator_backend=backend,
         accelerator_build=build,
@@ -226,14 +239,14 @@ def from_python(python: Path) -> Observation:
             if (
                 bare.returncode == 0
                 and set(measured["distributions"]) <= {"pip"}
-                and measured["machine"] in {"x86_64", "amd64"}
+                and str(measured["machine"]).lower() in OS_ARCH
                 and measured["libc"][0] == "glibc"
                 and re.fullmatch(r"cpython-[0-9]{3}", measured["tag"])
             ):
                 return Observation(
                     python_abi=measured["tag"].replace("cpython-", "cp"),
                     python_full_version=measured["version"],
-                    os_arch="linux/amd64",
+                    os_arch=OS_ARCH[str(measured["machine"]).lower()],
                     libc="glibc" + measured["libc"][1],
                     accelerator_backend="none",
                     accelerator_build="cpu",

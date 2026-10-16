@@ -340,7 +340,7 @@ def _marker_environment(base: base_observation.Observation) -> dict[str, str]:
             "implementation_name": "cpython",
             "implementation_version": base.python_full_version,
             "os_name": "posix",
-            "platform_machine": "x86_64",
+            "platform_machine": base_observation.PLATFORM_MACHINE[base.os_arch],
             "platform_python_implementation": "CPython",
             "python_full_version": base.python_full_version,
             "python_version": f"{major}.{minor}",

@@ -31,6 +31,7 @@ import functools
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -93,12 +94,14 @@ class Pin:
     package: str = ""
     #: the archive paths recipes read; a worker image carries only these (`fetch`)
     keep: tuple[str, ...] = ()
+    #: a platform wheel's CPU (`platform.machine()`); empty for a source any machine builds
+    machine: str = ""
 
 
 _HEADERS = ("include", "tools/util/include", "LICENSE.txt")
 _GITHUB = "https://github.com/{}/archive/{}.tar.gz"
 _PYPI = "https://files.pythonhosted.org/packages/"
-PINS: tuple[Pin, ...] = (
+_PINS: tuple[Pin, ...] = (
     Pin(
         "sageattention",
         "d1a57a546c3d395b1ffcbeecc66d81db76f3b4b5",
@@ -139,6 +142,15 @@ PINS: tuple[Pin, ...] = (
         _PYPI + "19/04/d24939d30b077679bfc8bf4a53c7392f9d8650df7ce69164238a673753a1/"
         "comfy_kitchen-0.2.37-cp312-abi3-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
         "03cca0d10c314aaa13bff8f9422d03974221a344162b23d4f10d27eb2a35d0e8",
+        machine="x86_64",
+    ),
+    Pin(
+        KITCHEN_WHEEL,
+        "0.2.37",
+        _PYPI + "ab/3b/77e68e596cb8097e10753b8095164d07b79b976208da8bde3371ecbfc558/"
+        "comfy_kitchen-0.2.37-cp312-abi3-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl",
+        "0f872625af6b3d1f96f18c54b4ef11129df2d9178d28946e1f3d737b8252416d",
+        machine="aarch64",
     ),
     Pin(
         "nanobind",
@@ -167,6 +179,15 @@ PINS: tuple[Pin, ...] = (
         _PYPI + "e8/db/68786fdc0bfb3a9782df7304c1e577b9c5a7d14c75e98e06571cc1869b3f/"
         "apache_tvm_ffi-0.1.14.post1-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl",
         "eb759c039866b541ec2cb07d498082f8ba6ded74d58d9196180a5932f365c077",
+        machine="x86_64",
+    ),
+    Pin(
+        "apache-tvm-ffi",
+        "0.1.14.post1",
+        _PYPI + "35/16/47b9f8c06df3ee1eda3f0cef025bd94e70dcf37fc58296852a175512956b/"
+        "apache_tvm_ffi-0.1.14.post1-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl",
+        "3fd2255a2e363a40c51ec1eeedb1110a2c74e443f95ae351ee5a81b5ff6808cf",
+        machine="aarch64",
     ),
     Pin(
         "einops",
@@ -202,6 +223,15 @@ PINS: tuple[Pin, ...] = (
         _PYPI + "12/1c/2f7a13626af1edfefb5ad69234d47e3b212064a42ad2e6db59351b5ae002/"
         "nvidia_cutlass_dsl_libs_base-4.8.0-cp312-cp312-manylinux_2_28_x86_64.whl",
         "5bdc80989b0fbbac3d58960057e74e2ce8676fafa76b852d9422b9c4b9b74bdd",
+        machine="x86_64",
+    ),
+    Pin(
+        "nvidia-cutlass-dsl-libs-base",
+        "4.8.0",
+        _PYPI + "21/59/99fa03da9ace3048379601cf090a629c8d7df3ed33a4fa284848080e342d/"
+        "nvidia_cutlass_dsl_libs_base-4.8.0-cp312-cp312-manylinux_2_28_aarch64.whl",
+        "3affcaefb59a976ff5195dd2bff4c13594233cb4941540b74e372b63e497d3f2",
+        machine="aarch64",
     ),
     Pin(
         "nvidia-cutlass-dsl-libs-core",
@@ -216,6 +246,15 @@ PINS: tuple[Pin, ...] = (
         _PYPI + "df/75/6c52c58fc0fdab223feb9162886736390a6f902183d24df1508ac620a69d/"
         "nvidia_cutlass_dsl_libs_cu13-4.8.0-cp312-cp312-manylinux_2_28_x86_64.whl",
         "463cd7f0c452ffeeecb530a15aeb1b10cbbd2c8da6c5aa2fecf65f836258a732",
+        machine="x86_64",
+    ),
+    Pin(
+        "nvidia-cutlass-dsl-libs-cu13",
+        "4.8.0",
+        _PYPI + "bd/48/d5b62e1e3954dadc5e962d5be81c0c2acf3dcc7ed854f323447967ba3ec0/"
+        "nvidia_cutlass_dsl_libs_cu13-4.8.0-cp312-cp312-manylinux_2_28_aarch64.whl",
+        "d61ebe2416cae8a2d5377889549df9cb5008af006a1692d7d006d8f747e62e6c",
+        machine="aarch64",
     ),
     Pin(
         "quack-kernels",
@@ -230,6 +269,15 @@ PINS: tuple[Pin, ...] = (
         _PYPI + "e2/79/a914539b4785f3e44f891aa012a886edb8bc10fe081c440981c57543ce21/"
         "torch_c_dlpack_ext-0.1.5-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl",
         "e6f9da4bb9af70e27facc777458be62e10dbbbddda7672d16138db0553c5a524",
+        machine="x86_64",
+    ),
+    Pin(
+        "torch-c-dlpack-ext",
+        "0.1.5",
+        _PYPI + "87/06/8d760997307a5c3be4384424667bf31aae0a42060838c532c7d846516175/"
+        "torch_c_dlpack_ext-0.1.5-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl",
+        "3562ee411258676f9c38b8ad39306d1c8d027b6a86f6a87c920d2d009a9d1510",
+        machine="aarch64",
     ),
     Pin(
         "packaging",
@@ -253,6 +301,8 @@ PINS: tuple[Pin, ...] = (
         "3217dcc807155e45db462d7ef2431f5ddda0d7273b700d05a67b271ceb1287ab",
     ),
 )
+#: This machine's pins: its own platform wheels and every source.
+PINS = tuple(pin for pin in _PINS if pin.machine in ("", platform.machine()))
 
 
 @dataclass(frozen=True, slots=True)

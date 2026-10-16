@@ -91,7 +91,7 @@ class DeviceFacts:
     """The CUDA runtime torch was built against — a BUILD fact, carried beside the driver
     rather than in place of it. This is the field that used to be called `driver`."""
     os_arch: str = ""
-    """`Linux/x86_64`. The measurement subject includes its operating system."""
+    """`Linux/x86_64` or `Linux/aarch64`. The measurement subject includes its operating system."""
 
     @property
     def predicate(self) -> str:

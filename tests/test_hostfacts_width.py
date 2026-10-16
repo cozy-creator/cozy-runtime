@@ -22,6 +22,8 @@ from cozy_runtime.internal.hostfacts import measure
 
 H100 = "NVIDIA H100 80GB HBM3, 81559, 580.95.05, 9.0"
 H200 = "NVIDIA H200, 143771, 580.95.05, 9.0"
+# DGX Spark: an integrated GPU with no framebuffer, so the driver has no memory.total.
+GB10 = "NVIDIA GB10, [N/A], 580.95.05, 12.1"
 
 
 @pytest.fixture(autouse=True)
@@ -61,6 +63,16 @@ def test_a_wide_host_reports_its_width(
     # The per-card facts stay per-card: VRAM is one card's, never the sum.
     assert facts.gpu_name == "NVIDIA H100 80GB HBM3"
     assert facts.vram_total_bytes == 81559 * 1024 * 1024
+    assert "gpu_name" not in facts.unreadable
+
+
+def test_an_integrated_gpu_reports_the_host_pool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _driver(tmp_path, monkeypatch, GB10)
+    facts = measure("cuda")
+    assert (facts.gpu_name, facts.gpu_count, facts.gpu_sm) == ("NVIDIA GB10", 1, 121)
+    assert facts.vram_total_bytes == os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
     assert "gpu_name" not in facts.unreadable
 
 

@@ -34,10 +34,11 @@ def main() -> None:
     versions = {str(parse_wheel_filename(w.name)[1]) for w in wheels}
     assert len(versions) == 1, "the wheel set must contain one version"
     (version,) = versions
-    expected = {
-        "py3-none-any": None,
-        "cp312-abi3-manylinux_2_28_x86_64": 62,
-    }
+    # Each Linux arch's release job builds its own platform wheel beside the pure one.
+    arch = platform.machine()
+    platform_tag = f"cp312-abi3-manylinux_2_28_{arch}"
+    expected = {"py3-none-any": None, platform_tag: {"x86_64": 62, "aarch64": 183}.get(arch)}
+    assert platform.system() == "Linux" and expected[platform_tag], f"no Linux wheel for {arch}"
     assert {w.name for w in wheels} == {f"cozy_runtime-{version}-{tag}.whl" for tag in expected}, (
         "missing or unexpected platform wheels"
     )
@@ -74,17 +75,16 @@ def main() -> None:
             binaries[str(tag)] = binary
 
     for minor in (12, 13, 14):
-        for platforms, want in (
-            (
-                ["manylinux_2_28_x86_64", "manylinux_2_17_x86_64"],
-                "cp312-abi3-manylinux_2_28_x86_64",
-            ),
-            (["manylinux_2_17_x86_64"], "py3-none-any"),
-            (["manylinux_2_28_aarch64"], "py3-none-any"),
-            (["win_amd64"], "py3-none-any"),
-            (["macosx_14_0_arm64"], "py3-none-any"),
-            (["musllinux_1_2_x86_64"], "py3-none-any"),
+        for platforms in (
+            ["manylinux_2_28_x86_64", "manylinux_2_17_x86_64"],
+            ["manylinux_2_17_x86_64"],
+            ["manylinux_2_28_aarch64", "manylinux_2_17_aarch64"],
+            ["manylinux_2_17_aarch64"],
+            ["win_amd64"],
+            ["macosx_14_0_arm64"],
+            ["musllinux_1_2_x86_64"],
         ):
+            want = platform_tag if f"manylinux_2_28_{arch}" in platforms else "py3-none-any"
             supported = list(cpython_tags((3, minor), platforms=platforms))
             supported += list(compatible_tags((3, minor), platforms=platforms))
             ranks = {tag: index for index, tag in enumerate(supported)}
@@ -97,8 +97,6 @@ def main() -> None:
             )
             assert selected == f"cozy_runtime-{version}-{want}.whl", selected
 
-    if platform.system() != "Linux" or platform.machine() != "x86_64":
-        raise SystemExit("actual install verification requires Linux x86-64")
     with tempfile.TemporaryDirectory(prefix="tensord-install-") as directory:
         venv = Path(directory) / "venv"
         run("uv", "venv", str(venv), "--python", "3.12")
@@ -117,7 +115,7 @@ def main() -> None:
             f"cozy-runtime=={version}",
         )
         command = venv / "bin/tensord"
-        assert command.read_bytes() == binaries["cp312-abi3-manylinux_2_28_x86_64"]
+        assert command.read_bytes() == binaries[platform_tag]
         identity = json.loads(run(str(command), "version", "--json"))
         pin = (Path(__file__).resolve().parents[1] / "tensord.pin").read_text().strip()
         assert identity["name"] == "tensord" and "cozy.machine.v1" in identity["api"]
