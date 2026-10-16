@@ -91,6 +91,29 @@ def test_dense_warmup_excludes_padding_using_real_attention(dense_path: bool) ->
     assert torch.equal(out.view(torch.uint8), again.view(torch.uint8))
 
 
+def test_exact_paths_take_the_exact_kernel_when_the_dense_one_quantizes() -> None:
+    torch = pytest.importorskip("torch")
+
+    def quantized(*, query: Any, key: Any, value: Any, scale: float | None) -> Any:
+        e4m3 = [t.to(torch.float8_e4m3fn).to(t.dtype) for t in (query, key, value)]
+        return _dense_reference(query=e4m3[0], key=e4m3[1], value=e4m3[2], scale=scale)
+
+    generator = torch.Generator().manual_seed(7)
+    q, k, v = (torch.randn(1, 8, 2, 128, generator=generator) for _ in range(3))
+    layout = AttentionLayout(8, 2, 0, dense_until_step=4, exact_paths=("blocks.49",))
+    exact = _dense_reference(query=q, key=k, value=v, scale=None)
+    lossy = quantized(query=q, key=k, value=v, scale=None)
+    assert not torch.equal(exact, lossy)
+    attention_sol.bind_dense(quantized, "test-quantized; exact=test-native", _dense_reference)
+    try:
+        for path, expected in (("blocks.49.attn", exact), ("blocks.48.attn", lossy)):
+            site = attention_sol.Site("dit", path)
+            actual = attention_sol._execute(q, k, v, None, layout, site)
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    finally:
+        attention_sol.bind_dense(_dense_reference, "test-native-dense")
+
+
 def test_observations_are_request_local_and_restore_after_failure() -> None:
     torch = pytest.importorskip("torch")
     attention_sol.bind_dense(_dense_reference, "test-native-dense")

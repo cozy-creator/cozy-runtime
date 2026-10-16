@@ -56,6 +56,8 @@ class Site:
 _SITE: ContextVar[Site | None] = ContextVar("cozy_sol_site", default=None)
 _DENSE: Callable[..., Tensor] | None = None
 _DENSE_IDENTITY = ""
+#: The BF16 kernel the model's exact paths take when the dense one quantizes; else `_DENSE`.
+_EXACT: Callable[..., Tensor] | None = None
 NAMES = frozenset(
     {
         "sol-attn",
@@ -126,13 +128,16 @@ def record_rank(rank: int, counts: dict[str, int]) -> None:
         total[name] += value
 
 
-def bind_dense(call: Callable[..., Tensor], identity: str) -> None:
-    """Install the dense reference a selection resolved. Selection runs at preparation and at
-    a run's step and stage boundaries, so a rebind never changes a running step."""
-    if not callable(call) or not identity:
+def bind_dense(
+    call: Callable[..., Tensor], identity: str, exact: Callable[..., Tensor] | None = None
+) -> None:
+    """Install the dense reference a selection resolved, and the BF16 kernel the model's exact
+    paths take when that one quantizes. Selection runs at preparation and at a run's step and
+    stage boundaries, so a rebind never changes a running step."""
+    if not callable(call) or not identity or not (exact is None or callable(exact)):
         raise ValueError("Sol requires a resolved dense attention reference and its identity")
-    global _DENSE, _DENSE_IDENTITY
-    _DENSE, _DENSE_IDENTITY = call, identity
+    global _DENSE, _DENSE_IDENTITY, _EXACT
+    _DENSE, _DENSE_IDENTITY, _EXACT = call, identity, exact
 
 
 def dense_identity(kernel: str = "sol-attn") -> str:
@@ -235,6 +240,14 @@ def _dense(query: Tensor, key: Tensor, value: Tensor, scale: float | None) -> Te
     if _DENSE is None:
         raise RuntimeError("Sol dense reference was not resolved before execution")
     output = _DENSE(query=query, key=key, value=value, scale=scale)
+    _validate_result(output, query)
+    return output
+
+
+def _exact(query: Tensor, key: Tensor, value: Tensor, scale: float | None) -> Tensor:
+    if _EXACT is None:
+        return _dense(query=query, key=key, value=value, scale=scale)
+    output = _EXACT(query=query, key=key, value=value, scale=scale)
     _validate_result(output, query)
     return output
 
@@ -726,7 +739,12 @@ def _execute(
     """Apply the model's explicit policy after hardware/operand validation."""
     import torch
 
-    dense_path = any(site.path == p or site.path.startswith(p + ".") for p in layout.dense_paths)
+    def on(paths: tuple[str, ...]) -> bool:
+        return any(site.path == p or site.path.startswith(p + ".") for p in paths)
+
+    dense_path = on(layout.dense_paths)
+    if dense is _dense and on(layout.exact_paths):
+        dense = _exact
     if dense_path and query.shape[1] < layout.live_tokens:
         # A refiner has its own shorter document; its explicit dense policy wins.
         output = dense(query=query, key=key, value=value, scale=scale)
