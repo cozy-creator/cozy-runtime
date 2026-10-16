@@ -7,6 +7,7 @@ import re
 from typing import TYPE_CHECKING, Any, Literal
 
 import msgspec
+from tensorfs.derived import Config, Derivation, Target, derive
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author import (
@@ -283,6 +284,58 @@ def quantize_into(
         preserve_precision=plan.output_precision == "preserve",
     )
     return facade._artifact_result(result, receipt, tel, output)
+
+
+class SelectionPlan(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+    """The weights a lane keeps: those whose `component.key` matches one of `include`'s fnmatch
+    patterns, each of which must match one. Every other tensor is dropped; the kept ones are the
+    source's own objects (nothing is read or copied) and every config comes along. A small lane
+    of a big checkpoint's part, such as its multi-token-prediction head."""
+
+    include: tuple[str, ...]
+
+
+def select_into(
+    ctx: Context, tel: Telemetry, *, source: Any, plan: SelectionPlan, output: str
+) -> ModelArtifact:
+    """`plan`'s weights of `source`, written into the CALLING job's weights output `output`."""
+    ctx.raise_if_cancelled()
+    capability = ctx.tensorfs_source(source)
+    structure = capability.inspect()
+    rows = [(c, key) for c, tensors in structure.components.items() for key in tensors]
+
+    def kept(component: str, key: str) -> bool:
+        return any(fnmatch.fnmatchcase(f"{component}.{key}", rule) for rule in plan.include)
+
+    order = [(c, key) for c, key in rows if kept(c, key)]
+    unused = [
+        rule
+        for rule in plan.include
+        if not any(fnmatch.fnmatchcase(f"{c}.{key}", rule) for c, key in order)
+    ]
+    if not plan.include or len(set(plan.include)) != len(plan.include) or unused:
+        raise UnsupportedInput(
+            f"selection patterns match no weight: {unused or list(plan.include)}",
+            code="selection_plan",
+        )
+    targets = {
+        component: Target(
+            source="source",
+            source_component=component,
+            drop=tuple(key for c, key in rows if c == component and not kept(c, key)),
+        )
+        for component in dict.fromkeys(c for c, _ in order)
+    }
+    configs = {
+        name: Config("copy", source="source", source_config=name) for name in structure.configs
+    }
+    with derive(
+        ctx.output(output), Derivation({"source": capability}, targets, configs, order)
+    ) as transaction:
+        receipt = transaction.receipt if transaction.receipt is not None else transaction.commit()
+        artifact = ctx.adopt_model(receipt)
+    tel.log("selection", output=output, kept_keys=len(order), dropped_keys=len(rows) - len(order))
+    return artifact
 
 
 app.entrypoint(

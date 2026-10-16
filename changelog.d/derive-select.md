@@ -1,0 +1,1 @@
+`cozy_runtime.derive.operations.select_into` writes a lane of a source's matched weights only (`SelectionPlan(include=...)`), the source's own objects and configs: no bytes read or copied. Klein's drafter head lane (`mtp.*` of Qwen3.5-9B, 0.5 GB of 18) is one.
