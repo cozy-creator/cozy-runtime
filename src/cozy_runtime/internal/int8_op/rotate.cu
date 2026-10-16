@@ -136,16 +136,24 @@ __device__ __forceinline__ void store_tile(int8_t* row_out, int tile, int K,
     }
 }
 
+// `v / scale` by its reciprocal `r` and one correction step: the rounded quotient, without the
+// IEEE divide's cost per element (which bounded the pass at under half of B300's bandwidth).
+__device__ __forceinline__ float quotient(float v, float scale, float r) {
+    const float q = v * r;
+    return fmaf(fmaf(-q, scale, v), r, q);
+}
+
 // Two values as E4M3 bytes, `v / scale` rounded to nearest even and saturated: the eager leaf's
 // divide, clamp and cast.
-__device__ __forceinline__ uint32_t fp8x2(float a, float b, float scale) {
-    return __nv_cvt_float2_to_fp8x2(make_float2(__fdiv_rn(a, scale), __fdiv_rn(b, scale)),
+__device__ __forceinline__ uint32_t fp8x2(float a, float b, float scale, float r) {
+    return __nv_cvt_float2_to_fp8x2(make_float2(quotient(a, scale, r), quotient(b, scale, r)),
                                     __NV_SATFINITE, __NV_E4M3);
 }
 
 // The tile's E4M3 values into `row_out`.
 __device__ __forceinline__ void store_fp8(uint8_t* row_out, int tile, int K,
                                           const float (&v)[kLaneValues], float scale) {
+    const float r = 1.f / scale;
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
         const int at = run_start(tile, j);
@@ -154,8 +162,8 @@ __device__ __forceinline__ void store_fp8(uint8_t* row_out, int tile, int K,
         uint32_t w[2];
 #pragma unroll
         for (int h = 0; h < 2; ++h)
-            w[h] = fp8x2(e[4 * h], e[4 * h + 1], scale) |
-                   fp8x2(e[4 * h + 2], e[4 * h + 3], scale) << 16;
+            w[h] = fp8x2(e[4 * h], e[4 * h + 1], scale, r) |
+                   fp8x2(e[4 * h + 2], e[4 * h + 3], scale, r) << 16;
         *reinterpret_cast<uint2*>(row_out + at) = make_uint2(w[0], w[1]);
     }
 }

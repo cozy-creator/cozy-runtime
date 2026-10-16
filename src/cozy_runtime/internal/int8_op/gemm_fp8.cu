@@ -8,8 +8,9 @@ namespace {
 using E4M3 = cutlass::float_e4m3_t;
 
 #if COZY_SM == 100 || COZY_SM == 103
-// The int8 table's tcgen05 tiles. On a B300 at our shapes the two-SM 256x256 ran 2.5-3.0 PF
-// and the 256x128 led where 256x256 tiles fill under ~90% of their last wave.
+// The int8 table's tcgen05 tiles, measured on a B300 at our shapes: the two-SM 256x256 runs
+// 2.5-2.9 PF where its tiles fill 90% of their last wave, the 256x128 leads where they do not
+// (1536-4096 rows, SDXL), and the one-SM 64x128 up to 256 rows.
 template <typename Out>
 const Fn kConfigs[3] = {
     &TmaGemm<E4M3, Out, Shape<_256, _256, _128>, Shape<_2, _1, _1>, TwoSm>::run,  // 0
@@ -17,13 +18,13 @@ const Fn kConfigs[3] = {
     &TmaGemm<E4M3, Out, Shape<_64, _128, _128>, Shape<_1, _1, _1>, OneSm>::run,   // 2
 };
 
-int choose(int M, int N, int K, int sms) {
-    if (M <= 128 || int64_t(N) * K <= (4 << 20)) return 2;
+int choose(int M, int N, int, int sms) {
+    if (M <= 256) return 2;
     const auto filled = [&](int tile_n) {
         const int tiles = ((M + 255) / 256) * ((N + tile_n - 1) / tile_n), pairs = sms / 2;
         return double(tiles) / (double((tiles + pairs - 1) / pairs) * pairs);
     };
-    return filled(256) < 0.9 && filled(128) > filled(256) ? 1 : 0;
+    return filled(256) < 0.9 && filled(128) >= filled(256) ? 1 : 0;
 }
 #elif COZY_SM == 90
 // vLLM's `scaled_mm_sm90_fp8_dispatch.cuh` (Apache-2.0), and the int8 table's cooperative
