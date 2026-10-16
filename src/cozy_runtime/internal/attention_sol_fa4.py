@@ -110,25 +110,29 @@ def _merge_approximation(
     query: Tensor, kc: Tensor, vc: Tensor, pooled: Tensor, out: Tensor, lse: Tensor, scale: float
 ) -> None:
     _, tokens, heads, dim = query.shape
-    grid = (triton.cdiv(tokens, 128), heads)
+    blocks = kc.shape[1]
     if lse.shape != (1, heads, tokens) or not (lse.is_contiguous() and out.is_contiguous()):
         raise ValueError("FA4 returned an unexpected output or LSE layout")
-    _approximate_and_merge[grid](
+    length = (tokens - torch.arange(blocks, device=query.device) * BLOCK).clamp(1, BLOCK).float()
+    keys = kc[0].transpose(0, 1).contiguous()  # head-major block means
+    values = (vc[0].float() / length[:, None, None]).to(torch.bfloat16).transpose(0, 1).contiguous()
+    _approximate_and_merge[(triton.cdiv(tokens, 128), heads)](
         query,
-        kc,
-        vc,
+        keys,
+        values,
+        torch.log2(length),
         pooled.view(torch.int8),
         out,
         lse,
         tokens,
-        kc.shape[1],
+        blocks,
         heads,
         pooled.shape[1],
         pooled.shape[2],
         scale * LOG2E,
         D=dim,
         BLOCK_M=128,
-        BLOCK_N=64,
+        BLOCK_N=128,
         num_warps=8,
         num_stages=2,
     )
@@ -138,7 +142,8 @@ def _merge_approximation(
 def _approximate_and_merge(  # type: ignore[no-untyped-def]
     Q,
     KC,
-    VC,
+    VM,
+    BIAS,
     POOLED,
     OUT,
     LSE,
@@ -153,8 +158,9 @@ def _approximate_and_merge(  # type: ignore[no-untyped-def]
     BLOCK_N: tl.constexpr,
 ):
     """Sol's approximate branch for BLOCK_M rows of one head: every 64-key block outside the
-    rows' exact tile contributes its block-mean key and value with mass `length * exp(s)`.
-    Merged in place with FA4's exact output by log-sum-exp (FA4's LSE is natural-log)."""
+    rows' exact tile contributes its block-mean key KC and value VM with mass `length * exp(s)`
+    (BIAS = log2 length). Merged in place with FA4's exact output by log-sum-exp (FA4's LSE is
+    natural-log)."""
     tile = tl.program_id(0)
     head = tl.program_id(1).to(tl.int64)
     rows = (tile * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)
@@ -164,26 +170,25 @@ def _approximate_and_merge(  # type: ignore[no-untyped-def]
         Q + (rows[:, None] * heads + head) * D + dims[None, :], mask=live[:, None], other=0.0
     )
     pooled_row = POOLED + (head * q_tiles + (tile * BLOCK_M) // 256) * k_tiles
+    keys = KC + head * blocks * D
+    values = VM + head * blocks * D
     m_i = tl.full([BLOCK_M], float("-inf"), tl.float32)
     l_i = tl.zeros([BLOCK_M], tl.float32)
     acc = tl.zeros([BLOCK_M, D], tl.float32)
-    for start in range(0, blocks, BLOCK_N):
-        cols = (start + tl.arange(0, BLOCK_N)).to(tl.int64)
+    for start in tl.range(0, blocks, BLOCK_N, warp_specialize=True):
+        cols = start + tl.arange(0, BLOCK_N)
         valid = cols < blocks
-        offsets = (cols[:, None] * heads + head) * D + dims[None, :]
-        kc = tl.load(KC + offsets, mask=valid[:, None], other=0.0)
-        length = tl.maximum(tl.minimum(tokens - cols * 64, 64), 1).to(tl.float32)
-        exact = tl.load(pooled_row + cols // 2, mask=valid, other=1)
-        s = tl.dot(q, tl.trans(kc)) * scale_log2 + tl.log2(length)[None, :]
-        s = tl.where((exact == 0)[None, :], s, float("-inf"))
+        kc = tl.load(keys + cols[:, None] * D + dims[None, :], mask=valid[:, None], other=0.0)
+        keep = tl.load(pooled_row + cols // 2, mask=valid, other=1) == 0
+        bias = tl.where(keep, tl.load(BIAS + cols, mask=valid, other=0.0), float("-inf"))
+        s = tl.dot(q, tl.trans(kc)) * scale_log2 + bias[None, :]
         m_new = tl.maximum(m_i, tl.max(s, 1))
         m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
         p = tl.exp2(s - m_safe[:, None])
         alpha = tl.exp2(m_i - m_safe)
         l_i = l_i * alpha + tl.sum(p, 1)
-        vc = tl.load(VC + offsets, mask=valid[:, None], other=0.0).to(tl.float32)
-        mean = (vc / length[:, None]).to(tl.bfloat16)
-        acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), mean)
+        vm = tl.load(values + cols[:, None] * D + dims[None, :], mask=valid[:, None], other=0.0)
+        acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), vm)
         m_i = m_new
     o_offsets = (rows[:, None] * heads + head) * D + dims[None, :]
     exact_out = tl.load(OUT + o_offsets, mask=live[:, None], other=0.0).to(tl.float32)
