@@ -10,7 +10,8 @@ mass times the block's length), merged into FA4's output by log-sum-exp in one k
 Pooling only turns approximated blocks exact. On B200 with H3 15 s Q/K/V (111,598 rows, 56
 heads) it raises density from 17% to 33% and lowers the error against exact FP32 from
 0.09-0.14 (Sol's kernel) to 0.06-0.09; FA4 runs the exact tiles at 1.72 PF in FP8 and 1.2 PF
-in BF16, where Sol's own SM100 kernel reaches 0.55 PF (h3a-093).
+in BF16, where Sol's own SM100 kernel reaches 0.55 PF. A whole FP8 call takes 109-113 ms on a
+B200 and 81-86 ms on a B300, against Sol's 134-146 ms (h3a-093).
 """
 
 from __future__ import annotations
