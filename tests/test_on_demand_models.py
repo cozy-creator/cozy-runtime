@@ -45,7 +45,7 @@ from cozy_runtime.internal.executor_commands import (  # noqa: E402
     PrepareRequest,
     Start,
 )
-from cozy_runtime.internal.seam import Channel  # noqa: E402
+from cozy_runtime.internal.seam import RESULT_DOCUMENT, Channel  # noqa: E402
 from fetch_hub import COMPONENTS, Hub, objects_of, served  # noqa: E402
 
 MODULE = "on_demand_fixture"
@@ -194,8 +194,12 @@ def owner(channel: Channel, hub: Hub, store: Store, sealed: list[str]) -> None:
             channel.send_memfd(memfd)
             os.close(memfd)
             continue
-        assert kind == "sealed_tier", frame
-        memfd = channel.recv_memfd()
+        memfd = channel.recv_memfd() if frame.get("descriptor") else -1
+        if kind != "sealed_tier":  # a budget cell: this machine keeps none
+            if memfd >= 0:
+                os.close(memfd)
+            channel.send(answer | {"ok": False, "code": "unknown_durable_request"})
+            continue
         body = os.pread(memfd, frame["length"], 0)
         os.close(memfd)
         doc = msgspec.convert(canonical.parse(body), SealedPlan)
@@ -254,7 +258,7 @@ def attempt(executor: Executor, request_id: str, refine: bool) -> dict[str, Any]
         Invoke(request_id=request_id, entrypoint="run", spool=str(spool), deadline_s=60)
     )
     assert reply["outcome"]["terminal"] == "succeeded", reply
-    return dict(json.loads((spool / "result.json").read_bytes()))
+    return dict(json.loads((spool / RESULT_DOCUMENT).read_bytes()))
 
 
 class Machine:
