@@ -26,7 +26,13 @@ from dataclasses import dataclass
 from types import ModuleType
 from typing import Any
 
-from cozy_runtime.author.kernels import PreQuantized, readable
+from cozy_runtime.author.kernels import (
+    INT8_CONVROT,
+    ROWWISE_FP8,
+    PreQuantized,
+    readable,
+    shared_operand,
+)
 from cozy_runtime.internal import int8_linear
 from cozy_runtime.internal.encoding.formats import (
     E4M3_MAX,
@@ -201,6 +207,11 @@ def to_blocked(torch: Any, scales: Any) -> Any:
     return tiles.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1).contiguous()
 
 
+def _rowwise(torch: ModuleType, x: Tensor) -> PreQuantized:
+    payload, scale = quantize_activation_rowwise(torch, x)
+    return PreQuantized(payload, scale, tuple(x.shape))
+
+
 def _leaf_class(torch: Any) -> Any:
     """The `nn.Module` subclass every encoded leaf is an instance of, built ONCE, lazily.
 
@@ -272,6 +283,8 @@ def _leaf_class(torch: Any) -> Any:
                 dtype = torch.get_autocast_dtype(x.device.type)
                 out = self._cozy_forward(self, x.to(dtype), dtype)
             else:
+                if prequantized is None and self.provider == ROWWISE_FP8:
+                    prequantized = shared_operand(x, ROWWISE_FP8, lambda: _rowwise(torch, x))
                 operand = x if prequantized is None else prequantized
                 out = self._cozy_forward(self, operand, self.out_dtype)
             if self.bias is not None:
@@ -297,12 +310,20 @@ def _int8_leaf_class(torch: Any) -> Any:
 
     class Int8ConvRotLinear(_leaf_class(torch)):  # type: ignore[misc]
         def forward(self, x: Any, *, prequantized: PreQuantized | None = None) -> Any:
-            out_dtype = self.out_dtype
+            out_dtype, cast = self.out_dtype, x
             if torch.is_autocast_enabled(x.device.type):
                 # As the replaced `nn.Linear` does: from and to the autocast dtype.
                 out_dtype = torch.get_autocast_dtype(x.device.type)
-                x = x.to(out_dtype)
-            return int8_linear.linear(torch, x, self.data, self.scale, self.bias, out_dtype)
+                cast = x.to(out_dtype)
+            if prequantized is None or prequantized.provider != INT8_CONVROT:
+                prequantized = shared_operand(
+                    x, INT8_CONVROT, lambda: int8_linear.quantize(torch, cast)
+                )
+            if prequantized is not None:
+                return int8_linear.gemm(
+                    torch, prequantized, self.data, self.scale, self.bias, out_dtype
+                )
+            return int8_linear.linear(torch, cast, self.data, self.scale, self.bias, out_dtype)
 
     _int8_leaf_class._cached = Int8ConvRotLinear  # type: ignore[attr-defined]
     return Int8ConvRotLinear
