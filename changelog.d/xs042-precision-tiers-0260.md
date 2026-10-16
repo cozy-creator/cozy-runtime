@@ -1,0 +1,1 @@
+Runtime 0.26.0 is the xs-042 cohort: lanes and kernels come from the GPU's family, packages declare only tolerances, and TensorD 0.7.0 picks each slot's lane by rule (no Hub bindings or ladders). Packages published on older Runtimes must be republished: ladder `defaults=` are refused.
