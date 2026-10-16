@@ -1081,7 +1081,7 @@ def _head_dim(module: Any) -> int:
     return 0
 
 
-def _base(projection: Any) -> Any:
+def _base(projection: object) -> object:
     """A PEFT LoRA wrapper's current base layer (encoded fill can replace it after
     construction), else the projection itself."""
     peft_linear = getattr(sys.modules.get("peft.tuners.lora.layer"), "Linear", None)
@@ -1115,15 +1115,15 @@ def _dtype(module: Any) -> str:
     return next(iter(dtypes)) if len(dtypes) == 1 and "" not in dtypes else ""
 
 
-def _projections(module: Any) -> tuple[Any, ...]:
+def _projections(module: object) -> tuple[object, ...]:
     """The site's active Q/K/V projections; empty when the module does not say."""
-    q, k, v = (getattr(module, name, None) for name in ("to_q", "to_k", "to_v"))
+    q, k, v, kv = (getattr(module, name, None) for name in ("to_q", "to_k", "to_v", "to_kv"))
     packed = getattr(module, "to_qkv", None)
     fused = getattr(module, "fused_projections", None)
     if packed is not None and (fused is True or (fused is None and q is None)):
         return (packed,)
-    if q is not None and getattr(module, "to_kv", None) is not None and fused is True:
-        return (q, module.to_kv)
+    if q is not None and kv is not None and fused is True:
+        return (q, kv)
     if q is not None and k is not None and v is not None:
         return (q, k, v)
     return ()
@@ -1137,7 +1137,7 @@ _LIKE: dict[str, tuple[frozenset[int], tuple[str, ...]]] = {
 }
 
 
-def _like_projections(order: Sequence[str], module: Any, sm: int) -> tuple[str, ...]:
+def _like_projections(order: Sequence[str], module: object, sm: int) -> tuple[str, ...]:
     """`order` with `LIKE_PROJECTIONS` replaced by the kernels quantized like this site's
     Q/K/V projections on this card; by nothing (float attention, by design) when they are
     float, mixed, or not measured here."""
