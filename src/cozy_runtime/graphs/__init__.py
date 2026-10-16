@@ -59,10 +59,8 @@ except ImportError:  # pragma: no cover - the base package is torch-free
 #: Set while a mechanism runs its own graphs over a component (`cozy_runtime.lm`): its calls
 #: pass straight through.
 BYPASS: contextvars.ContextVar[bool] = contextvars.ContextVar("cozy_graphs_bypass", default=False)
-#: The first replay's largest relative L2 distance from the call run as written; where two calls
-#: run as written differ too (kernels reducing in no fixed order), up to `NOISE` times that
-#: distance, never past `NOISY` (a call reading state beside its arguments differs by more).
-TOLERANCE, NOISE, NOISY = 1e-3, 4.0, 5e-2
+#: The first replay's largest relative L2 distance from the call run as written.
+TOLERANCE = 1e-3
 #: A signature records only when its first call's launches took at least this share of its time
 #: (a GPU that outruns the launches gains nothing from a graph), and keeps its recording only
 #: when a replay takes at most `PAYS` of the call run as written.
@@ -327,21 +325,18 @@ def _record(
         with attention_ulysses.observing() as served:
             written_s = _seconds(lambda: written.append(call(module, *cargs, **ckwargs)))
         written = _floats(written[0])
-        error, noise = _distance(replayed, written), 0.0
-        if error > TOLERANCE and len(replayed) == len(written):
-            # kernels that reduce in no fixed order differ between two calls as written too
-            noise = _distance(_floats(call(module, *cargs, **ckwargs)), written)
+        error = _distance(replayed, written)
         if LANDED[0] != landed:
             graph, why = None, ""  # a kernel landed meanwhile: the next call starts over
             _chose(recorder, key, "kernel landed", "")
-        elif len(replayed) != len(written) or error > max(TOLERANCE, min(NOISE * noise, NOISY)):
-            graph, why = (
-                None,
-                (
-                    f"its first replay is {error:.2e} from the call run as written, "
-                    f"{noise:.2e} between two such calls"
-                ),
+        elif len(replayed) != len(written) or not error <= TOLERANCE:
+            each = " ".join(
+                f"{_distance([a], [b]):.0e}" for a, b in zip(replayed, written, strict=False)
             )
+            why = (
+                f"its first replay is {error:.2e} from the call run as written (by output: {each})"
+            )
+            graph = None
         elif (replay_s := _seconds(graph.replay)) > PAYS * written_s:
             graph, why = None, ""  # as fast as written: not worth its memory
             _chose(
@@ -440,8 +435,6 @@ def _signature(module: Any, leaves: list[Any], spec: Any) -> tuple[object, ...]:
 __all__ = [
     "BYPASS",
     "HOST_BOUND",
-    "NOISE",
-    "NOISY",
     "PAYS",
     "TOLERANCE",
     "capture",
