@@ -243,10 +243,10 @@ __device__ __forceinline__ void apply_prologue(const Prologue& p, int row, int t
     }
 }
 
-// The TMA GEMMs (Hopper, datacenter Blackwell, RTX 50's fp8) launch as programmatic dependents
+// The TMA GEMMs (wgmma, tcgen05, block-scaled mma.sync's fp8) launch as programmatic dependents
 // of this kernel: they start their prologue as soon as every block here has begun, and wait
 // for this grid before reading.
-#if COZY_SM == 90 || COZY_SM == 100 || COZY_SM == 103 || COZY_SM == 120
+#if defined(COZY_TMA) || defined(COZY_FP8_GEMM)
 constexpr bool kDependentGemm = true;
 #else
 constexpr bool kDependentGemm = false;

@@ -29,13 +29,11 @@ from typing import cast
 from cozy_runtime.author._errors import is_device_oom
 from cozy_runtime.author._model import LANDED, WARNINGS
 from cozy_runtime.author.kernels import INT8_CONVROT, PreQuantized, readable
-from cozy_runtime.internal import kernel_cache, kernel_compile, kernel_sources
+from cozy_runtime.internal import arch, kernel_cache, kernel_compile, kernel_sources
 from cozy_runtime.internal.encoding.formats import CONVROT_GROUP, Tensor, hadamard256
 
 ARTIFACT = "comfy-kitchen"
 OP = "cozy-int8"
-#: The cards the artifact's binary carries device code for (`attention_upstream.KITCHEN_SMS`).
-KITCHEN_SMS = frozenset({80, 86, 87, 89, 90, 100, 103, 110, 120, 121})
 #: How often a leaf asks whether a running build has landed: resolution, never a verdict.
 POLL_SECONDS = 1.0
 #: The op's one-launch GEMV takes this many rows (`kGemvRows`): it rotates them itself.
@@ -135,20 +133,27 @@ def _store() -> kernel_cache.Store:
 
 
 def _compiled(name: str, sm: int) -> Path | None:
-    """The built artifact's tree, None while it compiles."""
-    built = kernel_compile.submit(_store(), kernel_sources.job(name, sm))
-    if built.state in ("compiling", "pending"):
-        return None
-    if built.state != "ready":
-        raise kernel_sources.Absent(f"{name} sm{sm}: {built.line()}")
-    return Path(built.path) / kernel_cache.SITE
+    """The built artifact's tree, None while it compiles. The op builds for the card's family;
+    a card no row names takes the newest family whose build works for it (`arch`, §2.6)."""
+    families = arch.families(sm) if name == OP else ("",)
+    for family in families:
+        built = kernel_compile.submit(_store(), kernel_sources.job(name, sm, family=family))
+        if built.state in ("compiling", "pending"):
+            return None
+        if built.state == "ready":
+            if family:
+                arch.learn(sm, family)
+            return Path(built.path) / kernel_cache.SITE
+        if family == families[-1]:
+            raise kernel_sources.Absent(f"{name} sm{sm}: {built.line()}")
+    return None
 
 
 def native(torch: ModuleType, index: int) -> Op | None:
     """`torch.ops.cozy.int8_linear` on this card, or None while its build runs."""
 
     def opened(sm: int) -> Op | None:
-        if sm < 80:
+        if not arch.row(sm).family:
             raise kernel_sources.Absent(f"no int8 tensor-core GEMM for sm{sm}")
         tree = _compiled(OP, sm)
         if tree is None:
@@ -171,7 +176,7 @@ def kitchen(torch: ModuleType, index: int) -> ModuleType | None:
     the first ask) and for good when this card or machine cannot have it."""
 
     def opened(sm: int) -> ModuleType | None:
-        if sm not in KITCHEN_SMS:
+        if not arch.row(sm).family:
             raise kernel_sources.Absent(f"comfy-kitchen carries no device code for sm{sm}")
         found = util.find_spec("comfy_kitchen")
         store = kernel_cache.configured()

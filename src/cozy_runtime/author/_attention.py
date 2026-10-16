@@ -1,4 +1,4 @@
-"""A model's attention selection policy, and the attention calls a package brings."""
+"""The attention calls a package brings (`register_attention`)."""
 
 from __future__ import annotations
 
@@ -10,42 +10,6 @@ from typing import Any
 
 from cozy_runtime.author._attention_scope import AttentionLayout
 from cozy_runtime.author.kernels import PreQuantized
-
-#: A preference entry (`Model.choose_attention`): the attention kernel quantized like this
-#: site's Q/K/V projections, where Runtime serves one on this card (int8 leaves: `kitchen-int8`
-#: on sm86/sm89/sm120/sm121); none for float projections. The model consents; which encoding
-#: serves stays Runtime's (`encoded_leaves`).
-LIKE_PROJECTIONS = "like-projections"
-
-
-@dataclass(frozen=True, slots=True)
-class AttentionContext:
-    """One attention site's eligible choices, supplied before model warm-up.
-
-    Eligibility covers installed dependencies, hardware, site dtype/head size and
-    parallelism support. It is not a model-quality approval. Returning an explicit
-    backend still requires Runtime's kernel validation; unavailable choices refuse.
-    Activation dtype is the site's declared `activation_dtype`, else its projection output
-    contracts, with an ordinary floating Linear fallback (no external autocast).
-    Unknown/mismatched contracts are empty.
-    Processors without per-site dispatch have empty eligible/recommended values.
-    Return None to leave them unchanged; an explicit choice refuses.
-    Weight storage precision is deliberately separate from attention activation dtype.
-    """
-
-    component: str
-    module_path: str
-    device_kind: str
-    device_name: str
-    sm: int
-    activation_dtype: str
-    head_dim: int
-    degree: int
-    eligible: tuple[str, ...]
-    recommended: str
-    recommendation_reason: str
-    #: Eligible kernels with a compatible Runtime-provided wheel. Others may build from source.
-    prebuilt: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,14 +43,17 @@ class AttentionProducer:
     """A package's own attention call, selectable by `name` like any Runtime backend.
 
     Runtime serves it through `base`, one of its sparse (Sol-family) backends: the base's
-    device admission, compiled build and dense kernel, with the model's `AttentionLayout`. At
+    device admission, compiled build and dense kernel, with the model's `AttentionLayout`.
+    Wherever the base is in a site's cell, the producer is tried just before it; a site it
+    validates is a sparse site (its model supplies a layout there). At
     each site it is selected for, Runtime wraps the attention module's processor so the
     module's call reaches `produce(call, *args, **kwargs)`; `call.original` is the site's own
     processor. `validate(module)` raises ValueError, before any change, for a module it does
     not serve. `requires` names the callables it needs in the base's kernel module; one the
     build lacks makes the producer unavailable there, as a failed build does. `state()`
     makes one object per request on each GPU (`request_state`), closed (its `close()`, when
-    it has one) when the request ends. `context_parallel` admits Ulysses sequence parallelism.
+    it has one) when the request ends. `context_parallel` admits Ulysses sequence parallelism;
+    one without it steps to the next kernel under a group.
     """
 
     name: str
@@ -112,7 +79,7 @@ _PRODUCERS: dict[str, AttentionProducer] = {}
 
 
 def register_attention(producer: AttentionProducer) -> AttentionProducer:
-    """Make `producer.name` selectable in this process (`Model.choose_attention`, a request's
+    """Make `producer.name` selectable in this process (its base's cells, a request's
     `--attention-kernel`). A package registers at import; its name takes precedence."""
     _PRODUCERS[producer.name] = producer
     return producer

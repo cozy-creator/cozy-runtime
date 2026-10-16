@@ -19,6 +19,7 @@ import subprocess
 import sys
 from collections.abc import Mapping
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -28,7 +29,7 @@ from cozy_runtime.author._observations import (
     TEXT_CAP,
     EventRing,
 )
-from cozy_runtime.internal import accel, attention, attention_fp8, attention_upstream
+from cozy_runtime.internal import accel, arch, attention, attention_fp8
 from cozy_runtime.internal.encoding import DeviceFacts
 
 
@@ -98,15 +99,16 @@ def test_the_fp8_quantiser_maps_each_head_onto_e4m3_and_hands_back_its_descale()
 
 
 def test_every_nameable_kernel_has_one_name_and_one_backend() -> None:
-    names = [c.name for c in (*attention.CANDIDATES, *attention.PINNABLE)]
-    backends = [c.backend for c in (*attention.CANDIDATES, *attention.PINNABLE)]
+    names = [c.name for c in attention.KERNELS]
+    backends = [c.backend for c in attention.KERNELS]
     assert len(names) == len(set(names)) == len(set(backends))
     assert set(attention.BY_NAME) == set(names)
-    # Both quantized-activation kernels remain explicit choices. A speed result
-    # alone does not make their numerical change an automatic model default.
-    for name in ("flash-attn3-fp8", "sageattention", "sageattention-fp16pv"):
-        assert name in {c.name for c in attention.PINNABLE}
-        assert name not in {c.name for c in attention.CANDIDATES}
+    # A level-16 cell keeps the operands' precision; quantizing kernels serve lower levels.
+    for cells in (attention.DENSE, attention.SPARSE):
+        for family, levels in cells.items():
+            for name in (*levels[16], *(n for at, ns in levels.items() for n in ns)):
+                assert name in attention.BY_NAME, (family, name)
+            assert all(attention.BY_NAME[n].exact for n in levels[16]), family
 
 
 @pytest.mark.parametrize(
@@ -138,62 +140,18 @@ def test_a_site_is_admitted_by_its_own_dtype_and_head_dimension(
     assert attention._admits(attention.BY_NAME[name], dtype, head_dim) is admits
 
 
-def test_the_device_alone_decides_which_ranked_kernels_are_even_candidates() -> None:
-    """The pure half of the rule: no import, no compile, just the card. A device outside a
-    kernel's range never sees it, and every device sees the floor last."""
-    for device in (_device(0, kind="cpu"), _device(70), _device(89)):
-        assert [c.name for c in attention.for_device(device)] == ["sdpa"]
-    assert [c.name for c in attention.for_device(_device(90))] == RANKED
-    assert [c.name for c in attention.for_device(_device(100))] == ["sdpa"]
-    # Resolution then drops what the image does not ship, in order and without raising.
-    for device in (_device(0, kind="cpu"), _device(89), _device(90)):
-        offered = [entry.name for entry in attention.available(device)]
-        ranked = [candidate.name for candidate in attention.for_device(device)]
-        assert offered == [name for name in ranked if name in offered]
-
-
-# ----------------------------------------------------------- the range is bounded ABOVE too
-
-
-def test_every_candidate_states_the_architectures_it_serves() -> None:
-    """h3a-022. An OPEN-ENDED range admitted a card the binary had no device code for, and
-    FA3's launcher exits the process from C++ there. Every entry built for a card answers "and
-    up to what?"; the torch backends are unbounded because torch, not this runtime, builds
-    them, and the floor may never be bounded above."""
-    for candidate in (*attention.CANDIDATES, *attention.PINNABLE):
-        assert not candidate.max_sm or candidate.max_sm >= candidate.min_sm, candidate.name
-        assert not candidate.artifact or candidate.max_sm, candidate.name
-    fa3 = attention.BY_NAME["flash-attn3"]
-    assert (fa3.min_sm, fa3.max_sm, fa3.artifact) == (90, 90, "flash-attn3")
-    sage = attention.BY_NAME["sageattention"]
-    assert (sage.max_sm, sage.sms, sage.local) == (
-        120,
-        frozenset({89, 90, 120}),
-        attention_upstream.SAGE,
-    )
-    assert attention.BY_NAME["sol-attn"].sms == frozenset({89, 90, 100, 103, 120})
-    fp16pv = attention.BY_NAME["sageattention-fp16pv"]
-    assert (fp16pv.min_sm, fp16pv.max_sm, fp16pv.artifact) == (90, 90, "sageattention-full")
-    assert attention.BY_NAME["cudnn"].max_sm == 0 and attention.BY_NAME["sdpa"].max_sm == 0
-    assert attention.CANDIDATES[-1].name == "sdpa"
-    assert attention.CANDIDATES[-1].min_sm == 0 and attention.CANDIDATES[-1].max_sm == 0
-    for sm in (100, 120):
-        refused = _refusal(lambda card=sm: attention.pinned("flash-attn3", _device(card)))
-        assert refused.code == "attention_kernel_unsupported" and f"sm{sm}" in str(refused)
-
-
 @pytest.mark.parametrize(
     ("name", "card", "says", "below"),
     [
-        ("sageattention-fp16pv", 120, "sageattention-fp16pv serves sm90 only", 89),
-        ("sageattention", 100, "sageattention serves SM [89, 90, 120], not sm100", 86),
+        ("sageattention-fp16pv", 120, "sageattention-fp16pv runs on wgmma", 89),
+        ("sageattention", 100, "sageattention runs on mma.sync/wgmma with fp8", 86),
     ],
 )
 def test_a_static_ceiling_refuses_the_card_by_name_instead_of_reaching_the_kernel(
     name: str, card: int, says: str, below: int
 ) -> None:
-    """RED ARM, no plant and no device: a card outside the declared range is refused BY NAME
-    rather than admitted and reached.
+    """RED ARM, no plant and no device: a card whose row the kernel does not run is refused BY
+    NAME rather than admitted and reached.
 
     Admitting it is what the old table did, and probing it is what would then have run the
     kernel: h3a-022 measured `cudaErrorNoKernelImageForDevice` out of this extension on an
@@ -204,8 +162,8 @@ def test_a_static_ceiling_refuses_the_card_by_name_instead_of_reaching_the_kerne
     assert f"sm{card}" in str(refused)
     # The refusal is also the discoverability (cr-125): it says what this card CAN run.
     assert "This environment runs" in str(refused)
-    # And the same entry on the card it does claim gets past the device gate, so the ceiling
-    # is a bound and not a blanket refusal — sm90 reaches resolution and fails on absence.
+    # And the same entry on a row it runs gets past the device gate — sm90 reaches resolution
+    # and fails on absence.
     assert _refusal(lambda: attention.pinned(name, _device(90))).code == "attention_kernel_absent"
     under = _refusal(lambda: attention.pinned(name, _device(below)))
     assert under.code == "attention_kernel_unsupported" and f"sm{below}" in str(under)
@@ -219,6 +177,7 @@ def test_a_candidate_that_fails_to_resolve_for_any_reason_drops_out_of_auto() ->
     ranking rather than fail a prepare that was only trying to go faster. The plant is the
     shape that would really happen: a baked snapshot built for another ABI, whose loader
     raises whatever it raises. A PIN is the opposite and keeps its typed refusal."""
+    pytest.importorskip("diffusers")
     broken = attention.BY_NAME["flash-attn3"]
     real = attention._resolve
 
@@ -231,7 +190,16 @@ def test_a_candidate_that_fails_to_resolve_for_any_reason_drops_out_of_auto() ->
 
     attention._resolve = planted
     try:
-        assert "flash-attn3" not in [entry.name for entry in attention.available(_device(90))]
+        site = SimpleNamespace(head_dim=128, activation_dtype="bfloat16")
+        refused: dict[str, str] = {}
+        fallbacks: list[Any] = []
+        order = attention.walk(arch.row(90), 16)
+        served = attention._first(
+            order, arch.row(90), _device(90), "dit", site, 1, {}, refused, fallbacks
+        )
+        assert served is not None and served.name == "sdpa"
+        assert "undefined symbol" in refused["flash-attn3"]
+        assert [(f["preferred"], f["selected"]) for f in fallbacks] == [("flash-attn3", "sdpa")]
         assert "flash-attn3" not in attention.image_kernels(_device(90))
         # The pin does NOT swallow it: a caller who named it is told, not quietly served
         # something else.
@@ -250,7 +218,7 @@ def test_a_pin_this_runtime_does_not_know_refuses_and_names_what_it_knows() -> N
 def test_a_pin_this_device_cannot_serve_refuses_naming_the_device() -> None:
     refused = _refusal(lambda: attention.pinned("flash-attn3", _device(89)))
     assert refused.code == "attention_kernel_unsupported"
-    assert "sm90" in str(refused) and "sm89" in str(refused)
+    assert "wgmma" in str(refused) and "sm89" in str(refused)
     assert _refusal(lambda: attention.pinned("cudnn", _device(0, "cpu"))).code == (
         "attention_kernel_unsupported"
     )
@@ -494,7 +462,7 @@ def test_classic_attention_sites_are_managed_observed_and_bit_identical() -> Non
         after = (roots["unet"](sample, 10, text).sample, roots["vae"](image).sample)
     assert all(torch.equal(old, new) for old, new in zip(before, after, strict=True))
     planned = attention.plan(device, roots, "unet=sdpa")
-    assert planned.entry is not None and planned.entry.name == "sdpa" and not planned.fallbacks
+    assert {entry.name for *_, entry in planned.sites} == {"sdpa"} and not planned.fallbacks
 
     processors = [processor for _, _, processor in attention._sites(roots)]
     attention.select(device, roots)
@@ -725,7 +693,7 @@ def test_the_fastest_admitted_kernel_is_pinned_on_real_attention_sites() -> None
     # h3a-022, through the real registry: the range is bounded ABOVE as well as below, and the
     # card above the ceiling is refused by name rather than reached.
     assert out["too_new"]["code"] == "attention_kernel_unsupported"
-    assert "sageattention-fp16pv serves sm90 only" in out["too_new"]["detail"]
+    assert "sageattention-fp16pv runs on wgmma" in out["too_new"]["detail"]
 
     # And the pin computes: one real forward through the pinned site.
     assert out["forward"] == {"shape": [1, 64, 1024], "dtype": "torch.bfloat16"}

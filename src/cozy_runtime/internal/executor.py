@@ -132,6 +132,7 @@ from cozy_runtime.author.kernels import Launch, Plan, TritonKernels
 from cozy_runtime.derive.operations import app as builtin_operations_app
 from cozy_runtime.internal import (
     accel,
+    arch,
     attention,
     attention_sol,
     attention_ulysses,
@@ -279,6 +280,11 @@ def _env_changes() -> tuple[str, ...]:
         for name in sorted(_SEALED.keys() | current.keys())
         if current.get(name) != _SEALED.get(name) and name not in ROUTED
     )
+
+
+def _attention_pin(kernel: str, bits: int) -> str:
+    """A request's attention override: its pin, else level 16 at 16 bits (C4)."""
+    return kernel or (attention.EXACT if bits == 16 else "")
 
 
 def _sealed_entries() -> tuple[str, ...]:
@@ -2690,16 +2696,16 @@ class Executor:
             planned = self._execution_plan(model, torch, load_kernels, kernels_ready)
             roots = backend.roots
             stage("execution_plan")
-            # THE FASTEST KERNEL THIS DEVICE AND IMAGE SUPPORT, PINNED POST-FILL (cr-124),
-            # per attention site and before any warm step (`attention.select`).
+            # EACH SITE'S KERNEL FROM THE GROUP'S FAMILY CELL AT THE MODEL'S ATTENTION LEVEL,
+            # PINNED POST-FILL (cr-124), before any warm step (`attention.select`).
+            sms = [accel.device_capability(entry) for entry in _sealed_entries()]
             self._reselect = functools.partial(
                 attention.select,
                 device_facts,
                 roots,
                 degree=self.world,
-                choose=model.choose_attention
-                if type(model).choose_attention is not Model.choose_attention
-                else None,
+                bits=type(model).__attention_bits__,
+                row=arch.common(map(arch.row, sms)) if self.world > 1 and all(sms) else None,
             )
             applied = self._reselect()
             self.device_facts = device_facts
@@ -3273,7 +3279,7 @@ class Executor:
                 "detail": f"{command.entrypoint!r} is not an entrypoint of this release",
             }
         registration = self.discovered.app.get(command.entrypoint)
-        pin = command.attention_kernel
+        pin = _attention_pin(command.attention_kernel, command.bits)
         waits = Attribution()
         if pin and self._attention_reaches(pin):
             held = kernel_compile.held.set(
@@ -3353,7 +3359,7 @@ class Executor:
                 "runs the record its plan was priced against, and this executor holds none "
                 "(a fresh epoch holds nothing at all)",
             }
-        requested = command.attention_kernel
+        requested = _attention_pin(command.attention_kernel, command.bits)
         # A pin is the run's: a call holding no site in its scope runs its own selection,
         # and the worker reports a run none of whose calls applied it.
         pin = requested if requested and self._attention_reaches(requested) else ""
@@ -3506,6 +3512,10 @@ class Executor:
                 )
             for message, raised in WARNINGS:
                 record.emit("log", message, "warn", **raised)
+            members = self.model_executors or [self]
+            facts = next((m.device_facts for m in members if m.device_facts), None)
+            if facts is not None and (unnamed := arch.inherited(facts.sm, facts.name)):
+                record.emit("log", unnamed, "warn")
         WARNINGS.clear()
         stage_memo.ENGINE.close(record.emit)
         if later:

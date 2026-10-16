@@ -50,7 +50,7 @@ from packaging.tags import sys_tags
 from packaging.utils import parse_wheel_filename
 
 from cozy_runtime._cpus import cpus
-from cozy_runtime.internal import accel, config, egress, kernel_cache, kernel_compile
+from cozy_runtime.internal import accel, arch, config, egress, kernel_cache, kernel_compile
 
 ROOT = Path("/opt/cozy/kernel-sources")
 INDEX = "index.json"
@@ -59,7 +59,7 @@ PYTHON = "kernel-python"
 KITCHEN_WHEEL = "comfy-kitchen-wheel"
 #: Recipe fields outside a key: how many compiler processes a build runs, and other cards'
 #: text fixes.
-_UNKEYED = ("extensions", "unit_bytes", "replace_on", "build_deps")
+_UNKEYED = ("extensions", "unit_bytes", "replace_on", "build_deps", "by_row")
 #: What `setup.py` itself imports, from the registry when the environment lacks it; build-only.
 _BUILD_DEPS = ("setuptools", "wheel", "packaging")
 
@@ -279,6 +279,8 @@ class Recipe:
     #: recipes whose kernels this build also holds under the same module: imported first, it
     #: serves them too, so one process never needs both
     serves: tuple[str, ...] = ()
+    #: built for the card's row (`arch`): its family and formats are build inputs
+    by_row: bool = False
 
 
 #: The cards upstream SageAttention builds its SM89 and SM80 kernel families for.
@@ -289,7 +291,8 @@ _SAGE = {"CXX_APPEND_FLAGS": "-std=c++20", "NVCC_APPEND_FLAGS": "-std=c++20 --th
 #: `attention_upstream.fa3` calls (`num_splits=1`), a third of upstream's forward units.
 _FA3_OFF = ("BACKWARD", "SM80", "PAGEDKV", "APPENDKV", "SOFTCAP", "LOCAL", "SPLIT", "PACKGQA")
 #: FA3's head dimensions and dtypes the packages' attention sites run: H3's and Qwen Image's
-#: transformers at 128 in BF16, H3's video VAE at 64 in FP16 (`attention.CANDIDATES`).
+#: transformers at 128 in BF16, H3's video VAE at 64 in FP16 (`attention.KERNELS`). No package
+#: declares its sites' shapes, so this is the build's.
 _FA3_SHAPES = (("128", "bf16"), ("64", "fp16"))
 #: Upstream updates the submodule with git, and off CUDA 12.8 downloads NVIDIA's 12.6/12.8
 #: compilers over this machine's toolkit; build with the toolkit present. It hard-codes C++17
@@ -444,6 +447,7 @@ RECIPES: dict[str, Recipe] = {
             ("cozy-int8-src", "cutlass"),
             place={"cutlass": "cutlass"},
             unit_bytes=7 << 30,
+            by_row=True,
         ),
         Recipe(PYTHON, "python"),
     )
@@ -532,8 +536,9 @@ def reviewed_kitchen_wheel_compatible() -> bool:
     return _compatible_kitchen_wheel(Source(pin.name, pin.version, _filename(pin), pin.sha256))
 
 
-def job(name: str, sm: int, root: Path | None = None) -> kernel_compile.Job:
-    """The exact artifact `name` is on a card of capability `sm` in this environment."""
+def job(name: str, sm: int, root: Path | None = None, family: str = "") -> kernel_compile.Job:
+    """The exact artifact `name` is on a card of capability `sm` in this environment; a
+    by-row recipe's for the card's row as `family` (`arch.row`)."""
     recipe = RECIPES[name]
     sources, why = registry(root) if root is not None else (_pinned_sources(), "")
     sources = {**{own: _own(own) for own in OWN}, **sources}
@@ -582,6 +587,9 @@ def job(name: str, sm: int, root: Path | None = None) -> kernel_compile.Job:
                 )
             ),
         }
+    row = arch.row(sm, family) if recipe.by_row else None
+    if row is not None:
+        inputs["row"] = [row.family, *sorted(row.formats())]
     if recipe.build_deps:
         inputs["build_deps"] = {n: sources[n].sha256 for n in recipe.build_deps}
     inputs["sources"] = {n: s.sha256 for n, s in sorted(wanted.items())}
@@ -590,6 +598,7 @@ def job(name: str, sm: int, root: Path | None = None) -> kernel_compile.Job:
     spec = {
         "recipe": name,
         "sm": sm,
+        **({"row": inputs["row"]} if row is not None else {}),
         "sources": {n: asdict(s) for n, s in wanted.items()},
         "build_deps": {
             n: asdict(sources[n])
@@ -803,8 +812,9 @@ def build_setup(
                 "PYTORCH_NVCC": str(nvcc),
                 "PYTHONPATH": os.pathsep.join([str(deps), *sys.path]),
                 "PYTHONNOUSERSITE": "1",
-                # The card it builds for, for a build that names its target itself.
+                # The card it builds for, for a build that names its target itself, and its row.
                 "COZY_KERNEL_SM": str(spec.get("sm", 0)),
+                "COZY_KERNEL_ROW": " ".join(spec.get("row", ())),
                 **recipe.env,
             }
         )

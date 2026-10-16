@@ -7,7 +7,7 @@ namespace {
 
 using E4M3 = cutlass::float_e4m3_t;
 
-#if COZY_SM == 100 || COZY_SM == 103
+#ifdef COZY_TCGEN05
 // The int8 table's tcgen05 tiles, measured on a B300 at our shapes: the two-SM 256x256 runs
 // 2.5-2.9 PF where its tiles fill 90% of their last wave, the 256x128 leads where they do not
 // (1536-4096 rows, SDXL), and the one-SM 64x128 up to 256 rows.
@@ -26,7 +26,7 @@ int choose(int M, int N, int, int sms) {
     };
     return filled(256) < 0.9 && filled(128) >= filled(256) ? 1 : 0;
 }
-#elif COZY_SM == 90
+#elif defined(COZY_WGMMA)
 // vLLM's `scaled_mm_sm90_fp8_dispatch.cuh` (Apache-2.0) up to 128 rows, then measured on an H100
 // SXM at our shapes against cuBLASLt's `_scaled_mm`: the 2x1-cluster cooperative 128x256 matches
 // it at H3's 52k rows (1.24-1.32 PF), the 1x2-cluster ping-pong leads the up projections, the
@@ -49,7 +49,7 @@ int choose(int M, int N, int K, int) {
     return N >= 2 * K ? 5 : 0;
 }
 #else
-// vLLM's sm120 tile (`scaled_mm_sm120_fp8_dispatch.cuh`, Apache-2.0); no clusters on RTX 50.
+// Block-scaled mma.sync (RTX 50): vLLM's sm120 tile (`scaled_mm_sm120_fp8_dispatch.cuh`, Apache-2.0); no clusters on RTX 50.
 template <typename Out>
 const Fn kConfigs[1] = {
     &TmaGemm<E4M3, Out, Shape<_128, _128, _128>, Shape<_1, _1, _1>, Cooperative>::run,  // 0

@@ -216,12 +216,12 @@ def test_sol_sm90_object_is_a_function_of_its_block_layout_and_needs_no_gpu() ->
     assert _object(_COMPILE, 4032)["key"] != full["key"]
 
 
-@pytest.mark.parametrize("capability", sorted(attention_sol.ROUTES))
+@pytest.mark.parametrize("capability", [(8, 9), (9, 0), (12, 0), (12, 1)])
 def test_every_sol_route_compiles_without_a_gpu(
     capability: tuple[int, int], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Each card's object, through the compile manager's own GPU-less builder. SM100's launch
-    asks the driver for shared memory per SM (`min_blocks_per_mp=2`); its target answers."""
+    """Each CuTe route's object, through the compile manager's own GPU-less builder, for the
+    card's own target: 12.1 takes block-scaled mma.sync's sm120 route for sm_121a."""
     _site()
     monkeypatch.setenv("TMPDIR", str(tmp_path))
     monkeypatch.setattr("tempfile.tempdir", None)
@@ -268,7 +268,7 @@ def test_a_second_process_loads_the_sol_object_the_first_compiled(tmp_path: Path
     torch = pytest.importorskip("torch")
     if not accel.present(torch, "cuda"):
         pytest.skip("requires a CUDA device")
-    if tuple(torch.cuda.get_device_capability()) not in attention_sol.ROUTES:
+    if attention_sol.route(torch.cuda.get_device_capability()) not in attention_sol.ROUTES:
         pytest.skip("requires a card one of Sol's CuTe routes serves")
     own = str(tmp_path / "u1")
     first = json.loads(_run(_SERVE, str(tmp_path / "out0.pt"), own).stdout.splitlines()[-1])

@@ -209,7 +209,13 @@ def test_a_kernel_still_compiling_is_evidence_with_its_progress(
     import zipfile
     from functools import partial
 
-    from cozy_runtime.internal import attention, attention_upstream, kernel_cache, kernel_sources
+    from cozy_runtime.internal import (
+        arch,
+        attention,
+        attention_upstream,
+        kernel_cache,
+        kernel_sources,
+    )
     from cozy_runtime.internal.encoding import DeviceFacts
 
     wheel = tmp_path / "late_kernel-1.0-py3-none-any.whl"
@@ -226,21 +232,21 @@ def test_a_kernel_still_compiling_is_evidence_with_its_progress(
     assert lock is not None
     store.set_state(job.key, {"progress": 0.42, "started_unix_ms": 1})
     late = attention.Candidate(
-        name="late",
-        backend="_cozy_late_test",
-        local=attention_upstream.SDPA,
-        min_sm=0,
-        dtypes=frozenset(),
-        max_head_dim=0,
+        "late",
+        "_cozy_late_test",
+        attention_upstream.SDPA,
         artifact=kernel_sources.PYTHON,
         import_name="late_kernel",
     )
     cpu = DeviceFacts("cpu", "CPU", 0, "", "", 0)
-    monkeypatch.setattr(attention, "CANDIDATES", (late, *attention.CANDIDATES))
+    monkeypatch.setitem(attention.BY_NAME, "late", late)
     try:
-        skipped: dict[str, str] = {}
-        assert [ready.name for ready in attention.available(cpu, skipped)] == ["sdpa"]
-        assert "late" not in skipped  # still compiling is not a skip: it is evidence
+        refused: dict[str, str] = {}
+        served = attention._first(
+            ["late", "sdpa"], arch.NONE, cpu, "dit", object(), 1, {}, refused, []
+        )
+        assert served is not None and served.name == "sdpa"
+        assert "compiling" in refused["late"]
         rows = {row["kernel"]: row for row in attention.evidence(("sdpa",))}
         assert rows["sdpa"] == {"kernel": "sdpa", "state": "ready", "line": "ready", "served": True}
         assert rows["late"]["state"] == "compiling" and rows["late"]["progress"] == 0.42

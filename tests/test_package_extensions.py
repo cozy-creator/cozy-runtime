@@ -104,8 +104,8 @@ def test_a_producer_is_its_base_backend_under_its_own_name(producer: AttentionPr
     candidate, base = attention.known()[producer.name], attention.BY_NAME[BASE]
     assert candidate.producer is producer and attention.sparse(candidate)
     assert candidate.backend == "_cozy_test_producer" and candidate.local.head_local
-    assert (candidate.sms, candidate.artifact, candidate.import_name) == (
-        base.sms,
+    assert (candidate.families, candidate.artifact, candidate.import_name) == (
+        base.families,
         base.artifact,
         base.import_name,
     )

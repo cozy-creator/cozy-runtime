@@ -44,8 +44,8 @@ dtype or device does not match. qwen-image-2 is the reference user.
 
 ## Attention producers — `AttentionProducer`, `register_attention`
 
-A package's own attention call, selectable by name (`choose_attention`, `--attention-kernel`)
-and served through a Runtime sparse base (`base`, e.g. `kitchen-sol-fp4-fixed-means`): the
+A package's own attention call, tried just before its base in a site's cell (and selectable by
+`--attention-kernel`), served through a Runtime sparse base (`base`, e.g. `kitchen-sol-fp4-fixed-means`): the
 base's admission, build and dense kernel, with the model's `AttentionLayout`. At selected sites
 the module's call reaches `produce(call, *args)`; `ProducerCall` carries the layout, site, the
 base's kernel module, the request's `state()`, the Ulysses group and `exchange`, the leaf

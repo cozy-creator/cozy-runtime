@@ -12,7 +12,6 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from torch import Tensor
-    from torch import device as TorchDevice
 
 from cozy_runtime.internal import attention_sol, attention_ulysses, attention_upstream
 from cozy_runtime.internal.attention_ulysses import Local, Options
@@ -36,12 +35,6 @@ def _shape(query: Tensor, key: Tensor, value: Tensor) -> None:
         raise ValueError("Fixed-Kmean Sage2 requires B1, equal Q/KV heads, D128 and nonempty rows")
 
 
-def validate_device(device: TorchDevice) -> None:
-    torch = import_module("torch")
-    if device.type != "cuda" or torch.cuda.get_device_capability(device) != (9, 0):
-        raise ValueError("Fixed-Kmean Sage2 serves Hopper SM90 only")
-
-
 def forward(
     query: Tensor,
     key: Tensor,
@@ -59,7 +52,7 @@ def forward(
     if is_causal or enable_gqa:
         raise ValueError("Fixed-Kmean Sage2 serves noncausal equal-head inference only")
     attention_upstream._cuda_inputs(
-        query, key, value, enable_gqa, name=DENSE_NAME, admitted=((9, 0),), dims={128}, bf16=True
+        query, key, value, enable_gqa, name=DENSE_NAME, dims={128}, bf16=True
     )
     _shape(query, key, value)
     if any(t.stride(-1) != 1 for t in (query, key, value)):
@@ -125,7 +118,6 @@ def sparse_forward(query: Tensor, key: Tensor, value: Tensor, **options: Any) ->
         **options,
         dense=dense,
         prefix_dense=dense,
-        validate_device=validate_device,
     )
 
 

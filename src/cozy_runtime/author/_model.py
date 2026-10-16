@@ -4,9 +4,9 @@ construction transaction, and construction-identity coalescing.
 THE SIGNATURE IS THE SLOT (§1.1): a bare typed parameter (`model: Fl2VAModel`) is the whole
 declaration and its derived canonical path (`generate.models.model`) is the binding point.
 There is no slot object, no `artifacts=` dict, and the `Annotated` override-marker plane is
-EMPTY at launch. The CLASS carries closed keywords (`encoded_leaves`, `min_bits`, `phase`); there
-are no stamps, no `task=`/`objective=`/`structure=`, and no model or release name anywhere in code
-(model-code-fit §1, D1). A semantic twin is a component name or a config fact.
+EMPTY at launch. The CLASS carries closed keywords (`encoded_leaves`, `min_bits`, `phase`,
+`attention_bits`); there are no stamps, no `task=`/`objective=`/`structure=`, and no model or
+release name anywhere in code (model-code-fit §1, D1). A semantic twin is a component name or a config fact.
 
 Construction identity is (package release, model class, exact artifact snapshot + immutable
 config, construction/provider variant). Equal identities coalesce ONE single-flight model
@@ -36,7 +36,6 @@ from typing import (
     final,
 )
 
-from cozy_runtime.author._attention import AttentionContext
 from cozy_runtime.author._context import AdapterRef, Context, Device, RequestView, derive_seed
 from cozy_runtime.author._errors import (
     CapabilityError,
@@ -132,6 +131,25 @@ PHASES: Mapping[str, str] = {
 def closed(vocabulary: Collection[object], value: object) -> bool:
     """`value` is one of `vocabulary`'s keys, of the key's own type (no `8.0`, no `True`)."""
     return any(type(value) is type(key) and value == key for key in vocabulary)
+
+
+def attention_bits(owner: str, value: object) -> int | dict[str, int]:
+    """`attention_bits=`: the lowest attention precision the model's sites tolerate (16|8|4),
+    whole or per component-qualified module prefix (`"fl2va_dit"`,
+    `"transformer.single_transformer_blocks."`; the longest wins, unlisted sites 16)."""
+    if closed(MIN_BITS, value):
+        return cast(int, value)
+    if (
+        isinstance(value, Mapping)
+        and value
+        and all(type(k) is str and k and closed(MIN_BITS, v) for k, v in value.items())
+    ):
+        return dict(value)
+    raise ConformanceError(
+        f"class {owner}(attention_bits={value!r}): 16, 8 or 4, or a mapping of "
+        "component-qualified module prefixes to them",
+        code="attention_bits_value",
+    )
 
 
 #: Keyword names an author-facing model method may not declare. Every one of them names a
@@ -581,6 +599,8 @@ class Model[PipelineT]:
     """`min_bits=`: the lowest weight precision the lane rules may pick (`MIN_BITS`)."""
     __phase__: str = "compute"
     """`phase=`: "decode" for an LM's token loop, else "compute" (`PHASES`)."""
+    __attention_bits__: int | dict[str, int] = 16
+    """`attention_bits=`: the attention precision its sites tolerate (`attention_bits`)."""
 
     __adapter_compatibility__: tuple[AdapterCompatibility, ...] = ()
     """Closed generic adapter declarations; empty means overlays are refused."""
@@ -609,9 +629,9 @@ class Model[PipelineT]:
 
     def __init_subclass__(cls, /, **keywords: object) -> None:
         """The class-keyword plane: `encoded_leaves` (model-code-fit §1), the closed consent
-        about what the runtime may substitute, and the precision tolerances `min_bits` and
-        `phase` (xs-042). Each is inherited by subclasses. A package's own fused plan is its
-        `execution_plan`.
+        about what the runtime may substitute, and the precision tolerances `min_bits`, `phase`
+        and `attention_bits` (xs-042). Each is inherited by subclasses. A package's own fused
+        plan is its `execution_plan`.
 
         Anything else refuses typed: the open stamp vocabulary (`task=`, `objective=`),
         `structure=` and `self_loading=` are deleted (D1), and a keyword the runtime does not
@@ -633,13 +653,15 @@ class Model[PipelineT]:
                         code=f"{keyword}_value",
                     )
                 setattr(cls, attribute, value)
+        if "attention_bits" in keywords:
+            cls.__attention_bits__ = attention_bits(cls.__name__, keywords.pop("attention_bits"))
         if keywords:
             names = ", ".join(f"{key}=…" for key in keywords)
             raise ConformanceError(
                 f"class {cls.__name__}({names}): a Model class carries encoded_leaves, "
-                "min_bits and phase — fusion=, stamps, task=, objective= and structure= are "
-                "deleted (model-code-fit D1); a semantic twin is a component name or a config "
-                "fact",
+                "min_bits, phase and attention_bits — fusion=, stamps, task=, objective= and "
+                "structure= are deleted (model-code-fit D1); a semantic twin is a component "
+                "name or a config fact",
                 code="class_keyword",
                 fields=sorted(keywords),
             )
@@ -653,19 +675,6 @@ class Model[PipelineT]:
             "loader.construct(T, factory=…) — the one construction primitive (§1.1)",
             code="no_load",
         )
-
-    def choose_attention(self, context: AttentionContext) -> str | Sequence[str] | None:
-        """Select an eligible backend before warm-up, or retain Runtime's recommendation.
-
-        This hook chooses a name, not a kernel implementation or device operation.
-        A name is an explicit choice: validated and never silently replaced. A sequence
-        of names is a preference: Runtime takes the first one this site, device,
-        environment and numerical probe admit on each GPU, records why each earlier
-        one was skipped, and falls back to its recommendation when none serves.
-        Approximate attention remains the model author's quality decision, independent
-        of FP8 checkpoint storage. Developer request overrides take precedence.
-        """
-        return None
 
     def execution_plan(self, plan: Plan) -> str:
         """Install this model's execution plan on its filled components: its own fused

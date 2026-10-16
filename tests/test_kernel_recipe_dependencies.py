@@ -102,14 +102,7 @@ def _dependency(tmp_path: Path, name: str) -> tuple[attention.Candidate, kernel_
         {"sources": {name: asdict(source)}},
     )
     candidate = attention.Candidate(
-        name,
-        "_cozy_" + name,
-        attention_upstream.SDPA,
-        0,
-        frozenset(),
-        0,
-        artifact=name,
-        import_name=module,
+        name, "_cozy_" + name, attention_upstream.SDPA, artifact=name, import_name=module
     )
     return candidate, job
 

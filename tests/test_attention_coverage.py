@@ -10,7 +10,6 @@ from typing import Any
 
 import pytest
 
-from cozy_runtime.author import AttentionContext
 from cozy_runtime.internal import attention
 from cozy_runtime.internal.attention_registry import register
 from cozy_runtime.internal.encoding import DeviceFacts
@@ -111,27 +110,6 @@ def test_a_request_pin_takes_the_sites_it_can_and_says_why_not_the_rest() -> Non
     assert not hasattr(legacy.processor, "_attention_backend")
 
 
-def test_author_sees_empty_choices_for_legacy_and_cannot_force_it() -> None:
-    legacy, mixed = _modules()
-    contexts: list[AttentionContext] = []
-
-    def abstain(context: AttentionContext) -> None:
-        contexts.append(context)
-
-    attention.select(_device(), {"mixed": mixed}, choose=abstain)
-    context = next(c for c in contexts if c.module_path == "legacy")
-    assert context.eligible == () and context.recommended == ""
-    assert "per-site" in context.recommendation_reason
-    assert not hasattr(legacy.processor, "_attention_backend")
-
-    def force(context: AttentionContext) -> str | None:
-        return "sdpa" if context.module_path == "legacy" else None
-
-    with pytest.raises(attention.AttentionRefusal, match="per-site"):
-        attention.select(_device(), {"mixed": mixed}, choose=force)
-    assert not hasattr(legacy.processor, "_attention_backend")
-
-
 def test_scoped_pin_does_not_require_control_of_an_unselected_legacy_component() -> None:
     legacy, mixed = _modules()
     roots = {"dit": mixed["managed"], "vae": legacy}
@@ -139,4 +117,4 @@ def test_scoped_pin_does_not_require_control_of_an_unselected_legacy_component()
     assert applied.hosts == {"dit": {"sdpa": 1}}
     assert not hasattr(legacy.processor, "_attention_backend")
     unmanaged = attention.plan(_device(), roots, "vae=sdpa")
-    assert unmanaged.entry is None and "per-site" in unmanaged.fallbacks[0]["reason"]
+    assert not unmanaged.sites and "per-site" in unmanaged.fallbacks[0]["reason"]

@@ -8,20 +8,12 @@ from typing import TYPE_CHECKING, Unpack
 if TYPE_CHECKING:
     from cozy_runtime.internal.attention_ulysses import PartialOptions
 
-    from torch import Tensor, device as Device
+    from torch import Tensor
 
 from cozy_runtime.internal import attention_sol, attention_ulysses, attention_upstream
 from cozy_runtime.internal.attention_ulysses import Local, Options
 
 NAMES = frozenset({"kitchen-sol", "kitchen-sol-fp4-lowmem", "kitchen-sol-fp4-fixed-means"})
-FP4 = frozenset({"kitchen-sol-fp4-lowmem", "kitchen-sol-fp4-fixed-means"})
-
-
-def validate_device(device: Device) -> None:
-    torch = import_module("torch")
-    capability = torch.cuda.get_device_capability(device) if device.type == "cuda" else None
-    if capability not in attention_upstream.KITCHEN_SMS:
-        raise ValueError(f"Kitchen Sol does not support device capability {capability}")
 
 
 def sparse(
@@ -82,7 +74,6 @@ def forward(query: Tensor, key: Tensor, value: Tensor, **options: Unpack[Partial
         **options,
         sparse=sparse,
         dense=dense_kitchen,
-        validate_device=validate_device,
     )
 
 
@@ -97,7 +88,6 @@ def forward_fp4_lowmem(
         sparse=sparse,
         dense=dense_fp4_lowmem,
         prefix_dense=dense_kitchen,
-        validate_device=validate_device,
     )
 
 
@@ -112,7 +102,6 @@ def forward_fp4_fixed_means(
         sparse=sparse,
         dense=dense_fp4_fixed_means,
         prefix_dense=dense_kitchen,
-        validate_device=validate_device,
     )
 
 

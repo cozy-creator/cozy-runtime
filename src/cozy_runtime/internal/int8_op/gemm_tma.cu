@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // The int8 GEMM on TMA cards (`gemm_tma.cuh`). Hopper (90): tiles after vLLM's
 // `scaled_mm_sm90_int8_dispatch.cuh` (Apache-2.0). Datacenter Blackwell (100): tcgen05, after
-// SGLang's `convrot_int8` (Apache-2.0); sm103 has no int8 UMMA.
+// SGLang's `convrot_int8` (Apache-2.0); a tcgen05 row without int8 (B300) builds none.
 #include <algorithm>
 
 #include "gemm_tma.cuh"
@@ -9,7 +9,7 @@
 namespace cozy_int8 {
 namespace {
 
-#if COZY_SM == 100
+#ifdef COZY_TCGEN05
 // Measured on a B200 at our shapes (SGLang's 128x128 and 128x256 one-SM tiles ran 10-20% below
 // the two-SM 256x256): small problems take the cluster-free 64x128.
 template <typename Out>

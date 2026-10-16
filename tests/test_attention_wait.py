@@ -3,8 +3,7 @@ ready, and the construction takes the kernel at its next selection once it is bu
 is the run's next step. A request's explicit `--attention-kernel` is the opposite: it waits
 for its own kernel's build and holds that kernel for every step, or is refused. Real
 Diffusers attention sites, a real source registry, real builder processes and the real
-store; the kernel is a registry wheel a CPU can build, named in a model's ladder and in the
-ranked table. A cancel ends the override's wait at once, and the wait is a stage of its run.
+store; the kernel is a registry wheel a CPU can build, first in the CPU row's level-16 cell. A cancel ends the override's wait at once, and the wait is a stage of its run.
 """
 
 from __future__ import annotations
@@ -53,12 +52,9 @@ from test_kernel_compile import _held, _registry
 
 CPU = DeviceFacts(kind="cpu", name="cpu", sm=0, driver="", configuration="", index=0)
 TINY = attention.Candidate(
-    name="tiny",
-    backend="_cozy_tiny",
-    local=attention_upstream.SDPA,
-    min_sm=0,
-    dtypes=frozenset(),
-    max_head_dim=0,
+    "tiny",
+    "_cozy_tiny",
+    attention_upstream.SDPA,
     artifact=kernel_sources.PYTHON,
     import_name="tiny_kernel",
 )
@@ -91,7 +87,7 @@ def _sites() -> dict[str, object]:
 
 @pytest.fixture
 def store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[kernel_cache.Store]:
-    """A machine run's store and scratch scope, and `tiny` known to selection."""
+    """A machine run's store and scratch scope, and `tiny` first in the CPU row's cell."""
     scope = tmp_path / "run"
     scope.mkdir()
     monkeypatch.setenv("TMPDIR", str(scope))
@@ -102,6 +98,7 @@ def store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[kernel_ca
     monkeypatch.setattr(liveness, "SAMPLE_SECONDS", 0.05)
     monkeypatch.setattr(kernel_compile, "POLL_SECONDS", 0.01)
     monkeypatch.setitem(attention.BY_NAME, "tiny", TINY)
+    monkeypatch.setitem(attention.DENSE, "", {16: ("tiny",)})
     for table in ("_READY", "_BROKEN", "_STATES"):
         monkeypatch.setattr(attention, table, {})
     # Tests in one second build the same wheel, so the same key: each has its own builders.
@@ -115,26 +112,20 @@ def store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[kernel_ca
     importlib.invalidate_caches()
 
 
-def _ladder(*names: str) -> Any:
-    return lambda context: names
-
-
 def _built(store: kernel_cache.Store, job: kernel_compile.Job) -> None:
     kernel_compile.submit(store, job)  # nobody builds it now: this starts the build
     while kernel_compile.status(store, job).state != "ready":
         time.sleep(kernel_compile.POLL_SECONDS)
 
 
-@pytest.mark.parametrize("choose", [_ladder("tiny", "sdpa"), None], ids=["ladder", "ranked"])
 def test_a_site_serves_what_is_ready_while_its_kernel_compiles_and_takes_it_once_built(
-    store: kernel_cache.Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, choose: Any
+    store: kernel_cache.Store, tmp_path: Path
 ) -> None:
     _registry(tmp_path / "sources")
-    monkeypatch.setattr(attention, "CANDIDATES", (TINY, attention.BY_NAME["sdpa"]))
     job = kernel_sources.job(kernel_sources.PYTHON, 0)
     lock, builder = _held(store, job, MOVING)
     try:
-        first = attention.select(CPU, _sites(), choose=choose)
+        first = attention.select(CPU, _sites())
         # Selected while the build still runs: nothing waited for it.
         assert kernel_compile.status(store, job).state == "compiling"
         assert first.hosts == {"dit": {"sdpa": 2}} and first.waiting == ("tiny",), first
@@ -145,7 +136,7 @@ def test_a_site_serves_what_is_ready_while_its_kernel_compiles_and_takes_it_once
         builder.wait()
     _built(store, job)
     assert attention.compiled(first.waiting, CPU)
-    later = attention.select(CPU, _sites(), choose=choose)
+    later = attention.select(CPU, _sites())
     assert later.hosts == {"dit": {"tiny": 2}} and later.waiting == (), later
 
 
@@ -157,7 +148,7 @@ def test_a_kernel_whose_compile_failed_is_skipped_with_why_and_the_next_one_serv
     kernel_compile.submit(store, job)
     while kernel_compile.status(store, job).state != "failed":
         time.sleep(kernel_compile.POLL_SECONDS)
-    applied = attention.select(CPU, _sites(), choose=_ladder("tiny", "sdpa"))
+    applied = attention.select(CPU, _sites())
     assert applied.hosts == {"dit": {"sdpa": 2}} and applied.waiting == ()
     assert "compile_source_mismatch" in (applied.skipped or {})["tiny"], applied.skipped
     assert attention.evidence(["sdpa"])[1]["state"] == "failed"
@@ -231,9 +222,7 @@ def _host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[SimpleNam
         assert host.activate(Activate(construction="a"))["ok"]
         construction, roots = host.constructions["a"], _sites()
         construction.backend, construction.device_facts = SimpleNamespace(roots=roots), CPU
-        construction._reselect = partial(
-            attention.select, CPU, roots, choose=_ladder("tiny", "sdpa")
-        )
+        construction._reselect = partial(attention.select, CPU, roots)
         construction.attention = construction._reselect()
         construction.attention_defaults = attention.snapshot(roots)
         package = sys.modules["steps_fixture"]
@@ -434,7 +423,7 @@ def test_an_override_whose_compile_fails_falls_back_with_the_compiles_reason(
         assert host.held[-1] == SDPA_SITES
         unsupported = host.run("unsupported", "flash-attn3")
         assert unsupported["fallbacks"][0]["preferred"] == "flash-attn3", unsupported
-        assert "sm90" in unsupported["fallbacks"][0]["reason"], unsupported
+        assert "wgmma" in unsupported["fallbacks"][0]["reason"], unsupported
         assert host.held[-1] == SDPA_SITES
 
 

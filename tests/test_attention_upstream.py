@@ -13,7 +13,7 @@ from typing import Any
 
 import pytest
 
-from cozy_runtime.internal import accel, attention, attention_ulysses
+from cozy_runtime.internal import accel, arch, attention, attention_ulysses
 from cozy_runtime.internal import attention_upstream as upstream
 
 torch = pytest.importorskip("torch")
@@ -161,7 +161,7 @@ def test_sage3_refuses_what_upstream_would_silently_change() -> None:
         upstream.sage3_fp4(q, q, q, scale=128**-0.5)
 
 
-def test_sage2_selects_upstreams_mode_by_the_querys_card(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_sage2_selects_upstreams_mode_by_the_querys_row(monkeypatch: pytest.MonkeyPatch) -> None:
     class Query:
         device = torch.device("cuda", 0)
 
@@ -176,22 +176,26 @@ def test_sage2_selects_upstreams_mode_by_the_querys_card(monkeypatch: pytest.Mon
     assert upstream.SAGE.impl(Query()) == (
         "sageattn_qk_int8_pv_fp8_cuda(per_thread, fp32+fp16, smooth_k)"
     )
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (12, 0))
-    assert upstream.SAGE.impl(Query()) == (
-        "sageattn_qk_int8_pv_fp8_cuda(per_warp, fp32+fp16, smooth_k)"
-    )
-    with pytest.raises(ValueError, match="no mode for sm120"):
+    for card in ((12, 0), (12, 1)):
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_, c=card: c)
+        assert upstream.SAGE.impl(Query()) == (
+            "sageattn_qk_int8_pv_fp8_cuda(per_warp, fp32+fp16, smooth_k)"
+        )
+    with pytest.raises(ValueError, match="no mode for sm121"):
         upstream.SAGE_FP16PV.impl(Query())
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (8, 6))
+    with pytest.raises(ValueError, match="no mode for sm86"):
+        upstream.SAGE.impl(Query())
     with pytest.raises(ValueError, match="CUDA devices only"):
         upstream.SAGE.impl(torch.zeros(1))
 
 
-#: adapter -> (module, cards, masks, grouped heads, scale, rel L2 bound)
-REAL: dict[Any, tuple[str, tuple[tuple[int, int], ...], bool, bool, float | None, float]] = {
-    upstream.kitchen_int8: ("comfy_kitchen", upstream.KITCHEN_SMS, True, True, 0.075, 0.05),
-    upstream.flashinfer_mixed: ("flashinfer", ((10, 0), (10, 3)), False, True, 0.075, 0.05),
-    upstream.fa4_fp8: ("flash_attn", ((10, 0), (10, 3)), False, False, 0.075, 0.06),
-    upstream.sage3_fp4: ("sageattn3", ((12, 0),), False, False, None, 0.2),
+#: adapter -> (module, the kernel it is, masks, grouped heads, scale, rel L2 bound)
+REAL: dict[Any, tuple[str, str, bool, bool, float | None, float]] = {
+    upstream.kitchen_int8: ("comfy_kitchen", "kitchen-int8", True, True, 0.075, 0.05),
+    upstream.flashinfer_mixed: ("flashinfer", "flashinfer-bf16-fp8", False, True, 0.075, 0.05),
+    upstream.fa4_fp8: ("flash_attn", "flash-attn4-fp8", False, False, 0.075, 0.06),
+    upstream.sage3_fp4: ("sageattn3", "sageattention3-fp4", False, False, None, 0.2),
 }
 
 
@@ -204,16 +208,16 @@ REAL: dict[Any, tuple[str, tuple[tuple[int, int], ...], bool, bool, float | None
 def test_real_upstream_matches_sdpa_and_preserves_inputs(
     adapter: Callable[..., Any], grouped: bool
 ) -> None:
-    dependency, cards, masks, groups, scale, bound = REAL[adapter]
+    dependency, kernel, masks, groups, scale, bound = REAL[adapter]
     if grouped and not groups:
         pytest.skip("adapter serves equal Q/KV heads only")
     if importlib.util.find_spec(dependency) is None:
         pytest.skip(f"{dependency} is not installed")
     if not accel.present(torch, "cuda"):
         pytest.skip("CUDA is unavailable")
-    capability = torch.cuda.get_device_capability()
-    if capability not in cards:
-        pytest.skip(f"adapter does not serve {capability}")
+    major, minor = torch.cuda.get_device_capability()
+    if attention._off_row(attention.BY_NAME[kernel], arch.row(major * 10 + minor)):
+        pytest.skip(f"adapter does not serve sm{major}{minor}")
     generator = torch.Generator(device="cuda").manual_seed(6057)
     kv_heads = 2 if grouped else 4
     # Packed projections leave gaps between heads/tokens, as actual H3 QKV does.
