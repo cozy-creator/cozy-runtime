@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -392,11 +393,13 @@ def test_sdxl_on_the_apple_gpu(tmp_path: Path, size: int) -> None:
             "generate",
         )
         cold = time.perf_counter() - started
+        planes = [machine.plane]
         started = time.perf_counter()
         second = machine.attempt(
             "generate", {"prompt": "a lighthouse on a cliff in a storm, oil painting", "seed": 77}
         )
         warm = time.perf_counter() - started
+        planes.append(machine.plane)
     assert (first["width"], first["height"]) == (size, size)
     OUT.mkdir(parents=True, exist_ok=True)
     (OUT / "sdxl-frames.json").write_text(json.dumps(machine.frames, default=str))
@@ -413,9 +416,37 @@ def test_sdxl_on_the_apple_gpu(tmp_path: Path, size: int) -> None:
             "recommended_max_bytes": int(torch.mps.recommended_max_memory()),
             "ram_bytes": os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"),
             "digests": [first["digest"], second["digest"]],
-            "plane": machine.plane,
+            "stages_ms": _stages(machine.frames),
+            "planes": [
+                {k: p.get(k) for k in ("evictions", "disk_copy_bytes", "disk_gbps", "resident")}
+                for p in planes
+            ],
+            # what the store's objects read at, twice: the disk, then what the page cache kept
+            "read_gbps": [_read_gbps(Path(store.root, "blobs")) for _ in range(2)],
+            "swap": subprocess.run(
+                ["sysctl", "-n", "vm.swapusage"], capture_output=True, text=True
+            ).stdout.strip(),
         },
     )
+
+
+def _stages(frames: list[dict[str, Any]]) -> dict[str, dict[str, float]]:
+    """Each attempt's stage durations, from its telemetry."""
+    out: dict[str, dict[str, float]] = {}
+    for frame in frames:
+        if frame.get("kind") == "stage":
+            out.setdefault(frame["request_id"], {})[frame["name"]] = frame["value"]
+    return out
+
+
+def _read_gbps(root: Path) -> float:
+    started, total = time.perf_counter(), 0
+    for path in root.rglob("*"):
+        if path.is_file():
+            with path.open("rb", buffering=0) as handle:
+                while chunk := handle.read(8 << 20):
+                    total += len(chunk)
+    return round(total / (time.perf_counter() - started) / 1e9, 3)
 
 
 # ---------------------------------------------------------------------------- the machine
