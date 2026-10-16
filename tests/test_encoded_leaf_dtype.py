@@ -12,11 +12,8 @@ except ImportError as exc:
 
 from cozy_runtime.derive.microscale import encode_int8_convrot256
 from cozy_runtime.internal import accel
-from cozy_runtime.internal.encoding.leaves import (
-    Int8ConvRotNativeLeaf,
-    RowwiseNativeLeaf,
-    quantize_activation_rowwise,
-)
+from cozy_runtime.internal.encoding.leaves import Int8ConvRotNativeLeaf, RowwiseNativeLeaf
+from cozy_runtime.internal.fp8_linear import eager_quantize
 
 
 class EncodedLeafDtypeTest(unittest.TestCase):
@@ -87,7 +84,7 @@ class EncodedLeafDtypeTest(unittest.TestCase):
                 )
                 self.assertEqual(get_parameter_dtype(leaf), dtype)
                 activation = logical.to(get_parameter_dtype(leaf))
-                quantized, activation_scale = quantize_activation_rowwise(torch, activation)
+                quantized, activation_scale = eager_quantize(torch, activation)
                 expected = (quantized.float() * activation_scale) @ (
                     payload.float() * scales[:, None]
                 ).t()

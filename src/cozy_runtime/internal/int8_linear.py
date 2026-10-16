@@ -85,6 +85,21 @@ def _built(
     return state.served
 
 
+@dataclass(frozen=True, slots=True)
+class Unavailable:
+    """A card whose 8-bit op library will not build for this executor: its int8 and fp8 leaves
+    serve slower paths (comfy-kitchen, cuBLASLt, torch ops) for the executor's life."""
+
+    op: str
+    device: int
+    reason: str
+
+
+def unavailable() -> tuple[Unavailable, ...]:
+    """Each card a leaf asked for the op on whose build failed for good; every run says so."""
+    return tuple(Unavailable(OP, i, b.final) for i, b in sorted(_NATIVE.items()) if b.final)
+
+
 def _store() -> kernel_cache.Store:
     store = kernel_cache.configured()
     if store is None:

@@ -435,8 +435,9 @@ RECIPES: dict[str, Recipe] = {
             ),
         ),
         Recipe("comfy-kitchen", "setup", ("comfy-kitchen",), build_deps=("nanobind",)),
-        # `torch.ops.cozy.int8_*` (`int8_linear`): the Runtime's own sources and CUTLASS's
-        # headers. Its CUTLASS 3.x unit peaks at 6.2 GB (cicc, sm90), the mma.sync one at 2.6.
+        # `torch.ops.cozy.int8_*` and `fp8_*` (`int8_linear`, `fp8_linear`): the Runtime's own
+        # sources and CUTLASS's headers. A CUTLASS 3.x unit peaks at 6.2 GB (cicc, sm90), the
+        # mma.sync one at 2.6.
         Recipe(
             "cozy-int8",
             "setup",

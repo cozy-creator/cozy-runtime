@@ -57,11 +57,9 @@ from cozy_runtime.internal.encoding.formats import (
     registry_digests,
 )
 from cozy_runtime.internal.encoding.leaves import (
-    ACT_SCALE_FLOOR,
     Int8ConvRotNativeLeaf,
     Nvfp4NativeLeaf,
     RowwiseNativeLeaf,
-    quantize_activation_rowwise,
 )
 from cozy_runtime.internal.encoding.selection import (
     IDENTITY_SOURCES,
@@ -85,7 +83,6 @@ from cozy_runtime.internal.encoding.selection import (
 )
 
 __all__ = [
-    "ACT_SCALE_FLOOR",
     "E4M3_MAX",
     "IDENTITY_SOURCES",
     "NAMED_SEAMS",
@@ -130,7 +127,6 @@ __all__ = [
     "launch_providers",
     "measure_device",
     "measure_runtime",
-    "quantize_activation_rowwise",
     "refuse",
     "registry_digests",
     "runtime_source_digest",
