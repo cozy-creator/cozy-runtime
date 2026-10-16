@@ -30,6 +30,7 @@ on:
       - checks/kernel_formation.py
       - checks/formation/**
       - .github/workflows/kernel-formation.yaml
+run-name: kernel-formation ${{ inputs.ref || github.head_ref }}
 
 permissions:
   contents: read
