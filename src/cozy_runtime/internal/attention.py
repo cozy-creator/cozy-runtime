@@ -1130,10 +1130,10 @@ def _projections(module: Any) -> tuple[Any, ...]:
 
 
 #: `LIKE_PROJECTIONS`, per encoded-leaf provider: the cards where attention quantized like
-#: those projections serves faster than float attention, and its kernels. int8 on sm89: Klein
-#: at 2 MP on an RTX 4090, 0.336 -> 0.258 s/step (se-067), as BFL's int8 release runs it.
+#: those projections serves faster than float attention, and its kernels. int8, Klein at 2 MP
+#: (se-067), as BFL's int8 release runs it: RTX 4090 0.336 -> 0.258 s/step, RTX 5090 0.249 -> 0.172.
 _LIKE: dict[str, tuple[frozenset[int], tuple[str, ...]]] = {
-    INT8_CONVROT: (frozenset({86, 89}), ("kitchen-int8",)),
+    INT8_CONVROT: (frozenset({86, 89, 120, 121}), ("kitchen-int8",)),
 }
 
 
