@@ -21,7 +21,8 @@ import inspect
 import json
 import logging
 import threading
-from collections.abc import Callable, Iterator, Mapping, Sequence
+import weakref
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, ExitStack
 from dataclasses import dataclass, field
 from typing import (
@@ -227,6 +228,34 @@ class Residency(Protocol):
     def release(self, method: str, components: tuple[str, ...]) -> None: ...
 
     def batch_fits(self, method: str, batch: int) -> bool: ...
+
+    def recording(self) -> AbstractContextManager[dict[str, set[Any]]]:
+        """The block modules the body runs, by component."""
+        ...
+
+    def held(self, component: str, blocks: Collection[Any]) -> AbstractContextManager[bool]:
+        """The weights of `component`'s `blocks` (modules `recording` saw) fixed at their device
+        addresses for the body (a CUDA graph may read them there), or False when they cannot
+        be."""
+        ...
+
+    def layout(self, component: str, blocks: Collection[Any]) -> tuple[object, ...]:
+        """Where `component`'s common weights and `blocks` are bound now: a graph recorded over
+        them replays only while this is unchanged."""
+        ...
+
+    def note(self, key: str, value: str) -> None:
+        """A fact about how this attempt executed, reported with its memory facts."""
+        ...
+
+
+#: A component's root module -> the residency that places it and the component's name, so a
+#: Runtime mechanism handed the module (`cozy_runtime.lm`) reaches its placement.
+PLACED: weakref.WeakKeyDictionary[object, tuple[Residency, str]] = weakref.WeakKeyDictionary()
+#: What Runtime keeps on the device between calls for speed alone (CUDA graph recordings), as
+#: callables that drop it and say whether there was any: the plane calls them before it unmaps
+#: weights for room.
+RELEASERS: list[Callable[[], bool]] = []
 
 
 class Placement(Protocol):
