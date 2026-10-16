@@ -25,8 +25,9 @@ that is not a tensor or a plain value (a cache object), with gradients, on a CPU
 capture, or under `BYPASS` (`cozy_runtime.lm` runs its own) runs as written, and so does one in
 an attention layout's scope (sparse attention reads its step), under an activation capture,
 across GPUs (every GPU's peers must replay alike), whose blocks do not all fit at home (a stage
-that streams) or whose capture fails (a run warning). The
-plane drops every recording before it unmaps a weight for room (`release`).
+that streams), or whose capture failed in `TRIES` stages (a run warning: another thread's
+device work can end a capture, so a failed one waits for the next stage). The plane drops
+every recording before it unmaps a weight for room (`release`).
 
 `capture(step, pool, stream)` is the recipe: on a side stream, in thread-local mode so the
 plane's own threads keep working while it records, and outside Runtime's dispatch modes, whose
@@ -68,6 +69,8 @@ TOLERANCE = 5e-2
 #: (a GPU that outruns the launches gains nothing from a graph), and keeps its recording only
 #: when a replay takes at most `PAYS` of the call run as written.
 HOST_BOUND, PAYS = 0.5, 0.9
+#: Stages in which a signature's capture may fail before it runs as written for good.
+TRIES = 4
 _PLAIN = (type(None), bool, int, float, str)
 _SAID: set[str] = set()
 
@@ -141,6 +144,8 @@ class _Recorder:
         #: signatures that run as written for good, and captures that failed so far
         self.failed: set[tuple[object, ...]] = set()
         self.tries: dict[tuple[object, ...], int] = {}
+        #: signatures whose capture failed in a stage, by that stage's hold: tried in the next
+        self.waiting: dict[tuple[object, ...], object] = {}
         self.recordings: dict[tuple[object, ...], _Recording] = {}
         self.pool: Any = None
         self.stream: Any = None
@@ -160,6 +165,7 @@ class _Recorder:
         self.seen.clear()
         self.failed.clear()
         self.tries.clear()
+        self.waiting.clear()
         self.recordings.clear()
         self.pool, self.pool_bytes, self.chose = None, 0, {}
 
@@ -275,7 +281,7 @@ def _dispatch(module: Any, call: Callable[..., Any], args: Any, kwargs: Any) -> 
     if placed is not None:
         residency, name = placed
         hold = residency.hold_stage(name, recorder.blocks.get(name, set()))
-    if not hold[0]:
+    if not hold[0] or recorder.waiting.get(key) is hold:
         return call(module, *args, **kwargs)
     if recorder.structure[0] is not hold:  # read once per stage hold
         recorder.structure = (hold, _structure(module))
@@ -287,7 +293,7 @@ def _dispatch(module: Any, call: Callable[..., Any], args: Any, kwargs: Any) -> 
         if not recorder.recordings:  # its pool went with its last graph
             recorder.pool = None
     if entry is None:
-        entry = _record(module, call, leaves, spec, recorder, key, layout)
+        entry = _record(module, call, leaves, spec, recorder, key, (layout, hold))
         if entry is None:
             return call(module, *args, **kwargs)
     recorder.replays += 1
@@ -303,7 +309,7 @@ def _record(
     spec: Any,
     recorder: _Recorder,
     key: tuple[object, ...],
-    layout: object,
+    at: tuple[object, object],
 ) -> _Recording | None:
     """Record the call at `key` into the component's pool, and check its first replay against
     the call run as written. None, with a run warning, when it cannot be."""
@@ -348,21 +354,24 @@ def _record(
     recorder.record_s += time.perf_counter() - started
     if graph is None:
         outputs.clear()
-        recorder.tries[key] = recorder.tries.get(key, 0) + 1
-        if recorder.tries[key] >= 2 or not why or why.startswith("its "):  # never retries
+        recorder.tries[key] = tries = recorder.tries.get(key, 0) + 1
+        if not why or why.startswith("its ") or tries >= TRIES:  # the call's own doing
             recorder.failed.add(key)
+        else:  # another thread's device work (a module load, an unmap) can end a capture
+            recorder.waiting[key] = at[1]
         if why or not recorder.recordings:
             recorder.pool = None  # spent: the next recording takes a new one
             torch.cuda.empty_cache()
         if not why:
             return None
         line = f"{type(module).__name__} runs as written at this signature: {why}"
-        say(f"graphs:{type(module).__name__}:{why[:40]}", f"[graphs] {line}")
-        WARNINGS.append(
-            ("a CUDA graph was not used", {"module": type(module).__name__, "why": why})
-        )
+        say(f"graphs:{type(module).__name__}:{tries}:{why[:40]}", f"[graphs] {line}")
+        if key in recorder.failed:
+            WARNINGS.append(
+                ("a CUDA graph was not used", {"module": type(module).__name__, "why": why})
+            )
         return None
-    entry = _Recording(graph, inputs, outputs[0], layout, served)
+    entry = _Recording(graph, inputs, outputs[0], at[0], served)
     if recorder.pool is pool:  # else the plane released the pool for room meanwhile
         recorder.pool_bytes += max(torch.cuda.memory_reserved() - reserved, 0)
         recorder.recordings[key] = entry
@@ -456,6 +465,7 @@ __all__ = [
     "HOST_BOUND",
     "PAYS",
     "TOLERANCE",
+    "TRIES",
     "capture",
     "install",
     "release",
