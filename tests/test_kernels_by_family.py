@@ -17,6 +17,7 @@ import pytest
 from cozy_runtime.author import AttentionProducer, ConformanceError, Model
 from cozy_runtime.author import _attention as author_attention
 from cozy_runtime.internal import (
+    accel,
     arch,
     attention,
     int8_linear,
@@ -152,43 +153,59 @@ def test_the_8bit_op_builds_by_row_whatever_the_lane(
     assert defines == expected
 
 
+@pytest.mark.parametrize(("builds", "code"), [({"mma.sync"}, 0), (set(), 1)])
 def test_an_unnamed_card_whose_target_takes_only_mma_sync_inherits_it(
-    tmp_path: Path, toolchain: None, monkeypatch: pytest.MonkeyPatch
+    builds: set[str],
+    code: int,
+    tmp_path: Path,
+    toolchain: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """A fake 13.0: its compiler refuses tcgen05 and wgmma. The op tries the newest family
-    first, serves the first that builds, and the row, the attention cells and the run's
-    warning follow it."""
-    store = kernel_cache.Store(tmp_path / "u1")
-    monkeypatch.setattr(kernel_cache, "_MACHINE_STORE", [store])
+    """A fake 13.0 whose compiler refuses tcgen05 and wgmma: the boot tries the newest family
+    first and lands on the first that builds. The rejected families are probes: the boot exits
+    0 with one warning; only the card's own family failing (here, every one) counts. The
+    executor's op, row, attention cells and run warning follow the same verdicts."""
     tried: list[str] = []
 
-    def compiled(_store: kernel_cache.Store, job: kernel_compile.Job) -> kernel_compile.State:
+    def verdict(_store: kernel_cache.Store, job: kernel_compile.Job, *_: str) -> Any:
         family = job.spec["row"][0]
         tried.append(family)
-        ok = family == "mma.sync"
-        return kernel_compile.State(
-            job.key.kernel, "ready" if ok else "failed", path=str(tmp_path / family)
-        )
+        state = "ready" if family in builds else "failed"
+        return kernel_compile.State(job.key.kernel, state, path=str(tmp_path / family))
 
-    monkeypatch.setattr(kernel_compile, "submit", compiled)
-    assert arch.row(130).family == "tcgen05"  # before its build: the newest candidate
-    assert int8_linear._compiled(int8_linear.OP, 130) == tmp_path / "mma.sync" / "site"
-    assert tried == ["tcgen05", "wgmma", "mma.sync"]
+    monkeypatch.setattr(kernel_compile, "submit", verdict)
+    monkeypatch.setattr(kernel_compile, "wait", verdict)
+    monkeypatch.setattr(kernel_compile, "waiting", None)
+    monkeypatch.setattr(kernel_cache, "_MACHINE_STORE", [None])
+    monkeypatch.setattr(accel, "device_capability", lambda entry: 130)
+    monkeypatch.setenv(kernel_cache.OWN_ENV, str(tmp_path / "u0"))
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-x")
+    assert arch.row(130).family == "tcgen05"  # before any build: the newest candidate
+    assert machine_kernels.main() == code
+    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert list(dict.fromkeys(tried)) == ["tcgen05", "wgmma", "mma.sync"]
+    [warning] = [row["warning"] for row in lines if "warning" in row]
+    assert warning.startswith("sm_130 (GPU-x) has no row; served as mma.sync with fp8 int8")
+    assert [row["probe"] for row in lines if "probe" in row] == ["tcgen05", "wgmma"]
+    assert (lines[-1]["kernels"], lines[-1]["failed"]) == (1, code)
+
+    monkeypatch.setattr(arch, "_LEARNED", {})
+    monkeypatch.setattr(kernel_cache, "_MACHINE_STORE", [kernel_cache.Store(tmp_path / "u1")])
+    if builds:
+        assert int8_linear._compiled(int8_linear.OP, 130) == tmp_path / "mma.sync" / "site"
+    else:
+        with pytest.raises(kernel_sources.Absent):
+            int8_linear._compiled(int8_linear.OP, 130)
+        return
     row = arch.row(130)
     assert row.inherited and (row.family, row.formats()) == ("mma.sync", _88)
     assert attention.walk(row, 8) == ["kitchen-int8", "sageattention", "sdpa"]
-    assert "sm_130 (NVIDIA X) has no row; served as mma.sync" in arch.inherited(130, "NVIDIA X")
     assert arch.inherited(90, "H100") == ""
     built, gencode, defines = _builder(
         tmp_path, 130, kernel_sources.job("cozy-int8", 130).spec["row"]
     )
     assert built[2:] == ["gemm_sm80.cu"] and gencode == "sm_130" and defines == {"MMA_SYNC"}
-    jobs = machine_kernels.jobs({130: "GPU-x"})
-    assert [j.spec["row"][0] for j in jobs if j.key.kernel == "cozy-int8"] == [
-        "tcgen05",
-        "wgmma",
-        "mma.sync",
-    ]
 
 
 # ------------------------------------------------------------------------- attention cells

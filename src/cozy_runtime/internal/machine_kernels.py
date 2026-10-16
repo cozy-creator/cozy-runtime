@@ -62,22 +62,50 @@ def boot(row: arch.Row) -> list[attention.Candidate]:
     return found
 
 
+def _job(artifact: str, sm: int, device: str, family: str = "") -> kernel_compile.Job | None:
+    try:
+        job = kernel_sources.job(artifact, sm, family=family)
+    except kernel_sources.Absent:
+        return None
+    # Upstream's setup.py builds for the cards it sees: this one.
+    return dataclasses.replace(job, env={"CUDA_VISIBLE_DEVICES": device})
+
+
 def jobs(present: Mapping[int, str]) -> list[kernel_compile.Job]:
-    """Each card architecture's attention (`boot`) and its 8-bit op, once per key; a card no row
-    names builds the op for each family it could hold, newest first (`arch.families`)."""
+    """Each card architecture's attention (`boot`) and its 8-bit op for its row, once per key."""
     found: dict[str, kernel_compile.Job] = {}
     for sm, device in sorted(present.items()):
         builds = [(c.artifact, "") for c in boot(arch.row(sm)) if c.artifact]
-        builds += [(INT8, family) for family in arch.families(sm)]
+        builds += [(INT8, arch.row(sm).family)] if arch.row(sm).family else []
         for artifact, family in builds:
-            try:
-                job = kernel_sources.job(artifact, sm, family=family)
-            except kernel_sources.Absent:
-                continue
-            # Upstream's setup.py builds for the cards it sees: this one.
-            job = dataclasses.replace(job, env={"CUDA_VISIBLE_DEVICES": device})
-            found.setdefault(job.key.digest, job)
+            job = _job(artifact, sm, device, family)
+            if job is not None:
+                found.setdefault(job.key.digest, job)
     return list(found.values())
+
+
+def inherit(store: kernel_cache.Store, present: Mapping[int, str]) -> list[str]:
+    """Each card no row names (§2.6): its 8-bit op built for each family it could hold in turn,
+    newest first; the first that builds is the card's (`arch.learn`), else mma.sync. A family
+    rejected on the way is a probe, not a failure: only the card's own is counted, with the
+    rest (`jobs`). One warning per card."""
+    warnings: list[str] = []
+    for sm, device in sorted(present.items()):
+        families = arch.families(sm)
+        if sm in arch.ROWS or not families:
+            continue
+        landed = families[-1]
+        for family in families[:-1]:
+            job = _job(INT8, sm, device, family)
+            state = kernel_compile.wait(store, job) if job is not None else None
+            if state is not None:
+                print(json.dumps({**state.document(), "probe": family}), flush=True)
+            if state is not None and state.state == "ready":
+                landed = family
+                break
+        arch.learn(sm, landed)
+        warnings.append(arch.inherited(sm, device))
+    return warnings
 
 
 def sol_objects(store: kernel_cache.Store, present: Mapping[int, str]) -> list[kernel_compile.Job]:
@@ -122,6 +150,8 @@ def main() -> int:
     if store is not None and present:
         kernel_cache.configure(store)
         kernel_compile.waiting = progress
+        for warning in inherit(store, present):
+            print(json.dumps({"warning": warning}), flush=True)
         built = jobs(present)
         for job in built:
             kernel_compile.submit(store, job)
