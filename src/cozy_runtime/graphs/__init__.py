@@ -7,10 +7,12 @@ address, so a graph that reads weights stays valid while they are bound there: n
 between calls.
 
 The first call of each signature runs as written, through the paging hooks, which record the
-blocks it reads. At the second, the stage holds those blocks at their homes
-(`Residency.hold_stage`), the call is recorded into the component's one memory pool with its
-tensor inputs in static buffers, and the first replay is checked against the call run as
-written: on a mismatch that signature runs as written from then on, with a run warning. Every
+blocks it reads; one whose GPU work outlasts its launches (`HOST_BOUND`) runs as written for
+good, since a graph saves only launches. At the second, the stage holds those blocks at their
+homes (`Residency.hold_stage`), the call is recorded into the component's one memory pool with
+its tensor inputs in static buffers, and the first replay is checked against the call run as
+written: on a mismatch that signature runs as written from then on, with a run warning, and a
+recording that is not faster (`PAYS`) is dropped with its memory. Every
 later call copies its inputs in, replays, and returns clones of the outputs (a multistep
 scheduler keeps earlier ones). Recordings outlive the request: a later one at the same signature
 replays from its first call while the weights are bound where they were and the module runs the
@@ -34,6 +36,7 @@ every replay.
 
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import sys
 import time
@@ -58,6 +61,10 @@ except ImportError:  # pragma: no cover - the base package is torch-free
 BYPASS: contextvars.ContextVar[bool] = contextvars.ContextVar("cozy_graphs_bypass", default=False)
 #: The first replay's largest relative L2 distance from the call run as written.
 TOLERANCE = 1e-3
+#: A signature records only when its first call's launches took at least this share of its time
+#: (a GPU that outruns the launches gains nothing from a graph), and keeps its recording only
+#: when a replay takes at most `PAYS` of the call run as written.
+HOST_BOUND, PAYS = 0.5, 0.9
 _PLAIN = (type(None), bool, int, float, str)
 _SAID: set[str] = set()
 
@@ -136,7 +143,7 @@ class _Recorder:
         self.stream: Any = None
         #: the stage hold its structure was read under, and that structure
         self.structure: tuple[object, tuple[object, ...]] = (None, ())
-        self.pool_bytes = self.replays = 0
+        self.pool_bytes = self.replays = self.plain = 0
         self.record_s = 0.0
 
 
@@ -229,10 +236,15 @@ def _dispatch(module: Any, call: Callable[..., Any], args: Any, kwargs: Any) -> 
     if key not in recorder.seen:
         # The first call of a signature: as written, through the hooks, which record its blocks.
         recorder.seen.add(key)
-        if placed is None:
-            return call(module, *args, **kwargs)
-        with placed[0].recording() as read:
+        torch.cuda.synchronize()
+        started = time.perf_counter()
+        with placed[0].recording() if placed else contextlib.nullcontext({}) as read:
             out = call(module, *args, **kwargs)
+        launched = time.perf_counter() - started
+        torch.cuda.synchronize()
+        if launched < HOST_BOUND * (time.perf_counter() - started):
+            recorder.failed.add(key)
+            recorder.plain += 1
         for name, blocks in read.items():
             recorder.blocks.setdefault(name, set()).update(blocks)
         return out
@@ -289,9 +301,12 @@ def _record(
         replayed = [
             v.float() for v in pytree.tree_leaves(outputs[0]) if isinstance(v, torch.Tensor)
         ]
+        written: list[Any] = []
         with attention_ulysses.observing() as served:
-            out = call(module, *cargs, **ckwargs)
-        written = [v.float() for v in pytree.tree_leaves(out) if isinstance(v, torch.Tensor)]
+            written_s = _seconds(
+                lambda: written.extend(pytree.tree_leaves(call(module, *cargs, **ckwargs)))
+            )
+        written = [v.float() for v in written if isinstance(v, torch.Tensor)]
         error = max(
             (
                 float((a - b).norm() / b.norm().clamp_min(1e-12))
@@ -301,13 +316,20 @@ def _record(
         )
         if len(replayed) != len(written) or not error <= TOLERANCE:
             graph, why = None, f"its first replay is {error:.2e} from the call run as written"
+        elif _seconds(graph.replay) > PAYS * written_s:
+            graph, why = None, ""  # as fast as written: not worth its memory
     recorder.record_s += time.perf_counter() - started
     if graph is None:
+        outputs.clear()
         recorder.tries[key] = recorder.tries.get(key, 0) + 1
-        if recorder.tries[key] >= 2 or why.startswith("its "):  # a wrong replay never retries
+        if recorder.tries[key] >= 2 or not why or why.startswith("its "):  # never retries
             recorder.failed.add(key)
-        recorder.pool = None  # spent: the next recording takes a new one
-        torch.cuda.empty_cache()
+        if why or not recorder.recordings:
+            recorder.pool = None  # spent: the next recording takes a new one
+            torch.cuda.empty_cache()
+        if not why:
+            recorder.plain += 1
+            return None
         line = f"{type(module).__name__} runs as written at this signature: {why}"
         say(f"graphs:{type(module).__name__}:{why[:40]}", f"[graphs] {line}")
         WARNINGS.append(
@@ -324,8 +346,17 @@ def _record(
 def _facts(recorder: _Recorder) -> str:
     return (
         f"{len(recorder.recordings)} recorded in {recorder.record_s:.2f} s, "
+        f"{recorder.plain} as fast as written, "
         f"{recorder.replays} replays, pool {recorder.pool_bytes >> 20} MiB"
     )
+
+
+def _seconds(step: Callable[[], object]) -> float:
+    torch.cuda.synchronize()
+    started = time.perf_counter()
+    step()
+    torch.cuda.synchronize()
+    return time.perf_counter() - started
 
 
 def _clonable(out: Any) -> bool:
@@ -359,4 +390,4 @@ def _signature(module: Any, leaves: list[Any], spec: Any) -> tuple[object, ...]:
     return tuple(key)
 
 
-__all__ = ["BYPASS", "TOLERANCE", "capture", "install", "release", "say"]
+__all__ = ["BYPASS", "HOST_BOUND", "PAYS", "TOLERANCE", "capture", "install", "release", "say"]
