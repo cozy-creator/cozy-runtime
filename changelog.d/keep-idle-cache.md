@@ -1,0 +1,1 @@
+Torch's idle cache stays until a stage's weights need its room: a request no longer maps and unmaps its VAE decode's activations again (45 ms on an RTX 5090, seconds on a host whose driver maps slowly).
