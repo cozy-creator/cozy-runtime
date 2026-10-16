@@ -784,6 +784,14 @@ def _sol_route(device: DeviceFacts) -> None:
         route = attention_sol.backend(device.index)
         if route == "fa4_block_sparse":
             _import(known()["flash-attn4"])
+            try:
+                import_module("cozy_runtime.internal.attention_sol_fa4").warm(device.index)
+            except Exception as exc:
+                raise AttentionRefusal(
+                    "attention_kernel_launch_failed",
+                    f"sol-attn's FA4 block-sparse route did not build on {device.name}: "
+                    f"{type(exc).__name__}: {exc}"[:600],
+                ) from exc
         elif not route.startswith("cute_"):
             raise AttentionRefusal(
                 "attention_kernel_absent",
