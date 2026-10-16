@@ -105,7 +105,7 @@ def discover_installed(application: str, *, seconds: float | None = IMPORT_SECON
     or adding a host path would recreate the source/PYTHONPATH authority the fixed worker rejects.
     """
 
-    return _discover(application, Path("/"), {}, seconds=seconds, add=None)
+    return _discover(application, Path("/"), seconds=seconds, add=None)
 
 
 def discover_distribution(
