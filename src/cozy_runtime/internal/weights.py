@@ -3762,6 +3762,9 @@ class WeightResidency:
     def note(self, key: str, value: str) -> None:
         self.weights.modes[key] = value
 
+    def allocatable(self) -> int:
+        return self.weights.allocatable()
+
     def hold_stage(self, name: str, blocks: Collection[Module]) -> tuple[bool, tuple[object, ...]]:
         """`held` for the rest of the open stage, entered once per component: whether it holds,
         and the layout it holds them at."""

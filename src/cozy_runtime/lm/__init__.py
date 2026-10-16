@@ -16,7 +16,9 @@ stop flag a few steps behind.
 A graph reads the weights at their plane homes: a weight set keeps one device address range for
 its life, and a refill maps a region back at the same address. For the loop Runtime leases every
 block the step reads at home and turns their paging hooks off (`Residency.held`). Where they do
-not all fit, on a CPU, or when a capture fails, the same step runs eagerly. A model this does not
+not all fit, or the device has no room for a graph's pool beside them, the call decodes
+through Transformers' loop, and so does one that runs out of device memory; on a CPU, or after a
+capture fails (a run warning), the same step runs eagerly. A model this does not
 serve (a layer type other than full or linear attention, an attention other than SDPA or eager, a
 generation config that adds logits processors) generates through Transformers, said once.
 """
@@ -28,12 +30,12 @@ import sys
 import time
 import weakref
 from collections import deque
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
-from cozy_runtime.author._model import PLACED, RELEASERS
+from cozy_runtime.author._model import PLACED, RELEASERS, WARNINGS
 from cozy_runtime.author.kernels import KernelsUnavailable, Launch, Plan, TritonKernels
-from cozy_runtime.graphs import BYPASS, capture, say
+from cozy_runtime.graphs import BYPASS, ROOM, allocated, capture, say
 from cozy_runtime.lm import _kernels
 
 try:
@@ -56,8 +58,6 @@ else:
 MIN_WINDOW = 256
 #: Steps the host may queue ahead of the stop flag it last read.
 LAG = 2
-#: Captures tried per window; an eager step runs between them.
-CAPTURES = 2
 #: A placed model's decode blocks, as its first call's first step ran them: later calls hold
 #: them before their prefill.
 _READS: weakref.WeakKeyDictionary[Any, frozenset[Any]] = weakref.WeakKeyDictionary()
@@ -132,6 +132,35 @@ def _generate(
     filler: int,
     presence_penalty: float,
 ) -> Any:
+    try:
+        # Outside Runtime's per-op dispatch: its recovery would journal, spill or band the
+        # session's buffers, which its graphs read by address and later calls reuse. Room the
+        # step cannot get ends the static path, not the call.
+        with _disable_current_modes():
+            tokens = _static(model, inputs, max_new_tokens, stops, filler, presence_penalty)
+        if tokens is not None:
+            return tokens
+        why = "its decode set does not fit at home"
+    except torch.OutOfMemoryError as exc:
+        why = f"OutOfMemoryError: {exc}".splitlines()[0][:300]
+    _SESSIONS.pop(model, None)  # its buffers go back before Transformers' loop needs the room
+    torch.cuda.empty_cache()
+    say(f"lm:{type(model).__name__}:{why[:30]}", f"[lm] {type(model).__name__}: {why}")
+    WARNINGS.append(("decode ran through Transformers' loop", {"why": why}))
+    # Transformers' own loop under Runtime's recovery, which makes room op by op.
+    return _transformers(model, inputs, max_new_tokens, stops, filler, presence_penalty)
+
+
+def _static(
+    model: Any,
+    inputs: Mapping[str, Any],
+    max_new_tokens: int,
+    stops: list[int],
+    filler: int,
+    presence_penalty: float,
+) -> Any:
+    """The tokens from the static cache, replayed where its blocks are held at home; None when
+    they do not all fit there."""
     ids = inputs["input_ids"]
     prompt, cuda = int(ids.shape[1]), ids.is_cuda
     # Prompts within one window step share a session (its buffers and graphs).
@@ -146,12 +175,13 @@ def _generate(
     )
     decode = _SESSIONS.get(model)
     if decode is None or decode.key != key:
+        _SESSIONS.pop(model, None)
         decode = _SESSIONS[model] = _Decode(model, key, presence_penalty)
     decode.begin(inputs, stops, filler)
     placed = PLACED.get(model)
     if placed is None:  # a module Runtime does not place: its tensors stay where they are
         decode.prefill()
-        return decode.run(graphs=cuda, layout=())
+        return decode.run(graphs=cuda, layout=(), room=None)
     residency, name = placed
     blocks = _READS.get(model)
     if blocks is None:
@@ -161,21 +191,13 @@ def _generate(
         with residency.recording() as read:
             decode.first()
         blocks = _READS[model] = frozenset(read.get(name, ()))
-        with residency.held(name, blocks) as held:
-            if held:
-                return decode.run(graphs=True, layout=residency.layout(name, blocks))
-    else:
-        with residency.held(name, blocks) as held:
-            if held:
-                decode.prefill()
-                return decode.run(graphs=True, layout=residency.layout(name, blocks))
-    # They do not all fit at home beside what this stage holds: Transformers' own loop
-    # streams them, which a static cache's recovery copies would only slow down.
-    say(
-        f"held:{type(model).__name__}",
-        f"[lm] {type(model).__name__}: no graphs, decode set does not fit",
-    )
-    return _transformers(model, inputs, max_new_tokens, stops, filler, presence_penalty)
+    with residency.held(name, blocks) as held:
+        if not held:
+            return None
+        if not decode.made:
+            decode.prefill()
+        layout = residency.layout(name, blocks)
+        return decode.run(graphs=True, layout=layout, room=residency.allocatable)
 
 
 def install(plan: Plan, model: Any) -> str:
@@ -526,6 +548,8 @@ class _Decode:
         self.layout: tuple[object, ...] | None = None
         self.pool: Any = None
         self.side: Any = None
+        #: bytes an eager step allocates (`_measured`): what a capture's pool takes, about
+        self.need = 0
 
     def begin(self, inputs: Mapping[str, Any], stops: list[int], pad: int) -> None:
         self.inputs = inputs
@@ -564,15 +588,10 @@ class _Decode:
             self.cache.reset()
             return model(**prepared, return_dict=True).logits[:, -1]
 
-        try:
-            # Outside Runtime's per-op dispatch, as a paging hook runs a block that writes
-            # nothing it did not make: held blocks have no hook (2.2k image tokens: 1.09 s
-            # under it, 0.49 s without, on a 4090).
-            with _disable_current_modes():
-                logits = forward()
-        except torch.OutOfMemoryError:
-            torch.cuda.empty_cache()
-            logits = forward()  # again under the recovery, which makes room op by op
+        # Outside Runtime's per-op dispatch (the caller's), as a paging hook runs a block that
+        # writes nothing it did not make: held blocks have no hook (2.2k image tokens: 1.09 s
+        # under it, 0.49 s without, on a 4090).
+        logits = forward()
         if position is not None:
             following = position[..., -1:] + 1
             if self.position is None or self.position.shape != following.shape:
@@ -602,7 +621,7 @@ class _Decode:
         started = time.perf_counter()
         if self.made < self.max_new_tokens and not bool(self.flag):
             self.cache.window = window(self.prompt + self.made, self.capacity)
-            self.step()
+            self._measured()
             self.made += 1
             if self.ids.is_cuda:
                 torch.cuda.current_stream().synchronize()
@@ -643,10 +662,12 @@ class _Decode:
         if self.position is not None:
             self.position.add_(1)
 
-    def run(self, graphs: bool, layout: tuple[object, ...]) -> Any:
+    def run(self, graphs: bool, layout: tuple[object, ...], room: Callable[[], int] | None) -> Any:
         """The steps after the prefill (and the first step, if it ran): each window's recorded
-        once and replayed when `graphs` (over weights bound at `layout`), else eager. Returns
-        the new tokens."""
+        once and replayed when `graphs` (over weights bound at `layout`), else eager. A window
+        records only while `room()` (device bytes torch can take without unmapping a weight)
+        is `ROOM` times what an eager step allocates; after a capture fails, the call's steps
+        run eagerly. Returns the new tokens."""
         cuda = self.ids.is_cuda
         captures, capture_s, looped = 0, 0.0, self.made
         began = time.perf_counter()
@@ -657,26 +678,29 @@ class _Decode:
             if self.pool is not None:
                 torch.cuda.empty_cache()
             self.pool, self.side = torch.cuda.graph_pool_handle(), torch.cuda.Stream()
-        recorded, pool, side = self.graphs, self.pool, self.side
-        tries: dict[int, int] = {}
+        recorded = self.graphs
         queued: deque[Any] = deque()
         while self.made < self.max_new_tokens and not (self.made == 1 and bool(self.flag)):
             size = window(self.prompt + self.made, self.capacity)
             self.cache.window = size
-            if graphs and recorded.get(size) is None and tries.get(size, 0) < CAPTURES:
-                # One more try after an eager step: a capture that ran out of memory leaves its
-                # pool spent, and the eager step's recovery makes room.
-                capturing = time.perf_counter()
-                recorded[size] = self._capture(pool, side)
-                if recorded[size] is None:
-                    torch.cuda.empty_cache()
-                    pool = self.pool = torch.cuda.graph_pool_handle()
-                tries[size] = tries.get(size, 0) + 1
-                capture_s += time.perf_counter() - capturing
-                captures += 1
             graph = recorded.get(size)
+            if graph is None and graphs and self.need and not self.failed:
+                free = room() if room is not None else ROOM * self.need
+                if free < ROOM * self.need:
+                    self.failed = (
+                        f"no room: {free >> 20} MiB free, a step allocates {self.need >> 20} MiB"
+                    )
+                else:
+                    capturing = time.perf_counter()
+                    graph = self._capture()
+                    if graph is not None:
+                        recorded[size] = graph
+                    capture_s += time.perf_counter() - capturing
+                    captures += 1
             if graph is not None:
                 graph.replay()
+            elif graphs and not self.need:
+                self._measured()
             else:
                 self.step()
             self.made += 1
@@ -694,10 +718,9 @@ class _Decode:
         if cuda:
             torch.cuda.current_stream().synchronize()
         loop_s, looped = time.perf_counter() - began, self.made - looped
-        mode = "graphs" if graphs else "eager"
-        if graphs and None in recorded.values():
-            mode = "partly eager: a capture failed"
-            self.graphs = {size: g for size, g in recorded.items() if g is not None}
+        mode = (
+            "graphs" if graphs and not self.failed else "eager" if not captures else "partly eager"
+        )
         tokens = self.out[:, : self.made]
         hit = (tokens[..., None] == self.stops).any(-1)
         if bool(hit.any(-1).all()):
@@ -718,13 +741,24 @@ class _Decode:
             placed[0].note(f"{placed[1]}.lm", self.facts)
         return tokens
 
-    def _capture(self, pool: Any, side: Any) -> Any:
-        """The step at the current window as a CUDA graph, or None (said once): it then runs
-        eagerly."""
-        graph, why = capture(self.step, pool, side)
+    def _measured(self) -> None:
+        """An eager step, and what it allocates: about what its graph's pool takes."""
+        before = allocated(self.ids.device)
+        self.step()
+        self.need = max(self.need, allocated(self.ids.device) - before)
+
+    def _capture(self) -> Any:
+        """The step at the current window as a CUDA graph, or None, with a run warning: the
+        call's steps then run eagerly, and the next call records into a fresh pool. A capture
+        executes nothing, so the buffers are as they were."""
+        graph, why = capture(self.step, self.pool, self.side)
         if graph is None:
-            self.failed = self.failed or why
+            self.failed, self.pool = why, None
+            torch.cuda.empty_cache()
             say(f"capture:{type(self.model).__name__}", f"[lm] capture failed: {why}")
+            WARNINGS.append(
+                ("a CUDA graph was not used", {"module": type(self.model).__name__, "why": why})
+            )
         return graph
 
 
