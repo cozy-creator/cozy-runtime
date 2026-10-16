@@ -26,7 +26,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import cast
 
-from cozy_runtime.author.kernels import readable
+from cozy_runtime.author.kernels import INT8_CONVROT, PreQuantized, readable
 from cozy_runtime.internal import kernel_cache, kernel_compile, kernel_sources
 from cozy_runtime.internal.encoding.formats import CONVROT_GROUP, Tensor, hadamard256
 
@@ -36,6 +36,8 @@ OP = "cozy-int8"
 KITCHEN_SMS = frozenset({80, 86, 87, 89, 90, 100, 103, 110, 120, 121})
 #: How often a leaf asks whether a running build has landed: resolution, never a verdict.
 POLL_SECONDS = 1.0
+#: The op's one-launch GEMV takes this many rows (`kGemvRows`): it rotates them itself.
+GEMV_ROWS = 4
 
 
 @dataclass(slots=True)
@@ -171,6 +173,33 @@ def linear(
                 )
     out = eager(torch, x, data, scale, out_dtype)
     return out if bias is None else out + bias.to(out.dtype)
+
+
+def quantize(torch: ModuleType, x: Tensor) -> PreQuantized | None:
+    """`x` rotated and quantized once for several int8 leaves (`kernels.quantize_once`), or None
+    where each leaf's own call serves it: no op on this card yet, or the GEMV's few rows."""
+    if not x.is_cuda or x.dtype not in _HALF or x.numel() <= GEMV_ROWS * x.shape[-1]:
+        return None
+    if _OPS.get(x.get_device()) is None:
+        return None
+    payload, scale = torch.ops.cozy.int8_quantize.default(x)
+    return PreQuantized(payload, scale, tuple(x.shape), INT8_CONVROT)
+
+
+def gemm(
+    torch: ModuleType,
+    operand: PreQuantized,
+    data: Tensor,
+    scale: Tensor,
+    bias: Tensor | None,
+    out_dtype: object,
+) -> Tensor:
+    """The linear of a `quantize`d operand: the op's GEMM, both scales and the bias in its
+    epilogue."""
+    out = torch.ops.cozy.int8_gemm.default(
+        operand.payload, operand.scale, data, scale, bias, out_dtype
+    )
+    return out.view(*operand.shape[:-1], -1)
 
 
 def eager(torch: ModuleType, x: Tensor, data: Tensor, scale: Tensor, out_dtype: Tensor) -> Tensor:

@@ -34,6 +34,7 @@ import msgspec
 
 from cozy_runtime.author._attention import _PRODUCERS, AttentionContext, AttentionProducer
 from cozy_runtime.author._attention_scope import _EXPECTED
+from cozy_runtime.author.kernels import quantize_once
 from cozy_runtime.internal import (
     accel,
     attention_kitchen_sol,
@@ -943,12 +944,13 @@ class ClassicSdpa:
             attention_mask = attention_mask.view(batch, attn.heads, -1, attention_mask.shape[-1])
         if attn.group_norm is not None:
             hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
-        query = attn.to_q(hidden_states)
         if encoder_hidden_states is None:
             encoder_hidden_states = hidden_states
         elif attn.norm_cross:
             encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
-        key, value = attn.to_k(encoder_hidden_states), attn.to_v(encoder_hidden_states)
+        with quantize_once(hidden_states, encoder_hidden_states):
+            query = attn.to_q(hidden_states)
+            key, value = attn.to_k(encoder_hidden_states), attn.to_v(encoder_hidden_states)
         head_dim = key.shape[-1] // attn.heads
         query, key, value = (x.view(batch, -1, attn.heads, head_dim) for x in (query, key, value))
         if attn.norm_q is not None:
