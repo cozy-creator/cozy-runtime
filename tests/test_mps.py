@@ -45,6 +45,7 @@ from cozy_runtime.internal.executor_commands import (  # noqa: E402
     Start,
 )
 from cozy_runtime.internal.seam import RESULT_DOCUMENT, Channel  # noqa: E402
+from cozy_runtime.internal.weights import Weights  # noqa: E402
 from fetch_hub import COMPONENTS, Hub, write  # noqa: E402
 
 pytestmark = pytest.mark.real_gpu
@@ -88,6 +89,21 @@ def test_the_accelerator_boundary_on_the_apple_gpu() -> None:
     refused.append(f"{type(pool.value).__name__}: {str(pool.value)[:200]}")
     assert is_device_oom(raised.value) and is_device_oom(pool.value), refused
     _record("oom", {"refusals": refused})
+
+
+def test_attention_runs_inside_the_recovery_mode() -> None:
+    """Every op of an attempt runs inside Runtime's out-of-memory recovery (a dispatch mode),
+    where SDPA asks for its kernel through an op MPS lacks: it gets MPS's own attention."""
+    weights = Weights(torch, torch.device("mps"), "mps")
+    q, k, v = (torch.randn(2, 10, 4096, 64, device="mps", dtype=torch.float16) for _ in range(3))
+    plain = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+    with weights.recovering():
+        recovered = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+    assert torch.equal(plain, recovered)
+    reference = torch.nn.functional.scaled_dot_product_attention(
+        q.cpu().float(), k.cpu().float(), v.cpu().float()
+    )
+    assert (recovered.cpu().float() - reference).norm() / reference.norm() < 2e-3
 
 
 SOURCE = """

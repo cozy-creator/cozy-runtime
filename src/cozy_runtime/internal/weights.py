@@ -1832,6 +1832,10 @@ def _ops_type(torch: ModuleType) -> type:
     pointwise = torch.Tag.pointwise
     #: op -> whether it draws from a generator, writes in place, is pointwise
     traits: dict[Any, tuple[bool, bool, bool]] = {}
+    #: SDPA asks this op for its kernel only under a dispatch mode, and MPS has none for it:
+    #: there the answer is the math route, which on MPS is its own fused attention
+    sdp_choice = torch.ops.aten._fused_sdp_choice.default
+    math = int(torch.nn.attention.SDPBackend.MATH.value)
 
     class Ops(mode):  # type: ignore[misc]
         """Every torch op, in one dispatch layer. With `weights`, one that runs out of device
@@ -1855,6 +1859,8 @@ def _ops_type(torch: ModuleType) -> type:
             self, func: Any, types: Any, args: tuple[Any, ...] = (), kwargs: Any = None
         ) -> Any:
             kwargs = kwargs or {}
+            if func is sdp_choice and args[0].is_mps:
+                return math
             out = self._run(func, args, kwargs)
             if spill.PRESSED[0]:
                 spill.touch((*args, *kwargs.values(), out))
