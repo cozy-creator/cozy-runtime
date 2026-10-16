@@ -41,7 +41,7 @@ ROWS = {
     100: ("tcgen05", _884),
     103: ("tcgen05", frozenset({"fp8", "fp4"})),
     120: ("mma.sync", _884),
-    121: ("mma.sync", _884),
+    121: ("mma.sync", frozenset({"int8", "fp4"})),  # fp8 gated until a 12.1 card proves it
 }
 
 
@@ -132,7 +132,7 @@ GEMM = {
     100: ("sm_100a", [_TMA, _FP8]),
     103: ("sm_103a", [_MMA, _FP8]),
     120: ("sm_120a", [_MMA, _FP8]),
-    121: ("sm_121a", [_MMA, _FP8]),
+    121: ("sm_121", [_MMA]),
     110: ("sm_110a", [_TMA, _FP8]),  # Thor inherits tcgen05
 }
 
@@ -142,7 +142,7 @@ def test_the_8bit_op_builds_by_row_whatever_the_lane(
     sm: int, tmp_path: Path, toolchain: None
 ) -> None:
     """One op library per card serves every lane (int8, fp8), built for the row's family:
-    12.1 and an unnamed 11.0 take their family's GEMMs."""
+    an unnamed 11.0 takes its family's GEMMs; 12.1 builds no fp8 GEMM until proven."""
     job = kernel_sources.job(machine_kernels.INT8, sm)
     assert json.loads(job.key.inputs)["row"] == job.spec["row"]
     built, gencode, defines = _builder(tmp_path, sm, job.spec["row"])
@@ -240,7 +240,23 @@ CELLS: dict[int, dict[int, tuple[list[str], list[str]]]] = {
     100: {16: (["cudnn", "sdpa"], ["sol-attn", "cudnn", "sdpa"]), 8: _BLACKWELL_8, 4: _BLACKWELL_8},
     120: {16: (["sdpa"], ["sol-attn", "sdpa"]), 8: _ADA_8, 4: _RTX_4},
 }
-CELLS[80], CELLS[103], CELLS[121] = CELLS[86], CELLS[100], CELLS[120]
+CELLS[80], CELLS[103] = CELLS[86], CELLS[100]
+#: GB10, fp8 gated: no Sage2 (fp8 P/V) and no Sol (its fp8 rows' route); fp4 cells stay.
+CELLS[121] = {
+    16: (["sdpa"], ["sdpa"]),
+    8: (["kitchen-int8", "sdpa"], ["kitchen-sol", "kitchen-int8", "sdpa"]),
+    4: (
+        ["sageattention3-fp4", "kitchen-int8", "sdpa"],
+        [
+            "kitchen-sol-fp4-fixed-means",
+            "kitchen-sol-fp4-lowmem",
+            "sageattention3-fp4",
+            "kitchen-sol",
+            "kitchen-int8",
+            "sdpa",
+        ],
+    ),
+}
 
 
 @pytest.mark.parametrize("sm", sorted(CELLS))
@@ -285,6 +301,7 @@ BOOT = {
     100: {_PY},
     103: {_PY},
     120: {_PY, "comfy-kitchen", "sageattn3"},
+    121: {"comfy-kitchen", "sageattn3"},
 }
 
 
