@@ -646,7 +646,7 @@ class Nvfp4NativeLeaf:
         return 3 * rows * cols
 
     @staticmethod
-    def _forward(leaf: Tensor, x: Tensor) -> Tensor:
+    def _forward(leaf: Tensor, x: Tensor, out_dtype: Tensor) -> Tensor:
         import torch
 
         rows, cols = leaf.out_features, leaf.in_features // NVFP4_BLOCK
@@ -657,7 +657,7 @@ class Nvfp4NativeLeaf:
             leaf.weight_scale,
             lambda: from_blocked(torch, leaf.weight_scale, rows, cols),
             leaf.weight_scale_2,
-            leaf.out_dtype,
+            out_dtype,
         )
 
     def leaf(
