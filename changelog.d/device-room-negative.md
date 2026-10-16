@@ -1,0 +1,1 @@
+An executor never asks the machine for a negative number of device bytes: giving back a small shared holding under pressure computed `free + shared - margin` below zero (-22 MiB), which the machine could not read and the executor ended (run 10078, a 16 GB card). Non-positive asks are not sent.

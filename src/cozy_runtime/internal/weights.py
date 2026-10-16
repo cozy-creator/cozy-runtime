@@ -561,7 +561,11 @@ class Weights:
             self.limit_torch()
         if shared and self.room is not None:
             free = accel.allocation(self.torch, self.kind)["driver_free_bytes"] - self.floor_free
-            self.room(max(free, 0) + shared - weight_policy.MARGIN)
+            # Under pressure (nothing free, a small holding) there is nothing worth asking for:
+            # 42 MiB shared less the margin once asked for -22 MiB (run 10078).
+            ask = max(free, 0) + shared - weight_policy.MARGIN
+            if ask > 0:
+                self.room(ask)
         self.paged_out[0] += 1
         self.paged_out[1] += own + shared
         return True

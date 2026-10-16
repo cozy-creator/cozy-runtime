@@ -4300,7 +4300,10 @@ class Executor:
     def _device_room(self, free_bytes: int) -> None:
         """Ask the worker for `free_bytes` free on this GPU from its other tenants; it answers
         once they gave what they could, with this process's cap raised into that room when it
-        holds one (an older worker refuses, and nothing changes)."""
+        holds one (an older worker refuses, and nothing changes). An ask for no bytes is no
+        ask: the machine reads a byte count as unsigned."""
+        if free_bytes <= 0:
+            return
         held = self.weights._held()[1] if self.weights is not None else -1
         answer = self._durable(DeviceRoom(free_bytes=free_bytes, holding_bytes=held), Room)
         if answer.ok and answer.cap_bytes >= 0 and self.weights is not None:
