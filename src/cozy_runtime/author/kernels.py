@@ -10,7 +10,8 @@ waits for that build and returns the launcher. A request never compiles, and a l
 weight operand the plane has not mapped (`readable`).
 
 Also public here: the operand an encoded leaf takes already quantized (`PreQuantized`), a scope
-in which the leaves that read one activation quantize it once (`quantize_once`), and the
+in which the leaves that read one activation quantize it once (`quantize_once`), a producer's
+norm, modulation and activation folded into that quantization (`int8_rows`), and the
 Runtime's compiled CUDA kernels (`rms_rope_split_half`), which ride its linux x86 cp312-abi3
 wheel.
 """
@@ -178,6 +179,32 @@ def shared_operand(
     return None
 
 
+def int8_rows(
+    x: Any,
+    consumers: tuple[Any, ...],
+    *,
+    norm: str | None = None,
+    eps: float = 0.0,
+    scale: Any = None,
+    shift: Any = None,
+    activation: str | None = None,
+) -> PreQuantized | None:
+    """The rows a producer would hand `consumers`, `activation(norm(x) * (1 + scale) + shift)`,
+    rotated and quantized for int8 in one pass of the Runtime's op: pass the result to each
+    consumer in place of its input. Each part is optional: `norm` "layer" or "rms" (no affine),
+    `activation` "gelu" or "gelu_tanh"; `scale` and `shift` are `[..., width]` tables, and x's
+    row r reads table row `r // (x rows / table rows)`.
+
+    None unless every consumer is an un-hooked int8 encoded leaf of x's width and the op serves
+    this card: the caller then runs its own ops."""
+    if not consumers or getattr(consumers[0], "provider", None) != INT8_CONVROT:
+        return None
+    rows: PreQuantized | None = consumers[0].int8_prologue(
+        x, consumers, norm=norm, eps=eps, scale=scale, shift=shift, activation=activation
+    )
+    return rows
+
+
 def native() -> str:
     """Why this Runtime has no compiled CUDA kernels here, or "" when it has them."""
     if find_spec("cozy_runtime._kernels._C") is None:
@@ -226,6 +253,7 @@ __all__ = [
     "PreQuantized",
     "TritonEntry",
     "TritonKernels",
+    "int8_rows",
     "native",
     "quantize_once",
     "readable",

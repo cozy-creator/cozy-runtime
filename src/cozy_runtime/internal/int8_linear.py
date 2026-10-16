@@ -178,6 +178,45 @@ def quantize(torch: ModuleType, x: Tensor) -> PreQuantized | None:
     return PreQuantized(payload, scale, tuple(x.shape), INT8_CONVROT)
 
 
+#: `torch.ops.cozy.int8_quantize`'s prologue codes (`cozy_int8::Prologue`).
+NORMS = {None: 0, "layer": 1, "rms": 2}
+ACTIVATIONS = {None: 0, "gelu": 1, "gelu_tanh": 2}
+
+
+def prologue(
+    torch: ModuleType,
+    x: Tensor,
+    consumers: tuple[object, ...],
+    *,
+    norm: str | None,
+    eps: float,
+    scale: Tensor | None,
+    shift: Tensor | None,
+    activation: str | None,
+) -> PreQuantized | None:
+    """`activation(norm(x) * (1 + scale) + shift)`, rotated and quantized in one pass, when each
+    of `consumers` is an un-hooked int8 leaf of x's width the op serves on this card; else None."""
+    if not x.is_cuda or x.dtype not in _HALF or _OPS.get(x.get_device()) is None:
+        return None
+    if any(t is not None and t.dtype != x.dtype for t in (scale, shift)):
+        return None  # eager promotes the rows to the table's dtype
+    hooks = torch.nn.modules.module
+    if hooks._global_forward_hooks or hooks._global_forward_pre_hooks:
+        return None
+    for module in consumers:
+        if (
+            getattr(module, "provider", None) != INT8_CONVROT
+            or getattr(module, "in_features", None) != x.shape[-1]
+            or module._forward_hooks  # type: ignore[attr-defined]
+            or module._forward_pre_hooks  # type: ignore[attr-defined]
+        ):
+            return None
+    payload, row_scale = torch.ops.cozy.int8_quantize.default(
+        x, scale, shift, NORMS[norm], eps, ACTIVATIONS[activation]
+    )
+    return PreQuantized(payload, row_scale, tuple(x.shape), INT8_CONVROT)
+
+
 def gemm(
     torch: ModuleType,
     operand: PreQuantized,
