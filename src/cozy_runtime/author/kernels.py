@@ -200,7 +200,7 @@ def int8_rows(
     if not consumers or getattr(consumers[0], "provider", None) != INT8_CONVROT:
         return None
     rows: PreQuantized | None = consumers[0].int8_prologue(
-        x, consumers, norm=norm, eps=eps, scale=scale, shift=shift, activation=activation
+        x, consumers, norm, eps, scale, shift, activation
     )
     return rows
 

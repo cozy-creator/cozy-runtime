@@ -343,10 +343,26 @@ def _int8_leaf_class(torch: Any) -> Any:
             return int8_linear.linear(torch, cast, self.data, self.scale, self.bias, out_dtype)
 
         def int8_prologue(
-            self, x: Tensor, consumers: tuple[object, ...], **parts: Any
+            self,
+            x: Tensor,
+            consumers: tuple[object, ...],
+            norm: str | None,
+            eps: float,
+            scale: Tensor | None,
+            shift: Tensor | None,
+            activation: str | None,
         ) -> PreQuantized | None:
             """`kernels.int8_rows` for consumers led by this leaf."""
-            return int8_linear.prologue(torch, x, consumers, **parts)
+            return int8_linear.prologue(
+                torch,
+                x,
+                consumers,
+                norm=norm,
+                eps=eps,
+                scale=scale,
+                shift=shift,
+                activation=activation,
+            )
 
     _int8_leaf_class._cached = Int8ConvRotLinear  # type: ignore[attr-defined]
     return Int8ConvRotLinear
