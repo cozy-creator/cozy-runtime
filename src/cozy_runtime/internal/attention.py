@@ -280,13 +280,18 @@ PINNABLE: tuple[Candidate, ...] = (
         local=attention_sol.SOL,
         min_sm=89,
         max_sm=120,
-        sms=frozenset(major * 10 + minor for major, minor in attention_sol.ROUTES),
+        sms=frozenset(
+            major * 10 + minor for major, minor in (*attention_sol.ROUTES, *attention_sol.FA4)
+        ),
         dtypes=frozenset({"bfloat16"}),
         max_head_dim=128,
         head_dims=frozenset({128}),
         artifact=kernel_sources.PYTHON,
         import_name="sol_attn",
-        why="Explicit sparse experiment on its CuTe routes; eager model layout.",
+        why=(
+            "Explicit sparse experiment: upstream's CuTe routes, and on SM100/SM103 Sol's route "
+            "on FA4's block-sparse forward (h3a-093); eager model layout."
+        ),
     ),
 )
 
@@ -779,10 +784,20 @@ def failures(
 
 
 def _sol_route(device: DeviceFacts) -> None:
-    """Sol serves only its CuTe routes; upstream silently falls back to Triton without CuTe."""
+    """Sol serves only its CuTe routes and FA4's; upstream silently falls back to Triton."""
     if device.kind == "cuda":
         route = attention_sol.backend(device.index)
-        if not route.startswith("cute_"):
+        if route == "fa4_block_sparse":
+            _import(known()["flash-attn4"])
+            try:
+                import_module("cozy_runtime.internal.attention_sol_fa4").warm(device.index)
+            except Exception as exc:
+                raise AttentionRefusal(
+                    "attention_kernel_launch_failed",
+                    f"sol-attn's FA4 block-sparse route did not build on {device.name}: "
+                    f"{type(exc).__name__}: {exc}"[:600],
+                ) from exc
+        elif not route.startswith("cute_"):
             raise AttentionRefusal(
                 "attention_kernel_absent",
                 f"sol-attn selects its {route!r} route on {device.name}; only its CuTe routes "

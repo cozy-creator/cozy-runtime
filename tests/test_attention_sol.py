@@ -154,7 +154,7 @@ def test_missing_semantics_and_cpu_execution_refuse() -> None:
     token = attention_sol._SITE.set(attention_sol.Site("dit", "blocks.2.attn"))
     try:
         with attention_scope(AttentionLayout(4, 0, 0)):
-            with pytest.raises(ValueError, match="CuTe routes only"):
+            with pytest.raises(ValueError, match="Sol serves upstream.s CuTe routes"):
                 attention_sol.sol_attention(q, q, q)
             with pytest.raises(ValueError, match="unmasked"):
                 attention_sol.sol_attention(q, q, q, attn_mask=torch.ones(4, 4))
