@@ -255,9 +255,9 @@ def run(payload: Ask, model: Pipe) -> Answer:
 def test_a_stage_pages_the_last_ones_weights_out(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Unified memory pages as a discrete card does: the decoder's stage plans its own weights
-    only, so the encoder's 64 MiB leave the pool while it runs, and the next request reads
-    them back from the page cache."""
+    """Unified memory pages as a discrete card does: an unmeasured decoder stage plans its own
+    weights only, so the encoder's 64 MiB leave the pool while it runs, and the next request
+    reads them back from the page cache."""
     project = tmp_path / "project"
     project.mkdir()
     (project / "apple_paged.py").write_text(PAGED)
@@ -282,7 +282,10 @@ def test_a_stage_pages_the_last_ones_weights_out(
         sys.modules.pop("apple_paged", None)
     encoder = 8 * 2048 * 2048 * 2
     assert first["allocated"] < encoder, (first, m.plane)
-    assert again["allocated"] < encoder and again["value"] != first["value"]
+    # The second request read the encoder back from the page cache; with room now measured
+    # for each stage's activations, it keeps both components hot.
+    assert again["value"] != first["value"]
+    assert m.plane["evictions"] > 0 and m.plane["disk_copy_bytes"] >= 2 * encoder, m.plane
 
 
 def test_weight_only_int8_against_fp16() -> None:
