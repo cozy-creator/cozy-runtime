@@ -573,7 +573,9 @@ class Machine:
         reply = self.executor.serve_invoke(
             Invoke(request_id=request, entrypoint=entrypoint, spool=str(spool), deadline_s=None)
         )
-        assert reply["outcome"]["terminal"] == "succeeded", reply
+        assert reply["outcome"]["terminal"] == "succeeded", json.dumps(
+            {"outcome": reply["outcome"], "logs": self.frames[-12:]}, default=str
+        )[:6000]
         self.plane = self.executor._plane_facts() or {}
         result = dict(json.loads((spool / RESULT_DOCUMENT).read_bytes()))
         images = sorted(spool.rglob("*.webp"))
