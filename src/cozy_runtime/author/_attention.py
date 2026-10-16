@@ -19,8 +19,9 @@ class AttentionContext:
     Eligibility covers installed dependencies, hardware, site dtype/head size and
     parallelism support. It is not a model-quality approval. Returning an explicit
     backend still requires Runtime's kernel validation; unavailable choices refuse.
-    Activation dtype comes from projection output contracts, with an ordinary floating
-    Linear fallback (no external autocast). Unknown/mismatched contracts are empty.
+    Activation dtype is the site's declared `activation_dtype`, else its projection output
+    contracts, with an ordinary floating Linear fallback (no external autocast).
+    Unknown/mismatched contracts are empty.
     Processors without per-site dispatch have empty eligible/recommended values.
     Return None to leave them unchanged; an explicit choice refuses.
     Weight storage precision is deliberately separate from attention activation dtype.

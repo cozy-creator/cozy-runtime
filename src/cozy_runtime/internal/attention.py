@@ -1071,6 +1071,10 @@ def _dtype(module: Any) -> str:
     disagreeing projection contracts admit only an unbounded dtype backend (SDPA).
     Floating Linear inference assumes no external autocast changes its output dtype.
     """
+    declared = getattr(module, "activation_dtype", None)
+    if declared is not None:
+        name = str(declared).removeprefix("torch.")
+        return name if name in {"float16", "bfloat16", "float32", "float64"} else ""
     q, k, v = (getattr(module, name, None) for name in ("to_q", "to_k", "to_v"))
     packed = getattr(module, "to_qkv", None)
     fused = getattr(module, "fused_projections", None)
