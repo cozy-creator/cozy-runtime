@@ -35,7 +35,7 @@ from typing import Any
 
 from cozy_runtime.author._model import PLACED, RELEASERS, WARNINGS
 from cozy_runtime.author.kernels import KernelsUnavailable, Launch, Plan, TritonKernels
-from cozy_runtime.graphs import BYPASS, ROOM, allocated, capture, say
+from cozy_runtime.graphs import BYPASS, ROOM, capture, say
 from cozy_runtime.lm import _kernels
 
 try:
@@ -549,7 +549,7 @@ class _Decode:
         self.pool: Any = None
         self.side: Any = None
         #: bytes an eager step allocates (`_measured`): what a capture's pool takes, about
-        self.need = 0
+        self.need: int | None = None
 
     def begin(self, inputs: Mapping[str, Any], stops: list[int], pad: int) -> None:
         self.inputs = inputs
@@ -666,8 +666,8 @@ class _Decode:
         """The steps after the prefill (and the first step, if it ran): each window's recorded
         once and replayed when `graphs` (over weights bound at `layout`), else eager. A window
         records only while `room()` (device bytes torch can take without unmapping a weight)
-        is `ROOM` times what an eager step allocates; after a capture fails, the call's steps
-        run eagerly. Returns the new tokens."""
+        is `ROOM` times what an eager step takes at its peak; after a capture fails, the call's
+        steps run eagerly. Returns the new tokens."""
         cuda = self.ids.is_cuda
         captures, capture_s, looped = 0, 0.0, self.made
         began = time.perf_counter()
@@ -684,11 +684,11 @@ class _Decode:
             size = window(self.prompt + self.made, self.capacity)
             self.cache.window = size
             graph = recorded.get(size)
-            if graph is None and graphs and self.need and not self.failed:
+            if graph is None and graphs and self.need is not None and not self.failed:
                 free = room() if room is not None else ROOM * self.need
                 if free < ROOM * self.need:
                     self.failed = (
-                        f"no room: {free >> 20} MiB free, a step allocates {self.need >> 20} MiB"
+                        f"no room: {free >> 20} MiB free, a step takes {self.need >> 20} MiB"
                     )
                 else:
                     capturing = time.perf_counter()
@@ -699,7 +699,7 @@ class _Decode:
                     captures += 1
             if graph is not None:
                 graph.replay()
-            elif graphs and not self.need:
+            elif graphs and self.need is None:
                 self._measured()
             else:
                 self.step()
@@ -742,10 +742,12 @@ class _Decode:
         return tokens
 
     def _measured(self) -> None:
-        """An eager step, and what it allocates: about what its graph's pool takes."""
-        before = allocated(self.ids.device)
+        """An eager step, and the device bytes it takes at its peak: the segments it reserves
+        beyond what torch holds with its idle cache given back, as a graph's pool would."""
+        torch.cuda.empty_cache()
+        before = torch.cuda.memory_reserved(self.ids.device)
         self.step()
-        self.need = max(self.need, allocated(self.ids.device) - before)
+        self.need = max(self.need or 0, torch.cuda.memory_reserved(self.ids.device) - before)
 
     def _capture(self) -> Any:
         """The step at the current window as a CUDA graph, or None, with a run warning: the
