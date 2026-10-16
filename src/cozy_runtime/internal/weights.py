@@ -4439,7 +4439,8 @@ class WeightResidency:
         """Its components in the stage order learned here (definition order before that),
         each one's regions in execution order: the plan an attempt re-asserts."""
         stages = [*self.stages, *(m for m in self.scopes if m not in self.stages)]
-        names = stage_components(stages, self.scopes)
+        # A partial binding leaves components its scopes name unbuilt; they have no plan.
+        names = [n for n in stage_components(stages, self.scopes) if n in self.components]
         names += [name for name in self.components if name not in names]
         groups: list[Group] = []
         for name in names:

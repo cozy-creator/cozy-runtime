@@ -61,11 +61,13 @@ class Pipe(Model[Any]):
 BUILT = {"encoder": 1, "denoiser": BLOCKS, "decoder": 2}
 
 
-def load(weights: Weights, checkpoint: Checkpoint) -> SimpleNamespace:
+def load(
+    weights: Weights, checkpoint: Checkpoint, built: dict[str, int] = BUILT
+) -> SimpleNamespace:
     """Construct on meta and register with the plane, as the executor's Load does."""
-    rows = [row for name in BUILT for row in checkpoint.rows(name)]
+    rows = [row for name in built for row in checkpoint.rows(name)]
     backend = PlaneBackend.for_script(
-        dict.fromkeys(BUILT, checkpoint),
+        dict.fromkeys(built, checkpoint),
         rows,
         weights=weights,
         construction="pipe",
@@ -74,10 +76,10 @@ def load(weights: Weights, checkpoint: Checkpoint) -> SimpleNamespace:
     scopes = in_definition_order(Pipe, component_use(Pipe))
     backend.order = tuple(stage_components(scopes, scopes))
     with serving_substrate("cpu", Observations()):
-        holder = SimpleNamespace(components={n: Small(b) for n, b in BUILT.items()})
+        holder = SimpleNamespace(components={n: Small(b) for n, b in built.items()})
     walked = census(holder)
     backend.expect(
-        {n: [d.key for d in walked.destinations if d.key.startswith(n + ".")] for n in BUILT}
+        {n: [d.key for d in walked.destinations if d.key.startswith(n + ".")] for n in built}
     )
     live = backend.materialize(holder, walked)
     for destination in walked.destinations:
@@ -125,6 +127,19 @@ def test_load_asks_for_what_the_code_builds_in_stage_and_learned_block_order(
         assert groups[2][1] == list(
             dict.fromkeys(ref for index in regions for ref in denoiser.objects[index])
         )
+        planner.end()
+
+
+def test_a_partial_binding_plans_only_the_components_it_built(tmp_path: Path) -> None:
+    """A callable that declares some components (H3's ref2va-only segment) leaves the rest of
+    the class's scopes unbuilt; the next attempt's plan skips them instead of failing."""
+    with served(tmp_path) as (hub, store):
+        planner = fetches(hub, store)
+        built = {"encoder": 1, "decoder": 2}
+        model = load(cpu(planner), Checkpoint.from_store(store, hub.manifest), built)
+        assert [sorted(refs) for _, refs in model.residency.fetch_plan()] == [
+            objects_of(store, hub.manifest, name) for name in ("encoder", "decoder")
+        ]
         planner.end()
 
 
