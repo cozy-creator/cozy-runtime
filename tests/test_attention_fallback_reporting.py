@@ -24,7 +24,6 @@ from test_attention_wait import (
     MOVING,
     _finisher,
     _host,
-    _ladder,
     _sites,
     _waiting,
     store,
@@ -111,7 +110,7 @@ def test_failed_build_retains_actual_failure_reason(
     job = kernel_sources.job(kernel_sources.PYTHON, 0)
     state = kernel_compile.wait(store, job, "tiny")
     assert state.state == "failed"
-    selected = attention.select(CPU, _sites(), choose=_ladder("tiny", "sdpa"))
+    selected = attention.select(CPU, _sites())
     [fallback] = selected.fallbacks
     assert fallback["preferred"] == "tiny" and fallback["selected"] == "sdpa"
     assert "compile_source_mismatch" in fallback["reason"]

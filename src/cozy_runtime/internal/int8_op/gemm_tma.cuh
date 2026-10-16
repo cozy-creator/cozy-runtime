@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // The 8-bit GEMM on TMA cards, CUTLASS 3.x with the dequant in an EVT epilogue,
 // D = out(acc * scales[m] * w_scale[n] + bias[n]), for int8 (`gemm_tma.cu`) and E4M3
-// (`gemm_fp8.cu`) operands; COZY_SM picks the builder. Hopper (90): warp-specialized wgmma.
-// Datacenter Blackwell (100, 103): tcgen05. RTX 50 (120): its TMA warp-specialized mma.
+// (`gemm_fp8.cu`) operands; the row's family picks the builder: wgmma warp-specialized,
+// tcgen05, or block-scaled mma.sync (RTX 50) through its TMA warp-specialized mma.
 #pragma once
 
 #include <cuda.h>
@@ -55,7 +55,7 @@ struct Mainloop {
     using type = Schedule;
 };
 
-#if COZY_SM == 100 || COZY_SM == 103
+#ifdef COZY_TCGEN05
 using Arch = cutlass::arch::Sm100;
 using OneSm = cutlass::gemm::KernelTmaWarpSpecialized1SmSm100;
 using TwoSm = cutlass::gemm::KernelTmaWarpSpecialized2SmSm100;
@@ -64,7 +64,7 @@ using EpilogueOf = std::conditional_t<std::is_same_v<Schedule, TwoSm>,
                                       cutlass::epilogue::TmaWarpSpecialized2Sm,
                                       cutlass::epilogue::TmaWarpSpecialized1Sm>;
 #else
-#if COZY_SM == 120
+#ifdef COZY_MMA_SYNC
 using Arch = cutlass::arch::Sm120;
 #else
 using Arch = cutlass::arch::Sm90;

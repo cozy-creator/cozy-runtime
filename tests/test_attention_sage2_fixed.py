@@ -7,25 +7,19 @@ from typing import Any
 import pytest
 
 from cozy_runtime.author._attention_scope import AttentionLayout, attention_scope
-from cozy_runtime.internal import attention
+from cozy_runtime.internal import arch, attention
 from cozy_runtime.internal import attention_sage2_fixed as fixed
 from cozy_runtime.internal import attention_sol as sol
 from cozy_runtime.internal.attention_ulysses import Local
-from cozy_runtime.internal.encoding import DeviceFacts
 
 
-def test_fixed_recipes_are_explicit_sm90_bf16_d128_and_head_local() -> None:
+def test_fixed_recipes_are_wgmma_bf16_d128_and_head_local() -> None:
     for name in (fixed.DENSE_NAME, fixed.SOL_NAME):
         candidate = attention.BY_NAME[name]
-        assert candidate not in attention.CANDIDATES
         assert candidate.local.head_local
         for sm in (80, 89, 100, 120, 121):
-            assert attention._device_admits(
-                candidate, DeviceFacts("cuda", "other", sm, "driver", "test")
-            )
-        assert not attention._device_admits(
-            candidate, DeviceFacts("cuda", "H100", 90, "driver", "test")
-        )
+            assert attention._off_row(candidate, arch.row(sm))
+        assert not attention._off_row(candidate, arch.row(90))
         assert attention._admits(candidate, "bfloat16", 128)
         assert not attention._admits(candidate, "float16", 128)
         assert not attention._admits(candidate, "bfloat16", 64)
@@ -58,7 +52,7 @@ def test_hybrid_dense_steps_and_prefix_use_the_same_fixed_local(monkeypatch: Any
 
     # The policy is real; CPU stand-ins replace only the two unavailable CUDA kernels.
     monkeypatch.setattr(fixed, "DENSE", Local(dense, lambda *_: "fixed CPU policy stand-in"))
-    monkeypatch.setattr(fixed, "validate_device", lambda _device: None)
+    monkeypatch.setattr(sol, "_card", lambda _device: (9, 0))
     monkeypatch.setattr(sol, "_DENSE", wrong)
     monkeypatch.setattr(sol, "specialize", lambda *_args: None)
     monkeypatch.setattr(sol, "_ready", lambda *_args: object())

@@ -392,6 +392,9 @@ class PrepareRequest(_Attempt, frozen=True, kw_only=True, tag="prepare_request")
     payload: Json
     construction: str = ""
     attention_kernel: str = ""
+    #: The request's precision (16|8|4; 0: the rules choose): 16 holds every attention site at
+    #: level 16 (`attention.EXACT`).
+    bits: int = 0
     input_metadata: dict[str, InputMetadata] = {}
 
 
@@ -407,6 +410,7 @@ class Invoke(_Attempt, frozen=True, kw_only=True, tag="invoke"):
     max_input_bytes: int | None = None
     construction: str = ""
     attention_kernel: str = ""
+    bits: int = 0  # as `PrepareRequest.bits`
     #: The weight plane's device budget for this attempt; -1: the executor derives it.
     plane_budget_bytes: int = -1
     #: The process's device cap for this attempt (`PROCESS_CAP`); -1: none

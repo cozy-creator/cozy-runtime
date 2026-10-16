@@ -24,7 +24,7 @@ def test_request_artifact_observation_and_restore_use_actual_diffusers_processor
         attention._member(attention.BY_NAME["sdpa"]),
         artifact={"artifact": "fixture", "key": "abc", "compile_ms": "1.0"},
     )
-    swap = attention.Swap(entry, (("dit", module.processor),), "dit=sdpa")
+    swap = attention.Swap((("dit", "", module, module.processor, entry),), "dit=sdpa")
     value = torch.ones(1, 4, 128)
     with torch.no_grad():
         baseline = module(value)

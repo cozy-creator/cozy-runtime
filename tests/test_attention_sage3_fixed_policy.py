@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 
 from cozy_runtime.internal import (
+    arch,
     attention,
     attention_kitchen_sol,
     attention_sol,
@@ -34,19 +35,17 @@ def test_explicit_dense_selector_installs_on_real_diffusers_sites(degree: int) -
     candidate = attention.BY_NAME[DENSE]
     resolved = attention.Ready(candidate, attention._member(candidate))
     device = DeviceFacts("cuda", "RTX 5090", 120, "", "", index=0)
-    selected = attention.install([resolved], roots, degree=degree, device=device)
+    selected = attention.install([resolved], roots, DENSE, degree=degree, device=device)
     assert selected.hosts == {"fl2va_dit": {DENSE: 1}}
     assert attention.observed(roots).hosts == selected.hosts
     assert not isinstance(site.processor, producers.Processor)
 
 
-def test_fixed_recipe_stays_sm120_bf16_head128_only() -> None:
+def test_fixed_recipe_stays_block_scaled_mma_sync_bf16_head128_only() -> None:
     for name in (DENSE, HYBRID):
         candidate = attention.BY_NAME[name]
-        assert candidate not in attention.CANDIDATES
         for sm in (80, 89, 90, 100, 120, 121):
-            facts = DeviceFacts("cuda", "fixture", sm, "580", "", index=0)
-            assert bool(attention._device_admits(candidate, facts)) == (sm != 120)
+            assert bool(attention._off_row(candidate, arch.row(sm))) == (sm not in (120, 121))
         assert attention._admits(candidate, "bfloat16", 128)
         assert not attention._admits(candidate, "float16", 128)
         assert not attention._admits(candidate, "bfloat16", 64)
@@ -89,7 +88,7 @@ def test_dense_adapter_preserves_operands_scale_and_upstream_correction(monkeypa
     result = upstream.sage3_fp4_fixed_means(q, k, v, scale=128**-0.5)
     assert result.shape == q.shape
     assert calls == [((q, k, v), {})]  # omitted fixed_correction keeps the upstream matmul
-    assert validation[0]["admitted"] == ((12, 0),)
+    assert validation[0]["dims"] == (128,)
     for options in ({"is_causal": True}, {"enable_gqa": True}, {"scale": 1.0}):
         with pytest.raises(ValueError):
             upstream.sage3_fp4_fixed_means(q, k, v, **options)

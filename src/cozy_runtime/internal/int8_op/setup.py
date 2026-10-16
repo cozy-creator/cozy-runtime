@@ -1,10 +1,10 @@
 """Builds `cozy_int8` (the `torch.ops.cozy.int8_*` and `fp8_*` library) for one card,
-`COZY_KERNEL_SM`.
+`COZY_KERNEL_SM`, by its row (`COZY_KERNEL_ROW`: the MMA family, then its formats).
 
-int8: Hopper and B200 take the TMA GEMM (wgmma, tcgen05), every other card the mma.sync GEMM.
-fp8: Hopper, B200, B300 and RTX 50 take the TMA GEMM (wgmma, tcgen05, sm120's mma); other cards
-cuBLASLt's. Those cards build for their arch-specific target. CUTLASS is the `cutlass` tree
-beside this file.
+int8: wgmma and tcgen05 rows with int8 take the TMA GEMM, every other card the mma.sync GEMM.
+fp8: wgmma, tcgen05 and block-scaled mma.sync (fp4 rows) take CUTLASS's TMA GEMM, other fp8
+cards cuBLASLt's. Those build for the card's arch-specific target. CUTLASS is the `cutlass`
+tree beside this file.
 """
 
 import os
@@ -13,11 +13,16 @@ from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 sm = int(os.environ["COZY_KERNEL_SM"])
+family, *formats = os.environ["COZY_KERNEL_ROW"].split()
 cutlass = os.path.abspath("cutlass")
-tma = sm in (90, 100)
-fp8 = sm in (90, 100, 103, 120)
-arch = f"{sm}a" if fp8 else str(sm)
-defines = [f"-DCOZY_SM={sm}", *(["-DCOZY_FP8_GEMM"] if fp8 else [])]
+tma = family in ("wgmma", "tcgen05") and "int8" in formats
+fp8 = "fp8" in formats and (family != "mma.sync" or "fp4" in formats)
+arch = f"{sm}a" if tma or fp8 else str(sm)
+defines = [
+    f"-DCOZY_{family.replace('.', '_').upper()}",
+    *(["-DCOZY_TMA"] if tma else []),
+    *(["-DCOZY_FP8_GEMM"] if fp8 else []),
+]
 nvcc = [
     "-O3",
     "-std=c++17",

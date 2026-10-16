@@ -345,7 +345,7 @@ def h3_model(*, adapters: bool = False) -> H3Calls:
         rope_freq_dim=2,
     ).eval()
     # Runtime's own selection: its SDPA runs through the Ulysses wrapper on sharded sites.
-    attention.install(attention.available(DeviceFacts("cpu", "CPU", 0, "", "", 0)), {"dit": dit})
+    attention.select(DeviceFacts("cpu", "CPU", 0, "", "", 0), {"dit": dit})
 
     def no_grad(module: Any, args: Any) -> None:
         assert not torch.is_grad_enabled()

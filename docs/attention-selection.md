@@ -1,47 +1,38 @@
 # Attention selection
 
-Runtime owns backend integration and preparation-time selection. Its current
-curated default keeps floating-point attention: FA3 BF16/FP16 when this machine has
-compiled it for the card and the site supports it, otherwise PyTorch SDPA. The table in
-`internal/attention.py` links retained H3 timing evidence. It is not a universal
-hardware optimum, and no accuracy check gates a compiled kernel. Approximate backends
-remain explicit choices.
+Runtime picks each attention site's kernel from the GPU's family, never from a card list
+(`internal/arch.py` rows, precision-tiers §2.1 and §2.4):
 
-A model may choose a different eligible implementation before warm-up:
+1. **Level.** 16 when the request asks for 16 bits (`bits` on `PrepareRequest`/`Invoke`,
+   served as the `exact` pin); otherwise the model's `attention_bits` for the site; 16 when
+   the model declares none. A sparse site's exact paths (`AttentionLayout.exact_paths`) stay
+   at 16.
+2. **Kernel.** The first kernel of the family's cell at that level (`attention.DENSE`) that
+   serves the site's dtype, head dimension and degree, is compiled, imports and launches;
+   then each level above; then SDPA. A sparse site (one a package producer validates: its
+   model supplies an `AttentionLayout`) tries `attention.SPARSE` first at each level, its
+   dense rows on the level's dense cell. A producer is tried just before its base.
 
 ```python
-from cozy_runtime.author import AttentionContext, Model
-
-
-class VideoModel(Model[object]):
-    def choose_attention(self, context: AttentionContext) -> str | None:
-        if context.component == "dit" and "kitchen-int8" in context.eligible:
-            return "kitchen-int8"  # This model's separately qualified quality policy.
-        return None  # Keep Runtime's recommendation for other sites.
+class H3(Model[object], attention_bits={"fl2va_dit": 4, "ref2va_dit": 4}): ...
+class Klein(Model[object], attention_bits={"transformer.single_transformer_blocks.": 8}): ...
 ```
 
-A preference may name `LIKE_PROJECTIONS` (`cozy_runtime.author`): at each site, the
-attention kernel quantized like that site's Q/K/V projections, on the cards where it was
-measured faster than float attention (int8 leaves: `kitchen-int8` on sm86/sm89/sm120/sm121). Float
-projections expand to nothing, so one model keeps float attention on its bf16 lane and
-quantizes it on its int8 lane. The model consents; which encoding serves stays Runtime's.
+`attention_bits` is 16, 8 or 4, or a mapping from component-qualified module prefixes to them
+(the longest prefix wins, unlisted sites 16). It is the model's tolerance, independent of its
+weight lane. A kernel skipped because it is absent, compiling or failed is one run warning
+(`fallbacks`) and is selected again once ready; one the row or the site's shape cannot run is
+not in the walk.
 
-The immutable context contains component and module path, device kind/name/SM,
-attention activation dtype, head dimension, parallel degree, eligible names and
-the recommendation's evidence/reason. Activation dtype comes from active projection
-output contracts (or ordinary floating Linear inference without external autocast),
-never unrelated normalization parameters or encoded storage dtype. Unknown or
-disagreeing projection contracts admit only a dtype-unbounded backend.
-It has no tensors or device methods. FP8
-checkpoint weights do not imply FP8 attention. Eligibility checks site/hardware and
-context-parallel support; selecting an optional backend then resolves it: compiled,
-imported and launched once. Nothing benchmarks every
-request or promotes approximate attention automatically.
+| level | mma.sync | wgmma | tcgen05 |
+|---|---|---|---|
+| 16 | SDPA | FA3 | cuDNN |
+| 8 | kitchen-int8, Sage2 (fp8 rows) | Sage2 | FA4 fp8 |
+| 4 | Sage3 fp4 (fp4 rows), else 8 | 8 | 8 |
+| sparse 16 / 8 / 4 | Sol / Sol, Kitchen Sol / Kitchen fp4 Sol | Sol / Sol + fixed-Kmean Sage2, Sol | Sol |
 
-Returning an unknown or ineligible backend refuses preparation; it does not fall
-back. Returning `None` keeps the recommendation. The entire site's selection set
-is validated before processor fields change. The hook does not replace model
-`load`/`warm` lifecycle or introduce an invocable model method.
+A card no row names takes the newest family whose 8-bit op builds for its own target and says
+so on every run (`arch.inherited`).
 
 The existing developer attention override string supports:
 
@@ -52,17 +43,15 @@ The existing developer attention override string supports:
 - `base_model/fl2va_dit=sageattention`: scope to a model parameter in a multi-model
   callable. An unqualified component scope matches that component in each model.
 
-Unknown scopes refuse. A package policy cannot override a developer's matching
-explicit pin. Per-request backend changes still refuse compiled or context-parallel
+Unknown scopes refuse. A pin bypasses the level rule, `bits` included. Per-request backend changes still refuse compiled or context-parallel
 frozen constructions. A group may repeat its prepared pin: every matching live
 processor and its saved preparation must already select that backend. This is a
 verified no-op, with no kernel search or mutation. Empty, unknown, mixed or changed
 selections do not qualify. Remote request pins do not themselves choose a group's
-preparation backend; use the model's preparation policy for that selection. No
-request silently substitutes a kernel or recompiles the model.
+preparation backend. No request silently substitutes a kernel or recompiles the model.
 Prepared selections are saved and restored across all model executors before and
 after request execution, including handler failures. An ordinary request therefore
-retains its prepared model policy, without repeating resolution or a previous
+retains its prepared selection, without repeating resolution or a previous
 request's experimental choice.
 
 `kitchen-int8` and `flashinfer-bf16-fp8` are newly registered explicit experimental
@@ -86,12 +75,10 @@ executing an override fails; prepared Sol hooks remain owned by the generation.
 
 Diffusers' classic `AttnProcessor2_0` (SDXL's UNet, AutoencoderKL) calls SDPA
 directly. Selection first replaces it with `ClassicSdpa`, the same math through
-backend dispatch: auto keeps SDPA there (bit-identical), and pins and model policies
-may choose another kernel. Other legacy processors have no per-site backend selection
-contract. Runtime leaves them untouched and does not report an installed backend for
-them. Model policies receive an empty `eligible`
-and `recommended` context explaining this limitation. Explicit matching pins or
-policy choices refuse, including components mixing managed and legacy processors;
+backend dispatch: auto keeps SDPA there (bit-identical), and pins may choose another
+kernel. Other legacy processors have no per-site backend selection contract. Runtime
+leaves them untouched and does not report an installed backend for them. Explicit
+matching pins refuse, including components mixing managed and legacy processors;
 Runtime never creates an unused processor attribute to claim partial coverage.
 
 ## Kernels compiled on the machine, and Ulysses
@@ -100,9 +87,9 @@ Nothing is compiled on a builder. The image carries every kernel as pinned sourc
 (`python -m cozy_runtime.internal.kernel_sources fetch /opt/cozy/kernel-sources`: sources
 by commit or version and sha256, plus `index.json`) and the CUDA toolkit. At machine start
 and after each install, while weights download, the machine runs the kernel boot for each
-installed generation under that generation's seal (`internal/machine_kernels.py`): the
-ladder for each card (Sol's Python sources, SageAttention2, FA3 on sm90), best first, then
-Sol's card objects, through the compile manager (`internal/kernel_compile.py`). One niced
+installed generation under that generation's seal (`internal/machine_kernels.py`): for each
+card, the first kernel of each level of its row's cells and the 8-bit op, then Sol's card
+objects, through the compile manager (`internal/kernel_compile.py`). One niced
 build per exact key (sources, arch, driver, torch, CUDA, Python, compiler) per machine, into
 the store its executors read; a key already built is never built again, so a restart
 compiles nothing. An extension build runs as many compiler processes as the machine's CPUs
@@ -115,7 +102,7 @@ Selection serves a kernel only once it is compiled, imports and launches. A site
 run a kernel still compiling waits for it, judged by the build's measured progress, and the
 request shows `compiling <kernel>`; it never runs another kernel in its place. One whose
 compile failed is skipped with why, and the chain falls through; SDPA is always ready. A
-ranked kernel no site runs is not waited for. Sol compiles one object per card, except on
+kernel no site runs is not waited for. Sol compiles one object per card, except on
 SM90, where upstream specializes on the length's 64-token block layout; the first sight of
 a length (intake or a dense step) submits that object, and its first sparse step waits for
 it.
@@ -134,10 +121,9 @@ compile time.
 Select with the existing `kernel.attention=dit=flash-attn3` or
 `--attention-kernel=dit=flash-attn3` Creator argument. Eager requests restore the
 prepared selection after success or failure, so an unpinned A / pinned B / unpinned
-A sequence shares its prepared executor. Compiled or context-parallel changes
-require preparing a new model generation whose `choose_attention` policy selects
-that backend before warm-up; the request refuses a frozen change and does not
-silently rebuild it.
+A sequence shares its prepared executor. A compiled or context-parallel construction
+keeps the kernel it was prepared with; the request refuses a frozen change and does
+not silently rebuild it.
 
 Preparation facts and request `attention.artifact` observations identify the compiled
 artifact by its store key. Each GPU's execution record carries `attention.impl`: the

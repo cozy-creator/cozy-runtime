@@ -54,11 +54,22 @@ def _refusal(run: Any) -> dict[str, str]:
     return {"code": "", "detail": "no refusal"}
 
 
+def _ready_now(device: Any) -> list[str]:
+    """The kernels of the level-16 cell this card can serve now, in order."""
+    found = []
+    for name in attention.walk(attention.device_row(device), 16):
+        try:
+            found.append(attention._resolve(attention.BY_NAME[name], device, wait=False).name)
+        except Exception:
+            continue
+    return found
+
+
 def main() -> None:
     device = _device()
     out: dict[str, Any] = {
         "sm": device.sm,
-        "offered": [r.name for r in attention.available(device)],
+        "offered": _ready_now(device),
     }
     out["image_kernels"] = attention.image_kernels(device)
 

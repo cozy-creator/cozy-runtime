@@ -51,7 +51,7 @@ def test_peft_attention_contract_tracks_actual_encoded_replacement(factor_dtype:
     assert output.dtype == plain.dtype == torch.bfloat16
     torch.testing.assert_close(output, (plain + extra).to(plain.dtype), rtol=0, atol=0)
     assert attention._dtype(site) == "bfloat16"
-    sol = next(candidate for candidate in attention.PINNABLE if candidate.name == "sol-attn")
+    sol = attention.BY_NAME["sol-attn"]
     assert attention._admits(sol, attention._dtype(site), 128)
     assert not attention._admits(sol, "", 128)
     assert adapted.lora_A["adapter_0"].weight.dtype == getattr(torch, factor_dtype)
@@ -76,5 +76,5 @@ def test_custom_wrapper_cannot_claim_peft_output_contract(
     # Unavailable optional exports must not break an unadapted author's projection.
     monkeypatch.setitem(sys.modules, "peft.tuners.lora.layer", ModuleType("unavailable_peft"))
     assert attention._projection_dtype(Custom()) == ""
-    sdpa = next(candidate for candidate in attention.CANDIDATES if candidate.name == "sdpa")
+    sdpa = attention.BY_NAME["sdpa"]
     assert attention._admits(sdpa, attention._projection_dtype(Custom()), 128)

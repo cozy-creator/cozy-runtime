@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
-from cozy_runtime.author import AttentionContext, Model
-from cozy_runtime.internal import attention
+from cozy_runtime.author import AttentionProducer
+from cozy_runtime.author import _attention as author_attention
+from cozy_runtime.internal import attention, attention_sol
 from cozy_runtime.internal.attention_registry import register
 from cozy_runtime.internal.encoding import DeviceFacts
 from cozy_runtime.internal.executor import Executor
@@ -49,39 +49,6 @@ def _choices(roots: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
-def test_author_context_is_immutable_and_model_policy_executes() -> None:
-    class Policy(Model[object]):
-        def choose_attention(self, context: AttentionContext) -> str | None:
-            assert context.component in ("dit", "vae") and context.module_path == "0"
-            assert context.device_kind == "cpu" and context.sm == 0
-            assert context.activation_dtype == "float32" and context.head_dim == 8
-            assert context.eligible == ("sdpa",) and context.recommended == "sdpa"
-            with pytest.raises(FrozenInstanceError):
-                context.degree = 99  # type: ignore[misc]
-            return "sdpa"
-
-    policy = object.__new__(Policy)
-    roots = _roots()
-    applied = attention.select(_device(), roots, choose=policy.choose_attention)
-    assert applied.totals() == {"sdpa": 2}
-    import torch
-
-    with torch.no_grad():
-        assert roots["dit"][0](torch.ones(1, 2, 8)).isfinite().all()
-
-
-def test_invalid_author_choice_leaves_every_processor_unchanged() -> None:
-    roots = _roots()
-    before = _choices(roots)
-
-    def choose(context: AttentionContext) -> str:
-        return "sdpa" if context.component == "dit" else "kitchen-int8"
-
-    with pytest.raises(attention.AttentionRefusal, match="eligible"):
-        attention.select(_device(), roots, choose=choose)
-    assert _choices(roots) == before
-
-
 def test_scoped_pin_and_snapshot_restore_different_prepared_policy() -> None:
     roots = _roots(128)  # a shape FA3's build has
     # Installation-only control: real members, no claim that FA3 executes on CPU.
@@ -99,14 +66,8 @@ def test_scoped_pin_and_snapshot_restore_different_prepared_policy() -> None:
 
 def test_scoped_prepare_pin_preserves_other_components_and_rejects_typos() -> None:
     roots = _roots()
-    seen: list[str] = []
-
-    def choose(context: AttentionContext) -> None:
-        seen.append(context.component)
-
-    applied = attention.select(_device(), roots, "dit=sdpa", choose=choose)
-    assert applied.hosts == {"dit": {"sdpa": 1}, "vae": {"sdpa": 1}}
-    assert seen == ["vae"]
+    applied = attention.select(_device(), roots, "dit=sdpa")
+    assert applied.hosts == {"dit": {"sdpa": 1}, "vae": {"sdpa": 1}} and applied.pin == "dit=sdpa"
     for pin in ("missing=sdpa", "=sdpa", "dit=", "dit=sdpa=bad"):
         with pytest.raises(attention.AttentionRefusal):
             attention.plan(_device(), roots, pin)
@@ -168,7 +129,7 @@ def test_a_pin_falls_back_visibly_where_its_kernel_cannot_run() -> None:
     attention.select(_device(), roots)
     roots["dit"][0]._compiled_call_impl = lambda: None
     swap = attention.plan(_device(), roots, "dit=cudnn")
-    assert swap.entry is None and not swap.sites
+    assert not swap.sites
     (row,) = swap.fallbacks
     assert (row["component"], row["preferred"], row["selected"]) == ("dit", "cudnn", "sdpa")
     assert "compiled" in row["reason"]
@@ -177,7 +138,7 @@ def test_a_pin_falls_back_visibly_where_its_kernel_cannot_run() -> None:
     assert "vae" not in {r["component"] for r in swap.fallbacks}
     assert "dit: selected sdpa instead of cudnn" in applied.line()
     card = attention.plan(_device(), roots, "vae=flash-attn3")
-    assert card.entry is None and "sm90" in card.fallbacks[0]["reason"]
+    assert not card.sites and "wgmma" in card.fallbacks[0]["reason"]
     assert len(attention.plan(_device(), roots, "vae=sdpa").sites) == 1
     assert len(attention.plan(_device(), roots, "vae=sdpa", 2).sites) == 1  # a group too
 
@@ -192,7 +153,7 @@ def test_a_compiled_construction_serves_the_pin_it_was_prepared_with(tmp_path: P
     executor.backend = SimpleNamespace(roots=roots)
     assert executor._attention_plan("dit=sdpa") is None
     other = executor._attention_plan("dit=flash-attn3")
-    assert other is not None and other.entry is None
+    assert other is not None and not other.sites
     assert "compiled" in other.fallbacks[0]["reason"]
 
 
@@ -257,21 +218,6 @@ def test_registration_is_idempotent_local_and_dispatches_real_cpu_attention() ->
     assert registry.get_active_backend() == active
 
 
-def test_new_approximate_backends_remain_explicit_and_architecture_exact() -> None:
-    for name, sms in [
-        ("kitchen-int8", {80, 86, 87, 89, 90, 100, 103, 110, 120, 121}),
-        ("flashinfer-bf16-fp8", {100, 103}),
-        ("flash-attn4-fp8", {100, 103}),
-        ("sageattention3-fp4", {120}),
-        ("sageattention", {89, 90, 120}),
-    ]:
-        candidate = attention.BY_NAME[name]
-        assert candidate in attention.PINNABLE and candidate not in attention.CANDIDATES
-        assert candidate.sms == sms
-    assert not attention._admits(attention.BY_NAME["flashinfer-bf16-fp8"], "bfloat16", 64)
-    assert attention._admits(attention.BY_NAME["flashinfer-bf16-fp8"], "bfloat16", 128)
-
-
 def test_model_qualified_preparation_pin_routes_to_one_construction() -> None:
     assert (
         attention.for_model("base_model/dit=sageattention", ["base_model"]) == "dit=sageattention"
@@ -331,17 +277,15 @@ def test_sol_sites_are_removed_after_request_and_partial_apply_failure() -> None
     defaults = attention.snapshot(roots)
     dit, vae = roots["dit"][0], roots["vae"][0]
     entry = _ready("sol-attn")[0]
-    swap = attention.Swap(entry, (("dit", dit.processor),), "dit=sol-attn", (("dit", "0", dit),))
+    swap = attention.Swap((("dit", "0", dit, dit.processor, entry),), "dit=sol-attn")
     with attention.override(defaults, roots, swap):
         assert hasattr(dit, "_cozy_sol_site")
     assert not hasattr(dit, "_cozy_sol_site")
     assert not dit._forward_pre_hooks and not dit._forward_hooks
     attention_sol.install_site(vae, "vae", "prepared")
     conflicting = attention.Swap(
-        entry,
-        (("dit", dit.processor), ("vae", vae.processor)),
+        (("dit", "0", dit, dit.processor, entry), ("vae", "changed", vae, vae.processor, entry)),
         "sol-attn",
-        (("dit", "0", dit), ("vae", "changed", vae)),
     )
     with (
         pytest.raises(ValueError, match="another Sol site"),
@@ -470,12 +414,8 @@ def test_repeated_group_pin_requires_every_scoped_prepared_site() -> None:
     assert not attention._is_selected(defaults, roots, "base/dit=sdpa")
 
 
-#: A DiT-only attention preference, as a package's `choose_attention` states one (H3's).
-DIT_PREFERENCE = ("sol-attn", "sageattention", "flash-attn3", "sdpa")
-
-
-def prefer_for_dits(context: AttentionContext) -> tuple[str, ...] | None:
-    return DIT_PREFERENCE if context.component.endswith("_dit") else None
+#: H3's declaration: its DiTs tolerate 4-bit attention; its VAEs stay exact.
+H3_BITS = {"fl2va_dit": 4, "ref2va_dit": 4}
 
 
 def _dit_roots(dtype: str) -> dict[str, Any]:
@@ -497,137 +437,83 @@ def _cuda(sm: int) -> DeviceFacts:
     return DeviceFacts(kind="cuda", name=f"sm{sm}", sm=sm, driver="", configuration="", index=0)
 
 
-def test_no_device_defaults_to_dense_fp8() -> None:
-    fp8 = {"flash-attn3-fp8", "flashinfer-bf16-fp8"}
-    for device in (_device(), _cuda(90), _cuda(100)):
-        assert not fp8 & {candidate.name for candidate in attention.for_device(device)}
-
-
-@pytest.mark.parametrize(("sm", "served"), [(90, "flash-attn3"), (100, "sdpa")])
-def test_dits_fall_through_when_sol_and_sage_cannot_serve(sm: int, served: str) -> None:
-    """sm90 with Sol and Sage not compiled here walks to FA3; sm100, where FA3's hopper build
-    has no device code, walks to SDPA. Each earlier preference says why it was skipped."""
-    pytest.importorskip("torch")
+@pytest.mark.parametrize(("sm", "served"), [(90, "flash-attn3"), (100, "cudnn")])
+def test_dits_step_up_a_level_when_their_cell_cannot_serve(sm: int, served: str) -> None:
+    """H3's DiTs at level 4 walk their family's level-8 cell (Sage2 on wgmma, FA4 fp8 on
+    tcgen05), absent here, to level 16, with one warning per DiT; the VAEs sit at 16."""
     pytest.importorskip("diffusers")
     roots = _dit_roots("bfloat16")
     skipped: dict[str, str] = {}
     applied = attention.install(
-        _ready(*[c.name for c in attention.for_device(_cuda(sm))]),
+        _ready("flash-attn3", "cudnn", "sdpa"),
         roots,
         device=_cuda(sm),
-        choose=prefer_for_dits,
+        bits=H3_BITS,
         skipped=skipped,
     )
     assert applied.hosts == {name: {served: 1} for name in roots}
-    assert {"sol-attn", "sageattention"} <= set(skipped), skipped
-    if sm != 90:
-        assert f"sm{sm}" in skipped["sageattention"] and "sm100" not in skipped["sol-attn"]
-    assert not {name for name in skipped if "fp8" in name}
-
-
-def test_a_preference_records_skips_through_real_cpu_selection() -> None:
-    pytest.importorskip("torch")
-    pytest.importorskip("diffusers")
-    applied = attention.select(_device(), _dit_roots("float32"), choose=prefer_for_dits)
-    assert applied.totals() == {"sdpa": 4}
-    assert applied.skipped is not None
-    assert {"sol-attn", "sageattention", "flash-attn3"} <= set(applied.skipped)
-    assert "skipped" in applied.line()
+    absent = "sageattention" if sm == 90 else "flash-attn4-fp8"
+    assert set(skipped) == {absent}
+    assert {(row["component"], row["preferred"], row["selected"]) for row in applied.fallbacks} == {
+        (dit, absent, served) for dit in H3_BITS
+    }
 
 
 @pytest.mark.parametrize(
-    ("offered", "dense", "identity"),
+    ("offered", "identity"),
     [
-        (("sageattention", "flash-attn3"), "sageattention", "sageattention; exact=flash-attn3"),
-        (("flash-attn3",), "flash-attn3", "flash-attn3"),
+        (("sageattention", "flash-attn3"), "sageattention; exact=flash-attn3"),
+        (("flash-attn3",), "flash-attn3"),
     ],
 )
-def test_sol_recomputes_dense_rows_with_the_next_preference(
-    offered: tuple[str, ...], dense: str, identity: str
+def test_sol_recomputes_dense_rows_on_the_sites_level_and_exact_paths_at_16(
+    offered: tuple[str, ...], identity: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Sol's dense steps, prefix and paths run on the kernel after it in the model's
-    preference, not the ranked floor (run 1565: SDPA at 35 s/step where Sage takes ~24 s). An
-    unready Sage is recorded as skipped, so a later request boundary re-selects onto it."""
-    pytest.importorskip("torch")
+    """A sparse site (a package producer serves it) on Hopper at level 4: Sol + fixed-Kmean
+    Sage2 first, absent here, then Sol, whose dense rows take the level's Sage2 and whose
+    exact paths FA3 (run 1565: SDPA at 35 s/step where Sage takes ~24 s). An unready Sage is
+    skipped, so a later boundary re-selects onto it."""
     pytest.importorskip("diffusers")
-    from cozy_runtime.internal import attention_sol
+    roots = _dit_roots("bfloat16")
+    dits = {id(root[0]) for name, root in roots.items() if name in H3_BITS}
 
+    def validate(module: object) -> None:
+        if id(module) not in dits:
+            raise ValueError("not an H3 DiT site")
+
+    producer = AttentionProducer("h3-p", "kitchen-sol-fp4-fixed-means", lambda *_: None, validate)
+    monkeypatch.setitem(author_attention._PRODUCERS, "h3-p", producer)
+    held = attention_sol.binding()
     skipped: dict[str, str] = {}
-    applied = attention.install(
-        _ready("sol-attn", *offered, "sdpa"),
-        _dit_roots("bfloat16"),
-        device=_cuda(90),
-        choose=prefer_for_dits,
-        skipped=skipped,
-    )
-    assert applied.hosts["ref2va_dit"] == {"sol-attn": 1}
-    assert attention_sol.dense_identity() == identity
-    assert ("sageattention" in skipped) == (dense != "sageattention")
+    try:
+        applied = attention.install(
+            _ready("sol-attn", *offered, "sdpa"),
+            roots,
+            device=_cuda(90),
+            bits=H3_BITS,
+            skipped=skipped,
+        )
+        assert applied.hosts["ref2va_dit"] == {"sol-attn": 1}
+        assert applied.hosts["video_vae"] == {"flash-attn3": 1}
+        assert attention_sol.dense_identity() == identity
+        assert "sol-attn-sage2-fixed-kmean" in skipped
+        assert ("sageattention" in skipped) == ("sageattention" not in offered)
+    finally:
+        attention_sol.rebind(held)
+        for name in H3_BITS:
+            module = roots[name][0]
+            if getattr(module, "_cozy_sol_site", None) is not None:
+                attention_sol.remove_site(module, name, "0")
 
 
-def test_a_pin_overrides_the_preference() -> None:
+def test_a_pin_overrides_the_level() -> None:
     pytest.importorskip("torch")
     pytest.importorskip("diffusers")
-    consulted: list[str] = []
-
-    def choose(context: AttentionContext) -> Any:
-        consulted.append(context.component)
-        return prefer_for_dits(context)
-
     ready = _ready("flash-attn3", "sdpa")
     scoped = attention.install(
-        ready, _dit_roots("bfloat16"), "ref2va_dit=sdpa", device=_cuda(90), choose=choose
+        ready, _dit_roots("bfloat16"), "ref2va_dit=sdpa", device=_cuda(90), bits=H3_BITS
     )
     assert scoped.hosts["ref2va_dit"] == {"sdpa": 1}
     assert scoped.hosts["fl2va_dit"] == {"flash-attn3": 1}
-    assert "ref2va_dit" not in consulted
-    consulted.clear()
-    whole = attention.install(
-        ready, _dit_roots("bfloat16"), "sdpa", device=_cuda(90), choose=choose
-    )
-    assert whole.totals() == {"sdpa": 4} and not consulted
-
-
-def test_a_kernel_this_runtime_lacks_is_skipped_for_the_next_preference() -> None:
-    """A package written for a newer Runtime prefers a kernel an older machine lacks; the
-    load used to refuse `attention_kernel_unknown` instead of serving its next choice."""
-    applied = attention.select(_device(), _roots(), choose=lambda context: ("sol-next", "sdpa"))
-    assert applied.totals() == {"sdpa": 2}
-
-
-def test_attention_like_projections_follows_the_int8_lane() -> None:
-    """`LIKE_PROJECTIONS` quantizes attention only where the site's Q/K/V are int8 leaves on a
-    measured card (Klein's int8 lane on sm89: kitchen-int8, as BFL's int8 release runs). Float
-    projections, and a card it was not measured on, keep float attention with no fallback."""
-    torch = pytest.importorskip("torch")
-    pytest.importorskip("diffusers")
-    from cozy_runtime.author import LIKE_PROJECTIONS
-    from cozy_runtime.author.kernels import INT8_CONVROT
-    from cozy_runtime.internal.encoding.leaves import _native_leaf_class
-
-    roots = _dit_roots("bfloat16")
-    site = roots["fl2va_dit"][0]
-    for name in ("to_q", "to_k", "to_v"):
-        linear = getattr(site, name)
-        roles = {
-            "data": torch.zeros(linear.out_features, linear.in_features, dtype=torch.int8),
-            "scale": torch.ones(linear.out_features),
-        }
-        leaf = _native_leaf_class(torch)(
-            None, roles, None, torch.bfloat16, INT8_CONVROT, "int8-convrot256/1",
-            linear.in_features, linear.out_features,
-        )  # fmt: skip
-        setattr(site, name, leaf)
-    ready = _ready("kitchen-int8", "sdpa")
-
-    def choose(context: AttentionContext) -> tuple[str, ...]:
-        return (LIKE_PROJECTIONS, "sdpa")
-
-    applied = attention.install(ready, roots, device=_cuda(89), choose=choose)
-    assert applied.hosts == {
-        "fl2va_dit": {"kitchen-int8": 1},
-        **{name: {"sdpa": 1} for name in ("ref2va_dit", "audio_vae", "video_vae")},
-    }
-    assert not applied.fallbacks and not applied.skipped
-    hopper = attention.install(ready, roots, device=_cuda(90), choose=choose)
-    assert hopper.totals() == {"sdpa": 4} and not hopper.fallbacks
+    whole = attention.install(ready, _dit_roots("bfloat16"), "sdpa", device=_cuda(90), bits=8)
+    assert whole.totals() == {"sdpa": 4}

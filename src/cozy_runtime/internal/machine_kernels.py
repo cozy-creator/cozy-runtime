@@ -1,12 +1,12 @@
-"""The machine's kernels, compiled at machine start on the cards present, best first, while
-weights download: first the links between its GPUs (`parallel.links`), which a group reads, then
-the attention ladder and the 8-bit linear op (int8, fp8).
+"""The machine's kernels, compiled at machine start on the cards present while weights download:
+first the links between its GPUs (`parallel.links`), which a group reads, then each card row's
+attention cells (`boot`) and the 8-bit linear op (int8, fp8).
 
 The machine launches `python -m cozy_runtime.internal.machine_kernels` once per installed
 generation, under that generation's own seal: its interpreter and torch, every card of the
 machine, and the kernel store and scratch scope its executors use. Each key here is therefore
 the key an executor computes, by the same functions. For each distinct card architecture it
-starts every artifact of `LADDER` the card admits at once, through the compile manager, niced:
+starts every artifact of `boot` at once, through the compile manager, niced:
 the machine's compile ledger admits their compiler jobs within its CPUs and memory
 (`kernel_compile.compiler_job`); Sol's card objects start once its sources are in. A request
 finds each one ready or building and, without an override, never waits for one: it serves the
@@ -26,6 +26,7 @@ from collections.abc import Mapping
 
 from cozy_runtime.internal import (
     accel,
+    arch,
     attention,
     attention_sol,
     config,
@@ -33,13 +34,8 @@ from cozy_runtime.internal import (
     kernel_compile,
     kernel_sources,
 )
-from cozy_runtime.internal.encoding import DeviceFacts
 from cozy_runtime.internal.parallel import links
 
-#: The best attention first, as the installed models rank it: H3's DiT ladder (Sol,
-#: SageAttention2, FA3 BF16; SDPA needs no compile). Models without a preference use the
-#: ranked table, whose only compiled kernel is FA3.
-LADDER: tuple[str, ...] = ("sol-attn", "sageattention", "flash-attn3")
 #: The op library every 8-bit lane serves (`int8_linear`, `fp8_linear`), on sm80+ cards.
 INT8 = "cozy-int8"
 
@@ -50,40 +46,66 @@ def cards(devices: str) -> dict[int, str]:
     return {sm: entry for entry in reversed(entries) if (sm := accel.device_capability(entry))}
 
 
-def ladder(present: Mapping[int, str]) -> list[kernel_compile.Job]:
-    """The ladder artifacts each card architecture admits, in ladder order, once per key."""
-    jobs: dict[str, kernel_compile.Job] = {}
+def boot(row: arch.Row) -> list[attention.Candidate]:
+    """What a card builds ahead of any request: the first kernel the row runs at each level of
+    its cells, dense and sparse, and the dense kernels those compute with. Every installed
+    package's declared levels are among them; a later kernel builds when a site reaches it."""
+    found: list[attention.Candidate] = []
+    for cells in (attention.DENSE, attention.SPARSE):
+        for names in cells.get(row.family, {}).values():
+            for candidate in (attention.BY_NAME[n] for n in names):
+                if not attention._off_row(candidate, row):
+                    found.append(candidate)
+                    if candidate.dense:
+                        found.append(attention.BY_NAME[candidate.dense])
+                    break
+    return found
+
+
+def _job(artifact: str, sm: int, device: str, family: str = "") -> kernel_compile.Job | None:
+    try:
+        job = kernel_sources.job(artifact, sm, family=family)
+    except kernel_sources.Absent:
+        return None
+    # Upstream's setup.py builds for the cards it sees: this one.
+    return dataclasses.replace(job, env={"CUDA_VISIBLE_DEVICES": device})
+
+
+def jobs(present: Mapping[int, str]) -> list[kernel_compile.Job]:
+    """Each card architecture's attention (`boot`) and its 8-bit op for its row, once per key."""
+    found: dict[str, kernel_compile.Job] = {}
     for sm, device in sorted(present.items()):
-        facts = DeviceFacts("cuda", "", sm, "", "")
-        # The approved Blackwell recipe needs BOTH binaries before selection. The
-        # registry's capability predicate is shared with the model chooser; other
-        # cards keep their existing boot ladder and compile optional pins on demand.
-        hybrid = attention.BY_NAME["kitchen-sol-fp4-lowmem"]
-        names = (
-            LADDER
-            if attention._device_admits(hybrid, facts)
-            else ("sageattention3-fp4-global-lowmem", "kitchen-int8", *LADDER)
-        )
-        for name in names:
-            candidate = attention.BY_NAME[name]
-            if attention._device_admits(candidate, facts):
-                continue
-            try:
-                job = kernel_sources.job(candidate.artifact, sm)
-            except kernel_sources.Absent:
-                continue
-            # Upstream's setup.py builds for the cards it sees: this one.
-            job = dataclasses.replace(job, env={"CUDA_VISIBLE_DEVICES": device})
-            jobs.setdefault(job.key.digest, job)
-        if sm >= 80:
-            try:
-                job = kernel_sources.job(INT8, sm)
-            except kernel_sources.Absent:
-                continue
-            jobs.setdefault(
-                job.key.digest, dataclasses.replace(job, env={"CUDA_VISIBLE_DEVICES": device})
-            )
-    return list(jobs.values())
+        builds = [(c.artifact, "") for c in boot(arch.row(sm)) if c.artifact]
+        builds += [(INT8, arch.row(sm).family)] if arch.row(sm).family else []
+        for artifact, family in builds:
+            job = _job(artifact, sm, device, family)
+            if job is not None:
+                found.setdefault(job.key.digest, job)
+    return list(found.values())
+
+
+def inherit(store: kernel_cache.Store, present: Mapping[int, str]) -> list[str]:
+    """Each card no row names (§2.6): its 8-bit op built for each family it could hold in turn,
+    newest first; the first that builds is the card's (`arch.learn`), else mma.sync. A family
+    rejected on the way is a probe, not a failure: only the card's own is counted, with the
+    rest (`jobs`). One warning per card."""
+    warnings: list[str] = []
+    for sm, device in sorted(present.items()):
+        families = arch.families(sm)
+        if sm in arch.ROWS or not families:
+            continue
+        landed = families[-1]
+        for family in families[:-1]:
+            job = _job(INT8, sm, device, family)
+            state = kernel_compile.wait(store, job) if job is not None else None
+            if state is not None:
+                print(json.dumps({**state.document(), "probe": family}), flush=True)
+            if state is not None and state.state == "ready":
+                landed = family
+                break
+        arch.learn(sm, landed)
+        warnings.append(arch.inherited(sm, device))
+    return warnings
 
 
 def sol_objects(store: kernel_cache.Store, present: Mapping[int, str]) -> list[kernel_compile.Job]:
@@ -95,11 +117,11 @@ def sol_objects(store: kernel_cache.Store, present: Mapping[int, str]) -> list[k
     if tree is None:
         return []
     site.addsitedir(str(tree / kernel_cache.SITE))
-    jobs: list[kernel_compile.Job] = []
+    found: list[kernel_compile.Job] = []
     for sm in sorted(present):
-        if divmod(sm, 10) in attention_sol.ROUTES:
-            jobs += attention_sol.card_jobs(store, divmod(sm, 10))
-    return jobs
+        if attention_sol.route(divmod(sm, 10)) in attention_sol.ROUTES:
+            found += attention_sol.card_jobs(store, divmod(sm, 10))
+    return found
 
 
 def main() -> int:
@@ -128,10 +150,12 @@ def main() -> int:
     if store is not None and present:
         kernel_cache.configure(store)
         kernel_compile.waiting = progress
-        jobs = ladder(present)
-        for job in jobs:
+        for warning in inherit(store, present):
+            print(json.dumps({"warning": warning}), flush=True)
+        built = jobs(present)
+        for job in built:
             kernel_compile.submit(store, job)
-        sources = [job for job in jobs if job.key.kernel == kernel_sources.PYTHON]
+        sources = [job for job in built if job.key.kernel == kernel_sources.PYTHON]
         for job in sources:
             done(job, kernel_compile.wait(store, job))
         try:
@@ -142,7 +166,7 @@ def main() -> int:
             print(f"sol objects: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
         for job in objects:
             kernel_compile.submit(store, job)
-        for job in [*(job for job in jobs if job not in sources), *objects]:
+        for job in [*(job for job in built if job not in sources), *objects]:
             done(job, kernel_compile.wait(store, job))
     last = {
         "done": True,

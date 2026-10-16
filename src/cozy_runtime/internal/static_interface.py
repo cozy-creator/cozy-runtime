@@ -49,7 +49,14 @@ import cozy_runtime.internal.static_invocable as static_invocable
 from cozy_runtime import _interpreter, author
 from cozy_runtime.author._markers import MODEL_DEFAULT, PREFLIGHT
 from cozy_runtime.author._memo import memo_policy
-from cozy_runtime.author._model import ENCODED_LEAVES, MIN_BITS, PHASES, Model, closed
+from cozy_runtime.author._model import (
+    ENCODED_LEAVES,
+    MIN_BITS,
+    PHASES,
+    Model,
+    attention_bits,
+    closed,
+)
 from cozy_runtime.author._model_defaults import (
     check_model_arguments,
     model_components,
@@ -920,6 +927,11 @@ class Reader:
                 min_bits = typing.cast(int, value)
             elif keyword.arg == "phase" and closed(PHASES, value):
                 phase = typing.cast(str, value)
+            elif keyword.arg == "attention_bits":
+                try:  # Runtime reads it at selection; the interface does not carry it
+                    attention_bits(node.name, value)
+                except author.ConformanceError as exc:
+                    self.refuse(module, keyword, str(exc))
             else:
                 self.refuse(module, keyword, "a Model class keyword outside the closed set")
         for decorator in node.decorator_list:
