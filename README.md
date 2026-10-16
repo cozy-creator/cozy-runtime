@@ -257,7 +257,7 @@ sequence, and a CLOSED vocabulary — `msgspec.Struct` classes with their
 `msgspec.Meta`/`AssetBound`/`ModelDefault`/`Preflight`, `Literal`, `Enum`/`IntEnum`/`StrEnum`,
 unions, `list`/`tuple`/`dict`/`Sequence`/`Mapping`/`Set`, the asset classes, `Assets[...]` with
 `AssetLimits`, `Tree`, `ModelArtifact`, `Model` subclasses (`encoded_leaves=`,
-`@sequence_parallel`, `@uses_components`), `Weights[M]`, and `@app.entrypoint` with literal
+`min_bits=`, `phase=`, `@sequence_parallel`, `@uses_components`), `Weights[M]`, and `@app.entrypoint` with literal
 keywords and `WeightsOutput(...)` tuples. Explicit function registrations and async
 `@invocable` exports use the same schema builders, with their declared capabilities and
 immutable defaults. A value the package owns as DATA rather than as
