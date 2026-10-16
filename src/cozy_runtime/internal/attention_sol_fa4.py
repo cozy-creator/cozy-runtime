@@ -18,7 +18,6 @@ from __future__ import annotations
 from importlib import import_module
 from typing import TYPE_CHECKING
 
-import torch
 import triton
 import triton.language as tl
 
@@ -39,6 +38,8 @@ def sparse(
 ) -> Tensor:
     """One BF16 BTHD document; every row, the protected prefix's included. `fp8` runs the exact
     tiles in e4m3 with Hadamard-rotated Q/K, as the dense rows' FA4 FP8 does."""
+    import torch
+
     scale = query.shape[-1] ** -0.5 if scale is None else float(scale)
     attention_sol._pin_preprocess()
     kc, vc, threshold = import_module("sol_attn.preprocess").prepare(
@@ -72,6 +73,8 @@ def warm(index: int) -> None:
     """Build this card's FA4 block-sparse forwards (FP8 and BF16) and the merge at preparation,
     one small call each: FA4's and Triton's caches key neither on length nor on head count, so
     a run's first sparse step finds them built."""
+    import torch
+
     device = torch.device("cuda", index)
     with torch.no_grad(), torch.cuda.device(device):
         q, k, v = (
@@ -84,6 +87,8 @@ def warm(index: int) -> None:
 
 def route(query: Tensor, kc: Tensor, threshold: Tensor, scale: float, sink_tokens: int) -> Tensor:
     """Sol's exact-block decisions pooled onto FA4's tiles: bool [heads, query tiles, key tiles]."""
+    import torch
+
     _, tokens, heads, dim = query.shape
     blocks = kc.shape[1]
     pad = blocks * BLOCK - tokens
@@ -109,6 +114,8 @@ def route(query: Tensor, kc: Tensor, threshold: Tensor, scale: float, sink_token
 def _merge_approximation(
     query: Tensor, kc: Tensor, vc: Tensor, pooled: Tensor, out: Tensor, lse: Tensor, scale: float
 ) -> None:
+    import torch
+
     _, tokens, heads, dim = query.shape
     blocks = kc.shape[1]
     if lse.shape != (1, heads, tokens) or not (lse.is_contiguous() and out.is_contiguous()):

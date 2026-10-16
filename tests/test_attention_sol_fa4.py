@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import math
+from typing import Any
 
 import pytest
 
@@ -21,7 +22,7 @@ def _blackwell() -> None:
             pytest.skip(f"requires {name}")
 
 
-def _reference(q, k, v, scale, pooled, kc, vc):
+def _reference(q: Any, k: Any, v: Any, scale: float, pooled: Any, kc: Any, vc: Any) -> Any:
     """Exact attention over each row's pooled tiles plus Sol's approximation of every other
     64-token block (block-mean key, block-sum value over its length, mass times length)."""
     _, t, h, _ = q.shape
