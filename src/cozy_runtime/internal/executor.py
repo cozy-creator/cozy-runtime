@@ -3489,6 +3489,10 @@ class Executor:
                 self.residency.restore()
             except Exception as exc:
                 record.emit("confession", "weights.restore", f"{type(exc).__name__}: {exc}"[:300])
+            # The owner charges this process what its reply says it holds: bytes mapped after
+            # the reply read as foreign memory, and shrank the next grant (an 8 GiB pool's
+            # upsampler got a 3.1 GB cap beside 4-5 GB "external", runs 8420-8437).
+            plane_facts = self._plane_facts()
         d2h_ms = (time.perf_counter() - d2h_started) * 1000
         released_us = execution_evidence.now_us()
         peak_vram = accel.peak_allocated(torch, self.device_kind) if torch is not None else 0
