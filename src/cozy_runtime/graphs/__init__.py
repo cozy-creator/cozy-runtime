@@ -1,40 +1,45 @@
-"""CUDA graphs over a component's weights at their plane homes: one capture recipe for Runtime.
+"""CUDA graphs over a component's weights at their plane homes, on by default.
 
-    from cozy_runtime import graphs
+Runtime records each placed component's calls and replays them (`install`, run by the executor
+when it constructs a model); a package declares a component `@uncaptured` to opt out. A weight set
+keeps one device address range for its life, and a refill maps a region back at the same
+address, so a graph that reads weights stays valid while they are bound there: nothing is pinned
+between calls.
 
-    with graphs.graphed(unet) as call:
-        noise = call(latents, t, encoder_hidden_states=text, return_dict=False)[0]
+The first call of each signature runs as written, through the paging hooks, which record the
+blocks it reads. At the second, the stage holds those blocks at their homes
+(`Residency.hold_stage`), the call is recorded into the component's one memory pool with its
+tensor inputs in static buffers, and the first replay is checked against the call run as
+written: on a mismatch that signature runs as written from then on, with a run warning. Every
+later call copies its inputs in, replays, and returns clones of the outputs (a multistep
+scheduler keeps earlier ones). Recordings outlive the request: a later one at the same signature
+replays from its first call while the weights are bound where they were and the module runs the
+same code (`Residency.layout`, `_structure`); otherwise it records again.
 
-A weight set keeps one device address range for its life, and a refill maps a region back at the
-same address, so a graph that reads weights stays valid while they are bound there: no pinning.
-The first call of each input signature runs eagerly through the paging hooks, which record the
-blocks it reads. From the second on, `graphed` leases those blocks at their homes for the `with`
-(`Residency.held`), records the call with its tensor inputs in static buffers once, and replays
-it: each call copies its inputs in, replays, and returns clones of the outputs (a multistep
-scheduler keeps earlier ones). Recordings outlive the `with` and the request: a later request at
-the same signature replays from its first call, once its weights are bound where they were when
-recorded (`Residency.layout`); moved, it records again. A signature is the tensors' shapes,
-dtypes, devices and strides, every other argument by value, and the module's attention
-processors (a kernel switch records again). Weights with LoRA baked in are not held, so those
-calls run eagerly. Where the blocks do not fit, on a CPU, or when a capture fails, calls run
-eagerly as they would have. The plane drops every recording before it unmaps weights for room
-(`release`).
+A signature is the tensors' shapes, dtypes, devices and strides and every other argument by
+value; a recording also keys on the code each submodule runs (an attention kernel switch, a
+forward swapped between requests). A call with an argument
+that is not a tensor or a plain value (a cache object), with gradients, on a CPU, inside another
+capture, or under `BYPASS` (`cozy_runtime.lm` runs its own) runs as written, and so does one whose
+blocks do not all fit at home (a stage that streams) or whose capture fails (a run warning). The
+plane drops every recording before it unmaps a weight for room (`release`).
 
-`capture(step, pool, stream)` is the recipe (`cozy_runtime.lm` uses it too): on a side stream,
-in thread-local mode so the plane's own threads keep working while it records, and outside
-Runtime's dispatch modes, whose out-of-memory recovery copies what an op writes into first,
-which a graph would then copy on every replay.
+`capture(step, pool, stream)` is the recipe: on a side stream, in thread-local mode so the
+plane's own threads keep working while it records, and outside Runtime's dispatch modes, whose
+out-of-memory recovery copies what an op writes into first, which a graph would then copy on
+every replay.
 """
 
 from __future__ import annotations
 
+import contextvars
 import sys
+import time
 import weakref
-from collections.abc import Callable, Iterator
-from contextlib import ExitStack, contextmanager
+from collections.abc import Callable, Mapping
 from typing import Any
 
-from cozy_runtime.author._model import PLACED, RELEASERS
+from cozy_runtime.author._model import PLACED, RELEASERS, WARNINGS
 
 try:
     import torch
@@ -43,6 +48,12 @@ try:
 except ImportError:  # pragma: no cover - the base package is torch-free
     torch = None
 
+#: Set while a mechanism runs its own graphs over a component (`cozy_runtime.lm`): its calls
+#: pass straight through.
+BYPASS: contextvars.ContextVar[bool] = contextvars.ContextVar("cozy_graphs_bypass", default=False)
+#: The first replay's largest relative L2 distance from the call run as written.
+TOLERANCE = 1e-3
+_PLAIN = (type(None), bool, int, float, str)
 _SAID: set[str] = set()
 
 
@@ -84,8 +95,7 @@ def capture(step: Callable[[], object], pool: Any, stream: Any) -> tuple[Any, st
 
 
 class _Recording:
-    """One signature's graph, its static inputs and outputs, and where the weights it reads were
-    bound when it was recorded: it replays only while they still are."""
+    """One signature's graph, its static inputs and outputs, and the layout it was recorded at."""
 
     def __init__(self, graph: Any, inputs: list[Any], outputs: Any, layout: object) -> None:
         self.graph, self.inputs, self.outputs, self.layout = graph, inputs, outputs, layout
@@ -101,139 +111,234 @@ class _Recording:
 
 
 class _Recorder:
-    """A module's recordings, kept across requests: the blocks its calls read (as the first one
-    ran them through the paging hooks), and a recording per signature."""
+    """A component's recordings, kept across requests in one memory pool."""
 
     def __init__(self) -> None:
+        #: the blocks its calls read, as the first one ran them through the paging hooks
         self.blocks: dict[str, set[Any]] = {}
         self.seen: set[tuple[object, ...]] = set()
+        #: signatures that run as written for good, and captures that failed so far
         self.failed: set[tuple[object, ...]] = set()
+        self.tries: dict[tuple[object, ...], int] = {}
         self.recordings: dict[tuple[object, ...], _Recording] = {}
+        self.pool: Any = None
+        self.stream: Any = None
+        #: the stage hold its structure was read under, and that structure
+        self.structure: tuple[object, tuple[object, ...]] = (None, ())
+        self.pool_bytes = self.replays = 0
+        self.record_s = 0.0
 
 
-#: Every module's recordings in this process, until the module goes or memory is wanted.
+#: Every graphed component's recorder in this process.
 _RECORDERS: weakref.WeakKeyDictionary[Any, _Recorder] = weakref.WeakKeyDictionary()
+_CLASSES: dict[type, type] = {}
+
+
+def install(model: object, roots: Mapping[str, Any]) -> list[str]:
+    """Record and replay the calls of each of `model`'s component roots (`roots`, name -> module)
+    the Model class does not declare `@uncaptured`. Returns the components installed."""
+    if torch is None:
+        return []
+    skipped = set(getattr(type(model), "__uncaptured__", ()))
+    installed = []
+    for name, root in roots.items():
+        if name in skipped or not isinstance(root, torch.nn.Module):
+            continue
+        if not getattr(type(root), "_cozy_graphed", False):
+            root.__class__ = _graphed(type(root))
+        installed.append(name)
+    return installed
+
+
+def _graphed(cls: type) -> type:
+    """`cls` with a `__call__` that replays recordings: the same name, a subclass of it."""
+    made = _CLASSES.get(cls)
+    if made is None:
+        call = cls.__call__
+
+        def __call__(self: Any, *args: Any, **kwargs: Any) -> Any:
+            return _dispatch(self, call, args, kwargs)
+
+        made = _CLASSES[cls] = type(
+            cls.__name__,
+            (cls,),
+            {
+                "__call__": __call__,
+                "_cozy_graphed": True,
+                "__module__": cls.__module__,
+                "__qualname__": cls.__qualname__,
+            },
+        )
+    return made
 
 
 def release() -> bool:
-    """Drop every recording (their graphs' memory pools and static buffers): what the plane
-    calls before it unmaps weights for room. Returns whether there was any."""
-    had = any(recorder.recordings for recorder in _RECORDERS.values())
+    """Drop every recording and its pool: what the plane calls before it unmaps weights for room.
+    Returns whether there was any."""
+    had = False
     for recorder in _RECORDERS.values():
+        had = had or bool(recorder.recordings)
         recorder.recordings.clear()
+        recorder.pool, recorder.pool_bytes = None, 0
     return had
 
 
 RELEASERS.append(release)
 
 
+def _dispatch(module: Any, call: Callable[..., Any], args: Any, kwargs: Any) -> Any:
+    if (
+        BYPASS.get()
+        or not torch.cuda.is_available()
+        or torch.is_grad_enabled()
+        or torch.cuda.is_current_stream_capturing()
+    ):
+        return call(module, *args, **kwargs)
+    leaves, spec = pytree.tree_flatten((args, kwargs))
+    tensors = [leaf for leaf in leaves if isinstance(leaf, torch.Tensor)]
+    if (
+        not tensors
+        or not all(tensor.is_cuda for tensor in tensors)
+        or not all(
+            isinstance(leaf, (torch.Tensor, torch.dtype, torch.device)) or type(leaf) in _PLAIN
+            for leaf in leaves
+        )
+    ):
+        return call(module, *args, **kwargs)
+    recorder = _RECORDERS.get(module)
+    if recorder is None:
+        recorder = _RECORDERS[module] = _Recorder()
+    key = _signature(module, leaves, spec)
+    if key in recorder.failed:
+        return call(module, *args, **kwargs)
+    placed = PLACED.get(module)
+    if key not in recorder.seen:
+        # The first call of a signature: as written, through the hooks, which record its blocks.
+        recorder.seen.add(key)
+        if placed is None:
+            return call(module, *args, **kwargs)
+        with placed[0].recording() as read:
+            out = call(module, *args, **kwargs)
+        for name, blocks in read.items():
+            recorder.blocks.setdefault(name, set()).update(blocks)
+        return out
+    hold: tuple[bool, tuple[object, ...]] = (True, ())
+    if placed is not None:
+        residency, name = placed
+        hold = residency.hold_stage(name, recorder.blocks.get(name, set()))
+    if not hold[0]:
+        return call(module, *args, **kwargs)
+    if recorder.structure[0] is not hold:  # read once per stage hold
+        recorder.structure = (hold, _structure(module))
+    layout = (hold[1], recorder.structure[1])
+    entry = recorder.recordings.get(key)
+    if entry is not None and entry.layout != layout:
+        del recorder.recordings[key]  # its weights moved, or its code: it records again
+        entry = None
+    if entry is None:
+        entry = _record(module, call, leaves, spec, recorder, key, layout)
+        if entry is None:
+            return call(module, *args, **kwargs)
+    recorder.replays += 1
+    if placed is not None:
+        placed[0].note(f"{placed[1]}.graphs", _facts(recorder))
+    return entry(leaves)
+
+
+def _record(
+    module: Any,
+    call: Callable[..., Any],
+    leaves: list[Any],
+    spec: Any,
+    recorder: _Recorder,
+    key: tuple[object, ...],
+    layout: object,
+) -> _Recording | None:
+    """Record the call at `key` into the component's pool, and check its first replay against
+    the call run as written. None, with a run warning, when it cannot be."""
+    started = time.perf_counter()
+    if recorder.pool is None:
+        recorder.pool, recorder.stream = torch.cuda.graph_pool_handle(), torch.cuda.Stream()
+    reserved = torch.cuda.memory_reserved()
+    inputs = [leaf.clone() if isinstance(leaf, torch.Tensor) else None for leaf in leaves]
+    static = [s if s is not None else v for s, v in zip(inputs, leaves, strict=True)]
+    cargs, ckwargs = pytree.tree_unflatten(static, spec)
+    outputs: list[Any] = []
+    graph, why = capture(
+        lambda: outputs.append(call(module, *cargs, **ckwargs)), recorder.pool, recorder.stream
+    )
+    if graph is not None and not _clonable(outputs[0]):
+        graph, why = None, f"its output {type(outputs[0]).__name__} is not a tree of tensors"
+    if graph is not None:
+        graph.replay()
+        replayed = [
+            v.float() for v in pytree.tree_leaves(outputs[0]) if isinstance(v, torch.Tensor)
+        ]
+        written = [
+            v.float()
+            for v in pytree.tree_leaves(call(module, *cargs, **ckwargs))
+            if isinstance(v, torch.Tensor)
+        ]
+        error = max(
+            (
+                float((a - b).norm() / b.norm().clamp_min(1e-12))
+                for a, b in zip(replayed, written, strict=False)
+            ),
+            default=0.0,
+        )
+        if len(replayed) != len(written) or not error <= TOLERANCE:
+            graph, why = None, f"its first replay is {error:.2e} from the call run as written"
+    recorder.record_s += time.perf_counter() - started
+    if graph is None:
+        recorder.tries[key] = recorder.tries.get(key, 0) + 1
+        if recorder.tries[key] >= 2 or why.startswith("its "):  # a wrong replay never retries
+            recorder.failed.add(key)
+        recorder.pool = None  # spent: the next recording takes a new one
+        torch.cuda.empty_cache()
+        line = f"{type(module).__name__} runs as written at this signature: {why}"
+        say(f"graphs:{type(module).__name__}:{why[:40]}", f"[graphs] {line}")
+        WARNINGS.append(
+            ("a CUDA graph was not used", {"module": type(module).__name__, "why": why})
+        )
+        return None
+    recorder.pool_bytes += max(torch.cuda.memory_reserved() - reserved, 0)
+    entry = recorder.recordings[key] = _Recording(graph, inputs, outputs[0], layout)
+    return entry
+
+
+def _facts(recorder: _Recorder) -> str:
+    return (
+        f"{len(recorder.recordings)} recorded in {recorder.record_s:.2f} s, "
+        f"{recorder.replays} replays, pool {recorder.pool_bytes >> 20} MiB"
+    )
+
+
 def _clonable(out: Any) -> bool:
     """Whether every leaf of `out` is a tensor or a plain value, so a replay can hand clones."""
     leaves, _ = pytree.tree_flatten(out)
     return any(isinstance(v, torch.Tensor) for v in leaves) and all(
-        v is None or isinstance(v, (torch.Tensor, int, float, bool, str)) for v in leaves
+        isinstance(v, torch.Tensor) or type(v) in _PLAIN for v in leaves
     )
 
 
 def _structure(module: Any) -> tuple[object, ...]:
-    """Which code each submodule runs: its class and any forward set on the instance. A package
-    that swaps a block's forward between requests (SDXL's hidiffusion) records again."""
-    return tuple((id(type(m)), id(m.__dict__.get("forward"))) for m in module.modules())
+    """Which code each submodule runs: its class, any forward set on the instance (SDXL's
+    hidiffusion swaps them between requests) and its attention processor (a kernel switch)."""
+    return tuple(
+        (id(type(m)), id(m.__dict__.get("forward")), id(getattr(m, "processor", None)))
+        for m in module.modules()
+    )
 
 
-def _signature(module: Any, leaves: list[Any], spec: Any) -> tuple[object, ...] | None:
-    """The tensors' geometry, every other argument by value, and the attention processors the
-    module serves with now (a kernel switch records again)."""
+def _signature(module: Any, leaves: list[Any], spec: Any) -> tuple[object, ...]:
+    """The tensors' geometry and every other argument by value."""
     key: list[object] = [str(spec)]
-    processors = getattr(module, "attn_processors", None)
-    if isinstance(processors, dict):
-        key.append(tuple(sorted((name, id(p)) for name, p in processors.items())))
     for leaf in leaves:
         if isinstance(leaf, torch.Tensor):
             key.append((tuple(leaf.shape), leaf.dtype, leaf.device, leaf.stride()))
-            continue
-        try:
-            hash(leaf)
-        except TypeError:
-            return None
-        key.append((type(leaf), leaf))
+        else:
+            key.append((type(leaf), leaf))
     return tuple(key)
 
 
-@contextmanager
-def graphed(module: Any) -> Iterator[Callable[..., Any]]:
-    """`module`'s calls for the body, replayed from CUDA graphs recorded at each signature's
-    second call and kept across requests. Open it in the `@uses_components` method that calls
-    the module (once per step is fine: the recordings outlive the `with`)."""
-    placed = PLACED.get(module)
-    recorder = _RECORDERS.get(module)
-    if recorder is None:
-        recorder = _RECORDERS[module] = _Recorder()
-    with ExitStack() as stack:
-        state: dict[str, Any] = {"held": None, "layout": None}
-
-        def hold() -> bool:
-            if state["held"] is None:
-                held: bool = True
-                layout: tuple[object, ...] = ()
-                if placed is not None:
-                    residency, name = placed
-                    blocks = recorder.blocks.get(name, set())
-                    held = stack.enter_context(residency.held(name, blocks))
-                    layout = residency.layout(name, blocks) if held else ()
-                state["held"] = held
-                state["layout"] = (layout, _structure(module)) if held else None
-                state["stream"] = torch.cuda.Stream()
-            return bool(state["held"])
-
-        def call(*args: Any, **kwargs: Any) -> Any:
-            leaves, spec = pytree.tree_flatten((args, kwargs))
-            tensors = [leaf for leaf in leaves if isinstance(leaf, torch.Tensor)]
-            key = (
-                None if not tensors or not tensors[0].is_cuda else _signature(module, leaves, spec)
-            )
-            if key is None or key in recorder.failed:
-                return module(*args, **kwargs)
-            if key not in recorder.seen:
-                # The first call of a signature: eager, through the hooks, which record its blocks.
-                recorder.seen.add(key)
-                if placed is not None and state["held"] is None:
-                    with placed[0].recording() as read:
-                        out = module(*args, **kwargs)
-                    for name, blocks in read.items():
-                        recorder.blocks.setdefault(name, set()).update(blocks)
-                    return out
-                return module(*args, **kwargs)
-            if not hold():
-                return module(*args, **kwargs)
-            entry = recorder.recordings.get(key)
-            if entry is not None and entry.layout != state["layout"]:
-                del recorder.recordings[key]  # its weights moved: it is recorded again
-                torch.cuda.empty_cache()  # into a new pool: the spent one's memory goes back
-                entry = None
-            if entry is None:
-                inputs = [v.clone() if isinstance(v, torch.Tensor) else None for v in leaves]
-                static = [s if s is not None else v for s, v in zip(inputs, leaves, strict=True)]
-                cargs, ckwargs = pytree.tree_unflatten(static, spec)
-                outputs: list[Any] = []
-                graph, why = capture(
-                    lambda: outputs.append(module(*cargs, **ckwargs)), None, state["stream"]
-                )
-                if graph is not None and not _clonable(outputs[0]):
-                    graph, why = (
-                        None,
-                        f"its output {type(outputs[0]).__name__} is not a tree of tensors",
-                    )
-                if graph is None:
-                    recorder.failed.add(key)
-                    say(f"graphed:{type(module).__name__}", f"[graphs] eager: {why}")
-                    return module(*args, **kwargs)
-                entry = recorder.recordings[key] = _Recording(
-                    graph, inputs, outputs[0], state["layout"]
-                )
-            return entry(leaves)
-
-        yield call
-
-
-__all__ = ["capture", "graphed", "release", "say"]
+__all__ = ["BYPASS", "TOLERANCE", "capture", "install", "release", "say"]

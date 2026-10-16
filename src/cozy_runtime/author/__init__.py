@@ -136,6 +136,7 @@ from cozy_runtime.author._model import (
     ScopeCall,
     placeable,
     sequence_parallel,
+    uncaptured,
     uses_components,
 )
 from cozy_runtime.author._script import ScriptContext, script_app
@@ -313,6 +314,7 @@ __all__ = [
     "sequence_parallel",
     "split",
     "spread",
+    "uncaptured",
     "upload_checkpoint",
     "uses_components",
 ]

@@ -239,6 +239,13 @@ class Residency(Protocol):
         be."""
         ...
 
+    def hold_stage(
+        self, component: str, blocks: Collection[Any]
+    ) -> tuple[bool, tuple[object, ...]]:
+        """`held` for the rest of the open stage, entered once per component: whether it holds,
+        and `layout` as it holds them."""
+        ...
+
     def layout(self, component: str, blocks: Collection[Any]) -> tuple[object, ...]:
         """Where `component`'s common weights and `blocks` are bound now: a graph recorded over
         them replays only while this is unchanged."""
@@ -256,6 +263,32 @@ PLACED: weakref.WeakKeyDictionary[object, tuple[Residency, str]] = weakref.WeakK
 #: callables that drop it and say whether there was any: the plane calls them before it unmaps
 #: weights for room.
 RELEASERS: list[Callable[[], bool]] = []
+#: Warnings Runtime's speed mechanisms raise (a graph that would not record or replayed wrong),
+#: as (message, fields): the executor puts each in the run it served and clears them.
+WARNINGS: list[tuple[str, dict[str, str | bool | int | float | None]]] = []
+
+
+def uncaptured(*names: str) -> Callable[[type[ModelT]], type[ModelT]]:
+    """Declare components whose calls Runtime never records as CUDA graphs: a component whose
+    calls depend on state outside their arguments (a cache it mutates, a host-side branch on
+    tensor values) runs as written."""
+    if not names or any(
+        not isinstance(name, str) or not name.replace("_", "").isalnum() for name in names
+    ):
+        raise ConformanceError(
+            f"@uncaptured{names!r}: name one or more components by plain identifier",
+            code="uncaptured_components",
+        )
+
+    def decorate(cls: type[ModelT]) -> type[ModelT]:
+        if not (inspect.isclass(cls) and issubclass(cls, Model)):
+            raise ConformanceError(
+                "@uncaptured decorates a Model class", code="uncaptured_components"
+            )
+        cls.__uncaptured__ = tuple(dict.fromkeys(names))
+        return cls
+
+    return decorate
 
 
 class Placement(Protocol):
@@ -504,6 +537,8 @@ class Model[PipelineT]:
 
     __placeable__: tuple[str, ...] = ()
     """`@placeable(...)`: components the runtime may host on another GPU of the group."""
+    __uncaptured__: tuple[str, ...] = ()
+    """`@uncaptured(...)`: components whose calls are never recorded as CUDA graphs."""
 
     __encoded_leaves__: str = "refuse"
     """The class's `encoded_leaves=` declaration, defaulted to the conservative answer.
