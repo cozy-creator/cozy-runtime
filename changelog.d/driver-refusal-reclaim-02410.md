@@ -1,0 +1,1 @@
+Runtime 0.24.10: a map the device refuses reclaims room by unmapping idle weights instead of failing with "needs 0 B", so a second request under memory pressure runs (H3 nvfp4 on a 5090, runs 9374/9458; the describer on sm86, 0.24.4 run 6972), and the request after a spill no longer runs 3× slower.
