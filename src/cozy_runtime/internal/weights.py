@@ -4255,7 +4255,7 @@ class WeightResidency:
 
         return run
 
-    def _root(self, component: Component, forward: Callable[..., Any]) -> Callable[..., Any]:
+    def _root[**P, R](self, component: Component, forward: Callable[P, R]) -> Callable[P, R]:
         """The component's own call (`unet(...)`) inside the process's recovery recovers as
         one: once its first call showed it changes nothing outside itself, it runs with no
         dispatch layer, its ops between blocks paying none; one that then runs out of device
@@ -4265,7 +4265,7 @@ class WeightResidency:
         weights = self.weights
         torch = weights.torch
 
-        def call(*args: Any, **kwargs: Any) -> Any:
+        def call(*args: P.args, **kwargs: P.kwargs) -> R:
             mode = _innermost(torch)
             if mode is None or mode.weights is not weights or weights.grouped:
                 return forward(*args, **kwargs)

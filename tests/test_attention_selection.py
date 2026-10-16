@@ -171,7 +171,7 @@ def test_every_candidate_states_the_architectures_it_serves() -> None:
         frozenset({89, 90, 120}),
         attention_upstream.SAGE,
     )
-    assert attention.BY_NAME["sol-attn"].sms == frozenset({89, 90, 100, 120})
+    assert attention.BY_NAME["sol-attn"].sms == frozenset({89, 90, 100, 103, 120})
     fp16pv = attention.BY_NAME["sageattention-fp16pv"]
     assert (fp16pv.min_sm, fp16pv.max_sm, fp16pv.artifact) == (90, 90, "sageattention-full")
     assert attention.BY_NAME["cudnn"].max_sm == 0 and attention.BY_NAME["sdpa"].max_sm == 0
