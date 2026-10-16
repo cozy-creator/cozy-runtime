@@ -219,26 +219,24 @@ RELEASERS.append(release)
 
 
 def _dispatch(module: Any, call: Callable[..., Any], args: Any, kwargs: Any) -> Any:
-    if (
-        BYPASS.get()
-        or not torch.cuda.is_available()
-        or torch.is_grad_enabled()
-        or torch.cuda.is_current_stream_capturing()
-        or _ACTIVE_LAYOUT.get() is not None
-        or _capture_clock.get() is not None
-        or (torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1)
-    ):
+    if BYPASS.get() or not torch.cuda.is_available() or torch.cuda.is_current_stream_capturing():
         return call(module, *args, **kwargs)
     leaves, spec = pytree.tree_flatten((args, kwargs))
-    tensors = [leaf for leaf in leaves if isinstance(leaf, torch.Tensor)]
-    if (
-        not tensors
-        or not all(tensor.is_cuda for tensor in tensors)
-        or not all(
-            isinstance(leaf, (torch.Tensor, torch.dtype, torch.device)) or type(leaf) in _PLAIN
-            for leaf in leaves
-        )
-    ):
+    why = (
+        "with gradients"
+        if torch.is_grad_enabled()
+        else "in an attention layout's scope"
+        if _ACTIVE_LAYOUT.get() is not None
+        else "under an activation capture"
+        if _capture_clock.get() is not None
+        else "across GPUs"
+        if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1
+        else _unplain(leaves)
+    )
+    if why:
+        placed = PLACED.get(module)
+        if placed is not None:
+            placed[0].note(f"{placed[1]}.graphs", f"runs as written {why}")
         return call(module, *args, **kwargs)
     recorder = _RECORDERS.get(module)
     if recorder is None:
@@ -387,6 +385,22 @@ def _seconds(step: Callable[[], object]) -> float:
     step()
     torch.cuda.synchronize()
     return time.perf_counter() - started
+
+
+def _unplain(leaves: list[Any]) -> str:
+    """Why a call's arguments cannot be replayed into, or ""."""
+    tensors = [leaf for leaf in leaves if isinstance(leaf, torch.Tensor)]
+    if not tensors:
+        return "with no tensor argument"
+    if not all(tensor.is_cuda for tensor in tensors):
+        return "with a tensor argument off the GPU"
+    for leaf in leaves:
+        if (
+            not isinstance(leaf, (torch.Tensor, torch.dtype, torch.device))
+            and type(leaf) not in _PLAIN
+        ):
+            return f"with a {type(leaf).__name__} argument"
+    return ""
 
 
 def _floats(out: Any) -> list[Any]:
