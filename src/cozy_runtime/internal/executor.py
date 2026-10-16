@@ -215,6 +215,7 @@ from cozy_runtime.internal.parallel.plan import (
     rank_invariant_digest,
 )
 from cozy_runtime.internal.pieces import Pieces
+from cozy_runtime.internal.resolution import RefusedLeaves
 from cozy_runtime.internal.seam import (
     EXECUTOR_PROTOCOL_REVISION,
     RESULT_DOCUMENT,
@@ -713,6 +714,8 @@ class Executor:
         self._attention_hold = contextlib.ExitStack()
         self._producer_hold: tuple[str, dict[str, object]] | None = None
         self.facts: dict[str, Any] = {}
+        #: what this generation's plan serves decoded because the device refused its leaf
+        self.refused_leaves: tuple[RefusedLeaves, ...] = ()
         self.schema_digests: dict[str, str] = {}
         #: request_id -> the record `prepare_request` resolved, run by `invoke`
         self.prepared: dict[str, PreparedRequest] = {}
@@ -2690,6 +2693,14 @@ class Executor:
         )
         record = registry.generations()[0].record
         self.plan = plan
+        self.refused_leaves = plan.refused_leaves()
+        for group in self.refused_leaves:
+            print(
+                f"[executor] {group.component}: {group.tensors} {group.lane} tensor(s) serve "
+                f"decoded, leaf {group.leaf} refused on {device_facts.predicate}: {group.reason}",
+                file=sys.stderr,
+                flush=True,
+            )
         self.attention = applied
         constructed_preimage = canonical.write(
             {
@@ -3396,6 +3407,11 @@ class Executor:
                 record = AuthorAttempt(command.request_id, spool, 0, sink=progress)
         assert record is not None
         self.handled = (outcome, stage[0], record)
+        if self.rank == 0:
+            for member in self.model_executors or [self]:
+                for group in member.refused_leaves:
+                    fields = dataclasses.asdict(group)
+                    record.emit("log", "encoded leaf refused, served decoded", "warn", **fields)
         stage_memo.ENGINE.close(record.emit)
         if later:
             # The override put back the run's first selection; the construction keeps its last.

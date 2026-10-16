@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Protocol
@@ -62,6 +63,7 @@ from cozy_runtime.internal.encoding import (
     Encoded,
     EncodingRefusal,
     Provider,
+    Refusal,
     RuntimeIdentity,
     Selection,
     Selector,
@@ -234,6 +236,9 @@ class TensorResolution:
     rule, and the decode floor serves it — IN the plan, not in a log nobody keeps."""
     leaf_speedup_x: float = -1.0
     """`CapabilityRecord.leaf_speedup_x` of the implementation this row resolved to."""
+    refused: Refusal | None = None
+    """Set when this row is served decoded because this device REFUSED its encoded leaf;
+    None when its route is by design (`reason`)."""
 
     def identity(self) -> dict[str, str | list[int]]:
         """What the plan DIGEST takes from this row. Measurements are excluded on purpose:
@@ -262,7 +267,20 @@ class TensorResolution:
             "kernel_numeric_error": self.kernel_numeric_error,
             "leaf_speedup_x": self.leaf_speedup_x,
             "reason": self.reason,
+            "refused": f"{self.refused.leaf}: {self.refused.reason}" if self.refused else "",
         }
+
+
+@dataclass(frozen=True, slots=True)
+class RefusedLeaves:
+    """One component's tensors of one lane that serve decoded because this device refused
+    their leaf for one reason. A run served by such a plan says so in its record."""
+
+    component: str
+    lane: str
+    leaf: str
+    reason: str
+    tensors: int
 
 
 # ------------------------------------------------------------------------- THE PLAN
@@ -299,6 +317,14 @@ class ResolvedModelPlan:
     def by_key(self) -> dict[str, TensorResolution]:
         """contract key -> its resolution. The fill plane EXECUTES this map (cr-025)."""
         return {row.key: row for row in self.tensors}
+
+    def refused_leaves(self) -> tuple[RefusedLeaves, ...]:
+        groups = Counter(
+            (row.component, row.alias, row.refused.leaf, row.refused.reason)
+            for row in self.tensors
+            if row.refused is not None
+        )
+        return tuple(RefusedLeaves(*group, n) for group, n in sorted(groups.items()))
 
     def route_census(self) -> dict[str, int]:
         census: dict[str, int] = {}
@@ -919,6 +945,11 @@ def _build(
                 kernel_numeric_error=selection.record.kernel_numeric_error,
                 reason=_reason(selection, found, policy),
                 leaf_speedup_x=selection.record.leaf_speedup_x,
+                refused=found.refused[0]
+                if found.refused
+                and encoded_leaves == "accept"
+                and selection.provider.route == "decoded_float"
+                else None,
             )
         )
     return ResolvedModelPlan(
