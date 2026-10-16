@@ -263,6 +263,9 @@ PLACED: weakref.WeakKeyDictionary[object, tuple[Residency, str]] = weakref.WeakK
 #: callables that drop it and say whether there was any: the plane calls them before it unmaps
 #: weights for room.
 RELEASERS: list[Callable[[], bool]] = []
+#: Kernel builds this process loaded after it started (a boot build landing): calls may take a
+#: faster path from each on, so graphs record them again. None loads while a graph records.
+LANDED: list[int] = [0]
 #: Warnings Runtime's speed mechanisms raise (a graph that would not record or replayed wrong),
 #: as (message, fields): the executor puts each in the run it served and clears them.
 WARNINGS: list[tuple[str, dict[str, str | bool | int | float | None]]] = []

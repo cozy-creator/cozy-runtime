@@ -26,6 +26,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+from cozy_runtime.author._model import LANDED
 from cozy_runtime.author.kernels import readable
 from cozy_runtime.internal import kernel_cache, kernel_compile, kernel_sources
 from cozy_runtime.internal.encoding.formats import CONVROT_GROUP, Tensor, hadamard256
@@ -65,7 +66,12 @@ def _built(
     it) and for good when this card or machine cannot have it, said once."""
     state = states.setdefault(index, _Build())
     now = time.monotonic()
-    if state.served is not None or state.final or now - state.asked < POLL_SECONDS:
+    if (
+        state.served is not None
+        or state.final
+        or now - state.asked < POLL_SECONDS
+        or torch.cuda.is_current_stream_capturing()  # a load would end the graph being recorded
+    ):
         return state.served
     state.asked = now
     major, minor = torch.cuda.get_device_capability(index)
@@ -73,6 +79,7 @@ def _built(
     try:
         state.served = opened(sm)
         if state.served is not None:
+            LANDED[0] += 1
             print(f"[int8] {name} serves sm{sm}", file=sys.stderr)
     except Exception as exc:  # the next path serves this process; said once
         state.final = f"{type(exc).__name__}: {exc}"[:300]

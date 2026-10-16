@@ -46,7 +46,7 @@ from typing import Any
 
 from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT
 from cozy_runtime.author._capture import _capture_clock
-from cozy_runtime.author._model import PLACED, RELEASERS, WARNINGS
+from cozy_runtime.author._model import LANDED, PLACED, RELEASERS, WARNINGS
 from cozy_runtime.internal import attention_ulysses
 
 try:
@@ -145,6 +145,17 @@ class _Recorder:
         self.structure: tuple[object, tuple[object, ...]] = (None, ())
         self.pool_bytes = self.replays = self.plain = 0
         self.record_s = 0.0
+        #: `LANDED` when it last started over: a kernel landing since changes what calls run
+        self.landed = LANDED[0]
+
+    def forget(self) -> None:
+        """Start over: what was recorded or decided ran code a kernel landing replaced."""
+        self.landed = LANDED[0]
+        self.seen.clear()
+        self.failed.clear()
+        self.tries.clear()
+        self.recordings.clear()
+        self.pool, self.pool_bytes, self.plain = None, 0, 0
 
 
 #: Every graphed component's recorder in this process.
@@ -229,6 +240,8 @@ def _dispatch(module: Any, call: Callable[..., Any], args: Any, kwargs: Any) -> 
     recorder = _RECORDERS.get(module)
     if recorder is None:
         recorder = _RECORDERS[module] = _Recorder()
+    if recorder.landed != LANDED[0]:
+        recorder.forget()
     key = _signature(module, leaves, spec)
     if key in recorder.failed:
         return call(module, *args, **kwargs)
@@ -261,6 +274,8 @@ def _dispatch(module: Any, call: Callable[..., Any], args: Any, kwargs: Any) -> 
     if entry is not None and entry.layout != layout:
         del recorder.recordings[key]  # its weights moved, or its code: it records again
         entry = None
+        if not recorder.recordings:  # its pool went with its last graph
+            recorder.pool = None
     if entry is None:
         entry = _record(module, call, leaves, spec, recorder, key, layout)
         if entry is None:
@@ -282,7 +297,7 @@ def _record(
 ) -> _Recording | None:
     """Record the call at `key` into the component's pool, and check its first replay against
     the call run as written. None, with a run warning, when it cannot be."""
-    started = time.perf_counter()
+    started, landed = time.perf_counter(), LANDED[0]
     if recorder.pool is None:
         recorder.pool, recorder.stream = torch.cuda.graph_pool_handle(), torch.cuda.Stream()
     reserved = torch.cuda.memory_reserved()
@@ -314,7 +329,9 @@ def _record(
             ),
             default=0.0,
         )
-        if len(replayed) != len(written) or not error <= TOLERANCE:
+        if LANDED[0] != landed:
+            graph, why = None, ""  # a kernel landed meanwhile: the next call starts over
+        elif len(replayed) != len(written) or not error <= TOLERANCE:
             graph, why = None, f"its first replay is {error:.2e} from the call run as written"
         elif _seconds(graph.replay) > PAYS * written_s:
             graph, why = None, ""  # as fast as written: not worth its memory
