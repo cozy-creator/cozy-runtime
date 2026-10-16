@@ -15,7 +15,9 @@ class AttentionLayout:
 
     Dense paths are component-relative attention module prefixes. They protect
     refiners or sensitive layers without making a generic backend infer model
-    semantics from tensor values. Step indices are zero-based. This describes
+    semantics from tensor values. Exact paths are the layers whose dense rows keep
+    BF16 attention when the dense kernel quantizes (a layer whose keys a per-head
+    8-bit scale cannot carry). Step indices are zero-based. This describes
     inference only; it does not authorize a backend or select a kernel.
     """
 
@@ -24,6 +26,7 @@ class AttentionLayout:
     step: int
     dense_until_step: int = 0
     dense_paths: tuple[str, ...] = ()
+    exact_paths: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         for name in ("live_tokens", "protected_prefix", "step", "dense_until_step"):
@@ -32,11 +35,13 @@ class AttentionLayout:
                 raise ValueError(f"{name} must be a nonnegative integer")
         if not self.live_tokens or self.protected_prefix > self.live_tokens:
             raise ValueError("attention layout requires a live document containing its prefix")
-        if not isinstance(self.dense_paths, tuple) or any(
-            not isinstance(path, str) or not path or path.startswith(".") or path.endswith(".")
-            for path in self.dense_paths
-        ):
-            raise ValueError("dense_paths must be a tuple of nonempty module prefixes")
+        for name in ("dense_paths", "exact_paths"):
+            paths = getattr(self, name)
+            if not isinstance(paths, tuple) or any(
+                not isinstance(path, str) or not path or path.startswith(".") or path.endswith(".")
+                for path in paths
+            ):
+                raise ValueError(f"{name} must be a tuple of nonempty module prefixes")
 
 
 _ACTIVE_LAYOUT: ContextVar[AttentionLayout | None] = ContextVar(

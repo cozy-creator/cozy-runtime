@@ -1,0 +1,1 @@
+`flash-attn4-fp8` rotates Q and K by a Hadamard before its per-head E4M3 scales (B200, real H3 Q/K/V: 0.026 rel L2, 205 ms against cuDNN BF16's 267). A model's `AttentionLayout.exact_paths` keep BF16 attention for their dense rows when Sol's dense kernel quantizes: Sol binds the next exact kernel of the model's order beside it.
