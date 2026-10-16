@@ -143,7 +143,10 @@ class _Recorder:
         self.stream: Any = None
         #: the stage hold its structure was read under, and that structure
         self.structure: tuple[object, tuple[object, ...]] = (None, ())
-        self.pool_bytes = self.replays = self.plain = 0
+        self.pool_bytes = self.replays = 0
+        #: signatures that run as written by choice, by why, and the latest one's detail
+        self.chose: dict[str, int] = {}
+        self.detail = ""
         self.record_s = 0.0
         #: `LANDED` when it last started over: a kernel landing since changes what calls run
         self.landed = LANDED[0]
@@ -155,7 +158,7 @@ class _Recorder:
         self.failed.clear()
         self.tries.clear()
         self.recordings.clear()
-        self.pool, self.pool_bytes, self.plain = None, 0, 0
+        self.pool, self.pool_bytes, self.chose = None, 0, {}
 
 
 #: Every graphed component's recorder in this process.
@@ -243,9 +246,11 @@ def _dispatch(module: Any, call: Callable[..., Any], args: Any, kwargs: Any) -> 
     if recorder.landed != LANDED[0]:
         recorder.forget()
     key = _signature(module, leaves, spec)
-    if key in recorder.failed:
-        return call(module, *args, **kwargs)
     placed = PLACED.get(module)
+    if key in recorder.failed:
+        if placed is not None:
+            placed[0].note(f"{placed[1]}.graphs", _facts(recorder))
+        return call(module, *args, **kwargs)
     if key not in recorder.seen:
         # The first call of a signature: as written, through the hooks, which record its blocks.
         recorder.seen.add(key)
@@ -255,9 +260,9 @@ def _dispatch(module: Any, call: Callable[..., Any], args: Any, kwargs: Any) -> 
             out = call(module, *args, **kwargs)
         launched = time.perf_counter() - started
         torch.cuda.synchronize()
-        if launched < HOST_BOUND * (time.perf_counter() - started):
-            recorder.failed.add(key)
-            recorder.plain += 1
+        took = time.perf_counter() - started
+        if launched < HOST_BOUND * took:
+            _chose(recorder, key, "GPU-bound", f"launched in {launched:.3f} of {took:.3f} s")
             if placed:
                 placed[0].note(f"{placed[1]}.graphs", _facts(recorder))
         for name, blocks in read.items():
@@ -333,10 +338,14 @@ def _record(
         )
         if LANDED[0] != landed:
             graph, why = None, ""  # a kernel landed meanwhile: the next call starts over
+            _chose(recorder, key, "kernel landed", "")
         elif len(replayed) != len(written) or not error <= TOLERANCE:
             graph, why = None, f"its first replay is {error:.2e} from the call run as written"
-        elif _seconds(graph.replay) > PAYS * written_s:
+        elif (replay_s := _seconds(graph.replay)) > PAYS * written_s:
             graph, why = None, ""  # as fast as written: not worth its memory
+            _chose(
+                recorder, key, "no faster", f"replay {replay_s:.4f} s, {written_s:.4f} s as written"
+            )
     recorder.record_s += time.perf_counter() - started
     if graph is None:
         outputs.clear()
@@ -347,7 +356,6 @@ def _record(
             recorder.pool = None  # spent: the next recording takes a new one
             torch.cuda.empty_cache()
         if not why:
-            recorder.plain += 1
             return None
         line = f"{type(module).__name__} runs as written at this signature: {why}"
         say(f"graphs:{type(module).__name__}:{why[:40]}", f"[graphs] {line}")
@@ -362,11 +370,18 @@ def _record(
     return entry
 
 
+def _chose(recorder: _Recorder, key: tuple[object, ...], why: str, detail: str) -> None:
+    recorder.failed.add(key)
+    recorder.chose[why] = recorder.chose.get(why, 0) + 1
+    recorder.detail = f"{why}: {detail}" if detail else why
+
+
 def _facts(recorder: _Recorder) -> str:
+    chose = ", ".join(f"{n} {why}" for why, n in recorder.chose.items())
     return (
         f"{len(recorder.recordings)} recorded in {recorder.record_s:.2f} s, "
-        f"{recorder.plain} as fast as written, "
         f"{recorder.replays} replays, pool {recorder.pool_bytes >> 20} MiB"
+        + (f"; as written: {chose} ({recorder.detail})" if chose else "")
     )
 
 
