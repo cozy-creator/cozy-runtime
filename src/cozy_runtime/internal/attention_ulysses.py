@@ -59,8 +59,11 @@ class Local:
     head_local: bool = True
 
 
-#: backend -> implementations served in the observed scope on this rank
-_SEEN: ContextVar[dict[str, set[str]] | None] = ContextVar("cozy_attention_seen", default=None)
+#: backend -> implementations served in the observed scope on this rank, and the operand
+#: signatures already named there (an implementation is named once per signature, not per call)
+_SEEN: ContextVar[tuple[dict[str, set[str]], set[object]] | None] = ContextVar(
+    "cozy_attention_seen", default=None
+)
 _MEMBERS: dict[str, AttentionBackendName] = {}
 
 
@@ -68,7 +71,7 @@ _MEMBERS: dict[str, AttentionBackendName] = {}
 def observing() -> Iterator[dict[str, set[str]]]:
     """Collect, per backend, the implementations that served on this rank in this scope."""
     seen: dict[str, set[str]] = {}
-    token = _SEEN.set(seen)
+    token = _SEEN.set((seen, set()))
     try:
         yield seen
     finally:
@@ -130,11 +133,14 @@ def _dispatch(backend: str, local: Local) -> Callable[..., Tensor]:
 def _call(
     backend: str, local: Local, query: Tensor, key: Tensor, value: Tensor, options: Options
 ) -> Tensor:
-    import torch
-
-    seen = _SEEN.get()
-    if seen is not None and not torch.compiler.is_compiling():
-        seen.setdefault(backend, set()).add(local.impl(query, key, value, options))
+    scope = _SEEN.get()
+    if scope is not None:
+        masked, causal = options["attn_mask"] is not None, options["is_causal"]
+        signature = (backend, query.shape, key.shape, query.dtype, masked, causal)
+        seen, named = scope
+        if signature not in named:
+            named.add(signature)
+            seen.setdefault(backend, set()).add(local.impl(query, key, value, options))
     return local.forward(query, key, value, **options)
 
 
@@ -237,6 +243,6 @@ def describe(seen: dict[str, set[str]], names: dict[str, str]) -> str:
 
 def record(backend: str, implementation: str) -> None:
     """Record a producer that projects before the ordinary Q/K/V dispatch seam."""
-    seen = _SEEN.get()
-    if seen is not None:
-        seen.setdefault(backend, set()).add(implementation)
+    scope = _SEEN.get()
+    if scope is not None:
+        scope[0].setdefault(backend, set()).add(implementation)
