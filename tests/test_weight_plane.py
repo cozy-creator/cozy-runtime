@@ -1998,6 +1998,60 @@ def test_a_group_gpus_first_decode_keeps_its_denoisers_weights_under_a_cap(
 
 
 @on_card
+def test_a_components_call_runs_without_a_dispatch_layer_and_recovers_whole(card: Any) -> None:
+    """A component's own call inside the process's recovery: its first is observed, the next
+    pass no op through the dispatch layer, and its blocks run on the stage's held leases. One
+    that runs out of device memory outside its blocks makes room and runs again from its
+    start, exactly, its ops recovering one by one from then on."""
+    weights = card.weights
+    model = load(weights, card.checkpoint, "root")
+    component = model.residency.components["stack"]
+    x = torch.randn(8192, HIDDEN, device="cuda", dtype=torch.float16)
+    weights.set_budget(1 << 30)
+    reference = run(model, x, passes=1)
+    kind = weights_module._OPS.setdefault(id(torch), weights_module._ops_type(torch))
+    counted = {"ops": 0, "acquires": 0}
+    original_run, original_acquire = kind._run, WeightResidency._acquire
+
+    def op(self: Any, *args: Any) -> Any:
+        counted["ops"] += 1
+        return original_run(self, *args)
+
+    def acquire(self: Any, *args: Any) -> Any:
+        counted["acquires"] += 1
+        return original_acquire(self, *args)
+
+    kind._run, WeightResidency._acquire = op, acquire
+    ballast = None
+    try:
+        for _ in range(2):  # a cyclic stage: its second entry holds its resident blocks
+            model.residency.admit("run", ("stack",))
+            with weights.recovering(), torch.inference_mode():
+                model.stack(x)
+            model.residency.release("run", ("stack",))
+        assert component.effects is not None and not component.effects.writes
+        assert set(component.holds) == {region.index for region in component.blocks}
+        counted.update(ops=0, acquires=0)
+        model.residency.admit("run", ("stack",))
+        with weights.recovering(), torch.inference_mode():
+            steady = model.stack(x)
+            assert counted == {"ops": 0, "acquires": 0}
+            retries = weights.oom_retries
+            torch.cuda.empty_cache()
+            free, _ = torch.cuda.mem_get_info()
+            # less than `x * embed` takes: the call's first op, outside every block
+            ballast = torch.empty(free - (16 << 20), dtype=torch.uint8, device="cuda")
+            out = model.stack(x)
+    finally:
+        kind._run, WeightResidency._acquire = original_run, original_acquire
+        model.residency.release("run", ("stack",))
+        del ballast
+        torch.cuda.empty_cache()
+    assert component.tight and weights.oom_retries > retries
+    assert same(reference, [steady]) and same(reference, [out])
+
+
+@on_card
 def test_an_op_outside_every_block_runs_again_after_weights_leave(card: Any) -> None:
     """Package arithmetic between component calls allocates too: when it cannot, idle and
     then resident weights are unmapped and that one op runs again."""
