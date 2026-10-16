@@ -30,10 +30,9 @@ from cozy_runtime.author.kernels import (
     INT8_CONVROT,
     ROWWISE_FP8,
     PreQuantized,
-    readable,
     shared_operand,
 )
-from cozy_runtime.internal import int8_linear, nvfp4_linear
+from cozy_runtime.internal import fp8_linear, int8_linear, nvfp4_linear
 from cozy_runtime.internal.encoding.formats import (
     E4M3_MAX,
     E8M0_BIAS,
@@ -49,114 +48,6 @@ from cozy_runtime.internal.encoding.formats import (
     _rank2,
     refuse,
 )
-
-#: The activation scale's floor, and the same policy `ROW_SCALE_FLOOR` states for weights:
-#: a row of exact zeros has amax 0, and dividing by it poisons a whole output row with NaN.
-ACT_SCALE_FLOOR = 1e-12
-
-
-def _triton_rowwise_kernel() -> Any:
-    """The FUSED spelling of `quantize_activation_rowwise`, compiled once, lazily.
-
-    cr-086 measured #515f's warning coming true on sm89 at the real Anima DiT shapes: the
-    unfused six-pass quantize costs 1.2-5.1 ms around a GEMM that costs 1.0-6.6 ms, so the
-    whole w8a8 leaf ran at 0.60-1.14x the bf16 linear it replaced while the fp8 GEMM alone
-    ran at 1.6-2.0x. One Triton kernel — a per-row amax reduction and the scaled cast in a
-    single launch — does the same arithmetic (same divide, same clamp, same RTNE cast) in
-    0.03-0.54 ms and turns the leaf into the speedup the tensor cores promise.
-
-    Same divide (`div_rn`, IEEE round-nearest — triton's bare `/` is an approximate
-    reciprocal and measurably drifts), same clamp, same floor. The one honest difference:
-    triton's f32->e4m3 downcast double-rounds through f16, so values landing exactly on a
-    representational tie pick the other neighbour (~0.25% of elements, one fp8 code) —
-    inside the probe's deviation bound, and the probe measures whichever path actually runs.
-
-    Returns the compiled kernel, or None where triton is absent or refuses this device;
-    the eager spelling below stays the executable floor.
-    """
-    cached = getattr(_triton_rowwise_kernel, "_cached", "unset")
-    if cached != "unset":
-        return cached
-    try:
-        import triton
-        import triton.language as tl
-
-        @triton.jit  # type: ignore[untyped-decorator]
-        def _kernel(  # type: ignore[no-untyped-def]
-            x_ptr, out_ptr, scale_ptr, columns, stride_x, stride_out, BLOCK: tl.constexpr
-        ):
-            # int64: `row * stride` passes 2**31 elements at H3's 15 s + 56-frame continuation
-            # (~155k rows into the 14336-wide FFN out projection) and wrapped to a negative offset.
-            row = tl.program_id(0).to(tl.int64)
-            offsets = tl.arange(0, BLOCK)
-            amax = tl.zeros((BLOCK,), dtype=tl.float32)
-            for start in range(0, columns, BLOCK):
-                index = start + offsets
-                value = tl.load(x_ptr + row * stride_x + index, mask=index < columns, other=0.0).to(
-                    tl.float32
-                )
-                amax = tl.maximum(amax, tl.abs(value))
-            scale = tl.maximum(tl.max(amax, axis=0) / 448.0, 1e-12)
-            tl.store(scale_ptr + row, scale)
-            for start in range(0, columns, BLOCK):
-                index = start + offsets
-                value = tl.load(x_ptr + row * stride_x + index, mask=index < columns, other=0.0).to(
-                    tl.float32
-                )
-                quantized = tl.clamp(tl.div_rn(value, scale), -448.0, 448.0)
-                tl.store(
-                    out_ptr + row * stride_out + index,
-                    quantized.to(tl.float8e4nv, fp_downcast_rounding="rtne"),
-                    mask=index < columns,
-                )
-
-    except Exception:
-        _kernel = None
-    _triton_rowwise_kernel._cached = _kernel  # type: ignore[attr-defined]
-    return _kernel
-
-
-def quantize_activation_rowwise(torch: Any, x: Any) -> tuple[Any, Any]:
-    """`[..., K]` float -> `[M, K]` E4M3 payload + `[M, 1]` f32 per-TOKEN scale.
-
-    v1's proven recipe (`gen_worker/models/w8a8.py::_quant_src`), transcribed: amax over the
-    reduction axis, `.float()` BEFORE the divide so the scale is f32 whatever the activation
-    is, the literal 448.0 rather than `finfo.max`, a floor, and the clamp BEFORE the cast
-    because the cast does not saturate. One scale per ROW of the `[M, K]` operand is what
-    pairs with a per-output-row weight scale: the two scale vectors are the two OUTER
-    dimensions of the product and neither is the reduction axis.
-
-    #515f named the unfused cost honestly — six elementwise passes over `[M, K]` around a
-    GEMM costing `M*K*N`, disappearing only "when the quantize is fused into one kernel" —
-    and `_triton_rowwise_kernel` is that fusion (cr-086): one launch, deviation noted on
-    its docstring. A CUDA operand takes it when triton built; everything else (CPU probes,
-    a venv without triton, a launch failure) runs the eager passes below and stays correct.
-
-    NOT a probe-only helper, despite the family resemblance to `instruments.py`'s two: this
-    one runs inside every forward pass of a rowwise encoded leaf.
-    """
-    if isinstance(x, PreQuantized):
-        return x.payload, x.scale
-    flat = x.reshape(-1, x.shape[-1])
-    if flat.is_cuda and flat.numel() and flat.stride(-1) == 1:
-        kernel = _triton_rowwise_kernel()
-        if kernel is not None:
-            rows, columns = int(flat.shape[0]), int(flat.shape[1])
-            out = torch.empty(rows, columns, dtype=torch.float8_e4m3fn, device=flat.device)
-            scale = torch.empty(rows, 1, dtype=torch.float32, device=flat.device)
-            try:
-                with readable(flat) as (flat,):
-                    kernel[(rows,)](
-                        flat, out, scale, columns, flat.stride(0), columns, BLOCK=1024, num_warps=8
-                    )
-                return out, scale
-            except Exception:
-                # One honest disable: a device triton cannot serve falls to eager for the
-                # life of the process rather than re-raising per forward.
-                _triton_rowwise_kernel._cached = None  # type: ignore[attr-defined]
-    amax = flat.abs().amax(dim=-1, keepdim=True).float()
-    scale = (amax / E4M3_MAX).clamp(min=ACT_SCALE_FLOOR)
-    return (flat.float() / scale).clamp(-E4M3_MAX, E4M3_MAX).to(torch.float8_e4m3fn), scale
 
 
 def quantize_activation_mx(torch: Any, x: Any) -> tuple[Any, Any]:
@@ -216,11 +107,6 @@ def from_blocked(torch: ModuleType, blocked: Tensor, rows: int, cols: int) -> Te
     row_blocks, col_blocks = padded_rows // 128, padded_cols // 4
     tiles = blocked.reshape(-1, 32, 4, 4).transpose(1, 2).reshape(row_blocks, col_blocks, 128, 4)
     return tiles.permute(0, 2, 1, 3).reshape(padded_rows, padded_cols)[:rows, :cols]
-
-
-def _rowwise(torch: ModuleType, x: Tensor) -> PreQuantized:
-    payload, scale = quantize_activation_rowwise(torch, x)
-    return PreQuantized(payload, scale, tuple(x.shape))
 
 
 def _leaf_class(torch: Any) -> Any:
@@ -294,8 +180,6 @@ def _leaf_class(torch: Any) -> Any:
                 dtype = torch.get_autocast_dtype(x.device.type)
                 out = self._cozy_forward(self, x.to(dtype), dtype)
             else:
-                if prequantized is None and self.provider == ROWWISE_FP8:
-                    prequantized = shared_operand(x, ROWWISE_FP8, lambda: _rowwise(torch, x))
                 operand = x if prequantized is None else prequantized
                 out = self._cozy_forward(self, operand, self.out_dtype)
             if self.bias is not None:
@@ -313,34 +197,38 @@ def _leaf_class(torch: Any) -> Any:
     return EncodedLinear
 
 
-def _int8_leaf_class(torch: Any) -> Any:
-    """`EncodedLinear` whose forward is one `int8_linear.linear` call, the bias in its epilogue."""
-    cached = getattr(_int8_leaf_class, "_cached", None)
+#: The 8-bit leaves' ops, by provider: each module's `quantize`, `gemm` and `linear`.
+_NATIVE_OPS: dict[str, ModuleType] = {INT8_CONVROT: int8_linear, ROWWISE_FP8: fp8_linear}
+
+
+def _native_leaf_class(torch: ModuleType) -> type:
+    """`EncodedLinear` whose forward is one call of its provider's op (`int8_linear`,
+    `fp8_linear`), the bias in the GEMM's epilogue."""
+    cached: type | None = getattr(_native_leaf_class, "_cached", None)
     if cached is not None:
         return cached
 
-    class Int8ConvRotLinear(_leaf_class(torch)):  # type: ignore[misc]
-        def forward(self, x: Any, *, prequantized: PreQuantized | None = None) -> Any:
+    class NativeLinear(_leaf_class(torch)):  # type: ignore[misc]
+        def forward(
+            self, x: Tensor | PreQuantized, *, prequantized: PreQuantized | None = None
+        ) -> Tensor:
+            ops = _NATIVE_OPS[self.provider]
             out_dtype = self.out_dtype
             if isinstance(x, PreQuantized):
                 # A producer's prologue (`kernels.int8_rows`) hands the operand in place of x.
                 if torch.is_autocast_enabled(x.payload.device.type):
                     out_dtype = torch.get_autocast_dtype(x.payload.device.type)
-                return int8_linear.gemm(torch, x, self.data, self.scale, self.bias, out_dtype)
+                return ops.gemm(torch, x, self.data, self.scale, self.bias, out_dtype)
             cast = x
             if torch.is_autocast_enabled(x.device.type):
                 # As the replaced `nn.Linear` does: from and to the autocast dtype.
                 out_dtype = torch.get_autocast_dtype(x.device.type)
                 cast = x.to(out_dtype)
-            if prequantized is None or prequantized.provider != INT8_CONVROT:
-                prequantized = shared_operand(
-                    x, INT8_CONVROT, lambda: int8_linear.quantize(torch, cast)
-                )
+            if prequantized is None or prequantized.provider != self.provider:
+                prequantized = shared_operand(x, self.provider, lambda: ops.quantize(torch, cast))
             if prequantized is not None:
-                return int8_linear.gemm(
-                    torch, prequantized, self.data, self.scale, self.bias, out_dtype
-                )
-            return int8_linear.linear(torch, cast, self.data, self.scale, self.bias, out_dtype)
+                return ops.gemm(torch, prequantized, self.data, self.scale, self.bias, out_dtype)
+            return ops.linear(torch, cast, self.data, self.scale, self.bias, out_dtype)
 
         def int8_prologue(
             self,
@@ -364,8 +252,8 @@ def _int8_leaf_class(torch: Any) -> Any:
                 activation=activation,
             )
 
-    _int8_leaf_class._cached = Int8ConvRotLinear  # type: ignore[attr-defined]
-    return Int8ConvRotLinear
+    _native_leaf_class._cached = NativeLinear  # type: ignore[attr-defined]
+    return NativeLinear
 
 
 def _leaf_geometry(replaced: Any, data: Any) -> tuple[int, int, Any]:
@@ -383,27 +271,19 @@ def _leaf_geometry(replaced: Any, data: Any) -> tuple[int, int, Any]:
 
 @dataclass(frozen=True, slots=True)
 class RowwiseNativeLeaf:
-    """`fp8-rowwise/1` ENCODED GEMM: the tensor cores consume the stored E4M3 payload directly.
+    """`fp8-rowwise/1` ENCODED GEMM: the tensor cores consume the stored E4M3 payload directly
+    (`fp8_linear`).
 
-    #514b's engineering fact decides the shape: fp8 tensor cores need BOTH operands fp8, so
-    the serving form is necessarily **w8a8** — the weight is stored quantized and the
-    ACTIVATION is quantized at dispatch, per token, into the scale geometry that pairs with
-    the weight's per-output-row one. That is not weight-only quantization and this docstring
-    does not pretend it is: #517d measured the derived-w8a8 lane at 16.72 dB against the
-    dequant-bf16 lane's 20.82 dB on identical bytes, of which 1.48-1.63 dB is the activation
-    quantization alone. What it buys is the other half of the same measurement: 0.5003x the
-    resident VRAM, because the payload IS the weight.
+    fp8 tensor cores need BOTH operands fp8, so this is w8a8 (#514b): the activation is
+    quantized per token at dispatch, into the scale geometry that pairs with the weight's
+    per-output-row one. #517d measured that at 16.72 dB against the dequant-bf16 lane's 20.82
+    dB on identical bytes, 1.48-1.63 dB of it the activation quantization; it buys 0.5003x the
+    resident VRAM, because the payload IS the weight. The accumulation is the fast one, as
+    `_scaled_mm(use_fast_accum=True)`'s: on an L40S the default ran 0.52x bf16 and the fast
+    one 2.03x, for -0.007 to -0.018 dB (#517b).
 
-    **`use_fast_accum=True` is not a tuning knob here, it is the difference between winning
-    and losing** (#517b): measured on an L40S, the default accumulate path runs the fp8 GEMM
-    at 0.52x bf16 and the fast one at 2.03x, for -0.007 to -0.018 dB. v1 never passes the
-    flag and banked its own lane losing 0.81-0.93x to bf16 on the same shapes.
-
-    **The device predicate is a PROFITABILITY floor stated honestly.** #517c measured rowwise
-    `_scaled_mm` WORKING on sm89, which makes v1's `W8A8_ROWWISE_MIN_SM=90` a profitability
-    floor mislabelled as a capability floor. The floor here is `cuda.sm89+` because that is
-    where the kernel exists; whether it is PROFITABLE on a given card is what the probe
-    measures, and a card no probe ran on mints no record whatever this floor says.
+    The floor `cuda.sm89+` is where an fp8 tensor-core GEMM exists; whether it pays on a card
+    is what the probe measures.
     """
 
     encoding: str
@@ -447,17 +327,11 @@ class RowwiseNativeLeaf:
         return "contract"
 
     def supports(self, shape: Sequence[int]) -> str:
-        """Rank 2, and NOTHING ELSE IS CLAIMED (#549.5).
-
-        A per-output-row scale has no block structure, so there is no divisibility law to
-        state here the way `mxfp8/1` has one. `torch._scaled_mm` carries alignment
-        preferences of its own on some arches; NOTHING IN THIS FLEET HAS MEASURED THEM, and
-        a preflight that refused on an unmeasured guess would be exactly the hand-written
-        floor #511b forbids. A shape the kernel actually rejects raises inside the probe's
-        `_native_agreement`, mints no record, and falls to the decode floor — measured, not
-        guessed.
-        """
-        return _rank2(shape)
+        """Rank 2, and the fp8 GEMMs' 16-byte rows: K and N divisible by 16."""
+        why = _rank2(shape)
+        if why or (int(shape[0]) % 16 == 0 and int(shape[1]) % 16 == 0):
+            return why
+        return f"the fp8 GEMM needs K and N divisible by 16; this tensor is {list(shape)}"
 
     def decode(self, torch: Any, parts: Mapping[str, Any], destination: Any) -> None:
         raise AssertionError(
@@ -474,31 +348,11 @@ class RowwiseNativeLeaf:
     def fill_scratch_bytes(self, parts: Mapping[str, RolePart]) -> int:
         return 0
 
-    @staticmethod
-    def _forward(leaf: Any, x: Any, out_dtype: Any) -> Any:
-        import torch
-
-        payload, scale = leaf.data, leaf.scale
-        xq, xs = quantize_activation_rowwise(torch, x)
-        # `_scaled_mm` wants the second operand COLUMN-major, which `payload.t()` already is
-        # for a contiguous `[out, in]`. `scale_b` is per COLUMN of that operand, which is per
-        # OUTPUT row of the weight — and `reshape(1, -1)` is what serves the alias's rank-1
-        # `[out]` and rank-2 `[out, 1]` variants through one spelling.
-        out = torch._scaled_mm(
-            xq,
-            payload.t(),
-            scale_a=xs,
-            scale_b=scale.to(torch.float32).reshape(1, -1),
-            out_dtype=out_dtype,
-            use_fast_accum=True,
-        )
-        return out.reshape(*x.shape[:-1], -1)
-
     def leaf(self, torch: Any, parts: Mapping[str, Any], replaced: Any, out_dtype: Any) -> Any:
         data = parts["data"]
         in_features, out_features, bias = _leaf_geometry(replaced, data)
-        return _leaf_class(torch)(
-            RowwiseNativeLeaf._forward,
+        return _native_leaf_class(torch)(
+            None,
             {"data": data, "scale": parts["scale"]},
             bias,
             out_dtype,
@@ -751,7 +605,7 @@ class Int8ConvRotNativeLeaf:
             int8_linear.kitchen(torch, torch.cuda.current_device())
         data = parts["data"]
         in_features, out_features, bias = _leaf_geometry(replaced, data)
-        return _int8_leaf_class(torch)(
+        return _native_leaf_class(torch)(
             None,
             {"data": data, "scale": parts["scale"]},
             bias,

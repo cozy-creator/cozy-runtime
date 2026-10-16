@@ -8,7 +8,6 @@ from pathlib import Path
 import pytest
 import tensorfs
 from tensorfs.derived import Derivation, Part, Source, Target, Tensor
-from test_lora_composition import compose, fixture, header
 
 from cozy_runtime.author import Artifact, Config, ModelRegistry
 from cozy_runtime.author._loader import census
@@ -16,14 +15,15 @@ from cozy_runtime.internal import lora_composition
 from cozy_runtime.internal.encoding import SPEC_ROWWISE
 from cozy_runtime.internal.fill import Checkpoint, tensor_schema_of
 from native_weights import NativeExecution
+from test_lora_composition import compose, fixture, header
 
 
 def test_native_encoded_base_keeps_parts_and_matches_cpu_peft_arithmetic(tmp_path: Path) -> None:
     torch = pytest.importorskip("torch")
     pytest.importorskip("peft")
+    from cozy_runtime.internal.encoding.leaves import RowwiseNativeLeaf
+    from cozy_runtime.internal.fp8_linear import eager_quantize
     from test_lora_peft import TinyModel
-
-    from cozy_runtime.internal.encoding.leaves import RowwiseNativeLeaf, quantize_activation_rowwise
 
     class EncodedTinyModel(TinyModel, encoded_leaves="accept"):
         pass
@@ -131,7 +131,7 @@ def test_native_encoded_base_keeps_parts_and_matches_cpu_peft_arithmetic(tmp_pat
     assert not tuple(native.parameters())
     root.proj.base_layer = native
     x = torch.tensor([[1.25, -2, 0.5], [0, 1, 2]])
-    quantized, activation_scale = quantize_activation_rowwise(torch, x)
+    quantized, activation_scale = eager_quantize(torch, x)
     expected = (quantized.float() * activation_scale) @ (payload.float() * scales[:, None]).t()
     expected += torch.tensor([1.0, -1.0])
     for a, b, scale in (

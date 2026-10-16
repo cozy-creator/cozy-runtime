@@ -136,6 +136,7 @@ from cozy_runtime.internal import (
     child_env,
     execution_evidence,
     executor_commands,
+    int8_linear,
     kernel_cache,
     kernel_compile,
     model_config,
@@ -3331,6 +3332,13 @@ class Executor:
                 for group in member.refused_leaves:
                     fields = dataclasses.asdict(group)
                     record.emit("log", "encoded leaf refused, served decoded", "warn", **fields)
+            for missing in int8_linear.unavailable():
+                record.emit(
+                    "log",
+                    "8-bit op unavailable, slower kernels served",
+                    "warn",
+                    **dataclasses.asdict(missing),
+                )
         stage_memo.ENGINE.close(record.emit)
         if later:
             # The override put back the run's first selection; the construction keeps its last.

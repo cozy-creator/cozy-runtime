@@ -1,6 +1,6 @@
 """The machine's kernels, compiled at machine start on the cards present, best first, while
-weights download: the attention ladder and the int8 linear op; first, the links between its
-GPUs (`parallel.links`), which a group reads.
+weights download: the attention ladder and the 8-bit linear op (int8, fp8); first, the links
+between its GPUs (`parallel.links`), which a group reads.
 
 The machine launches `python -m cozy_runtime.internal.machine_kernels` once per installed
 generation, under that generation's own seal: its interpreter and torch, every card of the
@@ -40,7 +40,7 @@ from cozy_runtime.internal.parallel import links
 #: SageAttention2, FA3 BF16; SDPA needs no compile). Models without a preference use the
 #: ranked table, whose only compiled kernel is FA3.
 LADDER: tuple[str, ...] = ("sol-attn", "sageattention", "flash-attn3")
-#: The int8 linear every 8-bit lane serves (`int8_linear`), on every int8 tensor-core card.
+#: The op library every 8-bit lane serves (`int8_linear`, `fp8_linear`), on sm80+ cards.
 INT8 = "cozy-int8"
 
 
