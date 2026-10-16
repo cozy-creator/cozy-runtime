@@ -63,6 +63,12 @@ def test_the_accelerator_boundary_on_the_apple_gpu() -> None:
     assert accel.completion_event(torch, "mps").query() in (True, False)
     del held
     accel.release_cached(torch, "mps")
+    storage = torch.ones(1 << 20, dtype=torch.uint8, device="mps").untyped_storage()
+    try:
+        storage.resize_(0)
+        _record("storage_resize", {"ok": storage.nbytes() == 0})
+    except Exception as exc:
+        _record("storage_resize", {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
     identity = accel.device_identity(torch, "mps")
     assert identity["name"].startswith("Apple") and identity["driver_api"].startswith("macOS")
     # MPS refuses one buffer larger than Metal allows, and a pool past its limit, with plain
@@ -275,7 +281,7 @@ def test_a_stage_pages_the_last_ones_weights_out(
         hub.close()
         sys.modules.pop("apple_paged", None)
     encoder = 8 * 2048 * 2048 * 2
-    assert first["allocated"] < encoder, first
+    assert first["allocated"] < encoder, (first, m.plane)
     assert again["allocated"] < encoder and again["value"] != first["value"]
 
 
