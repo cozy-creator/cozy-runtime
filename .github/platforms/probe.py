@@ -202,6 +202,46 @@ def attention(device: str) -> None:
         leg(f"sdpa 4096x10x64 {device} {dtype}", go)
 
 
+def mps_limits() -> None:
+    """Weight-only int8, the OOM type, and whether SDPA materializes the score matrix: 16k
+    tokens x 24 heads x 128 is 12 GiB of fp16 scores, past the runner's MPS budget."""
+    x = torch.randn(64, 4096, dtype=torch.float16)
+    w = torch.randint(-127, 127, (4096, 4096), dtype=torch.int8)
+    scale = torch.rand(4096, dtype=torch.float16) / 64
+    ref = x.float() @ (w.float() * scale.float()[:, None]).t()
+
+    def int8_weight_only() -> str:
+        out, s = timed(lambda: torch._weight_int8pack_mm(x.to("mps"), w.to("mps"), scale.to("mps")), "mps")
+        return f"{s * 1e3:.2f}ms " + compare("vs dequant fp32", ref, out)
+
+    leg("weight-only int8 _weight_int8pack_mm on mps", int8_weight_only)
+    f = torch.nn.functional.scaled_dot_product_attention
+    q = torch.randn(1, 24, 16384, 128, device="mps", dtype=torch.float16)
+
+    def long_sdpa() -> str:
+        out, s = timed(lambda: f(q, q, q), "mps", n=1)
+        return f"{s:.2f}s driver={torch.mps.driver_allocated_memory() >> 20}MiB"
+
+    leg("sdpa 16384x24x128 fp16 whole", long_sdpa)
+    torch.mps.empty_cache()
+
+    def chunked() -> str:
+        out, s = timed(lambda: torch.cat([f(c, q, q) for c in q.split(2048, dim=2)], dim=2), "mps", n=1)
+        return f"{s:.2f}s driver={torch.mps.driver_allocated_memory() >> 20}MiB"
+
+    leg("sdpa 16384x24x128 fp16 in 2048-query chunks", chunked)
+    torch.mps.empty_cache()
+
+    def oom() -> str:
+        try:
+            torch.empty(64 << 30, dtype=torch.uint8, device="mps")
+            return "64 GiB allocated"
+        except BaseException as e:  # noqa: BLE001
+            return f"{type(e).__module__}.{type(e).__qualname__} is torch.OutOfMemoryError: {isinstance(e, torch.OutOfMemoryError)}: {str(e)[:160]}"
+
+    leg("mps oom type", oom)
+
+
 def mps_facts() -> None:
     print("mps.is_built:", torch.backends.mps.is_built())
     print("mps.is_available:", torch.backends.mps.is_available())
@@ -231,6 +271,7 @@ def main() -> None:
         leg("attention", lambda: attention(device))
         leg("sdxl unet", lambda: sdxl_unet(device))
         leg("sdxl vae", lambda: sdxl_vae(device))
+        leg("mps limits", mps_limits)
 
 
 if __name__ == "__main__":
