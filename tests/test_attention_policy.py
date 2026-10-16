@@ -389,6 +389,48 @@ def test_encoded_projection_output_contract_wins_over_norm_and_storage_dtype() -
     assert attention._dtype(module) == ""
 
 
+def test_a_site_that_casts_its_own_operands_is_admitted_by_its_declared_dtype() -> None:
+    """A package's own attention site (SeedVR2's windows) has no Q/K/V projections to read: it
+    declares the dtype its operands reach the kernel in, and is selected like any other site."""
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("diffusers")
+    from diffusers.models.attention import AttentionModuleMixin
+    from diffusers.models.attention_dispatch import dispatch_attention_fn
+
+    class Processor:
+        _attention_backend = None
+        _parallel_config = None
+
+        def __call__(self, attn: Any, q: Any, k: Any, v: Any) -> Any:
+            return dispatch_attention_fn(
+                q, k, v, backend=self._attention_backend, parallel_config=self._parallel_config
+            )
+
+    class Site(torch.nn.Module, AttentionModuleMixin):  # type: ignore[misc,name-defined]
+        activation_dtype: Any = torch.bfloat16
+        head_dim = 128
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.set_processor(Processor())
+
+        def forward(self, q: Any, k: Any, v: Any) -> Any:
+            return self.processor(self, *(x.to(self.activation_dtype) for x in (q, k, v)))
+
+    site = Site()
+    roots = {"dit": torch.nn.ModuleList([site, torch.nn.Linear(4, 4)])}
+    assert attention._dtype(site) == "bfloat16"
+    assert attention.install(_ready("flash-attn3", "sdpa"), roots).totals() == {"flash-attn3": 1}
+    assert attention.install(_ready("sdpa"), roots).totals() == {"sdpa": 1}
+    q, k, v = torch.randn(3, 2, 7, 1, 128).unbind(0)
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        *(x.bfloat16().transpose(1, 2) for x in (q, k, v))
+    ).transpose(1, 2)
+    torch.testing.assert_close(site(q, k, v), expected)
+    site.activation_dtype = torch.int8
+    assert attention._dtype(site) == ""
+
+
 def test_active_packed_projection_and_unknown_contract_are_distinguished() -> None:
     torch = pytest.importorskip("torch")
     module = _roots()["dit"][0]

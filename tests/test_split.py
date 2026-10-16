@@ -107,6 +107,16 @@ def test_an_encode_cuts_on_aligned_pixels(card: Any) -> None:
         torch.testing.assert_close(tiled, net(x), rtol=1e-9, atol=1e-9)
 
 
+def test_an_unmeasured_op_with_its_own_estimate_starts_at_the_pieces_that_fit(card: Any) -> None:
+    """The op's `per_element` sizes its first pieces; the Runtime's measurement replaces it."""
+    device = card(Card(limit=10**9, room=100 * 8 * 3))
+    split(lambda t: t, torch.zeros(16, 3), Cut(0), per_element=100.0)
+    assert device.pieces == [8 * 3] * 2
+    device.ratio, device.pieces = 50.0, []
+    split(lambda t: t, torch.zeros(16, 3), Cut(0), per_element=100.0)
+    assert device.pieces == [16 * 3]
+
+
 def test_a_measured_op_starts_at_the_pieces_that_fit(card: Any) -> None:
     """Bytes per element times the largest piece within the room: no failed attempt first."""
     device = card(Card(limit=10**9, ratio=100.0, room=100 * 2 * 4 * 36))
