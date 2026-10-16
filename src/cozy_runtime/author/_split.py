@@ -54,16 +54,19 @@ def install(runtime: Pieces | None) -> None:
     _RUNTIME = runtime
 
 
-def split(fn: Callable[[Any], Any], x: Any, *cuts: Cut) -> Any:
+def split(fn: Callable[[Any], Any], x: Any, *cuts: Cut, per_element: float = 0.0) -> Any:
     """`fn(x)` in the fewest pieces along `cuts` that fit the device; `fn` maps each window of
     `x` to that window of its result. A piece that runs out of memory runs again at half the
-    size. Without a managing Runtime it runs whole."""
+    size. Without a managing Runtime it runs whole. `per_element`, the op's own estimate of
+    the peak device bytes one element of `x` takes, sizes its pieces until the Runtime has
+    measured them; without one they are 1/FIRST of `x`."""
     runtime = _RUNTIME
     if runtime is None or not cuts:
         return fn(x)
     shape = tuple(int(n) for n in x.shape)
     key = _key(fn, shape, cuts, x.dtype)
     ratio, room = runtime.room(key)
+    ratio = ratio or per_element or None
     # Unmeasured: small pieces, measured as they run.
     windows = _windows(shape, cuts, room / ratio if ratio else math.prod(shape) / FIRST)
     while True:
