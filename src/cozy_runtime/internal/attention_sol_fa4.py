@@ -22,6 +22,7 @@ import torch
 import triton
 import triton.language as tl
 
+from cozy_runtime.internal import attention_sol
 from cozy_runtime.internal import attention_upstream as upstream
 
 if TYPE_CHECKING:
@@ -39,6 +40,7 @@ def sparse(
     """One BF16 BTHD document; every row, the protected prefix's included. `fp8` runs the exact
     tiles in e4m3 with Hadamard-rotated Q/K, as the dense rows' FA4 FP8 does."""
     scale = query.shape[-1] ** -0.5 if scale is None else float(scale)
+    attention_sol._pin_preprocess()
     kc, vc, threshold = import_module("sol_attn.preprocess").prepare(
         query, key, value, scale=scale, tau=1.0, thresh_type="exact"
     )
@@ -64,6 +66,20 @@ def sparse(
     )[:2]
     _merge_approximation(query, kc, vc, pooled, out, lse, scale)
     return out
+
+
+def warm(index: int) -> None:
+    """Build this card's FA4 block-sparse forwards (FP8 and BF16) and the merge at preparation,
+    one small call each: FA4's and Triton's caches key neither on length nor on head count, so
+    a run's first sparse step finds them built."""
+    device = torch.device("cuda", index)
+    with torch.no_grad(), torch.cuda.device(device):
+        q, k, v = (
+            torch.randn(1, 1024, 2, 128, device=device, dtype=torch.bfloat16) for _ in range(3)
+        )
+        for fp8 in (True, False):
+            sparse(q, k, v, None, 64, fp8=fp8)
+        torch.cuda.synchronize(device)
 
 
 def route(query: Tensor, kc: Tensor, threshold: Tensor, scale: float, sink_tokens: int) -> Tensor:
@@ -183,4 +199,4 @@ def _approximate_and_merge(  # type: ignore[no-untyped-def]
     tl.store(OUT + o_offsets, merged.to(tl.bfloat16), mask=live[:, None])
 
 
-__all__ = ["route", "sparse"]
+__all__ = ["route", "sparse", "warm"]
