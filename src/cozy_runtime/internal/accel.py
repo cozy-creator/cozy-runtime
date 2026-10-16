@@ -656,10 +656,47 @@ def memory_class(kind: str) -> Literal["discrete", "unified"]:
 
 
 def unified_budget(torch: ModuleType) -> int:
-    """The bytes one unified-memory process may hold: Metal's recommended working set,
-    within physical RAM less what the system keeps."""
+    """The bytes one unified-memory process may hold: Metal's recommended working set, within
+    physical RAM less what the system keeps, and within what it holds plus what the system has
+    available now (shared mode follows memory pressure: past it, macOS swaps)."""
     ram = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
-    return max(min(int(torch.mps.recommended_max_memory()), ram - HOST_RESERVE), 0)
+    held = int(torch.mps.driver_allocated_memory())
+    return max(
+        min(int(torch.mps.recommended_max_memory()), ram - HOST_RESERVE, held + _available()), 0
+    )
+
+
+class _VmStatistics64(ctypes.Structure):
+    """`vm_statistics64` (`<mach/vm_statistics.h>`), as `host_statistics64` fills it."""
+
+    _fields_ = (
+        ("free", ctypes.c_uint32),
+        ("active", ctypes.c_uint32),
+        ("inactive", ctypes.c_uint32),
+        ("wired", ctypes.c_uint32),
+        ("events", ctypes.c_uint64 * 9),
+        ("purgeable", ctypes.c_uint32),
+        ("speculative", ctypes.c_uint32),
+        ("compressor", ctypes.c_uint64 * 4),
+        ("pages", ctypes.c_uint32 * 4),
+        ("uncompressed", ctypes.c_uint64),
+    )
+
+
+_HOST_VM_INFO64 = 4
+_libc = ctypes.CDLL(None) if sys.platform == "darwin" else None
+
+
+def _available() -> int:
+    """Bytes macOS can give without paging: free, speculative, purgeable and inactive pages."""
+    assert _libc is not None
+    stats = _VmStatistics64()
+    count = ctypes.c_uint32(ctypes.sizeof(stats) // 4)
+    host = _libc.mach_host_self()
+    if _libc.host_statistics64(host, _HOST_VM_INFO64, ctypes.byref(stats), ctypes.byref(count)):
+        raise OSError("host_statistics64 refused")
+    pages = stats.free + stats.speculative + stats.purgeable + stats.inactive
+    return pages * os.sysconf("SC_PAGE_SIZE")
 
 
 def bf16_supported(kind: str) -> bool:

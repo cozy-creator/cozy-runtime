@@ -71,6 +71,11 @@ def test_the_accelerator_boundary_on_the_apple_gpu() -> None:
         _record("storage_resize", {"ok": storage.nbytes() == 0})
     except Exception as exc:
         _record("storage_resize", {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+    _record(
+        "budget",
+        {"budget": memory["driver_total_bytes"], "available": accel._available(), "ram": ram}
+        | {"recommended": int(torch.mps.recommended_max_memory())},
+    )
     identity = accel.device_identity(torch, "mps")
     assert identity["name"].startswith("Apple") and identity["driver_api"].startswith("macOS")
     # MPS refuses one buffer larger than Metal allows, and a pool past its limit, with plain
