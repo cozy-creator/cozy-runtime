@@ -28,6 +28,8 @@ which a graph would then copy on every replay.
 
 from __future__ import annotations
 
+import contextvars
+
 import sys
 import weakref
 from collections.abc import Callable, Iterator
@@ -44,6 +46,17 @@ except ImportError:  # pragma: no cover - the base package is torch-free
     torch = None
 
 _SAID: set[str] = set()
+
+
+#: Set while a mechanism runs its own graphs over a component (`cozy_runtime.lm`).
+BYPASS: contextvars.ContextVar[bool] = contextvars.ContextVar("cozy_graphs_bypass", default=False)
+#: A capture goes ahead only with this many times what its call allocates free.
+ROOM = 2
+
+
+def allocated(device: Any = None) -> int:
+    """Bytes torch's allocator has handed out on `device` since the process began."""
+    return int(torch.cuda.memory_stats(device).get("allocated_bytes.all.allocated", 0))
 
 
 def say(key: str, line: str) -> None:

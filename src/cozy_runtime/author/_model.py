@@ -256,6 +256,7 @@ PLACED: weakref.WeakKeyDictionary[object, tuple[Residency, str]] = weakref.WeakK
 #: callables that drop it and say whether there was any: the plane calls them before it unmaps
 #: weights for room.
 RELEASERS: list[Callable[[], bool]] = []
+WARNINGS: list[tuple[str, dict[str, str | bool | int | float | None]]] = []
 
 
 class Placement(Protocol):

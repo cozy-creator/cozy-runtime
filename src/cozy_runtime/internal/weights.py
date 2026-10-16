@@ -3691,6 +3691,9 @@ class WeightResidency:
     def note(self, key: str, value: str) -> None:
         self.weights.modes[key] = value
 
+    def allocatable(self) -> int:
+        return self.weights.allocatable()
+
     def layout(self, name: str, blocks: Collection[Module]) -> tuple[object, ...]:
         component = self.components.get(name)
         if component is None:
