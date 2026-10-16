@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from importlib import import_module, util
 from pathlib import Path
 from types import ModuleType
-from typing import Any
+from typing import cast
 
 from cozy_runtime.author.kernels import readable
 from cozy_runtime.internal import kernel_cache, kernel_compile, kernel_sources
@@ -40,16 +40,19 @@ POLL_SECONDS = 1.0
 
 @dataclass(slots=True)
 class _Build:
-    served: Any = None
+    served: object = None
     asked: float = float("-inf")
     final: str = ""
 
 
+#: The loaded op: `(x, data, scale, bias, out_dtype) -> out`.
+type Op = Callable[..., Tensor]
+
 _KITCHEN: dict[int, _Build] = {}
 _NATIVE: dict[int, _Build] = {}
 #: Device index -> the loaded op, and the activation dtypes it takes: every call reads these.
-_OPS: dict[int, Any] = {}
-_HALF: list[Any] = []
+_OPS: dict[int, Op] = {}
+_HALF: list[object] = []
 #: The op library this process loaded; its ops are registered once per process.
 _LOADED: list[str] = []
 
@@ -59,8 +62,8 @@ def _built(
     index: int,
     states: dict[int, _Build],
     name: str,
-    opened: Callable[[int], Any],
-) -> Any:
+    opened: Callable[[int], object],
+) -> object:
     """`opened(sm)` on this card once its build lands, None while it runs (the first ask starts
     it) and for good when this card or machine cannot have it, said once."""
     state = states.setdefault(index, _Build())
@@ -97,10 +100,10 @@ def _compiled(name: str, sm: int) -> Path | None:
     return Path(built.path) / kernel_cache.SITE
 
 
-def native(torch: ModuleType, index: int) -> Any:
+def native(torch: ModuleType, index: int) -> Op | None:
     """`torch.ops.cozy.int8_linear` on this card, or None while its build runs."""
 
-    def opened(sm: int) -> Any:
+    def opened(sm: int) -> Op | None:
         if sm < 80:
             raise kernel_sources.Absent(f"no int8 tensor-core GEMM for sm{sm}")
         tree = _compiled(OP, sm)
@@ -116,7 +119,7 @@ def native(torch: ModuleType, index: int) -> Any:
         _OPS[index] = torch.ops.cozy.int8_linear.default
         return _OPS[index]
 
-    return _built(torch, index, _NATIVE, "cozy int8 op", opened)
+    return cast("Op | None", _built(torch, index, _NATIVE, "cozy int8 op", opened))
 
 
 def kitchen(torch: ModuleType, index: int) -> ModuleType | None:
@@ -137,14 +140,19 @@ def kitchen(torch: ModuleType, index: int) -> ModuleType | None:
             site.addsitedir(str(tree))
         return import_module("comfy_kitchen.backends.cuda")
 
-    module: ModuleType | None = _built(
-        torch, index, _KITCHEN, "comfy-kitchen CUTLASS int8 GEMM", opened
+    return cast(
+        "ModuleType | None",
+        _built(torch, index, _KITCHEN, "comfy-kitchen CUTLASS int8 GEMM", opened),
     )
-    return module
 
 
 def linear(
-    torch: ModuleType, x: Tensor, data: Tensor, scale: Tensor, bias: Tensor | None, out_dtype: Any
+    torch: ModuleType,
+    x: Tensor,
+    data: Tensor,
+    scale: Tensor,
+    bias: Tensor | None,
+    out_dtype: object,
 ) -> Tensor:
     """`x @ W.T + bias` for one `int8-convrot256/1` weight: `data` int8 `[N, K]`, `scale` f32."""
     op = _OPS.get(x.get_device())

@@ -261,14 +261,14 @@ def _leaf_class(torch: Any) -> Any:
     return EncodedLinear
 
 
-def _int8_leaf_class(torch: Any) -> Any:
+def _int8_leaf_class(torch: ModuleType) -> type:
     """`EncodedLinear` whose forward is one `int8_linear.linear` call, the bias in its epilogue."""
-    cached = getattr(_int8_leaf_class, "_cached", None)
+    cached: type | None = getattr(_int8_leaf_class, "_cached", None)
     if cached is not None:
         return cached
 
     class Int8ConvRotLinear(_leaf_class(torch)):  # type: ignore[misc]
-        def forward(self, x: Any, *, prequantized: PreQuantized | None = None) -> Any:
+        def forward(self, x: Tensor, *, prequantized: PreQuantized | None = None) -> Tensor:
             out_dtype = self.out_dtype
             if torch.is_autocast_enabled(x.device.type):
                 # As the replaced `nn.Linear` does: from and to the autocast dtype.
