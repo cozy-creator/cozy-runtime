@@ -42,10 +42,8 @@ LEVELS_MAX = 448.0 * 6.0
 SCALE_FLOOR = 1e-30
 #: Up to this many rows a product is bandwidth-bound: W4A16 reads the fewest bytes on any card.
 DECODE_ROWS = 16
-#: The GEMV's tile: 64 output rows by 256 input columns (128 bytes of each packed row).
-GEMV_N, GEMV_K = 64, 256
-#: The one-row GEMV's tile: 16 output rows by 64 int32 words (512 weights) of each.
-GEMV1_N, GEMV1_W = 16, 64
+#: The GEMV's tile: 64 output rows by 32 int32 words (256 weights) of each.
+GEMV_N, GEMV_W = 64, 32
 
 _MAJOR: dict[int, int] = {}
 
@@ -108,6 +106,19 @@ if not TRITON_ABSENT:
         )
 
     @triton.jit  # type: ignore[untyped-decorator]
+    def _nibble(words, i: tl.constexpr):  # type: ignore[no-untyped-def]
+        """Element 8w + i of each int32 word as f32, 2^-14 of its value: the E2M1 code's sign,
+        exponent and mantissa moved into f16's fields (the caller scales back by 2^14)."""
+        code = (words >> (4 * i)) & 0xF
+        bits = ((code & 7) << 9) | ((code & 8) << 12)
+        return bits.to(tl.int16).to(tl.float16, bitcast=True).to(tl.float32)
+
+    @triton.jit  # type: ignore[untyped-decorator]
+    def _weights(words, i: tl.constexpr, scale):  # type: ignore[no-untyped-def]
+        """Nibble i of each word, scaled, in bf16: E2M1 times E4M3 is exact there."""
+        return (_nibble(words, i) * scale).to(tl.bfloat16)
+
+    @triton.jit  # type: ignore[untyped-decorator]
     def _gemv(  # type: ignore[no-untyped-def]
         x_ptr,
         w_ptr,
@@ -117,95 +128,64 @@ if not TRITON_ABSENT:
         M,
         N,
         K,
-        stride_x,
-        col_tiles,
-        span,
-        BLOCK_M: tl.constexpr,
-        BLOCK_N: tl.constexpr,
-        BLOCK_K: tl.constexpr,
-        SPLIT: tl.constexpr,
-    ):
-        rm = tl.arange(0, BLOCK_M)
-        rn = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
-        rk = tl.arange(0, BLOCK_K)
-        start = tl.program_id(1) * span
-        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-        for k0 in range(start, tl.minimum(start + span, K), BLOCK_K):
-            x = tl.load(
-                x_ptr + rm[:, None] * stride_x + (k0 + rk)[None, :],
-                mask=(rm[:, None] < M) & ((k0 + rk)[None, :] < K),
-                other=0.0,
-            )
-            weight = _decode(w_ptr, s_ptr, rn, k0, N, K, col_tiles, BLOCK_N, BLOCK_K)
-            acc += tl.dot(x, tl.trans(weight.to(x.dtype)))
-        acc *= tl.load(two_ptr)
-        where = out_ptr + rm[:, None] * N + rn[None, :]
-        ok = (rm[:, None] < M) & (rn[None, :] < N)
-        if SPLIT:
-            tl.atomic_add(where, acc, mask=ok)
-        else:
-            tl.store(where, acc.to(out_ptr.dtype.element_ty), mask=ok)
-
-    @triton.jit  # type: ignore[untyped-decorator]
-    def _nibble(words, i: tl.constexpr):  # type: ignore[no-untyped-def]
-        """Element 8w + i of each int32 word as f32, 2^-14 of its value: the E2M1 code's sign,
-        exponent and mantissa moved into f16's fields (the caller scales back by 2^14)."""
-        code = (words >> (4 * i)) & 0xF
-        bits = ((code & 7) << 9) | ((code & 8) << 12)
-        return bits.to(tl.int16).to(tl.float16, bitcast=True).to(tl.float32)
-
-    @triton.jit  # type: ignore[untyped-decorator]
-    def _gemv1(  # type: ignore[no-untyped-def]
-        x_ptr,
-        w_ptr,
-        s_ptr,
-        two_ptr,
-        out_ptr,
-        N,
-        K,
         col_tiles,
         span,
         BLOCK_N: tl.constexpr,
         BLOCK_W: tl.constexpr,
         SPLIT: tl.constexpr,
     ):
-        """One row, read as int32 words of 8 weights: each nibble against x at its column,
-        reduced per 16-block, scaled once per block. SPLIT writes f32 partials per K span."""
+        """Up to 16 rows (a decoded token, or a step's drafted ones) on the tensor cores: each
+        int32 word of 8 weights is decoded once for every row, so the weight is read once, and a
+        row's sums never depend on the rows beside it, so a drafted token keeps decode's bits
+        (a one-row FMA kernel is 7% faster on a 4090, but its sums are not these). SPLIT writes
+        f32 partials per K span."""
         rn = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+        rm = tl.arange(0, 16)
         rw = tl.arange(0, BLOCK_W)
+        rk = tl.arange(0, 8 * BLOCK_W)
         start = tl.program_id(1) * span
         words_per_row = K // 8
-        acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+        acc = tl.zeros((16, BLOCK_N), dtype=tl.float32)
         for w0 in range(start // 8, tl.minimum(start + span, K) // 8, BLOCK_W):
             cols = w0 + rw
-            inside = cols < words_per_row
             words = tl.load(
                 w_ptr + rn[:, None].to(tl.int64) * words_per_row + cols[None, :],
-                mask=(rn[:, None] < N) & inside[None, :],
+                mask=(rn[:, None] < N) & (cols[None, :] < words_per_row),
                 other=0,
             )
-            at = x_ptr + 8 * cols
-            part = _nibble(words, 0) * tl.load(at, mask=inside, other=0.0).to(tl.float32)
-            part += _nibble(words, 1) * tl.load(at + 1, mask=inside, other=0.0).to(tl.float32)
-            part += _nibble(words, 2) * tl.load(at + 2, mask=inside, other=0.0).to(tl.float32)
-            part += _nibble(words, 3) * tl.load(at + 3, mask=inside, other=0.0).to(tl.float32)
-            part += _nibble(words, 4) * tl.load(at + 4, mask=inside, other=0.0).to(tl.float32)
-            part += _nibble(words, 5) * tl.load(at + 5, mask=inside, other=0.0).to(tl.float32)
-            part += _nibble(words, 6) * tl.load(at + 6, mask=inside, other=0.0).to(tl.float32)
-            part += _nibble(words, 7) * tl.load(at + 7, mask=inside, other=0.0).to(tl.float32)
-            blocks = tl.sum(part.reshape(BLOCK_N, BLOCK_W // 2, 2), axis=2)
-            scale = _scales(s_ptr, rn, 8 * w0, N, K, col_tiles, 8 * BLOCK_W)
-            acc += tl.sum(blocks * scale, axis=1)
-        acc *= 16384.0
+            # The nibbles' 2^-14 goes back with the scale; two words share a 16-block's.
+            scale = _scales(s_ptr, rn, 8 * w0, N, K, col_tiles, 8 * BLOCK_W) * 16384.0
+            scale = tl.reshape(
+                tl.broadcast_to(scale[:, :, None], (BLOCK_N, BLOCK_W // 2, 2)), (BLOCK_N, BLOCK_W)
+            )
+            # Nibble i of word w is element 8w + i: joined innermost, the tile is in K order.
+            even = tl.join(
+                tl.join(_weights(words, 0, scale), _weights(words, 4, scale)),
+                tl.join(_weights(words, 2, scale), _weights(words, 6, scale)),
+            )
+            odd = tl.join(
+                tl.join(_weights(words, 1, scale), _weights(words, 5, scale)),
+                tl.join(_weights(words, 3, scale), _weights(words, 7, scale)),
+            )
+            weight = tl.reshape(tl.join(even, odd), (BLOCK_N, 8 * BLOCK_W))
+            k = 8 * w0 + rk
+            x = tl.load(
+                x_ptr + rm[:, None] * K + k[None, :],
+                mask=(rm[:, None] < M) & (k[None, :] < K),
+                other=0.0,
+            )
+            acc += tl.dot(x, tl.trans(weight))
+        where = rm[:, None] * N + rn[None, :]
+        ok = (rm[:, None] < M) & (rn[None, :] < N)
         if SPLIT:
-            tl.store(out_ptr + tl.program_id(1) * N + rn, acc, mask=rn < N)
+            tl.store(out_ptr + tl.program_id(1) * M * N + where, acc, mask=ok)
         else:
             acc *= tl.load(two_ptr)
-            tl.store(out_ptr + rn, acc.to(out_ptr.dtype.element_ty), mask=rn < N)
+            tl.store(out_ptr + where, acc.to(out_ptr.dtype.element_ty), mask=ok)
 
     @triton.jit  # type: ignore[untyped-decorator]
     def _gather(part_ptr, two_ptr, out_ptr, N, SPLIT: tl.constexpr, BLOCK: tl.constexpr):  # type: ignore[no-untyped-def]
-        """`_gemv1`'s K-span partials summed, scaled by the second level, cast."""
+        """`_gemv`'s K-span partials summed, scaled by the second level, cast."""
         rn = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
         acc = tl.zeros((BLOCK,), dtype=tl.float32)
         for split in range(SPLIT):
@@ -253,11 +233,11 @@ def _entries() -> list[TritonEntry]:
 
     entries = [
         TritonEntry(
-            _gemv1,
-            signature(_gemv1, w_ptr="*i32", out_ptr="*fp32" if split else "*bf16"),
-            {"BLOCK_N": GEMV1_N, "BLOCK_W": GEMV1_W, "SPLIT": split},
+            _gemv,
+            signature(_gemv, w_ptr="*i32", out_ptr="*fp32" if split else "*bf16"),
+            {"BLOCK_N": GEMV_N, "BLOCK_W": GEMV_W, "SPLIT": split},
             aligned=("x_ptr", "w_ptr", "out_ptr", "K", "span"),
-            num_warps=4,
+            num_warps=8,
         )
         for split in (0, 1)
     ]
@@ -270,15 +250,6 @@ def _entries() -> list[TritonEntry]:
             num_warps=4,
         )
         for split in (2, 4)
-    ]
-    entries += [
-        TritonEntry(
-            _gemv,
-            signature(_gemv, out_ptr="*fp32" if split else "*bf16"),
-            {"BLOCK_M": 16, "BLOCK_N": GEMV_N, "BLOCK_K": GEMV_K, "SPLIT": split},
-            num_warps=4,
-        )
-        for split in (0, 1)
     ]
     entries.append(
         TritonEntry(_dequant, signature(_dequant), {"BLOCK_N": 64, "BLOCK_K": 128}, num_warps=4)
@@ -306,15 +277,6 @@ def _launcher(device: Device) -> Launch | None:
             launch = None
         _LAUNCH[index] = (now, launch)
     return launch
-
-
-_SMS: dict[int, int] = {}
-
-
-def _sms(torch: ModuleType, index: int) -> int:
-    if index not in _SMS:
-        _SMS[index] = int(torch.cuda.get_device_properties(index).multi_processor_count)
-    return _SMS[index]
 
 
 def _major(torch: ModuleType, index: int) -> int:
@@ -370,77 +332,47 @@ def matmul(
         if launch is not None:
             with readable(weight, blocked_scale, scale_2) as (weight, blocked_scale, scale_2):
                 scales, tiles = blocked_scale.view(torch.uint8), int(blocked_scale.shape[1]) // 4
-                aligned = flat.data_ptr() % 16 == 0 and weight.data_ptr() % 16 == 0
-                if rows == 1 and cols % 8 == 0 and aligned:
-                    # One decoded token reads the weight as int32 words, split over K while a
-                    # few programs per row block would leave SMs idle (a 3090: 213-335 GB/s for
-                    # a program per 32 rows, 520-795 GB/s so).
+                if rows <= DECODE_ROWS and weight.data_ptr() % 16 == 0:
+                    # Bandwidth-bound: split over K while a few programs per row block would
+                    # leave SMs idle (a 3090: 213-335 GB/s for a program per 32 rows, 520-795 so).
+                    flat = flat if flat.data_ptr() % 16 == 0 else flat.clone()
                     split = 4 if rows_out <= 8192 else 2 if rows_out <= 16384 else 1
-                    span = -(-cols // (split * 8 * GEMV1_W)) * 8 * GEMV1_W
-                    out = torch.empty(1, rows_out, dtype=out_dtype, device=x.device)
+                    span = -(-cols // (split * 8 * GEMV_W)) * 8 * GEMV_W
+                    out = torch.empty(rows, rows_out, dtype=out_dtype, device=x.device)
                     part = (
-                        torch.empty(split, rows_out, dtype=torch.float32, device=x.device)
+                        torch.empty(split, rows, rows_out, dtype=torch.float32, device=x.device)
                         if split > 1
                         else out
                     )
                     launch(
-                        _gemv1,
-                        (-(-rows_out // GEMV1_N), split, 1),
+                        _gemv,
+                        (-(-rows_out // GEMV_N), split, 1),
                         flat,
                         weight.view(torch.int32),
                         scales,
                         scale_2,
                         part,
+                        rows,
                         rows_out,
                         cols,
                         tiles,
                         span,
-                        GEMV1_N,
-                        GEMV1_W,
+                        GEMV_N,
+                        GEMV_W,
                         int(split > 1),
                     )
                     if split > 1:
                         launch(
                             _gather,
-                            (-(-rows_out // 1024), 1, 1),
+                            (-(-(rows * rows_out) // 1024), 1, 1),
                             part,
                             scale_2,
                             out,
-                            rows_out,
+                            rows * rows_out,
                             split,
                             1024,
                         )
                     return out.reshape(*x.shape[:-1], rows_out)
-                if rows <= DECODE_ROWS:
-                    # Split K until the card has ~4 programs per SM: a decode GEMV is bandwidth.
-                    columns = -(-rows_out // GEMV_N)
-                    split = max(1, min(cols // GEMV_K, -(-4 * _sms(torch, index) // columns)))
-                    span = -(-cols // (split * GEMV_K)) * GEMV_K
-                    acc = (
-                        torch.zeros(rows, rows_out, dtype=torch.float32, device=x.device)
-                        if split > 1
-                        else torch.empty(rows, rows_out, dtype=out_dtype, device=x.device)
-                    )
-                    launch(
-                        _gemv,
-                        (columns, -(-cols // span), 1),
-                        flat,
-                        weight,
-                        scales,
-                        scale_2,
-                        acc,
-                        rows,
-                        rows_out,
-                        cols,
-                        flat.stride(0),
-                        tiles,
-                        span,
-                        16,
-                        GEMV_N,
-                        GEMV_K,
-                        int(split > 1),
-                    )
-                    return acc.to(out_dtype).reshape(*x.shape[:-1], rows_out)
                 decoded = torch.empty(rows_out, cols, dtype=x.dtype, device=x.device)
                 launch(
                     _dequant,
