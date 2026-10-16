@@ -754,11 +754,12 @@ def test_an_activation_estimate_larger_than_the_card_never_refuses_the_stage(car
 
 
 @on_gpu
-def test_an_earlier_stages_idle_cache_is_neither_kept_nor_counted(card: Any) -> None:
-    """SeedVR2 run 5937: a VAE decode left torch 5.5 GiB of idle cache; the transformer's next
-    stage was planned in what the driver had beside it (a 0.5 GiB budget), and the cache counted
-    as its activations. Before a stage plans, torch's idle cache beyond the stage's activations
-    goes back to the driver; what is still cached at its entry is no activation of its own."""
+def test_an_earlier_stages_idle_cache_stays_until_a_stage_needs_its_room(card: Any) -> None:
+    """A VAE decode's 5 GiB of idle cache went back to the driver at every stage's exit, and the
+    next request's decode mapped it again: 45 ms a request on an RTX 5090, seconds on a host whose
+    driver maps slowly (runs 9466-9479). It stays while the next stage's weights fit beside it, and
+    is no activation of that stage's own; it goes back when they do not (SeedVR2 run 5937: a
+    transformer planned beside a decode's 5.5 GiB had a 0.5 GiB budget)."""
     weights = card.weights
     model = load(weights, card.checkpoint, "cached")
     x = torch.ones(4, HIDDEN, device="cuda", dtype=torch.float16)
@@ -774,13 +775,26 @@ def test_an_earlier_stages_idle_cache_is_neither_kept_nor_counted(card: Any) -> 
         return torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
 
     stage("decode", 512 << 20)
-    weights.seed_activations({"encode": 1 << 30})  # room for its cache: it stays
+    assert idle() >= 512 << 20, "a stage's exit keeps its cache"
     stage("encode", 0)
-    assert idle() >= 512 << 20
+    assert idle() >= 512 << 20, "its weights are mapped: nothing needs the room"
     assert model.residency.peaks["encode"] < weight_policy.MARGIN, "the cache was not its own"
-    model.residency.admit("denoise", ("stack",))
-    assert idle() < 512 << 20, "nothing measured for the stage: its plan has the room"
-    model.residency.release("denoise", ("stack",))
+    segments = torch.cuda.memory_stats()["num_device_alloc"]
+    stage("decode", 512 << 20)
+    assert torch.cuda.memory_stats()["num_device_alloc"] == segments, "the decode reused it"
+    # Its weights unmapped, under a cap that leaves them no room beside the cache: it goes back.
+    model.residency.unpark()
+    weights.set_budget(0)
+    weights.set_budget(-1)
+    weights.measure_context()
+    held = max(weights.context_bytes, 0) + torch.cuda.memory_reserved()
+    weights.set_cap(held + weight_policy.MARGIN)
+    try:
+        model.residency.admit("denoise", ("stack",))
+        assert idle() < 512 << 20, "its weights needed the room"
+        model.residency.release("denoise", ("stack",))
+    finally:
+        weights.set_cap(-1)
 
 
 @on_card

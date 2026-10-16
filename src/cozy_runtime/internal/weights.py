@@ -855,13 +855,21 @@ class Weights:
         return given > 0 and given >= need and self.allocatable() >= need
 
     def trim_cache(self, method: str) -> None:
-        """Before a stage plans: torch's idle cache beyond what the stage's activations need
-        goes back to the driver, for its weights. Kept, an earlier stage's (a VAE decode's
-        5 GiB) holds the room the next one streams its transformer through."""
+        """Before a stage plans: torch's idle cache beyond the stage's activations goes back to
+        the driver when the stage's weights still to map do not fit beside it (run 5937: a
+        decode's 5.5 GiB left a transformer a 0.5 GiB budget). Otherwise it stays, and the next
+        decode reuses it: given back, every request mapped and unmapped a VAE decode's 5 GiB
+        again (45 ms on an RTX 5090, seconds on a host whose driver maps slowly, runs 9466-9479)."""
         if self.host_only:
             return
-        idle = accel.reserved(self.torch, self.kind) - accel.allocated(self.torch, self.kind)
-        if idle > self.activation.get(method, 0) + weight_policy.MARGIN:
+        memory = accel.allocation(self.torch, self.kind)
+        idle = memory["reserved_bytes"] - memory["allocated_bytes"]
+        if idle <= self.activation.get(method, 0) + weight_policy.MARGIN:
+            return
+        unmapped = sum(
+            max(c.ws.nbytes - self.resident_bytes(c), 0) for _, _, c in self.opened().values()
+        )
+        if unmapped + weight_policy.MARGIN > self.headroom(memory):
             accel.release_cached(self.torch, self.kind)
 
     def within_device(self, budget: int) -> int:
