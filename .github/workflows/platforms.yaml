@@ -45,7 +45,7 @@ jobs:
       - name: Venv
         run: |
           uv venv --python 3.12 .venv
-          py=$(ls .venv/bin/python .venv/Scripts/python.exe 2>/dev/null | head -1)
+          py=.venv/bin/python; [ -x "$py" ] || py=.venv/Scripts/python.exe
           echo "PY=$PWD/$py" >> "$GITHUB_ENV"
           case "$RUNNER_OS" in macOS) echo "TORCH_BACKEND=" ;; *) echo "TORCH_BACKEND=--torch-backend=cpu" ;; esac >> "$GITHUB_ENV"
 
@@ -95,7 +95,7 @@ jobs:
             echo "install=${{ steps.install.outcome }} probe=${{ steps.probe.outcome }}"
             echo '```'
             grep -iE 'error|failed|could not' install.txt | head -20 || true
-            cat probe.txt wheels.txt 2>/dev/null | head -250
+            cat probe.txt wheels.txt 2>/dev/null | head -250 || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
