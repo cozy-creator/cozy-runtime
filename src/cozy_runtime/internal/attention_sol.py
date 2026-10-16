@@ -255,8 +255,11 @@ def _validate_result(output: Tensor, query: Tensor) -> None:
 #: through `make_kernel`'s static route layout: 64-token blocks, grouped 64 at a time, the tail
 #: group's block count, and whether the last block is full. Every operand layout is dynamic,
 #: so its object is a function of (blocks, full), never of the exact count. The other routes'
-#: `make_kernel()` takes nothing: one object per card serves every length.
-ROUTES = {(8, 9): "sm89", (9, 0): "sm90", (10, 0): "sm100", (12, 0): "sm120"}
+#: `make_kernel()` takes nothing: one object per card serves every length. SM103 (B300) runs
+#: SM100's kernel, compiled for its own target, through upstream's SM100 dispatch (`_DISPATCH`).
+ROUTES = {(8, 9): "sm89", (9, 0): "sm90", (10, 0): "sm100", (10, 3): "sm100", (12, 0): "sm120"}
+#: The capability upstream's dispatch knows a route by, where the card's own is not it.
+_DISPATCH = {(10, 3): (10, 0)}
 _BLOCK = 64
 #: Loaded objects by key digest; one serves every head count, batch and device (h3a-087).
 _KERNELS: dict[str, Loaded] = {}
@@ -598,20 +601,20 @@ def _native(
     every KV block. This does not perform the wrapper's protected-query recomputation."""
     _pin_preprocess()
     batch, tokens, heads, _ = query.shape
-    capability = tuple(import_module("torch").cuda.get_device_capability(query.device))
-    import_module("sol_attn.interface")._compiled[
-        (query.device.index, capability, batch, tokens, heads, 1)
-    ] = loaded
-    return import_module("sol_attn").sol_attn(
+    arch = _dispatch(query.device)
+    interface = import_module("sol_attn.interface")
+    interface._compiled[(query.device.index, arch, batch, tokens, heads, 1)] = loaded
+    return interface._sol_attn_cute(
         query.contiguous(),
         key.contiguous(),
         value.contiguous(),
-        scale=scale,
+        arch=arch,
+        scale=_SCALE if scale is None else float(scale),
         tau=1.0,
         thresh_type="exact",
         kv_splits=1,
-        sink_start=0,
         sink_tokens=sink_tokens,
+        sink_start=0,
     )
 
 
@@ -703,9 +706,16 @@ def _attention(
     )
 
 
-def backend(device: Device) -> str:
-    """The route upstream selects on this device: `cute_<sm>`, or its silent Triton fallback."""
-    return str(import_module("sol_attn").get_sol_attn_backend(device))
+def _dispatch(device: Device | int) -> tuple[int, int]:
+    found = tuple(import_module("torch").cuda.get_device_capability(device))
+    capability = (found[0], found[1])
+    return _DISPATCH.get(capability, capability)
+
+
+def backend(device: Device | int) -> str:
+    """The route upstream selects for this card's route: `cute_<sm>`, or its silent Triton
+    fallback."""
+    return str(import_module("sol_attn.interface")._backend_for_arch(_dispatch(device)))
 
 
 SOL = Local(sol_attention, lambda query, *_: backend(query.device))
