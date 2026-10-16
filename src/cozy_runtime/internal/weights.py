@@ -40,6 +40,7 @@ from cozy_runtime.author._activity import aside
 from cozy_runtime.author._errors import RuntimeFailure, is_device_oom, is_library_refusal
 from cozy_runtime.author._executor_requests import DeviceTierAnswer, SealedPlan, SharedRegion
 from cozy_runtime.author._loader import Census, TensorLike, TensorSpec, _members
+from cozy_runtime.author._model import PLACED, RELEASERS
 from cozy_runtime.internal import (
     accel,
     bands,
@@ -795,6 +796,8 @@ class Weights:
                     "the weights it reads, and the GPU cannot give that with them mapped",
                 )
 
+        for release in RELEASERS:  # what is kept for speed alone goes before any weight
+            release()
         accel.release_cached(self.torch, self.kind)
         if self.open:
             # Inside a block nothing is re-placed under its lease (None): other weights leave,
@@ -3108,8 +3111,11 @@ class WeightResidency:
         self._capacity = (*self._shortfall_error, self._budget_error)
         self._poisoned_error = plane.error("Poisoned")
         self._quiet = weights.torch.utils._python_dispatch._disable_current_modes
+        #: block modules run while `recording`, by component
+        self.read: dict[str, set[Module]] | None = None
         weights.residencies.add(self)
-        for component in self.components.values():
+        for name, component in self.components.items():
+            PLACED[component.root] = (self, name)
             self._hook(component)
 
     def _hook(self, component: Component) -> None:
@@ -3564,6 +3570,8 @@ class WeightResidency:
     def vacate(self) -> dict[str, Any]:
         """Unmap this construction's idle weights. They stay in the pinned tier; the next
         stage wants them back at link speed."""
+        for release in RELEASERS:
+            release()
         self.unpark()
         idle = [c for c in self.components.values() if c.lease is None and c.cursor is None]
         freed = sum(self.weights.resident_bytes(c) for c in idle)
@@ -3606,6 +3614,134 @@ class WeightResidency:
         )
         movable = device.committed - device.leased_bytes - device.held_bytes - own
         return free, max(movable, 0)
+
+    @contextmanager
+    def recording(self) -> Iterator[dict[str, set[Module]]]:
+        """The block modules the body runs, by component."""
+        read: dict[str, set[Module]] = {}
+        self.read = read
+        try:
+            yield read
+        finally:
+            self.read = None
+
+    @contextmanager
+    def held(self, name: str, blocks: Collection[Module]) -> Iterator[bool]:
+        """`name`'s `blocks` leased at their homes and bound there, their hooks off, beside the
+        stage's common lease, for the body: kernels it launches may be captured into CUDA graphs
+        over those addresses. A region's home is fixed for its weight set's life (an eviction
+        unmaps it, a refill maps it there again), and a lease keeps it mapped. Yields False,
+        having held nothing, when `name` is not in the open stage, a block bakes LoRA, or the
+        blocks do not all fit at home beside what is leased."""
+        weights = self.weights
+        component = self.components.get(name)
+        why = (
+            "no such component"
+            if component is None
+            else "a CPU executor"
+            if weights.host_only
+            else "a GPU group"
+            if weights.grouped
+            else "outside its stage"
+            if self.active is None
+            or name not in self.active[1]
+            or (component.common is not None and component.lease is None)
+            else ""
+        )
+        regions = [] if component is None else [r for r in component.blocks if r.module in blocks]
+        if not why and len(regions) != len(blocks):
+            why = "its blocks are not the recorded ones (it moved to another grain)"
+        if not why and any(region.bakes for region in regions):
+            why = "it bakes LoRA"
+        if why:
+            self.note(f"{name}.held", f"declined: {why}")
+            yield False
+            return
+        assert component is not None
+        leases: list[Lease] = []
+        with self._quiet():
+            try:
+                stream = weights.stream()
+                for region in regions:
+                    self._arrive(component, region.index)
+                    leases.append(self._hold(component, region, stream))
+                    weights.drain()
+                for region, lease in zip(regions, leases, strict=True):
+                    bind(weights.torch, region, lease, refill=True)
+            except BaseException as exc:
+                self._let_go(component, regions[: len(leases)], leases)
+                if not isinstance(exc, self._capacity) and not is_device_oom(exc):
+                    raise
+                why = str(exc).splitlines()[0][:200]
+        if why:
+            self.note(f"{name}.held", f"declined: {why}")
+            yield False
+            return
+        hooked = {r.index: row for r, row in zip(component.blocks, self.hooks[name], strict=True)}
+        wrappers = [(hooked[region.index][0], region.module.forward) for region in regions]
+        for region in regions:
+            module, had, forward = hooked[region.index]
+            if had:
+                module.forward = forward
+            else:
+                del module.forward
+        try:
+            yield True
+        finally:
+            for module, wrapper in wrappers:
+                module.forward = wrapper
+            with self._quiet():
+                self._let_go(component, regions, leases)
+
+    def _hold(self, component: Component, region: Region, stream: int) -> Lease:
+        """`region`'s home lease for `held`: refused for the plane's own budget, the budget
+        grows into the device's free room once (torch's idle cache given back first), as a
+        block's own acquire does."""
+        weights = self.weights
+
+        def acquire() -> Lease:
+            lease: Lease = weights.plane.acquire(
+                component.ws,
+                weights.index,
+                region.index,
+                stream,
+                priority=plane.PREFIX + weights.tick(),
+            )
+            return lease
+
+        try:
+            return acquire()
+        except self._capacity:
+            accel.release_cached(weights.torch, weights.kind)
+            if not weights.grow(region.span):
+                raise
+        return acquire()
+
+    def note(self, key: str, value: str) -> None:
+        self.weights.modes[key] = value
+
+    def layout(self, name: str, blocks: Collection[Module]) -> tuple[object, ...]:
+        component = self.components.get(name)
+        if component is None:
+            return ()
+        regions = [r for r in component.blocks if r.module in blocks]
+        if component.common is not None:
+            regions.insert(0, component.common)
+        return (
+            component.key,
+            id(component),
+            *((r.index, r.bound, *(t.data_ptr() for t in r.derived)) for r in regions),
+        )
+
+    def _let_go(
+        self, component: Component, regions: Sequence[Region], leases: Sequence[Lease]
+    ) -> None:
+        """End `held`'s leases; outside its lease only a stage-resident region stays bound."""
+        for region, lease in zip(regions, leases, strict=True):
+            if region.index not in component.resident:
+                unbind(region)
+            lease.release()
+        self.weights.drain()
 
     def whole(self) -> list[str]:
         """Its components a stage last placed whole here: none of their blocks streams."""
@@ -3967,6 +4103,8 @@ class WeightResidency:
                 self._asked({component.key: region.index})
             passes = component.passes
             self._observe(component, region.index)
+            if self.read is not None:
+                self.read.setdefault(component.name, set()).add(region.module)
             if component.passes > passes:
                 weights.hold_host()
             if not weights.running:  # a block boundary, before this block leases anything
