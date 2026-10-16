@@ -32,9 +32,14 @@ from typing import Any
 
 import msgspec
 
-from cozy_runtime.author._attention import _PRODUCERS, AttentionContext, AttentionProducer
+from cozy_runtime.author._attention import (
+    _PRODUCERS,
+    LIKE_PROJECTIONS,
+    AttentionContext,
+    AttentionProducer,
+)
 from cozy_runtime.author._attention_scope import _EXPECTED
-from cozy_runtime.author.kernels import quantize_once
+from cozy_runtime.author.kernels import INT8_CONVROT, quantize_once
 from cozy_runtime.internal import (
     accel,
     attention_kitchen_sol,
@@ -1048,15 +1053,21 @@ def _head_dim(module: Any) -> int:
     return 0
 
 
+def _base(projection: Any) -> Any:
+    """A PEFT LoRA wrapper's current base layer (encoded fill can replace it after
+    construction), else the projection itself."""
+    peft_linear = getattr(sys.modules.get("peft.tuners.lora.layer"), "Linear", None)
+    if peft_linear is not None and isinstance(projection, peft_linear):
+        return projection.get_base_layer()
+    return projection
+
+
 def _projection_dtype(projection: Any) -> str:
     """Encoded output contract, or an ordinary floating Linear's result dtype."""
     import torch
 
-    peft_linear = getattr(sys.modules.get("peft.tuners.lora.layer"), "Linear", None)
-    if peft_linear is not None and isinstance(projection, peft_linear):
-        # PEFT returns the base result's dtype, even with differently typed factors.
-        # Inspect the current base: encoded fill can replace it after construction.
-        projection = projection.get_base_layer()
+    # PEFT returns the base result's dtype, even with differently typed factors.
+    projection = _base(projection)
     declared = getattr(projection, "out_dtype", None)
     if declared is None and type(projection) is torch.nn.Linear:
         declared = projection.weight.dtype
@@ -1071,20 +1082,41 @@ def _dtype(module: Any) -> str:
     disagreeing projection contracts admit only an unbounded dtype backend (SDPA).
     Floating Linear inference assumes no external autocast changes its output dtype.
     """
+    projections = _projections(module)
+    dtypes = {_projection_dtype(projection) for projection in projections}
+    return next(iter(dtypes)) if len(dtypes) == 1 and "" not in dtypes else ""
+
+
+def _projections(module: Any) -> tuple[Any, ...]:
+    """The site's active Q/K/V projections; empty when the module does not say."""
     q, k, v = (getattr(module, name, None) for name in ("to_q", "to_k", "to_v"))
     packed = getattr(module, "to_qkv", None)
     fused = getattr(module, "fused_projections", None)
-    projections: tuple[Any, ...]
     if packed is not None and (fused is True or (fused is None and q is None)):
-        projections = (packed,)
-    elif q is not None and getattr(module, "to_kv", None) is not None and fused is True:
-        projections = (q, module.to_kv)
-    elif q is not None and k is not None and v is not None:
-        projections = (q, k, v)
-    else:
-        return ""
-    dtypes = {_projection_dtype(projection) for projection in projections}
-    return next(iter(dtypes)) if len(dtypes) == 1 and "" not in dtypes else ""
+        return (packed,)
+    if q is not None and getattr(module, "to_kv", None) is not None and fused is True:
+        return (q, module.to_kv)
+    if q is not None and k is not None and v is not None:
+        return (q, k, v)
+    return ()
+
+
+#: `LIKE_PROJECTIONS`, per encoded-leaf provider: the cards where attention quantized like
+#: those projections serves faster than float attention, and its kernels. int8 on sm89: Klein
+#: at 2 MP on an RTX 4090, 0.336 -> 0.258 s/step (se-067), as BFL's int8 release runs it.
+_LIKE: dict[str, tuple[frozenset[int], tuple[str, ...]]] = {
+    INT8_CONVROT: (frozenset({86, 89}), ("kitchen-int8",)),
+}
+
+
+def _like_projections(order: Sequence[str], module: Any, sm: int) -> tuple[str, ...]:
+    """`order` with `LIKE_PROJECTIONS` replaced by the kernels quantized like this site's
+    Q/K/V projections on this card; by nothing (float attention, by design) when they are
+    float, mixed, or not measured here."""
+    providers = {getattr(_base(p), "provider", "") for p in _projections(module)}
+    sms, like = _LIKE.get(providers.pop() if len(providers) == 1 else "", (frozenset(), ()))
+    like = like if sm in sms else ()
+    return tuple(n for name in order for n in (like if name == LIKE_PROJECTIONS else (name,)))
 
 
 def _admits(candidate: Candidate, dtype: str, head_dim: int) -> bool:
@@ -1483,6 +1515,7 @@ def install(
             )
             selection = choose(context)
             if isinstance(selection, (tuple, list)):
+                selection = _like_projections(selection, module, device.sm)
                 preference = selection
                 found = _preferred(selection, device, dtype, head_dim, degree, resolved, refused)
                 preferred = preferred or found is not None

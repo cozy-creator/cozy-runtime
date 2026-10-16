@@ -548,3 +548,41 @@ def test_a_kernel_this_runtime_lacks_is_skipped_for_the_next_preference() -> Non
     load used to refuse `attention_kernel_unknown` instead of serving its next choice."""
     applied = attention.select(_device(), _roots(), choose=lambda context: ("sol-next", "sdpa"))
     assert applied.totals() == {"sdpa": 2}
+
+
+def test_attention_like_projections_follows_the_int8_lane() -> None:
+    """`LIKE_PROJECTIONS` quantizes attention only where the site's Q/K/V are int8 leaves on a
+    measured card (Klein's int8 lane on sm89: kitchen-int8, as BFL's int8 release runs). Float
+    projections, and a card it was not measured on, keep float attention with no fallback."""
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("diffusers")
+    from cozy_runtime.author import LIKE_PROJECTIONS
+    from cozy_runtime.author.kernels import INT8_CONVROT
+    from cozy_runtime.internal.encoding.leaves import _native_leaf_class
+
+    roots = _dit_roots("bfloat16")
+    site = roots["fl2va_dit"][0]
+    for name in ("to_q", "to_k", "to_v"):
+        linear = getattr(site, name)
+        roles = {
+            "data": torch.zeros(linear.out_features, linear.in_features, dtype=torch.int8),
+            "scale": torch.ones(linear.out_features),
+        }
+        leaf = _native_leaf_class(torch)(
+            None, roles, None, torch.bfloat16, INT8_CONVROT, "int8-convrot256/1",
+            linear.in_features, linear.out_features,
+        )  # fmt: skip
+        setattr(site, name, leaf)
+    ready = _ready("kitchen-int8", "sdpa")
+
+    def choose(context: AttentionContext) -> tuple[str, ...]:
+        return (LIKE_PROJECTIONS, "sdpa")
+
+    applied = attention.install(ready, roots, device=_cuda(89), choose=choose)
+    assert applied.hosts == {
+        "fl2va_dit": {"kitchen-int8": 1},
+        **{name: {"sdpa": 1} for name in ("ref2va_dit", "audio_vae", "video_vae")},
+    }
+    assert not applied.fallbacks and not applied.skipped
+    hopper = attention.install(ready, roots, device=_cuda(90), choose=choose)
+    assert hopper.totals() == {"sdpa": 4} and not hopper.fallbacks
