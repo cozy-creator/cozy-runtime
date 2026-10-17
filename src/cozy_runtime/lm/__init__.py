@@ -95,6 +95,10 @@ _ENGINES_LOCK = threading.Lock()
 #: Batch sizes a step's graphs are recorded at: a step runs the smallest holding every row, and
 #: the largest bounds the rows an engine decodes at once (more wait for a slot).
 BUCKETS = (1, 2, 4, 8, 16)
+#: The most rows a step drafts for: a verify pass keeps every linear-attention layer's state
+#: after each of its tokens (Qwen3.5-9B: 24 x 3 x 2 MiB a row), and with more rows the model's
+#: own step is compute-bound enough that drafts save little; larger buckets decode undrafted.
+DRAFT_ROWS = 4
 
 
 def release() -> bool:
@@ -1104,7 +1108,7 @@ class _Engine:
     def _one(self, size: int, run: Callable[[int], None]) -> None:
         """One step at `size` rows, and what the host knows of the rows after it."""
         rows = [row for row in self.slots if row is not None]
-        per = DEPTH + 1 if self.draft is not None else 1
+        per = DEPTH + 1 if self._drafting(size) else 1
         self.cache.window = window(max(row.reach for row in rows) + per, self.capacity)
         run(size)
         for row in rows:
@@ -1501,7 +1505,7 @@ class _Engine:
         self.retire = True
 
     def _replay(self, size: int, cuda: bool) -> None:
-        drafted = self.draft is not None
+        drafted = self._drafting(size)
         key = (size, self.cache.window, drafted)
         graph = self.graphs.get(key)
         if graph is None and cuda and key not in self.unrecorded and self.building != LANDED[0]:
@@ -1549,7 +1553,8 @@ class _Engine:
         say(f"capture:{type(self.model).__name__}", f"[lm] capture failed: {why}")
         warning = ("a CUDA graph was not used", {"module": type(self.model).__name__, "why": why})
         for request in {id(r.request): r.request for r in self.slots if r is not None}.values():
-            request.warnings.append(warning)
+            if warning not in request.warnings:
+                request.warnings.append(warning)
         for row in self.slots:
             if row is not None:
                 row.request.warnings.append(
@@ -1562,16 +1567,19 @@ class _Engine:
         torch.cuda.empty_cache()
         before = torch.cuda.memory_reserved(self.cache_device)
         self._advance(size)
-        key = (size, self.draft is not None)
+        key = (size, self._drafting(size))
         self.need[key] = max(
             self.need.get(key, 0), torch.cuda.memory_reserved(self.cache_device) - before
         )
 
+    def _drafting(self, size: int) -> bool:
+        return self.draft is not None and size <= DRAFT_ROWS
+
     def _advance(self, size: int) -> None:
-        if self.draft is None:
-            self._step(size)
-        else:
+        if self._drafting(size):
             self._speculate(size)
+        else:
+            self._step(size)
 
     def _select(self, logits: Any, size: int) -> Any:
         """Each live row's next token, on the device, in `ids` and `out`; a row that stops (a
