@@ -14,7 +14,7 @@ import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import TYPE_CHECKING, Any, NoReturn
+from typing import TYPE_CHECKING, NoReturn
 
 from cozy_runtime.author._errors import (
     MEMORY_EXHAUSTED,
@@ -92,7 +92,7 @@ class MemoryExhausted(RuntimeFailure):
         super().__init__(detail, code=MEMORY_EXHAUSTED)
         self.detail, self.op, self.nbytes = detail, op, nbytes
         self.ledger, self.tried = ledger, tried
-        self.shortfall = {
+        self.shortfall: dict[str, int | str] = {
             "resource": "vram",
             "needed_bytes": nbytes,
             "available_bytes": max(ledger.free - ledger.floor, 0),
@@ -135,7 +135,7 @@ class Memory:
         #: the bytes the last `free_for` gave back
         self.freed = 0
         #: the attempt's refusal, for its reply
-        self.refusal: dict[str, Any] | None = None
+        self.refusal: dict[str, int | str] | None = None
         #: the running stage gave weights back: its next block boundary plans it again
         self.shrunk = False
         #: rung 1 asks the owner; never from inside torch's allocator
