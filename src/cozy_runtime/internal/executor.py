@@ -151,6 +151,7 @@ from cozy_runtime.internal import (
     native_interfaces,
     package_interface,
     plane,
+    prebuilt,
     prepare_diagnostics,
     proctree,
     sandbox,
@@ -3775,6 +3776,7 @@ class Executor:
         prefix = member._prefix()
         counted = member.backend.gemm_sites if member.backend is not None else {}
         index = member.device_facts.index if member.device_facts is not None else 0
+        sm = member.device_facts.sm if member.device_facts is not None else 0
         missing = int8_linear.unavailable()
         native = {"int8": int8_linear.OP, "fp8": fp8_linear.OP}
         for (component, leaf), sites in sorted(counted.items()):
@@ -3782,8 +3784,9 @@ class Executor:
             fields: dict[str, Any] = {"component": prefix + component, "sites": sites}
             record.emit("confession", "gemm.selected", kernel, format=form, leaf=leaf, **fields)
             wanted = native.get(form, kernel)
-            if missing and kernel != wanted:
-                fallback(kernel, wanted=wanted, served=kernel, reason=missing[0].reason, **fields)
+            reason = prebuilt.lost(form, sm) or (missing[0].reason if missing else "")
+            if reason and kernel != wanted:
+                fallback(kernel, wanted=wanted, served=kernel, reason=reason, **fields)
         for group in member.refused_leaves:
             fallback(
                 "torch.linear",

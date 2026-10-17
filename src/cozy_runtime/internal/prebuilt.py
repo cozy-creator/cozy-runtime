@@ -24,7 +24,7 @@ from cozy_runtime.internal import arch, verify
 from cozy_runtime.internal.encoding.formats import CONVROT_GROUP, E4M3_MAX, Tensor, hadamard256
 
 try:
-    from cozy_kernels import FAMILIES, GEMM, _gemm
+    from cozy_kernels import FAMILIES, GEMM, TMA_GEMM, _gemm
 
     ABSENT = ""
 except ImportError as absent:  # no cozy-kernels wheel for this OS and CPU
@@ -318,6 +318,16 @@ def covers(sm: int) -> bool:
     boot, and builds them only if they fail their probe here (`int8_linear.native`)."""
     family = arch.row(sm).family
     return not ABSENT and any(sm in GEMM[f].get(family, ()) for f in GEMM)
+
+
+def lost(f: str, sm: int) -> str:
+    """Why the wheel has no `f` GEMM for this card where a full build has one (a Windows wheel,
+    cr-201), or "": a run's GEMM column says it beside the kernel that served."""
+    family = arch.row(sm).family
+    if ABSENT or _gemm.TMA or sm not in TMA_GEMM.get(f, {}).get(family, ()):
+        return ""
+    return (f"the Windows cozy-kernels wheel has no {family} {f} GEMM for sm{sm}: MSVC cannot "
+            "build CUTLASS's TMA kernels (cr-201)")  # fmt: skip
 
 
 def library(torch: ModuleType, index: int, sm: int) -> tuple[Prebuilt | None, str]:

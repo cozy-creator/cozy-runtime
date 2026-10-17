@@ -9,6 +9,7 @@ fp8 leaf failed its float16 GEMM check and raised for float32.
 
 from __future__ import annotations
 
+import ast
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,9 +18,9 @@ import msgspec
 import pytest
 
 from cozy_runtime.author._services import Attempt
-from cozy_runtime.author.kernels import INT8_CONVROT
+from cozy_runtime.author.kernels import INT8_CONVROT, ROWWISE_FP8
 from cozy_runtime.derive.microscale import encode_int8_convrot256
-from cozy_runtime.internal import int8_linear, probe, qualification
+from cozy_runtime.internal import fp8_linear, int8_linear, prebuilt, probe, qualification
 from cozy_runtime.internal.encoding import (
     SPEC_INT8_CONVROT256,
     SPEC_NVFP4,
@@ -236,3 +237,43 @@ def test_a_run_names_each_components_gemm_kernel_and_each_fallback(tmp_path: Pat
         ]
     finally:
         del int8_linear._NATIVE[0]
+
+
+def test_a_windows_wheel_names_the_gemm_that_served_and_why(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Windows cozy-kernels wheel has no CUTLASS TMA GEMMs (cr-201): an RTX 50's fp8 leaves
+    multiply in `_scaled_mm`, and the run's GEMM column says so and why. Ada's fp8 GEMM is
+    `_scaled_mm` on every wheel, so it says nothing more. The wheel's facts are stated: its
+    declared table, and `_gemm.TMA` false."""
+    torch = pytest.importorskip("torch")
+    source = Path(__file__).parents[1] / "kernels/src/cozy_kernels/__init__.py"
+    [table] = [
+        node.value
+        for node in ast.parse(source.read_text()).body
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+        if node.target.id == "TMA_GEMM" and node.value is not None
+    ]
+    monkeypatch.setattr(prebuilt, "ABSENT", "")
+    monkeypatch.setattr(prebuilt, "_gemm", SimpleNamespace(TMA=False), raising=False)
+    monkeypatch.setattr(prebuilt, "TMA_GEMM", ast.literal_eval(table), raising=False)
+    reason = prebuilt.lost("fp8", 120)
+    assert "cr-201" in reason
+    assert prebuilt.lost("fp8", 89) == prebuilt.lost("int8", 86) == ""
+
+    monkeypatch.setitem(int8_linear._LIBS, 0, prebuilt.Prebuilt(torch, 0, "mma.sync", False))
+    monkeypatch.setitem(fp8_linear._OPS, 0, int8_linear._LIBS[0].fp8_linear)
+    executor = Executor(None, tmp_path)  # type: ignore[arg-type]
+    executor.backend = SimpleNamespace(gemm_sites={("transformer", ROWWISE_FP8): 3})
+    rows = []
+    for sm, name in ((120, "NVIDIA GeForce RTX 5080"), (89, "NVIDIA L4")):
+        executor.device_facts = DeviceFacts("cuda", name, sm, "580.95.05", "", 0)
+        record = Attempt("gemm", tmp_path, sm)
+        Executor._emit_gemm(record, executor)
+        rows.append([
+            (row["name"], row["value"], row["fields"].get("reason", ""))  # type: ignore[union-attr]
+            for row in record.ring.rows()
+            if row["kind"] == "confession"
+        ])  # fmt: skip
+    selected = ("gemm.selected", fp8_linear.SCALED_MM, "")
+    assert rows == [[selected, ("gemm.fallback", fp8_linear.SCALED_MM, reason)], [selected]]

@@ -16,7 +16,7 @@ import sys
 from types import ModuleType
 
 from cozy_runtime.author.kernels import PreQuantized
-from cozy_runtime.internal import int8_linear
+from cozy_runtime.internal import int8_linear, prebuilt
 from cozy_runtime.internal.encoding.formats import E4M3_MAX, Tensor
 
 #: The activation scale's floor, as `ROW_SCALE_FLOOR` is the weights': a row of exact zeros
@@ -123,5 +123,10 @@ def linear(
 
 
 def serving(index: int) -> str:
-    """The kernel this card's fp8 leaves serve now: a run's `gemm.selected`, read once a run."""
-    return OP if _OPS.get(index) is not None else SCALED_MM
+    """The GEMM this card's fp8 leaves serve now: a run's `gemm.selected`, read once a run. A
+    prebuilt library with no fp8 GEMM for the card (Ada; RTX 50 on Windows) quantizes, and
+    `_scaled_mm` multiplies."""
+    if _OPS.get(index) is None:
+        return SCALED_MM
+    library = int8_linear.library(index)
+    return SCALED_MM if isinstance(library, prebuilt.Prebuilt) and not library.cutlass_fp8 else OP
