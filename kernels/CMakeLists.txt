@@ -12,6 +12,9 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC" AND CMAKE_CXX_COMPILER_VERSION VERSION_
     string(APPEND CMAKE_CUDA_FLAGS " -allow-unsupported-compiler")
 endif()
 enable_language(CUDA)
+# The C and C++ runtimes linked static, as NVIDIA's cudart_static is (LIBCMT): a Windows module
+# needs no Visual C++ redistributable (MSVCP140), as a Linux one links libstdc++ static.
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CUDA_STANDARD 17)
