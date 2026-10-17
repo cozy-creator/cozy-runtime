@@ -27,9 +27,9 @@ on:
         type: string
         default: '["x86_64", "aarch64"]'
       windows:
-        description: Whether to build for Windows x86_64
-        type: boolean
-        default: true
+        description: "Whether to build for Windows x86_64: yes or no"
+        type: string
+        default: 'yes'
   pull_request:
     paths: &inputs
       - kernels/**
@@ -127,8 +127,8 @@ jobs:
           if-no-files-found: error
 
   windows:
-    # A push or pull request carries no inputs: it builds every target.
-    if: ${{ inputs.windows || inputs.windows == null }}
+    # A push or pull request carries no inputs, and builds every target.
+    if: ${{ inputs.windows != 'no' }}
     # No larger Windows runner: the standard one, one compile at a time.
     runs-on: windows-2025
     timeout-minutes: 360

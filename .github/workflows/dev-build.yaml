@@ -48,7 +48,7 @@ jobs:
     with:
       ref: ${{ inputs.ref }}
       linux: ${{ contains(inputs.runner, 'arm') && '["aarch64"]' || '["x86_64"]' }}
-      windows: false
+      windows: 'no'
 
   dev:
     needs: modules
