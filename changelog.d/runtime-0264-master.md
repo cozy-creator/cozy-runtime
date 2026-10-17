@@ -1,0 +1,1 @@
+Runtime 0.26.4 is cut from master: 0.26.3 plus spilled tensors restored at the next request (#1515), derive's select_into (#1503), LM decode dropping a draft head that does not fit (#1505), a held decode set letting idle weights go (#1512), the Transformers 5.16-5.18 static cache (#1502), and the MPS tier (#1501).
