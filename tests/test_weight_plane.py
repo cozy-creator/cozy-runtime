@@ -257,6 +257,20 @@ def test_the_pinned_tier_holds_every_part_where_the_layout_says(tmp_path: Path) 
     assert same(run(model, x, passes=1), [expected])
 
 
+def test_a_cpu_executor_computes_on_a_tier_no_budget_cuts(tmp_path: Path) -> None:
+    """Audit row 9: a pinned budget below the weights refused a CPU executor
+    (`device_shortfall`). It computes on its tier, so the tier holds every weight it binds."""
+    weights = Weights(torch, torch.device("cpu"), "cpu")
+    weights.set_budget(-1, pinned=1 << 20)
+    checkpoint, values = write_checkpoint(tmp_path)
+    model = load(weights, checkpoint, "uncut")
+    x = torch.rand(4, HIDDEN, generator=torch.Generator().manual_seed(5)).half()
+    reference = Stack()
+    reference.load_state_dict(values)
+    with torch.inference_mode():
+        assert same(run(model, x, passes=1), [reference(x)])
+
+
 def test_a_stored_tensor_the_code_does_not_build_is_skipped_and_never_read(
     tmp_path: Path,
 ) -> None:
@@ -1251,47 +1265,22 @@ def test_the_owner_lowers_a_running_process_cap_at_its_next_block(card: Any) -> 
     assert same(reference, outputs)
 
 
-class Bare(torch.nn.Module):  # type: ignore[misc,name-defined]
-    """Blocks and nothing else: no `common`, so its stage holds no lease between blocks."""
-
-    _no_split_modules = ("Block",)
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.blocks = torch.nn.ModuleList([Block() for _ in range(BLOCKS)])
-
-    def forward(self, x: Any) -> Any:
-        for block in self.blocks:
-            x = block(x)
-        return x
-
-
 @on_card
-def test_a_block_whose_component_moves_to_the_sub_block_grain_under_it_runs_at_that_grain(
-    tmp_path: Path,
-) -> None:
-    """Run 5894, `tensorfs.plane.Closed`: a stage that held no lease between blocks was placed
-    again from inside a block, at its block floor, and moved the component to the sub-block
-    grain. That closed the weight set the block had chosen, and its acquire read it. The block
-    runs at the grain the component has now instead, with the same bits."""
+def test_a_component_moves_to_the_sub_block_grain_at_any_block_boundary(card: Any) -> None:
+    """Run 5894, `tensorfs.plane.Closed`, and cr-203 U5. A block placed again from inside its
+    own attempt finds its component at another grain, and runs there, same bits. Moving
+    waited for no lease or cursor anywhere, so never mid-stage, where a stage leases its
+    common and streams through a cursor. Now it moves at the next block boundary: the
+    cursor and leases close with the coarse weight set, and common is leased again."""
     from cozy_runtime.internal import budget_cell
 
-    weights = Weights(torch, torch.device("cuda", 0), "cuda")
-    weights.set_budget(-1, pinned=1 << 30)
-    generator = torch.Generator().manual_seed(11)
-    values: dict[str, Any] = {}
-    for index in range(BLOCKS):
-        for name in ("proj", "out"):
-            values[f"blocks.{index}.{name}.weight"] = (
-                torch.randn(HIDDEN, HIDDEN, generator=generator) / HIDDEN**0.5
-            )
-        values[f"blocks.{index}.norm"] = torch.rand(HIDDEN, generator=generator) + 0.5
-    model = load(weights, store_component(tmp_path, "stack", values), "regrain", factory=Bare)
+    weights = card.weights
+    model = load(weights, card.checkpoint, "regrain")
     layout: weight_policy.Layout = model.residency.components["stack"].layout
-    assert model.residency.components["stack"].common is None and layout.fine is not None
     x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
     weights.set_budget(1 << 30)
     reference = run(model, x)
+    weights.set_budget(tight(model))
     cell, fd = budget_cell.Cell.create()
     worker = budget_cell.Cell(fd)
     os.close(fd)
@@ -1299,18 +1288,44 @@ def test_a_block_whose_component_moves_to_the_sub_block_grain_under_it_runs_at_t
     model.residency.admit("run", ("stack",))
     try:
         with torch.inference_mode():
-            outputs = [model.stack(x)]
+            outputs = [model.stack(x), model.stack(x)]  # the second pass streams in order
+            coarse = model.residency.components["stack"]
+            assert coarse.cursor is not None and coarse.lease is not None
             # One block at a time: the next block applies it before its acquire, and moves on.
             ticket = worker.ask(layout.common + layout.largest)
-            outputs += [model.stack(x), model.stack(x)]
+            outputs.append(model.stack(x))
     finally:
         model.residency.release("run", ("stack",))
         weights.cell = None
         worker.answered(ticket)
         cell.close()
         worker.close()
-    assert model.residency.components["stack"].fine
+    fine = model.residency.components["stack"]
+    assert fine.fine and fine.common is not None and weights.modes["stack.grain"] == "sub-block"
     assert same(reference, outputs)
+
+
+@on_card
+def test_activations_short_of_memory_move_the_stage_to_its_finest_grain(card: Any) -> None:
+    """Memory's rung 2 used to stop at streaming everything: once no unleased weight was left,
+    the stage never planned smaller. Each out-of-memory now lowers what the next block boundary
+    plans in, down to the finest floor, and the component moves there mid-stage."""
+    weights = card.weights
+    model = load(weights, card.checkpoint, "finer")
+    x = torch.randn(8192, HIDDEN, device="cuda", dtype=torch.float16)
+    weights.set_budget(1 << 30)
+    reference = run(model, x)
+    torch.cuda.empty_cache()
+    free, _ = torch.cuda.mem_get_info()
+    ballast = torch.empty(free - (48 << 20), dtype=torch.uint8, device="cuda")
+    try:
+        tight_run = run(model, x)
+    finally:
+        del ballast
+        torch.cuda.empty_cache()
+    assert model.residency.components["stack"].fine
+    pairs = zip(reference, tight_run, strict=True)
+    assert all(torch.allclose(a, b, rtol=1e-2, atol=1e-2) for a, b in pairs)
 
 
 class WritingBlock(Block):

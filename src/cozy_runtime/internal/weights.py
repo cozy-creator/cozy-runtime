@@ -816,10 +816,10 @@ class Weights:
         }
 
     def floor(self) -> int:
-        """The plane bytes the open stages cannot run below, each component at its grain
-        (mid-stage none can refine: its leases hold the coarse regions)."""
+        """The plane bytes the open stages cannot run below: each component at its finest
+        grain, which it moves to at its next block boundary (`WeightResidency._refine`)."""
         return sum(
-            weight_policy.floor(replace(component.planned, fine=None))
+            weight_policy.floor(component.planned)
             for _, _, component in self.opened().values()
             if not component.spared
         )
@@ -1424,20 +1424,12 @@ class Weights:
 
     def _bind_host(self, component: Component) -> None:
         """A CPU executor computes on its pinned tier: every region pinned there (never evicted
-        implicitly) and bound in place, the pages shared with every executor of the layout."""
-        if self.pinned < 0:
-            self._pin(sum(c.ws.nbytes for c in self.components.values()))
+        implicitly) and bound in place, the pages shared with every executor of the layout.
+        The tier holds every set it registered: past the host, the machine's layout pages."""
+        self._pin(self._total())
         if self.fetch is not None:
             self.fetch.wait(component.manifest, _ordered(component.objects))
-        try:
-            ticket = self.plane.want(
-                component.ws, plane.PINNED, None, priority=self.tick(), pin=True
-            )
-        except (plane.error("Shortfall"), plane.error("BelowFloor")) as exc:
-            raise ResidencyRefusal(
-                "device_shortfall", f"{component.key} does not fit host memory: {exc}"
-            ) from None
-        ticket.wait()
+        self.plane.want(component.ws, plane.PINNED, None, priority=self.tick(), pin=True).wait()
         fd = os.dup(component.ws.host_fd)
         try:
             # Private: the pages are the tier's until written, and nothing here writes them.
@@ -3493,14 +3485,15 @@ class WeightResidency:
         weights.page_out(_in_use(weights))
         self.pressure = (weights.allocatable(), weights.retries())
 
-    def _acquire_common(self, component: Component, stream: Any) -> Any:
-        """The stage's common region's lease, room made for it by the ladder."""
+    def _acquire_common(self, component: Component, stream: Any, upto: Rung = Rung.DISK) -> Any:
+        """The stage's common region's lease, room made for it by the ladder (`upto`)."""
         weights, common = self.weights, component.common
         assert common is not None
         self._arrive(component, common.index)
         return weights.memory.retry(
             lambda: weights.plane.acquire(component.ws, weights.index, common.index, stream),
             f"{component.name}.common",
+            upto=upto,
         )
 
     def _place(self, budget: int, resume: Mapping[str, int] = {}) -> int:
@@ -3527,7 +3520,7 @@ class WeightResidency:
             try:
                 self._plan(budget, resume, outside)
                 weights.limit_torch()
-                memory.shrunk = False
+                memory.shrunk, memory.plan = False, -1
                 return budget
             except weight_policy.BelowFloor as exc:
                 (nbytes, own), floor = (max(exc.needed - exc.available, 1), True), True
@@ -4190,25 +4183,35 @@ class WeightResidency:
         )
 
     def _refinable(self, component: Component) -> bool:
-        return not (
-            component.fine
-            or component.layout.fine is None
-            or self.refine is None
-            or any(c.lease is not None or c.cursor is not None for c in self.components.values())
-            or not reap(component)  # its weight set cannot close under an open ring (0.27.3)
+        """Whether it can move to a finer grain now: never under a block in its forward or a
+        held scope (their leases and captured graphs keep its regions), nor under a ring a
+        view keeps open (its weight set cannot close, 0.27.3)."""
+        layout = component.layout
+        return (
+            self.refine is not None
+            and layout.fine is not None
+            and sum(layout.fine) < layout.least
+            and component.key not in self.weights.running
+            and component.name not in self.stage_holds
+            and reap(component)
         )
 
     def _refine(self, key: str) -> bool:
-        """Move the weight set `key` to the sub-block grain, if it still can: never while a
-        lease or cursor holds its coarse regions. A block that chose the old grain runs at the
-        new one (`_regrained`)."""
+        """Move the weight set `key` to the sub-block grain at a block boundary, if it can: its
+        cursor and leases close with its weight set, its common is leased again for the open
+        stage, and a block that chose the old grain runs at the new one (`_regrained`)."""
         name = next((n for n, c in self.components.items() if c.key == key), "")
         component = self.components.get(name)
         if component is None or self.refine is None or not self._refinable(component):
             return False
+        staged = component.lease is not None
         self._unhook(name)
         component = self.components[name] = self.refine(name)
         self._hook(component)
+        if staged and component.common is not None:  # inside a plan: never its rung 2
+            component.lease = self._acquire_common(component, self.weights.stream(), Rung.IDLE)
+            bind(self.weights.torch, component.common, component.lease)
+        self.note(f"{name}.grain", "sub-block")
         return True
 
     def _block(
@@ -4298,11 +4301,11 @@ class WeightResidency:
             quiet, seen, memory = not (observed or region.tight), -1, weights.memory
             op = f"{component.name}.{region.path}"
             while True:
-                if self.components.get(component.name) is not component:
-                    raise _Regrained
                 if memory.shrunk and not weights.running:  # the stage gave weights back
                     memory.shrunk = False
                     self._replan({component.key: region.index})
+                if self.components.get(component.name) is not component:
+                    raise _Regrained
                 if component.spared:
                     self._unspare(component)
                 stream = weights.stream()
@@ -4478,13 +4481,16 @@ class WeightResidency:
         )
 
     def _replan(self, resume: Mapping[str, int]) -> None:
-        """Plan the open stages again in the budget they have: their cursors start over from
-        the block that runs again (`resume`)."""
-        opened = [component for _, _, component in self.weights.opened().values()]
+        """Plan the open stages again in the budget they have, or the less memory's rung 2
+        left them (`Memory.plan`): their cursors start over from the block that runs again
+        (`resume`)."""
+        weights = self.weights
+        opened = [component for _, _, component in weights.opened().values()]
         for component in opened:
             close_cursor(component)
         if opened:
-            self._place(max(self.weights.applied, self.weights.floor()), resume)
+            budget = weights.applied if weights.memory.plan < 0 else weights.memory.plan
+            self._place(max(min(budget, weights.applied), weights.floor()), resume)
 
     def _restore(self, component: Component, region: Region) -> None:
         """Give a block the stored bytes again (its resident ones hold a delta its forward
@@ -4592,6 +4598,8 @@ class WeightResidency:
             unseen = [r.index for r in component.blocks if r.index not in component.seen]
             component.order = [*component.seen, *unseen]
             component.observed = True
+            if component.residence is not None and component.residence.streamed:
+                self.weights.memory.shrunk = True  # streamed in order from this block boundary
             return
         if index not in component.seen:
             component.seen.append(index)
