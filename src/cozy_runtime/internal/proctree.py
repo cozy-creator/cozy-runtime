@@ -193,27 +193,32 @@ def arm_parent_death() -> None:
     _prctl(_PR_SET_PDEATHSIG, signal.SIGKILL)
 
 
-def _watch_parent_exit() -> None:
-    # A literal platform test: the type checker knows kqueue only where it exists.
-    if sys.platform != "darwin":
+# A literal platform test: the type checker knows kqueue only where it exists.
+if sys.platform == "darwin":
+
+    def _watch_parent_exit() -> None:
+        queue = select.kqueue()
+        exit_event = select.kevent(
+            os.getppid(),
+            filter=select.KQ_FILTER_PROC,
+            flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+            fflags=select.KQ_NOTE_EXIT,
+        )
+        try:
+            queue.control([exit_event], 0, 0)
+        except ProcessLookupError:
+            os.kill(os.getpid(), signal.SIGKILL)
+
+        def watch() -> None:
+            queue.control(None, 1, None)
+            os.kill(os.getpid(), signal.SIGKILL)
+
+        threading.Thread(target=watch, name="parent-watch", daemon=True).start()
+
+else:
+
+    def _watch_parent_exit() -> None:
         raise ProcessTreeUnsupported("arm_parent_death")
-    queue = select.kqueue()
-    exit_event = select.kevent(
-        os.getppid(),
-        filter=select.KQ_FILTER_PROC,
-        flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
-        fflags=select.KQ_NOTE_EXIT,
-    )
-    try:
-        queue.control([exit_event], 0, 0)
-    except ProcessLookupError:
-        os.kill(os.getpid(), signal.SIGKILL)
-
-    def watch() -> None:
-        queue.control(None, 1, None)
-        os.kill(os.getpid(), signal.SIGKILL)
-
-    threading.Thread(target=watch, name="parent-watch", daemon=True).start()
 
 
 def seal_no_new_privs() -> None:
