@@ -1,9 +1,9 @@
 name: dev-build
 # Builds publish.yaml's release files for any ref and runs one targeted test command, off the dev box:
 #   gh workflow run dev-build.yaml -R cozy-creator/cozy-runtime -f ref=<sha> [-f build=pure|none]
-#     [-f tensord_ref=<ref>] [-f tensorfs_ref=<ref>] [-f test='uv run pytest -q tests/test_x.py']
-# The artifact is cozy-runtime-<sha>[-tensord-<sha>][-tensorfs-<sha>]. The files carry the ref's
-# pyproject version; the commit is stamped in cozy_runtime._build_provenance.
+#     [-f test='uv run pytest -q tests/test_x.py']
+# The artifact is cozy-runtime-<sha>[-aarch64]. The files carry the ref's pyproject version; the
+# commit is stamped in cozy_runtime._build_provenance.
 on:
   workflow_dispatch:
     inputs:
@@ -12,19 +12,11 @@ on:
         type: string
         default: master
       build:
-        description: "wheels: sdist, pure wheel and the runner arch's Linux wheel with its kernels and tensord; pure: sdist and pure wheel; none: tests only"
+        description: "wheels: sdist, pure wheel and the runner arch's Linux wheel with its kernels; pure: sdist and pure wheel; none: tests only"
         type: string
         default: wheels
       test:
         description: Targeted test command, run with bash at the ref in a delegated cgroup; empty runs none
-        type: string
-        default: ''
-      tensord_ref:
-        description: TensorD branch, tag or SHA replacing tensord.pin; empty keeps the pin
-        type: string
-        default: ''
-      tensorfs_ref:
-        description: TensorFS branch, tag or SHA replacing TensorD's Cargo.toml pin; empty keeps it
         type: string
         default: ''
       runner:
@@ -35,7 +27,7 @@ on:
         description: Caller's id, shown in the run name so the caller can find its run
         type: string
         default: ''
-run-name: dev-build ${{ inputs.ref }} ${{ inputs.build }} ${{ inputs.tensord_ref }} ${{ inputs.tensorfs_ref }} ${{ inputs.nonce }}
+run-name: dev-build ${{ inputs.ref }} ${{ inputs.build }} ${{ inputs.nonce }}
 
 permissions:
   contents: read
@@ -65,56 +57,16 @@ jobs:
           path: source
       - id: pin
         working-directory: source
-        env:
-          TENSORD_REF: ${{ inputs.tensord_ref }}
-        run: |
-          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          echo "tensord=${TENSORD_REF:-$(cat tensord.pin)}" >> "$GITHUB_OUTPUT"
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - uses: astral-sh/setup-uv@v7
       - uses: arduino/setup-task@v2
         with:
           repo-token: ${{ github.token }}
       - run: uv python install 3.12
-      - name: TensorFS read access (the TensorD build, and a git source until 0.10 is published)
+      - name: TensorFS read access (an arm runner builds TensorFS from its tag)
         env:
           TENSORFS_KEY: ${{ secrets.TENSORFS_READ_KEY }}
         run: bash source/scripts/prepare-release-source-access.sh
-      - if: env.WHEELS == 'true'
-        uses: actions/checkout@v4
-        with:
-          repository: cozy-creator/tensord
-          ref: ${{ steps.pin.outputs.tensord }}
-          path: tensord
-      - id: tensord
-        if: env.WHEELS == 'true'
-        env:
-          OVERRIDE: ${{ inputs.tensord_ref }}
-        run: |
-          sha=$(git -C tensord rev-parse HEAD)
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          [ -z "$OVERRIDE" ] || echo "suffix=-tensord-$sha" >> "$GITHUB_OUTPUT"
-      # A dev TensorFS: pin its commit and commit locally, since the release build stamps a clean HEAD.
-      - id: tensorfs
-        if: env.WHEELS == 'true' && inputs.tensorfs_ref != ''
-        working-directory: tensord
-        env:
-          REF: ${{ inputs.tensorfs_ref }}
-        run: |
-          set -eu
-          sha=$REF
-          [[ $sha =~ ^[0-9a-f]{40}$ ]] || sha=$(git ls-remote https://github.com/cozy-creator/tensorfs.git "$REF" "$REF^{}" | sort -k2 | tail -1 | cut -f1)
-          [[ $sha =~ ^[0-9a-f]{40}$ ]] || { echo "::error::TensorFS ref $REF not found"; exit 1; }
-          sed -i -E "/cozy-creator\/tensorfs\.git/ s/(tag|branch|rev) = \"[^\"]*\"/rev = \"$sha\"/" Cargo.toml
-          CARGO_NET_GIT_FETCH_WITH_CLI=true cargo fetch
-          git -c user.name=dev-build -c user.email=dev-build@invalid commit -qam "dev-build: TensorFS $sha"
-          echo "suffix=-tensorfs-$sha" >> "$GITHUB_OUTPUT"
-      - if: env.WHEELS == 'true'
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: tensord -> target
-          # One cache per TensorD commit (and TensorFS override): no build output crosses refs.
-          key: tensord-${{ steps.tensord.outputs.sha }}${{ steps.tensorfs.outputs.suffix }}
-          cache-on-failure: true
       # An arm runner builds the locked TensorFS from its tag until TensorFS publishes aarch64 wheels.
       - working-directory: source
         run: |
@@ -123,8 +75,8 @@ jobs:
           version=$(grep -A1 '^name = "tensorfs"$' uv.lock | sed -n 's/^version = "\(.*\)"$/\1/p')
           uv pip install "tensorfs @ git+https://github.com/cozy-creator/tensorfs@v$version"
           echo UV_NO_SYNC=1 >> "$GITHUB_ENV"
-      # From here to the machine check: publish.yaml's build job, step for step.
-      # On either arch the Linux wheel is the pure one plus its kernels and tensord.
+      # From here to the wheel check: publish.yaml's build job, step for step.
+      # On either arch the Linux wheel is the pure one plus its kernels.
       - name: Build (sdist + pure-py wheel)
         if: inputs.build != 'none'
         working-directory: source
@@ -143,28 +95,14 @@ jobs:
         if: env.WHEELS == 'true'
         working-directory: source
         run: task wheel KERNELS="$GITHUB_WORKSPACE/kernels-out" PLAT="manylinux_2_28_$(uname -m)"
-      - name: Bundle tensord into the Linux wheel
+      - name: Verify wheel selection
         if: env.WHEELS == 'true'
         working-directory: source
-        env:
-          CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
-          OVERRIDE: ${{ inputs.tensord_ref }}${{ inputs.tensorfs_ref }}
-        # The release container installs its toolchain under target/manylinux/rustup; it never
-        # comes from or goes to the cache (rust-cache would prune it to a broken stub).
-        # An override is pinned as the commit it built, the form a candidate pin takes.
-        run: |
-          rm -rf "$GITHUB_WORKSPACE/tensord/target/manylinux/rustup"
-          CARGO_BUILD_JOBS=$(nproc) task machine MACHINE="$GITHUB_WORKSPACE/tensord"
-          rm -rf "$GITHUB_WORKSPACE/tensord/target/manylinux/rustup"
-          [ -z "$OVERRIDE" ] || git -C "$GITHUB_WORKSPACE/tensord" rev-parse HEAD > tensord.pin
-      - name: Verify wheel selection and the installed machine command
-        if: env.WHEELS == 'true'
-        working-directory: source
-        run: uv run --script scripts/verify-machine-wheels.py --dist dist
+        run: uv run --script scripts/verify-wheels.py --dist dist
       - if: inputs.build != 'none'
         uses: actions/upload-artifact@v4
         with:
-          name: cozy-runtime-${{ steps.pin.outputs.sha }}${{ steps.tensord.outputs.suffix }}${{ steps.tensorfs.outputs.suffix }}${{ runner.arch == 'ARM64' && '-aarch64' || '' }}
+          name: cozy-runtime-${{ steps.pin.outputs.sha }}${{ runner.arch == 'ARM64' && '-aarch64' || '' }}
           path: source/dist/
           if-no-files-found: error
           retention-days: 7

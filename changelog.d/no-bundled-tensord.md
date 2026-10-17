@@ -1,0 +1,1 @@
+The Runtime wheels no longer install `tensord`: the machine is `cozy machine serve`, a role of the `cozy` binary (v0.10.0), which worker images bake. `tensord.pin`, `task machine`, the aarch64 machine wheel and dev-build's `tensord_ref`/`tensorfs_ref` are gone; aarch64 installs the pure wheel.
