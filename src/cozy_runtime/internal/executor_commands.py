@@ -295,9 +295,6 @@ class Load(Command, frozen=True, kw_only=True, tag="load"):
     #: TensorD prepares/retains sealed CPU layouts (`SEALED_TIERS`). Runtime adopts the
     #: buffer read-only (`SealedTier`); a managed executor has no implicit Store fallback.
     sealed_tiers: bool = False
-    #: TensorD supplies actual header/model-asset bytes (`ModelSource`). Required for new
-    #: model-bearing construction; weightless loads need no model-source access.
-    model_sources: bool = False
     #: TensorD stages shared CPU layouts in part and supplies read-only object files
     #: (`SealedStage`, `ObjectFiles`). Runtime's plane uses them for unstaged regions.
     staged_tiers: bool = False
@@ -368,8 +365,6 @@ class Invoke(_Attempt, frozen=True, kw_only=True, tag="invoke"):
     construction: str = ""
     attention_kernel: str = ""
     bits: int = 0  # as `PrepareRequest.bits`
-    #: The weight plane's device budget for this attempt; -1: the executor derives it.
-    plane_budget_bytes: int = -1
     #: The process's device cap for this attempt; -1: none
     cap_bytes: int = -1
     #: Per GPU of a group, its own cap for this attempt (index = rank, `RANK_CELLS`)
