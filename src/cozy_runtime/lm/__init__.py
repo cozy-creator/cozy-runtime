@@ -1132,10 +1132,19 @@ class _Engine:
         started = time.perf_counter()
         for request in incoming:
             # One call joins at a time while rows decode: their tokens keep coming meanwhile.
-            if waiting or (admitted and self._occupied()) or not self._admit(request):
+            if waiting or (admitted and self._occupied()):
                 waiting.append(request)
-            else:
+                continue
+            try:
+                joined = self._admit(request)
+            except torch.OutOfMemoryError as exc:  # this call alone takes Transformers' loop
+                request.fallback = f"OutOfMemoryError: {exc}".splitlines()[0][:300]
+                torch.cuda.empty_cache()
+                continue
+            if joined:
                 admitted = True
+            else:
+                waiting.append(request)
         self.debt = time.perf_counter() - started if admitted else 0.0
         with self.cond:
             self.pending.extendleft(reversed(waiting))
