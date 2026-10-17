@@ -396,8 +396,9 @@ class Weights:
         #: weights), innermost last; and the component whose block ran last
         self.running: list[str] = []
         self.last = ""
-        #: a read outside a module's forward is being mapped (`reading`)
-        self.mapping = False
+        #: how deep reads outside a module's forward are being mapped (`reading`): a LoRA bake
+        #: in a region such a read binds reads its overlay's factors, one level in
+        self.mapping = 0
         #: the plane is placing or giving room: an allocator refusal inside is its own to answer
         self.placing = False
         #: the bytes of the last allocator refusal `refused` unmapped weights for
@@ -1110,35 +1111,52 @@ class Weights:
         else the read is refused, and no kernel is ever handed its empty pointer."""
         opened = self.opened()
         held: list[tuple[Component, Region, Lease]] = []
-        if self.mapping:  # a read from inside the mapping of another: never a second one
-            raise _unbound_read(op)
-        self.mapping = True
+        if self.mapping >= NESTED_READS:  # a mapping that maps again, and again (run 2793)
+            raise _unbound_read(op, f"weight reads nested {self.mapping} deep")
+        self.mapping += 1
+        mapping = True
         try:
+            bound_at_entry: set[int] = set()
             for standin in standins:
                 origin: Origin | None = getattr(standin, "origin", None)
                 if origin is None or origin[0] is not self:
-                    raise _unbound_read(op)
-                _, component, region, _, _ = origin
+                    raise _unbound_read(op, "the weight belongs to no plane of this process")
+                _, component, region, _, name = origin
                 row = opened.get(component.key)
                 if row is None or row[2] is not component:
-                    raise _unbound_read(op)
+                    stages = sorted(c.name for _, _, c in opened.values())
+                    raise _unbound_read(
+                        op,
+                        f"{component.name}.{region.path}:{name} is in no open stage "
+                        f"(open: {', '.join(stages) or 'none'})",
+                    )
+                if region.bound is not None:
+                    bound_at_entry.add(id(region))
                 if region.bound is None and all(region is not other for _, other, _ in held):
                     held.append((component, region, row[0]._lease(component, region, op)))
             for _, region, lease in held:  # a re-plan for a later lease unbound earlier ones
                 bind(self.torch, region, lease)
             real: dict[int, Tensor] = {}
             for standin in standins:
-                _, _, _, table, name = getattr(standin, "origin")  # noqa: B009
+                _, component, region, table, name = getattr(standin, "origin")  # noqa: B009
                 value = table[name]
                 if value is None or type(value) is type(standin):
-                    raise _unbound_read(op)
+                    leased = any(region is other for _, other, _ in held)
+                    raise _unbound_read(
+                        op,
+                        f"{component.name}.{region.path}:{name} lost its bytes before the op ran "
+                        f"(region {region.index}, bound at entry {id(region) in bound_at_entry}, "
+                        f"leased {leased}, {len(standins)} weight operands, "
+                        f"{len(held)} regions leased)",
+                    )
                 real[id(standin)] = value.to(dtype=standin.dtype, device=standin.device)
-            self.mapping = False
+            self.mapping, mapping = self.mapping - 1, False
             yield Read(
                 real, tuple((r.bound, r.bound + r.span) for _, r, _ in held if r.bound is not None)
             )
         finally:
-            self.mapping = False
+            if mapping:
+                self.mapping -= 1
             for component, region, lease in reversed(held):
                 if region.index not in component.resident:
                     unbind(region)
@@ -1728,7 +1746,7 @@ def _unbound_type(torch: ModuleType) -> type:
             origins = (getattr(standin, "origin", None) for standin in standins)
             origin: Origin | None = next((found for found in origins if found is not None), None)
             if origin is None:
-                raise _unbound_read(op)
+                raise _unbound_read(op, "no weight operand carries its plane origin")
             with origin[0].reading(standins, op) as read:
                 yield read
 
@@ -1756,7 +1774,8 @@ def _unbound_type(torch: ModuleType) -> type:
             if func._schema.is_mutable and any(
                 isinstance(v, cls) for v in _tensor_operands(tuple(_written(func, args, kwargs)))
             ):
-                raise _unbound_read(str(func))  # a write would be lost with the mapping
+                # a write would be lost with the mapping
+                raise _unbound_read(str(func), "the op writes into the weight")
             with cls.reading(standins, str(func)) as read:
                 return read.kept(
                     func(
@@ -1768,11 +1787,15 @@ def _unbound_type(torch: ModuleType) -> type:
     return Unbound
 
 
-def _unbound_read(op: str) -> ResidencyRefusal:
-    return ResidencyRefusal(
-        "weight_unbound",
-        f"{op}: a weight is read while no plane bytes are bound to it (outside its stage)",
-    )
+#: Reads outside a module's forward mapped inside one another at most: a block read binds a
+#: region whose LoRA bake reads its overlay's factors (runs 10440, 10454). Deeper is a mapping
+#: that maps again without end (run 2793: `Tensor.to` retyping a stand-in under an OOM retry).
+NESTED_READS = 2
+
+
+def _unbound_read(op: str, why: str = "") -> ResidencyRefusal:
+    detail = f"{op}: a weight is read while no plane bytes are bound to it (outside its stage)"
+    return ResidencyRefusal("weight_unbound", f"{detail}: {why}" if why else detail)
 
 
 @dataclass(frozen=True, slots=True)
