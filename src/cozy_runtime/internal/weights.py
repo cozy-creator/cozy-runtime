@@ -346,8 +346,10 @@ class Weights:
         self.host_only = device.type == "cpu"
         #: one pool (Apple GPUs): the page cache is the host tier and regions are torch tensors,
         #: through a plane that speaks the TensorFS plane's contract
-        self.unified = accel.memory_class(kind) == "unified"
+        self.unified = accel.memory_class(kind, torch, device) == "unified"
         self.pool = UnifiedPlane(torch, device) if self.unified else None
+        if self.pool is not None:
+            self.pool.writes = self._writes
         self.plane: Plane = (
             cast("Plane", self.pool)
             if self.pool is not None
@@ -453,6 +455,13 @@ class Weights:
         self.clock += 1
         return self.clock
 
+    def _writes(self, name: str, index: int) -> bool:
+        """Whether a weight set's region holds LoRA'd linears, whose bake writes its bytes."""
+        for component in self.components.values():
+            if component.ws.name == name:
+                return any(r.bakes for r in component.regions if r.index == index)
+        return False
+
     def stream(self) -> int:
         if self.kind != "cuda":
             return 0  # one command queue
@@ -462,9 +471,10 @@ class Weights:
         """`accel.allocation`, with a unified plane's regions taken out of torch's figures:
         they are torch tensors there, and the plane counts them as its own (`committed`)."""
         memory = accel.allocation(self.torch, self.kind)
-        if self.pool is not None:
+        if self.pool is not None:  # regions read in place are no torch allocation
+            held = self.pool.committed - self.pool.mapped
             for name in ("allocated_bytes", "reserved_bytes"):
-                memory[name] = max(memory[name] - self.pool.committed, 0)
+                memory[name] = max(memory[name] - held, 0)
         return memory
 
     def synchronize(self) -> None:
@@ -967,7 +977,7 @@ class Weights:
         free (run 5940: a 4 MP decode's 31 GB feature cache past a 62 GB container's limit).
         The pinned tier's weights, which the page cache and disk hold too, give way first.
         Whether any moved."""
-        if self.kind != "cuda" or self.grouped:
+        if self.kind != "cuda" or self.grouped or self.unified:  # one pool: a move frees nothing
             return False
         # What is kept for speed alone (an LM's decode session, recorded graphs) goes, never
         # to host: moved there, every later call would read it over the bus (run 10143).

@@ -1,7 +1,8 @@
-"""The unified-memory plane (Apple GPUs) over a real TensorFS store: every region's bytes are
-the stored bytes, inline and object parts alike, read from a store lease and from the
-machine's object files; budgets evict in the plane's order and refuse what cannot fit; a
-cursor lets its oldest streamed region go. On the CPU everywhere, and on MPS where there is one.
+"""The unified-memory plane (Apple GPUs, integrated CUDA GPUs) over a real TensorFS store: every
+region's bytes are the stored bytes, inline and object parts alike, read from a store lease and
+from the machine's object files; budgets evict in the plane's order and refuse what cannot fit;
+a cursor lets its oldest streamed region go. On an integrated CUDA GPU (GB10) object regions are
+the files' pages, read in place. On the CPU everywhere, and on MPS or CUDA where there is one.
 """
 
 from __future__ import annotations
@@ -17,11 +18,16 @@ torch = pytest.importorskip("torch")
 
 import tensorfs  # noqa: E402
 
-from cozy_runtime.internal import plane  # noqa: E402
+from cozy_runtime.internal import mapped_region, plane  # noqa: E402
 from cozy_runtime.internal.unified_plane import UnifiedPlane  # noqa: E402
 from fetch_hub import write  # noqa: E402
 
-DEVICES = ["cpu"] + (["mps"] if torch.backends.mps.is_available() else [])
+DEVICES = (
+    ["cpu"]
+    + (["mps"] if torch.backends.mps.is_available() else [])
+    + (["cuda"] if torch.cuda.is_available() else [])
+)
+INTEGRATED = torch.cuda.is_available() and mapped_region.supported(0)
 
 #: `tiny` is stored inline in the header; every other tensor is an object
 VALUES = {
@@ -78,6 +84,31 @@ def test_every_region_holds_the_stored_bytes(tmp_path: Path, device: str, files:
         assert got == VALUES[key].tobytes(), key
         assert part["offset"] % 4096 == 0
     assert unified.committed == ws.nbytes
+    ws.close()
+
+
+@pytest.mark.skipif(not INTEGRATED, reason="needs an integrated CUDA GPU (GB10)")
+@pytest.mark.parametrize("written", [False, True], ids=["in-place", "written"])
+def test_an_integrated_gpu_reads_object_regions_in_place(tmp_path: Path, written: bool) -> None:
+    unified, ws = registered(tmp_path, "cuda", files=True)
+    unified.writes = lambda name, index: written
+    unified.set_vram_budget(0, ws.nbytes)
+    before = torch.cuda.memory_allocated()
+    unified.want(ws, 0, None, priority=1)
+    objects = sum(r.span for r in ws._regions if r.copies[0][0]["source"] == "object")
+    inline = ws.nbytes - objects
+    # Object regions are the files' pages: no torch allocation holds them; a LoRA'd one is a copy.
+    assert unified.mapped == (0 if written else objects) and unified.committed == ws.nbytes
+    assert torch.cuda.memory_allocated() - before == (ws.nbytes if written else inline)
+    for part in ws.parts:
+        region = ws.regions[part["region"]]
+        with unified.acquire(ws, 0, part["region"], 0) as lease:
+            at = part["offset"] - region["offset"]
+            got = lease.view()[at : at + part["nbytes"]].clone().cpu().numpy().tobytes()
+        key = part["what"].removeprefix("c/").removesuffix("#value")
+        assert got == VALUES[key].tobytes(), key
+    assert unified.drop(ws, 0, None) == ws.nbytes and unified.mapped == 0
+    torch.cuda.synchronize()
     ws.close()
 
 

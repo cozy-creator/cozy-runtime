@@ -1,5 +1,7 @@
 """The weight plane of the unified memory class (design §6.2): one pool, so the host tier is the
-OS page cache of the store's objects, and a resident region is one device tensor read from it.
+OS page cache of the store's objects, and a resident region is one device tensor read from it. On
+an integrated CUDA GPU (GB10) a region is those pages themselves, mapped and registered in place
+(`mapped_region`): no second copy of the bytes.
 
 It speaks `tensorfs.plane`'s contract (`crates/tensorfs-plane/API.md`) for the calls Runtime
 makes, so `weights.py`'s residency, paging and out-of-memory recovery run unchanged on Apple
@@ -12,10 +14,11 @@ binds them any more: `weights.py` unbinds an evicted region as on a discrete car
 from __future__ import annotations
 
 import mmap
+import os
 import threading
 import time
 from collections import deque
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from types import ModuleType
 from typing import TYPE_CHECKING
@@ -23,6 +26,8 @@ from typing import TYPE_CHECKING
 import tensorfs
 from tensorfs import ReadLease, ReadPlan, Store
 from tensorfs import plane as _plane
+
+from cozy_runtime.internal import mapped_region
 
 if TYPE_CHECKING:
     from tensorfs.plane import Part, Region, Trim
@@ -85,10 +90,13 @@ class _FileSource(_Source):
 
     def __init__(self, files: Iterable[tuple[str, int, int]], header: Header) -> None:
         super().__init__(header)
-        self.maps = {
-            sha.removeprefix("sha256:"): mmap.mmap(fd, length, access=mmap.ACCESS_READ)
-            for sha, length, fd in files
-        }
+        self.maps: dict[str, mmap.mmap] = {}
+        #: each object's own descriptor, for regions mapped in place
+        self.fds: dict[str, int] = {}
+        for sha, length, fd in files:
+            key = sha.removeprefix("sha256:")
+            self.maps[key] = mmap.mmap(fd, length, access=mmap.ACCESS_READ)
+            self.fds[key] = os.dup(fd)
 
     def object(self, row: ReadItem, into: memoryview) -> None:
         mapped = self.maps[row["object"].removeprefix("sha256:")]
@@ -98,6 +106,8 @@ class _FileSource(_Source):
     def close(self) -> None:
         for mapped in self.maps.values():
             mapped.close()
+        for fd in self.fds.values():
+            os.close(fd)
 
 
 @dataclass(slots=True)
@@ -112,6 +122,8 @@ class _Region:
     pinned: bool = False
     leases: int = 0
     held: int = 0
+    #: its bytes are the object files' pages, read in place
+    mapped: bool = False
 
 
 class WeightSet:
@@ -263,6 +275,12 @@ class UnifiedPlane:
         self.serial = 0
         self.counts = {"misses": 0, "evictions": 0, "evicted_bytes": 0, "fills": 0}
         self.fill_bytes = self.fill_ns = 0
+        #: an integrated CUDA GPU reads regions in place from the mapped object files
+        self.in_place = device.type == "cuda" and mapped_region.supported(device.index or 0)
+        #: of `committed`, the bytes read in place: no torch allocation holds them
+        self.mapped = 0
+        #: whether a region's bytes are written (a LoRA baked into them): it gets its own copy
+        self.writes: Callable[[str, int], bool] = lambda name, index: False
         self._events: list[Facts] = []
 
     # -- sources and weight sets
@@ -406,6 +424,7 @@ class UnifiedPlane:
                         "leased_bytes": leased,
                         "held_bytes": held,
                         "disk_copy_bytes": self.fill_bytes,
+                        "mapped_bytes": self.mapped,
                         "disk_copy_ns": self.fill_ns,
                         "misses": self.counts["misses"],
                         "evictions": self.counts["evictions"],
@@ -449,20 +468,82 @@ class UnifiedPlane:
     def _fill(self, ws: WeightSet, region: _Region) -> None:
         torch = self.torch
         started = time.perf_counter_ns()
-        staging = torch.empty(region.span, dtype=torch.uint8)
-        into = memoryview(staging.numpy())
-        for row, at, within in region.copies:
-            ws.source.read(row, within, into[at : at + row["len"]])
-        region.tensor = staging.to(self.device)
+        split = self._in_place(ws, region)
+        if split is not None:
+            pieces, rest = split
+
+            def write(into: memoryview) -> None:
+                for row, at, within in rest:
+                    ws.source.read(row, within, into[at : at + row["len"]])
+
+            index = self.device.index or 0
+            region.tensor = mapped_region.region(torch, index, region.span, pieces, write)
+            region.mapped = True
+            self.mapped += region.span
+        else:
+            staging = torch.empty(region.span, dtype=torch.uint8)
+            into = memoryview(staging.numpy())
+            for row, at, within in region.copies:
+                ws.source.read(row, within, into[at : at + row["len"]])
+            region.tensor = staging.to(self.device)
+            self.fill_bytes += region.span
         self.committed += region.span
         self.counts["fills"] += 1
-        self.fill_bytes += region.span
         self.fill_ns += time.perf_counter_ns() - started
+
+    def _in_place(
+        self, ws: WeightSet, region: _Region
+    ) -> tuple[list[mapped_region.Piece], list[tuple[ReadItem, int, int]]] | None:
+        """The region's object rows as file pieces to map in place, and the rows written around
+        them (inline parts); None where it is copied: not an integrated GPU, a region whose
+        bytes are written, or a row off its page that shares one with a mapped piece."""
+        source = ws.source
+        if not (self.in_place and isinstance(source, _FileSource)) or self.writes(
+            ws.name, region.index
+        ):
+            return None
+        page = mapped_region.PAGE
+        pieces: list[mapped_region.Piece] = []
+        rest: list[tuple[ReadItem, int, int]] = []
+        for row, at, within in region.copies:
+            off = row.get("off", 0)
+            fd = (
+                source.fds.get(row["object"].removeprefix("sha256:"))
+                if row["source"] == "object"
+                else None
+            )
+            if fd is None or off % page or at % page:
+                rest.append((row, at, within))
+            elif (
+                pieces
+                and pieces[-1][0] == fd
+                and pieces[-1][1] + pieces[-1][2] == off
+                and (pieces[-1][3] + pieces[-1][2] == at and pieces[-1][2] % page == 0)
+            ):
+                fd_, off_, nbytes, at_ = pieces[-1]
+                pieces[-1] = (fd_, off_, nbytes + row["len"], at_)
+            else:
+                pieces.append((fd, off, row["len"], at))
+        mapped = {
+            p
+            for _, _, nbytes, at in pieces
+            for p in range(at // page, (at + nbytes - 1) // page + 1)
+        }
+        if not pieces or any(
+            p in mapped
+            for row, at, _ in rest
+            for p in range(at // page, (at + row["len"] - 1) // page + 1)
+        ):
+            return None
+        return pieces, rest
 
     def _free(self, ws: WeightSet, region: _Region) -> int:
         if region.tensor is None:
             return 0
         region.tensor = None
+        if region.mapped:
+            region.mapped = False
+            self.mapped -= region.span
         self.committed -= region.span
         return region.span
 

@@ -14,6 +14,7 @@ qualification gate. Callers hand in their `torch` module; this module imports no
 from __future__ import annotations
 
 import ctypes
+import functools
 import os
 import platform
 import re
@@ -26,6 +27,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, Literal
 
+from cozy_runtime.internal import proctree
 from cozy_runtime.internal.config import inherited_environment, sees_no_gpu
 
 #: The #450 law, imposed on every MPS executor's sealed environment: enabling the fallback
@@ -478,6 +480,15 @@ def allocation(torch: Any, kind: str, device: Any = None) -> dict[str, int]:
             "driver_free_bytes": max(total - driver, 0),
             "driver_total_bytes": total,
         }
+    if memory_class(kind, torch, device) == "unified":
+        # The host's: the driver's free figure is MemFree, blind to the page cache it can reclaim.
+        ram = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+        return {
+            "allocated_bytes": int(torch.cuda.memory_allocated(device)),
+            "reserved_bytes": int(torch.cuda.memory_reserved(device)),
+            "driver_free_bytes": max(proctree.host_memory().available, 0),
+            "driver_total_bytes": ram - HOST_RESERVE,
+        }
     free, total = torch.cuda.mem_get_info(device)
     return {
         "allocated_bytes": int(torch.cuda.memory_allocated(device)),
@@ -665,12 +676,24 @@ def qualification_gate(kind: str) -> None:
 HOST_RESERVE = 2 << 30
 
 
-def memory_class(kind: str) -> Literal["discrete", "unified"]:
+def memory_class(
+    kind: str, torch: ModuleType | None = None, device: Any = None
+) -> Literal["discrete", "unified"]:
     """How the device's memory relates to the host's (design §6.2). `unified`: one pool, so
     weights never page between a host and a device tier and "offload to CPU" frees nothing.
-    Apple GPUs are unified; CUDA cards are discrete here (coherent and integrated CUDA
-    machines are TensorD's to detect)."""
-    return "unified" if kind == "mps" else "discrete"
+    Apple GPUs are unified, and so is an integrated CUDA GPU (GB10, Jetson: CUDA's INTEGRATED,
+    the fact TensorD reports as the machine's memory class)."""
+    if kind == "mps":
+        return "unified"
+    if kind == "cuda" and torch is not None:
+        index = device.index if hasattr(device, "index") else device
+        return _integrated(torch, int(index or 0))
+    return "discrete"
+
+
+@functools.cache
+def _integrated(torch: ModuleType, index: int) -> Literal["discrete", "unified"]:
+    return "unified" if torch.cuda.get_device_properties(index).is_integrated else "discrete"
 
 
 def unified_budget(torch: ModuleType) -> int:
