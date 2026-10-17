@@ -56,9 +56,9 @@ app.entrypoint(
 app.entrypoint(
     t.bf16_full, name="bf16-full", weights=(WeightsOutput("bf16-full", LANE),), accelerator=False
 )
-app.entrypoint(t.bf16_pruned, name="bf16-pruned", weights=(WeightsOutput("bf16-pruned", LANE),))
-app.entrypoint(t.fp8_pruned, name="fp8-pruned", weights=(WeightsOutput("fp8-pruned", LANE),))
-app.entrypoint(t.mxfp8_pruned, name="mxfp8-pruned", weights=(WeightsOutput("mxfp8-pruned", LANE),))
+app.entrypoint(t.bf16_pruned, name="bf16-pruned", weights=(WeightsOutput("bf16", LANE),))
+app.entrypoint(t.fp8_pruned, name="fp8-pruned", weights=(WeightsOutput("fp8", LANE),))
+app.entrypoint(t.mxfp8_pruned, name="mxfp8-pruned", weights=(WeightsOutput("mxfp8", LANE),))
 app.entrypoint(t.fp8, name="fp8", weights=(WeightsOutput("fp8", LANE),), accelerator=False)
 app.entrypoint(t.mxfp8, name="mxfp8", weights=(WeightsOutput("mxfp8", LANE),), accelerator=False)
 app.entrypoint(

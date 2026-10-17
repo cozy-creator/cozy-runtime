@@ -128,7 +128,7 @@ def test_child_progress_uses_its_reserved_scope_and_deduplicates_polls(tmp_path:
     # Every byte update must relay the child's identity, which lets the machine attach
     # its current byte counters to the parent's progress frame.
     stage = (
-        "downloading paul/minimax-h3@1.0.0-rc.3 fp8-pruned "
+        "downloading paul/minimax-h3@1.0.0-rc.3 fp8 "
         "(text_encoder, ref2va_dit, video_vae, audio_vae) and "
         "paul/minimax-h3-turbo-lora@1.0.0-audit.1 pdd8 (ref2va_turbo)"
     )
