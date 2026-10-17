@@ -265,25 +265,31 @@ def test_an_op_runs_again_only_once_its_failed_frames_let_go(
     assert weights.oom_retries == 1
 
 
+@pytest.mark.parametrize(
+    "need,free,floor",
+    [
+        (25_493_504, 184_221_696, 268_435_456),  # runs 10829, 10837: SDXL's encode, 12 GB
+        (444_596_224, 12_165_483_520, 0),  # run 10831: an H3 follower GPU, 16 GB
+    ],
+)
 def test_an_allocation_refused_with_room_on_the_ledger_still_climbs_the_ladder(
-    card: tuple[Weights, dict[str, int]],
+    card: tuple[Weights, dict[str, int]], need: int, free: int, floor: int
 ) -> None:
-    """Runs 10829 and 10837 (SDXL's encode on a 12 GB card beside an idle Klein): 25,493,504 B
-    refused with 184,221,696 B free above the floor. The ledger said it fit, so the owner was
-    never asked, and the run failed `memory_exhausted`. A second refusal with the same room is
-    evidence the ledger is short for this op: the ask doubles and the ladder walks on."""
+    """Refused with far more free above the floor than it asked for. The ledger said it fit, so
+    the owner was never asked, and the run failed. A second refusal with the same room is
+    evidence the ledger is short for this op (fragmentation, a library's own bytes): the ask
+    doubles and the ladder walks on, the owner asked for all of it."""
     weights, device = card
     asked: list[int] = []
 
-    def owner(nbytes: int) -> None:  # the idle tenant's 7.56 GB, once asked for
+    def owner(nbytes: int) -> None:  # an idle tenant's 7.56 GB, once asked for
         asked.append(nbytes)
         device["free"] += 7_560_000_000
 
-    weights.room, weights.floor_free = owner, 268_435_456
-    device["free"] = 184_221_696 + weights.floor_free
-    need = 25_493_504
+    weights.room, weights.floor_free, weights.total = owner, floor, 24 << 30
+    device["free"] = free + floor
     seen = weights.memory.again(need, "aten.convolution.default")
-    assert seen == 184_221_696 and not asked, "the first refusal runs again in what is free"
+    assert seen == free and not asked, "the first refusal runs again in what is free"
     now = weights.memory.again(need, "aten.convolution.default", seen=seen)
     assert now > seen and asked and asked[0] >= 2 * seen, "the second asks the owner"
 
@@ -316,3 +322,35 @@ def test_an_op_refused_with_room_on_the_ledger_runs_once_the_owner_made_more(
     with weights.recovering():
         assert torch.equal(torch.ops.cozy_memory_test.stubborn(x), x)
     assert READY[0] and weights.oom_retries == 2
+
+
+@pytest.mark.parametrize("cap", [-1, 6 << 30])
+def test_torchs_limit_leaves_it_all_the_ladder_counts_free(
+    monkeypatch: pytest.MonkeyPatch, cap: int
+) -> None:
+    """The allocator's per-process fraction is set from the same figures `Memory.free` reads,
+    each time the ladder settles: torch may take a fresh segment of every byte the ladder
+    counts free, never fewer (the suspect for runs 10829 and 10831)."""
+    weights = Weights(torch, torch.device("cpu"), "cpu")
+    weights.host_only, weights.total, weights.floor_free, weights.context_bytes = (
+        False,
+        8 << 30,
+        268_435_456,
+        300 << 20,
+    )
+    figures = {
+        "allocated_bytes": 1 << 30,
+        "reserved_bytes": 3 << 30,
+        "driver_free_bytes": 2 << 30,
+        "driver_total_bytes": 8 << 30,
+    }
+    monkeypatch.setattr(accel, "allocation", lambda *_, **__: figures)
+    limits: list[float] = []
+    monkeypatch.setattr(
+        torch.cuda, "set_per_process_memory_fraction", lambda f, _: limits.append(f)
+    )
+    monkeypatch.setattr(accel, "release_cached", lambda *_: None)
+    weights.cap = cap
+    weights.memory._settle()
+    fresh = round(limits[-1] * weights.total) - figures["reserved_bytes"]
+    assert abs(fresh - weights.memory.free()) <= 1, (fresh, weights.memory.free())
