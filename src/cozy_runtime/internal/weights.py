@@ -331,6 +331,28 @@ class Component:
 # ------------------------------------------------------------------------ the process
 
 
+class Reservation:
+    """Device bytes a live owner keeps for speed and gives back under pressure. They live in
+    torch's cache, which the ledger counts already: a reservation is the owner's admission
+    token and shed handle, and `granted` is a fact, never added to the ledger."""
+
+    def __init__(self, weights: Weights, owner: str, shed: Callable[[int], int]) -> None:
+        self.weights, self.owner, self.shed = weights, owner, shed
+        self.granted = 0
+
+    def resize(self, nbytes: int) -> bool:
+        """Whether the owner may hold `nbytes` now. Never waits or raises: False pauses the
+        owner, which tries again when its own work frees room."""
+        if nbytes > self.granted and not self.weights.grant(nbytes - self.granted):
+            return False
+        self.granted = nbytes
+        return True
+
+    def close(self) -> None:
+        self.weights.reservations.pop(self, None)
+        self.granted = 0
+
+
 class Weights:
     """This executor process's plane, budgets and every registered weight set (one per rank).
 
@@ -416,6 +438,8 @@ class Weights:
         #: asks the Worker for `bytes` free on this GPU from its other tenants (`DeviceRoom`);
         #: None in a process without a Worker
         self.room: Callable[[int], None] | None = None
+        #: device bytes live owners keep for speed and shed under pressure (`reserve`)
+        self.reservations: dict[Reservation, None] = {}
         #: the last out-of-memory retry granted without memory coming back: (op, allocatable)
         self.last_retry: tuple[str, int] | None = None
         #: the CUDA context and library workspaces outside torch and the plane, measured once
@@ -860,6 +884,7 @@ class Weights:
         for release in RELEASERS:  # what is kept for speed alone goes before any weight
             release()
         accel.release_cached(self.torch, self.kind)
+        self.shed(need)
         if self.open:
             # Inside a block nothing is re-placed under its lease (None): other weights leave,
             # and their blocks map them again as they run.
@@ -977,7 +1002,7 @@ class Weights:
             return False
         # What is kept for speed alone (an LM's decode session, recorded graphs) goes, never
         # to host: moved there, every later call would read it over the bus (run 10143).
-        if any([release() for release in RELEASERS]):
+        if any([release() for release in RELEASERS]) or self.shed(need):
             accel.release_cached(self.torch, self.kind)
             if self.allocatable() >= need + weight_policy.MARGIN:
                 return True
@@ -1088,6 +1113,34 @@ class Weights:
         """Device bytes torch can allocate now: its headroom plus its own idle cache."""
         memory = self.allocation()
         return self.headroom(memory) + max(memory["reserved_bytes"] - memory["allocated_bytes"], 0)
+
+    def reserve(self, owner: str, nbytes: int, shed: Callable[[int], int]) -> Reservation:
+        """A hold on device bytes `owner` keeps for speed (an LM engine's slots), granted as
+        far as there is room now (`Reservation.granted`). Under pressure `shed(need)` gives
+        back what it can before any weight unmaps."""
+        reservation = Reservation(self, owner, shed)
+        self.reservations[reservation] = None
+        reservation.resize(nbytes)
+        return reservation
+
+    def grant(self, nbytes: int) -> bool:
+        """Whether `nbytes` more fit now beside the floor, components no stage uses paging out
+        for them first. Never waits."""
+        if self.host_only:
+            return True
+        want = nbytes + weight_policy.MARGIN
+        if self.allocatable() >= want:
+            return True
+        return self.page_out(_in_use(self), want) and self.allocatable() >= want
+
+    def shed(self, need: int) -> bool:
+        """Reservations give back toward `need`, the youngest first. Whether any gave."""
+        gave = False
+        for reservation in reversed(list(self.reservations)):
+            if self.allocatable() >= need + weight_policy.MARGIN:
+                break
+            gave = reservation.shed(need) > 0 or gave
+        return gave
 
     def progressed(self, before: int, need: int, op: str = "") -> None:
         """An out-of-memory retry runs again only when it can succeed: memory came back (this
