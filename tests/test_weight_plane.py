@@ -30,12 +30,21 @@ from tensorfs.derived import Derivation, Part, Target, Tensor  # noqa: E402
 
 from cozy_runtime.author._activity import asides  # noqa: E402
 from cozy_runtime.author._loader import census  # noqa: E402
-from cozy_runtime.author.kernels import rms_rope_split_half  # noqa: E402
-from cozy_runtime.derive.microscale import encode_fp8_rowwise  # noqa: E402
-from cozy_runtime.internal import accel, paging, plane, spill, weight_policy  # noqa: E402
+from cozy_runtime.author.kernels import INT8_CONVROT, rms_rope_split_half  # noqa: E402
+from cozy_runtime.derive.microscale import encode_fp8_rowwise, encode_int8_convrot256  # noqa: E402
+from cozy_runtime.internal import (  # noqa: E402
+    accel,
+    attention_ulysses,
+    paging,
+    plane,
+    spill,
+    weight_policy,
+)
+from cozy_runtime.internal import attention_upstream as upstream  # noqa: E402
 from cozy_runtime.internal import weights as weights_module  # noqa: E402
 from cozy_runtime.internal.derive import Observations, serving_substrate  # noqa: E402
 from cozy_runtime.internal.encoding import SPEC_PLAIN, SPEC_ROWWISE  # noqa: E402
+from cozy_runtime.internal.encoding.leaves import _native_leaf_class  # noqa: E402
 from cozy_runtime.internal.fill import Checkpoint  # noqa: E402
 from cozy_runtime.internal.weights import (  # noqa: E402
     INDIVISIBLE,
@@ -2290,6 +2299,103 @@ def test_an_image_decode_short_of_memory_is_still_the_untiled_image(tmp_path: Pa
         torch.testing.assert_close(image, reference, atol=1e-2, rtol=0)
 
 
+@contextmanager
+def short(weights: Weights, nbytes: int) -> Iterator[None]:
+    """Ops under the process's recovery with `nbytes` of room for activations beside what it
+    holds now."""
+    weights.modes.clear()
+    weights.set_cap(room(weights, nbytes))
+    try:
+        with weights.recovering(), torch.inference_mode():
+            yield
+    finally:
+        weights.set_cap(-1)
+        torch.cuda.empty_cache()
+
+
+@on_gpu
+def test_attention_and_an_int8_linear_short_of_memory_run_in_pieces_on_the_card() -> None:
+    """cr-203 U2: attention through the Runtime's dispatch whose output does not fit beside
+    its Q/K/V runs in head groups, an int8 leaf's product and a bf16 matmul in rows. Each
+    attention and int8 piece computes as the whole does: the same bits."""
+    weights = Weights(torch, torch.device("cuda", 0), "cuda")
+    weights.set_budget(-1, pinned=1 << 30)
+    torch.manual_seed(4)
+    q, k, v = (torch.randn(1, 16384, 16, 128, device="cuda", dtype=torch.bfloat16) for _ in "qkv")
+    options = attention_ulysses.Options(
+        attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, enable_gqa=False
+    )
+    w = torch.randn(3072, 2048)
+    encoded = encode_int8_convrot256("w", w.numpy())
+    data = torch.frombuffer(bytearray(encoded.payload), dtype=torch.int8).view(3072, 2048)
+    scale = torch.frombuffer(bytearray(encoded.companions[0].raw), dtype=torch.float32)
+    roles = {"data": data.cuda(), "scale": scale.cuda()}
+    bias = torch.randn(3072, device="cuda", dtype=torch.bfloat16)
+    leaf = _native_leaf_class(torch)(
+        None, roles, bias, torch.bfloat16, INT8_CONVROT, "int8", 2048, 3072
+    )
+    x = torch.randn(1, 16384, 2048, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(8192, 2048, device="cuda", dtype=torch.bfloat16) / 32
+    with torch.inference_mode():
+        attended, product, plain = upstream.sdpa(q, k, v, **options), leaf(x), x @ w.t()
+    with short(weights, 32 << 20):
+        pieces = attention_ulysses._call("_cozy_sdpa", upstream.SDPA, q, k, v, options)
+    assert "attention" in weights.modes["bands"], weights.modes
+    assert torch.equal(pieces, attended)
+    with short(weights, 32 << 20):
+        rows = leaf(x)
+    assert "encoded linear" in weights.modes["bands"], weights.modes
+    assert torch.equal(rows, product)
+    with short(weights, 32 << 20):
+        bands = x @ w.t()
+    assert "aten.matmul" in weights.modes["bands"], weights.modes
+    torch.testing.assert_close(bands, plain, atol=2**-6, rtol=2**-7)
+
+
+@on_gpu
+def test_a_transformer_short_of_memory_cuts_its_linears_norms_and_attention() -> None:
+    """cr-203 U2: a Flux.2 transformer whose activations do not fit beside what the process
+    holds (its own weights are plain tensors, so they spill first). Each op that runs out
+    whole runs in exact row bands, attention (the Runtime's SDPA dispatch) in head groups: the
+    uncut output, to bfloat16 rounding of products whose kernels change with their rows."""
+    diffusers = pytest.importorskip("diffusers")
+    weights = Weights(torch, torch.device("cuda", 0), "cuda")
+    weights.set_budget(-1, pinned=1 << 30)
+    torch.manual_seed(3)
+    model = diffusers.Flux2Transformer2DModel(
+        in_channels=64,
+        num_layers=1,
+        num_single_layers=2,
+        attention_head_dim=128,
+        num_attention_heads=8,
+        joint_attention_dim=512,
+        timestep_guidance_channels=64,
+        axes_dims_rope=(32, 32, 32, 32),
+        guidance_embeds=False,
+    ).to("cuda", torch.bfloat16)
+    sdpa = attention_ulysses.member("_cozy_sdpa", upstream.SDPA)
+    for module in model.modules():
+        if hasattr(getattr(module, "processor", None), "_attention_backend"):
+            module.processor._attention_backend = sdpa
+    side = 96  # 9216 image tokens: 113 MiB MLP activations, 18 MiB Q, K and V
+    image = torch.randn(1, side * side, 64, device="cuda", dtype=torch.bfloat16)
+    text = torch.randn(1, 64, 512, device="cuda", dtype=torch.bfloat16)
+    ids = torch.zeros(1, side * side, 4, device="cuda")
+    ids[..., 2], ids[..., 3] = torch.arange(side * side) // side, torch.arange(side * side) % side
+    step = torch.tensor([0.5], device="cuda")
+
+    def call() -> Any:
+        return model(image, text, step, ids, torch.zeros(1, 64, 4, device="cuda")).sample
+
+    with torch.inference_mode():
+        reference = call()
+    with short(weights, 64 << 20):
+        out = call()
+    assert "bands" in weights.modes, weights.modes
+    error = ((out.float() - reference.float()).norm() / reference.float().norm()).item()
+    assert error < 1e-2, (error, weights.modes)
+
+
 @on_gpu
 def test_a_banded_result_out_of_memory_inside_a_nested_recovery_lives_in_host_memory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -2305,7 +2411,7 @@ def test_a_banded_result_out_of_memory_inside_a_nested_recovery_lives_in_host_me
     with torch.inference_mode():
         reference = plain.decode(z).sample
     del plain
-    monkeypatch.setattr(weights, "activation_room", lambda: (1 << 40, 0))  # every result fits
+    monkeypatch.setattr(weights, "activation_room", lambda whole=False: (1 << 40, 0))  # all fit
     weights.modes.clear()
     weights.set_cap(room(weights, 96 << 20))
     model.residency.admit("run", ("vae",))
