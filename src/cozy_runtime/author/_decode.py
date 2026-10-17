@@ -1065,7 +1065,7 @@ class MediaReads:
 
     def probe(self, asset: Asset) -> Probe:
         """Source header facts, cached on the handle. Never decodes a picture or sample."""
-        _budget, path = self._start(asset, f"{type(asset).__name__}.probe", retained=False)
+        _budget, path = self._start(asset, f"{type(asset).__name__}.probe", decode=False)
         if asset._probed is None:
             if asset.kind == "image":
                 with _reading(asset, None, "image"):
@@ -1107,7 +1107,7 @@ class MediaReads:
         self._open_streams -= 1
 
     def _start(
-        self, asset: Asset, operation: str, *, retained: bool = True
+        self, asset: Asset, operation: str, *, retained: bool = True, decode: bool = True
     ) -> tuple[_Budget, Path]:
         self._attempt.check_open(operation)
         if self._attempt.components_active():
@@ -1123,7 +1123,7 @@ class MediaReads:
                 code="foreign_asset",
                 fields=fields,
             )
-        if asset._max_decoded_bytes <= 0:
+        if decode and asset._max_decoded_bytes <= 0:
             raise CapabilityError(
                 f"asset {asset.ref!r} has no decoded-byte ceiling: declare "
                 "AssetBound(max_decoded_bytes=...) on the field that carries it",
@@ -1133,7 +1133,7 @@ class MediaReads:
         if asset._read_guard is not None:
             asset._read_guard()
         budget = _Budget(
-            min(asset._max_decoded_bytes, self._limits.max_decoded_bytes),
+            min(max(asset._max_decoded_bytes, 0), self._limits.max_decoded_bytes),
             parent=self._budget if retained else None,
             scope="retained decoded" if retained else "streamed decoded",
             cumulative=retained,

@@ -415,6 +415,14 @@ def test_a_live_webm_without_a_recorded_duration_is_measured_from_packets(
     assert [row.field for row in record.rows] == ["input"]
 
 
+def test_a_probe_needs_no_decode_bound_but_a_read_does(media: dict[str, Path]) -> None:
+    video = fakes.file_input(VideoAsset, media["clip"], max_decoded_bytes=0)
+    assert video.probe().source_duration == 2
+    with pytest.raises(CapabilityError) as caught:
+        video.read()
+    assert caught.value.code == "decoded_bound_missing"
+
+
 def test_reads_refuse_inside_a_component_scope(media: dict[str, Path]) -> None:
     record = fakes.fake_attempt("scope")
     video = fakes.file_input(VideoAsset, media["clip"], attempt=record)
