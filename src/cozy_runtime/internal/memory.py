@@ -26,16 +26,13 @@ from cozy_runtime.author._model import RELEASERS
 from cozy_runtime.internal import accel, plane, spill, weight_policy
 
 if TYPE_CHECKING:
-    from cozy_runtime.internal.weights import Weights
+    from cozy_runtime.internal.weights import Component, Weights
 
 MARGIN = weight_policy.MARGIN
 #: torch's out-of-memory message: CUDA's units are KiB/MiB/GiB, MPS's KB/MB/GB of 1024
 _REQUESTED = re.compile(r"Tried to allocate ([0-9.]+) (B|KiB|MiB|GiB|KB|MB|GB)")
 _UNITS = {"B": 1, "KiB": 1 << 10, "MiB": 1 << 20, "GiB": 1 << 30}
 _UNITS |= {"KB": _UNITS["KiB"], "MB": _UNITS["MiB"], "GB": _UNITS["GiB"]}
-#: cursors dropped open since the last collection: a view into each ring outlived its stage,
-#: and the ring closes itself once the last view goes
-ORPHANED = [0]
 
 
 class Rung(IntEnum):
@@ -125,6 +122,19 @@ def shortage(exc: BaseException) -> tuple[int, bool] | None:
     return None
 
 
+def reap(component: Component) -> bool:
+    """Close the cursors a view into their ring kept open (`close_cursor`): whether none is."""
+    for cursor in list(component.orphans):
+        try:
+            cursor.close()
+        except plane.error("Poisoned"):
+            raise
+        except plane.error("PlaneError"):
+            continue
+        component.orphans.remove(cursor)
+    return not component.orphans
+
+
 class Memory:
     """The ladder and the refusal for one executor's GPU (`Weights.memory`)."""
 
@@ -180,8 +190,8 @@ class Memory:
         """Whether `nbytes` (and a margin) are free once the ladder ran as far as `upto`:
         rung by rung, each action again while it gives bytes back, until they are."""
         weights = self.weights
-        if weights.host_only:
-            return False
+        if weights.host_only or nbytes + max(weights.context_bytes, 0) > weights.total:
+            return False  # no rung makes a GPU larger: nothing moves for it
         want, start = max(nbytes, 0) + MARGIN, -1
         placing, weights.placing, self._collected = weights.placing, True, False
         try:
@@ -302,10 +312,15 @@ class Memory:
         """Rings whose cursor could not close (a failed block's frames hold a view in a
         reference cycle, run 10562) and bytes no class accounts for: garbage is collected,
         once, and the rings whose last view it held close."""
-        if self._collected or not (ORPHANED[0] or self.ledger().residue > MARGIN):
+        components = self.weights.components.values()
+        if self._collected or not (
+            any(c.orphans for c in components) or self.ledger().residue > MARGIN
+        ):
             return
-        self._collected, ORPHANED[0] = True, 0
+        self._collected = True
         gc.collect()
+        for component in components:
+            reap(component)
 
     def _finer(self, short: int) -> None:
         """The running stage's regions no block leases now leave; its next block boundary
