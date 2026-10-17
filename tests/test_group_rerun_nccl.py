@@ -1,11 +1,12 @@
-"""A GPU group runs a call again when one GPU runs out of memory, over NCCL on two GPUs.
+"""A GPU group's out-of-memory, over NCCL on two GPUs, with real follower processes.
 
-Real follower processes, a real NCCL communicator. GPU 1 runs out of memory BEFORE its
-collective, so GPU 0 waits inside it: only aborting the communicator (`RankGroup.interrupt`)
-lets GPU 0 return, and the group forms again in the same processes. Every GPU puts back what
-the failed attempt changed (its call journal) and the call runs again from its inputs; the
-output equals a control's. With the tiny H3 DiT the failure is in its second transformer
-block, between Ulysses all-to-alls.
+An op that runs out recovers on its own GPU while the others wait at the next collective. A
+collective that runs out (NCCL's own buffers) cannot: GPU 1's collective runs out BEFORE GPU
+0's, which waits inside it until aborting the communicator (`RankGroup.interrupt`) lets it
+return, and the group forms again in the same processes. Every GPU puts back what the failed
+attempt changed (its call journal) and the call runs again from its inputs; the output
+equals a control's. With the tiny H3 DiT both are in its second transformer block, between
+Ulysses all-to-alls.
 """
 
 from __future__ import annotations
@@ -95,9 +96,9 @@ def test_a_gpu_out_of_memory_before_its_collective_reruns_the_call(
         pids = group.pids()
         # Each GPU: (2 + its number + the calls it counted), summed.
         assert float(model.counted()) == 7.0
-        # GPU 1 out after its collective: GPU 0 finished its part, both put it back.
+        # GPU 1's later collective out: GPU 0 finished its part, both put it back.
         assert float(model.counted(after=1)) == 9.0
-        # GPU 1 out BEFORE its collective: GPU 0 waits in it until the abort.
+        # GPU 1's collective out BEFORE GPU 0's: GPU 0 waits in its own until the abort.
         assert float(model.counted(before=1)) == 11.0
         assert float(model.block.seen) == 3.0, "GPU 0 counted each call once"
         assert group.pids() == pids and not group.broken and group.pg is not first
@@ -132,6 +133,41 @@ def test_the_h3_dit_reruns_between_its_all_to_alls_and_matches_a_control(
             assert torch.equal(a, b), "the rerun's output is the control's"
             torch.testing.assert_close(a, c, rtol=1e-4, atol=1e-5)
         assert not group.broken
+    finally:
+        group.close()
+        for end in sockets:
+            end.close()
+
+
+def test_an_op_out_of_memory_on_a_follower_recovers_on_its_gpu(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """GPU 1's second transformer block allocates more than its card has free, mid-forward:
+    its ladder sheds a cache (a ballast, `RELEASERS`) and the op runs again on GPU 1 alone
+    while GPU 0 waits at the next all-to-all. The call completes once, the group never forms
+    again, and the output equals one GPU's."""
+    pytest.importorskip("diffusers")
+    group = group_of_two(tmp_path, "--h3", "--op-oom-at", "2")
+    leader, sockets = leader_of(group, tmp_path, monkeypatch)
+    model: Any = h3_model()
+    model.dit.to("cuda:0")
+    model.text_encoder.to("cuda:0")
+    batch = {k: v.to("cuda:0") if isinstance(v, torch.Tensor) else v for k, v in h3_batch().items()}
+    with torch.no_grad():
+        alone = model.dit(**batch)
+    leader.backend = prepared({"dit": model.dit, "text_encoder": model.text_encoder})
+    try:
+        group.spawn()
+        first = leader.pg = group.form(torch, SEAL)
+        assert leader._install_group(torch, model) is None
+        leader._attempt_spool = tmp_path / "attempt"
+        control = model.infer(batch)
+        recovered = model.infer(batch)  # GPU 1's block runs out on its second call
+        assert (tmp_path / "released-1").exists(), "GPU 1's ladder let the ballast go"
+        for a, b, c in zip(control, recovered, alone, strict=True):
+            assert torch.equal(a, b)
+            torch.testing.assert_close(a, c, rtol=1e-4, atol=1e-5)
+        assert not group.broken and group.pg is first, "no rerun: the group never re-formed"
     finally:
         group.close()
         for end in sockets:

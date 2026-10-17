@@ -23,7 +23,6 @@ from transformers.modeling_outputs import BaseModelOutputWithPast
 from cozy_runtime.author import AdapterRef, Model, placeable, spread, uses_components
 from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT, AttentionLayout, attention_scope
 from cozy_runtime.author._loader import census
-from cozy_runtime.author._model import RELEASERS
 from cozy_runtime.internal import attention, lora_composition, lora_contract
 from cozy_runtime.internal.encoding import SPEC_PLAIN, DeviceFacts
 from cozy_runtime.internal.executor import Executor, _capture_seal, answer
@@ -490,28 +489,32 @@ def h3_batch(*, mixed_lengths: bool = False) -> dict[str, Any]:
     }
 
 
-def out_of_memory_at(block: torch.nn.Module, call: int, released: Path | None = None) -> None:
-    """`block` runs out of memory on its `call`-th forward, before it runs. With `released`: a
+def out_of_memory_at(
+    block: torch.nn.Module, call: int, weights: Weights | None = None, released: Path | None = None
+) -> None:
+    """`block` runs out of memory on its `call`-th forward, before it runs. With `weights`: a
     real allocation on the card, inside the forward, that fits only once a cache the ladder
-    sheds (`RELEASERS`) let a ballast go, which it marks; else a collective out of memory, the
-    GPUs before it in the group already in its first collective."""
+    sheds (`Weights.reserve`) let its ballast go, which it marks at `released`; else a
+    collective out of memory, the GPUs before it in the group already in its first one."""
     calls = [0]
 
     def hook(module: Any, args: Any) -> None:
         calls[0] += 1
         if calls[0] != call:
             return
-        if released is None:
+        if weights is None or released is None:
             raise collective_oom()
         free, _ = torch.cuda.mem_get_info()
         ballast = [torch.empty(free - (256 << 20), dtype=torch.uint8, device="cuda")]
 
-        def release() -> None:
+        def shed(_need: int) -> int:
+            gave = sum(t.nbytes for t in ballast)
             ballast.clear()
-            RELEASERS.remove(release)
+            reservation.close()
             released.touch()
+            return gave
 
-        RELEASERS.append(release)
+        reservation = weights.reserve("ballast", ballast[0].nbytes, shed)
         torch.empty(512 << 20, dtype=torch.uint8, device="cuda")  # an activation
 
     block.register_forward_pre_hook(hook)
@@ -585,10 +588,12 @@ def main() -> None:
                 executor.weights = executor.weights or Weights(torch, device, "cuda")
                 for root in roots.values():
                     root.to(device)
-                if args.oom_at or args.op_oom_at:
-                    released = args.root / f"released-{args.rank}" if args.op_oom_at else None
-                    block = model.dit.transformer_blocks[1]
-                    out_of_memory_at(block, args.oom_at or args.op_oom_at, released)
+                block = model.dit.transformer_blocks[1] if args.h3 else None
+                if block is not None and args.oom_at:
+                    out_of_memory_at(block, args.oom_at)
+                if block is not None and args.op_oom_at:
+                    released = args.root / f"released-{args.rank}"
+                    out_of_memory_at(block, args.op_oom_at, executor.weights, released)
             if args.h3 and reply.get("ok") and not again:
                 refused = executor._install_group(torch, model, HOSTED_CAPACITY)
                 assert refused is None, refused
