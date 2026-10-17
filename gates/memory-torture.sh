@@ -5,7 +5,7 @@
 #   gates/memory-torture.sh <hub> <wheel|-> [card...]
 #
 # <wheel> is the candidate cozy-runtime wheel (a file or https://…#sha256=…), `-` for the Hub's target.
-# Cards (default: all): 8 12 24 32 2x8. Each rents the first SKU of its row with capacity, runs every cell,
+# Cards (default: all): 8 12 24 32 2x8; `<card>:h3` runs only its H3 cell (and the references). Each rents the first SKU of its row with capacity, runs every cell,
 # confirms each output landed, ends the rental and confirms it is gone. Results: ./memory-torture-<stamp>/.
 set -uo pipefail
 H=$1 W=$2; shift 2
@@ -140,7 +140,8 @@ h3() {  # H3 long_form: <segs> × 15 s; the last segment is guided by a video re
 }
 
 card() {
-  local card=$1 gpus="" sku
+  local card=${1%%:*} only=${1#*:} gpus="" sku
+  [ "$only" = "$1" ] && only=""
   [ "$card" = 2x8 ] && gpus=2
   M=""
   for sku in ${SKUS[$card]}; do
@@ -168,11 +169,14 @@ PY
     FOLLOW="$FOLLOW $!"
   done
   say "card $card: $(grep -iE 'runtime|tensord' "machine-$card.txt" | tr -s ' ' | tr '\n' ' ' | cut -c1-200)"
-  case $card in
-    2x8) local r=$RANDOM; references 2x8 "$r"; h3 2x8 2 "$(image 2x8-klein-a)" "$(image 2x8-klein-b)" "$r" 2 ;;
-    32) cells 32 3 ;;
-    *) cells "$card" 2 ;;
-  esac
+  local r=$RANDOM segs=2 gpus2=""
+  [ "$card" = 32 ] && segs=3
+  [ "$card" = 2x8 ] && gpus2=2
+  if [ "$card" = 2x8 ] || [ "$only" = h3 ]; then
+    references "$card" "$r"; h3 "$card" "$segs" "$(image "$card-klein-a")" "$(image "$card-klein-b")" "$r" $gpus2
+  else
+    cells "$card" "$segs"
+  fi
   release
 }
 
