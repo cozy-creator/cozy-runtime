@@ -13,6 +13,7 @@ import io
 import math
 import os
 import struct
+import sys
 import threading
 from array import array
 from collections.abc import Callable, Generator, Iterator
@@ -75,9 +76,10 @@ class DecodeLimits:
 
 
 # Structural codec ceilings, not package policy. Frame and sample ceilings count values a
-# read keeps; duration policy is the field's declared preparation. `max_decoded_bytes` is the
-# documented, machine-independent bound of an `Assets` media kind that declares none; the
-# attempt-wide retained budget is the machine's memory (`host_decode_limits`).
+# read keeps; duration policy is the field's declared preparation. `max_decoded_bytes` is only
+# what an `Assets` media kind that declares none publishes (its interface stays byte-stable);
+# it is never enforced: the attempt's budget is what the machine holds (`host_decode_limits`),
+# and only a bound the author declared narrows its field's reads.
 DEFAULT_DECODE_LIMITS = DecodeLimits(
     max_decoded_bytes=2 * 1024**3,
     max_pixels_per_frame=8192 * 8192,
@@ -90,17 +92,28 @@ MAX_ACTIVE_MEDIA_STREAMS = 2
 
 
 def host_decode_limits() -> DecodeLimits:
-    """The codec ceilings with the retained-media budget set by this machine's memory, never
-    a flat constant: decoded media that fits the machine is served. A field's declared
-    `AssetBound(max_decoded_bytes=...)` still narrows its own value."""
+    """The codec ceilings with the retained-media budget set by what this machine holds, its
+    memory and swap, never a flat constant: decoded media that fits the machine is served. A
+    field's declared `AssetBound(max_decoded_bytes=...)` still narrows its own value."""
     try:
         memory = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
     except (AttributeError, OSError, ValueError):
-        return DEFAULT_DECODE_LIMITS
+        memory = sys.maxsize  # unknown: nothing is refused on a guess
     return replace(
-        DEFAULT_DECODE_LIMITS,
-        max_decoded_bytes=max(DEFAULT_DECODE_LIMITS.max_decoded_bytes, memory),
+        DEFAULT_DECODE_LIMITS, max_decoded_bytes=min(memory + _swap_bytes(), sys.maxsize)
     )
+
+
+def _swap_bytes() -> int:
+    """The machine's swap, where pages of retained media can go: 0 where it is not readable."""
+    try:
+        with open("/proc/meminfo") as meminfo:
+            for line in meminfo:
+                if line.startswith("SwapTotal:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0
 
 
 class DecoderUnavailable(CapabilityError):
@@ -1179,17 +1192,13 @@ class MediaReads:
                 code="foreign_asset",
                 fields=fields,
             )
-        if decode and asset._max_decoded_bytes <= 0:
-            raise CapabilityError(
-                f"asset {asset.ref!r} has no decoded-byte ceiling: declare "
-                "AssetBound(max_decoded_bytes=...) on the field that carries it",
-                code="decoded_bound_missing",
-                fields=fields,
-            )
         if asset._read_guard is not None:
             asset._read_guard()
+        declared = asset._max_decoded_bytes  # 0: the field declares none; the machine's applies
         budget = _Budget(
-            min(max(asset._max_decoded_bytes, 0), self._limits.max_decoded_bytes),
+            min(declared, self._limits.max_decoded_bytes)
+            if declared > 0
+            else self._limits.max_decoded_bytes,
             parent=self._budget if retained else None,
             scope="retained decoded" if retained else "streamed decoded",
             cumulative=retained,

@@ -160,9 +160,7 @@ async def compose(ctx: Context, payload: Request) -> Result:
     assert "media_decode" not in imported["entrypoints"][0]["invocable"]["capabilities"]
 
 
-def test_a_named_media_input_needs_its_decode_bound(tmp_path: Path) -> None:
-    from cozy_runtime.author import ConformanceError
-
+def test_a_named_media_input_needs_no_decode_bound(tmp_path: Path) -> None:
     (tmp_path / "package.toml").write_text('[application]\nobject="unbounded_decode:app"\n')
     (tmp_path / "unbounded_decode.py").write_text("""import msgspec
 from cozy_runtime.author import App, Context, ImageAsset
@@ -175,5 +173,5 @@ class Result(msgspec.Struct):
 async def compose(ctx: Context, payload: Request) -> Result:
     raise RuntimeError("discovery only")
 """)
-    with pytest.raises(ConformanceError, match="asset_decode_unbounded"):
-        package_interface.build(discover(tmp_path))
+    built = package_interface.build(discover(tmp_path))
+    assert "media_decode" in built["entrypoints"][0]["invocable"]["capabilities"]
