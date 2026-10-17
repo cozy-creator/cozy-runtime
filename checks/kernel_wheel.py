@@ -30,10 +30,12 @@ RUST_FLOOR = re.compile(
 CALL = """
 import sys
 sys.path.insert(0, sys.argv[1])
-from cozy_kernels import _gemm
+from cozy_kernels import _fa3, _gemm
 code = _gemm.gemv(0, 0, False, 0, 0, 0, 0, False, 1, 8, 256, 0)
 assert code != 0, "a gemv ran with no GPU"
 assert _gemm.gemm(0, 3, False, 0, 0, 0, 0, 0, 0, False, 1, 8, 256, -1, None, 0) == 1
+head_96 = (0, 0, 0, 0, 0, 0, True, 1, 8, 8, 2, 2, 96, (0, 0, 0), (0, 0, 0), (0, 0, 0), (0, 0, 0))
+assert _fa3.fwd(*head_96, 1.0, False, 0, 0) == _fa3.NOT_SUPPORTED
 print(f"{sys.version.split()[0]}: gemv without a GPU -> {code} {_gemm.error_name(code)}")
 """
 

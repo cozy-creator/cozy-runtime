@@ -40,7 +40,7 @@ jobs:
       matrix:
         include:
           # CUTLASS units peak at ~6 GB each: compile jobs sized by the runner's memory.
-          - {arch: x86_64, cuda: x86_64, runner: linux-x64-16core, jobs: 10}
+          - {arch: x86_64, cuda: x86_64, runner: linux-x64-16core, jobs: 6}
           # The arm64 larger runner has no docker; the standard one does.
           - {arch: aarch64, cuda: sbsa, runner: ubuntu-24.04-arm, jobs: 1}
     runs-on: ${{ matrix.runner }}
