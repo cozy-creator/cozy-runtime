@@ -13,10 +13,11 @@ CARDS=${*:-8 12 24 32 2x8}
 declare -A SKUS=([8]="rtx-3070" [12]="rtx-5070 rtx-3080-ti rtx-4070-ti" [24]="rtx-4000-ada rtx-pro-4000 l4"
   [32]="rtx-pro-4500 rtx-5090" [2x8]="rtx-3070 rtx-5060-ti rtx-4060-ti rtx-3080-ti l4")
 D=$PWD/memory-torture-$(date -u +%Y%m%dT%H%M%SZ); mkdir -p "$D"; cd "$D" || exit 1
-TAG=$(basename "$D") FAILED=0 M=""
+TAG=$(basename "$D") FAILED=0 M="" FOLLOW=""
 say() { echo "$(date -u +%T) $*" | tee -a summary.txt; }
 release() {  # end the machine this script rented, once its outputs landed, and confirm it is gone
   [ -z "$M" ] && return
+  [ -n "$FOLLOW" ] && kill $FOLLOW 2>/dev/null; FOLLOW=""
   cozy machine end "$M" --tensorhub "$H" > "end-$M.log" 2>&1
   cozy machine show "$M" --tensorhub "$H" > "gone-$M.txt" 2>&1
   say "ended $M: $(grep -E '^(state|status)' "gone-$M.txt" | tr -s ' ' | tr '\n' ' ')"
@@ -60,8 +61,11 @@ except Exception:
 calls = run.get("calls") or [run]
 modes = {k: v for c in calls for k, v in (((c.get("measurements") or {}).get("memory") or {}).get("modes") or {}).items()}
 ooms = sum(((c.get("measurements") or {}).get("memory") or {}).get("oom_retries") or 0 for c in calls)
+reason = run.get("reason") or ""
+if isinstance(reason, dict):
+    reason = f"{reason.get('code')}: {reason.get('message')}"
 print(f"{cell} run={n} {state} exec={(run.get('execution_ms') or 0) / 1000:.0f}s oom_retries={ooms} "
-      f"modes={json.dumps(modes)} reason={(run.get('reason') or '')[:300]}")
+      f"modes={json.dumps(modes)} reason={str(reason)[:300]}")
 PY
   case $state in completed*landed) ;; *) FAILED=$((FAILED + 1)) ;; esac
 }
@@ -158,6 +162,11 @@ PY
     say "card $card: the wheel did not install: $(tail -c 300 "update-$card.log")"; FAILED=$((FAILED + 1)); release; return
   fi
   cozy machine show "$M" --tensorhub "$H" > "machine-$card.txt" 2>&1
+  local log  # the machine's own and memory logs, kept here in case the machine is lost mid-run
+  for log in tensord memory; do
+    cozy machine logs "$M" "$log" -f -n 0 --tensorhub "$H" > "$log-$card.log" 2>&1 &
+    FOLLOW="$FOLLOW $!"
+  done
   say "card $card: $(grep -iE 'runtime|tensord' "machine-$card.txt" | tr -s ' ' | tr '\n' ' ' | cut -c1-200)"
   case $card in
     2x8) local r=$RANDOM; references 2x8 "$r"; h3 2x8 2 "$(image 2x8-klein-a)" "$(image 2x8-klein-b)" "$r" 2 ;;
