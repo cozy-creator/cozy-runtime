@@ -33,8 +33,8 @@ A Turbo input keeps all eight steps and the full 15-second request:
 Run full unprofiled warmups through this **same entrypoint**, then change only `profile_enabled` to `true` for the trace input. The regular entrypoint additionally requires `steps: 30`. Keep `profile_detail` and `trace_cpu_ops` false for the qualified CUDA-only path; CPU operator/projection hooks can alter eligibility and timing.
 
 ```sh
-cozy run ./h3-profile-capture/turbo --input=warmup.json --rental=YOUR_RENTAL --idempotency-key=h3-warmup-1 --await
-cozy run ./h3-profile-capture/turbo --input=trace.json --rental=YOUR_RENTAL --idempotency-key=h3-trace-1 --await --out=./trace-output
+cozy run ./h3-profile-capture/turbo --input=warmup.json --on YOUR_MACHINE --idempotency-key=h3-warmup-1
+cozy run ./h3-profile-capture/turbo --input=trace.json --on YOUR_MACHINE --idempotency-key=h3-trace-1 --out=./trace-output
 ```
 
 Use distinct keys for distinct requests; observe an uncertain accepted request rather than submitting it under a new key. A full trace declares a 64 GiB output bound, which is **not a RAM cap**. Profiler buffers and export still require host memory and disk space. Kernel construction before the handler and artifact export after it are outside the authored capture.

@@ -6,7 +6,7 @@ those executors and coordinates machine budgets, storage lifetime and process li
 TensorFS is a library used inside both TensorD and Runtime.
 
 The Linux x86-64 wheel (glibc 2.28+) also installs TensorD's `tensord` executable.
-Worker images and `cozy machine install` take it from there:
+Worker images take it from there:
 
 ```sh
 uv pip install cozy-runtime

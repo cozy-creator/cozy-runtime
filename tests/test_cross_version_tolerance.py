@@ -47,7 +47,7 @@ def test_native_rows_bind_per_operation(tmp_path: Path) -> None:
     # One the worker did not list is refused alone, naming the rental update.
     assert not any(b.unavailable for key, b in bindings.items() if key[1] != rows[0]["export"])
     broker.bind(fake_context(request_id="parent"))  # type: ignore[attr-defined]
-    with pytest.raises(CapabilityError, match="cozy rental update") as refused:
+    with pytest.raises(CapabilityError, match="cozy machine update") as refused:
         broker.reserve(rows[0]["module"], rows[0]["export"], {})  # type: ignore[attr-defined]
     assert refused.value.code == "child_capability_unavailable"
 

@@ -256,7 +256,7 @@ class _CallType:
 
 RUNTIME_UPDATE = (
     "this package's SDK is newer than this Runtime; update the rental's Runtime "
-    "(`cozy rental update <name>`) or pin an older SDK"
+    "(`cozy machine update <name>`) or pin an older SDK"
 )
 
 
