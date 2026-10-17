@@ -1532,7 +1532,7 @@ class _Engine:
                     self.pool, self.side = torch.cuda.graph_pool_handle(), torch.cuda.Stream()
                 capturing = time.perf_counter()
                 try:
-                    graph, why = capture(lambda: self._advance(size), self.pool, self.side)
+                    graph, why = capture(torch, lambda: self._advance(size), self.pool, self.side)
                 except Building:  # eager until a kernel lands
                     graph, why, self.building = None, "", LANDED[0]
                 self.captured[0] += 1

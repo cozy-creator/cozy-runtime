@@ -23,7 +23,7 @@ from transformers.modeling_outputs import BaseModelOutputWithPast
 from cozy_runtime.author import AdapterRef, Model, placeable, spread, uses_components
 from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT, AttentionLayout, attention_scope
 from cozy_runtime.author._loader import census
-from cozy_runtime.internal import attention, lora_composition, lora_contract, plane
+from cozy_runtime.internal import attention, lora_composition, lora_contract
 from cozy_runtime.internal.encoding import SPEC_PLAIN, DeviceFacts
 from cozy_runtime.internal.executor import Executor, _capture_seal, answer
 from cozy_runtime.internal.executor_commands import decode
@@ -497,7 +497,6 @@ def main() -> None:
     parser.add_argument("--staged", action="store_true")
     parser.add_argument("--hosted", action="store_true")
     parser.add_argument("--spread", action="store_true")
-    parser.add_argument("--before-plane", action="store_true")
     #: an NCCL group: this rank's card, once it has joined
     parser.add_argument("--cuda", action="store_true")
     #: the tiny H3 DiT's second transformer block runs out of memory on this call (1-based)
@@ -560,10 +559,6 @@ def main() -> None:
             reply = {"ok": True, "rank": args.rank, **({"hosts": {}} if "pin" in command else {})}
         elif name == "hello":
             reply = executor.hello()
-            if args.before_plane:  # a Runtime from before the weight plane says no such thing
-                reply["memory"] = [m for m in reply["memory"] if m != plane.CAPABILITY]
-        elif name == "budget" and args.before_plane:
-            reply = {"ok": False, "code": "follower_command_unsupported", "detail": "budget"}
         else:
             answered = answer(executor, command)
             assert answered is not None, name

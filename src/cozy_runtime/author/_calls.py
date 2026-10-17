@@ -204,7 +204,7 @@ def prefetch(
     Acknowledgment does not promise readiness; the later call resolves its own inputs.
     Explicit models select the same declared slots as an ordinary child call; omitted
     or None choices retain inherited bindings/defaults. Pass overrides to the actual
-    call too: older owners may decline the hint or ignore its choices.
+    call too: the machine may decline the hint.
     """
     broker = _current.get()
     if broker is None or broker.closed or broker.context is None:
@@ -227,13 +227,8 @@ def prefetch(
     answer = broker.exchange(
         ModelPrefetch(module=module, export=name, payload=payload.decode()), Answer
     )
-    # An owner can decline an optional optimization. Normal calls
-    # retain their ordinary demand preparation path.
-    if answer.code not in (
-        "model_prefetch_unsupported",
-        "weights_host_unavailable",
-        "unknown_durable_request",
-    ):
+    # The machine can decline an optional optimization; the call prepares on demand.
+    if answer.code != "model_prefetch_unsupported":
         broker._check(answer, 0)
 
 
@@ -245,47 +240,11 @@ class _CallType:
     request: type[msgspec.Struct]
     result: type[msgspec.Struct]
     python_result: type[msgspec.Struct] | None = None
-    #: Request fields the serving Runtime accepts; ``None`` when it did not say.
-    served_fields: frozenset[str] | None = None
-    #: Why the serving Runtime cannot serve this operation; "" when it can.
+    #: Why the machine cannot serve this operation; "" when it can.
     unavailable: str = ""
     #: A callable bound from its own code: its model slots, which a direct caller passes
     #: beside its request fields and the call carries as `{payload, models}`.
     models: frozenset[str] | None = None
-
-
-RUNTIME_UPDATE = (
-    "this package's SDK is newer than this Runtime; update the rental's Runtime "
-    "(`cozy machine update <name>`) or pin an older SDK"
-)
-
-
-def _served(binding: _CallType, request: msgspec.Struct, value: dict[str, Any]) -> dict[str, Any]:
-    """Omit an option the serving Runtime predates while it keeps its default; else refuse."""
-    served = binding.served_fields
-    if served is None:
-        return value
-    unsupported = []
-    for field_info in msgspec.structs.fields(binding.request):
-        name = field_info.encode_name
-        if name in served:
-            continue
-        default = (
-            field_info.default_factory()
-            if field_info.default_factory is not msgspec.NODEFAULT
-            else field_info.default
-        )
-        if default is not msgspec.NODEFAULT and getattr(request, field_info.name) == default:
-            value.pop(name, None)
-        else:
-            unsupported.append(name)
-    if unsupported:
-        raise CapabilityError(
-            f"{binding.module}.{binding.export} does not support {', '.join(unsupported)} "
-            f"here: {RUNTIME_UPDATE}",
-            code="child_capability_unavailable",
-        )
-    return value
 
 
 class PendingCall[R](Awaitable[R]):
@@ -370,14 +329,7 @@ class _Broker:
         """`ctx.release_gpus()` of this attempt: its root's GPU lease ends at the worker."""
         if self.closed:
             raise CapabilityError("GPU release escaped its attempt", code="escaped_handle")
-        answer = self.exchange(GpuRelease(), Answer)
-        # A worker that predates the release declines it; the lease then ends with the root.
-        if answer.code not in (
-            "weights_host_unavailable",
-            "unknown_durable_request",
-            "no_durable_exchange",
-        ):
-            self._check(answer, 0)
+        self._check(self.exchange(GpuRelease(), Answer), 0)
 
     def reserve(
         self,
@@ -437,7 +389,7 @@ class _Broker:
             raise ConformanceError(
                 "package call arguments do not match its interface", code="child_arguments"
             ) from exc
-        payload = application_json.encode(_served(binding, request, encoded))
+        payload = application_json.encode(encoded)
         if len(payload) > MAX_CALL_BYTES:
             raise CapabilityError("package call exceeds inline bound", code="child_payload_bound")
         call = PendingCall[Any](self, self.next_index, binding, payload, ctx)

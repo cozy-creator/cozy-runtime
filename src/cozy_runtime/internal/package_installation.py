@@ -18,7 +18,7 @@ from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import NotRequired, TypedDict
+from typing import TypedDict
 
 import msgspec
 from packaging.requirements import Requirement
@@ -45,13 +45,9 @@ _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 class InstallationRecord(TypedDict):
     package: str
     release: str
-    python: NotRequired[str]
-    generation: NotRequired[str]
-    site_packages: NotRequired[str]
-    #: The base interpreter, the machine SDK the SDK was chosen against, and the SDK installed.
-    interpreter: NotRequired[str]
-    machine: NotRequired[dict[str, str]]
-    sdk: NotRequired[dict[str, str]]
+    python: str
+    generation: str
+    site_packages: str
 
 
 def machine_sdk() -> dict[str, str]:
@@ -90,31 +86,20 @@ def _directory(root: Path, installation_id: str) -> Path:
     return root / "installations" / installation_id
 
 
-def _read_record(directory: Path) -> InstallationRecord:
-    return msgspec.json.decode(
-        (directory / "installation.json").read_bytes(), type=InstallationRecord
-    )
-
-
 def open_installation(root: Path, installation_id: str) -> InstalledEnvironment:
     directory = _directory(root, installation_id)
     try:
         with (directory / "installation.json").open("rb") as stream:
             record = msgspec.json.decode(stream.read(), type=InstallationRecord)
             info = os.fstat(stream.fileno())
-        python = Path(record.get("python", directory / "venv" / "bin" / "python"))
-        generation = Path(record.get("generation", python.parent.parent))
-        sites = (
-            [Path(record["site_packages"])]
-            if "site_packages" in record
-            else list((generation / "lib").glob("python*/site-packages"))
-        )
-        if len(sites) != 1 or not python.is_file():
+        python = Path(record["python"])
+        generation = Path(record["generation"])
+        if not python.is_file():
             raise ValueError("venv is incomplete")
         return InstalledEnvironment(
             installation_id,
             generation,
-            sites[0],
+            Path(record["site_packages"]),
             python,
             record["package"],
             record["release"],
@@ -123,7 +108,7 @@ def open_installation(root: Path, installation_id: str) -> InstalledEnvironment:
             if generation.is_relative_to(directory) and _retained(directory)
             else None,
         )
-    except (OSError, ValueError, KeyError, TypeError) as exc:
+    except (OSError, ValueError, msgspec.DecodeError) as exc:
         raise EnvironmentRefusal("package_installation_absent", installation_id) from exc
 
 
@@ -327,9 +312,9 @@ def _build(
     release: str,
     environment: dict[str, str],
     lock_fd: int,
-) -> dict[str, str]:
+) -> None:
     """Install an installation's retained inputs into `generation`: the lock exactly, except
-    the Runtime, which the package's bounds choose (`_select_sdk`). Returns the SDK installed."""
+    the Runtime, which the package's bounds choose (`_select_sdk`)."""
     uv = shutil.which("uv")
     if uv is None:
         raise EnvironmentRefusal("package_installation_uv_absent", "uv is required")
@@ -405,11 +390,6 @@ def _build(
             machine_wheels(directory.parent.parent),
         )
     _compile_bytecode(generation, site)
-    return {
-        name: distribution.version
-        for distribution in importlib.metadata.distributions(path=[str(site)])
-        if (name := canonicalize_name(distribution.metadata["Name"] or "")) in SDK
-    }
 
 
 def _compile_bytecode(generation: Path, site: Path) -> None:
@@ -426,11 +406,15 @@ def _compile_bytecode(generation: Path, site: Path) -> None:
     )
 
 
-def _write_record(directory: Path, generation: Path, record: InstallationRecord) -> None:
+def _write_record(directory: Path, generation: Path, package: str, release: str) -> None:
     """Publish the record naming `generation` as the installation's environment."""
-    record["python"] = str(generation / "bin" / "python")
-    record["generation"] = str(generation)
-    record["site_packages"] = str(_site(generation))
+    record: InstallationRecord = {
+        "package": package,
+        "release": release,
+        "python": str(generation / "bin" / "python"),
+        "generation": str(generation),
+        "site_packages": str(_site(generation)),
+    }
     temporary = directory / ".installation.json"
     temporary.write_text(json.dumps(record, sort_keys=True) + "\n")
     os.replace(temporary, directory / "installation.json")
@@ -449,8 +433,7 @@ def _install(
     cache: Path | None = None,
     lock_fd: int = -1,
 ) -> InstalledEnvironment:
-    """Create a venv without package fingerprints; existing IDs are operation replays only.
-    Its inputs stay in the installation, so a later machine Runtime rebuilds it (`refresh`)."""
+    """Create a venv without package fingerprints; existing IDs are operation replays only."""
     identifier = installation_id or "install-" + uuid.uuid4().hex
     directory = _directory(root, identifier)
     if (directory / "installation.json").is_file():
@@ -460,8 +443,7 @@ def _install(
                 "package_installation_conflict",
                 "installation ID belongs to another package release",
             )
-        # Held from before a Runtime update: its SDK follows this machine's Runtime.
-        return _refresh(root, identifier, cache, lock_fd)
+        return installed
     directory.parent.mkdir(parents=True, exist_ok=True, mode=0o711)
     directory.mkdir(exist_ok=True, mode=0o711)
     # A failure retains unpublished uv state for the next operation replay. The process
@@ -489,7 +471,7 @@ def _install(
                     shutil.copyfile(wheel, staged / wheel.name)
             os.replace(staged, directory / "wheels")
     generation = directory / "venv"
-    sdk = _build(
+    _build(
         directory,
         generation,
         python,
@@ -498,17 +480,7 @@ def _install(
         environment=_environment(cache),
         lock_fd=lock_fd,
     )
-    _write_record(
-        directory,
-        generation,
-        {
-            "package": package,
-            "release": release,
-            "interpreter": str(python),
-            "machine": machine_sdk(),
-            "sdk": sdk,
-        },
-    )
+    _write_record(directory, generation, package, release)
     installed = open_installation(root, identifier)
     return InstalledEnvironment(
         installed.installation_id,
@@ -525,54 +497,6 @@ def _retained(directory: Path) -> bool:
     """Whether an installation keeps the inputs it was built from: a synced source, wheels,
     or a published release's lock."""
     return any((directory / name).exists() for name in ("source", "wheels", "requirements.txt"))
-
-
-def stale(root: Path, installation_id: str) -> bool:
-    """Whether an installation's SDK was chosen against another machine Runtime than this
-    one (a Runtime update) and `refresh` rebuilds it."""
-    directory = _directory(root, installation_id)
-    try:
-        record = _read_record(directory)
-    except (OSError, msgspec.DecodeError):
-        return False
-    return record.get("machine") != machine_sdk() and _retained(directory)
-
-
-def refresh(root: Path, installation_id: str, *, cache: Path | None = None) -> InstalledEnvironment:
-    """The installation, rebuilt from its retained inputs as a new generation when its SDK
-    was chosen against another machine Runtime (a Runtime update): its ID names a package
-    revision, not an executor. Executors of the old generation keep its files."""
-    with _installation_lock(root, installation_id) as lock_fd:
-        return _refresh(root, installation_id, cache, lock_fd)
-
-
-def _refresh(
-    root: Path, installation_id: str, cache: Path | None, lock_fd: int
-) -> InstalledEnvironment:
-    directory = _directory(root, installation_id)
-    installed = open_installation(root, installation_id)
-    record = _read_record(directory)
-    machine = machine_sdk()
-    if record.get("machine") == machine or not _retained(directory):
-        return installed
-    key = hashlib.sha256(json.dumps(machine, sort_keys=True).encode()).hexdigest()[:16]
-    generation = directory / f"venv-{key}"
-    shutil.rmtree(generation, ignore_errors=True)
-    sdk = _build(
-        directory,
-        generation,
-        Path(record.get("interpreter", installed.python)),
-        package=installed.package,
-        release=installed.release,
-        environment=_environment(cache),
-        lock_fd=lock_fd,
-    )
-    record["machine"], record["sdk"] = machine, sdk
-    _write_record(directory, generation, record)
-    for old in directory.glob("venv*"):
-        if old not in (generation, installed.generation):
-            shutil.rmtree(old, ignore_errors=True)
-    return open_installation(root, installation_id)
 
 
 def open_existing_environment(

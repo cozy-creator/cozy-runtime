@@ -3,8 +3,7 @@
 The executor sends `{"event": "request", "seq": N, "kind": K, **body}` and blocks until
 the worker answers `{"event": "answer", "seq": N, **answer}`; a `Handoff` answer is then
 followed by one connected socket. Each side decodes what it receives once, here. Every
-field is written, defaults included, and a field a newer peer adds is ignored: the
-executor runs in its package's own environment, so either side may be the older Runtime.
+field is written, defaults included.
 """
 
 from __future__ import annotations
@@ -208,7 +207,7 @@ class SealedTier(_Request, frozen=True, kw_only=True, tag="sealed_tier"):
     #: the plan's memfd; never on the wire
     memfd: int = -1
     #: The regions to stage (`host_tiers.staged/1`): the rest are holes this executor reads
-    #: from the object files (`ObjectFiles`). Unset: every region (older executors).
+    #: from the object files (`ObjectFiles`). Unset: every region.
     stage_regions: tuple[int, ...] | UnsetType = UNSET
 
 
@@ -257,7 +256,7 @@ class BudgetCell(_Request, frozen=True, kw_only=True, tag="budget_cell"):
     #: the memfd the worker received; never on the wire
     memfd: int = -1
     #: Which GPU of a group the cell caps (`RANK_CELLS`): rank 0 hands its owner one cell per
-    #: follower at formation, the follower reads it. 0 is rank 0's own (every older executor).
+    #: follower at formation, the follower reads it. 0 is rank 0's own.
     rank: int = 0
 
 

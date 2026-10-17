@@ -608,7 +608,6 @@ class Machine:
             "devices": "0",
             "authorized_device_limit_bytes": accel.unified_budget(torch),
             "models": [{"binding": binding}],
-            "model_sources": True,
         }
         loaded = self.executor.load(msgspec.convert(load, Load))
         assert loaded["ok"], loaded

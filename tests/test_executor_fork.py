@@ -245,9 +245,6 @@ def test_model_load_requires_sources_and_leaves_weightless_execution_usable(
         if many
         else {"binding": binding}
     )
-    refused = _call(channel, command)
-    assert refused["code"] == "model_sources_ungranted", refused
-    assert not refused["poisoned"]
     loaded = _call(
         channel,
         {
@@ -261,9 +258,9 @@ def test_model_load_requires_sources_and_leaves_weightless_execution_usable(
         },
     )
     assert loaded["ok"], loaded
-    # Grant presence advances to the next operation's own admission check. It does not
-    # require a particular wheel flavor or fabricate a device budget for this peer.
-    admitted = _call(channel, {**command, "model_sources": True})
+    # A model-bearing load meets its own admission check. It does not require a particular
+    # wheel flavor or fabricate a device budget for this peer.
+    admitted = _call(channel, command)
     assert admitted["code"] == "authorization_absent", admitted
 
 

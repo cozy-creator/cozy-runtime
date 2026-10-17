@@ -14,11 +14,10 @@ import msgspec
 import pytest
 
 from cozy_runtime.author._observations import MAX_SERIES, Attribution, EventRing
-from cozy_runtime.internal import execution_evidence, executor_replies, package_interface
+from cozy_runtime.internal import execution_evidence, package_interface
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.executor import _SEALED, Executor, _send_reply
 from cozy_runtime.internal.executor_commands import Activate, Invoke, Load, PrepareRequest, Start
-from cozy_runtime.internal.executor_replies import AttemptReply
 from cozy_runtime.internal.seam import Channel
 
 MODULE = "execution_evidence_fixture"
@@ -112,27 +111,19 @@ def _invoke(host: Executor, request_id: str, **extra: Any) -> dict[str, Any]:
     )
 
 
-def test_an_attempt_records_its_rank_setup_and_every_step(executor: Executor) -> None:
+def test_an_attempt_records_its_gpu_setup_and_every_step(executor: Executor) -> None:
     reply = _invoke(executor, "evidence")
     assert reply["outcome"]["terminal"] == "succeeded", reply["outcome"]
     execution = reply["execution"]
     assert execution["degree"] == 1
-    [rank] = execution["ranks"]
-    assert set(rank) == {
-        "rank",
-        "pid",
-        "ordinal",
-        "uuid",
-        "arch",
-        "start_us",
-        "end_us",
-        "attention",
-    }
-    assert (rank["rank"], rank["pid"]) == (0, os.getpid())
-    assert 0 < rank["start_us"] <= rank["end_us"]
-    assert rank["attention"] == {"requested": "", "observed": "", "impl": ""}
+    [gpu] = execution["gpus"]
+    assert "ranks" not in execution
+    assert set(gpu) == {"gpu", "pid", "uuid", "arch", "start_us", "end_us", "attention"}
+    assert (gpu["gpu"], gpu["pid"]) == (-1, os.getpid())  # off CUDA: no GPU number
+    assert 0 < gpu["start_us"] <= gpu["end_us"]
+    assert gpu["attention"] == {"requested": "", "observed": "", "impl": ""}
     boot = execution["executor"]
-    assert "package_import" in boot["legs_ms"] and boot["started_unix_ms"] * 1000 < rank["start_us"]
+    assert "package_import" in boot["legs_ms"] and boot["started_unix_ms"] * 1000 < gpu["start_us"]
     assert set(execution["construction"]) >= {"prepared_unix_ms", "prepare_ms", "legs_ms"}
 
     attribution = reply["attribution"]
@@ -142,7 +133,7 @@ def test_an_attempt_records_its_rank_setup_and_every_step(executor: Executor) ->
     assert denoise["count"] == 4 and denoise["series_dropped"] == 0
     ends = [end for end, _ms in denoise["series"]]
     assert len(ends) == 4 and ends == sorted(ends)
-    assert condition["ended_unix_ms"] <= ends[0] <= rank["end_us"] // 1000
+    assert condition["ended_unix_ms"] <= ends[0] <= gpu["end_us"] // 1000
     assert sum(ms for _end, ms in denoise["series"]) == pytest.approx(denoise["total_ms"], abs=0.01)
 
 
@@ -166,9 +157,8 @@ def test_a_reply_of_several_mib_crosses_the_seam_whole(executor: Executor) -> No
         received = Channel(right).recv(timeout=60)
         sending.join()
     assert received is not None and received["attribution"]["padding"] == "x" * (8 << 20)
-    kept = executor_replies.decode(received, AttemptReply)
-    assert kept.ok and kept.outcome is not None and kept.outcome.terminal == "succeeded", kept
-    assert reply["result_ref"] and msgspec.to_builtins(kept.result_ref) == reply["result_ref"]
+    assert received["ok"] and received["outcome"]["terminal"] == "succeeded", received
+    assert reply["result_ref"] and received["result_ref"] == reply["result_ref"]
 
 
 def test_a_telemetry_key_read_as_a_credential_costs_the_reply_only_its_telemetry(
@@ -181,10 +171,11 @@ def test_a_telemetry_key_read_as_a_credential_costs_the_reply_only_its_telemetry
     left, right = socket.socketpair()
     with left, right:
         _send_reply(Channel(left), reply)
-        kept = executor_replies.decode(Channel(right).recv(), AttemptReply)
-    assert kept.ok and kept.outcome is not None and kept.outcome.terminal == "succeeded", kept
-    assert not kept.observations and not kept.attribution and not kept.execution
-    assert kept.observation_caps["dropped_observations_for_credential"] == 1
+        kept = Channel(right).recv()
+    assert kept is not None and kept["ok"] and kept["outcome"]["terminal"] == "succeeded", kept
+    assert not kept.get("observations") and not kept.get("attribution")
+    assert not kept.get("execution")
+    assert kept["observation_caps"]["dropped_observations_for_credential"] == 1
 
 
 def test_the_request_pin_is_what_every_rank_reports_as_requested() -> None:
@@ -192,9 +183,9 @@ def test_the_request_pin_is_what_every_rank_reports_as_requested() -> None:
     assert execution_evidence.observed(hosts) == "sdpa"
     hosts["base_model/ref2va_dit"] = {"flash-attn3": 50, "sdpa": 2}
     assert execution_evidence.observed(hosts) == "ref2va_dit=flash-attn3+sdpa,video_vae=sdpa"
-    held: dict[int, execution_evidence.RankEvidence] = {}
+    held: dict[int, execution_evidence.GpuEvidence] = {}
     for start, end in ((5, 9), (2, 4), (10, 12)):
-        execution_evidence.widen(held, execution_evidence.record(1, {"pid": 7}, start, end))
+        execution_evidence.widen(held, 1, execution_evidence.record({"pid": 7}, start, end))
     assert (held[1]["start_us"], held[1]["end_us"], held[1]["pid"]) == (2, 12, 7)
 
 

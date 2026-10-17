@@ -140,6 +140,18 @@ def _nvml_library() -> ctypes.CDLL | None:
         return library
 
 
+def nvml_index(uuid: str) -> int:
+    """nvidia-smi's number for a `GPU-…` UUID; -1 when NVML cannot say."""
+    library = _nvml_library() if uuid else None
+    handle = _nvml_handle(library, uuid) if library is not None else None
+    index = ctypes.c_uint()
+    if handle is None or library is None:
+        return -1
+    if library.nvmlDeviceGetIndex(handle, ctypes.byref(index)) != _NVML_SUCCESS:
+        return -1
+    return int(index.value)
+
+
 def _nvml_handle(library: ctypes.CDLL, device: str) -> ctypes.c_void_p | None:
     """One envelope entry's handle: an index by index, anything else by UUID."""
     handle = ctypes.c_void_p()
@@ -427,7 +439,10 @@ ALLOCATOR = "expandable_segments:True"
 
 def initialize(torch: Any, kind: str) -> None:
     """Bring the accelerator context up EAGERLY, so its cost is a measured prepare step
-    rather than a surprise inside the first kernel. torch's allocator is configured first."""
+    rather than a surprise inside the first kernel. torch's allocator is configured first.
+    A CPU executor has no accelerator to bring up."""
+    if kind == "cpu":
+        return
     if sees_no_gpu():
         raise RuntimeError("this process sees no GPU (CUDA_VISIBLE_DEVICES is empty)")
     if kind == "mps" and not torch.backends.mps.is_available():

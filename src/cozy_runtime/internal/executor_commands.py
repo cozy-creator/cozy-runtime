@@ -1,8 +1,7 @@
-"""The worker's commands to its executor, decoded once where the executor reads them.
+"""The machine's commands to its executor, decoded once where the executor reads them.
 
-Each struct is the canonical-JSON frame `seam.py` carries, tagged by `cmd`. An omitted
-field is its default, so an executor pinned to an older Runtime reads the same bytes, and
-a field a newer worker adds is ignored.
+Each struct is the canonical-JSON frame `seam.py` carries, tagged by `cmd`; an omitted field
+is its default.
 """
 
 from __future__ import annotations
@@ -39,14 +38,6 @@ class Probe(Command, frozen=True, kw_only=True, tag="probe"):
     collect: bool = False
 
 
-class Residency(Command, frozen=True, kw_only=True, tag="residency"):
-    pass
-
-
-class Warm(Command, frozen=True, kw_only=True, tag="warm"):
-    """An older worker's startup warm. Never sent now; answered so that worker still runs."""
-
-
 class Join(Command, frozen=True, kw_only=True, tag="join"):
     port: int
     backend: str = "nccl"
@@ -71,22 +62,6 @@ class Fork(Command, frozen=True, kw_only=True, tag="fork"):
     environment: dict[str, str]
 
 
-class DescribeInstalled(Command, frozen=True, kw_only=True, tag="describe_installed"):
-    distribution: str
-    output: str
-    application: str = ""
-
-
-class Vacate(Command, frozen=True, kw_only=True, tag="vacate"):
-    residents: bool = True
-    #: the group ranks that give their weights back; empty is every rank
-    ranks: tuple[int, ...] = ()
-
-
-class Restore(Command, frozen=True, kw_only=True, tag="restore"):
-    names: tuple[str, ...] = ()
-
-
 class Budget(Command, frozen=True, kw_only=True, tag="budget"):
     """This executor's weight-plane budgets (`weight_plane/1`). Lowering unmaps at once."""
 
@@ -94,22 +69,18 @@ class Budget(Command, frozen=True, kw_only=True, tag="budget"):
     vram_bytes: int
     #: -1 leaves the pinned host tier's budget as it is
     pinned_bytes: int = -1
-    #: The process's device cap (`PROCESS_CAP`); -1 lifts it, unset leaves it as it is
+    #: The process's device cap; -1 lifts it, unset leaves it as it is
     cap_bytes: int | UnsetType = UNSET
     #: Per GPU of a group, its own process cap (index = rank, `RANK_CELLS`); a rank past the
     #: end takes `cap_bytes`.
     rank_caps: tuple[int, ...] = ()
-    #: Physical free bytes the owner keeps on the GPU (`PROCESS_CAP`); unset leaves it
+    #: Physical free bytes the owner keeps on the GPU; unset leaves it
     floor_bytes: int | UnsetType = UNSET
 
 
 #: An executor capability: a group's followers obey their own GPU's cap and budget cell: the
 #: owner's `Start.rank_cells` and the `rank_caps` of `Load`, `Budget` and `Invoke`.
 RANK_CELLS = "rank_cells/1"
-
-#: An executor capability: it holds its whole device footprint (CUDA context, torch's reserved
-#: bytes, the plane's maps) inside `cap_bytes`, every plane budget and torch's allocator with it.
-PROCESS_CAP = "process_cap/1"
 
 
 class Share(Command, frozen=True, kw_only=True, tag="share"):
@@ -132,7 +103,7 @@ class Map(Command, frozen=True, kw_only=True, tag="map"):
     first stages would (`MAP`): nothing runs, and they stay mapped as after a call."""
 
     construction: str
-    #: The process's device cap (`PROCESS_CAP`); -1 lifts it
+    #: The process's device cap; -1 lifts it
     cap_bytes: int = -1
     #: Physical free bytes the owner keeps on the GPU; unset leaves it
     floor_bytes: int | UnsetType = UNSET
@@ -183,12 +154,9 @@ class CallInterface(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=Tru
 
     module: str
     export: str
-    interface_digest: str = ""
     interface_document: Json = None
     interface_path: str = ""
     native_effect: bool = False
-    request_fields: tuple[str, ...] | None = None
-    unavailable: str = ""
     builtin: str = ""
     self_call: bool = msgspec.field(default=False, name="self")
 
@@ -209,10 +177,9 @@ class Start(Command, frozen=True, kw_only=True, tag="start"):
     sequence_parallel_degree: int = 1
     application: str = ""
     package_interface: str = ""
-    #: Import torch, the Runtime and the package and stop: no device is touched. Sent only to
-    #: an executor whose hello lists `import_only`; an older one would ignore it and start.
+    #: Import torch, the Runtime and the package and stop: no device is touched.
     import_only: bool = False
-    #: Absent from an older Worker: the executor keeps its in-memory tier at its default.
+    #: Absent: the executor keeps its in-memory tier at its default.
     memo: MemoSettings | None = None
     #: The owner keeps one budget cell per GPU of a group (`RANK_CELLS`): rank 0 creates each
     #: follower's at formation, hands it to its owner (`BudgetCell.rank`) and to the follower.
@@ -240,8 +207,7 @@ class Adapter(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
 class Binding(Release, frozen=True, kw_only=True):
     """One model's construction: its class, where its weights are, and how to fill them.
 
-    A weightless binding names only its release and an empty `model_class`. Every field is
-    written, defaults included: executors of older Runtimes index them directly.
+    A weightless binding names only its release and an empty `model_class`.
     """
 
     model_class: str = ""
@@ -263,11 +229,6 @@ class Binding(Release, frozen=True, kw_only=True):
     package: str = ""
     model: str = ""
     adapters: tuple[Adapter, ...] = ()
-    #: The read ring of executors before the weight plane; they index these directly.
-    window_bytes: int = 4 << 20
-    slots: int = 16
-    readers: int = 16
-    inflight: int = 8
 
     def parameter_names(self) -> tuple[str, ...]:
         """Every declared name for this shared construction, its primary first."""
@@ -279,7 +240,7 @@ class Binding(Release, frozen=True, kw_only=True):
 
 
 class Budgets(msgspec.Struct, frozen=True, kw_only=True):
-    # Older executors read the wire key `declared_weight_bytes`; 0.18.69 and earlier index it.
+    # TensorD 0.7.3 writes the wire key `declared_weight_bytes`.
     logical_weight_bytes: int = msgspec.field(default=0, name="declared_weight_bytes")
 
 
@@ -302,9 +263,6 @@ LOAD_PINNED = "load_pinned/1"
 LOAD_ATTENTION_PIN = "attention.load_pin/1"
 #: An executor capability: it adopts the machine's sealed host layouts (`Load.sealed_tiers`).
 SEALED_TIERS = "host_tiers.sealed/1"
-#: An executor capability: it adopts a sealed host layout its machine is still filling, using
-#: each region once Ready; machines give other executors complete layouts only.
-SEALED_FILLING = "host_tiers.filling/1"
 #: An executor capability: it reads the holes of a layout staged in part from the object files
 #: its machine hands over, so the machine stages only the regions it streams.
 SEALED_STAGED = "host_tiers.staged/1"
@@ -321,8 +279,7 @@ class Load(Command, frozen=True, kw_only=True, tag="load"):
     sequence_parallel_degree: int = 1
     #: the pin of the request this executor loads for (`LOAD_ATTENTION_PIN`)
     attention_pin: str = ""
-    #: The one-model form. Executors before the typed commands index both keys directly, so a
-    #: worker always writes them for one model; a many-model load writes neither.
+    #: The one-model form; a many-model load names `models`.
     binding: Binding | UnsetType = UNSET
     budgets: Budgets | UnsetType = UNSET
     models: tuple[ModelLoad, ...] | UnsetType = UNSET
@@ -338,13 +295,10 @@ class Load(Command, frozen=True, kw_only=True, tag="load"):
     #: TensorD prepares/retains sealed CPU layouts (`SEALED_TIERS`). Runtime adopts the
     #: buffer read-only (`SealedTier`); a managed executor has no implicit Store fallback.
     sealed_tiers: bool = False
-    #: TensorD supplies actual header/model-asset bytes (`ModelSource`). Required for new
-    #: model-bearing construction; weightless loads need no model-source access.
-    model_sources: bool = False
     #: TensorD stages shared CPU layouts in part and supplies read-only object files
     #: (`SealedStage`, `ObjectFiles`). Runtime's plane uses them for unstaged regions.
     staged_tiers: bool = False
-    #: The process's device cap for the load (`PROCESS_CAP`); unset: none given
+    #: The process's device cap for the load; unset: none given
     cap_bytes: int | UnsetType = UNSET
     #: Per GPU of a group, its own cap for the load (index = rank, `RANK_CELLS`)
     rank_caps: tuple[int, ...] = ()
@@ -411,9 +365,7 @@ class Invoke(_Attempt, frozen=True, kw_only=True, tag="invoke"):
     construction: str = ""
     attention_kernel: str = ""
     bits: int = 0  # as `PrepareRequest.bits`
-    #: The weight plane's device budget for this attempt; -1: the executor derives it.
-    plane_budget_bytes: int = -1
-    #: The process's device cap for this attempt (`PROCESS_CAP`); -1: none
+    #: The process's device cap for this attempt; -1: none
     cap_bytes: int = -1
     #: Per GPU of a group, its own cap for this attempt (index = rank, `RANK_CELLS`)
     rank_caps: tuple[int, ...] = ()
@@ -429,11 +381,6 @@ class Invoke(_Attempt, frozen=True, kw_only=True, tag="invoke"):
     #: with the machine (attached, and offered at each stage's exit), False keeps them private
     #: (they stream); unset leaves the executor's current setting.
     device_weights: bool | UnsetType = UNSET
-    #: Read only by executors before the weight plane.
-    placement: str = "all_resident"
-    headroom_bytes: int = 0
-    scope_headroom_bytes: dict[str, int] = {}
-    measured_scopes: tuple[str, ...] = ()
     #: Each `Weights[M]` parameter's checkpoint, read through the owner's source channel.
     sources: dict[str, _MANIFEST] = {}
     #: The weights outputs this attempt may write, and each one's granted new bytes.
@@ -444,13 +391,8 @@ type KnownCommand = (
     Hello
     | Shutdown
     | Probe
-    | Residency
-    | Warm
     | Join
     | Fork
-    | DescribeInstalled
-    | Vacate
-    | Restore
     | Budget
     | Share
     | Revoke

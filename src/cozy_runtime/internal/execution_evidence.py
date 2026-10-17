@@ -1,33 +1,27 @@
 """The per-GPU execution record: which process on which GPU ran an attempt, when, with what.
 
-The executor reports one record per process of its group, in process order, as `ranks`:
+The executor reports one record per process of its group, in process order, as `gpus`:
 
-    {"rank": int, "pid": int, "ordinal": int, "uuid": str, "arch": str,
-     "start_us": int, "end_us": int,
+    {"gpu": int, "pid": int, "uuid": str, "arch": str, "start_us": int, "end_us": int,
      "attention": {"requested": str, "observed": str, "impl": str, "kernels"?: [kernel],
                    "segments"?: [segment]}}
     kernel = {"kernel": str, "state": str, "line": str, "served": bool,
               "progress"?: float, "compile_ms"?: float, "detail"?: str}
     segment = {"stage": str, "step": int, "at_us": int, "observed": str, "dense": str}
 
-The worker publishes them as `gpus` (`by_gpu`) in the attempt's triage
-`measurements.execution`, the attention observation and the GPU scheduler's grant and release
-events: the same record under `gpu`, the number nvidia-smi shows, without the process-group
-rank. `ranks` rides beside `gpus` until no deployed reader needs it, then goes. Fields are
-added, never changed.
-
-`ordinal` is the process's seal entry as a number (-1 without one), `uuid` the NVML `GPU-…`
-identity and `arch` its `sm_XY` ("" off CUDA). `start_us`/`end_us` are wall-clock unix
-MICROseconds bounding the GPU's work for the attempt, 0 for one that did none: nanoseconds
-since the epoch exceed the ±2^53 integer range canonical JSON (and every JSON reader) admits.
-`attention.requested` is the request's pin ("" = automatic), `observed` what the process's
-processors held, in the pin grammar, and `impl` the kernel implementation under that backend
-when one was observed. `kernels` is every compiled kernel this GPU knows of: `state` ready,
-compiling (with its `progress`), failed or absent, whether it `served` this attempt, and how
-long its compile took. `segments` is present when the run took a kernel that finished
-compiling mid-run: each selection from the step of its stage it first served (`stage` "" is
-the run's start), in the pin grammar, with Sol's dense reference (`dense`, "" without Sol).
-`observed` and `kernels` then cover every selection the run served.
+`gpu` is the number nvidia-smi shows (NVML's index for the card's UUID, else the seal's
+`CUDA_VISIBLE_DEVICES` entry; -1 off CUDA), `uuid` the NVML `GPU-…` identity and `arch` its
+`sm_XY` ("" off CUDA). `start_us`/`end_us` are wall-clock unix MICROseconds bounding the
+GPU's work for the attempt, 0 for one that did none: nanoseconds since the epoch exceed the
+±2^53 integer range canonical JSON (and every JSON reader) admits. `attention.requested` is
+the request's pin ("" = automatic), `observed` what the process's processors held, in the
+pin grammar, and `impl` the kernel implementation under that backend when one was observed.
+`kernels` is every compiled kernel this GPU knows of: `state` ready, compiling (with its
+`progress`), failed or absent, whether it `served` this attempt, and how long its compile
+took. `segments` is present when the run took a kernel that finished compiling mid-run: each
+selection from the step of its stage it first served (`stage` "" is the run's start), in the
+pin grammar, with Sol's dense reference (`dense`, "" without Sol). `observed` and `kernels`
+then cover every selection the run served.
 """
 
 from __future__ import annotations
@@ -36,6 +30,8 @@ import os
 import time
 from collections.abc import Mapping, Sequence
 from typing import Any, NotRequired, TypedDict
+
+from cozy_runtime.internal import accel
 
 
 class RuntimeGPU(TypedDict):
@@ -79,13 +75,12 @@ class RankAttention(TypedDict):
     fallbacks: NotRequired[list[AttentionFallback]]
 
 
-class RankEvidence(TypedDict):
+class GpuEvidence(TypedDict):
     """One process's record (the shape above). Mappings, not structs: the executor extends
     them by key and they land in the attempt's measurements as JSON."""
 
-    rank: int
+    gpu: int
     pid: int
-    ordinal: int
     uuid: str
     arch: str
     start_us: int
@@ -94,17 +89,19 @@ class RankEvidence(TypedDict):
 
 
 def identity(torch: Any, cuda: bool, local: int, sealed: Sequence[str]) -> dict[str, Any]:
-    """This process's `pid`, host `ordinal`, `uuid` and `arch` for device `local` of its seal."""
+    """This process's `pid`, `gpu`, `uuid` and `arch` for device `local` of its seal."""
     if not cuda:
-        return {"pid": os.getpid(), "ordinal": -1, "uuid": "", "arch": ""}
+        return {"pid": os.getpid(), "gpu": -1, "uuid": "", "arch": ""}
     entry = sealed[local] if local < len(sealed) else str(local)
     try:
         properties = torch.cuda.get_device_properties(local)
         uuid, arch = f"GPU-{properties.uuid}", f"sm_{properties.major}{properties.minor}"
     except Exception:  # identity is observation: it never fails the attempt
         uuid, arch = "", ""
-    ordinal = int(entry) if entry.isdigit() else -1
-    return {"pid": os.getpid(), "ordinal": ordinal, "uuid": uuid, "arch": arch}
+    gpu = accel.nvml_index(uuid)
+    if gpu < 0:
+        gpu = int(entry) if entry.isdigit() else -1
+    return {"pid": os.getpid(), "gpu": gpu, "uuid": uuid, "arch": arch}
 
 
 def attention(
@@ -148,16 +145,14 @@ def now_us() -> int:
 
 
 def record(
-    rank: int,
     who: Mapping[str, Any],
     start_us: int,
     end_us: int,
     seen: RankAttention | None = None,
-) -> RankEvidence:
+) -> GpuEvidence:
     return {
-        "rank": rank,
+        "gpu": int(who.get("gpu", -1)),
         "pid": int(who.get("pid", 0)),
-        "ordinal": int(who.get("ordinal", -1)),
         "uuid": str(who.get("uuid", "")),
         "arch": str(who.get("arch", "")),
         "start_us": start_us,
@@ -166,12 +161,12 @@ def record(
     }
 
 
-def widen(held: dict[int, RankEvidence], row: RankEvidence) -> None:
-    """Fold one mirrored call's record into its process's: earliest start, latest end, and
-    the attention it served through its latest call."""
-    current = held.get(row["rank"])
+def widen(held: dict[int, GpuEvidence], process: int, row: GpuEvidence) -> None:
+    """Fold one mirrored call's record into group process `process`'s: earliest start, latest
+    end, and the attention it served through its latest call."""
+    current = held.get(process)
     if current is None:
-        held[row["rank"]] = row.copy()
+        held[process] = row.copy()
         return
     current["start_us"] = min(current["start_us"], row["start_us"])
     current["end_us"] = max(current["end_us"], row["end_us"])
@@ -211,24 +206,3 @@ def identify(entry: str, inventory: Sequence[RuntimeGPU] = ()) -> GpuIdentity:
     if entry.isdigit():
         return {"gpu": int(entry), "uuid": ""}
     return {"gpu": -1, "uuid": entry}
-
-
-def _ordinal(row: Mapping[str, object]) -> int:
-    ordinal = row.get("ordinal", -1)
-    return ordinal if isinstance(ordinal, int) else -1
-
-
-def by_gpu(
-    ranks: Sequence[Mapping[str, object]], inventory: Sequence[RuntimeGPU] = ()
-) -> list[dict[str, object]]:
-    """The executor's per-process records as the wire's `gpus`: each under `gpu`, the number
-    nvidia-smi shows. The UUID decides it where the inventory knows the card, so a CUDA order
-    that differs from nvidia-smi's never mislabels one; else the seal entry does."""
-    numbers = {row["device_uuid"]: row["device_index"] for row in inventory}
-    return [
-        {
-            "gpu": numbers.get(str(row.get("uuid", "")), _ordinal(row)),
-            **{key: value for key, value in row.items() if key not in ("rank", "ordinal")},
-        }
-        for row in ranks
-    ]

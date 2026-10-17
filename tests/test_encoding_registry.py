@@ -25,7 +25,6 @@ from cozy_runtime.internal.encoding import (
     RolePart,
     Selector,
     launch_providers,
-    selection,
 )
 
 VECTORS = Path(__file__).resolve().parents[1] / "src/cozy_runtime/internal/encoding/vectors"
@@ -52,8 +51,7 @@ def test_every_provider_is_reviewed_against_the_exact_tensorfs_03_seed() -> None
         SPEC_INT8_CONVROT256,
         SPEC_NVFP4,
     }
-    # TensorFS before 0.9.2 carries no int8-convrot256/1; that one provider is then not served.
-    assert reviewed - {SPEC_INT8_CONVROT256} <= set(seeds)
+    assert reviewed <= set(seeds)
     assert RETIRED.isdisjoint(seeds)
     assert quantization.PLAIN_SPEC == SPEC_PLAIN
     assert set(quantization._ARTIFACT_SPECS.values()) == {
@@ -63,7 +61,7 @@ def test_every_provider_is_reviewed_against_the_exact_tensorfs_03_seed() -> None
     }
 
     providers = launch_providers()
-    assert set(providers) == reviewed & set(seeds)
+    assert set(providers) == reviewed
     assert all(
         provider.reviewed_specs <= set(seeds)
         for implementations in providers.values()
@@ -106,16 +104,3 @@ def test_an_mxfp8_tensor_refuses_at_bind() -> None:
     with pytest.raises(EncodingRefusal) as refused:
         selector.candidates("w", Encoded(MXFP8, "mxfp8/1", parts), "bf16", (2, 64))
     assert refused.value.code in {"spec_unreviewed", "unknown_encoding"}
-
-
-def test_a_spec_the_installed_tensorfs_lacks_is_skipped_with_one_warning(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    older = selection.registry_digests() - {SPEC_INT8_CONVROT256}
-    monkeypatch.setattr(selection, "registry_digests", lambda: older)
-    monkeypatch.setattr(selection, "_ABSENT", set())
-    for _ in range(2):
-        providers = launch_providers()
-        assert SPEC_INT8_CONVROT256 not in providers and SPEC_ROWWISE in providers
-    warned = capsys.readouterr().err.splitlines()
-    assert len(warned) == 1 and SPEC_INT8_CONVROT256 in warned[0]  # once, not per call

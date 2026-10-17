@@ -21,10 +21,8 @@ the executor.
 from __future__ import annotations
 
 import functools
-import gc
 import mmap
 import os
-import re
 import time
 import weakref
 import zlib
@@ -39,7 +37,7 @@ import msgspec
 import tensorfs
 
 from cozy_runtime.author._activity import aside
-from cozy_runtime.author._errors import RuntimeFailure, is_device_oom, is_library_refusal
+from cozy_runtime.author._errors import RuntimeFailure, is_device_oom
 from cozy_runtime.author._executor_requests import DeviceTierAnswer, SealedPlan, SharedRegion
 from cozy_runtime.author._loader import Census, TensorLike, TensorSpec, _members
 from cozy_runtime.author._model import PLACED, RELEASERS
@@ -79,7 +77,13 @@ from cozy_runtime.internal.fill import (
     store_refusals,
     tensorfs_requirement_dtype,
 )
-from cozy_runtime.internal.memory import ORPHANED, Memory
+from cozy_runtime.internal.memory import (
+    Memory,
+    MemoryExhausted,
+    Rung,
+    reap,
+    shortage,
+)
 from cozy_runtime.internal.paging import partition
 from cozy_runtime.internal.planfacts import PlanFacts
 from cozy_runtime.internal.probe import QualificationResult, observed_capability_records
@@ -103,31 +107,19 @@ type Origin = tuple[Weights, Component, Region, Table, str]
 
 #: The largest region at the sub-block grain (proving-cpu.md C2: SDXL runs at 1 GiB).
 REGION_LIMIT = 16 << 20
-#: torch's out-of-memory message: CUDA's units are KiB/MiB/GiB, MPS's KB/MB/GB of 1024
-_REQUESTED = re.compile(r"Tried to allocate ([0-9.]+) (B|KiB|MiB|GiB|KB|MB|GB)")
-_UNITS = {"B": 1, "KiB": 1 << 10, "MiB": 1 << 20, "GiB": 1 << 30}
-_UNITS |= {"KB": _UNITS["KiB"], "MB": _UNITS["MiB"], "GB": _UNITS["GiB"]}
 #: The TensorFS planning window a weight set's read plan is cut into.
 READ_WINDOW = 4 << 20
 #: The stage `WeightResidency.map_ahead` opens: no package method has this name.
 MAPPING = "(map)"
 
 
-#: The one memory failure a request can end with: an operation that needs more device memory
-#: at once than the GPU can give, with every weight it does not read unmapped, every idle
-#: tenant gone and the stage at its finest grain. Sizes and estimates only change how a stage
-#: runs (tile, stream finer, evict, page from host); they never stop it.
-INDIVISIBLE = "operation_exceeds_device"
-
-
 class ResidencyRefusal(RuntimeFailure):
-    """A stage cannot run in what the device has: capacity, never broken state. Carries the
-    structured shortfall with both numbers."""
+    """A weight read or a stage the plane refuses for its state, not its memory (that is
+    `memory.MemoryExhausted`)."""
 
-    def __init__(self, code: str, detail: str, shortfall: dict[str, Any] | None = None) -> None:
+    def __init__(self, code: str, detail: str) -> None:
         super().__init__(detail, code=code)
         self.detail = detail
-        self.shortfall = shortfall
 
 
 # ---------------------------------------------------------------------------- the model
@@ -305,6 +297,8 @@ class Component:
     manifest: str = ""
     objects: list[list[Ref]] = field(default_factory=list)
     landed: set[int] = field(default_factory=set)
+    #: cursors a view into their ring kept open past their stage (`close_cursor`, `reap`)
+    orphans: list[Cursor] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.numbers = {region.index: i for i, region in enumerate(self.blocks)}
@@ -428,8 +422,6 @@ class Weights:
         self.mapping_ops: list[str] = []
         #: the plane is placing or giving room: an allocator refusal inside is its own to answer
         self.placing = False
-        #: the bytes of the last allocator refusal `refused` unmapped weights for
-        self.given = 0
         #: a group's stage whose activations are not measured yet runs its first pass at the
         #: floor, and is placed again at its second with what that pass measured
         self.growing = False
@@ -440,8 +432,6 @@ class Weights:
         self.room: Callable[[int], None] | None = None
         #: device bytes live owners keep for speed and shed under pressure (`reserve`)
         self.reservations: dict[Reservation, None] = {}
-        #: the last out-of-memory retry granted without memory coming back: (op, allocatable)
-        self.last_retry: tuple[str, int] | None = None
         #: the CUDA context and library workspaces outside torch and the plane, measured once
         self.context_bytes = -1
         #: the machine's custody of GPU weights (`weights.attach/1`); None: every region private
@@ -786,18 +776,6 @@ class Weights:
             if not c.spared
         )
 
-    def grow(self, need: int) -> bool:
-        """The plane refused a region for its own budget while the device has room: map
-        `need` more (up to what is free above the floor and inside the cap) instead of
-        unmapping. False when the device has no such room."""
-        if self.host_only:
-            return False
-        free = self.headroom(self.allocation())
-        if free < need + weight_policy.MARGIN:
-            return False
-        self._apply(self.applied + need + weight_policy.MARGIN)
-        return True
-
     def decoded(self) -> int:
         """Device bytes the bound regions' decoded copies hold now."""
         return sum(
@@ -859,72 +837,20 @@ class Weights:
         with _noting(self.torch, self, journal):
             yield journal
 
-    def make_room(self, need: int, operands: Sequence[object], op: str = "") -> None:
-        """An op ran out of device memory (outside every block, or inside one whose ops
-        recover one by one): unmap `need` bytes of weights nothing uses now, least recently
-        used first; when that gives nothing back, the open stages' components not in use give
-        theirs back (`WeightResidency._make_room`). An operand that is itself a weight must
-        still be mapped after."""
-        read = [
-            (component.key, region, region.bound)
-            for pointer in _pointers(operands)
-            for component in self.components.values()
-            for region in component.regions
-            if region.bound is not None and region.bound <= pointer < region.bound + region.span
-        ]
-
-        def mapped() -> None:
-            if any(region.bound != address for _, region, address in read):
-                raise ResidencyRefusal(
-                    INDIVISIBLE,
-                    f"{op or 'an allocation'} needs {need} B of device memory at once beside "
-                    "the weights it reads, and the GPU cannot give that with them mapped",
-                )
-
-        for release in RELEASERS:  # what is kept for speed alone goes before any weight
-            release()
-        accel.release_cached(self.torch, self.kind)
-        self.shed(need)
-        if self.open:
-            # Inside a block nothing is re-placed under its lease (None): other weights leave,
-            # and their blocks map them again as they run.
-            reads = {key for key, _, _ in read}
-            self.open[-1][0]._make_room(need, None if self.running else {}, op, reads, operands)
-        elif not self.answered(need):
-            before = self.allocatable()
-            self.shrink(need)
-            try:
-                self.progressed(before, need, op)
-            except ResidencyRefusal:
-                if not self.spill(need, operands):
-                    raise
-        mapped()
-
     def refused(self, need: int) -> None:
         """torch's allocator refused `need` bytes. A caller that catches that never reaches a
         block's recovery: cuDNN tries its next convolution algorithm, down to one that needs
         no workspace (4-7x slower for SeedVR2's VAE convolutions on an RTX 4060 Ti), and torch
         keeps that choice for the shape as long as the process lives. So the room is made
-        before that next attempt: torch's limit follows the driver again, and what the driver
-        lacks comes from weights nothing reads now (activations first). A refusal that reaches
-        the caller is still the recovery's."""
+        before that next attempt, from weights no stage holds (rungs 0-1; the owner is not
+        asked from inside torch's allocator). A refusal that reaches the caller is the op's."""
         if self.placing:
             return
-        self.placing = True
+        self.memory.asking = False
         try:
-            self.limit_torch()
-            short = need + weight_policy.MARGIN - self.headroom(self.allocation())
-            self.given = need if short > 0 and self.shrink(short) else 0
-            self.drain()
+            self.memory.free_for(need, "an allocation", upto=Rung.IDLE)
         finally:
-            self.placing = False
-
-    def answered(self, need: int) -> bool:
-        """The allocator's refusal of `need` bytes that reached the caller already had its
-        room (`refused`): the op runs again without a second unmapping. None was given for a
-        refusal of unknown size."""
-        given, self.given = self.given, 0
-        return given > 0 and given >= need and self.allocatable() >= need
+            self.memory.asking = True
 
     def trim_cache(self, method: str) -> None:
         """Before a stage plans: torch's idle cache beyond the stage's activations goes back to
@@ -943,54 +869,6 @@ class Weights:
         )
         if unmapped + weight_policy.MARGIN > self.headroom(memory):
             accel.release_cached(self.torch, self.kind)
-
-    def within_device(self, budget: int) -> int:
-        """A map was refused at `budget`: torch, another process or the machine's custody holds
-        what it counted on. The budget held to what the device gives the plane now beside the
-        stage's activations (torch's idle cache back first), so the plane's idle chunks go back
-        and its least recently used regions leave; never below the open stages' floor: past
-        it, weights stream from host. The request's record keeps the device as it was at the
-        first refusal."""
-        self.modes.setdefault("short of device memory", self.ledger())
-        accel.release_cached(self.torch, self.kind)
-        memory, held = self._held()
-        free = memory["driver_free_bytes"] - self.floor_free
-        if self.cap >= 0:
-            free = min(free, self.cap - held)
-        method = self.open[-1][1] if self.open else ""
-        # an adaptive stage fits its activations to the room it finds: it asks for its
-        # smallest piece
-        growth = self.adaptive.get(method, self.activation.get(method, 0))
-        given = weight_policy.plane_budget(self._committed() + free, growth)
-        return min(budget, max(given, self.floor()))
-
-    def reclaim(self, need: int, asked: bool) -> tuple[bool, bool]:
-        """Room for `need` bytes the budget cannot give, each source only once those before
-        gave none: a component no stage uses (the machine's custody too), the owner (asked
-        once), this process's tensors moved to host memory. Whether any gave room, and whether
-        the owner was asked."""
-        self.modes.setdefault("short of device memory", self.ledger())
-        if self.page_out(_in_use(self), need + weight_policy.MARGIN):
-            return True, asked
-        if not asked and self.room is not None and self.cap >= 0:
-            self.room(need + weight_policy.MARGIN)
-            return True, True
-        return self.spill(need, ()), asked
-
-    def ledger(self) -> str:
-        """The device as its driver and this process count it."""
-        memory = self.allocation()
-        device = plane.stats(self.plane).device(self.index)
-        free, total = memory["driver_free_bytes"], memory["driver_total_bytes"]
-        held = max(self.context_bytes, 0) + memory["reserved_bytes"] + max(device.committed, 0)
-        return (
-            f"driver {free} B free of {total}; this process {held} (context {self.context_bytes}, "
-            f"torch {memory['reserved_bytes']} reserved, {memory['allocated_bytes']} allocated, "
-            f"{self.decoded()} of them decoded weights; plane {device.committed} of its "
-            f"{device.budget} budget, {device.leased_bytes + device.held_bytes} leased); "
-            f"{device.shared_bytes} mapped from the machine; cap {self.cap}; elsewhere "
-            f"{total - free - held}"
-        )
 
     def spill(self, need: int, operands: Sequence[object]) -> bool:
         """The last room an op is given: this process's own tensors move to page-locked host
@@ -1013,11 +891,46 @@ class Weights:
             moved = spill.spill(self.torch, device, want, operands, want if room < 0 else room)
         accel.release_cached(self.torch, self.kind)
         self.limit_torch()
-        self.last_retry = None
         self.modes["spilled"] = (
             f"{spill.MOVED[0]}x {spill.MOVED[1]} B to host in {spill.MOVED[2] // 1_000_000} ms"
         )
         return moved > 0
+
+    def pin(self, operands: Sequence[object]) -> list[Lease]:
+        """Leases on the weight regions an op that ran out of memory reads at their homes: the
+        room made for it never unmaps them, and one the allocator's own refusal unmapped maps
+        again at its home (it never moves), where the op's tensors point."""
+        pointers, held = list(_pointers(operands)), cast("list[Lease]", [])
+        try:
+            for component in self.components.values() if pointers else ():
+                cursor = component.cursor
+                ring = (
+                    range(cursor.ring_ptr, cursor.ring_ptr + cursor.ring_nbytes) if cursor else ()
+                )
+                for region in component.regions:
+                    homes = [region.bound] if region.bound is not None else list(region.views)
+                    spans = [(a, a + region.span) for a in homes if a not in ring]
+                    if not any(a <= p < b for a, b in spans for p in pointers):
+                        continue
+                    held.append(
+                        self.memory.retry(
+                            functools.partial(
+                                self.plane.acquire,
+                                component.ws,
+                                self.index,
+                                region.index,
+                                self.stream(),
+                            ),
+                            f"{component.name}.{region.path}",
+                        )
+                    )
+                    if region.bound != int(held[-1].ptr):
+                        bind(self.torch, region, held[-1])
+        except BaseException:
+            for lease in held:  # a lease dropped unreleased poisons the plane (run 10996)
+                lease.release()
+            raise
+        return held
 
     def unpin(self, need: int, operands: Sequence[object]) -> bool:
         """Memory rung 5: the pinned tier halves (its weights stream from the page cache and
@@ -1040,7 +953,7 @@ class Weights:
             and any(region.bound <= p < region.bound + region.span for p in pointers)
         }
         keep, residency = {*self.running, *reads}, self.open[-1][0]
-        return residency._spare({*keep, self.last}, None) or residency._spare(keep, None)
+        return residency._spare({*keep, self.last}) or residency._spare(keep)
 
     def restore_spilled(self) -> int:
         """Tensors an earlier op moved to host memory come back while the device has room
@@ -1141,47 +1054,6 @@ class Weights:
                 break
             gave = reservation.shed(need) > 0 or gave
         return gave
-
-    def progressed(self, before: int, need: int, op: str = "") -> None:
-        """An out-of-memory retry runs again only when it can succeed: memory came back (this
-        process's own unmapping, else the owner's: its other tenants on this GPU give theirs),
-        or a fresh segment of `need` fits now. torch's idle cache and its limit follow first:
-        both lag what the plane and the owner just did. The same failure retried at the same
-        bytes would churn maps on a full card, so a repeat ends it."""
-        accel.release_cached(self.torch, self.kind)
-        self.limit_torch()
-        after = self.allocatable()
-        retry = (op, after)
-        fresh = self.headroom(self.allocation())
-        if after <= before and self.room is not None:
-            self.room(need + weight_policy.MARGIN)
-            after = self.allocatable()
-            fresh = self.headroom(self.allocation())
-            retry = (op, after)
-        repeat, self.last_retry = retry == self.last_retry, retry
-        if after <= before and (fresh < need + weight_policy.MARGIN or repeat):
-            device = plane.stats(self.plane).device(self.index)
-            torch_bytes = accel.allocated(self.torch, self.kind)
-            raise ResidencyRefusal(
-                INDIVISIBLE,
-                f"{op or 'an allocation'} of {need} B: nothing on this GPU could give device "
-                f"memory back ({after} B allocatable before and after, every weight it does "
-                "not read unmapped and every idle tenant asked; plane budget "
-                f"{device.budget} B, mapped {device.committed} B, leased "
-                f"{device.leased_bytes} B, cap {self.cap} B; torch holds {torch_bytes} B of "
-                f"tensors, {spill.MOVED[1]} B moved to host)",
-                {
-                    "resource": "vram",
-                    "scope": "operation",
-                    "needed_bytes": need,
-                    "available_bytes": after,
-                    "evidence_class": "measured",
-                    "request_shape": op,
-                    "plane_mapped_bytes": device.committed,
-                    "torch_allocated_bytes": torch_bytes,
-                    "spilled_bytes": spill.MOVED[1],
-                },
-            )
 
     @contextmanager
     def reading(self, standins: Sequence[Tensor], op: str) -> Iterator[Read]:
@@ -2025,6 +1897,7 @@ def _ops_type(torch: ModuleType) -> type:
                 except Exception as exc:
                     if not is_device_oom(exc):
                         raise
+                    exc.__traceback__ = None
                     out = NotImplemented  # it recovers as any op does, below
                 if out is not NotImplemented:
                     return out
@@ -2041,39 +1914,58 @@ def _ops_type(torch: ModuleType) -> type:
             targets: list[Tensor] = []
             if writes:
                 targets = list(_tensor_operands(tuple(_written(func, args, kwargs))))
-            refused = False
             written: list[tuple[Tensor, Tensor]] | None = None
-            while True:
-                try:
-                    if written is None:  # the copies are allocations too: they recover first
-                        for journal in journals if targets else ():
-                            journal.before_write(targets)
-                        copied = weights is not None and not pure
-                        written = [(t, t.clone()) for t in targets] if copied else []
-                    return func(*args, **kwargs)
-                except Exception as exc:
-                    if weights is None:
-                        raise
-                    need, refused = _room_for(exc, refused)
-                    up = exc if is_device_oom(exc) and bands.raises() else None
-                # outside `except`, so the failed op's frames are gone; it runs again from
-                # what it read: its generators and the tensors it writes into, as they were
-                for generator, state in states:
-                    generator.set_state(state)
-                for target, first in written or ():
-                    target.copy_(first)
-                if up is not None:  # the call around it cuts itself (`Bands.attend`) first
-                    raise up
-                if banded is not None:
-                    try:  # out of memory whole: in bands of rows when it can be
-                        out = banded.run(func, args, kwargs, short=True)
+            seen, pins = -1, cast("list[Lease]", [])
+            try:
+                while True:
+                    try:
+                        if written is None:  # the copies are allocations too: they recover first
+                            for journal in journals if targets else ():
+                                journal.before_write(targets)
+                            copied = weights is not None and not pure
+                            written = [(t, t.clone()) for t in targets] if copied else []
+                        return func(*args, **kwargs)
                     except Exception as exc:
-                        if not is_device_oom(exc):
+                        if weights is None or (short := shortage(exc)) is None:
                             raise
-                        out = NotImplemented  # still out at its finest: room is made
-                    if out is not NotImplemented:
-                        return out
-                weights.make_room(need, (*args, *kwargs.values()), str(func))
+                        why = str(exc).splitlines()[0][:200] if str(exc) else ""
+                        up = exc if is_device_oom(exc) and bands.raises() else None
+                        exc.__traceback__ = None  # the failed op's frames free their tensors
+                    # outside `except`: it runs again from what it read, its generators and
+                    # the tensors it writes into as they were
+                    for generator, state in states:
+                        generator.set_state(state)
+                    for target, first in written or ():
+                        target.copy_(first)
+                    operands, op, memory = (*args, *kwargs.values()), str(func), weights.memory
+                    need = short[0] or sum(t.nbytes for t in spill.stored(operands))
+                    pins = pins or weights.pin(operands)
+                    if (now := memory.again(need, op, operands, seen, Rung.IDLE)) >= 0:
+                        seen = now
+                        continue
+                    if up is not None:  # the call around it cuts itself (`Bands.attend`) first
+                        raise up
+                    if banded is not None:
+                        try:  # still short: in bands of rows when it can be
+                            out = banded.run(func, args, kwargs, short=True)
+                        except Exception as exc:
+                            if not is_device_oom(exc):
+                                raise
+                            exc.__traceback__ = None
+                            out = NotImplemented
+                        if out is not NotImplemented:
+                            return out
+                    if (seen := memory.again(need, op, operands, seen)) < 0:
+                        shapes = ", ".join(
+                            f"{t.dtype}{tuple(t.shape)}" for t in spill.stored(operands)
+                        )
+                        dtype = kwargs.get("dtype")
+                        memory.exhausted(
+                            need, f"{op}({shapes}{f' -> {dtype}' if dtype else ''})", why
+                        )
+            finally:
+                for lease in pins:
+                    lease.release()
 
     return Ops
 
@@ -2276,21 +2168,14 @@ def close_cursor(component: Component) -> None:
         for address in [a for a in region.views if a in ring]:
             del region.views[address]
     component.cursor = None
-    for collect in (False, True):
-        try:
-            cursor.close()
-            return
-        except plane.error("Poisoned"):
-            raise
-        except plane.error("PlaneError"):
-            # A view into the ring outlives the stage: a failed block's frames, in a cycle,
-            # hold one (run 10562: the next stage's ring found the budget still taken). Once
-            # they are collected the ring goes; a view still in use closes it when it goes,
-            # and memory's rung 1 collects again for it.
-            if collect:
-                ORPHANED[0] += 1
-                return
-        gc.collect()
+    try:
+        cursor.close()
+    except plane.error("Poisoned"):
+        raise
+    except plane.error("PlaneError"):
+        # A view into the ring outlives the stage: a failed block's frames, in a cycle, hold
+        # one (run 10562). The next stage short of room collects them first (memory's rung 1).
+        component.orphans.append(cursor)
 
 
 def _bake_key(bake: Bake) -> tuple[object, ...]:
@@ -3421,7 +3306,6 @@ class WeightResidency:
         self.active: tuple[str, tuple[str, ...]] | None = None
         self.spare = False
         self.poisoned = ""
-        self.last_shortfall: dict[str, Any] | None = None
         self.refusals: list[str] = []
         #: this attempt's activation peak per method, and per batch item with the batch it ran
         self.peaks: dict[str, int] = {}
@@ -3441,10 +3325,6 @@ class WeightResidency:
         #: its common leases and cursors live, the cursor already copying the next pass), and
         #: TensorD's budget it was planned in
         self.parked: tuple[str, tuple[str, ...], int] | None = None
-        self._device_short, self._below_floor = plane.error("Shortfall"), plane.error("BelowFloor")
-        self._shortfall_error = (self._device_short, self._below_floor)
-        self._budget_error = plane.error("BudgetExceeded")
-        self._capacity = (*self._shortfall_error, self._budget_error)
         self._poisoned_error = plane.error("Poisoned")
         self._quiet = weights.torch.utils._python_dispatch._disable_current_modes
         #: block modules run while `recording`, by component
@@ -3492,7 +3372,6 @@ class WeightResidency:
         self.unpark()
         self.peaks.clear()
         self.entries.clear()
-        self.last_shortfall = None
         self.derived_at_open = self._derived()
         self.attempts += 1
 
@@ -3568,7 +3447,7 @@ class WeightResidency:
                 component = self.components[name]
                 component.passes = 0
                 if component.common is not None:
-                    component.lease = self._acquire_common(method, component, budget, stream)
+                    component.lease = self._acquire_common(component, stream)
                     bind(weights.torch, component.common, component.lease)
         except BaseException:
             with suppress(Exception):  # the original failure is the one to report
@@ -3613,39 +3492,23 @@ class WeightResidency:
         weights.page_out(_in_use(weights))
         self.pressure = (weights.allocatable(), weights.retries())
 
-    def _acquire_common(self, method: str, component: Component, budget: int, stream: Any) -> Any:
-        """The stage's common region's lease; short of device memory, the plane is held to
-        what the device gives, then room comes back (`reclaim`), the plane growing into it,
-        before that is reported."""
-        weights = self.weights
-        assert component.common is not None
-        self._arrive(component, component.common.index)
-        span, asked = component.common.span, False
-        while True:
-            try:
-                return weights.plane.acquire(
-                    component.ws, weights.index, component.common.index, stream
-                )
-            except self._capacity as exc:
-                lowered = weights.within_device(budget)
-                if lowered < budget:
-                    budget = lowered
-                    weights._apply(budget)
-                    continue
-                gave, asked = weights.reclaim(span, asked)
-                if not gave:
-                    raise self._shortfall(
-                        method, span, budget, f"{exc}; {weights.ledger()}"
-                    ) from None
-                weights.grow(span)
+    def _acquire_common(self, component: Component, stream: Any) -> Any:
+        """The stage's common region's lease, room made for it by the ladder."""
+        weights, common = self.weights, component.common
+        assert common is not None
+        self._arrive(component, common.index)
+        return weights.memory.retry(
+            lambda: weights.plane.acquire(component.ws, weights.index, common.index, stream),
+            f"{component.name}.common",
+        )
 
     def _place(self, budget: int, resume: Mapping[str, int] = {}) -> int:
-        """`_plan` the open stages in `budget`. When the device refuses a map (another process,
-        torch or the machine's custody holds what the budget counted on), plan again inside
-        what it gives now, never below the open stages' floor, and past that reclaim room
-        (`Weights.reclaim`). When binding runs out of device memory (it decodes and converts
-        weights into torch's bytes, and torch may hold more than the budget knew), plan again
-        in what is left. Returns the budget used."""
+        """`_plan` the open stages in `budget`. Short of memory anywhere in it (a plane refusal
+        for its real deficit, a map the device refuses, binding out of device memory), rungs
+        0-1 make room and the same plan runs again; else the plane's budget grows into room the
+        device has; else the sets plan again in less, finer, down to their floor; there the
+        rest of the ladder runs, and only when that gives nothing is it `memory_exhausted`.
+        Returns the budget used."""
         weights = self.weights
         placing, weights.placing = weights.placing, True
         try:
@@ -3655,92 +3518,39 @@ class WeightResidency:
 
     def _placed(self, budget: int, resume: Mapping[str, int]) -> int:
         weights = self.weights
-        method = weights.open[-1][1]
+        memory, method = weights.memory, weights.open[-1][1]
+        op = f"{method}()"
         weights.quiesce()  # a plan unmaps: other components' sets, this one's stale regions
-        asked, outside = False, 0
+        outside = 0
         while True:
-            oom: tuple[int, str] | None = None
-            refused: tuple[int, str] | None = None
             try:
-                self._plan(budget, resume, outside=outside)
+                self._plan(budget, resume, outside)
                 weights.limit_torch()
+                memory.shrunk = False
                 return budget
-            except self._budget_error as exc:
-                refused = (int(getattr(exc, "requested", 0)), str(exc))
-            except self._device_short as exc:
-                # The plane's budget holds more than the plan placed: a ring a view still keeps
-                # mapped (run 10562, H3's second segment on 32 GB). The sets plan again in what
-                # it leaves, finer, until their floor does not fit.
-                outside += max(int(getattr(exc, "need", 0)) - int(getattr(exc, "available", 0)), 1)
-                weights.modes["held outside the plan"] = f"{outside} B"
-                continue
-            except ResidencyRefusal as exc:
-                # Short when the plane placed the plan: the owner makes room once (its idle
-                # tenants leave), then this process's own tensors move to host memory, and the
-                # stage plans again in what that gave.
-                if exc.code != INDIVISIBLE:
-                    raise
-                short = self.last_shortfall or {}
-                missing = int(short.get("needed_bytes", 0)) - int(short.get("available_bytes", 0))
-                if not asked and weights.room is not None and weights.cap >= 0:
-                    asked = True
-                    weights.room(max(missing, 0) + weight_policy.MARGIN)
-                elif not weights.spill(max(missing, 0), ()):
-                    raise
-                budget = max(budget, weights.driver_budget(method))
-                continue
+            except weight_policy.BelowFloor as exc:
+                (nbytes, own), floor = (max(exc.needed - exc.available, 1), True), True
             except Exception as exc:
-                if not is_device_oom(exc):
+                short = shortage(exc)
+                if short is None:
                     raise
-                oom = (_requested(exc), str(exc).splitlines()[0][:300])
-            # outside `except`, so the failed plan's frames (and their tensors) are gone
-            if oom is not None:
-                budget, asked = self._after_bind(budget, method, *oom, asked=asked)
+                (nbytes, own), floor = short, False
+                exc.__traceback__ = None  # the failed plan's frames free their tensors
+            nbytes = nbytes or weight_policy.MARGIN
+            if self.spare:  # an optional call is taken only if it fits beside what is here
+                raise ResidencyRefusal("device_spared", f"{op} declined: {nbytes} B short")
+            if own and memory.collect():  # the plane's own bytes: a ring a view kept open
                 continue
-            # A map the device refused: the plan is held to what it gives, then room comes back.
-            assert refused is not None
-            need, failed = refused
-            lowered = weights.within_device(budget)
-            if lowered < budget:
-                budget = lowered
+            if memory.free_for(nbytes, op, upto=Rung.IDLE) and memory.freed:
                 continue
-            gave, asked = weights.reclaim(need, asked)
-            if not gave:
-                raise self._shortfall(
-                    method,
-                    max(weights.floor(), need),
-                    weights._committed() + weights.allocatable(),
-                    f"{failed}; {weights.ledger()}",
-                )
-
-    def _after_bind(
-        self, budget: int, method: str, need: int, failed: str, asked: bool = False
-    ) -> tuple[int, bool]:
-        """The budget to plan again in after binding ran out of device memory: what the open
-        stages' weights and their decoded copies can have now (mapped, decoded and free). At
-        the stage's floor the owner is asked for room once (its idle tenants leave), then this
-        process's own tensors move to host memory; the failure is reported by its own name only
-        when that gave nothing either."""
-        weights = self.weights
-        accel.release_cached(weights.torch, weights.kind)
-        mapped = max(plane.stats(weights.plane).device(weights.index).committed, 0)
-        room = mapped + weights.decoded() + weights.allocatable() - need - weight_policy.MARGIN
-        lowered = max(min(room, budget - weight_policy.MARGIN), weights.floor())
-        if lowered >= budget and not asked and weights.room is not None and weights.cap >= 0:
+            unused = max(budget - weights._committed(), 0)
+            if own and memory.free() >= unused + nbytes + weight_policy.MARGIN:
+                budget += nbytes  # the plane's budget grows into room the device has
+            elif not floor:
+                outside += nbytes  # a ring a view keeps mapped (run 10562), a full device
+            elif method == MAPPING or memory.again(nbytes, op, seen=memory.free()) < 0:
+                memory.exhausted(nbytes, op)  # mapping ahead moves no tensor to host
             weights.oom_retries += 1
-            weights.room(need + weight_policy.MARGIN)
-            return budget, True
-        if lowered >= budget and weights.spill(need, ()):
-            return budget, asked
-        if lowered >= budget:
-            raise self._shortfall(
-                method,
-                need,
-                room,
-                f"binding its weights ran out of device memory at the stage's floor: {failed}",
-            )
-        weights.oom_retries += 1
-        return lowered, asked
 
     def _left(self) -> None:
         if self.stage_holds:
@@ -3884,7 +3694,7 @@ class WeightResidency:
         try:
             self.admit(MAPPING, names)
             self.release(MAPPING, names)
-        except ResidencyRefusal:
+        except (ResidencyRefusal, MemoryExhausted):
             pass  # not even the floor fits: what was placed stays, the rest is host memory
         finally:
             weights.sharing, weights.room = sharing, room
@@ -4037,7 +3847,7 @@ class WeightResidency:
                     bind(weights.torch, region, lease, refill=True)
             except BaseException as exc:
                 self._let_go(component, regions[: len(leases)], leases)
-                if not isinstance(exc, self._capacity) and not is_device_oom(exc):
+                if not isinstance(exc, MemoryExhausted) and shortage(exc) is None:
                     raise
                 why = str(exc).splitlines()[0][:200]
         if why:
@@ -4061,41 +3871,20 @@ class WeightResidency:
                 self._let_go(component, regions, leases)
 
     def _hold(self, component: Component, region: Region, stream: int) -> Lease:
-        """`region`'s home lease for `held`: refused for the plane's own budget, the budget
-        grows into the device's free room (torch's idle cache given back first), as a block's
-        own acquire does; short of that, components no open stage uses give their device bytes
-        back, the machine's custody too (an LM's decode set beside a pipeline's idle DiT, VAE
-        and text encoder on a 16 GB card), and the owner is asked once."""
+        """`region`'s home lease for `held`: an optional speed, so room for it comes only from
+        what no stage holds (rungs 0-1: idle weights, the machine's custody, idle tenants)."""
         weights = self.weights
-
-        def acquire() -> Lease:
-            lease: Lease = weights.plane.acquire(
+        return weights.memory.retry(
+            lambda: weights.plane.acquire(
                 component.ws,
                 weights.index,
                 region.index,
                 stream,
                 priority=plane.PREFIX + weights.tick(),
-            )
-            return lease
-
-        # Each source once per round, each round after one gave room: a component pages out
-        # whole and the owner is asked once, so the loop ends.
-        asked = grown = False
-        while True:
-            try:
-                return acquire()
-            except self._capacity:
-                accel.release_cached(weights.torch, weights.kind)
-                if not grown and weights.grow(region.span):
-                    grown = True
-                    continue
-                if weights.page_out(_in_use(weights), region.span + weight_policy.MARGIN):
-                    grown = False
-                    continue
-                if asked or weights.room is None or weights.cap < 0:
-                    raise
-                asked, grown = True, False
-                weights.room(region.span + weight_policy.MARGIN)
+            ),
+            f"{component.name}.{region.path} held",
+            upto=Rung.IDLE,
+        )
 
     def note(self, key: str, value: str) -> None:
         self.weights.modes[key] = value
@@ -4177,7 +3966,9 @@ class WeightResidency:
         for component, index in gone:
             try:  # the lowest priority: it takes only room nothing else holds
                 weights.plane.want(component.ws, weights.index, [index], priority=0)
-            except self._capacity:
+            except Exception as exc:
+                if shortage(exc) is None:
+                    raise
                 break
         weights.limit_torch()
 
@@ -4213,15 +4004,13 @@ class WeightResidency:
 
     # -- the stage
 
-    def _plan(
-        self, budget: int, resume: Mapping[str, int] = {}, asked: bool = False, outside: int = 0
-    ) -> None:
+    def _plan(self, budget: int, resume: Mapping[str, int] = {}, outside: int = 0) -> None:
         """Place every open stage's components inside `budget`: each resident set wanted, the
         rest streamed by a cursor in the blocks' execution order (from `resume[weight set]`
         when a block boundary re-plans mid-pass). Before a component's order is observed its
         blocks are acquired on demand. A component whose block floor does not fit moves to
-        the sub-block grain first. `outside`: what the plane holds beyond any plan (a ring a
-        view still keeps mapped), which the sets leave room for."""
+        the sub-block grain first. `outside`: what the sets leave of `budget` (a ring a view
+        still keeps mapped, a device that gives less). A plane refusal raises to `_placed`."""
         weights = self.weights
         opened = {key: row for key, row in weights.opened().items() if not row[2].spared}
         components = {key: component for key, (_, _, component) in opened.items()}
@@ -4279,13 +4068,8 @@ class WeightResidency:
                 paid = stage(layouts)
         except weight_policy.BelowFloor as exc:
             if exc.component in opened and opened[exc.component][0]._refine(exc.component):
-                return self._plan(budget, resume, asked, outside)
-            if not asked and weights.room is not None and weights.cap >= 0:
-                # Never refused for size while the GPU has room to give: the owner makes it
-                # (idle tenants leave, held weights nobody reads are revoked) and raises the cap.
-                weights.room(max(exc.needed - exc.available, 0) + weight_policy.MARGIN)
-                return self._plan(max(budget, weights.driver_budget(method)), resume, True, outside)
-            raise self._shortfall(method, exc.needed, exc.available, str(exc)) from None
+                return self._plan(budget, resume, outside)
+            raise
         # A budget that only fits one block at a time streams with no overlap: regions of at
         # most 16 MiB let it hold a window of several. (Window 1 chosen when two fit stays.)
         for key, residence in paid.items():
@@ -4296,7 +4080,7 @@ class WeightResidency:
                 and layout.common + 2 * layout.largest > budget - outside
                 and opened[key][0]._refine(key)
             ):
-                return self._plan(budget, resume, outside=outside)
+                return self._plan(budget, resume, outside)
         need = sum(r.vram_bytes(layouts[key]) for key, r in paid.items())
         placed = {key: _unpaid(components[key], kept[key], r) for key, r in paid.items()}
         if self.spare and need > budget - outside:
@@ -4344,17 +4128,14 @@ class WeightResidency:
                     weights.plane.drop(component.ws, weights.index, stale)
                 for index in stale:
                     unbind(component.regions[index])
-            try:
-                arriving.append(
-                    weights.plane.want(
-                        component.ws,
-                        weights.index,
-                        list(component.resident),
-                        priority=plane.PREFIX + clock,
-                    )
+            arriving.append(
+                weights.plane.want(
+                    component.ws,
+                    weights.index,
+                    list(component.resident),
+                    priority=plane.PREFIX + clock,
                 )
-            except self._below_floor as exc:
-                raise self._shortfall(method, need, budget, str(exc)) from None
+            )
             if streams:
                 _stage_stream(weights, component, residence, clock)
         # Every eviction so far is past: its regions leave their bindings now, before the
@@ -4390,24 +4171,21 @@ class WeightResidency:
                 order = component.order
                 start = order.index(resume[key]) if key in resume else 0
                 component.schedule = order[start:] + order[:start]
-                try:
-                    component.cursor = weights.plane.stream(
-                        component.ws,
-                        weights.index,
-                        component.schedule,
+                component.cursor = weights.plane.stream(
+                    component.ws,
+                    weights.index,
+                    component.schedule,
+                    residence.window,
+                    repeat=0,
+                    priority=plane.STREAMED + clock,
+                    tag=opened[key][1],
+                    # the plane's ring holds the stored bytes; their decoded copies are
+                    # counted in the budget beside it
+                    ring_bytes=weight_policy.ring_bytes(
+                        [component.layout.blocks[i] for i in residence.streamed],
                         residence.window,
-                        repeat=0,
-                        priority=plane.STREAMED + clock,
-                        tag=opened[key][1],
-                        # the plane's ring holds the stored bytes; their decoded copies
-                        # are counted in the budget beside it
-                        ring_bytes=weight_policy.ring_bytes(
-                            [component.layout.blocks[i] for i in residence.streamed],
-                            residence.window,
-                        ),
-                    )
-                except self._below_floor as exc:
-                    raise self._shortfall(method, need, budget, str(exc)) from None
+                    ),
+                )
 
     def _derived(self) -> int:
         return sum(
@@ -4423,6 +4201,7 @@ class WeightResidency:
             or component.layout.fine is None
             or self.refine is None
             or any(c.lease is not None or c.cursor is not None for c in self.components.values())
+            or not reap(component)  # its weight set cannot close under an open ring (0.27.3)
         )
 
     def _refine(self, key: str) -> bool:
@@ -4520,36 +4299,24 @@ class WeightResidency:
                 self._grow()
             versions = _versions(args, kwargs)
             held = _containers(args, kwargs)
-            # a library's refusal is answered once: by its op when ops recover one by one
-            refused = weights.grouped or region.effects is None or region.effects.writes
-            quiet = not (refused or region.tight)
-            refusals = 0
+            # observed (a group's, a first run, one that writes), its ops recover one by one
+            observed = weights.grouped or region.effects is None or region.effects.writes
+            quiet, seen, memory = not (observed or region.tight), -1, weights.memory
+            op = f"{component.name}.{region.path}"
             while True:
                 if self.components.get(component.name) is not component:
                     raise _Regrained
+                if memory.shrunk and not weights.running:  # the stage gave weights back
+                    memory.shrunk = False
+                    self._replan({component.key: region.index})
                 if component.spared:
                     self._unspare(component)
                 stream = weights.stream()
                 holds = component.holds
                 hold = holds.pop(region.index, None) if component.hold_stream == stream else None
-                try:
-                    lease = hold or self._acquire(component, region.index, stream)
-                except self._capacity:
-                    # The plane refused the region for its own plan: grow its budget into
-                    # the device's free room, then plan the stage afresh, and only then
-                    # unmap (which must give memory back, or the op cannot run).
-                    refusals += 1
-                    if refusals == 1 and weights.grow(region.span):
-                        continue
-                    if refusals <= 2:
-                        self._replan({component.key: region.index})
-                        continue
-                    self._make_room(
-                        region.span,
-                        {component.key: region.index},
-                        f"{component.name}.{region.path}",
-                    )
-                    continue
+                lease = hold or memory.retry(
+                    functools.partial(self._acquire, component, region.index, stream), op
+                )
                 need, stale = 0, False
                 try:
                     try:
@@ -4570,8 +4337,11 @@ class WeightResidency:
                     except _Stale:
                         stale = True
                     except Exception as exc:
-                        need, refused = _room_for(exc, refused)
-                        need = need or region.span
+                        short = shortage(exc)
+                        if short is None:
+                            raise
+                        need = short[0] or region.span
+                        exc.__traceback__ = None  # the failed run's frames free their tensors
                 finally:
                     # Outside its lease only a stage-resident region stays bound: any other
                     # read finds the stand-in (`Weights.reading`), never a stale address.
@@ -4584,36 +4354,21 @@ class WeightResidency:
                 if stale:
                     self._restore(component, region)
                     continue
-                if weights.grouped:
-                    raise self._shortfall(
-                        self.active[0] if self.active else "",
-                        need,
-                        0,
-                        f"{component.name}.{region.path} ran out of memory outside torch's "
-                        "own ops, and it shares its call with its group, so it cannot run "
-                        "again alone",
-                    )
-                if _versions(args, kwargs) != versions:
-                    # It wrote into its inputs although its first run did not: observe it
-                    # from now on. This attempt cannot be rewound.
+                # It cannot run again (U4 replays both): a group's block holds the group's
+                # collectives; one that wrote into its inputs, which its first run did not,
+                # cannot be rewound (observed from now on).
+                why = "it holds its group's collectives" if weights.grouped else ""
+                if not why and _versions(args, kwargs) != versions:
                     region.effects = None
-                    raise self._shortfall(
-                        self.active[0] if self.active else "",
-                        need,
-                        0,
-                        f"{component.name}.{region.path} ran out of memory after changing its "
-                        "inputs in place, which its first run did not, so it cannot run again",
-                    )
+                    why = "it changed its inputs in place, which its first run did not"
+                if why:
+                    memory.exhausted(need, op, f"out of memory outside torch's ops, and {why}")
                 with self._quiet():  # putting state back is not the block's own op
                     rewind()
                 _put_back(held)
                 region.tight = True
-                self._make_room(
-                    need,
-                    {component.key: region.index},
-                    f"{component.name}.{region.path}",
-                    operands=(*args, *kwargs.values()),
-                )
+                if (seen := memory.again(need, op, (*args, *kwargs.values()), seen)) < 0:
+                    memory.exhausted(need, op)
 
         return run
 
@@ -4651,16 +4406,19 @@ class WeightResidency:
                 with self._quiet():
                     return forward(*args, **kwargs)
             except Exception as exc:
-                need = _room_for(exc, False)[0]
-                if _versions(args, kwargs) != versions:
-                    component.effects = None  # it changed its inputs: observed again
+                if (short := shortage(exc)) is None:
                     raise
-            # outside `except`, so the failed call's frames (and their tensors) are gone
+                exc.__traceback__ = None  # the failed call's frames free their tensors
+            need, op = short[0], f"{component.name}()"
+            if _versions(args, kwargs) != versions:
+                component.effects = None  # observed again from now on
+                weights.memory.exhausted(need, op, "it changed its inputs in place")
             for generator, state in kept:
                 generator.set_state(state)
             _put_back(held)
-            component.tight = True
-            weights.make_room(need, (*args, *kwargs.values()), f"{component.name}()")
+            component.tight = True  # its ops recover one by one from now on
+            weights.memory.free_for(need, op, (*args, *kwargs.values()))
+            weights.oom_retries += 1
             return forward(*args, **kwargs)
 
         return call
@@ -4688,19 +4446,9 @@ class WeightResidency:
         else:
             streamed = -plane.STREAMED if weights.growing else plane.STREAMED
             priority = None if index in component.resident else streamed + weights.tick()
-            try:
-                lease = weights.plane.acquire(
-                    component.ws, weights.index, index, stream, priority=priority
-                )
-            except self._capacity:
-                held = [c for c in weights.components.values() if c.holds]
-                if not held:
-                    raise
-                for other in held:  # a fill is never refused for the stages' holds
-                    let_go(other)
-                lease = weights.plane.acquire(
-                    component.ws, weights.index, index, stream, priority=priority
-                )
+            lease = weights.plane.acquire(
+                component.ws, weights.index, index, stream, priority=priority
+            )
         weights.drain()  # what this fill displaced is unbound at once, in every weight set
         return lease
 
@@ -4730,27 +4478,10 @@ class WeightResidency:
     def _lease(self, component: Component, region: Region, op: str) -> Lease:
         """A region's lease for an op that reads it outside its forward (`Weights.reading`)."""
         weights = self.weights
-        grown = False
-        while True:
-            try:
-                return self._acquire(component, region.index, weights.stream())
-            except self._capacity:
-                grown = not grown and weights.grow(region.span)
-                if grown:
-                    continue
-                if weights.running:
-                    raise self._shortfall(
-                        weights.open[-1][1],
-                        region.span,
-                        0,
-                        f"{op} reads {component.name}.{region.path} inside another block's "
-                        "forward, whose lease no weight can leave under",
-                    ) from None
-                weights.open[-1][0]._make_room(
-                    region.span,
-                    {component.key: region.index},
-                    f"{op} ({component.name}.{region.path})",
-                )
+        return weights.memory.retry(
+            lambda: self._acquire(component, region.index, weights.stream()),
+            f"{op} ({component.name}.{region.path})",
+        )
 
     def _replan(self, resume: Mapping[str, int]) -> None:
         """Plan the open stages again in the budget they have: their cursors start over from
@@ -4802,58 +4533,15 @@ class WeightResidency:
             finally:
                 lease.release()
 
-    def _make_room(
-        self,
-        need: int,
-        resume: Mapping[str, int] | None = {},
-        op: str = "",
-        reads: Collection[str] = (),
-        operands: Sequence[object] = (),
-    ) -> None:
-        """Activations first: unmap `need` bytes of weights nothing uses now, least recently
-        used first, then re-place the open stages (a block that runs again resumes its
-        component's cursor: `resume`; None: inside a block's forward, nothing is re-placed
-        under its lease). When that gives nothing back, the components not in use give theirs
-        back (`_spare`): every one but those with a block in its forward, those the op
-        `reads` and the block that runs again; the one whose block ran last goes only when
-        nothing else is left to give. Then this process's own tensors move to host memory,
-        the op's `operands` last (`Weights.spill`)."""
-        weights = self.weights
-        method = weights.open[-1][1] if weights.open else ""
-        if weights.answered(need):
-            return
-        before = weights.allocatable()
-        if resume is None:
-            weights.shrink(need)
-            weights.drain()
-        else:
-            opened = [component for _, _, component in weights.opened().values()]
-            for component in opened:
-                close_cursor(component)
-            weights.shrink(need)
-            if opened:
-                self._place(max(weights.applied, weights.floor()), resume)
-        try:
-            weights.progressed(before, need, op or f"{method}()")
-        except ResidencyRefusal as refusal:
-            certain = {*weights.running, *reads, *(resume or {})}
-            if not (
-                self._spare({*certain, weights.last}, resume)
-                or self._spare(certain, resume)
-                or weights.spill(need, operands)
-            ):
-                self.last_shortfall = refusal.shortfall
-                raise
-
-    def _spare(self, keep: Collection[str], resume: Mapping[str, int] | None) -> bool:
+    def _spare(self, keep: Collection[str]) -> bool:
         """Activations first, past the stage's floor. A stage that scopes several components
         (Anima's `render`: conditioner, text encoder, transformer and VAE) keeps every one's
         common region leased and bound for the whole stage; while memory runs out, those not
         in `keep` give theirs back: leases released, regions unbound and unmapped. A read of
         one meanwhile maps it for that op (`Weights.reading`), and its next block maps its
-        common again (`_unspare`). The open stages are re-placed with `resume` (None: a block
-        is in its forward, and nothing is re-placed under its lease). With nothing in `keep`
-        known to be in use, every one gives back. False when nobody else held anything."""
+        common again (`_unspare`); the next block boundary plans the stage again. With nothing
+        in `keep` known to be in use, every one gives back. False when nobody else held
+        anything."""
         weights = self.weights
         opened = weights.opened()
         if weights.host_only:
@@ -4884,26 +4572,15 @@ class WeightResidency:
         # Dropped regions stay mapped as the plane's idle cache until its budget leaves them
         # no room: the plane keeps what the running component streams in, torch the rest.
         weights._apply(min(weights.applied, max(weights.window(), weights.floor())))
-        if resume is not None:
-            self._place(max(weights.applied, weights.floor()), resume)
-        after = max(plane.stats(weights.plane).device(weights.index).committed, 0)
-        if after >= before:
-            return False
-        weights.oom_retries += 1
-        weights.last_retry = None
-        return True
+        weights.memory.shrunk = True
+        return max(plane.stats(weights.plane).device(weights.index).committed, 0) < before
 
     def _unspare(self, component: Component) -> None:
         """A spared component runs again within its stage: its common region is leased and
         bound for the rest of the stage, and its blocks join the stage's plan."""
         weights = self.weights
         if component.common is not None and component.lease is None:
-            component.lease = self._acquire_common(
-                weights.open[-1][1] if weights.open else "",
-                component,
-                weights.applied,
-                weights.stream(),
-            )
+            component.lease = self._acquire_common(component, weights.stream())
             bind(weights.torch, component.common, component.lease)
             component.resident = (component.common.index,)
         component.spared = False  # only once its common is leased: a failed lease leaves it spared
@@ -4967,25 +4644,6 @@ class WeightResidency:
             weights.plane.drop(component.ws, weights.index, None)
             for region in component.regions:
                 unbind(region)
-
-    def _shortfall(self, method: str, needed: int, available: int, detail: str) -> ResidencyRefusal:
-        shortfall = {
-            "resource": "vram",
-            "scope": "component_use",
-            "needed_bytes": int(needed),
-            "available_bytes": int(available),
-            "evidence_class": "measured",
-            "request_shape": method,
-        }
-        self.last_shortfall = shortfall
-        self.refusals.append(f"{INDIVISIBLE}: {method}: {detail}"[:400])
-        return ResidencyRefusal(
-            INDIVISIBLE,
-            f"{method}(): {detail}; its smallest working set needs {needed} B of device memory "
-            f"at once and {available} B can be had at the finest grain, the owner having made "
-            "room",
-            shortfall,
-        )
 
     def _poison(self, exc: BaseException) -> ResidencyRefusal:
         """The plane latched poison (a lease lost, a driver mapping in doubt): this process is
@@ -5165,21 +4823,3 @@ def _put_back(held: list[tuple[object, object]]) -> None:
         elif isinstance(value, dict) and isinstance(first, dict):
             value.clear()
             value.update(first)
-
-
-def _requested(exc: BaseException) -> int:
-    """The allocation torch could not make, from its own message."""
-    found = _REQUESTED.search(str(exc))
-    return int(float(found.group(1)) * _UNITS[found.group(2)]) if found else 0
-
-
-def _room_for(exc: BaseException, refused: bool) -> tuple[int, bool]:
-    """The room to make before a failed op runs again, and whether a library's refusal has now
-    been answered: out of device memory, what torch asked for; a cuBLAS or cuDNN status, the
-    libraries' own room, once (`refused`: the same op already had it). Anything else, and a
-    second refusal, is the op's own failure and raises."""
-    if is_device_oom(exc):
-        return _requested(exc), refused
-    if refused or not is_library_refusal(exc):
-        raise exc
-    return weight_policy.LIBRARY_ROOM, True

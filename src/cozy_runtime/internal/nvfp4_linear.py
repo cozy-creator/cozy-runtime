@@ -30,7 +30,7 @@ from cozy_runtime.author.kernels import (
     TritonKernels,
     readable,
 )
-from cozy_runtime.internal import int8_linear, triton_kernels
+from cozy_runtime.internal import int8_linear
 from cozy_runtime.internal.encoding.formats import NVFP4_BLOCK, Tensor, nvfp4_values
 
 if TYPE_CHECKING:
@@ -264,6 +264,10 @@ KERNELS = TritonKernels("cozy-nvfp4", _entries())
 #: How often a call asks whether the start's build has landed: resolution, never a verdict.
 POLL_SECONDS = 1.0
 _LAUNCH: dict[int, tuple[float, Launch | None]] = {}
+#: `triton_kernels.ready`, bound by `triton_kernels` itself when it is imported, which the
+#: executor does past its device boundary: this module imports neither Triton nor torch, so
+#: `encoding` imports in a session without a GPU (test_device_session).
+READY: list[Callable[..., Launch | None]] = []
 
 
 def _launcher(device: Device) -> Launch | None:
@@ -274,7 +278,7 @@ def _launcher(device: Device) -> Launch | None:
     now = time.monotonic()
     if launch is None and now - asked >= POLL_SECONDS:
         try:
-            launch = triton_kernels.ready(KERNELS, device=device)
+            launch = READY[0](KERNELS, device=device) if READY else None
         except KernelsUnavailable:
             launch = None
         _LAUNCH[index] = (now, launch)

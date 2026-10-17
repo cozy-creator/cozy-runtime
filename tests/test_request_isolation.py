@@ -168,19 +168,6 @@ def test_an_attempt_whose_tail_raises_names_its_cause_and_stage(
     assert (after["code"], after["detail"]) == ("poisoned_generation", reply["poisoned"])
 
 
-def test_a_refused_load_leaves_loaded_constructions_serving(
-    host: tuple[Executor, dict[str, Any]],
-) -> None:
-    executor, load = host
-    assert executor.load(msgspec.convert({**load, "construction": "a"}, Load))["ok"]
-    model = {**load["binding"], "model_class": f"{MODULE}:Model"}
-    refused = executor.load(msgspec.convert({**load, "construction": "b", "binding": model}, Load))
-    assert refused["code"] == "model_sources_ungranted", refused
-    assert not executor.poisoned and "b" not in executor.constructions
-    assert executor.activate(Activate(construction="a"))["ok"]
-    assert _serve(executor, "after", "ok")["outcome"]["terminal"] == "succeeded"
-
-
 def test_a_pin_no_parallel_group_can_run_refuses_before_construction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

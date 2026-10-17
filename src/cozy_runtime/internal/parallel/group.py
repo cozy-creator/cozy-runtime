@@ -76,13 +76,11 @@ class Frame(msgspec.Struct, frozen=True):
 
 
 class _Hello(msgspec.Struct, frozen=True):
-    """A follower's `hello`, as far as rank 0 checks it: who it is and under which seal, and
-    what its memory answers beyond the floor's commands (`weight_plane/1`)."""
+    """A follower's `hello`, as far as rank 0 checks it: who it is and under which seal."""
 
     rank: int
     world: int
     sealed: dict[str, str]
-    memory: tuple[str, ...] = ()
 
 
 _Bytes = Annotated[int, msgspec.Meta(ge=0)]
@@ -141,8 +139,6 @@ class Follower:
     replies: queue.Queue[tuple[Frame, dict[str, Any]] | None] = field(default_factory=queue.Queue)
     #: the seam-closed verdict once the reader saw EOF or a torn frame; "" while live
     gone: str = ""
-    #: its `hello`'s memory capabilities: rank 0 sends it only the commands it answers
-    memory: tuple[str, ...] = ()
     #: a request of its own is with the machine: that wait is not its stillness
     relaying: bool = False
     #: a byte here aborts its collectives (its watcher thread; `RankGroup.interrupt`)
@@ -195,15 +191,9 @@ def abortable(backend: str) -> None:
         update_environment({"TORCH_NCCL_ASYNC_ERROR_HANDLING": "0"})
 
 
-#: The NCCL names this process's group set from its measured links: Runtime-owned, so the
-#: seal's restore leaves them alone (an older machine still seals NCCL_P2P_LEVEL=NVL).
-ROUTED: dict[str, str] = {}
-
-
 def route(nccl: Mapping[str, str]) -> None:
     """NCCL reads its route once, when this process's first communicator forms; every GPU of
     the group writes the same values, chosen by rank 0, before it joins."""
-    ROUTED.update(nccl)
     update_environment(nccl)
 
 
@@ -338,7 +328,7 @@ class RankGroup:
         #: per follower rank, its executor's plane facts as its latest reply stated them
         self.rank_planes: dict[int, dict[str, Any]] = {}
         #: per follower rank, its `execution_evidence` record folded over this attempt's calls
-        self.rank_records: dict[int, execution_evidence.RankEvidence] = {}
+        self.rank_records: dict[int, execution_evidence.GpuEvidence] = {}
         #: per spread method this attempt
         self.spread_log: dict[str, SpreadLog] = {}
         self._readers: list[threading.Thread] = []
@@ -538,7 +528,6 @@ class RankGroup:
                     f"({hello.sealed!r} vs {dict(sealed)!r})",
                     code="group_unformed",
                 )
-            follower.memory = hello.memory
 
     def form(
         self,

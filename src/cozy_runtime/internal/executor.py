@@ -13,12 +13,10 @@ output transaction durability remain with the native TensorFS store and executio
 Its whole surface is the seam (`internal/seam.py`), and its whole vocabulary is:
 
     hello     process facts: pid, parent, no_new_privs, oom_score_adj, the SEALED env
-    describe_installed  derive one installed PackageInterface into brokered scratch
     start     spawn and join every rank, import torch, the runtime and the package, warm up
     load      construct + fill one construction under its key; idempotent per key
     activate  make one loaded construction resident, parking LRU constructions for room
     unload    drop one construction and free its device bytes
-    residency every loaded construction, resident or parked
     prepare_request  resolve ONE request (decode, normalize, preflight) and retain it, so
               TensorD prices a plan against the record the handler will actually run
     invoke    run ONE PREPARED attempt through the author invocation kernel and report its facts
@@ -40,7 +38,6 @@ from __future__ import annotations
 import argparse
 import contextlib
 import ctypes
-import dataclasses
 import faulthandler
 import functools
 import gc
@@ -140,6 +137,7 @@ from cozy_runtime.internal import (
     builtin_operations,
     canonical,
     child_env,
+    effect_interfaces,
     execution_evidence,
     executor_commands,
     fetch_plan,
@@ -148,7 +146,6 @@ from cozy_runtime.internal import (
     kernel_cache,
     kernel_compile,
     model_config,
-    native_interfaces,
     package_interface,
     plane,
     prebuilt,
@@ -163,15 +160,13 @@ from cozy_runtime.internal import (
     zygote,
 )
 from cozy_runtime.internal.config import inherited_environment, restore_seal, seal_snapshot
-from cozy_runtime.internal.discovery import discover_distribution, discover_installed
+from cozy_runtime.internal.discovery import discover_installed
 from cozy_runtime.internal.encoding.leaves import FORMATS, serving
 from cozy_runtime.internal.executor_commands import (
     LOAD_ATTENTION_PIN,
     LOAD_PINNED,
     MAP,
-    PROCESS_CAP,
     RANK_CELLS,
-    SEALED_FILLING,
     SEALED_STAGED,
     SEALED_TIERS,
     Activate,
@@ -179,7 +174,6 @@ from cozy_runtime.internal.executor_commands import (
     Binding,
     Budget,
     CallInterface,
-    DescribeInstalled,
     Fork,
     GroupHardware,
     Hello,
@@ -192,23 +186,19 @@ from cozy_runtime.internal.executor_commands import (
     PrepareRequest,
     Probe,
     Release,
-    Residency,
-    Restore,
     Revoke,
     Share,
     Shutdown,
     Start,
     Unload,
-    Vacate,
-    Warm,
 )
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.lora_composition import bind as bind_adapters
 from cozy_runtime.internal.lora_contract import read as read_adapter_graph
+from cozy_runtime.internal.memory import MemoryExhausted
 from cozy_runtime.internal.model_values import read_values_into
 from cozy_runtime.internal.parallel import copy_engine, cp, links, mirror, wire
 from cozy_runtime.internal.parallel.group import (
-    ROUTED,
     RankGroup,
     RankSpec,
     abort_process_group,
@@ -232,7 +222,6 @@ from cozy_runtime.internal.seam import (
     connect,
 )
 from cozy_runtime.internal.weights import (
-    INDIVISIBLE,
     DeviceTiers,
     HostTiers,
     Journal,
@@ -256,7 +245,7 @@ else:
 INLINE_RESULT_MAX = 4 * 1024 * 1024
 
 #: Outcomes that are capacity, not broken state: they fail the attempt and keep the executor.
-CAPACITY_CODES = frozenset({DEVICE_OOM, MEMORY_EXHAUSTED, INDIVISIBLE, "device_spared"})
+CAPACITY_CODES = frozenset({DEVICE_OOM, MEMORY_EXHAUSTED, "device_spared"})
 
 #: How many PREPARED requests this epoch holds at once. A serving lane admits and
 #: runs one attempt at a time, so anything past the newest few is a request the
@@ -290,7 +279,7 @@ def _env_changes() -> tuple[str, ...]:
     return tuple(
         name
         for name in sorted(_SEALED.keys() | current.keys())
-        if current.get(name) != _SEALED.get(name) and name not in ROUTED
+        if current.get(name) != _SEALED.get(name)
     )
 
 
@@ -527,7 +516,7 @@ def _working_peak(peak: int, at_entry: int, residency: Mapping[str, Any]) -> int
     return max(int(peak) - int(at_entry), scoped, 0)
 
 
-def _serving(interface: str, module: str, export: str, surface: Any) -> _CallType:
+def _serving(module: str, export: str, surface: Any) -> _CallType:
     """A callable bound from its own code, called as every function is: `{payload, models}`.
     Its direct caller passes the model slots beside the request fields (`_CallType.models`)."""
     slots = frozenset(binding.param for binding in surface.model_bindings)
@@ -556,7 +545,7 @@ def _serving(interface: str, module: str, export: str, surface: Any) -> _CallTyp
     call = msgspec.defstruct(
         f"{export}Call", [("payload", request), ("models", models)], module=module, frozen=True
     )
-    return _CallType(interface, module, export, call, result, models=slots)
+    return _CallType("", module, export, call, result, models=slots)
 
 
 # --------------------------------------------------------------------------- state
@@ -572,13 +561,6 @@ class _CompositeResidency:
     def poisoned(self) -> str:
         return next((str(row.poisoned) for row in self.rows.values() if row.poisoned), "")
 
-    @property
-    def last_shortfall(self) -> Any:
-        return next(
-            (row.last_shortfall for row in self.rows.values() if row.last_shortfall is not None),
-            None,
-        )
-
     def open_attempt(self, *_: object) -> None:
         for row in self.rows.values():
             row.open_attempt()
@@ -590,10 +572,6 @@ class _CompositeResidency:
     def restore(self) -> None:
         for row in self.rows.values():
             row.restore()
-
-    def vacate(self) -> dict[str, Any]:
-        freed = sum(int(row.vacate()["freed_bytes"]) for row in self.rows.values())
-        return {"freed": {}, "held": {}, "freed_bytes": freed}
 
     def document(self) -> dict[str, Any]:
         documents = {name: row.document() for name, row in sorted(self.rows.items())}
@@ -647,9 +625,6 @@ class _OnDemand:
                 self._model = self._build()
         return getattr(self._model, name)
 
-
-#: Model classes that still define `warm` (packages built for an older Runtime), noted once each.
-_WARM_NOTED: set[type] = set()
 
 #: The requests rank 0 relays to the machine for a follower (`_relay`).
 _RELAYED = frozenset({"sealed_tier", "sealed_stage", "object_files", "model_source"})
@@ -856,22 +831,16 @@ class Executor:
                 return self.join(command)
             case Attention():
                 return self.select_attention(command)
-            case DescribeInstalled():
-                return self.describe_installed(command)
             case Fork():
                 return self.fork(command)
             case Start():
                 return self.start(command)
-            case Warm():
-                return self.warm(command)
             case Load():
                 return self.load(command)
             case Activate():
                 return self.activate(command)
             case Unload():
                 return self.unload(command)
-            case Residency():
-                return self.residency_document()
             case PrepareRequest():
                 return self.serve_request(command)
             case Invoke():
@@ -884,10 +853,6 @@ class Executor:
                 if command.collect:
                     gc.collect()
                 return self.probe()
-            case Vacate():
-                return self.vacate(residents=command.residents, ranks=command.ranks)
-            case Restore():
-                return self.restore(names=command.names)
             case Budget():
                 return self.budget(command)
             case Share():
@@ -911,22 +876,17 @@ class Executor:
             "runtime_version": RUNTIME_VERSION,
             "tensorfs_version": _distribution_version("tensorfs"),
             "executor_protocol_revision": EXECUTOR_PROTOCOL_REVISION,
-            "native_interfaces": native_interfaces.stated(),
-            "model_adapters": ["peft_graph/1"],
             #: what the worker's memory manager may ask beyond the floor's commands
             "memory": [
                 "import_only",
                 zygote.CAPABILITY,
-                "vacate_ranks",
                 LOAD_ATTENTION_PIN,
                 plane.CAPABILITY,
                 LOAD_PINNED,
-                PROCESS_CAP,
                 RANK_CELLS,
                 MAP,
                 *plane.SHARING,
                 SEALED_TIERS,
-                SEALED_FILLING,
                 SEALED_STAGED,
             ],
             "memo": [stage_memo.CAPABILITY],
@@ -940,33 +900,6 @@ class Executor:
             "rss_bytes": _rss(),
             "rank": self.rank,
             "world": self.world,
-        }
-
-    def describe_installed(self, command: DescribeInstalled) -> dict[str, Any]:
-        """Import one installed package and write its interface to brokered scratch."""
-        output = Path(command.output)
-        if not command.distribution or not output.is_absolute():
-            return {"ok": False, "code": "package_prepare_path_invalid", "detail": "paths"}
-        # Worker supervises this executor by observed progress and death. An import
-        # slowed by host pressure is not a package conformance failure after 60 seconds.
-        discovered = (
-            discover_installed(command.application, seconds=None)
-            if command.application
-            else discover_distribution(command.distribution, seconds=None)
-        )
-        body = package_interface.build(discovered, installed=True)
-        raw = package_interface.canonical_bytes(body)
-        with output.open("xb") as stream:
-            stream.write(raw)
-            stream.flush()
-            os.fsync(stream.fileno())
-        output.chmod(0o400)
-        self.discovered = discovered
-        self.surface_names = {surface.name: surface for surface in discovered.surfaces}
-        return {
-            "ok": True,
-            "application": discovered.application,
-            "length": len(raw),
         }
 
     # ------------------------------------------------------------- the group (cr-068)
@@ -1042,10 +975,9 @@ class Executor:
         impl: str = "",
         segments: Sequence[Mapping[str, Any]] = (),
     ) -> dict[str, Any]:
-        """The attempt's execution record: degree, every rank, and the setup it ran on."""
-        ranks = [
+        """The attempt's execution record: degree, every GPU, and the setup it ran on."""
+        gpus = [
             execution_evidence.record(
-                0,
                 self._rank_identity() if self.torch is not None else {"pid": os.getpid()},
                 start_us,
                 end_us,
@@ -1060,16 +992,18 @@ class Executor:
             )
         ]
         if self.group is not None:
+            numbers = _gpu_numbers(self.world)
             for follower in self.group.followers:
+                gpu = numbers[follower.rank] if follower.rank < len(numbers) else -1
                 row = self.group.rank_records.get(follower.rank) or execution_evidence.record(
-                    follower.rank, {"pid": follower.pid}, 0, 0
+                    {"pid": follower.pid, "gpu": gpu}, 0, 0
                 )
-                ranks.append({**row, "attention": {**row["attention"], "requested": pin}})
+                gpus.append({**row, "attention": {**row["attention"], "requested": pin}})
         facts = self.facts
         transport = self.host.transport
         return {
             "degree": self.world,
-            "ranks": ranks,
+            "gpus": gpus,
             **({"transport": transport.document()} if transport is not None else {}),
             # per spread method: the calls each rank ran, and why a rank declined
             "spread": dict(self.group.spread_log) if self.group is not None else {},
@@ -1159,7 +1093,7 @@ class Executor:
         if command.room >= 0:
             try:
                 reply["freed"] = self._group_room(command.room, self._rerun_methods)
-            except ResidencyRefusal as exc:
+            except (ResidencyRefusal, MemoryExhausted) as exc:
                 return {"ok": False, "code": exc.code, "detail": str(exc)[:900]}
         return reply
 
@@ -1181,14 +1115,15 @@ class Executor:
     def _group_room(self, need: int, methods: Iterable[str]) -> int:
         """Before a group call runs again: this GPU plans `methods` with `need` more room for
         activations and gives that many device bytes back now. The bytes that came back; a
-        GPU with nothing left to give refuses (`Weights.make_room`)."""
+        GPU with nothing left to give refuses (`memory_exhausted`)."""
         weights = self.host.weights
         if weights is None or weights.host_only:
             return 0
         need = max(need, weight_policy.MARGIN)
         weights.seed_activations({m: weights.activation.get(m, 0) + need for m in methods})
-        before = weights.allocatable()
-        weights.make_room(need, (), "a group call that ran out of memory")
+        before, op = weights.allocatable(), "a group call that ran out of memory"
+        if not weights.memory.free_for(need, op):
+            weights.memory.exhausted(need, op)
         return max(weights.allocatable() - before, 0)
 
     def _group_rerun(self, need: int) -> int:
@@ -1410,7 +1345,6 @@ class Executor:
             "working_peak_bytes": working,
             **({"result": result} if hosted else {}),
             "evidence": execution_evidence.record(
-                self.rank,
                 self._rank_identity(),
                 started_us,
                 execution_evidence.now_us(),
@@ -1932,11 +1866,6 @@ class Executor:
             **({"compiles": compiles} if compiles else {}),
         }
 
-    def warm(self, command: Warm) -> dict[str, Any]:
-        """An older worker's startup warm: its compiles start with the process now
-        (`_expect_kernels`) and launch checks run at construction."""
-        return {"ok": True, "ranks": [], "skipped": "compiles start with the process"}
-
     def _model_classes(self) -> list[type[Model[Any]]]:
         """The classes the package's constructed Model slots declare, wherever they are
         defined (a script's come from its libraries, not its entry module)."""
@@ -2283,12 +2212,6 @@ class Executor:
                 "detail": f"this executor is poisoned ({self.poisoned}); a poisoned "
                 "generation has no recovery edge to Ready — the worker replaces it",
             }
-        if not command.model_sources and any(row.binding.model_class for row in command.rows()):
-            return self._refusal(
-                "model_sources_ungranted",
-                "model-bearing loads require the machine's model source grant; "
-                "an installed TensorFS Store does not grant managed model access",
-            )
         sealed_devices = _SEALED.get("CUDA_VISIBLE_DEVICES", "")
         if command.devices != sealed_devices:
             # THE SEAL IS THE DEVICE SELECTION (cr-066). The worker names the lane it
@@ -2504,7 +2427,7 @@ class Executor:
         host = self.host
 
         def sourced(manifest: str) -> Callable[[str], bytes]:
-            """Read actual header/asset bytes supplied by TensorD (`Load.model_sources`).
+            """Read actual header/asset bytes supplied by TensorD (`ModelSource`).
             A follower uses rank 0's relay; this executor opens no Store."""
             return lambda name: host._model_source(manifest, name)
 
@@ -2553,14 +2476,6 @@ class Executor:
         model_cls = next(
             cls for cls in self._model_classes() if cls.__name__ == binding.model_class
         )
-        if callable(getattr(model_cls, "warm", None)) and model_cls not in _WARM_NOTED:
-            _WARM_NOTED.add(model_cls)
-            print(
-                f"[executor] {model_cls.__qualname__}.warm is not called: the call that waits "
-                "on a load pays its own first launches",
-                file=sys.stderr,
-                flush=True,
-            )
         config_checkpoint = next(
             (
                 checkpoint
@@ -2717,7 +2632,7 @@ class Executor:
                 exc if isinstance(exc, GroupRefusal) else GroupRefusal(str(exc))
             )
         stage("admission")
-        # An older Worker sends no `Budget`: its assigned ceiling bounds every stage instead.
+        # The load's ceiling bounds a stage's driver-derived budget when no `Budget` grants one.
         weights.ceiling = int(agreed) if isinstance(agreed, int) else -1
         artifact = Artifact(
             reference.snapshot,
@@ -2821,7 +2736,9 @@ class Executor:
         self.residency = WeightResidency(weights, backend.components, scopes, refine=backend.refine)
         object.__setattr__(model, "_cozy_residency", self.residency)
         # Its components' calls replay CUDA graphs once recorded (`graphs`), unless uncaptured.
-        graphs.install(model, {name: c.root for name, c in self.residency.components.items()})
+        graphs.install(
+            self.torch, model, {name: c.root for name, c in self.residency.components.items()}
+        )
         stage_memo.install(
             model,
             torch=torch,
@@ -3013,7 +2930,7 @@ class Executor:
             child._group_parent = self
             # The command with one model in place of its set: everything the machine said
             # about the load holds for each model (a field named one by one here was
-            # dropped twice: `model_sources`, then `device_weights`, so a construction
+            # dropped once: `device_weights`, so a construction
             # of two models never attached the machine's GPU weights).
             load = msgspec.structs.replace(
                 command,
@@ -3312,18 +3229,18 @@ class Executor:
         if isinstance(target, dict):
             return target
         target.handled = None
-        # Every attempt carries its grant; none (-1: an older Worker, or no reading) derives
-        # from the driver, so a cut to 0 never outlives the attempt that follows it. Only a
-        # grant that changed reaches the group's GPUs.
+        # The plane's budget derives from the driver at every attempt (TensorD sends none), so
+        # a cut to 0 never outlives the attempt that follows it. Only a grant that changed
+        # reaches the group's GPUs.
         if self.weights is not None and (
-            command.plane_budget_bytes != self.weights.budget
+            self.weights.budget != -1
             or command.cap_bytes != self.weights.cap
             or command.rank_caps != self.rank_caps
             or command.floor_bytes != self.weights.owner_floor
         ):
             granted = self.budget(
                 Budget(
-                    vram_bytes=command.plane_budget_bytes,
+                    vram_bytes=-1,
                     cap_bytes=command.cap_bytes,
                     rank_caps=command.rank_caps,
                     floor_bytes=command.floor_bytes,
@@ -3490,6 +3407,7 @@ class Executor:
             self.residency.open_attempt()
         if self.host.weights is not None:
             self.host.weights.modes.clear()
+            self.host.weights.memory.refusal = None
         if torch is not None:
             accel.reset_peak(torch, self.device_kind)
         allocated_at_start = accel.allocated(torch, self.device_kind) if torch is not None else 0
@@ -3734,7 +3652,9 @@ class Executor:
         # The BOUNDED observation tail and the O(1) time attribution cross the seam on every
         # path, success or fault. A failed attempt's log tail is the one triage most needs,
         # and cr-011 hoisted the record out of `invoke` precisely so it survives the failure.
-        shortfall = self.residency.last_shortfall if self.residency is not None else None
+        weights = self.host.weights
+        exhausted = weights is not None and outcome.code == MEMORY_EXHAUSTED
+        shortfall = weights.memory.refusal if exhausted and weights is not None else None
         return {
             "ok": True,
             "shortfall": shortfall,
@@ -4217,29 +4137,19 @@ class Executor:
                 "call interface inventory exceeds its bound", code="child_interface"
             )
         bindings: dict[tuple[str, str], _CallType] = {}
-        own = native_interfaces.bindings()
+        own = effect_interfaces.bindings()
         for row in rows:
-            interface, module, export = row.interface_digest, row.module, row.export
+            module, export = row.module, row.export
             if row.native_effect:
-                # Admission is per operation: the worker judged this one against what this
-                # Runtime stated at hello. One this Runtime lacks cannot be called from here.
-                native = own.get((module, export))
-                if native is None:
-                    continue
-                if row.request_fields is not None:
-                    native = dataclasses.replace(
-                        native, served_fields=frozenset(row.request_fields)
-                    )
-                if row.unavailable:
-                    native = dataclasses.replace(native, unavailable=row.unavailable[:1024])
-                bindings[(module, export)] = native
+                if module == effect_interfaces.MODULE and export in own:
+                    bindings[(module, export)] = own[export]
             elif row.builtin:
                 if row.builtin != "operations":
                     raise CapabilityError("unknown Runtime builtin", code="child_interface")
-                builtin_operations.validate_binding(interface, module, export)
+                builtin_operations.validate_binding(module, export)
                 describe(builtin_operations_app)
                 builtin = builtin_operations_app.get(export).surface
-                bindings[(module, export)] = _serving(interface, module, export, builtin)
+                bindings[(module, export)] = _serving(module, export, builtin)
             elif row.self_call:
                 assert self.discovered is not None
                 own_surface = next(
@@ -4254,7 +4164,7 @@ class Executor:
                     raise CapabilityError(
                         "self call is not a registered App export", code="child_interface"
                     )
-                bindings[(module, export)] = _serving(interface, module, export, own_surface)
+                bindings[(module, export)] = _serving(module, export, own_surface)
             else:
                 imported = importlib.import_module(module)
                 function = getattr(imported, export, None)
@@ -4268,7 +4178,7 @@ class Executor:
                         model_defaults=declared.defaults,
                         model_components=declared.components,
                     )
-                    binding = _serving("", module, export, registration.surface)
+                    binding = _serving(module, export, registration.surface)
                 else:
                     generated_binding = getattr(imported, "__cozy_bindings__", {}).get(export)
                     if not isinstance(generated_binding, _CallType):
@@ -4280,8 +4190,9 @@ class Executor:
                 if prior is not None and prior != binding:
                     raise CapabilityError("ambiguous managed export", code="child_interface")
                 bindings[(module, export)] = binding
-        for module, export in own.keys() - bindings.keys():
-            bindings[(module, export)] = native_interfaces.unserved(module, export)
+        for export in own:
+            key = (effect_interfaces.MODULE, export)
+            bindings.setdefault(key, effect_interfaces.unserved(export))
         return bindings
 
     def _publish(self, request: Publish) -> Published:
@@ -4384,7 +4295,7 @@ class Executor:
 
     def _stage_tier(self, plan: SealedPlan, regions: list[int]) -> list[int]:
         """Ask the machine to stage `regions` of `plan`'s layout (`SealedStage`); returns those
-        staged or staging (an older machine stages none: they keep reading the files)."""
+        staged or staging (none: they keep reading the files)."""
         body = canonical.write(msgspec.to_builtins(plan))
         memfd = plane.sealed_memfd("cozy-sealed-plan", body)
         try:
@@ -4438,10 +4349,8 @@ class Executor:
     def _device_room(self, free_bytes: int) -> None:
         """Ask the worker for `free_bytes` free on this GPU from its other tenants; it answers
         once they gave what they could, with this process's cap raised into that room when it
-        holds one (an older worker refuses, and nothing changes). An ask for no bytes is no
-        ask: the machine reads a byte count as unsigned."""
-        if free_bytes <= 0:
-            return
+        holds one (a refusal changes nothing). Only `Memory.ask` asks, and never for <= 0
+        bytes: the machine reads a byte count as unsigned."""
         held = self.weights._held()[1] if self.weights is not None else -1
         answer = self._durable(DeviceRoom(free_bytes=free_bytes, holding_bytes=held), Room)
         if answer.ok and answer.cap_bytes >= 0 and self.weights is not None:
@@ -4459,7 +4368,7 @@ class Executor:
         return fds
 
     def _budget_cell(self) -> budget_cell.Cell | None:
-        """Hand the worker this process's budget cell; None from an older worker."""
+        """Hand the worker this process's budget cell; None when it refuses."""
         cell, fd = budget_cell.Cell.create()
         try:
             answer = self._durable(BudgetCell(memfd=fd), Answer)
@@ -4471,8 +4380,8 @@ class Executor:
         return None
 
     def _child_events(self) -> int | None:
-        """The worker's nudge socket for this attempt's calls; None from an older worker, and
-        on Windows, whose event loop cannot watch a pipe: its calls are polled."""
+        """The worker's nudge socket for this attempt's calls; None when it refuses, and on
+        Windows, whose event loop cannot watch a pipe: its calls are polled."""
         if sys.platform == "win32":
             return None
         answer = self._durable(ChildEvents(), Handoff)
@@ -4675,39 +4584,6 @@ class Executor:
         recorded. The proof is the device's own: every stream is complete."""
         return accel.streams_idle(self.torch, self.device_kind)
 
-    def vacate(self, residents: bool = True, ranks: tuple[int, ...] = ()) -> dict[str, Any]:
-        """An older Worker's eviction, on `ranks` of a group (every rank when empty): unmap
-        every construction's weights. The bytes stay in the host tier, so the next stage
-        wants them back at link speed; the process stays Ready."""
-        if self.poisoned:
-            return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
-        chosen = set(ranks) if ranks else set(range(self.world))
-        followers = sorted(rank for rank in chosen if 0 < rank < self.world)
-
-        def own() -> int:
-            freed = 0
-            if (self.rank > 0 or 0 in chosen) and self.weights is not None and residents:
-                self._unpark()
-                freed = self.weights.vacate()
-            if self.torch is not None:
-                accel.release_cached(self.torch, self.device_kind)
-            return freed
-
-        freed, refused = self._followers(followers, Vacate(residents=residents), "vacate", own)
-        if refused:
-            return refused
-        return {
-            **self.probe(),
-            "vacated": {"freed": {}, "held": {}, "freed_bytes": freed},
-        }
-
-    def restore(self, names: tuple[str, ...] = ()) -> dict[str, Any]:
-        """An older Worker's refill: nothing to do, because every stage wants its own
-        weights back from the host tier as it starts."""
-        if self.poisoned:
-            return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
-        return {**self.probe(), "restored": {"restored": {}, "held": {}, "restored_bytes": 0}}
-
     def budget(self, command: Budget) -> dict[str, Any]:
         """The Worker's plane budgets for every rank of this process: lowering unmaps now."""
         if self.poisoned:
@@ -4776,7 +4652,7 @@ class Executor:
     ) -> DeviceTierAnswer:
         """The GPU regions the machine keeps for exactly this weight set's layout, with fds:
         its stored bytes, or with `variant` "*" its most recent baked variant (the answer
-        names it; an older machine names none, and its answer is not one). `held` is False
+        names it; an answer naming none is not one). `held` is False
         when it keeps none this process can map."""
         answer = self._durable(
             DeviceTier(name=name, layout=layout, device=device, variant=variant),
@@ -4855,11 +4731,8 @@ class Executor:
         }
 
     def _plane_ranks(self) -> list[int]:
-        """The follower GPUs that answer the plane's commands. One from before the plane
-        (its `hello` does not say so) keeps its weights its own way: no budget reaches it."""
-        if self.group is None:
-            return []
-        return [f.rank for f in self.group.followers if plane.CAPABILITY in f.memory]
+        """The follower GPUs, which answer the plane's commands."""
+        return [] if self.group is None else [f.rank for f in self.group.followers]
 
     def _unpark(self) -> None:
         """Close every construction's parked stage (a repeating method's open plan)."""
