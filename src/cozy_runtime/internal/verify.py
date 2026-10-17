@@ -54,7 +54,7 @@ def within(errors: dict[str, float], budget: float) -> Verdict:
     if not errors:
         return Verdict(False, "no case ran")
     worst = max(errors, key=lambda case: errors[case])
-    detail = f"rel L2 {errors[worst]:.2e} at {worst} (budget {budget:.0e}, {len(errors)} cases)"
+    detail = f"rel L2 {errors[worst]:.2e} at {worst} (budget {budget:g}, {len(errors)} cases)"
     return Verdict(errors[worst] <= budget, detail)
 
 
