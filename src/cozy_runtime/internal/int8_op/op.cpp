@@ -28,6 +28,12 @@
 namespace {
 
 using at::Tensor;
+// The int8 GEMM this build carries: its TMA family's, else mma.sync's (`gemm_sm80.cu`).
+#ifdef COZY_TMA
+namespace int8_family = cozy_int8::COZY_FAMILY;
+#else
+namespace int8_family = cozy_int8::mma_sync;
+#endif
 
 // One 8-bit operand format: its name in messages, its torch dtype, the K multiple it takes.
 struct Format {
@@ -114,13 +120,14 @@ cudaError_t gemm(const Format& f, const void* q, const float* scales, const Tens
     const bool half = is_half(out.scalar_type());
     if (f.type == at::kChar) {
         Scratch scratch{data.options().dtype(at::kByte), {}};
-        return cozy_int8::gemm(static_cast<const int8_t*>(q), data.const_data_ptr<int8_t>(),
-                               scales, scale.const_data_ptr<float>(), b, out.data_ptr(), half,
-                               int(M), N, K, sms, int(config), {&allocate, &scratch}, stream);
+        return int8_family::gemm(static_cast<const int8_t*>(q), data.const_data_ptr<int8_t>(),
+                                 scales, scale.const_data_ptr<float>(), b, out.data_ptr(), half,
+                                 int(M), N, K, sms, int(config), {&allocate, &scratch}, stream);
     }
 #ifdef COZY_FP8_GEMM
-    return cozy_int8::fp8_gemm(q, data.const_data_ptr(), scales, scale.const_data_ptr<float>(), b,
-                               out.data_ptr(), half, int(M), N, K, sms, int(config), stream);
+    return cozy_int8::COZY_FAMILY::fp8_gemm(q, data.const_data_ptr(), scales,
+                                            scale.const_data_ptr<float>(), b, out.data_ptr(), half,
+                                            int(M), N, K, sms, int(config), stream);
 #else
     return cudaErrorNotSupported;
 #endif

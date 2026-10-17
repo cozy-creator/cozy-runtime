@@ -17,7 +17,7 @@
 
 #include "int8.h"
 
-namespace cozy_int8 {
+namespace cozy_int8::mma_sync {
 namespace {
 
 using namespace cute;
@@ -289,4 +289,4 @@ cudaError_t gemm(const int8_t* q, const int8_t* w, const float* scales, const fl
                                                   config, workspace, stream);
 }
 
-}  // namespace cozy_int8
+}  // namespace cozy_int8::mma_sync

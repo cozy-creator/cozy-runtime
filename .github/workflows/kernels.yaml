@@ -1,0 +1,88 @@
+name: kernels
+# The cozy-kernels wheels (`kernels/`): every prebuilt kernel for every GPU target, one wheel per
+# OS and CPU, each checked for its tag, its declared targets, no torch and an import on every
+# Python it claims (checks/kernel_wheel.py). PRs that touch kernel sources run it. By hand:
+#   gh workflow run kernels.yaml -R cozy-creator/cozy-runtime -f ref=<tag|sha>
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or SHA to build
+        type: string
+        default: master
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        required: true
+  pull_request:
+    paths:
+      - kernels/**
+      - src/cozy_runtime/internal/int8_op/**
+      - checks/kernel_wheel.py
+      - .github/workflows/kernels.yaml
+  push:
+    tags: ['v*']
+run-name: kernels ${{ inputs.ref || github.head_ref || github.ref_name }}
+
+permissions:
+  contents: read
+
+# A newer push to the same ref replaces a build still running.
+concurrency:
+  group: kernels-${{ inputs.ref || github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # CUTLASS units peak at ~6 GB each: compile jobs sized by the runner's memory.
+          - {arch: x86_64, cuda: x86_64, runner: linux-x64-16core, jobs: 10}
+          # The arm64 larger runner has no docker; the standard one does.
+          - {arch: aarch64, cuda: sbsa, runner: ubuntu-24.04-arm, jobs: 1}
+    runs-on: ${{ matrix.runner }}
+    # Hang bound, not a work budget.
+    timeout-minutes: 240
+    env:
+      # glibc 2.28 and gcc-toolset-14: the wheel's floor is the floor it was compiled on.
+      IMAGE: quay.io/pypa/manylinux_2_28_${{ matrix.arch }}:2026.10.10-1
+      PLAT: manylinux_2_28_${{ matrix.arch }}
+      CUDA_REPO: https://developer.download.nvidia.com/compute/cuda/repos/rhel8/${{ matrix.cuda }}/cuda-rhel8.repo
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - name: Build and check the wheel
+        run: |
+          # TensorD's driver floor (public cozy repo), which the wheel's must equal.
+          curl -fsSL https://raw.githubusercontent.com/cozy-creator/cozy/master/crates/cozy-platform/src/gpu/mod.rs \
+            -o platform-gpu.rs
+          docker run --rm -v "$PWD:/src" -w /src -e PLAT -e CUDA_REPO -e HOST_OWNER="$(id -u):$(id -g)" \
+            -e CMAKE_BUILD_PARALLEL_LEVEL=${{ matrix.jobs }} "$IMAGE" bash -euo pipefail -c '
+              dnf install -y -q dnf-plugins-core && dnf config-manager --add-repo "$CUDA_REPO"
+              dnf install -y -q cuda-nvcc-13-0-13.0.88 cuda-cudart-devel-13-0-13.0.96 cuda-cuobjdump-13-0-13.0.85
+              export PATH=/usr/local/cuda-13.0/bin:$PATH
+              export CC=/opt/rh/gcc-toolset-14/root/usr/bin/gcc CXX=/opt/rh/gcc-toolset-14/root/usr/bin/g++
+              py=/opt/python/cp312-cp312/bin/python
+              $py -m pip install -q uv==0.12.7
+              time $py -m uv build --wheel --python $py --out-dir /tmp/raw kernels
+              auditwheel repair --plat "$PLAT" --only-plat -w dist /tmp/raw/*.whl
+              $py checks/kernel_wheel.py dist/*.whl "$PLAT" --python $py \
+                --python /opt/python/cp313-cp313/bin/python --python /opt/python/cp314-cp314/bin/python \
+                --platform-floor platform-gpu.rs
+              chown -R "$HOST_OWNER" dist
+            ' 2>&1 | tee build.log
+          exit "${PIPESTATUS[0]}"
+      - uses: astral-sh/setup-uv@v7
+      - name: Stable ABI only
+        run: uvx abi3audit==0.0.26 --strict --report dist/*.whl
+      - if: always()
+        run: grep -E '^(_gemm|FAILED|cozy_kernels|real)' build.log >> "$GITHUB_STEP_SUMMARY" || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cozy-kernels-${{ matrix.arch }}
+          path: dist/*.whl
+          if-no-files-found: error

@@ -2,7 +2,7 @@
 // The fp8-rowwise GEMM on TMA cards (`gemm_tma.cuh`): E4M3 operands, f32 accumulation.
 #include "gemm_tma.cuh"
 
-namespace cozy_int8 {
+namespace cozy_int8::COZY_FAMILY {
 namespace {
 
 using E4M3 = cutlass::float_e4m3_t;
@@ -68,4 +68,4 @@ cudaError_t fp8_gemm(const void* q, const void* w, const float* scales, const fl
                   bias, out, M, N, K, sms, stream);
 }
 
-}  // namespace cozy_int8
+}  // namespace cozy_int8::COZY_FAMILY

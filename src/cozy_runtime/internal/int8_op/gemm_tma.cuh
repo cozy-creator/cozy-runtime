@@ -43,7 +43,7 @@ inline CUresult encode_tiled(CUtensorMap* map, CUtensorMapDataType type, cuuint3
 
 #include "int8.h"
 
-namespace cozy_int8 {
+namespace cozy_int8::COZY_FAMILY {
 
 using namespace cute;
 using Pingpong = cutlass::gemm::KernelTmaWarpSpecializedPingpong;
@@ -180,4 +180,4 @@ cudaError_t launch(const Fn (&bf16)[Count], const Fn (&fp16)[Count], int config,
     return (out_half ? fp16 : bf16)[config](q, w, xs, ws, bias, out, M, N, K, sms, s);
 }
 
-}  // namespace cozy_int8
+}  // namespace cozy_int8::COZY_FAMILY
