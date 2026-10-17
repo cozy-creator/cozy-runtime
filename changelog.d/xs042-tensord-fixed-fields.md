@@ -1,0 +1,1 @@
+The executor no longer reads `Load.model_sources` or `Invoke.plane_budget_bytes`: every deployed TensorD sends sources with every model-bearing load and no plane budget (-1), so the `model_sources_ungranted` refusal and the budget field are gone.

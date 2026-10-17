@@ -2160,12 +2160,6 @@ class Executor:
                 "detail": f"this executor is poisoned ({self.poisoned}); a poisoned "
                 "generation has no recovery edge to Ready — the worker replaces it",
             }
-        if not command.model_sources and any(row.binding.model_class for row in command.rows()):
-            return self._refusal(
-                "model_sources_ungranted",
-                "model-bearing loads require the machine's model source grant; "
-                "an installed TensorFS Store does not grant managed model access",
-            )
         sealed_devices = _SEALED.get("CUDA_VISIBLE_DEVICES", "")
         if command.devices != sealed_devices:
             # THE SEAL IS THE DEVICE SELECTION (cr-066). The worker names the lane it
@@ -2381,7 +2375,7 @@ class Executor:
         host = self.host
 
         def sourced(manifest: str) -> Callable[[str], bytes]:
-            """Read actual header/asset bytes supplied by TensorD (`Load.model_sources`).
+            """Read actual header/asset bytes supplied by TensorD (`ModelSource`).
             A follower uses rank 0's relay; this executor opens no Store."""
             return lambda name: host._model_source(manifest, name)
 
@@ -2882,7 +2876,7 @@ class Executor:
             child._group_parent = self
             # The command with one model in place of its set: everything the machine said
             # about the load holds for each model (a field named one by one here was
-            # dropped twice: `model_sources`, then `device_weights`, so a construction
+            # dropped once: `device_weights`, so a construction
             # of two models never attached the machine's GPU weights).
             load = msgspec.structs.replace(
                 command,
@@ -3181,18 +3175,18 @@ class Executor:
         if isinstance(target, dict):
             return target
         target.handled = None
-        # Every attempt carries its grant; none (-1: no reading) derives
-        # from the driver, so a cut to 0 never outlives the attempt that follows it. Only a
-        # grant that changed reaches the group's GPUs.
+        # The plane's budget derives from the driver at every attempt (TensorD sends none), so
+        # a cut to 0 never outlives the attempt that follows it. Only a grant that changed
+        # reaches the group's GPUs.
         if self.weights is not None and (
-            command.plane_budget_bytes != self.weights.budget
+            self.weights.budget != -1
             or command.cap_bytes != self.weights.cap
             or command.rank_caps != self.rank_caps
             or command.floor_bytes != self.weights.owner_floor
         ):
             granted = self.budget(
                 Budget(
-                    vram_bytes=command.plane_budget_bytes,
+                    vram_bytes=-1,
                     cap_bytes=command.cap_bytes,
                     rank_caps=command.rank_caps,
                     floor_bytes=command.floor_bytes,

@@ -344,7 +344,6 @@ def test_an_on_demand_model_is_built_and_fetched_only_by_a_request_that_reads_it
         "devices": _SEALED.get("CUDA_VISIBLE_DEVICES", ""),
         "authorized_device_limit_bytes": 1 << 30,
         "models": models,
-        "model_sources": True,
         "sealed_tiers": True,
     }
     loaded = executor.load(msgspec.convert(load, Load))
