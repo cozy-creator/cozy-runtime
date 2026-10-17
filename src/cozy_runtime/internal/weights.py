@@ -396,8 +396,9 @@ class Weights:
         #: weights), innermost last; and the component whose block ran last
         self.running: list[str] = []
         self.last = ""
-        #: a read outside a module's forward is being mapped (`reading`)
-        self.mapping = False
+        #: how deep reads outside a module's forward are being mapped (`reading`): a LoRA bake
+        #: in a region such a read binds reads its overlay's factors, one level in
+        self.mapping = 0
         #: the plane is placing or giving room: an allocator refusal inside is its own to answer
         self.placing = False
         #: the bytes of the last allocator refusal `refused` unmapped weights for
@@ -1110,9 +1111,10 @@ class Weights:
         else the read is refused, and no kernel is ever handed its empty pointer."""
         opened = self.opened()
         held: list[tuple[Component, Region, Lease]] = []
-        if self.mapping:  # a read from inside the mapping of another: never a second one
-            raise _unbound_read(op, "inside another weight read's mapping")
-        self.mapping = True
+        if self.mapping >= NESTED_READS:  # a mapping that maps again, and again (run 2793)
+            raise _unbound_read(op, f"weight reads nested {self.mapping} deep")
+        self.mapping += 1
+        mapping = True
         try:
             bound_at_entry: set[int] = set()
             for standin in standins:
@@ -1148,12 +1150,13 @@ class Weights:
                         f"{len(held)} regions leased)",
                     )
                 real[id(standin)] = value.to(dtype=standin.dtype, device=standin.device)
-            self.mapping = False
+            self.mapping, mapping = self.mapping - 1, False
             yield Read(
                 real, tuple((r.bound, r.bound + r.span) for _, r, _ in held if r.bound is not None)
             )
         finally:
-            self.mapping = False
+            if mapping:
+                self.mapping -= 1
             for component, region, lease in reversed(held):
                 if region.index not in component.resident:
                     unbind(region)
@@ -1782,6 +1785,12 @@ def _unbound_type(torch: ModuleType) -> type:
                 )
 
     return Unbound
+
+
+#: Reads outside a module's forward mapped inside one another at most: a block read binds a
+#: region whose LoRA bake reads its overlay's factors (runs 10440, 10454). Deeper is a mapping
+#: that maps again without end (run 2793: `Tensor.to` retyping a stand-in under an OOM retry).
+NESTED_READS = 2
 
 
 def _unbound_read(op: str, why: str = "") -> ResidencyRefusal:
