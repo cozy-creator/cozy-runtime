@@ -110,7 +110,7 @@ jobs:
         uses: astral-sh/setup-uv@v7
       - name: Stable ABI only
         if: steps.cache.outputs.cache-hit != 'true'
-        run: uvx abi3audit==0.0.26 --strict --report modules/cozy_runtime/_kernels/*.so
+        run: uvx abi3audit==0.0.26 --strict --report --assume-minimum-abi3 3.12 modules/cozy_runtime/_kernels/*.so
       - if: steps.cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
@@ -199,7 +199,7 @@ jobs:
         uses: astral-sh/setup-uv@v7
       - name: Stable ABI only
         if: steps.cache.outputs.cache-hit != 'true'
-        run: uvx abi3audit==0.0.26 --strict --report (Get-ChildItem modules\cozy_runtime\_kernels\*.pyd).FullName
+        run: uvx abi3audit==0.0.26 --strict --report --assume-minimum-abi3 3.12 (Get-ChildItem modules\cozy_runtime\_kernels\*.pyd).FullName
         shell: pwsh
       - if: steps.cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
