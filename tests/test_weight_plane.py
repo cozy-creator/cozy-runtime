@@ -10,6 +10,7 @@ card, so run it under the shared GPU lock.
 from __future__ import annotations
 
 import ctypes
+import functools
 import gc
 import io
 import mmap
@@ -1086,15 +1087,16 @@ def test_decoded_copies_count_in_a_stages_budget(tmp_path: Path) -> None:
     assert ring < counted.ring
 
 
-def sdxl_unet() -> Any:
+def sdxl_unet(widths: tuple[int, int] = (64, 128)) -> Any:
     """SDXL's UNet architecture (convolutions, group norms, cross-attention transformer
-    blocks, text-time embeddings), small: what streams in SDXL, in fp16."""
+    blocks, text-time embeddings), small: what streams in SDXL, in fp16. SDXL's own first two
+    widths (320, 640) make blocks past a region's 2 MiB, so its finer grain holds less."""
     diffusers = pytest.importorskip("diffusers")
     return diffusers.UNet2DConditionModel(
         sample_size=32,
         down_block_types=("DownBlock2D", "CrossAttnDownBlock2D"),
         up_block_types=("CrossAttnUpBlock2D", "UpBlock2D"),
-        block_out_channels=(64, 128),
+        block_out_channels=widths,
         transformer_layers_per_block=(1, 2),
         attention_head_dim=(2, 4),
         cross_attention_dim=64,
@@ -1117,9 +1119,7 @@ def refined(model: Any, name: str) -> weight_policy.Layout:
 
 @on_card
 @pytest.mark.parametrize("pressure,fine", [(False, False), (True, False), (False, True)])
-def test_an_sdxl_unet_streams_bit_exact(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pressure: bool, fine: bool
-) -> None:
+def test_an_sdxl_unet_streams_bit_exact(tmp_path: Path, pressure: bool, fine: bool) -> None:
     """SDXL's UNet resident, then streamed through a tight budget, computes the same bits.
     Under pressure the streamed arm alone also has a ballast leaving only the plane's budget
     and the resident run's measured activations free, as physical ballast does in G4: every
@@ -1127,14 +1127,13 @@ def test_an_sdxl_unet_streams_bit_exact(
     can only be the kernels' choice under memory pressure. `fine`: the Worker's budget below
     its block floor moves it to the sub-block grain at the first call's first block, mid-stage
     with its common leased (cr-203 U5)."""
-    if fine:  # the sub-block grain of a UNet this small: units of at most 256 KiB
-        monkeypatch.setattr(weights_module, "REGION_LIMIT", 256 << 10)
+    factory = functools.partial(sdxl_unet, (320, 640) if fine else (64, 128))
     torch.manual_seed(11)
-    values = {k: v.float() * 0.05 for k, v in sdxl_unet().state_dict().items()}
+    values = {k: v.float() * 0.05 for k, v in factory().state_dict().items()}
     weights = Weights(torch, torch.device("cuda", 0), "cuda")
     weights.set_budget(-1, pinned=1 << 30)
     model = load(
-        weights, store_component(tmp_path, "unet", values), "unet", name="unet", factory=sdxl_unet
+        weights, store_component(tmp_path, "unet", values), "unet", name="unet", factory=factory
     )
     generator = torch.Generator(device="cuda").manual_seed(3)
     args = (
@@ -1329,6 +1328,7 @@ def test_memorys_rung_2_moves_the_running_stage_to_its_finest_grain(card: Any) -
         with torch.inference_mode():
             outputs = [model.stack(x)]  # resident whole
             # An op short of more than is free, which unmapping the resident set covers.
+            torch.cuda.empty_cache()
             assert weights.memory.free_for(weights.memory.free() + (32 << 20), "an op")
             assert not model.residency.components["stack"].fine
             outputs += [model.stack(x), model.stack(x)]
