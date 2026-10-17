@@ -204,13 +204,13 @@ def test_declared_bounds_of_any_size_describe_and_undeclared_kinds_publish_the_d
 
 FIT = """
 from cozy_runtime.author import AssetLimits, Assets
-Fit = VideoPreparation(
-    max_seconds=15, excess="truncate", max_short_edge=768, max_pixels=768 * 1344, max_fps=24,
-    audio=False,
-)
 Clips = Annotated[
-    Assets[Annotated[VideoAsset, AssetBound(max_decoded_bytes=1 << 30), Fit]],
+    Assets[Annotated[VideoAsset, AssetBound(max_decoded_bytes=1 << 30)]],
     AssetLimits(videos=1),
+    VideoPreparation(
+        max_seconds=15, excess="truncate", max_short_edge=768, max_pixels=768 * 1344, max_fps=24,
+        audio=False,
+    ),
 ]
 class Reference(msgspec.Struct):
     use_audio: bool = False
