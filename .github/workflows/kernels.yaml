@@ -21,8 +21,6 @@ on:
       - src/cozy_runtime/internal/int8_op/**
       - checks/kernel_wheel.py
       - .github/workflows/kernels.yaml
-  push:
-    tags: ['v*']
 run-name: kernels ${{ inputs.ref || github.head_ref || github.ref_name }}
 
 permissions:
