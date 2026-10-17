@@ -39,6 +39,7 @@ from cozy_kernels import _gemm, _norm
 code = _gemm.gemv(0, 0, False, 0, 0, 0, 0, False, 1, 8, 256, 0)
 assert code != 0, "a gemv ran with no GPU"
 assert _gemm.gemm(0, 3, False, 0, 0, 0, 0, 0, 0, False, 1, 8, 256, -1, None, 0) == 1
+assert _gemm.TMA == ("tma" not in sys.argv[2:]), f"_gemm.TMA is {_gemm.TMA}"
 assert callable(_norm.rms_rope_split_half)
 if "_fa3" not in sys.argv[2:]:
     from cozy_kernels import _fa3
@@ -92,7 +93,12 @@ def main() -> int:
     parser.add_argument("platform", help="the wheel's platform tag, e.g. manylinux_2_28_x86_64")
     parser.add_argument("--python", action="append", default=[], help="an interpreter to import on")
     parser.add_argument("--platform-floor", type=Path, help="cozy-platform's src/gpu/mod.rs")
-    parser.add_argument("--without", action="append", default=[], help="a module this wheel omits")
+    parser.add_argument(
+        "--without",
+        action="append",
+        default=[],
+        help="a module this wheel omits, or `tma`: CUTLASS's TMA GEMMs (_gemm's `sm_*a` cubins)",
+    )
     options = parser.parse_args()
     wheel: Path = options.wheel
     failed: list[str] = []
@@ -122,6 +128,8 @@ def main() -> int:
                 continue
             module = modules[0]
             cubin, ptx = embedded(module)
+            if name == "_gemm" and "tma" in options.without:
+                want = {**want, "cubin": tuple(t for t in want["cubin"] if not t.endswith("a"))}
             for kind, have, wanted in (("cubin", cubin, want["cubin"]), ("ptx", ptx, want["ptx"])):
                 if have != set(wanted):
                     failed.append(

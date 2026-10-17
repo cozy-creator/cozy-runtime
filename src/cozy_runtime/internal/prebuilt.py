@@ -328,9 +328,12 @@ def library(torch: ModuleType, index: int, sm: int) -> tuple[Prebuilt | None, st
         return None, ABSENT
     if not arch.families(sm):
         return None, f"sm{sm} has no tensor-core family"
+    carried = [family for family in arch.families(sm) if any(family in GEMM[f] for f in GEMM)]
+    if not carried:  # a Windows wheel has mma.sync only (cr-201)
+        return None, f"the cozy-kernels wheel has no {'/'.join(arch.families(sm))} GEMM"
     digest = artifact()
     reasons: list[str] = []
-    for family in arch.families(sm):
+    for family in carried:
         row = arch.row(sm, family)
         ops = Prebuilt(torch, index, family, sm in GEMM["fp8"].get(family, ()))
         formats = [f for f in (INT8, FP8) if getattr(row, f.name)]

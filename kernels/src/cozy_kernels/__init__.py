@@ -6,6 +6,8 @@ torch nor the Python version is a build input. A module carries a cubin for each
 the device before it serves; this package holds no policy.
 """
 
+from cozy_kernels import _gemm
+
 #: The CUDA toolkit the wheel is built with, and the oldest driver that runs it, per
 #: `sys.platform`. cozy-platform's `gpu` holds the same floor for TensorD's startup check.
 CUDA = "13.0"
@@ -43,8 +45,12 @@ ARCHS: dict[str, dict[str, tuple[str, ...]]] = {
 }
 
 #: The cards `_gemm.gemm` has a cubin for, by format and family; quantize and gemv run on every
-#: target above.
+#: target above. All but int8 on mma.sync are CUTLASS's TMA GEMMs, which a Windows wheel lacks
+#: (`_gemm.TMA`, cr-201): it carries none of `ARCHS`' arch-specific (`a`) cubins.
 GEMM: dict[str, dict[str, tuple[int, ...]]] = {
-    "int8": {"mma.sync": (80, 86, 89, 120, 121), "wgmma": (90,), "tcgen05": (100,)},
-    "fp8": {"mma.sync": (120, 121), "wgmma": (90,), "tcgen05": (100, 103)},
+    "int8": {
+        "mma.sync": (80, 86, 89, 120, 121),
+        **({"wgmma": (90,), "tcgen05": (100,)} if _gemm.TMA else {}),
+    },
+    "fp8": {"mma.sync": (120, 121), "wgmma": (90,), "tcgen05": (100, 103)} if _gemm.TMA else {},
 }

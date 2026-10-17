@@ -65,10 +65,16 @@ void* allocate(size_t bytes, void* context) {
     return at<void>(nb::cast<uintptr_t>(scratch.held.attr("data_ptr")()));
 }
 
+#ifdef COZY_TMA
 constexpr cozy_int8::Gemm* kInt8[] = {&cozy_int8::mma_sync::gemm, &cozy_int8::wgmma::gemm,
                                       &cozy_int8::tcgen05::gemm};
 constexpr cozy_int8::Fp8Gemm* kFp8[] = {&cozy_int8::mma_sync::fp8_gemm,
                                         &cozy_int8::wgmma::fp8_gemm, &cozy_int8::tcgen05::fp8_gemm};
+#else
+// Without CUTLASS's TMA GEMMs (an MSVC build): int8 on mma.sync only (`cozy_kernels.GEMM`).
+constexpr cozy_int8::Gemm* kInt8[] = {&cozy_int8::mma_sync::gemm, nullptr, nullptr};
+constexpr cozy_int8::Fp8Gemm* kFp8[] = {nullptr, nullptr, nullptr};
+#endif
 
 // The activation rows' width each format takes: the kernels index registers by it.
 bool fits(bool fp8, int K) { return K > 0 && K <= cozy_int8::kMaxK && K % (fp8 ? 16 : 256) == 0; }
@@ -114,6 +120,7 @@ int gemm(int device, int family, bool fp8, uintptr_t q, uintptr_t scales, uintpt
          uintptr_t w_scale, uintptr_t bias, uintptr_t out, bool out_half, int M, int N, int K,
          int config, nb::handle allocator, uintptr_t stream) {
     if (family < 0 || family > 2 || M < 1 || N < 1 || !fits(fp8, K)) return cudaErrorInvalidValue;
+    if (fp8 ? kFp8[family] == nullptr : kInt8[family] == nullptr) return cudaErrorNotSupported;
     const OnDevice guard(device);
     if (guard.error() != cudaSuccess) return guard.error();
     const int sms = sm_count(device);
@@ -134,6 +141,11 @@ NB_MODULE(_gemm, m) {
     m.attr("OUT_OF_MEMORY") = int(cudaErrorMemoryAllocation);
     m.attr("GEMV_ROWS") = cozy_int8::kGemvRows;
     m.attr("MAX_K") = cozy_int8::kMaxK;
+#ifdef COZY_TMA
+    m.attr("TMA") = true;
+#else
+    m.attr("TMA") = false;
+#endif
     m.def("error_name", [](int code) { return cudaGetErrorName(cudaError_t(code)); });
     m.def("quantize", &quantize, "device"_a, "fp8"_a, "x"_a, "x_half"_a, "q"_a, "scales"_a, "M"_a,
           "K"_a, "scale"_a, "shift"_a, "scale_stride"_a, "shift_stride"_a, "rows_per_entry"_a,
