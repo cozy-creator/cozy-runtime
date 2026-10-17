@@ -25,6 +25,9 @@ LIBRARY_ROOM = 64 << 20
 #: Device bytes left free on a GPU that drives a display: its compositor allocates as windows
 #: open, and a card held at a few MiB free froze a laptop (2026-10-01).
 DISPLAY_FLOOR = 512 << 20
+#: Host memory left to everything else on the machine (the OS, other processes, the page cache
+#: weights stream through) when this process's tensors move there under pressure.
+HOST_MARGIN = 1 << 30
 #: The event model's fixed costs: one copy's issue, and one block's acquire/release hook.
 COPY_OVERHEAD_S = 20e-6
 HOOK_S = 15e-6

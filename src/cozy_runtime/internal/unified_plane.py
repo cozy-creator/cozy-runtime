@@ -295,6 +295,17 @@ class UnifiedPlane:
     def device_sharing(self, device: int) -> bool:
         return False
 
+    def storages(self) -> set[int]:
+        """The resident regions' storages (`_cdata`): weights this plane places, never moved
+        off the device by a spill."""
+        with self.lock:
+            return {
+                int(r.tensor.untyped_storage()._cdata)
+                for ws in self.sets.values()
+                for r in ws._regions
+                if r.tensor is not None
+            }
+
     # -- budgets and residency
 
     def set_vram_budget(self, device: int, nbytes: int) -> Trim:
