@@ -466,8 +466,8 @@ requires-dist = [
     { name = "packaging", specifier = ">=24" },
     { name = "peft", marker = "extra == 'adapters'", specifier = ">=0.20,<0.21" },
     { name = "pillow", specifier = ">=12" },
-    { name = "tensorfs", specifier = ">=0.10,<0.11" },
-    { name = "tensorfs", marker = "extra == 'model-execution'", specifier = ">=0.10,<0.11" },
+    { name = "tensorfs", specifier = ">=0.10,<0.12" },
+    { name = "tensorfs", marker = "extra == 'model-execution'", specifier = ">=0.10,<0.12" },
     { name = "tokenizers", marker = "extra == 'adapters'", specifier = ">=0.23.1" },
     { name = "torch", marker = "extra == 'adapters'", specifier = ">=2.13" },
     { name = "torch", marker = "extra == 'corpus'", specifier = ">=2.13" },
@@ -485,7 +485,7 @@ dev = [
     { name = "pytest", specifier = ">=8.4" },
     { name = "pytest-split", specifier = ">=0.11.0" },
     { name = "ruff", specifier = ">=0.16" },
-    { name = "tensorfs", specifier = ">=0.10,<0.11" },
+    { name = "tensorfs", specifier = ">=0.10,<0.12" },
 ]
 diffusers = [
     { name = "diffusers", specifier = ">=0.40.0" },
