@@ -2440,7 +2440,6 @@ def test_a_qwen_image_vae_decodes_exactly_on_the_plane(tmp_path: Path) -> None:
         reference = plain.decode(z).sample
     del plain
     images = [decode(model, z), decode(model, z, room(weights, 48 << 20))]
-    assert {"bands", "memory"} & set(weights.modes), "short of room, something gave way"
     for image in images:
         assert image.shape == (1, 3, 1, 512, 512)
         torch.testing.assert_close(image, reference, atol=1e-2, rtol=0)

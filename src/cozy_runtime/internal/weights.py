@@ -1928,7 +1928,7 @@ def _ops_type(torch: ModuleType) -> type:
                     operands, op, memory = (*args, *kwargs.values()), str(func), weights.memory
                     need = short[0] or sum(t.nbytes for t in spill.stored(operands))
                     pins = pins or weights.pin(operands)
-                    if (now := memory.again(need, op, operands, seen, Rung.CACHES)) >= 0:
+                    if (now := memory.again(need, op, operands, seen, Rung.IDLE)) >= 0:
                         seen = now
                         continue
                     if up is not None:  # the call around it cuts itself (`Bands.attend`) first
