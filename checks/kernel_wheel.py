@@ -41,11 +41,14 @@ print(f"{sys.version.split()[0]}: gemv without a GPU -> {code} {_gemm.error_name
 def declared(package: Path, name: str) -> Any:
     """`cozy_kernels.<name>`, read from the source without running it."""
     for node in ast.parse((package / "__init__.py").read_text()).body:
-        target = node.target if isinstance(node, ast.AnnAssign) else None
-        if isinstance(node, ast.Assign) and len(node.targets) == 1:
-            target = node.targets[0]
-        if isinstance(target, ast.Name) and target.id == name and node.value is not None:
-            return ast.literal_eval(node.value)
+        if isinstance(node, ast.AnnAssign):
+            target, value = node.target, node.value
+        elif isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target, value = node.targets[0], node.value
+        else:
+            continue
+        if isinstance(target, ast.Name) and target.id == name and value is not None:
+            return ast.literal_eval(value)
     raise SystemExit(f"cozy_kernels declares no {name}")
 
 
