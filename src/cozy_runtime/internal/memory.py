@@ -11,6 +11,7 @@ from __future__ import annotations
 import gc
 import os
 import re
+import traceback
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import IntEnum
@@ -133,6 +134,17 @@ def reap(component: Component) -> bool:
             continue
         component.orphans.remove(cursor)
     return not component.orphans
+
+
+def _caller() -> str:
+    """Where the refused op was issued: the innermost frames outside torch and this ladder."""
+    frames = [
+        f
+        for f in traceback.extract_stack()[:-3]
+        if "/torch/" not in f.filename
+        and os.path.basename(f.filename) not in ("memory.py", "weights.py", "contextlib.py")
+    ]
+    return " < ".join(f"{os.path.basename(f.filename)}:{f.lineno} {f.name}" for f in frames[:-5:-1])
 
 
 class Memory:
@@ -280,7 +292,8 @@ class Memory:
         tried = self.summary() or "no rung gave bytes back"
         detail = (
             f"{op} needs {nbytes} B of device memory at once"
-            f"{f' ({why})' if why else ''}; {verdict}; ladder: {tried}; {ledger.text()}"
+            f"{f' ({why})' if why else ''}; {verdict}; ladder: {tried}; {ledger.text()}; "
+            f"issued from {_caller()}"
         )
         failure = MemoryExhausted(detail, op, nbytes, ledger, tried)
         self.refusal = failure.shortfall

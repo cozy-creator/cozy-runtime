@@ -1944,7 +1944,13 @@ def _ops_type(torch: ModuleType) -> type:
                         if out is not NotImplemented:
                             return out
                     if (seen := memory.again(need, op, operands, seen)) < 0:
-                        memory.exhausted(need, op, why)
+                        shapes = ", ".join(
+                            f"{t.dtype}{tuple(t.shape)}" for t in spill.stored(operands)
+                        )
+                        dtype = kwargs.get("dtype")
+                        memory.exhausted(
+                            need, f"{op}({shapes}{f' -> {dtype}' if dtype else ''})", why
+                        )
             finally:
                 for lease in pins:
                     lease.release()
