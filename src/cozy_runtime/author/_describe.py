@@ -218,7 +218,6 @@ def decode_bounds(name: str, payload_type: object, assets: AssetsBinding | None)
             )
 
 
-
 def _check_model(binding: ModelBinding) -> None:
     """The SOURCE clock over one model slot: syntax, placement and excluded surfaces only.
 
