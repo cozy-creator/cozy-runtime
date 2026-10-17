@@ -1,0 +1,1 @@
+A drafted LM decode whose head does not fit at home beside the model's decode set (Klein, its upsampler and the drafter on a 16 GB card) decodes graphed without drafting ("decoded without drafting") instead of through Transformers' loop (60 s a caption, run 10077).
