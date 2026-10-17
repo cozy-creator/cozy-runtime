@@ -68,7 +68,8 @@ function(gemm_unit name source targets)
 endfunction()
 
 # mma.sync carries PTX (`80` is SASS and PTX), which the driver compiles for a card none names.
-gemm_unit(rotate rotate.cu "80;86-real;89-real;90-real;100-real;103-real;120-real;121-real")
+set(EVERY "80;86-real;89-real;90-real;100-real;103-real;120-real;121-real")
+gemm_unit(rotate rotate.cu "${EVERY}")
 gemm_unit(int8_mma_sync gemm_sm80.cu "80;86-real;89-real;120-real;121-real" COZY_MMA_SYNC)
 gemm_unit(int8_wgmma gemm_tma.cu "90a-real" COZY_WGMMA)
 gemm_unit(int8_tcgen05 gemm_tma.cu "100a-real" COZY_TCGEN05)
@@ -129,3 +130,9 @@ if(COZY_FA3)
     kernel_module(_fa3 fa3.cpp fa3_units)
     target_include_directories(_fa3 PRIVATE "${FA3}" "${FA3_CUTLASS_DIR}/include")
 endif()
+
+# RMSNorm plus split-half RoPE (comfy-kitchen v0.2.31's, `csrc/norm/UPSTREAM.md`).
+add_library(rms_rope OBJECT csrc/norm/rms_rope.cu)
+set_target_properties(rms_rope PROPERTIES CUDA_ARCHITECTURES "${EVERY}")
+target_compile_options(rms_rope PRIVATE --expt-extended-lambda --use_fast_math)
+kernel_module(_norm norm.cpp rms_rope)

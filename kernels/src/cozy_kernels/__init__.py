@@ -36,6 +36,10 @@ ARCHS: dict[str, dict[str, tuple[str, ...]]] = {
     },
     # FlashAttention-3's forward runs on Hopper only (wgmma, TMA).
     "_fa3": {"cubin": ("sm_90a",), "ptx": ()},
+    "_norm": {
+        "cubin": ("sm_80", "sm_86", "sm_89", "sm_90", "sm_100", "sm_103", "sm_120", "sm_121"),
+        "ptx": ("compute_80",),
+    },
 }
 
 #: The cards `_gemm.gemm` has a cubin for, by format and family; quantize and gemv run on every
