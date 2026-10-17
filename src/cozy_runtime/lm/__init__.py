@@ -47,6 +47,7 @@ from cozy_runtime.author._context import CURRENT, Context
 from cozy_runtime.author._model import LANDED, PLACED, RELEASERS, WARNINGS, Building
 from cozy_runtime.author.kernels import KernelsUnavailable, Launch, Plan, TritonKernels
 from cozy_runtime.graphs import BYPASS, ROOM, capture, say
+from cozy_runtime.internal import spill
 from cozy_runtime.lm import _kernels
 
 try:
@@ -1477,6 +1478,12 @@ class _Engine:
             self._empty(slot)
         self.rows_index = torch.arange(capacity, device=device)
         self.flag = torch.zeros((size,), dtype=torch.bool, pin_memory=device.type == "cuda")
+        # Its steps read them under their graphs, outside the dispatch mode: they never leave.
+        held = [*fields.values(), self.rows_index]
+        for layer in (*cache.layers, *([draft] if self.draft is not None else [])):
+            for value in vars(layer).values():
+                held.extend(value.values() if isinstance(value, dict) else [value])
+        spill.native(torch, *held)
         self.views = {}
         self._forget()
         self.width = stops

@@ -888,10 +888,9 @@ class Weights:
             self.spilled_from = list(spill.TOTALS)
         want = need + weight_policy.MARGIN
         room = self.lockable(want)
-        placed = self.pool.storages() if self.pool is not None else ()
         with self.torch.utils._python_dispatch._disable_current_modes():
             moved = spill.spill(
-                self.torch, self._device(), want, operands, room, not self.unified, disk, placed
+                self.torch, self._device(), want, operands, room, not self.unified, disk
             )
         accel.release_cached(self.torch, self.kind)
         self.limit_torch()

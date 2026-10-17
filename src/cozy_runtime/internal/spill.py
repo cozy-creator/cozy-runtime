@@ -21,7 +21,7 @@ import os
 import tempfile
 import time
 from bisect import bisect_right
-from collections.abc import Callable, Collection, Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from functools import partial
@@ -78,6 +78,8 @@ class Off:
 
 #: every storage off its device, by `_cdata`
 OFF: dict[int, Off] = {}
+#: storages code outside the dispatch mode reads (`native`), by `_cdata`
+NATIVE: dict[int, StorageWeakRef] = {}
 
 
 def _size(nbytes: int) -> int:
@@ -161,6 +163,15 @@ def stored(values: Iterable[object]) -> Iterator[Tensor]:
             yield from stored([getattr(item, name) for name in flatten()[0]])
 
 
+def native(torch: ModuleType, *values: object) -> None:
+    """Code outside the dispatch mode reads these tensors' storages (a CUDA graph's static
+    inputs, an LM engine's buffers under its graphs, a plane's weights): they never leave the
+    device, since neither a pointer it holds nor a read it makes would follow them."""
+    for tensor in stored(values):
+        storage = tensor.untyped_storage()
+        NATIVE[int(storage._cdata)] = torch.multiprocessing.reductions.StorageWeakRef(storage)
+
+
 def began() -> None:
     """The outermost stage begins: what no op touches from now on may leave the device whole."""
     BEGAN[0] = _CLOCK[0] + 1
@@ -223,14 +234,12 @@ def spill(
     room: int,
     mapped: bool = True,
     disk: bool = False,
-    placed: Collection[int] = (),
 ) -> int:
     """Move this process's storages on `device` off it until `need` device bytes came back,
     least recently used first and `operands` last, taking at most `room` bytes of host memory
     (-1: unknown, as much as `need`): mapped while the host locks it (`mapped`), else out to
-    host memory, and, with `disk`, out to disk once the host can give no more. `placed`:
-    storages (`_cdata`) another owner places (a unified plane's weights). Returns the bytes
-    moved."""
+    host memory, and, with `disk`, out to disk once the host can give no more. Returns the
+    bytes moved."""
     if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
         return 0  # a capture can neither wait for the device nor copy from pageable memory
     PRESSED[0] = True
@@ -238,7 +247,7 @@ def spill(
     _sweep()
     _fence(torch, device)
     read = {int(t.untyped_storage()._cdata) for t in stored(operands) if t.device == device}
-    found = _found(torch, device, need, read, placed)
+    found = _found(torch, device, need, read)
     left, moved, disk = room if room >= 0 else need, 0, disk and room >= 0
     for key, storage in sorted(
         found.items(), key=lambda r: (r[0] in read, _last(r[0]), -r[1].nbytes())
@@ -330,7 +339,7 @@ def _fence(torch: ModuleType, device: Device) -> None:
 
 
 def _found(
-    torch: ModuleType, device: Device, need: int, read: set[int], placed: Collection[int]
+    torch: ModuleType, device: Device, need: int, read: set[int]
 ) -> dict[int, UntypedStorage]:
     """Storages torch's allocator holds on `device` for this process, by `_cdata`: in its own
     pool (a CUDA graph's pool holds what its graphs read) or, without segments, resizable."""
@@ -351,7 +360,7 @@ def _found(
             if storage is None or storage.device != device:
                 continue
             key = int(storage._cdata)
-            if key in found or key in placed or storage.nbytes() < SMALLEST:
+            if key in found or key in NATIVE or storage.nbytes() < SMALLEST:
                 continue
             if segments is None:
                 if not storage.resizable():
@@ -459,3 +468,5 @@ def _sweep() -> None:
     for key in [key for key, off in OFF.items() if off.ref.expired()]:
         if (file := OFF.pop(key).file) is not None:
             file.close()
+    for key in [key for key, ref in NATIVE.items() if ref.expired()]:
+        del NATIVE[key]

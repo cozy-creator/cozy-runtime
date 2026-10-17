@@ -29,6 +29,7 @@ def _pressed() -> Iterator[None]:
     yield
     spill.OFF.clear()
     spill.USED.clear()
+    spill.NATIVE.clear()
     spill.PRESSED[0] = False
 
 
@@ -37,12 +38,15 @@ def test_what_no_op_touched_this_stage_leaves_whole_and_comes_back_for_its_next_
     disk: bool,
 ) -> None:
     """An earlier stage's tensor leaves (to host memory, or to disk once the host can give no
-    more), its storage released; one this stage touched, and the op's own operand, stay. The
-    next op that reads it brings it back first, and it reads the same values."""
+    more), its storage released; one this stage touched, the op's own operand and one code
+    outside the mode reads (`native`: a graph's input) stay. The next op that reads it brings
+    it back first, and it reads the same values."""
     with _noting(torch, None, None):
         earlier = torch.arange(FLOATS, dtype=torch.float32)
         operand = torch.ones(FLOATS)
         live = torch.ones(FLOATS)
+        graphed = torch.ones(FLOATS)
+        spill.native(torch, graphed)
         spill.began()
         live.mul_(2)
         # as much as the two it may move: no other host tensor of this process is looked at
@@ -50,7 +54,8 @@ def test_what_no_op_touched_this_stage_leaves_whole_and_comes_back_for_its_next_
         moved = spill.spill(torch, CPU, need, (operand,), 0 if disk else need, False, disk)
         assert moved == 4 * FLOATS
         assert earlier.untyped_storage().nbytes() == 0, "its bytes left with it"
-        assert operand.untyped_storage().nbytes() == live.untyped_storage().nbytes() == 4 * FLOATS
+        kept = (operand, live, graphed)
+        assert all(t.untyped_storage().nbytes() == 4 * FLOATS for t in kept)
         off = spill.OFF[earlier.untyped_storage()._cdata]
         assert (off.file is not None) == disk and (off.host is None) == disk
         assert spill.TOTALS[5 if disk else 4] >= 4 * FLOATS

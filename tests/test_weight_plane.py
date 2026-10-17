@@ -1132,6 +1132,36 @@ def test_a_card_the_packages_tensors_fill_runs_its_stage_through_host_and_disk(
     assert not spill.OFF and not spill.PRESSED[0]
 
 
+@on_card
+def test_a_cast_over_half_the_hosts_room_lands_in_host_memory(card: Any) -> None:
+    """Run 10861, H3 ref2va_turbo 15 s on a 4090: a 12.76 GB `aten._to_copy` had no room on
+    the card, and its result was refused host memory at half of what the host could give. A
+    cast whose result is larger than that half, under a cap that leaves it no device room, now
+    runs in bands into host memory, up to what the host has beside its margin."""
+    weights = card.weights
+    x = torch.randn(3 << 29, device="cuda", dtype=torch.float16)  # 3 GiB; cast: 6 GiB
+    result = 2 * x.nbytes
+    available = proctree.host_memory().available
+    room = result + weight_policy.HOST_MARGIN + (1536 << 20)  # half of it is < `result`
+    if not room <= available < 64 << 30:
+        pytest.skip(f"{available} B on the host: not the room this cast is measured against")
+    ballast = torch.ones(available - room, dtype=torch.uint8)  # its pages are the host's
+    weights.measure_context()
+    weights.set_cap(max(weights.context_bytes, 0) + torch.cuda.memory_reserved() + (1 << 30))
+    try:
+        with weights.recovering():
+            y = x.float()
+            assert spill.hosted(y)
+            for part in (slice(0, 1 << 24), slice(-(1 << 24), None)):
+                assert torch.equal(y[part].half(), x[part])
+        assert "host memory" in weights.modes.get("bands", ""), weights.modes
+    finally:
+        weights.set_cap(-1)
+    del y, ballast
+    gc.collect()
+    spill.release(torch)
+
+
 def test_decoded_copies_count_in_a_stages_budget(tmp_path: Path) -> None:
     """A weight the card cannot run as stored (fp8 before sm89) is decoded into a float copy
     when its region binds. That copy is torch's memory beside the plane's stored bytes, so a

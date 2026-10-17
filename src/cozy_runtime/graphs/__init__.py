@@ -50,7 +50,7 @@ from typing import Any
 from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT
 from cozy_runtime.author._capture import _capture_clock
 from cozy_runtime.author._model import LANDED, PLACED, RELEASERS, WARNINGS, Building
-from cozy_runtime.internal import attention_ulysses
+from cozy_runtime.internal import attention_ulysses, spill
 
 #: Set while a mechanism runs its own graphs over a component (`cozy_runtime.lm`): its calls
 #: pass straight through.
@@ -333,6 +333,7 @@ def _record(
         recorder.pool, recorder.stream = torch.cuda.graph_pool_handle(), torch.cuda.Stream()
     reserved = torch.cuda.memory_reserved()
     inputs = [leaf.clone() if isinstance(leaf, torch.Tensor) else None for leaf in leaves]
+    spill.native(torch, inputs)  # its replays read them by address: they never leave
     static = [s if s is not None else v for s, v in zip(inputs, leaves, strict=True)]
     cargs, ckwargs = torch.utils._pytree.tree_unflatten(static, spec)
     outputs: list[Any] = []
