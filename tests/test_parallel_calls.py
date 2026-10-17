@@ -238,8 +238,8 @@ def test_leader_calls_real_follower_executors_twice(tmp_path: Path, degree: int,
             assert not is_h3 or impls <= {"flash", "efficient", "math"}
             execution = leader._execution("ref2va_dit=sdpa", None, 1, 2)
             assert execution["degree"] == degree
-            assert [row["rank"] for row in execution["ranks"]] == list(range(degree))
-            assert {row["attention"]["requested"] for row in execution["ranks"]} == {
+            assert len(execution["gpus"]) == degree and "ranks" not in execution
+            assert {row["attention"]["requested"] for row in execution["gpus"]} == {
                 "ref2va_dit=sdpa"
             }
             records.clear()

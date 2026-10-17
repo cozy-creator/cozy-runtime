@@ -259,8 +259,8 @@ def _host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[SimpleNam
             )
             assert reply["outcome"]["terminal"] == "succeeded", reply["outcome"]
             replies.append(reply)
-            [rank] = reply["execution"]["ranks"]
-            return dict(rank["attention"])
+            [gpu] = reply["execution"]["gpus"]
+            return dict(gpu["attention"])
 
         yield SimpleNamespace(
             construction=construction,
