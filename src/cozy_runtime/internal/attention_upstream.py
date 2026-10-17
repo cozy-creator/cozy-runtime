@@ -12,8 +12,7 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, Collection
 from importlib import import_module
-from types import ModuleType
-from typing import TYPE_CHECKING, Unpack
+from typing import TYPE_CHECKING, Protocol, Unpack
 
 if TYPE_CHECKING:
     from cozy_runtime.internal.attention_ulysses import PartialOptions
@@ -25,13 +24,20 @@ from cozy_runtime.internal.attention_ulysses import Local, Options
 
 # Optional dependencies are named under TYPE_CHECKING so base imports stay Torch-free.
 
-#: The loaded FlashAttention-3 snapshot (`kernels` loads it under a generated module name)
-#: and the build variant it came from.
-_FA3: ModuleType | None = None
+
+class FlashAttn3(Protocol):
+    """What serves FA3: upstream's `flash_attn_interface` or the wheel's (`prebuilt`)."""
+
+    @property
+    def flash_attn_func(self) -> Callable[..., object]: ...
+
+
+#: The loaded FlashAttention-3 and the build it came from.
+_FA3: FlashAttn3 | None = None
 _FA3_VARIANT = ""
 
 
-def bind_fa3(module: ModuleType, variant: str) -> None:
+def bind_fa3(module: FlashAttn3, variant: str) -> None:
     global _FA3, _FA3_VARIANT
     _FA3, _FA3_VARIANT = module, variant
 
@@ -172,7 +178,7 @@ def cudnn(
 # ------------------------------------------------------------------- FlashAttention 3 and 4
 
 
-def _fa3() -> ModuleType:
+def _fa3() -> FlashAttn3:
     if _FA3 is None:
         raise RuntimeError("flash-attn3 was dispatched before its snapshot was loaded")
     return _FA3

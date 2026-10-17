@@ -27,7 +27,7 @@ from functools import partial
 from importlib import import_module, util
 from pathlib import Path
 from types import ModuleType
-from typing import Any
+from typing import Any, cast
 
 import msgspec
 
@@ -586,7 +586,9 @@ def _resolve(candidate: Candidate, device: DeviceFacts, wait: bool = True) -> Re
                     f"{candidate.name}: Kitchen dense INT8 is unavailable",
                 )
         if candidate.local in (upstream.FA3, upstream.FA3_FP8):
-            upstream.bind_fa3(module, (artifact or {}).get("key", "environment"))
+            upstream.bind_fa3(
+                cast("upstream.FlashAttn3", module), (artifact or {}).get("key", "environment")
+            )
     if candidate.name in {"sol-attn", attention_sage2_fixed.SOL_NAME}:
         _sol_route(device)
         if device.kind == "cuda":
