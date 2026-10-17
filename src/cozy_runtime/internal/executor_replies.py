@@ -79,10 +79,6 @@ class PlaneFacts(msgspec.Struct, frozen=True, kw_only=True):
     cache_releases: int = 0
     cache_released_bytes: int = 0
     cache_released_by: dict[str, tuple[int, int]] = {}
-    #: Per stage method, the most room torch had at an entry of this request in which it
-    #: dropped its cache more than once: the owner keeps it for the request's shape and
-    #: gives it to later executors (`Invoke.squeezed_bytes`)
-    squeezed: dict[str, int] = {}
     #: components given back to make torch room since the process began, and their bytes
     paged_out: int = 0
     paged_out_bytes: int = 0

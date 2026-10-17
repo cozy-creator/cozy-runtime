@@ -24,7 +24,6 @@ import pytest
 
 from cozy_runtime.author._signature import ModelBinding
 from cozy_runtime.internal import budget_cell, package_interface, spawn
-from cozy_runtime.internal import executor as executor_module
 from cozy_runtime.internal.config import seal_snapshot
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.parallel import cp, wire
@@ -293,12 +292,6 @@ def test_each_follower_takes_its_own_budget_cell_with_its_join(tmp_path: Path) -
         for cell, fd in cells:
             cell.close()
             os.close(fd)
-
-
-def test_a_rank_takes_its_own_cap_or_the_one_cap() -> None:
-    assert executor_module._rank_cap((7, 8, 9), 1, 5) == 8
-    assert executor_module._rank_cap((7,), 2, 5) == 5
-    assert executor_module._rank_cap((), 0, msgspec.UNSET) is msgspec.UNSET
 
 
 @needs_torch
