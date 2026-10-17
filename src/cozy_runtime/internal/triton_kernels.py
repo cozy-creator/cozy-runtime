@@ -33,7 +33,7 @@ from cozy_runtime.author.kernels import (
     entry_key,
     readable,
 )
-from cozy_runtime.internal import kernel_cache, kernel_compile, tools
+from cozy_runtime.internal import kernel_cache, kernel_compile, nvfp4_linear, tools
 
 try:
     import torch
@@ -287,3 +287,6 @@ def ready(kernels: TritonKernels, *, device: object) -> Launch | None:
     launch = load(kernels, device=device)
     LANDED[0] += 1
     return launch
+
+
+nvfp4_linear.READY[:] = [ready]

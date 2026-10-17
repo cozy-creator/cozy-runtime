@@ -30,10 +30,11 @@ started process other device work can end a capture, so a failed one waits for t
 request). The plane drops
 every recording before it unmaps a weight for room (`release`).
 
-`capture(step, pool, stream)` is the recipe: on a side stream, in thread-local mode so the
+`capture(torch, step, pool, stream)` is the recipe: on a side stream, in thread-local mode so the
 plane's own threads keep working while it records, and outside Runtime's dispatch modes, whose
 out-of-memory recovery copies what an op writes into first, which a graph would then copy on
-every replay.
+every replay. `torch` is the torch module, passed in: this module imports no torch, so a session
+without a GPU, whose executor imports it too, never does.
 """
 
 from __future__ import annotations
@@ -50,13 +51,6 @@ from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT
 from cozy_runtime.author._capture import _capture_clock
 from cozy_runtime.author._model import LANDED, PLACED, RELEASERS, WARNINGS, Building
 from cozy_runtime.internal import attention_ulysses
-
-try:
-    import torch
-    from torch.utils import _pytree as pytree
-    from torch.utils._python_dispatch import _disable_current_modes
-except ImportError:  # pragma: no cover - the base package is torch-free
-    torch = None
 
 #: Set while a mechanism runs its own graphs over a component (`cozy_runtime.lm`): its calls
 #: pass straight through.
@@ -86,7 +80,7 @@ def say(key: str, line: str) -> None:
         print(line, file=sys.stderr)
 
 
-def capture(step: Callable[[], object], pool: Any, stream: Any) -> tuple[Any, str]:
+def capture(torch: Any, step: Callable[[], object], pool: Any, stream: Any) -> tuple[Any, str]:
     """`step` recorded as a CUDA graph into `pool` on `stream`: (graph, "") or (None, why).
     After a failure the pool is spent: the allocator keeps a released pool until its blocks
     are free, and a capture into it again trips its use count, so the next try takes a new one
@@ -96,7 +90,7 @@ def capture(step: Callable[[], object], pool: Any, stream: Any) -> tuple[Any, st
     current = torch.cuda.current_stream()
     stream.wait_stream(current)
     failure: BaseException | None = None
-    with _disable_current_modes(), torch.cuda.stream(stream):
+    with torch.utils._python_dispatch._disable_current_modes(), torch.cuda.stream(stream):
         try:
             graph.capture_begin(pool=pool, capture_error_mode="thread_local")
         except Exception as exc:
@@ -123,9 +117,10 @@ class _Recording:
     the attention implementations it serves (a replay reports them as a call would)."""
 
     def __init__(
-        self, graph: Any, inputs: list[Any], outputs: Any, layout: object, served: Any
+        self, torch: Any, graph: Any, inputs: list[Any], outputs: Any, layout: object, served: Any
     ) -> None:
-        self.graph, self.inputs, self.outputs, self.layout = graph, inputs, outputs, layout
+        self.torch, self.graph, self.inputs, self.outputs = torch, graph, inputs, outputs
+        self.layout = layout
         self.served = [(b, i) for b, impls in served.items() for i in impls]
 
     def __call__(self, leaves: list[Any]) -> Any:
@@ -135,8 +130,9 @@ class _Recording:
         self.graph.replay()
         for backend, implementation in self.served:
             attention_ulysses.record(backend, implementation)
-        return pytree.tree_map(
-            lambda v: v.clone() if isinstance(v, torch.Tensor) else v, self.outputs
+        tensor = self.torch.Tensor
+        return self.torch.utils._pytree.tree_map(
+            lambda v: v.clone() if isinstance(v, tensor) else v, self.outputs
         )
 
 
@@ -184,30 +180,28 @@ _RECORDERS: weakref.WeakKeyDictionary[Any, _Recorder] = weakref.WeakKeyDictionar
 _CLASSES: dict[type, type] = {}
 
 
-def install(model: object, roots: Mapping[str, Any]) -> list[str]:
+def install(torch: Any, model: object, roots: Mapping[str, Any]) -> list[str]:
     """Record and replay the calls of each of `model`'s component roots (`roots`, name -> module)
     the Model class does not declare `@uncaptured`. Returns the components installed."""
-    if torch is None:
-        return []
     skipped = set(getattr(type(model), "__uncaptured__", ()))
     installed = []
     for name, root in roots.items():
         if name in skipped or not isinstance(root, torch.nn.Module):
             continue
         if not getattr(type(root), "_cozy_graphed", False):
-            root.__class__ = _graphed(type(root))
+            root.__class__ = _graphed(torch, type(root))
         installed.append(name)
     return installed
 
 
-def _graphed(cls: type) -> type:
+def _graphed(torch: Any, cls: type) -> type:
     """`cls` with a `__call__` that replays recordings: the same name, a subclass of it."""
     made = _CLASSES.get(cls)
     if made is None:
         call = cls.__call__
 
         def __call__(self: Any, *args: Any, **kwargs: Any) -> Any:
-            return _dispatch(self, call, args, kwargs)
+            return _dispatch(torch, self, call, args, kwargs)
 
         made = _CLASSES[cls] = type(
             cls.__name__,
@@ -236,10 +230,10 @@ def release() -> bool:
 RELEASERS.append(release)
 
 
-def _dispatch(module: Any, call: Callable[..., Any], args: Any, kwargs: Any) -> Any:
+def _dispatch(torch: Any, module: Any, call: Callable[..., Any], args: Any, kwargs: Any) -> Any:
     if BYPASS.get() or not torch.cuda.is_available() or torch.cuda.is_current_stream_capturing():
         return call(module, *args, **kwargs)
-    leaves, spec = pytree.tree_flatten((args, kwargs))
+    leaves, spec = torch.utils._pytree.tree_flatten((args, kwargs))
     why = (
         "with gradients"
         if torch.is_grad_enabled()
@@ -249,7 +243,7 @@ def _dispatch(module: Any, call: Callable[..., Any], args: Any, kwargs: Any) -> 
         if _capture_clock.get() is not None
         else "across GPUs"
         if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1
-        else _unplain(leaves)
+        else _unplain(torch, leaves)
     )
     if why:
         placed = PLACED.get(module)
@@ -261,7 +255,7 @@ def _dispatch(module: Any, call: Callable[..., Any], args: Any, kwargs: Any) -> 
         recorder = _RECORDERS[module] = _Recorder()
     if recorder.landed != LANDED[0]:
         recorder.forget()
-    key = _signature(module, leaves, spec)
+    key = _signature(torch, leaves, spec)
     placed = PLACED.get(module)
     if key in recorder.failed:
         if placed is not None:
@@ -279,7 +273,7 @@ def _dispatch(module: Any, call: Callable[..., Any], args: Any, kwargs: Any) -> 
         recorder.need[key] = torch.cuda.memory_reserved() - before
         torch.cuda.synchronize()
         took = time.perf_counter() - started
-        if not _clonable(out):
+        if not _clonable(torch, out):
             _chose(recorder, key, "its output", f"a {type(out).__name__}")
         elif launched < HOST_BOUND * took:
             _chose(recorder, key, "GPU-bound", f"launched in {launched:.3f} of {took:.3f} s")
@@ -312,7 +306,7 @@ def _dispatch(module: Any, call: Callable[..., Any], args: Any, kwargs: Any) -> 
             recorder.detail = f"no room: {free >> 20} MiB free, it allocates {need >> 20} MiB"
             placed[0].note(f"{placed[1]}.graphs", _facts(recorder))
             return call(module, *args, **kwargs)
-        entry = _record(module, call, leaves, spec, recorder, key, layout, placed)
+        entry = _record(torch, module, call, leaves, spec, recorder, key, layout, placed)
         if entry is None:
             return call(module, *args, **kwargs)
     recorder.replays += 1
@@ -322,6 +316,7 @@ def _dispatch(module: Any, call: Callable[..., Any], args: Any, kwargs: Any) -> 
 
 
 def _record(
+    torch: Any,
     module: Any,
     call: Callable[..., Any],
     leaves: list[Any],
@@ -339,25 +334,25 @@ def _record(
     reserved = torch.cuda.memory_reserved()
     inputs = [leaf.clone() if isinstance(leaf, torch.Tensor) else None for leaf in leaves]
     static = [s if s is not None else v for s, v in zip(inputs, leaves, strict=True)]
-    cargs, ckwargs = pytree.tree_unflatten(static, spec)
+    cargs, ckwargs = torch.utils._pytree.tree_unflatten(static, spec)
     outputs: list[Any] = []
     pool = recorder.pool
     try:
         graph, why = capture(
-            lambda: outputs.append(call(module, *cargs, **ckwargs)), pool, recorder.stream
+            torch, lambda: outputs.append(call(module, *cargs, **ckwargs)), pool, recorder.stream
         )
     except Building as building:  # as written until a kernel lands: `forget` tries again
         graph, why, recorder.pool = None, "", None  # the aborted capture spent its pool
         _chose(recorder, key, "kernel building", f"{building} builds; it records once one lands")
-    if graph is not None and not _clonable(outputs[0]):
+    if graph is not None and not _clonable(torch, outputs[0]):
         graph, why = None, f"its output {type(outputs[0]).__name__} is not a tree of tensors"
     if graph is not None:
         graph.replay()
-        replayed = _floats(outputs[0])
+        replayed = _floats(torch, outputs[0])
         written: list[Any] = []
         with attention_ulysses.observing() as served:
-            written_s = _seconds(lambda: written.append(call(module, *cargs, **ckwargs)))
-        written = _floats(written[0])
+            written_s = _seconds(torch, lambda: written.append(call(module, *cargs, **ckwargs)))
+        written = _floats(torch, written[0])
         error = _distance(replayed, written)
         if LANDED[0] != landed:
             graph, why = None, ""  # a kernel landed meanwhile: the next call starts over
@@ -370,7 +365,7 @@ def _record(
                 f"its first replay is {error:.2e} from the call run as written (by output: {each})"
             )
             graph = None
-        elif (replay_s := _seconds(graph.replay)) > PAYS * written_s:
+        elif (replay_s := _seconds(torch, graph.replay)) > PAYS * written_s:
             graph, why = None, ""  # as fast as written: not worth its memory
             _chose(
                 recorder, key, "no faster", f"replay {replay_s:.4f} s, {written_s:.4f} s as written"
@@ -395,7 +390,7 @@ def _record(
                 ("a CUDA graph was not used", {"module": type(module).__name__, "why": why})
             )
         return None
-    entry = _Recording(graph, inputs, outputs[0], layout, served)
+    entry = _Recording(torch, graph, inputs, outputs[0], layout, served)
     if recorder.pool is pool:  # else the plane released the pool for room meanwhile
         recorder.pool_bytes += max(torch.cuda.memory_reserved() - reserved, 0)
         recorder.recordings[key] = entry
@@ -417,7 +412,7 @@ def _facts(recorder: _Recorder) -> str:
     )
 
 
-def _seconds(step: Callable[[], object]) -> float:
+def _seconds(torch: Any, step: Callable[[], object]) -> float:
     torch.cuda.synchronize()
     started = time.perf_counter()
     step()
@@ -425,7 +420,7 @@ def _seconds(step: Callable[[], object]) -> float:
     return time.perf_counter() - started
 
 
-def _unplain(leaves: list[Any]) -> str:
+def _unplain(torch: Any, leaves: list[Any]) -> str:
     """Why a call's arguments cannot be replayed into, or ""."""
     tensors = [leaf for leaf in leaves if isinstance(leaf, torch.Tensor)]
     if not tensors:
@@ -441,8 +436,8 @@ def _unplain(leaves: list[Any]) -> str:
     return ""
 
 
-def _floats(out: Any) -> list[Any]:
-    return [v.float() for v in pytree.tree_leaves(out) if isinstance(v, torch.Tensor)]
+def _floats(torch: Any, out: Any) -> list[Any]:
+    return [v.float() for v in torch.utils._pytree.tree_leaves(out) if isinstance(v, torch.Tensor)]
 
 
 def _distance(a: list[Any], b: list[Any]) -> float:
@@ -453,9 +448,9 @@ def _distance(a: list[Any], b: list[Any]) -> float:
     )
 
 
-def _clonable(out: Any) -> bool:
+def _clonable(torch: Any, out: Any) -> bool:
     """Whether every leaf of `out` is a tensor or a plain value, so a replay can hand clones."""
-    leaves, _ = pytree.tree_flatten(out)
+    leaves, _ = torch.utils._pytree.tree_flatten(out)
     return any(isinstance(v, torch.Tensor) for v in leaves) and all(
         isinstance(v, torch.Tensor) or type(v) in _PLAIN for v in leaves
     )
@@ -473,7 +468,7 @@ def _structure(module: Any) -> tuple[object, ...]:
     return tuple(rows)
 
 
-def _signature(module: Any, leaves: list[Any], spec: Any) -> tuple[object, ...]:
+def _signature(torch: Any, leaves: list[Any], spec: Any) -> tuple[object, ...]:
     """The tensors' geometry and every other argument by value."""
     key: list[object] = [str(spec)]
     for leaf in leaves:

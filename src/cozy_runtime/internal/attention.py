@@ -799,6 +799,9 @@ def _trees(roots: Mapping[str, object]) -> Iterator[tuple[str, Any]]:
 
 def _attention_records(roots: Mapping[str, object]) -> Iterator[_Record]:
     """All Diffusers attention processors, including those with no backend dispatch."""
+    trees = list(_trees(roots))
+    if not trees:  # a weightless call has none, and imports no Diffusers (or torch) to say so
+        return
     try:
         from diffusers.models.attention import AttentionModuleMixin
         from diffusers.models.attention_processor import Attention, MochiAttention
@@ -806,7 +809,7 @@ def _attention_records(roots: Mapping[str, object]) -> Iterator[_Record]:
         return
     classes = (Attention, MochiAttention, AttentionModuleMixin)
     seen: set[int] = set()
-    for component, tree in _trees(roots):
+    for component, tree in trees:
         for path, module in tree.named_modules():
             processor = getattr(module, "processor", None)
             if id(module) not in seen and isinstance(module, classes) and processor is not None:

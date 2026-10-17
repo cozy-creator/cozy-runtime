@@ -2684,7 +2684,9 @@ class Executor:
         self.residency = WeightResidency(weights, backend.components, scopes, refine=backend.refine)
         object.__setattr__(model, "_cozy_residency", self.residency)
         # Its components' calls replay CUDA graphs once recorded (`graphs`), unless uncaptured.
-        graphs.install(model, {name: c.root for name, c in self.residency.components.items()})
+        graphs.install(
+            self.torch, model, {name: c.root for name, c in self.residency.components.items()}
+        )
         stage_memo.install(
             model,
             torch=torch,
