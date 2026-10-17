@@ -310,6 +310,14 @@ RELEASERS: list[Callable[[], bool]] = []
 #: Kernel builds this process loaded after it started (a boot build landing): calls may take a
 #: faster path from each on, so graphs record them again. None loads while a graph records.
 LANDED: list[int] = [0]
+
+
+class Building(Exception):
+    """Raised in a CUDA graph capture by a call whose kernel is still building and whose
+    stand-in cannot record: a recording now would only bake a slower path, so the graphs module
+    records once a kernel lands (`LANDED`)."""
+
+
 #: Warnings Runtime's speed mechanisms raise (a graph that would not record or replayed wrong),
 #: as (message, fields): the executor puts each in the run it served and clears them.
 WARNINGS: list[tuple[str, dict[str, str | bool | int | float | None]]] = []

@@ -48,7 +48,7 @@ from typing import Any
 
 from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT
 from cozy_runtime.author._capture import _capture_clock
-from cozy_runtime.author._model import LANDED, PLACED, RELEASERS, WARNINGS
+from cozy_runtime.author._model import LANDED, PLACED, RELEASERS, WARNINGS, Building
 from cozy_runtime.internal import attention_ulysses
 
 try:
@@ -111,6 +111,8 @@ def capture(step: Callable[[], object], pool: Any, stream: Any) -> tuple[Any, st
             except Exception as exc:
                 failure = failure or exc
     current.wait_stream(stream)
+    if isinstance(failure, Building):
+        raise failure
     if failure is not None:
         return None, f"{type(failure).__name__}: {failure}".splitlines()[0][:300]
     return graph, ""
@@ -340,9 +342,13 @@ def _record(
     cargs, ckwargs = pytree.tree_unflatten(static, spec)
     outputs: list[Any] = []
     pool = recorder.pool
-    graph, why = capture(
-        lambda: outputs.append(call(module, *cargs, **ckwargs)), pool, recorder.stream
-    )
+    try:
+        graph, why = capture(
+            lambda: outputs.append(call(module, *cargs, **ckwargs)), pool, recorder.stream
+        )
+    except Building as building:  # as written until a kernel lands: `forget` tries again
+        graph, why, recorder.pool = None, "", None  # the aborted capture spent its pool
+        _chose(recorder, key, "kernel building", f"{building} builds; it records once one lands")
     if graph is not None and not _clonable(outputs[0]):
         graph, why = None, f"its output {type(outputs[0]).__name__} is not a tree of tensors"
     if graph is not None:

@@ -27,7 +27,7 @@ from types import ModuleType
 from typing import cast
 
 from cozy_runtime.author._errors import is_device_oom
-from cozy_runtime.author._model import LANDED, WARNINGS
+from cozy_runtime.author._model import LANDED, WARNINGS, Building
 from cozy_runtime.author.kernels import INT8_CONVROT, PreQuantized, readable
 from cozy_runtime.internal import arch, kernel_cache, kernel_compile, kernel_sources
 from cozy_runtime.internal.encoding.formats import CONVROT_GROUP, Tensor, hadamard256
@@ -216,15 +216,19 @@ def linear(
             op = native(torch, index)
             if op is not None:
                 return op(x, data, scale, bias, out_dtype), OP
-            # comfy-kitchen's GEMM ends a CUDA graph capture (run 10264, sm86): one records eager.
-            capturing = torch.cuda.is_current_stream_capturing()
-            module = None if capturing else kitchen(torch, index)
+            if torch.cuda.is_current_stream_capturing():
+                # comfy-kitchen's GEMM ends a capture (run 10264) and a recording of the eager law
+                # replays 5x slower than kitchen as written (run 10287): record once the op lands.
+                raise Building(OP)
+            module = kitchen(torch, index)
             if module is not None:
                 with readable(data, scale, bias) as (d, s, b):
                     out = module.int8_linear(
                         x, d, s, b, out_dtype, convrot=True, convrot_groupsize=CONVROT_GROUP
                     )
                 return out, ARTIFACT
+    except Building:
+        raise
     except Exception as exc:  # eager serves this call
         failed(OP if op is not None else ARTIFACT, index, exc)
     out = eager(torch, x, data, scale, out_dtype)
