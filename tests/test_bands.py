@@ -31,7 +31,7 @@ class Card:
     """The executor's memory as bands read it: `room` bytes free, nothing to unmap, no host
     memory to put a result in."""
 
-    grouped = unified = False
+    unified = False
 
     def __init__(self, room: int) -> None:
         self.torch, self.device, self.room = torch, torch.device("cpu"), room

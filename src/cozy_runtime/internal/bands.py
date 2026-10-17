@@ -397,9 +397,10 @@ class Bands:
         return cast("AbstractContextManager[Any]", self.torch.cuda.stream(self.streams[turn % 2]))
 
     def _hostable(self, nbytes: int) -> bool:
-        """Whether a result of `nbytes` may live in host memory (never a group's, and never on
-        unified memory, where the host's is the device's)."""
-        if self.weights.grouped or self.weights.unified:
+        """Whether a result of `nbytes` may live in host memory (never on unified memory, where
+        the host's is the device's). A group GPU's too: it stays a CUDA tensor, which kernels
+        and collectives read over the bus."""
+        if self.weights.unified:
             return False
         lockable = self.weights.lockable(nbytes)
         return lockable < 0 or nbytes <= lockable
