@@ -6,7 +6,7 @@
 
 #include "gemm_tma.cuh"
 
-namespace cozy_int8 {
+namespace cozy_int8::COZY_FAMILY {
 namespace {
 
 #ifdef COZY_TCGEN05
@@ -50,4 +50,4 @@ cudaError_t gemm(const int8_t* q, const int8_t* w, const float* scales, const fl
                   out, M, N, K, sms, stream);
 }
 
-}  // namespace cozy_int8
+}  // namespace cozy_int8::COZY_FAMILY

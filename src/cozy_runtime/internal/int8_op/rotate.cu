@@ -245,12 +245,7 @@ __device__ __forceinline__ void apply_prologue(const Prologue& p, int row, int t
 
 // The TMA GEMMs (wgmma, tcgen05, block-scaled mma.sync's fp8) launch as programmatic dependents
 // of this kernel: they start their prologue as soon as every block here has begun, and wait
-// for this grid before reading.
-#if defined(COZY_TMA) || defined(COZY_FP8_GEMM)
-constexpr bool kDependentGemm = true;
-#else
-constexpr bool kDependentGemm = false;
-#endif
+// for this grid before reading. Before any other kernel the signal does nothing.
 
 // blockDim (32 * tiles, rows): each warp holds one tile of its row in registers across the
 // barriers, where the row's warps exchange their sums (a prologue's norm) and maxima.
@@ -259,7 +254,7 @@ __global__ void __launch_bounds__(1024) quantize_kernel(
     const T* __restrict__ x, void* __restrict__ q, float* __restrict__ scales, int M, int K,
     const Prologue prologue) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-    if constexpr (kDependentGemm) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
 #endif
     __shared__ float partial[kPrologue ? 96 : 32];
     const int tiles = blockDim.x >> 5, tile = threadIdx.x >> 5, lane = threadIdx.x & 31;

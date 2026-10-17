@@ -56,17 +56,41 @@ cudaError_t fp8_quantize(const void* x, bool x_half, void* q, float* scales, int
 cudaError_t gemv(const void* x, bool x_half, const int8_t* w, const float* w_scale, const void* bias,
           void* out, bool out_half, int M, int N, int K, int sms, cudaStream_t stream);
 
-// D[M, N] = (q @ w.T) * scales[m] * w_scale[n] + bias[n] on this build's card; `config` < 0
-// picks the tile by shape, else names one (a sweep); cudaErrorNotSupported when that tile
-// cannot take the problem.
-cudaError_t gemm(const int8_t* q, const int8_t* w, const float* scales, const float* w_scale,
-          const void* bias, void* out, bool out_half, int M, int N, int K, int sms, int config,
-          Workspace workspace, cudaStream_t stream);
+// D[M, N] = (q @ w.T) * scales[m] * w_scale[n] + bias[n]; `config` < 0 picks the tile by shape,
+// else names one (a sweep); cudaErrorNotSupported when that tile cannot take the problem.
+using Gemm = cudaError_t(const int8_t* q, const int8_t* w, const float* scales,
+                         const float* w_scale, const void* bias, void* out, bool out_half, int M,
+                         int N, int K, int sms, int config, Workspace workspace,
+                         cudaStream_t stream);
 
 // The same epilogue on E4M3 operands, f32 accumulation: wgmma on Hopper, tcgen05 on datacenter
-// Blackwell, RTX 50's TMA mma. Only builds that define COZY_FP8_GEMM carry it.
-cudaError_t fp8_gemm(const void* q, const void* w, const float* scales, const float* w_scale,
-                     const void* bias, void* out, bool out_half, int M, int N, int K, int sms,
-                     int config, cudaStream_t stream);
+// Blackwell, RTX 50's TMA mma.
+using Fp8Gemm = cudaError_t(const void* q, const void* w, const float* scales,
+                            const float* w_scale, const void* bias, void* out, bool out_half,
+                            int M, int N, int K, int sms, int config, cudaStream_t stream);
+
+// Each tensor-core family's GEMMs, compiled for that family's targets only and kept apart by
+// namespace, so one module can link every family (`kernels/`). A unit names its family by its
+// define (`COZY_FAMILY`); `gemm_sm80.cu` is always mma.sync's int8.
+namespace mma_sync {
+Gemm gemm;
+Fp8Gemm fp8_gemm;
+}  // namespace mma_sync
+namespace wgmma {
+Gemm gemm;
+Fp8Gemm fp8_gemm;
+}  // namespace wgmma
+namespace tcgen05 {
+Gemm gemm;
+Fp8Gemm fp8_gemm;
+}  // namespace tcgen05
 
 }  // namespace cozy_int8
+
+#if defined(COZY_TCGEN05)
+#define COZY_FAMILY tcgen05
+#elif defined(COZY_WGMMA)
+#define COZY_FAMILY wgmma
+#else
+#define COZY_FAMILY mma_sync
+#endif
