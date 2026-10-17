@@ -176,11 +176,12 @@ def test_sage2_selects_upstreams_mode_by_the_querys_row(monkeypatch: pytest.Monk
     assert upstream.SAGE.impl(Query()) == (
         "sageattn_qk_int8_pv_fp8_cuda(per_thread, fp32+fp16, smooth_k)"
     )
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (12, 0))
-    assert upstream.SAGE.impl(Query()) == (
-        "sageattn_qk_int8_pv_fp8_cuda(per_warp, fp32+fp16, smooth_k)"
-    )
-    with pytest.raises(ValueError, match="no mode for sm120"):
+    for card in ((12, 0), (12, 1)):
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_, c=card: c)
+        assert upstream.SAGE.impl(Query()) == (
+            "sageattn_qk_int8_pv_fp8_cuda(per_warp, fp32+fp16, smooth_k)"
+        )
+    with pytest.raises(ValueError, match="no mode for sm121"):
         upstream.SAGE_FP16PV.impl(Query())
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (8, 6))
     with pytest.raises(ValueError, match="no mode for sm86"):
