@@ -924,10 +924,9 @@ class Executor:
         impl: str = "",
         segments: Sequence[Mapping[str, Any]] = (),
     ) -> dict[str, Any]:
-        """The attempt's execution record: degree, every rank, and the setup it ran on."""
-        ranks = [
+        """The attempt's execution record: degree, every GPU, and the setup it ran on."""
+        gpus = [
             execution_evidence.record(
-                0,
                 self._rank_identity() if self.torch is not None else {"pid": os.getpid()},
                 start_us,
                 end_us,
@@ -942,16 +941,18 @@ class Executor:
             )
         ]
         if self.group is not None:
+            numbers = _gpu_numbers(self.world)
             for follower in self.group.followers:
+                gpu = numbers[follower.rank] if follower.rank < len(numbers) else -1
                 row = self.group.rank_records.get(follower.rank) or execution_evidence.record(
-                    follower.rank, {"pid": follower.pid}, 0, 0
+                    {"pid": follower.pid, "gpu": gpu}, 0, 0
                 )
-                ranks.append({**row, "attention": {**row["attention"], "requested": pin}})
+                gpus.append({**row, "attention": {**row["attention"], "requested": pin}})
         facts = self.facts
         transport = self.host.transport
         return {
             "degree": self.world,
-            "ranks": ranks,
+            "gpus": gpus,
             **({"transport": transport.document()} if transport is not None else {}),
             # per spread method: the calls each rank ran, and why a rank declined
             "spread": dict(self.group.spread_log) if self.group is not None else {},
@@ -1292,7 +1293,6 @@ class Executor:
             "working_peak_bytes": working,
             **({"result": result} if hosted else {}),
             "evidence": execution_evidence.record(
-                self.rank,
                 self._rank_identity(),
                 started_us,
                 execution_evidence.now_us(),

@@ -491,5 +491,5 @@ def _accept(
         )
     group.working_peaks[rank] = max(group.working_peaks.get(rank, 0), reply.working_peak_bytes)
     if reply.evidence is not None:
-        execution_evidence.widen(group.rank_records, reply.evidence)
+        execution_evidence.widen(group.rank_records, rank, reply.evidence)
     return reply

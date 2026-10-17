@@ -328,7 +328,7 @@ class RankGroup:
         #: per follower rank, its executor's plane facts as its latest reply stated them
         self.rank_planes: dict[int, dict[str, Any]] = {}
         #: per follower rank, its `execution_evidence` record folded over this attempt's calls
-        self.rank_records: dict[int, execution_evidence.RankEvidence] = {}
+        self.rank_records: dict[int, execution_evidence.GpuEvidence] = {}
         #: per spread method this attempt
         self.spread_log: dict[str, SpreadLog] = {}
         self._readers: list[threading.Thread] = []

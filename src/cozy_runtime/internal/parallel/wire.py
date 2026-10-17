@@ -355,7 +355,7 @@ class RunReply(msgspec.Struct, frozen=True):
     #: Sol attention calls by kind, on a sharded forward
     sol_calls: dict[str, int] = {}
     working_peak_bytes: int = 0
-    evidence: execution_evidence.RankEvidence | None = None
+    evidence: execution_evidence.GpuEvidence | None = None
     #: a hosted call's marshalled result
     result: Json = None
     #: why a spread call was declined; "" when it ran
