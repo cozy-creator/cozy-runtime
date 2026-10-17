@@ -3528,7 +3528,7 @@ class WeightResidency:
                 budget += nbytes  # the plane's budget grows into room the device has
             elif not floor:
                 outside += nbytes  # a ring a view keeps mapped (run 10562), a full device
-            elif method == MAPPING or not (memory.free_for(nbytes, op) and memory.freed):
+            elif method == MAPPING or memory.again(nbytes, op, seen=memory.free()) < 0:
                 memory.exhausted(nbytes, op)  # mapping ahead moves no tensor to host
             weights.oom_retries += 1
 
