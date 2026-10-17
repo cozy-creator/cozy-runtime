@@ -30,6 +30,7 @@ from cozy_runtime.author._assets import (
     Tree,
     VideoAsset,
     asset_kinds,
+    field_preparation,
 )
 from cozy_runtime.author._context import Context
 from cozy_runtime.author._decode import DEFAULT_DECODE_LIMITS
@@ -204,6 +205,18 @@ def assets_binding(name: str, annotation: object) -> AssetsBinding:
         max_length,
         tuple(preparations[key] for key in sorted(preparations)),
     )
+
+
+def check_parameter_markers(annotation: object) -> None:
+    """Counts annotate an Assets input; a preparation annotates a parameter or field that
+    carries its media kind. One rule for describe and the static readers."""
+    base, markers = strip(annotation)
+    if base is Assets or get_origin(base) is Assets:
+        return
+    for marker in markers:
+        if isinstance(marker, AssetLimits):
+            raise ConformanceError("AssetLimits annotates an Assets input", code="asset_limits")
+    field_preparation(base, markers)
 
 
 def media_kinds(payload_type: object, assets: AssetsBinding | None = None) -> frozenset[str]:
@@ -445,14 +458,8 @@ def analyze(
                 fields=[parameter.name],
             )
         annotation = hints[parameter.name]
-        base, markers = strip(annotation)
-        if not (base is Assets or get_origin(base) is Assets):
-            for marker in markers:
-                if isinstance(marker, _COLLECTION_MARKERS):
-                    raise ConformanceError(
-                        f"{type(marker).__name__} annotates an Assets input or a media field",
-                        code=_marker_code(marker),
-                    )
+        base, _ = strip(annotation)
+        check_parameter_markers(annotation)
         if base is Assets or get_origin(base) is Assets:
             if parameter.default is not parameter.empty:
                 raise ConformanceError("Assets inputs cannot have defaults", code="assets_default")

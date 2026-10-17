@@ -47,6 +47,7 @@ import cozy_runtime.internal.memo_identity as memo_identity
 import cozy_runtime.internal.package_interface as package_interface
 import cozy_runtime.internal.static_invocable as static_invocable
 from cozy_runtime import _interpreter, author
+from cozy_runtime.author._describe import assert_declaration_shape, decode_bounds
 from cozy_runtime.author._markers import MODEL_DEFAULT, PREFLIGHT
 from cozy_runtime.author._memo import memo_policy
 from cozy_runtime.author._model import (
@@ -1799,6 +1800,9 @@ def _callable(reader: Reader, registration: Registration) -> dict[str, Json]:
         payload = assets_payload(
             typing.cast(type[msgspec.Struct], payload), assets, fn.name, module.name
         )
+    assert_declaration_shape(payload)
+    assert_declaration_shape(result, result=True)
+    decode_bounds(registration.name, payload, assets)
     doc = package_interface.callable_doc(
         name=registration.name,
         payload_type=payload,
@@ -1985,6 +1989,9 @@ def _script_doc(reader: Reader, app: Assigned) -> dict[str, Json]:
         else msgspec.defstruct("_ScriptCompleted", [])
     )
     payload = msgspec.defstruct("_ScriptRequest", payload_fields)
+    assert_declaration_shape(payload)
+    assert_declaration_shape(result, result=True)
+    decode_bounds("main", payload, None)
     doc = package_interface.callable_doc(
         name="main",
         payload_type=payload,
