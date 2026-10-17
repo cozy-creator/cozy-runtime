@@ -44,8 +44,8 @@ SCALE_FLOOR = 1e-30
 DECODE_ROWS = 16
 #: The GEMV's tile: 64 output rows by 32 int32 words (256 weights) of each.
 GEMV_N, GEMV_W = 64, 32
-#: The kernels a call can serve on besides comfy-kitchen's W4A4 (`gemm.selected`).
-GEMV, DECODE, EAGER = "cozy-nvfp4-gemv", "cozy-nvfp4-decode", "torch-decode"
+#: The kernels a leaf serves besides comfy-kitchen's W4A4 (`gemm.selected`).
+DECODE, EAGER = "cozy-nvfp4-decode", "torch-decode"
 
 _MAJOR: dict[int, int] = {}
 
@@ -295,10 +295,9 @@ def matmul(
     linear_scale: Callable[[], Tensor],
     scale_2: Tensor,
     out_dtype: Tensor,
-) -> tuple[Tensor, str]:
+) -> Tensor:
     """`x @ W.T` for one stored `nvfp4-w4a4/1` weight (`weight` u8 `[N, K/2]`, `blocked_scale` its
-    E4M3 block scales in cuBLASLt's 128x4 layout, `scale_2` the f32 `[1]` second level), and the
-    kernel that served it.
+    E4M3 block scales in cuBLASLt's 128x4 layout, `scale_2` the f32 `[1]` second level).
 
     `linear_scale` returns the `[N, K/16]` row-major scales; only the eager path asks for it."""
     rows_out, cols = int(weight.shape[0]), 2 * int(weight.shape[1])
@@ -324,7 +323,7 @@ def matmul(
                     out = module.scaled_mm_nvfp4(
                         payload, w, tensor_scale, second, block, scales, out_dtype=out_dtype
                     )
-                return out[:rows].reshape(*x.shape[:-1], rows_out), int8_linear.ARTIFACT
+                return out[:rows].reshape(*x.shape[:-1], rows_out)
             except Exception as exc:  # W4A16 serves this call
                 int8_linear.failed("comfy-kitchen nvfp4", index, exc)
         launch = (
@@ -375,7 +374,7 @@ def matmul(
                             split,
                             1024,
                         )
-                    return out.reshape(*x.shape[:-1], rows_out), GEMV
+                    return out.reshape(*x.shape[:-1], rows_out)
                 decoded = torch.empty(rows_out, cols, dtype=x.dtype, device=x.device)
                 launch(
                     _dequant,
@@ -391,6 +390,15 @@ def matmul(
                     128,
                 )
             out = torch.nn.functional.linear(flat, decoded).to(out_dtype)
-            return out.reshape(*x.shape[:-1], rows_out), DECODE
+            return out.reshape(*x.shape[:-1], rows_out)
     decoded = nvfp4_values(torch, weight, linear_scale(), scale_2).to(x.dtype)
-    return torch.nn.functional.linear(x, decoded).to(out_dtype), EAGER
+    return torch.nn.functional.linear(x, decoded).to(out_dtype)
+
+
+def serving(index: int) -> str:
+    """The kernel this card's nvfp4 leaves serve a product of more than `DECODE_ROWS` rows with
+    now (fewer rows take the GEMV): a run's `gemm.selected`, read once a run."""
+    kitchen = int8_linear._KITCHEN.get(index)
+    if _MAJOR.get(index, 0) >= 10 and kitchen is not None and kitchen.served is not None:
+        return int8_linear.ARTIFACT
+    return DECODE if _LAUNCH.get(index, (0.0, None))[1] is not None else EAGER

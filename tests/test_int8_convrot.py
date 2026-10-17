@@ -131,11 +131,10 @@ def test_leaf_matches_its_exact_weight() -> None:
     devices = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
     for device in devices:
         for dtype in (torch.float32, torch.bfloat16):
-            got, kernel = int8_linear.linear(
+            got = int8_linear.linear(
                 torch, x.to(device, dtype), data.to(device), scale.to(device), None, dtype
             )
             assert got.shape == (3, 40, 64) and got.dtype == dtype
-            assert device == "cuda" or kernel == int8_linear.EAGER
             error = (got.double().cpu() - reference).norm() / reference.norm()
             assert error < 0.02, (device, dtype, float(error))
 
@@ -160,9 +159,8 @@ def test_a_gemm_that_raises_is_served_by_torch_and_the_run_says_so() -> None:
     operand = PreQuantized(payload, row_scale, tuple(x.shape), INT8_CONVROT)
     WARNINGS.clear()
     for _ in range(2):
-        got, kernel = int8_linear.gemm(torch, operand, data, scale, None, torch.float32)
+        got = int8_linear.gemm(torch, operand, data, scale, None, torch.float32)
         assert torch.equal(got, int8_linear.eager(torch, x, data, scale, torch.float32))
-        assert kernel == int8_linear.EAGER
     [(message, fields)] = WARNINGS
     assert message == "encoded GEMM failed, a slower path served"
     assert fields["op"] == int8_linear.OP and fields["device"] == -1
@@ -197,8 +195,8 @@ def test_native_op_is_built_by_the_compile_manager_and_keeps_the_law(tmp_path: P
         for dtype in (torch.bfloat16, torch.float16):
             x = torch.randn(1, rows + 1, in_features, generator=generator).to("cuda", dtype)[:, 1:]
             bias = torch.randn(out_features, generator=generator).to("cuda", dtype)
-            got, kernel = int8_linear.linear(torch, x, data, scale, bias, dtype)
-            assert kernel == int8_linear.OP
+            got = int8_linear.linear(torch, x, data, scale, bias, dtype)
+            assert int8_linear.serving(0) == int8_linear.OP
             want = int8_linear.eager(torch, x, data, scale, torch.float32) + bias.float()
             assert got.shape == (1, rows, out_features) and got.dtype == dtype
             error = float((got.float() - want).norm() / want.norm())

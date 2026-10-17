@@ -238,7 +238,7 @@ def prepared(roots: dict[str, Any], sizes: Mapping[str, int] | None = None) -> S
     weight set's layout (only totals reach the hosting plan)."""
     return SimpleNamespace(
         roots=roots,
-        leaves={},
+        gemm_sites={},
         components={
             name: SimpleNamespace(layout=Layout(common=size))
             for name, size in (sizes or {}).items()

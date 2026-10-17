@@ -1,0 +1,1 @@
+`gemm.selected` reads the kernel each provider serves from its dispatch state once per run, and counts leaves when they install. An encoded leaf's forward and the int8, fp8 and nvfp4 dispatchers are again exactly 0.26.4's: no per-call attribute write and no returned kernel name.
