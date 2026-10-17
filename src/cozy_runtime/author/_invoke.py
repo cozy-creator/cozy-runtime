@@ -25,7 +25,7 @@ import functools
 import hashlib
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack
-from dataclasses import dataclass, field, is_dataclass
+from dataclasses import dataclass, field, is_dataclass, replace
 from fractions import Fraction
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, get_args, get_type_hints
@@ -49,7 +49,6 @@ from cozy_runtime.author._assets import (
 from cozy_runtime.author._calls import ChildCallError, _Broker, _current
 from cozy_runtime.author._context import AdapterRef, Context, Device
 from cozy_runtime.author._decode import (
-    DEFAULT_DECODE_LIMITS,
     AudioProbe,
     VideoProbe,
     image_decoded_bytes,
@@ -549,6 +548,9 @@ def _prepare_assets(
         asset._fidelity = value.fidelity
         asset._preparation = binding.preparation(cls.kind)
         value.asset = asset
+        if bound is not None and cls.kind in binding.undeclared:  # the machine's budget, not 2 GiB
+            declares = bound.max_bytes is not None or bound.media_types
+            bound = replace(bound, max_decoded_bytes=None) if declares else None
         bounds[input_id] = bound
     try:
         Assets._from_bound(value.asset for value in values)
@@ -840,9 +842,7 @@ def _hydrate(
             media_type=granted.media_type,
             digest=granted.digest,
             length=granted.length,
-            max_decoded_bytes=(bound.max_decoded_bytes or 0)
-            if bound is not None
-            else (DEFAULT_DECODE_LIMITS.max_decoded_bytes if item.input_id in assets_bounds else 0),
+            max_decoded_bytes=(bound.max_decoded_bytes or 0) if bound is not None else 0,
             input_id=item.input_id,
             order=item.order,
             read_guard=(lambda: record.check_open("Asset.read_bytes")) if record else None,

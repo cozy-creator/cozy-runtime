@@ -130,8 +130,16 @@ app.entrypoint(upscale, accelerator=False)
     ],
     ids=["entrypoint", "invocable"],
 )
-def test_an_unbounded_media_input_refuses_in_every_reader(tmp_path: Path, body: str) -> None:
-    _both_refuse(_package(tmp_path, "unbounded_media", body), "asset_decode_unbounded")
+def test_a_media_input_with_no_decoded_bound_describes_in_every_reader(
+    tmp_path: Path, body: str
+) -> None:
+    """Owner, 2026-10-17: memory is Runtime's job, so no package is refused for a bound it did
+    not declare; both readers describe it the same way."""
+    root = _package(tmp_path, "unbounded_media", body)
+    imported = package_interface.build(discover(root))
+    assert package_interface.canonical_bytes(imported) == package_interface.canonical_bytes(
+        static_interface.build(root)
+    )
 
 
 @pytest.mark.parametrize(

@@ -356,12 +356,11 @@ def test_a_live_webm_without_a_recorded_duration_is_measured_from_packets(
     assert [row.field for row in record.rows] == ["input"]
 
 
-def test_a_probe_needs_no_decode_bound_but_a_read_does(media: dict[str, Path]) -> None:
+def test_a_read_needs_no_declared_decode_bound(media: dict[str, Path]) -> None:
+    """A field that declares none reads within what the machine holds (owner, 2026-10-17)."""
     video = fakes.file_input(VideoAsset, media["clip"], max_decoded_bytes=0)
     assert video.probe().source_duration == 2
-    with pytest.raises(CapabilityError) as caught:
-        video.read()
-    assert caught.value.code == "decoded_bound_missing"
+    assert video.read().duration == 2
 
 
 def test_reads_refuse_inside_a_component_scope(media: dict[str, Path]) -> None:
