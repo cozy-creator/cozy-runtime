@@ -901,23 +901,35 @@ class Weights:
         room made for it never unmaps them, and one the allocator's own refusal unmapped maps
         again at its home (it never moves), where the op's tensors point."""
         pointers, held = list(_pointers(operands)), cast("list[Lease]", [])
-        for component in self.components.values() if pointers else ():
-            cursor = component.cursor
-            ring = range(cursor.ring_ptr, cursor.ring_ptr + cursor.ring_nbytes) if cursor else ()
-            for region in component.regions:
-                homes = [region.bound] if region.bound is not None else list(region.views)
-                spans = [(a, a + region.span) for a in homes if a not in ring]
-                if not any(a <= p < b for a, b in spans for p in pointers):
-                    continue
-                lease = self.memory.retry(
-                    functools.partial(
-                        self.plane.acquire, component.ws, self.index, region.index, self.stream()
-                    ),
-                    f"{component.name}.{region.path}",
+        try:
+            for component in self.components.values() if pointers else ():
+                cursor = component.cursor
+                ring = (
+                    range(cursor.ring_ptr, cursor.ring_ptr + cursor.ring_nbytes) if cursor else ()
                 )
-                if region.bound != int(lease.ptr):
-                    bind(self.torch, region, lease)
-                held.append(lease)
+                for region in component.regions:
+                    homes = [region.bound] if region.bound is not None else list(region.views)
+                    spans = [(a, a + region.span) for a in homes if a not in ring]
+                    if not any(a <= p < b for a, b in spans for p in pointers):
+                        continue
+                    held.append(
+                        self.memory.retry(
+                            functools.partial(
+                                self.plane.acquire,
+                                component.ws,
+                                self.index,
+                                region.index,
+                                self.stream(),
+                            ),
+                            f"{component.name}.{region.path}",
+                        )
+                    )
+                    if region.bound != int(held[-1].ptr):
+                        bind(self.torch, region, held[-1])
+        except BaseException:
+            for lease in held:  # a lease dropped unreleased poisons the plane (run 10996)
+                lease.release()
+            raise
         return held
 
     def unpin(self, need: int, operands: Sequence[object]) -> bool:

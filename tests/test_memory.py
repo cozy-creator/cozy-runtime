@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import gc
 import weakref
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -17,11 +18,12 @@ from cozy_runtime.author import _split
 from cozy_runtime.author._errors import DEVICE_OOM, MEMORY_EXHAUSTED, classify
 from cozy_runtime.internal import accel, plane
 from cozy_runtime.internal import memory as memory_module
+from cozy_runtime.internal import weights as weights_module
 from cozy_runtime.internal.executor import CAPACITY_CODES, Executor
 from cozy_runtime.internal.memory import MARGIN, Ledger, MemoryExhausted, Rung
 from cozy_runtime.internal.parallel import mirror
-from cozy_runtime.internal.weights import Weights
-from test_block_replay_contract import StatefulBlock, wrapped
+from cozy_runtime.internal.weights import Region, Weights
+from test_block_replay_contract import CpuLease, StatefulBlock, wrapped
 
 torch = pytest.importorskip("torch")
 pytest_plugins = ("test_request_isolation",)
@@ -354,3 +356,28 @@ def test_torchs_limit_leaves_it_all_the_ladder_counts_free(
     weights.memory._settle()
     fresh = round(limits[-1] * weights.total) - figures["reserved_bytes"]
     assert abs(fresh - weights.memory.free()) <= 1, (fresh, weights.memory.free())
+
+
+def test_a_pin_that_fails_part_way_releases_what_it_leased(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lease dropped without release poisons the plane: pinning an op's weights for its
+    room gives back what it leased when the next weight cannot be leased."""
+    module = StatefulBlock("counter")
+    weights, region, trace = wrapped(module, monkeypatch)
+    second = Region(2, "second", module, [], span=region.span, views=dict(region.views))
+    weights.components["model/1"].regions.append(second)
+    tensor = module.linear.weight.detach()
+    refused = MemoryExhausted("no room", "acquire", 1, weights.memory.ledger(), "")
+
+    def acquire(*_: Any) -> Any:
+        if trace["acquired"]:
+            raise refused
+        return CpuLease(tensor, trace)
+
+    monkeypatch.setattr(weights, "plane", SimpleNamespace(acquire=acquire, devices=[]))
+    # a CPU tensor stands for the device operand: its address is the region's home
+    monkeypatch.setattr(weights_module, "_pointers", lambda _: iter([tensor.data_ptr()]))
+    with pytest.raises(MemoryExhausted):
+        weights.pin((tensor,))
+    assert trace["acquired"] == trace["released"] == 1
