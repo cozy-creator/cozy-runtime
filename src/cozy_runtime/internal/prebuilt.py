@@ -176,7 +176,12 @@ class Prebuilt:
         config: int,
     ) -> Tensor:
         torch = self.torch
+        want = torch.float8_e4m3fn if f.fp8 else torch.int8
+        if q.dtype != want or q.dim() != 2 or not q.is_contiguous() or q.data_ptr() % 16:
+            raise ValueError(f"{f.name}_gemm: q must be a contiguous, aligned {want} [M, K]")
         rows, width = q.shape
+        if scales.dtype != torch.float32 or scales.numel() != rows or not scales.is_contiguous():
+            raise ValueError(f"{f.name}_gemm: scales must be contiguous float32 with {rows} values")
         bias = self._weight(f, data, scale, bias, width, out_dtype)
         out = torch.empty(rows, data.shape[0], dtype=out_dtype, device=q.device)
         if rows == 0:
@@ -242,6 +247,9 @@ class Prebuilt:
             raise ValueError(f"{f.name}: scale must be float32 with {data.shape[0]} values")
         if not scale.is_contiguous():
             raise ValueError(f"{f.name}: scale must be contiguous")
+        on = (data, scale) if bias is None else (data, scale, bias)
+        if any(t.get_device() != self.index for t in on):
+            raise ValueError(f"{f.name}: the weight's tensors must be on cuda:{self.index}")
         self._half(out_dtype)
         if bias is None:
             return None
