@@ -87,7 +87,9 @@ class _Oracle(torch.nn.Module):
         self.prompt, self.miss = prompt, miss
         self.reference = torch.cat([reference[0], torch.zeros(64, dtype=torch.long, device=DEVICE)])
 
-    def forward(self, embeds: Any, hidden: Any, positions: Any, cache: Any, mask: Any) -> Any:
+    def forward(
+        self, embeds: Any, hidden: Any, positions: Any, cache: Any, mask: Any, rotary: Any
+    ) -> Any:
         text = positions[0] if positions.dim() == 3 else positions  # Qwen3.5's mrope rows
         at = (text + 1 - self.prompt).clamp(min=0)  # each row's next token
         token = self.reference[at]
@@ -105,7 +107,9 @@ class _Random(torch.nn.Module):
         self.fc = torch.nn.Linear(2 * size, size, bias=False)
         self.layer = torch.nn.Linear(size, size)
 
-    def forward(self, embeds: Any, hidden: Any, positions: Any, cache: Any, mask: Any) -> Any:
+    def forward(
+        self, embeds: Any, hidden: Any, positions: Any, cache: Any, mask: Any, rotary: Any
+    ) -> Any:
         return torch.tanh(self.layer(self.fc(torch.cat([embeds, hidden], dim=-1))))
 
 
@@ -251,3 +255,27 @@ def test_a_head_that_does_not_fit_decodes_without_drafting(
     )
     assert torch.equal(got, want)
     assert [message for message, _ in WARNINGS] == ["decoded without drafting"]
+
+
+def test_a_head_attached_as_a_package_attaches_it_decodes_graphed() -> None:
+    """A package keeps the head's weights in its model's component (`model.mtp = draft.mtp`):
+    Runtime places them with the model and nothing else of the head. Its attention rotates with
+    the model's own tables, so every step replays as a graph (run 10372 decoded eagerly)."""
+    torch.manual_seed(5)
+    model = _qwen3_5()
+    space = sys.modules[type(model).__module__]
+    draft = lm.Draft(model.config, space).eval()
+    model.mtp = draft.mtp.to(DEVICE)
+    ids = torch.randint(10, 44, (1, 30), device=DEVICE)
+    want = _reference(model, ids, 40, 0.0)
+    WARNINGS.clear()
+    got = lm.generate(
+        model,
+        {"input_ids": ids, "attention_mask": torch.ones_like(ids)},
+        max_new_tokens=40,
+        stop=STOP,
+        pad=0,
+        draft=draft,
+    )
+    assert torch.equal(got, want)
+    assert WARNINGS == []
