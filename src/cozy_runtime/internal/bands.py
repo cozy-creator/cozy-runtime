@@ -243,7 +243,10 @@ class Bands:
         block's rows are copied once; a device tensor's are a view unless padded."""
         n = int(x.shape[dim])
         start, stop = min(max(lo, 0), n), max(min(hi, n), 0)
-        rows = x.narrow(dim, start, max(stop - start, 0))
+        if stop <= start:  # wholly past the edges (run 10683: inside a padding's band)
+            shape = [*x.shape[:dim], hi - lo, *x.shape[dim + 1 :]]
+            return self.torch.full(shape, fill, dtype=x.dtype, device=self.weights.device)
+        rows = x.narrow(dim, start, stop - start)
         if spill.hosted(x):
             rows = rows.clone(memory_format=self.torch.contiguous_format)
         if start - lo or hi - stop:
