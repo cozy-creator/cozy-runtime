@@ -1,11 +1,15 @@
 name: kernels
-# The cozy-kernels wheels (`kernels/`): every prebuilt kernel for every GPU target, one wheel per
-# OS and CPU, each checked for its tag, its declared targets, no torch and an import on every
-# Python it claims (checks/kernel_wheel.py). PRs that touch kernel sources run it. By hand:
+# Cozy's prebuilt kernels (`kernels/`): the modules each native cozy-runtime wheel carries under
+# `cozy_runtime/_kernels`, one set per OS and CPU, each held to its declared targets, imports and a
+# call without a GPU (checks/kernel_modules.py). publish.yaml and dev-build.yaml call this and
+# repackage the artifact `kernels-<target>` into their wheels (`task wheel`). By hand:
 #   gh workflow run kernels.yaml -R cozy-creator/cozy-runtime -f ref=<tag|sha>
-# A release builds a `kernels-v<version>` tag, proves that run's wheels on GPUs, then publishes
-# exactly those files to PyPI:
-#   gh workflow run kernels.yaml -R cozy-creator/cozy-runtime -f ref=kernels-v0.1.0 -f publish_run=<run id>
+#
+# Built modules are cached under a key of everything that shapes their bytes: `kernels/**`
+# (sources, flags, targets, toolchain.env's pins), the catalog and checker they are held to, the
+# target, Windows' exact compiler and this recipe's revision (`kernels-r1`; bump it when a build
+# step below changes). Only that exact key is ever restored: a miss compiles. Master's runs warm
+# the cache releases read.
 on:
   workflow_dispatch:
     inputs:
@@ -13,112 +17,152 @@ on:
         description: Branch, tag or SHA to build
         type: string
         default: master
-      publish_run:
-        description: Publish this earlier run's wheels, built from the kernels-v* tag in ref, to PyPI
-        type: string
-        default: ''
   workflow_call:
     inputs:
       ref:
         type: string
         required: true
+      linux:
+        description: The Linux CPUs to build for, a JSON list
+        type: string
+        default: '["x86_64", "aarch64"]'
+      windows:
+        description: Whether to build for Windows x86_64
+        type: boolean
+        default: true
   pull_request:
-    paths:
+    paths: &inputs
       - kernels/**
-      - checks/kernel_wheel.py
+      - src/cozy_runtime/_kernels/__init__.py
+      - checks/kernel_modules.py
       - .github/workflows/kernels.yaml
+  push:
+    branches: [master]
+    paths: *inputs
 run-name: kernels ${{ inputs.ref || github.head_ref || github.ref_name }}
 
 permissions:
   contents: read
 
-# A newer push to the same ref replaces a build still running.
+# A newer push to the same ref replaces a build still running; a caller's build is its own.
 concurrency:
-  group: kernels-${{ inputs.ref || github.head_ref || github.ref }}
+  group: kernels-${{ inputs.ref || github.head_ref || github.ref }}-${{ github.workflow }}
   cancel-in-progress: true
 
 jobs:
   linux:
-    if: ${{ !inputs.publish_run }}
+    if: ${{ inputs.linux != '[]' }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # CUTLASS units peak at ~6 GB each: compile jobs sized by the runner's memory.
-          # `without`: what the wheel omits (CMake decides; `kernel_wheel.py` holds it to it).
-          - {arch: x86_64, cuda: x86_64, runner: linux-x64-16core, jobs: 6, without: ''}
-          # The arm64 larger runner has no docker; the standard one does. ptxas on an arm64 host
-          # crashes on FA3's units (signal 11, cr-200).
-          - {arch: aarch64, cuda: sbsa, runner: ubuntu-24.04-arm, jobs: 1, without: _fa3}
-    runs-on: ${{ matrix.runner }}
+        arch: ${{ fromJSON(inputs.linux || '["x86_64", "aarch64"]') }}
+    # CUTLASS units peak at ~6 GB each: compile jobs sized by the runner's memory. The arm64 larger
+    # runner has no docker; the standard one does.
+    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'linux-x64-16core' }}
     # Hang bound, not a work budget.
     timeout-minutes: 240
     env:
-      # glibc 2.28 and gcc-toolset-14: the wheel's floor is the floor it was compiled on.
-      IMAGE: quay.io/pypa/manylinux_2_28_${{ matrix.arch }}:2026.10.10-1
-      PLAT: manylinux_2_28_${{ matrix.arch }}
-      CUDA_REPO: https://developer.download.nvidia.com/compute/cuda/repos/rhel8/${{ matrix.cuda }}/cuda-rhel8.repo
+      ARCH: ${{ matrix.arch }}
+      JOBS: ${{ matrix.arch == 'aarch64' && 1 || 6 }}
+      # ptxas on an arm64 host crashes on FA3's units (signal 11, cr-200): CMake builds none there.
+      WITHOUT: ${{ matrix.arch == 'aarch64' && '_fa3' || '' }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.sha }}
-      - name: Build and check the wheel
+      - id: key
         run: |
-          # TensorD's driver floor (public cozy repo), which the wheel's must equal.
+          grep -v '^#' kernels/toolchain.env >> "$GITHUB_ENV"
+          echo "key=kernels-r1-linux-$ARCH-${{ hashFiles('kernels/**', 'src/cozy_runtime/_kernels/__init__.py', 'checks/kernel_modules.py') }}" >> "$GITHUB_OUTPUT"
+      - id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: modules
+          key: ${{ steps.key.outputs.key }}
+      - name: Build and check the modules
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          # TensorD's driver floor (public cozy repo), which the modules' must equal.
           curl -fsSL https://raw.githubusercontent.com/cozy-creator/cozy/master/crates/cozy-platform/src/gpu/mod.rs \
             -o platform-gpu.rs
-          docker run --rm -v "$PWD:/src" -w /src -e PLAT -e CUDA_REPO -e HOST_OWNER="$(id -u):$(id -g)" \
-            -e WITHOUT="${{ matrix.without }}" -e CMAKE_BUILD_PARALLEL_LEVEL=${{ matrix.jobs }} "$IMAGE" bash -euo pipefail -c '
-              dnf install -y -q dnf-plugins-core && dnf config-manager --add-repo "$CUDA_REPO"
-              dnf install -y -q cuda-nvcc-13-0-13.0.88 cuda-cudart-devel-13-0-13.0.96 cuda-cuobjdump-13-0-13.0.85
-              export PATH=/usr/local/cuda-13.0/bin:$PATH
+          # glibc 2.28 and gcc-toolset-14: the wheels' floor is the floor the modules compile on.
+          docker run --rm -v "$PWD:/src" -w /src --env-file <(grep -v '^#' kernels/toolchain.env) \
+            -e ARCH -e JOBS -e WITHOUT -e HOST_OWNER="$(id -u):$(id -g)" \
+            "quay.io/pypa/manylinux_2_28_$ARCH:$MANYLINUX" bash -euo pipefail -c '
+              cuda=$([ "$ARCH" = aarch64 ] && echo sbsa || echo x86_64)
+              dnf install -y -q dnf-plugins-core
+              dnf config-manager --add-repo "https://developer.download.nvidia.com/compute/cuda/repos/rhel8/$cuda/cuda-rhel8.repo"
+              dnf install -y -q "cuda-nvcc-13-0-$CUDA_NVCC" "cuda-cudart-devel-13-0-$CUDA_CUDART" \
+                "cuda-cuobjdump-13-0-$CUDA_CUOBJDUMP"
+              export PATH=/opt/python/cp312-cp312/bin:/usr/local/cuda-13.0/bin:$PATH
               export CC=/opt/rh/gcc-toolset-14/root/usr/bin/gcc CXX=/opt/rh/gcc-toolset-14/root/usr/bin/g++
-              py=/opt/python/cp312-cp312/bin/python
-              $py -m pip install -q uv==0.12.7
-              time $py -m uv build --wheel --python $py --out-dir /tmp/raw kernels
-              auditwheel repair --plat "$PLAT" --only-plat -w dist /tmp/raw/*.whl
-              $py checks/kernel_wheel.py dist/*.whl "$PLAT" --python $py \
+              python -m pip install -q --root-user-action ignore "nanobind==$NANOBIND" "cmake==$CMAKE" "ninja==$NINJA"
+              time cmake -S kernels -B /tmp/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPython_EXECUTABLE="$(command -v python)"
+              time cmake --build /tmp/build --parallel "$JOBS"
+              cmake --install /tmp/build --prefix modules
+              python checks/kernel_modules.py modules --python python \
                 --python /opt/python/cp313-cp313/bin/python --python /opt/python/cp314-cp314/bin/python \
                 --platform-floor platform-gpu.rs $(for w in $WITHOUT; do echo --without $w; done)
-              chown -R "$HOST_OWNER" dist
+              chown -R "$HOST_OWNER" modules
             ' 2>&1 | tee build.log
           exit "${PIPESTATUS[0]}"
-      - uses: astral-sh/setup-uv@v7
+      - if: steps.cache.outputs.cache-hit != 'true'
+        uses: astral-sh/setup-uv@v7
       - name: Stable ABI only
-        run: uvx abi3audit==0.0.26 --strict --report dist/*.whl
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: uvx abi3audit==0.0.26 --strict --report modules/cozy_runtime/_kernels/*.so
+      - if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: modules
+          key: ${{ steps.key.outputs.key }}
       - if: always()
-        run: grep -E '^(_gemm|FAILED|cozy_kernels|real)' build.log >> "$GITHUB_STEP_SUMMARY" || true
+        run: |
+          echo "${{ steps.key.outputs.key }}: ${{ steps.cache.outputs.cache-hit == 'true' && 'cached' || 'built' }}" >> "$GITHUB_STEP_SUMMARY"
+          grep -E '^(_gemm|_fa3|_norm|FAILED|real)' build.log >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
       - uses: actions/upload-artifact@v4
         with:
-          name: cozy-kernels-${{ matrix.arch }}
-          path: dist/*.whl
+          name: kernels-linux-${{ matrix.arch }}
+          path: modules/
           if-no-files-found: error
 
   windows:
-    if: ${{ !inputs.publish_run }}
+    # A push or pull request carries no inputs: it builds every target.
+    if: ${{ inputs.windows || inputs.windows == null }}
     # No larger Windows runner: the standard one, one compile at a time.
     runs-on: windows-2025
     timeout-minutes: 360
     env:
       REDIST: https://developer.download.nvidia.com/compute/cuda/redist
-      CMAKE_BUILD_PARALLEL_LEVEL: 1
       CMAKE_GENERATOR: Ninja
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.sha }}
+      - shell: bash
+        run: grep -v '^#' kernels/toolchain.env >> "$GITHUB_ENV"
       - {uses: actions/setup-python@v5, id: py313, with: {python-version: '3.13'}}
       - {uses: actions/setup-python@v5, id: py314, with: {python-version: '3.14'}}
       - {uses: actions/setup-python@v5, id: py312, with: {python-version: '3.12'}}
-      # CUDA 13.0's host_config.h takes MSVC through 19.4x: the image's Visual Studio 2026 carries
-      # Visual Studio 2022's last toolset, 14.44.
+      # The image's Visual Studio 2026 carries Visual Studio 2022's last toolset.
       - uses: ilammy/msvc-dev-cmd@v1.13.0
         with:
-          toolset: '14.44'
-      - name: CUDA 13.0 from NVIDIA's redistributables, each archive held to its digest
+          toolset: ${{ env.MSVC_TOOLSET }}
+      - id: key
+        shell: bash
+        run: |
+          cl=$(cl 2>&1 | grep -o 'Version [0-9.]*' | cut -d' ' -f2)
+          echo "key=kernels-r1-win_amd64-msvc$cl-${{ hashFiles('kernels/**', 'src/cozy_runtime/_kernels/__init__.py', 'checks/kernel_modules.py') }}" >> "$GITHUB_OUTPUT"
+      - id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: modules
+          key: ${{ steps.key.outputs.key }}
+      - name: CUDA from NVIDIA's redistributables, each archive held to its digest
+        if: steps.cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
-          $manifest = Invoke-RestMethod "$env:REDIST/redistrib_13.0.2.json"
+          $manifest = Invoke-RestMethod "$env:REDIST/redistrib_$env:CUDA_REDIST.json"
           $root = "$env:RUNNER_TEMP\cuda"
           New-Item -ItemType Directory -Force $root | Out-Null
           foreach ($name in "cuda_nvcc", "cuda_crt", "libnvvm", "cuda_cudart", "cuda_cccl", "cuda_cuobjdump") {
@@ -131,94 +175,43 @@ jobs:
           "$root\bin" >> $env:GITHUB_PATH
           "CUDAToolkit_ROOT=$root" >> $env:GITHUB_ENV
           "CUDA_PATH=$root" >> $env:GITHUB_ENV
-      - name: Build and check the wheel
+      - name: Build and check the modules
+        if: steps.cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           $py = "${{ steps.py312.outputs.python-path }}"
-          & $py -m pip install -q uv==0.12.7
+          & $py -m pip install -q "nanobind==$env:NANOBIND" "cmake==$env:CMAKE" "ninja==$env:NINJA"
+          $env:PATH = "$(Split-Path $py)\Scripts;$env:PATH"
           Invoke-WebRequest https://raw.githubusercontent.com/cozy-creator/cozy/master/crates/cozy-platform/src/gpu/mod.rs -OutFile platform-gpu.rs
           $began = Get-Date
-          & $py -m uv build --wheel --python $py --out-dir dist kernels
+          cmake -S kernels -B "$env:RUNNER_TEMP\build" -G Ninja -DCMAKE_BUILD_TYPE=Release "-DPython_EXECUTABLE=$py"
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --build "$env:RUNNER_TEMP\build" --parallel 1
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --install "$env:RUNNER_TEMP\build" --prefix modules
           "built in $(((Get-Date) - $began).TotalMinutes) min"
-          $wheel = (Get-ChildItem dist\*.whl).FullName
           # MSVC builds neither CUTLASS's TMA GEMMs nor FA3 (cr-201).
-          & $py checks/kernel_wheel.py $wheel win_amd64 --without tma --without _fa3 --python $py `
+          & $py checks/kernel_modules.py modules --without tma --without _fa3 --python $py `
             --python "${{ steps.py313.outputs.python-path }}" --python "${{ steps.py314.outputs.python-path }}" `
             --platform-floor platform-gpu.rs
           exit $LASTEXITCODE
-      - uses: astral-sh/setup-uv@v7
+      - if: steps.cache.outputs.cache-hit != 'true'
+        uses: astral-sh/setup-uv@v7
       - name: Stable ABI only
-        run: uvx abi3audit==0.0.26 --strict --report (Get-ChildItem dist\*.whl).FullName
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: uvx abi3audit==0.0.26 --strict --report (Get-ChildItem modules\cozy_runtime\_kernels\*.pyd).FullName
         shell: pwsh
+      - if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: modules
+          key: ${{ steps.key.outputs.key }}
+      - if: always()
+        shell: bash
+        run: |
+          echo "${{ steps.key.outputs.key }}: ${{ steps.cache.outputs.cache-hit == 'true' && 'cached' || 'built' }}" >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:
-          name: cozy-kernels-win_amd64
-          path: dist/*.whl
+          name: kernels-win_amd64
+          path: modules/
           if-no-files-found: error
-
-  publish:
-    if: inputs.publish_run && startsWith(inputs.ref, 'kernels-v')
-    runs-on: ubuntu-latest
-    environment: pypi
-    # Hang bound, not a work budget.
-    timeout-minutes: 20
-    permissions:
-      id-token: write  # PyPI trusted publishing (OIDC)
-      actions: read
-    env:
-      RUN: ${{ inputs.publish_run }}
-      REF: ${{ inputs.ref }}
-      GH_TOKEN: ${{ github.token }}
-    steps:
-      - name: The run built this tag and passed
-        run: |
-          gh run view "$RUN" -R "$GITHUB_REPOSITORY" --json workflowName,displayTitle,conclusion \
-            --jq '"\(.workflowName)|\(.displayTitle)|\(.conclusion)"' | tee run
-          [ "$(cat run)" = "kernels|kernels $REF|success" ]
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: cozy-kernels-*
-          path: dist
-          merge-multiple: true
-          run-id: ${{ inputs.publish_run }}
-          github-token: ${{ github.token }}
-      - name: One wheel per target, each at the tag's version
-        working-directory: dist
-        run: |
-          version=${REF#kernels-v}
-          want=$(printf "cozy_kernels-$version-cp312-abi3-%s.whl\n" \
-            manylinux_2_28_aarch64 manylinux_2_28_x86_64 win_amd64)
-          [ "$(ls | sort)" = "$want" ] || { ls; echo "::error::expected $want"; exit 1; }
-          sha256sum * | tee ../sums
-          echo "VERSION=$version" >> "$GITHUB_ENV"
-      - name: Publish (trusted publishing)
-        uses: pypa/gh-action-pypi-publish@release/v1
-      # Uploads land one file at a time: wait while a file is absent, refuse any the run did not build.
-      - name: PyPI serves exactly the built files
-        run: |
-          python3 - <<'PY'
-          import json, os, sys, time, urllib.error, urllib.request
-          version = os.environ["VERSION"]
-          want = {name: digest for digest, name in (line.split() for line in open("sums"))}
-          request = urllib.request.Request(
-              f"https://pypi.org/pypi/cozy-kernels/{version}/json", headers={"Cache-Control": "no-cache"}
-          )
-          while True:
-              try:
-                  with urllib.request.urlopen(request, timeout=30) as response:
-                      served = {f["filename"]: f["digests"]["sha256"] for f in json.load(response)["urls"]}
-              except (OSError, urllib.error.URLError) as error:
-                  print(f"PyPI JSON unavailable ({error}); retrying", flush=True)
-                  time.sleep(5)
-                  continue
-              wrong = {name: digest for name, digest in served.items() if want.get(name) != digest}
-              if wrong:
-                  sys.exit(f"PyPI serves files the run did not build: {wrong}")
-              missing = sorted(set(want) - set(served))
-              if not missing:
-                  print("\n".join(f"{want[name]}  {name}" for name in sorted(want)))
-                  break
-              print(f"not yet served: {missing}", flush=True)
-              time.sleep(5)
-          PY

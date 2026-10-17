@@ -2,6 +2,15 @@
 name = "cozy-runtime"
 version = "0.27.1"
 description = "Cozy author surface and device executor"
+# The native wheels carry the kernels (`kernels/`): derived from comfy-kitchen, vLLM and SGLang
+# (Apache-2.0, comfy-kitchen's NOTICE), with CUTLASS and FlashAttention-3 (BSD-3-Clause). The
+# pure wheel ships the same manifest.
+license-files = [
+    "kernels/LICENSE",
+    "kernels/NOTICE",
+    "kernels/LICENSE-cutlass",
+    "kernels/LICENSE-flash-attention",
+]
 requires-python = ">=3.12"
 dependencies = [
     "tensorfs>=0.10,<0.11",
@@ -53,8 +62,8 @@ testpaths = ["tests"]
 addopts = "-q -p no:cacheprovider"
 
 [build-system]
-# The pure wheel and the sdist. `task machine` makes each Linux arch's wheel from the pure one
-# plus the pinned tensord executable. The kernels are the cozy-kernels wheel's (`kernels/`).
+# The pure wheel and the sdist. `task wheel` makes each native wheel from the pure one plus that
+# platform's kernel modules (kernels.yaml); `task machine` adds the pinned tensord to Linux's.
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 

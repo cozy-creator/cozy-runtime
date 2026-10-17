@@ -12,7 +12,7 @@ weight operand the plane has not mapped (`readable`).
 Also public here: the operand an encoded leaf takes already quantized (`PreQuantized`), a scope
 in which the leaves that read one activation quantize it once (`quantize_once`), a producer's
 norm, modulation and activation folded into that quantization (`int8_rows`), and the
-compiled CUDA kernels of the cozy-kernels wheel (`rms_rope_split_half`).
+compiled CUDA kernels the native Runtime wheels carry (`rms_rope_split_half`).
 """
 
 from __future__ import annotations
@@ -234,7 +234,7 @@ def rms_rope_split_half(
 ) -> tuple[Any, Any]:
     """Per-head RMSNorm of `q` and `k` (scaled by `q_scale`/`k_scale`), then split-half RoPE by
     the `[..., rot_dim // 2, 2, 2]` rotation matrix `freqs`, out of place, in one launch.
-    `native()` says why this machine cannot (no cozy-kernels wheel for its OS and CPU).
+    `native()` says why this machine cannot (its Runtime wheel carries no kernels).
     """
     with readable(q, k, freqs, q_scale, k_scale) as (q, k, freqs, q_scale, k_scale):
         return _kernels.rms_rope_split_half(q, k, freqs, q_scale, k_scale, epsilon, rot_dim)

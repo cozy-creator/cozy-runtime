@@ -185,12 +185,14 @@ numerics. A method drawing from the default RNG refuses `memo_rng`. Results go t
 executor's LRU, and to the machine's disk tier only when small and measured costly to
 produce (`memo:` in runtime.yaml; tracker design `pipeline-memoization.md`).
 
-Runtime's compiled CUDA kernels are the `cozy-kernels` wheel (`kernels/`, one per OS and CPU:
-Linux x86_64 and aarch64, Windows x86_64), which Runtime depends on: the 8-bit op, FlashAttention-3's
-forward and RMSNorm + split-half RoPE (`author.kernels.rms_rope_split_half`), every GPU target's
-cubins plus PTX, nanobind on the stable ABI, no torch ABI. Each kernel serves once it passes its
-probe on the card (`internal/verify.py`). `kernels.yaml` builds and checks the wheels; Runtime's
-own wheels are the pure one and, per Linux arch, that wheel plus tensord (`task machine`).
+Runtime's compiled CUDA kernels (`kernels/`) ride its native wheels, one per OS and CPU (Linux
+x86_64 and aarch64, Windows x86_64), under `cozy_runtime/_kernels`: the 8-bit op,
+FlashAttention-3's forward and RMSNorm + split-half RoPE (`author.kernels.rms_rope_split_half`),
+every GPU target's cubins plus PTX, nanobind on the stable ABI, no torch ABI. Each kernel serves
+once it passes its probe on the card (`internal/verify.py`). `kernels.yaml` builds and checks the
+modules, cached by a hash of everything that shapes their bytes; `task wheel` adds them to the
+pure wheel, and `task machine` adds tensord to Linux's. The pure wheel (macOS, any other platform)
+carries none.
 
 Every model-specific optimization first benchmarks `torch.compile`/Inductor as a discovery
 oracle and records profile identity, graph breaks, generated kernels, compile cost, warm

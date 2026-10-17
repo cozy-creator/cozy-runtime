@@ -9,7 +9,7 @@ built by the compile manager into a scratch store: every attention artifact a ca
 (`attention_sol`), and the Triton sets an executor builds at start (`triton_kernels`: nvfp4, the
 LM decode and the fused DiT layouts below). Upstream's `setup.py` asks torch which card it
 builds for; `formation/sitecustomize.py` answers with the job's card. Nothing else stands in for
-a device: the compilers produce the real binaries. The cozy-kernels wheel's kernels form in
+a device: the compilers produce the real binaries. The prebuilt kernels (`kernels/`) form in
 `kernels.yaml`.
 
 `--ledger` records each formed key. A key digests every build input (sources, recipe,

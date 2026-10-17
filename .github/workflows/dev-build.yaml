@@ -12,7 +12,7 @@ on:
         type: string
         default: master
       build:
-        description: "wheels: sdist, pure wheel and the runner arch's Linux wheel with tensord (and kernels on x86_64); pure: sdist and pure wheel; none: tests only"
+        description: "wheels: sdist, pure wheel and the runner arch's Linux wheel with its kernels and tensord; pure: sdist and pure wheel; none: tests only"
         type: string
         default: wheels
       test:
@@ -41,9 +41,20 @@ permissions:
   contents: read
 
 jobs:
+  # The runner arch's kernel modules, cached by everything that shapes their bytes (kernels.yaml).
+  modules:
+    if: ${{ inputs.build == 'wheels' }}
+    uses: ./.github/workflows/kernels.yaml
+    with:
+      ref: ${{ inputs.ref }}
+      linux: ${{ contains(inputs.runner, 'arm') && '["aarch64"]' || '["x86_64"]' }}
+      windows: false
+
   dev:
+    needs: modules
+    if: ${{ !cancelled() && needs.modules.result != 'failure' }}
     runs-on: ${{ inputs.runner }}
-    # Hang bound, not a work budget: a native-input change adds the CUDA kernel build.
+    # Hang bound, not a work budget.
     timeout-minutes: 60
     env:
       WHEELS: ${{ inputs.build == 'wheels' }}
@@ -113,7 +124,7 @@ jobs:
           uv pip install "tensorfs @ git+https://github.com/cozy-creator/tensorfs@v$version"
           echo UV_NO_SYNC=1 >> "$GITHUB_ENV"
       # From here to the machine check: publish.yaml's build job, step for step.
-      # On either arch the Linux wheel is the pure one plus tensord.
+      # On either arch the Linux wheel is the pure one plus its kernels and tensord.
       - name: Build (sdist + pure-py wheel)
         if: inputs.build != 'none'
         working-directory: source
@@ -122,6 +133,16 @@ jobs:
         run: |
           uv run python scripts/stamp-build-provenance.py "$COZY_RUNTIME_BUILD_COMMIT"
           uv build --out-dir dist
+      - if: env.WHEELS == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: kernels-linux-*
+          path: kernels-out
+          merge-multiple: true
+      - name: The Linux wheel, the pure one plus its kernels
+        if: env.WHEELS == 'true'
+        working-directory: source
+        run: task wheel KERNELS="$GITHUB_WORKSPACE/kernels-out" PLAT="manylinux_2_28_$(uname -m)"
       - name: Bundle tensord into the Linux wheel
         if: env.WHEELS == 'true'
         working-directory: source

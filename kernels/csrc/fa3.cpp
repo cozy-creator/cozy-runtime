@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// `cozy_kernels._fa3`: FlashAttention-3's Hopper forward (Dao-AILab flash-attention v2.8.3.post1,
+// `_kernels._fa3`: FlashAttention-3's Hopper forward (Dao-AILab flash-attention v2.8.3.post1,
 // `hopper/`, BSD-3-Clause), its instantiation units compiled unmodified for sm_90a, reached
 // without torch: this file fills `Flash_fwd_params` as upstream's `mha_fwd` does for dense,
 // fixed-length, unpaged, unsplit attention (K/V heads dividing Q heads), head dims 64 and 128,

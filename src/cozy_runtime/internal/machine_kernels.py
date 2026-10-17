@@ -1,6 +1,6 @@
 """The machine's kernels, compiled at machine start on the cards present while weights download:
 first the links between its GPUs (`parallel.links`), which a group reads, then each card row's
-attention cells (`boot`). The cozy-kernels wheel's kernels (the 8-bit op, FA3) need no build.
+attention cells (`boot`). The Runtime wheel's prebuilt kernels (the 8-bit op, FA3) need no build.
 
 The machine launches `python -m cozy_runtime.internal.machine_kernels` once per installed
 generation, under that generation's own seal: its interpreter and torch, every card of the

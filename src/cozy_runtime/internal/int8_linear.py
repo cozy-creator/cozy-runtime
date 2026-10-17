@@ -1,4 +1,4 @@
-"""The `int8-convrot256/1` encoded GEMM: the cozy-kernels wheel's 8-bit op (`prebuilt`).
+"""The `int8-convrot256/1` encoded GEMM: the Runtime wheel's prebuilt 8-bit op (`prebuilt`).
 
 The op rotates each activation row by the regular Hadamard per 256 channels and quantizes it per
 token in one kernel, then runs an int8 GEMM whose epilogue applies both scales and the bias:
@@ -150,14 +150,14 @@ def _kitchen_tree(sm: int) -> Path | None:
 
 
 def native(torch: ModuleType, index: int) -> Op | None:
-    """The cozy-kernels 8-bit op's int8 linear on this card, once it verifies here (`prebuilt`);
+    """The prebuilt 8-bit op's int8 linear on this card, once it verifies here (`prebuilt`);
     None for good where it does not, said once."""
 
     def opened(sm: int) -> Op:
         ops, detail = prebuilt.library(torch, index, sm)
         if ops is None:
             raise kernel_sources.Absent(detail)
-        print(f"[int8] prebuilt cozy-kernels verified on sm{sm}: {detail}", file=sys.stderr)
+        print(f"[int8] prebuilt kernels verified on sm{sm}: {detail}", file=sys.stderr)
         _HALF[:] = (torch.bfloat16, torch.float16)
         _LIBS[index] = ops
         _OPS[index] = ops.int8_linear

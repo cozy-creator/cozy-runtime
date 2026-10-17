@@ -9,7 +9,6 @@ fp8 leaf failed its float16 GEMM check and raised for float32.
 
 from __future__ import annotations
 
-import ast
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,6 +16,7 @@ from types import SimpleNamespace
 import msgspec
 import pytest
 
+from cozy_runtime import _kernels
 from cozy_runtime.author._services import Attempt
 from cozy_runtime.author.kernels import INT8_CONVROT, ROWWISE_FP8
 from cozy_runtime.derive.microscale import encode_int8_convrot256
@@ -242,21 +242,13 @@ def test_a_run_names_each_components_gemm_kernel_and_each_fallback(tmp_path: Pat
 def test_a_windows_wheel_names_the_gemm_that_served_and_why(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A Windows cozy-kernels wheel has no CUTLASS TMA GEMMs (cr-201): an RTX 50's fp8 leaves
+    """A Windows cozy-runtime wheel has no CUTLASS TMA GEMMs (cr-201): an RTX 50's fp8 leaves
     multiply in `_scaled_mm`, and the run's GEMM column says so and why. Ada's fp8 GEMM is
-    `_scaled_mm` on every wheel, so it says nothing more. The wheel's facts are stated: its
-    declared table, and `_gemm.TMA` false."""
+    `_scaled_mm` on every wheel, so it says nothing more. The wheel's one fact is stated:
+    `_gemm.TMA` false."""
     torch = pytest.importorskip("torch")
-    source = Path(__file__).parents[1] / "kernels/src/cozy_kernels/__init__.py"
-    [table] = [
-        node.value
-        for node in ast.parse(source.read_text()).body
-        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
-        if node.target.id == "TMA_GEMM" and node.value is not None
-    ]
     monkeypatch.setattr(prebuilt, "ABSENT", "")
-    monkeypatch.setattr(prebuilt, "_gemm", SimpleNamespace(TMA=False), raising=False)
-    monkeypatch.setattr(prebuilt, "TMA_GEMM", ast.literal_eval(table), raising=False)
+    monkeypatch.setattr(_kernels, "_gemm", SimpleNamespace(TMA=False), raising=False)
     reason = prebuilt.lost("fp8", 120)
     assert "cr-201" in reason
     assert prebuilt.lost("fp8", 89) == prebuilt.lost("int8", 86) == ""

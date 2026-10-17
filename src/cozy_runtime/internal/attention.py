@@ -492,7 +492,7 @@ def _launch(ready: Ready, device: DeviceFacts) -> None:
 
 
 def _prebuilt_fa3(candidate: Candidate, device: DeviceFacts) -> Ready | None:
-    """FlashAttention-3 from the cozy-kernels wheel once it verifies on this Hopper card; a
+    """FlashAttention-3 from the Runtime wheel once it verifies on this Hopper card; a
     failure is the run's one warning for it, and the local build is tried next."""
     if device.kind != "cuda" or not prebuilt.serves(candidate.name, device.sm):
         return None
@@ -502,13 +502,13 @@ def _prebuilt_fa3(candidate: Candidate, device: DeviceFacts) -> Ready | None:
     if kernel is None:
         if not prebuilt.ABSENT:
             _STATES[f"{candidate.name} prebuilt"] = kernel_compile.State(
-                "cozy-kernels", "failed", detail=why
+                "prebuilt", "failed", detail=why
             )
         return None
     digest = prebuilt.artifact("_fa3").partition(":")[2][:16]
     upstream.bind_fa3(kernel, f"prebuilt {digest}")
-    _STATES[candidate.name] = kernel_compile.State("cozy-kernels", "ready")
-    return Ready(candidate, _member(candidate), {"artifact": "cozy-kernels", "key": digest})
+    _STATES[candidate.name] = kernel_compile.State("prebuilt", "ready")
+    return Ready(candidate, _member(candidate), {"artifact": "prebuilt", "key": digest})
 
 
 def _compile_dependencies(

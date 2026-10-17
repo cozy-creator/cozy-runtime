@@ -1,6 +1,6 @@
 """The `fp8-rowwise/1` encoded GEMM: one call of the Runtime's 8-bit op library.
 
-The op is the cozy-kernels wheel's (`prebuilt`), serving once it verifies on the card
+The op is the Runtime wheel's prebuilt one (`prebuilt`), serving once it verifies on the card
 (`int8_linear.native`). One kernel quantizes each activation row to E4M3 against its own
 amax (`eager_quantize`'s law, bit for bit). The GEMM then applies both row scales and the bias in
 its epilogue: wgmma on Hopper, tcgen05 on B200 and B300, the TMA mma on RTX 50, and cuBLASLt's

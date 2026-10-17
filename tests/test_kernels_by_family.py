@@ -70,7 +70,7 @@ def test_each_row_from_its_capability_and_a_set_is_their_intersection() -> None:
 # ------------------------------------------------------------------------------ GEMM
 
 
-@pytest.mark.skipif(bool(prebuilt.ABSENT), reason="the cozy-kernels wheel is not installed")
+@pytest.mark.skipif(bool(prebuilt.ABSENT), reason="this Runtime wheel carries no kernels")
 def test_an_unnamed_card_takes_the_newest_family_whose_prebuilt_kernels_verified(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

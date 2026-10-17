@@ -16,7 +16,7 @@ pytestmark = pytest.mark.skipif(
 
 
 def test_fp8_op_verifies_on_the_card_and_keeps_the_law(tmp_path: Path) -> None:
-    """The cozy-kernels wheel's 8-bit op library, verified on this card. Its quantize kernel is
+    """The Runtime wheel's prebuilt 8-bit op library, verified on this card. Its quantize kernel is
     `eager_quantize` bit for bit (a zero row, K not a multiple of 256), and every GEMM tile of
     this card's table, with a bias, in fp16 and bf16, from an unaligned view, agrees with the
     f64 product of the quantized operands."""
