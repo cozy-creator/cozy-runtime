@@ -52,6 +52,7 @@ from cozy_runtime.internal import (
 from cozy_runtime.internal import attention_upstream as upstream
 from cozy_runtime.internal.attention_ulysses import Local
 from cozy_runtime.internal.encoding import DeviceFacts
+from cozy_runtime.internal.encoding.formats import Tensor
 
 # Tensors, torch modules and Diffusers' registry, backend members and processors are `Any`:
 # neither torch nor diffusers is installed in the check venv.
@@ -475,8 +476,8 @@ def _launch(ready: Ready, device: DeviceFacts) -> None:
     import torch
     from diffusers.models.attention_dispatch import dispatch_attention_fn
 
-    def call(q: Any, k: Any, v: Any, causal: bool) -> Any:
-        out = dispatch_attention_fn(q, k, v, backend=ready.member)
+    def call(q: Tensor, k: Tensor, v: Tensor, causal: bool) -> Tensor:
+        out: object = dispatch_attention_fn(q, k, v, backend=ready.member)
         return out[0] if isinstance(out, tuple) else out
 
     probe = partial(prebuilt.attention_probe, torch, device.index, call, candidate.exact, pairs,
