@@ -52,7 +52,6 @@ import json
 import math
 import os
 import platform
-import resource
 import select
 import socket
 import sys
@@ -245,6 +244,11 @@ from cozy_runtime.internal.weights import (
 )
 from cozy_runtime.internal.weights_writer import ExecutionStorage
 
+if sys.platform == "win32":
+    from ctypes import wintypes
+else:
+    import resource
+
 #: The native inline-result door: a small typed result rides
 #: the terminal envelope and skips the file-store round trip. Larger than this REFUSES at
 #: cr-007 — the blob-receipt branch needs a real write-and-receipt transaction, and minting
@@ -365,7 +369,6 @@ def _cancelled(root: Path, request_id: str) -> bool:
         return False
 
 
-_LIBC = ctypes.CDLL(None, use_errno=True)
 _IN_MOVED_TO = 0x80
 
 
@@ -375,11 +378,15 @@ def _held(
 ) -> Iterator[Callable[[float], bool]]:
     """A compile wait of this request's preparation (`kernel_compile.held`): a stage of its
     record, whose polls sleep until the worker's cancel marker (`_cancelled`) lands naming it,
-    which inotify sees at its rename into `root`. Without a watch, each poll reads it."""
-    fd = _LIBC.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
-    if fd >= 0 and _LIBC.inotify_add_watch(fd, os.fsencode(root), _IN_MOVED_TO) < 0:
-        os.close(fd)
-        fd = -1
+    which inotify sees at its rename into `root`. Without a watch (off Linux), each poll
+    reads it."""
+    fd = -1
+    if sys.platform == "linux":
+        libc = ctypes.CDLL(None, use_errno=True)
+        fd = libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
+        if fd >= 0 and libc.inotify_add_watch(fd, os.fsencode(root), _IN_MOVED_TO) < 0:
+            os.close(fd)
+            fd = -1
 
     def sleep(seconds: float) -> bool:
         if not _cancelled(root, request_id):
@@ -422,8 +429,58 @@ def _oom_score_adj() -> str:
         return ""
 
 
-def _rss() -> int:
-    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+if sys.platform == "win32":
+
+    class _MemoryCounters(ctypes.Structure):
+        _fields_ = [
+            ("cb", wintypes.DWORD),
+            ("PageFaultCount", wintypes.DWORD),
+            ("PeakWorkingSetSize", ctypes.c_size_t),
+            *(
+                (name, ctypes.c_size_t)
+                for name in (
+                    "WorkingSetSize",
+                    "QuotaPeakPagedPoolUsage",
+                    "QuotaPagedPoolUsage",
+                    "QuotaPeakNonPagedPoolUsage",
+                    "QuotaNonPagedPoolUsage",
+                    "PagefileUsage",
+                    "PeakPagefileUsage",
+                )
+            ),
+        ]
+
+    def _rss() -> int:
+        """The peak working set: what `ru_maxrss` is elsewhere."""
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.K32GetProcessMemoryInfo.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+        ]
+        counters = _MemoryCounters(cb=ctypes.sizeof(_MemoryCounters))
+        if not kernel32.K32GetProcessMemoryInfo(
+            wintypes.HANDLE(-1), ctypes.byref(counters), counters.cb
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return int(counters.PeakWorkingSetSize)
+
+    def _identity() -> tuple[int, int, int]:
+        """Process group, uid, euid. A Windows executor is its own group (its Job Object)
+        and has no POSIX ids."""
+        return os.getpid(), 0, 0
+
+else:
+
+    def _rss() -> int:
+        # Kilobytes on Linux, bytes on macOS.
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * (
+            1 if sys.platform == "darwin" else 1024
+        )
+
+    def _identity() -> tuple[int, int, int]:
+        """Process group, uid, euid."""
+        return os.getpgrp(), os.getuid(), os.geteuid()
 
 
 def _deadline(seconds: float | None) -> float:
@@ -843,6 +900,7 @@ class Executor:
                 raise AssertionError("shutdown ends the command loop")
 
     def hello(self) -> dict[str, Any]:
+        group, uid, euid = _identity()
         return {
             "ok": True,
             "pid": os.getpid(),
@@ -872,11 +930,11 @@ class Executor:
                 SEALED_STAGED,
             ],
             "memo": [stage_memo.CAPABILITY],
-            "pgid": os.getpgrp(),
+            "pgid": group,
             "no_new_privs": _proc_status("NoNewPrivs"),
             "oom_score_adj": _oom_score_adj(),
-            "uid": os.getuid(),
-            "euid": os.geteuid(),
+            "uid": uid,
+            "euid": euid,
             "sealed": dict(_SEALED),
             "torch_loaded": "torch" in sys.modules,
             "rss_bytes": _rss(),
@@ -4290,8 +4348,9 @@ class Executor:
             )
         try:
             body = bytearray()
+            os.lseek(answer.descriptor, 0, os.SEEK_SET)
             while len(body) < answer.length:
-                chunk = os.pread(answer.descriptor, answer.length - len(body), len(body))
+                chunk = os.read(answer.descriptor, answer.length - len(body))
                 if not chunk:
                     break
                 body += chunk
@@ -4348,12 +4407,14 @@ class Executor:
         fds the caller's to close. None unless the machine's answer names that same list."""
         # One descriptor per object (SDXL's UNet: about 1,700): lift the soft limit to the hard,
         # which macOS caps at OPEN_MAX.
-        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-        if soft != hard:
-            try:
-                resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
-            except (ValueError, OSError):
-                resource.setrlimit(resource.RLIMIT_NOFILE, (min(hard, _OPEN_MAX), hard))
+        # Windows has no such limit.
+        if sys.platform != "win32":
+            soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+            if soft != hard:
+                try:
+                    resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+                except (ValueError, OSError):
+                    resource.setrlimit(resource.RLIMIT_NOFILE, (min(hard, _OPEN_MAX), hard))
         body = canonical.write(msgspec.to_builtins(plan))
         memfd = plane.sealed_memfd("cozy-sealed-plan", body)
         try:
@@ -4410,7 +4471,10 @@ class Executor:
         return None
 
     def _child_events(self) -> int | None:
-        """The worker's nudge socket for this attempt's calls; None from an older worker."""
+        """The worker's nudge socket for this attempt's calls; None from an older worker, and
+        on Windows, whose event loop cannot watch a pipe: its calls are polled."""
+        if sys.platform == "win32":
+            return None
         answer = self._durable(ChildEvents(), Handoff)
         return answer.descriptor if answer.ok else None
 

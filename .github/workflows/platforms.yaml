@@ -2,10 +2,12 @@ name: platforms
 # A published Runtime on every desktop platform, Linux x86_64 as the control: does it install
 # (TensorFS has only a linux-x86_64 wheel, so elsewhere it builds from the sdist), which modules
 # import, do the CLI verbs run, and on macOS what MPS serves (SDXL-width UNet, VAE, attention vs
-# CPU fp32). `mps` runs this ref's Apple-GPU tests on macos-15 (`sdxl`: the SDXL spike too).
+# CPU fp32). `mps` runs this ref's Apple-GPU tests on macos-15 (`sdxl`: the SDXL spike too);
+# `windows` its executor-path tests on windows-2025.
 # Manual only: macOS bills 10x and Windows 2x.
 #   gh workflow run platforms.yaml -R cozy-creator/cozy-runtime --ref <branch> [-f os='["macos-15"]'] [-f runtime=<version>]
 #   gh workflow run platforms.yaml -R cozy-creator/cozy-runtime --ref <branch> -f os='[]' -f mps=true [-f sdxl=true]
+#   gh workflow run platforms.yaml -R cozy-creator/cozy-runtime --ref <branch> -f os='[]' -f windows=true
 on:
   workflow_dispatch:
     inputs:
@@ -27,6 +29,10 @@ on:
         default: false
       sdxl:
         description: With mps, the SDXL spike (fidika/sdxl from tensorhub.com, ~7 GB)
+        type: boolean
+        default: false
+      windows:
+        description: This ref's executor-path tests on windows-2025
         type: boolean
         default: false
 
@@ -221,3 +227,25 @@ jobs:
           path: ${{ runner.temp }}/mps-results
           if-no-files-found: ignore
           retention-days: 30
+
+  windows:
+    if: inputs.windows
+    name: windows (windows-2025)
+    runs-on: windows-2025
+    # Hang bound, not a work budget.
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v7
+
+      # The seam, file lock and parent watch import no TensorFS or torch.
+      - name: Tests
+        run: |
+          uv venv --python 3.12 .venv
+          uv pip install --python .venv/Scripts/python.exe --no-deps -e .
+          uv pip install --python .venv/Scripts/python.exe msgspec pytest
+          .venv/Scripts/python.exe -m pytest -q -rs tests/test_windows_executor_path.py

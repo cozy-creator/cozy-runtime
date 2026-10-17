@@ -22,6 +22,9 @@ import socket
 import sys
 from collections.abc import Sequence
 
+if sys.platform != "win32":
+    import resource
+
 #: Extensions whose bytes ARE the weights. The derivation reads configs and code; a
 #: checkpoint byte reaching a factory means the derive/serve fence has already failed.
 WEIGHT_SUFFIXES: tuple[str, ...] = (
@@ -88,7 +91,8 @@ def unix_seam(event: str, args: tuple[object, ...]) -> bool:
     """True when a `NETWORK_EVENTS` hit is an AF_UNIX connect: a local seam, not egress."""
     if event != "socket.connect" or not args:
         return False
-    return getattr(args[0], "family", None) == socket.AF_UNIX
+    unix = getattr(socket, "AF_UNIX", None)  # none on Windows
+    return unix is not None and getattr(args[0], "family", None) == unix
 
 
 def refuse_network(why: str, *, allow_unix_seam: bool = False) -> None:
@@ -148,9 +152,10 @@ def install(*, allow_write_prefixes: Sequence[str] = ()) -> None:
 
 
 def bound(*, address_bytes: int, cpu_seconds: int) -> None:
-    """Bound the child. A construction that tries to allocate real weights dies here."""
-    import resource
-
+    """Bound the child. A construction that tries to allocate real weights dies here. Windows
+    has no rlimits: there the child is unbounded."""
+    if sys.platform == "win32":
+        return
     resource.setrlimit(resource.RLIMIT_AS, (address_bytes, address_bytes))
     resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds))
 

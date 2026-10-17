@@ -34,7 +34,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
 
+from cozy_runtime.internal import filelock
 from cozy_runtime.internal.child_env import EXECUTOR_SCOPE_ENV
+
+if sys.platform == "win32":
+    import _winapi
 
 PLATFORM = sys.platform
 
@@ -49,9 +53,10 @@ _PR_GET_NO_NEW_PRIVS = 39
 # only on Linux; Python builds that expose the typed wrappers use those instead.
 _SYS_PIDFD_SEND_SIGNAL = 424
 _SYS_PIDFD_OPEN = 434
+_SYNCHRONIZE = 0x00100000
 
-# Linux's parent-death signal survives exec. darwin's is a watching thread, which an exec ends:
-# a process that execs (the trampoline) leaves the arming to the program it becomes.
+# Linux's parent-death signal survives exec. darwin's and Windows's are a watching thread, which
+# an exec ends: a process that execs (the trampoline) leaves the arming to the program it becomes.
 PARENT_DEATH_SURVIVES_EXEC = PLATFORM == "linux"
 
 
@@ -184,9 +189,10 @@ def _prctl(option: int, arg: int = 0) -> int:
 def arm_parent_death() -> None:
     """SIGKILL this process when its parent dies. Covers FUTURE deaths only — the caller
     must re-check the parent afterwards (trampoline step 2). Linux: PR_SET_PDEATHSIG, which
-    survives exec. darwin: a daemon thread waits on the parent's exit (kqueue NOTE_EXIT) and
-    kills this process; an exec ends it (`PARENT_DEATH_SURVIVES_EXEC`)."""
-    if PLATFORM == "darwin":
+    survives exec. darwin and Windows: a daemon thread waits on the parent's exit (kqueue
+    NOTE_EXIT; the parent's process handle) and kills this process; an exec ends it
+    (`PARENT_DEATH_SURVIVES_EXEC`)."""
+    if PLATFORM in ("darwin", "win32"):
         _watch_parent_exit()
         return
     _linux_only("arm_parent_death")
@@ -212,6 +218,20 @@ if sys.platform == "darwin":
         def watch() -> None:
             queue.control(None, 1, None)
             os.kill(os.getpid(), signal.SIGKILL)
+
+        threading.Thread(target=watch, name="parent-watch", daemon=True).start()
+
+elif sys.platform == "win32":
+
+    def _watch_parent_exit() -> None:
+        try:
+            parent = _winapi.OpenProcess(_SYNCHRONIZE, False, os.getppid())
+        except OSError:
+            _winapi.TerminateProcess(_winapi.GetCurrentProcess(), 1)
+
+        def watch() -> None:
+            _winapi.WaitForSingleObject(parent, _winapi.INFINITE)
+            _winapi.TerminateProcess(_winapi.GetCurrentProcess(), 1)
 
         threading.Thread(target=watch, name="parent-watch", daemon=True).start()
 
@@ -1159,12 +1179,9 @@ def remove_executor_scope(scope: ExecutorScope) -> None:
 def acquire_worker_root_lease(path: Path, *, wait: bool = False) -> WorkerRootLease:
     """Acquire the process-lifetime single-worker lease for one worker root; with `wait`,
     block until its holder releases it."""
-    _posix_only("acquire_worker_root_lease")
-    import fcntl
-
     descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
     try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+        filelock.lock(descriptor, wait=wait)
     except BaseException:
         os.close(descriptor)
         raise
@@ -1190,12 +1207,9 @@ def lease_holder(path: Path) -> int | None:
 
 
 def release_worker_root_lease(lease: WorkerRootLease) -> None:
-    _posix_only("release_worker_root_lease")
-    import fcntl
-
     if lease.descriptor < 0:
         return
-    fcntl.flock(lease.descriptor, fcntl.LOCK_UN)
+    filelock.unlock(lease.descriptor)
     os.close(lease.descriptor)
     lease.descriptor = -1
 
