@@ -1,23 +1,17 @@
-"""An executor's own tensors off its GPU, the last room an op can be given (memory rungs 4-5).
+"""An executor's own tensors off its GPU: memory rungs 4 and 5, after every weight an op does
+not read is unmapped and every idle tenant gave back. Least recently used first (`touch`), the
+op's operands last, a storage leaves two ways:
 
-Once every weight an op does not read is unmapped and every idle tenant has given back, the
-device bytes left are the tensors this process holds (a package's caches, an earlier stage's
-outputs, a decoder's feature maps). They leave least recently used first (`touch`), the op's
-own operands last, two ways:
+- Mapped: repointed in place to page-locked host memory the GPU reads over the bus, so whatever
+  holds its tensors, native code included, is unchanged. While the host can give it.
+- Out: one no op touched since its stage began (`began`) is copied to pageable host memory, or
+  to disk once the host can give no more (rung 5), and its device bytes are released; the
+  dispatch mode brings it back before an op reads it (`fault`). Never a CUDA graph pool's: its
+  graphs read it unseen. Unified memory (Apple) has only this way.
 
-- Mapped: copied to page-locked host memory the GPU addresses directly, the storage repointed
-  there. Every tensor over it stays a CUDA tensor read over the bus, so whatever holds one,
-  native code included, is unchanged. While the host can lock it (`Weights.lockable`).
-- Out: a storage no op has touched since its stage began (`began`: an earlier stage's state,
-  a decoder's leftovers) is copied to pageable host memory, or to a file on the machine's disk
-  once the host can give no more (rung 5), and its device bytes are released; the dispatch mode
-  brings it back before an op touches it (`fault`). Never a CUDA graph pool's: its graphs read
-  it without the mode seeing them. Unified memory (Apple) has only this way.
-
-Ops note what they touch only under pressure, from a stage's first move until nothing is off
-the device: a stage with room pays nothing per op. Locking new pages runs at about 1.6 GB/s,
-most of a mapped move's cost: a block no tensor holds any more stays locked for the next move
-or host result of its size, until the stage closes.
+Ops are noted only under pressure, from the first move until nothing is off the device. Locking
+new pages runs at about 1.6 GB/s: a freed block stays locked for the next of its size until the
+stage closes.
 """
 
 from __future__ import annotations
