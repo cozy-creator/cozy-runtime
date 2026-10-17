@@ -402,6 +402,9 @@ class Weights:
         self.mapping = 0
         self.mapped: set[int] = set()
         self.mapping_ops: list[str] = []
+        #: bakes that wait for the overlay factors the read in flight is binding:
+        #: (region, the parts it was placed with, home)
+        self.pending_bakes: list[tuple[Region, list[dict[str, Tensor]], bool]] = []
         #: the plane is placing or giving room: an allocator refusal inside is its own to answer
         self.placing = False
         #: the bytes of the last allocator refusal `refused` unmapped weights for
@@ -1168,6 +1171,7 @@ class Weights:
             self.mapping, mapping = self.mapping - 1, False
             self.mapped -= mine
             self.mapping_ops.pop()
+            self._bake_pending()
             yield Read(
                 real, tuple((r.bound, r.bound + r.span) for _, r, _ in held if r.bound is not None)
             )
@@ -1176,10 +1180,21 @@ class Weights:
                 self.mapping -= 1
                 self.mapped -= mine
                 self.mapping_ops.pop()
+                if not self.mapping:
+                    self.pending_bakes = []  # a failed read leaves them unbaked: hooks serve
             for component, region, lease in reversed(held):
                 if region.index not in component.resident:
                     unbind(region)
                 lease.release()
+
+    def _bake_pending(self) -> None:
+        """The bakes that waited for the factors this read bound (run 10549), each on the
+        bytes still placed where it was; a region placed again since bakes as it was placed."""
+        pending, self.pending_bakes = self.pending_bakes, []
+        for region, parts, home in pending:
+            views = region.views.get(region.bound) if region.bound is not None else None
+            if views is not None and views.parts is parts:
+                _bake(self.torch, region, parts, home, False)
 
     def drain(self) -> None:
         """Read the plane's events: a region evicted from this device goes back to meta before
@@ -2240,14 +2255,17 @@ def _bake(
     if home and refill and _stale(region, keys):
         raise _Stale(region.index)
     bakes_now = some and (not home or not region.baked)
-    if bakes_now and _factors_mapping(region, keys):
-        # Placed inside the read that is mapping its overlay's factors (run 10549): they cannot
-        # be read again from here. The region serves unbaked, its hooks adding the delta per call.
+    waiting = _factors_mapping(region, keys) if bakes_now else None
+    if waiting is not None:
+        # Placed inside the read that is binding its overlay's factors (run 10549): they cannot
+        # be read again from here, so the bake waits for that read to bind them. Until then the
+        # region serves unbaked, its hooks adding the delta per call.
         for bake in region.bakes:
             if bake.layer is not None:
                 bake.layer._cozy_baked = False
             for hook in bake.hooks:
                 hook._cozy_baked = False
+        waiting.pending_bakes.append((region, parts, home))
         return False
     now = home and some and not region.baked
     if now:
@@ -2267,17 +2285,17 @@ def _bake(
     return now
 
 
-def _factors_mapping(region: Region, keys: list[tuple[object, ...]]) -> bool:
-    """Whether a factor some hook of the region would bake is a stand-in whose region a weight
-    read in flight is mapping now."""
+def _factors_mapping(region: Region, keys: list[tuple[object, ...]]) -> Weights | None:
+    """The plane whose weight read in flight is mapping a factor some hook of the region would
+    bake (a stand-in), or None."""
     for bake, row in zip(region.bakes, keys, strict=True):
         for hook, key in zip(bake.hooks, row[1:], strict=True):
             got = hook.lora_factors() if key is not None else None
             for factor in (got[1], got[2]) if got is not None else ():
                 origin = getattr(factor, "origin", None)
                 if origin is not None and id(origin[2]) in origin[0].mapped:
-                    return True
-    return False
+                    return cast("Weights", origin[0])
+    return None
 
 
 def _stale(region: Region, keys: list[tuple[object, ...]]) -> bool:
