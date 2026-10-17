@@ -58,7 +58,6 @@ import socket
 import sys
 import threading
 import time
-from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
@@ -163,7 +162,7 @@ from cozy_runtime.internal import (
 )
 from cozy_runtime.internal.config import inherited_environment, restore_seal, seal_snapshot
 from cozy_runtime.internal.discovery import discover_distribution, discover_installed
-from cozy_runtime.internal.encoding.leaves import FORMATS
+from cozy_runtime.internal.encoding.leaves import FORMATS, serving
 from cozy_runtime.internal.executor_commands import (
     LOAD_ATTENTION_PIN,
     LOAD_PINNED,
@@ -3761,26 +3760,23 @@ class Executor:
 
     @staticmethod
     def _emit_gemm(record: AuthorAttempt, member: Executor) -> None:
-        """`gemm.selected`: per component, format and kernel, the encoded leaves whose last call
-        that kernel served. `gemm.fallback`: each that served below what its lane wanted, why,
-        also said as a warning line (a machine before TensorD keeps `gemm.*` drops the fact)."""
+        """`gemm.selected`: per component and leaf provider, the kernel its installed leaves serve
+        now (read once a run, never per call). `gemm.fallback`: each that serves below what its
+        lane wanted, and why, also said as a warning line (a machine before TensorD keeps
+        `gemm.*` drops the fact)."""
 
         def fallback(value: str, **fields: Any) -> None:
             record.emit("confession", "gemm.fallback", value, **fields)
             record.emit("log", "a GEMM served below its lane", "warn", kernel=value, **fields)
 
         prefix = member._prefix()
-        leaves = member.backend.leaves if member.backend is not None else {}
-        served = Counter(
-            (key.partition(".")[0], leaf.provider, leaf.kernel)
-            for key, (leaf, _, _) in leaves.items()
-            if leaf.kernel
-        )
+        counted = member.backend.gemm_sites if member.backend is not None else {}
+        index = member.device_facts.index if member.device_facts is not None else 0
         missing = int8_linear.unavailable()
         native = {"int8": int8_linear.OP, "fp8": fp8_linear.OP}
-        for (component, leaf, kernel), sites in sorted(served.items()):
+        for (component, leaf), sites in sorted(counted.items()):
+            kernel, form = serving(leaf, index), FORMATS[leaf]
             fields: dict[str, Any] = {"component": prefix + component, "sites": sites}
-            form = FORMATS[leaf]
             record.emit("confession", "gemm.selected", kernel, format=form, leaf=leaf, **fields)
             wanted = native.get(form, kernel)
             if missing and kernel != wanted:
