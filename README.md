@@ -185,47 +185,12 @@ numerics. A method drawing from the default RNG refuses `memo_rng`. Results go t
 executor's LRU, and to the machine's disk tier only when small and measured costly to
 produce (`memo:` in runtime.yaml; tracker design `pipeline-memoization.md`).
 
-Runtime is ONE PyPI package with two wheel files per release: the pure `py3-none-any`
-wheel, and a `cp312-abi3` linux/x86 wheel carrying the same code plus the compiled CUDA
-kernels at `cozy_runtime._kernels` (`COZY_RUNTIME_BUILD_KERNELS=1` selects that build;
-the default `uv build` stays toolchain-free). The `native/` sources ship generic fused
-operations (today one: RMSNorm + split-half RoPE); packages decide where they run. The
-anima package installs it in its own post-fill plan and runs eager wherever the extension,
-CUDA or its reviewed Torch/CUDA pair is missing.
-
-`scripts/build-kernel-wheel.sh` is that second wheel's ONE recipe, run by `publish.yaml`
-and by hand alike. It builds inside `manylinux_2_28_x86_64` with CUDA 13.0 and lets
-auditwheel certify the platform tag, so nvcc never has to exist on the host and the
-release cannot ship a tag the binary does not honour. A wheel's glibc floor is the floor
-of the machine that compiled it, which is why the build is manylinux rather than the GPU
-worker image's Ubuntu 24.04 base (that toolchain yields an unpublishable
-`manylinux_2_39`); the parts that must match the worker image -- nvcc 13.0.88, cp312,
-static cudart -- do. A developer box wanting the fused kernels installs that exact file,
-never a side channel:
-
-```
-scripts/build-kernel-wheel.sh --out dist
-uv tool install --force --python 3.12 \
-  "cozy-runtime[media,model-execution] @ $PWD/dist/cozy_runtime-<version>-cp312-abi3-manylinux_2_28_x86_64.whl"
-```
-
-For Python development edits, reuse a verified published native wheel without running CUDA:
-
-```sh
-uv run --script scripts/build-dev-wheel.py \
-  --native-wheel /path/to/cozy_runtime-<version>-cp312-abi3-manylinux_2_28_x86_64.whl \
-  --native-sha256 <that-wheel-sha256> --out dist/dev
-```
-
-This builds the current working tree, including uncommitted Python edits. It checks the native
-sources, build configuration and wrapper against the donor's embedded commit; changes require a
-normal native build. The result remains one standard Runtime wheel. Its local dev version binds
-both input wheels and the build script, and `COMMIT="unknown"` avoids claiming Git HEAD for a
-dirty snapshot. `SOURCE_WHEEL_SHA256` identifies the exact Python wheel retained under the
-output's `source-wheels/`; `native-provenance.json` records the donor commit and wheel/binary
-hashes. Standard `wheel unpack` and `wheel pack` verify and
-regenerate RECORD. Install the resulting wheel through the developer pod's coordinated software
-update; this command builds an artifact and does not replace a running worker.
+Runtime's compiled CUDA kernels are the `cozy-kernels` wheel (`kernels/`, one per OS and CPU:
+Linux x86_64 and aarch64, Windows x86_64), which Runtime depends on: the 8-bit op, FlashAttention-3's
+forward and RMSNorm + split-half RoPE (`author.kernels.rms_rope_split_half`), every GPU target's
+cubins plus PTX, nanobind on the stable ABI, no torch ABI. Each kernel serves once it passes its
+probe on the card (`internal/verify.py`). `kernels.yaml` builds and checks the wheels; Runtime's
+own wheels are the pure one and, per Linux arch, that wheel plus tensord (`task machine`).
 
 Every model-specific optimization first benchmarks `torch.compile`/Inductor as a discovery
 oracle and records profile identity, graph breaks, generated kernels, compile cost, warm
