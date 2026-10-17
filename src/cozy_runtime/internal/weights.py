@@ -4280,7 +4280,7 @@ class WeightResidency:
                     self._squeezing()
                 if weights.growing and component.passes == 2 > passes:
                     self._grow()
-            memory, op = weights.memory, f"{component.name}.{region.path}"
+            memory, op, seen = weights.memory, f"{component.name}.{region.path}", -1
             while True:
                 if memory.shrunk and not weights.running:  # the stage gave weights back
                     memory.shrunk = False
@@ -4295,20 +4295,27 @@ class WeightResidency:
                 lease = hold or memory.retry(
                     functools.partial(self._acquire, component, region.index, stream), op
                 )
+                short: tuple[int, bool] | None = None
                 try:
                     # The plane's bind and bake are its own math, outside the block's
-                    # recovery: a bake that fails leaves the region dirty, and it refills.
+                    # recovery: one short of memory leaves the region dirty, and it refills.
                     if region.bound != int(lease.ptr) or region.bakes:
-                        with self._quiet():
-                            baked = bind(weights.torch, region, lease, refill=True)
-                            if baked and region.index in component.resident:
-                                self._bake_resident(component)
-                    weights.running.append(component.key)
-                    weights.last = component.key
-                    try:
-                        return forward(*args, **kwargs)
-                    finally:
-                        weights.running.pop()
+                        try:
+                            with self._quiet():
+                                baked = bind(weights.torch, region, lease, refill=True)
+                                if baked and region.index in component.resident:
+                                    self._bake_resident(component)
+                        except Exception as exc:
+                            if (short := shortage(exc)) is None:
+                                raise
+                            exc.__traceback__ = None
+                    if short is None:
+                        weights.running.append(component.key)
+                        weights.last = component.key
+                        try:
+                            return forward(*args, **kwargs)
+                        finally:
+                            weights.running.pop()
                 except _Stale:
                     pass
                 finally:
@@ -4320,7 +4327,10 @@ class WeightResidency:
                         holds[region.index] = hold  # the stage's, until it lets go
                     else:
                         lease.release()
-                self._restore(component, region)
+                if short is None:
+                    self._restore(component, region)
+                elif (seen := memory.again(short[0] or region.span, op, (), seen)) < 0:
+                    memory.exhausted(short[0] or region.span, op)
 
         return run
 
