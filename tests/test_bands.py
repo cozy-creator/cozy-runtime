@@ -18,6 +18,8 @@ diffusers = pytest.importorskip("diffusers")
 
 from torch.utils._python_dispatch import TorchDispatchMode  # noqa: E402
 
+from cozy_runtime.internal import attention_upstream as upstream  # noqa: E402
+from cozy_runtime.internal.attention_ulysses import Options, _call  # noqa: E402
 from cozy_runtime.internal.bands import Bands  # noqa: E402
 
 
@@ -323,3 +325,48 @@ def test_a_padding_taller_than_a_band_fills_the_bands_wholly_inside_it(room: int
     x = torch.randn(1, 3, 4, 7)
     _, ran = banded(lambda: torch.nn.functional.pad(x, (1, 2, 6, 5), value=0.5) * 2, room)
     assert "aten.pad" in ran or "aten.constant_pad_nd" in ran
+
+
+class Tight(TorchDispatchMode):  # type: ignore[misc]
+    """A card whose attention kernel fits `heads` query heads of `rows` query rows at once: a
+    larger call runs out of device memory, as on a full GPU. Notes each call's (heads, rows)."""
+
+    def __init__(self, heads: int, rows: int) -> None:
+        super().__init__()
+        self.heads, self.rows, self.ran = heads, rows, set[tuple[int, int]]()
+
+    def __torch_dispatch__(self, func: Any, types: Any, args: Any = (), kwargs: Any = None) -> Any:
+        if "scaled_dot_product" in str(func):
+            size = (int(args[0].shape[1]), int(args[0].shape[2]))  # [batch, heads, rows, dim]
+            if size[0] > self.heads or size[1] > self.rows:
+                raise torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 2.00 MiB")
+            self.ran.add(size)
+        return func(*args, **(kwargs or {}))
+
+
+@pytest.mark.parametrize(
+    ("heads", "rows", "masking"),
+    [(4, 1000, "none"), (2, 1000, "causal"), (1, 128, "none"), (4, 128, "mask"), (8, 128, "mask")],
+)
+def test_attention_out_of_memory_runs_in_head_groups_then_query_rows(
+    heads: int, rows: int, masking: str
+) -> None:
+    """The Runtime's attention dispatch, out of device memory whole: query heads with their K/V
+    head (4 share one), whole groups first, then query rows in 128s beside every key, a mask
+    cut with them; causal by heads only. Each piece computes its rows as the whole does."""
+    torch.manual_seed(8)
+    keys = 300 if masking == "causal" else 250
+    q, k, v = torch.randn(2, 300, 8, 16), torch.randn(2, keys, 2, 16), torch.randn(2, keys, 2, 16)
+    mask = torch.rand(2, 1, 300, keys) > 0.3 if masking == "mask" else None
+    causal = masking == "causal"
+    options = Options(attn_mask=mask, dropout_p=0.0, is_causal=causal, scale=None, enable_gqa=True)
+    card = Bands(Card(1 << 30))  # noqa: F841 (the dispatch finds a device's bands while they live)
+    with torch.inference_mode():
+        whole = upstream.sdpa(q, k, v, **options)
+        with Tight(heads, rows) as tight:
+            out = _call("_cozy_sdpa", upstream.SDPA, q, k, v, options)
+    if rows >= 300:  # a head's rows as the whole call computes them, to the bit
+        assert torch.equal(out, whole)
+    else:  # a shorter query may take another CPU GEMM tiling (a GPU kernel's 128-row tiles not)
+        torch.testing.assert_close(out, whole, rtol=1e-6, atol=1e-6)
+    assert max(h for h, _ in tight.ran) <= heads and max(r for _, r in tight.ran) <= rows

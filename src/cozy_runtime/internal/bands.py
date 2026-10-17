@@ -19,9 +19,12 @@ padding: a lone frame through a causal 3D convolution is a 2D one.
 
 from __future__ import annotations
 
+import sys
+import weakref
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
+from types import CodeType, FrameType
 from typing import TYPE_CHECKING, Any, cast
 
 from cozy_runtime.author._errors import is_device_oom
@@ -34,6 +37,36 @@ if TYPE_CHECKING:
     from cozy_runtime.internal.weights import Weights
 
 type Rule = Callable[[OpOverload, tuple[Any, ...], dict[str, Any]], "Plan | None"]
+
+#: each device's bands (`attend`, from the attention dispatch)
+ON: weakref.WeakValueDictionary[str, Bands] = weakref.WeakValueDictionary()
+#: the code of calls that cut themselves (`cuts`)
+_CUTTERS: set[CodeType] = set()
+
+
+def cuts[F: Callable[..., object]](call: F) -> F:
+    """`call` cuts itself into pieces (`Bands.attend`): an op under it that runs out of device
+    memory raises to it before any room is made for the op whole (`raises`)."""
+    _CUTTERS.add(call.__code__)
+    return call
+
+
+def held[T](piece: Callable[[], T]) -> T:
+    """`piece()`, whose ops make room as any op does: a cut's finest piece."""
+    return piece()
+
+
+def raises() -> bool:
+    """Whether an op that ran out of device memory raises to a call around it that cuts itself.
+    Read from the stack when an op runs out, so a call pays nothing for it otherwise."""
+    frame: FrameType | None = sys._getframe(1)
+    while frame is not None:
+        if frame.f_code is held.__code__:
+            return False
+        if frame.f_code in _CUTTERS:
+            return True
+        frame = frame.f_back
+    return False
 
 
 @dataclass(slots=True)
@@ -67,6 +100,7 @@ class Bands:
     def __init__(self, weights: Weights) -> None:
         self.weights = weights
         torch = self.torch = weights.torch
+        ON[str(weights.device)] = self
         self.aten = aten = torch.ops.aten
         self.pointwise, self.seeded = torch.Tag.pointwise, torch.Tag.nondeterministic_seeded
         self.last: _Zeros | None = None
@@ -181,40 +215,10 @@ class Bands:
     # -- placing and running bands
 
     def _banded(self, plan: Plan, operands: Any) -> Any:
-        """The op in bands, its result on the device when it fits there: idle weights unmap
-        and the tensors used least recently move to host memory first (`spill`); else in
-        host memory."""
-        torch, weights = self.torch, self.weights
-        meta, axis = plan.out, plan.axis
-        height = int(meta.shape[axis])
-        nbytes = _span(meta) * meta.element_size()
-        free, movable = weights.activation_room()
-        room, least = free + movable, nbytes + 2 * plan.per_row * plan.align
-        if least > room and weights.spill(least - room, operands):
-            free, movable = weights.activation_room()
-            room = free + movable
-        on_device = least <= room or not self._hostable(nbytes)
-        # two bands in flight (`_on`)
-        rows = (room - (nbytes if on_device else 0)) // max(2 * plan.per_row, 1)
-        rows = max(plan.align, min(height, rows) // plan.align * plan.align)
-        out = None
-        if on_device:
-            weights.free_for(nbytes + 2 * rows * plan.per_row)
-            try:
-                out = torch.empty_strided(
-                    meta.shape, meta.stride(), dtype=meta.dtype, device=weights.device
-                )
-            except Exception as exc:
-                if not is_device_oom(exc) or not self._hostable(nbytes):
-                    raise
-        if "bands" not in weights.modes:
-            self.ops = self.hosted = 0
-        self.ops += 1
-        if out is None:
-            out = spill.empty(torch, weights.device, meta)
-            self.hosted += nbytes
-        hosted = f", {self.hosted} B of results in host memory" if self.hosted else ""
-        weights.modes["bands"] = f"{self.ops} ops{hosted}"
+        """The op in bands, its result placed by `_room`."""
+        torch, weights, axis = self.torch, self.weights, plan.axis
+        height = int(plan.out.shape[axis])
+        out, rows = self._room(plan.out, height, plan.per_row, plan.align, operands)
         while plan.gather is not None:  # statistics first, at a height memory allows
             try:
                 plan.gather(rows)
@@ -245,6 +249,112 @@ class Bands:
             for stream in self.streams:
                 main.wait_stream(stream)
         return out
+
+    def _room(
+        self, meta: Tensor, height: int, per_row: int, align: int, operands: tuple[object, ...]
+    ) -> tuple[Tensor, int]:
+        """A result like `meta` on the device when it fits there (idle weights unmap and the
+        tensors used least recently move to host memory first: `spill`), else in host memory;
+        and the rows of `height` a piece may take beside it, on multiples of `align`."""
+        torch, weights = self.torch, self.weights
+        nbytes = _span(meta) * meta.element_size()
+        free, movable = weights.activation_room()
+        room, least = free + movable, nbytes + 2 * per_row * align
+        if least > room and weights.spill(least - room, operands):
+            free, movable = weights.activation_room()
+            room = free + movable
+        on_device = least <= room or not self._hostable(nbytes)
+        # two pieces in flight (`_on`)
+        rows = (room - (nbytes if on_device else 0)) // max(2 * per_row, 1)
+        rows = max(align, min(height, rows) // align * align)
+        out = None
+        if on_device:
+            weights.free_for(nbytes + 2 * rows * per_row)
+            try:
+                out = torch.empty_strided(
+                    meta.shape, meta.stride(), dtype=meta.dtype, device=weights.device
+                )
+            except Exception as exc:
+                if not is_device_oom(exc) or not self._hostable(nbytes):
+                    raise
+        if "bands" not in weights.modes:
+            self.ops = self.hosted = 0
+        self.ops += 1
+        if out is None:
+            out = spill.empty(torch, weights.device, meta)
+            self.hosted += nbytes
+        hosted = f", {self.hosted} B of results in host memory" if self.hosted else ""
+        weights.modes["bands"] = f"{self.ops} ops{hosted}"
+        return out, rows
+
+    def attend(
+        self,
+        call: Callable[[Tensor, Tensor, Tensor, Tensor | None], Tensor],
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        mask: Tensor | None,
+        rows: int,
+        heads: bool,
+    ) -> Tensor | None:
+        """Attention over [batch, sequence, heads, dim] that ran out of device memory whole, or
+        reads Q, K or V from host memory, in pieces each computed as the whole computes it:
+        query heads with their K/V heads (`heads`: the kernel reduces within a head, its scales
+        and block routing included), whole K/V groups first, down to one head; then one piece's
+        query rows on multiples of `rows` (the kernel's query block; 0: never), each beside
+        every key. A mask is cut with them. None: it cannot be cut."""
+        count, length = int(q.shape[2]), int(q.shape[1])
+        group, unit = count // int(k.shape[2]), 1 if heads else count
+        if (mask is not None and mask.dim() != 4) or (unit == count and not rows):
+            return None
+        meta = self.torch.empty(q.shape, dtype=q.dtype, device="meta")
+        with self.torch.utils._python_dispatch._disable_current_modes():
+            out, n = self._room(meta, count, 2 * (_bytes(q) + _bytes(k)) // count, unit, (q, k, v))
+        self.rewrites += 1
+
+        def piece(h: int, n: int, s: int, m: int) -> None:
+            """Query heads [h, h + n) and rows [s, s + m) into `out`."""
+            kv = [self._take(t, 2, h // group, (h + n - 1) // group + 1) for t in (k, v)]
+            part = mask
+            if part is not None:  # a dim of one broadcasts
+                part = part if part.shape[1] == 1 else part.narrow(1, h, n)
+                part = part if part.shape[2] == 1 else self._take(part, 2, s, s + m)
+            query = self._take(q.narrow(2, h, n), 1, s, s + m)
+            out.narrow(1, s, m).narrow(2, h, n).copy_(call(query, kv[0], kv[1], part))
+
+        h = 0
+        while h < count:
+            # whole K/V groups, else heads that share one K/V head
+            n = n // group * group if n >= group else min(n, group - h % group)
+            n = min(n, count - h)
+            if self._attempt(n <= unit and not rows, piece, h, n, 0, length):
+                h += n
+            elif n > unit:
+                n = max(unit, n // 2)
+            else:
+                span, s = max(rows, length // 2 // rows * rows), 0
+                while s < length:
+                    m = min(span, length - s)
+                    if self._attempt(span <= rows, piece, h, n, s, m):
+                        s += m
+                    else:
+                        span = max(rows, span // 2 // rows * rows)
+                h += n
+        return out
+
+    def _attempt(self, finest: bool, piece: Callable[..., None], *args: int) -> bool:
+        """`piece(*args)`; False: it ran out of device memory (`raises`). The finest piece's
+        ops make room as any op does."""
+        if finest:
+            held(lambda: piece(*args))
+            return True
+        try:
+            piece(*args)
+        except Exception as exc:
+            if not is_device_oom(exc):
+                raise
+            return False
+        return True
 
     def _on(self, turn: int) -> AbstractContextManager[Any]:
         if not self.streams:
