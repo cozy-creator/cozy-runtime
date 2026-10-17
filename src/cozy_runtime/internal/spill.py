@@ -39,6 +39,8 @@ GRAIN = 2 << 20
 ALIGN = 256
 #: [times tensors moved, their bytes, nanoseconds it took] since the process began
 MOVED = [0, 0, 0]
+#: [times tensors came back (`restore`), their bytes] since the process began
+RESTORED = [0, 0]
 #: locked blocks no tensor holds, by size; and the address of every block one holds -> its size
 _FREE: dict[int, list[Any]] = {}
 HELD: dict[int, int] = {}
@@ -202,6 +204,43 @@ def spill(
     MOVED[1] += moved
     MOVED[2] += time.perf_counter_ns() - started
     return moved
+
+
+def restore(torch: ModuleType, device: Device, room: int) -> int:
+    """The storages in host blocks come back to `device`, largest first, while `room` bytes
+    allow: each is copied back and repointed in place, and its host block is free again. A
+    moved tensor nobody brings back is read over the bus for as long as it lives, and a cache
+    or a decoder's state lives across calls. Returns the bytes restored."""
+    if not HELD or room <= 0:
+        return 0
+    torch.cuda.synchronize(device)
+    starts = sorted(HELD)
+    found: dict[int, UntypedStorage] = {}
+    for value in gc.get_objects():
+        if (
+            type(value) not in (torch.Tensor, torch.nn.Parameter)
+            or value.layout is not torch.strided
+            or value.device != device
+        ):
+            continue
+        storage = value.untyped_storage()
+        address, at = storage.data_ptr(), bisect_right(starts, storage.data_ptr()) - 1
+        if at >= 0 and address < starts[at] + HELD[starts[at]]:
+            found.setdefault(address, storage)
+    back = 0
+    for storage in sorted(found.values(), key=lambda s: -s.nbytes()):
+        nbytes = int(storage.nbytes())
+        if back + nbytes > room:
+            continue
+        fresh = torch.empty(nbytes, dtype=torch.uint8, device=device)
+        fresh.copy_(torch.empty(0, dtype=torch.uint8, device=device).set_(storage))
+        # `fresh` takes the host pointer and frees its block when it goes
+        storage._swap_data_ptr_(fresh.untyped_storage())
+        back += nbytes
+    torch.cuda.synchronize(device)
+    RESTORED[0] += back > 0
+    RESTORED[1] += back
+    return back
 
 
 def _move(torch: ModuleType, device: Device, storage: UntypedStorage) -> int:
