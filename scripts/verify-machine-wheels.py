@@ -71,7 +71,7 @@ def main() -> None:
             modules = {
                 n.removeprefix("cozy_runtime/_kernels/")
                 for n in archive.namelist()
-                if n.startswith("cozy_runtime/_kernels/_") and not n.endswith(".pyi")
+                if n.startswith("cozy_runtime/_kernels/") and n.endswith((".so", ".pyd"))
             }
             assert modules == set(kernels.get(str(tag), ())), f"{wheel.name} kernels: {modules}"
             if architecture is None:
