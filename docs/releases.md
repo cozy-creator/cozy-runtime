@@ -37,6 +37,9 @@ gh workflow run publish.yaml -f release_tag=vX.Y.Z -f mode=prebuilt \
 This path needs no TensorD or TensorFS source credentials. It verifies tag identity,
 downloads the release assets and requires the native wheel, pure wheel and sdist for
 that same verified version. It refuses wrong-version, missing, extra or changed files.
+A release whose TensorD pin has no arm build may omit the Linux aarch64 wheel only by naming it:
+`-f waive_platforms=linux-aarch64`. The run prints the waiver as a warning and in its summary; record
+it with the release. Without the waiver all four files are required.
 It does not import or execute downloaded artifact contents. The publishing job rechecks the hashes
 after artifact transfer, publishes with OIDC, and checks PyPI serves the same file set
 and hashes. Native donor pins and source build checks still belong to source mode.

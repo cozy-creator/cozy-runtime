@@ -24,7 +24,18 @@ def selected(sums: str) -> dict[str, str]:
     return files
 
 
-def verify(dist: Path, sums: str, version: str) -> str:
+# A platform wheel one release may omit, by an explicit waiver its publisher names.
+WAIVABLE = {"linux-aarch64": "cp312-abi3-manylinux_2_28_aarch64.whl"}
+
+
+def waivers(names: str) -> frozenset[str]:
+    waived = frozenset(names.replace(",", " ").split())
+    if unknown := sorted(waived - WAIVABLE.keys()):
+        raise ValueError(f"unknown platform waiver {unknown}; waivable: {sorted(WAIVABLE)}")
+    return waived
+
+
+def verify(dist: Path, sums: str, version: str, waived: frozenset[str] = frozenset()) -> str:
     files = selected(sums)
     if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
         raise ValueError("release version must be the verified X.Y.Z version")
@@ -33,7 +44,7 @@ def verify(dist: Path, sums: str, version: str) -> str:
         f"cozy_runtime-{version}-py3-none-any.whl",
         f"cozy_runtime-{version}-cp312-abi3-manylinux_2_28_x86_64.whl",
         f"cozy_runtime-{version}-cp312-abi3-manylinux_2_28_aarch64.whl",
-    }
+    } - {f"cozy_runtime-{version}-{WAIVABLE[platform]}" for platform in waived}
     if files.keys() != required:
         raise ValueError(
             f"approved files are not the complete {version} release: "
@@ -59,8 +70,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dist", type=Path, required=True)
     parser.add_argument("--version", required=True, help="Version verified from the immutable tag")
+    parser.add_argument(
+        "--waive-platforms",
+        default="",
+        help=f"Platform wheels this release omits: {sorted(WAIVABLE)}",
+    )
     args = parser.parse_args()
-    sums = verify(args.dist, os.environ.get("SUMS", ""), args.version)
+    waived = waivers(args.waive_platforms)
+    sums = verify(args.dist, os.environ.get("SUMS", ""), args.version, waived)
+    for platform in sorted(waived):
+        print(f"WAIVED: {args.version} publishes no {platform} wheel ({WAIVABLE[platform]})")
     if output := os.environ.get("GITHUB_OUTPUT"):
         with open(output, "a") as stream:
             stream.write(f"sha256sums<<SUMS\n{sums}\nSUMS\n")
