@@ -13,6 +13,7 @@ binds them any more: `weights.py` unbinds an evicted region as on a discrete car
 
 from __future__ import annotations
 
+import contextlib
 import mmap
 import os
 import threading
@@ -44,6 +45,16 @@ ALIGN = 4096
 
 def _aligned(n: int) -> int:
     return -(-n // ALIGN) * ALIGN
+
+
+def _read_bytes() -> int:
+    """Bytes this process read from storage (`/proc/self/io`); 0 where the kernel counts none."""
+    with contextlib.suppress(OSError):
+        with open("/proc/self/io") as io:
+            for line in io:
+                if line.startswith("read_bytes:"):
+                    return int(line.split()[1])
+    return 0
 
 
 class _Source:
@@ -415,7 +426,7 @@ class UnifiedPlane:
             leased = sum(r.span for _, r in regions if r.tensor is not None and r.leases)
             held = sum(r.span for _, r in regions if r.tensor is not None and r.held)
             return {
-                "host": {"budget": self.pinned_budget, "used": 0},
+                "host": {"budget": self.pinned_budget, "used": 0, "disk_read_bytes": _read_bytes()},
                 "devices": [
                     {
                         "ordinal": 0,
