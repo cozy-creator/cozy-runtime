@@ -312,3 +312,14 @@ def test_a_flux2_transformer_in_bands_is_the_whole_one(room: int) -> None:
             out = call()
     torch.testing.assert_close(out, stock, rtol=1e-4, atol=1e-5)
     assert "aten.linear" in short.ran
+
+
+@pytest.mark.parametrize("room", ROOMS)
+def test_a_padding_taller_than_a_band_fills_the_bands_wholly_inside_it(room: int) -> None:
+    """Run 10683, H3's second segment on an RTX 5090: a constant padding ran in one-row bands,
+    and a band wholly inside the padding was cut from no rows with a negative pad, which
+    torch refuses: "narrow(): length must be non-negative"."""
+    torch.manual_seed(5)
+    x = torch.randn(1, 3, 4, 7)
+    _, ran = banded(lambda: torch.nn.functional.pad(x, (1, 2, 6, 5), value=0.5) * 2, room)
+    assert "aten.pad" in ran or "aten.constant_pad_nd" in ran
