@@ -14,6 +14,7 @@ import msgspec
 import pytest
 from PIL import Image
 
+from cozy_runtime.author._decode import DEFAULT_DECODE_LIMITS, host_decode_limits
 from cozy_runtime.author import (
     App,
     AssetBound,
@@ -355,6 +356,24 @@ def test_assets_decode_uses_existing_per_item_limit(tmp_path: Path) -> None:
         Invocation("limited", tmp_path / "limited", time.monotonic() + 10, assets=rows),
     )
     assert outcome.terminal == "refused" and outcome.code == "decoded_bytes_limit"
+
+
+LargePictures = Annotated[
+    Assets[Annotated[ImageAsset, AssetBound(max_decoded_bytes=8 << 30)]],
+    msgspec.Meta(min_length=1),
+]
+
+
+def test_a_declared_bound_above_the_old_2_gib_ceiling_describes() -> None:
+    """Retained media is budgeted by the machine's memory, not a flat ceiling."""
+    large = App()
+
+    @large.entrypoint
+    def decode(payload: Request, assets: LargePictures, decoder: MediaDecoder) -> Result:
+        raise AssertionError("describe never executes")
+
+    describe(large)
+    assert host_decode_limits().max_decoded_bytes >= DEFAULT_DECODE_LIMITS.max_decoded_bytes
 
 
 def test_collection_labels_are_exact_and_do_not_mutate_source() -> None:

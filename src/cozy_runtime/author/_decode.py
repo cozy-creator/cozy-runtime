@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import math
+import os
 import struct
 from array import array
 from collections.abc import Callable, Iterator
@@ -76,6 +77,20 @@ DEFAULT_DECODE_LIMITS = DecodeLimits(
 )
 
 MAX_ACTIVE_MEDIA_STREAMS = 2
+
+
+def host_decode_limits() -> DecodeLimits:
+    """The codec ceilings with the retained-media budget set by this machine's memory, never
+    a flat constant: decoded media that fits the machine is served. A field's declared
+    `AssetBound(max_decoded_bytes=...)` still narrows its own value."""
+    try:
+        memory = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except (AttributeError, OSError, ValueError):
+        return DEFAULT_DECODE_LIMITS
+    return replace(
+        DEFAULT_DECODE_LIMITS,
+        max_decoded_bytes=max(DEFAULT_DECODE_LIMITS.max_decoded_bytes, memory),
+    )
 
 
 class DecoderUnavailable(CapabilityError):
@@ -917,11 +932,11 @@ class MediaDecoder:
         attempt: _Attempt,
         *,
         active: Callable[[], bool],
-        limits: DecodeLimits = DEFAULT_DECODE_LIMITS,
+        limits: DecodeLimits | None = None,
     ) -> None:
         self._attempt = attempt
         self._active = active
-        self._limits = limits
+        self._limits = limits = limits or host_decode_limits()
         self._budget = _Budget(limits.max_decoded_bytes)
         self._open_streams = 0
 

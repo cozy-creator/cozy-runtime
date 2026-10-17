@@ -33,7 +33,7 @@ from typing import Any
 from cozy_runtime.author._app import Registration
 from cozy_runtime.author._assets import Asset, GrantedInput, bind
 from cozy_runtime.author._context import AdapterRef, Context, Device
-from cozy_runtime.author._decode import DEFAULT_DECODE_LIMITS, DecodeLimits, MediaDecoder
+from cozy_runtime.author._decode import DecodeLimits, MediaDecoder
 from cozy_runtime.author._defaults import Clamp, Recipe
 from cozy_runtime.author._errors import CapabilityError
 from cozy_runtime.author._invoke import Invocation, InvocationResult, invoke, prepare
@@ -198,7 +198,7 @@ def fake_media_decoder(
     attempt: Attempt | None = None,
     *,
     active: bool = False,
-    limits: DecodeLimits = DEFAULT_DECODE_LIMITS,
+    limits: DecodeLimits | None = None,
 ) -> MediaDecoder:
     """The real decoder over a caller-controlled attempt, without a parallel fake codec."""
     return MediaDecoder(attempt or fake_attempt(), active=lambda: active, limits=limits)
