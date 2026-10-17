@@ -40,10 +40,11 @@ import time
 import weakref
 from collections import deque
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import ExitStack, contextmanager
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from typing import Any
 
-from cozy_runtime.author._model import LANDED, PLACED, RELEASERS, WARNINGS, Building
+from cozy_runtime.author._errors import is_device_oom, is_library_refusal
+from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building, Reservation
 from cozy_runtime.author.kernels import KernelsUnavailable, Launch, Plan, TritonKernels
 from cozy_runtime.graphs import BYPASS, ROOM, capture, say
 from cozy_runtime.lm import _kernels
@@ -89,7 +90,7 @@ def drafting(draft: Any) -> Iterator[None]:
 #: A placed model's decode blocks, as its first loop's first step ran them: later loops hold
 #: them before their first step.
 _READS: weakref.WeakKeyDictionary[Any, frozenset[Any]] = weakref.WeakKeyDictionary()
-#: Each model's continuous batch (buffers and graphs), kept until the plane wants the memory.
+#: Each model's continuous batch (buffers and graphs), kept until memory wants it (`_shed`).
 _ENGINES: weakref.WeakKeyDictionary[Any, _Engine] = weakref.WeakKeyDictionary()
 _ENGINES_LOCK = threading.Lock()
 #: Batch sizes a step's graphs are recorded at: a step runs the smallest holding every row, and
@@ -100,14 +101,6 @@ BUCKETS = (1, 2, 4, 8, 16)
 #: own step is compute-bound enough that drafts save little; larger buckets decode undrafted.
 DRAFT_ROWS = 4
 
-
-def release() -> bool:
-    """Drop every idle engine's buffers and graphs: what the plane calls before it unmaps
-    weights for room."""
-    return any([engine.idle() for engine in list(_ENGINES.values())])
-
-
-RELEASERS.append(release)
 #: Generation-config fields that add a logits processor to greedy decoding, and their no-op values.
 #: Runtime's gated-delta-net decode kernels, built on the executor's GPUs when it starts, for
 #: every package that imports this module (`install`).
@@ -806,15 +799,19 @@ def _slot_bytes(fresh: _Prefill, capacity: int, drafted: bool, text: Any) -> int
     return total + capacity * 18 + 4 * int(getattr(text, "vocab_size", 0) or 0)
 
 
-def _reservation(model: Any, shed: Callable[[int], int]) -> Any:
-    """The memory manager's hold on an engine's buffers; None for a model Runtime does not
-    place (its tensors are where its caller put them)."""
+def _short(exc: BaseException) -> bool:
+    return is_device_oom(exc) or is_library_refusal(exc)
+
+
+def _why(exc: BaseException) -> str:
+    return f"{type(exc).__name__}: {exc}".splitlines()[0][:300]
+
+
+def _reservation(model: Any, shed: Callable[[int], int]) -> Reservation | None:
+    """Memory's hold on an engine's buffers; None for a model Runtime does not place (its
+    tensors are where its caller put them)."""
     placed = PLACED.get(model)
-    if placed is None:
-        return None
-    weights = getattr(placed[0], "weights", None)
-    reserve = getattr(weights, "reserve", None)
-    return reserve(f"lm:{type(model).__name__}", 0, shed) if reserve is not None else None
+    return None if placed is None else placed[0].reserve(f"lm:{type(model).__name__}", 0, shed)
 
 
 class _Request:
@@ -919,7 +916,7 @@ class _Engine:
         self.stale = False
         #: seconds the last admission took: decoding gets as long before the next one
         self.debt = 0.0
-        self.reservation: Any = None
+        self.reservation = _reservation(model, self._shed)
         self.retire = False
         self.cache_device: Any = None
         self.open: bool | float
@@ -995,7 +992,7 @@ class _Engine:
 
     def _drive(self, mine: _Request) -> None:
         try:
-            with ExitStack() as stack:
+            with self._using(), ExitStack() as stack:
                 held = self._hold(stack)
                 while True:
                     if self.rehold:  # another head: its blocks are held instead
@@ -1034,15 +1031,20 @@ class _Engine:
                         held = self._hold(stack)
                     elif occupied:
                         self._steps()
-        except torch.OutOfMemoryError as exc:
-            self._fail(None, f"OutOfMemoryError: {exc}".splitlines()[0][:300])
         except BaseException as exc:  # a failed step fails every row in it
-            self._fail(exc, "")
-            raise
+            if not _short(exc):
+                self._fail(exc, "")
+                raise
+            # Steps run outside the op recovery (a graph replays as one): out of memory, the
+            # rows decode through Transformers' loop, whose ops recover.
+            self._fail(None, _why(exc))
         finally:
             with self.cond:
                 self.driver = None
                 self.cond.notify_all()
+
+    def _using(self) -> AbstractContextManager[None]:
+        return nullcontext() if self.reservation is None else self.reservation.using()
 
     def _fail(self, exc: BaseException | None, why: str) -> None:
         """Every held and waiting call ends: with `exc`, or through Transformers' loop (`why`)."""
@@ -1137,8 +1139,10 @@ class _Engine:
                 continue
             try:
                 joined = self._admit(request)
-            except torch.OutOfMemoryError as exc:  # this call alone takes Transformers' loop
-                request.fallback = f"OutOfMemoryError: {exc}".splitlines()[0][:300]
+            except Exception as exc:  # out of memory, this call alone takes Transformers' loop
+                if not _short(exc):
+                    raise
+                request.fallback = _why(exc)
                 torch.cuda.empty_cache()
                 continue
             if joined:
@@ -1358,8 +1362,6 @@ class _Engine:
         """Buffers for `size` slots of `capacity` positions, granted by the memory manager; the
         rows held now move over, and the graphs record again. False when there is no room."""
         device = fresh.token.device
-        if self.reservation is None:
-            self.reservation = _reservation(self.model, self._shed)
         nbytes = _slot_bytes(fresh, capacity, self.draft is not None, self.text) * size
         if self.reservation is not None and not self.reservation.resize(nbytes):
             return False
@@ -1755,12 +1757,10 @@ class _Engine:
         self.slots, self.capacity = [], 0
         self.layout = None
         if self.reservation is not None:
-            self.reservation.close()
-            self.reservation = None
+            self.reservation.resize(0)
 
     def idle(self) -> bool:
-        """Its buffers and graphs go back when no call holds it: what the plane takes before
-        it unmaps weights. Whether it had any."""
+        """Its buffers and graphs go back when no call holds it. Whether it had any."""
         if not self.cond.acquire(blocking=False):
             return False
         try:
@@ -1787,6 +1787,5 @@ __all__ = [
     "drafting",
     "generate",
     "install",
-    "release",
     "window",
 ]

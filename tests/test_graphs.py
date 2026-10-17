@@ -69,7 +69,7 @@ def test_recordings_replay_across_calls_and_signatures() -> None:
         finally:
             graphs.BYPASS.reset(token)
         assert recorder.replays == 4
-        assert graphs.release() and not recorder.recordings
+        assert recorder.shed(0) > 0 and not recorder.recordings and recorder.pool is None
 
 
 @pytest.mark.skipif(not CUDA, reason="CUDA graphs need a GPU")

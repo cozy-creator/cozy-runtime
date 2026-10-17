@@ -335,9 +335,3 @@ def stage(
         spare -= max(chosen.vram_bytes(layout) - need[name], 0)
         placed[name] = chosen
     return placed
-
-
-def batch_fits(free: int, evictable: int, extra_bytes: int) -> bool:
-    """Whether a batched call (e.g. cond+uncond as one batch) fits, counting evictable weights
-    as free. Decided before the stage and recorded; never switched mid-request."""
-    return extra_bytes <= free + evictable

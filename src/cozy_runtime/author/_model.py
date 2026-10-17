@@ -181,7 +181,6 @@ _RUNTIME_MEMBERS = frozenset(
         "for_test",
         "checkpoint_ref",
         "harness",
-        "batch_fits",
     }
 )
 
@@ -247,6 +246,22 @@ class _Scope(Protocol):
     def __exit__(self, *exc: object) -> None: ...
 
 
+class Reservation(Protocol):
+    """Memory's hold on what an owner keeps for speed (`Residency.reserve`)."""
+
+    granted: int
+
+    def resize(self, nbytes: int) -> bool:
+        """Whether the owner may hold `nbytes` now; False: it holds what it has."""
+        ...
+
+    def using(self) -> AbstractContextManager[None]:
+        """The owner runs: its bytes go after idle weights and finer grains."""
+        ...
+
+    def close(self) -> None: ...
+
+
 class Residency(Protocol):
     """The runtime's component-use ADMISSION, installed on a constructed generation.
 
@@ -262,8 +277,6 @@ class Residency(Protocol):
     def admit(self, method: str, components: tuple[str, ...]) -> None: ...
 
     def release(self, method: str, components: tuple[str, ...]) -> None: ...
-
-    def batch_fits(self, method: str, batch: int) -> bool: ...
 
     def recording(self) -> AbstractContextManager[dict[str, set[Any]]]:
         """The block modules the body runs, by component."""
@@ -295,6 +308,13 @@ class Residency(Protocol):
         """Device bytes torch can allocate now without the plane unmapping a weight."""
         ...
 
+    def reserve(
+        self, owner: str, nbytes: int, shed: Callable[[int], int], host: bool = False
+    ) -> Reservation:
+        """Bytes `owner` keeps for speed alone, on the device or (`host`) in host memory:
+        `shed(n)` gives toward `n` under pressure and says how much it gave."""
+        ...
+
     #: How many attempts (requests) it has opened.
     attempts: int
 
@@ -302,10 +322,6 @@ class Residency(Protocol):
 #: A component's root module -> the residency that places it and the component's name, so a
 #: Runtime mechanism handed the module (`cozy_runtime.lm`) reaches its placement.
 PLACED: weakref.WeakKeyDictionary[object, tuple[Residency, str]] = weakref.WeakKeyDictionary()
-#: What Runtime keeps on the device between calls for speed alone (CUDA graph recordings), as
-#: callables that drop it and say whether there was any: the plane calls them before it unmaps
-#: weights for room.
-RELEASERS: list[Callable[[], bool]] = []
 #: Kernel builds this process loaded after it started (a boot build landing): calls may take a
 #: faster path from each on, so graphs record them again. None loads while a graph records.
 LANDED: list[int] = [0]
@@ -695,14 +711,6 @@ class Model[PipelineT]:
     def unload(self, loader: Loader) -> None:
         """Release declared state. The runtime drains before calling this."""
         return None
-
-    def batch_fits(self, method: str, batch: int = 2) -> bool:
-        """Whether `method` can run `batch` requests' worth at once — cond and uncond as one
-        batch, say — counting weights the runtime may unmap as free. Ask before the stage;
-        the runtime records the answer in the run's outputs and it holds for the request.
-        Unmeasured is yes: the first run measures, and a block that runs out retries."""
-        residency = self._cozy_residency
-        return True if residency is None else residency.batch_fits(method, batch)
 
     def prepare_adapters(self, overlays: tuple[AdapterRef, ...]) -> None:
         """Apply an admitted ordered overlay once during model preparation."""

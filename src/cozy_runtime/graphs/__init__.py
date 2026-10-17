@@ -27,8 +27,9 @@ an attention layout's scope (sparse attention reads its step), under an activati
 across GPUs (every GPU's peers must replay alike), whose blocks do not all fit at home (a stage
 that streams), or whose capture failed in `TRIES` requests (a run warning: in a freshly
 started process other device work can end a capture, so a failed one waits for the next
-request). The plane drops
-every recording before it unmaps a weight for room (`release`).
+request). A component's recordings and pool are a
+reservation memory sheds under pressure: an idle component's before any weight unmaps, the
+running one's after its stage streams finer (`_Recorder.shed`).
 
 `capture(torch, step, pool, stream)` is the recipe: on a side stream, in thread-local mode so the
 plane's own threads keep working while it records, and outside Runtime's dispatch modes, whose
@@ -49,7 +50,7 @@ from typing import Any
 
 from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT
 from cozy_runtime.author._capture import _capture_clock
-from cozy_runtime.author._model import LANDED, PLACED, RELEASERS, WARNINGS, Building
+from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building
 from cozy_runtime.internal import attention_ulysses
 
 #: Set while a mechanism runs its own graphs over a component (`cozy_runtime.lm`): its calls
@@ -139,7 +140,10 @@ class _Recording:
 class _Recorder:
     """A component's recordings, kept across requests in one memory pool."""
 
-    def __init__(self) -> None:
+    def __init__(self, module: Any) -> None:
+        placed = PLACED.get(module)
+        name = f"graphs:{type(module).__name__}"
+        self.reservation = None if placed is None else placed[0].reserve(name, 0, self.shed)
         #: the blocks its calls read, as the first one ran them through the paging hooks
         self.blocks: dict[str, set[Any]] = {}
         self.seen: set[tuple[object, ...]] = set()
@@ -173,6 +177,12 @@ class _Recorder:
         self.need.clear()
         self.recordings.clear()
         self.pool, self.pool_bytes, self.chose = None, 0, {}
+
+    def shed(self, _: int) -> int:
+        """Memory wants the room: every recording goes, and its pool. The bytes it held."""
+        freed, self.pool, self.pool_bytes = self.pool_bytes, None, 0
+        self.recordings.clear()
+        return freed
 
 
 #: Every graphed component's recorder in this process.
@@ -216,20 +226,6 @@ def _graphed(torch: Any, cls: type) -> type:
     return made
 
 
-def release() -> bool:
-    """Drop every recording and its pool: what the plane calls before it unmaps weights for room.
-    Returns whether there was any."""
-    had = False
-    for recorder in _RECORDERS.values():
-        had = had or bool(recorder.recordings)
-        recorder.recordings.clear()
-        recorder.pool, recorder.pool_bytes = None, 0
-    return had
-
-
-RELEASERS.append(release)
-
-
 def _dispatch(torch: Any, module: Any, call: Callable[..., Any], args: Any, kwargs: Any) -> Any:
     if BYPASS.get() or not torch.cuda.is_available() or torch.cuda.is_current_stream_capturing():
         return call(module, *args, **kwargs)
@@ -252,7 +248,21 @@ def _dispatch(torch: Any, module: Any, call: Callable[..., Any], args: Any, kwar
         return call(module, *args, **kwargs)
     recorder = _RECORDERS.get(module)
     if recorder is None:
-        recorder = _RECORDERS[module] = _Recorder()
+        recorder = _RECORDERS[module] = _Recorder(module)
+    with contextlib.nullcontext() if recorder.reservation is None else recorder.reservation.using():
+        return _run(torch, module, call, args, kwargs, leaves, spec, recorder)
+
+
+def _run(
+    torch: Any,
+    module: Any,
+    call: Callable[..., Any],
+    args: Any,
+    kwargs: Any,
+    leaves: list[Any],
+    spec: Any,
+    recorder: _Recorder,
+) -> Any:
     if recorder.landed != LANDED[0]:
         recorder.forget()
     key = _signature(torch, leaves, spec)
@@ -488,6 +498,5 @@ __all__ = [
     "TRIES",
     "capture",
     "install",
-    "release",
     "say",
 ]

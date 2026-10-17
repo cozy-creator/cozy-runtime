@@ -23,7 +23,6 @@ from cozy_runtime.author._errors import (
     is_device_oom,
     is_library_refusal,
 )
-from cozy_runtime.author._model import RELEASERS
 from cozy_runtime.internal import accel, plane, spill, weight_policy
 
 if TYPE_CHECKING:
@@ -38,9 +37,9 @@ _UNITS |= {"KB": _UNITS["KiB"], "MB": _UNITS["MiB"], "GB": _UNITS["GiB"]}
 
 class Rung(IntEnum):
     SLACK = 0  # torch's idle cache
-    IDLE = 1  # orphaned rings, weights no stage holds, other tenants (`DeviceRoom`)
+    IDLE = 1  # idle owners' caches, orphaned rings, idle weights, other tenants (`DeviceRoom`)
     FINER = 2  # the running stage's resident set, its components not in use
-    CACHES = 3  # what is kept for speed alone: reservations (`Weights.reserve`), `RELEASERS`
+    CACHES = 3  # what the running owners keep for speed alone (`Weights.reserve`)
     HOST = 4  # live tensors to page-locked host memory, the op's operands last
     DISK = 5  # the pinned tier toward 0, so more can lock
 
@@ -312,14 +311,14 @@ class Memory:
     def _ladder(self, operands: Sequence[object]) -> list[tuple[Rung, Callable[[int], object]]]:
         weights = self.weights
         return [
+            (Rung.IDLE, weights.shed),
             (Rung.IDLE, self._collect),
             (Rung.IDLE, lambda short: weights.shrink(short, keep_holds=True)),
             (Rung.IDLE, lambda short: weights.page_out(None, short)),
             (Rung.IDLE, lambda short: self.ask(self.free() + short)),  # all it wants free
             (Rung.FINER, self._finer),
             (Rung.FINER, lambda _: weights.spare(operands)),
-            (Rung.CACHES, lambda short: weights.shed(self.free() + short - MARGIN)),
-            (Rung.CACHES, lambda _: [release() for release in RELEASERS]),
+            (Rung.CACHES, lambda short: weights.shed(short, running=True)),
             (Rung.HOST, lambda short: weights.spill(short, operands)),
             (Rung.DISK, lambda short: weights.unpin(short, operands)),
         ]

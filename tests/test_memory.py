@@ -3,7 +3,7 @@
 
 Torch and the plane are real (CPU); the device's byte counts are the fixture
 (`accel.allocation`), and what frees them is what would on a card: the owner's idle tenants
-(`DeviceRoom`) and the caches kept for speed (`RELEASERS`)."""
+(`DeviceRoom`) and the caches kept for speed (`Weights.reserve`)."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ import pytest
 
 from cozy_runtime.author import _split
 from cozy_runtime.author._errors import DEVICE_OOM, MEMORY_EXHAUSTED, classify
+from cozy_runtime.author._loader import DerivedCache
 from cozy_runtime.internal import accel, plane
 from cozy_runtime.internal import memory as memory_module
 from cozy_runtime.internal import weights as weights_module
@@ -52,40 +53,89 @@ def card(monkeypatch: pytest.MonkeyPatch) -> tuple[Weights, dict[str, int]]:
 def gives(device: dict[str, int], amounts: list[int], calls: list[str], name: str) -> Any:
     """An owner or a cache that frees `amounts`, one per call, then nothing."""
 
-    def give(*_: Any) -> bool:
+    def give(*_: Any) -> int:
         calls.append(name)
-        device["free"] += amounts.pop(0) if amounts else 0
-        return True
+        freed = amounts.pop(0) if amounts else 0
+        device["free"] += freed
+        return freed
 
     return give
 
 
 def test_each_rung_runs_while_it_gives_and_the_ladder_stops_once_enough_is_free(
-    card: tuple[Weights, dict[str, int]], monkeypatch: pytest.MonkeyPatch
+    card: tuple[Weights, dict[str, int]],
 ) -> None:
     weights, device = card
     calls: list[str] = []
     owner, asked = gives(device, [100 * MIB, 100 * MIB], calls, "owner"), []
     weights.room = lambda nbytes: (asked.append(nbytes), owner())
-    monkeypatch.setattr(memory_module, "RELEASERS", [gives(device, [1 << 30], calls, "cache")])
-    assert not weights.memory.free_for(500 * MIB, "aten.mm.default", upto=Rung.IDLE)
-    assert calls == ["owner", "owner", "owner"], "asked while it gave, then left"
-    assert asked == [500 * MIB + MARGIN] * 3, "each ask is all it wants free, never the rest"
-    calls.clear()
-    assert weights.memory.free_for(500 * MIB, "aten.mm.default")
-    assert calls == ["owner", "cache"], "an idle owner first, then the running one's caches"
+    cache = weights.reserve("cache", 0, gives(device, [1 << 30], calls, "cache"))
+    with cache.using():
+        assert not weights.memory.free_for(500 * MIB, "aten.mm.default", upto=Rung.IDLE)
+        assert calls == ["owner", "owner", "owner"], "asked while it gave, then left"
+        assert asked == [500 * MIB + MARGIN] * 3, "each ask is all it wants free, never the rest"
+        calls.clear()
+        assert weights.memory.free_for(500 * MIB, "aten.mm.default")
+    assert calls == ["owner", "cache"], "idle tenants first, then the running owner's caches"
     assert weights.memory.free_for(500 * MIB, "aten.mm.default") and len(calls) == 2
     assert weights.modes["memory"] == f"idle 2x {200 * MIB} B, caches 1x {1 << 30} B"
 
 
+def test_idle_caches_go_before_any_weight_and_a_running_owners_after_finer_weights(
+    card: tuple[Weights, dict[str, int]],
+) -> None:
+    """Rung 1 sheds what idle owners keep for speed, the youngest first, before it asks other
+    tenants; the running owner's go at rung 3. Memory holds a reservation only while its owner
+    does."""
+    weights, device = card
+    calls: list[str] = []
+    weights.room = gives(device, [], calls, "owner")
+    older = weights.reserve("older", 0, gives(device, [64 * MIB], calls, "older"))
+    younger = weights.reserve("younger", 0, gives(device, [64 * MIB], calls, "younger"))
+    running = weights.reserve("running", 0, gives(device, [512 * MIB], calls, "running"))
+    with running.using():
+        assert weights.memory.free_for(500 * MIB, "aten.mm.default")
+    assert calls == ["younger", "older", "younger", "older", "owner", "running"]
+    assert older.resize(256 * MIB) and not younger.resize(4 << 30), "granted only where it fits"
+    assert weights.reserve("host", 0, gives(device, [], calls, "host"), host=True).resize(1 << 40)
+    del older, younger, running
+    gc.collect()
+    assert not weights.reservations
+
+
+def test_a_derived_cache_is_a_reservation_its_oldest_entries_shed_first(
+    card: tuple[Weights, dict[str, int]],
+) -> None:
+    """The package bounds the entries, the Runtime their bytes: device entries shed for device
+    room, host entries for host room, and an entry with no room is returned, not kept."""
+    weights, device = card
+    device["free"] = 1 << 30
+    generation = SimpleNamespace(_cozy_residency=weights, _cozy_require_scope=lambda _: None)
+    cache = DerivedCache("latents", max_entries=3, owner=generation)
+
+    def gpu() -> Any:
+        return SimpleNamespace(device=SimpleNamespace(type="cuda"), nbytes=100 * MIB)
+
+    for key in "abc":
+        cache.get(key, build=gpu)
+    cache.get("h", build=lambda: torch.zeros(MIB))
+    assert "a" not in cache and cache.entries == 3, "the package's count, oldest out"
+    assert weights.shed(150 * MIB) and {"b", "c"}.isdisjoint(cache._entries)
+    assert "h" in cache and weights.shed(1, host=True) and not cache.entries
+    device["free"] = 0
+    built = cache.get("d", build=gpu)
+    assert cache.get("d", build=lambda: built) is built and "d" not in cache
+
+
 def test_a_ladder_nothing_gives_ends_with_each_action_tried_once(
-    card: tuple[Weights, dict[str, int]], monkeypatch: pytest.MonkeyPatch
+    card: tuple[Weights, dict[str, int]],
 ) -> None:
     weights, device = card
     calls: list[str] = []
     weights.room = gives(device, [], calls, "owner")
-    monkeypatch.setattr(memory_module, "RELEASERS", [gives(device, [], calls, "cache")])
-    assert not weights.memory.free_for(1 << 30, "aten.mm.default")
+    cache = weights.reserve("cache", 0, gives(device, [], calls, "cache"))
+    with cache.using():
+        assert not weights.memory.free_for(1 << 30, "aten.mm.default")
     assert calls == ["owner", "cache"] and weights.memory.freed == 0
     assert weights.memory.again(1 << 30, "aten.mm.default") == -1
 
@@ -103,11 +153,10 @@ def test_an_attempt_runs_again_only_after_more_came_free(
 
 
 def test_the_one_refusal_carries_the_ledger_the_op_and_each_rung(
-    card: tuple[Weights, dict[str, int]], monkeypatch: pytest.MonkeyPatch
+    card: tuple[Weights, dict[str, int]],
 ) -> None:
     weights, device = card
     weights.room = gives(device, [64 * MIB], [], "owner")
-    monkeypatch.setattr(memory_module, "RELEASERS", [])
     assert not weights.memory.free_for(1 << 30, "aten.mm.default")
     with pytest.raises(MemoryExhausted) as refused:
         weights.memory.exhausted(1 << 30, "aten.mm.default")
@@ -244,7 +293,7 @@ def grab(x: torch.Tensor) -> torch.Tensor:  # type: ignore[name-defined]
 
 
 def test_an_op_runs_again_only_once_its_failed_frames_let_go(
-    card: tuple[Weights, dict[str, int]], monkeypatch: pytest.MonkeyPatch
+    card: tuple[Weights, dict[str, int]],
 ) -> None:
     """pgw#1499: the failed op's frames held its tensors (6.92 GiB) while room was measured
     for it, through the exception's traceback. The op runner clears the traceback and leaves
@@ -257,7 +306,6 @@ def test_an_op_runs_again_only_once_its_failed_frames_let_go(
         device["free"] += 1 << 30
 
     weights.room = owner
-    monkeypatch.setattr(memory_module, "RELEASERS", [])
     MADE.clear()
     x = torch.ones(4)
     with weights.recovering():
@@ -308,10 +356,9 @@ READY = [False]
 
 
 def test_an_op_refused_with_room_on_the_ledger_runs_once_the_owner_made_more(
-    card: tuple[Weights, dict[str, int]], monkeypatch: pytest.MonkeyPatch
+    card: tuple[Weights, dict[str, int]],
 ) -> None:
     weights, device = card
-    monkeypatch.setattr(memory_module, "RELEASERS", [])
     device["free"] = 184_221_696
 
     def owner(_: int) -> None:

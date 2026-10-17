@@ -21,6 +21,7 @@ ref, device/dtype override, offload/pin/eviction knob, compile hook or selection
 
 from __future__ import annotations
 
+import functools
 import io
 import time
 from collections import OrderedDict
@@ -29,12 +30,24 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Literal, NoReturn, Protocol, TypeVar, cast, final, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    Literal,
+    NoReturn,
+    Protocol,
+    TypeVar,
+    cast,
+    final,
+    runtime_checkable,
+)
 
 import msgspec
 
 from cozy_runtime.author._context import AdapterRef, Device
 from cozy_runtime.author._errors import CapabilityError, ConformanceError, InvalidRequest
+
+if TYPE_CHECKING:
+    from cozy_runtime.author._model import Reservation
 
 T = TypeVar("T")
 S = TypeVar("S", bound=msgspec.Struct)
@@ -517,27 +530,27 @@ class _NullBackend:
 class DerivedCache:
     """A model-generation-scoped handle for immutable, digest-keyed derived entries.
 
-    MEMORY-ONLY and declared-bounded: entries die with the generation, `get` is legal only
-    inside an active component-use scope, and there is no persistence surface to declare
-    (durable derived tables live in pruned-DiT artifacts produced by jobs, §1.3). At its
-    bound the least recently used entries leave to admit a new one; an entry larger than
-    the whole bound refuses. cr-008b owns the ledger accounting and lease mechanics.
+    MEMORY-ONLY: entries die with the generation, and `get` is legal only inside an active
+    component-use scope. The package says how many entries are worth keeping; their bytes are
+    the Runtime's, a reservation memory sheds under pressure, least recently used first (device
+    entries for device room, host entries for host room). An entry with no room is not kept.
     """
 
-    __slots__ = ("_bytes", "_entries", "_owner", "max_bytes", "max_entries", "name")
+    __slots__ = ("_bytes", "_entries", "_held", "_owner", "max_entries", "name")
 
-    def __init__(self, name: str, *, max_entries: int, max_bytes: int, owner: _ScopeHost) -> None:
+    def __init__(self, name: str, *, max_entries: int, owner: _ScopeHost) -> None:
         self.name = name
         self.max_entries = max_entries
-        self.max_bytes = max_bytes
-        self._entries: OrderedDict[object, tuple[object, int]] = OrderedDict()
-        self._bytes = 0
+        #: key -> (value, bytes, on a device)
+        self._entries: OrderedDict[object, tuple[object, int, bool]] = OrderedDict()
+        self._bytes = {True: 0, False: 0}
+        self._held: dict[bool, Reservation | None] = {}
         self._owner = owner
 
     def __repr__(self) -> str:
         return (
             f"DerivedCache({self.name!r}, entries={len(self._entries)}/{self.max_entries}, "
-            f"bytes={self._bytes}/{self.max_bytes})"
+            f"bytes={sum(self._bytes.values())})"
         )
 
     def __contains__(self, key: object) -> bool:
@@ -563,23 +576,51 @@ class DerivedCache:
             return cast(V, self._entries[key][0])
         value = build()
         _require_immutable(self.name, value)
-        size = _entry_bytes(value)
-        if size > self.max_bytes or self.max_entries < 1:
-            raise CapabilityError(
-                f"cache {self.name!r}: one {size} B entry exceeds its declared bound "
-                f"({self.max_entries} entries, {self.max_bytes} bytes)",
-                code="cache_bound",
-            )
-        while len(self._entries) >= self.max_entries or self._bytes + size > self.max_bytes:
-            _, (_, dropped) = self._entries.popitem(last=False)
-            self._bytes -= dropped
-        self._entries[key] = (value, size)
-        self._bytes += size
+        while self._entries and len(self._entries) >= self.max_entries:
+            self._evict()
+        size, device = _entry_bytes(value), _on_device(value)
+        held = self._reservation(device)
+        if held is None or held.resize(self._bytes[device] + size):
+            self._entries[key] = (value, size, device)
+            self._bytes[device] += size
         return value
 
     def drop(self) -> None:
         self._entries.clear()
-        self._bytes = 0
+        self._bytes = {True: 0, False: 0}
+        for held in self._held.values():
+            if held is not None:
+                held.close()
+        self._held.clear()
+
+    def _reservation(self, device: bool) -> Reservation | None:
+        if device not in self._held:
+            residency = getattr(self._owner, "_cozy_residency", None)
+            shed = functools.partial(self._shed, device)
+            self._held[device] = (
+                None
+                if residency is None
+                else residency.reserve(f"cache:{self.name}", 0, shed, host=not device)
+            )
+        return self._held[device]
+
+    def _evict(self, device: bool | None = None) -> int:
+        """The least recently used entry (on `device`, if given) leaves: its bytes."""
+        key = next((k for k, e in self._entries.items() if device in (None, e[2])), None)
+        if key is None:
+            return 0
+        _, size, on = self._entries.pop(key)
+        self._bytes[on] -= size
+        return size
+
+    def _shed(self, device: bool, nbytes: int) -> int:
+        freed = 0
+        while freed < nbytes and (size := self._evict(device)):
+            freed += size
+        held = self._held.get(device)
+        if held is not None:
+            held.resize(self._bytes[device])
+        return freed
 
 
 def _require_immutable(name: str, value: object) -> None:
@@ -592,6 +633,12 @@ def _require_immutable(name: str, value: object) -> None:
     if isinstance(value, tuple):
         for item in value:
             _require_immutable(name, item)
+
+
+def _on_device(value: object) -> bool:
+    if isinstance(value, tuple):
+        return any(_on_device(v) for v in value)
+    return getattr(getattr(value, "device", None), "type", "cpu") not in ("cpu", "meta")
 
 
 def _entry_bytes(value: object) -> int:
@@ -812,14 +859,16 @@ class Loader:
             )
         return self.construct(t, factory=cast("Callable[[Config], T]", adapter))
 
-    def cache(self, name: str, *, max_entries: int = 64, max_bytes: int = 1 << 30) -> DerivedCache:
-        """Declare a model-generation-scoped derived cache. Memory-only, by construction."""
+    def cache(self, name: str, *, max_entries: int = 64) -> DerivedCache:
+        """Declare a model-generation-scoped derived cache of up to `max_entries` entries.
+        Memory-only, by construction; its bytes are the Runtime's."""
         self._require_open("loader.cache")
-        if not name or not name.replace("_", "").isalnum():
+        if not name or not name.replace("_", "").isalnum() or max_entries < 1:
             raise ConformanceError(
-                f"cache name {name!r} must be a plain identifier", code="cache_name"
+                f"cache {name!r} needs a plain identifier and at least one entry",
+                code="cache_name",
             )
-        cache = DerivedCache(name, max_entries=max_entries, max_bytes=max_bytes, owner=self._owner)
+        cache = DerivedCache(name, max_entries=max_entries, owner=self._owner)
         self._caches.append(cache)
         return cache
 
