@@ -6,6 +6,8 @@ torch nor the Python version is a build input. A module carries a cubin for each
 the device before it serves; this package holds no policy.
 """
 
+from cozy_kernels import _gemm
+
 #: The CUDA toolkit the wheel is built with, and the oldest driver that runs it, per
 #: `sys.platform`. cozy-platform's `gpu` holds the same floor for TensorD's startup check.
 CUDA = "13.0"
@@ -36,11 +38,21 @@ ARCHS: dict[str, dict[str, tuple[str, ...]]] = {
     },
     # FlashAttention-3's forward runs on Hopper only (wgmma, TMA).
     "_fa3": {"cubin": ("sm_90a",), "ptx": ()},
+    "_norm": {
+        "cubin": ("sm_80", "sm_86", "sm_89", "sm_90", "sm_100", "sm_103", "sm_120", "sm_121"),
+        "ptx": ("compute_80",),
+    },
 }
 
+#: The GEMMs that are CUTLASS's TMA kernels, by format and family: a Windows wheel lacks them
+#: (`_gemm.TMA`, cr-201), and with them every one of `ARCHS`' arch-specific (`a`) cubins.
+TMA_GEMM: dict[str, dict[str, tuple[int, ...]]] = {
+    "int8": {"wgmma": (90,), "tcgen05": (100,)},
+    "fp8": {"mma.sync": (120, 121), "wgmma": (90,), "tcgen05": (100, 103)},
+}
 #: The cards `_gemm.gemm` has a cubin for, by format and family; quantize and gemv run on every
 #: target above.
 GEMM: dict[str, dict[str, tuple[int, ...]]] = {
-    "int8": {"mma.sync": (80, 86, 89, 120, 121), "wgmma": (90,), "tcgen05": (100,)},
-    "fp8": {"mma.sync": (120, 121), "wgmma": (90,), "tcgen05": (100, 103)},
+    "int8": {"mma.sync": (80, 86, 89, 120, 121), **(TMA_GEMM["int8"] if _gemm.TMA else {})},
+    "fp8": dict(TMA_GEMM["fp8"]) if _gemm.TMA else {},
 }

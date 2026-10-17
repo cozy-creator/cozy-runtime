@@ -2,6 +2,8 @@ NOT_SUPPORTED: int
 OUT_OF_MEMORY: int
 GEMV_ROWS: int
 MAX_K: int
+#: Whether CUTLASS's TMA GEMMs are built in (not on Windows).
+TMA: bool
 
 def error_name(code: int) -> str: ...
 def quantize(

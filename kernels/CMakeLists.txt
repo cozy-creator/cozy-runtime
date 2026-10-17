@@ -4,7 +4,17 @@
 # Each unit is compiled for its own targets only: an arch-specific instruction (wgmma, tcgen05)
 # never meets a card it cannot run on.
 cmake_minimum_required(VERSION 3.26)
-project(cozy_kernels LANGUAGES CXX CUDA)
+project(cozy_kernels LANGUAGES CXX)
+# CUDA 13.0 takes MSVC through 19.4x (Visual Studio 2022); a newer one builds only past nvcc's check.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 19.50)
+    message(WARNING "MSVC ${CMAKE_CXX_COMPILER_VERSION} (${CMAKE_CXX_COMPILER}) is newer than CUDA 13.0 "
+                    "supports: building with -allow-unsupported-compiler")
+    string(APPEND CMAKE_CUDA_FLAGS " -allow-unsupported-compiler")
+endif()
+enable_language(CUDA)
+# The C and C++ runtimes linked static, as NVIDIA's cudart_static is (LIBCMT): a Windows module
+# needs no Visual C++ redistributable (MSVCP140), as a Linux one links libstdc++ static.
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CUDA_STANDARD 17)
@@ -37,11 +47,6 @@ endfunction()
 
 pinned(CUTLASS_DIR NVIDIA/cutlass 098de2a652cf8f00fd70b2df54051c7eccbb855a
        a8a1b952c7f6179bc8076f20d45859f18bd81f21f3d22b6766d7f3f0cceb5d54)
-# FlashAttention-3 (v2.8.3.post1) and the CUTLASS its submodule pins.
-pinned(FLASH_ATTENTION_DIR Dao-AILab/flash-attention a8aa52b1ab3e9ca574c8a33b3f35afc017ffa2e2
-       e06c229e24ad61bcb31eea9446a5e6484cd8b3b5d10d90b0f8f48cc2b0d4c431)
-pinned(FA3_CUTLASS_DIR NVIDIA/cutlass dc4817921edda44a549197ff3a9dcf5df0636e7b
-       f2a3a9df5e6f010c8b02716aa2644a6f071827fafa606fac5f5241cab6a1ab56)
 
 set(INT8 "${CMAKE_CURRENT_SOURCE_DIR}/../src/cozy_runtime/internal/int8_op")
 set(isolated $<$<PLATFORM_ID:Linux>:-fno-gnu-unique>)
@@ -56,23 +61,49 @@ function(gemm_unit name source targets)
     target_compile_definitions(${name} PRIVATE CUTLASS_ENABLE_GDC_FOR_SM90
                                CUTLASS_ENABLE_GDC_FOR_SM100 ${ARGN})
     target_compile_options(${name} PRIVATE --expt-relaxed-constexpr
-                           $<$<PLATFORM_ID:Linux>:-Xcompiler=-fno-gnu-unique>)
+                           $<$<PLATFORM_ID:Linux>:-Xcompiler=-fno-gnu-unique>
+                           $<$<CXX_COMPILER_ID:MSVC>:-Xcompiler=/Zc:__cplusplus>)
 endfunction()
 
 # mma.sync carries PTX (`80` is SASS and PTX), which the driver compiles for a card none names.
-gemm_unit(rotate rotate.cu "80;86-real;89-real;90-real;100-real;103-real;120-real;121-real")
+set(EVERY "80;86-real;89-real;90-real;100-real;103-real;120-real;121-real")
+gemm_unit(rotate rotate.cu "${EVERY}")
 gemm_unit(int8_mma_sync gemm_sm80.cu "80;86-real;89-real;120-real;121-real" COZY_MMA_SYNC)
-gemm_unit(int8_wgmma gemm_tma.cu "90a-real" COZY_WGMMA)
-gemm_unit(int8_tcgen05 gemm_tma.cu "100a-real" COZY_TCGEN05)
-gemm_unit(fp8_wgmma gemm_fp8.cu "90a-real" COZY_WGMMA)
-gemm_unit(fp8_tcgen05 gemm_fp8.cu "100a-real;103a-real" COZY_TCGEN05)
-gemm_unit(fp8_mma_sync gemm_fp8.cu "120a-real;121a-real" COZY_MMA_SYNC)
+set(units rotate int8_mma_sync)
+# Every other GEMM is CUTLASS's TMA kernel: its 128-byte-aligned parameters are passed by value,
+# which MSVC refuses (C2719), so a Windows build carries none (cr-201).
+if(MSVC)
+    set(tma OFF)
+else()
+    set(tma ON)
+endif()
+option(COZY_TMA "CUTLASS's TMA GEMMs: wgmma, tcgen05 and RTX 50's fp8" ${tma})
+if(COZY_TMA)
+    gemm_unit(int8_wgmma gemm_tma.cu "90a-real" COZY_WGMMA)
+    gemm_unit(int8_tcgen05 gemm_tma.cu "100a-real" COZY_TCGEN05)
+    gemm_unit(fp8_wgmma gemm_fp8.cu "90a-real" COZY_WGMMA)
+    gemm_unit(fp8_tcgen05 gemm_fp8.cu "100a-real;103a-real" COZY_TCGEN05)
+    gemm_unit(fp8_mma_sync gemm_fp8.cu "120a-real;121a-real" COZY_MMA_SYNC)
+    list(APPEND units int8_wgmma int8_tcgen05 fp8_wgmma fp8_tcgen05 fp8_mma_sync)
+endif()
 
 # FlashAttention-3's Hopper forward: upstream's instantiation units for head dims 64 and 128 in
 # bf16 and fp16, unmodified, with its own switches turning off what `fa3.cpp` never reaches.
-option(COZY_FA3 "FlashAttention-3's forward (_fa3)" ON)
-set(FA3 "${FLASH_ATTENTION_DIR}/hopper")
+# Neither MSVC (its TMA parameters, as above) nor ptxas on an arm64 host (signal 11, cr-200)
+# builds them.
+if(MSVC OR CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
+    set(fa3 OFF)
+else()
+    set(fa3 ON)
+endif()
+option(COZY_FA3 "FlashAttention-3's forward (_fa3)" ${fa3})
 if(COZY_FA3)
+# FlashAttention-3 (v2.8.3.post1) and the CUTLASS its submodule pins.
+pinned(FLASH_ATTENTION_DIR Dao-AILab/flash-attention a8aa52b1ab3e9ca574c8a33b3f35afc017ffa2e2
+       e06c229e24ad61bcb31eea9446a5e6484cd8b3b5d10d90b0f8f48cc2b0d4c431)
+pinned(FA3_CUTLASS_DIR NVIDIA/cutlass dc4817921edda44a549197ff3a9dcf5df0636e7b
+       f2a3a9df5e6f010c8b02716aa2644a6f071827fafa606fac5f5241cab6a1ab56)
+set(FA3 "${FLASH_ATTENTION_DIR}/hopper")
 add_library(fa3_units OBJECT "${FA3}/flash_prepare_scheduler.cu"
             "${FA3}/instantiations/flash_fwd_hdim64_bf16_sm90.cu"
             "${FA3}/instantiations/flash_fwd_hdim64_fp16_sm90.cu"
@@ -114,10 +145,16 @@ function(kernel_module name binding)
     install(TARGETS ${name} LIBRARY DESTINATION cozy_kernels)
 endfunction()
 
-kernel_module(_gemm gemm.cpp rotate int8_mma_sync int8_wgmma int8_tcgen05 fp8_wgmma fp8_tcgen05
-              fp8_mma_sync)
+kernel_module(_gemm gemm.cpp ${units})
 target_include_directories(_gemm PRIVATE "${INT8}")
+target_compile_definitions(_gemm PRIVATE $<$<BOOL:${COZY_TMA}>:COZY_TMA>)
 if(COZY_FA3)
     kernel_module(_fa3 fa3.cpp fa3_units)
     target_include_directories(_fa3 PRIVATE "${FA3}" "${FA3_CUTLASS_DIR}/include")
 endif()
+
+# RMSNorm plus split-half RoPE (comfy-kitchen v0.2.31's, `csrc/norm/UPSTREAM.md`).
+add_library(rms_rope OBJECT csrc/norm/rms_rope.cu)
+set_target_properties(rms_rope PROPERTIES CUDA_ARCHITECTURES "${EVERY}")
+target_compile_options(rms_rope PRIVATE --expt-extended-lambda --use_fast_math)
+kernel_module(_norm norm.cpp rms_rope)

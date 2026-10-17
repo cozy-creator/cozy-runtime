@@ -3,6 +3,9 @@ name: kernels
 # OS and CPU, each checked for its tag, its declared targets, no torch and an import on every
 # Python it claims (checks/kernel_wheel.py). PRs that touch kernel sources run it. By hand:
 #   gh workflow run kernels.yaml -R cozy-creator/cozy-runtime -f ref=<tag|sha>
+# A release builds a `kernels-v<version>` tag, proves that run's wheels on GPUs, then publishes
+# exactly those files to PyPI:
+#   gh workflow run kernels.yaml -R cozy-creator/cozy-runtime -f ref=kernels-v0.1.0 -f publish_run=<run id>
 on:
   workflow_dispatch:
     inputs:
@@ -10,6 +13,10 @@ on:
         description: Branch, tag or SHA to build
         type: string
         default: master
+      publish_run:
+        description: Publish this earlier run's wheels, built from the kernels-v* tag in ref, to PyPI
+        type: string
+        default: ''
   workflow_call:
     inputs:
       ref:
@@ -33,15 +40,17 @@ concurrency:
 
 jobs:
   linux:
+    if: ${{ !inputs.publish_run }}
     strategy:
       fail-fast: false
       matrix:
         include:
           # CUTLASS units peak at ~6 GB each: compile jobs sized by the runner's memory.
-          - {arch: x86_64, cuda: x86_64, runner: linux-x64-16core, jobs: 6, fa3: 'ON'}
-          # The arm64 larger runner has no docker; the standard one does. Its ptxas crashes on
-          # FA3's units (signal 11, twice): this wheel ships without `_fa3` (cr-200).
-          - {arch: aarch64, cuda: sbsa, runner: ubuntu-24.04-arm, jobs: 1, fa3: 'OFF'}
+          # `without`: what the wheel omits (CMake decides; `kernel_wheel.py` holds it to it).
+          - {arch: x86_64, cuda: x86_64, runner: linux-x64-16core, jobs: 6, without: ''}
+          # The arm64 larger runner has no docker; the standard one does. ptxas on an arm64 host
+          # crashes on FA3's units (signal 11, cr-200).
+          - {arch: aarch64, cuda: sbsa, runner: ubuntu-24.04-arm, jobs: 1, without: _fa3}
     runs-on: ${{ matrix.runner }}
     # Hang bound, not a work budget.
     timeout-minutes: 240
@@ -60,19 +69,18 @@ jobs:
           curl -fsSL https://raw.githubusercontent.com/cozy-creator/cozy/master/crates/cozy-platform/src/gpu/mod.rs \
             -o platform-gpu.rs
           docker run --rm -v "$PWD:/src" -w /src -e PLAT -e CUDA_REPO -e HOST_OWNER="$(id -u):$(id -g)" \
-            -e FA3=${{ matrix.fa3 }} -e CMAKE_BUILD_PARALLEL_LEVEL=${{ matrix.jobs }} "$IMAGE" bash -euo pipefail -c '
+            -e WITHOUT="${{ matrix.without }}" -e CMAKE_BUILD_PARALLEL_LEVEL=${{ matrix.jobs }} "$IMAGE" bash -euo pipefail -c '
               dnf install -y -q dnf-plugins-core && dnf config-manager --add-repo "$CUDA_REPO"
               dnf install -y -q cuda-nvcc-13-0-13.0.88 cuda-cudart-devel-13-0-13.0.96 cuda-cuobjdump-13-0-13.0.85
               export PATH=/usr/local/cuda-13.0/bin:$PATH
               export CC=/opt/rh/gcc-toolset-14/root/usr/bin/gcc CXX=/opt/rh/gcc-toolset-14/root/usr/bin/g++
               py=/opt/python/cp312-cp312/bin/python
               $py -m pip install -q uv==0.12.7
-              time $py -m uv build --wheel --python $py --out-dir /tmp/raw -C cmake.define.COZY_FA3=$FA3 \
-                kernels
+              time $py -m uv build --wheel --python $py --out-dir /tmp/raw kernels
               auditwheel repair --plat "$PLAT" --only-plat -w dist /tmp/raw/*.whl
               $py checks/kernel_wheel.py dist/*.whl "$PLAT" --python $py \
                 --python /opt/python/cp313-cp313/bin/python --python /opt/python/cp314-cp314/bin/python \
-                --platform-floor platform-gpu.rs $([ "$FA3" = ON ] || echo --without _fa3)
+                --platform-floor platform-gpu.rs $(for w in $WITHOUT; do echo --without $w; done)
               chown -R "$HOST_OWNER" dist
             ' 2>&1 | tee build.log
           exit "${PIPESTATUS[0]}"
@@ -86,3 +94,132 @@ jobs:
           name: cozy-kernels-${{ matrix.arch }}
           path: dist/*.whl
           if-no-files-found: error
+
+  windows:
+    if: ${{ !inputs.publish_run }}
+    # No larger Windows runner: the standard one, one compile at a time.
+    runs-on: windows-2025
+    timeout-minutes: 360
+    env:
+      REDIST: https://developer.download.nvidia.com/compute/cuda/redist
+      CMAKE_BUILD_PARALLEL_LEVEL: 1
+      CMAKE_GENERATOR: Ninja
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - {uses: actions/setup-python@v5, id: py313, with: {python-version: '3.13'}}
+      - {uses: actions/setup-python@v5, id: py314, with: {python-version: '3.14'}}
+      - {uses: actions/setup-python@v5, id: py312, with: {python-version: '3.12'}}
+      # CUDA 13.0's host_config.h takes MSVC through 19.4x: the image's Visual Studio 2026 carries
+      # Visual Studio 2022's last toolset, 14.44.
+      - uses: ilammy/msvc-dev-cmd@v1.13.0
+        with:
+          toolset: '14.44'
+      - name: CUDA 13.0 from NVIDIA's redistributables, each archive held to its digest
+        shell: pwsh
+        run: |
+          $manifest = Invoke-RestMethod "$env:REDIST/redistrib_13.0.2.json"
+          $root = "$env:RUNNER_TEMP\cuda"
+          New-Item -ItemType Directory -Force $root | Out-Null
+          foreach ($name in "cuda_nvcc", "cuda_crt", "libnvvm", "cuda_cudart", "cuda_cccl", "cuda_cuobjdump") {
+            $entry = $manifest.$name."windows-x86_64"
+            Invoke-WebRequest "$env:REDIST/$($entry.relative_path)" -OutFile "$name.zip"
+            if ((Get-FileHash "$name.zip" -Algorithm SHA256).Hash -ne $entry.sha256.ToUpper()) { throw "$name digest" }
+            Expand-Archive "$name.zip" "$env:RUNNER_TEMP\x\$name"
+            Copy-Item "$env:RUNNER_TEMP\x\$name\*\*" $root -Recurse -Force
+          }
+          "$root\bin" >> $env:GITHUB_PATH
+          "CUDAToolkit_ROOT=$root" >> $env:GITHUB_ENV
+          "CUDA_PATH=$root" >> $env:GITHUB_ENV
+      - name: Build and check the wheel
+        shell: pwsh
+        run: |
+          $py = "${{ steps.py312.outputs.python-path }}"
+          & $py -m pip install -q uv==0.12.7
+          Invoke-WebRequest https://raw.githubusercontent.com/cozy-creator/cozy/master/crates/cozy-platform/src/gpu/mod.rs -OutFile platform-gpu.rs
+          $began = Get-Date
+          & $py -m uv build --wheel --python $py --out-dir dist kernels
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          "built in $(((Get-Date) - $began).TotalMinutes) min"
+          $wheel = (Get-ChildItem dist\*.whl).FullName
+          # MSVC builds neither CUTLASS's TMA GEMMs nor FA3 (cr-201).
+          & $py checks/kernel_wheel.py $wheel win_amd64 --without tma --without _fa3 --python $py `
+            --python "${{ steps.py313.outputs.python-path }}" --python "${{ steps.py314.outputs.python-path }}" `
+            --platform-floor platform-gpu.rs
+          exit $LASTEXITCODE
+      - uses: astral-sh/setup-uv@v7
+      - name: Stable ABI only
+        run: uvx abi3audit==0.0.26 --strict --report (Get-ChildItem dist\*.whl).FullName
+        shell: pwsh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cozy-kernels-win_amd64
+          path: dist/*.whl
+          if-no-files-found: error
+
+  publish:
+    if: inputs.publish_run && startsWith(inputs.ref, 'kernels-v')
+    runs-on: ubuntu-latest
+    environment: pypi
+    # Hang bound, not a work budget.
+    timeout-minutes: 20
+    permissions:
+      id-token: write  # PyPI trusted publishing (OIDC)
+      actions: read
+    env:
+      RUN: ${{ inputs.publish_run }}
+      REF: ${{ inputs.ref }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: The run built this tag and passed
+        run: |
+          gh run view "$RUN" -R "$GITHUB_REPOSITORY" --json workflowName,displayTitle,conclusion \
+            --jq '"\(.workflowName)|\(.displayTitle)|\(.conclusion)"' | tee run
+          [ "$(cat run)" = "kernels|kernels $REF|success" ]
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: cozy-kernels-*
+          path: dist
+          merge-multiple: true
+          run-id: ${{ inputs.publish_run }}
+          github-token: ${{ github.token }}
+      - name: One wheel per target, each at the tag's version
+        working-directory: dist
+        run: |
+          version=${REF#kernels-v}
+          want=$(printf "cozy_kernels-$version-cp312-abi3-%s.whl\n" \
+            manylinux_2_28_aarch64 manylinux_2_28_x86_64 win_amd64)
+          [ "$(ls | sort)" = "$want" ] || { ls; echo "::error::expected $want"; exit 1; }
+          sha256sum * | tee ../sums
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+      - name: Publish (trusted publishing)
+        uses: pypa/gh-action-pypi-publish@release/v1
+      # Uploads land one file at a time: wait while a file is absent, refuse any the run did not build.
+      - name: PyPI serves exactly the built files
+        run: |
+          python3 - <<'PY'
+          import json, os, sys, time, urllib.error, urllib.request
+          version = os.environ["VERSION"]
+          want = {name: digest for digest, name in (line.split() for line in open("sums"))}
+          request = urllib.request.Request(
+              f"https://pypi.org/pypi/cozy-kernels/{version}/json", headers={"Cache-Control": "no-cache"}
+          )
+          while True:
+              try:
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      served = {f["filename"]: f["digests"]["sha256"] for f in json.load(response)["urls"]}
+              except (OSError, urllib.error.URLError) as error:
+                  print(f"PyPI JSON unavailable ({error}); retrying", flush=True)
+                  time.sleep(5)
+                  continue
+              wrong = {name: digest for name, digest in served.items() if want.get(name) != digest}
+              if wrong:
+                  sys.exit(f"PyPI serves files the run did not build: {wrong}")
+              missing = sorted(set(want) - set(served))
+              if not missing:
+                  print("\n".join(f"{want[name]}  {name}" for name in sorted(want)))
+                  break
+              print(f"not yet served: {missing}", flush=True)
+              time.sleep(5)
+          PY

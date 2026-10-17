@@ -24,7 +24,7 @@ from cozy_runtime.internal import arch, verify
 from cozy_runtime.internal.encoding.formats import CONVROT_GROUP, E4M3_MAX, Tensor, hadamard256
 
 try:
-    from cozy_kernels import FAMILIES, GEMM, _gemm
+    from cozy_kernels import FAMILIES, GEMM, TMA_GEMM, _gemm
 
     ABSENT = ""
 except ImportError as absent:  # no cozy-kernels wheel for this OS and CPU
@@ -320,6 +320,16 @@ def covers(sm: int) -> bool:
     return not ABSENT and any(sm in GEMM[f].get(family, ()) for f in GEMM)
 
 
+def lost(f: str, sm: int) -> str:
+    """Why the wheel has no `f` GEMM for this card where a full build has one (a Windows wheel,
+    cr-201), or "": a run's GEMM column says it beside the kernel that served."""
+    family = arch.row(sm).family
+    if ABSENT or _gemm.TMA or sm not in TMA_GEMM.get(f, {}).get(family, ()):
+        return ""
+    return (f"the Windows cozy-kernels wheel has no {family} {f} GEMM for sm{sm}: MSVC cannot "
+            "build CUTLASS's TMA kernels (cr-201)")  # fmt: skip
+
+
 def library(torch: ModuleType, index: int, sm: int) -> tuple[Prebuilt | None, str]:
     """The prebuilt ops on cuda:`index` (capability `sm`) once each format its row runs passes
     its probe, or None and why. A card no row names tries each family it could hold, newest
@@ -328,9 +338,12 @@ def library(torch: ModuleType, index: int, sm: int) -> tuple[Prebuilt | None, st
         return None, ABSENT
     if not arch.families(sm):
         return None, f"sm{sm} has no tensor-core family"
+    carried = [family for family in arch.families(sm) if any(family in GEMM[f] for f in GEMM)]
+    if not carried:  # a Windows wheel has mma.sync only (cr-201)
+        return None, f"the cozy-kernels wheel has no {'/'.join(arch.families(sm))} GEMM"
     digest = artifact()
     reasons: list[str] = []
-    for family in arch.families(sm):
+    for family in carried:
         row = arch.row(sm, family)
         ops = Prebuilt(torch, index, family, sm in GEMM["fp8"].get(family, ()))
         formats = [f for f in (INT8, FP8) if getattr(row, f.name)]
