@@ -38,6 +38,7 @@ from cozy_runtime.internal import (  # noqa: E402
     attention_sol,
     kernel_cache,
     kernel_compile,
+    tools,
     triton_kernels,
 )
 from cozy_runtime.internal.encoding.leaves import RowwiseNativeLeaf  # noqa: E402
@@ -187,6 +188,23 @@ def test_a_kernel_set_is_keyed_by_its_sources_and_entries() -> None:
         triton_kernels.load(kernels, device="cpu")
     assert refused.value.code == "kernels_absent"
     assert triton_kernels.expect(kernels, 89).startswith("kernels_absent: no machine kernel store")
+
+
+def test_a_kernel_set_without_a_c_compiler_is_absent_and_starts_no_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = kernel_cache.Store(tmp_path / "u")
+    monkeypatch.setattr(kernel_cache, "_MACHINE_STORE", [store])
+    monkeypatch.setattr(kernel_compile, "_STARTED", {})
+    monkeypatch.setattr(tools, "_MISSING", {})
+    monkeypatch.setenv("PATH", str(tmp_path))  # no gcc, clang or CC
+    monkeypatch.delenv("CC", raising=False)
+    monkeypatch.setenv("TRITON_LIBCUDA_PATH", str(tmp_path))  # the key reads no driver
+    monkeypatch.setenv("TRITON_CACHE_DIR", str(store.own / "triton"))
+    kernels = TritonKernels("test-no-cc", [_entry(2)])
+    assert triton_kernels.expect(kernels, 89) == "kernels_absent: test-no-cc: cc not found"
+    assert kernel_compile._STARTED == {}
+    assert tools.warnings() == [(tools.warning("cc"), {"code": "triton_no_compiler", "tool": "cc"})]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="compiling and launching needs a card")

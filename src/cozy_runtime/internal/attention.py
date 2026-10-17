@@ -17,6 +17,7 @@ step, and refuses an unsupported or failed kernel (owner ruling 2026-10-10).
 
 from __future__ import annotations
 
+import shutil
 import site
 import sys
 from collections import deque
@@ -47,6 +48,7 @@ from cozy_runtime.internal import (
     kernel_sources,
     prebuilt,
     producers,
+    tools,
     verify,
 )
 from cozy_runtime.internal import attention_upstream as upstream
@@ -403,12 +405,22 @@ def reserve(pin: str, device: DeviceFacts) -> None:
 
 
 def _job(candidate: Candidate, device: DeviceFacts) -> kernel_compile.Job:
+    """The candidate's build here; a build tool it lacks is the run's warning (`tools`)."""
     build = _build(candidate)
+    failed = f"{candidate.name} prebuilt" in _STATES  # the wheel's kernel failed its probe
+    code = "kernel_verify_failed" if failed else "kernel_prebuilt_missing"
     try:
-        return kernel_sources.job(build, device.sm)
+        job = kernel_sources.job(build, device.sm)
     except kernel_sources.Absent as exc:
+        for tool in exc.tools:
+            tools.missing(tool, code)
         _STATES[candidate.name] = kernel_compile.State(build, "absent", detail=str(exc))
         raise AttentionRefusal("attention_kernel_absent", f"{candidate.name}: {exc}") from exc
+    store = kernel_cache.configured()
+    built = store is None or store.entry(job.key) is not None
+    if job.kind == "setup" and not built and not shutil.which("ninja"):
+        tools.missing("ninja", code)
+    return job
 
 
 def _compiled(candidate: Candidate, device: DeviceFacts, wait: bool) -> dict[str, str] | None:
@@ -666,6 +678,8 @@ def _sol_route(device: DeviceFacts) -> None:
         route = attention_sol.backend(device.index)
         if route == "fa4_block_sparse":
             _import(known()["flash-attn4"])
+            if not tools.triton():
+                raise AttentionRefusal("attention_kernel_absent", "sol-attn FA4: cc not found")
             try:
                 import_module("cozy_runtime.internal.attention_sol_fa4").warm(device.index)
             except Exception as exc:

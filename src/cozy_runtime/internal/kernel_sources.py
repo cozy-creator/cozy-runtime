@@ -66,7 +66,12 @@ _BUILD_DEPS = ("setuptools", "wheel", "packaging")
 
 
 class Absent(Exception):
-    """This machine cannot build the artifact at all: a missing source or toolkit."""
+    """This machine cannot build the artifact at all: a missing source or toolkit (`tools`,
+    the build tools it lacks)."""
+
+    def __init__(self, detail: str, tools: tuple[str, ...] = ()) -> None:
+        super().__init__(detail)
+        self.tools = tools
 
 
 @dataclass(frozen=True, slots=True)
@@ -475,12 +480,14 @@ def _nvcc() -> str:
 @functools.cache
 def compiler() -> str:
     """The CUDA toolkit and host compiler that will build, as they identify themselves."""
-    environment = config.inherited_environment()
-    nvcc = _nvcc()
+    nvcc, cxx = _nvcc(), config.inherited_environment().get("CXX") or "c++"
+    lacking = tuple(tool for tool, path in (("nvcc", nvcc), ("cc", cxx)) if not shutil.which(path))
+    if lacking:
+        raise Absent(f"{' and '.join(lacking)} not found", lacking)
     try:
         found = [
             subprocess.run([tool, "--version"], capture_output=True, text=True, check=True).stdout
-            for tool in (nvcc, environment.get("CXX") or "c++")
+            for tool in (nvcc, cxx)
         ]
     except (OSError, subprocess.CalledProcessError) as exc:
         raise Absent(f"no CUDA toolkit to build with ({nvcc}): {exc}") from exc
