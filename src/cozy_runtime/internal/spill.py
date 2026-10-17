@@ -247,8 +247,8 @@ def spill(
     _sweep()
     _fence(torch, device)
     read = {int(t.untyped_storage()._cdata) for t in stored(operands) if t.device == device}
-    found = _found(torch, device, need, read)
     left, moved, disk = room if room >= 0 else need, 0, disk and room >= 0
+    found = _found(torch, device, need, read, mapped and left >= need)
     for key, storage in sorted(
         found.items(), key=lambda r: (r[0] in read, _last(r[0]), -r[1].nbytes())
     ):
@@ -339,10 +339,12 @@ def _fence(torch: ModuleType, device: Device) -> None:
 
 
 def _found(
-    torch: ModuleType, device: Device, need: int, read: set[int]
+    torch: ModuleType, device: Device, need: int, read: set[int], mappable: bool
 ) -> dict[int, UntypedStorage]:
     """Storages torch's allocator holds on `device` for this process, by `_cdata`: in its own
-    pool (a CUDA graph's pool holds what its graphs read) or, without segments, resizable."""
+    pool (a CUDA graph's pool holds what its graphs read) or, without segments, resizable.
+    Every object is looked at when those ops touched cannot give `need`: any of them while
+    they can be mapped, else only those no op touched this stage."""
     segments: list[tuple[int, int]] | None = None
     if device.type == "cuda":
         segments = sorted(
@@ -354,7 +356,7 @@ def _found(
     found: dict[int, UntypedStorage] = {}
 
     def add(storages: Iterable[UntypedStorage | None]) -> int:
-        """Those among `storages`; the bytes of those no operand reads."""
+        """Those among `storages`; the bytes of those that may leave."""
         spare = 0
         for storage in storages:
             if storage is None or storage.device != device:
@@ -371,10 +373,10 @@ def _found(
                 if at < 0 or address >= segments[at][1]:
                     continue
             found[key] = storage
-            spare += 0 if key in read else int(storage.nbytes())
+            if key not in read and (mappable or _last(key) < BEGAN[0]):
+                spare += int(storage.nbytes())
         return spare
 
-    # The storages ops touched cover a decode's maps; every object only when they fall short.
     if add(_strong(torch, ref) for _, ref in list(USED.values())) < need:
         add(
             value.untyped_storage()
