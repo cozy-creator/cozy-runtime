@@ -581,9 +581,7 @@ class _OnDemand:
 _WARM_NOTED: set[type] = set()
 
 #: The requests rank 0 relays to the machine for a follower (`_relay`).
-_RELAYED = frozenset(
-    {"sealed_tier", "sealed_stage", "object_files", "model_source"}
-)
+_RELAYED = frozenset({"sealed_tier", "sealed_stage", "object_files", "model_source"})
 
 #: The runtime modules a construction imports, named ONCE so `start` can warm
 #: exactly the set `_prepare_first` re-imports (cr-104). Warming a name this tuple omits
@@ -3764,7 +3762,13 @@ class Executor:
     @staticmethod
     def _emit_gemm(record: AuthorAttempt, member: Executor) -> None:
         """`gemm.selected`: per component, format and kernel, the encoded leaves whose last call
-        that kernel served. `gemm.fallback`: each that served below what its lane wanted, why."""
+        that kernel served. `gemm.fallback`: each that served below what its lane wanted, why,
+        also said as a warning line (a machine before TensorD keeps `gemm.*` drops the fact)."""
+
+        def fallback(value: str, **fields: Any) -> None:
+            record.emit("confession", "gemm.fallback", value, **fields)
+            record.emit("log", "a GEMM served below its lane", "warn", kernel=value, **fields)
+
         prefix = member._prefix()
         leaves = member.backend.leaves if member.backend is not None else {}
         served = Counter(
@@ -3780,25 +3784,13 @@ class Executor:
             record.emit("confession", "gemm.selected", kernel, format=form, leaf=leaf, **fields)
             wanted = native.get(form, kernel)
             if missing and kernel != wanted:
-                reason = missing[0].reason
-                record.emit(
-                    "confession",
-                    "gemm.fallback",
-                    kernel,
-                    wanted=wanted,
-                    served=kernel,
-                    reason=reason,
-                    **fields,
-                )
+                fallback(kernel, wanted=wanted, served=kernel, reason=missing[0].reason, **fields)
         for group in member.refused_leaves:
-            served_as = {"bfloat16": "bf16", "float16": "fp16"}.get(group.dtype, group.dtype)
-            record.emit(
-                "confession",
-                "gemm.fallback",
+            fallback(
                 "torch.linear",
                 component=prefix + group.component,
                 wanted=FORMATS.get(group.leaf, group.lane),
-                served=served_as,
+                served={"bfloat16": "bf16", "float16": "fp16"}.get(group.dtype, group.dtype),
                 reason=group.reason,
                 sites=group.tensors,
             )
