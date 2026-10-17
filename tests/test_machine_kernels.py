@@ -162,7 +162,9 @@ def test_the_boot_starts_every_build_at_once_through_the_compile_ledger(
     index = json.loads((root / "index.json").read_text())
     index["sources"] |= {
         "sageattention": _tree(root, "sageattention", files("sageattention", "setup.py")),
-        "flash-attention": _tree(root, "flash-attention", files("flash-attn3", "hopper/setup.py")),
+        "flash-attention": _tree(
+            root, "flash-attention", files("flash-attn3-full", "hopper/setup.py")
+        ),
         "flash-attention-cutlass": _tree(root, "cutlass", {"README.md": "cutlass\n"}),
     }
     (root / "index.json").write_text(json.dumps(index))
@@ -183,8 +185,10 @@ def test_the_boot_starts_every_build_at_once_through_the_compile_ledger(
 
     code, lines = _boot(capsys)
     ready = {row["kernel"] for row in lines if row.get("state") == "ready"}
-    assert code == 0 and ready == {kernel_sources.PYTHON, "sageattention", "flash-attn3"}, lines
-    for name in ("sageattention", "flash-attn3"):
+    assert code == 0 and ready == {kernel_sources.PYTHON, "sageattention", "flash-attn3-full"}, (
+        lines
+    )
+    for name in ("sageattention", "flash-attn3-full"):
         recipe = kernel_sources.RECIPES[name]
         rewritten = (meet / f"{name}.py").read_text()
         for path, old, new in (*recipe.replace, *recipe.replace_on.get(90, ())):
