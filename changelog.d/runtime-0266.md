@@ -1,0 +1,1 @@
+Runtime 0.26.6 is cut from release/0.26: weight reads nest one level under a LoRA bake (the 32 GB H3 `weight_unbound` fix, with the refusal naming the weight), and the MTP draft head rotates with the model's own `rotary_emb` (#1536), on TensorD 0.7.3.
