@@ -1047,10 +1047,13 @@ class MediaReads:
         budget, path = self._start(asset, "ImageAsset.read")
         try:
             with _reading(asset, None, "image"):
-                return _image(path, self._limits, budget, _image_preparation(asset))
+                prepared = _image(path, self._limits, budget, _image_preparation(asset))
         except BaseException:
             budget.refund()
             raise
+        # A fresh RGB image of those pixels: no source metadata (a palette's `transparency`,
+        # EXIF, ICC) reaches the package, so a later `convert("RGBA")` stays opaque.
+        return pil_frombytes("RGB", prepared.size, prepared.tobytes())
 
     def video(self, asset: VideoAsset, *, end: object, fps: object, audio: bool) -> DecodedVideo:
         cut = _effective_end(end, asset._end)

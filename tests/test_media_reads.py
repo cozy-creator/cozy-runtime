@@ -12,6 +12,7 @@ from pathlib import Path
 import av
 import numpy as np
 import pytest
+from PIL import Image, ImageOps
 
 from cozy_runtime.author import (
     AudioAsset,
@@ -24,7 +25,12 @@ from cozy_runtime.author import (
     VideoAsset,
     fakes,
 )
-from cozy_runtime.author._decode import DEFAULT_DECODE_LIMITS, MediaReads
+from cozy_runtime.author._decode import (
+    DEFAULT_DECODE_LIMITS,
+    MediaReads,
+    _Budget,
+    decode_image_path,
+)
 from cozy_runtime.author._services import Attempt
 from media_sources import joined, mp4, steady, webm
 
@@ -205,3 +211,40 @@ def test_a_malformed_image_is_a_decode_refusal_from_probe_and_read(tmp_path: Pat
         with pytest.raises(InvalidRequest) as caught:
             read()
         assert caught.value.code == "media_malformed" and caught.value.fields == ("input",)
+
+
+def _as_0_26_5(path: Path) -> Image.Image:
+    """0.26.5's `MediaDecoder.value`: the decoded RGB bytes rebuilt as a fresh PIL image."""
+    decoded = decode_image_path(path, DEFAULT_DECODE_LIMITS, _Budget(1 << 30))
+    return Image.frombytes("RGB", (decoded.width, decoded.height), decoded.rgb)
+
+
+def test_an_image_read_carries_no_source_metadata(tmp_path: Path) -> None:
+    path = tmp_path / "palette.png"
+    indexes = (np.arange(120 * 120).reshape(120, 120) % 7).astype(np.uint8)
+    source = Image.fromarray(indexes, mode="P")
+    colours = [(i * 30, 255 - i * 30, (i * 70) % 256) for i in range(7)]
+    source.putpalette([value for colour in colours for value in colour])
+    source.save(path, transparency=3)
+    with Image.open(path) as opened:
+        naive = np.asarray(opened.convert("RGB").convert("RGBA"))[..., 3]
+    assert (naive == 0).sum() > 0  # Pillow carries `transparency` through convert("RGB")
+
+    image = fakes.file_input(ImageAsset, path).read()
+    expected = _as_0_26_5(path)
+    assert (image.mode, image.size, image.info) == (expected.mode, expected.size, expected.info)
+    assert image.info == {} and image.tobytes() == expected.tobytes()
+    assert (np.asarray(image.convert("RGBA"))[..., 3] == 255).all()
+
+
+def test_an_exif_rotated_jpeg_reads_upright(tmp_path: Path) -> None:
+    path = tmp_path / "rotated.jpg"
+    exif = Image.Exif()
+    exif[274] = 6  # stored 120x80, displayed a quarter turn
+    pixels = np.random.default_rng(3).integers(0, 256, (80, 120, 3), dtype=np.uint8)
+    Image.fromarray(pixels).save(path, format="JPEG", exif=exif, quality=95)
+    image = fakes.file_input(ImageAsset, path).read()
+    with Image.open(path) as opened:
+        upright = ImageOps.exif_transpose(opened).convert("RGB")
+    assert image.size == (80, 120) and image.info == {}
+    assert image.tobytes() == upright.tobytes() == _as_0_26_5(path).tobytes()
