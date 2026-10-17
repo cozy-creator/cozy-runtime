@@ -238,7 +238,7 @@ def install(plan: Plan, model: Any) -> str:
                 setattr(space, name, _SLOTS[name](current, launch))
         _STEPS[0] = launch
         for engine in list(_ENGINES.values()):  # their graphs recorded Transformers' path
-            engine.graphs, engine.need = {}, {}
+            engine.stale = True
 
     try:
         if plan.when_ready is None:
@@ -909,7 +909,12 @@ class _Engine:
         self.layout: tuple[object, ...] | None = None
         self.pool: Any = None
         self.side: Any = None
-        self.failed = ""
+        #: (bucket, window, drafted) -> why that step runs eagerly
+        self.unrecorded: dict[tuple[int, int, bool], str] = {}
+        #: the graphs recorded a path that changed since (a kernel landed in `install`)
+        self.stale = False
+        #: seconds the last admission took: decoding gets as long before the next one
+        self.debt = 0.0
         self.reservation: Any = None
         self.retire = False
         self.cache_device: Any = None
@@ -1120,11 +1125,14 @@ class _Engine:
         self.retire = False
         waiting: list[_Request] = []
         admitted = False
+        started = time.perf_counter()
         for request in incoming:
-            if waiting or not self._admit(request):
+            # One call joins at a time while rows decode: their tokens keep coming meanwhile.
+            if waiting or (admitted and self._occupied()) or not self._admit(request):
                 waiting.append(request)
             else:
                 admitted = True
+        self.debt = time.perf_counter() - started if admitted else 0.0
         with self.cond:
             self.pending.extendleft(reversed(waiting))
             if waiting and not self._occupied() and not admitted and not self.rehold:
@@ -1418,7 +1426,8 @@ class _Engine:
             self._empty(slot)
         self.rows_index = torch.arange(capacity, device=device)
         self.flag = torch.zeros((size,), dtype=torch.bool, pin_memory=device.type == "cuda")
-        self.views, self.graphs, self.need = {}, {}, {}
+        self.views = {}
+        self._forget()
         self.width = stops
         return True
 
@@ -1462,18 +1471,22 @@ class _Engine:
     def _steps(self) -> None:
         """Steps until a row is done or a call waits to join, queued `LAG` ahead of the host."""
         cuda = self.cache_device.type == "cuda"
-        if cuda and (self.where != self.layout or self.landed != LANDED[0]):
+        if cuda and (self.where != self.layout or self.landed != LANDED[0] or self.stale):
             # The weights moved, or a kernel landed (the graphs recorded its stand-in).
-            self.graphs, self.need, self.layout, self.landed = {}, {}, self.where, LANDED[0]
-        if cuda and self.pool is None:
-            self.pool, self.side = torch.cuda.graph_pool_handle(), torch.cuda.Stream()
+            self._forget()
+            self.layout, self.landed, self.stale = self.where, LANDED[0], False
         queued: deque[Any] = deque()
         size = self._bucket()
+        began = time.perf_counter()
+
+        def joining() -> bool:  # a waiting call joins once decoding had its prefill's time
+            return bool(self.pending) and time.perf_counter() - began >= self.debt
+
         with _disable_current_modes():
             while True:
                 self._one(size, lambda size: self._replay(size, cuda))
                 if not cuda:
-                    if bool(self.flag[:size].any()) or self.pending:
+                    if bool(self.flag[:size].any()) or joining():
                         break
                     continue
                 event = torch.cuda.Event()
@@ -1481,7 +1494,7 @@ class _Engine:
                 queued.append(event)
                 if len(queued) > LAG:
                     queued.popleft().synchronize()
-                    if bool(self.flag[:size].any()) or self.pending:
+                    if bool(self.flag[:size].any()) or joining():
                         break
             if cuda:
                 torch.cuda.current_stream().synchronize()
@@ -1491,36 +1504,52 @@ class _Engine:
         drafted = self.draft is not None
         key = (size, self.cache.window, drafted)
         graph = self.graphs.get(key)
-        if graph is None and cuda and not self.failed and self.building != LANDED[0]:
+        if graph is None and cuda and key not in self.unrecorded and self.building != LANDED[0]:
             need = self.need.get((size, drafted))
             if need is None:
                 self._measured(size)
                 return
             free = self.room() if self.room is not None else ROOM * need
             if free < ROOM * need:
-                self.failed = f"no room: {free >> 20} MiB free, a step takes {need >> 20} MiB"
+                self._unrecorded(
+                    key, f"no room: {free >> 20} MiB free, a step takes {need >> 20} MiB"
+                )
             else:
+                if self.pool is None:
+                    self.pool, self.side = torch.cuda.graph_pool_handle(), torch.cuda.Stream()
                 capturing = time.perf_counter()
                 try:
                     graph, why = capture(lambda: self._advance(size), self.pool, self.side)
-                except Building:  # eager until a kernel lands; the aborted capture spent its pool
-                    graph, why, self.pool, self.building = None, "", None, LANDED[0]
+                except Building:  # eager until a kernel lands
+                    graph, why, self.building = None, "", LANDED[0]
                 self.captured[0] += 1
                 self.captured[1] += time.perf_counter() - capturing
-                if graph is None and why:
-                    self._capture_failed(why)
-                else:
+                if graph is not None:
                     self.graphs[key] = graph
+                else:
+                    self.pool = None  # an aborted capture spent its pool
+                    if why:
+                        self._unrecorded(key, why)
         if graph is not None:
             graph.replay()
         else:
             self._advance(size)
             self.eager += 1
 
-    def _capture_failed(self, why: str) -> None:
-        self.failed, self.pool = why, None
-        torch.cuda.empty_cache()
+    def _forget(self) -> None:
+        """Every recorded step goes, and its pool: a fresh pool records the next ones (a pool
+        whose graphs are gone takes no new recording)."""
+        if self.graphs or self.pool is not None:
+            self.graphs, self.need, self.unrecorded, self.pool = {}, {}, {}, None
+            torch.cuda.empty_cache()
+
+    def _unrecorded(self, key: tuple[int, int, bool], why: str) -> None:
+        """That step runs eagerly from now on, with a warning on the calls it serves."""
+        self.unrecorded[key] = why
         say(f"capture:{type(self.model).__name__}", f"[lm] capture failed: {why}")
+        warning = ("a CUDA graph was not used", {"module": type(self.model).__name__, "why": why})
+        for request in {id(r.request): r.request for r in self.slots if r is not None}.values():
+            request.warnings.append(warning)
         for row in self.slots:
             if row is not None:
                 row.request.warnings.append(
@@ -1703,9 +1732,10 @@ class _Engine:
     # ------------------------------------------------------------------ memory
 
     def _drop(self) -> None:
-        self.cache = None
-        self.views, self.graphs, self.need = {}, {}, {}
-        self.slots, self.capacity, self.pool = [], 0, None
+        if self.cache_device is not None and self.cache_device.type == "cuda":
+            self._forget()
+        self.cache, self.views = None, {}
+        self.slots, self.capacity = [], 0
         self.layout = None
         if self.reservation is not None:
             self.reservation.close()
