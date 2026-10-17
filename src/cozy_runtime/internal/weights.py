@@ -4406,6 +4406,7 @@ class WeightResidency:
             _put_back(held)
             component.tight = True  # its ops recover one by one from now on
             weights.memory.free_for(need, op, (*args, *kwargs.values()))
+            weights.oom_retries += 1
             return forward(*args, **kwargs)
 
         return call
