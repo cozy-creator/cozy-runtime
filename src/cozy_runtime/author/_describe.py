@@ -18,7 +18,7 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 from cozy_runtime.author._assets import asset_kinds
-from cozy_runtime.author._decode import DEFAULT_DECODE_LIMITS, require_decoder_dependency
+from cozy_runtime.author._decode import require_decoder_dependency
 from cozy_runtime.author._demand import FeatureSpec, feature_specs
 from cozy_runtime.author._errors import CapabilityError, ConformanceError
 from cozy_runtime.author._markers import AssetBound
@@ -189,13 +189,6 @@ def _media_decode_bounds(surface: Surface) -> None:
                 "AssetBound(max_decoded_bytes=...): compressed and decoded size are separate "
                 "limits, and the decoder has no unbounded overload",
                 code="asset_decode_unbounded",
-                fields=[path],
-            )
-        if bound.max_decoded_bytes > DEFAULT_DECODE_LIMITS.max_decoded_bytes:
-            raise ConformanceError(
-                f"{surface.name}.{path} declares {bound.max_decoded_bytes} decoded bytes, "
-                f"above Runtime's {DEFAULT_DECODE_LIMITS.max_decoded_bytes}-byte hard ceiling",
-                code="asset_decode_limit",
                 fields=[path],
             )
     try:
