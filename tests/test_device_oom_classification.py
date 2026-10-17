@@ -10,6 +10,12 @@ ALLOCATION_FAILURES = (
     "CUDA error: CUBLAS_STATUS_ALLOC_FAILED when calling `cublasCreate(handle)`",
     "cuDNN error: CUDNN_STATUS_ALLOC_FAILED",
     "CUDA error: out of memory\nCUDA kernel errors might be asynchronously reported",
+    "cuFFT error: CUFFT_ALLOC_FAILED",
+    "cusolver error: CUSOLVER_STATUS_ALLOC_FAILED, when calling `cusolverDnCreate(handle)`",
+    "CUDA error: CUSPARSE_STATUS_ALLOC_FAILED when calling `cusparseCreate(handle)`",
+    "NCCL error in: ProcessGroupNCCL.cpp:3356, unhandled cuda error, NCCL version 2.27.5\n"
+    "ncclUnhandledCudaError: Call to CUDA function failed.\nLast error:\n"
+    "Cuda failure 2 'out of memory'",
 )
 
 

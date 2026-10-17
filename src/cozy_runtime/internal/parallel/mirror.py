@@ -16,7 +16,7 @@ from typing import Any
 import msgspec
 
 from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT
-from cozy_runtime.author._errors import DEVICE_OOM, Cancelled, is_device_oom
+from cozy_runtime.author._errors import DEVICE_OOM, MEMORY_EXHAUSTED, Cancelled, is_device_oom
 from cozy_runtime.author._model import remote_scope
 from cozy_runtime.internal import attention_sol, execution_evidence
 from cozy_runtime.internal.parallel import cp, wire
@@ -30,7 +30,7 @@ def _failed(what: str, exc: BaseException) -> str:
 
 
 #: Refusals of the weight plane that mean "this GPU has no room for the call as placed".
-_NO_ROOM = frozenset({"device_shortfall", "operation_exceeds_device"})
+_NO_ROOM = frozenset({"device_shortfall", MEMORY_EXHAUSTED})
 
 
 def out_of_memory(exc: BaseException) -> int | None:

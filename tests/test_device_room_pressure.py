@@ -13,6 +13,7 @@ from types import ModuleType
 import pytest
 
 from cozy_runtime.internal import accel, plane, weight_policy
+from cozy_runtime.internal.memory import Memory
 from cozy_runtime.internal.weights import WeightResidency, Weights
 
 MIB = 1 << 20
@@ -52,6 +53,7 @@ def account(monkeypatch: pytest.MonkeyPatch, *, cached: int = 0, trim: bool = Tr
     own.activation, own.adaptive = {"denoise": 512 * MIB}, {}
     own.pool = None  # a discrete GPU: no unified plane
     own.residencies = weakref.WeakSet()
+    own.memory = Memory(own)
     # Its unpark callback is the only residency I/O this accounting test observes.
     residency = WeightResidency.__new__(WeightResidency)
     own.residencies.add(residency)
