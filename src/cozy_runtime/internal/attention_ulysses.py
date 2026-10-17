@@ -16,6 +16,9 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, TypedDict
 
+from cozy_runtime.author._errors import is_device_oom
+from cozy_runtime.internal import bands, spill
+
 if TYPE_CHECKING:
     from diffusers.models.attention_dispatch import AttentionBackendName
     from torch import Tensor
@@ -31,8 +34,6 @@ if TYPE_CHECKING:
         enable_gqa: bool
 
 
-from cozy_runtime.author._errors import is_device_oom
-from cozy_runtime.internal import bands, spill
 from cozy_runtime.internal.attention_registry import register
 from cozy_runtime.internal.parallel import copy_engine
 

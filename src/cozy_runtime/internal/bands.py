@@ -312,24 +312,22 @@ class Bands:
             out, n = self._room(meta, count, 2 * (_bytes(q) + _bytes(k)) // count, unit, (q, k, v))
         self.rewrites += 1
 
-        def piece(h: int, n: int, s: int, m: int, finest: bool) -> bool:
-            """Heads [h, h + n), rows [s, s + m) into `out`; False: out of device memory (never
-            the finest piece, whose ops make room as any op does)."""
+        def piece(h: int, n: int, s: int, m: int) -> None:
+            """Query heads [h, h + n) and rows [s, s + m) into `out`."""
             kv = [self._take(t, 2, h // group, (h + n - 1) // group + 1) for t in (k, v)]
             part = mask
             if part is not None:  # a dim of one broadcasts
                 part = part if part.shape[1] == 1 else part.narrow(1, h, n)
                 part = part if part.shape[2] == 1 else self._take(part, 2, s, s + m)
             query = self._take(q.narrow(2, h, n), 1, s, s + m)
-            slot = out.narrow(1, s, m).narrow(2, h, n)
-            return self._attempt(lambda: slot.copy_(call(query, kv[0], kv[1], part)), finest)
+            out.narrow(1, s, m).narrow(2, h, n).copy_(call(query, kv[0], kv[1], part))
 
         h = 0
         while h < count:
             # whole K/V groups, else heads that share one K/V head
             n = n // group * group if n >= group else min(n, group - h % group)
             n = min(n, count - h)
-            if piece(h, n, 0, length, n <= unit and not rows):
+            if self._attempt(n <= unit and not rows, piece, h, n, 0, length):
                 h += n
             elif n > unit:
                 n = max(unit, n // 2)
@@ -337,21 +335,21 @@ class Bands:
                 span, s = max(rows, length // 2 // rows * rows), 0
                 while s < length:
                     m = min(span, length - s)
-                    if piece(h, n, s, m, span <= rows):
+                    if self._attempt(span <= rows, piece, h, n, s, m):
                         s += m
                     else:
                         span = max(rows, span // 2 // rows * rows)
                 h += n
         return out
 
-    def _attempt(self, piece: Callable[[], object], finest: bool) -> bool:
-        """`piece()`; False: it ran out of device memory (`raises`). The finest piece's ops
-        make room as any op does."""
+    def _attempt(self, finest: bool, piece: Callable[..., None], *args: int) -> bool:
+        """`piece(*args)`; False: it ran out of device memory (`raises`). The finest piece's
+        ops make room as any op does."""
         if finest:
-            held(piece)
+            held(lambda: piece(*args))
             return True
         try:
-            piece()
+            piece(*args)
         except Exception as exc:
             if not is_device_oom(exc):
                 raise
