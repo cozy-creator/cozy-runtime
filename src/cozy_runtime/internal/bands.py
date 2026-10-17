@@ -342,6 +342,30 @@ class Bands:
                 h += n
         return out
 
+    def rows(
+        self, call: Callable[..., Tensor], sources: tuple[Tensor, ...], meta: Tensor
+    ) -> Tensor:
+        """A product whose output rows (`meta`'s first dim) are `call` of the same rows of
+        each of `sources`, out of device memory whole or reading host memory: in pieces of
+        rows, halved on out of device memory down to one."""
+        height = int(meta.shape[0])
+        per_row = (_bytes(meta) + sum(map(_bytes, sources))) // max(height, 1)
+        with self.torch.utils._python_dispatch._disable_current_modes():
+            out, n = self._room(meta, height, per_row, 1, sources)
+        self.rewrites += 1
+
+        def piece(a: int, m: int) -> None:
+            out.narrow(0, a, m).copy_(call(*(self._take(t, 0, a, a + m) for t in sources)))
+
+        a = 0
+        while a < height:
+            m = min(n, height - a)
+            if self._attempt(m == 1, piece, a, m):
+                a += m
+            else:
+                n = max(1, m // 2)
+        return out
+
     def _attempt(self, finest: bool, piece: Callable[..., None], *args: int) -> bool:
         """`piece(*args)`; False: it ran out of device memory (`raises`). The finest piece's
         ops make room as any op does."""

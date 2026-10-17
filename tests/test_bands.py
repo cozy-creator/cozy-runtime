@@ -18,9 +18,13 @@ diffusers = pytest.importorskip("diffusers")
 
 from torch.utils._python_dispatch import TorchDispatchMode  # noqa: E402
 
+from cozy_runtime.author.kernels import INT8_CONVROT, PreQuantized  # noqa: E402
+from cozy_runtime.derive.microscale import encode_int8_convrot256  # noqa: E402
 from cozy_runtime.internal import attention_upstream as upstream  # noqa: E402
 from cozy_runtime.internal.attention_ulysses import Options, _call  # noqa: E402
 from cozy_runtime.internal.bands import Bands  # noqa: E402
+from cozy_runtime.internal.encoding.formats import hadamard256  # noqa: E402
+from cozy_runtime.internal.encoding.leaves import _native_leaf_class  # noqa: E402
 
 
 class Card:
@@ -370,3 +374,47 @@ def test_attention_out_of_memory_runs_in_head_groups_then_query_rows(
     else:  # a shorter query may take another CPU GEMM tiling (a GPU kernel's 128-row tiles not)
         torch.testing.assert_close(out, whole, rtol=1e-6, atol=1e-6)
     assert max(h for h, _ in tight.ran) <= heads and max(r for _, r in tight.ran) <= rows
+
+
+class Rows(TorchDispatchMode):  # type: ignore[misc]
+    """A card whose products fit `rows` rows of their left operand at once."""
+
+    def __init__(self, rows: int) -> None:
+        super().__init__()
+        self.rows, self.ran = rows, list[int]()
+
+    def __torch_dispatch__(self, func: Any, types: Any, args: Any = (), kwargs: Any = None) -> Any:
+        if func.overloadpacket in (torch.ops.aten.mm, torch.ops.aten.matmul):
+            if args[0].shape[0] > self.rows:
+                raise torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 2.00 MiB")
+            self.ran.append(int(args[0].shape[0]))
+        return func(*args, **(kwargs or {}))
+
+
+@pytest.mark.parametrize("operand", ("activation", "prequantized"))
+def test_an_encoded_linear_out_of_memory_runs_in_rows(operand: str) -> None:
+    """An int8 convrot leaf (its torch-ops law here) that runs out of device memory whole:
+    each piece of rows is rotated, quantized and multiplied on its own, the whole call's bits;
+    a producer's quantized operand is cut with its row scales."""
+    torch.manual_seed(9)
+    w, x = torch.randn(48, 256), torch.randn(2, 37, 256)
+    encoded = encode_int8_convrot256("w", w.numpy())
+    data = torch.frombuffer(bytearray(encoded.payload), dtype=torch.int8).view(48, 256)
+    scale = torch.frombuffer(bytearray(encoded.companions[0].raw), dtype=torch.float32)
+    roles = {"data": data, "scale": scale}
+    leaf = _native_leaf_class(torch)(
+        None, roles, torch.randn(48), torch.float32, INT8_CONVROT, "int8", 256, 48
+    )
+    given: Any = x
+    if operand == "prequantized":
+        rotated = hadamard256(torch, x.reshape(-1, 256)).mul_(1 / 16)
+        rows = (rotated.abs().amax(-1, keepdim=True) / 127).clamp_(min=1e-12)
+        q = torch.round(rotated / rows).clamp_(-127, 127).to(torch.int8)
+        given = PreQuantized(q, rows, tuple(x.shape), INT8_CONVROT)
+    card = Bands(Card(1 << 30))  # noqa: F841 (the leaf finds a device's bands while they live)
+    with torch.inference_mode():
+        whole = leaf(given)
+        with Rows(16) as tight:
+            out = leaf(given)
+    assert torch.equal(out, whole) and out.shape == (2, 37, 48)
+    assert max(tight.ran) <= 16
