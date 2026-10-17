@@ -75,10 +75,11 @@ class DecodeLimits:
 
 
 # Structural codec ceilings, not package policy. Frame and sample ceilings count values a
-# read keeps; duration policy is the field's declared preparation. 16 GiB holds three
-# retained 15-second 1080p reads at 24 fps per field and per attempt.
+# read keeps; duration policy is the field's declared preparation. `max_decoded_bytes` is the
+# documented, machine-independent bound of an `Assets` media kind that declares none; the
+# attempt-wide retained budget is the machine's memory (`host_decode_limits`).
 DEFAULT_DECODE_LIMITS = DecodeLimits(
-    max_decoded_bytes=16 * 1024**3,
+    max_decoded_bytes=2 * 1024**3,
     max_pixels_per_frame=8192 * 8192,
     max_video_frames=3600,
     max_audio_channels=8,
@@ -1021,9 +1022,10 @@ def _reading(asset: Asset, av: Any, what: str) -> Iterator[None]:
 class MediaReads:
     """The attempt's one media reader. Every hydrated handle of the attempt reads here.
 
-    One retained-value budget spans every `read()` of the attempt; streams are bounded per
-    event and at most `MAX_ACTIVE_MEDIA_STREAMS` are open at once. Reads refuse inside an
-    active component-use scope and after the attempt closes.
+    One retained-value budget, the machine's memory, spans every `read()` of the attempt; a
+    field's declared bound narrows its own reads. Streams are bounded per event and at most
+    `MAX_ACTIVE_MEDIA_STREAMS` are open at once. Reads refuse inside an active component-use
+    scope and after the attempt closes.
     """
 
     __slots__ = ("_attempt", "_budget", "_limits", "_lock", "_open_streams")

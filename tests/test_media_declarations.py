@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from cozy_runtime.author import ConformanceError, Invocation, attempt, fakes
+from cozy_runtime.author._decode import DEFAULT_DECODE_LIMITS, host_decode_limits
 from cozy_runtime.internal import package_interface, static_interface
 from cozy_runtime.internal.discovery import discover
 from media_sources import mp4, steady
@@ -158,3 +159,35 @@ app.entrypoint(render, accelerator=False)
 )
 def test_a_result_preparation_refuses_in_every_reader(tmp_path: Path, body: str) -> None:
     _both_refuse(_package(tmp_path, "result_prep", body), "preparation_target")
+
+
+BUDGETS = """
+from cozy_runtime.author import AssetLimits, Assets, AudioAsset
+References = Annotated[
+    Assets[Annotated[VideoAsset, AssetBound(max_decoded_bytes=8 << 30)] | AudioAsset],
+    AssetLimits(videos=1, audio=1),
+]
+class Shot(msgspec.Struct):
+    clip: Annotated[VideoAsset, AssetBound(max_bytes=1 << 30, max_decoded_bytes=12 << 30)]
+@invocable
+async def render(ctx: Context, *, shot: Shot, refs: References) -> Done:
+    raise RuntimeError("source only")
+app.entrypoint(render, accelerator=False)
+"""
+
+
+def test_declared_bounds_of_any_size_describe_and_undeclared_kinds_publish_the_default(
+    tmp_path: Path,
+) -> None:
+    root = _package(tmp_path, "budgets", BUDGETS)
+    imported = package_interface.build(discover(root))
+    assert package_interface.canonical_bytes(imported) == package_interface.canonical_bytes(
+        static_interface.build(root)
+    )
+    kinds = {row["kind"]: row for row in imported["entrypoints"][0]["assets"]["kinds"]}
+    # Machine-independent: a declared bound as declared, an undeclared one as the default.
+    assert kinds["video"]["max_decoded_bytes"] == 8 << 30
+    assert kinds["audio"]["max_decoded_bytes"] == DEFAULT_DECODE_LIMITS.max_decoded_bytes
+    assert DEFAULT_DECODE_LIMITS.max_decoded_bytes == 2 << 30
+    assert fakes.fake_attempt("host").media._budget.limit == host_decode_limits().max_decoded_bytes
+    assert host_decode_limits().max_decoded_bytes >= 2 << 30

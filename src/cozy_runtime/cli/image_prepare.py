@@ -78,7 +78,7 @@ def _request() -> _Request:
         or not request.prepare.profile
         or len(request.prepare.profile) > 64
         or request.max_bytes <= 0
-        or not 0 <= request.max_decoded_bytes <= DEFAULT_DECODE_LIMITS.max_decoded_bytes
+        or request.max_decoded_bytes < 0
         or not request.media_types
         or len(request.media_types) != len(set(request.media_types))
         or not set(request.media_types) <= set(KIND_MEDIA["image"])

@@ -59,6 +59,8 @@ def test_cli_image_handoff_and_raw_paths(tmp_path: Path) -> None:
     )
     before = source.read_bytes()
     body = request(source)
+    # A declared bound above the old 2 GiB ceiling is admitted (owner ruling 2026-10-17).
+    assert run({**body, "max_decoded_bytes": 8 << 30})["status"] == "prepared"
     answer = run(body)
     assert answer["status"] == "prepared"
     assert "digest" not in answer  # Creator fingerprints the selected carrier.

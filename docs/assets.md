@@ -89,12 +89,15 @@ argument, where each applies to its kind.
 
 ## Budget
 
-`AssetBound(max_decoded_bytes=)` bounds the RGB8/float32 value one read retains, charged
-after `end`, `fps` and preparation: dropped frames, repeated slots and resized pixels cost
-nothing extra. Every image, video and audio request field declares it (describe refuses
-`asset_decode_unbounded`); an `Assets` kind without one takes Runtime's ceiling. The
-ceiling is 16 GiB per read and per attempt, enough for three retained 15-second 1080p
-reads at 24 fps. Streams are bounded per event.
+Retained media is budgeted by the machine's memory: every `read()` of an attempt shares one
+budget of the host's physical memory (never below 2 GiB), so a run that fits the machine
+succeeds. `AssetBound(max_decoded_bytes=)` narrows one field's reads to the RGB8/float32 value
+it retains, charged after `end`, `fps` and preparation: dropped frames, repeated slots and
+resized pixels cost nothing extra. Every image, video and audio request field declares it
+(describe refuses `asset_decode_unbounded`), and any size describes. An `Assets` kind without
+one takes the documented 2 GiB default, which the interface publishes; a 15-second 1080p
+read at 24 fps retains about 2.2 GB, so declare more on a kind that needs it. Streams are
+bounded per event.
 
 ## Collections
 
