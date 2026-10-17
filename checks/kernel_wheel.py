@@ -40,6 +40,8 @@ print(f"{sys.version.split()[0]}: gemv without a GPU -> {code} {_gemm.error_name
 
 def declared(package: Path, name: str) -> Any:
     """`cozy_kernels.<name>`, read from the source without running it."""
+    target: ast.expr
+    value: ast.expr | None
     for node in ast.parse((package / "__init__.py").read_text()).body:
         if isinstance(node, ast.AnnAssign):
             target, value = node.target, node.value
