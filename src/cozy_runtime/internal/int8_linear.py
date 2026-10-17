@@ -208,9 +208,10 @@ def linear(
             op = native(torch, index)
             if op is not None:
                 return op(x, data, scale, bias, out_dtype)
-            if torch.cuda.is_current_stream_capturing():
+            if torch.cuda.is_current_stream_capturing() and not _NATIVE[index].final:
                 # comfy-kitchen's GEMM ends a capture (run 10264) and a recording of the eager law
                 # replays 5x slower than kitchen as written (run 10287): record once the op lands.
+                # An op refused for good never lands: the component runs as written.
                 raise Building(OP)
             module = kitchen(torch, index)
             if module is not None:
