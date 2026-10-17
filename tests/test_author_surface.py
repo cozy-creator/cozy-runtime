@@ -272,18 +272,3 @@ def test_a_model_may_not_name_an_artifact_identifier() -> None:
     with pytest.raises(ConformanceError) as derived:
         Weights("stabilityai/stable-diffusion-xl-base-1.0")
     assert derived.value.code == "weights_manifest_invalid"
-
-
-# --------------------------------------------------------------------------- warm
-
-
-class Warmed(Model[Pipeline]):
-    """A model built for an older Runtime: it still defines `warm`, which nothing calls."""
-
-    pipeline: Pipeline
-
-    def load(self, loader: Loader) -> None:
-        self.pipeline = loader.construct(Pipeline, factory=lambda config: Pipeline())
-
-    def warm(self, ctx: Context) -> None:
-        raise AssertionError("the Runtime no longer calls Model.warm")

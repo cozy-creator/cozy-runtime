@@ -576,9 +576,6 @@ class _OnDemand:
         return getattr(self._model, name)
 
 
-#: Model classes that still define `warm` (packages built for an older Runtime), noted once each.
-_WARM_NOTED: set[type] = set()
-
 #: The requests rank 0 relays to the machine for a follower (`_relay`).
 _RELAYED = frozenset({"sealed_tier", "sealed_stage", "object_files", "model_source"})
 
@@ -2433,14 +2430,6 @@ class Executor:
         model_cls = next(
             cls for cls in self._model_classes() if cls.__name__ == binding.model_class
         )
-        if callable(getattr(model_cls, "warm", None)) and model_cls not in _WARM_NOTED:
-            _WARM_NOTED.add(model_cls)
-            print(
-                f"[executor] {model_cls.__qualname__}.warm is not called: the call that waits "
-                "on a load pays its own first launches",
-                file=sys.stderr,
-                flush=True,
-            )
         config_checkpoint = next(
             (
                 checkpoint

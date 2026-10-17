@@ -206,11 +206,9 @@ def from_python(python: Path) -> Observation:
             str(python),
             "-I",
             "-c",
-            # Measure the target patch even when its installed Runtime predates this field.
-            "import json, platform; "
+            "import json; "
             "from cozy_runtime.internal.base_observation import current, _body; "
-            "print(json.dumps({**_body(current()), "
-            "'python_full_version': platform.python_version()}))",
+            "print(json.dumps(_body(current())))",
         ],
         stdin=subprocess.DEVNULL,
         capture_output=True,
@@ -427,7 +425,6 @@ def _parse(value: object) -> Observation:
         )
     except (TypeError, ValueError) as exc:
         raise ObservationRefusal("base observation rows are invalid") from exc
-    # Another installed Runtime may add diagnostics; only consumed facts are canonical.
     if _body(observation) != {name: value[name] for name in fields}:
         raise ObservationRefusal("base observation is not canonical internal data")
     return observation
