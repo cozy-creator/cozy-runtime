@@ -139,9 +139,12 @@ function(kernel_module name binding)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         # Static libstdc++/libgcc keep the wheel at its manylinux floor: only glibc's versioned
         # symbols stay external. -Bsymbolic binds the module's CUTLASS instantiations to itself,
-        # never to another library's of the same name (comfy-kitchen's) in the process.
+        # never to another library's of the same name (comfy-kitchen's) in the process. The module
+        # exports PyInit_* alone: an exported (GNU-unique) libstdc++ symbol binds process-wide
+        # and crashed torch imported after it (0.28.0's blocker).
         target_link_options(${name} PRIVATE -Wl,--build-id=none -Wl,-Bsymbolic
-                            -static-libstdc++ -static-libgcc)
+                            -static-libstdc++ -static-libgcc -Wl,--exclude-libs,ALL
+                            -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/modules.map)
         set_target_properties(${name} PROPERTIES SUFFIX ".abi3.so")
     endif()
     install(TARGETS ${name} LIBRARY DESTINATION cozy_runtime/_kernels)

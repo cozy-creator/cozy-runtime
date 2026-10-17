@@ -100,9 +100,11 @@ jobs:
               time cmake -S kernels -B /tmp/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPython_EXECUTABLE="$(command -v python)"
               time cmake --build /tmp/build --parallel "$JOBS"
               cmake --install /tmp/build --prefix modules
+              # CPU torch, which each module must load before: none may export what it binds.
+              python -m pip install -q --root-user-action ignore "torch==$TORCH" --index-url https://download.pytorch.org/whl/cpu
               python checks/kernel_modules.py modules --python python \
                 --python /opt/python/cp313-cp313/bin/python --python /opt/python/cp314-cp314/bin/python \
-                --platform-floor platform-gpu.rs $(for w in $WITHOUT; do echo --without $w; done)
+                --platform-floor platform-gpu.rs --torch-python python $(for w in $WITHOUT; do echo --without $w; done)
               chown -R "$HOST_OWNER" modules
             ' 2>&1 | tee build.log
           exit "${PIPESTATUS[0]}"
@@ -190,10 +192,11 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cmake --install "$env:RUNNER_TEMP\build" --prefix modules
           "built in $(((Get-Date) - $began).TotalMinutes) min"
+          & $py -m pip install -q "torch==$env:TORCH" --index-url https://download.pytorch.org/whl/cpu
           # MSVC builds neither CUTLASS's TMA GEMMs nor FA3 (cr-201).
           & $py checks/kernel_modules.py modules --without tma --without _fa3 --python $py `
             --python "${{ steps.py313.outputs.python-path }}" --python "${{ steps.py314.outputs.python-path }}" `
-            --platform-floor platform-gpu.rs
+            --platform-floor platform-gpu.rs --torch-python $py
           exit $LASTEXITCODE
       - if: steps.cache.outputs.cache-hit != 'true'
         uses: astral-sh/setup-uv@v7
