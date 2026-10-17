@@ -34,6 +34,8 @@ from cozy_runtime.internal.encoding.formats import CONVROT_GROUP, Tensor, hadama
 
 ARTIFACT = "comfy-kitchen"
 OP = "cozy-int8"
+#: The kernel a call served when neither the op nor comfy-kitchen did (`gemm.selected`).
+EAGER = "torch._int_mm"
 #: How often a leaf asks whether a running build has landed: resolution, never a verdict.
 POLL_SECONDS = 1.0
 #: The op's one-launch GEMV takes this many rows (`kGemvRows`): it rotates them itself.
@@ -202,27 +204,29 @@ def linear(
     scale: Tensor,
     bias: Tensor | None,
     out_dtype: object,
-) -> Tensor:
-    """`x @ W.T + bias` for one `int8-convrot256/1` weight: `data` int8 `[N, K]`, `scale` f32."""
+) -> tuple[Tensor, str]:
+    """`x @ W.T + bias` for one `int8-convrot256/1` weight (`data` int8 `[N, K]`, `scale` f32),
+    and the kernel that served it."""
     index = x.get_device()
     op = _OPS.get(index)
     try:
         if op is not None and x.dtype in _HALF:
-            return op(x, data, scale, bias, out_dtype)
+            return op(x, data, scale, bias, out_dtype), OP
         if x.is_cuda and x.dtype in (torch.bfloat16, torch.float16):
             op = native(torch, index)
             if op is not None:
-                return op(x, data, scale, bias, out_dtype)
+                return op(x, data, scale, bias, out_dtype), OP
             module = kitchen(torch, index)
             if module is not None:
                 with readable(data, scale, bias) as (d, s, b):
-                    return module.int8_linear(
+                    out = module.int8_linear(
                         x, d, s, b, out_dtype, convrot=True, convrot_groupsize=CONVROT_GROUP
                     )
+                return out, ARTIFACT
     except Exception as exc:  # eager serves this call
         failed(OP if op is not None else ARTIFACT, index, exc)
     out = eager(torch, x, data, scale, out_dtype)
-    return out if bias is None else out + bias.to(out.dtype)
+    return (out if bias is None else out + bias.to(out.dtype)), EAGER
 
 
 def quantize(torch: ModuleType, x: Tensor) -> PreQuantized | None:
@@ -290,9 +294,10 @@ def gemm(
     scale: Tensor,
     bias: Tensor | None,
     out_dtype: object,
-) -> Tensor:
-    """The linear of a `quantize`d operand: the op's GEMM, both scales and the bias in its
-    epilogue."""
+) -> tuple[Tensor, str]:
+    """The linear of a `quantize`d operand (the op's GEMM, both scales and the bias in its
+    epilogue), and the kernel that served it."""
+    kernel = OP
     try:
         out = torch.ops.cozy.int8_gemm.default(
             operand.payload, operand.scale, data, scale, bias, out_dtype
@@ -300,8 +305,8 @@ def gemm(
     except Exception as exc:  # torch's int8 GEMM serves this call
         failed(OP, operand.payload.get_device(), exc)
         out = _product(torch, operand.payload, operand.scale, data, scale, out_dtype)
-        out = out if bias is None else out + bias.to(out.dtype)
-    return out.view(*operand.shape[:-1], -1)
+        out, kernel = (out if bias is None else out + bias.to(out.dtype)), EAGER
+    return out.view(*operand.shape[:-1], -1), kernel
 
 
 def eager(torch: ModuleType, x: Tensor, data: Tensor, scale: Tensor, out_dtype: Tensor) -> Tensor:

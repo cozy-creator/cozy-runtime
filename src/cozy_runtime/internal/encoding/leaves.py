@@ -42,6 +42,10 @@ from cozy_runtime.internal.encoding.formats import (
     _rank2,
 )
 
+NVFP4 = "cozy.nvfp4.native-leaf/1"
+#: Each leaf provider's lane format, as a run's `gemm.selected` names it.
+FORMATS = {INT8_CONVROT: "int8", ROWWISE_FP8: "fp8", NVFP4: "nvfp4"}
+
 
 def _blocked_shape(rows: int, cols: int) -> tuple[int, int]:
     return -(-rows // 128) * 128, -(-cols // 4) * 4
@@ -131,6 +135,9 @@ def _leaf_class(torch: Any) -> Any:
             self.encoding = encoding
             self.in_features = in_features
             self.out_features = out_features
+            #: The kernel its last call served (`gemm.selected`). A CUDA graph replays the
+            #: recorded call's kernel without running this forward, so the last one is it.
+            self.kernel = ""
 
         def roles(self) -> dict[str, Any]:
             return {role: getattr(self, role) for role in self._cozy_roles}
@@ -141,10 +148,11 @@ def _leaf_class(torch: Any) -> Any:
                 # As the replaced `nn.Linear` does under autocast: compute from, and return,
                 # the autocast dtype, whatever the stored weight's logical dtype is.
                 dtype = torch.get_autocast_dtype(x.device.type)
-                out = self._cozy_forward(self, x.to(dtype), dtype)
+                out, kernel = self._cozy_forward(self, x.to(dtype), dtype)
             else:
                 operand = x if prequantized is None else prequantized
-                out = self._cozy_forward(self, operand, self.out_dtype)
+                out, kernel = self._cozy_forward(self, operand, self.out_dtype)
+            self.kernel = kernel
             if self.bias is not None:
                 out = out + self.bias.to(out.dtype)
             return out
@@ -181,7 +189,9 @@ def _native_leaf_class(torch: ModuleType) -> type:
                 # A producer's prologue (`kernels.int8_rows`) hands the operand in place of x.
                 if torch.is_autocast_enabled(x.payload.device.type):
                     out_dtype = torch.get_autocast_dtype(x.payload.device.type)
-                return ops.gemm(torch, x, self.data, self.scale, self.bias, out_dtype)
+                out, kernel = ops.gemm(torch, x, self.data, self.scale, self.bias, out_dtype)
+                self.kernel = kernel
+                return out
             cast = x
             if torch.is_autocast_enabled(x.device.type):
                 # As the replaced `nn.Linear` does: from and to the autocast dtype.
@@ -190,8 +200,13 @@ def _native_leaf_class(torch: ModuleType) -> type:
             if prequantized is None or prequantized.provider != self.provider:
                 prequantized = shared_operand(x, self.provider, lambda: ops.quantize(torch, cast))
             if prequantized is not None:
-                return ops.gemm(torch, prequantized, self.data, self.scale, self.bias, out_dtype)
-            return ops.linear(torch, cast, self.data, self.scale, self.bias, out_dtype)
+                out, kernel = ops.gemm(
+                    torch, prequantized, self.data, self.scale, self.bias, out_dtype
+                )
+            else:
+                out, kernel = ops.linear(torch, cast, self.data, self.scale, self.bias, out_dtype)
+            self.kernel = kernel
+            return out
 
         def int8_prologue(
             self,
@@ -438,7 +453,7 @@ class Nvfp4NativeLeaf:
 
     @property
     def name(self) -> str:
-        return "cozy.nvfp4.native-leaf/1"
+        return NVFP4
 
     @property
     def route(self) -> str:
@@ -500,7 +515,7 @@ class Nvfp4NativeLeaf:
         return 3 * rows * cols
 
     @staticmethod
-    def _forward(leaf: Tensor, x: Tensor, out_dtype: Tensor) -> Tensor:
+    def _forward(leaf: Tensor, x: Tensor, out_dtype: Tensor) -> tuple[Tensor, str]:
         import torch
 
         rows, cols = leaf.out_features, leaf.in_features // NVFP4_BLOCK

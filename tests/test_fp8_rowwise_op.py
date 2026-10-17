@@ -57,7 +57,8 @@ def test_fp8_op_is_built_by_the_compile_manager_and_keeps_the_law(tmp_path: Path
             bias = torch.randn(out_features, generator=generator).to("cuda", dtype)
             q, s = fp8_linear.eager_quantize(torch, x)
             want = (q.double() * s.double()) @ exact.t() + bias.double()
-            got = fp8_linear.linear(torch, x, data, weight_scale, bias, dtype)
+            got, kernel = fp8_linear.linear(torch, x, data, weight_scale, bias, dtype)
+            assert kernel == fp8_linear.OP
             assert got.shape == (1, rows, out_features) and got.dtype == dtype
             assert _error(got.reshape(rows, -1), want) < 0.01, (rows, out_features, dtype)
             operand = fp8_linear.quantize(torch, x.reshape(rows, -1))

@@ -280,6 +280,8 @@ class RefusedLeaves:
     lane: str
     leaf: str
     reason: str
+    dtype: str
+    """What they serve as instead: the destination's float dtype."""
     tensors: int
 
 
@@ -320,7 +322,7 @@ class ResolvedModelPlan:
 
     def refused_leaves(self) -> tuple[RefusedLeaves, ...]:
         groups = Counter(
-            (row.component, row.alias, row.refused.leaf, row.refused.reason)
+            (row.component, row.alias, row.refused.leaf, row.refused.reason, row.output_dtype)
             for row in self.tensors
             if row.refused is not None
         )

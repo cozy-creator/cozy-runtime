@@ -23,8 +23,10 @@ from cozy_runtime.internal.encoding.formats import E4M3_MAX, Tensor
 #: has amax 0, and dividing by it poisons a whole output row with NaN.
 SCALE_FLOOR = 1e-12
 
-#: The op's name in a run's warnings.
+#: The op's name in a run's warnings and `gemm.selected`.
 OP = "cozy-fp8"
+#: The kernel a call served where the op did not.
+SCALED_MM = "torch._scaled_mm"
 #: Device index -> the loaded op, `(x, data, scale, bias, out_dtype) -> out`.
 _OPS: dict[int, int8_linear.Op] = {}
 
@@ -76,15 +78,16 @@ def gemm(
     scale: Tensor,
     bias: Tensor | None,
     out_dtype: object,
-) -> Tensor:
-    """The linear of a quantized operand: the op's GEMM, both scales and the bias in its
-    epilogue, or `_scaled_mm` (fast accumulation, #517b) and the bias after it."""
+) -> tuple[Tensor, str]:
+    """The linear of a quantized operand (the op's GEMM, both scales and the bias in its
+    epilogue, or `_scaled_mm` (fast accumulation, #517b) and the bias after it), and the
+    kernel that served it."""
     if _op(torch, operand.payload, out_dtype) is not None:
         try:
             out = torch.ops.cozy.fp8_gemm.default(
                 operand.payload, operand.scale, data, scale, bias, out_dtype
             )
-            return out.view(*operand.shape[:-1], -1)
+            return out.view(*operand.shape[:-1], -1), OP
         except Exception as exc:  # `_scaled_mm` serves this call
             int8_linear.failed(OP, operand.payload.get_device(), exc)
     # `payload.t()` of a contiguous `[out, in]` is the column-major operand `_scaled_mm`
@@ -99,7 +102,7 @@ def gemm(
     )
     if bias is not None:
         out = out + bias.to(out.dtype)
-    return out.view(*operand.shape[:-1], -1)
+    return out.view(*operand.shape[:-1], -1), SCALED_MM
 
 
 def linear(
@@ -109,12 +112,13 @@ def linear(
     scale: Tensor,
     bias: Tensor | None,
     out_dtype: object,
-) -> Tensor:
-    """`x @ W.T + bias` for one `fp8-rowwise/1` weight: `data` E4M3 `[N, K]`, `scale` f32."""
+) -> tuple[Tensor, str]:
+    """`x @ W.T + bias` for one `fp8-rowwise/1` weight (`data` E4M3 `[N, K]`, `scale` f32), and
+    the kernel that served it."""
     op = _op(torch, x, x.dtype, out_dtype)
     if op is not None:
         try:
-            return op(x, data, scale, bias, out_dtype)
+            return op(x, data, scale, bias, out_dtype), OP
         except Exception as exc:  # the op's two halves, else torch ops, serve this call
             int8_linear.failed(OP, x.get_device(), exc)
     return gemm(torch, quantize(torch, x), data, scale, bias, out_dtype)
