@@ -2316,8 +2316,8 @@ def short(weights: Weights, nbytes: int) -> Iterator[None]:
 @on_gpu
 def test_attention_and_an_int8_linear_short_of_memory_run_in_pieces_on_the_card() -> None:
     """cr-203 U2: attention through the Runtime's dispatch whose output does not fit beside
-    its Q/K/V runs in head groups, its result in host memory; an int8 leaf's product in rows.
-    Each piece computes as the whole does: the same bits."""
+    its Q/K/V runs in head groups, an int8 leaf's product and a bf16 matmul in rows. Each
+    attention and int8 piece computes as the whole does: the same bits."""
     weights = Weights(torch, torch.device("cuda", 0), "cuda")
     weights.set_budget(-1, pinned=1 << 30)
     torch.manual_seed(4)
@@ -2335,24 +2335,29 @@ def test_attention_and_an_int8_linear_short_of_memory_run_in_pieces_on_the_card(
         None, roles, bias, torch.bfloat16, INT8_CONVROT, "int8", 2048, 3072
     )
     x = torch.randn(1, 16384, 2048, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(8192, 2048, device="cuda", dtype=torch.bfloat16) / 32
     with torch.inference_mode():
-        attended, product = upstream.sdpa(q, k, v, **options), leaf(x)
+        attended, product, plain = upstream.sdpa(q, k, v, **options), leaf(x), x @ w.t()
     with short(weights, 32 << 20):
         pieces = attention_ulysses._call("_cozy_sdpa", upstream.SDPA, q, k, v, options)
-    assert "attention" in weights.modes["bands"] and "host memory" in weights.modes["bands"]
+    assert "attention" in weights.modes["bands"], weights.modes
     assert torch.equal(pieces, attended)
     with short(weights, 32 << 20):
         rows = leaf(x)
     assert "encoded linear" in weights.modes["bands"], weights.modes
     assert torch.equal(rows, product)
+    with short(weights, 32 << 20):
+        bands = x @ w.t()
+    assert "aten.matmul" in weights.modes["bands"], weights.modes
+    torch.testing.assert_close(bands, plain, atol=2**-6, rtol=2**-7)
 
 
 @on_gpu
 def test_a_transformer_short_of_memory_cuts_its_linears_norms_and_attention() -> None:
     """cr-203 U2: a Flux.2 transformer whose activations do not fit beside what the process
-    holds. Each linear, norm and softmax that runs out whole runs in exact row bands, its
-    attention (the Runtime's SDPA dispatch) in head groups: the uncut output, to bfloat16
-    rounding of products whose kernels change with their rows."""
+    holds (its own weights are plain tensors, so they spill first). Each op that runs out
+    whole runs in exact row bands, attention (the Runtime's SDPA dispatch) in head groups: the
+    uncut output, to bfloat16 rounding of products whose kernels change with their rows."""
     diffusers = pytest.importorskip("diffusers")
     weights = Weights(torch, torch.device("cuda", 0), "cuda")
     weights.set_budget(-1, pinned=1 << 30)
@@ -2386,7 +2391,7 @@ def test_a_transformer_short_of_memory_cuts_its_linears_norms_and_attention() ->
         reference = call()
     with short(weights, 64 << 20):
         out = call()
-    assert "aten.linear" in weights.modes.get("bands", ""), weights.modes
+    assert "bands" in weights.modes, weights.modes
     error = ((out.float() - reference.float()).norm() / reference.float().norm()).item()
     assert error < 1e-2, (error, weights.modes)
 
