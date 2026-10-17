@@ -156,7 +156,13 @@ except ValueError:
 print(next((d["machine"]["name"] for d in reversed(docs) if (d.get("machine") or {}).get("name")), ""))
 PY
 )
-    [ -n "$M" ] && { say "card $card: rented $sku as $M"; break; }
+    if [ -n "$M" ]; then  # address it by its rental alias from here on: the Hub reuses names
+      local name=$M
+      M=$(cozy machine show "$name" --tensorhub "$H" 2>/dev/null | awk '$1 == "alias" {print $2}')
+      [ -z "$M" ] && M=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1])).get("machine",{}).get("alias",""))' "rent-$card.json" 2>/dev/null)
+      [ -z "$M" ] && { say "card $card: rented $sku as $name but found no rent- alias; end it by hand"; FAILED=$((FAILED + 1)); return; }
+      say "card $card: rented $sku as $name ($M)"; break
+    fi
   done
   [ -z "$M" ] && { say "card $card: no SKU had capacity ($(tail -c 200 "rent-$card.err"))"; FAILED=$((FAILED + 1)); return; }
   if [ "$W" != - ] && ! cozy machine update "$M" --runtime-wheel "$W" --tensorhub "$H" > "update-$card.log" 2>&1; then
