@@ -27,7 +27,7 @@ def test_declared_blocks_with_shared_storage_are_not_independently_pageable() ->
     model = Network()
     layout = partition(model)
     assert layout is not None and len(layout.blocks) == 2
-    assert layout.working_bytes < layout.total_bytes
+    assert layout.common.nbytes + layout.blocks[0].nbytes < layout.total_bytes
     model.blocks[1].linear.weight = model.blocks[0].linear.weight
     with pytest.raises(ValueError, match="shared across paging units"):
         partition(model)

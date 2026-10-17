@@ -35,10 +35,6 @@ class BlockLayout:
     blocks: tuple[PageUnit, ...]
 
     @property
-    def working_bytes(self) -> int:
-        return self.common.nbytes + max(block.nbytes for block in self.blocks)
-
-    @property
     def total_bytes(self) -> int:
         return self.common.nbytes + sum(block.nbytes for block in self.blocks)
 
