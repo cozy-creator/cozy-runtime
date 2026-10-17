@@ -56,7 +56,7 @@ def main() -> None:
         )
     )
     root.attn.processor._attention_backend = attention._member(attention.known()[name])
-    target.backend = SimpleNamespace(roots={"dit": root}, leaves={})
+    target.backend = SimpleNamespace(roots={"dit": root}, gemm_sites={})
     target.attention_defaults = attention.snapshot(target.backend.roots)
     follower.constructions["proof"] = target
     previous = None

@@ -35,6 +35,7 @@ from cozy_runtime.internal.encoding import (
     launch_providers,
 )
 from cozy_runtime.internal.encoding.leaves import NVFP4
+from cozy_runtime.internal.encoding.leaves import sites as leaf_sites
 from cozy_runtime.internal.executor import Executor
 from cozy_runtime.internal.fill import PlanRow, dtype_name
 from cozy_runtime.internal.planfacts import PlanFacts
@@ -140,9 +141,10 @@ def test_a_leaf_that_failed_or_raised_in_qualification_warns_once_per_reason() -
 
 
 def test_a_run_names_each_components_gemm_kernel_and_each_fallback(tmp_path: Path) -> None:
-    """Real leaves, run here on the CPU, where each serves its eager kernel; a leaf that never ran
-    names none. The refused fp8 leaves of the sm86 plan serve bf16, and an 8-bit op library that
-    failed for good is the reason an int8 leaf served torch's GEMM."""
+    """Real leaves, counted as the plane counts them when they install; on the CPU each provider
+    serves its eager kernel, read once for the run. The refused fp8 leaves of the sm86 plan serve
+    bf16, and an 8-bit op library that failed for good is the reason int8 leaves serve torch's GEMM.
+    A leaf's call records nothing: the forward is 0.26.4's."""
     torch = pytest.importorskip("torch")
     encoded = encode_int8_convrot256("w", weight(64, 512, 5))
     int8_roles = {
@@ -159,9 +161,9 @@ def test_a_run_names_each_components_gemm_kernel_and_each_fallback(tmp_path: Pat
         torch, roles(torch, weight(256, 512, 6), "cpu"), probe._StandIn(512, 256), torch.bfloat16
     )
     leaves["transformer.d.weight"] = (nvfp4, None, ())
-    x = torch.randn(40, 512, dtype=torch.bfloat16)
-    for key in ("transformer.a.weight", "transformer.b.weight", "transformer.d.weight"):
-        leaves[key][0](x)
+    before = set(vars(nvfp4))
+    nvfp4(torch.randn(40, 512, dtype=torch.bfloat16))
+    assert set(vars(nvfp4)) == before  # nothing written per call
 
     table = msgspec.convert(
         json.loads(next(qualification.SHIPPED.glob("cuda.sm86-*.json")).read_bytes()),
@@ -174,7 +176,7 @@ def test_a_run_names_each_components_gemm_kernel_and_each_fallback(tmp_path: Pat
     )
     rows = [row(f"unet.{n}.weight", SPEC_ROWWISE, "bf16", (64, 256)) for n in "ab"]
     executor = Executor(None, tmp_path)  # type: ignore[arg-type]
-    executor.backend = SimpleNamespace(leaves=leaves)
+    executor.backend = SimpleNamespace(gemm_sites=leaf_sites(leaves))
     executor.models = {"klein": object()}
     executor.refused_leaves = plan(rows, admitted.capabilities, table.device).refused_leaves()
 
@@ -195,12 +197,17 @@ def test_a_run_names_each_components_gemm_kernel_and_each_fallback(tmp_path: Pat
             for row in confessions
         ]
 
-    int8_row = (("component", "klein/transformer"), ("format", "int8"), ("leaf", INT8_CONVROT))
-    selected = [
-        ("gemm.selected", int8_linear.EAGER, *int8_row, ("sites", 2)),
-        ("gemm.selected", "torch-decode", ("component", "klein/transformer"), ("format", "nvfp4"),
-         ("leaf", NVFP4), ("sites", 1)),
-    ]  # fmt: skip
+    def int8_row(component: str, sites: int) -> tuple[object, ...]:
+        return ("gemm.selected", int8_linear.EAGER, ("component", f"klein/{component}"),
+                ("format", "int8"), ("leaf", INT8_CONVROT), ("sites", sites))  # fmt: skip
+
+    def int8_fallback(component: str, sites: int) -> tuple[object, ...]:
+        return ("gemm.fallback", int8_linear.EAGER, ("component", f"klein/{component}"),
+                ("reason", "RuntimeError: no nvcc"), ("served", int8_linear.EAGER),
+                ("sites", sites), ("wanted", int8_linear.OP))  # fmt: skip
+
+    nvfp4_row = ("gemm.selected", "torch-decode", ("component", "klein/transformer"),
+                 ("format", "nvfp4"), ("leaf", NVFP4), ("sites", 1))  # fmt: skip
     refused = (
         "gemm.fallback",
         "torch.linear",
@@ -210,17 +217,22 @@ def test_a_run_names_each_components_gemm_kernel_and_each_fallback(tmp_path: Pat
         ("sites", 2),
         ("wanted", "fp8"),
     )
-    assert emitted() == [*selected, refused]
+    assert emitted() == [
+        int8_row("text_encoder", 1),
+        int8_row("transformer", 2),
+        nvfp4_row,
+        refused,
+    ]
 
     int8_linear._NATIVE[0] = int8_linear._Build(final="RuntimeError: no nvcc")
     try:
         assert emitted() == [
-            selected[0],
-            ("gemm.fallback", int8_linear.EAGER, ("component", "klein/transformer"),
-             ("reason", "RuntimeError: no nvcc"), ("served", int8_linear.EAGER), ("sites", 2),
-             ("wanted", int8_linear.OP)),
-            selected[1],
+            int8_row("text_encoder", 1),
+            int8_fallback("text_encoder", 1),
+            int8_row("transformer", 2),
+            int8_fallback("transformer", 2),
+            nvfp4_row,
             refused,
-        ]  # fmt: skip
+        ]
     finally:
         del int8_linear._NATIVE[0]

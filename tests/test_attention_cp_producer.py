@@ -98,7 +98,7 @@ def test_real_follower_commands_share_attempt_state_and_restore_closes(tmp_path:
     )
     root = StateCalls()
     model = StateModel.for_test(dit=root)
-    target.backend = SimpleNamespace(roots={"dit": root}, leaves={}, close=lambda: None)
+    target.backend = SimpleNamespace(roots={"dit": root}, gemm_sites={}, close=lambda: None)
     target.attention_defaults = attention.snapshot(target.backend.roots)
     target.device_facts = DeviceFacts("cpu", "fixture", 0, "", "", 0)
     follower.constructions["proof"] = target
