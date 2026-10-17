@@ -194,6 +194,9 @@ def arm_parent_death() -> None:
 
 
 def _watch_parent_exit() -> None:
+    # A literal platform test: the type checker knows kqueue only where it exists.
+    if sys.platform != "darwin":
+        raise ProcessTreeUnsupported("arm_parent_death")
     queue = select.kqueue()
     exit_event = select.kevent(
         os.getppid(),
