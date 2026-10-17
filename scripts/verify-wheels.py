@@ -33,7 +33,9 @@ def main() -> None:
     # builds the Windows one (publish.yaml holds the exact release set).
     arch = platform.machine()
     linux = f"cp312-abi3-manylinux_2_28_{arch}"
-    assert platform.system() == "Linux" and arch in ("x86_64", "aarch64"), f"no Linux wheel for {arch}"
+    assert platform.system() == "Linux" and arch in ("x86_64", "aarch64"), (
+        f"no Linux wheel for {arch}"
+    )
     kernels: dict[str, tuple[str, ...]] = {
         "py3-none-any": (),
         linux: ("_gemm.abi3.so", "_norm.abi3.so", *(("_fa3.abi3.so",) * (arch == "x86_64"))),
@@ -59,7 +61,9 @@ def main() -> None:
             assert metadata.get_all("Tag") == [str(tag)]
             pure = str(tag) == "py3-none-any"
             assert metadata["Root-Is-Purelib"] == ("true" if pure else "false")
-            assert not any(".data/scripts/" in n for n in archive.namelist()), f"{wheel.name} carries a script"
+            assert not any(".data/scripts/" in n for n in archive.namelist()), (
+                f"{wheel.name} carries a script"
+            )
             modules = {
                 n.removeprefix("cozy_runtime/_kernels/")
                 for n in archive.namelist()
