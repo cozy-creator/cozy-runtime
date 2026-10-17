@@ -3878,8 +3878,10 @@ class WeightResidency:
 
     def _hold(self, component: Component, region: Region, stream: int) -> Lease:
         """`region`'s home lease for `held`: refused for the plane's own budget, the budget
-        grows into the device's free room once (torch's idle cache given back first), as a
-        block's own acquire does."""
+        grows into the device's free room (torch's idle cache given back first), as a block's
+        own acquire does; short of that, components no open stage uses give their device bytes
+        back, the machine's custody too (an LM's decode set beside a pipeline's idle DiT, VAE
+        and text encoder on a 16 GB card), and the owner is asked once."""
         weights = self.weights
 
         def acquire() -> Lease:
@@ -3892,13 +3894,24 @@ class WeightResidency:
             )
             return lease
 
-        try:
-            return acquire()
-        except self._capacity:
-            accel.release_cached(weights.torch, weights.kind)
-            if not weights.grow(region.span):
-                raise
-        return acquire()
+        # Each source once per round, each round after one gave room: a component pages out
+        # whole and the owner is asked once, so the loop ends.
+        asked = grown = False
+        while True:
+            try:
+                return acquire()
+            except self._capacity:
+                accel.release_cached(weights.torch, weights.kind)
+                if not grown and weights.grow(region.span):
+                    grown = True
+                    continue
+                if weights.page_out(_in_use(weights), region.span + weight_policy.MARGIN):
+                    grown = False
+                    continue
+                if asked or weights.room is None or weights.cap < 0:
+                    raise
+                asked, grown = True, False
+                weights.room(region.span + weight_policy.MARGIN)
 
     def note(self, key: str, value: str) -> None:
         self.weights.modes[key] = value
