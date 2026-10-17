@@ -1021,9 +1021,6 @@ class _Engine:
                         self.draft = None
                         stack.close()
                         held = self._hold(stack)
-                    if held is None and any(row is not None for row in self.slots):
-                        self._record()
-                        held = self._hold(stack)
                     with self.cond:
                         self.incoming = list(self.pending)
                         self.pending.clear()
@@ -1040,7 +1037,10 @@ class _Engine:
                             break
                         if mine.finished and (occupied or self.pending):
                             break  # a waiting caller drives on
-                    if occupied:
+                    if occupied and held is None:  # the first loop records what a step reads
+                        self._record()
+                        held = self._hold(stack)
+                    elif occupied:
                         self._steps()
         except torch.OutOfMemoryError as exc:
             self._fail(None, f"OutOfMemoryError: {exc}".splitlines()[0][:300])
