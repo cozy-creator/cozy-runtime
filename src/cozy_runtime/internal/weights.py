@@ -2055,6 +2055,12 @@ def journaling(torch: ModuleType, journal: Journal) -> Iterator[Journal]:
         yield journal
 
 
+def _in_call(torch: ModuleType) -> bool:
+    """Whether ops run in a group call's journal now (`journaling`)."""
+    mode = _innermost(torch)
+    return mode is not None and any(j.marking for j in mode.journals)
+
+
 def _generators(
     torch: ModuleType, func: Any, args: tuple[Any, ...], kwargs: Mapping[str, Any]
 ) -> list[Any]:
@@ -3294,6 +3300,9 @@ class WeightResidency:
         self.active: tuple[str, tuple[str, ...]] | None = None
         self.spare = False
         self.poisoned = ""
+        #: a block that writes what it did not make failed this attempt with no journal: if
+        #: the attempt fails, the process is replaced, never served again (state, not capacity)
+        self.unjournaled = ""
         self.refusals: list[str] = []
         #: this attempt's activation peak per method, and per batch item with the batch it ran
         self.peaks: dict[str, int] = {}
@@ -3355,6 +3364,7 @@ class WeightResidency:
         self.unpark()
         self.peaks.clear()
         self.entries.clear()
+        self.unjournaled = ""
         self.derived_at_open = self._derived()
         self.attempts += 1
 
@@ -4226,7 +4236,7 @@ class WeightResidency:
                     or weights.grouped
                     or _hosts(args, kwargs)
                 ):
-                    return observed(effects is None and not weights.grouped, *args, **kwargs)
+                    return observed(effects is None, *args, **kwargs)
                 kept = [(g, g.get_state()) for g in effects.generators]
                 held = _containers(args, kwargs)
                 try:
@@ -4254,14 +4264,31 @@ class WeightResidency:
                 raise self._poison(exc) from exc
 
         def observed(first: bool, *args: Any, **kwargs: Any) -> Any:
-            """Its ops recover one by one; its first run also learns its `Effects`."""
+            """Its ops recover one by one; its first run also learns its `Effects`, and a
+            first run that fails is put back. A writer that fails later leaves its writes:
+            unless a group call's journal puts them back, the process is not served again
+            should the attempt fail (`unjournaled`)."""
             if not first:
-                with weights.recovering():
-                    return attempt(True, *args, **kwargs)
+                try:
+                    with weights.recovering():
+                        return attempt(True, *args, **kwargs)
+                except _Regrained:
+                    raise
+                except Exception:
+                    wrote = region.effects is not None and region.effects.writes
+                    if wrote and not _in_call(weights.torch):
+                        self.unjournaled = f"{component.name}.{region.path} failed after writing"
+                        weights.modes["unjournaled"] = self.unjournaled
+                    raise
             journal = Journal()
             rewrites = weights.bands.rewrites if weights.bands is not None else 0
-            with weights.recovering(journal):
-                out = attempt(True, *args, **kwargs)
+            try:
+                with weights.recovering(journal):
+                    out = attempt(True, *args, **kwargs)
+            except BaseException:
+                with self._quiet():
+                    journal.rewind()
+                raise
             banded = weights.bands is not None and weights.bands.rewrites > rewrites
             region.effects = journal.effects(banded)
             return out

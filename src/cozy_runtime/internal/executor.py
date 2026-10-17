@@ -560,6 +560,10 @@ class _CompositeResidency:
     def poisoned(self) -> str:
         return next((str(row.poisoned) for row in self.rows.values() if row.poisoned), "")
 
+    @property
+    def unjournaled(self) -> str:
+        return next((row.unjournaled for row in self.rows.values() if row.unjournaled), "")
+
     def open_attempt(self, *_: object) -> None:
         for row in self.rows.values():
             row.open_attempt()
@@ -3617,10 +3621,14 @@ class Executor:
         # is the process, so the worker must replace it either way.
         if self.residency is not None and self.residency.poisoned:
             self.poisoned = self.poisoned or f"weights: {self.residency.poisoned[:200]}"
+        left = getattr(self.residency, "unjournaled", "")
+        if outcome.terminal == "failed" and left:
+            # State, not capacity: a block left writes no journal can put back.
+            self.poisoned = self.poisoned or f"weights: {left[:200]}"
+        weights = self.host.weights
         # The BOUNDED observation tail and the O(1) time attribution cross the seam on every
         # path, success or fault. A failed attempt's log tail is the one triage most needs,
         # and cr-011 hoisted the record out of `invoke` precisely so it survives the failure.
-        weights = self.host.weights
         exhausted = weights is not None and outcome.code == MEMORY_EXHAUSTED
         shortfall = weights.memory.refusal if exhausted and weights is not None else None
         return {

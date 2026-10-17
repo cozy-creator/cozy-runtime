@@ -184,10 +184,16 @@ def test_exhausted_functional_op_without_a_python_body_keeps_its_contract(
         assert torch.equal(torch.nn.functional.linear(value, weight), value)
 
 
+@pytest.mark.parametrize("learned", [False, True])
 def test_an_executor_capacity_failure_keeps_its_generation_serving(
     host: tuple[Executor, dict[str, Any]],
     monkeypatch: pytest.MonkeyPatch,
+    learned: bool,
 ) -> None:
+    """Capacity fails the attempt, never the process. A block's first run is journaled, so
+    one that fails is put back and the generation serves on. A block known to write what it
+    did not make runs with no journal: failing, it leaves its writes, so the attempt still
+    fails `memory_exhausted` and its process is then replaced (state, not capacity)."""
     runner, load = host
     assert runner.load(msgspec.convert({**load, "construction": "a"}, Load))["ok"]
     assert runner.activate(Activate(construction="a"))["ok"]
@@ -196,6 +202,9 @@ def test_an_executor_capacity_failure_keeps_its_generation_serving(
     weights, _region, trace = wrapped(module, monkeypatch)
     monkeypatch.setattr(weights, "shrink", lambda _need, _keep=0, **_: 0)
     value = torch.tensor([[0.25, -0.5]])
+    if learned:
+        with torch.inference_mode():
+            module(value)  # learns that it writes its buffer
 
     def fail_in_handler() -> None:
         try:
@@ -210,5 +219,9 @@ def test_an_executor_capacity_failure_keeps_its_generation_serving(
         "failed",
         MEMORY_EXHAUSTED,
     ), failed
+    if learned:
+        assert "model.block failed after writing" in failed["poisoned"], failed
+        return
     assert not failed["poisoned"] and not runner.poisoned
+    assert float(module.ticks) == 0, "its first run's write was put back"
     assert runner.load(msgspec.convert({**load, "construction": "b"}, Load))["ok"]
