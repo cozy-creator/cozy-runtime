@@ -38,9 +38,10 @@ jobs:
       matrix:
         include:
           # CUTLASS units peak at ~6 GB each: compile jobs sized by the runner's memory.
-          - {arch: x86_64, cuda: x86_64, runner: linux-x64-16core, jobs: 6}
-          # The arm64 larger runner has no docker; the standard one does.
-          - {arch: aarch64, cuda: sbsa, runner: ubuntu-24.04-arm, jobs: 1}
+          - {arch: x86_64, cuda: x86_64, runner: linux-x64-16core, jobs: 6, fa3: 'ON'}
+          # The arm64 larger runner has no docker; the standard one does. Its ptxas crashes on
+          # FA3's units (signal 11, twice): this wheel ships without `_fa3` (cr-200).
+          - {arch: aarch64, cuda: sbsa, runner: ubuntu-24.04-arm, jobs: 1, fa3: 'OFF'}
     runs-on: ${{ matrix.runner }}
     # Hang bound, not a work budget.
     timeout-minutes: 240
@@ -59,18 +60,19 @@ jobs:
           curl -fsSL https://raw.githubusercontent.com/cozy-creator/cozy/master/crates/cozy-platform/src/gpu/mod.rs \
             -o platform-gpu.rs
           docker run --rm -v "$PWD:/src" -w /src -e PLAT -e CUDA_REPO -e HOST_OWNER="$(id -u):$(id -g)" \
-            -e CMAKE_BUILD_PARALLEL_LEVEL=${{ matrix.jobs }} "$IMAGE" bash -euo pipefail -c '
+            -e FA3=${{ matrix.fa3 }} -e CMAKE_BUILD_PARALLEL_LEVEL=${{ matrix.jobs }} "$IMAGE" bash -euo pipefail -c '
               dnf install -y -q dnf-plugins-core && dnf config-manager --add-repo "$CUDA_REPO"
               dnf install -y -q cuda-nvcc-13-0-13.0.88 cuda-cudart-devel-13-0-13.0.96 cuda-cuobjdump-13-0-13.0.85
               export PATH=/usr/local/cuda-13.0/bin:$PATH
               export CC=/opt/rh/gcc-toolset-14/root/usr/bin/gcc CXX=/opt/rh/gcc-toolset-14/root/usr/bin/g++
               py=/opt/python/cp312-cp312/bin/python
               $py -m pip install -q uv==0.12.7
-              time $py -m uv build --wheel --python $py --out-dir /tmp/raw kernels
+              time $py -m uv build --wheel --python $py --out-dir /tmp/raw -C cmake.define.COZY_FA3=$FA3 \
+                kernels
               auditwheel repair --plat "$PLAT" --only-plat -w dist /tmp/raw/*.whl
               $py checks/kernel_wheel.py dist/*.whl "$PLAT" --python $py \
                 --python /opt/python/cp313-cp313/bin/python --python /opt/python/cp314-cp314/bin/python \
-                --platform-floor platform-gpu.rs
+                --platform-floor platform-gpu.rs $([ "$FA3" = ON ] || echo --without _fa3)
               chown -R "$HOST_OWNER" dist
             ' 2>&1 | tee build.log
           exit "${PIPESTATUS[0]}"

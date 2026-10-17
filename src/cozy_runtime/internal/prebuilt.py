@@ -24,11 +24,17 @@ from cozy_runtime.internal import arch, verify
 from cozy_runtime.internal.encoding.formats import CONVROT_GROUP, E4M3_MAX, Tensor, hadamard256
 
 try:
-    from cozy_kernels import FAMILIES, GEMM, _fa3, _gemm
+    from cozy_kernels import FAMILIES, GEMM, _gemm
 
     ABSENT = ""
 except ImportError as absent:  # no cozy-kernels wheel for this OS and CPU
     ABSENT = f"no cozy-kernels wheel is installed ({absent})"
+try:
+    from cozy_kernels import _fa3
+
+    NO_FA3 = ""
+except ImportError as absent:  # Linux aarch64's wheel carries no FA3 (cr-200)
+    NO_FA3 = f"the cozy-kernels wheel carries no FlashAttention-3 ({absent})"
 
 #: The verdicts' kernel names, one per format: each verifies on its own.
 KERNELS = {"int8": "cozy-kernels-int8", "fp8": "cozy-kernels-fp8"}
@@ -467,8 +473,8 @@ def _strides(t: Tensor) -> tuple[int, int, int]:
 
 def fa3(torch: ModuleType, index: int, sm: int) -> tuple[FlashAttention3 | None, str]:
     """FlashAttention-3 from the wheel on cuda:`index` once it passes its probe, or None and why."""
-    if ABSENT:
-        return None, ABSENT
+    if ABSENT or NO_FA3:
+        return None, ABSENT or NO_FA3
     if sm != 90:
         return None, f"the wheel's FlashAttention-3 runs on sm90, not sm{sm}"
     kernel = FlashAttention3(torch, index)

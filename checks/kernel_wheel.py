@@ -26,16 +26,20 @@ GLIBC = re.compile(r"(libc|libm|libdl|libpthread|librt|ld-linux[\w.-]*)\.so(\.\d
 RUST_FLOOR = re.compile(
     r'DRIVER_FLOOR: &str = if cfg!\(windows\) \{ "([\d.]+)" \} else \{ "([\d.]+)" \}'
 )
-#: A module on a machine without a GPU: one gemv returns CUDA's error, a bad family is refused.
+#: A module on a machine without a GPU: one gemv returns CUDA's error, a bad family is refused,
+#: FA3 refuses a head dim it has no kernel for.
 CALL = """
 import sys
 sys.path.insert(0, sys.argv[1])
-from cozy_kernels import _fa3, _gemm
+from cozy_kernels import _gemm
 code = _gemm.gemv(0, 0, False, 0, 0, 0, 0, False, 1, 8, 256, 0)
 assert code != 0, "a gemv ran with no GPU"
 assert _gemm.gemm(0, 3, False, 0, 0, 0, 0, 0, 0, False, 1, 8, 256, -1, None, 0) == 1
-head_96 = (0, 0, 0, 0, 0, 0, True, 1, 8, 8, 2, 2, 96, (0, 0, 0), (0, 0, 0), (0, 0, 0), (0, 0, 0))
-assert _fa3.fwd(*head_96, 1.0, False, 0, 0) == _fa3.NOT_SUPPORTED
+if "_fa3" not in sys.argv[2:]:
+    from cozy_kernels import _fa3
+    strides = ((0, 0, 0),) * 4
+    head_96 = (0, 0, 0, 0, 0, 0, True, 1, 8, 8, 2, 2, 96, *strides)
+    assert _fa3.fwd(*head_96, 1.0, False, 0, 0) == _fa3.NOT_SUPPORTED
 print(f"{sys.version.split()[0]}: gemv without a GPU -> {code} {_gemm.error_name(code)}")
 """
 
@@ -79,6 +83,7 @@ def main() -> int:
     parser.add_argument("platform", help="the wheel's platform tag, e.g. manylinux_2_28_x86_64")
     parser.add_argument("--python", action="append", default=[], help="an interpreter to import on")
     parser.add_argument("--platform-floor", type=Path, help="cozy-platform's src/gpu/mod.rs")
+    parser.add_argument("--without", action="append", default=[], help="a module this wheel omits")
     options = parser.parse_args()
     wheel: Path = options.wheel
     failed: list[str] = []
@@ -99,6 +104,10 @@ def main() -> int:
                 failed.append(f"DRIVER_FLOOR differs from cozy-platform's {rust or '(none)'}")
         for name, want in declared(package, "ARCHS").items():
             modules = [p for p in package.glob(f"{name}.*") if p.suffix in (".so", ".pyd")]
+            if name in options.without:
+                if modules:
+                    failed.append(f"{name}: carried, but this target omits it")
+                continue
             if len(modules) != 1:
                 failed.append(f"{name}: {len(modules)} module files")
                 continue
@@ -121,7 +130,9 @@ def main() -> int:
             run = subprocess.run([*install, str(wheel)], capture_output=True, text=True)
             if run.returncode == 0:
                 run = subprocess.run(
-                    [python, "-I", "-c", CALL, str(target)], capture_output=True, text=True
+                    [python, "-I", "-c", CALL, str(target), *options.without],
+                    capture_output=True,
+                    text=True,
                 )
             print(run.stdout.strip())
             if run.returncode != 0:

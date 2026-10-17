@@ -70,7 +70,9 @@ gemm_unit(fp8_mma_sync gemm_fp8.cu "120a-real;121a-real" COZY_MMA_SYNC)
 
 # FlashAttention-3's Hopper forward: upstream's instantiation units for head dims 64 and 128 in
 # bf16 and fp16, unmodified, with its own switches turning off what `fa3.cpp` never reaches.
+option(COZY_FA3 "FlashAttention-3's forward (_fa3)" ON)
 set(FA3 "${FLASH_ATTENTION_DIR}/hopper")
+if(COZY_FA3)
 add_library(fa3_units OBJECT "${FA3}/flash_prepare_scheduler.cu"
             "${FA3}/instantiations/flash_fwd_hdim64_bf16_sm90.cu"
             "${FA3}/instantiations/flash_fwd_hdim64_fp16_sm90.cu"
@@ -90,6 +92,7 @@ target_compile_options(fa3_units PRIVATE --use_fast_math --expt-relaxed-constexp
                        -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__
                        $<$<PLATFORM_ID:Linux>:-Xcompiler=-fno-gnu-unique>
                        $<$<CXX_COMPILER_ID:MSVC>:-Xcompiler=/Zc:__cplusplus>)
+endif()
 
 # One module: its binding, its units' objects, the static CUDA runtime.
 function(kernel_module name binding)
@@ -114,5 +117,7 @@ endfunction()
 kernel_module(_gemm gemm.cpp rotate int8_mma_sync int8_wgmma int8_tcgen05 fp8_wgmma fp8_tcgen05
               fp8_mma_sync)
 target_include_directories(_gemm PRIVATE "${INT8}")
-kernel_module(_fa3 fa3.cpp fa3_units)
-target_include_directories(_fa3 PRIVATE "${FA3}" "${FA3_CUTLASS_DIR}/include")
+if(COZY_FA3)
+    kernel_module(_fa3 fa3.cpp fa3_units)
+    target_include_directories(_fa3 PRIVATE "${FA3}" "${FA3_CUTLASS_DIR}/include")
+endif()
