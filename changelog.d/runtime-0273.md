@@ -1,0 +1,1 @@
+Runtime 0.27.3 is cut from release/0.27 and replaces the unpublished 0.27.2. A stage never refines its grain while a ring held outside its plan keeps the weight set open. Under 0.27.2 that refine closed the set and failed (`LeaseViolation`); now the stage streams at its grain in what remains of the budget. On TensorD 0.7.3.

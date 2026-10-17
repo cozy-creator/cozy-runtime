@@ -4197,7 +4197,12 @@ class WeightResidency:
                 }
                 paid = stage(layouts)
         except weight_policy.BelowFloor as exc:
-            if exc.component in opened and opened[exc.component][0]._refine(exc.component):
+            # Refining closes the weight set, which a ring held outside the plan keeps open.
+            if (
+                not outside
+                and exc.component in opened
+                and opened[exc.component][0]._refine(exc.component)
+            ):
                 return self._plan(budget, resume, asked, outside)
             if not asked and weights.room is not None and weights.cap >= 0:
                 # Never refused for size while the GPU has room to give: the owner makes it
@@ -4213,6 +4218,7 @@ class WeightResidency:
                 residence.streamed
                 and residence.window == 1
                 and layout.common + 2 * layout.largest > budget - outside
+                and not outside
                 and opened[key][0]._refine(key)
             ):
                 return self._plan(budget, resume, outside=outside)
