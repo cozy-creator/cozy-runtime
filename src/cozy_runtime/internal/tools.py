@@ -1,5 +1,5 @@
 """Build tools the Runtime uses when present and never bundles; costs and text are cozy's
-(`crates/cozy-platform/src/tools.rs`, cozy-creator/cozy d72af3a29).
+(`crates/cozy-platform/src/tools.rs`, cozy-creator/cozy-creator d72af3a29).
 
 A missing one never fails a run: the build that needs it does not start, its fallback serves,
 and every run of the process carries one warning for the tool. Codes: `kernel_prebuilt_missing`,

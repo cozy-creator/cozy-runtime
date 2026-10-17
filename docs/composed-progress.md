@@ -40,4 +40,4 @@ This is a display feature, not a checkpoint, scheduling or memoization boundary.
 
 Tracking: [Runtime #552](https://github.com/cozy-creator/cozy-runtime/issues/552),
 [H3 #242](https://github.com/cozy-creator/packages-v2/issues/242), and
-[Creator #594](https://github.com/cozy-creator/cozy/issues/594).
+[Creator #594](https://github.com/cozy-creator/cozy-creator/issues/594).
