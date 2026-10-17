@@ -2,9 +2,15 @@
 name = "cozy-runtime"
 version = "0.27.1"
 description = "Cozy author surface and device executor"
-# The upstream Apache-2.0 LICENSE/NOTICE ride every wheel: the cp312-abi3 wheel carries
-# the derived native kernels, and shipping them from the pure wheel too keeps one manifest.
-license-files = ["native/LICENSE", "native/NOTICE"]
+# The native wheels carry the kernels (`kernels/`): derived from comfy-kitchen, vLLM and SGLang
+# (Apache-2.0, comfy-kitchen's NOTICE), with CUTLASS and FlashAttention-3 (BSD-3-Clause). The
+# pure wheel ships the same manifest.
+license-files = [
+    "kernels/LICENSE",
+    "kernels/NOTICE",
+    "kernels/LICENSE-cutlass",
+    "kernels/LICENSE-flash-attention",
+]
 requires-python = ">=3.12"
 dependencies = [
     "tensorfs>=0.10,<0.11",
@@ -56,14 +62,10 @@ testpaths = ["tests"]
 addopts = "-q -p no:cacheprovider"
 
 [build-system]
-# ONE package, two wheel files per release. The in-tree shim delegates to
-# hatchling — the toolchain-free default producing the py3-none-any wheel and the sdist —
-# and, only when COZY_RUNTIME_BUILD_KERNELS=1, to scikit-build-core, which compiles
-# `native/` into `cozy_runtime/_kernels/_C.abi3.so` and tags the wheel cp312-abi3.
-# `task machine` adds the pinned tensord executable to that wheel.
+# The pure wheel and the sdist. `task wheel` makes each native wheel from the pure one plus that
+# platform's kernel modules (kernels.yaml); `task machine` adds the pinned tensord to Linux's.
 requires = ["hatchling"]
-build-backend = "dual_build_backend"
-backend-path = ["scripts"]
+build-backend = "hatchling.build"
 
 # Local dotenv files are not distribution source. VCS ignores also exclude task/output trees.
 [tool.hatch.build.targets.sdist]
@@ -76,16 +78,6 @@ packages = ["src/cozy_runtime"]
 package = true
 # The historical SDXL development corpus keeps its own locked dependency cohort.
 conflicts = [[{ extra = "corpus" }, { group = "diffusers" }]]
-
-# TensorFS 0.10 is unreleased: its master, exactly, until the cohort publishes it (never a test
-# publish). Workflows read it with TENSORFS_READ_KEY. The release replaces this with the version.
-# Read only on the COZY_RUNTIME_BUILD_KERNELS=1 wheel build; the root CMakeLists.txt is
-# the reviewed kernels build (static cudart, abi3, the upstream fleet arch policy).
-[tool.scikit-build]
-minimum-version = "1.0"
-cmake.build-type = "Release"
-wheel.packages = ["src/cozy_runtime"]
-wheel.py-api = "cp312"
 
 [tool.mypy]
 python_version = "3.12"

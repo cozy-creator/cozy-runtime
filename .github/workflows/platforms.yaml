@@ -4,7 +4,7 @@ name: platforms
 # import, do the CLI verbs run, and on macOS what MPS serves (SDXL-width UNet, VAE, attention vs
 # CPU fp32). `mps` runs this ref's Apple-GPU tests on macos-15 (`sdxl`: the SDXL spike too).
 # Manual only: macOS bills 10x and Windows 2x.
-#   gh workflow run platforms.yaml -R cozy-creator/cozy-runtime --ref <branch> [-f os='["macos-15"]'] [-f runtime=0.25.1]
+#   gh workflow run platforms.yaml -R cozy-creator/cozy-runtime --ref <branch> [-f os='["macos-15"]'] [-f runtime=<version>]
 #   gh workflow run platforms.yaml -R cozy-creator/cozy-runtime --ref <branch> -f os='[]' -f mps=true [-f sdxl=true]
 on:
   workflow_dispatch:
@@ -14,9 +14,9 @@ on:
         type: string
         default: '["ubuntu-24.04", "ubuntu-24.04-arm", "macos-15", "windows-2025"]'
       runtime:
-        description: Published cozy-runtime version
+        description: Published cozy-runtime version; empty takes the newest
         type: string
-        default: 0.25.1
+        default: ''
       tensorfs_ref:
         description: TensorFS branch, tag or SHA built from source and installed first; empty takes PyPI's (mps builds cross-platform-probe)
         type: string
@@ -77,15 +77,15 @@ jobs:
         continue-on-error: true
         run: uv pip install --python "$PY" ./.tensorfs 2>&1 | tee tensorfs.txt; exit "${PIPESTATUS[0]}"
 
-      - name: Install cozy-runtime ${{ inputs.runtime }}
+      - name: Install cozy-runtime ${{ inputs.runtime || '(newest)' }}
         id: install
         continue-on-error: true
-        run: uv pip install --python "$PY" "cozy-runtime==${{ inputs.runtime }}" 2>&1 | tee install.txt; exit "${PIPESTATUS[0]}"
+        run: uv pip install --python "$PY" "cozy-runtime${{ inputs.runtime && format('=={0}', inputs.runtime) || '' }}" 2>&1 | tee install.txt; exit "${PIPESTATUS[0]}"
 
       # Without TensorFS the rest of the probe still says what imports.
       - name: Install without TensorFS
         if: steps.install.outcome != 'success'
-        run: uv pip install --python "$PY" --no-deps "cozy-runtime==${{ inputs.runtime }}" && uv pip install --python "$PY" cryptography msgspec numpy packaging pillow
+        run: uv pip install --python "$PY" --no-deps "cozy-runtime${{ inputs.runtime && format('=={0}', inputs.runtime) || '' }}" && uv pip install --python "$PY" cryptography msgspec numpy packaging pillow
 
       - name: Torch and the Diffusers group
         run: |

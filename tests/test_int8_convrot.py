@@ -168,18 +168,15 @@ def test_a_gemm_that_raises_is_served_by_torch_and_the_run_says_so() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the int8 op runs on a CUDA card")
-def test_native_op_is_built_by_the_compile_manager_and_keeps_the_law(tmp_path: Path) -> None:
-    """The op as a pod gets it: the machine's compile manager builds `cozy-int8` for this card
-    from the pinned sources, the leaf loads it, and every path (GEMV rows, the GEMM, a bias,
-    fp16 and bf16, an unaligned view) agrees with the eager W8A8 law."""
-    from cozy_runtime.internal import int8_linear, kernel_cache, kernel_compile, kernel_sources
+def test_native_op_verifies_on_the_card_and_keeps_the_law(tmp_path: Path) -> None:
+    """The op as a machine gets it: the Runtime wheel's prebuilt one, verified on this card and kept
+    in its store; every path (GEMV rows, the GEMM, a bias, fp16 and bf16, an unaligned view)
+    agrees with the eager W8A8 law."""
+    from cozy_runtime.internal import int8_linear, kernel_cache
 
-    store = kernel_cache.Store(tmp_path / "kernels")
-    kernel_cache.configure(store)
-    major, minor = torch.cuda.get_device_capability(0)
-    state = kernel_compile.wait(store, kernel_sources.job(int8_linear.OP, major * 10 + minor))
-    assert state.state == "ready", state.line()
+    kernel_cache.configure(kernel_cache.Store(tmp_path / "kernels"))
     assert int8_linear.native(torch, 0) is not None
+    assert any((tmp_path / "kernels" / "verified").iterdir())
     generator = torch.Generator().manual_seed(11)
     for rows, out_features, in_features in (
         (1, 1024, 4096),

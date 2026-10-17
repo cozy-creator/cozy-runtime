@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from torch import Tensor
 
 from cozy_runtime.author.kernels import readable
+from cozy_runtime.internal import tools
 
 # Triton launch objects remain dynamic; tensor signatures name their optional dependency.
 
@@ -44,6 +45,9 @@ def _triton_kernels() -> Any:
     cached = getattr(_triton_kernels, "_cached", "unset")
     if cached != "unset":
         return cached
+    if not tools.triton():
+        _triton_kernels._cached = None  # type: ignore[attr-defined]
+        return None
     try:
         import triton
         import triton.language as tl

@@ -42,7 +42,16 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # The kernel modules for each native wheel: cached by everything that shapes their bytes, built
+  # only when that changed (kernels.yaml).
+  modules:
+    if: ${{ inputs.mode == 'source' }}
+    uses: ./.github/workflows/kernels.yaml
+    with:
+      ref: ${{ inputs.release_tag }}
+
   build:
+    needs: modules
     if: ${{ inputs.mode == 'source' }}
     outputs:
       version: ${{ steps.dist.outputs.version }}
@@ -88,48 +97,7 @@ jobs:
         run: bash release-tools/scripts/prepare-release-source-access.sh
       - run: uv sync --locked
         working-directory: source
-      # One Python source build plus the kernel wheel (cr-094): the latter is tagged
-      # cp312-abi3 and carrying `cozy_runtime/_kernels/_C.abi3.so`. The recipe lives in the
-      # scripts so a developer can run the very same build on a box with no CUDA toolkit.
-      - name: Fetch the pinned public native donor
-        run: |
-          uv run --no-project --python 3.12 python - <<'PY'
-          import hashlib, json, os, pathlib, urllib.parse, urllib.request
-          filename = "cozy_runtime-0.18.86-cp312-abi3-manylinux_2_28_x86_64.whl"
-          expected = "d47d42187e8121a832fe69a8fa3faa676bd462d44f8c6c103685cfdb336ab7db"
-          with urllib.request.urlopen("https://pypi.org/pypi/cozy-runtime/0.18.86/json", timeout=30) as response:
-              metadata = json.load(response)
-          rows = [row for row in metadata["urls"] if row["filename"] == filename]
-          if len(rows) != 1 or rows[0]["digests"]["sha256"] != expected:
-              raise SystemExit("PyPI native donor differs from its reviewed release pin")
-          url = urllib.parse.urlsplit(rows[0]["url"])
-          if url.scheme != "https" or url.netloc != "files.pythonhosted.org":
-              raise SystemExit("native donor URL is outside the public PyPI file origin")
-          path = pathlib.Path(os.environ["RUNNER_TEMP"]) / filename
-          with urllib.request.urlopen(rows[0]["url"], timeout=60) as response, path.open("wb") as output:
-              while chunk := response.read(1 << 20):
-                  output.write(chunk)
-          with path.open("rb") as source:
-              if hashlib.file_digest(source, "sha256").hexdigest() != expected:
-                  raise SystemExit("downloaded native donor failed its pinned SHA-256")
-          PY
-      # Runs on the still-clean checkout: reuse refuses a dirty tree, and stamping dirties it.
-      - name: Reuse unchanged native inputs or build the kernels wheel
-        working-directory: source
-        run: |
-          set +e
-          uv run --script scripts/build-dev-wheel.py \
-            --native-wheel "$RUNNER_TEMP/cozy_runtime-0.18.86-cp312-abi3-manylinux_2_28_x86_64.whl" \
-            --native-sha256 d47d42187e8121a832fe69a8fa3faa676bd462d44f8c6c103685cfdb336ab7db \
-            --release-commit "${{ steps.release.outputs.source }}" --reuse-or-build --out dist
-          status=$?
-          set -e
-          if [ "$status" -eq 3 ]; then
-            scripts/build-kernel-wheel.sh --out dist --commit "${{ steps.release.outputs.source }}"
-          elif [ "$status" -ne 0 ]; then
-            exit "$status"
-          fi
-      # The pure wheel remains the portable macOS/Windows/source-build artifact.
+      # The pure wheel remains the portable macOS and source-build artifact.
       - name: Build (sdist + pure-py wheel)
         working-directory: source
         env:
@@ -137,6 +105,15 @@ jobs:
         run: |
           uv run python scripts/stamp-build-provenance.py "$COZY_RUNTIME_BUILD_COMMIT"
           uv build --out-dir dist
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: kernels-*
+          path: kernels-out
+      - name: The x86_64 and Windows wheels, the pure one plus their kernels
+        working-directory: source
+        run: |
+          task wheel KERNELS="$GITHUB_WORKSPACE/kernels-out/kernels-linux-x86_64" PLAT=manylinux_2_28_x86_64
+          task wheel KERNELS="$GITHUB_WORKSPACE/kernels-out/kernels-win_amd64" PLAT=win_amd64
       # TensorD itself is public; only private TensorFS source needs additional read access.
       - name: Bundle the pinned tensord into the Linux wheel
         working-directory: source
@@ -150,7 +127,7 @@ jobs:
       # Everything visible in dist/ is uploaded, so the set is exact; the digests travel to
       # `publish` outside the artifact.
       - id: dist
-        name: Release carries the sdist, portable wheel and the Linux wheel
+        name: Release carries the sdist, portable wheel, and the x86_64 and Windows wheels
         working-directory: source
         run: |
           uv run --no-project --python 3.12 python - <<'PY'
@@ -160,6 +137,7 @@ jobs:
               f"cozy_runtime-{v}.tar.gz",
               f"cozy_runtime-{v}-py3-none-any.whl",
               f"cozy_runtime-{v}-cp312-abi3-manylinux_2_28_x86_64.whl",
+              f"cozy_runtime-{v}-cp312-abi3-win_amd64.whl",
           }
           dist = pathlib.Path("dist")
           # uv writes dist/.gitignore; hidden files are neither uploaded nor published.
@@ -179,9 +157,9 @@ jobs:
           path: source/dist/
           if-no-files-found: error
 
-  # The Linux arm64 wheel, on its own runner: the pure wheel plus an aarch64 tensord (no kernels
-  # wheel is built for aarch64 yet; callers probe `_kernels._C`).
+  # The Linux arm64 wheel, on its own runner: the pure wheel plus its kernels and an aarch64 tensord.
   build-aarch64:
+    needs: modules
     if: ${{ inputs.mode == 'source' }}
     outputs:
       sha256sum: ${{ steps.dist.outputs.sha256sum }}
@@ -213,7 +191,11 @@ jobs:
         run: bash release-tools/scripts/prepare-release-source-access.sh
       - run: uv sync --locked
         working-directory: source
-      - name: Pure wheel, an aarch64 tensord bundled into it, verified
+      - uses: actions/download-artifact@v4
+        with:
+          name: kernels-linux-aarch64
+          path: kernels-out
+      - name: Pure wheel, its kernels and an aarch64 tensord bundled into it, verified
         working-directory: source
         env:
           COZY_RUNTIME_BUILD_COMMIT: ${{ steps.release.outputs.source }}
@@ -221,6 +203,7 @@ jobs:
         run: |
           uv run python scripts/stamp-build-provenance.py "$COZY_RUNTIME_BUILD_COMMIT"
           uv build --wheel --out-dir dist
+          task wheel KERNELS="$GITHUB_WORKSPACE/kernels-out" PLAT=manylinux_2_28_aarch64
           task machine
           uv run --script scripts/verify-machine-wheels.py --dist dist
       - id: dist
@@ -285,16 +268,46 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+  # The Windows wheel, the very file this release publishes, installs and loads its kernels on
+  # Windows. No-deps: TensorFS publishes no Windows build yet, so the full install is not yet a
+  # Windows promise; the wheel's own contents are.
+  windows:
+    needs: [build, gated]
+    if: ${{ !cancelled() && (needs.build.result == 'success' || needs.gated.result == 'success') }}
+    runs-on: windows-2025
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-dist
+          path: dist
+      - uses: astral-sh/setup-uv@v7
+      - name: Install with no dependencies, load the kernels
+        shell: pwsh
+        run: |
+          uv venv --python 3.12 venv
+          uv pip install --python venv\Scripts\python.exe --no-deps (Get-ChildItem dist\*-win_amd64.whl).FullName
+          venv\Scripts\python.exe -I -c @"
+          import cozy_runtime._kernels as k
+          assert not k.ABSENT, k.ABSENT
+          assert not k._gemm.TMA and k.NO_FA3, 'the Windows wheel carries mma.sync GEMMs only (cr-201)'
+          code = k._gemm.gemv(0, 0, False, 0, 0, 0, 0, False, 1, 8, 256, 0)
+          print('kernels load; gemv without a GPU ->', code, k._gemm.error_name(code))
+          "@
+          exit $LASTEXITCODE
+
   # Every kernel the release builds on a machine compiles for every card it serves (0.25.0
   # shipped nvfp4 kernels that never built: every nvfp4 layer took its slow path).
-  kernels:
+  formation:
     uses: ./.github/workflows/kernel-formation.yaml
     with:
       ref: ${{ inputs.release_tag }}
 
   publish:
-    needs: [build, build-aarch64, gated, kernels]
-    if: ${{ !cancelled() && !inputs.rehearsal && needs.kernels.result == 'success' && (needs.build.result == 'success' && needs.build-aarch64.result == 'success' || needs.gated.result == 'success') }}
+    needs: [build, build-aarch64, gated, formation, windows]
+    if: ${{ !cancelled() && !inputs.rehearsal && needs.formation.result == 'success' && needs.windows.result == 'success' && (needs.build.result == 'success' && needs.build-aarch64.result == 'success' || needs.gated.result == 'success') }}
     runs-on: ubuntu-latest
     environment: pypi
     # Hang bound, not a work budget.

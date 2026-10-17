@@ -15,24 +15,14 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def test_fp8_op_is_built_by_the_compile_manager_and_keeps_the_law(tmp_path: Path) -> None:
-    """The compile manager builds the 8-bit op library for this card from the pinned sources.
-    Its quantize kernel is `eager_quantize` bit for bit (a zero row, K not a multiple of 256),
-    and every GEMM tile of this card's table, with a bias, in fp16 and bf16, from an unaligned
-    view, agrees with the f64 product of the quantized operands."""
-    from cozy_runtime.internal import (
-        fp8_linear,
-        int8_linear,
-        kernel_cache,
-        kernel_compile,
-        kernel_sources,
-    )
+def test_fp8_op_verifies_on_the_card_and_keeps_the_law(tmp_path: Path) -> None:
+    """The Runtime wheel's prebuilt 8-bit op library, verified on this card. Its quantize kernel is
+    `eager_quantize` bit for bit (a zero row, K not a multiple of 256), and every GEMM tile of
+    this card's table, with a bias, in fp16 and bf16, from an unaligned view, agrees with the
+    f64 product of the quantized operands."""
+    from cozy_runtime.internal import fp8_linear, int8_linear, kernel_cache
 
-    store = kernel_cache.Store(tmp_path / "kernels")
-    kernel_cache.configure(store)
-    major, minor = torch.cuda.get_device_capability(0)
-    state = kernel_compile.wait(store, kernel_sources.job(int8_linear.OP, major * 10 + minor))
-    assert state.state == "ready", state.line()
+    kernel_cache.configure(kernel_cache.Store(tmp_path / "kernels"))
     assert fp8_linear.native(torch, 0) is not None
     generator = torch.Generator().manual_seed(13)
     for rows, width in ((1, 16), (5, 4096), (300, 1040), (64, 32768)):
@@ -64,10 +54,10 @@ def test_fp8_op_is_built_by_the_compile_manager_and_keeps_the_law(tmp_path: Path
             operand = fp8_linear.quantize(torch, x.reshape(rows, -1))
             for config in range(4):
                 try:
-                    tile = torch.ops.cozy.fp8_gemm.default(
+                    tile = int8_linear.library(0).fp8_gemm(
                         operand.payload, operand.scale, data, weight_scale, bias, dtype, config
                     )
-                except RuntimeError as exc:
+                except ValueError as exc:
                     assert "cannot take" in str(exc), exc
                     continue
                 assert _error(tile, want) < 0.01, (rows, out_features, dtype, config)

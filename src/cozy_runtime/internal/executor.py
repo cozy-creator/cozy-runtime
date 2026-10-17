@@ -159,6 +159,7 @@ from cozy_runtime.internal import (
     spawn,
     stage_memo,
     tolerant,
+    tools,
     weight_policy,
     zygote,
 )
@@ -3542,7 +3543,7 @@ class Executor:
                 record.emit(
                     "log", f"{feature} unavailable on {self.device_kind}", "warn", instead=instead
                 )
-            for message, raised in WARNINGS:
+            for message, raised in (*WARNINGS, *tools.warnings()):
                 record.emit("log", message, "warn", **raised)
             members = self.model_executors or [self]
             facts = next((m.device_facts for m in members if m.device_facts), None)

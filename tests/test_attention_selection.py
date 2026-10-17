@@ -50,10 +50,9 @@ RANKED = ["flash-attn3", "sdpa"]
 
 
 def test_fp8_admits_a_strict_subset_of_the_bf16_entrys_sites_so_no_floor_site_moves() -> None:
-    """The promotion moves ONLY sites the bf16 entry already served at head dim <= 128. Every
-    site that kept the floor keeps it — H3's two VAEs (x37) hold it on dtype — because fp8's
-    admission is a strict subset of flash-attn3's on every axis, and a site outside it falls
-    through to the next rank rather than being forced."""
+    """The promotion moves ONLY sites the bf16 entry already serves at head dim <= 128, because
+    fp8's admission is within flash-attn3's on every axis, and a site outside it falls through
+    to the next rank rather than being forced."""
     fp8, bf16 = attention.BY_NAME["flash-attn3-fp8"], attention.BY_NAME["flash-attn3"]
     dtypes = ("bfloat16", "float16", "float32", "float8_e4m3fn", "")
     dims = (0, 64, 128, 192, 256, 512)
@@ -65,7 +64,7 @@ def test_fp8_admits_a_strict_subset_of_the_bf16_entrys_sites_so_no_floor_site_mo
         ("float16", 128),
     }
     built = {(d, h) for d in dtypes for h in dims if attention._admits(bf16, d, h)}
-    assert built == {("bfloat16", 128), ("float16", 64)}  # exactly what its build has
+    assert built == admitted  # the wheel's FA3: head dims 64 and 128 in bf16 and fp16
     assert not attention._admits(fp8, "bfloat16", 256)
 
 
@@ -121,7 +120,7 @@ def test_every_nameable_kernel_has_one_name_and_one_backend() -> None:
         ("flash-attn3-fp8", "float32", 128, False),
         ("flash-attn3", "bfloat16", 128, True),
         ("flash-attn3", "bfloat16", 256, False),
-        ("flash-attn3", "bfloat16", 64, False),
+        ("flash-attn3", "bfloat16", 64, True),
         ("flash-attn3", "float16", 64, True),
         ("flash-attn3", "bfloat16", 512, False),
         ("flash-attn3", "float32", 128, False),

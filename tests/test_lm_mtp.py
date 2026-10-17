@@ -242,8 +242,7 @@ def test_a_head_that_does_not_fit_decodes_without_drafting(
     model = _qwen3_5()
     ids = torch.randint(10, 44, (1, 30), device=DEVICE)
     want = _reference(model, ids, 40, 0.0)
-    static = lm._static
-    monkeypatch.setattr(lm, "_static", lambda *a: None if a[-1] is not None else static(*a))
+    monkeypatch.setattr(lm._Engine, "_hold", lambda engine, _stack: engine.draft is None)
     WARNINGS.clear()
     got = lm.generate(
         model,

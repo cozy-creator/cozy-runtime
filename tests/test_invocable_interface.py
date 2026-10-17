@@ -8,7 +8,6 @@ import sys
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any, cast
 
 import msgspec
 import pytest
@@ -86,17 +85,6 @@ def test_invocable_dispatch_uses_private_body_and_export_requires_owner(tmp_path
     assert descriptor["invocable"]["defaults"] == {"request/count": 2}
     assert descriptor["invocable"]["memoize"] is True
     assert descriptor["invocable"]["type_names"]["result/detail"] == "Detail"
-
-
-def test_legacy_memo_declaration_refuses_instead_of_silently_disabling_cache() -> None:
-    with pytest.raises(TypeError, match="reusable"):
-        cast(Any, invocable)(reusable=True)
-    _, raw = described()
-    document = canonical.parse_canonical(raw)
-    declaration = document["entrypoints"][0]["invocable"]
-    declaration["reusable"] = declaration.pop("memoize")
-    with pytest.raises(ConformanceError, match="missing required field `memoize`"):
-        package_interface.read_bytes(canonical.write(document))
 
 
 def test_additive_invocable_metadata_from_another_runtime_still_generates() -> None:

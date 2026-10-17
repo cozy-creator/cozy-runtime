@@ -17,6 +17,7 @@ step, and refuses an unsupported or failed kernel (owner ruling 2026-10-10).
 
 from __future__ import annotations
 
+import shutil
 import site
 import sys
 from collections import deque
@@ -47,6 +48,7 @@ from cozy_runtime.internal import (
     kernel_sources,
     prebuilt,
     producers,
+    tools,
     verify,
 )
 from cozy_runtime.internal import attention_upstream as upstream
@@ -99,8 +101,8 @@ _MMA, _WGMMA, _TCGEN05 = (frozenset({f}) for f in (arch.MMA_SYNC, arch.WGMMA, ar
 _FP8, _FP4 = frozenset({"fp8"}), frozenset({"fp4"})
 _HALF, _BF16, _D128 = frozenset({"bfloat16", "float16"}), frozenset({"bfloat16"}), frozenset({128})
 _D64_128 = frozenset({64, 128})
-#: What FA3's build has (`kernel_sources._FA3_SHAPES`): no package declares its sites' shapes.
-_FA3 = frozenset({(128, "bfloat16"), (64, "float16")})
+#: What the wheel's FA3 serves (`prebuilt.FlashAttention3`); `flash-attn3-full` serves more.
+_FA3 = frozenset((d, dtype) for d in (64, 128) for dtype in ("bfloat16", "float16"))
 _PY, _KITCHEN, _SAGE3 = kernel_sources.PYTHON, "comfy-kitchen", "sageattn3"
 
 KERNELS: tuple[Candidate, ...] = (
@@ -108,7 +110,7 @@ KERNELS: tuple[Candidate, ...] = (
     Candidate("cudnn", "_cozy_cudnn", upstream.CUDNN, _GPU, dtypes=_HALF, max_head_dim=128),
     Candidate(
         "flash-attn3", "_cozy_flash_attn3", upstream.FA3, _WGMMA, dtypes=_HALF, max_head_dim=256,
-        shapes=_FA3, artifact="flash-attn3", import_name="flash_attn_interface",
+        shapes=_FA3, artifact="flash-attn3-full", import_name="flash_attn_interface",
     ),
     Candidate(
         "flash-attn3-fp8", "_cozy_flash_attn3_fp8", upstream.FA3_FP8, _WGMMA, exact=False,
@@ -403,12 +405,22 @@ def reserve(pin: str, device: DeviceFacts) -> None:
 
 
 def _job(candidate: Candidate, device: DeviceFacts) -> kernel_compile.Job:
+    """The candidate's build here; a build tool it lacks is the run's warning (`tools`)."""
     build = _build(candidate)
+    failed = f"{candidate.name} prebuilt" in _STATES  # the wheel's kernel failed its probe
+    code = "kernel_verify_failed" if failed else "kernel_prebuilt_missing"
     try:
-        return kernel_sources.job(build, device.sm)
+        job = kernel_sources.job(build, device.sm)
     except kernel_sources.Absent as exc:
+        for tool in exc.tools:
+            tools.missing(tool, code)
         _STATES[candidate.name] = kernel_compile.State(build, "absent", detail=str(exc))
         raise AttentionRefusal("attention_kernel_absent", f"{candidate.name}: {exc}") from exc
+    store = kernel_cache.configured()
+    built = store is None or store.entry(job.key) is not None
+    if job.kind == "setup" and not built and not shutil.which("ninja"):
+        tools.missing("ninja", code)
+    return job
 
 
 def _compiled(candidate: Candidate, device: DeviceFacts, wait: bool) -> dict[str, str] | None:
@@ -492,9 +504,9 @@ def _launch(ready: Ready, device: DeviceFacts) -> None:
 
 
 def _prebuilt_fa3(candidate: Candidate, device: DeviceFacts) -> Ready | None:
-    """FlashAttention-3 from the cozy-kernels wheel once it verifies on this Hopper card; a
+    """FlashAttention-3 from the Runtime wheel once it verifies on this Hopper card; a
     failure is the run's one warning for it, and the local build is tried next."""
-    if candidate.name != "flash-attn3" or device.kind != "cuda" or device.sm != 90:
+    if device.kind != "cuda" or not prebuilt.serves(candidate.name, device.sm):
         return None
     import torch
 
@@ -502,13 +514,13 @@ def _prebuilt_fa3(candidate: Candidate, device: DeviceFacts) -> Ready | None:
     if kernel is None:
         if not prebuilt.ABSENT:
             _STATES[f"{candidate.name} prebuilt"] = kernel_compile.State(
-                "cozy-kernels", "failed", detail=why
+                "prebuilt", "failed", detail=why
             )
         return None
     digest = prebuilt.artifact("_fa3").partition(":")[2][:16]
     upstream.bind_fa3(kernel, f"prebuilt {digest}")
-    _STATES[candidate.name] = kernel_compile.State("cozy-kernels", "ready")
-    return Ready(candidate, _member(candidate), {"artifact": "cozy-kernels", "key": digest})
+    _STATES[candidate.name] = kernel_compile.State("prebuilt", "ready")
+    return Ready(candidate, _member(candidate), {"artifact": "prebuilt", "key": digest})
 
 
 def _compile_dependencies(
@@ -666,6 +678,8 @@ def _sol_route(device: DeviceFacts) -> None:
         route = attention_sol.backend(device.index)
         if route == "fa4_block_sparse":
             _import(known()["flash-attn4"])
+            if not tools.triton():
+                raise AttentionRefusal("attention_kernel_absent", "sol-attn FA4: cc not found")
             try:
                 import_module("cozy_runtime.internal.attention_sol_fa4").warm(device.index)
             except Exception as exc:

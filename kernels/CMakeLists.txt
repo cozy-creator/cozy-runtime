@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-# cozy-kernels: one module per kernel group, every GPU target we serve inside it
-# (`cozy_kernels.ARCHS`), the CUDA 13.0 runtime linked static, nanobind on Python's stable ABI.
+# Cozy's prebuilt kernels: one module per kernel group, every GPU target we serve inside it
+# (`cozy_runtime._kernels.ARCHS`), the CUDA 13.0 runtime linked static, nanobind on Python's
+# stable ABI. Installed under `cozy_runtime/_kernels`, they go into the native cozy-runtime wheels
+# (kernels.yaml builds them, keyed by this directory: toolchain.env pins the toolchain).
 # Each unit is compiled for its own targets only: an arch-specific instruction (wgmma, tcgen05)
 # never meets a card it cannot run on.
 cmake_minimum_required(VERSION 3.26)
-project(cozy_kernels LANGUAGES CXX)
+project(cozy_runtime_kernels LANGUAGES CXX)
 # CUDA 13.0 takes MSVC through 19.4x (Visual Studio 2022); a newer one builds only past nvcc's check.
 if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 19.50)
     message(WARNING "MSVC ${CMAKE_CXX_COMPILER_VERSION} (${CMAKE_CXX_COMPILER}) is newer than CUDA 13.0 "
@@ -48,7 +50,7 @@ endfunction()
 pinned(CUTLASS_DIR NVIDIA/cutlass 098de2a652cf8f00fd70b2df54051c7eccbb855a
        a8a1b952c7f6179bc8076f20d45859f18bd81f21f3d22b6766d7f3f0cceb5d54)
 
-set(INT8 "${CMAKE_CURRENT_SOURCE_DIR}/../src/cozy_runtime/internal/int8_op")
+set(INT8 "${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm")
 set(isolated $<$<PLATFORM_ID:Linux>:-fno-gnu-unique>)
 
 # One 8-bit unit for `targets`, its family named by its defines (`int8.h`).
@@ -142,7 +144,7 @@ function(kernel_module name binding)
                             -static-libstdc++ -static-libgcc)
         set_target_properties(${name} PROPERTIES SUFFIX ".abi3.so")
     endif()
-    install(TARGETS ${name} LIBRARY DESTINATION cozy_kernels)
+    install(TARGETS ${name} LIBRARY DESTINATION cozy_runtime/_kernels)
 endfunction()
 
 kernel_module(_gemm gemm.cpp ${units})

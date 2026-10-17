@@ -1,11 +1,11 @@
-"""The prebuilt kernels of the `cozy_kernels` wheel: one wheel per OS and CPU with every card's
-cubins inside (`kernels/`), each verified on the device before it serves (`verify`). `_gemm` is
-the 8-bit linears; `_fa3` is FlashAttention-3's Hopper forward (`FlashAttention3`).
+"""The prebuilt kernels the native cozy-runtime wheels carry (`cozy_runtime._kernels`, built from
+`kernels/`): every card's cubins inside, each verified on the device before it serves (`verify`).
+`_gemm` is the 8-bit linears; `_fa3` is FlashAttention-3's Hopper forward (`FlashAttention3`).
 
-`Prebuilt` answers the six calls of the op a machine can compile (`int8_op/op.cpp`):
-`*_linear` quantizes, multiplies and applies both scales and the bias (int8's few rows in one
-GEMV launch), `*_quantize` optionally folds the producer's norm, modulation and activation into
-the quantization, and `*_gemm` multiplies a quantized operand. It allocates with torch and
+`Prebuilt` answers the 8-bit op library's six calls: `*_linear` quantizes, multiplies and applies
+both scales and the bias (int8's few rows in one GEMV launch), `*_quantize` optionally folds the
+producer's norm, modulation and activation into the quantization, and `*_gemm` multiplies a
+quantized operand. It allocates with torch and
 launches on torch's current stream. A GEMM tile that cannot take a shape hands that call to
 cuBLASLt (`_int_mm`, `_scaled_mm`), said once; a card the wheel has no fp8 GEMM for (Ada) is
 cuBLASLt's by design. `torch` is the torch module: this module imports no torch.
@@ -13,6 +13,7 @@ cuBLASLt's by design. `torch` is the torch module: this module imports no torch.
 
 from __future__ import annotations
 
+import hashlib
 import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -20,24 +21,14 @@ from functools import partial
 from importlib import metadata
 from types import ModuleType
 
+from cozy_runtime import _kernels
+from cozy_runtime._kernels import ABSENT as ABSENT
+from cozy_runtime._kernels import ARCHS, FAMILIES, GEMM, NO_FA3, TMA_GEMM
 from cozy_runtime.internal import arch, verify
 from cozy_runtime.internal.encoding.formats import CONVROT_GROUP, E4M3_MAX, Tensor, hadamard256
 
-try:
-    from cozy_kernels import FAMILIES, GEMM, TMA_GEMM, _gemm
-
-    ABSENT = ""
-except ImportError as absent:  # no cozy-kernels wheel for this OS and CPU
-    ABSENT = f"no cozy-kernels wheel is installed ({absent})"
-try:
-    from cozy_kernels import _fa3
-
-    NO_FA3 = ""
-except ImportError as absent:  # Linux aarch64's wheel carries no FA3 (cr-200)
-    NO_FA3 = f"the cozy-kernels wheel carries no FlashAttention-3 ({absent})"
-
 #: The verdicts' kernel names, one per format: each verifies on its own.
-KERNELS = {"int8": "cozy-kernels-int8", "fp8": "cozy-kernels-fp8"}
+KERNELS = {"int8": "prebuilt-int8", "fp8": "prebuilt-fp8"}
 #: The probe's budget for the relative L2 error against the exact law (the op tests' bound).
 BUDGET = 1e-2
 #: Attention's, against fp32 attention: an exact kernel's bf16 output, and a quantized one's
@@ -79,14 +70,14 @@ class Prebuilt:
         rows, width = flat.shape
         bias = self._weight(INT8, data, scale, bias, width, out_dtype)
         shape = (*x.shape[:-1], data.shape[0])
-        if rows <= _gemm.GEMV_ROWS:
+        if rows <= _kernels._gemm.GEMV_ROWS:
             out = self.torch.empty(shape, dtype=out_dtype, device=x.device)
-            code = 0 if rows == 0 else _gemm.gemv(
+            code = 0 if rows == 0 else _kernels._gemm.gemv(
                 self.index, flat.data_ptr(), self._half(flat.dtype), data.data_ptr(),
                 scale.data_ptr(), _ptr(bias), out.data_ptr(), self._half(out_dtype), rows,
                 data.shape[0], width, self._stream(),
             )  # fmt: skip
-            if code != _gemm.NOT_SUPPORTED:
+            if code != _kernels._gemm.NOT_SUPPORTED:
                 self._check(code, "the GEMV")
                 return out
         q, scales = self.int8_quantize(flat)
@@ -165,7 +156,7 @@ class Prebuilt:
         entries = next((t.shape[0] for t in tables if t is not None), rows) or 1
         if any(t is not None and t.shape[0] != entries for t in tables) or rows % entries:
             raise ValueError(f"{f.name}_quantize: modulation rows do not divide {rows} rows")
-        code = _gemm.quantize(
+        code = _kernels._gemm.quantize(
             self.index, f.fp8, flat.data_ptr(), self._half(flat.dtype), q.data_ptr(),
             scales.data_ptr(), rows, width, _ptr(tables[0]), _ptr(tables[1]),
             _stride(tables[0]), _stride(tables[1]), max(rows // entries, 1), norm, eps,
@@ -196,9 +187,9 @@ class Prebuilt:
         out = torch.empty(rows, data.shape[0], dtype=out_dtype, device=q.device)
         if rows == 0:
             return out
-        code = _gemm.NOT_SUPPORTED
+        code = _kernels._gemm.NOT_SUPPORTED
         if not f.fp8 or self.cutlass_fp8:
-            code = _gemm.gemm(
+            code = _kernels._gemm.gemm(
                 self.index, FAMILIES.index(self.family), f.fp8, q.data_ptr(), scales.data_ptr(),
                 data.data_ptr(), scale.data_ptr(), _ptr(bias), out.data_ptr(),
                 self._half(out_dtype), rows, data.shape[0], width, config,
@@ -206,7 +197,7 @@ class Prebuilt:
             )  # fmt: skip
         if code == 0:
             return out
-        if code != _gemm.NOT_SUPPORTED:
+        if code != _kernels._gemm.NOT_SUPPORTED:
             self._check(code, "the GEMM")
         if config >= 0:
             raise ValueError(f"{f.name}_gemm: config {config} cannot take {rows}x{width}")
@@ -232,9 +223,9 @@ class Prebuilt:
         width = x.shape[-1]
         if not x.is_cuda or x.get_device() != self.index:
             raise ValueError(f"{f.name}: x must be on cuda:{self.index}")
-        if width % f.multiple or width > _gemm.MAX_K:
+        if width % f.multiple or width > _kernels._gemm.MAX_K:
             raise ValueError(f"{f.name}: K must be a multiple of {f.multiple} up to "
-                             f"{_gemm.MAX_K}, not {width}")  # fmt: skip
+                             f"{_kernels._gemm.MAX_K}, not {width}")  # fmt: skip
         flat = x.reshape(-1, width).contiguous()
         return flat if flat.data_ptr() % 16 == 0 else flat.clone()
 
@@ -289,8 +280,8 @@ class Prebuilt:
     def _check(self, code: int, what: str) -> None:
         if code == 0:
             return
-        detail = f"8-bit linear: {what}: {_gemm.error_name(code)}"
-        if code == _gemm.OUT_OF_MEMORY:
+        detail = f"8-bit linear: {what}: {_kernels._gemm.error_name(code)}"
+        if code == _kernels._gemm.OUT_OF_MEMORY:
             raise self.torch.cuda.OutOfMemoryError(detail)
         raise RuntimeError(detail)
 
@@ -304,29 +295,48 @@ def _stride(t: Tensor | None) -> int:
 
 
 def artifact(module: str = "_gemm") -> str:
-    """An installed module's digest, as its wheel's RECORD has it: nothing is hashed."""
+    """A kernel module's digest, as cozy-runtime's RECORD has it, or its loaded file's for a source
+    checkout's build (no RECORD names it): a verdict never outlives the bytes it judged."""
     try:
-        files = metadata.distribution("cozy-kernels").files or []
+        files = metadata.distribution("cozy-runtime").files or []
     except metadata.PackageNotFoundError:
+        files = []
+    path = f"cozy_runtime/_kernels/{module}."
+    found = next(
+        (f for f in files if str(f).startswith(path) and f.suffix in (".so", ".pyd") and f.hash),
+        None,
+    )
+    if found and found.hash:
+        return f"{found.hash.mode}:{found.hash.value}"
+    loaded = getattr(_kernels, module, None)
+    if loaded is None or not loaded.__file__:
         return ""
-    found = next((f for f in files if f.name.startswith(f"{module}.") and f.hash), None)
-    return f"{found.hash.mode}:{found.hash.value}" if found and found.hash else ""
+    with open(loaded.__file__, "rb") as stream:
+        return f"sha256:{hashlib.file_digest(stream, 'sha256').hexdigest()}"
 
 
-def covers(sm: int) -> bool:
-    """Whether the installed wheel carries this card's 8-bit GEMMs: a machine then builds none at
-    boot, and builds them only if they fail their probe here (`int8_linear.native`)."""
-    family = arch.row(sm).family
-    return not ABSENT and any(sm in GEMM[f].get(family, ()) for f in GEMM)
+#: The attention kernels the wheel serves, by candidate name (`attention.KERNELS`).
+ATTENTION = {"flash-attn3": "_fa3"}
+
+
+def serves(kernel: str, sm: int) -> bool:
+    """Whether the installed wheel carries `kernel` for this card: a machine builds none."""
+    module = ATTENTION.get(kernel)
+    return (
+        not ABSENT
+        and module is not None
+        and bool(artifact(module))
+        and any(target.rstrip("af") == f"sm_{sm}" for target in ARCHS[module]["cubin"])
+    )
 
 
 def lost(f: str, sm: int) -> str:
     """Why the wheel has no `f` GEMM for this card where a full build has one (a Windows wheel,
     cr-201), or "": a run's GEMM column says it beside the kernel that served."""
     family = arch.row(sm).family
-    if ABSENT or _gemm.TMA or sm not in TMA_GEMM.get(f, {}).get(family, ()):
+    if ABSENT or _kernels._gemm.TMA or sm not in TMA_GEMM.get(f, {}).get(family, ()):
         return ""
-    return (f"the Windows cozy-kernels wheel has no {family} {f} GEMM for sm{sm}: MSVC cannot "
+    return (f"the Windows cozy-runtime wheel has no {family} {f} GEMM for sm{sm}: MSVC cannot "
             "build CUTLASS's TMA kernels (cr-201)")  # fmt: skip
 
 
@@ -340,7 +350,7 @@ def library(torch: ModuleType, index: int, sm: int) -> tuple[Prebuilt | None, st
         return None, f"sm{sm} has no tensor-core family"
     carried = [family for family in arch.families(sm) if any(family in GEMM[f] for f in GEMM)]
     if not carried:  # a Windows wheel has mma.sync only (cr-201)
-        return None, f"the cozy-kernels wheel has no {'/'.join(arch.families(sm))} GEMM"
+        return None, f"the cozy-runtime wheel has no {'/'.join(arch.families(sm))} GEMM"
     digest = artifact()
     reasons: list[str] = []
     for family in carried:
@@ -360,7 +370,7 @@ def library(torch: ModuleType, index: int, sm: int) -> tuple[Prebuilt | None, st
                 arch.learn(sm, family)
             return ops, "; ".join(f"{name} {v.detail}" for name, v in verdicts.items())
         reasons.append(f"{family}: {'; '.join(failed)}")
-    return None, f"cozy-kernels failed verification on sm{sm}: {' | '.join(reasons)}"
+    return None, f"the prebuilt kernels failed verification on sm{sm}: {' | '.join(reasons)}"
 
 
 def probe(torch: ModuleType, ops: Prebuilt, f: _Format) -> verify.Verdict:
@@ -468,7 +478,7 @@ class FlashAttention3:
         lse = torch.empty(batch, heads, seqlen_q, dtype=torch.float32, device=q.device)
         semaphore = torch.zeros(1, dtype=torch.int32, device=q.device) if causal else None
         scale = softmax_scale if softmax_scale is not None else head_dim**-0.5
-        code = _fa3.fwd(
+        code = _kernels._fa3.fwd(
             self.index, q.data_ptr(), k.data_ptr(), v.data_ptr(), out.data_ptr(),
             lse.data_ptr(), q.dtype == torch.bfloat16, batch, seqlen_q, k.shape[1], heads,
             k.shape[2], head_dim, _strides(q), _strides(k), _strides(v), _strides(out),
@@ -476,7 +486,7 @@ class FlashAttention3:
             int(torch.cuda.current_stream(self.index).cuda_stream),
         )  # fmt: skip
         if code:
-            raise ValueError(f"flash-attn3 prebuilt: {_fa3.error_name(code)}")
+            raise ValueError(f"flash-attn3 prebuilt: {_kernels._fa3.error_name(code)}")
         return out, lse
 
 
@@ -497,7 +507,7 @@ def fa3(torch: ModuleType, index: int, sm: int) -> tuple[FlashAttention3 | None,
 
     pairs = [(d, n) for d in (64, 128) for n in ("bfloat16", "float16")]
     probe = partial(attention_probe, torch, index, call, True, pairs, True)
-    verdict = verify.verified("cozy-kernels-fa3", artifact("_fa3"), sm, probe)
+    verdict = verify.verified("prebuilt-fa3", artifact("_fa3"), sm, probe)
     return (kernel if verdict.ok else None), verdict.detail
 
 

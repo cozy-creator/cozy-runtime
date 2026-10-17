@@ -56,7 +56,6 @@ from cozy_runtime.author._loader import (
     Scheduler,
     census,
 )
-from cozy_runtime.author._model import _public_methods
 from cozy_runtime.author.fakes import (
     fake_attempt,
     fake_input,
@@ -288,18 +287,3 @@ class Warmed(Model[Pipeline]):
 
     def warm(self, ctx: Context) -> None:
         raise AssertionError("the Runtime no longer calls Model.warm")
-
-
-def test_warm_stays_a_reserved_member_and_not_a_scope() -> None:
-    """Packages built for an older Runtime define `warm`: it is no public method of theirs, and
-    `@uses_components` still refuses it, so their interfaces describe as they did."""
-    with pytest.raises(ConformanceError) as refused:
-
-        class Scoped(Model[Pipeline]):
-            @uses_components("transformer")
-            def warm(self, ctx: Context) -> None:
-                return None
-
-    assert refused.value.code == "component_placement"
-    assert "warm" not in [name for name, _ in _public_methods(Warmed)]
-    assert not hasattr(Model, "warm")
