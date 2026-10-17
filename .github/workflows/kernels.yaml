@@ -3,6 +3,9 @@ name: kernels
 # OS and CPU, each checked for its tag, its declared targets, no torch and an import on every
 # Python it claims (checks/kernel_wheel.py). PRs that touch kernel sources run it. By hand:
 #   gh workflow run kernels.yaml -R cozy-creator/cozy-runtime -f ref=<tag|sha>
+# A release builds a `kernels-v<version>` tag, proves that run's wheels on GPUs, then publishes
+# exactly those files to PyPI:
+#   gh workflow run kernels.yaml -R cozy-creator/cozy-runtime -f ref=kernels-v0.1.0 -f publish_run=<run id>
 on:
   workflow_dispatch:
     inputs:
@@ -10,6 +13,10 @@ on:
         description: Branch, tag or SHA to build
         type: string
         default: master
+      publish_run:
+        description: Publish this earlier run's wheels, built from the kernels-v* tag in ref, to PyPI
+        type: string
+        default: ''
   workflow_call:
     inputs:
       ref:
@@ -33,6 +40,7 @@ concurrency:
 
 jobs:
   linux:
+    if: ${{ !inputs.publish_run }}
     strategy:
       fail-fast: false
       matrix:
@@ -88,6 +96,7 @@ jobs:
           if-no-files-found: error
 
   windows:
+    if: ${{ !inputs.publish_run }}
     # No larger Windows runner: the standard one, one compile at a time.
     runs-on: windows-2025
     timeout-minutes: 360
@@ -148,3 +157,68 @@ jobs:
           path: dist/*.whl
           if-no-files-found: error
 
+  publish:
+    if: inputs.publish_run && startsWith(inputs.ref, 'kernels-v')
+    runs-on: ubuntu-latest
+    environment: pypi
+    # Hang bound, not a work budget.
+    timeout-minutes: 20
+    permissions:
+      id-token: write  # PyPI trusted publishing (OIDC)
+      actions: read
+    env:
+      RUN: ${{ inputs.publish_run }}
+      REF: ${{ inputs.ref }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: The run built this tag and passed
+        run: |
+          gh run view "$RUN" -R "$GITHUB_REPOSITORY" --json workflowName,displayTitle,conclusion \
+            --jq '"\(.workflowName)|\(.displayTitle)|\(.conclusion)"' | tee run
+          [ "$(cat run)" = "kernels|kernels $REF|success" ]
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: cozy-kernels-*
+          path: dist
+          merge-multiple: true
+          run-id: ${{ inputs.publish_run }}
+          github-token: ${{ github.token }}
+      - name: One wheel per target, each at the tag's version
+        working-directory: dist
+        run: |
+          version=${REF#kernels-v}
+          want=$(printf "cozy_kernels-$version-cp312-abi3-%s.whl\n" \
+            manylinux_2_28_aarch64 manylinux_2_28_x86_64 win_amd64)
+          [ "$(ls | sort)" = "$want" ] || { ls; echo "::error::expected $want"; exit 1; }
+          sha256sum * | tee ../sums
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+      - name: Publish (trusted publishing)
+        uses: pypa/gh-action-pypi-publish@release/v1
+      # Uploads land one file at a time: wait while a file is absent, refuse any the run did not build.
+      - name: PyPI serves exactly the built files
+        run: |
+          python3 - <<'PY'
+          import json, os, sys, time, urllib.error, urllib.request
+          version = os.environ["VERSION"]
+          want = {name: digest for digest, name in (line.split() for line in open("sums"))}
+          request = urllib.request.Request(
+              f"https://pypi.org/pypi/cozy-kernels/{version}/json", headers={"Cache-Control": "no-cache"}
+          )
+          while True:
+              try:
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      served = {f["filename"]: f["digests"]["sha256"] for f in json.load(response)["urls"]}
+              except (OSError, urllib.error.URLError) as error:
+                  print(f"PyPI JSON unavailable ({error}); retrying", flush=True)
+                  time.sleep(5)
+                  continue
+              wrong = {name: digest for name, digest in served.items() if want.get(name) != digest}
+              if wrong:
+                  sys.exit(f"PyPI serves files the run did not build: {wrong}")
+              missing = sorted(set(want) - set(served))
+              if not missing:
+                  print("\n".join(f"{want[name]}  {name}" for name in sorted(want)))
+                  break
+              print(f"not yet served: {missing}", flush=True)
+              time.sleep(5)
+          PY
