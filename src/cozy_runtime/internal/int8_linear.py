@@ -26,7 +26,14 @@ from typing import cast
 from cozy_runtime.author._errors import is_device_oom
 from cozy_runtime.author._model import LANDED, WARNINGS, Building
 from cozy_runtime.author.kernels import INT8_CONVROT, PreQuantized, readable
-from cozy_runtime.internal import arch, kernel_cache, kernel_compile, kernel_sources, prebuilt
+from cozy_runtime.internal import (
+    arch,
+    kernel_cache,
+    kernel_compile,
+    kernel_sources,
+    prebuilt,
+    tools,
+)
 from cozy_runtime.internal.encoding.formats import CONVROT_GROUP, Tensor, hadamard256
 
 ARTIFACT = "comfy-kitchen"
@@ -141,7 +148,13 @@ def _store() -> kernel_cache.Store:
 def _kitchen_tree(sm: int) -> Path | None:
     """comfy-kitchen's reviewed wheel unpacked for this card (`kernel_sources`), None while the
     machine's compile manager places it."""
-    built = kernel_compile.submit(_store(), kernel_sources.job(ARTIFACT, sm))
+    try:
+        job = kernel_sources.job(ARTIFACT, sm)
+    except kernel_sources.Absent as exc:
+        for tool in exc.tools:
+            tools.missing(tool, "kernel_prebuilt_missing")
+        raise
+    built = kernel_compile.submit(_store(), job)
     if built.state in ("compiling", "pending"):
         return None
     if built.state != "ready":
