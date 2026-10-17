@@ -20,6 +20,7 @@ from cozy_runtime.author._assets import (
     file_state,
 )
 from cozy_runtime.author._capture import ExecutionObservation
+from cozy_runtime.author._decode import MediaReads
 from cozy_runtime.author._media import admits, normalize
 
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
@@ -78,6 +79,7 @@ def decode(
     observation: ExecutionObservation | None,
     grant_token: object | None = None,
     python_type: type[msgspec.Struct] | None = None,
+    media: MediaReads | None = None,
 ) -> tuple[Any, ExecutionObservation | None]:
     """Every native result leaf is replaced from the separately verified host grant."""
     if len(grants) > 32:
@@ -219,5 +221,6 @@ def decode(
             order=item.order,
             read_guard=guard,
             source_state=file_state(asset._local),
+            media=media,
         )
     return result, observation

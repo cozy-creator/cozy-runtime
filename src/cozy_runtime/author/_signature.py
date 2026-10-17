@@ -20,6 +20,7 @@ import msgspec
 
 from cozy_runtime.author._artifacts import ModelArtifact
 from cozy_runtime.author._assets import (
+    MEDIA_KINDS,
     Asset,
     Assets,
     AudioAsset,
@@ -28,22 +29,24 @@ from cozy_runtime.author._assets import (
     ImageAsset,
     Tree,
     VideoAsset,
+    asset_kinds,
 )
 from cozy_runtime.author._context import Context
-from cozy_runtime.author._decode import DECODED_ASSET_TYPES, DEFAULT_DECODE_LIMITS
+from cozy_runtime.author._decode import DEFAULT_DECODE_LIMITS
 from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._markers import (
+    PREPARATIONS,
     AssetBound,
     AssetLimits,
     Bound,
-    ImagePreparation,
+    Preparation,
     _PreflightMarker,
 )
 from cozy_runtime.author._memo import Memoize
 from cozy_runtime.author._model import Model, component_use
 from cozy_runtime.author._model_defaults import check_model_arguments
 from cozy_runtime.author._services import SERVICES, Secrets, Settings
-from cozy_runtime.author._walker import is_struct, strip
+from cozy_runtime.author._walker import is_struct, strip, walk
 from cozy_runtime.author._weights import WeightsOutput, weights_class
 
 Role = Literal["context", "payload", "wire", "assets", "preflight", "model", "weights", "service"]
@@ -74,21 +77,26 @@ class PreflightSpec:
     argument_order: tuple[str, ...] = ()
 
 
+_COLLECTION_MARKERS = (AssetLimits, *PREPARATIONS)
+
+
 @dataclass(frozen=True, slots=True)
 class AssetsBinding:
     parameter: str
     annotation: object
     kinds: tuple[tuple[type[Asset], AssetBound | None], ...]
-    decoded: bool = False
     counts: tuple[tuple[str, int], ...] = ()
     max_length: int | None = None
-    image_preparation: ImagePreparation | None = None
+    preparations: tuple[Preparation, ...] = ()
+
+    def preparation(self, kind: str) -> Preparation | None:
+        return next((p for p in self.preparations if p.kind == kind), None)
 
     @property
     def wire_type(self) -> object:
         _, declared = strip(self.annotation)
         markers = tuple(
-            marker for marker in declared if not isinstance(marker, (AssetLimits, ImagePreparation))
+            marker for marker in declared if not isinstance(marker, _COLLECTION_MARKERS)
         )
         if self.max_length is not None and not any(
             isinstance(marker, msgspec.Meta) and marker.max_length is not None for marker in markers
@@ -109,40 +117,40 @@ class AssetInputValue(msgspec.Struct, forbid_unknown_fields=True):
     fidelity: Fidelity = "auto"
 
 
+def _marker_code(marker: object) -> str:
+    return "asset_limits" if isinstance(marker, AssetLimits) else "preparation_target"
+
+
 def assets_binding(name: str, annotation: object) -> AssetsBinding:
+    """The one reading of an Assets input, shared by describe and the static reader.
+
+    Elements are the media handles (and `FileAsset`); a media kind without a declared
+    decoded bound takes Runtime's ceiling. Counts and preparations annotate the collection.
+    """
     base, metadata = strip(annotation)
     args = get_args(base)
     item = args[0] if args else ImageAsset | VideoAsset | AudioAsset | FileAsset
     inner, _ = strip(item)
     options = get_args(inner) if get_origin(inner) in (typing.Union, types.UnionType) else (item,)
     kinds: dict[str, tuple[type[Asset], AssetBound | None]] = {}
-    decoded: bool | None = None
     for option in options:
         cls, markers = strip(option)
         for marker in markers:
-            if isinstance(marker, (AssetLimits, ImagePreparation)):
+            if isinstance(marker, _COLLECTION_MARKERS):
                 raise ConformanceError(
                     f"{type(marker).__name__} annotates the Assets collection",
-                    code="asset_limits" if isinstance(marker, AssetLimits) else "image_preparation",
+                    code=_marker_code(marker),
                 )
-        value_type = cls in DECODED_ASSET_TYPES
-        if decoded is not None and value_type != decoded:
-            raise ConformanceError(
-                "Assets cannot mix decoded values and raw handles in one view",
-                code="assets_element",
-            )
-        decoded = value_type
-        if value_type:
-            cls = DECODED_ASSET_TYPES[typing.cast(type, cls)]
         if cls not in (ImageAsset, VideoAsset, AudioAsset, FileAsset):
             raise ConformanceError(
-                "Assets elements must be media values or typed assets", code="assets_element"
+                "Assets elements are ImageAsset, VideoAsset, AudioAsset or FileAsset handles",
+                code="assets_element",
             )
         cls = typing.cast(type[Asset], cls)
         if cls.kind in kinds:
             raise ConformanceError("Assets repeats a media kind", code="assets_element")
         bound = next((marker for marker in markers if isinstance(marker, AssetBound)), None)
-        if value_type:
+        if cls.kind in MEDIA_KINDS:
             if bound is None:
                 bound = AssetBound(max_decoded_bytes=DEFAULT_DECODE_LIMITS.max_decoded_bytes)
             elif bound.max_decoded_bytes is None:
@@ -175,22 +183,35 @@ def assets_binding(name: str, annotation: object) -> AssetsBinding:
         for marker in metadata
     ):
         raise ConformanceError("Assets minimum exceeds its total limit", code="asset_limits")
-    preparations = [marker for marker in metadata if isinstance(marker, ImagePreparation)]
-    if preparations and (not decoded or "image" not in kinds):
-        raise ConformanceError(
-            "ImagePreparation requires decoded image Assets", code="image_preparation"
-        )
-    if preparations and any(marker != preparations[0] for marker in preparations[1:]):
-        raise ConformanceError("conflicting ImagePreparation markers", code="image_preparation")
+    preparations: dict[str, Preparation] = {}
+    for marker in metadata:
+        if not isinstance(marker, PREPARATIONS):
+            continue
+        if marker.kind not in kinds:
+            raise ConformanceError(
+                f"{type(marker).__name__} annotates Assets without {marker.kind} inputs",
+                code="preparation_target",
+            )
+        if preparations.setdefault(marker.kind, marker) != marker:
+            raise ConformanceError(
+                f"conflicting {type(marker).__name__} markers", code="preparation_target"
+            )
     return AssetsBinding(
         name,
         annotation,
         tuple(kinds[key] for key in sorted(kinds)),
-        bool(decoded),
         tuple(sorted(counts.items())),
         max_length,
-        preparations[0] if preparations else None,
+        tuple(preparations[key] for key in sorted(preparations)),
     )
+
+
+def media_kinds(payload_type: object, assets: AssetsBinding | None = None) -> frozenset[str]:
+    """The media handle kinds a signature names. Naming one grants `media_decode`."""
+    kinds = {kind for node in walk(payload_type) for kind in asset_kinds(node.annotation)}
+    if assets is not None:
+        kinds |= {cls.kind for cls, _bound in assets.kinds}
+    return frozenset(kinds & MEDIA_KINDS)
 
 
 @dataclass(frozen=True, slots=True)
@@ -338,8 +359,8 @@ def _classify(name: str, annotation: object, where: str) -> Param:
         return Param(name, "weights", layout)
     origin = get_origin(base)
     if base is Assets or origin is Assets:
-        binding = assets_binding(name, annotation)
-        return Param(name, "assets", annotation, "media_decode" if binding.decoded else None)
+        assets_binding(name, annotation)
+        return Param(name, "assets", annotation)
     for capability, service in _PARAMETERIZED.items():
         if base is service or origin is service:
             args = get_args(base)
@@ -427,12 +448,10 @@ def analyze(
         base, markers = strip(annotation)
         if not (base is Assets or get_origin(base) is Assets):
             for marker in markers:
-                if isinstance(marker, (AssetLimits, ImagePreparation)):
+                if isinstance(marker, _COLLECTION_MARKERS):
                     raise ConformanceError(
-                        f"{type(marker).__name__} annotates an Assets input",
-                        code="asset_limits"
-                        if isinstance(marker, AssetLimits)
-                        else "image_preparation",
+                        f"{type(marker).__name__} annotates an Assets input or a media field",
+                        code=_marker_code(marker),
                     )
         if base is Assets or get_origin(base) is Assets:
             if parameter.default is not parameter.empty:
@@ -442,14 +461,7 @@ def analyze(
                     "invocable Assets must be keyword-only", code="invocable_signature"
                 )
             binding = assets_binding(parameter.name, annotation)
-            params.append(
-                Param(
-                    parameter.name,
-                    "assets",
-                    annotation,
-                    "media_decode" if binding.decoded else None,
-                )
-            )
+            params.append(Param(parameter.name, "assets", annotation))
             if invocable:
                 wire_fields.append((parameter.name, binding.wire_type))
             continue
@@ -537,6 +549,11 @@ def analyze(
             payload_type = assets_payload(
                 typing.cast(type[msgspec.Struct], payload_type), binding, fn.__name__, fn.__module__
             )
+    assets_param = assets_params[0] if assets_params else None
+    media = media_kinds(
+        payload_type,
+        assets_binding(assets_param.name, assets_param.annotation) if assets_param else None,
+    )
     contexts = [p for p in params if p.role == "context"]
     if len(contexts) > 1:
         raise ConformanceError(f"{where}: Context is injected at most once", code="context_arity")
@@ -578,7 +595,8 @@ def analyze(
         payload_type=payload_type,
         result_type=strip(result)[0],
         capabilities=frozenset(p.capability for p in params if p.capability)
-        | ({"weights"} if weights_outputs else set()),
+        | ({"weights"} if weights_outputs else set())
+        | ({"media_decode"} if media else set()),
         publishes=publishes,
         emits_media=emits_media,
         weights_outputs=weights_outputs,
@@ -674,7 +692,7 @@ def _wire_type(annotation: object, seen: frozenset[type] = frozenset()) -> None:
 
 #: Attribute names that read asset BYTES. A preflight that names one is refused statically —
 #: the runtime refusal in `Asset.read_bytes` is the structural backstop, not the only gate.
-BYTE_ACCESS = frozenset({"read_bytes", "open", "tobytes", "read"})
+BYTE_ACCESS = frozenset({"read_bytes", "open", "tobytes", "read", "stream", "probe"})
 
 
 def analyze_preflight(

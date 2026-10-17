@@ -57,10 +57,10 @@ from cozy_runtime.author._context import (
 from cozy_runtime.author._data import data_values
 from cozy_runtime.author._decode import (
     DEFAULT_DECODE_LIMITS,
+    AudioProbe,
     DecodedAudio,
     DecodedAudioChunk,
     DecodedAudioFormat,
-    DecodedImage,
     DecodedMediaEvent,
     DecodedMediaHeader,
     DecodedMediaStream,
@@ -69,9 +69,9 @@ from cozy_runtime.author._decode import (
     DecodedVideoFrame,
     DecodeLimits,
     DecoderUnavailable,
+    ImageProbe,
     MediaDecodeError,
-    MediaDecoder,
-    Mixed,
+    VideoProbe,
 )
 from cozy_runtime.author._defaults import Clamp, Overlay, Recipe, decode_request
 from cozy_runtime.author._demand import RequestFeatures
@@ -119,11 +119,13 @@ from cozy_runtime.author._loader import (
 from cozy_runtime.author._markers import (
     AssetBound,
     AssetLimits,
+    AudioPreparation,
     Bound,
     ImagePreparation,
     ModelDefault,
     Preflight,
     Shape,
+    VideoPreparation,
 )
 from cozy_runtime.author._memo import MemoDistribution, Memoize, MemoResource
 from cozy_runtime.author._model import (
@@ -192,6 +194,8 @@ __all__ = [
     "AttentionLayout",
     "AttentionProducer",
     "AudioAsset",
+    "AudioPreparation",
+    "AudioProbe",
     "AuthorError",
     "Backend",
     "Bound",
@@ -212,7 +216,6 @@ __all__ = [
     "DecodedAudio",
     "DecodedAudioChunk",
     "DecodedAudioFormat",
-    "DecodedImage",
     "DecodedMediaEvent",
     "DecodedMediaHeader",
     "DecodedMediaStream",
@@ -233,16 +236,15 @@ __all__ = [
     "ImageAsset",
     "ImageFrame",
     "ImagePreparation",
+    "ImageProbe",
     "InvalidRequest",
     "Invocation",
     "InvocationResult",
     "Loader",
     "MediaDecodeError",
-    "MediaDecoder",
     "MemoDistribution",
     "MemoResource",
     "Memoize",
-    "Mixed",
     "Model",
     "ModelArtifact",
     "ModelAssets",
@@ -284,6 +286,8 @@ __all__ = [
     "UnsupportedInput",
     "VideoAsset",
     "VideoJoin",
+    "VideoPreparation",
+    "VideoProbe",
     "Weights",
     "WeightsOutput",
     "WeightsReceipt",

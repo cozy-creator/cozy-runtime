@@ -65,7 +65,7 @@ and numerical component checks. CI also checks builds, types, lint and architect
 Tests requiring a GPU or host facilities name those requirements; CPU/descriptor proofs do
 not establish GPU inference or provider qualification.
 
-For labelled model-ready input media, see [Ordered media inputs](docs/assets.md).
+For media inputs (handles, reads, preparation), see [Media inputs](docs/assets.md).
 
 ## Layout
 
@@ -467,19 +467,19 @@ policy input, not duplicated per tensor. A non-`ok` verdict is the typed prepare
 `model_fit_refused`. Every PlacementSet writer fills `Slot.components` from the private construction,
 never from the header.
 
-A package whose signature declares `MediaDecoder` must install `cozy-runtime[media]`;
-`--conformance describe` refuses the release if PyAV is absent (the static reader has no
-environment to check). The package interface publishes the hard per-field
-codec ceilings and the attempt-wide retained decoded-value ceiling.
+A package whose signature names a video or audio input must install
+`cozy-runtime[media]`; `--conformance describe` refuses the release if PyAV is absent (the
+static reader has no environment to check). Media inputs are handles read through the
+attempt's one budget; see [Media inputs](docs/assets.md).
 
-Decoded image inputs can opt into preparation through their argument annotation:
+Image inputs can opt into preparation on a field or an `Assets` argument:
 
 ```python
 from typing import Annotated
-from cozy_runtime.author import AssetLimits, Assets, Image, ImagePreparation
+from cozy_runtime.author import AssetLimits, Assets, ImageAsset, ImagePreparation
 
 Pictures = Annotated[
-    Assets[Image],
+    Assets[ImageAsset],
     AssetLimits(images=3),
     ImagePreparation(max_edge=4096, max_pixels=16_777_216),
 ]

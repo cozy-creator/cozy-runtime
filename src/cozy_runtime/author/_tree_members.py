@@ -115,5 +115,6 @@ def project[A: Asset](tree: Tree, path: str, asset_type: type[A], *, bound: Asse
         input_id=path,
         read_guard=guard,
         source_state=actual,
+        media=broker.media,
     )
     return asset

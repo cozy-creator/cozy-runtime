@@ -8,7 +8,7 @@ than re-deriving annotation semantics — one answer to "what does this type tre
 Only the wire grammar Creator consumes is emitted. Python names, default factories and
 input decoded-memory ceilings stay with the installed signature that enforces them.
 Result schemas preserve explicit decoded bounds so generated callers can consume
-returned media. Input descriptors keep their existing identity.
+returned media. A field's declared preparation rides `asset_bound.prepare`.
 """
 
 from __future__ import annotations
@@ -22,7 +22,15 @@ from typing import Literal, get_args, get_origin
 import msgspec
 
 from cozy_runtime.author._artifacts import ModelArtifact
-from cozy_runtime.author._assets import Asset, AudioAsset, FileAsset, ImageAsset, Tree, VideoAsset
+from cozy_runtime.author._assets import (
+    Asset,
+    AudioAsset,
+    FileAsset,
+    ImageAsset,
+    Tree,
+    VideoAsset,
+    field_preparation,
+)
 from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._markers import AssetBound, _ModelDefaultMarker
 from cozy_runtime.author._walker import is_struct, strip, unwrap_optional
@@ -307,17 +315,20 @@ def _field(
     constraints = _constraints(markers)
     if constraints:
         doc["constraints"] = constraints
+    bound: dict[str, Json] = {}
     for marker in markers:
         if isinstance(marker, AssetBound):
-            bound: dict[str, Json] = {}
             if marker.max_bytes is not None:
                 bound["max_bytes"] = marker.max_bytes
             if decoded_bounds and marker.max_decoded_bytes is not None:
                 bound["max_decoded_bytes"] = marker.max_decoded_bytes
             if marker.media_types:
                 bound["media_types"] = list(marker.media_types)
-            if bound:
-                doc["asset_bound"] = bound
+    preparation = field_preparation(base, markers)
+    if preparation is not None:
+        bound["prepare"] = dict(preparation.descriptor())
+    if bound:
+        doc["asset_bound"] = bound
     return doc
 
 

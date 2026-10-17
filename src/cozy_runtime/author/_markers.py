@@ -9,9 +9,11 @@ below exist only for facts derivation and measurement cannot know.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Annotated, TypeAlias, TypeVar
+from fractions import Fraction
+from typing import Annotated, Literal, TypeAlias, TypeVar
 
 from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._media import KIND_MEDIA
@@ -152,11 +154,13 @@ class AssetLimits:
 
 
 IMAGE_PREPARATION_PROFILE = "image-fit/1"
+VIDEO_PREPARATION_PROFILE = "video-trim/1"
+AUDIO_PREPARATION_PROFILE = "audio-trim/1"
 
 
 @dataclass(frozen=True, slots=True)
 class ImagePreparation:
-    """Opt-in useful image geometry for an Assets argument, preserving aspect ratio.
+    """Opt-in useful image geometry for an image field or Assets, preserving aspect ratio.
 
     These caps request preparation, not rejection of a larger source image. Source
     resource ceilings remain separate. Fidelity is interpreted by the package.
@@ -164,6 +168,8 @@ class ImagePreparation:
 
     max_edge: int | None = None
     max_pixels: int | None = None
+
+    kind = "image"
 
     def __post_init__(self) -> None:
         if self.max_edge is None and self.max_pixels is None:
@@ -174,7 +180,7 @@ class ImagePreparation:
                     "image preparation caps must be positive integers", code="image_preparation"
                 )
 
-    def descriptor(self) -> dict[str, str | int]:
+    def descriptor(self) -> dict[str, str | int | float]:
         return {
             "profile": IMAGE_PREPARATION_PROFILE,
             **{
@@ -183,6 +189,100 @@ class ImagePreparation:
                 if value is not None
             },
         }
+
+
+Excess = Literal["refuse", "truncate"]
+
+
+@dataclass(frozen=True, slots=True)
+class _Trim:
+    min_seconds: int | float | None = None
+    max_seconds: int | float | None = None
+    excess: Excess = "refuse"
+
+    kind = ""
+    profile = ""
+
+    def __post_init__(self) -> None:
+        name = type(self).__name__
+        if self.min_seconds is None and self.max_seconds is None:
+            raise ConformanceError(f"{name} needs min_seconds or max_seconds", code="preparation")
+        for value in (self.min_seconds, self.max_seconds):
+            if value is not None and (
+                type(value) not in (int, float) or not math.isfinite(value) or value <= 0
+            ):
+                raise ConformanceError(
+                    f"{name} seconds must be positive finite numbers", code="preparation"
+                )
+        if (
+            self.min_seconds is not None
+            and self.max_seconds is not None
+            and self.min_seconds > self.max_seconds
+        ):
+            raise ConformanceError(f"{name} min_seconds exceeds max_seconds", code="preparation")
+        if self.excess not in ("refuse", "truncate"):
+            raise ConformanceError(f"{name} excess is refuse or truncate", code="preparation")
+        if self.excess == "truncate" and self.max_seconds is None:
+            raise ConformanceError(f"{name} truncate needs max_seconds", code="preparation")
+
+    @property
+    def minimum(self) -> Fraction | None:
+        return None if self.min_seconds is None else seconds(self.min_seconds)
+
+    @property
+    def maximum(self) -> Fraction | None:
+        return None if self.max_seconds is None else seconds(self.max_seconds)
+
+    def descriptor(self) -> dict[str, str | int | float]:
+        return {
+            "profile": self.profile,
+            "excess": self.excess,
+            **{
+                key: value
+                for key, value in (
+                    ("min_seconds", self.min_seconds),
+                    ("max_seconds", self.max_seconds),
+                )
+                if value is not None
+            },
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class VideoPreparation(_Trim):
+    """Declared duration policy for a video field or the videos of an Assets input.
+
+    Shorter than `min_seconds`, or longer than `max_seconds` with `excess="refuse"`,
+    refuses the request before the handler runs. `excess="truncate"` ends every read
+    and stream of that input at `max_seconds` and reports an `adjusted` row.
+    """
+
+    kind = "video"
+    profile = VIDEO_PREPARATION_PROFILE
+
+
+@dataclass(frozen=True, slots=True)
+class AudioPreparation(_Trim):
+    """The `VideoPreparation` duration policy for audio inputs."""
+
+    kind = "audio"
+    profile = AUDIO_PREPARATION_PROFILE
+
+
+Preparation = ImagePreparation | VideoPreparation | AudioPreparation
+PREPARATIONS = (ImagePreparation, VideoPreparation, AudioPreparation)
+
+
+def seconds(value: object) -> Fraction:
+    """An exact, positive duration from an int, float or Fraction number of seconds."""
+    if isinstance(value, bool) or not isinstance(value, (int, float, Fraction)):
+        raise ValueError("seconds must be an int, float or Fraction")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("seconds must be finite")
+    exact = value if isinstance(value, Fraction) else Fraction(str(value))
+    if exact <= 0:
+        raise ValueError("seconds must be positive")
+    return exact
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,7 +334,7 @@ class AssetBound:
         if self.max_decoded_bytes is not None and kind not in {"image", "video", "audio"}:
             raise ConformanceError(
                 f"AssetBound(max_decoded_bytes=) cannot annotate a {kind!r} asset: only "
-                "ImageAsset, VideoAsset and AudioAsset have a MediaDecoder",
+                "ImageAsset, VideoAsset and AudioAsset are read as media",
                 fields=["max_decoded_bytes"],
             )
         allowed = KIND_MEDIA.get(kind, ())

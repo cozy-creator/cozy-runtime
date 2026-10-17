@@ -92,6 +92,7 @@ def test_rich_fixture_spells_the_whole_vocabulary() -> None:
         '"tag_field": "type"',
         '"asset_bound"',
         '"media_types": ["audio/wav"]',
+        '"profile": "audio-trim/1"',
         '"wire": "omissible"',
         '"constraints": {"ge": 256, "le": 2048}',
         '"literal": [30, 40, 50]',

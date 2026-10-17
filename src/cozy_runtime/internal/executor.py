@@ -123,8 +123,8 @@ from cozy_runtime.author._invoke import (
 )
 from cozy_runtime.author._model import WARNINGS, Model, component_use
 from cozy_runtime.author._observations import Attribution
+from cozy_runtime.author._services import AdjustmentRow, ProgressFrame
 from cozy_runtime.author._services import Attempt as AuthorAttempt
-from cozy_runtime.author._services import ProgressFrame
 from cozy_runtime.author._split import install as install_pieces
 from cozy_runtime.author._weights import Weights as RawWeights
 from cozy_runtime.author.kernels import _SETS as KERNEL_SETS
@@ -434,6 +434,18 @@ def _deadline(seconds: float | None) -> float:
     same attempt (cr-009).
     """
     return math.inf if seconds is None else time.monotonic() + seconds
+
+
+def adjustment_row(row: AdjustmentRow) -> dict[str, str]:
+    """The reply's adjustment row: kind and source stay fields; values cross as text."""
+    return {
+        "field": row.field,
+        "kind": row.kind,
+        "requested": "" if row.requested is None else str(row.requested),
+        "applied": "" if row.applied is None else str(row.applied),
+        "reason": row.reason[:256],
+        "source": row.source,
+    }
 
 
 def _granted_inputs(command: Invoke) -> dict[str, GrantedInput]:
@@ -3351,10 +3363,7 @@ class Executor:
         return {
             "ok": True,
             "features": dict(prepared.features.values),
-            "adjustments": [
-                {"field": row.field, "requested": str(row.requested), "applied": str(row.applied)}
-                for row in prepared.overlay.rows
-            ],
+            "adjustments": [adjustment_row(row) for row in prepared.overlay.rows],
             **prepared.digests(),
         }
 
@@ -3699,13 +3708,7 @@ class Executor:
             "result_ref": result_ref,
             "result_schema_digest": self._result_schema_digest(surface),
             "adjustments": [
-                {
-                    "field": row.field,
-                    "requested": str(row.requested),
-                    "applied": str(row.applied),
-                    "reason": f"{row.kind}: {row.reason}"[:256],
-                }
-                for row in (envelope.adjustments if envelope else ())
+                adjustment_row(row) for row in (envelope.adjustments if envelope else ())
             ],
             "ignored": list(record.ignored),
             "oversize_result_bytes": oversize,

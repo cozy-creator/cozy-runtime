@@ -17,14 +17,32 @@ import stat
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from copy import copy
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
-from typing import Any, ClassVar, Final, Literal, Self, cast, get_args, overload
+from typing import TYPE_CHECKING, Any, ClassVar, Final, Literal, Self, get_args, overload
 
 from PIL.Image import Image as Image
 
-from cozy_runtime.author._errors import CapabilityError, PreflightViolation, RuntimeFailure
-from cozy_runtime.author._markers import AssetBound, ImagePreparation
+from cozy_runtime.author._errors import (
+    CapabilityError,
+    ConformanceError,
+    PreflightViolation,
+    RuntimeFailure,
+)
+from cozy_runtime.author._markers import PREPARATIONS, AssetBound, Preparation
 from cozy_runtime.author._walker import strip, unwrap_optional
+
+if TYPE_CHECKING:
+    from cozy_runtime.author._decode import (
+        AudioProbe,
+        DecodedAudio,
+        DecodedMediaStream,
+        DecodedVideo,
+        ImageProbe,
+        MediaReads,
+        Probe,
+        VideoProbe,
+    )
 
 _UNBOUND: Final = ""
 Fidelity = Literal["auto", "low", "medium", "high"]
@@ -51,15 +69,18 @@ class Asset:
 
     __slots__ = (
         "_attempt",
+        "_end",
         "_fidelity",
         "_file_state",
         "_grant_token",
-        "_image_preparation",
         "_input_id",
         "_label",
         "_local",
         "_max_decoded_bytes",
+        "_media",
         "_position",
+        "_preparation",
+        "_probed",
         "_read_guard",
         "digest",
         "media_type",
@@ -86,7 +107,10 @@ class Asset:
         self._local = local
         self._attempt = attempt
         self._input_id = ""
-        self._image_preparation: ImagePreparation | None = None
+        self._preparation: Preparation | None = None
+        self._end: Fraction | None = None
+        self._probed: Probe | None = None
+        self._media: MediaReads | None = None
         self._fidelity: Fidelity = "auto"
         self._label = ""
         self._position = -1
@@ -164,6 +188,23 @@ class Asset:
         finally:
             self._check_file()
 
+    def _reads(self) -> MediaReads:
+        """The attempt reader this hydrated handle reads through."""
+        if self._local is None:
+            raise PreflightViolation(
+                f"asset {self.ref!r} has no bytes here: preflight and describe read counts, "
+                "kinds and typed metadata only — media is read after hydration",
+                code="asset_bytes_unavailable",
+            )
+        if self._media is None:
+            raise CapabilityError(
+                f"asset {self.ref!r} is not a granted media input of a running attempt; an "
+                "output becomes readable when it is granted as an input",
+                code="media_unreadable",
+                fields=[self._input_id] if self._input_id else (),
+            )
+        return self._media
+
     def _check_file(self) -> None:
         if self._file_state is not None and (
             self._local is None or file_state(self._local) != self._file_state
@@ -186,15 +227,71 @@ class Asset:
 
 
 class ImageAsset(Asset):
+    """An image input. `read()` decodes it once per call, charging the attempt budget."""
+
     kind: ClassVar[str] = "image"
+
+    def read(self) -> Image:
+        """Display-oriented RGB pixels with the field's `ImagePreparation` applied."""
+        return self._reads().image(self)
+
+    def probe(self) -> ImageProbe:
+        """Header geometry: `width`/`height` are what `read()` returns. No decode."""
+        return self._reads().probe(self)  # type: ignore[return-value]
 
 
 class AudioAsset(Asset):
+    """An audio input, read at its native rate. Its preparation may end it early."""
+
     kind: ClassVar[str] = "audio"
+
+    def probe(self) -> AudioProbe:
+        """Header facts; `duration` is the prepared length, `source_duration` the file's."""
+        return self._reads().probe(self)  # type: ignore[return-value]
+
+    def read(self, *, end: float | Fraction | None = None) -> DecodedAudio:
+        """PCM from the first sample to `end` seconds (exact sample), retained in full."""
+        return self._reads().audio(self, end=end)
+
+    def stream(self, *, end: float | Fraction | None = None) -> DecodedMediaStream:
+        """The same PCM as a context-managed stream, bounded per chunk."""
+        return self._reads().stream(self, end=end, audio=True, pictures=True)
 
 
 class VideoAsset(Asset):
+    """A video input. Reads never resize pixels; its preparation may end it early."""
+
     kind: ClassVar[str] = "video"
+
+    def probe(self) -> VideoProbe:
+        """Display-oriented header facts; `duration` is the prepared length. No decode."""
+        return self._reads().probe(self)  # type: ignore[return-value]
+
+    def read(
+        self,
+        *,
+        end: float | Fraction | None = None,
+        fps: float | Fraction | None = None,
+        audio: bool = True,
+    ) -> DecodedVideo:
+        """Every frame starting before `end` and the soundtrack cut at `end`.
+
+        `end` counts seconds from the first frame; the last frame's duration is clipped to
+        it. `fps` maps the frames onto a constant clock starting at 0: each frame shows until
+        the next starts, rounded to the nearest slot, and a repeated frame is the same bytes.
+        """
+        return self._reads().video(self, end=end, fps=fps, audio=audio)
+
+    def stream(
+        self,
+        *,
+        end: float | Fraction | None = None,
+        audio: bool = True,
+        pictures: bool = True,
+    ) -> DecodedMediaStream:
+        """Time-ordered frames and PCM bounded by `end`; `pictures=False` reads only the
+        soundtrack, without decoding a picture."""
+        return self._reads().stream(self, end=end, audio=audio, pictures=pictures)
 
 
 class FileAsset(Asset):
@@ -216,16 +313,14 @@ class AssetInfo:
 
 
 class Assets[T](Sequence[T]):
-    """Ordered granted inputs, accessed by position or an optional unique label.
+    """Ordered granted input handles, accessed by position or an optional unique label.
 
-    ``Assets[Image]`` yields real PIL images; ``Assets[Mixed]`` yields decoded image,
-    video or audio values. Decode is lazy and uses the attempt's shared decoder.
-    ``info(key)`` exposes metadata without decoding, including during preflight.
-    Explicit ``Assets[ImageAsset]`` and other handle types remain a raw input view.
-    Construction holds references for forwarding; value access starts at injection.
+    ``Assets[ImageAsset | VideoAsset | AudioAsset]`` yields the handles themselves; each
+    reads through the attempt's one media reader (`read`, `stream`, `probe`).
+    ``info(key)`` exposes metadata without reading, including during preflight.
     """
 
-    __slots__ = ("_cache", "_decoded", "_guard", "_items", "_project")
+    __slots__ = ("_items",)
 
     def __init__(self, values: Iterable[Asset] = ()) -> None:
         items: list[Asset] = []
@@ -237,21 +332,10 @@ class Assets[T](Sequence[T]):
             item._position = position
             items.append(item)
         self._items = tuple(items)
-        self._project: Callable[[Asset], object] | None = None
-        self._decoded = True
-        self._cache: dict[int, object] = {}
-        self._guard: Callable[[], None] | None = None
         self._check_labels()
 
     @classmethod
-    def _from_bound(
-        cls,
-        values: Iterable[Asset],
-        *,
-        decoded: bool = False,
-        project: Callable[[Asset], object] | None = None,
-        guard: Callable[[], None] | None = None,
-    ) -> Assets[T]:
+    def _from_bound(cls, values: Iterable[Asset]) -> Assets[T]:
         """Retain exact slot IDs/order after binding; no byte acquisition or decode."""
         result = cls()
         items: list[Asset] = []
@@ -264,9 +348,6 @@ class Assets[T](Sequence[T]):
             seen.add(value.id)
             items.append(copy(value))
         result._items = tuple(items)
-        result._project = project
-        result._decoded = decoded
-        result._guard = guard
         result._check_labels()
         return result
 
@@ -302,19 +383,7 @@ class Assets[T](Sequence[T]):
     def __getitem__(self, key: int | str | slice) -> T | Assets[T]:
         if isinstance(key, slice):
             return self.select(*range(len(self))[key])
-        index = self._index(key)
-        if not self._decoded:
-            return cast(T, self._items[index])
-        if self._guard is not None:
-            self._guard()
-        if self._project is None:
-            raise PreflightViolation(
-                "Assets values are available after hydration; use info(key) for metadata",
-                code="asset_bytes_unavailable",
-            )
-        if index not in self._cache:
-            self._cache[index] = self._project(self._items[index])
-        return cast(T, self._cache[index])
+        return self._items[self._index(key)]  # type: ignore[return-value]
 
     @overload
     def get(self, key: int | str, default: None = None) -> T | None: ...
@@ -345,11 +414,7 @@ class Assets[T](Sequence[T]):
 
     def select(self, *keys: int | str) -> Assets[T]:
         """Select/reorder occurrences without decoding or changing their granted bytes."""
-        result: Assets[T] = Assets(self._items[self._index(key)] for key in keys)
-        result._decoded = self._decoded
-        result._project = self._project
-        result._guard = self._guard
-        return result
+        return Assets(self._items[self._index(key)] for key in keys)
 
     def by_id(self, input_id: str) -> T:
         for index, item in enumerate(self._items):
@@ -359,6 +424,27 @@ class Assets[T](Sequence[T]):
 
     def by_label(self, label: str) -> T:
         return self[label]
+
+
+MEDIA_KINDS = frozenset({"image", "video", "audio"})
+
+
+def field_preparation(annotation: object, markers: Sequence[object]) -> Preparation | None:
+    """The one preparation a field's markers declare, checked against the field's kinds."""
+    found = [marker for marker in markers if isinstance(marker, PREPARATIONS)]
+    if not found:
+        return None
+    if len(found) > 1:
+        raise ConformanceError(
+            "a field declares at most one preparation", code="preparation_target"
+        )
+    preparation = found[0]
+    if preparation.kind not in asset_kinds(annotation):
+        raise ConformanceError(
+            f"{type(preparation).__name__} annotates a field with no {preparation.kind} asset",
+            code="preparation_target",
+        )
+    return preparation
 
 
 def asset_kinds(annotation: object) -> frozenset[str]:
@@ -528,6 +614,7 @@ def bind(
     order: int = 0,
     read_guard: Callable[[], None] | None = None,
     source_state: FileState | None = None,
+    media: MediaReads | None = None,
 ) -> None:
     """Hydrate an asset in place. Runtime-only: author code has no path into this.
 
@@ -551,6 +638,8 @@ def bind(
     asset.size_bytes = length
     asset.digest = digest
     asset._max_decoded_bytes = max_decoded_bytes
+    asset._media = media
+    asset._probed = None
 
 
 def bind_tree(tree: Tree, *, root: Path, digest: str, attempt: str) -> None:

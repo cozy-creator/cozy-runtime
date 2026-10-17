@@ -14,7 +14,13 @@ from cozy_runtime.author._assets import Assets
 from cozy_runtime.author._describe import assert_declaration_shape
 from cozy_runtime.author._model_defaults import check_model_arguments
 from cozy_runtime.author._services import SERVICES, UNGRANTABLE
-from cozy_runtime.author._signature import _classify, _wire_default, _wire_type, assets_binding
+from cozy_runtime.author._signature import (
+    _classify,
+    _wire_default,
+    _wire_type,
+    assets_binding,
+    media_kinds,
+)
 from cozy_runtime.author._walker import is_struct, strip
 from cozy_runtime.internal.canonical import Json
 
@@ -101,8 +107,6 @@ def build(reader: Reader, registration: Registration) -> dict[str, Json]:
                 reader.refuse(module, arg, "one Assets parameter without a default is supported")
             assets = assets_binding(arg.arg, translated)
             fields.append((arg.arg, assets.wire_type))
-            if assets.decoded:
-                capabilities.append("media_decode")
             continue
         _wire_type(translated)
         if arg.arg in defaults:
@@ -153,6 +157,8 @@ def build(reader: Reader, registration: Registration) -> dict[str, Json]:
     )
     if registration.weights and "weights" not in capabilities:
         capabilities.append("weights")
+    if media_kinds(payload, assets):
+        capabilities.append("media_decode")
     slots = [str(slot["path"]).rsplit(".", 1)[-1] for slot in models]
     check_model_arguments(registration.model_defaults, slots)
     check_model_arguments(registration.model_components, slots, what="components")

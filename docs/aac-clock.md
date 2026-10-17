@@ -26,7 +26,7 @@ caller to interleave earlier. Arbitrarily long audio-last streaming is not promi
 The frozen H3 `df0d602` caller already queues at most eight video frames per slice,
 then yields audio through that slice's frame clock, plus its final audio remainder.
 
-The CPU regression uses real Outputs and MediaDecoder services at 32 and 48 kHz,
+The CPU regression uses real Outputs and video handle reads at 32 and 48 kHz,
 with 5- and 15-second timelines plus H3's aligned frame/audio geometries. It checks
 interleaved and late audio, exact decoded sample counts and timestamps, fragmented
 writes before EOF, and sample correlation to catch a false fix that cuts the tail

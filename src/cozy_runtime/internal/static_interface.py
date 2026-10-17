@@ -71,7 +71,13 @@ from cozy_runtime.author._script_metadata import (
     main_definition,
 )
 from cozy_runtime.author._services import SERVICES
-from cozy_runtime.author._signature import AssetsBinding, _classify, assets_binding, assets_payload
+from cozy_runtime.author._signature import (
+    AssetsBinding,
+    _classify,
+    assets_binding,
+    assets_payload,
+    media_kinds,
+)
 from cozy_runtime.author._walker import is_struct
 from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.package_interface import ModelSpec
@@ -219,10 +225,6 @@ _AUTHOR_TYPES = (
     "FileAsset",
     "Tree",
     "ModelArtifact",
-    "Image",
-    "DecodedVideo",
-    "DecodedAudio",
-    "Mixed",
     "Context",
     "Assets",
     "Settings",
@@ -235,6 +237,8 @@ _AUTHOR_VALUES = (
     "AssetBound",
     "AssetLimits",
     "ImagePreparation",
+    "VideoPreparation",
+    "AudioPreparation",
     "WeightsOutput",
     "Bound",
     "Shape",
@@ -1762,8 +1766,6 @@ def _callable(reader: Reader, registration: Registration) -> dict[str, Json]:
                 if assets is not None:
                     reader.refuse(module, arg, "a second Assets parameter", "static_unsupported")
                 assets = assets_binding(arg.arg, reader.translate(module, arg.annotation))
-                if assets.decoded:
-                    capabilities.append("media_decode")
                 continue
 
         if (
@@ -1810,6 +1812,8 @@ def _callable(reader: Reader, registration: Registration) -> dict[str, Json]:
     )
     if registration.weights:
         capabilities.append("weights")
+    if media_kinds(payload, assets):
+        capabilities.append("media_decode")
     doc["invocable"] = invocable_interface.serving_metadata(
         payload,
         result,
@@ -1997,6 +2001,11 @@ def _script_doc(reader: Reader, app: Assigned) -> dict[str, Json]:
         module=module.name,
         export="main",
         context="_script_context",
-        capabilities=sorted(services | {"telemetry"} | ({"weights"} if weights else set())),
+        capabilities=sorted(
+            services
+            | {"telemetry"}
+            | ({"weights"} if weights else set())
+            | ({"media_decode"} if media_kinds(payload) else set())
+        ),
     )
     return doc

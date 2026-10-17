@@ -45,8 +45,7 @@ def _source(tmp_path: Path) -> tuple[Attempt, VideoAsset]:
 def test_leaving_a_stream_after_its_first_frame_saves_that_frame(tmp_path: Path) -> None:
     attempt, source = _source(tmp_path)
     out = fakes.fake_outputs(attempt)
-    video = fakes.fake_input(source, attempt=attempt.request_id, max_decoded_bytes=8 << 20)
-    decoder = fakes.fake_media_decoder(attempt)
+    video = fakes.fake_input(source, attempt=attempt, max_decoded_bytes=8 << 20)
 
     def first_frame(events: Iterator[DecodedMediaEvent]) -> Iterator[DecodedMediaEvent]:
         for event in events:
@@ -54,11 +53,11 @@ def test_leaving_a_stream_after_its_first_frame_saves_that_frame(tmp_path: Path)
             if isinstance(event, DecodedVideoFrame):
                 break
 
-    with decoder.stream_video(video) as stream:
+    with video.stream() as stream:
         saved = out.save_video_stream(first_frame(stream))
     assert (saved.frame_count, saved.frame_rate, saved.video_codec) == (1, 24, "h264")
-    reinput = fakes.fake_input(saved.video, attempt=attempt.request_id, max_decoded_bytes=8 << 20)
-    decoded = decoder.decode_video(reinput)
+    reinput = fakes.fake_input(saved.video, attempt=attempt, max_decoded_bytes=8 << 20)
+    decoded = reinput.read()
     assert (decoded.width, decoded.height, decoded.frame_count) == (48, 32, 1)
     assert decoded.duration == Fraction(1, 24)
 
@@ -130,12 +129,7 @@ def test_corrupt_video_bytes_are_media_malformed(tmp_path: Path, damage: str) ->
         data[start : start + 2000] = np.random.default_rng(3).bytes(2000)
     path = tmp_path / f"{damage}.mp4"
     path.write_bytes(data)
-    video = fakes.fake_input(
-        VideoAsset(str(path), local=path, size_bytes=len(data)),
-        attempt=attempt.request_id,
-        max_decoded_bytes=8 << 20,
-    )
-    decoder = fakes.fake_media_decoder(attempt)
-    with pytest.raises(MediaDecodeError) as caught, decoder.stream_video(video) as stream:
+    video = fakes.file_input(VideoAsset, path, attempt=attempt, max_decoded_bytes=8 << 20)
+    with pytest.raises(MediaDecodeError) as caught, video.stream() as stream:
         list(stream)
     assert caught.value.code == "media_malformed" and caught.value.fields == ("input",)

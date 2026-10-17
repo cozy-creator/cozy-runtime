@@ -4,7 +4,7 @@ Staged admission (#756) keeps components beside a scope only when that scope's p
 measured at the request's exact cell. H3's cell used to be `-` for every length and reference
 count, so a first 15 s request after 10 s ones could run on a 10 s peak. This drives the real
 `prepare` path over an H3-shaped entrypoint (bounded `duration_s` with a frames table, an
-`Assets[Mixed]` parameter, a preflight) and hands the cells to the real ledger.
+media-handle `Assets` parameter, a preflight) and hands the cells to the real ledger.
 """
 
 from __future__ import annotations
@@ -22,11 +22,13 @@ from cozy_runtime.author import (
     App,
     AssetLimits,
     Assets,
+    AudioAsset,
     ConformanceError,
     Context,
-    Mixed,
+    ImageAsset,
     Preflight,
     Shape,
+    VideoAsset,
     describe,
     invocable,
     prepare,
@@ -37,7 +39,10 @@ from cozy_runtime.author._demand import shape_cell
 #: Stands in for H3's `official.frames_for` table (whole seconds onto its frame grid).
 FRAMES = {s: 24 * s + 5 for s in range(5, 16)}
 DurationSeconds = Annotated[int, msgspec.Meta(ge=5, le=15), Shape(frames=FRAMES)]
-References = Annotated[Assets[Mixed], AssetLimits(images=9, videos=3, audio=3, total=12)]
+References = Annotated[
+    Assets[ImageAsset | VideoAsset | AudioAsset],
+    AssetLimits(images=9, videos=3, audio=3, total=12),
+]
 
 
 class TurboInput(msgspec.Struct, forbid_unknown_fields=True):

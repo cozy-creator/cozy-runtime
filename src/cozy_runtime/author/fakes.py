@@ -8,7 +8,8 @@ by construction — there is no parallel behavioral runtime here to maintain.
 
 `fake_input()` closes the loop the other way: a saved OUTPUT asset becomes an input
 handle hydrated through the real `bind`, so one attempt's result feeds the next the way
-the executor feeds it.
+the executor feeds it. `file_input()` does the same for a file on disk, and
+`granted_input()` is the verified grant `invoke_with_fakes(assets=...)` takes for one.
 
 `Settings` and `Secrets` need no fake wrapper: they carry exactly the validated value, so
 `Settings(MyConfig(...))` IS the fake — a wrapper adding nothing is a surface to maintain.
@@ -23,6 +24,7 @@ against with no store and no device.
 
 from __future__ import annotations
 
+import hashlib
 import tempfile
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -31,13 +33,21 @@ from pathlib import Path
 from typing import Any
 
 from cozy_runtime.author._app import Registration
-from cozy_runtime.author._assets import Asset, GrantedInput, bind
+from cozy_runtime.author._assets import Asset, GrantedInput, bind, file_state
 from cozy_runtime.author._context import AdapterRef, Context, Device
-from cozy_runtime.author._decode import DecodeLimits, MediaDecoder
+from cozy_runtime.author._decode import DEFAULT_DECODE_LIMITS
 from cozy_runtime.author._defaults import Clamp, Recipe
 from cozy_runtime.author._errors import CapabilityError
-from cozy_runtime.author._invoke import Invocation, InvocationResult, invoke, prepare
+from cozy_runtime.author._invoke import (
+    Invocation,
+    InvocationResult,
+    invoke,
+    prepare,
+    prepare_duration,
+)
 from cozy_runtime.author._loader import Census, TensorLike, TensorSpec
+from cozy_runtime.author._markers import Preparation
+from cozy_runtime.author._media import SNIFF_BYTES, sniff
 from cozy_runtime.author._model import Model
 from cozy_runtime.author._observations import Observation
 from cozy_runtime.author._services import (
@@ -76,19 +86,19 @@ def fake_attempt(
 def fake_input[AssetT: Asset](
     source: AssetT,
     *,
-    attempt: str,
+    attempt: Attempt | None = None,
     input_id: str = "input",
     order: int = 0,
-    max_decoded_bytes: int = 0,
+    max_decoded_bytes: int = DEFAULT_DECODE_LIMITS.max_decoded_bytes,
+    preparation: Preparation | None = None,
 ) -> AssetT:
     """`source`'s bytes as a fresh INPUT handle hydrated into `attempt`.
 
     The round trip a package author needs and cannot otherwise take: `out.save_*` returns
-    an OUTPUT asset, and feeding it back to a handler — or to `MediaDecoder` — is what the
-    executor does when one attempt's result becomes the next attempt's granted input.
-    Hydration runs through the same `bind` the executor's `_hydrate` runs, with the same
-    facts the worker established before acceptance, so a fake input cannot carry a
-    provenance the real one would not have.
+    an OUTPUT asset, and reading it back is what the executor allows once one attempt's
+    result becomes the next attempt's granted input. Hydration runs through the same
+    `bind` and duration preparation the executor's `_hydrate` runs, so a fake input reads
+    through `attempt.media` exactly as a real one does.
     """
     if source._local is None:
         raise CapabilityError(
@@ -104,19 +114,74 @@ def fake_input[AssetT: Asset](
         length=source.size_bytes,
         order=order,
     )
-    bound = type(source)(source.ref)
+    return _hydrated(type(source)(source.ref), granted, attempt, max_decoded_bytes, preparation)
+
+
+def granted_input(
+    path: Path, *, input_id: str, order: int = 0, media_type: str | None = None
+) -> GrantedInput:
+    """A real file as the verified grant the worker hands an attempt: its sha256 identity,
+    sniffed media type, length and the file-state guard that refuses a changed source.
+    Its `digest` is the request's reference string for the field it fills."""
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        head = source.read(SNIFF_BYTES)
+        digest.update(head)
+        while chunk := source.read(1 << 20):
+            digest.update(chunk)
+    return GrantedInput(
+        input_id=input_id,
+        local=path,
+        media_type=sniff(head) if media_type is None else media_type,
+        digest="sha256:" + digest.hexdigest(),
+        length=path.stat().st_size,
+        order=order,
+        file_state=file_state(path),
+    )
+
+
+def file_input[AssetT: Asset](
+    asset_type: type[AssetT],
+    path: Path,
+    *,
+    attempt: Attempt | None = None,
+    input_id: str = "input",
+    order: int = 0,
+    max_decoded_bytes: int = DEFAULT_DECODE_LIMITS.max_decoded_bytes,
+    preparation: Preparation | None = None,
+) -> AssetT:
+    """A file on disk as an input handle of `attempt`, granted as `granted_input` grants it."""
+    granted = granted_input(path, input_id=input_id, order=order)
+    return _hydrated(asset_type(granted.digest), granted, attempt, max_decoded_bytes, preparation)
+
+
+def _hydrated[AssetT: Asset](
+    asset: AssetT,
+    granted: GrantedInput,
+    attempt: Attempt | None,
+    max_decoded_bytes: int,
+    preparation: Preparation | None,
+) -> AssetT:
+    if preparation is not None and preparation.kind != asset.kind:
+        raise ValueError(f"{type(preparation).__name__} does not prepare a {asset.kind} input")
+    record = attempt or fake_attempt()
     bind(
-        bound,
+        asset,
         local=granted.local,
-        attempt=attempt,
+        attempt=record.request_id,
         media_type=granted.media_type,
         digest=granted.digest,
         length=granted.length,
         max_decoded_bytes=max_decoded_bytes,
         input_id=granted.input_id,
         order=granted.order,
+        read_guard=lambda: record.check_open("Asset.read_bytes"),
+        source_state=granted.file_state,
+        media=record.media,
     )
-    return bound
+    asset._preparation = preparation
+    prepare_duration(asset, record)
+    return asset
 
 
 def fake_context(
@@ -192,16 +257,6 @@ def fake_egress(respond: Callable[..., Any], attempt: Attempt | None = None) -> 
     """An `Egress` over a local responder. The real broker, allowlist and SSRF fail-closed
     path are cr-012's; this proves only injection and the capability."""
     return Egress(attempt or fake_attempt(), respond)
-
-
-def fake_media_decoder(
-    attempt: Attempt | None = None,
-    *,
-    active: bool = False,
-    limits: DecodeLimits | None = None,
-) -> MediaDecoder:
-    """The real decoder over a caller-controlled attempt, without a parallel fake codec."""
-    return MediaDecoder(attempt or fake_attempt(), active=lambda: active, limits=limits)
 
 
 def invoke_with_fakes(

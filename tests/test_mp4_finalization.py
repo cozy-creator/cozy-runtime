@@ -97,7 +97,6 @@ def test_every_join_revision_is_indexed_without_changing_packets_or_previous_rev
     sources = [_segment(tmp_path, name, 48) for name in ("a", "bb", "ccc")]
     parent = fakes.fake_attempt("parent", spool=tmp_path / "parent")
     outputs = fakes.fake_outputs(parent)
-    decoder = fakes.fake_media_decoder(parent)
     join = outputs.join_video(AUDIO if with_audio else None)
     written = 0
     revisions: list[tuple[Path, bytes]] = []
@@ -105,7 +104,7 @@ def test_every_join_revision_is_indexed_without_changing_packets_or_previous_rev
     def soundtrack(video: VideoAsset, frames: int) -> Iterator[DecodedMediaEvent]:
         nonlocal written
         if with_audio:
-            with decoder.stream_audio(video) as stream:
+            with video.stream(pictures=False) as stream:
                 for event in stream:
                     if isinstance(event, DecodedAudioChunk):
                         yield DecodedAudioChunk(
@@ -122,7 +121,7 @@ def test_every_join_revision_is_indexed_without_changing_packets_or_previous_rev
 
     for i, source in enumerate(sources):
         video = fakes.fake_input(
-            source, attempt="parent", input_id=f"v{i}", max_decoded_bytes=8 << 20
+            source, attempt=parent, input_id=f"v{i}", max_decoded_bytes=8 << 20
         )
         revision = join.append(video, partial(soundtrack, video), last=last and i == 2)
         parts = [parent.spool / part.local for part in parent.parts[revision.ref]]
@@ -159,9 +158,9 @@ def test_every_join_revision_is_indexed_without_changing_packets_or_previous_rev
         extra = sum(samples for _, _, samples, _ in _audio(final)) - written
         assert 0 <= extra < saved.audio.codec_frame_samples
         hydrated = fakes.fake_input(
-            saved.video, attempt="parent", input_id="finished", max_decoded_bytes=8 << 20
+            saved.video, attempt=parent, input_id="finished", max_decoded_bytes=8 << 20
         )
-        with decoder.stream_audio(hydrated) as stream:
+        with hydrated.stream(pictures=False) as stream:
             actual_samples = sum(e.sample_count for e in stream if isinstance(e, DecodedAudioChunk))
             assert actual_samples == written
     again = join.finish()

@@ -14,12 +14,12 @@ import msgspec
 import pytest
 from PIL import Image
 
-from cozy_runtime.author._decode import DEFAULT_DECODE_LIMITS, host_decode_limits
 from cozy_runtime.author import (
     App,
     AssetBound,
     AssetLimits,
     Assets,
+    AudioAsset,
     AuthorError,
     CapabilityError,
     ConformanceError,
@@ -28,20 +28,17 @@ from cozy_runtime.author import (
     FileAsset,
     ImageAsset,
     Invocation,
-    MediaDecoder,
-    Mixed,
     Preflight,
     PreflightViolation,
+    VideoAsset,
     attempt,
     describe,
     invocable,
     prepare,
 )
-from cozy_runtime.author import (
-    Image as InputImage,
-)
 from cozy_runtime.author._assets import GrantedInput, InputMetadata
 from cozy_runtime.author._calls import _Broker, _CallType
+from cozy_runtime.author._decode import DEFAULT_DECODE_LIMITS, host_decode_limits
 from cozy_runtime.author._invoke import run_prepared
 from cozy_runtime.author.fakes import fake_context
 from cozy_runtime.internal import interface_wheel, package_interface
@@ -84,9 +81,7 @@ app = App()
 
 
 @app.entrypoint(preflight=preflight)
-def collect(
-    payload: Request, assets: Pictures, facts: Preflight[Facts], decoder: MediaDecoder
-) -> Result:
+def collect(payload: Request, assets: Pictures, facts: Preflight[Facts]) -> Result:
     assert type(payload) is Request
     assert tuple(asset.label for asset in assets) == facts.labels
     assert assets.by_id(assets[0].id) is assets[0]
@@ -97,7 +92,7 @@ def collect(
         [a.id for a in assets],
         [a.position for a in assets],
         [a.digest for a in assets],
-        [decoder.decode_image(a).rgb.hex() for a in assets],
+        [a.read().tobytes().hex() for a in assets],
         payload.named.read_bytes().decode(),
     )
 
@@ -346,9 +341,9 @@ def test_assets_decode_uses_existing_per_item_limit(tmp_path: Path) -> None:
     limited = App()
 
     @limited.entrypoint
-    def decode(payload: Request, assets: TinyPictures, decoder: MediaDecoder) -> Result:
-        decoder.decode_image(assets[0])
-        raise AssertionError("12 decoded RGB bytes cannot fit an8-byte field bound")
+    def decode(payload: Request, assets: TinyPictures) -> Result:
+        assets[0].read()
+        raise AssertionError("12 decoded RGB bytes cannot fit an 8-byte field bound")
 
     _, outcome, _ = attempt(
         limited.get("decode"),
@@ -369,7 +364,7 @@ def test_a_declared_bound_above_the_old_2_gib_ceiling_describes() -> None:
     large = App()
 
     @large.entrypoint
-    def decode(payload: Request, assets: LargePictures, decoder: MediaDecoder) -> Result:
+    def decode(payload: Request, assets: LargePictures) -> Result:
         raise AssertionError("describe never executes")
 
     describe(large)
@@ -394,7 +389,7 @@ def test_collection_labels_are_exact_and_do_not_mutate_source() -> None:
         source.with_label(None)  # type: ignore[arg-type]
 
 
-SimplePictures = Annotated[Assets[InputImage], msgspec.Meta(min_length=1, max_length=4)]
+SimplePictures = Annotated[Assets[ImageAsset], msgspec.Meta(min_length=1, max_length=4)]
 
 
 @invocable(memoize=True)
@@ -404,7 +399,7 @@ async def decoded_child(ctx: Context, *, assets: SimplePictures) -> Result:
         [assets.info(i).id for i in range(len(assets))],
         [assets.info(i).position for i in range(len(assets))],
         [assets.info(i).digest for i in range(len(assets))],
-        [image.tobytes().hex() for image in assets],
+        [image.read().tobytes().hex() for image in assets],
         "",
     )
 
@@ -413,9 +408,9 @@ decoded_app = App()
 decoded_app.entrypoint(decoded_child, accelerator=False)
 
 
-def test_decoded_assets_are_lazy_real_images_with_one_attempt_budget(tmp_path: Path) -> None:
+def test_handles_read_lazily_through_one_attempt_budget(tmp_path: Path) -> None:
     wire, rows = inputs(tmp_path)
-    escaped: list[Assets[InputImage]] = []
+    escaped: list[Assets[ImageAsset]] = []
     inspected: list[str] = []
 
     def inspect_inputs(payload: Request, assets: SimplePictures) -> Facts:
@@ -423,22 +418,23 @@ def test_decoded_assets_are_lazy_real_images_with_one_attempt_budget(tmp_path: P
         inspected.append(assets.info(0).digest)
         with pytest.raises(FrozenInstanceError):
             assets.info(0).label = "changed"  # type: ignore[misc]
-        with pytest.raises(PreflightViolation, match="metadata"):
-            assets[0]
+        with pytest.raises(PreflightViolation, match="hydration"):
+            getattr(assets[0], "re" + "ad")()  # the runtime backstop behind the static fence
         assert assets.get("missing") is None
         return Facts(("alice", ""), (0, 1))
 
     local = App()
 
     @local.entrypoint(preflight=inspect_inputs)
-    def decode(payload: Request, assets: SimplePictures, decoder: MediaDecoder) -> Result:
-        assert decoder._budget.used == 0  # info and preflight performed no decode.
-        first = assets["alice"]
-        assert type(first) is InputImage and first.mode == "RGB" and first.size == (2, 2)
-        assert assets[0] is first and assets.get("alice") is first
-        assert decoder._budget.used == 12
-        second = assets[1]
-        assert second is not first and decoder._budget.used == 24
+    def decode(payload: Request, assets: SimplePictures) -> Result:
+        media = assets[0]._media
+        assert media is not None and media.retained_bytes == 0  # preflight decoded nothing
+        assert assets[0] is assets["alice"] and assets.get("alice") is assets[0]
+        first = assets["alice"].read()
+        assert type(first) is Image.Image and first.mode == "RGB" and first.size == (2, 2)
+        assert media.retained_bytes == 12
+        second = assets[1].read()
+        assert second is not first and media.retained_bytes == 24
         first.putpixel((0, 0), (0, 0, 255))
         assert second.getpixel((0, 0)) == (255, 0, 0)
         escaped.append(assets)
@@ -452,7 +448,7 @@ def test_decoded_assets_are_lazy_real_images_with_one_attempt_budget(tmp_path: P
     assert outcome.terminal == "succeeded", outcome
     assert result is not None and result.result.rgb == ["ff0000" * 4]
     with pytest.raises(CapabilityError, match="escaped_handle"):
-        escaped[0]["alice"]  # Cached values cannot bypass the collection lifetime check.
+        escaped[0]["alice"].read()  # A handle cannot outlive its attempt.
 
 
 def test_decoded_selection_forwards_custody_without_decoding(tmp_path: Path) -> None:
@@ -463,13 +459,7 @@ def test_decoded_selection_forwards_custody_without_decoding(tmp_path: Path) -> 
         digest=rows["assets.0.asset"].digest,
         attempt="parent",
     )
-    original: Assets[InputImage] = Assets([photo.with_label("one"), photo.with_label("two")])
-    original._decoded = True
-
-    def no_decode(asset: Any) -> object:
-        raise AssertionError("selection/serialization must not decode")
-
-    original._project = no_decode
+    original: Assets[ImageAsset] = Assets([photo.with_label("one"), photo.with_label("two")])
     forwarded = original.select("two", "one")
     assert forwarded.info(0).label == "two" and original.info(0).label == "one"
     assert forwarded[:1].info(0).label == "two"
@@ -501,7 +491,7 @@ def test_decoded_selection_forwards_custody_without_decoding(tmp_path: Path) -> 
     assert result.result.rgb == ["ff0000" * 4] * 2
 
 
-def test_decoded_descriptor_and_generated_client_preserve_the_value_type(tmp_path: Path) -> None:
+def test_handle_descriptor_and_generated_client_preserve_the_handle_type(tmp_path: Path) -> None:
     found = Discovered(
         decoded_app,
         __name__ + ":decoded_app",
@@ -511,35 +501,34 @@ def test_decoded_descriptor_and_generated_client_preserve_the_value_type(tmp_pat
     )
     document = package_interface.build(found)
     slot = document["entrypoints"][0]["assets"]
-    assert slot["view"] == "decoded"
-    assert slot["kinds"][0]["max_decoded_bytes"] == 2 * 1024**3
+    assert "view" not in slot
+    assert slot["kinds"][0]["max_decoded_bytes"] == DEFAULT_DECODE_LIMITS.max_decoded_bytes
+    assert "media_decode" in document["entrypoints"][0]["invocable"]["capabilities"]
     raw = package_interface.canonical_bytes(document)
     package_interface.read_bytes(raw)
     generated = interface_wheel.generate(raw)
-    assert any(b"Assets[Annotated[Image," in value for value in generated.values())
+    assert any(b"Assets[Annotated[ImageAsset," in value for value in generated.values())
     for key, value in generated.items():
         if key.endswith(".py"):
             compile(value, key, "exec")
-    for invalid_view in ("raw", "pixels", None, 1):
-        invalid = json.loads(json.dumps(document))
-        invalid["entrypoints"][0]["assets"]["view"] = invalid_view
-        with pytest.raises(ConformanceError):
-            package_interface.read_bytes(json.dumps(invalid).encode())
 
 
-def test_assets_refuses_mixed_raw_and_decoded_view() -> None:
+def test_assets_elements_are_handles_only() -> None:
     local = App()
 
     @local.entrypoint
     def bad(payload: Request, assets: Assets[ImageAsset | DecodedVideo]) -> Result:
-        raise AssertionError("mixed view must refuse during describe")
+        raise AssertionError("a decoded value type must refuse during describe")
 
-    with pytest.raises(ConformanceError, match="mix decoded values and raw"):
+    with pytest.raises(ConformanceError, match="assets_element"):
         describe(local)
 
 
-LimitedMixed = Annotated[Assets[Mixed], AssetLimits(images=1, videos=1, audio=1, total=3)]
-SimpleLimited = Annotated[Assets[InputImage], AssetLimits(images=2)]
+LimitedMixed = Annotated[
+    Assets[ImageAsset | VideoAsset | AudioAsset],
+    AssetLimits(images=1, videos=1, audio=1, total=3),
+]
+SimpleLimited = Annotated[Assets[ImageAsset], AssetLimits(images=2)]
 
 
 def test_kind_count_refuses_before_hydration(tmp_path: Path) -> None:
@@ -564,8 +553,8 @@ def test_fidelity_is_metadata_and_does_not_resize(tmp_path: Path) -> None:
     def render(payload: Request, assets: SimpleLimited) -> Result:
         assert assets.info("alice").fidelity == fidelity
         assert assets.info(1).fidelity == "auto"
-        assert assets["alice"].size == (513, 257)
-        assert assets[1].size == (513, 257)
+        assert assets["alice"].read().size == (513, 257)
+        assert assets[1].read().size == (513, 257)
         assert assets.select(0).info(0).fidelity == fidelity
         return Result([], [], [], [], [], "")
 
@@ -613,7 +602,7 @@ def test_count_metadata_comes_from_argument_and_conflicts_refuse(tmp_path: Path)
     @conflict.entrypoint
     def wrong(
         payload: Request,
-        assets: Annotated[Assets[InputImage], AssetLimits(total=2), msgspec.Meta(max_length=3)],
+        assets: Annotated[Assets[ImageAsset], AssetLimits(total=2), msgspec.Meta(max_length=3)],
     ) -> Result:
         raise AssertionError("conflicting declarations must refuse")
 
@@ -630,14 +619,23 @@ def test_count_metadata_comes_from_argument_and_conflicts_refuse(tmp_path: Path)
     assert "assets" not in inspect.signature(invocable).parameters
 
 
-def test_implicit_decode_does_not_require_bounds_on_named_raw_media() -> None:
+def test_assets_kinds_take_the_ceiling_but_named_media_declares_its_bound() -> None:
     class WithRaw(msgspec.Struct):
         photo: ImageAsset
 
     def handler(payload: Request, assets: SimpleLimited) -> Result:
         raise AssertionError("describe only")
 
-    handler.__annotations__["payload"] = WithRaw
     local = App()
     local.entrypoint(handler)
-    describe(local)
+    surface = describe(local)[0]
+    binding = surface.assets_binding
+    assert binding is not None and "media_decode" in surface.capabilities
+    assert binding.kinds[0][1] == AssetBound(
+        max_decoded_bytes=DEFAULT_DECODE_LIMITS.max_decoded_bytes
+    )
+    handler.__annotations__["payload"] = WithRaw
+    named = App()
+    named.entrypoint(handler)
+    with pytest.raises(ConformanceError, match="asset_decode_unbounded"):
+        describe(named)

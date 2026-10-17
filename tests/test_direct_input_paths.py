@@ -15,7 +15,7 @@ import msgspec
 import pytest
 from PIL import Image
 
-from cozy_runtime.author import App, AssetBound, ImageAsset, Invocation, MediaDecoder, attempt
+from cozy_runtime.author import App, AssetBound, ImageAsset, Invocation, attempt
 from cozy_runtime.author._assets import GrantedInput, file_state
 from cozy_runtime.author._media import SNIFF_BYTES, reconcile, sniff
 from cozy_runtime.internal.executor_commands import InputFile
@@ -38,12 +38,12 @@ app = App()
 
 
 @app.entrypoint
-def inspect_input(payload: Payload, decoder: MediaDecoder) -> Result:
-    frame = decoder.decode_image(payload.image)
-    # This fixture inspects private path custody; real packages only see Assets values.
+def inspect_input(payload: Payload) -> Result:
+    frame = payload.image.read()
+    # This fixture inspects private path custody; real packages only read handles.
     source = payload.image._local
     assert source is not None
-    return Result(str(source), source.stat().st_ino, frame.rgb[:3].hex())
+    return Result(str(source), source.stat().st_ino, frame.tobytes()[:3].hex())
 
 
 def grant(source: Path, declared: str = "image/png") -> dict[str, GrantedInput]:

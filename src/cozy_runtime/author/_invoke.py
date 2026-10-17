@@ -26,6 +26,7 @@ import hashlib
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass, field, is_dataclass
+from fractions import Fraction
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, get_args, get_type_hints
 
@@ -43,10 +44,16 @@ from cozy_runtime.author._assets import (
     Tree,
     bind,
     bind_tree,
+    field_preparation,
 )
 from cozy_runtime.author._calls import ChildCallError, _Broker, _current
 from cozy_runtime.author._context import AdapterRef, Context, Device
-from cozy_runtime.author._decode import DEFAULT_DECODE_LIMITS, MediaDecoder, image_decoded_bytes
+from cozy_runtime.author._decode import (
+    DEFAULT_DECODE_LIMITS,
+    AudioProbe,
+    VideoProbe,
+    image_decoded_bytes,
+)
 from cozy_runtime.author._defaults import Clamp, Overlay, Recipe, resolve
 from cozy_runtime.author._demand import RequestFeatures, normalize
 from cozy_runtime.author._describe import check
@@ -61,7 +68,7 @@ from cozy_runtime.author._errors import (
     classify,
 )
 from cozy_runtime.author._executor_requests import Publish, Published
-from cozy_runtime.author._markers import AssetBound
+from cozy_runtime.author._markers import AssetBound, ImagePreparation, Preparation
 from cozy_runtime.author._media import KIND_MEDIA, admits
 from cozy_runtime.author._model import Model
 from cozy_runtime.author._observations import Observation, Track
@@ -332,13 +339,15 @@ def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> Invoc
     """
     surface, overlay = prepared.surface, prepared.overlay
     inv.spool.mkdir(parents=True, exist_ok=True)
+    record.rows.extend(overlay.rows)
+    models = tuple(inv.models.values())
+    record.components_active = lambda: any(model._cozy_active is not None for model in models)
 
     # Hydration is EAGER and happens only now: a refused request downloads nothing (§1.3).
     _hydrate(overlay.payload, inv, prepared.asset_bounds, record)
 
     attempt = record
     attempt.outputs = surface.outputs
-    attempt.rows.extend(overlay.rows)
     ctx = Context(inv.request_id, inv.deadline, inv.device, inv.cancel, inv.adapters)
     handles = ExitStack()
     _bind_tensorfs(ctx, record, inv, surface, handles)
@@ -350,7 +359,7 @@ def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> Invoc
 
     attempt.entered = True
     if inv.calls is not None:
-        inv.calls.bind(ctx, Telemetry(record, ctx))
+        inv.calls.bind(ctx, Telemetry(record, ctx), record.media)
     token = _current.set(inv.calls)
     try:
         result = _call(surface, kwargs, inv.activity)
@@ -460,8 +469,7 @@ def _preflight(surface: Surface, overlay: Overlay, settings: object) -> tuple[ob
         if role == "assets":
             args.append(
                 Assets._from_bound(
-                    (row.asset for row in getattr(overlay.payload, str(spec.assets_parameter))),
-                    decoded=bool(surface.assets_binding and surface.assets_binding.decoded),
+                    row.asset for row in getattr(overlay.payload, str(spec.assets_parameter))
                 )
             )
         else:
@@ -539,8 +547,7 @@ def _prepare_assets(
         asset._input_id, asset._position = input_id, position
         asset._label = value.label
         asset._fidelity = value.fidelity
-        if cls is ImageAsset:
-            asset._image_preparation = binding.image_preparation
+        asset._preparation = binding.preparation(cls.kind)
         value.asset = asset
         bounds[input_id] = bound
     try:
@@ -647,6 +654,7 @@ class AssetInput:
     asset: Asset
     bound: AssetBound | None
     segments: tuple[str | int, ...]
+    preparation: Preparation | None = None
 
 
 def asset_inputs(payload: object) -> list[AssetInput]:
@@ -670,6 +678,7 @@ def asset_inputs(payload: object) -> list[AssetInput]:
         order: int,
         seen: set[int],
         bound: AssetBound | None,
+        preparation: Preparation | None,
     ) -> None:
         if isinstance(value, Asset):
             bad = [part for part in segments if isinstance(part, str) and (not part or "." in part)]
@@ -680,46 +689,44 @@ def asset_inputs(payload: object) -> list[AssetInput]:
                     code="asset_input_path_unsupported",
                 )
             input_id = ".".join(str(part) for part in segments)
-            found.append(AssetInput(input_id, order, value, bound, segments))
+            prepared = preparation if preparation and preparation.kind == value.kind else None
+            found.append(AssetInput(input_id, order, value, bound, segments, prepared))
             return
         if isinstance(value, Tree) or id(value) in seen:
             return
         seen.add(id(value))
         if isinstance(value, (list, tuple)):
             for index, item in enumerate(value):
-                walk_value(item, (*segments, index), index, seen, bound)
+                walk_value(item, (*segments, index), index, seen, bound, preparation)
             return
         if isinstance(value, dict):
             for key, item in value.items():
-                walk_value(item, (*segments, str(key)), order, seen, bound)
+                walk_value(item, (*segments, str(key)), order, seen, bound, preparation)
             return
         if isinstance(value, msgspec.Struct):
-            for field_info in msgspec.structs.fields(type(value)):
-                _base, markers = strip(field_info.type)
-                declared = next((m for m in markers if isinstance(m, AssetBound)), None)
-                name = field_info.encode_name
-                walk_value(
-                    getattr(value, field_info.name),
-                    (*segments, name),
-                    order,
-                    seen,
-                    declared if declared is not None else bound,
-                )
-            return
-        if is_dataclass(value) and not isinstance(value, type):
+            fields = [
+                (field_info.encode_name, field_info.name, field_info.type)
+                for field_info in msgspec.structs.fields(type(value))
+            ]
+        elif is_dataclass(value) and not isinstance(value, type):
             annotations = get_type_hints(type(value), include_extras=True)
-            for name, member in field_values(value).items():
-                _base, markers = strip(annotations.get(name, object))
-                declared = next((m for m in markers if isinstance(m, AssetBound)), None)
-                walk_value(
-                    member,
-                    (*segments, name),
-                    order,
-                    seen,
-                    declared if declared is not None else bound,
-                )
+            fields = [(name, name, annotations.get(name, object)) for name in field_values(value)]
+        else:
+            return
+        for name, attribute, annotation in fields:
+            base, markers = strip(annotation)
+            declared = next((m for m in markers if isinstance(m, AssetBound)), None)
+            prepared = field_preparation(base, markers)
+            walk_value(
+                getattr(value, attribute),
+                (*segments, name),
+                order,
+                seen,
+                declared if declared is not None else bound,
+                prepared if prepared is not None else preparation,
+            )
 
-    walk_value(payload, (), 0, set(), None)
+    walk_value(payload, (), 0, set(), None, None)
     counts: dict[str, int] = {}
     for item in found:
         counts[item.input_id] = counts.get(item.input_id, 0) + 1
@@ -839,7 +846,73 @@ def _hydrate(
             input_id=item.input_id,
             order=item.order,
             read_guard=(lambda: record.check_open("Asset.read_bytes")) if record else None,
+            media=record.media if record else None,
         )
+        if item.input_id not in assets_bounds:
+            item.asset._preparation = item.preparation
+        if record is not None:
+            prepare_duration(item.asset, record)
+
+
+def prepare_duration(asset: Asset, record: Attempt) -> None:
+    """Hold a hydrated input to its declared duration policy before the handler runs.
+
+    Shorter than `min_seconds`, or longer than `max_seconds` under `excess="refuse"`,
+    refuses naming the field. `excess="truncate"` ends every read at `max_seconds` and,
+    when the source is longer, records a runtime-owned `adjusted` row and a warning.
+    """
+    preparation = asset._preparation
+    if preparation is None or preparation.kind == "image" or preparation.kind != asset.kind:
+        return
+    assert not isinstance(preparation, ImagePreparation)
+    probe = asset._reads().probe(asset)
+    assert isinstance(probe, (VideoProbe, AudioProbe))
+    source = probe.source_duration
+    field_id = asset._input_id
+    minimum, maximum = preparation.minimum, preparation.maximum
+    if minimum is not None and source < minimum:
+        raise InvalidRequest(
+            f"{asset.kind} input {field_id!r} is {_seconds(source)} s; this field needs at "
+            f"least {preparation.min_seconds} s",
+            code="media_too_short",
+            fields=[field_id],
+        )
+    if maximum is None:
+        return
+    if preparation.excess == "refuse":
+        if source > maximum:
+            raise InvalidRequest(
+                f"{asset.kind} input {field_id!r} is {_seconds(source)} s; this field admits "
+                f"at most {preparation.max_seconds} s",
+                code="media_too_long",
+                fields=[field_id],
+            )
+        return
+    asset._end = maximum
+    if source > maximum:
+        reason = f"{asset.kind} truncated to {preparation.max_seconds:g} s"
+        record.rows.append(
+            AdjustmentRow(
+                "adjusted",
+                field_id,
+                _seconds(source),
+                preparation.max_seconds,
+                reason,
+                source="policy",
+            )
+        )
+        record.emit(
+            "log",
+            f"input {asset.kind} truncated",
+            "warn",
+            field=field_id,
+            source_seconds=_seconds(source),
+            applied_seconds=float(maximum),
+        )
+
+
+def _seconds(value: Fraction) -> float:
+    return round(float(value), 3)
 
 
 # ------------------------------------------------------------------------- injection
@@ -856,28 +929,14 @@ def _inject(
     """Build the call kwargs. A service absent from the signature is never constructed —
     which is precisely why a handler without `Outputs` structurally cannot save."""
     kwargs: dict[str, object] = {}
-    # Both the implicit decoded view and an explicitly requested service share one budget.
-    decoder = (
-        MediaDecoder(
-            attempt,
-            active=lambda: any(model._cozy_active is not None for model in inv.models.values()),
-        )
-        if "media_decode" in surface.capabilities
-        else None
-    )
     for param in surface.params:
         if param.role == "context":
             kwargs[param.name] = ctx
         elif param.role == "payload":
             kwargs[param.name] = _payload_value(surface, overlay.payload)
         elif param.role == "assets":
-            binding = surface.assets_binding
-            assert binding is not None
             kwargs[param.name] = Assets._from_bound(
-                (row.asset for row in getattr(overlay.payload, param.name)),
-                decoded=binding.decoded,
-                project=decoder.value if decoder is not None else None,
-                guard=lambda: attempt.check_open("Assets"),
+                row.asset for row in getattr(overlay.payload, param.name)
             )
         elif param.role == "wire":
             kwargs[param.name] = getattr(overlay.payload, param.name)
@@ -900,9 +959,6 @@ def _inject(
                     fields=[param.name],
                 )
             kwargs[param.name] = model
-        elif param.capability == "media_decode":
-            assert decoder is not None
-            kwargs[param.name] = decoder
         else:
             kwargs[param.name] = _service(param, attempt, ctx, inv, surface)
     return kwargs
