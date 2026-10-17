@@ -318,19 +318,21 @@ class Memory:
         weights.drain()
         weights.limit_torch()
 
-    def _collect(self, _: int) -> None:
+    def collect(self) -> bool:
         """Rings whose cursor could not close (a failed block's frames hold a view in a
-        reference cycle, run 10562) and bytes no class accounts for: garbage is collected,
-        once, and the rings whose last view it held close."""
-        components = self.weights.components.values()
-        if self._collected or not (
-            any(c.orphans for c in components) or self.ledger().residue > MARGIN
-        ):
-            return
-        self._collected = True
+        reference cycle, run 10562) and bytes no class accounts for: garbage is collected and
+        the rings whose last view it held close. Whether one did."""
+        components = list(self.weights.components.values())
+        orphans = sum(len(c.orphans) for c in components)
+        if not orphans and self.ledger().residue <= MARGIN:
+            return False
         gc.collect()
-        for component in components:
-            reap(component)
+        return sum(len(c.orphans) for c in components if not reap(c)) < orphans
+
+    def _collect(self, _: int) -> None:
+        if not self._collected:  # once a pass
+            self._collected = True
+            self.collect()
 
     def _finer(self, short: int) -> None:
         """The running stage's regions no block leases now leave; its next block boundary
