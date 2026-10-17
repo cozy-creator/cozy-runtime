@@ -829,12 +829,17 @@ class Weights:
         """Run the caller's torch ops with out-of-memory recovery: an op that cannot allocate
         runs again once room is made (a seeded op from its generator's state before it). With
         a `journal`, every write into a tensor that existed before is kept first (`Journal`).
-        Inside this plane's recovery it adds no dispatch layer (`_noting`)."""
+        Inside this plane's recovery it adds no dispatch layer (`_noting`). Leaving the
+        outermost, what is out of the device comes back while there is room: only an op in
+        this mode brings it back by itself."""
         if self.host_only:
             yield journal
             return
+        outermost = _innermost(self.torch) is None
         with _noting(self.torch, self, journal):
             yield journal
+        if outermost and spill.OFF:
+            self.restore_spilled()
 
     def refused(self, need: int) -> None:
         """torch's allocator refused `need` bytes. A caller that catches that never reaches a

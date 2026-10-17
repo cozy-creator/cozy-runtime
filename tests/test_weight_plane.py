@@ -16,7 +16,7 @@ import io
 import mmap
 import os
 from collections.abc import Collection, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -39,6 +39,7 @@ from cozy_runtime.internal import (  # noqa: E402
     budget_cell,
     paging,
     plane,
+    proctree,
     spill,
     weight_policy,
 )
@@ -1076,6 +1077,59 @@ def test_an_op_with_no_room_left_moves_the_tensors_the_process_holds_to_host(car
     spill.release(torch)
     assert not spill.HELD, "every moved tensor is gone"
     assert not spill.PRESSED[0] and not spill.USED, "no host block left: no op is noted"
+
+
+def fill_card(weights: Weights) -> list[Any]:
+    """The package's tensors (an earlier stage's state, a decoder's leftovers) take the card:
+    64 MiB at a time until torch is refused, each holding its own index."""
+    weights.vacate()
+    torch.cuda.empty_cache()
+    held: list[Any] = []
+    with suppress(torch.OutOfMemoryError):
+        while torch.cuda.mem_get_info()[0] > 64 << 20:
+            held.append(torch.full((16 << 20,), float(len(held)), device="cuda"))
+    return held
+
+
+@on_card
+@pytest.mark.parametrize("host", ["room", "full"])
+def test_a_card_the_packages_tensors_fill_runs_its_stage_through_host_and_disk(
+    card: Any, host: str
+) -> None:
+    """cr-203 U3. The package's tensors fill the card, and a stage then needs room for its
+    weights and activations: they leave the device and the stage computes the same bits.
+    With room on the host they are mapped there in place, up to what it can give beside its
+    margin (no longer half of it). With the host full to its margin, those no op touched
+    since the stage began go to disk, their device bytes released, and each comes back with
+    its values when an op reads it. A copy an in-place op takes under that pressure is in
+    host memory."""
+    weights = card.weights
+    model = load(weights, card.checkpoint, f"fill-{host}")
+    x = torch.randn(1 << 16, HIDDEN, device="cuda", dtype=torch.float16)  # 256 MiB
+    with weights.recovering():
+        reference = run(model, x, passes=1)
+    model.residency.unpark()
+    ballast = None
+    if host == "full":
+        available = proctree.host_memory().available
+        if not 0 < available < 64 << 30:
+            pytest.skip(f"{available} B on the host: too much to fill for a test")
+        free = available - weight_policy.HOST_MARGIN - (512 << 20)
+        ballast = torch.ones(max(free, 0), dtype=torch.uint8)  # its pages are the host's
+    held = fill_card(weights)
+    before = list(spill.TIERS)
+    with weights.recovering():
+        got = run(model, x, passes=1)
+        tier = 0 if host == "room" else 2
+        assert spill.TIERS[tier] - before[tier] >= 256 << 20, spill.summary()
+        assert spill.keep(x).device.type == "cpu"
+        assert all(bool((t == i).all()) for i, t in enumerate(held)), "each one's own values"
+        assert same(reference, got)  # in the mode: what left the device comes back to be read
+    del ballast, held, got
+    gc.collect()
+    weights.restore_spilled()
+    spill.release(torch)
+    assert not spill.OFF and not spill.PRESSED[0]
 
 
 def test_decoded_copies_count_in_a_stages_budget(tmp_path: Path) -> None:
