@@ -11,6 +11,7 @@ from __future__ import annotations
 import gc
 import os
 import re
+import traceback
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import IntEnum
@@ -26,23 +27,20 @@ from cozy_runtime.author._model import RELEASERS
 from cozy_runtime.internal import accel, plane, spill, weight_policy
 
 if TYPE_CHECKING:
-    from cozy_runtime.internal.weights import Weights
+    from cozy_runtime.internal.weights import Component, Weights
 
 MARGIN = weight_policy.MARGIN
 #: torch's out-of-memory message: CUDA's units are KiB/MiB/GiB, MPS's KB/MB/GB of 1024
 _REQUESTED = re.compile(r"Tried to allocate ([0-9.]+) (B|KiB|MiB|GiB|KB|MB|GB)")
 _UNITS = {"B": 1, "KiB": 1 << 10, "MiB": 1 << 20, "GiB": 1 << 30}
 _UNITS |= {"KB": _UNITS["KiB"], "MB": _UNITS["MiB"], "GB": _UNITS["GiB"]}
-#: cursors dropped open since the last collection: a view into each ring outlived its stage,
-#: and the ring closes itself once the last view goes
-ORPHANED = [0]
 
 
 class Rung(IntEnum):
     SLACK = 0  # torch's idle cache
     IDLE = 1  # orphaned rings, weights no stage holds, other tenants (`DeviceRoom`)
     FINER = 2  # the running stage's resident set, its components not in use
-    CACHES = 3  # what is kept for speed alone (`RELEASERS`; reservations with U7)
+    CACHES = 3  # what is kept for speed alone: reservations (`Weights.reserve`), `RELEASERS`
     HOST = 4  # live tensors to page-locked host memory, the op's operands last
     DISK = 5  # the pinned tier toward 0, so more can lock
 
@@ -125,6 +123,30 @@ def shortage(exc: BaseException) -> tuple[int, bool] | None:
     return None
 
 
+def reap(component: Component) -> bool:
+    """Close the cursors a view into their ring kept open (`close_cursor`): whether none is."""
+    for cursor in list(component.orphans):
+        try:
+            cursor.close()
+        except plane.error("Poisoned"):
+            raise
+        except plane.error("PlaneError"):
+            continue
+        component.orphans.remove(cursor)
+    return not component.orphans
+
+
+def _caller() -> str:
+    """Where the refused op was issued: the innermost frames outside torch and this ladder."""
+    frames = [
+        f
+        for f in traceback.extract_stack()[:-3]
+        if "/torch/" not in f.filename
+        and os.path.basename(f.filename) not in ("memory.py", "weights.py", "contextlib.py")
+    ]
+    return " < ".join(f"{os.path.basename(f.filename)}:{f.lineno} {f.name}" for f in frames[:-5:-1])
+
+
 class Memory:
     """The ladder and the refusal for one executor's GPU (`Weights.memory`)."""
 
@@ -180,13 +202,14 @@ class Memory:
         """Whether `nbytes` (and a margin) are free once the ladder ran as far as `upto`:
         rung by rung, each action again while it gives bytes back, until they are."""
         weights = self.weights
-        if weights.host_only:
-            return False
-        want, start = max(nbytes, 0) + MARGIN, -1
+        self.freed = 0
+        if weights.host_only or nbytes + max(weights.context_bytes, 0) > weights.total:
+            return False  # no rung makes a GPU larger: nothing moves for it
+        want, start = max(nbytes, 0) + MARGIN, self.free()
         placing, weights.placing, self._collected = weights.placing, True, False
         try:
-            self._settle()
-            start = have = self.free()
+            self._settle()  # rung 0: torch's idle cache, which counts as given back
+            have = self.free()
             for rung, act in self._ladder(operands):
                 if rung > upto or have >= want:
                     break
@@ -201,7 +224,7 @@ class Memory:
             return have >= want
         finally:
             weights.placing = placing
-            self.freed = max(self.free() - start, 0) if start >= 0 else 0
+            self.freed = max(self.free() - start, 0)
 
     def again(
         self,
@@ -211,12 +234,22 @@ class Memory:
         seen: int = -1,
         upto: Rung = Rung.DISK,
     ) -> int:
-        """The room a failed attempt runs again with: `free_for` found it, and more is free
-        than at the attempt's last try (`seen`). -1: it does not run again."""
-        if self.free_for(nbytes, op, operands, upto) and (now := self.free()) > seen:
-            self.weights.oom_retries += 1
-            return now
-        return -1
+        """The room a failed attempt runs again with: more is free than at its last try
+        (`seen`), and its bytes are (the margin is the ladder's aim, not the op's need). One that
+        failed with the room the ledger gave it was
+        refused by more than the ledger shows (fragmentation, a library's own bytes): its ask
+        doubles, walking the ladder further, until more comes free or it is more than the
+        GPU has. -1: it does not run again."""
+        weights, ask = self.weights, nbytes
+        most = weights.total - max(weights.context_bytes, 0) - MARGIN
+        while True:
+            fits = self.free_for(ask, op, operands, upto)
+            if (now := self.free()) > seen and (fits or now >= nbytes or ask > nbytes):
+                weights.oom_retries += 1
+                return now
+            if not fits or ask >= most:
+                return -1
+            ask = min(2 * max(ask, now), most)
 
     def retry[T](
         self,
@@ -260,11 +293,11 @@ class Memory:
         tried = self.summary() or "no rung gave bytes back"
         detail = (
             f"{op} needs {nbytes} B of device memory at once"
-            f"{f' ({why})' if why else ''}; {verdict}; ladder: {tried}; {ledger.text()}"
+            f"{f' ({why})' if why else ''}; {verdict}; ladder: {tried}; {ledger.text()}; "
+            f"issued from {_caller()}"
         )
         failure = MemoryExhausted(detail, op, nbytes, ledger, tried)
         self.refusal = failure.shortfall
-        self.weights.modes["memory.exhausted"] = detail[:1200]
         raise failure
 
     def ask(self, nbytes: int) -> None:
@@ -282,9 +315,10 @@ class Memory:
             (Rung.IDLE, self._collect),
             (Rung.IDLE, lambda short: weights.shrink(short, keep_holds=True)),
             (Rung.IDLE, lambda short: weights.page_out(None, short)),
-            (Rung.IDLE, self.ask),
+            (Rung.IDLE, lambda short: self.ask(self.free() + short)),  # all it wants free
             (Rung.FINER, self._finer),
             (Rung.FINER, lambda _: weights.spare(operands)),
+            (Rung.CACHES, lambda short: weights.shed(self.free() + short - MARGIN)),
             (Rung.CACHES, lambda _: [release() for release in RELEASERS]),
             (Rung.HOST, lambda short: weights.spill(short, operands)),
             (Rung.DISK, lambda short: weights.unpin(short, operands)),
@@ -298,14 +332,21 @@ class Memory:
         weights.drain()
         weights.limit_torch()
 
-    def _collect(self, _: int) -> None:
+    def collect(self) -> bool:
         """Rings whose cursor could not close (a failed block's frames hold a view in a
-        reference cycle, run 10562) and bytes no class accounts for: garbage is collected,
-        once, and the rings whose last view it held close."""
-        if self._collected or not (ORPHANED[0] or self.ledger().residue > MARGIN):
-            return
-        self._collected, ORPHANED[0] = True, 0
+        reference cycle, run 10562) and bytes no class accounts for: garbage is collected and
+        the rings whose last view it held close. Whether one did."""
+        components = list(self.weights.components.values())
+        orphans = sum(len(c.orphans) for c in components)
+        if not orphans and self.ledger().residue <= MARGIN:
+            return False
         gc.collect()
+        return sum(len(c.orphans) for c in components if not reap(c)) < orphans
+
+    def _collect(self, _: int) -> None:
+        if not self._collected:  # once a pass
+            self._collected = True
+            self.collect()
 
     def _finer(self, short: int) -> None:
         """The running stage's regions no block leases now leave; its next block boundary

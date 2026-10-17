@@ -46,8 +46,8 @@ from cozy_runtime.internal.derive import Observations, serving_substrate  # noqa
 from cozy_runtime.internal.encoding import SPEC_PLAIN, SPEC_ROWWISE  # noqa: E402
 from cozy_runtime.internal.encoding.leaves import _native_leaf_class  # noqa: E402
 from cozy_runtime.internal.fill import Checkpoint  # noqa: E402
+from cozy_runtime.internal.memory import Rung  # noqa: E402
 from cozy_runtime.internal.weights import (  # noqa: E402
-    INDIVISIBLE,
     HostTiers,
     Journal,
     PlaneBackend,
@@ -368,7 +368,7 @@ def test_a_kernel_launch_is_never_handed_a_weight_with_no_bytes() -> None:
     bytes bound, which nothing here can map (no stage owns it), is refused before the launch;
     every other operand passes through untouched."""
     from cozy_runtime.internal.triton_kernels import _Launcher
-    from cozy_runtime.internal.weights import ResidencyRefusal, unbound
+    from cozy_runtime.internal.weights import unbound
 
     launched: list[tuple[Any, ...]] = []
     compiled: Any = {"scale[]": {(4, 1, 1): lambda *args: launched.append(args)}}
@@ -898,7 +898,7 @@ def test_a_map_the_device_refuses_unmaps_idle_weights_and_the_stage_runs(
     weights.modes.clear()
     with held_elsewhere(free - (128 << 20)):
         got = run(stage, x, passes=1)
-    assert "short of device memory" in weights.modes, "the device refused no map"
+    assert "idle" in weights.modes["memory"], "the device refused no map"
     assert spill.MOVED[0] == moved, "a tensor went to host memory instead"
     assert same(expected, got)
 
@@ -940,7 +940,8 @@ def test_a_ring_a_view_outlives_never_refuses_the_next_stage(card: Any, holder: 
     finally:
         gc.enable()
     assert not model.residency.refusals, model.residency.refusals
-    assert weights.applied == budget
+    # collected, the ring went; a live view's ring stays, and the plane grows past it
+    assert (weights.applied == budget) == (holder == "garbage")
     assert same(expected, first)
     assert same(expected, second)
 
@@ -1442,9 +1443,8 @@ def test_weights_leave_only_after_the_kernels_that_read_them(tmp_path: Path, cut
 def test_an_op_that_no_unmap_can_help_fails_once(card: Any) -> None:
     """The 3 GiB freeze (W5, 21:53): an allocation retried about 40 times in 1.3 s while the
     driver's free bytes never grew, each retry unmapping weights, closing and remapping the
-    stage's ring. A retry runs again only when memory came back: this process's unmapping,
-    else the Worker's other tenants on the GPU (`DeviceRoom`); when neither can, it fails,
-    naming the op and its size."""
+    stage's ring. A retry runs again only when memory came back, and an op no GPU this size
+    can hold beside its context fails at once, moving nothing, naming the op and its size."""
     weights = card.weights
     model = load(weights, card.checkpoint, "stuck")
     x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
@@ -1452,13 +1452,13 @@ def test_an_op_that_no_unmap_can_help_fails_once(card: Any) -> None:
     weights.set_budget(tight(model))
     run(model, x, passes=1)
     calls = {"room": 0}
-    make_room = weights.make_room
+    free_for = weights.memory.free_for
 
-    def counted(need: int, operands: Any, op: str = "") -> None:
+    def counted(*args: Any, **kwargs: Any) -> bool:
         calls["room"] += 1
-        make_room(need, operands, op)
+        return free_for(*args, **kwargs)
 
-    weights.make_room = counted
+    weights.memory.free_for = counted  # type: ignore[method-assign]
     asked: list[int] = []
     weights.room = asked.append  # the Worker: no other tenant here gives anything
     model.residency.admit("run", ("stack",))
@@ -1467,16 +1467,16 @@ def test_an_op_that_no_unmap_can_help_fails_once(card: Any) -> None:
         with (
             weights.recovering(),
             torch.inference_mode(),
-            pytest.raises(Exception, match=r"aten\.empty.* of \d+ B: nothing on this GPU"),
+            pytest.raises(Exception, match=r"aten\.empty.* needs \d+ B of device memory"),
         ):
             torch.empty(1 << 40, dtype=torch.uint8, device="cuda")
     finally:
         model.residency.release("run", ("stack",))
-        del weights.make_room
+        del weights.memory.free_for
         weights.room = None
         torch.cuda.empty_cache()
-    assert calls["room"] <= 1 + len(layout.blocks)
-    assert asked and all(n > 1 << 39 for n in asked)
+    # the allocator's own refusal, then the op's two passes: nothing moves, nothing is asked
+    assert calls["room"] <= 3 and not asked and len(layout.blocks) == BLOCKS
     assert same(run(model, x, passes=1), run(model, x, passes=1))
 
 
@@ -1576,7 +1576,7 @@ def test_a_stage_spares_its_idle_components_for_the_one_that_runs(tmp_path: Path
         with torch.inference_mode():
             assert torch.equal(modules["encoder"](x), encoded)
             mapped = weights.facts().committed_bytes
-            assert residency._spare({stack.key}, {stack.key: 0})
+            assert residency._spare({stack.key})
             assert bool(encoder.spared) and encoder.lease is None and common.bound is None
             assert weights.facts().committed_bytes <= mapped - common.span
             # the running component is untouched, and a read of the spared one maps it
@@ -1587,7 +1587,6 @@ def test_a_stage_spares_its_idle_components_for_the_one_that_runs(tmp_path: Path
         residency.release("run", scope)
     residency.unpark()  # a repeating stage stays open until the next request plans afresh
     assert not encoder.spared, "a stage's end clears it"
-    assert weights.facts().oom_retries >= 1
 
 
 @on_card
@@ -1605,22 +1604,17 @@ def test_an_op_out_of_memory_spares_the_components_not_in_use(
     encoder, stack = residency.components["encoder"], residency.components["stack"]
     common = encoder.common
     assert common is not None
-    progressed, full = weights.progressed, [ResidencyRefusal(INDIVISIBLE, "a full card")]
-
-    def nothing_came_back(*args: Any) -> None:
-        if full:
-            raise full.pop()
-        progressed(*args)
-
     residency.admit("run", scope)
     try:
         with torch.inference_mode():
             encoded = modules["encoder"](x)
             reference = modules["stack"](encoded)  # the stack's blocks ran last
             mapped = weights.facts().committed_bytes
-            monkeypatch.setattr(weights, "progressed", nothing_came_back)
-            weights.make_room(1 << 20, (encoded,), "aten.clone.default")
-            assert not full and encoder.spared and not stack.spared
+            monkeypatch.setattr(weights, "shrink", lambda *_, **__: 0)  # unmapping gives nothing
+            weights.memory._settle()  # torch's idle cache is not what this asks for
+            ask = weights.memory.free() - weight_policy.MARGIN + common.span // 2
+            assert weights.memory.free_for(ask, "aten.clone.default", (encoded,), Rung.FINER)
+            assert encoder.spared and not stack.spared
             assert weights.facts().committed_bytes <= mapped - common.span
             assert torch.equal(modules["stack"](encoded), reference)
             assert torch.equal(modules["encoder"](x), encoded)
@@ -1761,7 +1755,7 @@ def test_a_stage_with_no_component_known_in_use_spares_them_all(tmp_path: Path) 
         with torch.inference_mode():
             reference = modules["stack"](modules["encoder"](x))
             mapped = weights.facts().committed_bytes
-            assert residency._spare({"another construction/vae"}, {})
+            assert residency._spare({"another construction/vae"})
             assert encoder.spared and stack.spared
             assert weights.facts().committed_bytes < mapped
             assert torch.equal(modules["stack"](modules["encoder"](x)), reference)
@@ -2446,7 +2440,6 @@ def test_a_qwen_image_vae_decodes_exactly_on_the_plane(tmp_path: Path) -> None:
         reference = plain.decode(z).sample
     del plain
     images = [decode(model, z), decode(model, z, room(weights, 48 << 20))]
-    assert "host memory" in weights.modes["bands"]
     for image in images:
         assert image.shape == (1, 3, 1, 512, 512)
         torch.testing.assert_close(image, reference, atol=1e-2, rtol=0)

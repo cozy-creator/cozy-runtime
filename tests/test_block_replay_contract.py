@@ -17,7 +17,7 @@ from typing import Any
 import msgspec
 import pytest
 
-from cozy_runtime.internal import accel, weight_policy
+from cozy_runtime.internal import accel, plane, weight_policy
 from cozy_runtime.internal.executor import Executor
 from cozy_runtime.internal.executor_commands import Activate, Load
 from cozy_runtime.internal.weights import (
@@ -82,7 +82,7 @@ def wrapped(
     # Actual CPU plane and actual production objects. Enable the nongrouped
     # device-control branch while all tensor math/lease storage remains CPU.
     weights = Weights(torch, torch.device("cpu"), "cpu")
-    weights.host_only = False
+    weights.host_only, weights.total = False, 1 << 20
     monkeypatch.setattr(weights, "stream", lambda: 0)
     monkeypatch.setattr(weights, "hold_host", lambda: None)
     monkeypatch.setattr(weights, "limit_torch", lambda: None)
@@ -98,7 +98,7 @@ def wrapped(
         },
     )
 
-    def shrink(need: int, keep: int = 0) -> int:
+    def shrink(need: int, keep: int = 0, keep_holds: bool = False) -> int:
         trace["room"].append({"need": need, "keep": keep})
         trace["free"] += max(need, weight_policy.MARGIN)
         return max(need, weight_policy.MARGIN)
@@ -141,7 +141,7 @@ def wrapped(
     monkeypatch.setattr(
         residency, "_acquire", lambda component, index, stream: CpuLease(tensor, trace)
     )
-    # The original _make_room and Weights.progressed execute; shrink/accounting
+    # The original memory ladder executes; shrink/accounting
     # above model device I/O and report actual progress before retry is granted.
     return weights, region, trace
 
@@ -373,30 +373,30 @@ def test_a_failed_op_runs_again_from_what_it_read(effect: str, monkeypatch: Any)
         assert torch.equal(out, torch.rand(2, generator=control)), "the same draw"
 
 
-def test_before_forward_acquisition_failure_keeps_existing_recovery(monkeypatch: Any) -> None:
+def test_a_refused_lease_runs_again_once_room_came_back(monkeypatch: Any) -> None:
+    """The device refuses a block's lease before its forward: the ladder gives room back and
+    the lease is asked again; the forward runs once."""
     module = StatefulBlock("counter")
-    weights, region, trace = wrapped(module, monkeypatch)
+    _, region, trace = wrapped(module, monkeypatch)
     residency = trace["residency"]
     acquire = residency._acquire
     attempts = []
-    replans = []
 
     def constrained(component: Any, index: int, stream: int) -> Any:
         attempts.append(1)
-        if len(attempts) <= 3:
-            raise residency._budget_error("before forward acquisition")
+        if len(attempts) == 1:
+            refused: Any = plane.error("BudgetExceeded")("the device is full")
+            refused.pool, refused.requested = "device", region.span
+            raise refused
         return acquire(component, index, stream)
 
     monkeypatch.setattr(residency, "_acquire", constrained)
-    monkeypatch.setattr(weights, "grow", lambda need: False)
-    monkeypatch.setattr(residency, "_replan", lambda resume: replans.append(resume))
     value = torch.tensor([[0.25, -0.5]])
     with torch.inference_mode():
         assert torch.equal(module(value), value + 1)
-    assert module.calls == 1 and len(attempts) == 4 and len(replans) == 2
+    assert module.calls == 1 and len(attempts) == 2
     assert trace["acquired"] == trace["released"] == 1
-    assert len(trace["room"]) == 1 and trace["room"][0]["need"] == region.span
-    assert not residency.poisoned
+    assert len(trace["room"]) == 1 and not residency.poisoned
 
 
 @pytest.mark.parametrize("custom", ["leaf", "forward", "hook"])

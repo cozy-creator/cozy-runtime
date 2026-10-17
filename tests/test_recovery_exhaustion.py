@@ -9,18 +9,18 @@ from typing import Any
 import msgspec
 import pytest
 
+from cozy_runtime.author._errors import MEMORY_EXHAUSTED
 from cozy_runtime.internal import lora_bake, weight_policy
 from cozy_runtime.internal import weights as source
 from cozy_runtime.internal.encoding import SPEC_PLAIN, Encoded, RolePart
 from cozy_runtime.internal.executor import Executor
 from cozy_runtime.internal.executor_commands import Activate, Load
 from cozy_runtime.internal.fill import PlanRow
+from cozy_runtime.internal.memory import MemoryExhausted
 from cozy_runtime.internal.weights import (
-    INDIVISIBLE,
     Bake,
     Component,
     Region,
-    ResidencyRefusal,
     Views,
     Weight,
     WeightResidency,
@@ -149,13 +149,13 @@ def test_exhausted_recovery_reports_its_capacity_and_leaves_the_state_it_found(
     exactly as if the failed one never ran."""
     control, current = StatefulBlock(effect), StatefulBlock(effect)
     weights, _region, trace = wrapped(current, monkeypatch)
-    monkeypatch.setattr(weights, "shrink", lambda _need, _keep=0: 0)
+    monkeypatch.setattr(weights, "shrink", lambda _need, _keep=0, **_: 0)
     failed = FailAfterOp(torch.ops.aten.linear.default)
     value = torch.tensor([[0.25, -0.5]])
     before = value.clone()
-    with failed, torch.inference_mode(), pytest.raises(ResidencyRefusal) as failure:
+    with failed, torch.inference_mode(), pytest.raises(MemoryExhausted) as failure:
         current(value)
-    assert failure.value.code == INDIVISIBLE and "aten.linear.default" in str(failure.value)
+    assert failure.value.code == MEMORY_EXHAUSTED and "aten.linear.default" in str(failure.value)
     assert torch.equal(value, before) and not trace["residency"].poisoned
     assert trace["acquired"] == trace["released"] == 1
     with torch.inference_mode():
@@ -170,7 +170,7 @@ def test_exhausted_functional_op_without_a_python_body_keeps_its_contract(
 ) -> None:
     module = StatefulBlock("counter")
     weights, _region, trace = wrapped(module, monkeypatch)
-    monkeypatch.setattr(weights, "shrink", lambda _need, _keep=0: 0)
+    monkeypatch.setattr(weights, "shrink", lambda _need, _keep=0, **_: 0)
     value = torch.tensor([[0.25, -0.5]])
     weight = torch.eye(2)
     failed = FailAfterOp(torch.ops.aten.linear.default)
@@ -178,10 +178,10 @@ def test_exhausted_functional_op_without_a_python_body_keeps_its_contract(
         failed,
         weights.recovering(),
         torch.inference_mode(),
-        pytest.raises(ResidencyRefusal) as failure,
+        pytest.raises(MemoryExhausted) as failure,
     ):
         torch.nn.functional.linear(value, weight)
-    assert failure.value.code == INDIVISIBLE and not trace["residency"].poisoned
+    assert failure.value.code == MEMORY_EXHAUSTED and not trace["residency"].poisoned
     assert module.calls == 0 and failed.calls == 1
     with weights.recovering(), torch.inference_mode():
         assert torch.equal(torch.nn.functional.linear(value, weight), value)
@@ -197,7 +197,7 @@ def test_an_executor_capacity_failure_keeps_its_generation_serving(
     target = runner.constructions["a"]
     module = StatefulBlock("buffer")
     weights, _region, trace = wrapped(module, monkeypatch)
-    monkeypatch.setattr(weights, "shrink", lambda _need, _keep=0: 0)
+    monkeypatch.setattr(weights, "shrink", lambda _need, _keep=0, **_: 0)
     value = torch.tensor([[0.25, -0.5]])
 
     def fail_in_handler() -> None:
@@ -211,7 +211,7 @@ def test_an_executor_capacity_failure_keeps_its_generation_serving(
     failed = _serve(runner, "exhausted", "contract")
     assert (failed["outcome"]["terminal"], failed["outcome"]["code"]) == (
         "failed",
-        INDIVISIBLE,
+        MEMORY_EXHAUSTED,
     ), failed
     assert not failed["poisoned"] and not runner.poisoned
     assert float(module.ticks) == 0, "its write was put back"

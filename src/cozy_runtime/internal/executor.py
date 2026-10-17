@@ -196,6 +196,7 @@ from cozy_runtime.internal.executor_commands import (
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.lora_composition import bind as bind_adapters
 from cozy_runtime.internal.lora_contract import read as read_adapter_graph
+from cozy_runtime.internal.memory import MemoryExhausted
 from cozy_runtime.internal.model_values import read_values_into
 from cozy_runtime.internal.parallel import copy_engine, cp, links, mirror, wire
 from cozy_runtime.internal.parallel.group import (
@@ -222,7 +223,6 @@ from cozy_runtime.internal.seam import (
     connect,
 )
 from cozy_runtime.internal.weights import (
-    INDIVISIBLE,
     DeviceTiers,
     HostTiers,
     Journal,
@@ -241,7 +241,7 @@ from cozy_runtime.internal.weights_writer import ExecutionStorage
 INLINE_RESULT_MAX = 4 * 1024 * 1024
 
 #: Outcomes that are capacity, not broken state: they fail the attempt and keep the executor.
-CAPACITY_CODES = frozenset({DEVICE_OOM, MEMORY_EXHAUSTED, INDIVISIBLE, "device_spared"})
+CAPACITY_CODES = frozenset({DEVICE_OOM, MEMORY_EXHAUSTED, "device_spared"})
 
 #: How many PREPARED requests this epoch holds at once. A serving lane admits and
 #: runs one attempt at a time, so anything past the newest few is a request the
@@ -503,13 +503,6 @@ class _CompositeResidency:
     @property
     def poisoned(self) -> str:
         return next((str(row.poisoned) for row in self.rows.values() if row.poisoned), "")
-
-    @property
-    def last_shortfall(self) -> Any:
-        return next(
-            (row.last_shortfall for row in self.rows.values() if row.last_shortfall is not None),
-            None,
-        )
 
     def open_attempt(self, *_: object) -> None:
         for row in self.rows.values():
@@ -1042,7 +1035,7 @@ class Executor:
         if command.room >= 0:
             try:
                 reply["freed"] = self._group_room(command.room, self._rerun_methods)
-            except ResidencyRefusal as exc:
+            except (ResidencyRefusal, MemoryExhausted) as exc:
                 return {"ok": False, "code": exc.code, "detail": str(exc)[:900]}
         return reply
 
@@ -1064,14 +1057,15 @@ class Executor:
     def _group_room(self, need: int, methods: Iterable[str]) -> int:
         """Before a group call runs again: this GPU plans `methods` with `need` more room for
         activations and gives that many device bytes back now. The bytes that came back; a
-        GPU with nothing left to give refuses (`Weights.make_room`)."""
+        GPU with nothing left to give refuses (`memory_exhausted`)."""
         weights = self.host.weights
         if weights is None or weights.host_only:
             return 0
         need = max(need, weight_policy.MARGIN)
         weights.seed_activations({m: weights.activation.get(m, 0) + need for m in methods})
-        before = weights.allocatable()
-        weights.make_room(need, (), "a group call that ran out of memory")
+        before, op = weights.allocatable(), "a group call that ran out of memory"
+        if not weights.memory.free_for(need, op):
+            weights.memory.exhausted(need, op)
         return max(weights.allocatable() - before, 0)
 
     def _group_rerun(self, need: int) -> int:
@@ -3355,6 +3349,7 @@ class Executor:
             self.residency.open_attempt()
         if self.host.weights is not None:
             self.host.weights.modes.clear()
+            self.host.weights.memory.refusal = None
         if torch is not None:
             accel.reset_peak(torch, self.device_kind)
         allocated_at_start = accel.allocated(torch, self.device_kind) if torch is not None else 0
@@ -3599,7 +3594,9 @@ class Executor:
         # The BOUNDED observation tail and the O(1) time attribution cross the seam on every
         # path, success or fault. A failed attempt's log tail is the one triage most needs,
         # and cr-011 hoisted the record out of `invoke` precisely so it survives the failure.
-        shortfall = self.residency.last_shortfall if self.residency is not None else None
+        weights = self.host.weights
+        exhausted = weights is not None and outcome.code == MEMORY_EXHAUSTED
+        shortfall = weights.memory.refusal if exhausted and weights is not None else None
         return {
             "ok": True,
             "shortfall": shortfall,
@@ -4291,10 +4288,8 @@ class Executor:
     def _device_room(self, free_bytes: int) -> None:
         """Ask the worker for `free_bytes` free on this GPU from its other tenants; it answers
         once they gave what they could, with this process's cap raised into that room when it
-        holds one (a refusal changes nothing). An ask for no bytes is no
-        ask: the machine reads a byte count as unsigned."""
-        if free_bytes <= 0:
-            return
+        holds one (a refusal changes nothing). Only `Memory.ask` asks, and never for <= 0
+        bytes: the machine reads a byte count as unsigned."""
         held = self.weights._held()[1] if self.weights is not None else -1
         answer = self._durable(DeviceRoom(free_bytes=free_bytes, holding_bytes=held), Room)
         if answer.ok and answer.cap_bytes >= 0 and self.weights is not None:

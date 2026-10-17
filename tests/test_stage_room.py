@@ -137,56 +137,6 @@ def test_a_squeezed_stage_pages_out_the_component_it_does_not_read(tmp_path: Pat
         b.backend.close()
 
 
-def test_a_stage_squeezed_inside_one_entry_pages_out_at_its_next_block(tmp_path: Path) -> None:
-    """One entry can be a whole denoise: the idle component leaves at the next block boundary
-    once torch has dropped its cache twice, and what the entry asks after that fits."""
-    a_at, _ = write_checkpoint(tmp_path / "a")
-    weights = Weights(torch, torch.device("cuda", 0), "cuda")
-    weights.set_budget(-1, pinned=1 << 30)
-    weights.set_cap(4 << 30)
-    a = load(weights, a_at, "a")
-    b = load(weights, other_checkpoint(tmp_path / "b"), "b", name="other", scope="rest")
-    try:
-        x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
-        expected, expected_rest = run(a, x, passes=1), rest(b, x)
-        stack, other = a.backend.components["stack"], b.backend.components["other"]
-        own, idle = weights.resident_bytes(stack), weights.resident_bytes(other)
-        capped(weights, own + idle)
-        retries: list[int] = []
-        a.residency.admit("run", ("stack",))
-        try:
-            with torch.inference_mode():
-                room = weights.allocatable()
-                # what the stage's plan left of the idle component (its LRU may take some)
-                held = weights.resident_bytes(other)
-                dropped = weights.retries()
-                # Each larger than the last, each fits alone, and each with the one before it
-                # passes torch's limit: two cache drops.
-                for share in (0.48, 0.54, 0.55):
-                    torch.empty(int(room * share), dtype=torch.uint8, device="cuda")
-                retries.append(weights.retries() - dropped)
-                out = [a.stack(x)]  # its first block boundary: the idle component leaves
-                retries.append(weights.retries())
-                # Larger than the block torch keeps (so it has to grow it): over the room
-                # beside that block, and under that room plus the idle component's bytes.
-                larger = int(room * 0.56)
-                assert room < int(room * 1.11) < room + held - 16 * MIB
-                torch.empty(larger, dtype=torch.uint8, device="cuda")
-                retries.append(weights.retries() - retries[1])
-        finally:
-            a.residency.release("run", ("stack",))
-        assert retries[0] == 2 and retries[2] == 0, retries
-        assert same(out, expected) and weights.resident_bytes(other) == 0
-        facts = weights.facts()
-        assert facts.paged_out == 1 and facts.paged_out_bytes >= held  # with what was filling
-        assert abs(weights.facts().squeezed["run"] - room) < 8 * MIB
-        assert same(rest(b, x), expected_rest)
-    finally:
-        torch.cuda.set_per_process_memory_fraction(1.0, 0)
-        a.backend.close()
-        b.backend.close()
-
-
 def test_a_component_mapped_from_the_machine_is_given_back_and_fills_again(tmp_path: Path) -> None:
     """Degree 2: the idle component's bytes are the machine's. The executor lets its mapping go
     and asks for room; the machine drops the holding nobody maps and raises the cap. A room an

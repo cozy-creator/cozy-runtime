@@ -14,7 +14,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from cozy_runtime.internal import accel, weight_policy  # noqa: E402
-from cozy_runtime.internal.weights import _room_for  # noqa: E402
+from cozy_runtime.internal.memory import shortage  # noqa: E402
 
 on_card = pytest.mark.skipif(not accel.present(torch, "cuda"), reason="a CUDA card")
 
@@ -145,19 +145,17 @@ def test_a_library_refused_inside_a_stage_runs_again_once_weights_made_room(
     assert done.returncode == 0 and done.stdout.split()[-1:] == ["ran"], done.stderr[-800:]
 
 
-def test_a_library_refusal_is_given_room_once_and_then_is_its_own_failure() -> None:
+def test_a_library_refusal_asks_for_its_room_and_other_failures_are_its_own() -> None:
+    """A library's status asks for the room its first launch takes; it runs again only after
+    more came free (`Memory.again`), so a status that is not about memory ends the ladder."""
     refusal = RuntimeError(
         "CUDA error: CUBLAS_STATUS_INTERNAL_ERROR when calling `cublasGemmEx( handle, opa, opb,"
     )
-    assert _room_for(refusal, False) == (weight_policy.LIBRARY_ROOM, True)
-    with pytest.raises(RuntimeError, match="CUBLAS_STATUS_INTERNAL_ERROR"):
-        _room_for(refusal, True)
+    assert shortage(refusal) == (weight_policy.LIBRARY_ROOM, False)
     cudnn = RuntimeError("cuDNN error: CUDNN_STATUS_EXECUTION_FAILED")
-    assert _room_for(cudnn, False) == (weight_policy.LIBRARY_ROOM, True)
-    with pytest.raises(RuntimeError, match="shape mismatch"):
-        _room_for(RuntimeError("shape mismatch"), False)
-    oom = RuntimeError("CUDA error: out of memory")
-    assert _room_for(oom, True) == (0, True), "out of memory is always answered"
+    assert shortage(cudnn) == (weight_policy.LIBRARY_ROOM, False)
+    assert shortage(RuntimeError("shape mismatch")) is None
+    assert shortage(RuntimeError("CUDA error: out of memory")) == (0, False)
 
 
 @on_card
