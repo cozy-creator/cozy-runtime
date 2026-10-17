@@ -263,6 +263,7 @@ def _host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[SimpleNam
             return dict(gpu["attention"])
 
         yield SimpleNamespace(
+            mux=host.mux,
             construction=construction,
             package=package,
             held=package.HELD,
@@ -370,9 +371,9 @@ def test_an_override_naming_a_compiling_kernel_waits_for_it_then_runs_every_step
 def test_a_cancel_ends_an_override_waiting_for_its_compile_at_once_and_the_build_goes_on(
     store: kernel_cache.Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The worker's cancel marker landing (TensorD's rename) ends the waiting request canceled
-    at once: the wait sleeps on it, not on its poll (an hour here). The build goes on, and a
-    later request runs every step on the kernel it built."""
+    """A `cancel` ends the waiting request canceled at once: the wait sleeps on it, not on its
+    poll (an hour here). The build goes on, and a later request runs every step on the kernel
+    it built."""
     _registry(tmp_path / "sources")
     job = kernel_sources.job(kernel_sources.PYTHON, 0)
     lock, builder = _held(store, job, MOVING)
@@ -385,10 +386,8 @@ def test_a_cancel_ends_an_override_waiting_for_its_compile_at_once_and_the_build
         request.start()
         while request.is_alive() and not _waiting(host.frames):
             time.sleep(0.01)
-        pending = tmp_path / "root" / "executor.cancel.pending"
-        pending.write_text("canceled")
         canceled = time.monotonic()
-        pending.rename(tmp_path / "root" / "executor.cancel")
+        host.mux.cancel("canceled")
         request.join(30)
         took = time.monotonic() - canceled
         assert not request.is_alive() and took < 1.0, took

@@ -99,7 +99,7 @@ def _serve(executor: Executor, request_id: str, mode: str) -> dict[str, Any]:
     spool = executor.root / request_id
     spool.mkdir()
     if mode == "cancel":
-        (executor.root / "executor.cancel").write_text(request_id)
+        executor.mux.cancel(request_id)
     return executor.serve_invoke(
         Invoke(request_id=request_id, entrypoint="generate", spool=str(spool), deadline_s=30)
     )

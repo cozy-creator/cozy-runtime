@@ -14,6 +14,7 @@ per call from measurements: a result goes to disk only when it is small and prod
 
 from __future__ import annotations
 
+import contextvars
 import dataclasses
 import enum
 import functools
@@ -418,17 +419,27 @@ def _default_process_bytes() -> int:
     return min(1 << 30, physical // 16) if physical > 0 else 1 << 30
 
 
+@dataclasses.dataclass(slots=True)
+class _Attempt:
+    exchange: Exchange | None
+    spool: Path | None
+    calls: list[Call]
+
+
 class Engine:
-    """This process's tier 0, its statistics and its link to the Worker's machine tier."""
+    """This process's tier 0, its statistics and each attempt's link to the Worker's machine
+    tier."""
 
     def __init__(self) -> None:
         self.entries: OrderedDict[str, Entry] = OrderedDict()
         self.held = 0
         self.stats: dict[str, MethodStats] = {}
+        #: calls outside every attempt
         self.calls: list[Call] = []
         self.disputed: set[tuple[str, str]] = set()
-        self.exchange: Exchange | None = None
-        self.spool: Path | None = None
+        self._attempt: contextvars.ContextVar[_Attempt | None] = contextvars.ContextVar(
+            "cozy_memo_attempt", default=None
+        )
         self._stages: dict[Callable[..., object], tuple[str | None, inspect.Signature]] = {}
         self._keys: dict[str, tuple[threading.Lock, list[int]]] = {}
         self._lock = threading.RLock()
@@ -442,16 +453,22 @@ class Engine:
             )
             self._trim()
 
+    @property
+    def exchange(self) -> Exchange | None:
+        attempt = self._attempt.get()
+        return attempt.exchange if attempt is not None else None
+
     def open(self, exchange: Exchange | None, spool: Path | None) -> None:
-        """An attempt starts: the Worker's machine tier is reachable only inside one."""
-        self.exchange = exchange if self.settings.entry_bytes > 0 else None
-        self.spool = spool
+        """An attempt starts in this context: the Worker's machine tier is reachable only inside
+        one."""
+        live = exchange if self.settings.entry_bytes > 0 else None
+        self._attempt.set(_Attempt(live, spool, []))
 
     def close(self, sink: Callable[..., object]) -> None:
         """The attempt ends: its calls and its methods' running totals become observations."""
-        self.exchange, self.spool = None, None
-        with self._lock:
-            calls, self.calls = self.calls, []
+        attempt = self._attempt.get()
+        self._attempt.set(None)
+        calls = attempt.calls if attempt is not None else []
         for call in calls:
             sink("metric", "memo.call", round(call.ms, 3), **dataclasses.asdict(call))
         for stage in sorted({call.stage for call in calls}):
@@ -501,9 +518,10 @@ class Engine:
                     del self._keys[key]
 
     def fetch(self, key: str, stage: str, numerics: str) -> Entry | None:
-        if self.exchange is None:
+        exchange = self.exchange
+        if exchange is None:
             return None
-        answer = self.exchange(StageMemoLookup(key=key, stage=stage, numerics=numerics), MemoEntry)
+        answer = exchange(StageMemoLookup(key=key, stage=stage, numerics=numerics), MemoEntry)
         if not isinstance(answer, MemoEntry) or not answer.ok:
             return None
         if answer.disputed:
@@ -522,14 +540,15 @@ class Engine:
 
     def store(self, key: str, stage: str, numerics: str, entry: Entry | None, reason: str) -> str:
         """Hand `entry` to the Worker, or end the key's claim saying why there is none."""
-        if self.exchange is None:
+        attempt = self._attempt.get()
+        if attempt is None or attempt.exchange is None:
             return reason
         local = ""
-        if entry is not None and self.spool is not None:
-            target = self.spool / f"stage-memo-{key[:16]}-{time.monotonic_ns()}.safetensors"
+        if entry is not None and attempt.spool is not None:
+            target = attempt.spool / f"stage-memo-{key[:16]}-{time.monotonic_ns()}.safetensors"
             target.write_bytes(entry.payload)
             local = str(target)
-        answer = self.exchange(
+        answer = attempt.exchange(
             StageMemoStore(
                 key=key,
                 stage=stage,
@@ -558,8 +577,8 @@ class Engine:
         return "cheap" if read > 0 and entry.cost_s < VALUE_RATIO * read else ""
 
     def record(self, call: Call) -> None:
-        with self._lock:
-            self.calls.append(call)
+        attempt = self._attempt.get()
+        (attempt.calls if attempt is not None else self.calls).append(call)
 
 
 ENGINE = Engine()

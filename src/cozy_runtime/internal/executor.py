@@ -23,10 +23,12 @@ Its whole surface is the seam (`internal/seam.py`), and its whole vocabulary is:
     probe     device/host memory facts, for TensorD's ledger reconciliation
     shutdown  cooperative exit
 
-Cancellation is attempt-keyed: `ctx.raise_if_cancelled` reads the marker TensorD publishes for
-this exact request. A stale cancellation therefore cannot cross into the next attempt.
-Every telemetry step, stage and progress call and, in a group, every mirrored call is a safe
-point. TensorD supervises executor lifetime and records the attempt's terminal outcome.
+Calls run side by side, as tasks on one bounded pool (`serve`): every per-call command,
+reply and frame names its `request_id`, and answers to the executor's requests come back by
+`seq` (`seam.Mux`). Cancellation is call-keyed: `ctx.raise_if_cancelled` reads the mark a
+`cancel` command left for this exact request. Every telemetry step, stage and progress call
+and, in a group, every mirrored call is a safe point. TensorD supervises executor lifetime
+and records each attempt's terminal outcome.
 
 The env seal is enforced, not trusted: the sealed values are snapshotted BEFORE torch is
 imported, re-imposed before Torch import, CUDA init and every reply, and any names package
@@ -37,7 +39,9 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import contextvars
 import ctypes
+import dataclasses
 import faulthandler
 import functools
 import gc
@@ -49,12 +53,12 @@ import json
 import math
 import os
 import platform
-import select
 import socket
 import sys
 import threading
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from concurrent.futures import Future, wait
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -66,7 +70,7 @@ from tensorfs.derived import SourceCapability
 from cozy_runtime import __version__ as RUNTIME_VERSION
 from cozy_runtime import graphs
 from cozy_runtime.author import describe
-from cozy_runtime.author._activity import settles
+from cozy_runtime.author._activity import ThreadPoolExecutor, settles
 from cozy_runtime.author._app import Registration
 from cozy_runtime.author._artifacts import ModelArtifact
 from cozy_runtime.author._assets import GrantedInput
@@ -118,7 +122,7 @@ from cozy_runtime.author._invoke import (
     prepare,
     run_prepared,
 )
-from cozy_runtime.author._model import WARNINGS, Model, component_use
+from cozy_runtime.author._model import WARNINGS, Model, WarningRow, component_use
 from cozy_runtime.author._observations import Attribution
 from cozy_runtime.author._services import AdjustmentRow, ProgressFrame
 from cozy_runtime.author._services import Attempt as AuthorAttempt
@@ -217,6 +221,8 @@ from cozy_runtime.internal.seam import (
     EXECUTOR_PROTOCOL_REVISION,
     RESULT_DOCUMENT,
     Channel,
+    Frame,
+    Mux,
     SeamError,
     connect,
 )
@@ -246,10 +252,12 @@ INLINE_RESULT_MAX = 4 * 1024 * 1024
 #: Outcomes that are capacity, not broken state: they fail the attempt and keep the executor.
 CAPACITY_CODES = frozenset({DEVICE_OOM, MEMORY_EXHAUSTED, "device_spared"})
 
-#: How many PREPARED requests this epoch holds at once. A serving lane admits and
-#: runs one attempt at a time, so anything past the newest few is a request the
-#: worker prepared and then never dispatched.
-PREPARED_HELD = 8
+#: Calls this executor runs at once: its pool's workers. More wait their turn in the pool.
+CALLS_IN_FLIGHT = 16
+
+#: How many PREPARED requests this epoch holds at once: anything past the newest few beyond
+#: the calls in flight is a request the worker prepared and then never dispatched.
+PREPARED_HELD = 2 * CALLS_IN_FLIGHT
 
 #: The environment as it was when this process started, restricted to the sealed names.
 #: Captured before any import that could initialize CUDA.
@@ -349,48 +357,89 @@ def _env_document() -> dict[str, Any]:
     return {"env_intact": not _env_changes(), "env_changed": list(changed)}
 
 
-def _cancelled(root: Path, request_id: str) -> bool:
-    """Whether the worker's one cooperative marker names this exact attempt."""
+#: The call the current thread serves ("" outside every call): its requests and its compile
+#: waits' progress name it.
+_CALL: contextvars.ContextVar[str] = contextvars.ContextVar("cozy_call", default="")
+
+
+def _cancelled(mux: Mux, root: Path, request_id: str, wait: float = 0.0) -> bool:
+    """Whether a `cancel` named this call, waiting up to `wait` seconds for one. TensorD 0.10
+    marks it in `root`'s `executor.cancel` instead, read once the wait ends."""
+    if mux.cancelled(request_id, wait):
+        return True
     try:
         return (root / "executor.cancel").read_text() == request_id
     except (OSError, UnicodeError):
         return False
 
 
-_IN_MOVED_TO = 0x80
-
-
 @contextlib.contextmanager
 def _held(
-    root: Path, request_id: str, waits: Attribution, waiter: str
+    mux: Mux, root: Path, request_id: str, waits: Attribution, waiter: str
 ) -> Iterator[Callable[[float], bool]]:
     """A compile wait of this request's preparation (`kernel_compile.held`): a stage of its
-    record, whose polls sleep until the worker's cancel marker (`_cancelled`) lands naming it,
-    which inotify sees at its rename into `root`. Without a watch (off Linux), each poll
-    reads it."""
-    fd = -1
-    if sys.platform == "linux":
-        libc = ctypes.CDLL(None, use_errno=True)
-        fd = libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
-        if fd >= 0 and libc.inotify_add_watch(fd, os.fsencode(root), _IN_MOVED_TO) < 0:
-            os.close(fd)
-            fd = -1
-
-    def sleep(seconds: float) -> bool:
-        if not _cancelled(root, request_id):
-            if fd < 0:
-                time.sleep(seconds)
-            elif select.select([fd], [], [], seconds)[0]:
-                os.read(fd, 1 << 16)
-        return _cancelled(root, request_id)
-
+    record, whose polls sleep until a cancel names it (`_cancelled`)."""
     started = time.perf_counter()
     try:
-        yield sleep
+        yield functools.partial(_cancelled, mux, root, request_id)
     finally:
-        if fd >= 0:
-            os.close(fd)
         waits.stage(f"waiting for {waiter} compile", (time.perf_counter() - started) * 1000)
+
+
+@dataclasses.dataclass(slots=True)
+class _Slot:
+    first: bool
+    leaving: bool = False
+    last: bool = False
+
+
+class _InFlight:
+    """The attempts in flight, side by side. The first in readies the plane and the last out
+    drains it, each with no other attempt running. One that changes what every attempt runs on
+    (a pinned kernel, a capture, a GPU group's call) runs alone, and later ones wait for it."""
+
+    def __init__(self) -> None:
+        self._changed = threading.Condition()
+        self.count = 0
+        self._leaving = 0
+        self._alone = False
+        self._queued = 0
+
+    @contextlib.contextmanager
+    def attempt(self, alone: bool) -> Iterator[_Slot]:
+        with self._changed:
+            self._queued += alone
+            self._changed.wait_for(
+                lambda: not self._alone and not (self.count if alone else self._queued)
+            )
+            self._queued -= alone
+            self.count += 1
+            slot = _Slot(first=self.count == 1)
+            self._alone = alone or slot.first
+        try:
+            yield slot
+        finally:
+            with self._changed:
+                self.count -= 1
+                self._leaving -= slot.leaving
+                self._alone = self._alone and self.count > 0
+                self._changed.notify_all()
+
+    def ready(self) -> None:
+        """The first in readied the plane: others may join it."""
+        with self._changed:
+            self._alone = False
+            self._changed.notify_all()
+
+    def last(self, slot: _Slot) -> bool:
+        """This attempt is leaving. Whether every attempt in flight is, so that this one drains
+        the plane, alone."""
+        with self._changed:
+            slot.leaving = True
+            self._leaving += 1
+            slot.last = self._leaving == self.count
+            self._alone = self._alone or slot.last
+            return slot.last
 
 
 def _distribution_version(name: str) -> str:
@@ -699,6 +748,9 @@ class Executor:
         self.channel = channel
         self.root = root
         self.host: Executor = host or self
+        #: HOST ONLY: the seam every thread reads through, and the attempts in flight
+        self.mux: Mux = host.mux if host is not None else Mux(channel)
+        self.in_flight: _InFlight = host.in_flight if host is not None else _InFlight()
         #: this process's CUDA context and first library launches, measured at device init
         #: from this process's own driver row (-1: not attributable)
         self.device_context = -1
@@ -791,9 +843,9 @@ class Executor:
         self._bound_calls: tuple[tuple[CallInterface, ...], CallBindings] | None = None
         self.ready = False
         self.poisoned = ""
-        #: the current attempt's handler outcome, the stage it last reported and its record:
+        #: by request: an attempt's handler outcome, the stage it last reported and its record,
         #: the reason an attempt whose tail raised still answers with (`unsettled`)
-        self.handled: tuple[Outcome, str, AuthorAttempt] | None = None
+        self.handled: dict[str, tuple[Outcome, str, AuthorAttempt]] = {}
         self.constructed_model_digest = ""
         #: What the runtime pinned on this generation's attention sites (cr-124). One BOOT
         #: line, not a per-attempt record: the choice is a function of device and image.
@@ -815,11 +867,6 @@ class Executor:
         #: request_id -> the record `prepare_request` resolved, run by `invoke`
         self.prepared: dict[str, PreparedRequest] = {}
         self.attempts = 0
-        #: the DURABLE exchange counter (cr-009). Worker-answered, never sheddable.
-        self._exchange = 0
-        #: one exchange at a time: a publish from a joining thread and a child poll from the
-        #: event loop share the seam, and each answer belongs to its own request.
-        self._durable_lock = threading.Lock()
 
     # ------------------------------------------------------------------ prepare
 
@@ -849,7 +896,8 @@ class Executor:
                     return self._settled(self.serve_invoke(command))
                 except Exception as exc:
                     key = command.construction or self.active
-                    return self.unsettled(self.constructions.get(key, self), exc)
+                    target = self.constructions.get(key, self)
+                    return self.unsettled(target, exc, command.request_id)
             case Probe():
                 if command.collect:
                     gc.collect()
@@ -1392,10 +1440,7 @@ class Executor:
                     prepared=owner.group_components,
                     group=self.group,
                     spool=lambda: owner._attempt_spool,
-                    cancelled=lambda: (
-                        bool(owner._attempt_request)
-                        and _cancelled(owner.root, owner._attempt_request)
-                    ),
+                    cancelled=owner._attempt_cancelled,
                     rerun=owner._group_rerun,
                     journaled=owner._call_journal,
                     device=self._rank_device(torch),
@@ -1423,10 +1468,7 @@ class Executor:
                     spool=lambda: owner._attempt_spool,
                     rank=home,
                     device=self._rank_device(torch),
-                    cancelled=lambda: (
-                        bool(owner._attempt_request)
-                        and _cancelled(owner.root, owner._attempt_request)
-                    ),
+                    cancelled=owner._attempt_cancelled,
                 )
         # Every rank may take a spread call. A rank homing a placeable component takes one
         # only beside everything it holds (measured room), so it never gives up the
@@ -1449,10 +1491,7 @@ class Executor:
                     group=self.group,
                     spool=lambda: owner._attempt_spool,
                     device=self._rank_device(torch),
-                    cancelled=lambda: (
-                        bool(owner._attempt_request)
-                        and _cancelled(owner.root, owner._attempt_request)
-                    ),
+                    cancelled=owner._attempt_cancelled,
                 )
         self.facts["sequence_parallel"] = {
             "degree": self.world,
@@ -1464,6 +1503,12 @@ class Executor:
             "followers": list(self.group.pids()) if self.group is not None else [],
         }
         return None
+
+    def _attempt_cancelled(self) -> bool:
+        """A group's one attempt is cancelled (its calls on the other GPUs read this)."""
+        return bool(self._attempt_request) and _cancelled(
+            self.mux, self.root, self._attempt_request
+        )
 
     def _call_journal(self) -> contextlib.AbstractContextManager[Journal | None]:
         """One GPU of a group in a call: every op it runs is journaled (`weights.journaling`),
@@ -3177,11 +3222,11 @@ class Executor:
         target = self._target(command, attempt=False)
         if isinstance(target, dict):
             return target
-        if self.fetch is not None:
+        if self.fetch is not None and not self.in_flight.count:
             # The attempt re-asserts what it reads, on its own channel, in the order this
             # process learned: a no-op for objects already here, and every fetch stays owned
             # by a live call. The channel it replaces goes only after (nothing on the wire
-            # stops), and nothing of an earlier call carries over.
+            # stops), and nothing of an earlier call carries over. Calls in flight keep theirs.
             groups = [
                 group
                 for member in target.model_executors or [target]
@@ -3200,7 +3245,35 @@ class Executor:
         target = self._target(command, attempt=True)
         if isinstance(target, dict):
             return target
-        target.handled = None
+        if (refused := target._unready(command)) is not None:
+            return refused
+        requested = _attention_pin(command.attention_kernel, command.bits)
+        alone = (
+            self.world > 1
+            or command.capture is not None
+            or bool(requested and target._attention_reaches(requested))
+        )
+        with self.in_flight.attempt(alone) as slot:
+            try:
+                if slot.first:
+                    refused = self._ready(target, command)
+                    if refused is not None:
+                        return refused
+                elif self.weights is not None:
+                    self.weights.seed_activations(command.activation_bytes)
+                if not alone:
+                    self.in_flight.ready()
+                reply = target.invoke(command, slot)
+            finally:
+                if self.fetch is not None and (slot.last or self.in_flight.count == 1):
+                    self.fetch.end()
+        self.attempts += 1
+        self.poisoned = self.poisoned or target.poisoned
+        reply["poisoned"] = self.poisoned
+        return reply
+
+    def _ready(self, target: Executor, command: Invoke) -> Frame | None:
+        """The first attempt in: the plane takes its grant, and nothing earlier carries over."""
         # The plane's budget derives from the driver at every attempt (TensorD sends none), so
         # a cut to 0 never outlives the attempt that follows it. Only a grant that changed
         # reaches the group's GPUs.
@@ -3229,15 +3302,15 @@ class Executor:
             self.weights.seed_squeezed(command.squeezed_bytes)
             if not isinstance(command.device_weights, UnsetType):
                 self._device_weights(command.device_weights)
-        try:
-            reply = target.invoke(command)
-        finally:
-            if self.fetch is not None:
-                self.fetch.end()
-        self.attempts += 1
-        self.poisoned = self.poisoned or target.poisoned
-        reply["poisoned"] = self.poisoned
-        return reply
+            self.weights.modes.clear()
+            self.weights.memory.refusal = None
+        target._upgrade_attention()
+        target._install_ready_kernels()
+        if target.residency is not None:
+            target.residency.open_attempt()
+        if target.torch is not None:
+            accel.reset_peak(target.torch, target.device_kind)
+        return None
 
     def prepare_request(self, command: PrepareRequest) -> dict[str, Any]:
         """Resolve ONE request through the kernel's pre-admission half, and retain it.
@@ -3271,7 +3344,7 @@ class Executor:
         waits = Attribution()
         if pin and self._attention_reaches(pin):
             held = kernel_compile.held.set(
-                functools.partial(_held, self.root, command.request_id, waits)
+                functools.partial(_held, self.host.mux, self.root, command.request_id, waits)
             )
             try:
                 self._attention_plan(pin)
@@ -3309,7 +3382,7 @@ class Executor:
         # A prepared request the worker never dispatched (a refusal after the plan, a
         # cancel while it queued) would otherwise be retained for the generation's life.
         for stale in list(self.prepared)[: -PREPARED_HELD or None]:
-            del self.prepared[stale]
+            self.prepared.pop(stale, None)
         return {
             "ok": True,
             "features": dict(prepared.features.values),
@@ -3317,8 +3390,8 @@ class Executor:
             **prepared.digests(),
         }
 
-    def invoke(self, command: Invoke) -> dict[str, Any]:
-        """ONE attempt through the author kernel, with the §3.4 freeze point held."""
+    def _unready(self, command: Invoke) -> Frame | None:
+        """Why this construction cannot run `command` now, before it joins the attempts."""
         if not self.ready:
             return {
                 "ok": False,
@@ -3328,15 +3401,13 @@ class Executor:
             }
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
-        surface = self.surface_names.get(command.entrypoint)
-        if surface is None:
+        if self.surface_names.get(command.entrypoint) is None:
             return {
                 "ok": False,
                 "code": "unknown_entrypoint",
                 "detail": f"{command.entrypoint!r} is not an entrypoint of this release",
             }
-        prepared = self.prepared.pop(command.request_id, None)
-        if prepared is None:
+        if command.request_id not in self.prepared:
             return {
                 "ok": False,
                 "code": "prepared_request_absent",
@@ -3344,12 +3415,16 @@ class Executor:
                 "runs the record its plan was priced against, and this executor holds none "
                 "(a fresh epoch holds nothing at all)",
             }
+        return None
+
+    def invoke(self, command: Invoke, slot: _Slot) -> dict[str, Any]:
+        """ONE attempt through the author kernel, with the §3.4 freeze point held."""
+        surface = self.surface_names[command.entrypoint]
+        prepared = self.prepared.pop(command.request_id)
         requested = _attention_pin(command.attention_kernel, command.bits)
         # A pin is the run's: a call holding no site in its scope runs its own selection,
         # and the worker reports a run none of whose calls applied it.
         pin = requested if requested and self._attention_reaches(requested) else ""
-        self._upgrade_attention()
-        self._install_ready_kernels()
         try:
             swap = self._attention_plan(pin) if pin else None
             self._restore_attention()
@@ -3374,14 +3449,6 @@ class Executor:
         # exact case triage exists for. A seam refusal there is dropped live output, the ONE
         # loss this lane may incur.
         progress = self._progress_sink(command.request_id)
-
-        if self.residency is not None:
-            self.residency.open_attempt()
-        if self.host.weights is not None:
-            self.host.weights.modes.clear()
-            self.host.weights.memory.refusal = None
-        if torch is not None:
-            accel.reset_peak(torch, self.device_kind)
         allocated_at_start = accel.allocated(torch, self.device_kind) if torch is not None else 0
         lease_acquired = time.perf_counter()
         started_wall = time.time()
@@ -3411,7 +3478,7 @@ class Executor:
                 return  # an override holds its kernel for every step
             if not segments:
                 segments.append(_segment("", 0, served_attention, started_us))
-            if not self._upgrade_attention():
+            if self.host.in_flight.count > 1 or not self._upgrade_attention():
                 return
             later.append(self._attention_selection(attention.observed(self._attention_roots())))
             row = _segment(frame.stage, steps.get(frame.stage, 0), later[-1])
@@ -3427,8 +3494,10 @@ class Executor:
         }
         storage = ExecutionStorage(spool, self._durable, command.weights)
         stage_memo.ENGINE.open(self._durable, spool)
+        warnings: list[WarningRow] = []
         try:
             with (
+                WARNINGS.attempt() as warnings,
                 self._recovering(),
                 attention.override(
                     self._attention_snapshot(), self._attention_roots(), swap, pin
@@ -3447,7 +3516,9 @@ class Executor:
                             spool=spool,
                             deadline=deadline,
                             device=self._device(),
-                            cancel=lambda: _cancelled(self.root, command.request_id),
+                            cancel=functools.partial(
+                                _cancelled, self.host.mux, self.root, command.request_id
+                            ),
                             models=self.models,
                             progress=boundary,
                             activity=self._activity_sink(command.request_id),
@@ -3483,7 +3554,7 @@ class Executor:
             if record is None:
                 record = AuthorAttempt(command.request_id, spool, 0, sink=progress)
         assert record is not None
-        self.handled = (outcome, stage[0], record)
+        self.handled[command.request_id] = (outcome, stage[0], record)
         if self.rank == 0:
             for member in self.model_executors or [self]:
                 self._emit_gemm(record, member)
@@ -3491,13 +3562,12 @@ class Executor:
                 record.emit(
                     "log", f"{feature} unavailable on {self.device_kind}", "warn", instead=instead
                 )
-            for message, raised in (*WARNINGS, *tools.warnings()):
+            for message, raised in (*warnings, *tools.warnings()):
                 record.emit("log", message, "warn", **raised)
             members = self.model_executors or [self]
             facts = next((m.device_facts for m in members if m.device_facts), None)
             if facts is not None and (unnamed := arch.inherited(facts.sm, facts.name)):
                 record.emit("log", unnamed, "warn")
-        WARNINGS.clear()
         stage_memo.ENGINE.close(record.emit)
         if later:
             # The override put back the run's first selection; the construction keeps its last.
@@ -3543,8 +3613,10 @@ class Executor:
             else attention.observed(self._attention_roots())
         )
         self._emit_attention(record, restored, "attention.restored")
+        # The last attempt out drains the device and reads its context, with none running.
+        last = self.host.in_flight.last(slot)
         # The first stages launch the libraries' kernels and workspaces: the context grows.
-        if self.host.weights is not None:
+        if self.host.weights is not None and last:
             self.host.weights.measure_context()
         # THE MODES THIS ATTEMPT RAN IN (weight-plane.md principle 7): where decode maps lived
         # and batch layout, each decided before its stage and recorded with the run.
@@ -3566,11 +3638,11 @@ class Executor:
         # tenant gives room by a budget cut, never by a per-request cache flush. A
         # WEIGHTLESS generation holds no stream, so its quiescence is structural.
         d2h_started = time.perf_counter()
-        if self.residency is not None:
+        if self.residency is not None and last:
             self.residency.unpark()  # a repeating stage closes with its attempt
-        if torch is not None:
+        if torch is not None and last:
             accel.drain(torch, self.device_kind)
-        if self.residency is not None:
+        if self.residency is not None and last:
             # Weights the attempt's activations took map again on the plane's copy streams:
             # keeping hot is never the attempt's verdict.
             try:
@@ -3591,7 +3663,8 @@ class Executor:
         # DEVICE RELEASE IS THIS REPLY (cr-079): the handler registered its outputs as raw
         # host frames, so `device_lease_ms` is device time and the encode is the worker's.
         lease_ms = (time.perf_counter() - lease_acquired) * 1000
-        quiescent = self._quiescent() if torch is not None else True
+        # An attempt leaving others running has its outputs on the host; theirs are theirs.
+        quiescent = self._quiescent() if torch is not None and last else True
         self.attempts += 1
         result_ref, outputs, oversize = _serialize_result(envelope, spool)
         # Only a failure inside the handler leaves package state unknown. A request refusal,
@@ -3631,6 +3704,7 @@ class Executor:
         # and cr-011 hoisted the record out of `invoke` precisely so it survives the failure.
         exhausted = weights is not None and outcome.code == MEMORY_EXHAUSTED
         shortfall = weights.memory.refusal if exhausted and weights is not None else None
+        del self.handled[command.request_id]
         return {
             "ok": True,
             "shortfall": shortfall,
@@ -4371,7 +4445,7 @@ class Executor:
 
         This is the seam's other half of `child.Executor.call(on_request=…)`. It is a
         separate lane from progress on purpose: a durable fact must not be sheddable, and
-        the lossy lane's whole contract is that it may shed.
+        the lossy lane's whole contract is that it may shed. It names the call it serves.
         """
         body = encode_request(request)
         sending = (
@@ -4382,37 +4456,28 @@ class Executor:
         body.pop("memfd", None)
         shared = request.fds if isinstance(request, DeviceTier) else ()
         body.pop("fds", None)
-        # One exchange at a time on the channel the host and its constructions share.
-        host = self.host
-        with host._durable_lock:
-            host._exchange += 1
-            exchange = f"{body['kind']}#{host._exchange}"
+        if sending >= 0:
+            body["descriptor"] = True
+        if shared:
+            body["descriptors"] = len(shared)
+        channel, exchange = self.channel, body["kind"]
+
+        def send() -> None:
             if sending >= 0:
-                body["descriptor"] = True
-            if shared:
-                body["descriptors"] = len(shared)
-            self.channel.send({"event": "request", "seq": host._exchange, **body})
-            if sending >= 0:
-                self.channel.send_memfd(sending)
+                channel.send_memfd(sending)
             for fd in shared:
-                self.channel.send_shared(fd)
-            frame = self.channel.recv()
-            if frame is None:
-                raise SeamError("seam_closed", f"the worker closed during {exchange}")
-            if frame.get("event") != "answer" or frame.get("seq") != host._exchange:
-                raise SeamError(
-                    "seam_out_of_order",
-                    f"expected the answer to {exchange}, got {frame.get('event')!r}",
-                )
+                channel.send_shared(fd)
+
+        def receive(frame: Frame) -> None:
             handoff = issubclass(into, Handoff)
             if frame.get("descriptor") is True:
                 if issubclass(into, Tier):
-                    frame["descriptor"] = self.channel.recv_memfd()
+                    frame["descriptor"] = channel.recv_memfd()
                 elif not handoff:
-                    self.channel.close()
+                    channel.close()
                     raise SeamError("seam_descriptor", "unexpected capability in control reply")
                 else:
-                    frame["descriptor"] = self.channel.recv_descriptor()
+                    frame["descriptor"] = channel.recv_descriptor()
             elif handoff and frame.get("ok") is True:
                 raise SeamError("seam_descriptor", "successful reply omitted its capability")
             # descriptors arrive by SCM_RIGHTS, never as numbers
@@ -4428,27 +4493,29 @@ class Executor:
                     or type(count) is not int
                     or count < 0
                 ):
-                    self.channel.close()
+                    channel.close()
                     raise SeamError("seam_descriptor", "unexpected descriptors in a reply")
                 received: list[int] = []
                 try:
                     for _ in range(count):
-                        received.append(
-                            self.channel.recv_file() if files else self.channel.recv_shared()
-                        )
+                        received.append(channel.recv_file() if files else channel.recv_shared())
                     if lease:
-                        frame["lease_fd"] = self.channel.recv_lease()
+                        frame["lease_fd"] = channel.recv_lease()
                 except BaseException:
                     for fd in received:
                         os.close(fd)
                     raise
                 frame["fds"] = received
+
+        frame = self.host.mux.ask(
+            {"event": "request", "request_id": _CALL.get(), **body}, send, receive
+        )
         try:
             return tolerant.read(frame, into, ("progress", "observation"))[0]
         except msgspec.ValidationError as exc:
             raise SeamError("seam_answer_malformed", f"{exchange}: {exc}") from exc
 
-    def _relay(self, follower: Channel, frame: dict[str, Any]) -> None:
+    def _relay(self, follower: Channel, frame: Frame) -> None:
         """A follower's own request to the machine, sent on rank 0's seam and answered on the
         follower's with every descriptor passed through: its sealed layouts and model files,
         asked exactly as rank 0 asks them. The follower is inside one command and reads
@@ -4464,25 +4531,28 @@ class Executor:
                 | {"detail": detail}
             )
             return
-        with self._durable_lock:
-            self._exchange += 1
-            self.channel.send({**frame, "seq": self._exchange})
-            if sends:
-                follower.pass_fd(self.channel)
-            answer = self.channel.recv()
-            if answer is None:
-                raise SeamError("seam_closed", f"the machine closed during a relayed {kind}")
+
+        def receive(answer: Frame) -> None:
             count = answer.get("descriptors", 0)
-            if (
-                answer.get("event") != "answer"
-                or answer.get("seq") != self._exchange
-                or type(count) is not int
-                or count < 0
-            ):
+            if type(count) is not int or count < 0:
                 raise SeamError("seam_out_of_order", f"no answer to a relayed {kind}")
-            follower.send({**answer, "seq": seq})
-            for _ in range(count + (answer.get("descriptor") is True)):
-                self.channel.pass_fd(follower)
+            passed = count + (answer.get("descriptor") is True)
+            answer["passed"] = [self.channel._recv_fd() for _ in range(passed)]
+
+        answer = self.mux.ask(
+            {**frame, "request_id": self._attempt_request},
+            (lambda: follower.pass_fd(self.channel)) if sends else lambda: None,
+            receive,
+        )
+        passed: list[int] = answer.pop("passed")
+        try:
+            with follower.sending:
+                follower.send({**answer, "seq": seq})
+                for fd in passed:
+                    follower._send_fd(fd, "relayed capability")
+        finally:
+            for fd in passed:
+                os.close(fd)
 
     def _activity_sink(self, request_id: str) -> Callable[[int, bool, bool, bool], None]:
         def activity(sequence: int, active: bool, known: bool, finished: bool) -> None:
@@ -4789,13 +4859,13 @@ class Executor:
             "reserved_bytes": memory["reserved_bytes"],
         }
 
-    def unsettled(self, target: Executor, exc: Exception) -> dict[str, Any]:
+    def unsettled(self, target: Executor, exc: Exception, request_id: str) -> dict[str, Any]:
         """An attempt that raised outside its handler. A CUDA fault is sticky, so the tail's
         first sync raises it again: the process cannot serve another attempt, and the reply
         names the handler's own failure (else this one) and the stage it happened in. Memory
         is capacity: it ends the attempt, never the process, and its facts go with it."""
         later = classify(exc)
-        first, stage, record = target.handled or (later, "", None)
+        first, stage, record = target.handled.pop(request_id, None) or (later, "", None)
         first = first if first.terminal == "failed" else later
         where = f" in {stage}" if stage else ""
         message = first.message + where + ("" if first is later else f"; then {later.message}")
@@ -4867,7 +4937,7 @@ class Executor:
 _TELEMETRY = ("observations", "execution", "attribution")
 
 
-def _send_reply(channel: Channel, reply: dict[str, Any]) -> None:
+def _send_reply(channel: Channel, reply: Frame) -> None:
     """Put ONE reply on the seam. Telemetry never costs a reply its outcome."""
     try:
         channel.send(reply)
@@ -4971,7 +5041,7 @@ _FOLLOWER_COMMANDS = frozenset(
 )
 
 
-def answer(executor: Executor, frame: dict[str, Any]) -> dict[str, Any] | None:
+def answer(executor: Executor, frame: Frame) -> Frame | None:
     """One command's reply as this GPU's process answers it; None is `shutdown`."""
     name = str(frame.get("cmd", ""))
     if executor.rank > 0 and name not in _FOLLOWER_COMMANDS:
@@ -5061,12 +5131,13 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _compiling(channel: Channel, state: kernel_compile.State) -> None:
-    """A wait on a compiling kernel, told to the machine as the running request's stage."""
+    """A wait on a compiling kernel, told to the machine as the waiting call's stage ("": the
+    executor's, outside every call)."""
     with contextlib.suppress(SeamError):
         channel.send(
             {
                 "event": "progress",
-                "request_id": "",
+                "request_id": _CALL.get(),
                 "kind": "progress",
                 "stage": f"waiting for {state.kernel} compile",
                 "stage_fraction": state.progress,
@@ -5075,45 +5146,77 @@ def _compiling(channel: Channel, state: kernel_compile.State) -> None:
         )
 
 
+#: Commands of one call: served on the executor's pool, side by side with other calls.
+_CALL_COMMANDS = frozenset({"prepare_request", "invoke"})
+
+
 def serve(executor: Executor, channel: Channel) -> int:
-    """Answer commands until the machine shuts this executor down or its seam ends."""
+    """Answer commands until the machine shuts this executor down or its seam ends. A call's
+    commands run on the pool, and a process-wide command once no call is in flight."""
     kernel_compile.waiting = functools.partial(_compiling, channel)
+    # Runtime-owned workers (no attempt counts them as its own), none before the first call.
+    calls = ThreadPoolExecutor(CALLS_IN_FLIGHT, "call")
+    running: set[Future[None]] = set()
     while True:
         try:
-            frame = channel.recv()
+            frame = executor.mux.command()
         except SeamError:
             return int(Exit.unavailable)
         if frame is None:
             return int(Exit.ok)
         name = str(frame.get("cmd", ""))
-        if executor.group is not None and executor.group.broken and not executor.poisoned:
-            # A FOLLOWER DIED BETWEEN COMMANDS (cr-068): the group is one executor, so this
-            # process is poisoned before it answers anything, and the worker's next
-            # command reads `poisoned_generation` and rebuilds the whole cgroup.
-            executor.poisoned = f"group: {executor.group.broken}"[:200]
-        try:
-            answered = answer(executor, frame)
-            if answered is None:  # shutdown
-                if executor.group is not None:
-                    executor.group.close()
-                channel.send({"reply": name, "ok": True})
-                return int(Exit.ok)
-            reply = answered
-        except msgspec.ValidationError as exc:
-            reply = {"ok": False, "code": "command_malformed", "detail": str(exc)[:1024]}
-        except Exception as exc:  # the executor reports its own faults; it never hides one
-            outcome: Outcome = classify(exc)
-            reply = {
-                "ok": False,
-                "code": outcome.code,
-                "detail": f"{type(exc).__name__}: {exc}"[:1024],
-                "terminal": outcome.terminal,
-                "origin": outcome.origin,
-            }
-            if name in _TRACED_COMMANDS:
-                reply["traceback"] = prepare_diagnostics.exception_trace(exc)
-        reply["reply"] = name
+        if name in _CALL_COMMANDS and executor.rank == 0:
+            context = contextvars.Context()
+            running.add(calls.submit(context.run, _serve_call, executor, frame))
+            continue
+        wait(running)
+        running.clear()
+        reply = _reply(executor, frame)
+        if reply is None:  # shutdown
+            if executor.group is not None:
+                executor.group.close()
+            channel.send({"reply": name, "ok": True})
+            return int(Exit.ok)
         _send_reply(channel, reply)
+
+
+def _serve_call(executor: Executor, frame: Frame) -> None:
+    request_id = str(frame.get("request_id", ""))
+    _CALL.set(request_id)
+    reply = _reply(executor, frame)
+    assert reply is not None
+    if frame["cmd"] == "invoke":
+        executor.mux.forget(request_id)
+    _send_reply(executor.channel, {**reply, "request_id": request_id})
+
+
+def _reply(executor: Executor, frame: Frame) -> Frame | None:
+    """One command's reply, its faults included; None is `shutdown`."""
+    name = str(frame.get("cmd", ""))
+    if executor.group is not None and executor.group.broken and not executor.poisoned:
+        # A FOLLOWER DIED BETWEEN COMMANDS (cr-068): the group is one executor, so this
+        # process is poisoned before it answers anything, and the worker's next
+        # command reads `poisoned_generation` and rebuilds the whole cgroup.
+        executor.poisoned = f"group: {executor.group.broken}"[:200]
+    try:
+        reply = answer(executor, frame)
+        if reply is None:
+            return None
+    except msgspec.ValidationError as exc:
+        reply = {"ok": False, "code": "command_malformed", "detail": str(exc)[:1024]}
+    except Exception as exc:  # the executor reports its own faults; it never hides one
+        outcome: Outcome = classify(exc)
+        reply = {
+            "ok": False,
+            "code": outcome.code,
+            "detail": f"{type(exc).__name__}: {exc}"[:1024],
+            "terminal": outcome.terminal,
+            "origin": outcome.origin,
+        }
+        if name in _TRACED_COMMANDS:
+            reply["traceback"] = prepare_diagnostics.exception_trace(exc)
+    reply["reply"] = name
+    return reply
 
 
 if __name__ == "__main__":

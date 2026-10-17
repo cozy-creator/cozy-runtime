@@ -277,4 +277,4 @@ def test_a_head_attached_as_a_package_attaches_it_decodes_graphed() -> None:
         draft=draft,
     )
     assert torch.equal(got, want)
-    assert WARNINGS == []
+    assert not WARNINGS
