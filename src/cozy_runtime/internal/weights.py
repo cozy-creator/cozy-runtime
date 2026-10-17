@@ -27,7 +27,7 @@ import re
 import time
 import weakref
 import zlib
-from collections import deque
+from collections import Counter, deque
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, nullcontext, suppress
 from dataclasses import dataclass, field, replace
@@ -66,6 +66,7 @@ from cozy_runtime.internal.encoding import (
     measure_device,
     measure_runtime,
 )
+from cozy_runtime.internal.encoding.leaves import sites as leaf_sites
 from cozy_runtime.internal.executor_replies import PlaneFacts, Streamed
 from cozy_runtime.internal.fetch_plan import Fetches, Group, Ref, region_objects, stage_components
 from cozy_runtime.internal.fill import (
@@ -2473,6 +2474,8 @@ class PlaneBackend:
         self.encoded_leaves = "refuse"
         #: contract key -> (installed leaf, replaced module, derived roles)
         self.leaves: dict[str, tuple[Any, Any, tuple[str, ...]]] = {}
+        #: (component, provider) -> installed leaves, counted when they install (`gemm.selected`)
+        self.gemm_sites: Counter[tuple[str, str]] = Counter()
 
     @classmethod
     def for_script(
@@ -2737,6 +2740,7 @@ class PlaneBackend:
         self.leaves = {
             key: self._install_leaf(key) for key in order if self._route(key) == "encoded_gemm"
         }
+        self.gemm_sites = leaf_sites(self.leaves)
         prepared = {
             name: self._prepare_layout(name, root, keys)
             for name, root in self.roots.items()
