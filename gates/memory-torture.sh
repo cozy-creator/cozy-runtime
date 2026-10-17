@@ -11,7 +11,7 @@ set -uo pipefail
 H=$1 W=$2; shift 2
 CARDS=${*:-8 12 24 32 2x8}
 declare -A SKUS=([8]="rtx-3070" [12]="rtx-5070 rtx-3080-ti rtx-4070-ti" [24]="rtx-4000-ada rtx-pro-4000 l4"
-  [32]="rtx-pro-4500 rtx-5090" [2x8]="rtx-3070")
+  [32]="rtx-pro-4500 rtx-5090" [2x8]="rtx-3070 rtx-5060-ti rtx-4060-ti rtx-3080-ti l4")
 D=$PWD/memory-torture-$(date -u +%Y%m%dT%H%M%SZ); mkdir -p "$D"; cd "$D" || exit 1
 TAG=$(basename "$D") FAILED=0 M=""
 say() { echo "$(date -u +%T) $*" | tee -a summary.txt; }
