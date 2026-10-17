@@ -45,8 +45,11 @@ class Join(Command, frozen=True, kw_only=True, tag="join"):
     cell: bool = False
     #: A socket follows: a byte on it aborts this follower's collectives (`RankGroup.interrupt`).
     abort: bool = False
-    #: The group forms again after a call ran out of memory: device bytes to give back first.
-    room: int = -1
+    #: The group forms again after a call ended short of memory (`mirror.mirror_component`).
+    again: bool = False
+    #: This GPU ran out in a collective: it first makes more room than its last run had (-1:
+    #: none yet), and answers the room it found.
+    seen: int | None = None
     #: The NCCL route rank 0 chose from the group's measured links; set before joining.
     nccl: dict[str, str] = {}
     #: Every GPU then times NCCL against its copy engines (`copy_engine.calibrate`).

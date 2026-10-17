@@ -23,6 +23,7 @@ from transformers.modeling_outputs import BaseModelOutputWithPast
 from cozy_runtime.author import AdapterRef, Model, placeable, spread, uses_components
 from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT, AttentionLayout, attention_scope
 from cozy_runtime.author._loader import census
+from cozy_runtime.author._model import RELEASERS
 from cozy_runtime.internal import attention, lora_composition, lora_contract
 from cozy_runtime.internal.encoding import SPEC_PLAIN, DeviceFacts
 from cozy_runtime.internal.executor import Executor, _capture_seal, answer
@@ -35,8 +36,17 @@ from cozy_runtime.internal.weights import PlaneBackend, WeightResidency, Weights
 from cozy_runtime.internal.weights_sink import weights_transaction_id
 
 
+def collective_oom() -> Exception:
+    """What NCCL raises when it cannot allocate inside a collective."""
+    return torch.distributed.DistBackendError(
+        "NCCL error in: ProcessGroupNCCL.cpp:3356, unhandled cuda error\n"
+        "ncclUnhandledCudaError: Call to CUDA function failed.\nLast error:\n"
+        "Cuda failure 2 'out of memory'"
+    )
+
+
 class Collective(torch.nn.Module):  # type: ignore[misc]  # torch is optional in the base checking env
-    #: this process's calls that asked to run out of memory, after and before the collective
+    #: this process's calls whose collective was to run out of memory, after and before it
     ooms = 0
     ooms_before = 0
 
@@ -59,6 +69,7 @@ class Collective(torch.nn.Module):  # type: ignore[misc]  # torch is optional in
         oom_before: int = 0,
         stall: float = 0.0,
         leader_skips: bool = False,
+        exhausted: bool = False,
     ) -> Any:
         assert in_gated_call()
         expected_layout = None if step is None else AttentionLayout(29, 9, step, 1, ("blocks.0",))
@@ -80,11 +91,11 @@ class Collective(torch.nn.Module):  # type: ignore[misc]  # torch is optional in
         if fail_leader and rank == 0:
             raise RuntimeError("GPU 0 ran out of memory")
         if oom_before and rank > 0:
-            # A follower's first `oom_before` calls run out of memory before the collective:
-            # GPU 0 waits in it until the group's collectives are aborted.
+            # A follower's first `oom_before` calls run out of memory in a collective before
+            # GPU 0's: GPU 0 waits in its own until the group's collectives are aborted.
             Collective.ooms_before += 1
             if Collective.ooms_before <= oom_before:
-                raise torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 64.00 MiB.")
+                raise collective_oom()
         if stall and rank > 0:
             time.sleep(stall)  # GPU 0 is inside the collective meanwhile
         if leader_skips and rank == 0:
@@ -93,10 +104,12 @@ class Collective(torch.nn.Module):  # type: ignore[misc]  # torch is optional in
         if leader_skips:
             result = result.cpu()  # GPU 1's host waits on it too
         if oom and torch.distributed.get_rank() > 0:
-            # A follower's first `oom` calls run out of memory after its collectives.
+            # A follower's first `oom` calls run out of memory in a later collective.
             Collective.ooms += 1
             if Collective.ooms <= oom:
-                raise torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 64.00 MiB.")
+                raise collective_oom()
+        if exhausted and rank > 0:
+            raise torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 64.00 MiB.")
         return result
 
 
@@ -132,6 +145,11 @@ class ModelCalls(Model[object]):
     def out_of_memory(self, times: int) -> Any:
         with torch.no_grad():
             return self.block(torch.ones(1), oom=times)
+
+    @uses_components("block", "overlay")
+    def exhausted(self) -> Any:
+        with torch.no_grad():
+            return self.block(torch.ones(1), exhausted=True)
 
     @uses_components("block", "overlay")
     def counted(self, after: int = 0, before: int = 0) -> Any:
@@ -472,15 +490,29 @@ def h3_batch(*, mixed_lengths: bool = False) -> dict[str, Any]:
     }
 
 
-def out_of_memory_at(block: torch.nn.Module, call: int) -> None:
-    """`block` runs out of memory on its `call`-th forward, before it runs: the GPUs before it in
-    the group are already in its first collective."""
+def out_of_memory_at(block: torch.nn.Module, call: int, released: Path | None = None) -> None:
+    """`block` runs out of memory on its `call`-th forward, before it runs. With `released`: a
+    real allocation on the card, inside the forward, that fits only once a cache the ladder
+    sheds (`RELEASERS`) let a ballast go, which it marks; else a collective out of memory, the
+    GPUs before it in the group already in its first collective."""
     calls = [0]
 
     def hook(module: Any, args: Any) -> None:
         calls[0] += 1
-        if calls[0] == call:
-            raise torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 2.00 GiB.")
+        if calls[0] != call:
+            return
+        if released is None:
+            raise collective_oom()
+        free, _ = torch.cuda.mem_get_info()
+        ballast = [torch.empty(free - (256 << 20), dtype=torch.uint8, device="cuda")]
+
+        def release() -> None:
+            ballast.clear()
+            RELEASERS.remove(release)
+            released.touch()
+
+        RELEASERS.append(release)
+        torch.empty(512 << 20, dtype=torch.uint8, device="cuda")  # an activation
 
     block.register_forward_pre_hook(hook)
 
@@ -499,8 +531,10 @@ def main() -> None:
     parser.add_argument("--spread", action="store_true")
     #: an NCCL group: this rank's card, once it has joined
     parser.add_argument("--cuda", action="store_true")
-    #: the tiny H3 DiT's second transformer block runs out of memory on this call (1-based)
+    #: the tiny H3 DiT's second transformer block runs out of memory on this call (1-based):
+    #: in a collective, or in an op that recovers on its own GPU (`out_of_memory_at`)
     parser.add_argument("--oom-at", type=int, default=0)
+    parser.add_argument("--op-oom-at", type=int, default=0)
     args = parser.parse_args()
     if args.cuda:  # a stuck NCCL test says where each process is
         faulthandler.dump_traceback_later(60, repeat=True)
@@ -534,6 +568,8 @@ def main() -> None:
     executor.backend = prepared(roots, HOSTED_SIZES if args.hosted else None)
     executor.torch = torch
     executor.ready = True
+    if not args.cuda:  # no device memory: each rerun finds 512 MiB more, up to 1 GiB
+        executor._again = lambda seen: max(seen, 0) + (512 << 20) if seen < 1 << 30 else -1
     if not args.h3:
         executor.group_components = {("fixture", key): (model, root) for key, root in roots.items()}
         executor.group_sharded.add(("fixture", "block"))
@@ -543,12 +579,16 @@ def main() -> None:
             return
         if name == "join":
             reply = executor.join(decode(command))
-            again = int(command.get("room", -1)) >= 0  # the group formed again: installed
+            again = bool(command.get("again"))  # the group formed again: installed
             if args.cuda and reply.get("ok") and not again:
+                device = executor._rank_device(torch)
+                executor.weights = executor.weights or Weights(torch, device, "cuda")
                 for root in roots.values():
-                    root.to(executor._rank_device(torch))
-                if args.oom_at:
-                    out_of_memory_at(model.dit.transformer_blocks[1], args.oom_at)
+                    root.to(device)
+                if args.oom_at or args.op_oom_at:
+                    released = args.root / f"released-{args.rank}" if args.op_oom_at else None
+                    block = model.dit.transformer_blocks[1]
+                    out_of_memory_at(block, args.oom_at or args.op_oom_at, released)
             if args.h3 and reply.get("ok") and not again:
                 refused = executor._install_group(torch, model, HOSTED_CAPACITY)
                 assert refused is None, refused

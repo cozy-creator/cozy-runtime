@@ -23,6 +23,7 @@ from typing import Annotated, Any, Protocol, TypedDict
 
 import msgspec
 
+from cozy_runtime.author._errors import DEVICE_OOM, MEMORY_EXHAUSTED
 from cozy_runtime.internal import execution_evidence, liveness, spawn
 from cozy_runtime.internal.config import inherited_environment, update_environment
 from cozy_runtime.internal.parallel.plan import GpuDivergence, GroupPlan, GroupRefusal
@@ -34,6 +35,10 @@ from cozy_runtime.internal.seam import Channel, SeamError
 #: then written, never "only when unset" - and every rank REQUIRES it before forming a
 #: communicator: the executor asserts the seal, it does not write its own environment.
 NVLS_ENV = "NCCL_NVLS_ENABLE"
+#: A GPU's part of a call ended short of memory: the attempt fails, the group stays whole.
+SHORT = frozenset({DEVICE_OOM, MEMORY_EXHAUSTED})
+#: Another GPU ended the collective this one waited in (`RankGroup.interrupt`).
+ENDED = "group_call_ended"
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,8 +144,10 @@ class Follower:
     replies: queue.Queue[tuple[Frame, dict[str, Any]] | None] = field(default_factory=queue.Queue)
     #: the seam-closed verdict once the reader saw EOF or a torn frame; "" while live
     gone: str = ""
-    #: a request of its own is with the machine: that wait is not its stillness
+    #: a request of its own is with the machine: that wait is not its stillness; and how
+    #: many it made (a call's movement while it recovers, `RankGroup.watched`)
     relaying: bool = False
+    relayed: int = 0
     #: a byte here aborts its collectives (its watcher thread; `RankGroup.interrupt`)
     abort: socket.socket | None = None
 
@@ -313,13 +320,13 @@ class RankGroup:
         self.broken = ""
         #: a call in flight may run again when a GPU runs out of memory (`mirror.mirrored`)
         self.rerunnable = False
-        #: `interrupt` ended this formation's collectives; `form(room=...)` clears it
+        #: `interrupt` ended this formation's collectives; `form(again=...)` clears it
         self.interrupted = False
         #: set once this formation's interrupt has aborted its communicator (set: none due)
         self._ended = threading.Event()
         self._ended.set()
-        #: device bytes the followers gave back at the last `form(room=...)`
-        self.gave = 0
+        #: per follower that made room at the last `form(again=...)`, the room it found (-1: none)
+        self.rooms: dict[int, int] = {}
         #: per mirrored component, the pace of its calls (`watched`): the longest pause any
         #: call of it showed carries over to the next
         self.paces: dict[str, liveness.Pace] = {}
@@ -410,13 +417,16 @@ class RankGroup:
                     break
                 finally:
                     follower.relaying = False
+                    follower.relayed += 1
                 continue
             if isinstance(frame.get("plane"), dict):
                 self.rank_planes[follower.rank] = frame["plane"]
             follower.replies.put((head, frame))
-            if head.reply == "run" and not head.ok and self.rerunnable and "rerun" in frame:
-                self.interrupt()
-            elif head.reply == "run" and not head.ok:
+            if head.reply != "run" or head.ok:
+                continue
+            if "rerun" in frame and self.rerunnable:
+                self.interrupt()  # GPU 0 may wait on it in a collective
+            elif "rerun" in frame or head.code not in SHORT:
                 self._break(
                     f"{follower.gpu} failed its part of the call: {head.code}: {head.detail}"[:600]
                 )
@@ -447,9 +457,10 @@ class RankGroup:
     def watched(self, name: str, device: Callable[[], int]) -> Iterator[None]:
         """A mirrored call in flight, judged by its own pace (`liveness.Pace`), never a clock:
         the reading is GPU 0's device progress (`device`), the bytes each follower moved and
-        the answers that arrived. Every GPU of a call waits on the others in its
-        collectives, so a GPU stuck in one stops them all; a spinning wait burns CPU, which is
-        why CPU time is not in the reading. Still for longer than STILL_FACTOR times the
+        the answers that arrived, and the requests each made of the machine for room. Every GPU
+        of a call waits on the others in its collectives, so a GPU stuck in one stops them all;
+        a spinning wait burns CPU, which is why CPU time is not in the reading. A request with
+        the machine is no stillness. Still for longer than STILL_FACTOR times the
         longest pause any call of this component showed (the first call learns its own, from
         its device progress) and the noise floor: the group breaks, naming the GPUs that
         have not answered. NCCL's own watchdog is off (`abortable`): this is the one that
@@ -464,11 +475,13 @@ class RankGroup:
                 pace.observe(
                     (
                         device(),
-                        tuple(liveness.moved(f.pid) for f in self.followers),
-                        tuple(f.replies.qsize() for f in self.followers),
+                        tuple(
+                            (liveness.moved(f.pid), f.replies.qsize(), f.relayed)
+                            for f in self.followers
+                        ),
                     )
                 )
-                if pace.wedged(floor):
+                if pace.wedged(floor) and not any(f.relaying for f in self.followers):
                     quiet = [f.gpu for f in self.followers if f.replies.empty()] or ["GPU 0"]
                     self._break(f"{', '.join(quiet)} wedged in {name!r}: {pace.verdict(floor)}")
                     return
@@ -484,7 +497,7 @@ class RankGroup:
     def interrupt(self) -> None:
         """End the collective in flight on every GPU and keep the group whole: each
         follower's watcher aborts its communicator, and this process aborts its own. The group
-        forms again (`form(room=...)`) before its next call. Once per formation: a second
+        forms again (`form(again=...)`) before its next call. Once per formation: a second
         caller (the reader thread and the call's own thread both may) returns only once the
         first one's abort is done, so the group is never formed again under an abort still
         in progress (that deadlocks torch's process-group teardown)."""
@@ -534,15 +547,16 @@ class RankGroup:
         torch: Any,
         sealed: Mapping[str, str],
         cells: Sequence[int] = (),
-        room: int = -1,
+        again: Mapping[int, int] | None = None,
         nccl: Mapping[str, str] | None = None,
         formed: Callable[[Any], None] | None = None,
     ) -> Any:
         """Form the process group: the store on a kernel-chosen loopback port, every
         follower joining it, rank 0 joining last, one barrier as the proof. `cells`, one per
         follower in rank order, are their budget cells: each follows its `join`, then the
-        socket its watcher reads (`interrupt`). `room` >= 0 forms it AGAIN after an
-        `interrupt`: every follower joins a new store and gives that many device bytes back.
+        socket its watcher reads (`interrupt`). `again` forms it AGAIN after an `interrupt`:
+        every follower joins a new store, and each it names (rank -> the room its last run had)
+        first makes more room than that (`rooms`).
         `nccl` is the route every GPU forms under; `formed` runs on rank 0 right after the
         barrier, while each follower runs its half before it answers the join."""
         dist = torch.distributed
@@ -553,7 +567,7 @@ class RankGroup:
         if nccl is not None:
             self.nccl = dict(nccl)
             route(self.nccl)
-        if room >= 0 and dist.is_initialized():
+        if again is not None and dist.is_initialized():
             dist.destroy_process_group()
         self.store = dist.TCPStore(
             "127.0.0.1", 0, self.degree, is_master=True, wait_for_workers=False
@@ -567,8 +581,10 @@ class RankGroup:
             "calibrate": formed is not None,
         }
         for index, follower in enumerate(self.followers):
-            if room >= 0:
-                self.send_one(follower.rank, {**join, "room": room})
+            if again is not None:
+                self.send_one(
+                    follower.rank, {**join, "again": True, "seen": again.get(follower.rank)}
+                )
                 continue
             follower.abort, watcher = socket.socketpair()
             try:
@@ -595,7 +611,11 @@ class RankGroup:
                     f"{reply.get('detail', '')}"[:400],
                     code="group_unformed",
                 )
-        self.gave = sum(int(reply.get("freed") or 0) for reply in replies)
+        self.rooms = {
+            follower.rank: int(reply["room"])
+            for follower, reply in zip(self.followers, replies, strict=True)
+            if "room" in reply
+        }
         self.formed, self.interrupted = True, False
         return self.pg
 

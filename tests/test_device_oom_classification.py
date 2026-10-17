@@ -4,7 +4,16 @@ from __future__ import annotations
 
 import pytest
 
-from cozy_runtime.author._errors import DEVICE_OOM, classify, is_device_oom
+from cozy_runtime.author._errors import (
+    DEVICE_OOM,
+    MEMORY_EXHAUSTED,
+    RuntimeFailure,
+    classify,
+    is_device_oom,
+)
+from cozy_runtime.internal.memory import shortage
+from cozy_runtime.internal.parallel.group import ENDED
+from cozy_runtime.internal.parallel.mirror import ending
 
 ALLOCATION_FAILURES = (
     "CUDA error: CUBLAS_STATUS_ALLOC_FAILED when calling `cublasCreate(handle)`",
@@ -58,3 +67,16 @@ def test_a_driver_call_out_of_device_memory_is_a_device_oom() -> None:
     )
     assert is_device_oom(exc)
     assert classify(exc).code == DEVICE_OOM
+
+
+def test_a_collective_out_of_memory_is_the_groups_to_run_again() -> None:
+    """No op runs a collective again alone: its peers wait in it. The group does, and every
+    other way a GPU's part ends either keeps the group (capacity, an ended collective) or
+    breaks it (a fault)."""
+    torch = pytest.importorskip("torch")
+    nccl = torch.distributed.DistBackendError(ALLOCATION_FAILURES[-1])
+    assert shortage(nccl) is None and ending(nccl) == DEVICE_OOM
+    assert ending(torch.OutOfMemoryError("CUDA out of memory.")) == MEMORY_EXHAUSTED
+    assert ending(RuntimeFailure("the ladder ran out", code=MEMORY_EXHAUSTED)) == MEMORY_EXHAUSTED
+    assert ending(torch.distributed.DistBackendError("NCCL communicator was aborted")) == ENDED
+    assert ending(ValueError("a fault")) is None
