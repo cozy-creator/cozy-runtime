@@ -64,7 +64,7 @@ def machine_sdk() -> dict[str, str]:
 
 
 def machine_wheels(install_root: Path) -> Path | None:
-    """Where `cozy machine install` keeps the wheels this machine's Runtime and TensorFS were
+    """Where a machine keeps the wheels its Runtime and TensorFS were
     installed from (`<machine root>/opt/cozy/wheels`); None for an install root outside a
     machine layout."""
     layout = host_paths.Layout.of_install_root(install_root)

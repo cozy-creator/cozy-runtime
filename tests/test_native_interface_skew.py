@@ -65,7 +65,7 @@ def test_additive_optional_fields_are_admitted_in_both_directions() -> None:
 
 def test_required_fields_are_enforced_naming_the_side_to_update() -> None:
     newer = _unavailable(_stating("99.0.0", _NewerRequired), "publish_release")
-    assert "request mirror is not read" in newer and "cozy rental update" in newer
+    assert "request mirror is not read" in newer and "cozy machine update" in newer
     older = _unavailable(_stating("0.18.1", _WithoutRelease), "publish_release")
     assert "request release is not sent" in older
     assert "publish the package against cozy-runtime>=" in older
@@ -86,4 +86,4 @@ def test_an_operation_this_worker_lacks_is_refused_alone() -> None:
     rows = native_interfaces.rows(hello)
     (refused,) = [row for row in rows if "unavailable" in row]
     assert refused["export"] == "publish_dataset"
-    assert "cozy rental update" in str(refused["unavailable"])
+    assert "cozy machine update" in str(refused["unavailable"])

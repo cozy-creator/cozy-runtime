@@ -17,7 +17,7 @@ from cozy_runtime.internal.executor import Executor
 from cozy_runtime.internal.executor_commands import CallInterface
 from cozy_runtime.internal.seam import Channel
 
-UPDATE = "update the rental's Runtime (`cozy rental update <name>`) or pin an older SDK"
+UPDATE = "update the rental's Runtime (`cozy machine update <name>`) or pin an older SDK"
 
 
 def _broker(tmp_path: Path, rows: list[dict[str, Any]]) -> Any:

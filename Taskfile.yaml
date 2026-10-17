@@ -2,8 +2,7 @@ version: "3"
 silent: true
 
 tasks:
-  # The Linux wheel of this machine's arch delivers the machine: worker images and `cozy machine install` take
-  # tensord from it. An arch with no kernels wheel (aarch64) gets the pure wheel tagged for it.
+  # The Linux wheel of this machine's arch delivers the machine: worker images take tensord from it. An arch with no kernels wheel (aarch64) gets the pure wheel tagged for it.
   machine:
     desc: Bundle tensord at its pin (tensord.pin, a commit or a release tag; MACHINE=checkout builds that source instead) into dist's Linux wheel for this arch
     cmds:

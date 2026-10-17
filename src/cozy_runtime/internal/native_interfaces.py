@@ -40,7 +40,7 @@ class Statement(msgspec.Struct, frozen=True):
 
 _SERVICES = {effect_interfaces.MODULE: (effect_interfaces, "native_effect")}
 
-UPDATE_RENTAL = "run `cozy rental update <rental>`"
+UPDATE_RENTAL = "run `cozy machine update <name>`"
 
 
 def stated() -> dict[str, Json]:

@@ -51,7 +51,7 @@ class Layout:
 
     @property
     def machine_wheels(self) -> Path:
-        """The Runtime and TensorFS wheels `cozy machine install` installed, kept verbatim."""
+        """The Runtime and TensorFS wheels this machine was installed from, kept verbatim."""
         return self._at("opt/cozy/wheels")
 
     @classmethod
