@@ -14,7 +14,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from cozy_runtime.internal import accel, config  # noqa: E402
+from cozy_runtime.internal import accel  # noqa: E402
 
 PROBE = """
 import json, torch
@@ -37,11 +37,3 @@ def test_the_allocator_grows_a_segment_with_no_environment_naming_it() -> None:
     assert done.returncode == 0, done.stderr[-2000:]
     reserved = json.loads(done.stdout.strip().splitlines()[-1])["reserved_mib"]
     assert 1536 <= reserved < 2048, f"one segment grown to the request, not two: {reserved} MiB"
-
-
-def test_the_seal_report_keeps_the_name_an_older_machine_imposes() -> None:
-    """A machine that still imposes the variable compares it with the executor's report and
-    refuses the executor when it is missing: the report names it, whatever its value."""
-    reported = config.seal_snapshot({"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"})
-    assert reported["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"
-    assert "PYTORCH_CUDA_ALLOC_CONF" not in config.seal_snapshot({})

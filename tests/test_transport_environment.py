@@ -29,11 +29,9 @@ def test_nccl_settings_are_applied_before_communicator_creation(
 ) -> None:
     monkeypatch.setenv("TORCH_NCCL_ASYNC_ERROR_HANDLING", "3")
     monkeypatch.setenv("NCCL_P2P_LEVEL", "NVL")
-    monkeypatch.setattr(group, "ROUTED", {})
     group.abortable("gloo")
     assert os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] == "3"
     group.abortable("nccl")
     group.route({"NCCL_P2P_LEVEL": "SYS"})
     assert os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] == "0"
     assert os.environ["NCCL_P2P_LEVEL"] == "SYS"
-    assert group.ROUTED == {"NCCL_P2P_LEVEL": "SYS"}

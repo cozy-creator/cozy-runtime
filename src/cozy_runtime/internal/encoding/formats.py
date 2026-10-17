@@ -16,13 +16,12 @@ an `input_scale`, 50 `mlp.fc2` without).
 
 **A provider claims DIGESTS it was reviewed against, and an alias claims nothing** (#549.4).
 `reviewed_specs` is a frozenset of exact spec digests, spelled here, and `launch_providers`
-offers a provider for a digest only if that digest is in the set AND still in the registry.
+offers a provider for a digest only if that digest is in the set.
 The old spelling read digests OUT of `tensorfs.seed_digests()` by ALIAS, which meant a new,
 semantically different spec filed under `fp8-rowwise/1` would have INHERITED this file's decoder
 the moment the registry grew it. Transcribing the digests is the cost of making that
-impossible: a digest the installed registry lacks gets no provider (one warning at launch),
-and its bytes refuse at bind instead of being decoded unreviewed. Alias is display, and only
-display.
+impossible: an unreviewed digest gets no provider, and its bytes refuse at bind instead of
+being decoded unreviewed. Alias is display, and only display.
 
 **The decode target is the CENSUS's dtype, and the census cannot express an encoding.**
 A derived `LogicalTensor` names a destination and nothing else — no parts, no scale_of, no
@@ -103,13 +102,6 @@ def aliases() -> dict[str, str]:
     return {digest: alias for alias, digest in tensorfs.seed_digests()}
 
 
-def registry_digests() -> frozenset[str]:
-    """Every spec digest the compiled registry carries, in any alias."""
-    import tensorfs
-
-    return frozenset(digest for _, digest in tensorfs.seed_digests())
-
-
 def digests_of(alias: str) -> tuple[str, ...]:
     """Every spec digest the platform registry files under one alias, in registry order.
 
@@ -130,8 +122,7 @@ def digests_of(alias: str) -> tuple[str, ...]:
 # "reviewed" means the exact vector object this spec digest names was decoded bit-for-bit,
 # not that somebody read the prose.
 #
-# A digest the installed registry lacks (an older TensorFS) is warned once at launch and serves
-# nothing; a registry that files a NEW digest under one of these aliases acquires no provider.
+# A registry that files a NEW digest under one of these aliases acquires no provider.
 
 #: `plain/1` — one `value` role carrying the logical bytes verbatim.
 SPEC_PLAIN = "sha256:1fb882a7e46d0aff520f9d8a28cefd643954c19371737443101ba3c5fcc3613f"

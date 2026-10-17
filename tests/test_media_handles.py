@@ -51,7 +51,6 @@ from cozy_runtime.author._assets import GrantedInput
 from cozy_runtime.author._decode import DEFAULT_DECODE_LIMITS
 from cozy_runtime.author._media import KIND_MEDIA
 from cozy_runtime.internal import (
-    executor_replies,
     interface_wheel,
     package_interface,
     schema,
@@ -643,11 +642,7 @@ def test_executor_reply_rows_keep_kind_and_source() -> None:
         "reason": "seed ignored",
         "source": "handler",
     }
-    frame = {"ok": True, "adjustments": wire}
-    attempted = executor_replies.decode(frame, executor_replies.AttemptReply)
-    prepared = executor_replies.decode(frame, executor_replies.PreparedReply)
-    for adjustments in (attempted.adjustments, prepared.adjustments):
-        assert [(a.kind, a.source, a.requested) for a in adjustments] == [
-            ("adjusted", "policy", "120.0"),
-            ("warn", "handler", ""),
-        ]
+    assert [(a["kind"], a["source"], a["requested"]) for a in wire] == [
+        ("adjusted", "policy", "120.0"),
+        ("warn", "handler", ""),
+    ]

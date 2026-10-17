@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import msgspec
 
-from cozy_runtime import canonical_json
 from cozy_runtime.author._artifacts import ModelArtifact
 from cozy_runtime.author._assets import FileAsset
 from cozy_runtime.author._calls import _CallType
 from cozy_runtime.author.publication import AssessmentRef, CheckpointRef, ReleaseReceipt
-from cozy_runtime.internal import schema
 
 MODULE = "cozy_runtime.author.publication"
 
@@ -37,16 +37,6 @@ TYPES: dict[str, tuple[type[msgspec.Struct], type[msgspec.Struct]]] = {
     "attach_assessment": (AttachAssessment, AssessmentRef),
     "publish_release": (Publish, ReleaseReceipt),
 }
-DOCUMENT = canonical_json.encode(
-    {
-        "format": "cozy.native-effect-interface/1",
-        "module": MODULE,
-        "operations": {
-            name: {"request": schema.render(request), "result": schema.render(result)}
-            for name, (request, result) in TYPES.items()
-        },
-    }
-)
 
 
 def bindings() -> dict[str, _CallType]:
@@ -54,3 +44,9 @@ def bindings() -> dict[str, _CallType]:
         name: _CallType("", MODULE, name, request, result)
         for name, (request, result) in TYPES.items()
     }
+
+
+def unserved(export: str) -> _CallType:
+    """An effect the machine did not offer this executor: a call to it is refused."""
+    detail = f'native operation "{export}" is not offered by this machine'
+    return dataclasses.replace(bindings()[export], unavailable=detail)

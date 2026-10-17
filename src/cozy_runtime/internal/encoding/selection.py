@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import platform
 import subprocess
-import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -43,7 +42,6 @@ from cozy_runtime.internal.encoding.formats import (
     Verbatim,
     aliases,
     refuse,
-    registry_digests,
 )
 from cozy_runtime.internal.encoding.leaves import (
     Int8ConvRotNativeLeaf,
@@ -547,10 +545,6 @@ NAMED_SEAMS: dict[str, tuple[str, str]] = {
 # ------------------------------------------------------------------------ the launch table
 
 
-#: Spec digests already reported as absent from this process's TensorFS registry.
-_ABSENT: set[str] = set()
-
-
 def launch_providers() -> dict[str, tuple[Provider, ...]]:
     """The LAUNCH TIER provider set: spec digest -> the ORDERED CANDIDATES for that digest.
 
@@ -560,15 +554,10 @@ def launch_providers() -> dict[str, tuple[Provider, ...]]:
     semantically different `fp8-rowwise/1` is never decoded by `cozy.fp8-rowwise.dequant/1`
     on the strength of its display name.
 
-    A reviewed digest the installed TensorFS does not carry (an older TensorFS than this
-    Runtime's newest encoding) is skipped with one warning: executors launch, and bytes in
-    that encoding are refused at bind (`unknown_encoding`), so a lane falls back to another.
-
     The order within a digest is REGISTRATION order and it decides NOTHING. Selection among
     candidates is `resolution.py`'s joint plan decision over records that exist only where a
     probe measured.
     """
-    known = registry_digests()
     out: dict[str, list[Provider]] = {}
     builds: tuple[Callable[[str], Provider], ...] = (
         Verbatim,
@@ -585,15 +574,7 @@ def launch_providers() -> dict[str, tuple[Provider, ...]]:
         # `provider.encoding` a fact rather than a lookup.
         probe = build("")
         for digest in sorted(probe.reviewed_specs):
-            if digest in known:
-                out.setdefault(digest, []).append(build(digest))
-            elif digest not in _ABSENT:
-                _ABSENT.add(digest)
-                print(
-                    f"[encoding] the installed TensorFS registry carries no spec {digest}: "
-                    f"{probe.name} and every other provider of it are not served",
-                    file=sys.stderr,
-                )
+            out.setdefault(digest, []).append(build(digest))
     return {digest: tuple(candidates) for digest, candidates in out.items()}
 
 

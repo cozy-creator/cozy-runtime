@@ -116,22 +116,6 @@ CHILD_ENV_ALLOWLIST: tuple[ProjectedVar, ...] = (
         "executor's process on every GPU refuses to form a communicator under any other value",
     ),
     ProjectedVar(
-        "NCCL_P2P_LEVEL",
-        "parallel.links",
-        "REPORTED, never projected: a group sets it itself before its communicator forms, from "
-        "its GPUs' measured links (`parallel/links.py`): SYS when every pair copied directly "
-        "faster than through host memory, else NVL (peer memory over NVLink only; two A40s "
-        "over PCI hung at formation 4 times in 10, runs 2852/2909). An older machine still "
-        "imposes NVL and refuses an executor whose seal report lacks it, so the report keeps it",
-    ),
-    ProjectedVar(
-        "PYTORCH_CUDA_ALLOC_CONF",
-        "plan.allocator_policy",
-        "REPORTED, never projected: torch's allocator is set in code at the accelerator's init "
-        "(`accel.ALLOCATOR`). An older machine still imposes this name and refuses an executor "
-        "whose seal report lacks it, so the report keeps it; nothing here reads it",
-    ),
-    ProjectedVar(
         "OMP_NUM_THREADS",
         "plan.cpu_threads",
         "thread cap must be set before torch import to bound host CPU in the executor",

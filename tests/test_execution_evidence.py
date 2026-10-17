@@ -14,11 +14,10 @@ import msgspec
 import pytest
 
 from cozy_runtime.author._observations import MAX_SERIES, Attribution, EventRing
-from cozy_runtime.internal import execution_evidence, executor_replies, package_interface
+from cozy_runtime.internal import execution_evidence, package_interface
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.executor import _SEALED, Executor, _send_reply
 from cozy_runtime.internal.executor_commands import Activate, Invoke, Load, PrepareRequest, Start
-from cozy_runtime.internal.executor_replies import AttemptReply
 from cozy_runtime.internal.seam import Channel
 
 MODULE = "execution_evidence_fixture"
@@ -166,9 +165,8 @@ def test_a_reply_of_several_mib_crosses_the_seam_whole(executor: Executor) -> No
         received = Channel(right).recv(timeout=60)
         sending.join()
     assert received is not None and received["attribution"]["padding"] == "x" * (8 << 20)
-    kept = executor_replies.decode(received, AttemptReply)
-    assert kept.ok and kept.outcome is not None and kept.outcome.terminal == "succeeded", kept
-    assert reply["result_ref"] and msgspec.to_builtins(kept.result_ref) == reply["result_ref"]
+    assert received["ok"] and received["outcome"]["terminal"] == "succeeded", received
+    assert reply["result_ref"] and received["result_ref"] == reply["result_ref"]
 
 
 def test_a_telemetry_key_read_as_a_credential_costs_the_reply_only_its_telemetry(
@@ -181,10 +179,11 @@ def test_a_telemetry_key_read_as_a_credential_costs_the_reply_only_its_telemetry
     left, right = socket.socketpair()
     with left, right:
         _send_reply(Channel(left), reply)
-        kept = executor_replies.decode(Channel(right).recv(), AttemptReply)
-    assert kept.ok and kept.outcome is not None and kept.outcome.terminal == "succeeded", kept
-    assert not kept.observations and not kept.attribution and not kept.execution
-    assert kept.observation_caps["dropped_observations_for_credential"] == 1
+        kept = Channel(right).recv()
+    assert kept is not None and kept["ok"] and kept["outcome"]["terminal"] == "succeeded", kept
+    assert not kept.get("observations") and not kept.get("attribution")
+    assert not kept.get("execution")
+    assert kept["observation_caps"]["dropped_observations_for_credential"] == 1
 
 
 def test_the_request_pin_is_what_every_rank_reports_as_requested() -> None:

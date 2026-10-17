@@ -25,7 +25,6 @@ from cozy_runtime.internal import (  # noqa: E402
     attention_sol,
     attention_ulysses,
     execution_evidence,
-    plane,
     spawn,
 )
 from cozy_runtime.internal.config import seal_snapshot  # noqa: E402
@@ -458,25 +457,16 @@ def test_a_call_that_fails_for_good_leaves_the_state_it_found(tmp_path: Path) ->
     assert not torch.distributed.is_initialized()
 
 
-@pytest.mark.parametrize("before_plane", [False, True])
-def test_the_plane_budget_reaches_the_followers_that_answer_it(
-    tmp_path: Path, before_plane: bool
-) -> None:
+def test_the_plane_budget_reaches_the_followers(tmp_path: Path) -> None:
     """Run 2566: GPU 0 sent the plane's `budget` to a follower that refused the command, and
-    the group broke. Every follower of this Runtime answers it. One from before the plane
-    does not say `weight_plane/1` in its hello, so it is never sent it, and the group serves."""
+    the group broke. Every follower answers it."""
     fixture = Path(__file__).parent / "testdata" / "parallel_calls.py"
     env = {**os.environ, "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"}
 
     def launch(module_argv: list[str], fd: int) -> spawn.Child:
         return spawn.spawn_follower(
             python=sys.executable,
-            module_argv=[
-                str(fixture),
-                *module_argv[2:],
-                "--staged",
-                *(["--before-plane"] if before_plane else []),
-            ],
+            module_argv=[str(fixture), *module_argv[2:], "--staged"],
             inherit_fd=fd,
             env=env,
         )
@@ -493,18 +483,14 @@ def test_the_plane_budget_reaches_the_followers_that_answer_it(
     try:
         group.spawn()
         group.dial_back(seal_snapshot(env))
-        assert [plane.CAPABILITY in f.memory for f in group.followers] == [not before_plane]
         reply = leader.with_planes(leader.budget(Budget(vram_bytes=-1, pinned_bytes=1 << 20)))
         assert reply["ok"]
         # every GPU pins its own weights: each takes its share of the group's host budget
         assert leader.weights.pinned == 1 << 19
         # and states its own plane: rank 0's reply carries each follower's, for the owner
         (follower,) = reply["rank_planes"]
-        if before_plane:
-            assert follower is None
-        else:
-            assert follower["pinned_budget_bytes"] == reply["plane"]["pinned_budget_bytes"]
-            assert follower["pinned_budget_bytes"] > 0
+        assert follower["pinned_budget_bytes"] == reply["plane"]["pinned_budget_bytes"]
+        assert follower["pinned_budget_bytes"] > 0
         assert not group.broken
     finally:
         group.close()

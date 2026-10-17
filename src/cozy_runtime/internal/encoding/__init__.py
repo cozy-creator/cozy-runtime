@@ -54,7 +54,6 @@ from cozy_runtime.internal.encoding.formats import (
     aliases,
     digests_of,
     refuse,
-    registry_digests,
 )
 from cozy_runtime.internal.encoding.leaves import (
     Int8ConvRotNativeLeaf,
@@ -128,6 +127,5 @@ __all__ = [
     "measure_device",
     "measure_runtime",
     "refuse",
-    "registry_digests",
     "runtime_source_digest",
 ]
