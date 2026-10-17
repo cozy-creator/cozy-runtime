@@ -171,8 +171,10 @@ def executor(tmp_path: Path) -> Iterator[tuple[Peer, Path]]:
     try:
         channel, _ = _accept(listener)
         peer = Peer(channel, hold=3)
-        binding = {"application": "callsapp:app", "package_interface": str(interface)}
-        binding["package_interface"] = str(tmp_path / "interface.json")
+        binding = {
+            "application": "callsapp:app",
+            "package_interface": str(tmp_path / "interface.json"),
+        }
         assert peer.call({"cmd": "start", "devices": "", **binding})["ok"]
         load = {"cmd": "load", "construction": "c", "devices": "", "binding": binding}
         assert peer.call(load)["ok"]
@@ -185,26 +187,18 @@ def executor(tmp_path: Path) -> Iterator[tuple[Peer, Path]]:
 
 def _prepare(peer: Peer, root: Path, request_id: str, n: int, mode: str) -> None:
     (root / request_id).mkdir()
+    payload = {"n": n, "mode": mode}
     peer.channel.send(
-        {
-            "cmd": "prepare_request",
-            "request_id": request_id,
-            "entrypoint": "generate",
-            "payload": {"n": n, "mode": mode},
-        }
+        {"cmd": "prepare_request", "request_id": request_id, **_CALL, "payload": payload}
     )
 
 
 def _invoke(peer: Peer, root: Path, request_id: str) -> None:
-    peer.channel.send(
-        {
-            "cmd": "invoke",
-            "request_id": request_id,
-            "entrypoint": "generate",
-            "spool": str(root / request_id),
-            "deadline_s": 120,
-        }
-    )
+    spool = str(root / request_id)
+    peer.channel.send({"cmd": "invoke", "request_id": request_id, **_CALL, "spool": spool})
+
+
+_CALL = {"entrypoint": "generate", "deadline_s": 120}
 
 
 def _outcome(peer: Peer, request_id: str) -> dict[str, Any]:
