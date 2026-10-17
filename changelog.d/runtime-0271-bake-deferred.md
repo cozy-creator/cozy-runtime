@@ -1,0 +1,1 @@
+A block placed inside the weight read that is mapping its overlay's factors serves unbaked, its LoRA hooks adding the delta per call, rather than reading those factors again (H3 1.42.0 long_form on 32 GB, run 10549: `a weight read re-entered its own mapping`). A re-entry refusal now names the weight and the reads it is inside.
