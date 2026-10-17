@@ -975,6 +975,11 @@ def test_an_op_with_no_room_left_moves_the_tensors_the_process_holds_to_host(car
     # INVALID_VALUE (run 9141).
     assert any(map(spill.hosted, held)) and all(t.data_ptr() % 256 == 0 for t in held)
     assert spill.PRESSED[0] and spill.USED, "after a spill, ops are noted for the next one"
+    # Runs 10143-10144: left in host memory, a cache read at every step made a decode 5x
+    # slower. With room again (the next request), they come back, values and tensors the same.
+    assert weights.restore_spilled() > 0
+    assert not any(map(spill.hosted, held))
+    assert all(t.is_cuda and bool((t == i).all()) for i, t in enumerate(held))
     del x, held, capped, reference  # the input is a candidate too: no op reads it after the first
     gc.collect()
     spill.release(torch)

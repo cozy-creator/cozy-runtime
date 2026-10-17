@@ -969,6 +969,12 @@ class Weights:
         Whether any moved."""
         if self.kind != "cuda" or self.grouped:
             return False
+        # What is kept for speed alone (an LM's decode session, recorded graphs) goes, never
+        # to host: moved there, every later call would read it over the bus (run 10143).
+        if any([release() for release in RELEASERS]):
+            accel.release_cached(self.torch, self.kind)
+            if self.allocatable() >= need + weight_policy.MARGIN:
+                return True
         want = need + weight_policy.MARGIN
         room = self.lockable(want)
         device = self.torch.device("cuda", self.index)
@@ -981,6 +987,26 @@ class Weights:
             f"{spill.MOVED[0]}x {spill.MOVED[1]} B to host in {spill.MOVED[2] // 1_000_000} ms"
         )
         return moved > 0
+
+    def restore_spilled(self) -> int:
+        """Tensors an earlier op moved to host memory come back while the device has room
+        beside the floor and the cap: left there, a cache or a decoder's state is read over the
+        bus at every later step (runs 10143-10144: a drafted decode at 90 ms/token instead of
+        18; a prefill 3x slower). Called as a request begins, before its stages plan."""
+        if self.kind != "cuda" or self.grouped or not spill.HELD:
+            return 0
+        accel.release_cached(self.torch, self.kind)
+        memory, held = self._held()
+        room = memory["driver_free_bytes"] - self.floor_free - weight_policy.MARGIN
+        if self.cap >= 0:
+            room = min(room, self.cap - held - weight_policy.MARGIN)
+        device = self.torch.device("cuda", self.index)
+        with self.torch.utils._python_dispatch._disable_current_modes():
+            back = spill.restore(self.torch, device, room)
+        if back:
+            self.limit_torch()
+            self.modes["restored"] = f"{back} B from host"
+        return back
 
     def lockable(self, want: int) -> int:
         """Host bytes this process may lock for `want` (a spill, a banded op's result): half
