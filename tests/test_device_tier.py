@@ -22,7 +22,17 @@ from cozy_runtime.internal import accel  # noqa: E402
 from cozy_runtime.internal.executor import Executor  # noqa: E402
 from cozy_runtime.internal.seam import Channel  # noqa: E402
 from cozy_runtime.internal.weights import DeviceTiers, Weights  # noqa: E402
-from test_weight_plane import BLOCKS, HIDDEN, load, run, same, tight, write_checkpoint  # noqa: E402
+from test_weight_plane import (  # noqa: E402
+    BLOCKS,
+    HIDDEN,
+    held_elsewhere,
+    load,
+    run,
+    same,
+    store_component,
+    tight,
+    write_checkpoint,
+)
 
 pytestmark = pytest.mark.skipif(not accel.present(torch, "cuda"), reason="a CUDA card")
 
@@ -309,5 +319,46 @@ def test_a_holder_naming_another_layout_is_never_mapped(tmp_path: Path) -> None:
         assert custody.ended()[-1], "the refused answer's lease is closed at once"
         assert same(run(again, x), expected)
         assert replacement.facts().h2d_bytes > 0
+    finally:
+        custody.close()
+
+
+@pytest.mark.skipif(
+    accel.drives_display(0), reason="a card that drives no display: its free bytes hold"
+)
+def test_a_held_decode_set_lets_idle_attached_weights_go(tmp_path: Path) -> None:
+    """Runs 10077 and 10083 (Klein's upsampler on a 16 GB card): the pipeline's idle weights
+    were attached from the machine's custody, and a decode set held at home for its CUDA graphs
+    found no room beside them, so the LM decoded through Transformers' loop. The idle component
+    lets its attachment go, the machine drops what nobody maps, and the set holds."""
+    checkpoint, values = write_checkpoint(tmp_path)
+    x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
+    custody = Custody()
+    try:
+        weights, _ = executor_with(custody, tmp_path / "a")
+        if not weights.plane.device_sharing(0):
+            pytest.skip("this GPU cannot export memory")
+        idle = load(weights, checkpoint, "idle")
+        run(idle, x)  # offered at its stage exit: mapped from the custody from here on
+        resting = idle.backend.components["stack"]
+        assert resting.shared
+        halved = {key: value * 0.5 for key, value in values.items()}
+        lm = load(weights, store_component(tmp_path / "lm", "stack", halved), "lm")
+        stack = lm.residency.components["stack"]
+        blocks = [region.module for region in stack.blocks]
+        need = sum(region.span for region in stack.blocks)
+        weights.set_cap(torch.cuda.get_device_properties(0).total_memory)
+        weights.room = lambda _: custody.collect()  # the machine drops what nobody maps
+        torch.cuda.empty_cache()
+        free, _ = torch.cuda.mem_get_info()
+        with held_elsewhere(free - need // 2):  # another tenant holds the rest of the card
+            lm.residency.admit("run", ("stack",))
+            try:
+                with lm.residency.held("stack", blocks) as held:
+                    assert held, weights.modes.get("stack.held")
+            finally:
+                lm.residency.release("run", ("stack",))
+                torch.cuda.empty_cache()
+        assert not resting.shared
     finally:
         custody.close()
