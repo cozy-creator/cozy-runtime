@@ -327,11 +327,9 @@ class Component:
 
 
 class Reservation:
-    """Bytes a live owner keeps for speed alone (an LM engine's slots, a component's graph
-    pool, a derived cache) and gives back under pressure: `shed(n)` gives toward `n` and says
-    how much it gave. They are torch's or the host's already, so a reservation is the owner's
-    admission token and shed handle, and `granted` is a fact, never added to the ledger.
-    Memory holds it weakly: it ends with its owner."""
+    """Bytes a live owner keeps for speed alone, which `shed(n)` gives back toward `n`. They
+    are torch's or the host's already: a reservation is the owner's admission token and shed
+    handle, `granted` a fact never added to the ledger. It ends with its owner."""
 
     def __init__(
         self, weights: Weights, owner: str, shed: Callable[[int], int], host: bool

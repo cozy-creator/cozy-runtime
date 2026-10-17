@@ -44,7 +44,8 @@ from contextlib import AbstractContextManager, ExitStack, contextmanager, nullco
 from typing import Any
 
 from cozy_runtime.author._errors import is_device_oom, is_library_refusal
-from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building, Reservation
+from cozy_runtime.author._loader import Reservation
+from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building
 from cozy_runtime.author.kernels import KernelsUnavailable, Launch, Plan, TritonKernels
 from cozy_runtime.graphs import BYPASS, ROOM, capture, say
 from cozy_runtime.lm import _kernels

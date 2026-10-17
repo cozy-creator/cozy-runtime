@@ -26,28 +26,16 @@ import io
 import time
 from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import (
-    TYPE_CHECKING,
-    Literal,
-    NoReturn,
-    Protocol,
-    TypeVar,
-    cast,
-    final,
-    runtime_checkable,
-)
+from typing import Literal, NoReturn, Protocol, TypeVar, cast, final, runtime_checkable
 
 import msgspec
 
 from cozy_runtime.author._context import AdapterRef, Device
 from cozy_runtime.author._errors import CapabilityError, ConformanceError, InvalidRequest
-
-if TYPE_CHECKING:
-    from cozy_runtime.author._model import Reservation
 
 T = TypeVar("T")
 S = TypeVar("S", bound=msgspec.Struct)
@@ -526,6 +514,22 @@ class _NullBackend:
 # --------------------------------------------------------------------------- cache
 
 
+class Reservation(Protocol):
+    """Memory's hold on what an owner keeps for speed (`Residency.reserve`)."""
+
+    granted: int
+
+    def resize(self, nbytes: int) -> bool:
+        """Whether the owner may hold `nbytes` now; False: it holds what it has."""
+        ...
+
+    def using(self) -> AbstractContextManager[None]:
+        """The owner runs: its bytes go after idle weights and finer grains."""
+        ...
+
+    def close(self) -> None: ...
+
+
 @final
 class DerivedCache:
     """A model-generation-scoped handle for immutable, digest-keyed derived entries.
@@ -536,21 +540,20 @@ class DerivedCache:
     entries for device room, host entries for host room). An entry with no room is not kept.
     """
 
-    __slots__ = ("_bytes", "_entries", "_held", "_owner", "max_entries", "name")
+    __slots__ = ("_entries", "_held", "_owner", "max_entries", "name")
 
     def __init__(self, name: str, *, max_entries: int, owner: _ScopeHost) -> None:
         self.name = name
         self.max_entries = max_entries
         #: key -> (value, bytes, on a device)
         self._entries: OrderedDict[object, tuple[object, int, bool]] = OrderedDict()
-        self._bytes = {True: 0, False: 0}
         self._held: dict[bool, Reservation | None] = {}
         self._owner = owner
 
     def __repr__(self) -> str:
         return (
             f"DerivedCache({self.name!r}, entries={len(self._entries)}/{self.max_entries}, "
-            f"bytes={sum(self._bytes.values())})"
+            f"bytes={self._bytes(True) + self._bytes(False)})"
         )
 
     def __contains__(self, key: object) -> bool:
@@ -576,18 +579,16 @@ class DerivedCache:
             return cast(V, self._entries[key][0])
         value = build()
         _require_immutable(self.name, value)
-        while self._entries and len(self._entries) >= self.max_entries:
-            self._evict()
+        while len(self._entries) >= self.max_entries:
+            self._entries.popitem(last=False)
         size, device = _entry_bytes(value), _on_device(value)
         held = self._reservation(device)
-        if held is None or held.resize(self._bytes[device] + size):
+        if held is None or held.resize(self._bytes(device) + size):
             self._entries[key] = (value, size, device)
-            self._bytes[device] += size
         return value
 
     def drop(self) -> None:
         self._entries.clear()
-        self._bytes = {True: 0, False: 0}
         for held in self._held.values():
             if held is not None:
                 held.close()
@@ -604,22 +605,20 @@ class DerivedCache:
             )
         return self._held[device]
 
-    def _evict(self, device: bool | None = None) -> int:
-        """The least recently used entry (on `device`, if given) leaves: its bytes."""
-        key = next((k for k, e in self._entries.items() if device in (None, e[2])), None)
-        if key is None:
-            return 0
-        _, size, on = self._entries.pop(key)
-        self._bytes[on] -= size
-        return size
+    def _bytes(self, device: bool) -> int:
+        return sum(size for _, size, on in self._entries.values() if on == device)
 
     def _shed(self, device: bool, nbytes: int) -> int:
+        """Memory wants `nbytes` on the device (else in host memory): the least recently used
+        entries there leave. The bytes they held."""
         freed = 0
-        while freed < nbytes and (size := self._evict(device)):
-            freed += size
+        for key, (_, size, on) in list(self._entries.items()):
+            if freed < nbytes and on == device:
+                del self._entries[key]
+                freed += size
         held = self._held.get(device)
         if held is not None:
-            held.resize(self._bytes[device])
+            held.resize(self._bytes(device))
         return freed
 
 

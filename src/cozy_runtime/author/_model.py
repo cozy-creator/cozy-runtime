@@ -51,6 +51,7 @@ from cozy_runtime.author._loader import (
     Loader,
     Mode,
     ModelFitRefused,
+    Reservation,
     Scheduler,
     loading,
 )
@@ -244,22 +245,6 @@ class _Scope(Protocol):
     def __enter__(self) -> None: ...
 
     def __exit__(self, *exc: object) -> None: ...
-
-
-class Reservation(Protocol):
-    """Memory's hold on what an owner keeps for speed (`Residency.reserve`)."""
-
-    granted: int
-
-    def resize(self, nbytes: int) -> bool:
-        """Whether the owner may hold `nbytes` now; False: it holds what it has."""
-        ...
-
-    def using(self) -> AbstractContextManager[None]:
-        """The owner runs: its bytes go after idle weights and finer grains."""
-        ...
-
-    def close(self) -> None: ...
 
 
 class Residency(Protocol):
