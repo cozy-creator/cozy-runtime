@@ -2,9 +2,10 @@
 
 An op's output rows need a known span of each input's rows: a convolution's reach (kernel,
 stride, dilation; zeros only past the input's edges), a nearest upsampling's source rows, a
-padding's shifted rows, the same rows for a pointwise op, a cast or a norm over channels. A
-group norm gathers its statistics over every band first, in float32, then normalizes band by
-band. Ops that mix rows (attention, matmuls) are never cut.
+padding's shifted rows, the same rows for a pointwise op, a cast, a softmax or a norm within a
+row, and for a matrix product the same rows of its left operand with all of its right one (a
+weight, read whole by each band). A group norm gathers its statistics over every band first, in
+float32, then normalizes band by band.
 
 An op runs in bands when an operand lives in host memory (a spill, or an earlier band's
 result: each band reads its rows over the bus once, where a kernel would read them again and
@@ -28,10 +29,11 @@ from cozy_runtime.internal import spill
 
 if TYPE_CHECKING:
     from torch import Tensor
+    from torch._ops import OpOverload, OpOverloadPacket
 
     from cozy_runtime.internal.weights import Weights
 
-type Rule = Callable[[Any, tuple[Any, ...], dict[str, Any]], "Plan | None"]
+type Rule = Callable[[OpOverload, tuple[Any, ...], dict[str, Any]], "Plan | None"]
 
 
 @dataclass(slots=True)
@@ -41,9 +43,9 @@ class Plan:
     while it computes. `gather(rows)` reads what every band needs first (a norm's
     statistics); `finish` makes the op's own result from the filled tensor."""
 
-    out: Any
+    out: Tensor
     axis: int
-    band: Callable[[int, int], Any]
+    band: Callable[[int, int], Tensor]
     per_row: int
     align: int = 1
     gather: Callable[[int], None] | None = None
@@ -54,8 +56,8 @@ class Plan:
 class _Zeros:
     """The last op's result `padded`: `source` with `pads` zeros (before, after) per dim."""
 
-    padded: Any
-    source: Any
+    padded: Tensor
+    source: Tensor
     pads: tuple[tuple[int, int], ...]
 
 
@@ -95,19 +97,38 @@ class Bands:
             aten.linalg_vector_norm,
             aten.repeat_interleave,
             aten.cat,
+            aten.softmax,
+            aten._softmax,
+            aten._safe_softmax,
+            aten.log_softmax,
+            aten._log_softmax,
         )
-        self.rules: dict[Any, Rule] = {
+        #: a product's operands read by rows: the left one first, then a bias or row scales
+        self.products: dict[OpOverloadPacket, tuple[int, ...]] = {
+            aten.mm: (0,),
+            aten.bmm: (0,),
+            aten.matmul: (0,),
+            aten.linear: (0,),
+            aten._scaled_mm: (0, 2),
+            aten.addmm: (1, 0),
+            aten.baddbmm: (1, 0),
+            aten._addmm_activation: (1, 0),
+        }
+        norms = (aten.layer_norm, aten.native_layer_norm, aten.rms_norm, aten._fused_rms_norm)
+        self.rules: dict[OpOverloadPacket, Rule] = {
             **dict.fromkeys(self.convs, self._conv),
             **dict.fromkeys(self.pads, self._pad),
             **dict.fromkeys(ups, self._upsample),
             **dict.fromkeys((aten.group_norm, aten.native_group_norm), self._norm),
             **dict.fromkeys(rows, self._rows),
+            **dict.fromkeys(self.products, self._product),
+            **dict.fromkeys(norms, self._row_norm),
         }
         #: each op seen, as `_kind` read it
-        self.kinds: dict[Any, tuple[Rule | None, bool, bool]] = {}
+        self.kinds: dict[OpOverload, tuple[Rule | None, bool, bool]] = {}
 
     def run(
-        self, func: Any, args: tuple[Any, ...], kwargs: dict[str, Any], short: bool = False
+        self, func: OpOverload, args: tuple[Any, ...], kwargs: dict[str, Any], short: bool = False
     ) -> Any:
         """`func(*args, **kwargs)` in bands, or NotImplemented: the op runs as it is. `short`:
         it just ran out of device memory whole."""
@@ -116,11 +137,11 @@ class Bands:
         if kind is None:
             kind = self.kinds[func] = self._kind(func)
         rule, padding, conv = kind
-        if rule is None:
-            return NotImplemented
+        if rule is None or not (short or padding or conv or spill.HELD):
+            return NotImplemented  # whole, with room, nothing in host memory: as it is
         skips = conv and last is not None and args[0] is last.padded
         if not (short or padding or skips or spill.HELD):
-            return NotImplemented  # whole, with room, nothing in host memory: as it is
+            return NotImplemented
         tensors = _tensors((args, kwargs))
         if any(hasattr(t, "__tensor_flatten__") for t in tensors):
             return NotImplemented  # a wrapper's ops are its own (a collective's, a DTensor)
@@ -147,7 +168,7 @@ class Bands:
                 self._zeros(func, out, args, kwargs)
             return out if plan.finish is None else plan.finish(out)
 
-    def _kind(self, func: Any) -> tuple[Rule | None, bool, bool]:
+    def _kind(self, func: OpOverload) -> tuple[Rule | None, bool, bool]:
         """An op's rule (None: it never runs in bands), whether it pads, whether it convolves."""
         packet = func.overloadpacket
         rule = self.rules.get(packet)
@@ -260,8 +281,11 @@ class Bands:
             return value
         return self._take(value, value.dim() - (out.dim() - axis), a, b)
 
-    def _meta(self, func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
-        """The op's result as a meta tensor; None when it is not one new tensor."""
+    def _meta(
+        self, func: OpOverload, args: tuple[Any, ...], kwargs: dict[str, Any], many: bool = False
+    ) -> Any:
+        """The op's result as a meta tensor (`many`: or a tuple of them); None when it is not
+        new tensors."""
         made: list[Any] = []
 
         def meta(value: Any) -> Any:
@@ -280,13 +304,18 @@ class Bands:
             out = func(*meta(args), **{k: meta(v) for k, v in kwargs.items()})
         except Exception:  # no meta kernel, or arguments it refuses: the op runs as it is
             return None
-        if not isinstance(out, self.torch.Tensor) or out._is_view() or any(out is m for m in made):
-            return None  # no one tensor, or an alias of an operand: never cut
+        for one in out if many and isinstance(out, tuple) else (out,):
+            if (
+                not isinstance(one, self.torch.Tensor)
+                or one._is_view()
+                or any(one is m for m in made)
+            ):
+                return None  # not tensors, or an alias of an operand: never cut
         return out
 
     # -- rules: an op's output rows from its inputs' rows
 
-    def _rows(self, func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Plan | None:
+    def _rows(self, func: OpOverload, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Plan | None:
         """A pointwise op, a cast or copy on one device, a norm, repeat or join along dims
         before the last two: each output row reads the same row of every operand that spans
         the rows (aligned from the right, as broadcasting does)."""
@@ -297,15 +326,18 @@ class Bands:
             device = _arg(func, args, kwargs, "device")
             if device is not None and self.torch.device(device) != args[0].device:
                 return None
-        dims = _arg(func, args, kwargs, "dim")
-        if dims is not None:
-            rank = _tensors(args[:1])[0].dim()
-            dims = [dims] if isinstance(dims, int) else list(dims)
-            if not dims or any(d % rank >= rank - 2 for d in dims):
-                return None
         out = self._meta(func, args, kwargs)
         if not isinstance(out, self.torch.Tensor) or out.dim() < 2:
             return None
+        dims = _arg(func, args, kwargs, "dim")
+        if dims is not None:
+            rank = _tensors(args[:1])[0].dim()
+            dims = [d % rank for d in ([dims] if isinstance(dims, int) else dims)]
+            # along the rows, or along the last dim and dropping it: rows mix or shift
+            if not dims or any(
+                d == rank - 2 or (d == rank - 1 and out.dim() != rank) for d in dims
+            ):
+                return None
         axis = out.dim() - 2
         height = int(out.shape[axis])
         if height < 2:
@@ -313,7 +345,7 @@ class Bands:
         spanning = [t for t in _tensors((args, kwargs)) if _spans(t, out, axis)]
         per_row = (_bytes(out) + sum(map(_bytes, spanning))) // height
 
-        def band(a: int, b: int) -> Any:
+        def band(a: int, b: int) -> Tensor:
             return func(
                 *self._narrowed(args, out, axis, a, b),
                 **{k: self._narrowed(v, out, axis, a, b) for k, v in kwargs.items()},
@@ -321,7 +353,65 @@ class Bands:
 
         return Plan(out, axis, band, per_row)
 
-    def _upsample(self, func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Plan | None:
+    def _product(
+        self, func: OpOverload, args: tuple[Any, ...], kwargs: dict[str, Any]
+    ) -> Plan | None:
+        """A matrix product (a linear, a batched or scaled one): output rows [a, b) read rows
+        [a, b) of the left operand and of a bias or row scales spanning them, the right
+        operand whole."""
+        reads = self.products[func.overloadpacket]
+        left, right = args[reads[0]], args[reads[0] + 1]
+        out = self._meta(func, args, kwargs)
+        if out is None or out.dim() < 2 or left.dim() < 2 or right.dim() < 2:
+            return None
+        axis = out.dim() - 2
+        height = int(out.shape[axis])
+        if height < 2 or not _spans(left, out, axis):
+            return None
+        rows = [
+            i
+            for i in reads
+            if isinstance(args[i], self.torch.Tensor) and _spans(args[i], out, axis)
+        ]
+
+        def band(a: int, b: int) -> Tensor:
+            values = list(args)
+            for i in rows:
+                values[i] = self._take(args[i], args[i].dim() - (out.dim() - axis), a, b)
+            return func(*values, **kwargs)
+
+        return Plan(out, axis, band, (_bytes(out) + sum(_bytes(args[i]) for i in rows)) // height)
+
+    def _row_norm(
+        self, func: OpOverload, args: tuple[Any, ...], kwargs: dict[str, Any]
+    ) -> Plan | None:
+        """A layer or RMS norm over trailing dims: each row normalized on its own. Statistics
+        it returns beside the result (`native_layer_norm`, `_fused_rms_norm`) fill band by band."""
+        x = args[0]
+        axis = x.dim() - len(_arg(func, args, kwargs, "normalized_shape")) - 1
+        made = self._meta(func, args, kwargs, many=True)
+        if made is None or axis < 0 or x.shape[axis] < 2:
+            return None
+        out, *metas = made if isinstance(made, tuple) else (made,)
+        stats = [self.torch.empty(m.shape, dtype=m.dtype, device=x.device) for m in metas]
+
+        def band(a: int, b: int) -> Tensor:
+            got = func(self._take(x, axis, a, b), *args[1:], **kwargs)
+            if not stats:
+                return got
+            for stat, part in zip(stats, got[1:], strict=True):
+                stat.narrow(axis, a, b - a).copy_(part)
+            return got[0]
+
+        def finish(result: Any) -> Any:
+            return (result, *stats)
+
+        per_row = 2 * _bytes(x) // int(x.shape[axis])
+        return Plan(out, axis, band, per_row, finish=finish if stats else None)
+
+    def _upsample(
+        self, func: OpOverload, args: tuple[Any, ...], kwargs: dict[str, Any]
+    ) -> Plan | None:
         """Nearest (or nearest-exact) upsampling by a whole factor `r` along the rows: output
         rows [a, b) on multiples of `r` read input rows [a/r, b/r)."""
         x = args[0]
@@ -335,7 +425,7 @@ class Bands:
             return None
         names = [argument.name for argument in func._schema.arguments]
 
-        def band(a: int, b: int) -> Any:
+        def band(a: int, b: int) -> Tensor:
             values = dict(zip(names, args, strict=False)) | kwargs
             if values.get("output_size") is not None:
                 size = list(values["output_size"])
@@ -346,7 +436,7 @@ class Bands:
 
         return Plan(out, axis, band, (_bytes(out) + _bytes(x)) // height, align=ratio)
 
-    def _pad(self, func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Plan | None:
+    def _pad(self, func: OpOverload, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Plan | None:
         """A constant padding: output rows [a, b) are input rows [a - top, b - top), the
         value past its edges; every other dim padded as asked."""
         x, pads, value = self._padding(func, args, kwargs)
@@ -359,27 +449,29 @@ class Bands:
         top = pads[2] if len(pads) >= 4 else 0
         rest = [0 if i in (2, 3) else p for i, p in enumerate(pads)]
 
-        def band(a: int, b: int) -> Any:
+        def band(a: int, b: int) -> Tensor:
             rows = self._take(x, axis, a - top, b - top, value)
             return self.aten.constant_pad_nd(rows, rest, value)
 
         return Plan(out, axis, band, (_bytes(out) + _bytes(x)) // max(int(out.shape[axis]), 1))
 
     def _padding(
-        self, func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]
+        self, func: OpOverload, args: tuple[Any, ...], kwargs: dict[str, Any]
     ) -> tuple[Any, list[int] | None, float]:
         x, pads = args[0], [int(p) for p in _arg(func, args, kwargs, "pad")]
         if func.overloadpacket == self.aten.pad and _arg(func, args, kwargs, "mode") != "constant":
             return x, None, 0.0
         return x, pads, float(_arg(func, args, kwargs, "value") or 0.0)
 
-    def _remember(self, func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+    def _remember(self, func: OpOverload, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
         """A padding with room runs as it is; the op after it may read past it."""
         out = func(*args, **kwargs)
         self._zeros(func, out, args, kwargs)
         return out
 
-    def _zeros(self, func: Any, out: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
+    def _zeros(
+        self, func: OpOverload, out: Any, args: tuple[Any, ...], kwargs: dict[str, Any]
+    ) -> None:
         x, pads, value = self._padding(func, args, kwargs)
         if pads is None or value != 0 or min(pads, default=0) < 0:
             return
@@ -389,7 +481,11 @@ class Bands:
         self.last = _Zeros(out, x, tuple(pairs))
 
     def _conv(
-        self, func: Any, args: tuple[Any, ...], kwargs: dict[str, Any], zeros: _Zeros | None = None
+        self,
+        func: OpOverload,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        zeros: _Zeros | None = None,
     ) -> Plan | None:
         """A convolution's output rows [a, b) read input rows [a*s - p, (b-1)*s - p + d*(k-1)
         + 1), zeros past the edges. Right after a zero padding (`zeros`) it reads the
@@ -421,7 +517,7 @@ class Bands:
             return None  # the padded tensor exists already: reading its source gains nothing
         conv = self.aten.convolution
 
-        def band(a: int, b: int) -> Any:
+        def band(a: int, b: int) -> Tensor:
             lo, hi = a * s - front[j], (b - 1) * s - front[j] + d * (k - 1) + 1
             edge = max(-lo, 0)
             if edge == max(hi - int(x.shape[axis]), 0):  # as many zeros both sides: its own
@@ -451,7 +547,7 @@ class Bands:
         per_row = (2 * _bytes(out) + _bytes(x) * s) // max(int(out.shape[axis]), 1)
         return Plan(out, axis, band, per_row)
 
-    def _norm(self, func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Plan | None:
+    def _norm(self, func: OpOverload, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Plan | None:
         """A group norm: per image and group, mean and variance over every band in float32
         (merged as one pass over all of it would be, up to rounding), then each band
         normalized."""
@@ -491,7 +587,7 @@ class Bands:
             affine[:] = [scale.reshape(shape), shift.reshape(shape)]
             moments[:] = [mean, rstd]
 
-        def band(a: int, b: int) -> Any:
+        def band(a: int, b: int) -> Tensor:
             rows = self._take(x, axis, a, b)
             scale, shift = affine
             return torch.addcmul(shift, rows, scale, out=torch.empty_like(rows))
@@ -506,7 +602,7 @@ class Bands:
         return Plan(out, axis, band, per_row, gather=gather, finish=finish)
 
 
-def _arg(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any], name: str) -> Any:
+def _arg(func: OpOverload, args: tuple[Any, ...], kwargs: dict[str, Any], name: str) -> Any:
     """Argument `name` of `func` as called, else its schema default."""
     for index, argument in enumerate(func._schema.arguments):
         if argument.name == name:
@@ -518,7 +614,9 @@ def _arg(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any], name: str) ->
     return kwargs.get(name)
 
 
-def _conv_spec(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[Any, ...] | None:
+def _conv_spec(
+    func: OpOverload, args: tuple[Any, ...], kwargs: dict[str, Any]
+) -> tuple[Any, ...] | None:
     """(input, weight, bias, stride, padding, dilation, groups), each per spatial dim; None for
     a transposed convolution or a padding given by name."""
     w = args[1]
