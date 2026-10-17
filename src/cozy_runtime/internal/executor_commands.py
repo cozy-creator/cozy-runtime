@@ -72,17 +72,12 @@ class Budget(Command, frozen=True, kw_only=True, tag="budget"):
     vram_bytes: int
     #: -1 leaves the pinned host tier's budget as it is
     pinned_bytes: int = -1
-    #: The process's device cap; -1 lifts it, unset leaves it as it is
-    cap_bytes: int | UnsetType = UNSET
-    #: Per GPU of a group, its own process cap (index = rank, `RANK_CELLS`); a rank past the
-    #: end takes `cap_bytes`.
-    rank_caps: tuple[int, ...] = ()
     #: Physical free bytes the owner keeps on the GPU; unset leaves it
     floor_bytes: int | UnsetType = UNSET
 
 
-#: An executor capability: a group's followers obey their own GPU's cap and budget cell: the
-#: owner's `Start.rank_cells` and the `rank_caps` of `Load`, `Budget` and `Invoke`.
+#: An executor capability: a group's followers obey their own GPU's budget cell, the owner's
+#: `Start.rank_cells`.
 RANK_CELLS = "rank_cells/1"
 
 
@@ -102,12 +97,10 @@ class Revoke(Command, frozen=True, kw_only=True, tag="revoke"):
 
 
 class Map(Command, frozen=True, kw_only=True, tag="map"):
-    """Map one loaded construction's weights onto the GPU now, inside `cap_bytes`, as its
-    first stages would (`MAP`): nothing runs, and they stay mapped as after a call."""
+    """Map one loaded construction's weights onto the GPU now, as its first stages would
+    (`MAP`): nothing runs, and they stay mapped as after a call."""
 
     construction: str
-    #: The process's device cap; -1 lifts it
-    cap_bytes: int = -1
     #: Physical free bytes the owner keeps on the GPU; unset leaves it
     floor_bytes: int | UnsetType = UNSET
 
@@ -301,10 +294,6 @@ class Load(Command, frozen=True, kw_only=True, tag="load"):
     #: TensorD stages shared CPU layouts in part and supplies read-only object files
     #: (`SealedStage`, `ObjectFiles`). Runtime's plane uses them for unstaged regions.
     staged_tiers: bool = False
-    #: The process's device cap for the load; unset: none given
-    cap_bytes: int | UnsetType = UNSET
-    #: Per GPU of a group, its own cap for the load (index = rank, `RANK_CELLS`)
-    rank_caps: tuple[int, ...] = ()
 
     def single(self) -> ModelLoad:
         return ModelLoad(
@@ -368,18 +357,8 @@ class Invoke(_Attempt, frozen=True, kw_only=True, tag="invoke"):
     construction: str = ""
     attention_kernel: str = ""
     bits: int = 0  # as `PrepareRequest.bits`
-    #: The process's device cap for this attempt; -1: none
-    cap_bytes: int = -1
-    #: Per GPU of a group, its own cap for this attempt (index = rank, `RANK_CELLS`)
-    rank_caps: tuple[int, ...] = ()
     #: Physical free bytes the owner keeps on the GPU; -1: only a display's own floor
     floor_bytes: int = -1
-    #: Activation growth per stage method the owner measured for this request's shape in
-    #: earlier processes: a floor under this executor's own estimates, never a cap
-    activation_bytes: dict[str, int] = {}
-    #: Per stage method, the most room torch had when an entry of it squeezed in an earlier
-    #: process at this request's shape (`Weights.squeezed`): its entries are given more
-    squeezed_bytes: dict[str, int] = {}
     #: The owner's Degree 2 for this attempt (`weights.attach/1`): True keeps GPU weights
     #: with the machine (attached, and offered at each stage's exit), False keeps them private
     #: (they stream); unset leaves the executor's current setting.

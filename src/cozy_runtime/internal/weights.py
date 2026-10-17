@@ -381,13 +381,6 @@ class Weights:
         self.activation: dict[str, int] = {}
         #: each stage method's last plan inputs (`driver_budget`), in the facts
         self.plan_inputs: dict[str, dict[str, int]] = {}
-        #: per stage method, the most room torch had (`allocatable`) at an entry in which it
-        #: dropped its whole cache more than once: under a limit torch refuses reserved plus
-        #: one request, so a peak that fits can still squeeze. An entry of that method is
-        #: given more room first (`WeightResidency._clear`). Measured here or seeded.
-        self.squeezed: dict[str, int] = {}
-        #: those this request's own entries measured: what the owner keeps for its shape
-        self.squeezes: dict[str, int] = {}
         #: components given back to make torch room (`page_out`), and their bytes
         self.paged_out = [0, 0]
         #: methods whose stage fits itself to the room it finds (it runs its ops in `split`
@@ -550,29 +543,6 @@ class Weights:
         self.owner_floor = floor
         self.floor_free = max(self.display_floor, floor)
 
-    def seed_activations(self, measured: Mapping[str, int]) -> None:
-        """Activation growth the owner measured for these methods in earlier processes: this
-        process plans its first stages with room for them instead of keeping every weight
-        and recovering from the out-of-memory that follows. Only ever raises an estimate."""
-        for method, nbytes in measured.items():
-            if nbytes > self.activation.get(method, 0):
-                self.activation[method] = int(nbytes)
-
-    def seed_squeezed(self, measured: Mapping[str, int]) -> None:
-        """Rooms the owner saw squeeze these methods at this request's shape in earlier
-        processes (`squeezed`), as the request begins. Only ever raises one."""
-        self.squeezes = {}
-        for method, nbytes in measured.items():
-            self.squeezed[method] = max(self.squeezed.get(method, 0), int(nbytes))
-
-    def retries(self) -> int:
-        """Times torch dropped its whole cache to place one allocation, since the process began.
-        Read at every block boundary of a stage: the allocator's own counters, without the
-        flattened copy `torch.cuda.memory_stats` makes of them."""
-        if self.kind != "cuda":
-            return 0
-        return int(self.torch._C._cuda_memoryStats(self.index).get("num_alloc_retries", 0))
-
     def page_out(self, keep: Collection[str] | None, need: int = -1) -> bool:
         """Give torch the device bytes of one component no stage uses now (none in `keep`): the
         one with the fewest bytes to copy back, any that holds baked bytes (a bake to restore)
@@ -582,7 +552,7 @@ class Weights:
         process's cap rises into that room). False: nothing to give. `keep` None: every
         component an open or parked stage uses."""
         keep = _in_use(self) if keep is None else keep
-        asks = self.room is not None and self.cap >= 0
+        asks = self.room is not None
         idle = [
             (any(region.baked for region in c.regions), self.resident_bytes(c), key)
             for key, c in self.components.items()
@@ -631,15 +601,16 @@ class Weights:
         return True
 
     def room_before(self, method: str) -> None:
-        """Under a cap, before a stage plans: when other processes on the GPU leave less free
-        than this stage's measured activations need of what the cap grants, ask the owner to
-        make room first (`DeviceRoom`: idle tenants leave). Activations cannot shrink once
-        the stage runs; a stage never measured asks nothing. A process over its cap gives
-        back its own cached segments and idle maps first, then asks for the rest."""
-        if self.room is None or self.cap < 0 or self.host_only:
+        """Before a stage plans: when other processes on the GPU leave less free than this
+        stage's measured activations need, ask the owner to make room first (`DeviceRoom`:
+        idle tenants leave). Activations cannot shrink once the stage runs; a stage never
+        measured asks nothing. Over the floor watchdog's cap (pressure, never a refusal), the
+        process gives back its own cached segments and idle maps first, then asks for the
+        rest."""
+        if self.room is None or self.host_only:
             return
         memory, held = self._held()
-        if held > self.cap:
+        if 0 <= self.cap < held:
             accel.release_cached(self.torch, self.kind)
             memory, held = self._held()
             if held > self.cap:
@@ -651,11 +622,13 @@ class Weights:
         slack = max(memory["reserved_bytes"] - memory["allocated_bytes"], 0)
         # an adaptive stage fits itself to the room it finds: it asks for its smallest piece
         need = self.adaptive.get(method, self.activation.get(method, 0)) - slack
-        if held > self.cap:
+        if 0 <= self.cap < held:
             # Still over: the owner raises the cap into the room it makes.
             self.memory.ask(max(need, 0) + weight_policy.MARGIN)
             return
-        granted = min(need + weight_policy.MARGIN, self.cap - held)
+        granted = need + weight_policy.MARGIN
+        if self.cap >= 0:
+            granted = min(granted, self.cap - held)
         if need > 0 and memory["driver_free_bytes"] - self.floor_free < granted:
             self.memory.ask(granted)
 
@@ -1575,7 +1548,6 @@ class Weights:
             cache_releases=sum(count for count, _ in accel.RELEASED.values()),
             cache_released_bytes=sum(freed for _, freed in accel.RELEASED.values()),
             cache_released_by={who: (n, freed) for who, (n, freed) in accel.RELEASED.items()},
-            squeezed=dict(self.squeezes),
             paged_out=self.paged_out[0],
             paged_out_bytes=self.paged_out[1],
             spilled=spill.TOTALS[0],
@@ -3323,8 +3295,6 @@ class WeightResidency:
         self.baseline = -1
         #: torch's idle cache at the entry's start: segments an earlier stage reserved
         self.cached = 0
-        #: torch's room and its cache drops so far, at the open entry's start
-        self.pressure = (0, 0)
         self.derived_at_open = 0
         #: stages of each method in this attempt, and the most any attempt has run: a method
         #: entered again and again (a denoise step per stage) is cyclic like a multi-pass one
@@ -3407,7 +3377,6 @@ class WeightResidency:
         self.entries[method] = self.entries.get(method, 0) + 1
         self.repeats[method] = max(self.repeats.get(method, 0), self.entries[method])
         weights.hold_host()
-        self._clear(method, local)
         weights.room_before(method)
         if weights.host_only:  # everything is bound in place already; no device to measure
             self.active = (method, local)
@@ -3460,42 +3429,6 @@ class WeightResidency:
             self._left()
             raise
         self._entered(method)
-
-    def _clear(self, method: str, local: Sequence[str]) -> None:
-        """Before an entry of `method`: while torch has no more room than an entry of it is
-        known to squeeze in (`Weights.squeezed`), components no stage uses now give it the
-        bytes it lacks, the cheapest to restore first. They fill again when their own stage
-        opens, or once the attempt ends (`restore`)."""
-        weights = self.weights
-        bound = weights.squeezed.get(method)
-        if bound is None or weights.host_only or weights.grouped or method in weights.adaptive:
-            return
-        keep = {self.components[name].key for name in local} | _in_use(weights)
-        while (need := bound + weight_policy.MARGIN - weights.allocatable()) >= 0:
-            if not weights.page_out(keep, need + weight_policy.MARGIN):
-                break
-
-    def _squeezing(self) -> None:
-        """At an outer block boundary inside a stage: torch dropped its whole cache more than
-        once since the entry or the last page-out, so the room it has squeezes this entry (one
-        stage can be a whole denoise). Read at every block, so it acts within the step that
-        squeezes (one read, 11 us on an RTX 4070). The room is kept for later entries and
-        executors, and the idle component cheapest to restore leaves now: never one an open or
-        repeating stage uses (`_in_use`), so never one `_spare` gave back."""
-        weights = self.weights
-        if self.active is None or self.baseline < 0 or weights.grouped or weights.mapping:
-            return
-        if self.active[0] in weights.adaptive:
-            return
-        room, dropped = self.pressure
-        if weights.retries() - dropped <= 1:
-            return
-        method = self.active[0]
-        weights.squeezed[method] = weights.squeezes[method] = max(
-            weights.squeezed.get(method, 0), room
-        )
-        weights.page_out(_in_use(weights))
-        self.pressure = (weights.allocatable(), weights.retries())
 
     def _acquire_common(self, component: Component, stream: Any, upto: Rung = Rung.DISK) -> Any:
         """The stage's common region's lease, room made for it by the ladder (`upto`)."""
@@ -3626,7 +3559,6 @@ class WeightResidency:
                 weights.modes[f"{name}.grain"] = "sub-block"
         self.baseline = accel.allocated(weights.torch, weights.kind)
         self.cached = accel.reserved(weights.torch, weights.kind) - self.baseline
-        self.pressure = (weights.allocatable(), weights.retries())
         accel.reset_peak(weights.torch, weights.kind)
         if len(weights.open) == 1:
             spill.began()
@@ -3671,12 +3603,6 @@ class WeightResidency:
             )
             self.peaks[method] = max(self.peaks.get(method, 0), peak)
             weights.activation[method] = max(weights.activation.get(method, 0), peak)
-            room, dropped = self.pressure
-            if weights.retries() - dropped > 1:
-                # One drop clears another stage's cache; a second in the same entry is this
-                # stage's own blocks against torch's limit: the room it had squeezes it.
-                room = max(weights.squeezed.get(method, 0), room)
-                weights.squeezed[method] = weights.squeezes[method] = room
             item = peak // max(self.batch.pop(method, 1), 1)
             self.per_item[method] = max(self.per_item.get(method, 0), item)
         self.baseline = -1
@@ -3709,8 +3635,6 @@ class WeightResidency:
             for table in (
                 weights.activation,
                 weights.plan_inputs,
-                weights.squeezed,
-                weights.squeezes,
                 self.peaks,
                 self.per_item,
                 self.entries,
@@ -4318,8 +4242,6 @@ class WeightResidency:
                     self.read.setdefault(component.name, set()).add(region.module)
                 if component.passes > passes:
                     weights.hold_host()
-                if not weights.running:  # a block boundary, before this block leases anything
-                    self._squeezing()
                 if weights.growing and component.passes == 2 > passes:
                     self._grow()
             memory, op, seen = weights.memory, f"{component.name}.{region.path}", -1

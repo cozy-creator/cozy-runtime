@@ -689,7 +689,7 @@ def test_batch_fits_asks_an_unmeasured_method_with_what_earlier_executors_measur
     weights = card.weights
     residency = load(weights, card.checkpoint, "batch").residency
     assert residency.batch_fits("run", 2), "measured nowhere: the first run measures"
-    weights.seed_activations({"run": torch.cuda.get_device_properties(0).total_memory})
+    weights.activation["run"] = torch.cuda.get_device_properties(0).total_memory
     assert not residency.batch_fits("run", 2)
     assert weights.modes["run.batch"] == "1"
     facts = weights.facts()
@@ -804,7 +804,7 @@ def test_an_activation_estimate_larger_than_the_card_never_refuses_the_stage(car
     reference = run(model, x)
     model.residency.unpark()
     weights.set_budget(-1)
-    weights.seed_activations({"run": weights.total})
+    weights.activation["run"] = weights.total
     assert weights.driver_budget("run") == 0, "no stage open: no floor to keep"
     assert same(run(model, x), reference)
 

@@ -753,8 +753,6 @@ class Executor:
         #: a follower's last mirrored call that succeeded: rewound if the group runs it again
         #: because another GPU failed it (`join` with `again`), dropped at its next call
         self._last_journal: Journal | None = None
-        #: the per-GPU caps the group's planes were last given (`budget`)
-        self.rank_caps: tuple[int, ...] = ()
         self._device_ready = False
         self._startup_reported = False
         #: a follower's budget cell from rank 0 (`RANK_CELLS`), for its weight plane
@@ -2548,9 +2546,7 @@ class Executor:
         weights.sharing = (
             DeviceTiers(ask=self._ask_device, offer=self._offer_device) if sharing else None
         )
-        cap = _rank_cap(command.rank_caps, self.rank, command.cap_bytes)
-        if not isinstance(cap, UnsetType):
-            weights.set_cap(cap)
+        weights.set_cap(-1)  # a load is uncapped, as a call starts
         # A load plans in what the driver has: the Worker made room for it, and an earlier
         # cut to 0 is no grant for this construction. Its pinned budget arrives with it, so
         # the fill stays inside it (a CPU executor computes on its tier: never cut there).
@@ -2917,8 +2913,7 @@ class Executor:
                 sequence_parallel_degree=max(self.world, 1),
             )
             if self._deferred(binding):
-                # Built inside the attempt that reads it, under that attempt's cap.
-                load = msgspec.structs.replace(load, cap_bytes=UNSET, rank_caps=())
+                # Built inside the attempt that reads it.
                 build = functools.partial(self._build_on_demand, child, load)
                 child.models = dict.fromkeys(binding.parameter_names(), _OnDemand(build))
                 children.append((parameter, child, {}))
@@ -3201,23 +3196,16 @@ class Executor:
         if isinstance(target, dict):
             return target
         target.handled = None
-        # The plane's budget derives from the driver at every attempt (TensorD sends none), so
-        # a cut to 0 never outlives the attempt that follows it. Only a grant that changed
-        # reaches the group's GPUs.
+        # Every attempt starts uncapped and derives its budget from the driver, so a cut to 0
+        # or a floor watchdog's cap never outlives the attempt that follows it; a group's GPUs
+        # are told every time (each has its own cell).
         if self.weights is not None and (
-            self.weights.budget != -1
-            or command.cap_bytes != self.weights.cap
-            or command.rank_caps != self.rank_caps
+            self.world > 1
+            or self.weights.budget >= 0
+            or self.weights.cap >= 0
             or command.floor_bytes != self.weights.owner_floor
         ):
-            granted = self.budget(
-                Budget(
-                    vram_bytes=-1,
-                    cap_bytes=command.cap_bytes,
-                    rank_caps=command.rank_caps,
-                    floor_bytes=command.floor_bytes,
-                )
-            )
+            granted = self.budget(Budget(vram_bytes=-1, floor_bytes=command.floor_bytes))
             if not granted.get("ok"):
                 return granted
         if self.weights is not None:
@@ -3225,8 +3213,6 @@ class Executor:
             # (its cursor at that request's end) never carries over. Its weights stay mapped.
             self._unpark()
             self.weights.restore_spilled()
-            self.weights.seed_activations(command.activation_bytes)
-            self.weights.seed_squeezed(command.squeezed_bytes)
             if not isinstance(command.device_weights, UnsetType):
                 self._device_weights(command.device_weights)
         try:
@@ -4575,9 +4561,7 @@ class Executor:
             self._unpark()  # a parked stage's holds would make a cut unreleasable
             if not isinstance(command.floor_bytes, UnsetType):
                 weights.set_floor(command.floor_bytes)
-            cap = _rank_cap(command.rank_caps, self.rank, command.cap_bytes)
-            if not isinstance(cap, UnsetType):
-                weights.set_cap(cap)  # every GPU's own process
+            weights.set_cap(-1)  # a cap is the floor watchdog's, for one call (its cell)
             # The pinned budget is the group's: every GPU pins its own weights in host memory.
             pinned = command.pinned_bytes // self.world if command.pinned_bytes >= 0 else -1
             return weights.set_budget(command.vram_bytes, pinned)
@@ -4585,7 +4569,6 @@ class Executor:
         freed, refused = self._followers(self._plane_ranks(), command, "budget", own)
         if refused:
             return refused
-        self.rank_caps = command.rank_caps
         return {"ok": True, "freed_bytes": freed, "plane": self._plane_facts()}
 
     def share(self) -> dict[str, Any]:
@@ -4691,9 +4674,7 @@ class Executor:
             )
         if self.weights is None or self.group is not None:
             return {"ok": True, "mapped_bytes": 0, "plane": self._plane_facts()}
-        granted = self.budget(
-            Budget(vram_bytes=-1, cap_bytes=command.cap_bytes, floor_bytes=command.floor_bytes)
-        )
+        granted = self.budget(Budget(vram_bytes=-1, floor_bytes=command.floor_bytes))
         if not granted.get("ok"):
             return granted
         members = child.model_executors or [child]
@@ -4942,11 +4923,6 @@ def _assets_at(node: Any, path: str) -> list[dict[str, Any]]:
         for index, value in enumerate(node):
             found += _assets_at(value, f"{path}.{index}" if path else str(index))
     return found
-
-
-def _rank_cap(caps: tuple[int, ...], rank: int, default: int | UnsetType) -> int | UnsetType:
-    """This GPU's process cap: its own entry when the owner sent one per GPU, else the one."""
-    return caps[rank] if rank < len(caps) else default
 
 
 # --------------------------------------------------------------------------- main

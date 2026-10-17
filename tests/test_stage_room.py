@@ -68,8 +68,7 @@ def capped(weights: Weights, committed: int, room: int = ROOM) -> None:
 
 def test_a_component_mapped_from_the_machine_is_given_back_and_fills_again(tmp_path: Path) -> None:
     """Degree 2: the idle component's bytes are the machine's. The executor lets its mapping go
-    and asks for room; the machine drops the holding nobody maps and raises the cap. A room an
-    earlier executor squeezed in is seeded, so this one pages before its first entry."""
+    and asks for room; the machine drops the holding nobody maps and raises the cap."""
     a_at, _ = write_checkpoint(tmp_path / "a")
     b_at = other_checkpoint(tmp_path / "b")
     x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
@@ -100,10 +99,8 @@ def test_a_component_mapped_from_the_machine_is_given_back_and_fills_again(tmp_p
             weights.set_cap(weights.cap + asked[-1])
 
         weights.room = room
-        weights.seed_squeezed({"run": weights.allocatable()})
         free = torch.cuda.mem_get_info(0)[0]
         assert same(run(a, x, passes=1), expected)
-        assert weights.facts().squeezed == {}, "a seed is the owner's already: nothing to report"
         # The other set left this process and custody, and its memory is the driver's again.
         (freed,) = asked  # the holding's whole chunks: a little more than its regions' bytes
         assert freed >= mapped and not other.shared and weights.resident_bytes(other) == 0
@@ -220,7 +217,7 @@ def test_an_op_cut_into_pieces_leaves_its_models_whole_components_mapped(tmp_pat
             model.residency.release("run", ("stack",))
         assert "run" in weights.adaptive
 
-        weights.seed_activations({"run": 2 * weights.cap})
+        weights.activation["run"] = 2 * weights.cap
         copied = weights.facts().h2d_bytes
         assert same(run(model, x, passes=1), expected)
         assert weights.resident_bytes(other) == idle
