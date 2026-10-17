@@ -171,7 +171,7 @@ _PY = kernel_sources.PYTHON
 BOOT = {
     86: {"comfy-kitchen"},
     89: {_PY, "comfy-kitchen"},
-    90: {_PY, "sageattention", "flash-attn3"},
+    90: {_PY, "sageattention", "flash-attn3-full"},
     100: {_PY},
     103: {_PY},
     120: {_PY, "comfy-kitchen", "sageattn3"},
