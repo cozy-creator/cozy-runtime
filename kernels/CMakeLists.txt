@@ -48,7 +48,7 @@ endfunction()
 pinned(CUTLASS_DIR NVIDIA/cutlass 098de2a652cf8f00fd70b2df54051c7eccbb855a
        a8a1b952c7f6179bc8076f20d45859f18bd81f21f3d22b6766d7f3f0cceb5d54)
 
-set(INT8 "${CMAKE_CURRENT_SOURCE_DIR}/../src/cozy_runtime/internal/int8_op")
+set(INT8 "${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm")
 set(isolated $<$<PLATFORM_ID:Linux>:-fno-gnu-unique>)
 
 # One 8-bit unit for `targets`, its family named by its defines (`int8.h`).

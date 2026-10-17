@@ -99,8 +99,8 @@ _MMA, _WGMMA, _TCGEN05 = (frozenset({f}) for f in (arch.MMA_SYNC, arch.WGMMA, ar
 _FP8, _FP4 = frozenset({"fp8"}), frozenset({"fp4"})
 _HALF, _BF16, _D128 = frozenset({"bfloat16", "float16"}), frozenset({"bfloat16"}), frozenset({128})
 _D64_128 = frozenset({64, 128})
-#: What FA3's build has (`kernel_sources._FA3_SHAPES`): no package declares its sites' shapes.
-_FA3 = frozenset({(128, "bfloat16"), (64, "float16")})
+#: What the wheel's FA3 serves (`prebuilt.FlashAttention3`); `flash-attn3-full` serves more.
+_FA3 = frozenset((d, dtype) for d in (64, 128) for dtype in ("bfloat16", "float16"))
 _PY, _KITCHEN, _SAGE3 = kernel_sources.PYTHON, "comfy-kitchen", "sageattn3"
 
 KERNELS: tuple[Candidate, ...] = (
@@ -108,7 +108,7 @@ KERNELS: tuple[Candidate, ...] = (
     Candidate("cudnn", "_cozy_cudnn", upstream.CUDNN, _GPU, dtypes=_HALF, max_head_dim=128),
     Candidate(
         "flash-attn3", "_cozy_flash_attn3", upstream.FA3, _WGMMA, dtypes=_HALF, max_head_dim=256,
-        shapes=_FA3, artifact="flash-attn3", import_name="flash_attn_interface",
+        shapes=_FA3, artifact="flash-attn3-full", import_name="flash_attn_interface",
     ),
     Candidate(
         "flash-attn3-fp8", "_cozy_flash_attn3_fp8", upstream.FA3_FP8, _WGMMA, exact=False,
@@ -494,7 +494,7 @@ def _launch(ready: Ready, device: DeviceFacts) -> None:
 def _prebuilt_fa3(candidate: Candidate, device: DeviceFacts) -> Ready | None:
     """FlashAttention-3 from the cozy-kernels wheel once it verifies on this Hopper card; a
     failure is the run's one warning for it, and the local build is tried next."""
-    if candidate.name != "flash-attn3" or device.kind != "cuda" or device.sm != 90:
+    if device.kind != "cuda" or not prebuilt.serves(candidate.name, device.sm):
         return None
     import torch
 

@@ -18,7 +18,6 @@ on:
         required: true
   pull_request:
     paths:
-      - src/cozy_runtime/internal/int8_op/**
       - src/cozy_runtime/internal/kernel_*.py
       - src/cozy_runtime/internal/machine_kernels.py
       - src/cozy_runtime/internal/triton_kernels.py

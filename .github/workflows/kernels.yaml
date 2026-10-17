@@ -25,7 +25,6 @@ on:
   pull_request:
     paths:
       - kernels/**
-      - src/cozy_runtime/internal/int8_op/**
       - checks/kernel_wheel.py
       - .github/workflows/kernels.yaml
 run-name: kernels ${{ inputs.ref || github.head_ref || github.ref_name }}
