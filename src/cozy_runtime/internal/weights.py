@@ -398,10 +398,8 @@ class Weights:
         self.last = ""
         #: how deep reads outside a module's forward are being mapped (`reading`): a LoRA bake
         #: in a region such a read binds reads its overlay's factors, and a placement that read
-        #: makes can bind and bake more, so reads nest; the regions they are mapping
+        #: makes can bind and bake more, so reads nest, re-entering a region too
         self.mapping = 0
-        self.mapped: set[int] = set()
-        self.mapping_ops: list[str] = []
         #: the plane is placing or giving room: an allocator refusal inside is its own to answer
         self.placing = False
         #: the bytes of the last allocator refusal `refused` unmapped weights for
@@ -1114,21 +1112,7 @@ class Weights:
         else the read is refused, and no kernel is ever handed its empty pointer."""
         opened = self.opened()
         held: list[tuple[Component, Region, Lease]] = []
-        mine = {id(o[2]) for s in standins if (o := getattr(s, "origin", None)) is not None}
-        if mine & self.mapped:  # a mapping that maps its own weights again (run 2793)
-            names = [
-                f"{o[1].name}.{o[2].path}:{o[4]}"
-                for s in standins
-                if (o := getattr(s, "origin", None)) is not None and id(o[2]) in self.mapped
-            ]
-            raise _unbound_read(
-                op,
-                f"a weight read re-entered its own mapping ({', '.join(names)}; inside "
-                f"{' > '.join(self.mapping_ops)})",
-            )
         self.mapping += 1
-        self.mapped |= mine
-        self.mapping_ops.append(op)
         mapping = True
         try:
             bound_at_entry: set[int] = set()
@@ -1166,16 +1150,12 @@ class Weights:
                     )
                 real[id(standin)] = value.to(dtype=standin.dtype, device=standin.device)
             self.mapping, mapping = self.mapping - 1, False
-            self.mapped -= mine
-            self.mapping_ops.pop()
             yield Read(
                 real, tuple((r.bound, r.bound + r.span) for _, r, _ in held if r.bound is not None)
             )
         finally:
             if mapping:
                 self.mapping -= 1
-                self.mapped -= mine
-                self.mapping_ops.pop()
             for component, region, lease in reversed(held):
                 if region.index not in component.resident:
                     unbind(region)
@@ -2206,6 +2186,11 @@ def close_cursor(component: Component) -> None:
         pass
 
 
+#: Regions whose bake is in flight: its factor reads may place the region again, never bake it
+#: twice.
+_BAKING: set[int] = set()
+
+
 def _bake_key(bake: Bake) -> tuple[object, ...]:
     """What baking `bake` now would add: its graph, and each hook's current factors (None: the
     hook serves no update now)."""
@@ -2239,22 +2224,20 @@ def _bake(
         BAKED[2] += len(region.bakes)
     if home and refill and _stale(region, keys):
         raise _Stale(region.index)
-    bakes_now = some and (not home or not region.baked)
-    if bakes_now and _factors_mapping(region, keys):
-        # Placed inside the read that is mapping its overlay's factors (run 10549): they cannot
-        # be read again from here. The region serves unbaked, its hooks adding the delta per call.
-        for bake in region.bakes:
-            if bake.layer is not None:
-                bake.layer._cozy_baked = False
-            for hook in bake.hooks:
-                hook._cozy_baked = False
+    if id(region) in _BAKING:
+        # Placed again by a read its own bake made (the overlay's factors, read through a lease
+        # that needed room): the bake in flight finishes it.
         return False
     now = home and some and not region.baked
     if now:
         region.dirty = True  # until every weight is baked
     if now or (some and not home):
-        with _timed(torch, parts):
-            BAKED[0] += _apply(torch, region, parts, keys)
+        _BAKING.add(id(region))
+        try:
+            with _timed(torch, parts):
+                BAKED[0] += _apply(torch, region, parts, keys)
+        finally:
+            _BAKING.discard(id(region))
     if now:
         region.baked, region.baked_with, region.dirty = True, keys, False
         region.variant = _variant(region, keys)
@@ -2265,19 +2248,6 @@ def _bake(
         for hook, key in zip(bake.hooks, hooks, strict=True):
             hook._cozy_baked = baked and key is not None
     return now
-
-
-def _factors_mapping(region: Region, keys: list[tuple[object, ...]]) -> bool:
-    """Whether a factor some hook of the region would bake is a stand-in whose region a weight
-    read in flight is mapping now."""
-    for bake, row in zip(region.bakes, keys, strict=True):
-        for hook, key in zip(bake.hooks, row[1:], strict=True):
-            got = hook.lora_factors() if key is not None else None
-            for factor in (got[1], got[2]) if got is not None else ():
-                origin = getattr(factor, "origin", None)
-                if origin is not None and id(origin[2]) in origin[0].mapped:
-                    return True
-    return False
 
 
 def _stale(region: Region, keys: list[tuple[object, ...]]) -> bool:
