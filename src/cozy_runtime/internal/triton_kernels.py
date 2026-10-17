@@ -5,9 +5,9 @@ Each entry compiles into Triton's own keyed cache (`TRITON_CACHE_DIR`, inside th
 kernel store), then Triton's launcher module, in the compile manager's niced background builder
 (`BUILDERS["triton"]`), which imports each kernel by module and name; the store's entry marks the
 cache filled. The key is Triton's own hash of every entry (sources and the functions they call,
-signature, architecture, options, Triton) plus the driver, the launcher module's key and the
-cache location. `load` waits for a live build by its measured progress, then serves it or
-raises `KernelsUnavailable`: a request never compiles.
+signature, architecture, options, Triton) plus the launcher module's key and the cache
+location; a driver update rebuilds nothing. `load` waits for a live build by its measured
+progress, then serves it or raises `KernelsUnavailable`: a request never compiles.
 
 Executor-only: torch and Triton are imported at the top, guarded; their absence is
 `kernels_absent`.
@@ -34,7 +34,6 @@ from cozy_runtime.author.kernels import (
     readable,
 )
 from cozy_runtime.internal import kernel_cache, kernel_compile
-from cozy_runtime.internal.accel import driver_version
 
 try:
     import torch
@@ -135,7 +134,6 @@ def job(kernels: TritonKernels, arch: int) -> kernel_compile.Job:
     entries = {entry.key: _cache_key(entry, arch) for entry in kernels.entries}
     inputs = {
         "arch": arch,
-        "driver": driver_version(),
         "triton": triton.__version__,
         "entries": entries,
         "launcher": _launcher_key(),

@@ -33,6 +33,7 @@ from cozy_runtime.internal import (
     kernel_cache,
     kernel_compile,
     kernel_sources,
+    prebuilt,
 )
 from cozy_runtime.internal.parallel import links
 
@@ -72,11 +73,13 @@ def _job(artifact: str, sm: int, device: str, family: str = "") -> kernel_compil
 
 
 def jobs(present: Mapping[int, str]) -> list[kernel_compile.Job]:
-    """Each card architecture's attention (`boot`) and its 8-bit op for its row, once per key."""
+    """Each card architecture's attention (`boot`) and its 8-bit op for its row, once per key;
+    none where the prebuilt wheel carries the card's (`prebuilt.covers`)."""
     found: dict[str, kernel_compile.Job] = {}
     for sm, device in sorted(present.items()):
         builds = [(c.artifact, "") for c in boot(arch.row(sm)) if c.artifact]
-        builds += [(INT8, arch.row(sm).family)] if arch.row(sm).family else []
+        own = arch.row(sm).family and not prebuilt.covers(sm)
+        builds += [(INT8, arch.row(sm).family)] if own else []
         for artifact, family in builds:
             job = _job(artifact, sm, device, family)
             if job is not None:

@@ -1,11 +1,11 @@
-"""The `fp8-rowwise/1` encoded GEMM: `torch.ops.cozy.fp8_linear`, one torch op.
+"""The `fp8-rowwise/1` encoded GEMM: one call of the Runtime's 8-bit op library.
 
-It lives in the Runtime's 8-bit op library (`int8_op/`), which the machine compiles on the
-card at boot (`int8_linear.native`). One kernel quantizes each activation row to E4M3 against
-its own amax (`eager_quantize`'s law, bit for bit). The GEMM then applies both row scales and
-the bias in its epilogue: wgmma on Hopper, tcgen05 on B200 and B300, the TMA mma on RTX 50, and
-cuBLASLt's `_scaled_mm` on other cards. Until the library lands, and for what it does not take
-(f32, a CPU probe), the same law runs in torch ops and `_scaled_mm`.
+The library (`int8_op/`) comes prebuilt and verified on the card, else compiled by the machine
+at boot (`int8_linear.native`). One kernel quantizes each activation row to E4M3 against its own
+amax (`eager_quantize`'s law, bit for bit). The GEMM then applies both row scales and the bias in
+its epilogue: wgmma on Hopper, tcgen05 on B200 and B300, the TMA mma on RTX 50, and cuBLASLt's
+`_scaled_mm` on other cards. Until the library lands, and for what it does not take (f32, a CPU
+probe), the same law runs in torch ops and `_scaled_mm`.
 
 `torch` is the torch module: this module imports no torch.
 """
@@ -32,10 +32,10 @@ _OPS: dict[int, int8_linear.Op] = {}
 
 
 def native(torch: ModuleType, index: int) -> int8_linear.Op | None:
-    """`torch.ops.cozy.fp8_linear` on this card, or None while the library builds."""
+    """The library's fp8 linear on this card, or None while the library builds."""
     op = _OPS.get(index)
     if op is None and int8_linear.native(torch, index) is not None:
-        op = _OPS[index] = torch.ops.cozy.fp8_linear.default
+        op = _OPS[index] = int8_linear.library(index).fp8_linear
         major, minor = torch.cuda.get_device_capability(index)
         print(f"[fp8] cozy fp8 op serves sm{major * 10 + minor}", file=sys.stderr)
     return op
@@ -63,7 +63,7 @@ def quantize(torch: ModuleType, x: Tensor) -> PreQuantized:
     """`x` as the leaf's operand, shared by the fp8 leaves that read it (`quantize_once`)."""
     if _op(torch, x, x.dtype) is not None:
         try:
-            payload, scale = torch.ops.cozy.fp8_quantize.default(x)
+            payload, scale = int8_linear.library(x.get_device()).fp8_quantize(x)
             return PreQuantized(payload, scale, tuple(x.shape))
         except Exception as exc:  # torch ops serve this call
             int8_linear.failed(OP, x.get_device(), exc)
@@ -84,7 +84,7 @@ def gemm(
     kernel that served it."""
     if _op(torch, operand.payload, out_dtype) is not None:
         try:
-            out = torch.ops.cozy.fp8_gemm.default(
+            out = int8_linear.library(operand.payload.get_device()).fp8_gemm(
                 operand.payload, operand.scale, data, scale, bias, out_dtype
             )
             return out.view(*operand.shape[:-1], -1), OP

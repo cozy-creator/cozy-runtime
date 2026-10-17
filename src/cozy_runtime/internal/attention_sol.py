@@ -378,7 +378,6 @@ def job(tokens: int, capability: tuple[int, int]) -> kernel_compile.Job:
     inputs = {
         "library": sol_library(),
         "target": spelled,
-        "driver": accel.driver_version(),
         "options": OPTIONS,
         "variant": shape,
     }
