@@ -216,7 +216,9 @@ def linear(
             op = native(torch, index)
             if op is not None:
                 return op(x, data, scale, bias, out_dtype), OP
-            module = kitchen(torch, index)
+            # comfy-kitchen's GEMM ends a CUDA graph capture (run 10264, sm86): one records eager.
+            capturing = torch.cuda.is_current_stream_capturing()
+            module = None if capturing else kitchen(torch, index)
             if module is not None:
                 with readable(data, scale, bias) as (d, s, b):
                     out = module.int8_linear(
