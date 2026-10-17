@@ -65,6 +65,7 @@ from msgspec import UNSET, UnsetType
 from tensorfs.derived import SourceCapability
 
 from cozy_runtime import __version__ as RUNTIME_VERSION
+from cozy_runtime import graphs
 from cozy_runtime.author import describe
 from cozy_runtime.author._activity import settles
 from cozy_runtime.author._app import Registration
@@ -2689,11 +2690,9 @@ class Executor:
         self.residency = WeightResidency(weights, backend.components, scopes, refine=backend.refine)
         object.__setattr__(model, "_cozy_residency", self.residency)
         # Its components' calls replay CUDA graphs once recorded (`graphs`), unless uncaptured.
-        # Imported past the device boundary: `graphs` imports torch, and a session without a
-        # GPU never does (test_device_session).
-        from cozy_runtime import graphs
-
-        graphs.install(model, {name: c.root for name, c in self.residency.components.items()})
+        graphs.install(
+            self.torch, model, {name: c.root for name, c in self.residency.components.items()}
+        )
         stage_memo.install(
             model,
             torch=torch,

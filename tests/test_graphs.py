@@ -21,7 +21,7 @@ def _mlp(device: str) -> Any:
     module = torch.nn.Sequential(
         torch.nn.Linear(64, 128), torch.nn.GELU(), torch.nn.Linear(128, 64)
     ).to(device)
-    graphs.install(object(), {"mlp": module})
+    graphs.install(torch, object(), {"mlp": module})
     return module
 
 
@@ -75,7 +75,7 @@ def test_recordings_replay_across_calls_and_signatures() -> None:
 @pytest.mark.skipif(not CUDA, reason="CUDA graphs need a GPU")
 def test_a_call_that_depends_on_hidden_state_runs_as_written() -> None:
     module = _counting().cuda()
-    graphs.install(object(), {"counting": module})
+    graphs.install(torch, object(), {"counting": module})
     WARNINGS.clear()
     with torch.inference_mode():
         x = torch.zeros(3, device="cuda")
