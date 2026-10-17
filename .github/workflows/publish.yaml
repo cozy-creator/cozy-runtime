@@ -5,6 +5,7 @@ name: Publish to PyPI
 #   gh workflow run publish.yaml -f release_tag=vX.Y.Z -f mode=source
 # Approved existing release assets:
 #   gh workflow run publish.yaml -f release_tag=vX.Y.Z -f mode=prebuilt -f gated_sha256sums='<sha256> <filename> ...'
+#   (add -f waive_platforms=linux-aarch64 to publish one release without its aarch64 wheel; the run records it)
 # Add -f rehearsal=true to verify a tag/files without entering the publish job.
 # Build/download jobs have read-only repository access. Only publish obtains PyPI OIDC.
 on:
@@ -28,6 +29,10 @@ on:
         default: false
       gated_sha256sums:
         description: '"<sha256> <filename>" pairs, space separated: publish exactly these release assets, no build'
+        type: string
+        default: ''
+      waive_platforms:
+        description: 'Prebuilt only: platform wheels this one release omits, named explicitly (linux-aarch64)'
         type: string
         default: ''
 
@@ -263,11 +268,17 @@ jobs:
           TAG: ${{ inputs.release_tag }}
           VERSION: ${{ steps.release.outputs.version }}
           SUMS: ${{ inputs.gated_sha256sums }}
+          WAIVE: ${{ inputs.waive_platforms }}
         run: |
-          set -eu
+          set -euo pipefail
           test -n "$SUMS" || { echo "::error::Prebuilt mode requires gated_sha256sums."; exit 1; }
           gh release download "$TAG" -R "$GITHUB_REPOSITORY" -D dist
-          uv run --no-project --python 3.12 python release-tools/checks/release_assets.py --dist dist --version "$VERSION"
+          uv run --no-project --python 3.12 python release-tools/checks/release_assets.py --dist dist --version "$VERSION" \
+            --waive-platforms "$WAIVE" | tee assets.txt
+          if grep -q '^WAIVED:' assets.txt; then
+            grep '^WAIVED:' assets.txt | while read -r line; do echo "::warning::$line"; done
+            { echo '### Platform waiver'; grep '^WAIVED:' assets.txt; } >> "$GITHUB_STEP_SUMMARY"
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: release-dist
