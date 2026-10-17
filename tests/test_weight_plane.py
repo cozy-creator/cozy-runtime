@@ -924,10 +924,6 @@ def test_a_ring_a_view_outlives_never_refuses_the_next_stage(card: Any, holder: 
         for grab in grabs:
             grab.remove()
         assert weights.facts().streamed["stack"].resident_blocks < BLOCKS
-        stack = model.residency.components["stack"]
-        for region in stack.regions:  # only the ring's views outlive the stage, as in 10562
-            if region.index in stack.resident and region.module is not model.stack:
-                frames.pop(region.module.proj, None)
         if holder == "garbage":
             del frames
         model.residency.unpark()
