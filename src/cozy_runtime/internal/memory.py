@@ -223,11 +223,20 @@ class Memory:
         upto: Rung = Rung.DISK,
     ) -> int:
         """The room a failed attempt runs again with: `free_for` found it, and more is free
-        than at the attempt's last try (`seen`). -1: it does not run again."""
-        if self.free_for(nbytes, op, operands, upto) and (now := self.free()) > seen:
-            self.weights.oom_retries += 1
-            return now
-        return -1
+        than at its last try (`seen`). One that failed with the room the ledger gave it was
+        refused by more than the ledger shows (fragmentation, a library's own bytes): its ask
+        doubles, walking the ladder further, until more comes free or it is more than the
+        GPU has. -1: it does not run again."""
+        weights, ask = self.weights, nbytes
+        most = weights.total - max(weights.context_bytes, 0) - MARGIN
+        while True:
+            fits = self.free_for(ask, op, operands, upto)
+            if (now := self.free()) > seen and (fits or ask > nbytes):
+                weights.oom_retries += 1
+                return now
+            if not fits or ask >= most:
+                return -1
+            ask = min(2 * max(ask, now), most)
 
     def retry[T](
         self,

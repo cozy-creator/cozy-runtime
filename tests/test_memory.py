@@ -263,3 +263,56 @@ def test_an_op_runs_again_only_once_its_failed_frames_let_go(
     assert torch.equal(out, x) and len(MADE) == 2
     assert seen == [True], "the failed op's tensor was alive when room was measured"
     assert weights.oom_retries == 1
+
+
+def test_an_allocation_refused_with_room_on_the_ledger_still_climbs_the_ladder(
+    card: tuple[Weights, dict[str, int]],
+) -> None:
+    """Runs 10829 and 10837 (SDXL's encode on a 12 GB card beside an idle Klein): 25,493,504 B
+    refused with 184,221,696 B free above the floor. The ledger said it fit, so the owner was
+    never asked, and the run failed `memory_exhausted`. A second refusal with the same room is
+    evidence the ledger is short for this op: the ask doubles and the ladder walks on."""
+    weights, device = card
+    asked: list[int] = []
+
+    def owner(nbytes: int) -> None:  # the idle tenant's 7.56 GB, once asked for
+        asked.append(nbytes)
+        device["free"] += 7_560_000_000
+
+    weights.room, weights.floor_free = owner, 268_435_456
+    device["free"] = 184_221_696 + weights.floor_free
+    need = 25_493_504
+    seen = weights.memory.again(need, "aten.convolution.default")
+    assert seen == 184_221_696 and not asked, "the first refusal runs again in what is free"
+    now = weights.memory.again(need, "aten.convolution.default", seen=seen)
+    assert now > seen and asked and asked[0] >= 2 * seen, "the second asks the owner"
+
+
+@torch.library.custom_op("cozy_memory_test::stubborn", mutates_args=())  # type: ignore[untyped-decorator]
+def stubborn(x: torch.Tensor) -> torch.Tensor:  # type: ignore[name-defined]
+    """An op the allocator refuses while the ledger shows room, until an owner made more."""
+    if not READY[0]:
+        raise torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 24.31 MiB")
+    return x.clone()
+
+
+READY = [False]
+
+
+def test_an_op_refused_with_room_on_the_ledger_runs_once_the_owner_made_more(
+    card: tuple[Weights, dict[str, int]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    weights, device = card
+    monkeypatch.setattr(memory_module, "RELEASERS", [])
+    device["free"] = 184_221_696
+
+    def owner(_: int) -> None:
+        device["free"] += 7_560_000_000
+        READY[0] = True
+
+    weights.room = owner
+    READY[0] = False
+    x = torch.ones(4)
+    with weights.recovering():
+        assert torch.equal(torch.ops.cozy_memory_test.stubborn(x), x)
+    assert READY[0] and weights.oom_retries == 2
