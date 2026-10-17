@@ -2910,13 +2910,14 @@ class PlaneBackend:
         declares no blocks is paged at the sub-block grain: as one region nothing below its
         whole size could hold it (run 5424, SeedVR2's 6.4 GB DiT on an 8 GB card)."""
         try:
-            layout = partition(root, REGION_LIMIT if fine else None)
-            if layout is None and not fine:
-                layout = partition(root, REGION_LIMIT)
-                fine = layout is not None
+            layout = None if fine else partition(root)
         except ValueError:
-            layout = None  # storage shared across units: one region, not streamable
-        units = [unit.path for unit in layout.blocks] if layout is not None else []
+            layout = None  # its blocks share storage: the sub-block grain places them
+        if layout is None:
+            with suppress(ValueError):  # custom state-dict keys: one region, not streamable
+                layout = partition(root, REGION_LIMIT)
+            fine = layout is not None
+        units = [unit.paths for unit in layout.blocks] if layout is not None else []
         members: list[list[str]] = [[] for _ in range(len(units) + 1)]
         for key in keys:
             path = key[len(name) + 1 :].rpartition(".")[0]
@@ -3025,8 +3026,8 @@ class PlaneBackend:
         for (index, group), span in zip(kept, spans, strict=True):
             region = Region(
                 index=len(regions),
-                path=units[index - 1] if index else "",
-                module=root.get_submodule(units[index - 1]) if index else root,
+                path=units[index - 1][0] if index else "",
+                module=root.get_submodule(units[index - 1][0]) if index else root,
                 weights=[],
                 offset=span.offset,
                 span=span.span,
@@ -3135,7 +3136,7 @@ class _Prepared:
     checkpoint, read plan, region ids and digest, and the plan the machine fills from."""
 
     keys: list[str]
-    units: list[str]
+    units: list[tuple[str, ...]]
     kept: list[tuple[int, list[str]]]
     checkpoint: Checkpoint
     plan: ReadPlan
@@ -3217,7 +3218,7 @@ class LoRASource(Protocol):
 
 
 def _fine(root: Module) -> tuple[int, int] | None:
-    """(common, largest region) spans at the sub-block grain, for the refusal floor."""
+    """(common, largest region) spans at the sub-block grain, for its floor."""
     try:
         layout = partition(root, REGION_LIMIT)
     except ValueError:
@@ -3232,10 +3233,10 @@ def _span(nbytes: int) -> int:
     return -(-nbytes // (2 << 20)) * (2 << 20)
 
 
-def _unit_of(path: str, blocks: Sequence[str]) -> int:
-    """The region a module path belongs to: 1 + its block's index, or 0 (common)."""
-    for index, block in enumerate(blocks):
-        if path == block or path.startswith(block + "."):
+def _unit_of(path: str, units: Sequence[Sequence[str]]) -> int:
+    """The region a module path belongs to: 1 + its unit's index, or 0 (common)."""
+    for index, paths in enumerate(units):
+        if any(path == unit or path.startswith(unit + ".") for unit in paths):
             return index + 1
     return 0
 
@@ -4052,20 +4053,13 @@ class WeightResidency:
                 },
             )
 
-        # Every component keeps its grain while the budget holds each one's floor at it: a
-        # larger component never takes the room a smaller one needs to stay whole (H3's
-        # turbo LoRA beside its DiT, run 2947). Only when those floors do not fit does a
-        # component that can still refine count at its finer floor, and move to it.
-        layouts = {key: _paid(c, replace(c.planned, fine=None))[0] for key, c in components.items()}
+        # A component counts at its finest grain only while it can still move there.
+        layouts = {
+            key: _paid(c, c.planned if row._refinable(c) else replace(c.planned, fine=None))[0]
+            for key, (row, _, c) in opened.items()
+        }
         try:
-            try:
-                paid = stage(layouts)
-            except weight_policy.BelowFloor:
-                layouts = {
-                    key: _paid(c, c.planned)[0] if opened[key][0]._refinable(c) else layouts[key]
-                    for key, c in components.items()
-                }
-                paid = stage(layouts)
+            paid = stage(layouts)
         except weight_policy.BelowFloor as exc:
             if exc.component in opened and opened[exc.component][0]._refine(exc.component):
                 return self._plan(budget, resume, outside)
@@ -4705,8 +4699,7 @@ def _paid(
     common = component.common
     fixed = (common.decoded if common.index in component.shared else layout.common) if common else 0
     fixed += sum(b.decoded for b in component.blocks if b.index in component.shared)
-    blocks = tuple(layout.blocks[i] for i in kept)
-    return weight_policy.Layout(common=fixed, blocks=blocks, fine=None), kept
+    return replace(layout, common=fixed, blocks=tuple(layout.blocks[i] for i in kept)), kept
 
 
 def _unpaid(

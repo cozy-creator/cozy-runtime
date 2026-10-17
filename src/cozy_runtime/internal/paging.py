@@ -1,8 +1,8 @@
 """A component's weight-plane regions, from the model's own no-split forward boundaries.
 
-The layout carries module references and shape facts, never tensor payloads. `common` holds
-every weight outside a block; each innermost declared block is one region the plane moves
-as a unit and the executor hooks once per call (`weights.py`).
+The layout carries module paths and shape facts, never tensor payloads. `common` holds every
+weight outside a unit; each unit is one region the plane moves as a unit and the executor hooks
+once per call, at its first module's forward (`weights.py`).
 """
 
 from __future__ import annotations
@@ -19,10 +19,14 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class PageUnit:
-    path: str
-    owners: tuple[tuple[str, Module], ...]
+    #: the module subtrees whose weights it holds; the first one's forward is its hook
+    paths: tuple[str, ...]
     nbytes: int
     keys: tuple[str, ...]
+
+    @property
+    def path(self) -> str:
+        return self.paths[0]
 
 
 @dataclass(frozen=True)
@@ -38,15 +42,6 @@ class BlockLayout:
     def total_bytes(self) -> int:
         return self.common.nbytes + sum(block.nbytes for block in self.blocks)
 
-    def document(self) -> dict[str, int]:
-        return {
-            "total_bytes": self.total_bytes,
-            "common_bytes": self.common.nbytes,
-            "largest_block_bytes": max(block.nbytes for block in self.blocks),
-            "working_bytes": self.working_bytes,
-            "blocks": len(self.blocks),
-        }
-
 
 #: A sub-block unit holds at least this fraction of the region limit (64 KiB of 16 MiB).
 SMALL = 256
@@ -54,20 +49,19 @@ SMALL = 256
 
 def partition(root: Module, limit: int | None = None) -> BlockLayout | None:
     """Use declared indivisible blocks (instances of a declared class or of any subclass of
-    one); never guess an arbitrary ModuleList's semantics.
+    one); never guess an arbitrary ModuleList's semantics. Blocks that share a tensor storage
+    cannot be placed apart: they refuse before any device allocation.
 
     With `limit`, the units are instead the largest module subtrees of at most `limit` bytes
     anywhere in the component (a single larger leaf stays whole, and so does a LoRA'd linear
-    with its factors: they are baked into it when its bytes are placed). The weights of the modules
-    that had to be split stay in `common`, and so do a subtree under `limit // SMALL` (a
-    region costs 2 MiB of the budget however little it holds, and weights that small, norm
-    scales, are what fused kernels read without calling their module) and a module nothing
-    calls (`_container`). That is the sub-block
-    grain a budget below the block floor needs (proving-cpu.md C2: SDXL at 1 GiB); every
-    unit's own forward is its hook, and a weight read any other way is mapped for that op
-    (`weights.Weights.reading`).
-    Cross-unit module/tensor aliases and custom state-dict layouts cannot safely be
-    independently placed; they refuse before any device allocation.
+    with its factors: they are baked into it when its bytes are placed), and this grain never
+    refuses for aliases: units that share a storage are one region (tied embeddings), hooked
+    at the first, the others' weights read through their stand-ins; one that shares with
+    `common` joins it. The weights of the modules that had to be split stay
+    in `common`, and so do a subtree under `limit // SMALL` (a region costs 2 MiB of the
+    budget however little it holds, and weights that small, norm scales, are what fused
+    kernels read without calling their module) and a module nothing calls (`_container`).
+    Custom state-dict layouts refuse at either grain.
     """
     classes = getattr(root, "_no_split_modules", None)
     if limit is not None:
@@ -94,38 +88,54 @@ def partition(root: Module, limit: int | None = None) -> BlockLayout | None:
         blocks = [unit for unit in _split(root, "", limit) if unit]
     if not blocks:
         return None
-    owners: dict[str, list[tuple[str, Module]]] = {"": [], **{path: [] for path in blocks}}
-    sizes = dict.fromkeys(owners, 0)
-    keys: dict[str, list[str]] = {path: [] for path in owners}
-    storage_units: dict[object, str] = {}
-    module_units: dict[int, str] = {}
-    for path, module in modules:
-        unit = next(
-            (block for block in blocks if path == block or path.startswith(block + ".")), ""
-        )
-        prior = module_units.setdefault(id(module), unit)
-        if prior != unit:
-            raise ValueError("one module is shared across paging units")
-        owners[unit].append((path, module))
-        tensors = list(module.named_parameters(recurse=False, remove_duplicate=False)) + list(
-            module.named_buffers(recurse=False, remove_duplicate=False)
+    rank = {path: index for index, path in enumerate(["", *blocks])}
+    group = {path: path for path in rank}
+
+    def find(unit: str) -> str:
+        while group[unit] != unit:
+            unit = group[unit]
+        return unit
+
+    units = [
+        (path, module, next((b for b in blocks if path == b or path.startswith(b + ".")), ""))
+        for path, module in modules
+    ]
+    storages: dict[object, str] = {}
+    for _, module, unit in units:
+        for tensor in chain(module.parameters(recurse=False), module.buffers(recurse=False)):
+            if not tensor.numel():
+                continue
+            prior = storages.setdefault(tensor.untyped_storage(), unit)
+            a, b = sorted((find(prior), find(unit)), key=rank.__getitem__)
+            if a != b and limit is None:
+                raise ValueError("one tensor storage is shared across paging units")
+            group[b] = a
+    sizes = dict.fromkeys(rank, 0)
+    keys: dict[str, list[str]] = {path: [] for path in rank}
+    counted: set[int] = set()
+    for path, module, unit in units:
+        unit = find(unit)
+        tensors = chain(
+            module.named_parameters(recurse=False, remove_duplicate=False),
+            module.named_buffers(recurse=False, remove_duplicate=False),
         )
         for local, tensor in tensors:
-            storage = tensor.untyped_storage()
-            if tensor.numel():
-                prior = storage_units.setdefault(storage, unit)
-                if prior != unit:
-                    raise ValueError("one tensor storage is shared across paging units")
-            sizes[unit] += int(tensor.numel() * tensor.element_size())
+            if id(tensor) not in counted:  # a tied tensor's bytes count once
+                counted.add(id(tensor))
+                sizes[unit] += int(tensor.numel() * tensor.element_size())
             if local not in module._non_persistent_buffers_set:
                 keys[unit].append(f"{path}.{local}" if path else local)
-    mapped = {key for group in keys.values() for key in group}
-    if mapped != set(root.state_dict()):
+    if {key for held in keys.values() for key in held} != set(root.state_dict()):
         raise ValueError("custom state-dict keys do not map to registered paging destinations")
-    units = {
-        path: PageUnit(path, tuple(owners[path]), sizes[path], tuple(keys[path])) for path in owners
-    }
-    return BlockLayout(units[""], tuple(units[path] for path in blocks))
+
+    return BlockLayout(
+        PageUnit(("",), sizes[""], tuple(keys[""])),
+        tuple(
+            PageUnit(tuple(p for p in blocks if find(p) == head), sizes[head], tuple(keys[head]))
+            for head in blocks
+            if find(head) == head
+        ),
+    )
 
 
 def _split(root: Module, path: str, limit: int) -> list[str]:

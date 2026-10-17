@@ -31,6 +31,38 @@ def test_declared_blocks_with_shared_storage_are_not_independently_pageable() ->
     model.blocks[1].linear.weight = model.blocks[0].linear.weight
     with pytest.raises(ValueError, match="shared across paging units"):
         partition(model)
+    # The finer grain never refuses for it: the aliased units are one region.
+    fine = partition(model, 16)
+    assert fine is not None and [b.paths for b in fine.blocks] == [
+        ("blocks.0.linear", "blocks.1.linear")
+    ]
+    assert fine.total_bytes == 64
+
+
+def test_tied_embeddings_at_the_sub_block_grain_are_one_region_hooked_at_the_first() -> None:
+    """Qwen3's text encoders tie `lm_head` to `embed_tokens`: at 16 MiB regions the two units
+    shared a storage and the component had no finer grain than its block floor."""
+    torch = pytest.importorskip("torch")
+
+    class Lm(torch.nn.Module):  # type: ignore[name-defined,misc]  # optional real Torch
+        def __init__(self) -> None:
+            super().__init__()
+            self.embed_tokens = torch.nn.Embedding(64, 8, device="meta")
+            self.layers = torch.nn.ModuleList(
+                [torch.nn.Linear(8, 8, bias=False, device="meta") for _ in range(2)]
+            )
+            self.lm_head = torch.nn.Linear(8, 64, bias=False, device="meta")
+            self.lm_head.weight = self.embed_tokens.weight
+
+    layout = partition(Lm(), 1024)
+    assert layout is not None
+    assert [b.paths for b in layout.blocks] == [
+        ("embed_tokens", "lm_head"),
+        ("layers.0",),
+        ("layers.1",),
+    ]
+    assert layout.blocks[0].nbytes == 64 * 8 * 4  # the tied tensor counts once
+    assert set(layout.blocks[0].keys) == {"embed_tokens.weight", "lm_head.weight"}
 
 
 def test_nested_declarations_page_the_innermost_blocks() -> None:
