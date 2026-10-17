@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import base64
 import email.parser
-import fcntl
 import functools
 import hashlib
 import json
@@ -51,7 +50,7 @@ from packaging.tags import sys_tags
 from packaging.utils import parse_wheel_filename
 
 from cozy_runtime._cpus import cpus
-from cozy_runtime.internal import config, egress, kernel_cache, kernel_compile
+from cozy_runtime.internal import config, egress, filelock, kernel_cache, kernel_compile
 
 ROOT = Path("/opt/cozy/kernel-sources")
 INDEX = "index.json"
@@ -620,7 +619,7 @@ def _verified(source: Mapping[str, Any]) -> Path:
     if source.get("acquire"):
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         with (path.parent / ".fetch.lock").open("a+b") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+            filelock.lock(lock)
             if not path.is_file() or _digest(path) != source["sha256"]:
                 preseed = Path(source["preseed"])
                 if preseed.is_file() and _digest(preseed) == source["sha256"]:
