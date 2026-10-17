@@ -284,7 +284,6 @@ class Memory:
         )
         failure = MemoryExhausted(detail, op, nbytes, ledger, tried)
         self.refusal = failure.shortfall
-        self.weights.modes["memory.exhausted"] = detail[:1200]
         raise failure
 
     def ask(self, nbytes: int) -> None:

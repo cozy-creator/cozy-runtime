@@ -116,7 +116,7 @@ def test_the_one_refusal_carries_the_ledger_the_op_and_each_rung(
     assert "should have fit" in failure.detail and "unattributed 0" in failure.detail
     assert failure.shortfall == weights.memory.refusal
     assert failure.shortfall["needed_bytes"] == 1 << 30
-    assert weights.modes["memory.exhausted"].startswith("aten.mm.default needs")
+    assert "memory.exhausted" not in weights.modes, "a refusal caught and recovered is no mode"
     # capacity everywhere it is read: the attempt fails, the process and its group stay
     outcome = classify(failure)
     assert (outcome.terminal, outcome.code) == ("failed", MEMORY_EXHAUSTED)
