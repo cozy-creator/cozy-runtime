@@ -1934,7 +1934,7 @@
     "gpu_inference_launched": false,
     "owned_server_stopped": true,
     "next": "Implement explicit controller-side CLI development service client; preserve executor fence.",
-    "pr": "https://github.com/cozy-creator/cozy/pull/1160",
+    "pr": "https://github.com/cozy-creator/cozy-creator/pull/1160",
     "candidate_commit": "de4341cb",
     "prior_cli_attempt": "typed-nil preflight exited before any graph submission; fixed with actual command-path test",
     "cli_pr_merged": true,

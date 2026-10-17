@@ -149,7 +149,7 @@ lock is not a Cozy receipt transaction. See [uv cache safety](https://docs.astra
 
 Tracking: [epic #202](https://github.com/cozy-creator/tracker-v2/issues/202),
 [Runtime #546](https://github.com/cozy-creator/cozy-runtime/issues/546),
-[Creator #590](https://github.com/cozy-creator/cozy/issues/590),
+[Creator #590](https://github.com/cozy-creator/cozy-creator/issues/590),
 [Hub #648](https://github.com/cozy-creator/tensorhub-v2/issues/648).
 
 ### Stable wheel inputs for uv reuse

@@ -83,7 +83,7 @@ jobs:
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
           # TensorD's driver floor (public cozy repo), which the modules' must equal.
-          curl -fsSL https://raw.githubusercontent.com/cozy-creator/cozy/master/crates/cozy-platform/src/gpu/mod.rs \
+          curl -fsSL https://raw.githubusercontent.com/cozy-creator/cozy-creator/master/crates/cozy-platform/src/gpu/mod.rs \
             -o platform-gpu.rs
           # glibc 2.28 and gcc-toolset-14: the wheels' floor is the floor the modules compile on.
           docker run --rm -v "$PWD:/src" -w /src --env-file <(grep -v '^#' kernels/toolchain.env) \
@@ -182,7 +182,7 @@ jobs:
           $py = "${{ steps.py312.outputs.python-path }}"
           & $py -m pip install -q "nanobind==$env:NANOBIND" "cmake==$env:CMAKE" "ninja==$env:NINJA"
           $env:PATH = "$(Split-Path $py)\Scripts;$env:PATH"
-          Invoke-WebRequest https://raw.githubusercontent.com/cozy-creator/cozy/master/crates/cozy-platform/src/gpu/mod.rs -OutFile platform-gpu.rs
+          Invoke-WebRequest https://raw.githubusercontent.com/cozy-creator/cozy-creator/master/crates/cozy-platform/src/gpu/mod.rs -OutFile platform-gpu.rs
           $began = Get-Date
           cmake -S kernels -B "$env:RUNNER_TEMP\build" -G Ninja -DCMAKE_BUILD_TYPE=Release "-DPython_EXECUTABLE=$py"
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
