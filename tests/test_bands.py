@@ -25,7 +25,7 @@ class Card:
     """The executor's memory as bands read it: `room` bytes free, nothing to unmap, no host
     memory to put a result in."""
 
-    grouped = False
+    grouped = unified = False
 
     def __init__(self, room: int) -> None:
         self.torch, self.device, self.room = torch, torch.device("cpu"), room
@@ -202,3 +202,113 @@ def test_joins_repeats_and_copies_band_along_other_dims(room: int) -> None:
 
     _, ran = banded(call, room)
     assert {"aten.cat", "aten.repeat_interleave", "aten.contiguous"} <= set(ran)
+
+
+def products(x: Any, w: Any, v: Any, bias: Any, gamma: Any) -> Any:
+    """A transformer's row ops: linears with and without a bias, layer and RMS norms, a
+    softmax over scores, batched products with a bias, a log softmax."""
+    f = torch.nn.functional
+    h = f.layer_norm(f.linear(x, w, bias), (40,), gamma, bias)
+    h = f.rms_norm(f.linear(h, v), (40,), gamma, 1e-6)
+    heads = h.view(2, 37, 4, 10).transpose(1, 2)
+    scores = (heads @ heads.transpose(-1, -2)).softmax(-1)
+    h = (scores @ heads).transpose(1, 2).reshape(h.shape)
+    h = torch.baddbmm(h, h, v.expand(2, -1, -1), alpha=0.5)
+    return torch.log_softmax(torch.addmm(bias, h[0], v.t()), -1)
+
+
+@pytest.mark.parametrize("inference", (False, True))
+@pytest.mark.parametrize("room", ROOMS)
+def test_products_softmaxes_and_norms_band_by_rows(room: int, inference: bool) -> None:
+    """Output rows read the same rows of a product's left operand (its right one whole) and
+    of a norm's or softmax's input. Under inference mode torch hands the mode `linear`,
+    `matmul`, `softmax` and the norms whole; else their decompositions."""
+    torch.manual_seed(5)
+    x, w, v = torch.randn(2, 37, 24), torch.randn(40, 24), torch.randn(40, 40) / 6
+    bias, gamma = torch.randn(40), torch.rand(40)
+    mode = torch.inference_mode if inference else torch.no_grad
+    with mode():
+        stock = products(x, w, v, bias, gamma)
+        with Short(room) as short:
+            out = products(x, w, v, bias, gamma)
+    torch.testing.assert_close(out, stock, rtol=1e-5, atol=1e-5)
+    ran = set(short.ran)
+    if inference:
+        assert {"aten.linear", "aten.matmul", "aten.layer_norm", "aten.rms_norm"} <= ran
+        assert {"aten.softmax", "aten.log_softmax"} <= ran
+    else:
+        assert {"aten.addmm", "aten.mm", "aten.bmm", "aten.native_layer_norm"} <= ran
+        assert {"aten._softmax", "aten._log_softmax"} <= ran
+    assert {"aten.baddbmm"} <= ran
+
+
+@pytest.mark.parametrize("room", ROOMS)
+def test_row_ops_in_bands_are_bit_exact_and_products_close(room: int) -> None:
+    """A softmax or a norm computes each row alone: the same bits in any band. A product's
+    kernel may change with the band's height (CPU and cuBLAS alike): float32 within rounding,
+    bfloat16 within its own."""
+    torch.manual_seed(6)
+    x, w = torch.randn(3, 50, 64), torch.randn(96, 64)
+    aten = torch.ops.aten
+    exact = {
+        "softmax": lambda: torch.softmax(x, -1),
+        "layer_norm": lambda: aten.native_layer_norm(x, [64], w[0], w[1], 1e-5),
+        "rms_norm": lambda: torch.nn.functional.rms_norm(x, (64,), w[0], 1e-6),
+        "fused_rms_norm": lambda: aten._fused_rms_norm(x, [64], w[0], 1e-6),
+    }
+    e4m3, rows, cols = x[0].to(torch.float8_e4m3fn), x[0, :, :1].abs() + 0.5, w[None, :, 0].abs()
+    close = {
+        "linear": lambda: torch.nn.functional.linear(x, w),
+        "bf16": lambda: torch.nn.functional.linear(x.bfloat16(), w.bfloat16(), w[:, 0].bfloat16()),
+        "fp8 rowwise": lambda: torch._scaled_mm(
+            e4m3, w.to(torch.float8_e4m3fn).t(), rows, cols, out_dtype=torch.bfloat16
+        ),
+    }
+    ran: set[str] = set()
+    with torch.inference_mode():
+        for name, call in {**exact, **close}.items():
+            stock = call()
+            with Short(room) as short:
+                out = call()
+            ran |= set(short.ran)
+            if name in exact:
+                pairs = zip(
+                    *(t if isinstance(t, tuple) else (t,) for t in (out, stock)), strict=True
+                )
+                assert all(torch.equal(got, want) for got, want in pairs), name
+            else:  # bfloat16 within one of its steps at this magnitude (about 8)
+                loose = {} if out.dtype == torch.float32 else {"atol": 2**-4, "rtol": 2**-7}
+                torch.testing.assert_close(out, stock, **loose)
+    names = ("softmax", "native_layer_norm", "rms_norm", "_fused_rms_norm", "linear", "_scaled_mm")
+    assert {f"aten.{name}" for name in names} <= ran
+
+
+@pytest.mark.parametrize("room", ROOMS)
+def test_a_flux2_transformer_in_bands_is_the_whole_one(room: int) -> None:
+    """A Flux.2 (Klein) transformer, seeded on the CPU: its linears, norms and modulations
+    in bands; its attention whole."""
+    torch.manual_seed(14)
+    model = diffusers.Flux2Transformer2DModel(
+        in_channels=8,
+        num_layers=1,
+        num_single_layers=1,
+        attention_head_dim=16,
+        num_attention_heads=2,
+        joint_attention_dim=24,
+        timestep_guidance_channels=16,
+        axes_dims_rope=(4, 4, 4, 4),
+        guidance_embeds=False,
+    ).eval()
+    image, text = torch.randn(1, 30, 8), torch.randn(1, 7, 24)
+    ids = torch.zeros(1, 30, 4)
+    ids[..., 2], ids[..., 3] = torch.arange(30) // 6, torch.arange(30) % 6
+
+    def call() -> Any:
+        return model(image, text, torch.tensor([0.5]), ids, torch.zeros(1, 7, 4)).sample
+
+    with torch.inference_mode():
+        stock = call()
+        with Short(room) as short:
+            out = call()
+    torch.testing.assert_close(out, stock, rtol=1e-4, atol=1e-5)
+    assert "aten.linear" in short.ran
