@@ -58,6 +58,7 @@ import socket
 import sys
 import threading
 import time
+from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
@@ -143,6 +144,7 @@ from cozy_runtime.internal import (
     execution_evidence,
     executor_commands,
     fetch_plan,
+    fp8_linear,
     int8_linear,
     kernel_cache,
     kernel_compile,
@@ -161,6 +163,7 @@ from cozy_runtime.internal import (
 )
 from cozy_runtime.internal.config import inherited_environment, restore_seal, seal_snapshot
 from cozy_runtime.internal.discovery import discover_distribution, discover_installed
+from cozy_runtime.internal.encoding.leaves import FORMATS
 from cozy_runtime.internal.executor_commands import (
     LOAD_ATTENTION_PIN,
     LOAD_PINNED,
@@ -3526,19 +3529,10 @@ class Executor:
         self.handled = (outcome, stage[0], record)
         if self.rank == 0:
             for member in self.model_executors or [self]:
-                for group in member.refused_leaves:
-                    fields = dataclasses.asdict(group)
-                    record.emit("log", "encoded leaf refused, served decoded", "warn", **fields)
+                self._emit_gemm(record, member)
             for feature, instead in accel.unavailable(self.device_kind) if self.models else ():
                 record.emit(
                     "log", f"{feature} unavailable on {self.device_kind}", "warn", instead=instead
-                )
-            for missing in int8_linear.unavailable():
-                record.emit(
-                    "log",
-                    "8-bit op unavailable, slower kernels served",
-                    "warn",
-                    **dataclasses.asdict(missing),
                 )
             for message, raised in WARNINGS:
                 record.emit("log", message, "warn", **raised)
@@ -3752,18 +3746,62 @@ class Executor:
     def _restore_attention(self) -> None:
         self._attention_snapshot().restore()
 
+    def _prefix(self) -> str:
+        """A qualified request names its model even when it is the only one; component-only pins
+        still match through attention._matches."""
+        return "+".join(sorted(self.models)) + "/" if self.models else ""
+
     def _attention_roots(self) -> dict[str, Any]:
         roots: dict[str, Any] = {}
         executors = self.model_executors or [self]
         for executor in executors:
             if executor.backend is None:
                 continue
-            # A qualified request names its model even when it is the only one.
-            # Component-only pins still match through attention._matches.
-            prefix = "+".join(sorted(executor.models)) + "/" if executor.models else ""
             for name, root in executor.backend.roots.items():
-                roots[prefix + name] = root
+                roots[executor._prefix() + name] = root
         return roots
+
+    @staticmethod
+    def _emit_gemm(record: AuthorAttempt, member: Executor) -> None:
+        """`gemm.selected`: per component, format and kernel, the encoded leaves whose last call
+        that kernel served. `gemm.fallback`: each that served below what its lane wanted, why."""
+        prefix = member._prefix()
+        leaves = member.backend.leaves if member.backend is not None else {}
+        served = Counter(
+            (key.partition(".")[0], leaf.provider, leaf.kernel)
+            for key, (leaf, _, _) in leaves.items()
+            if leaf.kernel
+        )
+        missing = int8_linear.unavailable()
+        native = {"int8": int8_linear.OP, "fp8": fp8_linear.OP}
+        for (component, leaf, kernel), sites in sorted(served.items()):
+            fields: dict[str, Any] = {"component": prefix + component, "sites": sites}
+            form = FORMATS[leaf]
+            record.emit("confession", "gemm.selected", kernel, format=form, leaf=leaf, **fields)
+            wanted = native.get(form, kernel)
+            if missing and kernel != wanted:
+                reason = missing[0].reason
+                record.emit(
+                    "confession",
+                    "gemm.fallback",
+                    kernel,
+                    wanted=wanted,
+                    served=kernel,
+                    reason=reason,
+                    **fields,
+                )
+        for group in member.refused_leaves:
+            served_as = {"bfloat16": "bf16", "float16": "fp16"}.get(group.dtype, group.dtype)
+            record.emit(
+                "confession",
+                "gemm.fallback",
+                "torch.linear",
+                component=prefix + group.component,
+                wanted=FORMATS.get(group.leaf, group.lane),
+                served=served_as,
+                reason=group.reason,
+                sites=group.tensors,
+            )
 
     def _attention_selection(self, observed: attention.Applied) -> attention.Applied:
         """Attach preparation reasons only to the choices this request actually holds.
@@ -3776,9 +3814,8 @@ class Executor:
         for executor in self.model_executors or [self]:
             if executor.attention is None:
                 continue
-            prefix = "+".join(sorted(executor.models)) + "/" if executor.models else ""
             for row in executor.attention.fallbacks:
-                component = prefix + row["component"]
+                component = executor._prefix() + row["component"]
                 if pin and attention._matches(component, scope):
                     continue
                 if row["selected"] in observed.hosts.get(component, {}):

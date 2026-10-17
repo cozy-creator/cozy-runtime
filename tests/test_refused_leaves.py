@@ -1,6 +1,7 @@
 """A plan that serves tensors decoded because this device REFUSED their leaf says so, once per
 (component, lane, leaf, reason). A decode by design (a geometry the format rules out, a package
-that declines leaves) says nothing.
+that declines leaves) says nothing. A run names the kernel each component's leaves served
+(`gemm.selected`) and each fallback below its lane (`gemm.fallback`).
 
 Real measurements only: the shipped sm86 table (RTX 3090) and the recorded sm89 probe, whose
 fp8 leaf failed its float16 GEMM check and raised for float32.
@@ -9,21 +10,32 @@ fp8 leaf failed its float16 GEMM check and raised for float32.
 from __future__ import annotations
 
 import json
+from pathlib import Path
+from types import SimpleNamespace
 
 import msgspec
+import pytest
 
-from cozy_runtime.internal import probe, qualification
+from cozy_runtime.author._services import Attempt
+from cozy_runtime.author.kernels import INT8_CONVROT
+from cozy_runtime.derive.microscale import encode_int8_convrot256
+from cozy_runtime.internal import int8_linear, probe, qualification
 from cozy_runtime.internal.encoding import (
     SPEC_INT8_CONVROT256,
+    SPEC_NVFP4,
     SPEC_ROWWISE,
     SPEC_ROWWISE_KEEPDIM,
     Capabilities,
     DeviceFacts,
     Encoded,
+    Int8ConvRotNativeLeaf,
+    Nvfp4NativeLeaf,
     RolePart,
     aliases,
     launch_providers,
 )
+from cozy_runtime.internal.encoding.leaves import NVFP4
+from cozy_runtime.internal.executor import Executor
 from cozy_runtime.internal.fill import PlanRow, dtype_name
 from cozy_runtime.internal.planfacts import PlanFacts
 from cozy_runtime.internal.probe import QualificationResult
@@ -34,7 +46,9 @@ from cozy_runtime.internal.resolution import (
     Variant,
     resolve,
 )
+from test_int8_convrot import weight
 from test_leaf_speedup_record import rekeyed
+from test_nvfp4 import roles
 
 FP8_LEAF = "cozy.fp8-rowwise.native-leaf/1"
 
@@ -95,6 +109,7 @@ def test_a_leaf_below_its_floor_warns_and_a_geometry_or_a_declined_leaf_does_not
             "fp8-rowwise/1",
             FP8_LEAF,
             "its kernel needs cuda.sm89+ and this device is cuda.sm86",
+            "bfloat16",
             2,
         ),
     )
@@ -122,3 +137,81 @@ def test_a_leaf_that_failed_or_raised_in_qualification_warns_once_per_reason() -
             1,
         ),
     ]
+
+
+def test_a_run_names_each_components_gemm_kernel_and_each_fallback(tmp_path: Path) -> None:
+    """Real leaves, run here on the CPU, where each serves its eager kernel; a leaf that never ran
+    names none. The refused fp8 leaves of the sm86 plan serve bf16, and an 8-bit op library that
+    failed for good is the reason an int8 leaf served torch's GEMM."""
+    torch = pytest.importorskip("torch")
+    encoded = encode_int8_convrot256("w", weight(64, 512, 5))
+    int8_roles = {
+        "data": torch.frombuffer(bytearray(encoded.payload), dtype=torch.int8).reshape(64, 512),
+        "scale": torch.frombuffer(bytearray(encoded.companions[0].raw), dtype=torch.float32),
+    }
+    stand_in = probe._StandIn(512, 64)
+    int8 = Int8ConvRotNativeLeaf(SPEC_INT8_CONVROT256)
+    leaves = {
+        key: (int8.leaf(torch, int8_roles, stand_in, torch.bfloat16), None, ())
+        for key in ("transformer.a.weight", "transformer.b.weight", "text_encoder.c.weight")
+    }
+    nvfp4 = Nvfp4NativeLeaf(SPEC_NVFP4).leaf(
+        torch, roles(torch, weight(256, 512, 6), "cpu"), probe._StandIn(512, 256), torch.bfloat16
+    )
+    leaves["transformer.d.weight"] = (nvfp4, None, ())
+    x = torch.randn(40, 512, dtype=torch.bfloat16)
+    for key in ("transformer.a.weight", "transformer.b.weight", "transformer.d.weight"):
+        leaves[key][0](x)
+
+    table = msgspec.convert(
+        json.loads(next(qualification.SHIPPED.glob("cuda.sm86-*.json")).read_bytes()),
+        QualificationResult,
+    )
+    providers = launch_providers()
+    cells = {s: providers[s] for s in (SPEC_ROWWISE, SPEC_ROWWISE_KEEPDIM)}
+    admitted = qualification.qualified(
+        object(), cells, table.device, ("bfloat16",), release="t/1", runtime=table.runtime
+    )
+    rows = [row(f"unet.{n}.weight", SPEC_ROWWISE, "bf16", (64, 256)) for n in "ab"]
+    executor = Executor(None, tmp_path)  # type: ignore[arg-type]
+    executor.backend = SimpleNamespace(leaves=leaves)
+    executor.models = {"klein": object()}
+    executor.refused_leaves = plan(rows, admitted.capabilities, table.device).refused_leaves()
+
+    def emitted() -> list[tuple[object, ...]]:
+        record = Attempt("gemm", tmp_path, 0)
+        Executor._emit_gemm(record, executor)
+        return [
+            (row["name"], row["value"], *sorted(row["fields"].items()))  # type: ignore[union-attr]
+            for row in record.ring.rows()
+        ]
+
+    int8_row = (("component", "klein/transformer"), ("format", "int8"), ("leaf", INT8_CONVROT))
+    selected = [
+        ("gemm.selected", int8_linear.EAGER, *int8_row, ("sites", 2)),
+        ("gemm.selected", "torch-decode", ("component", "klein/transformer"), ("format", "nvfp4"),
+         ("leaf", NVFP4), ("sites", 1)),
+    ]  # fmt: skip
+    refused = (
+        "gemm.fallback",
+        "torch.linear",
+        ("component", "klein/unet"),
+        ("reason", "its kernel needs cuda.sm89+ and this device is cuda.sm86"),
+        ("served", "bf16"),
+        ("sites", 2),
+        ("wanted", "fp8"),
+    )
+    assert emitted() == [*selected, refused]
+
+    int8_linear._NATIVE[0] = int8_linear._Build(final="RuntimeError: no nvcc")
+    try:
+        assert emitted() == [
+            selected[0],
+            ("gemm.fallback", int8_linear.EAGER, ("component", "klein/transformer"),
+             ("reason", "RuntimeError: no nvcc"), ("served", int8_linear.EAGER), ("sites", 2),
+             ("wanted", int8_linear.OP)),
+            selected[1],
+            refused,
+        ]  # fmt: skip
+    finally:
+        del int8_linear._NATIVE[0]
