@@ -292,7 +292,7 @@ class Memory:
             (Rung.IDLE, self._collect),
             (Rung.IDLE, lambda short: weights.shrink(short, keep_holds=True)),
             (Rung.IDLE, lambda short: weights.page_out(None, short)),
-            (Rung.IDLE, self.ask),
+            (Rung.IDLE, lambda short: self.ask(self.free() + short)),  # all it wants free
             (Rung.FINER, self._finer),
             (Rung.FINER, lambda _: weights.spare(operands)),
             (Rung.CACHES, lambda _: [release() for release in RELEASERS]),
