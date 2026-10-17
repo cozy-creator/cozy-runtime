@@ -26,6 +26,7 @@ class Card:
     memory to put a result in."""
 
     grouped = False
+    unified = False
 
     def __init__(self, room: int) -> None:
         self.torch, self.device, self.room = torch, torch.device("cpu"), room
@@ -202,3 +203,14 @@ def test_joins_repeats_and_copies_band_along_other_dims(room: int) -> None:
 
     _, ran = banded(call, room)
     assert {"aten.cat", "aten.repeat_interleave", "aten.contiguous"} <= set(ran)
+
+
+@pytest.mark.parametrize("room", ROOMS)
+def test_a_padding_taller_than_a_band_fills_the_bands_wholly_inside_it(room: int) -> None:
+    """Run 10683, H3's second segment on an RTX 5090: a constant padding ran in one-row bands,
+    and a band wholly inside the padding was cut from no rows with a negative pad, which
+    torch refuses: "narrow(): length must be non-negative"."""
+    torch.manual_seed(5)
+    x = torch.randn(1, 3, 4, 7)
+    _, ran = banded(lambda: torch.nn.functional.pad(x, (1, 2, 6, 5), value=0.5) * 2, room)
+    assert "aten.pad" in ran or "aten.constant_pad_nd" in ran
