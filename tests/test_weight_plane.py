@@ -2411,7 +2411,7 @@ def test_a_banded_result_out_of_memory_inside_a_nested_recovery_lives_in_host_me
     with torch.inference_mode():
         reference = plain.decode(z).sample
     del plain
-    monkeypatch.setattr(weights, "activation_room", lambda: (1 << 40, 0))  # every result fits
+    monkeypatch.setattr(weights, "activation_room", lambda whole=False: (1 << 40, 0))  # all fit
     weights.modes.clear()
     weights.set_cap(room(weights, 96 << 20))
     model.residency.admit("run", ("vae",))
