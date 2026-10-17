@@ -11,7 +11,7 @@ import cozy_runtime.internal.invocable_interface as invocable_interface
 import cozy_runtime.internal.package_interface as package_interface
 from cozy_runtime import author
 from cozy_runtime.author._assets import Assets
-from cozy_runtime.author._describe import assert_declaration_shape, decode_bounds
+from cozy_runtime.author._describe import assert_declaration_shape
 from cozy_runtime.author._model_defaults import check_model_arguments
 from cozy_runtime.author._services import SERVICES, UNGRANTABLE
 from cozy_runtime.author._signature import (
@@ -147,7 +147,6 @@ def build(reader: Reader, registration: Registration) -> dict[str, Json]:
         reader.refuse(module, fn.returns, "an invocable result must be a msgspec.Struct")
     assert_declaration_shape(payload)
     assert_declaration_shape(result, result=True)
-    decode_bounds(registration.name, payload, assets)
     doc = package_interface.callable_doc(
         name=registration.name,
         payload_type=payload,

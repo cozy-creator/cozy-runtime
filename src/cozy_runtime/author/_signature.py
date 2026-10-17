@@ -89,6 +89,9 @@ class AssetsBinding:
     counts: tuple[tuple[str, int], ...] = ()
     max_length: int | None = None
     preparations: tuple[Preparation, ...] = ()
+    #: media kinds whose decoded bound is the published default, not the author's: their reads
+    #: take the machine's budget
+    undeclared: frozenset[str] = frozenset()
 
     def preparation(self, kind: str) -> Preparation | None:
         return next((p for p in self.preparations if p.kind == kind), None)
@@ -134,6 +137,7 @@ def assets_binding(name: str, annotation: object) -> AssetsBinding:
     inner, _ = strip(item)
     options = get_args(inner) if get_origin(inner) in (typing.Union, types.UnionType) else (item,)
     kinds: dict[str, tuple[type[Asset], AssetBound | None]] = {}
+    undeclared: set[str] = set()
     for option in options:
         cls, markers = strip(option)
         for marker in markers:
@@ -151,10 +155,11 @@ def assets_binding(name: str, annotation: object) -> AssetsBinding:
         if cls.kind in kinds:
             raise ConformanceError("Assets repeats a media kind", code="assets_element")
         bound = next((marker for marker in markers if isinstance(marker, AssetBound)), None)
-        if cls.kind in MEDIA_KINDS:
+        if cls.kind in MEDIA_KINDS and (bound is None or bound.max_decoded_bytes is None):
+            undeclared.add(cls.kind)
             if bound is None:
                 bound = AssetBound(max_decoded_bytes=DEFAULT_DECODE_LIMITS.max_decoded_bytes)
-            elif bound.max_decoded_bytes is None:
+            else:
                 bound = replace(bound, max_decoded_bytes=DEFAULT_DECODE_LIMITS.max_decoded_bytes)
         if bound is not None:
             bound.check_kind(cls.kind)
@@ -204,6 +209,7 @@ def assets_binding(name: str, annotation: object) -> AssetsBinding:
         tuple(sorted(counts.items())),
         max_length,
         tuple(preparations[key] for key in sorted(preparations)),
+        frozenset(undeclared),
     )
 
 

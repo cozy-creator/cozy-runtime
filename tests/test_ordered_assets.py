@@ -619,7 +619,7 @@ def test_count_metadata_comes_from_argument_and_conflicts_refuse(tmp_path: Path)
     assert "assets" not in inspect.signature(invocable).parameters
 
 
-def test_assets_kinds_take_the_ceiling_but_named_media_declares_its_bound() -> None:
+def test_assets_kinds_and_named_media_describe_with_no_declared_bound() -> None:
     class WithRaw(msgspec.Struct):
         photo: ImageAsset
 
@@ -631,11 +631,7 @@ def test_assets_kinds_take_the_ceiling_but_named_media_declares_its_bound() -> N
     surface = describe(local)[0]
     binding = surface.assets_binding
     assert binding is not None and "media_decode" in surface.capabilities
-    assert binding.kinds[0][1] == AssetBound(
-        max_decoded_bytes=DEFAULT_DECODE_LIMITS.max_decoded_bytes
-    )
     handler.__annotations__["payload"] = WithRaw
     named = App()
     named.entrypoint(handler)
-    with pytest.raises(ConformanceError, match="asset_decode_unbounded"):
-        describe(named)
+    assert "media_decode" in describe(named)[0].capabilities

@@ -2,8 +2,8 @@
 overlay's factors through the stand-in dispatch: the second read nests inside the first.
 
 Runs 10440, 10443 and 10454 (H3 long_form's second segment on an RTX 5090) were refused there,
-`weight_unbound: aten.mul.Tensor ... inside another weight read's mapping`, and served by
-cozy-runtime #1537's nesting (run 10466 on the same pod and request)."""
+`weight_unbound: aten.mul.Tensor ... inside another weight read's mapping`. Reads now nest, and
+only a read that re-enters its own mapping is refused (run 10466 on the same pod and request)."""
 
 from __future__ import annotations
 
