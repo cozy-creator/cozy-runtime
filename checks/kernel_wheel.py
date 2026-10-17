@@ -4,7 +4,8 @@
 module's cubins and PTX are exactly `cozy_kernels.ARCHS` (cuobjdump). Nothing is bundled beside
 it, and on Linux it needs only glibc (readelf): no torch, no CUDA library, no libpython. It
 imports on every Python given, and a call on a machine without a GPU returns CUDA's error
-rather than crashing. Any failure is named, and the run exits 1.
+rather than crashing. Its driver floor equals cozy-platform's (`--platform-floor`, the Rust
+source TensorD checks at startup). Any failure is named, and the run exits 1.
 """
 
 from __future__ import annotations
@@ -17,9 +18,14 @@ import sys
 import tempfile
 import zipfile
 from pathlib import Path
+from typing import Any
 
 #: What a Linux module may need: glibc's own libraries.
 GLIBC = re.compile(r"(libc|libm|libdl|libpthread|librt|ld-linux[\w.-]*)\.so(\.\d+)*")
+#: cozy-platform's `gpu::DRIVER_FLOOR`: Windows', then everything else's.
+RUST_FLOOR = re.compile(
+    r'DRIVER_FLOOR: &str = if cfg!\(windows\) \{ "([\d.]+)" \} else \{ "([\d.]+)" \}'
+)
 #: A module on a machine without a GPU: one gemv returns CUDA's error, a bad family is refused.
 CALL = """
 import sys
@@ -32,15 +38,15 @@ print(f"{sys.version.split()[0]}: gemv without a GPU -> {code} {_gemm.error_name
 """
 
 
-def declared(package: Path) -> dict[str, dict[str, tuple[str, ...]]]:
-    """`ARCHS`, read from the source without running it."""
-    tree = ast.parse((package / "__init__.py").read_text())
-    for node in tree.body:
-        if isinstance(node, ast.AnnAssign) and getattr(node.target, "id", "") == "ARCHS":
-            assert node.value is not None
-            value: dict[str, dict[str, tuple[str, ...]]] = ast.literal_eval(node.value)
-            return value
-    raise SystemExit("cozy_kernels declares no ARCHS")
+def declared(package: Path, name: str) -> Any:
+    """`cozy_kernels.<name>`, read from the source without running it."""
+    for node in ast.parse((package / "__init__.py").read_text()).body:
+        target = node.target if isinstance(node, ast.AnnAssign) else None
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target = node.targets[0]
+        if isinstance(target, ast.Name) and target.id == name and node.value is not None:
+            return ast.literal_eval(node.value)
+    raise SystemExit(f"cozy_kernels declares no {name}")
 
 
 def embedded(module: Path) -> tuple[set[str], set[str]]:
@@ -65,6 +71,7 @@ def main() -> int:
     parser.add_argument("wheel", type=Path)
     parser.add_argument("platform", help="the wheel's platform tag, e.g. manylinux_2_28_x86_64")
     parser.add_argument("--python", action="append", default=[], help="an interpreter to import on")
+    parser.add_argument("--platform-floor", type=Path, help="cozy-platform's src/gpu/mod.rs")
     options = parser.parse_args()
     wheel: Path = options.wheel
     failed: list[str] = []
@@ -78,7 +85,12 @@ def main() -> int:
         bundled = [p.name for p in site.iterdir() if p.name.endswith(".libs")]
         if bundled:
             failed.append(f"the wheel bundles libraries: {bundled}")
-        for name, want in declared(package).items():
+        if options.platform_floor is not None:
+            found = RUST_FLOOR.search(options.platform_floor.read_text())
+            rust = {"win32": found[1], "linux": found[2]} if found else {}
+            if declared(package, "DRIVER_FLOOR") != rust:
+                failed.append(f"DRIVER_FLOOR differs from cozy-platform's {rust or '(none)'}")
+        for name, want in declared(package, "ARCHS").items():
             modules = [p for p in package.glob(f"{name}.*") if p.suffix in (".so", ".pyd")]
             if len(modules) != 1:
                 failed.append(f"{name}: {len(modules)} module files")

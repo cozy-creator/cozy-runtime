@@ -36,7 +36,8 @@ jobs:
         include:
           # CUTLASS units peak at ~6 GB each: compile jobs sized by the runner's memory.
           - {arch: x86_64, cuda: x86_64, runner: linux-x64-16core, jobs: 10}
-          - {arch: aarch64, cuda: sbsa, runner: linux-arm64, jobs: 2}
+          # The arm64 larger runner has no docker; the standard one does.
+          - {arch: aarch64, cuda: sbsa, runner: ubuntu-24.04-arm, jobs: 1}
     runs-on: ${{ matrix.runner }}
     # Hang bound, not a work budget.
     timeout-minutes: 240
@@ -51,6 +52,9 @@ jobs:
           ref: ${{ inputs.ref || github.sha }}
       - name: Build and check the wheel
         run: |
+          # TensorD's driver floor (public cozy repo), which the wheel's must equal.
+          curl -fsSL https://raw.githubusercontent.com/cozy-creator/cozy/master/crates/cozy-platform/src/gpu/mod.rs \
+            -o platform-gpu.rs
           docker run --rm -v "$PWD:/src" -w /src -e PLAT -e CUDA_REPO -e HOST_OWNER="$(id -u):$(id -g)" \
             -e CMAKE_BUILD_PARALLEL_LEVEL=${{ matrix.jobs }} "$IMAGE" bash -euo pipefail -c '
               dnf install -y -q dnf-plugins-core && dnf config-manager --add-repo "$CUDA_REPO"
@@ -62,7 +66,8 @@ jobs:
               time $py -m uv build --wheel --python $py --out-dir /tmp/raw kernels
               auditwheel repair --plat "$PLAT" --only-plat -w dist /tmp/raw/*.whl
               $py checks/kernel_wheel.py dist/*.whl "$PLAT" --python $py \
-                --python /opt/python/cp313-cp313/bin/python --python /opt/python/cp314-cp314/bin/python
+                --python /opt/python/cp313-cp313/bin/python --python /opt/python/cp314-cp314/bin/python \
+                --platform-floor platform-gpu.rs
               chown -R "$HOST_OWNER" dist
             ' 2>&1 | tee build.log
           exit "${PIPESTATUS[0]}"
