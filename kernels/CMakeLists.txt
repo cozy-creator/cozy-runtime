@@ -84,7 +84,10 @@ target_compile_definitions(fa3_units PRIVATE CUTE_SM90_EXTENDED_MMA_SHAPES_ENABL
     FLASHATTENTION_DISABLE_LOCAL FLASHATTENTION_DISABLE_SOFTCAP FLASHATTENTION_DISABLE_PACKGQA
     FLASHATTENTION_DISABLE_FP8 FLASHATTENTION_DISABLE_VARLEN FLASHATTENTION_DISABLE_SM8x
     $<$<CXX_COMPILER_ID:MSVC>:_USE_MATH_DEFINES>)
-target_compile_options(fa3_units PRIVATE --use_fast_math
+# Upstream builds through torch's extension builder, which adds its own nvcc flags: the same here.
+target_compile_options(fa3_units PRIVATE --use_fast_math --expt-relaxed-constexpr
+                       -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__
+                       -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__
                        $<$<PLATFORM_ID:Linux>:-Xcompiler=-fno-gnu-unique>
                        $<$<CXX_COMPILER_ID:MSVC>:-Xcompiler=/Zc:__cplusplus>)
 
