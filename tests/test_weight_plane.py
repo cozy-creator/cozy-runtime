@@ -568,7 +568,7 @@ def test_a_kernel_launched_outside_torch_never_reads_an_unmapped_weight(
     them, and the kernel read a pointer with nothing mapped behind it. The scales stay in
     `common`; and were one its own region after all (the second case), the launch maps it
     first (`author.kernels.readable`) and never faults the device."""
-    pytest.importorskip("cozy_runtime._kernels._C")
+    pytest.importorskip("cozy_runtime._kernels._norm")
     own_region = small != paging.SMALL
     monkeypatch.setattr(paging, "SMALL", small)
     weights = Weights(torch, torch.device("cuda", 0), "cuda")

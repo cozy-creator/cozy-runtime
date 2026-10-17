@@ -44,6 +44,7 @@ def verify(dist: Path, sums: str, version: str, waived: frozenset[str] = frozens
         f"cozy_runtime-{version}-py3-none-any.whl",
         f"cozy_runtime-{version}-cp312-abi3-manylinux_2_28_x86_64.whl",
         f"cozy_runtime-{version}-cp312-abi3-manylinux_2_28_aarch64.whl",
+        f"cozy_runtime-{version}-cp312-abi3-win_amd64.whl",
     } - {f"cozy_runtime-{version}-{WAIVABLE[platform]}" for platform in waived}
     if files.keys() != required:
         raise ValueError(

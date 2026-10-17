@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// `cozy_kernels._gemm`: the 8-bit linears (`int8_op/int8.h`) for every card in one module. Each
+// `_kernels._gemm`: the 8-bit linears (`gemm/int8.h`) for every card in one module. Each
 // tensor-core family's GEMMs are compiled for that family's targets only (`CMakeLists.txt`) and
 // the caller names the device's family (`FAMILIES`). Arguments are raw device pointers, sizes
 // and a stream, so neither torch nor the Python version is a build input; the caller allocates
@@ -71,7 +71,7 @@ constexpr cozy_int8::Gemm* kInt8[] = {&cozy_int8::mma_sync::gemm, &cozy_int8::wg
 constexpr cozy_int8::Fp8Gemm* kFp8[] = {&cozy_int8::mma_sync::fp8_gemm,
                                         &cozy_int8::wgmma::fp8_gemm, &cozy_int8::tcgen05::fp8_gemm};
 #else
-// Without CUTLASS's TMA GEMMs (an MSVC build): int8 on mma.sync only (`cozy_kernels.GEMM`).
+// Without CUTLASS's TMA GEMMs (an MSVC build): int8 on mma.sync only (`_kernels.GEMM`).
 constexpr cozy_int8::Gemm* kInt8[] = {&cozy_int8::mma_sync::gemm, nullptr, nullptr};
 constexpr cozy_int8::Fp8Gemm* kFp8[] = {nullptr, nullptr, nullptr};
 #endif

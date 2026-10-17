@@ -21,6 +21,7 @@ def release_files(root: Path, version: str = "1.2.3") -> dict[str, str]:
         f"cozy_runtime-{version}-py3-none-any.whl",
         f"cozy_runtime-{version}-cp312-abi3-manylinux_2_28_x86_64.whl",
         f"cozy_runtime-{version}-cp312-abi3-manylinux_2_28_aarch64.whl",
+        f"cozy_runtime-{version}-cp312-abi3-win_amd64.whl",
         f"cozy_runtime-{version}.tar.gz",
     ]
     files = {}
@@ -76,6 +77,7 @@ def test_valid_hashes_of_another_version_cannot_publish_under_selected_tag(tmp_p
         "py3-none-any.whl",
         "cp312-abi3-manylinux_2_28_x86_64.whl",
         "cp312-abi3-manylinux_2_28_aarch64.whl",
+        "cp312-abi3-win_amd64.whl",
         "tar.gz",
     ],
 )

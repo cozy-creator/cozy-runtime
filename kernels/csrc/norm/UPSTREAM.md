@@ -12,7 +12,7 @@ These four files are retained byte-for-byte with their NVIDIA SPDX headers:
 - `dtype_dispatch.cuh` — SHA-256 `5a155c3bf2123604a0689ad792016b703c45d9676a389381b482ac1f1afb23bc`
 - `utils.cuh` — SHA-256 `a3482d9911029f017c64b39dae5198f76a4c9585b8ede5c734643bcc18d04a4d`
 
-`../norm.cpp` (the binding, module `cozy_kernels._norm`), the Python wrapper, build system,
+`../norm.cpp` (the binding, module `cozy_runtime._kernels._norm`), the Python wrapper, build system,
 architecture targets, and package boundary are Cozy modifications. The upstream `LICENSE` and
-`NOTICE` ride the cozy-kernels wheel. No HIP, Triton, quantization, attention, or unrelated native operation
+`NOTICE` ride the cozy-runtime wheels. No HIP, Triton, quantization, attention, or unrelated native operation
 from the upstream distribution is included.

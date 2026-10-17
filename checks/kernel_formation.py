@@ -4,12 +4,13 @@ serves, with the worker image's own toolchain and no GPU. The release gate
 (`.github/workflows/kernel-formation.yaml`).
 
 A kernel here is the exact job a machine or executor submits for a card of that capability,
-built by the compile manager into a scratch store: the int8/fp8 op and every attention artifact
-a candidate admits (`kernel_sources`), the Python kernel tree and Sol's card objects
+built by the compile manager into a scratch store: every attention artifact a candidate admits
+(`kernel_sources`), the Python kernel tree and Sol's card objects
 (`attention_sol`), and the Triton sets an executor builds at start (`triton_kernels`: nvfp4, the
 LM decode and the fused DiT layouts below). Upstream's `setup.py` asks torch which card it
 builds for; `formation/sitecustomize.py` answers with the job's card. Nothing else stands in for
-a device: the compilers produce the real binaries.
+a device: the compilers produce the real binaries. The prebuilt kernels (`kernels/`) form in
+`kernels.yaml`.
 
 `--ledger` records each formed key. A key digests every build input (sources, recipe,
 toolchain, target), so a recorded key is recalled, never compiled again. A failure names the
@@ -86,12 +87,9 @@ TRITON = (nvfp4_linear.KERNELS, lm.KERNELS, *LAYOUTS)
 
 
 def kernels(sm: int) -> Iterator[tuple[str, Callable[[], kernel_compile.Job]]]:
-    """What a card of capability `sm` builds, by name: its 8-bit op, the attention artifacts its
-    candidates admit, and the Triton sets."""
+    """What a card of capability `sm` builds, by name: the attention artifacts its candidates
+    admit, and the Triton sets."""
     row = arch.row(sm)
-    yield machine_kernels.INT8, functools.partial(
-        kernel_sources.job, machine_kernels.INT8, sm, family=row.family
-    )
     artifacts = {
         c.artifact
         for c in attention.BY_NAME.values()

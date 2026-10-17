@@ -2,7 +2,19 @@ version: "3"
 silent: true
 
 tasks:
-  # The Linux wheel of this machine's arch delivers the machine: worker images take tensord from it. An arch with no kernels wheel (aarch64) gets the pure wheel tagged for it.
+  # A native wheel is the pure one plus one platform's kernel modules: kernels.yaml's artifact
+  # `kernels-<target>`, an install prefix holding `cozy_runtime/_kernels`.
+  wheel:
+    desc: dist's native wheel for PLAT (manylinux_2_28_x86_64, manylinux_2_28_aarch64, win_amd64), the pure wheel plus the kernel modules under KERNELS
+    cmds:
+      - |
+        set -eu; work=$(mktemp -d); trap 'rm -rf "$work"' EXIT
+        uvx --from wheel==0.47.0 wheel unpack "$PWD"/dist/cozy_runtime-*-py3-none-any.whl --dest "$work"
+        cp "{{.KERNELS}}"/cozy_runtime/_kernels/_* "$work"/*/cozy_runtime/_kernels/
+        sed -i -e 's/^Root-Is-Purelib: true$/Root-Is-Purelib: false/' -e 's/^Tag: py3-none-any$/Tag: cp312-abi3-{{.PLAT}}/' "$work"/*/*.dist-info/WHEEL
+        SOURCE_DATE_EPOCH=946684800 uvx --from wheel==0.47.0 wheel pack "$work"/* --dest-dir dist
+  # The Linux wheel of this machine's arch delivers the machine: worker images take tensord from it. It is the
+  # arch's native wheel (`task wheel`), else the pure wheel tagged for the arch.
   machine:
     desc: Bundle tensord at its pin (tensord.pin, a commit or a release tag; MACHINE=checkout builds that source instead) into dist's Linux wheel for this arch
     cmds:

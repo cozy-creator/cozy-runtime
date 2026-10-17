@@ -1,6 +1,6 @@
 """The machine's kernels, compiled at machine start on the cards present while weights download:
 first the links between its GPUs (`parallel.links`), which a group reads, then each card row's
-attention cells (`boot`) and the 8-bit linear op (int8, fp8).
+attention cells (`boot`). The Runtime wheel's prebuilt kernels (the 8-bit op, FA3) need no build.
 
 The machine launches `python -m cozy_runtime.internal.machine_kernels` once per installed
 generation, under that generation's own seal: its interpreter and torch, every card of the
@@ -37,9 +37,6 @@ from cozy_runtime.internal import (
 )
 from cozy_runtime.internal.parallel import links
 
-#: The op library every 8-bit lane serves (`int8_linear`, `fp8_linear`), on sm80+ cards.
-INT8 = "cozy-int8"
-
 
 def cards(devices: str) -> dict[int, str]:
     """Each distinct card architecture among the sealed devices, and the first card of it."""
@@ -63,9 +60,9 @@ def boot(row: arch.Row) -> list[attention.Candidate]:
     return found
 
 
-def _job(artifact: str, sm: int, device: str, family: str = "") -> kernel_compile.Job | None:
+def _job(artifact: str, sm: int, device: str) -> kernel_compile.Job | None:
     try:
-        job = kernel_sources.job(artifact, sm, family=family)
+        job = kernel_sources.job(artifact, sm)
     except kernel_sources.Absent:
         return None
     # Upstream's setup.py builds for the cards it sees: this one.
@@ -73,42 +70,15 @@ def _job(artifact: str, sm: int, device: str, family: str = "") -> kernel_compil
 
 
 def jobs(present: Mapping[int, str]) -> list[kernel_compile.Job]:
-    """Each card architecture's attention (`boot`) and its 8-bit op for its row, once per key;
-    none where the prebuilt wheel carries the card's (`prebuilt.covers`)."""
+    """Each card architecture's attention (`boot`), once per key; none the wheel serves."""
     found: dict[str, kernel_compile.Job] = {}
     for sm, device in sorted(present.items()):
-        builds = [(c.artifact, "") for c in boot(arch.row(sm)) if c.artifact]
-        own = arch.row(sm).family and not prebuilt.covers(sm)
-        builds += [(INT8, arch.row(sm).family)] if own else []
-        for artifact, family in builds:
-            job = _job(artifact, sm, device, family)
-            if job is not None:
-                found.setdefault(job.key.digest, job)
+        for candidate in boot(arch.row(sm)):
+            if candidate.artifact and not prebuilt.serves(candidate.name, sm):
+                job = _job(candidate.artifact, sm, device)
+                if job is not None:
+                    found.setdefault(job.key.digest, job)
     return list(found.values())
-
-
-def inherit(store: kernel_cache.Store, present: Mapping[int, str]) -> list[str]:
-    """Each card no row names (§2.6): its 8-bit op built for each family it could hold in turn,
-    newest first; the first that builds is the card's (`arch.learn`), else mma.sync. A family
-    rejected on the way is a probe, not a failure: only the card's own is counted, with the
-    rest (`jobs`). One warning per card."""
-    warnings: list[str] = []
-    for sm, device in sorted(present.items()):
-        families = arch.families(sm)
-        if sm in arch.ROWS or not families:
-            continue
-        landed = families[-1]
-        for family in families[:-1]:
-            job = _job(INT8, sm, device, family)
-            state = kernel_compile.wait(store, job) if job is not None else None
-            if state is not None:
-                print(json.dumps({**state.document(), "probe": family}), flush=True)
-            if state is not None and state.state == "ready":
-                landed = family
-                break
-        arch.learn(sm, landed)
-        warnings.append(arch.inherited(sm, device))
-    return warnings
 
 
 def sol_objects(store: kernel_cache.Store, present: Mapping[int, str]) -> list[kernel_compile.Job]:
@@ -153,8 +123,6 @@ def main() -> int:
     if store is not None and present:
         kernel_cache.configure(store)
         kernel_compile.waiting = progress
-        for warning in inherit(store, present):
-            print(json.dumps({"warning": warning}), flush=True)
         built = jobs(present)
         for job in built:
             kernel_compile.submit(store, job)

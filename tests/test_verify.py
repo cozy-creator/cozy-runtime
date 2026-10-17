@@ -32,27 +32,27 @@ def test_a_verdict_is_kept_per_machine_and_a_driver_update_verifies_again(
         probes.append(accel.driver_version())
         return verify.within({"bf16 linear M=3": 2e-3, "fp16 tile 0": 4e-4}, 1e-2)
 
-    first = verify.verified("cozy-kernels-int8-mmasync", "sha256:abc", 86, probe)
+    first = verify.verified("prebuilt-int8-mmasync", "sha256:abc", 86, probe)
     assert first.ok and first.detail.startswith("rel L2 2.00e-03 at bf16 linear M=3"), first
     monkeypatch.setattr(verify, "_KNOWN", {})  # another process of this machine
-    assert verify.verified("cozy-kernels-int8-mmasync", "sha256:abc", 86, probe) == first
+    assert verify.verified("prebuilt-int8-mmasync", "sha256:abc", 86, probe) == first
     assert len(probes) == 1
     monkeypatch.setattr(accel, "driver_version", lambda: "999.1")
-    assert verify.verified("cozy-kernels-int8-mmasync", "sha256:abc", 86, probe) == first
-    assert verify.verified("cozy-kernels-int8-mmasync", "sha256:new", 86, probe).ok
+    assert verify.verified("prebuilt-int8-mmasync", "sha256:abc", 86, probe) == first
+    assert verify.verified("prebuilt-int8-mmasync", "sha256:new", 86, probe).ok
     assert probes[1:] == ["999.1", "999.1"]
 
 
 def test_a_probe_over_budget_or_raising_refuses_the_kernel_for_good() -> None:
     over = verify.verified(
-        "cozy-kernels-fp8-wgmma", "sha256:abc", 90, lambda: verify.within({"tile 3": 0.7}, 1e-2)
+        "prebuilt-fp8-wgmma", "sha256:abc", 90, lambda: verify.within({"tile 3": 0.7}, 1e-2)
     )
     assert not over.ok and "7.00e-01 at tile 3" in over.detail
 
     def raises() -> Verdict:
         raise RuntimeError("8-bit linear: the GEMM: cudaErrorInvalidKernelImage")
 
-    refused = verify.verified("cozy-kernels-int8-wgmma", "sha256:abc", 90, raises)
+    refused = verify.verified("prebuilt-int8-wgmma", "sha256:abc", 90, raises)
     assert refused == Verdict(
         False, "RuntimeError: 8-bit linear: the GEMM: cudaErrorInvalidKernelImage"
     )
@@ -68,7 +68,7 @@ def test_a_probe_that_ends_its_process_leaves_the_kernel_refused(store: Path) ->
         from pathlib import Path
         from cozy_runtime.internal import kernel_cache, verify
         kernel_cache.configure(kernel_cache.Store(Path(sys.argv[1])))
-        verify.verified("cozy-kernels-int8-mmasync", "sha256:abc", 120, lambda: os._exit(3))
+        verify.verified("prebuilt-int8-mmasync", "sha256:abc", 120, lambda: os._exit(3))
         """
     )
     ended = subprocess.run([sys.executable, "-c", code, str(store)], env=dict(os.environ))
@@ -77,5 +77,5 @@ def test_a_probe_that_ends_its_process_leaves_the_kernel_refused(store: Path) ->
     def never() -> Verdict:
         raise AssertionError("a refused kernel is probed again")
 
-    verdict = verify.verified("cozy-kernels-int8-mmasync", "sha256:abc", 120, never)
+    verdict = verify.verified("prebuilt-int8-mmasync", "sha256:abc", 120, never)
     assert verdict == Verdict(False, "its probe ended the process before a verdict")

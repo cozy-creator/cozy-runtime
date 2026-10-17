@@ -4,10 +4,6 @@ stated, since this box has no card to read them from."""
 
 from __future__ import annotations
 
-import json
-import subprocess
-import sys
-from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -20,12 +16,12 @@ from cozy_runtime.internal import (
     accel,
     arch,
     attention,
-    int8_linear,
     kernel_cache,
-    kernel_compile,
     kernel_sources,
     machine_kernels,
+    prebuilt,
     static_interface,
+    verify,
 )
 from cozy_runtime.internal.encoding import DeviceFacts
 from cozy_runtime.internal.executor import _attention_pin
@@ -74,138 +70,32 @@ def test_each_row_from_its_capability_and_a_set_is_their_intersection() -> None:
 # ------------------------------------------------------------------------------ GEMM
 
 
-_STUBS = {
-    "setuptools/__init__.py": (
-        "import json\ndef setup(**kw):\n    print(json.dumps(kw['ext_modules'][0]))\n"
-    ),
-    "torch/__init__.py": "",
-    "torch/utils/__init__.py": "",
-    "torch/utils/cpp_extension.py": (
-        "BuildExtension = object\n"
-        "def CUDAExtension(name, sources, **kw):\n"
-        "    return {'sources': sources, 'nvcc': kw['extra_compile_args']['nvcc']}\n"
-    ),
-}
-
-
-def _builder(tmp_path: Path, sm: int, row: list[str]) -> tuple[list[str], str, set[str]]:
-    """The real `int8_op/setup.py` for one card, setuptools and torch's extension stated."""
-    stubs = tmp_path / "stubs"
-    for relative, text in _STUBS.items():
-        (stubs / relative).parent.mkdir(parents=True, exist_ok=True)
-        (stubs / relative).write_text(text)
-    env = {"PYTHONPATH": str(stubs), "COZY_KERNEL_SM": str(sm), "COZY_KERNEL_ROW": " ".join(row)}
-    found = subprocess.run(
-        [sys.executable, "setup.py"],
-        cwd=kernel_sources.OWN["cozy-int8-src"],
-        env=env,
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    ext = json.loads(found.stdout.splitlines()[-1])
-    [gencode] = [flag for flag in ext["nvcc"] if flag.startswith("-gencode")]
-    defines = {f.removeprefix("-DCOZY_") for f in ext["nvcc"] if f.startswith("-DCOZY_")}
-    return ext["sources"], gencode.rsplit("=", 1)[-1], defines
-
-
-@pytest.fixture
-def toolchain(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A registry carrying the op's CUTLASS, and the torch/compiler it would build against."""
-    root = tmp_path / "sources"
-    root.mkdir()
-    cutlass = {"version": "0", "file": "cutlass.tar.gz", "sha256": "0" * 64}
-    (root / "index.json").write_text(json.dumps({"schema": 1, "sources": {"cutlass": cutlass}}))
-    kernel_sources.registry.cache_clear()
-    monkeypatch.setattr(kernel_sources, "job", partial(kernel_sources.job, root=root))
-    monkeypatch.setattr(kernel_sources, "torch_build", lambda: ("2.14.0", "13.0"))
-    monkeypatch.setattr(kernel_sources, "compiler", lambda: "toolkit")
-
-
-_MMA, _TMA, _FP8 = "gemm_sm80.cu", "gemm_tma.cu", "gemm_fp8.cu"
-#: card -> (its target, its GEMM sources): the TMA int8 GEMM and the CUTLASS fp8 one, or not
-GEMM = {
-    80: ("sm_80", [_MMA]),
-    86: ("sm_86", [_MMA]),
-    89: ("sm_89", [_MMA]),
-    90: ("sm_90a", [_TMA, _FP8]),
-    100: ("sm_100a", [_TMA, _FP8]),
-    103: ("sm_103a", [_MMA, _FP8]),
-    120: ("sm_120a", [_MMA, _FP8]),
-    121: ("sm_121a", [_MMA, _FP8]),
-    110: ("sm_110a", [_TMA, _FP8]),  # Thor inherits tcgen05
-}
-
-
-@pytest.mark.parametrize("sm", sorted(GEMM))
-def test_the_8bit_op_builds_by_row_whatever_the_lane(
-    sm: int, tmp_path: Path, toolchain: None
+@pytest.mark.skipif(bool(prebuilt.ABSENT), reason="this Runtime wheel carries no kernels")
+def test_an_unnamed_card_takes_the_newest_family_whose_prebuilt_kernels_verified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """One op library per card serves every lane (int8, fp8), built for the row's family:
-    12.1 and an unnamed 11.0 take their family's GEMMs."""
-    job = kernel_sources.job(machine_kernels.INT8, sm)
-    assert json.loads(job.key.inputs)["row"] == job.spec["row"]
-    built, gencode, defines = _builder(tmp_path, sm, job.spec["row"])
-    assert (gencode, built[2:]) == GEMM[sm]
-    expected = {arch.row(sm).family.replace(".", "_").upper()}
-    expected |= {"TMA"} if _TMA in built else set()
-    expected |= {"FP8_GEMM"} if _FP8 in built else set()
-    assert defines == expected
-
-
-@pytest.mark.parametrize(("builds", "code"), [({"mma.sync"}, 0), (set(), 1)])
-def test_an_unnamed_card_whose_target_takes_only_mma_sync_inherits_it(
-    builds: set[str],
-    code: int,
-    tmp_path: Path,
-    toolchain: None,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """A fake 13.0 whose compiler refuses tcgen05 and wgmma: the boot tries the newest family
-    first and lands on the first that builds. The rejected families are probes: the boot exits
-    0 with one warning; only the card's own family failing (here, every one) counts. The
-    executor's op, row, attention cells and run warning follow the same verdicts."""
-    tried: list[str] = []
-
-    def verdict(_store: kernel_cache.Store, job: kernel_compile.Job, *_: str) -> Any:
-        family = job.spec["row"][0]
-        tried.append(family)
-        state = "ready" if family in builds else "failed"
-        return kernel_compile.State(job.key.kernel, state, path=str(tmp_path / family))
-
-    monkeypatch.setattr(kernel_compile, "submit", verdict)
-    monkeypatch.setattr(kernel_compile, "wait", verdict)
-    monkeypatch.setattr(kernel_compile, "waiting", None)
-    monkeypatch.setattr(kernel_cache, "_MACHINE_STORE", [None])
-    monkeypatch.setattr(accel, "device_capability", lambda entry: 130)
-    monkeypatch.setenv(kernel_cache.OWN_ENV, str(tmp_path / "u0"))
-    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-x")
-    assert arch.row(130).family == "tcgen05"  # before any build: the newest candidate
-    assert machine_kernels.main() == code
-    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
-    assert list(dict.fromkeys(tried)) == ["tcgen05", "wgmma", "mma.sync"]
-    [warning] = [row["warning"] for row in lines if "warning" in row]
-    assert warning.startswith("sm_130 (GPU-x) has no row; served as mma.sync with fp8 int8")
-    assert [row["probe"] for row in lines if "probe" in row] == ["tcgen05", "wgmma"]
-    assert (lines[-1]["kernels"], lines[-1]["failed"]) == (1, code)
-
-    monkeypatch.setattr(arch, "_LEARNED", {})
-    monkeypatch.setattr(kernel_cache, "_MACHINE_STORE", [kernel_cache.Store(tmp_path / "u1")])
-    if builds:
-        assert int8_linear._compiled(int8_linear.OP, 130) == tmp_path / "mma.sync" / "site"
-    else:
-        with pytest.raises(kernel_sources.Absent):
-            int8_linear._compiled(int8_linear.OP, 130)
-        return
+    """A fake 13.0, with the verdicts an earlier process on this machine left (§2.6): the wheel's
+    tcgen05 and wgmma kernels failed their probe on it, mma.sync's passed. The card takes
+    mma.sync's 8-bit op and row, and is never probed again."""
+    torch = pytest.importorskip("torch")
+    monkeypatch.setattr(kernel_cache, "_MACHINE_STORE", [kernel_cache.Store(tmp_path / "u0")])
+    monkeypatch.setattr(verify, "_KNOWN", {})
+    digest = prebuilt.artifact()
+    for family in ("tcgen05", "wgmma", "mma.sync"):
+        for f in ("int8", "fp8"):
+            kernel = f"{prebuilt.KERNELS[f]}-{family.replace('.', '')}"
+            key = (kernel, digest, 130, accel.driver_version())
+            path = verify._path(key)
+            assert path is not None
+            path.parent.mkdir(parents=True, exist_ok=True)
+            verify._write(path, key, verify.Verdict(family == "mma.sync", "an earlier probe"))
+    ops, detail = prebuilt.library(torch, 0, 130)
+    assert ops is not None and ops.family == "mma.sync", detail
     row = arch.row(130)
     assert row.inherited and (row.family, row.formats()) == ("mma.sync", _88)
     assert attention.walk(row, 8) == ["kitchen-int8", "sageattention", "sdpa"]
+    assert arch.inherited(130, "GPU-x").startswith("sm_130 (GPU-x) has no row; served as mma.sync")
     assert arch.inherited(90, "H100") == ""
-    built, gencode, defines = _builder(
-        tmp_path, 130, kernel_sources.job("cozy-int8", 130).spec["row"]
-    )
-    assert built[2:] == ["gemm_sm80.cu"] and gencode == "sm_130" and defines == {"MMA_SYNC"}
 
 
 # ------------------------------------------------------------------------- attention cells
@@ -281,7 +171,7 @@ _PY = kernel_sources.PYTHON
 BOOT = {
     86: {"comfy-kitchen"},
     89: {_PY, "comfy-kitchen"},
-    90: {_PY, "sageattention", "flash-attn3"},
+    90: {_PY, "sageattention", "flash-attn3-full"},
     100: {_PY},
     103: {_PY},
     120: {_PY, "comfy-kitchen", "sageattn3"},

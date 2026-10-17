@@ -51,7 +51,7 @@ from packaging.tags import sys_tags
 from packaging.utils import parse_wheel_filename
 
 from cozy_runtime._cpus import cpus
-from cozy_runtime.internal import arch, config, egress, kernel_cache, kernel_compile
+from cozy_runtime.internal import config, egress, kernel_cache, kernel_compile
 
 ROOT = Path("/opt/cozy/kernel-sources")
 INDEX = "index.json"
@@ -60,7 +60,7 @@ PYTHON = "kernel-python"
 KITCHEN_WHEEL = "comfy-kitchen-wheel"
 #: Recipe fields outside a key: how many compiler processes a build runs, and other cards'
 #: text fixes.
-_UNKEYED = ("extensions", "unit_bytes", "replace_on", "build_deps", "by_row")
+_UNKEYED = ("extensions", "unit_bytes", "replace_on", "build_deps")
 #: What `setup.py` itself imports, from the registry when the environment lacks it; build-only.
 _BUILD_DEPS = ("setuptools", "wheel", "packaging")
 
@@ -329,8 +329,6 @@ class Recipe:
     #: recipes whose kernels this build also holds under the same module: imported first, it
     #: serves them too, so one process never needs both
     serves: tuple[str, ...] = ()
-    #: built for the card's row (`arch`): its family and formats are build inputs
-    by_row: bool = False
 
 
 #: The cards upstream SageAttention builds its SM89 and SM80 kernel families for.
@@ -340,10 +338,6 @@ _SAGE = {"CXX_APPEND_FLAGS": "-std=c++20", "NVCC_APPEND_FLAGS": "-std=c++20 --th
 #: FA3 inference forward only, one KV split and no packed GQA: exactly what
 #: `attention_upstream.fa3` calls (`num_splits=1`), a third of upstream's forward units.
 _FA3_OFF = ("BACKWARD", "SM80", "PAGEDKV", "APPENDKV", "SOFTCAP", "LOCAL", "SPLIT", "PACKGQA")
-#: FA3's head dimensions and dtypes the packages' attention sites run: H3's and Qwen Image's
-#: transformers at 128 in BF16, H3's video VAE at 64 in FP16 (`attention.KERNELS`). No package
-#: declares its sites' shapes, so this is the build's.
-_FA3_SHAPES = (("128", "bf16"), ("64", "fp16"))
 #: Upstream updates the submodule with git, and off CUDA 12.8 downloads NVIDIA's 12.6/12.8
 #: compilers over this machine's toolkit; build with the toolkit present. It hard-codes C++17
 #: and reads no append variable; only `flash_api.cpp`, a host unit, includes Torch.
@@ -357,14 +351,6 @@ _FA3_TOOLKIT = (
     ("hopper/setup.py", 'if bare_metal_version != Version("12.8"):', "if False:"),
 )
 _FA3_UNIT = "if not (packgqa and (paged or split))]"
-_HALF_64_DV = (
-    "return run_mha_fwd_<Arch, cutlass::half_t, 64, {}, Split, PagedKVNonTMA, Has_softcap, "
-    "PackGQA>(params, stream);"
-)
-_HALF_128 = "if (params.d <= 128) { return run_mha_fwd_<Arch, cutlass::half_t"
-_LOCAL_CHECK = (
-    'TORCH_CHECK(!params.is_local, "This flash attention build does not support local attention.");'
-)
 #: Torch 2.14's headers need C++20; every recipe below says so in upstream's own terms.
 RECIPES: dict[str, Recipe] = {
     recipe.name: recipe
@@ -406,62 +392,9 @@ RECIPES: dict[str, Recipe] = {
             # Upstream hard-codes C++17 for both compilers and reads no append variable.
             replace=(("sageattention3_blackwell/setup.py", '"-std=c++17"', '"-std=c++20"'),),
         ),
-        Recipe(
-            "flash-attn3",
-            "setup",
-            ("flash-attention", "flash-attention-cutlass"),
-            subdir="hopper",
-            place={"flash-attention-cutlass": "csrc/cutlass"},
-            env={
-                f"FLASH_ATTENTION_DISABLE_{part}": "TRUE"
-                for part in (*_FA3_OFF, "FP8", "HDIM96", "HDIM192", "HDIM256", "VARLEN")
-            },
-            # One unit per shape in `_FA3_SHAPES` (4.6-4.7 GB max RSS each, cicc), not
-            # upstream's units of every head dimension (14.2 GB, ~190 s apiece on H100 pods);
-            # dispatch to a shape not built is compiled out, and so are causal and variable
-            # length attention, which no package's site runs (bidirectional DiTs and VAEs).
-            unit_bytes=5 << 30,
-            replace=(
-                (
-                    "hopper/static_switch.h",
-                    "CAUSAL_CONST_NAME = true;" + " " * 42 + "\\\n        return __VA_ARGS__();",
-                    "CAUSAL_CONST_NAME = false;" + " " * 41 + "\\\n        return __VA_ARGS__();",
-                ),
-                (
-                    "hopper/flash_api.cpp",
-                    _LOCAL_CHECK,
-                    _LOCAL_CHECK
-                    + '\n    TORCH_CHECK(!params.is_causal, "This build is non-causal.");',
-                ),
-                (
-                    "hopper/setup.py",
-                    'HEAD_DIMENSIONS_FWD = ["all", "diff"]',
-                    f"HEAD_DIMENSIONS_FWD = {sorted({h for h, _ in _FA3_SHAPES})!r}",
-                ),
-                (
-                    "hopper/setup.py",
-                    _FA3_UNIT,
-                    _FA3_UNIT[:-1] + f" and (hdim, dtype) in {_FA3_SHAPES!r}]",
-                ),
-                (
-                    "hopper/flash_api.cpp",
-                    "if (params.is_bf16) {\n            #ifndef FLASHATTENTION_DISABLE_HDIM64",
-                    "if (params.is_bf16) {\n            #if 0",
-                ),
-                (
-                    "hopper/flash_api.cpp",
-                    f"#ifndef FLASHATTENTION_DISABLE_HDIM128\n            {_HALF_128}",
-                    f"#if 0\n            {_HALF_128}",
-                ),
-                *(
-                    ("hopper/flash_api.cpp", _HALF_64_DV.format(dv), "TORCH_CHECK(false);")
-                    for dv in (512, 256)
-                ),
-                *_FA3_TOOLKIT,
-            ),
-        ),
-        # Every forward head dimension and dtype, FP8 included, one unit per dimension: what
-        # the `flash-attn3-fp8` pin runs, built when a pin asks for it.
+        # FlashAttention-3 here, every forward head dimension and dtype, FP8 included, one unit
+        # per dimension: what the `flash-attn3-fp8` pin runs, and FA3 itself on a Hopper card
+        # whose prebuilt one (`prebuilt.fa3`) did not verify.
         Recipe(
             "flash-attn3-full",
             "setup",
@@ -488,17 +421,6 @@ RECIPES: dict[str, Recipe] = {
             ),
         ),
         Recipe("comfy-kitchen", "setup", ("comfy-kitchen",), build_deps=("nanobind",)),
-        # `torch.ops.cozy.int8_*` and `fp8_*` (`int8_linear`, `fp8_linear`): the Runtime's own
-        # sources and CUTLASS's headers. A CUTLASS 3.x unit peaks at 6.2 GB (cicc, sm90), the
-        # mma.sync one at 2.6.
-        Recipe(
-            "cozy-int8",
-            "setup",
-            ("cozy-int8-src", "cutlass"),
-            place={"cutlass": "cutlass"},
-            unit_bytes=7 << 30,
-            by_row=True,
-        ),
         Recipe(PYTHON, "python"),
     )
 }
@@ -586,12 +508,10 @@ def reviewed_kitchen_wheel_compatible() -> bool:
     return _compatible_kitchen_wheel(Source(pin.name, pin.version, _filename(pin), pin.sha256))
 
 
-def job(name: str, sm: int, root: Path | None = None, family: str = "") -> kernel_compile.Job:
-    """The exact artifact `name` is on a card of capability `sm` in this environment; a
-    by-row recipe's for the card's row as `family` (`arch.row`)."""
+def job(name: str, sm: int, root: Path | None = None) -> kernel_compile.Job:
+    """The exact artifact `name` is on a card of capability `sm` in this environment."""
     recipe = RECIPES[name]
     sources, why = registry(root) if root is not None else (_pinned_sources(), "")
-    sources = {**{own: _own(own) for own in OWN}, **sources}
     inputs: dict[str, Any]
     wheel = sources.get(KITCHEN_WHEEL) if name == "comfy-kitchen" else None
     if _compatible_kitchen_wheel(wheel):
@@ -636,9 +556,6 @@ def job(name: str, sm: int, root: Path | None = None, family: str = "") -> kerne
                 )
             ),
         }
-    row = arch.row(sm, family) if recipe.by_row else None
-    if row is not None:
-        inputs["row"] = [row.family, *sorted(row.formats())]
     if recipe.build_deps:
         inputs["build_deps"] = {n: sources[n].sha256 for n in recipe.build_deps}
     inputs["sources"] = {n: s.sha256 for n, s in sorted(wanted.items())}
@@ -647,7 +564,6 @@ def job(name: str, sm: int, root: Path | None = None, family: str = "") -> kerne
     spec = {
         "recipe": name,
         "sm": sm,
-        **({"row": inputs["row"]} if row is not None else {}),
         "sources": {n: asdict(s) for n, s in wanted.items()},
         "build_deps": {
             n: asdict(sources[n])
@@ -663,20 +579,6 @@ def _filename(pin: Pin) -> str:
     if name.endswith(".tar.gz") and not name.startswith(pin.name):
         name = f"{pin.name}-{name}"
     return name
-
-
-#: The Runtime's own kernel sources, shipped in its wheel: name -> package directory.
-OWN = {"cozy-int8-src": Path(__file__).parent / "int8_op"}
-
-
-@functools.cache
-def _own(name: str) -> Source:
-    """An in-tree source, keyed by the digest of its files: an edit is a new artifact."""
-    root = OWN[name]
-    digest = hashlib.sha256()
-    for path in sorted(p for p in root.rglob("*") if p.is_file() and "__pycache__" not in p.parts):
-        digest.update(path.relative_to(root).as_posix().encode() + b"\0" + path.read_bytes())
-    return Source(name, "0", str(root), digest.hexdigest())
 
 
 def _pinned_sources() -> dict[str, Source]:
@@ -861,9 +763,6 @@ def build_setup(
                 "PYTORCH_NVCC": str(nvcc),
                 "PYTHONPATH": os.pathsep.join([str(deps), *sys.path]),
                 "PYTHONNOUSERSITE": "1",
-                # The card it builds for, for a build that names its target itself, and its row.
-                "COZY_KERNEL_SM": str(spec.get("sm", 0)),
-                "COZY_KERNEL_ROW": " ".join(spec.get("row", ())),
                 **recipe.env,
             }
         )

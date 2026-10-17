@@ -34,14 +34,23 @@ def main() -> None:
     versions = {str(parse_wheel_filename(w.name)[1]) for w in wheels}
     assert len(versions) == 1, "the wheel set must contain one version"
     (version,) = versions
-    # Each Linux arch's release job builds its own platform wheel beside the pure one.
+    # Each Linux arch's release job builds its own platform wheel beside the pure one; x86_64's
+    # release job also builds the Windows one (publish.yaml holds the exact release set). Every
+    # native wheel carries its platform's kernels.
     arch = platform.machine()
     platform_tag = f"cp312-abi3-manylinux_2_28_{arch}"
+    windows_tag = "cp312-abi3-win_amd64"
     expected = {"py3-none-any": None, platform_tag: {"x86_64": 62, "aarch64": 183}.get(arch)}
     assert platform.system() == "Linux" and expected[platform_tag], f"no Linux wheel for {arch}"
+    if arch == "x86_64" and any(w.name.endswith(f"-{windows_tag}.whl") for w in wheels):
+        expected[windows_tag] = None
     assert {w.name for w in wheels} == {f"cozy_runtime-{version}-{tag}.whl" for tag in expected}, (
         "missing or unexpected platform wheels"
     )
+    kernels = {
+        platform_tag: ("_gemm.abi3.so", "_norm.abi3.so", *(("_fa3.abi3.so",) * (arch == "x86_64"))),
+        windows_tag: ("_gemm.pyd", "_norm.pyd"),
+    }
     installed_command = f"cozy_runtime-{version}.data/scripts/tensord"
     tags_by_name = {}
     binaries = {}
@@ -59,9 +68,16 @@ def main() -> None:
             )
             assert metadata.get_all("Tag") == [str(tag)]
             architecture = expected[str(tag)]
+            modules = {
+                n.removeprefix("cozy_runtime/_kernels/")
+                for n in archive.namelist()
+                if n.startswith("cozy_runtime/_kernels/") and n.endswith((".so", ".pyd"))
+            }
+            assert modules == set(kernels.get(str(tag), ())), f"{wheel.name} kernels: {modules}"
             if architecture is None:
                 assert installed_command not in archive.namelist()
-                assert metadata["Root-Is-Purelib"] == "true"
+                pure = str(tag) == "py3-none-any"
+                assert metadata["Root-Is-Purelib"] == ("true" if pure else "false")
                 continue
             assert metadata["Root-Is-Purelib"] == "false"
             entry = archive.getinfo(installed_command)
@@ -85,6 +101,8 @@ def main() -> None:
             ["musllinux_1_2_x86_64"],
         ):
             want = platform_tag if f"manylinux_2_28_{arch}" in platforms else "py3-none-any"
+            if platforms == ["win_amd64"] and windows_tag in expected:
+                want = windows_tag
             supported = list(cpython_tags((3, minor), platforms=platforms))
             supported += list(compatible_tags((3, minor), platforms=platforms))
             ranks = {tag: index for index, tag in enumerate(supported)}
