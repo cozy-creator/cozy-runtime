@@ -2339,11 +2339,11 @@ def test_attention_and_an_int8_linear_short_of_memory_run_in_pieces_on_the_card(
         attended, product = upstream.sdpa(q, k, v, **options), leaf(x)
     with short(weights, 32 << 20):
         pieces = attention_ulysses._call("_cozy_sdpa", upstream.SDPA, q, k, v, options)
-    assert "host memory" in weights.modes["bands"], weights.modes
+    assert "attention" in weights.modes["bands"] and "host memory" in weights.modes["bands"]
     assert torch.equal(pieces, attended)
     with short(weights, 32 << 20):
         rows = leaf(x)
-    assert "bands" in weights.modes, weights.modes
+    assert "encoded linear" in weights.modes["bands"], weights.modes
     assert torch.equal(rows, product)
 
 
@@ -2386,7 +2386,7 @@ def test_a_transformer_short_of_memory_cuts_its_linears_norms_and_attention() ->
         reference = call()
     with short(weights, 64 << 20):
         out = call()
-    assert "bands" in weights.modes, weights.modes
+    assert "aten.linear" in weights.modes.get("bands", ""), weights.modes
     error = ((out.float() - reference.float()).norm() / reference.float().norm()).item()
     assert error < 1e-2, (error, weights.modes)
 

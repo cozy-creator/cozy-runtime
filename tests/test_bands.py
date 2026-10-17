@@ -364,7 +364,7 @@ def test_attention_out_of_memory_runs_in_head_groups_then_query_rows(
     mask = torch.rand(2, 1, 300, keys) > 0.3 if masking == "mask" else None
     causal = masking == "causal"
     options = Options(attn_mask=mask, dropout_p=0.0, is_causal=causal, scale=None, enable_gqa=True)
-    card = Bands(Card(1 << 30))  # noqa: F841 (the dispatch finds a device's bands while they live)
+    card = Bands(Card(1 << 30))  # the dispatch finds a device's bands while they live
     with torch.inference_mode():
         whole = upstream.sdpa(q, k, v, **options)
         with Tight(heads, rows) as tight:
@@ -374,6 +374,7 @@ def test_attention_out_of_memory_runs_in_head_groups_then_query_rows(
     else:  # a shorter query may take another CPU GEMM tiling (a GPU kernel's 128-row tiles not)
         torch.testing.assert_close(out, whole, rtol=1e-6, atol=1e-6)
     assert max(h for h, _ in tight.ran) <= heads and max(r for _, r in tight.ran) <= rows
+    assert card.weights.modes["bands"].startswith("1 ops (1 attention)")
 
 
 class Rows(TorchDispatchMode):  # type: ignore[misc]
@@ -411,10 +412,10 @@ def test_an_encoded_linear_out_of_memory_runs_in_rows(operand: str) -> None:
         rows = (rotated.abs().amax(-1, keepdim=True) / 127).clamp_(min=1e-12)
         q = torch.round(rotated / rows).clamp_(-127, 127).to(torch.int8)
         given = PreQuantized(q, rows, tuple(x.shape), INT8_CONVROT)
-    card = Bands(Card(1 << 30))  # noqa: F841 (the leaf finds a device's bands while they live)
+    card = Bands(Card(1 << 30))  # the leaf finds a device's bands while they live
     with torch.inference_mode():
         whole = leaf(given)
         with Rows(16) as tight:
             out = leaf(given)
     assert torch.equal(out, whole) and out.shape == (2, 37, 48)
-    assert max(tight.ran) <= 16
+    assert max(tight.ran) <= 16 and "1 encoded linear" in card.weights.modes["bands"]

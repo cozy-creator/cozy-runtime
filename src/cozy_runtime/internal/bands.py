@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import sys
 import weakref
+from collections import Counter
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
@@ -109,9 +110,10 @@ class Bands:
         self.streams: tuple[Any, ...] = ()
         if weights.device.type == "cuda":
             self.streams = (torch.cuda.Stream(weights.device), torch.cuda.Stream(weights.device))
-        #: this call's banded ops and the bytes of their results put in host memory; ops
-        #: rewritten since the process began (`Effects.banded`)
-        self.ops = self.hosted = self.rewrites = 0
+        #: this call's banded ops by name and the bytes of their results put in host memory;
+        #: ops rewritten since the process began (`Effects.banded`)
+        self.ops: Counter[str] = Counter()
+        self.hosted = self.rewrites = 0
         self.pads = {aten.pad, aten.constant_pad_nd}
         self.convs = {aten.conv1d, aten.conv2d, aten.conv3d, aten.convolution}
         ups = (
@@ -195,7 +197,7 @@ class Bands:
                     return NotImplemented
             self.rewrites += 1
             if short or hosted:
-                out = self._banded(plan, (*args, *kwargs.values()))
+                out = self._banded(plan, (*args, *kwargs.values()), str(func.overloadpacket))
             else:  # a convolution skipping taps, with room for it whole
                 out = plan.band(0, int(plan.out.shape[plan.axis]))
             if padding:
@@ -214,11 +216,11 @@ class Bands:
 
     # -- placing and running bands
 
-    def _banded(self, plan: Plan, operands: Any) -> Any:
+    def _banded(self, plan: Plan, operands: Any, name: str) -> Any:
         """The op in bands, its result placed by `_room`."""
         torch, weights, axis = self.torch, self.weights, plan.axis
         height = int(plan.out.shape[axis])
-        out, rows = self._room(plan.out, height, plan.per_row, plan.align, operands)
+        out, rows = self._room(name, plan.out, height, plan.per_row, plan.align, operands)
         while plan.gather is not None:  # statistics first, at a height memory allows
             try:
                 plan.gather(rows)
@@ -251,11 +253,18 @@ class Bands:
         return out
 
     def _room(
-        self, meta: Tensor, height: int, per_row: int, align: int, operands: tuple[object, ...]
+        self,
+        name: str,
+        meta: Tensor,
+        height: int,
+        per_row: int,
+        align: int,
+        operands: tuple[object, ...],
     ) -> tuple[Tensor, int]:
-        """A result like `meta` on the device when it fits there (idle weights unmap and the
-        tensors used least recently move to host memory first: `spill`), else in host memory;
-        and the rows of `height` a piece may take beside it, on multiples of `align`."""
+        """The result of op `name`, like `meta`, on the device when it fits there (idle weights
+        unmap and the tensors used least recently move to host memory first: `spill`), else in
+        host memory; and the rows of `height` a piece may take beside it, on multiples of
+        `align`."""
         torch, weights = self.torch, self.weights
         nbytes = _span(meta) * meta.element_size()
         free, movable = weights.activation_room()
@@ -278,13 +287,14 @@ class Bands:
                 if not is_device_oom(exc) or not self._hostable(nbytes):
                     raise
         if "bands" not in weights.modes:
-            self.ops = self.hosted = 0
-        self.ops += 1
+            self.ops, self.hosted = Counter(), 0
+        self.ops[name] += 1
         if out is None:
             out = spill.empty(torch, weights.device, meta)
             self.hosted += nbytes
         hosted = f", {self.hosted} B of results in host memory" if self.hosted else ""
-        weights.modes["bands"] = f"{self.ops} ops{hosted}"
+        names = ", ".join(f"{n} {op}" for op, n in self.ops.most_common())
+        weights.modes["bands"] = f"{self.ops.total()} ops ({names}){hosted}"
         return out, rows
 
     def attend(
@@ -309,7 +319,8 @@ class Bands:
             return None
         meta = self.torch.empty(q.shape, dtype=q.dtype, device="meta")
         with self.torch.utils._python_dispatch._disable_current_modes():
-            out, n = self._room(meta, count, 2 * (_bytes(q) + _bytes(k)) // count, unit, (q, k, v))
+            per_head = 2 * (_bytes(q) + _bytes(k)) // count
+            out, n = self._room("attention", meta, count, per_head, unit, (q, k, v))
         self.rewrites += 1
 
         def piece(h: int, n: int, s: int, m: int) -> None:
@@ -351,7 +362,7 @@ class Bands:
         height = int(meta.shape[0])
         per_row = (_bytes(meta) + sum(map(_bytes, sources))) // max(height, 1)
         with self.torch.utils._python_dispatch._disable_current_modes():
-            out, n = self._room(meta, height, per_row, 1, sources)
+            out, n = self._room("encoded linear", meta, height, per_row, 1, sources)
         self.rewrites += 1
 
         def piece(a: int, m: int) -> None:
