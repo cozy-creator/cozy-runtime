@@ -17,14 +17,14 @@ import inspect
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
-from cozy_runtime.author._assets import MEDIA_KINDS, asset_kinds, field_preparation
+from cozy_runtime.author._assets import asset_kinds, field_preparation
 from cozy_runtime.author._decode import require_decoder_dependency
 from cozy_runtime.author._demand import FeatureSpec, feature_specs
 from cozy_runtime.author._errors import CapabilityError, ConformanceError
 from cozy_runtime.author._markers import AssetBound
 from cozy_runtime.author._model import EXCLUDED_KEYWORDS, Model
 from cozy_runtime.author._services import UNGRANTABLE
-from cozy_runtime.author._signature import AssetsBinding, ModelBinding, Surface, media_kinds
+from cozy_runtime.author._signature import ModelBinding, Surface, media_kinds
 from cozy_runtime.author._walker import walk
 from cozy_runtime.author._weights import MAX_WEIGHTS_OUTPUTS
 
@@ -170,17 +170,10 @@ def check(surface: Surface) -> Surface:
 
 
 def _media_decode_bounds(surface: Surface) -> None:
-    """A media handle is readable, so every one a request names is expansion-bounded.
-
-    Compressed bytes are already deployment- and field-bounded. Decode has a different
-    amplification factor, so a media field without a decoded bound would make the most
-    dangerous input the one field a package forgot to annotate. Refuse that package at
-    describe instead of offering a request-time unbounded read. An Assets kind without a
-    declared bound takes Runtime's ceiling.
-    """
+    """A video or audio input needs PyAV in the release's closure. A media input needs no
+    declared decoded bound: Runtime decodes what the call reads, within what the machine holds."""
     if "media_decode" not in surface.capabilities:
         return
-    decode_bounds(surface.name, surface.payload_type, surface.assets_binding)
     if not media_kinds(surface.payload_type, surface.assets_binding) & {"video", "audio"}:
         return
     try:
@@ -191,31 +184,6 @@ def _media_decode_bounds(surface: Surface) -> None:
             "PyAV; install cozy-runtime[media] in the package closure",
             code="media_decoder_dependency",
         ) from exc
-
-
-def decode_bounds(name: str, payload_type: object, assets: AssetsBinding | None) -> None:
-    """Every image/video/audio input a request names declares its decoded-byte bound. Any
-    size describes: retained media is budgeted by the machine's memory at run time. One
-    check for describe and both static readers."""
-    fields = [
-        (node.path, asset_kinds(node.annotation), node.marker(AssetBound))
-        for node in walk(payload_type)
-    ]
-    if assets is not None:
-        fields.extend(
-            (assets.parameter, frozenset({cls.kind}), bound) for cls, bound in assets.kinds
-        )
-    for path, kinds, bound in fields:
-        if not kinds & MEDIA_KINDS:
-            continue
-        if not isinstance(bound, AssetBound) or bound.max_decoded_bytes is None:
-            raise ConformanceError(
-                f"{name}.{path} is a readable media input but declares no "
-                "AssetBound(max_decoded_bytes=...): compressed and decoded size are separate "
-                "limits, and a read has no unbounded overload",
-                code="asset_decode_unbounded",
-                fields=[path],
-            )
 
 
 def _check_model(binding: ModelBinding) -> None:
