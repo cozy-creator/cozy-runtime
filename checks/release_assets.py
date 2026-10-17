@@ -32,6 +32,7 @@ def verify(dist: Path, sums: str, version: str) -> str:
         f"cozy_runtime-{version}.tar.gz",
         f"cozy_runtime-{version}-py3-none-any.whl",
         f"cozy_runtime-{version}-cp312-abi3-manylinux_2_28_x86_64.whl",
+        f"cozy_runtime-{version}-cp312-abi3-manylinux_2_28_aarch64.whl",
     }
     if files.keys() != required:
         raise ValueError(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import platform
 import subprocess
 import sys
 from pathlib import Path
@@ -42,9 +43,9 @@ def _compile(root: Path, python: Path, *, stable: bool = False) -> Path:
     )
     include, extension, cache_tag = json.loads(result.stdout)
     abi = cache_tag.replace("cpython-", "cp")
-    tag = f"{abi}-{abi}-linux_x86_64"
+    tag = f"{abi}-{abi}-linux_{platform.machine()}"
     if stable:
-        extension, tag = ".abi3.so", "cp312-abi3-linux_x86_64"
+        extension, tag = ".abi3.so", f"cp312-abi3-linux_{platform.machine()}"
     source = root / "native.c"
     source.write_text(_SOURCE)
     output = root / ("_native_project" + extension)
@@ -165,7 +166,9 @@ def test_compiled_project_on_available_supported_interpreters(
     "tag",
     [
         "cp399-cp399-linux_x86_64",
-        "cp312-cp312-manylinux_2_17_aarch64",
+        # The other Linux arch: a wheel this machine cannot load.
+        "cp312-cp312-manylinux_2_17_"
+        + ("x86_64" if platform.machine() == "aarch64" else "aarch64"),
         "cp312-cp312-win_amd64",
     ],
 )

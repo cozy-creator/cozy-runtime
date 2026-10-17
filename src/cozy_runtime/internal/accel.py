@@ -38,6 +38,7 @@ BACKENDS = ("cuda", "mps")
 #: NVML's own answers, by name. `nvmlReturn_t` is an enum; these are the two this module
 #: branches on.
 _NVML_SUCCESS = 0
+_NVML_ERROR_NOT_SUPPORTED = 3
 _NVML_ERROR_INSUFFICIENT_SIZE = 7
 
 
@@ -292,9 +293,24 @@ def _nvml_device_memory(device: str) -> DeviceMemory | None:
     if handle is None:
         return DeviceMemory("unreadable")
     memory = _NvmlMemory()
-    if library.nvmlDeviceGetMemoryInfo(handle, ctypes.byref(memory)) != _NVML_SUCCESS:
+    answer = library.nvmlDeviceGetMemoryInfo(handle, ctypes.byref(memory))
+    if answer == _NVML_ERROR_NOT_SUPPORTED:
+        return _host_pool()
+    if answer != _NVML_SUCCESS:
         return DeviceMemory("unreadable")
     return _device_memory_of(int(memory.free), int(memory.total))
+
+
+def _host_pool() -> DeviceMemory:
+    """An integrated GPU's memory (GB10, Jetson): it has no framebuffer and allocates from the
+    host's RAM, so the driver answers Not Supported / `[N/A]` and its free and total are the
+    host's MemAvailable and MemTotal."""
+    try:
+        rows = dict(row.split(":", 1) for row in Path("/proc/meminfo").read_text().splitlines())
+        free, total = (int(rows[key].split()[0]) * 1024 for key in ("MemAvailable", "MemTotal"))
+    except (OSError, KeyError, ValueError, IndexError):
+        return DeviceMemory("unreadable")
+    return _device_memory_of(free, total)
 
 
 def device_capability(device: str) -> int:
@@ -369,6 +385,8 @@ def device_memory(device: str, kind: str) -> DeviceMemory:
     try:
         out = _smi(f"--id={device}", "--query-gpu=memory.free,memory.total")
         line = out.stdout.strip().splitlines()[0]
+        if line.replace(" ", "") == "[N/A],[N/A]":
+            return _host_pool()
         free, total = (int(part.strip()) * 1024 * 1024 for part in line.split(","))
     except (OSError, subprocess.SubprocessError, ValueError, IndexError):
         return DeviceMemory("unreadable")

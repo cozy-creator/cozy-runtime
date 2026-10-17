@@ -98,7 +98,13 @@ def measure(expected_backend: str = "") -> HostFacts:
             if len({row[0] for row in rows}) != 1:
                 raise ValueError(f"mixed accelerators: {sorted({row[0] for row in rows})}")
             name, total, drv, cap = rows[0]
-            gpu_name, vram, driver = name, int(float(total)) * 1024 * 1024, drv
+            # An integrated GPU (GB10) has no framebuffer: its memory is the host's.
+            vram = (
+                os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+                if total == "[N/A]"
+                else int(float(total)) * 1024 * 1024
+            )
+            gpu_name, driver = name, drv
             gpu_sm = int(float(cap) * 10)
             gpu_count = len(rows)
             backend = "cuda"

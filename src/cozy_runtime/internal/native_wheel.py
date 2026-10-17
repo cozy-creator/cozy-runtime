@@ -15,6 +15,7 @@ from __future__ import annotations
 import contextlib
 import csv
 import os
+import platform
 import re
 import shutil
 import signal
@@ -148,10 +149,13 @@ class _ELF:
                 "package_environment_native_elf_unsupported",
                 f"{path}: requires ELF64 little-endian",
             )
-        if machine != 62 or (require_shared and elf_type != 3) or elf_type not in {2, 3}:
+        want = base_observation.ELF_MACHINE.get(
+            base_observation.OS_ARCH.get(platform.machine().lower(), "")
+        )
+        if machine != want or (require_shared and elf_type != 3) or elf_type not in {2, 3}:
             raise NativeWheelRefusal(
                 "package_environment_native_elf_unsupported",
-                f"{path}: e_type={elf_type} e_machine={machine}, want x86_64 shared object",
+                f"{path}: e_type={elf_type} e_machine={machine}, want {want} shared object",
             )
         section_offset, section_entry_size = header[6], header[11]
         section_count, names_index = header[12], header[13]
@@ -587,7 +591,7 @@ def verify_seat(
             f"required=cpython:{base.python_abi}",
         )
     machine = observation.get("machine")
-    measured_arch = "linux/amd64" if machine in {"amd64", "x86_64"} else ""
+    measured_arch = base_observation.OS_ARCH.get(str(machine), "")
     if observation.get("system") != "linux" or measured_arch != base.os_arch:
         raise NativeWheelRefusal(
             "package_environment_native_os_cpu_mismatch",

@@ -12,7 +12,7 @@ on:
         type: string
         default: master
       build:
-        description: "wheels: sdist, pure wheel and the Linux wheel with kernels and tensord; pure: sdist and pure wheel; none: tests only"
+        description: "wheels: sdist, pure wheel and the runner arch's Linux wheel with tensord (and kernels on x86_64); pure: sdist and pure wheel; none: tests only"
         type: string
         default: wheels
       test:
@@ -106,11 +106,18 @@ jobs:
           # One cache per TensorD commit (and TensorFS override): no build output crosses refs.
           key: tensord-${{ steps.tensord.outputs.sha }}${{ steps.tensorfs.outputs.suffix }}
           cache-on-failure: true
-      - run: uv sync --locked
-        working-directory: source
+      # An arm runner builds the locked TensorFS from its tag until TensorFS publishes aarch64 wheels.
+      - working-directory: source
+        run: |
+          if [ "$RUNNER_ARCH" != ARM64 ]; then uv sync --locked; exit 0; fi
+          uv sync --locked --no-install-package tensorfs
+          version=$(grep -A1 '^name = "tensorfs"$' uv.lock | sed -n 's/^version = "\(.*\)"$/\1/p')
+          uv pip install "tensorfs @ git+https://github.com/cozy-creator/tensorfs@v$version"
+          echo UV_NO_SYNC=1 >> "$GITHUB_ENV"
       # From here to the machine check: publish.yaml's build job, step for step.
+      # The kernels wheel is x86_64; on an arm runner the Linux wheel is the pure one plus tensord.
       - name: Fetch the pinned public native donor
-        if: env.WHEELS == 'true'
+        if: env.WHEELS == 'true' && runner.arch == 'X64'
         run: |
           uv run --no-project --python 3.12 python - <<'PY'
           import hashlib, json, os, pathlib, urllib.parse, urllib.request
@@ -134,7 +141,7 @@ jobs:
           PY
       # Runs on the still-clean checkout: reuse refuses a dirty tree, and stamping dirties it.
       - name: Reuse unchanged native inputs or build the kernels wheel
-        if: env.WHEELS == 'true'
+        if: env.WHEELS == 'true' && runner.arch == 'X64'
         working-directory: source
         run: |
           set +e
@@ -178,7 +185,7 @@ jobs:
       - if: inputs.build != 'none'
         uses: actions/upload-artifact@v4
         with:
-          name: cozy-runtime-${{ steps.pin.outputs.sha }}${{ steps.tensord.outputs.suffix }}${{ steps.tensorfs.outputs.suffix }}
+          name: cozy-runtime-${{ steps.pin.outputs.sha }}${{ steps.tensord.outputs.suffix }}${{ steps.tensorfs.outputs.suffix }}${{ runner.arch == 'ARM64' && '-aarch64' || '' }}
           path: source/dist/
           if-no-files-found: error
           retention-days: 7

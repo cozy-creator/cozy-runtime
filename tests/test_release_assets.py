@@ -20,6 +20,7 @@ def release_files(root: Path, version: str = "1.2.3") -> dict[str, str]:
     names = [
         f"cozy_runtime-{version}-py3-none-any.whl",
         f"cozy_runtime-{version}-cp312-abi3-manylinux_2_28_x86_64.whl",
+        f"cozy_runtime-{version}-cp312-abi3-manylinux_2_28_aarch64.whl",
         f"cozy_runtime-{version}.tar.gz",
     ]
     files = {}
@@ -70,7 +71,13 @@ def test_valid_hashes_of_another_version_cannot_publish_under_selected_tag(tmp_p
 
 
 @pytest.mark.parametrize(
-    "omit", ["py3-none-any.whl", "cp312-abi3-manylinux_2_28_x86_64.whl", "tar.gz"]
+    "omit",
+    [
+        "py3-none-any.whl",
+        "cp312-abi3-manylinux_2_28_x86_64.whl",
+        "cp312-abi3-manylinux_2_28_aarch64.whl",
+        "tar.gz",
+    ],
 )
 def test_hash_approval_cannot_omit_a_required_distribution(tmp_path: Path, omit: str) -> None:
     files = release_files(tmp_path)
