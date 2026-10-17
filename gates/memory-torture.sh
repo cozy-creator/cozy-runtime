@@ -140,7 +140,7 @@ card() {
   [ "$card" = 2x8 ] && gpus=2
   M=""
   for sku in ${SKUS[$card]}; do
-    cozy machine rent "$sku" ${gpus:+--gpus "$gpus"} --disk-gb 250 --tensorhub "$H" --json > "rent-$card.json" 2> "rent-$card.err"
+    cozy machine rent "$sku" ${gpus:+--gpus "$gpus"} --disk-gb 160 --tensorhub "$H" --json > "rent-$card.json" 2> "rent-$card.err"
     M=$(python3 -I - "rent-$card.json" <<'PY'
 import json, sys
 text = open(sys.argv[1]).read()
@@ -157,6 +157,8 @@ PY
   if [ "$W" != - ] && ! cozy machine update "$M" --runtime-wheel "$W" --tensorhub "$H" > "update-$card.log" 2>&1; then
     say "card $card: the wheel did not install: $(tail -c 300 "update-$card.log")"; FAILED=$((FAILED + 1)); release; return
   fi
+  cozy machine show "$M" --tensorhub "$H" > "machine-$card.txt" 2>&1
+  say "card $card: $(grep -iE 'runtime|tensord' "machine-$card.txt" | tr -s ' ' | tr '\n' ' ' | cut -c1-200)"
   case $card in
     2x8) local r=$RANDOM; references 2x8 "$r"; h3 2x8 2 "$(image 2x8-klein-a)" "$(image 2x8-klein-b)" "$r" 2 ;;
     32) cells 32 3 ;;
