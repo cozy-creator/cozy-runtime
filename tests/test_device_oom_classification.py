@@ -57,6 +57,15 @@ def test_torch_device_oom_is_still_recognized() -> None:
     )
 
 
+def test_a_plane_driver_call_out_of_device_memory_is_a_device_oom() -> None:
+    """Run 10996: the weight plane's own driver calls run out of device memory too."""
+    errors = pytest.importorskip("tensorfs.plane")
+    exc = errors.CudaError("cuda driver: cuEventCreate failed with CUDA_ERROR_OUT_OF_MEMORY (2)")
+    assert classify(exc).code == DEVICE_OOM
+    other = errors.CudaError("cuda driver: cuMemMap failed with CUDA_ERROR_INVALID_VALUE (1)")
+    assert not is_device_oom(other)
+
+
 def test_a_driver_call_out_of_device_memory_is_a_device_oom() -> None:
     """Run 4297: the driver could not allocate a stream on a full card."""
     torch = pytest.importorskip("torch")

@@ -929,8 +929,7 @@ class Weights:
                     if region.bound != int(held[-1].ptr):
                         bind(self.torch, region, held[-1])
         except BaseException:
-            for lease in held:  # a lease dropped unreleased poisons the plane (run 10996)
-                lease.release()
+            release_all(held)
             raise
         return held
 
@@ -1127,10 +1126,10 @@ class Weights:
                 self.mapping -= 1
                 self.mapped -= mine
                 self.mapping_ops.pop()
-            for component, region, lease in reversed(held):
+            for component, region, _ in held:
                 if region.index not in component.resident:
                     unbind(region)
-                lease.release()
+            release_all(lease for *_, lease in reversed(held))
 
     def drain(self) -> None:
         """Read the plane's events: a region evicted from this device goes back to meta before
@@ -1965,8 +1964,7 @@ def _ops_type(torch: ModuleType) -> type:
                             need, f"{op}({shapes}{f' -> {dtype}' if dtype else ''})", why
                         )
             finally:
-                for lease in pins:
-                    lease.release()
+                release_all(pins)
 
     return Ops
 
@@ -2148,8 +2146,20 @@ def let_go(component: Component) -> None:
     """Release the stage's leases on the component's resident blocks; they stay bound, and
     each block leases its own again until the next plan holds them."""
     holds, component.holds = component.holds, {}
-    for lease in holds.values():
-        lease.release()
+    release_all(holds.values())
+
+
+def release_all(leases: Iterable[Lease]) -> None:
+    """Release every lease, then raise the first failure: one a failure skipped would be
+    collected unreleased, which poisons the plane (run 10996, a release under device OOM)."""
+    failure: BaseException | None = None
+    for lease in leases:
+        try:
+            lease.release()
+        except BaseException as exc:
+            failure = failure or exc
+    if failure is not None:
+        raise failure
 
 
 def close_cursor(component: Component) -> None:
@@ -3915,10 +3925,10 @@ class WeightResidency:
         self, component: Component, regions: Sequence[Region], leases: Sequence[Lease]
     ) -> None:
         """End `held`'s leases; outside its lease only a stage-resident region stays bound."""
-        for region, lease in zip(regions, leases, strict=True):
+        for region in regions:
             if region.index not in component.resident:
                 unbind(region)
-            lease.release()
+        release_all(leases)
         self.weights.drain()
 
     def whole(self) -> list[str]:

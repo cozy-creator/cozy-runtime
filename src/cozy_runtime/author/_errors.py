@@ -168,8 +168,8 @@ def is_device_oom(exc: BaseException) -> bool:
     """A device allocation failure, recognized WITHOUT importing torch: torch's
     `OutOfMemoryError`, an asynchronous `AcceleratorError` for cudaErrorMemoryAllocation, an
     allocation that failed inside a CUDA library call (cuBLAS, cuDNN, cuFFT, cuSOLVER,
-    cuSPARSE, NCCL), or MPS's plain RuntimeError for a pool past its limit or one buffer
-    larger than Metal allows.
+    cuSPARSE, NCCL), a TensorFS driver call that found none, or MPS's plain RuntimeError for a
+    pool past its limit or one buffer larger than Metal allows.
 
     This module is the author kernel's and it is deliberately dependency-free — the
     worker imports it and the worker has no torch. The identity is therefore structural:
@@ -181,6 +181,8 @@ def is_device_oom(exc: BaseException) -> bool:
         return True
     if torch_error and name == "AcceleratorError":
         return getattr(exc, "error_code", None) == 2 or "out of memory" in text
+    if type(exc).__module__ == "tensorfs.plane":  # a driver call of the plane's (run 10996)
+        return name == "CudaError" and "CUDA_ERROR_OUT_OF_MEMORY" in text
     if not isinstance(exc, RuntimeError):
         return False
     if "NCCL" in text and "out of memory" in text:
