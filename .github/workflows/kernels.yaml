@@ -28,6 +28,11 @@ run-name: kernels ${{ inputs.ref || github.head_ref || github.ref_name }}
 permissions:
   contents: read
 
+# A newer push to the same ref replaces a build still running.
+concurrency:
+  group: kernels-${{ inputs.ref || github.head_ref || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   linux:
     strategy:
