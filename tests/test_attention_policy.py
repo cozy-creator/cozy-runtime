@@ -168,14 +168,15 @@ def test_a_pinned_build_is_imported_first_and_serves_the_default_too(
     monkeypatch.setattr(attention, "_BUILDS", {})
     attention.reserve("dit=flash-attn3-fp8", hopper)
     assert attention._build(fa3) == attention._build(fp8) == "flash-attn3-full"
+    sage = attention.BY_NAME["sageattention"]
     attention.reserve("sageattention-fp16pv", hopper)
-    assert attention._build(attention.BY_NAME["sageattention"]) == "sageattention-full"
-    monkeypatch.setattr(attention, "_BUILDS", {fa3.import_name: fa3.artifact})
-    assert attention._build(fa3) == "flash-attn3"
+    assert attention._build(sage) == "sageattention-full"
+    monkeypatch.setattr(attention, "_BUILDS", {sage.import_name: sage.artifact})
+    assert attention._build(sage) == "sageattention"
     with pytest.raises(attention.AttentionRefusal) as needs:
-        attention.plan(hopper, _roots(), "dit=flash-attn3-fp8")
+        attention.plan(hopper, _roots(), "dit=sageattention-fp16pv")
     assert needs.value.code == "attention_kernel_needs_executor"
-    assert "flash-attn3-full" in str(needs.value)
+    assert "sageattention-full" in str(needs.value)
 
 
 def test_registration_is_idempotent_local_and_dispatches_real_cpu_attention() -> None:

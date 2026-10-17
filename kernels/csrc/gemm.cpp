@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// `cozy_kernels._gemm`: the 8-bit linears (`int8_op/int8.h`) for every card in one module. Each
+// `cozy_kernels._gemm`: the 8-bit linears (`gemm/int8.h`) for every card in one module. Each
 // tensor-core family's GEMMs are compiled for that family's targets only (`CMakeLists.txt`) and
 // the caller names the device's family (`FAMILIES`). Arguments are raw device pointers, sizes
 // and a stream, so neither torch nor the Python version is a build input; the caller allocates

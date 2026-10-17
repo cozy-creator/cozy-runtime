@@ -2,10 +2,10 @@
 cubins inside (`kernels/`), each verified on the device before it serves (`verify`). `_gemm` is
 the 8-bit linears; `_fa3` is FlashAttention-3's Hopper forward (`FlashAttention3`).
 
-`Prebuilt` answers the six calls of the op a machine can compile (`int8_op/op.cpp`):
-`*_linear` quantizes, multiplies and applies both scales and the bias (int8's few rows in one
-GEMV launch), `*_quantize` optionally folds the producer's norm, modulation and activation into
-the quantization, and `*_gemm` multiplies a quantized operand. It allocates with torch and
+`Prebuilt` answers the 8-bit op library's six calls: `*_linear` quantizes, multiplies and applies
+both scales and the bias (int8's few rows in one GEMV launch), `*_quantize` optionally folds the
+producer's norm, modulation and activation into the quantization, and `*_gemm` multiplies a
+quantized operand. It allocates with torch and
 launches on torch's current stream. A GEMM tile that cannot take a shape hands that call to
 cuBLASLt (`_int_mm`, `_scaled_mm`), said once; a card the wheel has no fp8 GEMM for (Ada) is
 cuBLASLt's by design. `torch` is the torch module: this module imports no torch.
@@ -24,7 +24,7 @@ from cozy_runtime.internal import arch, verify
 from cozy_runtime.internal.encoding.formats import CONVROT_GROUP, E4M3_MAX, Tensor, hadamard256
 
 try:
-    from cozy_kernels import FAMILIES, GEMM, TMA_GEMM, _gemm
+    from cozy_kernels import ARCHS, FAMILIES, GEMM, TMA_GEMM, _gemm
 
     ABSENT = ""
 except ImportError as absent:  # no cozy-kernels wheel for this OS and CPU
@@ -313,11 +313,19 @@ def artifact(module: str = "_gemm") -> str:
     return f"{found.hash.mode}:{found.hash.value}" if found and found.hash else ""
 
 
-def covers(sm: int) -> bool:
-    """Whether the installed wheel carries this card's 8-bit GEMMs: a machine then builds none at
-    boot, and builds them only if they fail their probe here (`int8_linear.native`)."""
-    family = arch.row(sm).family
-    return not ABSENT and any(sm in GEMM[f].get(family, ()) for f in GEMM)
+#: The attention kernels the wheel serves, by candidate name (`attention.KERNELS`).
+ATTENTION = {"flash-attn3": "_fa3"}
+
+
+def serves(kernel: str, sm: int) -> bool:
+    """Whether the installed wheel carries `kernel` for this card: a machine builds none."""
+    module = ATTENTION.get(kernel)
+    return (
+        not ABSENT
+        and module is not None
+        and bool(artifact(module))
+        and any(target.rstrip("af") == f"sm_{sm}" for target in ARCHS[module]["cubin"])
+    )
 
 
 def lost(f: str, sm: int) -> str:

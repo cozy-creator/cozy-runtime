@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // The 8-bit linears' launchers (int8-convrot256, fp8-rowwise): raw pointers and a stream, no
-// torch, so the CUTLASS units compile without torch's headers. `out` and `bias` are bf16
-// (`half == false`) or fp16.
-// Each returns its launch's error: a module loaded lazily into a full GPU fails with
-// cudaErrorMemoryAllocation, which the op raises as an out-of-memory error Runtime recovers.
+// torch. `out` and `bias` are bf16 (`half == false`) or fp16. Each returns its launch's error: a
+// module loaded lazily into a full GPU fails with cudaErrorMemoryAllocation, which the caller
+// raises as an out-of-memory error Runtime recovers.
 #pragma once
 
 #include <cuda_runtime.h>
@@ -70,7 +69,7 @@ using Fp8Gemm = cudaError_t(const void* q, const void* w, const float* scales,
                             int M, int N, int K, int sms, int config, cudaStream_t stream);
 
 // Each tensor-core family's GEMMs, compiled for that family's targets only and kept apart by
-// namespace, so one module can link every family (`kernels/`). A unit names its family by its
+// namespace, so one module links every family (`CMakeLists.txt`). A unit names its family by its
 // define (`COZY_FAMILY`); `gemm_sm80.cu` is always mma.sync's int8.
 namespace mma_sync {
 Gemm gemm;
