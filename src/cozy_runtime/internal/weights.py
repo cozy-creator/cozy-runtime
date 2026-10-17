@@ -3519,6 +3519,8 @@ class WeightResidency:
                 (nbytes, own), floor = short, False
                 exc.__traceback__ = None  # the failed plan's frames free their tensors
             nbytes = nbytes or weight_policy.MARGIN
+            if self.spare:  # an optional call is taken only if it fits beside what is here
+                raise ResidencyRefusal("device_spared", f"{op} declined: {nbytes} B short")
             if memory.free_for(nbytes, op, upto=Rung.IDLE) and memory.freed:
                 continue
             unused = max(budget - weights._committed(), 0)
