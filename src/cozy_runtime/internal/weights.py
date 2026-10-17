@@ -840,7 +840,7 @@ class Weights:
         outermost = _innermost(self.torch) is None
         with _noting(self.torch, self, journal):
             yield journal
-        if outermost and spill.OFF:
+        if outermost and spill.OFF and not self.open:  # a call's, not a block's
             self.restore_spilled()
 
     def refused(self, need: int) -> None:

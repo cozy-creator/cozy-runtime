@@ -34,6 +34,8 @@ from functools import partial
 from types import ModuleType
 from typing import TYPE_CHECKING, cast
 
+from cozy_runtime.author._errors import is_device_oom
+
 if TYPE_CHECKING:
     from io import BufferedRandom
 
@@ -302,15 +304,20 @@ def restore(torch: ModuleType, device: Device, room: int) -> int:
             continue
         if back == 0:
             _fence(torch, device)
-        if off.host is None and off.file is None:
-            fresh = torch.empty(off.nbytes, dtype=torch.uint8, device=device)
-            fresh.copy_(_flat(torch, storage))
-            # `fresh` takes the host pointer and frees its block when it goes
-            storage._swap_data_ptr_(fresh.untyped_storage())
-            del OFF[storage._cdata]
-            TOTALS[6] += off.nbytes
-        else:
-            _in(torch, storage, off)
+        try:
+            if off.host is None and off.file is None:
+                fresh = torch.empty(off.nbytes, dtype=torch.uint8, device=device)
+                fresh.copy_(_flat(torch, storage))
+                # `fresh` takes the host pointer and frees its block when it goes
+                storage._swap_data_ptr_(fresh.untyped_storage())
+                del OFF[storage._cdata]
+                TOTALS[6] += off.nbytes
+            else:
+                _in(torch, storage, off)
+        except Exception as exc:
+            if not is_device_oom(exc):
+                raise
+            break  # less room than the driver said: the rest come back when an op reads them
         back += off.nbytes
     return back
 
