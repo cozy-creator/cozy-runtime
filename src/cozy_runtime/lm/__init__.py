@@ -136,9 +136,10 @@ def generate(
     tail): `inputs` as the processor returned them, generation ends at a `stop` token or after
     `max_new_tokens`, and a row that stopped early continues as `pad` (default: the first stop).
     `presence_penalty` subtracts that much from every token already generated (vLLM's).
-    `draft(embeds, hidden, position_ids, past_key_values, attention_mask) -> hidden` is the
-    model's multi-token-prediction head (`Draft`): from a token's embedding and the state the
-    model's head read before it, the state the head reads for the token after. It speeds up a
+    `draft(embeds, hidden, position_ids, past_key_values, attention_mask, rotary) -> hidden` is
+    the model's multi-token-prediction head (`Draft`): from a token's embedding and the state the
+    model's head read before it, the state the head reads for the token after; `rotary` is the
+    model's own rotary embedding. It speeds up a
     batch of one, each token computed as decode computes it. Without one, the head `drafting`
     names is used."""
     draft = draft if draft is not None else _DRAFT.get()
@@ -269,9 +270,6 @@ class Draft(torch.nn.Module if not ABSENT else object):  # type: ignore[misc]
         text = config.get_text_config(decoder=True)
         prefix = next(n[: -len("DecoderLayer")] for n in vars(space) if n.endswith("DecoderLayer"))
         norm = getattr(space, f"{prefix}RMSNorm")
-        rotary = getattr(space, f"{prefix}TextRotaryEmbedding", None) or getattr(
-            space, f"{prefix}RotaryEmbedding"
-        )
         layer = getattr(space, f"{prefix}DecoderLayer")(
             text, list(text.layer_types).index("full_attention")
         )
@@ -283,9 +281,12 @@ class Draft(torch.nn.Module if not ABSENT else object):  # type: ignore[misc]
         self.mtp.pre_fc_norm_hidden = norm(size, eps=eps)
         self.mtp.layers = torch.nn.ModuleList([layer])
         self.mtp.norm = norm(size, eps=eps)
-        self.rotary = rotary(config=text)
 
-    def forward(self, embeds: Any, hidden: Any, positions: Any, cache: Any, mask: Any) -> Any:
+    def forward(
+        self, embeds: Any, hidden: Any, positions: Any, cache: Any, mask: Any, rotary: Any
+    ) -> Any:
+        """`rotary` is the model's: its tables are where the model is, at the model's precision
+        (a copy of its own would be wherever a package left it, as the head's dtype)."""
         mtp = self.mtp
         joined = torch.cat([mtp.pre_fc_norm_embedding(embeds), mtp.pre_fc_norm_hidden(hidden)], -1)
         x = mtp.fc(joined)
@@ -293,7 +294,7 @@ class Draft(torch.nn.Module if not ABSENT else object):  # type: ignore[misc]
         text, rope = (positions[0], positions[1:]) if positions.shape[0] == 4 else (None, positions)
         x = mtp.layers[0](
             x,
-            position_embeddings=self.rotary(x, rope),
+            position_embeddings=rotary(x, rope),
             attention_mask=mask,
             position_ids=text,
             past_key_values=cache,
@@ -923,6 +924,7 @@ class _Decode:
             self.rows = torch.arange(self.capacity, device=device)
             #: the state the model's head read for the token `ids` holds: the draft's input
             self.hidden: Any = None
+            self.rotary = model.get_decoder().rotary_emb
 
     def begin(self, inputs: Mapping[str, Any], stops: list[int], pad: int) -> None:
         self.inputs = inputs
@@ -983,7 +985,7 @@ class _Decode:
         self.cache.window = self.prompt + 1
         self.dcache.layers[0].cumulative_length.fill_(1)
         embed = self.model.get_input_embeddings()
-        last = self.draft(embed(tokens), hidden, at, self.dcache, mask)[:, -1:]
+        last = self.draft(embed(tokens), hidden, at, self.dcache, mask, self.rotary)[:, -1:]
         if self.hidden is None or self.hidden.shape != last.shape:
             self.hidden, self.graphs = torch.empty_like(last), {}
         self.hidden.copy_(last)
@@ -1089,7 +1091,7 @@ class _Decode:
                 open_ = (keys > self.length) & (keys <= self.length + i)
                 mask = torch.where(open_, self.open, self.dmask[..., :size])
                 at = self.position + i if self.position is not None else (self.length + i)[:, None]
-                hidden = self.draft(embed(token), hidden, at, self.dcache, mask)
+                hidden = self.draft(embed(token), hidden, at, self.dcache, mask, self.rotary)
             scores = head(hidden)[:, -1].float()
             if seen is not None:
                 scores = scores - self.penalty * seen
@@ -1145,7 +1147,7 @@ class _Decode:
             if self.position is not None
             else (self.length + 1 + rows)[None]
         )
-        states = self.draft(embed(tokens), taken[-1][:, -span:], at, self.dcache, mask)
+        states = self.draft(embed(tokens), taken[-1][:, -span:], at, self.dcache, mask, self.rotary)
         self.hidden.copy_(states.index_select(1, kept))
         # Back to the kept tokens' end: keys past it are masked and overwritten later.
         ended = self.length + kept + 1
