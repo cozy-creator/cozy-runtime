@@ -128,6 +128,32 @@ def test_image_prompt_across_a_window_boundary() -> None:
     _same(model, inputs, 30)
 
 
+def test_a_batch_of_images_left_padded() -> None:
+    """Images of different sizes in one call, as a describer batches them: one prefill over the
+    left-padded rows, each row's own mrope positions, decoded together."""
+    torch.manual_seed(2)
+    model = _qwen3_5()
+    vision = model.config.vision_config
+    patch = vision.in_channels * vision.temporal_patch_size * vision.patch_size**2
+    rows, grids = [], [[1, 4, 4], [1, 4, 8]]
+    for (_, h, w), words in zip(grids, (21, 9), strict=True):
+        image = [301, *[300] * (h * w // vision.spatial_merge_size**2), 302]
+        text = torch.randint(10, 290, (words,)).tolist()
+        rows.append(text[:3] + image + text[3:])
+    width = max(map(len, rows))
+    ids = torch.tensor([[0] * (width - len(r)) + r for r in rows], device=DEVICE)
+    mask = torch.tensor([[0] * (width - len(r)) + [1] * len(r) for r in rows], device=DEVICE)
+    inputs = {
+        "input_ids": ids,
+        "attention_mask": mask,
+        "pixel_values": torch.randn(sum(h * w for _, h, w in grids), patch).to(DEVICE),
+        "image_grid_thw": torch.tensor(grids, device=DEVICE),
+        "mm_token_type_ids": (ids == 300).int(),
+    }
+    assert int((mask == 0).sum()) > 0
+    _same(model, inputs, 30)
+
+
 def test_windows_double_up_to_the_capacity() -> None:
     assert [lm.window(n, 5000) for n in (1, 256, 257, 1500, 4097)] == [256, 256, 512, 2048, 5000]
 
