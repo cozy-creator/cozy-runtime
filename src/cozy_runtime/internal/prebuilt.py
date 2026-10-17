@@ -55,7 +55,7 @@ class Prebuilt:
     index: int
     family: str
     #: whether the wheel carries a CUTLASS fp8 GEMM for this card
-    fp8_gemm: bool
+    cutlass_fp8: bool
     _scratch: Callable[[int], Tensor] = field(init=False)
 
     def __post_init__(self) -> None:
@@ -182,7 +182,7 @@ class Prebuilt:
         if rows == 0:
             return out
         code = _gemm.NOT_SUPPORTED
-        if not f.fp8 or self.fp8_gemm:
+        if not f.fp8 or self.cutlass_fp8:
             code = _gemm.gemm(
                 self.index, FAMILIES.index(self.family), f.fp8, q.data_ptr(), scales.data_ptr(),
                 data.data_ptr(), scale.data_ptr(), _ptr(bias), out.data_ptr(),
@@ -195,7 +195,7 @@ class Prebuilt:
             self._check(code, "the GEMM")
         if config >= 0:
             raise ValueError(f"{f.name}_gemm: config {config} cannot take {rows}x{width}")
-        if f.fp8 and not self.fp8_gemm:
+        if f.fp8 and not self.cutlass_fp8:
             pass  # cuBLASLt is this card's fp8 GEMM
         elif f.name not in _SAID:
             _SAID.add(f.name)
@@ -263,7 +263,7 @@ class Prebuilt:
     def _half(self, dtype: object) -> bool:
         if dtype not in (self.torch.bfloat16, self.torch.float16):
             raise ValueError(f"8-bit linear: activations and outputs are bf16 or fp16, not {dtype}")
-        return dtype == self.torch.float16
+        return bool(dtype == self.torch.float16)
 
     def _stream(self) -> int:
         return int(self.torch.cuda.current_stream(self.index).cuda_stream)
