@@ -56,7 +56,8 @@ function(gemm_unit name source targets)
     target_compile_definitions(${name} PRIVATE CUTLASS_ENABLE_GDC_FOR_SM90
                                CUTLASS_ENABLE_GDC_FOR_SM100 ${ARGN})
     target_compile_options(${name} PRIVATE --expt-relaxed-constexpr
-                           $<$<PLATFORM_ID:Linux>:-Xcompiler=-fno-gnu-unique>)
+                           $<$<PLATFORM_ID:Linux>:-Xcompiler=-fno-gnu-unique>
+                           $<$<CXX_COMPILER_ID:MSVC>:-Xcompiler=/Zc:__cplusplus>)
 endfunction()
 
 # mma.sync carries PTX (`80` is SASS and PTX), which the driver compiles for a card none names.

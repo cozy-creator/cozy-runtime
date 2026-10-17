@@ -2,7 +2,8 @@
 """Kernel wheel formation: a built cozy-kernels wheel is the file its target promises
 (`.github/workflows/kernels.yaml`). Its name carries exactly `cp312-abi3-<platform>`. Each
 module's cubins and PTX are exactly `cozy_kernels.ARCHS` (cuobjdump). Nothing is bundled beside
-it, and on Linux it needs only glibc (readelf): no torch, no CUDA library, no libpython. It
+it, and it needs only the OS's C runtime (readelf, dumpbin): no torch, no CUDA library, no
+version-specific libpython (Windows' stable-ABI `python3.dll` is the one Python it may name). It
 imports on every Python given, and a call on a machine without a GPU returns CUDA's error
 rather than crashing. Its driver floor equals cozy-platform's (`--platform-floor`, the Rust
 source TensorD checks at startup). Any failure is named, and the run exits 1.
@@ -20,8 +21,11 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
-#: What a Linux module may need: glibc's own libraries.
-GLIBC = re.compile(r"(libc|libm|libdl|libpthread|librt|ld-linux[\w.-]*)\.so(\.\d+)*")
+#: What a module may need: glibc's own libraries; Windows' kernel, C runtime and stable ABI.
+SYSTEM = re.compile(
+    r"(libc|libm|libdl|libpthread|librt|ld-linux[\w.-]*)\.so(\.\d+)*"
+    r"|(?i:(kernel32|python3|ucrtbase|vcruntime140(_1)?|api-ms-win-[\w-]+)\.dll)"
+)
 #: cozy-platform's `gpu::DRIVER_FLOOR`: Windows', then everything else's.
 RUST_FLOOR = re.compile(
     r'DRIVER_FLOOR: &str = if cfg!\(windows\) \{ "([\d.]+)" \} else \{ "([\d.]+)" \}'
@@ -73,7 +77,11 @@ def embedded(module: Path) -> tuple[set[str], set[str]]:
 
 
 def needed(module: Path) -> list[str]:
-    out = subprocess.run(["readelf", "-d", str(module)], capture_output=True, text=True).stdout
+    windows = module.suffix == ".pyd"
+    tool = ["dumpbin", "/dependents"] if windows else ["readelf", "-d"]
+    out = subprocess.run([*tool, str(module)], capture_output=True, text=True).stdout
+    if windows:
+        return re.findall(r"^\s+(\S+\.dll)\s*$", out, re.MULTILINE | re.IGNORECASE)
     return re.findall(r"\(NEEDED\)\s+Shared library: \[([^\]]+)\]", out)
 
 
@@ -120,10 +128,11 @@ def main() -> int:
                         f"undeclared {sorted(have - set(wanted))}"
                     )
             print(f"{name}: cubin {' '.join(sorted(cubin))}; ptx {' '.join(sorted(ptx))}")
-            if module.suffix == ".so":
-                foreign = [lib for lib in needed(module) if not GLIBC.fullmatch(lib)]
-                if foreign:
-                    failed.append(f"{name} needs {foreign}")
+            libraries = needed(module)
+            print(f"{name} needs {' '.join(libraries)}")
+            foreign = [lib for lib in libraries if not SYSTEM.fullmatch(lib)]
+            if foreign or not libraries:
+                failed.append(f"{name} needs {foreign or 'nothing readable'}")
         for python in options.python:
             target = site / f"py-{Path(python).parent.parent.name}"
             install = [python, "-m", "pip", "install", "-q", "--no-deps", "--target", str(target)]

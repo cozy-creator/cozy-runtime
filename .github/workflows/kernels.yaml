@@ -86,3 +86,60 @@ jobs:
           name: cozy-kernels-${{ matrix.arch }}
           path: dist/*.whl
           if-no-files-found: error
+
+  windows:
+    # No larger Windows runner: the standard one, one compile at a time.
+    runs-on: windows-2025
+    timeout-minutes: 360
+    env:
+      REDIST: https://developer.download.nvidia.com/compute/cuda/redist
+      CMAKE_BUILD_PARALLEL_LEVEL: 1
+      CMAKE_GENERATOR: Ninja
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - {uses: actions/setup-python@v5, id: py313, with: {python-version: '3.13'}}
+      - {uses: actions/setup-python@v5, id: py314, with: {python-version: '3.14'}}
+      - {uses: actions/setup-python@v5, id: py312, with: {python-version: '3.12'}}
+      - uses: ilammy/msvc-dev-cmd@v1.13.0
+      - name: CUDA 13.0 from NVIDIA's redistributables, each archive held to its digest
+        shell: pwsh
+        run: |
+          $manifest = Invoke-RestMethod "$env:REDIST/redistrib_13.0.2.json"
+          $root = "$env:RUNNER_TEMP\cuda"
+          New-Item -ItemType Directory -Force $root | Out-Null
+          foreach ($name in "cuda_nvcc", "cuda_crt", "libnvvm", "cuda_cudart", "cuda_cccl", "cuda_cuobjdump") {
+            $entry = $manifest.$name."windows-x86_64"
+            Invoke-WebRequest "$env:REDIST/$($entry.relative_path)" -OutFile "$name.zip"
+            if ((Get-FileHash "$name.zip" -Algorithm SHA256).Hash -ne $entry.sha256.ToUpper()) { throw "$name digest" }
+            Expand-Archive "$name.zip" "$env:RUNNER_TEMP\x\$name"
+            Copy-Item "$env:RUNNER_TEMP\x\$name\*\*" $root -Recurse -Force
+          }
+          "$root\bin" >> $env:GITHUB_PATH
+          "CUDAToolkit_ROOT=$root" >> $env:GITHUB_ENV
+          "CUDA_PATH=$root" >> $env:GITHUB_ENV
+      - name: Build and check the wheel
+        shell: pwsh
+        run: |
+          $py = "${{ steps.py312.outputs.python-path }}"
+          & $py -m pip install -q uv==0.12.7
+          Invoke-WebRequest https://raw.githubusercontent.com/cozy-creator/cozy/master/crates/cozy-platform/src/gpu/mod.rs -OutFile platform-gpu.rs
+          $began = Get-Date
+          & $py -m uv build --wheel --python $py --out-dir dist kernels
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          "built in $(((Get-Date) - $began).TotalMinutes) min"
+          $wheel = (Get-ChildItem dist\*.whl).FullName
+          & $py checks/kernel_wheel.py $wheel win_amd64 --python $py `
+            --python "${{ steps.py313.outputs.python-path }}" --python "${{ steps.py314.outputs.python-path }}" `
+            --platform-floor platform-gpu.rs
+          exit $LASTEXITCODE
+      - uses: astral-sh/setup-uv@v7
+      - name: Stable ABI only
+        run: uvx abi3audit==0.0.26 --strict --report (Get-ChildItem dist\*.whl).FullName
+        shell: pwsh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cozy-kernels-win_amd64
+          path: dist/*.whl
+          if-no-files-found: error
