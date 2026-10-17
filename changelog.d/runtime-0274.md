@@ -1,0 +1,1 @@
+Runtime 0.27.4 is cut from release/0.27 (0.27.3 plus one fix). On a fresh machine, while `cozy-int8` still builds, an LM decode's graph capture raised `Building` out of `lm.generate` and failed the call: a describer call failed, and H3 skipped its character descriptions. The decode now runs eagerly until the kernel lands. On TensorD 0.7.3.

@@ -42,7 +42,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from typing import Any
 
-from cozy_runtime.author._model import PLACED, RELEASERS, WARNINGS
+from cozy_runtime.author._model import LANDED, PLACED, RELEASERS, WARNINGS, Building
 from cozy_runtime.author.kernels import KernelsUnavailable, Launch, Plan, TritonKernels
 from cozy_runtime.graphs import BYPASS, ROOM, capture, say
 from cozy_runtime.lm import _kernels
@@ -910,6 +910,8 @@ class _Decode:
         self.seen: Any = None
         #: window -> its graph, and the weights' layout they were recorded over
         self.graphs: dict[int, Any] = {}
+        #: `LANDED` when a capture met a kernel still building: none records until one lands
+        self.building = -1
         self.layout: tuple[object, ...] | None = None
         self.pool: Any = None
         self.side: Any = None
@@ -1197,7 +1199,13 @@ class _Decode:
             size = window(self.prompt + self.made + self.per, self.capacity)
             self.cache.window = size
             graph = recorded.get(size)
-            if graph is None and graphs and self.need is not None and not self.failed:
+            if (
+                graph is None
+                and graphs
+                and self.need is not None
+                and not self.failed
+                and self.building != LANDED[0]
+            ):
                 free = room() if room is not None else ROOM * self.need
                 if free < ROOM * self.need:
                     self.failed = (
@@ -1272,7 +1280,12 @@ class _Decode:
         """The step at the current window as a CUDA graph, or None, with a run warning: the
         call's steps then run eagerly, and the next call records into a fresh pool. A capture
         executes nothing, so the buffers are as they were."""
-        graph, why = capture(self._advance, self.pool, self.side)
+        try:
+            graph, why = capture(self._advance, self.pool, self.side)
+        except Building:  # a kernel still builds (a fresh machine): eager until one lands
+            self.building, self.pool = LANDED[0], None
+            torch.cuda.empty_cache()
+            return None
         if graph is None:
             self.failed, self.pool = why, None
             torch.cuda.empty_cache()

@@ -202,6 +202,25 @@ def test_running_out_of_memory_decodes_through_transformers() -> None:
 
 
 @pytest.mark.skipif(DEVICE != "cuda", reason="CUDA graphs need a GPU")
+def test_a_kernel_building_at_capture_leaves_the_decode_eager() -> None:
+    """A kernel still building raises `Building` inside a capture (int8_linear on a fresh
+    machine): the steps run eagerly and the call gives Transformers' tokens."""
+    from cozy_runtime.author._model import Building
+
+    torch.manual_seed(6)
+    model = _qwen3_5()
+    layer = [m for m in model.modules() if type(m).__name__.endswith("DecoderLayer")][1]
+
+    def hook(*_: Any) -> None:
+        if torch.cuda.is_current_stream_capturing():
+            raise Building("cozy-int8")
+
+    layer.register_forward_pre_hook(hook)
+    ids = torch.randint(10, 290, (1, 60), device=DEVICE)
+    _same(model, {"input_ids": ids, "attention_mask": torch.ones_like(ids)}, 40)
+
+
+@pytest.mark.skipif(DEVICE != "cuda", reason="CUDA graphs need a GPU")
 def test_a_capture_out_of_memory_leaves_the_decode_serving(
     capfd: pytest.CaptureFixture[str],
 ) -> None:
