@@ -427,7 +427,10 @@ ALLOCATOR = "expandable_segments:True"
 
 def initialize(torch: Any, kind: str) -> None:
     """Bring the accelerator context up EAGERLY, so its cost is a measured prepare step
-    rather than a surprise inside the first kernel. torch's allocator is configured first."""
+    rather than a surprise inside the first kernel. torch's allocator is configured first.
+    A CPU executor has no accelerator to bring up."""
+    if kind == "cpu":
+        return
     if sees_no_gpu():
         raise RuntimeError("this process sees no GPU (CUDA_VISIBLE_DEVICES is empty)")
     if kind == "mps" and not torch.backends.mps.is_available():
