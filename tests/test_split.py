@@ -141,7 +141,7 @@ def test_a_refusal_is_a_reason_to_cut_finer_and_other_failures_are_not(card: Any
         @contextmanager
         def piece(self, key: str, elements: int, need: int, least: int = 0) -> Iterator[None]:
             if elements > self.limit:
-                raise RuntimeFailure("no room", code="operation_exceeds_device")
+                raise RuntimeFailure("no room", code="memory_exhausted")
             self.pieces.append(elements)
             yield
 

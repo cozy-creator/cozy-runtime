@@ -81,6 +81,7 @@ from cozy_runtime.author._context import AdapterRef, Device
 from cozy_runtime.author._demand import shape_cell
 from cozy_runtime.author._errors import (
     DEVICE_OOM,
+    MEMORY_EXHAUSTED,
     CapabilityError,
     ConformanceError,
     InvalidRequest,
@@ -250,7 +251,7 @@ from cozy_runtime.internal.weights_writer import ExecutionStorage
 INLINE_RESULT_MAX = 4 * 1024 * 1024
 
 #: Outcomes that are capacity, not broken state: they fail the attempt and keep the executor.
-CAPACITY_CODES = frozenset({"device_out_of_memory", INDIVISIBLE, "device_spared"})
+CAPACITY_CODES = frozenset({DEVICE_OOM, MEMORY_EXHAUSTED, INDIVISIBLE, "device_spared"})
 
 #: How many PREPARED requests this epoch holds at once. A serving lane admits and
 #: runs one attempt at a time, so anything past the newest few is a request the
@@ -4874,15 +4875,23 @@ class Executor:
     def unsettled(self, target: Executor, exc: Exception) -> dict[str, Any]:
         """An attempt that raised outside its handler. A CUDA fault is sticky, so the tail's
         first sync raises it again: the process cannot serve another attempt, and the reply
-        names the handler's own failure (else this one) and the stage it happened in."""
+        names the handler's own failure (else this one) and the stage it happened in. Memory
+        is capacity: it ends the attempt, never the process, and its facts go with it."""
         later = classify(exc)
         first, stage, record = target.handled or (later, "", None)
         first = first if first.terminal == "failed" else later
         where = f" in {stage}" if stage else ""
         message = first.message + where + ("" if first is later else f"; then {later.message}")
-        self.poisoned = target.poisoned = (
-            self.poisoned or target.poisoned or f"{first.code}{where}: {first.message}"[:300]
-        )
+        capacity, facts, quiet = later.code in CAPACITY_CODES, None, False
+        if capacity:
+            with contextlib.suppress(Exception):  # a sticky fault raises here: then it is one
+                facts = self._plane_facts()
+                quiet = self._quiescent() if self.torch is not None else True
+        if not quiet:
+            self.poisoned = target.poisoned = (
+                self.poisoned or target.poisoned or f"{first.code}{where}: {first.message}"[:300]
+            )
+        weights = self.host.weights
         return {
             "ok": True,
             "outcome": {
@@ -4894,10 +4903,12 @@ class Executor:
                 "traceback": first.traceback or later.traceback,
             },
             "observations": record.ring.rows() if record is not None else [],
-            "quiescent": False,
+            "quiescent": quiet,
             "poisoned": self.poisoned,
             "outputs": [],
             "frames": [],
+            "plane": facts,
+            "shortfall": weights.memory.refusal if quiet and weights is not None else None,
         }
 
     def _settled(self, reply: dict[str, Any]) -> dict[str, Any]:

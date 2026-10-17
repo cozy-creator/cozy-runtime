@@ -10,10 +10,8 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from cozy_runtime.author._errors import is_device_oom
+from cozy_runtime.author._errors import MEMORY_EXHAUSTED, is_device_oom
 
-#: The refusal an op ends with when the device cannot give it the bytes it needs at once.
-EXCEEDS = "operation_exceeds_device"
 #: An op not measured yet runs in pieces of at most 1/FIRST of its input.
 FIRST = 8
 
@@ -103,7 +101,7 @@ def _name(fn: Callable[[Any], Any]) -> str:
 
 
 def _short(exc: BaseException) -> bool:
-    return is_device_oom(exc) or getattr(exc, "code", None) == EXCEEDS
+    return is_device_oom(exc) or getattr(exc, "code", None) == MEMORY_EXHAUSTED
 
 
 def _spans(length: int, cut: Cut, count: int) -> list[tuple[int, int]]:

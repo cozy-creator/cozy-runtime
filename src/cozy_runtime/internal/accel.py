@@ -199,6 +199,14 @@ def _nvml_compute_table() -> dict[int, int] | None:
     return table
 
 
+def compute_processes(device: str) -> dict[int, int] | None:
+    """`device`'s compute processes as NVML counts them: pid -> used bytes (-1 unaccounted).
+    None where the driver will not say."""
+    library = _nvml_library()
+    handle = _nvml_handle(library, device) if library is not None and device else None
+    return _nvml_device_compute_table(library, handle) if handle is not None else None
+
+
 def _table_rows(pids: set[int], table: dict[int, int]) -> dict[int, ProcessMemory]:
     return {
         pid: (

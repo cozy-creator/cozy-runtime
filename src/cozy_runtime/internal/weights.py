@@ -79,6 +79,7 @@ from cozy_runtime.internal.fill import (
     store_refusals,
     tensorfs_requirement_dtype,
 )
+from cozy_runtime.internal.memory import ORPHANED, Memory
 from cozy_runtime.internal.paging import partition
 from cozy_runtime.internal.planfacts import PlanFacts
 from cozy_runtime.internal.probe import QualificationResult, observed_capability_records
@@ -450,6 +451,8 @@ class Weights:
         self.floor_free = self.display_floor
         #: ops run in bands of rows when their operands live in host memory or they run out
         self.bands = None if self.host_only else bands.Bands(self)
+        #: the one owner of this GPU's bytes: its ladder and its refusal
+        self.memory = Memory(self)
         if not self.host_only:
             self.measure_context()
         if kind == "cuda":
@@ -464,7 +467,7 @@ class Weights:
             return 0  # one command queue
         return int(self.torch._C._cuda_getCurrentRawStream(self.index))
 
-    def memory(self) -> dict[str, int]:
+    def allocation(self) -> dict[str, int]:
         """`accel.allocation`, with a unified plane's regions taken out of torch's figures:
         they are torch tensors there, and the plane counts them as its own (`committed`)."""
         memory = accel.allocation(self.torch, self.kind)
@@ -514,7 +517,7 @@ class Weights:
         own limit: past the budget the system pages, which is slower, not a failure."""
         if self.host_only or self.unified:
             return
-        memory = self.memory()
+        memory = self.allocation()
         reserved = memory["reserved_bytes"]
         allowed = reserved + memory["driver_free_bytes"] - self.floor_free
         if self.cap >= 0:
@@ -554,13 +557,15 @@ class Weights:
             return 0
         return int(self.torch._C._cuda_memoryStats(self.index).get("num_alloc_retries", 0))
 
-    def page_out(self, keep: Collection[str], need: int = -1) -> bool:
+    def page_out(self, keep: Collection[str] | None, need: int = -1) -> bool:
         """Give torch the device bytes of one component no stage uses now (none in `keep`): the
         one with the fewest bytes to copy back, any that holds baked bytes (a bake to restore)
         after the rest; with a `need`, only that many, its last blocks first. Its own bytes
         leave the plane and its budget. Bytes mapped from the machine's custody are let go and
         the machine is asked for them (`DeviceRoom`: it drops a holding nobody maps, and this
-        process's cap rises into that room). False: nothing to give."""
+        process's cap rises into that room). False: nothing to give. `keep` None: every
+        component an open or parked stage uses."""
+        keep = _in_use(self) if keep is None else keep
         asks = self.room is not None and self.cap >= 0
         idle = [
             (any(region.baked for region in c.regions), self.resident_bytes(c), key)
@@ -602,13 +607,9 @@ class Weights:
             # never above the budget a spare lowered; torch's limit follows either way.
             self._apply(min(self.applied, max(before - own, 0)))
             self.limit_torch()
-        if shared and self.room is not None:
-            free = self.memory()["driver_free_bytes"] - self.floor_free
-            # Under pressure (nothing free, a small holding) there is nothing worth asking for:
-            # 42 MiB shared less the margin once asked for -22 MiB (run 10078).
-            ask = max(free, 0) + shared - weight_policy.MARGIN
-            if ask > 0:
-                self.room(ask)
+        if shared:
+            free = self.allocation()["driver_free_bytes"] - self.floor_free
+            self.memory.ask(max(free, 0) + shared - weight_policy.MARGIN)
         self.paged_out[0] += 1
         self.paged_out[1] += own + shared
         return True
@@ -635,19 +636,17 @@ class Weights:
         # an adaptive stage fits itself to the room it finds: it asks for its smallest piece
         need = self.adaptive.get(method, self.activation.get(method, 0)) - slack
         if held > self.cap:
-            # Still over: the owner raises the cap into the room it makes (never a negative ask).
-            self.room(max(need, 0) + weight_policy.MARGIN)
-            return
-        if need <= 0:
+            # Still over: the owner raises the cap into the room it makes.
+            self.memory.ask(max(need, 0) + weight_policy.MARGIN)
             return
         granted = min(need + weight_policy.MARGIN, self.cap - held)
-        if granted > 0 and memory["driver_free_bytes"] - self.floor_free < granted:
-            self.room(granted)
+        if need > 0 and memory["driver_free_bytes"] - self.floor_free < granted:
+            self.memory.ask(granted)
 
     def _held(self) -> tuple[Mapping[str, int], int]:
         """Torch's allocation figures, and what this process holds on the device: its context,
         torch's reserved segments and the plane's maps."""
-        memory = self.memory()
+        memory = self.allocation()
         committed = max(plane.stats(self.plane).device(self.index).committed, 0)
         return memory, max(self.context_bytes, 0) + memory["reserved_bytes"] + committed
 
@@ -669,13 +668,14 @@ class Weights:
             self.activation.values(), default=0
         )
 
-    def _apply(self, nbytes: int) -> int:
+    def _apply(self, nbytes: int, keep_holds: bool = False) -> int:
+        """The plane's budget; lowered, the stages' holds go first unless `keep_holds`."""
         nbytes = max(nbytes, 0)
         if nbytes == self.applied or self.host_only:
             return 0
         if nbytes < self.applied:
             self.quiesce()
-            for component in self.components.values():
+            for component in () if keep_holds else self.components.values():
                 let_go(component)
         trim = self.plane.set_vram_budget(self.index, nbytes)
         self.applied = nbytes
@@ -719,7 +719,7 @@ class Weights:
     def driver_budget(self, method: str) -> int:
         """What the driver has free beside this process's weights, inside its cap and above its
         floor, less the activation growth this method measured (activations first)."""
-        memory = self.memory()
+        memory = self.allocation()
         committed = max(plane.stats(self.plane).device(self.index).committed, 0)
         # torch reuses its own cached segments first; only growth beyond them needs the driver
         slack = max(memory["reserved_bytes"] - memory["allocated_bytes"], 0)
@@ -768,7 +768,7 @@ class Weights:
         unmapping. False when the device has no such room."""
         if self.host_only:
             return False
-        free = self.headroom(self.memory())
+        free = self.headroom(self.allocation())
         if free < need + weight_policy.MARGIN:
             return False
         self._apply(self.applied + need + weight_policy.MARGIN)
@@ -783,21 +783,21 @@ class Weights:
             for t in region.derived
         )
 
-    def shrink(self, need: int, keep: int = 0) -> int:
+    def shrink(self, need: int, keep: int = 0, keep_holds: bool = False) -> int:
         """Out of memory: give torch `need` more bytes by unmapping plane bytes, least recently
         used first, as far as what is in use (leased, held by a cursor, a ring) and never below
         `keep`: never a planning floor, which counts regions no kernel reads now. The cut is
         from what is mapped, which a budget larger than the model never reaches; the plane
         holds it until the Worker's next grant, and a stage planned later never below the open
-        stages' floor."""
+        stages' floor. `keep_holds`: only weights no stage holds (memory rung 1)."""
         target = max(min(self.applied, self._committed()) - need - weight_policy.MARGIN, keep)
         if target >= self.applied:
             return 0
         self.oom_retries += 1
-        freed = self._apply(target)
+        freed = self._apply(target, keep_holds)
         # What the plane could not unmap is in use: the budget holds it, so the next map has
         # exactly the room torch leaves (`grow`), not a deficit.
-        self._apply(max(self.applied, self._committed()))
+        self._apply(max(self.applied, self._committed()), keep_holds)
         if self.budget >= 0:
             self.budget = min(self.budget, max(self.applied, self.floor()))
         return freed
@@ -888,7 +888,7 @@ class Weights:
         self.placing = True
         try:
             self.limit_torch()
-            short = need + weight_policy.MARGIN - self.headroom(self.memory())
+            short = need + weight_policy.MARGIN - self.headroom(self.allocation())
             self.given = need if short > 0 and self.shrink(short) else 0
             self.drain()
         finally:
@@ -909,7 +909,7 @@ class Weights:
         again (45 ms on an RTX 5090, seconds on a host whose driver maps slowly, runs 9466-9479)."""
         if self.host_only:
             return
-        memory = self.memory()
+        memory = self.allocation()
         idle = memory["reserved_bytes"] - memory["allocated_bytes"]
         if idle <= self.activation.get(method, 0) + weight_policy.MARGIN:
             return
@@ -954,7 +954,7 @@ class Weights:
 
     def ledger(self) -> str:
         """The device as its driver and this process count it."""
-        memory = self.memory()
+        memory = self.allocation()
         device = plane.stats(self.plane).device(self.index)
         free, total = memory["driver_free_bytes"], memory["driver_total_bytes"]
         held = max(self.context_bytes, 0) + memory["reserved_bytes"] + max(device.committed, 0)
@@ -993,6 +993,29 @@ class Weights:
             f"{spill.MOVED[0]}x {spill.MOVED[1]} B to host in {spill.MOVED[2] // 1_000_000} ms"
         )
         return moved > 0
+
+    def unpin(self, need: int, operands: Sequence[object]) -> bool:
+        """Memory rung 5: the pinned tier halves (its weights stream from the page cache and
+        disk instead), so more of this process's tensors can lock host memory."""
+        self._pin(self.pinned_applied // 2)
+        return self.spill(need, operands)
+
+    def spare(self, operands: Sequence[object]) -> bool:
+        """Memory rung 2: the open stages' components with no block in its forward and none of
+        `operands` give their weights back (`WeightResidency._spare`); the one whose block
+        ran last only when nothing else is left."""
+        if not self.open:
+            return False
+        pointers = list(_pointers(operands))
+        reads = {
+            component.key
+            for component in self.components.values()
+            for region in component.regions
+            if region.bound is not None
+            and any(region.bound <= p < region.bound + region.span for p in pointers)
+        }
+        keep, residency = {*self.running, *reads}, self.open[-1][0]
+        return residency._spare({*keep, self.last}, None) or residency._spare(keep, None)
 
     def restore_spilled(self) -> int:
         """Tensors an earlier op moved to host memory come back while the device has room
@@ -1063,7 +1086,7 @@ class Weights:
 
     def allocatable(self) -> int:
         """Device bytes torch can allocate now: its headroom plus its own idle cache."""
-        memory = self.memory()
+        memory = self.allocation()
         return self.headroom(memory) + max(memory["reserved_bytes"] - memory["allocated_bytes"], 0)
 
     def progressed(self, before: int, need: int, op: str = "") -> None:
@@ -1076,11 +1099,11 @@ class Weights:
         self.limit_torch()
         after = self.allocatable()
         retry = (op, after)
-        fresh = self.headroom(self.memory())
+        fresh = self.headroom(self.allocation())
         if after <= before and self.room is not None:
             self.room(need + weight_policy.MARGIN)
             after = self.allocatable()
-            fresh = self.headroom(self.memory())
+            fresh = self.headroom(self.allocation())
             retry = (op, after)
         repeat, self.last_retry = retry == self.last_retry, retry
         if after <= before and (fresh < need + weight_policy.MARGIN or repeat):
@@ -1209,7 +1232,7 @@ class Weights:
         device_id = self._uuid()
         row = accel.process_memories_by_device({pid}, self.kind, (device_id,))[device_id][pid]
         if row.state == "present":
-            reserved = self.memory()["reserved_bytes"]
+            reserved = self.allocation()["reserved_bytes"]
             device = plane.stats(self.plane).device(self.index)
             # Shared regions (exported or attached) are the machine's to count, once: the
             # driver charges one to whichever process it picks, never this one's context.
@@ -1575,7 +1598,7 @@ class Weights:
         reserved = (
             -1
             if self.host_only
-            else self.memory()["reserved_bytes"]
+            else self.allocation()["reserved_bytes"]
             if self.unified
             else int(self.torch.cuda.memory_reserved(self.device))
         )
@@ -2206,8 +2229,10 @@ def close_cursor(component: Component) -> None:
         except plane.error("PlaneError"):
             # A view into the ring outlives the stage: a failed block's frames, in a cycle,
             # hold one (run 10562: the next stage's ring found the budget still taken). Once
-            # they are collected the ring goes; a view still in use closes it when it goes.
+            # they are collected the ring goes; a view still in use closes it when it goes,
+            # and memory's rung 1 collects again for it.
             if collect:
+                ORPHANED[0] += 1
                 return
         gc.collect()
 
@@ -3886,7 +3911,7 @@ class WeightResidency:
         everything mapped but what is leased or held, and what `components` keep resident
         (theirs is the stage's own set, just wanted)."""
         weights = self.weights
-        memory = weights.memory()
+        memory = weights.allocation()
         free = weights.headroom(memory) + max(
             memory["reserved_bytes"] - memory["allocated_bytes"], 0
         )

@@ -1,0 +1,323 @@
+"""One owner of an executor's device memory per GPU (runtime-memory-v2.md §1-3).
+
+Every memory signal (an op out of memory, the allocator's refusal, the plane short for a map)
+asks `free_for`, which walks one ladder in order: each action runs again while it gives device
+bytes back and is left when a pass gives none, so it ends without counts or timers. Only
+`exhausted` raises for memory, with the ledger of every byte on the GPU.
+"""
+
+from __future__ import annotations
+
+import gc
+import os
+import re
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from enum import IntEnum
+from typing import TYPE_CHECKING, Any, NoReturn
+
+from cozy_runtime.author._errors import (
+    MEMORY_EXHAUSTED,
+    RuntimeFailure,
+    is_device_oom,
+    is_library_refusal,
+)
+from cozy_runtime.author._model import RELEASERS
+from cozy_runtime.internal import accel, plane, spill, weight_policy
+
+if TYPE_CHECKING:
+    from cozy_runtime.internal.weights import Weights
+
+MARGIN = weight_policy.MARGIN
+#: torch's out-of-memory message: CUDA's units are KiB/MiB/GiB, MPS's KB/MB/GB of 1024
+_REQUESTED = re.compile(r"Tried to allocate ([0-9.]+) (B|KiB|MiB|GiB|KB|MB|GB)")
+_UNITS = {"B": 1, "KiB": 1 << 10, "MiB": 1 << 20, "GiB": 1 << 30}
+_UNITS |= {"KB": _UNITS["KiB"], "MB": _UNITS["MiB"], "GB": _UNITS["GiB"]}
+#: cursors dropped open since the last collection: a view into each ring outlived its stage,
+#: and the ring closes itself once the last view goes
+ORPHANED = [0]
+
+
+class Rung(IntEnum):
+    SLACK = 0  # torch's idle cache
+    IDLE = 1  # orphaned rings, weights no stage holds, other tenants (`DeviceRoom`)
+    FINER = 2  # the running stage's resident set, its components not in use
+    CACHES = 3  # what is kept for speed alone (`RELEASERS`; reservations with U7)
+    HOST = 4  # live tensors to page-locked host memory, the op's operands last
+    DISK = 5  # the pinned tier toward 0, so more can lock
+
+
+@dataclass(frozen=True, slots=True)
+class Ledger:
+    """Every byte of one GPU in one class, as the driver, torch and the plane count it."""
+
+    total: int
+    free: int
+    context: int
+    #: other processes on the GPU (NVML); -1 when the driver does not show this one
+    foreign: int
+    reserved: int
+    allocated: int
+    mapped: int
+    leased: int
+    budget: int
+    shared: int
+    hosted: int
+    floor: int
+    cap: int
+
+    @property
+    def residue(self) -> int:
+        """What the driver charges that no class accounts for: never working set."""
+        if self.foreign < 0:
+            return 0
+        held = self.foreign + self.context + self.reserved + self.mapped + self.shared
+        return max(self.total - self.free - held, 0)
+
+    def text(self) -> str:
+        others = "unknown" if self.foreign < 0 else self.foreign
+        return (
+            f"driver {self.free} B free of {self.total}; context {self.context}; torch "
+            f"{self.reserved} reserved, {self.allocated} allocated; plane {self.mapped} mapped, "
+            f"{self.leased} leased, budget {self.budget}; {self.shared} from the machine; "
+            f"other processes {others}; unattributed {self.residue}; {self.hosted} in host "
+            f"memory; floor {self.floor}, cap {self.cap}"
+        )
+
+
+class MemoryExhausted(RuntimeFailure):
+    """The one memory refusal: the ladder ran to its end and the op still does not fit."""
+
+    def __init__(self, detail: str, op: str, nbytes: int, ledger: Ledger, tried: str) -> None:
+        super().__init__(detail, code=MEMORY_EXHAUSTED)
+        self.detail, self.op, self.nbytes = detail, op, nbytes
+        self.ledger, self.tried = ledger, tried
+        self.shortfall = {
+            "resource": "vram",
+            "needed_bytes": nbytes,
+            "available_bytes": max(ledger.free - ledger.floor, 0),
+            "request_shape": op,
+        }
+
+
+def requested(exc: BaseException) -> int:
+    """The allocation torch could not make, from its own message (0: not stated)."""
+    found = _REQUESTED.search(str(exc))
+    return int(float(found.group(1)) * _UNITS[found.group(2)]) if found else 0
+
+
+def shortage(exc: BaseException) -> tuple[int, bool] | None:
+    """(bytes short, whether the plane's own budget was) for a memory failure; None for any
+    other. A plane refusal carries its real deficit, never a plan's totals (run 10562)."""
+    if isinstance(exc, plane.error("Shortfall")):
+        return max(int(getattr(exc, "need", 0)) - int(getattr(exc, "available", 0)), 1), True
+    if isinstance(exc, plane.error("BelowFloor")):
+        return max(int(getattr(exc, "need", 0)) - int(getattr(exc, "budget", 0)), 1), True
+    if isinstance(exc, plane.error("BudgetExceeded")):
+        asked = int(getattr(exc, "requested", 0))
+        if getattr(exc, "pool", "") == "device":  # the device itself is full
+            return asked, False
+        return max(asked - int(getattr(exc, "available", 0)), 1), True
+    if is_device_oom(exc):
+        return requested(exc), False
+    if is_library_refusal(exc):  # a cuBLAS/cuDNN handle or workspace that found no room
+        return weight_policy.LIBRARY_ROOM, False
+    return None
+
+
+class Memory:
+    """The ladder and the refusal for one executor's GPU (`Weights.memory`)."""
+
+    def __init__(self, weights: Weights) -> None:
+        self.weights = weights
+        #: rung -> [passes that gave bytes back, bytes] this attempt (`modes["memory"]`)
+        self.used: dict[Rung, list[int]] = {}
+        #: the bytes the last `free_for` gave back
+        self.freed = 0
+        #: the attempt's refusal, for its reply
+        self.refusal: dict[str, Any] | None = None
+        #: the running stage gave weights back: its next block boundary plans it again
+        self.shrunk = False
+        #: rung 1 asks the owner; never from inside torch's allocator
+        self.asking = True
+        self._collected = False
+
+    def free(self) -> int:
+        """Device bytes torch or the plane can take now: free above the floor, in the cap."""
+        return self.weights.headroom(self.weights.allocation())
+
+    def ledger(self) -> Ledger:
+        weights = self.weights
+        memory = weights.allocation()
+        device = plane.stats(weights.plane).device(weights.index)
+        foreign = -1
+        rows = accel.compute_processes(dict(weights.plane.devices).get(weights.index, ""))
+        if rows is not None and os.getpid() in rows:
+            foreign = sum(n for pid, n in rows.items() if pid != os.getpid() and n > 0)
+        return Ledger(
+            total=memory["driver_total_bytes"],
+            free=memory["driver_free_bytes"],
+            context=max(weights.context_bytes, 0),
+            foreign=foreign,
+            reserved=memory["reserved_bytes"],
+            allocated=memory["allocated_bytes"],
+            mapped=max(device.committed, 0),
+            leased=device.leased_bytes + device.held_bytes,
+            budget=device.budget,
+            shared=device.shared_bytes,
+            hosted=sum(spill.HELD.values()),
+            floor=weights.floor_free,
+            cap=weights.cap,
+        )
+
+    def free_for(
+        self,
+        nbytes: int,
+        op: str,
+        operands: Sequence[object] = (),
+        upto: Rung = Rung.DISK,
+    ) -> bool:
+        """Whether `nbytes` (and a margin) are free once the ladder ran as far as `upto`:
+        rung by rung, each action again while it gives bytes back, until they are."""
+        weights = self.weights
+        if weights.host_only:
+            return False
+        want, start = max(nbytes, 0) + MARGIN, -1
+        placing, weights.placing, self._collected = weights.placing, True, False
+        try:
+            self._settle()
+            start = have = self.free()
+            for rung, act in self._ladder(operands):
+                if rung > upto or have >= want:
+                    break
+                while have < want:
+                    act(want - have)
+                    self._settle()
+                    now = self.free()
+                    if now <= have:
+                        break
+                    self._count(rung, now - have)
+                    have = now
+            return have >= want
+        finally:
+            weights.placing = placing
+            self.freed = max(self.free() - start, 0) if start >= 0 else 0
+
+    def again(
+        self,
+        nbytes: int,
+        op: str,
+        operands: Sequence[object] = (),
+        seen: int = -1,
+        upto: Rung = Rung.DISK,
+    ) -> int:
+        """The room a failed attempt runs again with: `free_for` found it, and more is free
+        than at the attempt's last try (`seen`). -1: it does not run again."""
+        if self.free_for(nbytes, op, operands, upto) and (now := self.free()) > seen:
+            self.weights.oom_retries += 1
+            return now
+        return -1
+
+    def retry[T](
+        self,
+        attempt: Callable[[], T],
+        op: str,
+        operands: Sequence[object] = (),
+        upto: Rung = Rung.DISK,
+    ) -> T:
+        """`attempt()` until it allocates. A plane short of its own budget grows it into room
+        the device has (each growth asks for all of it, so it ends); any other shortage runs
+        again only after more came free."""
+        weights, seen = self.weights, -1
+        while True:
+            try:
+                return attempt()
+            except Exception as exc:
+                short = shortage(exc)
+                if short is None:
+                    raise
+                exc.__traceback__ = None  # the failed attempt's frames free their tensors
+            nbytes, own = short
+            nbytes = nbytes or MARGIN
+            if own:
+                unused = max(weights.applied - weights._committed(), 0)
+                if not self.free_for(nbytes + unused, op, operands, upto):
+                    self.exhausted(nbytes, op)
+                weights._apply(weights.applied + nbytes)
+                weights.oom_retries += 1
+            elif (seen := self.again(nbytes, op, operands, seen, upto)) < 0:
+                self.exhausted(nbytes, op)
+
+    def exhausted(self, nbytes: int, op: str, why: str = "") -> NoReturn:
+        """Raise the one memory refusal: the ledger, the op and what each rung gave."""
+        ledger = self.ledger()
+        slack = ledger.total - ledger.context - ledger.floor - ledger.leased - nbytes
+        verdict = (
+            f"it should have fit by {slack} B beside the context and its leased weights"
+            if slack >= 0
+            else f"{-slack} B more than the GPU has beside the context and its leased weights"
+        )
+        tried = self.summary() or "no rung gave bytes back"
+        detail = (
+            f"{op} needs {nbytes} B of device memory at once"
+            f"{f' ({why})' if why else ''}; {verdict}; ladder: {tried}; {ledger.text()}"
+        )
+        failure = MemoryExhausted(detail, op, nbytes, ledger, tried)
+        self.refusal = failure.shortfall
+        self.weights.modes["memory.exhausted"] = detail[:1200]
+        raise failure
+
+    def ask(self, nbytes: int) -> None:
+        """The owner's idle tenants on this GPU give `nbytes` (`DeviceRoom`): the one place a
+        process asks, and never for nothing or less (runs 4267, 10078)."""
+        if nbytes > 0 and self.asking and self.weights.room is not None:
+            self.weights.room(nbytes)
+
+    def summary(self) -> str:
+        return ", ".join(f"{r.name.lower()} {n}x {b} B" for r, (n, b) in sorted(self.used.items()))
+
+    def _ladder(self, operands: Sequence[object]) -> list[tuple[Rung, Callable[[int], object]]]:
+        weights = self.weights
+        return [
+            (Rung.IDLE, self._collect),
+            (Rung.IDLE, lambda short: weights.shrink(short, keep_holds=True)),
+            (Rung.IDLE, lambda short: weights.page_out(None, short)),
+            (Rung.IDLE, self.ask),
+            (Rung.FINER, self._finer),
+            (Rung.FINER, lambda _: weights.spare(operands)),
+            (Rung.CACHES, lambda _: [release() for release in RELEASERS]),
+            (Rung.HOST, lambda short: weights.spill(short, operands)),
+            (Rung.DISK, lambda short: weights.unpin(short, operands)),
+        ]
+
+    def _settle(self) -> None:
+        """What the plane and torch just gave back reaches the driver, and torch's limit
+        follows it."""
+        weights = self.weights
+        accel.release_cached(weights.torch, weights.kind)
+        weights.drain()
+        weights.limit_torch()
+
+    def _collect(self, _: int) -> None:
+        """Rings whose cursor could not close (a failed block's frames hold a view in a
+        reference cycle, run 10562) and bytes no class accounts for: garbage is collected,
+        once, and the rings whose last view it held close."""
+        if self._collected or not (ORPHANED[0] or self.ledger().residue > MARGIN):
+            return
+        self._collected, ORPHANED[0] = True, 0
+        gc.collect()
+
+    def _finer(self, short: int) -> None:
+        """The running stage's regions no block leases now leave; its next block boundary
+        plans it again in what is left (`WeightResidency._replan`)."""
+        if self.weights.shrink(short):
+            self.shrunk = True
+
+    def _count(self, rung: Rung, freed: int) -> None:
+        modes = self.weights.modes
+        if "memory" not in modes:  # a new attempt cleared its modes
+            self.used.clear()
+        row = self.used.setdefault(rung, [0, 0])
+        row[0] += 1
+        row[1] += freed
+        modes["memory"] = self.summary()
