@@ -1,0 +1,1 @@
+Runtime 0.27.2 is cut from release/0.27. A stage's ring that a view outlives never refuses the next stage. The cursor collects garbage and closes; bytes a live view still holds are left room beside, and the stage plans finer in the same budget. This fixes H3 long_form's second segment on 32 GB cards (`operation_exceeds_device`, run 10562). On TensorD 0.7.3.
