@@ -102,8 +102,8 @@ def test_preparation_descriptor_is_argument_metadata(tmp_path: Path) -> None:
             package_interface.read_bytes(json.dumps(invalid).encode())
     additive = json.loads(encoded)
     additive["entrypoints"][0]["assets"]["kinds"][0]["prepare"]["crop"] = True
-    read = package_interface.read_bytes(json.dumps(additive).encode())
-    assert read["entrypoints"][0]["assets"]["kinds"][0]["prepare"]["max_edge"] == 512
+    with pytest.raises(ConformanceError):  # a known profile admits exactly its grammar
+        package_interface.read_bytes(json.dumps(additive).encode())
     for cap in (0, -1, True, 1.5):
         with pytest.raises(ConformanceError, match="positive"):
             ImagePreparation(max_edge=cap)  # type: ignore[arg-type]

@@ -89,17 +89,20 @@ class ModelSlot(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
         return self.path.rpartition(".")[2]
 
 
-class ImageFit(msgspec.Struct, frozen=True, kw_only=True):
+class ImageFit(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=True):
     profile: Literal["image-fit/1"]
     max_edge: Annotated[int, msgspec.Meta(gt=0)] | None = None
     max_pixels: Annotated[int, msgspec.Meta(gt=0)] | None = None
 
 
-class Trim(msgspec.Struct, frozen=True, kw_only=True):
+_Seconds = Annotated[int, msgspec.Meta(gt=0)] | Annotated[float, msgspec.Meta(gt=0)]
+
+
+class Trim(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=True):
     profile: Literal["video-trim/1", "audio-trim/1"]
     excess: Literal["refuse", "truncate"]
-    min_seconds: Annotated[float, msgspec.Meta(gt=0)] | None = None
-    max_seconds: Annotated[float, msgspec.Meta(gt=0)] | None = None
+    min_seconds: _Seconds | None = None
+    max_seconds: _Seconds | None = None
 
 
 #: Profile -> its grammar and the marker that enforces it. A profile not listed here is a
@@ -665,24 +668,58 @@ def _assets_slot(slot: AssetsSlot, request: Json, source: str, path: str) -> Non
                 _invalid(source, path, "assets MIME types must be distinct and canonical")
             media.add(mime)
         if row.prepare is not msgspec.UNSET:
-            _preparation(row.prepare, source, f"{path}.prepare", row.kind)
+            _preparation(row.prepare, source, f"{path}.prepare", frozenset({row.kind}))
 
 
-def _preparation(value: Json, source: str, path: str, kind: str | None = None) -> None:
-    """A known profile's members and kind; an unknown profile is a newer writer's."""
+def preparation_members(
+    value: Json,
+) -> tuple[type[ImagePreparation | VideoPreparation | AudioPreparation], dict[str, Json]] | None:
+    """A known profile's marker and its grammar members, or None for a newer writer's profile.
+
+    A known profile admits exactly its grammar: an extra member refuses.
+    """
     if not isinstance(value, dict) or not isinstance(value.get("profile"), str):
-        _invalid(source, path, "must be an object naming its profile")
+        raise ConformanceError("must be an object naming its profile", code="preparation")
     known = PREPARATION_PROFILES.get(value["profile"])
     if known is None:
-        return
+        return None
     grammar, marker = known
     try:
         members = msgspec.structs.asdict(msgspec.convert(value, grammar, strict=True))
-        marker(**{key: item for key, item in members.items() if key != "profile"})
-    except (msgspec.ValidationError, ConformanceError, TypeError) as exc:
-        _invalid(source, path, f"is not a valid {value['profile']} preparation: {exc}")
-    if kind is not None and kind != marker.kind:
-        _invalid(source, path, f"{value['profile']} does not prepare {kind} inputs")
+    except msgspec.ValidationError as exc:
+        raise ConformanceError(str(exc), code="preparation") from exc
+    members = {key: item for key, item in members.items() if key != "profile" and item is not None}
+    marker(**members)
+    return marker, members
+
+
+def _preparation(value: Json, source: str, path: str, kinds: frozenset[str]) -> None:
+    """A known profile's members, and that it prepares a kind the declaration carries."""
+    try:
+        known = preparation_members(value)
+    except (ConformanceError, TypeError) as exc:
+        _invalid(source, path, f"is not a valid preparation: {exc}")
+    if known is not None and known[0].kind not in kinds:
+        _invalid(source, path, f"{value['profile']} does not prepare {sorted(kinds)} inputs")
+
+
+def _schema_asset_kinds(value: Json) -> frozenset[str]:
+    """The asset kinds a rendered type reaches through containers, stopping at records."""
+    if not isinstance(value, dict):
+        return frozenset()
+    if isinstance(value.get("asset"), str):
+        return frozenset({value["asset"]})
+    if isinstance(value.get("union"), list):
+        members: list[Json] = value["union"]
+    elif isinstance(value.get("tuple"), list):
+        members = value["tuple"]
+    elif "list" in value:
+        members = [value["list"]]
+    elif isinstance(value.get("map"), dict):
+        members = [value["map"].get("value")]
+    else:
+        return frozenset()
+    return frozenset(kind for member in members for kind in _schema_asset_kinds(member))
 
 
 def _schema(value: Json, source: str, path: str, union_tag_field: str | None = None) -> None:
@@ -749,7 +786,10 @@ def _schema(value: Json, source: str, path: str, union_tag_field: str | None = N
                     _invalid(source, f"{field_path}.asset_bound", "must be an object")
                 if "prepare" in asset_bound:
                     _preparation(
-                        asset_bound["prepare"], source, f"{field_path}.asset_bound.prepare"
+                        asset_bound["prepare"],
+                        source,
+                        f"{field_path}.asset_bound.prepare",
+                        _schema_asset_kinds(field["type"]),
                     )
         return
     if form == "union":

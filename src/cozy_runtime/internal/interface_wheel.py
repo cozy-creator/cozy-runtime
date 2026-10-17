@@ -301,14 +301,15 @@ def _module(module: str, entries: list[tuple[CallableDoc, Invocable]], digest: s
 
 
 def _preparation(declared: object) -> str | None:
-    """A known preparation profile as its marker spelling; an unknown one is dropped."""
-    if not isinstance(declared, dict):
+    """A known preparation profile as its marker spelling, from its grammar members only;
+    an unknown profile is dropped."""
+    if declared is None or declared is msgspec.UNSET:
         return None
-    known = package_interface.PREPARATION_PROFILES.get(declared.get("profile"))  # type: ignore[arg-type]
+    known = package_interface.preparation_members(declared)
     if known is None:
         return None
-    members = {key: value for key, value in declared.items() if key != "profile"}
-    return f"{known[1].__name__}(**{members!r})"
+    marker, members = known
+    return f"{marker.__name__}(**{members!r})"
 
 
 def _declare(declarations: dict[str, tuple[bytes, str]], name: str, source: str) -> None:
