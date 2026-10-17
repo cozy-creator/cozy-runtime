@@ -6,7 +6,9 @@ PTX (cuobjdump). Each needs only the OS's C runtime (readelf, dumpbin): no torch
 no version-specific libpython (Windows' stable-ABI `python3.dll` is the one Python it may name).
 Each loads on every Python given, and a call on a machine without a GPU returns CUDA's error
 rather than crashing. The driver floor equals cozy-platform's (`--platform-floor`, the Rust source
-TensorD checks at startup). Any failure is named, and the run exits 1.
+TensorD checks at startup). Each exports `PyInit_*` alone (nm, dumpbin): an exported libstdc++
+symbol binds process-wide and crashed torch imported after it. With `--torch-python`, each module
+loads before torch in a fresh interpreter. Any failure is named, and the run exits 1.
 """
 
 from __future__ import annotations
@@ -94,11 +96,33 @@ def needed(module: Path) -> list[str]:
     return re.findall(r"\(NEEDED\)\s+Shared library: \[([^\]]+)\]", out)
 
 
+#: A module loaded by path, then torch, in one fresh interpreter.
+BEFORE_TORCH = """
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location(sys.argv[1], sys.argv[2])
+spec.loader.exec_module(importlib.util.module_from_spec(spec))
+import torch
+print(f"{sys.argv[1]} before torch {torch.__version__}: ok")
+"""
+
+
+def exported(module: Path) -> list[str]:
+    """The module's exported (dynamic, defined) symbols."""
+    if module.suffix == ".pyd":
+        out = subprocess.run(["dumpbin", "/exports", str(module)], capture_output=True, text=True)
+        return re.findall(r"^\s+\d+\s+[0-9A-F]+\s+[0-9A-F]{8}\s+(\S+)", out.stdout, re.MULTILINE)
+    out = subprocess.run(
+        ["nm", "-D", "--defined-only", str(module)], capture_output=True, text=True
+    )
+    return [line.split()[-1] for line in out.stdout.splitlines() if line.strip()]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("modules", type=Path, help="the install prefix: <it>/cozy_runtime/_kernels")
     parser.add_argument("--python", action="append", default=[], help="an interpreter to import on")
     parser.add_argument("--platform-floor", type=Path, help="cozy-platform's src/gpu/mod.rs")
+    parser.add_argument("--torch-python", help="an interpreter with torch: each module before it")
     parser.add_argument(
         "--without",
         action="append",
@@ -142,6 +166,19 @@ def main() -> int:
         foreign = [lib for lib in libraries if not SYSTEM.fullmatch(lib)]
         if foreign or not libraries:
             failed.append(f"{name} needs {foreign or 'nothing readable'}")
+        exports = exported(module)
+        if exports != [f"PyInit_{name}"]:
+            failed.append(
+                f"{name} exports {len(exports)} symbols, not PyInit_{name} alone: {exports[:5]}"
+            )
+        if options.torch_python:
+            call = [options.torch_python, "-I", "-c", BEFORE_TORCH, name, str(module)]
+            run = subprocess.run(call, capture_output=True, text=True)
+            print(run.stdout.strip())
+            if run.returncode != 0:
+                failed.append(
+                    f"{name} before torch exits {run.returncode}: {run.stderr.strip()[-400:]}"
+                )
     for python in options.python:
         call = [python, "-I", "-c", CALL, str(package), *options.without]
         run = subprocess.run(call, capture_output=True, text=True)
