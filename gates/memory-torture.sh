@@ -5,13 +5,13 @@
 #   gates/memory-torture.sh <hub> <wheel|-> [card...]
 #
 # <wheel> is the candidate cozy-runtime wheel (a file or https://…#sha256=…), `-` for the Hub's target.
-# Cards (default: all): 8 12 24 32 2x8; `<card>:h3` runs only its H3 cell (and the references). Each rents the first SKU of its row with capacity, runs every cell,
+# Cards (default: all): 8 12 24 32 2x8 4090 (the ref2va_turbo 15 s acceptance card, 10812/10813); `<card>:h3` runs only its H3 cell (and the references). Each rents the first SKU of its row with capacity, runs every cell,
 # confirms each output landed, ends the rental and confirms it is gone. Results: ./memory-torture-<stamp>/.
 set -uo pipefail
 H=$1 W=$2; shift 2
-CARDS=${*:-8 12 24 32 2x8}
+CARDS=${*:-8 12 24 32 2x8 4090}
 declare -A SKUS=([8]="rtx-3070" [12]="rtx-5070 rtx-3080-ti rtx-4070-ti" [24]="rtx-4000-ada rtx-pro-4000 l4"
-  [32]="rtx-pro-4500 rtx-5090" [2x8]="rtx-3070 rtx-5060-ti rtx-4060-ti rtx-3080-ti l4")
+  [32]="rtx-pro-4500 rtx-5090" [2x8]="rtx-3070 rtx-5060-ti rtx-4060-ti rtx-3080-ti l4" [4090]="rtx-4090")
 D=$PWD/memory-torture-$(date -u +%Y%m%dT%H%M%SZ); mkdir -p "$D"; cd "$D" || exit 1
 TAG=$(basename "$D") FAILED=0 M="" FOLLOW=""
 say() { echo "$(date -u +%T) $*" | tee -a summary.txt; }
@@ -115,7 +115,14 @@ cells() {  # the matrix on one machine; $1 = card, $2 = H3 segments
   n1=$(start "$k-pair-qwen" fidika/qwen-image-2/generate_image prompt="a fox in fresh snow, $TAG $k pair" seed=$((r + 8)) megapixels:=1)
   n2=$(start "$k-pair-lm" fidika/character-describer/describe_character --asset "image=$b")
   finish "$k-pair-qwen" "$n1"; finish "$k-pair-lm" "$n2"
+  h3ref "$k" "$b" "$r"
   h3 "$k" "$segs" "$a" "$b" "$r"
+}
+
+h3ref() {  # H3 ref2va_turbo, one 15 s clip from one character image (runs 10812/10813 on a 4090)
+  local k=$1 a=$2 r=$3
+  printf '{"prompt": "The woman in <Picture 1> walks through a sunlit park in autumn, leaves falling, she picks up a red leaf and smiles, %s %s.\n\nnon_diegetic_music:\nN/A", "seed": %d, "duration_s": 15}\n' "$TAG" "$k" $((r + 40)) > "h3ref-$k.json"
+  cell "$k-h3ref" fidika/minimax-h3/ref2va_turbo --input "h3ref-$k.json" --asset "$a"
 }
 
 h3() {  # H3 long_form: <segs> × 15 s; the last segment is guided by a video reference (ref2va)
@@ -178,8 +185,10 @@ PY
   local r=$RANDOM segs=2 gpus2=""
   [ "$card" = 32 ] && segs=3
   [ "$card" = 2x8 ] && gpus2=2
-  if [ "$card" = 2x8 ] || [ "$only" = h3 ]; then
-    references "$card" "$r"; h3 "$card" "$segs" "$(image "$card-klein-a")" "$(image "$card-klein-b")" "$r" $gpus2
+  if [ "$card" = 2x8 ] || [ "$card" = 4090 ] || [ "$only" = h3 ]; then
+    references "$card" "$r"
+    [ "$card" = 2x8 ] || h3ref "$card" "$(image "$card-klein-b")" "$r"
+    [ "$card" = 4090 ] || h3 "$card" "$segs" "$(image "$card-klein-a")" "$(image "$card-klein-b")" "$r" $gpus2
   else
     cells "$card" "$segs"
   fi
