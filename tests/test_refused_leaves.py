@@ -181,9 +181,18 @@ def test_a_run_names_each_components_gemm_kernel_and_each_fallback(tmp_path: Pat
     def emitted() -> list[tuple[object, ...]]:
         record = Attempt("gemm", tmp_path, 0)
         Executor._emit_gemm(record, executor)
+        rows = record.ring.rows()
+        confessions = [row for row in rows if row["kind"] == "confession"]
+        warnings = [row for row in rows if row["kind"] == "log"]
+        # Each fallback is also one warning line, its facts as fields.
+        assert [(w["name"], w["value"], w["fields"]) for w in warnings] == [
+            ("a GEMM served below its lane", "warn", {**c["fields"], "kernel": c["value"]})  # type: ignore[dict-item]
+            for c in confessions
+            if c["name"] == "gemm.fallback"
+        ]
         return [
             (row["name"], row["value"], *sorted(row["fields"].items()))  # type: ignore[union-attr]
-            for row in record.ring.rows()
+            for row in confessions
         ]
 
     int8_row = (("component", "klein/transformer"), ("format", "int8"), ("leaf", INT8_CONVROT))
