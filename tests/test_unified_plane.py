@@ -27,7 +27,7 @@ DEVICES = (
     + (["mps"] if torch.backends.mps.is_available() else [])
     + (["cuda"] if torch.cuda.is_available() else [])
 )
-INTEGRATED = torch.cuda.is_available() and mapped_region.supported(0)
+INTEGRATED = torch.cuda.is_available() and mapped_region.mode(0) is not None
 
 #: `tiny` is stored inline in the header; every other tensor is an object
 VALUES = {

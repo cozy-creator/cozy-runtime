@@ -276,7 +276,7 @@ class UnifiedPlane:
         self.counts = {"misses": 0, "evictions": 0, "evicted_bytes": 0, "fills": 0}
         self.fill_bytes = self.fill_ns = 0
         #: an integrated CUDA GPU reads regions in place from the mapped object files
-        self.in_place = device.type == "cuda" and mapped_region.supported(device.index or 0)
+        self.in_place = mapped_region.mode(device.index or 0) if device.type == "cuda" else None
         #: of `committed`, the bytes read in place: no torch allocation holds them
         self.mapped = 0
         #: whether a region's bytes are written (a LoRA baked into them): it gets its own copy
@@ -477,7 +477,9 @@ class UnifiedPlane:
                     ws.source.read(row, within, into[at : at + row["len"]])
 
             index = self.device.index or 0
-            region.tensor = mapped_region.region(torch, index, region.span, pieces, write)
+            region.tensor = mapped_region.region(
+                torch, index, region.span, pieces, write, self.in_place == "registered"
+            )
             region.mapped = True
             self.mapped += region.span
         else:
