@@ -43,7 +43,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from typing import Any
 
-from cozy_runtime.author._model import PLACED, RELEASERS, WARNINGS
+from cozy_runtime.author._model import LANDED, PLACED, RELEASERS, WARNINGS, Building
 from cozy_runtime.author.kernels import KernelsUnavailable, Launch, Plan, TritonKernels
 from cozy_runtime.graphs import BYPASS, ROOM, capture, say
 from cozy_runtime.lm import _kernels
@@ -439,26 +439,6 @@ def _transformers(
             logits_processor=LogitsProcessorList(processors),
         )
     return out[:, prompt:]
-
-
-def _into(mine: Any, value: Any) -> Any:
-    """`value` (a cache layer's field) copied into `mine` in place where they match, so a graph
-    that reads `mine` reads it; else `value` itself."""
-    if isinstance(value, torch.Tensor):
-        same = isinstance(mine, torch.Tensor) and (mine.shape, mine.dtype, mine.device) == (
-            value.shape,
-            value.dtype,
-            value.device,
-        )
-        return mine.copy_(value) if same else value
-    if isinstance(value, list):
-        if isinstance(mine, list) and len(mine) == len(value):
-            return [_into(a, b) for a, b in zip(mine, value, strict=True)]
-        return value
-    if isinstance(value, dict):
-        held = mine if isinstance(mine, dict) else {}
-        return {key: _into(held.get(key), item) for key, item in value.items()}
-    return value
 
 
 def window(length: int, capacity: int) -> int:
@@ -914,6 +894,9 @@ class _Engine:
         #: captures recorded in this engine's life and their seconds, steps run eagerly
         self.captured = [0, 0.0]
         self.eager = 0
+        #: `LANDED` when a capture met a kernel still building (none records until one lands),
+        #: and when the graphs were last started over
+        self.building, self.landed = -1, LANDED[0]
         self.driver: int | None = None
         self.draft: Any = None
         self.slots: list[_Row | None] = []
@@ -1479,8 +1462,9 @@ class _Engine:
     def _steps(self) -> None:
         """Steps until a row is done or a call waits to join, queued `LAG` ahead of the host."""
         cuda = self.cache_device.type == "cuda"
-        if cuda and self.room is not None and self.where != self.layout:
-            self.graphs, self.need, self.layout = {}, {}, self.where
+        if cuda and (self.where != self.layout or self.landed != LANDED[0]):
+            # The weights moved, or a kernel landed (the graphs recorded its stand-in).
+            self.graphs, self.need, self.layout, self.landed = {}, {}, self.where, LANDED[0]
         if cuda and self.pool is None:
             self.pool, self.side = torch.cuda.graph_pool_handle(), torch.cuda.Stream()
         queued: deque[Any] = deque()
@@ -1507,7 +1491,7 @@ class _Engine:
         drafted = self.draft is not None
         key = (size, self.cache.window, drafted)
         graph = self.graphs.get(key)
-        if graph is None and cuda and not self.failed:
+        if graph is None and cuda and not self.failed and self.building != LANDED[0]:
             need = self.need.get((size, drafted))
             if need is None:
                 self._measured(size)
@@ -1517,10 +1501,13 @@ class _Engine:
                 self.failed = f"no room: {free >> 20} MiB free, a step takes {need >> 20} MiB"
             else:
                 capturing = time.perf_counter()
-                graph, why = capture(lambda: self._advance(size), self.pool, self.side)
+                try:
+                    graph, why = capture(lambda: self._advance(size), self.pool, self.side)
+                except Building:  # eager until a kernel lands; the aborted capture spent its pool
+                    graph, why, self.pool, self.building = None, "", None, LANDED[0]
                 self.captured[0] += 1
                 self.captured[1] += time.perf_counter() - capturing
-                if graph is None:
+                if graph is None and why:
                     self._capture_failed(why)
                 else:
                     self.graphs[key] = graph
