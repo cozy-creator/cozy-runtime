@@ -5109,6 +5109,12 @@ def main(argv: list[str] | None = None) -> int:
             return int(Exit.structural)
     elif not args.socket:
         parser.error("--socket is required for rank 0")
+    if not proctree.PARENT_DEATH_SURVIVES_EXEC:
+        # The trampoline's exec ended its guard (darwin): this process watches its parent.
+        expected = os.getppid()
+        proctree.arm_parent_death()
+        if os.getppid() != expected:
+            return int(Exit.structural)
 
     _capture_seal()
     _remember_distributions()

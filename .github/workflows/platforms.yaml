@@ -211,7 +211,7 @@ jobs:
 
       - name: Tests
         run: |
-          .venv/bin/python -m pytest -q -rs -s --real-gpu tests/test_unified_plane.py tests/test_mps.py \
+          .venv/bin/python -m pytest -q -rs -s --real-gpu tests/test_unified_plane.py tests/test_mps.py tests/test_parent_watch.py \
             ${{ !inputs.sdxl && '-k "not sdxl"' || '' }}
 
       - uses: actions/upload-artifact@v4
