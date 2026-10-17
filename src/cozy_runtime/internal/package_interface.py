@@ -21,6 +21,7 @@ from cozy_runtime.author import ConformanceError, Surface, WeightsOutput
 from cozy_runtime.author._markers import (
     AUDIO_PREPARATION_PROFILE,
     IMAGE_PREPARATION_PROFILE,
+    VIDEO_FIT_PROFILE,
     VIDEO_PREPARATION_PROFILE,
     AudioPreparation,
     ImagePreparation,
@@ -105,6 +106,23 @@ class Trim(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=True
     max_seconds: _Seconds | None = None
 
 
+_Cap = Annotated[int, msgspec.Meta(gt=0)]
+
+
+class VideoFit(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=True):
+    """`video-trim/1` and the most of a video the package reads: client hints, never a refusal."""
+
+    profile: Literal["video-fit/1"]
+    excess: Literal["refuse", "truncate"]
+    min_seconds: _Seconds | None = None
+    max_seconds: _Seconds | None = None
+    max_short_edge: _Cap | None = None
+    max_long_edge: _Cap | None = None
+    max_pixels: _Cap | None = None
+    max_fps: _Seconds | None = None
+    audio: bool | Annotated[str, msgspec.Meta(pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")] | None = None
+
+
 #: Profile -> its grammar and the marker that enforces it. A profile not listed here is a
 #: newer writer's, and readers ignore it.
 PREPARATION_PROFILES: dict[
@@ -112,6 +130,7 @@ PREPARATION_PROFILES: dict[
 ] = {
     IMAGE_PREPARATION_PROFILE: (ImageFit, ImagePreparation),
     VIDEO_PREPARATION_PROFILE: (Trim, VideoPreparation),
+    VIDEO_FIT_PROFILE: (VideoFit, VideoPreparation),
     AUDIO_PREPARATION_PROFILE: (Trim, AudioPreparation),
 }
 
@@ -689,7 +708,10 @@ def preparation_members(
     except msgspec.ValidationError as exc:
         raise ConformanceError(str(exc), code="preparation") from exc
     members = {key: item for key, item in members.items() if key != "profile" and item is not None}
-    marker(**members)
+    if marker(**members).descriptor()["profile"] != value["profile"]:
+        raise ConformanceError(
+            f"{value['profile']} declares none of its own members", code="preparation"
+        )
     return marker, members
 
 

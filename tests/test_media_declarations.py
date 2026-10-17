@@ -6,11 +6,12 @@ import sys
 import time
 from pathlib import Path
 
+import msgspec
 import pytest
 
 from cozy_runtime.author import ConformanceError, Invocation, attempt, fakes
 from cozy_runtime.author._decode import DEFAULT_DECODE_LIMITS, host_decode_limits
-from cozy_runtime.internal import package_interface, static_interface
+from cozy_runtime.internal import interface_wheel, package_interface, static_interface
 from cozy_runtime.internal.discovery import discover
 from media_sources import mp4, steady
 
@@ -199,3 +200,108 @@ def test_declared_bounds_of_any_size_describe_and_undeclared_kinds_publish_the_d
     assert DEFAULT_DECODE_LIMITS.max_decoded_bytes == 2 << 30
     assert fakes.fake_attempt("host").media._budget.limit == host_decode_limits().max_decoded_bytes
     assert host_decode_limits().max_decoded_bytes >= 2 << 30
+
+
+FIT = """
+from cozy_runtime.author import AssetLimits, Assets
+Fit = VideoPreparation(
+    max_seconds=15, excess="truncate", max_short_edge=768, max_pixels=768 * 1344, max_fps=24,
+    audio=False,
+)
+Clips = Annotated[
+    Assets[Annotated[VideoAsset, AssetBound(max_decoded_bytes=1 << 30), Fit]],
+    AssetLimits(videos=1),
+]
+class Reference(msgspec.Struct):
+    use_audio: bool = False
+    video: Annotated[
+        VideoAsset,
+        AssetBound(max_bytes=1 << 30, max_decoded_bytes=1 << 30),
+        VideoPreparation(
+            max_seconds=15, excess="truncate", max_short_edge=768, max_fps=24, audio="use_audio"
+        ),
+    ] | None = None
+@invocable
+async def render(ctx: Context, *, reference: Reference, clips: Clips) -> Done:
+    return Done(str(reference.video.read().duration))
+app.entrypoint(render, accelerator=False)
+"""
+
+
+def test_a_video_fit_describes_its_caps_as_hints_and_round_trips(tmp_path: Path) -> None:
+    """Upload trimming (owner ruling): a video's fit is the most of it the package reads, so a
+    client may reduce a larger source before it uploads. Describe and both static readers write
+    `video-fit/1` with every cap; the caller wheel reads them back as the same marker; a source
+    larger than the fit runs, since a fit never refuses."""
+    root = _package(tmp_path / "pkg", "video_fit", FIT)
+    imported = package_interface.build(discover(root))
+    raw = package_interface.canonical_bytes(imported)
+    assert raw == package_interface.canonical_bytes(static_interface.build(root))
+    entry = imported["entrypoints"][0]
+    assert entry["assets"]["kinds"][0]["prepare"] == {
+        "profile": "video-fit/1",
+        "excess": "truncate",
+        "max_seconds": 15,
+        "max_short_edge": 768,
+        "max_pixels": 1032192,
+        "max_fps": 24,
+        "audio": False,
+    }
+    reference = next(f for f in entry["request"]["fields"] if f["name"] == "reference")
+    video = next(f for f in reference["type"]["fields"] if f["name"] == "video")
+    assert video["asset_bound"]["prepare"] == {
+        "profile": "video-fit/1",
+        "excess": "truncate",
+        "max_seconds": 15,
+        "max_short_edge": 768,
+        "max_fps": 24,
+        "audio": "use_audio",
+    }
+    package_interface.read_bytes(raw)
+    code = interface_wheel.generate(raw)["video_fit/__init__.py"]
+    assert (
+        b"VideoPreparation(**{'excess': 'truncate', 'max_seconds': 15, 'max_short_edge': 768, "
+        b"'max_fps': 24, 'audio': 'use_audio'})" in code
+    )
+
+    starts, end = steady(30, 60)
+    grant = fakes.granted_input(
+        mp4(tmp_path / "clip.mp4", size=(1280, 720), starts=starts, end=end),
+        input_id="reference.video",
+    )
+    app = sys.modules["video_fit"].app
+    spool, deadline = tmp_path / "spool", time.monotonic() + 60
+    result, outcome, _ = attempt(
+        app.get("render"),
+        {"reference": {"video": grant.digest}, "clips": []},
+        Invocation("fit", spool, deadline, assets={"reference.video": grant}),
+    )
+    assert outcome.terminal == "succeeded", outcome
+    assert result is not None and result.result.seconds == "2"
+
+    def refused(prepare: dict[str, object]) -> None:
+        document = msgspec.json.decode(raw)
+        document["entrypoints"][0]["assets"]["kinds"][0]["prepare"] = prepare
+        with pytest.raises(ConformanceError):
+            package_interface.read_bytes(msgspec.json.encode(document))
+
+    fit = {"profile": "video-fit/1", "excess": "refuse"}
+    refused(fit)  # a fit with no cap is a trim, spelled video-trim/1
+    refused({**fit, "max_fps": 0})
+    refused({**fit, "max_short_edge": 1.5})
+    refused({**fit, "audio": "use audio"})
+    refused({**fit, "max_fps": 24, "start": 1})
+    refused({"profile": "video-trim/1", "excess": "refuse", "max_seconds": 1, "max_fps": 24})
+
+
+def test_a_duration_alone_still_writes_video_trim(tmp_path: Path) -> None:
+    """Every declaration written before the fit describes byte for byte as it did."""
+    root = _package(tmp_path / "pkg", "trim_only", DIRECT)
+    clip = next(
+        f
+        for f in package_interface.build(discover(root))["entrypoints"][0]["request"]["fields"]
+        if f["name"] == "clip"
+    )
+    assert msgspec.json.encode(clip["asset_bound"]["prepare"]) == (
+        b'{"profile":"video-trim/1","excess":"truncate","max_seconds":1}'
+    )

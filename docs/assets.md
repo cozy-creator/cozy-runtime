@@ -77,6 +77,14 @@ async def render(ctx: Context, *, shot: Shot, refs: References) -> Done:
 excess="refuse"|"truncate")` and `AudioPreparation(...)` annotate one field or an `Assets`
 argument, where each applies to its kind.
 
+- `VideoPreparation(max_short_edge=, max_long_edge=, max_pixels=, max_fps=, audio=)` also
+  declares the video's fit: the most of it the package reads. `audio` is `False` when the
+  package never reads the input's audio, or the name of a boolean member of the same record
+  that says whether it does (`"use_audio"`). A fit is a hint, never a refusal: a client may
+  reduce a larger source to it before it uploads (the cozy CLI does, with ffmpeg), so the
+  package's own sizing must give the same result for an input already within it (resample
+  to a fixed frame rate and size; never halve).
+
 - Images keep their aspect ratio and are never upscaled. Pillow decodes, applies EXIF
   orientation (including mirrors) and resamples with Lanczos.
 - At hydration the runtime probes each prepared video or audio input. Shorter than
@@ -147,7 +155,9 @@ forwardable but reads refuse `decoded_bound_missing`.
 
 An `Assets` kind row carries `prepare`, and a field's `asset_bound` carries `prepare`,
 each with one profile: `image-fit/1` `{max_edge, max_pixels}`, `video-trim/1` and
-`audio-trim/1` `{min_seconds, max_seconds, excess}`. A known profile admits exactly those
+`audio-trim/1` `{min_seconds, max_seconds, excess}`, and `video-fit/1`, `video-trim/1`'s
+members with `{max_short_edge, max_long_edge, max_pixels, max_fps, audio}`, written only when
+a video declares a fit. A known profile admits exactly those
 members and must prepare a kind its declaration carries; readers ignore a profile they do
 not know. Preparations annotate inputs (fields, invocable parameters, `Assets`); a result
 declaring one refuses at describe.
