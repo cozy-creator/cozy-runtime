@@ -207,6 +207,12 @@ def same(a: list[Any], b: list[Any]) -> bool:
     )
 
 
+def close(a: list[Any], b: list[Any]) -> None:
+    """The same output to fp16 rounding: a linear cut into rows runs other GEMM kernels."""
+    for x, y in zip(a, b, strict=True):
+        torch.testing.assert_close(x, y, atol=2**-6, rtol=2**-7)
+
+
 def tight(model: Any) -> int:
     """The floor at a window of two, plus one resident block: the rest must stream."""
     layout: weight_policy.Layout = model.residency.components["stack"].layout
@@ -1060,7 +1066,7 @@ def test_an_op_with_no_room_left_moves_the_tensors_the_process_holds_to_host(car
         facts = weights.facts()
     finally:
         weights.set_cap(-1)
-    assert same(reference, capped)
+    close(reference, capped)
     assert facts.spilled_bytes - moved >= 128 << 20
     assert all(t.is_cuda and bool((t == i).all()) for i, t in enumerate(held))
     # cudaMalloc's alignment holds in host memory too: a moved cuBLASLt workspace off it is
@@ -1091,31 +1097,34 @@ def fill_card(weights: Weights) -> list[Any]:
     return held
 
 
+def host_room(monkeypatch: pytest.MonkeyPatch, room: int) -> None:
+    """What the host gives tensors leaving the device (`Weights.lockable`) held to `room`, as
+    a container limited that tightly reads it: the margin left to the rest of the host grows to
+    all but `room` of what it has."""
+    available = proctree.host_memory().available
+    if available > room + weight_policy.HOST_MARGIN:
+        monkeypatch.setattr(weight_policy, "HOST_MARGIN", available - room)
+
+
 @on_card
 @pytest.mark.parametrize("host", ["room", "full"])
 def test_a_card_the_packages_tensors_fill_runs_its_stage_through_host_and_disk(
-    card: Any, host: str
+    card: Any, host: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """cr-203 U3. The package's tensors fill the card, and a stage then needs room for its
-    weights and activations: they leave the device and the stage computes the same bits.
-    With room on the host they are mapped there in place, up to what it can give beside its
-    margin (no longer half of it). With the host full to its margin, those no op touched
-    since the stage began go to disk, their device bytes released, and each comes back with
-    its values when an op reads it. A copy an in-place op takes under that pressure is in
-    host memory."""
+    weights and activations: they leave the device and the stage computes the same output.
+    With room on the host they are mapped there in place. With the host's room down to half
+    a GiB, those no op touched since the stage began go to disk, their device bytes released,
+    and each comes back with its values when an op reads it. A copy an in-place op takes under
+    that pressure is in host memory."""
     weights = card.weights
     model = load(weights, card.checkpoint, f"fill-{host}")
     x = torch.randn(1 << 16, HIDDEN, device="cuda", dtype=torch.float16)  # 256 MiB
     with weights.recovering():
         reference = run(model, x, passes=1)
     model.residency.unpark()
-    ballast = None
     if host == "full":
-        available = proctree.host_memory().available
-        if not 0 < available < 64 << 30:
-            pytest.skip(f"{available} B on the host: too much to fill for a test")
-        free = available - weight_policy.HOST_MARGIN - (512 << 20)
-        ballast = torch.ones(max(free, 0), dtype=torch.uint8)  # its pages are the host's
+        host_room(monkeypatch, 512 << 20)
     held = fill_card(weights)
     before = list(spill.TOTALS)
     with weights.recovering():
@@ -1124,8 +1133,8 @@ def test_a_card_the_packages_tensors_fill_runs_its_stage_through_host_and_disk(
         assert spill.TOTALS[tier] - before[tier] >= 256 << 20, spill.summary(before)
         assert spill.keep(x).device.type == "cpu"
         assert all(bool((t == i).all()) for i, t in enumerate(held)), "each one's own values"
-        assert same(reference, got)  # in the mode: what left the device comes back to be read
-    del ballast, held, got
+        close(reference, got)  # in the mode: what left the device comes back to be read
+    del held, got
     gc.collect()
     weights.restore_spilled()
     spill.release(torch)
@@ -1133,19 +1142,16 @@ def test_a_card_the_packages_tensors_fill_runs_its_stage_through_host_and_disk(
 
 
 @on_card
-def test_a_cast_over_half_the_hosts_room_lands_in_host_memory(card: Any) -> None:
+def test_a_cast_over_half_the_hosts_room_lands_in_host_memory(
+    card: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Run 10861, H3 ref2va_turbo 15 s on a 4090: a 12.76 GB `aten._to_copy` had no room on
     the card, and its result was refused host memory at half of what the host could give. A
     cast whose result is larger than that half, under a cap that leaves it no device room, now
-    runs in bands into host memory, up to what the host has beside its margin."""
+    runs in bands into host memory."""
     weights = card.weights
     x = torch.randn(3 << 29, device="cuda", dtype=torch.float16)  # 3 GiB; cast: 6 GiB
-    result = 2 * x.nbytes
-    available = proctree.host_memory().available
-    room = result + weight_policy.HOST_MARGIN + (1536 << 20)  # half of it is < `result`
-    if not room <= available < 64 << 30:
-        pytest.skip(f"{available} B on the host: not the room this cast is measured against")
-    ballast = torch.ones(available - room, dtype=torch.uint8)  # its pages are the host's
+    host_room(monkeypatch, 2 * x.nbytes + (512 << 20))  # half of it is less than the result
     weights.measure_context()
     weights.set_cap(max(weights.context_bytes, 0) + torch.cuda.memory_reserved() + (1 << 30))
     try:
@@ -1157,7 +1163,7 @@ def test_a_cast_over_half_the_hosts_room_lands_in_host_memory(card: Any) -> None
         assert "host memory" in weights.modes.get("bands", ""), weights.modes
     finally:
         weights.set_cap(-1)
-    del y, ballast
+    del y
     gc.collect()
     spill.release(torch)
 
