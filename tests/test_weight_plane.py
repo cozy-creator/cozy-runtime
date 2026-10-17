@@ -895,6 +895,48 @@ def test_a_map_the_device_refuses_unmaps_idle_weights_and_the_stage_runs(
 
 
 @on_card
+@pytest.mark.parametrize("holder", ["garbage", "live"])
+def test_a_ring_a_view_outlives_never_refuses_the_next_stage(card: Any, holder: str) -> None:
+    """Run 10562, H3's second segment on 32 GB: a view into the stage's ring outlived it (frames
+    of a block that failed and ran again hold one). The cursor stayed open under it, its ring
+    mapped, and the next stage's ring found the plane's budget taken: "need 813694976 bytes,
+    283700736 free; evicting lower priorities is not enough, blocked by []", refused as the
+    stage's working set. Garbage is collected and the ring goes; a view still in use leaves
+    the next stage what remains of the same budget. Either way: no refusal, the same bits."""
+    weights = card.weights
+    model = load(weights, card.checkpoint, f"ring-{holder}")
+    layout: weight_policy.Layout = model.residency.components["stack"].layout
+    x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
+    weights.set_budget(1 << 30)
+    expected = run(model, x)
+    model.residency.unpark()
+    budget = tight(model) + 2 * layout.largest  # three resident blocks and a ring of two
+    weights.set_budget(budget)
+    frames: dict[Any, Any] = {}
+    frames["cycle"] = frames
+    grabs = [
+        block.proj.register_forward_pre_hook(lambda m, _, f=frames: f.__setitem__(m, m.weight))
+        for block in model.stack.blocks
+    ]
+    gc.disable()
+    try:
+        first = run(model, x)  # its order learned, then streamed
+        for grab in grabs:
+            grab.remove()
+        assert weights.facts().streamed["stack"].resident_blocks < BLOCKS
+        if holder == "garbage":
+            del frames
+        model.residency.unpark()
+        second = run(model, x)
+    finally:
+        gc.enable()
+    assert not model.residency.refusals, model.residency.refusals
+    assert weights.applied == budget
+    assert same(expected, first)
+    assert same(expected, second)
+
+
+@on_card
 def test_a_process_cap_holds_torch_and_the_plane_inside_it(card: Any) -> None:
     """The owner's cap bounds the whole process: its CUDA context, torch's reserved bytes and
     the plane's maps. Activations the plan did not count are an out-of-memory torch's
