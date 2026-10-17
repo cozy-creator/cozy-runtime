@@ -1,11 +1,11 @@
 [project]
 name = "cozy-kernels"
 # Released with each Runtime minor; Runtime depends on `cozy-kernels==<minor>.*`.
-version = "0.27.0"
+version = "0.1.0"
 description = "Cozy's prebuilt CUDA kernels: one wheel per OS and CPU, every GPU target inside"
 # The GEMMs derive from comfy-kitchen, vLLM and SGLang (Apache-2.0; comfy-kitchen's NOTICE
-# rides) and build on CUTLASS (BSD-3-Clause).
-license-files = ["LICENSE", "NOTICE", "LICENSE-cutlass"]
+# rides); CUTLASS and FlashAttention-3 are BSD-3-Clause.
+license-files = ["LICENSE", "NOTICE", "LICENSE-cutlass", "LICENSE-flash-attention"]
 requires-python = ">=3.12"
 
 [build-system]

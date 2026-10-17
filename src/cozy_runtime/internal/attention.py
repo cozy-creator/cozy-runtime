@@ -23,10 +23,11 @@ from collections import deque
 from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
+from functools import partial
 from importlib import import_module, util
 from pathlib import Path
 from types import ModuleType
-from typing import Any
+from typing import Any, cast
 
 import msgspec
 
@@ -44,11 +45,14 @@ from cozy_runtime.internal import (
     kernel_cache,
     kernel_compile,
     kernel_sources,
+    prebuilt,
     producers,
+    verify,
 )
 from cozy_runtime.internal import attention_upstream as upstream
 from cozy_runtime.internal.attention_ulysses import Local
 from cozy_runtime.internal.encoding import DeviceFacts
+from cozy_runtime.internal.encoding.formats import Tensor
 
 # Tensors, torch modules and Diffusers' registry, backend members and processors are `Any`:
 # neither torch nor diffusers is installed in the check venv.
@@ -459,37 +463,52 @@ def _import(candidate: Candidate) -> ModuleType:
 
 
 def _launch(ready: Ready, device: DeviceFacts) -> None:
-    """One small call through a compiled kernel: one whose first launch raises is not served.
-    Not an accuracy check. Torch's own backends need none; Sol launches only inside its
+    """`verify_op` for a compiled kernel: each (head dim, dtype) it serves against attention in
+    float64 on this card, kept per machine by its build's key (`verify`). One that fails, or
+    whose probe raises, is not served. Torch's own backends need none; Sol runs only inside its
     model's layout."""
-    if not ready.candidate.artifact or ready.name in attention_sol.NAMES or device.kind != "cuda":
+    candidate = ready.candidate
+    if not candidate.artifact or ready.name in attention_sol.NAMES or device.kind != "cuda":
+        return
+    pairs = [(d, n) for d in (64, 128) for n in ("bfloat16", "float16") if _admits(candidate, n, d)]
+    if not pairs:
         return
     import torch
     from diffusers.models.attention_dispatch import dispatch_attention_fn
 
-    dims = ready.candidate.head_dims or frozenset({128})
-    dim = 128 if 128 in dims else min(dims)
-    dtype = (
-        torch.float16
-        if "bfloat16" not in (ready.candidate.dtypes or {"bfloat16"})
-        else (torch.bfloat16)
-    )
-    target = torch.device("cuda", device.index)
-    try:
-        with torch.no_grad(), torch.cuda.device(target):
-            q, k, v = (torch.randn(1, 256, 2, dim, device=target, dtype=dtype) for _ in range(3))
-            out = dispatch_attention_fn(q, k, v, backend=ready.member)
-            out = out[0] if isinstance(out, tuple) else out
-            torch.cuda.synchronize(target)
-    except Exception as exc:
+    def call(q: Tensor, k: Tensor, v: Tensor, causal: bool) -> Tensor:
+        out: object = dispatch_attention_fn(q, k, v, backend=ready.member)
+        return out[0] if isinstance(out, tuple) else out
+
+    probe = partial(prebuilt.attention_probe, torch, device.index, call, candidate.exact, pairs,
+                    False)  # fmt: skip
+    key = (ready.artifact or {}).get("key", "")
+    verdict = verify.verified(f"attention-{candidate.name}", key, device.sm, probe)
+    if not verdict.ok:
         raise AttentionRefusal(
-            "attention_kernel_launch_failed",
-            f"{ready.name} did not launch on {device.name}: {type(exc).__name__}: {exc}"[:600],
-        ) from exc
-    if tuple(out.shape) != tuple(q.shape):
-        raise AttentionRefusal(
-            "attention_kernel_launch_failed", f"{ready.name} returned {tuple(out.shape)}"
+            "attention_kernel_failed_verification",
+            f"{ready.name} on {device.name}: {verdict.detail}"[:600],
         )
+
+
+def _prebuilt_fa3(candidate: Candidate, device: DeviceFacts) -> Ready | None:
+    """FlashAttention-3 from the cozy-kernels wheel once it verifies on this Hopper card; a
+    failure is the run's one warning for it, and the local build is tried next."""
+    if candidate.name != "flash-attn3" or device.kind != "cuda" or device.sm != 90:
+        return None
+    import torch
+
+    kernel, why = prebuilt.fa3(torch, device.index, device.sm)
+    if kernel is None:
+        if not prebuilt.ABSENT:
+            _STATES[f"{candidate.name} prebuilt"] = kernel_compile.State(
+                "cozy-kernels", "failed", detail=why
+            )
+        return None
+    digest = prebuilt.artifact("_fa3").partition(":")[2][:16]
+    upstream.bind_fa3(kernel, f"prebuilt {digest}")
+    _STATES[candidate.name] = kernel_compile.State("cozy-kernels", "ready")
+    return Ready(candidate, _member(candidate), {"artifact": "cozy-kernels", "key": digest})
 
 
 def _compile_dependencies(
@@ -536,6 +555,10 @@ def _resolve(candidate: Candidate, device: DeviceFacts, wait: bool = True) -> Re
         ready = Ready(candidate, _member(candidate), base.artifact)
         _READY[(candidate.name, device)] = ready
         return ready
+    prebuilt_ready = _prebuilt_fa3(candidate, device)
+    if prebuilt_ready is not None:
+        _READY[(candidate.name, device)] = prebuilt_ready
+        return prebuilt_ready
     artifact: dict[str, str] | None
     if candidate.dense:
         dense = BY_NAME[candidate.dense]
@@ -564,7 +587,9 @@ def _resolve(candidate: Candidate, device: DeviceFacts, wait: bool = True) -> Re
                     f"{candidate.name}: Kitchen dense INT8 is unavailable",
                 )
         if candidate.local in (upstream.FA3, upstream.FA3_FP8):
-            upstream.bind_fa3(module, (artifact or {}).get("key", "environment"))
+            upstream.bind_fa3(
+                cast("upstream.FlashAttn3", module), (artifact or {}).get("key", "environment")
+            )
     if candidate.name in {"sol-attn", attention_sage2_fixed.SOL_NAME}:
         _sol_route(device)
         if device.kind == "cuda":

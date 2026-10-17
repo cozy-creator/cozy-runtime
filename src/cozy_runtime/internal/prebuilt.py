@@ -1,5 +1,6 @@
-"""The 8-bit linears from the prebuilt `cozy_kernels._gemm`: one wheel per OS and CPU with every
-card's cubins inside (`kernels/`), verified on the device before they serve (`verify`).
+"""The prebuilt kernels of the `cozy_kernels` wheel: one wheel per OS and CPU with every card's
+cubins inside (`kernels/`), each verified on the device before it serves (`verify`). `_gemm` is
+the 8-bit linears; `_fa3` is FlashAttention-3's Hopper forward (`FlashAttention3`).
 
 `Prebuilt` answers the six calls of the op a machine can compile (`int8_op/op.cpp`):
 `*_linear` quantizes, multiplies and applies both scales and the bias (int8's few rows in one
@@ -13,7 +14,7 @@ cuBLASLt's by design. `torch` is the torch module: this module imports no torch.
 from __future__ import annotations
 
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from functools import partial
 from importlib import metadata
@@ -28,11 +29,20 @@ try:
     ABSENT = ""
 except ImportError as absent:  # no cozy-kernels wheel for this OS and CPU
     ABSENT = f"no cozy-kernels wheel is installed ({absent})"
+try:
+    from cozy_kernels import _fa3
+
+    NO_FA3 = ""
+except ImportError as absent:  # Linux aarch64's wheel carries no FA3 (cr-200)
+    NO_FA3 = f"the cozy-kernels wheel carries no FlashAttention-3 ({absent})"
 
 #: The verdicts' kernel names, one per format: each verifies on its own.
 KERNELS = {"int8": "cozy-kernels-int8", "fp8": "cozy-kernels-fp8"}
 #: The probe's budget for the relative L2 error against the exact law (the op tests' bound).
 BUDGET = 1e-2
+#: Attention's, against fp32 attention: an exact kernel's bf16 output, and a quantized one's
+#: (8 or 4 bits): far below the O(1) of garbage, above the measured quantization error.
+ATTENTION_BUDGET = {True: 2e-2, False: 0.25}
 _SAID: set[str] = set()
 
 
@@ -293,13 +303,13 @@ def _stride(t: Tensor | None) -> int:
     return 0 if t is None else int(t.stride(0))
 
 
-def artifact() -> str:
-    """The installed `_gemm` module's digest, as its wheel's RECORD has it: nothing is hashed."""
+def artifact(module: str = "_gemm") -> str:
+    """An installed module's digest, as its wheel's RECORD has it: nothing is hashed."""
     try:
         files = metadata.distribution("cozy-kernels").files or []
     except metadata.PackageNotFoundError:
         return ""
-    found = next((f for f in files if f.name.startswith("_gemm.") and f.hash), None)
+    found = next((f for f in files if f.name.startswith(f"{module}.") and f.hash), None)
     return f"{found.hash.mode}:{found.hash.value}" if found and found.hash else ""
 
 
@@ -417,3 +427,92 @@ def _prologue(
     y = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + eps)
     y = y * (1 + modulation[entry]) + shift[entry]
     return 0.5 * y * (1 + torch.tanh(0.79788456 * (y + 0.044715 * y**3)))
+
+
+@dataclass(frozen=True, slots=True)
+class FlashAttention3:
+    """`flash_attn_interface.flash_attn_func`'s dense forward over `_fa3`, on one Hopper card:
+    `(b, s, h, d)` bf16 or fp16, head dims 64 and 128, K/V heads dividing Q heads, one split."""
+
+    torch: ModuleType
+    index: int
+
+    def flash_attn_func(
+        self,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        softmax_scale: float | None = None,
+        causal: bool = False,
+        num_splits: int = 1,
+    ) -> tuple[Tensor, Tensor]:
+        torch = self.torch
+        q, k, v = (t if t.stride(-1) == 1 else t.contiguous() for t in (q, k, v))
+        batch, seqlen_q, heads, head_dim = q.shape
+        if num_splits != 1 or q.dtype not in (torch.bfloat16, torch.float16):
+            raise ValueError("flash-attn3 prebuilt: one split of bf16 or fp16")
+        out = torch.empty_like(q)
+        lse = torch.empty(batch, heads, seqlen_q, dtype=torch.float32, device=q.device)
+        semaphore = torch.zeros(1, dtype=torch.int32, device=q.device) if causal else None
+        scale = softmax_scale if softmax_scale is not None else head_dim**-0.5
+        code = _fa3.fwd(
+            self.index, q.data_ptr(), k.data_ptr(), v.data_ptr(), out.data_ptr(),
+            lse.data_ptr(), q.dtype == torch.bfloat16, batch, seqlen_q, k.shape[1], heads,
+            k.shape[2], head_dim, _strides(q), _strides(k), _strides(v), _strides(out),
+            float(scale), causal, _ptr(semaphore),
+            int(torch.cuda.current_stream(self.index).cuda_stream),
+        )  # fmt: skip
+        if code:
+            raise ValueError(f"flash-attn3 prebuilt: {_fa3.error_name(code)}")
+        return out, lse
+
+
+def _strides(t: Tensor) -> tuple[int, int, int]:
+    return int(t.stride(0)), int(t.stride(1)), int(t.stride(2))
+
+
+def fa3(torch: ModuleType, index: int, sm: int) -> tuple[FlashAttention3 | None, str]:
+    """FlashAttention-3 from the wheel on cuda:`index` once it passes its probe, or None and why."""
+    if ABSENT or NO_FA3:
+        return None, ABSENT or NO_FA3
+    if sm != 90:
+        return None, f"the wheel's FlashAttention-3 runs on sm90, not sm{sm}"
+    kernel = FlashAttention3(torch, index)
+
+    def call(q: Tensor, k: Tensor, v: Tensor, causal: bool) -> Tensor:
+        return kernel.flash_attn_func(q, k, v, causal=causal)[0]
+
+    pairs = [(d, n) for d in (64, 128) for n in ("bfloat16", "float16")]
+    probe = partial(attention_probe, torch, index, call, True, pairs, True)
+    verdict = verify.verified("cozy-kernels-fa3", artifact("_fa3"), sm, probe)
+    return (kernel if verdict.ok else None), verdict.detail
+
+
+def attention_probe(
+    torch: ModuleType,
+    index: int,
+    call: Callable[[Tensor, Tensor, Tensor, bool], Tensor],
+    exact: bool,
+    pairs: Sequence[tuple[int, str]],
+    causal: bool,
+) -> verify.Verdict:
+    """An attention kernel `call(q, k, v, causal) -> out` on `(b, s, h, d)` against attention in
+    float64: each (head dim, dtype) it serves, with a query longer than its keys, and causal at
+    equal lengths (flash-attention aligns the mask bottom-right) where `causal`."""
+    device = torch.device("cuda", index)
+    generator = torch.Generator(device=device).manual_seed(20261017)
+    errors: dict[str, float] = {}
+    for head_dim, name in pairs:
+        for masked, lengths in ((False, (300, 257)), *(((True, (257, 257)),) if causal else ())):
+            q, k, v = (
+                torch.randn(1, s, 2, head_dim, generator=generator, device=device)
+                for s in (lengths[0], lengths[1], lengths[1])
+            )
+            want = torch.nn.functional.scaled_dot_product_attention(
+                *(t.transpose(1, 2).double() for t in (q, k, v)), is_causal=masked
+            ).transpose(1, 2)
+            dtype = getattr(torch, name)
+            got = call(q.to(dtype), k.to(dtype), v.to(dtype), masked)
+            case = f"d={head_dim} {name}{' causal' if masked else ''}"
+            errors[case] = verify.error(torch, got, want)
+    return verify.within(errors, ATTENTION_BUDGET[exact])
