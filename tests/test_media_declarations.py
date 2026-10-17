@@ -215,12 +215,12 @@ Clips = Annotated[
 class Reference(msgspec.Struct):
     use_audio: bool = False
     video: Annotated[
-        VideoAsset,
+        VideoAsset | None,
         AssetBound(max_bytes=1 << 30, max_decoded_bytes=1 << 30),
         VideoPreparation(
             max_seconds=15, excess="truncate", max_short_edge=768, max_fps=24, audio="use_audio"
         ),
-    ] | None = None
+    ] = None
 @invocable
 async def render(ctx: Context, *, reference: Reference, clips: Clips) -> Done:
     return Done(str(reference.video.read().duration))
