@@ -1,0 +1,1 @@
+Runtime 0.27.1 is cut from master: weight reads nest one level under a LoRA bake, which fixes H3 long_form on 32 GB cards (`weight_unbound`, #1540), with the refusal naming the weight; FlashAttention-3 forward prebuilt and every compiled attention kernel verified numerically (#1527); the aarch64 publish waiver (#1539). On TensorD 0.7.3.
