@@ -861,8 +861,9 @@ class _Request:
         #: the head it drafts with (None: any, drafting keeps a model's tokens)
         self.draft: Any = None
         self.prefill_s = self.began = self.ended = 0.0
+        #: the engine's (captures, capture seconds, eager steps) at admission, then over its life
+        self.at: tuple[float, ...] = (0, 0.0, 0)
         self.steps = self.live = 0
-        self.mode = ""
         self.warnings: list[tuple[str, dict[str, Any]]] = []
 
     @property
@@ -910,6 +911,9 @@ class _Engine:
         self.rehold = False
         #: heads whose blocks did not fit at home beside the model's
         self.unfit: set[int] = set()
+        #: captures recorded in this engine's life and their seconds, steps run eagerly
+        self.captured = [0, 0.0]
+        self.eager = 0
         self.driver: int | None = None
         self.draft: Any = None
         self.slots: list[_Row | None] = []
@@ -972,17 +976,21 @@ class _Engine:
 
     def _report(self, request: _Request) -> None:
         tokens = sum(int(t.shape[0]) for t in request.tokens)
-        looped = tokens - len(request.tokens)  # each row's first token is the prefill's
-        loop_s = max(request.ended - request.began, 0.0)
+        rows = len(request.tokens)
+        looped = (tokens - rows) / rows  # a row's tokens after its first, the prefill's
+        captures, capture_s, eager = request.at
+        loop_s = max(request.ended - request.began - capture_s, 0.0)
         per = 1000 * loop_s / max(looped, 1)
-        batch = request.live / max(request.steps, 1)
-        mode = request.mode or "graphs"
+        mode = "eager" if self.cache_device.type != "cuda" else "graphs"
+        if eager:
+            mode = "partly eager" if mode == "graphs" else mode
         if self.draft is not None:
-            rate = looped / len(request.tokens) / max(request.steps, 1)
-            mode += f", drafting {DEPTH}: {rate:.2f} tokens a step"
+            mode += f", drafting {DEPTH}: {looped / max(request.steps, 1):.2f} tokens a step"
+        mode += f", {request.live / max(request.steps, 1):.1f} rows a step"
         facts = (
             f"prefill {request.prefill_s:.3f} s",
-            f"then {per:.2f} ms/token over {looped} ({mode}, {batch:.1f} rows a step)",
+            f"then {per:.2f} ms/token over {looped:.0f} ({mode})",
+            f"{captures} captures {capture_s:.3f} s",
             f"gated-delta kernels {'on' if _LAUNCHED[0] else 'off'}",
         )
         text = f"{tokens} tokens after {request.prompt}: " + ", ".join(facts)
@@ -1113,8 +1121,9 @@ class _Engine:
         run(size)
         for row in rows:
             row.reach = min(row.reach + per, self.capacity)
-            row.request.steps += 1
-            row.request.live += len(rows)
+        for request in {id(row.request): row.request for row in rows}.values():
+            request.steps += 1
+            request.live += len(rows)
 
     def _settle(self, incoming: list[_Request]) -> None:
         """Between steps, with the device caught up: done and cancelled rows leave, the rows
@@ -1151,6 +1160,13 @@ class _Engine:
             request.tokens[row.row] = self.out[slot, : n[slot]].clone()
             request.left -= 1
             request.ended = time.perf_counter()
+            if not request.left:
+                request.at = tuple(
+                    now - then
+                    for now, then in zip(
+                        (self.captured[0], self.captured[1], self.eager), request.at, strict=True
+                    )
+                )
             self.slots[slot] = None
         # The rows above the holes move down, so a step runs the smallest bucket.
         top = len(self.slots) - 1
@@ -1331,6 +1347,7 @@ class _Engine:
                     self.hidden[slot].copy_(last[row])
                 self.slots[slot] = _Row(request, row, prompt)
         request.began = time.perf_counter()
+        request.at = (self.captured[0], self.captured[1], self.eager)
         self.retire = self.retire or bool(self.done[free[: int(fresh.token.shape[0])]].any())
 
     def _grow(self, size: int, capacity: int, fresh: _Prefill) -> bool:
@@ -1499,7 +1516,10 @@ class _Engine:
             if free < ROOM * need:
                 self.failed = f"no room: {free >> 20} MiB free, a step takes {need >> 20} MiB"
             else:
+                capturing = time.perf_counter()
                 graph, why = capture(lambda: self._advance(size), self.pool, self.side)
+                self.captured[0] += 1
+                self.captured[1] += time.perf_counter() - capturing
                 if graph is None:
                     self._capture_failed(why)
                 else:
@@ -1508,9 +1528,7 @@ class _Engine:
             graph.replay()
         else:
             self._advance(size)
-            for row in self.slots:
-                if row is not None:
-                    row.request.mode = "eager" if not cuda else "partly eager"
+            self.eager += 1
 
     def _capture_failed(self, why: str) -> None:
         self.failed, self.pool = why, None
