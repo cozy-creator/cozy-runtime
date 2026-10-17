@@ -49,8 +49,8 @@ def test_what_no_op_touched_this_stage_leaves_whole_and_comes_back_for_its_next_
         spill.native(torch, graphed)
         spill.began()
         live.mul_(2)
-        # as much as the two it may move: no other host tensor of this process is looked at
-        need = 2 * 4 * FLOATS
+        # no more than it may move: no other host tensor of this process is looked at
+        need = 4 * FLOATS
         moved = spill.spill(torch, CPU, need, (operand,), 0 if disk else need, False, disk)
         assert moved == 4 * FLOATS
         assert earlier.untyped_storage().nbytes() == 0, "its bytes left with it"

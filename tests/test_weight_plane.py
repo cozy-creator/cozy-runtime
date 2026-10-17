@@ -49,7 +49,7 @@ from cozy_runtime.internal.derive import Observations, serving_substrate  # noqa
 from cozy_runtime.internal.encoding import SPEC_PLAIN, SPEC_ROWWISE  # noqa: E402
 from cozy_runtime.internal.encoding.leaves import _native_leaf_class  # noqa: E402
 from cozy_runtime.internal.fill import Checkpoint  # noqa: E402
-from cozy_runtime.internal.memory import Rung  # noqa: E402
+from cozy_runtime.internal.memory import MemoryExhausted, Rung  # noqa: E402
 from cozy_runtime.internal.weights import (  # noqa: E402
     HostTiers,
     Journal,
@@ -1128,7 +1128,10 @@ def test_a_card_the_packages_tensors_fill_runs_its_stage_through_host_and_disk(
     held = fill_card(weights)
     before = list(spill.TOTALS)
     with weights.recovering():
-        got = run(model, x, passes=1)
+        try:
+            got = run(model, x, passes=1)
+        except MemoryExhausted as exc:
+            pytest.fail(f"{exc}; moved {spill.summary(before)}; applied {weights.applied}")
         tier = 3 if host == "room" else 5
         assert spill.TOTALS[tier] - before[tier] >= 256 << 20, spill.summary(before)
         assert spill.keep(x).device.type == "cpu"
