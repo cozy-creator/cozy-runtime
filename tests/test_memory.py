@@ -18,7 +18,7 @@ from cozy_runtime.author._errors import DEVICE_OOM, MEMORY_EXHAUSTED, classify
 from cozy_runtime.internal import accel, plane
 from cozy_runtime.internal import memory as memory_module
 from cozy_runtime.internal.executor import CAPACITY_CODES, Executor
-from cozy_runtime.internal.memory import Ledger, MemoryExhausted, Rung
+from cozy_runtime.internal.memory import MARGIN, Ledger, MemoryExhausted, Rung
 from cozy_runtime.internal.parallel import mirror
 from cozy_runtime.internal.weights import Weights
 from test_block_replay_contract import StatefulBlock, wrapped
@@ -63,10 +63,12 @@ def test_each_rung_runs_while_it_gives_and_the_ladder_stops_once_enough_is_free(
 ) -> None:
     weights, device = card
     calls: list[str] = []
-    weights.room = gives(device, [100 * MIB, 100 * MIB], calls, "owner")
+    owner, asked = gives(device, [100 * MIB, 100 * MIB], calls, "owner"), []
+    weights.room = lambda nbytes: (asked.append(nbytes), owner())
     monkeypatch.setattr(memory_module, "RELEASERS", [gives(device, [1 << 30], calls, "cache")])
     assert not weights.memory.free_for(500 * MIB, "aten.mm.default", upto=Rung.IDLE)
     assert calls == ["owner", "owner", "owner"], "asked while it gave, then left"
+    assert asked == [500 * MIB + MARGIN] * 3, "each ask is all it wants free, never the rest"
     calls.clear()
     assert weights.memory.free_for(500 * MIB, "aten.mm.default")
     assert calls == ["owner", "cache"], "an idle owner first, then the running one's caches"
