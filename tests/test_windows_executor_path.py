@@ -135,12 +135,16 @@ channel.close()
             os.close(first)
             os.close(second)
 
+    #: The interpreter itself, as the environment's: a venv's python.exe is a launcher that
+    #: starts it as a child, which would make the launcher the watched parent.
+    DIRECT = {**os.environ, "__PYVENV_LAUNCHER__": sys.executable}
+
     PARENT = """
-import subprocess, sys, time
+import os, subprocess, sys, time
 watcher = subprocess.Popen(
-    [sys.executable, "-c", "import time\\nfrom cozy_runtime.internal import proctree\\n"
+    [sys._base_executable, "-c", "import time\\nfrom cozy_runtime.internal import proctree\\n"
      "proctree.arm_parent_death()\\nprint('armed', flush=True)\\ntime.sleep(600)"],
-    stdout=subprocess.PIPE, text=True,
+    env={**os.environ, "__PYVENV_LAUNCHER__": sys.executable}, stdout=subprocess.PIPE, text=True,
 )
 assert watcher.stdout.readline().strip() == "armed"
 print(watcher.pid, flush=True)
@@ -148,7 +152,9 @@ time.sleep(600)
 """
 
     def test_an_executor_armed_against_parent_death_dies_with_its_parent() -> None:
-        parent = subprocess.Popen([sys.executable, "-c", PARENT], stdout=subprocess.PIPE, text=True)
+        parent = subprocess.Popen(
+            [sys._base_executable, "-c", PARENT], env=DIRECT, stdout=subprocess.PIPE, text=True
+        )
         assert parent.stdout is not None
         watcher = _winapi.OpenProcess(
             0x00100000 | 0x0001,  # SYNCHRONIZE | PROCESS_TERMINATE
