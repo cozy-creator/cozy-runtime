@@ -35,6 +35,7 @@ from cozy_runtime.derive.microscale import encode_fp8_rowwise, encode_int8_convr
 from cozy_runtime.internal import (  # noqa: E402
     accel,
     attention_ulysses,
+    budget_cell,
     paging,
     plane,
     spill,
@@ -1123,7 +1124,9 @@ def test_an_sdxl_unet_streams_bit_exact(
     Under pressure the streamed arm alone also has a ballast leaving only the plane's budget
     and the resident run's measured activations free, as physical ballast does in G4: every
     streamed lease's bytes are checked against the store (`verify_bytes`), so a difference
-    can only be the kernels' choice under memory pressure."""
+    can only be the kernels' choice under memory pressure. `fine`: the Worker's budget below
+    its block floor moves it to the sub-block grain at the first call's first block, mid-stage
+    with its common leased (cr-203 U5)."""
     if fine:  # the sub-block grain of a UNet this small: units of at most 256 KiB
         monkeypatch.setattr(weights_module, "REGION_LIMIT", 256 << 10)
     torch.manual_seed(11)
@@ -1161,9 +1164,13 @@ def test_an_sdxl_unet_streams_bit_exact(
     resident = steps()
     peak = torch.cuda.max_memory_allocated() - base
     layout: weight_policy.Layout = model.residency.components["unet"].layout
-    if fine:
-        layout = refined(model, "unet")
     weights.set_budget(layout.common + 3 * layout.largest)
+    cell, fd = budget_cell.Cell.create()
+    worker = budget_cell.Cell(fd)
+    os.close(fd)
+    if fine:
+        weights.cell = cell
+        ticket = worker.ask(layout.common + layout.largest)
     ballast = None
     if pressure:
         torch.cuda.empty_cache()
@@ -1186,6 +1193,14 @@ def test_an_sdxl_unet_streams_bit_exact(
         model.residency.unpark()
         del ballast
         torch.cuda.empty_cache()
+        if fine:
+            weights.cell = None
+            worker.answered(ticket)
+        cell.close()
+        worker.close()
+    if fine:
+        assert model.residency.components["unet"].fine
+        layout = model.residency.components["unet"].layout
     assert not wrong, f"plane bytes differ from the store: {wrong[:8]}"
     assert weights.facts().streamed["unet"].resident_blocks < len(layout.blocks)
     exact = [torch.equal(a, b) for a, b in zip(resident, streamed, strict=True)]
@@ -1196,8 +1211,6 @@ def test_an_sdxl_unet_streams_bit_exact(
 def test_the_worker_lowers_a_running_stage_at_its_next_block(card: Any) -> None:
     """Room for another executor's context, made while a call runs: the Worker asks through
     the budget cell, and the stage unmaps and streams from its next block on, unchanged."""
-    from cozy_runtime.internal import budget_cell
-
     weights = card.weights
     model = load(weights, card.checkpoint, "cut")
     x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
@@ -1231,8 +1244,6 @@ def test_the_owner_lowers_a_running_process_cap_at_its_next_block(card: Any) -> 
     """Room for another executor, or a display's floor, made while a call runs: the owner
     asks for a smaller process cap through the budget cell; from its next block the stage
     streams inside it and the process holds no more than the cap, with the same bits."""
-    from cozy_runtime.internal import budget_cell
-
     weights = card.weights
     model = load(weights, card.checkpoint, "cap-cut")
     x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
@@ -1272,8 +1283,6 @@ def test_a_component_moves_to_the_sub_block_grain_at_any_block_boundary(card: An
     waited for no lease or cursor anywhere, so never mid-stage, where a stage leases its
     common and streams through a cursor. Now it moves at the next block boundary: the
     cursor and leases close with the coarse weight set, and common is leased again."""
-    from cozy_runtime.internal import budget_cell
-
     weights = card.weights
     model = load(weights, card.checkpoint, "regrain")
     layout: weight_policy.Layout = model.residency.components["stack"].layout
@@ -1306,26 +1315,27 @@ def test_a_component_moves_to_the_sub_block_grain_at_any_block_boundary(card: An
 
 
 @on_card
-def test_activations_short_of_memory_move_the_stage_to_its_finest_grain(card: Any) -> None:
-    """Memory's rung 2 used to stop at streaming everything: once no unleased weight was left,
-    the stage never planned smaller. Each out-of-memory now lowers what the next block boundary
-    plans in, down to the finest floor, and the component moves there mid-stage."""
+def test_memorys_rung_2_moves_the_running_stage_to_its_finest_grain(card: Any) -> None:
+    """Memory's rung 2 stopped at streaming everything: once no unleased weight was left, the
+    stage never planned smaller. It now also lowers what the next block boundary plans in,
+    down to the finest floor, and the component moves there mid-stage."""
     weights = card.weights
     model = load(weights, card.checkpoint, "finer")
-    x = torch.randn(8192, HIDDEN, device="cuda", dtype=torch.float16)
+    x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
     weights.set_budget(1 << 30)
     reference = run(model, x)
-    torch.cuda.empty_cache()
-    free, _ = torch.cuda.mem_get_info()
-    ballast = torch.empty(free - (48 << 20), dtype=torch.uint8, device="cuda")
+    model.residency.admit("run", ("stack",))
     try:
-        tight_run = run(model, x)
+        with torch.inference_mode():
+            outputs = [model.stack(x)]  # resident whole
+            # An op short of more than is free, which unmapping the resident set covers.
+            assert weights.memory.free_for(weights.memory.free() + (32 << 20), "an op")
+            assert not model.residency.components["stack"].fine
+            outputs += [model.stack(x), model.stack(x)]
     finally:
-        del ballast
-        torch.cuda.empty_cache()
+        model.residency.release("run", ("stack",))
     assert model.residency.components["stack"].fine
-    pairs = zip(reference, tight_run, strict=True)
-    assert all(torch.allclose(a, b, rtol=1e-2, atol=1e-2) for a, b in pairs)
+    assert same(reference, outputs)
 
 
 class WritingBlock(Block):
@@ -1375,8 +1385,6 @@ def test_budgets_cut_and_raised_while_streaming_stay_exact(card: Any) -> None:
     boundaries while the cursor's copies are in flight, and every cut closes the ring and maps
     a new one. Hundreds of them, alternately tight and roomy, compute the resident bits; run
     under `compute-sanitizer --tool memcheck` this is the reproduction."""
-    from cozy_runtime.internal import budget_cell
-
     weights = card.weights
     model = load(weights, card.checkpoint, "churn")
     x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
@@ -1412,8 +1420,6 @@ def test_weights_leave_only_after_the_kernels_that_read_them(tmp_path: Path, cut
     Whatever unmaps the set next (the next stage's weights, a Worker's mid-call cut, an
     out-of-memory cut) waits for them; unmapping under them was an illegal address (on a
     laptop, an MMU fault that can freeze it)."""
-    from cozy_runtime.internal import budget_cell
-
     weights = Weights(torch, torch.device("cuda", 0), "cuda")
     weights.set_budget(-1, pinned=1 << 30)
     checkpoint = write_checkpoint(tmp_path)[0]
