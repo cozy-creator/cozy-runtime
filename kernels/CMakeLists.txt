@@ -4,7 +4,14 @@
 # Each unit is compiled for its own targets only: an arch-specific instruction (wgmma, tcgen05)
 # never meets a card it cannot run on.
 cmake_minimum_required(VERSION 3.26)
-project(cozy_kernels LANGUAGES CXX CUDA)
+project(cozy_kernels LANGUAGES CXX)
+# CUDA 13.0 takes MSVC through 19.4x (Visual Studio 2022); a newer one builds only past nvcc's check.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 19.50)
+    message(WARNING "MSVC ${CMAKE_CXX_COMPILER_VERSION} (${CMAKE_CXX_COMPILER}) is newer than CUDA 13.0 "
+                    "supports: building with -allow-unsupported-compiler")
+    string(APPEND CMAKE_CUDA_FLAGS " -allow-unsupported-compiler")
+endif()
+enable_language(CUDA)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CUDA_STANDARD 17)

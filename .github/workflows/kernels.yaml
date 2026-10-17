@@ -102,7 +102,11 @@ jobs:
       - {uses: actions/setup-python@v5, id: py313, with: {python-version: '3.13'}}
       - {uses: actions/setup-python@v5, id: py314, with: {python-version: '3.14'}}
       - {uses: actions/setup-python@v5, id: py312, with: {python-version: '3.12'}}
+      # CUDA 13.0's host_config.h takes MSVC through 19.4x: the image's Visual Studio 2026 carries
+      # Visual Studio 2022's last toolset, 14.44.
       - uses: ilammy/msvc-dev-cmd@v1.13.0
+        with:
+          toolset: '14.44'
       - name: CUDA 13.0 from NVIDIA's redistributables, each archive held to its digest
         shell: pwsh
         run: |
@@ -143,3 +147,4 @@ jobs:
           name: cozy-kernels-win_amd64
           path: dist/*.whl
           if-no-files-found: error
+
