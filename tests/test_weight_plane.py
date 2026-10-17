@@ -1150,7 +1150,7 @@ def test_a_cast_over_half_the_hosts_room_lands_in_host_memory(
     cast whose result is larger than that half, under a cap that leaves it no device room, now
     runs in bands into host memory."""
     weights = card.weights
-    x = torch.randn(3 << 29, device="cuda", dtype=torch.float16)  # 3 GiB; cast: 6 GiB
+    x = torch.randn(1 << 30, device="cuda", dtype=torch.float16)  # 2 GiB; cast: 4 GiB
     host_room(monkeypatch, 2 * x.nbytes + (512 << 20))  # half of it is less than the result
     weights.measure_context()
     weights.set_cap(max(weights.context_bytes, 0) + torch.cuda.memory_reserved() + (1 << 30))
