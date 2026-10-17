@@ -2002,12 +2002,15 @@ def _ops_type(torch: ModuleType) -> type:
                     if weights is None:
                         raise
                     need, refused = _room_for(exc, refused)
+                    up = exc if is_device_oom(exc) and bands.raises() else None
                 # outside `except`, so the failed op's frames are gone; it runs again from
                 # what it read: its generators and the tensors it writes into, as they were
                 for generator, state in states:
                     generator.set_state(state)
                 for target, first in written or ():
                     target.copy_(first)
+                if up is not None:  # the call around it cuts itself (`Bands.attend`) first
+                    raise up
                 if banded is not None:
                     try:  # out of memory whole: in bands of rows when it can be
                         out = banded.run(func, args, kwargs, short=True)

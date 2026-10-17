@@ -358,7 +358,7 @@ def _sage(modes: dict[str, tuple[str, str, str]]) -> Local:
         entry, granularity, accumulation = mode(query)
         return f"{entry}({granularity}, {accumulation}, smooth_k)"
 
-    return Local(forward, impl)
+    return Local(forward, impl, rows=BLOCK)  # Q quantized per block of its rows
 
 
 def _sage_row(row: arch.Row) -> str:
@@ -641,11 +641,14 @@ def _named(name: str) -> Callable[..., str]:
     return lambda *_: name
 
 
-SDPA = Local(sdpa, sdpa_impl)
-CUDNN = Local(cudnn, _named("cudnn"))
-FA3 = Local(fa3, lambda *_: f"flash_attn3 {_FA3_VARIANT}")
+#: The query rows a call is cut at (`Local.rows`): a multiple of every kernel's query tile.
+BLOCK = 128
+
+SDPA = Local(sdpa, sdpa_impl, rows=BLOCK)
+CUDNN = Local(cudnn, _named("cudnn"), rows=BLOCK)
+FA3 = Local(fa3, lambda *_: f"flash_attn3 {_FA3_VARIANT}", rows=BLOCK)
 FA3_FP8 = Local(fa3_fp8, lambda *_: f"flash_attn3 {_FA3_VARIANT} e4m3 per-head")
-FA4 = Local(fa4, _named("flash_attn.cute.flash_attn_func"))
+FA4 = Local(fa4, _named("flash_attn.cute.flash_attn_func"), rows=BLOCK)
 FA4_FP8 = Local(fa4_fp8, _named("flash_attn.cute.interface._flash_attn_fwd e4m3 per-head"))
 #: FP8 P/V, as upstream's `sageattn` dispatches it: the Hopper kernel (two-level FP32
 #: accumulation only) and the SM89 kernel, per warp on consumer Blackwell.
@@ -659,8 +662,10 @@ SAGE = _sage(
 #: FP16 P/V at upstream's default (and most accurate) FP32 accumulation; BF16 V is cast to FP16.
 SAGE_FP16PV = _sage({"wgmma": ("sageattn_qk_int8_pv_fp16_cuda", "per_thread", "fp32")})
 KITCHEN = Local(kitchen_int8, _named("comfy_kitchen.int8_attention"))
-FLASHINFER = Local(flashinfer_mixed, _named("cute_dsl_fmha_ragged_prefill jit, e4m3 V per-head"))
-SAGE3 = Local(sage3_fp4, _named("sageattn3.sageattn3_blackwell(nvfp4, per_block_mean)"))
+FLASHINFER = Local(
+    flashinfer_mixed, _named("cute_dsl_fmha_ragged_prefill jit, e4m3 V per-head"), rows=BLOCK
+)
+SAGE3 = Local(sage3_fp4, _named("sageattn3.sageattn3_blackwell(nvfp4, per_block_mean)"), rows=BLOCK)
 
 SAGE3_GLOBAL_LOWMEM = Local(
     sage3_fp4_global_lowmem,
