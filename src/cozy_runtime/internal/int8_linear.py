@@ -7,8 +7,9 @@ Blackwell, mma.sync on every other card, and a single GEMV launch for up to 4 ro
 call, so a leaf's host time is a bf16 `F.linear`'s. A weight stand-in reaches it through torch
 dispatch, which binds its bytes for the op.
 
-The op is built by the machine's compile manager at boot (`machine_kernels`), beside the weight
-download. Until it lands a leaf serves through comfy-kitchen's reviewed binary, else eagerly
+The op comes prebuilt (`prebuilt`: the cozy-kernels wheel, verified on the card at first use),
+else from the machine's compile manager (`machine_kernels`), which builds it beside the weight
+download. Until one serves, a leaf serves through comfy-kitchen's reviewed binary, else eagerly
 on torch's int8 GEMM, so no run waits for a compile, and it switches at its next call.
 
 `torch` is the torch module: this module imports no torch.
@@ -29,7 +30,7 @@ from typing import cast
 from cozy_runtime.author._errors import is_device_oom
 from cozy_runtime.author._model import LANDED, WARNINGS, Building
 from cozy_runtime.author.kernels import INT8_CONVROT, PreQuantized, readable
-from cozy_runtime.internal import arch, kernel_cache, kernel_compile, kernel_sources
+from cozy_runtime.internal import arch, kernel_cache, kernel_compile, kernel_sources, prebuilt
 from cozy_runtime.internal.encoding.formats import CONVROT_GROUP, Tensor, hadamard256
 
 ARTIFACT = "comfy-kitchen"
@@ -51,6 +52,23 @@ class _Build:
 
 #: The loaded op: `(x, data, scale, bias, out_dtype) -> out`.
 type Op = Callable[..., Tensor]
+
+
+class _Compiled:
+    """The locally compiled library's six ops (`torch.ops.cozy`), named as `prebuilt.Prebuilt`'s."""
+
+    def __init__(self, torch: ModuleType) -> None:
+        ops = torch.ops.cozy
+        self.int8_linear: Op = ops.int8_linear.default
+        self.int8_quantize: Callable[..., tuple[Tensor, Tensor]] = ops.int8_quantize.default
+        self.int8_gemm: Op = ops.int8_gemm.default
+        self.fp8_linear: Op = ops.fp8_linear.default
+        self.fp8_quantize: Callable[..., tuple[Tensor, Tensor]] = ops.fp8_quantize.default
+        self.fp8_gemm: Op = ops.fp8_gemm.default
+
+
+#: Device index -> the library serving its 8-bit ops: prebuilt, else compiled here.
+_LIBS: dict[int, prebuilt.Prebuilt | _Compiled] = {}
 
 _KITCHEN: dict[int, _Build] = {}
 _NATIVE: dict[int, _Build] = {}
@@ -127,6 +145,25 @@ def failed(op: str, device: int, exc: Exception) -> None:
         )
 
 
+def _refused(device: int, reason: str) -> None:
+    """The prebuilt library failed its probe on this card: the next path serves, and every run
+    of this executor says so once."""
+    fields: dict[str, str | bool | int | float | None] = {
+        "op": OP,
+        "device": device,
+        "reason": reason[:300],
+    }
+    row = ("prebuilt kernels failed verification, a slower path serves", fields)
+    if row not in WARNINGS:
+        WARNINGS.append(row)
+        print(f"[int8] {reason}", file=sys.stderr)
+
+
+def library(index: int) -> prebuilt.Prebuilt | _Compiled:
+    """The library `native` loaded for this card."""
+    return _LIBS[index]
+
+
 def _store() -> kernel_cache.Store:
     store = kernel_cache.configured()
     if store is None:
@@ -152,21 +189,36 @@ def _compiled(name: str, sm: int) -> Path | None:
 
 
 def native(torch: ModuleType, index: int) -> Op | None:
-    """`torch.ops.cozy.int8_linear` on this card, or None while its build runs."""
+    """The 8-bit op library's int8 linear on this card, or None while its build runs: the
+    prebuilt one once it verifies here, else the one the machine compiles."""
 
     def opened(sm: int) -> Op | None:
         if not arch.row(sm).family:
             raise kernel_sources.Absent(f"no int8 tensor-core GEMM for sm{sm}")
-        tree = _compiled(OP, sm)
+        ops, detail = prebuilt.library(torch, index, sm)
+        if ops is not None:
+            print(f"[int8] prebuilt cozy-kernels verified on sm{sm}: {detail}", file=sys.stderr)
+            _HALF[:] = (torch.bfloat16, torch.float16)
+            _LIBS[index] = ops
+            _OPS[index] = ops.int8_linear
+            return _OPS[index]
+        refused = detail.startswith("cozy-kernels failed")
+        if refused:
+            _refused(index, detail)
+        try:
+            tree = _compiled(OP, sm)
+        except kernel_sources.Absent as exc:
+            raise kernel_sources.Absent(f"{detail}; {exc}" if refused else str(exc)) from exc
         if tree is None:
             return None
-        [library] = tree.glob("cozy_int8*.so")
+        [built] = tree.glob("cozy_int8*.so")
         if not _LOADED:
-            torch.ops.load_library(str(library))
-            _LOADED.append(str(library))
-        elif _LOADED[0] != str(library):
+            torch.ops.load_library(str(built))
+            _LOADED.append(str(built))
+        elif _LOADED[0] != str(built):
             raise kernel_sources.Absent(f"this process serves another card's op ({_LOADED[0]})")
         _HALF[:] = (torch.bfloat16, torch.float16)
+        _LIBS[index] = _Compiled(torch)
         _OPS[index] = torch.ops.cozy.int8_linear.default
         return _OPS[index]
 
@@ -243,7 +295,7 @@ def quantize(torch: ModuleType, x: Tensor) -> PreQuantized | None:
     if _OPS.get(x.get_device()) is None:
         return None
     try:
-        payload, scale = torch.ops.cozy.int8_quantize.default(x)
+        payload, scale = _LIBS[x.get_device()].int8_quantize(x)
     except Exception as exc:
         failed(OP, x.get_device(), exc)
         return None
@@ -284,7 +336,7 @@ def prologue(
         ):
             return None
     try:
-        payload, row_scale = torch.ops.cozy.int8_quantize.default(
+        payload, row_scale = _LIBS[x.get_device()].int8_quantize(
             x, scale, shift, NORMS[norm], eps, ACTIVATIONS[activation]
         )
     except Exception as exc:
@@ -305,7 +357,7 @@ def gemm(
     epilogue), and the kernel that served it."""
     kernel = OP
     try:
-        out = torch.ops.cozy.int8_gemm.default(
+        out = _LIBS[operand.payload.get_device()].int8_gemm(
             operand.payload, operand.scale, data, scale, bias, out_dtype
         )
     except Exception as exc:  # torch's int8 GEMM serves this call

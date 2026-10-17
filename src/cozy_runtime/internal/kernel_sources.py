@@ -17,9 +17,9 @@ card and no upstream patch is needed; a one-line incompatibility with this torch
 replacement applied at build time, in the open, in the recipe. `python` unpacks every Python
 source (wheels, and a tree's pure package by its `package` path) into one importable tree: the
 CuTe DSL, TVM-FFI and the JIT kernels built on them (Sol, FlashAttention-4, FlashInfer). Every
-source's digest is a key input, with the card's architecture, the driver, torch, CUDA, Python
-and the compiler, so another image, card or driver builds its own entry and never loads this
-one's.
+source's digest is a key input, with the card's architecture, torch, CUDA, Python and the
+compiler, so another image or card builds its own entry and never loads this one's. A driver
+update rebuilds nothing; the kernel is verified again on it (`verify`).
 """
 
 from __future__ import annotations
@@ -51,7 +51,7 @@ from packaging.tags import sys_tags
 from packaging.utils import parse_wheel_filename
 
 from cozy_runtime._cpus import cpus
-from cozy_runtime.internal import accel, arch, config, egress, kernel_cache, kernel_compile
+from cozy_runtime.internal import arch, config, egress, kernel_cache, kernel_compile
 
 ROOT = Path("/opt/cozy/kernel-sources")
 INDEX = "index.json"
@@ -625,7 +625,6 @@ def job(name: str, sm: int, root: Path | None = None, family: str = "") -> kerne
             raise Absent("this environment has no torch to build against")
         inputs = {
             "arch": f"sm_{sm}",
-            "driver": accel.driver_version(),
             "torch": release,
             "cuda": cuda,
             "python": _python(),

@@ -91,7 +91,7 @@ wheel.py-api = "cp312"
 python_version = "3.12"
 files = ["src", "checks", "tests", "examples"]
 explicit_package_bases = true
-mypy_path = "src:checks:tests:examples/marco-polo:tests/testdata/static_describe/rich"
+mypy_path = "src:checks:tests:examples/marco-polo:tests/testdata/static_describe/rich:kernels/src"
 # The `extends` fixture imports its DEPENDENCY's modules, which is the whole point of it
 # (cr-117). The rich fixture is that dependency, so mypy is pointed at it rather than
 # told to ignore the import.
