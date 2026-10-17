@@ -108,8 +108,8 @@ def test_streaming_media_preserves_pcm_clock(
     assert saved.audio.codec_frame_samples == 1024
 
     reader = fakes.fake_attempt("decode", spool=tmp_path / "decode")
-    asset = fakes.fake_input(saved.video, attempt=reader.request_id, max_decoded_bytes=8 << 20)
-    decoded = fakes.fake_media_decoder(reader).decode_video(asset)
+    asset = fakes.fake_input(saved.video, attempt=reader, max_decoded_bytes=8 << 20)
+    decoded = asset.read()
     assert decoded.frame_count == frames and decoded.start_time == 0
     assert decoded.duration == Fraction(frames, 24)
     assert all(

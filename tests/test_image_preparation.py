@@ -17,10 +17,10 @@ from cozy_runtime.author import (
     AssetLimits,
     Assets,
     ConformanceError,
+    ImageAsset,
     ImagePreparation,
     describe,
 )
-from cozy_runtime.author import Image as InputImage
 from cozy_runtime.author._decode import (
     DEFAULT_DECODE_LIMITS,
     IMAGE_SOURCE_MAX_BYTES,
@@ -72,10 +72,10 @@ def test_preparation_descriptor_is_argument_metadata(tmp_path: Path) -> None:
     def render(
         payload: PrepRequest,
         assets: Annotated[
-            Assets[InputImage], AssetLimits(images=2), ImagePreparation(max_edge=512)
+            Assets[ImageAsset], AssetLimits(images=2), ImagePreparation(max_edge=512)
         ],
     ) -> PrepResult:
-        return PrepResult(assets[0].width)
+        return PrepResult(assets[0].probe().width)
 
     found = Discovered(app, "image_preparation:app", tmp_path, sys.modules[__name__], describe(app))
     body = package_interface.build(found)
@@ -85,9 +85,12 @@ def test_preparation_descriptor_is_argument_metadata(tmp_path: Path) -> None:
         "profile": "image-fit/1",
         "max_edge": 512,
     }
+    unknown = json.loads(encoded)
+    unknown["entrypoints"][0]["assets"]["kinds"][0]["prepare"] = {"profile": "fit/9", "x": []}
+    package_interface.read_bytes(json.dumps(unknown).encode())  # a newer writer's profile
     for policy in (
-        {"profile": "unknown", "max_edge": 512},
         {"profile": "image-fit/1"},
+        {"profile": "video-trim/1", "max_seconds": 5, "excess": "refuse"},
         {"profile": "image-fit/1", "max_edge": 0},
         {"profile": "image-fit/1", "max_edge": True},
         {"profile": "image-fit/1", "max_pixels": 1.5},
@@ -99,8 +102,8 @@ def test_preparation_descriptor_is_argument_metadata(tmp_path: Path) -> None:
             package_interface.read_bytes(json.dumps(invalid).encode())
     additive = json.loads(encoded)
     additive["entrypoints"][0]["assets"]["kinds"][0]["prepare"]["crop"] = True
-    read = package_interface.read_bytes(json.dumps(additive).encode())
-    assert read["entrypoints"][0]["assets"]["kinds"][0]["prepare"]["max_edge"] == 512
+    with pytest.raises(ConformanceError):  # a known profile admits exactly its grammar
+        package_interface.read_bytes(json.dumps(additive).encode())
     for cap in (0, -1, True, 1.5):
         with pytest.raises(ConformanceError, match="positive"):
             ImagePreparation(max_edge=cap)  # type: ignore[arg-type]
@@ -117,9 +120,11 @@ def test_image_preparation_static_alias_never_imports_package(tmp_path: Path) ->
     (tmp_path / "image_preparation.py").write_text("""
 from typing import Annotated
 import msgspec
-from cozy_runtime.author import App, Assets, Image, ImagePreparation, AssetLimits
+from cozy_runtime.author import App, Assets, ImageAsset, ImagePreparation, AssetLimits
 raise AssertionError("package analysis executed user code")
-PictureInputs = Annotated[Assets[Image], AssetLimits(images=2), ImagePreparation(max_edge=512)]
+PictureInputs = Annotated[
+    Assets[ImageAsset], AssetLimits(images=2), ImagePreparation(max_edge=512)
+]
 class Request(msgspec.Struct):
     prompt: str
 class Result(msgspec.Struct):
@@ -130,7 +135,7 @@ def render(
     payload: Request,
     assets: PictureInputs,
 ) -> Result:
-    return Result(assets[0].width)
+    return Result(assets[0].probe().width)
 """)
     body = static_interface.build(tmp_path)
     assert body["entrypoints"][0]["assets"]["kinds"][0]["prepare"] == {

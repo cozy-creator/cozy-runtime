@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Annotated, Any, Literal
 
 import msgspec
+from cozy_runtime.models.minimax_h3.model import H3Model, H3TurboBase, H3TurboLoRA
 
 from cozy_runtime.author import (
     App,
@@ -13,13 +14,12 @@ from cozy_runtime.author import (
     Assets,
     Context,
     FileAsset,
-    Image,
+    ImageAsset,
     Outputs,
     Telemetry,
     Tree,
     VideoAsset,
 )
-from cozy_runtime.models.minimax_h3.model import H3Model, H3TurboBase, H3TurboLoRA
 
 from .instrument import profile_request, retained_handler, software_versions, unprofiled_request
 
@@ -34,7 +34,7 @@ _DEFAULT_MODEL_LADDER = [
 _DEFAULT_TURBO_LORA_LADDER = [
     {"gpu": "5090", "gpus": 1, "lane": "paul/minimax-h3-turbo-lora@1.0.0-audit.1/pdd8"}
 ]
-KeyframeAssets = Annotated[Assets[Image], AssetLimits(images=2)]
+KeyframeAssets = Annotated[Assets[ImageAsset], AssetLimits(images=2)]
 
 
 class TurboInput(msgspec.Struct, kw_only=True):

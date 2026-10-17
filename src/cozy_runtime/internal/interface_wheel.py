@@ -54,7 +54,7 @@ def _module(module: str, entries: list[tuple[CallableDoc, Invocable]], digest: s
         "from enum import Enum",
         "import msgspec",
         "from cozy_runtime.author import "
-        "AssetBound, Assets, ImagePreparation, Image, DecodedAudio, DecodedVideo, "
+        "AssetBound, Assets, AudioPreparation, ImagePreparation, VideoPreparation, "
         "ImageAsset, AudioAsset, VideoAsset, FileAsset, Tree",
         "from cozy_runtime.author import ModelArtifact",
         "from cozy_runtime.author._calls import _CallType, _invoke_proxy",
@@ -107,13 +107,16 @@ def _module(module: str, entries: list[tuple[CallableDoc, Invocable]], digest: s
                         annotation = (
                             f"Annotated[{annotation}, msgspec.Meta(**{field['constraints']!r})]"
                         )
+                    declared = field.get("asset_bound", {})
                     bound = {
                         name: limit
-                        for name, limit in field.get("asset_bound", {}).items()
+                        for name, limit in declared.items()
                         if name in package_interface.ASSET_BOUND_KEYS
                     }
                     if bound:
                         annotation = f"Annotated[{annotation}, AssetBound(**{bound!r})]"
+                    if (marker := _preparation(declared.get("prepare"))) is not None:
+                        annotation = f"Annotated[{annotation}, {marker}]"
                     default = ""
                     if field_path in defaults:
                         value = defaults[field_path]
@@ -210,14 +213,11 @@ def _module(module: str, entries: list[tuple[CallableDoc, Invocable]], digest: s
             annotation = expression(fields[name]["type"], path)
             if entry.assets is not msgspec.UNSET and entry.assets.parameter == name:
                 kinds = []
+                markers = []
                 for row in entry.assets.kinds:
-                    cls = (
-                        {"image": "Image", "audio": "DecodedAudio", "video": "DecodedVideo"}[
-                            row.kind
-                        ]
-                        if entry.assets.view == "decoded"
-                        else expression({"asset": row.kind}, path)
-                    )
+                    cls = expression({"asset": row.kind}, path)
+                    if (marker := _preparation(row.prepare)) is not None:
+                        markers.append(marker)
                     bound = {
                         key: value
                         for key, value in (
@@ -231,20 +231,8 @@ def _module(module: str, entries: list[tuple[CallableDoc, Invocable]], digest: s
                         cls = f"Annotated[{cls}, AssetBound(**{bound!r})]"
                     kinds.append(cls)
                 annotation = "Assets[" + " | ".join(kinds) + "]"
-                preparation = next(
-                    (row.prepare for row in entry.assets.kinds if row.prepare is not msgspec.UNSET),
-                    None,
-                )
-                if preparation is not None:
-                    caps = {
-                        key: value
-                        for key, value in (
-                            ("max_edge", preparation.max_edge),
-                            ("max_pixels", preparation.max_pixels),
-                        )
-                        if value is not msgspec.UNSET
-                    }
-                    annotation = f"Annotated[{annotation}, ImagePreparation(**{caps!r})]"
+                if markers:
+                    annotation = f"Annotated[{annotation}, {', '.join(markers)}]"
             default = (
                 " = " + literal(fields[name]["type"], path, defaults[path])
                 if path in defaults
@@ -310,6 +298,18 @@ def _module(module: str, entries: list[tuple[CallableDoc, Invocable]], digest: s
         + functions
         + ["__cozy_bindings__ = {", *bindings, "}", ""]
     )
+
+
+def _preparation(declared: object) -> str | None:
+    """A known preparation profile as its marker spelling, from its grammar members only;
+    an unknown profile is dropped."""
+    if declared is None or declared is msgspec.UNSET:
+        return None
+    known = package_interface.preparation_members(declared)
+    if known is None:
+        return None
+    marker, members = known
+    return f"{marker.__name__}(**{members!r})"
 
 
 def _declare(declarations: dict[str, tuple[bytes, str]], name: str, source: str) -> None:

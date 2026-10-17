@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Every construct the static package-interface reader admits, in one weightless package"
 requires-python = ">=3.12,<3.13"
 dependencies = [
-    "cozy-runtime>=0.1,<1",
+    "cozy-runtime[media]>=0.1,<1",
     "msgspec>=0.19",
 ]
 

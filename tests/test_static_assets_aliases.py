@@ -18,7 +18,7 @@ def fixture(root: Path, *, poison: bool = False) -> Path:
         ('raise RuntimeError("alias module must not execute")\n' if poison else "")
         + """from typing import Annotated
 import msgspec
-from cozy_runtime.author import Assets, AssetLimits, AssetBound, Image, Context, Outputs
+from cozy_runtime.author import Assets, AssetLimits, AssetBound, ImageAsset, Context, Outputs
 class Request(msgspec.Struct):
     prompt: str
 class Result(msgspec.Struct):
@@ -27,7 +27,7 @@ Input = Request
 Ctx = Context
 Save = Outputs
 Images = Annotated[
-    Assets[Annotated[Image,
+    Assets[Annotated[ImageAsset,
         AssetBound(media_types=("image/png",), max_bytes=4096, max_decoded_bytes=8192)]],
     AssetLimits(images=2, total=2), msgspec.Meta(min_length=1),
 ]
@@ -57,7 +57,7 @@ def test_assigned_assets_context_and_service_aliases_equal_imported_surface(tmp_
     assert isinstance(entries, list) and isinstance(entries[0], dict)
     assets = entries[0]["assets"]
     assert isinstance(assets, dict)
-    assert assets["parameter"] == "assets" and assets["view"] == "decoded"
+    assert assets["parameter"] == "assets" and "view" not in assets
     assert assets["kinds"] == [
         {
             "kind": "image",

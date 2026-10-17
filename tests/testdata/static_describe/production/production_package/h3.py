@@ -10,18 +10,24 @@ from cozy_runtime.author import (
     AssetBound,
     AssetLimits,
     Assets,
+    AudioAsset,
     Context,
-    Image,
     ImageAsset,
-    MediaDecoder,
-    Mixed,
+    ImagePreparation,
     Outputs,
     Telemetry,
     VideoAsset,
+    VideoPreparation,
 )
 
-KeyframeAssets = Annotated[Assets[Image], AssetLimits(images=2)]
-DirectReferenceAssets = Annotated[Assets[Mixed], AssetLimits(images=4, videos=2, audio=2, total=6)]
+KeyframeAssets = Annotated[
+    Assets[ImageAsset], AssetLimits(images=2), ImagePreparation(max_edge=4096)
+]
+DirectReferenceAssets = Annotated[
+    Assets[ImageAsset | VideoAsset | AudioAsset],
+    AssetLimits(images=4, videos=2, audio=2, total=6),
+    VideoPreparation(min_seconds=2, max_seconds=15, excess="truncate"),
+]
 Mp4 = Annotated[VideoAsset, AssetBound(media_types=("video/mp4",), max_bytes=1 << 30)]
 
 
@@ -55,7 +61,16 @@ class ReferenceRenderOutput(RenderOutput):
 
 class Reference(msgspec.Struct):
     name: str
-    image: Annotated[ImageAsset, AssetBound(max_bytes=64 << 20, max_decoded_bytes=256 << 20)]
+    image: Annotated[
+        ImageAsset,
+        AssetBound(max_bytes=64 << 20, max_decoded_bytes=256 << 20),
+        ImagePreparation(max_pixels=4_194_304),
+    ]
+    video: Annotated[
+        VideoAsset | None,
+        AssetBound(max_bytes=1 << 30, max_decoded_bytes=3 << 30),
+        VideoPreparation(max_seconds=15, excess="truncate"),
+    ] = None
 
 
 class LongFormInput(msgspec.Struct):
@@ -114,13 +129,13 @@ async def ref2va_turbo(
 
 
 async def long_form(
-    ctx: Context, payload: LongFormInput, decoder: MediaDecoder, out: Outputs, tel: Telemetry
+    ctx: Context, payload: LongFormInput, out: Outputs, tel: Telemetry
 ) -> LongFormOutput:
     raise NotImplementedError
 
 
 async def long_form_cuts(
-    ctx: Context, payload: LongFormCutsInput, decoder: MediaDecoder, out: Outputs, tel: Telemetry
+    ctx: Context, payload: LongFormCutsInput, out: Outputs, tel: Telemetry
 ) -> LongFormOutput:
     raise NotImplementedError
 
@@ -129,7 +144,6 @@ async def assemble_video(
     ctx: Context,
     *,
     payload: AssembleVideoRequest,
-    decoder: MediaDecoder,
     out: Outputs,
     tel: Telemetry,
 ) -> AssembleVideoResponse:

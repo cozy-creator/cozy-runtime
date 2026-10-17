@@ -18,7 +18,6 @@ from cozy_runtime.author import (
     Context,
     ImageAsset,
     Invocation,
-    MediaDecoder,
     Tree,
     attempt,
     describe,
@@ -39,9 +38,9 @@ class DigestResult(msgspec.Struct):
 
 
 @invocable(memoize=True)
-async def score(ctx: Context, *, media: ImageInput, decoder: MediaDecoder) -> DigestResult:
-    decoded = decoder.decode_image(media.image)
-    return DigestResult(hashlib.sha256(decoded.rgb).hexdigest())
+async def score(ctx: Context, *, media: ImageInput) -> DigestResult:
+    decoded = media.image.read()
+    return DigestResult(hashlib.sha256(decoded.tobytes()).hexdigest())
 
 
 class ParentInput(msgspec.Struct):
@@ -69,9 +68,7 @@ def test_broker_serializes_verified_nested_media_and_refuses_unhydrated_forgery(
     @parent.entrypoint(accelerator=False)
     async def main(ctx: Context, payload: ParentInput) -> DigestResult:
         asset = ImageAsset(digest) if payload.forge else payload.image
-        # Generated client interfaces omit injected capabilities; this fixture shares
-        # the implementation module so the type checker still sees its decoder.
-        return await score(media=ImageInput(asset))  # type: ignore[call-arg]
+        return await score(media=ImageInput(asset))
 
     calls: list[dict[str, Any]] = []
     response = ""

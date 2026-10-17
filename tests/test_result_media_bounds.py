@@ -11,8 +11,8 @@ import msgspec
 import pytest
 from PIL import Image
 
+from cozy_runtime.author import ImageAsset
 from cozy_runtime.author._call_results import decode
-from cozy_runtime.author._decode import MediaDecoder
 from cozy_runtime.author._errors import CapabilityError, RuntimeFailure
 from cozy_runtime.author._invoke import asset_inputs
 from cozy_runtime.author._services import Attempt
@@ -111,34 +111,42 @@ def test_returned_image_keeps_bounds_and_request_interface_identity(
         if closed:
             raise CapabilityError("result escaped parent", code="escaped_handle")
 
+    parent = Attempt("parent", tmp_path)
     result, _ = decode(
-        value, result_type, grants, request_id="parent", guard=guard, observation=None
+        value,
+        result_type,
+        grants,
+        request_id="parent",
+        guard=guard,
+        observation=None,
+        media=parent.media,
     )
     asset = asset_inputs(result)[0].asset
+    assert isinstance(asset, ImageAsset)
     assert asset._max_decoded_bytes == 36 and asset._input_id == "wire_frame"
-    decoder = MediaDecoder(Attempt("parent", tmp_path), active=lambda: False)
-    decoded = decoder.decode_image(asset)  # type: ignore[arg-type]
-    assert (decoded.width, decoded.height, len(decoded.rgb)) == (4, 3, 36)
+    decoded = asset.read()
+    assert decoded.size == (4, 3) and len(decoded.tobytes()) == 36
+    assert parent.media.retained_bytes == 36
     closed = True
     with pytest.raises(CapabilityError, match="escaped_handle"):
-        decoder.decode_image(asset)  # type: ignore[arg-type]
+        asset.read()
     closed = False
     image.write_bytes(data + b"changed")
     with pytest.raises(RuntimeFailure, match="input_changed"):
-        decoder.decode_image(asset)  # type: ignore[arg-type]
+        asset.read()
 
 
-def test_generated_only_function_can_request_decoder_without_payload_assets(tmp_path: Path) -> None:
-    """Generated child results supply decode capabilities after the parent starts."""
+def test_function_without_media_inputs_declares_no_media_capability(tmp_path: Path) -> None:
+    """A received child result is its own read capability; the parent names no decoder."""
     source = """import msgspec
-from cozy_runtime.author import App, Context, MediaDecoder
+from cozy_runtime.author import App, Context
 app = App()
 class Request(msgspec.Struct):
     prompt: str
 class Result(msgspec.Struct):
     width: int
 @app.entrypoint(accelerator=False)
-async def compose(ctx: Context, payload: Request, media: MediaDecoder) -> Result:
+async def compose(ctx: Context, payload: Request) -> Result:
     raise RuntimeError("discovery only")
 """
     (tmp_path / "pyproject.toml").write_text('[project]\nname="generated-only"\nversion="0.1.0"\n')
@@ -149,21 +157,22 @@ async def compose(ctx: Context, payload: Request, media: MediaDecoder) -> Result
         static_interface.build(tmp_path)
     )
     assert imported["entrypoints"][0]["name"] == "compose"
+    assert "media_decode" not in imported["entrypoints"][0]["invocable"]["capabilities"]
 
 
-def test_generated_function_does_not_waive_explicit_input_decode_bounds(tmp_path: Path) -> None:
+def test_a_named_media_input_needs_its_decode_bound(tmp_path: Path) -> None:
     from cozy_runtime.author import ConformanceError
 
     (tmp_path / "package.toml").write_text('[application]\nobject="unbounded_decode:app"\n')
     (tmp_path / "unbounded_decode.py").write_text("""import msgspec
-from cozy_runtime.author import App, Context, ImageAsset, MediaDecoder
+from cozy_runtime.author import App, Context, ImageAsset
 app = App()
 class Request(msgspec.Struct):
     image: ImageAsset
 class Result(msgspec.Struct):
     width: int
 @app.entrypoint(accelerator=False)
-async def compose(ctx: Context, payload: Request, media: MediaDecoder) -> Result:
+async def compose(ctx: Context, payload: Request) -> Result:
     raise RuntimeError("discovery only")
 """)
     with pytest.raises(ConformanceError, match="asset_decode_unbounded"):

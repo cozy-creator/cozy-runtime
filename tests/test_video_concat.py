@@ -93,10 +93,9 @@ def test_join_copies_packets_under_an_exact_soundtrack(tmp_path: Path) -> None:
     sources = [_segment(tmp_path, name, frames) for name, frames in (("a", 30), ("bb", 45))]
     parent = fakes.fake_attempt("parent", spool=tmp_path / "parent")
     videos = [
-        fakes.fake_input(v, attempt="parent", input_id=f"v{i}", max_decoded_bytes=8 << 20)
+        fakes.fake_input(v, attempt=parent, input_id=f"v{i}", max_decoded_bytes=8 << 20)
         for i, v in enumerate(sources)
     ]
-    decoder = fakes.fake_media_decoder(parent)
     counted: list[Sequence[int]] = []
 
     def soundtrack(frames: Sequence[int]) -> Iterator[DecodedMediaEvent]:
@@ -104,7 +103,7 @@ def test_join_copies_packets_under_an_exact_soundtrack(tmp_path: Path) -> None:
         yield DecodedMediaHeader(video=None, audio=AUDIO)
         written = 0
         for video in videos:  # each video's soundtrack, read without decoding a picture
-            with decoder.stream_audio(video) as stream:
+            with video.stream(pictures=False) as stream:
                 for event in stream:
                     if isinstance(event, DecodedAudioChunk):
                         yield DecodedAudioChunk(
@@ -128,9 +127,7 @@ def test_join_copies_packets_under_an_exact_soundtrack(tmp_path: Path) -> None:
     joined = _packets(saved.video._local)
     assert joined == [p for v in sources for p in _packets(v._local)]  # type: ignore[arg-type]
     reader = fakes.fake_attempt("reader", spool=tmp_path / "reader")
-    decoded = fakes.fake_media_decoder(reader).decode_video(
-        fakes.fake_input(saved.video, attempt="reader", max_decoded_bytes=8 << 20)
-    )
+    decoded = fakes.fake_input(saved.video, attempt=reader, max_decoded_bytes=8 << 20).read()
     assert decoded.frame_count == 75
     assert all(v * decoded.time_base == Fraction(i, 24) for i, v in enumerate(decoded.frame_pts))
 
@@ -139,7 +136,7 @@ def test_different_tracks_refuse_before_the_soundtrack_is_read(tmp_path: Path) -
     sources = [_segment(tmp_path, "a", 24), _segment(tmp_path, "wide", 24, width=96)]
     parent = fakes.fake_attempt("parent", spool=tmp_path / "parent")
     videos = [
-        fakes.fake_input(v, attempt="parent", input_id=f"v{i}", max_decoded_bytes=8 << 20)
+        fakes.fake_input(v, attempt=parent, input_id=f"v{i}", max_decoded_bytes=8 << 20)
         for i, v in enumerate(sources)
     ]
 

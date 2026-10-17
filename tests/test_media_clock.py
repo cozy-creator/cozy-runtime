@@ -34,23 +34,23 @@ def test_real_rotated_video_and_audio_round_trip(tmp_path: Path, mirror: bool) -
                 writer.mux(packet)
 
     attempt = fakes.fake_attempt("roundtrip", spool=tmp_path / "roundtrip")
-    asset = fakes.fake_input(
-        VideoAsset(str(oriented), local=oriented, size_bytes=oriented.stat().st_size),
-        attempt=attempt.request_id,
-        max_decoded_bytes=8 << 20,
-    )
-    decoder = fakes.fake_media_decoder(attempt)
+    asset = fakes.file_input(VideoAsset, oriented, attempt=attempt, max_decoded_bytes=8 << 20)
     if mirror:
-        with pytest.raises(MediaDecodeError) as error, decoder.stream_video(asset) as stream:
+        with pytest.raises(MediaDecodeError) as error, asset.stream() as stream:
             fakes.fake_outputs(attempt).save_video_stream(iter(stream))
         assert error.value.code == "media_rotation"
+        with pytest.raises(MediaDecodeError) as probed:
+            asset.probe()
+        assert probed.value.code == "media_rotation"
         return
 
-    original = decoder.decode_video(asset)
-    with decoder.stream_video(asset) as stream:
+    probe = asset.probe()
+    assert (probe.width, probe.height, probe.duration) == (32, 48, Fraction(frames, 24))
+    original = asset.read()
+    with asset.stream() as stream:
         saved = fakes.fake_outputs(attempt).save_video_stream(iter(stream))
-    reinput = fakes.fake_input(saved.video, attempt=attempt.request_id, max_decoded_bytes=8 << 20)
-    decoded = decoder.decode_video(reinput)
+    reinput = fakes.fake_input(saved.video, attempt=attempt, max_decoded_bytes=8 << 20)
+    decoded = reinput.read()
     assert (decoded.width, decoded.height, decoded.frame_count) == (32, 48, frames)
     assert decoded.start_time == original.start_time == 0
     assert decoded.duration == original.duration == Fraction(frames, 24)

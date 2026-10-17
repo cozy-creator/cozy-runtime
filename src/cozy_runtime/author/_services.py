@@ -46,7 +46,7 @@ from cozy_runtime.author._decode import (
     DecodedMediaEvent,
     DecodedMediaHeader,
     DecodedVideoFrame,
-    MediaDecoder,
+    MediaReads,
 )
 from cozy_runtime.author._errors import AuthorError, CapabilityError, OutputError
 from cozy_runtime.author._executor_requests import Publish, Published, PublishPart
@@ -201,10 +201,15 @@ class Attempt:
     _progress_diagnostics: set[str] = field(default_factory=set)
     #: Overlapped calls (`author.concurrently`) record from their own threads.
     _recording: threading.Lock = field(default_factory=threading.Lock)
+    #: Whether a model component-use scope is open; media reads refuse while one is.
+    components_active: Callable[[], bool] = field(default=lambda: False)
+    #: The attempt's one media reader: every hydrated input handle reads through it.
+    media: MediaReads = field(init=False)
 
     def __post_init__(self) -> None:
         if not self.ring.subject:
             self.ring.subject = self.request_id
+        self.media = MediaReads(self)
 
     def emit(self, kind: str, name: str, value: Scalar = None, /, **fields: Scalar) -> Observation:
         """One RETAINED record: the bounded ring, its emit-boundary checks, then the lane."""
@@ -1617,7 +1622,6 @@ SERVICES: Mapping[str, type] = {
     "egress": Egress,
     "settings": Settings,
     "secrets": Secrets,
-    "media_decode": MediaDecoder,
 }
 
 #: capability name -> why NOTHING can grant it yet. A capability with no grant path refuses

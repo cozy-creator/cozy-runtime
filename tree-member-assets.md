@@ -7,8 +7,8 @@ package-owned.
 `tree.member(path, ImageAsset, bound=AssetBound(...))` projects one regular member
 from a verified held native Tree into the existing typed Asset surface. Runtime
 checks canonical membership, path, digest/length, media and byte bounds; author
-code never supplies a local hydrated path. MediaDecoder and normal child calls
-consume the resulting attempt-scoped read capability. Output copy/re-export uses
+code never supplies a local hydrated path. The handle's reads (`read`, `stream`,
+`probe`) and normal child calls consume the resulting attempt-scoped read capability. Output copy/re-export uses
 the existing Outputs writer and native output commit.
 
 The follow-up cr180 propagates an explicitly declared fixed-output aggregate budget

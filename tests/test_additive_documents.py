@@ -55,7 +55,8 @@ def test_additive_asset_bound_keys_are_read_and_not_generated(tmp_path: Path) ->
         "from cozy_runtime.author import App, AssetBound, Context, ImageAsset, Model",
     ).replace(
         "    prompt: str\n",
-        "    prompt: str\n    image: Annotated[ImageAsset, AssetBound(max_bytes=4096)]\n",
+        "    prompt: str\n"
+        "    image: Annotated[ImageAsset, AssetBound(max_bytes=4096, max_decoded_bytes=1 << 20)]\n",
     )
     (root / "serving_fixture.py").write_text(source)
     body = json.loads(package_interface.canonical_bytes(static_interface.build(root)))

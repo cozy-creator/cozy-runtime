@@ -87,10 +87,15 @@ class ResultRef(msgspec.Struct, frozen=True):
 
 
 class Adjustment(msgspec.Struct, frozen=True, kw_only=True):
+    """One caller-visible divergence between requested and served, as the client sees it."""
+
     field: str
+    kind: Literal["adjusted", "clamp", "warn"]
     requested: str
     applied: str
     reason: str = ""
+    #: `handler`, or the runtime-owned origin (`policy`, `checkpoint:…`, `adapter:…`)
+    source: str = "handler"
 
 
 class Streamed(msgspec.Struct, frozen=True, kw_only=True):
@@ -249,7 +254,7 @@ class PreparedReply(msgspec.Struct, frozen=True, kw_only=True):
     features_digest: str = ""
     overlay_digest: str = ""
     facts_digest: str = ""
-    adjustments: tuple[dict[str, str], ...] = ()
+    adjustments: tuple[Adjustment, ...] = ()
 
 
 def budget_claim(reply: AttemptReply) -> dict[str, int]:

@@ -47,6 +47,7 @@ import cozy_runtime.internal.memo_identity as memo_identity
 import cozy_runtime.internal.package_interface as package_interface
 import cozy_runtime.internal.static_invocable as static_invocable
 from cozy_runtime import _interpreter, author
+from cozy_runtime.author._describe import assert_declaration_shape, decode_bounds
 from cozy_runtime.author._markers import MODEL_DEFAULT, PREFLIGHT
 from cozy_runtime.author._memo import memo_policy
 from cozy_runtime.author._model import (
@@ -71,7 +72,13 @@ from cozy_runtime.author._script_metadata import (
     main_definition,
 )
 from cozy_runtime.author._services import SERVICES
-from cozy_runtime.author._signature import AssetsBinding, _classify, assets_binding, assets_payload
+from cozy_runtime.author._signature import (
+    AssetsBinding,
+    _classify,
+    assets_binding,
+    assets_payload,
+    media_kinds,
+)
 from cozy_runtime.author._walker import is_struct
 from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.package_interface import ModelSpec
@@ -219,10 +226,6 @@ _AUTHOR_TYPES = (
     "FileAsset",
     "Tree",
     "ModelArtifact",
-    "Image",
-    "DecodedVideo",
-    "DecodedAudio",
-    "Mixed",
     "Context",
     "Assets",
     "Settings",
@@ -235,6 +238,8 @@ _AUTHOR_VALUES = (
     "AssetBound",
     "AssetLimits",
     "ImagePreparation",
+    "VideoPreparation",
+    "AudioPreparation",
     "WeightsOutput",
     "Bound",
     "Shape",
@@ -1762,8 +1767,6 @@ def _callable(reader: Reader, registration: Registration) -> dict[str, Json]:
                 if assets is not None:
                     reader.refuse(module, arg, "a second Assets parameter", "static_unsupported")
                 assets = assets_binding(arg.arg, reader.translate(module, arg.annotation))
-                if assets.decoded:
-                    capabilities.append("media_decode")
                 continue
 
         if (
@@ -1797,6 +1800,9 @@ def _callable(reader: Reader, registration: Registration) -> dict[str, Json]:
         payload = assets_payload(
             typing.cast(type[msgspec.Struct], payload), assets, fn.name, module.name
         )
+    assert_declaration_shape(payload)
+    assert_declaration_shape(result, result=True)
+    decode_bounds(registration.name, payload, assets)
     doc = package_interface.callable_doc(
         name=registration.name,
         payload_type=payload,
@@ -1810,6 +1816,8 @@ def _callable(reader: Reader, registration: Registration) -> dict[str, Json]:
     )
     if registration.weights:
         capabilities.append("weights")
+    if media_kinds(payload, assets):
+        capabilities.append("media_decode")
     doc["invocable"] = invocable_interface.serving_metadata(
         payload,
         result,
@@ -1981,6 +1989,9 @@ def _script_doc(reader: Reader, app: Assigned) -> dict[str, Json]:
         else msgspec.defstruct("_ScriptCompleted", [])
     )
     payload = msgspec.defstruct("_ScriptRequest", payload_fields)
+    assert_declaration_shape(payload)
+    assert_declaration_shape(result, result=True)
+    decode_bounds("main", payload, None)
     doc = package_interface.callable_doc(
         name="main",
         payload_type=payload,
@@ -1997,6 +2008,11 @@ def _script_doc(reader: Reader, app: Assigned) -> dict[str, Json]:
         module=module.name,
         export="main",
         context="_script_context",
-        capabilities=sorted(services | {"telemetry"} | ({"weights"} if weights else set())),
+        capabilities=sorted(
+            services
+            | {"telemetry"}
+            | ({"weights"} if weights else set())
+            | ({"media_decode"} if media_kinds(payload) else set())
+        ),
     )
     return doc

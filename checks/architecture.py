@@ -487,7 +487,7 @@ def fence_package_owns_no_residency() -> list[str]:
 
 
 def fence_package_owns_no_media_decode() -> list[str]:
-    """cr-012's one-decoder law: package code consumes `MediaDecoder` values.
+    """cr-012's one-decoder law: package code reads media through its input handles.
 
     Opening a container, reaching the runtime's private spool path, or calling a library
     path helper would create another fetch/decode authority with different bounds and clock
@@ -501,7 +501,7 @@ def fence_package_owns_no_media_decode() -> list[str]:
             if name == "av" or name.startswith("av.") or name == "PIL" or name.startswith("PIL."):
                 bad.append(
                     f"{rel}: package code imports {name!r} — hydrated media decodes only "
-                    "through the Runtime-owned MediaDecoder"
+                    "through its handle (read, stream, probe) and the attempt's reader"
                 )
         for node in ast.walk(tree):
             if not isinstance(node, ast.Attribute):
@@ -900,7 +900,7 @@ def fence_one_address_predicate() -> list[str]:
 #: `dict[str, Any]` record's missing key, 2026-09-28). Records are decoded once, at their
 #: boundary, into typed structs; this count under `internal/` may only fall. Lower it in
 #: the change that removes some.
-ANY_CEILING = 648
+ANY_CEILING = 643
 
 
 def any_references(tree: ast.AST) -> int:

@@ -61,7 +61,7 @@ def test_optional_tree_bound_static_imported_parity(tmp_path: Path) -> None:
     (tmp_path / "package.toml").write_text('[application]\nobject="bounded_trees:app"\n')
     (tmp_path / "bounded_trees.py").write_text("""from typing import Annotated
 import msgspec
-from cozy_runtime.author import App, AssetBound, MediaDecoder, Tree
+from cozy_runtime.author import App, AssetBound, Tree
 class Request(msgspec.Struct):
     prefix: Annotated[Tree | None, AssetBound(max_bytes=268435456)] = None
 class Result(msgspec.Struct):
@@ -69,7 +69,7 @@ class Result(msgspec.Struct):
     prefix: Annotated[Tree, AssetBound(max_bytes=268435456)]
 app = App()
 @app.entrypoint(accelerator=False)
-def assemble(payload: Request, media: MediaDecoder) -> Result:
+def assemble(payload: Request) -> Result:
     raise RuntimeError("describe only")
 """)
     source = static_interface.build(tmp_path)

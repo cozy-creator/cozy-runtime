@@ -11,10 +11,17 @@ import cozy_runtime.internal.invocable_interface as invocable_interface
 import cozy_runtime.internal.package_interface as package_interface
 from cozy_runtime import author
 from cozy_runtime.author._assets import Assets
-from cozy_runtime.author._describe import assert_declaration_shape
+from cozy_runtime.author._describe import assert_declaration_shape, decode_bounds
 from cozy_runtime.author._model_defaults import check_model_arguments
 from cozy_runtime.author._services import SERVICES, UNGRANTABLE
-from cozy_runtime.author._signature import _classify, _wire_default, _wire_type, assets_binding
+from cozy_runtime.author._signature import (
+    _classify,
+    _wire_default,
+    _wire_type,
+    assets_binding,
+    check_parameter_markers,
+    media_kinds,
+)
 from cozy_runtime.author._walker import is_struct, strip
 from cozy_runtime.internal.canonical import Json
 
@@ -76,6 +83,7 @@ def build(reader: Reader, registration: Registration) -> dict[str, Json]:
             parameters.append(arg.arg)
             continue
         translated = reader.translate(module, annotation)
+        check_parameter_markers(translated)
         base, _ = strip(translated)
         injected = (
             base is author.Context
@@ -101,8 +109,6 @@ def build(reader: Reader, registration: Registration) -> dict[str, Json]:
                 reader.refuse(module, arg, "one Assets parameter without a default is supported")
             assets = assets_binding(arg.arg, translated)
             fields.append((arg.arg, assets.wire_type))
-            if assets.decoded:
-                capabilities.append("media_decode")
             continue
         _wire_type(translated)
         if arg.arg in defaults:
@@ -140,7 +146,8 @@ def build(reader: Reader, registration: Registration) -> dict[str, Json]:
     if not is_struct(result):
         reader.refuse(module, fn.returns, "an invocable result must be a msgspec.Struct")
     assert_declaration_shape(payload)
-    assert_declaration_shape(result)
+    assert_declaration_shape(result, result=True)
+    decode_bounds(registration.name, payload, assets)
     doc = package_interface.callable_doc(
         name=registration.name,
         payload_type=payload,
@@ -153,6 +160,8 @@ def build(reader: Reader, registration: Registration) -> dict[str, Json]:
     )
     if registration.weights and "weights" not in capabilities:
         capabilities.append("weights")
+    if media_kinds(payload, assets):
+        capabilities.append("media_decode")
     slots = [str(slot["path"]).rsplit(".", 1)[-1] for slot in models]
     check_model_arguments(registration.model_defaults, slots)
     check_model_arguments(registration.model_components, slots, what="components")

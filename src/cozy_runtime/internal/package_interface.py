@@ -18,7 +18,14 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal, NoReturn, cast
 import msgspec
 
 from cozy_runtime.author import ConformanceError, Surface, WeightsOutput
-from cozy_runtime.author._markers import IMAGE_PREPARATION_PROFILE
+from cozy_runtime.author._markers import (
+    AUDIO_PREPARATION_PROFILE,
+    IMAGE_PREPARATION_PROFILE,
+    VIDEO_PREPARATION_PROFILE,
+    AudioPreparation,
+    ImagePreparation,
+    VideoPreparation,
+)
 from cozy_runtime.author._media import KIND_MEDIA
 from cozy_runtime.author._model import ENCODED_LEAVES, Model, component_use
 from cozy_runtime.author._model_defaults import model_default
@@ -82,10 +89,31 @@ class ModelSlot(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
         return self.path.rpartition(".")[2]
 
 
-class ImagePreparation(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
-    profile: str
-    max_edge: Annotated[int, msgspec.Meta(gt=0)] | msgspec.UnsetType = msgspec.UNSET
-    max_pixels: Annotated[int, msgspec.Meta(gt=0)] | msgspec.UnsetType = msgspec.UNSET
+class ImageFit(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=True):
+    profile: Literal["image-fit/1"]
+    max_edge: Annotated[int, msgspec.Meta(gt=0)] | None = None
+    max_pixels: Annotated[int, msgspec.Meta(gt=0)] | None = None
+
+
+_Seconds = Annotated[int, msgspec.Meta(gt=0)] | Annotated[float, msgspec.Meta(gt=0)]
+
+
+class Trim(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=True):
+    profile: Literal["video-trim/1", "audio-trim/1"]
+    excess: Literal["refuse", "truncate"]
+    min_seconds: _Seconds | None = None
+    max_seconds: _Seconds | None = None
+
+
+#: Profile -> its grammar and the marker that enforces it. A profile not listed here is a
+#: newer writer's, and readers ignore it.
+PREPARATION_PROFILES: dict[
+    str, tuple[type[msgspec.Struct], type[ImagePreparation | VideoPreparation | AudioPreparation]]
+] = {
+    IMAGE_PREPARATION_PROFILE: (ImageFit, ImagePreparation),
+    VIDEO_PREPARATION_PROFILE: (Trim, VideoPreparation),
+    AUDIO_PREPARATION_PROFILE: (Trim, AudioPreparation),
+}
 
 
 class AssetKind(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
@@ -94,13 +122,12 @@ class AssetKind(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
     max_count: Annotated[int, msgspec.Meta(ge=0)] | msgspec.UnsetType = msgspec.UNSET
     max_bytes: Annotated[int, msgspec.Meta(gt=0)] | msgspec.UnsetType = msgspec.UNSET
     max_decoded_bytes: Annotated[int, msgspec.Meta(gt=0)] | msgspec.UnsetType = msgspec.UNSET
-    prepare: ImagePreparation | msgspec.UnsetType = msgspec.UNSET
+    prepare: dict[str, JsonValue] | msgspec.UnsetType = msgspec.UNSET
 
 
 class AssetsSlot(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
     parameter: str
     kinds: Annotated[tuple[AssetKind, ...], msgspec.Meta(min_length=1, max_length=4)]
-    view: Literal["decoded"] | msgspec.UnsetType = msgspec.UNSET
 
 
 class WeightsOutputDeclaration(msgspec.Struct, frozen=True, kw_only=True):
@@ -249,13 +276,10 @@ def callable_doc(
                 row["max_bytes"] = bound.max_bytes
             if bound and bound.max_decoded_bytes is not None:
                 row["max_decoded_bytes"] = bound.max_decoded_bytes
-            if cls.kind == "image" and assets.image_preparation is not None:
-                row["prepare"] = dict(assets.image_preparation.descriptor())
+            if (preparation := assets.preparation(cls.kind)) is not None:
+                row["prepare"] = dict(preparation.descriptor())
             kinds.append(row)
-        slot: dict[str, Json] = {"parameter": assets.parameter, "kinds": kinds}
-        if assets.decoded:
-            slot["view"] = "decoded"
-        doc["assets"] = slot
+        doc["assets"] = {"parameter": assets.parameter, "kinds": kinds}
     if publishes:
         doc["publishes"] = True
     if not accelerator:
@@ -637,21 +661,65 @@ def _assets_slot(slot: AssetsSlot, request: Json, source: str, path: str) -> Non
         _invalid(source, path, "assets kinds must be unique")
     media: set[str] = set()
     for row in slot.kinds:
-        if slot.view == "decoded" and row.kind == "file":
-            _invalid(source, path, "decoded Assets does not include generic file handles")
         if not row.media_types and row.kind != "file":
             _invalid(source, path, "a media kind needs explicit MIME types")
         for mime in row.media_types:
             if mime != mime.strip().lower() or "/" not in mime or mime in media:
                 _invalid(source, path, "assets MIME types must be distinct and canonical")
             media.add(mime)
-        if row.prepare is not msgspec.UNSET and (
-            row.kind != "image"
-            or slot.view != "decoded"
-            or row.prepare.profile != IMAGE_PREPARATION_PROFILE
-            or (row.prepare.max_edge is msgspec.UNSET and row.prepare.max_pixels is msgspec.UNSET)
-        ):
-            _invalid(source, path, "image preparation needs decoded image Assets and a cap")
+        if row.prepare is not msgspec.UNSET:
+            _preparation(row.prepare, source, f"{path}.prepare", frozenset({row.kind}))
+
+
+def preparation_members(
+    value: Json,
+) -> tuple[type[ImagePreparation | VideoPreparation | AudioPreparation], dict[str, Json]] | None:
+    """A known profile's marker and its grammar members, or None for a newer writer's profile.
+
+    A known profile admits exactly its grammar: an extra member refuses.
+    """
+    if not isinstance(value, dict) or not isinstance(value.get("profile"), str):
+        raise ConformanceError("must be an object naming its profile", code="preparation")
+    known = PREPARATION_PROFILES.get(value["profile"])
+    if known is None:
+        return None
+    grammar, marker = known
+    try:
+        members = msgspec.structs.asdict(msgspec.convert(value, grammar, strict=True))
+    except msgspec.ValidationError as exc:
+        raise ConformanceError(str(exc), code="preparation") from exc
+    members = {key: item for key, item in members.items() if key != "profile" and item is not None}
+    marker(**members)
+    return marker, members
+
+
+def _preparation(value: Json, source: str, path: str, kinds: frozenset[str]) -> None:
+    """A known profile's members, and that it prepares a kind the declaration carries."""
+    try:
+        known = preparation_members(value)
+    except (ConformanceError, TypeError) as exc:
+        _invalid(source, path, f"is not a valid preparation: {exc}")
+    if known is not None and known[0].kind not in kinds:
+        _invalid(source, path, f"{value['profile']} does not prepare {sorted(kinds)} inputs")
+
+
+def _schema_asset_kinds(value: Json) -> frozenset[str]:
+    """The asset kinds a rendered type reaches through containers, stopping at records."""
+    if not isinstance(value, dict):
+        return frozenset()
+    if isinstance(value.get("asset"), str):
+        return frozenset({value["asset"]})
+    if isinstance(value.get("union"), list):
+        members: list[Json] = value["union"]
+    elif isinstance(value.get("tuple"), list):
+        members = value["tuple"]
+    elif "list" in value:
+        members = [value["list"]]
+    elif isinstance(value.get("map"), dict):
+        members = [value["map"].get("value")]
+    else:
+        return frozenset()
+    return frozenset(kind for member in members for kind in _schema_asset_kinds(member))
 
 
 def _schema(value: Json, source: str, path: str, union_tag_field: str | None = None) -> None:
@@ -712,8 +780,17 @@ def _schema(value: Json, source: str, path: str, union_tag_field: str | None = N
                 constraints = field["constraints"]
                 if not isinstance(constraints, dict) or not constraints:
                     _invalid(source, f"{field_path}.constraints", "must be a non-empty object")
-            if "asset_bound" in field and not isinstance(field["asset_bound"], dict):
-                _invalid(source, f"{field_path}.asset_bound", "must be an object")
+            if "asset_bound" in field:
+                asset_bound = field["asset_bound"]
+                if not isinstance(asset_bound, dict):
+                    _invalid(source, f"{field_path}.asset_bound", "must be an object")
+                if "prepare" in asset_bound:
+                    _preparation(
+                        asset_bound["prepare"],
+                        source,
+                        f"{field_path}.asset_bound.prepare",
+                        _schema_asset_kinds(field["type"]),
+                    )
         return
     if form == "union":
         union = _fields(value, {"union"}, source, path)

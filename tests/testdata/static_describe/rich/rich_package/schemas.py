@@ -10,6 +10,7 @@ import msgspec
 from cozy_runtime.author import (
     AssetBound,
     AudioAsset,
+    AudioPreparation,
     FileAsset,
     ImageAsset,
     ModelDefault,
@@ -42,7 +43,7 @@ class ImageReference(msgspec.Struct, tag="image", tag_field="type", forbid_unkno
 
 
 class AudioReference(msgspec.Struct, tag="audio", tag_field="type", forbid_unknown_fields=True):
-    audio: Annotated[AudioAsset, bounds.AUDIO_BOUND]
+    audio: Annotated[AudioAsset, bounds.AUDIO_BOUND, AudioPreparation(max_seconds=30)]
 
 
 Reference = ImageReference | AudioReference

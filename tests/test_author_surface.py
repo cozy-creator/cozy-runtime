@@ -212,7 +212,8 @@ def test_a_saved_output_becomes_a_granted_input(tmp_path: Path) -> None:
     out = fake_outputs(fake_attempt("first", spool=tmp_path / "first"))
     saved = out.save_bytes(b"payload bytes", media_type="application/octet-stream")
 
-    granted = fake_input(saved, attempt="second", input_id="document", max_decoded_bytes=1 << 20)
+    second = fake_attempt("second", spool=tmp_path / "second")
+    granted = fake_input(saved, attempt=second, input_id="document", max_decoded_bytes=1 << 20)
 
     assert type(granted) is type(saved)
     assert granted is not saved
@@ -223,7 +224,7 @@ def test_a_saved_output_becomes_a_granted_input(tmp_path: Path) -> None:
     assert granted.read_bytes() == b"payload bytes"
 
     with pytest.raises(CapabilityError):
-        fake_input(FileAsset("file:never-hydrated"), attempt="second")
+        fake_input(FileAsset("file:never-hydrated"), attempt=second)
 
 
 def test_a_request_decodes_only_through_the_supported_path() -> None:

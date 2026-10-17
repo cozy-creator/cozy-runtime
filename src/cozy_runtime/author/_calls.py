@@ -23,6 +23,7 @@ from cozy_runtime.author._artifacts import ModelArtifact
 from cozy_runtime.author._assets import Asset, Assets, Tree, asset_dec_hook
 from cozy_runtime.author._capture import ActivationCapture, ExecutionObservation
 from cozy_runtime.author._context import Context
+from cozy_runtime.author._decode import MediaReads
 from cozy_runtime.author._errors import CapabilityError, ConformanceError
 from cozy_runtime.author._executor_requests import (
     MAX_CALL_INDEX,
@@ -352,12 +353,17 @@ class _Broker:
         self.context: Context | None = None
         self.grant_token = object()
         self.telemetry: Telemetry | None = None
+        #: The attempt's media reader: received media and Tree members read through it.
+        self.media: MediaReads | None = None
 
-    def bind(self, ctx: Context, telemetry: Telemetry | None = None) -> None:
+    def bind(
+        self, ctx: Context, telemetry: Telemetry | None = None, media: MediaReads | None = None
+    ) -> None:
         if self.closed or self.context is not None or ctx.request_id != self.request_id:
             raise CapabilityError("package broker escaped its attempt", code="escaped_handle")
         self.context = ctx
         self.telemetry = telemetry
+        self.media = media
         ctx._release_gpus = self.release_gpus
 
     def release_gpus(self) -> None:
@@ -484,6 +490,7 @@ class _Broker:
                             observation=call.observation,
                             grant_token=self.grant_token,
                             python_type=call.binding.python_result,
+                            media=self.media,
                         )
                         return cast(R, result)
                     except (ValueError, TypeError, msgspec.ValidationError) as exc:
