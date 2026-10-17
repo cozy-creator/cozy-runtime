@@ -534,9 +534,8 @@ class Weights:
         memory = self.allocation()
         reserved = memory["reserved_bytes"]
         allowed = reserved + memory["driver_free_bytes"] - self.floor_free
-        if self.cap >= 0:
-            committed = max(plane.stats(self.plane).device(self.index).committed, 0)
-            allowed = min(allowed, self.cap - max(self.context_bytes, 0) - committed)
+        if self.cap >= 0:  # the plane's budget, not only its maps: it grows into the rest
+            allowed = min(allowed, self.cap - max(self.context_bytes, 0) - self._claimed())
         if reserved > allowed:
             # A lowered limit stops new segments; the idle ones torch keeps go back now.
             accel.release_cached(self.torch, self.kind)
@@ -666,13 +665,17 @@ class Weights:
 
     def headroom(self, memory: Mapping[str, int]) -> int:
         """Device bytes this process may still take: the driver's free above the floor and,
-        under a cap, the cap less what the process holds (context, torch, the plane's maps)."""
+        under a cap, the cap less what the process holds or the plane may map (context, torch,
+        the plane's budget)."""
         free = memory["driver_free_bytes"] - self.floor_free
         if self.cap >= 0:
-            committed = max(plane.stats(self.plane).device(self.index).committed, 0)
-            held = max(self.context_bytes, 0) + memory["reserved_bytes"] + committed
+            held = max(self.context_bytes, 0) + memory["reserved_bytes"] + self._claimed()
             free = min(free, self.cap - held)
         return max(free, 0)
+
+    def _claimed(self) -> int:
+        """What the plane holds or its budget lets it map."""
+        return max(plane.stats(self.plane).device(self.index).committed, self.applied, 0)
 
     def sizing(self) -> int:
         """The largest measured activations a grant must leave room for: an adaptive stage
@@ -3537,7 +3540,7 @@ class WeightResidency:
                 continue
             if memory.free_for(nbytes, op, upto=Rung.IDLE) and memory.freed:
                 continue
-            unused = max(budget - weights._committed(), 0)
+            unused = max(budget - weights._committed(), 0) if weights.cap < 0 else 0
             if own and memory.free() >= unused + nbytes + weight_policy.MARGIN:
                 budget += nbytes  # the plane's budget grows into room the device has
             elif not floor:
