@@ -39,7 +39,7 @@ class Rung(IntEnum):
     SLACK = 0  # torch's idle cache
     IDLE = 1  # orphaned rings, weights no stage holds, other tenants (`DeviceRoom`)
     FINER = 2  # the running stage's resident set, its components not in use
-    CACHES = 3  # what is kept for speed alone (`RELEASERS`; reservations with U7)
+    CACHES = 3  # what is kept for speed alone: reservations (`Weights.reserve`), `RELEASERS`
     HOST = 4  # live tensors to page-locked host memory, the op's operands last
     DISK = 5  # the pinned tier toward 0, so more can lock
 
@@ -305,6 +305,7 @@ class Memory:
             (Rung.IDLE, lambda short: self.ask(self.free() + short)),  # all it wants free
             (Rung.FINER, self._finer),
             (Rung.FINER, lambda _: weights.spare(operands)),
+            (Rung.CACHES, lambda short: weights.shed(self.free() + short - MARGIN)),
             (Rung.CACHES, lambda _: [release() for release in RELEASERS]),
             (Rung.HOST, lambda short: weights.spill(short, operands)),
             (Rung.DISK, lambda short: weights.unpin(short, operands)),
