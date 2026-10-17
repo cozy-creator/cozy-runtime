@@ -396,6 +396,8 @@ class Weights:
         self.adaptive: dict[str, int] = {}
         self.oom_retries = 0
         self.modes: dict[str, str] = {}
+        #: `spill.TOTALS` as the attempt's first spill began: its mode counts from there
+        self.spilled_from = list(spill.TOTALS)
         #: the stages open now, outermost first. A stage another model slot enters inside one
         #: (H3's turbo LoRA inside its DiT's) is placed with it, inside the one budget.
         self.open: list[tuple[WeightResidency, str, tuple[str, ...]]] = []
@@ -882,12 +884,8 @@ class Weights:
         disk once the host can give no more. Whether any moved."""
         if self.host_only:
             return False
-        # What is kept for speed alone (an LM's decode session, recorded graphs) goes, never
-        # to host: moved there, every later call would read it over the bus (run 10143).
-        if any([release() for release in RELEASERS]):
-            accel.release_cached(self.torch, self.kind)
-            if self.allocatable() >= need + weight_policy.MARGIN:
-                return True
+        if "spilled" not in self.modes:  # a new attempt: its own moves from here
+            self.spilled_from = list(spill.TOTALS)
         want = need + weight_policy.MARGIN
         room = self.lockable(want)
         placed = self.pool.storages() if self.pool is not None else ()
@@ -897,7 +895,7 @@ class Weights:
             )
         accel.release_cached(self.torch, self.kind)
         self.limit_torch()
-        self.modes["spilled"] = spill.summary()
+        self.modes["spilled"] = spill.summary(self.spilled_from)
         return moved > 0
 
     def _device(self) -> Device:
@@ -1374,9 +1372,9 @@ class Weights:
     # -- the pinned tier
 
     def host_share(self) -> int:
-        """This process's pinned tier at most: its weights, inside the machine's pinned total
-        (`weight_policy.pinned_total`) less what others pin already. -1: the host is
-        unreadable."""
+        """This process's pinned tier at most: its weights, inside what it pins now and its
+        GPU's share of what the host has beside its margin. Tensors moved off the device take
+        host memory before it (`lockable`). -1: the host is unreadable."""
         total = sum(c.ws.nbytes for c in self.components.values())
         try:
             memory = proctree.host_memory()
@@ -1384,9 +1382,8 @@ class Weights:
             return -1
         if memory.available < 0:
             return -1
-        others = max(memory.shmem - max(plane.stats(self.plane).host.used, 0), 0)
-        allowed = weight_policy.pinned_total(memory.available, memory.shmem)
-        return min(total, max(allowed - others, 0) // self.world)
+        own = max(plane.stats(self.plane).host.used, 0)
+        return min(total, own + max(memory.available - weight_policy.HOST_MARGIN, 0) // self.world)
 
     def hold_host(self) -> None:
         """Keep the pinned tier inside what the host has now, whoever set its budget: the
@@ -1583,8 +1580,8 @@ class Weights:
             squeezed=dict(self.squeezes),
             paged_out=self.paged_out[0],
             paged_out_bytes=self.paged_out[1],
-            spilled=spill.MOVED[0],
-            spilled_bytes=spill.MOVED[1],
+            spilled=spill.TOTALS[0],
+            spilled_bytes=spill.TOTALS[1],
             modes={**self.modes, **lora_bake.mode()},
         )
 

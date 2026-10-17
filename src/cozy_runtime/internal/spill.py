@@ -52,12 +52,9 @@ GRAIN = 2 << 20
 ALIGN = 256
 #: A move to or from disk crosses host memory in pieces of this size.
 CHUNK = 64 << 20
-#: [times tensors moved, their bytes, nanoseconds it took] since the process began
-MOVED = [0, 0, 0]
-#: bytes moved [mapped, out to host memory, out to disk] since the process began
-TIERS = [0, 0, 0]
-#: [times tensors came back (`restore`, `fault`), their bytes] since the process began
-RESTORED = [0, 0]
+#: since the process began: [moves, their bytes, nanoseconds they took, bytes mapped, bytes
+#: out to host memory, bytes out to disk, bytes back on the device (`restore`, `fault`)]
+TOTALS = [0, 0, 0, 0, 0, 0, 0]
 #: locked blocks no tensor holds, by size; and the address of every block one holds -> its size
 _FREE: dict[int, list[Tensor]] = {}
 HELD: dict[int, int] = {}
@@ -197,11 +194,12 @@ def hosted(value: object) -> bool:
     return bool(HELD) and any(t.untyped_storage().data_ptr() in HELD for t in stored((value,)))
 
 
-def summary() -> str:
-    seconds = MOVED[2] / 1e9
+def summary(since: Sequence[int]) -> str:
+    """What moved since `TOTALS` read `since`: one call's moves, not the process's."""
+    n, moved, ns, mapped, host, disk, back = (a - b for a, b in zip(TOTALS, since, strict=True))
     return (
-        f"{MOVED[0]}x {MOVED[1]} B in {seconds:.1f} s: {TIERS[0]} B mapped, {TIERS[1]} B to "
-        f"host, {TIERS[2]} B to disk; {RESTORED[1]} B back"
+        f"{n}x {moved} B in {ns / 1e9:.1f} s ({mapped} B mapped, {host} B to host, {disk} B "
+        f"to disk), {back} B back"
     )
 
 
@@ -258,17 +256,17 @@ def spill(
             except RuntimeError:  # the host locks no more: what can leave whole does
                 mapped = False
             else:
-                left, moved, TIERS[0] = left - nbytes, moved + nbytes, TIERS[0] + nbytes
+                left, moved, TOTALS[3] = left - nbytes, moved + nbytes, TOTALS[3] + nbytes
                 continue
         if out and (nbytes <= left or disk):
             on_disk = nbytes > left
             _out(torch, storage, on_disk)
             left -= 0 if on_disk else nbytes
             moved += nbytes
-            TIERS[2 if on_disk else 1] += nbytes
-    MOVED[0] += moved > 0
-    MOVED[1] += moved
-    MOVED[2] += time.perf_counter_ns() - started
+            TOTALS[5 if on_disk else 4] += nbytes
+    TOTALS[0] += moved > 0
+    TOTALS[1] += moved
+    TOTALS[2] += time.perf_counter_ns() - started
     return moved
 
 
@@ -310,8 +308,7 @@ def restore(torch: ModuleType, device: Device, room: int) -> int:
             # `fresh` takes the host pointer and frees its block when it goes
             storage._swap_data_ptr_(fresh.untyped_storage())
             del OFF[storage._cdata]
-            RESTORED[0] += 1
-            RESTORED[1] += off.nbytes
+            TOTALS[6] += off.nbytes
         else:
             _in(torch, storage, off)
         back += off.nbytes
@@ -453,8 +450,7 @@ def _in(torch: ModuleType, storage: UntypedStorage, off: Off) -> None:
             flat[span].copy_(part)
         file.close()
     del OFF[storage._cdata]
-    RESTORED[0] += 1
-    RESTORED[1] += off.nbytes
+    TOTALS[6] += off.nbytes
 
 
 def _sweep() -> None:

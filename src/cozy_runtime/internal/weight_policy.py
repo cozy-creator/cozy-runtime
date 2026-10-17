@@ -95,14 +95,6 @@ def free_floor(total: int, display: bool) -> int:
     return max(DISPLAY_FLOOR, total // 16) if display else 0
 
 
-def pinned_total(available: int, pinned: int) -> int:
-    """The most the pinned host tier may hold across the machine: half of what the host has
-    for it (free before its tightest limit, plus what is pinned already). Pinned memory is
-    unreclaimable; the other half stays for processes and the page cache, the tier's own
-    fallback. Everyone who pins (each executor, the Worker's kept tiers) shares this one sum."""
-    return (max(available, 0) + max(pinned, 0)) // 2
-
-
 def floor(layout: Layout) -> int:
     """The least a component runs in: `least` at the finest grain it can move to."""
     return min(layout.least, sum(layout.fine)) if layout.fine else layout.least

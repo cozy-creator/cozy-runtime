@@ -53,7 +53,7 @@ def test_what_no_op_touched_this_stage_leaves_whole_and_comes_back_for_its_next_
         assert operand.untyped_storage().nbytes() == live.untyped_storage().nbytes() == 4 * FLOATS
         off = spill.OFF[earlier.untyped_storage()._cdata]
         assert (off.file is not None) == disk and (off.host is None) == disk
-        assert spill.TIERS[2 if disk else 1] >= 4 * FLOATS
+        assert spill.TOTALS[5 if disk else 4] >= 4 * FLOATS
         got = earlier + 1  # an op touches it: back first
     assert torch.equal(got, torch.arange(FLOATS, dtype=torch.float32) + 1)
     assert earlier.untyped_storage().nbytes() == 4 * FLOATS and not spill.OFF

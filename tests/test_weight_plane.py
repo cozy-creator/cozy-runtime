@@ -934,12 +934,12 @@ def test_a_map_the_device_refuses_unmaps_idle_weights_and_the_stage_runs(
     weights.set_budget(-1)  # each stage's budget from what the driver has
     torch.cuda.empty_cache()
     free, _ = torch.cuda.mem_get_info()
-    moved = spill.MOVED[0]
+    moved = spill.TOTALS[0]
     weights.modes.clear()
     with held_elsewhere(free - (128 << 20)):
         got = run(stage, x, passes=1)
     assert "idle" in weights.modes["memory"], "the device refused no map"
-    assert spill.MOVED[0] == moved, "a tensor went to host memory instead"
+    assert spill.TOTALS[0] == moved, "a tensor went to host memory instead"
     assert same(expected, got)
 
 
@@ -1117,11 +1117,11 @@ def test_a_card_the_packages_tensors_fill_runs_its_stage_through_host_and_disk(
         free = available - weight_policy.HOST_MARGIN - (512 << 20)
         ballast = torch.ones(max(free, 0), dtype=torch.uint8)  # its pages are the host's
     held = fill_card(weights)
-    before = list(spill.TIERS)
+    before = list(spill.TOTALS)
     with weights.recovering():
         got = run(model, x, passes=1)
-        tier = 0 if host == "room" else 2
-        assert spill.TIERS[tier] - before[tier] >= 256 << 20, spill.summary()
+        tier = 3 if host == "room" else 5
+        assert spill.TOTALS[tier] - before[tier] >= 256 << 20, spill.summary(before)
         assert spill.keep(x).device.type == "cpu"
         assert all(bool((t == i).all()) for i, t in enumerate(held)), "each one's own values"
         assert same(reference, got)  # in the mode: what left the device comes back to be read
