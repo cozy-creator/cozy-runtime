@@ -35,6 +35,7 @@ class Row:
 
 NONE = Row("none", "")
 _AMPERE = Row("Ampere", MMA_SYNC, int8=True)
+_RTX = Row("Blackwell RTX", MMA_SYNC, int8=True, fp8=True, fp4=True)  # block-scaled mma.sync
 ROWS: dict[int, Row] = {
     80: _AMPERE,
     86: _AMPERE,
@@ -43,9 +44,8 @@ ROWS: dict[int, Row] = {
     90: Row("Hopper", WGMMA, int8=True, fp8=True),
     100: Row("Blackwell", TCGEN05, int8=True, fp8=True, fp4=True),
     103: Row("Blackwell Ultra", TCGEN05, fp8=True, fp4=True),
-    120: Row("Blackwell RTX", MMA_SYNC, int8=True, fp8=True, fp4=True),  # block-scaled mma.sync
-    # No fp8 on GB10 until a 12.1 card passes `verify_op`: its CUTLASS fp8 GEMM may build a trap.
-    121: Row("Blackwell RTX", MMA_SYNC, int8=True, fp4=True),
+    120: _RTX,
+    121: _RTX,
 }
 #: cc -> the family an unnamed card's 8-bit op built for (`learn`)
 _LEARNED: dict[int, str] = {}
