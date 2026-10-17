@@ -33,7 +33,7 @@ from cozy_runtime.author.kernels import (
     entry_key,
     readable,
 )
-from cozy_runtime.internal import kernel_cache, kernel_compile
+from cozy_runtime.internal import kernel_cache, kernel_compile, tools
 
 try:
     import torch
@@ -181,11 +181,18 @@ def _store() -> kernel_cache.Store:
     return store
 
 
+def _submit(store: kernel_cache.Store, found: kernel_compile.Job) -> kernel_compile.State:
+    """`kernel_compile.submit`; a set not built while Triton has no C compiler is absent."""
+    if kernel_compile.status(store, found).state == "ready" or tools.triton():
+        return kernel_compile.submit(store, found)
+    raise KernelsUnavailable("kernels_absent", f"{found.key.kernel}: cc not found")
+
+
 def expect(kernels: TritonKernels, arch: int) -> str:
     """Submit `kernels`' build for `arch` without waiting, before any device exists: the
     state's line. Keyed in the process that will load it (its Triton and cache directory)."""
     try:
-        return kernel_compile.submit(_store(), job(kernels, arch)).line()
+        return _submit(_store(), job(kernels, arch)).line()
     except KernelsUnavailable as exc:
         return f"{exc.code}: {exc}"
 
@@ -235,6 +242,7 @@ def load(kernels: TritonKernels, *, device: object) -> Launch:
     major, minor = torch.cuda.get_device_capability(index)
     arch, store = major * 10 + minor, _store()
     found = job(kernels, arch)
+    _submit(store, found)
     state = kernel_compile.wait(store, found, kernels.name)
     if state.state != "ready":
         raise KernelsUnavailable("kernels_failed", f"{kernels.name} sm{arch}: {state.line()}")
@@ -274,7 +282,7 @@ def ready(kernels: TritonKernels, *, device: object) -> Launch | None:
     if torch.cuda.is_current_stream_capturing():  # a load would end the graph being recorded
         return None
     major, minor = torch.cuda.get_device_capability(target.index or 0)
-    if kernel_compile.submit(_store(), job(kernels, major * 10 + minor)).state == "compiling":
+    if _submit(_store(), job(kernels, major * 10 + minor)).state == "compiling":
         return None
     launch = load(kernels, device=device)
     LANDED[0] += 1

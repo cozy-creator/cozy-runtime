@@ -28,8 +28,10 @@ from types import ModuleType
 from typing import IO, TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
-    from torch import Generator, Tensor, device as Device
+    from torch import Generator, Tensor
+    from torch import device as Device
 
+from cozy_runtime.internal import tools
 from cozy_runtime.internal.encoding import E4M3_MAX
 from cozy_runtime.internal.encoding.formats import hadamard256
 
@@ -477,8 +479,10 @@ def warm(device: int) -> None:
     a child process under this one's interpreter and import path, once per process at load.
     This process then only loads the kernels from Triton's cache: it never runs a compiler, so
     one that crashes ends the child, and this process bakes eagerly with its reason."""
-    global _BUILD, _TRIED
+    global _BUILD, _TRIED, FUSED_ERROR
     _TRIED = True
+    if FUSED_ERROR is None and not _BUILT and not tools.triton():
+        FUSED_ERROR = "cc not found"
     if FUSED_ERROR is None and not _BUILT and _BUILD is None:
         log = tempfile.TemporaryFile()  # noqa: SIM115 - read and closed with the build (`_ready`)
         boot = json.dumps({"path": sys.path, "device": device})
@@ -492,7 +496,8 @@ def _ready(device: int, wait: bool = True) -> bool:
     global FUSED_ERROR, _BUILT, _BUILD
     if FUSED_ERROR is None and not _BUILT:
         warm(device)
-        assert _BUILD is not None
+        if _BUILD is None:
+            return False
         child, log = _BUILD
         if child.poll() is None and not wait:
             return False
