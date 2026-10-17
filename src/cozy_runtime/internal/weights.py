@@ -874,19 +874,12 @@ class Weights:
         if unmapped + weight_policy.MARGIN > self.headroom(memory):
             accel.release_cached(self.torch, self.kind)
 
-    def spill(self, need: int, operands: Sequence[object]) -> bool:
-        """Memory rung 4: this process's own tensors leave the device (`spill`), the op's
-        operands last: mapped to page-locked host memory while the host can give it
-        (`lockable`), those no op touched since their stage began out to host memory where
-        nothing can be mapped (unified memory, a host that locks no more). Whether any moved."""
-        return self._offload(need, operands, disk=False)
-
-    def unpin(self, need: int, operands: Sequence[object]) -> bool:
-        """Memory rung 5: as rung 4, and what can leave whole goes to disk once the host can
-        give no more (the pinned tier gave its share first: `lockable`)."""
-        return self._offload(need, operands, disk=True)
-
-    def _offload(self, need: int, operands: Sequence[object], disk: bool) -> bool:
+    def spill(self, need: int, operands: Sequence[object], disk: bool = False) -> bool:
+        """Memory rungs 4 and 5 (`disk`): this process's own tensors leave the device (`spill`),
+        the op's operands last. Mapped to page-locked host memory while the host can give it
+        (`lockable`); those no op touched since their stage began out to host memory where
+        nothing can be mapped (unified memory, a host that locks no more), and with `disk` to
+        disk once the host can give no more. Whether any moved."""
         if self.host_only:
             return False
         # What is kept for speed alone (an LM's decode session, recorded graphs) goes, never
