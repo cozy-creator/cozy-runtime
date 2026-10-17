@@ -155,6 +155,7 @@ class AssetLimits:
 
 IMAGE_PREPARATION_PROFILE = "image-fit/1"
 VIDEO_PREPARATION_PROFILE = "video-trim/1"
+VIDEO_FIT_PROFILE = "video-fit/1"
 AUDIO_PREPARATION_PROFILE = "audio-trim/1"
 
 
@@ -205,7 +206,7 @@ class _Trim:
 
     def __post_init__(self) -> None:
         name = type(self).__name__
-        if self.min_seconds is None and self.max_seconds is None:
+        if self.min_seconds is None and self.max_seconds is None and not self.fit():
             raise ConformanceError(f"{name} needs min_seconds or max_seconds", code="preparation")
         for value in (self.min_seconds, self.max_seconds):
             if value is not None and (
@@ -224,6 +225,10 @@ class _Trim:
             raise ConformanceError(f"{name} excess is refuse or truncate", code="preparation")
         if self.excess == "truncate" and self.max_seconds is None:
             raise ConformanceError(f"{name} truncate needs max_seconds", code="preparation")
+
+    def fit(self) -> dict[str, int | float | bool | str]:
+        """The client-hint caps it declares besides its duration policy."""
+        return {}
 
     @property
     def minimum(self) -> Fraction | None:
@@ -250,15 +255,69 @@ class _Trim:
 
 @dataclass(frozen=True, slots=True)
 class VideoPreparation(_Trim):
-    """Declared duration policy for a video field or the videos of an Assets input.
+    """Declared duration policy and fit for a video field or the videos of an Assets input.
 
     Shorter than `min_seconds`, or longer than `max_seconds` with `excess="refuse"`,
     refuses the request before the handler runs. `excess="truncate"` ends every read
     and stream of that input at `max_seconds` and reports an `adjusted` row.
+
+    The fit is the most of the input the package reads, never a refusal: `max_short_edge`,
+    `max_long_edge` and `max_pixels` bound a frame, `max_fps` the frame rate, and `audio` is
+    False when the package never reads the input's audio, or the name of a boolean member of
+    the same record that says whether it does. A client may reduce a larger video to the fit
+    before it uploads it, so the package's own sizing must give the same result for an input
+    already within it. Declaring any fit writes `video-fit/1`; a duration alone, `video-trim/1`.
     """
+
+    max_short_edge: int | None = None
+    max_long_edge: int | None = None
+    max_pixels: int | None = None
+    max_fps: int | float | None = None
+    audio: bool | str | None = None
 
     kind = "video"
     profile = VIDEO_PREPARATION_PROFILE
+
+    def __post_init__(self) -> None:
+        _Trim.__post_init__(self)
+        for key in ("max_short_edge", "max_long_edge", "max_pixels"):
+            value = getattr(self, key)
+            if value is not None and (type(value) is not int or value <= 0):
+                raise ConformanceError(
+                    f"VideoPreparation {key} is a positive integer", code="preparation"
+                )
+        fps = self.max_fps
+        if fps is not None and (
+            type(fps) not in (int, float) or not math.isfinite(fps) or fps <= 0
+        ):
+            raise ConformanceError(
+                "VideoPreparation max_fps is a positive number", code="preparation"
+            )
+        audio = self.audio
+        if (
+            audio is not None
+            and type(audio) is not bool
+            and not (isinstance(audio, str) and audio.isidentifier())
+        ):
+            raise ConformanceError(
+                "VideoPreparation audio is a bool or the name of a boolean member",
+                code="preparation",
+            )
+
+    def fit(self) -> dict[str, int | float | bool | str]:
+        caps = (
+            ("max_short_edge", self.max_short_edge),
+            ("max_long_edge", self.max_long_edge),
+            ("max_pixels", self.max_pixels),
+            ("max_fps", self.max_fps),
+            ("audio", self.audio),
+        )
+        return {key: value for key, value in caps if value is not None}
+
+    def descriptor(self) -> dict[str, str | int | float]:
+        fit = self.fit()
+        trim = _Trim.descriptor(self)
+        return {**trim, "profile": VIDEO_FIT_PROFILE, **fit} if fit else trim
 
 
 @dataclass(frozen=True, slots=True)
