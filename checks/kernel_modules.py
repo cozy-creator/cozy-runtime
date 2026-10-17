@@ -166,7 +166,10 @@ def main() -> int:
         foreign = [lib for lib in libraries if not SYSTEM.fullmatch(lib)]
         if foreign or not libraries:
             failed.append(f"{name} needs {foreign or 'nothing readable'}")
-        exports = exported(module)
+        # A DLL's exports bind no other DLL's names: Windows may also export nanobind's own
+        # exception types, which it marks dllexport for cross-module translation.
+        windows = module.suffix == ".pyd"
+        exports = [e for e in exported(module) if not (windows and "@nanobind@@" in e)]
         if exports != [f"PyInit_{name}"]:
             failed.append(
                 f"{name} exports {len(exports)} symbols, not PyInit_{name} alone: {exports[:5]}"
