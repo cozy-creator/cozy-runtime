@@ -51,8 +51,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref }}
-          # The native reuse proof compares against its donor's source commit.
-          fetch-depth: 0
           path: source
       - id: pin
         working-directory: source
@@ -115,47 +113,7 @@ jobs:
           uv pip install "tensorfs @ git+https://github.com/cozy-creator/tensorfs@v$version"
           echo UV_NO_SYNC=1 >> "$GITHUB_ENV"
       # From here to the machine check: publish.yaml's build job, step for step.
-      # The kernels wheel is x86_64; on an arm runner the Linux wheel is the pure one plus tensord.
-      - name: Fetch the pinned public native donor
-        if: env.WHEELS == 'true' && runner.arch == 'X64'
-        run: |
-          uv run --no-project --python 3.12 python - <<'PY'
-          import hashlib, json, os, pathlib, urllib.parse, urllib.request
-          filename = "cozy_runtime-0.18.86-cp312-abi3-manylinux_2_28_x86_64.whl"
-          expected = "d47d42187e8121a832fe69a8fa3faa676bd462d44f8c6c103685cfdb336ab7db"
-          with urllib.request.urlopen("https://pypi.org/pypi/cozy-runtime/0.18.86/json", timeout=30) as response:
-              metadata = json.load(response)
-          rows = [row for row in metadata["urls"] if row["filename"] == filename]
-          if len(rows) != 1 or rows[0]["digests"]["sha256"] != expected:
-              raise SystemExit("PyPI native donor differs from its reviewed release pin")
-          url = urllib.parse.urlsplit(rows[0]["url"])
-          if url.scheme != "https" or url.netloc != "files.pythonhosted.org":
-              raise SystemExit("native donor URL is outside the public PyPI file origin")
-          path = pathlib.Path(os.environ["RUNNER_TEMP"]) / filename
-          with urllib.request.urlopen(rows[0]["url"], timeout=60) as response, path.open("wb") as output:
-              while chunk := response.read(1 << 20):
-                  output.write(chunk)
-          with path.open("rb") as source:
-              if hashlib.file_digest(source, "sha256").hexdigest() != expected:
-                  raise SystemExit("downloaded native donor failed its pinned SHA-256")
-          PY
-      # Runs on the still-clean checkout: reuse refuses a dirty tree, and stamping dirties it.
-      - name: Reuse unchanged native inputs or build the kernels wheel
-        if: env.WHEELS == 'true' && runner.arch == 'X64'
-        working-directory: source
-        run: |
-          set +e
-          uv run --script scripts/build-dev-wheel.py \
-            --native-wheel "$RUNNER_TEMP/cozy_runtime-0.18.86-cp312-abi3-manylinux_2_28_x86_64.whl" \
-            --native-sha256 d47d42187e8121a832fe69a8fa3faa676bd462d44f8c6c103685cfdb336ab7db \
-            --release-commit "${{ steps.pin.outputs.sha }}" --reuse-or-build --out dist
-          status=$?
-          set -e
-          if [ "$status" -eq 3 ]; then
-            scripts/build-kernel-wheel.sh --out dist --commit "${{ steps.pin.outputs.sha }}"
-          elif [ "$status" -ne 0 ]; then
-            exit "$status"
-          fi
+      # On either arch the Linux wheel is the pure one plus tensord.
       - name: Build (sdist + pure-py wheel)
         if: inputs.build != 'none'
         working-directory: source

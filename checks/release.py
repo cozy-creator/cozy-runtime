@@ -2,8 +2,8 @@
 """Validate an immutable new publication, not ordinary source development.
 
 The explicitly dispatched publish workflow calls this guard. Source branches may
-retain a released manifest version; scripts/build-dev-wheel.py gives their
-unpublished artifacts a source/donor/recipe-derived local version.
+retain a released manifest version; dev-build's artifacts carry it, with their commit
+stamped in `cozy_runtime._build_provenance`.
 
 The selected tag must name this exact clean checkout, and publication requires that PyPI
 does not already know the version (including a partial release). Existing

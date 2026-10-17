@@ -1,16 +1,20 @@
-"""Cozy's purpose-built CUDA kernels: nanobind + DLPack over the CUDA runtime, abi3.
-
-The compiled ``_C`` extension rides only the linux/x86 cp312-abi3 wheel
-(``COZY_RUNTIME_BUILD_KERNELS=1`` at build time); the pure wheel carries this wrapper
-alone, and callers probe ``cozy_runtime._kernels._C`` before use.
+"""Cozy's purpose-built CUDA kernels for package authors: the cozy-kernels wheel's `_norm`
+(nanobind + DLPack over the CUDA runtime, one wheel per OS and CPU). Callers probe
+`author.kernels.native()` before use.
 """
 
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
 
-from importlib import import_module
 from typing import Any
+
+try:
+    from cozy_kernels import _norm
+
+    ABSENT = ""
+except ImportError as absent:  # no cozy-kernels wheel for this OS and CPU
+    ABSENT = f"no cozy-kernels wheel is installed ({absent})"
 
 
 def rms_rope_split_half(
@@ -33,8 +37,7 @@ def rms_rope_split_half(
     q_out = torch.empty_like(q)
     k_out = torch.empty_like(k)
     stream = torch.cuda.current_stream(q.device).cuda_stream
-    native = import_module("cozy_runtime._kernels._C")
-    native.rms_rope_split_half(
+    _norm.rms_rope_split_half(
         q,
         k,
         freqs,

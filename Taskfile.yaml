@@ -2,7 +2,7 @@ version: "3"
 silent: true
 
 tasks:
-  # The Linux wheel of this machine's arch delivers the machine: worker images take tensord from it. An arch with no kernels wheel (aarch64) gets the pure wheel tagged for it.
+  # The Linux wheel of this machine's arch delivers the machine: worker images take tensord from it. It is the pure wheel, tagged for the arch.
   machine:
     desc: Bundle tensord at its pin (tensord.pin, a commit or a release tag; MACHINE=checkout builds that source instead) into dist's Linux wheel for this arch
     cmds:
@@ -11,11 +11,7 @@ tasks:
         src="{{.MACHINE}}"; [ -n "$src" ] || { src=$work/src; git init -q "$src"
           git -C "$src" fetch -q --depth 1 https://github.com/cozy-creator/tensord "$(cat tensord.pin)" && git -C "$src" checkout -q FETCH_HEAD; }
         task -d "$src" release OUT="$work/bin"
-        if ls "$PWD"/dist/cozy_runtime-*-$tag.whl >/dev/null 2>&1; then
-          uvx --from wheel==0.47.0 wheel unpack "$PWD"/dist/cozy_runtime-*-$tag.whl --dest "$work/wheel"
-        else
-          uvx --from wheel==0.47.0 wheel unpack "$PWD"/dist/cozy_runtime-*-py3-none-any.whl --dest "$work/wheel"
-          sed -i -e 's/^Root-Is-Purelib: true$/Root-Is-Purelib: false/' -e "s/^Tag: py3-none-any$/Tag: $tag/" "$work"/wheel/*/*.dist-info/WHEEL
-        fi
+        uvx --from wheel==0.47.0 wheel unpack "$PWD"/dist/cozy_runtime-*-py3-none-any.whl --dest "$work/wheel"
+        sed -i -e 's/^Root-Is-Purelib: true$/Root-Is-Purelib: false/' -e "s/^Tag: py3-none-any$/Tag: $tag/" "$work"/wheel/*/*.dist-info/WHEEL
         install -D -m 0755 "$work/bin/tensord-linux-$arch" "$(echo "$work"/wheel/*/*.dist-info | sed 's/\.dist-info$/.data/')/scripts/tensord"
         SOURCE_DATE_EPOCH=946684800 uvx --from wheel==0.47.0 wheel pack "$work"/wheel/* --dest-dir dist

@@ -12,8 +12,7 @@ weight operand the plane has not mapped (`readable`).
 Also public here: the operand an encoded leaf takes already quantized (`PreQuantized`), a scope
 in which the leaves that read one activation quantize it once (`quantize_once`), a producer's
 norm, modulation and activation folded into that quantization (`int8_rows`), and the
-Runtime's compiled CUDA kernels (`rms_rope_split_half`), which ride its linux x86 cp312-abi3
-wheel.
+compiled CUDA kernels of the cozy-kernels wheel (`rms_rope_split_half`).
 """
 
 from __future__ import annotations
@@ -24,7 +23,6 @@ from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from importlib.util import find_spec
 from typing import Any, cast
 
 from cozy_runtime import _kernels
@@ -206,10 +204,8 @@ def int8_rows(
 
 
 def native() -> str:
-    """Why this Runtime has no compiled CUDA kernels here, or "" when it has them."""
-    if find_spec("cozy_runtime._kernels._C") is None:
-        return "this Runtime wheel carries no compiled kernels (cozy_runtime._kernels._C)"
-    return ""
+    """Why this machine has no compiled CUDA kernels, or "" when it has them."""
+    return _kernels.ABSENT
 
 
 @contextmanager
@@ -238,7 +234,7 @@ def rms_rope_split_half(
 ) -> tuple[Any, Any]:
     """Per-head RMSNorm of `q` and `k` (scaled by `q_scale`/`k_scale`), then split-half RoPE by
     the `[..., rot_dim // 2, 2, 2]` rotation matrix `freqs`, out of place, in one launch.
-    `native()` says why this Runtime cannot (only its linux x86 wheel carries the kernel).
+    `native()` says why this machine cannot (no cozy-kernels wheel for its OS and CPU).
     """
     with readable(q, k, freqs, q_scale, k_scale) as (q, k, freqs, q_scale, k_scale):
         return _kernels.rms_rope_split_half(q, k, freqs, q_scale, k_scale, epsilon, rot_dim)
