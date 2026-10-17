@@ -1,0 +1,1 @@
+- A stage whose op runs in `split` pieces keeps room for its finest piece beside the weights it holds whole. SeedVR2's warm request on an 8 GiB pool no longer maps its whole DiT and then spills every piece to host memory (5090: denoise 128 s against 15 s cold; 5060 Ti: the request failed).
