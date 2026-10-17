@@ -190,13 +190,14 @@ class Memory:
         """Whether `nbytes` (and a margin) are free once the ladder ran as far as `upto`:
         rung by rung, each action again while it gives bytes back, until they are."""
         weights = self.weights
+        self.freed = 0
         if weights.host_only or nbytes + max(weights.context_bytes, 0) > weights.total:
             return False  # no rung makes a GPU larger: nothing moves for it
-        want, start = max(nbytes, 0) + MARGIN, -1
+        want, start = max(nbytes, 0) + MARGIN, self.free()
         placing, weights.placing, self._collected = weights.placing, True, False
         try:
-            self._settle()
-            start = have = self.free()
+            self._settle()  # rung 0: torch's idle cache, which counts as given back
+            have = self.free()
             for rung, act in self._ladder(operands):
                 if rung > upto or have >= want:
                     break
@@ -211,7 +212,7 @@ class Memory:
             return have >= want
         finally:
             weights.placing = placing
-            self.freed = max(self.free() - start, 0) if start >= 0 else 0
+            self.freed = max(self.free() - start, 0)
 
     def again(
         self,
