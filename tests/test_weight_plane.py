@@ -895,16 +895,16 @@ def test_a_map_the_device_refuses_unmaps_idle_weights_and_the_stage_runs(
 
 
 @on_card
-@pytest.mark.parametrize("holder", ["garbage", "live"])
-def test_a_ring_a_view_outlives_never_refuses_the_next_stage(card: Any, holder: str) -> None:
-    """Run 10562, H3's second segment on 32 GB: a view into the stage's ring outlived it (frames
-    of a block that failed and ran again hold one). The cursor stayed open under it, its ring
-    mapped, and the next stage's ring found the plane's budget taken: "need 813694976 bytes,
-    283700736 free; evicting lower priorities is not enough, blocked by []", refused as the
-    stage's working set. Garbage is collected and the ring goes; a view still in use leaves
-    the next stage what remains of the same budget. Either way: no refusal, the same bits."""
+def test_a_ring_dead_frames_still_view_never_refuses_the_next_stage(card: Any) -> None:
+    """Run 10562, H3's second segment on 32 GB: frames of a block that failed and ran again, in
+    a reference cycle, held a view into the stage's ring. The cursor stayed open under it, its
+    ring mapped, and the next stage's ring found the plane's budget taken: "need 813694976
+    bytes, 283700736 free; evicting lower priorities is not enough, blocked by []", refused as
+    the stage's working set. The garbage is collected and the ring goes: no refusal, the same
+    budget, the same bits. (A view still in use pins the old cursor's ring and its home
+    regions too; Runtime 0.28's memory ladder grows into device room for it.)"""
     weights = card.weights
-    model = load(weights, card.checkpoint, f"ring-{holder}")
+    model = load(weights, card.checkpoint, "ring")
     layout: weight_policy.Layout = model.residency.components["stack"].layout
     x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
     weights.set_budget(1 << 30)
@@ -924,8 +924,7 @@ def test_a_ring_a_view_outlives_never_refuses_the_next_stage(card: Any, holder: 
         for grab in grabs:
             grab.remove()
         assert weights.facts().streamed["stack"].resident_blocks < BLOCKS
-        if holder == "garbage":
-            del frames
+        del frames  # garbage, still viewing the ring
         model.residency.unpark()
         second = run(model, x)
     finally:
