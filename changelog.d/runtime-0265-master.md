@@ -1,0 +1,1 @@
+Runtime 0.26.5 is cut from master: each component's GEMM kernels named in a run (`gemm.selected`/`gemm.fallback`, #1519, #1522) and a CUDA graph capture before the int8 op lands recording eager instead of comfy-kitchen (#1520), on TensorD 0.7.3.
