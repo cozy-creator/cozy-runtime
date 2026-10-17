@@ -2273,6 +2273,44 @@ def test_a_group_gpus_denoise_keeps_a_resident_set_after_a_one_pass_warm_up(card
 
 
 @on_gpu
+def test_a_stage_that_runs_once_never_evicts_what_a_repeating_stage_keeps(
+    tmp_path: Path,
+) -> None:
+    """Run 10808 (H3 on an RTX 4090): the text encoder's one pass evicted the DiT's resident
+    set, and every request's denoise read it back (99 GiB paged per 5 s clip). A stage that
+    runs once streams beside a repeating stage's kept set, exactly, and the repeating stage's
+    next entry copies nothing in."""
+    weights = Weights(torch, torch.device("cuda", 0), "cuda")
+    weights.set_budget(-1, pinned=1 << 30)
+    (tmp_path / "dit").mkdir()
+    (tmp_path / "te").mkdir()
+    dit = load(weights, write_checkpoint(tmp_path / "dit")[0], "dit")
+    te = load(weights, write_checkpoint(tmp_path / "te")[0], "te")
+    denoiser, encoder = dit.residency.components["stack"], te.residency.components["stack"]
+    weights.set_budget(denoiser.layout.total + (64 << 20))  # the DiT whole, not both
+    x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
+
+    def staged(model: Any, method: str, passes: int) -> list[Any]:
+        model.residency.admit(method, ("stack",))
+        try:
+            with torch.inference_mode():
+                return [model.stack(x) for _ in range(passes)]
+        finally:
+            model.residency.release(method, ("stack",))
+
+    encoded = staged(te, "encode", 1)  # a request's first: unknown, so planned as cyclic
+    reference = staged(dit, "denoise", 3)
+    held = weights.resident_bytes(denoiser)
+    assert denoiser.residence is not None and denoiser.residence.streamed == () and held > 0
+    assert same(staged(te, "encode", 1), encoded)
+    assert encoder.residence is not None and encoder.residence.streamed
+    assert weights.resident_bytes(denoiser) == held
+    weights.modes.clear()
+    assert same(staged(dit, "denoise", 1), reference[:1])
+    assert weights.modes["denoise.loaded"] == "0 B"
+
+
+@on_gpu
 def test_a_group_gpus_first_decode_keeps_its_denoisers_weights_under_a_cap(
     tmp_path: Path,
 ) -> None:

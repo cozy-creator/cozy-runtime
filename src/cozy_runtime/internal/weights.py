@@ -254,9 +254,13 @@ class Component:
     order: list[int] = field(default_factory=list)
     observed: bool = False
     seen: list[int] = field(default_factory=list)
-    #: block passes in the running stage, and in its last one: >1 is a cyclic (denoise) stage
+    #: block passes and block calls in the open stage; per method, whether its last stage
+    #: read a block more than once (cyclic: a denoise's steps, a decode's chunks)
     passes: int = 0
-    last_passes: int = 0
+    uses: int = 0
+    cycled: dict[str, bool] = field(default_factory=dict)
+    #: its last stage repeated: its resident set stays mapped above idle weights (`plane.HOT`)
+    hot: bool = False
     residence: weight_policy.Residence | None = None
     cursor: Cursor | None = None
     #: the cursor's schedule: `order` from the block it started at
@@ -298,6 +302,11 @@ class Component:
 
     def __post_init__(self) -> None:
         self.numbers = {region.index: i for i, region in enumerate(self.blocks)}
+
+    @property
+    def cycling(self) -> bool:
+        """The open stage read one of its blocks more than once."""
+        return self.uses > len(self.blocks)
 
     @property
     def planned(self) -> weight_policy.Layout:
@@ -423,6 +432,9 @@ class Weights:
         #: a group's stage whose activations are not measured yet runs its first pass at the
         #: floor, and is placed again at its second with what that pass measured
         self.growing = False
+        #: the band the open stages stream and fill on demand in: above repeating stages' kept
+        #: resident sets when they repeat too, among idle weights when they run once
+        self.band = plane.STREAMED
         #: the Worker's mid-call budget (`budget_cell`): read at every block boundary
         self.cell: budget_cell.Cell | None = None
         #: asks the Worker for `bytes` free on this GPU from its other tenants (`DeviceRoom`);
@@ -1508,7 +1520,7 @@ class Weights:
                 component.key, self.index
             )
         stages = [row for row in held.stages if row.device == self.index]
-        copied = device.host_copy_bytes + device.bounce_copy_bytes + device.disk_copy_bytes
+        copied = device.copied
         reserved = (
             -1
             if self.host_only
@@ -3456,7 +3468,7 @@ class WeightResidency:
                     bind(weights.torch, component.common, component.lease)
         except BaseException:
             with suppress(Exception):  # the original failure is the one to report
-                self._close(local)
+                self._close(method, local)
             self._left()
             raise
         self._entered(method)
@@ -3647,11 +3659,9 @@ class WeightResidency:
         try:
             if self.repeats.get(method, 0) > 1 and not weights.host_only:
                 # A repeating stage (a denoise step per entry) stays open for the next entry.
-                for name in local:
-                    self.components[name].last_passes = self.components[name].passes
                 self.parked = (method, local, weights.budget)
-            else:
-                self._close(local)
+            else:  # it repeated if a component of any open stage read a block again
+                self._close(method, local, any(c.cycling for _, _, c in weights.opened().values()))
             weights.drain()
             if weights.sharing is not None:
                 # Shared while resident: the next stage's plan would evict it otherwise.
@@ -3979,6 +3989,8 @@ class WeightResidency:
                 if shortage(exc) is None:
                     raise
                 break
+            if component.hot:  # back in its repeating stage's kept set
+                weights.plane.prioritise(component.ws, weights.index, [index], plane.HOT)
         weights.limit_torch()
 
     def document(self) -> dict[str, Any]:
@@ -4029,7 +4041,19 @@ class WeightResidency:
         # machine is on the device already and is never streamed (see `_paid`).
         kept = {key: _paid(c, c.planned)[1] for key, c in components.items()}
         at = {key: {block: p for p, block in enumerate(blocks)} for key, blocks in kept.items()}
-        measured = _costs(weights, {key: (c, opened[key][1]) for key, c in components.items()})
+        held = plane.stats(weights.plane)
+        measured = _costs(held, weights.index, opened)
+        # A stage that reads a block again is cyclic whatever its method's last stage did (a
+        # denoise after a one-pass warm-up), and so is a method not run yet: it keeps a
+        # resident set. One that runs once plans, streams and fills beside the resident sets
+        # repeating stages keep (keep hot).
+        cyclic = {
+            key
+            for key, (row, tag, c) in opened.items()
+            if c.cycling or c.cycled.get(tag, True) or row.repeats.get(tag, 0) > 1
+        }
+        weights.band = plane.STREAMED if cyclic else 0
+        hot = 0 if cyclic else _hot(weights, components)
 
         def stage(
             layouts: Mapping[str, weight_policy.Layout],
@@ -4052,13 +4076,8 @@ class WeightResidency:
                     )
                     for key, cost in measured.items()
                 },
-                # A stage on its second pass is cyclic whatever its last run was (a denoise
-                # after a one-pass warm-up): placed again, it keeps a resident set.
-                cyclic={
-                    key
-                    for key, (row, tag, c) in opened.items()
-                    if c.passes > 1 or c.last_passes != 1 or row.repeats.get(tag, 0) > 1
-                },
+                cyclic=cyclic,
+                hot=hot,
             )
 
         # A component counts at its finest grain only while it can still move there.
@@ -4138,7 +4157,7 @@ class WeightResidency:
                     priority=plane.PREFIX + clock,
                 )
             )
-            if streams:
+            if streams and key in cyclic:  # the host tier holds what streams every step
                 _stage_stream(weights, component, residence, clock)
         # Every eviction so far is past: its regions leave their bindings now, before the
         # resident sets bind (a region evicted earlier and wanted again binds after this).
@@ -4149,6 +4168,12 @@ class WeightResidency:
         with aside("loading weights"), suppress(plane.error("PlaneError")):
             for ticket in arriving:
                 ticket.wait()
+        # What each stage's entries copied in, for the run's record (keep hot: a repeating
+        # stage entered again copies nothing).
+        loaded = plane.stats(weights.plane).device(weights.index).copied
+        loaded -= held.device(weights.index).copied
+        tally = f"{method}.loaded"
+        weights.modes[tally] = f"{int(weights.modes.get(tally, '0 B').split()[0]) + loaded} B"
         stream = weights.stream()
         for key, residence in placed.items():
             component = components[key]
@@ -4179,7 +4204,7 @@ class WeightResidency:
                     component.schedule,
                     residence.window,
                     repeat=0,
-                    priority=plane.STREAMED + clock,
+                    priority=weights.band + clock,
                     tag=opened[key][1],
                     # the plane's ring holds the stored bytes; their decoded copies are
                     # counted in the budget beside it
@@ -4389,7 +4414,8 @@ class WeightResidency:
         """The block's lease: from the stage's cursor when the block is due within its window
         (an earlier departure skips ahead), else resident access or a demand fill. A demand
         fill ranks above every earlier streamed block and below the stage's prefix, so the
-        least recently used block is the one it can displace. On a group's first pass it
+        least recently used block is the one it can displace; a stage that runs once fills
+        among idle weights, below repeating stages' resident sets. On a group's first pass it
         ranks below every idle weight too: the pass streams through its own window, and other
         stages' weights stay mapped (keep hot)."""
         weights = self.weights
@@ -4397,7 +4423,7 @@ class WeightResidency:
         if component.cursor is not None and _due(component, component.cursor, index):
             lease: Lease = component.cursor.acquire(index, stream)
         else:
-            streamed = -plane.STREAMED if weights.growing else plane.STREAMED
+            streamed = -plane.STREAMED if weights.growing else weights.band
             priority = None if index in component.resident else streamed + weights.tick()
             lease = weights.plane.acquire(
                 component.ws, weights.index, index, stream, priority=priority
@@ -4543,6 +4569,7 @@ class WeightResidency:
 
     def _observe(self, component: Component, index: int) -> None:
         """Count passes and learn the blocks' execution order from a stage's first pass."""
+        component.uses += 1
         if component.observed:
             if index == component.order[0]:
                 component.passes += 1
@@ -4564,19 +4591,21 @@ class WeightResidency:
         """Close a repeating stage left open: another stage, an attempt's end, or a budget
         change comes first."""
         if self.parked is not None:
-            local = self.parked[1]
+            method, local, _ = self.parked
             self.parked = None
-            self._close(local)
+            self._close(method, local, hot=True)
 
-    def _close(self, local: Sequence[str]) -> None:
+    def _close(self, method: str, local: Sequence[str], hot: bool = False) -> None:
         """End the stage for `local`: cursors closed, common leases released, and every region
-        at idle priority, still mapped and bound (least recently used goes first)."""
+        at idle priority, still mapped and bound (least recently used goes first). A stage that
+        repeated keeps its resident sets `hot`: above every idle weight, so a stage that runs
+        once plans beside them and never evicts them (keep hot)."""
         weights = self.weights
         idle = weights.tick()
         failure: BaseException | None = None
         for name in local:
             component = self.components[name]
-            component.last_passes = component.passes
+            component.cycled[method], component.uses = component.cycling, 0
             try:
                 close_cursor(component)
             except BaseException as exc:  # release the rest, then raise the first
@@ -4585,10 +4614,14 @@ class WeightResidency:
                 component.lease.release()
                 component.lease = None
             component.spared = False
+            component.hot = hot
             if not weights.host_only:  # host maps bind once, at load
                 for region in component.regions:
                     _drop_copies(region)
                 weights.plane.prioritise(component.ws, weights.index, None, priority=idle)
+                if hot and component.resident:
+                    kept = list(component.resident)
+                    weights.plane.prioritise(component.ws, weights.index, kept, plane.HOT + idle)
         if failure is not None:
             raise failure
 
@@ -4714,24 +4747,39 @@ def _unshared(component: Component) -> bool:
     return bool(set(component.resident) - component.shared - leased)
 
 
+def _hot(weights: Weights, opened: Collection[str]) -> int:
+    """Device bytes the resident sets repeating stages kept (`Component.hot`) hold outside
+    `opened`, their decoded copies with them."""
+    weights.drain()  # what was evicted is unbound
+    held = 0
+    for key, component in weights.components.items():
+        if component.hot and key not in opened:
+            kept = set(component.resident) - component.shared
+            held += sum(
+                r.span + r.decoded
+                for r in component.regions
+                if r.index in kept and r.bound is not None
+            )
+    return held
+
+
 def _costs(
-    weights: Weights, components: Mapping[str, tuple[Component, str]]
+    held: plane.Stats, index: int, opened: Mapping[str, tuple[WeightResidency, str, Component]]
 ) -> dict[str, weight_policy.Costs]:
     """Each component's measured streaming costs for its stage's tag: GPU seconds per use of
     each block from the plane's per-region timing, and the achieved pinned-to-device rate."""
-    held = plane.stats(weights.plane)
-    device = held.device(weights.index)
+    device = held.device(index)
     # the pinned tier's rate (a ring streams from it), not blended with the page cache's
     tier_ns = device.host_copy_ns - device.mapped_copy_ns
     link = (device.host_copy_bytes - device.mapped_copy_bytes) * 1e9 / tier_ns if tier_ns else 0.0
     out: dict[str, weight_policy.Costs] = {}
-    for key, (component, tag) in components.items():
+    for key, (_, tag, component) in opened.items():
         compute = {
             component.numbers[row.region]: row.compute_ns / row.uses / 1e9
             for row in held.regions
             if row.ws == key
             and row.tag == tag
-            and row.device == weights.index
+            and row.device == index
             and row.uses
             and row.region in component.numbers
         }

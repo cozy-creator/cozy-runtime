@@ -31,9 +31,12 @@ CAPABILITY = "weight_plane/1"
 SHARING = ("weights.attach/1", "weights.revoke/1", "weights.trim/1")
 PINNED: Final = "pinned"
 #: Priorities are plain integers; the plane evicts ascending and never picks among equals, so
-#: every band carries the LRU clock. Idle regions (a finished stage's) sit lowest; a running
-#: stage's streamed and demand-filled blocks above them, each newer one above the older; its
-#: resident prefix above everything, so nothing in the stage evicts it.
+#: every band carries the LRU clock. Idle regions (a finished stage's) sit lowest, with what a
+#: stage that runs once streams; a repeating stage's resident set kept after it (`HOT`) above
+#: them, so nothing that runs once evicts it; a repeating stage's streamed and demand-filled
+#: blocks above that, each newer one above the older; a running stage's resident prefix above
+#: everything, so nothing in the stage evicts it.
+HOT = 1 << 39
 STREAMED = 1 << 40
 PREFIX = 2 << 40
 
@@ -83,6 +86,11 @@ class DeviceStats(msgspec.Struct, frozen=True, kw_only=True):
     misses: int = 0
     evictions: int = 0
     evicted_bytes: int = 0
+
+    @property
+    def copied(self) -> int:
+        """Weight bytes copied to the device, from every source."""
+        return self.host_copy_bytes + self.bounce_copy_bytes + self.disk_copy_bytes
 
 
 class SetDevice(msgspec.Struct, frozen=True, kw_only=True):

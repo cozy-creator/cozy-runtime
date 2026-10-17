@@ -70,6 +70,21 @@ def test_run_once_is_whole_or_streamed_and_below_one_slot_refuses_with_numbers()
     assert (refused.value.needed, refused.value.available) == (one, one - 1)
 
 
+def test_a_stage_that_runs_once_streams_beside_what_repeating_stages_keep() -> None:
+    """Run 10808: H3's text encoder, run once a request, evicted its DiT's resident set on a
+    4090, and every denoise read it back. It streams beside that set, taking from it only what
+    a window of two lacks; a cyclic stage plans in the whole budget."""
+    text = policy.Layout(common=200 << 20, blocks=(12 << 20,) * 12)
+    window = text.common + policy.ring_bytes(text.blocks, policy.DEFAULT_WINDOW)
+    beside = policy.stage({"text": text}, BUDGET, hot=BUDGET - window - (1 << 20))["text"]
+    assert beside.streamed and beside.window == policy.DEFAULT_WINDOW
+    assert beside.vram_bytes(text) == window
+    assert policy.stage({"text": text}, BUDGET, hot=BUDGET)["text"].vram_bytes(text) == window
+    assert policy.stage({"text": text}, BUDGET)["text"].streamed == ()
+    unet = policy.stage({"unet": UNET}, BUDGET, cyclic={"unet"})
+    assert policy.stage({"unet": UNET}, BUDGET, cyclic={"unet"}, hot=BUDGET) == unet
+
+
 def test_activations_come_first() -> None:
     assert policy.plane_budget(8 << 30, 3 << 30, 300 << 20) == (5 << 30) - (300 << 20) - (
         policy.MARGIN

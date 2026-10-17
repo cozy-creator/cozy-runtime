@@ -294,6 +294,7 @@ def stage(
     orders: Mapping[str, Sequence[int]] | None = None,
     costs: Mapping[str, Costs] | None = None,
     cyclic: Collection[str] = (),
+    hot: int = 0,
 ) -> dict[str, Residence]:
     """Every declared component's residence for one stage, inside one plane budget.
 
@@ -304,8 +305,13 @@ def stage(
     components first (they repeat, so every resident byte saves a copy per pass), then to
     run-once ones, which are resident only when whole. Components outside the stage are not
     counted: they are evictable, lower priority, and the plane unmaps them as this stage's
-    wants arrive.
+    wants arrive. A stage with no cyclic component plans beside `hot`, the bytes repeating
+    stages' resident sets keep: it streams through a window of two rather than evict them,
+    which every request would read back (keep hot; H3's text encoder evicted its DiT, 10808).
     """
+    if not any(name in cyclic for name in layouts):
+        window = sum(min(o.total, o.common + DEFAULT_WINDOW * o.largest) for o in layouts.values())
+        budget = max(budget - hot, min(window, budget))
     orders, costs = orders or {}, costs or {}
     need = {name: layout.least for name, layout in layouts.items()}
     if sum(need.values()) > budget:

@@ -40,8 +40,10 @@ from test_weight_plane import (  # noqa: E402
     Stack,
     assert_pinned,
     load,
+    on_gpu,
     run,
     same,
+    tight,
     write_checkpoint,
 )
 
@@ -407,4 +409,33 @@ def test_a_layout_staged_in_part_pins_only_what_was_staged_and_reads_no_store(
     finally:
         nothing.close()
         some.close()
+        machine.close()
+
+
+@on_gpu
+def test_the_machine_stages_only_what_a_stage_streams_every_step(tmp_path: Path) -> None:
+    """Run 10808 (H3 on an RTX 4090): the machine keeps what it staged while the layout is
+    held, so the text encoder's one pass, staged first, filled its host tier and left the
+    DiT's per-step blocks to the disk. A stage that runs once streams from the object files;
+    one that repeats asks for its streamed blocks."""
+    checkpoint = write_checkpoint(tmp_path)[0]
+    machine = Machine(checkpoint.root, staged=True)
+    session = Session(machine, tmp_path, stage=())
+    try:
+        weights = Weights(torch, torch.device("cuda", 0), "cuda")
+        weights.set_budget(-1, pinned=1 << 30)
+        model = load(weights, checkpoint, "steps", tiers=session.tiers)
+        component = model.residency.components["stack"]
+        weights.set_budget(tight(model))
+        x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
+        for _ in range(3):  # its order is learned by the second: the third streams it, once
+            run(model, x, passes=1)
+        assert component.observed and component.residence is not None
+        assert component.residence.streamed and machine.stage_asks == [()]
+        run(model, x, passes=3)
+        run(model, x, passes=1)
+        streamed = tuple(component.blocks[i].index for i in component.residence.streamed)
+        assert machine.stage_asks[1:] and machine.stage_asks[-1] == streamed
+    finally:
+        session.close()
         machine.close()
