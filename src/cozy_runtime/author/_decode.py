@@ -13,9 +13,10 @@ import io
 import math
 import os
 import struct
+import threading
 from array import array
 from collections.abc import Callable, Generator, Iterator
-from contextlib import ExitStack, contextmanager, suppress
+from contextlib import ExitStack, contextmanager, nullcontext, suppress
 from dataclasses import dataclass, replace
 from fractions import Fraction
 from numbers import Integral
@@ -289,17 +290,29 @@ class _Budget:
     used: int = 0
     scope: str = "retained decoded"
     cumulative: bool = True
+    lock: threading.Lock | None = None
 
     def claim(self, size: int, what: str) -> None:
-        next_used = self.used + size if self.cumulative else max(self.used, size)
-        if size < 0 or next_used > self.limit:
-            raise MediaDecodeError(
-                f"{self.scope} {what} would cross the {self.limit}-byte value limit",
-                code="decoded_bytes_limit",
-            )
+        with self.lock or nullcontext():
+            next_used = self.used + size if self.cumulative else max(self.used, size)
+            if size < 0 or next_used > self.limit:
+                raise MediaDecodeError(
+                    f"{self.scope} {what} would cross the {self.limit}-byte value limit",
+                    code="decoded_bytes_limit",
+                )
+            if self.parent is not None:
+                self.parent.claim(size, "attempt media")
+            self.used = next_used
+
+    def refund(self) -> None:
+        """Return what a failed read claimed, so the attempt can read again."""
         if self.parent is not None:
-            self.parent.claim(size, "attempt media")
-        self.used = next_used
+            self.parent.release(self.used)
+        self.used = 0
+
+    def release(self, size: int) -> None:
+        with self.lock or nullcontext():
+            self.used -= size
 
 
 def _half_up(value: Fraction) -> int:
@@ -311,7 +324,8 @@ class _AudioStreamDecoder:
 
     With `end`, samples at or after `origin + end` are never converted: the frame that
     crosses it is validated whole and cut to the exact sample, and the caller stops reading.
-    `origin` defaults to the stream's own first presentation time.
+    `origin` defaults to the stream's own first presentation time. The total-sample ceiling
+    applies to a retained read; a stream holds one chunk at a time.
     """
 
     def __init__(
@@ -323,12 +337,14 @@ class _AudioStreamDecoder:
         *,
         end: Fraction | None = None,
         origin: Fraction | None = None,
+        retained: bool = True,
     ) -> None:
         self._av = av
         self._limits = limits
         self._budget = budget
         self._end = end
         self._origin = origin
+        self._retained = retained
         self._keep: int | None = None
         self._resampler: Any | None = None
         self._last_presentation_time: Fraction | None = None
@@ -441,7 +457,7 @@ class _AudioStreamDecoder:
         )
         if take <= 0:
             return None
-        if self.sample_count + take > self._limits.max_audio_samples:
+        if self._retained and self.sample_count + take > self._limits.max_audio_samples:
             raise MediaDecodeError(
                 f"audio crosses the {self._limits.max_audio_samples}-sample limit",
                 code="audio_samples_limit",
@@ -562,8 +578,11 @@ class _Picture:
 class _VideoClock:
     """Validate one video stream in presentation order; pictures convert only when kept.
 
-    With `end` (seconds after the first frame), the first frame starting at or after it
-    ends the decode: it is never converted and the demux stops there. The last kept
+    Each frame shows until the next one starts, whatever duration the container records
+    for it (B-frame and variable-rate streams record decode-order timing); only the last
+    frame uses its own. Time running backwards refuses. With `end` (seconds after the first
+    frame), the first frame starting at or after it ends the decode: only its start is
+    read, it is never validated or converted, and the demux stops there. The last kept
     frame's duration is clipped to `end`. The declared frame count is checked only when
     the decode reached the end of the stream.
     """
@@ -622,8 +641,6 @@ class _VideoClock:
         if self._last_pts is not None and pts <= self._last_pts:
             raise MediaDecodeError("video PTS is not strictly monotone", code="media_clock")
         duration = int(frame.duration or 0)
-        if duration <= 0:
-            raise MediaDecodeError("video frame has no exact positive duration", code="media_clock")
         rotation = _display_rotation(frame)
         if self._rotation is None:
             self._rotation = rotation
@@ -658,30 +675,30 @@ class _VideoClock:
         self._seen += 1
         return _Picture(self, frame, pts, duration, color_facts)
 
-    def _past_end(self, ticks: int) -> bool:
-        assert self.time_base is not None
-        return self._end is not None and ticks * self.time_base >= self._end
+    def _ends(self, frame: Any, pending: _Picture) -> bool:
+        """Whether `frame` starts at or after `end`; then its start ends `pending`."""
+        if self._end is None or frame.pts is None or frame.time_base is None:
+            return False
+        assert self.origin is not None and self.time_base is not None
+        if _positive_fraction(frame.time_base, "video frame time base") != self.time_base:
+            return False
+        pts = int(frame.pts)
+        if (pts - self.origin) * self.time_base < self._end:
+            return False
+        if pts <= pending.pts:
+            raise MediaDecodeError("video PTS is not strictly monotone", code="media_clock")
+        pending.duration = pts - pending.pts
+        return True
 
     def pictures(self, frames: Iterator[Any]) -> Iterator[_Picture]:
         pending: _Picture | None = None
         for frame in frames:
-            current = self._check(frame)
-            assert self.origin is not None
-            if pending is not None:
-                derived = current.pts - pending.pts
-                # Coarse clocks (for example WebM milliseconds at 24 fps) round adjacent
-                # starts by one source tick. Normalize that one-tick ambiguity; anything
-                # larger is a real gap.
-                if derived <= 0 or abs(derived - pending.duration) > 1:
-                    raise MediaDecodeError(
-                        "video presentation has a gap or overlap", code="video_discontinuity"
-                    )
-                pending.duration = derived
-            if self._past_end(current.pts - self.origin):
-                current.frame = None
+            if pending is not None and self._ends(frame, pending):
                 self.stopped = True
                 break
+            current = self._check(frame)
             if pending is not None:
+                pending.duration = current.pts - pending.pts
                 yield pending
             pending = current
         if pending is None:
@@ -690,6 +707,10 @@ class _VideoClock:
             raise MediaDecodeError(
                 f"video decoded {self._seen} of {self._declared_frames} declared frames",
                 code="media_truncated",
+            )
+        if pending.duration <= 0:
+            raise MediaDecodeError(
+                "the last video frame has no exact positive duration", code="media_clock"
             )
         if self._end is not None:
             assert self.origin is not None and self.time_base is not None
@@ -750,9 +771,12 @@ def _audio_events(
     *,
     end: Fraction | None,
     origin: Fraction | None,
+    retained: bool,
 ) -> Iterator[_Event]:
     audio_format = _stream_audio_format(stream, limits)
-    decoder = _AudioStreamDecoder(av, stream, limits, budget, end=end, origin=origin)
+    decoder = _AudioStreamDecoder(
+        av, stream, limits, budget, end=end, origin=origin, retained=retained
+    )
     yield DecodedMediaHeader(video=None, audio=audio_format)
     yield from decoder.chunks(iter(container.decode(stream)))
 
@@ -765,36 +789,36 @@ def _media_events(
     budget: _Budget,
     *,
     end: Fraction | None,
+    retained: bool,
     audio: bool = True,
     pictures: bool = True,
 ) -> Generator[_Event]:
     """The time-ordered header, pictures and PCM of one input, bounded by `end`.
 
     The soundtrack reads through its own container, so neither track's demux runs past
-    `end`. A soundtrack is cut at the first video frame's time plus `end`.
+    `end`. A soundtrack is cut at the first decoded video frame's time plus `end`, with or
+    without its pictures.
     """
     with ExitStack() as stack:
         source = stack.enter_context(path.open("rb"))
         container = stack.enter_context(av.open(source, mode="r"))
         if kind == "audio":
             stream = _one_stream(list(container.streams.audio), "audio")
-            yield from _audio_events(av, container, stream, limits, budget, end=end, origin=None)
+            yield from _audio_events(
+                av, container, stream, limits, budget, end=end, origin=None, retained=retained
+            )
             return
-        video_stream = _one_stream(list(container.streams.video), "video")
+        _one_stream(list(container.streams.video), "video")
         soundtrack = _soundtrack(container)
         if not pictures:
             if soundtrack is None:
                 _required_stream("audio", 0)
-            start = video_stream.start_time
-            origin = (
-                start * _positive_fraction(video_stream.time_base, "video stream time base")
-                if start is not None
-                else None
-            )
+            origin = None if end is None else _first_picture_time(av, path)
             yield from _audio_events(
-                av, container, soundtrack, limits, budget, end=end, origin=origin
+                av, container, soundtrack, limits, budget, end=end, origin=origin, retained=retained
             )
             return
+        video_stream = container.streams.video[0]
         clock = _VideoClock(av, video_stream, limits, end)
         video = clock.pictures(iter(container.decode(video_stream)))
         next_video: _Picture | None = next(video)
@@ -809,7 +833,13 @@ def _media_events(
             audio_stream = _one_stream(list(audio_container.streams.audio), "audio")
             audio_format = _stream_audio_format(audio_stream, limits)
             decoder = _AudioStreamDecoder(
-                av, audio_stream, limits, budget, end=end, origin=clock.origin_time
+                av,
+                audio_stream,
+                limits,
+                budget,
+                end=end,
+                origin=clock.origin_time,
+                retained=retained,
             )
             sound = decoder.chunks(iter(audio_container.decode(audio_stream)))
         next_audio = next(sound, None)
@@ -841,12 +871,27 @@ def _media_events(
                 next_audio = next(sound, None)
 
 
+def _first_picture_time(av: Any, path: Path) -> Fraction:
+    """The presentation time of a video's first decoded frame: the origin `end` counts from."""
+    with path.open("rb") as source, av.open(source, mode="r") as container:
+        stream = container.streams.video[0]
+        stream.codec_context.thread_count = 1
+        for frame in container.decode(stream):
+            if frame.pts is None or frame.time_base is None:
+                raise MediaDecodeError("video frame has no exact PTS/time base", code="media_clock")
+            return _fraction(frame.pts, "video frame PTS") * _positive_fraction(
+                frame.time_base, "video frame time base"
+            )
+    raise MediaDecodeError("video stream decoded no frames", code="media_empty")
+
+
 class DecodedMediaStream(Iterator[DecodedMediaEvent]):
     """One context-managed, single-consumer stream over verified media bytes.
 
     PyAV, packets and the attempt-spool path remain private. Reading to the end (or to
     the read's `end`) checks truncation and final decoder state; leaving the context early
-    only closes it. The budget covers one event at a time.
+    only closes it. The budget covers one event at a time, and a stream has no frame or
+    sample-count ceiling: it retains nothing.
     """
 
     __slots__ = (
@@ -897,19 +942,9 @@ class DecodedMediaStream(Iterator[DecodedMediaEvent]):
         return self
 
     def _converted(self, events: Generator[_Event]) -> Generator[DecodedMediaEvent]:
-        count = 0
-        limit = self._reads._limits.max_video_frames
         try:
             for event in events:
-                if isinstance(event, _Picture):
-                    if count >= limit:
-                        raise MediaDecodeError(
-                            f"video crosses the {limit}-frame limit", code="video_frames_limit"
-                        )
-                    count += 1
-                    yield event.convert(self._budget)
-                else:
-                    yield event
+                yield event.convert(self._budget) if isinstance(event, _Picture) else event
         finally:
             events.close()
 
@@ -991,12 +1026,14 @@ class MediaReads:
     active component-use scope and after the attempt closes.
     """
 
-    __slots__ = ("_attempt", "_budget", "_limits", "_open_streams")
+    __slots__ = ("_attempt", "_budget", "_limits", "_lock", "_open_streams")
 
     def __init__(self, attempt: _Attempt, *, limits: DecodeLimits | None = None) -> None:
         self._attempt = attempt
         self._limits = limits = limits or host_decode_limits()
-        self._budget = _Budget(limits.max_decoded_bytes)
+        # Overlapped calls (`author.concurrently`) read from their own threads.
+        self._lock = threading.Lock()
+        self._budget = _Budget(limits.max_decoded_bytes, lock=self._lock)
         self._open_streams = 0
 
     @property
@@ -1006,45 +1043,56 @@ class MediaReads:
 
     def image(self, asset: ImageAsset) -> PILImage:
         budget, path = self._start(asset, "ImageAsset.read")
-        with _reading(asset, None, "image"):
-            return _image(path, self._limits, budget, _image_preparation(asset))
+        try:
+            with _reading(asset, None, "image"):
+                return _image(path, self._limits, budget, _image_preparation(asset))
+        except BaseException:
+            budget.refund()
+            raise
 
     def video(self, asset: VideoAsset, *, end: object, fps: object, audio: bool) -> DecodedVideo:
-        budget, path = self._start(asset, "VideoAsset.read")
         cut = _effective_end(end, asset._end)
         rate = None if fps is None else _rate(fps)
+        budget, path = self._start(asset, "VideoAsset.read")
         av = _av()
-        with _reading(asset, av, "video"):
-            events = _media_events(av, path, "video", self._limits, budget, end=cut, audio=audio)
-            try:
+        events = _media_events(
+            av, path, "video", self._limits, budget, end=cut, retained=True, audio=audio
+        )
+        try:
+            with _reading(asset, av, "video"):
                 return _collect_video(events, budget, self._limits, rate)
-            finally:
-                events.close()
+        except BaseException:
+            budget.refund()
+            raise
+        finally:
+            events.close()
 
     def audio(self, asset: AudioAsset, *, end: object) -> DecodedAudio:
-        budget, path = self._start(asset, "AudioAsset.read")
         cut = _effective_end(end, asset._end)
+        budget, path = self._start(asset, "AudioAsset.read")
         av = _av()
-        with _reading(asset, av, "audio"):
-            events = _media_events(av, path, "audio", self._limits, budget, end=cut)
-            try:
+        events = _media_events(av, path, "audio", self._limits, budget, end=cut, retained=True)
+        try:
+            with _reading(asset, av, "audio"):
                 header = next(events)
                 assert isinstance(header, DecodedMediaHeader) and header.audio is not None
                 sound = _collect_audio(header.audio, events)
                 if sound is None:
                     raise MediaDecodeError("audio read selected no samples", code="media_empty")
                 return sound
-            finally:
-                events.close()
+        except BaseException:
+            budget.refund()
+            raise
+        finally:
+            events.close()
 
     def stream(
         self, asset: VideoAsset | AudioAsset, *, end: object, audio: bool, pictures: bool
     ) -> DecodedMediaStream:
-        operation = f"{type(asset).__name__}.stream"
-        budget, path = self._start(asset, operation, retained=False)
         cut = _effective_end(end, asset._end)
         if not (audio or pictures):
             raise ValueError("a stream needs pictures, audio or both")
+        budget, path = self._start(asset, f"{type(asset).__name__}.stream", retained=False)
         av = _av()
         return DecodedMediaStream(
             self,
@@ -1058,6 +1106,7 @@ class MediaReads:
                 self._limits,
                 budget,
                 end=cut,
+                retained=False,
                 audio=audio,
                 pictures=pictures,
             ),
@@ -1096,15 +1145,17 @@ class MediaReads:
                 "media streaming is forbidden inside an active component-use scope",
                 code="decode_in_component_scope",
             )
-        if self._open_streams >= MAX_ACTIVE_MEDIA_STREAMS:
-            raise CapabilityError(
-                f"an attempt admits at most {MAX_ACTIVE_MEDIA_STREAMS} active media streams",
-                code="media_stream_active",
-            )
-        self._open_streams += 1
+        with self._lock:
+            if self._open_streams >= MAX_ACTIVE_MEDIA_STREAMS:
+                raise CapabilityError(
+                    f"an attempt admits at most {MAX_ACTIVE_MEDIA_STREAMS} active media streams",
+                    code="media_stream_active",
+                )
+            self._open_streams += 1
 
     def _release_stream(self) -> None:
-        self._open_streams -= 1
+        with self._lock:
+            self._open_streams -= 1
 
     def _start(
         self, asset: Asset, operation: str, *, retained: bool = True, decode: bool = True
@@ -1286,12 +1337,14 @@ def _collect_video(
     )
 
 
-def _stream_duration(container: Any, stream: Any) -> Fraction:
-    """A stream's presentation length from its header, or from a packet scan without
-    decoding when the container does not record it (fragmented MP4, live WebM)."""
+def _stream_duration(av: Any, container: Any, stream: Any) -> Fraction:
+    """A stream's presentation length from its header, else the container's (Matroska
+    records only that), else from a packet scan without decoding (live WebM)."""
     time_base = _positive_fraction(stream.time_base, f"{stream.type} stream time base")
     if stream.duration:
         return int(stream.duration) * time_base
+    if container.duration:
+        return Fraction(int(container.duration), int(av.time_base))
     first: int | None = None
     last: int | None = None
     for packet in container.demux(stream):
@@ -1334,7 +1387,7 @@ def _probe_video(av: Any, path: Path, limits: DecodeLimits) -> VideoProbe:
             width, height, aspect = height, width, 1 / aspect
         rate = stream.average_rate
         audio_format = _stream_audio_format(soundtrack, limits) if soundtrack is not None else None
-        duration = _stream_duration(container, stream)
+        duration = _stream_duration(av, container, stream)
     return VideoProbe(
         width=width,
         height=height,
@@ -1350,7 +1403,7 @@ def _probe_audio(av: Any, path: Path, limits: DecodeLimits) -> AudioProbe:
     with path.open("rb") as source, av.open(source, mode="r") as container:
         stream = _one_stream(list(container.streams.audio), "audio")
         audio_format = _stream_audio_format(stream, limits)
-        duration = _stream_duration(container, stream)
+        duration = _stream_duration(av, container, stream)
     return AudioProbe(
         duration=duration,
         source_duration=duration,
@@ -1363,12 +1416,33 @@ def _probe_audio(av: Any, path: Path, limits: DecodeLimits) -> AudioProbe:
 _SWAPPED_ORIENTATIONS = frozenset({5, 6, 7, 8})
 
 
+@contextmanager
+def _pillow() -> Iterator[None]:
+    """Pillow's refusals as typed decode errors; filesystem failures pass through."""
+    try:
+        yield
+    except MediaDecodeError:
+        raise
+    except DecompressionBombError as exc:
+        raise MediaDecodeError(str(exc), code="pixels_per_frame_limit") from exc
+    except OSError as exc:
+        if exc.errno is not None:
+            raise  # Filesystem failures retain the caller's materialization error boundary.
+        raise MediaDecodeError(
+            f"image could not be decoded: {_safe_error(exc)}", code="media_malformed"
+        ) from exc
+    except (ValueError, SyntaxError) as exc:
+        raise MediaDecodeError(
+            f"image could not be decoded: {_safe_error(exc)}", code="media_malformed"
+        ) from exc
+
+
 def _probe_image(path: Path, limits: DecodeLimits) -> ImageProbe:
     if path.stat().st_size > IMAGE_SOURCE_MAX_BYTES:
         raise MediaDecodeError(
             "image source exceeds preparation byte ceiling", code="image_source_bytes"
         )
-    with pil_open(path) as header:
+    with _pillow(), pil_open(path) as header:
         width, height = header.size
         _check_pixels(width, height, limits)
         if getattr(header, "n_frames", 1) != 1:
@@ -1463,7 +1537,7 @@ def _image(
     Resource ceilings are application policy. Pillow owns image formats, EXIF
     orientation (including mirrors), RGB conversion and resampling.
     """
-    try:
+    with _pillow():
         source_geometry = image_source_geometry(path, limits, preparation)
         with pil_open(path) as image:
             if image.size != source_geometry:
@@ -1481,20 +1555,6 @@ def _image(
             if rgb.size != size:
                 rgb = rgb.resize(size, Resampling.LANCZOS)
             return rgb
-    except MediaDecodeError:
-        raise
-    except DecompressionBombError as exc:
-        raise MediaDecodeError(str(exc), code="pixels_per_frame_limit") from exc
-    except OSError as exc:
-        if exc.errno is not None:
-            raise  # Filesystem failures retain the caller's materialization error boundary.
-        raise MediaDecodeError(
-            f"image could not be decoded: {_safe_error(exc)}", code="media_malformed"
-        ) from exc
-    except (ValueError, SyntaxError) as exc:
-        raise MediaDecodeError(
-            f"image could not be decoded: {_safe_error(exc)}", code="media_malformed"
-        ) from exc
 
 
 def decode_image_path(

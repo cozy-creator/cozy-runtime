@@ -53,17 +53,23 @@ async def render(ctx: Context, *, shot: Shot, refs: References) -> Done:
 | `video.stream(*, end=None, audio=True, pictures=True)` | `DecodedMediaStream` bounded by `end`; `pictures=False` reads only the soundtrack |
 | `audio.read(*, end=None)` / `audio.stream(*, end=None)` | native-rate `DecodedAudio` / stream cut at `end` |
 
-- `end` counts seconds from the first frame (or sample). Frames starting at or after it
-  are never converted and the demux stops; the last kept frame's duration is clipped to
-  it and the soundtrack ends on the sample at it. A source longer than the 3600-frame
-  ceiling reads its first seconds: ceilings count frames a read keeps.
+- Each frame shows until the next one starts, whatever duration the container records
+  (B-frame and variable-rate files record decode-order timing); only the last frame uses
+  its own. Time running backwards refuses.
+- `end` counts seconds from the first decoded frame (or, for audio, sample), with or
+  without pictures. The first frame starting at or after it is never validated or
+  converted and the demux stops; the last kept frame's duration is clipped to it and the
+  soundtrack ends on the sample at it. A source longer than the 3600-frame ceiling reads
+  its first seconds: ceilings count frames a read keeps. A stream retains one event at a
+  time and has no frame or sample ceiling.
 - `fps` maps frames onto a constant clock starting at 0: each frame shows until the next
   starts, rounded to the nearest slot. A frame filling several slots is the same `bytes`
   object. Video pixels are never resized; sample-rate conversion stays in the package.
 - `probe()` reads headers only. A container without a recorded duration (live WebM) is
   measured from its packets without decoding.
 - Reads refuse inside an active component-use scope and after the attempt closes. Each
-  `read()` decodes again; keep the value. `read_bytes()` still returns the whole file.
+  `read()` decodes again; keep the value. A refused read returns what it charged, so a
+  shorter `end` can follow. `read_bytes()` still returns the whole file.
 
 ## Preparation
 
@@ -138,8 +144,10 @@ forwardable but reads refuse `decoded_bound_missing`.
 
 An `Assets` kind row carries `prepare`, and a field's `asset_bound` carries `prepare`,
 each with one profile: `image-fit/1` `{max_edge, max_pixels}`, `video-trim/1` and
-`audio-trim/1` `{min_seconds, max_seconds, excess}`. Readers ignore a profile they do not
-know.
+`audio-trim/1` `{min_seconds, max_seconds, excess}`. A known profile admits exactly those
+members and must prepare a kind its declaration carries; readers ignore a profile they do
+not know. Preparations annotate inputs (fields, invocable parameters, `Assets`); a result
+declaring one refuses at describe.
 
 ## Tests
 

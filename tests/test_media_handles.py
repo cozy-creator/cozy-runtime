@@ -10,7 +10,6 @@ from __future__ import annotations
 import math
 import sys
 import time
-from collections.abc import Sequence
 from fractions import Fraction
 from pathlib import Path
 from types import ModuleType
@@ -60,90 +59,30 @@ from cozy_runtime.internal import (
 )
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.executor import adjustment_row
+from media_sources import mp4, steady
 
-TICK = Fraction(1, 90000)
 HD = 1920 * 1080 * 3
-
-
-def _mp4(
-    path: Path,
-    *,
-    size: tuple[int, int],
-    starts: Sequence[Fraction],
-    end: Fraction,
-    audio_seconds: int = 0,
-    sample_rate: int = 16000,
-) -> Path:
-    """H.264 frames shown at `starts` until `end`, each a distinct flat luma, plus AAC."""
-    width, height = size
-    durations = {
-        int(start / TICK): int((stop - start) / TICK)
-        for start, stop in zip(starts, [*starts[1:], end], strict=True)
-    }
-    with av.open(str(path), "w", format="mp4") as out:
-        video = out.add_stream("libx264", rate=None)
-        video.width, video.height, video.pix_fmt = width, height, "yuv420p"
-        video.time_base = video.codec_context.time_base = TICK
-        video.options = {"preset": "ultrafast", "crf": "40", "bf": "0"}
-        sound = out.add_stream("aac", rate=sample_rate, layout="mono") if audio_seconds else None
-
-        def mux(packets: Sequence[Any]) -> None:
-            for packet in packets:
-                packet.duration = durations[int(packet.pts or 0)]
-                out.mux(packet)
-
-        for index, start in enumerate(starts):
-            frame = av.VideoFrame(width, height, "yuv420p")
-            luma = frame.planes[0].line_size * height
-            chroma = frame.planes[1].line_size * (height // 2)
-            frame.planes[0].update(bytes([(index * 37) % 256]) * luma)
-            frame.planes[1].update(bytes([128]) * chroma)
-            frame.planes[2].update(bytes([128]) * chroma)
-            frame.pts, frame.time_base = int(start / TICK), TICK
-            mux(video.encode(frame))
-        mux(video.encode())
-        if sound is not None:
-            total = audio_seconds * sample_rate
-            clock = np.arange(total, dtype=np.float32)
-            wave = (0.2 * np.sin(2 * np.pi * 440 * clock / sample_rate)).astype(np.float32)
-            for offset in range(0, total, 1024):
-                chunk = av.AudioFrame.from_ndarray(
-                    np.ascontiguousarray(wave[None, offset : offset + 1024]),
-                    format="fltp",
-                    layout="mono",
-                )
-                chunk.sample_rate, chunk.pts = sample_rate, offset
-                chunk.time_base = Fraction(1, sample_rate)
-                for packet in sound.encode(chunk):
-                    out.mux(packet)
-            for packet in sound.encode():
-                out.mux(packet)
-    return path
-
-
-def _steady(fps: int, frames: int) -> tuple[list[Fraction], Fraction]:
-    return [Fraction(index, fps) for index in range(frames)], Fraction(frames, fps)
 
 
 @pytest.fixture(scope="module")
 def media(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Path]:
     root = tmp_path_factory.mktemp("media")
-    long_starts, long_end = _steady(2, 240)
-    many_starts, many_end = _steady(30, 3750)
-    clip_starts, clip_end = _steady(30, 60)
+    long_starts, long_end = steady(2, 240)
+    many_starts, many_end = steady(30, 3750)
+    clip_starts, clip_end = steady(30, 60)
     vfr = [Fraction(0)]
     for gap in [Fraction(1, 30), Fraction(1, 15), Fraction(1, 60), Fraction(1, 24)] * 10:
         vfr.append(vfr[-1] + gap)
     paths = {
-        "reference": _mp4(
+        "reference": mp4(
             root / "reference.mp4",
             size=(1920, 1080),
             starts=long_starts,
             end=long_end,
             audio_seconds=120,
         ),
-        "many": _mp4(root / "many.mp4", size=(64, 36), starts=many_starts, end=many_end),
-        "clip": _mp4(
+        "many": mp4(root / "many.mp4", size=(64, 36), starts=many_starts, end=many_end),
+        "clip": mp4(
             root / "clip.mp4",
             size=(64, 48),
             starts=clip_starts,
@@ -151,7 +90,7 @@ def media(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Path]:
             audio_seconds=2,
             sample_rate=48000,
         ),
-        "vfr": _mp4(root / "vfr.mp4", size=(64, 48), starts=vfr[:-1], end=vfr[-1]),
+        "vfr": mp4(root / "vfr.mp4", size=(64, 48), starts=vfr[:-1], end=vfr[-1]),
     }
     live = root / "live.webm"
     with av.open(str(live), "w", format="webm", options={"live": "1"}) as out:
@@ -331,6 +270,8 @@ def test_a_source_past_the_frame_ceiling_reads_and_streams_its_first_seconds(
     with pytest.raises(MediaDecodeError) as caught:
         video.read()  # every frame kept: 3750 crosses the 3600-frame ceiling
     assert caught.value.code == "video_frames_limit"
+    with video.stream() as stream:  # a stream retains one frame: no frame ceiling
+        assert sum(isinstance(event, DecodedVideoFrame) for event in stream) == 3750
 
 
 def test_the_soundtrack_is_cut_on_the_exact_sample_and_the_last_frame_clipped(
@@ -624,7 +565,10 @@ def test_the_interface_carries_each_preparation_profile(tmp_path: Path) -> None:
     module = ModuleType("generated_prepared_media")
     sys.modules[module.__name__] = module
     code = interface_wheel.generate(raw)["prepared_media/__init__.py"]
-    assert b"VideoPreparation(**{" in code and b"ImagePreparation(**{" in code
+    assert (
+        b"VideoPreparation(**{'excess': 'truncate', 'min_seconds': 2, 'max_seconds': 15})" in code
+    )
+    assert b"ImagePreparation(**{'max_edge': 1024})" in code
     exec(compile(code, "generated_prepared_media.py", "exec"), module.__dict__)
     binding = module.__dict__["__cozy_bindings__"]["render"]
     payload = next(f for f in msgspec.structs.fields(binding.request) if f.name == "payload")
@@ -637,11 +581,23 @@ def test_the_interface_carries_each_preparation_profile(tmp_path: Path) -> None:
             package_interface.read_bytes(msgspec.json.encode(document))
 
     refused({"profile": "video-trim/1", "max_seconds": 15, "excess": "clip"})
+    refused({"profile": "video-trim/1", "max_seconds": 15, "excess": "refuse", "start": 1})
     refused({"profile": "video-trim/1", "min_seconds": 9, "max_seconds": 3, "excess": "refuse"})
     refused({"profile": "image-fit/1", "max_edge": 64})  # an image profile on videos
     document = msgspec.json.decode(raw)
     document["entrypoints"][0]["assets"]["kinds"][1]["prepare"] = {"profile": "video-fit/2"}
     package_interface.read_bytes(msgspec.json.encode(document))  # a newer writer's profile
+
+    def field_refused(prepare: object) -> None:
+        document = msgspec.json.decode(raw)
+        fields = document["entrypoints"][0]["request"]["fields"]
+        shot = next(f for f in fields if f["name"] == "shot")
+        shot["type"]["fields"][0]["asset_bound"]["prepare"] = prepare
+        with pytest.raises(ConformanceError):
+            package_interface.read_bytes(msgspec.json.encode(document))
+
+    field_refused({"profile": "image-fit/1", "max_edge": 64})  # an image profile on a video
+    field_refused({"profile": "video-trim/1", "max_seconds": 15, "excess": "refuse", "start": 1})
 
 
 class Misplaced(msgspec.Struct):
