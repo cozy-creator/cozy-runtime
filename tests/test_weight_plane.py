@@ -2338,6 +2338,55 @@ def test_a_stage_that_runs_once_never_evicts_what_a_repeating_stage_keeps(
 
 
 @on_gpu
+def test_a_hot_set_mapped_back_after_an_attempt_gives_way_to_any_ask(tmp_path: Path) -> None:
+    """Owner, 2026-10-18 (memory v2 §3 promotion, B1): after an attempt a repeating stage's
+    resident set maps back into free room only, evicting nothing, and gives way at once to
+    what asks: an op out of memory (the ladder's rung 1) and the machine's room ask (a budget
+    it lowers to 0). A later repeating stage (a decode) had taken part of it."""
+    weights = Weights(torch, torch.device("cuda", 0), "cuda")
+    weights.set_budget(-1, pinned=1 << 30)
+    (tmp_path / "dit").mkdir()
+    (tmp_path / "vae").mkdir()
+    dit = load(weights, write_checkpoint(tmp_path / "dit")[0], "dit")
+    vae = load(weights, write_checkpoint(tmp_path / "vae")[0], "vae")
+    denoiser, decoder = dit.residency.components["stack"], vae.residency.components["stack"]
+    whole = denoiser.layout.total
+    weights.set_budget(whole + (64 << 20))
+    x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
+
+    def staged(model: Any, method: str, passes: int) -> None:
+        model.residency.open_attempt()
+        model.residency.admit(method, ("stack",))
+        try:
+            with torch.inference_mode():
+                for _ in range(passes):
+                    model.stack(x)
+        finally:
+            model.residency.release(method, ("stack",))
+
+    staged(dit, "denoise", 3)
+    staged(vae, "decode", 3)  # repeats too: it takes what it needs of the DiT's set
+    weights.drain()
+    taken = weights.resident_bytes(denoiser)
+    assert denoiser.hot and taken < whole
+    gone = [r.index for r in denoiser.regions if r.index in denoiser.resident and r.bound is None]
+    weights.set_budget(-1)  # the room the device has now
+    mapped = plane.stats(weights.plane).device(0).committed
+    dit.residency.restore()
+    assert plane.stats(weights.plane).device(0).committed > mapped, "mapped back in the room"
+    weights.plane.want(denoiser.ws, 0, gone, priority=plane.HOT).wait()  # its fills land
+    weights.drain()
+    back = weights.resident_bytes(denoiser)
+    assert back > taken and weights.resident_bytes(decoder) == decoder.layout.total
+    assert weights.memory.free_for(weights.memory.free() + (16 << 20), "an op")
+    weights.drain()
+    assert weights.resident_bytes(denoiser) < back, "an op out of memory takes it first"
+    assert weights.resident_bytes(decoder) == decoder.layout.total
+    weights.set_budget(0)  # the machine's ask for room
+    assert weights.resident_bytes(denoiser) == 0
+
+
+@on_gpu
 def test_a_group_gpus_first_decode_keeps_its_denoisers_weights_under_a_cap(
     tmp_path: Path,
 ) -> None:
