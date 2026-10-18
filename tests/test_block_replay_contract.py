@@ -247,23 +247,44 @@ def test_a_block_that_counts_in_an_attribute_counts_each_call_once(
     assert failed.calls == 2 and len(trace["room"]) == 1 and not trace["residency"].poisoned
 
 
-def test_a_block_that_counts_in_an_attribute_is_never_run_twice(monkeypatch: Any) -> None:
+def test_a_block_that_counts_in_an_attribute_runs_again_from_it(monkeypatch: Any) -> None:
     """Out of memory outside its ops after it counted (a library call's own allocation): it
-    reaches the caller, as a writing block's does, rather than counting twice."""
-    module = Stepped()
+    runs again from the attributes, generators and containers it started with, so the count
+    reads once per call and the draws are a run's with room (the owner, 10-05: replays are
+    made safe, not refused)."""
+    control, module = Stepped(), Stepped()
+    _weights, _region, trace = wrapped(module, monkeypatch)
+    value = torch.tensor([[0.25, -0.5]])
+    torch.manual_seed(5)
+    with torch.inference_mode():
+        expected = [control(value) for _ in range(2)]
+    torch.manual_seed(5)
+    with torch.inference_mode():
+        out = [module(value)]
+        module.linear.register_forward_pre_hook(lambda *_: module.fail())
+        module.failing = True
+        out.append(module(value))
+    assert module.inner.timestep == control.inner.timestep == 2
+    assert all(torch.equal(a, b) for a, b in zip(out, expected, strict=True))
+    assert len(trace["room"]) == 1 and not trace["residency"].poisoned
+
+
+class Doubled(StatefulBlock):
+    def forward(self, value: Any) -> Any:
+        return 2 * super().forward(value)
+
+
+def test_a_block_whose_class_changes_after_load_runs_its_new_forward(monkeypatch: Any) -> None:
+    """HiDiffusion patches SDXL's blocks at its first 4 MP request by swapping each module's
+    class. The block's hook reads the forward at every call, so the new one runs."""
+    module = StatefulBlock("counter")
     _weights, _region, trace = wrapped(module, monkeypatch)
     value = torch.tensor([[0.25, -0.5]])
     with torch.inference_mode():
-        module(value)
-        module.linear.register_forward_pre_hook(lambda *_: module.fail())
-        module.failing = True
-        try:
-            module(value)
-            raised = False
-        except torch.OutOfMemoryError:
-            raised = True
-    assert module.inner.timestep == 2, "counted once per call"
-    assert raised and not trace["room"]
+        assert torch.equal(module(value), value + 1)
+        module.__class__ = Doubled
+        assert torch.equal(module(value), 2 * (value + 2))
+    assert trace["acquired"] == trace["released"] == 2
 
 
 def test_successful_current_block_path_preserves_module_semantics(monkeypatch: Any) -> None:
