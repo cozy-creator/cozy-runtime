@@ -22,7 +22,7 @@ from cozy_runtime.internal.seam import Channel
 def seam(handler: Handler) -> Exchange:
     """Each request crosses a real seam socket pair, its capability included."""
 
-    def exchange[A: Answer](request: Request, into: type[A], /) -> A:
+    def exchange[A: Answer](request: Request, into: type[A], request_id: str | None = None, /) -> A:
         left, right = socket.socketpair()
         with left, right:
             executor, worker = Channel(left), Channel(right)
@@ -50,7 +50,7 @@ def seam(handler: Handler) -> Exchange:
 def wire(fake: Callable[[str, dict[str, Any]], Mapping[str, object]]) -> Exchange:
     """A fake worker that reads each request's `kind` and body and answers a wire document."""
 
-    def exchange[A: Answer](request: Request, into: type[A], /) -> A:
+    def exchange[A: Answer](request: Request, into: type[A], request_id: str | None = None, /) -> A:
         body = encode(request)
         kind = body.pop("kind")
         assert isinstance(kind, str)
