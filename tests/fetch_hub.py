@@ -148,6 +148,14 @@ class Hub:
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.served: list[threading.Thread] = []
+        #: a handle on each served channel's owner end, kept to end it (`shut`)
+        self.owners: list[socket.socket] = []
+
+    def shut(self) -> None:
+        """The owner ends every channel it serves, as TensorD does when their call ends."""
+        for end in self.owners:
+            with contextlib.suppress(OSError):
+                end.shutdown(socket.SHUT_RDWR)
 
     def grant(self) -> list[dict[str, object]]:
         hex_id = self.manifest.removeprefix("sha256:")
@@ -160,6 +168,7 @@ class Hub:
     def channel(self, store: Store) -> int:
         """One fresh channel's executor end, its owner end served on a thread."""
         owner, executor = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.owners.append(owner.dup())
         served = threading.Thread(
             target=_ext.serve_fetch,
             args=(store, owner.detach()),
@@ -179,6 +188,8 @@ class Hub:
         return [self.gets[sha] for sha, _ in cast(list[tuple[str, int]], refs)]
 
     def close(self) -> None:
+        for end in self.owners:
+            end.close()
         self.gate.set()
         self.server.shutdown()
         self.server.server_close()

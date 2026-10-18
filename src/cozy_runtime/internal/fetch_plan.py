@@ -130,7 +130,11 @@ class Fetches:
         self._ask = ask
         self._progress = progress
         self._lock = threading.Lock()
+        #: one reader asks for a fresh channel at a time; the rest take the one it got
+        self._asking = threading.Lock()
         self._channel: Fetch | None = None
+        #: the channel a read found closed, replaced at the next ask (`_gone`)
+        self._dead: Fetch | None = None
         #: this command's plans, by what planned them (one per model of a many-model load)
         self._plans: dict[str, list[Group]] = {}
         #: the next rank free for look-ahead
@@ -139,6 +143,11 @@ class Fetches:
         self._whole: set[str] = set()
         #: on-demand plans this pass wanted (`want`)
         self._wanted: set[str] = set()
+
+    @property
+    def open(self) -> bool:
+        """Whether a channel serves the calls in flight."""
+        return self._current() is not None
 
     @property
     def groups(self) -> list[Group]:
@@ -183,35 +192,61 @@ class Fetches:
 
     def ahead(self, manifest: str, refs: Sequence[Ref]) -> None:
         """Want `refs` after everything already planned (a raw source's look-ahead)."""
-        channel = self._current(ask=True)
-        if channel is None or not refs:
-            return
-        with self._lock:
-            rank, self._rank = self._rank, self._rank + 1
-        self._send(channel, manifest, refs, rank)
+        for again in (False, True):
+            channel = self._current(ask=True)
+            if channel is None or not refs or manifest in self._whole:
+                return
+            with self._lock:
+                rank, self._rank = self._rank, self._rank + 1
+            try:
+                for start in range(0, len(refs), _BATCH):
+                    channel.schedule(manifest, _wire(refs[start : start + _BATCH]), rank)
+                return
+            except (tensorfs.errors.Refusal, OSError) as exc:
+                if again or not self._gone(channel, exc):
+                    if not self._unfetchable(manifest, exc):
+                        raise
+                    return
 
     def present(self, manifest: str, refs: Sequence[Ref]) -> bool:
         """Whether every one of `refs` is here (no channel: the owner placed them all)."""
-        channel = self._current()
-        if channel is None or manifest in self._whole or not refs:
-            return True
-        try:
-            return all(channel.present(manifest, _wire(refs)))
-        except (tensorfs.errors.Refusal, OSError) as exc:
-            return self._unfetchable(manifest, exc)
+        for again in (False, True):
+            channel = self._current(ask=again)
+            if channel is None or manifest in self._whole or not refs:
+                return True
+            try:
+                return all(channel.present(manifest, _wire(refs)))
+            except (tensorfs.errors.Refusal, OSError) as exc:
+                if again or not self._gone(channel, exc):
+                    return self._unfetchable(manifest, exc)
+        return True
 
     def wait(self, manifest: str, refs: Sequence[Ref]) -> None:
         """Block until `refs` are here, raised to Now. A refusal fails the run."""
-        channel = self._current()
-        if channel is None or manifest in self._whole or not refs:
-            return
-        try:
-            if not all(channel.present(manifest, _wire(refs))):
-                self._progress(*self._landed(channel))
-                channel.wait(manifest, _wire(refs))
-        except (tensorfs.errors.Refusal, OSError) as exc:
-            if not self._unfetchable(manifest, exc):
-                raise failure(manifest, refs, exc) from None
+        for again in (False, True):
+            channel = self._current(ask=again)
+            if channel is None or manifest in self._whole or not refs:
+                return
+            try:
+                if not all(channel.present(manifest, _wire(refs))):
+                    self._progress(*self._landed(channel))
+                    channel.wait(manifest, _wire(refs))
+                return
+            except (tensorfs.errors.Refusal, OSError) as exc:
+                if again or not self._gone(channel, exc):
+                    if not self._unfetchable(manifest, exc):
+                        raise failure(manifest, refs, exc) from None
+                    return
+
+    def _gone(self, channel: Fetch, exc: BaseException) -> bool:
+        """Whether `channel` closed under a read: calls in flight share one, and the owner ends
+        it with the call that asked for it. The reader then asks a fresh one, as itself, with
+        the plan so far."""
+        if not (isinstance(exc, OSError) or "fetch channel closed" in str(exc)):
+            return False
+        with self._lock:
+            self._dead = channel
+        return True
 
     def end(self) -> None:
         """The attempt ended: its interest goes with its channel."""
@@ -224,10 +259,14 @@ class Fetches:
     def _current(self, ask: bool = False) -> Fetch | None:
         with self._lock:
             channel = self._channel
-        if channel is None and ask:
-            self.schedule((), "ask")
-            with self._lock:
-                channel = self._channel
+        if ask and (channel is None or channel is self._dead):
+            with self._asking:
+                with self._lock:
+                    channel = self._channel
+                if channel is None or channel is self._dead:
+                    self.schedule((), "ask")
+                    with self._lock:
+                        channel = self._channel
         return channel
 
     def _send(self, channel: Fetch, manifest: str, refs: Sequence[Ref], rank: int) -> None:

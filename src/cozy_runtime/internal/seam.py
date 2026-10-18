@@ -36,6 +36,8 @@ import sys
 import tempfile
 import threading
 import time
+from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, NoReturn
 
@@ -71,6 +73,9 @@ SECRET_KEYS = frozenset({"token", "credential", "authorization", "secret", "jwt"
 #: take the road the output blobs take, and only their digest and length cross here. The
 #: WORKER names the file, so no path ever comes off the child (cr-007).
 RESULT_DOCUMENT = "result.canonical"
+
+#: One decoded frame: a JSON object, routed by its `event`, `cmd`, `seq` and `request_id`.
+type Frame = dict[str, object]
 
 #: Peer-gone errnos: ECONNRESET, EPIPE, ENOTCONN.
 _GONE_ERRNOS = (104, 32, 107)
@@ -113,9 +118,9 @@ class Channel:
     frames_out: int = 0
     frames_in: int = 0
     refusals: list[str] = field(default_factory=list)
-    #: One frame at a time: follower progress is forwarded from reader threads and overlapped
-    #: calls log from theirs, beside the thread that owns the attempt.
-    sending: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
+    #: One frame at a time, and a frame with the descriptors that follow it (held across both
+    #: by `Mux.ask`): attempts, follower readers and overlapped calls all send.
+    sending: threading.RLock = field(default_factory=threading.RLock, repr=False, compare=False)
 
     def send(self, message: dict[str, Any]) -> None:
         _scan(message)
@@ -229,6 +234,22 @@ class Channel:
             os.close(received)
             raise
         return received
+
+    def recv_fds(self, count: int) -> list[int]:
+        """`count` descriptors, unopened, for a relay to pass on (`send_fds`)."""
+        received: list[int] = []
+        try:
+            for _ in range(count):
+                received.append(self._recv_fd())
+        except BaseException:
+            for fd in received:
+                os.close(fd)
+            raise
+        return received
+
+    def send_fds(self, fds: list[int]) -> None:
+        for fd in fds:
+            self._send_fd(fd, "relayed capability")
 
     def pass_fd(self, to: Channel) -> None:
         """Relay one descriptor to another seam unopened: its receiver checks what it is."""
@@ -438,6 +459,139 @@ if sys.platform == "win32":
                 self._raise(exc)
             self.recv_bytes += 9
             return handle
+
+
+#: Cancel marks kept for calls this executor has not served (yet, or ever).
+CANCELS_KEPT = 256
+
+
+def _nothing(*_: object) -> None:
+    return None
+
+
+@dataclass(slots=True)
+class _Asked:
+    receive: Callable[[Frame], None]
+    answer: Frame | None = None
+    error: SeamError | None = None
+
+
+class Mux:
+    """One seam shared by every thread of the process. Whoever needs a frame reads the next
+    one and routes it: an answer to the request waiting on its `seq`, a `cancel` to its call's
+    mark, anything else to the commands, in order. No reader thread exists, so a process that
+    has served no call stays single-threaded and forkable (`zygote`)."""
+
+    def __init__(self, channel: Channel) -> None:
+        self.channel = channel
+        self._seq = 0
+        self._asked: dict[int, _Asked] = {}
+        self._commands: deque[Frame] = deque()
+        self._cancels: dict[str, None] = {}
+        self._reading = False
+        self._ended: SeamError | None = None
+        self._changed = threading.Condition()
+
+    def ask(
+        self,
+        request: Frame,
+        send: Callable[[], None] = _nothing,
+        receive: Callable[[Frame], None] = _nothing,
+    ) -> Frame:
+        """Send `request` and the descriptors `send` writes after it, and return its answer.
+        `receive` takes the descriptors following the answer, on the thread that read it."""
+        asked = _Asked(receive)
+        with self.channel.sending:
+            with self._changed:
+                self._seq += 1
+                seq = self._seq
+                self._asked[seq] = asked
+            try:
+                self.channel.send({**request, "seq": seq})
+                send()
+            except BaseException:
+                with self._changed:
+                    del self._asked[seq]
+                raise
+        self._pump(lambda: asked.answer is not None)
+        if asked.error is not None:
+            raise asked.error
+        if asked.answer is None:
+            assert self._ended is not None
+            raise SeamError(self._ended.code, f"{request.get('kind')}#{seq}: {self._ended.detail}")
+        return asked.answer
+
+    def command(self) -> Frame | None:
+        """The next command; None once the peer closed the seam."""
+        self._pump(lambda: bool(self._commands))
+        with self._changed:
+            if self._commands:
+                return self._commands.popleft()
+        assert self._ended is not None
+        if self._ended.code == "seam_closed":
+            return None
+        raise self._ended
+
+    def cancel(self, request_id: str) -> None:
+        with self._changed:
+            self._cancels[request_id] = None
+            while len(self._cancels) > CANCELS_KEPT:
+                del self._cancels[next(iter(self._cancels))]
+            self._changed.notify_all()
+
+    def cancelled(self, request_id: str, wait: float = 0.0) -> bool:
+        """Whether `request_id` is cancelled, waiting up to `wait` seconds for it."""
+        with self._changed:
+            return self._changed.wait_for(lambda: request_id in self._cancels, wait)
+
+    def forget(self, request_id: str) -> None:
+        with self._changed:
+            self._cancels.pop(request_id, None)
+
+    def _pump(self, done: Callable[[], bool]) -> None:
+        while True:
+            with self._changed:
+                self._changed.wait_for(
+                    lambda: done() or self._ended is not None or not self._reading
+                )
+                if done() or self._ended is not None:
+                    return
+                self._reading = True
+            ended: SeamError | None = None
+            try:
+                frame = self.channel.recv()
+                if frame is None:
+                    ended = SeamError("seam_closed", "the worker closed the seam")
+                else:
+                    self._route(frame)
+            except Exception as exc:  # the stream is past a frame no one can place: it ends
+                ended = exc if isinstance(exc, SeamError) else SeamError("seam_io", repr(exc))
+            finally:
+                with self._changed:
+                    self._reading = False
+                    self._ended = self._ended or ended
+                    self._changed.notify_all()
+
+    def _route(self, frame: Frame) -> None:
+        if frame.get("event") == "answer":
+            seq = frame.get("seq")
+            with self._changed:
+                asked = self._asked.pop(seq, None) if isinstance(seq, int) else None
+            if asked is None:
+                raise SeamError("seam_out_of_order", f"an answer to no request: {seq!r}")
+            try:
+                asked.receive(frame)  # its descriptors follow it on the stream
+            except (
+                SeamError
+            ) as exc:  # that exchange fails; a receive that lost the stream closed it
+                asked.error = exc
+            with self._changed:
+                asked.answer = frame
+        elif frame.get("cmd") == "cancel":
+            self.cancel(str(frame.get("request_id", "")))
+        else:
+            with self._changed:
+                self._commands.append(frame)
 
 
 def listener(path: str) -> socket.socket:

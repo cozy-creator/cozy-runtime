@@ -145,6 +145,56 @@ def test_an_ended_attempt_drops_what_it_wanted(tmp_path: Path) -> None:
         assert not any(store.contains(sha) for sha, _ in wanted)
 
 
+def test_a_channel_its_call_ended_is_asked_again_by_a_call_still_reading(tmp_path: Path) -> None:
+    """Calls in flight share one channel. When the owner ends it with the call that asked for
+    it, a call still waiting asks a fresh one with the plan so far, rather than reading the
+    closed channel as nothing to fetch."""
+    with served(tmp_path) as (hub, store):
+        wanted = objects_of(store, hub.manifest, "encoder")
+        hub.held = {sha for sha, _ in wanted}
+        hub.gate.clear()
+        planner = fetches(hub, store)
+        planner.schedule([(hub.manifest, wanted)])
+        assert hub.asked.wait(30)
+        asked = len(hub.served)
+        hub.shut()
+        threading.Timer(1.0, hub.gate.set).start()
+        planner.wait(hub.manifest, wanted)
+        assert all(store.contains(sha) for sha, _ in wanted)
+        assert len(hub.served) == asked + 1  # one fresh channel, asked by the reader
+        planner.end()
+
+
+def test_two_readers_that_find_the_channel_closed_share_one_fresh_one(tmp_path: Path) -> None:
+    """Two calls waiting when the owner ends their channel each ask again at once: one asks,
+    the other takes what it got, so neither reads a channel the other's ask just closed."""
+    with served(tmp_path) as (hub, store):
+        wanted = objects_of(store, hub.manifest, "encoder")
+        hub.held = {sha for sha, _ in wanted}
+        hub.gate.clear()
+        planner = fetches(hub, store)
+        planner.schedule([(hub.manifest, wanted)])
+        assert hub.asked.wait(30)
+        asked = len(hub.served)
+        hub.shut()
+        start, landed = threading.Barrier(2), []
+
+        def reader() -> None:
+            start.wait()
+            planner.wait(hub.manifest, wanted)
+            landed.append(all(store.contains(sha) for sha, _ in wanted))
+
+        readers = [threading.Thread(target=reader) for _ in range(2)]
+        for thread in readers:
+            thread.start()
+        threading.Timer(1.0, hub.gate.set).start()
+        for thread in readers:
+            thread.join(60)
+        assert landed == [True, True]
+        assert len(hub.served) == asked + 1
+        planner.end()
+
+
 def test_a_raw_source_wants_its_declared_components_and_the_rest_of_what_it_reads(
     tmp_path: Path,
 ) -> None:

@@ -22,8 +22,9 @@ import json
 import logging
 import threading
 import weakref
+from collections import deque
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
-from contextlib import AbstractContextManager, ExitStack
+from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import dataclass, field
 from typing import (
     Any,
@@ -36,7 +37,14 @@ from typing import (
     final,
 )
 
-from cozy_runtime.author._context import AdapterRef, Context, Device, RequestView, derive_seed
+from cozy_runtime.author._context import (
+    CURRENT,
+    AdapterRef,
+    Context,
+    Device,
+    RequestView,
+    derive_seed,
+)
 from cozy_runtime.author._errors import (
     CapabilityError,
     ConformanceError,
@@ -317,9 +325,114 @@ class Building(Exception):
     records once a kernel lands (`LANDED`)."""
 
 
-#: Warnings Runtime's speed mechanisms raise (a graph that would not record or replayed wrong),
-#: as (message, fields): the executor puts each in the run it served and clears them.
-WARNINGS: list[tuple[str, dict[str, str | bool | int | float | None]]] = []
+type WarningRow = tuple[str, dict[str, str | bool | int | float | None]]
+
+
+class _Warnings:
+    """Warnings Runtime's speed mechanisms raise (a graph that would not record or replayed
+    wrong), as (message, fields). Each lands in the attempt whose context raised it; one raised
+    outside every attempt lands in the next attempt to end."""
+
+    def __init__(self) -> None:
+        self._process: list[WarningRow] = []
+        self._lock = threading.Lock()
+        self._attempt: contextvars.ContextVar[list[WarningRow] | None] = contextvars.ContextVar(
+            "cozy_warnings", default=None
+        )
+
+    def _rows(self) -> list[WarningRow]:
+        rows = self._attempt.get()
+        return self._process if rows is None else rows
+
+    def _taken(self) -> list[WarningRow]:
+        with self._lock:
+            rows, self._process = self._process, []
+        return rows
+
+    def append(self, row: WarningRow) -> None:
+        self._rows().append(row)
+
+    def clear(self) -> None:
+        self._rows().clear()
+
+    def __contains__(self, row: object) -> bool:
+        return row in self._rows()
+
+    def __iter__(self) -> Iterator[WarningRow]:
+        return iter(list(self._rows()))
+
+    def __len__(self) -> int:
+        return len(self._rows())
+
+    @contextmanager
+    def attempt(self) -> Iterator[list[WarningRow]]:
+        """This context's warnings until it ends, with those raised outside every attempt."""
+        rows = self._taken()
+        token = self._attempt.set(rows)
+        try:
+            yield rows
+        finally:
+            self._attempt.reset(token)
+            rows += self._taken()
+
+
+WARNINGS = _Warnings()
+
+
+class _Scopes:
+    """Calls take component scopes one at a time, in the order they ask: a call entering a scope
+    while another call holds one waits for it. Within one call, on any of its threads, scopes
+    nest as they always have; a thread outside every call (`CURRENT` unset) never waits.
+
+    Known limit: a call's threads are those that carry its context (SDK pools, its event loop's
+    executor). A plain `threading.Thread` an author starts carries none, so it enters scopes
+    as no call, even inside another call's turn. Harmless with one call at a time; batching
+    calls in one executor (cr-202 U4) must close it before authors' plain threads matter; one
+    entering during another call's turn warns (`busy`)."""
+
+    def __init__(self) -> None:
+        self._changed = threading.Condition()
+        self._holder: object = None
+        self._depth = 0
+        self._queue: deque[object] = deque()
+
+    def enter(self, call: object) -> None:
+        with self._changed:
+            if self._holder is not call:
+                ticket = object()
+                self._queue.append(ticket)
+                self._changed.wait_for(
+                    lambda: (
+                        self._holder is call or (self._holder is None and self._queue[0] is ticket)
+                    )
+                )
+                self._queue.remove(ticket)
+                self._holder = call
+                self._changed.notify_all()  # the call's other threads waiting now pass
+            self._depth += 1
+
+    def leave(self) -> None:
+        with self._changed:
+            self._depth -= 1
+            if not self._depth:
+                self._holder = None
+                self._changed.notify_all()
+
+    def busy(self) -> bool:
+        """Whether some call holds the turn."""
+        return self._holder is not None
+
+    @contextmanager
+    def held(self, call: object) -> Iterator[None]:
+        """`call`'s turn: while it lasts, no other call is in a scope."""
+        self.enter(call)
+        try:
+            yield
+        finally:
+            self.leave()
+
+
+SCOPES = _Scopes()
 
 
 def uncaptured(*names: str) -> Callable[[type[ModelT]], type[ModelT]]:
@@ -871,21 +984,22 @@ def _declared_state(cls: type) -> tuple[str, ...]:
 
 @final
 class _ComponentScope:
-    """ONE public scope is active at a time per instance (§1.1). A composite operation
-    declares its components together on one method.
+    """ONE public scope is active at a time per instance (§1.1), and one call holds scopes at a
+    time (`SCOPES`). A composite operation declares its components together on one method.
 
     The one exception holds nothing here: a REMOTE scope, whose every declared component the
     runtime keeps on another GPU of the group (`Placement.remote`). It admits nothing on
     this device and marks this context, not the instance, so it may be open beside the one
     local scope (`author.concurrently` overlaps the two)."""
 
-    __slots__ = ("_components", "_method", "_model", "_remote")
+    __slots__ = ("_call", "_components", "_method", "_model", "_remote")
 
     def __init__(self, model: Model[Any], method: str, components: tuple[str, ...]) -> None:
         self._model = model
         self._method = method
         self._components = components
         self._remote: contextvars.Token[Any] | None = None
+        self._call: Context | None = None
 
     def __enter__(self) -> None:
         model = self._model
@@ -914,6 +1028,24 @@ class _ComponentScope:
             if model._cozy_harness is not None:
                 model._cozy_harness.calls.append(ScopeCall(self._method, self._components))
             return
+        self._call = CURRENT.get()
+        if self._call is not None:
+            SCOPES.enter(self._call)
+        elif SCOPES.busy():
+            row: WarningRow = (
+                "a thread outside every call entered a component scope during another call's turn",
+                {"method": f"{type(model).__name__}.{self._method}"},
+            )
+            if row not in WARNINGS:
+                WARNINGS.append(row)
+        try:
+            self._admit(model)
+        except BaseException:
+            if self._call is not None:
+                SCOPES.leave()
+            raise
+
+    def _admit(self, model: Model[Any]) -> None:
         if model._cozy_active is not None:
             raise CapabilityError(
                 f"{type(model).__name__}.{self._method} entered while "
@@ -941,12 +1073,16 @@ class _ComponentScope:
             if placement is not None:
                 placement.leave(self._components)
             return
-        object.__setattr__(model, "_cozy_active", None)
-        # RELEASE MAKES BYTES EVICTABLE; it does not evict, and it imposes no global scope
-        # sequence (§3.2). The lease ends at the completion event, not at this statement.
-        residency = model._cozy_residency
-        if residency is not None:
-            residency.release(self._method, self._components)
+        try:
+            object.__setattr__(model, "_cozy_active", None)
+            # RELEASE MAKES BYTES EVICTABLE; it does not evict, and it imposes no global scope
+            # sequence (§3.2). The lease ends at the completion event, not at this statement.
+            residency = model._cozy_residency
+            if residency is not None:
+                residency.release(self._method, self._components)
+        finally:
+            if self._call is not None:
+                SCOPES.leave()
 
 
 # --------------------------------------------------------------------------- identity

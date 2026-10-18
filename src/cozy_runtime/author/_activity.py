@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import functools
 import selectors
 import threading
@@ -32,9 +33,14 @@ _ASIDE: ContextVar[Callable[[str, float], None] | None] = ContextVar(
 _SETTLE: Callable[[], None] | None = None
 
 
-def _owned[T](call: Callable[[], T]) -> T:
+def own_thread() -> None:
+    """This thread is a Runtime pool's: no attempt counts it as one of its own."""
     with _REGISTRY_LOCK:
         _POOL_THREADS.add(threading.current_thread())
+
+
+def _owned[T](call: Callable[[], T]) -> T:
+    own_thread()
     return call()
 
 
@@ -242,7 +248,9 @@ class EventLoop(asyncio.SelectorEventLoop):
         if self.activity.finished:
             return super().run_in_executor(executor, func, *args)
         if executor is None or isinstance(executor, PythonThreadPoolExecutor):
-            call, ticket = self.activity.preparing(functools.partial(func, *args))
+            # The callback runs in the attempt's context, as the attempt's own code does.
+            context = contextvars.copy_context()
+            call, ticket = self.activity.preparing(functools.partial(context.run, func, *args))
             # The SDK pool captures context too. This submission is already observed
             # here, so its normal submit path must not count the same callback twice.
             token = _CURRENT.set(None)
@@ -266,13 +274,13 @@ class ThreadPoolExecutor(PythonThreadPoolExecutor):
     """Standard thread pool whose submitted work participates in run timing.
 
     Only executing callbacks count; queued futures and idle pool threads do not.
-    Attribution is captured per submission, so pools can survive and serve many
-    invocations. Outside an invocation this behaves like the standard executor.
+    Attribution and the submitter's context are captured per submission, so pools can survive
+    and serve many invocations. Outside an invocation this behaves like the standard executor.
     """
 
     def submit[**P, T](self, fn: Callable[P, T], /, *args: P.args, **kwargs: P.kwargs) -> Future[T]:
         activity = _CURRENT.get()
-        call = functools.partial(fn, *args, **kwargs)
+        call = functools.partial(contextvars.copy_context().run, fn, *args, **kwargs)
         if activity is None or activity.finished:
             return super().submit(_owned, call)
         observed, ticket = activity.preparing(call)
