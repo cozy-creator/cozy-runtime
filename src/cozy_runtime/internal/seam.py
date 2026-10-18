@@ -166,7 +166,7 @@ class Channel:
             descriptor.close()
 
     def send_memfd(self, fd: int) -> None:
-        """Transfer one weight set's pinned host tier (`tensorfs.plane` memfd)."""
+        """Transfer one weight set's pinned host tier (`tensorfs.varena` memfd)."""
         _require_memfd(fd)
         self._send_fd(fd, "memfd")
 

@@ -1,7 +1,7 @@
 """The weight plane of the unified memory class (design §6.2): one pool, so the host tier is the
 OS page cache of the store's objects, and a resident region is one device tensor read from it.
 
-It speaks `tensorfs.plane`'s contract (`crates/tensorfs-plane/API.md`) for the calls Runtime
+It speaks `tensorfs.varena`'s contract (`crates/varena/API.md`) for the calls Runtime
 makes, so `weights.py`'s residency, paging and out-of-memory recovery run unchanged on Apple
 GPUs. What it has not: a pinned tier (the page cache is it), a byte ring (a streamed region is
 read where it is used and its cursor lets it go `window` regions later), sealed layouts and
@@ -22,17 +22,17 @@ from typing import TYPE_CHECKING
 
 import tensorfs
 from tensorfs import ReadLease, ReadPlan, Store
-from tensorfs import plane as _plane
+from tensorfs import varena as _plane
 
 from cozy_runtime.internal import spill
 
 if TYPE_CHECKING:
-    from tensorfs.plane import Part, Region, Trim
+    from tensorfs.varena import Part, Region, Trim
     from tensorfs.records import Header, ReadItem
     from torch import Tensor
     from torch import device as Device
 
-#: `stats()` and an event, as `tensorfs.plane` spells them (Runtime reads them typed)
+#: `stats()` and an event, as `tensorfs.varena` spells them (Runtime reads them typed)
 type Facts = dict[str, object]
 
 #: Every part starts on a page, so any dtype views it.
@@ -117,7 +117,7 @@ class _Region:
 
 
 class WeightSet:
-    """One component's layout: its regions and parts as `tensorfs.plane.WeightSet` states them."""
+    """One component's layout: its regions and parts as `tensorfs.varena.WeightSet` states them."""
 
     def __init__(
         self,
@@ -253,7 +253,7 @@ class Cursor:
 
 
 class UnifiedPlane:
-    """`tensorfs.plane.Plane` for one unified-memory device (`device`): budgets, residency
+    """`tensorfs.varena.Plane` for one unified-memory device (`device`): budgets, residency
     intent, leases, cursors, stats and events, over regions read from the page cache."""
 
     def __init__(self, torch: ModuleType, device: Device) -> None:

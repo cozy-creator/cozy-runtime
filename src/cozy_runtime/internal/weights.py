@@ -94,7 +94,7 @@ from cozy_runtime.internal.unified_plane import UnifiedPlane
 
 if TYPE_CHECKING:
     from tensorfs import ReadPlan
-    from tensorfs.plane import Cursor, Lease, Plane, Source, Ticket, WeightSet
+    from tensorfs.varena import Cursor, Lease, Plane, Source, Ticket, WeightSet
     from torch import Tensor
     from torch import device as Device
     from torch import dtype as Dtype
