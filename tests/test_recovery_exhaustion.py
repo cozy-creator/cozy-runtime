@@ -105,7 +105,7 @@ def test_sdk_seeded_bind_refills_its_base_before_one_forward(
 
         class Outer(StatefulBlock):
             def forward(self, value: Any) -> Any:
-                self.calls += 1
+                self._runs[0] += 1
                 return module(value)
 
         outer = Outer("counter")

@@ -21,6 +21,7 @@ from torch.utils._python_dispatch import TorchDispatchMode  # noqa: E402
 from cozy_runtime.author.kernels import INT8_CONVROT, PreQuantized  # noqa: E402
 from cozy_runtime.derive.microscale import encode_int8_convrot256  # noqa: E402
 from cozy_runtime.internal import attention_upstream as upstream  # noqa: E402
+from cozy_runtime.internal import spill  # noqa: E402
 from cozy_runtime.internal.attention_ulysses import Options, _call  # noqa: E402
 from cozy_runtime.internal.bands import Bands  # noqa: E402
 from cozy_runtime.internal.encoding.formats import hadamard256  # noqa: E402
@@ -45,6 +46,9 @@ class Card:
 
     def lockable(self, want: int) -> int:
         return 0  # no host memory apart: results stay on the "device"
+
+    def spill(self, need: int, operands: Any) -> bool:
+        return False  # no other tensors to move
 
 
 class Short(TorchDispatchMode):  # type: ignore[misc]
@@ -416,3 +420,59 @@ def test_an_encoded_linear_out_of_memory_runs_in_rows(operand: str) -> None:
             out = leaf(given)
     assert torch.equal(out, whole) and out.shape == (2, 37, 48)
     assert max(tight.ran) <= 16 and "1 encoded linear" in card.weights.modes["bands"]
+
+
+class Crowded(Card):
+    """A card `room` bytes free beside `others` bytes of tensors no op reads: `spill` moves
+    what it is asked of them to host memory, never the op's `operands`."""
+
+    def __init__(self, room: int, others: int, host: int = 0, device: str = "cpu") -> None:
+        super().__init__(room)
+        self.others, self.host, self.device = others, host, torch.device(device)
+        self.asked: list[tuple[int, Any]] = []
+
+    def lockable(self, want: int) -> int:
+        return self.host
+
+    def spill(self, need: int, operands: Any) -> bool:
+        self.asked.append((need, operands))
+        moved = min(need, self.others)
+        self.room, self.others = self.room + moved, self.others - moved
+        return moved > 0
+
+
+def crowded_product(card: Crowded) -> tuple[Any, Any, int]:
+    """A product out of device memory whole on `card`: its result, the whole one's, and the
+    bytes its result and two pieces of rows need."""
+    torch.manual_seed(12)
+    x, w = torch.randn(64, 32, device=card.device), torch.randn(32, 128, device=card.device)
+    with torch.inference_mode():
+        whole = x @ w
+        bands = Bands(card)  # type: ignore[arg-type]
+        out = bands.run(torch.ops.aten.mm.default, (x, w), {}, short=True)
+    assert [ops for _, ops in card.asked] == [(x, w)]
+    return out, whole, whole.nbytes + 2 * (whole.nbytes + x.nbytes) // 64
+
+
+@pytest.mark.parametrize("others", (1 << 20, 0))
+def test_a_result_without_room_moves_other_tensors_off_first(others: int) -> None:
+    """Run 11340 (0.28.1, 8 GB H3): feed-forward results went to host memory while tensors no
+    op read kept the card, 1.48 TB over the bus, and the LoRA found no room. Those tensors move
+    first, just what the result and two pieces lack, the op's operands never. Nothing to move
+    and no host memory: the result takes the device all the same."""
+    card = Crowded(room=1024, others=others, host=1 << 30 if others else 0)
+    out, whole, least = crowded_product(card)
+    assert card.asked[0][0] == least - 1024 and card.others == max(others - least + 1024, 0)
+    assert out.device == card.device and "host memory" not in card.modes["bands"]
+    torch.testing.assert_close(out, whole)  # pieces may take another CPU GEMM tiling
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="a host block is page-locked memory")
+def test_a_result_goes_to_host_memory_only_when_nothing_moves() -> None:
+    """No other tensor to move: the result takes host memory, which the bands write."""
+    card = Crowded(room=1024, others=0, host=1 << 30, device="cuda")
+    out, whole, _ = crowded_product(card)
+    assert spill.hosted(out) and "B of results in host memory" in card.modes["bands"]
+    torch.testing.assert_close(out, whole)
+    del out
+    spill.release(torch)

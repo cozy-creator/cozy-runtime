@@ -50,7 +50,7 @@ from typing import Any
 from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT
 from cozy_runtime.author._capture import _capture_clock
 from cozy_runtime.author._model import LANDED, PLACED, RELEASERS, WARNINGS, Building
-from cozy_runtime.internal import attention_ulysses, spill
+from cozy_runtime.internal import attention_ulysses, module_state, spill
 
 #: Set while a mechanism runs its own graphs over a component (`cozy_runtime.lm`): its calls
 #: pass straight through.
@@ -273,9 +273,14 @@ def _dispatch(torch: Any, module: Any, call: Callable[..., Any], args: Any, kwar
         torch.cuda.synchronize()
         torch.cuda.empty_cache()  # what it reserves from here is what it takes at its peak
         started, before = time.perf_counter(), torch.cuda.memory_reserved()
+        state = module_state.snapshot(module)
         with placed[0].recording() if placed else contextlib.nullcontext({}) as read:
             out = call(module, *args, **kwargs)
         launched = time.perf_counter() - started
+        if module_state.changed(state, module_state.snapshot(module)):
+            # A replay runs none of its Python: one that changes its own attributes (HiDiffusion's
+            # step counters) runs as written, and is never run again to measure it.
+            _chose(recorder, key, "its state", "it changes its own attributes")
         recorder.need[key] = torch.cuda.memory_reserved() - before
         torch.cuda.synchronize()
         took = time.perf_counter() - started
@@ -344,6 +349,10 @@ def _record(
     cargs, ckwargs = torch.utils._pytree.tree_unflatten(static, spec)
     outputs: list[Any] = []
     pool = recorder.pool
+    # Measuring changes nothing the call would see: its passes put back the attributes and
+    # the generators they advanced (the owner: a first request equals a warm one).
+    state = module_state.snapshot(module)
+    cpu, cuda = torch.random.get_rng_state(), torch.cuda.get_rng_state()
     try:
         graph, why = capture(
             torch, lambda: outputs.append(call(module, *cargs, **ckwargs)), pool, recorder.stream
@@ -378,6 +387,9 @@ def _record(
             _chose(
                 recorder, key, "no faster", f"replay {replay_s:.4f} s, {written_s:.4f} s as written"
             )
+    module_state.restore(module, state)
+    torch.random.set_rng_state(cpu)
+    torch.cuda.set_rng_state(cuda)
     recorder.record_s += time.perf_counter() - started
     if graph is None:
         outputs.clear()

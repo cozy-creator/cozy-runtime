@@ -38,6 +38,10 @@ class Probe(Command, frozen=True, kw_only=True, tag="probe"):
     collect: bool = False
 
 
+class Reclaim(Command, frozen=True, kw_only=True, tag="reclaim"):
+    """Rank 0's attempt failed: a follower gives back what it took on its GPU."""
+
+
 class Join(Command, frozen=True, kw_only=True, tag="join"):
     port: int
     backend: str = "nccl"
@@ -394,6 +398,7 @@ type KnownCommand = (
     Hello
     | Shutdown
     | Probe
+    | Reclaim
     | Join
     | Fork
     | Budget

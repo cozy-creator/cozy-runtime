@@ -46,7 +46,7 @@ from cozy_runtime.author._assets import (
     bind_tree,
     field_preparation,
 )
-from cozy_runtime.author._calls import ChildCallError, _Broker, _current
+from cozy_runtime.author._calls import _Broker, _current
 from cozy_runtime.author._context import CURRENT, AdapterRef, Context, Device
 from cozy_runtime.author._decode import (
     AudioProbe,
@@ -65,6 +65,7 @@ from cozy_runtime.author._errors import (
     Outcome,
     OutputError,
     classify,
+    unwind,
 )
 from cozy_runtime.author._executor_requests import Publish, Published
 from cozy_runtime.author._markers import AssetBound, ImagePreparation, Preparation
@@ -427,8 +428,9 @@ def run_prepared(
     except (KeyboardInterrupt, SystemExit):
         raise
     except Exception as exc:
-        record.failed_at_call = isinstance(exc, ChildCallError)
-        return None, classify(exc), record
+        outcome = classify(exc)
+        unwind(exc)
+        return None, outcome, record
     finally:
         record.closed = True
 

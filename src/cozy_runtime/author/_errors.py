@@ -211,6 +211,18 @@ def is_library_refusal(exc: BaseException) -> bool:
     return isinstance(exc, RuntimeError) and ("CUBLAS_STATUS_" in text or "CUDNN_STATUS_" in text)
 
 
+def unwind(exc: BaseException) -> None:
+    """Let a failure's frames go, and the tensors their locals hold: every traceback in its
+    cause and context chain (its outcome keeps the text)."""
+    chain: list[BaseException | None] = [exc]
+    seen: set[int] = set()
+    while chain:
+        if (link := chain.pop()) is not None and id(link) not in seen:
+            seen.add(id(link))
+            link.__traceback__ = None
+            chain += (link.__cause__, link.__context__)
+
+
 def classify(exc: BaseException | None) -> Outcome:
     """Map what escaped a handler onto the neutral set.
 
