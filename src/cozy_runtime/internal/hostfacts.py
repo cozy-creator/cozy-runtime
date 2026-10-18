@@ -11,6 +11,7 @@ than one that fails).
 from __future__ import annotations
 
 import ast
+import ctypes
 import os
 import platform
 import re
@@ -24,6 +25,39 @@ from pathlib import Path
 from cozy_runtime.internal.config import sees_no_gpu
 
 TORCH_VERSION_MAX_BYTES = 64 * 1024
+
+if sys.platform == "win32":
+
+    class _MemoryStatus(ctypes.Structure):
+        """`MEMORYSTATUSEX`, as `GlobalMemoryStatusEx` fills it."""
+
+        _fields_ = (
+            ("dwLength", ctypes.c_uint32),
+            ("dwMemoryLoad", ctypes.c_uint32),
+            ("ullTotalPhys", ctypes.c_uint64),
+            ("ullAvailPhys", ctypes.c_uint64),
+            ("ullTotalPageFile", ctypes.c_uint64),
+            ("ullAvailPageFile", ctypes.c_uint64),
+            ("ullTotalVirtual", ctypes.c_uint64),
+            ("ullAvailVirtual", ctypes.c_uint64),
+            ("ullAvailExtendedVirtual", ctypes.c_uint64),
+        )
+
+    def physical_memory() -> int:
+        """The host's physical memory in bytes; 0 where it cannot be read."""
+        status = _MemoryStatus(dwLength=ctypes.sizeof(_MemoryStatus))
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return 0
+        return int(status.ullTotalPhys)
+
+else:
+
+    def physical_memory() -> int:
+        """The host's physical memory in bytes; 0 where it cannot be read."""
+        try:
+            return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+        except (ValueError, OSError):
+            return 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,21 +133,15 @@ def measure(expected_backend: str = "") -> HostFacts:
                 raise ValueError(f"mixed accelerators: {sorted({row[0] for row in rows})}")
             name, total, drv, cap = rows[0]
             # An integrated GPU (GB10) has no framebuffer: its memory is the host's.
-            vram = (
-                os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
-                if total == "[N/A]"
-                else int(float(total)) * 1024 * 1024
-            )
+            vram = physical_memory() if total == "[N/A]" else int(float(total)) * 1024 * 1024
             gpu_name, driver = name, drv
             gpu_sm = int(float(cap) * 10)
             gpu_count = len(rows)
             backend = "cuda"
         except (OSError, subprocess.SubprocessError, ValueError, IndexError):
             unreadable += ["gpu_name", "gpu_sm", "vram_total_bytes", "driver_version"]
-    try:
-        pages = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
-    except (ValueError, OSError):
-        pages = 0
+    pages = physical_memory()
+    if not pages:
         unreadable.append("host_ram_total_bytes")
     cuda_version, cuda_unreadable = _installed_cuda_version()
     if cuda_unreadable:

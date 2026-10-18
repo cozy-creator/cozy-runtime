@@ -242,10 +242,9 @@ jobs:
 
       - uses: astral-sh/setup-uv@v7
 
-      # The seam, file lock and parent watch import no TensorFS or torch.
+      # This ref with its dependencies (TensorFS's win_amd64 wheel), no torch: the executor imports.
       - name: Tests
         run: |
           uv venv --python 3.12 .venv
-          uv pip install --python .venv/Scripts/python.exe --no-deps -e .
-          uv pip install --python .venv/Scripts/python.exe msgspec pytest
+          uv pip install --python .venv/Scripts/python.exe -e . pytest
           .venv/Scripts/python.exe -m pytest -q -rs tests/test_windows_executor_path.py

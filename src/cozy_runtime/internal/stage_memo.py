@@ -21,7 +21,6 @@ import hashlib
 import importlib.metadata
 import inspect
 import logging
-import os
 import struct
 import sys
 import threading
@@ -48,7 +47,7 @@ from cozy_runtime.author._executor_requests import (
     StageMemoStore,
 )
 from cozy_runtime.author._stage_memo import exactness
-from cozy_runtime.internal import attention
+from cozy_runtime.internal import attention, hostfacts
 from cozy_runtime.internal.executor_commands import MemoSettings
 from cozy_runtime.internal.hostfacts import HostFacts
 from cozy_runtime.internal.memo_implementation import describe
@@ -415,7 +414,7 @@ def _ewma(previous: float, sample: float) -> float:
 
 def _default_process_bytes() -> int:
     """1 GiB, or a sixteenth of the host's memory where that is less."""
-    physical = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    physical = hostfacts.physical_memory()
     return min(1 << 30, physical // 16) if physical > 0 else 1 << 30
 
 
