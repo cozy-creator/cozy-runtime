@@ -1975,12 +1975,14 @@ class Effects:
     elsewhere), the generators its seeded ops draw from, and whether the bands rewrote an op
     of it (`Bands.rewrites`: a convolution past its padding's zeros, an op cut in rows). A
     forward that changes nothing else runs with no dispatch layer and, out of memory, again
-    from its generators' states; one that writes, or that the bands rewrote, keeps its ops'
-    recovery. Python attributes it changes (a counter on the module) are not seen."""
+    from its generators' states; one that writes, that the bands rewrote, or that changes a
+    plain attribute of a module in it (`state`: HiDiffusion's step counters) keeps its ops'
+    recovery and never runs twice."""
 
     writes: bool
     generators: tuple[Any, ...]
     banded: bool = False
+    state: bool = False
 
 
 @dataclass(slots=True, eq=False)  # one is told from another by identity, never content
@@ -2035,8 +2037,20 @@ class Journal:
         self.made_here.clear()
         self.first.clear()
 
-    def effects(self, banded: bool = False) -> Effects:
-        return Effects(bool(self.kept), tuple(self.drawn.values()), banded)
+    def effects(self, banded: bool = False, state: bool = False) -> Effects:
+        return Effects(bool(self.kept), tuple(self.drawn.values()), banded, state)
+
+
+def _attributes(module: Module) -> list[tuple[int, str, object]]:
+    """Every plain value a module tree keeps outside torch's sight, a tensor by identity: what
+    a forward can change that no journal sees (a step counter, a cached tensor swapped)."""
+    plain = (int, float, bool, str, bytes, type(None))
+    return [
+        (id(m), name, value if isinstance(value, plain) else id(value))
+        for m in module.modules()
+        for name, value in vars(m).items()
+        if isinstance(value, plain) or hasattr(value, "untyped_storage")
+    ]
 
 
 #: how often a journaled call marks its device progress, in ops (an event costs microseconds)
@@ -4234,10 +4248,10 @@ class WeightResidency:
     ) -> Callable[..., Any]:
         """The one hook per block: acquire, bind, run, release. Its ops recover one by one in
         the process's dispatch mode. A block whose first run wrote nothing that existed before
-        it (`Effects`) runs with no mode; out of memory there, it gets back the generators it
-        drew from and the containers it was handed and runs again with its ops recovering, as
-        it does from then on (`tight`). A group GPU's blocks hold their group's collectives:
-        they never run twice, and always recover op by op."""
+        it and changed no attribute (`Effects`) runs with no mode; out of memory there, it gets
+        back the generators it drew from and the containers it was handed and runs again with
+        its ops recovering, as it does from then on (`tight`). A group GPU's blocks hold their
+        group's collectives: they never run twice, and always recover op by op."""
         weights = self.weights
 
         def run(*args: Any, **kwargs: Any) -> Any:
@@ -4246,6 +4260,7 @@ class WeightResidency:
                 if (
                     effects is None
                     or effects.writes
+                    or effects.state
                     or effects.banded
                     or region.tight
                     or weights.grouped
@@ -4297,6 +4312,7 @@ class WeightResidency:
                     raise
             journal = Journal()
             rewrites = weights.bands.rewrites if weights.bands is not None else 0
+            attributes = _attributes(region.module)
             try:
                 with weights.recovering(journal):
                     out = attempt(True, *args, **kwargs)
@@ -4305,7 +4321,7 @@ class WeightResidency:
                     journal.rewind()
                 raise
             banded = weights.bands is not None and weights.bands.rewrites > rewrites
-            region.effects = journal.effects(banded)
+            region.effects = journal.effects(banded, _attributes(region.module) != attributes)
             return out
 
         def attempt(entering: bool, *args: Any, **kwargs: Any) -> Any:
