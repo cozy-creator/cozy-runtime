@@ -427,10 +427,20 @@ def run_prepared(
     except (KeyboardInterrupt, SystemExit):
         raise
     except Exception as exc:
-        record.failed_at_call = isinstance(exc, ChildCallError)
+        record.failed_at_call = _at_call(exc)
         return None, classify(exc), record
     finally:
         record.closed = True
+
+
+def _at_call(exc: BaseException | None) -> bool:
+    """Whether a package call's failure ended the handler: raised at the call boundary, or
+    raised again from it (`raise ... from failure`, H3's `segment_failed`, run 11275)."""
+    while exc is not None:
+        if isinstance(exc, ChildCallError):
+            return True
+        exc = exc.__cause__
+    return False
 
 
 def attempt(

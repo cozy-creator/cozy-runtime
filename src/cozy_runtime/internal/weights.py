@@ -511,6 +511,18 @@ class Weights:
             accel.release_cached(self.torch, self.kind)
         return freed
 
+    def take_cap(self) -> None:
+        """A process cap the owner wrote into the cell (a room grant raising it into what the
+        other tenants gave, the floor watchdog lowering it), applied now: a group's follower
+        hears its cap only there, and an op waiting for room reads no block boundary (run
+        11275: refused under a 718 MB cap on an empty 8 GB GPU). Plane budgets wait for one."""
+        cell = self.cell
+        wanted = cell.pending() if cell is not None else None
+        if cell is not None and wanted is not None and wanted <= budget_cell.CAP:
+            cell.poll()
+            self.set_cap(budget_cell.CAP - wanted)
+            cell.acknowledge(self.applied)
+
     def set_cap(self, cap: int) -> None:
         """The owner's process cap; -1 lifts it. Every plane budget stays inside it, and torch's
         allocator is held to what it leaves beside the context and the plane's maps: an

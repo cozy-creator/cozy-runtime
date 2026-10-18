@@ -59,12 +59,16 @@ class Cell:
 
     # -- the executor
 
+    def pending(self) -> int | None:
+        """A budget asked since the last `poll`, left in the cell, else None."""
+        asked, wanted, _, _ = self._read()
+        return None if asked == self.seen else wanted
+
     def poll(self) -> int | None:
         """A budget asked since the last `acknowledge`, else None."""
-        asked, wanted, _, _ = self._read()
-        if asked == self.seen:
-            return None
-        self.seen = asked
+        wanted = self.pending()
+        if wanted is not None:
+            self.seen = self._read()[0]
         return wanted
 
     def acknowledge(self, applied: int) -> None:

@@ -26,7 +26,7 @@ import os
 import shutil
 
 import msgspec
-from cozy_runtime.author import App, Context, InvalidRequest, Telemetry
+from cozy_runtime.author import App, ChildCallError, Context, InvalidRequest, OutputError, Telemetry
 
 app = App()
 
@@ -52,6 +52,12 @@ def generate(ctx: Context, payload: Request, tel: Telemetry) -> Result:
         ctx.raise_if_cancelled()
     if payload.mode == "fail":
         raise RuntimeError("handler state is now unknown")
+    if payload.mode == "segment":  # H3's long_form, run 11275
+        failure = ChildCallError("memory_exhausted", "GPU 1: the ladder ran out", 0)
+        try:
+            raise failure
+        except ChildCallError as caught:
+            raise OutputError("segment 1 of 2 failed", code="segment_failed") from caught
     if payload.mode == "long":
         progress = "\\n".join(f"Downloading part {n} of 400" for n in range(400))
         raise RuntimeError(f"{progress}\\nthe cause, on the last line")
@@ -122,6 +128,9 @@ def test_handler_refusals_and_cancels_keep_the_generation_ready(
     assert not executor.poisoned and not refused["poisoned"] and not canceled["poisoned"]
     assert _serve(executor, "served", "ok")["outcome"]["terminal"] == "succeeded"
 
+    # A package call's failure raised again from it is the call's: a safe point, no poison.
+    segment = _serve(executor, "segment", "segment")
+    assert segment["outcome"]["code"] == "segment_failed" and not segment["poisoned"]
     failed = _serve(executor, "failed", "fail")
     assert failed["outcome"]["terminal"] == "failed" and failed["poisoned"]
 

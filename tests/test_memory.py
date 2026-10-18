@@ -8,6 +8,7 @@ Torch and the plane are real (CPU); the device's byte counts are the fixture
 from __future__ import annotations
 
 import gc
+import os
 import weakref
 from types import SimpleNamespace
 from typing import Any, cast
@@ -16,7 +17,7 @@ import pytest
 
 from cozy_runtime.author import _split
 from cozy_runtime.author._errors import DEVICE_OOM, MEMORY_EXHAUSTED, classify
-from cozy_runtime.internal import accel, plane
+from cozy_runtime.internal import accel, budget_cell, plane
 from cozy_runtime.internal import memory as memory_module
 from cozy_runtime.internal import weights as weights_module
 from cozy_runtime.internal.executor import CAPACITY_CODES, Executor
@@ -125,6 +126,39 @@ def test_the_one_refusal_carries_the_ledger_the_op_and_each_rung(
     assert MEMORY_EXHAUSTED in CAPACITY_CODES and DEVICE_OOM in CAPACITY_CODES
     assert mirror.ending(failure) == MEMORY_EXHAUSTED
     assert _split._short(failure)
+
+
+def test_a_cap_raised_in_the_cell_counts_while_an_op_waits_for_room(
+    card: tuple[Weights, dict[str, int]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Run 11275: a group follower hears its cap only in its budget cell. The owner raised it
+    into an emptied GPU while one op waited for room, and the op was refused under the old
+    718 MB cap. A room ask now takes the cell's cap at once (a plane budget waits for a block
+    boundary), and a refusal names the cap and the GPU as the op found it."""
+    weights, device = card
+    monkeypatch.setattr(memory_module, "RELEASERS", [])
+    device["free"] = 7 << 30
+    weights.set_cap(700 * MIB)
+    weights.cell, fd = budget_cell.Cell.create()
+    owner = budget_cell.Cell(fd)
+    os.close(fd)
+
+    with pytest.raises(MemoryExhausted) as refused:  # no grant: the cap binds, and says so
+        weights.memory.retry(lambda: weights.memory.exhausted(1 << 30, "aten.mm.default"), "x")
+    assert "under its 734003200 B cap" in refused.value.detail
+    assert cast(int, refused.value.shortfall["available_bytes"]) <= 700 * MIB
+    assert weights.memory.again(1 << 30, "aten.mm.default") == -1
+    with pytest.raises(MemoryExhausted) as again:
+        weights.memory.exhausted(1 << 30, "aten.mm.default")
+    assert "when it ran out: driver 7516192768 B free" in again.value.detail
+
+    asks: list[int] = []
+    weights.room = lambda nbytes: asks.append(owner.ask(budget_cell.CAP - (7 << 30)))
+    assert weights.memory.free_for(1 << 30, "aten.mm.default"), "the raised cap counts at once"
+    assert weights.cap == 7 << 30 and owner.answered(asks[-1]) is not None
+    weights.room = lambda nbytes: asks.append(owner.ask(123 << 20))  # a plane budget: waits
+    weights.memory.ask(MIB)
+    assert weights.cell.pending() == 123 << 20 and weights.cap == 7 << 30
 
 
 def test_the_ledger_names_what_no_class_accounts_for() -> None:
