@@ -38,10 +38,16 @@ class Peak(msgspec.Struct, frozen=True, kw_only=True):
 
 
 class Memory(msgspec.Struct, frozen=True, kw_only=True):
-    """The invoke reply's `memory`: each model's steps, the evictions the request made, the
-    peaks per shape key, and torch bytes package state still held at its end, by GPU."""
+    """The invoke reply's `memory`, which `cozy run show` states as `measurements.memory.stats`
+    and the merge gate reads: torch bytes package state still held at the request's end
+    (`leftover`), weight bytes copied to the device while it ran (`paged_in`, home or through
+    slots), and each model's bytes copied per step (`steps`). Then the detail: every step's
+    row, the evictions it made, the peaks per shape key, and `leftover` by GPU."""
 
-    steps: list[Step] = []
+    leftover: int = 0
+    paged_in: int = 0
+    steps: dict[str, list[int]] = {}
+    rows: list[Step] = []
     evictions: list[Eviction] = []
     peaks: list[Peak] = []
-    leftover: list[tuple[int, int]] = []
+    leftover_by_gpu: list[tuple[int, int]] = []

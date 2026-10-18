@@ -1973,19 +1973,26 @@ class Executor:
 
     @staticmethod
     def _memory(request: RequestStats | None) -> dict[str, Any] | None:
-        """The request's memory as its reply states it: each model's steps, its evictions and
-        what package state still held at its end (B3 adds the peaks per shape key)."""
+        """The request's memory as its reply states it (`ReplyMemory`): the merge gate's
+        leftover, paged-in and per-step bytes, then the detail (B3 adds the peaks per shape
+        key)."""
         if request is None:
             return None
+        steps: dict[str, list[int]] = {}
+        for step in request.steps:
+            steps.setdefault(step.model, []).append(step.paged_in + step.streamed)
         memory = ReplyMemory(
-            steps=[_reply_step(s) for s in request.steps],
+            leftover=sum(n for _, n in request.leftover),
+            paged_in=request.copied,
+            steps=steps,
+            rows=[_reply_step(s) for s in request.steps],
             evictions=[
                 ReplyEviction(
                     model=e.model, gpu=e.gpu, rung=e.rung, reason=e.reason, nbytes=e.nbytes
                 )
                 for e in request.evictions
             ],
-            leftover=list(request.leftover),
+            leftover_by_gpu=list(request.leftover),
         )
         return msgspec.to_builtins(memory)
 
