@@ -1181,6 +1181,27 @@ def test_a_cast_over_half_the_hosts_room_lands_in_host_memory(
     spill.release(torch)
 
 
+@on_card
+def test_a_release_that_fails_leaves_no_lease_to_be_collected(card: Any) -> None:
+    """Run 10996: a release that raised (the card had 24 MB free) left the leases after it to
+    be collected unreleased, and that poisons the plane. The rest are released first."""
+    weights = card.weights
+    model = load(weights, card.checkpoint, "released")
+    x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
+    reference = run(model, x, passes=1)
+    component, stream = model.residency.components["stack"], weights.stream()
+    leases = [
+        weights.plane.acquire(component.ws, weights.index, region.index, stream)
+        for region in component.blocks[:2]
+    ]
+    leases[0].release()  # a second release raises, as a failing one does
+    with pytest.raises(plane.error("PlaneError")):
+        weights_module.release_all(leases)
+    del leases
+    gc.collect()
+    assert same(reference, run(model, x, passes=1))
+
+
 def test_decoded_copies_count_in_a_stages_budget(tmp_path: Path) -> None:
     """A weight the card cannot run as stored (fp8 before sm89) is decoded into a float copy
     when its region binds. That copy is torch's memory beside the plane's stored bytes, so a

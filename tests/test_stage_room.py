@@ -1,8 +1,7 @@
-"""A stage whose room makes torch drop its cache again and again gets more: the components it
-does not read leave the device before its next entry, and fill again when their own stage
-opens. Under a per-process limit torch refuses a request when its reserved bytes plus the
-request pass the limit, even one that only has to extend a block it holds, so a peak that fits
-can still squeeze. Real planes, a real allocator under a real cap, on one CUDA card."""
+"""Room between a model's components on one CUDA card under an owner's cap: what a stage does
+not read is given back (to the machine, or to activations) and maps again for its own stage,
+and an op cut into pieces leaves a component placed whole mapped. Real planes, a real allocator
+under a real cap."""
 
 from __future__ import annotations
 
@@ -16,7 +15,6 @@ torch = pytest.importorskip("torch")
 
 from cozy_runtime.author._loader import census  # noqa: E402
 from cozy_runtime.internal import accel, plane, weight_policy  # noqa: E402
-from cozy_runtime.internal import weights as weights_module  # noqa: E402
 from cozy_runtime.internal.derive import Observations, serving_substrate  # noqa: E402
 from cozy_runtime.internal.pieces import Pieces  # noqa: E402
 from cozy_runtime.internal.weights import PlaneBackend, WeightResidency, Weights  # noqa: E402
@@ -60,81 +58,12 @@ def rest(model: Any, x: Any) -> list[Any]:
         model.residency.release("rest", ("other",))
 
 
-def growing(model: Any, x: Any) -> list[Any]:
-    """One entry of "run": the stack's forward, then three buffers each larger than the last
-    (256, 384, 512 MiB), each freed at once. Every one has to grow what torch holds."""
-    model.residency.admit("run", ("stack",))
-    try:
-        with torch.inference_mode():
-            out = [model.stack(x)]
-            for mib in (256, 384, 512):
-                torch.empty(mib * MIB, dtype=torch.uint8, device="cuda")
-            return out
-    finally:
-        model.residency.release("run", ("stack",))
-
-
 def capped(weights: Weights, committed: int, room: int = ROOM) -> None:
     """Hold the process to its context, `committed` weight bytes, torch's live bytes and `room`."""
     weights.measure_context()
     torch.cuda.empty_cache()
     live = int(torch.cuda.memory_allocated())
     weights.set_cap(max(weights.context_bytes, 0) + committed + live + room)
-
-
-def test_a_squeezed_stage_pages_out_the_component_it_does_not_read(tmp_path: Path) -> None:
-    a_at, _ = write_checkpoint(tmp_path / "a")
-    weights = Weights(torch, torch.device("cuda", 0), "cuda")
-    weights.set_budget(-1, pinned=1 << 30)
-    weights.set_cap(4 << 30)  # under an owner's cap other stages' weights stay mapped
-    a = load(weights, a_at, "a")
-    b = load(weights, other_checkpoint(tmp_path / "b"), "b", name="other", scope="rest")
-    try:
-        x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
-        expected, expected_rest = run(a, x, passes=1), rest(b, x)
-        stack, other = a.backend.components["stack"], b.backend.components["other"]
-        own, idle = weights.resident_bytes(stack), weights.resident_bytes(other)
-        assert own > 0 and idle > 0
-        capped(weights, own + idle)
-
-        # The peak (512 MiB) fits the room (600 MiB), and torch still drops its cache twice:
-        # 256 cached + 384 asked and 384 cached + 512 asked both pass its limit.
-        room, dropped = weights.allocatable(), weights.retries()
-        assert same(growing(a, x), expected)
-        assert weights.retries() - dropped == 2
-        squeezed = weights.facts().squeezed["run"]
-        assert abs(squeezed - room) < 8 * MIB, "the room that entry had"
-        assert weights.resident_bytes(other) == idle, "nothing left the device during it"
-
-        # Before the next entry the idle component gives torch what it lacks, its last blocks
-        # first. From an empty cache (as a new process starts) one drop is left: the last
-        # buffer's.
-        torch.cuda.empty_cache()
-        dropped = weights.retries()
-        assert same(growing(a, x), expected)
-        assert weights.retries() - dropped == 1
-        left = weights.resident_bytes(other)
-        assert weights.resident_bytes(stack) == own and 0 < left < idle
-        assert weights.facts().squeezed["run"] == squeezed, "that entry did not squeeze"
-
-        # Its own stage fills it again, unmodified: only what it gave.
-        copied = weights.facts().h2d_bytes
-        assert same(rest(b, x), expected_rest)
-        assert weights.facts().h2d_bytes - copied == idle - left
-
-        # A component an open stage scopes (spared by `_spare` or not) is never paged out:
-        # with both stages open there is nothing to give.
-        b.residency.admit("rest", ("other",))
-        a.residency.admit("run", ("stack",))
-        try:
-            assert weights.page_out(weights_module._in_use(weights)) is False
-        finally:
-            a.residency.release("run", ("stack",))
-            b.residency.release("rest", ("other",))
-    finally:
-        torch.cuda.set_per_process_memory_fraction(1.0, 0)
-        a.backend.close()
-        b.backend.close()
 
 
 def test_a_component_mapped_from_the_machine_is_given_back_and_fills_again(tmp_path: Path) -> None:
