@@ -132,10 +132,10 @@
    },
    "geometry_class": "rank2.block32",
    "implementation": "cozy.fp8-rowwise.dequant/1",
-   "implementation_digest": "sha256:d61890abde414d7b3348245c173127403e6c8d174210313483884b8ae6c50220",
+   "implementation_digest": "sha256:4c251ff4e77785e25e8fa8ef4ddbb8f6f07c7ae9f689abb50293b71c28ed5e86",
    "implementation_revision": "2",
    "output_dtype": "bfloat16",
-   "scheme": "fp8-rowwise"
+   "scheme": "fp8.rowwise"
   },
   {
    "delivery_route": "decoded_float",
@@ -201,10 +201,10 @@
    },
    "geometry_class": "rank2.block32",
    "implementation": "cozy.fp8-rowwise.dequant/1",
-   "implementation_digest": "sha256:d61890abde414d7b3348245c173127403e6c8d174210313483884b8ae6c50220",
+   "implementation_digest": "sha256:4c251ff4e77785e25e8fa8ef4ddbb8f6f07c7ae9f689abb50293b71c28ed5e86",
    "implementation_revision": "2",
    "output_dtype": "float16",
-   "scheme": "fp8-rowwise"
+   "scheme": "fp8.rowwise"
   },
   {
    "delivery_route": "decoded_float",
@@ -270,10 +270,10 @@
    },
    "geometry_class": "rank2.block32",
    "implementation": "cozy.fp8-rowwise.dequant/1",
-   "implementation_digest": "sha256:d61890abde414d7b3348245c173127403e6c8d174210313483884b8ae6c50220",
+   "implementation_digest": "sha256:4c251ff4e77785e25e8fa8ef4ddbb8f6f07c7ae9f689abb50293b71c28ed5e86",
    "implementation_revision": "2",
    "output_dtype": "float32",
-   "scheme": "fp8-rowwise"
+   "scheme": "fp8.rowwise"
   },
   {
    "delivery_route": "encoded_gemm",
@@ -289,10 +289,10 @@
    },
    "geometry_class": "rank2.block32",
    "implementation": "cozy.fp8-rowwise.native-leaf/1",
-   "implementation_digest": "sha256:5406670cdf997ab0e09a8f2c7756a1006147cb52edbd5071c03f447f20fc2956",
+   "implementation_digest": "sha256:5c614d74947f8948f4aa0dab3148c999e22d5b453d3b00183e466e33c9ef7862",
    "implementation_revision": "1",
    "output_dtype": "bfloat16",
-   "scheme": "fp8-rowwise"
+   "scheme": "fp8.rowwise"
   },
   {
    "delivery_route": "encoded_gemm",
@@ -308,10 +308,10 @@
    },
    "geometry_class": "rank2.block32",
    "implementation": "cozy.fp8-rowwise.native-leaf/1",
-   "implementation_digest": "sha256:5406670cdf997ab0e09a8f2c7756a1006147cb52edbd5071c03f447f20fc2956",
+   "implementation_digest": "sha256:5c614d74947f8948f4aa0dab3148c999e22d5b453d3b00183e466e33c9ef7862",
    "implementation_revision": "1",
    "output_dtype": "float16",
-   "scheme": "fp8-rowwise"
+   "scheme": "fp8.rowwise"
   },
   {
    "delivery_route": "encoded_gemm",
@@ -327,10 +327,10 @@
    },
    "geometry_class": "rank2.block32",
    "implementation": "cozy.fp8-rowwise.native-leaf/1",
-   "implementation_digest": "sha256:5406670cdf997ab0e09a8f2c7756a1006147cb52edbd5071c03f447f20fc2956",
+   "implementation_digest": "sha256:5c614d74947f8948f4aa0dab3148c999e22d5b453d3b00183e466e33c9ef7862",
    "implementation_revision": "1",
    "output_dtype": "float32",
-   "scheme": "fp8-rowwise"
+   "scheme": "fp8.rowwise"
   },
   {
    "delivery_route": "decoded_float",
@@ -386,10 +386,10 @@
    },
    "geometry_class": "rank2.block32",
    "implementation": "cozy.fp8-tensorwise.dequant/1",
-   "implementation_digest": "sha256:35009464aa992865908ecb835c3473b9728eee16bb8d2fcb0bdaa0426691f5b0",
+   "implementation_digest": "sha256:215339859a2606ca35a9e08cf9507f87cf1a62bcf94cef400170bc84c1c4cda5",
    "implementation_revision": "1",
    "output_dtype": "bfloat16",
-   "scheme": "fp8-tensorwise"
+   "scheme": "fp8.tensorwise"
   },
   {
    "delivery_route": "decoded_float",
@@ -445,10 +445,10 @@
    },
    "geometry_class": "rank2.block32",
    "implementation": "cozy.fp8-tensorwise.dequant/1",
-   "implementation_digest": "sha256:35009464aa992865908ecb835c3473b9728eee16bb8d2fcb0bdaa0426691f5b0",
+   "implementation_digest": "sha256:215339859a2606ca35a9e08cf9507f87cf1a62bcf94cef400170bc84c1c4cda5",
    "implementation_revision": "1",
    "output_dtype": "float16",
-   "scheme": "fp8-tensorwise"
+   "scheme": "fp8.tensorwise"
   },
   {
    "delivery_route": "decoded_float",
@@ -504,10 +504,10 @@
    },
    "geometry_class": "rank2.block32",
    "implementation": "cozy.fp8-tensorwise.dequant/1",
-   "implementation_digest": "sha256:35009464aa992865908ecb835c3473b9728eee16bb8d2fcb0bdaa0426691f5b0",
+   "implementation_digest": "sha256:215339859a2606ca35a9e08cf9507f87cf1a62bcf94cef400170bc84c1c4cda5",
    "implementation_revision": "1",
    "output_dtype": "float32",
-   "scheme": "fp8-tensorwise"
+   "scheme": "fp8.tensorwise"
   },
   {
    "delivery_route": "decoded_float",
@@ -563,10 +563,10 @@
    },
    "geometry_class": "rank2.block32",
    "implementation": "cozy.int8-convrot.dequant/1",
-   "implementation_digest": "sha256:e2f6035ffb9453a3a2eb15bb62eb0d4b57c3d285aab1523e490f05f031ab2158",
+   "implementation_digest": "sha256:94f43ffe46ffa853173695388bd604f1fcdb6da12ab56a75385b77a0512db9c2",
    "implementation_revision": "1",
    "output_dtype": "bfloat16",
-   "scheme": "int8-convrot"
+   "scheme": "int8.convrot"
   },
   {
    "delivery_route": "decoded_float",
@@ -622,10 +622,10 @@
    },
    "geometry_class": "rank2.block32",
    "implementation": "cozy.int8-convrot.dequant/1",
-   "implementation_digest": "sha256:e2f6035ffb9453a3a2eb15bb62eb0d4b57c3d285aab1523e490f05f031ab2158",
+   "implementation_digest": "sha256:94f43ffe46ffa853173695388bd604f1fcdb6da12ab56a75385b77a0512db9c2",
    "implementation_revision": "1",
    "output_dtype": "float16",
-   "scheme": "int8-convrot"
+   "scheme": "int8.convrot"
   },
   {
    "delivery_route": "decoded_float",
@@ -681,10 +681,10 @@
    },
    "geometry_class": "rank2.block32",
    "implementation": "cozy.int8-convrot.dequant/1",
-   "implementation_digest": "sha256:e2f6035ffb9453a3a2eb15bb62eb0d4b57c3d285aab1523e490f05f031ab2158",
+   "implementation_digest": "sha256:94f43ffe46ffa853173695388bd604f1fcdb6da12ab56a75385b77a0512db9c2",
    "implementation_revision": "1",
    "output_dtype": "float32",
-   "scheme": "int8-convrot"
+   "scheme": "int8.convrot"
   },
   {
    "delivery_route": "encoded_gemm",
@@ -724,10 +724,10 @@
    },
    "geometry_class": "rank2.block32",
    "implementation": "cozy.int8-convrot256.native-leaf/1",
-   "implementation_digest": "sha256:82761f6134e733db9c763221a4b7d447626090725bcffececfb714b0eff5e3ea",
+   "implementation_digest": "sha256:067e444f7d361cdbd8073d116cf845b5e7091528e0ac27ecabd496d5d917f252",
    "implementation_revision": "1",
    "output_dtype": "bfloat16",
-   "scheme": "int8-convrot"
+   "scheme": "int8.convrot"
   },
   {
    "delivery_route": "encoded_gemm",
@@ -767,10 +767,10 @@
    },
    "geometry_class": "rank2.block32",
    "implementation": "cozy.int8-convrot256.native-leaf/1",
-   "implementation_digest": "sha256:82761f6134e733db9c763221a4b7d447626090725bcffececfb714b0eff5e3ea",
+   "implementation_digest": "sha256:067e444f7d361cdbd8073d116cf845b5e7091528e0ac27ecabd496d5d917f252",
    "implementation_revision": "1",
    "output_dtype": "float16",
-   "scheme": "int8-convrot"
+   "scheme": "int8.convrot"
   },
   {
    "delivery_route": "encoded_gemm",
@@ -810,10 +810,10 @@
    },
    "geometry_class": "rank2.block32",
    "implementation": "cozy.int8-convrot256.native-leaf/1",
-   "implementation_digest": "sha256:82761f6134e733db9c763221a4b7d447626090725bcffececfb714b0eff5e3ea",
+   "implementation_digest": "sha256:067e444f7d361cdbd8073d116cf845b5e7091528e0ac27ecabd496d5d917f252",
    "implementation_revision": "1",
    "output_dtype": "float32",
-   "scheme": "int8-convrot"
+   "scheme": "int8.convrot"
   }
  ],
  "runtime": {

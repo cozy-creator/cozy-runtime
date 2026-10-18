@@ -141,10 +141,10 @@ def _dtype(key: str, name: str) -> str:
 
 def _part(key: str, role: str, part: tensorfs.Part) -> RolePart:
     shape = tuple(part.shape)
-    if part.dtype == "F4":  # packed two per byte, element 2k low: a decoder reads u8 [R, C/2]
-        if len(shape) != 2 or shape[1] % 2:
+    if part.dtype == "F4":  # packed two per byte: a decoder reads u8 [..., C/2]
+        if len(shape) < 2 or shape[-1] % 2:
             raise _refuse("carrier_geometry", f"{key}: F4 part {role} is {list(shape)}", [key])
-        return RolePart(role, "u8", (shape[0], shape[1] // 2), part.length)
+        return RolePart(role, "u8", (*shape[:-1], shape[-1] // 2), part.length)
     return RolePart(role, _dtype(key, part.dtype), shape, part.length)
 
 

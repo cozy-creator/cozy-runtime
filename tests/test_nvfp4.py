@@ -16,7 +16,14 @@ from cozy_runtime.internal.encoding import params_of
 from tensord_peer import context, lane, output
 
 ENCODING = "nvfp4"
-PARAMS = params_of({"block": 16})
+PARAMS = params_of(
+    {
+        "block_size": 16,
+        "global_scale": "multiply",
+        "nibble_order": "low_first",
+        "scale_layout": "row_major",
+    }
+)
 
 
 def weight(rows: int, cols: int, seed: int) -> np.ndarray:
@@ -62,15 +69,20 @@ def test_one_lane_carries_nvfp4_beside_int8(tmp_path: Path) -> None:
     )
     quantize_into(
         context(peer), fake_telemetry(fake_attempt("nvfp4")), source=Weights(source),
-        plan=plan, encoding="int8-convrot", output="model",
+        plan=plan, encoding="int8.convrot", output="model",
     )  # fmt: skip
     out = output(store, peer)
     q_proj = out.tensors["text_encoder"]["layers.0.q_proj.weight"]
-    assert q_proj.encoding is not None and q_proj.encoding.scheme == "int8-convrot"
+    assert q_proj.encoding is not None and q_proj.encoding.scheme == "int8.convrot"
     ff = out.tensors["transformer"]["blocks.0.ff.weight"]
     assert ff.encoding is not None and (ff.encoding.scheme, ff.encoding.params) == (
         ENCODING,
-        {"block": 16},
+        {
+            "block_size": 16,
+            "global_scale": "multiply",
+            "nibble_order": "low_first",
+            "scale_layout": "row_major",
+        },
     )
     parts = {role: (p.dtype, p.shape) for role, p in ff.parts.items()}
     assert parts == {
@@ -106,7 +118,8 @@ def test_decode_is_the_spec_law_and_the_mined_vectors() -> None:
 
     provider = Nvfp4Dequant(params=PARAMS)
     vectors = probe._spec_vectors(torch, provider, torch.device("cpu"))
-    assert vectors.passed and not vectors.skipped and len(vectors.cases) == 2
+    nvfp4 = [c for c in probe.vector_cases() if c.encoding.scheme == "nvfp4" and not c.refuse]
+    assert vectors.passed and not vectors.skipped and len(vectors.cases) == len(nvfp4) >= 7
     for dtype in (torch.float32, torch.bfloat16, torch.float16):
         assert probe._numerics_nvfp4(torch, provider, torch.device("cpu"), dtype).passed
 

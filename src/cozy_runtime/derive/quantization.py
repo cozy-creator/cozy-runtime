@@ -65,16 +65,16 @@ def _rowwise(
 
 
 _ENCODINGS: dict[str, _Encoding] = {
-    "fp8-rowwise": _Encoding(
+    "fp8.rowwise": _Encoding(
         2.0**-3, _rowwise(encode_fp8_rowwise), "F8_E4M3", 32, {"axis": 0}, _row_scale
     ),
     # The bound is a tripwire for a broken encoder, not a quality gate.
-    "int8-convrot": _Encoding(
+    "int8.convrot": _Encoding(
         2.0**-4,
         _rowwise(encode_int8_convrot256),
         "I8",
         CONVROT_GROUP,
-        {"block": CONVROT_GROUP, "rotation": "hadamard"},
+        {"rotation": "hadamard", "rotation_size": CONVROT_GROUP},
         _row_scale,
     ),
     # A block's error is at most half its largest E2M1 step (2 of 6) times its scale, and a
@@ -84,7 +84,12 @@ _ENCODINGS: dict[str, _Encoding] = {
         encode_nvfp4,
         "F4",
         NVFP4_BLOCK,
-        {"block": NVFP4_BLOCK},
+        {
+            "block_size": NVFP4_BLOCK,
+            "global_scale": "multiply",
+            "nibble_order": "low_first",
+            "scale_layout": "row_major",
+        },
         lambda rows, cols: (
             ("scale", "F8_E4M3", (rows, cols // NVFP4_BLOCK)),
             ("scale_2", "F32", ()),
@@ -209,7 +214,7 @@ def prepare_bf16(
 
 
 def column_block(encoding: str | None) -> int:
-    """The column multiple a scheme's tensors need; 32 is fp8-rowwise's."""
+    """The column multiple a scheme's tensors need; 32 is fp8.rowwise's."""
     found = _ENCODINGS.get(encoding or "")
     return found.block if found is not None else 32
 

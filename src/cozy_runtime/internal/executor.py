@@ -4457,7 +4457,7 @@ class Executor:
 
     def _checkpoint(self, manifest: str) -> Checkpoint:
         """A selected checkpoint's header through TensorD (`ModelSource`). Only the header is
-        known: cozytensors/2 lists a checkpoint's files in its manifest, which `ModelSource`
+        known: cozytensors/1 lists a checkpoint's files in its manifest, which `ModelSource`
         does not serve."""
         return Checkpoint.granted(
             manifest,

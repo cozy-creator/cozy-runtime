@@ -1,4 +1,4 @@
-"""A cozytensors/2 checkpoint read through the wheel: rows in construction order with their
+"""A cozytensors/1 checkpoint read through the wheel: rows in construction order with their
 scheme and parts, the census fit, configs from files, and the chunks a fetch plan names."""
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ def _store(root: Path) -> tuple[tensorfs.Store, Checkpoint]:
         "proj.weight",
         "BF16",
         [4, 32],
-        "fp8-rowwise",
+        "fp8.rowwise",
         {
             "weight": ("F8_E4M3", [4, 32], np.full((4, 32), 0x38, np.uint8)),
             "scale": ("F32", [4], np.ones(4, np.float32)),
@@ -51,7 +51,7 @@ def test_rows_carry_order_scheme_params_and_parts(tmp_path: Path) -> None:
     rows = ck.rows("unet")
     assert [r.name for r in rows] == list(ck.ck.tensors["unet"])
     encoded = next(r for r in rows if r.name == "proj.weight")
-    assert (encoded.encoded.scheme, dict(encoded.encoded.params)) == ("fp8-rowwise", {"axis": 0})
+    assert (encoded.encoded.scheme, dict(encoded.encoded.params)) == ("fp8.rowwise", {"axis": 0})
     assert {p.role: (p.dtype, p.shape) for p in encoded.encoded.parts} == {
         "weight": ("f8_e4m3fn", (4, 32)),
         "scale": ("f32", (4,)),
@@ -97,7 +97,7 @@ def test_configs_come_from_files_and_the_fit_judges_the_census(tmp_path: Path) -
     assert (refused["code"], refused["key"], refused["encoding"]) == (
         "encoding_unsupported",
         "proj.weight",
-        "fp8-rowwise",
+        "fp8.rowwise",
     )
     assert (
         fit([TensorRequirement("unet", "conv_in.weight", (4, 8))], ck, encoded_leaves=True)["code"]

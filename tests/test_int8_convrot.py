@@ -15,7 +15,7 @@ from cozy_runtime.derive.operations import QuantizationPlan, quantize_into
 from cozy_runtime.internal.encoding import params_of
 from tensord_peer import context, lane, output
 
-ENCODING = "int8-convrot"
+ENCODING = "int8.convrot"
 
 
 def weight(rows: int, cols: int, seed: int) -> np.ndarray:
@@ -91,7 +91,7 @@ def test_decode_is_the_spec_law_and_the_mined_vectors() -> None:
     from cozy_runtime.internal import probe
     from cozy_runtime.internal.encoding import Int8ConvRotDequant
 
-    provider = Int8ConvRotDequant(params=params_of({"block": 256, "rotation": "hadamard"}))
+    provider = Int8ConvRotDequant(params=params_of({"rotation": "hadamard", "rotation_size": 256}))
     vectors = probe._spec_vectors(torch, provider, torch.device("cpu"))
     assert vectors.passed and len(vectors.cases) == 3
     for dtype in (torch.float32, torch.bfloat16, torch.float16):

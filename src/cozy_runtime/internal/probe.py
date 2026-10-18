@@ -8,7 +8,7 @@ Four things happen per (encoding, IMPLEMENTATION, output dtype), in this order, 
 failure at any one leaves NO record — which is what "fail-closed" means when the table is
 minted rather than declared. The middle term is new: since #517e an encoding carries
 ORDERED CANDIDATES rather than one provider, and each candidate is qualified separately,
-because "fp8-rowwise works here" is not a fact — "this implementation of it works here" is.
+because "fp8.rowwise works here" is not a fact — "this implementation of it works here" is.
 
 1. **numerics self-check** against an INDEPENDENT reference. The e4m3 decoder below is
    written from the OCP number format by integer arithmetic, not by asking torch to cast —
@@ -308,7 +308,7 @@ def _grade_scaled(eps: float, got: Sequence[float], scale_value: float) -> Sweep
 def _numerics_rowwise(torch: Any, provider: Provider, device: Any, dtype: Any) -> Sweep:
     """Decode all 256 e4m3 patterns against 256 DIFFERENT row scales — 65,536 pairs.
 
-    `fp8-rowwise`'s scale is a CONTINUOUS f32 per output row, not a format with 256 code
+    `fp8.rowwise`'s scale is a CONTINUOUS f32 per output row, not a format with 256 code
     points, so there is no finite cross-product of element and scale codes to exhaust. The
     honest substitute is the one that would catch the failure this route actually has: a
     row scale is applied per ROW, so the domain that matters is (every element pattern) x
@@ -410,6 +410,19 @@ def _numerics_int8_rowwise(
         torch, {"weight": data.to(device), "scale": scale.float().to(device)}, destination
     )
     return _exact_sweep(torch, destination.cpu(), truth, dtype)
+
+
+def _numerics_int8_tensorwise(
+    torch: ModuleType, provider: Provider, device: Tensor, dtype: Tensor
+) -> Sweep:
+    """Every int8 value under one f32 scale that each dtype rounds differently: the decode is
+    `round_L(weight × s)` with `s` the scale rounded to the dtype, exact in f64 before the cast."""
+    data = (torch.arange(256) - 128).to(torch.int8).reshape(16, 16)
+    scale = torch.tensor(0.0123, dtype=torch.float32)
+    rounded = scale.to(dtype).double()
+    destination = torch.empty(16, 16, dtype=dtype, device=device)
+    provider.decode(torch, {"weight": data.to(device), "scale": scale.to(device)}, destination)
+    return _exact_sweep(torch, destination.cpu(), data.double() * rounded, dtype)
 
 
 def _numerics_mxfp8(torch: ModuleType, provider: Provider, device: Tensor, dtype: Tensor) -> Sweep:
@@ -676,6 +689,10 @@ def _weight_roles(torch: Any, provider: Provider, device: Any) -> tuple[Any, dic
             "weight": payload.reshape(rows, cols).clamp(-448.0, 448.0).to(torch.float8_e4m3fn),
             "scale": byte.view(torch.float8_e8m0fnu),
         }
+    if provider.suite == "int8-tensorwise-decode":
+        scale = (weight.abs().max() / 127.0).clamp(min=1e-12).to(torch.float32)
+        payload = torch.round(weight / scale).clamp(-127, 127).to(torch.int8)
+        return weight, {"weight": payload, "scale": scale.reshape(())}
     if provider.suite == "fp8-tensorwise-decode":
         amax = weight.abs().max().clamp(min=1e-12)
         scale = (amax / 448.0).to(torch.float32)
@@ -785,13 +802,9 @@ def _native_axes(torch: Any, provider: LeafProvider, device: Any, deviation: flo
 
 # ------------------------------------------------------------- the conformance vectors
 
-#: The conformance decode cases: tensorfs `conformance/vectors/cases.json`, and `restored.json`,
-#: U2's own mxfp8 and int8-rowwise cases from before #1478 dropped them (until U2e restores
-#: them upstream). They ship in the package, so an installed wheel qualifies as the repo does.
-VECTORS = tuple(
-    Path(__file__).resolve().parent / "encoding" / "vectors" / name
-    for name in ("cases.json", "restored.json")
-)
+#: The cozytensors/1 conformance decode cases (tensorfs `conformance/vectors/cases.json`). They
+#: ship in the package, so an installed wheel qualifies as the repo does.
+VECTORS = Path(__file__).resolve().parent / "encoding" / "vectors" / "cases.json"
 
 
 class VectorPart(msgspec.Struct, frozen=True):
@@ -820,14 +833,8 @@ class VectorCase(msgspec.Struct, frozen=True):
 
 def vector_cases() -> list[VectorCase]:
     """The conformance cases with a scheme (the plain ones are TensorFS's read cases)."""
-    rows = [
-        row
-        for path in VECTORS
-        for row in msgspec.json.decode(path.read_bytes(), type=dict[str, list[dict[str, object]]])[
-            "cases"
-        ]
-    ]
-    return [msgspec.convert(row, VectorCase) for row in rows if "encoding" in row]
+    rows = msgspec.json.decode(VECTORS.read_bytes(), type=dict[str, list[dict[str, object]]])
+    return [msgspec.convert(row, VectorCase) for row in rows["cases"] if "encoding" in row]
 
 
 def vector_tensor(torch: ModuleType, part: VectorPart, device: Tensor) -> Tensor:
@@ -835,7 +842,7 @@ def vector_tensor(torch: ModuleType, part: VectorPart, device: Tensor) -> Tensor
     is its packed bytes, u8 `[R, C/2]`, as the fill plane hands it to a decoder."""
     flat = torch.frombuffer(bytearray(base64.b64decode(part.bits)), dtype=torch.uint8)
     if part.dtype == "F4":
-        return flat.reshape(part.shape[0], part.shape[1] // 2).to(device)
+        return flat.reshape(*part.shape[:-1], part.shape[-1] // 2).to(device)
     name = TORCH_DTYPES[TENSORFS_DTYPES[part.dtype]]
     return flat.view(getattr(torch, name)).reshape(part.shape).to(device)
 
@@ -972,6 +979,7 @@ DECODE_SUITES: dict[str, Callable[[Any, Provider, Any, Any], Sweep]] = {
     "int8-convrot-decode": _numerics_int8_convrot,
     "nvfp4-decode": _numerics_nvfp4,
     "int8-rowwise-decode": _numerics_int8_rowwise,
+    "int8-tensorwise-decode": _numerics_int8_tensorwise,
     "mxfp8-decode": _numerics_mxfp8,
 }
 
@@ -1036,9 +1044,27 @@ def qualify(
     return admission_table(result), result
 
 
+#: The params a suite's synthetic operands are written with: the producers' own (ModelOpt's
+#: layouts). The spec's conformance cases cover the other layouts.
+PROBE_PARAMS: dict[str, dict[str, object]] = {
+    "fp8.rowwise": {"axis": 0},
+    "int8.rowwise": {"axis": 0},
+    "int8.convrot": {"rotation": "hadamard", "rotation_size": 256},
+    "mxfp8": {"block_size": MX_BLOCK, "scale_layout": "row_major"},
+    "nvfp4": {
+        "block_size": NVFP4_BLOCK,
+        "global_scale": "multiply",
+        "nibble_order": "low_first",
+        "scale_layout": "row_major",
+    },
+}
+
+
 def _measured(torch: ModuleType, provider: Provider, target: Tensor, dtype: Tensor) -> Evidence:
     """`_evidence`, where a device that lacks a dtype the decode reads (MPS has no float8)
     mints no record for it: the encoding refuses at bind naming why."""
+    params = params_of(PROBE_PARAMS.get(provider.encoding, {}))
+    provider = replace(provider, params=params)  # type: ignore[type-var]
     try:
         return _evidence(torch, provider, target, dtype)
     except (TypeError, RuntimeError, NotImplementedError) as exc:

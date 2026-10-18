@@ -126,7 +126,7 @@ class ResidencyRefusal(RuntimeFailure):
 
 
 def _REGISTER_PENDING() -> ResidencyRefusal:  # noqa: N802
-    """Weight sets register on cozytensors/2 checkpoints through `varena.register` (U8)."""
+    """Weight sets register on cozytensors/1 checkpoints through `varena.register` (U8)."""
     return ResidencyRefusal(
         "weights_register_pending", "v2 registration lands in cr-203 U11b on varena.register"
     )
