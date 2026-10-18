@@ -351,6 +351,7 @@ def _record(
     except Building as building:  # as written until a kernel lands: `forget` tries again
         graph, why, recorder.pool = None, "", None  # the aborted capture spent its pool
         _chose(recorder, key, "kernel building", f"{building} builds; it records once one lands")
+    native(torch, outputs)  # in the graph's pool: its replays write them
     if graph is not None and not _clonable(torch, outputs[0]):
         graph, why = None, f"its output {type(outputs[0]).__name__} is not a tree of tensors"
     if graph is not None:

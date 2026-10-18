@@ -17,10 +17,10 @@ stage closes.
 from __future__ import annotations
 
 import gc
+import mmap
 import os
 import tempfile
 import time
-from bisect import bisect_right
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
@@ -46,8 +46,6 @@ GRAIN = 2 << 20
 #: cudaMalloc's alignment, which CUDA libraries take for granted (cuBLASLt answers INVALID_VALUE
 #: for a workspace off it: run 9141); torch's host allocator gives 64.
 ALIGN = 256
-#: A move to or from disk crosses host memory in pieces of this size.
-CHUNK = 64 << 20
 #: since the process began: [moves, their bytes, nanoseconds they took, bytes mapped, bytes
 #: out to host memory, bytes out to disk, bytes back on the device (`restore`, `fault`)]
 TOTALS = [0, 0, 0, 0, 0, 0, 0]
@@ -75,6 +73,10 @@ class Off:
     host: Tensor | None = None
     file: BufferedRandom | None = None
 
+    @property
+    def out(self) -> bool:
+        return self.host is not None or self.file is not None
+
 
 #: every storage off its device, by `_cdata`
 OFF: dict[int, Off] = {}
@@ -89,20 +91,6 @@ def _size(nbytes: int) -> int:
 def reusable(nbytes: int) -> bool:
     """Whether a free block can take `nbytes` without locking more."""
     return bool(_FREE.get(_size(nbytes)))
-
-
-def _locked(torch: ModuleType, size: int) -> Tensor:
-    """A page-locked block of `size` bytes (and the alignment's slack): a free one, else new."""
-    free = _FREE.get(size)
-    if free:
-        return free.pop()
-    data = torch.empty(size + ALIGN, dtype=torch.uint8)
-    status = torch.cuda.cudart().cudaHostRegister(data.data_ptr(), size + ALIGN, _MAPPED)
-    if status != torch.cuda.cudart().cudaError.success:
-        with suppress(RuntimeError):  # CUDA's last error until a launch's check reads it
-            torch.empty(1, device="cuda").zero_()
-        torch.cuda.check_error(status)
-    return data
 
 
 class _Host:
@@ -127,8 +115,17 @@ class _Host:
 
 
 def _host(torch: ModuleType, nbytes: int) -> _Host:
+    """A page-locked block for `nbytes`: a free one of its size, else newly locked."""
     size = _size(nbytes)
-    return _Host(_locked(torch, size), size, nbytes)
+    if free := _FREE.get(size):
+        return _Host(free.pop(), size, nbytes)
+    data = torch.empty(size + ALIGN, dtype=torch.uint8)
+    status = torch.cuda.cudart().cudaHostRegister(data.data_ptr(), size + ALIGN, _MAPPED)
+    if status != torch.cuda.cudart().cudaError.success:
+        with suppress(RuntimeError):  # CUDA's last error until a launch's check reads it
+            torch.empty(1, device="cuda").zero_()
+        torch.cuda.check_error(status)
+    return _Host(data, size, nbytes)
 
 
 def release(torch: ModuleType) -> None:
@@ -235,11 +232,9 @@ def spill(
     mapped: bool = True,
     disk: bool = False,
 ) -> int:
-    """Move this process's storages on `device` off it until `need` device bytes came back,
-    least recently used first and `operands` last, taking at most `room` bytes of host memory
-    (-1: unknown, as much as `need`): mapped while the host locks it (`mapped`), else out to
-    host memory, and, with `disk`, out to disk once the host can give no more. Returns the
-    bytes moved."""
+    """This process's storages off `device` until `need` bytes came back, taking at most `room`
+    of host memory (-1: unknown): mapped while it locks (`mapped`), else out to it, and with
+    `disk` to disk past it. Returns the bytes moved."""
     if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
         return 0  # a capture can neither wait for the device nor copy from pageable memory
     PRESSED[0] = True
@@ -285,7 +280,7 @@ def fault(
     for tensor in stored(operands):
         storage = tensor.untyped_storage()
         off = OFF.get(storage._cdata)
-        if off is None or (off.host is None and off.file is None):
+        if off is None or not off.out:
             continue
         back = partial(_in, torch, storage, off)
         if retry is None:
@@ -295,10 +290,9 @@ def fault(
 
 
 def restore(torch: ModuleType, device: Device, room: int) -> int:
-    """The storages off `device` come back while `room` bytes allow, largest first: a mapped
-    one is copied back and repointed in place (its host block free again), an out one brought
-    in. A tensor left mapped is read over the bus for as long as it lives, and a cache or a
-    decoder's state lives across calls. Returns the bytes restored."""
+    """The storages off `device` come back while `room` bytes allow, largest first: a cache or a
+    decoder's state left mapped is read over the bus for as long as it lives. Returns the bytes
+    restored."""
     _sweep()
     back = 0
     for off in sorted(OFF.values(), key=lambda off: -off.nbytes):
@@ -308,15 +302,7 @@ def restore(torch: ModuleType, device: Device, room: int) -> int:
         if back == 0:
             _fence(torch, device)
         try:
-            if off.host is None and off.file is None:
-                fresh = torch.empty(off.nbytes, dtype=torch.uint8, device=device)
-                fresh.copy_(_flat(torch, storage))
-                # `fresh` takes the host pointer and frees its block when it goes
-                storage._swap_data_ptr_(fresh.untyped_storage())
-                del OFF[storage._cdata]
-                TOTALS[6] += off.nbytes
-            else:
-                _in(torch, storage, off)
+            _in(torch, storage, off)
         except Exception as exc:
             if not is_device_oom(exc):
                 raise
@@ -341,37 +327,21 @@ def _fence(torch: ModuleType, device: Device) -> None:
 def _found(
     torch: ModuleType, device: Device, need: int, read: set[int], mappable: bool
 ) -> dict[int, UntypedStorage]:
-    """Storages torch's allocator holds on `device` for this process, by `_cdata`: in its own
-    pool (a CUDA graph's pool holds what its graphs read) or, without segments, resizable.
-    Every object is looked at when those ops touched cannot give `need`: any of them while
-    they can be mapped, else only those no op touched this stage."""
-    segments: list[tuple[int, int]] | None = None
-    if device.type == "cuda":
-        segments = sorted(
-            (s["address"], s["address"] + s["total_size"])
-            for s in torch.cuda.memory_snapshot()
-            if s["device"] == device.index and tuple(s.get("segment_pool_id", (0, 0))) == (0, 0)
-        )
-    starts = [start for start, _ in segments or ()]
+    """Storages torch's allocator holds on `device` for this process (resizable: neither a
+    plane's nor a host block's), by `_cdata`. Every object is looked at when those ops
+    touched cannot give `need`: any of them while they can be mapped, else only those no op
+    touched this stage."""
     found: dict[int, UntypedStorage] = {}
 
     def add(storages: Iterable[UntypedStorage | None]) -> int:
         """Those among `storages`; the bytes of those that may leave."""
         spare = 0
         for storage in storages:
-            if storage is None or storage.device != device:
+            if storage is None or storage.device != device or not storage.resizable():
                 continue
             key = int(storage._cdata)
-            if key in found or key in NATIVE or storage.nbytes() < SMALLEST:
+            if key in found or key in OFF or key in NATIVE or storage.nbytes() < SMALLEST:
                 continue
-            if segments is None:
-                if not storage.resizable():
-                    continue
-            else:
-                address = storage.data_ptr()
-                at = bisect_right(starts, address) - 1
-                if at < 0 or address >= segments[at][1]:
-                    continue
             found[key] = storage
             if key not in read and (mappable or _last(key) < BEGAN[0]):
                 spare += int(storage.nbytes())
@@ -412,14 +382,6 @@ def _note(
     OFF[int(storage._cdata)] = Off(weak, int(storage.nbytes()), host, file)
 
 
-def _chunks(torch: ModuleType, nbytes: int) -> Iterator[tuple[slice, Tensor]]:
-    """A disk copy's pieces: each one's span, and host memory to cross in."""
-    staging = torch.empty(min(CHUNK, nbytes), dtype=torch.uint8)
-    for at in range(0, nbytes, CHUNK):
-        part = staging[: min(CHUNK, nbytes - at)]
-        yield slice(at, at + part.numel()), part
-
-
 def _map(torch: ModuleType, device: Device, storage: UntypedStorage) -> None:
     nbytes = int(storage.nbytes())
     host = _host(torch, nbytes)
@@ -432,34 +394,37 @@ def _map(torch: ModuleType, device: Device, storage: UntypedStorage) -> None:
 def _out(torch: ModuleType, storage: UntypedStorage, disk: bool) -> None:
     """The storage's bytes to pageable host memory or a file, its device bytes released (the
     device is fenced: `spill`)."""
-    flat = _flat(torch, storage)
+    flat, nbytes = _flat(torch, storage), int(storage.nbytes())
     if disk:
         # In the executor's scratch scope on the machine's disk (`TMPDIR`), never RAM-backed;
         # unnamed, so it goes with the process at the latest.
         file = tempfile.TemporaryFile()  # noqa: SIM115 - held until the storage is back
-        for span, part in _chunks(torch, flat.numel()):
-            file.write(part.copy_(flat[span]).numpy().data)
-        file.flush()
-        os.fdatasync(file.fileno())
+        os.ftruncate(file.fileno(), nbytes)
+        with mmap.mmap(file.fileno(), nbytes) as pages:
+            torch.frombuffer(pages, dtype=torch.uint8).copy_(flat)
+            pages.flush()
         os.posix_fadvise(file.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)  # its pages leave RAM
         _note(torch, storage, file=file)
     else:
-        _note(torch, storage, torch.empty(flat.numel(), dtype=torch.uint8).copy_(flat))
+        _note(torch, storage, torch.empty(nbytes, dtype=torch.uint8).copy_(flat))
     storage.resize_(0)
 
 
 def _in(torch: ModuleType, storage: UntypedStorage, off: Off) -> None:
-    """An out storage's bytes back on its device. Its allocation is the only step that can
-    fail, and it fails before anything changed."""
-    storage.resize_(off.nbytes)
+    """A storage's bytes back on its device: a mapped one copied and repointed in place (its
+    host block free again), an out one allocated and filled. The allocation is the only step
+    that can fail, and it fails before anything changed."""
+    if not off.out:
+        fresh = torch.empty(off.nbytes, dtype=torch.uint8, device=storage.device)
+        storage._swap_data_ptr_(fresh.copy_(_flat(torch, storage)).untyped_storage())
+    else:
+        storage.resize_(off.nbytes)
     flat = _flat(torch, storage)
     if off.host is not None:
         flat.copy_(off.host)
     elif (file := off.file) is not None:
-        file.seek(0)
-        for span, part in _chunks(torch, off.nbytes):
-            file.readinto(part.numpy().data)
-            flat[span].copy_(part)
+        with mmap.mmap(file.fileno(), off.nbytes) as pages:
+            flat.copy_(torch.frombuffer(pages, dtype=torch.uint8))
         file.close()
     del OFF[storage._cdata]
     TOTALS[6] += off.nbytes
