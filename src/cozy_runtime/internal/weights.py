@@ -47,6 +47,7 @@ from cozy_runtime.internal import (
     budget_cell,
     canonical,
     lora_bake,
+    module_state,
     plane,
     proctree,
     spill,
@@ -1975,12 +1976,15 @@ class Effects:
     elsewhere), the generators its seeded ops draw from, and whether the bands rewrote an op
     of it (`Bands.rewrites`: a convolution past its padding's zeros, an op cut in rows). A
     forward that changes nothing else runs with no dispatch layer and, out of memory, again
-    from its generators' states; one that writes, or that the bands rewrote, keeps its ops'
-    recovery. Python attributes it changes (a counter on the module) are not seen."""
+    from its generators' states. One that writes, that the bands rewrote, or that changes a
+    plain attribute of a module in it (`state`: HiDiffusion's step counters) keeps its ops'
+    recovery; one that does not write runs again from those attributes too."""
 
     writes: bool
     generators: tuple[Any, ...]
     banded: bool = False
+    #: the (module, attribute) pairs its first run changed
+    state: tuple[tuple[Module, str], ...] = ()
 
 
 @dataclass(slots=True, eq=False)  # one is told from another by identity, never content
@@ -2035,8 +2039,30 @@ class Journal:
         self.made_here.clear()
         self.first.clear()
 
-    def effects(self, banded: bool = False) -> Effects:
-        return Effects(bool(self.kept), tuple(self.drawn.values()), banded)
+    def effects(self, banded: bool = False, state: tuple[tuple[Module, str], ...] = ()) -> Effects:
+        return Effects(bool(self.kept), tuple(self.drawn.values()), banded, state)
+
+
+def _class_forward(module: Module, *args: object, **kwargs: object) -> object:
+    return type(module).forward(module, *args, **kwargs)
+
+
+def _start(
+    effects: Effects, args: tuple[object, ...], kwargs: Mapping[str, object]
+) -> Callable[[], None]:
+    """What a block's run starts from, to put back before it runs again: the attributes its
+    first run changed, its generators' states, the containers it was handed."""
+    attrs = module_state.take(effects.state)
+    kept = [(g, g.get_state()) for g in effects.generators]
+    held = _containers(args, kwargs)
+
+    def restore() -> None:
+        module_state.put_back(attrs)
+        for generator, state in kept:
+            generator.set_state(state)
+        _put_back(held)
+
+    return restore
 
 
 #: how often a journaled call marks its device progress, in ops (an event costs microseconds)
@@ -3358,8 +3384,12 @@ class WeightResidency:
         rows = self.hooks[component.name] = []
         for region in component.blocks:
             module = region.module
-            rows.append((module, "forward" in module.__dict__, module.forward))
-            module.forward = self._block(component, region, module.forward)
+            had = "forward" in module.__dict__
+            rows.append((module, had, module.forward))
+            # Read at each call: a package that swaps the module's class after load
+            # (HiDiffusion, at its first 4 MP request) runs its own forward.
+            forward = module.forward if had else functools.partial(_class_forward, module)
+            module.forward = self._block(component, region, forward)
 
     def _unhook(self, name: str) -> None:
         for module, had, forward in self.hooks.pop(name, []):
@@ -4234,36 +4264,55 @@ class WeightResidency:
     ) -> Callable[..., Any]:
         """The one hook per block: acquire, bind, run, release. Its ops recover one by one in
         the process's dispatch mode. A block whose first run wrote nothing that existed before
-        it (`Effects`) runs with no mode; out of memory there, it gets back the generators it
-        drew from and the containers it was handed and runs again with its ops recovering, as
-        it does from then on (`tight`). A group GPU's blocks hold their group's collectives:
-        they never run twice, and always recover op by op."""
+        it and changed no attribute (`Effects`) runs with no mode; out of memory there, it gets
+        back the generators it drew from and the containers it was handed and runs again with
+        its ops recovering, as it does from then on (`tight`). One that wrote nothing runs again
+        so from any shortage outside its ops, its changed attributes put back too. A group GPU's
+        blocks hold their group's collectives: they never run twice, and always recover op by
+        op."""
         weights = self.weights
 
         def run(*args: Any, **kwargs: Any) -> Any:
             try:
                 effects = region.effects
-                if (
-                    effects is None
-                    or effects.writes
+                if effects is None:
+                    return learn(*args, **kwargs)
+                quiet = not (
+                    effects.writes
+                    or effects.state
                     or effects.banded
                     or region.tight
                     or weights.grouped
                     or _hosts(args, kwargs)
-                ):
-                    return observed(effects is None, *args, **kwargs)
-                kept = [(g, g.get_state()) for g in effects.generators]
-                held = _containers(args, kwargs)
+                )
+                # A run that wrote nothing runs again, out of memory outside its ops, from what
+                # it started with (the owner, 10-05: replays are made safe, not refused). A
+                # group GPU's never runs twice.
+                restore = (
+                    None if effects.writes or weights.grouped else _start(effects, args, kwargs)
+                )
                 try:
-                    with self._quiet() if self._modes() else nullcontext():
+                    if quiet:
+                        with self._quiet() if self._modes() else nullcontext():
+                            return attempt(True, *args, **kwargs)
+                    with weights.recovering():
                         return attempt(True, *args, **kwargs)
+                except _Regrained:
+                    raise
                 except Exception as exc:
-                    if (short := shortage(exc)) is None:
+                    short = None if restore is None else shortage(exc)
+                    if short is None:
+                        if effects.writes and not _in_call(weights.torch):
+                            # it leaves its writes: unless a group call's journal puts them
+                            # back, the process is not served again should the attempt fail
+                            self.unjournaled = (
+                                f"{component.name}.{region.path} failed after writing"
+                            )
+                            weights.modes["unjournaled"] = self.unjournaled
                         raise
                     exc.__traceback__ = None  # the failed run's frames free their tensors
-                for generator, state in kept:
-                    generator.set_state(state)
-                _put_back(held)
+                assert restore is not None
+                restore()
                 region.tight = True
                 op, operands = f"{component.name}.{region.path}", (*args, *kwargs.values())
                 weights.memory.free_for(short[0] or region.span, op, operands)
@@ -4278,25 +4327,12 @@ class WeightResidency:
             except self._poisoned_error as exc:
                 raise self._poison(exc) from exc
 
-        def observed(first: bool, *args: Any, **kwargs: Any) -> Any:
-            """Its ops recover one by one; its first run also learns its `Effects`, and a
-            first run that fails is put back. A writer that fails later leaves its writes:
-            unless a group call's journal puts them back, the process is not served again
-            should the attempt fail (`unjournaled`)."""
-            if not first:
-                try:
-                    with weights.recovering():
-                        return attempt(True, *args, **kwargs)
-                except _Regrained:
-                    raise
-                except Exception:
-                    wrote = region.effects is not None and region.effects.writes
-                    if wrote and not _in_call(weights.torch):
-                        self.unjournaled = f"{component.name}.{region.path} failed after writing"
-                        weights.modes["unjournaled"] = self.unjournaled
-                    raise
+        def learn(*args: Any, **kwargs: Any) -> Any:
+            """Its first run, journaled: its ops recover one by one, it learns its `Effects`,
+            and one that fails is put back."""
             journal = Journal()
             rewrites = weights.bands.rewrites if weights.bands is not None else 0
+            attributes = module_state.snapshot(region.module)
             try:
                 with weights.recovering(journal):
                     out = attempt(True, *args, **kwargs)
@@ -4305,7 +4341,8 @@ class WeightResidency:
                     journal.rewind()
                 raise
             banded = weights.bands is not None and weights.bands.rewrites > rewrites
-            region.effects = journal.effects(banded)
+            changed = module_state.changed(attributes, module_state.snapshot(region.module))
+            region.effects = journal.effects(banded, changed)
             return out
 
         def attempt(entering: bool, *args: Any, **kwargs: Any) -> Any:
