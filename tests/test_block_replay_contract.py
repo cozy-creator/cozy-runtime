@@ -41,7 +41,7 @@ class StatefulBlock(torch.nn.Module):  # type: ignore[misc,name-defined]
         self.linear = torch.nn.Linear(2, 2, bias=False)
         self.linear.weight = torch.nn.Parameter(torch.eye(2), requires_grad=False)
         self.register_buffer("ticks", torch.zeros(()))
-        self.runs = [0]  # the test's count, in a container: not the block's own state
+        self._runs = [0]  # the test's count, private: not the block's own state
         self.count = 0
         self.effect = effect
         self.generator = torch.Generator().manual_seed(1234)
@@ -49,10 +49,10 @@ class StatefulBlock(torch.nn.Module):  # type: ignore[misc,name-defined]
 
     @property
     def calls(self) -> int:
-        return self.runs[0]
+        return self._runs[0]
 
     def forward(self, value: Any) -> Any:
-        self.runs[0] += 1
+        self._runs[0] += 1
         if self.effect == "counter":
             self.count += 1
             extra = self.count

@@ -47,6 +47,7 @@ from cozy_runtime.internal import (
     budget_cell,
     canonical,
     lora_bake,
+    module_state,
     plane,
     proctree,
     spill,
@@ -2042,31 +2043,8 @@ class Journal:
         return Effects(bool(self.kept), tuple(self.drawn.values()), banded, state)
 
 
-_MISSING = object()
-
-
-def _attributes(module: Module) -> dict[tuple[Module, str], object]:
-    """Every plain value a module tree keeps outside torch's sight, a tensor by identity: what
-    a forward can change that no journal sees (a step counter, a cached tensor swapped)."""
-    plain = (int, float, bool, str, bytes, type(None))
-    return {
-        (m, name): value if isinstance(value, plain) else id(value)
-        for m in module.modules()
-        for name, value in vars(m).items()
-        if isinstance(value, plain) or hasattr(value, "untyped_storage")
-    }
-
-
 def _class_forward(module: Module, *args: object, **kwargs: object) -> object:
     return type(module).forward(module, *args, **kwargs)
-
-
-def _changed(
-    before: Mapping[tuple[Module, str], object], after: Mapping[tuple[Module, str], object]
-) -> tuple[tuple[Module, str], ...]:
-    return tuple(
-        k for k in {**before, **after} if before.get(k, _MISSING) != after.get(k, _MISSING)
-    )
 
 
 def _start(
@@ -2074,16 +2052,12 @@ def _start(
 ) -> Callable[[], None]:
     """What a block's run starts from, to put back before it runs again: the attributes its
     first run changed, its generators' states, the containers it was handed."""
-    attrs = [(m, n, vars(m).get(n, _MISSING)) for m, n in effects.state]
+    attrs = module_state.take(effects.state)
     kept = [(g, g.get_state()) for g in effects.generators]
     held = _containers(args, kwargs)
 
     def restore() -> None:
-        for module, name, value in attrs:
-            if value is _MISSING:
-                vars(module).pop(name, None)
-            else:
-                setattr(module, name, value)
+        module_state.put_back(attrs)
         for generator, state in kept:
             generator.set_state(state)
         _put_back(held)
@@ -4358,7 +4332,7 @@ class WeightResidency:
             and one that fails is put back."""
             journal = Journal()
             rewrites = weights.bands.rewrites if weights.bands is not None else 0
-            attributes = _attributes(region.module)
+            attributes = module_state.snapshot(region.module)
             try:
                 with weights.recovering(journal):
                     out = attempt(True, *args, **kwargs)
@@ -4367,7 +4341,7 @@ class WeightResidency:
                     journal.rewind()
                 raise
             banded = weights.bands is not None and weights.bands.rewrites > rewrites
-            changed = _changed(attributes, _attributes(region.module))
+            changed = module_state.changed(attributes, module_state.snapshot(region.module))
             region.effects = journal.effects(banded, changed)
             return out
 
