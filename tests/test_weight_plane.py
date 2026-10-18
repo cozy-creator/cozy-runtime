@@ -1251,6 +1251,94 @@ def test_an_sdxl_unet_streams_bit_exact(tmp_path: Path, pressure: bool, fine: bo
 
 
 @on_card
+@pytest.mark.parametrize("stored", ["fp16", "fp8"])
+def test_an_sdxl_unet_out_of_memory_computes_the_resident_bits(
+    tmp_path: Path, card: Any, stored: str
+) -> None:
+    """Runs 10964, 11090, 11098 (SDXL at 4 MP on an RTX 3070: ~100 out-of-memory retries, idle
+    weights unmapped) drew a hatched image a 24 GB card does not. One card, one UNet, the same
+    inputs: resident with room, then with its activations short, so ops run out, idle weights
+    leave and each op runs again. Every module's output is the resident run's; the first that
+    is not names the path that broke it. `fp8`: linears stored fp8, decoded copies on sm86."""
+    torch.manual_seed(11)
+    values = {k: v.float() * 0.05 for k, v in sdxl_unet().state_dict().items()}
+    fp8 = [
+        k for k, v in values.items() if stored == "fp8" and k.endswith("weight") and v.dim() == 2
+    ]
+    weights = card.weights
+    model = load(
+        weights,
+        store_component(tmp_path / "unet", "unet", values, fp8=fp8),
+        "unet",
+        name="unet",
+        factory=sdxl_unet,
+    )
+    idle = load(weights, card.checkpoint, "idle")
+    run(idle, torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16), passes=1)
+    generator = torch.Generator(device="cuda").manual_seed(3)
+    side = 128  # SDXL's 4 MP latent
+    args = (
+        torch.randn(2, 4, side, side, device="cuda", dtype=torch.float16, generator=generator),
+        torch.tensor([500.0], device="cuda"),
+        torch.randn(2, 77, 64, device="cuda", dtype=torch.float16, generator=generator),
+    )
+    added = {
+        "text_embeds": torch.randn(2, 64, device="cuda", dtype=torch.float16, generator=generator),
+        "time_ids": torch.tensor([[8 * side] * 2 + [0, 0] + [8 * side] * 2] * 2).cuda().half(),
+    }
+    seen: dict[str, Any] = {}
+    names = {module: name for name, module in model.stack.named_modules()}
+
+    def record(module: Any, _: Any, out: Any) -> None:
+        if isinstance(out, torch.Tensor):  # a replayed block records again: the last one counts
+            seen[names[module]] = out.detach().cpu().float()
+
+    def step() -> tuple[Any, dict[str, Any]]:
+        seen.clear()
+        model.residency.admit("run", ("unet",))
+        try:
+            with weights.recovering(), torch.inference_mode():
+                out = model.stack(*args, added_cond_kwargs=added).sample.float().cpu()
+        finally:
+            model.residency.release("run", ("unet",))
+        return out, dict(seen)
+
+    hooks = [m.register_forward_hook(record) for m in names]
+    try:
+        weights.set_budget(-1)
+        torch.cuda.reset_peak_memory_stats()
+        base = torch.cuda.memory_allocated()
+        resident, modules = step()
+        peak = torch.cuda.max_memory_allocated() - base
+        mapped, retries = (
+            weights.resident_bytes(idle.residency.components["stack"]),
+            weights.oom_retries,
+        )
+        torch.cuda.empty_cache()
+        free, _ = torch.cuda.mem_get_info()
+        ballast = torch.empty(max(free - peak // 2, 0), dtype=torch.uint8, device="cuda")
+        try:
+            short, pressed = step()
+        finally:
+            del ballast
+            torch.cuda.empty_cache()
+    finally:
+        for hook in hooks:
+            hook.remove()
+    facts = weights.facts()
+    print("retries", facts.oom_retries - retries, "modes", facts.modes)
+    assert facts.oom_retries > retries, "the run had the room: nothing was retried"
+    assert weights.resident_bytes(idle.residency.components["stack"]) < mapped
+    wrong = [
+        (name, float((a - pressed[name]).abs().max()), float(a.abs().max()))
+        for name, a in modules.items()
+        if name in pressed and a.shape == pressed[name].shape and not torch.equal(a, pressed[name])
+    ]
+    print("first modules off:", wrong[:12])
+    assert torch.equal(resident, short), f"{len(wrong)} modules off, first: {wrong[:4]}"
+
+
+@on_card
 def test_the_worker_lowers_a_running_stage_at_its_next_block(card: Any) -> None:
     """Room for another executor's context, made while a call runs: the Worker asks through
     the budget cell, and the stage unmaps and streams from its next block on, unchanged."""

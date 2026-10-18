@@ -3791,11 +3791,12 @@ class WeightResidency:
         device = plane.stats(weights.plane).device(weights.index)
         held = {self.components[name].key for name in components if name in self.components}
         held.update(weights.opened())
-        own = sum(
-            weights.components[key].regions[index].span
-            for key in held
-            for index in weights.components[key].resident
-        )
+        own = 0  # their resident set the stage's leases do not count already (its holds do)
+        for key in held:
+            component = weights.components[key]
+            common = component.common if component.lease is not None else None
+            leased = {*component.holds, *([common.index] if common is not None else [])}
+            own += sum(component.regions[i].span for i in component.resident if i not in leased)
         movable = device.committed - device.leased_bytes - device.held_bytes - own
         return free, max(movable, 0)
 
