@@ -1,6 +1,6 @@
 """The executor's weights on the real weight plane (weight-plane.md §4).
 
-Real: a TensorFS store holding a block model's weights, `tensorfs.plane`, the runtime's
+Real: a TensorFS store holding a block model's weights, `tensorfs.varena`, the runtime's
 `PlaneBackend` and `WeightResidency`, torch. The model is small and exact: a stack of
 declared no-split blocks whose forward reads every weight, so any byte streamed wrong changes
 the output. The host tier runs without a card; the rest needs device 0 and holds the whole
@@ -1443,7 +1443,7 @@ def test_the_owner_lowers_a_running_process_cap_at_its_next_block(card: Any) -> 
 
 @on_card
 def test_a_component_moves_to_the_sub_block_grain_at_any_block_boundary(card: Any) -> None:
-    """Run 5894, `tensorfs.plane.Closed`, and cr-203 U5. A block placed again from inside its
+    """Run 5894, `tensorfs.varena.Closed`, and cr-203 U5. A block placed again from inside its
     own attempt finds its component at another grain, and runs there, same bits. Moving
     waited for no lease or cursor anywhere, so never mid-stage, where a stage leases its
     common and streams through a cursor. Now it moves at the next block boundary: the

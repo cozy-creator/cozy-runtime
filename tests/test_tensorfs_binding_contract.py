@@ -45,7 +45,7 @@ import inspect
 from pathlib import Path
 
 import tensorfs
-import tensorfs.plane
+import tensorfs.varena
 
 SRC = Path(__file__).resolve().parent.parent / "src" / "cozy_runtime"
 
@@ -109,7 +109,7 @@ CALLED: dict[str, str] = {
     "DerivedWriter.fence": "(self, /)",
     "DerivedWriter.source_read_into": "(self, /, source, component, key, role, off, into)",
     "ReadPlan.items": "(self, /)",
-    # The weight plane (`tensorfs.plane`, 0.3.84): what `internal/plane.py`, `internal/weights.py`
+    # The weight plane (`tensorfs.varena`, 0.3.84): what `internal/plane.py`, `internal/weights.py`
     # and `worker/host_tier.py` call.
     "plane.Plane": (
         "(devices, readers=8, copy_streams=1, slab_bytes=Ellipsis, staging_buffers=4, "

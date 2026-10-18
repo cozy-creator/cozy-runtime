@@ -1,6 +1,6 @@
 """The machine keeps GPU weights across executors (`weights.attach/1`, Degree 2).
 
-Real: two `tensorfs.plane` device planes (an executor and its replacement), the executor's
+Real: two `tensorfs.varena` device planes (an executor and its replacement), the executor's
 own durable exchange over a seam socketpair with exported CUDA fds, and a custody stand-in
 that does what TensorD's does: keep the fds, hand duplicates out. The replacement copies
 no byte to the GPU, computes bit-identically, and after a revoke fills its own copy again.
