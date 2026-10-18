@@ -105,21 +105,3 @@ def test_asset_selection_requires_unique_safe_names_and_hashes(sums: str) -> Non
     with pytest.raises(ValueError):
         assets.selected(sums)
 
-
-def test_a_named_waiver_omits_exactly_the_aarch64_wheel(tmp_path: Path) -> None:
-    files = release_files(tmp_path)
-    aarch64 = next(name for name in files if name.endswith("manylinux_2_28_aarch64.whl"))
-    (tmp_path / aarch64).unlink()
-    del files[aarch64]
-    sums = sums_for(files)
-    with pytest.raises(ValueError, match=r"not the complete 1\.2\.3 release"):
-        assets.verify(tmp_path, sums, "1.2.3")
-    assert assets.verify(tmp_path, sums, "1.2.3", assets.waivers("linux-aarch64")) == sums
-
-
-def test_a_waived_wheel_that_is_present_and_unknown_waivers_refuse(tmp_path: Path) -> None:
-    sums = sums_for(release_files(tmp_path))
-    with pytest.raises(ValueError, match=r"not the complete 1\.2\.3 release"):
-        assets.verify(tmp_path, sums, "1.2.3", assets.waivers("linux-aarch64"))
-    with pytest.raises(ValueError, match="unknown platform waiver"):
-        assets.waivers("linux-x86_64")

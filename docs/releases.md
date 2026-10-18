@@ -12,14 +12,11 @@ uploads. Never move a published tag or fill an existing version from different s
 gh workflow run publish.yaml -f release_tag=vX.Y.Z -f mode=source
 ```
 
-The hosted job builds the source and pure wheel, adds each platform's kernel modules to make
-the native wheels (Linux x86_64 and aarch64, Windows x86_64: `kernels.yaml` reuses cached modules
-when `kernels/` is unchanged, and compiles otherwise), and bundles the pinned TensorD binary
-into the Linux ones. TensorD is public and needs no SSH deploy key. Its TensorFS
-dependency is private, so the job checks source access before expensive build work.
-Existing authenticated Git access works; the optional `TENSORFS_READ_KEY` repository
-secret can supply a TensorFS read key. Without source access the job refuses with an
-actionable message.
+The hosted job builds the source and pure wheel, and adds each platform's kernel modules to make
+the native wheels (Linux x86_64 and aarch64, Windows x86_64): `kernels.yaml` reuses cached modules
+when `kernels/` is unchanged, and compiles otherwise. No wheel carries a machine: TensorD ships in
+the `cozy` binary. TensorFS source access is needed only where a runner builds TensorFS from its
+tag; the optional `TENSORFS_READ_KEY` repository secret supplies it.
 
 A local authenticated source build followed by the prebuilt entrypoint is also supported.
 This requires neither a new deploy key nor copying a personal token into the repository.
@@ -35,12 +32,9 @@ gh workflow run publish.yaml -f release_tag=vX.Y.Z -f mode=prebuilt \
   -f gated_sha256sums='<sha256> <filename> <sha256> <filename> ...'
 ```
 
-This path needs no TensorD or TensorFS source credentials. It verifies tag identity,
-downloads the release assets and requires the three native wheels, pure wheel and sdist for
-that same verified version. It refuses wrong-version, missing, extra or changed files.
-A release whose TensorD pin has no arm build may omit the Linux aarch64 wheel only by naming it:
-`-f waive_platforms=linux-aarch64`. The run prints the waiver as a warning and in its summary; record
-it with the release. Without the waiver all five files are required.
+This path needs no source credentials. It verifies tag identity, downloads the release assets
+and requires the three native wheels, pure wheel and sdist for that same verified version. It
+refuses wrong-version, missing, extra or changed files.
 It does not import or execute downloaded artifact contents. The publishing job rechecks the hashes
 after artifact transfer, publishes with OIDC, and checks PyPI serves the same file set
 and hashes. Source build checks still belong to source mode.

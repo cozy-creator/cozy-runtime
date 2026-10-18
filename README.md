@@ -5,18 +5,8 @@ TensorD-launched executors, and the package CLI. TensorD makes model weights ava
 those executors and coordinates machine budgets, storage lifetime and process lifecycle.
 TensorFS is a library used inside both TensorD and Runtime.
 
-The Linux x86-64 wheel (glibc 2.28+) also installs TensorD's `tensord` executable.
-Worker images take it from there:
-
-```sh
-uv pip install cozy-runtime
-tensord version --json
-```
-
-It is built from [TensorD](https://github.com/cozy-creator/tensord) at the revision recorded
-in `tensord.pin`. `task machine` bundles it into `dist`'s Linux wheel
-(`MACHINE=<checkout>` builds a local checkout); the publish workflow runs the same task.
-The pure Python wheel and source distribution carry no machine executable.
+TensorD is a role of the `cozy` binary (`cozy machine serve`, from
+[cozy-creator/cozy](https://github.com/cozy-creator/cozy)); no Runtime wheel carries it.
 See [Publishing Runtime](docs/releases.md) for explicit source and approved-prebuilt releases.
 
 TensorD owns accepted executions and their durable journal behind `cozy.machine.v1`.
@@ -191,8 +181,7 @@ FlashAttention-3's forward and RMSNorm + split-half RoPE (`author.kernels.rms_ro
 every GPU target's cubins plus PTX, nanobind on the stable ABI, no torch ABI. Each kernel serves
 once it passes its probe on the card (`internal/verify.py`). `kernels.yaml` builds and checks the
 modules, cached by a hash of everything that shapes their bytes; `task wheel` adds them to the
-pure wheel, and `task machine` adds tensord to Linux's. The pure wheel (macOS, any other platform)
-carries none.
+pure wheel. The pure wheel (macOS, any other platform) carries none.
 
 Every model-specific optimization first benchmarks `torch.compile`/Inductor as a discovery
 oracle and records profile identity, graph breaks, generated kernels, compile cost, warm
