@@ -938,8 +938,9 @@ class Weights:
 
     def spare(self, operands: Sequence[object]) -> bool:
         """Memory rung 2: the open stages' components with no block in its forward and none of
-        `operands` give their weights back (`WeightResidency._spare`); the one whose block
-        ran last only when nothing else is left."""
+        `operands` give their weights back (`WeightResidency._spare`), never the one whose block
+        ran last: its own code between its blocks (or a sub-block grain's parts) may hold its
+        weights, and a kernel would be handed them unmapped (runs 11440, 11536)."""
         if not self.open:
             return False
         pointers = list(_pointers(operands))
@@ -951,7 +952,7 @@ class Weights:
             and any(region.bound <= p < region.bound + region.span for p in pointers)
         }
         keep, residency = {*self.running, *reads}, self.open[-1][0]
-        return residency._spare({*keep, self.last}) or residency._spare(keep)
+        return residency._spare({*keep, self.last})
 
     def restore_spilled(self) -> int:
         """Tensors an earlier op moved off the device come back while it has room beside the
