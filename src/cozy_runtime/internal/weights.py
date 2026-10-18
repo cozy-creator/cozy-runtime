@@ -3727,6 +3727,8 @@ class WeightResidency:
                 self.repeats,
             ):
                 table.pop(MAPPING, None)
+            for component in self.components.values():
+                component.cycled.pop(MAPPING, None)
         held, complete = 0, True
         for component in map(self.components.__getitem__, names):
             on = set(component.resident) | component.shared
@@ -4751,16 +4753,14 @@ def _hot(weights: Weights, opened: Collection[str]) -> int:
     """Device bytes the resident sets repeating stages kept (`Component.hot`) hold outside
     `opened`, their decoded copies with them."""
     weights.drain()  # what was evicted is unbound
-    held = 0
-    for key, component in weights.components.items():
-        if component.hot and key not in opened:
-            kept = set(component.resident) - component.shared
-            held += sum(
-                r.span + r.decoded
-                for r in component.regions
-                if r.index in kept and r.bound is not None
-            )
-    return held
+    return sum(
+        r.span + r.decoded
+        for key, c in weights.components.items()
+        if c.hot and key not in opened
+        for kept in [set(c.resident) - c.shared]
+        for r in c.regions
+        if r.index in kept and r.bound is not None
+    )
 
 
 def _costs(
