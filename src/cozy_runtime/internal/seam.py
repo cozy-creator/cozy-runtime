@@ -75,7 +75,7 @@ SECRET_KEYS = frozenset({"token", "credential", "authorization", "secret", "jwt"
 RESULT_DOCUMENT = "result.canonical"
 
 #: One decoded frame: a JSON object, routed by its `event`, `cmd`, `seq` and `request_id`.
-type Frame = dict[str, Any]
+type Frame = dict[str, object]
 
 #: Peer-gone errnos: ECONNRESET, EPIPE, ENOTCONN.
 _GONE_ERRNOS = (104, 32, 107)
@@ -122,7 +122,7 @@ class Channel:
     #: by `Mux.ask`): attempts, follower readers and overlapped calls all send.
     sending: threading.RLock = field(default_factory=threading.RLock, repr=False, compare=False)
 
-    def send(self, message: Frame) -> None:
+    def send(self, message: dict[str, Any]) -> None:
         _scan(message)
         data = json.dumps(message, separators=(",", ":"), sort_keys=True).encode()
         if len(data) > MAX_FRAME:
@@ -235,6 +235,22 @@ class Channel:
             raise
         return received
 
+    def recv_fds(self, count: int) -> list[int]:
+        """`count` descriptors, unopened, for a relay to pass on (`send_fds`)."""
+        received: list[int] = []
+        try:
+            for _ in range(count):
+                received.append(self._recv_fd())
+        except BaseException:
+            for fd in received:
+                os.close(fd)
+            raise
+        return received
+
+    def send_fds(self, fds: list[int]) -> None:
+        for fd in fds:
+            self._send_fd(fd, "relayed capability")
+
     def pass_fd(self, to: Channel) -> None:
         """Relay one descriptor to another seam unopened: its receiver checks what it is."""
         fd = self._recv_fd()
@@ -285,7 +301,7 @@ class Channel:
 
     def recv(
         self, timeout: float | None = None, *, total_timeout: float | None = None
-    ) -> Frame | None:
+    ) -> dict[str, Any] | None:
         """One frame, or None when the peer is gone (a disposable executor's normal end)."""
         deadline = time.monotonic() + total_timeout if total_timeout is not None else None
         head = self._read_exact(
@@ -457,6 +473,7 @@ def _nothing(*_: object) -> None:
 class _Asked:
     receive: Callable[[Frame], None]
     answer: Frame | None = None
+    error: SeamError | None = None
 
 
 class Mux:
@@ -489,9 +506,16 @@ class Mux:
                 self._seq += 1
                 seq = self._seq
                 self._asked[seq] = asked
-            self.channel.send({**request, "seq": seq})
-            send()
+            try:
+                self.channel.send({**request, "seq": seq})
+                send()
+            except BaseException:
+                with self._changed:
+                    del self._asked[seq]
+                raise
         self._pump(lambda: asked.answer is not None)
+        if asked.error is not None:
+            raise asked.error
         if asked.answer is None:
             assert self._ended is not None
             raise SeamError(self._ended.code, f"{request.get('kind')}#{seq}: {self._ended.detail}")
@@ -555,7 +579,12 @@ class Mux:
                 asked = self._asked.pop(seq, None) if isinstance(seq, int) else None
             if asked is None:
                 raise SeamError("seam_out_of_order", f"an answer to no request: {seq!r}")
-            asked.receive(frame)  # its descriptors follow it on the stream
+            try:
+                asked.receive(frame)  # its descriptors follow it on the stream
+            except (
+                SeamError
+            ) as exc:  # that exchange fails; a receive that lost the stream closed it
+                asked.error = exc
             with self._changed:
                 asked.answer = frame
         elif frame.get("cmd") == "cancel":

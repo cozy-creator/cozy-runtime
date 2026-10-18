@@ -57,8 +57,8 @@ import socket
 import sys
 import threading
 import time
+import traceback
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from concurrent.futures import Future, wait
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -70,14 +70,14 @@ from tensorfs.derived import SourceCapability
 from cozy_runtime import __version__ as RUNTIME_VERSION
 from cozy_runtime import graphs
 from cozy_runtime.author import describe
-from cozy_runtime.author._activity import ThreadPoolExecutor, settles
+from cozy_runtime.author._activity import ThreadPoolExecutor, own_thread, settles
 from cozy_runtime.author._app import Registration
 from cozy_runtime.author._artifacts import ModelArtifact
 from cozy_runtime.author._assets import GrantedInput
 from cozy_runtime.author._attention import _close as close_producer_states
 from cozy_runtime.author._calls import _Broker, _CallType, _export
 from cozy_runtime.author._capture import ActivationCapture
-from cozy_runtime.author._context import AdapterRef, Device
+from cozy_runtime.author._context import CURRENT, AdapterRef, Device
 from cozy_runtime.author._demand import shape_cell
 from cozy_runtime.author._errors import (
     DEVICE_OOM,
@@ -98,12 +98,12 @@ from cozy_runtime.author._executor_requests import (
     DeviceRoom,
     DeviceTier,
     DeviceTierAnswer,
+    Exchange,
     FetchChannel,
     Handoff,
     ModelSource,
     ObjectFiles,
     ObjectFilesAnswer,
-    Publish,
     Published,
     Request,
     Room,
@@ -122,7 +122,7 @@ from cozy_runtime.author._invoke import (
     prepare,
     run_prepared,
 )
-from cozy_runtime.author._model import WARNINGS, Model, WarningRow, component_use
+from cozy_runtime.author._model import SCOPES, WARNINGS, Model, WarningRow, component_use
 from cozy_runtime.author._observations import Attribution
 from cozy_runtime.author._services import AdjustmentRow, ProgressFrame
 from cozy_runtime.author._services import Attempt as AuthorAttempt
@@ -748,9 +748,11 @@ class Executor:
         self.channel = channel
         self.root = root
         self.host: Executor = host or self
-        #: HOST ONLY: the seam every thread reads through, and the attempts in flight
+        #: HOST ONLY: the seam every thread reads through, the attempts in flight and the lock
+        #: their fetch channel opens and closes under
         self.mux: Mux = host.mux if host is not None else Mux(channel)
         self.in_flight: _InFlight = host.in_flight if host is not None else _InFlight()
+        self._fetching = threading.Lock()
         #: this process's CUDA context and first library launches, measured at device init
         #: from this process's own driver row (-1: not attributable)
         self.device_context = -1
@@ -3222,11 +3224,18 @@ class Executor:
         target = self._target(command, attempt=False)
         if isinstance(target, dict):
             return target
-        if self.fetch is not None and not self.in_flight.count:
-            # The attempt re-asserts what it reads, on its own channel, in the order this
-            # process learned: a no-op for objects already here, and every fetch stays owned
-            # by a live call. The channel it replaces goes only after (nothing on the wire
-            # stops), and nothing of an earlier call carries over. Calls in flight keep theirs.
+        self._plan_fetch(target)
+        return target.prepare_request(command)
+
+    def _plan_fetch(self, target: Executor) -> None:
+        """The calls' fetch channel, opened by the first that finds none: it re-asserts what
+        the construction reads, in the order this process learned (a no-op for objects already
+        here), and every fetch stays owned by a live call. The last attempt out closes it."""
+        if self.fetch is None:
+            return
+        with self._fetching:
+            if self.fetch.open:
+                return
             groups = [
                 group
                 for member in target.model_executors or [target]
@@ -3237,16 +3246,11 @@ class Executor:
             self.fetch.begin()
             if groups:
                 self.fetch.schedule(groups)
-            else:
-                self.fetch.end()
-        return target.prepare_request(command)
 
     def serve_invoke(self, command: Invoke) -> dict[str, Any]:
         target = self._target(command, attempt=True)
         if isinstance(target, dict):
             return target
-        if (refused := target._unready(command)) is not None:
-            return refused
         requested = _attention_pin(command.attention_kernel, command.bits)
         alone = (
             self.world > 1
@@ -3255,61 +3259,68 @@ class Executor:
         )
         with self.in_flight.attempt(alone) as slot:
             try:
-                if slot.first:
-                    refused = self._ready(target, command)
-                    if refused is not None:
-                        return refused
-                elif self.weights is not None:
-                    self.weights.seed_activations(command.activation_bytes)
+                # Admitted only now: an attempt before it may have poisoned the generation.
+                prepared = target._admitted(command)
+                refused = prepared if isinstance(prepared, dict) else None
+                refused = refused or self._grant(target, command, first=slot.first)
                 if not alone:
                     self.in_flight.ready()
-                reply = target.invoke(command, slot)
+                if refused is not None:
+                    return refused
+                assert not isinstance(prepared, dict)
+                self._plan_fetch(target)
+                reply = target.invoke(command, prepared, slot)
             finally:
                 if self.fetch is not None and (slot.last or self.in_flight.count == 1):
-                    self.fetch.end()
+                    with self._fetching:
+                        self.fetch.end()
         self.attempts += 1
         self.poisoned = self.poisoned or target.poisoned
         reply["poisoned"] = self.poisoned
         return reply
 
-    def _ready(self, target: Executor, command: Invoke) -> Frame | None:
-        """The first attempt in: the plane takes its grant, and nothing earlier carries over."""
-        # The plane's budget derives from the driver at every attempt (TensorD sends none), so
-        # a cut to 0 never outlives the attempt that follows it. Only a grant that changed
-        # reaches the group's GPUs.
-        if self.weights is not None and (
-            self.weights.budget != -1
-            or command.cap_bytes != self.weights.cap
-            or command.rank_caps != self.rank_caps
-            or command.floor_bytes != self.weights.owner_floor
-        ):
-            granted = self.budget(
-                Budget(
-                    vram_bytes=-1,
-                    cap_bytes=command.cap_bytes,
-                    rank_caps=command.rank_caps,
-                    floor_bytes=command.floor_bytes,
+    def _grant(self, target: Executor, command: Invoke, *, first: bool) -> Frame | None:
+        """Every attempt's grant and the kernels that became ready, applied while no call is in
+        a scope; the first attempt in also starts the plane afresh."""
+        with SCOPES.held(object()):
+            # The plane's budget derives from the driver at every attempt (TensorD sends none),
+            # so a cut to 0 never outlives the attempt that follows it. Only a grant that
+            # changed reaches the group's GPUs.
+            if self.weights is not None and (
+                self.weights.budget != -1
+                or command.cap_bytes != self.weights.cap
+                or command.rank_caps != self.rank_caps
+                or command.floor_bytes != self.weights.owner_floor
+            ):
+                granted = self.budget(
+                    Budget(
+                        vram_bytes=-1,
+                        cap_bytes=command.cap_bytes,
+                        rank_caps=command.rank_caps,
+                        floor_bytes=command.floor_bytes,
+                    )
                 )
-            )
-            if not granted.get("ok"):
-                return granted
-        if self.weights is not None:
-            # A new request plans its stages afresh: a repeating stage the last one left open
-            # (its cursor at that request's end) never carries over. Its weights stay mapped.
-            self._unpark()
-            self.weights.restore_spilled()
-            self.weights.seed_activations(command.activation_bytes)
-            self.weights.seed_squeezed(command.squeezed_bytes)
-            if not isinstance(command.device_weights, UnsetType):
-                self._device_weights(command.device_weights)
-            self.weights.modes.clear()
-            self.weights.memory.refusal = None
-        target._upgrade_attention()
-        target._install_ready_kernels()
-        if target.residency is not None:
-            target.residency.open_attempt()
-        if target.torch is not None:
-            accel.reset_peak(target.torch, target.device_kind)
+                if not granted.get("ok"):
+                    return granted
+            if self.weights is not None:
+                if first:
+                    # A new request plans its stages afresh: a repeating stage the last one left
+                    # open (its cursor at that request's end) never carries over. Its weights
+                    # stay mapped.
+                    self._unpark()
+                    self.weights.restore_spilled()
+                    self.weights.seed_squeezed(command.squeezed_bytes)
+                    self.weights.modes.clear()
+                    self.weights.memory.refusal = None
+                self.weights.seed_activations(command.activation_bytes)
+                if not isinstance(command.device_weights, UnsetType):
+                    self._device_weights(command.device_weights)
+            target._upgrade_attention()
+            target._install_ready_kernels()
+            if first and target.residency is not None:
+                target.residency.open_attempt()
+            if first and target.torch is not None:
+                accel.reset_peak(target.torch, target.device_kind)
         return None
 
     def prepare_request(self, command: PrepareRequest) -> dict[str, Any]:
@@ -3390,8 +3401,8 @@ class Executor:
             **prepared.digests(),
         }
 
-    def _unready(self, command: Invoke) -> Frame | None:
-        """Why this construction cannot run `command` now, before it joins the attempts."""
+    def _admitted(self, command: Invoke) -> PreparedRequest | Frame:
+        """The record `command` runs, taken as it is admitted, or why it cannot run now."""
         if not self.ready:
             return {
                 "ok": False,
@@ -3407,7 +3418,8 @@ class Executor:
                 "code": "unknown_entrypoint",
                 "detail": f"{command.entrypoint!r} is not an entrypoint of this release",
             }
-        if command.request_id not in self.prepared:
+        prepared = self.prepared.pop(command.request_id, None)
+        if prepared is None:
             return {
                 "ok": False,
                 "code": "prepared_request_absent",
@@ -3415,22 +3427,29 @@ class Executor:
                 "runs the record its plan was priced against, and this executor holds none "
                 "(a fresh epoch holds nothing at all)",
             }
-        return None
+        return prepared
 
-    def invoke(self, command: Invoke, slot: _Slot) -> dict[str, Any]:
+    def invoke(self, command: Invoke, prepared: PreparedRequest, slot: _Slot) -> dict[str, Any]:
         """ONE attempt through the author kernel, with the §3.4 freeze point held."""
         surface = self.surface_names[command.entrypoint]
-        prepared = self.prepared.pop(command.request_id)
         requested = _attention_pin(command.attention_kernel, command.bits)
         # A pin is the run's: a call holding no site in its scope runs its own selection,
-        # and the worker reports a run none of whose calls applied it.
+        # and the worker reports a run none of whose calls applied it. A pinned attempt runs
+        # alone; another changes no site, so calls beside it see only upgrades.
         pin = requested if requested and self._attention_reaches(requested) else ""
-        try:
-            swap = self._attention_plan(pin) if pin else None
-            self._restore_attention()
-        except attention.AttentionRefusal as exc:
-            self._restore_attention()
-            return {"ok": False, "code": exc.code, "detail": str(exc)[:900], "origin": "request"}
+        swap = None
+        if pin:
+            try:
+                swap = self._attention_plan(pin)
+            except attention.AttentionRefusal as exc:
+                return {
+                    "ok": False,
+                    "code": exc.code,
+                    "detail": str(exc)[:900],
+                    "origin": "request",
+                }
+            finally:
+                self._restore_attention()
         spool = Path(command.spool)
         deadline = _deadline(command.deadline_s)
         torch = self.torch
@@ -3478,7 +3497,8 @@ class Executor:
                 return  # an override holds its kernel for every step
             if not segments:
                 segments.append(_segment("", 0, served_attention, started_us))
-            if self.host.in_flight.count > 1 or not self._upgrade_attention():
+            # An upgrade swaps sites every call reads: only while this call alone is in a scope.
+            if not SCOPES.holds(CURRENT.get()) or not self._upgrade_attention():
                 return
             later.append(self._attention_selection(attention.observed(self._attention_roots())))
             row = _segment(frame.stage, steps.get(frame.stage, 0), later[-1])
@@ -3492,15 +3512,18 @@ class Executor:
         sources: dict[str, RawWeights[Any]] = {
             name: RawWeights(manifest) for name, manifest in command.sources.items()
         }
-        storage = ExecutionStorage(spool, self._durable, command.weights)
-        stage_memo.ENGINE.open(self._durable, spool)
+        exchange = self._exchange(command.request_id)
+        storage = ExecutionStorage(spool, exchange, command.weights)
+        stage_memo.ENGINE.open(exchange, spool)
         warnings: list[WarningRow] = []
         try:
             with (
                 WARNINGS.attempt() as warnings,
                 self._recovering(),
-                attention.override(
-                    self._attention_snapshot(), self._attention_roots(), swap, pin
+                attention.override(self._attention_snapshot(), self._attention_roots(), swap, pin)
+                if pin
+                else contextlib.nullcontext(
+                    attention.observed(self._attention_roots())
                 ) as served_attention,
                 self._ranks_attention(pin, served_attention),
                 attention_sol.observing(ranks=sol_rank_counts, kernels=sol_kernels) as sol_counts,
@@ -3541,7 +3564,7 @@ class Executor:
                             tensorfs_source=self._sources(storage, command) if sources else None,
                             tensorfs_output=storage.open_output if command.weights else None,
                             tensorfs_adopt=storage.adopt_model if command.weights else None,
-                            publish=self._publish,
+                            publish=lambda request: exchange(request, Published),
                             calls=self.host._call_broker(
                                 command.request_id, self.host.call_interfaces
                             ),
@@ -4179,7 +4202,10 @@ class Executor:
             return None
         if self._bound_calls is None or self._bound_calls[0] is not rows:
             self._bound_calls = (rows, self._call_bindings(rows))
-        return _Broker(request_id, self._bound_calls[1], self._durable, self._child_events)
+        exchange = self._exchange(request_id)
+        return _Broker(
+            request_id, self._bound_calls[1], exchange, lambda: self._child_events(exchange)
+        )
 
     def _call_bindings(self, rows: tuple[CallInterface, ...]) -> CallBindings:
         if len(rows) > 256:
@@ -4245,10 +4271,6 @@ class Executor:
             bindings.setdefault(key, effect_interfaces.unserved(export))
         return bindings
 
-    def _publish(self, request: Publish) -> Published:
-        """One product onto the run's output log, durable before this returns."""
-        return self._durable(request, Published)
-
     def _tiers(self, sealed: bool, staged: bool = False) -> HostTiers | None:
         """The machine's sealed layouts: every rank asks for its own (a follower through rank
         0, `_relay`), and the machine keeps one copy for all. `staged`: a GPU executor's,
@@ -4271,7 +4293,7 @@ class Executor:
         """A wait on weights not here yet, told to the machine as the running request's stage."""
         with contextlib.suppress(SeamError):
             self.channel.send(
-                {"event": "progress", "request_id": "", "kind": "progress", "stage": line}
+                {"event": "progress", "request_id": _CALL.get(), "kind": "progress", "stage": line}
                 | {"stage_fraction": fraction, "advance": 0}
             )
 
@@ -4432,20 +4454,31 @@ class Executor:
         cell.close()
         return None
 
-    def _child_events(self) -> int | None:
+    def _child_events(self, exchange: Exchange) -> int | None:
         """The worker's nudge socket for this attempt's calls; None when it refuses, and on
         Windows, whose event loop cannot watch a pipe: its calls are polled."""
         if sys.platform == "win32":
             return None
-        answer = self._durable(ChildEvents(), Handoff)
+        answer = exchange(ChildEvents(), Handoff)
         return answer.descriptor if answer.ok else None
 
-    def _durable[A: Answer](self, request: Request, into: type[A]) -> A:
+    def _exchange(self, request_id: str) -> Exchange:
+        """One call's durable exchange, naming it from whatever thread its code runs on."""
+
+        def exchange[A: Answer](request: Request, into: type[A], /) -> A:
+            return self._durable(request, into, request_id)
+
+        return exchange
+
+    def _durable[A: Answer](
+        self, request: Request, into: type[A], request_id: str | None = None
+    ) -> A:
         """One DURABLE mid-attempt exchange. Blocks until the worker answers.
 
         This is the seam's other half of `child.Executor.call(on_request=…)`. It is a
         separate lane from progress on purpose: a durable fact must not be sheddable, and
-        the lossy lane's whole contract is that it may shed. It names the call it serves.
+        the lossy lane's whole contract is that it may shed. It names the call it serves (by
+        default the one this thread serves, "" outside every call).
         """
         body = encode_request(request)
         sending = (
@@ -4508,7 +4541,10 @@ class Executor:
                 frame["fds"] = received
 
         frame = self.host.mux.ask(
-            {"event": "request", "request_id": _CALL.get(), **body}, send, receive
+            {"event": "request", "request_id": _CALL.get() if request_id is None else request_id}
+            | body,
+            send,
+            receive,
         )
         try:
             return tolerant.read(frame, into, ("progress", "observation"))[0]
@@ -4532,24 +4568,23 @@ class Executor:
             )
             return
 
+        passed: list[int] = []
+
         def receive(answer: Frame) -> None:
             count = answer.get("descriptors", 0)
             if type(count) is not int or count < 0:
                 raise SeamError("seam_out_of_order", f"no answer to a relayed {kind}")
-            passed = count + (answer.get("descriptor") is True)
-            answer["passed"] = [self.channel._recv_fd() for _ in range(passed)]
+            passed.extend(self.channel.recv_fds(count + (answer.get("descriptor") is True)))
 
-        answer = self.mux.ask(
-            {**frame, "request_id": self._attempt_request},
-            (lambda: follower.pass_fd(self.channel)) if sends else lambda: None,
-            receive,
-        )
-        passed: list[int] = answer.pop("passed")
         try:
+            answer = self.mux.ask(
+                {**frame, "request_id": self._attempt_request},
+                (lambda: follower.pass_fd(self.channel)) if sends else lambda: None,
+                receive,
+            )
             with follower.sending:
                 follower.send({**answer, "seq": seq})
-                for fd in passed:
-                    follower._send_fd(fd, "relayed capability")
+                follower.send_fds(passed)
         finally:
             for fd in passed:
                 os.close(fd)
@@ -4942,7 +4977,7 @@ class Executor:
 _TELEMETRY = ("observations", "execution", "attribution")
 
 
-def _send_reply(channel: Channel, reply: Frame) -> None:
+def _send_reply(channel: Channel, reply: dict[str, Any]) -> None:
     """Put ONE reply on the seam. Telemetry never costs a reply its outcome."""
     try:
         channel.send(reply)
@@ -5155,13 +5190,53 @@ def _compiling(channel: Channel, state: kernel_compile.State) -> None:
 _CALL_COMMANDS = frozenset({"prepare_request", "invoke"})
 
 
+class _Order:
+    """Commands in the order they came: a call's run side by side, and a process-wide one
+    alone, after every command before it and before every command after it."""
+
+    def __init__(self) -> None:
+        self._changed = threading.Condition()
+        #: ticket -> whether it runs alone, until its command is answered
+        self._open: dict[int, bool] = {}
+        self._next = 0
+
+    def ticket(self, alone: bool) -> int:
+        with self._changed:
+            self._next += 1
+            self._open[self._next] = alone
+            return self._next
+
+    def first(self, ticket: int) -> bool:
+        with self._changed:
+            return min(self._open) == ticket
+
+    @contextlib.contextmanager
+    def turn(self, ticket: int) -> Iterator[None]:
+        with self._changed:
+            alone = self._open[ticket]
+            self._changed.wait_for(
+                lambda: (
+                    min(self._open) == ticket
+                    if alone
+                    else not any(a for t, a in self._open.items() if t < ticket)
+                )
+            )
+        try:
+            yield
+        finally:
+            with self._changed:
+                del self._open[ticket]
+                self._changed.notify_all()
+
+
 def serve(executor: Executor, channel: Channel) -> int:
-    """Answer commands until the machine shuts this executor down or its seam ends. A call's
-    commands run on the pool, and a process-wide command once no call is in flight."""
+    """Answer commands until the machine shuts this executor down or its seam ends. This thread
+    keeps reading: a call's commands run on the pool, and so does a process-wide one that must
+    wait for calls in flight; one that need not runs here, where Start and Fork always ran."""
     kernel_compile.waiting = functools.partial(_compiling, channel)
-    # Runtime-owned workers (no attempt counts them as its own), none before the first call.
-    calls = ThreadPoolExecutor(CALLS_IN_FLIGHT, "call")
-    running: set[Future[None]] = set()
+    # Runtime-owned workers (no attempt counts one as its own), none before the first is needed.
+    pool = ThreadPoolExecutor(CALLS_IN_FLIGHT, "call", initializer=own_thread)
+    order = _Order()
     while True:
         try:
             frame = executor.mux.command()
@@ -5170,29 +5245,48 @@ def serve(executor: Executor, channel: Channel) -> int:
         if frame is None:
             return int(Exit.ok)
         name = str(frame.get("cmd", ""))
-        if name in _CALL_COMMANDS and executor.rank == 0:
-            context = contextvars.Context()
-            running.add(calls.submit(context.run, _serve_call, executor, frame))
+        if executor.rank > 0:  # a follower answers its GPU 0, one command at a time
+            reply = _reply(executor, frame)
+            if reply is None:
+                return _shut(executor, channel)
+            _send_reply(channel, reply)
             continue
-        wait(running)
-        running.clear()
-        reply = _reply(executor, frame)
-        if reply is None:  # shutdown
-            if executor.group is not None:
-                executor.group.close()
-            channel.send({"reply": name, "ok": True})
-            return int(Exit.ok)
+        ticket = order.ticket(alone=name not in _CALL_COMMANDS)
+        if name == "shutdown":
+            with order.turn(ticket):
+                return _shut(executor, channel)
+        if name in _CALL_COMMANDS or not order.first(ticket):
+            pool.submit(contextvars.Context().run, _serve, executor, frame, order.turn(ticket))
+            continue
+        with order.turn(ticket):
+            reply = _reply(executor, frame)
+        assert reply is not None
         _send_reply(channel, reply)
 
 
-def _serve_call(executor: Executor, frame: Frame) -> None:
-    request_id = str(frame.get("request_id", ""))
-    _CALL.set(request_id)
-    reply = _reply(executor, frame)
-    assert reply is not None
-    if frame["cmd"] == "invoke":
-        executor.mux.forget(request_id)
-    _send_reply(executor.channel, {**reply, "request_id": request_id})
+def _shut(executor: Executor, channel: Channel) -> int:
+    if executor.group is not None:
+        executor.group.close()
+    channel.send({"reply": "shutdown", "ok": True})
+    return int(Exit.ok)
+
+
+def _serve(executor: Executor, frame: Frame, turn: contextlib.AbstractContextManager[None]) -> None:
+    """One command on a pool worker, in its turn. A BaseException, or a reply the seam would
+    not take, ends the process, as either did when commands ran on the main thread."""
+    try:
+        with turn:
+            call = str(frame.get("request_id", "")) if frame.get("cmd") in _CALL_COMMANDS else ""
+            _CALL.set(call)
+            reply = _reply(executor, frame)
+            assert reply is not None
+            if frame.get("cmd") == "invoke":
+                executor.mux.forget(call)
+            _send_reply(executor.channel, {**reply, "request_id": call} if call else reply)
+    except BaseException as exc:
+        traceback.print_exc()
+        sys.stderr.flush()
+        os._exit(exc.code if isinstance(exc, SystemExit) and isinstance(exc.code, int) else 1)
 
 
 def _reply(executor: Executor, frame: Frame) -> Frame | None:

@@ -434,7 +434,7 @@ class Engine:
         self.entries: OrderedDict[str, Entry] = OrderedDict()
         self.held = 0
         self.stats: dict[str, MethodStats] = {}
-        #: calls outside every attempt
+        #: calls outside every attempt's context, observed with the next attempt to close
         self.calls: list[Call] = []
         self.disputed: set[tuple[str, str]] = set()
         self._attempt: contextvars.ContextVar[_Attempt | None] = contextvars.ContextVar(
@@ -468,7 +468,9 @@ class Engine:
         """The attempt ends: its calls and its methods' running totals become observations."""
         attempt = self._attempt.get()
         self._attempt.set(None)
-        calls = attempt.calls if attempt is not None else []
+        with self._lock:
+            calls, self.calls = self.calls, []
+        calls += attempt.calls if attempt is not None else []
         for call in calls:
             sink("metric", "memo.call", round(call.ms, 3), **dataclasses.asdict(call))
         for stage in sorted({call.stage for call in calls}):
@@ -578,7 +580,8 @@ class Engine:
 
     def record(self, call: Call) -> None:
         attempt = self._attempt.get()
-        (attempt.calls if attempt is not None else self.calls).append(call)
+        with self._lock:
+            (attempt.calls if attempt is not None else self.calls).append(call)
 
 
 ENGINE = Engine()

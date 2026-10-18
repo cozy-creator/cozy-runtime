@@ -141,6 +141,11 @@ class Fetches:
         self._wanted: set[str] = set()
 
     @property
+    def open(self) -> bool:
+        """Whether a channel serves the calls in flight."""
+        return self._current() is not None
+
+    @property
     def groups(self) -> list[Group]:
         """The plan on the channel, in rank order."""
         return [group for plan in list(self._plans.values()) for group in plan]

@@ -1,31 +1,35 @@
 """Calls side by side in one real executor process (cr-202 U3), CUDA hidden.
 
-Three calls meet in one decode-phase scope at once and take their compute stages one at a
-time; their requests are answered out of order and each reply, frame and result stays its
-own call's. A cancel ends its own call only, whenever it arrives.
+Three calls are in flight at once and take their component scopes one call at a time; their
+requests, made from a helper thread, are answered out of order and each reply, frame and result
+stays its own call's. A cancel ends its own call only, whenever it arrives, a process-wide
+command waits for the calls before it without stopping the seam, and a handler's SystemExit
+ends the process.
 """
 
 from __future__ import annotations
 
+import contextvars
 import json
 import subprocess
 import sys
 import threading
-import time
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from cozy_runtime.author import Model, uses_components
-from cozy_runtime.author._model import STAGES
+from cozy_runtime.author._context import CURRENT, Context
 from cozy_runtime.internal import package_interface
 from cozy_runtime.internal.discovery import discover_installed
 from cozy_runtime.internal.seam import RESULT_DOCUMENT, Channel
 from test_executor_fork import _accept, _environment, _listener
 
 APP = """
+import sys
 import threading
 import time
 
@@ -36,27 +40,28 @@ from cozy_runtime.author._services import ImageFrame
 app = App()
 TOGETHER = threading.Barrier(3, timeout=60)
 LOCK = threading.Lock()
-COMPUTING = [0, 0]  # now, most at once
+SCOPED = [0, 0]  # calls in a component scope now, most at once
+
+
+def inside() -> None:
+    with LOCK:
+        SCOPED[0] += 1
+        SCOPED[1] = max(SCOPED)
+    time.sleep(0.1)
+    with LOCK:
+        SCOPED[0] -= 1
 
 
 class Decoder(Model[object], phase="decode"):
     @uses_components("lm")
-    def decode(self, out: Outputs) -> ImageAsset:
-        TOGETHER.wait()  # every call is inside this one scope at once
-        image = out.save_image(ImageFrame(1, 1, bytes(3)))
-        out.publish("image", image)
-        return image
+    def decode(self) -> None:
+        inside()
 
 
 class Denoiser(Model[object]):
     @uses_components("dit")
     def denoise(self) -> None:
-        with LOCK:
-            COMPUTING[0] += 1
-            COMPUTING[1] = max(COMPUTING)
-        time.sleep(0.2)
-        with LOCK:
-            COMPUTING[0] -= 1
+        inside()
 
 
 DECODER, DENOISER = Decoder.for_test(), Denoiser.for_test()
@@ -69,22 +74,28 @@ class Request(msgspec.Struct):
 
 class Result(msgspec.Struct):
     n: int
-    computing: int
+    scoped: int
     image: ImageAsset
 
 
 @app.entrypoint(accelerator=False)
 def generate(ctx: Context, payload: Request, out: Outputs, tel: Telemetry) -> Result:
     tel.progress(0.5, stage=f"call-{payload.n}")
-    if payload.mode == "hold":
-        while True:
-            time.sleep(0.01)
-            tel.progress(0.5, stage=f"call-{payload.n}")
+    while payload.mode == "hold":
+        time.sleep(0.01)
+        tel.progress(0.5, stage=f"call-{payload.n}")
+    if payload.mode == "exit":
+        sys.exit(3)
+    image = out.save_image(ImageFrame(1, 1, bytes(3)))
     if payload.mode == "plain":
-        return Result(payload.n, 0, out.save_image(ImageFrame(1, 1, bytes(3))))
-    image = DECODER.decode(out)
+        return Result(payload.n, 0, image)
+    TOGETHER.wait()  # every call is in flight at once
+    helper = threading.Thread(target=out.publish, args=("image", image))
+    helper.start()
+    helper.join()
+    DECODER.decode()
     DENOISER.denoise()
-    return Result(payload.n, COMPUTING[1], image)
+    return Result(payload.n, SCOPED[1], image)
 """
 
 
@@ -119,8 +130,8 @@ class Peer:
             assert self.changed.wait_for(found, seconds), self.frames[-5:]
             return found()
 
-    def reply(self, cmd: str, request_id: str = "") -> dict[str, Any]:
-        def found() -> dict[str, Any] | None:
+    def replied(self, cmd: str, request_id: str = "") -> dict[str, Any] | None:
+        with self.changed:
             return next(
                 (
                     f
@@ -130,7 +141,8 @@ class Peer:
                 None,
             )
 
-        return dict(self.until(found))
+    def reply(self, cmd: str, request_id: str = "") -> dict[str, Any]:
+        return dict(self.until(lambda: self.replied(cmd, request_id)))
 
     def call(self, frame: dict[str, Any]) -> dict[str, Any]:
         self.channel.send(frame)
@@ -147,8 +159,34 @@ class Peer:
             ]
 
 
+@dataclass
+class Running:
+    peer: Peer
+    root: Path
+    process: subprocess.Popen[bytes]
+
+    def prepare(self, request_id: str, n: int, mode: str) -> None:
+        (self.root / request_id).mkdir()
+        payload = {"n": n, "mode": mode}
+        frame = {"cmd": "prepare_request", "request_id": request_id, **_CALL, "payload": payload}
+        self.peer.channel.send(frame)
+        assert self.peer.reply("prepare_request", request_id)["ok"]
+
+    def invoke(self, request_id: str) -> None:
+        spool = str(self.root / request_id)
+        self.peer.channel.send({"cmd": "invoke", "request_id": request_id, **_CALL, "spool": spool})
+
+    def outcome(self, request_id: str) -> dict[str, Any]:
+        reply = self.peer.reply("invoke", request_id)
+        assert reply["ok"] and not reply["poisoned"], reply
+        return dict(reply["outcome"])
+
+
+_CALL = {"entrypoint": "generate", "deadline_s": 120}
+
+
 @pytest.fixture
-def executor(tmp_path: Path) -> Iterator[tuple[Peer, Path]]:
+def executor(tmp_path: Path) -> Iterator[Running]:
     (tmp_path / "callsapp.py").write_text(APP)
     sys.path.insert(0, str(tmp_path))
     try:
@@ -179,132 +217,113 @@ def executor(tmp_path: Path) -> Iterator[tuple[Peer, Path]]:
         load = {"cmd": "load", "construction": "c", "devices": "", "binding": binding}
         assert peer.call(load)["ok"]
         assert peer.call({"cmd": "activate", "construction": "c"})["ok"]
-        yield peer, root
+        yield Running(peer, root, process)
     finally:
         process.kill()
         process.wait()
 
 
-def _prepare(peer: Peer, root: Path, request_id: str, n: int, mode: str) -> None:
-    (root / request_id).mkdir()
-    payload = {"n": n, "mode": mode}
-    peer.channel.send(
-        {"cmd": "prepare_request", "request_id": request_id, **_CALL, "payload": payload}
-    )
-
-
-def _invoke(peer: Peer, root: Path, request_id: str) -> None:
-    spool = str(root / request_id)
-    peer.channel.send({"cmd": "invoke", "request_id": request_id, **_CALL, "spool": spool})
-
-
-_CALL = {"entrypoint": "generate", "deadline_s": 120}
-
-
-def _outcome(peer: Peer, request_id: str) -> dict[str, Any]:
-    reply = peer.reply("invoke", request_id)
-    assert reply["ok"] and not reply["poisoned"], reply
-    return dict(reply["outcome"])
-
-
-def test_calls_share_a_decode_stage_and_take_compute_stages_one_at_a_time(
-    executor: tuple[Peer, Path],
+def test_calls_run_side_by_side_and_take_component_scopes_one_call_at_a_time(
+    executor: Running,
 ) -> None:
-    peer, root = executor
+    peer = executor.peer
     calls = {"a": 1, "b": 2, "c": 3}
     for request_id, n in calls.items():
-        _prepare(peer, root, request_id, n, "share")
+        executor.prepare(request_id, n, "share")
     for request_id in calls:
-        assert peer.reply("prepare_request", request_id)["ok"]
-    for request_id in calls:
-        _invoke(peer, root, request_id)
+        executor.invoke(request_id)
     for request_id, n in calls.items():
-        assert _outcome(peer, request_id)["terminal"] == "succeeded"
-        result = json.loads((root / request_id / RESULT_DOCUMENT).read_bytes())
-        # The three met in the decode stage (else the barrier breaks) and denoised alone.
-        assert (result["n"], result["computing"]) == (n, 1), result
+        assert executor.outcome(request_id)["terminal"] == "succeeded"
+        result = json.loads((executor.root / request_id / RESULT_DOCUMENT).read_bytes())
+        # The three were in flight at once (else the barrier breaks); one call was in a scope.
+        assert (result["n"], result["scoped"]) == (n, 1), result
         assert [f["stage"] for f in peer.progress(request_id)] == [f"call-{n}"]
-    # Each publish named its call, and its answer, sent last first, reached it.
+        # Its own activity, measured whole: no other call's worker reads as its thread.
+        activity = peer.progress(request_id, "execution_activity")[-1]
+        assert activity["finished"] and activity["known"], activity
+    # Each publish, made on a helper thread, named its call; its answer, sent last first,
+    # reached it.
     assert sorted(peer.answered) == sorted(calls) and len(peer.asked) == 3
     assert peer.answered == [request["request_id"] for request in reversed(peer.asked)]
 
 
-def test_a_cancel_ends_its_own_call_whenever_it_arrives(executor: tuple[Peer, Path]) -> None:
-    peer, root = executor
+def test_a_cancel_ends_its_own_call_whenever_it_arrives(executor: Running) -> None:
+    peer, root = executor.peer, executor.root
     peer.channel.send({"cmd": "cancel", "request_id": "early"})  # before the call exists
-    _prepare(peer, root, "early", 1, "plain")
-    assert peer.reply("prepare_request", "early")["ok"]
-    _invoke(peer, root, "early")
-    assert _outcome(peer, "early")["terminal"] == "canceled"
+    executor.prepare("early", 1, "plain")
+    executor.invoke("early")
+    assert executor.outcome("early")["terminal"] == "canceled"
 
-    _prepare(peer, root, "held", 2, "hold")
-    _prepare(peer, root, "beside", 3, "plain")
-    assert peer.reply("prepare_request", "held")["ok"]
-    assert peer.reply("prepare_request", "beside")["ok"]
-    _invoke(peer, root, "held")
+    executor.prepare("held", 2, "hold")
+    executor.prepare("beside", 3, "plain")
+    executor.invoke("held")
     peer.until(lambda: peer.progress("held"))
-    _invoke(peer, root, "beside")
-    assert _outcome(peer, "beside")["terminal"] == "succeeded"  # while `held` runs
-    # Measured whole: the worker `held` runs on is the executor's, not a thread of `beside`.
-    activity = peer.progress("beside", "execution_activity")[-1]
-    assert activity["finished"] and activity["known"], activity
-    assert not any(f.get("reply") == "invoke" and f["request_id"] == "held" for f in peer.frames)
+    executor.invoke("beside")
+    assert executor.outcome("beside")["terminal"] == "succeeded"  # while `held` runs
+    # A process-wide command waits for the call before it, and the seam keeps being read.
+    peer.channel.send({"cmd": "probe"})
     peer.channel.send({"cmd": "cancel", "request_id": "held"})
-    assert _outcome(peer, "held")["terminal"] == "canceled"
+    assert executor.outcome("held")["terminal"] == "canceled"
+    assert peer.reply("probe")["ok"]
     assert not any(f.get("reply") == "cancel" for f in peer.frames)
     # TensorD 0.10 marks a cancel by renaming `executor.cancel` into the root, not a command.
-    _prepare(peer, root, "filed", 4, "hold")
-    assert peer.reply("prepare_request", "filed")["ok"]
-    _invoke(peer, root, "filed")
+    executor.prepare("filed", 4, "hold")
+    executor.invoke("filed")
     peer.until(lambda: peer.progress("filed"))
     (root / "executor.cancel.pending").write_text("filed")
     (root / "executor.cancel.pending").rename(root / "executor.cancel")
-    assert _outcome(peer, "filed")["terminal"] == "canceled"
-    # A process-wide command is served once no call is in flight.
-    assert peer.call({"cmd": "probe"})["ok"]
+    assert executor.outcome("filed")["terminal"] == "canceled"
+
+
+def test_a_handlers_system_exit_ends_the_process(executor: Running) -> None:
+    executor.prepare("gone", 1, "exit")
+    executor.invoke("gone")
+    assert executor.process.wait(60) == 3
+    assert executor.peer.replied("invoke", "gone") is None
 
 
 class Encoder(Model[object]):
     @uses_components("dit")
     def encode(self, entered: threading.Event, leave: threading.Event) -> None:
         entered.set()
-        leave.wait(30)
+        assert leave.wait(30)
 
 
 class Decoder(Model[object], phase="decode"):
     @uses_components("lm")
     def decode(self, entered: threading.Event, leave: threading.Event) -> None:
         entered.set()
-        leave.wait(30)
+        assert leave.wait(30)
 
 
-def _thread(call: Callable[[threading.Event, threading.Event], None]) -> tuple[Any, ...]:
+def _call(name: str) -> contextvars.Context:
+    context = contextvars.Context()
+    context.run(CURRENT.set, Context(name, float("inf")))
+    return context
+
+
+def _in(context: contextvars.Context, scope: Callable[..., None]) -> tuple[Any, ...]:
     entered, leave = threading.Event(), threading.Event()
-    thread = threading.Thread(target=call, args=(entered, leave), daemon=True)
+    thread = threading.Thread(target=context.copy().run, args=(scope, entered, leave), daemon=True)
     thread.start()
     return thread, entered, leave
 
 
-def test_a_waiting_compute_stage_takes_its_turn_before_later_decode_joins() -> None:
-    decoder, encoder = Decoder.for_test(), Encoder.for_test()
-    first, first_in, first_out = _thread(decoder.decode)
-    assert first_in.wait(10)
-    joined, joined_in, joined_out = _thread(decoder.decode)
-    assert joined_in.wait(10)  # shared: the second decode joins the open stage
-    compute, compute_in, compute_out = _thread(encoder.encode)
-    while not STAGES._queue:
-        time.sleep(0.01)
-    late, late_in, late_out = _thread(decoder.decode)
-    time.sleep(0.2)
-    assert not compute_in.is_set() and not late_in.is_set()  # it queues behind the compute
-    first_out.set()
-    joined_out.set()
-    assert compute_in.wait(10)
-    assert not late_in.wait(0.2)
-    compute_out.set()
-    assert late_in.wait(10)
-    late_out.set()
-    for thread in (first, joined, compute, late):
+def test_a_call_waits_for_another_calls_scope_and_its_own_threads_never_do() -> None:
+    encoder, decoder, other = Encoder.for_test(), Decoder.for_test(), Decoder.for_test()
+    first, second = _call("first"), _call("second")
+    holder, held, release = _in(first, encoder.encode)
+    assert held.wait(10)
+    waiter, waited, unblock = _in(second, decoder.decode)
+    assert not waited.wait(0.3)  # another call's scope is open
+    helper, helped, helper_out = _in(first, decoder.decode)
+    assert helped.wait(10)  # the holding call's own thread: today's nesting
+    outside, out_in, out_out = _in(contextvars.Context(), other.decode)
+    assert out_in.wait(10)  # a thread outside every call never waits
+    for event in (helper_out, out_out, release):
+        event.set()
+    assert waited.wait(10)
+    unblock.set()
+    for thread in (holder, waiter, helper, outside):
         thread.join(10)
-    assert decoder._cozy_active is None and encoder._cozy_active is None
-    assert STAGES._open is None and not STAGES._holders
+    assert encoder._cozy_active is None and decoder._cozy_active is None
