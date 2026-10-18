@@ -8,6 +8,7 @@ at 1605 MHz scaled to the clean 592.9 ms step, in execution order.
 from __future__ import annotations
 
 import csv
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +58,15 @@ def test_unmeasured_costs_place_a_spread_set_two_slots_wide() -> None:
     assert placed.resident and placed.streamed
     assert min(placed.streamed) < len(BLOCKS) // 2 < max(placed.streamed)
     assert policy.residence(UNET, UNET.total).streamed == ()
+
+
+def test_a_repeating_stage_keeps_its_resident_set_when_its_room_moves() -> None:
+    """A stage nested in the DiT's (H3's turbo LoRA) or a request's activations move its room by
+    a block or two: only those blocks move, never the spread around them."""
+    costs = policy.Costs(compute=COMPUTE, link_bps=LINK)
+    rooms = [BUDGET - k * (64 << 20) for k in range(4)]
+    streamed = [set(policy.residence(UNET, room, costs=costs).streamed) for room in rooms]
+    assert all(wider < narrower for wider, narrower in pairwise(streamed))
 
 
 def test_run_once_is_whole_or_streamed_and_below_one_slot_refuses_with_numbers() -> None:

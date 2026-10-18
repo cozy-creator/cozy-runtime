@@ -7,6 +7,7 @@ same rules. Activations come first: the plane gets what the driver has free afte
 
 from __future__ import annotations
 
+import bisect
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from itertools import pairwise
@@ -256,25 +257,33 @@ def _fit(
 
 
 def _spread(compute: Sequence[float]) -> Callable[[int], list[int]]:
-    """`count` positions spaced evenly by cumulative compute."""
+    """`count` positions spread by cumulative compute, the first `count` of one order whose
+    every prefix is spread (halves, then quarters, then eighths): a placement one block wider
+    or narrower moves only that block, so a repeating stage keeps its resident set when its
+    room moves a little (another stage nested in it, a request's activations)."""
     total, ends, running = sum(compute), [], 0.0
     for seconds in compute:
         running += seconds
         ends.append(running - seconds / 2)
+    order: list[int] = []
+    taken = [False] * len(ends)
 
-    def pick(count: int) -> list[int]:
-        chosen: list[int] = []
-        taken: set[int] = set()
-        for j in range(count):
-            target = (j + 0.5) * total / count
-            position = min(
-                (p for p in range(len(ends)) if p not in taken), key=lambda p: abs(ends[p] - target)
-            )
-            chosen.append(position)
-            taken.add(position)
-        return chosen
+    def free(p: int) -> bool:
+        return 0 <= p < len(ends) and not taken[p]
 
-    return pick
+    for k in range(1, len(ends) + 1):
+        place, fraction, bits = 0.0, 0.5, k  # base-2 van der Corput: 1/2, 1/4, 3/4, 1/8, ...
+        while bits:
+            place, fraction, bits = place + fraction * (bits & 1), fraction / 2, bits >> 1
+        target = place * total
+        high = bisect.bisect_left(ends, target)  # the free position nearest it
+        low = high - 1
+        while not free(low) and not free(high):
+            low, high = low - 1, high + 1
+        nearest = min((p for p in (low, high) if free(p)), key=lambda p: abs(ends[p] - target))
+        taken[nearest] = True
+        order.append(nearest)
+    return lambda count: order[:count]
 
 
 def _tail(count_all: int) -> Callable[[int], list[int]]:

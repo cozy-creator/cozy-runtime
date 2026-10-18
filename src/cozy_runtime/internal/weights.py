@@ -3965,22 +3965,22 @@ class WeightResidency:
         )
 
     def restore(self) -> None:
-        """After an attempt: the components its stages placed whole and then gave to activations
-        map again (keep hot), in the background, into the room the device has now, in the order
-        the stages read them. Nothing is evicted for them; the next stage waits only for what has
-        not arrived yet. A streamed component's prefix stays where its stage left it: the next
-        request would evict it again (an 8 GB card copied 16 GB more per request)."""
+        """After an attempt: the components its stages placed whole and the resident sets of
+        repeating ones (`hot`), as far as they gave bytes to activations or a later repeating
+        stage, map again (keep hot), in the background, into the room the device has now, in the
+        order the stages read them. Nothing is evicted for them; the next stage waits only for
+        what has not arrived yet, and no stage that runs once evicts a hot set again."""
         weights = self.weights
         if weights.host_only or weights.grouped or weights.open or self.parked is not None:
             return
         weights.drain()
         weights._apply(max(weights.applied, weights.stage_budget(MAPPING)))
         weights.plan_inputs.pop(MAPPING, None)
-        whole = set(self.whole())
+        kept = {*self.whole(), *(name for name, c in self.components.items() if c.hot)}
         gone = [
             (component, index)
             for name in stage_components(self.stages, self.scopes)
-            if name in whole and (component := self.components.get(name)) is not None
+            if name in kept and (component := self.components.get(name)) is not None
             for index in component.resident
             if component.regions[index].bound is None
         ]
