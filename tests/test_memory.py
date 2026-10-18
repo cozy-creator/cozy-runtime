@@ -277,10 +277,10 @@ def test_a_capacity_failure_outside_the_handler_keeps_the_process(
     host: tuple[Executor, dict[str, Any]],
 ) -> None:
     executor, _ = host
-    reply = executor.unsettled(executor, torch.OutOfMemoryError("CUDA out of memory."))
+    reply = executor.unsettled(executor, torch.OutOfMemoryError("CUDA out of memory."), "oom")
     assert reply["outcome"]["code"] == DEVICE_OOM and not reply["poisoned"]
     assert reply["quiescent"] and not executor.poisoned
-    fault = executor.unsettled(executor, RuntimeError("an illegal memory access"))
+    fault = executor.unsettled(executor, RuntimeError("an illegal memory access"), "fault")
     assert fault["poisoned"] and not fault["quiescent"] and executor.poisoned
 
 
