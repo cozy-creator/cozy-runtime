@@ -411,9 +411,6 @@ class _Scopes:
                 self._holder = None
                 self._changed.notify_all()
 
-    def holds(self, call: object) -> bool:
-        return call is not None and self._holder is call
-
     @contextmanager
     def held(self, call: object) -> Iterator[None]:
         """`call`'s turn: while it lasts, no other call is in a scope."""

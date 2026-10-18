@@ -3282,7 +3282,8 @@ class Executor:
     def _grant(self, target: Executor, command: Invoke, *, first: bool) -> Frame | None:
         """Every attempt's grant and the kernels that became ready, applied while no call is in
         a scope; the first attempt in also starts the plane afresh."""
-        with SCOPES.held(object()):
+        turn = object()
+        with SCOPES.held(turn):
             # The plane's budget derives from the driver at every attempt (TensorD sends none),
             # so a cut to 0 never outlives the attempt that follows it. Only a grant that
             # changed reaches the group's GPUs.
@@ -3315,7 +3316,7 @@ class Executor:
                 self.weights.seed_activations(command.activation_bytes)
                 if not isinstance(command.device_weights, UnsetType):
                     self._device_weights(command.device_weights)
-            target._upgrade_attention()
+            target._upgrade_attention(turn)
             target._install_ready_kernels()
             if first and target.residency is not None:
                 target.residency.open_attempt()
@@ -3497,8 +3498,7 @@ class Executor:
                 return  # an override holds its kernel for every step
             if not segments:
                 segments.append(_segment("", 0, served_attention, started_us))
-            # An upgrade swaps sites every call reads: only while this call alone is in a scope.
-            if not SCOPES.holds(CURRENT.get()) or not self._upgrade_attention():
+            if not self._upgrade_attention(CURRENT.get()):
                 return
             later.append(self._attention_selection(attention.observed(self._attention_roots())))
             row = _segment(frame.stage, steps.get(frame.stage, 0), later[-1])
@@ -3911,41 +3911,50 @@ class Executor:
                 except Exception as exc:  # an upgrade is never worth a failed run
                     print(f"[kernels] deferred install refused: {exc}"[:600], file=sys.stderr)
 
-    def _upgrade_attention(self) -> bool:
+    def _upgrade_attention(self, call: object = None) -> bool:
         """A RUN WITHOUT AN OVERRIDE NEVER WAITS FOR A COMPILE: at each step or stage boundary
         of one, and between requests, a kernel the selection passed over while it compiled is
         ready, so the construction selects again and serves it from the next step on (a run
         may mix kernels, owner ruling 2026-10-09); a group's followers take rank 0's kernels
         once no call holds them. Where a selection or a follower cannot, the prepared one
-        stays and is not tried again. Whether any construction selected again."""
-        upgraded = False
-        for executor in self.model_executors or [self]:
-            applied, again, device = executor.attention, executor._reselect, executor.device_facts
-            if applied is None or again is None or device is None or not applied.waiting:
-                continue
-            if not attention.compiled(applied.waiting, device):
-                continue
-            try:
-                fresh = again()
-            except Exception as exc:  # an upgrade is never worth a failed run
-                print(
-                    f"[attention] selecting again refused: {exc}"[:600], file=sys.stderr, flush=True
-                )
-                executor.attention_defaults.restore()
-                executor.attention = replace(applied, waiting=())
-                continue
-            if executor.group is not None:
-                with executor.group.hold(range(1, executor.group.degree)):
-                    if executor._agree_attention(fresh, poison=False):
-                        executor.attention_defaults.restore()
-                        executor._agree_attention(applied, poison=False)
-                        executor.attention = replace(applied, waiting=())
-                        continue
-            assert executor.backend is not None
-            executor.attention = fresh
-            executor.attention_defaults = attention.snapshot(dict(executor.backend.roots))
-            upgraded = True
-        return upgraded
+        stays and is not tried again. Sites every call reads change only while no other call is
+        in a scope (`SCOPES`, entered as `call`). Whether any construction selected again."""
+        due = [
+            executor
+            for executor in self.model_executors or [self]
+            if executor.attention is not None
+            and executor._reselect is not None
+            and executor.device_facts is not None
+            and executor.attention.waiting
+            and attention.compiled(executor.attention.waiting, executor.device_facts)
+        ]
+        if not due:
+            return False
+        with SCOPES.held(object() if call is None else call):
+            return any([self._reselect_attention(executor) for executor in due])
+
+    @staticmethod
+    def _reselect_attention(executor: Executor) -> bool:
+        applied, again = executor.attention, executor._reselect
+        assert applied is not None and again is not None
+        try:
+            fresh = again()
+        except Exception as exc:  # an upgrade is never worth a failed run
+            print(f"[attention] selecting again refused: {exc}"[:600], file=sys.stderr, flush=True)
+            executor.attention_defaults.restore()
+            executor.attention = replace(applied, waiting=())
+            return False
+        if executor.group is not None:
+            with executor.group.hold(range(1, executor.group.degree)):
+                if executor._agree_attention(fresh, poison=False):
+                    executor.attention_defaults.restore()
+                    executor._agree_attention(applied, poison=False)
+                    executor.attention = replace(applied, waiting=())
+                    return False
+        assert executor.backend is not None
+        executor.attention = fresh
+        executor.attention_defaults = attention.snapshot(dict(executor.backend.roots))
+        return True
 
     def _agree_attention(
         self, applied: attention.Applied, *, poison: bool = True
