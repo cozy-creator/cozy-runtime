@@ -73,6 +73,12 @@ _PLAIN = (type(None), bool, int, float, str)
 _SAID: set[str] = set()
 
 
+def native(torch: Any, *tensors: Any) -> None:
+    """Storages graphs read by address (a recording's static inputs, an LM engine's buffers):
+    memory never moves them off the device (`spill.native`)."""
+    spill.native(torch, *tensors)
+
+
 def say(key: str, line: str) -> None:
     """`line` on stderr, once per process for `key`."""
     if key not in _SAID:
@@ -333,7 +339,7 @@ def _record(
         recorder.pool, recorder.stream = torch.cuda.graph_pool_handle(), torch.cuda.Stream()
     reserved = torch.cuda.memory_reserved()
     inputs = [leaf.clone() if isinstance(leaf, torch.Tensor) else None for leaf in leaves]
-    spill.native(torch, inputs)  # its replays read them by address: they never leave
+    native(torch, inputs)
     static = [s if s is not None else v for s, v in zip(inputs, leaves, strict=True)]
     cargs, ckwargs = torch.utils._pytree.tree_unflatten(static, spec)
     outputs: list[Any] = []
@@ -489,6 +495,7 @@ __all__ = [
     "TRIES",
     "capture",
     "install",
+    "native",
     "release",
     "say",
 ]
