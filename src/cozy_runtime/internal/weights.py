@@ -24,6 +24,7 @@ import functools
 import mmap
 import os
 import time
+import traceback
 import weakref
 import zlib
 from collections import Counter, deque
@@ -48,6 +49,7 @@ from cozy_runtime.internal import (
     canonical,
     lora_bake,
     plane,
+    pointer_diag,
     proctree,
     spill,
     weight_policy,
@@ -617,6 +619,7 @@ class Weights:
             self.drain()  # something reads it after all: what did leave is unbound
             return False
         for region in regions:
+            pointer_diag.note("dropped", str(component.name), region.index, region.bound)
             unbind(region)
             _unbaked(region)
         if own:
@@ -1147,6 +1150,7 @@ class Weights:
             component = self.components.get(str(name))
             if component is not None and 0 <= int(index) < len(component.regions):
                 region = component.regions[int(index)]
+                pointer_diag.note("evicted", str(name), int(index), region.bound)
                 unbind(region)
                 _unbaked(region)
 
@@ -1496,7 +1500,14 @@ class Weights:
             # close (refine, unload) waits for the device, then closes
             self.synchronize()
             self.plane.set_vram_budget(self.index, self.applied)
-            component.ws.close()
+            try:
+                component.ws.close()
+            except plane.error("LeaseViolation") as exc:
+                for row in pointer_diag.leases(component):
+                    exc.add_note(row)
+                for row in traceback.format_stack(limit=16)[:-1]:
+                    exc.add_note("DIAG close at " + " ".join(row.split())[:300])
+                raise
         _end_leases(component)  # after the close released every shared region
 
     # -- facts
@@ -2173,6 +2184,7 @@ def close_cursor(component: Component) -> None:
     ring = range(cursor.ring_ptr, cursor.ring_ptr + cursor.ring_nbytes)
     for region in component.regions:
         if region.bound is not None and region.bound in ring:
+            pointer_diag.note("ring closed", str(component.name), region.index, region.bound)
             unbind(region)
         for address in [a for a in region.views if a in ring]:
             del region.views[address]

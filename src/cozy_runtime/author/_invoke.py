@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import hashlib
+import traceback
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass, field, is_dataclass, replace
@@ -86,6 +87,7 @@ from cozy_runtime.author._services import (
 from cozy_runtime.author._signature import Param, Surface
 from cozy_runtime.author._walker import field_values, strip, unwrap_optional, walk
 from cozy_runtime.author._weights import ReadValues, Weights
+from cozy_runtime.internal import pointer_diag  # noqa: F401  DIAGNOSTIC: watches Triton launches
 
 if TYPE_CHECKING:
     from tensorfs.derived import Derivation, DerivedTransaction, SourceCapability
@@ -397,6 +399,17 @@ def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> Invoc
     )
 
 
+def _diagnose(record: Attempt, exc: BaseException) -> None:
+    """DIAGNOSTIC: a failed attempt's frames and notes into its run log, 190 characters a row."""
+    lines = "".join(traceback.format_exception(exc)).splitlines()[-80:]
+    try:
+        for line in lines:
+            for at in range(0, max(len(line), 1), 190):
+                record.emit("log", line[at : at + 190] or "-", "error")
+    except Exception:  # noqa: BLE001, S110
+        pass
+
+
 def run_prepared(
     prepared: PreparedRequest, inv: Invocation
 ) -> tuple[InvocationResult | None, Outcome, Attempt]:
@@ -428,6 +441,8 @@ def run_prepared(
         raise
     except Exception as exc:
         record.failed_at_call = isinstance(exc, ChildCallError)
+        if not record.failed_at_call:
+            _diagnose(record, exc)
         return None, classify(exc), record
     finally:
         record.closed = True
