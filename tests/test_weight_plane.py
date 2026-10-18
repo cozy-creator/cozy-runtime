@@ -29,6 +29,7 @@ from tensorfs import Store  # noqa: E402
 from tensorfs.derived import Config as NativeConfig  # noqa: E402
 from tensorfs.derived import Derivation, Part, Target, Tensor  # noqa: E402
 
+from cozy_runtime import graphs  # noqa: E402
 from cozy_runtime.author._activity import asides  # noqa: E402
 from cozy_runtime.author._loader import census  # noqa: E402
 from cozy_runtime.author.kernels import INT8_CONVROT, rms_rope_split_half  # noqa: E402
@@ -1126,6 +1127,9 @@ def test_a_card_the_packages_tensors_fill_runs_its_stage_through_host_and_disk(
     if host == "full":
         host_room(monkeypatch, 512 << 20)
     held = fill_card(weights)
+    # what a graph reads by address (an LM engine's KV) never moves, though it is the oldest
+    graphs.native(torch, held[0])
+    at = held[0].data_ptr()
     before = list(spill.TOTALS)
     with weights.recovering():
         try:
@@ -1135,6 +1139,7 @@ def test_a_card_the_packages_tensors_fill_runs_its_stage_through_host_and_disk(
         moved = [now - then for now, then in zip(spill.TOTALS, before, strict=True)]
         assert moved[3] if host == "room" else moved[5], spill.summary(before)
         assert spill.keep(x).device.type == "cpu"
+        assert held[0].data_ptr() == at, "a native storage moved"
         close(reference, got)  # in the mode: what left the device comes back to be read
         del got, reference
         assert all(bool((t == i).all()) for i, t in enumerate(held)), "each one's own values"
