@@ -3578,7 +3578,7 @@ class Executor:
         if torch is not None:
             accel.drain(torch, self.device_kind)
         left, refused = 0, None
-        if torch is not None and outcome.terminal != "succeeded":
+        if outcome.terminal != "succeeded":
             # A group is N residencies: every GPU gives back what the attempt took on it.
             left, refused = self._followers(
                 self._plane_ranks(), Reclaim(), "reclaim", lambda: self._release(allocated_at_start)
@@ -4585,6 +4585,8 @@ class Executor:
         if self.host.weights is not None:
             self.host.weights.shed(sys.maxsize)
         gc.collect()
+        if self.torch is None:
+            return 0
         spill.release(self.torch)
         accel.release_cached(self.torch, self.device_kind)
         return accel.allocated(self.torch, self.device_kind) - idle
@@ -4592,7 +4594,7 @@ class Executor:
     def reclaim(self) -> dict[str, Any]:
         """A follower's half of rank 0's `_release`: what stays allocated recycles the group."""
         entry, self._run_entry = self._run_entry, None
-        left = self._release(entry[1]) if entry is not None and self.torch is not None else 0
+        left = self._release(entry[1]) if entry is not None else 0
         if left > weight_policy.MARGIN:
             self.poisoned = f"the failed request left {left} B on {_gpu(self.rank)}"
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}

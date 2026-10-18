@@ -12,6 +12,7 @@ from typing import Any
 
 import msgspec
 import pytest
+import torch
 
 from cozy_runtime.internal import accel, attention, attention_ulysses, executor, package_interface
 from cozy_runtime.internal.config import seal_snapshot
@@ -150,21 +151,27 @@ def test_handler_refusals_and_cancels_keep_the_generation_ready(
     assert failed["outcome"]["terminal"] == "failed" and failed["poisoned"]
 
 
-def test_a_failed_request_gives_back_what_it_held(
+def test_a_failed_request_gives_back_what_it_held(host: tuple[Executor, dict[str, Any]]) -> None:
+    """Run 11340's executor kept 7.27 GiB after its request failed, and the next request
+    (11405) found the GPU full. A failure's frames let its tensors go."""
+    executor, load = host
+    assert executor.load(msgspec.convert({**load, "construction": "a"}, Load))["ok"]
+    assert executor.activate(Activate(construction="a"))["ok"]
+    held = _serve(executor, "held", "hold")
+    assert held["outcome"]["code"] == "segment_failed" and not held["poisoned"]
+    assert sys.modules[MODULE].HELD[-1]() is None
+
+
+@pytest.mark.skipif(not torch.backends.cuda.is_built(), reason="the tail reads CUDA's streams")
+def test_bytes_a_failed_request_leaves_allocated_recycle_the_executor(
     host: tuple[Executor, dict[str, Any]], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Run 11340's executor kept 7.27 GiB after its request failed, and the next request
-    (11405) found the GPU full. A failure's frames let its tensors go; bytes that stay
-    allocated recycle the executor."""
     executor, load = host
     assert executor.load(msgspec.convert({**load, "construction": "a"}, Load))["ok"]
     assert executor.activate(Activate(construction="a"))["ok"]
     fixture = sys.modules[MODULE]
-    executor.constructions["a"].torch = fixture.torch  # as a model's generation imports it
+    executor.constructions["a"].torch = torch  # as a model's generation imports it
     monkeypatch.setattr(accel, "allocated", lambda *_: len(fixture.LEAKED) << 30)
-    held = _serve(executor, "held", "hold")
-    assert held["outcome"]["code"] == "segment_failed" and fixture.HELD[-1]() is None
-    assert not held["poisoned"]
     leaked = _serve(executor, "leaked", "leak")
     assert leaked["poisoned"] == f"the failed request left {1 << 30} B on the GPU"
 
