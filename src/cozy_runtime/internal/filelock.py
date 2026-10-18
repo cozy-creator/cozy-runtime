@@ -6,10 +6,14 @@ caller will not wait, as `fcntl.flock` does."""
 from __future__ import annotations
 
 import sys
-from typing import IO, Any
+from typing import Protocol
 
 
-def _fd(file: int | IO[Any]) -> int:
+class Fileno(Protocol):
+    def fileno(self) -> int: ...
+
+
+def _fd(file: int | Fileno) -> int:
     return file if isinstance(file, int) else file.fileno()
 
 
@@ -51,7 +55,7 @@ if sys.platform == "win32":
         # The byte at 2**63 - 2, which no file reaches.
         return _Overlapped(0, 0, 0xFFFFFFFE, 0x7FFFFFFF, None)
 
-    def lock(file: int | IO[Any], *, shared: bool = False, wait: bool = True) -> None:
+    def lock(file: int | Fileno, *, shared: bool = False, wait: bool = True) -> None:
         """Take the lock, waiting for its holder unless `wait` is False."""
         flags = (0 if shared else _EXCLUSIVE) | (0 if wait else _NO_WAIT)
         handle = msvcrt.get_osfhandle(_fd(file))
@@ -61,7 +65,7 @@ if sys.platform == "win32":
                 raise BlockingIOError("the lock is held")
             raise ctypes.WinError(error)
 
-    def unlock(file: int | IO[Any]) -> None:
+    def unlock(file: int | Fileno) -> None:
         handle = msvcrt.get_osfhandle(_fd(file))
         if not _kernel32.UnlockFileEx(handle, 0, 1, 0, ctypes.byref(_far())):
             raise ctypes.WinError(ctypes.get_last_error())
@@ -69,10 +73,10 @@ if sys.platform == "win32":
 else:
     import fcntl
 
-    def lock(file: int | IO[Any], *, shared: bool = False, wait: bool = True) -> None:
+    def lock(file: int | Fileno, *, shared: bool = False, wait: bool = True) -> None:
         """Take the lock, waiting for its holder unless `wait` is False."""
         mode = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
         fcntl.flock(_fd(file), mode | (0 if wait else fcntl.LOCK_NB))
 
-    def unlock(file: int | IO[Any]) -> None:
+    def unlock(file: int | Fileno) -> None:
         fcntl.flock(_fd(file), fcntl.LOCK_UN)
