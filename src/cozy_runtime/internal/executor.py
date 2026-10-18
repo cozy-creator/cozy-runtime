@@ -4873,7 +4873,12 @@ class Executor:
         if capacity:
             with contextlib.suppress(Exception):  # a sticky fault raises here: then it is one
                 facts = self._plane_facts()
-                quiet = self._quiescent() if self.torch is not None else True
+                # Calls still in flight own the work the streams still hold.
+                quiet = (
+                    self._quiescent()
+                    if self.torch is not None and not self.in_flight.count
+                    else True
+                )
         if not quiet:
             self.poisoned = target.poisoned = (
                 self.poisoned or target.poisoned or f"{first.code}{where}: {first.message}"[:300]

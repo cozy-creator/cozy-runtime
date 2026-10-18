@@ -252,6 +252,14 @@ def test_a_cancel_ends_its_own_call_whenever_it_arrives(executor: tuple[Peer, Pa
     peer.channel.send({"cmd": "cancel", "request_id": "held"})
     assert _outcome(peer, "held")["terminal"] == "canceled"
     assert not any(f.get("reply") == "cancel" for f in peer.frames)
+    # TensorD 0.10 marks a cancel by renaming `executor.cancel` into the root, not a command.
+    _prepare(peer, root, "filed", 4, "hold")
+    assert peer.reply("prepare_request", "filed")["ok"]
+    _invoke(peer, root, "filed")
+    peer.until(lambda: peer.progress("filed"))
+    (root / "executor.cancel.pending").write_text("filed")
+    (root / "executor.cancel.pending").rename(root / "executor.cancel")
+    assert _outcome(peer, "filed")["terminal"] == "canceled"
     # A process-wide command is served once no call is in flight.
     assert peer.call({"cmd": "probe"})["ok"]
 
