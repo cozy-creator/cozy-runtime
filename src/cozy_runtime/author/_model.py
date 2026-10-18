@@ -382,7 +382,12 @@ WARNINGS = _Warnings()
 class _Scopes:
     """Calls take component scopes one at a time, in the order they ask: a call entering a scope
     while another call holds one waits for it. Within one call, on any of its threads, scopes
-    nest as they always have; a thread outside every call (`CURRENT` unset) never waits."""
+    nest as they always have; a thread outside every call (`CURRENT` unset) never waits.
+
+    Known limit: a call's threads are those that carry its context (SDK pools, its event loop's
+    executor). A plain `threading.Thread` an author starts carries none, so it enters scopes
+    as no call, even inside another call's turn. Harmless with one call at a time; batching
+    calls in one executor (cr-202 U4) must close it before authors' plain threads matter."""
 
     def __init__(self) -> None:
         self._changed = threading.Condition()

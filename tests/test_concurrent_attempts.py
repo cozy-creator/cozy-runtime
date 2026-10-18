@@ -318,8 +318,11 @@ def test_a_call_waits_for_another_calls_scope_and_its_own_threads_never_do() -> 
     assert not waited.wait(0.3)  # another call's scope is open
     helper, helped, helper_out = _in(first, decoder.decode)
     assert helped.wait(10)  # the holding call's own thread: today's nesting
-    outside, out_in, out_out = _in(contextvars.Context(), other.decode)
-    assert out_in.wait(10)  # a thread outside every call never waits
+    # An author's plain thread carries no call (`_Scopes`' known limit): it never waits.
+    out_in, out_out = threading.Event(), threading.Event()
+    outside = threading.Thread(target=other.decode, args=(out_in, out_out), daemon=True)
+    first.copy().run(outside.start)
+    assert out_in.wait(10)
     for event in (helper_out, out_out, release):
         event.set()
     assert waited.wait(10)
