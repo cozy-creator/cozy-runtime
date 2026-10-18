@@ -527,9 +527,13 @@ class Weights:
         has the room: the driver keeps its own memory (fault buffers, page tables) from what
         is free, and with none left its library faulted (run 5422: SIGSEGV in libcuda after
         NV_ERR_NO_MEMORY, the laptop's free at 10 MB). Torch then runs out of memory at the
-        limit and the plane makes room, before the driver does. Unified memory keeps torch's
-        own limit: past the budget the system pages, which is slower, not a failure."""
-        if self.host_only or self.unified:
+        limit and the plane makes room, before the driver does. On unified memory only an
+        owner's cap limits torch: past the budget the system pages, which is slower, not a
+        failure."""
+        if self.host_only:
+            return
+        if self.unified:
+            accel.hold_pool(self.torch, self.cap)
             return
         memory = self.allocation()
         reserved = memory["reserved_bytes"]
