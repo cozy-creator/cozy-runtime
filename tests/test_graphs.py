@@ -85,6 +85,48 @@ def test_a_call_that_depends_on_hidden_state_runs_as_written() -> None:
     assert [message for message, _ in WARNINGS] == ["a CUDA graph was not used"]
 
 
+def _stepped() -> Any:
+    """HiDiffusion's patched blocks: a step counter in a plain attribute picks the path, and a
+    window shift is drawn from the CPU generator."""
+
+    base: Any = torch.nn.Module
+
+    class Stepped(base):  # type: ignore[misc]
+        def __init__(self) -> None:
+            super().__init__()
+            self.linear = torch.nn.Linear(64, 64)
+            self.timestep = 0
+
+        def forward(self, x: Any) -> Any:
+            shift = float(torch.rand(1))
+            self.timestep += 1
+            return self.linear(x) * self.timestep + shift
+
+    return Stepped()
+
+
+@pytest.mark.skipif(not CUDA, reason="CUDA graphs need a GPU")
+def test_a_first_request_equals_a_warm_one_for_a_module_with_state() -> None:
+    """The owner: measuring and recording never change model state, so a fresh executor's
+    first request equals a warm one with the same seed (run 11226 drifted two steps)."""
+    torch.manual_seed(1)
+    module = _stepped().cuda()
+    graphs.install(torch, object(), {"stepped": module})
+
+    def request() -> tuple[list[Any], int]:
+        module.timestep = 0
+        torch.manual_seed(5)
+        x = torch.ones(4, 64, device="cuda")
+        return [module(x) for _ in range(3)], module.timestep
+
+    with torch.inference_mode():
+        first, steps = request()
+        warm, again = request()
+    assert steps == again == 3
+    assert all(torch.equal(a, b) for a, b in zip(first, warm, strict=True))
+    assert not graphs._RECORDERS[module].recordings
+
+
 @pytest.mark.skipif(not CUDA, reason="CUDA graphs need a GPU")
 def test_a_capture_out_of_memory_leaves_the_calls_serving() -> None:
     module = _mlp("cuda")

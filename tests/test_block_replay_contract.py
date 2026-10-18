@@ -41,15 +41,21 @@ class StatefulBlock(torch.nn.Module):  # type: ignore[misc,name-defined]
         self.linear = torch.nn.Linear(2, 2, bias=False)
         self.linear.weight = torch.nn.Parameter(torch.eye(2), requires_grad=False)
         self.register_buffer("ticks", torch.zeros(()))
-        self.calls = 0
+        self._runs = [0]  # the test's count, private: not the block's own state
+        self.count = 0
         self.effect = effect
         self.generator = torch.Generator().manual_seed(1234)
         self.fail_next = False
 
+    @property
+    def calls(self) -> int:
+        return self._runs[0]
+
     def forward(self, value: Any) -> Any:
-        self.calls += 1
+        self._runs[0] += 1
         if self.effect == "counter":
-            extra = self.calls
+            self.count += 1
+            extra = self.count
         elif self.effect == "buffer":
             self.ticks.add_(1)
             extra = self.ticks
@@ -187,18 +193,98 @@ def test_a_block_that_writes_is_never_run_twice(monkeypatch: Any) -> None:
     assert float(module.ticks) == 2.0 and module.calls == 2 and not trace["room"]
 
 
-def test_a_python_attribute_is_the_one_state_a_replay_does_not_put_back(monkeypatch: Any) -> None:
-    """A counter kept as a plain Python attribute is not seen: the replay advances it once
-    more. The call still succeeds, which is the owner's rule."""
-    control, current = StatefulBlock("counter"), StatefulBlock("counter")
+class Counted(torch.nn.Module):  # type: ignore[misc,name-defined]
+    """HiDiffusion's patched blocks: each counts its calls in a plain attribute, which picks
+    its step's path (RAU-Net's downsampling, run 11090's hatched 4 MP SDXL)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.timestep = 0
+
+    def forward(self, value: Any) -> Any:
+        self.timestep += 1
+        return value
+
+
+class Stepped(StatefulBlock):
+    """A window shift drawn from the CPU generator, a counted module, then the op that runs
+    out of memory: after the count."""
+
+    def __init__(self) -> None:
+        super().__init__("counter")
+        self.inner = Counted()
+
+    def forward(self, value: Any) -> Any:
+        return self.linear(self.inner(value + torch.rand(1)))
+
+    def fail(self) -> None:
+        if self.__dict__.pop("failing", False):
+            raise torch.OutOfMemoryError("a library call ran out of memory after the count")
+
+
+@pytest.mark.parametrize("first", [True, False], ids=["observed run", "quiet run"])
+def test_a_block_that_counts_in_an_attribute_counts_each_call_once(
+    first: bool, monkeypatch: Any
+) -> None:
+    """An op out of memory in a block whose forward advances a plain attribute: its first run
+    learns that, so the block never runs twice; the op runs again, the count advances once per
+    call and the draws are a run's with room."""
+    control, current = Stepped(), Stepped()
     _weights, _region, trace = wrapped(current, monkeypatch)
     value = torch.tensor([[0.25, -0.5]])
+    torch.manual_seed(5)
     with torch.inference_mode():
-        control(value), current(value)
-        control(value)
-        current.fail_next = True
-        current(value)
-    assert current.calls == control.calls + 1 and len(trace["room"]) == 1
+        expected = [control(value) for _ in range(3)]
+    torch.manual_seed(5)
+    failed = FailAfterOp(torch.ops.aten.linear.default)
+    with torch.inference_mode():
+        out = [] if first else [current(value)]
+        with failed:
+            out.append(current(value))
+        out += [current(value) for _ in range(3 - len(out))]
+    assert current.inner.timestep == control.inner.timestep == 3
+    assert all(torch.equal(a, b) for a, b in zip(out, expected, strict=True))
+    assert failed.calls == 2 and len(trace["room"]) == 1 and not trace["residency"].poisoned
+
+
+def test_a_block_that_counts_in_an_attribute_runs_again_from_it(monkeypatch: Any) -> None:
+    """Out of memory outside its ops after it counted (a library call's own allocation): it
+    runs again from the attributes, generators and containers it started with, so the count
+    reads once per call and the draws are a run's with room (the owner, 10-05: replays are
+    made safe, not refused)."""
+    control, module = Stepped(), Stepped()
+    _weights, _region, trace = wrapped(module, monkeypatch)
+    value = torch.tensor([[0.25, -0.5]])
+    torch.manual_seed(5)
+    with torch.inference_mode():
+        expected = [control(value) for _ in range(2)]
+    torch.manual_seed(5)
+    with torch.inference_mode():
+        out = [module(value)]
+        module.linear.register_forward_pre_hook(lambda *_: module.fail())
+        module.failing = True
+        out.append(module(value))
+    assert module.inner.timestep == control.inner.timestep == 2
+    assert all(torch.equal(a, b) for a, b in zip(out, expected, strict=True))
+    assert len(trace["room"]) == 1 and not trace["residency"].poisoned
+
+
+class Doubled(StatefulBlock):
+    def forward(self, value: Any) -> Any:
+        return 2 * super().forward(value)
+
+
+def test_a_block_whose_class_changes_after_load_runs_its_new_forward(monkeypatch: Any) -> None:
+    """HiDiffusion patches SDXL's blocks at its first 4 MP request by swapping each module's
+    class. The block's hook reads the forward at every call, so the new one runs."""
+    module = StatefulBlock("counter")
+    _weights, _region, trace = wrapped(module, monkeypatch)
+    value = torch.tensor([[0.25, -0.5]])
+    with torch.inference_mode():
+        assert torch.equal(module(value), value + 1)
+        module.__class__ = Doubled
+        assert torch.equal(module(value), 2 * (value + 2))
+    assert trace["acquired"] == trace["released"] == 2
 
 
 def test_successful_current_block_path_preserves_module_semantics(monkeypatch: Any) -> None:
