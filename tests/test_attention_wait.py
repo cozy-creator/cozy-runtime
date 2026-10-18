@@ -27,6 +27,7 @@ from typing import Any, cast
 import msgspec
 import pytest
 
+from cozy_runtime.author._model import SCOPES
 from cozy_runtime.internal import (
     attention,
     attention_upstream,
@@ -336,6 +337,43 @@ def test_an_override_holds_its_kernel_for_every_step_while_another_finishes_comp
         assert pinned["observed"] == "sdpa" and "segments" not in pinned, pinned
         # Its default selection takes the built kernel at the next request, as before.
         assert host.run("default")["observed"] == "tiny" and host.held == [TINY_SITES] * 4
+
+
+def test_two_calls_due_the_same_upgrade_select_once(
+    store: kernel_cache.Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two calls both find a kernel ready while a third holds the scope turn: the first to get
+    the turn selects again, and the second, re-checking in its turn, finds nothing due."""
+    _registry(tmp_path / "sources")
+    job = kernel_sources.job(kernel_sources.PYTHON, 0)
+    lock, builder = _held(store, job, MOVING)
+    with _host(tmp_path, monkeypatch) as host:
+        construction = host.construction
+        assert construction.attention.waiting == ("tiny",)
+        _finisher(store, job, lock, builder)()
+        selections: list[int] = []
+        select = construction._reselect
+
+        def counted() -> Any:
+            selections.append(1)
+            return select()
+
+        construction._reselect = counted
+        holder = object()
+        SCOPES.enter(holder)
+        calls = [
+            threading.Thread(target=construction._upgrade_attention, args=(object(),))
+            for _ in range(2)
+        ]
+        for call in calls:
+            call.start()
+        while len(SCOPES._queue) < 2:  # both found the upgrade due and wait for the turn
+            time.sleep(0.01)
+        SCOPES.leave()
+        for call in calls:
+            call.join(30)
+        assert selections == [1]
+        assert construction.attention.hosts == {"dit": {"tiny": 2}}
 
 
 def test_an_override_naming_a_compiling_kernel_waits_for_it_then_runs_every_step_on_it(

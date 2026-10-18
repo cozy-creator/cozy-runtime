@@ -165,6 +165,36 @@ def test_a_channel_its_call_ended_is_asked_again_by_a_call_still_reading(tmp_pat
         planner.end()
 
 
+def test_two_readers_that_find_the_channel_closed_share_one_fresh_one(tmp_path: Path) -> None:
+    """Two calls waiting when the owner ends their channel each ask again at once: one asks,
+    the other takes what it got, so neither reads a channel the other's ask just closed."""
+    with served(tmp_path) as (hub, store):
+        wanted = objects_of(store, hub.manifest, "encoder")
+        hub.held = {sha for sha, _ in wanted}
+        hub.gate.clear()
+        planner = fetches(hub, store)
+        planner.schedule([(hub.manifest, wanted)])
+        assert hub.asked.wait(30)
+        asked = len(hub.served)
+        hub.shut()
+        start, landed = threading.Barrier(2), []
+
+        def reader() -> None:
+            start.wait()
+            planner.wait(hub.manifest, wanted)
+            landed.append(all(store.contains(sha) for sha, _ in wanted))
+
+        readers = [threading.Thread(target=reader) for _ in range(2)]
+        for thread in readers:
+            thread.start()
+        threading.Timer(1.0, hub.gate.set).start()
+        for thread in readers:
+            thread.join(60)
+        assert landed == [True, True]
+        assert len(hub.served) == asked + 1
+        planner.end()
+
+
 def test_a_raw_source_wants_its_declared_components_and_the_rest_of_what_it_reads(
     tmp_path: Path,
 ) -> None:

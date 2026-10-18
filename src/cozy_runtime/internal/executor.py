@@ -3259,16 +3259,18 @@ class Executor:
         )
         with self.in_flight.attempt(alone) as slot:
             try:
-                # Admitted only now: an attempt before it may have poisoned the generation.
-                prepared = target._admitted(command)
-                if isinstance(prepared, dict):
-                    return prepared
-                refused = self._grant(target, command, first=slot.first)
+                # Admitted only now: an attempt before it may have poisoned the generation. Its
+                # record is taken once nothing can refuse it, so a refused call may come again.
+                refused = target._unadmitted(command) or self._grant(
+                    target, command, first=slot.first
+                )
                 if not alone:
                     self.in_flight.ready()
                 if refused is not None:
-                    target.prepared[command.request_id] = prepared  # it may come again
                     return refused
+                prepared = target.prepared.pop(command.request_id, None)
+                if prepared is None:  # trimmed by a prepare meanwhile
+                    return target._unadmitted(command) or {}
                 self._plan_fetch(target)
                 reply = target.invoke(command, prepared, slot)
             finally:
@@ -3403,8 +3405,8 @@ class Executor:
             **prepared.digests(),
         }
 
-    def _admitted(self, command: Invoke) -> PreparedRequest | Frame:
-        """The record `command` runs, taken as it is admitted, or why it cannot run now."""
+    def _unadmitted(self, command: Invoke) -> Frame | None:
+        """Why this construction cannot run `command` now; None when it can."""
         if not self.ready:
             return {
                 "ok": False,
@@ -3420,8 +3422,7 @@ class Executor:
                 "code": "unknown_entrypoint",
                 "detail": f"{command.entrypoint!r} is not an entrypoint of this release",
             }
-        prepared = self.prepared.pop(command.request_id, None)
-        if prepared is None:
+        if command.request_id not in self.prepared:
             return {
                 "ok": False,
                 "code": "prepared_request_absent",
@@ -3429,7 +3430,7 @@ class Executor:
                 "runs the record its plan was priced against, and this executor holds none "
                 "(a fresh epoch holds nothing at all)",
             }
-        return prepared
+        return None
 
     def invoke(self, command: Invoke, prepared: PreparedRequest, slot: _Slot) -> dict[str, Any]:
         """ONE attempt through the author kernel, with the §3.4 freeze point held."""

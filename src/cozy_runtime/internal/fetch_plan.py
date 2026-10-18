@@ -22,7 +22,6 @@ it refuses ends the run `model_fetch_failed` (`machine_disk_full` for a full dis
 
 from __future__ import annotations
 
-import contextlib
 import threading
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
@@ -131,7 +130,11 @@ class Fetches:
         self._ask = ask
         self._progress = progress
         self._lock = threading.Lock()
+        #: one reader asks for a fresh channel at a time; the rest take the one it got
+        self._asking = threading.Lock()
         self._channel: Fetch | None = None
+        #: the channel a read found closed, replaced at the next ask (`_gone`)
+        self._dead: Fetch | None = None
         #: this command's plans, by what planned them (one per model of a many-model load)
         self._plans: dict[str, list[Group]] = {}
         #: the next rank free for look-ahead
@@ -189,12 +192,21 @@ class Fetches:
 
     def ahead(self, manifest: str, refs: Sequence[Ref]) -> None:
         """Want `refs` after everything already planned (a raw source's look-ahead)."""
-        channel = self._current(ask=True)
-        if channel is None or not refs:
-            return
-        with self._lock:
-            rank, self._rank = self._rank, self._rank + 1
-        self._send(channel, manifest, refs, rank)
+        for again in (False, True):
+            channel = self._current(ask=True)
+            if channel is None or not refs or manifest in self._whole:
+                return
+            with self._lock:
+                rank, self._rank = self._rank, self._rank + 1
+            try:
+                for start in range(0, len(refs), _BATCH):
+                    channel.schedule(manifest, _wire(refs[start : start + _BATCH]), rank)
+                return
+            except (tensorfs.errors.Refusal, OSError) as exc:
+                if again or not self._gone(channel, exc):
+                    if not self._unfetchable(manifest, exc):
+                        raise
+                    return
 
     def present(self, manifest: str, refs: Sequence[Ref]) -> bool:
         """Whether every one of `refs` is here (no channel: the owner placed them all)."""
@@ -233,10 +245,7 @@ class Fetches:
         if not (isinstance(exc, OSError) or "fetch channel closed" in str(exc)):
             return False
         with self._lock:
-            if self._channel is channel:
-                self._channel, self._rank = None, 0
-        with contextlib.suppress(Exception):
-            channel.close()
+            self._dead = channel
         return True
 
     def end(self) -> None:
@@ -250,10 +259,14 @@ class Fetches:
     def _current(self, ask: bool = False) -> Fetch | None:
         with self._lock:
             channel = self._channel
-        if channel is None and ask:
-            self.schedule((), "ask")
-            with self._lock:
-                channel = self._channel
+        if ask and (channel is None or channel is self._dead):
+            with self._asking:
+                with self._lock:
+                    channel = self._channel
+                if channel is None or channel is self._dead:
+                    self.schedule((), "ask")
+                    with self._lock:
+                        channel = self._channel
         return channel
 
     def _send(self, channel: Fetch, manifest: str, refs: Sequence[Ref], rank: int) -> None:

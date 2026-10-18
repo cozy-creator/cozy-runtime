@@ -290,6 +290,20 @@ def test_a_shutdown_waits_for_the_calls_before_it_and_their_cancels_still_land(
     assert executor.process.wait(60) == 0
 
 
+def test_a_refused_invoke_keeps_its_prepared_record_to_come_again(executor: Running) -> None:
+    """The record is taken only once nothing can refuse the attempt (admission, then its
+    grant), so a call refused before it ran may come again."""
+    executor.prepare("again", 5, "plain")
+    spool = str(executor.root / "again")
+    refused = executor.peer.call(
+        {"cmd": "invoke", "request_id": "again", **_CALL, "entrypoint": "nope", "spool": spool}
+    )
+    assert (refused["ok"], refused["code"]) == (False, "unknown_entrypoint"), refused
+    executor.peer.frames.remove(refused)
+    executor.invoke("again")
+    assert executor.outcome("again")["terminal"] == "succeeded"
+
+
 def test_a_handlers_system_exit_ends_the_process(executor: Running) -> None:
     executor.prepare("gone", 1, "exit")
     executor.invoke("gone")
