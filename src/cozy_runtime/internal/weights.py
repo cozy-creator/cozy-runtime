@@ -47,6 +47,7 @@ from cozy_runtime.internal import (
     bands,
     budget_cell,
     canonical,
+    ffn,
     lora_bake,
     plane,
     proctree,
@@ -443,6 +444,8 @@ class Weights:
         self.room: Callable[[int], None] | None = None
         #: device bytes live owners keep for speed and shed under pressure (`reserve`)
         self.reservations: dict[Reservation, None] = {}
+        #: the bytes torch may hold, as `limit_torch` last set it (-1: no limit of ours)
+        self.torch_room = -1
         #: regions an attempt's end maps back (`map_back`); whether one is in flight; the one
         #: thread of this process that maps them, started on first use
         self.back: deque[tuple[Component, int]] = deque()
@@ -558,6 +561,7 @@ class Weights:
         if self.cap >= 0:
             committed = max(plane.stats(self.plane).device(self.index).committed, 0)
             allowed = min(allowed, self.cap - max(self.context_bytes, 0) - committed)
+        self.torch_room = allowed
         if reserved > allowed:
             # A lowered limit stops new segments; the idle ones torch keeps go back now.
             accel.release_cached(self.torch, self.kind)
@@ -1490,6 +1494,16 @@ class Weights:
             self.close(self.components.pop(key))
         if not self.host_only:
             self.plane.set_vram_budget(self.index, self.applied)
+
+    def fits(self, nbytes: int) -> bool:
+        """Whether torch can allocate `nbytes` more inside the limit `limit_torch` set: one
+        allocator read, no driver query (a feed-forward module asks it once a call)."""
+        room = self.torch_room
+        if room < 0:
+            return True
+        # the allocator's own counters, without the flattened copy `memory_allocated` makes
+        stats = self.torch._C._cuda_memoryStats(self.index)
+        return int(stats["allocated_bytes"]["all"]["current"]) + nbytes <= room
 
     def map_back(self, regions: Iterable[tuple[Component, int]]) -> None:
         """Map `regions` back into room nothing else holds, one at a time on this process's
@@ -3435,9 +3449,14 @@ class WeightResidency:
             module = region.module
             rows.append((module, "forward" in module.__dict__, module.forward))
             module.forward = self._block(component, region, module.forward)
+        # Feed-forward modules run in token pieces when their intermediate would not fit.
+        for module in component.root.modules():
+            if width := ffn.widest(module):
+                rows.append((module, "forward" in module.__dict__, module.forward))
+                module.forward = ffn.pieces(module.forward, width, self.weights.fits)
 
     def _unhook(self, name: str) -> None:
-        for module, had, forward in self.hooks.pop(name, []):
+        for module, had, forward in reversed(self.hooks.pop(name, [])):
             if had:
                 module.forward = forward
             else:
