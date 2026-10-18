@@ -65,6 +65,7 @@ from cozy_runtime.author._errors import (
     Outcome,
     OutputError,
     classify,
+    unwind,
 )
 from cozy_runtime.author._executor_requests import Publish, Published
 from cozy_runtime.author._markers import AssetBound, ImagePreparation, Preparation
@@ -427,8 +428,9 @@ def run_prepared(
     except (KeyboardInterrupt, SystemExit):
         raise
     except Exception as exc:
-        record.failed_at_call = _at_call(exc)
-        return None, classify(exc), record
+        outcome, record.failed_at_call = classify(exc), _at_call(exc)
+        unwind(exc)
+        return None, outcome, record
     finally:
         record.closed = True
 

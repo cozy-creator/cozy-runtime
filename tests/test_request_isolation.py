@@ -13,7 +13,7 @@ from typing import Any
 import msgspec
 import pytest
 
-from cozy_runtime.internal import attention, attention_ulysses, executor, package_interface
+from cozy_runtime.internal import accel, attention, attention_ulysses, executor, package_interface
 from cozy_runtime.internal.config import seal_snapshot
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.executor import _SEALED, Executor
@@ -25,10 +25,15 @@ SOURCE = """
 import os
 import shutil
 
+import weakref
+
 import msgspec
+import torch
 from cozy_runtime.author import App, ChildCallError, Context, InvalidRequest, OutputError, Telemetry
 
 app = App()
+HELD: list[weakref.ref] = []
+LEAKED: list[object] = []
 
 
 class Request(msgspec.Struct):
@@ -58,6 +63,16 @@ def generate(ctx: Context, payload: Request, tel: Telemetry) -> Result:
             raise failure
         except ChildCallError as caught:
             raise OutputError("segment 1 of 2 failed", code="segment_failed") from caught
+    if payload.mode in ("hold", "leak"):  # run 11340: a failed stage's activations
+        activations = torch.ones(1 << 20)
+        HELD.append(weakref.ref(activations))
+        if payload.mode == "leak":
+            LEAKED.append(activations)
+        try:
+            raise ChildCallError("memory_exhausted", "the ladder ran out", 0)
+        except ChildCallError as caught:
+            kept = caught  # its frame and its exception now hold each other
+            raise OutputError("segment 1 of 2 failed", code="segment_failed") from kept
     if payload.mode == "long":
         progress = "\\n".join(f"Downloading part {n} of 400" for n in range(400))
         raise RuntimeError(f"{progress}\\nthe cause, on the last line")
@@ -133,6 +148,25 @@ def test_handler_refusals_and_cancels_keep_the_generation_ready(
     assert segment["outcome"]["code"] == "segment_failed" and not segment["poisoned"]
     failed = _serve(executor, "failed", "fail")
     assert failed["outcome"]["terminal"] == "failed" and failed["poisoned"]
+
+
+def test_a_failed_request_gives_back_what_it_held(
+    host: tuple[Executor, dict[str, Any]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Run 11340's executor kept 7.27 GiB after its request failed, and the next request
+    (11405) found the GPU full. A failure's frames let its tensors go; bytes that stay
+    allocated recycle the executor."""
+    executor, load = host
+    assert executor.load(msgspec.convert({**load, "construction": "a"}, Load))["ok"]
+    assert executor.activate(Activate(construction="a"))["ok"]
+    fixture = sys.modules[MODULE]
+    executor.constructions["a"].torch = fixture.torch  # as a model's generation imports it
+    monkeypatch.setattr(accel, "allocated", lambda *_: len(fixture.LEAKED) << 30)
+    held = _serve(executor, "held", "hold")
+    assert held["outcome"]["code"] == "segment_failed" and fixture.HELD[-1]() is None
+    assert not held["poisoned"]
+    leaked = _serve(executor, "leaked", "leak")
+    assert leaked["poisoned"] == f"the failed request left {1 << 30} B on the GPU"
 
 
 def test_a_long_failure_keeps_its_cause_on_its_last_line(

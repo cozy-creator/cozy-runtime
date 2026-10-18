@@ -86,6 +86,7 @@ from cozy_runtime.author._errors import (
     classify,
     ends,
     is_device_oom,
+    unwind,
 )
 from cozy_runtime.author._executor_requests import (
     Answer,
@@ -118,7 +119,7 @@ from cozy_runtime.author._invoke import (
     prepare,
     run_prepared,
 )
-from cozy_runtime.author._model import WARNINGS, Model, component_use
+from cozy_runtime.author._model import RELEASERS, WARNINGS, Model, component_use
 from cozy_runtime.author._observations import Attribution
 from cozy_runtime.author._services import AdjustmentRow, ProgressFrame
 from cozy_runtime.author._services import Attempt as AuthorAttempt
@@ -153,6 +154,7 @@ from cozy_runtime.internal import (
     proctree,
     sandbox,
     spawn,
+    spill,
     stage_memo,
     tolerant,
     tools,
@@ -2536,6 +2538,7 @@ class Executor:
                 # recover from an out-of-memory op by op, never by running a block again.
                 host.weights.grouped = self.world > 1
                 host.weights.world = self.world
+                host.weights.follower = self.rank > 0
                 host.weights.room = host._device_room  # a follower's asks go through rank 0
                 host.weights.cell = host._budget_cell() if self.rank == 0 else host.rank_cell
             except plane.Unavailable as exc:
@@ -3480,6 +3483,7 @@ class Executor:
                     capture_result = capture.write(spool)
         except Exception as exc:
             envelope, outcome = None, classify(exc)
+            unwind(exc)
             if record is None:
                 record = AuthorAttempt(command.request_id, spool, 0, sink=progress)
         assert record is not None
@@ -3570,6 +3574,8 @@ class Executor:
             self.residency.unpark()  # a repeating stage closes with its attempt
         if torch is not None:
             accel.drain(torch, self.device_kind)
+        failed = torch is not None and outcome.terminal != "succeeded"
+        left = self._release(allocated_at_start) if failed else 0
         if self.residency is not None:
             # Weights the attempt's activations took map again on the plane's copy streams:
             # keeping hot is never the attempt's verdict.
@@ -3621,10 +3627,13 @@ class Executor:
         # is the process, so the worker must replace it either way.
         if self.residency is not None and self.residency.poisoned:
             self.poisoned = self.poisoned or f"weights: {self.residency.poisoned[:200]}"
-        left = getattr(self.residency, "unjournaled", "")
-        if outcome.terminal == "failed" and left:
+        unjournaled = getattr(self.residency, "unjournaled", "")
+        if outcome.terminal == "failed" and unjournaled:
             # State, not capacity: a block left writes no journal can put back.
-            self.poisoned = self.poisoned or f"weights: {left[:200]}"
+            self.poisoned = self.poisoned or f"weights: {unjournaled[:200]}"
+        if left > weight_policy.MARGIN:
+            # Bytes nothing here can name: only the process's end gives them back.
+            self.poisoned = self.poisoned or f"the failed request left {left} B on the GPU"
         weights = self.host.weights
         # The BOUNDED observation tail and the O(1) time attribution cross the seam on every
         # path, success or fault. A failed attempt's log tail is the one triage most needs,
@@ -4557,6 +4566,19 @@ class Executor:
         """No torch in this process means no device to name (cl-013). Ordinal 0 IS the
         lane's device: the worker sealed this process to exactly its lane (cr-066)."""
         return Device(self.device_kind, 0) if self.torch is not None else Device()
+
+    def _release(self, idle: int) -> int:
+        """A failed attempt gives back all it took (run 11340's executor kept 7.27 GiB that
+        the next request needed): its caches, its frames' cycles, its host copies and torch's
+        cached segments. Returns what stays allocated above `idle`."""
+        for release in RELEASERS:
+            release()
+        if self.host.weights is not None:
+            self.host.weights.shed(sys.maxsize)
+        gc.collect()
+        spill.release(self.torch)
+        accel.release_cached(self.torch, self.device_kind)
+        return accel.allocated(self.torch, self.device_kind) - idle
 
     def _quiescent(self) -> bool:
         """No author computation may still mutate GPU or output state when a terminal is

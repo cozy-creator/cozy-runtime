@@ -319,7 +319,7 @@ class Memory:
             else f"{-slack} B more than the GPU has {beside}"
         )
         tried = self.summary() or "no rung gave bytes back"
-        found = self.short[1] if self.short is not None and self.short[0] == op else None
+        found = self.short[1] if self.short is not None and op.startswith(self.short[0]) else None
         then = f"when it ran out: {found.text()}; after the ladder: " if found else ""
         detail = (
             f"{op} needs {nbytes} B of device memory at once"

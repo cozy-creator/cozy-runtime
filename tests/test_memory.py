@@ -161,6 +161,26 @@ def test_a_cap_raised_in_the_cell_counts_while_an_op_waits_for_room(
     assert weights.cell.pending() == 123 << 20 and weights.cap == 7 << 30
 
 
+def test_a_follower_is_capped_under_its_own_count_only_below_the_floor(
+    card: tuple[Weights, dict[str, int]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Run 11399: TensorD 0.10.0 capped GPU 1's process at 670 MB, its free bytes plus what it
+    held at its load, while it held 7.07 GiB, and a 610 MB add was refused with 4.86 GB free."""
+    weights, device = card
+    monkeypatch.setattr(memory_module, "RELEASERS", [])
+    weights.follower, weights.floor_free = True, 256 * MIB
+    device.update(reserved=3 << 30, free=4 << 30)
+    weights.set_cap(670 * MIB)
+    assert weights.cap == (7 << 30) - 256 * MIB
+    assert weights.memory.free_for(610 * MIB, "aten.add.Tensor")
+    device["free"] = 128 * MIB  # below the floor: the watchdog's lowering holds it under
+    weights.set_cap(2 << 30)
+    assert weights.cap == (3 << 30) - 128 * MIB
+    weights.follower = False  # rank 0 reports what it holds: its cap stands
+    weights.set_cap(670 * MIB)
+    assert weights.cap == 670 * MIB
+
+
 def test_the_ledger_names_what_no_class_accounts_for() -> None:
     gib = 1 << 30
     ledger = Ledger(
