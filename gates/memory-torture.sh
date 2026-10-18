@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # The memory-torture gate (cr-203): every Runtime release, on its own files, through `cozy run`.
 # The absolute bar: every cell completes, every output lands, nothing ends poisoned and no idle executor keeps
-# `leftover` bytes (B2's mem.stats()). The exit status counts the cells and cards that miss it, plus regressions.
+# `leftover` bytes; each warm cell (24) reports B2's mem.stats(), reads <= 40 GB (H3 5 s: 0 B per denoise step) and
+# needs no more OOM retries than its cold pass. The exit status counts the cells and cards that miss it, plus regressions.
 #
 #   gates/memory-torture.sh <hub> <wheel|-> [--matrix] [--tensorfs-wheel <file|url>] [--baseline <dir>] [card[:cell,…]...]
 #
@@ -75,10 +76,10 @@ PY
 }
 
 record() {  # one line per run (status, wall, execution, retries, poisoned, leftover, GB read host to GPU, memory rungs);
-            # fails if the run misses the absolute bar
+            # fails if the run misses the absolute bar, named in `bar=`
   local n=$1 cell=$2 state=$3
   python3 -I - "show-$cell.json" "$cell" "$n" "$state" <<'PY' | tee -a summary.txt
-import json, sys
+import json, re, sys
 path, cell, n, state = sys.argv[1:]
 try:
     run = json.load(open(path))
@@ -89,20 +90,30 @@ mem = [m.get("memory") or {} for m in ms]
 total = lambda key: sum(m.get(key) or 0 for m in mem)
 steps = sum((s.get("denoise") or next(iter(s.values()), {})).get("count") or 0
             for s in ((m.get("attribution") or {}).get("steps") or {} for m in ms))
-stats = [m["stats"] for m in mem if m.get("stats")]  # B2: mem.stats() per model per step, and the request's leftover
+# B2's mem.stats(), per call: {"leftover": B, "paged_in": B, "steps": {model: [B paged in per denoise step]}}
+stats = [m["stats"] for m in mem if m.get("stats")]
 leftover = sum(s.get("leftover") or 0 for s in stats) if stats else None
+step_read = max((b for s in stats for per in (s.get("steps") or {}).values() for b in per), default=0) / 1e9
 modes = {k: v for m in mem for k, v in (m.get("modes") or {}).items()}
 reason = run.get("reason") or ""
 if isinstance(reason, dict):
     reason = f"{reason.get('code')}: {reason.get('message')}"
-wall, read = (run.get("settled_at_ms") or 0) - (run.get("created_at_ms") or 0), total("paged_in_bytes") / 1e9
+wall = (run.get("settled_at_ms") or 0) - (run.get("created_at_ms") or 0)
+read = (sum(s.get("paged_in") or 0 for s in stats) if stats else total("paged_in_bytes")) / 1e9
 poisoned = "poisoned" in str(reason)
+bar = [w for w, bad in [("incomplete", not (state.startswith("completed ") and state.endswith(" landed"))),
+                        ("poisoned", poisoned), ("leftover", bool(leftover))] if bad]
+if cell.endswith("-warm"):  # §9: no re-reads of a model that fits, and no more OOM retries than the cold pass
+    cold = next((re.search(r" oom_retries=(\d+)", l) for l in open("summary.txt") if l.startswith(cell[:-5] + " run=")), None)
+    bar += [w for w, bad in [("no-mem-stats", not stats), ("read>40GB", read > 40),
+                             ("model-reads-per-step", cell.endswith("-h3ref5-warm") and step_read > 0),
+                             ("more-retries-than-cold", bool(cold) and total("oom_retries") > int(cold[1]))] if bad]
 print(f"{cell} run={n} {state} wall={max(wall, 0) / 1000:.0f}s exec={(run.get('execution_ms') or 0) / 1000:.0f}s "
       f"oom_retries={total('oom_retries')} poisoned={int(poisoned)} leftover={'-' if leftover is None else leftover} "
-      f"read={read:.1f}GB disk={total('disk_bytes') / 1e9:.1f}GB steps={steps} "
-      f"read_per_step={read / steps if steps else 0:.2f}GB modes={json.dumps(modes)} mem_stats={json.dumps(stats)} "
+      f"read={read:.1f}GB disk={total('disk_bytes') / 1e9:.1f}GB steps={steps} read_per_step={read / steps if steps else 0:.2f}GB "
+      f"step_read_max={int(step_read * 1e9)}B bar={','.join(bar) or 'ok'} modes={json.dumps(modes)} mem_stats={json.dumps(stats)} "
       f"reason={str(reason)[:300]}")
-sys.exit(not (state.startswith("completed ") and state.endswith(" landed")) or poisoned or bool(leftover))
+sys.exit(bool(bar))
 PY
 }
 
@@ -284,7 +295,8 @@ def cells(path):
         m = re.match(r"(\S+) run=(\d*) (\S+) (\S+)", line)
         if m:
             f = dict(re.findall(r" (\w+)=([\d.]+)", line.split(" modes=")[0]))
-            out[m[1]] = dict(f, run=m[2], status=m[3], ok=m[3] == "completed" and m[4] == "landed")
+            out[m[1]] = dict(f, run=m[2], status=m[3], ok=m[3] == "completed" and m[4] == "landed",
+                             bar=(re.search(r" bar=(\S+)", line) or [0, "?"])[1])
     return out
 def show(x):
     return f"{'ok' if x['ok'] else x['status']} exec {x.get('exec', '?')}s oom={x.get('oom_retries', '?')} #{x['run']}" if x else "-"
@@ -296,8 +308,8 @@ print(f"{'cell':20} {'0.27.4':34} {'candidate':34} GB read (per step), 0.27.4 ->
 for c in sorted(c for c in set(base) | set(here) if wanted(c)):
     b, h = base.get(c), here.get(c)
     why = ""
-    if not h or not h["ok"] or h.get("poisoned") == "1" or float(h.get("leftover", 0)) > 0:
-        why = "  FAIL (absolute bar)"
+    if not h or h["bar"] != "ok":
+        why = f"  FAIL: {h['bar'] if h else 'no run'}"
     elif c.endswith("-warm") and b and b["ok"] and float(h["exec"]) > 1.1 * float(b["exec"]):
         why, worse = f"  WORSE: warm execution {h['exec']}s > 1.1 x {b['exec']}s", worse + 1
     print(f"{c:20} {show(b):34} {show(h):34} {read(b)} -> {read(h)}{why}")
