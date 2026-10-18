@@ -81,6 +81,7 @@ from cozy_runtime.internal.fill import (
 from cozy_runtime.internal.memory import (
     Memory,
     MemoryExhausted,
+    Reservation,
     Rung,
     reap,
     shortage,
@@ -326,40 +327,6 @@ class Component:
 # ------------------------------------------------------------------------ the process
 
 
-class Reservation:
-    """Bytes a live owner keeps for speed alone, which `shed(n)` gives back toward `n`. They
-    are torch's or the host's already: a reservation is the owner's admission token and shed
-    handle, `granted` a fact never added to the ledger. It ends with its owner."""
-
-    def __init__(
-        self, weights: Weights, owner: str, shed: Callable[[int], int], host: bool
-    ) -> None:
-        self.weights, self.owner, self.shed, self.host = weights, owner, shed, host
-        self.granted = self.users = 0
-
-    def resize(self, nbytes: int) -> bool:
-        """Whether the owner may hold `nbytes` now. Never waits or raises: False pauses the
-        owner, which tries again when its own work frees room. Host bytes are never refused."""
-        grow = nbytes - self.granted
-        if grow > 0 and not self.host and not self.weights.grant(grow):
-            return False
-        self.granted = nbytes
-        return True
-
-    @contextmanager
-    def using(self) -> Iterator[None]:
-        """The owner runs: its device bytes go after idle weights and finer grains (rung 3)."""
-        self.users += 1
-        try:
-            yield
-        finally:
-            self.users -= 1
-
-    def close(self) -> None:
-        self.weights.reservations.pop(self, None)
-        self.granted = 0
-
-
 class Weights:
     """This executor process's plane, budgets and every registered weight set (one per rank).
 
@@ -443,10 +410,6 @@ class Weights:
         #: asks the Worker for `bytes` free on this GPU from its other tenants (`DeviceRoom`);
         #: None in a process without a Worker
         self.room: Callable[[int], None] | None = None
-        #: bytes live owners keep for speed and shed under pressure (`reserve`), oldest first
-        self.reservations: weakref.WeakKeyDictionary[Reservation, None] = (
-            weakref.WeakKeyDictionary()
-        )
         #: the CUDA context and library workspaces outside torch and the plane, measured once
         self.context_bytes = -1
         #: the machine's custody of GPU weights (`weights.attach/1`); None: every region private
@@ -895,12 +858,12 @@ class Weights:
             return False
         # What is kept for speed alone (an LM's decode slots, recorded graphs) goes, never
         # to host: moved there, every later call would read it over the bus (run 10143).
-        if self.shed(need) or self.shed(need, running=True):
+        if self.memory.shed(need) or self.memory.shed(need, running=True):
             accel.release_cached(self.torch, self.kind)
             if self.allocatable() >= need + weight_policy.MARGIN:
                 return True
         want = need + weight_policy.MARGIN
-        self.shed(want, host=True)  # caches kept in host memory make room for the spill
+        self.memory.shed(want, host=True)  # caches kept in host memory make room for the spill
         room = self.lockable(want)
         device = self.torch.device("cuda", self.index)
         with self.torch.utils._python_dispatch._disable_current_modes():
@@ -1042,37 +1005,6 @@ class Weights:
         """Device bytes torch can allocate now: its headroom plus its own idle cache."""
         memory = self.allocation()
         return self.headroom(memory) + max(memory["reserved_bytes"] - memory["allocated_bytes"], 0)
-
-    def reserve(
-        self, owner: str, nbytes: int, shed: Callable[[int], int], host: bool = False
-    ) -> Reservation:
-        """A hold on bytes `owner` keeps for speed, on the device (`host`: in host memory),
-        granted as far as there is room now (`Reservation.granted`)."""
-        reservation = Reservation(self, owner, shed, host)
-        self.reservations[reservation] = None
-        reservation.resize(nbytes)
-        return reservation
-
-    def grant(self, nbytes: int) -> bool:
-        """Whether `nbytes` more fit now beside the floor, components no stage uses paging out
-        for them first. Never waits."""
-        if self.host_only:
-            return True
-        want = nbytes + weight_policy.MARGIN
-        if self.allocatable() >= want:
-            return True
-        return self.page_out(_in_use(self), want) and self.allocatable() >= want
-
-    def shed(self, need: int, running: bool = False, host: bool = False) -> bool:
-        """Reservations give back toward `need`, the youngest first: those of idle owners, or
-        (`running`) those in use; device bytes, or (`host`) host bytes. Whether any gave."""
-        given = 0
-        for reservation in reversed(list(self.reservations)):
-            if given >= need:
-                break
-            if reservation.host == host and bool(reservation.users) == running:
-                given += max(reservation.shed(need - given), 0)
-        return given > 0
 
     @contextmanager
     def reading(self, standins: Sequence[Tensor], op: str) -> Iterator[Read]:
@@ -3761,7 +3693,7 @@ class WeightResidency:
     def vacate(self) -> dict[str, Any]:
         """Unmap this construction's idle weights. They stay in the pinned tier; the next
         stage wants them back at link speed."""
-        self.weights.shed(sys.maxsize)
+        self.weights.memory.shed(sys.maxsize)
         self.unpark()
         idle = [c for c in self.components.values() if c.lease is None and c.cursor is None]
         freed = sum(self.weights.resident_bytes(c) for c in idle)
@@ -3891,7 +3823,7 @@ class WeightResidency:
     def reserve(
         self, owner: str, nbytes: int, shed: Callable[[int], int], host: bool = False
     ) -> Reservation:
-        return self.weights.reserve(owner, nbytes, shed, host)
+        return self.weights.memory.reserve(owner, nbytes, shed, host)
 
     def hold_stage(self, name: str, blocks: Collection[Module]) -> tuple[bool, tuple[object, ...]]:
         """`held` for the rest of the open stage, entered once per component: whether it holds,

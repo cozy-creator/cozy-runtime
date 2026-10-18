@@ -12,7 +12,9 @@ import gc
 import os
 import re
 import traceback
-from collections.abc import Callable, Sequence
+import weakref
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import TYPE_CHECKING, NoReturn
@@ -39,7 +41,7 @@ class Rung(IntEnum):
     SLACK = 0  # torch's idle cache
     IDLE = 1  # idle owners' caches, orphaned rings, idle weights, other tenants (`DeviceRoom`)
     FINER = 2  # the running stage's resident set, its components not in use
-    CACHES = 3  # what the running owners keep for speed alone (`Weights.reserve`)
+    CACHES = 3  # what the running owners keep for speed alone (`Memory.reserve`)
     HOST = 4  # live tensors to page-locked host memory, the op's operands last
     DISK = 5  # the pinned tier toward 0, so more can lock
 
@@ -146,6 +148,38 @@ def _caller() -> str:
     return " < ".join(f"{os.path.basename(f.filename)}:{f.lineno} {f.name}" for f in frames[:-5:-1])
 
 
+class Reservation:
+    """Bytes a live owner keeps for speed alone, which `shed(n)` gives back toward `n`. They
+    are torch's or the host's already: a reservation is the owner's admission token and shed
+    handle, `granted` a fact never added to the ledger. It ends with its owner."""
+
+    def __init__(self, memory: Memory, owner: str, shed: Callable[[int], int], host: bool) -> None:
+        self.memory, self.owner, self.shed, self.host = memory, owner, shed, host
+        self.granted = self.users = 0
+
+    def resize(self, nbytes: int) -> bool:
+        """Whether the owner may hold `nbytes` now. Never waits or raises: False pauses the
+        owner, which tries again when its own work frees room. Host bytes are never refused."""
+        grow = nbytes - self.granted
+        if grow > 0 and not self.host and not self.memory.grant(grow):
+            return False
+        self.granted = nbytes
+        return True
+
+    @contextmanager
+    def using(self) -> Iterator[None]:
+        """The owner runs: its device bytes go after idle weights and finer grains (rung 3)."""
+        self.users += 1
+        try:
+            yield
+        finally:
+            self.users -= 1
+
+    def close(self) -> None:
+        self.memory.reservations.pop(self, None)
+        self.granted = 0
+
+
 class Memory:
     """The ladder and the refusal for one executor's GPU (`Weights.memory`)."""
 
@@ -162,6 +196,39 @@ class Memory:
         #: rung 1 asks the owner; never from inside torch's allocator
         self.asking = True
         self._collected = False
+        #: what live owners keep for speed (`reserve`), oldest first
+        self.reservations: weakref.WeakKeyDictionary[Reservation, None] = (
+            weakref.WeakKeyDictionary()
+        )
+
+    def reserve(
+        self, owner: str, nbytes: int, shed: Callable[[int], int], host: bool = False
+    ) -> Reservation:
+        """A hold on bytes `owner` keeps for speed, on the device (`host`: in host memory),
+        granted as far as there is room now (`Reservation.granted`)."""
+        reservation = Reservation(self, owner, shed, host)
+        self.reservations[reservation] = None
+        reservation.resize(nbytes)
+        return reservation
+
+    def grant(self, nbytes: int) -> bool:
+        """Whether `nbytes` more fit now beside the floor, components no stage uses paging out
+        for them first. Never waits."""
+        weights, want = self.weights, nbytes + MARGIN
+        if weights.host_only or weights.allocatable() >= want:
+            return True
+        return weights.page_out(None, want) and weights.allocatable() >= want
+
+    def shed(self, need: int, running: bool = False, host: bool = False) -> bool:
+        """Reservations give back toward `need`, the youngest first: those of idle owners, or
+        (`running`) those in use; device bytes, or (`host`) host bytes. Whether any gave."""
+        given = 0
+        for reservation in reversed(list(self.reservations)):
+            if given >= need:
+                break
+            if reservation.host == host and bool(reservation.users) == running:
+                given += max(reservation.shed(need - given), 0)
+        return given > 0
 
     def free(self) -> int:
         """Device bytes torch or the plane can take now: free above the floor, in the cap."""
@@ -311,14 +378,14 @@ class Memory:
     def _ladder(self, operands: Sequence[object]) -> list[tuple[Rung, Callable[[int], object]]]:
         weights = self.weights
         return [
-            (Rung.IDLE, weights.shed),
+            (Rung.IDLE, self.shed),
             (Rung.IDLE, self._collect),
             (Rung.IDLE, lambda short: weights.shrink(short, keep_holds=True)),
             (Rung.IDLE, lambda short: weights.page_out(None, short)),
             (Rung.IDLE, lambda short: self.ask(self.free() + short)),  # all it wants free
             (Rung.FINER, self._finer),
             (Rung.FINER, lambda _: weights.spare(operands)),
-            (Rung.CACHES, lambda short: weights.shed(short, running=True)),
+            (Rung.CACHES, lambda short: self.shed(short, running=True)),
             (Rung.HOST, lambda short: weights.spill(short, operands)),
             (Rung.DISK, lambda short: weights.unpin(short, operands)),
         ]

@@ -3,7 +3,7 @@
 
 Torch and the plane are real (CPU); the device's byte counts are the fixture
 (`accel.allocation`), and what frees them is what would on a card: the owner's idle tenants
-(`DeviceRoom`) and the caches kept for speed (`Weights.reserve`)."""
+(`DeviceRoom`) and the caches kept for speed (`Memory.reserve`)."""
 
 from __future__ import annotations
 
@@ -69,7 +69,7 @@ def test_each_rung_runs_while_it_gives_and_the_ladder_stops_once_enough_is_free(
     calls: list[str] = []
     owner, asked = gives(device, [100 * MIB, 100 * MIB], calls, "owner"), []
     weights.room = lambda nbytes: (asked.append(nbytes), owner())
-    cache = weights.reserve("cache", 0, gives(device, [1 << 30], calls, "cache"))
+    cache = weights.memory.reserve("cache", 0, gives(device, [1 << 30], calls, "cache"))
     with cache.using():
         assert not weights.memory.free_for(500 * MIB, "aten.mm.default", upto=Rung.IDLE)
         assert calls == ["owner", "owner", "owner"], "asked while it gave, then left"
@@ -90,17 +90,19 @@ def test_idle_caches_go_before_any_weight_and_a_running_owners_after_finer_weigh
     weights, device = card
     calls: list[str] = []
     weights.room = gives(device, [], calls, "owner")
-    older = weights.reserve("older", 0, gives(device, [64 * MIB], calls, "older"))
-    younger = weights.reserve("younger", 0, gives(device, [64 * MIB], calls, "younger"))
-    running = weights.reserve("running", 0, gives(device, [512 * MIB], calls, "running"))
+    older = weights.memory.reserve("older", 0, gives(device, [64 * MIB], calls, "older"))
+    younger = weights.memory.reserve("younger", 0, gives(device, [64 * MIB], calls, "younger"))
+    running = weights.memory.reserve("running", 0, gives(device, [512 * MIB], calls, "running"))
     with running.using():
         assert weights.memory.free_for(500 * MIB, "aten.mm.default")
     assert calls == ["younger", "older", "younger", "older", "owner", "running"]
     assert older.resize(256 * MIB) and not younger.resize(4 << 30), "granted only where it fits"
-    assert weights.reserve("host", 0, gives(device, [], calls, "host"), host=True).resize(1 << 40)
+    assert weights.memory.reserve("host", 0, gives(device, [], calls, "host"), host=True).resize(
+        1 << 40
+    )
     del older, younger, running
     gc.collect()
-    assert not weights.reservations
+    assert not weights.memory.reservations
 
 
 def test_a_derived_cache_is_a_reservation_its_oldest_entries_shed_first(
@@ -110,7 +112,7 @@ def test_a_derived_cache_is_a_reservation_its_oldest_entries_shed_first(
     room, host entries for host room, and an entry with no room is returned, not kept."""
     weights, device = card
     device["free"] = 1 << 30
-    generation = SimpleNamespace(_cozy_residency=weights, _cozy_require_scope=lambda _: None)
+    generation = SimpleNamespace(_cozy_residency=weights.memory, _cozy_require_scope=lambda _: None)
     cache = DerivedCache("latents", max_entries=3, owner=generation)
 
     def gpu() -> Any:
@@ -120,8 +122,8 @@ def test_a_derived_cache_is_a_reservation_its_oldest_entries_shed_first(
         cache.get(key, build=gpu)
     cache.get("h", build=lambda: torch.zeros(MIB))
     assert "a" not in cache and cache.entries == 3, "the package's count, oldest out"
-    assert weights.shed(150 * MIB) and {"b", "c"}.isdisjoint(cache._entries)
-    assert "h" in cache and weights.shed(1, host=True) and not cache.entries
+    assert weights.memory.shed(150 * MIB) and {"b", "c"}.isdisjoint(cache._entries)
+    assert "h" in cache and weights.memory.shed(1, host=True) and not cache.entries
     device["free"] = 0
     built = cache.get("d", build=gpu)
     assert cache.get("d", build=lambda: built) is built and "d" not in cache
@@ -133,7 +135,7 @@ def test_a_ladder_nothing_gives_ends_with_each_action_tried_once(
     weights, device = card
     calls: list[str] = []
     weights.room = gives(device, [], calls, "owner")
-    cache = weights.reserve("cache", 0, gives(device, [], calls, "cache"))
+    cache = weights.memory.reserve("cache", 0, gives(device, [], calls, "cache"))
     with cache.using():
         assert not weights.memory.free_for(1 << 30, "aten.mm.default")
     assert calls == ["owner", "cache"] and weights.memory.freed == 0
