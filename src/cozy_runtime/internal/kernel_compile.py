@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import fcntl
 import json
 import os
 import re
@@ -44,7 +43,7 @@ from typing import Any
 from cozy_runtime import __version__
 from cozy_runtime._build_provenance import COMMIT
 from cozy_runtime._cpus import cpus
-from cozy_runtime.internal import config, kernel_cache, liveness, proctree
+from cozy_runtime.internal import config, filelock, kernel_cache, liveness, proctree
 
 #: kind -> the `module:function` a builder runs: `build(spec, staging, report) -> facts`. The
 #: function fills `staging` (an `object` file, a `site/` tree, or nothing when the artifact
@@ -402,7 +401,7 @@ def _ledger(path: Path) -> Iterator[dict[str, Any]]:
     path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
     fd = os.open(path.with_suffix(".lock"), os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o666)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        filelock.lock(fd)
         try:
             book = json.loads(path.read_text())
         except (OSError, ValueError):

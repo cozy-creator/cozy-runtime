@@ -6,13 +6,14 @@ remain the sole owners of byte custody and eviction eligibility.
 
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from cozy_runtime.internal import filelock
 
 if TYPE_CHECKING:
     from .storage_admission import Write
@@ -96,7 +97,7 @@ def acquire(root: Path, writes: Sequence[Write]) -> Iterator[dict[str, object]]:
         0o600,
     )
     try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        filelock.lock(descriptor)
         try:
             facts = shortfall(writes)
         except OSError as exc:

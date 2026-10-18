@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import contextlib
 import errno
-import fcntl
 import hashlib
 import json
 import os
@@ -37,6 +36,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import msgspec
+
+from cozy_runtime.internal import filelock
 
 SCHEMA = 1
 _KERNEL = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
@@ -188,7 +189,7 @@ class Store:
         """Hold the key's build lock, waiting for whichever live process holds it now."""
         fd = self._open_lock(key)
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
+            filelock.lock(fd)
             yield
         finally:
             os.close(fd)
@@ -199,7 +200,7 @@ class Store:
         child and closes its own copy: the lock then lives exactly as long as that child."""
         fd = self._open_lock(key)
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            filelock.lock(fd, wait=False)
         except BlockingIOError:
             os.close(fd)
             return None
@@ -218,7 +219,7 @@ class Store:
         except OSError:
             return False
         try:
-            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            filelock.lock(fd, shared=True, wait=False)
         except BlockingIOError:
             return True
         finally:

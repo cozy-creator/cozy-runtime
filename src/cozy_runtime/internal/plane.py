@@ -8,7 +8,6 @@ budgets; TensorFS implements the operations. Facts Runtime reads back are typed 
 
 from __future__ import annotations
 
-import fcntl
 import os
 import sys
 from typing import TYPE_CHECKING, Final
@@ -17,6 +16,9 @@ import msgspec
 from tensorfs import plane as _plane
 
 from cozy_runtime.internal import seam
+
+if sys.platform == "linux":
+    import fcntl
 
 if TYPE_CHECKING:
     from tensorfs import ReadLease, Store
@@ -160,7 +162,10 @@ _LAYOUT_SEALS, _WRITE_SEALS = 0x1 | 0x2 | 0x4, 0x8 | 0x10
 
 
 def is_sealed(fd: int) -> bool:
-    """Whether `fd` is a memfd nobody can write, resize or unseal: a sealed host layout."""
+    """Whether `fd` is a memfd nobody can write, resize or unseal: a sealed host layout. Only
+    Linux seals."""
+    if sys.platform != "linux":
+        return False
     try:
         seals = fcntl.fcntl(fd, _GET_SEALS)
     except OSError:

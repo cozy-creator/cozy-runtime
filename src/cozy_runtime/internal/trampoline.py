@@ -51,6 +51,11 @@ def _fail(message: str, code: Exit) -> None:
 
 
 def _arm_parent_death(expect_parent: int) -> None:
+    # Where the guard is a thread (darwin), an exec would end it: the executor arms its own.
+    if not proctree.PARENT_DEATH_SURVIVES_EXEC:
+        if expect_parent and os.getppid() != expect_parent:
+            _fail("parent died before the executor started", Exit.structural)
+        return
     try:
         proctree.arm_parent_death()
     except proctree.ProcessTreeUnsupported as exc:

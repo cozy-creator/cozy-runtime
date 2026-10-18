@@ -1,10 +1,10 @@
 """The worker <-> device-executor seam: length-framed JSON, byte-accounted.
 
-One `SOCK_STREAM` unix socket carries length-framed canonical-JSON commands and replies:
-a fixed 4-byte big-endian length prefix, then exactly that many body bytes (#448). A byte
-stream plus explicit framing is the ONE protocol on every OS — Linux today, Windows
-socketpair and macOS AF_UNIX next, neither of which has SOCK_SEQPACKET (and SEQPACKET
-silently truncates an over-buffer message, the wedge defect class of cr-007).
+One byte stream carries length-framed canonical-JSON commands and replies: a fixed 4-byte
+big-endian length prefix, then exactly that many body bytes (#448). A byte stream plus
+explicit framing is the ONE protocol on every OS: a `SOCK_STREAM` unix socket on Linux and
+macOS, a byte-mode named pipe on Windows (`winpipe`). Neither of the last two has
+SOCK_SEQPACKET (which silently truncates an over-buffer message, cr-007's wedge).
 
 Three properties are structural rather than reviewed:
 
@@ -27,7 +27,6 @@ from __future__ import annotations
 import array
 import contextlib
 import ctypes
-import fcntl
 import json
 import os
 import socket
@@ -41,6 +40,14 @@ from dataclasses import dataclass, field
 from typing import Any, NoReturn
 
 from cozy_runtime.internal.canonical import DOC_MAX_BYTES
+
+if sys.platform == "win32":
+    import _winapi
+    import msvcrt
+
+    from cozy_runtime.internal import winpipe
+else:
+    import fcntl
 
 #: Worker/executor command-and-reply compatibility, independent of SDK package
 #: version or source build. Compatible additive fields keep this revision; only
@@ -374,6 +381,65 @@ class Channel:
         }
 
 
+if sys.platform == "win32":
+
+    class PipeChannel(Channel):
+        """Windows's seam end, on a `winpipe.Pipe`: a handle crosses duplicated into the
+        peer. A file arrives as a C runtime descriptor; a stream capability as its raw
+        handle, for TensorFS to adopt."""
+
+        def send_descriptor(self, descriptor: socket.socket) -> None:
+            raise SeamError("seam_descriptor", "no socket crosses a Windows seam")
+
+        def recv_descriptor(self) -> int:
+            handle = self._recv_handle()
+            if winpipe.file_type(handle) != winpipe.FILE_TYPE_PIPE:
+                _winapi.CloseHandle(handle)
+                raise SeamError("seam_descriptor", "capability must be a local stream")
+            return handle
+
+        def recv_file(self) -> int:
+            received = self._recv_fd()
+            try:
+                if not stat.S_ISREG(os.fstat(received).st_mode) or winpipe.writable(
+                    msvcrt.get_osfhandle(received)
+                ):
+                    raise SeamError(
+                        "seam_descriptor", "an object file must be a read-only regular file"
+                    )
+            except BaseException:
+                os.close(received)
+                raise
+            return received
+
+        def _send_fd(self, fd: int, what: str) -> None:
+            try:
+                self.sock.send_handle(msvcrt.get_osfhandle(fd))
+            except OSError as exc:
+                self._raise(exc)
+            self.sent_bytes += 9
+
+        def _recv_fd(self) -> int:
+            handle = self._recv_handle()
+            try:
+                return msvcrt.open_osfhandle(handle, os.O_NOINHERIT)
+            except OSError:
+                _winapi.CloseHandle(handle)
+                raise
+
+        def _recv_handle(self) -> int:
+            try:
+                handle = self.sock.recv_handle()
+            except ValueError as exc:
+                raise SeamError(
+                    "seam_descriptor", f"expected one scoped capability: {exc}"
+                ) from exc
+            except OSError as exc:
+                self._raise(exc)
+            self.recv_bytes += 9
+            return handle
+
+
 def listener(path: str) -> socket.socket:
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.bind(path)
@@ -382,6 +448,8 @@ def listener(path: str) -> socket.socket:
 
 
 def connect(path: str) -> Channel:
+    if sys.platform == "win32":
+        return PipeChannel(winpipe.Pipe.connect(path))
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.connect(path)
     return Channel(sock)
@@ -399,7 +467,12 @@ def _require_device(fd: int) -> None:
 
 def anonymous(name: str, sealing: bool = False) -> int:
     """A new close-on-exec in-memory file no path names: a memfd (`sealing`: one that may be
-    sealed), or on macOS, which has none, an unlinked file."""
+    sealed); on macOS, which has none, an unlinked file; on Windows, a temporary file gone
+    with its last handle."""
+    if sys.platform == "win32":
+        path = os.path.join(tempfile.gettempdir(), f"{name}.{os.urandom(8).hex()}")
+        flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_BINARY | os.O_NOINHERIT
+        return os.open(path, flags | os.O_TEMPORARY | os.O_SHORT_LIVED, 0o600)
     if sys.platform != "linux":
         fd, path = tempfile.mkstemp(prefix=f"{name}.")
         os.unlink(path)
@@ -415,12 +488,16 @@ def anonymous(name: str, sealing: bool = False) -> int:
 
 def _require_memfd(fd: int) -> None:
     """A regular file the kernel names `/memfd:…`: an anonymous in-memory tier, never a path.
-    macOS has no memfd: there an unlinked regular file, which no path names either."""
+    macOS has no memfd: there an unlinked regular file, which no path names either. Windows
+    cannot see whether a file's name goes with its last handle: there any regular file."""
     try:
         found = os.fstat(fd)
         named = os.readlink(f"/proc/self/fd/{fd}") if sys.platform == "linux" else ""
     except OSError as exc:
         raise SeamError("seam_descriptor", f"memfd unreadable: {exc}") from exc
-    anonymous = named.startswith("/memfd:") if sys.platform == "linux" else found.st_nlink == 0
+    if sys.platform == "linux":
+        anonymous = named.startswith("/memfd:")
+    else:
+        anonymous = sys.platform == "win32" or found.st_nlink == 0
     if not stat.S_ISREG(found.st_mode) or not anonymous:
         raise SeamError("seam_descriptor", "capability must be a memfd")

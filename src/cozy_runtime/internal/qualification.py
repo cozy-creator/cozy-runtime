@@ -14,7 +14,6 @@ not change what it says.
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import json
 import os
 from collections.abc import Iterator, Mapping, Sequence
@@ -24,6 +23,7 @@ from typing import Any
 
 import msgspec
 
+from cozy_runtime.internal import filelock
 from cozy_runtime.internal.encoding import (
     Capabilities,
     DeviceFacts,
@@ -147,7 +147,7 @@ def _held(cache: str, name: str) -> Iterator[tuple[Path | None, str]]:
         yield None, f"not kept: {type(exc).__name__}"
         return
     with lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        filelock.lock(lock)
         yield path, ""
 
 

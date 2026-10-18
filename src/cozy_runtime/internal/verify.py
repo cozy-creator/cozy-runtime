@@ -12,7 +12,6 @@ the family's order and the run says so.
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import math
@@ -22,7 +21,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import ModuleType
 
-from cozy_runtime.internal import accel, kernel_cache
+from cozy_runtime.internal import accel, filelock, kernel_cache
 from cozy_runtime.internal.encoding.formats import Tensor
 
 #: The verdict files under the machine's kernel store.
@@ -76,7 +75,7 @@ def verified(kernel: str, artifact: str, sm: int, probe: Callable[[], Verdict]) 
         known = _KNOWN[key] = _run(probe)
         return known
     with lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        filelock.lock(lock)
         known = _read(path)
         if known is None:
             _write(path, key, Verdict(False, "its probe ended the process before a verdict"))

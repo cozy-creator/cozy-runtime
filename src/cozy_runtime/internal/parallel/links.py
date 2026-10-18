@@ -20,7 +20,6 @@ conservative route.
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import os
@@ -37,7 +36,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
-from cozy_runtime.internal import kernel_cache, liveness, proctree, spawn
+from cozy_runtime.internal import filelock, kernel_cache, liveness, proctree, spawn
 from cozy_runtime.internal.config import inherited_environment
 from cozy_runtime.internal.parallel import copy_engine, group
 
@@ -301,7 +300,7 @@ def measured(directory: Path | None, devices: Sequence[str]) -> Links:
         directory.mkdir(parents=True, exist_ok=True)
         with open(directory / f"{boot}.lock", "a+") as lock:
             # Held by a measurement in flight, which ends by its own progress (`_probe`).
-            fcntl.flock(lock, fcntl.LOCK_EX)
+            filelock.lock(lock)
             for path in sorted(directory.glob(f"{boot}-*.json")):
                 links = Links.among(json.loads(path.read_text()), devices)
                 if links is not None:

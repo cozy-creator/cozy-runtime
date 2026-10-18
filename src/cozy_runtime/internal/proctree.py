@@ -22,17 +22,23 @@ import errno
 import hashlib
 import os
 import secrets
+import select
 import selectors
 import signal
 import stat
 import sys
+import threading
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
 
+from cozy_runtime.internal import filelock
 from cozy_runtime.internal.child_env import EXECUTOR_SCOPE_ENV
+
+if sys.platform == "win32":
+    import _winapi
 
 PLATFORM = sys.platform
 
@@ -47,6 +53,11 @@ _PR_GET_NO_NEW_PRIVS = 39
 # only on Linux; Python builds that expose the typed wrappers use those instead.
 _SYS_PIDFD_SEND_SIGNAL = 424
 _SYS_PIDFD_OPEN = 434
+_SYNCHRONIZE = 0x00100000
+
+# Linux's parent-death signal survives exec. darwin's and Windows's are a watching thread, which
+# an exec ends: a process that execs (the trampoline) leaves the arming to the program it becomes.
+PARENT_DEATH_SURVIVES_EXEC = PLATFORM == "linux"
 
 
 class ProcessTreeUnsupported(Exception):
@@ -177,20 +188,74 @@ def _prctl(option: int, arg: int = 0) -> int:
 
 def arm_parent_death() -> None:
     """SIGKILL this process when its parent dies. Covers FUTURE deaths only — the caller
-    must re-check the parent afterwards (trampoline step 2)."""
+    must re-check the parent afterwards (trampoline step 2). Linux: PR_SET_PDEATHSIG, which
+    survives exec. darwin and Windows: a daemon thread waits on the parent's exit (kqueue
+    NOTE_EXIT; the parent's process handle) and kills this process; an exec ends it
+    (`PARENT_DEATH_SURVIVES_EXEC`)."""
+    if PLATFORM in ("darwin", "win32"):
+        _watch_parent_exit()
+        return
     _linux_only("arm_parent_death")
     _prctl(_PR_SET_PDEATHSIG, signal.SIGKILL)
 
 
+# A literal platform test: the type checker knows kqueue only where it exists.
+if sys.platform == "darwin":
+
+    def _watch_parent_exit() -> None:
+        queue = select.kqueue()
+        exit_event = select.kevent(
+            os.getppid(),
+            filter=select.KQ_FILTER_PROC,
+            flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+            fflags=select.KQ_NOTE_EXIT,
+        )
+        try:
+            queue.control([exit_event], 0, 0)
+        except ProcessLookupError:
+            os.kill(os.getpid(), signal.SIGKILL)
+
+        def watch() -> None:
+            queue.control(None, 1, None)
+            os.kill(os.getpid(), signal.SIGKILL)
+
+        threading.Thread(target=watch, name="parent-watch", daemon=True).start()
+
+elif sys.platform == "win32":
+
+    def _watch_parent_exit() -> None:
+        try:
+            parent = _winapi.OpenProcess(_SYNCHRONIZE, False, os.getppid())
+        except OSError:
+            _winapi.TerminateProcess(_winapi.GetCurrentProcess(), 1)
+
+        def watch() -> None:
+            _winapi.WaitForSingleObject(parent, _winapi.INFINITE)
+            _winapi.TerminateProcess(_winapi.GetCurrentProcess(), 1)
+
+        threading.Thread(target=watch, name="parent-watch", daemon=True).start()
+
+else:
+
+    def _watch_parent_exit() -> None:
+        raise ProcessTreeUnsupported("arm_parent_death")
+
+
 def seal_no_new_privs() -> None:
-    """After this, exec can never gain privileges; setuid bits are inert."""
+    """After this, exec can never gain privileges; setuid bits are inert. darwin has no such
+    seal, and its machine runs executors as the user who owns it: nothing to drop."""
+    if PLATFORM == "darwin":
+        return
     _linux_only("seal_no_new_privs")
     _prctl(_PR_SET_NO_NEW_PRIVS, 1)
 
 
 def raise_own_oom_score(adj: int) -> None:
     """The EXECUTOR raises its OWN score so the kernel's victim ordering picks the
-    disposable process; the worker control process stays at the default (§3.1)."""
+    disposable process; the worker control process stays at the default (§3.1). darwin has
+    no per-process OOM score (jetsam priorities are not for applications): nothing to set."""
+    if PLATFORM == "darwin":
+        return
     _linux_only("raise_own_oom_score")
     with open("/proc/self/oom_score_adj", "w") as handle:
         handle.write(str(adj))
@@ -1114,12 +1179,9 @@ def remove_executor_scope(scope: ExecutorScope) -> None:
 def acquire_worker_root_lease(path: Path, *, wait: bool = False) -> WorkerRootLease:
     """Acquire the process-lifetime single-worker lease for one worker root; with `wait`,
     block until its holder releases it."""
-    _posix_only("acquire_worker_root_lease")
-    import fcntl
-
     descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
     try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+        filelock.lock(descriptor, wait=wait)
     except BaseException:
         os.close(descriptor)
         raise
@@ -1145,12 +1207,9 @@ def lease_holder(path: Path) -> int | None:
 
 
 def release_worker_root_lease(lease: WorkerRootLease) -> None:
-    _posix_only("release_worker_root_lease")
-    import fcntl
-
     if lease.descriptor < 0:
         return
-    fcntl.flock(lease.descriptor, fcntl.LOCK_UN)
+    filelock.unlock(lease.descriptor)
     os.close(lease.descriptor)
     lease.descriptor = -1
 
