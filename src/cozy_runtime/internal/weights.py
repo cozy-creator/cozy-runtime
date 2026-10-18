@@ -48,6 +48,7 @@ from cozy_runtime.internal import (
     budget_cell,
     canonical,
     lora_bake,
+    module_state,
     plane,
     proctree,
     spill,
@@ -418,6 +419,8 @@ class Weights:
         #: the GPUs of its group: each pins its own weights, so each takes this share of a
         #: host budget the Worker states for the whole group
         self.world = 1
+        #: a group's GPU 1 and up: the owner learns what it holds only from rank 0's replies
+        self.follower = False
         #: the components of the blocks in their forward now (their leases pin their own
         #: weights), innermost last; and the component whose block ran last
         self.running: list[str] = []
@@ -530,11 +533,28 @@ class Weights:
             accel.release_cached(self.torch, self.kind)
         return freed
 
+    def take_cap(self) -> None:
+        """A process cap the owner wrote into the cell (a room grant raising it into what the
+        other tenants gave, the floor watchdog lowering it), applied now: a group's follower
+        hears its cap only there, and an op waiting for room reads no block boundary (run
+        11275: refused under a 718 MB cap on an empty 8 GB GPU). Plane budgets wait for one."""
+        cell = self.cell
+        wanted = cell.pending() if cell is not None else None
+        if cell is not None and wanted is not None and wanted <= budget_cell.CAP:
+            cell.poll()
+            self.set_cap(budget_cell.CAP - wanted)
+            cell.acknowledge(self.applied)
+
     def set_cap(self, cap: int) -> None:
         """The owner's process cap; -1 lifts it. Every plane budget stays inside it, and torch's
         allocator is held to what it leaves beside the context and the plane's maps: an
         activation over its estimate is an out-of-memory the plane recovers from by unmapping,
-        never a full card."""
+        never a full card. TensorD 0.10.0 grants a follower its GPU's free bytes plus what it
+        held at its last reply (run 11399: 670 MB while it held 7.07 GiB), which counts its
+        bytes twice; only a card below its floor (the watchdog) holds one under its own count."""
+        if cap >= 0 and self.follower:
+            memory, held = self._held()
+            cap = max(cap, held + memory["driver_free_bytes"] - self.floor_free)
         self.cap = cap
         self.limit_torch()
 
@@ -958,8 +978,9 @@ class Weights:
 
     def spare(self, operands: Sequence[object]) -> bool:
         """Memory rung 2: the open stages' components with no block in its forward and none of
-        `operands` give their weights back (`WeightResidency._spare`); the one whose block
-        ran last only when nothing else is left."""
+        `operands` give their weights back (`WeightResidency._spare`), never the one whose block
+        ran last: its own code between its blocks (or a sub-block grain's parts) may hold its
+        weights, and a kernel would be handed them unmapped (runs 11440, 11536)."""
         if not self.open:
             return False
         pointers = list(_pointers(operands))
@@ -971,7 +992,7 @@ class Weights:
             and any(region.bound <= p < region.bound + region.span for p in pointers)
         }
         keep, residency = {*self.running, *reads}, self.open[-1][0]
-        return residency._spare({*keep, self.last}) or residency._spare(keep)
+        return residency._spare({*keep, self.last})
 
     def restore_spilled(self) -> int:
         """Tensors an earlier op moved off the device come back while it has room beside the
@@ -1391,9 +1412,9 @@ class Weights:
     # -- the pinned tier
 
     def host_share(self) -> int:
-        """This process's pinned tier at most: its weights, inside what it pins now and its
-        GPU's share of what the host has beside its margin. Tensors moved off the device take
-        host memory before it (`lockable`). -1: the host is unreadable."""
+        """This process's pinned tier at most: its weights, inside the machine's pinned total
+        (`weight_policy.pinned_total`) less what others pin already. -1: the host is
+        unreadable."""
         total = sum(c.ws.nbytes for c in self.components.values())
         try:
             memory = proctree.host_memory()
@@ -1401,8 +1422,9 @@ class Weights:
             return -1
         if memory.available < 0:
             return -1
-        own = max(plane.stats(self.plane).host.used, 0)
-        return min(total, own + max(memory.available - weight_policy.HOST_MARGIN, 0) // self.world)
+        others = max(memory.shmem - max(plane.stats(self.plane).host.used, 0), 0)
+        allowed = weight_policy.pinned_total(memory.available, memory.shmem)
+        return min(total, max(allowed - others, 0) // self.world)
 
     def hold_host(self) -> None:
         """Keep the pinned tier inside what the host has now, whoever set its budget: the
@@ -2050,12 +2072,15 @@ class Effects:
     elsewhere), the generators its seeded ops draw from, and whether the bands rewrote an op
     of it (`Bands.rewrites`: a convolution past its padding's zeros, an op cut in rows). A
     forward that changes nothing else runs with no dispatch layer and, out of memory, again
-    from its generators' states; one that writes, or that the bands rewrote, keeps its ops'
-    recovery. Python attributes it changes (a counter on the module) are not seen."""
+    from its generators' states. One that writes, that the bands rewrote, or that changes a
+    plain attribute of a module in it (`state`: HiDiffusion's step counters) keeps its ops'
+    recovery; one that does not write runs again from those attributes too."""
 
     writes: bool
     generators: tuple[Any, ...]
     banded: bool = False
+    #: the (module, attribute) pairs its first run changed
+    state: tuple[tuple[Module, str], ...] = ()
 
 
 @dataclass(slots=True, eq=False)  # one is told from another by identity, never content
@@ -2110,8 +2135,30 @@ class Journal:
         self.made_here.clear()
         self.first.clear()
 
-    def effects(self, banded: bool = False) -> Effects:
-        return Effects(bool(self.kept), tuple(self.drawn.values()), banded)
+    def effects(self, banded: bool = False, state: tuple[tuple[Module, str], ...] = ()) -> Effects:
+        return Effects(bool(self.kept), tuple(self.drawn.values()), banded, state)
+
+
+def _class_forward(module: Module, *args: object, **kwargs: object) -> object:
+    return type(module).forward(module, *args, **kwargs)
+
+
+def _start(
+    effects: Effects, args: tuple[object, ...], kwargs: Mapping[str, object]
+) -> Callable[[], None]:
+    """What a block's run starts from, to put back before it runs again: the attributes its
+    first run changed, its generators' states, the containers it was handed."""
+    attrs = module_state.take(effects.state)
+    kept = [(g, g.get_state()) for g in effects.generators]
+    held = _containers(args, kwargs)
+
+    def restore() -> None:
+        module_state.put_back(attrs)
+        for generator, state in kept:
+            generator.set_state(state)
+        _put_back(held)
+
+    return restore
 
 
 #: how often a journaled call marks its device progress, in ops (an event costs microseconds)
@@ -3433,8 +3480,12 @@ class WeightResidency:
         rows = self.hooks[component.name] = []
         for region in component.blocks:
             module = region.module
-            rows.append((module, "forward" in module.__dict__, module.forward))
-            module.forward = self._block(component, region, module.forward)
+            had = "forward" in module.__dict__
+            rows.append((module, had, module.forward))
+            # Read at each call: a package that swaps the module's class after load
+            # (HiDiffusion, at its first 4 MP request) runs its own forward.
+            forward = module.forward if had else functools.partial(_class_forward, module)
+            module.forward = self._block(component, region, forward)
 
     def _unhook(self, name: str) -> None:
         for module, had, forward in self.hooks.pop(name, []):
@@ -4320,36 +4371,55 @@ class WeightResidency:
     ) -> Callable[..., Any]:
         """The one hook per block: acquire, bind, run, release. Its ops recover one by one in
         the process's dispatch mode. A block whose first run wrote nothing that existed before
-        it (`Effects`) runs with no mode; out of memory there, it gets back the generators it
-        drew from and the containers it was handed and runs again with its ops recovering, as
-        it does from then on (`tight`). A group GPU's blocks hold their group's collectives:
-        they never run twice, and always recover op by op."""
+        it and changed no attribute (`Effects`) runs with no mode; out of memory there, it gets
+        back the generators it drew from and the containers it was handed and runs again with
+        its ops recovering, as it does from then on (`tight`). One that wrote nothing runs again
+        so from any shortage outside its ops, its changed attributes put back too. A group GPU's
+        blocks hold their group's collectives: they never run twice, and always recover op by
+        op."""
         weights = self.weights
 
         def run(*args: Any, **kwargs: Any) -> Any:
             try:
                 effects = region.effects
-                if (
-                    effects is None
-                    or effects.writes
+                if effects is None:
+                    return learn(*args, **kwargs)
+                quiet = not (
+                    effects.writes
+                    or effects.state
                     or effects.banded
                     or region.tight
                     or weights.grouped
                     or _hosts(args, kwargs)
-                ):
-                    return observed(effects is None, *args, **kwargs)
-                kept = [(g, g.get_state()) for g in effects.generators]
-                held = _containers(args, kwargs)
+                )
+                # A run that wrote nothing runs again, out of memory outside its ops, from what
+                # it started with (the owner, 10-05: replays are made safe, not refused). A
+                # group GPU's never runs twice.
+                restore = (
+                    None if effects.writes or weights.grouped else _start(effects, args, kwargs)
+                )
                 try:
-                    with self._quiet() if self._modes() else nullcontext():
+                    if quiet:
+                        with self._quiet() if self._modes() else nullcontext():
+                            return attempt(True, *args, **kwargs)
+                    with weights.recovering():
                         return attempt(True, *args, **kwargs)
+                except _Regrained:
+                    raise
                 except Exception as exc:
-                    if (short := shortage(exc)) is None:
+                    short = None if restore is None else shortage(exc)
+                    if short is None:
+                        if effects.writes and not _in_call(weights.torch):
+                            # it leaves its writes: unless a group call's journal puts them
+                            # back, the process is not served again should the attempt fail
+                            self.unjournaled = (
+                                f"{component.name}.{region.path} failed after writing"
+                            )
+                            weights.modes["unjournaled"] = self.unjournaled
                         raise
                     exc.__traceback__ = None  # the failed run's frames free their tensors
-                for generator, state in kept:
-                    generator.set_state(state)
-                _put_back(held)
+                assert restore is not None
+                restore()
                 region.tight = True
                 op, operands = f"{component.name}.{region.path}", (*args, *kwargs.values())
                 weights.memory.free_for(short[0] or region.span, op, operands)
@@ -4364,25 +4434,12 @@ class WeightResidency:
             except self._poisoned_error as exc:
                 raise self._poison(exc) from exc
 
-        def observed(first: bool, *args: Any, **kwargs: Any) -> Any:
-            """Its ops recover one by one; its first run also learns its `Effects`, and a
-            first run that fails is put back. A writer that fails later leaves its writes:
-            unless a group call's journal puts them back, the process is not served again
-            should the attempt fail (`unjournaled`)."""
-            if not first:
-                try:
-                    with weights.recovering():
-                        return attempt(True, *args, **kwargs)
-                except _Regrained:
-                    raise
-                except Exception:
-                    wrote = region.effects is not None and region.effects.writes
-                    if wrote and not _in_call(weights.torch):
-                        self.unjournaled = f"{component.name}.{region.path} failed after writing"
-                        weights.modes["unjournaled"] = self.unjournaled
-                    raise
+        def learn(*args: Any, **kwargs: Any) -> Any:
+            """Its first run, journaled: its ops recover one by one, it learns its `Effects`,
+            and one that fails is put back."""
             journal = Journal()
             rewrites = weights.bands.rewrites if weights.bands is not None else 0
+            attributes = module_state.snapshot(region.module)
             try:
                 with weights.recovering(journal):
                     out = attempt(True, *args, **kwargs)
@@ -4391,7 +4448,8 @@ class WeightResidency:
                     journal.rewind()
                 raise
             banded = weights.bands is not None and weights.bands.rewrites > rewrites
-            region.effects = journal.effects(banded)
+            changed = module_state.changed(attributes, module_state.snapshot(region.module))
+            region.effects = journal.effects(banded, changed)
             return out
 
         def attempt(entering: bool, *args: Any, **kwargs: Any) -> Any:

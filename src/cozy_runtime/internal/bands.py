@@ -197,7 +197,7 @@ class Bands:
                     return NotImplemented
             self.rewrites += 1
             if short or hosted:
-                out = self._banded(plan, str(func.overloadpacket))
+                out = self._banded(plan, (*args, *kwargs.values()), str(func.overloadpacket))
             else:  # a convolution skipping taps, with room for it whole
                 out = plan.band(0, int(plan.out.shape[plan.axis]))
             if padding:
@@ -216,11 +216,11 @@ class Bands:
 
     # -- placing and running bands
 
-    def _banded(self, plan: Plan, name: str) -> Any:
+    def _banded(self, plan: Plan, operands: Any, name: str) -> Any:
         """The op in bands, its result placed by `_room`."""
         torch, weights, axis = self.torch, self.weights, plan.axis
         height = int(plan.out.shape[axis])
-        out, rows = self._room(name, plan.out, height, plan.per_row, plan.align)
+        out, rows = self._room(name, plan.out, height, plan.per_row, plan.align, operands)
         while plan.gather is not None:  # statistics first, at a height memory allows
             try:
                 plan.gather(rows)
@@ -253,16 +253,25 @@ class Bands:
         return out
 
     def _room(
-        self, name: str, meta: Tensor, height: int, per_row: int, align: int
+        self,
+        name: str,
+        meta: Tensor,
+        height: int,
+        per_row: int,
+        align: int,
+        operands: tuple[object, ...],
     ) -> tuple[Tensor, int]:
-        """The result of op `name`, like `meta`, on the device when it fits there beside the
-        idle weights that may unmap, else in host memory; and the rows of `height` a piece may
-        take beside it, on multiples of `align`. Never other tensors moved off for it: on 8 GB
-        that took Qwen 4 MP's decode to 87 GB moved in 23 spills (run 10629)."""
+        """The result of op `name`, like `meta`, on the device when it fits there (idle weights
+        unmap and the tensors used least recently move to host memory first: `spill`), else in
+        host memory; and the rows of `height` a piece may take beside it, on multiples of
+        `align`."""
         torch, weights = self.torch, self.weights
         nbytes = _span(meta) * meta.element_size()
         free, movable = weights.activation_room()
         room, least = free + movable, nbytes + 2 * per_row * align
+        if least > room and weights.spill(least - room, operands):
+            free, movable = weights.activation_room()
+            room = free + movable
         on_device = least <= room or not self._hostable(nbytes)
         # two pieces in flight (`_on`)
         rows = (room - (nbytes if on_device else 0)) // max(2 * per_row, 1)
@@ -311,7 +320,7 @@ class Bands:
         meta = self.torch.empty(q.shape, dtype=q.dtype, device="meta")
         with self.torch.utils._python_dispatch._disable_current_modes():
             per_head = 2 * (_bytes(q) + _bytes(k)) // count
-            out, n = self._room("attention", meta, count, per_head, unit)
+            out, n = self._room("attention", meta, count, per_head, unit, (q, k, v))
         self.rewrites += 1
 
         def piece(h: int, n: int, s: int, m: int) -> None:
@@ -353,7 +362,7 @@ class Bands:
         height = int(meta.shape[0])
         per_row = (_bytes(meta) + sum(map(_bytes, sources))) // max(height, 1)
         with self.torch.utils._python_dispatch._disable_current_modes():
-            out, n = self._room("encoded linear", meta, height, per_row, 1)
+            out, n = self._room("encoded linear", meta, height, per_row, 1, sources)
         self.rewrites += 1
 
         def piece(a: int, m: int) -> None:

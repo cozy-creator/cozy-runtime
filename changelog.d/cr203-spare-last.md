@@ -1,0 +1,1 @@
+An op that runs out of memory never takes back the weights of the component whose block ran last: between its blocks (or a sub-block grain's parts) its own code may hold them, and a kernel was handed them unmapped ("Pointer argument cannot be accessed from Triton", H3 on 12 GB cards).

@@ -1087,8 +1087,8 @@ def test_an_op_with_no_room_left_moves_the_tensors_the_process_holds_to_host(car
     finally:
         weights.set_cap(-1)
     close(reference, capped)
-    # What does not fit goes to host memory: the held tensors, or the results of ops cut into
-    # rows (cr-203 U2/U3: a result is placed there before other tensors move for it).
+    # What does not fit goes to host memory: the held tensors first, the results of ops cut
+    # into rows only when nothing else moves (run 11340).
     moved = facts.spilled_bytes - moved
     assert moved >= 128 << 20 or "host memory" in facts.modes.get("bands", ""), facts.modes
     assert all(t.is_cuda and bool((t == i).all()) for i, t in enumerate(held))
@@ -1830,6 +1830,41 @@ def test_an_op_out_of_memory_spares_the_components_not_in_use(
             assert weights.facts().committed_bytes <= mapped - common.span
             assert torch.equal(modules["stack"](encoded), reference)
             assert torch.equal(modules["encoder"](x), encoded)
+    finally:
+        residency.release("run", scope)
+    residency.unpark()
+
+
+@on_card
+def test_an_op_out_of_memory_never_unmaps_what_the_component_that_ran_last_holds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Runs 11440 and 11536 (H3 on 12 GB cards): between its parts, a sub-block DiT's own code
+    read a norm weight from its common region and then allocated. With nothing else left to
+    give, the allocation's ladder spared the DiT itself, unmapping that weight, and the norm
+    kernel was handed a dead pointer ("cannot be accessed from Triton"). The component whose
+    block ran last keeps its weights; the op goes on to the next rung."""
+    weights, residency, modules = scoped(tmp_path)
+    scope = ("encoder", "stack")
+    x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
+    encoder, stack = residency.components["encoder"], residency.components["stack"]
+    assert stack.common is not None
+    residency.admit("run", scope)
+    try:
+        with torch.inference_mode():
+            encoded = modules["encoder"](x)
+            reference = modules["stack"](encoded)  # the stack's blocks ran last
+            embed = modules["stack"].embed  # held by its own code, as a kernel's operand
+            held = embed.clone()
+            assert residency._spare({stack.key}) and encoder.spared  # nothing else to give
+            monkeypatch.setattr(weights, "shrink", lambda *_, **__: 0)  # unmapping gives nothing
+            weights.memory._settle()
+            ask = weights.memory.free() - weight_policy.MARGIN + stack.common.span // 2
+            weights.memory.free_for(ask, "aten.empty.memory_format", (), Rung.FINER)
+            assert not stack.spared and stack.lease is not None
+            assert stack.common.bound is not None
+            assert torch.equal(embed, held)
+            assert torch.equal(modules["stack"](encoded), reference)
     finally:
         residency.release("run", scope)
     residency.unpark()

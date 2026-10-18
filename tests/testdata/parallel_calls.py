@@ -9,6 +9,7 @@ import os
 import socket
 import struct
 import time
+import weakref
 from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
@@ -44,6 +45,10 @@ def collective_oom() -> Exception:
     )
 
 
+#: weak references to what a failed call held on this process's GPU (run 11340)
+HELD: list[weakref.ref[Any]] = []
+
+
 class Collective(torch.nn.Module):  # type: ignore[misc]  # torch is optional in the base checking env
     #: this process's calls whose collective was to run out of memory, after and before it
     ooms = 0
@@ -69,6 +74,7 @@ class Collective(torch.nn.Module):  # type: ignore[misc]  # torch is optional in
         stall: float = 0.0,
         leader_skips: bool = False,
         exhausted: bool = False,
+        live: bool = False,
     ) -> Any:
         assert in_gated_call()
         expected_layout = None if step is None else AttentionLayout(29, 9, step, 1, ("blocks.0",))
@@ -78,6 +84,10 @@ class Collective(torch.nn.Module):  # type: ignore[misc]  # torch is optional in
         if check:
             torch.testing.assert_close(value.cpu(), torch.tensor([3.0, 5.0, 9.0]))
             return value
+        if live:  # what failed calls still hold, over the group
+            count = torch.tensor([float(sum(ref() is not None for ref in HELD))])
+            torch.distributed.all_reduce(count)
+            return count
         if fail and torch.distributed.get_rank() > 0:
             raise ValueError("follower failed before joining the collective")
         rank = torch.distributed.get_rank()
@@ -108,7 +118,13 @@ class Collective(torch.nn.Module):  # type: ignore[misc]  # torch is optional in
             if Collective.ooms <= oom:
                 raise collective_oom()
         if exhausted and rank > 0:
-            raise torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 64.00 MiB.")
+            activations = torch.ones(1 << 16)
+            HELD.append(weakref.ref(activations))
+            try:
+                raise torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 64.00 MiB.")
+            except torch.OutOfMemoryError as caught:
+                kept = caught  # its frame and its exception now hold each other
+                raise kept from None
         return result
 
 
@@ -149,6 +165,11 @@ class ModelCalls(Model[object]):
     def exhausted(self) -> Any:
         with torch.no_grad():
             return self.block(torch.ones(1), exhausted=True)
+
+    @uses_components("block", "overlay")
+    def live(self) -> Any:
+        with torch.no_grad():
+            return self.block(torch.ones(1), live=True)
 
     @uses_components("block", "overlay")
     def counted(self, after: int = 0, before: int = 0) -> Any:

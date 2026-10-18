@@ -150,12 +150,7 @@ class Attempt:
     settle_at_save: bool = False
     """Encode at the save instead (a fake harness: there is no worker to defer to)."""
     entered: bool = False
-    """Whether the package handler itself was entered. Pre-entry refusals never poison a
-    healthy executor; one structural bit is safer than duplicating refusal-code lists."""
-    failed_at_call: bool = False
-    """Whether what ended the handler was a package call's own failure, raised at the call
-    boundary: a safe point like a cancel, so the process stays reusable (run 1514's parent
-    paid a fresh 7.8 s start in run 1516 for a child's OOM)."""
+    """Whether the package handler itself was entered."""
     pending: dict[str, Asset] = field(default_factory=dict)
     committed_files: dict[str, FileAsset] = field(default_factory=dict)
     pending_trees: dict[str, Tree] = field(default_factory=dict)

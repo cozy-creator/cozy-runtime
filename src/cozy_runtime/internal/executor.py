@@ -90,6 +90,7 @@ from cozy_runtime.author._errors import (
     classify,
     ends,
     is_device_oom,
+    unwind,
 )
 from cozy_runtime.author._executor_requests import (
     Answer,
@@ -122,7 +123,14 @@ from cozy_runtime.author._invoke import (
     prepare,
     run_prepared,
 )
-from cozy_runtime.author._model import SCOPES, WARNINGS, Model, WarningRow, component_use
+from cozy_runtime.author._model import (
+    RELEASERS,
+    SCOPES,
+    WARNINGS,
+    Model,
+    WarningRow,
+    component_use,
+)
 from cozy_runtime.author._observations import Attribution
 from cozy_runtime.author._services import AdjustmentRow, ProgressFrame
 from cozy_runtime.author._services import Attempt as AuthorAttempt
@@ -157,6 +165,7 @@ from cozy_runtime.internal import (
     proctree,
     sandbox,
     spawn,
+    spill,
     stage_memo,
     tolerant,
     tools,
@@ -189,6 +198,7 @@ from cozy_runtime.internal.executor_commands import (
     ModelLoad,
     PrepareRequest,
     Probe,
+    Reclaim,
     Release,
     Revoke,
     Share,
@@ -906,6 +916,8 @@ class Executor:
                 return self.probe()
             case Budget():
                 return self.budget(command)
+            case Reclaim():
+                return self.reclaim()
             case Share():
                 return self.share()
             case Revoke():
@@ -2583,6 +2595,7 @@ class Executor:
                 # recover from an out-of-memory op by op, never by running a block again.
                 host.weights.grouped = self.world > 1
                 host.weights.world = self.world
+                host.weights.follower = self.rank > 0
                 host.weights.room = host._device_room  # a follower's asks go through rank 0
                 host.weights.cell = host._budget_cell() if self.rank == 0 else host.rank_cell
             except plane.Unavailable as exc:
@@ -3576,6 +3589,7 @@ class Executor:
                     capture_result = capture.write(spool)
         except Exception as exc:
             envelope, outcome = None, classify(exc)
+            unwind(exc)
             if record is None:
                 record = AuthorAttempt(command.request_id, spool, 0, sink=progress)
         assert record is not None
@@ -3667,6 +3681,16 @@ class Executor:
             self.residency.unpark()  # a repeating stage closes with its attempt
         if torch is not None and last:
             accel.drain(torch, self.device_kind)
+        left, refused = 0, None
+        if outcome.terminal != "succeeded" and last:
+            # The last attempt out, with none running (a group's runs alone): every GPU of a
+            # group, N residencies, gives back what the attempt took on it. One that leaves
+            # others running freed its frames (`unwind`); their bytes are theirs.
+            left, refused = self._followers(
+                self._plane_ranks(), Reclaim(), "reclaim", lambda: self._release(allocated_at_start)
+            )
+        if refused is not None:
+            self.poisoned = f"group: {refused['detail']}"[:300]
         if self.residency is not None and last:
             # Weights the attempt's activations took map again on the plane's copy streams:
             # keeping hot is never the attempt's verdict.
@@ -3692,19 +3716,8 @@ class Executor:
         quiescent = self._quiescent() if torch is not None and last else True
         self.attempts += 1
         result_ref, outputs, oversize = _serialize_result(envelope, spool)
-        # Only a failure inside the handler leaves package state unknown. A request refusal,
-        # a cooperative cancel/deadline or a failed package call stops at a safe point and
-        # keeps the generation Ready — and so does capacity: an OOM or a stage below its
-        # floor fails this attempt, never the executor (weight-plane.md principle 8).
-        if (
-            outcome.terminal == "failed"
-            and record.entered
-            and not record.failed_at_call
-            and outcome.code not in CAPACITY_CODES
-        ):
-            self.poisoned = f"{outcome.terminal}/{outcome.code}" + (
-                f" in {stage[0]}" if stage[0] else ""
-            )
+        # A failed request frees everything and never poisons the executor (owner, cr-203):
+        # only state nothing can put back (below) or bytes `_release` could not free recycle it.
         terminal = {
             "terminal": outcome.terminal,
             "origin": outcome.origin,
@@ -3719,10 +3732,13 @@ class Executor:
         # is the process, so the worker must replace it either way.
         if self.residency is not None and self.residency.poisoned:
             self.poisoned = self.poisoned or f"weights: {self.residency.poisoned[:200]}"
-        left = getattr(self.residency, "unjournaled", "")
-        if outcome.terminal == "failed" and left:
+        unjournaled = getattr(self.residency, "unjournaled", "")
+        if outcome.terminal == "failed" and unjournaled:
             # State, not capacity: a block left writes no journal can put back.
-            self.poisoned = self.poisoned or f"weights: {left[:200]}"
+            self.poisoned = self.poisoned or f"weights: {unjournaled[:200]}"
+        if left > weight_policy.MARGIN:
+            # Bytes nothing here can name: only the process's end gives them back.
+            self.poisoned = self.poisoned or f"the failed request left {left} B on the GPU"
         weights = self.host.weights
         # The BOUNDED observation tail and the O(1) time attribution cross the seam on every
         # path, success or fault. A failed attempt's log tail is the one triage most needs,
@@ -4676,6 +4692,30 @@ class Executor:
         lane's device: the worker sealed this process to exactly its lane (cr-066)."""
         return Device(self.device_kind, 0) if self.torch is not None else Device()
 
+    def _release(self, idle: int) -> int:
+        """A failed attempt gives back all it took (run 11340's executor kept 7.27 GiB that
+        the next request needed): its caches, its frames' cycles, its host copies and torch's
+        cached segments. Returns what stays allocated above `idle`."""
+        for release in RELEASERS:
+            release()
+        if self.host.weights is not None:
+            self.host.weights.shed(sys.maxsize)
+        gc.collect()
+        if self.torch is None:
+            return 0
+        spill.release(self.torch)
+        accel.release_cached(self.torch, self.device_kind)
+        return accel.allocated(self.torch, self.device_kind) - idle
+
+    def reclaim(self) -> dict[str, Any]:
+        """A follower's half of rank 0's `_release`: what stays allocated recycles the group."""
+        entry, self._run_entry = self._run_entry, None
+        left = self._release(entry[1]) if entry is not None else 0
+        if left > weight_policy.MARGIN:
+            self.poisoned = f"the failed request left {left} B on {_gpu(self.rank)}"
+            return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
+        return {"ok": True}
+
     def _quiescent(self) -> bool:
         """No author computation may still mutate GPU or output state when a terminal is
         recorded. The proof is the device's own: every stream is complete."""
@@ -5088,6 +5128,7 @@ _FOLLOWER_COMMANDS = frozenset(
         "vacate",
         "restore",
         "budget",
+        "reclaim",
         "probe",
         "shutdown",
     }
