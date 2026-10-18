@@ -1,7 +1,7 @@
-"""The executor's Windows path on real processes: the seam over a named pipe (frames, handles
-duplicated into the peer, a writable file refused, timeouts and a torn frame typed), the file
-lock, and parent death. The machine's end is the same `PipeChannel` on a pipe this test
-serves, named as TensorD names it."""
+"""The executor's Windows path on real processes: its import, the seam over a named pipe
+(frames, handles duplicated into the peer, a writable file refused, timeouts and a torn frame
+typed), the file lock, and parent death. The machine's end is the same `PipeChannel` on a pipe
+this test serves, named as TensorD names it."""
 
 from __future__ import annotations
 
@@ -64,6 +64,14 @@ except seam.SeamError as exc:
     channel.send({"refused": exc.code})
 channel.close()
 """
+
+    def test_the_executor_imports_as_the_machine_starts_it() -> None:
+        started = subprocess.run(
+            [sys.executable, "-I", "-c", "import cozy_runtime.internal.executor"],
+            capture_output=True,
+            text=True,
+        )
+        assert started.returncode == 0, started.stderr
 
     def test_frames_and_files_cross_a_named_pipe_seam(tmp_path: Path) -> None:
         path = str(tmp_path / "e.sock")
