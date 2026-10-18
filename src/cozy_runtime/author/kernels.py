@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from typing import Any, cast
 
 from cozy_runtime import _kernels
+from cozy_runtime.author._native import NATIVE_READS
 
 ROWWISE_FP8 = "cozy.fp8-rowwise.native-leaf/1"
 INT8_CONVROT = "cozy.int8-convrot256.native-leaf/1"
@@ -213,7 +214,11 @@ def readable[*Ts](*tensors: *Ts) -> Iterator[tuple[*Ts]]:
     """The operands of a kernel launched outside torch's dispatch (Triton, a compiled
     extension), which reads them by pointer. A weight with no plane bytes bound is a stand-in
     with nothing behind its pointer: its plane maps and holds it for the launch, or refuses
-    (`weights.Unbound.reading`). Every such launch goes through here, so none is handed one."""
+    (`weights.Unbound.reading`); a tensor the memory ladder took out of the device comes back
+    first (`NATIVE_READS`). Every such launch goes through here, so none is handed one: a
+    package launches its own kernels through `Plan.load` or calls this around them."""
+    for arrive in NATIVE_READS:
+        arrive(tensors)
     standins = [t for t in tensors if hasattr(type(t), "reading")]
     if not standins:
         yield tensors

@@ -30,7 +30,7 @@ from cozy_runtime.author.kernels import (
     TritonKernels,
     readable,
 )
-from cozy_runtime.internal import int8_linear
+from cozy_runtime.internal import int8_linear, spill
 from cozy_runtime.internal.encoding.formats import NVFP4_BLOCK, Tensor, nvfp4_values
 
 if TYPE_CHECKING:
@@ -304,6 +304,7 @@ def matmul(
     E4M3 block scales in cuBLASLt's 128x4 layout, `scale_2` the f32 `[1]` second level).
 
     `linear_scale` returns the `[N, K/16]` row-major scales; only the eager path asks for it."""
+    spill.arrive((x,))  # its kernels read it by pointer
     rows_out, cols = int(weight.shape[0]), 2 * int(weight.shape[1])
     flat = x.reshape(-1, cols).contiguous()
     rows = int(flat.shape[0])

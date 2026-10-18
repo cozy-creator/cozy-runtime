@@ -32,6 +32,7 @@ from cozy_runtime.internal import (
     kernel_compile,
     kernel_sources,
     prebuilt,
+    spill,
     tools,
 )
 from cozy_runtime.internal.encoding.formats import CONVROT_GROUP, Tensor, hadamard256
@@ -212,6 +213,7 @@ def linear(
     out_dtype: object,
 ) -> Tensor:
     """`x @ W.T + bias` for one `int8-convrot256/1` weight: `data` int8 `[N, K]`, `scale` f32."""
+    spill.arrive((x,))  # its kernels read it by pointer
     index = x.get_device()
     op = _OPS.get(index)
     try:

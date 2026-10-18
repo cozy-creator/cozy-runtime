@@ -467,6 +467,8 @@ class Weights:
         self.memory = Memory(self)
         if not self.host_only:
             self.measure_context()
+            # a storage a kernel reads comes back through this ladder (`spill.arrive`)
+            spill.RETRY[:] = [weakref.WeakMethod(self.memory.retry)]
         if kind == "cuda":
             _observe_refusals(torch, self)
 

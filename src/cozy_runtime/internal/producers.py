@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Protocol
 from cozy_runtime.author._attention import AttentionProducer, ProducerCall
 from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT
 from cozy_runtime.author.kernels import PreQuantized
-from cozy_runtime.internal import attention_sol, attention_ulysses, fp8_linear
+from cozy_runtime.internal import attention_sol, attention_ulysses, fp8_linear, spill
 
 if TYPE_CHECKING:
     from torch import Tensor
@@ -107,7 +107,7 @@ class Processor:
             component=self.component,
             path=self.path,
             layout=layout,
-            kernel=sys.modules.get(self.kernel),
+            kernel=_native(sys.modules.get(self.kernel)),
             state=state,
             group=group,
             original=original,
@@ -117,6 +117,40 @@ class Processor:
         )
         result: Tensor = self.producer.produce(call, *args, **kwargs)
         return result
+
+
+class _Native:
+    """A kernel module whose callables read their tensor operands by pointer: each brings them
+    back to the device first (`spill.arrive`), as `kernels.readable` does for Runtime's own
+    launches. A callable is wrapped once, on first use."""
+
+    def __init__(self, module: object) -> None:
+        self._module = module
+
+    def __getattr__(self, name: str) -> object:
+        value = getattr(self._module, name)
+        if not callable(value):
+            return value
+
+        def call(*args: object, **kwargs: object) -> object:
+            if spill.OUT[0] or spill.PRESSED[0]:
+                spill.arrive((args, tuple(kwargs.values())))
+            return value(*args, **kwargs)
+
+        setattr(self, name, call)
+        return call
+
+
+_NATIVE: dict[int, _Native] = {}
+
+
+def _native(module: object) -> object:
+    if module is None:
+        return None
+    found = _NATIVE.get(id(module))
+    if found is None:
+        found = _NATIVE[id(module)] = _Native(module)
+    return found
 
 
 def _quantize(x: Tensor) -> PreQuantized:

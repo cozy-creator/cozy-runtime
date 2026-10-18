@@ -7,12 +7,14 @@ from __future__ import annotations
 
 import gc
 from collections.abc import Iterator
+from types import SimpleNamespace
 
 import pytest
 
 torch = pytest.importorskip("torch")
 
-from cozy_runtime.internal import spill  # noqa: E402
+from cozy_runtime.author import kernels  # noqa: E402
+from cozy_runtime.internal import producers, spill  # noqa: E402
 from cozy_runtime.internal.weights import _noting  # noqa: E402
 
 CPU = torch.device("cpu")
@@ -28,6 +30,7 @@ def _pressed() -> Iterator[None]:
     spill.PRESSED[0] = True
     yield
     spill.OFF.clear()
+    spill.OUT[0] = 0
     spill.USED.clear()
     spill.NATIVE.clear()
     spill.PRESSED[0] = False
@@ -82,3 +85,57 @@ def test_a_copy_goes_with_its_last_tensor_and_the_rest_come_back_at_a_request() 
     assert not spill.OFF and torch.equal(kept, torch.full((FLOATS,), 7.0))
     spill.release(torch)
     assert not spill.PRESSED[0], "nothing off the device: ops are no longer noted"
+
+
+def _left(disk: bool) -> tuple[torch.Tensor, torch.Tensor]:
+    """A tensor only kernels read (no op touched it this stage) taken out whole, and a view of
+    it at an offset: once its storage is emptied, that view's pointer is not even null."""
+    with _noting(torch, None, None):
+        statistics = torch.arange(FLOATS, dtype=torch.float32)
+        view = statistics[1:]
+        spill.began()
+        spill.spill(torch, CPU, 4 * FLOATS, (), 0 if disk else 4 * FLOATS, False, disk)
+    assert statistics.untyped_storage().nbytes() == 0 and spill.OUT[0] == 1
+    return statistics, view
+
+
+def _read(tensor: torch.Tensor) -> torch.Tensor:
+    """A native kernel: it reads the bytes behind the pointer, never through torch's dispatch."""
+    assert tensor.untyped_storage().nbytes() >= tensor.numel() * tensor.element_size()
+    return tensor.clone()
+
+
+@pytest.mark.parametrize("disk", [False, True], ids=["host", "disk"])
+def test_a_kernel_launch_brings_back_what_the_ladder_took_out(disk: bool) -> None:
+    """Run 11343 (H3 on a 12 GB RTX 5070): the ladder took a tensor only kernels read out of the
+    device whole, and a Triton launch was handed a pointer with nothing behind it ('Pointer
+    argument cannot be accessed from Triton'). Every launch outside torch's dispatch reads its
+    operands through `readable`, which brings them back first."""
+    _, view = _left(disk)
+    with kernels.readable(view) as (operand,):
+        got = _read(operand)
+    assert torch.equal(got, torch.arange(1, FLOATS, dtype=torch.float32))
+    assert spill.OUT[0] == 0 and not spill.OFF
+
+
+def test_a_producers_kernel_call_brings_back_what_the_ladder_took_out() -> None:
+    """A package's attention producer calls its kernel module (Kitchen's `sol_attn_chunked`)
+    with state it keeps across steps: the module Runtime hands it brings each call's tensors
+    back first, nested in tuples and keywords too."""
+    _, view = _left(False)
+    kitchen = producers._native(SimpleNamespace(attend=lambda scales, kmean: _read(kmean)))
+    got = kitchen.attend((torch.ones(4),), kmean=view)  # type: ignore[attr-defined]
+    assert torch.equal(got, torch.arange(1, FLOATS, dtype=torch.float32)) and spill.OUT[0] == 0
+
+
+def test_a_tensor_kernels_read_counts_as_read() -> None:
+    """Under pressure a kernel's read counts as an op's does: a tensor only kernels read is not
+    the first to leave."""
+    with _noting(torch, None, None):
+        kept = torch.arange(FLOATS, dtype=torch.float32)
+        spill.began()
+    with kernels.readable(kept) as (operand,):
+        _read(operand)
+    with _noting(torch, None, None):
+        assert spill.spill(torch, CPU, 4 * FLOATS, (), 4 * FLOATS, False, False) == 0
+    assert kept.untyped_storage().nbytes() == 4 * FLOATS and not spill.OFF

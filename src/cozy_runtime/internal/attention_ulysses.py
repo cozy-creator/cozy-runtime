@@ -140,6 +140,7 @@ def _dispatch(backend: str, local: Local) -> Callable[..., Tensor]:
 def _call(
     backend: str, local: Local, query: Tensor, key: Tensor, value: Tensor, options: Options
 ) -> Tensor:
+    spill.arrive((query, key, value, options["attn_mask"]))  # kernels read them by pointer
     scope = _SEEN.get()
     if scope is not None:
         masked, causal = options["attn_mask"] is not None, options["is_causal"]

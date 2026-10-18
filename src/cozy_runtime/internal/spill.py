@@ -6,7 +6,8 @@ op's operands last, a storage leaves two ways:
   holds its tensors, native code included, is unchanged. While the host can give it.
 - Out: one no op touched since its stage began (`began`) is copied to pageable host memory, or
   to disk once the host can give no more (rung 5), and its device bytes are released; the
-  dispatch mode brings it back before an op reads it (`fault`). Never a CUDA graph pool's: its
+  dispatch mode brings it back before an op reads it (`fault`), and a launch outside it before
+  the kernel does (`arrive`). Never a CUDA graph pool's, nor what a graph holds (`home`): its
   graphs read it unseen. Unified memory (Apple) has only this way.
 
 Ops are noted only under pressure, from the first move until nothing is off the device. Locking
@@ -29,6 +30,7 @@ from types import ModuleType
 from typing import TYPE_CHECKING, cast
 
 from cozy_runtime.author._errors import is_device_oom
+from cozy_runtime.author._native import NATIVE_READS
 
 if TYPE_CHECKING:
     from io import BufferedRandom
@@ -36,6 +38,9 @@ if TYPE_CHECKING:
     from torch import Tensor, UntypedStorage
     from torch import device as Device
     from torch.multiprocessing.reductions import StorageWeakRef
+
+#: `Memory.retry`: an attempt, what it is, its operands
+type Retry = Callable[[Callable[[], None], str, Sequence[object]], None]
 
 #: Storages smaller than this are not worth a copy.
 SMALLEST = 1 << 20
@@ -80,6 +85,12 @@ class Off:
 
 #: every storage off its device, by `_cdata`
 OFF: dict[int, Off] = {}
+#: how many of them are out: a native read has work only while there is one, or pressure
+OUT = [0]
+#: the torch a move ran with, and the memory ladder that makes room for a storage's return
+#: (`Memory.retry`, weakly: the process's GPU executor sets it)
+_TORCH: list[ModuleType] = []
+RETRY: list[Callable[[], Retry | None]] = []
 #: storages code outside the dispatch mode reads (`native`), by `_cdata`
 NATIVE: dict[int, StorageWeakRef] = {}
 
@@ -169,6 +180,32 @@ def native(torch: ModuleType, *values: object) -> None:
         NATIVE[int(storage._cdata)] = torch.multiprocessing.reductions.StorageWeakRef(storage)
 
 
+def home(torch: ModuleType, values: tuple[object, ...]) -> None:
+    """`values` on their device for good, before code that keeps their addresses (a CUDA graph's
+    capture): back from wherever they are, and never moved again (`native`)."""
+    if OFF:
+        with torch.utils._python_dispatch._disable_current_modes():
+            fault(torch, values, RETRY[0]() if RETRY else None, mapped=True)
+    native(torch, *values)
+
+
+def arrive(values: tuple[object, ...]) -> None:
+    """Native code (a Triton or CUDA launch, a Kitchen call) reads `values` by pointer: a storage
+    out of the device comes back first, and under pressure they count as read, as an op's
+    operands do, so a tensor only kernels read never looks idle. Constant time while nothing
+    is out and nothing is pressed."""
+    if not (OUT[0] or PRESSED[0]) or not _TORCH:
+        return
+    torch = _TORCH[0]
+    with torch.utils._python_dispatch._disable_current_modes():
+        if OUT[0]:
+            fault(torch, values, RETRY[0]() if RETRY else None)
+        touch(torch, values)
+
+
+NATIVE_READS.append(arrive)
+
+
 def began() -> None:
     """The outermost stage begins: what no op touches from now on may leave the device whole."""
     BEGAN[0] = _CLOCK[0] + 1
@@ -238,6 +275,7 @@ def spill(
     if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
         return 0  # a capture can neither wait for the device nor copy from pageable memory
     PRESSED[0] = True
+    _TORCH[:] = [torch]
     started = time.perf_counter_ns()
     _sweep()
     _fence(torch, device)
@@ -278,14 +316,15 @@ def spill(
 def fault(
     torch: ModuleType,
     operands: Sequence[object],
-    retry: Callable[[Callable[[], None], str, Sequence[object]], None] | None,
+    retry: Retry | None,
+    mapped: bool = False,
 ) -> None:
-    """Storages among an op's `operands` that are out come back before it runs, each
-    allocation making its room as any op's does (`retry`)."""
+    """Storages among an op's `operands` that are out (and with `mapped`, those mapped too)
+    come back before it runs, each allocation making its room as any op's does (`retry`)."""
     for tensor in stored(operands):
         storage = tensor.untyped_storage()
         off = OFF.get(storage._cdata)
-        if off is None or not off.out:
+        if off is None or not (off.out or mapped):
             continue
         back = partial(_in, torch, storage, off)
         if retry is None:
@@ -382,7 +421,9 @@ def _note(
     file: BufferedRandom | None = None,
 ) -> None:
     weak = torch.multiprocessing.reductions.StorageWeakRef(storage)
-    OFF[int(storage._cdata)] = Off(weak, int(storage.nbytes()), host, file)
+    OFF[int(storage._cdata)] = off = Off(weak, int(storage.nbytes()), host, file)
+    OUT[0] += off.out
+    _TORCH[:] = [torch]
 
 
 def _map(torch: ModuleType, device: Device, storage: UntypedStorage) -> None:
@@ -430,13 +471,16 @@ def _in(torch: ModuleType, storage: UntypedStorage, off: Off) -> None:
             flat.copy_(torch.frombuffer(pages, dtype=torch.uint8))
         file.close()
     del OFF[storage._cdata]
+    OUT[0] -= off.out
     TOTALS[6] += off.nbytes
 
 
 def _sweep() -> None:
     """What was kept for storages no tensor holds any more goes."""
     for key in [key for key, off in OFF.items() if off.ref.expired()]:
-        if (file := OFF.pop(key).file) is not None:
-            file.close()
+        off = OFF.pop(key)
+        OUT[0] -= off.out
+        if off.file is not None:
+            off.file.close()
     for key in [key for key, ref in NATIVE.items() if ref.expired()]:
         del NATIVE[key]

@@ -16,7 +16,7 @@ import sys
 from types import ModuleType
 
 from cozy_runtime.author.kernels import PreQuantized
-from cozy_runtime.internal import int8_linear, prebuilt
+from cozy_runtime.internal import int8_linear, prebuilt, spill
 from cozy_runtime.internal.encoding.formats import E4M3_MAX, Tensor
 
 #: The activation scale's floor, as `ROW_SCALE_FLOOR` is the weights': a row of exact zeros
@@ -113,6 +113,7 @@ def linear(
     out_dtype: object,
 ) -> Tensor:
     """`x @ W.T + bias` for one `fp8-rowwise/1` weight: `data` E4M3 `[N, K]`, `scale` f32."""
+    spill.arrive((x,))  # its kernels read it by pointer
     op = _op(torch, x, x.dtype, out_dtype)
     if op is not None:
         try:

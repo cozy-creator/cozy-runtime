@@ -340,6 +340,16 @@ def _record(
     reserved = torch.cuda.memory_reserved()
     inputs = [leaf.clone() if isinstance(leaf, torch.Tensor) else None for leaf in leaves]
     native(torch, inputs)
+    # A graph bakes in every address it reads: what the module holds is on the device before
+    # the capture and never moves after it (a buffer the ladder moved would sit at another
+    # address, and a replay read dead memory).
+    spill.home(
+        torch,
+        (
+            *module.buffers(),
+            *(v for m in module.modules() for v in vars(m).values() if isinstance(v, torch.Tensor)),
+        ),
+    )
     static = [s if s is not None else v for s, v in zip(inputs, leaves, strict=True)]
     cargs, ckwargs = torch.utils._pytree.tree_unflatten(static, spec)
     outputs: list[Any] = []

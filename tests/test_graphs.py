@@ -12,6 +12,7 @@ torch = pytest.importorskip("torch")
 
 from cozy_runtime import graphs  # noqa: E402
 from cozy_runtime.author._model import WARNINGS  # noqa: E402
+from cozy_runtime.internal import spill  # noqa: E402
 
 CUDA = torch.cuda.is_available()
 
@@ -83,6 +84,47 @@ def test_a_call_that_depends_on_hidden_state_runs_as_written() -> None:
             module(x)
     assert not graphs._RECORDERS[module].recordings
     assert [message for message, _ in WARNINGS] == ["a CUDA graph was not used"]
+
+
+def _tabled() -> Any:
+    """A module whose forward reads a buffer of its own (a rope table): a graph bakes its
+    address."""
+
+    base: Any = torch.nn.Module
+
+    class Tabled(base):  # type: ignore[misc]
+        def __init__(self) -> None:
+            super().__init__()
+            self.linear = torch.nn.Linear(64, 64)
+            self.register_buffer("table", torch.arange(1 << 20, dtype=torch.float32))
+
+        def forward(self, x: Any) -> Any:
+            return self.linear(x) + self.table[:64]
+
+    return Tabled()
+
+
+@pytest.mark.skipif(not CUDA, reason="CUDA graphs need a GPU")
+def test_what_a_recording_reads_never_leaves_the_device() -> None:
+    """Run 11343's class on a graph: the memory ladder takes a storage out of the device whole
+    and brings it back at another address, but a replay reads the address the capture saw. What
+    a recorded module holds is on the device before the capture and never leaves after it."""
+    torch.manual_seed(0)
+    module = _tabled().cuda()
+    graphs.install(torch, object(), {"tabled": module})
+    x = torch.randn(4, 64, device="cuda")
+    with torch.inference_mode():
+        expected = torch.nn.Module.__call__(module, x)
+        for _ in range(3):
+            module(x)
+        assert graphs._RECORDERS[module].recordings, "it records"
+        table = module.table.untyped_storage()
+        spill.began()
+        spill.spill(torch, torch.device("cuda"), table.nbytes(), (), 0, False, True)
+        assert table.nbytes() == 4 << 20 and int(table._cdata) not in spill.OFF
+        assert torch.equal(module(x), expected)
+    spill.restore(torch, torch.device("cuda"), 1 << 40)
+    spill.NATIVE.clear()
 
 
 @pytest.mark.skipif(not CUDA, reason="CUDA graphs need a GPU")
