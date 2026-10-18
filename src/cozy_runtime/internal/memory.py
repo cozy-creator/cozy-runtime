@@ -282,7 +282,7 @@ class Memory:
             nbytes, own = short
             nbytes = nbytes or MARGIN
             if own:
-                unused = max(weights.applied - weights._committed(), 0) if weights.cap < 0 else 0
+                unused = max(weights.applied - weights._committed(), 0)
                 if not self.free_for(nbytes + unused, op, operands, upto):
                     self.exhausted(nbytes, op)
                 weights._apply(weights.applied + nbytes)
