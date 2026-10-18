@@ -245,9 +245,9 @@ jobs:
           path: dist/
           if-no-files-found: error
 
-  # The Windows wheel, the very file this release publishes, installs and loads its kernels on
-  # Windows. No-deps: TensorFS publishes no Windows build yet, so the full install is not yet a
-  # Windows promise; the wheel's own contents are.
+  # The Windows wheel, the very file this release publishes, installs with its dependencies on
+  # Windows, its executor imports as the machine starts it, and its kernels load (0.28.0's
+  # executor died on import: os.sysconf).
   windows:
     needs: [build, gated]
     if: ${{ !cancelled() && (needs.build.result == 'success' || needs.gated.result == 'success') }}
@@ -261,11 +261,13 @@ jobs:
           name: release-dist
           path: dist
       - uses: astral-sh/setup-uv@v7
-      - name: Install with no dependencies, load the kernels
+      - name: Install, import the executor, load the kernels
         shell: pwsh
         run: |
           uv venv --python 3.12 venv
-          uv pip install --python venv\Scripts\python.exe --no-deps (Get-ChildItem dist\*-win_amd64.whl).FullName
+          uv pip install --python venv\Scripts\python.exe (Get-ChildItem dist\*-win_amd64.whl).FullName
+          venv\Scripts\python.exe -I -c "import cozy_runtime.internal.executor"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           venv\Scripts\python.exe -I -c @"
           import cozy_runtime._kernels as k
           assert not k.ABSENT, k.ABSENT

@@ -1,0 +1,1 @@
+Runtime 0.28.1 replaces 0.28.0, which was tagged but never published: its Windows executor died on import (stage_memo called `os.sysconf`). Physical memory now comes from one helper that reads it on every OS (#1592), and the release's Windows job installs the wheel with its dependencies and imports the executor.
