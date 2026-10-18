@@ -38,6 +38,7 @@ from test_host_tier import GpuTier  # noqa: E402
 from test_weight_plane import (  # noqa: E402
     HIDDEN,
     Stack,
+    aim,
     assert_pinned,
     load,
     on_gpu,
@@ -229,14 +230,14 @@ def test_an_executor_computes_on_the_machines_sealed_layout_and_reads_no_store(
         # A GPU executor's tier (no device here): pinned inside the machine's budget only.
         budget = 64 << 20
         gpu = GpuTier(torch, torch.device("cpu"), "cpu")
-        gpu.set_budget(-1, budget)
+        gpu.set_pinned(budget)
         again = load(gpu, checkpoint, "sealed", tiers=second.tiers).backend.components["stack"]
         assert again.sealed and machine.fills == 1  # the machine's one fill serves both
         for ticket in again.filling:
             ticket.wait()
         tier = plane.stats(gpu.plane).host
         assert 0 < tier.used <= budget and tier.fill_bytes == 0, tier
-        gpu.set_budget(-1, again.ws.nbytes)  # a raise pins the rest, still without a read
+        gpu.set_pinned(again.ws.nbytes)  # a raise pins the rest, still without a read
         assert_pinned(gpu, again, values)
         assert plane.stats(gpu.plane).host.fill_bytes == 0
     finally:
@@ -383,7 +384,7 @@ def test_a_layout_staged_in_part_pins_only_what_was_staged_and_reads_no_store(
     nothing, some = Session(machine, tmp_path, stage=()), Session(machine, tmp_path, stage=(0,))
     try:
         gpu = GpuTier(torch, torch.device("cpu"), "cpu")
-        gpu.set_budget(-1, budget)
+        gpu.set_pinned(budget)
         model = load(gpu, checkpoint, "holes", tiers=nothing.tiers)
         component = model.backend.components["stack"]
         assert component.sealed and component.staging is not None
@@ -399,7 +400,7 @@ def test_a_layout_staged_in_part_pins_only_what_was_staged_and_reads_no_store(
         assert machine.stage_asks == [(), (1, 2)]
 
         part = GpuTier(torch, torch.device("cpu"), "cpu")
-        part.set_budget(-1, budget)
+        part.set_pinned(budget)
         again = load(part, checkpoint, "part", tiers=some.tiers).backend.components["stack"]
         assert again.sealed and machine.stage_asks[2:] == [(0,)]
         for ticket in again.filling:
@@ -423,10 +424,10 @@ def test_the_machine_stages_only_what_a_stage_streams_every_step(tmp_path: Path)
     session = Session(machine, tmp_path, stage=())
     try:
         weights = Weights(torch, torch.device("cuda", 0), "cuda")
-        weights.set_budget(-1, pinned=1 << 30)
+        weights.set_pinned(1 << 30)
         model = load(weights, checkpoint, "steps", tiers=session.tiers)
         component = model.residency.components["stack"]
-        weights.set_budget(tight(model))
+        aim(weights, tight(model))
         x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
 
         def request(passes: int) -> None:

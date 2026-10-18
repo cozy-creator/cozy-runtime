@@ -65,7 +65,7 @@ def test_a_gpu_executor_bakes_a_prepared_graph_and_per_step_serves_it_unbaked(
     weights = Weights(
         torch, torch.device(device, 0) if device == "cuda" else torch.device(device), device
     )
-    weights.set_budget(-1, pinned=64 << 20)
+    weights.set_pinned(64 << 20)
     backend = PlaneBackend.for_script(
         {"transformer": checkpoint}, rows, weights=weights, construction="baked", release="baked/1"
     )
@@ -205,7 +205,7 @@ def test_a_baked_fp8_projection_keeps_the_loras_effect(tmp_path: Path) -> None:
         configs[lora_composition.GRAPH_CONFIG],
     )
     weights = Weights(torch, torch.device("cuda", 0), "cuda")
-    weights.set_budget(-1, pinned=64 << 20)
+    weights.set_pinned(64 << 20)
     backend = PlaneBackend.for_script(
         {"transformer": checkpoint}, rows, weights=weights, construction="fp8", release="fp8/1"
     )

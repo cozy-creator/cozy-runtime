@@ -1,4 +1,4 @@
-"""Real rank control sockets agree plan, parking and ceiling without a CUDA collective."""
+"""Real rank control sockets agree plan and ceiling without a CUDA collective."""
 
 from __future__ import annotations
 
@@ -31,10 +31,7 @@ for model in ('base', 'overlay'):
         channel.recv()
         break
     if mode == 'wrong_model' and rank == 1:
-        channel.send(
-            {'reply': 'resident_budget', 'rank': rank, 'model': 'wrong', 'plan': plan,
-             'required': 1}
-        )
+        channel.send({'reply': 'resident_budget', 'rank': rank, 'model': 'wrong', 'plan': plan})
         channel.recv()
         break
     mine = dict(plan)
@@ -44,14 +41,10 @@ for model in ('base', 'overlay'):
     ceiling = 98091614208 - rank * 33554432 - offset
     if mode == 'zero' and rank == degree - 1:
         ceiling = 0
-    parked = []
-    actual = receive_residence(
-        channel, rank=rank, model=model, plan=mine, required=1000 + rank,
-        park=parked.extend, ceiling=lambda: ceiling,
-    )
+    actual = receive_residence(channel, rank=rank, model=model, plan=mine, ceiling=lambda: ceiling)
     expected = 0 if mode == 'zero' else 98091614208 - (degree-1) * 33554432 - offset
     assert actual == expected, (actual, expected)
-    channel.send({'reply': 'filled', 'ceiling': actual, 'model': model, 'parked': parked})
+    channel.send({'reply': 'filled', 'ceiling': actual, 'model': model})
 channel.recv()
 """
 
@@ -79,87 +72,54 @@ def test_residence_agreement_over_real_follower_processes(
         )
 
     group = RankGroup(degree=degree, backend="cpu:gloo", root=str(tmp_path), launch=launch)
-    needs: list[int] = []
-
-    def park(need: int) -> list[str]:
-        needs.append(need)
-        return ["sha256:old"]
-
     try:
         group.spawn()
         if mode in ("early_failure", "wrong_model", "divergent"):
             with pytest.raises(GroupRefusal) as refused:
-                group.agree_residence(
-                    model="base", plan=PLAN, required=1000, park=park, ceiling=lambda: 1
-                )
+                group.agree_residence(model="base", plan=PLAN, ceiling=lambda: 1)
             if mode == "early_failure":
                 assert "device_shortfall" in str(refused.value)
             if mode == "divergent":
                 assert isinstance(refused.value, GpuDivergence)
                 assert "plan_digest" in str(refused.value)
-            assert not needs, "nothing parks before every plan agrees"
             return
         for model, offset in [("base", 0), ("overlay", 100)]:
 
             def ceiling(offset: int = offset) -> int:
                 return 98091614208 - offset
 
-            agreed, parked = group.agree_residence(
-                model=model, plan=PLAN, required=1000, park=park, ceiling=ceiling
-            )
+            agreed = group.agree_residence(model=model, plan=PLAN, ceiling=ceiling)
             expected = 0 if mode == "zero" else 98091614208 - (degree - 1) * 33554432 - offset
-            assert agreed == expected and parked == ["sha256:old"]
-            # rank 0 parks for the LARGEST need any rank reported
-            assert needs[-1] == 1000 + degree - 1
+            assert agreed == expected
             replies = group.collect("filled")
-            assert all(
-                reply["ceiling"] == expected
-                and reply["model"] == model
-                and reply["parked"] == ["sha256:old"]
-                for reply in replies
-            )
+            assert all(r["ceiling"] == expected and r["model"] == model for r in replies)
     finally:
         group.close()
     assert all(follower.exit_status() is not None for follower in group.followers)
 
 
 @pytest.mark.parametrize(
-    ("park", "ceiling", "match"),
+    "ceiling",
     [
-        ({"cmd": "resident_budget", "model": "base", "park": "x"}, None, "parking"),
-        ({"cmd": "resident_budget", "model": "overlay", "park": []}, None, "parking"),
-        ({"cmd": "load", "model": "base", "park": []}, None, "parking"),
-        (None, {"cmd": "resident_ceiling", "model": "base", "ceiling": 101}, "ceiling"),
-        (None, {"cmd": "resident_ceiling", "model": "base", "ceiling": -1}, "ceiling"),
-        (None, {"cmd": "resident_ceiling", "model": "base", "ceiling": True}, "ceiling"),
-        (None, {"cmd": "resident_ceiling", "model": "overlay", "ceiling": 50}, "ceiling"),
+        {"cmd": "resident_ceiling", "model": "base", "ceiling": 101},
+        {"cmd": "resident_ceiling", "model": "base", "ceiling": -1},
+        {"cmd": "resident_ceiling", "model": "base", "ceiling": True},
+        {"cmd": "resident_ceiling", "model": "overlay", "ceiling": 50},
+        {"cmd": "load", "model": "base", "ceiling": 50},
     ],
 )
-def test_follower_refuses_invalid_or_larger_decision(
-    park: dict[str, object] | None, ceiling: dict[str, object] | None, match: str
-) -> None:
+def test_follower_refuses_invalid_or_larger_decision(ceiling: dict[str, object]) -> None:
     ours, theirs = socket.socketpair()
     follower, leader = Channel(ours), Channel(theirs)
     try:
-        leader.send(park or {"cmd": "resident_budget", "model": "base", "park": []})
-        if ceiling is not None:
-            leader.send(ceiling)
-        refusal = f"^gpu_divergence: GPU 1 disagrees .*invalid group .*{match}"
+        leader.send(ceiling)
+        refusal = "^gpu_divergence: GPU 1 disagrees .*invalid group residence ceiling"
         with pytest.raises(GpuDivergence, match=refusal):
-            receive_residence(
-                follower,
-                rank=1,
-                model="base",
-                plan=PLAN,
-                required=7,
-                park=lambda keys: None,
-                ceiling=lambda: 100,
-            )
+            receive_residence(follower, rank=1, model="base", plan=PLAN, ceiling=lambda: 100)
         offered = leader.recv()
-        assert offered is not None and offered["required"] == 7 and offered["plan"] == PLAN
-        if ceiling is not None:
-            measured = leader.recv()
-            assert measured is not None and measured["ceiling"] == 100
+        assert offered is not None and offered["plan"] == PLAN
+        measured = leader.recv()
+        assert measured is not None and measured["ceiling"] == 100
     finally:
         follower.close()
         leader.close()

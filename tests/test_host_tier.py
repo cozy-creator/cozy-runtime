@@ -60,7 +60,7 @@ def test_a_pinned_budget_given_with_the_load_bounds_the_fill_from_its_first_byte
     checkpoint = write_checkpoint(tmp_path)[0]
     budget = 96 << 20  # below the set's 128 MiB
     weights = GpuTier(torch, torch.device("cpu"), "cpu")
-    weights.set_budget(-1, budget)  # what `Executor.load` applies from `Load.pinned_bytes`
+    weights.set_pinned(budget)  # what `Executor.load` applies from `Load.pinned_bytes`
     filling = load(weights, checkpoint, "bounded").residency.components["stack"].filling
     assert filling
     for ticket in filling:
@@ -82,7 +82,7 @@ def test_a_weight_set_closes_after_its_pinned_tier_gave_regions_back(tmp_path: P
     its fill had asked for, and closing the set (to refine it) reported `region 80 left the
     pinned tier` as the run's failure. The tier is optional: the set closes."""
     weights = GpuTier(torch, torch.device("cpu"), "cpu")
-    weights.set_budget(-1, 1 << 30)
+    weights.set_pinned(1 << 30)
     component = load(weights, write_checkpoint(tmp_path)[0], "shrunk").residency.components["stack"]
     for ticket in component.filling:
         ticket.wait()

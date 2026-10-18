@@ -115,7 +115,7 @@ def test_an_armed_forward_bakes_and_a_base_forward_finds_the_bytes_refilled(
     weights = Weights(
         torch, torch.device(device, 0) if device == "cuda" else torch.device(device), device
     )
-    weights.set_budget(-1, pinned=64 << 20)
+    weights.set_pinned(64 << 20)
     backend = PlaneBackend.for_script(
         {"fl2va_dit": checkpoint}, rows, weights=weights, construction="lora", release="lora/1"
     )

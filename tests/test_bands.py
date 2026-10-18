@@ -9,6 +9,7 @@ memory (`short`): the bands it can run in, or whole.
 from __future__ import annotations
 
 from collections.abc import Callable
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -34,14 +35,9 @@ class Card:
     unified = False
 
     def __init__(self, room: int) -> None:
-        self.torch, self.device, self.room = torch, torch.device("cpu"), room
+        self.torch, self.device = torch, torch.device("cpu")
+        self.memory = SimpleNamespace(available=lambda: room, idle=lambda _: None)
         self.modes: dict[str, str] = {}
-
-    def activation_room(self) -> tuple[int, int]:
-        return self.room, 0
-
-    def free_for(self, need: int) -> None:
-        pass
 
     def lockable(self, want: int) -> int:
         return 0  # no host memory apart: results stay on the "device"

@@ -261,15 +261,14 @@ class Bands:
         that took Qwen 4 MP's decode to 87 GB moved in 23 spills (run 10629)."""
         torch, weights = self.torch, self.weights
         nbytes = _span(meta) * meta.element_size()
-        free, movable = weights.activation_room()
-        room, least = free + movable, nbytes + 2 * per_row * align
+        room, least = weights.memory.available(), nbytes + 2 * per_row * align
         on_device = least <= room or not self._hostable(nbytes)
         # two pieces in flight (`_on`)
         rows = (room - (nbytes if on_device else 0)) // max(2 * per_row, 1)
         rows = max(align, min(height, rows) // align * align)
         out = None
         if on_device:
-            weights.free_for(nbytes + 2 * rows * per_row)
+            weights.memory.idle(nbytes + 2 * rows * per_row)
             try:
                 out = torch.empty_strided(
                     meta.shape, meta.stride(), dtype=meta.dtype, device=weights.device

@@ -1,18 +1,23 @@
-"""One owner of an executor's device memory per GPU (runtime-memory-v2.md §1-3).
+"""One owner of an executor's device memory per GPU (runtime-memory-v2.md §1-3, §5).
 
 Every memory signal (an op out of memory, the allocator's refusal, the plane short for a map)
 asks `free_for`, which walks one ladder in order: each action runs again while it gives device
 bytes back and is left when a pass gives none, so it ends without counts or timers. Only
-`exhausted` raises for memory, with the ledger of every byte on the GPU.
+`exhausted` raises for memory, with the ledger of every byte on the GPU. A stage plans its
+weights in `target`, which only chooses speed: the plane maps until the device is full, and
+this ladder decides what leaves.
 """
 
 from __future__ import annotations
 
 import gc
+import mmap
 import os
 import re
+import struct
 import traceback
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import TYPE_CHECKING, NoReturn
@@ -24,7 +29,7 @@ from cozy_runtime.author._errors import (
     is_library_refusal,
 )
 from cozy_runtime.author._model import RELEASERS
-from cozy_runtime.internal import accel, plane, spill, weight_policy
+from cozy_runtime.internal import accel, plane, seam, spill, weight_policy
 
 if TYPE_CHECKING:
     from cozy_runtime.internal.weights import Component, Weights
@@ -34,10 +39,14 @@ MARGIN = weight_policy.MARGIN
 _REQUESTED = re.compile(r"Tried to allocate ([0-9.]+) (B|KiB|MiB|GiB|KB|MB|GB)")
 _UNITS = {"B": 1, "KiB": 1 << 10, "MiB": 1 << 20, "GiB": 1 << 30}
 _UNITS |= {"KB": _UNITS["KiB"], "MB": _UNITS["MiB"], "GB": _UNITS["GiB"]}
+#: the budget cell: asked, wanted, done, applied; a `wanted` at or below `CAP` is a process cap
+#: of `CAP - wanted` bytes (`process_cap/1`)
+_CELL = struct.Struct("<qqqq")
+CAP = -2
 
 
 class Rung(IntEnum):
-    SLACK = 0  # torch's idle cache
+    SLACK = 0  # torch's idle cache, the plane's unmapped chunks
     IDLE = 1  # orphaned rings, weights no stage holds, other tenants (`DeviceRoom`)
     FINER = 2  # the running stage's resident set, its components not in use
     CACHES = 3  # what is kept for speed alone: reservations (`Weights.reserve`), `RELEASERS`
@@ -58,7 +67,6 @@ class Ledger:
     allocated: int
     mapped: int
     leased: int
-    budget: int
     shared: int
     hosted: int
     floor: int
@@ -77,9 +85,9 @@ class Ledger:
         return (
             f"driver {self.free} B free of {self.total}; context {self.context}; torch "
             f"{self.reserved} reserved, {self.allocated} allocated; plane {self.mapped} mapped, "
-            f"{self.leased} leased, budget {self.budget}; {self.shared} from the machine; "
-            f"other processes {others}; unattributed {self.residue}; {self.hosted} in host "
-            f"memory; floor {self.floor}, cap {self.cap}"
+            f"{self.leased} leased; {self.shared} from the machine; other processes {others}; "
+            f"unattributed {self.residue}; {self.hosted} in host memory; floor {self.floor}, "
+            f"cap {self.cap}"
         )
 
 
@@ -110,23 +118,22 @@ def collective(exc: BaseException) -> bool:
     return "NCCL" in str(exc) and is_device_oom(exc)
 
 
-def shortage(exc: BaseException) -> tuple[int, bool] | None:
-    """(bytes short, whether the plane's own budget was) for a memory failure one op can run
-    again after; None for any other. A plane refusal carries its real deficit, never a plan's
-    totals (run 10562)."""
+def shortage(exc: BaseException) -> int | None:
+    """The bytes short for a memory failure one op can run again after (0: not stated); None
+    for any other. A plane refusal carries its real deficit, never a plan's totals (10562)."""
     if isinstance(exc, plane.error("Shortfall")):
-        return max(int(getattr(exc, "need", 0)) - int(getattr(exc, "available", 0)), 1), True
+        return max(int(getattr(exc, "need", 0)) - int(getattr(exc, "available", 0)), 1)
     if isinstance(exc, plane.error("BelowFloor")):
-        return max(int(getattr(exc, "need", 0)) - int(getattr(exc, "budget", 0)), 1), True
+        return max(int(getattr(exc, "need", 0)) - int(getattr(exc, "budget", 0)), 1)
     if isinstance(exc, plane.error("BudgetExceeded")):
         asked = int(getattr(exc, "requested", 0))
         if getattr(exc, "pool", "") == "device":  # the device itself is full
-            return asked, False
-        return max(asked - int(getattr(exc, "available", 0)), 1), True
+            return asked
+        return max(asked - int(getattr(exc, "available", 0)), 1)
     if is_device_oom(exc):
-        return None if collective(exc) else (requested(exc), False)
+        return None if collective(exc) else requested(exc)
     if is_library_refusal(exc):  # a cuBLAS/cuDNN handle or workspace that found no room
-        return weight_policy.LIBRARY_ROOM, False
+        return weight_policy.LIBRARY_ROOM
     return None
 
 
@@ -154,8 +161,42 @@ def _caller() -> str:
     return " < ".join(f"{os.path.basename(f.filename)}:{f.lineno} {f.name}" for f in frames[:-5:-1])
 
 
+class Cell:
+    """A running call's budget cell (`BudgetCell`): a 32-byte memfd the owner's floor watchdog
+    writes a process cap into, read at every block boundary (`WeightResidency._asked`). The
+    owner writes the first two words and the executor the last two, each in that order."""
+
+    def __init__(self, fd: int) -> None:
+        self.map = mmap.mmap(fd, _CELL.size)
+        #: the executor's last applied ask
+        self.seen = 0
+
+    @classmethod
+    def create(cls) -> tuple[Cell, int]:
+        """A fresh cell and its memfd (the caller hands the fd on, then closes it)."""
+        fd = seam.anonymous("cozy-budget-cell")
+        os.ftruncate(fd, _CELL.size)
+        return cls(fd), fd
+
+    def poll(self) -> int | None:
+        """What the owner wrote since the last `acknowledge`, else None."""
+        asked, wanted, _, _ = _CELL.unpack_from(self.map)
+        if asked == self.seen:
+            return None
+        self.seen = asked
+        return int(wanted)
+
+    def acknowledge(self, applied: int) -> None:
+        struct.pack_into("<q", self.map, 24, applied)
+        struct.pack_into("<q", self.map, 16, self.seen)
+
+    def close(self) -> None:
+        self.map.close()
+
+
 class Memory:
-    """The ladder and the refusal for one executor's GPU (`Weights.memory`)."""
+    """The ladder and the refusal for one executor's GPU (`Weights.memory`), and the Runtime's
+    side of `author.split`."""
 
     def __init__(self, weights: Weights) -> None:
         self.weights = weights
@@ -166,16 +207,54 @@ class Memory:
         #: the attempt's refusal, for its reply
         self.refusal: dict[str, int | str] | None = None
         #: the running stage gave weights back: its next block boundary plans it again, in
-        #: `plan` bytes when rung 2 set it (-1: the budget it has)
+        #: `plan` bytes when rung 2 set it (-1: what it holds)
         self.shrunk = False
         self.plan = -1
         #: rung 1 asks the owner; never from inside torch's allocator
         self.asking = True
         self._collected = False
+        #: per stage method, the most its activations grew in this process: what a stage's
+        #: entry leaves them (`target`), never a limit; for one that cuts ops into `split`
+        #: pieces, which fit the room they find, the room its finest piece needs (`cut`)
+        self.peaks: dict[str, int] = {}
+        self.cut: dict[str, int] = {}
+        #: per `split` op key, the most bytes one input element took at a piece's peak
+        self.ratio: dict[str, float] = {}
 
     def free(self) -> int:
         """Device bytes torch or the plane can take now: free above the floor, in the cap."""
         return self.weights.headroom(self.weights.allocation())
+
+    def target(self, method: str) -> int:
+        """The device bytes a stage of `method` places its weights in (speed only): what is
+        free, torch's idle cache and every weight byte on the device (rungs 0-1 give the rest
+        back; the open stages' own are planned again), less what its activations grew to
+        here. Unmeasured, it keeps everything hot: its first out-of-memory measures it."""
+        weights = self.weights
+        memory = weights.allocation()
+        held = max(plane.stats(weights.plane).device(weights.index).committed, 0)
+        slack = max(memory["reserved_bytes"] - memory["allocated_bytes"], 0)
+        growth = max(self.cut.get(method, self.peaks.get(method, 0)) - slack, 0)
+        return max(weights.headroom(memory) + held + weights.decoded() - growth - MARGIN, 0)
+
+    def available(self, whole: bool = False) -> int:
+        """What an op's own tensors may have now: free in the cap, torch's idle cache, the
+        plane's unmapped chunks and the weights no stage uses (rungs 0-1). `whole`: an op cut
+        into pieces, which cost less than a model's components placed whole read back each
+        time their stage comes round, so those are held too."""
+        weights = self.weights
+        memory = weights.allocation()
+        held = plane.stats(weights.plane)
+        device = held.device(weights.index)
+        idle = max(device.committed - device.mapped, 0) if device.mapped >= 0 else 0
+        idle += sum(held.ready(c.key, weights.index) for c in weights.unused(whole))
+        slack = max(memory["reserved_bytes"] - memory["allocated_bytes"], 0)
+        return weights.headroom(memory) + slack + idle
+
+    def idle(self, need: int) -> None:
+        """Rungs 0-1 make `need` free for an op's own tensors when torch cannot take it now."""
+        if need > self.weights.allocatable():
+            self.free_for(need, "room", upto=Rung.IDLE)
 
     def ledger(self) -> Ledger:
         weights = self.weights
@@ -194,7 +273,6 @@ class Memory:
             allocated=memory["allocated_bytes"],
             mapped=max(device.committed, 0),
             leased=device.leased_bytes + device.held_bytes,
-            budget=device.budget,
             shared=device.shared_bytes,
             hosted=sum(off.nbytes for off in spill.OFF.values() if off.file is None),
             floor=weights.floor_free,
@@ -268,28 +346,18 @@ class Memory:
         operands: Sequence[object] = (),
         upto: Rung = Rung.DISK,
     ) -> T:
-        """`attempt()` until it allocates. A plane short of its own budget grows it into room
-        the device has (each growth asks for all of it, so it ends); any other shortage runs
-        again only after more came free."""
-        weights, seen = self.weights, -1
+        """`attempt()` until it allocates, running again only after more came free."""
+        seen = -1
         while True:
             try:
                 return attempt()
             except Exception as exc:
-                short = shortage(exc)
-                if short is None:
+                nbytes = shortage(exc)
+                if nbytes is None:
                     raise
                 exc.__traceback__ = None  # the failed attempt's frames free their tensors
-            nbytes, own = short
-            nbytes = nbytes or MARGIN
-            if own:
-                unused = max(weights.applied - weights._committed(), 0)
-                if not self.free_for(nbytes + unused, op, operands, upto):
-                    self.exhausted(nbytes, op)
-                weights._apply(weights.applied + nbytes)
-                weights.oom_retries += 1
-            elif (seen := self.again(nbytes, op, operands, seen, upto)) < 0:
-                self.exhausted(nbytes, op)
+            if (seen := self.again(nbytes or MARGIN, op, operands, seen, upto)) < 0:
+                self.exhausted(nbytes or MARGIN, op)
 
     def exhausted(self, nbytes: int, op: str, why: str = "") -> NoReturn:
         """Raise the one memory refusal: the ledger, the op and what each rung gave."""
@@ -319,12 +387,40 @@ class Memory:
     def summary(self) -> str:
         return ", ".join(f"{r.name.lower()} {n}x {b} B" for r, (n, b) in sorted(self.used.items()))
 
+    # -- `author.split`'s `Pieces`
+
+    def room(self, key: str) -> tuple[float | None, int]:
+        return self.ratio.get(key), max(self.available(whole=True) - MARGIN, 0)
+
+    @contextmanager
+    def piece(self, key: str, elements: int, need: int, least: int = 0) -> Iterator[None]:
+        weights = self.weights
+        if weights.open:
+            method = weights.open[-1][1]
+            self.cut[method] = max(self.cut.get(method, 0), least)
+        torch, kind = weights.torch, weights.kind
+        accel.hold_peak(torch, kind)
+        self.idle(need)
+        base = accel.allocated(torch, kind)
+        try:
+            yield
+        except BaseException:
+            accel.drop_peak(torch, kind)  # a piece that failed never showed what it needs
+            raise
+        peak = accel.section_peak(torch, kind) - base
+        self.ratio[key] = max(self.ratio.get(key, 0.0), max(peak, 0) / max(elements, 1))
+
+    def ran(self, name: str, pieces: int) -> None:
+        if pieces > 1:
+            self.weights.modes[f"{name}.pieces"] = str(pieces)
+
+    # -- the ladder
+
     def _ladder(self, operands: Sequence[object]) -> list[tuple[Rung, Callable[[int], object]]]:
         weights = self.weights
         return [
             (Rung.IDLE, self._collect),
-            (Rung.IDLE, lambda short: weights.shrink(short, keep_holds=True)),
-            (Rung.IDLE, lambda short: weights.page_out(None, short)),
+            (Rung.IDLE, weights.unmap),
             (Rung.IDLE, lambda short: self.ask(self.free() + short)),  # all it wants free
             (Rung.FINER, self._finer),
             (Rung.FINER, lambda _: weights.spare(operands)),
@@ -340,6 +436,7 @@ class Memory:
         weights = self.weights
         accel.release_cached(weights.torch, weights.kind)
         weights.drain()
+        weights.release_idle()
         weights.limit_torch()
 
     def collect(self) -> bool:
@@ -364,11 +461,10 @@ class Memory:
         one, then its components' finest grain, down to their floor. Nothing here moves what
         the running block leases, so the failing op goes on to the next rung."""
         weights = self.weights
-        freed = weights.shrink(short)
+        freed = weights.unmap(short, running=True)
         if weights.open:
-            held = min(weights.applied, weights._committed())
-            held = min(held, self.plan) if self.plan >= 0 else held
-            self.plan = max(held - short, weights.floor())
+            held = weights.planned if self.plan < 0 else min(weights.planned, self.plan)
+            self.plan = max(held - short, 0)
         self.shrunk = self.shrunk or bool(freed or weights.open)
 
     def _count(self, rung: Rung, freed: int) -> None:

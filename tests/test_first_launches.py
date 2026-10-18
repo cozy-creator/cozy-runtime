@@ -69,7 +69,7 @@ dev = torch.device("cuda", 0)
     + FILL
     + """
 weights = Weights(torch, dev, "cuda")
-weights.set_budget(-1, pinned=1 << 30)
+weights.set_pinned(1 << 30)
 model = twp.load(weights, twp.write_checkpoint(Path(sys.argv[2]))[0], "refused")
 x = torch.ones(4, twp.HIDDEN, device=dev, dtype=torch.float16)
 a = torch.ones(64, 64, device=dev, dtype=torch.bfloat16)
@@ -103,7 +103,7 @@ dev = torch.device("cuda", 0)
     + FILL
     + """
 weights = Weights(torch, dev, "cuda")
-weights.set_budget(-1, pinned=1 << 30)
+weights.set_pinned(1 << 30)
 model = twp.load(weights, twp.write_checkpoint(Path(sys.argv[2]))[0], "starved")
 twp.run(model, torch.ones(4, twp.HIDDEN, device=dev, dtype=torch.float16), passes=1)
 x = torch.randn(1, 64, 5, 128, 256, device=dev, dtype=torch.float16)
@@ -151,11 +151,11 @@ def test_a_library_refusal_asks_for_its_room_and_other_failures_are_its_own() ->
     refusal = RuntimeError(
         "CUDA error: CUBLAS_STATUS_INTERNAL_ERROR when calling `cublasGemmEx( handle, opa, opb,"
     )
-    assert shortage(refusal) == (weight_policy.LIBRARY_ROOM, False)
+    assert shortage(refusal) == weight_policy.LIBRARY_ROOM
     cudnn = RuntimeError("cuDNN error: CUDNN_STATUS_EXECUTION_FAILED")
-    assert shortage(cudnn) == (weight_policy.LIBRARY_ROOM, False)
+    assert shortage(cudnn) == weight_policy.LIBRARY_ROOM
     assert shortage(RuntimeError("shape mismatch")) is None
-    assert shortage(RuntimeError("CUDA error: out of memory")) == (0, False)
+    assert shortage(RuntimeError("CUDA error: out of memory")) == 0
 
 
 @on_card

@@ -25,6 +25,7 @@ from cozy_runtime.internal.weights import DeviceTiers, Weights  # noqa: E402
 from test_weight_plane import (  # noqa: E402
     BLOCKS,
     HIDDEN,
+    aim,
     held_elsewhere,
     load,
     run,
@@ -142,7 +143,8 @@ def executor_with(custody: Custody, tmp_path: Path) -> tuple[Weights, Executor]:
     threading.Thread(target=custody.serve, args=(Channel(theirs),), daemon=True).start()
     executor = Executor(Channel(ours), tmp_path)
     weights = Weights(torch, torch.device("cuda", 0), "cuda")
-    weights.set_budget(1 << 30, pinned=1 << 30)
+    weights.set_pinned(1 << 30)
+    aim(weights, 1 << 30)
     weights.sharing = DeviceTiers(ask=executor._ask_device, offer=executor._offer_device)
     return weights, executor
 
@@ -291,7 +293,7 @@ def test_attached_weights_cost_no_budget_and_are_never_streamed(tmp_path: Path) 
         expected = run(model, x)
         replacement, _ = executor_with(custody, tmp_path / "b")
         again = load(replacement, checkpoint, "free")
-        replacement.set_budget(tight(again))
+        aim(replacement, tight(again))
         assert same(run(again, x), expected)
         facts = replacement.facts()
         assert facts.h2d_bytes == 0 and facts.committed_bytes == 0

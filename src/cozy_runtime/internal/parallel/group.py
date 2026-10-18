@@ -92,23 +92,15 @@ _Bytes = Annotated[int, msgspec.Meta(ge=0)]
 
 
 class _Offer(msgspec.Struct, frozen=True, tag_field="reply", tag="resident_budget"):
-    """A follower's plan and the bytes it needs, for `agree_residence`."""
+    """A follower's plan, for `agree_residence`."""
 
     rank: int
     model: str
     plan: GroupPlan
-    required: _Bytes
-
-
-class _Parking(msgspec.Struct, frozen=True, tag_field="cmd", tag="resident_budget"):
-    """Rank 0's answer to the offers: the constructions every rank parks."""
-
-    model: str
-    park: list[str]
 
 
 class _Measured(msgspec.Struct, frozen=True, tag_field="reply", tag="resident_ceiling"):
-    """A follower's ceiling, measured after it parked."""
+    """A follower's ceiling."""
 
     rank: int
     model: str
@@ -250,23 +242,13 @@ def receive_residence(
     rank: int,
     model: str,
     plan: Mapping[str, object],
-    required: int,
-    park: Callable[[list[str]], None],
     ceiling: Callable[[], int],
 ) -> int:
-    """A follower's half of `RankGroup.agree_residence`.
-
-    Offer this rank's plan and need, park what rank 0 parked, offer the ceiling measured
-    after that, and accept only a matching, no-larger group ceiling.
-    """
-    offer = _Offer(rank, model, GroupPlan.read(plan), required)
+    """A follower's half of `RankGroup.agree_residence`: offer this rank's plan and its
+    ceiling, and accept only a matching, no-larger group ceiling."""
+    offer = _Offer(rank, model, GroupPlan.read(plan))
     gpu = execution_evidence.gpu_name(offer.plan.devices, rank)
     channel.send(msgspec.to_builtins(offer))
-    what = "invalid group parking decision"
-    parking = _decode(channel.recv(timeout=None), _Parking, gpu, "parked_constructions", what)
-    if parking.model != model:
-        raise GpuDivergence(gpu, "parked_constructions", f"{what} for {parking.model!r}")
-    park(parking.park)
     local = ceiling()
     channel.send(msgspec.to_builtins(_Measured(rank, model, local)))
     what = "invalid group residence ceiling"
@@ -730,29 +712,22 @@ class RankGroup:
         *,
         model: str,
         plan: Mapping[str, object],
-        required: int,
-        park: Callable[[int], list[str]],
         ceiling: Callable[[], int],
-    ) -> tuple[int, list[str]]:
-        """Agree the plan, the constructions to park, and the ceiling, before any fill.
+    ) -> int:
+        """Agree the plan and the ceiling, before any fill.
 
-        Every rank resolved on its own card; each offer carries its plan and the bytes it
-        needs. A plan that differs is divergence, refused before a destination exists. Rank
-        0 parks for the largest need any rank reported and every rank parks the same
-        constructions; each then measures its own ceiling and the group fills under the
-        smallest. The control seam also observes an early load failure or rank death,
-        without parking the leader in a device collective.
+        Every rank resolved on its own card; each offer carries its plan, and a plan that
+        differs is divergence, refused before a destination exists. Each rank measures its own
+        ceiling and the group places components under the smallest (`mirror.hosting_plan`).
+        The control seam also observes an early load failure or rank death, without parking
+        the leader in a device collective.
         """
-        need = int(required)
         mine = GroupPlan.read(plan)
         for follower, reply in zip(self.followers, self.collect("resident_budget"), strict=True):
             offer = _decode(reply, _Offer, follower.gpu, "resident_budget", "invalid GPU offer")
             if (offer.rank, offer.model) != (follower.rank, model):
                 raise GpuDivergence(follower.gpu, "resident_budget", "invalid GPU offer")
             offer.plan.assert_agrees(mine, rank=follower.rank)
-            need = max(need, offer.required)
-        parked = park(need)
-        self.broadcast(msgspec.to_builtins(_Parking(model, parked)))
         shared = ceiling()
         for follower, reply in zip(self.followers, self.collect("resident_ceiling"), strict=True):
             measured = _decode(
@@ -768,7 +743,7 @@ class RankGroup:
                 )
             shared = min(shared, measured.ceiling)
         self.broadcast(msgspec.to_builtins(_Ceiling(model, shared)))
-        return shared, parked
+        return shared
 
     def call(self, command: Mapping[str, object]) -> list[dict[str, Any]]:
         self.broadcast(command)

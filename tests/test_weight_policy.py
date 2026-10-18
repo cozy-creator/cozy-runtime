@@ -8,6 +8,7 @@ at 1605 MHz scaled to the clean 592.9 ms step, in execution order.
 from __future__ import annotations
 
 import csv
+from dataclasses import replace
 from itertools import pairwise
 from pathlib import Path
 from typing import Any
@@ -69,15 +70,18 @@ def test_a_repeating_stage_keeps_its_resident_set_when_its_room_moves() -> None:
     assert all(wider < narrower for wider, narrower in pairwise(streamed))
 
 
-def test_run_once_is_whole_or_streamed_and_below_one_slot_refuses_with_numbers() -> None:
+def test_run_once_is_whole_or_streamed_and_below_one_slot_runs_at_its_floor() -> None:
     text = policy.Layout(common=200 << 20, blocks=(12 << 20,) * 12)
     both = policy.stage({"unet": UNET, "text": text}, BUDGET, cyclic={"unet"})
     assert both["text"].resident == () or both["text"].streamed == ()
     one = UNET.common + UNET.largest
     assert policy.stage({"unet": UNET}, one, cyclic={"unet"})["unet"].window == 1
+    floor = policy.stage({"unet": UNET}, one - 1, cyclic={"unet"})["unet"]
+    assert floor.window == 1 and floor.resident == ()
+    finer = replace(UNET, fine=(UNET.common, 16 << 20))  # it can move finer: it is named
     with pytest.raises(policy.BelowFloor) as refused:
-        policy.stage({"unet": UNET}, one - 1, cyclic={"unet"})
-    assert (refused.value.needed, refused.value.available) == (one, one - 1)
+        policy.stage({"unet": finer}, one - 1, cyclic={"unet"})
+    assert refused.value.component == "unet"
 
 
 def test_a_stage_that_runs_once_streams_beside_what_repeating_stages_keep() -> None:
@@ -93,12 +97,6 @@ def test_a_stage_that_runs_once_streams_beside_what_repeating_stages_keep() -> N
     assert policy.stage({"text": text}, BUDGET)["text"].streamed == ()
     unet = policy.stage({"unet": UNET}, BUDGET, cyclic={"unet"})
     assert policy.stage({"unet": UNET}, BUDGET, cyclic={"unet"}, hot=BUDGET) == unet
-
-
-def test_activations_come_first() -> None:
-    assert policy.plane_budget(8 << 30, 3 << 30, 300 << 20) == (5 << 30) - (300 << 20) - (
-        policy.MARGIN
-    )
 
 
 def test_attached_regions_are_resident_and_cost_only_their_decoded_copies() -> None:

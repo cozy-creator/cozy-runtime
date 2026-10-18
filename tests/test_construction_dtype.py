@@ -95,7 +95,7 @@ def test_native_checkpoint_registers_the_dtype_selected_constructor(
     rows = checkpoint.rows("linear")
     # The host tier alone: registration and the pinned fill need no card.
     weights = Weights(torch, torch.device("cpu"), "cpu")
-    weights.set_budget(-1, pinned=64 << 20)
+    weights.set_pinned(64 << 20)
     backend = PlaneBackend.for_script(
         {"linear": checkpoint}, rows, weights=weights, construction="dtype", release="dtype/1"
     )

@@ -1,9 +1,9 @@
 """Runtime's adapter to the in-process TensorFS weight-plane/device library.
 
-TensorD coordinates machine budgets and supplies model data/shared CPU buffers. Runtime
-constructs models and calls this library to allocate, map, copy, stream and unmap their GPU
-weight regions. `weights.py` and `weight_policy.py` choose executor residency within those
-budgets; TensorFS implements the operations. Facts Runtime reads back are typed here.
+TensorD supplies model data/shared CPU buffers. Runtime constructs models and calls this
+library to allocate, map, copy, stream and unmap their GPU weight regions. `memory.py`,
+`weights.py` and `weight_policy.py` choose executor residency; TensorFS implements the
+operations. Facts Runtime reads back are typed here.
 """
 
 from __future__ import annotations
@@ -64,7 +64,9 @@ class HostStats(msgspec.Struct, frozen=True, kw_only=True):
 class DeviceStats(msgspec.Struct, frozen=True, kw_only=True):
     ordinal: int
     budget: int = -1
+    #: mapped regions and rings; `committed` less this is unmapped chunks kept for reuse
     committed: int = -1
+    mapped: int = -1
     leased_bytes: int = 0
     held_bytes: int = 0
     #: one DMA from page-locked host memory

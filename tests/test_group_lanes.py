@@ -23,10 +23,10 @@ import msgspec
 import pytest
 
 from cozy_runtime.author._signature import ModelBinding
-from cozy_runtime.internal import budget_cell, package_interface, spawn
-from cozy_runtime.internal import executor as executor_module
+from cozy_runtime.internal import package_interface, spawn
 from cozy_runtime.internal.config import seal_snapshot
 from cozy_runtime.internal.discovery import discover
+from cozy_runtime.internal.memory import Cell
 from cozy_runtime.internal.parallel import cp, wire
 from cozy_runtime.internal.parallel.group import RankGroup
 from cozy_runtime.internal.parallel.plan import GpuDivergence, GroupPlan, GroupRefusal
@@ -274,7 +274,7 @@ def test_each_follower_takes_its_own_budget_cell_with_its_join(tmp_path: Path) -
         launch=_launcher(env),
         devices=("4", "5", "6"),
     )
-    cells = [budget_cell.Cell.create() for _ in range(2)]
+    cells = [Cell.create() for _ in range(2)]
     try:
         group.spawn()
         group.dial_back(seal_snapshot(env))
@@ -285,20 +285,13 @@ def test_each_follower_takes_its_own_budget_cell_with_its_join(tmp_path: Path) -
             maps = Path(f"/proc/{follower.pid}/maps").read_text().splitlines()
             held = {int(line.split()[4]) for line in maps if "memfd:cozy-budget-cell" in line}
             assert held == {mine}, (follower.gpu, held, mine)
-        # the followers still answer, and the cells are the owner's to write
+        # the followers still answer
         assert [r["ok"] for r in group.call({"cmd": "probe"})] == [True, True]
-        assert cells[0][0].ask(-2 - (1 << 30)) == 1
     finally:
         group.close()
         for cell, fd in cells:
             cell.close()
             os.close(fd)
-
-
-def test_a_rank_takes_its_own_cap_or_the_one_cap() -> None:
-    assert executor_module._rank_cap((7, 8, 9), 1, 5) == 8
-    assert executor_module._rank_cap((7,), 2, 5) == 5
-    assert executor_module._rank_cap((), 0, msgspec.UNSET) is msgspec.UNSET
 
 
 @needs_torch

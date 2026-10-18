@@ -15,6 +15,7 @@ import gc
 import io
 import mmap
 import os
+import struct
 from collections.abc import Collection, Iterator
 from contextlib import contextmanager, suppress
 from pathlib import Path
@@ -37,7 +38,6 @@ from cozy_runtime.derive.microscale import encode_fp8_rowwise, encode_int8_convr
 from cozy_runtime.internal import (  # noqa: E402
     accel,
     attention_ulysses,
-    budget_cell,
     paging,
     plane,
     proctree,
@@ -50,7 +50,7 @@ from cozy_runtime.internal.derive import Observations, serving_substrate  # noqa
 from cozy_runtime.internal.encoding import SPEC_PLAIN, SPEC_ROWWISE  # noqa: E402
 from cozy_runtime.internal.encoding.leaves import _native_leaf_class  # noqa: E402
 from cozy_runtime.internal.fill import Checkpoint  # noqa: E402
-from cozy_runtime.internal.memory import MemoryExhausted, Rung  # noqa: E402
+from cozy_runtime.internal.memory import CAP, Cell, MemoryExhausted, Rung  # noqa: E402
 from cozy_runtime.internal.weights import (  # noqa: E402
     HostTiers,
     Journal,
@@ -220,6 +220,15 @@ def tight(model: Any) -> int:
     return layout.common + 3 * layout.largest
 
 
+def aim(weights: Weights, nbytes: int) -> None:
+    """Every stage plans its weights in `nbytes` (`Memory.target`), as on a card that size;
+    -1: in the room the device has."""
+    if nbytes < 0:
+        vars(weights.memory).pop("target", None)
+    else:
+        weights.memory.target = lambda _method: nbytes  # type: ignore[method-assign]
+
+
 @pytest.fixture(autouse=True)
 def _collected() -> Iterator[None]:
     """A construction is a reference cycle (its blocks' hooks hold it) that keeps one file
@@ -232,13 +241,13 @@ def _collected() -> Iterator[None]:
 @pytest.fixture
 def card(tmp_path: Path) -> Any:
     weights = Weights(torch, torch.device("cuda", 0), "cuda")
-    weights.set_budget(-1, pinned=1 << 30)
+    weights.set_pinned(1 << 30)
     return SimpleNamespace(weights=weights, checkpoint=write_checkpoint(tmp_path)[0])
 
 
 def test_the_pinned_tier_holds_every_part_where_the_layout_says(tmp_path: Path) -> None:
     weights = Weights(torch, torch.device("cpu"), "cpu")
-    weights.set_budget(-1, pinned=1 << 30)
+    weights.set_pinned(1 << 30)
     checkpoint, values = write_checkpoint(tmp_path)
     model = load(weights, checkpoint, "host")
     component = model.backend.components["stack"]
@@ -271,7 +280,7 @@ def test_a_cpu_executor_computes_on_a_tier_no_budget_cuts(tmp_path: Path) -> Non
     """Audit row 9: a pinned budget below the weights refused a CPU executor
     (`device_shortfall`). It computes on its tier, so the tier holds every weight it binds."""
     weights = Weights(torch, torch.device("cpu"), "cpu")
-    weights.set_budget(-1, pinned=1 << 20)
+    weights.set_pinned(1 << 20)
     checkpoint, values = write_checkpoint(tmp_path)
     model = load(weights, checkpoint, "uncut")
     x = torch.rand(4, HIDDEN, generator=torch.Generator().manual_seed(5)).half()
@@ -288,7 +297,7 @@ def test_a_stored_tensor_the_code_does_not_build_is_skipped_and_never_read(
     (1.24 GB). The fit skips it with one warning, and nothing reads or maps its bytes: its
     object leaves the store before the fill, which still lands every built weight."""
     weights = Weights(torch, torch.device("cpu"), "cpu")
-    weights.set_budget(-1, pinned=1 << 30)
+    weights.set_pinned(1 << 30)
     generator = torch.Generator().manual_seed(7)
     values: dict[str, Any] = {"embed": torch.rand(HIDDEN, generator=generator) + 0.5}
     for index in range(BLOCKS):
@@ -425,7 +434,7 @@ def test_a_stage_waits_for_its_weights_before_its_clock_starts(card: Any) -> Non
     weights = card.weights
     model = load(weights, card.checkpoint, "arrive")
     spans: list[tuple[str, float]] = []
-    weights.set_budget(1 << 30)
+    aim(weights, 1 << 30)
     with asides(lambda name, ms: spans.append((name, ms))):
         model.residency.admit("run", ("stack",))
     arrived = weights.facts().h2d_bytes
@@ -441,14 +450,38 @@ def test_a_stage_waits_for_its_weights_before_its_clock_starts(card: Any) -> Non
 
 
 @on_card
+def test_a_pass_filled_on_demand_maps_no_more_than_its_plan(card: Any) -> None:
+    """The 10648 pair on a budgetless plane: a pass whose order is not learned yet fills its
+    streamed blocks on demand, and those fills mapped past the stage's plan into the floor and
+    a co-tenant's room (34 floor-watchdog caps on a 3070). They displace each other inside the
+    ring the plan gave the streamed blocks, and the stage computes the same bits."""
+    weights = card.weights
+    x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
+    reference = run(load(weights, card.checkpoint, "whole"), x, passes=1)
+    model = load(weights, card.checkpoint, "bounded")
+    aim(weights, tight(model))
+    model.residency.admit("run", ("stack",))
+    try:
+        with torch.inference_mode():
+            out = [model.stack(x)]  # one pass, unobserved: every streamed block filled on demand
+            held = weights.resident_bytes(model.residency.components["stack"])
+    finally:
+        model.residency.release("run", ("stack",))
+    residence = model.residency.components["stack"].residence
+    assert residence is not None and residence.streamed
+    assert 0 < held <= weights.planned
+    assert same(reference, out)
+
+
+@on_card
 def test_streamed_blocks_are_bit_identical_to_resident(card: Any) -> None:
     weights = card.weights
     model = load(weights, card.checkpoint, "exact")
     x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
-    weights.set_budget(1 << 30)
+    aim(weights, 1 << 30)
     resident = run(model, x)
     assert weights.facts().streamed["stack"].resident_blocks == BLOCKS
-    weights.set_budget(tight(model))
+    aim(weights, tight(model))
     streamed = run(model, x)
     facts = weights.facts()
     assert facts.streamed["stack"].window == 2
@@ -458,18 +491,21 @@ def test_streamed_blocks_are_bit_identical_to_resident(card: Any) -> None:
 
 
 @on_card
-def test_a_budget_below_the_block_floor_runs_at_the_sub_block_grain(card: Any) -> None:
+def test_a_stage_entered_below_its_block_floor_keeps_its_grain(card: Any) -> None:
+    """A target below the block floor (a learned peak larger than the card) is no reason to move
+    finer: the stage enters with a window of two at the grain it has. Only a refused map or
+    rung 2 moves it (`test_memorys_rung_2_moves_the_running_stage_to_its_finest_grain`)."""
     weights = card.weights
     model = load(weights, card.checkpoint, "fine")
     x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
-    weights.set_budget(1 << 30)
+    aim(weights, 1 << 30)
     resident = run(model, x)
     layout = model.residency.components["stack"].layout
     assert layout.fine is not None
-    weights.set_budget(layout.fine[0] + 2 * layout.fine[1])  # below common + one block
-    assert layout.common + layout.largest > weights.budget
+    aim(weights, layout.fine[0] + 2 * layout.fine[1])  # below common + one block
+    assert layout.common + layout.largest > layout.fine[0] + 2 * layout.fine[1]
     streamed = run(model, x)
-    assert model.residency.components["stack"].fine
+    assert not model.residency.components["stack"].fine
     assert same(resident, streamed)
 
 
@@ -557,12 +593,12 @@ def stack_of(
 
 
 def at_the_sub_block_grain(weights: Weights, model: Any, x: Any) -> tuple[list[Any], list[Any]]:
-    """The model's outputs resident, then in a budget below its block floor."""
-    weights.set_budget(1 << 30)
+    """The model's outputs resident, then at its sub-block grain, streamed (rung 2 moves it
+    there under pressure)."""
+    aim(weights, 1 << 30)
     resident = run(model, x)
-    layout = model.residency.components["stack"].layout
-    assert layout.fine is not None
-    weights.set_budget(layout.fine[0] + 2 * layout.fine[1])
+    layout = refined(model, "stack")
+    aim(weights, layout.common + 2 * layout.largest)
     streamed = run(model, x)
     assert model.residency.components["stack"].fine
     assert weights.modes["stack.grain"] == "sub-block"  # the run record's confession
@@ -577,7 +613,7 @@ def test_weights_read_outside_their_modules_forward_stream_exact(tmp_path: Path)
     stays in `common` (bound for the stage); the large one is mapped and held for the one op
     that reads it. Either way the bits are the resident run's."""
     weights = Weights(torch, torch.device("cuda", 0), "cuda")
-    weights.set_budget(-1, pinned=1 << 30)
+    weights.set_pinned(1 << 30)
     factory, values = stack_of(SiblingBlock, ("proj", "out"), (("norm", HIDDEN), ("scale", HIDDEN)))
     model = load(weights, store_component(tmp_path, "stack", values), "siblings", factory=factory)
     x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
@@ -598,7 +634,7 @@ def test_a_view_of_a_weight_read_outside_its_forward_in_inference_mode(tmp_path:
     bytes leave with the op's lease, and torch refused that copy as the view of a normal
     stand-in under `inference_mode`: 'Cannot set version_counter for inference tensor'."""
     weights = Weights(torch, torch.device("cuda", 0), "cuda")
-    weights.set_budget(-1, pinned=1 << 30)
+    weights.set_pinned(1 << 30)
     checkpoint, values = write_checkpoint(tmp_path)
     model = load(weights, checkpoint, "view-read")
     x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
@@ -628,7 +664,7 @@ def test_a_kernel_launched_outside_torch_never_reads_an_unmapped_weight(
     own_region = small != paging.SMALL
     monkeypatch.setattr(paging, "SMALL", small)
     weights = Weights(torch, torch.device("cuda", 0), "cuda")
-    weights.set_budget(-1, pinned=1 << 30)
+    weights.set_pinned(1 << 30)
     width = HIDDEN // HEADS
     factory, values = stack_of(
         FusedBlock, ("to_q", "to_k", "to_v", "to_out.0"), (("norm_q", width), ("norm_k", width))
@@ -651,11 +687,11 @@ def test_a_stage_entered_inside_another_leaves_the_outer_its_own_grain(card: Any
     outer = load(weights, card.checkpoint, "b-outer")
     inner = load(weights, card.checkpoint, "a-inner")  # placed first: it would take the spare
     x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
-    weights.set_budget(1 << 30)
+    aim(weights, 1 << 30)
     want = run(outer, x, passes=1), run(inner, x, passes=1)
     layout: weight_policy.Layout = outer.residency.components["stack"].layout
     assert layout.fine is not None and sum(layout.fine) < layout.common + layout.largest
-    weights.set_budget(layout.total + layout.common + layout.largest - (4 << 20))
+    aim(weights, layout.total + layout.common + layout.largest - (4 << 20))
     outer.residency.admit("run", ("stack",))
     try:
         got_inner = run(inner, x, passes=1)  # placed together with the outer's open stage
@@ -672,11 +708,11 @@ def test_the_execution_order_is_learned_then_streamed(card: Any) -> None:
     weights = card.weights
     model = load(weights, card.checkpoint, "reverse", reverse=True)
     x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
-    weights.set_budget(1 << 30)
+    aim(weights, 1 << 30)
     resident = run(model, x)
     component = model.residency.components["stack"]
     assert component.order == list(range(BLOCKS, 0, -1))
-    weights.set_budget(tight(model))
+    aim(weights, tight(model))
     assert same(resident, run(model, x))
 
 
@@ -684,12 +720,12 @@ def test_the_execution_order_is_learned_then_streamed(card: Any) -> None:
 def test_batch_fits_asks_an_unmeasured_method_with_what_earlier_executors_measured(
     card: Any,
 ) -> None:
-    """A fresh executor has measured nothing, and "unmeasured is yes" would batch cond and
-    uncond in a pool that cannot hold both. What the machine seeded for the method answers."""
+    """A fresh executor has measured nothing: the first run measures. What this process
+    learned for the method answers after that."""
     weights = card.weights
     residency = load(weights, card.checkpoint, "batch").residency
     assert residency.batch_fits("run", 2), "measured nowhere: the first run measures"
-    weights.seed_activations({"run": torch.cuda.get_device_properties(0).total_memory})
+    weights.memory.peaks["run"] = torch.cuda.get_device_properties(0).total_memory
     assert not residency.batch_fits("run", 2)
     assert weights.modes["run.batch"] == "1"
     facts = weights.facts()
@@ -703,7 +739,7 @@ def test_weights_mapped_ahead_leave_the_first_stage_nothing_to_copy(card: Any) -
     before any request, as much as a call keeps resident in the same budget. Its first stage
     then copies nothing and computes the same bits, and the map measures nothing of its own."""
     weights = card.weights
-    weights.set_budget(1 << 30)
+    aim(weights, 1 << 30)
     x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
     cold = load(weights, card.checkpoint, "cold")
     expected = run(cold, x, passes=1)
@@ -717,10 +753,9 @@ def test_weights_mapped_ahead_leave_the_first_stage_nothing_to_copy(card: Any) -
     assert same(expected, run(ahead, x, passes=1))
     facts = weights.facts()
     assert facts.h2d_bytes == arrived
-    assert weights_module.MAPPING not in weights.activation
-    assert weights_module.MAPPING not in facts.plan_inputs
+    assert weights_module.MAPPING not in weights.memory.peaks
     # A budget that holds only part of the weights maps that part, and says so.
-    weights.set_budget(tight(ahead))
+    aim(weights, tight(ahead))
     partial = load(weights, card.checkpoint, "partial")
     held, complete = partial.residency.map_ahead()
     assert 0 < held < spans and not complete
@@ -733,9 +768,9 @@ def test_a_stage_entered_once_per_step_keeps_a_resident_set(card: Any) -> None:
     weights = card.weights
     model = load(weights, card.checkpoint, "steps")
     x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
-    weights.set_budget(1 << 30)
+    aim(weights, 1 << 30)
     resident = run(model, x, passes=1)
-    weights.set_budget(tight(model))
+    aim(weights, tight(model))
     steps = [run(model, x, passes=1)[0] for _ in range(3)]
     facts = weights.facts().streamed["stack"]
     assert 0 < facts.resident_blocks < BLOCKS and facts.window >= 1
@@ -749,10 +784,10 @@ def test_a_component_converted_with_to_streams_in_that_dtype(card: Any) -> None:
     weights = card.weights
     model = load(weights, card.checkpoint, "dtype")
     x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float32)
-    weights.set_budget(1 << 30)
+    aim(weights, 1 << 30)
     model.stack.to(torch.float32)
     resident = run(model, x)
-    weights.set_budget(tight(model))
+    aim(weights, tight(model))
     streamed = run(model, x)
     assert weights.facts().streamed["stack"].resident_blocks < BLOCKS
     assert all(s.dtype == torch.float32 for s in streamed)
@@ -768,7 +803,7 @@ def test_a_component_cast_and_cast_back_in_its_stage_keeps_no_copy_after_it(card
     weights = card.weights
     model = load(weights, card.checkpoint, "cast")
     x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float32)
-    weights.set_budget(1 << 30)
+    aim(weights, 1 << 30)
     total = model.residency.components["stack"].layout.total
 
     def decode() -> Any:
@@ -800,12 +835,12 @@ def test_an_activation_estimate_larger_than_the_card_never_refuses_the_stage(car
     weights = card.weights
     model = load(weights, card.checkpoint, "seeded")
     x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
-    weights.set_budget(1 << 30)
+    aim(weights, 1 << 30)
     reference = run(model, x)
     model.residency.unpark()
-    weights.set_budget(-1)
-    weights.seed_activations({"run": weights.total})
-    assert weights.driver_budget("run") == 0, "no stage open: no floor to keep"
+    aim(weights, -1)
+    weights.memory.peaks["run"] = weights.total
+    assert weights.memory.target("run") == 0
     assert same(run(model, x), reference)
 
 
@@ -840,8 +875,7 @@ def test_an_earlier_stages_idle_cache_stays_until_a_stage_needs_its_room(card: A
     assert torch.cuda.memory_stats()["num_device_alloc"] == segments, "the decode reused it"
     # Its weights unmapped, under a cap that leaves them no room beside the cache: it goes back.
     model.residency.unpark()
-    weights.set_budget(0)
-    weights.set_budget(-1)
+    weights.vacate()
     weights.measure_context()
     held = max(weights.context_bytes, 0) + torch.cuda.memory_reserved()
     weights.set_cap(held + weight_policy.MARGIN)
@@ -863,11 +897,11 @@ def test_a_bind_that_runs_out_of_device_memory_plans_again_in_what_is_left(card:
     weights = card.weights
     model = load(weights, card.checkpoint, "bind")
     x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float32)
-    weights.set_budget(1 << 30)
+    aim(weights, 1 << 30)
     model.stack.to(torch.float32)
     resident = run(model, x)
     model.residency.unpark()
-    weights.set_budget(0)  # nothing mapped: the next stage binds, and converts, everything
+    weights.vacate()  # nothing mapped: the next stage binds, and converts, everything
     layout: weight_policy.Layout = model.residency.components["stack"].layout
     retries = weights.facts().oom_retries
     torch.cuda.empty_cache()
@@ -875,7 +909,7 @@ def test_a_bind_that_runs_out_of_device_memory_plans_again_in_what_is_left(card:
     # Room for the stored weights and half of their fp32 copies, no more.
     ballast = torch.empty(free - 2 * layout.total, dtype=torch.uint8, device="cuda")
     try:
-        weights.set_budget(layout.total + (8 << 20))
+        aim(weights, layout.total + (8 << 20))
         squeezed = run(model, x)
     finally:
         del ballast
@@ -933,12 +967,12 @@ def test_a_map_the_device_refuses_unmaps_idle_weights_and_the_stage_runs(
     )
     assert {idle.backend.resolved[f"stack.{key}"].route for key in fp8} == {"decoded_float"}
     x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
-    weights.set_budget(1 << 30)
+    aim(weights, 1 << 30)
     expected = run(stage, x, passes=1)
     weights.vacate()
     run(idle, x, passes=1)  # bound and idle: a float copy of every block's weights
     assert weights.decoded() >= 2 * BLOCKS * HIDDEN * HIDDEN * 2 > weight_policy.MARGIN
-    weights.set_budget(-1)  # each stage's budget from what the driver has
+    aim(weights, -1)  # each stage's budget from what the driver has
     torch.cuda.empty_cache()
     free, _ = torch.cuda.mem_get_info()
     moved = spill.TOTALS[0]
@@ -963,11 +997,11 @@ def test_a_ring_a_view_outlives_never_refuses_the_next_stage(card: Any, holder: 
     model = load(weights, card.checkpoint, f"ring-{holder}")
     layout: weight_policy.Layout = model.residency.components["stack"].layout
     x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
-    weights.set_budget(1 << 30)
+    aim(weights, 1 << 30)
     expected = run(model, x)
     model.residency.unpark()
     budget = tight(model) + 2 * layout.largest  # three resident blocks and a ring of two
-    weights.set_budget(budget)
+    aim(weights, budget)
     frames: dict[Any, Any] = {}
     frames["cycle"] = frames
     grabs = [
@@ -987,8 +1021,9 @@ def test_a_ring_a_view_outlives_never_refuses_the_next_stage(card: Any, holder: 
     finally:
         gc.enable()
     assert not model.residency.refusals, model.residency.refusals
-    # collected, the ring went; a live view's ring stays, and the plane grows past it
-    assert (weights.applied == budget) == (holder == "garbage")
+    # collected, the ring goes; a live view's ring stays, and the stages ran beside it
+    weights.memory.collect()
+    assert bool(model.residency.components["stack"].orphans) == (holder == "live")
     assert same(expected, first)
     assert same(expected, second)
 
@@ -1008,19 +1043,19 @@ def test_a_process_cap_holds_torch_and_the_plane_inside_it(card: Any) -> None:
     # the activations' tensors at their peak, without any segment slack torch kept
     measured = torch.cuda.max_memory_allocated() - live
     model.residency.unpark()
-    weights.set_budget(0)
+    weights.vacate()
     torch.cuda.empty_cache()
     weights.measure_context()
     # Room for the measured activations and a margin: a stage that keeps every weight (here
     # 128 MiB, more than the margin) leaves its activations short, one that streams does not.
     context = max(weights.context_bytes, 0)  # unreadable per process: counts nothing
     cap = context + torch.cuda.memory_reserved() + measured + weight_policy.MARGIN
-    weights.activation.clear()  # an estimate that is wrong: the stage keeps all its weights
+    weights.memory.peaks.clear()  # an estimate that is wrong: the stage keeps all its weights
     retries = weights.facts().oom_retries
     torch.cuda.reset_peak_memory_stats()
     weights.set_cap(cap)
     try:
-        weights.set_budget(-1)
+        aim(weights, -1)
         capped = run(model, x, passes=1)
         peak = torch.cuda.max_memory_reserved()
         facts = weights.facts()
@@ -1052,7 +1087,7 @@ def test_an_op_with_no_room_left_moves_the_tensors_the_process_holds_to_host(car
         reference = run(model, x, passes=1)
     assert not spill.PRESSED[0] and not spill.USED, "a run with room notes no op"
     model.residency.unpark()
-    weights.set_budget(0)
+    weights.vacate()
     held = [torch.full((32 << 20,), float(i), device="cuda") for i in range(8)]  # 1 GiB
     torch.cuda.empty_cache()
     weights.measure_context()
@@ -1061,7 +1096,7 @@ def test_an_op_with_no_room_left_moves_the_tensors_the_process_holds_to_host(car
     moved = weights.facts().spilled_bytes
     weights.set_cap(cap + weight_policy.MARGIN)
     try:
-        weights.set_budget(-1)
+        aim(weights, -1)
         with weights.recovering():  # as the executor runs every call
             capped = run(model, x, passes=1)
         facts = weights.facts()
@@ -1138,7 +1173,7 @@ def test_a_card_the_packages_tensors_fill_runs_its_stage_through_host_and_disk(
         try:
             got = run(model, x, passes=1)
         except MemoryExhausted as exc:
-            pytest.fail(f"{exc}; moved {spill.summary(before)}; applied {weights.applied}")
+            pytest.fail(f"{exc}; moved {spill.summary(before)}; planned {weights.planned}")
         moved = [now - then for now, then in zip(spill.TOTALS, before, strict=True)]
         assert moved[3] if host == "room" else moved[5], spill.summary(before)
         assert spill.keep(x).device.type == "cpu"
@@ -1207,7 +1242,7 @@ def test_decoded_copies_count_in_a_stages_budget(tmp_path: Path) -> None:
     when its region binds. That copy is torch's memory beside the plane's stored bytes, so a
     stage's budget counts both: the plane's ring stays sized by the stored bytes alone."""
     weights = Weights(torch, torch.device("cpu"), "cpu")
-    weights.set_budget(-1, pinned=1 << 30)
+    weights.set_pinned(1 << 30)
     model = load(weights, write_checkpoint(tmp_path)[0], "decoded")
     component = model.residency.components["stack"]
     assert component.planned == component.layout
@@ -1267,18 +1302,16 @@ def refined(model: Any, name: str) -> weight_policy.Layout:
 @on_card
 @pytest.mark.parametrize("pressure,fine", [(False, False), (True, False), (False, True)])
 def test_an_sdxl_unet_streams_bit_exact(tmp_path: Path, pressure: bool, fine: bool) -> None:
-    """SDXL's UNet resident, then streamed through a tight budget, computes the same bits.
-    Under pressure the streamed arm alone also has a ballast leaving only the plane's budget
-    and the resident run's measured activations free, as physical ballast does in G4: every
-    streamed lease's bytes are checked against the store (`verify_bytes`), so a difference
-    can only be the kernels' choice under memory pressure. `fine`: the Worker's budget below
-    its block floor moves it to the sub-block grain at the first call's first block, mid-stage
-    with its common leased (cr-203 U5)."""
+    """SDXL's UNet resident, then streamed through a tight target, computes the same bits.
+    Under pressure the streamed arm alone also has a ballast leaving only the target and the
+    resident run's measured activations free, as physical ballast does in G4: every streamed
+    lease's bytes are checked against the store (`verify_bytes`), so a difference can only be
+    the kernels' choice under memory pressure. `fine`: at its sub-block grain (cr-203 U5)."""
     factory = functools.partial(sdxl_unet, (320, 640) if fine else (64, 128))
     torch.manual_seed(11)
     values = {k: v.float() * 0.05 for k, v in factory().state_dict().items()}
     weights = Weights(torch, torch.device("cuda", 0), "cuda")
-    weights.set_budget(-1, pinned=1 << 30)
+    weights.set_pinned(1 << 30)
     model = load(
         weights, store_component(tmp_path, "unet", values), "unet", name="unet", factory=factory
     )
@@ -1304,24 +1337,21 @@ def test_an_sdxl_unet_streams_bit_exact(tmp_path: Path, pressure: bool, fine: bo
                 model.residency.release("run", ("unet",))
         return out
 
-    weights.set_budget(1 << 30)
+    aim(weights, 1 << 30)
     torch.cuda.reset_peak_memory_stats()
     base = torch.cuda.memory_allocated()
     resident = steps()
     peak = torch.cuda.max_memory_allocated() - base
     layout: weight_policy.Layout = model.residency.components["unet"].layout
-    weights.set_budget(layout.common + 3 * layout.largest)
-    cell, fd = budget_cell.Cell.create()
-    worker = budget_cell.Cell(fd)
-    os.close(fd)
-    if fine:
-        weights.cell = cell
-        ticket = worker.ask(layout.common + layout.largest)
+    if fine:  # its sub-block grain, where rung 2 moves it under pressure
+        layout = refined(model, "unet")
+    target = layout.common + 3 * layout.largest
+    aim(weights, target)
     ballast = None
     if pressure:
         torch.cuda.empty_cache()
         free, _ = torch.cuda.mem_get_info()
-        left = weights.budget + peak + weight_policy.MARGIN
+        left = target + peak + weight_policy.MARGIN
         ballast = torch.empty(max(free - left, 0), dtype=torch.uint8, device="cuda")
     wrong: list[str] = []
     acquire = model.residency._acquire
@@ -1339,11 +1369,6 @@ def test_an_sdxl_unet_streams_bit_exact(tmp_path: Path, pressure: bool, fine: bo
         model.residency.unpark()
         del ballast
         torch.cuda.empty_cache()
-        if fine:
-            weights.cell = None
-            worker.answered(ticket)
-        cell.close()
-        worker.close()
     if fine:
         assert model.residency.components["unet"].fine
         layout = model.residency.components["unet"].layout
@@ -1354,41 +1379,9 @@ def test_an_sdxl_unet_streams_bit_exact(tmp_path: Path, pressure: bool, fine: bo
 
 
 @on_card
-def test_the_worker_lowers_a_running_stage_at_its_next_block(card: Any) -> None:
-    """Room for another executor's context, made while a call runs: the Worker asks through
-    the budget cell, and the stage unmaps and streams from its next block on, unchanged."""
-    weights = card.weights
-    model = load(weights, card.checkpoint, "cut")
-    x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
-    weights.set_budget(1 << 30)
-    reference = run(model, x)
-    cell, fd = budget_cell.Cell.create()
-    worker = budget_cell.Cell(fd)
-    os.close(fd)
-    weights.cell = cell
-    model.residency.admit("run", ("stack",))
-    try:
-        with torch.inference_mode():
-            outputs = [model.stack(x)]
-            ticket = worker.ask(tight(model))
-            outputs += [model.stack(x), model.stack(x)]
-    finally:
-        model.residency.release("run", ("stack",))
-        weights.cell = None
-        applied = worker.answered(ticket)
-        cell.close()
-        worker.close()
-    assert applied == tight(model)
-    facts = weights.facts()
-    assert weights.applied == tight(model) and facts.committed_bytes <= tight(model)
-    assert facts.streamed["stack"].resident_blocks < BLOCKS
-    assert same(reference, outputs)
-
-
-@on_card
 def test_the_owner_lowers_a_running_process_cap_at_its_next_block(card: Any) -> None:
-    """Room for another executor, or a display's floor, made while a call runs: the owner
-    asks for a smaller process cap through the budget cell; from its next block the stage
+    """A display's floor, kept while a call runs: the owner's floor watchdog writes a smaller
+    process cap into the budget cell; from its next block the ladder sheds to it, the stage
     streams inside it and the process holds no more than the cap, with the same bits."""
     weights = card.weights
     model = load(weights, card.checkpoint, "cap-cut")
@@ -1398,25 +1391,26 @@ def test_the_owner_lowers_a_running_process_cap_at_its_next_block(card: Any) -> 
     weights.measure_context()
     context = max(weights.context_bytes, 0)
     cap = context + torch.cuda.memory_reserved() + tight(model) + weight_policy.MARGIN
-    cell, fd = budget_cell.Cell.create()
-    owner = budget_cell.Cell(fd)
+    cell, fd = Cell.create()
+    owner = mmap.mmap(fd, 32)
     os.close(fd)
     weights.cell = cell
     model.residency.admit("run", ("stack",))
     try:
         with torch.inference_mode():
             outputs = [model.stack(x)]
-            ticket = owner.ask(budget_cell.CAP - cap)
+            struct.pack_into("<q", owner, 8, CAP - cap)  # the cap, then the counter
+            struct.pack_into("<q", owner, 0, 1)
             outputs += [model.stack(x), model.stack(x)]
     finally:
         model.residency.release("run", ("stack",))
         weights.cell = None
-        applied = owner.answered(ticket)
+        done = struct.unpack_from("<qqqq", owner)[2]
         cell.close()
         owner.close()
         weights.set_cap(-1)
     facts = weights.facts()
-    assert applied is not None and applied == weights.applied
+    assert done == 1, "the executor read it at a block boundary"
     assert facts.streamed["stack"].resident_blocks < BLOCKS
     assert context + torch.cuda.memory_reserved() + facts.committed_bytes <= cap
     assert same(reference, outputs)
@@ -1433,28 +1427,20 @@ def test_a_component_moves_to_the_sub_block_grain_at_any_block_boundary(card: An
     model = load(weights, card.checkpoint, "regrain")
     layout: weight_policy.Layout = model.residency.components["stack"].layout
     x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
-    weights.set_budget(1 << 30)
+    aim(weights, 1 << 30)
     reference = run(model, x)
-    weights.set_budget(tight(model))
-    cell, fd = budget_cell.Cell.create()
-    worker = budget_cell.Cell(fd)
-    os.close(fd)
-    weights.cell = cell
+    aim(weights, tight(model))
     model.residency.admit("run", ("stack",))
     try:
         with torch.inference_mode():
             outputs = [model.stack(x), model.stack(x)]  # the second pass streams in order
             coarse = model.residency.components["stack"]
             assert coarse.cursor is not None and coarse.lease is not None
-            # One block at a time: the next block applies it before its acquire, and moves on.
-            ticket = worker.ask(layout.common + layout.largest)
+            # Rung 2's plan of one block at a time: the next block plans before its acquire.
+            weights.memory.plan, weights.memory.shrunk = layout.common + layout.largest, True
             outputs.append(model.stack(x))
     finally:
         model.residency.release("run", ("stack",))
-        weights.cell = None
-        worker.answered(ticket)
-        cell.close()
-        worker.close()
     fine = model.residency.components["stack"]
     assert fine.fine and fine.common is not None and weights.modes["stack.grain"] == "sub-block"
     assert same(reference, outputs)
@@ -1468,7 +1454,7 @@ def test_memorys_rung_2_moves_the_running_stage_to_its_finest_grain(card: Any) -
     weights = card.weights
     model = load(weights, card.checkpoint, "finer")
     x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
-    weights.set_budget(1 << 30)
+    aim(weights, 1 << 30)
     reference = run(model, x)
     model.residency.admit("run", ("stack",))
     try:
@@ -1508,7 +1494,7 @@ def test_a_block_that_writes_its_inputs_recovers_op_by_op(card: Any) -> None:
     weights = card.weights
     model = load(weights, card.checkpoint, "writes", factory=WritingStack)
     x = torch.randn(8192, HIDDEN, device="cuda", dtype=torch.float16)
-    weights.set_budget(1 << 30)
+    aim(weights, 1 << 30)
     reference = run(model, x, passes=1)
     blocks = model.residency.components["stack"].blocks
     assert len(blocks) == BLOCKS
@@ -1527,52 +1513,49 @@ def test_a_block_that_writes_its_inputs_recovers_op_by_op(card: Any) -> None:
 
 @on_card
 def test_budgets_cut_and_raised_while_streaming_stay_exact(card: Any) -> None:
-    """Xid 31 (a copy engine wrote into an unmapped address): the Worker's cuts land at block
-    boundaries while the cursor's copies are in flight, and every cut closes the ring and maps
-    a new one. Hundreds of them, alternately tight and roomy, compute the resident bits; run
-    under `compute-sanitizer --tool memcheck` this is the reproduction."""
+    """Xid 31 (a copy engine wrote into an unmapped address): re-plans land at block boundaries
+    while the cursor's copies are in flight, and every one closes the ring and maps a new one.
+    Hundreds of them, in what the stage holds or tighter (rung 2), compute the resident bits;
+    run under `compute-sanitizer --tool memcheck` this is the reproduction."""
     weights = card.weights
     model = load(weights, card.checkpoint, "churn")
     x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
-    weights.set_budget(1 << 30)
+    aim(weights, 1 << 30)
     reference = run(model, x, passes=1)
-    cell, fd = budget_cell.Cell.create()
-    worker = budget_cell.Cell(fd)
-    os.close(fd)
-    weights.cell = cell
-    budgets = (tight(model), 1 << 30, model.residency.components["stack"].layout.common)
+    aim(weights, tight(model) + 4 * model.residency.components["stack"].layout.largest)
+    plans = (-1, tight(model), -1)
     out = []
     model.residency.admit("run", ("stack",))
     try:
         with torch.inference_mode():
             for i in range(200):
-                worker.ask(budgets[i % len(budgets)])
+                weights.memory.plan, weights.memory.shrunk = plans[i % len(plans)], True
                 out.append(model.stack(x))
         torch.cuda.synchronize()
     finally:
         model.residency.release("run", ("stack",))
-        weights.cell = None
-        cell.close()
-        worker.close()
     assert all(same(reference, [o]) for o in out)
 
 
 @on_card
-@pytest.mark.parametrize("cut", ["next stage", "worker", "oom"])
+@pytest.mark.parametrize("cut", ["next stage", "rung 2", "oom"])
 def test_weights_leave_only_after_the_kernels_that_read_them(tmp_path: Path, cut: str) -> None:
     """A stage's resident set is bound for the whole stage, and code reads it outside block
     forwards too (a tied embedding, a numerical check, a LoRA merge): those kernels hold no
     lease, and they are queued long before they run (here behind a one-second kernel).
-    Whatever unmaps the set next (the next stage's weights, a Worker's mid-call cut, an
-    out-of-memory cut) waits for them; unmapping under them was an illegal address (on a
+    Whatever unmaps the set next (the next stage's weights, rung 2's mid-call plan, an
+    out-of-memory unmap) waits for them; unmapping under them was an illegal address (on a
     laptop, an MMU fault that can freeze it)."""
     weights = Weights(torch, torch.device("cuda", 0), "cuda")
-    weights.set_budget(-1, pinned=1 << 30)
+    weights.set_pinned(1 << 30)
     checkpoint = write_checkpoint(tmp_path)[0]
     first, second = load(weights, checkpoint, "first"), load(weights, checkpoint, "second")
     x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
     layout: weight_policy.Layout = first.residency.components["stack"].layout
-    weights.set_budget(layout.total + (8 << 20))  # one construction's weights at a time
+    torch.cuda.empty_cache()
+    weights.measure_context()
+    room = max(weights.context_bytes, 0) + torch.cuda.memory_reserved() + weight_policy.MARGIN
+    weights.set_cap(room + layout.total + (8 << 20))  # one construction's weights at a time
 
     def outside(model: Any) -> Any:  # a read outside every block forward
         return x @ model.stack.blocks[3].proj.weight.T
@@ -1581,28 +1564,22 @@ def test_weights_leave_only_after_the_kernels_that_read_them(tmp_path: Path, cut
     with torch.inference_mode():
         reference = outside(first)
     first.residency.release("run", ("stack",))
-    cell, fd = budget_cell.Cell.create()
-    worker = budget_cell.Cell(fd)
-    os.close(fd)
-    weights.cell = cell
     try:
         with torch.inference_mode():
             first.residency.admit("run", ("stack",))
             torch.cuda._sleep(int(2e9))  # the GPU falls a second behind the host
             late = outside(first)  # reads a resident weight after the sleep
-            if cut == "worker":
-                worker.ask(layout.common)  # applied at the next block boundary
-                first.stack(x)
+            if cut == "rung 2":
+                weights.memory.plan, weights.memory.shrunk = layout.common, True
+                first.stack(x)  # applied at the next block boundary
             elif cut == "oom":
-                weights.shrink(layout.total, 0)
+                weights.unmap(layout.total, running=True)
             first.residency.release("run", ("stack",))
             if cut == "next stage":
-                run(second, x, passes=1)  # wants the room: evicts the first's resident set
+                run(second, x, passes=1)  # wants the room: unmaps the first's resident set
         torch.cuda.synchronize()
     finally:
-        weights.cell = None
-        cell.close()
-        worker.close()
+        weights.set_cap(-1)
     assert torch.equal(reference, late)
 
 
@@ -1616,7 +1593,7 @@ def test_an_op_that_no_unmap_can_help_fails_once(card: Any) -> None:
     model = load(weights, card.checkpoint, "stuck")
     x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
     layout: weight_policy.Layout = model.residency.components["stack"].layout
-    weights.set_budget(tight(model))
+    aim(weights, tight(model))
     run(model, x, passes=1)
     calls = {"room": 0}
     free_for = weights.memory.free_for
@@ -1652,7 +1629,7 @@ def test_an_oom_at_a_block_boundary_unmaps_weights_and_retries(card: Any) -> Non
     weights = card.weights
     model = load(weights, card.checkpoint, "oom")
     x = torch.randn(8192, HIDDEN, device="cuda", dtype=torch.float16)
-    weights.set_budget(1 << 30)
+    aim(weights, 1 << 30)
     reference = run(model, x, passes=1)
     torch.cuda.empty_cache()
     free, _ = torch.cuda.mem_get_info()
@@ -1676,7 +1653,7 @@ def test_an_op_short_of_memory_mid_pass_drops_the_running_stages_resident_set(ca
     model = load(weights, card.checkpoint, "finer")
     stack = model.residency.components["stack"]
     x = torch.randn(8192, HIDDEN, device="cuda", dtype=torch.float16)
-    weights.set_budget(stack.layout.common + 6 * stack.layout.largest)
+    aim(weights, stack.layout.common + 6 * stack.layout.largest)
     reference = run(model, x, passes=3)
     assert stack.residence is not None and stack.residence.resident and stack.residence.streamed
     torch.cuda.empty_cache()
@@ -1711,7 +1688,8 @@ def scoped(tmp_path: Path) -> tuple[Weights, WeightResidency, dict[str, Any]]:
     its conditioner, text encoder, transformer and VAE: each one's common region stays leased
     for all of it."""
     weights = Weights(torch, torch.device("cuda", 0), "cuda")
-    weights.set_budget(1 << 30, pinned=1 << 30)
+    weights.set_pinned(1 << 30)
+    aim(weights, 1 << 30)
     stack_checkpoint, _ = write_checkpoint(tmp_path / "stack")
     generator = torch.Generator().manual_seed(11)
     encoder_checkpoint = store_component(
@@ -1803,7 +1781,7 @@ def test_an_op_out_of_memory_spares_the_components_not_in_use(
             encoded = modules["encoder"](x)
             reference = modules["stack"](encoded)  # the stack's blocks ran last
             mapped = weights.facts().committed_bytes
-            monkeypatch.setattr(weights, "shrink", lambda *_, **__: 0)  # unmapping gives nothing
+            monkeypatch.setattr(weights, "unmap", lambda *_, **__: 0)  # unmapping gives nothing
             weights.memory._settle()  # torch's idle cache is not what this asks for
             ask = weights.memory.free() - weight_policy.MARGIN + common.span // 2
             assert weights.memory.free_for(ask, "aten.clone.default", (encoded,), Rung.FINER)
@@ -1853,7 +1831,7 @@ def test_a_component_without_blocks_streams_inside_an_owners_cap(tmp_path: Path)
     ops between regions (`x * norm`, `tanh`) run out of memory at the cap, its weights leave
     for them, and it computes the same bits inside the cap."""
     weights = Weights(torch, torch.device("cuda", 0), "cuda")
-    weights.set_budget(-1, pinned=1 << 30)
+    weights.set_pinned(1 << 30)
     model = load(weights, write_checkpoint(tmp_path)[0], "flat", factory=Flat)
     component = model.residency.components["stack"]
     assert component.fine and len(component.blocks) == 2 * BLOCKS
@@ -1868,7 +1846,7 @@ def test_a_component_without_blocks_streams_inside_an_owners_cap(tmp_path: Path)
     uncapped = [t.cpu() for t in recovered(x)]  # off the card: its bytes are no room
     measured = torch.cuda.max_memory_allocated() - live
     model.residency.unpark()
-    weights.set_budget(0)
+    weights.vacate()
     torch.cuda.empty_cache()
     weights.measure_context()
     context = max(weights.context_bytes, 0)
@@ -1876,12 +1854,12 @@ def test_a_component_without_blocks_streams_inside_an_owners_cap(tmp_path: Path)
     # torch holds live, not its cache: earlier tests' segments are no room).
     cap = context + torch.cuda.memory_allocated() + measured + weight_policy.MARGIN
     assert component.layout.total > weight_policy.MARGIN
-    weights.activation.clear()  # unmeasured: the stage keeps every weight it can
+    weights.memory.peaks.clear()  # unmeasured: the stage keeps every weight it can
     retries = weights.facts().oom_retries
     torch.cuda.reset_peak_memory_stats()
     weights.set_cap(cap)
     try:
-        weights.set_budget(-1)
+        aim(weights, -1)
         capped = [t.cpu() for t in recovered(x)]
         peak = torch.cuda.max_memory_reserved()
         facts = weights.facts()
@@ -1917,13 +1895,14 @@ def test_a_module_called_again_right_after_itself_streams_once(tmp_path: Path) -
     unread: 300 GB of copies in one 17-frame window. A block not due within the cursor's
     window is filled on demand instead, and the stream copies each pass about once."""
     weights = Weights(torch, torch.device("cuda", 0), "cuda")
-    weights.set_budget(1 << 30, pinned=1 << 30)
+    weights.set_pinned(1 << 30)
+    aim(weights, 1 << 30)
     model = load(weights, write_checkpoint(tmp_path)[0], "twice", factory=FlatTwice)
     layout: weight_policy.Layout = model.residency.components["stack"].layout
     x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
     resident = run(model, x)
     model.residency.unpark()
-    weights.set_budget(layout.common + 4 * layout.largest)
+    aim(weights, layout.common + 4 * layout.largest)
     run(model, x, passes=2)  # the order is learned, then streamed
     before = weights.facts().h2d_bytes
     streamed = run(model, x)
@@ -1964,11 +1943,17 @@ def test_an_idle_construction_gives_room_and_returns_from_the_pinned_tier(card: 
     second = load(weights, card.checkpoint, "second")
     x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
     total = first.residency.components["stack"].layout.total
-    weights.set_budget(total + (8 << 20))
-    a = run(first, x)
-    b = run(second, x)  # evicts the idle first: least recently used
-    assert weights.resident_bytes(first.residency.components["stack"]) < total
-    again = run(first, x)
+    torch.cuda.empty_cache()
+    weights.measure_context()
+    room = max(weights.context_bytes, 0) + torch.cuda.memory_reserved() + weight_policy.MARGIN
+    weights.set_cap(room + total + (8 << 20))  # one construction's weights at a time
+    try:
+        a = run(first, x)
+        b = run(second, x)  # unmaps the idle first: least recently used
+        assert weights.resident_bytes(first.residency.components["stack"]) < total
+        again = run(first, x)
+    finally:
+        weights.set_cap(-1)
     assert same(a, again) and same(a, b)
 
 
@@ -2121,7 +2106,7 @@ def test_a_dit_with_its_loras_computes_on_the_pinned_tier(tmp_path: Path) -> Non
     a request LoRA and the consumer overlay armed computes what the same modules compute
     unmanaged."""
     weights = Weights(torch, torch.device("cpu"), "cpu")
-    weights.set_budget(-1, pinned=1 << 30)
+    weights.set_pinned(1 << 30)
     dit, adapter = lora_models(weights, tmp_path, "host")
     inputs = dit_inputs("cpu")
     got = lora_denoise(weights, dit, adapter, inputs, lambda step: None)
@@ -2154,18 +2139,18 @@ def test_a_dit_with_its_loras_pages_instead_of_running_out(tmp_path: Path) -> No
     overlay's stage shares the DiT's budget, blocks stream, and the allocation that fails
     unmaps weights and runs again."""
     weights = Weights(torch, torch.device("cuda", 0), "cuda")
-    weights.set_budget(-1, pinned=1 << 30)
+    weights.set_pinned(1 << 30)
     dit, adapter = lora_models(weights, tmp_path, "dit")
     inputs = dit_inputs("cuda")
     layout: weight_policy.Layout = dit.residency.components["fl2va_dit"].layout
     overlay = adapter.residency.components["fl2va_overlay"].layout.total
-    weights.set_budget(1 << 30)
+    aim(weights, 1 << 30)
     resident, peak = lora_reference(weights, dit, adapter, inputs)
     assert weights.facts().streamed["fl2va_dit"].resident_blocks == len(layout.blocks)
 
     spare = 6 * layout.largest  # what an out-of-memory retry can still unmap
-    weights.set_budget(weight_policy.floor(layout) + overlay + spare)
-    assert weights.budget < (layout.total + overlay) // 2
+    aim(weights, weight_policy.floor(layout) + overlay + spare)
+    assert weight_policy.floor(layout) + overlay + spare < (layout.total + overlay) // 2
     was = weights.facts()
     try:
         paged = lora_denoise(weights, dit, adapter, inputs, squeezing(1, peak))
@@ -2186,15 +2171,15 @@ def test_a_dit_with_its_loras_at_the_sub_block_grain_is_bit_exact(
     blocks split into their projections computes the resident run's bits."""
     monkeypatch.setattr(weights_module, "REGION_LIMIT", 1 << 20)
     weights = Weights(torch, torch.device("cuda", 0), "cuda")
-    weights.set_budget(-1, pinned=1 << 30)
+    weights.set_pinned(1 << 30)
     dit, adapter = lora_models(weights, tmp_path, "dit-fine")
     inputs = dit_inputs("cuda")
-    weights.set_budget(1 << 30)
+    aim(weights, 1 << 30)
     resident, _ = lora_reference(weights, dit, adapter, inputs)
     adapter.residency.unpark()
     layout = refined(dit, "fl2va_dit")
     overlay = adapter.residency.components["fl2va_overlay"].layout.total
-    weights.set_budget(layout.common + overlay + 3 * layout.largest)
+    aim(weights, layout.common + overlay + 3 * layout.largest)
     try:
         paged = lora_denoise(weights, dit, adapter, inputs, lambda step: None)
     finally:
@@ -2228,27 +2213,27 @@ def squeezing(at: int, peak: int) -> Any:
 def test_one_gpu_of_a_group_never_runs_a_block_twice(tmp_path: Path) -> None:
     """Run 2589 (2x A40): a block that ran out of memory was run again, but in a group it
     holds collectives the other GPUs are already in, and the group hung. One GPU of a group
-    runs an unmeasured stage's first pass at the floor and grows at the second by what it
-    measured; an op that still runs out of memory unmaps idle weights and that op runs again."""
+    plans as one GPU does; an op that runs out of memory unmaps idle weights and that op runs
+    again, never the block."""
     weights = Weights(torch, torch.device("cuda", 0), "cuda")
-    weights.set_budget(-1, pinned=1 << 30)
+    weights.set_pinned(1 << 30)
     dit, adapter = lora_models(weights, tmp_path, "dit")
     (tmp_path / "idle").mkdir()
     idle = load(weights, write_checkpoint(tmp_path / "idle")[0], "idle")
     inputs = dit_inputs("cuda")
     layout: weight_policy.Layout = dit.residency.components["fl2va_dit"].layout
-    weights.set_budget(1 << 30)
+    aim(weights, 1 << 30)
     resident, peak = lora_reference(weights, dit, adapter, inputs)
     calls = {"block": 0}
     block = dit.stack.transformer_blocks[0].attn
     block.register_forward_hook(lambda *_: calls.__setitem__("block", calls["block"] + 1))
 
     weights.grouped = True
-    weights.activation.clear()  # a fresh executor's first request: nothing measured
+    weights.memory.peaks.clear()  # a fresh executor's first request: nothing measured
     grown = lora_denoise(weights, dit, adapter, inputs, lambda step: None)
     assert same(list(resident), list(grown)) and calls["block"] == 3
     assert weights.facts().streamed["fl2va_dit"].resident_blocks == len(layout.blocks)
-    assert weights.facts().h2d_bytes > 0  # the first pass streamed every block
+    assert weights.facts().h2d_bytes > 0
 
     x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
     run(idle, x, passes=1)
@@ -2282,16 +2267,16 @@ def test_a_group_gpus_denoise_keeps_a_resident_set_after_a_one_pass_warm_up(card
         finally:
             model.residency.release(method, ("stack",))
 
-    weights.set_budget(1 << 30)
+    aim(weights, 1 << 30)
     resident = staged("reference", 3)
     model.residency.open_attempt()
     weights.grouped = True
-    weights.activation.clear()  # a fresh executor's first request: nothing measured
+    weights.memory.peaks.clear()  # a fresh executor's first request: nothing measured
     layout: weight_policy.Layout = model.residency.components["stack"].layout
-    weights.set_budget(layout.common + (BLOCKS // 2 + 2) * layout.largest)
+    aim(weights, layout.common + (BLOCKS // 2 + 2) * layout.largest)
     staged("warm", 1)
     # The warm-up's first launches (library workspaces) are not the denoise's activations.
-    weights.activation.clear()
+    weights.memory.peaks.clear()
     denoised = staged("denoise", 3)
     kept = weights.facts().streamed["stack"].resident_blocks
     assert 0 < kept < BLOCKS, kept
@@ -2307,13 +2292,13 @@ def test_a_stage_that_runs_once_never_evicts_what_a_repeating_stage_keeps(
     runs once streams beside a repeating stage's kept set, exactly, and the repeating stage's
     next entry copies nothing in."""
     weights = Weights(torch, torch.device("cuda", 0), "cuda")
-    weights.set_budget(-1, pinned=1 << 30)
+    weights.set_pinned(1 << 30)
     (tmp_path / "dit").mkdir()
     (tmp_path / "te").mkdir()
     dit = load(weights, write_checkpoint(tmp_path / "dit")[0], "dit")
     te = load(weights, write_checkpoint(tmp_path / "te")[0], "te")
     denoiser, encoder = dit.residency.components["stack"], te.residency.components["stack"]
-    weights.set_budget(denoiser.layout.total + (64 << 20))  # the DiT whole, not both
+    aim(weights, denoiser.layout.total + (64 << 20))  # the DiT whole, not both
     x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
 
     def staged(model: Any, method: str, passes: int) -> list[Any]:
@@ -2344,14 +2329,12 @@ def test_a_hot_set_mapped_back_after_an_attempt_gives_way_to_any_ask(tmp_path: P
     what asks: an op out of memory (the ladder's rung 1) and the machine's room ask (a budget
     it lowers to 0). A later repeating stage (a decode) had taken part of it."""
     weights = Weights(torch, torch.device("cuda", 0), "cuda")
-    weights.set_budget(-1, pinned=1 << 30)
+    weights.set_pinned(1 << 30)
     (tmp_path / "dit").mkdir()
     (tmp_path / "vae").mkdir()
     dit = load(weights, write_checkpoint(tmp_path / "dit")[0], "dit")
     vae = load(weights, write_checkpoint(tmp_path / "vae")[0], "vae")
     denoiser, decoder = dit.residency.components["stack"], vae.residency.components["stack"]
-    whole = denoiser.layout.total
-    weights.set_budget(whole + (64 << 20))
     x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
 
     def staged(model: Any, method: str, passes: int) -> None:
@@ -2366,11 +2349,12 @@ def test_a_hot_set_mapped_back_after_an_attempt_gives_way_to_any_ask(tmp_path: P
 
     staged(dit, "denoise", 3)
     held = weights.resident_bytes(denoiser)
+    weights.set_cap(room(weights, 64 << 20))  # the DiT whole, not both
     staged(vae, "decode", 3)  # repeats too: it takes what it needs of the DiT's set
     weights.drain()
     assert denoiser.hot and weights.resident_bytes(denoiser) < held
     decoded = weights.resident_bytes(decoder)
-    weights.set_budget(-1)  # the room the device has now
+    weights.set_cap(-1)  # the room the device has now
     dit.residency.restore()
     if (backing := weights.backing) is not None:
         backing.join()  # nothing asked: it all maps back
@@ -2384,7 +2368,7 @@ def test_a_hot_set_mapped_back_after_an_attempt_gives_way_to_any_ask(tmp_path: P
     # Mapping back again, the machine's ask comes while regions are still queued in the plane,
     # where no trim reaches them: the mapping stops at the one in flight, and nothing stays.
     dit.residency.restore()
-    weights.set_budget(0)
+    weights.vacate()
     assert weights.backing is None and not weights.back
     assert plane.stats(weights.plane).device(0).committed == 0
 
@@ -2398,7 +2382,7 @@ def test_a_group_gpus_first_decode_keeps_its_denoisers_weights_under_a_cap(
     segment read back whole (51 GiB, 1.3-2.0 s). Under the owner's cap the decode streams
     through its own window and the denoiser stays mapped: its next stage misses nothing."""
     weights = Weights(torch, torch.device("cuda", 0), "cuda")
-    weights.set_budget(-1, pinned=1 << 30)
+    weights.set_pinned(1 << 30)
     (tmp_path / "dit").mkdir()
     (tmp_path / "vae").mkdir()
     dit = load(weights, write_checkpoint(tmp_path / "dit")[0], "dit")
@@ -2416,7 +2400,7 @@ def test_a_group_gpus_first_decode_keeps_its_denoisers_weights_under_a_cap(
     weights.grouped = True
     weights.set_cap(room(weights, 1 << 30))
     try:
-        reference = staged(dit, "denoise", 3)  # streams its first pass, then grows
+        reference = staged(dit, "denoise", 3)
         denoiser = dit.residency.components["stack"]
         held = weights.resident_bytes(denoiser)
         assert held > 0
@@ -2440,7 +2424,7 @@ def test_a_components_blocks_run_without_a_dispatch_layer_and_its_ops_recover(ca
     model = load(weights, card.checkpoint, "root")
     component = model.residency.components["stack"]
     x = torch.randn(8192, HIDDEN, device="cuda", dtype=torch.float16)
-    weights.set_budget(1 << 30)
+    aim(weights, 1 << 30)
     reference = run(model, x, passes=1)
     kind = weights_module._OPS.setdefault(id(torch), weights_module._ops_type(torch))
     counted = {"ops": 0, "acquires": 0}
@@ -2492,7 +2476,7 @@ def test_an_op_outside_every_block_runs_again_after_weights_leave(card: Any) -> 
     weights = card.weights
     model = load(weights, card.checkpoint, "glue")
     x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
-    weights.set_budget(1 << 30)
+    aim(weights, 1 << 30)
     reference = run(model, x, passes=1)
     retries = weights.facts().oom_retries
     model.residency.admit("run", ("stack",))
@@ -2564,7 +2548,7 @@ def test_an_image_decode_short_of_memory_is_still_the_untiled_image(tmp_path: Pa
     read host rows over the bus once each. Either way the image is the untiled one to fp16
     rounding. The cap is the process's own: the card is never filled."""
     weights = Weights(torch, torch.device("cuda", 0), "cuda")
-    weights.set_budget(-1, pinned=1 << 30)
+    weights.set_pinned(1 << 30)
     model, plain = plane_vae(weights, tmp_path / "vae", kl_vae)
     z = torch.randn(1, 4, 256, 256, device="cuda", dtype=torch.float16)  # 512x512 pixels
     with torch.inference_mode():
@@ -2598,7 +2582,7 @@ def test_attention_and_an_int8_linear_short_of_memory_run_in_pieces_on_the_card(
     its Q/K/V runs in head groups, an int8 leaf's product and a bf16 matmul in rows. Each
     attention and int8 piece computes as the whole does: the same bits."""
     weights = Weights(torch, torch.device("cuda", 0), "cuda")
-    weights.set_budget(-1, pinned=1 << 30)
+    weights.set_pinned(1 << 30)
     torch.manual_seed(4)
     q, k, v = (torch.randn(1, 16384, 16, 128, device="cuda", dtype=torch.bfloat16) for _ in "qkv")
     options = attention_ulysses.Options(
@@ -2639,7 +2623,7 @@ def test_a_transformer_short_of_memory_cuts_its_linears_norms_and_attention() ->
     uncut output, to bfloat16 rounding of products whose kernels change with their rows."""
     diffusers = pytest.importorskip("diffusers")
     weights = Weights(torch, torch.device("cuda", 0), "cuda")
-    weights.set_budget(-1, pinned=1 << 30)
+    weights.set_pinned(1 << 30)
     torch.manual_seed(3)
     model = diffusers.Flux2Transformer2DModel(
         in_channels=64,
@@ -2684,13 +2668,13 @@ def test_a_banded_result_out_of_memory_inside_a_nested_recovery_lives_in_host_me
     taking the bands' own allocation for the package's op, refused it. The bands' ops reach
     no mode: the result goes to host memory and the image is the untiled one."""
     weights = Weights(torch, torch.device("cuda", 0), "cuda")
-    weights.set_budget(-1, pinned=1 << 30)
+    weights.set_pinned(1 << 30)
     model, plain = plane_vae(weights, tmp_path / "vae", kl_vae)
     z = torch.randn(1, 4, 256, 256, device="cuda", dtype=torch.float16)
     with torch.inference_mode():
         reference = plain.decode(z).sample
     del plain
-    monkeypatch.setattr(weights, "activation_room", lambda whole=False: (1 << 40, 0))  # all fit
+    monkeypatch.setattr(weights.memory, "available", lambda whole=False: 1 << 40)  # all fit
     weights.modes.clear()
     weights.set_cap(room(weights, 96 << 20))
     model.residency.admit("run", ("vae",))
@@ -2718,7 +2702,8 @@ def test_a_qwen_image_vae_decodes_exactly_on_the_plane(tmp_path: Path) -> None:
         return diffusers.AutoencoderKLQwenImage(base_dim=32, num_res_blocks=1).to(torch.float16)
 
     weights = Weights(torch, torch.device("cuda", 0), "cuda")
-    weights.set_budget(1 << 30, pinned=1 << 30)
+    weights.set_pinned(1 << 30)
+    aim(weights, 1 << 30)
     model, plain = plane_vae(weights, tmp_path / "vae", vae)
     z = torch.randn(1, 16, 1, 64, 64, device="cuda", dtype=torch.float16)
     with torch.inference_mode():
@@ -2737,7 +2722,7 @@ def test_a_decode_unmaps_idle_weights_only_for_the_room_it_needs(card: Any, tmp_
     weights unmaps none; on a card with 8 MiB left they leave first (activations first) and
     its maps stay on the card."""
     weights = card.weights
-    weights.set_budget(1 << 30)
+    aim(weights, 1 << 30)
     idle = load(weights, card.checkpoint, "idle")
     x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
     stack = idle.residency.components["stack"]
@@ -2786,7 +2771,7 @@ def test_a_decode_takes_no_room_from_its_stages_floor(card: Any, tmp_path: Path)
     allocatable. The room a decode takes is never its open stages' floor."""
     diffusers = pytest.importorskip("diffusers")
     weights = card.weights
-    weights.set_budget(-1, pinned=2 << 30)
+    weights.set_pinned(2 << 30)
     denoiser = load(weights, card.checkpoint, "beside", scope="render")
 
     def vae() -> Any:
@@ -2813,7 +2798,7 @@ def test_a_decode_takes_no_room_from_its_stages_floor(card: Any, tmp_path: Path)
     stack = denoiser.residency.components["stack"].layout
     fine = refined(model, "vae")
     assert fine.largest > stack.common + fine.common
-    weights.set_budget(weight_policy.floor(stack) + weight_policy.floor(fine) + (2 << 20))
+    aim(weights, weight_policy.floor(stack) + weight_policy.floor(fine) + (2 << 20))
     denoiser.residency.admit("render", ("stack",))
     try:
         model.residency.admit("run", ("vae",))
@@ -2821,7 +2806,6 @@ def test_a_decode_takes_no_room_from_its_stages_floor(card: Any, tmp_path: Path)
             with weights.recovering(), torch.inference_mode():
                 denoiser.stack(x)  # its last blocks stay mapped: room the decode may take
                 image = model.stack.decode(z).sample
-            assert weights.applied >= weights.floor()
         finally:
             model.residency.release("run", ("vae",))
     finally:

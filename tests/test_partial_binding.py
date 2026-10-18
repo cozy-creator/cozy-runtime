@@ -68,7 +68,7 @@ def bind(tmp_path: Path, component: str) -> tuple[PairModel, PlaneBackend, Any]:
     checkpoint = store_component(tmp_path, component, {"weight": value})
     rows = checkpoint.rows(component)
     weights = Weights(torch, torch.device("cpu"), "cpu")
-    weights.set_budget(-1, pinned=1 << 30)
+    weights.set_pinned(1 << 30)
     backend = PlaneBackend.for_script(
         {component: checkpoint}, rows, weights=weights, construction="partial", release="p/1"
     )

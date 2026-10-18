@@ -27,7 +27,7 @@ class PlaneFacts(msgspec.Struct, frozen=True, kw_only=True):
     #: torch's reserved bytes, and the process's device bytes (context + reserved + mapped)
     reserved_bytes: int = -1
     process_bytes: int = -1
-    #: the owner's process cap in force (`process_cap/1`); -1: none
+    #: the floor watchdog's process cap in force (`process_cap/1`); -1: none
     cap_bytes: int = -1
     #: torch's peak above its bytes at the attempt's start: activations and derived weights
     activation_peak_bytes: int = -1
@@ -47,10 +47,6 @@ class PlaneFacts(msgspec.Struct, frozen=True, kw_only=True):
     disk_gbps: float = 0.0
     #: page locks the driver refused (a sealed layout counts once)
     register_failed: int = 0
-    #: per stage method, its last plan's inputs, bytes: driver free, torch reserved and
-    #: allocated, the plane's committed and the bound weights' decoded copies, the stage's
-    #: activation growth and the budget that came out (`Weights.driver_budget`)
-    plan_inputs: dict[str, dict[str, int]] = {}
     #: GPU regions mapped from the machine's custody (`weights.attach/1`): outside
     #: `committed_bytes`, counted once by the machine
     shared_bytes: int = 0
@@ -79,10 +75,6 @@ class PlaneFacts(msgspec.Struct, frozen=True, kw_only=True):
     cache_releases: int = 0
     cache_released_bytes: int = 0
     cache_released_by: dict[str, tuple[int, int]] = {}
-    #: Per stage method, the most room torch had at an entry of this request in which it
-    #: dropped its cache more than once: the owner keeps it for the request's shape and
-    #: gives it to later executors (`Invoke.squeezed_bytes`)
-    squeezed: dict[str, int] = {}
     #: components given back to make torch room since the process began, and their bytes
     paged_out: int = 0
     paged_out_bytes: int = 0

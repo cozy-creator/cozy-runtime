@@ -93,7 +93,7 @@ def serve(tmp_path: Path, cls: type[Initialized] = Initialized) -> tuple[Initial
     checkpoint = store_component(tmp_path, "net", {"weight": value})
     rows = checkpoint.rows("net")
     weights = Weights(torch, torch.device("cpu"), "cpu")
-    weights.set_budget(-1, pinned=1 << 30)
+    weights.set_pinned(1 << 30)
     backend = PlaneBackend.for_script(
         {"net": checkpoint}, rows, weights=weights, construction="init", release="p/1"
     )

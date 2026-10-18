@@ -250,8 +250,8 @@ class FetchChannel(_Request, frozen=True, kw_only=True, tag="fetch_channel"):
 
 
 class BudgetCell(_Request, frozen=True, kw_only=True, tag="budget_cell"):
-    """The executor's plane budget cell (`internal/budget_cell.py`; its memfd follows this
-    request): the Worker lowers a running call's budget through it, at a block boundary."""
+    """The executor's budget cell (`memory.Cell`; its memfd follows this request): the owner's
+    floor watchdog caps a running call through it, read at a block boundary."""
 
     #: the memfd the worker received; never on the wire
     memfd: int = -1

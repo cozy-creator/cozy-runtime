@@ -1,8 +1,7 @@
-"""Weight-plane memory policy: pure arithmetic over measured facts (weight-plane.md §4-5).
+"""Weight-plane placement policy: pure arithmetic over measured facts (weight-plane.md §4-5).
 
 The plane moves bytes and never decides; this module decides and never moves bytes. It takes
-no torch, no plane and no I/O, so the executor (per stage) and the Worker (per tenant) run the
-same rules. Activations come first: the plane gets what the driver has free after them.
+no torch, no plane and no I/O. A stage places its weights in a target `memory.Memory` sets.
 """
 
 from __future__ import annotations
@@ -16,8 +15,8 @@ from itertools import pairwise
 #: one arriving.
 DEFAULT_WINDOW = 2
 MAX_WINDOW = 6
-#: Allocator fragmentation between the plane's budget and torch's activations. Small because a
-#: torch OOM at a block boundary lowers the budget and retries (§4, activations first).
+#: Allocator fragmentation between the plane's maps and torch's activations. Small because a
+#: torch OOM runs the memory ladder and retries the op.
 MARGIN = 64 << 20
 #: Room a GPU library is given when its call is refused: a first launch takes memory for
 #: itself (cuBLAS 36 MiB for a bf16 GEMM, 6 MiB more for fp16; cuDNN 2 MiB for a convolution;
@@ -75,19 +74,14 @@ class Residence:
 
 
 class BelowFloor(Exception):
-    """The budget cannot hold even the non-streamable minimum. Carries both numbers, and the
-    component that did not fit at its current grain."""
+    """A component does not fit its share of the target at its current grain: it moves to a
+    finer one. Carries both numbers and the component."""
 
     def __init__(self, needed: int, available: int, detail: str, component: str = "") -> None:
         super().__init__(f"{detail}: needs {needed} B, {available} B available")
         self.needed = needed
         self.available = available
         self.component = component
-
-
-def plane_budget(free: int, activation: int, context: int = 0, margin: int = MARGIN) -> int:
-    """`free - activation growth - context`: the device bytes the plane may map."""
-    return max(free - activation - context - margin, 0)
 
 
 def free_floor(total: int, display: bool) -> int:
@@ -190,7 +184,7 @@ def residence(
     if layout.total <= budget:
         return Residence(resident=tuple(walk), streamed=(), window=0)
     if layout.least > budget:
-        raise BelowFloor(layout.least, budget, "the component does not fit the plane budget")
+        raise BelowFloor(layout.least, budget, "the component does not fit its target")
     sizes = [layout.blocks[i] for i in walk]
     costs = costs or Costs()
     known = [costs.compute[i] for i in walk if i in costs.compute]
@@ -305,12 +299,13 @@ def stage(
     cyclic: Collection[str] = (),
     hot: int = 0,
 ) -> dict[str, Residence]:
-    """Every declared component's residence for one stage, inside one plane budget.
+    """Every declared component's residence for one stage, inside one target (`budget`).
 
     Each component first gets its floor at its grain, so a larger one never takes the room a
     smaller one needs to stay whole (H3's turbo LoRA beside its DiT, run 2947); only when those
     do not fit does each count at its finest grain, and the one placed first that does not fit
-    at its own is named in the `BelowFloor`, to move finer. What is left goes to cyclic
+    at its own is named in the `BelowFloor`, to move finer. Below every finest floor the stage
+    runs at them: the device makes room as it maps (`Memory`). What is left goes to cyclic
     components first (they repeat, so every resident byte saves a copy per pass), then to
     run-once ones, which are resident only when whole. Components outside the stage are not
     counted: they are evictable, lower priority, and the plane unmaps them as this stage's
@@ -325,11 +320,7 @@ def stage(
     need = {name: layout.least for name, layout in layouts.items()}
     if sum(need.values()) > budget:
         need = {name: floor(layout) for name, layout in layouts.items()}
-    if sum(need.values()) > budget:
-        raise BelowFloor(
-            sum(need.values()), budget, "the stage's weights do not fit at their finest grain"
-        )
-    spare = budget - sum(need.values())
+    spare = max(budget - sum(need.values()), 0)
     placed: dict[str, Residence] = {}
     for name in sorted(layouts, key=lambda n: (n not in cyclic, -layouts[n].total, n)):
         layout = layouts[name]

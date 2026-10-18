@@ -15,7 +15,7 @@ torch = pytest.importorskip("torch")
 
 from cozy_runtime.internal import plane  # noqa: E402
 from cozy_runtime.internal.weights import Weights, _unbaked, let_go, unbind  # noqa: E402
-from test_weight_plane import dit_inputs, lora_models, lora_reference, on_card  # noqa: E402
+from test_weight_plane import aim, dit_inputs, lora_models, lora_reference, on_card  # noqa: E402
 
 
 def _evict(weights: Weights, component: object, regions: list[object]) -> None:
@@ -48,9 +48,9 @@ def test_a_read_outside_forward_binds_a_baked_block_whose_bake_reads_the_overlay
     from testdata.consumer_lora import armed
 
     weights = Weights(torch, torch.device("cuda", 0), "cuda")
-    weights.set_budget(-1, pinned=1 << 30)
+    weights.set_pinned(1 << 30)
     dit, adapter = lora_models(weights, tmp_path, "nested")
-    weights.set_budget(1 << 30)
+    aim(weights, 1 << 30)
     lora_reference(weights, dit, adapter, dit_inputs("cuda"))  # every block baked, overlay armed
     site = dit.stack.get_submodule("transformer_blocks.0.attn.to_v")  # the overlay's own site
     baked = site.weight.detach().clone()

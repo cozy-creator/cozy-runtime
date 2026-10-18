@@ -138,7 +138,6 @@ def test_the_ledger_names_what_no_class_accounts_for() -> None:
         allocated=2 * gib,
         mapped=gib,
         leased=gib // 4,
-        budget=gib,
         shared=0,
         hosted=0,
         floor=0,
@@ -169,13 +168,13 @@ def test_garbage_holding_a_ring_is_collected_before_anything_else_moves(
     ring before it moves any weight; a ring a live view holds stays, and its weight set never
     moves to another grain under it (0.27.3)."""
     weights, _, _ = wrapped(StatefulBlock("counter"), monkeypatch)
-    component, shrink, open_then = weights.components["model/1"], weights.shrink, []
+    component, unmapping, open_then = weights.components["model/1"], weights.unmap, []
 
     def unmap(*args: Any, **kwargs: Any) -> int:
         open_then.append(len(component.orphans))
-        return shrink(*args, **kwargs)
+        return unmapping(*args, **kwargs)
 
-    monkeypatch.setattr(weights, "shrink", unmap)
+    monkeypatch.setattr(weights, "unmap", unmap)
 
     class Frames:
         pass
@@ -208,14 +207,9 @@ def test_no_room_ask_is_ever_for_nothing_or_less(
     for nbytes in (-(22 * MIB), 0):
         weights.memory.ask(nbytes)
     assert weights.memory.free_for(MIB, "aten.mm.default")
-    weights.cap = 2 << 30  # under an owner's cap, with room beside it
-    weights.activation["denoise"] = 64 * MIB
-    weights.room_before("denoise")
-    device["reserved"] = 512 * MIB  # torch's idle cache covers the stage's activations
-    weights.room_before("denoise")
     assert asked == []
-    device["free"], device["reserved"] = 0, 0
-    weights.room_before("denoise")
+    device["free"] = 0
+    assert not weights.memory.free_for(MIB, "aten.mm.default", upto=Rung.IDLE)
     assert asked and all(n > 0 for n in asked)
 
 
