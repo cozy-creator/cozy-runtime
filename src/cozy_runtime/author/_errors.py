@@ -159,8 +159,8 @@ SUCCEEDED = Outcome("succeeded", "runtime", "ok")
 #: say. Measured: cl-003 watched a plan-arithmetic defect arrive as
 #: `AUTHOR_EXCEPTION/CAUSE_ORIGIN_AUTHOR` on a package that made no memory call.
 DEVICE_OOM = "device_out_of_memory"
-#: The one memory refusal (`internal.memory.MemoryExhausted`): the op did not fit with every
-#: rung of the ladder tried. Capacity, like DEVICE_OOM: it fails the attempt, never the process.
+#: The one memory refusal (`tensorfs.varena.torch.Exhausted`): it did not fit with every other
+#: evictable byte gone. Capacity, like DEVICE_OOM: it fails the attempt, never the process.
 MEMORY_EXHAUSTED = "memory_exhausted"
 
 
@@ -243,6 +243,9 @@ def classify(exc: BaseException | None) -> Outcome:
     if is_device_oom(exc):
         first = str(exc).partition("\n")[0][:400] or "the device ran out of memory"
         return Outcome("failed", "runtime", DEVICE_OOM, first, (), _trace(exc))
+    if type(exc).__module__ == "tensorfs.varena.torch":  # varena's memory, named structurally
+        code = MEMORY_EXHAUSTED if type(exc).__name__ == "Exhausted" else "weight_unbound"
+        return Outcome("failed", "runtime", code, str(exc)[:400], (), _trace(exc))
     return Outcome(
         "failed",
         "author",

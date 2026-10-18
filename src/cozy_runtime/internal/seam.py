@@ -640,6 +640,27 @@ def anonymous(name: str, sealing: bool = False) -> int:
     return fd
 
 
+#: Linux `fcntl` seals by number (python-build-standalone may lack the names): seal, shrink,
+#: grow and write.
+_ADD_SEALS, _SEALS = 1033, 0x8 | 0x4 | 0x2 | 0x1
+
+
+def sealed(name: str, body: bytes) -> int:
+    """`body` in a new memfd, sealed: a document that crosses beside its request. macOS has
+    no memfd and no seals: there it is an unlinked file, which no path names."""
+    fd = anonymous(name, sealing=True)
+    try:
+        view = memoryview(body)
+        while view:
+            view = view[os.write(fd, view) :]
+        if sys.platform == "linux":
+            fcntl.fcntl(fd, _ADD_SEALS, _SEALS)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
 def _require_memfd(fd: int) -> None:
     """A regular file the kernel names `/memfd:…`: an anonymous in-memory tier, never a path.
     macOS has no memfd: there an unlinked regular file, which no path names either. Windows

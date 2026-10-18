@@ -38,10 +38,6 @@ class Probe(Command, frozen=True, kw_only=True, tag="probe"):
     collect: bool = False
 
 
-class Reclaim(Command, frozen=True, kw_only=True, tag="reclaim"):
-    """Rank 0's attempt failed: a follower gives back what it took on its GPU."""
-
-
 class Join(Command, frozen=True, kw_only=True, tag="join"):
     port: int
     backend: str = "nccl"
@@ -270,9 +266,10 @@ LOAD_PINNED = "load_pinned/1"
 LOAD_ATTENTION_PIN = "attention.load_pin/1"
 #: An executor capability: it adopts the machine's sealed host layouts (`Load.sealed_tiers`).
 SEALED_TIERS = "host_tiers.sealed/1"
-#: An executor capability: it reads the holes of a layout staged in part from the object files
-#: its machine hands over, so the machine stages only the regions it streams.
-SEALED_STAGED = "host_tiers.staged/1"
+#: Executor capabilities TensorD v0.10.x asks before its memory commands. The executor answers
+#: them all (xs-046 B2) until TensorD speaks the ledger (B4).
+WEIGHT_PLANE = "weight_plane/1"
+SHARING = ("weights.attach/1", "weights.revoke/1", "weights.trim/1")
 
 
 class Load(Command, frozen=True, kw_only=True, tag="load"):
@@ -398,7 +395,6 @@ type KnownCommand = (
     Hello
     | Shutdown
     | Probe
-    | Reclaim
     | Join
     | Fork
     | Budget

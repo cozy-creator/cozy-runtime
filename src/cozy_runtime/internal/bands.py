@@ -35,7 +35,6 @@ if TYPE_CHECKING:
     from torch import Tensor
     from torch._ops import OpOverload, OpOverloadPacket
 
-    from cozy_runtime.internal.weights import Weights
 
 type Rule = Callable[[OpOverload, tuple[Any, ...], dict[str, Any]], "Plan | None"]
 
@@ -96,9 +95,9 @@ class _Zeros:
 
 
 class Bands:
-    """One executor's banded ops (`Weights.bands`), run from its recovery mode."""
+    """One executor's banded ops, run from its recovery mode (B3 replaces them with cuts)."""
 
-    def __init__(self, weights: Weights) -> None:
+    def __init__(self, weights: Any) -> None:
         self.weights = weights
         torch = self.torch = weights.torch
         ON[str(weights.device)] = self

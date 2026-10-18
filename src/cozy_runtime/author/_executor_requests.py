@@ -8,7 +8,6 @@ field is written, defaults included.
 
 from __future__ import annotations
 
-import contextlib
 import os
 import socket
 from collections.abc import Callable, Mapping
@@ -16,7 +15,6 @@ from dataclasses import dataclass
 from typing import Annotated, Literal, Protocol, TypedDict, get_args
 
 import msgspec
-from msgspec import UNSET, UnsetType
 
 from cozy_runtime.author._assets import FileState
 from cozy_runtime.author._capture import ActivationCapture
@@ -27,15 +25,6 @@ MAX_CALL_INDEX = (1 << 32) - 1
 
 class _Request(msgspec.Struct, frozen=True, kw_only=True, tag_field="kind"):
     pass
-
-
-class DeviceRoom(_Request, frozen=True, kw_only=True, tag="device_room"):
-    """Idle co-tenants of the executor's devices give `free_bytes` back."""
-
-    free_bytes: int
-    #: what this process holds on its GPU now (context, torch's segments, plane maps), by its
-    #: own count: its last report to the machine may be its load's; -1 when unknown
-    holding_bytes: int = -1
 
 
 class ChildEvents(_Request, frozen=True, kw_only=True, tag="child_events"):
@@ -149,33 +138,6 @@ class WriterAdopt(_Writer, frozen=True, kw_only=True, tag="adopt"):
     length: int
 
 
-class SharedRegion(msgspec.Struct, frozen=True, kw_only=True):
-    """One plane region of shared GPU memory: its chunks' bytes, in address order. One fd per
-    chunk crosses the seam after the frame, in the same order."""
-
-    region: int
-    chunks: tuple[int, ...]
-
-
-class DeviceTier(_Request, frozen=True, kw_only=True, tag="device_tier"):
-    """GPU allocation handles TensorD retains across executors (`weights.attach/1`).
-    Runtime fills/exports regions before offering their fds; an ask receives retained
-    handles that Runtime's TensorFS plane attaches/maps in this executor."""
-
-    name: str
-    #: the plane's layout digest: the same bytes at the same offsets
-    layout: str
-    #: the GPU's UUID
-    device: str
-    offer: bool = False
-    regions: tuple[SharedRegion, ...] = ()
-    #: what the regions' bytes hold beside the layout's stored ones: "" (nothing), a baked
-    #: LoRA variant's digest, or in an ask "*": the layout's most recent baked variant
-    variant: str = ""
-    #: the fds that go with an offer, in `regions` order; never on the wire
-    fds: tuple[int, ...] = ()
-
-
 class SealedPlan(msgspec.Struct, frozen=True, kw_only=True):
     """What one weight set's sealed host layout holds (`host_tiers.sealed/1`): the TensorFS
     read plan and region grouping Runtime derived from model code. TensorD validates the
@@ -206,32 +168,6 @@ class SealedTier(_Request, frozen=True, kw_only=True, tag="sealed_tier"):
     length: Annotated[int, msgspec.Meta(ge=0)]
     #: the plan's memfd; never on the wire
     memfd: int = -1
-    #: The regions to stage (`host_tiers.staged/1`): the rest are holes this executor reads
-    #: from the object files (`ObjectFiles`). Unset: every region.
-    stage_regions: tuple[int, ...] | UnsetType = UNSET
-
-
-class SealedStage(_Request, frozen=True, kw_only=True, tag="sealed_stage"):
-    """More of a layout staged in part: the regions this executor now streams every step (its
-    plan in a sealed memfd after the request). `Staged` names those staged or staging; the
-    rest stay holes, read from the object files."""
-
-    sha256: str
-    length: Annotated[int, msgspec.Meta(ge=0)]
-    stage_regions: tuple[int, ...] = ()
-    #: the plan's memfd; never on the wire
-    memfd: int = -1
-
-
-class ObjectFiles(_Request, frozen=True, kw_only=True, tag="object_files"):
-    """The verified object files behind a plan (in a sealed memfd after the request), for the
-    holes of its layout: one read-only fd per object follows `ObjectFilesAnswer`, in SHA-256
-    order of the plan's objects."""
-
-    sha256: str
-    length: Annotated[int, msgspec.Meta(ge=0)]
-    #: the plan's memfd; never on the wire
-    memfd: int = -1
 
 
 class ModelSource(_Request, frozen=True, kw_only=True, tag="model_source"):
@@ -249,26 +185,10 @@ class FetchChannel(_Request, frozen=True, kw_only=True, tag="fetch_channel"):
     or credential, and ends with the call."""
 
 
-class BudgetCell(_Request, frozen=True, kw_only=True, tag="budget_cell"):
-    """The executor's plane budget cell (`internal/budget_cell.py`; its memfd follows this
-    request): the Worker lowers a running call's budget through it, at a block boundary."""
-
-    #: the memfd the worker received; never on the wire
-    memfd: int = -1
-    #: Which GPU of a group the cell caps (`RANK_CELLS`): rank 0 hands its owner one cell per
-    #: follower at formation, the follower reads it. 0 is rank 0's own.
-    rank: int = 0
-
-
 type _Tagged = (
-    DeviceRoom
-    | DeviceTier
-    | SealedTier
-    | SealedStage
-    | ObjectFiles
+    SealedTier
     | ModelSource
     | FetchChannel
-    | BudgetCell
     | ChildEvents
     | ChildCall
     | ChildPoll
@@ -324,51 +244,6 @@ class SourceBytes(Tier, frozen=True, kw_only=True):
 
     sha256: str = ""
     length: Annotated[int, msgspec.Meta(ge=0)] = 0
-
-
-class Staged(Answer, frozen=True, kw_only=True):
-    """The machine's answer to `SealedStage`: the regions staged or staging."""
-
-    staged: tuple[int, ...] = ()
-
-
-class ObjectFilesAnswer(Answer, frozen=True, kw_only=True):
-    """The machine's answer to `ObjectFiles`: the read-only fds follow, one per object of the
-    plan in SHA-256 order (SDXL's UNet: about 1,700), and the answer names the list by its
-    digest: SHA-256 of `<sha256>:<length>\n` lines."""
-
-    objects_sha256: str = ""
-    #: the fds that followed the answer; never on the wire
-    fds: tuple[int, ...] = ()
-
-
-class DeviceTierAnswer(Answer, frozen=True, kw_only=True):
-    """The machine's answer to a `DeviceTier` exchange. An ask that is `held` is followed by
-    one fd per chunk of `regions`; `duplicate` answers an offer another executor's won. With
-    `lease` one socket follows the chunks: the reader's lease, held open while it maps the
-    holding and closed once it let the bytes go (a crash closes it too)."""
-
-    held: bool = False
-    generation: int = 0
-    #: the holding's layout digest, which the attaching plane verifies before it maps
-    layout: str = ""
-    regions: tuple[SharedRegion, ...] = ()
-    duplicate: bool = False
-    lease: bool = False
-    #: the machine keys holdings by variant (an older one keeps only stored bytes), and the
-    #: variant of the holding it answered an ask with
-    variants: bool = False
-    variant: str = ""
-    #: the fds that followed the answer, in `regions` order; never on the wire
-    fds: tuple[int, ...] = ()
-    #: the lease socket that followed them, -1 when none; never on the wire
-    lease_fd: int = -1
-
-
-class Room(Answer, frozen=True, kw_only=True):
-    authorized_device_limit_bytes: int | UnsetType = UNSET
-    #: The process cap once room was made (`process_cap/1`); -1 keeps the one it has
-    cap_bytes: int = -1
 
 
 class CallProgress(msgspec.Struct, frozen=True, kw_only=True):
@@ -509,9 +384,8 @@ def decode(frame: Mapping[str, object]) -> Request:
 def respond(
     frame: Mapping[str, object], handler: Handler | None, received: int | None = None
 ) -> tuple[dict[str, object], socket.socket | int | None]:
-    """The answer frame to one request frame, and the capability that follows it. `received`
-    is the memfd that came with the request (a `BudgetCell`); it goes to the handler or is
-    closed."""
+    """The answer frame to one request frame, and the capability that follows it. A memfd that
+    came with the request (`received`) is closed: no request handled here carries one."""
     reply: Reply
     request: Request | None = None
     if handler is None:
@@ -521,21 +395,13 @@ def respond(
             request = decode(frame)
         except CapabilityError as exc:
             reply = refuse(exc.code, exc.message)
-    if isinstance(request, BudgetCell):
-        # The descriptor is only ever the one that arrived: a number on the wire is not.
-        request = msgspec.structs.replace(request, memfd=-1 if received is None else received)
-    elif isinstance(request, DeviceTier):
-        request = msgspec.structs.replace(request, fds=())
-    elif received is not None:
+    if received is not None:
         os.close(received)
         request, reply = None, refuse("seam_descriptor", "unexpected memfd with a request")
     if request is not None and handler is not None:
         try:
             reply = handler(request)
         except Exception as exc:  # answered, so the executor's exchange stays in step
-            if isinstance(request, BudgetCell) and request.memfd >= 0:
-                with contextlib.suppress(OSError):
-                    os.close(request.memfd)
             reply = refuse("request_failed", f"{type(exc).__name__}: {exc}"[:400])
     handoff = reply.descriptor if isinstance(reply, DescriptorReply) else None
     body = encode(reply.answer if isinstance(reply, DescriptorReply) else reply)

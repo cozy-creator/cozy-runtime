@@ -44,7 +44,7 @@ from contextlib import ExitStack, contextmanager
 from typing import Any
 
 from cozy_runtime.author._context import CURRENT, Context
-from cozy_runtime.author._model import LANDED, PLACED, RELEASERS, WARNINGS, Building
+from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building
 from cozy_runtime.author.kernels import KernelsUnavailable, Launch, Plan, TritonKernels
 from cozy_runtime.graphs import BYPASS, ROOM, capture, native, say
 from cozy_runtime.lm import _kernels
@@ -87,9 +87,6 @@ def drafting(draft: Any) -> Iterator[None]:
         _DRAFT.reset(token)
 
 
-#: A placed model's decode blocks, as its first loop's first step ran them: later loops hold
-#: them before their first step.
-_READS: weakref.WeakKeyDictionary[Any, frozenset[Any]] = weakref.WeakKeyDictionary()
 #: Each model's continuous batch (buffers and graphs), kept until the plane wants the memory.
 _ENGINES: weakref.WeakKeyDictionary[Any, _Engine] = weakref.WeakKeyDictionary()
 _ENGINES_LOCK = threading.Lock()
@@ -106,13 +103,6 @@ BUCKETS = (1, 2, 4, 8, 16)
 DRAFT_ROWS = 4
 
 
-def release() -> bool:
-    """Drop every idle engine's buffers and graphs: what the plane calls before it unmaps
-    weights for room."""
-    return any([engine.idle() for engine in list(_ENGINES.values())])
-
-
-RELEASERS.append(release)
 #: Generation-config fields that add a logits processor to greedy decoding, and their no-op values.
 #: Runtime's gated-delta-net decode kernels, built on the executor's GPUs when it starts, for
 #: every package that imports this module (`install`).
@@ -840,14 +830,10 @@ def _derived(models: Iterable[Any]) -> list[Any]:
 
 
 def _reservation(model: Any, shed: Callable[[int], int]) -> Any:
-    """The memory manager's hold on an engine's buffers; None for a model Runtime does not
-    place (its tensors are where its caller put them)."""
+    """The memory's count of an engine's buffers, shed on ask (`Residency.cache`); None for a
+    model Runtime does not place (its tensors are where its caller put them)."""
     placed = PLACED.get(model)
-    if placed is None:
-        return None
-    weights = getattr(placed[0], "weights", None)
-    reserve = getattr(weights, "reserve", None)
-    return reserve(f"lm:{type(model).__name__}", 0, shed) if reserve is not None else None
+    return None if placed is None else placed[0].cache(f"lm:{type(model).__name__}", shed)
 
 
 class _Request:
@@ -1071,17 +1057,7 @@ class _Engine:
                             break
                         if mine.finished and (occupied or self.pending):
                             break  # a waiting caller drives on
-                    if occupied and held is None:  # the first loop records what a step reads
-                        self._record()
-                        held = self._hold(stack)
-                        if held is False and self.draft is not None:  # the rows go on undrafted
-                            self.unfit.add(id(self.draft))
-                            self.draft = None
-                            stack.close()
-                            held = self._hold(stack)
-                        if held is False:  # never step through the paging hooks
-                            self._fail(None, "its decode set does not fit at home")
-                    elif occupied:
+                    if occupied:
                         self._steps()
         except torch.OutOfMemoryError as exc:
             self._fail(None, f"OutOfMemoryError: {exc}".splitlines()[0][:300])
@@ -1112,10 +1088,9 @@ class _Engine:
     def _targets(self) -> list[tuple[Any, Any]]:
         return [(m, PLACED[m]) for m in (self.model, self.draft) if m is not None and m in PLACED]
 
-    def _hold(self, stack: ExitStack) -> bool | None:
-        """The decode blocks of the model (and its head) leased at home for this driver's loop;
-        False when they do not all fit (the calls then decode through Transformers' loop), None
-        before the first step has recorded which blocks a step reads (`_record`)."""
+    def _hold(self, stack: ExitStack) -> bool:
+        """The model (and its head) pinned at home for the decode graphs (`Residency.pin`);
+        False when part of one streams (the calls then decode through Transformers' loop)."""
         targets = self._targets()
         # The steps also read buffers the model builds (its rotary tables): they stay where the
         # graphs recorded them, and a rebuilt one (a component placed again) records anew.
@@ -1125,34 +1100,25 @@ class _Engine:
         if not targets:
             self.where = (built,)
             return True
-        if any(m not in _READS for m, _ in targets):
-            return None
-        holds = [stack.enter_context(r.held(name, _READS[m])) for m, (r, name) in targets]
-        if not all(holds):
+        pins = [r.pin(name, f"lm:{name}", self._unpinned) for _, (r, name) in targets]
+        if any(pin is None for pin in pins):
             return False
         self.room = targets[0][1][0].allocatable
-        self.where = (*(r.layout(name, _READS[m]) for m, (r, name) in targets), built)
+        self.where = (*pins, built)
         return True
 
     room: Callable[[], int] | None = None
+    #: the pins the graphs read weights through: they live while this engine refers to them
     where: tuple[object, ...] = ()
 
-    def _record(self) -> None:
-        """The first loop's first step, eager through the paging hooks, which record the blocks
-        a step reads: later loops hold them at home before their first step."""
-        targets = self._targets()
-        with ExitStack() as stack:
-            reads = {}
-            for _, (residency, _name) in targets:
-                if id(residency) not in reads:
-                    reads[id(residency)] = stack.enter_context(residency.recording())
-            with _disable_current_modes():
-                self._one(self._bucket(), lambda size: self._advance(size))
-                if self.cache_device.type == "cuda":
-                    torch.cuda.current_stream().synchronize()
-        for m, (residency, name) in targets:
-            _READS[m] = frozenset(reads[id(residency)].get(name, ()))
-        self.retire = True
+    def _unpinned(self) -> int:
+        """Memory asks for the pinned weights: an idle engine lets its graphs and pins go now,
+        a busy one at its next loop."""
+        if self.idle():
+            self.where = ()
+        else:
+            self.rehold = self.stale = True
+        return 0
 
     def _cancelled(self) -> bool:
         """Whether a held row's call was cancelled: the host stops queueing steps for it."""
@@ -1843,7 +1809,7 @@ class _Engine:
     def _shed(self, nbytes: int) -> int:
         """Room the memory manager asks for under pressure: an idle engine drops its buffers;
         a busy one gives nothing (its rows are mid-flight)."""
-        before = self.reservation.granted if self.reservation is not None else 0
+        before = self.reservation.nbytes if self.reservation is not None else 0
         return before if self.idle() else 0
 
 
