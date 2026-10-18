@@ -64,7 +64,7 @@ addopts = "-q -p no:cacheprovider"
 [[tool.mypy.overrides]]
 # Pending xs-045 U8 / U9b and cr-203 U11b: these files still speak the v1 TensorFS API and
 # skip at import until those units port them.
-module = ["test_baked_variant", "test_client_scripts", "test_construction_dtype", "test_constructor_initialization", "test_device_tier", "test_encoded_residency", "test_fetch_load", "test_group_rerun_nccl", "test_host_tier", "test_lora_bake_plane", "test_lora_consumer_bake", "test_lora_encoded_base", "test_lora_peft", "test_model_artifact_calls", "test_model_reader", "test_model_runtime_closure", "test_mps", "test_nested_weight_read", "test_on_demand_models", "test_one_invoke", "test_parallel_calls", "test_partial_binding", "test_quantize_artifact_native", "test_runtime_quantize_operations", "test_stage_room", "test_unified_plane", "test_weight_plane"]
+module = ["test_baked_variant", "test_client_scripts", "test_construction_dtype", "test_constructor_initialization", "test_encoded_residency", "test_fetch_load", "test_lora_bake_plane", "test_lora_consumer_bake", "test_lora_encoded_base", "test_lora_peft", "test_model_artifact_calls", "test_model_reader", "test_model_runtime_closure", "test_mps", "test_on_demand_models", "test_one_invoke", "test_parallel_calls", "test_partial_binding", "test_quantize_artifact_native", "test_runtime_quantize_operations"]
 ignore_errors = true
 
 [build-system]

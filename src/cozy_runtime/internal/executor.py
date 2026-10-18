@@ -4673,11 +4673,6 @@ def _assets_at(node: Any, path: str) -> list[dict[str, Any]]:
     return found
 
 
-def _rank_cap(caps: tuple[int, ...], rank: int, default: int | UnsetType) -> int | UnsetType:
-    """This GPU's process cap: its own entry when the owner sent one per GPU, else the one."""
-    return caps[rank] if rank < len(caps) else default
-
-
 # --------------------------------------------------------------------------- main
 
 #: What a follower rank answers. It has no worker: rank 0 is its whole control plane.

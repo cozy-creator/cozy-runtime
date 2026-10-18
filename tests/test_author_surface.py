@@ -29,8 +29,9 @@ Each arm below refuses on the commit before cr-060's corrective. What the arms c
 
 from __future__ import annotations
 
+import contextlib
 import time
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 
 import msgspec
@@ -117,18 +118,21 @@ class Denoiser(Model[Pipeline]):
 
 
 class Lease:
-    """A `Residency` that RECORDS. The lease is the real one — `_ComponentScope` calls it
-    before the method body runs — and recording it is how the arm reads the ordering."""
+    """A `Residency` that RECORDS. The use is the real one — `_ComponentScope` enters it
+    before the method body runs and leaves it after — and recording it is how the arm reads
+    the ordering."""
 
     def __init__(self) -> None:
         self.admitted: list[tuple[str, tuple[str, ...]]] = []
         self.released: list[tuple[str, tuple[str, ...]]] = []
 
-    def admit(self, method: str, components: tuple[str, ...]) -> None:
+    @contextlib.contextmanager
+    def use(self, method: str, components: tuple[str, ...]) -> Iterator[None]:
         self.admitted.append((method, components))
-
-    def release(self, method: str, components: tuple[str, ...]) -> None:
-        self.released.append((method, components))
+        try:
+            yield
+        finally:
+            self.released.append((method, components))
 
 
 def _ctx() -> Context:
