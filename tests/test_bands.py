@@ -464,7 +464,7 @@ def test_a_result_without_room_moves_other_tensors_off_first(others: int) -> Non
     out, whole, least = crowded_product(card)
     assert card.asked[0][0] == least - 1024 and card.others == max(others - least + 1024, 0)
     assert out.device == card.device and "host memory" not in card.modes["bands"]
-    torch.testing.assert_close(out, whole, rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(out, whole)  # pieces may take another CPU GEMM tiling
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="a host block is page-locked memory")
@@ -473,6 +473,6 @@ def test_a_result_goes_to_host_memory_only_when_nothing_moves() -> None:
     card = Crowded(room=1024, others=0, host=1 << 30, device="cuda")
     out, whole, _ = crowded_product(card)
     assert spill.hosted(out) and "B of results in host memory" in card.modes["bands"]
-    torch.testing.assert_close(out, whole, rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(out, whole)
     del out
     spill.release(torch)
