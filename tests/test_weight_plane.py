@@ -1068,8 +1068,8 @@ def test_an_op_with_no_room_left_moves_the_tensors_the_process_holds_to_host(car
     finally:
         weights.set_cap(-1)
     close(reference, capped)
-    # What does not fit goes to host memory: the held tensors, or the results of ops cut into
-    # rows (cr-203 U2/U3: a result is placed there before other tensors move for it).
+    # What does not fit goes to host memory: the held tensors first, the results of ops cut
+    # into rows only when nothing else moves (run 11340).
     moved = facts.spilled_bytes - moved
     assert moved >= 128 << 20 or "host memory" in facts.modes.get("bands", ""), facts.modes
     assert all(t.is_cuda and bool((t == i).all()) for i, t in enumerate(held))
