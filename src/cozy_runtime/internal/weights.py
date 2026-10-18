@@ -409,6 +409,8 @@ class Weights:
         #: the GPUs of its group: each pins its own weights, so each takes this share of a
         #: host budget the Worker states for the whole group
         self.world = 1
+        #: a group's GPU 1 and up: the owner learns what it holds only from rank 0's replies
+        self.follower = False
         #: the components of the blocks in their forward now (their leases pin their own
         #: weights), innermost last; and the component whose block ran last
         self.running: list[str] = []
@@ -512,11 +514,28 @@ class Weights:
             accel.release_cached(self.torch, self.kind)
         return freed
 
+    def take_cap(self) -> None:
+        """A process cap the owner wrote into the cell (a room grant raising it into what the
+        other tenants gave, the floor watchdog lowering it), applied now: a group's follower
+        hears its cap only there, and an op waiting for room reads no block boundary (run
+        11275: refused under a 718 MB cap on an empty 8 GB GPU). Plane budgets wait for one."""
+        cell = self.cell
+        wanted = cell.pending() if cell is not None else None
+        if cell is not None and wanted is not None and wanted <= budget_cell.CAP:
+            cell.poll()
+            self.set_cap(budget_cell.CAP - wanted)
+            cell.acknowledge(self.applied)
+
     def set_cap(self, cap: int) -> None:
         """The owner's process cap; -1 lifts it. Every plane budget stays inside it, and torch's
         allocator is held to what it leaves beside the context and the plane's maps: an
         activation over its estimate is an out-of-memory the plane recovers from by unmapping,
-        never a full card."""
+        never a full card. TensorD 0.10.0 grants a follower its GPU's free bytes plus what it
+        held at its last reply (run 11399: 670 MB while it held 7.07 GiB), which counts its
+        bytes twice; only a card below its floor (the watchdog) holds one under its own count."""
+        if cap >= 0 and self.follower:
+            memory, held = self._held()
+            cap = max(cap, held + memory["driver_free_bytes"] - self.floor_free)
         self.cap = cap
         self.limit_torch()
 

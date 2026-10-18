@@ -65,6 +65,15 @@ class Ledger:
     cap: int
 
     @property
+    def room(self) -> int:
+        """What this process may take: free above the floor, and under a cap the cap less what
+        it holds."""
+        room = self.free - self.floor
+        if self.cap >= 0:
+            room = min(room, self.cap - self.context - self.reserved - self.mapped)
+        return max(room, 0)
+
+    @property
     def residue(self) -> int:
         """What the driver charges that no class accounts for: never working set."""
         if self.foreign < 0:
@@ -93,7 +102,7 @@ class MemoryExhausted(RuntimeFailure):
         self.shortfall: dict[str, int | str] = {
             "resource": "vram",
             "needed_bytes": nbytes,
-            "available_bytes": max(ledger.free - ledger.floor, 0),
+            "available_bytes": ledger.room,
             "request_shape": op,
         }
 
@@ -172,6 +181,8 @@ class Memory:
         #: rung 1 asks the owner; never from inside torch's allocator
         self.asking = True
         self._collected = False
+        #: the op that last ran out and the ledger when it did, before the ladder moved bytes
+        self.short: tuple[str, Ledger] | None = None
 
     def free(self) -> int:
         """Device bytes torch or the plane can take now: free above the floor, in the cap."""
@@ -251,6 +262,8 @@ class Memory:
         GPU has. -1: it does not run again."""
         weights, ask = self.weights, nbytes
         most = weights.total - max(weights.context_bytes, 0) - MARGIN
+        if seen < 0:  # its first refusal: the GPU as the op found it
+            self.short = (op, self.ledger())
         while True:
             fits = self.free_for(ask, op, operands, upto)
             if (now := self.free()) > seen and (fits or now >= nbytes or ask > nbytes):
@@ -293,16 +306,24 @@ class Memory:
     def exhausted(self, nbytes: int, op: str, why: str = "") -> NoReturn:
         """Raise the one memory refusal: the ledger, the op and what each rung gave."""
         ledger = self.ledger()
-        slack = ledger.total - ledger.context - ledger.floor - ledger.leased - nbytes
+        most = ledger.total - ledger.context - ledger.floor
+        if ledger.cap >= 0:
+            most = min(most, ledger.cap - ledger.context)
+        slack = most - ledger.leased - nbytes
+        beside = "beside the context and its leased weights" + (
+            f", under its {ledger.cap} B cap" if ledger.cap >= 0 else ""
+        )
         verdict = (
-            f"it should have fit by {slack} B beside the context and its leased weights"
+            f"it should have fit by {slack} B {beside}"
             if slack >= 0
-            else f"{-slack} B more than the GPU has beside the context and its leased weights"
+            else f"{-slack} B more than the GPU has {beside}"
         )
         tried = self.summary() or "no rung gave bytes back"
+        found = self.short[1] if self.short is not None and op.startswith(self.short[0]) else None
+        then = f"when it ran out: {found.text()}; after the ladder: " if found else ""
         detail = (
             f"{op} needs {nbytes} B of device memory at once"
-            f"{f' ({why})' if why else ''}; {verdict}; ladder: {tried}; {ledger.text()}; "
+            f"{f' ({why})' if why else ''}; {verdict}; ladder: {tried}; {then}{ledger.text()}; "
             f"issued from {_caller()}"
         )
         failure = MemoryExhausted(detail, op, nbytes, ledger, tried)
@@ -314,6 +335,7 @@ class Memory:
         process asks, and never for nothing or less (runs 4267, 10078)."""
         if nbytes > 0 and self.asking and self.weights.room is not None:
             self.weights.room(nbytes)
+            self.weights.take_cap()
 
     def summary(self) -> str:
         return ", ".join(f"{r.name.lower()} {n}x {b} B" for r, (n, b) in sorted(self.used.items()))
