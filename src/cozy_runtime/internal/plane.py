@@ -13,7 +13,7 @@ import sys
 from typing import TYPE_CHECKING, Final
 
 import msgspec
-from tensorfs import plane as _plane
+from tensorfs import varena as _plane
 
 from cozy_runtime.internal import seam
 
@@ -22,7 +22,7 @@ if sys.platform == "linux":
 
 if TYPE_CHECKING:
     from tensorfs import ReadLease, Store
-    from tensorfs.plane import Plane, Source
+    from tensorfs.varena import Plane, Source
 
 #: The executor capability TensorD negotiates on (`hello.memory`).
 CAPABILITY = "weight_plane/1"

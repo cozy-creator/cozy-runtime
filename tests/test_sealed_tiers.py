@@ -1,7 +1,7 @@
 """Executors adopt the machine's sealed host layouts (`host_tiers.sealed/1`), staged in part
 when they read the holes from the object files the machine hands over (`host_tiers.staged/1`).
 
-Real: a TensorFS store, the machine's half as TensorFS does it (`tensorfs.plane.fill_sealed`:
+Real: a TensorFS store, the machine's half as TensorFS does it (`tensorfs.varena.fill_sealed`:
 the verified read path, then seals), the executor's own durable exchange over a seam
 socketpair, and host-only planes. The executor reads no byte from the store, takes no lease,
 and owns none of the layout's RAM; it computes exactly on it.
@@ -24,7 +24,7 @@ torch = pytest.importorskip("torch")
 
 import tensorfs  # noqa: E402
 from tensorfs import Store  # noqa: E402
-from tensorfs import plane as tfs_plane  # noqa: E402
+from tensorfs import varena as tfs_plane  # noqa: E402
 
 from cozy_runtime.author._executor_requests import SealedPlan  # noqa: E402
 from cozy_runtime.internal import canonical, plane, spawn  # noqa: E402
