@@ -22,6 +22,7 @@ it refuses ends the run `model_fetch_failed` (`machine_disk_full` for a full dis
 
 from __future__ import annotations
 
+import contextlib
 import threading
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
@@ -197,26 +198,46 @@ class Fetches:
 
     def present(self, manifest: str, refs: Sequence[Ref]) -> bool:
         """Whether every one of `refs` is here (no channel: the owner placed them all)."""
-        channel = self._current()
-        if channel is None or manifest in self._whole or not refs:
-            return True
-        try:
-            return all(channel.present(manifest, _wire(refs)))
-        except (tensorfs.errors.Refusal, OSError) as exc:
-            return self._unfetchable(manifest, exc)
+        for again in (False, True):
+            channel = self._current(ask=again)
+            if channel is None or manifest in self._whole or not refs:
+                return True
+            try:
+                return all(channel.present(manifest, _wire(refs)))
+            except (tensorfs.errors.Refusal, OSError) as exc:
+                if again or not self._gone(channel, exc):
+                    return self._unfetchable(manifest, exc)
+        return True
 
     def wait(self, manifest: str, refs: Sequence[Ref]) -> None:
         """Block until `refs` are here, raised to Now. A refusal fails the run."""
-        channel = self._current()
-        if channel is None or manifest in self._whole or not refs:
-            return
-        try:
-            if not all(channel.present(manifest, _wire(refs))):
-                self._progress(*self._landed(channel))
-                channel.wait(manifest, _wire(refs))
-        except (tensorfs.errors.Refusal, OSError) as exc:
-            if not self._unfetchable(manifest, exc):
-                raise failure(manifest, refs, exc) from None
+        for again in (False, True):
+            channel = self._current(ask=again)
+            if channel is None or manifest in self._whole or not refs:
+                return
+            try:
+                if not all(channel.present(manifest, _wire(refs))):
+                    self._progress(*self._landed(channel))
+                    channel.wait(manifest, _wire(refs))
+                return
+            except (tensorfs.errors.Refusal, OSError) as exc:
+                if again or not self._gone(channel, exc):
+                    if not self._unfetchable(manifest, exc):
+                        raise failure(manifest, refs, exc) from None
+                    return
+
+    def _gone(self, channel: Fetch, exc: BaseException) -> bool:
+        """Whether `channel` closed under a read: calls in flight share one, and the owner ends
+        it with the call that asked for it. The reader then asks a fresh one, as itself, with
+        the plan so far."""
+        if not (isinstance(exc, OSError) or "fetch channel closed" in str(exc)):
+            return False
+        with self._lock:
+            if self._channel is channel:
+                self._channel, self._rank = None, 0
+        with contextlib.suppress(Exception):
+            channel.close()
+        return True
 
     def end(self) -> None:
         """The attempt ended: its interest goes with its channel."""

@@ -145,6 +145,26 @@ def test_an_ended_attempt_drops_what_it_wanted(tmp_path: Path) -> None:
         assert not any(store.contains(sha) for sha, _ in wanted)
 
 
+def test_a_channel_its_call_ended_is_asked_again_by_a_call_still_reading(tmp_path: Path) -> None:
+    """Calls in flight share one channel. When the owner ends it with the call that asked for
+    it, a call still waiting asks a fresh one with the plan so far, rather than reading the
+    closed channel as nothing to fetch."""
+    with served(tmp_path) as (hub, store):
+        wanted = objects_of(store, hub.manifest, "encoder")
+        hub.held = {sha for sha, _ in wanted}
+        hub.gate.clear()
+        planner = fetches(hub, store)
+        planner.schedule([(hub.manifest, wanted)])
+        assert hub.asked.wait(30)
+        asked = len(hub.served)
+        hub.shut()
+        threading.Timer(1.0, hub.gate.set).start()
+        planner.wait(hub.manifest, wanted)
+        assert all(store.contains(sha) for sha, _ in wanted)
+        assert len(hub.served) == asked + 1  # one fresh channel, asked by the reader
+        planner.end()
+
+
 def test_a_raw_source_wants_its_declared_components_and_the_rest_of_what_it_reads(
     tmp_path: Path,
 ) -> None:

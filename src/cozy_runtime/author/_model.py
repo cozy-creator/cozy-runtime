@@ -387,7 +387,8 @@ class _Scopes:
     Known limit: a call's threads are those that carry its context (SDK pools, its event loop's
     executor). A plain `threading.Thread` an author starts carries none, so it enters scopes
     as no call, even inside another call's turn. Harmless with one call at a time; batching
-    calls in one executor (cr-202 U4) must close it before authors' plain threads matter."""
+    calls in one executor (cr-202 U4) must close it before authors' plain threads matter; one
+    entering during another call's turn warns (`busy`)."""
 
     def __init__(self) -> None:
         self._changed = threading.Condition()
@@ -407,6 +408,7 @@ class _Scopes:
                 )
                 self._queue.remove(ticket)
                 self._holder = call
+                self._changed.notify_all()  # the call's other threads waiting now pass
             self._depth += 1
 
     def leave(self) -> None:
@@ -415,6 +417,10 @@ class _Scopes:
             if not self._depth:
                 self._holder = None
                 self._changed.notify_all()
+
+    def busy(self) -> bool:
+        """Whether some call holds the turn."""
+        return self._holder is not None
 
     @contextmanager
     def held(self, call: object) -> Iterator[None]:
@@ -1025,6 +1031,13 @@ class _ComponentScope:
         self._call = CURRENT.get()
         if self._call is not None:
             SCOPES.enter(self._call)
+        elif SCOPES.busy():
+            row: WarningRow = (
+                "a thread outside every call entered a component scope during another call's turn",
+                {"method": f"{type(model).__name__}.{self._method}"},
+            )
+            if row not in WARNINGS:
+                WARNINGS.append(row)
         try:
             self._admit(model)
         except BaseException:

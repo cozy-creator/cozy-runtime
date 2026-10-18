@@ -6,6 +6,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import socket
 import threading
 import time
@@ -148,6 +149,13 @@ class Hub:
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.served: list[threading.Thread] = []
+        self.owners: list[int] = []
+
+    def shut(self) -> None:
+        """The owner ends every channel it serves, as TensorD does when their call ends."""
+        for fd in self.owners:
+            with contextlib.suppress(OSError), socket.socket(fileno=os.dup(fd)) as end:
+                end.shutdown(socket.SHUT_RDWR)
 
     def grant(self) -> list[dict[str, object]]:
         hex_id = self.manifest.removeprefix("sha256:")
@@ -160,6 +168,7 @@ class Hub:
     def channel(self, store: Store) -> int:
         """One fresh channel's executor end, its owner end served on a thread."""
         owner, executor = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.owners.append(owner.fileno())
         served = threading.Thread(
             target=_ext.serve_fetch,
             args=(store, owner.detach()),

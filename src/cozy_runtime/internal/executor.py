@@ -3261,13 +3261,14 @@ class Executor:
             try:
                 # Admitted only now: an attempt before it may have poisoned the generation.
                 prepared = target._admitted(command)
-                refused = prepared if isinstance(prepared, dict) else None
-                refused = refused or self._grant(target, command, first=slot.first)
+                if isinstance(prepared, dict):
+                    return prepared
+                refused = self._grant(target, command, first=slot.first)
                 if not alone:
                     self.in_flight.ready()
                 if refused is not None:
+                    target.prepared[command.request_id] = prepared  # it may come again
                     return refused
-                assert not isinstance(prepared, dict)
                 self._plan_fetch(target)
                 reply = target.invoke(command, prepared, slot)
             finally:
@@ -3931,6 +3932,8 @@ class Executor:
         if not due:
             return False
         with SCOPES.held(object() if call is None else call):
+            # Another call may have selected again while this one waited for its turn.
+            due = [e for e in due if e.attention is not None and e.attention.waiting]
             return any([self._reselect_attention(executor) for executor in due])
 
     @staticmethod
@@ -5261,15 +5264,13 @@ def serve(executor: Executor, channel: Channel) -> int:
             _send_reply(channel, reply)
             continue
         ticket = order.ticket(alone=name not in _CALL_COMMANDS)
-        if name == "shutdown":
-            with order.turn(ticket):
-                return _shut(executor, channel)
         if name in _CALL_COMMANDS or not order.first(ticket):
             pool.submit(contextvars.Context().run, _serve, executor, frame, order.turn(ticket))
             continue
         with order.turn(ticket):
             reply = _reply(executor, frame)
-        assert reply is not None
+        if reply is None:
+            return _shut(executor, channel)
         _send_reply(channel, reply)
 
 
@@ -5282,13 +5283,18 @@ def _shut(executor: Executor, channel: Channel) -> int:
 
 def _serve(executor: Executor, frame: Frame, turn: contextlib.AbstractContextManager[None]) -> None:
     """One command on a pool worker, in its turn. A BaseException, or a reply the seam would
-    not take, ends the process, as either did when commands ran on the main thread."""
+    not take, ends the process, as either did when commands ran on the main thread; so does a
+    `shutdown` that waited here for the calls before it, once answered."""
     try:
         with turn:
             call = str(frame.get("request_id", "")) if frame.get("cmd") in _CALL_COMMANDS else ""
             _CALL.set(call)
             reply = _reply(executor, frame)
-            assert reply is not None
+            if reply is None:
+                code = _shut(executor, executor.channel)
+                sys.stdout.flush()
+                sys.stderr.flush()
+                os._exit(code)
             if frame.get("cmd") == "invoke":
                 executor.mux.forget(call)
             _send_reply(executor.channel, {**reply, "request_id": call} if call else reply)

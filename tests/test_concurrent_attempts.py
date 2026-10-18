@@ -23,6 +23,7 @@ import pytest
 
 from cozy_runtime.author import Model, uses_components
 from cozy_runtime.author._context import CURRENT, Context
+from cozy_runtime.author._model import WARNINGS
 from cozy_runtime.internal import package_interface
 from cozy_runtime.internal.discovery import discover_installed
 from cozy_runtime.internal.seam import RESULT_DOCUMENT, Channel
@@ -275,6 +276,20 @@ def test_a_cancel_ends_its_own_call_whenever_it_arrives(executor: Running) -> No
     assert executor.outcome("filed")["terminal"] == "canceled"
 
 
+def test_a_shutdown_waits_for_the_calls_before_it_and_their_cancels_still_land(
+    executor: Running,
+) -> None:
+    peer = executor.peer
+    executor.prepare("held", 1, "hold")
+    executor.invoke("held")
+    peer.until(lambda: peer.progress("held"))
+    peer.channel.send({"cmd": "shutdown"})
+    peer.channel.send({"cmd": "cancel", "request_id": "held"})
+    assert executor.outcome("held")["terminal"] == "canceled"
+    assert peer.reply("shutdown")["ok"]
+    assert executor.process.wait(60) == 0
+
+
 def test_a_handlers_system_exit_ends_the_process(executor: Running) -> None:
     executor.prepare("gone", 1, "exit")
     executor.invoke("gone")
@@ -312,6 +327,7 @@ def _in(context: contextvars.Context, scope: Callable[..., None]) -> tuple[Any, 
 def test_a_call_waits_for_another_calls_scope_and_its_own_threads_never_do() -> None:
     encoder, decoder, other = Encoder.for_test(), Decoder.for_test(), Decoder.for_test()
     first, second = _call("first"), _call("second")
+    WARNINGS.clear()
     holder, held, release = _in(first, encoder.encode)
     assert held.wait(10)
     waiter, waited, unblock = _in(second, decoder.decode)
@@ -323,6 +339,9 @@ def test_a_call_waits_for_another_calls_scope_and_its_own_threads_never_do() -> 
     outside = threading.Thread(target=other.decode, args=(out_in, out_out), daemon=True)
     first.copy().run(outside.start)
     assert out_in.wait(10)
+    assert [m for m, _ in WARNINGS] == [
+        "a thread outside every call entered a component scope during another call's turn"
+    ]
     for event in (helper_out, out_out, release):
         event.set()
     assert waited.wait(10)
@@ -330,3 +349,22 @@ def test_a_call_waits_for_another_calls_scope_and_its_own_threads_never_do() -> 
     for thread in (holder, waiter, helper, outside):
         thread.join(10)
     assert encoder._cozy_active is None and decoder._cozy_active is None
+
+
+def test_every_thread_of_a_call_waiting_on_another_call_passes_once_it_takes_the_turn() -> None:
+    """Another call holds the turn and one call's two threads queue. When the first of them
+    takes its call's turn, the second passes too, whatever order the two woke in."""
+    for _ in range(20):
+        holding, first, second = Encoder.for_test(), Decoder.for_test(), Decoder.for_test()
+        call, other = _call("call"), _call("other")
+        holder, held, release = _in(other, holding.encode)
+        assert held.wait(10)
+        one, one_in, one_out = _in(call, first.decode)
+        two, two_in, two_out = _in(call, second.decode)
+        assert not one_in.wait(0.1) and not two_in.wait(0.01)  # both queued
+        release.set()
+        assert one_in.wait(10) and two_in.wait(10)
+        one_out.set()
+        two_out.set()
+        for thread in (holder, one, two):
+            thread.join(10)
