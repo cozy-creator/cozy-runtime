@@ -30,7 +30,7 @@ from cozy_runtime.internal import (  # noqa: E402
 )
 from cozy_runtime.internal.config import seal_snapshot  # noqa: E402
 from cozy_runtime.internal.executor import Executor  # noqa: E402
-from cozy_runtime.internal.executor_commands import Budget  # noqa: E402
+from cozy_runtime.internal.executor_commands import Budget, Reclaim  # noqa: E402
 from cozy_runtime.internal.parallel import cp, mirror, wire  # noqa: E402
 from cozy_runtime.internal.parallel.group import RankGroup  # noqa: E402
 from cozy_runtime.internal.parallel.mirror import mirror_component  # noqa: E402
@@ -244,6 +244,9 @@ def test_leader_calls_real_follower_executors_twice(tmp_path: Path, degree: int,
                 "ref2va_dit=sdpa"
             }
             records.clear()
+        # an attempt that failed: every follower gives back what it took on its GPU (11340)
+        reclaimed = leader._followers(leader._plane_ranks(), Reclaim(), "reclaim", lambda: 0)
+        assert reclaimed == (0, None)
         if kind in ("collective", "staged"):
             # The follower returns a failure while rank 0 is already in all_reduce.
             # Reading the failure only AFTER rank 0's body returns would wait forever.

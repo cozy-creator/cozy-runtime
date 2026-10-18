@@ -187,6 +187,7 @@ from cozy_runtime.internal.executor_commands import (
     ModelLoad,
     PrepareRequest,
     Probe,
+    Reclaim,
     Release,
     Revoke,
     Share,
@@ -858,6 +859,8 @@ class Executor:
                 return self.probe()
             case Budget():
                 return self.budget(command)
+            case Reclaim():
+                return self.reclaim()
             case Share():
                 return self.share()
             case Revoke():
@@ -3574,8 +3577,14 @@ class Executor:
             self.residency.unpark()  # a repeating stage closes with its attempt
         if torch is not None:
             accel.drain(torch, self.device_kind)
-        failed = torch is not None and outcome.terminal != "succeeded"
-        left = self._release(allocated_at_start) if failed else 0
+        left, refused = 0, None
+        if torch is not None and outcome.terminal != "succeeded":
+            # A group is N residencies: every GPU gives back what the attempt took on it.
+            left, refused = self._followers(
+                self._plane_ranks(), Reclaim(), "reclaim", lambda: self._release(allocated_at_start)
+            )
+        if refused is not None:
+            self.poisoned = f"group: {refused['detail']}"[:300]
         if self.residency is not None:
             # Weights the attempt's activations took map again on the plane's copy streams:
             # keeping hot is never the attempt's verdict.
@@ -4580,6 +4589,15 @@ class Executor:
         accel.release_cached(self.torch, self.device_kind)
         return accel.allocated(self.torch, self.device_kind) - idle
 
+    def reclaim(self) -> dict[str, Any]:
+        """A follower's half of rank 0's `_release`: what stays allocated recycles the group."""
+        entry, self._run_entry = self._run_entry, None
+        left = self._release(entry[1]) if entry is not None and self.torch is not None else 0
+        if left > weight_policy.MARGIN:
+            self.poisoned = f"the failed request left {left} B on {_gpu(self.rank)}"
+            return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
+        return {"ok": True}
+
     def _quiescent(self) -> bool:
         """No author computation may still mutate GPU or output state when a terminal is
         recorded. The proof is the device's own: every stream is complete."""
@@ -4987,6 +5005,7 @@ _FOLLOWER_COMMANDS = frozenset(
         "vacate",
         "restore",
         "budget",
+        "reclaim",
         "probe",
         "shutdown",
     }
