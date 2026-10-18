@@ -111,6 +111,65 @@ _F8 = frozenset({"f8_e4m3fn", "f8_e5m2"})
 
 #: mxfp8's block: one E8M0 scale per this many elements along the last axis.
 MX_BLOCK = 32
+#: NVFP4's block: one E4M3 scale per 16 elements along the last axis.
+NVFP4_BLOCK = 16
+#: How a block-scale grid is stored: row-major `[rows, blocks]` (ModelOpt), or cuBLAS's 128x4
+#: tiles over the padded `[⌈rows/128⌉·128, ⌈blocks/4⌉·4]` grid (ComfyUI). Absent: row-major.
+SCALE_LAYOUTS = (None, "row_major", "cublas_128x4")
+#: Which nibble of an FP4 byte holds the even element: low (ModelOpt) or high (ComfyUI).
+NIBBLE_ORDERS = (None, "low_first", "high_first")
+
+
+def matrix(shape: Sequence[int]) -> tuple[int, int]:
+    """A row or block scheme's `[rows, columns]`: the last axis, every leading axis a row
+    (an MoE weight `[E, out, in]` is `E·out` rows)."""
+    rows = 1
+    for extent in shape[:-1]:
+        rows *= int(extent)
+    return rows, int(shape[-1]) if shape else 0
+
+
+def _blocked_shape(rows: int, cols: int) -> tuple[int, int]:
+    return -(-rows // 128) * 128, -(-cols // 4) * 4
+
+
+def to_blocked(torch: ModuleType, scales: Tensor) -> Tensor:
+    """`[rows, cols]` block-scale bytes -> cuBLASLt's 128x4 blocked ("swizzled") layout.
+
+    A silent-wrong-output hazard rather than an optimisation (#515d): a block-scaled GEMM checks
+    the scale grid's element count, not its layout, so a plain row-major grid is accepted where
+    the tiled one belongs and returns wrong numbers almost everywhere."""
+    rows, cols = int(scales.shape[0]), int(scales.shape[1])
+    padded_rows, padded_cols = _blocked_shape(rows, cols)
+    row_blocks, col_blocks = padded_rows // 128, padded_cols // 4
+    padded = torch.zeros(padded_rows, padded_cols, dtype=scales.dtype, device=scales.device)
+    padded[:rows, :cols] = scales
+    tiles = padded.view(row_blocks, 128, col_blocks, 4).permute(0, 2, 1, 3)
+    return tiles.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1).contiguous()
+
+
+def from_blocked(torch: ModuleType, blocked: Tensor, rows: int, cols: int) -> Tensor:
+    """`to_blocked`'s inverse: the `[rows, cols]` row-major grid of a blocked scale layout."""
+    padded_rows, padded_cols = _blocked_shape(rows, cols)
+    row_blocks, col_blocks = padded_rows // 128, padded_cols // 4
+    tiles = blocked.reshape(-1, 32, 4, 4).transpose(1, 2).reshape(row_blocks, col_blocks, 128, 4)
+    return tiles.permute(0, 2, 1, 3).reshape(padded_rows, padded_cols)[:rows, :cols]
+
+
+def scale_grid(torch: ModuleType, scale: Tensor, rows: int, blocks: int, layout: object) -> Tensor:
+    """A stored block-scale grid as row-major `[rows, blocks]`, from either layout."""
+    if layout == "cublas_128x4":
+        return from_blocked(torch, scale, rows, blocks)
+    return scale.reshape(rows, blocks)
+
+
+def _grid_shape(shape: Sequence[int], blocks: int, layout: object) -> tuple[int, ...]:
+    """A block-scale part's stored shape for a logical `shape` and its layout."""
+    if layout == "cublas_128x4":
+        return _blocked_shape(matrix(shape)[0], blocks)
+    return (*tuple(shape[:-1]), blocks)
+
+
 #: E8M0's one non-numeric byte; any other `b` is exactly `2**(b - 127)`.
 E8M0_NAN = 255
 
@@ -123,9 +182,9 @@ def part_rule(encoded: Encoded, shape: Sequence[int], dtype: str) -> str:
     if dtype not in DECODED:
         return f"{encoded.scheme} decodes to f32, bf16 or f16, not {dtype}"
     parts = {p.role: p for p in encoded.parts}
-    rows = int(shape[0]) if shape else 0
-    cols = int(shape[1]) if len(shape) > 1 else 0
-    axis = dict(encoded.params).get("axis")
+    rows, cols = matrix(shape)
+    params = dict(encoded.params)
+    axis, layout = params.get("axis"), params.get("scale_layout")
     rules: dict[str, tuple[frozenset[str], int | tuple[int, ...]]] = {
         "fp8-rowwise": {
             "weight": (_F8, tuple(shape)),
@@ -137,7 +196,7 @@ def part_rule(encoded: Encoded, shape: Sequence[int], dtype: str) -> str:
         },
         "mxfp8": {
             "weight": (_F8, tuple(shape)),
-            "scale": (frozenset({"f8_e8m0"}), (rows, -(-cols // MX_BLOCK))),
+            "scale": (frozenset({"f8_e8m0"}), _grid_shape(shape, -(-cols // MX_BLOCK), layout)),
         },
         "fp8-tensorwise": {
             "weight": (_F8, tuple(shape)),
@@ -149,8 +208,8 @@ def part_rule(encoded: Encoded, shape: Sequence[int], dtype: str) -> str:
             "scale": (frozenset({"f32"}), rows),
         },
         "nvfp4": {
-            "weight": (frozenset({"u8"}), (rows, cols // 2)),
-            "scale": (frozenset({"f8_e4m3fn"}), (rows, cols // NVFP4_BLOCK)),
+            "weight": (frozenset({"u8"}), (*tuple(shape[:-1]), cols // 2)),
+            "scale": (frozenset({"f8_e4m3fn"}), _grid_shape(shape, cols // NVFP4_BLOCK, layout)),
             "scale_2": (frozenset({"f32"}), 1),
             "input_scale": (frozenset({"f32"}), 1),
         },
@@ -252,6 +311,16 @@ class LeafProvider(Provider, Protocol):
 def _rank2(shape: Sequence[int]) -> str:
     if len(shape) != 2:
         return f"a scaled GEMM has two outer dimensions and this tensor is rank {len(shape)} {tuple(shape)}"
+    return ""
+
+
+def _rows(shape: Sequence[int], params: Mapping[str, object]) -> str:
+    """A row or block scheme's rank rule: at least two axes; a cuBLAS 128x4 scale grid tiles
+    one rank-2 weight."""
+    if len(shape) < 2:
+        return f"a row or block scheme needs two axes and this tensor is rank {len(shape)}"
+    if len(shape) > 2 and params.get("scale_layout") == "cublas_128x4":
+        return "cublas_128x4 scales tile one rank-2 weight, not a stack of them"
     return ""
 
 
@@ -416,10 +485,14 @@ class RowwiseDequant:
         return frozenset()
 
     def supports(self, shape: Sequence[int], params: Mapping[str, object]) -> str:
-        return _rank2(shape) or _params(params, {"axis": (0, 1)})
+        why = _rows(shape, params) or _params(params, {"axis": (0, 1)})
+        if why or len(shape) == 2 or params.get("axis") == 0:
+            return why
+        return "a per-column scale is a rank-2 weight's"
 
     def decode(self, torch: ModuleType, parts: Mapping[str, Tensor], destination: Tensor) -> None:
-        rows, cols = int(destination.shape[0]), int(destination.shape[1])
+        rows, cols = matrix(destination.shape)
+        destination = destination.view(rows, cols)
         payload = parts["weight"].view(rows, cols)
         per_column = dict(self.params).get("axis") == 1
         scale = parts["scale"].to(torch.float32).reshape((1, cols) if per_column else (rows, 1))
@@ -483,12 +556,17 @@ class MicroScaledDequant:
         return frozenset()
 
     def supports(self, shape: Sequence[int], params: Mapping[str, object]) -> str:
-        return _rank2(shape) or _params(params, {"block": (MX_BLOCK,)})
+        return _rows(shape, params) or _params(
+            params, {"block": (MX_BLOCK,), "scale_layout": SCALE_LAYOUTS}
+        )
 
     def decode(self, torch: ModuleType, parts: Mapping[str, Tensor], destination: Tensor) -> None:
-        rows, cols = int(destination.shape[0]), int(destination.shape[1])
+        rows, cols = matrix(destination.shape)
+        destination = destination.view(rows, cols)
         payload = parts["weight"].view(rows, cols)
-        mult = e8m0_multipliers(torch, parts["scale"]).reshape(rows, -1)
+        layout = dict(self.params).get("scale_layout")
+        grid = scale_grid(torch, parts["scale"], rows, -(-cols // MX_BLOCK), layout)
+        mult = e8m0_multipliers(torch, grid.contiguous())
         stride = max(1, _CHUNK_BYTES // max(cols * 8, 1))
         for start in range(0, rows, stride):
             stop = min(start + stride, rows)
@@ -554,15 +632,16 @@ class Int8ConvRotDequant:
         return frozenset()
 
     def supports(self, shape: Sequence[int], params: Mapping[str, object]) -> str:
-        why = _rank2(shape) or _params(
+        why = _rows(shape, params) or _params(
             params, {"block": (CONVROT_GROUP,), "rotation": ("hadamard",)}
         )
-        if why or int(shape[1]) % CONVROT_GROUP == 0:
+        if why or int(shape[-1]) % CONVROT_GROUP == 0:
             return why
-        return f"int8-convrot rotates whole {CONVROT_GROUP}-column groups; this tensor has {shape[1]} columns"
+        return f"int8-convrot rotates whole {CONVROT_GROUP}-column groups; this tensor has {shape[-1]} columns"
 
     def decode(self, torch: ModuleType, parts: Mapping[str, Tensor], destination: Tensor) -> None:
-        rows, cols = int(destination.shape[0]), int(destination.shape[1])
+        rows, cols = matrix(destination.shape)
+        destination = destination.view(rows, cols)
         payload = parts["weight"].view(rows, cols)
         scale = parts["scale"].to(torch.float32).reshape(rows, 1)
         stride = max(1, _CHUNK_BYTES // max(cols * 4, 1))
@@ -573,9 +652,6 @@ class Int8ConvRotDequant:
             destination[start:stop].copy_(block)
 
 
-#: NVFP4's block: one E4M3 scale per 16 elements along the input axis.
-NVFP4_BLOCK = 16
-
 #: E2M1 by nibble: bit 3 is the sign, bits 0-2 index the magnitudes.
 E2M1_VALUES = (
     0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
@@ -583,11 +659,14 @@ E2M1_VALUES = (
 )  # fmt: skip
 
 
-def nvfp4_values(torch: ModuleType, weight: Tensor, scale: Tensor, scale_2: Tensor) -> Tensor:
+def nvfp4_values(
+    torch: ModuleType, weight: Tensor, scale: Tensor, scale_2: Tensor, high_first: bool = False
+) -> Tensor:
     """`nvfp4` rows -> f32: `(e2m1 × e4m3 scale) × scale_2`. `weight` is u8 `[R, C/2]`,
-    element 2k in the low nibble."""
+    element 2k in the low nibble, or the high one when `high_first`."""
     rows, cols = int(weight.shape[0]), int(weight.shape[1]) * 2
-    codes = torch.stack((weight & 0x0F, weight >> 4), dim=-1).reshape(rows, cols)
+    pair = (weight >> 4, weight & 0x0F) if high_first else (weight & 0x0F, weight >> 4)
+    codes = torch.stack(pair, dim=-1).reshape(rows, cols)
     lut = torch.tensor(E2M1_VALUES, dtype=torch.float32, device=weight.device)
     blocks = lut[codes.long()].view(rows, cols // NVFP4_BLOCK, NVFP4_BLOCK)
     blocks.mul_(scale.to(torch.float32).view(rows, cols // NVFP4_BLOCK, 1))
@@ -635,18 +714,30 @@ class Nvfp4Dequant:
         return frozenset({"input_scale"})
 
     def supports(self, shape: Sequence[int], params: Mapping[str, object]) -> str:
-        why = _rank2(shape) or _params(params, {"block": (NVFP4_BLOCK,)})
-        if why or int(shape[1]) % NVFP4_BLOCK == 0:
+        why = _rows(shape, params) or _params(
+            params,
+            {"block": (NVFP4_BLOCK,), "nibble_order": NIBBLE_ORDERS, "scale_layout": SCALE_LAYOUTS},
+        )
+        if why or int(shape[-1]) % NVFP4_BLOCK == 0:
             return why
-        return f"nvfp4 scales whole {NVFP4_BLOCK}-column blocks; this tensor has {shape[1]} columns"
+        return (
+            f"nvfp4 scales whole {NVFP4_BLOCK}-column blocks; this tensor has {shape[-1]} columns"
+        )
 
     def decode(self, torch: ModuleType, parts: Mapping[str, Tensor], destination: Tensor) -> None:
-        rows, cols = int(destination.shape[0]), int(destination.shape[1])
+        rows, cols = matrix(destination.shape)
+        destination = destination.view(rows, cols)
+        params = dict(self.params)
         weight = parts["weight"].view(torch.uint8).view(rows, cols // 2)
-        scale = parts["scale"].view(rows, cols // NVFP4_BLOCK)
+        scale = scale_grid(
+            torch, parts["scale"], rows, cols // NVFP4_BLOCK, params.get("scale_layout")
+        )
+        high_first = params.get("nibble_order") == "high_first"
         stride = max(1, _CHUNK_BYTES // max(cols * 8, 1))
         for start in range(0, rows, stride):
             stop = min(start + stride, rows)
             destination[start:stop].copy_(
-                nvfp4_values(torch, weight[start:stop], scale[start:stop], parts["scale_2"])
+                nvfp4_values(
+                    torch, weight[start:stop], scale[start:stop], parts["scale_2"], high_first
+                )
             )

@@ -37,6 +37,9 @@ from cozy_runtime.author.kernels import (
 from cozy_runtime.internal import bands, fp8_linear, int8_linear, nvfp4_linear, spill
 from cozy_runtime.internal.encoding.formats import (
     E4M3_MAX,
+    _blocked_shape,
+    from_blocked,
+    to_blocked,
     MX_BLOCK,
     NVFP4_BLOCK,
     Int8ConvRotDequant,
@@ -85,35 +88,6 @@ def serving(provider: str, index: int) -> str:
 def sites(leaves: Mapping[str, tuple[Any, ...]]) -> Counter[tuple[str, str]]:
     """`(component, provider)` -> how many installed leaves: counted once, when they install."""
     return Counter((key.partition(".")[0], entry[0].provider) for key, entry in leaves.items())
-
-
-def _blocked_shape(rows: int, cols: int) -> tuple[int, int]:
-    return -(-rows // 128) * 128, -(-cols // 4) * 4
-
-
-def to_blocked(torch: ModuleType, scales: Tensor) -> Tensor:
-    """`[rows, cols]` block-scale bytes -> cuBLASLt's 128x4 blocked ("swizzled") layout.
-
-    A silent-wrong-output hazard rather than an optimisation (#515d): a block-scaled GEMM checks
-    the scale grid's ELEMENT COUNT, not its LAYOUT, so a plain row-major grid is accepted where
-    the tiled one belongs and returns wrong numbers almost everywhere. Nothing raises; the probe
-    oracle is what catches a builder who skips this.
-    """
-    rows, cols = int(scales.shape[0]), int(scales.shape[1])
-    padded_rows, padded_cols = _blocked_shape(rows, cols)
-    row_blocks, col_blocks = padded_rows // 128, padded_cols // 4
-    padded = torch.zeros(padded_rows, padded_cols, dtype=scales.dtype, device=scales.device)
-    padded[:rows, :cols] = scales
-    tiles = padded.view(row_blocks, 128, col_blocks, 4).permute(0, 2, 1, 3)
-    return tiles.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1).contiguous()
-
-
-def from_blocked(torch: ModuleType, blocked: Tensor, rows: int, cols: int) -> Tensor:
-    """`to_blocked`'s inverse: the `[rows, cols]` row-major grid of a blocked scale layout."""
-    padded_rows, padded_cols = _blocked_shape(rows, cols)
-    row_blocks, col_blocks = padded_rows // 128, padded_cols // 4
-    tiles = blocked.reshape(-1, 32, 4, 4).transpose(1, 2).reshape(row_blocks, col_blocks, 128, 4)
-    return tiles.permute(0, 2, 1, 3).reshape(padded_rows, padded_cols)[:rows, :cols]
 
 
 def _leaf_class(torch: Any) -> Any:
@@ -462,7 +436,7 @@ class Int8ConvRotNativeLeaf:
 
     def supports(self, shape: Sequence[int], params: Mapping[str, object]) -> str:
         """The decode's group law, and cuBLASLt's 8-aligned N for the eager int8 GEMM."""
-        why = Int8ConvRotDequant().supports(shape, params)
+        why = _rank2(shape) or Int8ConvRotDequant().supports(shape, params)
         if why or int(shape[0]) % 8 == 0:
             return why
         return f"the int8 GEMM needs N divisible by 8 and this tensor has {shape[0]} rows"
@@ -559,7 +533,7 @@ class Nvfp4NativeLeaf:
 
     def supports(self, shape: Sequence[int], params: Mapping[str, object]) -> str:
         """The decode's block law, and cuBLASLt's FP4 GEMM: K divisible by 32, N by 8."""
-        why = Nvfp4Dequant().supports(shape, params)
+        why = _rank2(shape) or Nvfp4Dequant().supports(shape, params)
         if why:
             return why
         if int(shape[1]) % 32 or int(shape[0]) % 8:
@@ -605,12 +579,18 @@ class Nvfp4NativeLeaf:
         if torch.cuda.is_available():
             # Starts the kernel's build beside the weight fill; the first calls run eager.
             int8_linear.kitchen(torch, torch.cuda.current_device())
+        params = dict(self.params)
         weight = parts["weight"].view(torch.uint8)
+        if params.get("nibble_order") == "high_first":
+            weight = (weight << 4) | (weight >> 4)  # the kernels read element 2k low
         out_features, in_features = int(weight.shape[0]), 2 * int(weight.shape[1])
         rows, cols = _blocked_shape(out_features, in_features // NVFP4_BLOCK)
-        # Swizzled once, at fill: the weight's grid never changes.
-        blocked = to_blocked(torch, parts["scale"].view(torch.uint8))
-        blocked = blocked.view(rows, cols).view(torch.float8_e4m3fn)
+        if params.get("scale_layout") == "cublas_128x4":
+            blocked = parts["scale"].view(torch.uint8).reshape(rows, cols)  # the kernels' tiles
+        else:
+            # Swizzled once, at fill: the weight's grid never changes.
+            blocked = to_blocked(torch, parts["scale"].view(torch.uint8)).view(rows, cols)
+        blocked = blocked.view(torch.float8_e4m3fn)
         return _leaf_class(torch)(
             Nvfp4NativeLeaf._forward,
             {
@@ -693,7 +673,7 @@ class MicroScaledNativeLeaf:
     def supports(self, shape: Sequence[int], params: Mapping[str, object]) -> str:
         """The decode's law, and whole blocks: the MMA reads 32-element blocks, so a short last
         block decodes instead."""
-        why = MicroScaledDequant().supports(shape, params)
+        why = _rank2(shape) or MicroScaledDequant().supports(shape, params)
         if why:
             return why
         if int(shape[1]) % MX_BLOCK:
@@ -738,8 +718,12 @@ class MicroScaledNativeLeaf:
                 f"the MX GEMM takes E4M3 weights and this one is {weight.dtype}: it decodes instead",
             )
         in_features, out_features, bias = _leaf_geometry(replaced, weight)
-        # Swizzled once, at fill: the weight's grid never changes.
-        blocked = to_blocked(torch, parts["scale"].view(torch.uint8)).view(torch.float8_e8m0fnu)
+        scale = parts["scale"].view(torch.uint8)
+        if dict(self.params).get("scale_layout") == "cublas_128x4":
+            blocked = scale.reshape(-1)  # already the kernels' tiles
+        else:
+            blocked = to_blocked(torch, scale)  # swizzled once, at fill
+        blocked = blocked.view(torch.float8_e8m0fnu)
         return _leaf_class(torch)(
             functools.partial(MicroScaledNativeLeaf._forward, torch),
             {"weight": weight, "scale": blocked},

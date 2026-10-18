@@ -113,7 +113,7 @@ def test_decode_is_the_spec_law_and_the_mined_vectors() -> None:
 
 def test_blocked_scales_round_trip() -> None:
     torch = pytest.importorskip("torch")
-    from cozy_runtime.internal.encoding.leaves import from_blocked, to_blocked
+    from cozy_runtime.internal.encoding.formats import from_blocked, to_blocked
 
     grid = torch.randint(0, 126, (200, 12), dtype=torch.uint8)
     assert torch.equal(from_blocked(torch, to_blocked(torch, grid), 200, 12), grid)
