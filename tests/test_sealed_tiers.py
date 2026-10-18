@@ -428,12 +428,19 @@ def test_the_machine_stages_only_what_a_stage_streams_every_step(tmp_path: Path)
         component = model.residency.components["stack"]
         weights.set_budget(tight(model))
         x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
+
+        def request(passes: int) -> None:
+            model.residency.open_attempt()
+            run(model, x, passes)
+
         for _ in range(3):  # its order is learned by the second: the third streams it, once
-            run(model, x, passes=1)
+            request(1)
         assert component.observed and component.residence is not None
         assert component.residence.streamed and machine.stage_asks == [()]
-        run(model, x, passes=3)
-        run(model, x, passes=1)
+        request(3)
+        request(1)
+        component = model.residency.components["stack"]
+        assert component.residence is not None
         streamed = tuple(component.blocks[i].index for i in component.residence.streamed)
         assert machine.stage_asks[1:] and machine.stage_asks[-1] == streamed
     finally:

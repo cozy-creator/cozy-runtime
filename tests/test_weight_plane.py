@@ -2291,6 +2291,7 @@ def test_a_stage_that_runs_once_never_evicts_what_a_repeating_stage_keeps(
     x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
 
     def staged(model: Any, method: str, passes: int) -> list[Any]:
+        model.residency.open_attempt()  # each a request's: entered once
         model.residency.admit(method, ("stack",))
         try:
             with torch.inference_mode():
