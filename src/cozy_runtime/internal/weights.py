@@ -4201,8 +4201,8 @@ class WeightResidency:
                 start = order.index(resume[key]) if key in resume else 0
                 # Its ring's blocks only: a cursor holds a resident one in place until it closes,
                 # out of the ladder's reach (15 s H3 on a 4090: 17 GB pinned under a 3.2 GB op).
-                held = set(component.resident)
-                component.schedule = [i for i in order[start:] + order[:start] if i not in held]
+                resident = set(component.resident)
+                component.schedule = [i for i in order[start:] + order[:start] if i not in resident]
                 component.cursor = weights.plane.stream(
                     component.ws,
                     weights.index,
@@ -4557,8 +4557,9 @@ class WeightResidency:
             component.spared = True
         weights.drain()
         # Dropped regions stay mapped as the plane's idle cache until its budget leaves them
-        # no room: the plane keeps what the running component streams in, torch the rest.
-        weights._apply(min(weights.applied, max(weights.window(), weights.floor())))
+        # no room: the plane keeps what the running component streams in, torch the rest. The
+        # running one's resident set stays held: its own cut is rung 2's (`Memory._finer`).
+        weights._apply(min(weights.applied, max(weights.window(), weights.floor())), True)
         weights.memory.shrunk = True
         return max(plane.stats(weights.plane).device(weights.index).committed, 0) < before
 
