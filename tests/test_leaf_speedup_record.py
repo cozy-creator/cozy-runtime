@@ -23,8 +23,8 @@ OBSERVATION = OBSERVATIONS / "probe-cuda-sm89.json"
 
 #: The two `fp8-rowwise/1` spec digests runtime 0.0.36 reviewed: both `fp8-rowwise` here.
 RECORDED_SPECS = {
-    "sha256:8c86b26daec5bcd287401d9873b70aa3594855f97ac4d01cf75cc2bafd5d50b5": "fp8-rowwise",
-    "sha256:91ddc2a73ba2778b344afc5e78b4addee9174a015cfff02f17cfbb629ad5ef78": "fp8-rowwise",
+    "sha256:8c86b26daec5bcd287401d9873b70aa3594855f97ac4d01cf75cc2bafd5d50b5": "fp8.rowwise",
+    "sha256:91ddc2a73ba2778b344afc5e78b4addee9174a015cfff02f17cfbb629ad5ef78": "fp8.rowwise",
 }
 
 LEAF = "cozy.fp8-rowwise.native-leaf/1"
@@ -37,7 +37,7 @@ def recorded() -> QualificationResult:
 def rekeyed() -> QualificationResult:
     """The recorded rowwise observations on this build's digests, measurements verbatim."""
     result = recorded()
-    by_name = {provider.name: provider for provider in launch_providers()["fp8-rowwise"]}
+    by_name = {provider.name: provider for provider in launch_providers()["fp8.rowwise"]}
     return msgspec.structs.replace(
         result,
         observations=[

@@ -36,10 +36,8 @@ from cozy_runtime.author.kernels import (
 )
 from cozy_runtime.internal import bands, fp8_linear, int8_linear, nvfp4_linear, spill
 from cozy_runtime.internal.encoding.formats import (
+    CONVROT_GROUP,
     E4M3_MAX,
-    _blocked_shape,
-    from_blocked,
-    to_blocked,
     MX_BLOCK,
     NVFP4_BLOCK,
     Int8ConvRotDequant,
@@ -48,10 +46,13 @@ from cozy_runtime.internal.encoding.formats import (
     Params,
     RolePart,
     Tensor,
+    _blocked_shape,
     _params,
     _rank2,
     e8m0_multipliers,
+    from_blocked,
     refuse,
+    to_blocked,
 )
 
 NVFP4 = "cozy.nvfp4.native-leaf/1"
@@ -292,7 +293,7 @@ def _leaf_geometry(replaced: Any, data: Any) -> tuple[int, int, Any]:
 
 @dataclass(frozen=True, slots=True)
 class RowwiseNativeLeaf:
-    """`fp8-rowwise/1` ENCODED GEMM: the tensor cores consume the stored E4M3 payload directly
+    """`fp8.rowwise` ENCODED GEMM: the tensor cores consume the stored E4M3 payload directly
     (`fp8_linear`).
 
     fp8 tensor cores need BOTH operands fp8, so this is w8a8 (#514b): the activation is
@@ -307,7 +308,7 @@ class RowwiseNativeLeaf:
     is what the probe measures.
     """
 
-    encoding: str = "fp8-rowwise"
+    encoding: str = "fp8.rowwise"
     params: Params = ()
 
     @property
@@ -324,7 +325,7 @@ class RowwiseNativeLeaf:
 
     @property
     def schemes(self) -> frozenset[str]:
-        return frozenset({"fp8-rowwise"})
+        return frozenset({"fp8.rowwise"})
 
     @property
     def code_revision(self) -> str:
@@ -395,7 +396,7 @@ class Int8ConvRotNativeLeaf:
     accumulation and 3-4x their bf16 rate, so this is the fast lane there.
     """
 
-    encoding: str = "int8-convrot"
+    encoding: str = "int8.convrot"
     params: Params = ()
 
     @property
@@ -412,7 +413,7 @@ class Int8ConvRotNativeLeaf:
 
     @property
     def schemes(self) -> frozenset[str]:
-        return frozenset({"int8-convrot"})
+        return frozenset({"int8.convrot"})
 
     @property
     def code_revision(self) -> str:
@@ -437,6 +438,8 @@ class Int8ConvRotNativeLeaf:
     def supports(self, shape: Sequence[int], params: Mapping[str, object]) -> str:
         """The decode's group law, and cuBLASLt's 8-aligned N for the eager int8 GEMM."""
         why = _rank2(shape) or Int8ConvRotDequant().supports(shape, params)
+        if not why and params.get("rotation_size") != CONVROT_GROUP:
+            why = f"the int8 kernel rotates {CONVROT_GROUP}-groups; this weight's are {params.get('rotation_size')}"
         if why or int(shape[0]) % 8 == 0:
             return why
         return f"the int8 GEMM needs N divisible by 8 and this tensor has {shape[0]} rows"
@@ -487,7 +490,7 @@ class Nvfp4NativeLeaf:
 
     On Blackwell a product of more than 16 rows is W4A4 on the FP4 tensor cores: each activation is
     quantized at dispatch against its own tensor amax, and on real FLUX.3 Klein activations that is
-    5-10% from bf16 per linear (int8-convrot: 0.5-1.2%) at 1.3-1.5x the int8 leaf's rate on an RTX
+    5-10% from bf16 per linear (int8.convrot: 0.5-1.2%) at 1.3-1.5x the int8 leaf's rate on an RTX
     5090. Every other product, and every one before Blackwell, is W4A16: Triton decodes the weight
     in registers onto the bf16 tensor cores, which is the bandwidth-bound decode loop of an LM.
     """
@@ -591,12 +594,15 @@ class Nvfp4NativeLeaf:
             # Swizzled once, at fill: the weight's grid never changes.
             blocked = to_blocked(torch, parts["scale"].view(torch.uint8)).view(rows, cols)
         blocked = blocked.view(torch.float8_e4m3fn)
+        second = parts["scale_2"].to(torch.float32).reshape(1)
+        if params.get("global_scale") == "divide":
+            second = 1.0 / second  # the kernels multiply: one f32 reciprocal, a W4A4 rounding
         return _leaf_class(torch)(
             Nvfp4NativeLeaf._forward,
             {
                 "weight": weight,
                 "weight_scale": blocked,
-                "weight_scale_2": parts["scale_2"].to(torch.float32).reshape(1),
+                "weight_scale_2": second,
             },
             getattr(replaced, "bias", None),
             out_dtype,

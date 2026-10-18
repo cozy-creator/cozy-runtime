@@ -52,13 +52,13 @@ FP8_LEAF = "cozy.fp8-rowwise.native-leaf/1"
 
 
 PARAMS: dict[str, dict[str, object]] = {
-    "fp8-rowwise": {"axis": 0},
-    "int8-convrot": {"block": 256, "rotation": "hadamard"},
+    "fp8.rowwise": {"axis": 0},
+    "int8.convrot": {"rotation": "hadamard", "rotation_size": 256},
 }
 
 
 def row(key: str, scheme: str, dtype: str, shape: tuple[int, int]) -> PlanRow:
-    weight = "i8" if scheme == "int8-convrot" else "f8_e4m3fn"
+    weight = "i8" if scheme == "int8.convrot" else "f8_e4m3fn"
     parts = (
         RolePart("weight", weight, shape, shape[0] * shape[1]),
         RolePart("scale", "f32", (shape[0],), 4 * shape[0]),
@@ -89,11 +89,11 @@ def test_a_leaf_below_its_floor_warns_and_a_geometry_or_a_declined_leaf_does_not
     table = sm86()
     capabilities = probe.admission_table(table)
     rows = [
-        row("unet.a.weight", "fp8-rowwise", "bf16", (64, 256)),
-        row("unet.b.weight", "fp8-rowwise", "bf16", (128, 256)),
-        row("te.c.weight", "int8-convrot", "bf16", (64, 256)),
+        row("unet.a.weight", "fp8.rowwise", "bf16", (64, 256)),
+        row("unet.b.weight", "fp8.rowwise", "bf16", (128, 256)),
+        row("te.c.weight", "int8.convrot", "bf16", (64, 256)),
         # The int8 GEMM needs N % 8 == 0: decoded by the format's rule, not refused.
-        row("te.d.weight", "int8-convrot", "bf16", (60, 256)),
+        row("te.d.weight", "int8.convrot", "bf16", (60, 256)),
     ]
     served = plan(rows, capabilities, table.device)
     assert {t.key: t.route for t in served.tensors} == {
@@ -105,7 +105,7 @@ def test_a_leaf_below_its_floor_warns_and_a_geometry_or_a_declined_leaf_does_not
     assert served.refused_leaves() == (
         RefusedLeaves(
             "unet",
-            "fp8-rowwise",
+            "fp8.rowwise",
             FP8_LEAF,
             "its kernel needs cuda.sm89+ and this device is cuda.sm86",
             "bfloat16",
@@ -118,10 +118,10 @@ def test_a_leaf_below_its_floor_warns_and_a_geometry_or_a_declined_leaf_does_not
 def test_a_leaf_that_failed_or_raised_in_qualification_warns_once_per_reason() -> None:
     result = rekeyed()
     rows = [
-        row("unet.a.weight", "fp8-rowwise", "f16", (64, 256)),
-        row("unet.b.weight", "fp8-rowwise", "f32", (64, 256)),
-        row("unet.c.weight", "fp8-rowwise", "f32", (128, 256)),
-        row("unet.d.weight", "fp8-rowwise", "bf16", (64, 256)),
+        row("unet.a.weight", "fp8.rowwise", "f16", (64, 256)),
+        row("unet.b.weight", "fp8.rowwise", "f32", (64, 256)),
+        row("unet.c.weight", "fp8.rowwise", "f32", (128, 256)),
+        row("unet.d.weight", "fp8.rowwise", "bf16", (64, 256)),
     ]
     served = plan(rows, probe.admission_table(result), result.device)
     assert served.by_key()["unet.d.weight"].route == "encoded_gemm"
@@ -150,12 +150,21 @@ def test_a_run_names_each_components_gemm_kernel_and_each_fallback(tmp_path: Pat
         "scale": torch.frombuffer(bytearray(encoded.companions[0].raw), dtype=torch.float32),
     }
     stand_in = probe._StandIn(512, 64)
-    int8 = Int8ConvRotNativeLeaf(params=params_of(PARAMS["int8-convrot"]))
+    int8 = Int8ConvRotNativeLeaf(params=params_of(PARAMS["int8.convrot"]))
     leaves = {
         key: (int8.leaf(torch, int8_roles, stand_in, torch.bfloat16), None, ())
         for key in ("transformer.a.weight", "transformer.b.weight", "text_encoder.c.weight")
     }
-    nvfp4 = Nvfp4NativeLeaf(params=params_of({"block": 16})).leaf(
+    nvfp4 = Nvfp4NativeLeaf(
+        params=params_of(
+            {
+                "block_size": 16,
+                "global_scale": "multiply",
+                "nibble_order": "low_first",
+                "scale_layout": "row_major",
+            }
+        )
+    ).leaf(
         torch, roles(torch, weight(256, 512, 6), "cpu"), probe._StandIn(512, 256), torch.bfloat16
     )
     leaves["transformer.d.weight"] = (nvfp4, None, ())
@@ -164,7 +173,7 @@ def test_a_run_names_each_components_gemm_kernel_and_each_fallback(tmp_path: Pat
     assert set(vars(nvfp4)) == before  # nothing written per call
 
     table = sm86()
-    rows = [row(f"unet.{n}.weight", "fp8-rowwise", "bf16", (64, 256)) for n in "ab"]
+    rows = [row(f"unet.{n}.weight", "fp8.rowwise", "bf16", (64, 256)) for n in "ab"]
     executor = Executor(None, tmp_path)  # type: ignore[arg-type]
     executor.backend = SimpleNamespace(gemm_sites=leaf_sites(leaves))
     executor.models = {"klein": object()}

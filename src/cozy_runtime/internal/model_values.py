@@ -13,9 +13,9 @@ _ELEMENTS = 1 << 22
 _FLOATS = {"F32": "float32", "F16": "float16", "BF16": "bfloat16"}
 #: (scheme, weight dtype) -> its torch element, for the per-row schemes a window reads.
 _ROWWISE = {
-    ("fp8-rowwise", "F8_E4M3"): "float8_e4m3fn",
-    ("fp8-rowwise", "F8_E5M2"): "float8_e5m2",
-    ("int8-rowwise", "I8"): "int8",
+    ("fp8.rowwise", "F8_E4M3"): "float8_e4m3fn",
+    ("fp8.rowwise", "F8_E5M2"): "float8_e5m2",
+    ("int8.rowwise", "I8"): "int8",
 }
 
 
@@ -30,7 +30,7 @@ def _part(
 def read_values_into(
     torch: ModuleType, source: Source, component: str, key: str, offset: int, into: memoryview
 ) -> None:
-    """Elements `offset..` of a plain float or per-row (`fp8-rowwise`, `int8-rowwise`) tensor,
+    """Elements `offset..` of a plain float or per-row (`fp8.rowwise`, `int8.rowwise`) tensor,
     as f32."""
     tensor = source.checkpoint.tensors.get(component, {}).get(key)
     count = into.nbytes // 4

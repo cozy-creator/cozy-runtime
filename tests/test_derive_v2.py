@@ -44,9 +44,18 @@ def _peer(root: Path, store: tensorfs.Store, source: tensorfs.Manifest) -> Peer:
 @pytest.mark.parametrize(
     ("scheme", "params", "bound"),
     [
-        ("fp8-rowwise", {"axis": 0}, 0.07),
-        ("int8-convrot", {"block": 256, "rotation": "hadamard"}, 0.02),
-        ("nvfp4", {"block": 16}, 0.2),
+        ("fp8.rowwise", {"axis": 0}, 0.07),
+        ("int8.convrot", {"rotation": "hadamard", "rotation_size": 256}, 0.02),
+        (
+            "nvfp4",
+            {
+                "block_size": 16,
+                "global_scale": "multiply",
+                "nibble_order": "low_first",
+                "scale_layout": "row_major",
+            },
+            0.2,
+        ),
     ],
 )
 def test_a_lane_encodes_by_scheme_and_decodes_through_the_reference(
@@ -76,7 +85,7 @@ def test_a_committed_output_replays_and_an_interrupted_one_resumes(tmp_path: Pat
     store, source, _ = _source(tmp_path)
     peer = _peer(tmp_path, store, source)
     weights: Weights[Any] = Weights(f"sha256:{source.sha256}")
-    lane = plan(["unet"], "fp8-rowwise")
+    lane = plan(["unet"], "fp8.rowwise")
     first = quantize(weights, lane, ctx=context(peer), tel=fake_telemetry())
     again = quantize(weights, lane, ctx=context(peer), tel=fake_telemetry())
     assert again.replayed and again.new_bytes_written_this_run == 0
@@ -121,7 +130,7 @@ def test_values_read_from_plain_and_rowwise_sources(tmp_path: Path) -> None:
     peer = _peer(tmp_path, store, source)
     quantize(
         Weights(f"sha256:{source.sha256}"),
-        plan(["unet"], "fp8-rowwise"),
+        plan(["unet"], "fp8.rowwise"),
         ctx=context(peer),
         tel=fake_telemetry(),
     )

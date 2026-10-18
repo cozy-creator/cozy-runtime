@@ -1,7 +1,7 @@
-"""Stored layouts the producers emit, against the reference decoder's bytes: every nvfp4 and
-mxfp8 conformance case re-laid as ComfyUI writes it (block scales in cuBLAS 128x4 tiles, FP4's
-even element in the high nibble) decodes to the same expected bytes, and a stack of weights
-(MoE `[E, out, in]`) decodes as its rows."""
+"""Stored layouts the producers emit, against the reference decoder's bytes: every row-major
+nvfp4 and mxfp8 conformance case re-laid as ComfyUI writes it (block scales in cuBLAS 128x4
+tiles, FP4's even element in the high nibble) decodes to the same expected bytes, and a stack of
+weights (MoE `[E, out, in]`) decodes as its rows."""
 
 from __future__ import annotations
 
@@ -63,7 +63,14 @@ def _relaid(case: VectorCase, layout: dict[str, object]) -> dict[str, Any]:
     return roles
 
 
-CASES = [c for c in vector_cases() if c.encoding.scheme in BLOCKS and not c.refuse]
+CASES = [
+    c
+    for c in vector_cases()
+    if c.encoding.scheme in BLOCKS
+    and not c.refuse
+    and c.encoding.params.get("scale_layout") == "row_major"
+    and c.encoding.params.get("nibble_order", "low_first") == "low_first"
+]
 
 
 @pytest.mark.parametrize("case", CASES, ids=lambda c: f"{c.encoding.scheme}-{c.key}")
@@ -80,12 +87,17 @@ def test_a_relaid_case_decodes_to_the_reference_bytes(
     assert same_bits(torch, got, case.expect) == 0
 
 
-@pytest.mark.parametrize("scheme", ["fp8-rowwise", "int8-rowwise", "mxfp8", "nvfp4"])
+@pytest.mark.parametrize(
+    "scheme", ["fp8.rowwise", "int8.rowwise", "int8.convrot", "mxfp8", "nvfp4"]
+)
 def test_a_stack_of_weights_decodes_as_its_rows(scheme: str) -> None:
     case = next(
         c
         for c in vector_cases()
-        if c.encoding.scheme == scheme and not c.refuse and len(c.shape) == 2
+        if c.encoding.scheme == scheme
+        and not c.refuse
+        and len(c.shape) == 2
+        and c.encoding.params.get("scale_layout", "row_major") == "row_major"
     )
     roles = {part.role: vector_tensor(torch, part, "cpu") for part in case.parts}
     once = _decode(case, dict(case.encoding.params), roles)

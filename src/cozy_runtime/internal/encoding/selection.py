@@ -519,7 +519,7 @@ class Capabilities:
 #: Routes this runtime names but does not build, by scheme: the device class that would serve
 #: one, and what owns building it. A refusal reads this to name the alternative.
 NAMED_SEAMS: dict[str, tuple[str, str]] = {
-    "fp8-tensorwise": (
+    "fp8.tensorwise": (
         "cuda.sm90+",
         "encoded-GEMM fp8 tensor-core execution via torch._scaled_mm; elsewhere the qualified "
         "route is decoded_float, which this runtime serves",
