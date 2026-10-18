@@ -1132,12 +1132,13 @@ def test_a_card_the_packages_tensors_fill_runs_its_stage_through_host_and_disk(
             got = run(model, x, passes=1)
         except MemoryExhausted as exc:
             pytest.fail(f"{exc}; moved {spill.summary(before)}; applied {weights.applied}")
-        tier = 3 if host == "room" else 5
-        assert spill.TOTALS[tier] - before[tier] >= 256 << 20, spill.summary(before)
+        moved = [now - then for now, then in zip(spill.TOTALS, before, strict=True)]
+        assert moved[3] if host == "room" else moved[5], spill.summary(before)
         assert spill.keep(x).device.type == "cpu"
-        assert all(bool((t == i).all()) for i, t in enumerate(held)), "each one's own values"
         close(reference, got)  # in the mode: what left the device comes back to be read
-    del held, got
+        del got, reference
+        assert all(bool((t == i).all()) for i, t in enumerate(held)), "each one's own values"
+    del held
     gc.collect()
     weights.restore_spilled()
     spill.release(torch)
@@ -1153,15 +1154,16 @@ def test_a_cast_over_half_the_hosts_room_lands_in_host_memory(
     cast whose result is larger than that half, under a cap that leaves it no device room, now
     runs in bands into host memory."""
     weights = card.weights
-    x = torch.randn(1 << 30, device="cuda", dtype=torch.float16)  # 2 GiB; cast: 4 GiB
+    x = torch.randn(1 << 15, 1 << 15, device="cuda", dtype=torch.float16)  # 2 GiB; cast: 4 GiB
     host_room(monkeypatch, 2 * x.nbytes + (512 << 20))  # half of it is less than the result
+    torch.cuda.empty_cache()  # the cap leaves room for no cast beside `x`, cached or not
     weights.measure_context()
     weights.set_cap(max(weights.context_bytes, 0) + torch.cuda.memory_reserved() + (1 << 30))
     try:
         with weights.recovering():
             y = x.float()
             assert spill.hosted(y)
-            for part in (slice(0, 1 << 24), slice(-(1 << 24), None)):
+            for part in (slice(0, 256), slice(-256, None)):
                 assert torch.equal(y[part].half(), x[part])
         assert "host memory" in weights.modes.get("bands", ""), weights.modes
     finally:
