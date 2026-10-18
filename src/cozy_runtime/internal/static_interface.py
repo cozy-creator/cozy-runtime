@@ -1839,7 +1839,9 @@ def environment_roots(python: Path | None, *, project: Path) -> tuple[Path, ...]
             "--environment-python must name a venv Python", code="static_environment"
         )
     roots: list[Path] = []
-    for directory in sorted((prefix / "lib").glob("python*/site-packages")):
+    # POSIX venvs keep lib/pythonX.Y/site-packages; Windows venvs keep Lib/site-packages.
+    sites = [*prefix.glob("lib/python*/site-packages"), *prefix.glob("Lib/site-packages")]
+    for directory in sorted(dict.fromkeys(site.resolve() for site in sites)):
         roots.append(directory.resolve())
         for path in sorted(directory.glob("*.pth")):
             if path.stat().st_size > 1 << 20:
