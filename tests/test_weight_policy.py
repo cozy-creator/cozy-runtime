@@ -8,6 +8,7 @@ at 1605 MHz scaled to the clean 592.9 ms step, in execution order.
 from __future__ import annotations
 
 import csv
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
@@ -59,6 +60,15 @@ def test_unmeasured_costs_place_a_spread_set_two_slots_wide() -> None:
     assert policy.residence(UNET, UNET.total).streamed == ()
 
 
+def test_a_repeating_stage_keeps_its_resident_set_when_its_room_moves() -> None:
+    """A stage nested in the DiT's (H3's turbo LoRA) or a request's activations move its room by
+    a block or two: only those blocks move, never the spread around them."""
+    costs = policy.Costs(compute=COMPUTE, link_bps=LINK)
+    rooms = [BUDGET - k * (64 << 20) for k in range(4)]
+    streamed = [set(policy.residence(UNET, room, costs=costs).streamed) for room in rooms]
+    assert all(wider < narrower for wider, narrower in pairwise(streamed))
+
+
 def test_run_once_is_whole_or_streamed_and_below_one_slot_refuses_with_numbers() -> None:
     text = policy.Layout(common=200 << 20, blocks=(12 << 20,) * 12)
     both = policy.stage({"unet": UNET, "text": text}, BUDGET, cyclic={"unet"})
@@ -68,6 +78,21 @@ def test_run_once_is_whole_or_streamed_and_below_one_slot_refuses_with_numbers()
     with pytest.raises(policy.BelowFloor) as refused:
         policy.stage({"unet": UNET}, one - 1, cyclic={"unet"})
     assert (refused.value.needed, refused.value.available) == (one, one - 1)
+
+
+def test_a_stage_that_runs_once_streams_beside_what_repeating_stages_keep() -> None:
+    """Run 10808: H3's text encoder, run once a request, evicted its DiT's resident set on a
+    4090, and every denoise read it back. It streams beside that set, taking from it only what
+    a window of two lacks; a cyclic stage plans in the whole budget."""
+    text = policy.Layout(common=200 << 20, blocks=(12 << 20,) * 12)
+    window = text.common + policy.ring_bytes(text.blocks, policy.DEFAULT_WINDOW)
+    beside = policy.stage({"text": text}, BUDGET, hot=BUDGET - window - (1 << 20))["text"]
+    assert beside.streamed and beside.window == policy.DEFAULT_WINDOW
+    assert beside.vram_bytes(text) == window
+    assert policy.stage({"text": text}, BUDGET, hot=BUDGET)["text"].vram_bytes(text) == window
+    assert policy.stage({"text": text}, BUDGET)["text"].streamed == ()
+    unet = policy.stage({"unet": UNET}, BUDGET, cyclic={"unet"})
+    assert policy.stage({"unet": UNET}, BUDGET, cyclic={"unet"}, hot=BUDGET) == unet
 
 
 def test_activations_come_first() -> None:

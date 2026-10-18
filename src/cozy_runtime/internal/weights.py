@@ -23,6 +23,7 @@ from __future__ import annotations
 import functools
 import mmap
 import os
+import threading
 import time
 import weakref
 import zlib
@@ -254,9 +255,13 @@ class Component:
     order: list[int] = field(default_factory=list)
     observed: bool = False
     seen: list[int] = field(default_factory=list)
-    #: block passes in the running stage, and in its last one: >1 is a cyclic (denoise) stage
+    #: block passes and block calls in the open stage; per method, whether its last stage
+    #: read a block more than once (cyclic: a denoise's steps, a decode's chunks)
     passes: int = 0
-    last_passes: int = 0
+    uses: int = 0
+    cycled: dict[str, bool] = field(default_factory=dict)
+    #: its last stage repeated: its resident set stays mapped above idle weights (`plane.HOT`)
+    hot: bool = False
     residence: weight_policy.Residence | None = None
     cursor: Cursor | None = None
     #: the cursor's schedule: `order` from the block it started at
@@ -298,6 +303,11 @@ class Component:
 
     def __post_init__(self) -> None:
         self.numbers = {region.index: i for i, region in enumerate(self.blocks)}
+
+    @property
+    def cycling(self) -> bool:
+        """The open stage read one of its blocks more than once."""
+        return self.uses > len(self.blocks)
 
     @property
     def planned(self) -> weight_policy.Layout:
@@ -423,6 +433,9 @@ class Weights:
         #: a group's stage whose activations are not measured yet runs its first pass at the
         #: floor, and is placed again at its second with what that pass measured
         self.growing = False
+        #: the band the open stages stream and fill on demand in: above repeating stages' kept
+        #: resident sets when they repeat too, among idle weights when they run once
+        self.band = plane.STREAMED
         #: the Worker's mid-call budget (`budget_cell`): read at every block boundary
         self.cell: budget_cell.Cell | None = None
         #: asks the Worker for `bytes` free on this GPU from its other tenants (`DeviceRoom`);
@@ -430,6 +443,10 @@ class Weights:
         self.room: Callable[[int], None] | None = None
         #: device bytes live owners keep for speed and shed under pressure (`reserve`)
         self.reservations: dict[Reservation, None] = {}
+        #: regions an attempt's end maps back (`map_back`), and the thread mapping them
+        self.back: deque[tuple[Component, int]] = deque()
+        self.backing: threading.Thread | None = None
+        self._back_lock = threading.Lock()
         #: the CUDA context and library workspaces outside torch and the plane, measured once
         self.context_bytes = -1
         #: the machine's custody of GPU weights (`weights.attach/1`); None: every region private
@@ -581,6 +598,7 @@ class Weights:
         the machine is asked for them (`DeviceRoom`: it drops a holding nobody maps, and this
         process's cap rises into that room). False: nothing to give. `keep` None: every
         component an open or parked stage uses."""
+        self.give_up()
         keep = _in_use(self) if keep is None else keep
         asks = self.room is not None and self.cap >= 0
         idle = [
@@ -690,6 +708,7 @@ class Weights:
         if nbytes == self.applied or self.host_only:
             return 0
         if nbytes < self.applied:
+            self.give_up()
             self.quiesce()
             for component in () if keep_holds else self.components.values():
                 let_go(component)
@@ -1470,7 +1489,47 @@ class Weights:
         if not self.host_only:
             self.plane.set_vram_budget(self.index, self.applied)
 
+    def map_back(self, regions: Iterable[tuple[Component, int]]) -> None:
+        """Map `regions` back into room nothing else holds, one at a time on a thread of its
+        own (a unified pool's in place): nothing is evicted for them, and anything that asks
+        for memory stops them at the one in flight (`give_up`; owner, 2026-10-18)."""
+        with self._back_lock:
+            self.back.extend(regions)
+            if self.backing is not None or not self.back:
+                return
+            if self.pool is None:
+                self.backing = threading.Thread(target=self._mapping_back, daemon=True)
+                self.backing.start()
+                return
+        self._mapping_back()
+
+    def _mapping_back(self) -> None:
+        while True:
+            with self._back_lock:
+                if not self.back:
+                    self.backing = None
+                    return
+                component, index = self.back.popleft()
+            try:  # the lowest priority: it takes only room nothing else holds
+                ticket = self.plane.want(component.ws, self.index, [index], priority=0)
+                if component.hot:  # back in its repeating stage's kept set
+                    self.plane.prioritise(component.ws, self.index, [index], plane.HOT)
+                ticket.wait()
+            except Exception:  # no room left, or its set closed: the rest stays unmapped
+                with self._back_lock:
+                    self.back.clear()
+
+    def give_up(self) -> None:
+        """Anything that asks for memory stops the mapping back first, at the region in
+        flight: a region still queued in the plane could not be unmapped."""
+        with self._back_lock:
+            self.back.clear()
+            backing = self.backing
+        if backing is not None and backing is not threading.current_thread():
+            backing.join()
+
     def close(self, component: Component) -> None:
+        self.give_up()
         self.quiesce()
         close_cursor(component)
         if component.lease is not None:
@@ -1508,7 +1567,7 @@ class Weights:
                 component.key, self.index
             )
         stages = [row for row in held.stages if row.device == self.index]
-        copied = device.host_copy_bytes + device.bounce_copy_bytes + device.disk_copy_bytes
+        copied = device.copied
         reserved = (
             -1
             if self.host_only
@@ -3456,7 +3515,7 @@ class WeightResidency:
                     bind(weights.torch, component.common, component.lease)
         except BaseException:
             with suppress(Exception):  # the original failure is the one to report
-                self._close(local)
+                self._close(method, local)
             self._left()
             raise
         self._entered(method)
@@ -3524,6 +3583,7 @@ class WeightResidency:
 
     def _placed(self, budget: int, resume: Mapping[str, int]) -> int:
         weights = self.weights
+        weights.give_up()  # a stage asks for its weights: nothing maps back beside its plan
         memory, method = weights.memory, weights.open[-1][1]
         op = f"{method}()"
         weights.quiesce()  # a plan unmaps: other components' sets, this one's stale regions
@@ -3647,11 +3707,9 @@ class WeightResidency:
         try:
             if self.repeats.get(method, 0) > 1 and not weights.host_only:
                 # A repeating stage (a denoise step per entry) stays open for the next entry.
-                for name in local:
-                    self.components[name].last_passes = self.components[name].passes
                 self.parked = (method, local, weights.budget)
-            else:
-                self._close(local)
+            else:  # it repeated if a component of any open stage read a block again
+                self._close(method, local, any(c.cycling for _, _, c in weights.opened().values()))
             weights.drain()
             if weights.sharing is not None:
                 # Shared while resident: the next stage's plan would evict it otherwise.
@@ -3717,6 +3775,8 @@ class WeightResidency:
                 self.repeats,
             ):
                 table.pop(MAPPING, None)
+            for component in self.components.values():
+                component.cycled.pop(MAPPING, None)
         held, complete = 0, True
         for component in map(self.components.__getitem__, names):
             on = set(component.resident) | component.shared
@@ -3953,32 +4013,26 @@ class WeightResidency:
         )
 
     def restore(self) -> None:
-        """After an attempt: the components its stages placed whole and then gave to activations
-        map again (keep hot), in the background, into the room the device has now, in the order
-        the stages read them. Nothing is evicted for them; the next stage waits only for what has
-        not arrived yet. A streamed component's prefix stays where its stage left it: the next
-        request would evict it again (an 8 GB card copied 16 GB more per request)."""
+        """After an attempt: the components its stages placed whole and the resident sets of
+        repeating ones (`hot`), as far as they gave bytes to activations or a later repeating
+        stage, map again (keep hot), in the background, into the room the device has now, in the
+        order the stages read them. Nothing is evicted for them; the next stage waits only for
+        what has not arrived yet, and no stage that runs once evicts a hot set again."""
         weights = self.weights
         if weights.host_only or weights.grouped or weights.open or self.parked is not None:
             return
         weights.drain()
         weights._apply(max(weights.applied, weights.stage_budget(MAPPING)))
         weights.plan_inputs.pop(MAPPING, None)
-        whole = set(self.whole())
+        kept = {*self.whole(), *(name for name, c in self.components.items() if c.hot)}
         gone = [
             (component, index)
             for name in stage_components(self.stages, self.scopes)
-            if name in whole and (component := self.components.get(name)) is not None
+            if name in kept and (component := self.components.get(name)) is not None
             for index in component.resident
             if component.regions[index].bound is None
         ]
-        for component, index in gone:
-            try:  # the lowest priority: it takes only room nothing else holds
-                weights.plane.want(component.ws, weights.index, [index], priority=0)
-            except Exception as exc:
-                if shortage(exc) is None:
-                    raise
-                break
+        weights.map_back(gone)
         weights.limit_torch()
 
     def document(self) -> dict[str, Any]:
@@ -4029,7 +4083,19 @@ class WeightResidency:
         # machine is on the device already and is never streamed (see `_paid`).
         kept = {key: _paid(c, c.planned)[1] for key, c in components.items()}
         at = {key: {block: p for p, block in enumerate(blocks)} for key, blocks in kept.items()}
-        measured = _costs(weights, {key: (c, opened[key][1]) for key, c in components.items()})
+        held = plane.stats(weights.plane)
+        measured = _costs(held, weights.index, opened)
+        # A stage that reads a block again is cyclic whatever its method's last stage did (a
+        # denoise after a one-pass warm-up), and so is a method not run yet: it keeps a
+        # resident set. One that runs once plans, streams and fills beside the resident sets
+        # repeating stages keep (keep hot).
+        cyclic = {
+            key
+            for key, (row, tag, c) in opened.items()
+            if c.cycling or c.cycled.get(tag, True) or row.repeats.get(tag, 0) > 1
+        }
+        weights.band = plane.STREAMED if cyclic else 0
+        hot = 0 if cyclic else _hot(weights, components)
 
         def stage(
             layouts: Mapping[str, weight_policy.Layout],
@@ -4052,13 +4118,8 @@ class WeightResidency:
                     )
                     for key, cost in measured.items()
                 },
-                # A stage on its second pass is cyclic whatever its last run was (a denoise
-                # after a one-pass warm-up): placed again, it keeps a resident set.
-                cyclic={
-                    key
-                    for key, (row, tag, c) in opened.items()
-                    if c.passes > 1 or c.last_passes != 1 or row.repeats.get(tag, 0) > 1
-                },
+                cyclic=cyclic,
+                hot=hot,
             )
 
         # A component counts at its finest grain only while it can still move there.
@@ -4138,7 +4199,7 @@ class WeightResidency:
                     priority=plane.PREFIX + clock,
                 )
             )
-            if streams:
+            if streams and key in cyclic:  # the host tier holds what streams every step
                 _stage_stream(weights, component, residence, clock)
         # Every eviction so far is past: its regions leave their bindings now, before the
         # resident sets bind (a region evicted earlier and wanted again binds after this).
@@ -4149,6 +4210,12 @@ class WeightResidency:
         with aside("loading weights"), suppress(plane.error("PlaneError")):
             for ticket in arriving:
                 ticket.wait()
+        # What each stage's entries copied in, for the run's record (keep hot: a repeating
+        # stage entered again copies nothing).
+        loaded = plane.stats(weights.plane).device(weights.index).copied
+        loaded -= held.device(weights.index).copied
+        tally = f"{method}.loaded"
+        weights.modes[tally] = f"{int(weights.modes.get(tally, '0 B').split()[0]) + loaded} B"
         stream = weights.stream()
         for key, residence in placed.items():
             component = components[key]
@@ -4172,14 +4239,17 @@ class WeightResidency:
             if residence.streamed and component.observed:
                 order = component.order
                 start = order.index(resume[key]) if key in resume else 0
-                component.schedule = order[start:] + order[:start]
+                # Its ring's blocks only: a cursor holds a resident one in place until it closes,
+                # out of the ladder's reach (15 s H3 on a 4090: 17 GB pinned under a 3.2 GB op).
+                resident = set(component.resident)
+                component.schedule = [i for i in order[start:] + order[:start] if i not in resident]
                 component.cursor = weights.plane.stream(
                     component.ws,
                     weights.index,
                     component.schedule,
                     residence.window,
                     repeat=0,
-                    priority=plane.STREAMED + clock,
+                    priority=weights.band + clock,
                     tag=opened[key][1],
                     # the plane's ring holds the stored bytes; their decoded copies are
                     # counted in the budget beside it
@@ -4389,7 +4459,8 @@ class WeightResidency:
         """The block's lease: from the stage's cursor when the block is due within its window
         (an earlier departure skips ahead), else resident access or a demand fill. A demand
         fill ranks above every earlier streamed block and below the stage's prefix, so the
-        least recently used block is the one it can displace. On a group's first pass it
+        least recently used block is the one it can displace; a stage that runs once fills
+        among idle weights, below repeating stages' resident sets. On a group's first pass it
         ranks below every idle weight too: the pass streams through its own window, and other
         stages' weights stay mapped (keep hot)."""
         weights = self.weights
@@ -4397,7 +4468,7 @@ class WeightResidency:
         if component.cursor is not None and _due(component, component.cursor, index):
             lease: Lease = component.cursor.acquire(index, stream)
         else:
-            streamed = -plane.STREAMED if weights.growing else plane.STREAMED
+            streamed = -plane.STREAMED if weights.growing else weights.band
             priority = None if index in component.resident else streamed + weights.tick()
             lease = weights.plane.acquire(
                 component.ws, weights.index, index, stream, priority=priority
@@ -4526,8 +4597,9 @@ class WeightResidency:
             component.spared = True
         weights.drain()
         # Dropped regions stay mapped as the plane's idle cache until its budget leaves them
-        # no room: the plane keeps what the running component streams in, torch the rest.
-        weights._apply(min(weights.applied, max(weights.window(), weights.floor())))
+        # no room: the plane keeps what the running component streams in, torch the rest. The
+        # running one's resident set stays held: its own cut is rung 2's (`Memory._finer`).
+        weights._apply(min(weights.applied, max(weights.window(), weights.floor())), True)
         weights.memory.shrunk = True
         return max(plane.stats(weights.plane).device(weights.index).committed, 0) < before
 
@@ -4543,6 +4615,7 @@ class WeightResidency:
 
     def _observe(self, component: Component, index: int) -> None:
         """Count passes and learn the blocks' execution order from a stage's first pass."""
+        component.uses += 1
         if component.observed:
             if index == component.order[0]:
                 component.passes += 1
@@ -4564,19 +4637,23 @@ class WeightResidency:
         """Close a repeating stage left open: another stage, an attempt's end, or a budget
         change comes first."""
         if self.parked is not None:
-            local = self.parked[1]
+            method, local, _ = self.parked
             self.parked = None
-            self._close(local)
+            self._close(method, local, hot=True)
 
-    def _close(self, local: Sequence[str]) -> None:
+    def _close(self, method: str, local: Sequence[str], hot: bool = False) -> None:
         """End the stage for `local`: cursors closed, common leases released, and every region
-        at idle priority, still mapped and bound (least recently used goes first)."""
+        at idle priority, still mapped and bound (least recently used goes first). A stage that
+        repeated keeps its resident sets `hot`: above every idle weight, so a stage that runs
+        once plans beside them and never evicts them (keep hot)."""
         weights = self.weights
         idle = weights.tick()
         failure: BaseException | None = None
         for name in local:
             component = self.components[name]
-            component.last_passes = component.passes
+            # one whose blocks never ran (a LoRA read by its DiT's blocks) repeats with its stage
+            component.cycled[method] = component.cycling if component.uses else hot
+            component.uses = 0
             try:
                 close_cursor(component)
             except BaseException as exc:  # release the rest, then raise the first
@@ -4585,10 +4662,14 @@ class WeightResidency:
                 component.lease.release()
                 component.lease = None
             component.spared = False
+            component.hot = hot
             if not weights.host_only:  # host maps bind once, at load
                 for region in component.regions:
                     _drop_copies(region)
                 weights.plane.prioritise(component.ws, weights.index, None, priority=idle)
+                if hot and component.resident:
+                    kept = list(component.resident)
+                    weights.plane.prioritise(component.ws, weights.index, kept, plane.HOT + idle)
         if failure is not None:
             raise failure
 
@@ -4596,6 +4677,7 @@ class WeightResidency:
         weights = self.weights
         if weights.host_only:
             return
+        weights.give_up()
         weights.quiesce()
         for component in components:
             close_cursor(component)
@@ -4714,24 +4796,37 @@ def _unshared(component: Component) -> bool:
     return bool(set(component.resident) - component.shared - leased)
 
 
+def _hot(weights: Weights, opened: Collection[str]) -> int:
+    """Device bytes the resident sets repeating stages kept (`Component.hot`) hold outside
+    `opened`, their decoded copies with them."""
+    weights.drain()  # what was evicted is unbound
+    return sum(
+        r.span + r.decoded
+        for key, c in weights.components.items()
+        if c.hot and key not in opened
+        for kept in [set(c.resident) - c.shared]
+        for r in c.regions
+        if r.index in kept and r.bound is not None
+    )
+
+
 def _costs(
-    weights: Weights, components: Mapping[str, tuple[Component, str]]
+    held: plane.Stats, index: int, opened: Mapping[str, tuple[WeightResidency, str, Component]]
 ) -> dict[str, weight_policy.Costs]:
     """Each component's measured streaming costs for its stage's tag: GPU seconds per use of
     each block from the plane's per-region timing, and the achieved pinned-to-device rate."""
-    held = plane.stats(weights.plane)
-    device = held.device(weights.index)
+    device = held.device(index)
     # the pinned tier's rate (a ring streams from it), not blended with the page cache's
     tier_ns = device.host_copy_ns - device.mapped_copy_ns
     link = (device.host_copy_bytes - device.mapped_copy_bytes) * 1e9 / tier_ns if tier_ns else 0.0
     out: dict[str, weight_policy.Costs] = {}
-    for key, (component, tag) in components.items():
+    for key, (_, tag, component) in opened.items():
         compute = {
             component.numbers[row.region]: row.compute_ns / row.uses / 1e9
             for row in held.regions
             if row.ws == key
             and row.tag == tag
-            and row.device == weights.index
+            and row.device == index
             and row.uses
             and row.region in component.numbers
         }

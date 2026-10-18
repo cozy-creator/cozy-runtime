@@ -1667,6 +1667,32 @@ def test_an_oom_at_a_block_boundary_unmaps_weights_and_retries(card: Any) -> Non
     assert same(reference, retried)
 
 
+@on_card
+def test_an_op_short_of_memory_mid_pass_drops_the_running_stages_resident_set(card: Any) -> None:
+    """H3 15 s on a 4090 after 5 s requests: the stage's cursor held its resident set in place,
+    so a 3.2 GB op found 17 GB of weights it could not unmap. The ring holds only what it
+    streams: rung 2 drops the resident blocks no block leases, before a tensor moves to host."""
+    weights = card.weights
+    model = load(weights, card.checkpoint, "finer")
+    stack = model.residency.components["stack"]
+    x = torch.randn(8192, HIDDEN, device="cuda", dtype=torch.float16)
+    weights.set_budget(stack.layout.common + 6 * stack.layout.largest)
+    reference = run(model, x, passes=3)
+    assert stack.residence is not None and stack.residence.resident and stack.residence.streamed
+    torch.cuda.empty_cache()
+    free, _ = torch.cuda.mem_get_info()
+    ballast = torch.empty(free - (48 << 20), dtype=torch.uint8, device="cuda")
+    weights.memory.used.clear()
+    try:
+        retried = run(model, x, passes=3)  # the same stage again: its cursor carries on
+    finally:
+        del ballast
+        torch.cuda.empty_cache()
+    assert weights.memory.used.get(Rung.FINER, [0, 0])[1] > 0, weights.memory.summary()
+    assert Rung.HOST not in weights.memory.used, weights.memory.summary()
+    assert same(reference, retried)
+
+
 class Table(torch.nn.Module):  # type: ignore[misc,name-defined]
     """A component with no blocks: all of it is its common region (a text encoder's
     embedding table is most of one)."""
@@ -2270,6 +2296,97 @@ def test_a_group_gpus_denoise_keeps_a_resident_set_after_a_one_pass_warm_up(card
     kept = weights.facts().streamed["stack"].resident_blocks
     assert 0 < kept < BLOCKS, kept
     assert same(resident, denoised)
+
+
+@on_gpu
+def test_a_stage_that_runs_once_never_evicts_what_a_repeating_stage_keeps(
+    tmp_path: Path,
+) -> None:
+    """Run 10808 (H3 on an RTX 4090): the text encoder's one pass evicted the DiT's resident
+    set, and every request's denoise read it back (99 GiB paged per 5 s clip). A stage that
+    runs once streams beside a repeating stage's kept set, exactly, and the repeating stage's
+    next entry copies nothing in."""
+    weights = Weights(torch, torch.device("cuda", 0), "cuda")
+    weights.set_budget(-1, pinned=1 << 30)
+    (tmp_path / "dit").mkdir()
+    (tmp_path / "te").mkdir()
+    dit = load(weights, write_checkpoint(tmp_path / "dit")[0], "dit")
+    te = load(weights, write_checkpoint(tmp_path / "te")[0], "te")
+    denoiser, encoder = dit.residency.components["stack"], te.residency.components["stack"]
+    weights.set_budget(denoiser.layout.total + (64 << 20))  # the DiT whole, not both
+    x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
+
+    def staged(model: Any, method: str, passes: int) -> list[Any]:
+        model.residency.open_attempt()  # each a request's: entered once
+        model.residency.admit(method, ("stack",))
+        try:
+            with torch.inference_mode():
+                return [model.stack(x) for _ in range(passes)]
+        finally:
+            model.residency.release(method, ("stack",))
+
+    encoded = staged(te, "encode", 1)  # a request's first: unknown, so planned as cyclic
+    reference = staged(dit, "denoise", 3)
+    held = weights.resident_bytes(denoiser)
+    assert denoiser.residence is not None and denoiser.residence.streamed == () and held > 0
+    assert same(staged(te, "encode", 1), encoded)
+    assert encoder.residence is not None and encoder.residence.streamed
+    assert weights.resident_bytes(denoiser) == held
+    weights.modes.clear()
+    assert same(staged(dit, "denoise", 1), reference[:1])
+    assert weights.modes["denoise.loaded"] == "0 B"
+
+
+@on_gpu
+def test_a_hot_set_mapped_back_after_an_attempt_gives_way_to_any_ask(tmp_path: Path) -> None:
+    """Owner, 2026-10-18 (memory v2 §3 promotion, B1): after an attempt a repeating stage's
+    resident set maps back into free room only, evicting nothing, and gives way at once to
+    what asks: an op out of memory (the ladder's rung 1) and the machine's room ask (a budget
+    it lowers to 0). A later repeating stage (a decode) had taken part of it."""
+    weights = Weights(torch, torch.device("cuda", 0), "cuda")
+    weights.set_budget(-1, pinned=1 << 30)
+    (tmp_path / "dit").mkdir()
+    (tmp_path / "vae").mkdir()
+    dit = load(weights, write_checkpoint(tmp_path / "dit")[0], "dit")
+    vae = load(weights, write_checkpoint(tmp_path / "vae")[0], "vae")
+    denoiser, decoder = dit.residency.components["stack"], vae.residency.components["stack"]
+    whole = denoiser.layout.total
+    weights.set_budget(whole + (64 << 20))
+    x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
+
+    def staged(model: Any, method: str, passes: int) -> None:
+        model.residency.open_attempt()
+        model.residency.admit(method, ("stack",))
+        try:
+            with torch.inference_mode():
+                for _ in range(passes):
+                    model.stack(x)
+        finally:
+            model.residency.release(method, ("stack",))
+
+    staged(dit, "denoise", 3)
+    held = weights.resident_bytes(denoiser)
+    staged(vae, "decode", 3)  # repeats too: it takes what it needs of the DiT's set
+    weights.drain()
+    assert denoiser.hot and weights.resident_bytes(denoiser) < held
+    decoded = weights.resident_bytes(decoder)
+    weights.set_budget(-1)  # the room the device has now
+    dit.residency.restore()
+    if (backing := weights.backing) is not None:
+        backing.join()  # nothing asked: it all maps back
+    weights.drain()
+    back = weights.resident_bytes(denoiser)
+    assert back == held and weights.resident_bytes(decoder) == decoded
+    assert weights.memory.free_for(weights.memory.free() + (16 << 20), "an op")
+    weights.drain()
+    assert weights.resident_bytes(denoiser) < back, "an op out of memory takes it first"
+    assert weights.resident_bytes(decoder) == decoded
+    # Mapping back again, the machine's ask comes while regions are still queued in the plane,
+    # where no trim reaches them: the mapping stops at the one in flight, and nothing stays.
+    dit.residency.restore()
+    weights.set_budget(0)
+    assert weights.backing is None and not weights.back
+    assert plane.stats(weights.plane).device(0).committed == 0
 
 
 @on_gpu
