@@ -93,6 +93,10 @@ _READS: weakref.WeakKeyDictionary[Any, frozenset[Any]] = weakref.WeakKeyDictiona
 #: Each model's continuous batch (buffers and graphs), kept until the plane wants the memory.
 _ENGINES: weakref.WeakKeyDictionary[Any, _Engine] = weakref.WeakKeyDictionary()
 _ENGINES_LOCK = threading.Lock()
+#: The weight plane's paging hooks and holds are not thread-safe: in a process one decode at a
+#: time runs through them, an engine's driver for its loop or a call through Transformers' loop.
+#: Concurrent calls on one model still decode together, in its engine.
+_PLANE = threading.RLock()
 #: Batch sizes a step's graphs are recorded at: a step runs the smallest holding every row, and
 #: the largest bounds the rows an engine decodes at once (more wait for a slot).
 BUCKETS = (1, 2, 4, 8, 16)
@@ -435,7 +439,7 @@ def _transformers(
     prompt = int(inputs["input_ids"].shape[1])
     processors = [_Presence(prompt, penalty)] if penalty else []
     context = CURRENT.get()
-    with torch.inference_mode():
+    with _PLANE, torch.inference_mode():
         out = model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
@@ -1033,7 +1037,7 @@ class _Engine:
 
     def _drive(self, mine: _Request) -> None:
         try:
-            with ExitStack() as stack:
+            with _PLANE, ExitStack() as stack:
                 held = self._hold(stack)
                 while True:
                     if self.rehold:  # another head: its blocks are held instead

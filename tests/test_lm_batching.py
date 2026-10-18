@@ -166,3 +166,58 @@ def test_a_cancelled_call_stops_decoding_and_raises_its_cancellation() -> None:
     want = _reference(model, ids, 12, 0.0)
     got = lm.generate(model, inputs, max_new_tokens=12, stop=STOP, pad=0)
     assert torch.equal(got, want)
+
+
+def test_decodes_run_through_the_weight_plane_one_at_a_time() -> None:
+    """The plane's paging hooks are not thread-safe: calls through Transformers' loop and an
+    engine's driver on another model never run a block at the same time, and each keeps the
+    tokens it decodes alone."""
+    torch.manual_seed(5)
+    batched, looped = _qwen3(), _qwen3()
+    looped.generation_config.repetition_penalty = 1.3  # lm decodes it through Transformers
+    inside, most, count = [0], [0], threading.Lock()
+
+    def enter(*_: Any) -> None:
+        with count:
+            inside[0] += 1
+            most[0] = max(most[0], inside[0])
+
+    def leave(*_: Any) -> None:
+        with count:
+            inside[0] -= 1
+
+    for model in (batched, looped):
+        for layer in model.model.layers:
+            layer.register_forward_pre_hook(enter)
+            layer.register_forward_hook(leave)
+    calls = [
+        (model, torch.randint(10, 44, (1, prompt), device=DEVICE), new)
+        for model, prompt, new in [
+            (batched, 30, 40),
+            (batched, 90, 25),
+            (looped, 40, 30),
+            (looped, 12, 35),
+            (looped, 70, 20),
+        ]
+    ]
+    wants = [
+        lm.generate(model, {"input_ids": ids}, max_new_tokens=new, stop=STOP, pad=0)
+        for model, ids, new in calls
+    ]
+    most[0] = 0
+    got: list[Any] = [None] * len(calls)
+    start = threading.Barrier(len(calls))
+
+    def run(i: int) -> None:
+        model, ids, new = calls[i]
+        start.wait()
+        got[i] = lm.generate(model, {"input_ids": ids}, max_new_tokens=new, stop=STOP, pad=0)
+
+    threads = [threading.Thread(target=run, args=(i,)) for i in range(len(calls))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert most[0] == 1
+    for g, want in zip(got, wants, strict=True):
+        assert torch.equal(g, want)
