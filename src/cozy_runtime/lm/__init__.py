@@ -43,6 +43,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from typing import Any
 
+from cozy_runtime.author._context import CURRENT, Context
 from cozy_runtime.author._model import LANDED, PLACED, RELEASERS, WARNINGS, Building
 from cozy_runtime.author.kernels import KernelsUnavailable, Launch, Plan, TritonKernels
 from cozy_runtime.graphs import BYPASS, ROOM, capture, say
@@ -52,7 +53,7 @@ try:
     import torch
     from torch.overrides import TorchFunctionMode
     from torch.utils._python_dispatch import _disable_current_modes
-    from transformers import LogitsProcessorList
+    from transformers import LogitsProcessorList, StoppingCriteria, StoppingCriteriaList
     from transformers.cache_utils import (
         Cache,
         LinearAttentionLayer,
@@ -61,7 +62,7 @@ try:
     )
 except ImportError as _absent:  # pragma: no cover - the base package has neither
     ABSENT = f"torch and transformers do not import ({_absent})"
-    StaticLayer = LinearAttentionLayer = Cache = TorchFunctionMode = object
+    StaticLayer = LinearAttentionLayer = Cache = TorchFunctionMode = StoppingCriteria = object
 else:
     ABSENT = ""
 
@@ -433,6 +434,7 @@ def _transformers(
 ) -> Any:
     prompt = int(inputs["input_ids"].shape[1])
     processors = [_Presence(prompt, penalty)] if penalty else []
+    context = CURRENT.get()
     with torch.inference_mode():
         out = model.generate(
             **inputs,
@@ -441,8 +443,20 @@ def _transformers(
             eos_token_id=stops,
             pad_token_id=pad,
             logits_processor=LogitsProcessorList(processors),
+            stopping_criteria=StoppingCriteriaList([_Cancel(context)] if context else []),
         )
     return out[:, prompt:]
+
+
+class _Cancel(StoppingCriteria):  # type: ignore[misc]
+    """Transformers' loop raises the attempt's cancellation between tokens."""
+
+    def __init__(self, context: Context) -> None:
+        self.context = context
+
+    def __call__(self, input_ids: Any, scores: Any, **kwargs: Any) -> Any:
+        self.context.raise_if_cancelled()
+        return torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
 
 
 def window(length: int, capacity: int) -> int:
@@ -849,10 +863,17 @@ class _Request:
         self.at: tuple[float, ...] = (0, 0.0, 0)
         self.steps = self.live = 0
         self.warnings: list[tuple[str, dict[str, Any]]] = []
+        #: the attempt it serves (cancellation), and whether its rows left for it
+        self.context: Context | None = CURRENT.get()
+        self.cut = False
 
     @property
     def finished(self) -> bool:
-        return self.left == 0 or self.error is not None or bool(self.fallback)
+        return self.left == 0 or self.error is not None or bool(self.fallback) or self.cut
+
+    @property
+    def cancelled(self) -> bool:
+        return self.context is not None and self.context.cancelled
 
     def result(self) -> Any:
         width = max(int(t.shape[0]) for t in self.tokens)
@@ -944,6 +965,8 @@ class _Engine:
             self._drive(request)
         for warning in request.warnings:
             WARNINGS.append(warning)
+        if request.cut and request.context is not None:
+            request.context.raise_if_cancelled()
         if request.error is not None:
             raise request.error
         if request.fallback:
@@ -1032,6 +1055,13 @@ class _Engine:
                     if occupied and held is None:  # the first loop records what a step reads
                         self._record()
                         held = self._hold(stack)
+                        if held is False and self.draft is not None:  # the rows go on undrafted
+                            self.unfit.add(id(self.draft))
+                            self.draft = None
+                            stack.close()
+                            held = self._hold(stack)
+                        if held is False:  # never step through the paging hooks
+                            self._fail(None, "its decode set does not fit at home")
                     elif occupied:
                         self._steps()
         except torch.OutOfMemoryError as exc:
@@ -1094,10 +1124,14 @@ class _Engine:
             with _disable_current_modes():
                 self._one(self._bucket(), lambda size: self._advance(size))
                 if self.cache_device.type == "cuda":
-                    torch.cuda.synchronize()
+                    torch.cuda.current_stream().synchronize()
         for m, (residency, name) in targets:
             _READS[m] = frozenset(reads[id(residency)].get(name, ()))
         self.retire = True
+
+    def _cancelled(self) -> bool:
+        """Whether a held row's call was cancelled: the host stops queueing steps for it."""
+        return any(row.request.cancelled for row in self.slots if row is not None)
 
     def _occupied(self) -> int:
         return sum(row is not None for row in self.slots)
@@ -1123,7 +1157,7 @@ class _Engine:
         if self.cache is not None:
             with _disable_current_modes():
                 if self.cache_device.type == "cuda":
-                    torch.cuda.synchronize()
+                    torch.cuda.current_stream().synchronize()
                 self._retire()
                 self.flag.zero_()
         self.retire = False
@@ -1131,6 +1165,9 @@ class _Engine:
         admitted = False
         started = time.perf_counter()
         for request in incoming:
+            if request.cancelled:
+                request.cut = True
+                continue
             # One call joins at a time while rows decode: their tokens keep coming meanwhile.
             if waiting or (admitted and self._occupied()):
                 waiting.append(request)
@@ -1158,9 +1195,10 @@ class _Engine:
         n = self.n.tolist()
         done = self.done.tolist()
         for slot, row in enumerate(self.slots):
-            if row is None or not done[slot]:
+            if row is None or not (done[slot] or row.request.cancelled):
                 continue
             request = row.request
+            request.cut = request.cut or request.cancelled
             request.tokens[row.row] = self.out[slot, : n[slot]].clone()
             request.left -= 1
             request.ended = time.perf_counter()
@@ -1499,7 +1537,7 @@ class _Engine:
             while True:
                 self._one(size, lambda size: self._replay(size, cuda))
                 if not cuda:
-                    if bool(self.flag[:size].any()) or joining():
+                    if bool(self.flag[:size].any()) or joining() or self._cancelled():
                         break
                     continue
                 event = torch.cuda.Event()
@@ -1507,7 +1545,7 @@ class _Engine:
                 queued.append(event)
                 if len(queued) > LAG:
                     queued.popleft().synchronize()
-                    if bool(self.flag[:size].any()) or joining():
+                    if bool(self.flag[:size].any()) or joining() or self._cancelled():
                         break
             if cuda:
                 torch.cuda.current_stream().synchronize()

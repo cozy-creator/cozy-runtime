@@ -17,6 +17,7 @@ import hashlib
 import random
 import time
 from collections.abc import Callable, Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, final
 
@@ -191,3 +192,8 @@ class Context:
             raise DeadlineExceeded(f"attempt {self.request_id} outlived its deadline")
         if self._cancel():
             raise Cancelled(f"attempt {self.request_id} was cancelled")
+
+
+#: The running attempt's `Context`, for Runtime code a handler calls without one (`lm`): its
+#: long loops answer cancellation as the handler would.
+CURRENT: ContextVar[Context | None] = ContextVar("cozy_attempt_context", default=None)

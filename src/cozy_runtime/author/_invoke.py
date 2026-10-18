@@ -47,7 +47,7 @@ from cozy_runtime.author._assets import (
     field_preparation,
 )
 from cozy_runtime.author._calls import ChildCallError, _Broker, _current
-from cozy_runtime.author._context import AdapterRef, Context, Device
+from cozy_runtime.author._context import CURRENT, AdapterRef, Context, Device
 from cozy_runtime.author._decode import (
     AudioProbe,
     VideoProbe,
@@ -359,7 +359,7 @@ def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> Invoc
     attempt.entered = True
     if inv.calls is not None:
         inv.calls.bind(ctx, Telemetry(record, ctx), record.media)
-    token = _current.set(inv.calls)
+    token, context = _current.set(inv.calls), CURRENT.set(ctx)
     try:
         result = _call(surface, kwargs, inv.activity)
         if inv.calls is not None:
@@ -367,6 +367,7 @@ def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> Invoc
     finally:
         if inv.calls is not None:
             inv.calls.close()
+        CURRENT.reset(context)
         _current.reset(token)
         handles.close()
 
