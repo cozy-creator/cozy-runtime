@@ -696,6 +696,19 @@ def memory_class(kind: str) -> Literal["discrete", "unified"]:
     return "unified" if kind == "mps" else "discrete"
 
 
+#: torch's own MPS high watermark, as a fraction of Metal's recommended working set
+MPS_WATERMARK = 1.7
+
+
+def hold_pool(torch: ModuleType, cap: int) -> None:
+    """Hold MPS's allocator, which also holds a unified plane's regions, to an owner's cap of
+    `cap` bytes; -1 gives torch its own watermark back (past the budget the system pages)."""
+    recommended = max(int(torch.mps.recommended_max_memory()), 1)
+    torch.mps.set_per_process_memory_fraction(
+        min(cap / recommended, 2.0) if cap >= 0 else MPS_WATERMARK
+    )
+
+
 def unified_budget(torch: ModuleType) -> int:
     """The bytes one unified-memory process may hold: Metal's recommended working set, within
     physical RAM less what the system keeps, and within what it holds plus what the system has
