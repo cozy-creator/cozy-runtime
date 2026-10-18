@@ -1742,10 +1742,11 @@ def _unbound_type(torch: ModuleType) -> type:
                 raise _unbound_read(str(func), "the op writes into the weight")
             with cls.reading(standins, str(func)) as read:
                 return read.kept(
+                    torch,
                     func(
                         *(read.operand(v) for v in args),
                         **{k: read.operand(v) for k, v in kwargs.items()},
-                    )
+                    ),
                 )
 
     return Unbound
@@ -1770,17 +1771,23 @@ class Read:
             return type(value)(self.real.get(id(item), item) for item in value)
         return self.real.get(id(value), value)
 
-    def kept(self, out: object) -> object:
-        """The op's result, without a view into bytes that leave with the op's leases."""
+    def kept(self, torch: ModuleType, out: object) -> object:
+        """The op's result, without a view into bytes that leave with the op's leases. The
+        copy is made outside inference mode: it stands for a view of the stand-in, and torch
+        refuses an inference tensor as the view of a normal one ('Cannot set version_counter
+        for inference tensor', runs 11026 and 11034)."""
         if isinstance(out, (tuple, list)):
-            return type(out)(self.kept(item) for item in out)
+            return type(out)(self.kept(torch, item) for item in out)
         viewed = any(
             a <= int(tensor.data_ptr()) < b
             for tensor in spill.stored((out,))
             if (tensor.is_cuda or tensor.is_mps) and tensor.numel()
             for a, b in self.spans
         )
-        return cast("Tensor", out).clone() if viewed else out
+        if not viewed:
+            return out
+        with torch.inference_mode(False):
+            return cast("Tensor", out).clone()
 
 
 #: the CUDA planes of this process, which torch's one out-of-memory observer answers for
