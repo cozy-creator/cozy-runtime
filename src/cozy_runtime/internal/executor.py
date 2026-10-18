@@ -65,7 +65,6 @@ from typing import Any
 
 import msgspec
 from msgspec import UNSET, UnsetType
-from tensorfs.derived import SourceCapability
 
 from cozy_runtime import __version__ as RUNTIME_VERSION
 from cozy_runtime import graphs
@@ -207,6 +206,14 @@ from cozy_runtime.internal.executor_commands import (
     Unload,
 )
 from cozy_runtime.internal.exits import Exit
+from cozy_runtime.internal.fill import (
+    HEADER,
+    Checkpoint,
+    FillRefusal,
+    dtype_name,
+    normalized,
+    tensor_schema_of,
+)
 from cozy_runtime.internal.lora_composition import bind as bind_adapters
 from cozy_runtime.internal.lora_contract import read as read_adapter_graph
 from cozy_runtime.internal.model_values import read_values_into
@@ -247,6 +254,7 @@ from cozy_runtime.internal.weights import (
     journaling,
 )
 from cozy_runtime.internal.weights_writer import ExecutionStorage
+from cozy_runtime.tensord_channels import Source
 
 if sys.platform == "win32":
     from ctypes import wintypes
@@ -1650,7 +1658,7 @@ class Executor:
             # and warmup run while the weights download. Never in an import-only parent: a
             # channel's reader thread would leave it unforkable.
             self.fetch.begin()
-            self.fetch.schedule(fetch_plan.at_start(eager, lambda m: self._model_source(m, "")))
+            self.fetch.schedule(fetch_plan.at_start(eager, lambda m: self._checkpoint(m).ck))
         started = time.perf_counter()
         stages: list[tuple[str, float]] = []
         _mark = [started]
@@ -2363,7 +2371,6 @@ class Executor:
         from cozy_runtime.author._model import component_use
         from cozy_runtime.internal.derive import Observations, serving_substrate
         from cozy_runtime.internal.encoding import launch_providers, measure_device, measure_runtime
-        from cozy_runtime.internal.fill import Checkpoint, FillRefusal, dtype_name, tensor_schema_of
         from cozy_runtime.internal.planfacts import PlanFacts
         from cozy_runtime.internal.qualification import qualified
         from cozy_runtime.internal.resolution import (
@@ -2459,17 +2466,11 @@ class Executor:
         )
         vmap = reference.snapshot_map()
         host = self.host
-
-        def sourced(manifest: str) -> Callable[[str], bytes]:
-            """Read actual header/asset bytes supplied by TensorD (`ModelSource`).
-            A follower uses rank 0's relay; this executor opens no Store."""
-            return lambda name: host._model_source(manifest, name)
-
-        # One Checkpoint per manifest: each opens and parses the whole header (SDXL's four
-        # components share one, 2,641 rows).
+        # One Checkpoint per manifest, its header and files read through TensorD
+        # (`ModelSource`; a follower asks through rank 0): SDXL's four components share one.
         opened: dict[str, Checkpoint] = {}
         for manifest in {vmap.get(name, reference.snapshot) for name in names}:
-            opened[manifest] = Checkpoint(manifest, sourced=sourced(manifest))
+            opened[manifest] = host._checkpoint(manifest)
         checkpoints = {name: opened[vmap.get(name, reference.snapshot)] for name in names}
         # `names` is what the DERIVE constructed (model-code-fit D9), not what the header
         # carries: a constructed component the checkpoint lacks is the fit's own
@@ -2517,8 +2518,8 @@ class Executor:
                 if checkpoint.manifest_id == reference.snapshot
             ),
             None,
-        ) or Checkpoint(reference.snapshot, sourced=sourced(reference.snapshot))
-        config_bytes = model_config.construction_config(config_checkpoint.header.get("configs"))
+        ) or host._checkpoint(reference.snapshot)
+        config_bytes = model_config.construction_config(config_checkpoint.configs())
         config_document = canonical.parse_canonical(config_bytes)
         if not isinstance(config_document, dict):
             raise RuntimeError("the CozyTensors construction config is not an object")
@@ -2674,12 +2675,12 @@ class Executor:
             # CUSTODY is a BINDING fact: canonical refuses a serve-time extra key, local
             # tiers it (§1.1).
             custody=binding.custody,
-            unnormalized=model_config.unnormalized(config_checkpoint.header.get("configs")),
+            unnormalized=normalized(config_checkpoint),
         )
         adapter_graphs = [
-            (checkpoint.manifest_id, data)
+            (checkpoint.manifest_id, checkpoint.file(model_config.ADAPTERS))
             for checkpoint in checkpoints.values()
-            if (data := model_config.adapter_graph(checkpoint.header.get("configs")))
+            if model_config.ADAPTERS in checkpoint.files
         ]
         if adapter_graphs:
             manifest, data = adapter_graphs[0]
@@ -2774,8 +2775,17 @@ class Executor:
         stage_memo.install(
             model,
             torch=torch,
-            headers={name: checkpoints[name].header for name in present},
-            assets=config_checkpoint.header,
+            headers={
+                name: {
+                    "components": {name: checkpoints[name].table(name)},
+                    "configs": checkpoints[name].configs(),
+                }
+                for name in present
+            },
+            assets={
+                "assets": {path: config_checkpoint.file(path) for path in config_checkpoint.files},
+                "configs": config_checkpoint.configs(),
+            },
             plan_rows=({**row.identity(), "component": row.component} for row in plan.tensors),
             adapters=(msgspec.to_builtins(row) for row in binding.adapters),
             roots=roots,
@@ -3575,7 +3585,7 @@ class Executor:
                             ),
                             max_output_bytes=command.max_output_bytes,
                             sources=sources,
-                            weights_values=read_values_into,
+                            weights_values=functools.partial(read_values_into, self.torch),
                             tensorfs_source=self._sources(storage, command) if sources else None,
                             tensorfs_output=storage.open_output if command.weights else None,
                             tensorfs_adopt=storage.adopt_model if command.weights else None,
@@ -4326,9 +4336,7 @@ class Executor:
                 | {"stage_fraction": fraction, "advance": 0}
             )
 
-    def _sources(
-        self, storage: ExecutionStorage, command: Invoke
-    ) -> Callable[[str], SourceCapability]:
+    def _sources(self, storage: ExecutionStorage, command: Invoke) -> Callable[[str], Source]:
         """The attempt's `Weights[M]` sources, each wanting its declared components ahead of
         its reads on the attempt's fetch channel."""
         host = self.host
@@ -4340,12 +4348,11 @@ class Executor:
                 *host.source_components.get(path, ()),
             )
 
-        def opened(manifest: str) -> SourceCapability:
-            capability = storage.source(manifest)
+        def opened(manifest: str) -> Source:
+            source = storage.source(manifest)
             if host.fetch is None or not host.fetch.available():
-                return capability
-            header = host._model_source(manifest, "")
-            return fetch_plan.source(host.fetch, capability, header, declared.get(manifest, ()))
+                return source
+            return fetch_plan.source(host.fetch, source, declared.get(manifest, ()))
 
         return opened
 
@@ -4446,6 +4453,16 @@ class Executor:
                 os.close(fd)
             return []
         return [(sha, length, fd) for (sha, length), fd in zip(objects, answer.fds, strict=True)]
+
+    def _checkpoint(self, manifest: str) -> Checkpoint:
+        """A selected checkpoint's header through TensorD (`ModelSource`). Only the header is
+        known: cozytensors/2 lists a checkpoint's files in its manifest, which `ModelSource`
+        does not serve."""
+        return Checkpoint.granted(
+            manifest,
+            (HEADER,),
+            lambda path: self._model_source(manifest, "" if path == HEADER else path),
+        )
 
     def _device_room(self, free_bytes: int) -> None:
         """Ask the worker for `free_bytes` free on this GPU from its other tenants; it answers

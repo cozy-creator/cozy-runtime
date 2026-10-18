@@ -21,8 +21,7 @@ if sys.platform == "linux":
     import fcntl
 
 if TYPE_CHECKING:
-    from tensorfs import ReadLease, Store
-    from tensorfs.varena import Plane, Source
+    from tensorfs.varena import Plane
 
 #: The executor capability TensorD negotiates on (`hello.memory`).
 CAPABILITY = "weight_plane/1"
@@ -205,11 +204,6 @@ def open_plane(device: int | None) -> Plane:
         return opened
     except _plane.PlaneError as exc:  # no CUDA driver here (CPU or MPS executor)
         raise Unavailable(f"the weight plane cannot open device {device}: {exc}") from exc
-
-
-def source(plane: Plane, store: Store, lease: ReadLease) -> Source:
-    """One manifest's read source, shared by its components' weight sets; consumes `lease`."""
-    return plane.source(store, lease)
 
 
 def stats(plane: Plane) -> Stats:

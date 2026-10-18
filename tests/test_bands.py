@@ -403,7 +403,7 @@ def test_an_encoded_linear_out_of_memory_runs_in_rows(operand: str) -> None:
     encoded = encode_int8_convrot256("w", w.numpy())
     data = torch.frombuffer(bytearray(encoded.payload), dtype=torch.int8).view(48, 256)
     scale = torch.frombuffer(bytearray(encoded.companions[0].raw), dtype=torch.float32)
-    roles = {"data": data, "scale": scale}
+    roles = {"weight": data, "scale": scale}
     leaf = _native_leaf_class(torch)(
         None, roles, torch.randn(48), torch.float32, INT8_CONVROT, "int8", 256, 48
     )

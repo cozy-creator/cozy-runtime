@@ -14,7 +14,7 @@ class Streamed(msgspec.Struct, frozen=True, kw_only=True):
 
 
 class PlaneFacts(msgspec.Struct, frozen=True, kw_only=True):
-    """The executor's weight plane (`weight_plane/1`), as exact counters. Bytes are per device
+    """The executor's weight plane, as exact counters. Bytes are per device
     of this rank; `-1` is unreadable, never zero."""
 
     budget_bytes: int = -1
@@ -27,7 +27,7 @@ class PlaneFacts(msgspec.Struct, frozen=True, kw_only=True):
     #: torch's reserved bytes, and the process's device bytes (context + reserved + mapped)
     reserved_bytes: int = -1
     process_bytes: int = -1
-    #: the owner's process cap in force (`process_cap/1`); -1: none
+    #: the owner's process cap in force; -1: none
     cap_bytes: int = -1
     #: torch's peak above its bytes at the attempt's start: activations and derived weights
     activation_peak_bytes: int = -1
@@ -51,7 +51,7 @@ class PlaneFacts(msgspec.Struct, frozen=True, kw_only=True):
     #: allocated, the plane's committed and the bound weights' decoded copies, the stage's
     #: activation growth and the budget that came out (`Weights.driver_budget`)
     plan_inputs: dict[str, dict[str, int]] = {}
-    #: GPU regions mapped from the machine's custody (`weights.attach/1`): outside
+    #: GPU regions mapped from the machine's custody: outside
     #: `committed_bytes`, counted once by the machine
     shared_bytes: int = 0
     #: bytes this executor process read from storage since it started (`/proc/self/io`;

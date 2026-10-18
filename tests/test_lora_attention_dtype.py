@@ -38,8 +38,8 @@ def test_peft_attention_contract_tracks_actual_encoded_replacement(factor_dtype:
 
     payload = torch.full((4, 4), 4, dtype=torch.float8_e4m3fn)
     scale = torch.full((4,), 0.25, dtype=torch.float32)
-    native = RowwiseNativeLeaf("fp8-rowwise/1").leaf(
-        torch, {"data": payload, "scale": scale}, base, torch.bfloat16
+    native = RowwiseNativeLeaf().leaf(
+        torch, {"weight": payload, "scale": scale}, base, torch.bfloat16
     )
     adapted.base_layer = native
     operands = torch.ones(2, 4, dtype=torch.bfloat16)

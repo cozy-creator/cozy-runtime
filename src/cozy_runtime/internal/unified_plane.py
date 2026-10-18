@@ -1,5 +1,5 @@
 """The weight plane of the unified memory class (design §6.2): one pool, so the host tier is the
-OS page cache of the store's objects, and a resident region is one device tensor read from it.
+OS page cache of a checkpoint's chunks, and a resident region is one device tensor read from it.
 
 It speaks `tensorfs.varena`'s contract (`crates/varena/API.md`) for the calls Runtime
 makes, so `weights.py`'s residency, paging and out-of-memory recovery run unchanged on Apple
@@ -18,19 +18,32 @@ from collections import deque
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from types import ModuleType
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol, TypedDict
 
-import tensorfs
-from tensorfs import ReadLease, ReadPlan, Store
 from tensorfs import varena as _plane
 
 from cozy_runtime.internal import spill
 
 if TYPE_CHECKING:
     from tensorfs.varena import Part, Region, Trim
-    from tensorfs.records import Header, ReadItem
     from torch import Tensor
     from torch import device as Device
+
+
+class ReadItem(TypedDict):
+    """One run of a part's bytes: where it lands in the part, and the chunk range it is."""
+
+    what: str
+    dest_off: int
+    len: int
+    object: str
+    object_length: int
+    off: int
+
+
+class ReadPlan(Protocol):
+    def items(self) -> list[ReadItem]: ...
+
 
 #: `stats()` and an event, as `tensorfs.varena` spells them (Runtime reads them typed)
 type Facts = dict[str, object]
@@ -44,55 +57,15 @@ def _aligned(n: int) -> int:
 
 
 class _Source:
-    """Bytes of the plan's rows: objects by digest, inline parts from the parsed header."""
+    """A checkpoint's chunk files, mapped read-only: their pages are the host tier."""
 
-    def __init__(self, header: Header) -> None:
-        self.components = header["components"]
-
-    def object(self, row: ReadItem, into: memoryview) -> None:
-        raise NotImplementedError
-
-    def read(self, row: ReadItem, within: int, into: memoryview) -> None:
-        if row["source"] == "object":
-            self.object(row, into)
-            return
-        component, _, rest = row["what"].partition("/")
-        key, _, role = rest.rpartition("#")
-        inline = self.components[component][key]["parts"][role]["inline"]  # type: ignore[typeddict-item]
-        into[:] = inline[within : within + row["len"]]
-
-    def close(self) -> None:
-        pass
-
-
-class _LeaseSource(_Source):
-    """An explicitly opened Store's read lease (standalone use)."""
-
-    def __init__(self, store: Store, lease: ReadLease) -> None:
-        header = store.manifest(lease.manifest)["header"]
-        if header is None:
-            raise _plane.Invalid(f"{lease.manifest} has no cozytensors header")
-        super().__init__(tensorfs.parse_header(header))
-        self.lease = lease
-
-    def object(self, row: ReadItem, into: memoryview) -> None:
-        self.lease.read_into(row["object"], row["object_length"], row["off"], row["len"], into)
-
-    def close(self) -> None:
-        self.lease.release()
-
-
-class _FileSource(_Source):
-    """The machine's verified object files, mapped read-only: their pages are the host tier."""
-
-    def __init__(self, files: Iterable[tuple[str, int, int]], header: Header) -> None:
-        super().__init__(header)
+    def __init__(self, files: Iterable[tuple[str, int, int]]) -> None:
         self.maps = {
             sha.removeprefix("sha256:"): mmap.mmap(fd, length, access=mmap.ACCESS_READ)
             for sha, length, fd in files
         }
 
-    def object(self, row: ReadItem, into: memoryview) -> None:
+    def read(self, row: ReadItem, within: int, into: memoryview) -> None:
         mapped = self.maps[row["object"].removeprefix("sha256:")]
         with memoryview(mapped) as view:
             into[:] = view[row["off"] : row["off"] + row["len"]]
@@ -269,13 +242,10 @@ class UnifiedPlane:
 
     # -- sources and weight sets
 
-    def source(self, store: Store, lease: ReadLease) -> _Source:
-        return _LeaseSource(store, lease)
-
-    def files_source(self, files: Iterable[tuple[str, int, int]], header: Header) -> _Source:
-        """The machine's verified object files (`(sha256, length, fd)`; the caller keeps the
-        fds, the maps are this plane's) and the checkpoint's parsed header."""
-        return _FileSource(files, header)
+    def files_source(self, files: Iterable[tuple[str, int, int]]) -> _Source:
+        """A checkpoint's chunk files (`(sha256, length, fd)`; the caller keeps the fds, the
+        maps are this plane's)."""
+        return _Source(files)
 
     def register(
         self,

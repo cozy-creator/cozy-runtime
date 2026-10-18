@@ -239,9 +239,7 @@ def test_a_shared_operand_gives_the_leaf_its_own_bits_and_hooks_the_tensor() -> 
     weight = torch.randn(128, 64, dtype=torch.bfloat16) * 0.1
     data, scale = eager_quantize(torch, weight)
     linear = torch.nn.Linear(64, 128, bias=False, dtype=torch.bfloat16)
-    leaf = RowwiseNativeLeaf("fp8-rowwise/1").leaf(
-        torch, {"data": data, "scale": scale}, linear, torch.bfloat16
-    )
+    leaf = RowwiseNativeLeaf().leaf(torch, {"weight": data, "scale": scale}, linear, torch.bfloat16)
     seen: list[Any] = []
     leaf.register_forward_hook(lambda _module, args, _out: seen.append(args[0]))
     hidden = torch.randn(1, 5, 64, dtype=torch.bfloat16)

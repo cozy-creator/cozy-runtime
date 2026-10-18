@@ -7,7 +7,7 @@ stages again) and writes what it applied, then `done = asked`. Only the Worker w
 first two words and only the executor the last two, each in that order, so a reader that
 sees the counter has the value it guards.
 
-A `wanted` at or below `CAP` asks for a process cap instead (`process_cap/1`): `CAP - wanted`
+A `wanted` at or below `CAP` asks for a process cap instead: `CAP - wanted`
 bytes for the whole process, its plane re-placed inside it. Only an owner that read the
 capability writes one.
 """

@@ -1,4 +1,5 @@
-"""Installed full TensorFS gives a function no output authority: the attempt's grant does."""
+"""Installed full TensorFS gives a function no output authority: the attempt's grant does, and a
+granted output is opened by TensorD's writer, never by the executor."""
 
 from __future__ import annotations
 
@@ -18,13 +19,14 @@ def test_storage_comes_from_the_attempts_grant_and_refuses_only_when_used(
     tmp_path: Path, granted: bool
 ) -> None:
     # The regression was hidden by reduced builds: prove Store is actually installed.
-    tensorfs.Store.init(tmp_path / "store")
+    tensorfs.Store(tmp_path / "store")
     project = tmp_path / "project"
     project.mkdir()
     (project / "package.toml").write_text('[application]\nobject="storage_grant_fn:app"\n')
     (project / "storage_grant_fn.py").write_text("""
 import msgspec
 from cozy_runtime.author import App, CapabilityError, Context, WeightsOutput
+from cozy_runtime.tensord_channels import Derivation
 app = App()
 class Request(msgspec.Struct):
     use_output: bool
@@ -35,7 +37,7 @@ def compute(payload: Request, ctx: Context) -> Result:
     if not payload.use_output:
         return Result("no-storage-needed")
     try:
-        ctx.output("model")
+        ctx.output("model", Derivation(None))
     except CapabilityError as exc:
         return Result(exc.code)
     return Result("granted")
@@ -53,9 +55,10 @@ def compute(payload: Request, ctx: Context) -> Result:
             expected = (
                 "no-storage-needed"
                 if not use_output
-                else "granted"
+                else "no_durable_exchange"  # this harness answers no TensorD request
                 if granted
                 else "weights_output_ungranted"
             )
             assert json.loads((spool / RESULT_DOCUMENT).read_bytes()) == {"code": expected}
-    assert not any(frame.get("kind") == "weights_writer" for frame in host.frames)
+    writer = [f for f in host.frames if f.get("kind") == "weights_writer"]
+    assert [f["operation"] for f in writer] == (["output"] if granted else [])

@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from types import ModuleType
 from typing import IO, TYPE_CHECKING, Literal
@@ -357,11 +358,15 @@ def _finish(torch: ModuleType, tensor: Tensor, stats: Stats | None, began: float
     stats.seconds += time.perf_counter() - began
 
 
-def bakeable(roles: dict[str, str]) -> bool:
-    """Whether a stored weight (role -> TensorFS dtype) takes `bake`."""
-    if set(roles) == {"value"}:
-        return roles["value"] in ("bf16", "f16", "f32")
-    return roles in ({"data": "i8", "scale": "f32"}, {"data": "f8_e4m3fn", "scale": "f32"})
+def bakeable(scheme: str, params: Mapping[str, object], roles: Mapping[str, str]) -> bool:
+    """Whether a stored weight (its scheme, params and role -> dtype) takes `bake`: a plain
+    float, a per-row `fp8-rowwise` E4M3 or an `int8-convrot` weight. `int8-rowwise` stores the
+    same parts as `int8-convrot` and is not rotated, so the scheme decides, not the parts."""
+    if scheme == "plain":
+        return dict(roles) in ({"value": "bf16"}, {"value": "f16"}, {"value": "f32"})
+    if scheme == "fp8-rowwise":
+        return params.get("axis") == 0 and dict(roles) == {"weight": "f8_e4m3fn", "scale": "f32"}
+    return scheme == "int8-convrot" and dict(roles) == {"weight": "i8", "scale": "f32"}
 
 
 def bake(
@@ -390,10 +395,10 @@ def bake(
         bake_plain(
             torch, weight, down, up, 1.0, rounding=rounding, generator=generator, stats=stats
         )
-    elif stored["data"].dtype == torch.int8:
+    elif stored["weight"].dtype == torch.int8:
         bake_int8_convrot(
             torch,
-            stored["data"],
+            stored["weight"],
             stored["scale"],
             down,
             up,
@@ -405,7 +410,7 @@ def bake(
     else:
         bake_rowwise(
             torch,
-            stored["data"],
+            stored["weight"],
             stored["scale"],
             down,
             up,
@@ -458,11 +463,11 @@ def fused(
     if "value" in stored:
         data = scale = stored["value"]
         kind = {torch.bfloat16: BF16, torch.float16: F16, torch.float32: F32}[data.dtype]
-    elif stored["data"].dtype == torch.int8:
-        data, scale, kind = stored["data"], stored["scale"].reshape(-1), INT8
+    elif stored["weight"].dtype == torch.int8:
+        data, scale, kind = stored["weight"], stored["scale"].reshape(-1), INT8
         down = rotate_factor(torch, down)
     else:
-        data, scale, kind = stored["data"].view(torch.uint8), stored["scale"].reshape(-1), ROWWISE
+        data, scale, kind = stored["weight"].view(torch.uint8), stored["scale"].reshape(-1), ROWWISE
     if not data.is_contiguous():
         raise ValueError("a fused bake writes a contiguous [out, in] weight")
     rows, cols = data.shape
@@ -532,7 +537,7 @@ def check(torch: ModuleType, device: Device) -> None:
     for kind in (BF16, F16, F32, ROWWISE):
         if kind == ROWWISE:
             data = torch.full((rows, cols), 0.5, device=device).to(torch.float8_e4m3fn)
-            stored = {"data": data, "scale": torch.full((rows,), 0.5, device=device)}
+            stored = {"weight": data, "scale": torch.full((rows,), 0.5, device=device)}
         else:
             dtype = (torch.bfloat16, torch.float16, torch.float32)[kind]
             stored = {"value": torch.full((rows, cols), 0.25, dtype=dtype, device=device)}
@@ -544,7 +549,7 @@ def check(torch: ModuleType, device: Device) -> None:
     # int8 of rotated rows: 2 + 24 * +-1/48 / 0.5 is 3 or 1 (the regular Hadamard keeps a
     # constant row), over partial row tiles and two inner steps.
     data = torch.full((rows, 256), 2, dtype=torch.int8, device=device)
-    stored = {"data": data, "scale": torch.full((rows,), 0.5, device=device)}
+    stored = {"weight": data, "scale": torch.full((rows,), 0.5, device=device)}
     fused(torch, stored, torch.ones((rank, 256), device=device), up * (32 / 48), INT8)
     want = torch.tensor([3, 1], device=device).repeat(rows // 2)[:, None].expand(rows, 256)
     if not torch.equal(data.long(), want):

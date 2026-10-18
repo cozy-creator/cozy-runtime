@@ -12,7 +12,7 @@ import pytest
 from cozy_runtime.author._errors import MEMORY_EXHAUSTED
 from cozy_runtime.internal import lora_bake, weight_policy
 from cozy_runtime.internal import weights as source
-from cozy_runtime.internal.encoding import SPEC_PLAIN, Encoded, RolePart
+from cozy_runtime.internal.encoding import PLAIN, Encoded, RolePart
 from cozy_runtime.internal.executor import Executor
 from cozy_runtime.internal.executor_commands import Activate, Load
 from cozy_runtime.internal.fill import PlanRow
@@ -57,7 +57,7 @@ def test_sdk_seeded_bind_refills_its_base_before_one_forward(
             "bf16",
             shape,
             nbytes,
-            Encoded(SPEC_PLAIN, "plain", (RolePart("value", "bf16", shape, nbytes),)),
+            Encoded(PLAIN, (), (RolePart("value", "bf16", shape, nbytes),)),
         )
         rows.append(Weight(row, "plain", None, {"value": (0, "bf16", shape)}))
     region.weights = rows

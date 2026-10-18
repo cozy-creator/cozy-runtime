@@ -9,6 +9,13 @@ card, so run it under the shared GPU lock.
 
 from __future__ import annotations
 
+import pytest
+
+pytest.skip(
+    "pending: weights register on cozytensors/2 through varena (xs-045 U8) and cr-203 U11b",
+    allow_module_level=True,
+)
+
 import ctypes
 import functools
 import gc

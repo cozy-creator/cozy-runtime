@@ -50,7 +50,7 @@ TABLE_DTYPES = ("bfloat16", "float16", "float32")
 SHIPPED = Path(__file__).resolve().parent / "qualification_tables"
 
 #: Bumped when a table's MEANING changes in a way its name does not catch.
-TABLE_FORMAT = 2
+TABLE_FORMAT = 3
 
 #: How many tables one machine keeps: a floor under growth across Runtime sources.
 KEEP = 64
@@ -86,7 +86,7 @@ def table_name(device: DeviceFacts, runtime: RuntimeIdentity) -> str:
 
 
 def _cell(one: Observation) -> tuple[str, str, str]:
-    return one.encoding_spec_id, one.implementation_digest, one.output_dtype
+    return one.scheme, one.implementation_digest, one.output_dtype
 
 
 def _covering(

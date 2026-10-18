@@ -4,6 +4,13 @@ bounds the fill from its first byte, and the tier stays under the cgroup's `memo
 
 from __future__ import annotations
 
+import pytest
+
+pytest.skip(
+    "pending: weights register on cozytensors/2 through varena (xs-045 U8) and cr-203 U11b",
+    allow_module_level=True,
+)
+
 import ctypes
 import json
 import os

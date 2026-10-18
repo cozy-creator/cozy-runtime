@@ -66,8 +66,17 @@ def test_a_nearest_refit_bake_is_the_lane_encoder_on_the_merged_weight() -> None
 
 
 def test_only_a_row_scaled_e4m3_weight_is_bakeable() -> None:
-    assert lora_bake.bakeable({"data": "f8_e4m3fn", "scale": "f32"})
-    assert not lora_bake.bakeable({"data": "f8_e4m3fn", "scale": "u8"})
+    assert lora_bake.bakeable("fp8-rowwise", {"axis": 0}, {"weight": "f8_e4m3fn", "scale": "f32"})
+    assert not lora_bake.bakeable(
+        "fp8-rowwise", {"axis": 0}, {"weight": "f8_e4m3fn", "scale": "u8"}
+    )
+    assert not lora_bake.bakeable(
+        "fp8-rowwise", {"axis": 1}, {"weight": "f8_e4m3fn", "scale": "f32"}
+    )
+    assert not lora_bake.bakeable("int8-rowwise", {"axis": 0}, {"weight": "i8", "scale": "f32"})
+    assert not lora_bake.bakeable(
+        "mxfp8", {"block": 32}, {"weight": "f8_e4m3fn", "scale": "f8_e8m0"}
+    )
 
 
 def test_nearest_on_the_kept_grid_loses_a_delta_below_half_a_step() -> None:
@@ -217,24 +226,26 @@ def test_an_int8_convrot_bake_keeps_the_delta_in_its_rotated_grid() -> None:
     """Stochastic rounding of the rotated rows keeps the LoRA in expectation; a zero delta is a
     fixed point; the stored weight decodes to the merged one within the lane's own error."""
     values, down, up = _layer(11)
-    assert lora_bake.bakeable({"data": "i8", "scale": "f32"})
+    assert lora_bake.bakeable(
+        "int8-convrot", {"block": 256, "rotation": "hadamard"}, {"weight": "i8", "scale": "f32"}
+    )
     data, scale = _int8(values)
-    zero = {"data": data.clone(), "scale": scale}
+    zero = {"weight": data.clone(), "scale": scale}
     lora_bake.bake(torch, zero, down * 0, up, seed=3, stats=lora_bake.Stats())
-    assert torch.equal(zero["data"], data)
+    assert torch.equal(zero["weight"], data)
     delta = (up.double() @ down.double()).numpy()
     target = values + delta
     base = decode_int8_convrot256(data.numpy(), scale.numpy())
     retained = []
     for seed in range(4):
-        stored, stats = {"data": data.clone(), "scale": scale}, lora_bake.Stats()
+        stored, stats = {"weight": data.clone(), "scale": scale}, lora_bake.Stats()
         lora_bake.bake(torch, stored, down * 8, up, seed=seed, stats=stats)
-        moved = decode_int8_convrot256(stored["data"].numpy(), scale.numpy()) - base
+        moved = decode_int8_convrot256(stored["weight"].numpy(), scale.numpy()) - base
         retained.append(float((moved * delta * 8).sum() / np.square(delta * 8).sum()))
         assert abs(stats.retention - retained[-1]) < 1e-6
     assert abs(sum(retained) / 4 - 1) < 0.05
-    stored = {"data": data.clone(), "scale": scale}
+    stored = {"weight": data.clone(), "scale": scale}
     lora_bake.bake(torch, stored, down, up, seed=0)
-    merged = decode_int8_convrot256(stored["data"].numpy(), scale.numpy())
+    merged = decode_int8_convrot256(stored["weight"].numpy(), scale.numpy())
     lane = encode_int8_convrot256("w", target.astype(np.float32)).relative_frobenius()
     assert np.linalg.norm(merged - target) / np.linalg.norm(target) < 2 * lane + 0.01
