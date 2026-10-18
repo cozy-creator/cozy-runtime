@@ -2,14 +2,29 @@
 # The memory-torture gate (cr-203): every Runtime release, on its own files, through `cozy run`.
 # Pass: every run succeeds and every output lands. Slower is fine; a failure is not.
 #
-#   gates/memory-torture.sh <hub> <wheel|-> [card...]
+#   gates/memory-torture.sh <hub> <wheel|-> [--matrix] [--tensorfs-wheel <file>] [--baseline <dir>] [card...]
 #
 # <wheel> is the candidate cozy-runtime wheel (a file or https://…#sha256=…), `-` for the Hub's target.
 # Cards (default: all): 8 12 24 32 2x8 4090 (the ref2va_turbo 15 s acceptance card, 10812/10813); `<card>:h3` runs only its H3 cell (and the references). Each rents the first SKU of its row with capacity whose GPUs are no larger than the card, runs every cell,
-# confirms each output landed, ends the rental and confirms it is gone. Results: ./memory-torture-<stamp>/.
+# confirms each output landed, ends the rental and confirms it is gone. Cards run at once. Results: ./memory-torture-<stamp>/.
+# --matrix: the merge matrix for every memory PR (gates/memory-matrix.sh): cards 8 12 24 2x8; H3 ref2va_turbo 5 s
+# and 15 s, H3 long_form (2 × 5 s; 2 × 15 s at degree 2 on 2x8), Qwen 4 MP and SDXL 4 MP.
+# --baseline <dir>: a 0.27.4 run's results; a cell that completed there and not here, or ends poisoned here and not
+# there, is WORSE (exit status).
 set -uo pipefail
 H=$1 W=$2; shift 2
-CARDS=${*:-8 12 24 32 2x8 4090}
+MATRIX="" TFS="" BASE="" CARDS=""
+while [ $# -gt 0 ]; do
+  case $1 in
+    --matrix) MATRIX=1 ;;
+    --tensorfs-wheel) TFS=$(realpath "$2"); shift ;;
+    --baseline) BASE=$(realpath "$2"); shift ;;
+    *) CARDS="$CARDS $1" ;;
+  esac
+  shift
+done
+[ -f "$W" ] && W=$(realpath "$W")
+[ -z "$CARDS" ] && { [ -n "$MATRIX" ] && CARDS="8 12 24 2x8" || CARDS="8 12 24 32 2x8 4090"; }
 declare -A SKUS=([8]="rtx-3070 rtx-3060-ti" [12]="rtx-5070 rtx-3080-ti rtx-4070-ti" [24]="rtx-4000-ada rtx-pro-4000 l4"
   [32]="rtx-pro-4500 rtx-5090" [2x8]="rtx-3070 rtx-3060-ti" [4090]="rtx-4090")
 declare -A GIB=([8]=8 [12]=12 [24]=24 [32]=32 [2x8]=8 [4090]=24)  # no GPU of a card may be larger
@@ -125,14 +140,27 @@ cells() {  # the matrix on one machine; $1 = card, $2 = H3 segments
   h3 "$k" "$segs" "$a" "$b" "$r"
 }
 
-h3ref() {  # H3 ref2va_turbo, one 15 s clip from one character image (runs 10812/10813 on a 4090)
-  local k=$1 a=$2 r=$3
-  printf '{"prompt": "The woman in <Picture 1> walks through a sunlit park in autumn, leaves falling, she picks up a red leaf and smiles, %s %s.\n\nnon_diegetic_music:\nN/A", "seed": %d, "duration_s": 15}\n' "$TAG" "$k" $((r + 40)) > "h3ref-$k.json"
-  cell "$k-h3ref" fidika/minimax-h3/ref2va_turbo --input "h3ref-$k.json" --asset "$a"
+h3ref() {  # H3 ref2va_turbo, one clip (15 s unless $4) from one character image (runs 10812/10813 on a 4090)
+  local k=$1 a=$2 r=$3 s=${4:-15} c=$1-h3ref
+  [ "$s" = 15 ] || c=$k-h3ref$s
+  printf '{"prompt": "The woman in <Picture 1> walks through a sunlit park in autumn, leaves falling, she picks up a red leaf and smiles, %s %s.\n\nnon_diegetic_music:\nN/A", "seed": %d, "duration_s": %d}\n' "$TAG" "$c" $((r + 40 + s)) "$s" > "$c.json"
+  cell "$c" fidika/minimax-h3/ref2va_turbo --input "$c.json" --asset "$a"
 }
 
-h3() {  # H3 long_form: <segs> × 15 s; the last segment is guided by a video reference (ref2va)
-  local k=$1 segs=$2 a=$3 b=$4 r=$5 gpus=${6:-} i
+matrix() {  # the merge matrix on one machine ($1 = card)
+  local k=$1 r=$RANDOM a b
+  references "$k" "$r"
+  a=$(image "$k-klein-a") b=$(image "$k-klein-b")
+  if [ "$k" = 2x8 ]; then h3 "$k" 2 "$a" "$b" "$r" 2; return; fi
+  cell "$k-sdxl4" fidika/sdxl/generate prompt="a brass doorknob on a blue door in morning sun, $TAG $k" seed=$((r + 3)) megapixels:=4
+  cell "$k-qwen4" fidika/qwen-image-2/generate_image prompt="a market street in the rain at night, $TAG $k" seed=$((r + 5)) megapixels:=4
+  h3ref "$k" "$b" "$r" 5
+  h3ref "$k" "$b" "$r" 15
+  h3 "$k" 2 "$a" "$b" "$r" "" 5
+}
+
+h3() {  # H3 long_form: <segs> × <seconds, 15>; the last segment is guided by a video reference (ref2va)
+  local k=$1 segs=$2 a=$3 b=$4 r=$5 gpus=${6:-} s=${7:-15} i
   ffmpeg -loglevel error -y -loop 1 -i "$a" -t 5 -r 24 -vf "scale=832:480:force_original_aspect_ratio=increase,crop=832:480,zoompan=z='1+0.002*on':d=1:s=832x480" -pix_fmt yuv420p "$D/clip-$k.mp4"
   {
     echo "mode: turbo"; echo "clean_references: false"; echo "describe_references: false"
@@ -143,18 +171,19 @@ h3() {  # H3 long_form: <segs> × 15 s; the last segment is guided by a video re
     echo "segments:"
     for i in $(seq 1 "$segs"); do
       if [ "$i" = "$segs" ]; then
-        echo "  - {duration_s: 15, seed: $((r + 20 + i)), prompt: '<Lena> and <Mara> walk the boardwalk as the camera moves like <Push>, $TAG $k $i.'}"
+        echo "  - {duration_s: $s, seed: $((r + 20 + i)), prompt: '<Lena> and <Mara> walk the boardwalk as the camera moves like <Push>, $TAG $k $i.'}"
       else
-        echo "  - {duration_s: 15, seed: $((r + 20 + i)), prompt: '<Lena> and <Mara> arm-wrestle on a beach boardwalk at golden hour, $TAG $k $i.'}"
+        echo "  - {duration_s: $s, seed: $((r + 20 + i)), prompt: '<Lena> and <Mara> arm-wrestle on a beach boardwalk at golden hour, $TAG $k $i.'}"
       fi
     done
   } > "h3-$k.yaml"
   cell "$k-h3" fidika/minimax-h3/long_form --input "h3-$k.yaml" ${gpus:+--gpus "$gpus"}
 }
 
-card() {
+card() {  # one card, in its own subshell: rent, install, run its cells, end the rental; exit status = failures
   local card=${1%%:*} only=${1#*:} gpus="" sku
   [ "$only" = "$1" ] && only=""
+  trap release EXIT INT TERM
   [ "$card" = 2x8 ] && gpus=2
   M=""
   for sku in ${SKUS[$card]}; do
@@ -180,7 +209,7 @@ PY
     fi
   done
   [ -z "$M" ] && { say "card $card: no SKU had capacity ($(tail -c 200 "rent-$card.err"))"; FAILED=$((FAILED + 1)); return; }
-  if [ "$W" != - ] && ! cozy machine update "$M" --runtime-wheel "$W" --tensorhub "$H" > "update-$card.log" 2>&1; then
+  if [ "$W" != - ] && ! cozy machine update "$M" --runtime-wheel "$W" ${TFS:+--tensorfs-wheel "$TFS"} --tensorhub "$H" > "update-$card.log" 2>&1; then
     say "card $card: the wheel did not install: $(tail -c 300 "update-$card.log")"; FAILED=$((FAILED + 1)); release; return
   fi
   cozy machine show "$M" --tensorhub "$H" > "machine-$card.txt" 2>&1
@@ -193,7 +222,9 @@ PY
   local r=$RANDOM segs=2 gpus2=""
   [ "$card" = 32 ] && segs=3
   [ "$card" = 2x8 ] && gpus2=2
-  if [ "$card" = 2x8 ] || [ "$card" = 4090 ] || [ "$only" = h3 ]; then
+  if [ -n "$MATRIX" ]; then
+    matrix "$card"
+  elif [ "$card" = 2x8 ] || [ "$card" = 4090 ] || [ "$only" = h3 ]; then
     references "$card" "$r"
     [ "$card" = 2x8 ] || h3ref "$card" "$(image "$card-klein-b")" "$r"
     [ "$card" = 4090 ] || h3 "$card" "$segs" "$(image "$card-klein-a")" "$(image "$card-klein-b")" "$r" $gpus2
@@ -201,8 +232,34 @@ PY
     cells "$card" "$segs"
   fi
   release
+  return "$FAILED"
 }
 
-for c in $CARDS; do card "$c"; done
+trap 'kill $PIDS 2>/dev/null' INT TERM
+PIDS=""
+for c in $CARDS; do (card "$c"; exit $?) & PIDS="$PIDS $!"; done
+for p in $PIDS; do wait "$p"; FAILED=$((FAILED + $?)); done
 say "memory-torture: $FAILED failed"
-[ "$FAILED" = 0 ]
+[ -z "$BASE" ] && { [ "$FAILED" = 0 ]; exit; }
+# Against a baseline: a cell that completed there and did not complete here is WORSE.
+python3 -I - "$BASE/summary.txt" summary.txt <<'PY' | tee -a summary.txt
+import re, sys
+def cells(path):
+    out = {}
+    for line in open(path):
+        m = re.search(r"\b(\S+) run=(\d*) (\S+).* exec=(\d+)s oom_retries=(\d+).* reason=(.*)", line)
+        if m:
+            out[m[1]] = (m[3], int(m[4]), int(m[5]), m[2], "poisoned" in m[6])
+    return out
+base, here = cells(sys.argv[1]), cells(sys.argv[2])
+worse = 0
+print(f"{'cell':16} {'baseline':28} {'candidate':28}")
+for c in sorted(set(base) | set(here)):
+    b, h = base.get(c), here.get(c)
+    show = lambda x: f"{x[0]} {x[1]}s oom={x[2]} #{x[3]}" if x else "-"
+    bad = b is not None and ((b[0] == "completed" and (h is None or h[0] != "completed")) or (h and h[4] and not b[4]))
+    worse += bad
+    print(f"{c:16} {show(b):28} {show(h):28}{'  WORSE' if bad else ''}")
+print(f"memory-matrix: {worse} worse than the baseline")
+sys.exit(min(worse, 255))
+PY
