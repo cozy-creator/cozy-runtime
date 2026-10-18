@@ -4610,7 +4610,9 @@ class WeightResidency:
         failure: BaseException | None = None
         for name in local:
             component = self.components[name]
-            component.cycled[method], component.uses = component.cycling, 0
+            # one whose blocks never ran (a LoRA read by its DiT's blocks) repeats with its stage
+            component.cycled[method] = component.cycling if component.uses else hot
+            component.uses = 0
             try:
                 close_cursor(component)
             except BaseException as exc:  # release the rest, then raise the first
