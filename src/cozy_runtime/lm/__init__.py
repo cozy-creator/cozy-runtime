@@ -39,7 +39,7 @@ import threading
 import time
 import weakref
 from collections import deque
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from typing import Any
 
@@ -820,6 +820,21 @@ def _slot_bytes(fresh: _Prefill, capacity: int, drafted: bool, text: Any) -> int
     return total + capacity * 18 + 4 * int(getattr(text, "vocab_size", 0) or 0)
 
 
+def _derived(models: Iterable[Any]) -> list[Any]:
+    """The non-persistent buffers of `models` on a device: built from config (a rotary table),
+    never a checkpoint's, so the plane neither places nor pins them."""
+    return [
+        tensor
+        for model in models
+        for module in model.modules()
+        for name, tensor in module._buffers.items()
+        if name in module._non_persistent_buffers_set
+        and type(tensor).__name__ == "Tensor"
+        and tensor.device.type != "meta"
+        and tensor.device.type != "cpu"
+    ]
+
+
 def _reservation(model: Any, shed: Callable[[int], int]) -> Any:
     """The memory manager's hold on an engine's buffers; None for a model Runtime does not
     place (its tensors are where its caller put them)."""
@@ -1098,7 +1113,13 @@ class _Engine:
         False when they do not all fit (the calls then decode through Transformers' loop), None
         before the first step has recorded which blocks a step reads (`_record`)."""
         targets = self._targets()
+        # The steps also read buffers the model builds (its rotary tables): they stay where the
+        # graphs recorded them, and a rebuilt one (a component placed again) records anew.
+        derived = _derived(m for m in (self.model, self.draft) if m is not None)
+        native(torch, *derived)
+        built = tuple(t.data_ptr() for t in derived)
         if not targets:
+            self.where = (built,)
             return True
         if any(m not in _READS for m, _ in targets):
             return None
@@ -1106,7 +1127,7 @@ class _Engine:
         if not all(holds):
             return False
         self.room = targets[0][1][0].allocatable
-        self.where = tuple(r.layout(name, _READS[m]) for m, (r, name) in targets)
+        self.where = (*(r.layout(name, _READS[m]) for m, (r, name) in targets), built)
         return True
 
     room: Callable[[], int] | None = None

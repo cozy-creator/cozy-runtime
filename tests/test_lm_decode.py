@@ -202,6 +202,22 @@ def test_running_out_of_memory_decodes_through_transformers() -> None:
 
 
 @pytest.mark.skipif(DEVICE != "cuda", reason="CUDA graphs need a GPU")
+def test_a_rebuilt_rotary_table_records_the_steps_anew() -> None:
+    """The steps read the model's own rotary table by address: one built again elsewhere (a
+    component placed again) must not leave the graphs reading the old one."""
+    torch.manual_seed(8)
+    model = _qwen3_5()
+    ids = torch.randint(10, 290, (1, 40), device=DEVICE)
+    inputs = {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
+    _same(model, inputs, 30)
+    rotary = model.get_decoder().rotary_emb
+    rotary.inv_freq = rotary.inv_freq.clone()  # the same values at a new address
+    del rotary  # the old table's memory goes back to the allocator
+    torch.cuda.empty_cache()
+    _same(model, inputs, 30)
+
+
+@pytest.mark.skipif(DEVICE != "cuda", reason="CUDA graphs need a GPU")
 def test_a_capture_out_of_memory_leaves_the_decode_serving(
     capfd: pytest.CaptureFixture[str],
 ) -> None:
