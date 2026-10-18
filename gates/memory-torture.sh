@@ -5,13 +5,14 @@
 #   gates/memory-torture.sh <hub> <wheel|-> [card...]
 #
 # <wheel> is the candidate cozy-runtime wheel (a file or https://…#sha256=…), `-` for the Hub's target.
-# Cards (default: all): 8 12 24 32 2x8 4090 (the ref2va_turbo 15 s acceptance card, 10812/10813); `<card>:h3` runs only its H3 cell (and the references). Each rents the first SKU of its row with capacity, runs every cell,
+# Cards (default: all): 8 12 24 32 2x8 4090 (the ref2va_turbo 15 s acceptance card, 10812/10813); `<card>:h3` runs only its H3 cell (and the references). Each rents the first SKU of its row with capacity whose GPUs are no larger than the card, runs every cell,
 # confirms each output landed, ends the rental and confirms it is gone. Results: ./memory-torture-<stamp>/.
 set -uo pipefail
 H=$1 W=$2; shift 2
 CARDS=${*:-8 12 24 32 2x8 4090}
-declare -A SKUS=([8]="rtx-3070" [12]="rtx-5070 rtx-3080-ti rtx-4070-ti" [24]="rtx-4000-ada rtx-pro-4000 l4"
-  [32]="rtx-pro-4500 rtx-5090" [2x8]="rtx-3070 rtx-5060-ti rtx-4060-ti rtx-3080-ti l4" [4090]="rtx-4090")
+declare -A SKUS=([8]="rtx-3070 rtx-3060-ti" [12]="rtx-5070 rtx-3080-ti rtx-4070-ti" [24]="rtx-4000-ada rtx-pro-4000 l4"
+  [32]="rtx-pro-4500 rtx-5090" [2x8]="rtx-3070 rtx-3060-ti" [4090]="rtx-4090")
+declare -A GIB=([8]=8 [12]=12 [24]=24 [32]=32 [2x8]=8 [4090]=24)  # no GPU of a card may be larger
 D=$PWD/memory-torture-$(date -u +%Y%m%dT%H%M%SZ); mkdir -p "$D"; cd "$D" || exit 1
 TAG=$(basename "$D") FAILED=0 M="" FOLLOW=""
 say() { echo "$(date -u +%T) $*" | tee -a summary.txt; }
@@ -24,6 +25,11 @@ release() {  # end the machine this script rented, once its outputs landed, and 
   M=""
 }
 trap release EXIT INT TERM
+
+fits() {  # rental $M has $2 GPUs, none over $1 GiB, as `cozy machine show` lists them
+  cozy machine show "$M" --tensorhub "$H" 2>/dev/null | sed -nE 's/^GPU [0-9]+ .* ([0-9.]+) GiB .*/\1/p' |
+    awk -v most="$1" -v n="$2" '{k++; if ($1 > most) big = 1} END {exit !(k == n && !big)}'
+}
 
 landed() {  # every output of run $1 is in out-$2 under its sha256; gives up only when nothing changes for 3 min
   local n=$1 dir=$2 last="" still=0 state
@@ -168,7 +174,9 @@ PY
       M=$(cozy machine show "$name" --tensorhub "$H" 2>/dev/null | awk '$1 == "alias" {print $2}')
       [ -z "$M" ] && M=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1])).get("machine",{}).get("alias",""))' "rent-$card.json" 2>/dev/null)
       [ -z "$M" ] && { say "card $card: rented $sku as $name but found no rent- alias; end it by hand"; FAILED=$((FAILED + 1)); return; }
-      say "card $card: rented $sku as $name ($M)"; break
+      say "card $card: rented $sku as $name ($M)"
+      fits "${GIB[$card]}" "${gpus:-1}" && break
+      say "card $card: $M's GPUs are not ${gpus:-1} of ${GIB[$card]} GiB or less; next SKU"; release
     fi
   done
   [ -z "$M" ] && { say "card $card: no SKU had capacity ($(tail -c 200 "rent-$card.err"))"; FAILED=$((FAILED + 1)); return; }
