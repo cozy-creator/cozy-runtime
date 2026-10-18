@@ -46,7 +46,7 @@ from cozy_runtime.author._assets import (
     bind_tree,
     field_preparation,
 )
-from cozy_runtime.author._calls import ChildCallError, _Broker, _current
+from cozy_runtime.author._calls import _Broker, _current
 from cozy_runtime.author._context import CURRENT, AdapterRef, Context, Device
 from cozy_runtime.author._decode import (
     AudioProbe,
@@ -428,21 +428,11 @@ def run_prepared(
     except (KeyboardInterrupt, SystemExit):
         raise
     except Exception as exc:
-        outcome, record.failed_at_call = classify(exc), _at_call(exc)
+        outcome = classify(exc)
         unwind(exc)
         return None, outcome, record
     finally:
         record.closed = True
-
-
-def _at_call(exc: BaseException | None) -> bool:
-    """Whether a package call's failure ended the handler: raised at the call boundary, or
-    raised again from it (`raise ... from failure`, H3's `segment_failed`, run 11275)."""
-    while exc is not None:
-        if isinstance(exc, ChildCallError):
-            return True
-        exc = exc.__cause__
-    return False
 
 
 def attempt(

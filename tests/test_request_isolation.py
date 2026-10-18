@@ -31,10 +31,17 @@ import weakref
 import msgspec
 import torch
 from cozy_runtime.author import App, ChildCallError, Context, InvalidRequest, OutputError, Telemetry
+from cozy_runtime.author._errors import RuntimeFailure
 
 app = App()
 HELD: list[weakref.ref] = []
 LEAKED: list[object] = []
+FAILURES = {  # the failures a request ends with
+    "fail": lambda: RuntimeError("handler state is now unknown"),
+    "exhausted": lambda: RuntimeFailure("aten.mm needs 1 GiB at once", code="memory_exhausted"),
+    "segment": lambda: ChildCallError("memory_exhausted", "GPU 1: the ladder ran out", 0),
+    "leak": lambda: RuntimeError("it keeps its activations"),
+}
 
 
 class Request(msgspec.Struct):
@@ -56,24 +63,19 @@ def generate(ctx: Context, payload: Request, tel: Telemetry) -> Result:
         raise InvalidRequest("the handler refused this request", code="mode_refused")
     if payload.mode == "cancel":
         ctx.raise_if_cancelled()
-    if payload.mode == "fail":
-        raise RuntimeError("handler state is now unknown")
-    if payload.mode == "segment":  # H3's long_form, run 11275
-        failure = ChildCallError("memory_exhausted", "GPU 1: the ladder ran out", 0)
-        try:
-            raise failure
-        except ChildCallError as caught:
-            raise OutputError("segment 1 of 2 failed", code="segment_failed") from caught
-    if payload.mode in ("hold", "leak"):  # run 11340: a failed stage's activations
-        activations = torch.ones(1 << 20)
-        HELD.append(weakref.ref(activations))
-        if payload.mode == "leak":
-            LEAKED.append(activations)
-        try:
-            raise ChildCallError("memory_exhausted", "the ladder ran out", 0)
-        except ChildCallError as caught:
-            kept = caught  # its frame and its exception now hold each other
-            raise OutputError("segment 1 of 2 failed", code="segment_failed") from kept
+    if payload.mode in FAILURES:  # run 11340: a failed stage holding its activations
+        with tel.stage("denoise"):
+            activations = torch.ones(1 << 20)
+            HELD.append(weakref.ref(activations))
+            if payload.mode == "leak":
+                LEAKED.append(activations)
+            try:
+                raise FAILURES[payload.mode]()
+            except Exception as caught:
+                kept = caught  # its frame and its exception now hold each other
+                if payload.mode == "segment":  # H3's long_form, run 11275
+                    raise OutputError("segment 1 of 2 failed", code="segment_failed") from kept
+                raise
     if payload.mode == "long":
         progress = "\\n".join(f"Downloading part {n} of 400" for n in range(400))
         raise RuntimeError(f"{progress}\\nthe cause, on the last line")
@@ -144,28 +146,35 @@ def test_handler_refusals_and_cancels_keep_the_generation_ready(
     assert not executor.poisoned and not refused["poisoned"] and not canceled["poisoned"]
     assert _serve(executor, "served", "ok")["outcome"]["terminal"] == "succeeded"
 
-    # A package call's failure raised again from it is the call's: a safe point, no poison.
-    segment = _serve(executor, "segment", "segment")
-    assert segment["outcome"]["code"] == "segment_failed" and not segment["poisoned"]
-    failed = _serve(executor, "failed", "fail")
-    assert failed["outcome"]["terminal"] == "failed" and failed["poisoned"]
 
-
-def test_a_failed_request_gives_back_what_it_held(host: tuple[Executor, dict[str, Any]]) -> None:
-    """Run 11340's executor kept 7.27 GiB after its request failed, and the next request
-    (11405) found the GPU full. A failure's frames let its tensors go."""
+@pytest.mark.parametrize(
+    ("mode", "code"),
+    [
+        ("fail", "unhandled_exception"),
+        ("exhausted", "memory_exhausted"),
+        ("segment", "segment_failed"),
+    ],
+)
+def test_a_failed_request_frees_everything_and_never_poisons_the_executor(
+    host: tuple[Executor, dict[str, Any]], mode: str, code: str
+) -> None:
+    """Owner rule (cr-203). Run 11340's executor kept 7.27 GiB after its request failed, and the
+    next request (11405) found the GPU full: a stage that raises, runs out, or re-raises a
+    package call's failure leaves none of its tensors, and the executor serves on."""
     executor, load = host
     assert executor.load(msgspec.convert({**load, "construction": "a"}, Load))["ok"]
     assert executor.activate(Activate(construction="a"))["ok"]
-    held = _serve(executor, "held", "hold")
-    assert held["outcome"]["code"] == "segment_failed" and not held["poisoned"]
-    assert sys.modules[MODULE].HELD[-1]() is None
+    failed = _serve(executor, mode, mode)
+    assert (failed["outcome"]["code"], failed["poisoned"]) == (code, ""), failed
+    assert sys.modules[MODULE].HELD[-1]() is None, "the failed stage's tensors are gone"
+    assert _serve(executor, "next", "ok")["outcome"]["terminal"] == "succeeded"
 
 
 @pytest.mark.skipif(not torch.backends.cuda.is_built(), reason="the tail reads CUDA's streams")
 def test_bytes_a_failed_request_leaves_allocated_recycle_the_executor(
     host: tuple[Executor, dict[str, Any]], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """The last resort only: a failure that kept its bytes is a bug, and the process ends."""
     executor, load = host
     assert executor.load(msgspec.convert({**load, "construction": "a"}, Load))["ok"]
     assert executor.activate(Activate(construction="a"))["ok"]

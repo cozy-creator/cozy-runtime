@@ -370,6 +370,9 @@ def test_a_group_runs_a_call_again_when_one_gpu_runs_out_of_memory(tmp_path: Pat
         assert failed.value.code == MEMORY_EXHAUSTED and "GPU 1: OutOfMemoryError" in str(
             failed.value
         )
+        # The attempt it failed frees what GPU 1 held, and no GPU is recycled (run 11340).
+        reclaimed = leader._followers(leader._plane_ranks(), Reclaim(), "reclaim", lambda: 0)
+        assert reclaimed == (0, None) and float(model.live()) == 0
         assert group.pids() == pids and not group.broken
         torch.testing.assert_close(model.out_of_memory(0), torch.tensor([5.0]))
     finally:

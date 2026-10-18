@@ -3609,19 +3609,8 @@ class Executor:
         quiescent = self._quiescent() if torch is not None else True
         self.attempts += 1
         result_ref, outputs, oversize = _serialize_result(envelope, spool)
-        # Only a failure inside the handler leaves package state unknown. A request refusal,
-        # a cooperative cancel/deadline or a failed package call stops at a safe point and
-        # keeps the generation Ready — and so does capacity: an OOM or a stage below its
-        # floor fails this attempt, never the executor (weight-plane.md principle 8).
-        if (
-            outcome.terminal == "failed"
-            and record.entered
-            and not record.failed_at_call
-            and outcome.code not in CAPACITY_CODES
-        ):
-            self.poisoned = f"{outcome.terminal}/{outcome.code}" + (
-                f" in {stage[0]}" if stage[0] else ""
-            )
+        # A failed request frees everything and never poisons the executor (owner, cr-203):
+        # only state nothing can put back (below) or bytes `_release` could not free recycle it.
         terminal = {
             "terminal": outcome.terminal,
             "origin": outcome.origin,
