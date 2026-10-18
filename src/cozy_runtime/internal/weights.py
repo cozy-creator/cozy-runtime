@@ -1391,9 +1391,9 @@ class Weights:
     # -- the pinned tier
 
     def host_share(self) -> int:
-        """This process's pinned tier at most: its weights, inside what it pins now and its
-        GPU's share of what the host has beside its margin. Tensors moved off the device take
-        host memory before it (`lockable`). -1: the host is unreadable."""
+        """This process's pinned tier at most: its weights, inside the machine's pinned total
+        (`weight_policy.pinned_total`) less what others pin already. -1: the host is
+        unreadable."""
         total = sum(c.ws.nbytes for c in self.components.values())
         try:
             memory = proctree.host_memory()
@@ -1401,8 +1401,9 @@ class Weights:
             return -1
         if memory.available < 0:
             return -1
-        own = max(plane.stats(self.plane).host.used, 0)
-        return min(total, own + max(memory.available - weight_policy.HOST_MARGIN, 0) // self.world)
+        others = max(memory.shmem - max(plane.stats(self.plane).host.used, 0), 0)
+        allowed = weight_policy.pinned_total(memory.available, memory.shmem)
+        return min(total, max(allowed - others, 0) // self.world)
 
     def hold_host(self) -> None:
         """Keep the pinned tier inside what the host has now, whoever set its budget: the
