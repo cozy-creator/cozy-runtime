@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # The memory-torture gate (cr-203): every Runtime release, on its own files, through `cozy run`.
-# Pass: every run succeeds and every output lands. Slower is fine; a failure is not.
+# The absolute bar: every cell completes, every output lands, nothing ends poisoned and no idle executor keeps
+# `leftover` bytes (B2's mem.stats()). The exit status counts the cells and cards that miss it, plus regressions.
 #
 #   gates/memory-torture.sh <hub> <wheel|-> [--matrix] [--tensorfs-wheel <file|url>] [--baseline <dir>] [card[:cell,…]...]
 #
@@ -12,8 +13,8 @@
 # --matrix: the merge matrix for every memory PR (gates/memory-matrix.sh): cards 8 12 24 2x8; Qwen 4 MP, SDXL 4 MP,
 # H3 ref2va_turbo 5 s and 15 s, H3 long_form (2 × 5 s; 2 × 15 s at degree 2 on 2x8) and the pair SDXL ∥ Klein; on 24
 # each H3 cell runs cold, then warm (`<cell>-warm`, a new prompt and seed), and the pair Qwen 1 MP ∥ LM.
-# --baseline <dir>: a 0.27.4 run's results; a cell is WORSE (exit status) if it completed there and not here, ends
-# poisoned here and not there, or is a warm cell whose wall is >10% over the baseline's (D7). Bytes read are reported.
+# --baseline <dir>: a 0.27.4 run's results, for relative checks only: a warm cell whose execution time is >10% over
+# the baseline's is WORSE (D7). GB read per request and per step are reported beside the baseline's.
 set -uo pipefail
 H=$1 W=$2; shift 2
 MATRIX="" TFS="" BASE="" CARDS=""
@@ -73,7 +74,8 @@ PY
   done
 }
 
-record() {  # one line per run: status, wall, retries, poisoned, bytes read (host to GPU) and each call's memory rungs
+record() {  # one line per run (status, wall, execution, retries, poisoned, leftover, GB read host to GPU, memory rungs);
+            # fails if the run misses the absolute bar
   local n=$1 cell=$2 state=$3
   python3 -I - "show-$cell.json" "$cell" "$n" "$state" <<'PY' | tee -a summary.txt
 import json, sys
@@ -87,19 +89,21 @@ mem = [m.get("memory") or {} for m in ms]
 total = lambda key: sum(m.get(key) or 0 for m in mem)
 steps = sum((s.get("denoise") or next(iter(s.values()), {})).get("count") or 0
             for s in ((m.get("attribution") or {}).get("steps") or {} for m in ms))
-def mem_stats():  # B2: the new Runtime's mem.stats() per model per step, from measurements.memory.stats
-    return [m["stats"] for m in mem if m.get("stats")]
+stats = [m["stats"] for m in mem if m.get("stats")]  # B2: mem.stats() per model per step, and the request's leftover
+leftover = sum(s.get("leftover") or 0 for s in stats) if stats else None
 modes = {k: v for m in mem for k, v in (m.get("modes") or {}).items()}
 reason = run.get("reason") or ""
 if isinstance(reason, dict):
     reason = f"{reason.get('code')}: {reason.get('message')}"
 wall, read = (run.get("settled_at_ms") or 0) - (run.get("created_at_ms") or 0), total("paged_in_bytes") / 1e9
+poisoned = "poisoned" in str(reason)
 print(f"{cell} run={n} {state} wall={max(wall, 0) / 1000:.0f}s exec={(run.get('execution_ms') or 0) / 1000:.0f}s "
-      f"oom_retries={total('oom_retries')} poisoned={int('poisoned' in str(reason))} read={read:.1f}GB "
-      f"disk={total('disk_bytes') / 1e9:.1f}GB steps={steps} read_per_step={read / steps if steps else 0:.2f}GB "
-      f"modes={json.dumps(modes)} mem_stats={json.dumps(mem_stats())} reason={str(reason)[:300]}")
+      f"oom_retries={total('oom_retries')} poisoned={int(poisoned)} leftover={'-' if leftover is None else leftover} "
+      f"read={read:.1f}GB disk={total('disk_bytes') / 1e9:.1f}GB steps={steps} "
+      f"read_per_step={read / steps if steps else 0:.2f}GB modes={json.dumps(modes)} mem_stats={json.dumps(stats)} "
+      f"reason={str(reason)[:300]}")
+sys.exit(not (state.startswith("completed ") and state.endswith(" landed")) or poisoned or bool(leftover))
 PY
-  case $state in completed*landed) ;; *) FAILED=$((FAILED + 1)) ;; esac
 }
 
 number() { grep -oE '"number": ?[0-9]+' "run-$1.json" 2>/dev/null | head -1 | grep -oE '[0-9]+$'; }
@@ -116,7 +120,7 @@ finish() {  # finish <cell> <run number>: follow it to its end, confirm its outp
   local cell=$1 n=$2
   [ -z "$n" ] && { say "$cell did not start: $(tail -c 300 "run-$cell.err")"; FAILED=$((FAILED + 1)); return; }
   cozy run watch "$n" --tensorhub "$H" > "watch-$cell.log" 2>&1
-  record "$n" "$cell" "$(landed "$n" "$cell")"
+  record "$n" "$cell" "$(landed "$n" "$cell")" || FAILED=$((FAILED + 1))
 }
 
 cell() {  # cell <cell> <cozy run args…>: one run, followed in the foreground until it ends
@@ -265,11 +269,9 @@ trap 'kill $PIDS 2>/dev/null' INT TERM
 PIDS=""
 for c in $CARDS; do (card "$c"; exit $?) & PIDS="$PIDS $!"; done
 for p in $PIDS; do wait "$p"; FAILED=$((FAILED + $?)); done
-say "memory-torture: $FAILED failed"
-[ -z "$BASE" ] && { [ "$FAILED" = 0 ]; exit; }
-# Against a baseline (D7): WORSE if it completed there and not here, ends poisoned here and not there, or is a warm
-# cell whose wall is >10% over the baseline's. Bytes read are reported only; mem_stats (B2) is in each line.
-python3 -I - "$BASE/summary.txt" summary.txt $CARDS <<'PY' | tee -a summary.txt
+say "memory-torture: $FAILED below the absolute bar"
+if [ -n "$BASE" ]; then  # relative to 0.27.4 (D7): a warm cell >10% slower to execute; GB read reported beside it
+  python3 -I - "$BASE/summary.txt" summary.txt $CARDS <<'PY' | tee -a summary.txt
 import re, sys
 asked = {a.split(":")[0]: a.split(":")[1].split(",") if ":" in a else [] for a in sys.argv[3:]}
 def wanted(c):  # the cells this run asked for, as `want` picks them
@@ -285,23 +287,23 @@ def cells(path):
             out[m[1]] = dict(f, run=m[2], status=m[3], ok=m[3] == "completed" and m[4] == "landed")
     return out
 def show(x):
-    return f"{'ok' if x['ok'] else x['status']} {x.get('wall', '?')}s oom={x.get('oom_retries', '?')} #{x['run']}" if x else "-"
+    return f"{'ok' if x['ok'] else x['status']} exec {x.get('exec', '?')}s oom={x.get('oom_retries', '?')} #{x['run']}" if x else "-"
 def read(x):
     return f"{x['read']} ({x.get('read_per_step', '?')}/step)" if x and "read" in x else "-"
 base, here = cells(sys.argv[1]), cells(sys.argv[2])
 worse = 0
-print(f"{'cell':20} {'baseline':30} {'candidate':30} GB read (per step), baseline -> candidate")
+print(f"{'cell':20} {'0.27.4':34} {'candidate':34} GB read (per step), 0.27.4 -> candidate")
 for c in sorted(c for c in set(base) | set(here) if wanted(c)):
     b, h = base.get(c), here.get(c)
     why = ""
-    if b and b["ok"] and not (h and h["ok"]):
-        why = "did not complete"
-    elif b and h and h.get("poisoned") == "1" and b.get("poisoned") != "1":
-        why = "poisoned"
-    elif c.endswith("-warm") and b and h and b["ok"] and float(h["wall"]) > 1.1 * float(b["wall"]):
-        why = f"warm wall {h['wall']}s > 1.1 x {b['wall']}s"
-    worse += bool(why)
-    print(f"{c:20} {show(b):30} {show(h):30} {read(b)} -> {read(h)}{'  WORSE: ' + why if why else ''}")
-print(f"memory-matrix: {worse} worse than the baseline")
+    if not h or not h["ok"] or h.get("poisoned") == "1" or float(h.get("leftover", 0)) > 0:
+        why = "  FAIL (absolute bar)"
+    elif c.endswith("-warm") and b and b["ok"] and float(h["exec"]) > 1.1 * float(b["exec"]):
+        why, worse = f"  WORSE: warm execution {h['exec']}s > 1.1 x {b['exec']}s", worse + 1
+    print(f"{c:20} {show(b):34} {show(h):34} {read(b)} -> {read(h)}{why}")
+print(f"memory-matrix: {worse} warm cells slower than 0.27.4")
 sys.exit(min(worse, 255))
 PY
+  FAILED=$((FAILED + $?))
+fi
+exit $((FAILED > 255 ? 255 : FAILED))
