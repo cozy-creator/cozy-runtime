@@ -244,7 +244,7 @@ class ModelSource(_Request, frozen=True, kw_only=True, tag="model_source"):
 
 
 class FetchChannel(_Request, frozen=True, kw_only=True, tag="fetch_channel"):
-    """A fresh fetch channel for the running call (`tensorfs.fetch`): a `Handoff` answers, one
+    """A fresh fetch channel for the running call (`tensord_channels.Fetch`): a `Handoff` answers, one
     connected socket following. It names only the call's selected checkpoints, never a hub
     or credential, and ends with the call."""
 

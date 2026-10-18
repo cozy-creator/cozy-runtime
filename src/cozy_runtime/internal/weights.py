@@ -35,7 +35,6 @@ from types import ModuleType
 from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
 import msgspec
-import tensorfs
 
 from cozy_runtime.author._activity import aside
 from cozy_runtime.author._errors import RuntimeFailure, is_device_oom
@@ -69,16 +68,19 @@ from cozy_runtime.internal.encoding import (
 )
 from cozy_runtime.internal.encoding.leaves import sites as leaf_sites
 from cozy_runtime.internal.executor_replies import PlaneFacts, Streamed
-from cozy_runtime.internal.fetch_plan import Fetches, Group, Ref, region_objects, stage_components
+from cozy_runtime.internal.fetch_plan import Fetches, Group, Ref, stage_components
 from cozy_runtime.internal.fill import (
+    WIDTHS,
     Checkpoint,
     PlanRow,
+    TensorRequirement,
     _refuse,
     dtype_name,
     servability,
     store_refusals,
     tensorfs_requirement_dtype,
 )
+from cozy_runtime.internal.fill import fit as fill_fit
 from cozy_runtime.internal.memory import (
     Memory,
     MemoryExhausted,
@@ -88,15 +90,14 @@ from cozy_runtime.internal.memory import (
 )
 from cozy_runtime.internal.paging import partition
 from cozy_runtime.internal.planfacts import PlanFacts
-from cozy_runtime.internal.probe import QualificationResult, observed_capability_records
+from cozy_runtime.internal.probe import QualificationResult
 from cozy_runtime.internal.qualification import qualified
 from cozy_runtime.internal.resolution import ResolvedModelPlan, TensorResolution, script_plan
 from cozy_runtime.internal.unified_plane import Lease as UnifiedLease
 from cozy_runtime.internal.unified_plane import UnifiedPlane
 
 if TYPE_CHECKING:
-    from tensorfs import ReadPlan
-    from tensorfs.varena import Cursor, Lease, Plane, Source, Ticket, WeightSet
+    from tensorfs.varena import Cursor, Lease, Plane, Ticket, WeightSet
     from torch import Tensor
     from torch import device as Device
     from torch import dtype as Dtype
@@ -122,6 +123,13 @@ class ResidencyRefusal(RuntimeFailure):
     def __init__(self, code: str, detail: str) -> None:
         super().__init__(detail, code=code)
         self.detail = detail
+
+
+def _REGISTER_PENDING() -> ResidencyRefusal:  # noqa: N802
+    """Weight sets register on cozytensors/2 checkpoints through `varena.register` (U8)."""
+    return ResidencyRefusal(
+        "weights_register_pending", "v2 registration lands in cr-203 U11b on varena.register"
+    )
 
 
 # ---------------------------------------------------------------------------- the model
@@ -2562,7 +2570,7 @@ def _nbytes(shape: Sequence[int], dtype: str) -> int:
     count = 1
     for extent in shape:
         count *= int(extent)
-    return count * int(tensorfs.DTYPES[dtype])
+    return count * WIDTHS[dtype]
 
 
 # ---------------------------------------------------------------------------- the backend
@@ -2696,7 +2704,7 @@ class PlaneBackend:
         resolved = self.resolved.get(key)
         if resolved is None:
             raise _refuse("plan_divergence", f"{key}: the plan names no such destination", [key])
-        actual = (row.encoded.encoding, tuple(row.shape), dtype_name(row.dtype))
+        actual = (row.encoded.scheme, tuple(row.shape), dtype_name(row.dtype))
         planned = (resolved.encoding, tuple(resolved.geometry), resolved.output_dtype)
         if actual != planned:
             raise _refuse(
@@ -2708,7 +2716,7 @@ class PlaneBackend:
         provider = next(
             (
                 c
-                for c in self.providers.get(row.encoded.encoding, ())
+                for c in self.providers.get(row.encoded.scheme, ())
                 if implementation_digest(c) == resolved.implementation_digest
             ),
             None,
@@ -2726,7 +2734,7 @@ class PlaneBackend:
                 [key],
             )
         records = self.capabilities.qualified(
-            row.encoded.encoding,
+            row.encoded.scheme,
             self.device_facts,
             resolved.output_dtype,
             {resolved.implementation_digest: provider},
@@ -2752,7 +2760,7 @@ class PlaneBackend:
         self.expected = {name: frozenset(keys) for name, keys in sets.items()}
 
     def fit(self, walked: Census, *, encoded_leaves: str) -> Mapping[str, object] | None:
-        """`tensorfs.fit` over the serving census, per checkpoint the census reads."""
+        """`fill.fit` over the serving census, per checkpoint the census reads."""
         by_checkpoint: dict[str, tuple[Checkpoint, list[str]]] = {}
         for component in walked.components:
             checkpoint = self.checkpoints.get(component)
@@ -2764,7 +2772,6 @@ class PlaneBackend:
                     [component],
                 )
             by_checkpoint.setdefault(checkpoint.manifest_id, (checkpoint, []))[1].append(component)
-        observations = canonical.write(observed_capability_records(self.probe))
         verdict: dict[str, object] | None = None
         ignored: list[str] = []
         warnings: list[str] = []
@@ -2772,7 +2779,7 @@ class PlaneBackend:
         for checkpoint, constructed in by_checkpoint.values():
             members = set(constructed)
             requirements = [
-                tensorfs.TensorRequirement(
+                TensorRequirement(
                     component=d.component,
                     key=d.key[len(d.component) + 1 :],
                     shape=list(d.spec.shape),
@@ -2781,24 +2788,19 @@ class PlaneBackend:
                 for d in walked.destinations
                 if d.component in members
             ]
-            with store_refusals(f"fitting {checkpoint.manifest_id[:23]}"):
-                fit = dict(
-                    tensorfs.fit(
-                        requirements,
-                        checkpoint.header_bytes,
-                        custody=self.custody,
-                        encoded_leaves=encoded_leaves == "accept",
-                        device=self.device_facts.predicate,
-                        observations=observations,
-                    )
-                )
+            fit = fill_fit(
+                requirements,
+                checkpoint,
+                encoded_leaves=encoded_leaves == "accept",
+                custody=self.custody,
+                device=self.device_facts.predicate,
+            )
             if not fit.get("ok"):
                 return fit
             verdict = fit
             extras = [str(k) for k in fit.get("ignored", ())]  # type: ignore[attr-defined]
             ignored.extend(extras)
             if extras:
-                # One line per checkpoint. A TensorFS before 0.3.90 lists the keys only.
                 warnings.append(str(fit.get("warning") or self._skipped_line(extras)))
             counted: Mapping[str, int] = fit.get("routes", {})  # type: ignore[assignment]
             for route in routes:
@@ -2895,35 +2897,12 @@ class PlaneBackend:
                 f"({', '.join(missing[:4])}): a DestinationSet is complete or nothing commits",
                 missing[:6],
             )
-        started = time.perf_counter()
         order = list(self.enqueued)
         self.leaves = {
             key: self._install_leaf(key) for key in order if self._route(key) == "encoded_gemm"
         }
         self.gemm_sites = leaf_sites(self.leaves)
-        prepared = {
-            name: self._prepare_layout(name, root, keys)
-            for name, root in self.roots.items()
-            if (keys := [key for key in order if self.plan[key].component == name])
-        }
-        fetch = self.weights.fetch
-        if fetch is not None:
-            # The Load pass: only what the code builds, in the order its stages use it.
-            first = [name for name in self.order if name in prepared]
-            rest = sorted(set(prepared) - set(first), key=lambda n: prepared[n].plan.bytes)
-            fetch.schedule(
-                [
-                    (prepared[n].checkpoint.manifest_id, _ordered(prepared[n].objects))
-                    for n in first + rest
-                ],
-                key=str(id(self)),  # one model of a many-model load: its part of the pass
-            )
-        for name, layout in prepared.items():
-            component = self._register(name, self.roots[name], layout.keys, prepared=layout)
-            self.components[name] = component
-            self.weights.register(component)
-        self.stats["register_ms"] = round((time.perf_counter() - started) * 1000, 2)
-        self.state = "ready"
+        raise _REGISTER_PENDING()
 
     def poison(self, keys: Sequence[str]) -> None:
         """Abort: forget every registered weight set and give the leases back."""
@@ -2992,242 +2971,7 @@ class PlaneBackend:
     def refine(self, name: str) -> Component:
         """Register `name` again at the sub-block grain (regions of at most `REGION_LIMIT`
         bytes): the only way a budget below its block floor can run it."""
-        old = self.components[name]
-        self.weights.close(old)
-        keys = [key for key in self.enqueued if self.plan[key].component == name]
-        component = self._register(name, old.root, keys, refine=True)
-        self.components[name] = component
-        self.weights.register(component)
-        return component
-
-    def _source(
-        self, name: str, checkpoint: Checkpoint, refs: Sequence[Ref], layout: _Prepared
-    ) -> Source:
-        """A weight set's own store source, leased over the objects it reads once they are
-        here: an explicit Store's path (tests, tools). A managed executor reads no store; on
-        unified memory it reads the machine's verified object files, whose pages are the host
-        tier."""
-        pool = self.weights.pool
-        files = self.tiers.files if self.tiers is not None and pool is not None else None
-        if checkpoint.store is None and files is None:
-            raise _refuse(
-                "store_unusable",
-                f"{name}: the machine served no layout for this weight set, and this "
-                "executor reads no store",
-            )
-        if self.weights.fetch is not None:
-            self.weights.fetch.wait(checkpoint.manifest_id, refs)
-        if checkpoint.store is None:
-            assert files is not None and pool is not None
-            handed = files(layout.sealed, _objects(layout.plan))
-            if not handed:
-                raise _refuse("store_unusable", f"{name}: the machine served no object files")
-            try:
-                return cast("Source", pool.files_source(handed, checkpoint.header))
-            finally:
-                for _, _, fd in handed:
-                    os.close(fd)
-        with store_refusals(f"leasing {name}"):
-            lease = checkpoint.store.acquire(checkpoint.manifest_id, sorted(refs))
-        return plane.source(self.weights.plane, checkpoint.store, lease)
-
-    def _prepare_layout(
-        self, name: str, root: Module, keys: list[str], *, fine: bool = False
-    ) -> _Prepared:
-        """Partition the component into regions (common, then each block or sub-block unit)
-        and plan its read: everything its weight set's layout is made of. A component that
-        declares no blocks is paged at the sub-block grain: as one region nothing below its
-        whole size could hold it (run 5424, SeedVR2's 6.4 GB DiT on an 8 GB card)."""
-        try:
-            layout = None if fine else partition(root)
-        except ValueError:
-            layout = None  # its blocks share storage: the sub-block grain places them
-        if layout is None:
-            with suppress(ValueError):  # custom state-dict keys: one region, not streamable
-                layout = partition(root, REGION_LIMIT)
-            fine = layout is not None
-        units = [unit.paths for unit in layout.blocks] if layout is not None else []
-        members: list[list[str]] = [[] for _ in range(len(units) + 1)]
-        for key in keys:
-            path = key[len(name) + 1 :].rpartition(".")[0]
-            members[_unit_of(path, units)].append(key)
-        kept = [(index, group) for index, group in enumerate(members) if group]
-        checkpoint = self.checkpoints[name]
-        skipped = self.skipped.get(name, ())
-        traversal = [(name, self.plan[key].name) for key in keys] + [(name, key) for key in skipped]
-        plan = checkpoint.read_plan(traversal, READ_WINDOW, (name,))
-        parts = (
-            [
-                self.plan[key].role_what(part.role)
-                for key in keys
-                for part in self.plan[key].encoded.parts
-            ]
-            if skipped
-            else []
-        )
-        if skipped:
-            # The plan names every stored tensor; only what the code builds is read or mapped.
-            plan = plan.select(parts)
-        key = f"{self.construction}/{name}"
-        ids = [[f"{name}/{self.plan[k].name}" for k in group] for _, group in kept]
-        digest = canonical.digest({"manifest": checkpoint.manifest_id, "regions": ids})
-        sealed_plan = SealedPlan(
-            manifest=checkpoint.manifest_id,
-            name=key,
-            layout=digest,
-            window=READ_WINDOW,
-            traversal=tuple(traversal),
-            components=(name,),
-            regions=tuple(tuple(group) for group in ids),
-            parts=tuple(parts),
-        )
-        objects = region_objects(plan, ids)
-        return _Prepared(
-            keys, units, kept, checkpoint, plan, ids, digest, sealed_plan, fine, objects
-        )
-
-    def _register(
-        self,
-        name: str,
-        root: Module,
-        keys: list[str],
-        *,
-        refine: bool = False,
-        prepared: _Prepared | None = None,
-    ) -> Component:
-        """Register the component's layout as one weight set and bind every stored part to
-        its destinations; `refine`: again, at the sub-block grain."""
-        layout = prepared or self._prepare_layout(name, root, keys, fine=refine)
-        units, kept, checkpoint, plan = layout.units, layout.kept, layout.checkpoint, layout.plan
-        ids, key = layout.ids, layout.sealed.name
-        weights = self.weights
-        # Standalone checkpoints can reread their explicit Store for a finer layout.
-        # Managed checkpoints ask TensorD for the finer shared CPU layout instead.
-        tiers = None if refine and checkpoint.store is not None else self.tiers
-        manifest, refs = checkpoint.manifest_id, _ordered(layout.objects)
-        here = weights.fetch is None or weights.fetch.present(manifest, refs)
-        staged: list[int] = []
-        with store_refusals(f"registering {name}"):
-            held = tiers.seal(layout.sealed) if tiers is not None else None
-            sealed = held is not None and plane.is_sealed(held)
-            files: list[tuple[str, int, int]] = []
-            if sealed and tiers is not None and tiers.files:
-                if not here and tiers.stage is not None:
-                    # An absent object has no file: the machine stages every region, in
-                    # order, as its objects land, and each is used once Ready.
-                    staged = tiers.stage(layout.sealed, list(range(len(ids))))
-                if len(staged) < len(ids):
-                    # The holes copy from the verified object files, once they are here.
-                    if not here and weights.fetch is not None:
-                        weights.fetch.wait(manifest, refs)
-                        here = True
-                    files = tiers.files(layout.sealed, _objects(plan))
-            try:
-                if sealed:
-                    assert held is not None
-                    # TensorD supplied the CPU buffer; this executor opens no Store or
-                    # local read lease. TensorFS can read unstaged regions from supplied
-                    # object descriptors (`files` is absent for older plane APIs).
-                    handed: dict[str, Any] = {"files": files} if files else {}
-                    ws = weights.plane.register_sealed(key, plan, ids, held, **handed)
-                else:
-                    ws = weights.plane.register(
-                        key, self._source(name, checkpoint, refs, layout), plan, ids, host_fd=held
-                    )
-            except plane.error("Invalid"):
-                if held is None:
-                    raise
-                ws = None  # the held tier is not this layout after all
-            finally:
-                if held is not None:
-                    os.close(held)  # the plane reopened its own description
-                for _, _, fd in files:
-                    os.close(fd)  # the plane duplicated each
-            if ws is None:
-                held, sealed = None, False
-                ws = weights.plane.register(
-                    key, self._source(name, checkpoint, refs, layout), plan, ids
-                )
-        spans = msgspec.convert(ws.regions, list[_Span])
-        placed = {row.what: row for row in msgspec.convert(ws.parts, list[_Placed])}
-        sites = _sites(root, name)
-        regions: list[Region] = []
-        for (index, group), span in zip(kept, spans, strict=True):
-            region = Region(
-                index=len(regions),
-                path=units[index - 1][0] if index else "",
-                module=root.get_submodule(units[index - 1][0]) if index else root,
-                weights=[],
-                offset=span.offset,
-                span=span.span,
-            )
-            for key in group:
-                row = self.plan[key]
-                weight = Weight(
-                    row=row,
-                    route=self._route(key),
-                    provider=self.selected[key].provider,
-                    parts={
-                        part.role: (
-                            placed[row.role_what(part.role)].offset - span.offset,
-                            part.dtype,
-                            tuple(part.shape),
-                        )
-                        for part in row.encoded.parts
-                    },
-                    sites=sites.get(key, []),
-                )
-                if key in self.leaves:
-                    weight.leaf, weight.replaced, weight.derived_roles = self.leaves[key]
-                    region.unbound.extend(
-                        (weight.leaf._buffers, role, unbound(self.torch, tensor, weights.device))
-                        for role, tensor in weight.leaf.roles().items()
-                    )
-                region.unbound.extend(
-                    (table, attr, unbound(self.torch, table[attr], weights.device))
-                    for table, attr, _ in weight.sites
-                )
-                region.weights.append(weight)
-            unbind(region)
-            regions.append(region)
-        common = regions[0] if kept[0][0] == 0 else None
-        blocks = [region for region in regions if region is not common]
-        component = Component(
-            name=name,
-            key=f"{self.construction}/{name}",
-            root=root,
-            ws=ws,
-            device=weights.index,
-            regions=regions,
-            sealed=sealed,
-            common=common,
-            blocks=blocks,
-            layout=weight_policy.Layout(
-                common=common.span if common else 0,
-                blocks=tuple(region.span for region in blocks),
-                fine=None if layout.fine else _fine(root),
-            ),
-            fine=layout.fine,
-            staging=(layout.sealed, tiers)
-            if sealed and tiers is not None and tiers.stage
-            else None,
-            staged=set(staged),
-            manifest=manifest,
-            objects=layout.objects,
-            # a store source waited for every object before its lease
-            landed=set(range(len(regions))) if here or not sealed else set(),
-        )
-        for region in regions:
-            for table, attr, standin in region.unbound:
-                setattr(standin, "origin", (weights, component, region, table, attr))  # noqa: B010
-            region.bakes = _lora_layers(root, region)
-            region.bake = _bakes_here(weights, component, region)
-            region.locate = weights.content
-        if any(region.bake for region in regions):  # its kernels build at load, in a child
-            lora_bake.warm(weights.device.index or 0)
-        if not refine:
-            weights.attach(component)
-        return component
+        raise _REGISTER_PENDING()
 
 
 @dataclass(frozen=True, slots=True)
@@ -3259,25 +3003,6 @@ class HostTiers:
     files: Callable[[SealedPlan, list[tuple[str, int]]], list[tuple[str, int, int]]] | None = None
 
 
-@dataclass(frozen=True, slots=True)
-class _Prepared:
-    """One component's layout before it registers: its keys, block units, kept groups,
-    checkpoint, read plan, region ids and digest, and the plan the machine fills from."""
-
-    keys: list[str]
-    units: list[tuple[str, ...]]
-    kept: list[tuple[int, list[str]]]
-    checkpoint: Checkpoint
-    plan: ReadPlan
-    ids: list[list[str]]
-    digest: str
-    sealed: SealedPlan
-    #: regions of at most `REGION_LIMIT` bytes
-    fine: bool
-    #: each region's objects, in read order
-    objects: list[list[Ref]]
-
-
 class _Span(msgspec.Struct, frozen=True):
     index: int
     offset: int
@@ -3301,7 +3026,10 @@ def _lora_layers(root: Module, region: Region) -> list[Bake]:
     for index, weight in enumerate(region.weights):
         roles = {role: dtype for role, (_, dtype, _) in weight.parts.items()}
         site = weight.row.name.removesuffix(".weight")
-        if site == weight.row.name or not lora_bake.bakeable(roles):
+        encoded = weight.row.encoded
+        if site == weight.row.name or not lora_bake.bakeable(
+            encoded.scheme, dict(encoded.params), roles
+        ):
             continue
         bake = Bake(index)
         try:
@@ -4776,16 +4504,6 @@ def _ordered(regions: Sequence[Sequence[Ref]], order: Iterable[int] | None = Non
     """The objects of `regions` in `order` (default: address order), each once."""
     picked = range(len(regions)) if order is None else order
     return list(dict.fromkeys(ref for index in picked for ref in regions[index]))
-
-
-def _objects(plan: ReadPlan) -> list[tuple[str, int]]:
-    """The objects `plan` reads, `(sha256 hex, length)` in SHA-256 order."""
-    found = {
-        item["object"].removeprefix("sha256:"): item["object_length"]
-        for item in plan.items()
-        if item.get("source") == "object"
-    }
-    return sorted(found.items())
 
 
 def _stage_stream(

@@ -108,6 +108,7 @@ TORCH_DTYPES: dict[str, str] = {
     "f64": "float64",
     "f8_e4m3fn": "float8_e4m3fn",
     "f8_e5m2": "float8_e5m2",
+    "f8_e8m0": "float8_e8m0fnu",
     "i64": "int64",
     "i32": "int32",
     "i16": "int16",
@@ -117,6 +118,24 @@ TORCH_DTYPES: dict[str, str] = {
 }
 
 _CANONICAL_DTYPES = {torch_name: name for name, torch_name in TORCH_DTYPES.items()}
+
+#: TensorFS (safetensors) dtype name -> this runtime's name, and back: the one boundary table.
+TENSORFS_DTYPES: dict[str, str] = {
+    "F16": "f16",
+    "BF16": "bf16",
+    "F32": "f32",
+    "F64": "f64",
+    "F8_E4M3": "f8_e4m3fn",
+    "F8_E5M2": "f8_e5m2",
+    "F8_E8M0": "f8_e8m0",
+    "I64": "i64",
+    "I32": "i32",
+    "I16": "i16",
+    "I8": "i8",
+    "U8": "u8",
+    "BOOL": "bool",
+}
+TENSORFS_NAMES: dict[str, str] = {name: tfs for tfs, name in TENSORFS_DTYPES.items()}
 
 
 def canonical_dtype(spelling: object) -> str:

@@ -1,0 +1,827 @@
+{
+ "device": {
+  "configuration": "140.00W/[N/A]",
+  "cuda_runtime": "13.0",
+  "driver": "580.178.04/apiunreadable",
+  "index": 0,
+  "kind": "cuda",
+  "name": "NVIDIA RTX A4000",
+  "os_arch": "Linux/x86_64",
+  "sm": 86
+ },
+ "device_predicate": "cuda.sm86",
+ "observations": [
+  {
+   "delivery_route": "verbatim",
+   "device_predicate": "cuda.sm86",
+   "evidence": {
+    "kind": "verbatim",
+    "note": "no decode: the stored bytes ARE the logical bytes, and the fill plane's source-comparison proves them byte for byte",
+    "passed": true,
+    "route_axes": {
+     "deviation_rel": -1.0,
+     "resident_bits_per_element": -1.0
+    }
+   },
+   "geometry_class": "rank2.block32",
+   "implementation": "cozy.plain.verbatim/1",
+   "implementation_digest": "sha256:63716b70257e9706f125f1e825da6d2f3cfdc47a4f0dbaa95a5380c6aeb7b027",
+   "implementation_revision": "1",
+   "output_dtype": "bfloat16",
+   "scheme": "plain"
+  },
+  {
+   "delivery_route": "verbatim",
+   "device_predicate": "cuda.sm86",
+   "evidence": {
+    "kind": "verbatim",
+    "note": "no decode: the stored bytes ARE the logical bytes, and the fill plane's source-comparison proves them byte for byte",
+    "passed": true,
+    "route_axes": {
+     "deviation_rel": -1.0,
+     "resident_bits_per_element": -1.0
+    }
+   },
+   "geometry_class": "rank2.block32",
+   "implementation": "cozy.plain.verbatim/1",
+   "implementation_digest": "sha256:63716b70257e9706f125f1e825da6d2f3cfdc47a4f0dbaa95a5380c6aeb7b027",
+   "implementation_revision": "1",
+   "output_dtype": "float16",
+   "scheme": "plain"
+  },
+  {
+   "delivery_route": "verbatim",
+   "device_predicate": "cuda.sm86",
+   "evidence": {
+    "kind": "verbatim",
+    "note": "no decode: the stored bytes ARE the logical bytes, and the fill plane's source-comparison proves them byte for byte",
+    "passed": true,
+    "route_axes": {
+     "deviation_rel": -1.0,
+     "resident_bits_per_element": -1.0
+    }
+   },
+   "geometry_class": "rank2.block32",
+   "implementation": "cozy.plain.verbatim/1",
+   "implementation_digest": "sha256:63716b70257e9706f125f1e825da6d2f3cfdc47a4f0dbaa95a5380c6aeb7b027",
+   "implementation_revision": "1",
+   "output_dtype": "float32",
+   "scheme": "plain"
+  },
+  {
+   "delivery_route": "decoded_float",
+   "device_predicate": "cuda.sm86",
+   "evidence": {
+    "kind": "decode",
+    "micro_bench": {
+     "decode_ns": 227183,
+     "gb_per_s": 55.423,
+     "reps": 8,
+     "shape": [
+      2048,
+      2048
+     ]
+    },
+    "numerics": {
+     "domain": {
+      "nan": 512,
+      "normal": 64512,
+      "overflow": 0,
+      "subnormal": 512,
+      "underflow": 0
+     },
+     "first_wrong": "",
+     "max_abs_error": 0.0,
+     "max_rel_error": 0.0,
+     "nan_preserved": true,
+     "pairs": 65536,
+     "passed": true,
+     "subnormal_tolerance": 1.8367099231598242e-40,
+     "tolerance": 0.015625,
+     "wrong": {
+      "nan": 0,
+      "normal": 0,
+      "overflow": 0,
+      "subnormal": 0,
+      "underflow": 0
+     }
+    },
+    "passed": true,
+    "route_axes": {
+     "deviation_rel": 0.0028968125527333312,
+     "resident_bits_per_element": 16.0
+    },
+    "spec_vectors": {
+     "cases": [
+      {
+       "differing_bytes": 0,
+       "elements": 512,
+       "name": "fp8-rowwise-keepdim-16x32-f32",
+       "passed": true
+      },
+      {
+       "differing_bytes": 0,
+       "elements": 512,
+       "name": "fp8-rowwise-keepdim-16x32-bf16",
+       "passed": true
+      }
+     ],
+     "kind": "spec-vectors",
+     "passed": true
+    }
+   },
+   "geometry_class": "rank2.block32",
+   "implementation": "cozy.fp8-rowwise.dequant/1",
+   "implementation_digest": "sha256:d61890abde414d7b3348245c173127403e6c8d174210313483884b8ae6c50220",
+   "implementation_revision": "2",
+   "output_dtype": "bfloat16",
+   "scheme": "fp8-rowwise"
+  },
+  {
+   "delivery_route": "decoded_float",
+   "device_predicate": "cuda.sm86",
+   "evidence": {
+    "kind": "decode",
+    "micro_bench": {
+     "decode_ns": 226876,
+     "gb_per_s": 55.498,
+     "reps": 8,
+     "shape": [
+      2048,
+      2048
+     ]
+    },
+    "numerics": {
+     "domain": {
+      "nan": 512,
+      "normal": 30800,
+      "overflow": 14584,
+      "subnormal": 13480,
+      "underflow": 6160
+     },
+     "first_wrong": "",
+     "max_abs_error": 2.9802322387695312e-08,
+     "max_rel_error": 0.0,
+     "nan_preserved": true,
+     "pairs": 65536,
+     "passed": true,
+     "subnormal_tolerance": 1.1920928955078125e-07,
+     "tolerance": 0.001953125,
+     "wrong": {
+      "nan": 0,
+      "normal": 0,
+      "overflow": 0,
+      "subnormal": 0,
+      "underflow": 0
+     }
+    },
+    "passed": true,
+    "route_axes": {
+     "deviation_rel": 0.0003630656623635043,
+     "resident_bits_per_element": 16.0
+    },
+    "spec_vectors": {
+     "cases": [
+      {
+       "differing_bytes": 0,
+       "elements": 512,
+       "name": "fp8-rowwise-keepdim-16x32-f32",
+       "passed": true
+      },
+      {
+       "differing_bytes": 0,
+       "elements": 512,
+       "name": "fp8-rowwise-keepdim-16x32-bf16",
+       "passed": true
+      }
+     ],
+     "kind": "spec-vectors",
+     "passed": true
+    }
+   },
+   "geometry_class": "rank2.block32",
+   "implementation": "cozy.fp8-rowwise.dequant/1",
+   "implementation_digest": "sha256:d61890abde414d7b3348245c173127403e6c8d174210313483884b8ae6c50220",
+   "implementation_revision": "2",
+   "output_dtype": "float16",
+   "scheme": "fp8-rowwise"
+  },
+  {
+   "delivery_route": "decoded_float",
+   "device_predicate": "cuda.sm86",
+   "evidence": {
+    "kind": "decode",
+    "micro_bench": {
+     "decode_ns": 245741,
+     "gb_per_s": 85.373,
+     "reps": 8,
+     "shape": [
+      2048,
+      2048
+     ]
+    },
+    "numerics": {
+     "domain": {
+      "nan": 512,
+      "normal": 64512,
+      "overflow": 0,
+      "subnormal": 512,
+      "underflow": 0
+     },
+     "first_wrong": "",
+     "max_abs_error": 0.0,
+     "max_rel_error": 0.0,
+     "nan_preserved": true,
+     "pairs": 65536,
+     "passed": true,
+     "subnormal_tolerance": 2.802596928649634e-45,
+     "tolerance": 2.384185791015625e-07,
+     "wrong": {
+      "nan": 0,
+      "normal": 0,
+      "overflow": 0,
+      "subnormal": 0,
+      "underflow": 0
+     }
+    },
+    "passed": true,
+    "route_axes": {
+     "deviation_rel": 4.687983043319e-07,
+     "resident_bits_per_element": 32.0
+    },
+    "spec_vectors": {
+     "cases": [
+      {
+       "differing_bytes": 0,
+       "elements": 512,
+       "name": "fp8-rowwise-keepdim-16x32-f32",
+       "passed": true
+      },
+      {
+       "differing_bytes": 0,
+       "elements": 512,
+       "name": "fp8-rowwise-keepdim-16x32-bf16",
+       "passed": true
+      }
+     ],
+     "kind": "spec-vectors",
+     "passed": true
+    }
+   },
+   "geometry_class": "rank2.block32",
+   "implementation": "cozy.fp8-rowwise.dequant/1",
+   "implementation_digest": "sha256:d61890abde414d7b3348245c173127403e6c8d174210313483884b8ae6c50220",
+   "implementation_revision": "2",
+   "output_dtype": "float32",
+   "scheme": "fp8-rowwise"
+  },
+  {
+   "delivery_route": "encoded_gemm",
+   "device_predicate": "cuda.sm86",
+   "evidence": {
+    "kind": "unmeasured",
+    "note": "cozy.fp8-rowwise.native-leaf/1 declares the floor cuda.sm89+ and this device is cuda.sm86; its suite is not run and it mints no record",
+    "passed": false,
+    "route_axes": {
+     "deviation_rel": -1.0,
+     "resident_bits_per_element": -1.0
+    }
+   },
+   "geometry_class": "rank2.block32",
+   "implementation": "cozy.fp8-rowwise.native-leaf/1",
+   "implementation_digest": "sha256:5406670cdf997ab0e09a8f2c7756a1006147cb52edbd5071c03f447f20fc2956",
+   "implementation_revision": "1",
+   "output_dtype": "bfloat16",
+   "scheme": "fp8-rowwise"
+  },
+  {
+   "delivery_route": "encoded_gemm",
+   "device_predicate": "cuda.sm86",
+   "evidence": {
+    "kind": "unmeasured",
+    "note": "cozy.fp8-rowwise.native-leaf/1 declares the floor cuda.sm89+ and this device is cuda.sm86; its suite is not run and it mints no record",
+    "passed": false,
+    "route_axes": {
+     "deviation_rel": -1.0,
+     "resident_bits_per_element": -1.0
+    }
+   },
+   "geometry_class": "rank2.block32",
+   "implementation": "cozy.fp8-rowwise.native-leaf/1",
+   "implementation_digest": "sha256:5406670cdf997ab0e09a8f2c7756a1006147cb52edbd5071c03f447f20fc2956",
+   "implementation_revision": "1",
+   "output_dtype": "float16",
+   "scheme": "fp8-rowwise"
+  },
+  {
+   "delivery_route": "encoded_gemm",
+   "device_predicate": "cuda.sm86",
+   "evidence": {
+    "kind": "unmeasured",
+    "note": "cozy.fp8-rowwise.native-leaf/1 declares the floor cuda.sm89+ and this device is cuda.sm86; its suite is not run and it mints no record",
+    "passed": false,
+    "route_axes": {
+     "deviation_rel": -1.0,
+     "resident_bits_per_element": -1.0
+    }
+   },
+   "geometry_class": "rank2.block32",
+   "implementation": "cozy.fp8-rowwise.native-leaf/1",
+   "implementation_digest": "sha256:5406670cdf997ab0e09a8f2c7756a1006147cb52edbd5071c03f447f20fc2956",
+   "implementation_revision": "1",
+   "output_dtype": "float32",
+   "scheme": "fp8-rowwise"
+  },
+  {
+   "delivery_route": "decoded_float",
+   "device_predicate": "cuda.sm86",
+   "evidence": {
+    "kind": "decode",
+    "micro_bench": {
+     "decode_ns": 151959,
+     "gb_per_s": 82.805,
+     "reps": 8,
+     "shape": [
+      2048,
+      2048
+     ]
+    },
+    "numerics": {
+     "max_abs_error": 0.0,
+     "max_rel_error": 0.0,
+     "nan_preserved": true,
+     "passed": true,
+     "patterns": 256,
+     "tolerance": 0.015625
+    },
+    "passed": true,
+    "route_axes": {
+     "deviation_rel": 0.0035039261951316392,
+     "resident_bits_per_element": 16.0
+    },
+    "spec_vectors": {
+     "cases": [
+      {
+       "differing_bytes": 0,
+       "elements": 512,
+       "name": "fp8-scaled-scalar-16x32-f32",
+       "passed": true
+      },
+      {
+       "differing_bytes": 0,
+       "elements": 512,
+       "name": "fp8-scaled-scalar-16x32-bf16",
+       "passed": true
+      },
+      {
+       "differing_bytes": 0,
+       "elements": 512,
+       "name": "fp8-scaled-scalar-16x32-f16",
+       "passed": true
+      }
+     ],
+     "kind": "spec-vectors",
+     "passed": true
+    }
+   },
+   "geometry_class": "rank2.block32",
+   "implementation": "cozy.fp8-tensorwise.dequant/1",
+   "implementation_digest": "sha256:35009464aa992865908ecb835c3473b9728eee16bb8d2fcb0bdaa0426691f5b0",
+   "implementation_revision": "1",
+   "output_dtype": "bfloat16",
+   "scheme": "fp8-tensorwise"
+  },
+  {
+   "delivery_route": "decoded_float",
+   "device_predicate": "cuda.sm86",
+   "evidence": {
+    "kind": "decode",
+    "micro_bench": {
+     "decode_ns": 153799,
+     "gb_per_s": 81.814,
+     "reps": 8,
+     "shape": [
+      2048,
+      2048
+     ]
+    },
+    "numerics": {
+     "max_abs_error": 0.0,
+     "max_rel_error": 0.0,
+     "nan_preserved": true,
+     "passed": true,
+     "patterns": 256,
+     "tolerance": 0.001953125
+    },
+    "passed": true,
+    "route_axes": {
+     "deviation_rel": 0.000519945201167108,
+     "resident_bits_per_element": 16.0
+    },
+    "spec_vectors": {
+     "cases": [
+      {
+       "differing_bytes": 0,
+       "elements": 512,
+       "name": "fp8-scaled-scalar-16x32-f32",
+       "passed": true
+      },
+      {
+       "differing_bytes": 0,
+       "elements": 512,
+       "name": "fp8-scaled-scalar-16x32-bf16",
+       "passed": true
+      },
+      {
+       "differing_bytes": 0,
+       "elements": 512,
+       "name": "fp8-scaled-scalar-16x32-f16",
+       "passed": true
+      }
+     ],
+     "kind": "spec-vectors",
+     "passed": true
+    }
+   },
+   "geometry_class": "rank2.block32",
+   "implementation": "cozy.fp8-tensorwise.dequant/1",
+   "implementation_digest": "sha256:35009464aa992865908ecb835c3473b9728eee16bb8d2fcb0bdaa0426691f5b0",
+   "implementation_revision": "1",
+   "output_dtype": "float16",
+   "scheme": "fp8-tensorwise"
+  },
+  {
+   "delivery_route": "decoded_float",
+   "device_predicate": "cuda.sm86",
+   "evidence": {
+    "kind": "decode",
+    "micro_bench": {
+     "decode_ns": 245035,
+     "gb_per_s": 85.586,
+     "reps": 8,
+     "shape": [
+      2048,
+      2048
+     ]
+    },
+    "numerics": {
+     "max_abs_error": 0.0,
+     "max_rel_error": 0.0,
+     "nan_preserved": true,
+     "passed": true,
+     "patterns": 256,
+     "tolerance": 2.384185791015625e-07
+    },
+    "passed": true,
+    "route_axes": {
+     "deviation_rel": 4.7013780833041383e-07,
+     "resident_bits_per_element": 32.0
+    },
+    "spec_vectors": {
+     "cases": [
+      {
+       "differing_bytes": 0,
+       "elements": 512,
+       "name": "fp8-scaled-scalar-16x32-f32",
+       "passed": true
+      },
+      {
+       "differing_bytes": 0,
+       "elements": 512,
+       "name": "fp8-scaled-scalar-16x32-bf16",
+       "passed": true
+      },
+      {
+       "differing_bytes": 0,
+       "elements": 512,
+       "name": "fp8-scaled-scalar-16x32-f16",
+       "passed": true
+      }
+     ],
+     "kind": "spec-vectors",
+     "passed": true
+    }
+   },
+   "geometry_class": "rank2.block32",
+   "implementation": "cozy.fp8-tensorwise.dequant/1",
+   "implementation_digest": "sha256:35009464aa992865908ecb835c3473b9728eee16bb8d2fcb0bdaa0426691f5b0",
+   "implementation_revision": "1",
+   "output_dtype": "float32",
+   "scheme": "fp8-tensorwise"
+  },
+  {
+   "delivery_route": "decoded_float",
+   "device_predicate": "cuda.sm86",
+   "evidence": {
+    "kind": "decode",
+    "micro_bench": {
+     "decode_ns": 3133944,
+     "gb_per_s": 4.018,
+     "reps": 8,
+     "shape": [
+      2048,
+      2048
+     ]
+    },
+    "numerics": {
+     "max_abs_error": 201326592.0,
+     "max_rel_error": 0.0038910505836575876,
+     "nan_preserved": true,
+     "passed": true,
+     "patterns": 65536,
+     "tolerance": 0.0078125
+    },
+    "passed": true,
+    "route_axes": {
+     "deviation_rel": 0.0028985892854582994,
+     "resident_bits_per_element": 16.0
+    },
+    "spec_vectors": {
+     "cases": [
+      {
+       "differing_bytes": 0,
+       "elements": 2048,
+       "name": "int8-convrot256-4x512-f32",
+       "passed": true
+      },
+      {
+       "differing_bytes": 0,
+       "elements": 2048,
+       "name": "int8-convrot256-4x512-bf16",
+       "passed": true
+      },
+      {
+       "differing_bytes": 0,
+       "elements": 2048,
+       "name": "int8-convrot256-4x512-f16",
+       "passed": true
+      }
+     ],
+     "kind": "spec-vectors",
+     "passed": true
+    }
+   },
+   "geometry_class": "rank2.block32",
+   "implementation": "cozy.int8-convrot.dequant/1",
+   "implementation_digest": "sha256:e2f6035ffb9453a3a2eb15bb62eb0d4b57c3d285aab1523e490f05f031ab2158",
+   "implementation_revision": "1",
+   "output_dtype": "bfloat16",
+   "scheme": "int8-convrot"
+  },
+  {
+   "delivery_route": "decoded_float",
+   "device_predicate": "cuda.sm86",
+   "evidence": {
+    "kind": "decode",
+    "micro_bench": {
+     "decode_ns": 3178049,
+     "gb_per_s": 3.962,
+     "reps": 8,
+     "shape": [
+      2048,
+      2048
+     ]
+    },
+    "numerics": {
+     "max_abs_error": 16.0,
+     "max_rel_error": 1.0,
+     "nan_preserved": true,
+     "passed": true,
+     "patterns": 65536,
+     "tolerance": 0.0009765625
+    },
+    "passed": true,
+    "route_axes": {
+     "deviation_rel": 0.00036265408705457103,
+     "resident_bits_per_element": 16.0
+    },
+    "spec_vectors": {
+     "cases": [
+      {
+       "differing_bytes": 0,
+       "elements": 2048,
+       "name": "int8-convrot256-4x512-f32",
+       "passed": true
+      },
+      {
+       "differing_bytes": 0,
+       "elements": 2048,
+       "name": "int8-convrot256-4x512-bf16",
+       "passed": true
+      },
+      {
+       "differing_bytes": 0,
+       "elements": 2048,
+       "name": "int8-convrot256-4x512-f16",
+       "passed": true
+      }
+     ],
+     "kind": "spec-vectors",
+     "passed": true
+    }
+   },
+   "geometry_class": "rank2.block32",
+   "implementation": "cozy.int8-convrot.dequant/1",
+   "implementation_digest": "sha256:e2f6035ffb9453a3a2eb15bb62eb0d4b57c3d285aab1523e490f05f031ab2158",
+   "implementation_revision": "1",
+   "output_dtype": "float16",
+   "scheme": "int8-convrot"
+  },
+  {
+   "delivery_route": "decoded_float",
+   "device_predicate": "cuda.sm86",
+   "evidence": {
+    "kind": "decode",
+    "micro_bench": {
+     "decode_ns": 3154035,
+     "gb_per_s": 6.652,
+     "reps": 8,
+     "shape": [
+      2048,
+      2048
+     ]
+    },
+    "numerics": {
+     "max_abs_error": 0.0,
+     "max_rel_error": 0.0,
+     "nan_preserved": true,
+     "passed": true,
+     "patterns": 65536,
+     "tolerance": 1.1920928955078125e-07
+    },
+    "passed": true,
+    "route_axes": {
+     "deviation_rel": 4.692735873106296e-07,
+     "resident_bits_per_element": 32.0
+    },
+    "spec_vectors": {
+     "cases": [
+      {
+       "differing_bytes": 0,
+       "elements": 2048,
+       "name": "int8-convrot256-4x512-f32",
+       "passed": true
+      },
+      {
+       "differing_bytes": 0,
+       "elements": 2048,
+       "name": "int8-convrot256-4x512-bf16",
+       "passed": true
+      },
+      {
+       "differing_bytes": 0,
+       "elements": 2048,
+       "name": "int8-convrot256-4x512-f16",
+       "passed": true
+      }
+     ],
+     "kind": "spec-vectors",
+     "passed": true
+    }
+   },
+   "geometry_class": "rank2.block32",
+   "implementation": "cozy.int8-convrot.dequant/1",
+   "implementation_digest": "sha256:e2f6035ffb9453a3a2eb15bb62eb0d4b57c3d285aab1523e490f05f031ab2158",
+   "implementation_revision": "1",
+   "output_dtype": "float32",
+   "scheme": "int8-convrot"
+  },
+  {
+   "delivery_route": "encoded_gemm",
+   "device_predicate": "cuda.sm86",
+   "evidence": {
+    "kind": "native",
+    "micro_bench": {
+     "float_gemm_ns": 47865,
+     "leaf_ns": 930838,
+     "reps": 8,
+     "shape": [
+      256,
+      2048,
+      2048
+     ],
+     "speedup_x": 0.0514
+    },
+    "numerics": {
+     "deviation_rel": 0.011806404328407724,
+     "finite": true,
+     "kind": "native",
+     "out_dtype": "bfloat16",
+     "out_dtype_is_contract": true,
+     "passed": true,
+     "shape": [
+      256,
+      2048,
+      2048
+     ],
+     "tolerance": 0.3
+    },
+    "passed": true,
+    "route_axes": {
+     "deviation_rel": 0.011806404328407724,
+     "resident_bits_per_element": 8.015625
+    }
+   },
+   "geometry_class": "rank2.block32",
+   "implementation": "cozy.int8-convrot256.native-leaf/1",
+   "implementation_digest": "sha256:82761f6134e733db9c763221a4b7d447626090725bcffececfb714b0eff5e3ea",
+   "implementation_revision": "1",
+   "output_dtype": "bfloat16",
+   "scheme": "int8-convrot"
+  },
+  {
+   "delivery_route": "encoded_gemm",
+   "device_predicate": "cuda.sm86",
+   "evidence": {
+    "kind": "native",
+    "micro_bench": {
+     "float_gemm_ns": 48543,
+     "leaf_ns": 1444714,
+     "reps": 8,
+     "shape": [
+      256,
+      2048,
+      2048
+     ],
+     "speedup_x": 0.0336
+    },
+    "numerics": {
+     "deviation_rel": 0.011679828226659302,
+     "finite": true,
+     "kind": "native",
+     "out_dtype": "float16",
+     "out_dtype_is_contract": true,
+     "passed": true,
+     "shape": [
+      256,
+      2048,
+      2048
+     ],
+     "tolerance": 0.3
+    },
+    "passed": true,
+    "route_axes": {
+     "deviation_rel": 0.011679828226659302,
+     "resident_bits_per_element": 8.015625
+    }
+   },
+   "geometry_class": "rank2.block32",
+   "implementation": "cozy.int8-convrot256.native-leaf/1",
+   "implementation_digest": "sha256:82761f6134e733db9c763221a4b7d447626090725bcffececfb714b0eff5e3ea",
+   "implementation_revision": "1",
+   "output_dtype": "float16",
+   "scheme": "int8-convrot"
+  },
+  {
+   "delivery_route": "encoded_gemm",
+   "device_predicate": "cuda.sm86",
+   "evidence": {
+    "kind": "native",
+    "micro_bench": {
+     "float_gemm_ns": 193767,
+     "leaf_ns": 916062,
+     "reps": 8,
+     "shape": [
+      256,
+      2048,
+      2048
+     ],
+     "speedup_x": 0.2115
+    },
+    "numerics": {
+     "deviation_rel": 0.01167574389546487,
+     "finite": true,
+     "kind": "native",
+     "out_dtype": "float32",
+     "out_dtype_is_contract": true,
+     "passed": true,
+     "shape": [
+      256,
+      2048,
+      2048
+     ],
+     "tolerance": 0.3
+    },
+    "passed": true,
+    "route_axes": {
+     "deviation_rel": 0.01167574389546487,
+     "resident_bits_per_element": 8.015625
+    }
+   },
+   "geometry_class": "rank2.block32",
+   "implementation": "cozy.int8-convrot256.native-leaf/1",
+   "implementation_digest": "sha256:82761f6134e733db9c763221a4b7d447626090725bcffececfb714b0eff5e3ea",
+   "implementation_revision": "1",
+   "output_dtype": "float32",
+   "scheme": "int8-convrot"
+  }
+ ],
+ "runtime": {
+  "release": "0.24.4",
+  "source_digest": "sha256:92dff6b23eaae91e97b8a00ad2764e77ec64ba3cac273f0a2b680546fff7b180",
+  "torch_build": "2.14.0+cu130"
+ },
+ "runtime_release": "0.24.4",
+ "suite_ms": 3538,
+ "tuple": "cuda/NVIDIA RTX A4000/dev0/140.00W/[N/A]/driver=580.178.04/apiunreadable/cudart=13.0/Linux/x86_64"
+}

@@ -296,11 +296,11 @@ def _int8(site: Any) -> None:
     for name in ("to_q", "to_k", "to_v"):
         linear = getattr(site, name)
         roles = {
-            "data": torch.zeros(linear.out_features, linear.in_features, dtype=torch.int8),
+            "weight": torch.zeros(linear.out_features, linear.in_features, dtype=torch.int8),
             "scale": torch.ones(linear.out_features),
         }
         leaf = _native_leaf_class(torch)(
-            None, roles, None, torch.bfloat16, INT8_CONVROT, "int8-convrot256/1",
+            None, roles, None, torch.bfloat16, INT8_CONVROT, "int8-convrot",
             linear.in_features, linear.out_features,
         )  # fmt: skip
         setattr(site, name, leaf)

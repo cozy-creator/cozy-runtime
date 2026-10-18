@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import json
 from types import SimpleNamespace
 from typing import cast
 from weakref import WeakValueDictionary
@@ -13,9 +12,9 @@ import pytest
 
 from cozy_runtime.author import Artifact, CheckpointUnnormalized, Config, Loader, ModelFitRefused
 from cozy_runtime.author._loader import Backend, Census, Fit
-from cozy_runtime.internal import model_config, storage_admission
+from cozy_runtime.internal import storage_admission
 
-RAW = {"converter": "identity/1", "dialect": "safetensors", "state": "raw"}
+REMEDY = "stored as-is: re-import it once a TensorFS converter recognizes its layout"
 
 
 @pytest.fixture(autouse=True)
@@ -24,15 +23,14 @@ def isolated_admission(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_a_construction_failing_on_an_as_is_checkpoint_names_the_fix() -> None:
-    remedy = model_config.unnormalized({"normalization": json.dumps(RAW).encode()})
-    artifact = Artifact("as-is", {}, Config({}), unnormalized=remedy)
+    artifact = Artifact("as-is", {}, Config({}), unnormalized=REMEDY)
 
     class Sdxl:  # reads the component configs an as-is single file does not carry
         def __init__(self, config: Config) -> None:
             self.components = {"unet": config.mapping()["unet"]}
 
     loader = Loader(artifact, owner=SimpleNamespace())
-    with pytest.raises(CheckpointUnnormalized, match="normalize job") as failed:
+    with pytest.raises(CheckpointUnnormalized, match="re-import") as failed:
         loader.construct(Sdxl, factory=Sdxl)
     assert isinstance(failed.value.__cause__, KeyError)
 
@@ -47,7 +45,7 @@ def test_a_construction_failing_on_an_as_is_checkpoint_names_the_fix() -> None:
             self.components: dict[str, object] = {}
 
     loader = Loader(artifact, owner=SimpleNamespace(), backend=cast(Backend, Verdict()))
-    with pytest.raises(ModelFitRefused, match="normalize job") as refused:
+    with pytest.raises(ModelFitRefused, match="re-import") as refused:
         loader.construct(Empty, factory=Empty)
     assert refused.value.code == "checkpoint_unnormalized"
     assert refused.value.fit["code"] == "missing_tensor"

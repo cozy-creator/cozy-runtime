@@ -230,7 +230,7 @@ def test_model_load_requires_sources_and_leaves_weightless_execution_usable(
     """A real control peer cannot turn an installed full Store into model authority."""
     import tensorfs
 
-    store = tensorfs.Store.init(tmp_path / "store")
+    store = tensorfs.Store(tmp_path / "store")
     _process, channel, start = zygote
     assert _call(channel, start)["ok"]
     binding = {"model_class": "UnimportableModel", "store": str(store.root)}

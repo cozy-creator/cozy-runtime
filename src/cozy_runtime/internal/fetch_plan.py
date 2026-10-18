@@ -1,4 +1,4 @@
-"""Runtime directs what TensorFS fetches (one-request-kind §2.6); TensorFS's fetcher downloads.
+"""Runtime directs what TensorD fetches (one-request-kind §2.6); TensorD's fetcher downloads.
 
 Each call's owner (TensorD) hands out a fresh fetch channel on every `fetch_channel` ask; it
 names only the call's selected checkpoints and ends with the call. Runtime plans in passes,
@@ -7,7 +7,7 @@ its tickets, so unused components stop and ranks change):
 
 1. **Start**, before torch and the package import: every construction's components, smallest
    first, so the imports, kernel compiles and the first stage overlap the download.
-2. **Load**: the components the code builds, in stage order, each region's objects in
+2. **Load**: the components the code builds, in stage order, each region's chunks in
    execution order. Components and tensors the code never builds are never asked for.
 3. **PrepareRequest**: the attempt re-asserts the plan, with the stage and block order this
    process learned.
@@ -23,18 +23,15 @@ it refuses ends the run `model_fetch_failed` (`machine_disk_full` for a full dis
 from __future__ import annotations
 
 import threading
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from typing import TYPE_CHECKING, Any
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from typing import TYPE_CHECKING
 
 import tensorfs
-from tensorfs.derived import SourceCapability
-from tensorfs.fetch import Fetch
 
 from cozy_runtime.author._errors import RuntimeFailure
+from cozy_runtime.tensord_channels import Fetch, Refused, Source
 
 if TYPE_CHECKING:
-    from tensorfs import ReadPlan
-
     from cozy_runtime.internal.executor_commands import Construction
 
 #: One object: `(sha256 hex, length)`.
@@ -44,46 +41,56 @@ type Group = tuple[str, list[Ref]]
 
 #: Objects per channel frame: a plan's frames stay small however large the model.
 _BATCH = 1024
-#: The planning window; any value plans the same objects.
-_WINDOW = 4 << 20
 
 
-def _items(plan: ReadPlan) -> Iterator[tuple[str, Ref]]:
-    """Each object `plan` reads, with the `<component>/<tensor>` it reads into."""
-    for item in plan.items():
-        if item["source"] == "object":
-            ref = (item["object"].removeprefix("sha256:"), item["object_length"])
-            yield item["what"].rpartition("#")[0], ref
+def tensor_chunks(ck: tensorfs.Checkpoint, component: str, key: str) -> list[Ref]:
+    """The chunks one tensor's parts live in, in order (a part continues into the chunks
+    after its first when it is longer than the rest of it)."""
+    chunks = ck.chunks
+    found: dict[Ref, None] = {}
+    for part in ck.tensors[component][key].parts.values():
+        index, start, left = part.chunk, part.offset, part.length
+        while left > 0:
+            found[chunks[index]] = None
+            left -= chunks[index][1] - start
+            index, start = index + 1, 0
+    return list(found)
 
 
 def component_objects(
-    header: bytes, component: str, keys: Sequence[str], start: int = 0
+    ck: tensorfs.Checkpoint, component: str, keys: Sequence[str], start: int = 0
 ) -> list[Ref]:
-    """The objects of one component's tensors `keys[start:]` (`keys`: all, header order)."""
-    plan = tensorfs.plan(header, [(component, key) for key in keys], [component], _WINDOW)
-    wanted = {f"{component}/{key}" for key in keys[start:]}
-    return list(dict.fromkeys(ref for what, ref in _items(plan) if what in wanted))
+    """The chunks of one component's tensors `keys[start:]` (`keys`: all, header order)."""
+    found: dict[Ref, None] = {}
+    for key in keys[start:]:
+        found.update(dict.fromkeys(tensor_chunks(ck, component, key)))
+    return list(found)
 
 
-def region_objects(plan: ReadPlan, regions: Sequence[Sequence[str]]) -> list[list[Ref]]:
-    """Each region's objects (`regions` lists `<component>/<tensor>` ids), in read order."""
-    index = {name: number for number, names in enumerate(regions) for name in names}
-    found: list[dict[Ref, None]] = [{} for _ in regions]
-    for what, ref in _items(plan):
-        found[index[what]][ref] = None
-    return [list(refs) for refs in found]
+def region_objects(ck: tensorfs.Checkpoint, regions: Sequence[Sequence[str]]) -> list[list[Ref]]:
+    """Each region's chunks (`regions` lists `<component>/<tensor>` ids), in read order."""
+    out: list[list[Ref]] = []
+    for names in regions:
+        found: dict[Ref, None] = {}
+        for name in names:
+            component, _, key = name.partition("/")
+            found.update(dict.fromkeys(tensor_chunks(ck, component, key)))
+        out.append(list(found))
+    return out
 
 
-def at_start(constructions: Sequence[Construction], header: Callable[[str], bytes]) -> list[Group]:
+def at_start(
+    constructions: Sequence[Construction], checkpoint: Callable[[str], tensorfs.Checkpoint]
+) -> list[Group]:
     """The Start pass: each construction's declared components (every one when none is
     declared), smallest first; inside one, header order. No class is known yet, and the
     small encoders a first stage uses then land first."""
     groups: list[Group] = []
     for row in constructions:
-        data = header(row.manifest)
-        table = tensorfs.parse_header(data)["components"]
+        ck = checkpoint(row.manifest)
+        table = ck.tensors
         names = [name for name in row.components or table if name in table]
-        planned = [component_objects(data, name, list(table[name])) for name in names]
+        planned = [component_objects(ck, name, list(table[name])) for name in names]
         planned.sort(key=lambda refs: sum(length for _, length in refs))
         groups += [(row.manifest, refs) for refs in planned]
     return groups
@@ -110,12 +117,8 @@ def failure(manifest: str, refs: Sequence[Ref], exc: BaseException) -> RuntimeFa
     code = getattr(exc, "code", "")
     detail = getattr(exc, "detail", str(exc))
     first = f"sha256:{refs[0][0]}" if refs else "its structure"
-    reason = "machine_disk_full" if code == "CAPACITY_EXHAUSTED" else "model_fetch_failed"
+    reason = "machine_disk_full" if code in ("CAPACITY_EXHAUSTED", "full") else "model_fetch_failed"
     return RuntimeFailure(f"{first} of {manifest[:23]}: {code} {detail}"[:900], code=reason)
-
-
-def _wire(refs: Sequence[Ref]) -> list[Any]:
-    return [{"sha256": sha, "length": length} for sha, length in refs]
 
 
 def _code(exc: BaseException) -> str:
@@ -177,7 +180,7 @@ class Fetches:
     def _replan(self) -> None:
         planned = self.groups
         fd = self._ask()
-        fresh = Fetch.from_fd(fd) if fd >= 0 else None
+        fresh = Fetch(fd) if fd >= 0 else None
         if fresh is not None:
             for rank, (manifest, refs) in enumerate(planned):
                 self._send(fresh, manifest, refs, rank)
@@ -200,9 +203,9 @@ class Fetches:
                 rank, self._rank = self._rank, self._rank + 1
             try:
                 for start in range(0, len(refs), _BATCH):
-                    channel.schedule(manifest, _wire(refs[start : start + _BATCH]), rank)
+                    channel.schedule(manifest, refs[start : start + _BATCH], rank)
                 return
-            except (tensorfs.errors.Refusal, OSError) as exc:
+            except (Refused, OSError) as exc:
                 if again or not self._gone(channel, exc):
                     if not self._unfetchable(manifest, exc):
                         raise
@@ -215,8 +218,8 @@ class Fetches:
             if channel is None or manifest in self._whole or not refs:
                 return True
             try:
-                return all(channel.present(manifest, _wire(refs)))
-            except (tensorfs.errors.Refusal, OSError) as exc:
+                return all(channel.present(manifest, refs))
+            except (Refused, OSError) as exc:
                 if again or not self._gone(channel, exc):
                     return self._unfetchable(manifest, exc)
         return True
@@ -228,11 +231,11 @@ class Fetches:
             if channel is None or manifest in self._whole or not refs:
                 return
             try:
-                if not all(channel.present(manifest, _wire(refs))):
+                if not all(channel.present(manifest, refs)):
                     self._progress(*self._landed(channel))
-                    channel.wait(manifest, _wire(refs))
+                    channel.wait(manifest, refs)
                 return
-            except (tensorfs.errors.Refusal, OSError) as exc:
+            except (Refused, OSError) as exc:
                 if again or not self._gone(channel, exc):
                     if not self._unfetchable(manifest, exc):
                         raise failure(manifest, refs, exc) from None
@@ -274,15 +277,15 @@ class Fetches:
             return
         try:
             for start in range(0, len(refs), _BATCH):
-                channel.schedule(manifest, _wire(refs[start : start + _BATCH]), rank)
-        except (tensorfs.errors.Refusal, OSError) as exc:
+                channel.schedule(manifest, refs[start : start + _BATCH], rank)
+        except (Refused, OSError) as exc:
             if not self._unfetchable(manifest, exc):
                 raise
 
     def _unfetchable(self, manifest: str, exc: BaseException) -> bool:
         """True when nothing of `manifest` is this channel's to fetch: held whole here
         (outside the grant), or the owner ended the call and with it the channel."""
-        if _code(exc) == "SOURCE_NOT_ALLOWED":
+        if _code(exc) in ("SOURCE_NOT_ALLOWED", "source_not_allowed"):
             self._whole.add(manifest)
             return True
         return isinstance(exc, OSError) or "fetch channel closed" in str(exc)
@@ -293,7 +296,7 @@ class Fetches:
         for manifest, refs in self.groups:
             if manifest in self._whole or not refs:
                 continue
-            here = channel.present(manifest, _wire(refs))
+            here = channel.present(manifest, refs)
             total += sum(length for _, length in refs)
             done += sum(length for (_, length), yes in zip(refs, here, strict=True) if yes)
         mib = 1 << 20
@@ -301,30 +304,23 @@ class Fetches:
         return line, done / total if total else 0.0
 
 
-def source(
-    fetches: Fetches, opened: SourceCapability, header: bytes, declared: Sequence[str]
-) -> SourceCapability:
+def source(fetches: Fetches, opened: Source, declared: Sequence[str]) -> Source:
     """A `Weights[M]` source with look-ahead: its declared components are wanted in header
     order when it opens, and a read of an undeclared component wants the rest of it."""
-    manifest = opened.manifest
-    table = tensorfs.parse_header(header)["components"]
+    table = opened.checkpoint.tensors
     for name in declared:
         if name in table:
-            fetches.ahead(manifest, component_objects(header, name, list(table[name])))
+            fetches.ahead(
+                opened.manifest, component_objects(opened.checkpoint, name, list(table[name]))
+            )
     started = set(declared)
 
-    def read_part(component: str, key: str, role: str, offset: int, into: object) -> None:
+    def ahead(component: str, key: str) -> None:
         if component not in started and key in table.get(component, {}):
             started.add(component)
             keys = list(table[component])
-            fetches.ahead(manifest, component_objects(header, component, keys, keys.index(key)))
-        opened.read_part_into(component, key, role, offset, into)
+            refs = component_objects(opened.checkpoint, component, keys, keys.index(key))
+            fetches.ahead(opened.manifest, refs)
 
-    return SourceCapability(
-        manifest,
-        opened.length,
-        lambda components, configs: opened.inspect(components=components, configs=configs),
-        opened.close,
-        read_part,
-        opened.check,
-    )
+    opened.ahead = ahead
+    return opened
