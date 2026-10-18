@@ -158,8 +158,10 @@ class Memory:
         self.freed = 0
         #: the attempt's refusal, for its reply
         self.refusal: dict[str, int | str] | None = None
-        #: the running stage gave weights back: its next block boundary plans it again
+        #: the running stage gave weights back: its next block boundary plans it again, in
+        #: `plan` bytes when rung 2 set it (-1: the budget it has)
         self.shrunk = False
+        self.plan = -1
         #: rung 1 asks the owner; never from inside torch's allocator
         self.asking = True
         self._collected = False
@@ -349,10 +351,17 @@ class Memory:
             self.collect()
 
     def _finer(self, short: int) -> None:
-        """The running stage's regions no block leases now leave; its next block boundary
-        plans it again in what is left (`WeightResidency._replan`)."""
-        if self.weights.shrink(short):
-            self.shrunk = True
+        """The running stage's regions no block leases now leave, and its next block boundary
+        plans it again in `short` less than it holds (`WeightResidency._replan`): a window of
+        one, then its components' finest grain, down to their floor. Nothing here moves what
+        the running block leases, so the failing op goes on to the next rung."""
+        weights = self.weights
+        freed = weights.shrink(short)
+        if weights.open:
+            held = min(weights.applied, weights._committed())
+            held = min(held, self.plan) if self.plan >= 0 else held
+            self.plan = max(held - short, weights.floor())
+        self.shrunk = self.shrunk or bool(freed or weights.open)
 
     def _count(self, rung: Rung, freed: int) -> None:
         modes = self.weights.modes
