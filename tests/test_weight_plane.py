@@ -1667,6 +1667,32 @@ def test_an_oom_at_a_block_boundary_unmaps_weights_and_retries(card: Any) -> Non
     assert same(reference, retried)
 
 
+@on_card
+def test_an_op_short_of_memory_mid_pass_drops_the_running_stages_resident_set(card: Any) -> None:
+    """H3 15 s on a 4090 after 5 s requests: the stage's cursor held its resident set in place,
+    so a 3.2 GB op found 17 GB of weights it could not unmap. The ring holds only what it
+    streams: rung 2 drops the resident blocks no block leases, before a tensor moves to host."""
+    weights = card.weights
+    model = load(weights, card.checkpoint, "finer")
+    stack = model.residency.components["stack"]
+    x = torch.randn(8192, HIDDEN, device="cuda", dtype=torch.float16)
+    weights.set_budget(stack.layout.common + 6 * stack.layout.largest)
+    reference = run(model, x, passes=3)
+    assert stack.residence is not None and stack.residence.resident and stack.residence.streamed
+    torch.cuda.empty_cache()
+    free, _ = torch.cuda.mem_get_info()
+    ballast = torch.empty(free - (48 << 20), dtype=torch.uint8, device="cuda")
+    weights.memory.used.clear()
+    try:
+        retried = run(model, x, passes=3)  # the same stage again: its cursor carries on
+    finally:
+        del ballast
+        torch.cuda.empty_cache()
+    assert weights.memory.used.get(Rung.FINER, [0, 0])[1] > 0, weights.memory.summary()
+    assert Rung.HOST not in weights.memory.used, weights.memory.summary()
+    assert same(reference, retried)
+
+
 class Table(torch.nn.Module):  # type: ignore[misc,name-defined]
     """A component with no blocks: all of it is its common region (a text encoder's
     embedding table is most of one)."""

@@ -4199,7 +4199,10 @@ class WeightResidency:
             if residence.streamed and component.observed:
                 order = component.order
                 start = order.index(resume[key]) if key in resume else 0
-                component.schedule = order[start:] + order[:start]
+                # Its ring's blocks only: a cursor holds a resident one in place until it closes,
+                # out of the ladder's reach (15 s H3 on a 4090: 17 GB pinned under a 3.2 GB op).
+                held = set(component.resident)
+                component.schedule = [i for i in order[start:] + order[:start] if i not in held]
                 component.cursor = weights.plane.stream(
                     component.ws,
                     weights.index,
