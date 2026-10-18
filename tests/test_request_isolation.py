@@ -170,7 +170,7 @@ def test_a_failed_request_frees_everything_and_never_poisons_the_executor(
     assert _serve(executor, "next", "ok")["outcome"]["terminal"] == "succeeded"
 
 
-@pytest.mark.skipif(not torch.backends.cuda.is_built(), reason="the tail reads CUDA's streams")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the tail reads CUDA's streams")
 def test_bytes_a_failed_request_leaves_allocated_recycle_the_executor(
     host: tuple[Executor, dict[str, Any]], monkeypatch: pytest.MonkeyPatch
 ) -> None:
