@@ -46,9 +46,6 @@ class Card:
     def lockable(self, want: int) -> int:
         return 0  # no host memory apart: results stay on the "device"
 
-    def spill(self, need: int, operands: Any) -> bool:
-        return False
-
 
 class Short(TorchDispatchMode):  # type: ignore[misc]
     """Every op as one out of memory whole: in bands when it can be, else as it is."""

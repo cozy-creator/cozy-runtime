@@ -25,6 +25,9 @@ LIBRARY_ROOM = 64 << 20
 #: Device bytes left free on a GPU that drives a display: its compositor allocates as windows
 #: open, and a card held at a few MiB free froze a laptop (2026-10-01).
 DISPLAY_FLOOR = 512 << 20
+#: Host memory left to everything else on the machine (the OS, other processes, the page cache
+#: weights stream through) when this process's tensors move there under pressure.
+HOST_MARGIN = 1 << 30
 #: The event model's fixed costs: one copy's issue, and one block's acquire/release hook.
 COPY_OVERHEAD_S = 20e-6
 HOOK_S = 15e-6
@@ -90,14 +93,6 @@ def free_floor(total: int, display: bool) -> int:
     """The physical free bytes nothing on a GPU may take: on one that drives a display, the
     larger of `DISPLAY_FLOOR` and a sixteenth of the card; none on any other."""
     return max(DISPLAY_FLOOR, total // 16) if display else 0
-
-
-def pinned_total(available: int, pinned: int) -> int:
-    """The most the pinned host tier may hold across the machine: half of what the host has
-    for it (free before its tightest limit, plus what is pinned already). Pinned memory is
-    unreclaimable; the other half stays for processes and the page cache, the tier's own
-    fallback. Everyone who pins (each executor, the Worker's kept tiers) shares this one sum."""
-    return (max(available, 0) + max(pinned, 0)) // 2
 
 
 def floor(layout: Layout) -> int:

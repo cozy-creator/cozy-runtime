@@ -24,6 +24,8 @@ import tensorfs
 from tensorfs import ReadLease, ReadPlan, Store
 from tensorfs import plane as _plane
 
+from cozy_runtime.internal import spill
+
 if TYPE_CHECKING:
     from tensorfs.plane import Part, Region, Trim
     from tensorfs.records import Header, ReadItem
@@ -454,6 +456,7 @@ class UnifiedPlane:
         for row, at, within in region.copies:
             ws.source.read(row, within, into[at : at + row["len"]])
         region.tensor = staging.to(self.device)
+        spill.native(torch, region.tensor)  # the plane's to place, never a spill's
         self.committed += region.span
         self.counts["fills"] += 1
         self.fill_bytes += region.span

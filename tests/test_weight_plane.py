@@ -16,7 +16,7 @@ import io
 import mmap
 import os
 from collections.abc import Collection, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -29,6 +29,7 @@ from tensorfs import Store  # noqa: E402
 from tensorfs.derived import Config as NativeConfig  # noqa: E402
 from tensorfs.derived import Derivation, Part, Target, Tensor  # noqa: E402
 
+from cozy_runtime import graphs  # noqa: E402
 from cozy_runtime.author._activity import asides  # noqa: E402
 from cozy_runtime.author._loader import census  # noqa: E402
 from cozy_runtime.author.kernels import INT8_CONVROT, rms_rope_split_half  # noqa: E402
@@ -39,6 +40,7 @@ from cozy_runtime.internal import (  # noqa: E402
     budget_cell,
     paging,
     plane,
+    proctree,
     spill,
     weight_policy,
 )
@@ -48,7 +50,7 @@ from cozy_runtime.internal.derive import Observations, serving_substrate  # noqa
 from cozy_runtime.internal.encoding import SPEC_PLAIN, SPEC_ROWWISE  # noqa: E402
 from cozy_runtime.internal.encoding.leaves import _native_leaf_class  # noqa: E402
 from cozy_runtime.internal.fill import Checkpoint  # noqa: E402
-from cozy_runtime.internal.memory import Rung  # noqa: E402
+from cozy_runtime.internal.memory import MemoryExhausted, Rung  # noqa: E402
 from cozy_runtime.internal.weights import (  # noqa: E402
     HostTiers,
     Journal,
@@ -204,6 +206,12 @@ def same(a: list[Any], b: list[Any]) -> bool:
     return all(
         torch.equal(x.view(torch.int16), y.view(torch.int16)) for x, y in zip(a, b, strict=True)
     )
+
+
+def close(a: list[Any], b: list[Any]) -> None:
+    """The same output to fp16 rounding: a linear cut into rows runs other GEMM kernels."""
+    for x, y in zip(a, b, strict=True):
+        torch.testing.assert_close(x, y, atol=2**-6, rtol=2**-7)
 
 
 def tight(model: Any) -> int:
@@ -933,12 +941,12 @@ def test_a_map_the_device_refuses_unmaps_idle_weights_and_the_stage_runs(
     weights.set_budget(-1)  # each stage's budget from what the driver has
     torch.cuda.empty_cache()
     free, _ = torch.cuda.mem_get_info()
-    moved = spill.MOVED[0]
+    moved = spill.TOTALS[0]
     weights.modes.clear()
     with held_elsewhere(free - (128 << 20)):
         got = run(stage, x, passes=1)
     assert "idle" in weights.modes["memory"], "the device refused no map"
-    assert spill.MOVED[0] == moved, "a tensor went to host memory instead"
+    assert spill.TOTALS[0] == moved, "a tensor went to host memory instead"
     assert same(expected, got)
 
 
@@ -1059,16 +1067,19 @@ def test_an_op_with_no_room_left_moves_the_tensors_the_process_holds_to_host(car
         facts = weights.facts()
     finally:
         weights.set_cap(-1)
-    assert same(reference, capped)
-    assert facts.spilled_bytes - moved >= 128 << 20
+    close(reference, capped)
+    # What does not fit goes to host memory: the held tensors, or the results of ops cut into
+    # rows (cr-203 U2/U3: a result is placed there before other tensors move for it).
+    moved = facts.spilled_bytes - moved
+    assert moved >= 128 << 20 or "host memory" in facts.modes.get("bands", ""), facts.modes
     assert all(t.is_cuda and bool((t == i).all()) for i, t in enumerate(held))
     # cudaMalloc's alignment holds in host memory too: a moved cuBLASLt workspace off it is
     # INVALID_VALUE (run 9141).
-    assert any(map(spill.hosted, held)) and all(t.data_ptr() % 256 == 0 for t in held)
-    assert spill.PRESSED[0] and spill.USED, "after a spill, ops are noted for the next one"
+    assert all(t.data_ptr() % 256 == 0 for t in held)
+    assert spill.PRESSED[0], "after a move, ops are noted for the next one"
     # Runs 10143-10144: left in host memory, a cache read at every step made a decode 5x
     # slower. With room again (the next request), they come back, values and tensors the same.
-    assert weights.restore_spilled() > 0
+    weights.restore_spilled()
     assert not any(map(spill.hosted, held))
     assert all(t.is_cuda and bool((t == i).all()) for i, t in enumerate(held))
     del x, held, capped, reference  # the input is a candidate too: no op reads it after the first
@@ -1076,6 +1087,98 @@ def test_an_op_with_no_room_left_moves_the_tensors_the_process_holds_to_host(car
     spill.release(torch)
     assert not spill.HELD, "every moved tensor is gone"
     assert not spill.PRESSED[0] and not spill.USED, "no host block left: no op is noted"
+
+
+def fill_card(weights: Weights) -> list[Any]:
+    """The package's tensors (an earlier stage's state, a decoder's leftovers) take the card:
+    64 MiB at a time until torch is refused, each holding its own index."""
+    weights.vacate()
+    torch.cuda.empty_cache()
+    held: list[Any] = []
+    with suppress(torch.OutOfMemoryError):
+        while torch.cuda.mem_get_info()[0] > 64 << 20:
+            held.append(torch.full((16 << 20,), float(len(held)), device="cuda"))
+    return held
+
+
+def host_room(monkeypatch: pytest.MonkeyPatch, room: int) -> None:
+    """What the host gives tensors leaving the device (`Weights.lockable`) held to `room`, as
+    a container limited that tightly reads it: the margin left to the rest of the host grows to
+    all but `room` of what it has."""
+    available = proctree.host_memory().available
+    if available > room + weight_policy.HOST_MARGIN:
+        monkeypatch.setattr(weight_policy, "HOST_MARGIN", available - room)
+
+
+@on_card
+@pytest.mark.parametrize("host", ["room", "full"])
+def test_a_card_the_packages_tensors_fill_runs_its_stage_through_host_and_disk(
+    card: Any, host: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """cr-203 U3. The package's tensors fill the card, and a stage then needs room for its
+    weights and activations: they leave the device and the stage computes the same output.
+    With room on the host they are mapped there in place. With the host's room down to half
+    a GiB, those no op touched since the stage began go to disk, their device bytes released,
+    and each comes back with its values when an op reads it. A copy an in-place op takes under
+    that pressure is in host memory."""
+    weights = card.weights
+    model = load(weights, card.checkpoint, f"fill-{host}")
+    x = torch.randn(1 << 16, HIDDEN, device="cuda", dtype=torch.float16)  # 256 MiB
+    with weights.recovering():
+        reference = run(model, x, passes=1)
+    model.residency.unpark()
+    if host == "full":
+        host_room(monkeypatch, 512 << 20)
+    held = fill_card(weights)
+    # what a graph reads by address (an LM engine's KV) never moves, though it is the oldest
+    graphs.native(torch, held[0])
+    at = held[0].data_ptr()
+    before = list(spill.TOTALS)
+    with weights.recovering():
+        try:
+            got = run(model, x, passes=1)
+        except MemoryExhausted as exc:
+            pytest.fail(f"{exc}; moved {spill.summary(before)}; applied {weights.applied}")
+        moved = [now - then for now, then in zip(spill.TOTALS, before, strict=True)]
+        assert moved[3] if host == "room" else moved[5], spill.summary(before)
+        assert spill.keep(x).device.type == "cpu"
+        assert held[0].data_ptr() == at, "a native storage moved"
+        close(reference, got)  # in the mode: what left the device comes back to be read
+        del got, reference
+        assert all(bool((t == i).all()) for i, t in enumerate(held)), "each one's own values"
+    del held
+    gc.collect()
+    weights.restore_spilled()
+    spill.release(torch)
+    assert not spill.OFF and not spill.PRESSED[0]
+
+
+@on_card
+def test_a_cast_over_half_the_hosts_room_lands_in_host_memory(
+    card: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Run 10861, H3 ref2va_turbo 15 s on a 4090: a 12.76 GB `aten._to_copy` had no room on
+    the card, and its result was refused host memory at half of what the host could give. A
+    cast whose result is larger than that half, under a cap that leaves it no device room, now
+    runs in bands into host memory."""
+    weights = card.weights
+    x = torch.randn(1 << 15, 1 << 15, device="cuda", dtype=torch.float16)  # 2 GiB; cast: 4 GiB
+    host_room(monkeypatch, 2 * x.nbytes + (512 << 20))  # half of it is less than the result
+    torch.cuda.empty_cache()  # the cap leaves room for no cast beside `x`, cached or not
+    weights.measure_context()
+    weights.set_cap(max(weights.context_bytes, 0) + torch.cuda.memory_reserved() + (1 << 30))
+    try:
+        with weights.recovering():
+            y = x.float()
+            assert spill.hosted(y)
+            for part in (slice(0, 256), slice(-256, None)):
+                assert torch.equal(y[part].half(), x[part])
+        assert "host memory" in weights.modes.get("bands", ""), weights.modes
+    finally:
+        weights.set_cap(-1)
+    del y
+    gc.collect()
+    spill.release(torch)
 
 
 def test_decoded_copies_count_in_a_stages_budget(tmp_path: Path) -> None:

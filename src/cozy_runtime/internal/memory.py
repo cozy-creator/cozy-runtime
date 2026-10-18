@@ -42,7 +42,7 @@ class Rung(IntEnum):
     FINER = 2  # the running stage's resident set, its components not in use
     CACHES = 3  # what is kept for speed alone: reservations (`Weights.reserve`), `RELEASERS`
     HOST = 4  # live tensors to page-locked host memory, the op's operands last
-    DISK = 5  # the pinned tier toward 0, so more can lock
+    DISK = 5  # live tensors no op touched this stage to disk, once the host can give no more
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,7 +196,7 @@ class Memory:
             leased=device.leased_bytes + device.held_bytes,
             budget=device.budget,
             shared=device.shared_bytes,
-            hosted=sum(spill.HELD.values()),
+            hosted=sum(off.nbytes for off in spill.OFF.values() if off.file is None),
             floor=weights.floor_free,
             cap=weights.cap,
         )
@@ -330,7 +330,7 @@ class Memory:
             (Rung.CACHES, lambda short: weights.shed(self.free() + short - MARGIN)),
             (Rung.CACHES, lambda _: [release() for release in RELEASERS]),
             (Rung.HOST, lambda short: weights.spill(short, operands)),
-            (Rung.DISK, lambda short: weights.unpin(short, operands)),
+            (Rung.DISK, lambda short: weights.spill(short, operands, disk=True)),
         ]
 
     def _settle(self) -> None:

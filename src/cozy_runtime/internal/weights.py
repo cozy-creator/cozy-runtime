@@ -396,6 +396,8 @@ class Weights:
         self.adaptive: dict[str, int] = {}
         self.oom_retries = 0
         self.modes: dict[str, str] = {}
+        #: `spill.TOTALS` as the attempt's first spill began: its mode counts from there
+        self.spilled_from = list(spill.TOTALS)
         #: the stages open now, outermost first. A stage another model slot enters inside one
         #: (H3's turbo LoRA inside its DiT's) is placed with it, inside the one budget.
         self.open: list[tuple[WeightResidency, str, tuple[str, ...]]] = []
@@ -829,12 +831,17 @@ class Weights:
         """Run the caller's torch ops with out-of-memory recovery: an op that cannot allocate
         runs again once room is made (a seeded op from its generator's state before it). With
         a `journal`, every write into a tensor that existed before is kept first (`Journal`).
-        Inside this plane's recovery it adds no dispatch layer (`_noting`)."""
+        Inside this plane's recovery it adds no dispatch layer (`_noting`). Leaving the
+        outermost, what is out of the device comes back while there is room: only an op in
+        this mode brings it back by itself."""
         if self.host_only:
             yield journal
             return
+        outermost = _innermost(self.torch) is None
         with _noting(self.torch, self, journal):
             yield journal
+        if outermost and spill.OFF and not self.open:  # a call's, not a block's
+            self.restore_spilled()
 
     def refused(self, need: int) -> None:
         """torch's allocator refused `need` bytes. A caller that catches that never reaches a
@@ -869,31 +876,29 @@ class Weights:
         if unmapped + weight_policy.MARGIN > self.headroom(memory):
             accel.release_cached(self.torch, self.kind)
 
-    def spill(self, need: int, operands: Sequence[object]) -> bool:
-        """The last room an op is given: this process's own tensors move to page-locked host
-        memory (`spill`), the op's operands last, never more than half of what the host has
-        free (run 5940: a 4 MP decode's 31 GB feature cache past a 62 GB container's limit).
-        The pinned tier's weights, which the page cache and disk hold too, give way first.
-        Whether any moved."""
-        if self.kind != "cuda" or self.grouped:
+    def spill(self, need: int, operands: Sequence[object], disk: bool = False) -> bool:
+        """Memory rungs 4 and 5 (`disk`): this process's own tensors leave the device (`spill`),
+        the op's operands last. Mapped to page-locked host memory while the host can give it
+        (`lockable`); those no op touched since their stage began out to host memory where
+        nothing can be mapped (unified memory, a host that locks no more), and with `disk` to
+        disk once the host can give no more. Whether any moved."""
+        if self.host_only:
             return False
-        # What is kept for speed alone (an LM's decode session, recorded graphs) goes, never
-        # to host: moved there, every later call would read it over the bus (run 10143).
-        if any([release() for release in RELEASERS]) or self.shed(need):
-            accel.release_cached(self.torch, self.kind)
-            if self.allocatable() >= need + weight_policy.MARGIN:
-                return True
+        if "spilled" not in self.modes:  # a new attempt: its own moves from here
+            self.spilled_from = list(spill.TOTALS)
         want = need + weight_policy.MARGIN
         room = self.lockable(want)
-        device = self.torch.device("cuda", self.index)
         with self.torch.utils._python_dispatch._disable_current_modes():
-            moved = spill.spill(self.torch, device, want, operands, want if room < 0 else room)
+            moved = spill.spill(
+                self.torch, self._device(), want, operands, room, not self.unified, disk
+            )
         accel.release_cached(self.torch, self.kind)
         self.limit_torch()
-        self.modes["spilled"] = (
-            f"{spill.MOVED[0]}x {spill.MOVED[1]} B to host in {spill.MOVED[2] // 1_000_000} ms"
-        )
+        self.modes["spilled"] = spill.summary(self.spilled_from)
         return moved > 0
+
+    def _device(self) -> Device:
+        return cast("Device", self.torch.device(self.device.type, self.index))
 
     def pin(self, operands: Sequence[object]) -> list[Lease]:
         """Leases on the weight regions an op that ran out of memory reads at their homes: the
@@ -931,12 +936,6 @@ class Weights:
             raise
         return held
 
-    def unpin(self, need: int, operands: Sequence[object]) -> bool:
-        """Memory rung 5: the pinned tier halves (its weights stream from the page cache and
-        disk instead), so more of this process's tensors can lock host memory."""
-        self._pin(self.pinned_applied // 2)
-        return self.spill(need, operands)
-
     def spare(self, operands: Sequence[object]) -> bool:
         """Memory rung 2: the open stages' components with no block in its forward and none of
         `operands` give their weights back (`WeightResidency._spare`); the one whose block
@@ -955,30 +954,30 @@ class Weights:
         return residency._spare({*keep, self.last}) or residency._spare(keep)
 
     def restore_spilled(self) -> int:
-        """Tensors an earlier op moved to host memory come back while the device has room
-        beside the floor and the cap: left there, a cache or a decoder's state is read over the
-        bus at every later step (runs 10143-10144: a drafted decode at 90 ms/token instead of
-        18; a prefill 3x slower). Called as a request begins, before its stages plan."""
-        if self.kind != "cuda" or self.grouped or not spill.HELD:
+        """Tensors an earlier op moved off the device come back while it has room beside the
+        floor and the cap: left mapped, a cache or a decoder's state is read over the bus at
+        every later step (runs 10143-10144: a drafted decode at 90 ms/token instead of 18; a
+        prefill 3x slower). Called as a request begins, before its stages plan."""
+        if self.host_only or not spill.OFF:
             return 0
         accel.release_cached(self.torch, self.kind)
         memory, held = self._held()
         room = memory["driver_free_bytes"] - self.floor_free - weight_policy.MARGIN
         if self.cap >= 0:
             room = min(room, self.cap - held - weight_policy.MARGIN)
-        device = self.torch.device("cuda", self.index)
         with self.torch.utils._python_dispatch._disable_current_modes():
-            back = spill.restore(self.torch, device, room)
+            back = spill.restore(self.torch, self._device(), room)
         if back:
             self.limit_torch()
             self.modes["restored"] = f"{back} B from host"
         return back
 
     def lockable(self, want: int) -> int:
-        """Host bytes this process may lock for `want` (a spill, a banded op's result): half
-        of what the host has free. A free locked block of its size is taken as it is; short of
-        room, free blocks go back to the host first, then the pinned tier's weights, which the
-        page cache and disk hold too. -1: unreadable."""
+        """Host bytes this process may take for `want` (a move off the device, a banded op's
+        result): what the host has beside a margin for everything else on it. A free locked
+        block of its size is taken as it is; short of room, free blocks go back to the host
+        first, then the pinned tier's weights, which the page cache and disk hold too.
+        -1: unreadable."""
         if spill.reusable(want):
             return want
         room = self._lockable()
@@ -986,17 +985,18 @@ class Weights:
             spill.release(self.torch)
             room = self._lockable()
         if 0 <= room < want and self.pinned_applied > 0:
-            self._pin(max(self.pinned_applied - 2 * (want - room), 0))
+            self._pin(max(self.pinned_applied - (want - room), 0))
             room = self._lockable()
         return room
 
     def _lockable(self) -> int:
-        """Half of what the host has free. -1: unreadable."""
+        """What the host has (its tightest cgroup's room, else `MemAvailable`) less its
+        margin. -1: unreadable."""
         try:
             available = proctree.host_memory().available
         except proctree.ProcessTreeUnsupported:
             return -1
-        return available // 2 if available >= 0 else -1
+        return max(available - weight_policy.HOST_MARGIN, 0) if available >= 0 else -1
 
     def activation_room(self, whole: bool = False) -> tuple[int, int]:
         """What torch can allocate now, and the mapped weight bytes no open stage holds: the
@@ -1371,9 +1371,9 @@ class Weights:
     # -- the pinned tier
 
     def host_share(self) -> int:
-        """This process's pinned tier at most: its weights, inside the machine's pinned total
-        (`weight_policy.pinned_total`) less what others pin already. -1: the host is
-        unreadable."""
+        """This process's pinned tier at most: its weights, inside what it pins now and its
+        GPU's share of what the host has beside its margin. Tensors moved off the device take
+        host memory before it (`lockable`). -1: the host is unreadable."""
         total = sum(c.ws.nbytes for c in self.components.values())
         try:
             memory = proctree.host_memory()
@@ -1381,9 +1381,8 @@ class Weights:
             return -1
         if memory.available < 0:
             return -1
-        others = max(memory.shmem - max(plane.stats(self.plane).host.used, 0), 0)
-        allowed = weight_policy.pinned_total(memory.available, memory.shmem)
-        return min(total, max(allowed - others, 0) // self.world)
+        own = max(plane.stats(self.plane).host.used, 0)
+        return min(total, own + max(memory.available - weight_policy.HOST_MARGIN, 0) // self.world)
 
     def hold_host(self) -> None:
         """Keep the pinned tier inside what the host has now, whoever set its budget: the
@@ -1580,8 +1579,8 @@ class Weights:
             squeezed=dict(self.squeezes),
             paged_out=self.paged_out[0],
             paged_out_bytes=self.paged_out[1],
-            spilled=spill.MOVED[0],
-            spilled_bytes=spill.MOVED[1],
+            spilled=spill.TOTALS[0],
+            spilled_bytes=spill.TOTALS[1],
             modes={**self.modes, **lora_bake.mode()},
         )
 
@@ -1873,9 +1872,12 @@ def _ops_type(torch: ModuleType) -> type:
             self, func: Any, types: Any, args: tuple[Any, ...] = (), kwargs: Any = None
         ) -> Any:
             kwargs = kwargs or {}
+            if spill.OFF:  # a storage out of the device comes back before an op touches it
+                retry = self.weights.memory.retry if self.weights is not None else None
+                spill.fault(torch, (*args, *kwargs.values()), retry)
             out = self._run(func, args, kwargs)
             if spill.PRESSED[0]:
-                spill.touch((*args, *kwargs.values(), out))
+                spill.touch(torch, (*args, *kwargs.values(), out))
             for journal in self.journals:
                 journal.made(out)
                 if journal.marking:
@@ -1921,7 +1923,7 @@ def _ops_type(torch: ModuleType) -> type:
                             for journal in journals if targets else ():
                                 journal.before_write(targets)
                             copied = weights is not None and not pure
-                            written = [(t, t.clone()) for t in targets] if copied else []
+                            written = [(t, spill.keep(t)) for t in targets] if copied else []
                         return func(*args, **kwargs)
                     except Exception as exc:
                         if weights is None or (short := shortage(exc)) is None:
@@ -2019,7 +2021,7 @@ class Journal:
             key = int(storage.data_ptr())
             if key in self.made_here or key in self.kept:
                 continue
-            self.kept[key] = (storage, storage.clone())
+            self.kept[key] = (storage, spill.keep(storage))
 
     def draws(self, states: Iterable[tuple[Any, Any]]) -> None:
         for generator, state in states:
@@ -3616,6 +3618,8 @@ class WeightResidency:
         self.cached = accel.reserved(weights.torch, weights.kind) - self.baseline
         self.pressure = (weights.allocatable(), weights.retries())
         accel.reset_peak(weights.torch, weights.kind)
+        if len(weights.open) == 1:
+            spill.began()
 
     def release(self, method: str, components: tuple[str, ...]) -> None:
         try:
@@ -3666,7 +3670,7 @@ class WeightResidency:
             item = peak // max(self.batch.pop(method, 1), 1)
             self.per_item[method] = max(self.per_item.get(method, 0), item)
         self.baseline = -1
-        if self.parked is None and weights.kind == "cuda":
+        if self.parked is None and not weights.host_only:
             # Host blocks no tensor holds any more are the host's again. Torch's idle device
             # cache stays: the next stage's plan trims what its weights need (`trim_cache`,
             # run 5908), and the machine asks for the rest when another tenant needs it.
