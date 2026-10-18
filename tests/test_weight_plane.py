@@ -1380,8 +1380,7 @@ class WritingStack(Stack):
 def test_a_block_that_writes_its_inputs_recovers_op_by_op(card: Any) -> None:
     """Runs 2619-2623 (Anima's VAE at 6 GiB): a block that ran out of memory after writing
     into its input in place could not run again, and the load was refused. Such a block runs
-    observed: its ops recover one by one, and its writes are journaled so the whole block can
-    run again from the input it was given."""
+    observed: its ops recover one by one, and it never runs twice."""
     weights = card.weights
     model = load(weights, card.checkpoint, "writes", factory=WritingStack)
     x = torch.randn(8192, HIDDEN, device="cuda", dtype=torch.float16)
@@ -2191,11 +2190,11 @@ def test_a_group_gpus_first_decode_keeps_its_denoisers_weights_under_a_cap(
 
 
 @on_card
-def test_a_components_call_runs_without_a_dispatch_layer_and_recovers_whole(card: Any) -> None:
-    """A component's own call inside the process's recovery: its first is observed, the next
-    pass no op through the dispatch layer, and its blocks run on the stage's held leases. One
-    that runs out of device memory outside its blocks makes room and runs again from its
-    start, exactly, its ops recovering one by one from then on."""
+def test_a_components_blocks_run_without_a_dispatch_layer_and_its_ops_recover(card: Any) -> None:
+    """A component's call inside the process's recovery: once their first run showed they
+    write nothing they did not make, its blocks run with no op through the dispatch layer, on
+    the stage's held leases; only its ops between blocks pass it. One of those that runs out
+    of device memory runs again once weights left, and the call computes the same bits."""
     weights = card.weights
     model = load(weights, card.checkpoint, "root")
     component = model.residency.components["stack"]
@@ -2222,13 +2221,14 @@ def test_a_components_call_runs_without_a_dispatch_layer_and_recovers_whole(card
             with weights.recovering(), torch.inference_mode():
                 model.stack(x)
             model.residency.release("run", ("stack",))
-        assert component.effects is not None and not component.effects.writes
+        first = counted["ops"] // 2
+        assert all(r.effects is not None and not r.effects.writes for r in component.blocks)
         assert set(component.holds) == {region.index for region in component.blocks}
         counted.update(ops=0, acquires=0)
         model.residency.admit("run", ("stack",))
         with weights.recovering(), torch.inference_mode():
             steady = model.stack(x)
-            assert counted == {"ops": 0, "acquires": 0}
+            assert counted["acquires"] == 0 and 0 < counted["ops"] < first, (counted, first)
             retries = weights.oom_retries
             torch.cuda.empty_cache()
             free, _ = torch.cuda.mem_get_info()
@@ -2240,7 +2240,7 @@ def test_a_components_call_runs_without_a_dispatch_layer_and_recovers_whole(card
         model.residency.release("run", ("stack",))
         del ballast
         torch.cuda.empty_cache()
-    assert component.tight and weights.oom_retries > retries
+    assert weights.oom_retries > retries
     assert same(reference, [steady]) and same(reference, [out])
 
 

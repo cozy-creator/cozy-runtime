@@ -104,9 +104,16 @@ def requested(exc: BaseException) -> int:
     return int(float(found.group(1)) * _UNITS[found.group(2)]) if found else 0
 
 
+def collective(exc: BaseException) -> bool:
+    """NCCL ran out of memory inside a collective: its peers wait in it, so no GPU runs it
+    again alone; the group runs the call again (`mirror.mirror_component`)."""
+    return "NCCL" in str(exc) and is_device_oom(exc)
+
+
 def shortage(exc: BaseException) -> tuple[int, bool] | None:
-    """(bytes short, whether the plane's own budget was) for a memory failure; None for any
-    other. A plane refusal carries its real deficit, never a plan's totals (run 10562)."""
+    """(bytes short, whether the plane's own budget was) for a memory failure one op can run
+    again after; None for any other. A plane refusal carries its real deficit, never a plan's
+    totals (run 10562)."""
     if isinstance(exc, plane.error("Shortfall")):
         return max(int(getattr(exc, "need", 0)) - int(getattr(exc, "available", 0)), 1), True
     if isinstance(exc, plane.error("BelowFloor")):
@@ -117,7 +124,7 @@ def shortage(exc: BaseException) -> tuple[int, bool] | None:
             return asked, False
         return max(asked - int(getattr(exc, "available", 0)), 1), True
     if is_device_oom(exc):
-        return requested(exc), False
+        return None if collective(exc) else (requested(exc), False)
     if is_library_refusal(exc):  # a cuBLAS/cuDNN handle or workspace that found no room
         return weight_policy.LIBRARY_ROOM, False
     return None

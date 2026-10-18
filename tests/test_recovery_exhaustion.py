@@ -1,4 +1,4 @@
-"""Exhausted operator recovery preserves capacity facts but retires entered Python state."""
+"""Exhausted operator recovery reports its capacity facts and the executor serves on."""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ from cozy_runtime.internal.weights import (
     Weight,
     WeightResidency,
 )
-from test_block_replay_contract import CpuLease, FailAfterOp, StatefulBlock, state, wrapped
+from test_block_replay_contract import CpuLease, FailAfterOp, StatefulBlock, wrapped
 from test_request_isolation import MODULE, _serve
 
 torch = pytest.importorskip("torch")
@@ -141,13 +141,12 @@ def test_sdk_seeded_bind_refills_its_base_before_one_forward(
 
 
 @pytest.mark.parametrize("effect", ["buffer", "rng"])
-def test_exhausted_recovery_reports_its_capacity_and_leaves_the_state_it_found(
+def test_exhausted_recovery_reports_its_capacity_and_serves_on(
     effect: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Nothing can make room: the call fails with the measured refusal (the only way it may
-    fail), its forward's writes and draws put back, so the executor serves the next call
-    exactly as if the failed one never ran."""
-    control, current = StatefulBlock(effect), StatefulBlock(effect)
+    fail), its inputs untouched, and the executor serves the next call."""
+    current = StatefulBlock(effect)
     weights, _region, trace = wrapped(current, monkeypatch)
     monkeypatch.setattr(weights, "shrink", lambda _need, _keep=0, **_: 0)
     failed = FailAfterOp(torch.ops.aten.linear.default)
@@ -159,10 +158,8 @@ def test_exhausted_recovery_reports_its_capacity_and_leaves_the_state_it_found(
     assert torch.equal(value, before) and not trace["residency"].poisoned
     assert trace["acquired"] == trace["released"] == 1
     with torch.inference_mode():
-        assert torch.equal(current(value), control(value))
-    assert {k: v for k, v in state(current).items() if k != "calls"} == {
-        k: v for k, v in state(control).items() if k != "calls"
-    }
+        assert current(value).shape == value.shape
+    assert trace["acquired"] == trace["released"] == 2
 
 
 def test_exhausted_functional_op_without_a_python_body_keeps_its_contract(
@@ -187,10 +184,16 @@ def test_exhausted_functional_op_without_a_python_body_keeps_its_contract(
         assert torch.equal(torch.nn.functional.linear(value, weight), value)
 
 
+@pytest.mark.parametrize("learned", [False, True])
 def test_an_executor_capacity_failure_keeps_its_generation_serving(
     host: tuple[Executor, dict[str, Any]],
     monkeypatch: pytest.MonkeyPatch,
+    learned: bool,
 ) -> None:
+    """Capacity fails the attempt, never the process. A block's first run is journaled, so
+    one that fails is put back and the generation serves on. A block known to write what it
+    did not make runs with no journal: failing, it leaves its writes, so the attempt still
+    fails `memory_exhausted` and its process is then replaced (state, not capacity)."""
     runner, load = host
     assert runner.load(msgspec.convert({**load, "construction": "a"}, Load))["ok"]
     assert runner.activate(Activate(construction="a"))["ok"]
@@ -199,6 +202,9 @@ def test_an_executor_capacity_failure_keeps_its_generation_serving(
     weights, _region, trace = wrapped(module, monkeypatch)
     monkeypatch.setattr(weights, "shrink", lambda _need, _keep=0, **_: 0)
     value = torch.tensor([[0.25, -0.5]])
+    if learned:
+        with torch.inference_mode():
+            module(value)  # learns that it writes its buffer
 
     def fail_in_handler() -> None:
         try:
@@ -213,6 +219,9 @@ def test_an_executor_capacity_failure_keeps_its_generation_serving(
         "failed",
         MEMORY_EXHAUSTED,
     ), failed
+    if learned:
+        assert "model.block failed after writing" in failed["poisoned"], failed
+        return
     assert not failed["poisoned"] and not runner.poisoned
-    assert float(module.ticks) == 0, "its write was put back"
+    assert float(module.ticks) == 0, "its first run's write was put back"
     assert runner.load(msgspec.convert({**load, "construction": "b"}, Load))["ok"]

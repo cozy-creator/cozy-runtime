@@ -123,7 +123,7 @@ def test_the_one_refusal_carries_the_ledger_the_op_and_each_rung(
     outcome = classify(failure)
     assert (outcome.terminal, outcome.code) == ("failed", MEMORY_EXHAUSTED)
     assert MEMORY_EXHAUSTED in CAPACITY_CODES and DEVICE_OOM in CAPACITY_CODES
-    assert mirror.out_of_memory(failure) == 1 << 30
+    assert mirror.ending(failure) == MEMORY_EXHAUSTED
     assert _split._short(failure)
 
 

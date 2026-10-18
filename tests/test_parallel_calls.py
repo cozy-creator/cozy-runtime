@@ -20,6 +20,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+from cozy_runtime.author._errors import MEMORY_EXHAUSTED  # noqa: E402
 from cozy_runtime.internal import (  # noqa: E402
     attention,
     attention_sol,
@@ -316,9 +317,10 @@ def test_a_leader_failure_in_a_mirrored_call_stays_the_attempts_error(tmp_path: 
 
 def test_a_group_runs_a_call_again_when_one_gpu_runs_out_of_memory(tmp_path: Path) -> None:
     """Run 4074: one GPU of two ran out of memory in a mirrored forward and the group aborted.
-    Now every GPU ends the call, the same follower processes form the group again, and the
-    call runs again from the same inputs. A call that runs out again with nothing given back
-    fails with the shortfall, naming the GPU."""
+    Now a collective that runs out ends the call on every GPU, the same follower processes
+    form the group again, and the call runs again from the same inputs while that GPU finds
+    more room. Capacity never breaks the group: a GPU that finds no more, or whose own ladder
+    ran out, ends the attempt `memory_exhausted`, and the group serves on (run 10831)."""
     fixture = Path(__file__).parent / "testdata" / "parallel_calls.py"
 
     def launch(module_argv: list[str], fd: int) -> spawn.Child:
@@ -349,18 +351,24 @@ def test_a_group_runs_a_call_again_when_one_gpu_runs_out_of_memory(tmp_path: Pat
             rerun=leader._group_rerun,
         )
         pids = group.pids()
-        # GPU 1 runs out once, after its collective: both GPUs run the call again.
+        # GPU 1's later collective runs out once: both GPUs run the call again.
         torch.testing.assert_close(model.out_of_memory(1), torch.tensor([5.0]))
         assert group.pids() == pids and not bool(group.broken) and not group.interrupted
         assert group.pg is not first and leader.pg is group.pg
         # The group formed again serves the next call as before.
         torch.testing.assert_close(model.out_of_memory(0), torch.tensor([5.0]))
-        # Out of memory again with nothing given back: the call fails, naming the GPU.
+        # Out of memory every time: it runs again while GPU 1 finds more room, then fails.
         with pytest.raises(GroupRefusal) as failed:
             model.out_of_memory(1 << 30)
-        assert failed.value.code == "device_out_of_memory"
-        assert "GPU 1 ran out of device memory in 'block'" in str(failed.value)
-        assert bool(group.broken)
+        assert failed.value.code == MEMORY_EXHAUSTED
+        assert "GPU 1 ran out of device memory in a collective of 'block'" in str(failed.value)
+        with pytest.raises(GroupRefusal) as failed:
+            model.exhausted()
+        assert failed.value.code == MEMORY_EXHAUSTED and "GPU 1: OutOfMemoryError" in str(
+            failed.value
+        )
+        assert group.pids() == pids and not group.broken
+        torch.testing.assert_close(model.out_of_memory(0), torch.tensor([5.0]))
     finally:
         group.close()
         ours.close()

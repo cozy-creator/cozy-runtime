@@ -1,15 +1,15 @@
-"""Block replay after an out-of-memory, on CPU math with controlled device lease/room I/O.
+"""Out-of-memory recovery around blocks, on CPU math with controlled device lease/room I/O.
 
-Owner, 2026-10-05: "I want processes to succeed and be resistant to changes, not fail." A
-block that fails after its forward changed state runs again from the state it started with:
-the tensors it wrote into and the generators it drew from are put back first. Only
-stream/acquisition/allocator accounting are CPU fixtures; no CUDA context is involved.
+Owner, 2026-10-05: "I want processes to succeed and be resistant to changes, not fail." An op
+that fails runs again in place. A block whose first run changed nothing outside itself runs
+with no dispatch layer, and out of memory runs again from the generators and containers it
+started with; one that writes is never run twice. Only stream/acquisition/allocator accounting
+are CPU fixtures; no CUDA context is involved.
 """
 
 from __future__ import annotations
 
 import hashlib
-import inspect
 import sys
 from types import MethodType
 from typing import Any
@@ -154,12 +154,9 @@ def state(module: StatefulBlock) -> dict[str, Any]:
     }
 
 
-@pytest.mark.parametrize("effect", ["buffer", "rng"])
-def test_a_block_that_fails_after_changing_state_runs_again_from_it(
-    effect: str, monkeypatch: Any
-) -> None:
-    control = StatefulBlock(effect)
-    current = StatefulBlock(effect)
+def test_a_block_that_fails_after_drawing_runs_again_from_it(monkeypatch: Any) -> None:
+    control = StatefulBlock("rng")
+    current = StatefulBlock("rng")
     _weights, _region, trace = wrapped(current, monkeypatch)
     value = torch.tensor([[0.25, -0.5]])
     before = value.clone()
@@ -176,33 +173,18 @@ def test_a_block_that_fails_after_changing_state_runs_again_from_it(
     assert trace["acquired"] == trace["released"] == 3
 
 
-class Root(torch.nn.Module):  # type: ignore[misc,name-defined]
-    """A component whose own call reaches its block before any op of its own, then computes
-    on (SeedVR2's DiT)."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.block = StatefulBlock("counter")
-
-    def forward(self, value: Any, *, pixel_values: Any = None) -> Any:
-        return self.block(value) + 1
-
-
-def test_a_components_call_keeps_its_signature_and_journals_beside_its_blocks(
-    monkeypatch: Any,
-) -> None:
-    """Run 9207: Transformers' `generate` checks its kwargs against `inspect.signature(
-    model.forward)`, which the call's recovery hid. Run 9210: the call's first journal and its
-    first block's held the same ops, and the block's exit took the call's out of the mode."""
-    root = Root()
-    weights, _region, trace = wrapped(root.block, monkeypatch, root=root)
-    assert inspect.signature(root.forward) == inspect.signature(Root.forward.__get__(root))
+def test_a_block_that_writes_is_never_run_twice(monkeypatch: Any) -> None:
+    """Its first run wrote into a buffer it did not make: its ops recover one by one, and an
+    out-of-memory outside them reaches the caller rather than writing twice."""
+    module = StatefulBlock("buffer")
+    _weights, _region, trace = wrapped(module, monkeypatch)
     value = torch.tensor([[0.25, -0.5]])
-    with weights.recovering(), torch.inference_mode():
-        first, second = root(value), root(value)
-    effects = trace["residency"].components["model"].effects
-    assert effects is not None and not effects.writes
-    assert torch.equal(first, value + 2) and torch.equal(second, value + 3)
+    with torch.inference_mode():
+        module(value)
+        module.fail_next = True
+        with pytest.raises(torch.OutOfMemoryError):
+            module(value)
+    assert float(module.ticks) == 2.0 and module.calls == 2 and not trace["room"]
 
 
 def test_a_python_attribute_is_the_one_state_a_replay_does_not_put_back(monkeypatch: Any) -> None:
@@ -462,11 +444,11 @@ def test_an_executor_request_recovers_in_process_and_its_generation_serves_on(
     runner, load = host
     assert runner.load(msgspec.convert({**load, "construction": "a"}, Load))["ok"]
     assert runner.activate(Activate(construction="a"))["ok"]
-    module = StatefulBlock("buffer")
+    module = StatefulBlock("rng")
     _weights, _region, trace = wrapped(module, monkeypatch)
     value = torch.tensor([[0.25, -0.5]])
     with torch.inference_mode():
-        module(value)  # the first run learns that it writes its buffer
+        module(value)  # the first run learns that it writes nothing it did not make
     module.fail_next = True
 
     def fail_in_handler() -> None:
@@ -479,5 +461,5 @@ def test_an_executor_request_recovers_in_process_and_its_generation_serves_on(
     monkeypatch.setattr(sys.modules[MODULE], "contract_failure", fail_in_handler)
     served = _serve(runner, "contract", "contract")
     assert served["outcome"]["terminal"] == "succeeded" and not served["poisoned"], served
-    assert float(module.ticks) == 2, "the failed attempt's write was put back, then made once"
+    assert module.calls == 3 and len(trace["room"]) == 1
     assert runner.load(msgspec.convert({**load, "construction": "b"}, Load))["ok"]

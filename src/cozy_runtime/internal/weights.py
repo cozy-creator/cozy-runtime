@@ -12,10 +12,10 @@ no-split block (`paging.partition`). A scope is a stage: at `admit` the policy
 plane budget; the resident set is
 wanted and a cursor streams the rest through its byte ring in the blocks' execution order.
 Each block runs inside exactly one acquire/release; a resident region binds at its stable
-address, a streamed one at its place in the ring, from cached views. A torch OOM makes room
-(unmap only) and runs the op again; one that escapes a block's ops runs the block again, with
-the state its forward changed restored first (`Effects`, `Journal`); capacity never poisons
-the executor.
+address, a streamed one at its place in the ring, from cached views. Every op that runs out
+of device memory runs again once room is made (`memory.Memory`); a block that changes nothing
+outside itself runs with no dispatch layer and, out of memory, once again with one (`Effects`);
+capacity never poisons the executor.
 """
 
 from __future__ import annotations
@@ -213,8 +213,8 @@ class Region:
     locate: Callable[[Tensor], str | None] | None = None
     #: a bake failed part way: the resident bytes must refill before any use
     dirty: bool = False
-    #: its forward ran out of device memory where its ops did not recover one by one: they do
-    #: from then on, so room is made for the op that needs it, never the whole block again
+    #: its forward ran out of device memory with no dispatch layer: its ops recover one by
+    #: one from then on, so room is made for the op that needs it, never the block again
     tight: bool = False
 
     @property
@@ -268,10 +268,6 @@ class Component:
     #: them go first (`let_go`)
     holds: dict[int, Lease] = field(default_factory=dict)
     hold_stream: int = 0
-    #: what its root module's own call changes outside itself (`WeightResidency._root`), and
-    #: whether one ran out of device memory outside its blocks
-    effects: Effects | None = None
-    tight: bool = False
     #: gave its weights back to another component's activations for the rest of the stage:
     #: none of its regions is leased or planned; its common maps again when it next runs
     spared: bool = False
@@ -831,10 +827,9 @@ class Weights:
     @contextmanager
     def recovering(self, journal: Journal | None = None) -> Iterator[Journal | None]:
         """Run the caller's torch ops with out-of-memory recovery: an op that cannot allocate
-        unmaps weights and runs again (a seeded op from its generator's state before it).
-        With a `journal`, every write into a tensor that existed before is kept first, so the
-        whole call can be rewound and run again. Inside this plane's recovery it adds no
-        dispatch layer (`_noting`)."""
+        runs again once room is made (a seeded op from its generator's state before it). With
+        a `journal`, every write into a tensor that existed before is kept first (`Journal`).
+        Inside this plane's recovery it adds no dispatch layer (`_noting`)."""
         if self.host_only:
             yield journal
             return
@@ -1979,10 +1974,9 @@ class Effects:
     writes into tensors that existed before it (its inputs, its buffers, anything held
     elsewhere), the generators its seeded ops draw from, and whether the bands rewrote an op
     of it (`Bands.rewrites`: a convolution past its padding's zeros, an op cut in rows). A
-    forward that changes nothing else runs again unobserved after an out-of-memory; one that
-    writes runs observed, its writes journaled; the generators are put back either way; one
-    the bands rewrote keeps its ops' recovery, which rewrites them. Python attributes it
-    changes (a counter on the module) are not seen."""
+    forward that changes nothing else runs with no dispatch layer and, out of memory, again
+    from its generators' states; one that writes, or that the bands rewrote, keeps its ops'
+    recovery. Python attributes it changes (a counter on the module) are not seen."""
 
     writes: bool
     generators: tuple[Any, ...]
@@ -1991,13 +1985,12 @@ class Effects:
 
 @dataclass(slots=True, eq=False)  # one is told from another by identity, never content
 class Journal:
-    """One observed attempt of a block: the storages its ops made, the first content of every
-    other storage they wrote into, and the generators its seeded ops drew from. `rewind`
-    puts those storages back, so the attempt can run again from where it started."""
+    """One observed run (a block's first, or a group GPU's whole call): the storages its ops
+    made, the first content of every other storage they wrote into, and the generators its
+    seeded ops drew from. `rewind` puts those back, so the run can start again from them."""
 
     made_here: set[int] = field(default_factory=set)
     kept: dict[int, tuple[Any, Any]] = field(default_factory=dict)
-    wrote: bool = False
     #: generator -> its state before this attempt first drew from it; every one drawn from
     first: dict[int, tuple[Any, Any]] = field(default_factory=dict)
     drawn: dict[int, Any] = field(default_factory=dict)
@@ -2027,7 +2020,6 @@ class Journal:
             if key in self.made_here or key in self.kept:
                 continue
             self.kept[key] = (storage, storage.clone())
-            self.wrote = True
 
     def draws(self, states: Iterable[tuple[Any, Any]]) -> None:
         for generator, state in states:
@@ -2044,7 +2036,7 @@ class Journal:
         self.first.clear()
 
     def effects(self, banded: bool = False) -> Effects:
-        return Effects(self.wrote or bool(self.kept), tuple(self.drawn.values()), banded)
+        return Effects(bool(self.kept), tuple(self.drawn.values()), banded)
 
 
 #: how often a journaled call marks its device progress, in ops (an event costs microseconds)
@@ -2056,7 +2048,7 @@ def journaling(torch: ModuleType, journal: Journal) -> Iterator[Journal]:
     """Every torch op in this context writes into `journal`: the storages it makes, the first
     content of every other storage it writes into, the generator state a seeded op draws
     from, and the device progress its ops make (`Journal.progress`). One GPU of a group keeps
-    one for a whole call, so the call can be rewound when any GPU of the group fails it
+    one for a whole call, so the call can be rewound when the group ends it
     (`mirror.mirror_component`); its blocks keep none of their own. On any device."""
     journal.marking = True
     with _noting(torch, None, journal):
@@ -3300,8 +3292,6 @@ class WeightResidency:
         self.refine = refine
         #: component -> (module, had its own `forward`, that forward) per hooked region
         self.hooks: dict[str, list[tuple[Module, bool, Callable[..., object]]]] = {}
-        #: component -> the same for its root module's own call (`_root`)
-        self.roots: dict[str, tuple[Module, bool, Callable[..., object]]] = {}
         #: method -> the components it declares (`component_use`), in definition order
         self.scopes = dict(scopes or {})
         #: methods in the order this process first entered them: the stage order it learned
@@ -3310,6 +3300,9 @@ class WeightResidency:
         self.active: tuple[str, tuple[str, ...]] | None = None
         self.spare = False
         self.poisoned = ""
+        #: a block that writes what it did not make failed this attempt with no journal: if
+        #: the attempt fails, the process is replaced, never served again (state, not capacity)
+        self.unjournaled = ""
         self.refusals: list[str] = []
         #: this attempt's activation peak per method, and per batch item with the batch it ran
         self.peaks: dict[str, int] = {}
@@ -3355,14 +3348,9 @@ class WeightResidency:
             module = region.module
             rows.append((module, "forward" in module.__dict__, module.forward))
             module.forward = self._block(component, region, module.forward)
-        root = component.root
-        if all(region.module is not root for region in component.blocks):
-            self.roots[component.name] = (root, "forward" in root.__dict__, root.forward)
-            root.forward = self._root(component, root.forward)
 
     def _unhook(self, name: str) -> None:
-        root = self.roots.pop(name, None)
-        for module, had, forward in [*self.hooks.pop(name, []), *([root] if root else [])]:
+        for module, had, forward in self.hooks.pop(name, []):
             if had:
                 module.forward = forward
             else:
@@ -3376,6 +3364,7 @@ class WeightResidency:
         self.unpark()
         self.peaks.clear()
         self.entries.clear()
+        self.unjournaled = ""
         self.derived_at_open = self._derived()
         self.attempts += 1
 
@@ -4228,89 +4217,97 @@ class WeightResidency:
     def _block(
         self, component: Component, region: Region, forward: Callable[..., Any]
     ) -> Callable[..., Any]:
-        """The one hook per block: acquire, bind, run, release. A torch OOM makes room and
-        runs the op again; one that escapes the block's ops (a library's own allocation)
-        makes room and runs the block again, from the state it started with: the
-        generators it draws from are put back, and so are the tensors it wrote into
-        (`Journal`). Only a block that shares its call with a group cannot run again."""
+        """The one hook per block: acquire, bind, run, release. Its ops recover one by one in
+        the process's dispatch mode. A block whose first run wrote nothing that existed before
+        it (`Effects`) runs with no mode; out of memory there, it gets back the generators it
+        drew from and the containers it was handed and runs again with its ops recovering, as
+        it does from then on (`tight`). A group GPU's blocks hold their group's collectives:
+        they never run twice, and always recover op by op."""
         weights = self.weights
-        torch = weights.torch
 
         def run(*args: Any, **kwargs: Any) -> Any:
             try:
                 effects = region.effects
                 if (
-                    effects is not None
-                    and not effects.writes
-                    and not effects.banded
-                    and not weights.grouped
-                    and not region.tight
-                    and not _hosts(args, kwargs)
+                    effects is None
+                    or effects.writes
+                    or effects.banded
+                    or region.tight
+                    or weights.grouped
+                    or _hosts(args, kwargs)
                 ):
-                    # Writes nothing that existed before it: it runs unobserved, and only
-                    # the generators it draws from are kept for a second run. Inputs in
-                    # host memory are read in bands, by the ops' recovery.
-                    kept = [(g, g.get_state()) for g in effects.generators]
-
-                    def rewind() -> None:
-                        for generator, state in kept:
-                            generator.set_state(state)
-
-                    if not self._modes():
-                        return rewound(rewind, *args, **kwargs)
-                    with self._quiet():
-                        return rewound(rewind, *args, **kwargs)
-                if weights.grouped and _in_call(torch):
-                    # One GPU of a group in its call: the call's journal rewinds what the
-                    # block changes, and its ops recover one by one in the call's mode.
-                    return rewound(lambda: None, *args, **kwargs)
-                # Its first run, a block that writes into tensors it did not make, or one
-                # GPU of a group outside its call: its ops recover one by one, journaled.
-                journal = Journal()
-                rewrites = weights.bands.rewrites if weights.bands is not None else 0
-                with weights.recovering(journal):
-                    out = rewound(journal.rewind, *args, **kwargs)
-                if effects is None and not weights.host_only:
-                    banded = weights.bands is not None and weights.bands.rewrites > rewrites
-                    region.effects = journal.effects(banded)
-                return out
+                    return observed(effects is None, *args, **kwargs)
+                kept = [(g, g.get_state()) for g in effects.generators]
+                held = _containers(args, kwargs)
+                try:
+                    with self._quiet() if self._modes() else nullcontext():
+                        return attempt(True, *args, **kwargs)
+                except Exception as exc:
+                    if (short := shortage(exc)) is None:
+                        raise
+                    exc.__traceback__ = None  # the failed run's frames free their tensors
+                for generator, state in kept:
+                    generator.set_state(state)
+                _put_back(held)
+                region.tight = True
+                op, operands = f"{component.name}.{region.path}", (*args, *kwargs.values())
+                weights.memory.free_for(short[0] or region.span, op, operands)
+                weights.oom_retries += 1
+                with weights.recovering():
+                    return attempt(False, *args, **kwargs)
             except _Regrained:
                 # Placed again from inside its own attempt, the component moved to another
-                # grain and closed the weight set this block chose (run 5894): rewound, the
-                # block runs at the grain the component has now.
+                # grain and closed the weight set this block chose (run 5894): the block runs
+                # at the grain the component has now.
                 return self._regrained(component, region, forward)(*args, **kwargs)
             except self._poisoned_error as exc:
                 raise self._poison(exc) from exc
 
-        def rewound(rewind: Callable[[], None], *args: Any, **kwargs: Any) -> Any:
-            """A block that fails for good leaves the state it found: the next request on
-            this executor starts from it, as if the failed one never ran."""
+        def observed(first: bool, *args: Any, **kwargs: Any) -> Any:
+            """Its ops recover one by one; its first run also learns its `Effects`, and a
+            first run that fails is put back. A writer that fails later leaves its writes:
+            unless a group call's journal puts them back, the process is not served again
+            should the attempt fail (`unjournaled`)."""
+            if not first:
+                try:
+                    with weights.recovering():
+                        return attempt(True, *args, **kwargs)
+                except _Regrained:
+                    raise
+                except Exception:
+                    wrote = region.effects is not None and region.effects.writes
+                    if wrote and not _in_call(weights.torch):
+                        self.unjournaled = f"{component.name}.{region.path} failed after writing"
+                        weights.modes["unjournaled"] = self.unjournaled
+                    raise
+            journal = Journal()
+            rewrites = weights.bands.rewrites if weights.bands is not None else 0
             try:
-                return attempt(rewind, *args, **kwargs)
+                with weights.recovering(journal):
+                    out = attempt(True, *args, **kwargs)
             except BaseException:
                 with self._quiet():
-                    rewind()
+                    journal.rewind()
                 raise
+            banded = weights.bands is not None and weights.bands.rewrites > rewrites
+            region.effects = journal.effects(banded)
+            return out
 
-        def attempt(rewind: Callable[[], None], *args: Any, **kwargs: Any) -> Any:
-            if weights.cell is not None and not weights.running:
-                self._asked({component.key: region.index})
-            passes = component.passes
-            self._observe(component, region.index)
-            if self.read is not None:
-                self.read.setdefault(component.name, set()).add(region.module)
-            if component.passes > passes:
-                weights.hold_host()
-            if not weights.running:  # a block boundary, before this block leases anything
-                self._squeezing()
-            if weights.growing and component.passes == 2 > passes:
-                self._grow()
-            versions = _versions(args, kwargs)
-            held = _containers(args, kwargs)
-            # observed (a group's, a first run, one that writes), its ops recover one by one
-            observed = weights.grouped or region.effects is None or region.effects.writes
-            quiet, seen, memory = not (observed or region.tight), -1, weights.memory
-            op = f"{component.name}.{region.path}"
+        def attempt(entering: bool, *args: Any, **kwargs: Any) -> Any:
+            if entering:  # once per call, never for its replay
+                if weights.cell is not None and not weights.running:
+                    self._asked({component.key: region.index})
+                passes = component.passes
+                self._observe(component, region.index)
+                if self.read is not None:
+                    self.read.setdefault(component.name, set()).add(region.module)
+                if component.passes > passes:
+                    weights.hold_host()
+                if not weights.running:  # a block boundary, before this block leases anything
+                    self._squeezing()
+                if weights.growing and component.passes == 2 > passes:
+                    self._grow()
+            memory, op, seen = weights.memory, f"{component.name}.{region.path}", -1
             while True:
                 if memory.shrunk and not weights.running:  # the stage gave weights back
                     memory.shrunk = False
@@ -4325,31 +4322,29 @@ class WeightResidency:
                 lease = hold or memory.retry(
                     functools.partial(self._acquire, component, region.index, stream), op
                 )
-                need, stale = 0, False
+                short: tuple[int, bool] | None = None
                 try:
-                    try:
-                        # The plane's bind and bake are its own math, outside the block's
-                        # recovery: a bake that fails leaves the region dirty, and it refills.
-                        if region.bound != int(lease.ptr) or region.bakes:
+                    # The plane's bind and bake are its own math, outside the block's
+                    # recovery: one short of memory leaves the region dirty, and it refills.
+                    if region.bound != int(lease.ptr) or region.bakes:
+                        try:
                             with self._quiet():
-                                baked = bind(torch, region, lease, refill=True)
+                                baked = bind(weights.torch, region, lease, refill=True)
                                 if baked and region.index in component.resident:
                                     self._bake_resident(component)
+                        except Exception as exc:
+                            if (short := shortage(exc)) is None:
+                                raise
+                            exc.__traceback__ = None
+                    if short is None:
                         weights.running.append(component.key)
                         weights.last = component.key
                         try:
-                            with weights.recovering() if quiet and region.tight else nullcontext():
-                                return forward(*args, **kwargs)
+                            return forward(*args, **kwargs)
                         finally:
                             weights.running.pop()
-                    except _Stale:
-                        stale = True
-                    except Exception as exc:
-                        short = shortage(exc)
-                        if short is None:
-                            raise
-                        need = short[0] or region.span
-                        exc.__traceback__ = None  # the failed run's frames free their tensors
+                except _Stale:
+                    pass
                 finally:
                     # Outside its lease only a stage-resident region stays bound: any other
                     # read finds the stand-in (`Weights.reading`), never a stale address.
@@ -4359,77 +4354,12 @@ class WeightResidency:
                         holds[region.index] = hold  # the stage's, until it lets go
                     else:
                         lease.release()
-                if stale:
+                if short is None:
                     self._restore(component, region)
-                    continue
-                # It cannot run again (U4 replays both): a group's block holds the group's
-                # collectives; one that wrote into its inputs, which its first run did not,
-                # cannot be rewound (observed from now on).
-                why = "it holds its group's collectives" if weights.grouped else ""
-                if not why and _versions(args, kwargs) != versions:
-                    region.effects = None
-                    why = "it changed its inputs in place, which its first run did not"
-                if why:
-                    memory.exhausted(need, op, f"out of memory outside torch's ops, and {why}")
-                with self._quiet():  # putting state back is not the block's own op
-                    rewind()
-                _put_back(held)
-                region.tight = True
-                if (seen := memory.again(need, op, (*args, *kwargs.values()), seen)) < 0:
-                    memory.exhausted(need, op)
+                elif (seen := memory.again(short[0] or region.span, op, (), seen)) < 0:
+                    memory.exhausted(short[0] or region.span, op)
 
         return run
-
-    def _root[**P, R](self, component: Component, forward: Callable[P, R]) -> Callable[P, R]:
-        """The component's own call (`unet(...)`) inside the process's recovery recovers as
-        one: once its first call showed it changes nothing outside itself, it runs with no
-        dispatch layer, its ops between blocks paying none; one that then runs out of device
-        memory outside its blocks makes room and runs again from its start, its ops recovering
-        one by one from then on (`tight`). One that writes what it did not make, or reads host
-        memory, keeps per-op recovery. Anywhere else (no recovery, a group GPU) it is as it is."""
-        weights = self.weights
-        torch = weights.torch
-
-        @functools.wraps(forward)  # its signature: Transformers' `generate` reads it
-        def call(*args: P.args, **kwargs: P.kwargs) -> R:
-            mode = _innermost(torch)
-            if mode is None or mode.weights is not weights or weights.grouped:
-                return forward(*args, **kwargs)
-            effects = component.effects
-            if effects is None:
-                journal = Journal()
-                rewrites = weights.bands.rewrites if weights.bands is not None else 0
-                with weights.recovering(journal):
-                    out = forward(*args, **kwargs)
-                banded = weights.bands is not None and weights.bands.rewrites > rewrites
-                learned = journal.effects(banded)
-                inner = (g for r in component.blocks if r.effects for g in r.effects.generators)
-                component.effects = replace(learned, generators=(*learned.generators, *inner))
-                return out
-            if effects.writes or effects.banded or component.tight or _hosts(args, kwargs):
-                return forward(*args, **kwargs)
-            kept = [(g, g.get_state()) for g in effects.generators]
-            versions, held = _versions(args, kwargs), _containers(args, kwargs)
-            try:
-                with self._quiet():
-                    return forward(*args, **kwargs)
-            except Exception as exc:
-                if (short := shortage(exc)) is None:
-                    raise
-                exc.__traceback__ = None  # the failed call's frames free their tensors
-            need, op = short[0], f"{component.name}()"
-            if _versions(args, kwargs) != versions:
-                component.effects = None  # observed again from now on
-                weights.memory.exhausted(need, op, "it changed its inputs in place")
-            for generator, state in kept:
-                generator.set_state(state)
-            _put_back(held)
-            component.tight = True  # its ops recover one by one from now on
-            weights.memory.free_for(need, op, (*args, *kwargs.values()))
-            weights.oom_retries += 1
-            return forward(*args, **kwargs)
-
-        return call
 
     def _regrained(
         self, component: Component, region: Region, forward: Callable[..., object]
@@ -4802,18 +4732,6 @@ def _hosts(args: tuple[Any, ...], kwargs: Mapping[str, Any]) -> bool:
         for item in (value if isinstance(value, (tuple, list)) else (value,))
         if type(item).__name__ in ("Tensor", "Parameter")
     )
-
-
-def _versions(args: tuple[Any, ...], kwargs: Mapping[str, Any]) -> tuple[int, ...]:
-    """In-place mutation counters of the block's tensor inputs (one level deep). Inference
-    tensors keep none; a block under `inference_mode` re-runs unchecked (retry the op)."""
-    out: list[int] = []
-    for value in (*args, *kwargs.values()):
-        for item in value if isinstance(value, (tuple, list)) else (value,):
-            inference = getattr(item, "is_inference", None)
-            if inference is not None and not inference():
-                out.append(int(item._version))
-    return tuple(out)
 
 
 def _containers(

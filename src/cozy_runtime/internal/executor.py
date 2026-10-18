@@ -195,7 +195,6 @@ from cozy_runtime.internal.executor_commands import (
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.lora_composition import bind as bind_adapters
 from cozy_runtime.internal.lora_contract import read as read_adapter_graph
-from cozy_runtime.internal.memory import MemoryExhausted
 from cozy_runtime.internal.model_values import read_values_into
 from cozy_runtime.internal.parallel import copy_engine, cp, links, mirror, wire
 from cozy_runtime.internal.parallel.group import (
@@ -561,6 +560,10 @@ class _CompositeResidency:
     def poisoned(self) -> str:
         return next((str(row.poisoned) for row in self.rows.values() if row.poisoned), "")
 
+    @property
+    def unjournaled(self) -> str:
+        return next((row.unjournaled for row in self.rows.values() if row.unjournaled), "")
+
     def open_attempt(self, *_: object) -> None:
         for row in self.rows.values():
             row.open_attempt()
@@ -627,7 +630,7 @@ class _OnDemand:
 
 
 #: The requests rank 0 relays to the machine for a follower (`_relay`).
-_RELAYED = frozenset({"sealed_tier", "sealed_stage", "object_files", "model_source"})
+_RELAYED = frozenset({"sealed_tier", "sealed_stage", "object_files", "model_source", "device_room"})
 
 #: The runtime modules a construction imports, named ONCE so `start` can warm
 #: exactly the set `_prepare_first` re-imports (cr-104). Warming a name this tuple omits
@@ -747,10 +750,8 @@ class Executor:
         self.transport: links.Transport | None = None
         #: a follower's watcher aborted its collectives; cleared when the group forms again
         self._interrupted = threading.Event()
-        #: a follower's stage methods of the group call that last ran out of memory
-        self._rerun_methods: tuple[str, ...] = ()
         #: a follower's last mirrored call that succeeded: rewound if the group runs it again
-        #: because another GPU failed it (`join` with `room`), dropped at its next call
+        #: because another GPU failed it (`join` with `again`), dropped at its next call
         self._last_journal: Journal | None = None
         #: the per-GPU caps the group's planes were last given (`budget`)
         self.rank_caps: tuple[int, ...] = ()
@@ -1046,7 +1047,7 @@ class Executor:
         import torch
 
         self.torch = torch
-        if command.room >= 0:
+        if command.again:
             # Rank 0 interrupted before it asked: the watcher has aborted the old group. A
             # call this GPU finished is undone too: the group runs it again from its inputs.
             self._interrupted.wait()
@@ -1090,11 +1091,8 @@ class Executor:
                 torch, self.pg, self.rank, self.world
             )
             copy_engine.install(exchange, self.pg)
-        if command.room >= 0:
-            try:
-                reply["freed"] = self._group_room(command.room, self._rerun_methods)
-            except (ResidencyRefusal, MemoryExhausted) as exc:
-                return {"ok": False, "code": exc.code, "detail": str(exc)[:900]}
+        if command.seen is not None:
+            reply["room"] = self._again(command.seen)
         return reply
 
     def _calibrated(self, pg: Any) -> None:
@@ -1112,34 +1110,28 @@ class Executor:
                 abort_process_group()
                 self._interrupted.set()
 
-    def _group_room(self, need: int, methods: Iterable[str]) -> int:
-        """Before a group call runs again: this GPU plans `methods` with `need` more room for
-        activations and gives that many device bytes back now. The bytes that came back; a
-        GPU with nothing left to give refuses (`memory_exhausted`)."""
+    def _again(self, seen: int) -> int:
+        """The room this GPU runs a group call again with after a collective of it ran out
+        of memory: more than its last run had (`seen`, -1 for none), else -1."""
         weights = self.host.weights
         if weights is None or weights.host_only:
-            return 0
-        need = max(need, weight_policy.MARGIN)
-        weights.seed_activations({m: weights.activation.get(m, 0) + need for m in methods})
-        before, op = weights.allocatable(), "a group call that ran out of memory"
-        if not weights.memory.free_for(need, op):
-            weights.memory.exhausted(need, op)
-        return max(weights.allocatable() - before, 0)
+            return -1
+        op = "a group collective that ran out of memory"
+        return weights.memory.again(max(seen, 0), op, (), seen)
 
-    def _group_rerun(self, need: int) -> int:
-        """Rank 0's half of a group rerun: every GPU gives `need` bytes back and the group
-        forms again. The bytes the whole group gave back."""
+    def _group_rerun(self, short: Mapping[int, int]) -> dict[int, int]:
+        """Rank 0's half of `mirror.mirror_component`'s rerun: each GPU in `short` (rank -> the
+        room its last run had) makes more room, and the group forms again. The room each found."""
         assert self.group is not None and self.torch is not None
-        weights = self.host.weights
-        gave = self._group_room(need, [m for _, m, _ in weights.open] if weights else ())
+        rooms = {0: self._again(short[0])} if 0 in short else {}
         transport = self.host.transport
         recalibrate = transport is not None and transport.links.copy_engines
         self.host.pg = self.group.form(
-            self.torch, _SEALED, room=need, formed=self.host._calibrated if recalibrate else None
+            self.torch, _SEALED, again=short, formed=self.host._calibrated if recalibrate else None
         )
         if self.host.comms is not None:
             self.host.comms.pg = self.host.pg
-        return gave + self.group.gave
+        return rooms | self.group.rooms
 
     def run(self, command: dict[str, Any]) -> dict[str, Any]:
         """Run a prepared sharded component, or one this rank hosts, under its leader's
@@ -1265,20 +1257,10 @@ class Executor:
                     answered = True
                     wire.send_tensor(output, 0, self.pg)
                 elif hosted:
-                    plane = models[name[0]]._cozy_residency
                     call = component.get_submodule(str(command.get("module", "")))
-                    try:
-                        output = call(*args, **kwargs)
-                    except accel.oom_error(self.torch, self.device_kind):
-                        # The call has no effect beside its result: free what the scope
-                        # does not hold and run it once more before refusing.
-                        if plane is None:
-                            raise
-                        plane.shed()
-                        accel.release_cached(self.torch, self.device_kind)
-                        output = call(*args, **kwargs)
                     result = wire.marshal(
-                        output, wire.TensorSpool(spool / str(command.get("results", "hosted")))
+                        call(*args, **kwargs),
+                        wire.TensorSpool(spool / str(command.get("results", "hosted"))),
                     )
                 else:
                     self._last_journal = None
@@ -1296,8 +1278,9 @@ class Executor:
                 accel.peak_allocated(self.torch, self.device_kind) - self._run_entry[1], 0
             )
         except Exception as exc:
+            ending = mirror.ending(exc)
             if spread and not answered:
-                declined = self._declines(exc)
+                declined = self._declines(exc, ending)
                 with contextlib.suppress(Exception):
                     wire.send_nothing(
                         0, self.pg, self._rank_device(self.torch), failed=declined is None
@@ -1313,22 +1296,16 @@ class Executor:
                         "working_peak_bytes": 0,
                         "declined": declined,
                     }
-            if not (hosted or spread):
-                # Out of memory here, or rank 0 ended this collective because another GPU
-                # was: the group gives memory back and runs the call again (`mirror.mirrored`).
-                need = mirror.out_of_memory(exc)
-                ended = need is None and type(exc).__name__ == "DistBackendError"
-                if need is not None or ended:
-                    self._rerun_methods = tuple(
-                        str(scope["method"]) for scope in command.get("scopes") or ()
-                    )
-                    return {
-                        "ok": False,
-                        "code": "group_call_ended" if ended else DEVICE_OOM,
-                        "detail": f"{type(exc).__name__}: {exc}"[:900],
-                        "rank": self.rank,
-                        "rerun": need or 0,
-                    }
+            if ending is not None and not spread:
+                # Short of memory, or rank 0 ended this collective: never this process's
+                # poison. A mirrored call's GPU waits for the group to form again.
+                return {
+                    "ok": False,
+                    "code": ending,
+                    "detail": f"{type(exc).__name__}: {exc}"[:900],
+                    "rank": self.rank,
+                    **({} if hosted else {"rerun": True}),
+                }
             outcome = classify(exc)
             self.poisoned = f"mirrored {name} failed: {outcome.code}"
             return {
@@ -1356,16 +1333,14 @@ class Executor:
             ),
         }
 
-    def _declines(self, exc: Exception) -> str | None:
+    def _declines(self, exc: Exception, ending: str | None) -> str | None:
         """Why a spread call is declined rather than failed: no room without evicting
-        (`device_spared`), or the device ran out inside the call."""
+        (`device_spared`), or this GPU ran short of memory in it (`mirror.ending`)."""
         if isinstance(exc, ResidencyRefusal) and exc.code == "device_spared":
             return exc.detail
-        if self.device_kind == "cuda" and isinstance(
-            exc, accel.oom_error(self.torch, self.device_kind)
-        ):
+        if ending == MEMORY_EXHAUSTED:
             accel.release_cached(self.torch, self.device_kind)
-            return f"device_out_of_memory: {exc}"[:300]
+            return f"{getattr(exc, 'code', DEVICE_OOM)}: {exc}"[:300]
         return None
 
     def _group_refusal(self, exc: GroupRefusal, *, closing: bool = True) -> dict[str, Any]:
@@ -2561,11 +2536,8 @@ class Executor:
                 # recover from an out-of-memory op by op, never by running a block again.
                 host.weights.grouped = self.world > 1
                 host.weights.world = self.world
-                if self.rank == 0:
-                    host.weights.cell = host._budget_cell()
-                    host.weights.room = host._device_room
-                else:
-                    host.weights.cell = host.rank_cell
+                host.weights.room = host._device_room  # a follower's asks go through rank 0
+                host.weights.cell = host._budget_cell() if self.rank == 0 else host.rank_cell
             except plane.Unavailable as exc:
                 return {"ok": False, "code": "weight_plane_unavailable", "detail": str(exc)}
         weights = host.weights
@@ -3649,10 +3621,14 @@ class Executor:
         # is the process, so the worker must replace it either way.
         if self.residency is not None and self.residency.poisoned:
             self.poisoned = self.poisoned or f"weights: {self.residency.poisoned[:200]}"
+        left = getattr(self.residency, "unjournaled", "")
+        if outcome.terminal == "failed" and left:
+            # State, not capacity: a block left writes no journal can put back.
+            self.poisoned = self.poisoned or f"weights: {left[:200]}"
+        weights = self.host.weights
         # The BOUNDED observation tail and the O(1) time attribution cross the seam on every
         # path, success or fault. A failed attempt's log tail is the one triage most needs,
         # and cr-011 hoisted the record out of `invoke` precisely so it survives the failure.
-        weights = self.host.weights
         exhausted = weights is not None and outcome.code == MEMORY_EXHAUSTED
         shortfall = weights.memory.refusal if exhausted and weights is not None else None
         return {
@@ -4350,11 +4326,14 @@ class Executor:
         """Ask the worker for `free_bytes` free on this GPU from its other tenants; it answers
         once they gave what they could, with this process's cap raised into that room when it
         holds one (a refusal changes nothing). Only `Memory.ask` asks, and never for <= 0
-        bytes: the machine reads a byte count as unsigned."""
-        held = self.weights._held()[1] if self.weights is not None else -1
+        bytes: the machine reads a byte count as unsigned. A follower asks through rank 0
+        (`_relay`): the machine makes room on every GPU of the lane, its holding and the
+        reply's cap are rank 0's, and its own cap arrives in its cell."""
+        weights = self.weights if self.rank == 0 else None
+        held = weights._held()[1] if weights is not None else -1
         answer = self._durable(DeviceRoom(free_bytes=free_bytes, holding_bytes=held), Room)
-        if answer.ok and answer.cap_bytes >= 0 and self.weights is not None:
-            self.weights.set_cap(answer.cap_bytes)
+        if weights is not None and answer.ok and answer.cap_bytes >= 0:
+            weights.set_cap(answer.cap_bytes)
 
     def _rank_cells(self) -> list[int]:
         """One budget cell per follower (`RANK_CELLS`), each handed to the owner with its
