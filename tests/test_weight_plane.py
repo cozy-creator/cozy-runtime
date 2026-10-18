@@ -47,7 +47,11 @@ from cozy_runtime.internal import (  # noqa: E402
 from cozy_runtime.internal import attention_upstream as upstream  # noqa: E402
 from cozy_runtime.internal import weights as weights_module  # noqa: E402
 from cozy_runtime.internal.derive import Observations, serving_substrate  # noqa: E402
-from cozy_runtime.internal.encoding import SPEC_PLAIN, SPEC_ROWWISE  # noqa: E402
+from cozy_runtime.internal.encoding import (  # noqa: E402
+    SPEC_INT8_CONVROT256,
+    SPEC_PLAIN,
+    SPEC_ROWWISE,
+)
 from cozy_runtime.internal.encoding.leaves import _native_leaf_class  # noqa: E402
 from cozy_runtime.internal.fill import Checkpoint  # noqa: E402
 from cozy_runtime.internal.memory import MemoryExhausted, Rung  # noqa: E402
@@ -117,10 +121,14 @@ def write_checkpoint(root: Path) -> tuple[Checkpoint, dict[str, Any]]:
 
 
 def store_component(
-    root: Path, name: str, values: dict[str, Any], fp8: Collection[str] = ()
+    root: Path,
+    name: str,
+    values: dict[str, Any],
+    fp8: Collection[str] = (),
+    int8: Collection[str] = (),
 ) -> Checkpoint:
     """`values` as one component's fp16 tensors in a real TensorFS store; those named in
-    `fp8` stored fp8-rowwise (data and a per-row scale)."""
+    `fp8` stored fp8-rowwise, in `int8` int8-convrot256 (data and a per-row scale)."""
     parts: dict[str, dict[str, bytes]] = {}
     tensors: dict[str, Tensor] = {}
     for key, value in values.items():
@@ -130,6 +138,11 @@ def store_component(
             parts[key] = {"data": encoded.payload, "scale": encoded.companions[0].raw}
             roles = {"data": Part("f8_e4m3fn", shape), "scale": Part("f32", shape[:1])}
             tensors[key] = Tensor("f16", shape, SPEC_ROWWISE, roles)
+        elif key in int8:
+            encoded = encode_int8_convrot256(key, value.float().numpy())
+            parts[key] = {"data": encoded.payload, "scale": encoded.companions[0].raw}
+            roles = {"data": Part("i8", shape), "scale": Part("f32", shape[:1])}
+            tensors[key] = Tensor("f16", shape, SPEC_INT8_CONVROT256, roles)
         else:
             parts[key] = {"value": value.half().numpy().tobytes()}
             tensors[key] = Tensor("f16", shape, SPEC_PLAIN, {"value": Part("f16", shape)})
@@ -183,7 +196,7 @@ def load(
     holder = SimpleNamespace(components={name: module})
     walked = census(holder)
     backend.expect({name: [d.key for d in walked.destinations]})
-    live = backend.materialize(holder, walked)
+    live = backend.materialize(holder, walked, encoded_leaves=leaves)
     for destination in walked.destinations:
         backend.fill(destination.key, destination.spec, live[destination.key])
     backend.commit()
@@ -1254,6 +1267,24 @@ def sdxl_unet(widths: tuple[int, int] = (64, 128)) -> Any:
     ).to(torch.float16)
 
 
+def wide_unet() -> Any:
+    """`sdxl_unet` with its linears as wide as a multiple of 256, as int8-convrot needs."""
+    diffusers = pytest.importorskip("diffusers")
+    return diffusers.UNet2DConditionModel(
+        sample_size=32,
+        down_block_types=("DownBlock2D", "CrossAttnDownBlock2D"),
+        up_block_types=("CrossAttnUpBlock2D", "UpBlock2D"),
+        block_out_channels=(256, 512),
+        transformer_layers_per_block=(1, 2),
+        attention_head_dim=(4, 8),
+        cross_attention_dim=256,
+        use_linear_projection=True,
+        addition_embed_type="text_time",
+        addition_time_embed_dim=32,
+        projection_class_embeddings_input_dim=32 * 6 + 64,
+    ).to(torch.float16)
+
+
 def refined(model: Any, name: str) -> weight_policy.Layout:
     """Move a component to the sub-block grain, as a budget below its block floor does."""
     model.residency.unpark()
@@ -1351,6 +1382,101 @@ def test_an_sdxl_unet_streams_bit_exact(tmp_path: Path, pressure: bool, fine: bo
     assert weights.facts().streamed["unet"].resident_blocks < len(layout.blocks)
     exact = [torch.equal(a, b) for a, b in zip(resident, streamed, strict=True)]
     assert all(exact), f"bytes exact, outputs not ({exact}): kernels chose by free memory"
+
+
+@on_card
+@pytest.mark.parametrize("stored", ["int8", "fp16", "fp8"])
+def test_an_sdxl_unet_out_of_memory_computes_the_resident_values(
+    tmp_path: Path, card: Any, stored: str
+) -> None:
+    """Runs 10964, 11090, 11098 (SDXL at 4 MP on an RTX 3070: ~100 out-of-memory retries, idle
+    weights unmapped) drew a hatched image a 24 GB card does not. One card, one UNet, the same
+    inputs: resident with room, then with its activations short, so ops run out, idle weights
+    leave and each op runs again. Each module's output is the resident one's but for a kernel's
+    own choice under pressure; the first that is not names the path that broke it. Linears as
+    SDXL's on sm86 (int8: the native op reads the bound bytes by address), fp16, or fp8."""
+    torch.manual_seed(11)
+    values = {k: v.float() * 0.05 for k, v in wide_unet().state_dict().items()}
+    linears = [k for k, v in values.items() if k.endswith("weight") and v.dim() == 2]
+    encoded = {stored: [k for k in linears if values[k].shape[1] % 256 == 0]}
+    weights = card.weights
+    model = load(
+        weights,
+        store_component(
+            tmp_path / "unet", "unet", values, encoded.get("fp8", ()), encoded.get("int8", ())
+        ),
+        "unet",
+        name="unet",
+        factory=wide_unet,
+    )
+    served = sum(getattr(m, "provider", None) == INT8_CONVROT for m in model.stack.modules())
+    assert served == (len(encoded["int8"]) if stored == "int8" else 0)
+    idle = load(weights, card.checkpoint, "idle")
+    run(idle, torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16), passes=1)
+    generator = torch.Generator(device="cuda").manual_seed(3)
+    side = 128  # SDXL's 4 MP latent
+    args = (
+        torch.randn(2, 4, side, side, device="cuda", dtype=torch.float16, generator=generator),
+        torch.tensor([500.0], device="cuda"),
+        torch.randn(2, 77, 256, device="cuda", dtype=torch.float16, generator=generator),
+    )
+    added = {
+        "text_embeds": torch.randn(2, 64, device="cuda", dtype=torch.float16, generator=generator),
+        "time_ids": torch.tensor([[8 * side] * 2 + [0, 0] + [8 * side] * 2] * 2).cuda().half(),
+    }
+    seen: dict[str, Any] = {}
+    names = {module: name for name, module in model.stack.named_modules()}
+
+    def record(module: Any, _: Any, out: Any) -> None:
+        if isinstance(out, torch.Tensor):  # a replayed block records again: the last one counts
+            seen[names[module]] = out.detach().cpu().float()
+
+    def step() -> tuple[Any, dict[str, Any]]:
+        seen.clear()
+        model.residency.admit("run", ("unet",))
+        try:
+            with weights.recovering(), torch.inference_mode():
+                out = model.stack(*args, added_cond_kwargs=added).sample.float().cpu()
+        finally:
+            model.residency.release("run", ("unet",))
+        return out, dict(seen)
+
+    hooks = [m.register_forward_hook(record) for m in names]
+    try:
+        weights.set_budget(-1)
+        torch.cuda.reset_peak_memory_stats()
+        base = torch.cuda.memory_allocated()
+        resident, modules = step()
+        peak = torch.cuda.max_memory_allocated() - base
+        mapped, retries = (
+            weights.resident_bytes(idle.residency.components["stack"]),
+            weights.oom_retries,
+        )
+        torch.cuda.empty_cache()
+        free, _ = torch.cuda.mem_get_info()
+        ballast = torch.empty(max(free - peak // 2, 0), dtype=torch.uint8, device="cuda")
+        try:
+            short, pressed = step()
+        finally:
+            del ballast
+            torch.cuda.empty_cache()
+    finally:
+        for hook in hooks:
+            hook.remove()
+    facts = weights.facts()
+    print("retries", facts.oom_retries - retries, "modes", facts.modes)
+    assert facts.oom_retries > retries, "the run had the room: nothing was retried"
+    assert weights.resident_bytes(idle.residency.components["stack"]) < mapped
+    wrong = [
+        (name, float((a - pressed[name]).abs().max()), float(a.abs().max()))
+        for name, a in modules.items()
+        if name in pressed and a.shape == pressed[name].shape and not torch.equal(a, pressed[name])
+    ]
+    print("first modules off:", wrong[:12])
+    # cuDNN picks another convolution algorithm with less room: an ulp, never a garbled module
+    # (runs 11144, 11152: one conv at 128x128, 1.9e-6 on 2.8e-3, the rest bit-exact).
+    assert all(diff <= 2**-9 * peak + 2**-14 for _, diff, peak in wrong), wrong[:4]
+    torch.testing.assert_close(short, resident)
 
 
 @on_card
