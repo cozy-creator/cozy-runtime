@@ -126,7 +126,7 @@ def test_real_follower_commands_share_attempt_state_and_restore_closes(tmp_path:
 
     try:
         assert call(4)["ok"]
-        assert call(5, fail=True)["code"] == "device_out_of_memory"
+        assert call(5, fail=True)["code"] == "memory_exhausted"  # its own ladder: not a collective
         assert call(5)["ok"]
         state = root.states[0]
         assert all(s is state for s in root.states) and state.steps == [4, 5, 5]
