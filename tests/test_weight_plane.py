@@ -568,6 +568,29 @@ def test_weights_read_outside_their_modules_forward_stream_exact(tmp_path: Path)
 
 
 @on_card
+def test_a_view_of_a_weight_read_outside_its_forward_in_inference_mode(tmp_path: Path) -> None:
+    """Runs 11026 and 11034 (Klein's prompt drafter beside three describers on 8 GB): a view
+    of a weight read outside its module's forward (`.t()`) came back as a copy, since its
+    bytes leave with the op's lease, and torch refused that copy as the view of a normal
+    stand-in under `inference_mode`: 'Cannot set version_counter for inference tensor'."""
+    weights = Weights(torch, torch.device("cuda", 0), "cuda")
+    weights.set_budget(-1, pinned=1 << 30)
+    checkpoint, values = write_checkpoint(tmp_path)
+    model = load(weights, checkpoint, "view-read")
+    x = torch.randn(64, HIDDEN, device="cuda", dtype=torch.float16)
+    at_the_sub_block_grain(weights, model, x)
+    model.residency.admit("run", ("stack",))
+    try:
+        weight = model.stack.blocks[BLOCKS - 1].out.weight
+        assert type(weight) is not torch.nn.Parameter, "a stand-in: its bytes are not mapped"
+        with torch.inference_mode():
+            view = weight.t()
+    finally:
+        model.residency.release("run", ("stack",))
+    assert torch.equal(view.cpu(), values[f"blocks.{BLOCKS - 1}.out.weight"].t())
+
+
+@on_card
 @pytest.mark.parametrize("small", [paging.SMALL, 1 << 40])
 def test_a_kernel_launched_outside_torch_never_reads_an_unmapped_weight(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, small: int
