@@ -15,7 +15,7 @@ from cozy_runtime.internal.parallel.group import RankGroup, receive_residence
 from cozy_runtime.internal.parallel.plan import GpuDivergence, GroupPlan, GroupRefusal
 from cozy_runtime.internal.seam import Channel
 
-PLAN = GroupPlan(2, ("0", "1"), "sha256:" + "a" * 64, 98091614208).document()
+PLAN = GroupPlan(2, ("0", "1"), "sha256:" + "a" * 64).document()
 
 _FOLLOWER = """
 import json, socket, sys

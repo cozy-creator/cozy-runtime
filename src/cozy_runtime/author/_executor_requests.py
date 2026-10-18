@@ -138,32 +138,24 @@ class WriterAdopt(_Writer, frozen=True, kw_only=True, tag="adopt"):
     length: int
 
 
-class SealedPlan(msgspec.Struct, frozen=True, kw_only=True):
-    """What one weight set's sealed host layout holds (`host_tiers.sealed/1`): the TensorFS
-    read plan and region grouping Runtime derived from model code. TensorD validates the
-    plan against its copy of the manifest header and fills the shared CPU layout through
-    TensorFS; the layout digest must match."""
+class GrantPlan(msgspec.Struct, frozen=True, kw_only=True):
+    """One weight set as varena maps it (`tensorfs.varena.torch.regions_of`): TensorD lays its
+    sealed host layout out with varena's own function over these regions, so both agree."""
 
     manifest: str
-    #: the weight set's key and region digest, as `HostTier` names them
+    #: the weight set's name in the executor's memory (`<construction>/<component>`)
     name: str
-    layout: str
-    window: int
-    traversal: tuple[tuple[str, str], ...]
     components: tuple[str, ...]
     regions: tuple[tuple[str, ...], ...]
-    #: the stored parts the code builds, when it skips some (all of them when empty)
-    parts: tuple[str, ...] = ()
+    #: the stored tensors the code builds
+    keys: tuple[str, ...]
 
 
-class SealedTier(_Request, frozen=True, kw_only=True, tag="sealed_tier"):
-    """One weight set's sealed CPU layout, prepared through TensorFS and retained by TensorD
-    across executors. The canonical `SealedPlan` follows in a sealed memfd; `Tier` answers,
-    the layout's memfd following when `held`."""
+class ReadGrant(_Request, frozen=True, kw_only=True, tag="read_grant"):
+    """One weight set's bytes (tensorfs-v2 §7): its `GrantPlan` follows in a sealed memfd.
+    `Granted` answers with the sealed host layout, or the manifest's chunk files."""
 
     manifest: str
-    name: str
-    layout: str
     sha256: str
     length: Annotated[int, msgspec.Meta(ge=0)]
     #: the plan's memfd; never on the wire
@@ -186,7 +178,7 @@ class FetchChannel(_Request, frozen=True, kw_only=True, tag="fetch_channel"):
 
 
 type _Tagged = (
-    SealedTier
+    ReadGrant
     | ModelSource
     | FetchChannel
     | ChildEvents
@@ -231,11 +223,19 @@ class Handoff(Answer, frozen=True, kw_only=True):
 
 
 class Tier(Answer, frozen=True, kw_only=True):
-    """The machine's answer to a sealed layout ask (`SealedTier`); one memfd follows when
-    `held`."""
+    """A memfd the machine holds, following when `held`."""
 
     held: bool = False
     descriptor: int = -1
+
+
+class Granted(Tier, frozen=True, kw_only=True):
+    """A `ReadGrant`'s answer: the sealed host layout (`held`), or every chunk file of the
+    manifest's selected components in sha256 order (`fds`), `objects_sha256` naming that list
+    (the sha256 of its `<sha256>:<length>` lines)."""
+
+    objects_sha256: str = ""
+    fds: tuple[int, ...] = ()
 
 
 class SourceBytes(Tier, frozen=True, kw_only=True):
@@ -285,6 +285,8 @@ class CallState(Answer, frozen=True, kw_only=True):
     progress: CallProgress | None = None
     #: The child's execution observation document.
     observation: object = None
+    #: A failed child's traceback, from its triage (its `detail` is untruncated too).
+    traceback: str = ""
 
 
 class MemoEntry(Answer, frozen=True, kw_only=True):

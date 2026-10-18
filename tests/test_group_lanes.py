@@ -207,13 +207,11 @@ def test_a_gloo_group_forms_on_a_kernel_chosen_port_and_agrees_or_refuses(
             "construction": "fixture",
             "devices": "4,5,6",
             "sequence_parallel_degree": 3,
-            "authorized_device_limit_bytes": 1,
             "binding": {
                 "application": "x:app",
                 "package_interface": "/nowhere",
                 "model_class": "",
             },
-            "budgets": {},
         }
         # the hardware half disagrees: refused BEFORE torch is imported on the follower
         divergent = {"degree": 3, "devices": ["0", "1", "7"]}
@@ -238,14 +236,10 @@ def test_a_gloo_group_forms_on_a_kernel_chosen_port_and_agrees_or_refuses(
 def test_the_plan_agrees_field_by_field_or_refuses() -> None:
     """A follower ASSERTS the broadcast plan; the first field that differs is named, with
     the GPU that disagrees, and no GPU ever adapts."""
-    plan = GroupPlan(2, ("2", "3"), "sha256:a", 1024)
+    plan = GroupPlan(2, ("2", "3"), "sha256:a")
     plan.assert_agrees(plan, rank=1)
     for field_name, other in (
         ("plan_digest", msgspec.structs.replace(plan, plan_digest="sha256:b")),
-        (
-            "authorized_device_limit_bytes",
-            msgspec.structs.replace(plan, authorized_device_limit_bytes=1),
-        ),
         ("degree", msgspec.structs.replace(plan, degree=4)),
     ):
         with pytest.raises(GpuDivergence) as refused:

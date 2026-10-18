@@ -96,12 +96,13 @@ from cozy_runtime.author._executor_requests import (
     ChildEvents,
     Exchange,
     FetchChannel,
+    Granted,
+    GrantPlan,
     Handoff,
     ModelSource,
     Published,
+    ReadGrant,
     Request,
-    SealedPlan,
-    SealedTier,
     SourceBytes,
     Tier,
 )
@@ -161,16 +162,9 @@ from cozy_runtime.internal.discovery import discover_installed
 from cozy_runtime.internal.encoding.leaves import FORMATS, serving
 from cozy_runtime.internal.executor_commands import (
     LOAD_ATTENTION_PIN,
-    LOAD_PINNED,
-    MAP,
-    RANK_CELLS,
-    SEALED_TIERS,
-    SHARING,
-    WEIGHT_PLANE,
     Activate,
     Attention,
     Binding,
-    Budget,
     CallInterface,
     Fork,
     GroupHardware,
@@ -184,15 +178,12 @@ from cozy_runtime.internal.executor_commands import (
     PrepareRequest,
     Probe,
     Release,
-    Revoke,
-    Share,
     Shutdown,
     Start,
     Unload,
 )
 from cozy_runtime.internal.executor_replies import Eviction as ReplyEviction
 from cozy_runtime.internal.executor_replies import Memory as ReplyMemory
-from cozy_runtime.internal.executor_replies import PlaneFacts
 from cozy_runtime.internal.executor_replies import Step as ReplyStep
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.fill import (
@@ -572,16 +563,6 @@ def _reply_step(step: Any) -> ReplyStep:
     )
 
 
-def _working_peak(peak: int, at_entry: int, residency: Mapping[str, Any]) -> int:
-    """The attempt's working memory: on the plane, its scopes' measured activations (an
-    adaptive scope, such as an image VAE's decode, fits itself to the room it finds);
-    otherwise torch's peak over its bytes at entry, never below a scope's own peak."""
-    scoped = int(residency.get("attempt_activation_peak_bytes", 0))
-    if "plane" in residency and scoped > 0:
-        return scoped
-    return max(int(peak) - int(at_entry), scoped, 0)
-
-
 def _serving(module: str, export: str, surface: Any) -> _CallType:
     """A callable bound from its own code, called as every function is: `{payload, models}`.
     Its direct caller passes the model slots beside the request fields (`_CallType.models`)."""
@@ -661,7 +642,7 @@ class _OnDemand:
 
 
 #: The requests rank 0 relays to the machine for a follower (`_relay`).
-_RELAYED = frozenset({"sealed_tier", "model_source"})
+_RELAYED = frozenset({"read_grant", "model_source"})
 
 #: The runtime modules a construction imports, named ONCE so `start` can warm
 #: exactly the set `_prepare_first` re-imports (cr-104). Warming a name this tuple omits
@@ -744,6 +725,10 @@ class Executor:
         #: all their weights live (`tensorfs.varena.torch`).
         self.constructions: dict[str, Executor] = {}
         self.memory: Memory | None = None
+        #: HOST ONLY: its GPUs' ledger memfds from `Start` (rank 0 hands follower r the r-th, a
+        #: follower holds its own), and the machine's memory mode
+        self.ledgers: list[int] = []
+        self.memory_mode = "shared"
         #: HOST ONLY, rank 0: what this process asks TensorFS to fetch, when and in what order
         self.fetch = (
             fetch_plan.Fetches(self._fetch_channel, self._fetch_progress)
@@ -879,12 +864,6 @@ class Executor:
                 if command.collect:
                     gc.collect()
                 return self.probe()
-            case Budget():
-                return self.budget(command)
-            case Share():
-                return self.share()
-            case Revoke():
-                return self.revoke(command)
             case Map():
                 return self.map(command)
             case Shutdown():
@@ -907,12 +886,6 @@ class Executor:
                 "import_only",
                 zygote.CAPABILITY,
                 LOAD_ATTENTION_PIN,
-                WEIGHT_PLANE,
-                LOAD_PINNED,
-                RANK_CELLS,
-                MAP,
-                *SHARING,
-                SEALED_TIERS,
             ],
             "memo": [stage_memo.CAPABILITY],
             "pgid": group,
@@ -1053,9 +1026,13 @@ class Executor:
         """A FOLLOWER joins rank 0's store and forms its half of the process group."""
         if self.rank == 0:
             return {"ok": False, "code": "not_a_follower", "detail": f"{_gpu(0)} forms the group"}
-        if command.cell:
-            # It follows the frame on the seam: taken first and dropped, whatever this answers.
-            os.close(self.channel.recv_memfd())
+        if command.ledger:
+            # It follows the frame on the seam: taken first, whatever this join answers.
+            fd = self.channel.recv_memfd()
+            if self.host.ledgers:
+                os.close(fd)
+            else:
+                self.host.ledgers = [fd]
         if command.abort:
             watcher = socket.socket(fileno=self.channel.recv_descriptor())
             threading.Thread(
@@ -1131,7 +1108,7 @@ class Executor:
         transport = self.host.transport
         recalibrate = transport is not None and transport.links.copy_engines
         self.host.pg = self.group.form(
-            self.torch, _SEALED, again={}, formed=self.host._calibrated if recalibrate else None
+            self.torch, _SEALED, again=True, formed=self.host._calibrated if recalibrate else None
         )
         if self.host.comms is not None:
             self.host.comms.pg = self.host.pg
@@ -1492,6 +1469,12 @@ class Executor:
         and reads as unstarted. The ordinary start that follows only initializes devices,
         warms the package and forms the group.
         """
+        ledgers = self.channel.recv_fds(command.ledgers) if command.ledgers else []
+        if self.poisoned or self.ledgers:
+            for fd in ledgers:  # one set per process
+                os.close(fd)
+        else:
+            self.ledgers, self.memory_mode = ledgers, command.memory_mode
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
         if command.memo is not None:
@@ -1665,6 +1648,7 @@ class Executor:
                     self.pg = self.group.form(
                         self.torch,
                         _SEALED,
+                        self.ledgers[1:],
                         nccl=self.transport.nccl,
                         formed=self._calibrated if measured.copy_engines else None,
                     )
@@ -1973,7 +1957,6 @@ class Executor:
             "construction": key,
             "reused": reused,
             "resident_bytes": self._resident_bytes(child),
-            "plane": self._plane_facts(),
         }
 
     def _resident_bytes(self, child: Executor) -> int:
@@ -1988,42 +1971,23 @@ class Executor:
         }
         return sum(m.resident for m in memory.stats(drain=False).models if m.name in names)
 
-    def _plane_facts(self, request: RequestStats | None = None) -> dict[str, Any] | None:
-        """This process's memory facts; with `request` (`RequestStats`), its steps too."""
-        memory, torch = self.host.memory, self.host.torch
-        if memory is None or torch is None:
+    @staticmethod
+    def _memory(request: RequestStats | None) -> dict[str, Any] | None:
+        """The request's memory as its reply states it: each model's steps, its evictions and
+        what package state still held at its end (B3 adds the peaks per shape key)."""
+        if request is None:
             return None
-        stats = memory.stats(drain=False)
-        resident = {m.name: m.resident for m in stats.models}
-        committed = sum(resident.values())
-        allocator = torch.cuda.memory_stats() if self.device_kind == "cuda" else dict[str, int]()
-        reserved = accel.reserved(torch, self.device_kind)
-        context = max(self.host.device_context, 0)
-        baked = sum(m.residency.baked() for m in self.host._members() if m.residency is not None)
-        facts = PlaneFacts(
-            committed_bytes=committed,
-            resident=resident,
-            context_bytes=context,
-            reserved_bytes=reserved,
-            process_bytes=context + reserved + committed,
-            h2d_bytes=sum(m.paged_in + m.streamed for m in stats.models),
-            stall_ns=sum(m.stall_ns for m in stats.models),
-            evictions=stats.evictions,
-            lora_baked=baked,
-            alloc_retries=int(allocator.get("num_alloc_retries", 0)),
-            alloc_ooms=int(allocator.get("num_ooms", 0)),
-            memory=None
-            if request is None
-            else ReplyMemory(
-                steps=[_reply_step(s) for s in request.steps],
-                evictions=[
-                    ReplyEviction(model=e.model, rung=e.rung, reason=e.reason, nbytes=e.nbytes)
-                    for e in request.evictions
-                ],
-                leftover_bytes=sum(n for _, n in request.leftover),
-            ),
+        memory = ReplyMemory(
+            steps=[_reply_step(s) for s in request.steps],
+            evictions=[
+                ReplyEviction(
+                    model=e.model, gpu=e.gpu, rung=e.rung, reason=e.reason, nbytes=e.nbytes
+                )
+                for e in request.evictions
+            ],
+            leftover=list(request.leftover),
         )
-        return msgspec.to_builtins(facts)
+        return msgspec.to_builtins(memory)
 
     def _members(self) -> list[Executor]:
         """Every loaded model's generation in this process."""
@@ -2032,17 +1996,6 @@ class Executor:
             for child in self.constructions.values()
             for member in child.model_executors or [child]
         ]
-
-    def with_planes(self, reply: dict[str, Any]) -> dict[str, Any]:
-        """Each GPU's own plane facts: a follower states its own to rank 0, and rank 0's
-        reply carries every follower's (`rank_planes`, rank 1 first; None: not stated yet),
-        so the owner charges each GPU of the group its own process."""
-        if self.rank > 0:
-            if reply.get("ok") and reply.get("plane") is None and self.host.memory is not None:
-                reply["plane"] = self._plane_facts()
-        elif self.group is not None:
-            reply["rank_planes"] = [self.group.rank_planes.get(r) for r in range(1, self.world)]
-        return reply
 
     def _follower_load(self, command: Load) -> dict[str, Any]:
         """Rank r's half of rank 0's load: one construction, or one model of a many-model
@@ -2183,7 +2136,6 @@ class Executor:
             ],
             "active": self.active,
             "free_bytes": free,
-            "plane": self._plane_facts(),
         }
 
     def _committed(self) -> int:
@@ -2284,19 +2236,6 @@ class Executor:
         self._stages = stages
         if not binding.model_class:
             return self._prepare_weightless(binding, started)
-        authorized = command.authorized_device_limit_bytes
-        if authorized is UNSET:
-            # NO SELF-DERIVED CEILING (cr-025/cr-066): the worker assigns one before every
-            # model-bearing prepare. An absent assignment is a worker defect, refused
-            # rather than defaulted to a read of free bytes.
-            self.poisoned = "prepare without an authorized device limit"
-            return {
-                "ok": False,
-                "code": "authorization_absent",
-                "detail": "the prepare carries no authorized_device_limit_bytes; the worker "
-                "assigns the residence ceiling and this executor derives none",
-            }
-
         _restore_seal()
 
         import torch  # the ONE torch import in the runtime, and it is in THIS process
@@ -2313,7 +2252,7 @@ class Executor:
         cuda_ms = (time.perf_counter() - started) * 1000
         stage("cuda_init")
         from tensorfs.varena import Unsupported as VarenaUnsupported
-        from tensorfs.varena.torch import Memory
+        from tensorfs.varena.torch import LedgerGrant, Memory, Mode
 
         from cozy_runtime.author import ModelRegistry
         from cozy_runtime.author._loader import Artifact, Config, ModelFitRefused
@@ -2513,7 +2452,6 @@ class Executor:
             degree=self.world,
             devices=_sealed_entries(),
             plan_digest=rank_invariant_digest(plan.identity()),
-            authorized_device_limit_bytes=authorized,
         )
 
         # The LOAD leg's liveness feed. Integral-MiB positions on the lossy lane, so the
@@ -2538,7 +2476,12 @@ class Executor:
         device = self._rank_device(torch)
         if host.memory is None:
             try:
-                host.memory = Memory.open(device)
+                ledger = (
+                    LedgerGrant(device.index or 0, *host.ledgers[:2])
+                    if device.type == "cuda" and len(host.ledgers) >= 2
+                    else None
+                )
+                host.memory = Memory.open(device, ledger, Mode(host.memory_mode))
             except VarenaUnsupported as exc:  # no varena on this OS (Windows)
                 return {"ok": False, "code": "weight_plane_unavailable", "detail": str(exc)}
             host.memory.context = max(host.device_context, 0)
@@ -2554,11 +2497,12 @@ class Executor:
             qualified=qualified_pair,
             device_facts=device_facts,
             custody=binding.custody,
-            grant=self._seal_tier if command.sealed_tiers else None,
+            grant=self._read_grant,
         )
         stage("backend_ctor")
-        # THE GROUP AGREES ITS PLAN before any rank registers a byte (cr-068). Budgets are
-        # the Worker's, per device, so the ceiling the ranks share is the one it assigned.
+        # THE GROUP AGREES ITS PLAN before any rank registers a byte (cr-068), and the smallest
+        # device any rank has: what a placeable component's home may hold.
+        total = accel.allocation(torch, self.device_kind)["driver_total_bytes"]
         try:
             if self.world > 1 and self.rank == 0:
                 assert self.group is not None
@@ -2567,7 +2511,7 @@ class Executor:
                     plan=mine.document(),
                     required=0,
                     park=lambda _need: [],
-                    ceiling=lambda: authorized,
+                    ceiling=lambda: total,
                 )
             elif self.world > 1:
                 agreed = receive_residence(
@@ -2577,10 +2521,10 @@ class Executor:
                     plan=mine.document(),
                     required=0,
                     park=lambda _keys: None,
-                    ceiling=lambda: authorized,
+                    ceiling=lambda: total,
                 )
             else:
-                agreed = authorized
+                agreed = total
         except (GroupRefusal, SeamError) as exc:
             return self._group_refusal(
                 exc if isinstance(exc, GroupRefusal) else GroupRefusal(str(exc))
@@ -2807,8 +2751,6 @@ class Executor:
                 }
                 for name, m in backend.models.items()
             },
-            "plane": self._plane_facts(),
-            "authorized_device_limit_bytes": authorized,
             "rss_bytes": _rss(),
             "gpu_name": accel.device_identity(torch, self.device_kind)["name"],
             "device_driver": device_facts.driver,
@@ -2863,18 +2805,6 @@ class Executor:
                 "detail": "model paths must be sorted unique and parameters must be unique",
             }
 
-        authorized = command.authorized_device_limit_bytes
-        if authorized is UNSET:
-            self.poisoned = "prepare without an authorized device limit"
-            return {
-                "ok": False,
-                "code": "authorization_absent",
-                "detail": "the prepare carries no authorized_device_limit_bytes; the worker "
-                "assigns the residence ceiling and this executor derives none",
-            }
-
-        # ONE authorization for the PROCESS: each model fits under what everything already
-        # loaded left of it, measured by this process's own allocator before its fill.
         children: list[tuple[str, Executor, dict[str, Any]]] = []
         for row in rows:
             binding = row.binding
@@ -2882,14 +2812,11 @@ class Executor:
             child = self._construction_child(self.construction)
             child._group_parent = self
             # The command with one model in place of its set: everything the machine said
-            # about the load holds for each model (a field named one by one here was
-            # dropped once: `device_weights`, so a construction
-            # of two models never attached the machine's GPU weights).
+            # about the load holds for each model.
             load = msgspec.structs.replace(
                 command,
                 construction=self.construction,
                 binding=binding,
-                budgets=row.budgets,
                 models=UNSET,
                 group=UNSET,
                 model_key=f"{self.construction}#{binding.model_binding_path}"
@@ -2898,8 +2825,7 @@ class Executor:
                 sequence_parallel_degree=max(self.world, 1),
             )
             if self._deferred(binding):
-                # Built inside the attempt that reads it, under that attempt's cap.
-                load = msgspec.structs.replace(load, cap_bytes=UNSET, rank_caps=())
+                # Built inside the attempt that reads it.
                 build = functools.partial(self._build_on_demand, child, load)
                 child.models = dict.fromkeys(binding.parameter_names(), _OnDemand(build))
                 children.append((parameter, child, {}))
@@ -3033,7 +2959,6 @@ class Executor:
             "allocator_bytes": int(last.get("allocator_bytes", -1)),
             "reserved_bytes": int(last.get("reserved_bytes", -1)),
             "layouts": layouts,
-            "plane": self._plane_facts(),
             "declared_scopes": scopes,
             "rss_bytes": max(
                 (int(facts.get("rss_bytes", 0)) for _, facts in facts_rows), default=0
@@ -3525,7 +3450,7 @@ class Executor:
         self._emit_attention(record, restored, "attention.restored")
         # The last attempt out drains the device, with none running.
         last = self.host.in_flight.last(slot)
-        plane_facts = self._plane_facts(request.stats if request is not None else None)
+        memory = self._memory(request.stats if request is not None else None)
         handler_ms = (time.perf_counter() - lease_acquired) * 1000
         self._attempt_spool = self.host._attempt_spool = None
         self.host._attempt_request = ""
@@ -3551,8 +3476,6 @@ class Executor:
         working_peak = max(peak_vram - allocated_at_start, 0)
         if self.group is not None:
             working_peak = max(working_peak, *self.group.working_peaks.values(), 0)
-        if plane_facts is not None:
-            plane_facts["activation_peak_bytes"] = working_peak
         # step 3: the lease releases here, and nothing after this line touches the device.
         # DEVICE RELEASE IS THIS REPLY (cr-079): the handler registered its outputs as raw
         # host frames, so `device_lease_ms` is device time and the encode is the worker's.
@@ -3612,7 +3535,7 @@ class Executor:
             ],
             "ignored": list(record.ignored),
             "oversize_result_bytes": oversize,
-            "plane": plane_facts,
+            "memory": memory,
             "metrics": {
                 "handler_ms": round(handler_ms, 3),
                 "device_lease_ms": round(lease_ms, 3),
@@ -4182,25 +4105,42 @@ class Executor:
             raise RuntimeError(f"{name or 'header'} of {manifest[:23]} is short")
         return bytes(body)
 
-    def _seal_tier(self, plan: SealedPlan) -> int | None:
-        """The machine's sealed host layout for `plan`, filled once and kept across executors
-        (the `WeightGrant` host cache); None when it holds none, and the weights read the
-        checkpoint's own chunks."""
+    def _read_grant(
+        self, plan: GrantPlan, objects: list[tuple[str, int]]
+    ) -> tuple[int | None, list[tuple[str, int, int]]]:
+        """One weight set's bytes from the machine (`ReadGrant`): its sealed host layout, or
+        the chunk files of `objects` (`(sha256, length)` in sha256 order, as the header names
+        them), each `(sha256, length, fd)`; the fds are the caller's to close."""
         body = canonical.write(msgspec.to_builtins(plan))
-        memfd = seam.sealed("cozy-sealed-plan", body)
+        memfd = seam.sealed("cozy-grant-plan", body)
         try:
-            request = SealedTier(
+            request = ReadGrant(
                 manifest=plan.manifest,
-                name=plan.name,
-                layout=plan.layout,
                 sha256=hashlib.sha256(body).hexdigest(),
                 length=len(body),
                 memfd=memfd,
             )
-            answer = self._durable(request, Tier)
+            answer = self._durable(request, Granted)
         finally:
             os.close(memfd)
-        return answer.descriptor if answer.ok and answer.held and answer.descriptor >= 0 else None
+        if answer.ok and answer.held and answer.descriptor >= 0:
+            return answer.descriptor, []
+        listed = "".join(f"{sha}:{length}\n" for sha, length in objects).encode()
+        if (
+            not answer.ok
+            or len(answer.fds) != len(objects)
+            or answer.objects_sha256 != hashlib.sha256(listed).hexdigest()
+        ):
+            for fd in answer.fds:
+                os.close(fd)
+            raise RuntimeFailure(
+                f"{plan.name}: the machine granted no bytes it names as this checkpoint's chunks "
+                f"({answer.code or 'a different list'})",
+                code="weights_ungranted",
+            )
+        return None, [
+            (sha, length, fd) for (sha, length), fd in zip(objects, answer.fds, strict=True)
+        ]
 
     def _checkpoint(self, manifest: str) -> Checkpoint:
         """A selected checkpoint's header through TensorD (`ModelSource`). Only the header is
@@ -4239,7 +4179,7 @@ class Executor:
         default the one this thread serves, "" outside every call).
         """
         body = encode_request(request)
-        sending = request.memfd if isinstance(request, SealedTier) else -1
+        sending = request.memfd if isinstance(request, ReadGrant) else -1
         body.pop("memfd", None)
         if sending >= 0:
             body["descriptor"] = True
@@ -4262,7 +4202,11 @@ class Executor:
             elif handoff and frame.get("ok") is True:
                 raise SeamError("seam_descriptor", "successful reply omitted its capability")
             # descriptors arrive by SCM_RIGHTS, never as numbers
-            if frame.pop("descriptors", 0) or frame.get("lease") is True:
+            frame.pop("fds", None)
+            count = frame.pop("descriptors", 0)
+            if count and issubclass(into, Granted) and type(count) is int and count > 0:
+                frame["fds"] = channel.recv_fds(count)
+            elif count or frame.get("lease") is True:
                 channel.close()
                 raise SeamError("seam_descriptor", "unexpected descriptors in a reply")
 
@@ -4402,85 +4346,26 @@ class Executor:
         recorded. The proof is the device's own: every stream is complete."""
         return accel.streams_idle(self.torch, self.device_kind)
 
-    def budget(self, command: Budget) -> dict[str, Any]:
-        """TensorD v0.10's budget, answered ok until it speaks the ledger (B4): varena decides
-        residency. A cut to 0 gives back every weight page no call is using, and torch's
-        idle cache; any other figure changes nothing."""
-        if self.poisoned:
-            return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
-
-        def own() -> int:
-            memory = self.memory
-            if memory is None or command.vram_bytes != 0:
-                return 0
-            freed = sum(model.evict() for model in list(memory.models.values()))
-            accel.release_cached(self.torch, self.device_kind)
-            return freed
-
-        freed, refused = self._followers(self._plane_ranks(), command, "budget", own)
-        if refused:
-            return refused
-        return {"ok": True, "freed_bytes": freed, "plane": self._plane_facts()}
-
-    def share(self) -> dict[str, Any]:
-        """Custody is gone (memory-varena D9): nothing is shared."""
-        if self.poisoned:
-            return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
-        return {"ok": True, "shared_bytes": 0, "plane": self._plane_facts()}
-
-    def revoke(self, command: Revoke) -> dict[str, Any]:
-        """Custody is gone: nothing was shared, so nothing is released."""
-        return {"ok": True, "released_bytes": 0}
-
     def map(self, command: Map) -> dict[str, Any]:
-        """Weights map as a call first binds them; nothing maps ahead."""
+        """Keep one loaded construction warm (`Memory.keep`): its models are evicted last and
+        copy home into free room first."""
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
-        if command.construction not in self.constructions:
+        child = self.constructions.get(command.construction)
+        if child is None:
             return self._refusal(
                 "construction_not_loaded", f"{command.construction!r} is not loaded"
             )
-        return {"ok": True, "mapped_bytes": 0, "complete": True, "plane": self._plane_facts()}
-
-    def _plane_ranks(self) -> list[int]:
-        """The follower GPUs, which answer the plane's commands."""
-        return [] if self.group is None else [f.rank for f in self.group.followers]
-
-    def _followers(
-        self, ranks: Any, command: Any, what: str, own: Callable[[], int]
-    ) -> tuple[int, dict[str, Any] | None]:
-        """Send `command` to follower `ranks`, run rank 0's own half (`own`), then read every
-        follower's reply, so the channel stays in step whatever `own` raises. Returns its
-        result and the group's refusal, if any."""
-        ranks = sorted(ranks) if self.group is not None else []
-        frame = executor_commands.encode(command)
-        try:
-            for rank in ranks:
-                self.group.send_one(rank, frame)  # type: ignore[union-attr]
-        except GroupRefusal as exc:
-            return 0, self._group_refusal(exc, closing=False)
-        failure: BaseException | None = None
-        result = 0
-        try:
-            result = own()
-        except BaseException as exc:
-            failure = exc
-        refused = None
-        for rank in ranks:
-            try:
-                reply = self.group.reply_one(rank, what)  # type: ignore[union-attr]
-                if not reply.get("ok"):
-                    raise GroupRefusal(
-                        f"{_gpu(rank)} refused to {what}: {reply.get('code')}: "
-                        f"{reply.get('detail', '')}"[:600],
-                        code="group_broken",
-                    )
-            except GroupRefusal as exc:
-                refused = self._group_refusal(exc, closing=False)
-                break  # the group is broken: no later reply is owed
-        if failure is not None:
-            raise failure
-        return result, refused
+        if self.memory is not None:
+            self.memory.keep(
+                [
+                    model
+                    for member in child.model_executors or [child]
+                    if member.backend is not None
+                    for model in member.backend.models.values()
+                ]
+            )
+        return {"ok": True}
 
     def _active_residency(self) -> dict[str, Any]:
         child = self.constructions.get(self.active)
@@ -4526,10 +4411,9 @@ class Executor:
         first = first if first.terminal == "failed" else later
         where = f" in {stage}" if stage else ""
         message = first.message + where + ("" if first is later else f"; then {later.message}")
-        capacity, facts, quiet = later.code in CAPACITY_CODES, None, False
+        capacity, quiet = later.code in CAPACITY_CODES, False
         if capacity:
             with contextlib.suppress(Exception):  # a sticky fault raises here: then it is one
-                facts = self._plane_facts()
                 # Calls still in flight own the work the streams still hold.
                 quiet = (
                     self._quiescent()
@@ -4555,7 +4439,6 @@ class Executor:
             "poisoned": self.poisoned,
             "outputs": [],
             "frames": [],
-            "plane": facts,
         }
 
     def _settled(self, reply: dict[str, Any]) -> dict[str, Any]:
@@ -4582,7 +4465,6 @@ class Executor:
             **self._device_figures(),
             "residency": self._active_residency(),
             "constructions": self.residency_document()["constructions"],
-            "plane": self._plane_facts(),
             "rss_bytes": _rss(),
             "attempts": self.attempts,
             "processes": processes,
@@ -4706,11 +4588,11 @@ def answer(executor: Executor, frame: Frame) -> Frame | None:
             "detail": f"{_gpu(executor.rank)} answers {sorted(_FOLLOWER_COMMANDS)}, not {name!r}",
         }
     if name == "run":
-        return executor.with_planes(executor.run(frame))
+        return executor.run(frame)
     if name not in executor_commands.NAMES:
         return {"ok": False, "code": "unknown_command", "detail": name}
     command = executor_commands.decode(frame)
-    return None if isinstance(command, Shutdown) else executor.with_planes(executor.handle(command))
+    return None if isinstance(command, Shutdown) else executor.handle(command)
 
 
 #: The commands whose refusals carry the raising traceback to the worker.

@@ -33,7 +33,6 @@ from tensorfs.varena.torch import (
     regions_of,
 )
 
-from cozy_runtime.author._executor_requests import SealedPlan
 from cozy_runtime.author._loader import Census, TensorLike, TensorSpec, _members
 from cozy_runtime.author._model import PLACED
 from cozy_runtime.internal import canonical, lora_bake
@@ -71,11 +70,15 @@ if TYPE_CHECKING:
     from torch import Tensor
     from torch.nn import Module
 
-#: The read window a sealed host layout's plan is cut into (TensorD's `plan_for_traversal`).
-READ_WINDOW = 4 << 20
-
-#: TensorD's sealed host layout for a weight set (`SealedTier`); None: it keeps none.
-type Grant = Callable[[SealedPlan], int | None]
+#: A weight set's bytes from TensorD (`ReadGrant`), by manifest and layout digest: the host
+#: layout deposited for it, or the chunk files of the `(sha256, length)` objects asked, each
+#: `(sha256, length, fd)`.
+type Grant = Callable[
+    [str, str, list[tuple[str, int]]], tuple[int | None, list[tuple[str, int, int]]]
+]
+#: A host layout varena sealed, deposited with TensorD (`Deposit`): manifest, name, layout
+#: digest, the memfd (the callee's to close).
+type Deposit = Callable[[str, str, str, int], None]
 
 
 # ---------------------------------------------------------------------------- the backend
@@ -99,10 +102,11 @@ class Backend:
         device_facts: DeviceFacts,
         custody: str = "canonical",
         grant: Grant | None = None,
+        deposit: Deposit | None = None,
     ) -> None:
         self.memory = memory
         self.device = device
-        self.grant = grant
+        self.grant, self.deposit = grant, deposit
         self.torch = torch
         self.construction = construction
         self.checkpoints = dict(checkpoints)
@@ -429,52 +433,49 @@ class Backend:
 
     def _register(self, name: str, root: Module, keys: list[str]) -> Model:
         """One component loaded into the memory: its stored tensors, bound through their
-        routes, its LoRAs baked on page-in, its bytes from TensorD's sealed host layout when it
-        keeps one (the regions the memory maps, so the layouts agree), else sealed by varena."""
+        routes, its LoRAs baked on page-in, its bytes from TensorD's grant: the host layout
+        deposited for it, else the chunk files, which varena seals and the layout goes to
+        TensorD for the next load."""
         checkpoint = self.checkpoints[name]
         rows = {self.plan[key].name: self.plan[key] for key in keys}
         bakes = self.bakes[name] = _Bakes(self.torch, root, rows, set(blocks_of(root)))
         grant = WeightGrant(checkpoint.ck, name, checkpoint.manifest_id, keys=tuple(rows))
         declared = Declared(grant, fill=bakes if bakes.bakes else None, bind=_Routes(self, rows))
         vars(root)["_varena"] = declared
-        fd = None
-        if self.grant is not None and self.device.type != "mps":
-            fd = self.grant(self._sealed(name, checkpoint, regions_of(root), rows))
-            vars(root)["_varena"] = replace(declared, weights=replace(grant, host_fd=fd))
+        layout = canonical.digest({"manifest": grant.manifest, "regions": regions_of(root)})
+        fd: int | None = None
+        files: list[tuple[str, int, int]] = []
+        if self.grant is not None:
+            fd, files = self.grant(grant.manifest, layout, self._objects(checkpoint))
+            granted = replace(grant, host_fd=fd, files=tuple(files))
+            vars(root)["_varena"] = replace(declared, weights=granted)
         try:
-            return self.memory.load(root)
+            model = self.memory.load(root)
         finally:
-            if fd is not None:
-                os.close(fd)
-            for _, sealed in self.memory.sealed():  # TensorD v0.10 takes no deposit
+            for held in ([] if fd is None else [fd]) + [f for _, _, f in files]:
+                os.close(held)
+        for _, sealed in self.memory.sealed():
+            if self.deposit is not None:
+                self.deposit(grant.manifest, f"{self.construction}/{name}", layout, sealed)
+            else:
                 os.close(sealed)
+        return model
 
-    def _sealed(
-        self,
-        name: str,
-        checkpoint: Checkpoint,
-        regions: list[list[str]],
-        rows: Mapping[str, PlanRow],
-    ) -> SealedPlan:
-        """The sealed host layout TensorD fills for one component: its header order, the
-        memory's regions, and the parts the code builds when it skips some."""
-        header = list(checkpoint.ck.tensors[name])
-        parts = (
-            ()
-            if len(rows) == len(header)
-            else tuple(row.role_what(p.role) for row in rows.values() for p in row.encoded.parts)
-        )
-        ids = tuple(tuple(region) for region in regions)
-        return SealedPlan(
-            manifest=checkpoint.manifest_id,
-            name=f"{self.construction}/{name}",
-            layout=canonical.digest({"manifest": checkpoint.manifest_id, "regions": regions}),
-            window=READ_WINDOW,
-            traversal=tuple((name, key) for key in header),
-            components=(name,),
-            regions=ids,
-            parts=parts,
-        )
+    def _objects(self, checkpoint: Checkpoint) -> list[tuple[str, int]]:
+        """Every chunk of the manifest's selected components, `(sha256, length)` in sha256
+        order: what a grant without a sealed layout hands over."""
+        selected = [
+            c for c, ck in self.checkpoints.items() if ck.manifest_id == checkpoint.manifest_id
+        ]
+        tensors = checkpoint.ck.tensors
+        used = {
+            part.chunk
+            for c in selected
+            for info in tensors.get(c, {}).values()
+            for part in info.parts.values()
+        }
+        chunks = checkpoint.ck.chunks
+        return sorted((chunks[i][0], chunks[i][1]) for i in used)
 
     def _install_leaf(self, key: str) -> tuple[Any, Any, tuple[str, ...]]:
         """Replace the linear op that owns `key` with its encoded leaf, on meta. Returns the
