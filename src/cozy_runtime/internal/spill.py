@@ -243,7 +243,12 @@ def spill(
     _fence(torch, device)
     read = {int(t.untyped_storage()._cdata) for t in stored(operands) if t.device == device}
     left, moved, disk = room if room >= 0 else need, 0, disk and room >= 0
-    found = _found(torch, device, need, read, mapped and left >= need)
+
+    def movable(key: int, nbytes: int) -> bool:
+        out = key not in read and _last(key) < BEGAN[0]
+        return key not in read and ((nbytes <= left and (mapped or out)) or (disk and out))
+
+    found = _found(torch, device, need, movable)
     for key, storage in sorted(
         found.items(), key=lambda r: (r[0] in read, _last(r[0]), -r[1].nbytes())
     ):
@@ -325,12 +330,11 @@ def _fence(torch: ModuleType, device: Device) -> None:
 
 
 def _found(
-    torch: ModuleType, device: Device, need: int, read: set[int], mappable: bool
+    torch: ModuleType, device: Device, need: int, movable: Callable[[int, int], bool]
 ) -> dict[int, UntypedStorage]:
     """Storages torch's allocator holds on `device` for this process (resizable: neither a
-    plane's nor a host block's), by `_cdata`. Every object is looked at when those ops
-    touched cannot give `need`: any of them while they can be mapped, else only those no op
-    touched this stage."""
+    plane's nor a host block's), by `_cdata`. Every object is looked at when the `movable`
+    ones ops touched cannot give `need`."""
     found: dict[int, UntypedStorage] = {}
 
     def add(storages: Iterable[UntypedStorage | None]) -> int:
@@ -343,8 +347,7 @@ def _found(
             if key in found or key in OFF or key in NATIVE or storage.nbytes() < SMALLEST:
                 continue
             found[key] = storage
-            if key not in read and (mappable or _last(key) < BEGAN[0]):
-                spare += int(storage.nbytes())
+            spare += int(storage.nbytes()) if movable(key, int(storage.nbytes())) else 0
         return spare
 
     if add(_strong(torch, ref) for _, ref in list(USED.values())) < need:
