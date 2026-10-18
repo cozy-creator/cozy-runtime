@@ -2541,6 +2541,7 @@ class Executor:
                 host.memory = Memory.open([device.index or 0] if device.type == "cuda" else [])
             except VarenaUnsupported as exc:  # no varena on this OS (Windows)
                 return {"ok": False, "code": "weight_plane_unavailable", "detail": str(exc)}
+            host.memory.context = max(host.device_context, 0)
         backend = Backend(
             checkpoints,
             rows,
