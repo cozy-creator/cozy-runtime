@@ -460,7 +460,7 @@ class Backend:
         return SealedPlan(
             manifest=checkpoint.manifest_id,
             name=f"{self.construction}/{name}",
-            layout=canonical.digest({"manifest": checkpoint.manifest_id, "regions": ids}),
+            layout=canonical.digest({"manifest": checkpoint.manifest_id, "regions": regions}),
             window=READ_WINDOW,
             traversal=tuple((name, key) for key in header),
             components=(name,),
