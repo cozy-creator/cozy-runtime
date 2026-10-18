@@ -443,10 +443,12 @@ class Weights:
         self.room: Callable[[int], None] | None = None
         #: device bytes live owners keep for speed and shed under pressure (`reserve`)
         self.reservations: dict[Reservation, None] = {}
-        #: regions an attempt's end maps back (`map_back`), and the thread mapping them
+        #: regions an attempt's end maps back (`map_back`); whether one is in flight; the one
+        #: thread of this process that maps them, started on first use
         self.back: deque[tuple[Component, int]] = deque()
-        self.backing: threading.Thread | None = None
-        self._back_lock = threading.Lock()
+        self.mapping_back = False
+        self.backed = threading.Condition()
+        self._mapper: threading.Thread | None = None
         #: the CUDA context and library workspaces outside torch and the plane, measured once
         self.context_bytes = -1
         #: the machine's custody of GPU weights (`weights.attach/1`); None: every region private
@@ -1490,43 +1492,57 @@ class Weights:
             self.plane.set_vram_budget(self.index, self.applied)
 
     def map_back(self, regions: Iterable[tuple[Component, int]]) -> None:
-        """Map `regions` back into room nothing else holds, one at a time on a thread of its
-        own (a unified pool's in place): nothing is evicted for them, and anything that asks
-        for memory stops them at the one in flight (`give_up`; owner, 2026-10-18)."""
-        with self._back_lock:
+        """Map `regions` back into room nothing else holds, one at a time on this process's
+        one mapping thread (a unified pool's in place): nothing is evicted for them, and
+        anything that asks for memory stops them at the one in flight (`give_up`; owner,
+        2026-10-18). Concurrency, not threads: the thread lives as long as the process."""
+        with self.backed:
             self.back.extend(regions)
-            if self.backing is not None or not self.back:
-                return
             if self.pool is None:
-                self.backing = threading.Thread(target=self._mapping_back, daemon=True)
-                self.backing.start()
+                if self._mapper is None:
+                    self._mapper = threading.Thread(
+                        target=self._mapping_back, name="cozy-map-back", daemon=True
+                    )
+                    self._mapper.start()
+                self.backed.notify_all()
                 return
-        self._mapping_back()
+        while self._map_one():
+            pass
 
     def _mapping_back(self) -> None:
         while True:
-            with self._back_lock:
-                if not self.back:
-                    self.backing = None
-                    return
-                component, index = self.back.popleft()
-            try:  # the lowest priority: it takes only room nothing else holds
-                ticket = self.plane.want(component.ws, self.index, [index], priority=0)
-                if component.hot:  # back in its repeating stage's kept set
-                    self.plane.prioritise(component.ws, self.index, [index], plane.HOT)
-                ticket.wait()
-            except Exception:  # no room left, or its set closed: the rest stays unmapped
-                with self._back_lock:
-                    self.back.clear()
+            with self.backed:
+                self.backed.wait_for(lambda: bool(self.back))
+            self._map_one()
+
+    def _map_one(self) -> bool:
+        """The next region mapped back; False when none is left."""
+        with self.backed:
+            if not self.back:
+                return False
+            component, index = self.back.popleft()
+            self.mapping_back = True
+        try:  # the lowest priority: it takes only room nothing else holds
+            ticket = self.plane.want(component.ws, self.index, [index], priority=0)
+            if component.hot:  # back in its repeating stage's kept set
+                self.plane.prioritise(component.ws, self.index, [index], plane.HOT)
+            ticket.wait()
+        except Exception:  # no room left, or its set closed: the rest stays unmapped
+            with self.backed:
+                self.back.clear()
+        finally:
+            with self.backed:
+                self.mapping_back = False
+                self.backed.notify_all()
+        return True
 
     def give_up(self) -> None:
         """Anything that asks for memory stops the mapping back first, at the region in
         flight: a region still queued in the plane could not be unmapped."""
-        with self._back_lock:
+        with self.backed:
             self.back.clear()
-            backing = self.backing
-        if backing is not None and backing is not threading.current_thread():
-            backing.join()
+            if self._mapper is not threading.current_thread():
+                self.backed.wait_for(lambda: not self.mapping_back)
 
     def close(self, component: Component) -> None:
         self.give_up()

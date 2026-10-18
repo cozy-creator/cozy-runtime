@@ -15,6 +15,7 @@ import gc
 import io
 import mmap
 import os
+import threading
 from collections.abc import Collection, Iterator
 from contextlib import contextmanager, suppress
 from pathlib import Path
@@ -279,6 +280,24 @@ def test_a_cpu_executor_computes_on_a_tier_no_budget_cuts(tmp_path: Path) -> Non
     reference.load_state_dict(values)
     with torch.inference_mode():
         assert same(run(model, x, passes=1), [reference(x)])
+
+
+def test_one_thread_maps_weights_back_for_the_process_and_any_ask_stops_it(
+    tmp_path: Path,
+) -> None:
+    """Owner: concurrency, not threads. Every attempt's end hands its regions to the one
+    mapping thread of the process, and an ask for memory stops it at the region in flight
+    (here none can map: a CPU plane has no device, so each attempt gives the rest up)."""
+    weights = Weights(torch, torch.device("cpu"), "cpu")
+    weights.set_budget(-1, pinned=1 << 30)
+    component = load(weights, write_checkpoint(tmp_path)[0], "back").backend.components["stack"]
+    regions = [(component, region.index) for region in component.regions]
+    threads = threading.active_count()
+    for _ in range(3):
+        weights.map_back(regions)
+        weights.give_up()
+        assert not weights.back and not weights.mapping_back
+    assert threading.active_count() == threads + 1, "one thread, however many attempts"
 
 
 def test_a_stored_tensor_the_code_does_not_build_is_skipped_and_never_read(
@@ -2372,8 +2391,8 @@ def test_a_hot_set_mapped_back_after_an_attempt_gives_way_to_any_ask(tmp_path: P
     decoded = weights.resident_bytes(decoder)
     weights.set_budget(-1)  # the room the device has now
     dit.residency.restore()
-    if (backing := weights.backing) is not None:
-        backing.join()  # nothing asked: it all maps back
+    with weights.backed:  # nothing asks: it all maps back
+        weights.backed.wait_for(lambda: not weights.back and not weights.mapping_back)
     weights.drain()
     back = weights.resident_bytes(denoiser)
     assert back == held and weights.resident_bytes(decoder) == decoded
@@ -2385,7 +2404,7 @@ def test_a_hot_set_mapped_back_after_an_attempt_gives_way_to_any_ask(tmp_path: P
     # where no trim reaches them: the mapping stops at the one in flight, and nothing stays.
     dit.residency.restore()
     weights.set_budget(0)
-    assert weights.backing is None and not weights.back
+    assert not weights.back and not weights.mapping_back
     assert plane.stats(weights.plane).device(0).committed == 0
 
 
