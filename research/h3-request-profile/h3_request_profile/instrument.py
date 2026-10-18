@@ -190,7 +190,7 @@ def retain_trace_file(
 def retained_handler(name: str) -> Callable[..., Any]:
     """Use the registered implementation, even when managed jobs replace public exports."""
     registration = import_module("h3").app.get(name)
-    if registration.kind != "entrypoint" or registration.internal or registration.hidden:
+    if registration.internal or registration.hidden:
         raise ValueError("Profiling requires a public retained H3 serving handler")
     return cast(Callable[..., Any], registration.fn)
 
