@@ -212,6 +212,7 @@ class Memory:
         rung by rung, each action again while it gives bytes back, until they are."""
         weights = self.weights
         self.freed = 0
+        weights.give_up()  # what an attempt's end maps back gives way first
         if weights.host_only or nbytes + max(weights.context_bytes, 0) > weights.total:
             return False  # no rung makes a GPU larger: nothing moves for it
         want, start = max(nbytes, 0) + MARGIN, self.free()

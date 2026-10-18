@@ -2365,25 +2365,28 @@ def test_a_hot_set_mapped_back_after_an_attempt_gives_way_to_any_ask(tmp_path: P
             model.residency.release(method, ("stack",))
 
     staged(dit, "denoise", 3)
+    held = weights.resident_bytes(denoiser)
     staged(vae, "decode", 3)  # repeats too: it takes what it needs of the DiT's set
     weights.drain()
-    taken = weights.resident_bytes(denoiser)
-    assert denoiser.hot and taken < whole
-    gone = [r.index for r in denoiser.regions if r.index in denoiser.resident and r.bound is None]
+    assert denoiser.hot and weights.resident_bytes(denoiser) < held
+    decoded = weights.resident_bytes(decoder)
     weights.set_budget(-1)  # the room the device has now
-    mapped = plane.stats(weights.plane).device(0).committed
     dit.residency.restore()
-    assert plane.stats(weights.plane).device(0).committed > mapped, "mapped back in the room"
-    weights.plane.want(denoiser.ws, 0, gone, priority=plane.HOT).wait()  # its fills land
+    if (backing := weights.backing) is not None:
+        backing.join()  # nothing asked: it all maps back
     weights.drain()
     back = weights.resident_bytes(denoiser)
-    assert back > taken and weights.resident_bytes(decoder) == decoder.layout.total
+    assert back == held and weights.resident_bytes(decoder) == decoded
     assert weights.memory.free_for(weights.memory.free() + (16 << 20), "an op")
     weights.drain()
     assert weights.resident_bytes(denoiser) < back, "an op out of memory takes it first"
-    assert weights.resident_bytes(decoder) == decoder.layout.total
-    weights.set_budget(0)  # the machine's ask for room
-    assert weights.resident_bytes(denoiser) == 0
+    assert weights.resident_bytes(decoder) == decoded
+    # Mapping back again, the machine's ask comes while regions are still queued in the plane,
+    # where no trim reaches them: the mapping stops at the one in flight, and nothing stays.
+    dit.residency.restore()
+    weights.set_budget(0)
+    assert weights.backing is None and not weights.back
+    assert plane.stats(weights.plane).device(0).committed == 0
 
 
 @on_gpu
