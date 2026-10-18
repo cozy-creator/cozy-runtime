@@ -5,6 +5,7 @@ images, drafted and not, and each row keeps the greedy tokens Transformers gives
 from __future__ import annotations
 
 import threading
+import time
 from typing import Any
 
 import pytest
@@ -13,6 +14,8 @@ torch = pytest.importorskip("torch")
 transformers = pytest.importorskip("transformers")
 
 from cozy_runtime import lm  # noqa: E402
+from cozy_runtime.author._context import CURRENT, Context  # noqa: E402
+from cozy_runtime.author._errors import Cancelled  # noqa: E402
 from test_lm_mtp import DEVICE, STOP, _head, _qwen3, _qwen3_5, _reference  # noqa: E402
 
 
@@ -132,3 +135,34 @@ def test_more_calls_than_the_largest_bucket_wait_for_a_slot() -> None:
     wants = [_reference(model, c["ids"], c["new"], 0.0) for c in calls]
     for got, want in zip(_together(model, calls), wants, strict=True):
         assert torch.equal(got, want)
+
+
+def test_a_cancelled_call_stops_decoding_and_raises_its_cancellation() -> None:
+    """A long generate (run 11093 sat in one for two hours) answers its attempt's cancellation
+    at the next step, and the engine then serves the next call."""
+    torch.manual_seed(4)
+    model = _qwen3()
+    ids = torch.randint(10, 44, (1, 20), device=DEVICE)
+    inputs = {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
+    cancel = threading.Event()
+    outcome: list[BaseException | None] = []
+
+    def run() -> None:
+        CURRENT.set(Context("r1", time.monotonic() + 600, _cancel=cancel.is_set))
+        try:  # a stop it never makes: only cancellation ends it early
+            lm.generate(model, inputs, max_new_tokens=20_000, stop=[10_000], pad=0)
+            outcome.append(None)
+        except BaseException as exc:
+            outcome.append(exc)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    time.sleep(1.0)
+    started = time.monotonic()
+    cancel.set()
+    thread.join(timeout=60)
+    assert not thread.is_alive() and isinstance(outcome[0], Cancelled)
+    assert time.monotonic() - started < 30
+    want = _reference(model, ids, 12, 0.0)
+    got = lm.generate(model, inputs, max_new_tokens=12, stop=STOP, pad=0)
+    assert torch.equal(got, want)
