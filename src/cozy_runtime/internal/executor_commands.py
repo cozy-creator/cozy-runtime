@@ -25,6 +25,17 @@ class Command(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True, tag
     """One worker command; `cmd` names it."""
 
 
+class TensorFSOptions(msgspec.Struct, frozen=True, kw_only=True):
+    """Ordinary endpoint settings and an already supplied bearer credential."""
+
+    endpoint: str
+    token: str | None = None
+    ca_der: str | None = None
+
+    def __repr__(self) -> str:
+        return f"TensorFSOptions(endpoint={self.endpoint!r}, token=<redacted>)"
+
+
 class Hello(Command, frozen=True, kw_only=True, tag="hello"):
     pass
 
@@ -281,6 +292,7 @@ class Load(Command, frozen=True, kw_only=True, tag="load"):
     through TensorFS. The command names one model (`binding`) or several (`models`)."""
 
     construction: str
+    tensorfs: TensorFSOptions | None = None
     devices: str = ""
     authorized_device_limit_bytes: int | UnsetType = UNSET
     sequence_parallel_degree: int = 1
@@ -361,6 +373,7 @@ class PrepareRequest(_Attempt, frozen=True, kw_only=True, tag="prepare_request")
 
 class Invoke(_Attempt, frozen=True, kw_only=True, tag="invoke"):
     entrypoint: str
+    tensorfs: TensorFSOptions | None = None
     spool: str
     deadline_s: float | None
     inputs: dict[str, InputFile] = {}
@@ -392,6 +405,9 @@ class Invoke(_Attempt, frozen=True, kw_only=True, tag="invoke"):
     sources: dict[str, _MANIFEST] = {}
     #: The weights outputs this attempt may write, and each one's granted new bytes.
     weights: dict[str, int] = {}
+    destination: str = ""
+    actor: str = ""
+    operation: str = ""
 
 
 type KnownCommand = (
