@@ -16,7 +16,7 @@ import time
 import weakref
 import zlib
 from collections import Counter
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
@@ -697,6 +697,10 @@ class Residency:
     def open_attempt(self) -> None:
         self.attempts += 1
         self.notes.clear()
+
+    def plan(self, request_id: str, steps: Sequence[str | Collection[str]]) -> None:
+        """The attempt's declared steps (`Context.plan`): varena evicts and restores by them."""
+        self.memory.plan(request_id, list(steps))
 
     def serve_lora(self, strategy: lora_bake.Strategy) -> None:
         """A request's LoRA serving (`lora_mode`): baked, or per step."""
