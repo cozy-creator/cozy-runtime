@@ -210,7 +210,8 @@ def test_a_transformers_model_binds_its_stored_names_through_its_conversion_mapp
     for component, model in built.items():
         model.config.architectures = [type(model).__name__]  # as `save_pretrained` writes it
         held = writer.component(
-            component, cls=f"transformers.{type(model).__name__}", config=model.config.to_dict()
+            component, cls=f"transformers.{type(model).__name__}",
+            config=json.loads(model.config.to_json_string(use_diff=False)),
         )
         for key, value in model.state_dict().items():  # upstream on-disk names
             stored = (
