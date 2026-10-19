@@ -41,7 +41,7 @@ Use distinct keys for distinct requests; observe an uncertain accepted request r
 
 ## Analysis and qualification
 
-`trace_summary.py` streams ChromeTrace JSON or gzip and unions device intervals across streams. The report's `research/h3-single5090/attribute_trace.py` uses this parser to correlate GPU activities with their launching CPU ranges. `phase_receipt.py` joins ordinary run-show data with either a traced or explicitly unprofiled summary. Missing trace steps in a profiled record remain an error.
+`trace_summary.py` streams ChromeTrace JSON or gzip and unions device intervals across streams. `phase_receipt.py` joins ordinary run-show data with either a traced or explicitly unprofiled summary. Missing trace steps in a profiled record remain an error.
 
 ```sh
 python research/h3-request-profile/trace_summary.py trace.json.gz --out=trace-summary.json

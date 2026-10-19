@@ -225,6 +225,4 @@ CUDA_VISIBLE_DEVICES='' PYTHONPATH="$runtime_worktree/src" \
 
 The input directory contains `cpu-real-factors.json` plus `spatial-A.bin`,
 `spatial-B.bin`, `wushu-A.bin`, `wushu-B.bin`. Every factor is hash checked before
-execution. Workstation evidence lives at
-`/home/fidika/cozy_v2/outputs/h3-lora-upstream-20260914/`; the original inputs at
-`/home/fidika/cozy_v2/outputs/h3-general-lora-20260914/prepared-merge/`.
+execution.
