@@ -5,7 +5,7 @@ cozy-runtime wheels promise. `<modules>/cozy_runtime/_kernels` holds exactly the
 PTX (cuobjdump). Each needs only the OS's C runtime (readelf, dumpbin): no torch, no CUDA library,
 no version-specific libpython (Windows' stable-ABI `python3.dll` is the one Python it may name).
 Each loads on every Python given, and a call on a machine without a GPU returns CUDA's error
-rather than crashing. The driver floor equals cozy-platform's (`--platform-floor`, the Rust source
+rather than crashing. The driver floor equals the `platform` crate's (`--platform-floor`, the Rust source
 TensorD checks at startup). Each exports `PyInit_*` alone (nm, dumpbin): an exported libstdc++
 symbol binds process-wide and crashed torch imported after it. With `--torch-python`, each module
 loads before torch in a fresh interpreter. Any failure is named, and the run exits 1.
@@ -26,7 +26,7 @@ SYSTEM = re.compile(
     r"(libc|libm|libdl|libpthread|librt|ld-linux[\w.-]*)\.so(\.\d+)*"
     r"|(?i:(kernel32|python3|ucrtbase|vcruntime140(_1)?|api-ms-win-[\w-]+)\.dll)"
 )
-#: cozy-platform's `gpu::DRIVER_FLOOR`: Windows', then everything else's.
+#: The `platform` crate's `gpu::DRIVER_FLOOR`: Windows', then everything else's.
 RUST_FLOOR = re.compile(
     r'DRIVER_FLOOR: &str = if cfg!\(windows\) \{ "([\d.]+)" \} else \{ "([\d.]+)" \}'
 )
@@ -121,7 +121,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("modules", type=Path, help="the install prefix: <it>/cozy_runtime/_kernels")
     parser.add_argument("--python", action="append", default=[], help="an interpreter to import on")
-    parser.add_argument("--platform-floor", type=Path, help="cozy-platform's src/gpu/mod.rs")
+    parser.add_argument("--platform-floor", type=Path, help="cozy's crates/platform/src/gpu/mod.rs")
     parser.add_argument("--torch-python", help="an interpreter with torch: each module before it")
     parser.add_argument(
         "--without",
@@ -140,7 +140,7 @@ def main() -> int:
         found = RUST_FLOOR.search(options.platform_floor.read_text())
         rust = {"win32": found[1], "linux": found[2]} if found else {}
         if declared("DRIVER_FLOOR") != rust:
-            failed.append(f"DRIVER_FLOOR differs from cozy-platform's {rust or '(none)'}")
+            failed.append(f"DRIVER_FLOOR differs from the platform crate's {rust or '(none)'}")
     for name, want in archs.items():
         modules = [p for p in package.glob(f"{name}.*") if p.suffix in (".so", ".pyd")]
         if name in options.without:
