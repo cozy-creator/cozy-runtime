@@ -204,7 +204,6 @@ from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.fill import (
     Checkpoint,
     FillRefusal,
-    chunk_refs,
     dtype_name,
     normalized,
     store_refusals,
@@ -400,7 +399,6 @@ def _held(
         waits.stage(f"waiting for {waiter} compile", (time.perf_counter() - started) * 1000)
 
 
-@dataclasses.dataclass(slots=True)
 def _replay_code(command: Invoke, request: str) -> str:
     """The code and request a weights output derives from: the attempt's operation and resolved
     request (`request`, its digest), with its file inputs and precision; without an operation,
@@ -410,6 +408,12 @@ def _replay_code(command: Invoke, request: str) -> str:
     files = sorted([name, row.digest, row.length] for name, row in command.inputs.items())
     asked = {"request": request, "files": files, "bits": command.bits}
     return f"{command.operation}\0{hashlib.sha256(canonical.write(asked)).hexdigest()}"
+
+
+def _open_checkpoint(store: weights_store.Store, ref: str) -> weights_store.Checkpoint:
+    """The checkpoint a header ref names in the machine's store; one it lacks refuses."""
+    with store_refusals(f"opening {ref[:23]}"):
+        return store.checkpoint(ref)
 
 
 def _show_checkpoint(
@@ -425,6 +429,7 @@ def _show_checkpoint(
         )
 
 
+@dataclasses.dataclass(slots=True)
 class _Slot:
     first: bool
     leaving: bool = False
@@ -798,7 +803,9 @@ class Executor:
         #: plane (`self.weights`), whose priorities are the LRU across them.
         self.constructions: dict[str, Executor] = {}
         self.weights: Weights | None = None
-        #: HOST ONLY: the checkpoints its constructions read, open from the store by header ref
+        #: HOST ONLY: the machine's TensorFS store (`_store`) and the checkpoints its
+        #: constructions read from it, by header ref
+        self.store: weights_store.Store | None = None
         self.opened: dict[str, Checkpoint] = {}
         #: HOST ONLY: the constructed slots built on first use (`on_demand=`), by the same path
         self.on_demand: frozenset[str] = frozenset()
@@ -2465,7 +2472,7 @@ class Executor:
         host = self.host
         # One Checkpoint per header ref, open from the store: SDXL's four components share one.
         refs = {name: vmap.get(name, reference.snapshot) for name in names}
-        checkpoints = {name: host._checkpoint(ref, command.hub) for name, ref in refs.items()}
+        checkpoints = {name: host._checkpoint(ref) for name, ref in refs.items()}
         # `names` is what the DERIVE constructed (model-code-fit D9), not what the header
         # carries: a constructed component the checkpoint lacks is the fit's own
         # `component_missing`, judged at construction with the §3 text, so the plan is
@@ -2505,7 +2512,7 @@ class Executor:
         model_cls = next(
             cls for cls in self._model_classes() if cls.__name__ == binding.model_class
         )
-        config_checkpoint = host._checkpoint(reference.snapshot, command.hub)
+        config_checkpoint = host._checkpoint(reference.snapshot)
         config_bytes = model_config.construction_config(config_checkpoint.configs())
         config_document = canonical.parse_canonical(config_bytes)
         if not isinstance(config_document, dict):
@@ -3491,13 +3498,13 @@ class Executor:
             name: RawWeights(ref) for name, ref in command.sources.items()
         }
         exchange = self._exchange(command.request_id)
+        store = self._store()
         outputs = weights_store.Outputs(
+            store,
             request_id=command.request_id,
             actor=command.actor,
             code=_replay_code(command, prepared.overlay.digest),
             bounds=command.weights,
-            destination=command.destination,
-            hub=command.hub,
             show=functools.partial(_show_checkpoint, exchange),
         )
         stage_memo.ENGINE.open(exchange, spool)
@@ -3548,9 +3555,7 @@ class Executor:
                             sources=sources,
                             weights_values=functools.partial(read_values_into, self.torch),
                             tensorfs_source=(
-                                functools.partial(weights_store.open_checkpoint, hub=command.hub)
-                                if sources
-                                else None
+                                functools.partial(_open_checkpoint, store) if sources else None
                             ),
                             tensorfs_output=outputs.open if command.weights else None,
                             tensorfs_adopt=outputs.adopt if command.weights else None,
@@ -4343,16 +4348,24 @@ class Executor:
                 except (ValueError, OSError):
                     resource.setrlimit(resource.RLIMIT_NOFILE, (min(hard, _OPEN_MAX), hard))
         ck = self.opened[plan.manifest].ck
-        index = {sha: i for i, (sha, _) in enumerate(chunk_refs(ck))}
-        return [(sha, length, ck.open_chunk(index[sha])) for sha, length in objects]
+        path = dict(zip((sha for sha, _ in ck.chunks), ck.chunk_paths, strict=True))
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)  # untranslated on Windows
+        return [(sha, length, os.open(path[sha], flags)) for sha, length in objects]
 
-    def _checkpoint(self, ref: str, hub: weights_store.Hub | None) -> Checkpoint:
-        """The checkpoint `ref` names, open from the store for as long as this process lives:
-        its bytes are kept from eviction while its constructions serve them."""
+    def _store(self) -> weights_store.Store:
+        """The machine's TensorFS store (`TENSORFS_HOME`), which TensorD shares."""
+        host = self.host
+        if host.store is None:
+            root = seal_snapshot().get(child_env.TENSORFS_HOME) or weights_store.DEFAULT_HOME
+            with store_refusals(f"opening the store at {root}"):
+                host.store = weights_store.Store(root)
+        return host.store
+
+    def _checkpoint(self, ref: str) -> Checkpoint:
+        """The checkpoint `ref` names in the store, opened once per process."""
         opened = self.opened.get(ref)
         if opened is None:
-            with store_refusals(f"opening {ref[:23]}"):
-                opened = Checkpoint(weights_store.open_checkpoint(ref, hub))
+            opened = Checkpoint(_open_checkpoint(self._store(), ref))
             self.opened[ref] = opened
         return opened
 

@@ -267,9 +267,7 @@ def _bind_tensorfs(
             raise CapabilityError(
                 "source is not an admitted Weights input", code="weights_source_ungranted"
             )
-        opened = source_reader(weights.checkpoint_ref)
-        handles.callback(opened.close)
-        return opened
+        return source_reader(weights.checkpoint_ref)
 
     def output(slot: str, derivation: Derivation) -> Output:
         current()

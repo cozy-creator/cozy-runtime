@@ -9,7 +9,6 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-import tensorfs
 
 from cozy_runtime import weights_store
 from cozy_runtime.author._executor_requests import Answer, CheckpointItem, Request, refuse
@@ -58,8 +57,8 @@ def compute(payload: Request, ctx: Context, source: Weights[Any]) -> Result:
 def test_a_granted_output_is_written_into_the_store_shown_and_replayed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, granted: bool
 ) -> None:
-    home(tmp_path / "tensorfs", monkeypatch)
-    source = checkpoint({"unet": {"w": np.ones(2, np.float32)}}, configs={"unet": {"in": 2}})
+    store = home(tmp_path / "tensorfs", monkeypatch)
+    source = checkpoint(store, {"unet": {"w": np.ones(2, np.float32)}}, configs={"unet": {"in": 2}})
     project = tmp_path / "project"
     project.mkdir()
     (project / "package.toml").write_text('[application]\nobject="storage_grant_fn:app"\n')
@@ -102,7 +101,7 @@ def test_a_granted_output_is_written_into_the_store_shown_and_replayed(
     assert results[3]["checkpoint"] == results[4]["checkpoint"] == results[1]["checkpoint"]
     assert results[3]["transaction"] == results[4]["transaction"] != results[1]["transaction"]
     assert [(item.output, item.repo_id) for item in shown] == [("model", weights_store.DERIVED)] * 4
-    out = tensorfs.open(weights_store.DERIVED, revision=shown[0].revision, local_files_only=True)
+    out = store.checkpoint(shown[0].revision)
     assert out.id == results[1]["checkpoint"]
     unet = out.components["unet"]
     assert set(unet.tensors) == {"w", "extra"} and unet.config == {"in": 2}

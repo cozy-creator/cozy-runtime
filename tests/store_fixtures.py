@@ -15,17 +15,20 @@ import tensorfs
 from cozy_runtime import weights_store
 from cozy_runtime.author import Context
 
-DTYPES = {"float16": "F16", "float32": "F32", "uint8": "U8", "int64": "I64"}
+DTYPES = {"float16": "F16", "float32": "F32", "uint8": "U8", "uint16": "BF16", "int64": "I64"}
+
+#: One shown checkpoint item: output, repo, revision, variant.
+type Shown = list[tuple[str, str, str, str]]
 
 
-def home(path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """`path` is the store of this process and of every process it starts."""
+def home(path: Path, monkeypatch: pytest.MonkeyPatch) -> tensorfs.Store:
+    """The store at `path`, which an executor this test drives opens as its machine's."""
     monkeypatch.setenv("TENSORFS_HOME", str(path))
-    tensorfs.configure(cache_dir=path)
-    return path
+    return tensorfs.Store(path)
 
 
 def checkpoint(
+    store: tensorfs.Store,
     components: Mapping[str, Mapping[str, Any]],
     *,
     classes: Mapping[str, str] = {},
@@ -34,54 +37,53 @@ def checkpoint(
     assets: Mapping[str, Mapping[str, bytes]] = {},
     pipeline: tuple[str, Mapping[str, object]] | None = None,
 ) -> str:
-    """`components`' numpy arrays as one checkpoint in the store (each component's in insertion
-    order), with their classes, configs and assets: its header ref."""
-    writer = tensorfs.Writer()
+    """`components`' numpy arrays (a uint16 one is bf16) as one checkpoint in `store`, each
+    component's in insertion order, with their classes, configs and assets: its header ref."""
+    writer = store.writer()
     if pipeline is not None:
         writer.pipeline(*pipeline)
     for name in dict.fromkeys([*components, *assets]):
         component = writer.component(
-            name,
-            cls=classes.get(name, ""),
-            config=dict(configs.get(name, {})),
-            config_file=config_files.get(name, "config.json"),
+            name, classes.get(name, ""), dict(configs.get(name, {})), config_files.get(name)
         )
         for key, value in components.get(name, {}).items():
-            component.put(key, value, dtype=DTYPES[str(value.dtype)], shape=list(value.shape))
+            component.put(key, DTYPES[str(value.dtype)], list(value.shape), value)
         for asset, data in assets.get(name, {}).items():
             component.asset(asset, data)
-    return writer.commit().id
+    ref = writer.commit().id
+    assert ref is not None
+    return ref
 
 
 def context(
+    store: tensorfs.Store,
     request_id: str = "test",
     outputs: Mapping[str, int] = {"model": 64 << 20},
     *,
-    shown: list[tuple[str, str, str, str]] | None = None,
-    code: str = "",
+    shown: Shown | None = None,
 ) -> Context:
-    """An attempt's `Context` reading its `Weights` sources from the store and writing
-    `outputs` into it; each checkpoint item it shows is appended to `shown`."""
+    """An attempt's `Context` reading its `Weights` sources from `store` and writing `outputs`
+    into it; each checkpoint item it shows is appended to `shown`."""
     items = shown if shown is not None else []
     bound = weights_store.Outputs(
+        store,
         request_id=request_id,
         actor="tester",
-        code=code or request_id,
+        code=request_id,
         bounds=outputs,
         show=lambda *item: items.append(item),
     )
     return Context(
         request_id,
         math.inf,
-        _tensorfs_source=lambda weights: weights_store.open_checkpoint(
-            weights.checkpoint_ref, None
-        ),
+        _tensorfs_source=lambda weights: store.checkpoint(weights.checkpoint_ref),
         _tensorfs_output=bound.open,
         _tensorfs_adopt=bound.adopt,
     )
 
 
-def adopted(shown: list[tuple[str, str, str, str]], slot: str = "model") -> tensorfs.Checkpoint:
+def adopted(store: tensorfs.Store, shown: Shown, slot: str = "model") -> tensorfs.Checkpoint:
     """The checkpoint the attempt last showed for `slot`."""
     _, repo_id, revision, _ = [item for item in shown if item[0] == slot][-1]
-    return tensorfs.open(repo_id, revision=revision, local_files_only=True)
+    assert repo_id == weights_store.DERIVED
+    return store.checkpoint(revision)

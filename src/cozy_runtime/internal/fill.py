@@ -172,15 +172,11 @@ def row(component: str, name: str, info: tensorfs.Info, bound: str = "") -> Plan
     return PlanRow(key, name, component, dtype, shape, nbytes, encoded)
 
 
-def chunk_refs(ck: tensorfs.Checkpoint) -> list[tuple[str, int]]:
-    """The header's chunks in order, `(sha256 hex, length)` (`Part.chunk` indexes them)."""
-    return [(chunk.sha256, chunk.length) for chunk in ck.chunks]
-
-
 class Checkpoint:
     """One opened checkpoint: its rows (in construction order), configs and assets."""
 
     def __init__(self, ck: tensorfs.Checkpoint) -> None:
+        assert ck.id is not None, "a checkpoint of the store"
         self.ck = ck
         #: the weight set's identity: the header's ref, `sha256:<hex>`
         self.id: str = ck.id
@@ -238,9 +234,9 @@ class Checkpoint:
     def asset_digests(self) -> dict[str, str]:
         """Every component's assets by `<component>/<name>`: their content's sha256."""
         return {
-            f"{component}/{name}": ref.sha256
+            f"{component}/{name}": sha256
             for component, held in self.ck.components.items()
-            for name, ref in held.assets.items()
+            for name, (sha256, _) in held.assets.items()
         }
 
     def assets(self) -> Assets:
@@ -250,7 +246,7 @@ class Checkpoint:
     def table(self, component: str) -> dict[str, list[object]]:
         """A component's stored tensors as plain data: what a memo of its weights is keyed on
         (chunks by digest, so it moves with the bytes)."""
-        chunks = chunk_refs(self.ck)
+        chunks = self.ck.chunks
         out: dict[str, list[object]] = {}
         for key, info in self.tensors(component).items():
             encoding = info.encoding

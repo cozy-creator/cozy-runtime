@@ -7,6 +7,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, get_args, get_origin
 
+from cozy_runtime import weights_store
 from cozy_runtime.author._errors import CapabilityError, ConformanceError
 from cozy_runtime.author._model import Model
 
@@ -103,7 +104,7 @@ class Weights[M: Model[Any]]:
     def read_into(self, component: str, key: str, role: str, offset: int, into: Any) -> None:
         """Stored bytes of one part (`""`: a plain tensor's), at most MAX_WEIGHTS_SOURCE_READ
         per call."""
-        self._view().components[component].tensors.read_into(key, into, role=role, offset=offset)
+        weights_store.read_into(self._view(), component, key, role, offset, into)
 
     def read_values_into(self, component: str, key: str, offset: int, into: Any) -> None:
         """Decode a flat logical element range into a contiguous writable float32 buffer."""

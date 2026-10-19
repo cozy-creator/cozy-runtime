@@ -82,16 +82,18 @@ def package(tmp_path: Path) -> Iterator[Discovered]:
 
 def _source(root: Path, monkeypatch: pytest.MonkeyPatch) -> str:
     """A bf16 `unet` of three tensors, each the same values plus its index."""
-    home(root, monkeypatch)
+    store = home(root, monkeypatch)
     bf16 = {
         key: np.frombuffer(st.from_f32(VALUES + index, "BF16"), np.uint16).reshape(8, 64)
         for index, key in enumerate(("z.weight", "a.weight", "bias"))
     }
-    writer = tensorfs.Writer()
-    unet = writer.component("unet", cls="diffusers.UNet2DConditionModel", config={"in": 64})
+    writer = store.writer()
+    unet = writer.component("unet", "diffusers.UNet2DConditionModel", {"in": 64})
     for key, value in bf16.items():
-        unet.put(key, value, dtype="BF16", shape=[8, 64])
-    return writer.commit().id
+        unet.put(key, "BF16", [8, 64], value)
+    ref = writer.commit().id
+    assert ref is not None
+    return ref
 
 
 def test_a_weights_argument_reads_the_checkpoint_its_attempt_names(
@@ -145,7 +147,7 @@ def test_a_writers_output_lands_only_through_its_grant(
     assert result.checkpoint != source
     (item,) = shown
     assert (item.output, item.repo_id) == ("model", weights_store.DERIVED)
-    lane = tensorfs.open(item.repo_id, revision=item.revision, local_files_only=True)
+    lane = tensorfs.Store(tmp_path / "tensorfs").checkpoint(item.revision)
     assert lane.id == result.checkpoint
     encoded = lane.components["unet"].tensors["a.weight"].encoding
     assert encoded is not None and encoded.scheme == "fp8.rowwise"

@@ -1,12 +1,11 @@
 """The Runtime's weights in the machine's TensorFS store, read and written with TensorFS itself.
 
-A checkpoint opens by its header ref (`sha256:<hex>`) from the shared store (`TENSORFS_HOME`):
-what the store holds reads at once, and with the request's Hub capability the rest is fetched
-on first read. A derived checkpoint is written with TensorFS's `Writer` straight into the store,
-only its new chunks written. Its replay key names the work (who asked, what code and request,
-which output, from what): a finished derivation is the `local/derived` revision of that key, so
-the same work in any process replays it, and an interrupted one resumes its writer. A run with
-a destination then uploads it there under the same capability.
+A checkpoint opens by its header ref (`sha256:<hex>`) from the shared store (the executor's
+`TENSORFS_HOME`). A derived checkpoint is written with TensorFS's `Writer` straight into the
+store, only its new chunks written. Its replay key names the work (who asked, what code and
+request, which output, from what): a finished derivation is the `local/derived` release of
+that key, so the same work in any process replays it, and an interrupted one resumes its
+keyed writer.
 """
 
 from __future__ import annotations
@@ -20,16 +19,18 @@ from collections.abc import Buffer, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import IO
 
-import msgspec
 import tensorfs
 from tensorfs import Checkpoint as Checkpoint
 from tensorfs import Info as Info
+from tensorfs import Store as Store
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author._artifacts import ModelArtifact
-from cozy_runtime.author._errors import CapabilityError, RuntimeFailure
+from cozy_runtime.author._errors import CapabilityError
 
-#: The local repo of finished derivations, one revision per replay key.
+#: The store's location when the machine names none (TensorFS's default, owner D3).
+DEFAULT_HOME = "~/.cache/tensorfs"
+#: The local repo of finished derivations, one release per replay key.
 DERIVED = "local/derived"
 
 #: Bytes to write: a buffer, or a file read from its position to its end.
@@ -38,55 +39,32 @@ type Data = Buffer | IO[bytes]
 type PartData = tuple[str, str, Sequence[int], Data]
 
 
-class Hub(msgspec.Struct, frozen=True, kw_only=True):
-    """A request's Hub and its capability (worker-scoped publishing §2), from the machine's
-    `Load` and `Invoke`; a public-only run has none."""
-
-    endpoint: str
-    #: the minted capability C, a compact JWS naming this run's ops
-    capability: str
-    #: the per-run key K (a P-256 private JWK) C and the token are bound to
-    key: str
-    token_endpoint: str
-
-
-def access(hub: Hub | None) -> dict[str, object]:
-    """How TensorFS reaches the request's Hub: its endpoint and a DPoP token traded for the
-    request's capability on the first Hub call (a warm run makes none). No Hub: only what the
-    store holds."""
-    if hub is None:
-        return {"local_files_only": True}
-    token = tensorfs.DPoP(
-        key=hub.key,
-        token_endpoint=hub.token_endpoint,
-        client_id="tensord",
-        resource=hub.endpoint,
-        assertion_claims={"capability": hub.capability},
-    )
-    return {"endpoint": hub.endpoint, "token": token}
-
-
-def open_checkpoint(ref: str, hub: Hub | None) -> Checkpoint:
-    """The checkpoint `ref` names, fetched on first read under `hub`'s capability."""
-    return tensorfs.open(ref, **access(hub))
-
-
-def upload(ck: Checkpoint, repo_id: str, hub: Hub | None) -> str:
-    """Upload a committed output to `repo_id` under `hub`'s capability: its tree's revision. A
-    failure ends the run `upload_failed`; the local output stays, for `cozy run upload`."""
-    if hub is None:
-        raise RuntimeFailure(f"no Hub capability to upload to {repo_id}", code="upload_failed")
-    try:
-        return tensorfs.upload_folder(repo_id=repo_id, folder_path=ck.path, **access(hub))
-    except tensorfs.Error as exc:
-        raise RuntimeFailure(f"uploading to {repo_id}: {exc}"[:900], code="upload_failed") from exc
-
-
 def read_into(
     ck: Checkpoint, component: str, key: str, role: str, offset: int, into: Buffer
 ) -> None:
-    """Stored bytes of one part (`""`: a plain tensor's), from `offset`."""
-    ck.components[component].tensors.read_into(key, into, role=role, offset=offset)
+    """Stored bytes of one part (`""`: a plain tensor's), read by TensorFS."""
+    try:
+        tensors = ck.components[component].tensors
+        part = tensors[key].parts[role]
+    except KeyError:
+        raise CapabilityError("model tensor part is absent", code="weights_reader_tensor") from None
+    try:
+        view = memoryview(into)
+    except TypeError:
+        raise CapabilityError(
+            "model read needs a writable buffer", code="weights_reader_buffer"
+        ) from None
+    if view.readonly or not view.c_contiguous or not 0 < view.nbytes <= 64 << 20:
+        raise CapabilityError(
+            "model read buffer is readonly, noncontiguous, empty or oversized",
+            code="weights_reader_buffer",
+        )
+    if type(offset) is not int or offset < 0 or offset + view.nbytes > part.length:
+        raise CapabilityError(
+            f"{component}/{key}#{role}: bytes {offset}+{view.nbytes} of {part.length}",
+            code="weights_reader_bounds",
+        )
+    tensors.read_into(key, view, role=role, offset=offset)
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,40 +96,43 @@ def replay_key(actor: str, code: str, slot: str, work: Mapping[str, object]) -> 
     return "sha256:" + hashlib.sha256(f"{actor}\0{code}\0{slot}\0{body}".encode()).hexdigest()
 
 
-def finished(transaction: str) -> Checkpoint | None:
-    """The output a finished derivation of `transaction` committed, if this store has one."""
+def finished(store: Store, transaction: str) -> Checkpoint | None:
+    """The output a finished derivation of `transaction` committed, if `store` has one."""
     try:
-        return tensorfs.open(DERIVED, revision=_revision(transaction), local_files_only=True)
-    except tensorfs.Error as exc:
-        if exc.code != "not_found":
-            raise
+        return store.checkpoint(f"{DERIVED}@{_release(transaction)}")
+    except tensorfs.NotFoundError:
         return None
 
 
-def _revision(transaction: str) -> str:
+def _release(transaction: str) -> str:
     return transaction.removeprefix("sha256:")
 
 
 class Output:
-    """One derived checkpoint, output `slot`, written into the store under its replay key
-    `transaction`. A finished one replays (`done`): every tensor is there and `commit` answers
-    it. An interrupted one resumes: what an earlier attempt wrote `has`. At most
+    """One derived checkpoint, output `slot`, written into `store` under its replay key
+    `transaction`. A finished one replays (`done`): every tensor is there and `commit`
+    answers it. An interrupted one resumes: what an earlier attempt wrote `has`. At most
     `max_new_bytes` are written."""
 
     def __init__(
-        self, slot: str, transaction: str, derivation: Derivation, max_new_bytes: int
+        self,
+        store: Store,
+        slot: str,
+        transaction: str,
+        derivation: Derivation,
+        max_new_bytes: int,
     ) -> None:
-        self.slot, self.transaction = slot, transaction
+        self.store, self.slot, self.transaction = store, slot, transaction
         self.max_new_bytes, self.written = max_new_bytes, 0
         self.order = tuple(derivation.order)
         #: each component a write may name, declared as its base (else first source) declares it
         froms = (*reversed(derivation.sources), *([derivation.base] if derivation.base else []))
         self.declared = {name: c for ck in froms for name, c in ck.components.items()}
-        self.done = finished(transaction)
+        self.done = finished(store, transaction)
         self._writer = (
             None
             if self.done is not None
-            else tensorfs.Writer(base=derivation.base, resume=_revision(transaction))
+            else store.writer(base=derivation.base, key=_release(transaction))
         )
         self._components: dict[str, tensorfs.ComponentWriter] = {}
 
@@ -180,9 +161,7 @@ class Output:
                 f"no checkpoint this output derives from has a component {name!r}",
                 code="weights_output_component",
             )
-        writer = self._writer.component(
-            name, cls=declared.cls, config=declared.config, config_file=declared.config_file
-        )
+        writer = self._writer.component(name, declared.cls, declared.config, declared.config_file)
         self._components[name] = writer
         return writer
 
@@ -204,13 +183,15 @@ class Output:
         if self.done is not None:
             held = self.done.components.get(component)
             return held is not None and key in held.tensors
-        return component in self.declared and self.component(component).has(key)
+        if self._writer is None:
+            raise CapabilityError("the output is closed", code="weights_writer_closed")
+        return self._writer.has(component, key)
 
     def put(self, component: str, key: str, dtype: str, shape: Sequence[int], data: Data) -> None:
         """A plain tensor: exactly its bytes."""
         with _view(data) as view:
             self._spend(view.nbytes)
-            self.component(component).put(key, view, dtype=dtype, shape=list(shape))
+            self.component(component).put(key, dtype, list(shape), view)
 
     def put_encoded(
         self,
@@ -229,10 +210,8 @@ class Output:
                 for role, part_dtype, part_shape, data in parts
             }
             self._spend(sum(view.nbytes for _, _, view in views.values()))
-            self.component(component).put_encoded(
-                key, dtype=dtype, shape=list(shape), scheme=scheme, params=dict(params),
-                parts=views,
-            )  # fmt: skip
+            writer = self.component(component)
+            writer.put_encoded(key, dtype, list(shape), scheme, views, dict(params))
 
     def copy(
         self,
@@ -244,8 +223,7 @@ class Output:
     ) -> None:
         """A tensor of `source`, renamed when asked: its stored parts are referenced, never
         written again."""
-        held = source.components[from_component or component]
-        self.component(component).copy(from_key or key, held, as_key=key)
+        self.component(component).copy(key, source, from_component, from_key)
 
     def commit(self) -> Checkpoint:
         """The finished checkpoint, kept as `local/derived` at its replay key: once committed,
@@ -259,11 +237,8 @@ class Output:
             for component, ordered in keys.items():
                 self.component(component).order(ordered)
             committed = self._writer.commit()
-            revision = _revision(self.transaction)
-            tensorfs.upload_folder(repo_id=DERIVED, folder_path=committed.path, revision=revision)
-            self.done = finished(self.transaction)
+            self.done = self.store.name(DERIVED, _release(self.transaction), committed)
             self.close()
-        assert self.done is not None
         return self.done
 
     def _spend(self, nbytes: int) -> None:
@@ -273,6 +248,37 @@ class Output:
                 f"the output writes over its {self.max_new_bytes} granted new bytes",
                 code="weights_output_bound",
             )
+
+
+class Outputs:
+    """One attempt's weights outputs in `store`. Each opens under its replay key; adopting one
+    commits it and shows it to the run (`show(slot, repo_id, revision, variant)`)."""
+
+    def __init__(
+        self,
+        store: Store,
+        *,
+        request_id: str,
+        actor: str,
+        code: str,
+        bounds: Mapping[str, int],
+        show: Callable[[str, str, str, str], None],
+    ) -> None:
+        self.store, self.request_id, self.actor, self.code = store, request_id, actor, code
+        self.bounds, self.show = dict(bounds), show
+
+    def open(self, slot: str, derivation: Derivation) -> Output:
+        bound = self.bounds.get(slot)
+        if bound is None:
+            raise CapabilityError("output is not declared", code="weights_output_ungranted")
+        key = replay_key(self.actor, self.code, slot, derivation.work(bound))
+        return Output(self.store, slot, key, derivation, bound)
+
+    def adopt(self, output: Output) -> ModelArtifact:
+        ck = output.commit()
+        assert ck.id is not None and ck.tree is not None
+        self.show(output.slot, DERIVED, ck.tree, ck.variant or "")
+        return ModelArtifact(self.request_id, output.slot, ck.id, output.transaction)
 
 
 @contextlib.contextmanager
@@ -299,40 +305,3 @@ def _view(data: Data) -> Iterator[memoryview]:
             yield view
         finally:
             view.release()
-
-
-class Outputs:
-    """One attempt's weights outputs. Each opens under its replay key; adopting one commits it,
-    shows it (`show(slot, repo_id, revision, variant)`) and, when the run names a
-    `destination`, uploads it there and shows that. A failed upload ends the run
-    `upload_failed` with the local checkpoint shown."""
-
-    def __init__(
-        self,
-        *,
-        request_id: str,
-        actor: str,
-        code: str,
-        bounds: Mapping[str, int],
-        show: Callable[[str, str, str, str], None],
-        destination: str = "",
-        hub: Hub | None = None,
-    ) -> None:
-        self.request_id, self.actor, self.code = request_id, actor, code
-        self.bounds, self.show = dict(bounds), show
-        self.destination, self.hub = destination, hub
-
-    def open(self, slot: str, derivation: Derivation) -> Output:
-        bound = self.bounds.get(slot)
-        if bound is None:
-            raise CapabilityError("output is not declared", code="weights_output_ungranted")
-        key = replay_key(self.actor, self.code, slot, derivation.work(bound))
-        return Output(slot, key, derivation, bound)
-
-    def adopt(self, output: Output) -> ModelArtifact:
-        ck = output.commit()
-        self.show(output.slot, DERIVED, ck.revision, ck.variant or "")
-        if self.destination:
-            revision = upload(ck, self.destination, self.hub)
-            self.show(output.slot, self.destination, revision, ck.variant or "")
-        return ModelArtifact(self.request_id, output.slot, ck.id, output.transaction)

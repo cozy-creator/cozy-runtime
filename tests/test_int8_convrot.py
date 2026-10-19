@@ -43,9 +43,10 @@ def test_producer_round_trip_and_scale_floor() -> None:
 def test_include_recipe_encodes_exactly_its_weights(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    home(tmp_path / "tensorfs", monkeypatch)
+    store = home(tmp_path / "tensorfs", monkeypatch)
     shown: list[tuple[str, str, str, str]] = []
     source = checkpoint(
+        store,
         {
             "transformer": {
                 "blocks.0.attn.to_q.weight": weight(8, 256, 1),
@@ -61,10 +62,10 @@ def test_include_recipe_encodes_exactly_its_weights(
         output_precision="preserve",
     )
     quantize_into(
-        context(shown=shown), fake_telemetry(fake_attempt("int8")), source=Weights(source),
+        context(store, shown=shown), fake_telemetry(fake_attempt("int8")), source=Weights(source),
         plan=plan, encoding=ENCODING, output="model",
     )  # fmt: skip
-    out = adopted(shown)
+    out = adopted(store, shown)
     encoded = {
         (component, key)
         for component, held in out.components.items()
@@ -82,7 +83,7 @@ def test_include_recipe_encodes_exactly_its_weights(
     typo = QuantizationPlan(components=("transformer",), include=("transformer.nope.*",))
     with pytest.raises(UnsupportedInput, match="match no weight"):
         quantize_into(
-            context("typo"), fake_telemetry(fake_attempt("typo")), source=Weights(source),
+            context(store, "typo"), fake_telemetry(fake_attempt("typo")), source=Weights(source),
             plan=typo, encoding=ENCODING, output="model",
         )  # fmt: skip
 

@@ -8,7 +8,6 @@ import numpy as np
 import pytest
 import tensorfs
 
-from cozy_runtime import weights_store
 from cozy_runtime.internal import canonical, probe
 from cozy_runtime.internal.encoding import launch_providers
 from cozy_runtime.internal.fill import Checkpoint, dtype_name
@@ -20,13 +19,13 @@ from test_leaf_speedup_record import sm86
 TENSORS = 40_000
 
 
-def _checkpoint(keys: list[str]) -> Checkpoint:
-    writer = tensorfs.Writer()
-    model = writer.component("model", cls="", config={})
+def _checkpoint(store: tensorfs.Store, keys: list[str]) -> Checkpoint:
+    writer = store.writer()
+    model = writer.component("model")
     one = np.array([0x3F80], np.uint16)
     for key in keys:
-        model.put(key, one, dtype="BF16", shape=[1])
-    return Checkpoint(weights_store.open_checkpoint(writer.commit().id, None))
+        model.put(key, "BF16", [1], one)
+    return Checkpoint(writer.commit())
 
 
 def test_a_40000_tensor_plan_resolves_and_digests(
@@ -39,8 +38,8 @@ def test_a_40000_tensor_plan_resolves_and_digests(
         ".gate_up_proj.weight_scale_inv"
         for i in range(TENSORS)
     ]
-    home(tmp_path, monkeypatch)
-    checkpoint = _checkpoint(keys)
+    store = home(tmp_path, monkeypatch)
+    checkpoint = _checkpoint(store, keys)
     table = sm86()
     ref = checkpoint.id
     variant = Variant("sm86", str(tmp_path), ref, {"model": ref}, True)
