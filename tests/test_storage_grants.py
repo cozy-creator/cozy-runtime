@@ -288,3 +288,90 @@ def test_a_raw_read_fills_only_the_requested_tensor_part(
     with pytest.raises(CapabilityError) as readonly:
         weights_store.read_into(ck, "unet", "w", "", 0, bytes(4))
     assert readonly.value.code == "weights_reader_buffer"
+
+
+@pytest.mark.parametrize("previous_release", [None, "1", "2"])
+def test_local_destinations_replace_the_alias_and_preserve_other_revisions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, previous_release: str | None
+) -> None:
+    store = home(tmp_path / "tensorfs", monkeypatch)
+    endpoint = tensorfs.Endpoint("local", cache_dir=store)
+    source = checkpoint(store, {"model": {"w": np.array([9], np.uint8)}})
+    prior = ""
+    with tensorfs.open(source, cache_dir=store, local_files_only=True) as seed:
+        if previous_release is not None:
+            prior = tensorfs.upload_folder(
+                repo_id="local/output", revision=previous_release,
+                folder_path=seed.path, cache_dir=store,
+            )
+        draft = tensorfs.upload_folder(
+            repo_id="local/output", folder_path=seed.path, cache_dir=store,
+        )
+        tensorfs.upload_folder(
+            repo_id="local/unrelated", revision="7", folder_path=seed.path, cache_dir=store,
+        )
+    unrelated = endpoint.repo("local/unrelated")
+    shown: Shown = []
+
+    def adopt(request: str, value: bytes) -> tuple[str, str]:
+        outputs = weights_store.Outputs(
+            store, request_id=request, actor="tester", code=request,
+            bounds={"model": 4}, show=lambda *item: shown.append(item),
+            destination="local/output",
+        )
+        with outputs.open("model", weights_store.Derivation(None)) as output:
+            output.put("model", "w", "U8", [len(value)], value)
+            artifact = outputs.adopt(output)
+        assert shown[-1][1] == "local/output"
+        with tensorfs.open("local/output", cache_dir=store) as named:
+            assert named.id == artifact.checkpoint
+            array = named.components["model"].tensors.read("w")
+            assert isinstance(array, tensorfs.Array) and array.tobytes() == value
+        return artifact.checkpoint, shown[-1][2]
+
+    first, first_tree = adopt("first", b"one")
+    second, second_tree = adopt("second", b"two")
+    assert first != second and first_tree != second_tree
+    with tensorfs.open(first_tree, cache_dir=store, local_files_only=True) as immutable:
+        assert immutable.id == first
+        array = immutable.components["model"].tensors.read("w")
+        assert isinstance(array, tensorfs.Array) and array.tobytes() == b"one"
+    if previous_release == "2":
+        with tensorfs.open("local/output", revision="2", cache_dir=store) as old:
+            assert old.tree == prior and old.id == source
+    result = endpoint.repo("local/output")
+    assert result is not None
+    repo, _etag = result
+    releases = repo["releases"]
+    assert isinstance(releases, list) and releases[-1]["version"] == "1"
+    assert releases[-1].get("revision", 0) == (2 if previous_release == "1" else 1)
+    with tensorfs.open(draft, cache_dir=store, local_files_only=True) as draft_checkpoint:
+        assert draft_checkpoint.tree_ref is not None
+        draft_ref = draft_checkpoint.tree_ref
+    assert repo["checkpoints"] == [{"sha256": draft_ref[0], "length": draft_ref[1]}]
+    assert endpoint.repo("local/unrelated") == unrelated
+
+
+def test_a_remote_destination_still_adds_an_unreleased_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = home(tmp_path / "tensorfs", monkeypatch)
+    origin = (tmp_path / "origin").as_uri()
+    shown: Shown = []
+    outputs = weights_store.Outputs(
+        store, request_id="remote", actor="tester", code="remote", bounds={"model": 4},
+        show=lambda *item: shown.append(item), destination="alice/output",
+        connection=weights_store.Connection(endpoint=origin),
+    )
+    with outputs.open("model", weights_store.Derivation(None)) as output:
+        output.put("model", "w", "U8", [4], b"data")
+        artifact = outputs.adopt(output)
+    assert shown[-1][1] == "alice/output"
+    result = tensorfs.Endpoint(origin).repo("alice/output")
+    assert result is not None
+    repo, _etag = result
+    assert repo["releases"] == []
+    checkpoints = repo["checkpoints"]
+    assert isinstance(checkpoints, list) and len(checkpoints) == 1
+    with tensorfs.open(shown[-1][2], cache_dir=store, local_files_only=True) as uploaded:
+        assert uploaded.id == artifact.checkpoint

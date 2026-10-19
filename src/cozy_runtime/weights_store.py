@@ -18,7 +18,7 @@ import os
 from collections.abc import Buffer, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import IO, TYPE_CHECKING
+from typing import IO, TYPE_CHECKING, cast
 
 import tensorfs
 from tensorfs import Checkpoint as Checkpoint
@@ -64,12 +64,41 @@ def upload(store: Path, ck: Checkpoint, repo_id: str, connection: Connection | N
     """Upload normally; a failed upload leaves the committed local checkpoint available."""
     options = connection or Connection()
     try:
-        return tensorfs.upload_folder(
+        tree = tensorfs.upload_folder(
             repo_id=repo_id, folder_path=ck.path, cache_dir=store,
             endpoint=options.endpoint, token=options.token, ca_der=options.ca_der,
         )  # fmt: skip
+        if repo_id.startswith("local/"):
+            _local_alias(store, repo_id, tree, ck.variant)
+        return tree
     except tensorfs.Error as exc:
         raise RuntimeFailure(f"uploading to {repo_id}: {exc}"[:900], code="upload_failed") from exc
+
+
+def _local_alias(store: Path, repo_id: str, tree: str, variant: str | None) -> None:
+    """Make an explicit local destination reusable by name, preserving its other revisions."""
+    with tensorfs.open(tree, variant=variant, cache_dir=store, local_files_only=True) as ck:
+        assert ck.tree_ref is not None
+        sha256, length = ck.tree_ref
+    target = {"sha256": sha256, "length": length}
+
+    def change(repo: dict[str, object] | None) -> dict[str, object]:
+        doc = repo or {"format": "tensorfs.repo/1", "name": repo_id, "releases": []}
+        releases = cast(list[dict[str, object]], doc["releases"])
+        before = next((row for row in releases if row["version"] == "1"), None)
+        alias: dict[str, object] = {"version": "1", "tree": target}
+        if before is not None:
+            changed = before["tree"] != target or bool(before.get("yanked", False))
+            alias["revision"] = cast(int, before.get("revision", 0)) + int(changed)
+        checkpoints = cast(list[dict[str, object]], doc.get("checkpoints", []))
+        # Unversioned lookup chooses the last non-yanked release, not the largest version.
+        return {
+            **doc,
+            "releases": [row for row in releases if row["version"] != "1"] + [alias],
+            "checkpoints": [row for row in checkpoints if row != target],
+        }
+
+    tensorfs.Endpoint("local", cache_dir=store).update_repo(repo_id, change)
 
 
 def read_into(
