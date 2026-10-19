@@ -95,12 +95,14 @@ from cozy_runtime.author._executor_requests import (
     Answer,
     ChildEvents,
     Deposit,
+    KeepPages,
     Exchange,
     FetchChannel,
     Granted,
     Handoff,
     ModelSource,
     Published,
+    Page,
     ReadGrant,
     Request,
     SourceBytes,
@@ -2541,6 +2543,7 @@ class Executor:
             custody=binding.custody,
             grant=self._read_grant,
             deposit=self._deposit,
+            keeper=self._keep_pages,
         )
         stage("backend_ctor")
         # THE GROUP AGREES ITS PLAN before any rank registers a byte (cr-068), and the smallest
@@ -3512,6 +3515,10 @@ class Executor:
         if torch is not None and last:
             accel.drain(torch, self.device_kind)
         d2h_ms = (time.perf_counter() - d2h_started) * 1000
+        if last and self.group is None:  # pages that landed outlive this process from here on
+            for member in self.model_executors or [self]:
+                if member.backend is not None:
+                    member.backend.keep()
         released_us = execution_evidence.now_us()
         peak_vram = accel.peak_allocated(torch, self.device_kind) if torch is not None else 0
         peak_reserved = accel.peak_reserved(torch, self.device_kind) if torch is not None else 0
@@ -4150,15 +4157,17 @@ class Executor:
 
     def _read_grant(
         self, manifest: str, layout: str, objects: list[tuple[str, int]]
-    ) -> tuple[int | None, list[tuple[str, int, int]]]:
+    ) -> tuple[int | None, list[tuple[str, int, int]], list[tuple[int, int]], str]:
         """One weight set's bytes from the machine (`ReadGrant`): the host layout deposited for
-        `layout`, or the chunk files of `objects` (`(sha256, length)` in sha256 order, as the
-        header names them), each `(sha256, length, fd)`; the fds are the caller's to close."""
+        `layout`, with the GPU pages a gone executor kept of it `(region, fd)` and what they hold,
+        or the chunk files of `objects` (`(sha256, length)` in sha256 order, as the header names
+        them), each `(sha256, length, fd)`; the fds are the caller's to close."""
         answer = self._durable(ReadGrant(manifest=manifest, layout=layout), Granted)
-        # Held: TensorD's one descriptor is the sealed layout an executor deposited, adopted
+        # Held: TensorD's first descriptor is the sealed layout an executor deposited, adopted
         # as it is. No chunk list names it (memory-varena §5.4, D9's refill).
-        if answer.ok and answer.held and len(answer.fds) == 1:
-            return answer.fds[0], []
+        if answer.ok and answer.held and len(answer.fds) == 1 + len(answer.pages):
+            pages = [(p.region, fd) for p, fd in zip(answer.pages, answer.fds[1:], strict=True)]
+            return answer.fds[0], [], pages, answer.fingerprint
         if (
             not answer.ok
             or answer.held
@@ -4172,9 +4181,23 @@ class Executor:
                 f"chunks ({answer.code or 'a different list'})",
                 code="weights_ungranted",
             )
-        return None, [
-            (sha, length, fd) for (sha, length), fd in zip(objects, answer.fds, strict=True)
-        ]
+        files = [(sha, length, fd) for (sha, length), fd in zip(objects, answer.fds, strict=True)]
+        return None, files, [], ""
+
+    def _keep_pages(self, layout: str, fingerprint: str, pages: list[tuple[int, int, int]]) -> None:
+        """GPU pages varena kept here go to the machine, which holds them past this process
+        for the next executor of `layout`. A refusal only costs that executor a refill."""
+        try:
+            request = KeepPages(
+                layout=layout,
+                fingerprint=fingerprint,
+                pages=tuple(Page(region=r, nbytes=n) for r, n, _ in pages),
+                fds=tuple(fd for _, _, fd in pages),
+            )
+            self._durable(request, Answer)
+        finally:
+            for _, _, fd in pages:
+                os.close(fd)
 
     def _deposit(
         self, manifest: str, name: str, layout: str, objects: list[tuple[str, int]], fd: int
@@ -4226,14 +4249,19 @@ class Executor:
         """
         body = encode_request(request)
         sending = request.memfd if isinstance(request, Deposit) else -1
+        kept = list(request.fds) if isinstance(request, KeepPages) else []
         body.pop("memfd", None)
+        body.pop("fds", None)
         if sending >= 0:
             body["descriptor"] = True
+        if kept:
+            body["descriptors"] = len(kept)
         channel, exchange = self.channel, body["kind"]
 
         def send() -> None:
             if sending >= 0:
                 channel.send_memfd(sending)
+            channel.send_fds(kept)
 
         def receive(frame: Frame) -> None:
             handoff = issubclass(into, Handoff)
