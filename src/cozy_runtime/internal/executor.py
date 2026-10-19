@@ -1986,15 +1986,14 @@ class Executor:
             if member.backend is not None
             for model in member.backend.models.values()
         }
-        return sum(m.resident for m in memory.stats().models if m.name in names)
+        return sum(n for name, n in memory.resident().items() if name in names)
 
     def _plane_facts(self, request: RequestStats | None = None) -> dict[str, Any] | None:
         """This process's memory facts; with `request` (`RequestStats`), its steps too."""
         memory, torch = self.host.memory, self.host.torch
         if memory is None or torch is None:
             return None
-        stats = memory.stats()
-        resident = {m.name: m.resident for m in stats.models}
+        resident = memory.resident()
         committed = sum(resident.values())
         allocator = torch.cuda.memory_stats() if self.device_kind == "cuda" else dict[str, int]()
         reserved = accel.reserved(torch, self.device_kind)
@@ -2006,9 +2005,9 @@ class Executor:
             context_bytes=context,
             reserved_bytes=reserved,
             process_bytes=context + reserved + committed,
-            h2d_bytes=sum(m.paged_in + m.streamed for m in stats.models),
-            stall_ns=sum(m.stall_ns for m in stats.models),
-            evictions=stats.evictions,
+            h2d_bytes=request.copied if request is not None else 0,
+            stall_ns=sum(s.stall_ns for s in request.steps) if request is not None else 0,
+            evictions=len(request.evictions) if request is not None else 0,
             lora_baked=baked,
             alloc_retries=int(allocator.get("num_alloc_retries", 0)),
             alloc_ooms=int(allocator.get("num_ooms", 0)),
@@ -2189,7 +2188,7 @@ class Executor:
     def _committed(self) -> int:
         """The weight bytes this process holds on its device; 0 before its memory opens."""
         memory = self.host.memory
-        return sum(m.resident for m in memory.stats().models) if memory else 0
+        return sum(memory.resident().values()) if memory else 0
 
     def _prepare_first(self, command: Load) -> dict[str, Any]:
         """Construct and fill one construction (or one model of a many-model one)."""
