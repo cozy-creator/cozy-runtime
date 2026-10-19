@@ -161,15 +161,16 @@ def test_values_read_from_plain_and_rowwise_sources(store: Path, source: str) ->
 
 
 def test_a_part_reads_across_its_chunks_from_any_offset(store: Path) -> None:
-    big = np.arange(20 << 18, dtype=np.float32)  # 20 MiB: more than one chunk
+    big = np.arange(68 << 20, dtype=np.uint8)  # crosses the 64 MiB chunk grid
     ck = tensorfs.open(
         checkpoint(store, {"unet": {"big": big}}), cache_dir=store, local_files_only=True
     )
     assert len(ck.chunks) > 1
     into = bytearray(4 << 20)
-    offset = (big.nbytes // 2) - 1001
+    part = ck.components["unet"].tensors["big"].parts[""]
+    offset = ck.chunks[part.chunk][1] - part.offset - 1001
     weights_store.read_into(ck, "unet", "big", "", offset, into)
-    assert bytes(into) == big.tobytes()[offset : offset + len(into)]
+    assert bytes(into) == memoryview(big)[offset : offset + len(into)]
     with pytest.raises(CapabilityError) as past:
         weights_store.read_into(ck, "unet", "big", "", big.nbytes - 3, bytearray(4))
     assert past.value.code == "weights_reader_bounds"

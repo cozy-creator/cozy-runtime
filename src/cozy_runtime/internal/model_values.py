@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import math
 from types import ModuleType
 
@@ -29,7 +30,7 @@ def _part(
 
 
 def read_values_into(
-    torch: ModuleType,
+    torch: ModuleType | None,
     source: Checkpoint,
     component: str,
     key: str,
@@ -38,6 +39,13 @@ def read_values_into(
 ) -> None:
     """Elements `offset..` of a plain float or per-row (`fp8.rowwise`, `int8.rowwise`) tensor,
     as f32."""
+    if torch is None:
+        try:
+            torch = importlib.import_module("torch")
+        except ImportError as exc:
+            raise CapabilityError(
+                "logical model decoder is unavailable", code="weights_reader_decoder_unavailable"
+            ) from exc
     held = source.components.get(component)
     tensor = None if held is None else held.tensors.get(key)
     count = into.nbytes // 4
