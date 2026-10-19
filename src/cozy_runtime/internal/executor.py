@@ -149,6 +149,7 @@ from cozy_runtime.internal import (
     prebuilt,
     prepare_diagnostics,
     proctree,
+    request_memory,
     sandbox,
     spawn,
     stage_memo,
@@ -184,7 +185,6 @@ from cozy_runtime.internal.executor_commands import (
 )
 from cozy_runtime.internal.executor_replies import Memory as ReplyMemory
 from cozy_runtime.internal.executor_replies import RankMemory
-from cozy_runtime.internal import request_memory
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.fill import (
     Checkpoint,
@@ -230,7 +230,8 @@ else:
     import resource
 
 if TYPE_CHECKING:
-    from tensorfs.varena.torch import Memory, Request as MemoryRequest, RequestStats
+    from tensorfs.varena.torch import Memory, RequestStats
+    from tensorfs.varena.torch import Request as MemoryRequest
 
 #: The native inline-result door: a small typed result rides
 #: the terminal envelope and skips the file-store round trip. Larger than this REFUSES at
