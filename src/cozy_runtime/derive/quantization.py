@@ -66,7 +66,12 @@ def _rowwise(
 
 _ENCODINGS: dict[str, _Encoding] = {
     "fp8.rowwise": _Encoding(
-        2.0**-3, _rowwise(encode_fp8_rowwise), "F8_E4M3", 32, {"axis": 0}, _row_scale
+        2.0**-3,
+        _rowwise(encode_fp8_rowwise),
+        "F8_E4M3",
+        32,
+        {"axis": 0, "scale_dtype": "F32"},
+        _row_scale,
     ),
     # The bound is a tripwire for a broken encoder, not a quality gate.
     "int8.convrot": _Encoding(
@@ -74,7 +79,7 @@ _ENCODINGS: dict[str, _Encoding] = {
         _rowwise(encode_int8_convrot256),
         "I8",
         CONVROT_GROUP,
-        {"rotation": "hadamard", "rotation_size": CONVROT_GROUP},
+        {"rotation": "hadamard", "rotation_size": CONVROT_GROUP, "scale_dtype": "F32"},
         _row_scale,
     ),
     # A block's error is at most half its largest E2M1 step (2 of 6) times its scale, and a

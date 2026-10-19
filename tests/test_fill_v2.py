@@ -37,7 +37,7 @@ def _store(root: Path) -> tuple[tensorfs.Store, Checkpoint]:
             "weight": ("F8_E4M3", [4, 32], np.full((4, 32), 0x38, np.uint8)),
             "scale": ("F32", [4], np.ones(4, np.float32)),
         },  # fmt: skip
-        {"axis": 0},
+        {"axis": 0, "scale_dtype": "F32"},
     )
     writer.put("vae", "decoder.weight", "F32", [3], np.ones(3, np.float32))
     writer.file("unet/config.json", b'{"in": 4}')
@@ -51,7 +51,10 @@ def test_rows_carry_order_scheme_params_and_parts(tmp_path: Path) -> None:
     rows = ck.rows("unet")
     assert [r.name for r in rows] == list(ck.ck.tensors["unet"])
     encoded = next(r for r in rows if r.name == "proj.weight")
-    assert (encoded.encoded.scheme, dict(encoded.encoded.params)) == ("fp8.rowwise", {"axis": 0})
+    assert (encoded.encoded.scheme, dict(encoded.encoded.params)) == (
+        "fp8.rowwise",
+        {"axis": 0, "scale_dtype": "F32"},
+    )
     assert {p.role: (p.dtype, p.shape) for p in encoded.encoded.parts} == {
         "weight": ("f8_e4m3fn", (4, 32)),
         "scale": ("f32", (4,)),

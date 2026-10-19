@@ -91,9 +91,11 @@ def test_decode_is_the_spec_law_and_the_mined_vectors() -> None:
     from cozy_runtime.internal import probe
     from cozy_runtime.internal.encoding import Int8ConvRotDequant
 
-    provider = Int8ConvRotDequant(params=params_of({"rotation": "hadamard", "rotation_size": 256}))
+    provider = Int8ConvRotDequant(
+        params=params_of({"rotation": "hadamard", "rotation_size": 256, "scale_dtype": "F32"})
+    )
     vectors = probe._spec_vectors(torch, provider, torch.device("cpu"))
-    assert vectors.passed and len(vectors.cases) == 3
+    assert vectors.passed and len(vectors.cases) == 4
     for dtype in (torch.float32, torch.bfloat16, torch.float16):
         assert probe._numerics_int8_convrot(torch, provider, torch.device("cpu"), dtype).passed
 

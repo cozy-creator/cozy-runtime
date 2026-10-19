@@ -11,6 +11,7 @@ from cozy_runtime.tensord_channels import Source
 
 _ELEMENTS = 1 << 22
 _FLOATS = {"F32": "float32", "F16": "float16", "BF16": "bfloat16"}
+_WIDTHS = {"F32": 4, "F16": 2, "BF16": 2}
 #: (scheme, weight dtype) -> its torch element, for the per-row schemes a window reads.
 _ROWWISE = {
     ("fp8.rowwise", "F8_E4M3"): "float8_e4m3fn",
@@ -53,11 +54,18 @@ def read_values_into(
     params = dict(tensor.encoding.params)
     stored = tensor.parts.get("weight")
     element = _ROWWISE.get((tensor.encoding.scheme, stored.dtype if stored else ""))
-    if element is None or params.get("axis") != 0 or len(tensor.shape) != 2:
+    if (
+        element is None
+        or params.get("axis") != 0
+        or params.get("scale_dtype") not in _WIDTHS
+        or len(tensor.shape) != 2
+    ):
         raise CapabilityError(
             f"no model reader for {tensor.encoding.scheme} {params}", code="weights_reader_encoding"
         )
     provider = RowwiseDequant(tensor.encoding.scheme, params=params_of(params))
+    scale_dtype = str(params.get("scale_dtype"))
+    scale_width, scale_element = _WIDTHS[scale_dtype], getattr(torch, _FLOATS[scale_dtype])
     columns = tensor.shape[1]
     consumed = 0
     while consumed < count:
@@ -68,13 +76,13 @@ def read_values_into(
         rows = max(whole_rows, 1)
         width = columns if whole_rows else min(remaining, columns - column, _ELEMENTS)
         payload = _part(source, component, key, "weight", position, rows * width)
-        scale = _part(source, component, key, "scale", row * 4, rows * 4)
+        scale = _part(source, component, key, "scale", row * scale_width, rows * scale_width)
         weight = torch.frombuffer(payload, dtype=torch.uint8).view(getattr(torch, element))
         provider.decode(
             torch,
             {
                 "weight": weight.reshape(rows, width),
-                "scale": torch.frombuffer(scale, dtype=torch.float32).reshape(rows),
+                "scale": torch.frombuffer(scale, dtype=scale_element).reshape(rows),
             },
             target[consumed : consumed + rows * width].reshape(rows, width),
         )

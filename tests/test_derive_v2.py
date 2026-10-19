@@ -45,8 +45,12 @@ def _peer(root: Path, store: tensorfs.Store, source: tensorfs.Manifest) -> Peer:
 @pytest.mark.parametrize(
     ("scheme", "params", "bound"),
     [
-        ("fp8.rowwise", {"axis": 0}, 0.07),
-        ("int8.convrot", {"rotation": "hadamard", "rotation_size": 256}, 0.02),
+        ("fp8.rowwise", {"axis": 0, "scale_dtype": "F32"}, 0.07),
+        (
+            "int8.convrot",
+            {"rotation": "hadamard", "rotation_size": 256, "scale_dtype": "F32"},
+            0.02,
+        ),
         (
             "nvfp4",
             {
@@ -173,3 +177,23 @@ def test_a_put_takes_a_buffer_a_file_or_an_in_memory_stream(tmp_path: Path) -> N
         ("blocks.1.proj.weight", weight),
     ):
         assert np.array_equal(torch.from_dlpack(written.read("unet", key)).numpy(), want), key
+
+
+def test_values_read_a_rowwise_scale_in_its_stored_dtype(tmp_path: Path) -> None:
+    store = tensorfs.Store(tmp_path / "store")
+    payload = torch.linspace(-2, 2, 4 * 32).reshape(4, 32).to(torch.float8_e4m3fn)
+    scale = torch.tensor([0.5, 0.25, 3.0, 0.0078125], dtype=torch.bfloat16)
+    writer = store.writer()
+    writer.put_encoded(
+        "unet", "w", "BF16", [4, 32], "fp8.rowwise",
+        {"weight": ("F8_E4M3", [4, 32], payload.view(torch.uint8).numpy()),
+         "scale": ("BF16", [4], scale.view(torch.uint16).numpy())},
+        {"axis": 0, "scale_dtype": "BF16"},
+    )  # fmt: skip
+    manifest = writer.commit()
+    ref = f"sha256:{manifest.sha256}"
+    reader = Peer(store, tmp_path / "spool", {ref: manifest.length}, {})
+    out = np.zeros(4 * 32, np.float32)
+    read_values_into(torch, reader.client.source(ref), "unet", "w", 0, memoryview(out).cast("B"))
+    want = (payload.float() * scale.float().reshape(4, 1)).reshape(-1).numpy()
+    assert np.array_equal(out, want)

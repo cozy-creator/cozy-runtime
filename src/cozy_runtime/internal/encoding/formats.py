@@ -122,7 +122,7 @@ SCALE_LAYOUTS = ("row_major", "cublas_128x4")
 NIBBLE_ORDERS = ("low_first", "high_first")
 #: nvfp4's second level: `scale_2` multiplies (ModelOpt) or divides (compressed-tensors).
 GLOBAL_SCALES = ("multiply", "divide")
-#: A tensorwise scale's stored dtype: it enters the decode as it is.
+#: A stored scale's dtype (tensorwise, rowwise, convrot): it enters the decode as it is.
 SCALE_DTYPES = ("F32", "BF16", "F16")
 
 
@@ -191,15 +191,16 @@ def part_rule(encoded: Encoded, shape: Sequence[int], dtype: str) -> str:
     rows, cols = matrix(shape)
     params = dict(encoded.params)
     axis, layout = params.get("axis"), params.get("scale_layout")
-    tensorwise = frozenset({_TENSORFS_DTYPES.get(str(params.get("scale_dtype")), "")})
+    #: a stored scale is in the dtype its `scale_dtype` names, and enters the decode exactly
+    stored = frozenset({_TENSORFS_DTYPES.get(str(params.get("scale_dtype")), "")})
     rules: dict[str, tuple[frozenset[str], int | tuple[int, ...]]] = {
         "fp8.rowwise": {
             "weight": (_F8, tuple(shape)),
-            "scale": (frozenset({"f32"}), cols if axis == 1 else rows),
+            "scale": (stored, cols if axis == 1 else rows),
         },
         "int8.rowwise": {
             "weight": (frozenset({"i8"}), tuple(shape)),
-            "scale": (frozenset({"f32"}), cols if axis == 1 else rows),
+            "scale": (stored, cols if axis == 1 else rows),
         },
         "mxfp8": {
             "weight": (_F8, tuple(shape)),
@@ -207,17 +208,17 @@ def part_rule(encoded: Encoded, shape: Sequence[int], dtype: str) -> str:
         },
         "fp8.tensorwise": {
             "weight": (_F8, tuple(shape)),
-            "scale": (tensorwise, 1),
+            "scale": (stored, 1),
             "input_scale": (frozenset({"f32"}), 1),
         },
         "int8.tensorwise": {
             "weight": (frozenset({"i8"}), tuple(shape)),
-            "scale": (tensorwise, 1),
+            "scale": (stored, 1),
             "input_scale": (frozenset({"f32"}), 1),
         },
         "int8.convrot": {
             "weight": (frozenset({"i8"}), tuple(shape)),
-            "scale": (frozenset({"f32"}), rows),
+            "scale": (stored, rows),
         },
         "nvfp4": {
             "weight": (frozenset({"u8"}), (*tuple(shape[:-1]), cols // 2)),
@@ -503,7 +504,7 @@ class RowwiseDequant:
         return frozenset()
 
     def supports(self, shape: Sequence[int], params: Mapping[str, object]) -> str:
-        why = _rows(shape, params) or _params(params, {"axis": (0, 1)})
+        why = _rows(shape, params) or _params(params, {"axis": (0, 1), "scale_dtype": SCALE_DTYPES})
         if why or len(shape) == 2 or params.get("axis") == 0:
             return why
         return "a per-column scale is a rank-2 weight's"
@@ -660,7 +661,12 @@ class Int8ConvRotDequant:
 
     def supports(self, shape: Sequence[int], params: Mapping[str, object]) -> str:
         why = _rows(shape, params) or _params(
-            params, {"rotation": ("hadamard",), "rotation_size": ROTATION_SIZES}
+            params,
+            {
+                "rotation": ("hadamard",),
+                "rotation_size": ROTATION_SIZES,
+                "scale_dtype": SCALE_DTYPES,
+            },
         )
         size = int(str(params.get("rotation_size", 1)))
         if why or int(shape[-1]) % size == 0:
