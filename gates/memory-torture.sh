@@ -30,7 +30,7 @@ while [ $# -gt 0 ]; do
 done
 [ -f "$W" ] && W=$(realpath "$W")
 [ -z "$CARDS" ] && { [ -n "$MATRIX" ] && CARDS="8 12 24 2x8" || CARDS="8 12 24 32 2x8"; }
-declare -A SKUS=([8]="rtx-3070 rtx-3060-ti" [12]="rtx-5070 rtx-3080-ti rtx-4070-ti" [24]="rtx-4090"
+declare -A SKUS=([8]="rtx-3070 rtx-3060-ti" [12]="rtx-4070-super rtx-5070 rtx-3080-ti rtx-4070-ti" [24]="rtx-4090"
   [32]="rtx-pro-4500 rtx-5090" [2x8]="rtx-3070 rtx-3060-ti")
 declare -A GIB=([8]=8 [12]=12 [24]=24 [32]=32 [2x8]=8)  # no GPU of a card may be larger
 D=$PWD/memory-torture-$(date -u +%Y%m%dT%H%M%SZ); mkdir -p "$D"; cd "$D" || exit 1
