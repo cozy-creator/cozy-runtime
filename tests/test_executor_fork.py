@@ -180,7 +180,7 @@ def test_a_forked_child_is_a_sealed_executor_with_the_imports_done(
 ) -> None:
     process, channel, start = zygote
     hello = _call(channel, {"cmd": "hello"})
-    assert "fork/1" in hello["memory"]
+    assert "fork/1" in hello["capabilities"]
     assert _call(channel, {**start, "import_only": True})["ok"]
     listener = _listener(tmp_path / "a.sock")
     began = time.monotonic()

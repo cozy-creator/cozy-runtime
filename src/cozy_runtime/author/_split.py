@@ -1,19 +1,13 @@
-"""`split`: the package says how an op cuts (`Cut`); the Runtime says how finely, from the
-op's measured bytes per element and the device's free memory."""
+"""`split`: the package says how an op cuts (`Cut`); the memory says how finely (varena's
+`cuts.split`, installed with it): whole, else in the windows that fit, remembered per op."""
 
 from __future__ import annotations
 
 import functools
 import math
 from collections.abc import Callable, Sequence
-from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from typing import Any, Protocol
-
-from cozy_runtime.author._errors import MEMORY_EXHAUSTED, is_device_oom
-
-#: An op not measured yet runs in pieces of at most 1/FIRST of its input.
-FIRST = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,23 +23,12 @@ class Cut:
 
 
 class Pieces(Protocol):
-    """The Runtime's side of `split`."""
+    """The memory's side of `split`: `run(most)` in windows of at most `most` of `total`
+    elements, the least `finest`, retried finer while out of memory."""
 
-    def room(self, key: str) -> tuple[float | None, int]:
-        """Measured peak bytes per input element (None until measured), and the bytes one
-        piece may take now."""
-        ...
-
-    def piece(
-        self, key: str, elements: int, need: int, least: int = 0
-    ) -> AbstractContextManager[None]:
-        """Make room for `need` bytes, run one piece and keep its measured peak. `least`: the
-        bytes the op's finest piece needs, the room its stage must keep for it."""
-        ...
-
-    def ran(self, name: str, pieces: int) -> None:
-        """Record that `name` ran in `pieces` pieces."""
-        ...
+    def __call__(
+        self, name: str, key: str, device: Any, total: int, finest: int, run: Callable[[int], Any]
+    ) -> Any: ...
 
 
 _RUNTIME: Pieces | None = None
@@ -56,32 +39,21 @@ def install(runtime: Pieces | None) -> None:
     _RUNTIME = runtime
 
 
-def split(fn: Callable[[Any], Any], x: Any, *cuts: Cut, per_element: float = 0.0) -> Any:
-    """`fn(x)` in the fewest pieces along `cuts` that fit the device; `fn` maps each window of
-    `x` to that window of its result. A piece that runs out of memory runs again at half the
-    size. Without a managing Runtime it runs whole. `per_element`, the op's own estimate of
-    the peak device bytes one element of `x` takes, sizes its pieces until the Runtime has
-    measured them; without one they are 1/FIRST of `x`."""
+def split(fn: Callable[[Any], Any], x: Any, *cuts: Cut) -> Any:
+    """`fn(x)`, whole or in the fewest pieces along `cuts` that fit the device; `fn` maps each
+    window of `x` to that window of its result. Without a managing memory it runs whole."""
     runtime = _RUNTIME
     if runtime is None or not cuts:
         return fn(x)
     shape = tuple(int(n) for n in x.shape)
-    key = _key(fn, shape, cuts, x.dtype)
-    ratio, room = runtime.room(key)
-    ratio = ratio or per_element or None
-    # Unmeasured: small pieces, measured as they run.
-    windows = _windows(shape, cuts, room / ratio if ratio else math.prod(shape) / FIRST)
-    least = int((ratio or 0.0) * _finest(shape, cuts))
-    while True:
-        try:
-            out = _run(fn, x, cuts, windows, runtime, key, ratio or 0.0, least)
-            runtime.ran(_name(fn), len(windows))
-            return out
-        except Exception as exc:
-            if not _short(exc) or len(_halved(shape, cuts, windows)) <= len(windows):
-                raise
-        # outside `except`, so the failed piece's frames are gone
-        windows = _halved(shape, cuts, windows)
+    return runtime(
+        _name(fn),
+        _key(fn, shape, cuts, x.dtype),
+        x.device,
+        math.prod(shape),
+        _finest(shape, cuts),
+        lambda most: _run(fn, x, cuts, _windows(shape, cuts, most)),
+    )
 
 
 type Window = tuple[tuple[int, int], ...]
@@ -98,10 +70,6 @@ def _key(
 
 def _name(fn: Callable[[Any], Any]) -> str:
     return str(getattr(fn, "__qualname__", type(fn).__qualname__))
-
-
-def _short(exc: BaseException) -> bool:
-    return is_device_oom(exc) or getattr(exc, "code", None) == MEMORY_EXHAUSTED
 
 
 def _spans(length: int, cut: Cut, count: int) -> list[tuple[int, int]]:
@@ -144,10 +112,6 @@ def _finest(shape: tuple[int, ...], cuts: tuple[Cut, ...]) -> int:
     return _largest(shape, cuts, list(zip(*_windows(shape, cuts, 0), strict=True)))
 
 
-def _halved(shape: tuple[int, ...], cuts: tuple[Cut, ...], windows: list[Window]) -> list[Window]:
-    return _windows(shape, cuts, _largest(shape, cuts, list(zip(*windows, strict=True))) // 2)
-
-
 def _longest(spans: Sequence[tuple[int, int]]) -> int:
     return max(b - a for a, b in spans)
 
@@ -160,19 +124,9 @@ def _largest(
     return rest * math.prod(_longest(s) for s in spans)
 
 
-def _run(
-    fn: Callable[[Any], Any],
-    x: Any,
-    cuts: tuple[Cut, ...],
-    windows: list[Window],
-    runtime: Pieces,
-    key: str,
-    ratio: float,
-    least: int,
-) -> Any:
+def _run(fn: Callable[[Any], Any], x: Any, cuts: tuple[Cut, ...], windows: list[Window]) -> Any:
     if len(windows) == 1:
-        with runtime.piece(key, x.numel(), int(ratio * x.numel()), least):
-            return fn(x)
+        return fn(x)
     ndim = x.dim()
     dims = [c.dim % ndim for c in cuts]
     blend = any(c.overlap for c in cuts)
@@ -183,9 +137,7 @@ def _run(
         index = [slice(None)] * ndim
         for d, (a, b) in zip(dims, window, strict=True):
             index[d] = slice(a, b)
-        piece = x[tuple(index)]
-        with runtime.piece(key, piece.numel(), int(ratio * piece.numel()), least):
-            part = fn(piece)
+        part = fn(x[tuple(index)])
         place = [slice(None)] * part.dim()
         for d, c, (a, _), size in zip(dims, cuts, window, sizes, strict=True):
             start = round(a * c.scale)

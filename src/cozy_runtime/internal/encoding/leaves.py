@@ -20,21 +20,19 @@ resolves to the decode floor at PLAN time with the reason in the plan, instead o
 from __future__ import annotations
 
 import functools
-import math
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from types import ModuleType
-from typing import Any, ClassVar, Protocol, cast
+from typing import Any, ClassVar, Protocol
 
-from cozy_runtime.author._errors import is_device_oom
 from cozy_runtime.author.kernels import (
     INT8_CONVROT,
     ROWWISE_FP8,
     PreQuantized,
     shared_operand,
 )
-from cozy_runtime.internal import bands, fp8_linear, int8_linear, nvfp4_linear, spill
+from cozy_runtime.internal import fp8_linear, int8_linear, nvfp4_linear
 from cozy_runtime.internal.encoding.formats import (
     CONVROT_GROUP,
     E4M3_MAX,
@@ -158,16 +156,9 @@ def _leaf_class(torch: Any) -> Any:
         def roles(self) -> dict[str, Any]:
             return {role: getattr(self, self.BUFFERS.get(role, role)) for role in self._cozy_roles}
 
-        @bands.cuts
         def forward(self, x: Any, *, prequantized: PreQuantized | None = None) -> Any:
             # Semantic hooks still see the original positional float operand.
-            if not spill.HELD or not spill.hosted(getattr(x, "payload", x)):
-                try:
-                    return self.linear(x, prequantized)
-                except Exception as exc:
-                    if not is_device_oom(exc):
-                        raise
-            return _rows(torch, self, x, prequantized)
+            return self.linear(x, prequantized)
 
         def linear(self, x: Tensor, prequantized: PreQuantized | None) -> Tensor:
             if prequantized is None and torch.is_autocast_enabled(x.device.type):
@@ -191,33 +182,6 @@ def _leaf_class(torch: Any) -> Any:
 
     _leaf_class._cached = EncodedLinear  # type: ignore[attr-defined]
     return EncodedLinear
-
-
-def _rows(
-    torch: ModuleType, leaf: Tensor, x: Tensor | PreQuantized, prequantized: PreQuantized | None
-) -> Tensor:
-    """An encoded linear that ran out of device memory whole, or reads x from host memory, in
-    pieces of x's rows where this device cuts (`bands.Bands.rows`): each row is quantized and
-    multiplied on its own (an nvfp4 activation's tensor scale becomes each piece's). Else
-    whole once more, room made for its ops."""
-    rows, shape = x.payload if isinstance(x, PreQuantized) else x, tuple(x.shape)
-    cut = bands.ON.get(str(rows.device))
-    if cut is None or len(shape) < 2:
-        return cast("Tensor", bands.held(lambda: leaf.linear(x, prequantized)))
-    dtype = leaf.out_dtype
-    if torch.is_autocast_enabled(rows.device.type):
-        dtype = torch.get_autocast_dtype(rows.device.type)
-    meta = torch.empty(math.prod(shape[:-1]), leaf.out_features, dtype=dtype, device="meta")
-    if isinstance(x, PreQuantized):
-        provider, scale = x.provider, x.scale.reshape(int(x.payload.shape[0]), -1)
-
-        def part(q: Tensor, s: Tensor) -> Tensor:
-            return cast("Tensor", leaf.linear(PreQuantized(q, s, tuple(q.shape), provider), None))
-
-        out = cut.rows(part, (x.payload, scale), meta)
-    else:
-        out = cut.rows(lambda part: leaf.linear(part, None), (x.reshape(-1, shape[-1]),), meta)
-    return out.view(*shape[:-1], -1)
 
 
 #: The 8-bit leaves' ops, by provider: each module's `quantize`, `gemm` and `linear`.

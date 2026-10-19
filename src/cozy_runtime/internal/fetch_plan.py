@@ -23,7 +23,7 @@ it refuses ends the run `model_fetch_failed` (`machine_disk_full` for a full dis
 from __future__ import annotations
 
 import threading
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING
 
 import tensorfs
@@ -94,22 +94,6 @@ def at_start(
         planned.sort(key=lambda refs: sum(length for _, length in refs))
         groups += [(row.manifest, refs) for refs in planned]
     return groups
-
-
-def in_definition_order(
-    cls: type, use: Mapping[str, tuple[str, ...]]
-) -> dict[str, tuple[str, ...]]:
-    """`component_use` with its methods in the order the class defines them: authors write
-    stages in pipeline order (encode, denoise, decode), which a sorted listing loses."""
-    named = dict.fromkeys(
-        name for klass in reversed(cls.__mro__) for name in vars(klass) if name in use
-    )
-    return {name: use[name] for name in [*named, *use]}
-
-
-def stage_components(stages: Iterable[str], use: Mapping[str, Sequence[str]]) -> list[str]:
-    """Components in the order `stages` first use them."""
-    return list(dict.fromkeys(name for stage in stages for name in use.get(stage, ())))
 
 
 def failure(manifest: str, refs: Sequence[Ref], exc: BaseException) -> RuntimeFailure:
