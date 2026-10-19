@@ -58,6 +58,7 @@ from cozy_runtime.author._numeric import within, worst
 from cozy_runtime.derive.microscale import encode_nvfp4
 from cozy_runtime.internal import accel, canonical
 from cozy_runtime.internal.decode_cores import Cores
+from cozy_runtime.internal.decode_schemes import run, sample
 from cozy_runtime.internal.encoding import (
     TORCH_DTYPES,
     Capabilities,
@@ -618,7 +619,7 @@ def _weight_roles(torch: Any, provider: Provider, device: Any) -> tuple[Any, dic
     rows, cols = BENCH_SHAPE
     generator = torch.Generator(device="cpu").manual_seed(0x511B)
     if isinstance(provider, CoreDequant):
-        roles = provider.adapter.sample(torch, rows, cols, generator, dict(provider.params))
+        roles = sample(torch, provider.adapter, BENCH_SHAPE, generator)
         roles = {role: part.to(device) for role, part in roles.items()}
         return _exact_weight(torch, provider, roles), roles
     weight = torch.randn(rows, cols, generator=generator, dtype=torch.float32).to(device) * 0.05
@@ -869,6 +870,11 @@ def _spec_vectors(torch: ModuleType, provider: Provider, device: Tensor) -> Spec
         roles = {part.role for part in case.parts}
         missing = sorted(provider.required - roles)
         surplus = sorted(roles - provider.required - provider.optional)
+        if surplus and not missing:  # the selector never hands this provider such a tensor
+            cases.append(
+                VectorCheck(case.key, passed=True, skipped=True, why=f"takes no {surplus}")
+            )
+            continue
         if missing or surplus:
             why = f"parts {sorted(roles)}: missing {missing}, unhandled {surplus}"
             cases.append(VectorCheck(case.key, passed=False, why=why))
@@ -959,21 +965,22 @@ def _cores_reference(
     implementation of the arithmetic the Triton kernels run."""
     reference = torch.empty(*shape, dtype=torch.float32)
     host = {role: part.cpu() for role, part in roles.items()}
-    eager = Cores(torch, kernel=False)
-    provider.adapter.decode(eager, host, dict(provider.params), shape, reference)
+    run(provider.adapter, Cores(torch, kernel=False), host, dict(provider.params), reference)
     return reference
 
 
 def _numerics_cores(torch: ModuleType, provider: Provider, device: Tensor, dtype: Tensor) -> Sweep:
-    """The adapter's random stored parts (every code, scale and term pattern its `sample`
-    draws), decoded on the device and by the eager reference: bit for bit after the one cast."""
+    """The row's random parts at its probe params (every byte pattern), decoded on the device
+    and by the eager reference: bit for bit after the one cast."""
     assert isinstance(provider, CoreDequant)
-    generator = torch.Generator(device="cpu").manual_seed(0x0C0E)
-    rows, cols = 384, 512
-    roles = provider.adapter.sample(torch, rows, cols, generator, dict(provider.params))
-    destination = torch.empty(rows, cols, dtype=dtype, device=device)
+    provider = replace(provider, params=params_of(provider.adapter.probe_params))
+    shape = (384, 512)
+    roles = sample(
+        torch, provider.adapter, shape, torch.Generator(device="cpu").manual_seed(0x0C0E)
+    )
+    destination = torch.empty(*shape, dtype=dtype, device=device)
     provider.decode(torch, {role: part.to(device) for role, part in roles.items()}, destination)
-    truth = _cores_reference(torch, provider, roles, (rows, cols)).double()
+    truth = _cores_reference(torch, provider, roles, shape).double()
     return _exact_sweep(torch, destination.cpu(), truth, dtype)
 
 

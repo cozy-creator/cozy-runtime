@@ -140,8 +140,10 @@ class Cores:
         zero: Tensor | None = None,
         bias: Tensor | None = None,
         g_idx: Tensor | None = None,
+        post: Tensor | None = None,
     ) -> None:
-        """`out` (`R*C` elements, f32/bf16/f16) = the affine decode of the packed codes."""
+        """`out` (`R*C` elements, f32/bf16/f16) = the affine decode of the packed codes, then
+        `x post` (one element, or one per column) when given."""
         if zero is not None and bias is not None:
             raise ValueError("an affine decode has a zero or a bias, not both")
         torch = self.torch
@@ -149,7 +151,7 @@ class Cores:
         stored = zero if zero is not None else bias
         term = None if stored is None else stored.reshape(-1).to(torch.float32)
         if not self.kernel:
-            q = _unpack(torch, words, packing, rows, cols).to(torch.float32)
+            q = unpack(torch, words, packing, rows, cols).to(torch.float32)
             at = _grid_index(torch, grid, rows, cols, g_idx, scale.device)
             s = scale[at]
             if term is None:
@@ -158,7 +160,7 @@ class Cores:
                 v = (q - term[at]) * s
             else:
                 v = q * s + term[at]
-            _round_into(torch, v, out)
+            round_into(torch, _post(torch, v, post, cols), out)
             return
         nw, _, _ = packing.stored(rows, cols)
         slots = torch.tensor(
@@ -181,6 +183,7 @@ class Cores:
             grid.size,
             *_packing_codes(packing),
             *_grid_codes(grid, g_idx),
+            *_post_args(torch, post, cols, scale),
             TERM=0 if term is None else (1 if zero is not None else 2),
             OUT=_out_code(torch, out),
             BLOCK=BLOCK,
@@ -201,14 +204,16 @@ class Cores:
         scale_2: Tensor | None = None,
         divide: bool = False,
         g_idx: Tensor | None = None,
+        post: Tensor | None = None,
     ) -> None:
-        """`out` = `T[q] x s`, then `x scale_2`; or `T[q] x (s / scale_2)` with `divide`."""
+        """`out` = `T[q] x s`, then `x scale_2`; or `T[q] x (s / scale_2)` with `divide`; then
+        `x post` (one element, or one per column) when given."""
         torch = self.torch
         values = values.reshape(-1).to(torch.float32)
         scale = scale.reshape(-1).to(torch.float32)
         second = None if scale_2 is None else scale_2.reshape(1).to(torch.float32)
         if not self.kernel:
-            q = _unpack(torch, words, packing, rows, cols)
+            q = unpack(torch, words, packing, rows, cols)
             if q.numel() and (int(q.min()) < 0 or int(q.max()) >= values.numel()):
                 raise CodeOutsideTable(f"a code is outside a table of {values.numel()}")
             s = scale[_grid_index(torch, grid, rows, cols, g_idx, scale.device)]
@@ -217,7 +222,7 @@ class Cores:
             v = values[q] * s
             if second is not None and not divide:
                 v = v * second
-            _round_into(torch, v, out)
+            round_into(torch, _post(torch, v, post, cols), out)
             return
         nw, _, _ = packing.stored(rows, cols)
         slots = torch.tensor(
@@ -244,6 +249,7 @@ class Cores:
             grid.size,
             *_packing_codes(packing),
             *_grid_codes(grid, g_idx),
+            *_post_args(torch, post, cols, scale),
             SCALE_2=0 if second is None else (2 if divide else 1),
             OUT=_out_code(torch, out),
             BLOCK=BLOCK,
@@ -261,22 +267,25 @@ class Cores:
         *,
         kernel_fn: object = None,
         eager_fn: Callable[[ModuleType, Tensor], Tensor] | None = None,
+        post: Tensor | None = None,
     ) -> None:
         """`out` from `U8` structs of `size` bytes holding `n` elements each, in row order.
         `kernel_fn(base, element, mask)` is a `@triton.jit` function returning one element's
         f32 value from its struct's bytes at `base`; `eager_fn(torch, structs)` maps every
-        struct (`[count, size]` u8) to its `[count, n]` f32 values."""
+        struct (`[count, size]` u8) to its `[count, n]` f32 values. `post`: a factor of one element
+        multiplying every value last."""
         torch = self.torch
         total = out.numel()
         if not self.kernel:
             assert eager_fn is not None, "an eager decode needs its struct function"
             structs = data.reshape(-1).view(torch.uint8).reshape(-1, size)
-            _round_into(torch, eager_fn(torch, structs).reshape(-1), out)
+            round_into(torch, _post(torch, eager_fn(torch, structs).reshape(-1), post, total), out)
             return
         _blocks_kernel[_launch(total)](
             _bits(torch, out),
             data.reshape(-1).view(torch.uint8),
             total,
+            *_post_args(torch, post, total, data),
             N=n,
             S=size,
             DECODE=kernel_fn,
@@ -289,8 +298,9 @@ class Cores:
 # ------------------------------------------------------------------- the eager reference
 
 
-def _unpack(torch: ModuleType, words: Tensor, p: Packing, rows: int, cols: int) -> Tensor:
-    """The view's codes, int64 [R, C]: spec §6's bit packing, one lane per row of words."""
+def unpack(torch: ModuleType, words: Tensor, p: Packing, rows: int, cols: int) -> Tensor:
+    """The view's codes, int64 [R, C], on the words' device: spec §6's bit packing, one lane per
+    row of words. Also how a scheme reads its small packed parts (zeros)."""
     nw, along, n = p.stored(rows, cols)
     raw = _words(torch, words, p.word).reshape(-1).to(torch.int64) & ((1 << p.word) - 1)
     if raw.numel() != nw * along:
@@ -337,7 +347,7 @@ def _grid_index(
     return ((i // 128) * -(-w // 4) + b // 4) * 512 + (i % 32) * 16 + (i % 128 // 32) * 4 + b % 4
 
 
-def _round_into(torch: ModuleType, v: Tensor, out: Tensor) -> None:
+def round_into(torch: ModuleType, v: Tensor, out: Tensor) -> None:
     """`round_L` into `out` by the kernels' own bit operations: nearest even, NaN canonical
     (torch's own casts keep NaN payloads)."""
     v = v.reshape(-1).to(torch.float32)
@@ -378,6 +388,24 @@ def _words(torch: ModuleType, words: Tensor, width: int) -> Tensor:
 
 def _g_idx(torch: ModuleType, g_idx: Tensor | None, placeholder: Tensor) -> Tensor:
     return placeholder if g_idx is None else g_idx.reshape(-1).to(torch.int32)
+
+
+def _post(torch: ModuleType, v: Tensor, post: Tensor | None, cols: int) -> Tensor:
+    """`v x post`: one factor, or one per column of the `[R, C]` view."""
+    if post is None:
+        return v
+    factor = post.reshape(-1).to(device=v.device, dtype=torch.float32)
+    return (v.reshape(-1, cols) * (factor if factor.numel() == cols else factor[0])).reshape(-1)
+
+
+def _post_args(
+    torch: ModuleType, post: Tensor | None, cols: int, placeholder: Tensor
+) -> tuple[Tensor, int]:
+    """(post pointer, POST code): 0 none, 1 one factor, 2 one per column."""
+    if post is None:
+        return placeholder, 0
+    factor = post.reshape(-1).to(torch.float32)
+    return factor, 2 if factor.numel() == cols and cols != 1 else 1
 
 
 def _packing_codes(p: Packing) -> tuple[int, ...]:
@@ -518,6 +546,15 @@ if triton is not None:
         return g
 
     @triton.jit  # type: ignore[untyped-decorator]
+    def _by_post(post, j, v, valid, POST: tl.constexpr):  # type: ignore[no-untyped-def]
+        """`v x post`: one factor (1), one per column (2), or none (0)."""
+        if POST == 1:
+            v = v * tl.load(post)
+        elif POST == 2:
+            v = v * tl.load(post + j, mask=valid, other=1.0)
+        return v
+
+    @triton.jit  # type: ignore[untyped-decorator]
     def _store(out, e, v, valid, OUT: tl.constexpr):  # type: ignore[no-untyped-def]
         """round_L into the destination's bits: nearest even, NaN canonical."""
         nan = v != v
@@ -555,6 +592,8 @@ if triton is not None:
         GRID: tl.constexpr,
         LAYOUT: tl.constexpr,
         HAS_G_IDX: tl.constexpr,
+        post,
+        POST: tl.constexpr,
         TERM: tl.constexpr,
         OUT: tl.constexpr,
         BLOCK: tl.constexpr,
@@ -590,6 +629,7 @@ if triton is not None:
             v = v * s + tl.load(term + g, mask=valid, other=0.0)
         else:
             v = v * s
+        v = _by_post(post, j, v, valid, POST)
         _store(out, e, v, valid, OUT)
 
     @triton.jit  # type: ignore[untyped-decorator]
@@ -619,6 +659,8 @@ if triton is not None:
         GRID: tl.constexpr,
         LAYOUT: tl.constexpr,
         HAS_G_IDX: tl.constexpr,
+        post,
+        POST: tl.constexpr,
         SCALE_2: tl.constexpr,
         OUT: tl.constexpr,
         BLOCK: tl.constexpr,
@@ -658,6 +700,7 @@ if triton is not None:
         v = t * s
         if SCALE_2 == 1:
             v = v * tl.load(scale_2)
+        v = _by_post(post, j, v, valid, POST)
         _store(out, e, v, valid, OUT)
 
     @triton.jit  # type: ignore[untyped-decorator]
@@ -665,6 +708,8 @@ if triton is not None:
         out,
         data,
         total,
+        post,
+        POST: tl.constexpr,
         N: tl.constexpr,
         S: tl.constexpr,
         DECODE: tl.constexpr,
@@ -674,6 +719,7 @@ if triton is not None:
         e = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
         valid = e < total
         v = DECODE(data + (e // N) * S, e % N, valid)
+        v = _by_post(post, e, v, valid, POST)
         _store(out, e, v, valid, OUT)
 
     @triton.jit

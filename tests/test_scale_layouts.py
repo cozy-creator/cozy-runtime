@@ -33,13 +33,30 @@ LAYOUTS = [
 ]
 
 
-def _decoder(scheme: str) -> Provider:
-    return next(p for p in launch_providers()[scheme] if p.route == "decoded_float")
+def _decoders(case: VectorCase, params: dict[str, object], roles: dict[str, Any]) -> list[Provider]:
+    """Every decode route the selector would hand this tensor (roles, params, shape)."""
+    return [
+        p
+        for p in launch_providers()[case.encoding.scheme]
+        if p.route == "decoded_float"
+        and p.required <= roles.keys() <= p.required | p.optional
+        and p.supports(case.shape, params) == ""
+    ]
 
 
 def _decode(case: VectorCase, params: dict[str, object], roles: dict[str, Any]) -> Any:
-    bound = replace(_decoder(case.encoding.scheme), params=params_of(params))  # type: ignore[type-var]
-    assert bound.supports(case.shape, params) == "", params
+    """The bytes every route that takes the tensor decodes (they must agree)."""
+    outs = [_decode_with(p, case, params, roles) for p in _decoders(case, params, roles)]
+    assert outs, (case.key, params)
+    for out in outs[1:]:
+        assert torch.equal(out.view(torch.uint8), outs[0].view(torch.uint8)), case.key
+    return outs[0]
+
+
+def _decode_with(
+    provider: Provider, case: VectorCase, params: dict[str, object], roles: dict[str, Any]
+) -> Any:
+    bound = replace(provider, params=params_of(params))  # type: ignore[type-var]
     dtype = getattr(
         torch, {"f32": "float32", "bf16": "bfloat16", "f16": "float16"}[TENSORFS_DTYPES[case.dtype]]
     )
@@ -54,12 +71,14 @@ def _relaid(case: VectorCase, layout: dict[str, object]) -> dict[str, Any]:
     if layout.get("nibble_order") == "high_first":
         weight = roles["weight"].view(torch.uint8)
         roles["weight"] = (weight << 4) | (weight >> 4)
-    if layout.get("scale_layout") == "cublas_128x4":
-        grid = (
-            roles["scale"].view(torch.uint8).reshape(rows, -(-cols // BLOCKS[case.encoding.scheme]))
-        )
-        padded = _blocked_shape(*grid.shape)
-        roles["scale"] = to_blocked(torch, grid).reshape(padded).view(roles["scale"].dtype)
+    if layout.get("scale_layout") == "cublas_128x4":  # tiled per matrix of a stack (spec §6)
+        height = case.shape[-2]
+        blocks = -(-cols // BLOCKS[case.encoding.scheme])
+        grids = roles["scale"].view(torch.uint8).reshape(rows // height, height, blocks)
+        padded = _blocked_shape(height, blocks)
+        tiles = [to_blocked(torch, grid).reshape(padded) for grid in grids]
+        stacked = torch.stack(tiles).reshape(*case.shape[:-2], *padded)
+        roles["scale"] = stacked.view(roles["scale"].dtype)
     return roles
 
 

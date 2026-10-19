@@ -5,10 +5,12 @@ one.
 
 - `encoding/vectors/cores.json`: the cores' own cases (affine and table over the producers'
   packings, and gguf-py's q4_0/q8_0 structs), bit for bit.
-- `encoding/vectors/cases/*.json`: every scheme the cores express (fp8 and int8 tensorwise and
-  rowwise, mxfp8, nvfp4) through one decode function each, bit for bit.
+- `encoding/vectors/cases/*.json`: every scheme row of `decode_schemes.ADAPTERS`, through
+  `decode_schemes.run`, and the schemes xs-045's own decoders serve (fp8 and int8 tensorwise and
+  rowwise, mxfp8) through one decode function each, bit for bit; every refusal case refused by
+  its row's part rules or its decode.
 
-This file imports only the cores, so the interpreter can load it.
+This file imports only the cores and the rows, so the interpreter can load it.
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ import pytest
 
 from cozy_runtime.internal import decode_cores as cores
 from cozy_runtime.internal.decode_cores import HAS_TRITON, Cores, Grid, Packing, blocks_of
+from cozy_runtime.internal.decode_schemes import BY_SCHEME, parts_rule, run
 
 try:
     import triton
@@ -130,32 +133,12 @@ def mxfp8(
     )
 
 
-def nvfp4(
-    c: Cores, parts: Mapping[str, Any], params: Mapping[str, object], shape: Any, out: Any
-) -> None:
-    rows, cols = view(shape, False)
-    weight = parts["weight"]
-    c.table(
-        weight.view(torch.uint8),
-        Packing(4, 8, order=str(params["nibble_order"])),
-        rows,
-        cols,
-        torch.tensor(E2M1, device=weight.device),
-        parts["scale"],
-        blocks_of(16, str(params["scale_layout"])),
-        out,
-        scale_2=parts["scale_2"],
-        divide=params["global_scale"] == "divide",
-    )
-
-
 DECODES: dict[str, Decode] = {
     "fp8.tensorwise": fp8,
     "fp8.rowwise": fp8,
     "int8.tensorwise": int8,
     "int8.rowwise": int8,
     "mxfp8": mxfp8,
-    "nvfp4": nvfp4,
 }
 
 # ----------------------------------------------------------------------- the vectors
@@ -166,6 +149,9 @@ DTYPES = {
     "F16": "float16",
     "I8": "int8",
     "U8": "uint8",
+    "I16": "int16",
+    "I32": "int32",
+    "I64": "int64",
     "F8_E4M3": "float8_e4m3fn",
     "F8_E5M2": "float8_e5m2",
     "F8_E8M0": "float8_e8m0fnu",
@@ -184,14 +170,16 @@ def part(p: Mapping[str, Any], device: str) -> Any:
     return flat.view(getattr(torch, DTYPES[p["dtype"]])).reshape(p["shape"]).to(device)
 
 
-def scheme_cases() -> list[dict[str, Any]]:
+def scheme_cases(refusals: bool = False) -> list[dict[str, Any]]:
+    """The cases of every scheme a row or a decode function above serves."""
     out = []
     for path in sorted((VECTORS / "cases").glob("*.json")):
-        out += [
-            c
-            for c in json.loads(path.read_text())["cases"]
-            if c.get("encoding", {}).get("scheme") in DECODES and "expect" in c
-        ]
+        for c in json.loads(path.read_text())["cases"]:
+            scheme = c.get("encoding", {}).get("scheme")
+            if (scheme in BY_SCHEME or (scheme in DECODES and not refusals)) and (
+                ("refuse" in c) == refusals
+            ):
+                out.append(c)
     return out
 
 
@@ -201,19 +189,59 @@ def same(got: Any, expect: str) -> bool:
     return bool(torch.equal(got.cpu().reshape(-1).view(torch.uint8), want))
 
 
+def decode(c: Cores, case: Mapping[str, Any], device: str) -> Any:
+    parts = {p["role"]: part(p, device) for p in case["parts"]}
+    out = torch.empty(*case["shape"], dtype=getattr(torch, DTYPES[case["dtype"]]), device=device)
+    params, scheme = case["encoding"]["params"], case["encoding"]["scheme"]
+    if scheme in BY_SCHEME:
+        run(BY_SCHEME[scheme], c, parts, params, out)
+    else:
+        DECODES[scheme](c, parts, params, tuple(case["shape"]), out)
+    return out
+
+
 @PATHS
 def test_every_scheme_the_cores_express_decodes_its_vectors(kernel: bool, device: str) -> None:
     c = Cores(torch, kernel)
     cases = scheme_cases()
+    seen = set()
     for case in cases:
-        parts = {p["role"]: part(p, device) for p in case["parts"]}
-        out = torch.empty(
-            *case["shape"], dtype=getattr(torch, DTYPES[case["dtype"]]), device=device
-        )
-        params = case["encoding"]["params"]
-        DECODES[case["encoding"]["scheme"]](c, parts, params, tuple(case["shape"]), out)
-        assert same(out, case["expect"]), f"{case['component']}/{case['key']}"
-    assert len(cases) >= 40, len(cases)
+        assert same(decode(c, case, device), case["expect"]), case["key"]
+        seen.add(case["encoding"]["scheme"])
+    assert len(cases) >= 200 and len(seen) >= 30, (len(cases), sorted(seen))
+
+
+#: The fill plane hands an `F4` part over as its packed bytes, so a `U8` part of the same bytes
+#: reads alike: only TensorFS's own decoder, which sees the header's dtype, refuses these.
+UNSEEN = {("mxfp4", "weight-u8")}
+
+
+def rolepart(p: Mapping[str, Any]) -> tuple[str, tuple[int, ...]]:
+    """A part's (runtime dtype, shape), as the fill plane lists it."""
+    if p["dtype"] == "F4":
+        return "u8", (*p["shape"][:-1], p["shape"][-1] // 2)
+    names = {"F8_E4M3": "f8_e4m3fn", "F8_E5M2": "f8_e5m2", "F8_E8M0": "f8_e8m0"}
+    return names.get(p["dtype"], p["dtype"].lower()), tuple(p["shape"])
+
+
+def test_every_refusal_case_is_refused() -> None:
+    """By the row's rules (params, parts, shapes) before a byte moves, or by its decode, which
+    checks the values the spec constrains (tables, indices, zeros, the stored shape)."""
+    if INTERPRETED:
+        pytest.skip("the eager path's")
+    cases = scheme_cases(refusals=True)
+    for case in cases:
+        scheme, params = case["encoding"]["scheme"], case["encoding"]["params"]
+        if (scheme, case["key"]) in UNSEEN:
+            continue
+        roles = {p["role"]: rolepart(p) for p in case["parts"]}
+        if case["dtype"] not in ("F32", "BF16", "F16") or parts_rule(
+            BY_SCHEME[scheme], case["shape"], params, roles
+        ):
+            continue
+        with pytest.raises((ValueError, cores.CodeOutsideTable)):
+            decode(Cores(torch, False), {**case, "dtype": "F32"}, "cpu")
+    assert len(cases) >= 70, len(cases)
 
 
 # ------------------------------------------------------------------- the core cases
