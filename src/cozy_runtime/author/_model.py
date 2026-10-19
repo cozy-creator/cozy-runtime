@@ -189,7 +189,6 @@ _RUNTIME_MEMBERS = frozenset(
         "for_test",
         "checkpoint_ref",
         "harness",
-        "batch_fits",
     }
 )
 
@@ -256,51 +255,31 @@ class _Scope(Protocol):
 
 
 class Residency(Protocol):
-    """The runtime's component-use ADMISSION, installed on a constructed generation.
+    """What a Runtime mechanism handed a placed component reaches, installed on a constructed
+    generation. Memory itself is varena's: it sees each forward through its own hooks.
 
     Declared here because the contract has one home; implemented nowhere in this package,
     because it needs a device and this package is torch-free by construction. cozy-runtime
-    supplies the body on the weight plane (`internal/weights.py`).
-
-    `admit` runs BEFORE method entry: the declared set becomes a stage with its resident
-    prefix wanted and its tail streaming, or it refuses typed. `release` runs after the body
-    returns and makes the stage's weights evictable; it never forces eviction.
+    supplies the body on varena's memory (`internal/weights.py`).
     """
 
-    def admit(self, method: str, components: tuple[str, ...]) -> None: ...
-
-    def release(self, method: str, components: tuple[str, ...]) -> None: ...
-
-    def batch_fits(self, method: str, batch: int) -> bool: ...
-
-    def recording(self) -> AbstractContextManager[dict[str, set[Any]]]:
-        """The block modules the body runs, by component."""
+    def pin(self, component: str, owner: str, shed: Callable[[], int]) -> object | None:
+        """Every weight of `component` bound at its home address for `owner` (a CUDA graph
+        reads them there) until memory asks for room, when `shed` drops what read them; they
+        stay bound while the returned token lives. None when part of it streams."""
         ...
 
-    def held(self, component: str, blocks: Collection[Any]) -> AbstractContextManager[bool]:
-        """The weights of `component`'s `blocks` (modules `recording` saw) fixed at their device
-        addresses for the body (a CUDA graph may read them there), or False when they cannot
-        be."""
-        ...
-
-    def hold_stage(
-        self, component: str, blocks: Collection[Any]
-    ) -> tuple[bool, tuple[object, ...]]:
-        """`held` for the rest of the open stage, entered once per component: whether it holds,
-        and `layout` as it holds them."""
-        ...
-
-    def layout(self, component: str, blocks: Collection[Any]) -> tuple[object, ...]:
-        """Where `component`'s common weights and `blocks` are bound now: a graph recorded over
-        them replays only while this is unchanged."""
+    def cache(self, owner: str, shed: Callable[[int], int]) -> Any:
+        """Device bytes `owner` keeps for speed (KV slots), counted and shed on ask: `resize`,
+        `close` and `nbytes`; None off a GPU."""
         ...
 
     def note(self, key: str, value: str) -> None:
         """A fact about how this attempt executed, reported with its memory facts."""
         ...
 
-    def allocatable(self) -> int:
-        """Device bytes torch can allocate now without the plane unmapping a weight."""
+    def plan(self, request_id: str, steps: Sequence[str | Collection[str]]) -> None:
+        """The attempt's declared steps by component name (`Context.plan`)."""
         ...
 
     #: How many attempts (requests) it has opened.
@@ -310,10 +289,6 @@ class Residency(Protocol):
 #: A component's root module -> the residency that places it and the component's name, so a
 #: Runtime mechanism handed the module (`cozy_runtime.lm`) reaches its placement.
 PLACED: weakref.WeakKeyDictionary[object, tuple[Residency, str]] = weakref.WeakKeyDictionary()
-#: What Runtime keeps on the device between calls for speed alone (CUDA graph recordings), as
-#: callables that drop it and say whether there was any: the plane calls them before it unmaps
-#: weights for room.
-RELEASERS: list[Callable[[], bool]] = []
 #: Kernel builds this process loaded after it started (a boot build landing): calls may take a
 #: faster path from each on, so graphs record them again. None loads while a graph records.
 LANDED: list[int] = [0]
@@ -484,6 +459,10 @@ class Placement(Protocol):
 #: thread's hosted calls and to nothing else.
 _REMOTE_SCOPES: contextvars.ContextVar[tuple[tuple[Model[Any], str, tuple[str, ...]], ...]] = (
     contextvars.ContextVar("cozy_remote_scopes", default=())
+)
+#: The local scopes open in this context, innermost last: (model, method, components).
+_LOCAL_SCOPES: contextvars.ContextVar[tuple[tuple[Model[Any], str, tuple[str, ...]], ...]] = (
+    contextvars.ContextVar("cozy_local_scopes", default=())
 )
 
 
@@ -732,7 +711,6 @@ class Model[PipelineT]:
 
     _cozy_ready = False
     _cozy_loading = False
-    _cozy_active: tuple[str, tuple[str, ...]] | None = None
     _cozy_harness: ModelTestHarness | None = None
     _cozy_record: ConstructionRecord | None = None
     _cozy_identity: ConstructionIdentity | None = None
@@ -809,13 +787,13 @@ class Model[PipelineT]:
         """Release declared state. The runtime drains before calling this."""
         return None
 
-    def batch_fits(self, method: str, batch: int = 2) -> bool:
-        """Whether `method` can run `batch` requests' worth at once — cond and uncond as one
-        batch, say — counting weights the runtime may unmap as free. Ask before the stage;
-        the runtime records the answer in the run's outputs and it holds for the request.
-        Unmeasured is yes: the first run measures, and a block that runs out retries."""
-        residency = self._cozy_residency
-        return True if residency is None else residency.batch_fits(method, batch)
+    @property
+    def _cozy_active(self) -> tuple[str, tuple[str, ...]] | None:
+        """This context's innermost open local scope of this instance: (method, components)."""
+        for owner, method, components in reversed(_LOCAL_SCOPES.get()):
+            if owner is self:
+                return method, components
+        return None
 
     def prepare_adapters(self, overlays: tuple[AdapterRef, ...]) -> None:
         """Apply an admitted ordered overlay once during model preparation."""
@@ -984,21 +962,22 @@ def _declared_state(cls: type) -> tuple[str, ...]:
 
 @final
 class _ComponentScope:
-    """ONE public scope is active at a time per instance (§1.1), and one call holds scopes at a
-    time (`SCOPES`). A composite operation declares its components together on one method.
+    """A method's declared components, nested or on any of the call's threads (cr-202), each
+    marking its own context (`Model._cozy_active`). It carries no memory meaning: varena sees
+    each forward itself. Calls still take scopes one at a time (`SCOPES`): the sites they read
+    change between turns (cr-202 U4 lifts it).
 
-    The one exception holds nothing here: a REMOTE scope, whose every declared component the
-    runtime keeps on another GPU of the group (`Placement.remote`). It admits nothing on
-    this device and marks this context, not the instance, so it may be open beside the one
-    local scope (`author.concurrently` overlaps the two)."""
+    A REMOTE scope, whose every declared component the runtime keeps on another GPU of the
+    group (`Placement.remote`), uses nothing on this device."""
 
-    __slots__ = ("_call", "_components", "_method", "_model", "_remote")
+    __slots__ = ("_call", "_components", "_local", "_method", "_model", "_remote")
 
     def __init__(self, model: Model[Any], method: str, components: tuple[str, ...]) -> None:
         self._model = model
         self._method = method
         self._components = components
         self._remote: contextvars.Token[Any] | None = None
+        self._local: contextvars.Token[Any] | None = None
         self._call: Context | None = None
 
     def __enter__(self) -> None:
@@ -1038,29 +1017,9 @@ class _ComponentScope:
             )
             if row not in WARNINGS:
                 WARNINGS.append(row)
-        try:
-            self._admit(model)
-        except BaseException:
-            if self._call is not None:
-                SCOPES.leave()
-            raise
-
-    def _admit(self, model: Model[Any]) -> None:
-        if model._cozy_active is not None:
-            raise CapabilityError(
-                f"{type(model).__name__}.{self._method} entered while "
-                f"{model._cozy_active[0]} holds the active component-use scope: one public "
-                "scope is active at a time per instance — an operation needing several "
-                "components declares them together on one method (§1.1)",
-                code="concurrent_scope",
-            )
-        # ADMISSION HAPPENS BEFORE ENTRY, and before the scope is marked active: a method
-        # whose declared set cannot be materialized never runs, so there is no state in
-        # which a body is executing against a component the runtime did not admit.
-        residency = model._cozy_residency
-        if residency is not None:
-            residency.admit(self._method, self._components)
-        object.__setattr__(model, "_cozy_active", (self._method, self._components))
+        self._local = _LOCAL_SCOPES.set(
+            (*_LOCAL_SCOPES.get(), (model, self._method, self._components))
+        )
         if model._cozy_harness is not None:
             model._cozy_harness.calls.append(ScopeCall(self._method, self._components))
 
@@ -1073,16 +1032,11 @@ class _ComponentScope:
             if placement is not None:
                 placement.leave(self._components)
             return
-        try:
-            object.__setattr__(model, "_cozy_active", None)
-            # RELEASE MAKES BYTES EVICTABLE; it does not evict, and it imposes no global scope
-            # sequence (§3.2). The lease ends at the completion event, not at this statement.
-            residency = model._cozy_residency
-            if residency is not None:
-                residency.release(self._method, self._components)
-        finally:
-            if self._call is not None:
-                SCOPES.leave()
+        if self._local is not None:
+            _LOCAL_SCOPES.reset(self._local)
+            self._local = None
+        if self._call is not None:
+            SCOPES.leave()
 
 
 # --------------------------------------------------------------------------- identity

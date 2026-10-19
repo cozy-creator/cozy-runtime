@@ -89,7 +89,7 @@ from cozy_runtime.author._walker import field_values, strip, unwrap_optional, wa
 from cozy_runtime.author._weights import ReadValues, Weights
 
 if TYPE_CHECKING:
-    from tensorfs.derived import Derivation, DerivedTransaction, SourceCapability
+    from cozy_runtime.tensord_channels import Derivation, Output, Source
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,9 +128,9 @@ class Invocation:
     sources: Mapping[str, Weights[Any]] = field(default_factory=dict)
     """`Weights[M]` parameter -> its raw checkpoint, read through this attempt's source."""
     weights_values: ReadValues | None = None
-    tensorfs_source: Callable[[str], SourceCapability] | None = None
-    tensorfs_output: Callable[[str, Derivation], DerivedTransaction] | None = None
-    tensorfs_adopt: Callable[[Mapping[str, Any]], ModelArtifact] | None = None
+    tensorfs_source: Callable[[str], Source] | None = None
+    tensorfs_output: Callable[[str, Derivation], Output] | None = None
+    tensorfs_adopt: Callable[[str, tuple[str, int]], ModelArtifact] | None = None
     max_output_bytes: int = MAX_OUTPUT_BYTES
     progress: Callable[[ProgressFrame | Observation], None] | None = None
     """The runtime's lossy LIVE sink (cr-007/cr-011): progress frames and retained
@@ -247,22 +247,19 @@ def lora_mode(payload_type: object, wire: Mapping[str, object]) -> tuple[Mapping
 def _bind_tensorfs(
     ctx: Context, record: Attempt, inv: Invocation, surface: Surface, handles: ExitStack
 ) -> None:
-    """Bind execution authority; TensorFS implements the source and output handles."""
+    """Bind the attempt's weights sources and outputs; TensorD serves their channels."""
     if inv.tensorfs_source is None and inv.tensorfs_output is None:
         return
-    from tensorfs.derived import OutputCapability, SourceCapability
-
-    source_reader = inv.tensorfs_source
-    output_opener = inv.tensorfs_output
+    source_reader, output_opener = inv.tensorfs_source, inv.tensorfs_output
     receipt_adopter = inv.tensorfs_adopt
-    outputs: dict[str, OutputCapability] = {}
+    outputs: dict[str, Output] = {}
     declared = {output.name for output in surface.weights_outputs}
 
     def current() -> None:
-        record.check_open("Context TensorFS capability")
+        record.check_open("Context weights capability")
         ctx.raise_if_cancelled()
 
-    def source(weights: Weights[Any]) -> SourceCapability:
+    def source(weights: Weights[Any]) -> Source:
         current()
         if source_reader is None or not any(
             weights is candidate for candidate in inv.sources.values()
@@ -270,58 +267,27 @@ def _bind_tensorfs(
             raise CapabilityError(
                 "source is not an admitted Weights input", code="weights_source_ungranted"
             )
-        capability = source_reader(weights.checkpoint_ref)
-        handles.callback(capability.close)
+        opened = source_reader(weights.checkpoint_ref)
+        handles.callback(opened.close)
+        return opened
 
-        def inspect(components: Sequence[str], configs: Sequence[str]) -> Any:
-            current()
-            try:
-                return capability.inspect(components=components, configs=configs)
-            finally:
-                current()
-
-        def read_part(component: str, key: str, role: str, offset: int, into: object) -> None:
-            current()
-            try:
-                capability.read_part_into(component, key, role, offset, into)
-            finally:
-                current()
-
-        def check() -> None:
-            current()
-            try:
-                capability.check()
-            finally:
-                current()
-
-        return SourceCapability(
-            capability.manifest, capability.length, inspect, capability.close, read_part, check
-        )
-
-    def output(slot: str) -> OutputCapability:
+    def output(slot: str, derivation: Derivation) -> Output:
         current()
         if output_opener is None or slot not in declared:
             raise CapabilityError(
                 "output slot is not interface-declared", code="weights_output_ungranted"
             )
-        if slot not in outputs:
-
-            def opened(definition: Derivation) -> DerivedTransaction:
-                current()
-                transaction = output_opener(slot, definition)
-                handles.callback(transaction.close)
-                return transaction
-
-            outputs[slot] = OutputCapability(opened)
+        if slot in outputs:
+            raise CapabilityError("output was already opened", code="weights_output_ungranted")
+        outputs[slot] = output_opener(slot, derivation)
+        handles.callback(outputs[slot].close)
         return outputs[slot]
 
-    def adopt(receipt: Mapping[str, Any]) -> ModelArtifact:
+    def adopt(opened: Output) -> ModelArtifact:
         current()
         if receipt_adopter is None:
-            raise CapabilityError(
-                "native receipt adoption is unavailable", code="weights_receipt_mismatch"
-            )
-        return receipt_adopter(receipt)
+            raise CapabilityError("adoption is unavailable", code="weights_receipt_mismatch")
+        return receipt_adopter(opened.transaction, opened.commit())
 
     ctx._tensorfs_source, ctx._tensorfs_output, ctx._tensorfs_adopt = source, output, adopt
     for weights in inv.sources.values():
@@ -349,6 +315,9 @@ def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> Invoc
     attempt = record
     attempt.outputs = surface.outputs
     ctx = Context(inv.request_id, inv.deadline, inv.device, inv.cancel, inv.adapters)
+    placed = next((m._cozy_residency for m in models if m._cozy_residency is not None), None)
+    if placed is not None:
+        ctx._plan = functools.partial(placed.plan, inv.request_id)
     handles = ExitStack()
     _bind_tensorfs(ctx, record, inv, surface, handles)
     kwargs = _inject(surface, attempt, ctx, overlay, prepared.facts, inv)

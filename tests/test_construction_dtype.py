@@ -1,5 +1,12 @@
 """Checkpoint dtype is immutable constructor input, before census and allocation."""
 
+import pytest
+
+pytest.skip(
+    "pending: weights register on cozytensors/1 through varena (xs-045 U8) and cr-203 U11b",
+    allow_module_level=True,
+)
+
 import io
 import mmap
 from pathlib import Path

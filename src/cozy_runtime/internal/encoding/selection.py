@@ -27,7 +27,7 @@ from __future__ import annotations
 import platform
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -35,16 +35,17 @@ from cozy_runtime.internal import accel, canonical
 from cozy_runtime.internal.encoding.formats import (
     Encoded,
     Int8ConvRotDequant,
+    MicroScaledDequant,
     Nvfp4Dequant,
     Provider,
     RowwiseDequant,
-    ScaledScalarDequant,
+    TensorwiseDequant,
     Verbatim,
-    aliases,
     refuse,
 )
 from cozy_runtime.internal.encoding.leaves import (
     Int8ConvRotNativeLeaf,
+    MicroScaledNativeLeaf,
     Nvfp4NativeLeaf,
     RowwiseNativeLeaf,
 )
@@ -312,7 +313,7 @@ class CapabilityRecord:
     that would win or lose a comparison it was never entitled to enter.
     """
 
-    encoding_spec_id: str
+    scheme: str
     implementation_digest: str
     runtime_release: str
     device_predicate: str
@@ -360,7 +361,7 @@ class CapabilityRecord:
 
     def document(self) -> dict[str, str | int | float]:
         return {
-            "encoding_spec_id": self.encoding_spec_id,
+            "scheme": self.scheme,
             "implementation_digest": self.implementation_digest,
             "implementation_revision": self.implementation_revision,
             "runtime_release": self.runtime_release,
@@ -429,7 +430,7 @@ class Capabilities:
         return [
             record
             for record in self.records
-            if record.encoding_spec_id == encoding
+            if record.scheme == encoding
             and record.output_dtype == output_dtype
             and device.satisfies(record.device_predicate)
             and record.implementation_digest in among
@@ -467,7 +468,6 @@ class Capabilities:
         encoding: str,
         device: DeviceFacts,
         output_dtype: str,
-        alias: str,
         *,
         objective: str,
         among: Mapping[str, Provider],
@@ -482,7 +482,7 @@ class Capabilities:
         if not records:
             raise refuse(
                 "encoding_unqualified",
-                self._why(encoding, device, output_dtype, alias, among),
+                self._why(encoding, device, output_dtype, among),
                 [encoding],
             )
         return self.rank(records, among, objective)[0]
@@ -492,13 +492,10 @@ class Capabilities:
         encoding: str,
         device: DeviceFacts,
         output_dtype: str,
-        alias: str,
         among: Mapping[str, Provider],
     ) -> str:
-        elsewhere = sorted(
-            {r.device_predicate for r in self.records if r.encoding_spec_id == encoding}
-        )
-        seam = NAMED_SEAMS.get(alias)
+        elsewhere = sorted({r.device_predicate for r in self.records if r.scheme == encoding})
+        seam = NAMED_SEAMS.get(encoding)
         alternative = f" The route that WOULD serve it is {seam[0]}: {seam[1]}." if seam else ""
         # WHICH implementations exist and what each one's floor is. "No qualified provider"
         # is the same words whether nothing was built or nothing was measured, and those are
@@ -509,7 +506,7 @@ class Capabilities:
             for p in sorted(among.values(), key=lambda p: p.name)
         )
         return (
-            f"{alias} ({encoding[:23]}…) has no qualified provider on "
+            f"{encoding} has no qualified provider on "
             f"{device_line(device)} for output dtype {output_dtype}. Qualified device "
             f"predicates for this encoding: {elsewhere or 'none'}. Implementations this "
             f"build carries: {built or 'none'}.{alternative} An unrecognised device is the "
@@ -519,25 +516,13 @@ class Capabilities:
 
 # --------------------------------------------------------------------------- the seams
 
-#: Encodings this runtime RECOGNISES but does not execute, with the device class that
-#: would and the milestone that owns building it. Data, not machinery: there is no stub
-#: provider object, no empty package and no dormant enum case — the refusal reads this
-#: table to name the alternative, which is the only consumer it has.
+#: Routes this runtime names but does not build, by scheme: the device class that would serve
+#: one, and what owns building it. A refusal reads this to name the alternative.
 NAMED_SEAMS: dict[str, tuple[str, str]] = {
-    "fp8-scaled-scalar/1": (
+    "fp8.tensorwise": (
         "cuda.sm90+",
-        "encoded-GEMM fp8 tensor-core execution via torch._scaled_mm — cr-008c's "
-        "encoded-provider leg; on sm89 the qualified route is decoded_float, which this "
-        "runtime serves",
-    ),
-    # `fp8-rowwise/1` and `nvfp4-w4a4/1` LEFT THIS TABLE when their encoded-GEMM leaves were
-    # built. A seam entry means "this runtime recognises the bytes and executes none of
-    # them"; each now has TWO providers, a decode floor and an encoded leaf, and the honest
-    # answer for a device that serves neither is the candidate list the refusal prints.
-    "svdq-microscale/1": (
-        "cuda.sm100+",
-        "svdq micro-scale; its wscale geometry is PROVISIONAL "
-        "pending producer-mined confirmation (tfs-008)",
+        "encoded-GEMM fp8 tensor-core execution via torch._scaled_mm; elsewhere the qualified "
+        "route is decoded_float, which this runtime serves",
     ),
 }
 
@@ -546,52 +531,33 @@ NAMED_SEAMS: dict[str, tuple[str, str]] = {
 
 
 def launch_providers() -> dict[str, tuple[Provider, ...]]:
-    """The LAUNCH TIER provider set: spec digest -> the ORDERED CANDIDATES for that digest.
-
-    **Built from `reviewed_specs`, not from aliases** (#549.4). Each provider names the exact
-    digests it was reviewed against; this function inverts that into digest -> providers. A
-    NEW digest the registry files under an existing alias therefore acquires no provider: a
-    semantically different `fp8-rowwise/1` is never decoded by `cozy.fp8-rowwise.dequant/1`
-    on the strength of its display name.
-
-    The order within a digest is REGISTRATION order and it decides NOTHING. Selection among
-    candidates is `resolution.py`'s joint plan decision over records that exist only where a
-    probe measured.
-    """
+    """Scheme -> its candidate providers. Their order decides nothing: `resolution.py` picks
+    among qualified records."""
     out: dict[str, list[Provider]] = {}
     builds: tuple[Callable[[str], Provider], ...] = (
         Verbatim,
-        ScaledScalarDequant,
+        TensorwiseDequant,
         RowwiseDequant,
         RowwiseNativeLeaf,
         Int8ConvRotDequant,
         Int8ConvRotNativeLeaf,
         Nvfp4Dequant,
         Nvfp4NativeLeaf,
+        MicroScaledDequant,
+        MicroScaledNativeLeaf,
     )
     for build in builds:
-        # The provider is instantiated once per digest it reviewed, which is what makes
-        # `provider.encoding` a fact rather than a lookup.
-        probe = build("")
-        for digest in sorted(probe.reviewed_specs):
-            out.setdefault(digest, []).append(build(digest))
-    return {digest: tuple(candidates) for digest, candidates in out.items()}
+        for scheme in sorted(build("").schemes):
+            out.setdefault(scheme, []).append(build(scheme))
+    return {scheme: tuple(candidates) for scheme, candidates in out.items()}
 
 
 # ------------------------------------------------------------------------------ digests
 
 
 def implementation_digest(provider: Provider) -> str:
-    """The provider's identity: name, route, device floor, oracle, role set, revision, specs.
-
-    `suite` joins the key because it is part of what a record MEANS: two implementations
-    checked by different oracles are not interchangeable, and a record whose evidence came
-    from one must not admit the other.
-
-    `code_revision` and `reviewed_specs` joined it with #549.9/#549.4: an implementation
-    whose arithmetic changed, or whose reviewed contract set changed, is a different
-    implementation, and records that measured the old one must not admit the new one.
-    """
+    """The provider's identity: name, route, device floor, oracle, parts, revision, schemes.
+    Records that measured another identity never admit this one."""
     return canonical.digest(
         {
             "name": provider.name,
@@ -601,7 +567,7 @@ def implementation_digest(provider: Provider) -> str:
             "required": sorted(provider.required),
             "optional": sorted(provider.optional),
             "code_revision": provider.code_revision,
-            "reviewed_specs": sorted(provider.reviewed_specs),
+            "schemes": sorted(provider.schemes),
         }
     )
 
@@ -611,16 +577,17 @@ def implementation_digest(provider: Provider) -> str:
 
 @dataclass(frozen=True, slots=True)
 class Selection:
-    """What the fill plane needs to move and decode one tensor."""
+    """What the fill plane needs to move and decode one tensor. Its provider is bound to the
+    tensor's params."""
 
     provider: Provider
     record: CapabilityRecord
     encoded: Encoded
     reason: str = ""
-    """WHY this provider, in one sentence, carried into the resolved plan. A plan that says
-    `decoded_float` where a leaf exists has to be able to say why — a geometry the leaf
-    refuses (#549.5) is exactly that, and a plan whose label is honest but whose reason is
-    missing is half a fix."""
+    """Why this provider, in one sentence, carried into the resolved plan."""
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "provider", replace(self.provider, params=self.encoded.params))  # type: ignore[type-var]
 
 
 @dataclass(frozen=True, slots=True)
@@ -660,7 +627,7 @@ class TensorCandidates:
 
 
 class Selector:
-    """Per-tensor candidate resolution: by digest, fail-closed, O(1) per key.
+    """Per-tensor candidate resolution: by scheme, fail-closed, O(1) per key.
 
     `objective` is the DEPLOYMENT's stated axis, carried down from the resolved plan. It is a
     constructor argument rather than a per-call one because delivery is decided ONCE per
@@ -675,37 +642,31 @@ class Selector:
         device: DeviceFacts,
         objective: str = "kernel_numeric_error",
     ) -> None:
-        #: digest -> ORDERED CANDIDATES.
         self.providers = providers
         self.capabilities = capabilities
         self.device = device
         self.objective = objective
-        self.aliases = aliases()
 
     def candidates(
         self, key: str, encoded: Encoded, output_dtype: str, shape: Sequence[int]
     ) -> TensorCandidates:
-        """Every servable route for one tensor, with the geometry preflight already applied.
-
-        Order of the four filters, and why it is this order: REGISTRY (is this digest known
-        at all), ROLES (is this provider a provider OF THESE BYTES), GEOMETRY (can it consume
-        THIS SHAPE — #549.5, pure, before any allocation), then CAPABILITY (was it measured
-        here). Each answers a different question and each has a different remedy, so
-        collapsing any two would print the wrong sentence.
-        """
-        providers = self.providers.get(encoded.encoding)
+        """Every servable route for one tensor. Filters in order, each with its own remedy:
+        scheme known, parts accounted for, shape and params supported, measured here."""
+        providers = self.providers.get(encoded.scheme)
         if not providers:
             self._refuse_unknown(key, encoded)
         among: dict[str, Provider] = {}
         mismatched: list[tuple[Provider, list[str], list[str]]] = []
         geometry: list[tuple[str, str]] = []
-        for candidate in providers:
+        params = dict(encoded.params)
+        for listed in providers:
+            candidate = replace(listed, params=encoded.params)  # type: ignore[type-var]
             missing = sorted(candidate.required - encoded.roles)
             surplus = sorted(encoded.roles - candidate.required - candidate.optional)
             if missing or surplus:
                 mismatched.append((candidate, missing, surplus))
                 continue
-            why = candidate.supports(shape)
+            why = candidate.supports(shape, params)
             if why:
                 geometry.append((candidate.name, why))
                 continue
@@ -713,28 +674,25 @@ class Selector:
         if not among and mismatched and not geometry:
             raise refuse(
                 "role_mismatch",
-                f"{key}: the header stores roles {sorted(encoded.roles)} and no provider "
-                f"reviewed for this tensor's own digest accounts for them — "
+                f"{key}: the header stores {encoded.scheme} parts {sorted(encoded.roles)} and no "
+                "provider accounts for them — "
                 + " | ".join(
                     f"{c.name} requires {sorted(c.required)}, tolerates {sorted(c.optional)} "
                     f"(missing {m}, unhandled {s})"
                     for c, m, s in mismatched
                 )
-                + ". A role a decoder cannot account for is a different physical contract, "
-                "never a tolerated variant",
+                + ".",
                 [key],
             )
         if not among:
             raise refuse(
                 "geometry_unsupported",
-                f"{key}: every implementation of {self.aliases.get(encoded.encoding, '?')} "
-                f"refuses this tensor's geometry {tuple(shape)} — "
-                + " | ".join(f"{name}: {why}" for name, why in geometry)
-                + ". The device is not the problem and neither are the bytes: nothing here "
-                "consumes this shape, and a reshape would be a different model",
+                f"{key}: every implementation of {encoded.scheme} refuses this tensor "
+                f"{tuple(shape)} {params} — "
+                + " | ".join(f"{name}: {why}" for name, why in geometry),
                 [key],
             )
-        records = self.capabilities.qualified(encoded.encoding, self.device, output_dtype, among)
+        records = self.capabilities.qualified(encoded.scheme, self.device, output_dtype, among)
         offered = frozenset(provider.route for provider in among.values())
         if not records:
             return TensorCandidates(
@@ -743,13 +701,7 @@ class Selector:
                 output_dtype,
                 {},
                 tuple(geometry),
-                self.capabilities._why(
-                    encoded.encoding,
-                    self.device,
-                    output_dtype,
-                    self.aliases.get(encoded.encoding, "?"),
-                    among,
-                ),
+                self.capabilities._why(encoded.scheme, self.device, output_dtype, among),
                 offered,
             )
         best: dict[str, Selection] = {}
@@ -763,7 +715,7 @@ class Selector:
             Refusal(
                 provider.name,
                 self.capabilities.refusals.get(
-                    (encoded.encoding, digest, output_dtype), "no qualification record"
+                    (encoded.scheme, digest, output_dtype), "no qualification record"
                 ),
             )
             for digest, provider in among.items()
@@ -793,53 +745,28 @@ class Selector:
         return why
 
     def _refuse_unknown(self, key: str, encoded: Encoded) -> NoReturn:
-        alias = self.aliases.get(encoded.encoding)
-        if alias is None:
+        seam = NAMED_SEAMS.get(encoded.scheme)
+        if seam is None:
             raise refuse(
                 "unknown_encoding",
-                f"{key}: the checkpoint cites encoding {encoded.encoding} and this "
-                "runtime's registry does not contain that spec at all — the pinned "
-                "registry plus reader set IS this runtime's encoding capability, and "
-                "an unregistered encoding refuses before generation rather than being "
-                "guessed from the key or the carrier dtypes",
+                f"{key}: the checkpoint stores scheme {encoded.scheme!r} and this runtime decodes "
+                f"none of that name (it decodes {sorted(self.providers)})",
                 [key],
             )
-        seam = NAMED_SEAMS.get(alias)
-        if seam is None:
-            # #549.4's ARM. The alias is registered, this build's providers reviewed OTHER
-            # digests under it, and nothing here has read THESE bytes. Under the alias-keyed
-            # launch table this tensor would have been handed the sibling digest's decoder.
-            raise refuse(
-                "spec_unreviewed",
-                f"{key}: {alias} is a REGISTERED alias and this runtime reviewed no provider "
-                f"against spec {encoded.encoding[:30]}… in particular. An alias is a display "
-                "label the registry may file several physically different specs under — "
-                "`nvfp4-w4a4/1` files four — so a provider claims DIGESTS, and a digest it "
-                "never read acquires no decoder from a name it happens to share",
-                [key],
-            )
-        # A registered encoding whose provider is a NAMED, UNBUILT seam is a DEVICE
-        # CAPABILITY statement, not an unknown one.
         raise refuse(
             "encoding_unqualified",
-            f"{key}: {alias} is registered and this runtime has no provider for it on "
-            f"{device_line(self.device)}. The route that WOULD serve it is {seam[0]}: "
-            f"{seam[1]}. Named and not built — never silently served by a route it was "
-            "not qualified for.",
+            f"{key}: this runtime has no provider for {encoded.scheme} on "
+            f"{device_line(self.device)}; the route that would serve it is {seam[0]}: {seam[1]}",
             [key],
         )
 
     def select(
         self, key: str, encoded: Encoded, output_dtype: str, shape: Sequence[int] = ()
     ) -> Selection:
-        """ONE answer, for a caller that has already had a plan resolved for it.
-
-        `shape` defaults to the encoded `data` role's own shape when a caller has not got the
-        logical row to hand — every geometry law in this build is about the payload's two
-        outer dimensions, and the data role carries them.
-        """
+        """One answer, for a caller whose plan is already resolved. `shape` defaults to the
+        `weight` (or plain `value`) part's own."""
         if not shape:
-            data = next((p for p in encoded.parts if p.role in ("data", "value")), None)
+            data = next((p for p in encoded.parts if p.role in ("weight", "value")), None)
             shape = data.shape if data else ()
         found = self.candidates(key, encoded, output_dtype, shape)
         if not found.by_route:

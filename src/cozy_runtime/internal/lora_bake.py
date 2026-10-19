@@ -2,7 +2,7 @@
 
 A bake is decode -> add `alpha * up @ down` -> round back to the stored representation, one
 row chunk at a time, so nothing larger than a chunk exists twice. Plain floats round once to
-their dtype. `fp8-rowwise/1` re-encodes E4M3, `int8-convrot256/1` its int8 grid in the
+their dtype. `fp8.rowwise` re-encodes E4M3, `int8-convrot256/1` its int8 grid in the
 rotated basis; the rounding is chosen because a delta below half a grid step vanishes
 under nearest rounding. `Stats` is what a quality gate reads: how much of the delta survived
 and how much rounding error the bake added.
@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from types import ModuleType
 from typing import IO, TYPE_CHECKING, Literal
@@ -272,7 +273,7 @@ def bake_rowwise(
     generator: Generator | None = None,
     stats: Stats | None = None,
 ) -> None:
-    """Bake into `fp8-rowwise/1`: `data` `[out, in]` E4M3, `scale` one f32 per output row.
+    """Bake into `fp8.rowwise`: `data` `[out, in]` E4M3, `scale` one f32 per output row.
 
     The stored base sits exactly on its row's grid, so with `keep` (or a `refit` that barely
     moves the scale) nearest rounding returns every element whose delta is under half a
@@ -357,11 +358,15 @@ def _finish(torch: ModuleType, tensor: Tensor, stats: Stats | None, began: float
     stats.seconds += time.perf_counter() - began
 
 
-def bakeable(roles: dict[str, str]) -> bool:
-    """Whether a stored weight (role -> TensorFS dtype) takes `bake`."""
-    if set(roles) == {"value"}:
-        return roles["value"] in ("bf16", "f16", "f32")
-    return roles in ({"data": "i8", "scale": "f32"}, {"data": "f8_e4m3fn", "scale": "f32"})
+def bakeable(scheme: str, params: Mapping[str, object], roles: Mapping[str, str]) -> bool:
+    """Whether a stored weight (its scheme, params and role -> dtype) takes `bake`: a plain
+    float, a per-row `fp8.rowwise` E4M3 or an `int8.convrot` weight. `int8.rowwise` stores the
+    same parts as `int8.convrot` and is not rotated, so the scheme decides, not the parts."""
+    if scheme == "plain":
+        return dict(roles) in ({"value": "bf16"}, {"value": "f16"}, {"value": "f32"})
+    if scheme == "fp8.rowwise":
+        return params.get("axis") == 0 and dict(roles) == {"weight": "f8_e4m3fn", "scale": "f32"}
+    return scheme == "int8.convrot" and dict(roles) == {"weight": "i8", "scale": "f32"}
 
 
 def bake(
@@ -373,7 +378,7 @@ def bake(
     seed: int,
     stats: Stats | None = None,
 ) -> None:
-    """Bake `up @ down` into one stored weight by its roles: plain floats, `fp8-rowwise/1`
+    """Bake `up @ down` into one stored weight by its roles: plain floats, `fp8.rowwise`
     (E4M3 data, f32 row scale) or `int8-convrot256/1` (int8 data, f32 row scale). bf16, E4M3
     and int8 round stochastically, scales kept: nearest returns a small delta to where it was,
     and loses most of a LoRA's effect on fp8 (MEASURE.md, TensorD #26). `seed` names the
@@ -390,10 +395,10 @@ def bake(
         bake_plain(
             torch, weight, down, up, 1.0, rounding=rounding, generator=generator, stats=stats
         )
-    elif stored["data"].dtype == torch.int8:
+    elif stored["weight"].dtype == torch.int8:
         bake_int8_convrot(
             torch,
-            stored["data"],
+            stored["weight"],
             stored["scale"],
             down,
             up,
@@ -405,7 +410,7 @@ def bake(
     else:
         bake_rowwise(
             torch,
-            stored["data"],
+            stored["weight"],
             stored["scale"],
             down,
             up,
@@ -430,7 +435,7 @@ def accumulate(
 # ----------------------------------------------------------------------------- fused bake
 
 #: Stored forms the fused kernel bakes (`bakeable`): bf16 (stochastic), f16 and f32 (nearest),
-#: `fp8-rowwise/1` (E4M3, stochastic, scale kept), `int8-convrot256/1` (int8 of the rotated
+#: `fp8.rowwise` (E4M3, stochastic, scale kept), `int8-convrot256/1` (int8 of the rotated
 #: rows, stochastic, scale kept; `fused` rotates `down`).
 BF16, F16, F32, ROWWISE, INT8 = range(5)
 #: A seed is 31 bits: one Triton signature for every weight.
@@ -458,11 +463,11 @@ def fused(
     if "value" in stored:
         data = scale = stored["value"]
         kind = {torch.bfloat16: BF16, torch.float16: F16, torch.float32: F32}[data.dtype]
-    elif stored["data"].dtype == torch.int8:
-        data, scale, kind = stored["data"], stored["scale"].reshape(-1), INT8
+    elif stored["weight"].dtype == torch.int8:
+        data, scale, kind = stored["weight"], stored["scale"].reshape(-1), INT8
         down = rotate_factor(torch, down)
     else:
-        data, scale, kind = stored["data"].view(torch.uint8), stored["scale"].reshape(-1), ROWWISE
+        data, scale, kind = stored["weight"].view(torch.uint8), stored["scale"].reshape(-1), ROWWISE
     if not data.is_contiguous():
         raise ValueError("a fused bake writes a contiguous [out, in] weight")
     rows, cols = data.shape
@@ -532,7 +537,7 @@ def check(torch: ModuleType, device: Device) -> None:
     for kind in (BF16, F16, F32, ROWWISE):
         if kind == ROWWISE:
             data = torch.full((rows, cols), 0.5, device=device).to(torch.float8_e4m3fn)
-            stored = {"data": data, "scale": torch.full((rows,), 0.5, device=device)}
+            stored = {"weight": data, "scale": torch.full((rows,), 0.5, device=device)}
         else:
             dtype = (torch.bfloat16, torch.float16, torch.float32)[kind]
             stored = {"value": torch.full((rows, cols), 0.25, dtype=dtype, device=device)}
@@ -544,7 +549,7 @@ def check(torch: ModuleType, device: Device) -> None:
     # int8 of rotated rows: 2 + 24 * +-1/48 / 0.5 is 3 or 1 (the regular Hadamard keeps a
     # constant row), over partial row tiles and two inner steps.
     data = torch.full((rows, 256), 2, dtype=torch.int8, device=device)
-    stored = {"data": data, "scale": torch.full((rows,), 0.5, device=device)}
+    stored = {"weight": data, "scale": torch.full((rows,), 0.5, device=device)}
     fused(torch, stored, torch.ones((rank, 256), device=device), up * (32 / 48), INT8)
     want = torch.tensor([3, 1], device=device).repeat(rows // 2)[:, None].expand(rows, 256)
     if not torch.equal(data.long(), want):

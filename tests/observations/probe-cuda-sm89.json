@@ -15,7 +15,7 @@
   {
    "delivery_route": "decoded_float",
    "device_predicate": "cuda.sm89",
-   "encoding_spec_id": "sha256:5fb5ffc9e387cd1e54fb9877058294f6965fdc0e504ab8799ac310d90f3fe489",
+   "scheme": "sha256:5fb5ffc9e387cd1e54fb9877058294f6965fdc0e504ab8799ac310d90f3fe489",
    "evidence": {
     "kind": "decode",
     "micro_bench": {
@@ -66,7 +66,7 @@
   {
    "delivery_route": "decoded_float",
    "device_predicate": "cuda.sm89",
-   "encoding_spec_id": "sha256:5fb5ffc9e387cd1e54fb9877058294f6965fdc0e504ab8799ac310d90f3fe489",
+   "scheme": "sha256:5fb5ffc9e387cd1e54fb9877058294f6965fdc0e504ab8799ac310d90f3fe489",
    "evidence": {
     "kind": "decode",
     "micro_bench": {
@@ -117,7 +117,7 @@
   {
    "delivery_route": "decoded_float",
    "device_predicate": "cuda.sm89",
-   "encoding_spec_id": "sha256:5fb5ffc9e387cd1e54fb9877058294f6965fdc0e504ab8799ac310d90f3fe489",
+   "scheme": "sha256:5fb5ffc9e387cd1e54fb9877058294f6965fdc0e504ab8799ac310d90f3fe489",
    "evidence": {
     "kind": "decode",
     "micro_bench": {
@@ -168,7 +168,7 @@
   {
    "delivery_route": "verbatim",
    "device_predicate": "cuda.sm89",
-   "encoding_spec_id": "sha256:71409d585d82c513f364ac730d2f573f0261828c4700ce653333a758d15e14bd",
+   "scheme": "sha256:71409d585d82c513f364ac730d2f573f0261828c4700ce653333a758d15e14bd",
    "evidence": {
     "kind": "verbatim",
     "note": "no decode: the stored bytes ARE the logical bytes, and the fill plane's source-comparison proves them byte for byte",
@@ -187,7 +187,7 @@
   {
    "delivery_route": "verbatim",
    "device_predicate": "cuda.sm89",
-   "encoding_spec_id": "sha256:71409d585d82c513f364ac730d2f573f0261828c4700ce653333a758d15e14bd",
+   "scheme": "sha256:71409d585d82c513f364ac730d2f573f0261828c4700ce653333a758d15e14bd",
    "evidence": {
     "kind": "verbatim",
     "note": "no decode: the stored bytes ARE the logical bytes, and the fill plane's source-comparison proves them byte for byte",
@@ -206,7 +206,7 @@
   {
    "delivery_route": "verbatim",
    "device_predicate": "cuda.sm89",
-   "encoding_spec_id": "sha256:71409d585d82c513f364ac730d2f573f0261828c4700ce653333a758d15e14bd",
+   "scheme": "sha256:71409d585d82c513f364ac730d2f573f0261828c4700ce653333a758d15e14bd",
    "evidence": {
     "kind": "verbatim",
     "note": "no decode: the stored bytes ARE the logical bytes, and the fill plane's source-comparison proves them byte for byte",
@@ -225,7 +225,7 @@
   {
    "delivery_route": "decoded_float",
    "device_predicate": "cuda.sm89",
-   "encoding_spec_id": "sha256:796a50ed4d63e0b7cfc70a8cd797a5fe796bba64cb3143de4d35f059653f5d80",
+   "scheme": "sha256:796a50ed4d63e0b7cfc70a8cd797a5fe796bba64cb3143de4d35f059653f5d80",
    "evidence": {
     "kind": "decode",
     "micro_bench": {
@@ -292,7 +292,7 @@
   {
    "delivery_route": "decoded_float",
    "device_predicate": "cuda.sm89",
-   "encoding_spec_id": "sha256:796a50ed4d63e0b7cfc70a8cd797a5fe796bba64cb3143de4d35f059653f5d80",
+   "scheme": "sha256:796a50ed4d63e0b7cfc70a8cd797a5fe796bba64cb3143de4d35f059653f5d80",
    "evidence": {
     "kind": "decode",
     "micro_bench": {
@@ -349,7 +349,7 @@
   {
    "delivery_route": "decoded_float",
    "device_predicate": "cuda.sm89",
-   "encoding_spec_id": "sha256:796a50ed4d63e0b7cfc70a8cd797a5fe796bba64cb3143de4d35f059653f5d80",
+   "scheme": "sha256:796a50ed4d63e0b7cfc70a8cd797a5fe796bba64cb3143de4d35f059653f5d80",
    "evidence": {
     "kind": "decode",
     "micro_bench": {
@@ -416,7 +416,7 @@
   {
    "delivery_route": "encoded_gemm",
    "device_predicate": "cuda.sm89",
-   "encoding_spec_id": "sha256:796a50ed4d63e0b7cfc70a8cd797a5fe796bba64cb3143de4d35f059653f5d80",
+   "scheme": "sha256:796a50ed4d63e0b7cfc70a8cd797a5fe796bba64cb3143de4d35f059653f5d80",
    "evidence": {
     "kind": "unmeasured",
     "note": "cozy.mxfp8.native-leaf/1 declares the floor cuda.sm120 and this device is cuda.sm89; its suite is not run and it mints no record",
@@ -435,7 +435,7 @@
   {
    "delivery_route": "encoded_gemm",
    "device_predicate": "cuda.sm89",
-   "encoding_spec_id": "sha256:796a50ed4d63e0b7cfc70a8cd797a5fe796bba64cb3143de4d35f059653f5d80",
+   "scheme": "sha256:796a50ed4d63e0b7cfc70a8cd797a5fe796bba64cb3143de4d35f059653f5d80",
    "evidence": {
     "kind": "unmeasured",
     "note": "cozy.mxfp8.native-leaf/1 declares the floor cuda.sm120 and this device is cuda.sm89; its suite is not run and it mints no record",
@@ -454,7 +454,7 @@
   {
    "delivery_route": "encoded_gemm",
    "device_predicate": "cuda.sm89",
-   "encoding_spec_id": "sha256:796a50ed4d63e0b7cfc70a8cd797a5fe796bba64cb3143de4d35f059653f5d80",
+   "scheme": "sha256:796a50ed4d63e0b7cfc70a8cd797a5fe796bba64cb3143de4d35f059653f5d80",
    "evidence": {
     "kind": "unmeasured",
     "note": "cozy.mxfp8.native-leaf/1 declares the floor cuda.sm120 and this device is cuda.sm89; its suite is not run and it mints no record",
@@ -473,7 +473,7 @@
   {
    "delivery_route": "decoded_float",
    "device_predicate": "cuda.sm89",
-   "encoding_spec_id": "sha256:8c86b26daec5bcd287401d9873b70aa3594855f97ac4d01cf75cc2bafd5d50b5",
+   "scheme": "sha256:8c86b26daec5bcd287401d9873b70aa3594855f97ac4d01cf75cc2bafd5d50b5",
    "evidence": {
     "kind": "decode",
     "micro_bench": {
@@ -540,7 +540,7 @@
   {
    "delivery_route": "decoded_float",
    "device_predicate": "cuda.sm89",
-   "encoding_spec_id": "sha256:8c86b26daec5bcd287401d9873b70aa3594855f97ac4d01cf75cc2bafd5d50b5",
+   "scheme": "sha256:8c86b26daec5bcd287401d9873b70aa3594855f97ac4d01cf75cc2bafd5d50b5",
    "evidence": {
     "kind": "decode",
     "micro_bench": {
@@ -597,7 +597,7 @@
   {
    "delivery_route": "decoded_float",
    "device_predicate": "cuda.sm89",
-   "encoding_spec_id": "sha256:8c86b26daec5bcd287401d9873b70aa3594855f97ac4d01cf75cc2bafd5d50b5",
+   "scheme": "sha256:8c86b26daec5bcd287401d9873b70aa3594855f97ac4d01cf75cc2bafd5d50b5",
    "evidence": {
     "kind": "decode",
     "micro_bench": {
@@ -664,7 +664,7 @@
   {
    "delivery_route": "encoded_gemm",
    "device_predicate": "cuda.sm89",
-   "encoding_spec_id": "sha256:8c86b26daec5bcd287401d9873b70aa3594855f97ac4d01cf75cc2bafd5d50b5",
+   "scheme": "sha256:8c86b26daec5bcd287401d9873b70aa3594855f97ac4d01cf75cc2bafd5d50b5",
    "evidence": {
     "kind": "native",
     "micro_bench": {
@@ -707,7 +707,7 @@
   {
    "delivery_route": "encoded_gemm",
    "device_predicate": "cuda.sm89",
-   "encoding_spec_id": "sha256:8c86b26daec5bcd287401d9873b70aa3594855f97ac4d01cf75cc2bafd5d50b5",
+   "scheme": "sha256:8c86b26daec5bcd287401d9873b70aa3594855f97ac4d01cf75cc2bafd5d50b5",
    "evidence": {
     "kind": "native",
     "numerics": {
@@ -739,7 +739,7 @@
   {
    "delivery_route": "encoded_gemm",
    "device_predicate": "cuda.sm89",
-   "encoding_spec_id": "sha256:8c86b26daec5bcd287401d9873b70aa3594855f97ac4d01cf75cc2bafd5d50b5",
+   "scheme": "sha256:8c86b26daec5bcd287401d9873b70aa3594855f97ac4d01cf75cc2bafd5d50b5",
    "evidence": {
     "kind": "native",
     "numerics": {
@@ -763,7 +763,7 @@
   {
    "delivery_route": "decoded_float",
    "device_predicate": "cuda.sm89",
-   "encoding_spec_id": "sha256:91ddc2a73ba2778b344afc5e78b4addee9174a015cfff02f17cfbb629ad5ef78",
+   "scheme": "sha256:91ddc2a73ba2778b344afc5e78b4addee9174a015cfff02f17cfbb629ad5ef78",
    "evidence": {
     "kind": "decode",
     "micro_bench": {
@@ -830,7 +830,7 @@
   {
    "delivery_route": "decoded_float",
    "device_predicate": "cuda.sm89",
-   "encoding_spec_id": "sha256:91ddc2a73ba2778b344afc5e78b4addee9174a015cfff02f17cfbb629ad5ef78",
+   "scheme": "sha256:91ddc2a73ba2778b344afc5e78b4addee9174a015cfff02f17cfbb629ad5ef78",
    "evidence": {
     "kind": "decode",
     "micro_bench": {
@@ -887,7 +887,7 @@
   {
    "delivery_route": "decoded_float",
    "device_predicate": "cuda.sm89",
-   "encoding_spec_id": "sha256:91ddc2a73ba2778b344afc5e78b4addee9174a015cfff02f17cfbb629ad5ef78",
+   "scheme": "sha256:91ddc2a73ba2778b344afc5e78b4addee9174a015cfff02f17cfbb629ad5ef78",
    "evidence": {
     "kind": "decode",
     "micro_bench": {
@@ -954,7 +954,7 @@
   {
    "delivery_route": "encoded_gemm",
    "device_predicate": "cuda.sm89",
-   "encoding_spec_id": "sha256:91ddc2a73ba2778b344afc5e78b4addee9174a015cfff02f17cfbb629ad5ef78",
+   "scheme": "sha256:91ddc2a73ba2778b344afc5e78b4addee9174a015cfff02f17cfbb629ad5ef78",
    "evidence": {
     "kind": "native",
     "micro_bench": {
@@ -997,7 +997,7 @@
   {
    "delivery_route": "encoded_gemm",
    "device_predicate": "cuda.sm89",
-   "encoding_spec_id": "sha256:91ddc2a73ba2778b344afc5e78b4addee9174a015cfff02f17cfbb629ad5ef78",
+   "scheme": "sha256:91ddc2a73ba2778b344afc5e78b4addee9174a015cfff02f17cfbb629ad5ef78",
    "evidence": {
     "kind": "native",
     "numerics": {
@@ -1029,7 +1029,7 @@
   {
    "delivery_route": "encoded_gemm",
    "device_predicate": "cuda.sm89",
-   "encoding_spec_id": "sha256:91ddc2a73ba2778b344afc5e78b4addee9174a015cfff02f17cfbb629ad5ef78",
+   "scheme": "sha256:91ddc2a73ba2778b344afc5e78b4addee9174a015cfff02f17cfbb629ad5ef78",
    "evidence": {
     "kind": "native",
     "numerics": {
@@ -1053,7 +1053,7 @@
   {
    "delivery_route": "decoded_float",
    "device_predicate": "cuda.sm89",
-   "encoding_spec_id": "sha256:c3f4ff643d6ce6cce6843d2cddd756b1e9fe91b8b6294e51a48b3339c42e7a7f",
+   "scheme": "sha256:c3f4ff643d6ce6cce6843d2cddd756b1e9fe91b8b6294e51a48b3339c42e7a7f",
    "evidence": {
     "kind": "decode",
     "micro_bench": {
@@ -1104,7 +1104,7 @@
   {
    "delivery_route": "decoded_float",
    "device_predicate": "cuda.sm89",
-   "encoding_spec_id": "sha256:c3f4ff643d6ce6cce6843d2cddd756b1e9fe91b8b6294e51a48b3339c42e7a7f",
+   "scheme": "sha256:c3f4ff643d6ce6cce6843d2cddd756b1e9fe91b8b6294e51a48b3339c42e7a7f",
    "evidence": {
     "kind": "decode",
     "micro_bench": {
@@ -1155,7 +1155,7 @@
   {
    "delivery_route": "decoded_float",
    "device_predicate": "cuda.sm89",
-   "encoding_spec_id": "sha256:c3f4ff643d6ce6cce6843d2cddd756b1e9fe91b8b6294e51a48b3339c42e7a7f",
+   "scheme": "sha256:c3f4ff643d6ce6cce6843d2cddd756b1e9fe91b8b6294e51a48b3339c42e7a7f",
    "evidence": {
     "kind": "decode",
     "micro_bench": {

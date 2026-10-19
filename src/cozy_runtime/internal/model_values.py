@@ -1,80 +1,71 @@
-"""Bounded CPU value reconstruction through the existing reviewed decode providers."""
+"""Bounded CPU value reconstruction of a source's tensors, through the serving decoders."""
 
 from __future__ import annotations
 
 import math
-from typing import Any
-
-from tensorfs.derived import SourceCapability, SourceInspection
+from types import ModuleType
 
 from cozy_runtime.author._errors import CapabilityError
-from cozy_runtime.internal.encoding.formats import (
-    SPEC_PLAIN,
-    SPEC_ROWWISE,
-    SPEC_ROWWISE_KEEPDIM,
-    RowwiseDequant,
-)
+from cozy_runtime.internal.encoding.formats import RowwiseDequant, params_of
+from cozy_runtime.tensord_channels import Source
 
 _ELEMENTS = 1 << 22
+_FLOATS = {"F32": "float32", "F16": "float16", "BF16": "bfloat16"}
+_WIDTHS = {"F32": 4, "F16": 2, "BF16": 2}
+#: (scheme, weight dtype) -> its torch element, for the per-row schemes a window reads.
+_ROWWISE = {
+    ("fp8.rowwise", "F8_E4M3"): "float8_e4m3fn",
+    ("fp8.rowwise", "F8_E5M2"): "float8_e5m2",
+    ("int8.rowwise", "I8"): "int8",
+}
 
 
-def _part(source: Any, component: str, key: str, role: str, offset: int, length: int) -> bytearray:
+def _part(
+    source: Source, component: str, key: str, role: str, offset: int, length: int
+) -> bytearray:
     data = bytearray(length)
-    source.read_part_into(component, key, role, offset, memoryview(data))
+    source.read_into(component, key, role, offset, memoryview(data))
     return data
 
 
 def read_values_into(
-    source: SourceCapability,
-    structure: SourceInspection,
-    component: str,
-    key: str,
-    offset: int,
-    into: memoryview,
+    torch: ModuleType, source: Source, component: str, key: str, offset: int, into: memoryview
 ) -> None:
-    import numpy as np
-
-    from cozy_runtime.derive.safetensors_io import to_f32
-
-    tensor = structure.components.get(component, {}).get(key)
+    """Elements `offset..` of a plain float or per-row (`fp8.rowwise`, `int8.rowwise`) tensor,
+    as f32."""
+    tensor = source.checkpoint.tensors.get(component, {}).get(key)
     count = into.nbytes // 4
     if tensor is None:
         raise CapabilityError("model tensor is absent", code="weights_reader_tensor")
     if offset < 0 or offset + count > math.prod(tensor.shape):
         raise CapabilityError("logical read leaves the tensor", code="weights_reader_bounds")
-    destination = np.frombuffer(into, dtype=np.float32)
-    if tensor.encoding == SPEC_PLAIN:
-        size = {"f32": 4, "f16": 2, "bf16": 2}.get(tensor.logical_dtype)
-        if size is None:
-            raise CapabilityError(
-                "logical dtype is not a supported float", code="weights_reader_encoding"
-            )
-        if set(tensor.parts) != {"value"}:
-            raise CapabilityError("plain tensor roles differ", code="weights_reader_encoding")
+    target = torch.frombuffer(into, dtype=torch.float32)
+    if tensor.encoding is None:
+        name = _FLOATS.get(tensor.dtype)
+        if name is None:
+            raise CapabilityError("logical dtype is not a float", code="weights_reader_encoding")
+        dtype = getattr(torch, name)
+        size = torch.empty((), dtype=dtype).element_size()
         for start in range(0, count, _ELEMENTS):
             length = min(_ELEMENTS, count - start)
-            raw = _part(source, component, key, "value", (offset + start) * size, length * size)
-            destination[start : start + length] = to_f32(
-                raw, tensor.logical_dtype.upper(), [length]
-            )
+            raw = _part(source, component, key, "", (offset + start) * size, length * size)
+            target[start : start + length].copy_(torch.frombuffer(raw, dtype=dtype))
         return
-    if tensor.encoding not in {SPEC_ROWWISE, SPEC_ROWWISE_KEEPDIM}:
+    params = dict(tensor.encoding.params)
+    stored = tensor.parts.get("weight")
+    element = _ROWWISE.get((tensor.encoding.scheme, stored.dtype if stored else ""))
+    if (
+        element is None
+        or params.get("axis") != 0
+        or params.get("scale_dtype") not in _WIDTHS
+        or len(tensor.shape) != 2
+    ):
         raise CapabilityError(
-            "encoding has no reviewed model reader", code="weights_reader_encoding"
+            f"no model reader for {tensor.encoding.scheme} {params}", code="weights_reader_encoding"
         )
-    if len(tensor.shape) != 2 or set(tensor.parts) != {"data", "scale"}:
-        raise CapabilityError("encoded tensor geometry differs", code="weights_reader_encoding")
-    try:
-        import torch
-    except ImportError:
-        raise CapabilityError(
-            "encoded model reads require Torch in the callable environment",
-            code="weights_reader_decoder_unavailable",
-        ) from None
-    provider = RowwiseDequant(tensor.encoding)
-    if provider.supports(tuple(tensor.shape)):
-        raise CapabilityError("encoding geometry is not reviewed", code="weights_reader_encoding")
-    target = torch.from_numpy(destination)
+    provider = RowwiseDequant(tensor.encoding.scheme, params=params_of(params))
+    scale_dtype = str(params.get("scale_dtype"))
+    scale_width, scale_element = _WIDTHS[scale_dtype], getattr(torch, _FLOATS[scale_dtype])
     columns = tensor.shape[1]
     consumed = 0
     while consumed < count:
@@ -84,16 +75,15 @@ def read_values_into(
         whole_rows = min(remaining // columns, _ELEMENTS // columns) if column == 0 else 0
         rows = max(whole_rows, 1)
         width = columns if whole_rows else min(remaining, columns - column, _ELEMENTS)
-        payload = _part(source, component, key, "data", position, rows * width)
-        scale = _part(source, component, key, "scale", row * 4, rows * 4)
-        data_tensor = (
-            torch.frombuffer(payload, dtype=torch.uint8)
-            .view(torch.float8_e4m3fn)
-            .reshape(rows, width)
+        payload = _part(source, component, key, "weight", position, rows * width)
+        scale = _part(source, component, key, "scale", row * scale_width, rows * scale_width)
+        weight = torch.frombuffer(payload, dtype=torch.uint8).view(getattr(torch, element))
+        provider.decode(
+            torch,
+            {
+                "weight": weight.reshape(rows, width),
+                "scale": torch.frombuffer(scale, dtype=scale_element).reshape(rows),
+            },
+            target[consumed : consumed + rows * width].reshape(rows, width),
         )
-        scale_tensor = torch.frombuffer(scale, dtype=torch.float32).reshape(rows)
-        output = target[consumed : consumed + rows * width].reshape(rows, width)
-        # Arithmetic and special values are the serving decoder's, selected by exact
-        # reviewed spec digest. Only the bounded source-range slicing is new here.
-        provider.decode(torch, {"data": data_tensor, "scale": scale_tensor}, output)
         consumed += rows * width
