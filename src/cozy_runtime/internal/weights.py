@@ -30,7 +30,6 @@ from tensorfs.varena.torch import (
     Unbound,
     WeightGrant,
     blocks_of,
-    regions_of,
 )
 
 from cozy_runtime.author._loader import Census, TensorLike, TensorSpec, _members
@@ -122,6 +121,8 @@ class Backend:
         self.models: dict[str, Model] = {}
         self.bakes: dict[str, _Bakes] = {}
         self.derived: dict[str, dict[tuple[Module, str], Tensor]] = {}
+        #: each bound component's grant from TensorD, asked once (`ahead`); its fds are ours
+        self.grants: dict[str, WeightGrant] = {}
         self.stats: dict[str, float] = {}
         self.device_facts = device_facts
         self.providers = launch_providers()
@@ -258,6 +259,14 @@ class Backend:
     def bound(self) -> frozenset[str]:
         """The components the binding selects; the construction's others stay on meta."""
         return frozenset(self.checkpoints)
+
+    def ahead(self) -> None:
+        """Before the factory runs, each bound component's grant. A held host tier is adopted
+        now and its copies to the GPU run while the module is built (memory-varena §5.4)."""
+        started = time.perf_counter()
+        for name in self.checkpoints:
+            self._granted(name)
+        self.stats["ahead_ms"] = round((time.perf_counter() - started) * 1000, 2)
 
     def expect(self, sets: Mapping[str, Sequence[str]]) -> None:
         """Completeness sets: a destination the census never reaches refuses the commit."""
@@ -411,6 +420,7 @@ class Backend:
             keys = [key for key in order if self.plan[key].component == name]
             if keys:
                 self.models[name] = self._register(name, root, keys)
+        self._release()
         if self.device.type == "cuda" and any(b.bakes for b in self.bakes.values()):
             lora_bake.warm(self.device.index or 0)  # its kernels build at load, in a child
         self.stats["register_ms"] = round((time.perf_counter() - started) * 1000, 2)
@@ -422,6 +432,7 @@ class Backend:
         self.state = "poisoned"
 
     def close(self) -> None:
+        self._release()
         for model in self.models.values():
             model.close()
         self.models.clear()
@@ -436,36 +447,60 @@ class Backend:
         routes, its LoRAs baked on page-in, its bytes from TensorD's grant: the host layout
         deposited for it, else the chunk files, which varena seals and the layout goes to
         TensorD for the next load."""
-        checkpoint = self.checkpoints[name]
         rows = {self.plan[key].name: self.plan[key] for key in keys}
         bakes = self.bakes[name] = _Bakes(self.torch, root, rows, set(blocks_of(root)))
-        grant = WeightGrant(checkpoint.ck, name, checkpoint.manifest_id, keys=tuple(rows))
-        declared = Declared(  # `_cozy_state`: what the package's forward changes
+        grant = replace(self._granted(name), keys=tuple(rows))
+        vars(root)["_varena"] = Declared(  # `_cozy_state`: what the package's forward changes
             grant,
             state=tuple(getattr(root, "_cozy_state", ())),
             fill=bakes if bakes.bakes else None,
             bind=_Routes(self, rows),
         )
-        vars(root)["_varena"] = declared
-        layout = canonical.digest({"manifest": grant.manifest, "regions": regions_of(root)})
-        fd: int | None = None
-        files: list[tuple[str, int, int]] = []
-        objects = self._objects(checkpoint)
-        if self.grant is not None:
-            fd, files = self.grant(grant.manifest, layout, objects)
-            granted = replace(grant, host_fd=fd, files=tuple(files))
-            vars(root)["_varena"] = replace(declared, weights=granted)
         try:
             model = self.memory.load(root)
         finally:
-            for held in ([] if fd is None else [fd]) + [f for _, _, f in files]:
-                os.close(held)
+            _close(self.grants.pop(name))
         for _, sealed in self.memory.sealed():
             if self.deposit is not None:
-                self.deposit(grant.manifest, f"{self.construction}/{name}", layout, objects, sealed)
+                objects = self._objects(self.checkpoints[name])
+                label = f"{self.construction}/{name}"
+                self.deposit(grant.manifest, label, self._layout(name), objects, sealed)
             else:
                 os.close(sealed)
         return model
+
+    def _layout(self, name: str) -> str:
+        """What a component's host tier is deposited and granted under: its manifest, the
+        construction (release, model class, components, custody) and its name. Known before the
+        module exists; a held tier of other regions is a miss (`Memory.load`)."""
+        return canonical.digest(
+            {
+                "manifest": self.checkpoints[name].manifest_id,
+                "construction": self.execution.construction.document(),
+                "component": name,
+            }
+        )
+
+    def _granted(self, name: str) -> WeightGrant:
+        """A component's grant, asked of TensorD once: its sealed host tier, adopted at once
+        and copying to the GPU, else its chunk files."""
+        grant = self.grants.get(name)
+        if grant is None:
+            checkpoint = self.checkpoints[name]
+            grant = WeightGrant(checkpoint.ck, name, checkpoint.manifest_id)
+            if self.grant is not None:
+                objects = self._objects(checkpoint)
+                fd, files = self.grant(grant.manifest, self._layout(name), objects)
+                grant = replace(grant, host_fd=fd, files=tuple(files))
+            self.grants[name] = grant
+            self.memory.adopt(grant)
+        return grant
+
+    def _release(self) -> None:
+        """Grants no registration took, and what `ahead` adopted for them."""
+        for name in list(self.grants):
+            _close(self.grants.pop(name))
+        self.memory.unclaimed()
 
     def _objects(self, checkpoint: Checkpoint) -> list[tuple[str, int]]:
         """Every chunk of the manifest's selected components, `(sha256, length)` in sha256
@@ -536,6 +571,11 @@ class Backend:
 
 
 # ----------------------------------------------------------------- routes and LoRA bakes
+
+
+def _close(grant: WeightGrant) -> None:
+    for fd in ([] if grant.host_fd is None else [grant.host_fd]) + [f for _, _, f in grant.files]:
+        os.close(fd)
 
 
 class _Routes:
