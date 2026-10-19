@@ -27,6 +27,8 @@ from cozy_runtime.internal.resolution import PlanRefusal, ResolvedModelPlan
 HEADER = "model.cozytensors"
 #: TensorD's `ModelSource` name for a checkpoint's manifest (its file list); `""` is its header.
 LISTING = "."
+#: A Diffusers pipeline's component list: when present, its components are the config sections.
+MODEL_INDEX = "model_index.json"
 
 
 class _Listing(msgspec.Struct):
@@ -286,13 +288,25 @@ class Checkpoint:
             ]
         return out
 
+    def sections(self) -> frozenset[str]:
+        """The folders whose config constructs: `model_index.json`'s components (scheduler and
+        tokenizers included) when the checkpoint has one, else the header's components and
+        `scheduler`. Any other folder's config (`vae_1_0/config.json`) is only a file."""
+        if MODEL_INDEX in self.files:
+            index = msgspec.json.decode(self.file(MODEL_INDEX), type=dict[str, object])
+            return frozenset(name for name in index if not name.startswith("_"))
+        return frozenset({*self.ck.tensors, "scheduler"})
+
     def configs(self) -> dict[str, bytes]:
-        """Construction configs by component: `<component>/config.json` (or a scheduler's
+        """Construction configs by section: `<section>/config.json` (or a scheduler's
         `scheduler_config.json`), and a root `config.json` as `model`."""
+        sections = self.sections()
         found: dict[str, bytes] = {}
         for path in self.files:
             folder, _, name = path.rpartition("/")
-            if name in ("config.json", "scheduler_config.json") and "/" not in folder:
+            if name in ("config.json", "scheduler_config.json") and (
+                not folder or folder in sections
+            ):
                 found[folder or "model"] = self.file(path)
         return found
 

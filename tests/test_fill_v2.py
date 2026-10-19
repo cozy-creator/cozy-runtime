@@ -50,6 +50,7 @@ def _store(root: Path) -> tuple[tensorfs.Store, Checkpoint]:
     writer.file("tokenizer/vocab.json", b'{"a": 0}')
     writer.file("tokenizer/merges.txt", b"#version: 0.2\na b\n")
     writer.file("assets/palette.bin", bytes(range(256)))
+    writer.file("vae_1_0/config.json", b'{"stray": true}')
     return store, Checkpoint.from_store(store, f"sha256:{writer.commit().sha256}")
 
 
@@ -86,7 +87,7 @@ def test_an_executor_gets_every_manifest_file_through_model_source(tmp_path: Pat
     try:
         granted = Executor(Channel(left), tmp_path)._checkpoint(ck.manifest_id)
         stored = {path: ck.file(path) for path in ck.files if path != HEADER}
-        assert granted.files == ck.files and len(stored) == 5
+        assert granted.files == ck.files and len(stored) == 6
         assert granted.model_assets() == stored
         assert (
             granted.configs()
@@ -108,7 +109,9 @@ def test_an_executor_gets_every_manifest_file_through_model_source(tmp_path: Pat
 
 def test_configs_come_from_files_and_the_fit_judges_the_census(tmp_path: Path) -> None:
     _, ck = _store(tmp_path)
+    # `vae_1_0` is no header component: its config is a file, not a section.
     assert ck.configs() == {"unet": b'{"in": 4}', "scheduler": b'{"steps": 2}'}
+    assert "vae_1_0/config.json" in ck.model_assets()
     assert (
         model_config.construction_config(ck.configs())
         == b'{"scheduler":{"steps":2},"unet":{"in":4}}'
@@ -138,6 +141,25 @@ def test_configs_come_from_files_and_the_fit_judges_the_census(tmp_path: Path) -
     assert fit([TensorRequirement("text", "x", (1,))], ck, encoded_leaves=True)["code"] == (
         "component_missing"
     )
+
+
+def test_a_model_index_names_the_config_sections(tmp_path: Path) -> None:
+    """With a `model_index.json`, its components are the sections: a header component it does
+    not list, and a folder it does not list, are files only."""
+    store = tensorfs.Store(tmp_path)
+    writer = store.writer()
+    writer.put("unet", "w", "F32", [2], np.ones(2, np.float32))
+    writer.put("vae", "w", "F32", [2], np.ones(2, np.float32))
+    index = b'{"_class_name": "P", "scheduler": [], "tokenizer": [], "unet": []}'
+    writer.file("model_index.json", index)
+    writer.file("unet/config.json", b'{"in": 4}')
+    writer.file("vae/config.json", b'{"z": 4}')
+    writer.file("vae_1_0/config.json", b'{"stray": true}')
+    writer.file("scheduler/scheduler_config.json", b'{"steps": 2}')
+    writer.file("tokenizer/vocab.json", b"{}")
+    ck = Checkpoint.from_store(store, f"sha256:{writer.commit().sha256}")
+    assert ck.sections() == {"scheduler", "tokenizer", "unet"}
+    assert ck.configs() == {"unet": b'{"in": 4}', "scheduler": b'{"steps": 2}'}
 
 
 def test_fetch_plans_name_each_tensors_chunks(tmp_path: Path) -> None:
