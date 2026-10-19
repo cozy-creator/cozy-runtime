@@ -263,46 +263,14 @@ def _eps(torch: Any, dtype: Any) -> float:
 
 
 def _numerics(torch: Any, provider: Provider, device: Any, dtype: Any) -> Sweep:
-    """Decode all 256 e4m3 patterns at a known scale and compare to the oracle.
-
-    The tolerance is DERIVED, not chosen: the route casts the element to the destination
-    dtype and multiplies by the scale in that dtype, so two roundings are the whole error
-    budget. A decoder that adds anything of its own fails here.
-    """
-    scale_value = 0.013671875  # exactly representable in f16/bf16/f32: 7 * 2^-9
-    patterns = bytes(range(256))
-    data = torch.frombuffer(bytearray(patterns), dtype=torch.uint8).view(torch.float8_e4m3fn)
-    data = data.reshape(16, 16).to(device)
-    weight_scale = torch.tensor(scale_value, dtype=torch.float32, device=device)
+    """All 256 E4M3 patterns under one f32 scale: the decode is `round_L(weight × scale)`, the
+    scale entering exactly, so it must equal the f64 product cast once into the dtype."""
+    data = torch.frombuffer(bytearray(bytes(range(256))), dtype=torch.uint8)
+    data = data.view(torch.float8_e4m3fn).reshape(16, 16)
+    scale = torch.tensor(0.0123, dtype=torch.float32)
     destination = torch.empty(16, 16, dtype=dtype, device=device)
-    provider.decode(torch, {"weight": data, "scale": weight_scale}, destination)
-    got = destination.reshape(-1).cpu().double().tolist()
-    return _grade_scaled(_eps(torch, dtype), got, scale_value)
-
-
-def _grade_scaled(eps: float, got: Sequence[float], scale_value: float) -> Sweep:
-    """Grade the 256 decoded patterns: NaN stays NaN, zero stays exactly zero, and every
-    other value is within two roundings relative. A non-finite error never passes."""
-    worst_rel, worst_abs, nan_ok = 0.0, 0.0, True
-    for byte, have in enumerate(got):
-        want = e4m3_value(byte) * scale_value
-        if math.isnan(want):
-            nan_ok = nan_ok and math.isnan(have)
-            continue
-        error = abs(have - want)
-        worst_abs = worst(worst_abs, error)
-        worst_rel = worst(
-            worst_rel, error / abs(want) if want else (0.0 if error == 0 else math.inf)
-        )
-    bound = 2.0 * eps
-    return Sweep(
-        patterns=len(got),
-        max_abs_error=worst_abs,
-        max_rel_error=worst_rel,
-        tolerance=bound,
-        nan_preserved=nan_ok,
-        passed=within(worst_rel, bound) and nan_ok,
-    )
+    provider.decode(torch, {"weight": data.to(device), "scale": scale.to(device)}, destination)
+    return _exact_sweep(torch, destination.cpu(), data.double() * scale.double(), dtype)
 
 
 def _numerics_rowwise(torch: Any, provider: Provider, device: Any, dtype: Any) -> Sweep:
@@ -415,14 +383,13 @@ def _numerics_int8_rowwise(
 def _numerics_int8_tensorwise(
     torch: ModuleType, provider: Provider, device: Tensor, dtype: Tensor
 ) -> Sweep:
-    """Every int8 value under one f32 scale that each dtype rounds differently: the decode is
-    `round_L(weight × s)` with `s` the scale rounded to the dtype, exact in f64 before the cast."""
+    """Every int8 value under one f32 scale: the decode is `round_L(weight × scale)`, the scale
+    entering exactly, so it must equal the f64 product cast once into the dtype."""
     data = (torch.arange(256) - 128).to(torch.int8).reshape(16, 16)
     scale = torch.tensor(0.0123, dtype=torch.float32)
-    rounded = scale.to(dtype).double()
     destination = torch.empty(16, 16, dtype=dtype, device=device)
     provider.decode(torch, {"weight": data.to(device), "scale": scale.to(device)}, destination)
-    return _exact_sweep(torch, destination.cpu(), data.double() * rounded, dtype)
+    return _exact_sweep(torch, destination.cpu(), data.double() * scale.double(), dtype)
 
 
 def _numerics_mxfp8(torch: ModuleType, provider: Provider, device: Tensor, dtype: Tensor) -> Sweep:
@@ -1047,6 +1014,8 @@ def qualify(
 #: The params a suite's synthetic operands are written with: the producers' own (ModelOpt's
 #: layouts). The spec's conformance cases cover the other layouts.
 PROBE_PARAMS: dict[str, dict[str, object]] = {
+    "fp8.tensorwise": {"scale_dtype": "F32"},
+    "int8.tensorwise": {"scale_dtype": "F32"},
     "fp8.rowwise": {"axis": 0},
     "int8.rowwise": {"axis": 0},
     "int8.convrot": {"rotation": "hadamard", "rotation_size": 256},

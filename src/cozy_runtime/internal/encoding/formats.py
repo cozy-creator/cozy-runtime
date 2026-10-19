@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from types import ModuleType
 from typing import Any, Protocol, runtime_checkable
 
+from cozy_runtime.author._loader import TENSORFS_DTYPES as _TENSORFS_DTYPES
 from cozy_runtime.author._loader import TORCH_DTYPES as _TORCH_DTYPES
 
 # `Any` below is a torch module, tensor, dtype or nn.Module: torch is absent from the check venv.
@@ -121,6 +122,8 @@ SCALE_LAYOUTS = ("row_major", "cublas_128x4")
 NIBBLE_ORDERS = ("low_first", "high_first")
 #: nvfp4's second level: `scale_2` multiplies (ModelOpt) or divides (compressed-tensors).
 GLOBAL_SCALES = ("multiply", "divide")
+#: A tensorwise scale's stored dtype: it enters the decode as it is.
+SCALE_DTYPES = ("F32", "BF16", "F16")
 
 
 def matrix(shape: Sequence[int]) -> tuple[int, int]:
@@ -188,6 +191,7 @@ def part_rule(encoded: Encoded, shape: Sequence[int], dtype: str) -> str:
     rows, cols = matrix(shape)
     params = dict(encoded.params)
     axis, layout = params.get("axis"), params.get("scale_layout")
+    tensorwise = frozenset({_TENSORFS_DTYPES.get(str(params.get("scale_dtype")), "")})
     rules: dict[str, tuple[frozenset[str], int | tuple[int, ...]]] = {
         "fp8.rowwise": {
             "weight": (_F8, tuple(shape)),
@@ -203,12 +207,12 @@ def part_rule(encoded: Encoded, shape: Sequence[int], dtype: str) -> str:
         },
         "fp8.tensorwise": {
             "weight": (_F8, tuple(shape)),
-            "scale": (frozenset({"f32"}), 1),
+            "scale": (tensorwise, 1),
             "input_scale": (frozenset({"f32"}), 1),
         },
         "int8.tensorwise": {
             "weight": (frozenset({"i8"}), tuple(shape)),
-            "scale": (frozenset({"f32"}), 1),
+            "scale": (tensorwise, 1),
             "input_scale": (frozenset({"f32"}), 1),
         },
         "int8.convrot": {
@@ -388,13 +392,9 @@ class Verbatim:
 
 @dataclass(frozen=True, slots=True)
 class TensorwiseDequant:
-    """`fp8.tensorwise` and `int8.tensorwise` -> float: `weight × s`, `s` the scale rounded to
-    the destination dtype.
-
-    `input_scale` is the activation scale of a quantized matmul and never enters the weight. The
-    multiply in the destination dtype is the spec's rounding (and halves the scratch): an E4M3,
-    E5M2 or int8 element times `s` is exact in f32 before that one rounding.
-    """
+    """`fp8.tensorwise` and `int8.tensorwise` -> float: `round_L(weight × scale)`, the scale in
+    the dtype its producer stored (`scale_dtype`), never rounded on the way in. `input_scale`
+    is the activation scale of a quantized matmul and never enters the weight."""
 
     encoding: str = "fp8.tensorwise"
     params: Params = ()
@@ -419,7 +419,7 @@ class TensorwiseDequant:
 
     @property
     def code_revision(self) -> str:
-        return "1"
+        return "2"
 
     @property
     def suite(self) -> str:
@@ -436,11 +436,16 @@ class TensorwiseDequant:
         return frozenset({"input_scale"})
 
     def supports(self, shape: Sequence[int], params: Mapping[str, object]) -> str:
-        return _params(params, {})
+        return _params(params, {"scale_dtype": SCALE_DTYPES})
 
     def decode(self, torch: ModuleType, parts: Mapping[str, Tensor], destination: Tensor) -> None:
-        destination.copy_(parts["weight"].view(destination.shape).to(destination.dtype))
-        destination.mul_(parts["scale"].to(destination.dtype).reshape(()))
+        flat = destination.view(-1)
+        payload = parts["weight"].view(-1)
+        scale = parts["scale"].to(torch.float32).reshape(())
+        stride = max(1, _CHUNK_BYTES // 4)
+        for start in range(0, flat.numel(), stride):
+            block = payload[start : start + stride].to(torch.float32).mul_(scale)
+            flat[start : start + stride].copy_(block)
 
 
 #: E4M3's largest finite magnitude. The cast to `float8_e4m3fn` does not saturate (449 becomes
