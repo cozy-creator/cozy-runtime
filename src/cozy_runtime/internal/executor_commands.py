@@ -89,6 +89,13 @@ class KeepWeights(Command, frozen=True, kw_only=True, tag="keep_weights"):
     construction: str
 
 
+class RequestMemory(Command, frozen=True, kw_only=True, tag="request_memory"):
+    construction: str
+    request_id: str
+    phase: Literal["begin", "plan", "end"]
+    steps: tuple[tuple[str, ...], ...] = ()
+
+
 class Activate(Command, frozen=True, kw_only=True, tag="activate"):
     construction: str
     authorized_device_limit_bytes: int | UnsetType = UNSET
@@ -323,6 +330,7 @@ type KnownCommand = (
     | Map
     | Unload
     | KeepWeights
+    | RequestMemory
     | Activate
     | Attention
     | Start
