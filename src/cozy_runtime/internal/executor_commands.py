@@ -25,7 +25,7 @@ class Command(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True, tag
     """One worker command; `cmd` names it."""
 
 
-class TensorFSOptions(msgspec.Struct, frozen=True, kw_only=True):
+class TensorFSOptions(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
     """Ordinary endpoint settings and an already supplied bearer credential."""
 
     endpoint: str

@@ -64,8 +64,7 @@ MAX_FRAME = DOC_MAX_BYTES
 #: exactly how many header bytes to collect before it commits to anything.
 HEADER = struct.Struct("!I")
 
-#: Key names that must never appear in a frame, at any depth. Credentials stop at the
-#: worker (§3.1); the executor cannot leak what it was never handed.
+#: Secret field names outside the explicitly supplied TensorFS command options.
 SECRET_KEYS = frozenset({"token", "credential", "authorization", "secret", "jwt"})
 
 #: The attempt-spool file the executor writes its serialized typed result into: the bytes
@@ -128,7 +127,9 @@ class Channel:
     sending: threading.RLock = field(default_factory=threading.RLock, repr=False, compare=False)
 
     def send(self, message: dict[str, Any]) -> None:
-        _scan(message, supplied_tensorfs=message.get("cmd") in {"load", "invoke"})
+        command = message.get("cmd")
+        supplied = isinstance(command, str) and command in {"load", "invoke"}
+        _scan(message, supplied_tensorfs=supplied)
         data = json.dumps(message, separators=(",", ":"), sort_keys=True).encode()
         if len(data) > MAX_FRAME:
             self.refusals.append("frame_too_large")
