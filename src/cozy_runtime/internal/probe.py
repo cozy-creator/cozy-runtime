@@ -266,7 +266,7 @@ def _eps(torch: Any, dtype: Any) -> float:
 
 
 def _numerics(torch: Any, provider: Provider, device: Any, dtype: Any) -> Sweep:
-    """All 256 E4M3 patterns under one f32 scale: the decode is `round_L(weight × scale)`, the
+    """All 256 E4M3 patterns under one f32 scale: the decode is `round_L(weight * scale)`, the
     scale entering exactly, so it must equal the f64 product cast once into the dtype."""
     data = torch.frombuffer(bytearray(bytes(range(256))), dtype=torch.uint8)
     data = data.view(torch.float8_e4m3fn).reshape(16, 16)
@@ -386,7 +386,7 @@ def _numerics_int8_rowwise(
 def _numerics_int8_tensorwise(
     torch: ModuleType, provider: Provider, device: Tensor, dtype: Tensor
 ) -> Sweep:
-    """Every int8 value under one f32 scale: the decode is `round_L(weight × scale)`, the scale
+    """Every int8 value under one f32 scale: the decode is `round_L(weight * scale)`, the scale
     entering exactly, so it must equal the f64 product cast once into the dtype."""
     data = (torch.arange(256) - 128).to(torch.int8).reshape(16, 16)
     scale = torch.tensor(0.0123, dtype=torch.float32)

@@ -28,7 +28,9 @@ from cozy_runtime.internal.decode_cores import (
 )
 
 if TYPE_CHECKING:
-    from torch import Generator, Tensor, device as Device, dtype as Dtype
+    from torch import Generator, Tensor
+    from torch import device as Device
+    from torch import dtype as Dtype
 
 try:
     import triton

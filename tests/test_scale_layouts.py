@@ -96,7 +96,7 @@ CASES = [
 
 @pytest.mark.parametrize("case", CASES, ids=lambda c: f"{c.encoding.scheme}-{c.key}")
 @pytest.mark.parametrize(
-    "layout", LAYOUTS, ids=lambda l: "+".join(f"{k}={v}" for k, v in l.items())
+    "layout", LAYOUTS, ids=lambda layout: "+".join(f"{k}={v}" for k, v in layout.items())
 )
 def test_a_relaid_case_decodes_to_the_reference_bytes(
     case: VectorCase, layout: dict[str, object]
