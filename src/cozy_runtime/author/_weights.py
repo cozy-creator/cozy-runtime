@@ -11,15 +11,15 @@ from cozy_runtime.author._errors import CapabilityError, ConformanceError
 from cozy_runtime.author._model import Model
 
 if TYPE_CHECKING:
-    from cozy_runtime.tensord_channels import Info, Source
+    from cozy_runtime.weights_store import Checkpoint, Info
 
 MAX_WEIGHTS_OUTPUTS = 16
 MAX_WEIGHTS_SOURCE_READ = 64 << 20
 MAX_WEIGHTS_NEW_BYTES = (1 << 53) - 1
 _OUTPUT_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
-_MANIFEST = re.compile(r"^sha256:[0-9a-f]{64}$")
+_REF = re.compile(r"^sha256:[0-9a-f]{64}$")
 
-ReadValues = Callable[["Source", str, str, int, memoryview], None]
+ReadValues = Callable[["Checkpoint", str, str, int, memoryview], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,21 +58,21 @@ class Weights[M: Model[Any]]:
     __slots__ = ("_open", "_source", "_values", "checkpoint_ref")
 
     def __init__(self, checkpoint_ref: str) -> None:
-        if _MANIFEST.fullmatch(checkpoint_ref) is None:
+        if _REF.fullmatch(checkpoint_ref) is None:
             raise ConformanceError(
-                "Weights requires one canonical sha256 manifest identity",
-                code="weights_manifest_invalid",
+                "Weights requires one checkpoint's header ref (sha256:<hex>)",
+                code="weights_ref_invalid",
             )
         self.checkpoint_ref = checkpoint_ref
-        self._open: Callable[[], Source] | None = None
+        self._open: Callable[[], Checkpoint] | None = None
         self._values: ReadValues | None = None
-        self._source: Source | None = None
+        self._source: Checkpoint | None = None
 
-    def _bind(self, open: Callable[[], Source] | None, values: ReadValues | None) -> None:
+    def _bind(self, open: Callable[[], Checkpoint] | None, values: ReadValues | None) -> None:
         """Runtime: this attempt's source access; `_bind(None, None)` ends it."""
         self._open, self._values, self._source = open, values, None
 
-    def _view(self) -> Source:
+    def _view(self) -> Checkpoint:
         if self._source is None:
             if self._open is None:
                 raise CapabilityError(
@@ -83,26 +83,44 @@ class Weights[M: Model[Any]]:
         return self._source
 
     def components(self) -> tuple[str, ...]:
-        return tuple(self._view().checkpoint.tensors)
+        """The components that hold tensors, in header order."""
+        return tuple(name for name, held in self._view().components.items() if held.tensors)
 
     def keys(self, component: str) -> tuple[str, ...]:
         """The component's tensors in construction order."""
-        rows = tuple(self._view().checkpoint.tensors.get(component, {}))
-        if not rows:
+        held = self._view().components.get(component)
+        if held is None or not held.tensors:
             raise CapabilityError("model component is absent", code="weights_reader_tensor")
-        return rows
+        return tuple(held.tensors)
 
     def tensor(self, component: str, key: str) -> Info:
         """The tensor's logical dtype and shape, its encoding and stored parts."""
         try:
-            return self._view().checkpoint.tensors[component][key]
+            return self._view().components[component].tensors[key]
         except KeyError:
             raise CapabilityError("model tensor is absent", code="weights_reader_tensor") from None
 
     def read_into(self, component: str, key: str, role: str, offset: int, into: Any) -> None:
         """Stored bytes of one part (`""`: a plain tensor's), at most MAX_WEIGHTS_SOURCE_READ
         per call."""
-        self._view().read_into(component, key, role, offset, into)
+        try:
+            target = memoryview(into)
+        except TypeError:
+            raise CapabilityError(
+                "model read needs a writable buffer", code="weights_reader_buffer"
+            ) from None
+        if (
+            target.readonly
+            or not target.c_contiguous
+            or not 0 < target.nbytes <= MAX_WEIGHTS_SOURCE_READ
+        ):
+            raise CapabilityError("model read buffer is invalid", code="weights_reader_buffer")
+        part = self.tensor(component, key).parts.get(role)
+        if part is None:
+            raise CapabilityError("model tensor part is absent", code="weights_reader_tensor")
+        if type(offset) is not int or offset < 0 or offset + target.nbytes > part.length:
+            raise CapabilityError("model read leaves the tensor part", code="weights_reader_bounds")
+        self._view().components[component].tensors.read_into(key, target, role=role, offset=offset)
 
     def read_values_into(self, component: str, key: str, offset: int, into: Any) -> None:
         """Decode a flat logical element range into a contiguous writable float32 buffer."""

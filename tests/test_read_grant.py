@@ -1,7 +1,4 @@
-"""An executor's `ReadGrant` against TensorD's own answers (`tensord_peer.answer_read_grants`,
-field for field as `Callbacks::read_grant` sends them): a held layout is the one descriptor,
-mapped as it is with no chunk list (D9's refill); chunk files come named by their list's digest;
-any other list is refused."""
+"""Kept layouts and GPU descriptors cross the seam; cold bytes open through TensorFS."""
 
 from __future__ import annotations
 
@@ -17,31 +14,31 @@ import numpy as np
 import pytest
 import tensorfs
 
-from cozy_runtime.author._errors import RuntimeFailure
 from cozy_runtime.internal.executor import Executor
+from cozy_runtime.internal.fill import Checkpoint
 from cozy_runtime.internal.seam import Channel, sealed
 from tensord_peer import answer_read_grants
 
 
 @pytest.fixture
-def checkpoint(tmp_path: Path) -> tuple[tensorfs.Store, str, list[tuple[str, int]]]:
-    store = tensorfs.Store(tmp_path / "store")
-    writer = store.writer()
-    writer.put("dit", "a.weight", "F32", [20 << 18], np.arange(20 << 18, dtype=np.float32))
-    writer.put("vae", "b.weight", "F16", [8, 4], np.ones((8, 4), np.float16))
-    manifest = f"sha256:{writer.commit().sha256}"
-    return store, manifest, sorted(store.checkpoint(manifest).chunks)
+def checkpoint(tmp_path: Path) -> tuple[Checkpoint, str, list[tuple[str, int]]]:
+    writer = tensorfs.Writer(cache_dir=tmp_path / "store")
+    writer.component("dit", cls="", config={}).put(
+        "a.weight", np.arange(20 << 18, dtype=np.float32), dtype="F32", shape=[20 << 18]
+    )
+    writer.component("vae", cls="", config={}).put(
+        "b.weight", np.ones((8, 4), np.float16), dtype="F16", shape=[8, 4]
+    )
+    ck = writer.commit()
+    assert ck.id is not None
+    return Checkpoint(ck), ck.id, sorted(ck.chunks)
 
 
 @contextmanager
-def grants(
-    tmp_path: Path, store: tensorfs.Store, deposited: dict[str, int]
-) -> Iterator[tuple[Executor, list[str]]]:
+def grants(tmp_path: Path, deposited: dict[str, int]) -> Iterator[tuple[Executor, list[str]]]:
     left, right = socket.socketpair()
     asked: list[str] = []
-    serving = threading.Thread(
-        target=answer_read_grants, args=(Channel(right), store, deposited, asked)
-    )
+    serving = threading.Thread(target=answer_read_grants, args=(Channel(right), deposited, asked))
     serving.start()
     try:
         yield Executor(Channel(left), tmp_path), asked
@@ -52,11 +49,13 @@ def grants(
 
 
 def test_a_held_layout_is_the_one_descriptor_mapped_as_it_is(tmp_path: Path, checkpoint) -> None:
-    store, manifest, objects = checkpoint
+    ck, manifest, objects = checkpoint
     layout = sealed("layout", b"a host layout varena sealed in another executor")
     try:
-        with grants(tmp_path, store, {"sha256:held": layout}) as (executor, asked):
-            fd, files, pages, _ = executor._read_grant(manifest, "sha256:held", objects)
+        with grants(tmp_path, {"sha256:held": layout}) as (executor, asked):
+            fd, files, pages, _ = executor._read_grant(
+                manifest, "sha256:held", objects, checkpoints={manifest: ck}
+            )
             assert files == [] == pages and fd is not None and asked == ["sha256:held"]
             assert os.pread(fd, 64, 0) == b"a host layout varena sealed in another executor"
             os.close(fd)
@@ -67,34 +66,36 @@ def test_a_held_layout_is_the_one_descriptor_mapped_as_it_is(tmp_path: Path, che
 def test_chunk_files_come_in_sha256_order_named_by_their_lists_digest(
     tmp_path: Path, checkpoint
 ) -> None:
-    store, manifest, objects = checkpoint
-    with grants(tmp_path, store, {}) as (executor, _):
-        fd, files, _, _ = executor._read_grant(manifest, "sha256:cold", objects)
+    ck, manifest, objects = checkpoint
+    with grants(tmp_path, {}) as (executor, _):
+        fd, files, _, _ = executor._read_grant(
+            manifest, "sha256:cold", objects, checkpoints={manifest: ck}
+        )
         assert fd is None and [(sha, n) for sha, n, _ in files] == objects
         for _, n, file in files:
             assert os.fstat(file).st_size == n
             os.close(file)
 
 
-def test_a_grant_of_another_chunk_list_is_refused(tmp_path: Path, checkpoint) -> None:
-    store, manifest, objects = checkpoint
-    with grants(tmp_path, store, {}) as (executor, _):
-        with pytest.raises(RuntimeFailure, match="a different list") as refused:
-            executor._read_grant(manifest, "sha256:cold", objects[:-1])
-        assert refused.value.code == "weights_ungranted"
+def test_an_object_outside_the_checkpoint_cannot_be_opened(tmp_path: Path, checkpoint) -> None:
+    ck, manifest, _ = checkpoint
+    with grants(tmp_path, {}) as (executor, _), pytest.raises(KeyError):
+        executor._read_grant(manifest, "sha256:cold", [("0" * 64, 1)], checkpoints={manifest: ck})
 
 
 def test_a_held_layout_carries_kept_regions_and_their_fingerprint(
     tmp_path: Path, checkpoint
 ) -> None:
-    _, manifest, objects = checkpoint
+    ck, manifest, objects = checkpoint
     layout = sealed("layout", b"held layout")
     page = sealed("kept-page", b"opaque page capability")
     left, right = socket.socketpair()
     executor, peer = Executor(Channel(left), tmp_path), Channel(right)
     try:
         with ThreadPoolExecutor(max_workers=1) as pool:
-            received = pool.submit(executor._read_grant, manifest, "held", objects)
+            received = pool.submit(
+                executor._read_grant, manifest, "held", objects, checkpoints={manifest: ck}
+            )
             frame = peer.recv()
             assert frame is not None and frame["kind"] == "read_grant"
             peer.send(

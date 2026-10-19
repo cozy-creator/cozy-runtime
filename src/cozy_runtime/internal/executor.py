@@ -38,6 +38,7 @@ code changed are reported in `env_changed` rather than silently ignored.
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import contextvars
 import ctypes
@@ -67,7 +68,7 @@ import msgspec
 from msgspec import UNSET, UnsetType
 
 from cozy_runtime import __version__ as RUNTIME_VERSION
-from cozy_runtime import graphs
+from cozy_runtime import graphs, weights_store
 from cozy_runtime.author import _split, describe
 from cozy_runtime.author._activity import ThreadPoolExecutor, own_thread
 from cozy_runtime.author._app import Registration
@@ -93,19 +94,17 @@ from cozy_runtime.author._errors import (
 )
 from cozy_runtime.author._executor_requests import (
     Answer,
+    CheckpointItem,
     ChildEvents,
     Deposit,
     Exchange,
-    FetchChannel,
     Granted,
     Handoff,
     KeepPages,
-    ModelSource,
     Page,
     Published,
     ReadGrant,
     Request,
-    SourceBytes,
     Tier,
 )
 from cozy_runtime.author._executor_requests import encode as encode_request
@@ -141,7 +140,6 @@ from cozy_runtime.internal import (
     effect_interfaces,
     execution_evidence,
     executor_commands,
-    fetch_plan,
     fp8_linear,
     int8_linear,
     kernel_cache,
@@ -181,6 +179,7 @@ from cozy_runtime.internal.executor_commands import (
     Release,
     Shutdown,
     Start,
+    TensorFSOptions,
     Unload,
 )
 from cozy_runtime.internal.executor_replies import Copy as ReplyCopy
@@ -194,6 +193,7 @@ from cozy_runtime.internal.fill import (
     FillRefusal,
     dtype_name,
     normalized,
+    store_refusals,
     tensor_schema_of,
 )
 from cozy_runtime.internal.lora_composition import bind as bind_adapters
@@ -225,8 +225,6 @@ from cozy_runtime.internal.seam import (
     SeamError,
     connect,
 )
-from cozy_runtime.internal.weights_writer import ExecutionStorage
-from cozy_runtime.tensord_channels import Source
 
 if sys.platform == "win32":
     from ctypes import wintypes
@@ -382,6 +380,40 @@ def _held(
         yield functools.partial(_cancelled, mux, root, request_id)
     finally:
         waits.stage(f"waiting for {waiter} compile", (time.perf_counter() - started) * 1000)
+
+
+def _connection(options: TensorFSOptions | None) -> weights_store.Connection | None:
+    if options is None:
+        return None
+    try:
+        ca_der = None if options.ca_der is None else base64.b64decode(options.ca_der, validate=True)
+    except ValueError as exc:
+        raise InvalidRequest("TensorFS CA is not base64 DER", code="tensorfs_config") from exc
+    return weights_store.Connection(options.endpoint, options.token, ca_der)
+
+
+def _replay_code(command: Invoke, request: str) -> str:
+    """The code and request a weights output derives from: the attempt's operation and resolved
+    request (`request`, its digest), with its file inputs and precision; without an operation,
+    its run, so only its own attempts resume it."""
+    if not command.operation:
+        return command.request_id
+    files = sorted([name, row.digest, row.length] for name, row in command.inputs.items())
+    asked = {"request": request, "files": files, "bits": command.bits}
+    return f"{command.operation}\0{hashlib.sha256(canonical.write(asked)).hexdigest()}"
+
+
+def _show_checkpoint(
+    exchange: Exchange, slot: str, repo_id: str, revision: str, variant: str
+) -> None:
+    """A weights output's checkpoint as the run's checkpoint item (`CheckpointItem`)."""
+    item = CheckpointItem(output=slot, repo_id=repo_id, revision=revision, variant=variant)
+    answer = exchange(item, Answer)
+    if not answer.ok:
+        raise RuntimeFailure(
+            answer.detail or "the machine refused the checkpoint item",
+            code=answer.code or "runtime_failure",
+        )
 
 
 @dataclasses.dataclass(slots=True)
@@ -662,7 +694,7 @@ class _OnDemand:
 
 
 #: The requests rank 0 relays to the machine for a follower (`_relay`).
-_RELAYED = frozenset({"read_grant", "model_source", "keep_pages"})
+_RELAYED = frozenset({"read_grant", "keep_pages"})
 
 #: The runtime modules a construction imports, named ONCE so `start` can warm
 #: exactly the set `_prepare_first` re-imports (cr-104). Warming a name this tuple omits
@@ -735,7 +767,6 @@ class Executor:
         #: their fetch channel opens and closes under
         self.mux: Mux = host.mux if host is not None else Mux(channel)
         self.in_flight: _InFlight = host.in_flight if host is not None else _InFlight()
-        self._fetching = threading.Lock()
         #: this process's CUDA context and first library launches, measured at device init
         #: from this process's own driver row (-1: not attributable)
         self.device_context = -1
@@ -751,14 +782,8 @@ class Executor:
         #: follower holds its own), and the machine's memory mode
         self.ledgers: list[int] = []
         self.memory_mode = "shared"
-        #: HOST ONLY, rank 0: what this process asks TensorFS to fetch, when and in what order
-        self.fetch = (
-            fetch_plan.Fetches(self._fetch_channel, self._fetch_progress)
-            if host is None and rank == 0
-            else None
-        )
-        #: HOST ONLY: each `Weights[M]` slot's declared components, by `<fn>.models.<param>`
-        self.source_components: dict[str, tuple[str, ...]] = {}
+        #: The machine's sealed TensorFS cache directory.
+        self.store: Path | None = None
         #: HOST ONLY: the constructed slots built on first use (`on_demand=`), by the same path
         self.on_demand: frozenset[str] = frozenset()
         self.active = ""
@@ -1555,12 +1580,6 @@ class Executor:
                 "code": "sequence_parallel_unsupported",
                 "detail": "a group runs constructed models",
             }
-        self.source_components = {
-            slot.path: slot.components
-            for entry in interface.entrypoints
-            for slot in entry.models
-            if slot.weights and isinstance(slot.components, tuple)
-        }
         # A group's GPUs construct in lockstep at its load: it builds every model there.
         self.on_demand = frozenset(
             slot.path
@@ -1568,13 +1587,6 @@ class Executor:
             for slot in entry.models
             if slot.on_demand and degree == 1
         )
-        eager = [row for row in command.constructions if row.path not in self.on_demand]
-        if self.fetch is not None and eager and not command.import_only:
-            # The Start pass, before torch and the package: the imports, kernel compiles
-            # and warmup run while the weights download. Never in an import-only parent: a
-            # channel's reader thread would leave it unforkable.
-            self.fetch.begin()
-            self.fetch.schedule(fetch_plan.at_start(eager, lambda m: self._checkpoint(m).ck))
         started = time.perf_counter()
         stages: list[tuple[str, float]] = []
         _mark = [started]
@@ -1942,8 +1954,6 @@ class Executor:
             loaded._bind_parameters(command)
             return self._load_reply(key, loaded, reused=True)
         child = self._construction_child(key)
-        if self.fetch is not None:
-            self.fetch.begin()  # the Load pass replaces the Start pass
         try:
             reply = child._prepare_first(command)
         except Exception:
@@ -2399,11 +2409,10 @@ class Executor:
         )
         vmap = reference.snapshot_map()
         host = self.host
-        # One Checkpoint per manifest, its header and files read through TensorD
-        # (`ModelSource`; a follower asks through rank 0): SDXL's four components share one.
+        # One checkpoint per header ref, through the public TensorFS API.
         opened: dict[str, Checkpoint] = {}
         for manifest in {vmap.get(name, reference.snapshot) for name in names}:
-            opened[manifest] = host._checkpoint(manifest)
+            opened[manifest] = host._checkpoint(manifest, _connection(command.tensorfs))
         checkpoints = {name: opened[vmap.get(name, reference.snapshot)] for name in names}
         # `names` is what the DERIVE constructed (model-code-fit D9), not what the header
         # carries: a constructed component the checkpoint lacks is the fit's own
@@ -2448,10 +2457,10 @@ class Executor:
             (
                 checkpoint
                 for checkpoint in checkpoints.values()
-                if checkpoint.manifest_id == reference.snapshot
+                if checkpoint.id == reference.snapshot
             ),
             None,
-        ) or host._checkpoint(reference.snapshot)
+        ) or host._checkpoint(reference.snapshot, _connection(command.tensorfs))
         config_bytes = model_config.construction_config(config_checkpoint.configs())
         config_document = canonical.parse_canonical(config_bytes)
         if not isinstance(config_document, dict):
@@ -2547,7 +2556,10 @@ class Executor:
             qualified=qualified_pair,
             device_facts=device_facts,
             custody=binding.custody,
-            grant=self._read_grant,
+            grant=functools.partial(
+                self._read_grant,
+                checkpoints={checkpoint.id: checkpoint for checkpoint in opened.values()},
+            ),
             deposit=self._deposit,
             keeper=self._keep_pages,
         )
@@ -2586,16 +2598,17 @@ class Executor:
             reference.snapshot,
             tensor_schema_of(rows),
             Config(config_document, "model.config"),
-            assets=config_checkpoint.model_assets(),
+            assets=config_checkpoint.assets(),
             # CUSTODY is a BINDING fact: canonical refuses a serve-time extra key, local
             # tiers it (§1.1).
             custody=binding.custody,
             unnormalized=normalized(config_checkpoint),
         )
         adapter_graphs = [
-            (checkpoint.manifest_id, checkpoint.file(model_config.ADAPTERS))
-            for checkpoint in checkpoints.values()
-            if model_config.ADAPTERS in checkpoint.files
+            (checkpoint.id, checkpoint.asset(component, model_config.ADAPTERS))
+            for checkpoint in {c.id: c for c in checkpoints.values()}.values()
+            for component, held in checkpoint.ck.components.items()
+            if model_config.ADAPTERS in held.assets
         ]
         if adapter_graphs:
             manifest, data = adapter_graphs[0]
@@ -2696,7 +2709,7 @@ class Executor:
                 for name in present
             },
             assets={
-                "assets": {path: config_checkpoint.file(path) for path in config_checkpoint.files},
+                "assets": config_checkpoint.asset_digests(),
                 "configs": config_checkpoint.configs(),
             },
             plan_rows=({**row.identity(), "component": row.component} for row in plan.tensors),
@@ -3129,16 +3142,6 @@ class Executor:
         self._plan_fetch(target)
         return target.prepare_request(command)
 
-    def _plan_fetch(self, target: Executor) -> None:
-        """The calls' fetch channel, opened by the first that finds none: every fetch stays
-        owned by a live call. The last attempt out closes it."""
-        if self.fetch is None:
-            return
-        with self._fetching:
-            if self.fetch.open:
-                return
-            self.fetch.begin()
-
     def serve_invoke(self, command: Invoke) -> dict[str, Any]:
         target = self._target(command, attempt=True)
         if isinstance(target, dict):
@@ -3150,25 +3153,17 @@ class Executor:
             or bool(requested and target._attention_reaches(requested))
         )
         with self.in_flight.attempt(alone) as slot:
-            try:
-                # Admitted only now: an attempt before it may have poisoned the generation. Its
-                # record is taken once nothing can refuse it, so a refused call may come again.
-                refused = target._unadmitted(command) or self._grant(
-                    target, command, first=slot.first
-                )
-                if not alone:
-                    self.in_flight.ready()
-                if refused is not None:
-                    return refused
-                prepared = target.prepared.pop(command.request_id, None)
-                if prepared is None:  # trimmed by a prepare meanwhile
-                    return target._unadmitted(command) or {}
-                self._plan_fetch(target)
-                reply = target.invoke(command, prepared, slot)
-            finally:
-                if self.fetch is not None and (slot.last or self.in_flight.count == 1):
-                    with self._fetching:
-                        self.fetch.end()
+            # Admitted only now: an attempt before it may have poisoned the generation. Its
+            # record is taken once nothing can refuse it, so a refused call may come again.
+            refused = target._unadmitted(command) or self._grant(target, command, first=slot.first)
+            if not alone:
+                self.in_flight.ready()
+            if refused is not None:
+                return refused
+            prepared = target.prepared.pop(command.request_id, None)
+            if prepared is None:  # trimmed by a prepare meanwhile
+                return target._unadmitted(command) or {}
+            reply = target.invoke(command, prepared, slot)
         self.attempts += 1
         self.poisoned = self.poisoned or target.poisoned
         reply["poisoned"] = self.poisoned
@@ -3375,7 +3370,21 @@ class Executor:
             name: RawWeights(manifest) for name, manifest in command.sources.items()
         }
         exchange = self._exchange(command.request_id)
-        storage = ExecutionStorage(spool, exchange, command.weights)
+        connection = _connection(command.tensorfs)
+        outputs = (
+            weights_store.Outputs(
+                self._store(),
+                request_id=command.request_id,
+                actor=command.actor,
+                code=_replay_code(command, prepared.overlay.digest),
+                bounds=command.weights,
+                show=functools.partial(_show_checkpoint, exchange),
+                destination=command.destination,
+                connection=connection,
+            )
+            if command.weights
+            else None
+        )
         stage_memo.ENGINE.open(exchange, spool)
         warnings: list[WarningRow] = []
         request: Any = None
@@ -3424,9 +3433,17 @@ class Executor:
                             max_output_bytes=command.max_output_bytes,
                             sources=sources,
                             weights_values=functools.partial(read_values_into, self.torch),
-                            tensorfs_source=self._sources(storage, command) if sources else None,
-                            tensorfs_output=storage.open_output if command.weights else None,
-                            tensorfs_adopt=storage.adopt_model if command.weights else None,
+                            tensorfs_source=(
+                                functools.partial(
+                                    weights_store.open_checkpoint,
+                                    self._store(),
+                                    connection=connection,
+                                )
+                                if sources
+                                else None
+                            ),
+                            tensorfs_output=outputs.open if outputs is not None else None,
+                            tensorfs_adopt=outputs.adopt if outputs is not None else None,
                             publish=lambda request: exchange(request, Published),
                             calls=self.host._call_broker(
                                 command.request_id, self.host.call_interfaces
@@ -3524,9 +3541,11 @@ class Executor:
         if last:
             self._keep_weights()
             if self.group is not None:
-                replies = self.group.call(executor_commands.encode(
-                    executor_commands.KeepWeights(construction=self.construction)
-                ))
+                replies = self.group.call(
+                    executor_commands.encode(
+                        executor_commands.KeepWeights(construction=self.construction)
+                    )
+                )
                 if any(not reply.get("ok") for reply in replies):
                     self.poisoned = "a follower could not keep its completed weight pages"
         released_us = execution_evidence.now_us()
@@ -4108,70 +4127,18 @@ class Executor:
             bindings.setdefault(key, effect_interfaces.unserved(export))
         return bindings
 
-    def _fetch_channel(self) -> int:
-        """A fresh fetch channel for the running call (`FetchChannel`); -1: none given."""
-        answer = self._durable(FetchChannel(), Handoff)
-        return answer.descriptor if answer.ok and answer.descriptor >= 0 else -1
-
-    def _fetch_progress(self, line: str, fraction: float) -> None:
-        """A wait on weights not here yet, told to the machine as the running request's stage."""
-        with contextlib.suppress(SeamError):
-            self.channel.send(
-                {"event": "progress", "request_id": _CALL.get(), "kind": "progress", "stage": line}
-                | {"stage_fraction": fraction, "advance": 0}
-            )
-
-    def _sources(self, storage: ExecutionStorage, command: Invoke) -> Callable[[str], Source]:
-        """The attempt's `Weights[M]` sources, each wanting its declared components ahead of
-        its reads on the attempt's fetch channel."""
-        host = self.host
-        declared: dict[str, tuple[str, ...]] = {}
-        for param, manifest in command.sources.items():
-            path = f"{command.entrypoint}.models.{param}"
-            declared[manifest] = (
-                *declared.get(manifest, ()),
-                *host.source_components.get(path, ()),
-            )
-
-        def opened(manifest: str) -> Source:
-            source = storage.source(manifest)
-            if host.fetch is None or not host.fetch.available():
-                return source
-            return fetch_plan.source(host.fetch, source, declared.get(manifest, ()))
-
-        return opened
-
-    def _model_source(self, manifest: str, name: str) -> bytes:
-        """One model file from the machine (`ModelSource`): the header (`name` empty), the
-        manifest (`fill.LISTING`) or one of its files, checked against the length stated."""
-        answer = self._durable(ModelSource(manifest=manifest, name=name), SourceBytes)
-        if not (answer.ok and answer.held and answer.descriptor >= 0):
-            raise RuntimeError(
-                f"the machine served no {name or 'header'} of {manifest[:23]}: "
-                f"{answer.code} {answer.detail}"
-            )
-        try:
-            body = bytearray()
-            os.lseek(answer.descriptor, 0, os.SEEK_SET)
-            while len(body) < answer.length:
-                chunk = os.read(answer.descriptor, answer.length - len(body))
-                if not chunk:
-                    break
-                body += chunk
-        finally:
-            os.close(answer.descriptor)
-        # A sealed memfd from the machine, which verified the bytes: the length is the check.
-        if len(body) != answer.length:
-            raise RuntimeError(f"{name or 'header'} of {manifest[:23]} is short")
-        return bytes(body)
-
     def _keep_weights(self) -> None:
         for member in self.model_executors or [self]:
             if member.backend is not None:
                 member.backend.keep()
 
     def _read_grant(
-        self, manifest: str, layout: str, objects: list[tuple[str, int]]
+        self,
+        manifest: str,
+        layout: str,
+        objects: list[tuple[str, int]],
+        *,
+        checkpoints: Mapping[str, Checkpoint],
     ) -> tuple[int | None, list[tuple[str, int, int]], list[tuple[int, int]], str]:
         """One weight set's bytes from the machine (`ReadGrant`): the host layout deposited for
         `layout`, with the GPU pages a gone executor kept of it `(region, fd)` and what they hold,
@@ -4183,20 +4150,23 @@ class Executor:
         if answer.ok and answer.held and len(answer.fds) == 1 + len(answer.pages):
             pages = [(p.region, fd) for p, fd in zip(answer.pages, answer.fds[1:], strict=True)]
             return answer.fds[0], [], pages, answer.fingerprint
-        if (
-            not answer.ok
-            or answer.held
-            or len(answer.fds) != len(objects)
-            or answer.objects_sha256 != _objects_sha256(objects)
-        ):
-            for fd in answer.fds:
-                os.close(fd)
+        for fd in answer.fds:
+            os.close(fd)
+        if answer.held:
             raise RuntimeFailure(
-                f"{manifest[:23]}: the machine granted no bytes it names as this checkpoint's "
-                f"chunks ({answer.code or 'a different list'})",
+                f"{manifest[:23]}: the machine supplied an invalid kept layout",
                 code="weights_ungranted",
             )
-        files = [(sha, length, fd) for (sha, length), fd in zip(objects, answer.fds, strict=True)]
+        ck = checkpoints[manifest].ck
+        index = {sha: i for i, (sha, _) in enumerate(ck.chunks)}
+        files: list[tuple[str, int, int]] = []
+        try:
+            for sha, length in objects:
+                files.append((sha, length, ck.open_chunk(index[sha])))
+        except BaseException:
+            for _, _, fd in files:
+                os.close(fd)
+            raise
         return None, files, [], ""
 
     def _keep_pages(self, layout: str, fingerprint: str, pages: list[tuple[int, int, int]]) -> None:
@@ -4232,10 +4202,19 @@ class Executor:
         finally:
             os.close(fd)
 
-    def _checkpoint(self, manifest: str) -> Checkpoint:
-        """A selected checkpoint through TensorD (`ModelSource`): its header and every file its
-        manifest lists (configs, tokenizers, assets)."""
-        return Checkpoint.granted(manifest, lambda name: self._model_source(manifest, name))
+    def _store(self) -> Path:
+        host = self.host
+        if host.store is None:
+            host.store = Path(
+                _SEALED.get(child_env.TENSORFS_HOME) or weights_store.DEFAULT_HOME
+            ).expanduser()
+        return host.store
+
+    def _checkpoint(
+        self, ref: str, connection: weights_store.Connection | None = None
+    ) -> Checkpoint:
+        with store_refusals(f"opening {ref[:23]}"):
+            return Checkpoint(weights_store.open_checkpoint(self._store(), ref, connection))
 
     def _child_events(self, exchange: Exchange) -> int | None:
         """The worker's nudge socket for this attempt's calls; None when it refuses, and on
@@ -4324,11 +4303,15 @@ class Executor:
         passed: list[int] = []
         try:
             if kind not in _RELAYED:
-                follower.send({
-                    "event": "answer", "seq": seq, "ok": False,
-                    "code": "request_unsupported",
-                    "detail": f"{_gpu(0)} relays no {kind!r} request",
-                })
+                follower.send(
+                    {
+                        "event": "answer",
+                        "seq": seq,
+                        "ok": False,
+                        "code": "request_unsupported",
+                        "detail": f"{_gpu(0)} relays no {kind!r} request",
+                    }
+                )
                 return
 
             def receive(answer: Frame) -> None:

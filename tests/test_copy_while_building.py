@@ -9,6 +9,7 @@ import os
 import socket
 import threading
 from dataclasses import replace
+from functools import partial
 from pathlib import Path
 
 import pytest
@@ -24,7 +25,7 @@ from cozy_runtime.internal.executor import Executor  # noqa: E402
 from cozy_runtime.internal.fill import Checkpoint  # noqa: E402
 from cozy_runtime.internal.seam import Channel  # noqa: E402
 from cozy_runtime.internal.weights import Backend  # noqa: E402
-from tensord_peer import answer_read_grants, model_source  # noqa: E402
+from tensord_peer import answer_read_grants  # noqa: E402
 
 DIM, BLOCKS = 64, 4
 
@@ -64,13 +65,13 @@ def built(grant: WeightGrant, blocks: list[str] | None = None) -> Net:
 def test_a_held_layout_binds_before_the_module_and_other_regions_miss(tmp_path: Path) -> None:
     torch.manual_seed(0)
     reference = Net()
-    store = tensorfs.Store(tmp_path / "store")
-    writer = store.writer()
+    writer = tensorfs.Writer(cache_dir=tmp_path / "store")
+    component = writer.component("net", cls="", config={})
     for key, t in reference.state_dict().items():
         t = t.detach().contiguous()
-        writer.put("net", key, "F32", list(t.shape), t.view(torch.uint8).numpy().tobytes())
-    ck = store.checkpoint(writer.commit())
-    grant = WeightGrant(ck, "net", f"sha256:{ck.manifest.sha256}")
+        component.put(key, t.view(torch.uint8).numpy().tobytes(), dtype="F32", shape=list(t.shape))
+    ck = writer.commit()
+    grant = WeightGrant(ck, "net", ck.id)
     held = varena.seal(ck, regions_of(built(grant)), "deposit")
     grant = replace(grant, host_fd=held)
     x = torch.randn(8, DIM, generator=torch.Generator().manual_seed(1))
@@ -104,16 +105,17 @@ def test_a_held_layout_binds_before_the_module_and_other_regions_miss(tmp_path: 
 def test_a_changed_held_layout_regrants_chunks_for_a_header_only_executor(tmp_path: Path) -> None:
     torch.manual_seed(0)
     reference = Net()
-    store = tensorfs.Store(tmp_path / "store")
-    writer = store.writer()
+    writer = tensorfs.Writer(cache_dir=tmp_path / "store")
+    component = writer.component("net", cls="", config={})
     for key, t in reference.state_dict().items():
         t = t.detach().contiguous()
-        writer.put("net", key, "F32", list(t.shape), t.numpy())
-    manifest = f"sha256:{writer.commit().sha256}"
-    ck = Checkpoint.granted(manifest, lambda name: model_source(store, manifest, name))
-    assert ck.ck.manifest is None
+        component.put(key, t.numpy(), dtype="F32", shape=list(t.shape))
+    native = writer.commit()
+    assert native.id is not None
+    manifest = native.id
+    ck = Checkpoint(native)
     grant = WeightGrant(ck.ck, "net", manifest)
-    held = varena.seal(store.checkpoint(manifest), regions_of(built(grant)), "old-layout")
+    held = varena.seal(native, regions_of(built(grant)), "old-layout")
     memory = Memory.open(torch.device("cpu"))
     backend = Backend.for_script(
         {"net": ck},
@@ -128,10 +130,10 @@ def test_a_changed_held_layout_regrants_chunks_for_a_header_only_executor(tmp_pa
     executor, asked = Executor(Channel(left), tmp_path), []
     serving = threading.Thread(
         target=answer_read_grants,
-        args=(Channel(right), store, {backend._layout("net"): held}, asked),
+        args=(Channel(right), {backend._layout("net"): held}, asked),
     )
     serving.start()
-    backend.grant = executor._read_grant
+    backend.grant = partial(executor._read_grant, checkpoints={manifest: ck})
     try:
         backend.ahead()
         with torch.device("meta"):

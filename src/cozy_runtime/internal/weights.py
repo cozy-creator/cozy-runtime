@@ -185,8 +185,8 @@ class Backend:
             components=sorted({row.component for row in rows}),
             release=release,
             store="script",
-            snapshot=next(iter(checkpoints.values())).manifest_id,
-            snapshots={name: book.manifest_id for name, book in checkpoints.items()},
+            snapshot=next(iter(checkpoints.values())).id,
+            snapshots={name: book.id for name, book in checkpoints.items()},
             providers=providers,
             capabilities=qualification.capabilities,
             device=facts,
@@ -290,7 +290,7 @@ class Backend:
                     f"no checkpoint for it (bound: {', '.join(sorted(self.checkpoints))})",
                     [component],
                 )
-            by_checkpoint.setdefault(checkpoint.manifest_id, (checkpoint, []))[1].append(component)
+            by_checkpoint.setdefault(checkpoint.id, (checkpoint, []))[1].append(component)
         verdict: dict[str, object] | None = None
         ignored: list[str] = []
         warnings: list[str] = []
@@ -490,7 +490,7 @@ class Backend:
         module exists; a held tier of other regions is a miss (`Memory.load`)."""
         return canonical.digest(
             {
-                "manifest": self.checkpoints[name].manifest_id,
+                "manifest": self.checkpoints[name].id,
                 "construction": self.execution.construction.document(),
                 "component": name,
             }
@@ -504,15 +504,18 @@ class Backend:
         grant = self.grants.get(name)
         if grant is None:
             checkpoint = self.checkpoints[name]
-            grant = WeightGrant(checkpoint.ck, name, checkpoint.manifest_id)
+            grant = WeightGrant(checkpoint.ck, name, checkpoint.id)
             if self.grant is not None:
                 objects = self._objects(checkpoint)
                 fd, files, pages, fingerprint = self.grant(
                     grant.manifest, "" if chunks else self._layout(name), objects
                 )
                 grant = replace(
-                    grant, host_fd=fd, files=tuple(files),
-                    pages=tuple(pages), fingerprint=fingerprint,
+                    grant,
+                    host_fd=fd,
+                    files=tuple(files),
+                    pages=tuple(pages),
+                    fingerprint=fingerprint,
                 )
             self.grants[name] = grant
             self.memory.adopt(grant)
@@ -537,10 +540,9 @@ class Backend:
     def _objects(self, checkpoint: Checkpoint) -> list[tuple[str, int]]:
         """Every chunk of the manifest's selected components, `(sha256, length)` in sha256
         order: what a grant without a sealed layout hands over."""
-        selected = [
-            c for c, ck in self.checkpoints.items() if ck.manifest_id == checkpoint.manifest_id
-        ]
-        tensors, chunks = checkpoint.ck.tensors, checkpoint.ck.chunks
+        selected = [c for c, ck in self.checkpoints.items() if ck.id == checkpoint.id]
+        tensors = {name: held.tensors for name, held in checkpoint.ck.components.items()}
+        chunks = checkpoint.ck.chunks
         used: set[int] = set()
         parts = (p for c in selected for t in tensors.get(c, {}).values() for p in t.parts.values())
         for part in parts:
