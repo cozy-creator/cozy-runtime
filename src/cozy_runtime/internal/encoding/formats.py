@@ -316,7 +316,10 @@ class LeafProvider(Provider, Protocol):
 
 def _rank2(shape: Sequence[int]) -> str:
     if len(shape) != 2:
-        return f"a scaled GEMM has two outer dimensions and this tensor is rank {len(shape)} {tuple(shape)}"
+        return (
+            f"a scaled GEMM has two outer dimensions and this tensor is rank "
+            f"{len(shape)} {tuple(shape)}"
+        )
     return ""
 
 
@@ -386,7 +389,7 @@ class Verbatim:
 
 @dataclass(frozen=True, slots=True)
 class TensorwiseDequant:
-    """`fp8.tensorwise` and `int8.tensorwise` -> float: `round_L(weight × scale)`, the scale in
+    """`fp8.tensorwise` and `int8.tensorwise` -> float: `round_L(weight * scale)`, the scale in
     the dtype its producer stored (`scale_dtype`), never rounded on the way in. `input_scale`
     is the activation scale of a quantized matmul and never enters the weight."""
 
@@ -455,7 +458,7 @@ _CHUNK_BYTES = 16 << 20
 
 @dataclass(frozen=True, slots=True)
 class RowwiseDequant:
-    """`fp8.rowwise` and `int8.rowwise` -> float: `weight[i, j] × scale[axis == 0 ? i : j]`,
+    """`fp8.rowwise` and `int8.rowwise` -> float: `weight[i, j] * scale[axis == 0 ? i : j]`,
     formed in f32 and rounded once into the destination (the producer's rule; narrowing the
     scale first is a full ULP off). Row chunks bound the f32 transient."""
 
@@ -528,7 +531,7 @@ def e8m0_multipliers(torch: ModuleType, scale: Tensor) -> Tensor:
 
 @dataclass(frozen=True, slots=True)
 class MicroScaledDequant:
-    """`mxfp8` -> float: `weight[i, j] × 2**(scale[i, j // 32] - 127)`, formed in f32 (exact:
+    """`mxfp8` -> float: `weight[i, j] * 2**(scale[i, j // 32] - 127)`, formed in f32 (exact:
     an E4M3/E5M2 element times a power of two stays inside f32) and rounded once into the
     destination. A short last block (`ceil(C / 32)` scales) decodes like any other."""
 
@@ -618,7 +621,7 @@ def hadamard256(torch: ModuleType, values: Tensor) -> Tensor:
 
 @dataclass(frozen=True, slots=True)
 class Int8ConvRotDequant:
-    """`int8.convrot` -> float: `(y[i] × scale[i]) × 2^-k`, `y` the exact int32 Hadamard sum of
+    """`int8.convrot` -> float: `(y[i] * scale[i]) * 2^-k`, `y` the exact int32 Hadamard sum of
     each `rotation_size = 4^k` group of int8 weights, cast once into the destination."""
 
     encoding: str = "int8.convrot"
@@ -701,8 +704,8 @@ def nvfp4_values(
     high_first: bool = False,
     divide: bool = False,
 ) -> Tensor:
-    """`nvfp4` rows -> f32: `(e2m1 × e4m3 scale) × scale_2`, or with `divide`
-    `e2m1 × (e4m3 scale ÷ scale_2)`. `weight` is u8 `[R, C/2]`, element 2k in the low nibble,
+    """`nvfp4` rows -> f32: `(e2m1 * e4m3 scale) * scale_2`, or with `divide`
+    `e2m1 * (e4m3 scale ÷ scale_2)`. `weight` is u8 `[R, C/2]`, element 2k in the low nibble,
     or the high one when `high_first`."""
     rows, cols = int(weight.shape[0]), int(weight.shape[1]) * 2
     pair = (weight >> 4, weight & 0x0F) if high_first else (weight & 0x0F, weight >> 4)

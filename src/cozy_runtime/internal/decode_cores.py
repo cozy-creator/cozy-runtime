@@ -25,7 +25,8 @@ from types import ModuleType
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from torch import Tensor, device as Device
+    from torch import Tensor
+    from torch import device as Device
 
 try:
     import triton
