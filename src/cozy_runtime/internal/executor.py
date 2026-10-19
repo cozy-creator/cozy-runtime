@@ -181,6 +181,7 @@ from cozy_runtime.internal.executor_commands import (
     Start,
     Unload,
 )
+from cozy_runtime.internal.executor_replies import Copy as ReplyCopy
 from cozy_runtime.internal.executor_replies import Eviction as ReplyEviction
 from cozy_runtime.internal.executor_replies import Memory as ReplyMemory
 from cozy_runtime.internal.executor_replies import Peak as ReplyPeak
@@ -2018,6 +2019,7 @@ class Executor:
             ],
             retries=request.retries,
             leftover_by_gpu=list(request.leftover),
+            copies=[ReplyCopy(**dataclasses.asdict(c)) for c in request.copies],
         )
         return cast("dict[str, Any]", msgspec.to_builtins(memory))
 
