@@ -235,6 +235,25 @@ class Channel:
             raise
         return received
 
+    def send_ledger(self, memfd: int, eventfd: int) -> None:
+        """Hand over one GPU's ledger (`tensorfs.varena.Ledger`): its memfd, then its eventfd."""
+        _require_memfd(memfd)
+        _require_eventfd(eventfd)
+        self._send_fd(memfd, "ledger memfd")
+        self._send_fd(eventfd, "ledger eventfd")
+
+    def recv_ledger(self) -> list[int]:
+        """One GPU's ledger memfd and eventfd; anything else is closed and refused."""
+        fds = self.recv_fds(2)
+        try:
+            _require_memfd(fds[0])
+            _require_eventfd(fds[1])
+        except SeamError:
+            for fd in fds:
+                os.close(fd)
+            raise
+        return fds
+
     def recv_fds(self, count: int) -> list[int]:
         """`count` descriptors, unopened, for a relay to pass on (`send_fds`)."""
         received: list[int] = []
@@ -659,6 +678,16 @@ def sealed(name: str, body: bytes) -> int:
         os.close(fd)
         raise
     return fd
+
+
+def _require_eventfd(fd: int) -> None:
+    """An eventfd, a ledger's freed-bytes signal (Linux only, as varena's ledger is)."""
+    try:
+        named = os.readlink(f"/proc/self/fd/{fd}")
+    except OSError as exc:
+        raise SeamError("seam_descriptor", f"eventfd unreadable: {exc}") from exc
+    if named != "anon_inode:[eventfd]":
+        raise SeamError("seam_descriptor", f"capability must be an eventfd, not {named}")
 
 
 def _require_memfd(fd: int) -> None:

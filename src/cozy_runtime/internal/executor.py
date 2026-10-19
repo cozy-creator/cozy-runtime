@@ -1034,7 +1034,7 @@ class Executor:
             return {"ok": False, "code": "not_a_follower", "detail": f"{_gpu(0)} forms the group"}
         if command.ledger:
             # Its ledger and eventfd follow the frame: taken first, whatever this join answers.
-            fds = [self.channel.recv_memfd(), self.channel.recv_memfd()]
+            fds = self.channel.recv_ledger()
             if self.host.ledgers:
                 for fd in fds:
                     os.close(fd)
@@ -1476,7 +1476,7 @@ class Executor:
         and reads as unstarted. The ordinary start that follows only initializes devices,
         warms the package and forms the group.
         """
-        ledgers = self.channel.recv_fds(2 * command.ledgers) if command.ledgers else []
+        ledgers = [fd for _ in range(command.ledgers) for fd in self.channel.recv_ledger()]
         if self.poisoned or self.ledgers:
             for fd in ledgers:  # one set per process
                 os.close(fd)

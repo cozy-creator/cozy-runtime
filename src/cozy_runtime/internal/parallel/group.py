@@ -582,8 +582,8 @@ class RankGroup:
             follower.abort, watcher = socket.socketpair()
             try:
                 self.send_one(follower.rank, {**join, "ledger": bool(ledgers), "abort": True})
-                for fd in ledgers[2 * index : 2 * index + 2]:
-                    self.memfd_to(follower.rank, fd)
+                if ledgers:
+                    follower.channel.send_ledger(*ledgers[2 * index : 2 * index + 2])
                 follower.channel.send_descriptor(watcher)
             except SeamError as exc:
                 raise GroupRefusal(
@@ -682,15 +682,6 @@ class RankGroup:
         except SeamError as exc:
             raise GroupRefusal(
                 f"{self.gpu(rank)} cannot be commanded: {exc}", code="group_broken"
-            ) from exc
-
-    def memfd_to(self, rank: int, memfd: int) -> None:
-        """Hand follower `rank` one pinned host tier (right after the frame naming it)."""
-        try:
-            self.followers[rank - 1].channel.send_memfd(memfd)
-        except SeamError as exc:
-            raise GroupRefusal(
-                f"{self.gpu(rank)} cannot take a host tier: {exc}", code="group_broken"
             ) from exc
 
     def reply_one(self, rank: int, name: str) -> dict[str, Any]:

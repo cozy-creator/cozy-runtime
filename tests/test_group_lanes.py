@@ -21,6 +21,7 @@ from typing import Any
 
 import msgspec
 import pytest
+from tensorfs.varena import Ledger
 
 from cozy_runtime.author._signature import ModelBinding
 from cozy_runtime.internal import executor_commands, package_interface, spawn
@@ -315,6 +316,37 @@ def test_a_followers_start_names_no_ledger_descriptors(tmp_path: Path) -> None:
         assert reply["code"] == "package_prepare_path_invalid", reply
     finally:
         group.close()
+
+
+@needs_torch
+@pytest.mark.skipif(sys.platform != "linux", reason="varena's ledger is Linux's")
+def test_a_group_forms_with_each_followers_ledger_memfd_and_eventfd(tmp_path: Path) -> None:
+    """TensorD hands rank 0 one ledger memfd and eventfd per GPU; rank 0 relays each
+    follower's pair at join, and the follower claims its row there. A real varena ledger's
+    pair crosses the real seam to a real follower process, and the group forms past join:
+    run 11905 broke there, its eventfd refused as a memfd ("cannot take a host tier")."""
+    import torch
+
+    env = {**os.environ, "CUDA_VISIBLE_DEVICES": "4,5"}
+    group = RankGroup(
+        degree=2,
+        backend="gloo",
+        python=sys.executable,
+        root=str(tmp_path),
+        sample_seconds=0.2,
+        launch=_launcher(env),
+        devices=("4", "5"),
+    )
+    ledger = Ledger.create("GPU-follower-5", GiB)
+    assert ledger.events_fd is not None
+    try:
+        group.spawn()
+        group.dial_back(seal_snapshot(env))
+        group.form(torch, {"NCCL_NVLS_ENABLE": "0"}, ledgers=[ledger.fd, ledger.events_fd])
+        assert group.formed and torch.distributed.get_world_size() == 2
+    finally:
+        group.close()
+    assert not torch.distributed.is_initialized()
 
 
 @needs_torch
