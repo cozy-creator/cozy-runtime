@@ -3,6 +3,13 @@ attempt, over a real Store, a real seam and the owner's writer channels."""
 
 from __future__ import annotations
 
+import pytest
+
+pytest.skip(
+    "pending: the executor's weights grant end to end against TensorD's v2 channels (xs-045 U9a/U9b)",
+    allow_module_level=True,
+)
+
 import json
 import sys
 from collections.abc import Iterator

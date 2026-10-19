@@ -177,7 +177,7 @@ class Channel:
             descriptor.close()
 
     def send_memfd(self, fd: int) -> None:
-        """Transfer one weight set's pinned host tier (`tensorfs.plane` memfd)."""
+        """Transfer one weight set's pinned host tier (`tensorfs.varena` memfd)."""
         _require_memfd(fd)
         self._send_fd(fd, "memfd")
 
@@ -240,6 +240,25 @@ class Channel:
             os.close(received)
             raise
         return received
+
+    def send_ledger(self, memfd: int, eventfd: int) -> None:
+        """Hand over one GPU's ledger (`tensorfs.varena.Ledger`): its memfd, then its eventfd."""
+        _require_memfd(memfd)
+        _require_eventfd(eventfd)
+        self._send_fd(memfd, "ledger memfd")
+        self._send_fd(eventfd, "ledger eventfd")
+
+    def recv_ledger(self) -> list[int]:
+        """One GPU's ledger memfd and eventfd; anything else is closed and refused."""
+        fds = self.recv_fds(2)
+        try:
+            _require_memfd(fds[0])
+            _require_eventfd(fds[1])
+        except SeamError:
+            for fd in fds:
+                os.close(fd)
+            raise
+        return fds
 
     def recv_fds(self, count: int) -> list[int]:
         """`count` descriptors, unopened, for a relay to pass on (`send_fds`)."""
@@ -644,6 +663,37 @@ def anonymous(name: str, sealing: bool = False) -> int:
     if fd < 0:
         raise OSError(ctypes.get_errno(), "memfd_create")
     return fd
+
+
+#: Linux `fcntl` seals by number (python-build-standalone may lack the names): seal, shrink,
+#: grow and write.
+_ADD_SEALS, _SEALS = 1033, 0x8 | 0x4 | 0x2 | 0x1
+
+
+def sealed(name: str, body: bytes) -> int:
+    """`body` in a new memfd, sealed: a document that crosses beside its request. macOS has
+    no memfd and no seals: there it is an unlinked file, which no path names."""
+    fd = anonymous(name, sealing=True)
+    try:
+        view = memoryview(body)
+        while view:
+            view = view[os.write(fd, view) :]
+        if sys.platform == "linux":
+            fcntl.fcntl(fd, _ADD_SEALS, _SEALS)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _require_eventfd(fd: int) -> None:
+    """An eventfd, a ledger's freed-bytes signal (Linux only, as varena's ledger is)."""
+    try:
+        named = os.readlink(f"/proc/self/fd/{fd}")
+    except OSError as exc:
+        raise SeamError("seam_descriptor", f"eventfd unreadable: {exc}") from exc
+    if named != "anon_inode:[eventfd]":
+        raise SeamError("seam_descriptor", f"capability must be an eventfd, not {named}")
 
 
 def _require_memfd(fd: int) -> None:

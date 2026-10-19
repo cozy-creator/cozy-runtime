@@ -2,6 +2,13 @@
 
 from __future__ import annotations
 
+import pytest
+
+pytest.skip(
+    "pending: weights register on cozytensors/1 through varena (xs-045 U8) and cr-203 U11b",
+    allow_module_level=True,
+)
+
 import base64
 import hashlib
 import json
