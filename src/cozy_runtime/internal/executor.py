@@ -886,8 +886,8 @@ class Executor:
             "runtime_version": RUNTIME_VERSION,
             "tensorfs_version": _distribution_version("tensorfs"),
             "executor_protocol_revision": EXECUTOR_PROTOCOL_REVISION,
-            #: what the worker's memory manager may ask beyond the floor's commands
-            "memory": [
+            #: commands beyond the floor's (`memory` is the invoke reply's own object)
+            "capabilities": [
                 "import_only",
                 zygote.CAPABILITY,
                 LOAD_ATTENTION_PIN,
