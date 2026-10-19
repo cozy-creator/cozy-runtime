@@ -402,7 +402,7 @@ class Bands:
         if self.weights.unified:
             return False
         lockable = self.weights.lockable(nbytes)
-        return lockable < 0 or nbytes <= lockable
+        return bool(lockable < 0 or nbytes <= lockable)
 
     def _take(self, x: Any, dim: int, lo: int, hi: int, fill: float = 0.0) -> Any:
         """Rows [lo, hi) of `x` along `dim` on the device, `fill` past its edges. A host

@@ -61,7 +61,7 @@ import traceback
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import msgspec
 from msgspec import UNSET, UnsetType
@@ -2022,7 +2022,7 @@ class Executor:
                 leftover_bytes=sum(n for _, n in request.leftover),
             ),
         )
-        return msgspec.to_builtins(facts)
+        return cast("dict[str, Any]", msgspec.to_builtins(facts))
 
     def _members(self) -> list[Executor]:
         """Every loaded model's generation in this process."""
@@ -4394,7 +4394,7 @@ class Executor:
         memory = self.host.memory
         if memory is None:
             return contextlib.nullcontext()
-        return memory.request(request_id)
+        return cast("contextlib.AbstractContextManager[Any]", memory.request(request_id))
 
     def _quiescent(self) -> bool:
         """No author computation may still mutate GPU or output state when a terminal is
@@ -4412,7 +4412,7 @@ class Executor:
             memory = self.memory
             if memory is None or command.vram_bytes != 0:
                 return 0
-            freed = sum(model.evict() for model in list(memory.models.values()))
+            freed = int(sum(model.evict() for model in list(memory.models.values())))
             accel.release_cached(self.torch, self.device_kind)
             return freed
 
