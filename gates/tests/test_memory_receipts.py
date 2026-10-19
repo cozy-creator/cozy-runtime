@@ -20,6 +20,7 @@ def positive():
     measurements = value.get("calls", [value])[0]["measurements"]
     stats = measurements["memory"]["stats"]
     stats.update(leftover=0, paged_in=0, retries=0)
+    stats["leftover_by_gpu"] = [[0, 0]]
     stats["steps"] = {"model/transformer_ref": [0, 0]}
     return value
 
@@ -74,6 +75,33 @@ class MemoryReceipts(unittest.TestCase):
         code, text = self.record(value)
         self.assertEqual(code, 1)
         self.assertIn("no-gpu-execution", text)
+
+    def test_every_executed_gpu_requires_its_leftover_receipt(self):
+        value = positive()
+        m = value.get("calls", [value])[0]["measurements"]
+        m["execution"]["gpus"].append({**m["execution"]["gpus"][0], "gpu": 1})
+        code, text = self.record(value)
+        self.assertEqual(code, 1)
+        self.assertIn("leftover-gpu-coverage", text)
+        m["memory"]["stats"]["leftover_by_gpu"].append([1, 0])
+        self.assertEqual(self.record(value)[0], 0)
+        m["memory"]["stats"]["leftover_by_gpu"][1][1] = 32
+        self.assertIn("leftover-gpu-coverage", self.record(value)[1])
+        m["memory"]["stats"]["leftover_by_gpu"] = [[0, 0], [1, 0], [2, 0]]
+        self.assertIn("leftover-gpu-coverage", self.record(value)[1])
+
+    def test_actual_degree_two_receipt_exposes_missing_gpu_one(self):
+        value = json.loads((ROOT / "tests/fixtures/h3-degree2-11916.json").read_text())
+        code, text = self.record(value, "2x8-h3")
+        self.assertEqual(code, 1)
+        self.assertIn("leftover-gpu-coverage", text)
+
+    def test_missing_malformed_and_duplicate_gpu_totals_refuse(self):
+        for by_gpu in (None, [], [0], [[False, 0]], [[0, False]], [[0, -1]], [[0, 0], [0, 0]], [[0, 1]]):
+            with self.subTest(by_gpu=by_gpu):
+                value = positive()
+                value.get("calls", [value])[0]["measurements"]["memory"]["stats"]["leftover_by_gpu"] = by_gpu
+                self.assertEqual(self.record(value)[0], 1)
 
     def test_warm_transformer_steps_cannot_default_to_zero(self):
         cold = "24-h3ref5 run=1 completed landed exec=10s poisoned=0 leftover=0 oom_retries=0 bar=ok\n"
