@@ -558,6 +558,7 @@ def _reply_step(step: Any) -> ReplyStep:
     """A `tensorfs.varena.torch.Step` as the reply carries it."""
     return ReplyStep(
         model=step.model,
+        gpu=step.gpu,
         step=step.step,
         home=step.home,
         resident=step.resident,
@@ -2005,7 +2006,7 @@ class Executor:
             retries=request.retries,
             leftover_by_gpu=list(request.leftover),
         )
-        return msgspec.to_builtins(memory)
+        return cast("dict[str, Any]", msgspec.to_builtins(memory))
 
     def _members(self) -> list[Executor]:
         """Every loaded model's generation in this process."""
