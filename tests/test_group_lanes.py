@@ -21,10 +21,10 @@ from typing import Any
 
 import msgspec
 import pytest
+from tensorfs.varena import Ledger
 
 from cozy_runtime.author._signature import ModelBinding
-from cozy_runtime.internal import budget_cell, package_interface, spawn
-from cozy_runtime.internal import executor as executor_module
+from cozy_runtime.internal import executor_commands, package_interface, spawn
 from cozy_runtime.internal.config import seal_snapshot
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.parallel import cp, wire
@@ -208,13 +208,11 @@ def test_a_gloo_group_forms_on_a_kernel_chosen_port_and_agrees_or_refuses(
             "construction": "fixture",
             "devices": "4,5,6",
             "sequence_parallel_degree": 3,
-            "authorized_device_limit_bytes": 1,
             "binding": {
                 "application": "x:app",
                 "package_interface": "/nowhere",
                 "model_class": "",
             },
-            "budgets": {},
         }
         # the hardware half disagrees: refused BEFORE torch is imported on the follower
         divergent = {"degree": 3, "devices": ["0", "1", "7"]}
@@ -239,14 +237,10 @@ def test_a_gloo_group_forms_on_a_kernel_chosen_port_and_agrees_or_refuses(
 def test_the_plan_agrees_field_by_field_or_refuses() -> None:
     """A follower ASSERTS the broadcast plan; the first field that differs is named, with
     the GPU that disagrees, and no GPU ever adapts."""
-    plan = GroupPlan(2, ("2", "3"), "sha256:a", 1024)
+    plan = GroupPlan(2, ("2", "3"), "sha256:a")
     plan.assert_agrees(plan, rank=1)
     for field_name, other in (
         ("plan_digest", msgspec.structs.replace(plan, plan_digest="sha256:b")),
-        (
-            "authorized_device_limit_bytes",
-            msgspec.structs.replace(plan, authorized_device_limit_bytes=1),
-        ),
         ("degree", msgspec.structs.replace(plan, degree=4)),
     ):
         with pytest.raises(GpuDivergence) as refused:
@@ -255,50 +249,6 @@ def test_the_plan_agrees_field_by_field_or_refuses() -> None:
         assert refused.value.field_name == field_name and refused.value.gpu == "GPU 3"
         assert refused.value.message.startswith(f"GPU 3 disagrees on {field_name!r}: GPU 2 decided")
         assert "no GPU adapts locally" in refused.value.message
-
-
-@needs_torch
-def test_each_follower_takes_its_own_budget_cell_with_its_join(tmp_path: Path) -> None:
-    """`RANK_CELLS`: rank 0 hands every follower its own budget cell right after `join`, so
-    the owner's floor watchdog writes each GPU's cap where that GPU's process reads it. Real
-    follower executors; the cell is the memfd each one maps, and nobody else's."""
-    import torch
-
-    env = {**os.environ, "CUDA_VISIBLE_DEVICES": "4,5,6"}
-    group = RankGroup(
-        degree=3,
-        backend="gloo",
-        python=sys.executable,
-        root=str(tmp_path),
-        sample_seconds=0.2,
-        launch=_launcher(env),
-        devices=("4", "5", "6"),
-    )
-    cells = [budget_cell.Cell.create() for _ in range(2)]
-    try:
-        group.spawn()
-        group.dial_back(seal_snapshot(env))
-        group.form(torch, {"NCCL_NVLS_ENABLE": "0"}, [fd for _, fd in cells])
-        assert group.formed
-        for (_cell, fd), follower in zip(cells, group.followers, strict=True):
-            mine = os.fstat(fd).st_ino
-            maps = Path(f"/proc/{follower.pid}/maps").read_text().splitlines()
-            held = {int(line.split()[4]) for line in maps if "memfd:cozy-budget-cell" in line}
-            assert held == {mine}, (follower.gpu, held, mine)
-        # the followers still answer, and the cells are the owner's to write
-        assert [r["ok"] for r in group.call({"cmd": "probe"})] == [True, True]
-        assert cells[0][0].ask(-2 - (1 << 30)) == 1
-    finally:
-        group.close()
-        for cell, fd in cells:
-            cell.close()
-            os.close(fd)
-
-
-def test_a_rank_takes_its_own_cap_or_the_one_cap() -> None:
-    assert executor_module._rank_cap((7, 8, 9), 1, 5) == 8
-    assert executor_module._rank_cap((7,), 2, 5) == 5
-    assert executor_module._rank_cap((), 0, msgspec.UNSET) is msgspec.UNSET
 
 
 @needs_torch
@@ -334,6 +284,69 @@ def test_a_follower_death_breaks_the_group_loudly(tmp_path: Path) -> None:
             group.check_alive()
     finally:
         group.close()
+
+
+def test_a_followers_start_names_no_ledger_descriptors(tmp_path: Path) -> None:
+    """TensorD hands rank 0 one ledger memfd and eventfd per GPU after its Start; rank 0
+    forwards the Start to its followers, which take their own ledger at join. A follower
+    handed the Start as TensorD sent it waited in `start` for descriptors nobody sends, and
+    the group wedged there (runs 11824, 11829). Real follower processes take rank 0's
+    forwarded Start and answer it: here, that its package interface is absent."""
+    env = {**os.environ, "CUDA_VISIBLE_DEVICES": "4,5"}
+    group = RankGroup(
+        degree=2,
+        backend="gloo",
+        python=sys.executable,
+        root=str(tmp_path),
+        sample_seconds=0.2,
+        launch=_launcher(env),
+        devices=("4", "5"),
+    )
+    start = executor_commands.Start(
+        devices="4,5",
+        sequence_parallel_degree=2,
+        ledgers=1,
+        package_interface=str(tmp_path / "absent.json"),
+    )
+    try:
+        group.spawn()
+        group.dial_back(seal_snapshot(env))
+        group.start(executor_commands.encode(start))
+        (reply,) = group.collect("start")
+        assert reply["code"] == "package_prepare_path_invalid", reply
+    finally:
+        group.close()
+
+
+@needs_torch
+@pytest.mark.skipif(sys.platform != "linux", reason="varena's ledger is Linux's")
+def test_a_group_forms_with_each_followers_ledger_memfd_and_eventfd(tmp_path: Path) -> None:
+    """TensorD hands rank 0 one ledger memfd and eventfd per GPU; rank 0 relays each
+    follower's pair at join, and the follower claims its row there. A real varena ledger's
+    pair crosses the real seam to a real follower process, and the group forms past join:
+    run 11905 broke there, its eventfd refused as a memfd ("cannot take a host tier")."""
+    import torch
+
+    env = {**os.environ, "CUDA_VISIBLE_DEVICES": "4,5"}
+    group = RankGroup(
+        degree=2,
+        backend="gloo",
+        python=sys.executable,
+        root=str(tmp_path),
+        sample_seconds=0.2,
+        launch=_launcher(env),
+        devices=("4", "5"),
+    )
+    ledger = Ledger.create("GPU-follower-5", GiB)
+    assert ledger.events_fd is not None
+    try:
+        group.spawn()
+        group.dial_back(seal_snapshot(env))
+        group.form(torch, {"NCCL_NVLS_ENABLE": "0"}, ledgers=[ledger.fd, ledger.events_fd])
+        assert group.formed and torch.distributed.get_world_size() == 2
+    finally:
+        group.close()
+    assert not torch.distributed.is_initialized()
 
 
 @needs_torch

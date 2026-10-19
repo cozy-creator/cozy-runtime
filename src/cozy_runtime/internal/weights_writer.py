@@ -1,19 +1,17 @@
-"""The executor's TensorFS source and output handles, granted per attempt by its owner.
+"""The executor's weights sources and outputs, granted per attempt by TensorD (`weights.rs`).
 
-Only bounded declarations and receipts cross the executor's control exchange; TensorFS
-owns the source and writer channels, which TensorD serves from its Store.
+A source is one of the call's `Weights[M]` checkpoints; an output one declared weights output,
+written through TensorD's derive channel. Only bounded exchange files cross the control
+exchange; TensorD serves the channels from its Store.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 from collections.abc import Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING
-
-import tensorfs
-from tensorfs.derived import DerivedTransaction, SourceCapability
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author._artifacts import ModelArtifact, ObjectRef
@@ -27,19 +25,22 @@ from cozy_runtime.author._executor_requests import (
     WriterRequest,
     WriterSource,
 )
-from cozy_runtime.internal import weights_receipts, weights_sink
+from cozy_runtime.tensord_channels import Derivation, Output, Source, ref
 
-if TYPE_CHECKING:
-    from tensorfs.derived import Derivation
+#: An exchange file stays this small (TensorD's bound).
+EXCHANGE_MAX = 64 << 20
+_OUTPUT_SLOT = re.compile(r"[a-z][a-z0-9_-]{0,63}")
 
 
-def declaration_bound() -> int:
-    """A declaration grows with the tensors it declares; TensorFS bounds its own documents."""
-    return int(tensorfs.manifest_max_bytes())
+def exchange_file(spool: Path, output_slot: str, kind: str) -> Path:
+    """One spool file the executor writes for TensorD; no child-authored path crosses."""
+    if _OUTPUT_SLOT.fullmatch(output_slot) is None or kind not in ("derivation", "native-receipt"):
+        raise CapabilityError("weights exchange identity is invalid", code="weights_host_identity")
+    return spool / f"weights-{output_slot}-{kind}.canonical"
 
 
 class ExecutionStorage:
-    """Execution bindings only: the executor receives TensorFS handles, never a Store."""
+    """Execution bindings only: the executor receives channels, never a Store."""
 
     def __init__(self, spool: Path, exchange: Exchange, outputs: Mapping[str, int]) -> None:
         self.spool, self.exchange, self.outputs = spool, exchange, dict(outputs)
@@ -51,34 +52,29 @@ class ExecutionStorage:
             raise CapabilityError(answer.detail, code=answer.code)
         return answer
 
-    def source(self, manifest: str) -> SourceCapability:
+    def source(self, manifest: str) -> Source:
         answer = self._call(WriterSource(manifest=manifest), Opened)
-        return SourceCapability.from_fd(manifest, answer.length, answer.descriptor)
+        return Source(manifest, answer.length, answer.descriptor)
 
-    def open_output(self, output_slot: str, definition: Derivation) -> DerivedTransaction:
+    def open_output(self, output_slot: str, derivation: Derivation) -> Output:
         maximum = self.outputs.get(output_slot)
         if maximum is None:
             raise CapabilityError("output is not declared", code="weights_output_ungranted")
-        data = json.dumps(definition.native_arguments(maximum), separators=(",", ":")).encode()
-        length = _write(
-            weights_sink.exchange_file(self.spool, output_slot, "derivation"),
-            data,
-            declaration_bound(),
-        )
+        data = json.dumps(derivation.document(maximum), separators=(",", ":")).encode()
+        length = _write(exchange_file(self.spool, output_slot, "derivation"), data)
         answer = self._call(WriterOutput(output_slot=output_slot, length=length), Opened)
-        writer = DerivedTransaction.accept(answer.descriptor)
         self.opened[answer.transaction] = output_slot
-        return writer
+        return Output(answer.descriptor, answer.transaction)
 
-    def adopt_model(self, facts: Mapping[str, object]) -> ModelArtifact:
-        transaction = weights_sink.native_receipt(facts).transaction_id
+    def adopt_model(self, transaction: str, manifest: tuple[str, int]) -> ModelArtifact:
+        """Keep a committed output: TensorD checks the relayed manifest against its own."""
         slot = self.opened.get(transaction)
         if slot is None:
             raise CapabilityError("receipt has no opened output", code="weights_receipt_mismatch")
+        receipt = {"transaction_id": transaction, "manifest": ref(*manifest)}
         length = _write(
-            weights_sink.exchange_file(self.spool, slot, "native-receipt"),
-            canonical_json.encode(dict(facts)),
-            weights_receipts.MAX_RECEIPT_BYTES,
+            exchange_file(self.spool, slot, "native-receipt"),
+            canonical_json.encode(receipt),
         )
         answer = self._call(
             WriterAdopt(output_slot=slot, transaction=transaction, length=length), Adopted
@@ -91,8 +87,8 @@ class ExecutionStorage:
         )
 
 
-def _write(path: Path, data: bytes, maximum: int) -> int:
-    if len(data) > maximum:
+def _write(path: Path, data: bytes) -> int:
+    if len(data) > EXCHANGE_MAX:
         raise CapabilityError("writer stream exceeds its bound", code="weights_writer_length")
     # An old name is never followed or opened for overwrite, including a planted symlink.
     path.unlink(missing_ok=True)

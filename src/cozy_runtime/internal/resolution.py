@@ -217,9 +217,7 @@ class TensorResolution:
     key: str
     component: str
     encoding: str
-    """The spec object digest. Identity."""
-    alias: str
-    """Display only."""
+    """The stored scheme (`plain` for a plain tensor)."""
     implementation: str
     implementation_digest: str
     implementation_revision: str
@@ -258,7 +256,6 @@ class TensorResolution:
         return {
             **self.identity(),
             "component": self.component,
-            "alias": self.alias,
             "implementation": self.implementation,
             "geometry_class": self.geometry_class,
             "numel": self.numel,
@@ -322,7 +319,7 @@ class ResolvedModelPlan:
 
     def refused_leaves(self) -> tuple[RefusedLeaves, ...]:
         groups = Counter(
-            (row.component, row.alias, row.refused.leaf, row.refused.reason, row.output_dtype)
+            (row.component, row.encoding, row.refused.leaf, row.refused.reason, row.output_dtype)
             for row in self.tensors
             if row.refused is not None
         )
@@ -932,8 +929,7 @@ def _build(
             TensorResolution(
                 key=row.key,
                 component=row.component,
-                encoding=row.encoded.encoding,
-                alias=row.encoded.alias,
+                encoding=row.encoded.scheme,
                 implementation=selection.provider.name,
                 implementation_digest=selection.record.implementation_digest,
                 implementation_revision=selection.provider.code_revision,

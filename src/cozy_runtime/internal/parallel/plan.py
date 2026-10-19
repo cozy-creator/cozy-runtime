@@ -62,8 +62,6 @@ class GroupPlan(msgspec.Struct, frozen=True):
     #: the resolved fill plan's RANK-INVARIANT digest (`rank_invariant_digest`): every
     #: tensor's route, the bytes, the device class - not the card's index
     plan_digest: str
-    #: the resident ceiling the worker assigned - the same number on every rank
-    authorized_device_limit_bytes: int
 
     def document(self) -> dict[str, object]:
         return {**msgspec.structs.asdict(self), "devices": list(self.devices)}

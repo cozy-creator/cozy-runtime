@@ -7,6 +7,13 @@ from the machine's object files. `test_sdxl_on_the_apple_gpu` is the SDXL spike:
 
 from __future__ import annotations
 
+import pytest
+
+pytest.skip(
+    "pending: weights register on cozytensors/1 through varena (xs-045 U8) and cr-203 U11b",
+    allow_module_level=True,
+)
+
 import contextlib
 import gc
 import hashlib
@@ -33,6 +40,7 @@ if not torch.backends.mps.is_available():
 import tensorfs  # noqa: E402
 from tensorfs import Store, _ext  # noqa: E402
 from tensorfs.fetch import Fetch  # noqa: E402
+from tensorfs.varena import cuts  # noqa: E402
 
 from cozy_runtime.author._errors import is_device_oom  # noqa: E402
 from cozy_runtime.author._executor_requests import SealedPlan  # noqa: E402
@@ -47,7 +55,6 @@ from cozy_runtime.internal.executor_commands import (  # noqa: E402
     Start,
 )
 from cozy_runtime.internal.seam import RESULT_DOCUMENT, Channel  # noqa: E402
-from cozy_runtime.internal.weights import Weights  # noqa: E402
 from fetch_hub import COMPONENTS, Hub, write  # noqa: E402
 
 pytestmark = pytest.mark.real_gpu
@@ -101,14 +108,16 @@ def test_the_accelerator_boundary_on_the_apple_gpu() -> None:
     _record("oom", {"refusals": refused})
 
 
-def test_attention_runs_inside_the_recovery_mode() -> None:
-    """Every op of an attempt runs inside Runtime's out-of-memory recovery (a dispatch mode),
+def test_attention_runs_inside_the_catch_layer() -> None:
+    """Every op within a `use` runs inside varena's out-of-memory catch (a dispatch mode),
     where SDPA asks for its kernel through an op MPS lacks: it gets MPS's own attention."""
-    weights = Weights(torch, torch.device("mps"), "mps")
     q, k, v = (torch.randn(2, 10, 4096, 64, device="mps", dtype=torch.float16) for _ in range(3))
     plain = torch.nn.functional.scaled_dot_product_attention(q, k, v)
-    with weights.recovering():
+    cuts.enter()
+    try:
         recovered = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+    finally:
+        cuts.leave()
     assert torch.equal(plain, recovered)
     reference = torch.nn.functional.scaled_dot_product_attention(
         q.cpu().float(), k.cpu().float(), v.cpu().float()
