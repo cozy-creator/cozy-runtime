@@ -3139,7 +3139,6 @@ class Executor:
         target = self._target(command, attempt=False)
         if isinstance(target, dict):
             return target
-        self._plan_fetch(target)
         return target.prepare_request(command)
 
     def serve_invoke(self, command: Invoke) -> dict[str, Any]:
