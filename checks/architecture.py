@@ -18,6 +18,7 @@ import contextlib
 import json
 import pathlib
 import re
+import subprocess
 import sys
 import tomllib
 
@@ -942,6 +943,28 @@ def fence_any_ratchet() -> list[str]:
     return []
 
 
+#: The repo is public: a home directory in a tracked file points at evidence nobody else can open. tests/ holds
+#: inputs, and a placeholder user (`/home/user/…`) is obviously fake anywhere.
+HOME_PATH = re.compile(r"(?:/home/|/Users/|[A-Za-z]:\\{1,2}Users\\{1,2})([A-Za-z0-9._-]+)")
+PLACEHOLDER_USERS = frozenset({"user", "username", "name", "me", "you", "alice", "bob", "example", "runner"})
+
+
+def fence_no_home_paths() -> list[str]:
+    tracked = subprocess.run(["git", "ls-files", "-z"], cwd=ROOT, capture_output=True, check=True).stdout
+    found = []
+    for rel in tracked.decode().split("\0"):
+        if not rel or rel.startswith("tests/"):
+            continue
+        try:
+            text = (ROOT / rel).read_text()
+        except (UnicodeDecodeError, OSError):
+            continue
+        for n, line in enumerate(text.splitlines(), 1):
+            found += [f"{rel}:{n}: {m[0]} is a local path; cite the evidence another way"
+                      for m in HOME_PATH.finditer(line) if m[1].lower() not in PLACEHOLDER_USERS]
+    return found
+
+
 FENCES = {
     "one-address-predicate": fence_one_address_predicate,
     "forbidden-dependency": fence_forbidden_dependency,
@@ -962,6 +985,7 @@ FENCES = {
     "package-owns-no-media-decode": fence_package_owns_no_media_decode,
     "base-distributions": fence_base_distributions,
     "any-ratchet": fence_any_ratchet,
+    "no-home-paths": fence_no_home_paths,
 }
 
 
