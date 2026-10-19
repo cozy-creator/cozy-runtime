@@ -75,17 +75,18 @@ def record(path, cell, number, state, substitute, summary):
         measurements = call.get("measurements") or {}
         execution = measurements.get("execution") or {}
         gpus = execution.get("gpus") or []
-        if any(isinstance(gpu, dict) and integer(gpu.get("gpu")) and
-               integer(gpu.get("start_us")) and gpu["start_us"] > 0 and
-               integer(gpu.get("end_us")) and gpu["end_us"] >= gpu["start_us"] for gpu in gpus):
-            gpu_measurements.append(measurements)
+        executed = {gpu["gpu"] for gpu in gpus if isinstance(gpu, dict) and integer(gpu.get("gpu")) and
+                    integer(gpu.get("start_us")) and gpu["start_us"] > 0 and
+                    integer(gpu.get("end_us")) and gpu["end_us"] >= gpu["start_us"]}
+        if executed:
+            gpu_measurements.append((measurements, executed))
             child_reasons.append(call.get("reason"))
             if call.get("status") not in (None, "completed"):
                 bar.append("gpu-call-incomplete")
     if not gpu_measurements:
         bar.append("no-gpu-execution")
     stats = []
-    for measurements in gpu_measurements:
+    for measurements, executed in gpu_measurements:
         memory = measurements.get("memory")
         value = memory.get("stats") if isinstance(memory, dict) else None
         if not isinstance(value, dict) or not value:
@@ -94,6 +95,14 @@ def record(path, cell, number, state, substitute, summary):
         for field in ("leftover", "paged_in", "retries"):
             if not integer(value.get(field)):
                 bar.append(f"no-valid-{field}")
+        by_gpu = value.get("leftover_by_gpu")
+        if (not isinstance(by_gpu, list) or not by_gpu or
+            any(not isinstance(row, list) or len(row) != 2 or not all(integer(n) for n in row) for row in by_gpu)):
+            bar.append("no-valid-leftover-by-gpu")
+        elif (len({row[0] for row in by_gpu}) != len(by_gpu) or
+              executed != {row[0] for row in by_gpu} or
+              sum(row[1] for row in by_gpu) != value.get("leftover")):
+            bar.append("leftover-gpu-coverage")
         steps = value.get("steps")
         if not isinstance(steps, dict) or any(not isinstance(k, str) or not isinstance(v, list) or
                                              not all(integer(n) for n in v) for k, v in steps.items()):
