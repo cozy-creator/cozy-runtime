@@ -68,7 +68,7 @@ from msgspec import UNSET, UnsetType
 
 from cozy_runtime import __version__ as RUNTIME_VERSION
 from cozy_runtime import graphs
-from cozy_runtime.author import describe
+from cozy_runtime.author import _split, describe
 from cozy_runtime.author._activity import ThreadPoolExecutor, own_thread
 from cozy_runtime.author._app import Registration
 from cozy_runtime.author._artifacts import ModelArtifact
@@ -2312,6 +2312,7 @@ class Executor:
         cuda_ms = (time.perf_counter() - started) * 1000
         stage("cuda_init")
         from tensorfs.varena import Unsupported as VarenaUnsupported
+        from tensorfs.varena import cuts
         from tensorfs.varena.torch import Memory
 
         from cozy_runtime.author import ModelRegistry
@@ -2541,6 +2542,8 @@ class Executor:
             except VarenaUnsupported as exc:  # no varena on this OS (Windows)
                 return {"ok": False, "code": "weight_plane_unavailable", "detail": str(exc)}
             host.memory.context = max(host.device_context, 0)
+            _split.install(cuts.split)
+            attention_ulysses.install(cuts.attend)
         backend = Backend(
             checkpoints,
             rows,

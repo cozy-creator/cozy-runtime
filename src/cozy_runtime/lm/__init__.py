@@ -47,7 +47,7 @@ from cozy_runtime.author._context import CURRENT, Context
 from cozy_runtime.author._errors import is_capacity
 from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building
 from cozy_runtime.author.kernels import KernelsUnavailable, Launch, Plan, TritonKernels
-from cozy_runtime.graphs import BYPASS, capture, native, say
+from cozy_runtime.graphs import BYPASS, capture, say
 from cozy_runtime.lm import _kernels
 
 try:
@@ -1094,10 +1094,9 @@ class _Engine:
         """The model (and its head) pinned at home for the decode graphs (`Residency.pin`);
         False when part of one streams (the calls then decode through Transformers' loop)."""
         targets = self._targets()
-        # The steps also read buffers the model builds (its rotary tables): they stay where the
-        # graphs recorded them, and a rebuilt one (a component placed again) records anew.
+        # The steps also read buffers the model builds (its rotary tables): a rebuilt one (a
+        # component placed again) records anew.
         derived = _derived(m for m in (self.model, self.draft) if m is not None)
-        native(torch, *derived)
         built = tuple(t.data_ptr() for t in derived)
         if not targets:
             self.where = (built,)
@@ -1478,12 +1477,6 @@ class _Engine:
             self._empty(slot)
         self.rows_index = torch.arange(capacity, device=device)
         self.flag = torch.zeros((size,), dtype=torch.bool, pin_memory=device.type == "cuda")
-        # Its steps read them under their graphs, outside the dispatch mode: they never leave.
-        held = [*fields.values(), self.rows_index]
-        for layer in (*cache.layers, *([draft] if self.draft is not None else [])):
-            for value in vars(layer).values():
-                held.extend(value.values() if isinstance(value, dict) else [value])
-        native(torch, *held)
         self.views = {}
         self._forget()
         self.width = stops

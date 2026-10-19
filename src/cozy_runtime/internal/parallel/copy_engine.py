@@ -71,9 +71,8 @@ class CopyEngineExchange:
         self.handle.barrier(channel=0)
         issued = torch.cuda.Event()
         issued.record(current)
-        # The receive buffers are scratch: a group GPU journals every block's writes into
-        # storage it did not make (`weights.Journal`), and cloning these whole buffers per
-        # block cost 70 s a denoise step (H100 NVL, H3). Their copies bypass Python dispatch.
+        # The receive buffers are scratch: their copies bypass Python dispatch, so the memory's
+        # catch never takes a block that writes them for one that writes its inputs.
         with torch._C._DisableTorchDispatch():
             self._issue(sends, matrix, widths, received, issued, current)
         self.handle.barrier(channel=1)
