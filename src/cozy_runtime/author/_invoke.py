@@ -23,7 +23,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import hashlib
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass, field, is_dataclass, replace
 from fractions import Fraction
@@ -136,6 +136,7 @@ class Invocation:
     """The runtime's lossy LIVE sink (cr-007/cr-011): progress frames and retained
     observations alike. Best-effort, never authoritative."""
     activity: Callable[[int, bool, bool, bool], None] | None = None
+    plan: Callable[[Sequence[str | Collection[str]]], None] | None = None
     calls: _Broker | None = None
     publish: Callable[[Publish], Published] | None = None
     """`Outputs.publish`'s exchange with the machine, which journals the run's output log."""
@@ -316,7 +317,9 @@ def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> Invoc
     attempt.outputs = surface.outputs
     ctx = Context(inv.request_id, inv.deadline, inv.device, inv.cancel, inv.adapters)
     placed = next((m._cozy_residency for m in models if m._cozy_residency is not None), None)
-    if placed is not None:
+    if inv.plan is not None:
+        ctx._plan = inv.plan
+    elif placed is not None:
         ctx._plan = functools.partial(placed.plan, inv.request_id)
     handles = ExitStack()
     _bind_tensorfs(ctx, record, inv, surface, handles)

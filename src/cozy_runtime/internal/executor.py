@@ -58,7 +58,7 @@ import sys
 import threading
 import time
 import traceback
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -183,11 +183,9 @@ from cozy_runtime.internal.executor_commands import (
     Start,
     Unload,
 )
-from cozy_runtime.internal.executor_replies import Copy as ReplyCopy
-from cozy_runtime.internal.executor_replies import Eviction as ReplyEviction
 from cozy_runtime.internal.executor_replies import Memory as ReplyMemory
-from cozy_runtime.internal.executor_replies import Peak as ReplyPeak
-from cozy_runtime.internal.executor_replies import Step as ReplyStep
+from cozy_runtime.internal.executor_replies import RankMemory
+from cozy_runtime.internal import request_memory
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.fill import (
     Checkpoint,
@@ -234,7 +232,7 @@ else:
     import resource
 
 if TYPE_CHECKING:
-    from tensorfs.varena.torch import Memory, RequestStats
+    from tensorfs.varena.torch import Memory, Request as MemoryRequest, RequestStats
 
 #: The native inline-result door: a small typed result rides
 #: the terminal envelope and skips the file-store round trip. Larger than this REFUSES at
@@ -568,21 +566,6 @@ def _allocations(torch: Any) -> int:
     return int(torch.cuda.memory_stats().get("allocation.all.allocated", 0))
 
 
-def _reply_step(step: Any) -> ReplyStep:
-    """A `tensorfs.varena.torch.Step` as the reply carries it."""
-    return ReplyStep(
-        model=step.model,
-        gpu=step.gpu,
-        step=step.step,
-        home=step.home,
-        resident=step.resident,
-        paged_in=step.paged_in,
-        streamed=step.streamed,
-        stall_ns=step.stall_ns,
-        activations=step.activations,
-    )
-
-
 def _serving(module: str, export: str, surface: Any) -> _CallType:
     """A callable bound from its own code, called as every function is: `{payload, models}`.
     Its direct caller passes the model slots beside the request fields (`_CallType.models`)."""
@@ -616,6 +599,14 @@ def _serving(module: str, export: str, surface: Any) -> _CallType:
 
 
 # --------------------------------------------------------------------------- state
+
+
+@dataclasses.dataclass(slots=True)
+class _RankRequest:
+    construction: str
+    id: str
+    context: contextlib.AbstractContextManager[MemoryRequest | None]
+    request: MemoryRequest | None
 
 
 class _CompositeResidency:
@@ -776,6 +767,7 @@ class Executor:
         self._run_entry: tuple[Path, int] | None = None
         #: follower only: every kernel its processors held across that attempt's calls
         self._run_held = attention.Applied({}, ())
+        self._rank_request: _RankRequest | None = None
         #: HOST ONLY: this process's start, for the execution record (wall ms and its legs)
         self.boot: dict[str, Any] = {}
         #: HOST ONLY: this rank's pid, host ordinal, GPU uuid and arch, read once after device init
@@ -894,6 +886,10 @@ class Executor:
                     return {"ok": False, "code": "construction_absent"}
                 keeping._keep_weights()
                 return {"ok": True}
+            case executor_commands.RequestMemory():
+                reply = msgspec.to_builtins(self.request_memory(command))
+                assert isinstance(reply, dict)
+                return reply
             case Shutdown():
                 raise AssertionError("shutdown ends the command loop")
 
@@ -2001,36 +1997,13 @@ class Executor:
         return sum(n for name, n in memory.resident().items() if name in names)
 
     @staticmethod
-    def _memory(request: RequestStats | None) -> dict[str, Any] | None:
-        """The request's memory as its reply states it (`ReplyMemory`): the merge gate's
-        leftover, paged-in and per-step bytes, then the detail: rows, evictions, the peaks and
-        cuts per shape key, and its out-of-memory retries."""
-        if request is None:
-            return None
-        steps: dict[str, list[int]] = {}
-        for step in request.steps:
-            steps.setdefault(step.model, []).append(step.paged_in + step.streamed)
-        memory = ReplyMemory(
-            leftover=sum(n for _, n in request.leftover),
-            paged_in=request.copied,
-            steps=steps,
-            rows=[_reply_step(s) for s in request.steps],
-            evictions=[
-                ReplyEviction(
-                    model=e.model, gpu=e.gpu, rung=e.rung, reason=e.reason, nbytes=e.nbytes
-                )
-                for e in request.evictions
-            ],
-            peaks=[
-                ReplyPeak(model=p.model, shape=p.shape, peak=p.peak, cuts=list(p.cuts))
-                for p in request.peaks
-            ],
-            retries=request.retries,
-            leftover_by_gpu=list(request.leftover),
-            plan=[list(step) for step in request.plan],
-            copies=[ReplyCopy(**dataclasses.asdict(c)) for c in request.copies],
-        )
-        return cast("dict[str, Any]", msgspec.to_builtins(memory))
+    def _memory(
+        request: RequestStats | None, followers: Sequence[ReplyMemory] = (), degree: int = 1
+    ) -> dict[str, Any] | None:
+        own = request_memory.measured(request, _gpu_numbers(degree))
+        records = ([own] if own is not None else []) + list(followers)
+        memory = request_memory.combined(records)
+        return None if memory is None else cast("dict[str, Any]", msgspec.to_builtins(memory))
 
     def _members(self) -> list[Executor]:
         """Every loaded model's generation in this process."""
@@ -3378,11 +3351,13 @@ class Executor:
         storage = ExecutionStorage(spool, exchange, command.weights)
         stage_memo.ENGINE.open(exchange, spool)
         warnings: list[WarningRow] = []
-        request: Any = None
+        request: MemoryRequest | None = None
+        rank_memory: list[ReplyMemory] = []
         try:
             with (
                 WARNINGS.attempt() as warnings,
                 self._request(command.request_id) as request,
+                self._ranks_request(command.request_id) as rank_memory,
                 attention.override(self._attention_snapshot(), self._attention_roots(), swap, pin)
                 if pin
                 else contextlib.nullcontext(
@@ -3408,6 +3383,7 @@ class Executor:
                             models=self.models,
                             progress=boundary,
                             activity=self._activity_sink(command.request_id),
+                            plan=functools.partial(self._plan_request, command.request_id),
                             # cr-012: the inputs the WORKER already fetched, verified and spooled.
                             # Every value is a path inside this attempt's own spool: this process is
                             # `sandbox.refuse_network` rejects ungranted network access.
@@ -3502,7 +3478,9 @@ class Executor:
         self._emit_attention(record, restored, "attention.restored")
         # The last attempt out drains the device, with none running.
         last = self.host.in_flight.last(slot)
-        memory = self._memory(request.stats if request is not None else None)
+        memory = self._memory(
+            request.stats if request is not None else None, rank_memory, self.world
+        )
         handler_ms = (time.perf_counter() - lease_acquired) * 1000
         self._attempt_spool = self.host._attempt_spool = None
         self.host._attempt_request = ""
@@ -3524,9 +3502,11 @@ class Executor:
         if last:
             self._keep_weights()
             if self.group is not None:
-                replies = self.group.call(executor_commands.encode(
-                    executor_commands.KeepWeights(construction=self.construction)
-                ))
+                replies = self.group.call(
+                    executor_commands.encode(
+                        executor_commands.KeepWeights(construction=self.construction)
+                    )
+                )
                 if any(not reply.get("ok") for reply in replies):
                     self.poisoned = "a follower could not keep its completed weight pages"
         released_us = execution_evidence.now_us()
@@ -3894,6 +3874,118 @@ class Executor:
             detail = f"{_gpu(int(reply.get('rank', -1)))}: {reply.get('detail', '')}"[:900]
             raise InvalidRequest(detail, code=str(reply.get("code")))
         return replies
+
+    def request_memory(self, command: executor_commands.RequestMemory) -> RankMemory:
+        state = self.host._rank_request
+        if not command.request_id or command.construction not in self.constructions:
+            return RankMemory(
+                ok=False, rank=self.rank, request_id=command.request_id, code="construction_absent"
+            )
+        if command.phase == "begin":
+            if state is not None:
+                return RankMemory(
+                    ok=False,
+                    rank=self.rank,
+                    request_id=command.request_id,
+                    code="request_memory_busy",
+                )
+            context = self._request(command.request_id)
+            request = context.__enter__()
+            self.host._rank_request = _RankRequest(
+                command.construction, command.request_id, context, request
+            )
+        elif state is None or (state.id, state.construction) != (
+            command.request_id,
+            command.construction,
+        ):
+            return RankMemory(
+                ok=False,
+                rank=self.rank,
+                request_id=command.request_id,
+                code="request_memory_absent",
+            )
+        elif command.phase == "plan":
+            if state.request is not None:
+                state.request.plan(command.steps)
+        else:
+            self.host._rank_request = None
+            state.context.__exit__(None, None, None)
+            memory = request_memory.measured(
+                state.request.stats if state.request is not None else None, _gpu_numbers(self.world)
+            )
+            return RankMemory(ok=True, rank=self.rank, request_id=command.request_id, memory=memory)
+        return RankMemory(ok=True, rank=self.rank, request_id=command.request_id)
+
+    def _rank_memory_command(self, command: executor_commands.RequestMemory) -> list[RankMemory]:
+        assert self.group is not None
+        try:
+            replies = [
+                msgspec.convert(reply, RankMemory, strict=True)
+                for reply in self.group.call(executor_commands.encode(command))
+            ]
+        except msgspec.ValidationError as exc:
+            self.poisoned = "group request memory reply was malformed"
+            raise GroupRefusal(self.poisoned, code="group_broken") from exc
+        if (
+            {reply.rank for reply in replies} != set(range(1, self.world))
+            or len(replies) != self.world - 1
+            or any(not reply.ok or reply.request_id != command.request_id for reply in replies)
+        ):
+            self.poisoned = "group request memory did not settle on every rank"
+            raise GroupRefusal(self.poisoned, code="group_broken")
+        return replies
+
+    @contextlib.contextmanager
+    def _ranks_request(self, request_id: str) -> Iterator[list[ReplyMemory]]:
+        records: list[ReplyMemory] = []
+        if self.group is None:
+            yield records
+            return
+        begun = False
+        try:
+            self._rank_memory_command(
+                executor_commands.RequestMemory(
+                    construction=self.construction, request_id=request_id, phase="begin"
+                )
+            )
+            begun = True
+            yield records
+        finally:
+            if not self.group.broken:
+                command = executor_commands.RequestMemory(
+                    construction=self.construction, request_id=request_id, phase="end"
+                )
+                if begun:
+                    replies = self._rank_memory_command(command)
+                    memory = self.host.memory
+                    if (
+                        memory is not None
+                        and memory.cuda
+                        and any(reply.memory is None for reply in replies)
+                    ):
+                        self.poisoned = "a GPU rank omitted its request memory"
+                        raise GroupRefusal(self.poisoned, code="group_broken")
+                    records.extend(reply.memory for reply in replies if reply.memory is not None)
+                else:
+                    # A partial begin still closes the ranks that entered; the original
+                    # refusal, not an absent state on another rank, remains the failure.
+                    self.group.call(executor_commands.encode(command))
+
+    def _plan_request(self, request_id: str, steps: Sequence[str | Collection[str]]) -> None:
+        if self.host.memory is not None:
+            self.host.memory.plan(request_id, list(steps))
+        if self.group is not None:
+            normalized = tuple(
+                (step,) if isinstance(step, str) else tuple(sorted(step)) for step in steps
+            )
+            self._rank_memory_command(
+                executor_commands.RequestMemory(
+                    construction=self.construction,
+                    request_id=request_id,
+                    phase="plan",
+                    steps=normalized,
+                )
+            )
 
     @contextlib.contextmanager
     def _ranks_attention(self, pin: str, applied: attention.Applied) -> Iterator[None]:
@@ -4324,11 +4416,15 @@ class Executor:
         passed: list[int] = []
         try:
             if kind not in _RELAYED:
-                follower.send({
-                    "event": "answer", "seq": seq, "ok": False,
-                    "code": "request_unsupported",
-                    "detail": f"{_gpu(0)} relays no {kind!r} request",
-                })
+                follower.send(
+                    {
+                        "event": "answer",
+                        "seq": seq,
+                        "ok": False,
+                        "code": "request_unsupported",
+                        "detail": f"{_gpu(0)} relays no {kind!r} request",
+                    }
+                )
                 return
 
             def receive(answer: Frame) -> None:
@@ -4423,13 +4519,13 @@ class Executor:
         lane's device: the worker sealed this process to exactly its lane (cr-066)."""
         return Device(self.device_kind, 0) if self.torch is not None else Device()
 
-    def _request(self, request_id: str) -> contextlib.AbstractContextManager[Any]:
+    def _request(self, request_id: str) -> contextlib.AbstractContextManager[MemoryRequest | None]:
         """The attempt as varena's request (memory-varena §5.7): everything it allocated is freed
         at its end, failed or not, and its steps are measured."""
         memory = self.host.memory
         if memory is None:
             return contextlib.nullcontext()
-        return cast("contextlib.AbstractContextManager[Any]", memory.request(request_id))
+        return memory.request(request_id)
 
     def _quiescent(self) -> bool:
         """No author computation may still mutate GPU or output state when a terminal is
@@ -4654,6 +4750,8 @@ _FOLLOWER_COMMANDS = frozenset(
         "unload",
         "run",
         "attention",
+        "keep_weights",
+        "request_memory",
         "vacate",
         "restore",
         "budget",

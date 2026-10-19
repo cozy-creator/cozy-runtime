@@ -75,3 +75,12 @@ class Memory(msgspec.Struct, frozen=True, kw_only=True):
     #: the declared plan (`Context.plan`), each step's components
     plan: list[list[str]] = []
     copies: list[Copy] = []
+
+
+class RankMemory(msgspec.Struct, frozen=True, kw_only=True):
+    ok: bool
+    rank: int
+    request_id: str
+    memory: Memory | None = None
+    code: str = ""
+    detail: str = ""
