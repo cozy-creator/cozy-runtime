@@ -272,6 +272,8 @@ class Output:
 
     def put(self, component: str, key: str, dtype: str, shape: Sequence[int], data: Data) -> None:
         """A plain tensor: exactly its bytes."""
+        if self.done is not None:
+            return
         with _view(data) as view:
             self._spend(view.nbytes)
             self.component(component).put(key, view, dtype=dtype, shape=list(shape))
@@ -287,6 +289,8 @@ class Output:
         parts: Sequence[PartData],
     ) -> None:
         """An encoded tensor: its logical dtype and shape, scheme and params, and each part."""
+        if self.done is not None:
+            return
         with contextlib.ExitStack() as stack:
             views = {
                 role: (part_dtype, list(part_shape), stack.enter_context(_view(data)))
@@ -308,6 +312,8 @@ class Output:
     ) -> None:
         """A tensor of `source`, renamed when asked: its stored parts are referenced, never
         written again."""
+        if self.done is not None:
+            return
         self.component(component).copy(
             from_key or key, source.components[from_component or component], as_key=key
         )
@@ -324,12 +330,15 @@ class Output:
             for component, ordered in keys.items():
                 self.component(component).order(ordered)
             committed = self._writer.commit()
-            revision = tensorfs.upload_folder(
+            tensorfs.upload_folder(
                 repo_id=DERIVED, revision=_release(self.transaction), folder_path=committed.path,
                 cache_dir=self.store.root, endpoint="local",
             )  # fmt: skip
             self.done = tensorfs.open(
-                DERIVED, revision=revision, cache_dir=self.store.root, local_files_only=True
+                DERIVED,
+                revision=_release(self.transaction),
+                cache_dir=self.store.root,
+                local_files_only=True,
             )
             self.close()
         return self.done

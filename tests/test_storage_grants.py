@@ -43,6 +43,11 @@ class Result(msgspec.Struct):
     transaction: str = ""
 
 
+@app.entrypoint(accelerator=False)
+def idle(payload: Request) -> Result:
+    return Result("no-storage-needed")
+
+
 @app.entrypoint(accelerator=False, weights=(WeightsOutput("model", max_new_bytes=4096),))
 def compute(payload: Request, ctx: Context, source: Weights[Any]) -> Result:
     if not payload.use_output:
@@ -225,7 +230,7 @@ def test_request_authority_ends_without_unloading_warm_models(
         assert len(executor.hub_access) == 2
         assert executor.unload(Unload(construction="", request_id="alice"))["ok"]
         assert set(executor.hub_requests) == {"bob"}, "a canceled run keeps no authority"
-        reply = host.run("compute", {"use_output": False}, tmp_path / "bob", hub=bob)
+        reply = host.run("idle", {"use_output": False}, tmp_path / "bob", hub=bob)
         assert reply["outcome"]["terminal"] == "succeeded", reply
         assert not executor.hub_access and not executor.hub_requests
         assert executor.store is None, "a function with no weights grant needs no store"
