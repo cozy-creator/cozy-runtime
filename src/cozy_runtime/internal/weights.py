@@ -19,13 +19,11 @@ from collections import Counter
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
-from typing import Any, Protocol, runtime_checkable
+from types import ModuleType
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
-import torch
 from tensorfs.varena.torch import Cache, Memory, Model, Shed, Unbound, WeightGrant, regions_of
 from tensorfs.varena.torch import innermost_blocks as blocks_of
-from torch import Tensor
-from torch.nn import Module
 
 from cozy_runtime.author._executor_requests import SealedPlan
 from cozy_runtime.author._loader import Census, TensorLike, TensorSpec, _members
@@ -60,6 +58,11 @@ from cozy_runtime.internal.probe import QualificationResult
 from cozy_runtime.internal.qualification import qualified
 from cozy_runtime.internal.resolution import ResolvedModelPlan, TensorResolution, script_plan
 
+if TYPE_CHECKING:
+    import torch
+    from torch import Tensor
+    from torch.nn import Module
+
 #: The read window a sealed host layout's plan is cut into (TensorD's `plan_for_traversal`).
 READ_WINDOW = 4 << 20
 
@@ -79,6 +82,7 @@ class Backend:
         checkpoints: Mapping[str, Checkpoint],
         rows: Sequence[PlanRow],
         *,
+        torch: ModuleType,
         plan: ResolvedModelPlan,
         memory: Memory,
         device: torch.device,
@@ -138,6 +142,7 @@ class Backend:
         checkpoints: Mapping[str, Checkpoint],
         rows: Sequence[PlanRow],
         *,
+        torch: ModuleType,
         memory: Memory,
         device: torch.device,
         construction: str,
@@ -175,6 +180,7 @@ class Backend:
         return cls(
             checkpoints,
             rows,
+            torch=torch,
             plan=plan,
             memory=memory,
             device=device,
@@ -424,7 +430,7 @@ class Backend:
         if self.grant is not None and self.device.type != "mps":
             regions = regions_of(grant, blocks_of(root))
             fd = self.grant(self._sealed(name, checkpoint, regions, rows))
-        bakes = self.bakes[name] = _Bakes(root, rows, set(blocks_of(root)))
+        bakes = self.bakes[name] = _Bakes(self.torch, root, rows, set(blocks_of(root)))
         target: int | torch.device = (
             self.device.index or 0 if self.device.type == "cuda" else self.device
         )
@@ -528,6 +534,7 @@ class _Routes:
     the stored ones). What it makes lives for that bind only."""
 
     def __init__(self, backend: Backend, rows: Mapping[str, PlanRow]) -> None:
+        self.torch = backend.torch
         self.rows = dict(rows)
         self.routes = {stored: backend._route(row.key) for stored, row in rows.items()}
         self.providers = {
@@ -540,7 +547,7 @@ class _Routes:
         }
 
     def __call__(self, key: str, parts: Mapping[str, Tensor]) -> Mapping[str, Tensor]:
-        row = self.rows[key]
+        torch, row = self.torch, self.rows[key]
         name = row.key.partition(".")[2]
         route = self.routes[key]
         if route == "verbatim":
@@ -587,7 +594,10 @@ class _Bakes:
     (`Memory.register(fill=)`), so a resident page carries its delta and an evicted one bakes
     again on its refault. Each weight's own seed makes every bake of it the same bytes."""
 
-    def __init__(self, root: Module, rows: Mapping[str, PlanRow], blocks: set[str]) -> None:
+    def __init__(
+        self, torch: ModuleType, root: Module, rows: Mapping[str, PlanRow], blocks: set[str]
+    ) -> None:
+        self.torch = torch
         self.bakes: dict[str, _Bake] = {}
         self.strategy: lora_bake.Strategy = "bake"
         self.baked_with: tuple[object, ...] | None = None
@@ -664,7 +674,7 @@ class _Bakes:
                     ups.append(got[2] * got[3])
             if not downs:
                 continue
-            kind = downs[0].dtype
+            kind, torch = downs[0].dtype, self.torch
             lora_bake.bake(
                 torch,
                 dict(weight),
@@ -686,7 +696,7 @@ class Residency:
     def __init__(
         self, memory: Memory, backend: Backend, scopes: Mapping[str, tuple[str, ...]]
     ) -> None:
-        self.memory = memory
+        self.memory, self.torch = memory, backend.torch
         self.models = dict(backend.models)
         self.bakes = dict(backend.bakes)
         self.scopes = dict(scopes)
@@ -769,8 +779,9 @@ class Residency:
         gpu = next((m.gpu for m in self.models.values()), -1)
         if gpu < 0:
             return 0
-        free = torch.cuda.mem_get_info(gpu)[0]
-        return int(free + torch.cuda.memory_reserved(gpu) - torch.cuda.memory_allocated(gpu))
+        cuda = self.torch.cuda
+        free = cuda.mem_get_info(gpu)[0]
+        return int(free + cuda.memory_reserved(gpu) - cuda.memory_allocated(gpu))
 
     def note(self, key: str, value: str) -> None:
         self.notes[key] = value

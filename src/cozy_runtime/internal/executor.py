@@ -2545,6 +2545,7 @@ class Executor:
         backend = Backend(
             checkpoints,
             rows,
+            torch=torch,
             plan=plan,
             memory=host.memory,
             device=device,
