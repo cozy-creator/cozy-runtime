@@ -47,7 +47,7 @@ from typing import Any
 from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT
 from cozy_runtime.author._capture import _capture_clock
 from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building
-from cozy_runtime.internal import attention_ulysses, module_state, spill
+from cozy_runtime.internal import attention_ulysses, module_state
 
 #: Set while a mechanism runs its own graphs over a component (`cozy_runtime.lm`): its calls
 #: pass straight through.
@@ -65,12 +65,6 @@ HOST_BOUND, PAYS = 0.5, 0.9
 TRIES = 4
 _PLAIN = (type(None), bool, int, float, str)
 _SAID: set[str] = set()
-
-
-def native(torch: Any, *tensors: Any) -> None:
-    """Storages graphs read by address (a recording's static inputs, an LM engine's buffers):
-    memory never moves them off the device (`spill.native`)."""
-    spill.native(torch, *tensors)
 
 
 def say(key: str, line: str) -> None:
@@ -316,7 +310,6 @@ def _record(
         recorder.pool, recorder.stream = torch.cuda.graph_pool_handle(), torch.cuda.Stream()
     reserved = torch.cuda.memory_reserved()
     inputs = [leaf.clone() if isinstance(leaf, torch.Tensor) else None for leaf in leaves]
-    native(torch, inputs)
     static = [s if s is not None else v for s, v in zip(inputs, leaves, strict=True)]
     cargs, ckwargs = torch.utils._pytree.tree_unflatten(static, spec)
     outputs: list[Any] = []
@@ -332,7 +325,6 @@ def _record(
     except Building as building:  # as written until a kernel lands: `forget` tries again
         graph, why, recorder.pool = None, "", None  # the aborted capture spent its pool
         _chose(recorder, key, "kernel building", f"{building} builds; it records once one lands")
-    native(torch, outputs)  # in the graph's pool: its replays write them
     if graph is not None and not _clonable(torch, outputs[0]):
         graph, why = None, f"its output {type(outputs[0]).__name__} is not a tree of tensors"
     if graph is not None:

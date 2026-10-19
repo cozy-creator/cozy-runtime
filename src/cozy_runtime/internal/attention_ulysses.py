@@ -16,9 +16,6 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, TypedDict
 
-from cozy_runtime.author._errors import is_device_oom
-from cozy_runtime.internal import bands, spill
-
 if TYPE_CHECKING:
     from diffusers.models.attention_dispatch import AttentionBackendName
     from torch import Tensor
@@ -55,7 +52,7 @@ class Local:
     `forward(query, key, value, *, attn_mask, dropout_p, is_causal, scale, enable_gqa)`
     validates what it serves; `impl(query, key, value, options)` names the concrete
     implementation serving those operands, e.g. the SDPA backend torch dispatches. `rows`: the
-    query block a call may be cut at and compute each row as whole (`bands.Bands.attend`);
+    query block a call may be cut at and compute each row as whole (memory's `attend` cut);
     0 where the kernel needs every query row at once (a scale or mean over the sequence).
     """
 
@@ -71,6 +68,13 @@ _SEEN: ContextVar[tuple[dict[str, set[str]], set[object]] | None] = ContextVar(
     "cozy_attention_seen", default=None
 )
 _MEMBERS: dict[str, AttentionBackendName] = {}
+#: the memory's attention cut (`tensorfs.varena.cuts.attend`), installed with the memory
+_CUT: Callable[..., Tensor] | None = None
+
+
+def install(cut: Callable[..., Tensor] | None) -> None:
+    global _CUT
+    _CUT = cut
 
 
 @contextmanager
@@ -136,7 +140,6 @@ def _dispatch(backend: str, local: Local) -> Callable[..., Tensor]:
     return attention
 
 
-@bands.cuts
 def _call(
     backend: str, local: Local, query: Tensor, key: Tensor, value: Tensor, options: Options
 ) -> Tensor:
@@ -148,26 +151,18 @@ def _call(
         if signature not in named:
             named.add(signature)
             seen.setdefault(backend, set()).add(local.impl(query, key, value, options))
-    if not (spill.HELD and any(map(spill.hosted, (query, key, value)))):
-        try:
-            return local.forward(query, key, value, **options)
-        except Exception as exc:
-            if not is_device_oom(exc):
-                raise
-    return _cut(local, query, key, value, options)
-
-
-def _cut(local: Local, query: Tensor, key: Tensor, value: Tensor, options: Options) -> Tensor:
-    """Attention that ran out of device memory whole, or reads host memory, in pieces where
-    this device cuts (`bands.Bands.attend`); else whole once more, room made for its ops. Apart
-    from `_call`, whose hot path then holds no closure."""
-    cut = bands.ON.get(str(query.device))
-    rows = 0 if options["is_causal"] else local.rows
-    out = None if cut is None else cut.attend(
+    cut = _CUT
+    if cut is None:
+        return local.forward(query, key, value, **options)
+    return cut(
         lambda q, k, v, mask: local.forward(q, k, v, **{**options, "attn_mask": mask}),
-        query, key, value, options["attn_mask"], rows, local.head_local,
-    )  # fmt: skip
-    return bands.held(lambda: local.forward(query, key, value, **options)) if out is None else out
+        query,
+        key,
+        value,
+        options["attn_mask"],
+        rows=0 if options["is_causal"] else local.rows,
+        heads=local.head_local,
+    )
 
 
 def group(config: object) -> ProcessGroup:
