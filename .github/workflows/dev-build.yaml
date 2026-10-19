@@ -12,7 +12,7 @@ on:
         type: string
         default: master
       build:
-        description: "wheels: sdist, pure wheel and the runner arch's Linux wheel with its kernels; pure: sdist and pure wheel; none: tests only"
+        description: "wheels: locked build; assemble: diagnostic wheels without project install or tests; pure: sdist and pure wheel; none: tests only"
         type: string
         default: wheels
       test:
@@ -35,7 +35,7 @@ permissions:
 jobs:
   # The runner arch's kernel modules, cached by everything that shapes their bytes (kernels.yaml).
   modules:
-    if: ${{ inputs.build == 'wheels' }}
+    if: ${{ inputs.build == 'wheels' || (inputs.build == 'assemble' && inputs.test == '') }}
     uses: ./.github/workflows/kernels.yaml
     with:
       ref: ${{ inputs.ref }}
@@ -49,7 +49,7 @@ jobs:
     # Hang bound, not a work budget.
     timeout-minutes: 60
     env:
-      WHEELS: ${{ inputs.build == 'wheels' }}
+      WHEELS: ${{ inputs.build == 'wheels' || inputs.build == 'assemble' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -58,17 +58,24 @@ jobs:
       - id: pin
         working-directory: source
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Diagnostic assembly carries no test claim
+        if: inputs.build == 'assemble'
+        env:
+          TEST: ${{ inputs.test }}
+        run: test -z "$TEST" || { echo 'assemble packages diagnostic bytes only; use the locked test path for tests'; exit 1; }
       - uses: astral-sh/setup-uv@v7
       - uses: arduino/setup-task@v2
         with:
           repo-token: ${{ github.token }}
       - run: uv python install 3.12
       - name: TensorFS read access (an arm runner builds TensorFS from its tag)
+        if: inputs.build != 'assemble'
         env:
           TENSORFS_KEY: ${{ secrets.TENSORFS_READ_KEY }}
         run: bash source/scripts/prepare-release-source-access.sh
       # An arm runner builds the locked TensorFS from its tag until TensorFS publishes aarch64 wheels.
       - working-directory: source
+        if: inputs.build != 'assemble'
         run: |
           if [ "$RUNNER_ARCH" != ARM64 ]; then uv sync --locked; exit 0; fi
           uv sync --locked --no-install-package tensorfs
@@ -82,8 +89,13 @@ jobs:
         working-directory: source
         env:
           COZY_RUNTIME_BUILD_COMMIT: ${{ steps.pin.outputs.sha }}
+          BUILD: ${{ inputs.build }}
         run: |
-          uv run python scripts/stamp-build-provenance.py "$COZY_RUNTIME_BUILD_COMMIT"
+          if [ "$BUILD" = assemble ]; then
+            uv run --no-project python scripts/stamp-build-provenance.py "$COZY_RUNTIME_BUILD_COMMIT"
+          else
+            uv run python scripts/stamp-build-provenance.py "$COZY_RUNTIME_BUILD_COMMIT"
+          fi
           uv build --out-dir dist
       - if: env.WHEELS == 'true'
         uses: actions/download-artifact@v4
@@ -98,7 +110,14 @@ jobs:
       - name: Verify wheel selection
         if: env.WHEELS == 'true'
         working-directory: source
-        run: uv run --script scripts/verify-wheels.py --dist dist
+        env:
+          BUILD: ${{ inputs.build }}
+        run: |
+          if [ "$BUILD" = assemble ]; then
+            uv run --no-project --script scripts/verify-wheels.py --dist dist
+          else
+            uv run --script scripts/verify-wheels.py --dist dist
+          fi
       - if: inputs.build != 'none'
         uses: actions/upload-artifact@v4
         with:
