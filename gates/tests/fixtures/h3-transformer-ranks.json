@@ -1,0 +1,234 @@
+{
+  "provenance": "Synthetic per-rank additions to the real11880 producer shape; gate fixtures only, no GPU execution claim.",
+  "execution": [
+    {
+      "gpu": 2,
+      "start_us": 100,
+      "end_us": 200
+    },
+    {
+      "gpu": 3,
+      "start_us": 100,
+      "end_us": 200
+    }
+  ],
+  "complete": [
+    {
+      "model": "model/transformer_ref",
+      "gpu": 2,
+      "step": 7,
+      "home": 10,
+      "resident": 10,
+      "paged_in": 0,
+      "streamed": 0,
+      "stall_ns": 0,
+      "activations": 0
+    },
+    {
+      "model": "model/transformer_ref",
+      "gpu": 2,
+      "step": 8,
+      "home": 10,
+      "resident": 10,
+      "paged_in": 0,
+      "streamed": 0,
+      "stall_ns": 0,
+      "activations": 0
+    },
+    {
+      "model": "model/transformer_ref",
+      "gpu": 3,
+      "step": 7,
+      "home": 10,
+      "resident": 10,
+      "paged_in": 0,
+      "streamed": 0,
+      "stall_ns": 0,
+      "activations": 0
+    },
+    {
+      "model": "model/transformer_ref",
+      "gpu": 3,
+      "step": 8,
+      "home": 10,
+      "resident": 10,
+      "paged_in": 0,
+      "streamed": 0,
+      "stall_ns": 0,
+      "activations": 0
+    }
+  ],
+  "missing_gpu3": [
+    {
+      "model": "model/transformer_ref",
+      "gpu": 2,
+      "step": 7,
+      "home": 10,
+      "resident": 10,
+      "paged_in": 0,
+      "streamed": 0,
+      "stall_ns": 0,
+      "activations": 0
+    },
+    {
+      "model": "model/transformer_ref",
+      "gpu": 2,
+      "step": 8,
+      "home": 10,
+      "resident": 10,
+      "paged_in": 0,
+      "streamed": 0,
+      "stall_ns": 0,
+      "activations": 0
+    }
+  ],
+  "short_gpu3": [
+    {
+      "model": "model/transformer_ref",
+      "gpu": 2,
+      "step": 7,
+      "home": 10,
+      "resident": 10,
+      "paged_in": 0,
+      "streamed": 0,
+      "stall_ns": 0,
+      "activations": 0
+    },
+    {
+      "model": "model/transformer_ref",
+      "gpu": 2,
+      "step": 8,
+      "home": 10,
+      "resident": 10,
+      "paged_in": 0,
+      "streamed": 0,
+      "stall_ns": 0,
+      "activations": 0
+    },
+    {
+      "model": "model/transformer_ref",
+      "gpu": 3,
+      "step": 7,
+      "home": 10,
+      "resident": 10,
+      "paged_in": 0,
+      "streamed": 0,
+      "stall_ns": 0,
+      "activations": 0
+    }
+  ],
+  "duplicate_pass": [
+    {
+      "model": "model/transformer_ref",
+      "gpu": 2,
+      "step": 7,
+      "home": 10,
+      "resident": 10,
+      "paged_in": 0,
+      "streamed": 0,
+      "stall_ns": 0,
+      "activations": 0
+    },
+    {
+      "model": "model/transformer_ref",
+      "gpu": 2,
+      "step": 8,
+      "home": 10,
+      "resident": 10,
+      "paged_in": 0,
+      "streamed": 0,
+      "stall_ns": 0,
+      "activations": 0
+    },
+    {
+      "model": "model/transformer_ref",
+      "gpu": 3,
+      "step": 7,
+      "home": 10,
+      "resident": 10,
+      "paged_in": 0,
+      "streamed": 0,
+      "stall_ns": 0,
+      "activations": 0
+    },
+    {
+      "model": "model/transformer_ref",
+      "gpu": 3,
+      "step": 8,
+      "home": 10,
+      "resident": 10,
+      "paged_in": 0,
+      "streamed": 0,
+      "stall_ns": 0,
+      "activations": 0
+    },
+    {
+      "model": "model/transformer_ref",
+      "gpu": 3,
+      "step": 8,
+      "home": 10,
+      "resident": 10,
+      "paged_in": 0,
+      "streamed": 0,
+      "stall_ns": 0,
+      "activations": 0
+    }
+  ],
+  "wrong_gpu": [
+    {
+      "model": "model/transformer_ref",
+      "gpu": 2,
+      "step": 7,
+      "home": 10,
+      "resident": 10,
+      "paged_in": 0,
+      "streamed": 0,
+      "stall_ns": 0,
+      "activations": 0
+    },
+    {
+      "model": "model/transformer_ref",
+      "gpu": 2,
+      "step": 8,
+      "home": 10,
+      "resident": 10,
+      "paged_in": 0,
+      "streamed": 0,
+      "stall_ns": 0,
+      "activations": 0
+    },
+    {
+      "model": "model/transformer_ref",
+      "gpu": 3,
+      "step": 7,
+      "home": 10,
+      "resident": 10,
+      "paged_in": 0,
+      "streamed": 0,
+      "stall_ns": 0,
+      "activations": 0
+    },
+    {
+      "model": "model/transformer_ref",
+      "gpu": 3,
+      "step": 8,
+      "home": 10,
+      "resident": 10,
+      "paged_in": 0,
+      "streamed": 0,
+      "stall_ns": 0,
+      "activations": 0
+    },
+    {
+      "model": "model/transformer_ref",
+      "gpu": 1,
+      "step": 7,
+      "home": 10,
+      "resident": 10,
+      "paged_in": 0,
+      "streamed": 0,
+      "stall_ns": 0,
+      "activations": 0
+    }
+  ]
+}

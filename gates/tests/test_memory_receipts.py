@@ -22,6 +22,11 @@ def positive():
     stats.update(leftover=0, paged_in=0, retries=0)
     stats["leftover_by_gpu"] = [[0, 0]]
     stats["steps"] = {"model/transformer_ref": [0, 0]}
+    stats["rows"] = [
+        {"model": "model/transformer_ref", "gpu": 0, "step": step,
+         "home": 10, "resident": 10, "paged_in": 0, "streamed": 0, "stall_ns": 0, "activations": 0}
+        for step in (7, 8)
+    ]
     return value
 
 
@@ -112,6 +117,41 @@ class MemoryReceipts(unittest.TestCase):
         code, text = self.record(value, "24-h3ref5-warm", cold)
         self.assertEqual(code, 1)
         self.assertIn("no-dit-step-stats", text)
+
+    def test_h3_requires_every_physical_ranks_real_transformer_passes(self):
+        fixture = json.loads((ROOT / "tests/fixtures/h3-transformer-ranks.json").read_text())
+        value = positive()
+        measurements = value.get("calls", [value])[0]["measurements"]
+        measurements["execution"]["gpus"] = fixture["execution"]
+        stats = measurements["memory"]["stats"]
+        stats["leftover_by_gpu"] = [[2, 0], [3, 0]]
+        stats["rows"] = fixture["complete"]
+        cold = "24-h3ref5 run=1 completed landed exec=10s poisoned=0 leftover=0 oom_retries=0 bar=ok\n"
+        self.assertEqual(self.record(value, "24-h3ref5-warm", cold)[0], 0)
+        for name in ("missing_gpu3", "short_gpu3", "duplicate_pass", "wrong_gpu"):
+            with self.subTest(name=name):
+                stats["rows"] = fixture[name]
+                code, text = self.record(value, "24-h3ref5-warm", cold)
+                self.assertEqual(code, 1)
+                self.assertIn("dit-row-", text)
+        stats["rows"] = fixture["complete"]
+        # Other components can run only on the leader; no blanket rank symmetry rule.
+        stats["rows"].append({"model": "model/text_encoder", "gpu": 2, "step": 1})
+        self.assertEqual(self.record(value, "24-h3ref5-warm", cold)[0], 0)
+        stats["rows"][2]["paged_in"] = 1
+        code, text = self.record(value, "24-h3ref5-warm", cold)
+        self.assertEqual(code, 1)
+        self.assertIn("dit-reads-per-step", text)
+
+    def test_h3_transformer_rows_require_typed_identity_and_reads(self):
+        for key, bad in (("model", None), ("gpu", False), ("step", False),
+                         ("step", -1), ("paged_in", None), ("streamed", False)):
+            with self.subTest(key=key, bad=bad):
+                value = positive()
+                value.get("calls", [value])[0]["measurements"]["memory"]["stats"]["rows"][0][key] = bad
+                code, text = self.record(value, "24-h3ref5")
+                self.assertEqual(code, 1)
+                self.assertIn("no-valid-dit-rows", text)
 
     def test_retries_use_current_stats_and_own_cold_pass(self):
         value = positive()
