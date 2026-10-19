@@ -65,6 +65,21 @@ release() {  # end the machine this script rented, once its outputs landed, and 
 }
 trap release EXIT INT TERM
 
+capped() {  # every GPU of $M is capped at $1 GiB: `machine show`'s limit line, or (any Calcifer) the memory log's ledger
+  cozy machine show "$M" --tensorhub "$H" 2>/dev/null | awk -v g="$1" '/^gpu memory limit/ {v = $4} END {exit v + 0 != g}' ||
+    cozy machine logs "$M" memory -n 0 --tensorhub "$H" 2>/dev/null | python3 -I -c '
+import json, sys
+cap = {}
+for line in sys.stdin:
+    try:
+        e = json.loads(line[line.index("{"):])
+    except ValueError:
+        continue
+    if e.get("event") == "ledger":
+        cap[e["gpu"]] = e.get("capacity")
+sys.exit(not cap or any(c != int(sys.argv[1]) << 30 for c in cap.values()))' "$1"
+}
+
 fits() {  # rental $M has $2 GPUs, none over $1 GiB, as `cozy machine show` lists them
   cozy machine show "$M" --tensorhub "$H" 2>/dev/null | sed -nE 's/^GPU [0-9]+ .* ([0-9.]+) GiB .*/\1/p' |
     awk -v most="$1" -v n="$2" '{k++; if ($1 > most) big = 1} END {exit !(k == n && !big)}'
@@ -281,7 +296,7 @@ PY
   [ -z "$M" ] && { say "card $card: no SKU had capacity ($(tail -c 200 "rent-$card.err"))"; FAILED=$((FAILED + 1)); return; }
   [ "$class" = "$card" ] || SUBST=$class@${GIB[$card]}
   if [ -n "$SUBST" ] && ! { cozy machine update "$M" --gpu-memory-limit "${GIB[$card]}GiB" --tensorhub "$H" > "cap-$card.log" 2>&1 &&
-      cozy machine show "$M" --tensorhub "$H" | awk -v g="${GIB[$card]}" '/^gpu memory limit/ {v = $4} END {exit v + 0 != g}'; }; then
+      capped "${GIB[$card]}"; }; then
     say "card $card: the ${GIB[$card]} GiB cap on $M is not in force: $(tail -c 300 "cap-$card.log")"; FAILED=$((FAILED + 1)); release; return
   fi
   local log  # the machine's own and memory logs, kept here in case the machine is lost mid-run
