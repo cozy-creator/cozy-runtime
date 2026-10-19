@@ -90,10 +90,11 @@ mem = [m.get("memory") or {} for m in ms]
 total = lambda key: sum(m.get(key) or 0 for m in mem)
 steps = sum((s.get("denoise") or next(iter(s.values()), {})).get("count") or 0
             for s in ((m.get("attribution") or {}).get("steps") or {} for m in ms))
-# B2's mem.stats(), per call: {"leftover": B, "paged_in": B, "steps": {model: [B paged in per denoise step]}}
+# B2's mem.stats(), per call: {"leftover": B, "paged_in": B, "steps": {"<construction>/<component>": [B per step]}}
 stats = [m["stats"] for m in mem if m.get("stats")]
 leftover = sum(s.get("leftover") or 0 for s in stats) if stats else None
-step_read = max((b for s in stats for per in (s.get("steps") or {}).values() for b in per), default=0) / 1e9
+dit_step = max((b for s in stats for k, per in (s.get("steps") or {}).items()  # H3's DiT: transformer, transformer_ref
+                if k.rsplit("/", 1)[-1].startswith("transformer") for b in per), default=0)
 modes = {k: v for m in mem for k, v in (m.get("modes") or {}).items()}
 reason = run.get("reason") or ""
 if isinstance(reason, dict):
@@ -106,12 +107,12 @@ bar = [w for w, bad in [("incomplete", not (state.startswith("completed ") and s
 if cell.endswith("-warm"):  # §9: no re-reads of a model that fits, and no more OOM retries than the cold pass
     cold = next((re.search(r" oom_retries=(\d+)", l) for l in open("summary.txt") if l.startswith(cell[:-5] + " run=")), None)
     bar += [w for w, bad in [("no-mem-stats", not stats), ("read>40GB", read > 40),
-                             ("model-reads-per-step", cell.endswith("-h3ref5-warm") and step_read > 0),
+                             ("dit-reads-per-step", cell.endswith("-h3ref5-warm") and dit_step > 0),
                              ("more-retries-than-cold", bool(cold) and total("oom_retries") > int(cold[1]))] if bad]
 print(f"{cell} run={n} {state} wall={max(wall, 0) / 1000:.0f}s exec={(run.get('execution_ms') or 0) / 1000:.0f}s "
       f"oom_retries={total('oom_retries')} poisoned={int(poisoned)} leftover={'-' if leftover is None else leftover} "
       f"read={read:.1f}GB disk={total('disk_bytes') / 1e9:.1f}GB steps={steps} read_per_step={read / steps if steps else 0:.2f}GB "
-      f"step_read_max={int(step_read * 1e9)}B bar={','.join(bar) or 'ok'} modes={json.dumps(modes)} mem_stats={json.dumps(stats)} "
+      f"dit_step_max={dit_step}B bar={','.join(bar) or 'ok'} modes={json.dumps(modes)} mem_stats={json.dumps(stats)} "
       f"reason={str(reason)[:300]}")
 sys.exit(bool(bar))
 PY
