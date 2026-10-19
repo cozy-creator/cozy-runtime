@@ -6,6 +6,7 @@ import traceback
 from collections.abc import Iterator
 from fractions import Fraction
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -26,7 +27,7 @@ from cozy_runtime.author._services import Attempt
 
 pytest.importorskip("av", reason="the media extra is absent from this venv")
 
-FACTS = dict(
+FACTS: dict[str, Any] = dict(
     time_base=Fraction(1, 24),
     pixel_aspect_ratio=Fraction(1),
     color_primaries=1,
@@ -55,7 +56,7 @@ def test_leaving_a_stream_after_its_first_frame_saves_that_frame(tmp_path: Path)
 
     with video.stream() as stream:
         saved = out.save_video_stream(first_frame(stream))
-    assert (saved.frame_count, saved.frame_rate, saved.video_codec) == (1, 24, "h264")
+    assert (saved.frame_count, saved.frame_rate, saved.video_codec) == (1, Fraction(24), "h264")
     reinput = fakes.fake_input(saved.video, attempt=attempt, max_decoded_bytes=8 << 20)
     decoded = reinput.read()
     assert (decoded.width, decoded.height, decoded.frame_count) == (48, 32, 1)

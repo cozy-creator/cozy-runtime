@@ -285,7 +285,7 @@ def test_a_video_fit_describes_its_caps_as_hints_and_round_trips(tmp_path: Path)
         with pytest.raises(ConformanceError):
             package_interface.read_bytes(msgspec.json.encode(document))
 
-    fit = {"profile": "video-fit/1", "excess": "refuse"}
+    fit: dict[str, object] = {"profile": "video-fit/1", "excess": "refuse"}
     refused(fit)  # a fit with no cap is a trim, spelled video-trim/1
     refused({**fit, "max_fps": 0})
     refused({**fit, "max_short_edge": 1.5})

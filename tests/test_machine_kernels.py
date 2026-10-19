@@ -17,6 +17,7 @@ from typing import Any
 
 import pytest
 
+from cozy_runtime._cpus import cpus
 from cozy_runtime.internal import (
     accel,
     kernel_cache,
@@ -194,7 +195,7 @@ def test_the_boot_starts_every_build_at_once_through_the_compile_ledger(
         for path, old, new in (*recipe.replace, *recipe.replace_on.get(90, ())):
             if path.endswith("setup.py"):
                 assert new in rewritten and old not in rewritten, (name, old)
-        assert int((meet / name).read_text()) == kernel_compile.cpus(), name
+        assert int((meet / name).read_text()) == cpus(), name
         assert (meet / f"{name}.nvcc").read_text() == "compiled\n", name
     book = json.loads((tmp_path / "kernels" / "u0" / ".compile.json").read_text())
     assert book["jobs"] == {} or not kernel_compile.compilers(tmp_path / "kernels" / "u0")

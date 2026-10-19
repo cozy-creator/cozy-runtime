@@ -216,7 +216,7 @@ class Bands:
 
     # -- placing and running bands
 
-    def _banded(self, plan: Plan, operands: Any, name: str) -> Any:
+    def _banded(self, plan: Plan, operands: tuple[object, ...], name: str) -> Any:
         """The op in bands, its result placed by `_room`."""
         torch, weights, axis = self.torch, self.weights, plan.axis
         height = int(plan.out.shape[axis])

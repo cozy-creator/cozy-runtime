@@ -212,6 +212,7 @@ from cozy_runtime.internal.lora_contract import read as read_adapter_graph
 from cozy_runtime.internal.model_values import read_values_into
 from cozy_runtime.internal.parallel import copy_engine, cp, links, mirror, wire
 from cozy_runtime.internal.parallel.group import (
+    ChildProcess,
     RankGroup,
     RankSpec,
     abort_process_group,
@@ -1813,7 +1814,7 @@ class Executor:
         self.forked.add(pid)
         return {"ok": True, "pid": pid}
 
-    def _follower(self, module_argv: list[str], rank_fd: int) -> spawn.Child:
+    def _follower(self, module_argv: list[str], rank_fd: int) -> ChildProcess:
         """A follower rank forked from this process when its imports are done and it holds no
         thread or device (`zygote`): it starts with torch, the Runtime and the package already
         imported, which a spawned one pays again (run 6351: 6.6 s of rank 0 waiting on them).
@@ -4707,7 +4708,7 @@ class Executor:
         accel.release_cached(self.torch, self.device_kind)
         return accel.allocated(self.torch, self.device_kind) - idle
 
-    def reclaim(self) -> dict[str, Any]:
+    def reclaim(self) -> dict[str, object]:
         """A follower's half of rank 0's `_release`: what stays allocated recycles the group."""
         entry, self._run_entry = self._run_entry, None
         left = self._release(entry[1]) if entry is not None else 0

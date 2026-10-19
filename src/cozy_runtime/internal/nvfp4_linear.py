@@ -60,7 +60,7 @@ else:
 
 if not TRITON_ABSENT:
 
-    @triton.jit  # type: ignore[untyped-decorator]
+    @triton.jit
     def _e2m1(code):  # type: ignore[no-untyped-def]
         """E2M1 nibbles -> f32, built as bits: 1.m x 2^(e-1), the e=0 code being 0 or 0.5."""
         exponent = (code >> 1) & 3
