@@ -335,7 +335,7 @@ def _pair(params: Mapping[str, object], key: str) -> tuple[int, int]:
 
 
 E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
-LAYOUTS = ("row_major", "cublas_128x4")
+SCALE_LAYOUTS = ("row_major", "cublas_128x4")
 
 
 # ------------------------------------------------------------------------------- nvfp4
@@ -413,7 +413,7 @@ NVFP4 = Adapter(
         "block_size": (16,),
         "global_scale": ("multiply", "divide"),
         "nibble_order": ("low_first", "high_first"),
-        "scale_layout": LAYOUTS,
+        "scale_layout": SCALE_LAYOUTS,
         "pre_quant_scale_dtype": ("F32", "BF16", "F16"),
     },
     (
