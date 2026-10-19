@@ -540,6 +540,17 @@ def adjustment_row(row: AdjustmentRow) -> dict[str, str]:
     }
 
 
+def _own_row(device_kind: str, entry: str) -> Any:
+    pid = os.getpid()
+    return accel.process_memories_by_device({pid}, device_kind, (entry,))[entry][pid]
+
+
+def _own_bytes(device_kind: str, entry: str) -> int | None:
+    """This process's device bytes as the driver counts them; None when not attributable."""
+    row = _own_row(device_kind, entry)
+    return int(row.bytes) if row.state == "present" else None
+
+
 def _granted_inputs(command: Invoke) -> dict[str, GrantedInput]:
     """Verified input paths in the attempt's spool."""
     return {input_id: row.granted(input_id) for input_id, row in command.inputs.items()}
@@ -725,6 +736,8 @@ class Executor:
         #: this process's CUDA context and first library launches, measured at device init
         #: from this process's own driver row (-1: not attributable)
         self.device_context = -1
+        #: the sealed device entry NVML names this process's row under ("" before device init)
+        self.device_entry = ""
         #: the construction key this generation was loaded under; "" on the host
         self.construction = construction
         #: HOST ONLY: every loaded construction and the active one. One memory decides where
@@ -949,8 +962,8 @@ class Executor:
             torch.cuda.set_device(self.rank)
         accel.first_launches(torch, self.device_kind)
         accel.reset_peak(torch, self.device_kind)
-        pid = os.getpid()
-        row = accel.process_memories_by_device({pid}, self.device_kind, (entry,))[entry][pid]
+        self.host.device_entry = entry
+        row = _own_row(self.device_kind, entry)
         if row.state == "present":
             # Foreign allocations cannot enter a context measurement. If a PID namespace or
             # driver hides our row, leave it unknown rather than adopting a device-wide delta.
@@ -2505,6 +2518,10 @@ class Executor:
             except VarenaUnsupported as exc:  # no varena on this OS (Windows)
                 return {"ok": False, "code": "weight_plane_unavailable", "detail": str(exc)}
             host.memory.context = max(host.device_context, 0)
+            if host.device_entry:  # measured again at each boundary: NCCL and libraries come later
+                host.memory.measure = functools.partial(
+                    _own_bytes, self.device_kind, host.device_entry
+                )
             _split.install(cuts.split)
             attention_ulysses.install(cuts.attend)
         backend = Backend(
