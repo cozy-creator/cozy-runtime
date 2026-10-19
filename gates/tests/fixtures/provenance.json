@@ -1,0 +1,10 @@
+{
+  "source": "/home/fidika/cozy_v2/outputs/xs046-b4/runs/b4-p3-d9-refill-20261019T142102Z/show-h3-d1-warm.json",
+  "sha256": "b1e4fd66464fa0ebbc1aa019e211a24f4f0f7b4305730274319d81b86f87f7e7",
+  "fields": "only status/identity/timings/GPU facts and required memory stats retained; fixture is not changed to pass",
+  "baseline_source": "/home/fidika/cozy_v2/outputs/memory-matrix-0274/summary.txt",
+  "control_runs": [
+    11616,
+    11618
+  ]
+}

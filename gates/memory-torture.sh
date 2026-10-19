@@ -26,6 +26,7 @@
 # --baseline-wheel: each card first runs its cells on these wheels (0.27.4 + tensorfs 0.10.0) into ./baseline/, then
 # switches the same rental to the candidate (H3 downloads once); those lines override --baseline's for their cells.
 set -uo pipefail
+GATE_RECEIPTS=$(dirname "$(realpath "$0")")/memory_receipts.py
 H=$1 W=$2; shift 2
 MATRIX="" TFS="" BASE="" CARDS="" BW="" BTFS="" ORG=fidika IMG=""
 declare -A AFTER=()
@@ -112,44 +113,7 @@ PY
 record() {  # one line per run (status, wall, execution, retries, poisoned, leftover, GB read host to GPU, memory rungs);
             # fails if the run misses the absolute bar, named in `bar=`
   local n=$1 cell=$2 state=$3
-  python3 -I - "show-$cell.json" "$cell" "$n" "$state" "$SUBST" <<'PY' | tee -a summary.txt
-import json, re, sys
-path, cell, n, state, subst = sys.argv[1:]
-try:
-    run = json.load(open(path))
-except Exception:
-    run = {}
-ms = [c.get("measurements") or {} for c in run.get("calls") or [run]]
-mem = [m.get("memory") or {} for m in ms]
-total = lambda key: sum(m.get(key) or 0 for m in mem)
-steps = sum((s.get("denoise") or next(iter(s.values()), {})).get("count") or 0
-            for s in ((m.get("attribution") or {}).get("steps") or {} for m in ms))
-# B2's mem.stats(), per call: {"leftover": B, "paged_in": B, "steps": {"<construction>/<component>": [B per step]}}
-stats = [m["stats"] for m in mem if m.get("stats")]
-leftover = sum(s.get("leftover") or 0 for s in stats) if stats else None
-dit_step = max((b for s in stats for k, per in (s.get("steps") or {}).items()  # H3's DiT: transformer, transformer_ref
-                if k.rsplit("/", 1)[-1].startswith("transformer") for b in per), default=0)
-modes = {k: v for m in mem for k, v in (m.get("modes") or {}).items()}
-reason = run.get("reason") or ""
-if isinstance(reason, dict):
-    reason = f"{reason.get('code')}: {reason.get('message')}"
-wall = (run.get("settled_at_ms") or 0) - (run.get("created_at_ms") or 0)
-read = (sum(s.get("paged_in") or 0 for s in stats) if stats else total("paged_in_bytes")) / 1e9
-poisoned = "poisoned" in str(reason)
-bar = [w for w, bad in [("incomplete", not (state.startswith("completed ") and state.endswith(" landed"))),
-                        ("poisoned", poisoned), ("leftover", bool(leftover))] if bad]
-if cell.endswith("-warm"):  # §9: no re-reads of a model that fits, and no more OOM retries than the cold pass
-    cold = next((re.search(r" oom_retries=(\d+)", l) for l in open("summary.txt") if l.startswith(cell[:-5] + " run=")), None)
-    bar += [w for w, bad in [("no-mem-stats", not stats), ("read>40GB", read > 40),
-                             ("dit-reads-per-step", cell.endswith("-h3ref5-warm") and dit_step > 0),
-                             ("more-retries-than-cold", bool(cold) and total("oom_retries") > int(cold[1]))] if bad]
-print(f"{cell} run={n} {state} wall={max(wall, 0) / 1000:.0f}s exec={(run.get('execution_ms') or 0) / 1000:.0f}s "
-      f"oom_retries={total('oom_retries')} poisoned={int(poisoned)} leftover={'-' if leftover is None else leftover} "
-      f"read={read:.1f}GB disk={total('disk_bytes') / 1e9:.1f}GB steps={steps} read_per_step={read / steps if steps else 0:.2f}GB "
-      f"dit_step_max={dit_step}B {f'substitute={subst} ' if subst else ''}bar={','.join(bar) or 'ok'} modes={json.dumps(modes)} mem_stats={json.dumps(stats)} "
-      f"reason={str(reason)[:300]}")
-sys.exit(bool(bar))
-PY
+  python3 -I "$GATE_RECEIPTS" record "show-$cell.json" "$cell" "$n" "$state" "$SUBST" summary.txt | tee -a summary.txt
 }
 
 number() { grep -oE '"number": ?[0-9]+' "run-$1.json" 2>/dev/null | head -1 | grep -oE '[0-9]+$'; }
@@ -348,43 +312,7 @@ for c in $CARDS; do (card "$c"; exit "$FAILED") & PIDS="$PIDS $!"; done
 for p in $PIDS; do wait "$p"; FAILED=$((FAILED + $?)); done
 say "memory-torture: $FAILED below the absolute bar"
 if [ -n "$BASE$BW" ]; then  # relative to 0.27.4 (D7): a warm cell >10% slower to execute; GB read reported beside it
-  python3 -I - <(cat ${BASE:+"$BASE/summary.txt"} ${BW:+baseline/summary.txt} 2>/dev/null) summary.txt $CARDS <<'PY' | tee -a summary.txt
-import re, sys
-asked = {a.split(":")[0]: a.split(":")[1].split(",") if ":" in a else [] for a in sys.argv[3:]}
-def wanted(c):  # the cells this run asked for, as `want` picks them
-    k, _, cell = c.partition("-")
-    cell = {"pair-klein": "pair-sdxl", "pair-lm": "pair-qwen"}.get(cell, cell)
-    return k in asked and (not asked[k] or cell in asked[k] or cell in ("klein-a", "klein-b"))
-def cells(path):
-    out = {}
-    for line in open(path):
-        m = re.match(r"(\S+) run=(\d*) (\S+) (\S+)", line)
-        if m:
-            f = dict(re.findall(r" (\w+)=([\d.]+)", line.split(" modes=")[0]))
-            out[m[1]] = dict(f, run=m[2], status=m[3], ok=m[3] == "completed" and m[4] == "landed",
-                             bar=(re.search(r" bar=(\S+)", line) or [0, "?"])[1],
-                             sub=(re.search(r" substitute=(\S+)", line) or [0, ""])[1])
-    return out
-def show(x):
-    return f"{'ok' if x['ok'] else x['status']} exec {x.get('exec', '?')}s oom={x.get('oom_retries', '?')} #{x['run']}" if x else "-"
-def read(x):
-    return f"{x['read']} ({x.get('read_per_step', '?')}/step)" if x and "read" in x else "-"
-base, here = cells(sys.argv[1]), cells(sys.argv[2])
-worse = 0
-print(f"{'cell':20} {'0.27.4':34} {'candidate':34} GB read (per step), 0.27.4 -> candidate")
-for c in sorted(c for c in set(base) | set(here) if wanted(c)):
-    b, h = base.get(c), here.get(c)
-    why = ""
-    if not h or h["bar"] != "ok":
-        why = f"  FAIL: {h['bar'] if h else 'no run'}"
-    elif h["sub"]:
-        why = f"  (substitute {h['sub']}: not compared)"
-    elif c.endswith("-warm") and b and b["ok"] and float(h["exec"]) > 1.1 * float(b["exec"]):
-        why, worse = f"  WORSE: warm execution {h['exec']}s > 1.1 x {b['exec']}s", worse + 1
-    print(f"{c:20} {show(b):34} {show(h):34} {read(b)} -> {read(h)}{why}")
-print(f"memory-matrix: {worse} warm cells slower than 0.27.4")
-sys.exit(min(worse, 255))
-PY
+  python3 -I "$GATE_RECEIPTS" compare <(cat ${BASE:+"$BASE/summary.txt"} ${BW:+baseline/summary.txt} 2>/dev/null) summary.txt $CARDS | tee -a summary.txt
   FAILED=$((FAILED + $?))
 fi
 exit $((FAILED > 255 ? 255 : FAILED))
