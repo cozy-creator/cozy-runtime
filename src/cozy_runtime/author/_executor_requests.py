@@ -229,9 +229,9 @@ class Tier(Answer, frozen=True, kw_only=True):
 
 
 class Granted(Tier, frozen=True, kw_only=True):
-    """A `ReadGrant`'s answer: the sealed host layout (`held`), or every chunk file of the
-    manifest's selected components in sha256 order (`fds`), `objects_sha256` naming that list
-    (the sha256 of its `<sha256>:<length>` lines)."""
+    """A `ReadGrant`'s answer, its descriptors in `fds`: the one sealed host layout deposited
+    for the layout (`held`), or every chunk file of the manifest's selected components in sha256
+    order, `objects_sha256` naming that list (the sha256 of its `<sha256>:<length>` lines)."""
 
     objects_sha256: str = ""
     fds: tuple[int, ...] = ()

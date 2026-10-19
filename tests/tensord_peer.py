@@ -33,7 +33,7 @@ from cozy_runtime.author._executor_requests import (
     WriterSource,
     refuse,
 )
-from cozy_runtime.internal import plane, seam
+from cozy_runtime.internal import seam
 from cozy_runtime.internal.weights_writer import ExecutionStorage, exchange_file
 from cozy_runtime.tensord_channels import Channel, Refused
 
@@ -155,9 +155,41 @@ def answer_model_sources(channel: seam.Channel, store: tensorfs.Store, asked: li
             continue
         facts = {"sha256": hashlib.sha256(body).hexdigest(), "length": len(body)}
         channel.send(answer | {"ok": True, "held": True, "descriptor": True} | facts)
-        memfd = plane.sealed_memfd("model-source", body)
+        memfd = seam.sealed("model-source", body)
         channel.send_memfd(memfd)
         os.close(memfd)
+
+
+def answer_read_grants(
+    channel: seam.Channel, store: tensorfs.Store, deposited: Mapping[str, int], asked: list[str]
+) -> None:
+    """The machine's half of an executor's `read_grant` requests, as `Callbacks::read_grant`
+    (crates/tensord/src/gpu_service.rs) answers them, field for field as its `Answer` serializes:
+    the layout deposited for `layout` (`deposited`: layout -> sealed memfd), read-only, as the one
+    descriptor (`held`); else every chunk of the checkpoint in sha256 order with
+    `objects_sha256`, the digest `deposits::objects_digest` names them by. `asked` records each
+    layout."""
+    while (frame := channel.recv()) is not None:
+        if frame.get("event") != "request" or frame.get("kind") != "read_grant":
+            continue
+        asked.append(frame["layout"])
+        answer = {"event": "answer", "seq": frame["seq"], "ok": True, "code": "", "detail": ""}
+        answer |= {"sha256": "", "length": 0}
+        if (layout := deposited.get(frame["layout"])) is not None:
+            fds = [os.open(f"/proc/self/fd/{layout}", os.O_RDONLY)]
+            channel.send(answer | {"held": True, "descriptors": 1})
+        else:
+            ck = store.checkpoint(frame["manifest"])
+            objects = sorted(ck.chunks)
+            lines = "".join(f"{sha}:{length}\n" for sha, length in objects)
+            fds = [os.open(blob(store, sha), os.O_RDONLY) for sha, _ in objects]
+            digest = hashlib.sha256(lines.encode()).hexdigest()
+            channel.send(
+                answer | {"held": False, "descriptors": len(fds), "objects_sha256": digest}
+            )
+        channel.send_fds(fds)
+        for fd in fds:
+            os.close(fd)
 
 
 def ref_of(store: tensorfs.Store, ck: tensorfs.Checkpoint, path: str) -> dict[str, object]:

@@ -4135,10 +4135,13 @@ class Executor:
         `layout`, or the chunk files of `objects` (`(sha256, length)` in sha256 order, as the
         header names them), each `(sha256, length, fd)`; the fds are the caller's to close."""
         answer = self._durable(ReadGrant(manifest=manifest, layout=layout), Granted)
-        if answer.ok and answer.held and answer.descriptor >= 0:
-            return answer.descriptor, []
+        # Held: TensorD's one descriptor is the sealed layout an executor deposited, adopted
+        # as it is. No chunk list names it (memory-varena §5.4, D9's refill).
+        if answer.ok and answer.held and len(answer.fds) == 1:
+            return answer.fds[0], []
         if (
             not answer.ok
+            or answer.held
             or len(answer.fds) != len(objects)
             or answer.objects_sha256 != _objects_sha256(objects)
         ):
