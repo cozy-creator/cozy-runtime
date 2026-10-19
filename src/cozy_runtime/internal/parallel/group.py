@@ -408,7 +408,7 @@ class RankGroup:
             if head.event == "request" and self.relay is not None:
                 follower.relaying = True
                 try:
-                    self.relay(follower.channel, frame)
+                    self.relay(follower.channel, {**frame, "rank": follower.rank})
                 except SeamError as exc:
                     follower.gone = f"{follower.gpu}'s request was not relayed: {exc}"
                     break

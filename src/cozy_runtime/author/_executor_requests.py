@@ -146,6 +146,7 @@ class ReadGrant(_Request, frozen=True, kw_only=True, tag="read_grant"):
     #: what the host layout is kept under: manifest, construction and component, known before
     #: the module is built (`weights.Backend._layout`); a held layout of other regions is a miss
     layout: str
+    rank: int = 0
 
 
 class Deposit(_Request, frozen=True, kw_only=True, tag="deposit"):
@@ -176,6 +177,7 @@ class KeepPages(_Request, frozen=True, kw_only=True, tag="keep_pages"):
     layout: str
     fingerprint: str
     pages: tuple[Page, ...]
+    rank: int = 0
     #: the containers; never on the wire
     fds: tuple[int, ...] = ()
 

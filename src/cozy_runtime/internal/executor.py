@@ -662,7 +662,7 @@ class _OnDemand:
 
 
 #: The requests rank 0 relays to the machine for a follower (`_relay`).
-_RELAYED = frozenset({"read_grant", "model_source"})
+_RELAYED = frozenset({"read_grant", "model_source", "keep_pages"})
 
 #: The runtime modules a construction imports, named ONCE so `start` can warm
 #: exactly the set `_prepare_first` re-imports (cr-104). Warming a name this tuple omits
@@ -888,6 +888,12 @@ class Executor:
                 return self.probe()
             case Map():
                 return self.map(command)
+            case executor_commands.KeepWeights():
+                target = self.constructions.get(command.construction)
+                if target is None:
+                    return {"ok": False, "code": "construction_absent"}
+                target._keep_weights()
+                return {"ok": True}
             case Shutdown():
                 raise AssertionError("shutdown ends the command loop")
 
@@ -3515,10 +3521,14 @@ class Executor:
         if torch is not None and last:
             accel.drain(torch, self.device_kind)
         d2h_ms = (time.perf_counter() - d2h_started) * 1000
-        if last and self.group is None:  # pages that landed outlive this process from here on
-            for member in self.model_executors or [self]:
-                if member.backend is not None:
-                    member.backend.keep()
+        if last:
+            self._keep_weights()
+            if self.group is not None:
+                replies = self.group.call(executor_commands.encode(
+                    executor_commands.KeepWeights(construction=self.construction)
+                ))
+                if any(not reply.get("ok") for reply in replies):
+                    self.poisoned = "a follower could not keep its completed weight pages"
         released_us = execution_evidence.now_us()
         peak_vram = accel.peak_allocated(torch, self.device_kind) if torch is not None else 0
         peak_reserved = accel.peak_reserved(torch, self.device_kind) if torch is not None else 0
@@ -4155,6 +4165,11 @@ class Executor:
             raise RuntimeError(f"{name or 'header'} of {manifest[:23]} is short")
         return bytes(body)
 
+    def _keep_weights(self) -> None:
+        for member in self.model_executors or [self]:
+            if member.backend is not None:
+                member.backend.keep()
+
     def _read_grant(
         self, manifest: str, layout: str, objects: list[tuple[str, int]]
     ) -> tuple[int | None, list[tuple[str, int, int]], list[tuple[int, int]], str]:
@@ -4162,7 +4177,7 @@ class Executor:
         `layout`, with the GPU pages a gone executor kept of it `(region, fd)` and what they hold,
         or the chunk files of `objects` (`(sha256, length)` in sha256 order, as the header names
         them), each `(sha256, length, fd)`; the fds are the caller's to close."""
-        answer = self._durable(ReadGrant(manifest=manifest, layout=layout), Granted)
+        answer = self._durable(ReadGrant(manifest=manifest, layout=layout, rank=self.rank), Granted)
         # Held: TensorD's first descriptor is the sealed layout an executor deposited, adopted
         # as it is. No chunk list names it (memory-varena §5.4, D9's refill).
         if answer.ok and answer.held and len(answer.fds) == 1 + len(answer.pages):
@@ -4191,6 +4206,7 @@ class Executor:
             request = KeepPages(
                 layout=layout,
                 fingerprint=fingerprint,
+                rank=self.rank,
                 pages=tuple(Page(region=r, nbytes=n) for r, n, _ in pages),
                 fds=tuple(fd for _, _, fd in pages),
             )
@@ -4301,36 +4317,35 @@ class Executor:
         asked exactly as rank 0 asks them. The follower is inside one command and reads
         nothing else until this answer."""
         seq, kind = frame.get("seq"), frame.get("kind")
-        sends = frame.get("descriptor") is True
-        if kind not in _RELAYED:
-            if sends:
-                os.close(follower._recv_fd())
-            detail = f"{_gpu(0)} relays no {kind!r} request"
-            follower.send(
-                {"event": "answer", "seq": seq, "ok": False, "code": "request_unsupported"}
-                | {"detail": detail}
-            )
-            return
-
+        count = frame.get("descriptors", 0)
+        if type(count) is not int or count < 0:
+            raise SeamError("seam_descriptor", "invalid relayed descriptor count")
+        sending = follower.recv_fds(count + (frame.get("descriptor") is True))
         passed: list[int] = []
-
-        def receive(answer: Frame) -> None:
-            count = answer.get("descriptors", 0)
-            if type(count) is not int or count < 0:
-                raise SeamError("seam_out_of_order", f"no answer to a relayed {kind}")
-            passed.extend(self.channel.recv_fds(count + (answer.get("descriptor") is True)))
-
         try:
+            if kind not in _RELAYED:
+                follower.send({
+                    "event": "answer", "seq": seq, "ok": False,
+                    "code": "request_unsupported", "detail": f"{_gpu(0)} relays no {kind!r} request",
+                })
+                return
+
+            def receive(answer: Frame) -> None:
+                count = answer.get("descriptors", 0)
+                if type(count) is not int or count < 0:
+                    raise SeamError("seam_out_of_order", f"no answer to a relayed {kind}")
+                passed.extend(self.channel.recv_fds(count + (answer.get("descriptor") is True)))
+
             answer = self.mux.ask(
                 {**frame, "request_id": self._attempt_request},
-                (lambda: follower.pass_fd(self.channel)) if sends else lambda: None,
+                lambda: self.channel.send_fds(sending),
                 receive,
             )
             with follower.sending:
                 follower.send({**answer, "seq": seq})
                 follower.send_fds(passed)
         finally:
-            for fd in passed:
+            for fd in sending + passed:
                 os.close(fd)
 
     def _activity_sink(self, request_id: str) -> Callable[[int, bool, bool, bool], None]:

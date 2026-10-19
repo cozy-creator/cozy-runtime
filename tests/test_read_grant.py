@@ -144,3 +144,56 @@ def test_kept_pages_transfer_containers_and_close_the_callers_descriptors(tmp_pa
         left.close()
         right.close()
         producer.close()
+
+
+def test_a_followers_kept_containers_reach_its_gpu_rank(tmp_path: Path) -> None:
+    leader_end, machine_end = socket.socketpair()
+    follower_end, relay_end = socket.socketpair()
+    container, producer = socket.socketpair()
+    descriptor = container.detach()
+    leader = Executor(Channel(leader_end), tmp_path)
+    follower = Executor(Channel(follower_end), tmp_path, rank=1, world=2)
+    machine, relay = Channel(machine_end), Channel(relay_end)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            depositing = pool.submit(follower._keep_pages, "layout", "parts", [(4, 8192, descriptor)])
+            request = relay.recv()
+            assert request is not None
+            forwarding = pool.submit(leader._relay, relay, request)
+            frame = machine.recv()
+            assert frame is not None and frame["kind"] == "keep_pages" and frame["rank"] == 1
+            assert frame["pages"] == [{"region": 4, "nbytes": 8192}]
+            handed = machine.recv_fds(1)[0]
+            machine.send({"event": "answer", "seq": frame["seq"], "ok": True})
+            forwarding.result()
+            depositing.result()
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+        with socket.socket(fileno=handed) as kept:
+            producer.sendall(b"rank1")
+            assert kept.recv(5) == b"rank1"
+    finally:
+        for sock in [leader_end, machine_end, follower_end, relay_end, producer]:
+            sock.close()
+
+
+def test_a_refused_follower_request_drains_its_plural_descriptors(tmp_path: Path) -> None:
+    leader_end, machine_end = socket.socketpair()
+    follower_end, relay_end = socket.socketpair()
+    container, producer = socket.socketpair()
+    leader, follower, relay = Executor(Channel(leader_end), tmp_path), Channel(follower_end), Channel(relay_end)
+    try:
+        request = {"event": "request", "seq": 1, "kind": "unknown", "descriptors": 1}
+        follower.send(request)
+        follower.send_fds([container.fileno()])
+        container.close()
+        assert relay.recv() == request
+        leader._relay(relay, request)
+        answer = follower.recv()
+        assert answer is not None and not answer["ok"] and answer["code"] == "request_unsupported"
+        assert producer.recv(1) == b"", "the refused container was closed"
+        follower.send({"reply": "next", "ok": True})
+        assert relay.recv() == {"reply": "next", "ok": True}, "the channel remains framed"
+    finally:
+        for sock in [leader_end, machine_end, follower_end, relay_end, container, producer]:
+            sock.close()

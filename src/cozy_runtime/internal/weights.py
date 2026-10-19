@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 from tensorfs.varena.torch import (
     Cache,
     Declared,
+    LayoutChanged,
     Memory,
     Model,
     Shrink,
@@ -462,7 +463,14 @@ class Backend:
             bind=_Routes(self, rows),
         )
         try:
-            model = self.memory.load(root)
+            try:
+                model = self.memory.load(root)
+            except LayoutChanged:
+                if self.grant is None:
+                    raise
+                fresh = replace(self._granted(name, chunks=True), keys=tuple(rows))
+                vars(root)["_varena"] = replace(vars(root)["_varena"], weights=fresh)
+                model = self.memory.load(root)
         finally:
             _close(self.grants.pop(name))
         for _, sealed in self.memory.sealed():
@@ -486,16 +494,18 @@ class Backend:
             }
         )
 
-    def _granted(self, name: str) -> WeightGrant:
+    def _granted(self, name: str, *, chunks: bool = False) -> WeightGrant:
         """A component's grant, asked of TensorD once: its sealed host tier, adopted at once
         and copying to the GPU, else its chunk files."""
+        if chunks and name in self.grants:
+            _close(self.grants.pop(name))
         grant = self.grants.get(name)
         if grant is None:
             checkpoint = self.checkpoints[name]
             grant = WeightGrant(checkpoint.ck, name, checkpoint.manifest_id)
             if self.grant is not None:
                 objects = self._objects(checkpoint)
-                fd, files, pages, fingerprint = self.grant(grant.manifest, self._layout(name), objects)
+                fd, files, pages, fingerprint = self.grant(grant.manifest, "" if chunks else self._layout(name), objects)
                 grant = replace(
                     grant, host_fd=fd, files=tuple(files), pages=tuple(pages), fingerprint=fingerprint
                 )

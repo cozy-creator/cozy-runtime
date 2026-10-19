@@ -74,6 +74,10 @@ class Unload(Command, frozen=True, kw_only=True, tag="unload"):
     construction: str
 
 
+class KeepWeights(Command, frozen=True, kw_only=True, tag="keep_weights"):
+    construction: str
+
+
 class Activate(Command, frozen=True, kw_only=True, tag="activate"):
     construction: str
     authorized_device_limit_bytes: int | UnsetType = UNSET
@@ -302,6 +306,7 @@ type KnownCommand = (
     | Fork
     | Map
     | Unload
+    | KeepWeights
     | Activate
     | Attention
     | Start
