@@ -662,13 +662,19 @@ class LoRASource(Protocol):
     def lora_factors(self) -> tuple[object, Tensor, Tensor, float] | None: ...
 
 
+class LoRALayer(Protocol):
+    active_adapters: Sequence[str]
+    scaling: Mapping[str, float]
+    _cozy_baked: bool
+
+
 @dataclass(slots=True)
 class _Bake:
     """One LoRA'd linear: its stored base weight, its PEFT layer with each adapter's factors
     (stored keys and scale), and the model's own hooks."""
 
     weight: str
-    layer: Any = None
+    layer: LoRALayer | None = None
     factors: list[tuple[str, str, float]] = field(default_factory=list)
     hooks: list[LoRASource] = field(default_factory=list)
 
@@ -698,10 +704,10 @@ class _Bakes:
             except AttributeError:  # a tensor named `.weight` on no module of its own
                 hooks = []
             if any(site.startswith(block + ".") for block in blocks):
-                bake.hooks = [hook for hook in hooks if isinstance(hook, LoRASource)]
+                bake.hooks = [cast(LoRASource, hook) for hook in hooks if isinstance(hook, LoRASource)]
             target = site.removesuffix(".base_layer")
             if target != site:
-                layer = root.get_submodule(target)
+                layer = cast(LoRALayer, root.get_submodule(target))
                 for adapter in getattr(layer, "active_adapters", ()):
                     a = names.get(f"{target}.lora_A.{adapter}.weight")
                     b = names.get(f"{target}.lora_B.{adapter}.weight")
