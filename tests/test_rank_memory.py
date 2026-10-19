@@ -1,4 +1,4 @@
-"""Actual CPU Memory requests and executor sockets; synthetic GPU facts test identity conversion only."""
+"""Actual CPU Memory requests and executor sockets; synthetic GPU facts test identity conversion."""
 
 from __future__ import annotations
 
