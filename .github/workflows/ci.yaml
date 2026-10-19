@@ -1,16 +1,18 @@
 name: ci
-# On demand, before a release (lint, types, fences, wheel, pytest, handoff proof):
+# Every PR and every push to master (lint, types, fences, wheel, pytest, handoff proof); also on demand:
 #   gh workflow run ci.yaml -R cozy-creator/cozy-runtime --ref <branch>
 # Every gate runs even when another is red; the final checks job requires all of them.
 # Tests keep real process/cgroup isolation on independent runners. publish.yaml explicitly selects source-build or approved prebuilt release files.
 on:
+  pull_request:
+  push:
+    branches: [master]
   workflow_dispatch:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 jobs:
   quality:
-    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -56,7 +58,6 @@ jobs:
   # `uv run pytest --store-durations --durations-path .github/test-durations.json` on a delegated host.
   # New tests are always collected; missing timings use the measured suite average.
   tests:
-    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
@@ -101,7 +102,7 @@ jobs:
           if-no-files-found: error
           include-hidden-files: true
   checks:
-    if: ${{ always() && github.event_name == 'workflow_dispatch' }}
+    if: ${{ always() }}
     needs: [quality, tests]
     runs-on: ubuntu-latest
     steps:
