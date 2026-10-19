@@ -9,6 +9,7 @@ import os
 import socket
 import threading
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -81,3 +82,65 @@ def test_a_grant_of_another_chunk_list_is_refused(tmp_path: Path, checkpoint) ->
         with pytest.raises(RuntimeFailure, match="a different list") as refused:
             executor._read_grant(manifest, "sha256:cold", objects[:-1])
         assert refused.value.code == "weights_ungranted"
+
+
+def test_a_held_layout_carries_kept_regions_and_their_fingerprint(
+    tmp_path: Path, checkpoint
+) -> None:
+    _, manifest, objects = checkpoint
+    layout = sealed("layout", b"held layout")
+    page = sealed("kept-page", b"opaque page capability")
+    left, right = socket.socketpair()
+    executor, peer = Executor(Channel(left), tmp_path), Channel(right)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            received = pool.submit(executor._read_grant, manifest, "held", objects)
+            frame = peer.recv()
+            assert frame is not None and frame["kind"] == "read_grant"
+            peer.send({
+                "event": "answer", "seq": frame["seq"], "ok": True, "held": True,
+                "descriptors": 2, "fingerprint": "sha256:layout-parts",
+                "pages": [{"region": 3, "nbytes": 2 << 20}],
+            })
+            peer.send_fds([layout, page])
+            fd, files, pages, fingerprint = received.result()
+        assert fd is not None and not files and fingerprint == "sha256:layout-parts"
+        assert len(pages) == 1 and pages[0][0] == 3
+        try:
+            assert os.pread(fd, 64, 0) == b"held layout"
+            assert os.pread(pages[0][1], 64, 0) == b"opaque page capability"
+        finally:
+            os.close(fd)
+            os.close(pages[0][1])
+    finally:
+        left.close()
+        right.close()
+        os.close(layout)
+        os.close(page)
+
+
+def test_kept_pages_transfer_containers_and_close_the_callers_descriptors(tmp_path: Path) -> None:
+    left, right = socket.socketpair()
+    container, producer = socket.socketpair()
+    descriptor = container.detach()
+    executor, peer = Executor(Channel(left), tmp_path), Channel(right)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            deposited = pool.submit(executor._keep_pages, "layout", "parts", [(2, 4096, descriptor)])
+            frame = peer.recv()
+            assert frame is not None and frame["kind"] == "keep_pages"
+            assert frame["layout"] == "layout" and frame["fingerprint"] == "parts"
+            assert frame["pages"] == [{"region": 2, "nbytes": 4096}]
+            assert frame["descriptors"] == 1 and "fds" not in frame
+            handed = peer.recv_fds(1)[0]
+            peer.send({"event": "answer", "seq": frame["seq"], "ok": True})
+            deposited.result()
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+        with socket.socket(fileno=handed) as kept:
+            producer.sendall(b"live")
+            assert kept.recv(4) == b"live"
+    finally:
+        left.close()
+        right.close()
+        producer.close()
