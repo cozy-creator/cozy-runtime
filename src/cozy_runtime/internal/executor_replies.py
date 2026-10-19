@@ -53,3 +53,5 @@ class Memory(msgspec.Struct, frozen=True, kw_only=True):
     peaks: list[Peak] = []
     retries: int = 0
     leftover_by_gpu: list[tuple[int, int]] = []
+    #: the declared plan (`Context.plan`), each step's components
+    plan: list[list[str]] = []

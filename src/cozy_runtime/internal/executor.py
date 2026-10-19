@@ -2018,6 +2018,7 @@ class Executor:
             ],
             retries=request.retries,
             leftover_by_gpu=list(request.leftover),
+            plan=[list(step) for step in request.plan],
         )
         return cast("dict[str, Any]", msgspec.to_builtins(memory))
 
