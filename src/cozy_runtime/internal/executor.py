@@ -889,10 +889,10 @@ class Executor:
             case Map():
                 return self.map(command)
             case executor_commands.KeepWeights():
-                target = self.constructions.get(command.construction)
-                if target is None:
+                keeping = self.constructions.get(command.construction)
+                if keeping is None:
                     return {"ok": False, "code": "construction_absent"}
-                target._keep_weights()
+                keeping._keep_weights()
                 return {"ok": True}
             case Shutdown():
                 raise AssertionError("shutdown ends the command loop")
