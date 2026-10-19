@@ -71,6 +71,7 @@ def test_a_held_layout_binds_before_the_module_and_other_regions_miss(tmp_path: 
         t = t.detach().contiguous()
         component.put(key, t.view(torch.uint8).numpy().tobytes(), dtype="F32", shape=list(t.shape))
     ck = writer.commit()
+    assert ck.id is not None
     grant = WeightGrant(ck, "net", ck.id)
     held = varena.seal(ck, regions_of(built(grant)), "deposit")
     grant = replace(grant, host_fd=held)

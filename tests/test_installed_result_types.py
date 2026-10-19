@@ -175,7 +175,7 @@ def test_plain_script_returns_installed_public_struct_after_managed_call(
     assert outcome.terminal == "succeeded", outcome
     assert result is not None and type(result.result.value) is imported.Selection
     assert isinstance(result.result.value.projection, ModelArtifact)
-    assert result.result.value.projection.manifest.digest == artifact["manifest"]["digest"]
+    assert result.result.value.projection.checkpoint == artifact["checkpoint"]
 
 
 @pytest.mark.parametrize(
