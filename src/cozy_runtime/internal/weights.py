@@ -704,7 +704,9 @@ class _Bakes:
             except AttributeError:  # a tensor named `.weight` on no module of its own
                 hooks = []
             if any(site.startswith(block + ".") for block in blocks):
-                bake.hooks = [cast(LoRASource, hook) for hook in hooks if isinstance(hook, LoRASource)]
+                bake.hooks = [
+                    cast(LoRASource, hook) for hook in hooks if isinstance(hook, LoRASource)
+                ]
             target = site.removesuffix(".base_layer")
             if target != site:
                 layer = cast(LoRALayer, root.get_submodule(target))
