@@ -307,7 +307,7 @@ def install_spread(
         method: str,
         spare: bool,
     ) -> None:
-        sent: list[tuple[int, int, tuple[Any, ...], wire.TensorSpool]] = []
+        sent: list[tuple[int, int, tuple[Any, ...], wire.TensorSpool | wire.Broadcast]] = []
         calls: dict[str, int] = log["calls"]
         try:
             for rank, (index, args) in zip(taken, batch[1:], strict=False):

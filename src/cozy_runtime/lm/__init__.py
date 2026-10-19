@@ -923,6 +923,22 @@ class _Engine:
     the caller that finds the engine idle drives, and hands driving to a waiting caller when its
     own rows are done."""
 
+    # The per-row buffers, assigned together from one `fields` mapping when the slots are sized.
+    ids: torch.Tensor
+    length: torch.Tensor
+    mask: torch.Tensor
+    out: torch.Tensor
+    n: torch.Tensor
+    done: torch.Tensor
+    limit: torch.Tensor
+    stops: torch.Tensor
+    pad: torch.Tensor
+    penalty: torch.Tensor
+    seen: torch.Tensor
+    position: torch.Tensor
+    dmask: torch.Tensor
+    hidden: torch.Tensor
+
     def __init__(self, model: Any) -> None:
         self.model = model
         self.text = model.config.get_text_config(decoder=True)

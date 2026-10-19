@@ -134,7 +134,7 @@ def test_a_kernel_that_failed_here_warns_in_every_run_its_fallback_serves(
 
 def test_a_failed_sol_object_warns_once_per_reason(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(attention, "_STATES", {})
-    rows = [
+    rows: list[dict[str, object]] = [
         {"source": "failed", "state": "failed: compile_failed: CUDA_ERROR_NOT_INITIALIZED"},
         {"source": "failed", "state": "failed: compile_failed: CUDA_ERROR_NOT_INITIALIZED"},
         {"source": "store", "tokens": 4096},

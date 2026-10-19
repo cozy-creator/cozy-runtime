@@ -20,7 +20,7 @@ from cozy_runtime.internal import kernel_cache, kernel_compile, triton_kernels  
 WIDTH, HEADS, HEAD_DIM = 256, 2, 128
 
 
-class HeadNorm(torch.nn.Module):
+class HeadNorm(torch.nn.Module):  # type: ignore[name-defined,misc]
     def __init__(self) -> None:
         super().__init__()
         self.weight = torch.nn.Parameter(1 + 0.2 * torch.randn(HEAD_DIM))
@@ -31,7 +31,7 @@ class HeadNorm(torch.nn.Module):
         return (x * torch.rsqrt(variance + self.eps)).to(x.dtype) * self.weight
 
 
-class Attention(torch.nn.Module):
+class Attention(torch.nn.Module):  # type: ignore[name-defined,misc]
     def __init__(self) -> None:
         super().__init__()
         self.to_q, self.to_k, self.to_v, self.to_out = (
@@ -55,7 +55,7 @@ class Attention(torch.nn.Module):
         return self.to_out(out.transpose(1, 2).flatten(2))
 
 
-class MLP(torch.nn.Module):
+class MLP(torch.nn.Module):  # type: ignore[name-defined,misc]
     def __init__(self) -> None:
         super().__init__()
         self.gate = torch.nn.Linear(WIDTH, 3 * WIDTH, bias=False)
@@ -63,7 +63,7 @@ class MLP(torch.nn.Module):
         self.down = torch.nn.Linear(3 * WIDTH, WIDTH, bias=False)
 
 
-class Block(torch.nn.Module):
+class Block(torch.nn.Module):  # type: ignore[name-defined,misc]
     """A single-stream adaLN block in plain torch: per-token rows (`index`) of a shared table."""
 
     def __init__(self) -> None:
@@ -86,7 +86,7 @@ def _rows(block: Any, arguments: Any) -> fusion.Modulation:
     return fusion.Modulation(arguments["index"], *arguments["table"].chunk(4, dim=-1))
 
 
-class FluxAttention(torch.nn.Module):
+class FluxAttention(torch.nn.Module):  # type: ignore[name-defined,misc]
     """Diffusers' attention contract (to_q/k/v, to_out, heads, a processor), q/k normalized and
     rotated in fp32 by repeated (cos, sin) tables, as Flux does."""
 
@@ -115,14 +115,14 @@ class FluxAttention(torch.nn.Module):
         return self.to_out[0](out.transpose(1, 2).flatten(2))
 
 
-class FeedForward(torch.nn.Module):
+class FeedForward(torch.nn.Module):  # type: ignore[name-defined,misc]
     def __init__(self) -> None:
         super().__init__()
         self.linear_in = torch.nn.Linear(WIDTH, 6 * WIDTH, bias=False)
         self.linear_out = torch.nn.Linear(3 * WIDTH, WIDTH, bias=False)
 
 
-class ParallelBlock(torch.nn.Module):
+class ParallelBlock(torch.nn.Module):  # type: ignore[name-defined,misc]
     """Flux's single-stream block: one modulated norm read by attention and a fused gate|up
     SwiGLU, one gate on their sum; per-token rows of a (shift, scale, gate) table."""
 

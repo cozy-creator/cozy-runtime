@@ -78,7 +78,7 @@ def _orthonormal(model: Any) -> Any:
     return model.to(DEVICE).eval()
 
 
-class _Oracle(torch.nn.Module):
+class _Oracle(torch.nn.Module):  # type: ignore[name-defined,misc]
     """A draft that knows the model's continuation and gets every `miss`-th token wrong."""
 
     def __init__(self, model: Any, prompt: int, reference: Any, miss: int) -> None:
@@ -97,7 +97,7 @@ class _Oracle(torch.nn.Module):
         return self.rows[token] * 4
 
 
-class _Random(torch.nn.Module):
+class _Random(torch.nn.Module):  # type: ignore[name-defined,misc]
     """A Qwen3.5-style head of random weights: its drafts are almost never kept."""
 
     def __init__(self, model: Any) -> None:
@@ -192,6 +192,7 @@ def test_a_verify_pass_steps_its_tokens_as_decode_does(
         job = triton_kernels.job(lm.KERNELS, major * 10 + minor)
         assert kernel_compile.wait(store, job).state == "ready"
     launch = triton_kernels.ready(lm.KERNELS, device="cuda")
+    assert launch is not None
     monkeypatch.setattr(lm, "_STEPS", [launch])
     space = sys.modules["transformers.models.qwen3_5.modeling_qwen3_5"]
     verify = lm._Verify()

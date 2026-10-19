@@ -12,14 +12,15 @@ from typing import Any
 
 import msgspec
 import pytest
-import torch
 
-from cozy_runtime.internal import accel, attention, attention_ulysses, executor, package_interface
-from cozy_runtime.internal.config import seal_snapshot
-from cozy_runtime.internal.discovery import discover
-from cozy_runtime.internal.executor import _SEALED, Executor
-from cozy_runtime.internal.executor_commands import Activate, Invoke, Load, PrepareRequest, Start
-from cozy_runtime.internal.seam import Channel
+torch = pytest.importorskip("torch")  # the fixture's stages hold tensors (#1598)
+
+from cozy_runtime.internal import accel, attention, attention_ulysses, executor, package_interface  # noqa: E402
+from cozy_runtime.internal.config import seal_snapshot  # noqa: E402
+from cozy_runtime.internal.discovery import discover  # noqa: E402
+from cozy_runtime.internal.executor import _SEALED, Executor  # noqa: E402
+from cozy_runtime.internal.executor_commands import Activate, Invoke, Load, PrepareRequest, Start  # noqa: E402
+from cozy_runtime.internal.seam import Channel  # noqa: E402
 
 MODULE = "request_isolation_fixture"
 SOURCE = """
