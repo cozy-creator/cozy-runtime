@@ -732,7 +732,7 @@ class Residency:
 
     def cache(self, owner: str, shed: Shrink) -> Cache | None:
         """Device bytes `owner` keeps for speed, counted and shed on ask; None off a GPU."""
-        return self.memory.cache(owner, shed) if self.memory.gpus else None
+        return self.memory.cache(owner, shed) if self.memory.cuda else None
 
     def note(self, key: str, value: str) -> None:
         self.notes[key] = value
