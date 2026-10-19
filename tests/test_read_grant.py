@@ -160,7 +160,9 @@ def test_a_followers_kept_containers_reach_its_gpu_rank(tmp_path: Path) -> None:
     container, producer = socket.socketpair()
     descriptor = container.detach()
     leader = Executor(Channel(leader_end), tmp_path)
-    follower = Executor(Channel(follower_end), tmp_path, rank=1, world=2)
+    follower_host = Executor(Channel(follower_end), tmp_path, rank=1, world=2)
+    follower = follower_host._construction_child("a-model-member")
+    leader._attempt_request = ""
     machine, relay = Channel(machine_end), Channel(relay_end)
     try:
         with ThreadPoolExecutor(max_workers=2) as pool:
@@ -172,6 +174,7 @@ def test_a_followers_kept_containers_reach_its_gpu_rank(tmp_path: Path) -> None:
             forwarding = pool.submit(leader._relay, relay, request)
             frame = machine.recv()
             assert frame is not None and frame["kind"] == "keep_pages" and frame["rank"] == 1
+            assert frame["request_id"] == "", "retention after the call is construction-scoped"
             assert frame["pages"] == [{"region": 4, "nbytes": 8192}]
             handed = machine.recv_fds(1)[0]
             machine.send({"event": "answer", "seq": frame["seq"], "ok": True})
