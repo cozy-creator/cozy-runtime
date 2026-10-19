@@ -143,7 +143,8 @@ class ReadGrant(_Request, frozen=True, kw_only=True, tag="read_grant"):
     deposited for `layout` (`held`), or the manifest's chunk files. TensorD never fills one."""
 
     manifest: str
-    #: the layout's digest over varena's regions (`tensorfs.varena.torch.regions_of`)
+    #: what the host layout is kept under: manifest, construction and component, known before
+    #: the module is built (`weights.Backend._layout`); a held layout of other regions is a miss
     layout: str
 
 

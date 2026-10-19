@@ -336,6 +336,9 @@ class _RecordingBackend:
     def filled_bytes(self) -> int:
         return sum(e.nbytes for e in self.events)
 
+    def ahead(self) -> None:
+        return None
+
     def fit(self, walked: Census, *, encoded_leaves: str) -> None:
         """A stand-in holds no checkpoint header, so there is nothing to judge against."""
         return None
