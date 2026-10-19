@@ -468,14 +468,15 @@ class Backend:
         selected = [
             c for c, ck in self.checkpoints.items() if ck.manifest_id == checkpoint.manifest_id
         ]
-        tensors = checkpoint.ck.tensors
-        used = {
-            part.chunk
-            for c in selected
-            for info in tensors.get(c, {}).values()
-            for part in info.parts.values()
-        }
-        chunks = checkpoint.ck.chunks
+        tensors, chunks = checkpoint.ck.tensors, checkpoint.ck.chunks
+        used: set[int] = set()
+        parts = (p for c in selected for t in tensors.get(c, {}).values() for p in t.parts.values())
+        for part in parts:
+            at, offset, left = part.chunk, part.offset, part.length
+            while left > 0:  # a part of 16 MiB or more runs on through the next chunks
+                used.add(at)
+                left -= chunks[at][1] - offset
+                at, offset = at + 1, 0
         return sorted((chunks[i][0], chunks[i][1]) for i in used)
 
     def _install_leaf(self, key: str) -> tuple[Any, Any, tuple[str, ...]]:
