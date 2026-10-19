@@ -435,7 +435,12 @@ class Backend:
         rows = {self.plan[key].name: self.plan[key] for key in keys}
         bakes = self.bakes[name] = _Bakes(self.torch, root, rows, set(blocks_of(root)))
         grant = WeightGrant(checkpoint.ck, name, checkpoint.manifest_id, keys=tuple(rows))
-        declared = Declared(grant, fill=bakes if bakes.bakes else None, bind=_Routes(self, rows))
+        declared = Declared(  # `_cozy_state`: what the package's forward changes
+            grant,
+            state=tuple(getattr(root, "_cozy_state", ())),
+            fill=bakes if bakes.bakes else None,
+            bind=_Routes(self, rows),
+        )
         vars(root)["_varena"] = declared
         fd = None
         if self.grant is not None and self.device.type != "mps":
