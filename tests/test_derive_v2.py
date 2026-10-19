@@ -4,6 +4,7 @@ committed output replays, a selection keeps only its tensors, and `Weights[M]` r
 
 from __future__ import annotations
 
+import io
 from pathlib import Path
 from typing import Any
 
@@ -148,3 +149,27 @@ def test_values_read_from_plain_and_rowwise_sources(tmp_path: Path) -> None:
         read_values_into(torch, opened, "unet", key, 0, memoryview(out).cast("B"))
         want = tensors[key].reshape(-1)
         assert float(np.linalg.norm(out - want) / np.linalg.norm(want)) <= tolerance + 1e-3, key
+
+
+def test_a_put_takes_a_buffer_a_file_or_an_in_memory_stream(tmp_path: Path) -> None:
+    store, source, tensors = _source(tmp_path)
+    peer = _peer(tmp_path, store, source)
+    out = peer.client.open_output("model", _derivation(peer, source))
+    bias = np.arange(64, dtype=np.float32)
+    norm = np.arange(256, dtype=np.float16)
+    on_disk = tmp_path / "bias.bin"
+    on_disk.write_bytes(b"skip" + bias.tobytes())
+    with on_disk.open("rb") as file:
+        file.seek(4)  # from its position to its end
+        out.put("unet", "blocks.0.proj.bias", "F32", [64], file)
+    out.put("unet", "norm.weight", "F16", [256], io.BytesIO(norm.tobytes()))
+    weight = tensors["blocks.1.proj.weight"]
+    out.put("unet", "blocks.1.proj.weight", "F32", list(weight.shape), weight)
+    sha, _ = out.commit()
+    written = store.checkpoint(f"sha256:{sha}")
+    for key, want in (
+        ("blocks.0.proj.bias", bias),
+        ("norm.weight", norm),
+        ("blocks.1.proj.weight", weight),
+    ):
+        assert np.array_equal(torch.from_dlpack(written.read("unet", key)).numpy(), want), key
