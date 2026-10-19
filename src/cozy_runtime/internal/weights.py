@@ -518,13 +518,14 @@ class Backend:
             self.memory.adopt(grant)
         return grant
 
-    def keep(self) -> None:
+    def keep(self, *, quiescent: bool = False) -> None:
         """Its models' GPU pages that landed since the last call, kept past this process:
-        TensorD holds them for the next executor of the same layout."""
+        TensorD holds them for the next executor of the same layout. `quiescent` is the
+        executor's fenced, drained end boundary; cached graph pins keep their addresses."""
         if self.keeper is None:
             return
         for name, model in self.models.items():
-            fingerprint, pages = model.kept()
+            fingerprint, pages = model.kept(quiescent=quiescent)
             if pages:
                 self.keeper(self._layout(name), fingerprint, pages)
 
