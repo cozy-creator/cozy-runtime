@@ -48,8 +48,10 @@ def _decode(case: VectorCase, params: dict[str, object], roles: dict[str, Any]) 
     """The bytes every route that takes the tensor decodes (they must agree)."""
     outs = [_decode_with(p, case, params, roles) for p in _decoders(case, params, roles)]
     assert outs, (case.key, params)
-    for out in outs[1:]:
-        assert torch.equal(out.view(torch.uint8), outs[0].view(torch.uint8)), case.key
+    for out in outs[1:]:  # bit for bit, NaN as NaN (a route need not canonicalize its NaN)
+        nan = out.isnan() & outs[0].isnan()
+        assert torch.equal(out[~nan].view(torch.uint8), outs[0][~nan].view(torch.uint8)), case.key
+        assert torch.equal(out.isnan(), outs[0].isnan()), case.key
     return outs[0]
 
 

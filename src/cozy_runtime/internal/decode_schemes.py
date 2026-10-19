@@ -436,6 +436,75 @@ NVFP4 = Adapter(
     rule=_nvfp4_rule,
 )
 
+# ------------------------------------------------------------------------------- mxfp8
+
+
+def _per_matrix_table(
+    c: Cores,
+    words: Tensor,
+    pack: Packing,
+    shape: tuple[int, ...],
+    values: Tensor,
+    scale: Tensor,
+    size: int,
+    layout: str,
+    out: Tensor,
+) -> None:
+    """`T[q] x s` on row blocks of `size`: one call, or one per matrix of a stack when cuBLAS
+    tiles each matrix on its own (spec §6)."""
+    n, cols, m = shape[-2], shape[-1], math.prod(shape[:-2])
+    if m == 1 or layout == "row_major":
+        c.table(words, pack, m * n, cols, values, scale, blocks_of(size, layout), out.reshape(-1))
+        return
+    w, s, e = words.numel() // m, scale.numel() // m, n * cols
+    o = out.reshape(-1)
+    for k in range(m):
+        c.table(
+            words[k * w : (k + 1) * w],
+            pack,
+            n,
+            cols,
+            values,
+            scale[k * s : (k + 1) * s],
+            blocks_of(size, layout),
+            o[k * e : (k + 1) * e],
+        )
+
+
+def _mxfp8(
+    c: Cores,
+    parts: Mapping[str, Tensor],
+    params: Mapping[str, object],
+    shape: tuple[int, ...],
+    out: Tensor,
+) -> None:
+    torch = c.torch
+    weight = parts["weight"]
+    values = _codes(torch, str(weight.dtype).removeprefix("torch."), out.device)
+    _per_matrix_table(
+        c,
+        _u8(torch, weight),
+        Packing(8, 8),
+        shape,
+        values,
+        _f32(torch, parts["scale"]),
+        32,
+        str(params["scale_layout"]),
+        out,
+    )
+
+
+MXFP8 = Adapter(
+    "mxfp8",
+    {"block_size": (32,), "scale_layout": SCALE_LAYOUTS},
+    (
+        Part("weight", ("f8_e4m3fn", "f8_e5m2"), _logical),
+        Part("scale", ("f8_e8m0",), _row_blocks(32, "", True)),
+    ),
+    _mxfp8,
+    {"block_size": 32, "scale_layout": "cublas_128x4"},
+)
+
 # ----------------------------------------------------------------- fp8.blockwise, mxfp4
 
 
@@ -1420,6 +1489,7 @@ COMFY_W4A4 = Adapter(
 #: Every scheme the cores decode, one row each.
 ADAPTERS: tuple[Adapter, ...] = (
     NVFP4,
+    MXFP8,
     FP8_BLOCKWISE,
     MXFP4,
     *(_gguf(name) for name in GGUF),

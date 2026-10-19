@@ -172,13 +172,6 @@ def scale_grid(torch: ModuleType, scale: Tensor, rows: int, blocks: int, layout:
     return scale.reshape(rows, blocks)
 
 
-def _grid_shape(shape: Sequence[int], blocks: int, layout: object) -> tuple[int, ...]:
-    """A block-scale part's stored shape for a logical `shape` and its layout."""
-    if layout == "cublas_128x4":
-        return _blocked_shape(matrix(shape)[0], blocks)
-    return (*tuple(shape[:-1]), blocks)
-
-
 #: E8M0's one non-numeric byte; any other `b` is exactly `2**(b - 127)`.
 E8M0_NAN = 255
 
@@ -200,7 +193,7 @@ def part_rule(encoded: Encoded, shape: Sequence[int], dtype: str) -> str:
     parts = {p.role: p for p in encoded.parts}
     rows, cols = matrix(shape)
     params = dict(encoded.params)
-    axis, layout = params.get("axis"), params.get("scale_layout")
+    axis = params.get("axis")
     #: a stored scale is in the dtype its `scale_dtype` names, and enters the decode exactly
     stored = frozenset({_TENSORFS_DTYPES.get(str(params.get("scale_dtype")), "")})
     rules: dict[str, tuple[frozenset[str], int | tuple[int, ...]]] = {
@@ -211,10 +204,6 @@ def part_rule(encoded: Encoded, shape: Sequence[int], dtype: str) -> str:
         "int8.rowwise": {
             "weight": (frozenset({"i8"}), tuple(shape)),
             "scale": (stored, cols if axis == 1 else rows),
-        },
-        "mxfp8": {
-            "weight": (_F8, tuple(shape)),
-            "scale": (frozenset({"f8_e8m0"}), _grid_shape(shape, -(-cols // MX_BLOCK), layout)),
         },
         "fp8.tensorwise": {
             "weight": (_F8, tuple(shape)),
@@ -579,9 +568,13 @@ class MicroScaledDequant:
         return frozenset()
 
     def supports(self, shape: Sequence[int], params: Mapping[str, object]) -> str:
-        return _rows(shape, params) or _params(
+        why = _rows(shape, params) or _params(
             params, {"block_size": (MX_BLOCK,), "scale_layout": SCALE_LAYOUTS}
         )
+        if not why and len(shape) > 2 and params.get("scale_layout") == "cublas_128x4":
+            # cuBLAS tiles each matrix of a stack (xs-049 U2): the cores' row
+            return f"a tiled stack {tuple(shape)} decodes through the cores, one matrix at a time"
+        return why
 
     def decode(self, torch: ModuleType, parts: Mapping[str, Tensor], destination: Tensor) -> None:
         rows, cols = matrix(destination.shape)
