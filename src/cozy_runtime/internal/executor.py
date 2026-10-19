@@ -2401,7 +2401,10 @@ class Executor:
         # NVML is queried with the sealed device (#549.9): inside the seal, card zero IS the
         # lane's card, so a multi-GPU pod's records name the card the fill actually uses.
         runtime_identity = measure_runtime(torch, binding.release)
-        providers = launch_providers()
+        # Only the schemes these rows store: a machine measures the decoders a model needs (a
+        # table grows as models arrive), not every scheme the Runtime can read.
+        stored = {row.encoded.scheme for row in rows}
+        providers = {s: c for s, c in launch_providers().items() if s in stored}
         # MEASURED ONCE PER (card, build, providers, dtypes), NOT ONCE PER PREPARE
         # (cr-103). The decode suite is 3.2-6.1 s of every model-bearing prepare and none
         # of its inputs change between two models on one warm pod, which is the swap case

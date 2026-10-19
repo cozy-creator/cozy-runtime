@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any, NoReturn
 
 from cozy_runtime.internal import accel, canonical
+from cozy_runtime.internal.encoding.adapters import CoreDequant
 from cozy_runtime.internal.encoding.formats import (
     Encoded,
     Int8ConvRotDequant,
@@ -545,6 +546,7 @@ def launch_providers() -> dict[str, tuple[Provider, ...]]:
         Nvfp4NativeLeaf,
         MicroScaledDequant,
         MicroScaledNativeLeaf,
+        CoreDequant,
     )
     for build in builds:
         for scheme in sorted(build("").schemes):
