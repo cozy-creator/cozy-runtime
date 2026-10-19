@@ -1,7 +1,7 @@
 """Bounded ComfyUI encoding vectors through Runtime's production decode providers.
 
 Run on one existing CUDA worker with Torch, Triton and the built TensorFS wheel:
-    python -m pytest -q -p no:cacheprovider tests/test_comfy_gpu_consumer.py
+    python -m pytest --real-gpu -q -p no:cacheprovider tests/test_comfy_gpu_consumer.py
 No model download is needed. This proves the portable encoding consumer, not the
 ComfyUI application or a model's visual output.
 """
@@ -19,7 +19,7 @@ torch = pytest.importorskip("torch")
 SCHEMES = frozenset(("comfy.asym_w4a8_int8", "comfy.w6a8_int8", "comfy.convrot_w4a4"))
 
 
-@pytest.mark.gpu
+@pytest.mark.real_gpu
 @pytest.mark.skipif(not HAS_TRITON or not torch.cuda.is_available(), reason="CUDA and Triton")
 def test_comfy_vectors_through_launched_gpu_consumers() -> None:
     providers = launch_providers()
