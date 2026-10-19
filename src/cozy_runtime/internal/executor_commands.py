@@ -41,7 +41,7 @@ class Probe(Command, frozen=True, kw_only=True, tag="probe"):
 class Join(Command, frozen=True, kw_only=True, tag="join"):
     port: int
     backend: str = "nccl"
-    #: The follower's GPU ledger memfd follows this command: it claims its own row there.
+    #: The follower's GPU ledger memfd and eventfd follow this command: it claims its row there.
     ledger: bool = False
     #: A socket follows: a byte on it aborts this follower's collectives (`RankGroup.interrupt`).
     abort: bool = False
@@ -63,10 +63,11 @@ class Fork(Command, frozen=True, kw_only=True, tag="fork"):
 
 
 class Map(Command, frozen=True, kw_only=True, tag="map"):
-    """Keep one loaded construction warm (`Memory.keep`): its models are evicted last and copy
-    home into free room first."""
+    """TensorD's warming: one loaded construction's models at `level` (`Memory.load`): `gpu`
+    is warm and fills free room now, `ram` leaves its resident pages idle."""
 
     construction: str
+    level: Literal["gpu", "ram"] = "gpu"
 
 
 class Unload(Command, frozen=True, kw_only=True, tag="unload"):
@@ -137,8 +138,8 @@ class Start(Command, frozen=True, kw_only=True, tag="start"):
     import_only: bool = False
     #: Absent: the executor keeps its in-memory tier at its default.
     memo: MemoSettings | None = None
-    #: Its GPUs' ledger memfds follow the frame, one per GPU in `devices` order (memory-varena
-    #: §5.6): rank 0 claims its row in the first and hands follower r the r-th.
+    #: Its GPUs' ledgers follow the frame, a memfd and an eventfd per GPU in `devices` order
+    #: (memory-varena §5.6): rank 0 claims its row in the first and hands follower r the r-th.
     ledgers: int = 0
     memory_mode: Literal["shared", "dedicated"] = "shared"
     #: The callables its attempts may call: their proxies are installed before the package is

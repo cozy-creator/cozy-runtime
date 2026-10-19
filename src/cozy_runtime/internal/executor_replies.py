@@ -42,7 +42,8 @@ class Memory(msgspec.Struct, frozen=True, kw_only=True):
     and the merge gate reads: torch bytes package state still held at the request's end
     (`leftover`), weight bytes copied to the device while it ran (`paged_in`, home or through
     slots), and each model's bytes copied per step (`steps`). Then the detail: every step's
-    row, the evictions it made, the peaks per shape key, and `leftover` by GPU."""
+    row, the evictions it made, the peaks and cuts per shape key, its out-of-memory retries,
+    and `leftover` by GPU."""
 
     leftover: int = 0
     paged_in: int = 0
@@ -50,4 +51,5 @@ class Memory(msgspec.Struct, frozen=True, kw_only=True):
     rows: list[Step] = []
     evictions: list[Eviction] = []
     peaks: list[Peak] = []
+    retries: int = 0
     leftover_by_gpu: list[tuple[int, int]] = []

@@ -138,27 +138,25 @@ class WriterAdopt(_Writer, frozen=True, kw_only=True, tag="adopt"):
     length: int
 
 
-class GrantPlan(msgspec.Struct, frozen=True, kw_only=True):
-    """One weight set as varena maps it (`tensorfs.varena.torch.regions_of`): TensorD lays its
-    sealed host layout out with varena's own function over these regions, so both agree."""
-
-    manifest: str
-    #: the weight set's name in the executor's memory (`<construction>/<component>`)
-    name: str
-    components: tuple[str, ...]
-    regions: tuple[tuple[str, ...], ...]
-    #: the stored tensors the code builds
-    keys: tuple[str, ...]
-
-
 class ReadGrant(_Request, frozen=True, kw_only=True, tag="read_grant"):
-    """One weight set's bytes (tensorfs-v2 §7): its `GrantPlan` follows in a sealed memfd.
-    `Granted` answers with the sealed host layout, or the manifest's chunk files."""
+    """One weight set's bytes (memory-varena §5.4): `Granted` answers with the host layout
+    deposited for `layout` (`held`), or the manifest's chunk files. TensorD never fills one."""
 
     manifest: str
-    sha256: str
-    length: Annotated[int, msgspec.Meta(ge=0)]
-    #: the plan's memfd; never on the wire
+    #: the layout's digest over varena's regions (`tensorfs.varena.torch.regions_of`)
+    layout: str
+
+
+class Deposit(_Request, frozen=True, kw_only=True, tag="deposit"):
+    """A host layout varena sealed in this process, its memfd following: TensorD keeps it
+    opaquely by (manifest, layout) and grants it to the next `ReadGrant` of that layout."""
+
+    manifest: str
+    name: str
+    layout: str
+    #: the chunk objects it was sealed from (`Granted.objects_sha256`)
+    objects_sha256: str
+    #: the memfd; never on the wire
     memfd: int = -1
 
 
@@ -179,6 +177,7 @@ class FetchChannel(_Request, frozen=True, kw_only=True, tag="fetch_channel"):
 
 type _Tagged = (
     ReadGrant
+    | Deposit
     | ModelSource
     | FetchChannel
     | ChildEvents

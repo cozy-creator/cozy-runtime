@@ -77,8 +77,8 @@ type Grant = Callable[
     [str, str, list[tuple[str, int]]], tuple[int | None, list[tuple[str, int, int]]]
 ]
 #: A host layout varena sealed, deposited with TensorD (`Deposit`): manifest, name, layout
-#: digest, the memfd (the callee's to close).
-type Deposit = Callable[[str, str, str, int], None]
+#: digest, the chunk objects it was sealed from, the memfd (the callee's to close).
+type Deposit = Callable[[str, str, str, list[tuple[str, int]], int], None]
 
 
 # ---------------------------------------------------------------------------- the backend
@@ -445,8 +445,9 @@ class Backend:
         layout = canonical.digest({"manifest": grant.manifest, "regions": regions_of(root)})
         fd: int | None = None
         files: list[tuple[str, int, int]] = []
+        objects = self._objects(checkpoint)
         if self.grant is not None:
-            fd, files = self.grant(grant.manifest, layout, self._objects(checkpoint))
+            fd, files = self.grant(grant.manifest, layout, objects)
             granted = replace(grant, host_fd=fd, files=tuple(files))
             vars(root)["_varena"] = replace(declared, weights=granted)
         try:
@@ -456,7 +457,7 @@ class Backend:
                 os.close(held)
         for _, sealed in self.memory.sealed():
             if self.deposit is not None:
-                self.deposit(grant.manifest, f"{self.construction}/{name}", layout, sealed)
+                self.deposit(grant.manifest, f"{self.construction}/{name}", layout, objects, sealed)
             else:
                 os.close(sealed)
         return model

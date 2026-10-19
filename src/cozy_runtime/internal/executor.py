@@ -94,10 +94,10 @@ from cozy_runtime.author._errors import (
 from cozy_runtime.author._executor_requests import (
     Answer,
     ChildEvents,
+    Deposit,
     Exchange,
     FetchChannel,
     Granted,
-    GrantPlan,
     Handoff,
     ModelSource,
     Published,
@@ -150,7 +150,6 @@ from cozy_runtime.internal import (
     prepare_diagnostics,
     proctree,
     sandbox,
-    seam,
     spawn,
     stage_memo,
     tolerant,
@@ -184,6 +183,7 @@ from cozy_runtime.internal.executor_commands import (
 )
 from cozy_runtime.internal.executor_replies import Eviction as ReplyEviction
 from cozy_runtime.internal.executor_replies import Memory as ReplyMemory
+from cozy_runtime.internal.executor_replies import Peak as ReplyPeak
 from cozy_runtime.internal.executor_replies import Step as ReplyStep
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.fill import (
@@ -298,6 +298,11 @@ def _gpu_numbers(degree: int) -> list[int]:
     """The group's GPUs as nvidia-smi numbers them, from the seal's entries."""
     entries = _sealed_entries()[:degree]
     return [execution_evidence.identify(entry)["gpu"] for entry in entries]
+
+
+def _objects_sha256(objects: Sequence[tuple[str, int]]) -> str:
+    """A grant's chunk list by digest: the sha256 of its `<sha256>:<length>` lines."""
+    return hashlib.sha256("".join(f"{sha}:{n}\n" for sha, n in objects).encode()).hexdigest()
 
 
 def _gpu(rank: int) -> str:
@@ -1027,12 +1032,13 @@ class Executor:
         if self.rank == 0:
             return {"ok": False, "code": "not_a_follower", "detail": f"{_gpu(0)} forms the group"}
         if command.ledger:
-            # It follows the frame on the seam: taken first, whatever this join answers.
-            fd = self.channel.recv_memfd()
+            # Its ledger and eventfd follow the frame: taken first, whatever this join answers.
+            fds = [self.channel.recv_memfd(), self.channel.recv_memfd()]
             if self.host.ledgers:
-                os.close(fd)
+                for fd in fds:
+                    os.close(fd)
             else:
-                self.host.ledgers = [fd]
+                self.host.ledgers = fds
         if command.abort:
             watcher = socket.socket(fileno=self.channel.recv_descriptor())
             threading.Thread(
@@ -1469,7 +1475,7 @@ class Executor:
         and reads as unstarted. The ordinary start that follows only initializes devices,
         warms the package and forms the group.
         """
-        ledgers = self.channel.recv_fds(command.ledgers) if command.ledgers else []
+        ledgers = self.channel.recv_fds(2 * command.ledgers) if command.ledgers else []
         if self.poisoned or self.ledgers:
             for fd in ledgers:  # one set per process
                 os.close(fd)
@@ -1648,7 +1654,7 @@ class Executor:
                     self.pg = self.group.form(
                         self.torch,
                         _SEALED,
-                        self.ledgers[1:],
+                        self.ledgers[2:],
                         nccl=self.transport.nccl,
                         formed=self._calibrated if measured.copy_engines else None,
                     )
@@ -1974,8 +1980,8 @@ class Executor:
     @staticmethod
     def _memory(request: RequestStats | None) -> dict[str, Any] | None:
         """The request's memory as its reply states it (`ReplyMemory`): the merge gate's
-        leftover, paged-in and per-step bytes, then the detail (B3 adds the peaks per shape
-        key)."""
+        leftover, paged-in and per-step bytes, then the detail: rows, evictions, the peaks and
+        cuts per shape key, and its out-of-memory retries."""
         if request is None:
             return None
         steps: dict[str, list[int]] = {}
@@ -1992,6 +1998,11 @@ class Executor:
                 )
                 for e in request.evictions
             ],
+            peaks=[
+                ReplyPeak(model=p.model, shape=p.shape, peak=p.peak, cuts=list(p.cuts))
+                for p in request.peaks
+            ],
+            retries=request.retries,
             leftover_by_gpu=list(request.leftover),
         )
         return msgspec.to_builtins(memory)
@@ -2505,6 +2516,7 @@ class Executor:
             device_facts=device_facts,
             custody=binding.custody,
             grant=self._read_grant,
+            deposit=self._deposit,
         )
         stage("backend_ctor")
         # THE GROUP AGREES ITS PLAN before any rank registers a byte (cr-068), and the smallest
@@ -4113,41 +4125,46 @@ class Executor:
         return bytes(body)
 
     def _read_grant(
-        self, plan: GrantPlan, objects: list[tuple[str, int]]
+        self, manifest: str, layout: str, objects: list[tuple[str, int]]
     ) -> tuple[int | None, list[tuple[str, int, int]]]:
-        """One weight set's bytes from the machine (`ReadGrant`): its sealed host layout, or
-        the chunk files of `objects` (`(sha256, length)` in sha256 order, as the header names
-        them), each `(sha256, length, fd)`; the fds are the caller's to close."""
-        body = canonical.write(msgspec.to_builtins(plan))
-        memfd = seam.sealed("cozy-grant-plan", body)
-        try:
-            request = ReadGrant(
-                manifest=plan.manifest,
-                sha256=hashlib.sha256(body).hexdigest(),
-                length=len(body),
-                memfd=memfd,
-            )
-            answer = self._durable(request, Granted)
-        finally:
-            os.close(memfd)
+        """One weight set's bytes from the machine (`ReadGrant`): the host layout deposited for
+        `layout`, or the chunk files of `objects` (`(sha256, length)` in sha256 order, as the
+        header names them), each `(sha256, length, fd)`; the fds are the caller's to close."""
+        answer = self._durable(ReadGrant(manifest=manifest, layout=layout), Granted)
         if answer.ok and answer.held and answer.descriptor >= 0:
             return answer.descriptor, []
-        listed = "".join(f"{sha}:{length}\n" for sha, length in objects).encode()
         if (
             not answer.ok
             or len(answer.fds) != len(objects)
-            or answer.objects_sha256 != hashlib.sha256(listed).hexdigest()
+            or answer.objects_sha256 != _objects_sha256(objects)
         ):
             for fd in answer.fds:
                 os.close(fd)
             raise RuntimeFailure(
-                f"{plan.name}: the machine granted no bytes it names as this checkpoint's chunks "
-                f"({answer.code or 'a different list'})",
+                f"{manifest[:23]}: the machine granted no bytes it names as this checkpoint's "
+                f"chunks ({answer.code or 'a different list'})",
                 code="weights_ungranted",
             )
         return None, [
             (sha, length, fd) for (sha, length), fd in zip(objects, answer.fds, strict=True)
         ]
+
+    def _deposit(
+        self, manifest: str, name: str, layout: str, objects: list[tuple[str, int]], fd: int
+    ) -> None:
+        """A host layout varena sealed here goes to the machine, which keeps it for the next
+        load of that layout (memory-varena §5.4). A refusal only costs that load a reseal."""
+        try:
+            request = Deposit(
+                manifest=manifest,
+                name=name,
+                layout=layout,
+                objects_sha256=_objects_sha256(objects),
+                memfd=fd,
+            )
+            self._durable(request, Answer)
+        finally:
+            os.close(fd)
 
     def _checkpoint(self, manifest: str) -> Checkpoint:
         """A selected checkpoint's header through TensorD (`ModelSource`). Only the header is
@@ -4186,7 +4203,7 @@ class Executor:
         default the one this thread serves, "" outside every call).
         """
         body = encode_request(request)
-        sending = request.memfd if isinstance(request, ReadGrant) else -1
+        sending = request.memfd if isinstance(request, Deposit) else -1
         body.pop("memfd", None)
         if sending >= 0:
             body["descriptor"] = True
@@ -4354,8 +4371,7 @@ class Executor:
         return accel.streams_idle(self.torch, self.device_kind)
 
     def map(self, command: Map) -> dict[str, Any]:
-        """Keep one loaded construction warm (`Memory.keep`): its models are evicted last and
-        copy home into free room first."""
+        """TensorD's warming: one loaded construction's models at `command.level`."""
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
         child = self.constructions.get(command.construction)
@@ -4364,14 +4380,10 @@ class Executor:
                 "construction_not_loaded", f"{command.construction!r} is not loaded"
             )
         if self.memory is not None:
-            self.memory.keep(
-                [
-                    model
-                    for member in child.model_executors or [child]
-                    if member.backend is not None
-                    for model in member.backend.models.values()
-                ]
-            )
+            for member in child.model_executors or [child]:
+                if member.backend is not None:
+                    for model in member.backend.models.values():
+                        self.memory.load(model.module, command.level)
         return {"ok": True}
 
     def _active_residency(self) -> dict[str, Any]:
