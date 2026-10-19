@@ -25,6 +25,7 @@ from cozy_runtime.author._invoke import Invocation, prepare, run_prepared  # noq
 from cozy_runtime.internal import executor_commands, request_memory, spawn  # noqa: E402
 from cozy_runtime.internal.executor import Executor, serve  # noqa: E402
 from cozy_runtime.internal.executor_replies import RankMemory  # noqa: E402
+from cozy_runtime.internal.executor_replies import Memory as ReplyMemory  # noqa: E402
 from cozy_runtime.internal.parallel.group import RankGroup  # noqa: E402
 from cozy_runtime.internal.seam import Channel  # noqa: E402
 
@@ -112,6 +113,24 @@ def test_weightless_follower_request_returns_no_gpu_evidence(tmp_path: Path) -> 
         assert command(peer, "plan", steps=(("component",),)).ok
         ended = command(peer, "end")
         assert ended.ok and ended.memory is None and worker._rank_request is None
+
+
+def test_single_rank_keeps_its_local_request_plan_and_reply(tmp_path: Path) -> None:
+    left, right = socket.socketpair()
+    executor = Executor(Channel(left), tmp_path)
+    executor.memory = Memory.open(torch.device("cpu"))
+    try:
+        with executor._request("single") as request, executor._ranks_request("single") as ranks:
+            executor._plan_request("single", ["old"])
+            executor._plan_request("single", ["local"])
+            assert torch.arange(4).sum().item() == 6
+        assert request is not None and request.stats is not None and not ranks
+        reply = msgspec.convert(executor._memory(request.stats, ranks), ReplyMemory, strict=True)
+        assert reply.plan == [["local"]] and reply.leftover == 0 and not reply.leftover_by_gpu
+        assert not executor.memory.active and not executor.memory.plans
+    finally:
+        left.close()
+        right.close()
 
 
 def test_real_cpu_context_stats_map_logical_two_gpu_facts_to_lane_two_three() -> None:
