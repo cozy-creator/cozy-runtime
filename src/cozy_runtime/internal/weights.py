@@ -3,7 +3,7 @@
 
 `Backend` is the loader's backend. `fit` judges, `materialize` keeps weights on meta and derived
 buffers real, `fill` checks each destination against its stored row, and `commit` installs
-encoded leaves and registers each component with `Memory.register`. A stored tensor becomes the
+encoded leaves and loads each component with `Memory.load`. A stored tensor becomes the
 module's through its route (`_Routes`: as stored, decoded, or a native leaf's buffers); a LoRA'd
 linear bakes on page-in (`_Bakes`), both declared on the module (`Declared`). `Residency` is
 what Runtime mechanisms reach a placed component through: graph pins, KV caches and notes.
@@ -26,7 +26,7 @@ from tensorfs.varena.torch import (
     Declared,
     Memory,
     Model,
-    Shed,
+    Shrink,
     Unbound,
     WeightGrant,
     blocks_of,
@@ -428,24 +428,26 @@ class Backend:
         return str(self.selected[key].provider.route)
 
     def _register(self, name: str, root: Module, keys: list[str]) -> Model:
-        """One component's model in the memory: its stored tensors, bound through their routes,
-        its LoRAs baked on page-in, its bytes from TensorD's sealed host layout when it keeps
-        one (the regions the memory maps, so the layouts agree)."""
+        """One component loaded into the memory: its stored tensors, bound through their
+        routes, its LoRAs baked on page-in, its bytes from TensorD's sealed host layout when it
+        keeps one (the regions the memory maps, so the layouts agree), else sealed by varena."""
         checkpoint = self.checkpoints[name]
         rows = {self.plan[key].name: self.plan[key] for key in keys}
         bakes = self.bakes[name] = _Bakes(self.torch, root, rows, set(blocks_of(root)))
-        vars(root)["_varena"] = Declared(
-            fill=bakes if bakes.bakes else None, bind=_Routes(self, rows)
-        )
         grant = WeightGrant(checkpoint.ck, name, checkpoint.manifest_id, keys=tuple(rows))
+        declared = Declared(grant, fill=bakes if bakes.bakes else None, bind=_Routes(self, rows))
+        vars(root)["_varena"] = declared
         fd = None
         if self.grant is not None and self.device.type != "mps":
-            fd = self.grant(self._sealed(name, checkpoint, regions_of(root, grant), rows))
+            fd = self.grant(self._sealed(name, checkpoint, regions_of(root), rows))
+            vars(root)["_varena"] = replace(declared, weights=replace(grant, host_fd=fd))
         try:
-            return self.memory.register(root, replace(grant, host_fd=fd))
+            return self.memory.load(root)
         finally:
             if fd is not None:
                 os.close(fd)
+            for _, sealed in self.memory.sealed():  # TensorD v0.10 takes no deposit
+                os.close(sealed)
 
     def _sealed(
         self,
@@ -529,7 +531,7 @@ class Backend:
 
 
 class _Routes:
-    """A stored tensor's parts as the module's tensors (`Memory.register(bind=)`): as stored,
+    """A stored tensor's parts as the module's tensors (`Declared.bind`): as stored,
     decoded into a fresh float tensor, or a native leaf's role buffers (derived roles made from
     the stored ones). What it makes lives for that bind only."""
 
@@ -716,7 +718,7 @@ class Residency:
             cache.close()
             return shed()
 
-        cache = self.memory.register_cache(owner, 0, give)
+        cache = self.memory.cache(owner, give)
         try:
             hold = cache.hold(model)
         except Unbound:
@@ -728,9 +730,9 @@ class Residency:
         self.pins[(component, owner)] = (token, cache)
         return token
 
-    def cache(self, owner: str, shed: Shed) -> Cache | None:
+    def cache(self, owner: str, shed: Shrink) -> Cache | None:
         """Device bytes `owner` keeps for speed, counted and shed on ask; None off a GPU."""
-        return self.memory.register_cache(owner, 0, shed) if self.memory.gpus else None
+        return self.memory.cache(owner, shed) if self.memory.gpus else None
 
     def note(self, key: str, value: str) -> None:
         self.notes[key] = value
