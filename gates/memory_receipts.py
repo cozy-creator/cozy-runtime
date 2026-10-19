@@ -51,6 +51,35 @@ def control_reason(row):
     return ""
 
 
+def transformer_rows(value, executed):
+    """H3's mirrored transformer passes, retaining the producer's physical GPU and step IDs."""
+    rows = value.get("rows")
+    if not isinstance(rows, list):
+        return [], "no-dit-row-stats"
+    selected = []
+    for row in rows:
+        if not isinstance(row, dict) or not isinstance(row.get("model"), str):
+            return [], "no-valid-dit-rows"
+        if not row["model"].rsplit("/", 1)[-1].startswith("transformer"):
+            continue
+        if any(not integer(row.get(key)) for key in ("gpu", "step", "paged_in", "streamed")):
+            return [], "no-valid-dit-rows"
+        selected.append(row)
+    passes = {gpu: [] for gpu in executed}
+    for row in selected:
+        if row["gpu"] not in passes:
+            return [], "dit-row-gpu-coverage"
+        passes[row["gpu"]].append((row["model"], row["step"]))
+    if not passes or any(not sequence for sequence in passes.values()):
+        return [], "dit-row-gpu-coverage"
+    sequences = [set(sequence) for sequence in passes.values()]
+    if any(len(sequence) != len(set(sequence)) for sequence in passes.values()) or any(
+        sequence != sequences[0] for sequence in sequences[1:]
+    ):
+        return [], "dit-row-pass-coverage"
+    return selected, ""
+
+
 def record(path, cell, number, state, substitute, summary):
     bar = []
     try:
@@ -85,7 +114,7 @@ def record(path, cell, number, state, substitute, summary):
                 bar.append("gpu-call-incomplete")
     if not gpu_measurements:
         bar.append("no-gpu-execution")
-    stats = []
+    stats, dit_rows = [], []
     for measurements, executed in gpu_measurements:
         memory = measurements.get("memory")
         value = memory.get("stats") if isinstance(memory, dict) else None
@@ -107,6 +136,13 @@ def record(path, cell, number, state, substitute, summary):
         if not isinstance(steps, dict) or any(not isinstance(k, str) or not isinstance(v, list) or
                                              not all(integer(n) for n in v) for k, v in steps.items()):
             bar.append("no-valid-steps")
+        # Text encoders and VAE stages may legitimately be hosted on one rank. H3's
+        # transformer is mirrored: an aggregate zero cannot stand in for an absent rank.
+        if "-h3" in cell:
+            rows, bad = transformer_rows(value, executed)
+            if bad:
+                bar.append(bad)
+            dit_rows.extend(rows)
         stats.append(value)
     total = lambda key: sum(s[key] for s in stats if integer(s.get(key)))
     complete_stats = bool(stats) and len(stats) == len(gpu_measurements)
@@ -130,7 +166,7 @@ def record(path, cell, number, state, substitute, summary):
         if "-h3ref5-warm" in cell:
             if not dit:
                 bar.append("no-dit-step-stats")
-            elif max(dit) > 0:
+            elif max(dit) > 0 or any(row["paged_in"] + row["streamed"] > 0 for row in dit_rows):
                 bar.append("dit-reads-per-step")
         cold = cells(summary).get(cell[:-5]) if Path(summary).exists() else None
         if cold is None or cold.get("bar") != "ok" or cold.get("status") != "completed" or not cold.get("landed"):
