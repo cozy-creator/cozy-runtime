@@ -61,7 +61,7 @@ import traceback
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import msgspec
 from msgspec import UNSET, UnsetType
@@ -4363,7 +4363,7 @@ class Executor:
         memory = self.host.memory
         if memory is None:
             return contextlib.nullcontext()
-        return memory.request(request_id)
+        return cast("contextlib.AbstractContextManager[Any]", memory.request(request_id))
 
     def _quiescent(self) -> bool:
         """No author computation may still mutate GPU or output state when a terminal is

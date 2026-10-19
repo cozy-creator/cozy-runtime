@@ -56,7 +56,7 @@ class Short(TorchDispatchMode):  # type: ignore[misc]
 
     def __init__(self, room: int, short: bool = True) -> None:
         super().__init__()
-        self.bands, self.short = Bands(Card(room)), short  # type: ignore[arg-type]
+        self.bands, self.short = Bands(Card(room)), short
         self.ran: list[str] = []
 
     def __torch_dispatch__(self, func: Any, types: Any, args: Any = (), kwargs: Any = None) -> Any:
@@ -448,7 +448,7 @@ def crowded_product(card: Crowded) -> tuple[Any, Any, int]:
     x, w = torch.randn(64, 32, device=card.device), torch.randn(32, 128, device=card.device)
     with torch.inference_mode():
         whole = x @ w
-        bands = Bands(card)  # type: ignore[arg-type]
+        bands = Bands(card)
         out = bands.run(torch.ops.aten.mm.default, (x, w), {}, short=True)
     assert [ops for _, ops in card.asked] == [(x, w)]
     return out, whole, whole.nbytes + 2 * (whole.nbytes + x.nbytes) // 64
