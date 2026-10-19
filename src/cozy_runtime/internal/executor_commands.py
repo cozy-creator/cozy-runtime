@@ -138,6 +138,7 @@ MAP = "weights.map/1"
 
 class Unload(Command, frozen=True, kw_only=True, tag="unload"):
     construction: str
+    request_id: str = ""
 
 
 class Activate(Command, frozen=True, kw_only=True, tag="activate"):

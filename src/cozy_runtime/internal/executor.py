@@ -812,6 +812,7 @@ class Executor:
         #: constructions read from it, by header ref
         self.store: weights_store.Store | None = None
         self.hub_access: dict[tuple[str, str], weights_store.Access] = {}
+        self.hub_requests: dict[str, tuple[tuple[str, str], str]] = {}
         self.hub_access_lock = threading.Lock()
         self.opened: dict[str, Checkpoint] = {}
         #: HOST ONLY: the constructed slots built on first use (`on_demand=`), by the same path
@@ -2065,8 +2066,15 @@ class Executor:
         return {"ok": False, "code": code, "detail": detail}
 
     def load(self, command: Load) -> dict[str, Any]:
-        with self._reading(command.hub):
-            return self._load(command)
+        try:
+            with self._reading(command.hub, command.request_id, command.construction):
+                reply = self._load(command)
+            if not reply.get("ok"):
+                self._forget_access(request_id=command.request_id)
+            return reply
+        except BaseException:
+            self._forget_access(request_id=command.request_id)
+            raise
 
     def _load(self, command: Load) -> dict[str, Any]:
         """Construct and fill ONE construction under its key; a loaded key answers again.
@@ -2226,6 +2234,7 @@ class Executor:
     def unload(self, command: Unload) -> dict[str, Any]:
         """Drop one construction: forget its weight sets, release its leases, drop every
         reference."""
+        self._forget_access(request_id=command.request_id, construction=command.construction)
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
         key = command.construction
@@ -3476,8 +3485,13 @@ class Executor:
         return None
 
     def invoke(self, command: Invoke, prepared: PreparedRequest, slot: _Slot) -> dict[str, Any]:
-        with self._reading(command.hub):
-            return self._invoke(command, prepared, slot)
+        try:
+            with self._reading(
+                command.hub, command.request_id, command.construction or self.active
+            ):
+                return self._invoke(command, prepared, slot)
+        finally:
+            self._forget_access(request_id=command.request_id)
 
     def _invoke(self, command: Invoke, prepared: PreparedRequest, slot: _Slot) -> dict[str, Any]:
         """ONE attempt through the author kernel, with the §3.4 freeze point held."""
@@ -3562,16 +3576,19 @@ class Executor:
             name: RawWeights(ref) for name, ref in command.sources.items()
         }
         exchange = self._exchange(command.request_id)
-        store = self._store()
-        outputs = weights_store.Outputs(
-            store,
-            request_id=command.request_id,
-            actor=command.actor,
-            code=_replay_code(command, prepared.overlay.digest),
-            bounds=command.weights,
-            show=functools.partial(_show_checkpoint, exchange),
-            destination=command.destination,
-            access=_READ_ACCESS.get(),
+        outputs = (
+            weights_store.Outputs(
+                self._store(),
+                request_id=command.request_id,
+                actor=command.actor,
+                code=_replay_code(command, prepared.overlay.digest),
+                bounds=command.weights,
+                show=functools.partial(_show_checkpoint, exchange),
+                destination=command.destination,
+                access=_READ_ACCESS.get(),
+            )
+            if command.weights
+            else None
         )
         stage_memo.ENGINE.open(exchange, spool)
         warnings: list[WarningRow] = []
@@ -3622,13 +3639,15 @@ class Executor:
                             weights_values=functools.partial(read_values_into, self.torch),
                             tensorfs_source=(
                                 functools.partial(
-                                    weights_store.open_checkpoint, store, access=_READ_ACCESS.get()
+                                    weights_store.open_checkpoint,
+                                    self._store(),
+                                    access=_READ_ACCESS.get(),
                                 )
                                 if sources
                                 else None
                             ),
-                            tensorfs_output=outputs.open if command.weights else None,
-                            tensorfs_adopt=outputs.adopt if command.weights else None,
+                            tensorfs_output=outputs.open if outputs is not None else None,
+                            tensorfs_adopt=outputs.adopt if outputs is not None else None,
                             publish=lambda request: exchange(request, Published),
                             calls=self.host._call_broker(
                                 command.request_id, self.host.call_interfaces
@@ -4432,20 +4451,41 @@ class Executor:
         return host.store
 
     @contextlib.contextmanager
-    def _reading(self, hub: weights_store.Hub | None) -> Iterator[None]:
+    def _reading(
+        self, hub: weights_store.Hub | None, request_id: str, construction: str
+    ) -> Iterator[None]:
         access = None
         if hub is not None and self.rank == 0:
+            if not request_id:
+                raise CapabilityError("Hub authority needs a request id", code="hub_request_absent")
             host, key = self.host, (hub.capability, hub.key)
             with host.hub_access_lock:
                 access = host.hub_access.get(key)
                 if access is None:
                     access = weights_store.Access(hub)
                     host.hub_access[key] = access
+                host.hub_requests[request_id] = (key, construction)
         token = _READ_ACCESS.set(access)
         try:
             yield
         finally:
             _READ_ACCESS.reset(token)
+
+    def _forget_access(self, *, request_id: str = "", construction: str = "") -> None:
+        host = self.host
+        with host.hub_access_lock:
+            ended = [
+                request
+                for request, (_, model) in host.hub_requests.items()
+                if (request_id and request == request_id)
+                or (construction and model == construction)
+            ]
+            for request in ended:
+                del host.hub_requests[request]
+            live = {key for key, _ in host.hub_requests.values()}
+            for key in list(host.hub_access):
+                if key not in live:
+                    del host.hub_access[key]
 
     def _checkpoint(self, ref: str) -> Checkpoint:
         """Immutable local metadata only: cached constructions retain no request's provider."""

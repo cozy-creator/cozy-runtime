@@ -16,9 +16,11 @@ import pytest
 from cozy_runtime import weights_store
 from cozy_runtime.author._executor_requests import Answer, CheckpointItem, Request, refuse
 from cozy_runtime.internal.discovery import discover
+from cozy_runtime.internal.executor_commands import Load, Unload
 from cozy_runtime.internal.seam import RESULT_DOCUMENT
 from session import session
 from store_fixtures import checkpoint, context, home
+from test_weights_metadata import _hub
 
 PACKAGE = """
 from typing import Any
@@ -205,3 +207,26 @@ def test_an_upload_failure_keeps_the_committed_local_checkpoint(
     kept = store.checkpoint(local.revision)
     assert set(kept.components["unet"].tensors) == {"w", "extra"}
     assert not kept.missing()
+
+
+def test_request_authority_ends_without_unloading_warm_models(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home(tmp_path / "tensorfs", monkeypatch)
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "package.toml").write_text('[application]\nobject="storage_authority_fn:app"\n')
+    (project / "storage_authority_fn.py").write_text(PACKAGE)
+    alice, bob = weights_store.Hub(**_hub()), weights_store.Hub(**_hub())
+    with session(tmp_path, discover(project)) as host:
+        executor = host.executor
+        for request, hub in (("alice", alice), ("bob", bob)):
+            assert executor.load(Load(construction="plan", request_id=request, hub=hub))["ok"]
+        assert len(executor.hub_access) == 2
+        assert executor.unload(Unload(construction="", request_id="alice"))["ok"]
+        assert set(executor.hub_requests) == {"bob"}, "a canceled run keeps no authority"
+        reply = host.run("compute", {"use_output": False}, tmp_path / "bob", hub=bob)
+        assert reply["outcome"]["terminal"] == "succeeded", reply
+        assert not executor.hub_access and not executor.hub_requests
+        assert executor.store is None, "a function with no weights grant needs no store"
+        assert "plan" in executor.constructions, "request cleanup retains the loaded construction"
