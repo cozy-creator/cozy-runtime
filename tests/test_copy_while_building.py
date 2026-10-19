@@ -97,7 +97,7 @@ def test_a_held_layout_binds_before_the_module_and_other_regions_miss(tmp_path: 
         os.close(held)
 
 
-def test_a_changed_held_layout_regrants_chunks_for_a_header_only_executor(tmp_path: Path) -> None:
+def test_a_changed_held_layout_refills_directly_from_the_stored_checkpoint(tmp_path: Path) -> None:
     torch.manual_seed(0)
     reference = network()
     writer = tensorfs.Writer(cache_dir=tmp_path / "store")
@@ -136,7 +136,9 @@ def test_a_changed_held_layout_regrants_chunks_for_a_header_only_executor(tmp_pa
             net = network()
         net._no_split_modules = ()
         model = backend._register("net", net, [row.key for row in ck.rows("net")])
-        assert asked == [backend._layout("net"), ""], "a mismatch explicitly asks for chunk files"
+        assert asked == [backend._layout("net")], (
+            "the stored checkpoint refills without another grant"
+        )
         assert not memory.adopted and model.ws.regions == regions_of(net)
         x = torch.randn(8, DIM)
         with torch.no_grad(), memory.request("changed-layout"):
@@ -149,3 +151,41 @@ def test_a_changed_held_layout_regrants_chunks_for_a_header_only_executor(tmp_pa
         serving.join()
         right.close()
         os.close(held)
+
+
+def test_a_standalone_checkpoint_load_owns_its_parameter_views(tmp_path: Path) -> None:
+    torch.manual_seed(7)
+    reference = network()
+    writer = tensorfs.Writer(cache_dir=tmp_path / "store")
+    component = writer.component("net", cls="", config={})
+    for key, value in reference.state_dict().items():
+        component.put(
+            key, value.detach().contiguous().numpy(), dtype="F32", shape=list(value.shape)
+        )
+    ck = writer.commit()
+    with torch.device("meta"):
+        net = network()
+    memory = Memory.open(torch.device("cpu"))
+    model = memory.load(net, ck=ck, component="net")
+    try:
+        part = next(
+            part
+            for part in model.ws.parts
+            if part.component == "net" and part.key == "embed.weight"
+        )
+        pinned = model.ws.bind(part.region)
+        storage = torch.from_dlpack(pinned)
+        retained = (
+            storage[part.offset : part.offset + part.nbytes].view(torch.float32).reshape(part.shape)
+        )
+        assert retained.data_ptr() == net.embed.weight.data_ptr() == pinned.ptr + part.offset
+        ck.close()
+        x = torch.randn(8, DIM)
+        with torch.no_grad(), memory.request("standalone"):
+            assert torch.equal(net(x), reference(x))
+        model.close()
+        assert torch.equal(retained, reference.embed.weight), "the consumer still owns its host pin"
+    finally:
+        model.close()
+        memory.unclaimed()
+        ck.close()
