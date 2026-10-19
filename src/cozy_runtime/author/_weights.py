@@ -7,7 +7,6 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, get_args, get_origin
 
-from cozy_runtime import weights_store
 from cozy_runtime.author._errors import CapabilityError, ConformanceError
 from cozy_runtime.author._model import Model
 
@@ -104,7 +103,24 @@ class Weights[M: Model[Any]]:
     def read_into(self, component: str, key: str, role: str, offset: int, into: Any) -> None:
         """Stored bytes of one part (`""`: a plain tensor's), at most MAX_WEIGHTS_SOURCE_READ
         per call."""
-        weights_store.read_into(self._view(), component, key, role, offset, into)
+        try:
+            target = memoryview(into)
+        except TypeError:
+            raise CapabilityError(
+                "model read needs a writable buffer", code="weights_reader_buffer"
+            ) from None
+        if (
+            target.readonly
+            or not target.c_contiguous
+            or not 0 < target.nbytes <= MAX_WEIGHTS_SOURCE_READ
+        ):
+            raise CapabilityError("model read buffer is invalid", code="weights_reader_buffer")
+        part = self.tensor(component, key).parts.get(role)
+        if part is None:
+            raise CapabilityError("model tensor part is absent", code="weights_reader_tensor")
+        if type(offset) is not int or offset < 0 or offset + target.nbytes > part.length:
+            raise CapabilityError("model read leaves the tensor part", code="weights_reader_bounds")
+        self._view().components[component].tensors.read_into(key, target, role=role, offset=offset)
 
     def read_values_into(self, component: str, key: str, offset: int, into: Any) -> None:
         """Decode a flat logical element range into a contiguous writable float32 buffer."""

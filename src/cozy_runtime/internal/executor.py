@@ -64,6 +64,7 @@ from pathlib import Path
 from typing import Any
 
 import msgspec
+import tensorfs
 from msgspec import UNSET, UnsetType
 
 from cozy_runtime import __version__ as RUNTIME_VERSION
@@ -194,6 +195,7 @@ from cozy_runtime.internal.executor_commands import (
     Probe,
     Reclaim,
     Release,
+    ResolveModels,
     Revoke,
     Share,
     Shutdown,
@@ -373,6 +375,9 @@ def _env_document() -> dict[str, Any]:
 #: The call the current thread serves ("" outside every call): its requests and its compile
 #: waits' progress name it.
 _CALL: contextvars.ContextVar[str] = contextvars.ContextVar("cozy_call", default="")
+_READ_ACCESS: contextvars.ContextVar[weights_store.Access | None] = contextvars.ContextVar(
+    "weights_access", default=None
+)
 
 
 def _cancelled(mux: Mux, root: Path, request_id: str, wait: float = 0.0) -> bool:
@@ -806,6 +811,8 @@ class Executor:
         #: HOST ONLY: the machine's TensorFS store (`_store`) and the checkpoints its
         #: constructions read from it, by header ref
         self.store: weights_store.Store | None = None
+        self.hub_access: dict[tuple[str, str], weights_store.Access] = {}
+        self.hub_access_lock = threading.Lock()
         self.opened: dict[str, Checkpoint] = {}
         #: HOST ONLY: the constructed slots built on first use (`on_demand=`), by the same path
         self.on_demand: frozenset[str] = frozenset()
@@ -914,6 +921,8 @@ class Executor:
         match command:
             case Hello():
                 return self.hello()
+            case ResolveModels():
+                return self.resolve_models(command)
             case Join():
                 return self.join(command)
             case Attention():
@@ -953,6 +962,47 @@ class Executor:
                 return self.map(command)
             case Shutdown():
                 raise AssertionError("shutdown ends the command loop")
+
+    def resolve_models(self, command: ResolveModels) -> dict[str, Any]:
+        """A request-owned helper lands metadata only, before package imports or device start."""
+        sealed = Path(
+            _SEALED.get(child_env.TENSORFS_HOME) or weights_store.DEFAULT_HOME
+        ).expanduser()
+        if Path(command.store).expanduser().resolve() != sealed.resolve():
+            return self._refusal(
+                "store_root_changed", "metadata helper store differs from its seal"
+            )
+        if self.started or self.imported or self.rank > 0 or "torch" in sys.modules:
+            return self._refusal(
+                "metadata_helper_started", "metadata resolution needs a fresh helper"
+            )
+        try:
+            access = weights_store.Access(command.hub)
+            store = self._store()
+            resolved = []
+            for model in command.models:
+                ck = tensorfs.open(
+                    model.repo_id, revision=model.revision, variant=model.variant,
+                    cache_dir=store.root, endpoint=access.hub.endpoint,
+                    token=access.token, ca_der=access.ca_der,
+                )  # fmt: skip
+                assert ck.header_ref is not None
+                header = {"sha256": ck.header_ref[0], "length": ck.header_ref[1]}
+                row = {
+                    "slot": model.slot, "repo_id": model.repo_id,
+                    "revision": ck.revision or model.revision,
+                    "variant": ck.variant or model.variant, "header": header,
+                }  # fmt: skip
+                if ck.tree_ref is not None:
+                    row["tree"] = {"sha256": ck.tree_ref[0], "length": ck.tree_ref[1]}
+                resolved.append(row)
+            reply: dict[str, Any] = {"ok": True, "resolved": resolved}
+            token = access.token.issued_token()
+            if token is not None:
+                reply["access_token"] = token
+            return reply
+        except tensorfs.Error as exc:
+            return self._refusal(exc.code, exc.detail)
 
     def hello(self) -> dict[str, Any]:
         group, uid, euid = _identity()
@@ -2015,6 +2065,10 @@ class Executor:
         return {"ok": False, "code": code, "detail": detail}
 
     def load(self, command: Load) -> dict[str, Any]:
+        with self._reading(command.hub):
+            return self._load(command)
+
+    def _load(self, command: Load) -> dict[str, Any]:
         """Construct and fill ONE construction under its key; a loaded key answers again.
 
         TensorD names the key and supplies model-source access and memory budgets. Runtime
@@ -2388,25 +2442,6 @@ class Executor:
 
         stage("runtime_imports")
         _restore_seal()
-        if self.world > 1 and self.rank == 0:
-            # THE FOLLOWERS RESOLVE BESIDE RANK 0, not after it: the load goes to every rank
-            # before this one reads a header, and the plans are compared at the residence
-            # agreement, before any rank reserves a destination.
-            assert self.group is not None
-            try:
-                self.group.broadcast(
-                    executor_commands.encode(
-                        msgspec.structs.replace(
-                            command,
-                            construction=self.construction,
-                            group=GroupHardware(degree=self.world, devices=_sealed_entries()),
-                        )
-                    )
-                )
-            except GroupRefusal as exc:
-                return self._group_refusal(exc)
-            stage("group_broadcast")
-
         if self.discovered is None:
             self._discover_provisioned(binding)
         stage("package_import")
@@ -2472,6 +2507,31 @@ class Executor:
         host = self.host
         # One Checkpoint per header ref, open from the store: SDXL's four components share one.
         refs = {name: vmap.get(name, reference.snapshot) for name in names}
+        if self.rank == 0:
+            for ref in set(refs.values()) | {reference.snapshot}:
+                with store_refusals(f"fetching {ref[:23]}"):
+                    current = weights_store.open_checkpoint(host._store(), ref, _READ_ACCESS.get())
+                    selected = [name for name, source in refs.items() if source == ref]
+                    current.fetch([name for name in selected if name in current.components])
+                    # Config construction may consume every component's small run assets.
+                    Checkpoint(current).assets()
+        if self.world > 1 and self.rank == 0:
+            # Only rank 0 reaches the endpoint; followers open the now-local component bytes.
+            assert self.group is not None
+            try:
+                self.group.broadcast(
+                    executor_commands.encode(
+                        msgspec.structs.replace(
+                            command,
+                            hub=None,
+                            construction=self.construction,
+                            group=GroupHardware(degree=self.world, devices=_sealed_entries()),
+                        )
+                    )
+                )
+            except GroupRefusal as exc:
+                return self._group_refusal(exc)
+            stage("group_broadcast")
         checkpoints = {name: host._checkpoint(ref) for name, ref in refs.items()}
         # `names` is what the DERIVE constructed (model-code-fit D9), not what the header
         # carries: a constructed component the checkpoint lacks is the fit's own
@@ -3416,6 +3476,10 @@ class Executor:
         return None
 
     def invoke(self, command: Invoke, prepared: PreparedRequest, slot: _Slot) -> dict[str, Any]:
+        with self._reading(command.hub):
+            return self._invoke(command, prepared, slot)
+
+    def _invoke(self, command: Invoke, prepared: PreparedRequest, slot: _Slot) -> dict[str, Any]:
         """ONE attempt through the author kernel, with the §3.4 freeze point held."""
         surface = self.surface_names[command.entrypoint]
         requested = _attention_pin(command.attention_kernel, command.bits)
@@ -3506,6 +3570,8 @@ class Executor:
             code=_replay_code(command, prepared.overlay.digest),
             bounds=command.weights,
             show=functools.partial(_show_checkpoint, exchange),
+            destination=command.destination,
+            access=_READ_ACCESS.get(),
         )
         stage_memo.ENGINE.open(exchange, spool)
         warnings: list[WarningRow] = []
@@ -3555,7 +3621,11 @@ class Executor:
                             sources=sources,
                             weights_values=functools.partial(read_values_into, self.torch),
                             tensorfs_source=(
-                                functools.partial(_open_checkpoint, store) if sources else None
+                                functools.partial(
+                                    weights_store.open_checkpoint, store, access=_READ_ACCESS.get()
+                                )
+                                if sources
+                                else None
                             ),
                             tensorfs_output=outputs.open if command.weights else None,
                             tensorfs_adopt=outputs.adopt if command.weights else None,
@@ -4356,15 +4426,32 @@ class Executor:
         """The machine's TensorFS store (`TENSORFS_HOME`), which TensorD shares."""
         host = self.host
         if host.store is None:
-            root = seal_snapshot().get(child_env.TENSORFS_HOME) or weights_store.DEFAULT_HOME
+            root = _SEALED.get(child_env.TENSORFS_HOME) or weights_store.DEFAULT_HOME
             with store_refusals(f"opening the store at {root}"):
                 host.store = weights_store.Store(root)
         return host.store
 
+    @contextlib.contextmanager
+    def _reading(self, hub: weights_store.Hub | None) -> Iterator[None]:
+        access = None
+        if hub is not None and self.rank == 0:
+            host, key = self.host, (hub.capability, hub.key)
+            with host.hub_access_lock:
+                access = host.hub_access.get(key)
+                if access is None:
+                    access = weights_store.Access(hub)
+                    host.hub_access[key] = access
+        token = _READ_ACCESS.set(access)
+        try:
+            yield
+        finally:
+            _READ_ACCESS.reset(token)
+
     def _checkpoint(self, ref: str) -> Checkpoint:
-        """The checkpoint `ref` names in the store, opened once per process."""
+        """Immutable local metadata only: cached constructions retain no request's provider."""
         opened = self.opened.get(ref)
         if opened is None:
+            weights_store.open_checkpoint(self._store(), ref, _READ_ACCESS.get())
             opened = Checkpoint(_open_checkpoint(self._store(), ref))
             self.opened[ref] = opened
         return opened

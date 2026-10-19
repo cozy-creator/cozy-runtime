@@ -30,6 +30,20 @@ class Hello(Command, frozen=True, kw_only=True, tag="hello"):
     pass
 
 
+class ResolveModel(msgspec.Struct, frozen=True, kw_only=True):
+    slot: str
+    repo_id: str
+    revision: str
+    variant: str
+
+
+class ResolveModels(Command, frozen=True, kw_only=True, tag="resolve_models"):
+    request_id: str
+    store: str
+    hub: Hub
+    models: tuple[ResolveModel, ...]
+
+
 class Shutdown(Command, frozen=True, kw_only=True, tag="shutdown"):
     pass
 
@@ -283,6 +297,7 @@ class Load(Command, frozen=True, kw_only=True, tag="load"):
     through TensorFS. The command names one model (`binding`) or several (`models`)."""
 
     construction: str
+    request_id: str = ""
     devices: str = ""
     authorized_device_limit_bytes: int | UnsetType = UNSET
     sequence_parallel_degree: int = 1
@@ -407,6 +422,7 @@ class Invoke(_Attempt, frozen=True, kw_only=True, tag="invoke"):
 
 type KnownCommand = (
     Hello
+    | ResolveModels
     | Shutdown
     | Probe
     | Reclaim

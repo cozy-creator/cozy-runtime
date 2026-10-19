@@ -96,11 +96,14 @@ def test_an_executor_opens_a_checkpoint_from_the_store_with_its_configs_and_asse
     write them, assets byte-exact), the same checkpoint for every later load."""
     ref = _pipeline(tmp_path / "tensorfs", monkeypatch).id
     assert ref is not None
+    redirected = tmp_path / "package-changed-store"
+    monkeypatch.setenv("TENSORFS_HOME", str(redirected))
     left, right = socket.socketpair()
     try:
         executor = Executor(Channel(left), tmp_path)
         ck = executor._checkpoint(ref)
         assert executor._checkpoint(ref) is ck and ck.id == ref
+        assert not redirected.exists(), "the executor uses its sealed store root"
         assert ck.configs() == {
             "unet": UNET,
             "scheduler": SCHEDULER,

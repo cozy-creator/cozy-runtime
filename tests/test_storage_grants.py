@@ -174,3 +174,34 @@ with outputs.open('model', Derivation(store.checkpoint(sys.argv[2]))) as out:
         capture_output=True, text=True, check=True,
     )  # fmt: skip
     assert replay.stdout.strip() == first.checkpoint
+
+
+def test_an_upload_failure_keeps_the_committed_local_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = home(tmp_path / "tensorfs", monkeypatch)
+    source = checkpoint(store, {"unet": {"w": np.ones(2, np.float32)}})
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "package.toml").write_text('[application]\nobject="storage_failure_fn:app"\n')
+    (project / "storage_failure_fn.py").write_text(PACKAGE)
+    shown: list[CheckpointItem] = []
+
+    def machine(request: Request) -> Answer:
+        assert isinstance(request, CheckpointItem)
+        shown.append(request)
+        return Answer(ok=True)
+
+    with session(tmp_path, discover(project)) as host:
+        host.handler = machine
+        reply = host.run(
+            "compute", {"use_output": True}, tmp_path / "failed", sources={"source": source},
+            weights={"model": 4096}, destination="alice/model",
+        )  # fmt: skip
+    assert reply["outcome"]["terminal"] == "failed", reply
+    assert reply["outcome"]["code"] == "upload_failed", reply
+    (local,) = shown
+    assert local.repo_id == weights_store.DERIVED
+    kept = store.checkpoint(local.revision)
+    assert set(kept.components["unet"].tensors) == {"w", "extra"}
+    assert not kept.missing()

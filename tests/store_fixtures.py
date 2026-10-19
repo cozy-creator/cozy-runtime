@@ -14,6 +14,7 @@ import tensorfs
 
 from cozy_runtime import weights_store
 from cozy_runtime.author import Context
+from cozy_runtime.internal import executor
 
 DTYPES = {"float16": "F16", "float32": "F32", "uint8": "U8", "uint16": "BF16", "int64": "I64"}
 
@@ -24,6 +25,8 @@ type Shown = list[tuple[str, str, str, str]]
 def home(path: Path, monkeypatch: pytest.MonkeyPatch) -> tensorfs.Store:
     """The store at `path`, which an executor this test drives opens as its machine's."""
     monkeypatch.setenv("TENSORFS_HOME", str(path))
+    # These in-process executors receive the same root as a freshly sealed child.
+    monkeypatch.setitem(executor._SEALED, "TENSORFS_HOME", str(path))
     return tensorfs.Store(path)
 
 
