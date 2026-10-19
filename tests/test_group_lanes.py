@@ -23,7 +23,7 @@ import msgspec
 import pytest
 
 from cozy_runtime.author._signature import ModelBinding
-from cozy_runtime.internal import package_interface, spawn
+from cozy_runtime.internal import executor_commands, package_interface, spawn
 from cozy_runtime.internal.config import seal_snapshot
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.parallel import cp, wire
@@ -281,6 +281,38 @@ def test_a_follower_death_breaks_the_group_loudly(tmp_path: Path) -> None:
         assert group.broken and "GPU 1" in group.broken
         with pytest.raises(GroupRefusal):
             group.check_alive()
+    finally:
+        group.close()
+
+
+def test_a_followers_start_names_no_ledger_descriptors(tmp_path: Path) -> None:
+    """TensorD hands rank 0 one ledger memfd and eventfd per GPU after its Start; rank 0
+    forwards the Start to its followers, which take their own ledger at join. A follower
+    handed the Start as TensorD sent it waited in `start` for descriptors nobody sends, and
+    the group wedged there (runs 11824, 11829). Real follower processes take rank 0's
+    forwarded Start and answer it: here, that its package interface is absent."""
+    env = {**os.environ, "CUDA_VISIBLE_DEVICES": "4,5"}
+    group = RankGroup(
+        degree=2,
+        backend="gloo",
+        python=sys.executable,
+        root=str(tmp_path),
+        sample_seconds=0.2,
+        launch=_launcher(env),
+        devices=("4", "5"),
+    )
+    start = executor_commands.Start(
+        devices="4,5",
+        sequence_parallel_degree=2,
+        ledgers=1,
+        package_interface=str(tmp_path / "absent.json"),
+    )
+    try:
+        group.spawn()
+        group.dial_back(seal_snapshot(env))
+        group.start(executor_commands.encode(start))
+        (reply,) = group.collect("start")
+        assert reply["code"] == "package_prepare_path_invalid", reply
     finally:
         group.close()
 

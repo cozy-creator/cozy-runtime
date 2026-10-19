@@ -1582,7 +1582,7 @@ class Executor:
                 if not self.group.followers:
                     self.group.spawn()
                     self.group.dial_back(_SEALED)
-                self.group.broadcast(executor_commands.encode(command))
+                self.group.start(executor_commands.encode(command))
                 stage("followers_spawned")
             if device:
                 import torch
