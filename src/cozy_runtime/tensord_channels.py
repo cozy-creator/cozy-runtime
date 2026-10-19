@@ -39,9 +39,13 @@ type Data = Buffer | IO[bytes]
 
 
 def length(data: Data) -> int:
+    """`data`'s bytes to write: a buffer's, or a file's (or `BytesIO`'s) from here to its end."""
     if isinstance(data, Buffer):
         return memoryview(data).nbytes
-    return os.fstat(data.fileno()).st_size - data.tell()
+    here = data.tell()
+    end = data.seek(0, os.SEEK_END)
+    data.seek(here)
+    return end - here
 
 
 class Refused(Exception):
