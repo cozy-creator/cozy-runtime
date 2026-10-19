@@ -5,13 +5,19 @@
 # needs no more OOM retries than its cold pass. The exit status counts the cells and cards that miss it, plus regressions.
 #
 #   gates/memory-torture.sh <hub> <wheel|-> [--matrix] [--tensorfs-wheel <file|url>] [--baseline <dir>]
-#                           [--baseline-wheel <file|url> [--baseline-tensorfs <file|url>]] [card[:cell,…]...]
+#                           [--baseline-wheel <file|url> [--baseline-tensorfs <file|url>]] [--tensorhub <hub>]
+#                           [--org <org>] [--image-digest sha256:…] [--after <card>=<cmd>] [card[:cell,…]...]
 #
 # <wheel> is the candidate cozy-runtime wheel (a file or https://…#sha256=…), `-` for the Hub's target.
 # Cards (default: all): 8 12 24 32 2x8; 24 is the RTX 4090, the ComfyUI comparison card. `<card>:<cell>,…` runs only
 # those cells and the references (`8:h3ref,h3`; a pair by its first cell, `pair-sdxl`). Each rents the first SKU of its
 # row with capacity whose GPUs are no larger than the card, runs every cell, confirms each output landed, ends the
-# rental and confirms it is gone. Cards run at once. Results: ./memory-torture-<stamp>/.
+# rental and confirms it is gone. Cards run at once. Results: ./memory-torture-<stamp>/. A card whose SKUs have no
+# capacity rents the next larger class (8: 12, 12: 16, 24: 32, 2x8: 2x12) capped by `cozy machine update
+# --gpu-memory-limit` to the card's GiB; its lines say `substitute=<class>@<GiB>`.
+# --tensorhub: the Hub (overrides <hub>). --org: whose packages run (default fidika). --image-digest: every rental
+# boots that worker image, and `machine show` must name it; with `-` as <wheel>, the image is the release under test.
+# --after <card>=<cmd>: after the card's cells, `<cmd> <rent-alias> <hub>` runs on its rental; its exit status counts.
 # --matrix: the merge matrix for every memory PR (gates/memory-matrix.sh): cards 8 12 24 2x8; Qwen 4 MP, SDXL 4 MP,
 # H3 ref2va_turbo 5 s and 15 s, H3 long_form (2 × 5 s; 2 × 15 s at degree 2 on 2x8) and the pair SDXL ∥ Klein; on 24
 # each H3 cell runs cold, then warm (`<cell>-warm`, a new prompt and seed), and the pair Qwen 1 MP ∥ LM.
@@ -21,7 +27,8 @@
 # switches the same rental to the candidate (H3 downloads once); those lines override --baseline's for their cells.
 set -uo pipefail
 H=$1 W=$2; shift 2
-MATRIX="" TFS="" BASE="" CARDS="" BW="" BTFS=""
+MATRIX="" TFS="" BASE="" CARDS="" BW="" BTFS="" ORG=fidika IMG=""
+declare -A AFTER=()
 while [ $# -gt 0 ]; do
   case $1 in
     --matrix) MATRIX=1 ;;
@@ -29,17 +36,24 @@ while [ $# -gt 0 ]; do
     --baseline) BASE=$(realpath "$2"); shift ;;
     --baseline-wheel) BW=$2; [ -f "$2" ] && BW=$(realpath "$2"); shift ;;
     --baseline-tensorfs) BTFS=$2; [ -f "$2" ] && BTFS=$(realpath "$2"); shift ;;
+    --tensorhub) H=$2; shift ;;
+    --org) ORG=$2; shift ;;
+    --image-digest) IMG=$2; shift ;;
+    --after) AFTER[${2%%=*}]=${2#*=}; shift ;;
     *) CARDS="$CARDS $1" ;;
   esac
   shift
 done
 [ -f "$W" ] && W=$(realpath "$W")
+[ -n "$IMG" ] && [ -n "$BW" ] && { echo "--baseline-wheel would replace the pinned image's Runtime" >&2; exit 2; }
 [ -z "$CARDS" ] && { [ -n "$MATRIX" ] && CARDS="8 12 24 2x8" || CARDS="8 12 24 32 2x8"; }
-declare -A SKUS=([8]="rtx-3070 rtx-3060-ti" [12]="rtx-4070-super rtx-5070 rtx-3080-ti rtx-4070-ti" [24]="rtx-4090"
-  [32]="rtx-pro-4500 rtx-5090" [2x8]="rtx-3070 rtx-3060-ti")
-declare -A GIB=([8]=8 [12]=12 [24]=24 [32]=32 [2x8]=8)  # no GPU of a card may be larger
+declare -A SKUS=([8]="rtx-3070 rtx-3060-ti" [12]="rtx-4070-super rtx-5070 rtx-3080-ti rtx-4070-ti rtx-3060"
+  [16]="rtx-4080-super rtx-4060-ti rtx-5060-ti" [24]="rtx-4090" [32]="rtx-pro-4500 rtx-5090" [2x8]="rtx-3070 rtx-3060-ti"
+  [2x12]="rtx-4070-super rtx-3060")
+declare -A GIB=([8]=8 [12]=12 [16]=16 [24]=24 [32]=32 [2x8]=8 [2x12]=12)  # no GPU of a card may be larger
+declare -A SUB=([8]=12 [12]=16 [24]=32 [2x8]=2x12)  # the next larger class, capped, when a card has no capacity
 D=$PWD/memory-torture-$(date -u +%Y%m%dT%H%M%SZ); mkdir -p "$D"; cd "$D" || exit 1
-TAG=$(basename "$D") FAILED=0 M="" FOLLOW="" ONLY=""
+TAG=$(basename "$D") FAILED=0 M="" FOLLOW="" ONLY="" SUBST=""
 say() { echo "$(date -u +%T) $*" | tee -a summary.txt; }
 release() {  # end the machine this script rented, once its outputs landed, and confirm it is gone
   [ -z "$M" ] && return
@@ -83,9 +97,9 @@ PY
 record() {  # one line per run (status, wall, execution, retries, poisoned, leftover, GB read host to GPU, memory rungs);
             # fails if the run misses the absolute bar, named in `bar=`
   local n=$1 cell=$2 state=$3
-  python3 -I - "show-$cell.json" "$cell" "$n" "$state" <<'PY' | tee -a summary.txt
+  python3 -I - "show-$cell.json" "$cell" "$n" "$state" "$SUBST" <<'PY' | tee -a summary.txt
 import json, re, sys
-path, cell, n, state = sys.argv[1:]
+path, cell, n, state, subst = sys.argv[1:]
 try:
     run = json.load(open(path))
 except Exception:
@@ -117,7 +131,7 @@ if cell.endswith("-warm"):  # §9: no re-reads of a model that fits, and no more
 print(f"{cell} run={n} {state} wall={max(wall, 0) / 1000:.0f}s exec={(run.get('execution_ms') or 0) / 1000:.0f}s "
       f"oom_retries={total('oom_retries')} poisoned={int(poisoned)} leftover={'-' if leftover is None else leftover} "
       f"read={read:.1f}GB disk={total('disk_bytes') / 1e9:.1f}GB steps={steps} read_per_step={read / steps if steps else 0:.2f}GB "
-      f"dit_step_max={dit_step}B bar={','.join(bar) or 'ok'} modes={json.dumps(modes)} mem_stats={json.dumps(stats)} "
+      f"dit_step_max={dit_step}B {f'substitute={subst} ' if subst else ''}bar={','.join(bar) or 'ok'} modes={json.dumps(modes)} mem_stats={json.dumps(stats)} "
       f"reason={str(reason)[:300]}")
 sys.exit(bool(bar))
 PY
@@ -151,18 +165,18 @@ image() { ls "$PWD/out-$1"/*.png "$PWD/out-$1"/*.webp "$PWD/out-$1"/*.jpg 2>/dev
 
 references() {  # two character images for the LM and H3 cells
   local k=$1 r=$2
-  cell "$k-klein-a" fidika/flux-3-klein/generate prompt="portrait of a young lifeguard with long platinum braids, orange swimsuit, $TAG $k a" seed=$((r + 1)) prompt_upsampling=false
-  cell "$k-klein-b" fidika/flux-3-klein/generate prompt="portrait of a woman with short curly auburn hair, navy wool coat, $TAG $k b" seed=$((r + 2)) prompt_upsampling=false
+  cell "$k-klein-a" $ORG/flux-3-klein/generate prompt="portrait of a young lifeguard with long platinum braids, orange swimsuit, $TAG $k a" seed=$((r + 1)) prompt_upsampling=false
+  cell "$k-klein-b" $ORG/flux-3-klein/generate prompt="portrait of a woman with short curly auburn hair, navy wool coat, $TAG $k b" seed=$((r + 2)) prompt_upsampling=false
 }
 
 cells() {  # the matrix on one machine; $1 = card, $2 = H3 segments
   local k=$1 segs=$2 r=$RANDOM
   references "$k" "$r"
-  cell "$k-sdxl" fidika/sdxl/generate prompt="a brass doorknob on a blue door in morning sun, $TAG $k" seed=$((r + 3))
-  cell "$k-qwen1" fidika/qwen-image-2/generate_image prompt="a lighthouse on a cliff at dusk, $TAG $k" seed=$((r + 4)) megapixels:=1
-  cell "$k-qwen4" fidika/qwen-image-2/generate_image prompt="a market street in the rain at night, $TAG $k" seed=$((r + 5)) megapixels:=4
+  cell "$k-sdxl" $ORG/sdxl/generate prompt="a brass doorknob on a blue door in morning sun, $TAG $k" seed=$((r + 3))
+  cell "$k-qwen1" $ORG/qwen-image-2/generate_image prompt="a lighthouse on a cliff at dusk, $TAG $k" seed=$((r + 4)) megapixels:=1
+  cell "$k-qwen4" $ORG/qwen-image-2/generate_image prompt="a market street in the rain at night, $TAG $k" seed=$((r + 5)) megapixels:=4
   local a b; a=$(image "$k-klein-a") b=$(image "$k-klein-b")
-  cell "$k-lm" fidika/character-describer/describe_character --asset "image=$a"
+  cell "$k-lm" $ORG/character-describer/describe_character --asset "image=$a"
   pair_sdxl "$k" "$r"
   pair_qwen "$k" "$r" "$b"
   h3ref "$k" "$b" "$r"
@@ -172,16 +186,16 @@ cells() {  # the matrix on one machine; $1 = card, $2 = H3 segments
 pair_sdxl() {  # co-resident pair, two runs on one GPU at once: SDXL ∥ Klein
   local k=$1 r=$2 n1 n2
   want "$k-pair-sdxl" || return 0
-  n1=$(start "$k-pair-sdxl" fidika/sdxl/generate prompt="a red kite over dunes, $TAG $k pair" seed=$((r + 6)))
-  n2=$(start "$k-pair-klein" fidika/flux-3-klein/generate prompt="a teapot on a windowsill, $TAG $k pair" seed=$((r + 7)) prompt_upsampling=false)
+  n1=$(start "$k-pair-sdxl" $ORG/sdxl/generate prompt="a red kite over dunes, $TAG $k pair" seed=$((r + 6)))
+  n2=$(start "$k-pair-klein" $ORG/flux-3-klein/generate prompt="a teapot on a windowsill, $TAG $k pair" seed=$((r + 7)) prompt_upsampling=false)
   finish "$k-pair-sdxl" "$n1"; finish "$k-pair-klein" "$n2"
 }
 
 pair_qwen() {  # co-resident pair: Qwen 1 MP ∥ LM ($3: the LM's image)
   local k=$1 r=$2 n1 n2
   want "$k-pair-qwen" || return 0
-  n1=$(start "$k-pair-qwen" fidika/qwen-image-2/generate_image prompt="a fox in fresh snow, $TAG $k pair" seed=$((r + 8)) megapixels:=1)
-  n2=$(start "$k-pair-lm" fidika/character-describer/describe_character --asset "image=$3")
+  n1=$(start "$k-pair-qwen" $ORG/qwen-image-2/generate_image prompt="a fox in fresh snow, $TAG $k pair" seed=$((r + 8)) megapixels:=1)
+  n2=$(start "$k-pair-lm" $ORG/character-describer/describe_character --asset "image=$3")
   finish "$k-pair-qwen" "$n1"; finish "$k-pair-lm" "$n2"
 }
 
@@ -190,7 +204,7 @@ h3ref() {  # H3 ref2va_turbo, one clip (15 s unless $4) from one character image
   [ "$s" = 15 ] || c=$k-h3ref$s
   c=$c${5:-}
   printf '{"prompt": "The woman in <Picture 1> walks through a sunlit park in autumn, leaves falling, she picks up a red leaf and smiles, %s %s.\n\nnon_diegetic_music:\nN/A", "seed": %d, "duration_s": %d}\n' "$TAG" "$c" $((r + 40 + s)) "$s" > "$c.json"
-  cell "$c" fidika/minimax-h3/ref2va_turbo --input "$c.json" --asset "$a"
+  cell "$c" $ORG/minimax-h3/ref2va_turbo --input "$c.json" --asset "$a"
 }
 
 matrix() {  # the merge matrix on one machine ($1 = card); on 24 each H3 cell runs again warm
@@ -198,8 +212,8 @@ matrix() {  # the merge matrix on one machine ($1 = card); on 24 each H3 cell ru
   references "$k" "$r"
   a=$(image "$k-klein-a") b=$(image "$k-klein-b")
   if [ "$k" = 2x8 ]; then h3 "$k-h3" 2 "$a" "$b" "$r" 2; return; fi
-  cell "$k-sdxl4" fidika/sdxl/generate prompt="a brass doorknob on a blue door in morning sun, $TAG $k" seed=$((r + 3)) megapixels:=4
-  cell "$k-qwen4" fidika/qwen-image-2/generate_image prompt="a market street in the rain at night, $TAG $k" seed=$((r + 5)) megapixels:=4
+  cell "$k-sdxl4" $ORG/sdxl/generate prompt="a brass doorknob on a blue door in morning sun, $TAG $k" seed=$((r + 3)) megapixels:=4
+  cell "$k-qwen4" $ORG/qwen-image-2/generate_image prompt="a market street in the rain at night, $TAG $k" seed=$((r + 5)) megapixels:=4
   h3ref "$k" "$b" "$r" 5; [ "$k" = 24 ] && h3ref "$k" "$b" $((r + 100)) 5 -warm
   h3ref "$k" "$b" "$r" 15; [ "$k" = 24 ] && h3ref "$k" "$b" $((r + 100)) 15 -warm
   h3 "$k-h3" 2 "$a" "$b" "$r" "" 5; [ "$k" = 24 ] && h3 "$k-h3-warm" 2 "$a" "$b" $((r + 100)) "" 5
@@ -226,18 +240,21 @@ h3() {  # H3 long_form <cell>: <segs> × <seconds, 15>; the last segment is guid
       fi
     done
   } > "$c.yaml"
-  cell "$c" fidika/minimax-h3/long_form --input "$c.yaml" ${gpus:+--gpus "$gpus"}
+  cell "$c" $ORG/minimax-h3/long_form --input "$c.yaml" ${gpus:+--gpus "$gpus"}
 }
 
 card() {  # one card, in its own subshell: rent, install, run its cells, end the rental; exit status = failures
   local card=${1%%:*} gpus="" sku
   ONLY=${1#*:}; [ "$ONLY" = "$1" ] && ONLY=""
-  trap release EXIT INT TERM
+  trap release EXIT
+  trap 'exit 143' INT TERM  # end the rental and stop: no cell may run after it
   [ "$card" = 2x8 ] && gpus=2
   M=""
-  for sku in ${SKUS[$card]}; do
-    cozy machine rent "$sku" ${gpus:+--gpus "$gpus"} --disk-gb 160 --tensorhub "$H" --json > "rent-$card.json" 2> "rent-$card.err"
-    M=$(python3 -I - "rent-$card.json" <<'PY'
+  local class
+  for class in "$card" ${SUB[$card]:-}; do
+    for sku in ${SKUS[$class]}; do
+      cozy machine rent "$sku" ${gpus:+--gpus "$gpus"} --disk-gb 160 ${IMG:+--image-digest "$IMG"} --tensorhub "$H" --json > "rent-$card.json" 2> "rent-$card.err"
+      M=$(python3 -I - "rent-$card.json" <<'PY'
 import json, sys
 text = open(sys.argv[1]).read()
 try:
@@ -247,17 +264,26 @@ except ValueError:
 print(next((d["machine"]["name"] for d in reversed(docs) if (d.get("machine") or {}).get("name")), ""))
 PY
 )
-    if [ -n "$M" ]; then  # address it by its rental alias from here on: the Hub reuses names
-      local name=$M
-      M=$(cozy machine show "$name" --tensorhub "$H" 2>/dev/null | awk '$1 == "alias" {print $2}')
-      [ -z "$M" ] && M=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1])).get("machine",{}).get("alias",""))' "rent-$card.json" 2>/dev/null)
-      [ -z "$M" ] && { say "card $card: rented $sku as $name but found no rent- alias; end it by hand"; FAILED=$((FAILED + 1)); return; }
-      say "card $card: rented $sku as $name ($M)"
-      fits "${GIB[$card]}" "${gpus:-1}" && break
-      say "card $card: $M's GPUs are not ${gpus:-1} of ${GIB[$card]} GiB or less; next SKU"; release
-    fi
+      if [ -n "$M" ]; then  # address it by its rental alias from here on: the Hub reuses names
+        local name=$M
+        M=$(cozy machine show "$name" --tensorhub "$H" 2>/dev/null | awk '$1 == "alias" {print $2}')
+        [ -z "$M" ] && M=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1])).get("machine",{}).get("alias",""))' "rent-$card.json" 2>/dev/null)
+        [ -z "$M" ] && { say "card $card: rented $sku as $name but found no rent- alias; end it by hand"; FAILED=$((FAILED + 1)); return; }
+        say "card $card: rented $sku as $name ($M)"
+        if [ -n "$IMG" ] && ! cozy machine show "$M" --tensorhub "$H" 2>/dev/null | awk -v i="$IMG" '$1 == "image" && $2 == i {ok = 1} END {exit !ok}'; then
+          say "card $card: $M does not boot $IMG"; FAILED=$((FAILED + 1)); release; return
+        fi
+        fits "${GIB[$class]}" "${gpus:-1}" && break 2
+        say "card $card: $M's GPUs are not ${gpus:-1} of ${GIB[$class]} GiB or less; next SKU"; release
+      fi
+    done
   done
   [ -z "$M" ] && { say "card $card: no SKU had capacity ($(tail -c 200 "rent-$card.err"))"; FAILED=$((FAILED + 1)); return; }
+  [ "$class" = "$card" ] || SUBST=$class@${GIB[$card]}
+  if [ -n "$SUBST" ] && ! { cozy machine update "$M" --gpu-memory-limit "${GIB[$card]}GiB" --tensorhub "$H" > "cap-$card.log" 2>&1 &&
+      cozy machine show "$M" --tensorhub "$H" | awk -v g="${GIB[$card]}" '/^gpu memory limit/ {v = $4} END {exit v + 0 != g}'; }; then
+    say "card $card: the ${GIB[$card]} GiB cap on $M is not in force: $(tail -c 300 "cap-$card.log")"; FAILED=$((FAILED + 1)); release; return
+  fi
   local log  # the machine's own and memory logs, kept here in case the machine is lost mid-run
   for log in tensord memory; do
     cozy machine logs "$M" "$log" -f -n 0 --tensorhub "$H" > "$log-$card.log" 2>&1 &
@@ -272,6 +298,10 @@ PY
     say "card $card: the wheel did not install: $(tail -c 300 "update-$card.log")"; FAILED=$((FAILED + 1)); release; return
   fi
   pass "$card"
+  if [ -n "${AFTER[$card]:-}" ]; then
+    bash -c "${AFTER[$card]} \"\$@\"" after "$M" "$H" > "after-$card.log" 2>&1
+    local rc=$?; say "card $card: after: ${AFTER[$card]} $M $H exited $rc"; FAILED=$((FAILED + rc))
+  fi
   release
   return "$FAILED"
 }
@@ -286,7 +316,7 @@ pass() {  # every cell of card $1 on $M, into the current directory
   local card=$1 r=$RANDOM segs=2
   [ "$card" = 32 ] && segs=3
   cozy machine show "$M" --tensorhub "$H" > "machine-$card.txt" 2>&1
-  say "card $card: $(grep -iE 'runtime|tensord' "machine-$card.txt" | tr -s ' ' | tr '\n' ' ' | cut -c1-200)"
+  say "card $card${SUBST:+ (substitute $SUBST)}: $(grep -iE '^(runtime|tensorfs|version|image|gpu memory)' "machine-$card.txt" | tr -s ' ' | tr '\n' ' ' | cut -c1-240)"
   if [ -n "$MATRIX" ]; then
     matrix "$card"
   elif [ "$card" = 2x8 ]; then
@@ -299,7 +329,7 @@ pass() {  # every cell of card $1 on $M, into the current directory
 
 trap 'kill $PIDS 2>/dev/null' INT TERM
 PIDS=""
-for c in $CARDS; do (card "$c"; exit $?) & PIDS="$PIDS $!"; done
+for c in $CARDS; do (card "$c"; exit "$FAILED") & PIDS="$PIDS $!"; done
 for p in $PIDS; do wait "$p"; FAILED=$((FAILED + $?)); done
 say "memory-torture: $FAILED below the absolute bar"
 if [ -n "$BASE$BW" ]; then  # relative to 0.27.4 (D7): a warm cell >10% slower to execute; GB read reported beside it
@@ -317,7 +347,8 @@ def cells(path):
         if m:
             f = dict(re.findall(r" (\w+)=([\d.]+)", line.split(" modes=")[0]))
             out[m[1]] = dict(f, run=m[2], status=m[3], ok=m[3] == "completed" and m[4] == "landed",
-                             bar=(re.search(r" bar=(\S+)", line) or [0, "?"])[1])
+                             bar=(re.search(r" bar=(\S+)", line) or [0, "?"])[1],
+                             sub=(re.search(r" substitute=(\S+)", line) or [0, ""])[1])
     return out
 def show(x):
     return f"{'ok' if x['ok'] else x['status']} exec {x.get('exec', '?')}s oom={x.get('oom_retries', '?')} #{x['run']}" if x else "-"
@@ -331,6 +362,8 @@ for c in sorted(c for c in set(base) | set(here) if wanted(c)):
     why = ""
     if not h or h["bar"] != "ok":
         why = f"  FAIL: {h['bar'] if h else 'no run'}"
+    elif h["sub"]:
+        why = f"  (substitute {h['sub']}: not compared)"
     elif c.endswith("-warm") and b and b["ok"] and float(h["exec"]) > 1.1 * float(b["exec"]):
         why, worse = f"  WORSE: warm execution {h['exec']}s > 1.1 x {b['exec']}s", worse + 1
     print(f"{c:20} {show(b):34} {show(h):34} {read(b)} -> {read(h)}{why}")
