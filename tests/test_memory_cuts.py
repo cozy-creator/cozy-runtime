@@ -52,8 +52,12 @@ def memory() -> Iterator[Any]:
     install_split(None)
 
 
+PIECES: list[tuple[int, int]] = []
+
+
 def scores_whole(q: Any, k: Any, v: Any, **options: Any) -> Any:
     """A [batch, sequence, heads, dim] kernel whose scores are one tensor."""
+    PIECES.append((q.shape[1], q.shape[2]))
     q, k, v = (t.transpose(1, 2) for t in (q, k, v))
     scores = (q @ k.transpose(-1, -2)) / q.shape[-1] ** 0.5
     if options.get("attn_mask") is not None:
@@ -71,11 +75,12 @@ def test_attention_through_the_dispatch_cuts_heads_then_rows(memory: Any) -> Non
         row = 2 * 96 * 8  # one query row of one head: its scores and their working copy
         for limit in (2 * 96 * row, 16 * row + 2048):
             card = Card(limit)
+            PIECES.clear()
             with card:
                 cut = dispatch_attention_fn(q, k, v, backend=backend)
             torch.testing.assert_close(cut, whole, rtol=1e-12, atol=1e-12)
             assert card.refused
-    assert list(memory.sizes.values()) == [16]  # query rows of one head, the kernel's block
+    assert PIECES[-6:] == [(16, 1)] * 6  # query rows of one head, on the kernel's block
 
 
 def test_a_split_runs_in_the_windows_that_fit(memory: Any) -> None:
