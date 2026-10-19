@@ -55,8 +55,8 @@ def test_a_held_layout_is_the_one_descriptor_mapped_as_it_is(tmp_path: Path, che
     layout = sealed("layout", b"a host layout varena sealed in another executor")
     try:
         with grants(tmp_path, store, {"sha256:held": layout}) as (executor, asked):
-            fd, files = executor._read_grant(manifest, "sha256:held", objects)
-            assert files == [] and fd is not None and asked == ["sha256:held"]
+            fd, files, pages, _ = executor._read_grant(manifest, "sha256:held", objects)
+            assert files == [] == pages and fd is not None and asked == ["sha256:held"]
             assert os.pread(fd, 64, 0) == b"a host layout varena sealed in another executor"
             os.close(fd)
     finally:
@@ -68,7 +68,7 @@ def test_chunk_files_come_in_sha256_order_named_by_their_lists_digest(
 ) -> None:
     store, manifest, objects = checkpoint
     with grants(tmp_path, store, {}) as (executor, _):
-        fd, files = executor._read_grant(manifest, "sha256:cold", objects)
+        fd, files, _, _ = executor._read_grant(manifest, "sha256:cold", objects)
         assert fd is None and [(sha, n) for sha, n, _ in files] == objects
         for _, n, file in files:
             assert os.fstat(file).st_size == n

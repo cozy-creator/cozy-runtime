@@ -70,11 +70,15 @@ if TYPE_CHECKING:
     from torch.nn import Module
 
 #: A weight set's bytes from TensorD (`ReadGrant`), by manifest and layout digest: the host
-#: layout deposited for it, or the chunk files of the `(sha256, length)` objects asked, each
-#: `(sha256, length, fd)`.
+#: layout deposited for it with the GPU pages kept of it `(region, fd)` and their fingerprint,
+#: or the chunk files of the `(sha256, length)` objects asked, each `(sha256, length, fd)`.
 type Grant = Callable[
-    [str, str, list[tuple[str, int]]], tuple[int | None, list[tuple[str, int, int]]]
+    [str, str, list[tuple[str, int]]],
+    tuple[int | None, list[tuple[str, int, int]], list[tuple[int, int]], str],
 ]
+#: GPU pages varena kept, given to TensorD (`KeepPages`): layout digest, fingerprint, and
+#: `(region, span, fd)` each (the callee's to close).
+type Keep = Callable[[str, str, list[tuple[int, int, int]]], None]
 #: A host layout varena sealed, deposited with TensorD (`Deposit`): manifest, name, layout
 #: digest, the chunk objects it was sealed from, the memfd (the callee's to close).
 type Deposit = Callable[[str, str, str, list[tuple[str, int]], int], None]
@@ -102,10 +106,11 @@ class Backend:
         custody: str = "canonical",
         grant: Grant | None = None,
         deposit: Deposit | None = None,
+        keeper: Keep | None = None,
     ) -> None:
         self.memory = memory
         self.device = device
-        self.grant, self.deposit = grant, deposit
+        self.grant, self.deposit, self.keeper = grant, deposit, keeper
         self.torch = torch
         self.construction = construction
         self.checkpoints = dict(checkpoints)
@@ -490,11 +495,23 @@ class Backend:
             grant = WeightGrant(checkpoint.ck, name, checkpoint.manifest_id)
             if self.grant is not None:
                 objects = self._objects(checkpoint)
-                fd, files = self.grant(grant.manifest, self._layout(name), objects)
-                grant = replace(grant, host_fd=fd, files=tuple(files))
+                fd, files, pages, fingerprint = self.grant(grant.manifest, self._layout(name), objects)
+                grant = replace(
+                    grant, host_fd=fd, files=tuple(files), pages=tuple(pages), fingerprint=fingerprint
+                )
             self.grants[name] = grant
             self.memory.adopt(grant)
         return grant
+
+    def keep(self) -> None:
+        """Its models' GPU pages that landed since the last call, kept past this process:
+        TensorD holds them for the next executor of the same layout."""
+        if self.keeper is None:
+            return
+        for name, model in self.models.items():
+            fingerprint, pages = model.kept()
+            if pages:
+                self.keeper(self._layout(name), fingerprint, pages)
 
     def _release(self) -> None:
         """Grants no registration took, and what `ahead` adopted for them."""
@@ -574,7 +591,8 @@ class Backend:
 
 
 def _close(grant: WeightGrant) -> None:
-    for fd in ([] if grant.host_fd is None else [grant.host_fd]) + [f for _, _, f in grant.files]:
+    held = [] if grant.host_fd is None else [grant.host_fd]
+    for fd in held + [f for _, _, f in grant.files] + [f for _, f in grant.pages]:
         os.close(fd)
 
 

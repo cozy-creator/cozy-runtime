@@ -161,6 +161,25 @@ class Deposit(_Request, frozen=True, kw_only=True, tag="deposit"):
     memfd: int = -1
 
 
+class Page(msgspec.Struct, frozen=True, kw_only=True):
+    """One kept GPU page: a home region and the bytes its allocation spans."""
+
+    region: int
+    nbytes: int
+
+
+class KeepPages(_Request, frozen=True, kw_only=True, tag="keep_pages"):
+    """GPU pages of weight regions varena kept here (`WeightSet.kept`), one container fd per
+    page following: TensorD holds them past this process and grants them, after `layout`'s held
+    host tier, to the next executor, which maps them when `fingerprint` matches."""
+
+    layout: str
+    fingerprint: str
+    pages: tuple[Page, ...]
+    #: the containers; never on the wire
+    fds: tuple[int, ...] = ()
+
+
 class ModelSource(_Request, frozen=True, kw_only=True, tag="model_source"):
     """One model file from TensorD (`Load.model_sources`): the CozyTensors header (`name`
     empty) or one header-declared asset. `SourceBytes` answers, a sealed memfd of exactly
@@ -179,6 +198,7 @@ class FetchChannel(_Request, frozen=True, kw_only=True, tag="fetch_channel"):
 type _Tagged = (
     ReadGrant
     | Deposit
+    | KeepPages
     | ModelSource
     | FetchChannel
     | ChildEvents
@@ -236,6 +256,9 @@ class Granted(Tier, frozen=True, kw_only=True):
 
     objects_sha256: str = ""
     fds: tuple[int, ...] = ()
+    #: held: GPU pages a gone executor kept of the layout, whose fds follow the layout's
+    fingerprint: str = ""
+    pages: tuple[Page, ...] = ()
 
 
 class SourceBytes(Tier, frozen=True, kw_only=True):
