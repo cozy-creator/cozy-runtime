@@ -5,8 +5,8 @@
 buffers real, `fill` checks each destination against its stored row, and `commit` installs
 encoded leaves and registers each component with `Memory.register`. A stored tensor becomes the
 module's through its route (`_Routes`: as stored, decoded, or a native leaf's buffers); a LoRA'd
-linear bakes on page-in (`_Bakes`). `Residency` is the body of the author's component scopes:
-each is a shared `use` of its components, never an exclusive one (cr-202).
+linear bakes on page-in (`_Bakes`), both declared on the module (`Declared`). `Residency` is
+what Runtime mechanisms reach a placed component through: graph pins, KV caches and notes.
 """
 
 from __future__ import annotations
@@ -16,14 +16,22 @@ import time
 import weakref
 import zlib
 from collections import Counter
-from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
-from tensorfs.varena.torch import Cache, Memory, Model, Shed, Unbound, WeightGrant, regions_of
-from tensorfs.varena.torch import innermost_blocks as blocks_of
+from tensorfs.varena.torch import (
+    Cache,
+    Declared,
+    Memory,
+    Model,
+    Shed,
+    Unbound,
+    WeightGrant,
+    blocks_of,
+    regions_of,
+)
 
 from cozy_runtime.author._executor_requests import SealedPlan
 from cozy_runtime.author._loader import Census, TensorLike, TensorSpec, _members
@@ -425,24 +433,16 @@ class Backend:
         one (the regions the memory maps, so the layouts agree)."""
         checkpoint = self.checkpoints[name]
         rows = {self.plan[key].name: self.plan[key] for key in keys}
-        grant = WeightGrant(checkpoint.ck, name, keys=tuple(rows))
+        bakes = self.bakes[name] = _Bakes(self.torch, root, rows, set(blocks_of(root)))
+        vars(root)["_varena"] = Declared(
+            fill=bakes if bakes.bakes else None, bind=_Routes(self, rows)
+        )
+        grant = WeightGrant(checkpoint.ck, name, checkpoint.manifest_id, keys=tuple(rows))
         fd = None
         if self.grant is not None and self.device.type != "mps":
-            regions = regions_of(grant, blocks_of(root))
-            fd = self.grant(self._sealed(name, checkpoint, regions, rows))
-        bakes = self.bakes[name] = _Bakes(self.torch, root, rows, set(blocks_of(root)))
-        target: int | torch.device = (
-            self.device.index or 0 if self.device.type == "cuda" else self.device
-        )
+            fd = self.grant(self._sealed(name, checkpoint, regions_of(root, grant), rows))
         try:
-            return self.memory.register(
-                f"{self.construction}/{name}",
-                root,
-                replace(grant, host_fd=fd),
-                target,
-                fill=bakes.fill if bakes.bakes else None,
-                bind=_Routes(self, rows),
-            )
+            return self.memory.register(root, replace(grant, host_fd=fd))
         finally:
             if fd is not None:
                 os.close(fd)
@@ -591,8 +591,8 @@ class _Bake:
 
 class _Bakes:
     """A component's LoRA'd linears, baked into their weights' bytes as the pages arrive
-    (`Memory.register(fill=)`), so a resident page carries its delta and an evicted one bakes
-    again on its refault. Each weight's own seed makes every bake of it the same bytes."""
+    (`Declared.fill`), so a resident page carries its delta and an evicted one bakes again on
+    its refault. Each weight's own seed makes every bake of it the same bytes."""
 
     def __init__(
         self, torch: ModuleType, root: Module, rows: Mapping[str, PlanRow], blocks: set[str]
@@ -600,7 +600,6 @@ class _Bakes:
         self.torch = torch
         self.bakes: dict[str, _Bake] = {}
         self.strategy: lora_bake.Strategy = "bake"
-        self.baked_with: tuple[object, ...] | None = None
         self.baked = 0
         names = {row.key.partition(".")[2]: stored for stored, row in rows.items()}
         for local, stored in names.items():
@@ -631,34 +630,21 @@ class _Bakes:
             if bake.layer is not None or bake.hooks:
                 self.bakes[stored] = bake
 
-    def stale(self) -> bool:
-        """Whether resident pages hold other deltas than baking now would add."""
-        return self.baked_with is not None and self.key() != self.baked_with
-
-    def key(self) -> tuple[object, ...]:
-        """What baking now would add: the strategy, and each linear's graph and hook factors."""
-        rows = []
-        for bake in self.bakes.values():
-            hooks = (hook.lora_factors() for hook in bake.hooks)
-            rows.append((bake.layer is not None, *(g and (g[0], g[3]) for g in hooks)))
-        return (self.strategy, *rows)
-
-    def refresh(self, model: Model) -> None:
-        """Before a use: pages baked for other deltas give back (they refill and bake again),
-        and each update skips while the bytes it reads hold it."""
-        key = self.key()
-        if key != self.baked_with:
-            if self.baked_with is not None:
-                model.evict()
-            self.baked_with = key
-        baked = self.strategy == "bake"
+    def prepare(self) -> tuple[object, ...]:
+        """As a forward starts (`Fill.prepare`): each LoRA'd linear told whether its bytes
+        carry its delta, and what baking now adds (the strategy, each linear's graph and hook
+        factors); pages baked for other deltas refill."""
+        baked, rows = self.strategy == "bake", []
         for bake in self.bakes.values():
             if bake.layer is not None:
                 bake.layer._cozy_baked = baked
             for hook in bake.hooks:
                 hook._cozy_baked = baked
+            hooks = (hook.lora_factors() for hook in bake.hooks)
+            rows.append((bake.layer is not None, *(g and (g[0], g[3]) for g in hooks)))
+        return (self.strategy, *rows)
 
-    def fill(self, block: object, parts: Mapping[str, Mapping[str, Tensor]]) -> None:
+    def __call__(self, block: object, parts: Mapping[str, Mapping[str, Tensor]]) -> None:
         if self.strategy != "bake":
             return
         for stored, bake in self.bakes.items():
@@ -689,29 +675,22 @@ class _Bakes:
 
 
 class Residency:
-    """The author scopes' body (`author._model.Residency`): a declared scope is a shared `use` of
-    its components' models (cr-202). It repeats once its method ran twice in a request or its
-    model ran two passes in one use."""
+    """What a Runtime mechanism handed a placed component's module reaches (`PLACED`): graph
+    pins and KV caches as the memory's caches, a request's LoRA serving, and notes."""
 
-    def __init__(
-        self, memory: Memory, backend: Backend, scopes: Mapping[str, tuple[str, ...]]
-    ) -> None:
-        self.memory, self.torch = memory, backend.torch
+    def __init__(self, memory: Memory, backend: Backend) -> None:
+        self.memory = memory
         self.models = dict(backend.models)
         self.bakes = dict(backend.bakes)
-        self.scopes = dict(scopes)
-        self.repeating: set[str] = set()
-        self.entries: Counter[str] = Counter()
         self.notes: dict[str, str] = {}
         self.attempts = 0
-        #: (component, owner) -> its pin and the cache that counts it
+        #: (component, owner) -> its pin and the cache that holds it
         self.pins: dict[tuple[str, str], tuple[_Pin, Cache]] = {}
         for name, model in self.models.items():
             PLACED[model.module] = (self, name)
 
     def open_attempt(self) -> None:
         self.attempts += 1
-        self.entries.clear()
         self.notes.clear()
 
     def serve_lora(self, strategy: lora_bake.Strategy) -> None:
@@ -719,27 +698,11 @@ class Residency:
         for bakes in self.bakes.values():
             bakes.strategy = strategy
 
-    @contextmanager
-    def use(self, method: str, components: tuple[str, ...]) -> Iterator[None]:
-        self.entries[method] += 1
-        if self.entries[method] > 1:
-            self.repeating.add(method)
-        named = [(c, self.models[c]) for c in components if c in self.models]
-        for name, model in named:
-            if self.bakes[name].stale():
-                self.unpin(name)
-            self.bakes[name].refresh(model)
-        steps = [model.steps for _, model in named]
-        with self.memory.use([m for _, m in named], repeats=method in self.repeating):
-            yield
-        if any(m.steps - s > 1 for (_, m), s in zip(named, steps, strict=True)):
-            self.repeating.add(method)
-
     def pin(self, component: str, owner: str, shed: Callable[[], int]) -> _Pin | None:
-        """Every weight of `component` bound for `owner` (a CUDA graph replays at their
-        addresses, decoded copies included), counted as a cache. When memory asks for room or
-        the component's LoRAs change, `shed` drops what read them there; the weights stay
-        bound until the last reference to the pin goes, so a replay in flight keeps them.
+        """Every weight of `component` held bound for `owner` (a CUDA graph replays at their
+        addresses, decoded copies included) by a cache of the memory's. When memory asks for
+        room or the component's LoRAs change, `shed` drops what read them there; the weights
+        stay bound until the last reference to the pin goes, so a replay in flight keeps them.
         None when part of the component streams (a slot's address moves)."""
         held = self.pins.get((component, owner))
         if held is not None:
@@ -747,41 +710,27 @@ class Residency:
         model = self.models.get(component)
         if model is None:
             return None
-        try:
-            hold = model.hold()
-        except Unbound:
-            return None
-        token = _Pin()
-        weakref.finalize(token, hold.close)
 
         def give(_: int) -> int:
             self.pins.pop((component, owner), None)
             cache.close()
             return shed()
 
-        cache = self.memory.cache(owner, model.gpu, give)
+        cache = self.memory.register_cache(owner, 0, give)
+        try:
+            hold = cache.hold(model)
+        except Unbound:
+            cache.close()
+            return None
+        token = _Pin()
+        weakref.finalize(token, hold.close)
         cache.nbytes = model.home_bytes()
         self.pins[(component, owner)] = (token, cache)
         return token
 
-    def unpin(self, component: str) -> None:
-        for (name, _), (_, cache) in list(self.pins.items()):
-            if name == component:
-                cache.shed(cache.nbytes)
-
     def cache(self, owner: str, shed: Shed) -> Cache | None:
         """Device bytes `owner` keeps for speed, counted and shed on ask; None off a GPU."""
-        gpu = next((m.gpu for m in self.models.values()), -1)
-        return self.memory.cache(owner, gpu, shed) if gpu >= 0 else None
-
-    def allocatable(self) -> int:
-        """Device bytes torch can allocate now without evicting a weight."""
-        gpu = next((m.gpu for m in self.models.values()), -1)
-        if gpu < 0:
-            return 0
-        cuda = self.torch.cuda
-        free = cuda.mem_get_info(gpu)[0]
-        return int(free + cuda.memory_reserved(gpu) - cuda.memory_allocated(gpu))
+        return self.memory.register_cache(owner, 0, shed) if self.memory.gpus else None
 
     def note(self, key: str, value: str) -> None:
         self.notes[key] = value

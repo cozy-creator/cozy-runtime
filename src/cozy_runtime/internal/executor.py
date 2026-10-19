@@ -2538,7 +2538,7 @@ class Executor:
         device = self._rank_device(torch)
         if host.memory is None:
             try:
-                host.memory = Memory.open([device.index or 0] if device.type == "cuda" else [])
+                host.memory = Memory.open(device)
             except VarenaUnsupported as exc:  # no varena on this OS (Windows)
                 return {"ok": False, "code": "weight_plane_unavailable", "detail": str(exc)}
             host.memory.context = max(host.device_context, 0)
@@ -2556,7 +2556,6 @@ class Executor:
             custody=binding.custody,
             grant=self._seal_tier if command.sealed_tiers else None,
         )
-        scopes = fetch_plan.in_definition_order(model_cls, component_use(model_cls))
         stage("backend_ctor")
         # THE GROUP AGREES ITS PLAN before any rank registers a byte (cr-068). Budgets are
         # the Worker's, per device, so the ceiling the ranks share is the one it assigned.
@@ -2686,7 +2685,7 @@ class Executor:
         self.models = {name: model for name in binding.parameter_names()}
         # THE COMPONENT-USE CONTRACT'S RUNTIME BODY: from here on a declared scope is a
         # shared `use` of its components, and each block binds its weights while it runs.
-        self.residency = Residency(host.memory, backend, scopes)
+        self.residency = Residency(host.memory, backend)
         object.__setattr__(model, "_cozy_residency", self.residency)
         # Its components' calls replay CUDA graphs once recorded (`graphs`), unless uncaptured.
         graphs.install(self.torch, model, {name: m.module for name, m in backend.models.items()})
@@ -4396,7 +4395,7 @@ class Executor:
         memory = self.host.memory
         if memory is None:
             return contextlib.nullcontext()
-        return memory.request(request_id, list(memory.gpus))
+        return memory.request(request_id)
 
     def _quiescent(self) -> bool:
         """No author computation may still mutate GPU or output state when a terminal is

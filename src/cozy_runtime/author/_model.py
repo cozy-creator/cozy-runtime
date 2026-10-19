@@ -255,17 +255,13 @@ class _Scope(Protocol):
 
 
 class Residency(Protocol):
-    """The runtime's component use, installed on a constructed generation.
+    """What a Runtime mechanism handed a placed component reaches, installed on a constructed
+    generation. Memory itself is varena's: it sees each forward through its own hooks.
 
     Declared here because the contract has one home; implemented nowhere in this package,
     because it needs a device and this package is torch-free by construction. cozy-runtime
     supplies the body on varena's memory (`internal/weights.py`).
-
-    `use` spans the method body: its components are needed now. It is a shared count, never an
-    exclusive scope: any number of calls may use one resident model at once (cr-202).
     """
-
-    def use(self, method: str, components: tuple[str, ...]) -> AbstractContextManager[None]: ...
 
     def pin(self, component: str, owner: str, shed: Callable[[], int]) -> object | None:
         """Every weight of `component` bound at its home address for `owner` (a CUDA graph
@@ -280,10 +276,6 @@ class Residency(Protocol):
 
     def note(self, key: str, value: str) -> None:
         """A fact about how this attempt executed, reported with its memory facts."""
-        ...
-
-    def allocatable(self) -> int:
-        """Device bytes torch can allocate now without evicting a weight."""
         ...
 
     #: How many attempts (requests) it has opened.
@@ -966,15 +958,15 @@ def _declared_state(cls: type) -> tuple[str, ...]:
 
 @final
 class _ComponentScope:
-    """A method's declared components, needed while it runs: a shared use of their weights,
-    nested or on any of the call's threads (cr-202), each marking its own context
-    (`Model._cozy_active`). Calls still take scopes one at a time (`SCOPES`): the sites they
-    read change between turns (cr-202 U4 lifts it).
+    """A method's declared components, nested or on any of the call's threads (cr-202), each
+    marking its own context (`Model._cozy_active`). It carries no memory meaning: varena sees
+    each forward itself. Calls still take scopes one at a time (`SCOPES`): the sites they read
+    change between turns (cr-202 U4 lifts it).
 
     A REMOTE scope, whose every declared component the runtime keeps on another GPU of the
     group (`Placement.remote`), uses nothing on this device."""
 
-    __slots__ = ("_call", "_components", "_local", "_method", "_model", "_remote", "_use")
+    __slots__ = ("_call", "_components", "_local", "_method", "_model", "_remote")
 
     def __init__(self, model: Model[Any], method: str, components: tuple[str, ...]) -> None:
         self._model = model
@@ -982,7 +974,6 @@ class _ComponentScope:
         self._components = components
         self._remote: contextvars.Token[Any] | None = None
         self._local: contextvars.Token[Any] | None = None
-        self._use: AbstractContextManager[None] | None = None
         self._call: Context | None = None
 
     def __enter__(self) -> None:
@@ -1022,16 +1013,6 @@ class _ComponentScope:
             )
             if row not in WARNINGS:
                 WARNINGS.append(row)
-        residency = model._cozy_residency
-        if residency is not None:
-            use = residency.use(self._method, self._components)
-            try:
-                use.__enter__()
-            except BaseException:
-                if self._call is not None:
-                    SCOPES.leave()
-                raise
-            self._use = use
         self._local = _LOCAL_SCOPES.set(
             (*_LOCAL_SCOPES.get(), (model, self._method, self._components))
         )
@@ -1050,14 +1031,8 @@ class _ComponentScope:
         if self._local is not None:
             _LOCAL_SCOPES.reset(self._local)
             self._local = None
-        # The use ends: its weights stay where they are, evictable (§3.2).
-        try:
-            if self._use is not None:
-                use, self._use = self._use, None
-                use.__exit__(*exc)
-        finally:
-            if self._call is not None:
-                SCOPES.leave()
+        if self._call is not None:
+            SCOPES.leave()
 
 
 # --------------------------------------------------------------------------- identity

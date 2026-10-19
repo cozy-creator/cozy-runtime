@@ -63,9 +63,6 @@ TOLERANCE = 5e-2
 HOST_BOUND, PAYS = 0.5, 0.9
 #: Requests in which a signature's capture may fail before it runs as written for good.
 TRIES = 4
-#: A call records only with this many times what it takes at its peak, run as written, free
-#: beside the weights (`Residency.allocatable`): its pool takes about that.
-ROOM = 2
 _PLAIN = (type(None), bool, int, float, str)
 _SAID: set[str] = set()
 
@@ -149,8 +146,6 @@ class _Recorder:
         self.tries: dict[tuple[object, ...], int] = {}
         #: signatures whose capture failed, by the attempt it failed in: tried in the next one
         self.waiting: dict[tuple[object, ...], int] = {}
-        #: what each signature's first call allocated: about what its pool takes
-        self.need: dict[tuple[object, ...], int] = {}
         self.recordings: dict[tuple[object, ...], _Recording] = {}
         self.pool: Any = None
         self.stream: Any = None
@@ -171,7 +166,6 @@ class _Recorder:
         self.failed.clear()
         self.tries.clear()
         self.waiting.clear()
-        self.need.clear()
         self.recordings.clear()
         self.pool, self.pool_bytes, self.chose = None, 0, {}
 
@@ -262,8 +256,7 @@ def _dispatch(torch: Any, module: Any, call: Callable[..., Any], args: Any, kwar
         # The first call of a signature: as written.
         recorder.seen.add(key)
         torch.cuda.synchronize()
-        torch.cuda.empty_cache()  # what it reserves from here is what it takes at its peak
-        started, before = time.perf_counter(), torch.cuda.memory_reserved()
+        started = time.perf_counter()
         state = module_state.snapshot(module)
         out = call(module, *args, **kwargs)
         launched = time.perf_counter() - started
@@ -271,7 +264,6 @@ def _dispatch(torch: Any, module: Any, call: Callable[..., Any], args: Any, kwar
             # A replay runs none of its Python: one that changes its own attributes (HiDiffusion's
             # step counters) runs as written, and is never run again to measure it.
             _chose(recorder, key, "its state", "it changes its own attributes")
-        recorder.need[key] = torch.cuda.memory_reserved() - before
         torch.cuda.synchronize()
         took = time.perf_counter() - started
         if not _clonable(torch, out):
@@ -297,14 +289,6 @@ def _dispatch(torch: Any, module: Any, call: Callable[..., Any], args: Any, kwar
         if not recorder.recordings:  # its pool went with its last graph
             recorder.pool = None
     if entry is None:
-        need = recorder.need.get(key, 0)
-        if placed is not None and (free := placed[0].allocatable()) < ROOM * need:
-            # No room for its pool beside the weights: as written this request, tried the next.
-            recorder.waiting[key] = placed[0].attempts
-            recorder.chose["no room"] = recorder.chose.get("no room", 0) + 1
-            recorder.detail = f"no room: {free >> 20} MiB free, it allocates {need >> 20} MiB"
-            placed[0].note(f"{placed[1]}.graphs", _facts(recorder))
-            return call(module, *args, **kwargs)
         entry = _record(torch, module, call, leaves, spec, recorder, key, layout, placed)
         if entry is None:
             return call(module, *args, **kwargs)
@@ -491,7 +475,6 @@ __all__ = [
     "BYPASS",
     "HOST_BOUND",
     "PAYS",
-    "ROOM",
     "TOLERANCE",
     "TRIES",
     "capture",

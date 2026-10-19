@@ -202,6 +202,14 @@ def is_device_oom(exc: BaseException) -> bool:
     )
 
 
+def is_capacity(exc: BaseException) -> bool:
+    """The device ran out: an allocation failure, or varena's `Exhausted`."""
+    exhausted = (
+        type(exc).__module__ == "tensorfs.varena.torch" and type(exc).__name__ == "Exhausted"
+    )
+    return exhausted or is_device_oom(exc)
+
+
 def is_library_refusal(exc: BaseException) -> bool:
     """A cuBLAS or cuDNN status raised from a library call. Each takes device memory for itself
     at a first launch (its handle, a workspace, a kernel's code) and reports its absence under

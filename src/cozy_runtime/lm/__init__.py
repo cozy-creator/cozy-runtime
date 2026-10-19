@@ -44,9 +44,10 @@ from contextlib import ExitStack, contextmanager
 from typing import Any
 
 from cozy_runtime.author._context import CURRENT, Context
+from cozy_runtime.author._errors import is_capacity
 from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building
 from cozy_runtime.author.kernels import KernelsUnavailable, Launch, Plan, TritonKernels
-from cozy_runtime.graphs import BYPASS, ROOM, capture, native, say
+from cozy_runtime.graphs import BYPASS, capture, native, say
 from cozy_runtime.lm import _kernels
 
 try:
@@ -935,7 +936,8 @@ class _Engine:
         self.cache: Any = None
         self.views: dict[int, Any] = {}
         self.graphs: dict[tuple[int, int, bool], Any] = {}
-        self.need: dict[tuple[int, bool], int] = {}
+        #: (rows, drafted) that ran one eager step: the next is recorded
+        self.warmed: set[tuple[int, bool]] = set()
         self.layout: tuple[object, ...] | None = None
         self.pool: Any = None
         self.side: Any = None
@@ -1103,11 +1105,9 @@ class _Engine:
         pins = [r.pin(name, f"lm:{name}", self._unpinned) for _, (r, name) in targets]
         if any(pin is None for pin in pins):
             return False
-        self.room = targets[0][1][0].allocatable
         self.where = (*pins, built)
         return True
 
-    room: Callable[[], int] | None = None
     #: the pins the graphs read weights through: they live while this engine refers to them
     where: tuple[object, ...] = ()
 
@@ -1384,14 +1384,24 @@ class _Engine:
         self.retire = self.retire or bool(self.done[free[: int(fresh.token.shape[0])]].any())
 
     def _grow(self, size: int, capacity: int, fresh: _Prefill) -> bool:
-        """Buffers for `size` slots of `capacity` positions, granted by the memory manager; the
-        rows held now move over, and the graphs record again. False when there is no room."""
-        device = fresh.token.device
+        """Buffers for `size` slots of `capacity` positions, counted as the memory's cache; the
+        rows held now move over, and the graphs record again. False when they do not fit."""
         if self.reservation is None:
             self.reservation = _reservation(self.model, self._shed)
-        nbytes = _slot_bytes(fresh, capacity, self.draft is not None, self.text) * size
-        if self.reservation is not None and not self.reservation.resize(nbytes):
+        try:
+            self._buffers(size, capacity, fresh)
+        except Exception as exc:
+            if not is_capacity(exc):
+                raise
             return False
+        if self.reservation is not None:
+            self.reservation.nbytes = (
+                _slot_bytes(fresh, capacity, self.draft is not None, self.text) * size
+            )
+        return True
+
+    def _buffers(self, size: int, capacity: int, fresh: _Prefill) -> None:
+        device = fresh.token.device
         old, held = self.cache, [row for row in self.slots if row is not None]
         cache = _StaticCache(self.text, capacity, MIN_WINDOW, rows=True)
         for mine, theirs in zip(cache.layers, fresh.cache.layers, strict=True):
@@ -1477,7 +1487,6 @@ class _Engine:
         self.views = {}
         self._forget()
         self.width = stops
-        return True
 
     # ------------------------------------------------------------------ steps
 
@@ -1553,31 +1562,25 @@ class _Engine:
         key = (size, self.cache.window, drafted)
         graph = self.graphs.get(key)
         if graph is None and cuda and key not in self.unrecorded and self.building != LANDED[0]:
-            need = self.need.get((size, drafted))
-            if need is None:
-                self._measured(size)
+            if (size, drafted) not in self.warmed:
+                self.warmed.add((size, drafted))
+                self._advance(size)
                 return
-            free = self.room() if self.room is not None else ROOM * need
-            if free < ROOM * need:
-                self._unrecorded(
-                    key, f"no room: {free >> 20} MiB free, a step takes {need >> 20} MiB"
-                )
+            if self.pool is None:
+                self.pool, self.side = torch.cuda.graph_pool_handle(), torch.cuda.Stream()
+            capturing = time.perf_counter()
+            try:
+                graph, why = capture(torch, lambda: self._advance(size), self.pool, self.side)
+            except Building:  # eager until a kernel lands
+                graph, why, self.building = None, "", LANDED[0]
+            self.captured[0] += 1
+            self.captured[1] += time.perf_counter() - capturing
+            if graph is not None:
+                self.graphs[key] = graph
             else:
-                if self.pool is None:
-                    self.pool, self.side = torch.cuda.graph_pool_handle(), torch.cuda.Stream()
-                capturing = time.perf_counter()
-                try:
-                    graph, why = capture(torch, lambda: self._advance(size), self.pool, self.side)
-                except Building:  # eager until a kernel lands
-                    graph, why, self.building = None, "", LANDED[0]
-                self.captured[0] += 1
-                self.captured[1] += time.perf_counter() - capturing
-                if graph is not None:
-                    self.graphs[key] = graph
-                else:
-                    self.pool = None  # an aborted capture spent its pool
-                    if why:
-                        self._unrecorded(key, why)
+                self.pool = None  # an aborted capture spent its pool
+                if why:
+                    self._unrecorded(key, why)
         if graph is not None:
             graph.replay()
         else:
@@ -1588,7 +1591,7 @@ class _Engine:
         """Every recorded step goes, and its pool: a fresh pool records the next ones (a pool
         whose graphs are gone takes no new recording)."""
         if self.graphs or self.pool is not None:
-            self.graphs, self.need, self.unrecorded, self.pool = {}, {}, {}, None
+            self.graphs, self.warmed, self.unrecorded, self.pool = {}, set(), {}, None
             torch.cuda.empty_cache()
 
     def _unrecorded(self, key: tuple[int, int, bool], why: str) -> None:
@@ -1604,17 +1607,6 @@ class _Engine:
                 row.request.warnings.append(
                     ("a CUDA graph was not used", {"module": type(self.model).__name__, "why": why})
                 )
-
-    def _measured(self, size: int) -> None:
-        """An eager step, and the device bytes it takes at its peak: the segments it reserves
-        beyond what torch holds with its idle cache given back, as a graph's pool would."""
-        torch.cuda.empty_cache()
-        before = torch.cuda.memory_reserved(self.cache_device)
-        self._advance(size)
-        key = (size, self._drafting(size))
-        self.need[key] = max(
-            self.need.get(key, 0), torch.cuda.memory_reserved(self.cache_device) - before
-        )
 
     def _drafting(self, size: int) -> bool:
         return self.draft is not None and size <= DRAFT_ROWS
