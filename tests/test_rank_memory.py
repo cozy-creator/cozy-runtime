@@ -24,8 +24,8 @@ from cozy_runtime.author import App, Context  # noqa: E402
 from cozy_runtime.author._invoke import Invocation, prepare, run_prepared  # noqa: E402
 from cozy_runtime.internal import executor_commands, request_memory, spawn  # noqa: E402
 from cozy_runtime.internal.executor import Executor, serve  # noqa: E402
-from cozy_runtime.internal.executor_replies import RankMemory  # noqa: E402
 from cozy_runtime.internal.executor_replies import Memory as ReplyMemory  # noqa: E402
+from cozy_runtime.internal.executor_replies import RankMemory  # noqa: E402
 from cozy_runtime.internal.parallel.group import RankGroup  # noqa: E402
 from cozy_runtime.internal.seam import Channel  # noqa: E402
 
@@ -77,6 +77,10 @@ def test_answer_path_preserves_keep_weights_and_request_boundaries(tmp_path: Pat
         for request_id in ("first", "second"):
             assert command(peer, "begin", request_id).ok
             assert worker.memory is not None and len(worker.memory.active) == 1
+            peer.send(executor_commands.encode(executor_commands.KeepWeights(construction="construction")))
+            assert peer.recv() == {
+                "reply": "keep_weights", "ok": False, "code": "request_memory_busy"
+            }
             assert command(peer, "plan", request_id, (("old",),)).ok
             assert command(peer, "plan", request_id, (("right", "left"), ("last",))).ok
             assert not command(peer, "end", "another-request").ok
@@ -90,6 +94,8 @@ def test_answer_path_preserves_keep_weights_and_request_boundaries(tmp_path: Pat
                 and not worker.memory.plans
                 and worker._rank_request is None
             )
+            peer.send(executor_commands.encode(executor_commands.KeepWeights(construction="construction")))
+            assert peer.recv() == {"reply": "keep_weights", "ok": True}
 
 
 def test_failed_mirrored_command_still_closes_its_request(tmp_path: Path) -> None:
@@ -102,6 +108,8 @@ def test_failed_mirrored_command_still_closes_its_request(tmp_path: Path) -> Non
         assert (
             worker.memory is not None and not worker.memory.active and worker._rank_request is None
         )
+        peer.send(executor_commands.encode(executor_commands.KeepWeights(construction="construction")))
+        assert peer.recv() == {"reply": "keep_weights", "ok": True}
         assert command(peer, "begin", "next").ok
         assert command(peer, "end", "next").ok
 

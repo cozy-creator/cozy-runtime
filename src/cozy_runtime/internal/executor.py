@@ -910,7 +910,11 @@ class Executor:
                 keeping = self.constructions.get(command.construction)
                 if keeping is None:
                     return {"ok": False, "code": "construction_absent"}
-                keeping._keep_weights()
+                if self.host._rank_request is not None:
+                    return {"ok": False, "code": "request_memory_busy"}
+                # RequestMemory.end synchronized this follower's device before replying.
+                # Its serial command loop admits no next forward while pages are exported.
+                keeping._keep_weights(quiescent=True)
                 return {"ok": True}
             case executor_commands.RequestMemory():
                 reply = msgspec.to_builtins(self.request_memory(command))
@@ -3521,7 +3525,7 @@ class Executor:
             accel.drain(torch, self.device_kind)
         d2h_ms = (time.perf_counter() - d2h_started) * 1000
         if last:
-            self._keep_weights()
+            self._keep_weights(quiescent=True)
             if self.group is not None:
                 replies = self.group.call(
                     executor_commands.encode(
@@ -4225,10 +4229,10 @@ class Executor:
             bindings.setdefault(key, effect_interfaces.unserved(export))
         return bindings
 
-    def _keep_weights(self) -> None:
+    def _keep_weights(self, *, quiescent: bool = False) -> None:
         for member in self.model_executors or [self]:
             if member.backend is not None:
-                member.backend.keep()
+                member.backend.keep(quiescent=quiescent)
 
     def _read_grant(
         self,
