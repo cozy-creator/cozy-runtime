@@ -180,6 +180,18 @@ PATH_KEYS = frozenset(
 #: Key SUFFIXES that name a carrier however the key is spelled (`unet_path`, `vae_dir`).
 PATH_SUFFIXES = ("_path", "_dir", "_file", "_url", "_repo")
 
+#: Where `save_pretrained` says a config came from: provenance in every upstream config, never
+#: construction input. It names a repo or folder, so a factory never sees it: dropped, not refused.
+PROVENANCE = "_name_or_path"
+
+
+def _without_provenance(data: Mapping[str, object]) -> dict[str, object]:
+    return {
+        key: _without_provenance(value) if isinstance(value, Mapping) else value
+        for key, value in data.items()
+        if key != PROVENANCE
+    }
+
 
 def _carrier(key: str, value: object) -> str | None:
     """Why this entry is a source carrier, if it is. Keys AND values are checked: a value
@@ -219,6 +231,7 @@ class Config:
     ) -> None:
         """Freeze one in-memory construction config. `bound` names the components the
         binding selects (None: all); the others' tensors are not in `tensor_dtypes`."""
+        data = _without_provenance(data)
         for key, value in data.items():
             carrier = _carrier(key, value)
             if carrier is not None:
