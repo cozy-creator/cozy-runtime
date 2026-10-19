@@ -990,7 +990,7 @@ class Executor:
             resolved: list[ResolvedModel] = []
             for model in command.models:
                 ck = tensorfs.open(
-                    model.repo_id, revision=model.revision, variant=model.variant,
+                    model.repo_id, revision=model.revision, variant=model.variant or None,
                     cache_dir=store.root, endpoint=access.hub.endpoint,
                     token=access.token, ca_der=access.ca_der,
                 )  # fmt: skip

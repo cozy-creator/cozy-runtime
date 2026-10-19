@@ -69,7 +69,7 @@ def test_metadata_helper_never_starts_a_package_or_trades_for_cached_metadata(
     frame = {
         "cmd": "resolve_models", "request_id": "metadata", "store": str(root), "hub": _hub(),
         "models": [{"slot": "source", "repo_id": "acme/metadata", "revision": ck.tree,
-                    "variant": ck.variant or ""}],
+                    "variant": ""}],
     }  # fmt: skip
     environment = _environment(tmp_path)
     environment["TENSORFS_HOME"] = str(root)
