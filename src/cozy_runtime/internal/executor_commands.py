@@ -15,6 +15,7 @@ from msgspec import UNSET, UnsetType
 from cozy_runtime.author._assets import FileState, GrantedInput, InputMetadata
 from cozy_runtime.author._services import MAX_OUTPUT_BYTES
 from cozy_runtime.internal.canonical import Json
+from cozy_runtime.weights_store import Hub
 
 _MANIFEST = Annotated[str, msgspec.Meta(pattern="^sha256:[0-9a-f]{64}$")]
 
@@ -270,8 +271,8 @@ LOAD_PINNED = "load_pinned/1"
 LOAD_ATTENTION_PIN = "attention.load_pin/1"
 #: An executor capability: it adopts the machine's sealed host layouts (`Load.sealed_tiers`).
 SEALED_TIERS = "host_tiers.sealed/1"
-#: An executor capability: it reads the holes of a layout staged in part from the object files
-#: its machine hands over, so the machine stages only the regions it streams.
+#: An executor capability: it reads the holes of a layout staged in part from the store's chunk
+#: files, so the machine stages only the regions it streams.
 SEALED_STAGED = "host_tiers.staged/1"
 
 
@@ -302,13 +303,15 @@ class Load(Command, frozen=True, kw_only=True, tag="load"):
     #: TensorD prepares/retains sealed CPU layouts (`SEALED_TIERS`). Runtime adopts the
     #: buffer read-only (`SealedTier`); a managed executor has no implicit Store fallback.
     sealed_tiers: bool = False
-    #: TensorD stages shared CPU layouts in part and supplies read-only object files
-    #: (`SealedStage`, `ObjectFiles`). Runtime's plane uses them for unstaged regions.
+    #: TensorD stages shared CPU layouts in part (`SealedStage`); Runtime's plane reads the
+    #: unstaged regions from the store's chunk files.
     staged_tiers: bool = False
     #: The process's device cap for the load; unset: none given
     cap_bytes: int | UnsetType = UNSET
     #: Per GPU of a group, its own cap for the load (index = rank, `RANK_CELLS`)
     rank_caps: tuple[int, ...] = ()
+    #: The request's Hub and capability its checkpoints are read under; none: public only
+    hub: Hub | None = None
 
     def single(self) -> ModelLoad:
         return ModelLoad(
@@ -388,10 +391,18 @@ class Invoke(_Attempt, frozen=True, kw_only=True, tag="invoke"):
     #: with the machine (attached, and offered at each stage's exit), False keeps them private
     #: (they stream); unset leaves the executor's current setting.
     device_weights: bool | UnsetType = UNSET
-    #: Each `Weights[M]` parameter's checkpoint, read through the owner's source channel.
+    #: Each `Weights[M]` parameter's checkpoint by header ref, opened from the store.
     sources: dict[str, _MANIFEST] = {}
     #: The weights outputs this attempt may write, and each one's granted new bytes.
     weights: dict[str, int] = {}
+    #: The repo its weights outputs upload to (`weights_destination`); empty: kept local
+    destination: str = ""
+    #: The request's Hub and capability, for its private reads and uploads; none: public only
+    hub: Hub | None = None
+    #: Who asked, and the machine's identity of the code it runs (empty: it memoizes nothing):
+    #: what a weights output's replay key starts from
+    actor: str = ""
+    operation: str = ""
 
 
 type KnownCommand = (

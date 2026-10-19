@@ -192,8 +192,9 @@ def test_a_declared_scope_still_leases_and_still_fences() -> None:
     assert frozen.value.code == "persistent_allocation"
 
 
-def test_weights_are_a_manifest_identity_never_a_model() -> None:
-    """`Weights[M]` carries one Manifest identity; nothing is constructed or readable unbound."""
+def test_weights_are_a_checkpoint_ref_never_a_model() -> None:
+    """`Weights[M]` carries one checkpoint's header ref; nothing is constructed or readable
+    unbound."""
     weights: Weights[Denoiser] = Weights(MANIFEST)
     assert weights.checkpoint_ref == MANIFEST and not isinstance(weights, Model)
     with pytest.raises(CapabilityError) as unbound:
@@ -268,7 +269,7 @@ def test_a_model_may_not_name_an_artifact_identifier() -> None:
         Denoiser.for_test(checkpoint_ref="hf:org/model@v2")
     assert scheme.value.code == "identifier_in_code"
 
-    # And raw weights take a Manifest digest, never a name.
+    # And raw weights take a checkpoint's header ref, never a name.
     with pytest.raises(ConformanceError) as derived:
         Weights("stabilityai/stable-diffusion-xl-base-1.0")
-    assert derived.value.code == "weights_manifest_invalid"
+    assert derived.value.code == "weights_ref_invalid"

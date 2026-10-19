@@ -54,8 +54,7 @@ def test_hint_uses_locked_callable_without_reserving_a_call_or_future_payload() 
         ]
         assert broker.calls == {} and broker.next_index == 0
         selected = author.ModelArtifact(
-            "earlier-native-output", "model", author.ObjectRef("sha256:" + "b" * 64, 123),
-            "sha256:" + "c" * 64,
+            "earlier-native-output", "model", "sha256:" + "b" * 64, "sha256:" + "c" * 64
         )
         author.prefetch(next_model, models={"model": selected, "vae": None})
         assert msgspec.json.decode(received[-1][1]["payload"]) == {

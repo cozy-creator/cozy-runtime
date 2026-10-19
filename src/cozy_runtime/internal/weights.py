@@ -68,7 +68,6 @@ from cozy_runtime.internal.encoding import (
 )
 from cozy_runtime.internal.encoding.leaves import sites as leaf_sites
 from cozy_runtime.internal.executor_replies import PlaneFacts, Streamed
-from cozy_runtime.internal.fetch_plan import Fetches, Group, Ref, stage_components
 from cozy_runtime.internal.fill import (
     WIDTHS,
     Checkpoint,
@@ -130,6 +129,22 @@ def _REGISTER_PENDING() -> ResidencyRefusal:  # noqa: N802
     return ResidencyRefusal(
         "weights_register_pending", "v2 registration lands in cr-203 U11b on varena.register"
     )
+
+
+def in_definition_order(
+    cls: type, use: Mapping[str, tuple[str, ...]]
+) -> dict[str, tuple[str, ...]]:
+    """`component_use` with its methods in the order the class defines them: authors write
+    stages in pipeline order (encode, denoise, decode), which a sorted listing loses."""
+    named = dict.fromkeys(
+        name for klass in reversed(cls.__mro__) for name in vars(klass) if name in use
+    )
+    return {name: use[name] for name in [*named, *use]}
+
+
+def stage_components(stages: Iterable[str], use: Mapping[str, Sequence[str]]) -> list[str]:
+    """Components in the order `stages` first use them."""
+    return list(dict.fromkeys(name for stage in stages for name in use.get(stage, ())))
 
 
 # ---------------------------------------------------------------------------- the model
@@ -299,14 +314,9 @@ class Component:
     #: this process or its death) once they are let go, which ends the lease
     leases: list[int] = field(default_factory=list)
     #: a layout the machine stages in part: its plan, and the regions staged so far (the rest
-    #: copy from the object files; the stream's regions are asked for as stages plan them)
+    #: copy from the chunk files; the stream's regions are asked for as stages plan them)
     staging: tuple[SealedPlan, HostTiers] | None = None
     staged: set[int] = field(default_factory=set)
-    #: its checkpoint, each region's objects (by plane index), and the regions whose objects
-    #: are known here: a region is read only once they landed (`WeightResidency._arrive`)
-    manifest: str = ""
-    objects: list[list[Ref]] = field(default_factory=list)
-    landed: set[int] = field(default_factory=set)
     #: cursors a view into their ring kept open past their stage (`close_cursor`, `reap`)
     orphans: list[Cursor] = field(default_factory=list)
 
@@ -464,8 +474,6 @@ class Weights:
         self.context_bytes = -1
         #: the machine's custody of GPU weights (`weights.attach/1`); None: every region private
         self.sharing: DeviceTiers | None = None
-        #: the call's fetch channel: readers wait on their objects there; None: all are here
-        self.fetch: Fetches | None = None
         #: the machine keeps baked variants beside stored bytes (its answers say so)
         self.variants = False
         #: how LoRA'd linears are served: baked into their weights (owner, 2026-10-04: the
@@ -1475,8 +1483,6 @@ class Weights:
         implicitly) and bound in place, the pages shared with every executor of the layout.
         The tier holds every set it registered: past the host, the machine's layout pages."""
         self._pin(self._total())
-        if self.fetch is not None:
-            self.fetch.wait(component.manifest, _ordered(component.objects))
         self.plane.want(component.ws, plane.PINNED, None, priority=self.tick(), pin=True).wait()
         fd = os.dup(component.ws.host_fd)
         try:
@@ -2607,9 +2613,6 @@ class PlaneBackend:
         self.custody = custody
         self.device = weights.device
         self.kind = weights.kind
-        #: the components in the order its stages first use them (`fetch_plan`): the order
-        #: their weights are fetched in
-        self.order: tuple[str, ...] = ()
         self.state = "open"
         self.expected: dict[str, frozenset[str]] = {}
         #: component -> stored tensors the code does not build: named in its read plan,
@@ -2675,8 +2678,8 @@ class PlaneBackend:
             components=sorted({row.component for row in rows}),
             release=release,
             store="script",
-            snapshot=next(iter(checkpoints.values())).manifest_id,
-            snapshots={name: book.manifest_id for name, book in checkpoints.items()},
+            snapshot=next(iter(checkpoints.values())).id,
+            snapshots={name: book.id for name, book in checkpoints.items()},
             providers=providers,
             capabilities=qualification.capabilities,
             device=facts,
@@ -2771,7 +2774,7 @@ class PlaneBackend:
                     f"no checkpoint for it (bound: {', '.join(sorted(self.checkpoints))})",
                     [component],
                 )
-            by_checkpoint.setdefault(checkpoint.manifest_id, (checkpoint, []))[1].append(component)
+            by_checkpoint.setdefault(checkpoint.id, (checkpoint, []))[1].append(component)
         verdict: dict[str, object] | None = None
         ignored: list[str] = []
         warnings: list[str] = []
@@ -2998,8 +3001,8 @@ class HostTiers:
     seal: Callable[[SealedPlan], int | None]
     #: stage more regions of a layout staged in part (`SealedStage`): those staged or staging
     stage: Callable[[SealedPlan, list[int]], list[int]] | None = None
-    #: the verified object files behind a plan, `(sha256, length, fd)` per object of the list
-    #: given (the plan's, in SHA-256 order; `ObjectFiles`)
+    #: the store's chunk files behind a plan, `(sha256, length, fd)` per object of the list
+    #: given (the plan's, in SHA-256 order)
     files: Callable[[SealedPlan, list[tuple[str, int]]], list[tuple[str, int, int]]] | None = None
 
 
@@ -3189,8 +3192,6 @@ class WeightResidency:
         #: block modules run while `recording`, by component
         self.read: dict[str, set[Module]] | None = None
         self.attempts = 0
-        #: an on-demand model's: asks for its weights as a stage begins (`Fetches.want`)
-        self.wanted: Callable[[], None] | None = None
         self._modes = weights.torch._C._len_torch_dispatch_stack
         #: `held` scopes the open stage keeps (`hold_stage`): (held, layout) by component
         self.stage_holds: dict[str, tuple[bool, tuple[object, ...]]] = {}
@@ -3239,8 +3240,6 @@ class WeightResidency:
         self.weights.set_lora(strategy)
 
     def admit(self, method: str, components: tuple[str, ...]) -> None:
-        if self.wanted is not None:
-            self.wanted()
         self._require_clean(method)
         try:
             with self._quiet():  # the plane's own binds are not the package's ops
@@ -3355,7 +3354,6 @@ class WeightResidency:
         """The stage's common region's lease, room made for it by the ladder (`upto`)."""
         weights, common = self.weights, component.common
         assert common is not None
-        self._arrive(component, common.index)
         return weights.memory.retry(
             lambda: weights.plane.acquire(component.ws, weights.index, common.index, stream),
             f"{component.name}.common",
@@ -3704,7 +3702,6 @@ class WeightResidency:
             try:
                 stream = weights.stream()
                 for region in regions:
-                    self._arrive(component, region.index)
                     leases.append(self._hold(component, region, stream))
                     weights.drain()
                 for region, lease in zip(regions, leases, strict=True):
@@ -4266,7 +4263,6 @@ class WeightResidency:
         ranks below every idle weight too: the pass streams through its own window, and other
         stages' weights stay mapped (keep hot)."""
         weights = self.weights
-        self._arrive(component, index)
         if component.cursor is not None and _due(component, component.cursor, index):
             lease: Lease = component.cursor.acquire(index, stream)
         else:
@@ -4277,29 +4273,6 @@ class WeightResidency:
             )
         weights.drain()  # what this fill displaced is unbound at once, in every weight set
         return lease
-
-    def _arrive(self, component: Component, index: int) -> None:
-        """A region is read only once its objects are here: the paging fill waits on them,
-        raised to Now, and never fetches anything itself."""
-        fetch = self.weights.fetch
-        if fetch is not None and index not in component.landed:
-            fetch.wait(component.manifest, component.objects[index])
-            component.landed.add(index)
-
-    def fetch_plan(self) -> list[Group]:
-        """Its components in the stage order learned here (definition order before that),
-        each one's regions in execution order: the plan an attempt re-asserts."""
-        stages = [*self.stages, *(m for m in self.scopes if m not in self.stages)]
-        # A partial binding leaves components its scopes name unbuilt; they have no plan.
-        names = [n for n in stage_components(stages, self.scopes) if n in self.components]
-        names += [name for name in self.components if name not in names]
-        groups: list[Group] = []
-        for name in names:
-            c = self.components[name]
-            blocks = c.order or [region.index for region in c.blocks]
-            first = [c.common.index] if c.common is not None else []
-            groups.append((c.manifest, _ordered(c.objects, [*first, *blocks])))
-        return groups
 
     def _lease(self, component: Component, region: Region, op: str) -> Lease:
         """A region's lease for an op that reads it outside its forward (`Weights.reading`)."""
@@ -4498,12 +4471,6 @@ class WeightResidency:
             raise ResidencyRefusal(
                 "residency_poisoned", f"{what}() against a poisoned weight plane: {self.poisoned}"
             )
-
-
-def _ordered(regions: Sequence[Sequence[Ref]], order: Iterable[int] | None = None) -> list[Ref]:
-    """The objects of `regions` in `order` (default: address order), each once."""
-    picked = range(len(regions)) if order is None else order
-    return list(dict.fromkeys(ref for index in picked for ref in regions[index]))
 
 
 def _stage_stream(

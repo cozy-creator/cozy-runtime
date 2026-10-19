@@ -227,13 +227,10 @@ def test_a_fork_refuses_what_it_cannot_keep(
 def test_model_load_requires_sources_and_leaves_weightless_execution_usable(
     zygote: tuple[subprocess.Popen[bytes], Channel, dict[str, Any]], tmp_path: Path, many: bool
 ) -> None:
-    """A real control peer cannot turn an installed full Store into model authority."""
-    import tensorfs
-
-    store = tensorfs.Store(tmp_path / "store")
+    """A real control peer cannot turn a store path into model authority."""
     _process, channel, start = zygote
     assert _call(channel, start)["ok"]
-    binding = {"model_class": "UnimportableModel", "store": str(store.root)}
+    binding = {"model_class": "UnimportableModel", "store": str(tmp_path / "store")}
     command: dict[str, Any] = {"cmd": "load", "construction": "ungranted", "devices": ""}
     command.update(
         {

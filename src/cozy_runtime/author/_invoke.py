@@ -89,7 +89,7 @@ from cozy_runtime.author._walker import field_values, strip, unwrap_optional, wa
 from cozy_runtime.author._weights import ReadValues, Weights
 
 if TYPE_CHECKING:
-    from cozy_runtime.tensord_channels import Derivation, Output, Source
+    from cozy_runtime.weights_store import Checkpoint, Derivation, Output
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,9 +128,9 @@ class Invocation:
     sources: Mapping[str, Weights[Any]] = field(default_factory=dict)
     """`Weights[M]` parameter -> its raw checkpoint, read through this attempt's source."""
     weights_values: ReadValues | None = None
-    tensorfs_source: Callable[[str], Source] | None = None
+    tensorfs_source: Callable[[str], Checkpoint] | None = None
     tensorfs_output: Callable[[str, Derivation], Output] | None = None
-    tensorfs_adopt: Callable[[str, tuple[str, int]], ModelArtifact] | None = None
+    tensorfs_adopt: Callable[[Output], ModelArtifact] | None = None
     max_output_bytes: int = MAX_OUTPUT_BYTES
     progress: Callable[[ProgressFrame | Observation], None] | None = None
     """The runtime's lossy LIVE sink (cr-007/cr-011): progress frames and retained
@@ -247,7 +247,7 @@ def lora_mode(payload_type: object, wire: Mapping[str, object]) -> tuple[Mapping
 def _bind_tensorfs(
     ctx: Context, record: Attempt, inv: Invocation, surface: Surface, handles: ExitStack
 ) -> None:
-    """Bind the attempt's weights sources and outputs; TensorD serves their channels."""
+    """Bind the attempt's weights sources and outputs, read and written in the store."""
     if inv.tensorfs_source is None and inv.tensorfs_output is None:
         return
     source_reader, output_opener = inv.tensorfs_source, inv.tensorfs_output
@@ -259,7 +259,7 @@ def _bind_tensorfs(
         record.check_open("Context weights capability")
         ctx.raise_if_cancelled()
 
-    def source(weights: Weights[Any]) -> Source:
+    def source(weights: Weights[Any]) -> Checkpoint:
         current()
         if source_reader is None or not any(
             weights is candidate for candidate in inv.sources.values()
@@ -285,9 +285,9 @@ def _bind_tensorfs(
 
     def adopt(opened: Output) -> ModelArtifact:
         current()
-        if receipt_adopter is None:
+        if receipt_adopter is None or not any(opened is mine for mine in outputs.values()):
             raise CapabilityError("adoption is unavailable", code="weights_receipt_mismatch")
-        return receipt_adopter(opened.transaction, opened.commit())
+        return receipt_adopter(opened)
 
     ctx._tensorfs_source, ctx._tensorfs_output, ctx._tensorfs_adopt = source, output, adopt
     for weights in inv.sources.values():
@@ -920,7 +920,7 @@ def _inject(
                     getattr(model, "_cozy_selection_ref", "")
                     or getattr(model, "checkpoint_ref", "")
                 )
-                != artifact.manifest.digest
+                != artifact.checkpoint
             ):
                 raise InvalidRequest(
                     "bound model differs from the exact call artifact",

@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     from cozy_runtime.author._artifacts import ModelArtifact
     from cozy_runtime.author._loader import Scheduler
     from cozy_runtime.author._weights import Weights
-    from cozy_runtime.tensord_channels import Derivation, Output, Source
+    from cozy_runtime.weights_store import Checkpoint, Derivation, Output
 
 DeviceType = Literal["cuda", "cpu", "mps"]
 
@@ -128,13 +128,14 @@ class Context:
     device: Device = field(default_factory=Device)
     _cancel: Callable[[], bool] = field(default=lambda: False, repr=False)
     _adapters: tuple[AdapterRef, ...] = field(default=(), repr=False)
-    _tensorfs_source: Callable[[Weights[Any]], Source] | None = field(default=None, repr=False)
+    _tensorfs_source: Callable[[Weights[Any]], Checkpoint] | None = field(default=None, repr=False)
     _tensorfs_output: Callable[[str, Derivation], Output] | None = field(default=None, repr=False)
     _tensorfs_adopt: Callable[[Output], ModelArtifact] | None = field(default=None, repr=False)
     _release_gpus: Callable[[], None] | None = field(default=None, repr=False)
 
-    def tensorfs_source(self, weights: Weights[Any]) -> Source:
-        """An admitted `Weights` argument's header, files and stored bytes."""
+    def tensorfs_source(self, weights: Weights[Any]) -> Checkpoint:
+        """An admitted `Weights` argument's checkpoint: its pipeline, components and stored
+        bytes."""
         self.raise_if_cancelled()
         if self._tensorfs_source is None:
             raise CapabilityError(
@@ -143,8 +144,8 @@ class Context:
         return self._tensorfs_source(weights)
 
     def output(self, slot: str, derivation: Derivation) -> Output:
-        """Open one interface-declared weights output: a new checkpoint written from
-        `derivation`'s base and sources, resumable, within the output's bound."""
+        """Open one interface-declared weights output: a new checkpoint written into the store
+        from `derivation`'s base and sources, resumable, within the output's bound."""
         self.raise_if_cancelled()
         if self._tensorfs_output is None:
             raise CapabilityError(
@@ -153,7 +154,8 @@ class Context:
         return self._tensorfs_output(slot, derivation)
 
     def adopt_model(self, output: Output) -> ModelArtifact:
-        """Commit `output` (a committed one replays) and keep it as this attempt's model."""
+        """Commit `output` (a committed one replays), upload it to the run's destination when
+        it names one, and keep it as this attempt's model."""
         self.raise_if_cancelled()
         if self._tensorfs_adopt is None:
             raise CapabilityError(

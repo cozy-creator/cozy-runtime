@@ -67,7 +67,7 @@ import msgspec
 from msgspec import UNSET, UnsetType
 
 from cozy_runtime import __version__ as RUNTIME_VERSION
-from cozy_runtime import graphs
+from cozy_runtime import graphs, weights_store
 from cozy_runtime.author import describe
 from cozy_runtime.author._activity import ThreadPoolExecutor, own_thread, settles
 from cozy_runtime.author._app import Registration
@@ -94,16 +94,13 @@ from cozy_runtime.author._errors import (
 from cozy_runtime.author._executor_requests import (
     Answer,
     BudgetCell,
+    CheckpointItem,
     ChildEvents,
     DeviceRoom,
     DeviceTier,
     DeviceTierAnswer,
     Exchange,
-    FetchChannel,
     Handoff,
-    ModelSource,
-    ObjectFiles,
-    ObjectFilesAnswer,
     Published,
     Request,
     Room,
@@ -111,7 +108,6 @@ from cozy_runtime.author._executor_requests import (
     SealedStage,
     SealedTier,
     SharedRegion,
-    SourceBytes,
     Staged,
     Tier,
 )
@@ -151,7 +147,6 @@ from cozy_runtime.internal import (
     effect_interfaces,
     execution_evidence,
     executor_commands,
-    fetch_plan,
     fp8_linear,
     int8_linear,
     kernel_cache,
@@ -209,8 +204,10 @@ from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.fill import (
     Checkpoint,
     FillRefusal,
+    chunk_refs,
     dtype_name,
     normalized,
+    store_refusals,
     tensor_schema_of,
 )
 from cozy_runtime.internal.lora_composition import bind as bind_adapters
@@ -251,10 +248,9 @@ from cozy_runtime.internal.weights import (
     ResidencyRefusal,
     WeightResidency,
     Weights,
+    in_definition_order,
     journaling,
 )
-from cozy_runtime.internal.weights_writer import ExecutionStorage
-from cozy_runtime.tensord_channels import Source
 
 if sys.platform == "win32":
     from ctypes import wintypes
@@ -405,6 +401,30 @@ def _held(
 
 
 @dataclasses.dataclass(slots=True)
+def _replay_code(command: Invoke, request: str) -> str:
+    """The code and request a weights output derives from: the attempt's operation and resolved
+    request (`request`, its digest), with its file inputs and precision; without an operation,
+    its run, so only its own attempts resume it."""
+    if not command.operation:
+        return command.request_id
+    files = sorted([name, row.digest, row.length] for name, row in command.inputs.items())
+    asked = {"request": request, "files": files, "bits": command.bits}
+    return f"{command.operation}\0{hashlib.sha256(canonical.write(asked)).hexdigest()}"
+
+
+def _show_checkpoint(
+    exchange: Exchange, slot: str, repo_id: str, revision: str, variant: str
+) -> None:
+    """A weights output's checkpoint as the run's checkpoint item (`CheckpointItem`)."""
+    item = CheckpointItem(output=slot, repo_id=repo_id, revision=revision, variant=variant)
+    answer = exchange(item, Answer)
+    if not answer.ok:
+        raise RuntimeFailure(
+            answer.detail or "the machine refused the checkpoint item",
+            code=answer.code or "runtime_failure",
+        )
+
+
 class _Slot:
     first: bool
     leaving: bool = False
@@ -697,7 +717,7 @@ class _OnDemand:
 
 
 #: The requests rank 0 relays to the machine for a follower (`_relay`).
-_RELAYED = frozenset({"sealed_tier", "sealed_stage", "object_files", "model_source", "device_room"})
+_RELAYED = frozenset({"sealed_tier", "sealed_stage", "device_room"})
 
 #: The runtime modules a construction imports, named ONCE so `start` can warm
 #: exactly the set `_prepare_first` re-imports (cr-104). Warming a name this tuple omits
@@ -766,11 +786,9 @@ class Executor:
         self.channel = channel
         self.root = root
         self.host: Executor = host or self
-        #: HOST ONLY: the seam every thread reads through, the attempts in flight and the lock
-        #: their fetch channel opens and closes under
+        #: HOST ONLY: the seam every thread reads through and the attempts in flight
         self.mux: Mux = host.mux if host is not None else Mux(channel)
         self.in_flight: _InFlight = host.in_flight if host is not None else _InFlight()
-        self._fetching = threading.Lock()
         #: this process's CUDA context and first library launches, measured at device init
         #: from this process's own driver row (-1: not attributable)
         self.device_context = -1
@@ -780,14 +798,8 @@ class Executor:
         #: plane (`self.weights`), whose priorities are the LRU across them.
         self.constructions: dict[str, Executor] = {}
         self.weights: Weights | None = None
-        #: HOST ONLY, rank 0: what this process asks TensorFS to fetch, when and in what order
-        self.fetch = (
-            fetch_plan.Fetches(self._fetch_channel, self._fetch_progress)
-            if host is None and rank == 0
-            else None
-        )
-        #: HOST ONLY: each `Weights[M]` slot's declared components, by `<fn>.models.<param>`
-        self.source_components: dict[str, tuple[str, ...]] = {}
+        #: HOST ONLY: the checkpoints its constructions read, open from the store by header ref
+        self.opened: dict[str, Checkpoint] = {}
         #: HOST ONLY: the constructed slots built on first use (`on_demand=`), by the same path
         self.on_demand: frozenset[str] = frozenset()
         self.active = ""
@@ -1639,12 +1651,6 @@ class Executor:
                 "code": "sequence_parallel_unsupported",
                 "detail": "a group runs constructed models",
             }
-        self.source_components = {
-            slot.path: slot.components
-            for entry in interface.entrypoints
-            for slot in entry.models
-            if slot.weights and isinstance(slot.components, tuple)
-        }
         # A group's GPUs construct in lockstep at its load: it builds every model there.
         self.on_demand = frozenset(
             slot.path
@@ -1652,13 +1658,6 @@ class Executor:
             for slot in entry.models
             if slot.on_demand and degree == 1
         )
-        eager = [row for row in command.constructions if row.path not in self.on_demand]
-        if self.fetch is not None and eager and not command.import_only:
-            # The Start pass, before torch and the package: the imports, kernel compiles
-            # and warmup run while the weights download. Never in an import-only parent: a
-            # channel's reader thread would leave it unforkable.
-            self.fetch.begin()
-            self.fetch.schedule(fetch_plan.at_start(eager, lambda m: self._checkpoint(m).ck))
         started = time.perf_counter()
         stages: list[tuple[str, float]] = []
         _mark = [started]
@@ -2031,8 +2030,6 @@ class Executor:
             loaded._bind_parameters(command)
             return self._load_reply(key, loaded, reused=True)
         child = self._construction_child(key)
-        if self.fetch is not None:
-            self.fetch.begin()  # the Load pass replaces the Start pass
         try:
             reply = child._prepare_first(command)
         except Exception:
@@ -2466,12 +2463,9 @@ class Executor:
         )
         vmap = reference.snapshot_map()
         host = self.host
-        # One Checkpoint per manifest, its header and files read through TensorD
-        # (`ModelSource`; a follower asks through rank 0): SDXL's four components share one.
-        opened: dict[str, Checkpoint] = {}
-        for manifest in {vmap.get(name, reference.snapshot) for name in names}:
-            opened[manifest] = host._checkpoint(manifest)
-        checkpoints = {name: opened[vmap.get(name, reference.snapshot)] for name in names}
+        # One Checkpoint per header ref, open from the store: SDXL's four components share one.
+        refs = {name: vmap.get(name, reference.snapshot) for name in names}
+        checkpoints = {name: host._checkpoint(ref, command.hub) for name, ref in refs.items()}
         # `names` is what the DERIVE constructed (model-code-fit D9), not what the header
         # carries: a constructed component the checkpoint lacks is the fit's own
         # `component_missing`, judged at construction with the §3 text, so the plan is
@@ -2511,14 +2505,7 @@ class Executor:
         model_cls = next(
             cls for cls in self._model_classes() if cls.__name__ == binding.model_class
         )
-        config_checkpoint = next(
-            (
-                checkpoint
-                for checkpoint in checkpoints.values()
-                if checkpoint.manifest_id == reference.snapshot
-            ),
-            None,
-        ) or host._checkpoint(reference.snapshot)
+        config_checkpoint = host._checkpoint(reference.snapshot, command.hub)
         config_bytes = model_config.construction_config(config_checkpoint.configs())
         config_document = canonical.parse_canonical(config_bytes)
         if not isinstance(config_document, dict):
@@ -2602,7 +2589,6 @@ class Executor:
             except plane.Unavailable as exc:
                 return {"ok": False, "code": "weight_plane_unavailable", "detail": str(exc)}
         weights = host.weights
-        weights.fetch = host.fetch
         # TensorD retains exported GPU allocation handles. Runtime's plane attaches those
         # allocations here and can later export its own filled regions for reuse.
         sharing = command.device_weights and self.world == 1
@@ -2627,14 +2613,13 @@ class Executor:
             qualified=qualified_pair,
             device_facts=device_facts,
             custody=binding.custody,
-            tiers=HostTiers(seal=lambda _plan: None, files=self.host._object_files)
+            tiers=HostTiers(seal=lambda _plan: None, files=self.host._chunk_files)
             if weights.unified  # the page cache is its host tier: the machine keeps no layout
             else self._tiers(
                 command.sealed_tiers, staged=command.staged_tiers and not weights.host_only
             ),
         )
-        scopes = fetch_plan.in_definition_order(model_cls, component_use(model_cls))
-        backend.order = tuple(fetch_plan.stage_components(scopes, scopes))
+        scopes = in_definition_order(model_cls, component_use(model_cls))
         stage("backend_ctor")
         # THE GROUP AGREES ITS PLAN before any rank registers a byte (cr-068). Budgets are
         # the Worker's, per device, so the ceiling the ranks share is the one it assigned.
@@ -2671,16 +2656,17 @@ class Executor:
             reference.snapshot,
             tensor_schema_of(rows),
             Config(config_document, "model.config"),
-            assets=config_checkpoint.model_assets(),
+            assets=config_checkpoint.assets(),
             # CUSTODY is a BINDING fact: canonical refuses a serve-time extra key, local
             # tiers it (§1.1).
             custody=binding.custody,
             unnormalized=normalized(config_checkpoint),
         )
         adapter_graphs = [
-            (checkpoint.manifest_id, checkpoint.file(model_config.ADAPTERS))
-            for checkpoint in checkpoints.values()
-            if model_config.ADAPTERS in checkpoint.files
+            (checkpoint.id, checkpoint.asset(component, model_config.ADAPTERS))
+            for checkpoint in {c.id: c for c in checkpoints.values()}.values()
+            for component, held in checkpoint.ck.components.items()
+            if model_config.ADAPTERS in held.assets
         ]
         if adapter_graphs:
             manifest, data = adapter_graphs[0]
@@ -2783,7 +2769,7 @@ class Executor:
                 for name in present
             },
             assets={
-                "assets": {path: config_checkpoint.file(path) for path in config_checkpoint.files},
+                "assets": config_checkpoint.asset_digests(),
                 "configs": config_checkpoint.configs(),
             },
             plan_rows=({**row.identity(), "component": row.component} for row in plan.tensors),
@@ -3166,10 +3152,6 @@ class Executor:
         residency = member.residency
         if residency is not None:
             self.residency.rows[parameter] = residency
-            fetch = self.host.fetch
-            if fetch is not None:
-                key = str(id(member.backend))  # the key its Load pass scheduled under
-                residency.wanted = functools.partial(fetch.want, key, residency.fetch_plan)
         return member.models[parameter]
 
     def _discover_provisioned(self, release: Release) -> None:
@@ -3247,28 +3229,7 @@ class Executor:
         target = self._target(command, attempt=False)
         if isinstance(target, dict):
             return target
-        self._plan_fetch(target)
         return target.prepare_request(command)
-
-    def _plan_fetch(self, target: Executor) -> None:
-        """The calls' fetch channel, opened by the first that finds none: it re-asserts what
-        the construction reads, in the order this process learned (a no-op for objects already
-        here), and every fetch stays owned by a live call. The last attempt out closes it."""
-        if self.fetch is None:
-            return
-        with self._fetching:
-            if self.fetch.open:
-                return
-            groups = [
-                group
-                for member in target.model_executors or [target]
-                # an on-demand model's waits for its first stage (`Fetches.want`)
-                if member.residency is not None and member.residency.wanted is None
-                for group in member.residency.fetch_plan()
-            ]
-            self.fetch.begin()
-            if groups:
-                self.fetch.schedule(groups)
 
     def serve_invoke(self, command: Invoke) -> dict[str, Any]:
         target = self._target(command, attempt=True)
@@ -3281,25 +3242,17 @@ class Executor:
             or bool(requested and target._attention_reaches(requested))
         )
         with self.in_flight.attempt(alone) as slot:
-            try:
-                # Admitted only now: an attempt before it may have poisoned the generation. Its
-                # record is taken once nothing can refuse it, so a refused call may come again.
-                refused = target._unadmitted(command) or self._grant(
-                    target, command, first=slot.first
-                )
-                if not alone:
-                    self.in_flight.ready()
-                if refused is not None:
-                    return refused
-                prepared = target.prepared.pop(command.request_id, None)
-                if prepared is None:  # trimmed by a prepare meanwhile
-                    return target._unadmitted(command) or {}
-                self._plan_fetch(target)
-                reply = target.invoke(command, prepared, slot)
-            finally:
-                if self.fetch is not None and (slot.last or self.in_flight.count == 1):
-                    with self._fetching:
-                        self.fetch.end()
+            # Admitted only now: an attempt before it may have poisoned the generation. Its
+            # record is taken once nothing can refuse it, so a refused call may come again.
+            refused = target._unadmitted(command) or self._grant(target, command, first=slot.first)
+            if not alone:
+                self.in_flight.ready()
+            if refused is not None:
+                return refused
+            prepared = target.prepared.pop(command.request_id, None)
+            if prepared is None:  # trimmed by a prepare meanwhile
+                return target._unadmitted(command) or {}
+            reply = target.invoke(command, prepared, slot)
         self.attempts += 1
         self.poisoned = self.poisoned or target.poisoned
         reply["poisoned"] = self.poisoned
@@ -3533,12 +3486,20 @@ class Executor:
         capture = None
         capture_result: dict[str, Any] | None = None
         record: AuthorAttempt | None = None
-        # Weights grants are the attempt's own: its sources and outputs end with it.
+        # Weights sources and outputs are the attempt's own: they end with it.
         sources: dict[str, RawWeights[Any]] = {
-            name: RawWeights(manifest) for name, manifest in command.sources.items()
+            name: RawWeights(ref) for name, ref in command.sources.items()
         }
         exchange = self._exchange(command.request_id)
-        storage = ExecutionStorage(spool, exchange, command.weights)
+        outputs = weights_store.Outputs(
+            request_id=command.request_id,
+            actor=command.actor,
+            code=_replay_code(command, prepared.overlay.digest),
+            bounds=command.weights,
+            destination=command.destination,
+            hub=command.hub,
+            show=functools.partial(_show_checkpoint, exchange),
+        )
         stage_memo.ENGINE.open(exchange, spool)
         warnings: list[WarningRow] = []
         try:
@@ -3586,9 +3547,13 @@ class Executor:
                             max_output_bytes=command.max_output_bytes,
                             sources=sources,
                             weights_values=functools.partial(read_values_into, self.torch),
-                            tensorfs_source=self._sources(storage, command) if sources else None,
-                            tensorfs_output=storage.open_output if command.weights else None,
-                            tensorfs_adopt=storage.adopt_model if command.weights else None,
+                            tensorfs_source=(
+                                functools.partial(weights_store.open_checkpoint, hub=command.hub)
+                                if sources
+                                else None
+                            ),
+                            tensorfs_output=outputs.open if command.weights else None,
+                            tensorfs_adopt=outputs.adopt if command.weights else None,
                             publish=lambda request: exchange(request, Published),
                             calls=self.host._call_broker(
                                 command.request_id, self.host.call_interfaces
@@ -4320,70 +4285,13 @@ class Executor:
         return HostTiers(
             seal=(lambda p: host._seal_tier(p, ())) if staged else host._seal_tier,
             stage=host._stage_tier if staged else None,
-            files=host._object_files if staged else None,
+            files=host._chunk_files if staged else None,
         )
-
-    def _fetch_channel(self) -> int:
-        """A fresh fetch channel for the running call (`FetchChannel`); -1: none given."""
-        answer = self._durable(FetchChannel(), Handoff)
-        return answer.descriptor if answer.ok and answer.descriptor >= 0 else -1
-
-    def _fetch_progress(self, line: str, fraction: float) -> None:
-        """A wait on weights not here yet, told to the machine as the running request's stage."""
-        with contextlib.suppress(SeamError):
-            self.channel.send(
-                {"event": "progress", "request_id": _CALL.get(), "kind": "progress", "stage": line}
-                | {"stage_fraction": fraction, "advance": 0}
-            )
-
-    def _sources(self, storage: ExecutionStorage, command: Invoke) -> Callable[[str], Source]:
-        """The attempt's `Weights[M]` sources, each wanting its declared components ahead of
-        its reads on the attempt's fetch channel."""
-        host = self.host
-        declared: dict[str, tuple[str, ...]] = {}
-        for param, manifest in command.sources.items():
-            path = f"{command.entrypoint}.models.{param}"
-            declared[manifest] = (
-                *declared.get(manifest, ()),
-                *host.source_components.get(path, ()),
-            )
-
-        def opened(manifest: str) -> Source:
-            source = storage.source(manifest)
-            if host.fetch is None or not host.fetch.available():
-                return source
-            return fetch_plan.source(host.fetch, source, declared.get(manifest, ()))
-
-        return opened
-
-    def _model_source(self, manifest: str, name: str) -> bytes:
-        """One model file from the machine (`ModelSource`): the header (`name` empty), the
-        manifest (`fill.LISTING`) or one of its files, checked against the length stated."""
-        answer = self._durable(ModelSource(manifest=manifest, name=name), SourceBytes)
-        if not (answer.ok and answer.held and answer.descriptor >= 0):
-            raise RuntimeError(
-                f"the machine served no {name or 'header'} of {manifest[:23]}: "
-                f"{answer.code} {answer.detail}"
-            )
-        try:
-            body = bytearray()
-            os.lseek(answer.descriptor, 0, os.SEEK_SET)
-            while len(body) < answer.length:
-                chunk = os.read(answer.descriptor, answer.length - len(body))
-                if not chunk:
-                    break
-                body += chunk
-        finally:
-            os.close(answer.descriptor)
-        # A sealed memfd from the machine, which verified the bytes: the length is the check.
-        if len(body) != answer.length:
-            raise RuntimeError(f"{name or 'header'} of {manifest[:23]} is short")
-        return bytes(body)
 
     def _seal_tier(self, plan: SealedPlan, stage: tuple[int, ...] | None = None) -> int | None:
         """The machine's sealed layout for `plan`, filled once and kept across executors; None
         when it holds none (no room), and this weight set reads the store itself. `stage`: only
-        those regions staged (`host_tiers.staged/1`), the rest holes read from object files."""
+        those regions staged (`host_tiers.staged/1`), the rest holes read from chunk files."""
         body = canonical.write(msgspec.to_builtins(plan))
         memfd = plane.sealed_memfd("cozy-sealed-plan", body)
         try:
@@ -4418,12 +4326,12 @@ class Executor:
             os.close(memfd)
         return list(answer.staged) if answer.ok else []
 
-    def _object_files(
+    def _chunk_files(
         self, plan: SealedPlan, objects: list[tuple[str, int]]
     ) -> list[tuple[str, int, int]]:
-        """The verified object files behind `plan` (`ObjectFiles`), for its layout's holes:
-        `(sha256, length, fd)` per object of `objects` (the plan's own, in SHA-256 order), the
-        fds the caller's to close. None unless the machine's answer names that same list."""
+        """The chunk files behind `plan`, for its layout's holes, from the store: `(sha256,
+        length, fd)` per object of `objects` (the plan's own, in SHA-256 order), the fds the
+        caller's to close."""
         # One descriptor per object (SDXL's UNet: about 1,700): lift the soft limit to the hard,
         # which macOS caps at OPEN_MAX.
         # Windows has no such limit.
@@ -4434,30 +4342,19 @@ class Executor:
                     resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
                 except (ValueError, OSError):
                     resource.setrlimit(resource.RLIMIT_NOFILE, (min(hard, _OPEN_MAX), hard))
-        body = canonical.write(msgspec.to_builtins(plan))
-        memfd = plane.sealed_memfd("cozy-sealed-plan", body)
-        try:
-            request = ObjectFiles(
-                sha256=hashlib.sha256(body).hexdigest(), length=len(body), memfd=memfd
-            )
-            answer = self._durable(request, ObjectFilesAnswer)
-        finally:
-            os.close(memfd)
-        listed = "".join(f"{sha}:{length}\n" for sha, length in objects).encode()
-        if (
-            not answer.ok
-            or len(answer.fds) != len(objects)
-            or answer.objects_sha256 != hashlib.sha256(listed).hexdigest()
-        ):
-            for fd in answer.fds:
-                os.close(fd)
-            return []
-        return [(sha, length, fd) for (sha, length), fd in zip(objects, answer.fds, strict=True)]
+        ck = self.opened[plan.manifest].ck
+        index = {sha: i for i, (sha, _) in enumerate(chunk_refs(ck))}
+        return [(sha, length, ck.open_chunk(index[sha])) for sha, length in objects]
 
-    def _checkpoint(self, manifest: str) -> Checkpoint:
-        """A selected checkpoint through TensorD (`ModelSource`): its header and every file its
-        manifest lists (configs, tokenizers, assets)."""
-        return Checkpoint.granted(manifest, lambda name: self._model_source(manifest, name))
+    def _checkpoint(self, ref: str, hub: weights_store.Hub | None) -> Checkpoint:
+        """The checkpoint `ref` names, open from the store for as long as this process lives:
+        its bytes are kept from eviction while its constructions serve them."""
+        opened = self.opened.get(ref)
+        if opened is None:
+            with store_refusals(f"opening {ref[:23]}"):
+                opened = Checkpoint(weights_store.open_checkpoint(ref, hub))
+            self.opened[ref] = opened
+        return opened
 
     def _device_room(self, free_bytes: int) -> None:
         """Ask the worker for `free_bytes` free on this GPU from its other tenants; it answers
@@ -4523,9 +4420,7 @@ class Executor:
         """
         body = encode_request(request)
         sending = (
-            request.memfd
-            if isinstance(request, BudgetCell | SealedTier | SealedStage | ObjectFiles)
-            else -1
+            request.memfd if isinstance(request, BudgetCell | SealedTier | SealedStage) else -1
         )
         body.pop("memfd", None)
         shared = request.fds if isinstance(request, DeviceTier) else ()
@@ -4560,19 +4455,13 @@ class Executor:
             count = frame.pop("descriptors", 0)
             lease = frame.get("lease") is True
             if count or lease:
-                files = issubclass(into, ObjectFilesAnswer)
-                if (
-                    not (files or issubclass(into, DeviceTierAnswer))
-                    or (files and lease)
-                    or type(count) is not int
-                    or count < 0
-                ):
+                if not issubclass(into, DeviceTierAnswer) or type(count) is not int or count < 0:
                     channel.close()
                     raise SeamError("seam_descriptor", "unexpected descriptors in a reply")
                 received: list[int] = []
                 try:
                     for _ in range(count):
-                        received.append(channel.recv_file() if files else channel.recv_shared())
+                        received.append(channel.recv_shared())
                     if lease:
                         frame["lease_fd"] = channel.recv_lease()
                 except BaseException:
@@ -5215,10 +5104,12 @@ def main(argv: list[str] | None = None) -> int:
     # cr-042: the executor's ONE network fence, installed BEFORE the seam dials so the
     # AF_UNIX exemption is exercised on every boot rather than asserted. It refuses
     # Python-level egress from package code; it is not a kernel bound and
-    # `sandbox.refuse_network` says exactly which adversary that leaves.
+    # `sandbox.refuse_network` says exactly which adversary that leaves. TensorFS's own
+    # transport (Rust, under the request's Hub capability) is not Python and passes it.
     sandbox.refuse_network(
-        "the executor is handed verified files in its attempt spool and never an address "
-        "(cr-012). Package code that dials is a bug, and this is where the bug stops",
+        "package code reaches the network only through the Runtime: its inputs arrive in the "
+        "attempt spool and its weights through TensorFS (cr-012). Package code that dials is "
+        "a bug, and this is where the bug stops",
         allow_unix_seam=True,
     )
     channel = (

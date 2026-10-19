@@ -13,7 +13,7 @@ import os
 import socket
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Annotated, Literal, Protocol, TypedDict, get_args
+from typing import Annotated, Protocol, TypedDict, get_args
 
 import msgspec
 from msgspec import UNSET, UnsetType
@@ -100,6 +100,17 @@ class Publish(_Request, frozen=True, kw_only=True, tag="publish"):
     parts: tuple[PublishPart, ...] = ()
 
 
+class CheckpointItem(_Request, frozen=True, kw_only=True, tag="checkpoint_item"):
+    """A weights output's checkpoint, shown as the run's `{type: "checkpoint"}` output item:
+    the repo and revision (`sha256:<tree>`) that hold it, and its variant. A later item of the
+    same output replaces it (the upload's after the local one)."""
+
+    output: str
+    repo_id: str
+    revision: str
+    variant: str = ""
+
+
 class StageMemoLookup(_Request, frozen=True, kw_only=True, tag="stage_memo_lookup"):
     """A memoized method's key, before its scope opens: the Worker answers a `MemoEntry`."""
 
@@ -128,25 +139,6 @@ class TreeMember(_Request, frozen=True, kw_only=True, tag="tree_member"):
     asset_kind: str
     max_bytes: int
     media_types: tuple[str, ...] = ()
-
-
-class _Writer(msgspec.Struct, frozen=True, kw_only=True, tag_field="operation"):
-    kind: Literal["weights_writer"] = "weights_writer"
-
-
-class WriterSource(_Writer, frozen=True, kw_only=True, tag="source"):
-    manifest: str
-
-
-class WriterOutput(_Writer, frozen=True, kw_only=True, tag="output"):
-    output_slot: str
-    length: int
-
-
-class WriterAdopt(_Writer, frozen=True, kw_only=True, tag="adopt"):
-    output_slot: str
-    transaction: str
-    length: int
 
 
 class SharedRegion(msgspec.Struct, frozen=True, kw_only=True):
@@ -207,7 +199,7 @@ class SealedTier(_Request, frozen=True, kw_only=True, tag="sealed_tier"):
     #: the plan's memfd; never on the wire
     memfd: int = -1
     #: The regions to stage (`host_tiers.staged/1`): the rest are holes this executor reads
-    #: from the object files (`ObjectFiles`). Unset: every region.
+    #: from the store's chunk files. Unset: every region.
     stage_regions: tuple[int, ...] | UnsetType = UNSET
 
 
@@ -221,32 +213,6 @@ class SealedStage(_Request, frozen=True, kw_only=True, tag="sealed_stage"):
     stage_regions: tuple[int, ...] = ()
     #: the plan's memfd; never on the wire
     memfd: int = -1
-
-
-class ObjectFiles(_Request, frozen=True, kw_only=True, tag="object_files"):
-    """The verified object files behind a plan (in a sealed memfd after the request), for the
-    holes of its layout: one read-only fd per object follows `ObjectFilesAnswer`, in SHA-256
-    order of the plan's objects."""
-
-    sha256: str
-    length: Annotated[int, msgspec.Meta(ge=0)]
-    #: the plan's memfd; never on the wire
-    memfd: int = -1
-
-
-class ModelSource(_Request, frozen=True, kw_only=True, tag="model_source"):
-    """One model file from TensorD (`Load.model_sources`): the CozyTensors header (`name`
-    empty) or one header-declared asset. `SourceBytes` answers, a sealed memfd of exactly
-    those bytes following: the executor reads no store."""
-
-    manifest: str
-    name: str = ""
-
-
-class FetchChannel(_Request, frozen=True, kw_only=True, tag="fetch_channel"):
-    """A fresh fetch channel for the running call (`tensord_channels.Fetch`): a `Handoff` answers, one
-    connected socket following. It names only the call's selected checkpoints, never a hub
-    or credential, and ends with the call."""
 
 
 class BudgetCell(_Request, frozen=True, kw_only=True, tag="budget_cell"):
@@ -265,9 +231,6 @@ type _Tagged = (
     | DeviceTier
     | SealedTier
     | SealedStage
-    | ObjectFiles
-    | ModelSource
-    | FetchChannel
     | BudgetCell
     | ChildEvents
     | ChildCall
@@ -278,6 +241,7 @@ type _Tagged = (
     | ModelPrefetch
     | TreeMember
     | Publish
+    | CheckpointItem
     | StageMemoLookup
     | StageMemoStore
 )
@@ -285,9 +249,7 @@ type _Tagged = (
 type CallRequest = (
     ChildCall | ChildPoll | ChildCancel | ChildForget | ChildEvents | GpuRelease | ModelPrefetch
 )
-#: One request to the worker's native writer broker, tagged by `operation`.
-type WriterRequest = WriterSource | WriterOutput | WriterAdopt
-type Request = _Tagged | WriterRequest
+type Request = _Tagged
 
 _KINDS = frozenset(str(kind.__struct_config__.tag) for kind in get_args(_Tagged.__value__))
 
@@ -318,28 +280,10 @@ class Tier(Answer, frozen=True, kw_only=True):
     descriptor: int = -1
 
 
-class SourceBytes(Tier, frozen=True, kw_only=True):
-    """The machine's answer to `ModelSource`: the sealed memfd follows (`held`), holding
-    `length` bytes whose SHA-256 is `sha256`."""
-
-    sha256: str = ""
-    length: Annotated[int, msgspec.Meta(ge=0)] = 0
-
-
 class Staged(Answer, frozen=True, kw_only=True):
     """The machine's answer to `SealedStage`: the regions staged or staging."""
 
     staged: tuple[int, ...] = ()
-
-
-class ObjectFilesAnswer(Answer, frozen=True, kw_only=True):
-    """The machine's answer to `ObjectFiles`: the read-only fds follow, one per object of the
-    plan in SHA-256 order (SDXL's UNet: about 1,700), and the answer names the list by its
-    digest: SHA-256 of `<sha256>:<length>\n` lines."""
-
-    objects_sha256: str = ""
-    #: the fds that followed the answer; never on the wire
-    fds: tuple[int, ...] = ()
 
 
 class DeviceTierAnswer(Answer, frozen=True, kw_only=True):
@@ -445,20 +389,6 @@ class Member(Answer, frozen=True, kw_only=True):
     file_state: FileState | None = None
 
 
-class Opened(Handoff, frozen=True, kw_only=True):
-    """A native source or output channel."""
-
-    length: int = 0
-    transaction: str = ""
-
-
-class Adopted(Answer, frozen=True, kw_only=True):
-    request_id: str = ""
-    manifest: str = ""
-    manifest_length: int = 0
-    receipt_digest: str = ""
-
-
 class Exchange(Protocol):
     """One durable request; blocks until the worker's answer decodes as `into`."""
 
@@ -490,9 +420,6 @@ def decode(frame: Mapping[str, object]) -> Request:
     """The request a frame states; a `CapabilityError` names why it cannot be answered."""
     kind = frame.get("kind")
     try:
-        if kind == "weights_writer":
-            writer: WriterRequest = msgspec.convert(frame, WriterRequest, strict=True)
-            return writer
         if kind not in _KINDS:
             raise CapabilityError(
                 f"{kind!r} is not a durable exchange this worker answers",

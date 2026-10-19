@@ -7,7 +7,7 @@ from types import ModuleType
 
 from cozy_runtime.author._errors import CapabilityError
 from cozy_runtime.internal.encoding.formats import RowwiseDequant, params_of
-from cozy_runtime.tensord_channels import Source
+from cozy_runtime.weights_store import Checkpoint, read_into
 
 _ELEMENTS = 1 << 22
 _FLOATS = {"F32": "float32", "F16": "float16", "BF16": "bfloat16"}
@@ -21,19 +21,25 @@ _ROWWISE = {
 
 
 def _part(
-    source: Source, component: str, key: str, role: str, offset: int, length: int
+    source: Checkpoint, component: str, key: str, role: str, offset: int, length: int
 ) -> bytearray:
     data = bytearray(length)
-    source.read_into(component, key, role, offset, memoryview(data))
+    read_into(source, component, key, role, offset, memoryview(data))
     return data
 
 
 def read_values_into(
-    torch: ModuleType, source: Source, component: str, key: str, offset: int, into: memoryview
+    torch: ModuleType,
+    source: Checkpoint,
+    component: str,
+    key: str,
+    offset: int,
+    into: memoryview,
 ) -> None:
     """Elements `offset..` of a plain float or per-row (`fp8.rowwise`, `int8.rowwise`) tensor,
     as f32."""
-    tensor = source.checkpoint.tensors.get(component, {}).get(key)
+    held = source.components.get(component)
+    tensor = None if held is None else held.tensors.get(key)
     count = into.nbytes // 4
     if tensor is None:
         raise CapabilityError("model tensor is absent", code="weights_reader_tensor")

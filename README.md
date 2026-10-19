@@ -83,23 +83,23 @@ the entrypoint, a frozen `RuntimeConfig` passed explicitly thereafter. Second re
 
     TensorD ──control + descriptors──▶ Runtime executor (Python/PyTorch)
 
-TensorD uses TensorFS to obtain verified stored weights and prepare/retain shared CPU
-buffers. Runtime constructs the model, plans its weight layout and uses TensorFS's local
+TensorD may prefetch public weights into the machine's TensorFS store and prepares/retains
+shared CPU buffers. Runtime opens the checkpoints a request names from that store, constructs the model, plans its weight layout and uses TensorFS's local
 plane/device APIs for GPU allocation, copies, mapping and unmapping. TensorD may retain
 exported GPU allocation handles between executors; Runtime attaches those allocations and
 binds tensor views in its own process. GPU tensors, prepared CPU buffers, and serialized
 weight objects are different representations with different lifetimes.
 
-TensorFS has no separate daemon in this arrangement. Runtime also has explicit standalone
-Store helpers for tools/tests; managed executors consume TensorD's scoped sources and buffers.
+TensorFS has no separate daemon in this arrangement: the Runtime reads and writes the machine's
+store itself (`weights_store.py`).
 
 | module | role |
 |---|---|
 | `internal/seam.py` | bounded control framing and native descriptor transfer |
 | `internal/trampoline.py` | exec-first stage and process settings |
 | `internal/executor.py` | disposable device process and package invocation |
-| `internal/weights_writer.py` | scoped native source/output client and broker |
-| `internal/fill.py` | project source headers into model rows and read plans; explicit standalone Store helpers |
+| `weights_store.py` | open checkpoints from the store; derived outputs, their replay keys and uploads |
+| `internal/fill.py` | project a checkpoint's components into model rows, configs and assets |
 | `internal/weights.py`, `internal/plane.py` | executor weight layout, residency policy and TensorFS GPU/CPU buffer operations |
 
 `checks/architecture.py` keeps versioned identities in two disjoint registries.

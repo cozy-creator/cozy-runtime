@@ -1,4 +1,4 @@
-"""`int8-convrot`: producer, recipe selection over TensorD's channels, decode and leaf."""
+"""`int8-convrot`: producer, recipe selection into the store, decode and leaf."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from cozy_runtime.author.fakes import fake_attempt, fake_telemetry
 from cozy_runtime.derive.microscale import decode_int8_convrot256, encode_int8_convrot256
 from cozy_runtime.derive.operations import QuantizationPlan, quantize_into
 from cozy_runtime.internal.encoding import params_of
-from tensord_peer import context, lane, output
+from store_fixtures import adopted, checkpoint, context, home
 
 ENCODING = "int8.convrot"
 
@@ -40,9 +40,12 @@ def test_producer_round_trip_and_scale_floor() -> None:
         encode_int8_convrot256("w", weight(4, 320, 1))
 
 
-def test_include_recipe_encodes_exactly_its_weights(tmp_path: Path) -> None:
-    store, source, peer = lane(
-        tmp_path,
+def test_include_recipe_encodes_exactly_its_weights(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home(tmp_path / "tensorfs", monkeypatch)
+    shown: list[tuple[str, str, str, str]] = []
+    source = checkpoint(
         {
             "transformer": {
                 "blocks.0.attn.to_q.weight": weight(8, 256, 1),
@@ -58,28 +61,28 @@ def test_include_recipe_encodes_exactly_its_weights(tmp_path: Path) -> None:
         output_precision="preserve",
     )
     quantize_into(
-        context(peer), fake_telemetry(fake_attempt("int8")), source=Weights(source),
+        context(shown=shown), fake_telemetry(fake_attempt("int8")), source=Weights(source),
         plan=plan, encoding=ENCODING, output="model",
     )  # fmt: skip
-    out = output(store, peer)
+    out = adopted(shown)
     encoded = {
         (component, key)
-        for component, tensors in out.tensors.items()
-        for key, info in tensors.items()
+        for component, held in out.components.items()
+        for key, info in held.tensors.items()
         if info.encoding is not None
     }
     assert encoded == {
         ("transformer", "blocks.0.attn.to_q.weight"),
         ("transformer", "blocks.0.mlp.out.weight"),
     }
-    to_q = out.tensors["transformer"]["blocks.0.attn.to_q.weight"]
+    to_q = out.components["transformer"].tensors["blocks.0.attn.to_q.weight"]
     assert to_q.encoding is not None and to_q.encoding.scheme == ENCODING
     assert (to_q.parts["weight"].dtype, to_q.parts["scale"].shape) == ("I8", (8,))
-    assert out.tensors["transformer"]["proj_out.weight"].dtype == "F32", "preserved"
+    assert out.components["transformer"].tensors["proj_out.weight"].dtype == "F32", "preserved"
     typo = QuantizationPlan(components=("transformer",), include=("transformer.nope.*",))
     with pytest.raises(UnsupportedInput, match="match no weight"):
         quantize_into(
-            context(peer), fake_telemetry(fake_attempt("typo")), source=Weights(source),
+            context("typo"), fake_telemetry(fake_attempt("typo")), source=Weights(source),
             plan=typo, encoding=ENCODING, output="model",
         )  # fmt: skip
 

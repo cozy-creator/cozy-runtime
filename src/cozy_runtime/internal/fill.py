@@ -1,21 +1,20 @@
-"""Checkpoints through the tensorfs API: header rows in construction order, files, the census fit.
+"""Checkpoints through the tensorfs API: header rows in construction order, configs and assets,
+the census fit.
 
-A managed executor is granted a checkpoint's header and files by TensorD and parses the header
-with `tensorfs.Checkpoint.parse`; a standalone caller reads a `tensorfs.Store` itself. Either
-way the Runtime reads headers only through the wheel. Rows carry each tensor's scheme, params
-and parts (`Encoded`); refusals are spoken in `FillRefusal`'s vocabulary.
+The Runtime opens each checkpoint from the machine's store by its header ref
+(`weights_store.open_checkpoint`) and reads it only through the wheel: rows from its components'
+tensors (each tensor's scheme, params and parts, `Encoded`), configs from `component.config`,
+assets through the store. Refusals are spoken in `FillRefusal`'s vocabulary.
 """
 
 from __future__ import annotations
 
 import contextlib
-import functools
 import json
 import sys
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 
-import msgspec
 import tensorfs
 
 from cozy_runtime.author._loader import TENSORFS_DTYPES, TensorSpec, canonical_dtype
@@ -23,18 +22,10 @@ from cozy_runtime.internal.encoding import PLAIN, TORCH_DTYPES, Encoded, RolePar
 from cozy_runtime.internal.encoding.formats import part_rule
 from cozy_runtime.internal.resolution import PlanRefusal, ResolvedModelPlan
 
-#: The header's path in a manifest.
-HEADER = "model.cozytensors"
-#: TensorD's `ModelSource` name for a checkpoint's manifest (its file list); `""` is its header.
-LISTING = "."
-#: A Diffusers pipeline's component list: when present, its components are the config sections.
-MODEL_INDEX = "model_index.json"
-
-
-class _Listing(msgspec.Struct):
-    """A `tensorfs.manifest/1` document, as far as its files' paths."""
-
-    files: dict[str, object]
+#: The component of a model without a pipeline, whose folder is the root (a Transformers model).
+ROOT_COMPONENT = "model"
+#: What a pipeline's config was on disk.
+PIPELINE_FILE = "model_index.json"
 
 
 #: Element bytes per Runtime dtype name.
@@ -181,53 +172,36 @@ def row(component: str, name: str, info: tensorfs.Info, bound: str = "") -> Plan
     return PlanRow(key, name, component, dtype, shape, nbytes, encoded)
 
 
+def chunk_refs(ck: tensorfs.Checkpoint) -> list[tuple[str, int]]:
+    """The header's chunks in order, `(sha256 hex, length)` (`Part.chunk` indexes them)."""
+    return [(chunk.sha256, chunk.length) for chunk in ck.chunks]
+
+
 class Checkpoint:
-    """One checkpoint's header rows (in its construction order) and files."""
+    """One opened checkpoint: its rows (in construction order), configs and assets."""
 
-    def __init__(
-        self,
-        manifest_id: str,
-        ck: tensorfs.Checkpoint,
-        files: Sequence[str],
-        read_file: Callable[[str], bytes],
-    ) -> None:
-        self.manifest_id = manifest_id
+    def __init__(self, ck: tensorfs.Checkpoint) -> None:
         self.ck = ck
-        self.files = tuple(files)
-        self._read = read_file
-
-    @classmethod
-    def granted(cls, manifest_id: str, source: Callable[[str], bytes]) -> Checkpoint:
-        """A checkpoint TensorD granted this executor (`ModelSource`): its manifest (`LISTING`)
-        names the files, each read through the grant once (the header as `""`)."""
-        files = msgspec.json.decode(source(LISTING), type=_Listing).files
-        read = functools.cache(lambda path: source("" if path == HEADER else path))
-        with store_refusals(f"parsing {manifest_id[:23]}"):
-            ck = tensorfs.Checkpoint.parse(read(HEADER))
-        return cls(manifest_id, ck, tuple(files), read)
-
-    @classmethod
-    def from_store(cls, store: tensorfs.Store, ref: str) -> Checkpoint:
-        """A checkpoint of a store this process opened itself (standalone use, tests)."""
-        with store_refusals(f"opening {ref}"):
-            ck = store.checkpoint(ref)
-        manifest = ck.manifest
-        assert manifest is not None
-        return cls(f"sha256:{manifest.sha256}", ck, ck.files, ck.file)
+        #: the weight set's identity: the header's ref, `sha256:<hex>`
+        self.id: str = ck.id
 
     def has(self, component: str) -> bool:
-        return component in self.ck.tensors
+        return component in self.ck.components
+
+    def tensors(self, component: str) -> Mapping[str, tensorfs.Info]:
+        held = self.ck.components.get(component)
+        return {} if held is None else held.tensors
 
     def rows(self, component: str) -> list[PlanRow]:
         """The component's rows in the header's (construction) order."""
-        tensors = self.ck.tensors.get(component)
-        if tensors is None:
+        if not self.has(component):
             raise _refuse(
                 "destination_absent",
                 f"this checkpoint has no component {component!r} (it has "
-                f"{', '.join(self.ck.tensors) or 'none'})",
+                f"{', '.join(self.ck.components) or 'none'})",
             )
         bind = self.binding(component)
+        tensors = self.tensors(component)
         return [row(component, name, info, bind(name)) for name, info in tensors.items()]
 
     def binding(self, component: str) -> Callable[[str], str]:
@@ -236,10 +210,9 @@ class Checkpoint:
         drops the `text_model.` its checkpoint stores); a name binds as stored otherwise."""
         mapping = sys.modules.get("transformers.conversion_mapping")
         loading = sys.modules.get("transformers.core_model_loading")
-        path = f"{component}/config.json"
-        if mapping is None or loading is None or path not in self.files:
+        if mapping is None or loading is None or not self.has(component):
             return str
-        config = json.loads(self.file(path))
+        config = self.ck.components[component].config
         transforms = None
         for name in (*config.get("architectures", ())[:1], config.get("model_type")):
             transforms = mapping.get_checkpoint_conversion_mapping(name) if name else None
@@ -254,20 +227,32 @@ class Checkpoint:
     def metadata(self) -> dict[str, object]:
         return dict(self.ck.metadata)
 
-    def file(self, path: str) -> bytes:
-        with store_refusals(f"reading {path} of {self.manifest_id[:23]}"):
-            return self._read(path)
+    def configs(self) -> dict[str, dict[str, object]]:
+        """Construction configs by component: each component's that has one."""
+        return {name: dict(c.config) for name, c in self.ck.components.items() if c.config}
 
-    def model_assets(self) -> dict[str, bytes]:
-        """Every file of the manifest but the header: configs, tokenizers, adapter graphs."""
-        return {path: self.file(path) for path in self.files if path != HEADER}
+    def asset(self, component: str, name: str) -> bytes:
+        with store_refusals(f"reading {component}/{name} of {self.id[:23]}"):
+            return self.ck.components[component].asset(name)
+
+    def asset_digests(self) -> dict[str, str]:
+        """Every component's assets by `<component>/<name>`: their content's sha256."""
+        return {
+            f"{component}/{name}": ref.sha256
+            for component, held in self.ck.components.items()
+            for name, ref in held.assets.items()
+        }
+
+    def assets(self) -> Assets:
+        """The checkpoint's run files as its Diffusers or Transformers folder holds them."""
+        return Assets(self)
 
     def table(self, component: str) -> dict[str, list[object]]:
         """A component's stored tensors as plain data: what a memo of its weights is keyed on
         (chunks by digest, so it moves with the bytes)."""
-        chunks = self.ck.chunks
+        chunks = chunk_refs(self.ck)
         out: dict[str, list[object]] = {}
-        for key, info in self.ck.tensors.get(component, {}).items():
+        for key, info in self.tensors(component).items():
             encoding = info.encoding
             out[key] = [
                 info.dtype,
@@ -288,27 +273,41 @@ class Checkpoint:
             ]
         return out
 
-    def sections(self) -> frozenset[str]:
-        """The folders whose config constructs: `model_index.json`'s components (scheduler and
-        tokenizers included) when the checkpoint has one, else the header's components and
-        `scheduler`. Any other folder's config (`vae_1_0/config.json`) is only a file."""
-        if MODEL_INDEX in self.files:
-            index = msgspec.json.decode(self.file(MODEL_INDEX), type=dict[str, object])
-            return frozenset(name for name in index if not name.startswith("_"))
-        return frozenset({*self.ck.tensors, "scheduler"})
 
-    def configs(self) -> dict[str, bytes]:
-        """Construction configs by section: `<section>/config.json` (or a scheduler's
-        `scheduler_config.json`), and a root `config.json` as `model`."""
-        sections = self.sections()
-        found: dict[str, bytes] = {}
-        for path in self.files:
-            folder, _, name = path.rpartition("/")
-            if name in ("config.json", "scheduler_config.json") and (
-                not folder or folder in sections
-            ):
-                found[folder or "model"] = self.file(path)
-        return found
+class Assets(Mapping[str, bytes]):
+    """A checkpoint's run files at the paths its Diffusers or Transformers folder gives them, as
+    `tensorfs.export` writes it: `model_index.json` from the pipeline, each component's config
+    (`config.json`, or its `config_file`) rendered as the HF writers write it, and its assets
+    byte-exact, read from the store on first use. A pipeline's component is the folder of its
+    name; without one, `model` is the root."""
+
+    def __init__(self, checkpoint: Checkpoint) -> None:
+        ck = checkpoint.ck
+        self._checkpoint = checkpoint
+        self._configs: dict[str, Mapping[str, object]] = {}
+        #: path -> (component, asset name)
+        self._assets: dict[str, tuple[str, str]] = {}
+        if ck.pipeline is not None:
+            self._configs[PIPELINE_FILE] = ck.pipeline.config
+        for name, held in ck.components.items():
+            folder = "" if ck.pipeline is None and name == ROOT_COMPONENT else f"{name}/"
+            if held.config or held.config_file:
+                self._configs[f"{folder}{held.config_file or 'config.json'}"] = held.config
+            for asset in held.assets:
+                self._assets[f"{folder}{asset}"] = (name, asset)
+
+    def __getitem__(self, path: str) -> bytes:
+        config = self._configs.get(path)
+        if config is not None:
+            return (json.dumps(config, indent=2, sort_keys=True) + "\n").encode()
+        component, name = self._assets[path]
+        return self._checkpoint.asset(component, name)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter([*self._configs, *self._assets])
+
+    def __len__(self) -> int:
+        return len(self._configs) + len(self._assets)
 
 
 @dataclass(frozen=True, slots=True)
@@ -355,11 +354,11 @@ def fit(
             return refused(
                 "component_missing",
                 f"the code builds component {component!r} and the checkpoint stores "
-                f"{', '.join(checkpoint.ck.tensors) or 'none'}",
+                f"{', '.join(checkpoint.ck.components) or 'none'}",
                 component,
             )
         bind = checkpoint.binding(component)
-        stored = {bind(name): info for name, info in checkpoint.ck.tensors[component].items()}
+        stored = {bind(name): info for name, info in checkpoint.tensors(component).items()}
         for key, requirement in wanted.items():
             info = stored.get(key)
             if info is None:
