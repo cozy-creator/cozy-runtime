@@ -10,6 +10,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import msgspec
 import numpy as np
 import pytest
 import tensorfs
@@ -98,7 +99,8 @@ def test_a_granted_output_is_written_into_the_store_shown_and_replayed(
                 tmp_path / spool,
                 sources={"source": source},
                 weights={"model": 4096} if granted else {},
-                **invoke,
+                actor=invoke.get("actor", ""),
+                operation=invoke.get("operation", ""),
             )
             assert reply["outcome"]["terminal"] == "succeeded", reply
             results.append(json.loads((tmp_path / spool / RESULT_DOCUMENT).read_bytes()))
@@ -143,7 +145,7 @@ def test_concurrent_requests_keep_their_output_grants(
                 weights={"model": bound}, actor=actor, operation="same-operation",
             )  # fmt: skip
             assert reply["outcome"]["terminal"] == "succeeded", reply
-            return json.loads((spool / RESULT_DOCUMENT).read_bytes())
+            return msgspec.json.decode((spool / RESULT_DOCUMENT).read_bytes(), type=dict[str, str])
 
         with ThreadPoolExecutor(max_workers=2) as pool:
             alice = pool.submit(run, "alice", 4096)
@@ -218,6 +220,33 @@ def test_an_upload_failure_keeps_the_committed_local_checkpoint(
     assert not kept.missing()
 
 
+def test_a_fresh_output_creates_its_component_and_replays_without_a_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = home(tmp_path / "tensorfs", monkeypatch)
+    derivation = weights_store.Derivation(None, order=(("model", "table"),))
+    shown: Shown = []
+    ctx = context(store, "fresh", shown=shown)
+    with ctx.output("model", derivation) as output:
+        output.put("model", "table", "U8", [4], b"data")
+        first = ctx.adopt_model(output)
+    ck = tensorfs.open(first.checkpoint, cache_dir=store, local_files_only=True)
+    assert ck.components["model"].cls == "" and ck.components["model"].config == {}
+    data = bytearray(4)
+    ck.components["model"].tensors.read_into("table", data, role="")
+    assert data == b"data"
+    with ctx.output("model", derivation) as replay:
+        assert replay.has("model", "table")
+        second = ctx.adopt_model(replay)
+        assert replay.written == 0
+    assert second == first
+    assert len(shown) == 2 and shown[0] == shown[1]
+    with ctx.output("model", weights_store.Derivation(ck)) as inherited:
+        with pytest.raises(CapabilityError) as refused:
+            inherited.put("missing", "table", "U8", [4], b"data")
+        assert refused.value.code == "weights_output_component"
+
+
 def test_a_closed_uncommitted_writer_resumes_its_saved_tensors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -236,8 +265,10 @@ def test_a_closed_uncommitted_writer_resumes_its_saved_tensors(
         artifact = ctx.adopt_model(resumed)
     ck = tensorfs.open(artifact.checkpoint, cache_dir=store, local_files_only=True)
     tensors = ck.components["unet"].tensors
-    assert tensors.read("first").tobytes() == b"one"
-    assert tensors.read("second").tobytes() == b"two"
+    first, second = tensors.read("first"), tensors.read("second")
+    assert isinstance(first, tensorfs.Array) and isinstance(second, tensorfs.Array)
+    assert first.tobytes() == b"one"
+    assert second.tobytes() == b"two"
 
 
 def test_a_raw_read_fills_only_the_requested_tensor_part(

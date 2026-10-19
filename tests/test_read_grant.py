@@ -19,9 +19,11 @@ from cozy_runtime.internal.fill import Checkpoint
 from cozy_runtime.internal.seam import Channel, sealed
 from tensord_peer import answer_read_grants
 
+type Stored = tuple[Checkpoint, str, list[tuple[str, int]]]
+
 
 @pytest.fixture
-def checkpoint(tmp_path: Path) -> tuple[Checkpoint, str, list[tuple[str, int]]]:
+def checkpoint(tmp_path: Path) -> Stored:
     writer = tensorfs.Writer(cache_dir=tmp_path / "store")
     writer.component("dit", cls="", config={}).put(
         "a.weight", np.arange(20 << 18, dtype=np.float32), dtype="F32", shape=[20 << 18]
@@ -48,7 +50,9 @@ def grants(tmp_path: Path, deposited: dict[str, int]) -> Iterator[tuple[Executor
         right.close()
 
 
-def test_a_held_layout_is_the_one_descriptor_mapped_as_it_is(tmp_path: Path, checkpoint) -> None:
+def test_a_held_layout_is_the_one_descriptor_mapped_as_it_is(
+    tmp_path: Path, checkpoint: Stored
+) -> None:
     ck, manifest, objects = checkpoint
     layout = sealed("layout", b"a host layout varena sealed in another executor")
     try:
@@ -64,7 +68,7 @@ def test_a_held_layout_is_the_one_descriptor_mapped_as_it_is(tmp_path: Path, che
 
 
 def test_chunk_files_come_in_sha256_order_named_by_their_lists_digest(
-    tmp_path: Path, checkpoint
+    tmp_path: Path, checkpoint: Stored
 ) -> None:
     ck, manifest, objects = checkpoint
     with grants(tmp_path, {}) as (executor, _):
@@ -77,14 +81,16 @@ def test_chunk_files_come_in_sha256_order_named_by_their_lists_digest(
             os.close(file)
 
 
-def test_an_object_outside_the_checkpoint_cannot_be_opened(tmp_path: Path, checkpoint) -> None:
+def test_an_object_outside_the_checkpoint_cannot_be_opened(
+    tmp_path: Path, checkpoint: Stored
+) -> None:
     ck, manifest, _ = checkpoint
     with grants(tmp_path, {}) as (executor, _), pytest.raises(KeyError):
         executor._read_grant(manifest, "sha256:cold", [("0" * 64, 1)], checkpoints={manifest: ck})
 
 
 def test_a_held_layout_carries_kept_regions_and_their_fingerprint(
-    tmp_path: Path, checkpoint
+    tmp_path: Path, checkpoint: Stored
 ) -> None:
     ck, manifest, objects = checkpoint
     layout = sealed("layout", b"held layout")

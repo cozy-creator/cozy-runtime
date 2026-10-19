@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 import socket
 import threading
+from collections import OrderedDict
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
@@ -20,6 +21,7 @@ import tensorfs  # noqa: E402
 from tensorfs import varena  # noqa: E402
 from tensorfs.varena.torch import Declared, Memory, WeightGrant, regions_of  # noqa: E402
 from torch import nn  # noqa: E402
+from torch.nn import Module  # noqa: E402
 
 from cozy_runtime.internal.executor import Executor  # noqa: E402
 from cozy_runtime.internal.fill import Checkpoint  # noqa: E402
@@ -30,41 +32,33 @@ from tensord_peer import answer_read_grants  # noqa: E402
 DIM, BLOCKS = 64, 4
 
 
-class Block(nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-        self.lin = nn.Linear(DIM, DIM)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + torch.relu(self.lin(x))
-
-
-class Net(nn.Module):
-    _no_split_modules = ("Block",)
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.embed = nn.Linear(DIM, DIM)
-        self.blocks = nn.ModuleList(Block() for _ in range(BLOCKS))
-        self.head = nn.Linear(DIM, DIM)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.embed(x)
-        for block in self.blocks:
-            x = block(x)
-        return self.head(x)
+def network() -> Module:
+    net = nn.Sequential(
+        OrderedDict(
+            embed=nn.Linear(DIM, DIM),
+            blocks=nn.Sequential(
+                *(
+                    nn.Sequential(OrderedDict(lin=nn.Linear(DIM, DIM), relu=nn.ReLU()))
+                    for _ in range(BLOCKS)
+                )
+            ),
+            head=nn.Linear(DIM, DIM),
+        )
+    )
+    net._no_split_modules = ("Sequential",)
+    return net
 
 
-def built(grant: WeightGrant, blocks: list[str] | None = None) -> Net:
+def built(grant: WeightGrant, blocks: list[str] | None = None) -> Module:
     with torch.device("meta"):
-        net = Net()
-    vars(net)["_varena"] = Declared(grant, blocks=blocks)
+        net = network()
+    net._varena = Declared(grant, blocks=blocks)
     return net
 
 
 def test_a_held_layout_binds_before_the_module_and_other_regions_miss(tmp_path: Path) -> None:
     torch.manual_seed(0)
-    reference = Net()
+    reference = network()
     writer = tensorfs.Writer(cache_dir=tmp_path / "store")
     component = writer.component("net", cls="", config={})
     for key, t in reference.state_dict().items():
@@ -105,7 +99,7 @@ def test_a_held_layout_binds_before_the_module_and_other_regions_miss(tmp_path: 
 
 def test_a_changed_held_layout_regrants_chunks_for_a_header_only_executor(tmp_path: Path) -> None:
     torch.manual_seed(0)
-    reference = Net()
+    reference = network()
     writer = tensorfs.Writer(cache_dir=tmp_path / "store")
     component = writer.component("net", cls="", config={})
     for key, t in reference.state_dict().items():
@@ -128,7 +122,8 @@ def test_a_changed_held_layout_regrants_chunks_for_a_header_only_executor(tmp_pa
         release="test",
     )
     left, right = socket.socketpair()
-    executor, asked = Executor(Channel(left), tmp_path), []
+    executor = Executor(Channel(left), tmp_path)
+    asked: list[str] = []
     serving = threading.Thread(
         target=answer_read_grants,
         args=(Channel(right), {backend._layout("net"): held}, asked),
@@ -138,7 +133,7 @@ def test_a_changed_held_layout_regrants_chunks_for_a_header_only_executor(tmp_pa
     try:
         backend.ahead()
         with torch.device("meta"):
-            net = Net()
+            net = network()
         net._no_split_modules = ()
         model = backend._register("net", net, [row.key for row in ck.rows("net")])
         assert asked == [backend._layout("net"), ""], "a mismatch explicitly asks for chunk files"

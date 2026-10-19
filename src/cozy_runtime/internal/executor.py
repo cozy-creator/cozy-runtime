@@ -3370,7 +3370,7 @@ class Executor:
         }
         exchange = self._exchange(command.request_id)
         connection = _connection(command.tensorfs)
-        outputs = (
+        weight_outputs = (
             weights_store.Outputs(
                 self._store(),
                 request_id=command.request_id,
@@ -3441,8 +3441,12 @@ class Executor:
                                 if sources
                                 else None
                             ),
-                            tensorfs_output=outputs.open if outputs is not None else None,
-                            tensorfs_adopt=outputs.adopt if outputs is not None else None,
+                            tensorfs_output=(
+                                weight_outputs.open if weight_outputs is not None else None
+                            ),
+                            tensorfs_adopt=(
+                                weight_outputs.adopt if weight_outputs is not None else None
+                            ),
                             publish=lambda request: exchange(request, Published),
                             calls=self.host._call_broker(
                                 command.request_id, self.host.call_interfaces

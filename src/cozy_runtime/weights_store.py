@@ -160,6 +160,7 @@ class Output:
         self.store, self.slot, self.transaction = store, slot, transaction
         self.max_new_bytes, self.written = max_new_bytes, 0
         self.order = tuple(derivation.order)
+        self._fresh = derivation.base is None and not derivation.sources
         #: each component a write may name, declared as its base (else first source) declares it
         froms = (*reversed(derivation.sources), *([derivation.base] if derivation.base else []))
         self.declared = {name: c for ck in froms for name, c in ck.components.items()}
@@ -185,21 +186,24 @@ class Output:
         self.close()
 
     def component(self, name: str) -> tensorfs.ComponentWriter:
-        """The writer of component `name`, declared (class, config) as the checkpoint it comes
-        from declares it."""
+        """Component `name`, with inherited class/config or empty metadata for a fresh output."""
         writer = self._components.get(name)
         if writer is not None:
             return writer
         if self._writer is None:
             raise CapabilityError("the output is committed or closed", code="weights_writer_closed")
         declared = self.declared.get(name)
-        if declared is None:
+        if declared is None and not self._fresh:
             raise CapabilityError(
                 f"no checkpoint this output derives from has a component {name!r}",
                 code="weights_output_component",
             )
-        writer = self._writer.component(
-            name, cls=declared.cls, config=declared.config, config_file=declared.config_file
+        writer = (
+            self._writer.component(name, cls="", config={})
+            if declared is None
+            else self._writer.component(
+                name, cls=declared.cls, config=declared.config, config_file=declared.config_file
+            )
         )
         self._components[name] = writer
         return writer

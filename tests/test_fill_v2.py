@@ -85,9 +85,12 @@ def test_rows_carry_order_scheme_params_and_parts(
         ck.rows("text_encoder")
     assert refused.value.code == "destination_absent"
     held = set(ck.ck.chunks)
-    assert {row[3] for table in ck.table("unet").values() for row in table[4]} <= {
-        sha for sha, _ in held
-    }
+    for table in ck.table("unet").values():
+        parts = table[4]
+        assert isinstance(parts, list)
+        for part in parts:
+            assert isinstance(part, list)
+            assert part[3] in {sha for sha, _ in held}
 
 
 def test_an_executor_opens_a_checkpoint_from_the_store_with_its_configs_and_assets(
