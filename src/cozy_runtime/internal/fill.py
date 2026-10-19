@@ -9,11 +9,13 @@ and parts (`Encoded`); refusals are spoken in `FillRefusal`'s vocabulary.
 from __future__ import annotations
 
 import contextlib
+import functools
 import json
 import sys
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 
+import msgspec
 import tensorfs
 
 from cozy_runtime.author._loader import TENSORFS_DTYPES, TensorSpec, canonical_dtype
@@ -23,6 +25,15 @@ from cozy_runtime.internal.resolution import PlanRefusal, ResolvedModelPlan
 
 #: The header's path in a manifest.
 HEADER = "model.cozytensors"
+#: TensorD's `ModelSource` name for a checkpoint's manifest (its file list); `""` is its header.
+LISTING = "."
+
+
+class _Listing(msgspec.Struct):
+    """A `tensorfs.manifest/1` document, as far as its files' paths."""
+
+    files: dict[str, object]
+
 
 #: Element bytes per Runtime dtype name.
 WIDTHS = {
@@ -184,13 +195,14 @@ class Checkpoint:
         self._read = read_file
 
     @classmethod
-    def granted(
-        cls, manifest_id: str, files: Sequence[str], read_file: Callable[[str], bytes]
-    ) -> Checkpoint:
-        """A checkpoint TensorD granted this executor: its files, read through the grant."""
+    def granted(cls, manifest_id: str, source: Callable[[str], bytes]) -> Checkpoint:
+        """A checkpoint TensorD granted this executor (`ModelSource`): its manifest (`LISTING`)
+        names the files, each read through the grant once (the header as `""`)."""
+        files = msgspec.json.decode(source(LISTING), type=_Listing).files
+        read = functools.cache(lambda path: source("" if path == HEADER else path))
         with store_refusals(f"parsing {manifest_id[:23]}"):
-            ck = tensorfs.Checkpoint.parse(read_file(HEADER))
-        return cls(manifest_id, ck, files, read_file)
+            ck = tensorfs.Checkpoint.parse(read(HEADER))
+        return cls(manifest_id, ck, tuple(files), read)
 
     @classmethod
     def from_store(cls, store: tensorfs.Store, ref: str) -> Checkpoint:

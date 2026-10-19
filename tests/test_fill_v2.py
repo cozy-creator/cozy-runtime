@@ -3,6 +3,8 @@ scheme and parts, the census fit, configs from files, and the chunks a fetch pla
 
 from __future__ import annotations
 
+import socket
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -10,6 +12,7 @@ import pytest
 import tensorfs
 
 from cozy_runtime.internal import fetch_plan, model_config
+from cozy_runtime.internal.executor import Executor
 from cozy_runtime.internal.fill import (
     HEADER,
     Checkpoint,
@@ -19,6 +22,8 @@ from cozy_runtime.internal.fill import (
     normalized,
     tensorfs_requirement_dtype,
 )
+from cozy_runtime.internal.seam import Channel
+from tensord_peer import answer_model_sources
 
 
 def _store(root: Path) -> tuple[tensorfs.Store, Checkpoint]:
@@ -42,7 +47,9 @@ def _store(root: Path) -> tuple[tensorfs.Store, Checkpoint]:
     writer.put("vae", "decoder.weight", "F32", [3], np.ones(3, np.float32))
     writer.file("unet/config.json", b'{"in": 4}')
     writer.file("scheduler/scheduler_config.json", b'{"steps": 2}')
-    writer.file("tokenizer/vocab.json", b"{}")
+    writer.file("tokenizer/vocab.json", b'{"a": 0}')
+    writer.file("tokenizer/merges.txt", b"#version: 0.2\na b\n")
+    writer.file("assets/palette.bin", bytes(range(256)))
     return store, Checkpoint.from_store(store, f"sha256:{writer.commit().sha256}")
 
 
@@ -67,14 +74,36 @@ def test_rows_carry_order_scheme_params_and_parts(tmp_path: Path) -> None:
     assert refused.value.code == "destination_absent"
 
 
-def test_a_granted_header_parses_as_the_stored_one(tmp_path: Path) -> None:
-    _, ck = _store(tmp_path)
-    files = {path: ck.file(path) for path in ck.files}
-    granted = Checkpoint.granted(ck.manifest_id, list(files), files.__getitem__)
-    assert granted.ck.tensors.keys() == ck.ck.tensors.keys()
-    assert [r.key for r in granted.rows("unet")] == [r.key for r in ck.rows("unet")]
-    assert granted.ck.chunks == ck.ck.chunks
-    assert set(granted.model_assets()) == set(files) - {HEADER}
+def test_an_executor_gets_every_manifest_file_through_model_source(tmp_path: Path) -> None:
+    """Through TensorD (`ModelSource`) an executor reads the header and every file the manifest
+    lists (configs, tokenizer, assets), byte for byte, each asked once."""
+    store, ck = _store(tmp_path / "store")
+    left, right = socket.socketpair()
+    asked: list[str] = []
+    machine = Channel(right)
+    serving = threading.Thread(target=answer_model_sources, args=(machine, store, asked))
+    serving.start()
+    try:
+        granted = Executor(Channel(left), tmp_path)._checkpoint(ck.manifest_id)
+        stored = {path: ck.file(path) for path in ck.files if path != HEADER}
+        assert granted.files == ck.files and len(stored) == 5
+        assert granted.model_assets() == stored
+        assert (
+            granted.configs()
+            == ck.configs()
+            == {
+                "unet": b'{"in": 4}',
+                "scheduler": b'{"steps": 2}',
+            }
+        )
+        assert [r.key for r in granted.rows("unet")] == [r.key for r in ck.rows("unet")]
+        assert granted.ck.chunks == ck.ck.chunks
+        granted.model_assets()
+        assert sorted(asked) == sorted(["", ".", *stored]), "each name asked once, never by HEADER"
+    finally:
+        left.close()
+        serving.join()
+        right.close()
 
 
 def test_configs_come_from_files_and_the_fit_judges_the_census(tmp_path: Path) -> None:

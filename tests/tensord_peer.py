@@ -1,10 +1,11 @@
 """TensorD's half of an attempt's weights channels, over a real `tensorfs.Store`, for Runtime tests.
 
-It answers `weights_writer` requests as `crates/tensord/src/weights.rs` does and serves the
-source and derive channels as `crates/tensord/src/derive/{mod,source}.rs` document them, with
-the bytes going through the real v2 store and `Writer`. What it does not do: pins, storage
-admission, `set_order` (the Python `Writer` has none; tests write in natural order) and
-renamed copies. The cross-process test against TensorD itself lives with TensorD.
+It answers `weights_writer` requests as `crates/tensord/src/weights.rs` does, `model_source` as
+`crates/tensord/src/model_sources.rs` does, and serves the source and derive channels as
+`crates/tensord/src/derive/{mod,source}.rs` document them, with the bytes going through the
+real v2 store and `Writer`. What it does not do: pins, storage admission, `set_order` (the
+Python `Writer` has none; tests write in natural order) and renamed copies. The cross-process
+test against TensorD itself lives with TensorD.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import socket
 import threading
 from collections.abc import Mapping
@@ -21,7 +23,6 @@ from typing import Any
 import tensorfs
 
 from cozy_runtime.author import Context
-
 from cozy_runtime.author._executor_requests import (
     Adopted,
     Answer,
@@ -32,8 +33,9 @@ from cozy_runtime.author._executor_requests import (
     WriterSource,
     refuse,
 )
-from cozy_runtime.tensord_channels import Channel, Refused
+from cozy_runtime.internal import plane, seam
 from cozy_runtime.internal.weights_writer import ExecutionStorage, exchange_file
+from cozy_runtime.tensord_channels import Channel, Refused
 
 HEADER = "model.cozytensors"
 
@@ -123,6 +125,39 @@ def serve_source(store: tensorfs.Store, manifest: str, sock: socket.socket) -> N
                 session.refuse("invalid_request", f"{op!r} is not a source operation")
     finally:
         session.channel.close()
+
+
+def model_source(store: tensorfs.Store, manifest: str, name: str) -> bytes:
+    """`ModelSources::source`: a selected checkpoint's header (`""`), its manifest (`"."`, the
+    file list) or one file it lists, never a `.cozytensors`."""
+    ck = store.checkpoint(manifest)
+    if name == "":
+        return ck.file(HEADER)
+    if name == ".":
+        return blob(store, manifest.removeprefix("sha256:")).read_bytes()
+    if name not in ck.files or name.endswith(".cozytensors"):
+        raise PermissionError("asset is outside the selected manifest")
+    return ck.file(name)
+
+
+def answer_model_sources(channel: seam.Channel, store: tensorfs.Store, asked: list[str]) -> None:
+    """The machine's half of an executor's `model_source` requests, each in a sealed memfd as
+    `GpuPool` answers them; a refusal is `model_source_refused`. `asked` records each name."""
+    while (frame := channel.recv()) is not None:
+        if frame.get("event") != "request" or frame.get("kind") != "model_source":
+            continue
+        asked.append(frame["name"])
+        answer = {"event": "answer", "seq": frame["seq"]}
+        try:
+            body = model_source(store, frame["manifest"], frame["name"])
+        except PermissionError as exc:
+            channel.send(answer | {"ok": False, "code": "model_source_refused", "detail": str(exc)})
+            continue
+        facts = {"sha256": hashlib.sha256(body).hexdigest(), "length": len(body)}
+        channel.send(answer | {"ok": True, "held": True, "descriptor": True} | facts)
+        memfd = plane.sealed_memfd("model-source", body)
+        channel.send_memfd(memfd)
+        os.close(memfd)
 
 
 def ref_of(store: tensorfs.Store, ck: tensorfs.Checkpoint, path: str) -> dict[str, object]:

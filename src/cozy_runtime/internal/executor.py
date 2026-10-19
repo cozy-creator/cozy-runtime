@@ -207,7 +207,6 @@ from cozy_runtime.internal.executor_commands import (
 )
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.fill import (
-    HEADER,
     Checkpoint,
     FillRefusal,
     dtype_name,
@@ -4358,8 +4357,8 @@ class Executor:
         return opened
 
     def _model_source(self, manifest: str, name: str) -> bytes:
-        """One model file from the machine (`ModelSource`): the header (`name` empty) or one
-        asset, checked against the length the machine states."""
+        """One model file from the machine (`ModelSource`): the header (`name` empty), the
+        manifest (`fill.LISTING`) or one of its files, checked against the length stated."""
         answer = self._durable(ModelSource(manifest=manifest, name=name), SourceBytes)
         if not (answer.ok and answer.held and answer.descriptor >= 0):
             raise RuntimeError(
@@ -4456,14 +4455,9 @@ class Executor:
         return [(sha, length, fd) for (sha, length), fd in zip(objects, answer.fds, strict=True)]
 
     def _checkpoint(self, manifest: str) -> Checkpoint:
-        """A selected checkpoint's header through TensorD (`ModelSource`). Only the header is
-        known: cozytensors/1 lists a checkpoint's files in its manifest, which `ModelSource`
-        does not serve."""
-        return Checkpoint.granted(
-            manifest,
-            (HEADER,),
-            lambda path: self._model_source(manifest, "" if path == HEADER else path),
-        )
+        """A selected checkpoint through TensorD (`ModelSource`): its header and every file its
+        manifest lists (configs, tokenizers, assets)."""
+        return Checkpoint.granted(manifest, lambda name: self._model_source(manifest, name))
 
     def _device_room(self, free_bytes: int) -> None:
         """Ask the worker for `free_bytes` free on this GPU from its other tenants; it answers
