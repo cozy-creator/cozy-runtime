@@ -95,14 +95,14 @@ from cozy_runtime.author._executor_requests import (
     Answer,
     ChildEvents,
     Deposit,
-    KeepPages,
     Exchange,
     FetchChannel,
     Granted,
     Handoff,
+    KeepPages,
     ModelSource,
-    Published,
     Page,
+    Published,
     ReadGrant,
     Request,
     SourceBytes,
@@ -4326,7 +4326,8 @@ class Executor:
             if kind not in _RELAYED:
                 follower.send({
                     "event": "answer", "seq": seq, "ok": False,
-                    "code": "request_unsupported", "detail": f"{_gpu(0)} relays no {kind!r} request",
+                    "code": "request_unsupported",
+                    "detail": f"{_gpu(0)} relays no {kind!r} request",
                 })
                 return
 

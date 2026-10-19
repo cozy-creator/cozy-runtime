@@ -97,11 +97,17 @@ def test_a_held_layout_carries_kept_regions_and_their_fingerprint(
             received = pool.submit(executor._read_grant, manifest, "held", objects)
             frame = peer.recv()
             assert frame is not None and frame["kind"] == "read_grant"
-            peer.send({
-                "event": "answer", "seq": frame["seq"], "ok": True, "held": True,
-                "descriptors": 2, "fingerprint": "sha256:layout-parts",
-                "pages": [{"region": 3, "nbytes": 2 << 20}],
-            })
+            peer.send(
+                {
+                    "event": "answer",
+                    "seq": frame["seq"],
+                    "ok": True,
+                    "held": True,
+                    "descriptors": 2,
+                    "fingerprint": "sha256:layout-parts",
+                    "pages": [{"region": 3, "nbytes": 2 << 20}],
+                }
+            )
             peer.send_fds([layout, page])
             fd, files, pages, fingerprint = received.result()
         assert fd is not None and not files and fingerprint == "sha256:layout-parts"
@@ -126,7 +132,9 @@ def test_kept_pages_transfer_containers_and_close_the_callers_descriptors(tmp_pa
     executor, peer = Executor(Channel(left), tmp_path), Channel(right)
     try:
         with ThreadPoolExecutor(max_workers=1) as pool:
-            deposited = pool.submit(executor._keep_pages, "layout", "parts", [(2, 4096, descriptor)])
+            deposited = pool.submit(
+                executor._keep_pages, "layout", "parts", [(2, 4096, descriptor)]
+            )
             frame = peer.recv()
             assert frame is not None and frame["kind"] == "keep_pages"
             assert frame["layout"] == "layout" and frame["fingerprint"] == "parts"
@@ -156,7 +164,9 @@ def test_a_followers_kept_containers_reach_its_gpu_rank(tmp_path: Path) -> None:
     machine, relay = Channel(machine_end), Channel(relay_end)
     try:
         with ThreadPoolExecutor(max_workers=2) as pool:
-            depositing = pool.submit(follower._keep_pages, "layout", "parts", [(4, 8192, descriptor)])
+            depositing = pool.submit(
+                follower._keep_pages, "layout", "parts", [(4, 8192, descriptor)]
+            )
             request = relay.recv()
             assert request is not None
             forwarding = pool.submit(leader._relay, relay, request)
@@ -181,7 +191,11 @@ def test_a_refused_follower_request_drains_its_plural_descriptors(tmp_path: Path
     leader_end, machine_end = socket.socketpair()
     follower_end, relay_end = socket.socketpair()
     container, producer = socket.socketpair()
-    leader, follower, relay = Executor(Channel(leader_end), tmp_path), Channel(follower_end), Channel(relay_end)
+    leader, follower, relay = (
+        Executor(Channel(leader_end), tmp_path),
+        Channel(follower_end),
+        Channel(relay_end),
+    )
     try:
         request = {"event": "request", "seq": 1, "kind": "unknown", "descriptors": 1}
         follower.send(request)

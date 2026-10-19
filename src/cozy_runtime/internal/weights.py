@@ -472,7 +472,9 @@ class Backend:
                 vars(root)["_varena"] = replace(vars(root)["_varena"], weights=fresh)
                 model = self.memory.load(root)
         finally:
-            _close(self.grants.pop(name))
+            remaining = self.grants.pop(name, None)
+            if remaining is not None:
+                _close(remaining)
         for _, sealed in self.memory.sealed():
             if self.deposit is not None:
                 objects = self._objects(self.checkpoints[name])
@@ -505,9 +507,12 @@ class Backend:
             grant = WeightGrant(checkpoint.ck, name, checkpoint.manifest_id)
             if self.grant is not None:
                 objects = self._objects(checkpoint)
-                fd, files, pages, fingerprint = self.grant(grant.manifest, "" if chunks else self._layout(name), objects)
+                fd, files, pages, fingerprint = self.grant(
+                    grant.manifest, "" if chunks else self._layout(name), objects
+                )
                 grant = replace(
-                    grant, host_fd=fd, files=tuple(files), pages=tuple(pages), fingerprint=fingerprint
+                    grant, host_fd=fd, files=tuple(files),
+                    pages=tuple(pages), fingerprint=fingerprint,
                 )
             self.grants[name] = grant
             self.memory.adopt(grant)

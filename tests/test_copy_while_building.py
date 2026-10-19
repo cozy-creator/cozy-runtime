@@ -116,8 +116,13 @@ def test_a_changed_held_layout_regrants_chunks_for_a_header_only_executor(tmp_pa
     held = varena.seal(store.checkpoint(manifest), regions_of(built(grant)), "old-layout")
     memory = Memory.open(torch.device("cpu"))
     backend = Backend.for_script(
-        {"net": ck}, ck.rows("net"), torch=torch, memory=memory,
-        device=torch.device("cpu"), construction="held-mismatch", release="test",
+        {"net": ck},
+        ck.rows("net"),
+        torch=torch,
+        memory=memory,
+        device=torch.device("cpu"),
+        construction="held-mismatch",
+        release="test",
     )
     left, right = socket.socketpair()
     executor, asked = Executor(Channel(left), tmp_path), []
