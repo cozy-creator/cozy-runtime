@@ -53,10 +53,12 @@ from typing import Any
 
 import msgspec
 
+from cozy_runtime.author._loader import TENSORFS_DTYPES
 from cozy_runtime.author._numeric import within, worst
 from cozy_runtime.derive.microscale import encode_nvfp4
 from cozy_runtime.internal import accel, canonical
-from cozy_runtime.author._loader import TENSORFS_DTYPES
+from cozy_runtime.internal.decode_cores import Cores
+from cozy_runtime.internal.decode_schemes import run, sample
 from cozy_runtime.internal.encoding import (
     TORCH_DTYPES,
     Capabilities,
@@ -70,6 +72,7 @@ from cozy_runtime.internal.encoding import (
     implementation_digest,
     measure_runtime,
 )
+from cozy_runtime.internal.encoding.adapters import CoreDequant
 from cozy_runtime.internal.encoding.formats import (
     E2M1_VALUES,
     E8M0_NAN,
@@ -615,6 +618,10 @@ def _weight_roles(torch: Any, provider: Provider, device: Any) -> tuple[Any, dic
     """
     rows, cols = BENCH_SHAPE
     generator = torch.Generator(device="cpu").manual_seed(0x511B)
+    if isinstance(provider, CoreDequant):
+        roles = sample(torch, provider.adapter, BENCH_SHAPE, generator)
+        roles = {role: part.to(device) for role, part in roles.items()}
+        return _exact_weight(torch, provider, roles), roles
     weight = torch.randn(rows, cols, generator=generator, dtype=torch.float32).to(device) * 0.05
     if provider.suite in ("fp8-rowwise-decode", "fp8-rowwise-native"):
         scale = (weight.abs().amax(dim=-1) / 448.0).clamp(min=1e-12)
@@ -677,6 +684,12 @@ def _exact_weight(torch: Any, provider: Provider, roles: Mapping[str, Any]) -> A
     element and a power-of-two or f32 scale multiply without rounding in f64 — so what the
     deviation below measures is entirely the route's own.
     """
+    if isinstance(provider, CoreDequant):
+        return (
+            _cores_reference(torch, provider, roles, BENCH_SHAPE)
+            .double()
+            .to(next(iter(roles.values())).device)
+        )
     if provider.suite in ("nvfp4-decode", "nvfp4-native"):
         packed = roles["weight"].cpu()
         rows, cols = int(packed.shape[0]), 2 * int(packed.shape[1])
@@ -769,9 +782,10 @@ def _native_axes(torch: Any, provider: LeafProvider, device: Any, deviation: flo
 
 # ------------------------------------------------------------- the conformance vectors
 
-#: The cozytensors/1 conformance decode cases (tensorfs `conformance/vectors/cases.json`). They
-#: ship in the package, so an installed wheel qualifies as the repo does.
-VECTORS = Path(__file__).resolve().parent / "encoding" / "vectors" / "cases.json"
+#: The cozytensors/1 conformance decode cases, one file per scheme family (tensorfs
+#: `conformance/vectors/cases/<family>.json`). They ship in the package, so an installed wheel
+#: qualifies as the repo does.
+VECTORS = Path(__file__).resolve().parent / "encoding" / "vectors" / "cases"
 
 
 class VectorPart(msgspec.Struct, frozen=True):
@@ -783,7 +797,7 @@ class VectorPart(msgspec.Struct, frozen=True):
 
 class VectorEncoding(msgspec.Struct, frozen=True):
     scheme: str
-    params: dict[str, int | float | str] = {}
+    params: dict[str, bool | int | float | str | list[int]] = {}
 
 
 class VectorCase(msgspec.Struct, frozen=True):
@@ -800,8 +814,11 @@ class VectorCase(msgspec.Struct, frozen=True):
 
 def vector_cases() -> list[VectorCase]:
     """The conformance cases with a scheme (the plain ones are TensorFS's read cases)."""
-    rows = msgspec.json.decode(VECTORS.read_bytes(), type=dict[str, list[dict[str, object]]])
-    return [msgspec.convert(row, VectorCase) for row in rows["cases"] if "encoding" in row]
+    out = []
+    for path in sorted(VECTORS.glob("*.json")):
+        rows = msgspec.json.decode(path.read_bytes(), type=dict[str, list[dict[str, object]]])
+        out += [msgspec.convert(row, VectorCase) for row in rows["cases"] if "encoding" in row]
+    return out
 
 
 def vector_tensor(torch: ModuleType, part: VectorPart, device: Tensor) -> Tensor:
@@ -853,6 +870,11 @@ def _spec_vectors(torch: ModuleType, provider: Provider, device: Tensor) -> Spec
         roles = {part.role for part in case.parts}
         missing = sorted(provider.required - roles)
         surplus = sorted(roles - provider.required - provider.optional)
+        if surplus and not missing:  # the selector never hands this provider such a tensor
+            cases.append(
+                VectorCheck(case.key, passed=True, skipped=True, why=f"takes no {surplus}")
+            )
+            continue
         if missing or surplus:
             why = f"parts {sorted(roles)}: missing {missing}, unhandled {surplus}"
             cases.append(VectorCheck(case.key, passed=False, why=why))
@@ -936,6 +958,32 @@ def _leaf_bench(torch: Any, provider: LeafProvider, device: Any, dtype: Any) -> 
     )
 
 
+def _cores_reference(
+    torch: ModuleType, provider: CoreDequant, roles: Mapping[str, Tensor], shape: tuple[int, ...]
+) -> Tensor:
+    """The spec's f32 value of `roles` by the cores' eager reference, on the host: a second
+    implementation of the arithmetic the Triton kernels run."""
+    reference = torch.empty(*shape, dtype=torch.float32)
+    host = {role: part.cpu() for role, part in roles.items()}
+    run(provider.adapter, Cores(torch, kernel=False), host, dict(provider.params), reference)
+    return reference
+
+
+def _numerics_cores(torch: ModuleType, provider: Provider, device: Tensor, dtype: Tensor) -> Sweep:
+    """The row's random parts at its probe params (every byte pattern), decoded on the device
+    and by the eager reference: bit for bit after the one cast."""
+    assert isinstance(provider, CoreDequant)
+    provider = replace(provider, params=params_of(provider.adapter.probe_params))
+    shape = (384, 512)
+    roles = sample(
+        torch, provider.adapter, shape, torch.Generator(device="cpu").manual_seed(0x0C0E)
+    )
+    destination = torch.empty(*shape, dtype=dtype, device=device)
+    provider.decode(torch, {role: part.to(device) for role, part in roles.items()}, destination)
+    truth = _cores_reference(torch, provider, roles, shape).double()
+    return _exact_sweep(torch, destination.cpu(), truth, dtype)
+
+
 #: Which self-check a provider gets, keyed by the ORACLE IT DECLARES (`Provider.suite`) and
 #: never by class or role set, so a second implementation of one encoding is measured by the
 #: same oracle as the first. A suite name in neither table qualifies NOTHING: minting a record
@@ -948,6 +996,7 @@ DECODE_SUITES: dict[str, Callable[[Any, Provider, Any, Any], Sweep]] = {
     "int8-rowwise-decode": _numerics_int8_rowwise,
     "int8-tensorwise-decode": _numerics_int8_tensorwise,
     "mxfp8-decode": _numerics_mxfp8,
+    "cores-decode": _numerics_cores,
 }
 
 #: Native leaves' oracle is their own GEMM against arithmetic (`_native_agreement`).
@@ -1032,7 +1081,10 @@ PROBE_PARAMS: dict[str, dict[str, object]] = {
 def _measured(torch: ModuleType, provider: Provider, target: Tensor, dtype: Tensor) -> Evidence:
     """`_evidence`, where a device that lacks a dtype the decode reads (MPS has no float8)
     mints no record for it: the encoding refuses at bind naming why."""
-    params = params_of(PROBE_PARAMS.get(provider.encoding, {}))
+    if isinstance(provider, CoreDequant):
+        params = params_of(provider.adapter.probe_params)
+    else:
+        params = params_of(PROBE_PARAMS.get(provider.encoding, {}))
     provider = replace(provider, params=params)  # type: ignore[type-var]
     try:
         return _evidence(torch, provider, target, dtype)

@@ -1,6 +1,6 @@
 """The seam on Windows: a byte-mode named pipe, overlapped so one thread reads while others
 write, with the socket calls the seam makes. The machine's listener (TensorD's
-`cozy_platform::ipc`) names its pipe from the path it hands the executor: `\\\\.\\pipe\\cozy-`
+`platform::ipc`) names its pipe from the path it hands the executor: `\\\\.\\pipe\\cozy-`
 and the first 16 bytes of the path text's SHA-256, in hex. A handle crosses by being
 duplicated into the peer's process: a zero marker byte, then its value there, 8 bytes
 little-endian."""

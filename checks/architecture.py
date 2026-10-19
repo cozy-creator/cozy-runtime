@@ -54,20 +54,20 @@ DENY_TOKENS = (
 
 # Per-package import fences. Values are forbidden module prefixes.
 PACKAGE_FENCES: dict[str, tuple[str, ...]] = {
-    "author": ("cozy_runtime.internal", "cozy_runtime.cli", "worker_protocol", "tensorfs"),
+    "author": ("cozy_runtime.internal", "cozy_runtime.cli", "tensorfs"),
     # Public derivation surface (cr-071): job packages import it directly. It builds only
     # on the author surface and scoped TensorFS API, never worker storage or CLI authority.
-    "derive": ("cozy_runtime.internal", "cozy_runtime.cli", "worker_protocol", "tensorfs"),
+    "derive": ("cozy_runtime.internal", "cozy_runtime.cli", "tensorfs"),
     # Fused DiT blocks: packages declare layouts here; kernels compile through author.kernels.
-    "fusion": ("cozy_runtime.internal", "cozy_runtime.cli", "worker_protocol", "tensorfs"),
+    "fusion": ("cozy_runtime.internal", "cozy_runtime.cli", "tensorfs"),
     # LM decode: static cache and CUDA-graphed steps; placement through the author protocol.
-    "lm": ("cozy_runtime.internal", "cozy_runtime.cli", "worker_protocol", "tensorfs"),
+    "lm": ("cozy_runtime.internal", "cozy_runtime.cli", "tensorfs"),
     # CUDA graphs over plane-held weights, which the executor installs on every component; a
     # replay reports the attention it serves into the run's evidence.
-    "graphs": ("cozy_runtime.cli", "worker_protocol", "tensorfs"),
+    "graphs": ("cozy_runtime.cli", "tensorfs"),
     # The activation probe (cr-075): a public mechanism surface shaped like `derive` — job
     # code and the runtime verb both build on it; it never reaches the worker planes.
-    "probe": ("cozy_runtime.internal", "cozy_runtime.cli", "worker_protocol", "tensorfs"),
+    "probe": ("cozy_runtime.internal", "cozy_runtime.cli", "tensorfs"),
     "internal": ("cozy_runtime.cli",),
     "cli": (),
 }
@@ -880,7 +880,7 @@ def fence_one_address_predicate() -> list[str]:
 #: `dict[str, Any]` record's missing key, 2026-09-28). Records are decoded once, at their
 #: boundary, into typed structs; this count under `internal/` may only fall. Lower it in
 #: the change that removes some.
-ANY_CEILING = 599
+ANY_CEILING = 462
 
 
 def any_references(tree: ast.AST) -> int:

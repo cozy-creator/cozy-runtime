@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from cozy_runtime.internal.decode_schemes import ADAPTERS
 from cozy_runtime.internal.encoding import (
     Capabilities,
     DeviceFacts,
@@ -15,6 +16,7 @@ from cozy_runtime.internal.encoding import (
     launch_providers,
     params_of,
 )
+from cozy_runtime.internal.encoding.adapters import CoreDequant
 
 CPU = DeviceFacts("cpu", "CPU", 0, "", "", 0)
 
@@ -31,13 +33,14 @@ def test_every_scheme_has_its_parts_and_nothing_else() -> None:
         "mxfp8": ({"weight", "scale"}, set()),
         "nvfp4": ({"weight", "scale", "scale_2"}, {"input_scale"}),
     }
-    assert set(providers) == set(expected)
+    # The cores' rows (decode_schemes.ADAPTERS) are their own: nvfp4's adds AWQ's pre_quant_scale.
+    rows = {a.scheme: (set(a.required), set(a.optional)) for a in ADAPTERS}
+    assert set(providers) == set(expected) | set(rows)
     for scheme, candidates in providers.items():
         for provider in candidates:
             assert provider.encoding == scheme and scheme in provider.schemes
-            assert (set(provider.required), set(provider.optional)) == expected[scheme], (
-                provider.name
-            )
+            want = rows[scheme] if isinstance(provider, CoreDequant) else expected[scheme]
+            assert (set(provider.required), set(provider.optional)) == want, provider.name
 
 
 def _candidates(encoded: Encoded, shape: tuple[int, ...]) -> TensorCandidates:

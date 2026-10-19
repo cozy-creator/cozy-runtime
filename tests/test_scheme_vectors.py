@@ -6,10 +6,12 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+import msgspec
 import pytest
 
 from cozy_runtime.author._loader import TENSORFS_DTYPES
-from cozy_runtime.internal.encoding import Encoded, RolePart, launch_providers, params_of
+from cozy_runtime.internal.decode_cores import CodeOutsideTable
+from cozy_runtime.internal.encoding import Encoded, Provider, RolePart, launch_providers, params_of
 from cozy_runtime.internal.encoding.formats import MicroScaledDequant, part_rule
 from cozy_runtime.internal.encoding.leaves import quantize_activation_mx
 from cozy_runtime.internal.probe import (
@@ -37,8 +39,8 @@ def _encoded(case: VectorCase) -> Encoded | str:
     parts = []
     for part in case.parts:
         if part.dtype == "F4":
-            rows, cols = part.shape
-            parts.append(RolePart(part.role, "u8", (rows, cols // 2), rows * cols // 2))
+            packed = (*part.shape[:-1], part.shape[-1] // 2)
+            parts.append(RolePart(part.role, "u8", packed, 0))
             continue
         dtype = TENSORFS_DTYPES.get(part.dtype)
         if dtype is None:
@@ -47,9 +49,18 @@ def _encoded(case: VectorCase) -> Encoded | str:
     return Encoded(case.encoding.scheme, params_of(case.encoding.params), tuple(parts))
 
 
+def _takes(provider: Provider, case: VectorCase) -> bool:
+    """The selector hands `provider` this tensor: its roles, params and shape."""
+    roles = {p.role for p in case.parts}
+    return (
+        provider.required <= roles <= provider.required | provider.optional
+        and not provider.supports(case.shape, case.encoding.params)
+    )
+
+
 @pytest.mark.parametrize("case", [c for c in CASES if not c.refuse], ids=lambda c: c.key)
 def test_every_scheme_case_decodes_to_its_expected_bytes(case: VectorCase) -> None:
-    providers = [p for p in DECODERS if p.encoding == case.encoding.scheme]
+    providers = [p for p in DECODERS if p.encoding == case.encoding.scheme and _takes(p, case)]
     assert providers, case
     for provider in providers:
         got = decode_case(torch, provider, case, "cpu")
@@ -71,8 +82,23 @@ def test_every_decode_refusal_refuses(case: VectorCase) -> None:
             or bool(provider.required - set(parts))
             or bool(set(parts) - provider.required - provider.optional)
             or bool(provider.supports(case.shape, case.encoding.params))
+            or _decode_refuses(provider, case)
         )
-        assert refused, (provider.name, case.key)
+        assert refused or (case.encoding.scheme, case.key) in UNSEEN, (provider.name, case.key)
+
+
+#: The fill plane hands an `F4` part over as its packed bytes, so a `U8` part of the same bytes
+#: reads alike: only TensorFS's own decoder, which sees the header's dtype, refuses these.
+UNSEEN = {("mxfp4", "weight-u8")}
+
+
+def _decode_refuses(provider: Provider, case: VectorCase) -> bool:
+    """A decode refuses the values the spec constrains (tables, indices, zeros, stored shape)."""
+    try:
+        decode_case(torch, provider, msgspec.structs.replace(case, dtype="F32"), "cpu")
+    except (ValueError, CodeOutsideTable):
+        return True
+    return False
 
 
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16", "float16"])
