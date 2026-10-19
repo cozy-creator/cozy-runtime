@@ -136,7 +136,7 @@ def test_a_changed_held_layout_regrants_chunks_for_a_header_only_executor(tmp_pa
         backend.ahead()
         with torch.device("meta"):
             net = Net()
-        net._no_split_modules = ("Linear",)
+        net._no_split_modules = ()
         model = backend._register("net", net, [row.key for row in ck.rows("net")])
         assert asked == [backend._layout("net"), ""], "a mismatch explicitly asks for chunk files"
         assert not memory.adopted and model.ws.regions == regions_of(net)
