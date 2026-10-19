@@ -105,6 +105,15 @@ def test_failed_mirrored_command_still_closes_its_request(tmp_path: Path) -> Non
         assert command(peer, "end", "next").ok
 
 
+def test_weightless_follower_request_returns_no_gpu_evidence(tmp_path: Path) -> None:
+    with follower(tmp_path) as (worker, peer):
+        worker.memory = None
+        assert command(peer, "begin").ok
+        assert command(peer, "plan", steps=(("component",),)).ok
+        ended = command(peer, "end")
+        assert ended.ok and ended.memory is None and worker._rank_request is None
+
+
 def test_real_cpu_context_stats_map_logical_two_gpu_facts_to_lane_two_three() -> None:
     memory = Memory.open(torch.device("cpu"))
     with memory.request("cpu") as request:

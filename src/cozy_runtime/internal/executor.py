@@ -3979,13 +3979,17 @@ class Executor:
                 if begun:
                     replies = self._rank_memory_command(command)
                     memory = self.host.memory
-                    if (
-                        memory is not None
-                        and memory.cuda
-                        and any(reply.memory is None for reply in replies)
-                    ):
-                        self.poisoned = "a GPU rank omitted its request memory"
-                        raise GroupRefusal(self.poisoned, code="group_broken")
+                    if memory is not None and memory.cuda:
+                        devices = _gpu_numbers(self.world)
+                        if len(devices) != self.world or any(
+                            reply.memory is None
+                            or reply.memory.leftover < 0
+                            or reply.memory.leftover_by_gpu
+                            != [(devices[reply.rank], reply.memory.leftover)]
+                            for reply in replies
+                        ):
+                            self.poisoned = "a GPU rank omitted its own request memory evidence"
+                            raise GroupRefusal(self.poisoned, code="group_broken")
                     records.extend(reply.memory for reply in replies if reply.memory is not None)
                 else:
                     # A partial begin still closes the ranks that entered; the original
