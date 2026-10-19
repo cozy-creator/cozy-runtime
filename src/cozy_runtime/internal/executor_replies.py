@@ -37,13 +37,32 @@ class Peak(msgspec.Struct, frozen=True, kw_only=True):
     cuts: list[str] = []
 
 
+class Copy(msgspec.Struct, frozen=True, kw_only=True):
+    """A run of weight copies since the last request (`tensorfs.varena.torch.Copy`): to a GPU
+    (`h2d`: a restore, refill or fill) or a host layout read from disk (`disk`), in GB/s and %
+    of its measured ceiling, with the PCIe link, GPU copy and page-lock seconds."""
+
+    kind: str
+    gpu: int
+    bytes: int
+    seconds: float
+    gbps: float
+    ceiling: float
+    pct: float
+    link: str = ""
+    busy_s: float = 0.0
+    pin_s: float = 0.0
+    staged: int = 0
+    cached: int = 0
+
+
 class Memory(msgspec.Struct, frozen=True, kw_only=True):
     """The invoke reply's `memory`, which `cozy run show` states as `measurements.memory.stats`
     and the merge gate reads: torch bytes package state still held at the request's end
     (`leftover`), weight bytes copied to the device while it ran (`paged_in`, home or through
     slots), and each model's bytes copied per step (`steps`). Then the detail: every step's
     row, the evictions it made, the peaks and cuts per shape key, its out-of-memory retries,
-    and `leftover` by GPU."""
+    `leftover` by GPU, and the copy runs against their ceilings."""
 
     leftover: int = 0
     paged_in: int = 0
@@ -55,3 +74,4 @@ class Memory(msgspec.Struct, frozen=True, kw_only=True):
     leftover_by_gpu: list[tuple[int, int]] = []
     #: the declared plan (`Context.plan`), each step's components
     plan: list[list[str]] = []
+    copies: list[Copy] = []
