@@ -1975,7 +1975,7 @@ class Executor:
             if member.backend is not None
             for model in member.backend.models.values()
         }
-        return sum(m.resident for m in memory.stats(drain=False).models if m.name in names)
+        return sum(m.resident for m in memory.stats().models if m.name in names)
 
     @staticmethod
     def _memory(request: RequestStats | None) -> dict[str, Any] | None:
@@ -2159,7 +2159,7 @@ class Executor:
     def _committed(self) -> int:
         """The weight bytes this process holds on its device; 0 before its memory opens."""
         memory = self.host.memory
-        return sum(m.resident for m in memory.stats(drain=False).models) if memory else 0
+        return sum(m.resident for m in memory.stats().models) if memory else 0
 
     def _prepare_first(self, command: Load) -> dict[str, Any]:
         """Construct and fill one construction (or one model of a many-model one)."""
