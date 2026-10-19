@@ -19,7 +19,7 @@ from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from types import ModuleType
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
 from tensorfs.varena.torch import (
     Cache,
@@ -570,7 +570,8 @@ class _Routes:
         path, buffers = name.removesuffix(".weight"), leaf.BUFFERS
         made = {f"{path}.{buffers.get(r, r)}": t for r, t in parts.items() if r not in derived}
         if derived:
-            fresh = self.providers[key].leaf(torch, parts, replaced, leaf.out_dtype)
+            provider = cast(LeafProvider, self.providers[key])
+            fresh = provider.leaf(torch, parts, replaced, leaf.out_dtype)
             for role in derived:
                 made[f"{path}.{buffers.get(role, role)}"] = fresh._buffers[buffers.get(role, role)]
         return made

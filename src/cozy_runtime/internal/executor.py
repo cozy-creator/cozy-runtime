@@ -61,7 +61,7 @@ import traceback
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import msgspec
 from msgspec import UNSET, UnsetType
@@ -558,6 +558,7 @@ def _reply_step(step: Any) -> ReplyStep:
     """A `tensorfs.varena.torch.Step` as the reply carries it."""
     return ReplyStep(
         model=step.model,
+        gpu=step.gpu,
         step=step.step,
         home=step.home,
         resident=step.resident,
@@ -2005,7 +2006,7 @@ class Executor:
             retries=request.retries,
             leftover_by_gpu=list(request.leftover),
         )
-        return msgspec.to_builtins(memory)
+        return cast("dict[str, Any]", msgspec.to_builtins(memory))
 
     def _members(self) -> list[Executor]:
         """Every loaded model's generation in this process."""
@@ -4366,7 +4367,7 @@ class Executor:
         memory = self.host.memory
         if memory is None:
             return contextlib.nullcontext()
-        return memory.request(request_id)
+        return cast("contextlib.AbstractContextManager[Any]", memory.request(request_id))
 
     def _quiescent(self) -> bool:
         """No author computation may still mutate GPU or output state when a terminal is

@@ -24,7 +24,7 @@ from cozy_runtime.author._split import install as install_split  # noqa: E402
 from cozy_runtime.internal import attention_ulysses  # noqa: E402
 
 
-class Card(TorchDispatchMode):
+class Card(TorchDispatchMode):  # type: ignore[misc]
     def __init__(self, limit: int) -> None:
         super().__init__()
         self.limit, self.refused = limit, 0
