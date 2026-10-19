@@ -230,7 +230,7 @@ LOAD_ATTENTION_PIN = "attention.load_pin/1"
 
 class Load(Command, frozen=True, kw_only=True, tag="load"):
     """Ask Runtime to construct models and register their weights with its memory, read through
-    TensorD's grants. The command names one model (`binding`) or several (`models`)."""
+    TensorFS. The command names one model (`binding`) or several (`models`)."""
 
     construction: str
     tensorfs: TensorFSOptions | None = None
@@ -305,7 +305,7 @@ class Invoke(_Attempt, frozen=True, kw_only=True, tag="invoke"):
     construction: str = ""
     attention_kernel: str = ""
     bits: int = 0  # as `PrepareRequest.bits`
-    #: Each `Weights[M]` parameter's checkpoint, read through the owner's source channel.
+    #: Each `Weights[M]` parameter's checkpoint, opened directly through TensorFS.
     sources: dict[str, _MANIFEST] = {}
     #: The weights outputs this attempt may write, and each one's granted new bytes.
     weights: dict[str, int] = {}

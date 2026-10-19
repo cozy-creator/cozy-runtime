@@ -1934,7 +1934,7 @@ class Executor:
     def load(self, command: Load) -> dict[str, Any]:
         """Construct and fill ONE construction under its key; a loaded key answers again.
 
-        TensorD names the key and supplies model-source access and memory budgets. Runtime
+        TensorD names the key and supplies endpoint options and memory budgets. Runtime
         constructs the model and registers weight regions with its local TensorFS plane;
         the first stage requests their GPU residency. A load refused before
         it touched the process leaves the other constructions serving; one that commanded
@@ -2350,8 +2350,8 @@ class Executor:
             self._discover_provisioned(binding)
         stage("package_import")
 
-        # The manifest identifies stored weights and metadata. TensorD supplies the header
-        # and asset bytes; Runtime calls TensorFS locally to parse them and plan reads.
+        # The header ref identifies stored weights and metadata. Runtime opens it through
+        # TensorFS in the shared store, then plans reads from its components.
         # The component SET, in the contract's own declared order. A single-component
         # binding is the same code with a one-element set: cr-008b did not add a second
         # path, it widened the one that existed. `snapshots` names ONE snapshot per
