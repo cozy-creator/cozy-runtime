@@ -16,8 +16,8 @@ Each arm below refuses on the commit before cr-060's corrective. What the arms c
 * `test_a_component_is_still_itself` — the same proxy made a real component INVISIBLE to
   `isinstance` and to the runtime's own `census`, which is a silent wrongness rather than
   a loud one.
-* `test_a_declared_scope_still_leases_and_still_fences` — what was KEPT: the residency
-  lease that admits before the method body runs, and the request-state-escape fence.
+* `test_a_declared_scope_still_fences` — what was KEPT: the request-state-escape fence. A
+  scope carries no memory meaning (varena sees each forward itself).
 * `test_a_job_model_is_a_plain_manifest_record` — the derive-only Model is a record now,
   not an instance whose every attribute read ran an interception.
 * `test_a_method_may_not_declare_a_runtime_decision` and
@@ -116,32 +116,14 @@ class Denoiser(Model[Pipeline]):
         return str(component())
 
 
-class Lease:
-    """A `Residency` that RECORDS. The lease is the real one — `_ComponentScope` calls it
-    before the method body runs — and recording it is how the arm reads the ordering."""
-
-    def __init__(self) -> None:
-        self.admitted: list[tuple[str, tuple[str, ...]]] = []
-        self.released: list[tuple[str, tuple[str, ...]]] = []
-
-    def admit(self, method: str, components: tuple[str, ...]) -> None:
-        self.admitted.append((method, components))
-
-    def release(self, method: str, components: tuple[str, ...]) -> None:
-        self.released.append((method, components))
-
-
 def _ctx() -> Context:
     return Context(request_id="cr-060", deadline=time.monotonic() + 60.0)
 
 
-def _generation(residency: Lease | None = None) -> Denoiser:
+def _generation() -> Denoiser:
     registry = ModelRegistry(release="cr-060-arm")
     artifact = Artifact(snapshot=MANIFEST, tensor_schema={}, config=Config({}))
-    model = registry.acquire("serve.models.model", Denoiser, artifact)
-    if residency is not None:
-        object.__setattr__(model, "_cozy_residency", residency)
-    return model
+    return registry.acquire("serve.models.model", Denoiser, artifact)
 
 
 def test_a_component_survives_generic_introspection() -> None:
@@ -173,14 +155,10 @@ def test_a_component_is_still_itself() -> None:
     assert set(model._cozy_schedulers) == {"scheduler"}
 
 
-def test_a_declared_scope_still_leases_and_still_fences() -> None:
-    """What cr-060 KEEPS: admission before the body, release after, and no state escape."""
-    lease = Lease()
-    model = _generation(lease)
-
+def test_a_declared_scope_still_fences() -> None:
+    """What cr-060 KEEPS: no request state escapes into the generation."""
+    model = _generation()
     assert model.denoise() == "denoised"
-    assert lease.admitted == [("denoise", ("transformer",))]
-    assert lease.released == [("denoise", ("transformer",))]
 
     view = model.for_request(_ctx())
     with pytest.raises(CapabilityError) as escape:

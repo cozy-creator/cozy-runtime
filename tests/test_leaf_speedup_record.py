@@ -2,8 +2,9 @@
 document (cr-135).
 
 The input is the recorded real probe `tests/observations/probe-cuda-sm89.json`. It was
-written by runtime 0.0.36 under that build's spec digests, so `rekeyed()` moves its
-observations onto the digests this build reviews; the card's measurements are untouched.
+written by runtime 0.0.36 under that build's spec digests, so `rekeyed()` moves its rowwise
+observations onto the scheme this build keys on; the card's measurements are untouched.
+`sm86()` is the release gate's sm86 table of runtime 0.28, rekeyed the same way.
 """
 
 from __future__ import annotations
@@ -14,22 +15,16 @@ from pathlib import Path
 import msgspec
 
 from cozy_runtime.internal import probe, qualification
-from cozy_runtime.internal.encoding import (
-    SPEC_ROWWISE,
-    SPEC_ROWWISE_KEEPDIM,
-    implementation_digest,
-    launch_providers,
-)
+from cozy_runtime.internal.encoding import implementation_digest, launch_providers
 from cozy_runtime.internal.probe import QualificationResult
 
-OBSERVATION = Path(__file__).resolve().parent / "observations" / "probe-cuda-sm89.json"
+OBSERVATIONS = Path(__file__).resolve().parent / "observations"
+OBSERVATION = OBSERVATIONS / "probe-cuda-sm89.json"
 
-#: The two `fp8-rowwise/1` spec digests runtime 0.0.36 reviewed, and what this build calls them.
+#: The two `fp8-rowwise/1` spec digests runtime 0.0.36 reviewed: both `fp8-rowwise` here.
 RECORDED_SPECS = {
-    "sha256:8c86b26daec5bcd287401d9873b70aa3594855f97ac4d01cf75cc2bafd5d50b5": SPEC_ROWWISE,
-    "sha256:91ddc2a73ba2778b344afc5e78b4addee9174a015cfff02f17cfbb629ad5ef78": (
-        SPEC_ROWWISE_KEEPDIM
-    ),
+    "sha256:8c86b26daec5bcd287401d9873b70aa3594855f97ac4d01cf75cc2bafd5d50b5": "fp8.rowwise",
+    "sha256:91ddc2a73ba2778b344afc5e78b4addee9174a015cfff02f17cfbb629ad5ef78": "fp8.rowwise",
 }
 
 LEAF = "cozy.fp8-rowwise.native-leaf/1"
@@ -42,19 +37,34 @@ def recorded() -> QualificationResult:
 def rekeyed() -> QualificationResult:
     """The recorded rowwise observations on this build's digests, measurements verbatim."""
     result = recorded()
-    by_name = {provider.name: provider for provider in launch_providers()[SPEC_ROWWISE]}
+    by_name = {provider.name: provider for provider in launch_providers()["fp8.rowwise"]}
     return msgspec.structs.replace(
         result,
         observations=[
             msgspec.structs.replace(
                 o,
-                encoding_spec_id=RECORDED_SPECS[o.encoding_spec_id],
+                scheme=RECORDED_SPECS[o.scheme],
                 implementation_digest=implementation_digest(by_name[o.implementation]),
             )
             for o in result.observations
-            if o.encoding_spec_id in RECORDED_SPECS and o.implementation in by_name
+            if o.scheme in RECORDED_SPECS and o.implementation in by_name
         ],
     )
+
+
+def sm86() -> QualificationResult:
+    """The sm86 table as `qualification.qualified` serves it: settled cells evidenced anew."""
+    table = msgspec.convert(
+        json.loads((OBSERVATIONS / "qualified-cuda-sm86.json").read_bytes()), QualificationResult
+    )
+    name = qualification.table_name(table.device, table.runtime)
+    measured = {o.scheme for o in table.observations}
+    providers = {k: v for k, v in launch_providers().items() if k in measured}
+    covered = qualification._covering(
+        table, name, providers, table.device, qualification.TABLE_DTYPES
+    )
+    assert covered is not None
+    return covered
 
 
 # ------------------------------------------------------------------------- the record

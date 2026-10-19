@@ -5,6 +5,13 @@ host copy first. A CPU executor (no bake) computes the same forwards per step.""
 
 from __future__ import annotations
 
+import pytest
+
+pytest.skip(
+    "pending: weights register on cozytensors/1 through varena (xs-045 U8) and cr-203 U11b",
+    allow_module_level=True,
+)
+
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any

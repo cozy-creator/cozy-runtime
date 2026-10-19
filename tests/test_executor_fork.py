@@ -180,7 +180,7 @@ def test_a_forked_child_is_a_sealed_executor_with_the_imports_done(
 ) -> None:
     process, channel, start = zygote
     hello = _call(channel, {"cmd": "hello"})
-    assert "fork/1" in hello["memory"]
+    assert "fork/1" in hello["capabilities"]
     assert _call(channel, {**start, "import_only": True})["ok"]
     listener = _listener(tmp_path / "a.sock")
     began = time.monotonic()
@@ -230,7 +230,7 @@ def test_model_load_requires_sources_and_leaves_weightless_execution_usable(
     """A real control peer cannot turn an installed full Store into model authority."""
     import tensorfs
 
-    store = tensorfs.Store.init(tmp_path / "store")
+    store = tensorfs.Store(tmp_path / "store")
     _process, channel, start = zygote
     assert _call(channel, start)["ok"]
     binding = {"model_class": "UnimportableModel", "store": str(store.root)}
