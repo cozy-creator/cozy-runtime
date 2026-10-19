@@ -12,9 +12,8 @@ Three properties are structural rather than reviewed:
   or hostile length prefix, before any body byte is read. Every wire byte in both directions
   is counted. Output bytes never cross this seam — they land in the attempt spool the worker
   brokered, which keeps the executor's writable storage to exactly that spool (§3.1).
-* **No credentials cross it.** `send` refuses a frame carrying a key from `SECRET_KEYS`, so a
-  grant token or worker JWT reaching the executor is a typed refusal at the boundary and not
-  a code-review rule. The executor holds no RecordOwner, storage or billing credential.
+* **Machine credentials stay outside it.** `send` refuses keys from `SECRET_KEYS`; Load and
+  Invoke may carry an ordinary, already supplied bearer at `tensorfs.token`.
 * **A torn frame is typed.** EOF or a peer reset exactly at a frame boundary is the
   disposable executor's normal end (`None`); EOF inside a header or body is
   `seam_eof_mid_frame`, never a silent short read.
@@ -88,18 +87,24 @@ class SeamError(Exception):
         self.detail = detail
 
 
-def _scan(value: Any, path: str = "") -> None:
+def _scan(value: Any, path: str = "", *, supplied_tensorfs: bool = False) -> None:
     if isinstance(value, dict):
         for key, item in value.items():
-            if key.lower() in SECRET_KEYS:
+            supplied = (
+                supplied_tensorfs
+                and path == "tensorfs."
+                and key == "token"
+                and isinstance(item, str)
+            )
+            if key.lower() in SECRET_KEYS and not supplied:
                 raise SeamError(
                     "credential_at_seam",
                     f"{path}{key!r}: credentials never cross the worker/executor seam",
                 )
-            _scan(item, f"{path}{key}.")
+            _scan(item, f"{path}{key}.", supplied_tensorfs=supplied_tensorfs)
     elif isinstance(value, (list, tuple)):
         for item in value:
-            _scan(item, path)
+            _scan(item, path, supplied_tensorfs=supplied_tensorfs)
 
 
 @dataclass(slots=True)
@@ -123,7 +128,7 @@ class Channel:
     sending: threading.RLock = field(default_factory=threading.RLock, repr=False, compare=False)
 
     def send(self, message: dict[str, Any]) -> None:
-        _scan(message)
+        _scan(message, supplied_tensorfs=message.get("cmd") in {"load", "invoke"})
         data = json.dumps(message, separators=(",", ":"), sort_keys=True).encode()
         if len(data) > MAX_FRAME:
             self.refusals.append("frame_too_large")
