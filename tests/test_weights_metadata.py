@@ -14,6 +14,8 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
 
+from cozy_runtime import weights_store
+from cozy_runtime.internal.executor_commands import Load
 from cozy_runtime.internal.seam import Channel
 from store_fixtures import checkpoint, home
 from test_executor_fork import _call, _environment, _listener
@@ -46,6 +48,14 @@ def _hub() -> dict[str, str]:
         "capability": f"{signed}.{signature}",
         "key": json.dumps(jwk),
     }
+
+
+def test_hub_and_command_diagnostics_redact_run_credentials() -> None:
+    grant = _hub()
+    hub = weights_store.Hub(**grant, access_token=grant["capability"])
+    shown = repr(Load(construction="model", request_id="run", hub=hub))
+    assert grant["key"] not in shown and grant["capability"] not in shown
+    assert "<redacted>" in shown and grant["endpoint"] in shown
 
 
 def test_metadata_helper_never_starts_a_package_or_trades_for_cached_metadata(

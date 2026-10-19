@@ -7,7 +7,7 @@ is its default.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Annotated, Literal, get_args
+from typing import Annotated, Literal, NotRequired, TypedDict, get_args
 
 import msgspec
 from msgspec import UNSET, UnsetType
@@ -42,6 +42,32 @@ class ResolveModels(Command, frozen=True, kw_only=True, tag="resolve_models"):
     store: str
     hub: Hub
     models: tuple[ResolveModel, ...]
+
+
+class ResolvedObject(TypedDict):
+    sha256: str
+    length: int
+
+
+class ResolvedModel(TypedDict):
+    slot: str
+    repo_id: str
+    revision: str
+    variant: str
+    header: ResolvedObject
+    tree: NotRequired[ResolvedObject]
+
+
+class ResolvedModels(TypedDict):
+    ok: Literal[True]
+    resolved: list[ResolvedModel]
+    access_token: NotRequired[str]
+
+
+class ResolveModelsFailure(TypedDict):
+    ok: Literal[False]
+    code: str
+    detail: str
 
 
 class Shutdown(Command, frozen=True, kw_only=True, tag="shutdown"):

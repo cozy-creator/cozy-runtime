@@ -195,7 +195,10 @@ from cozy_runtime.internal.executor_commands import (
     Probe,
     Reclaim,
     Release,
+    ResolvedModel,
+    ResolvedModels,
     ResolveModels,
+    ResolveModelsFailure,
     Revoke,
     Share,
     Shutdown,
@@ -923,7 +926,7 @@ class Executor:
             case Hello():
                 return self.hello()
             case ResolveModels():
-                return self.resolve_models(command)
+                return dict(self.resolve_models(command))
             case Join():
                 return self.join(command)
             case Attention():
@@ -964,46 +967,51 @@ class Executor:
             case Shutdown():
                 raise AssertionError("shutdown ends the command loop")
 
-    def resolve_models(self, command: ResolveModels) -> dict[str, Any]:
+    def resolve_models(self, command: ResolveModels) -> ResolvedModels | ResolveModelsFailure:
         """A request-owned helper lands metadata only, before package imports or device start."""
         sealed = Path(
             _SEALED.get(child_env.TENSORFS_HOME) or weights_store.DEFAULT_HOME
         ).expanduser()
         if Path(command.store).expanduser().resolve() != sealed.resolve():
-            return self._refusal(
-                "store_root_changed", "metadata helper store differs from its seal"
-            )
+            return {
+                "ok": False,
+                "code": "store_root_changed",
+                "detail": "metadata helper store differs from its seal",
+            }
         if self.started or self.imported or self.rank > 0 or "torch" in sys.modules:
-            return self._refusal(
-                "metadata_helper_started", "metadata resolution needs a fresh helper"
-            )
+            return {
+                "ok": False,
+                "code": "metadata_helper_started",
+                "detail": "metadata resolution needs a fresh helper",
+            }
         try:
             access = weights_store.Access(command.hub)
             store = self._store()
-            resolved = []
+            resolved: list[ResolvedModel] = []
             for model in command.models:
                 ck = tensorfs.open(
                     model.repo_id, revision=model.revision, variant=model.variant,
                     cache_dir=store.root, endpoint=access.hub.endpoint,
                     token=access.token, ca_der=access.ca_der,
                 )  # fmt: skip
-                assert ck.header_ref is not None
-                header = {"sha256": ck.header_ref[0], "length": ck.header_ref[1]}
-                row = {
+                header = ck.header_ref
+                assert header is not None
+                row: ResolvedModel = {
                     "slot": model.slot, "repo_id": model.repo_id,
                     "revision": ck.revision or model.revision,
-                    "variant": ck.variant or model.variant, "header": header,
+                    "variant": ck.variant or model.variant,
+                    "header": {"sha256": header[0], "length": header[1]},
                 }  # fmt: skip
                 if ck.tree_ref is not None:
                     row["tree"] = {"sha256": ck.tree_ref[0], "length": ck.tree_ref[1]}
                 resolved.append(row)
-            reply: dict[str, Any] = {"ok": True, "resolved": resolved}
+            reply: ResolvedModels = {"ok": True, "resolved": resolved}
             token = access.token.issued_token()
             if token is not None:
                 reply["access_token"] = token
             return reply
         except tensorfs.Error as exc:
-            return self._refusal(exc.code, exc.detail)
+            return {"ok": False, "code": exc.code, "detail": exc.detail}
 
     def hello(self) -> dict[str, Any]:
         group, uid, euid = _identity()

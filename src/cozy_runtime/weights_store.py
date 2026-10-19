@@ -54,6 +54,12 @@ class Hub(msgspec.Struct, frozen=True, kw_only=True):
     #: A token already traded by this run's metadata helper, bound to the same key.
     access_token: str | None = None
 
+    def __repr__(self) -> str:
+        return (
+            f"Hub(endpoint={self.endpoint!r}, capability=<redacted>, "
+            "key=<redacted>, access_token=<redacted>)"
+        )
+
 
 class Access:
     """One request's lazy TensorFS provider, shared by its metadata, loads and uploads."""
