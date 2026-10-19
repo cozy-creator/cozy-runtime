@@ -1,6 +1,6 @@
 """A missing optional build tool never fails a run: the build that needs it never starts, its
 fallback serves, and every run carries one warning per missing tool, with cozy's text
-(`cozy_platform::tools`), a stable code and the tool. Real Diffusers attention sites, the real
+(`platform::tools`), a stable code and the tool. Real Diffusers attention sites, the real
 SageAttention recipe, store and executor; PATH lacks the tools."""
 
 from __future__ import annotations

@@ -32,7 +32,7 @@ except ImportError as broken:
     NO_FA3 = f"this cozy-runtime wheel's FlashAttention-3 does not load ({broken})"
 
 #: The CUDA toolkit the kernels are built with, and the oldest driver that runs it, per
-#: `sys.platform`. cozy-platform's `gpu` holds the same floor for TensorD's startup check.
+#: `sys.platform`. cozy's `platform::gpu` holds the same floor for TensorD's startup check.
 CUDA = "13.0"
 DRIVER_FLOOR = {"linux": "580.65.06", "win32": "580.88"}
 
