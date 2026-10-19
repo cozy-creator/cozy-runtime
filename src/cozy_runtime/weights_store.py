@@ -19,6 +19,7 @@ from collections.abc import Buffer, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import IO
 
+import msgspec
 import tensorfs
 from tensorfs import Checkpoint as Checkpoint
 from tensorfs import Info as Info
@@ -37,6 +38,17 @@ DERIVED = "local/derived"
 type Data = Buffer | IO[bytes]
 #: An encoded tensor's part to write: role, TensorFS dtype, shape, bytes.
 type PartData = tuple[str, str, Sequence[int], Data]
+
+
+class Hub(msgspec.Struct, frozen=True, kw_only=True):
+    """Only this request's Hub capability and private P-256 key, sent by TensorD."""
+
+    endpoint: str
+    capability: str
+    key: str
+    token_endpoint: str
+    #: An optional base64 DER root, for the same Hub's private TLS authority.
+    ca_der: str | None = None
 
 
 def read_into(

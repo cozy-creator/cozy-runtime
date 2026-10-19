@@ -15,6 +15,7 @@ from msgspec import UNSET, UnsetType
 from cozy_runtime.author._assets import FileState, GrantedInput, InputMetadata
 from cozy_runtime.author._services import MAX_OUTPUT_BYTES
 from cozy_runtime.internal.canonical import Json
+from cozy_runtime.weights_store import Hub
 
 _MANIFEST = Annotated[str, msgspec.Meta(pattern="^sha256:[0-9a-f]{64}$")]
 
@@ -81,6 +82,7 @@ class Budget(Command, frozen=True, kw_only=True, tag="budget"):
     #: Per GPU of a group, its own process cap (index = rank, `RANK_CELLS`); a rank past the
     #: end takes `cap_bytes`.
     rank_caps: tuple[int, ...] = ()
+
     #: Physical free bytes the owner keeps on the GPU; unset leaves it
     floor_bytes: int | UnsetType = UNSET
 
@@ -309,6 +311,8 @@ class Load(Command, frozen=True, kw_only=True, tag="load"):
     cap_bytes: int | UnsetType = UNSET
     #: Per GPU of a group, its own cap for the load (index = rank, `RANK_CELLS`)
     rank_caps: tuple[int, ...] = ()
+    #: Only this request's Hub authority; no trade is made for a warm load.
+    hub: Hub | None = None
 
     def single(self) -> ModelLoad:
         return ModelLoad(
@@ -392,6 +396,9 @@ class Invoke(_Attempt, frozen=True, kw_only=True, tag="invoke"):
     sources: dict[str, _MANIFEST] = {}
     #: The weights outputs this attempt may write, and each one's granted new bytes.
     weights: dict[str, int] = {}
+    #: Only this request's weights-output destination and Hub authority.
+    destination: str = ""
+    hub: Hub | None = None
     #: Who asked, and the machine's identity of the code it runs (empty: it memoizes nothing):
     #: what a weights output's replay key starts from
     actor: str = ""

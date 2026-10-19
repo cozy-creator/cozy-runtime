@@ -5,6 +5,9 @@ same work. Nothing about weights crosses the seam to TensorD but that item."""
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -15,7 +18,7 @@ from cozy_runtime.author._executor_requests import Answer, CheckpointItem, Reque
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.seam import RESULT_DOCUMENT
 from session import session
-from store_fixtures import checkpoint, home
+from store_fixtures import checkpoint, context, home
 
 PACKAGE = """
 from typing import Any
@@ -105,3 +108,69 @@ def test_a_granted_output_is_written_into_the_store_shown_and_replayed(
     assert out.id == results[1]["checkpoint"]
     unet = out.components["unet"]
     assert set(unet.tensors) == {"w", "extra"} and unet.config == {"in": 2}
+
+
+def test_concurrent_requests_keep_their_output_grants(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = home(tmp_path / "tensorfs", monkeypatch)
+    source = checkpoint(store, {"unet": {"w": np.ones(2, np.float32)}})
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "package.toml").write_text('[application]\nobject="storage_isolation_fn:app"\n')
+    (project / "storage_isolation_fn.py").write_text(PACKAGE)
+    shown: list[CheckpointItem] = []
+
+    def machine(request: Request) -> Answer:
+        assert isinstance(request, CheckpointItem)
+        shown.append(request)
+        return Answer(ok=True)
+
+    with session(tmp_path, discover(project)) as host:
+        host.handler = machine
+
+        def run(actor: str, bound: int) -> dict[str, str]:
+            spool = tmp_path / actor
+            reply = host.run(
+                "compute", {"use_output": True}, spool, sources={"source": source},
+                weights={"model": bound}, actor=actor, operation="same-operation",
+            )  # fmt: skip
+            assert reply["outcome"]["terminal"] == "succeeded", reply
+            return json.loads((spool / RESULT_DOCUMENT).read_bytes())
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            alice = pool.submit(run, "alice", 4096)
+            bob = pool.submit(run, "bob", 4)
+            assert alice.result()["code"] == "granted"
+            assert bob.result()["code"] == "weights_output_bound"
+    assert len(shown) == 1
+    assert set(store.checkpoint(shown[0].revision).components["unet"].tensors) == {"w", "extra"}
+
+
+def test_a_finished_derivation_replays_in_another_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = home(tmp_path / "tensorfs", monkeypatch)
+    ref = checkpoint(store, {"unet": {"w": np.ones(2, np.float32)}})
+    base = store.checkpoint(ref)
+    ctx = context(store)
+    with ctx.output("model", weights_store.Derivation(base)) as out:
+        out.put("unet", "extra", "F32", [2], bytes(8))
+        first = ctx.adopt_model(out)
+    script = """
+import sys
+import tensorfs
+from cozy_runtime.weights_store import Derivation, Outputs
+store = tensorfs.Store(sys.argv[1])
+outputs = Outputs(store, request_id='test', actor='tester', code='test',
+                  bounds={'model': 64 << 20}, show=lambda *args: None)
+with outputs.open('model', Derivation(store.checkpoint(sys.argv[2]))) as out:
+    assert out.done is not None, 'another process finds the committed replay'
+    assert out.written == 0 and out.has('unet', 'extra')
+    print(outputs.adopt(out).checkpoint)
+"""
+    replay = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path / "tensorfs"), ref],
+        capture_output=True, text=True, check=True,
+    )  # fmt: skip
+    assert replay.stdout.strip() == first.checkpoint
