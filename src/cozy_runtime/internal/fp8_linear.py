@@ -1,4 +1,4 @@
-"""The `fp8-rowwise/1` encoded GEMM: one call of the Runtime's 8-bit op library.
+"""The `fp8.rowwise` encoded GEMM: one call of the Runtime's 8-bit op library.
 
 The op is the Runtime wheel's prebuilt one (`prebuilt`), serving once it verifies on the card
 (`int8_linear.native`). One kernel quantizes each activation row to E4M3 against its own
@@ -112,7 +112,7 @@ def linear(
     bias: Tensor | None,
     out_dtype: object,
 ) -> Tensor:
-    """`x @ W.T + bias` for one `fp8-rowwise/1` weight: `data` E4M3 `[N, K]`, `scale` f32."""
+    """`x @ W.T + bias` for one `fp8.rowwise` weight: `data` E4M3 `[N, K]`, `scale` f32."""
     op = _op(torch, x, x.dtype, out_dtype)
     if op is not None:
         try:

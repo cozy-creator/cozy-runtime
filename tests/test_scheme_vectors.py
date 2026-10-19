@@ -4,15 +4,17 @@ domain oracle in each output dtype."""
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from cozy_runtime.author._loader import TENSORFS_DTYPES
 from cozy_runtime.internal.encoding import Encoded, RolePart, launch_providers, params_of
-from cozy_runtime.internal.encoding.formats import MicroScaledDequant
+from cozy_runtime.internal.encoding.formats import MicroScaledDequant, part_rule
 from cozy_runtime.internal.encoding.leaves import quantize_activation_mx
-from cozy_runtime.internal.encoding.formats import part_rule
 from cozy_runtime.internal.probe import (
     DECODE_SUITES,
+    PROBE_PARAMS,
     VectorCase,
     decode_case,
     same_bits,
@@ -75,7 +77,8 @@ def test_every_decode_refusal_refuses(case: VectorCase) -> None:
 
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16", "float16"])
 def test_every_decoder_passes_its_own_domain_oracle(dtype: str) -> None:
-    for provider in DECODERS:
+    for listed in DECODERS:
+        provider = replace(listed, params=params_of(PROBE_PARAMS.get(listed.encoding, {})))  # type: ignore[type-var]
         sweep = DECODE_SUITES[provider.suite](
             torch, provider, torch.device("cpu"), getattr(torch, dtype)
         )
@@ -88,7 +91,7 @@ def test_the_mx_activation_quantizer_saturates_nothing_and_decodes_back() -> Non
     assert payload.dtype == torch.float8_e4m3fn and scales.shape == (7, 256 // 32)
     assert float(payload.float().abs().max()) <= 448.0 and not payload.float().isnan().any()
     back = torch.empty(7, 256, dtype=torch.float32)
-    MicroScaledDequant(params=params_of({"block": 32})).decode(
+    MicroScaledDequant(params=params_of({"block_size": 32, "scale_layout": "row_major"})).decode(
         torch, {"weight": payload, "scale": scales.view(torch.float8_e8m0fnu)}, back
     )
     assert float(((back - x).abs() / x.abs().clamp(min=1e-30)).max()) <= 2.0**-3

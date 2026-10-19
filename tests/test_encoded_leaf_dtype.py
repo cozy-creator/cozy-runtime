@@ -56,9 +56,9 @@ class EncodedLeafDtypeTest(unittest.TestCase):
         scale = torch.frombuffer(bytearray(encoded.companions[0].raw), dtype=torch.float32)
         original = torch.nn.Linear(256, 16, dtype=torch.float16)
         original.weight.data.copy_(weight)
-        leaf = Int8ConvRotNativeLeaf(params=params_of({"block": 256, "rotation": "hadamard"})).leaf(
-            torch, {"weight": data, "scale": scale}, original, torch.float16
-        )
+        leaf = Int8ConvRotNativeLeaf(
+            params=params_of({"rotation": "hadamard", "rotation_size": 256})
+        ).leaf(torch, {"weight": data, "scale": scale}, original, torch.float16)
         x = torch.randn(4, 256, generator=generator)
         expected = original.to(torch.float32)(x)
         with torch.autocast("cpu", dtype=torch.bfloat16):

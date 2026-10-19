@@ -6,7 +6,7 @@ This does not exercise the weight plane's device binding.
 import pytest
 
 pytest.skip(
-    "pending: weights register on cozytensors/2 through varena (xs-045 U8) and cr-203 U11b",
+    "pending: weights register on cozytensors/1 through varena (xs-045 U8) and cr-203 U11b",
     allow_module_level=True,
 )
 

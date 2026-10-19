@@ -300,7 +300,7 @@ def _int8(site: Any) -> None:
             "scale": torch.ones(linear.out_features),
         }
         leaf = _native_leaf_class(torch)(
-            None, roles, None, torch.bfloat16, INT8_CONVROT, "int8-convrot",
+            None, roles, None, torch.bfloat16, INT8_CONVROT, "int8.convrot",
             linear.in_features, linear.out_features,
         )  # fmt: skip
         setattr(site, name, leaf)

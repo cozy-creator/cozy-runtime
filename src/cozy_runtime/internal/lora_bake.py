@@ -2,7 +2,7 @@
 
 A bake is decode -> add `alpha * up @ down` -> round back to the stored representation, one
 row chunk at a time, so nothing larger than a chunk exists twice. Plain floats round once to
-their dtype. `fp8-rowwise/1` re-encodes E4M3, `int8-convrot256/1` its int8 grid in the
+their dtype. `fp8.rowwise` re-encodes E4M3, `int8-convrot256/1` its int8 grid in the
 rotated basis; the rounding is chosen because a delta below half a grid step vanishes
 under nearest rounding. `Stats` is what a quality gate reads: how much of the delta survived
 and how much rounding error the bake added.
@@ -273,7 +273,7 @@ def bake_rowwise(
     generator: Generator | None = None,
     stats: Stats | None = None,
 ) -> None:
-    """Bake into `fp8-rowwise/1`: `data` `[out, in]` E4M3, `scale` one f32 per output row.
+    """Bake into `fp8.rowwise`: `data` `[out, in]` E4M3, `scale` one f32 per output row.
 
     The stored base sits exactly on its row's grid, so with `keep` (or a `refit` that barely
     moves the scale) nearest rounding returns every element whose delta is under half a
@@ -360,13 +360,13 @@ def _finish(torch: ModuleType, tensor: Tensor, stats: Stats | None, began: float
 
 def bakeable(scheme: str, params: Mapping[str, object], roles: Mapping[str, str]) -> bool:
     """Whether a stored weight (its scheme, params and role -> dtype) takes `bake`: a plain
-    float, a per-row `fp8-rowwise` E4M3 or an `int8-convrot` weight. `int8-rowwise` stores the
-    same parts as `int8-convrot` and is not rotated, so the scheme decides, not the parts."""
+    float, a per-row `fp8.rowwise` E4M3 or an `int8.convrot` weight. `int8.rowwise` stores the
+    same parts as `int8.convrot` and is not rotated, so the scheme decides, not the parts."""
     if scheme == "plain":
         return dict(roles) in ({"value": "bf16"}, {"value": "f16"}, {"value": "f32"})
-    if scheme == "fp8-rowwise":
+    if scheme == "fp8.rowwise":
         return params.get("axis") == 0 and dict(roles) == {"weight": "f8_e4m3fn", "scale": "f32"}
-    return scheme == "int8-convrot" and dict(roles) == {"weight": "i8", "scale": "f32"}
+    return scheme == "int8.convrot" and dict(roles) == {"weight": "i8", "scale": "f32"}
 
 
 def bake(
@@ -378,7 +378,7 @@ def bake(
     seed: int,
     stats: Stats | None = None,
 ) -> None:
-    """Bake `up @ down` into one stored weight by its roles: plain floats, `fp8-rowwise/1`
+    """Bake `up @ down` into one stored weight by its roles: plain floats, `fp8.rowwise`
     (E4M3 data, f32 row scale) or `int8-convrot256/1` (int8 data, f32 row scale). bf16, E4M3
     and int8 round stochastically, scales kept: nearest returns a small delta to where it was,
     and loses most of a LoRA's effect on fp8 (MEASURE.md, TensorD #26). `seed` names the
@@ -435,7 +435,7 @@ def accumulate(
 # ----------------------------------------------------------------------------- fused bake
 
 #: Stored forms the fused kernel bakes (`bakeable`): bf16 (stochastic), f16 and f32 (nearest),
-#: `fp8-rowwise/1` (E4M3, stochastic, scale kept), `int8-convrot256/1` (int8 of the rotated
+#: `fp8.rowwise` (E4M3, stochastic, scale kept), `int8-convrot256/1` (int8 of the rotated
 #: rows, stochastic, scale kept; `fused` rotates `down`).
 BF16, F16, F32, ROWWISE, INT8 = range(5)
 #: A seed is 31 bits: one Triton signature for every weight.
