@@ -44,7 +44,7 @@ class Card(TorchDispatchMode):
 @pytest.fixture
 def memory() -> Iterator[Any]:
     memo = cuts.Memo()
-    cuts.serve(memo, cuts._NoRoom())
+    cuts.serve(memo, cuts._NoRungs())
     attention_ulysses.install(cuts.attend)
     install_split(cuts.split)
     yield memo
