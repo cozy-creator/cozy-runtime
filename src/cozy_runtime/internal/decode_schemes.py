@@ -28,7 +28,7 @@ from cozy_runtime.internal.decode_cores import (
 )
 
 if TYPE_CHECKING:
-    from torch import Tensor
+    from torch import Generator, Tensor, device as Device, dtype as Dtype
 
 try:
     import triton
@@ -228,25 +228,27 @@ def run(
     out.copy_(stored.transpose(-1, -2))
 
 
-def _random(torch: ModuleType, dtype: str, extents: tuple[int, ...], generator: Tensor) -> Tensor:
+def _random(
+    torch: ModuleType, dtype: str, extents: tuple[int, ...], generator: Generator
+) -> Tensor:
     """Random elements of `dtype`: every pattern of an integer part; finite, modest values of a
     float one (the probe scores a GEMM over the decoded weight, which a NaN or infinity spoils)."""
     n = math.prod(extents)
     if dtype in ("f32", "bf16", "f16"):
-        values = torch.randn(n, generator=generator) * 0.05
+        values: Tensor = torch.randn(n, generator=generator) * 0.05
         return values.to(getattr(torch, TORCH[dtype])).reshape(extents)
     if dtype == "f8_e8m0":  # 2^-8 .. 2^1
-        codes = torch.randint(119, 129, (n,), generator=generator, dtype=torch.int32)
+        codes: Tensor = torch.randint(119, 129, (n,), generator=generator, dtype=torch.int32)
         return codes.to(torch.uint8).view(torch.float8_e8m0fnu).reshape(extents)
     width = getattr(torch, TORCH[dtype]).itemsize
-    raw = torch.randint(0, 256, (n * width,), generator=generator, dtype=torch.int32)
+    raw: Tensor = torch.randint(0, 256, (n * width,), generator=generator, dtype=torch.int32)
     if dtype == "f8_e4m3fn":  # exponents up to 7: every value below 2, no NaN
         raw = raw & 0xBF
     return raw.to(torch.uint8).view(getattr(torch, TORCH[dtype])).reshape(extents)
 
 
 def sample(
-    torch: ModuleType, a: Adapter, shape: Sequence[int], generator: Tensor
+    torch: ModuleType, a: Adapter, shape: Sequence[int], generator: Generator
 ) -> dict[str, Tensor]:
     """Random stored parts of a tensor of `shape` at the row's probe params, then the row's `fix`
     for the parts whose values the decode checks or that hold floats in their bytes."""
@@ -273,24 +275,26 @@ def _f32(torch: ModuleType, t: Tensor) -> Tensor:
     255 NaN)."""
     if t.dtype == torch.float8_e8m0fnu:
         raw = t.view(torch.uint8).reshape(-1).to(torch.int32)
-        bits = torch.where(raw == 0, torch.full_like(raw, 1 << 22), raw << 23)
+        bits: Tensor = torch.where(raw == 0, torch.full_like(raw, 1 << 22), raw << 23)
         bits = torch.where(raw == 255, torch.full_like(bits, 0x7FC00000), bits)
         return bits.view(torch.float32)
     return t.reshape(-1).to(torch.float32)
 
 
-def _codes(torch: ModuleType, dtype: str, device: Tensor) -> Tensor:
+def _codes(torch: ModuleType, dtype: str, device: Device) -> Tensor:
     """Every code of an 8-bit float dtype, as f32: the table its bytes index."""
-    return (
+    codes: Tensor = (
         torch.arange(256, dtype=torch.uint8)
         .view(getattr(torch, dtype))
         .to(torch.float32)
         .to(device)
     )
+    return codes
 
 
-def _table(torch: ModuleType, values: Sequence[float], device: Tensor) -> Tensor:
-    return torch.tensor(values, dtype=torch.float32, device=device)
+def _table(torch: ModuleType, values: Sequence[float], device: Device) -> Tensor:
+    table: Tensor = torch.tensor(values, dtype=torch.float32, device=device)
+    return table
 
 
 def _u8(torch: ModuleType, t: Tensor) -> Tensor:
@@ -780,8 +784,8 @@ def _gguf_eager(name: str) -> Callable[[ModuleType, Tensor], Tensor]:
     order of operations."""
 
     def decode(torch: ModuleType, s: Tensor) -> Tensor:
-        f32 = torch.float32
-        i = s.to(torch.int32)
+        f32: Dtype = torch.float32
+        i: Tensor = s.to(torch.int32)
 
         def f16(at: int) -> Tensor:
             return s[:, at : at + 2].contiguous().view(torch.float16).to(f32)
@@ -791,19 +795,21 @@ def _gguf_eager(name: str) -> Callable[[ModuleType, Tensor], Tensor]:
 
         def nibbles(at: int, n: int) -> Tensor:
             qs = i[:, at : at + n]
-            return torch.cat((qs & 15, qs >> 4), dim=1)
+            joined: Tensor = torch.cat((qs & 15, qs >> 4), dim=1)
+            return joined
 
         def kvalue(q: Tensor) -> Tensor:
-            return torch.tensor(KVALUES, dtype=f32, device=s.device)[q]
+            table: Tensor = torch.tensor(KVALUES, dtype=f32, device=s.device)
+            return table[q]
 
         def pow2(x: Tensor) -> Tensor:
-            bits = torch.where(x >= -126, (x + 127) << 23, 1 << (x.clamp(-149, -127) + 149))
+            bits: Tensor = torch.where(x >= -126, (x + 127) << 23, 1 << (x.clamp(-149, -127) + 149))
             return bits.to(torch.int32).view(f32)
 
-        t = torch.arange(GGUF[name][0], device=s.device)
+        t: Tensor = torch.arange(GGUF[name][0], device=s.device)
         if name in ("q4_0", "q4_1", "q5_0", "q5_1"):
             at, base = {"q4_0": (2, 0), "q4_1": (4, 0), "q5_0": (6, 2), "q5_1": (8, 4)}[name]
-            q = nibbles(at, 16)
+            q: Tensor = nibbles(at, 16)
             if name in ("q5_0", "q5_1"):
                 q = q + 16 * ((u32(base)[:, :1] >> t) & 1).to(torch.int32)
             if name in ("q4_0", "q5_0"):
@@ -823,15 +829,15 @@ def _gguf_eager(name: str) -> Callable[[ModuleType, Tensor], Tensor]:
                 return dl * q.to(f32) - ml
             high = (i[:, 16 * half + lane] >> (t // 32)) & 1
             raw = i[:, 96 + b % 8]
-            lo = torch.where(b < 8, raw & 15, raw >> 4)
+            lo: Tensor = torch.where(b < 8, raw & 15, raw >> 4)
             sc = (lo | (((i[:, 104 + b % 4] >> (2 * (b // 4))) & 3) << 4)) - 32
             return (f16(108) * sc.to(f32)) * (q - 4 + 4 * high).to(f32)
         if name in ("q4_k", "q5_k"):
             a = t // 32
             ai = a % 4
             x, y, z = i[:, 4 + ai], i[:, 8 + ai], i[:, 12 + ai]
-            c = torch.where(a < 4, x & 63, (z & 15) | ((x >> 6) << 4))
-            e = torch.where(a < 4, y & 63, (z >> 4) | ((y >> 6) << 4))
+            c: Tensor = torch.where(a < 4, x & 63, (z & 15) | ((x >> 6) << 4))
+            e: Tensor = torch.where(a < 4, y & 63, (z >> 4) | ((y >> 6) << 4))
             byte = i[:, (16 if name == "q4_k" else 48) + 32 * (a // 2) + t % 32]
             q = torch.where(a % 2 == 0, byte & 15, byte >> 4)
             if name == "q5_k":
@@ -840,7 +846,7 @@ def _gguf_eager(name: str) -> Callable[[ModuleType, Tensor], Tensor]:
         if name == "q6_k":
             h, j, lane = t // 128, (t % 128) // 32, t % 32
             byte = i[:, 64 * h + 32 * (j % 2) + lane]
-            low = torch.where(j < 2, byte & 15, byte >> 4)
+            low: Tensor = torch.where(j < 2, byte & 15, byte >> 4)
             q = (low | (((i[:, 128 + 32 * h + lane] >> (2 * j)) & 3) << 4)) - 32
             sc = s[:, 192:208].contiguous().view(torch.int8).to(f32)[:, 8 * h + lane // 16 + 2 * j]
             return f16(208) * sc * q.to(f32)
@@ -849,14 +855,17 @@ def _gguf_eager(name: str) -> Callable[[ModuleType, Tensor], Tensor]:
         if name == "nvfp4":
             b = i[:, 0:4]
             e, m = (b >> 3) & 15, (b & 7).to(f32)
-            d = torch.where(e == 0, m * pow2(torch.full_like(e, -9)), (m + 8.0) * pow2(e - 10))
+            d: Tensor = torch.where(
+                e == 0, m * pow2(torch.full_like(e, -9)), (m + 8.0) * pow2(e - 10)
+            )
             d = torch.where(b == 0x7F, torch.zeros_like(d), d) * 0.5
             q = torch.cat([nibbles(4 + 8 * k, 8) for k in range(4)], dim=1)
             return kvalue(q) * d.repeat_interleave(16, dim=1)
         if name == "q1_0":
             bit = (i[:, 2 + t // 8] >> (t % 8)) & 1
             d = f16(0)
-            return torch.where(bit == 1, d, -d)
+            selected: Tensor = torch.where(bit == 1, d, -d)
+            return selected
         q = (i[:, 2 + t // 4] >> (2 * (t % 4))) & 3  # q2_0
         return (q - 1).to(f32) * f16(0)
 

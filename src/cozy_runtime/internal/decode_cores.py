@@ -25,7 +25,7 @@ from types import ModuleType
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from torch import Tensor
+    from torch import Tensor, device as Device
 
 try:
     import triton
@@ -302,21 +302,21 @@ def unpack(torch: ModuleType, words: Tensor, p: Packing, rows: int, cols: int) -
     """The view's codes, int64 [R, C], on the words' device: spec §6's bit packing, one lane per
     row of words. Also how a scheme reads its small packed parts (zeros)."""
     nw, along, n = p.stored(rows, cols)
-    raw = _words(torch, words, p.word).reshape(-1).to(torch.int64) & ((1 << p.word) - 1)
+    raw: Tensor = _words(torch, words, p.word).reshape(-1).to(torch.int64) & ((1 << p.word) - 1)
     if raw.numel() != nw * along:
         raise ValueError(f"{raw.numel()} words are not {nw}x{along}")
     lanes = raw.reshape(nw, along).t() if p.axis == 0 else raw.reshape(along, nw)
-    t = torch.arange(n, device=raw.device)
+    t: Tensor = torch.arange(n, device=raw.device)
     b, w = p.bits, p.word
     if p.fill == "dense":
         k, off = (t * b) // w, (t * b) % w
         spill = off + b > w
         lo = lanes[:, k] >> off
-        hi = torch.where(spill, lanes[:, (k + 1).clamp(max=nw - 1)] << (w - off), 0)
+        hi: Tensor = torch.where(spill, lanes[:, (k + 1).clamp(max=nw - 1)] << (w - off), 0)
         codes = (lo | hi) & ((1 << b) - 1)
     else:
         k, e = (t // p.per, t % p.per) if p.fill == "word" else (t % nw, t // nw)
-        slot = torch.tensor(p.slots(), device=raw.device)[e]
+        slot: Tensor = torch.tensor(p.slots(), device=raw.device)[e]
         codes = (lanes[:, k] >> (slot * b)) & ((1 << b) - 1)
     codes = codes - ((codes >> (b - 1)) << b) if p.signed else codes - p.offset
     stored = codes.t() if p.axis == 0 else codes
@@ -324,12 +324,13 @@ def unpack(torch: ModuleType, words: Tensor, p: Packing, rows: int, cols: int) -
 
 
 def _grid_index(
-    torch: ModuleType, g: Grid, rows: int, cols: int, g_idx: Tensor | None, device: Tensor
+    torch: ModuleType, g: Grid, rows: int, cols: int, g_idx: Tensor | None, device: Device
 ) -> Tensor:
-    i = torch.arange(rows, device=device).reshape(rows, 1)
-    j = torch.arange(cols, device=device).reshape(1, cols)
+    i: Tensor = torch.arange(rows, device=device).reshape(rows, 1)
+    j: Tensor = torch.arange(cols, device=device).reshape(1, cols)
     if g.kind == "tensor":
-        return torch.zeros(rows, cols, dtype=torch.int64, device=device)
+        zero: Tensor = torch.zeros(rows, cols, dtype=torch.int64, device=device)
+        return zero
     if g.kind == "row":
         return i.expand(rows, cols)
     if g.kind == "col":
