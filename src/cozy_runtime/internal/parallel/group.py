@@ -620,6 +620,12 @@ class RankGroup:
                     f"{follower.gpu} cannot be commanded: {exc}", code="group_broken"
                 ) from exc
 
+    def start(self, command: Mapping[str, object]) -> None:
+        """Hand every follower rank 0's Start. The ledger descriptors that follow TensorD's
+        Start are rank 0's; a follower takes its own at join (`form`), so the Start it gets
+        names none, or it would wait in `start` for descriptors nobody sends."""
+        self.broadcast({**command, "ledgers": 0})
+
     def collect(self, name: str) -> list[dict[str, Any]]:
         """One reply named `name` from every follower, in rank order.
 
