@@ -418,10 +418,10 @@ def _replay_code(command: Invoke, request: str) -> str:
     return f"{command.operation}\0{hashlib.sha256(canonical.write(asked)).hexdigest()}"
 
 
-def _open_checkpoint(store: weights_store.Store, ref: str) -> weights_store.Checkpoint:
+def _open_checkpoint(store: Path, ref: str) -> weights_store.Checkpoint:
     """The checkpoint a header ref names in the machine's store; one it lacks refuses."""
     with store_refusals(f"opening {ref[:23]}"):
-        return store.checkpoint(ref)
+        return tensorfs.open(ref, cache_dir=store, local_files_only=True)
 
 
 def _show_checkpoint(
@@ -813,7 +813,7 @@ class Executor:
         self.weights: Weights | None = None
         #: HOST ONLY: the machine's TensorFS store (`_store`) and the checkpoints its
         #: constructions read from it, by header ref
-        self.store: weights_store.Store | None = None
+        self.store: Path | None = None
         self.hub_access: dict[tuple[str, str], weights_store.Access] = {}
         self.hub_requests: dict[str, tuple[tuple[str, str], str]] = {}
         self.hub_access_lock = threading.Lock()
@@ -991,7 +991,7 @@ class Executor:
             for model in command.models:
                 ck = tensorfs.open(
                     model.repo_id, revision=model.revision, variant=model.variant or None,
-                    cache_dir=store.root, endpoint=access.hub.endpoint,
+                    cache_dir=store, endpoint=access.hub.endpoint,
                     token=access.token, ca_der=access.ca_der,
                 )  # fmt: skip
                 header = ck.header_ref
@@ -4449,13 +4449,13 @@ class Executor:
         flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)  # untranslated on Windows
         return [(sha, length, os.open(path[sha], flags)) for sha, length in objects]
 
-    def _store(self) -> weights_store.Store:
+    def _store(self) -> Path:
         """The machine's TensorFS store (`TENSORFS_HOME`), which TensorD shares."""
         host = self.host
         if host.store is None:
             root = _SEALED.get(child_env.TENSORFS_HOME) or weights_store.DEFAULT_HOME
             with store_refusals(f"opening the store at {root}"):
-                host.store = weights_store.Store(root)
+                host.store = Path(root).expanduser()
         return host.store
 
     @contextlib.contextmanager

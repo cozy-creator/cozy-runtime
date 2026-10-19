@@ -22,16 +22,16 @@ DTYPES = {"float16": "F16", "float32": "F32", "uint8": "U8", "uint16": "BF16", "
 type Shown = list[tuple[str, str, str, str]]
 
 
-def home(path: Path, monkeypatch: pytest.MonkeyPatch) -> tensorfs.Store:
+def home(path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """The store at `path`, which an executor this test drives opens as its machine's."""
     monkeypatch.setenv("TENSORFS_HOME", str(path))
     # These in-process executors receive the same root as a freshly sealed child.
     monkeypatch.setitem(executor._SEALED, "TENSORFS_HOME", str(path))
-    return tensorfs.Store(path)
+    return path
 
 
 def checkpoint(
-    store: tensorfs.Store,
+    store: Path,
     components: Mapping[str, Mapping[str, Any]],
     *,
     classes: Mapping[str, str] = {},
@@ -42,15 +42,20 @@ def checkpoint(
 ) -> str:
     """`components`' numpy arrays (a uint16 one is bf16) as one checkpoint in `store`, each
     component's in insertion order, with their classes, configs and assets: its header ref."""
-    writer = store.writer()
+    writer = tensorfs.Writer(cache_dir=store)
     if pipeline is not None:
         writer.pipeline(*pipeline)
     for name in dict.fromkeys([*components, *assets]):
         component = writer.component(
-            name, classes.get(name, ""), dict(configs.get(name, {})), config_files.get(name)
+            name,
+            cls=classes.get(name, ""),
+            config=dict(configs.get(name, {})),
+            config_file=config_files.get(name, "config.json"),
         )
         for key, value in components.get(name, {}).items():
-            component.put(key, DTYPES[str(value.dtype)], list(value.shape), value)
+            component.put(
+                key, memoryview(value), dtype=DTYPES[str(value.dtype)], shape=list(value.shape)
+            )
         for asset, data in assets.get(name, {}).items():
             component.asset(asset, data)
     ref = writer.commit().id
@@ -59,7 +64,7 @@ def checkpoint(
 
 
 def context(
-    store: tensorfs.Store,
+    store: Path,
     request_id: str = "test",
     outputs: Mapping[str, int] = {"model": 64 << 20},
     *,
@@ -79,14 +84,16 @@ def context(
     return Context(
         request_id,
         math.inf,
-        _tensorfs_source=lambda weights: store.checkpoint(weights.checkpoint_ref),
+        _tensorfs_source=lambda weights: tensorfs.open(
+            weights.checkpoint_ref, cache_dir=store, local_files_only=True
+        ),
         _tensorfs_output=bound.open,
         _tensorfs_adopt=bound.adopt,
     )
 
 
-def adopted(store: tensorfs.Store, shown: Shown, slot: str = "model") -> tensorfs.Checkpoint:
+def adopted(store: Path, shown: Shown, slot: str = "model") -> tensorfs.Checkpoint:
     """The checkpoint the attempt last showed for `slot`."""
     _, repo_id, revision, _ = [item for item in shown if item[0] == slot][-1]
     assert repo_id == weights_store.DERIVED
-    return store.checkpoint(revision)
+    return tensorfs.open(revision, cache_dir=store, local_files_only=True)

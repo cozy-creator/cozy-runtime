@@ -202,7 +202,7 @@ def run() -> None:
     second = metadata(fixture, fixture.runs[1], root / "cached-helper", store)
     assert second.get("access_token") is None, "cached metadata traded"
     header = "sha256:" + first["resolved"][0]["header"]["sha256"]
-    assert tensorfs.Store(store).checkpoint(header).missing(), (
+    assert tensorfs.open(header, cache_dir=store, local_files_only=True).missing(), (
         "metadata helper fetched weight bytes"
     )
     project = root / "package"
@@ -299,7 +299,7 @@ def run() -> None:
         )
         (kept,) = executor.items["denied"]
         assert kept.repo_id == weights_store.DERIVED
-        local = tensorfs.Store(store).checkpoint(kept.revision)
+        local = tensorfs.open(kept.revision, cache_dir=store, local_files_only=True)
         assert local.components["model"].tensors.read("derived").tobytes() == b"\x04"
         assert not local.missing()
         assert executor.call({"cmd": "hello"})["torch_loaded"] is False

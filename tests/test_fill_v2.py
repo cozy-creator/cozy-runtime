@@ -35,28 +35,30 @@ INDEX = {"_class_name": "StableDiffusionPipeline", "unet": ["diffusers", "UNet2D
 
 def _pipeline(root: Path, monkeypatch: pytest.MonkeyPatch) -> tensorfs.Checkpoint:
     store = home(root, monkeypatch)
-    writer = store.writer()
+    writer = tensorfs.Writer(cache_dir=store)
     writer.pipeline("diffusers.StableDiffusionPipeline", INDEX)
-    unet = writer.component("unet", "diffusers.UNet2DConditionModel", UNET)
-    unet.put("conv_in.weight", "F16", [8, 4], np.ones((8, 4), np.float16))
+    unet = writer.component("unet", cls="diffusers.UNet2DConditionModel", config=UNET)
+    unet.put("conv_in.weight", np.ones((8, 4), np.float16), dtype="F16", shape=[8, 4])
     big = np.arange(20 << 18, dtype=np.float32)  # 20 MiB: chunks of its own
-    unet.put("mid.weight", "F32", [20 << 18], big)
+    unet.put("mid.weight", big, dtype="F32", shape=[20 << 18])
     unet.put_encoded(
-        "proj.weight", "BF16", [4, 32], "fp8.rowwise",
-        {"weight": ("F8_E4M3", [4, 32], np.full((4, 32), 0x38, np.uint8)),
+        "proj.weight", dtype="BF16", shape=[4, 32], scheme="fp8.rowwise",
+        parts={"weight": ("F8_E4M3", [4, 32], np.full((4, 32), 0x38, np.uint8)),
          "scale": ("F32", [4], np.ones(4, np.float32))},
-        {"axis": 0, "scale_dtype": "F32"},
+        params={"axis": 0, "scale_dtype": "F32"},
     )  # fmt: skip
     writer.component(
-        "scheduler", "diffusers.EulerDiscreteScheduler", SCHEDULER, "scheduler_config.json",
+        "scheduler", cls="diffusers.EulerDiscreteScheduler", config=SCHEDULER,
+        config_file="scheduler_config.json",
     )  # fmt: skip
     tokenizer = writer.component(
-        "tokenizer", "transformers.CLIPTokenizer", TOKENIZER, "tokenizer_config.json",
+        "tokenizer", cls="transformers.CLIPTokenizer", config=TOKENIZER,
+        config_file="tokenizer_config.json",
     )  # fmt: skip
     tokenizer.asset("vocab.json", VOCAB)
     tokenizer.asset("merges.txt", MERGES)
-    vae = writer.component("vae", "diffusers.AutoencoderKL", {"z": 4})
-    vae.put("decoder.weight", "F32", [3], np.ones(3, np.float32))
+    vae = writer.component("vae", cls="diffusers.AutoencoderKL", config={"z": 4})
+    vae.put("decoder.weight", np.ones(3, np.float32), dtype="F32", shape=[3])
     return writer.commit()
 
 
@@ -141,7 +143,7 @@ def test_a_model_without_a_pipeline_is_its_root_folder(
         configs={"model": {"hidden_size": 2}},
         assets={"model": {"tokenizer.json": b"{}", "tokenizer_config.json": b'{"x": 1}'}},
     )
-    assets = Checkpoint(store.checkpoint(ref)).assets()
+    assets = Checkpoint(tensorfs.open(ref, cache_dir=store, local_files_only=True)).assets()
     assert sorted(assets) == ["config.json", "tokenizer.json", "tokenizer_config.json"]
     assert assets["tokenizer_config.json"] == b'{"x": 1}'
 
@@ -201,17 +203,17 @@ def test_a_transformers_model_binds_its_stored_names_through_its_conversion_mapp
         "text_encoder": transformers.CLIPTextModel(config),
         "text_encoder_2": transformers.CLIPTextModelWithProjection(config),
     }
-    writer = store.writer()
+    writer = tensorfs.Writer(cache_dir=store)
     for component, model in built.items():
         model.config.architectures = [type(model).__name__]  # as `save_pretrained` writes it
         held = writer.component(
-            component, f"transformers.{type(model).__name__}", model.config.to_dict()
+            component, cls=f"transformers.{type(model).__name__}", config=model.config.to_dict()
         )
         for key, value in model.state_dict().items():  # upstream on-disk names
             stored = (
                 key if key.startswith(("text_model.", "text_projection.")) else f"text_model.{key}"
             )
-            held.put(stored, "F32", list(value.shape), value.numpy())
+            held.put(stored, value.numpy(), dtype="F32", shape=list(value.shape))
     ck = Checkpoint(writer.commit())
     assert next(iter(ck.tensors("text_encoder"))).startswith("text_model.")
     for component, model in built.items():
@@ -240,9 +242,11 @@ def test_the_census_dtype_a_fit_pins_is_the_runtimes_name(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, torch_spelling: str, stored: str
 ) -> None:
     store = home(tmp_path, monkeypatch)
-    writer = store.writer()
+    writer = tensorfs.Writer(cache_dir=store)
     value = np.zeros(1, {"BF16": np.uint16, "F16": np.float16, "F32": np.float32}[stored])
-    writer.component("unet").put("weight", stored, [1], value)
+    writer.component("unet", cls="", config={}).put(
+        "weight", memoryview(value), dtype=stored, shape=[1]
+    )
     ck = Checkpoint(writer.commit())
     pinned = tensorfs_requirement_dtype(torch_spelling)
     assert pinned == (None if stored != "F32" else "f32"), "bf16 and f16 stay convertible"

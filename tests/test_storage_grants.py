@@ -12,6 +12,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import tensorfs
 
 from cozy_runtime import weights_store
 from cozy_runtime.author._executor_requests import Answer, CheckpointItem, Request, refuse
@@ -111,7 +112,7 @@ def test_a_granted_output_is_written_into_the_store_shown_and_replayed(
     assert results[3]["checkpoint"] == results[4]["checkpoint"] == results[1]["checkpoint"]
     assert results[3]["transaction"] == results[4]["transaction"] != results[1]["transaction"]
     assert [(item.output, item.repo_id) for item in shown] == [("model", weights_store.DERIVED)] * 4
-    out = store.checkpoint(shown[0].revision)
+    out = tensorfs.open(shown[0].revision, cache_dir=store, local_files_only=True)
     assert out.id == results[1]["checkpoint"]
     unet = out.components["unet"]
     assert set(unet.tensors) == {"w", "extra"} and unet.config == {"in": 2}
@@ -151,7 +152,8 @@ def test_concurrent_requests_keep_their_output_grants(
             assert alice.result()["code"] == "granted"
             assert bob.result()["code"] == "weights_output_bound"
     assert len(shown) == 1
-    assert set(store.checkpoint(shown[0].revision).components["unet"].tensors) == {"w", "extra"}
+    ck = tensorfs.open(shown[0].revision, cache_dir=store, local_files_only=True)
+    assert set(ck.components["unet"].tensors) == {"w", "extra"}
 
 
 def test_a_finished_derivation_replays_in_another_process(
@@ -159,19 +161,21 @@ def test_a_finished_derivation_replays_in_another_process(
 ) -> None:
     store = home(tmp_path / "tensorfs", monkeypatch)
     ref = checkpoint(store, {"unet": {"w": np.ones(2, np.float32)}})
-    base = store.checkpoint(ref)
+    base = tensorfs.open(ref, cache_dir=store, local_files_only=True)
     ctx = context(store)
     with ctx.output("model", weights_store.Derivation(base)) as out:
         out.put("unet", "extra", "F32", [2], bytes(8))
         first = ctx.adopt_model(out)
     script = """
 import sys
+from pathlib import Path
 import tensorfs
 from cozy_runtime.weights_store import Derivation, Outputs
-store = tensorfs.Store(sys.argv[1])
+store = Path(sys.argv[1])
 outputs = Outputs(store, request_id='test', actor='tester', code='test',
                   bounds={'model': 64 << 20}, show=lambda *args: None)
-with outputs.open('model', Derivation(store.checkpoint(sys.argv[2]))) as out:
+base = tensorfs.open(sys.argv[2], cache_dir=store, local_files_only=True)
+with outputs.open('model', Derivation(base)) as out:
     assert out.done is not None, 'another process finds the committed replay'
     assert out.written == 0 and out.has('unet', 'extra')
     print(outputs.adopt(out).checkpoint)
@@ -209,7 +213,7 @@ def test_an_upload_failure_keeps_the_committed_local_checkpoint(
     assert reply["outcome"]["code"] == "upload_failed", reply
     (local,) = shown
     assert local.repo_id == weights_store.DERIVED
-    kept = store.checkpoint(local.revision)
+    kept = tensorfs.open(local.revision, cache_dir=store, local_files_only=True)
     assert set(kept.components["unet"].tensors) == {"w", "extra"}
     assert not kept.missing()
 

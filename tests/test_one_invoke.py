@@ -87,10 +87,10 @@ def _source(root: Path, monkeypatch: pytest.MonkeyPatch) -> str:
         key: np.frombuffer(st.from_f32(VALUES + index, "BF16"), np.uint16).reshape(8, 64)
         for index, key in enumerate(("z.weight", "a.weight", "bias"))
     }
-    writer = store.writer()
-    unet = writer.component("unet", "diffusers.UNet2DConditionModel", {"in": 64})
+    writer = tensorfs.Writer(cache_dir=store)
+    unet = writer.component("unet", cls="diffusers.UNet2DConditionModel", config={"in": 64})
     for key, value in bf16.items():
-        unet.put(key, "BF16", [8, 64], value)
+        unet.put(key, memoryview(value), dtype="BF16", shape=[8, 64])
     ref = writer.commit().id
     assert ref is not None
     return ref
@@ -147,7 +147,7 @@ def test_a_writers_output_lands_only_through_its_grant(
     assert result.checkpoint != source
     (item,) = shown
     assert (item.output, item.repo_id) == ("model", weights_store.DERIVED)
-    lane = tensorfs.Store(tmp_path / "tensorfs").checkpoint(item.revision)
+    lane = tensorfs.open(item.revision, cache_dir=tmp_path / "tensorfs", local_files_only=True)
     assert lane.id == result.checkpoint
     encoded = lane.components["unet"].tensors["a.weight"].encoding
     assert encoded is not None and encoded.scheme == "fp8.rowwise"

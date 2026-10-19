@@ -19,12 +19,12 @@ from test_leaf_speedup_record import sm86
 TENSORS = 40_000
 
 
-def _checkpoint(store: tensorfs.Store, keys: list[str]) -> Checkpoint:
-    writer = store.writer()
-    model = writer.component("model")
+def _checkpoint(store: Path, keys: list[str]) -> Checkpoint:
+    writer = tensorfs.Writer(cache_dir=store)
+    model = writer.component("model", cls="", config={})
     one = np.array([0x3F80], np.uint16)
     for key in keys:
-        model.put(key, "BF16", [1], one)
+        model.put(key, memoryview(one), dtype="BF16", shape=[1])
     return Checkpoint(writer.commit())
 
 

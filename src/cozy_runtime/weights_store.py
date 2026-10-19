@@ -19,13 +19,13 @@ import mmap
 import os
 from collections.abc import Buffer, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import IO
 
 import msgspec
 import tensorfs
 from tensorfs import Checkpoint as Checkpoint
 from tensorfs import Info as Info
-from tensorfs import Store as Store
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author._artifacts import ModelArtifact
@@ -93,23 +93,23 @@ class Access:
         )
 
 
-def open_checkpoint(store: Store, ref: str, access: Access | None = None) -> Checkpoint:
+def open_checkpoint(store: Path, ref: str, access: Access | None = None) -> Checkpoint:
     """A header in the shared store, fetching missing bytes only under this request's provider."""
     if access is None:
-        return tensorfs.open(ref, cache_dir=store.root)
+        return tensorfs.open(ref, cache_dir=store)
     return tensorfs.open(
-        ref, cache_dir=store.root, endpoint=access.hub.endpoint,
+        ref, cache_dir=store, endpoint=access.hub.endpoint,
         token=access.token, ca_der=access.ca_der,
     )  # fmt: skip
 
 
-def upload(store: Store, ck: Checkpoint, repo_id: str, access: Access | None) -> str:
+def upload(store: Path, ck: Checkpoint, repo_id: str, access: Access | None) -> str:
     """Append this request's checkpoint; local bytes stay on an upload failure."""
     if access is None:
         raise RuntimeFailure(f"no Hub capability to upload to {repo_id}", code="upload_failed")
     try:
         return tensorfs.upload_folder(
-            repo_id=repo_id, folder_path=ck.path, cache_dir=store.root,
+            repo_id=repo_id, folder_path=ck.path, cache_dir=store,
             endpoint=access.hub.endpoint, token=access.token, ca_der=access.ca_der,
         )  # fmt: skip
     except tensorfs.Error as exc:
@@ -173,11 +173,11 @@ def replay_key(actor: str, code: str, slot: str, work: Mapping[str, object]) -> 
     return "sha256:" + hashlib.sha256(f"{actor}\0{code}\0{slot}\0{body}".encode()).hexdigest()
 
 
-def finished(store: Store, transaction: str) -> Checkpoint | None:
+def finished(store: Path, transaction: str) -> Checkpoint | None:
     """The output a finished derivation of `transaction` committed, if `store` has one."""
     try:
         return tensorfs.open(
-            DERIVED, revision=_release(transaction), cache_dir=store.root, local_files_only=True
+            DERIVED, revision=_release(transaction), cache_dir=store, local_files_only=True
         )
     except tensorfs.NotFoundError:
         return None
@@ -195,7 +195,7 @@ class Output:
 
     def __init__(
         self,
-        store: Store,
+        store: Path,
         slot: str,
         transaction: str,
         derivation: Derivation,
@@ -212,7 +212,7 @@ class Output:
             None
             if self.done is not None
             else tensorfs.Writer(
-                base=derivation.base, resume=_release(transaction), cache_dir=store.root
+                base=derivation.base, resume=_release(transaction), cache_dir=store
             )
         )
         self._components: dict[str, tensorfs.ComponentWriter] = {}
@@ -332,12 +332,12 @@ class Output:
             committed = self._writer.commit()
             tensorfs.upload_folder(
                 repo_id=DERIVED, revision=_release(self.transaction), folder_path=committed.path,
-                cache_dir=self.store.root, endpoint="local",
+                cache_dir=self.store, endpoint="local",
             )  # fmt: skip
             self.done = tensorfs.open(
                 DERIVED,
                 revision=_release(self.transaction),
-                cache_dir=self.store.root,
+                cache_dir=self.store,
                 local_files_only=True,
             )
             self.close()
@@ -358,7 +358,7 @@ class Outputs:
 
     def __init__(
         self,
-        store: Store,
+        store: Path,
         *,
         request_id: str,
         actor: str,

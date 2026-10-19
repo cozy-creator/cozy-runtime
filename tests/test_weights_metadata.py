@@ -10,6 +10,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import tensorfs
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
@@ -64,7 +65,13 @@ def test_metadata_helper_never_starts_a_package_or_trades_for_cached_metadata(
     root = tmp_path / "tensorfs"
     store = home(root, monkeypatch)
     header = checkpoint(store, {"model": {"w": np.ones(2, np.float32)}})
-    ck = store.name("acme/metadata", "1", store.checkpoint(header))
+    base = tensorfs.open(header, cache_dir=store, local_files_only=True)
+    typed = tensorfs.Writer(base=base, variant="f32", cache_dir=store).commit()
+    tensorfs.upload_folder(
+        repo_id="acme/metadata", revision="1", folder_path=typed.path,
+        cache_dir=store, endpoint="local",
+    )  # fmt: skip
+    ck = tensorfs.open("acme/metadata", revision="1", cache_dir=store, local_files_only=True)
     assert ck.tree is not None and ck.header_ref is not None
     frame = {
         "cmd": "resolve_models", "request_id": "metadata", "store": str(root), "hub": _hub(),
@@ -97,7 +104,7 @@ def test_metadata_helper_never_starts_a_package_or_trades_for_cached_metadata(
                     "length": ck.header_ref[1],
                 }
                 assert resolved["tree"]["sha256"] == ck.tree.removeprefix("sha256:")
-                assert not store.checkpoint(header).missing()
+                assert not tensorfs.open(header, cache_dir=store, local_files_only=True).missing()
                 refused = _call(channel, {**frame, "store": str(tmp_path / "other-store")})
                 assert refused["code"] == "store_root_changed", refused
                 assert _call(channel, {"cmd": "hello"})["torch_loaded"] is False

@@ -34,12 +34,12 @@ TENSORS: dict[str, np.ndarray] = {
 
 
 @pytest.fixture
-def store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tensorfs.Store:
+def store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return home(tmp_path / "tensorfs", monkeypatch)
 
 
 @pytest.fixture
-def source(store: tensorfs.Store) -> str:
+def source(store: Path) -> str:
     """A pipeline whose `unet` holds `TENSORS` and whose tokenizer holds only an asset."""
     return checkpoint(
         store,
@@ -81,7 +81,7 @@ def _read(ck: tensorfs.Checkpoint, key: str) -> np.ndarray:
     ],
 )
 def test_a_lane_encodes_by_scheme_and_decodes_through_the_reference(
-    store: tensorfs.Store, source: str, scheme: str, params: dict[str, object], bound: float
+    store: Path, source: str, scheme: str, params: dict[str, object], bound: float
 ) -> None:
     shown: Shown = []
     ctx = context(store, shown=shown)
@@ -104,7 +104,7 @@ def test_a_lane_encodes_by_scheme_and_decodes_through_the_reference(
 
 
 def test_a_committed_output_replays_and_an_interrupted_one_resumes(
-    store: tensorfs.Store, source: str
+    store: Path, source: str
 ) -> None:
     lane = plan(["unet"], "fp8.rowwise")
     first = quantize(Weights(source), lane, ctx=context(store), tel=fake_telemetry())
@@ -128,9 +128,7 @@ def test_a_committed_output_replays_and_an_interrupted_one_resumes(
     assert resumed.reused_keys == 1 and not resumed.replayed
 
 
-def test_a_selection_keeps_only_its_weights_and_every_component(
-    store: tensorfs.Store, source: str
-) -> None:
+def test_a_selection_keeps_only_its_weights_and_every_component(store: Path, source: str) -> None:
     shown: Shown = []
     select_into(
         context(store, shown=shown), fake_telemetry(), source=Weights(source),
@@ -148,7 +146,7 @@ def test_a_selection_keeps_only_its_weights_and_every_component(
         )  # fmt: skip
 
 
-def test_values_read_from_plain_and_rowwise_sources(store: tensorfs.Store, source: str) -> None:
+def test_values_read_from_plain_and_rowwise_sources(store: Path, source: str) -> None:
     ctx = context(store)
     lane = quantize(Weights(source), plan(["unet"], "fp8.rowwise"), ctx=ctx, tel=fake_telemetry())
     for ref, key, tolerance in (
@@ -156,14 +154,17 @@ def test_values_read_from_plain_and_rowwise_sources(store: tensorfs.Store, sourc
         (lane.checkpoint, "blocks.0.proj.weight", 0.07),
     ):
         out = np.zeros(64 * 256 if "weight" in key else 64, np.float32)
-        read_values_into(torch, store.checkpoint(ref), "unet", key, 0, memoryview(out).cast("B"))
+        ck = tensorfs.open(ref, cache_dir=store, local_files_only=True)
+        read_values_into(torch, ck, "unet", key, 0, memoryview(out).cast("B"))
         want = TENSORS[key].reshape(-1)
         assert float(np.linalg.norm(out - want) / np.linalg.norm(want)) <= tolerance + 1e-3, key
 
 
-def test_a_part_reads_across_its_chunks_from_any_offset(store: tensorfs.Store) -> None:
+def test_a_part_reads_across_its_chunks_from_any_offset(store: Path) -> None:
     big = np.arange(20 << 18, dtype=np.float32)  # 20 MiB: more than one chunk
-    ck = store.checkpoint(checkpoint(store, {"unet": {"big": big}}))
+    ck = tensorfs.open(
+        checkpoint(store, {"unet": {"big": big}}), cache_dir=store, local_files_only=True
+    )
     assert len(ck.chunks) > 1
     into = bytearray(4 << 20)
     offset = (big.nbytes // 2) - 1001
@@ -175,7 +176,7 @@ def test_a_part_reads_across_its_chunks_from_any_offset(store: tensorfs.Store) -
 
 
 def test_a_put_takes_a_buffer_a_file_or_an_in_memory_stream(
-    store: tensorfs.Store, source: str, tmp_path: Path
+    store: Path, source: str, tmp_path: Path
 ) -> None:
     ctx = context(store)
     base = ctx.tensorfs_source(Weights(source))
@@ -200,7 +201,7 @@ def test_a_put_takes_a_buffer_a_file_or_an_in_memory_stream(
         assert np.array_equal(torch.from_dlpack(value).numpy(), want), key
 
 
-def test_an_output_refuses_past_its_granted_bytes(store: tensorfs.Store, source: str) -> None:
+def test_an_output_refuses_past_its_granted_bytes(store: Path, source: str) -> None:
     ctx = context(store, outputs={"model": 100})
     base = ctx.tensorfs_source(Weights(source))
     with (
@@ -211,15 +212,15 @@ def test_an_output_refuses_past_its_granted_bytes(store: tensorfs.Store, source:
     assert refused.value.code == "weights_output_bound"
 
 
-def test_values_read_a_rowwise_scale_in_its_stored_dtype(store: tensorfs.Store) -> None:
+def test_values_read_a_rowwise_scale_in_its_stored_dtype(store: Path) -> None:
     payload = torch.linspace(-2, 2, 4 * 32).reshape(4, 32).to(torch.float8_e4m3fn)
     scale = torch.tensor([0.5, 0.25, 3.0, 0.0078125], dtype=torch.bfloat16)
-    writer = store.writer()
-    writer.component("unet").put_encoded(
-        "w", "BF16", [4, 32], "fp8.rowwise",
-        {"weight": ("F8_E4M3", [4, 32], payload.view(torch.uint8).numpy()),
+    writer = tensorfs.Writer(cache_dir=store)
+    writer.component("unet", cls="", config={}).put_encoded(
+        "w", dtype="BF16", shape=[4, 32], scheme="fp8.rowwise",
+        parts={"weight": ("F8_E4M3", [4, 32], payload.view(torch.uint8).numpy()),
          "scale": ("BF16", [4], scale.view(torch.uint16).numpy())},
-        {"axis": 0, "scale_dtype": "BF16"},
+        params={"axis": 0, "scale_dtype": "BF16"},
     )  # fmt: skip
     out = np.zeros(4 * 32, np.float32)
     read_values_into(torch, writer.commit(), "unet", "w", 0, memoryview(out).cast("B"))
