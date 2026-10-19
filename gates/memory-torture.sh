@@ -4,7 +4,8 @@
 # `leftover` bytes; each warm cell (24) reports B2's mem.stats(), reads <= 40 GB (H3 5 s: 0 B per denoise step) and
 # needs no more OOM retries than its cold pass. The exit status counts the cells and cards that miss it, plus regressions.
 #
-#   gates/memory-torture.sh <hub> <wheel|-> [--matrix] [--tensorfs-wheel <file|url>] [--baseline <dir>] [card[:cell,…]...]
+#   gates/memory-torture.sh <hub> <wheel|-> [--matrix] [--tensorfs-wheel <file|url>] [--baseline <dir>]
+#                           [--baseline-wheel <file|url> [--baseline-tensorfs <file|url>]] [card[:cell,…]...]
 #
 # <wheel> is the candidate cozy-runtime wheel (a file or https://…#sha256=…), `-` for the Hub's target.
 # Cards (default: all): 8 12 24 32 2x8; 24 is the RTX 4090, the ComfyUI comparison card. `<card>:<cell>,…` runs only
@@ -16,14 +17,18 @@
 # each H3 cell runs cold, then warm (`<cell>-warm`, a new prompt and seed), and the pair Qwen 1 MP ∥ LM.
 # --baseline <dir>: a 0.27.4 run's results, for relative checks only: a warm cell whose execution time is >10% over
 # the baseline's is WORSE (D7). GB read per request and per step are reported beside the baseline's.
+# --baseline-wheel: each card first runs its cells on these wheels (0.27.4 + tensorfs 0.10.0) into ./baseline/, then
+# switches the same rental to the candidate (H3 downloads once); those lines override --baseline's for their cells.
 set -uo pipefail
 H=$1 W=$2; shift 2
-MATRIX="" TFS="" BASE="" CARDS=""
+MATRIX="" TFS="" BASE="" CARDS="" BW="" BTFS=""
 while [ $# -gt 0 ]; do
   case $1 in
     --matrix) MATRIX=1 ;;
     --tensorfs-wheel) TFS=$2; [ -f "$2" ] && TFS=$(realpath "$2"); shift ;;
     --baseline) BASE=$(realpath "$2"); shift ;;
+    --baseline-wheel) BW=$2; [ -f "$2" ] && BW=$(realpath "$2"); shift ;;
+    --baseline-tensorfs) BTFS=$2; [ -f "$2" ] && BTFS=$(realpath "$2"); shift ;;
     *) CARDS="$CARDS $1" ;;
   esac
   shift
@@ -142,7 +147,7 @@ cell() {  # cell <cell> <cozy run args…>: one run, followed in the foreground 
   finish "$c" "$(number "$c")"
 }
 
-image() { ls "$D/out-$1"/*.png "$D/out-$1"/*.webp "$D/out-$1"/*.jpg 2>/dev/null | head -1; }
+image() { ls "$PWD/out-$1"/*.png "$PWD/out-$1"/*.webp "$PWD/out-$1"/*.jpg 2>/dev/null | head -1; }
 
 references() {  # two character images for the LM and H3 cells
   local k=$1 r=$2
@@ -253,18 +258,35 @@ PY
     fi
   done
   [ -z "$M" ] && { say "card $card: no SKU had capacity ($(tail -c 200 "rent-$card.err"))"; FAILED=$((FAILED + 1)); return; }
-  if [ "$W" != - ] && ! cozy machine update "$M" --runtime-wheel "$W" ${TFS:+--tensorfs-wheel "$TFS"} --tensorhub "$H" > "update-$card.log" 2>&1; then
-    say "card $card: the wheel did not install: $(tail -c 300 "update-$card.log")"; FAILED=$((FAILED + 1)); release; return
-  fi
-  cozy machine show "$M" --tensorhub "$H" > "machine-$card.txt" 2>&1
   local log  # the machine's own and memory logs, kept here in case the machine is lost mid-run
   for log in tensord memory; do
     cozy machine logs "$M" "$log" -f -n 0 --tensorhub "$H" > "$log-$card.log" 2>&1 &
     FOLLOW="$FOLLOW $!"
   done
-  say "card $card: $(grep -iE 'runtime|tensord' "machine-$card.txt" | tr -s ' ' | tr '\n' ' ' | cut -c1-200)"
-  local r=$RANDOM segs=2
+  if [ -n "$BW" ]; then  # the baseline first, in its own directory; its failures are not the candidate's
+    mkdir -p baseline
+    if update "$BW" "$BTFS" "$card-baseline"; then (cd baseline && TAG=$TAG-baseline && pass "$card")
+    else say "card $card: the baseline wheel did not install: $(tail -c 300 "update-$card-baseline.log")"; fi
+  fi
+  if { [ "$W" != - ] || [ -n "$BW" ]; } && ! update "$W" "$TFS" "$card"; then
+    say "card $card: the wheel did not install: $(tail -c 300 "update-$card.log")"; FAILED=$((FAILED + 1)); release; return
+  fi
+  pass "$card"
+  release
+  return "$FAILED"
+}
+
+update() {  # update <runtime wheel|-> <tensorfs wheel> <name>: install the wheels, or (-) the Hub's target, on $M
+  local w=$1 t=$2
+  [ "$w" = - ] && w="" t=""
+  cozy machine update "$M" ${w:+--runtime-wheel "$w"} ${t:+--tensorfs-wheel "$t"} --tensorhub "$H" > "update-$3.log" 2>&1
+}
+
+pass() {  # every cell of card $1 on $M, into the current directory
+  local card=$1 r=$RANDOM segs=2
   [ "$card" = 32 ] && segs=3
+  cozy machine show "$M" --tensorhub "$H" > "machine-$card.txt" 2>&1
+  say "card $card: $(grep -iE 'runtime|tensord' "machine-$card.txt" | tr -s ' ' | tr '\n' ' ' | cut -c1-200)"
   if [ -n "$MATRIX" ]; then
     matrix "$card"
   elif [ "$card" = 2x8 ]; then
@@ -273,8 +295,6 @@ PY
   else
     cells "$card" "$segs"
   fi
-  release
-  return "$FAILED"
 }
 
 trap 'kill $PIDS 2>/dev/null' INT TERM
@@ -282,8 +302,8 @@ PIDS=""
 for c in $CARDS; do (card "$c"; exit $?) & PIDS="$PIDS $!"; done
 for p in $PIDS; do wait "$p"; FAILED=$((FAILED + $?)); done
 say "memory-torture: $FAILED below the absolute bar"
-if [ -n "$BASE" ]; then  # relative to 0.27.4 (D7): a warm cell >10% slower to execute; GB read reported beside it
-  python3 -I - "$BASE/summary.txt" summary.txt $CARDS <<'PY' | tee -a summary.txt
+if [ -n "$BASE$BW" ]; then  # relative to 0.27.4 (D7): a warm cell >10% slower to execute; GB read reported beside it
+  python3 -I - <(cat ${BASE:+"$BASE/summary.txt"} ${BW:+baseline/summary.txt} 2>/dev/null) summary.txt $CARDS <<'PY' | tee -a summary.txt
 import re, sys
 asked = {a.split(":")[0]: a.split(":")[1].split(",") if ":" in a else [] for a in sys.argv[3:]}
 def wanted(c):  # the cells this run asked for, as `want` picks them
