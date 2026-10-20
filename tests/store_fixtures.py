@@ -19,7 +19,7 @@ from cozy_runtime.internal import executor
 DTYPES = {"float16": "F16", "float32": "F32", "uint8": "U8", "uint16": "BF16", "int64": "I64"}
 
 #: One shown checkpoint item: output, repo, revision, variant.
-type Shown = list[tuple[str, str, str, str]]
+type Shown = list[tuple[str, str, str, str, str]]
 
 
 def home(path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
@@ -92,6 +92,6 @@ def context(
 
 def adopted(store: Path, shown: Shown, slot: str = "model") -> tensorfs.Checkpoint:
     """The checkpoint the attempt last showed for `slot`."""
-    _, repo_id, revision, _ = [item for item in shown if item[0] == slot][-1]
+    _, repo_id, revision, _, _ = [item for item in shown if item[0] == slot][-1]
     assert repo_id == weights_store.DERIVED
     return tensorfs.open(revision, cache_dir=store, local_files_only=True)

@@ -113,14 +113,16 @@ def open_checkpoint(store: Path, ref: str, connection: Connection | None = None)
     return tensorfs.open(ref, cache_dir=store, endpoint=options.endpoint, token=options.token)
 
 
-def upload(store: Path, ck: Checkpoint, repo_id: str, connection: Connection | None = None) -> str:
-    """Add `ck` to `repo_id` as an unreleased tree and return the tree id: its revision. A failed
-    upload leaves the committed local checkpoint available."""
+def upload(
+    store: Path, ck: Checkpoint, repo_id: str, tag: str, connection: Connection | None = None
+) -> str:
+    """Commit `ck` to `repo_id`, move its private `tag` there and return the commit (its tree
+    id). A failed upload leaves the committed local checkpoint available."""
     options = connection or Connection()
     try:
         with _thin(store, ck) as folder:
             return tensorfs.upload_folder(
-                repo_id=repo_id, folder_path=folder, cache_dir=store,
+                repo_id=repo_id, folder_path=folder, revision=tag, cache_dir=store,
                 endpoint=options.endpoint, token=options.token,
             )  # fmt: skip
     except tensorfs.Error as exc:
@@ -202,14 +204,15 @@ def finished(store: Path, transaction: str) -> Checkpoint | None:
     """The output a finished derivation of `transaction` committed, if `store` has one."""
     try:
         return tensorfs.open(
-            DERIVED, revision=_release(transaction), cache_dir=store, local_files_only=True
+            DERIVED, revision=tag(transaction), cache_dir=store, local_files_only=True
         )
     except tensorfs.NotFoundError:
         return None
 
 
-def _release(transaction: str) -> str:
-    return transaction.removeprefix("sha256:")
+def tag(transaction: str) -> str:
+    """The private tag an output's commits move, named by its replay key: never digest-shaped."""
+    return "replay-" + transaction.removeprefix("sha256:")
 
 
 class Output:
@@ -238,7 +241,7 @@ class Output:
             None
             if self.done is not None
             else tensorfs.Writer(
-                base=derivation.base, resume=_release(transaction), cache_dir=store
+                base=derivation.base, resume=transaction.removeprefix("sha256:"), cache_dir=store
             )
         )
         self._components: dict[str, tensorfs.ComponentWriter] = {}
@@ -359,12 +362,12 @@ class Output:
             committed = self._writer.commit()
             with _thin(self.store, committed) as folder:
                 tensorfs.upload_folder(
-                    repo_id=DERIVED, revision=_release(self.transaction), folder_path=folder,
+                    repo_id=DERIVED, revision=tag(self.transaction), folder_path=folder,
                     cache_dir=self.store, endpoint="local",
                 )  # fmt: skip
             self.done = tensorfs.open(
                 DERIVED,
-                revision=_release(self.transaction),
+                revision=tag(self.transaction),
                 cache_dir=self.store,
                 local_files_only=True,
             )
@@ -382,7 +385,7 @@ class Output:
 
 class Outputs:
     """One attempt's weights outputs in `store`. Each opens under its replay key; adopting one
-    commits it and shows it to the run (`show(slot, repo_id, revision, variant)`)."""
+    commits it and shows it to the run (`show(slot, repo_id, commit, tag, variant)`)."""
 
     def __init__(
         self,
@@ -392,7 +395,7 @@ class Outputs:
         actor: str,
         code: str,
         bounds: Mapping[str, int],
-        show: Callable[[str, str, str, str], None],
+        show: Callable[[str, str, str, str, str], None],
         destination: str = "",
         connection: Connection | None = None,
     ) -> None:
@@ -408,12 +411,12 @@ class Outputs:
         return Output(self.store, slot, key, derivation, bound)
 
     def adopt(self, output: Output) -> ModelArtifact:
-        ck = output.commit()
+        ck, moved = output.commit(), tag(output.transaction)
         assert ck.tree is not None
-        self.show(output.slot, DERIVED, ck.tree, ck.variant or "")
+        self.show(output.slot, DERIVED, ck.tree, moved, ck.variant or "")
         if self.destination:
-            revision = upload(self.store, ck, self.destination, self.connection)
-            self.show(output.slot, self.destination, revision, ck.variant or "")
+            commit = upload(self.store, ck, self.destination, moved, self.connection)
+            self.show(output.slot, self.destination, commit, moved, ck.variant or "")
         return ModelArtifact(self.request_id, output.slot, ck.id, output.transaction)
 
 

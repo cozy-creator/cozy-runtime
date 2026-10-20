@@ -113,6 +113,7 @@ def test_a_granted_output_is_written_into_the_store_shown_and_replayed(
     assert results[3]["checkpoint"] == results[4]["checkpoint"] == results[1]["checkpoint"]
     assert results[3]["transaction"] == results[4]["transaction"] != results[1]["transaction"]
     assert [(item.output, item.repo_id) for item in shown] == [("model", weights_store.DERIVED)] * 4
+    assert all(item.tag.startswith("replay-") for item in shown)
     out = tensorfs.open(shown[0].revision, cache_dir=store, local_files_only=True)
     assert out.id == results[1]["checkpoint"]
     unet = out.components["unet"]
@@ -291,12 +292,11 @@ def test_a_raw_read_fills_only_the_requested_tensor_part(
 
 
 @pytest.mark.parametrize("destination", ["local/output", "alice/output"])
-def test_a_destination_adds_each_output_as_an_unreleased_tree(
+def test_a_destination_commits_each_output_under_its_private_replay_tag(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, destination: str
 ) -> None:
     store = home(tmp_path / "tensorfs", monkeypatch)
     origin = None if destination.startswith("local/") else (tmp_path / "origin").as_uri()
-    endpoint = tensorfs.Endpoint(origin or "local", cache_dir=store)
     shown: Shown = []
     trees = []
     for value in (b"one", b"two"):
@@ -313,9 +313,14 @@ def test_a_destination_adds_each_output_as_an_unreleased_tree(
         with outputs.open("model", weights_store.Derivation(None)) as output:
             output.put("model", "w", "U8", [len(value)], value)
             artifact = outputs.adopt(output)
-        _, repo_id, tree, _ = shown[-1]
+        _, repo_id, tree, moved, _ = shown[-1]
         assert repo_id == destination and tree.startswith("sha256:")
+        assert moved == weights_store.tag(artifact.transaction) and moved.startswith("replay-")
         trees.append(tree)
+        with tensorfs.open(
+            destination, revision=moved, endpoint=origin, cache_dir=store, local_files_only=True
+        ) as tagged:
+            assert tagged.id == artifact.checkpoint
         with tensorfs.open(
             destination, revision=tree, endpoint=origin, cache_dir=store, local_files_only=True
         ) as named:
@@ -331,10 +336,6 @@ def test_a_destination_adds_each_output_as_an_unreleased_tree(
                 array = got.components["model"].tensors.read("w")
                 assert isinstance(array, tensorfs.Array) and array.tobytes() == value
     assert trees[0] != trees[1]
-    result = endpoint.repo(destination)
-    assert result is not None
-    repo, _etag = result
-    assert repo["releases"] == []
-    checkpoints = repo["checkpoints"]
-    assert isinstance(checkpoints, list)
-    assert sorted(f"sha256:{row['sha256']}" for row in checkpoints) == sorted(trees)
+    # Replay tags are private: no public tag names a default for the destination.
+    with pytest.raises(tensorfs.NotFoundError):
+        tensorfs.open(destination, endpoint=origin, cache_dir=tmp_path / "default")

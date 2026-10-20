@@ -90,11 +90,13 @@ class Publish(_Request, frozen=True, kw_only=True, tag="publish"):
 
 
 class CheckpointItem(_Request, frozen=True, kw_only=True, tag="checkpoint_item"):
-    """A checkpoint output reference; a later uploaded reference replaces its local one."""
+    """A checkpoint output reference: the commit (`revision`, its tree id) and the private tag
+    the Runtime moved there; a later uploaded reference replaces its local one."""
 
     output: str
     repo_id: str
     revision: str
+    tag: str = ""
     variant: str = ""
 
 
