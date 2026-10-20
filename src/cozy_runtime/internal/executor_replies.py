@@ -56,6 +56,27 @@ class Copy(msgspec.Struct, frozen=True, kw_only=True):
     cached: int = 0
 
 
+class TraceEvent(msgspec.Struct, frozen=True, kw_only=True):
+    """An actual native placement decision, with the state before its action."""
+
+    sequence: int
+    request: str
+    step: int
+    page: int
+    gpu: int
+    rank: int
+    kind: str
+    reason: str
+    bytes: int
+    capacity: int
+    resident: int
+    orphan_bytes: int
+    model: str | None = None
+    class_: str = msgspec.field(name="class", default="free")
+    working_set: int | None = None
+    speculative_budget: int | None = None
+
+
 class Memory(msgspec.Struct, frozen=True, kw_only=True):
     """The invoke reply's `memory`, which `cozy run show` states as `measurements.memory.stats`
     and the merge gate reads: torch bytes package state still held at the request's end
@@ -75,6 +96,7 @@ class Memory(msgspec.Struct, frozen=True, kw_only=True):
     #: the declared plan (`Context.plan`), each step's components
     plan: list[list[str]] = []
     copies: list[Copy] = []
+    trace: list[TraceEvent] = []
 
 
 class RankMemory(msgspec.Struct, frozen=True, kw_only=True):

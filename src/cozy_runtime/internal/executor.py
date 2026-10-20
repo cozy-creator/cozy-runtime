@@ -3907,7 +3907,9 @@ class Executor:
             self.host._rank_request = None
             state.context.__exit__(None, None, None)
             memory = request_memory.measured(
-                state.request.stats if state.request is not None else None, _gpu_numbers(self.world)
+                state.request.stats if state.request is not None else None,
+                _gpu_numbers(self.world),
+                rank=self.rank,
             )
             return RankMemory(ok=True, rank=self.rank, request_id=command.request_id, memory=memory)
         return RankMemory(ok=True, rank=self.rank, request_id=command.request_id)

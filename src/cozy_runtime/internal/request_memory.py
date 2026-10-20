@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
-from cozy_runtime.internal.executor_replies import Copy, Eviction, Memory, Peak, Step
+import msgspec
+
+from cozy_runtime.internal.executor_replies import Copy, Eviction, Memory, Peak, Step, TraceEvent
 
 if TYPE_CHECKING:
     from tensorfs.varena.torch import RequestStats
 
 
-def measured(request: RequestStats | None, devices: Sequence[int]) -> Memory | None:
+def measured(
+    request: RequestStats | None, devices: Sequence[int], *, rank: int = 0
+) -> Memory | None:
     if request is None:
         return None
 
@@ -73,6 +77,14 @@ def measured(request: RequestStats | None, devices: Sequence[int]) -> Memory | N
             )
             for c in request.copies
         ],
+        trace=[
+            msgspec.convert(
+                {**event, "gpu": physical(cast(int, event["gpu"])), "rank": rank},
+                TraceEvent,
+                strict=True,
+            )
+            for event in request.trace
+        ],
     )
 
 
@@ -103,4 +115,5 @@ def combined(records: Sequence[Memory]) -> Memory | None:
         leftover_by_gpu=sorted(by_gpu),
         plan=plan,
         copies=[row for record in records for row in record.copies],
+        trace=[row for record in records for row in record.trace],
     )

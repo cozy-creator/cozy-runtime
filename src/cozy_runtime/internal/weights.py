@@ -702,7 +702,6 @@ class Residency:
             return None
         token = _Pin()
         weakref.finalize(token, hold.close)
-        cache.nbytes = model.home_bytes()
         self.pins[(component, owner)] = (token, cache)
         return token
 
