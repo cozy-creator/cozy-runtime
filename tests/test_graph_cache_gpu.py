@@ -107,10 +107,10 @@ def test_retired_token_rejects_borrow_and_last_reference_closes_its_real_cache(
             assert not ready
         del token
         gc.collect()
-        assert pointer() is retained and not cache.closed
+        assert pointer() is retained and not bool(cache.closed)
         del retained
         gc.collect()
-        assert pointer() is None and cache.closed and cache not in memory.caches
+        assert pointer() is None and bool(cache.closed) and cache not in memory.caches
     finally:
         memory.close()
         checkpoint.close()
@@ -150,7 +150,9 @@ def test_pressure_preserves_a_delayed_replay_then_reclaims_its_last_token(tmp_pa
                 finally:
                     relieved.set()
 
-            class PauseCopy(TorchDispatchMode):  # type: ignore[misc]  # Optional Torch is untyped.
+            dispatch_mode: Any = TorchDispatchMode
+
+            class PauseCopy(dispatch_mode):  # type: ignore[misc]  # Optional Torch is untyped.
                 def __torch_dispatch__(
                     self,
                     func: Any,
@@ -178,7 +180,7 @@ def test_pressure_preserves_a_delayed_replay_then_reclaims_its_last_token(tmp_pa
             # still owns the graph allocation and the persistent binding token.
             torch.cuda.empty_cache()
             memory.free(memory.device, memory.available() + 1)
-            assert token.retired and not cache.closed and model.common.count == 1
+            assert token.retired and not bool(cache.closed) and model.common.count == 1
             assert graphs._pool_bytes(torch, pools) > 0
             assert not recorder.recordings and token.nbytes == 0
             consumer.synchronize()
@@ -191,7 +193,7 @@ def test_pressure_preserves_a_delayed_replay_then_reclaims_its_last_token(tmp_pa
             pointer = weakref.ref(token)
             del entry, token
             gc.collect()
-            assert pointer() is None and cache.closed and model.common.count == 0
+            assert pointer() is None and bool(cache.closed) and model.common.count == 0
     finally:
         relieved.set()
         if pressure is not None:
