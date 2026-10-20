@@ -57,7 +57,9 @@ jobs:
         with:
           ref: ${{ github.workflow_sha }}
           path: workflow
-          sparse-checkout: scripts/prepare-release-source-access.sh
+          sparse-checkout: |
+            scripts/prepare-release-source-access.sh
+            scripts/ci-delegated.sh
           sparse-checkout-cone-mode: false
       - uses: actions/checkout@v4
         with:
@@ -120,8 +122,7 @@ jobs:
         env:
           TEST: ${{ inputs.test }}
         run: |
-          sudo systemd-run --wait --pipe --collect \
-            --unit="cozy-runtime-dev-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+          bash "$GITHUB_WORKSPACE/workflow/scripts/ci-delegated.sh" "cozy-runtime-dev-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
             --uid="$(id -u)" --gid="$(id -g)" \
             --property=Delegate=yes --working-directory="$PWD" \
             --setenv="PATH=$PATH" --setenv="HOME=$HOME" \

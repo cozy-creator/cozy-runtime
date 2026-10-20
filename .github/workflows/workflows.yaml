@@ -1,10 +1,10 @@
 name: workflows
 on:
   pull_request:
-    paths: ['.github/workflows/**', '.github/actionlint.yaml']
+    paths: ['.github/workflows/**', '.github/actionlint.yaml', 'scripts/ci-delegated.sh', 'scripts/test-ci-cancellation.sh']
   push:
     branches: [master]
-    paths: ['.github/workflows/**', '.github/actionlint.yaml']
+    paths: ['.github/workflows/**', '.github/actionlint.yaml', 'scripts/ci-delegated.sh', 'scripts/test-ci-cancellation.sh']
   workflow_dispatch:
 
 permissions:
@@ -26,3 +26,5 @@ jobs:
             https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz \
             | tar -xz -C "$RUNNER_TEMP" actionlint
           "$RUNNER_TEMP/actionlint" -color -shellcheck= -pyflakes=
+      - name: Cancellation reaps delegated children
+        run: timeout 20s bash scripts/test-ci-cancellation.sh

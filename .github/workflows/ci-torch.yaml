@@ -37,8 +37,7 @@ jobs:
       - name: Torch-gated test files
         run: |
           mapfile -t files < <(grep -lE '(importorskip|find_spec)\(\s*"(torch|diffusers|transformers)|needs_torch|NO_TORCH|SkipTest\(' tests/test_*.py)
-          sudo systemd-run --wait --pipe --collect \
-            --unit="cozy-runtime-torch-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+          bash "scripts/ci-delegated.sh" "cozy-runtime-torch-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
             --uid="$(id -u)" --gid="$(id -g)" \
             --property=Delegate=yes --working-directory="$PWD" \
             --setenv="PATH=$PATH" --setenv="HOME=$HOME" \
