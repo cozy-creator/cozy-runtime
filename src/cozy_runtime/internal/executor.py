@@ -1507,7 +1507,7 @@ class Executor:
         and reads as unstarted. The ordinary start that follows only initializes devices,
         warms the package and forms the group.
         """
-        ledgers = [fd for _ in range(command.ledgers) for fd in self.channel.recv_ledger()]
+        ledgers = self.channel.recv_ledgers(command.ledgers)
         if self.poisoned or self.ledgers:
             for fd in ledgers:  # one set per process
                 os.close(fd)
