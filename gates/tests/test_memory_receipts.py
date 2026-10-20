@@ -114,6 +114,9 @@ class MemoryReceipts(unittest.TestCase):
         self.assertEqual(API["transfer_bound"]({"proofs": [proof]}, trace, {0}, {0: 3}, False)[0], [])
         self.assertIn("transfer-proof-gpu-coverage", API["transfer_bound"](
             {"proofs": [proof]}, trace, {0, 1}, {}, True)[0])
+        extra = dict(trace[0], request="unaccounted")
+        self.assertIn("transfer-proof-trace-coverage", API["transfer_bound"](
+            {"proofs": [proof]}, [*trace, extra], {0}, {}, True)[0])
 
     def test_slim_trace_protects_working_pages_and_orphan_order(self):
         def event(sequence, kind, **values):

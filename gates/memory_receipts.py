@@ -206,13 +206,14 @@ def transfer_bound(stats, events, executed, by_gpu, required):
     proofs = stats.get("proofs")
     if not isinstance(proofs, list) or not proofs:
         return ["missing-transfer-proof"], None, "unproved"
-    keys, total, compulsory, scoped = set(), 0, 0, True
+    keys, identities, total, compulsory, scoped = set(), set(), 0, 0, True
     for proof in proofs:
         if (not isinstance(proof, dict) or not integer(proof.get("gpu"))
                 or proof["gpu"] not in executed or not integer(proof.get("rank"))
                 or not isinstance(proof.get("request"), str) or not proof["request"]):
             return ["invalid-transfer-proof-identity"], None, "unproved"
         key = (proof["gpu"], proof["rank"], proof["request"])
+        identities.add(key)
         if proof["gpu"] in keys:
             return ["duplicate-transfer-proof-gpu"], None, "unproved"
         keys.add(proof["gpu"])
@@ -233,6 +234,9 @@ def transfer_bound(stats, events, executed, by_gpu, required):
             return ["h2d-window-bound-inconclusive"], total, "inconclusive"
     if keys != executed:
         return ["transfer-proof-gpu-coverage"], None, "unproved"
+    if identities != {(event.get("gpu"), event.get("rank"), event.get("request"))
+                       for event in events if event.get("kind") == "begin"}:
+        return ["transfer-proof-trace-coverage"], None, "unproved"
     if not scoped:
         return (["transfer-proof-not-isolated"] if required else []), None, "shared-scope"
     return [], total, f"sufficient:compulsory={compulsory}B"
