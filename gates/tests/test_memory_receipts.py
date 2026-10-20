@@ -195,6 +195,35 @@ class MemoryReceipts(unittest.TestCase):
         self.assertIn("leftover=33554432", text)
         self.assertRegex(text, r"bar=[^ ]*leftover")
 
+    def test_actual_0274_rank_and_flat_memory_control_preserves_unknowns(self):
+        value = json.loads((ROOT / "tests/fixtures/0274-ranks-flat-memory-12082.json").read_text())
+        code, text = self.record(value, "24-klein-a")
+        self.assertEqual(code, 0, text)
+        self.assertIn("legacy_control=1", text)
+        self.assertIn("read=9.926GB", text)
+        self.assertIn("oom_retries=0", text)
+        self.assertIn("leftover=-", text)
+        self.assertIn("read_per_step=-", text)
+        # Retained weights are not a Torch leak; absent request facts stay unknown.
+        memory = value["measurements"]["memory"]
+        self.assertGreater(memory["weights_bytes"], 0)
+        del memory["paged_in_bytes"], memory["oom_retries"]
+        code, text = self.record(value, "24-h3ref5-warm")
+        self.assertEqual(code, 0, text)
+        self.assertIn("read=-GB", text)
+        self.assertIn("oom_retries=-", text)
+
+    def test_legacy_wire_never_substitutes_for_slim_candidate_evidence(self):
+        value = json.loads((ROOT / "tests/fixtures/0274-ranks-flat-memory-12082.json").read_text())
+        code, text = self.record(value, "24-klein-a", slim="slim")
+        self.assertEqual(code, 1, text)
+        self.assertIn("no-gpu-execution", text)
+        self.assertNotIn("legacy_control=1", text)
+        for field in ("start_us", "uuid", "pid"):
+            broken = copy.deepcopy(value)
+            del broken["measurements"]["execution"]["ranks"][0][field]
+            self.assertIn("no-gpu-execution", self.record(broken, "24-klein-a")[1])
+
     def test_missing_required_gpu_fields_refuse(self):
         for field in ("leftover", "paged_in", "retries", "steps"):
             with self.subTest(field=field):
