@@ -80,6 +80,12 @@ jobs:
           docker run --rm -v "$PWD:/w" -e TRITON_LIBCUDA_PATH=/w/libcuda -e LIBRARY_PATH=/w/libcuda \
             -e LD_LIBRARY_PATH=/w/libcuda \
             --entrypoint bash "$IMAGE" -euo pipefail -c '
+              # The unreleased TensorFS git pin builds from source. Its backend
+              # requires explicit Rust setup; the worker image carries no Rust.
+              if ! command -v cargo >/dev/null; then
+                curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.99.1
+                export PATH="$HOME/.cargo/bin:$PATH"
+              fi
               uv pip install --quiet --python /opt/cozy/python/bin/python /w/source
               /opt/cozy/python/bin/python /w/tools/checks/kernel_formation.py --ledger /w/ledger/formed.jsonl
             ' | tee formation.log
