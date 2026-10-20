@@ -135,8 +135,15 @@ def test_pressure_preserves_a_delayed_replay_then_reclaims_its_last_token(tmp_pa
             entry = next(iter(recorder.recordings.values()))
             token = placed.pins[("net", "graphs:net")]
             cache = token.cache
-            pools = {recording.graph.pool() for recording in recorder.recordings.values()}
-            assert token.nbytes == graphs._pool_bytes(torch, pools) > 0
+            pools, inputs = graphs._allocations(recorder.recordings.values())
+            pool_bytes = graphs._pool_bytes(torch, pools)
+            input_bytes = graphs._cache_bytes(torch, set(), inputs)
+            assert input_bytes > 0, "static inputs outside the private pool must be counted"
+            assert token.nbytes == graphs._cache_bytes(torch, pools, inputs)
+            assert token.nbytes == pool_bytes + input_bytes > pool_bytes > 0
+            assert graphs._allocations([entry, entry]) == graphs._allocations([entry]), (
+                "aliases to a recording's input storages must count only once"
+            )
 
             def ask_for_room() -> None:
                 try:
@@ -182,6 +189,7 @@ def test_pressure_preserves_a_delayed_replay_then_reclaims_its_last_token(tmp_pa
             memory.free(memory.device, memory.available() + 1)
             assert token.retired and not bool(cache.closed) and model.common.count == 1
             assert graphs._pool_bytes(torch, pools) > 0
+            assert graphs._cache_bytes(torch, set(), inputs) == input_bytes
             assert not recorder.recordings and token.nbytes == 0
             consumer.synchronize()
             bypass = graphs.BYPASS.set(True)
@@ -194,6 +202,11 @@ def test_pressure_preserves_a_delayed_replay_then_reclaims_its_last_token(tmp_pa
             del entry, token
             gc.collect()
             assert pointer() is None and bool(cache.closed) and model.common.count == 0
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            assert graphs._cache_bytes(torch, pools, inputs) == 0, (
+                "released recordings retained their private pool or default-pool static inputs"
+            )
     finally:
         relieved.set()
         if pressure is not None:
