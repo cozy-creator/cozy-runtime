@@ -150,7 +150,7 @@ def test_pressure_preserves_a_delayed_replay_then_reclaims_its_last_token(tmp_pa
                 finally:
                     relieved.set()
 
-            class PauseCopy(TorchDispatchMode):
+            class PauseCopy(TorchDispatchMode):  # type: ignore[misc]  # Optional Torch is untyped.
                 def __torch_dispatch__(
                     self,
                     func: Any,
