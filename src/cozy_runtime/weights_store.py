@@ -19,7 +19,7 @@ import tempfile
 from collections.abc import Buffer, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import IO, TYPE_CHECKING, cast
+from typing import IO
 
 import tensorfs
 from tensorfs import Checkpoint as Checkpoint
@@ -29,9 +29,6 @@ from tensorfs import raw
 from cozy_runtime import canonical_json
 from cozy_runtime.author._artifacts import ModelArtifact
 from cozy_runtime.author._errors import CapabilityError, RuntimeFailure
-
-if TYPE_CHECKING:
-    from tensorfs.api import Token
 
 #: The store's location when the machine names none (TensorFS's default, owner D3).
 DEFAULT_HOME = "~/.cache/tensorfs"
@@ -46,34 +43,28 @@ type PartData = tuple[str, str, Sequence[int], Data]
 
 @dataclass(frozen=True, slots=True)
 class Connection:
-    """Ordinary TensorFS endpoint options, including an already supplied credential."""
+    """The request's TensorFS endpoint and its already supplied bearer credential."""
 
     endpoint: str | None = None
-    token: Token | None = field(default=None, repr=False)
-    ca_der: bytes | None = field(default=None, repr=False)
+    token: str | None = field(default=None, repr=False)
 
 
 def open_checkpoint(store: Path, ref: str, connection: Connection | None = None) -> Checkpoint:
     """Open a checkpoint through the public TensorFS API in the shared cache."""
     options = connection or Connection()
-    return tensorfs.open(
-        ref, cache_dir=store, endpoint=options.endpoint,
-        token=options.token, ca_der=options.ca_der,
-    )  # fmt: skip
+    return tensorfs.open(ref, cache_dir=store, endpoint=options.endpoint, token=options.token)
 
 
 def upload(store: Path, ck: Checkpoint, repo_id: str, connection: Connection | None = None) -> str:
-    """Upload normally; a failed upload leaves the committed local checkpoint available."""
+    """Add `ck` to `repo_id` as an unreleased tree and return the tree id: its revision. A failed
+    upload leaves the committed local checkpoint available."""
     options = connection or Connection()
     try:
         with _portable(ck) as folder:
-            tree = tensorfs.upload_folder(
+            return tensorfs.upload_folder(
                 repo_id=repo_id, folder_path=folder, cache_dir=store,
-                endpoint=options.endpoint, token=options.token, ca_der=options.ca_der,
+                endpoint=options.endpoint, token=options.token,
             )  # fmt: skip
-        if repo_id.startswith("local/"):
-            _local_alias(store, repo_id, tree, ck.variant)
-        return tree
     except tensorfs.Error as exc:
         raise RuntimeFailure(f"uploading to {repo_id}: {exc}"[:900], code="upload_failed") from exc
 
@@ -85,32 +76,6 @@ def _portable(checkpoint: Checkpoint) -> Iterator[Path]:
         folder = Path(directory)
         tensorfs.materialize(checkpoint, local_dir=folder, format="cozytensors")
         yield folder
-
-
-def _local_alias(store: Path, repo_id: str, tree: str, variant: str | None) -> None:
-    """Make an explicit local destination reusable by name, preserving its other revisions."""
-    with tensorfs.open(tree, variant=variant, cache_dir=store, local_files_only=True) as ck:
-        assert ck.tree_ref is not None
-        sha256, length = ck.tree_ref
-    target = {"sha256": sha256, "length": length}
-
-    def change(repo: dict[str, object] | None) -> dict[str, object]:
-        doc = repo or {"format": "tensorfs.repo/1", "name": repo_id, "releases": []}
-        releases = cast(list[dict[str, object]], doc["releases"])
-        before = next((row for row in releases if row["version"] == "1"), None)
-        alias: dict[str, object] = {"version": "1", "tree": target}
-        if before is not None:
-            changed = before["tree"] != target or bool(before.get("yanked", False))
-            alias["revision"] = cast(int, before.get("revision", 0)) + int(changed)
-        checkpoints = cast(list[dict[str, object]], doc.get("checkpoints", []))
-        # Unversioned lookup chooses the last non-yanked release, not the largest version.
-        return {
-            **doc,
-            "releases": [row for row in releases if row["version"] != "1"] + [alias],
-            "checkpoints": [row for row in checkpoints if row != target],
-        }
-
-    tensorfs.Endpoint("local", cache_dir=store).update_repo(repo_id, change)
 
 
 def read_into(

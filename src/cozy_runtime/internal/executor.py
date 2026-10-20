@@ -65,6 +65,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import msgspec
+import tensorfs
 from msgspec import UNSET, UnsetType
 
 from cozy_runtime import __version__ as RUNTIME_VERSION
@@ -382,13 +383,17 @@ def _held(
 
 
 def _connection(options: TensorFSOptions | None) -> weights_store.Connection | None:
+    """The request's endpoint and token; its private CA, if any, joins TensorFS's trusted roots
+    for this process (`configure` adds a root, so setting it again is harmless)."""
     if options is None:
         return None
-    try:
-        ca_der = None if options.ca_der is None else base64.b64decode(options.ca_der, validate=True)
-    except ValueError as exc:
-        raise InvalidRequest("TensorFS CA is not base64 DER", code="tensorfs_config") from exc
-    return weights_store.Connection(options.endpoint, options.token, ca_der)
+    if options.ca_der is not None:
+        try:
+            ca_der = base64.b64decode(options.ca_der, validate=True)
+        except ValueError as exc:
+            raise InvalidRequest("TensorFS CA is not base64 DER", code="tensorfs_config") from exc
+        tensorfs.configure(ca_der=ca_der)
+    return weights_store.Connection(options.endpoint, options.token)
 
 
 def _replay_code(command: Invoke, request: str) -> str:
