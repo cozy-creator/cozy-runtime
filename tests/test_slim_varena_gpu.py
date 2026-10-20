@@ -154,26 +154,32 @@ def test_refused_capture_preserves_cache_held_common_for_eager_fallback(tmp_path
                 assert model.common.regions and model.common.pins
                 assert all(block.stream is not None for block in blocks)
                 with cache.serving():
-                    graph, why = capture(
+                    natural_graph, _why = capture(
                         torch, lambda: module(value), torch.cuda.graph_pool_handle(), capture_stream
                     )
-                    if graph is not None:
-                        # Some native/CUDA versions permit their normal setup in capture.
-                        # This public measurement callback makes CUDA itself refuse setup
-                        # before this forward acquires common, while the real hold remains.
-                        del graph
-                        prior_measure = memory.measure
-                        memory.measure = torch.cuda.synchronize
-                        try:
-                            graph, why = capture(
-                                torch,
-                                lambda: module(value),
-                                torch.cuda.graph_pool_handle(),
-                                capture_stream,
-                            )
-                        finally:
-                            memory.measure = prior_measure
+                    del natural_graph
+                    # Natural capture refusals vary by CUDA version. Also make CUDA
+                    # itself refuse this public measurement callback, proving failed
+                    # setup before the forward acquires its own common binding.
+                    measured_in_capture: list[bool] = []
+
+                    def synchronize_measurement() -> None:
+                        measured_in_capture.append(torch.cuda.is_current_stream_capturing())
+                        torch.cuda.synchronize()
+
+                    prior_measure = memory.measure
+                    memory.measure = synchronize_measurement
+                    try:
+                        graph, why = capture(
+                            torch,
+                            lambda: module(value),
+                            torch.cuda.graph_pool_handle(),
+                            capture_stream,
+                        )
+                    finally:
+                        memory.measure = prior_measure
                     assert graph is None and why, "the real CUDA capture must be refused"
+                    assert measured_in_capture == [True]
                     counts_after_refusal = tuple(block.count for block in blocks)
                     streams_after_refusal = tuple(block.stream for block in blocks)
                     # Execute fallback before checking bookkeeping: the old wheel reaches
