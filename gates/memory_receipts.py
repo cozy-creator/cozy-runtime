@@ -390,7 +390,9 @@ def record(path, cell, number, state, substitute, summary, slim=""):
                             or any(proof.get("complete") is not True for proof in proofs)):
                         bar.append("incomplete-h3-rank-proof")
             child_reasons.append(call.get("reason"))
-            if call.get("status") not in (None, "completed"):
+            # TensorD call outcomes use "succeeded"; the enclosing run uses
+            # "completed". Both persisted call spellings denote success.
+            if call.get("status") not in (None, "completed", "succeeded"):
                 bar.append("gpu-call-incomplete")
     if not gpu_measurements:
         bar.append("no-gpu-execution")

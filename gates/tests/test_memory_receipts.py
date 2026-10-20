@@ -224,6 +224,22 @@ class MemoryReceipts(unittest.TestCase):
             del broken["measurements"]["execution"]["ranks"][0][field]
             self.assertIn("no-gpu-execution", self.record(broken, "24-klein-a")[1])
 
+    def test_actual_0274_succeeded_child_is_a_complete_control(self):
+        # Selected, unchanged fields from actual H3 run 12087; the parent
+        # orchestrator had no CUDA identity, but its succeeded child did.
+        value = json.loads((ROOT / "tests/fixtures/0274-succeeded-child-12087.json").read_text())
+        code, text = self.record(value, "24-h3ref5")
+        self.assertEqual(code, 0, text)
+        self.assertIn("exec=246.412s", text)
+        self.assertIn("read=112.782GB", text)
+        self.assertIn("oom_retries=19", text)
+        for status in ("running", "failed", "canceled"):
+            value["calls"][0]["status"] = status
+            self.assertIn("gpu-call-incomplete", self.record(value, "24-h3ref5")[1])
+        value["calls"][0]["status"] = "succeeded"
+        value["status"] = "succeeded"
+        self.assertIn("incomplete", self.record(value, "24-h3ref5")[1])
+
     def test_missing_required_gpu_fields_refuse(self):
         for field in ("leftover", "paged_in", "retries", "steps"):
             with self.subTest(field=field):
@@ -284,6 +300,7 @@ class MemoryReceipts(unittest.TestCase):
     def test_actual_h3_group_requires_complete_proofs_from_both_executed_ranks(self):
         value = slim_positive()
         call = value["calls"][0]
+        call["status"] = "succeeded"
         call["function"] = "generate_ref2va_turbo"
         measurements = call["measurements"]
         measurements["execution"]["gpus"].append(dict(measurements["execution"]["gpus"][0], gpu=1))
