@@ -1,0 +1,1 @@
+A multi-frame image reads as its first frame instead of failing with `animated_image`: an iPhone JPEG is an MPO whose second frame is its half-size gray HDR gain map (run 12008), and APNG, GIF, animated WebP and TIFF pages read the same way. Every source, pixel and retained-byte limit applies to that frame.

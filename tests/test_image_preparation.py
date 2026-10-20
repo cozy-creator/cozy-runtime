@@ -10,7 +10,7 @@ from typing import Annotated
 
 import msgspec
 import pytest
-from PIL import Image
+from PIL import Image, ImageOps
 
 from cozy_runtime.author import (
     App,
@@ -20,6 +20,7 @@ from cozy_runtime.author import (
     ImageAsset,
     ImagePreparation,
     describe,
+    fakes,
 )
 from cozy_runtime.author._decode import (
     DEFAULT_DECODE_LIMITS,
@@ -179,19 +180,46 @@ def test_exif_images_decode_to_expected_pixels(
     assert source.read_bytes() == original
 
 
-@pytest.mark.parametrize("format", ["WEBP", "TIFF"], ids=["animation", "multipage"])
-def test_still_image_refuses_animation(tmp_path: Path, format: str) -> None:
-    source = tmp_path / ("animated." + format.lower())
-    Image.new("RGB", (7, 5), "red").save(
-        source,
-        format=format,
-        save_all=True,
-        append_images=[Image.new("RGB", (7, 5), "blue")],
-        duration=100,
+@pytest.mark.parametrize(
+    ("format", "options"),
+    [
+        ("MPO", {}),
+        ("PNG", {}),
+        ("PNG", {"default_image": True}),
+        ("GIF", {}),
+        ("WEBP", {"lossless": True}),
+        ("TIFF", {}),
+    ],
+    ids=["iphone-mpo", "apng", "apng-default-image", "gif", "webp", "tiff-pages"],
+)
+def test_multi_frame_image_reads_its_first_frame(
+    tmp_path: Path, format: str, options: dict[str, object]
+) -> None:
+    source = tmp_path / ("frames." + format.lower())
+    first = Image.frombytes("RGB", (8, 6), bytes(range(144)))
+    if format == "MPO":  # An iPhone JPEG: the rotated photo, then a half-size gray gain map.
+        exif = Image.Exif()
+        exif[274] = 6
+        options, second = {"exif": exif}, Image.new("L", (4, 3), 128)
+    else:
+        second = Image.new("RGB", (8, 6), "blue")
+    first.save(
+        source, format=format, save_all=True, append_images=[second], duration=100, **options
     )
-    with pytest.raises(MediaDecodeError) as error:
-        decode(source)
-    assert error.value.code == "animated_image"
+    with Image.open(source) as saved:
+        assert getattr(saved, "n_frames", 1) == 2
+        expected = ImageOps.exif_transpose(saved).convert("RGB")
+    asset = fakes.file_input(ImageAsset, source)
+    assert (asset.probe().width, asset.probe().height) == expected.size
+    assert asset.read().tobytes() == decode(source).rgb == expected.tobytes()
+    if format == "MPO":
+        assert expected.size == (6, 8)  # The rotated primary, not the 4x3 gain map.
+    else:
+        assert expected.tobytes() == first.tobytes()
+    claim = 8 * 6 * 3  # The retained budget is the decoded frame's, nothing more.
+    decode_image_path(source, DEFAULT_DECODE_LIMITS, _Budget(claim))
+    with pytest.raises(MediaDecodeError, match="decoded"):
+        decode_image_path(source, DEFAULT_DECODE_LIMITS, _Budget(claim - 1))
 
 
 def test_still_image_refuses_truncated_pixels(tmp_path: Path) -> None:
