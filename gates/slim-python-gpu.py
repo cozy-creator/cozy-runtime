@@ -125,8 +125,8 @@ def main(
         kind: int(count)
         for count, kind in re.findall(r"(\d+) (passed|failed|skipped|xfailed|xpassed)", result)
     }
-    if counts != {"passed": 3}:
-        raise RuntimeError(f"expected three executed CUDA tests, got {counts}")
+    if counts != {"passed": 4}:
+        raise RuntimeError(f"expected four executed CUDA tests, got {counts}")
     reader = run("read-engine", [python, "cuda_read_engine.py"])
     if "CUDA arrays: chunk-spanning reads, prebuilt decode, raw parts" not in reader:
         raise RuntimeError("the native CUDA reader did not finish its real consumer checks")
