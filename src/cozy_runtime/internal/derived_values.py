@@ -70,9 +70,11 @@ class DerivedValues:
             calls.append(None)
             lease = self.cache.serving()
             lease.__enter__()
+            entered: list[Any] = [lease, False, False]
+            calls[-1] = entered
             if helper:
                 self.lock.acquire()
-            calls[-1] = lease
+                entered[1] = True
             with self.lock:
                 for owner in self.owners:
                     if not owner.freqs:
@@ -81,14 +83,17 @@ class DerivedValues:
                         with self.torch.device("cpu"):
                             fresh = type(owner)(theta=owner.theta, axes_dim=owner.axes_dim)
                         owner.freqs = fresh.freqs
+            entered[2] = True
 
         def land(*_: object) -> None:
             calls = getattr(local, "calls", [])
-            if calls and (lease := calls.pop()) is not None:
+            if calls and (entered := calls.pop()) is not None:
+                lease, locked, ready = entered
                 try:
-                    self._publish()
+                    if ready:
+                        self._publish()
                 finally:
-                    if helper:
+                    if locked:
                         self.lock.release()
                     lease.__exit__(None, None, None)
 
@@ -107,7 +112,8 @@ class DerivedValues:
                             # replace their list, including reads on a side stream.
                             value.record_stream(self.torch.cuda.current_stream(self.memory.device))
                         nbytes += value.numel() * value.element_size()
-            self.cache.nbytes = nbytes
+            if self.cache.nbytes != nbytes:
+                self.cache.nbytes = nbytes
 
     @contextmanager
     def serving(self) -> Iterator[None]:
