@@ -448,8 +448,10 @@ def test_private_replay_retains_the_exact_tree_and_refuses_another_commit(
     weights_store._retain_replay(store, transaction, first.tree)
     assert endpoint.repo(weights_store.DERIVED) == (before, etag), "same-tree CAS is a no-op"
 
-    other_ref = checkpoint(store, {"model": {"w": np.frombuffer(b"two", dtype=np.uint8)}})
-    with tensorfs.open(other_ref, cache_dir=store, local_files_only=True) as other:
+    writer = tensorfs.Writer(cache_dir=store)
+    writer.component("model", cls="", config={}).put("w", b"two", dtype="U8", shape=[3])
+    with writer.commit() as other:
+        assert other.tree is not None
         with weights_store._thin(store, other) as folder:
             other_tree = tensorfs.upload_folder(
                 repo_id=weights_store.DERIVED, folder_path=folder, endpoint="local", cache_dir=store
