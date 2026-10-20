@@ -322,6 +322,14 @@ def test_a_destination_adds_each_output_as_an_unreleased_tree(
             assert named.id == artifact.checkpoint
             array = named.components["model"].tensors.read("w")
             assert isinstance(array, tensorfs.Array) and array.tobytes() == value
+            with weights_store._thin(store, named) as folder:  # the header only; no chunk copies
+                files = sorted(str(f.relative_to(folder)) for f in folder.rglob("*") if f.is_file())
+                assert len(files) == 1 and files[0].endswith(".cozytensors"), files
+        if origin is not None:  # the chunks reached the endpoint from the store
+            fresh = tmp_path / f"fresh-{value.decode()}"
+            with tensorfs.open(destination, revision=tree, endpoint=origin, cache_dir=fresh) as got:
+                array = got.components["model"].tensors.read("w")
+                assert isinstance(array, tensorfs.Array) and array.tobytes() == value
     assert trees[0] != trees[1]
     result = endpoint.repo(destination)
     assert result is not None

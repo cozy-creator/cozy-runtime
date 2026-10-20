@@ -60,7 +60,7 @@ def upload(store: Path, ck: Checkpoint, repo_id: str, connection: Connection | N
     upload leaves the committed local checkpoint available."""
     options = connection or Connection()
     try:
-        with _portable(ck) as folder:
+        with _thin(store, ck) as folder:
             return tensorfs.upload_folder(
                 repo_id=repo_id, folder_path=folder, cache_dir=store,
                 endpoint=options.endpoint, token=options.token,
@@ -70,12 +70,16 @@ def upload(store: Path, ck: Checkpoint, repo_id: str, connection: Connection | N
 
 
 @contextlib.contextmanager
-def _portable(checkpoint: Checkpoint) -> Iterator[Path]:
-    """Materialize a complete publication folder explicitly; never during model loading."""
-    with tempfile.TemporaryDirectory(prefix="tensorfs-publish-") as directory:
-        folder = Path(directory)
-        tensorfs.materialize(checkpoint, local_dir=folder, format="cozytensors")
-        yield folder
+def _thin(store: Path, ck: Checkpoint) -> Iterator[Path]:
+    """`ck`'s tree as a folder for `upload_folder`: its header and repo files only. The chunks
+    stay in the store, which the upload reads them from."""
+    assert ck.tree is not None
+    with tempfile.TemporaryDirectory(prefix="tensorfs-upload-") as directory:
+        yield Path(
+            tensorfs.materialize(
+                ck.tree, components=[], local_dir=directory, cache_dir=store, local_files_only=True
+            )
+        )
 
 
 def read_into(
@@ -295,7 +299,7 @@ class Output:
             for component, ordered in keys.items():
                 self.component(component).order(ordered)
             committed = self._writer.commit()
-            with _portable(committed) as folder:
+            with _thin(self.store, committed) as folder:
                 tensorfs.upload_folder(
                     repo_id=DERIVED, revision=_release(self.transaction), folder_path=folder,
                     cache_dir=self.store, endpoint="local",
