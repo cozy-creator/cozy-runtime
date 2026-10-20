@@ -26,7 +26,7 @@ torch = pytest.importorskip("torch")
 import tensorfs  # noqa: E402
 from tensorfs import Store  # noqa: E402
 from tensorfs import plane as tfs_plane  # noqa: E402
-from tensorfs.fetch import Fetch  # noqa: E402
+from tensorfs.fetch import Fetch, ObjectRef  # noqa: E402
 
 from cozy_runtime.author._errors import ConformanceError  # noqa: E402
 from cozy_runtime.author._executor_requests import SealedPlan  # noqa: E402
@@ -214,7 +214,7 @@ def owner(channel: Channel, hub: Hub, store: Store, sealed: list[str]) -> None:
                     if item["source"] == "object"
                 }.items()
             )
-            wire: list[tensorfs.ObjectRef] = [
+            wire: list[ObjectRef] = [
                 {"sha256": sha, "length": length} for sha, length in refs
             ]
             with Fetch.from_fd(hub.channel(store)) as fetch:

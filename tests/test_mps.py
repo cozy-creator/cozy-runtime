@@ -314,7 +314,9 @@ def test_a_stage_pages_weights_out_and_recovers_from_running_out(
             evictions = m.plane["evictions"]
             gc.collect()
             accel.release_cached(torch, "mps")
-            mapped = m.executor._plane_facts()["committed_bytes"]
+            facts = m.executor._plane_facts()
+            assert facts is not None
+            mapped = facts["committed_bytes"]
             cap = torch.mps.driver_allocated_memory() - mapped + encoder + decoder + (24 << 20)
             try:
                 tight = m.attempt("run", {"seed": 3, "scratch": 40 << 20}, cap_bytes=cap)
