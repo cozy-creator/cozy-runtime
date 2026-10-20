@@ -69,19 +69,20 @@ def read_values_into(
             ) from exc
     target = torch.frombuffer(into, dtype=torch.float32)
     params = dict(tensor.encoding.params)
-    stored = raw.parts(source, component, key).get("weight")
+    parts = raw.parts(source, component, key)
+    stored, scaled = parts.get("weight"), parts.get("scale")
     element = _ROWWISE.get((tensor.encoding.scheme, stored.dtype if stored else ""))
+    scale_dtype = scaled.dtype if scaled else ""
     if (
         element is None
         or params.get("axis") != 0
-        or params.get("scale_dtype") not in _WIDTHS
+        or scale_dtype not in _WIDTHS
         or len(tensor.shape) != 2
     ):
         raise CapabilityError(
             f"no model reader for {tensor.encoding.scheme} {params}", code="weights_reader_encoding"
         )
     provider = RowwiseDequant(tensor.encoding.scheme, params=params_of(params))
-    scale_dtype = str(params.get("scale_dtype"))
     scale_width, scale_element = _WIDTHS[scale_dtype], getattr(torch, _FLOATS[scale_dtype])
     columns = tensor.shape[1]
     consumed = 0

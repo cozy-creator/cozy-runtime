@@ -43,7 +43,7 @@ def test_the_conformance_cases_run_against_the_shipped_decoder() -> None:
     torch = pytest.importorskip("torch")
     report = _spec_vectors(
         torch,
-        RowwiseDequant(params=params_of({"axis": 0, "scale_dtype": "F32"})),
+        RowwiseDequant(params=params_of({"axis": 0})),
         torch.device("cpu"),
     )
     assert report.passed and not report.skipped and report.cases, report

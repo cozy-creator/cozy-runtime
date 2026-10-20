@@ -65,10 +65,10 @@ def _read(ck: tensorfs.Checkpoint, key: str) -> np.ndarray:
 @pytest.mark.parametrize(
     ("scheme", "params", "bound"),
     [
-        ("fp8.rowwise", {"axis": 0, "scale_dtype": "F32"}, 0.07),
+        ("fp8.rowwise", {"axis": 0}, 0.07),
         (
             "int8.convrot",
-            {"rotation": "kron_regular_h4", "rotation_size": 256, "scale_dtype": "F32"},
+            {"rotation": "kron_regular_h4", "rotation_size": 256},
             0.02,
         ),
         (
@@ -224,7 +224,7 @@ def test_values_read_a_rowwise_scale_in_its_stored_dtype(store: Path) -> None:
         "w", dtype="BF16", shape=[4, 32], scheme="fp8.rowwise",
         parts={"weight": ("F8_E4M3", [4, 32], payload.view(torch.uint8).numpy()),
          "scale": ("BF16", [4], scale.view(torch.uint16).numpy())},
-        params={"axis": 0, "scale_dtype": "BF16"},
+        params={"axis": 0},
     )  # fmt: skip
     out = np.zeros(4 * 32, np.float32)
     read_values_into(torch, writer.commit(), "unet", "w", 0, memoryview(out).cast("B"))
