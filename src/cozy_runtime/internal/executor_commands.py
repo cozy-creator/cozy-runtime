@@ -85,10 +85,6 @@ class Unload(Command, frozen=True, kw_only=True, tag="unload"):
     construction: str
 
 
-class KeepWeights(Command, frozen=True, kw_only=True, tag="keep_weights"):
-    construction: str
-
-
 class RequestMemory(Command, frozen=True, kw_only=True, tag="request_memory"):
     construction: str
     request_id: str
@@ -330,7 +326,6 @@ type KnownCommand = (
     | Fork
     | Map
     | Unload
-    | KeepWeights
     | RequestMemory
     | Activate
     | Attention

@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from cozy_runtime.author._errors import classify, is_varena_error
-from cozy_runtime.internal.executor import Executor
+from cozy_runtime.internal.executor import Executor, _reply
 from cozy_runtime.internal.seam import Channel, SeamError, anonymous
 
 
@@ -80,6 +80,18 @@ def test_only_sticky_native_failures_poison_an_executor(tmp_path: Path, sticky: 
         assert reply["outcome"]["code"] == failure.code
         assert bool(executor.poisoned) is sticky
         assert reply["quiescent"] is not sticky
+        assert executor.hello()["ok"] is True
+    finally:
+        left.close()
+        right.close()
+
+
+def test_removed_keep_command_is_refused_without_stopping_the_executor(tmp_path: Path) -> None:
+    left, right = socket.socketpair()
+    try:
+        executor = Executor(Channel(left), tmp_path)
+        reply = _reply(executor, {"cmd": "keep_weights", "construction": "old"})
+        assert reply is not None and reply["code"] == "command_malformed"
         assert executor.hello()["ok"] is True
     finally:
         left.close()
