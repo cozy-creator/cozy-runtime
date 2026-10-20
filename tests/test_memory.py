@@ -67,7 +67,11 @@ def test_each_rung_runs_while_it_gives_and_the_ladder_stops_once_enough_is_free(
     weights, device = card
     calls: list[str] = []
     owner, asked = gives(device, [100 * MIB, 100 * MIB], calls, "owner"), []
-    weights.room = lambda nbytes: (asked.append(nbytes), owner())
+    def ask(nbytes: int) -> None:
+        asked.append(nbytes)
+        owner()
+
+    weights.room = ask
     monkeypatch.setattr(memory_module, "RELEASERS", [gives(device, [1 << 30], calls, "cache")])
     assert not weights.memory.free_for(500 * MIB, "aten.mm.default", upto=Rung.IDLE)
     assert calls == ["owner", "owner", "owner"], "asked while it gave, then left"

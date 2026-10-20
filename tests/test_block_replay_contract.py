@@ -302,7 +302,10 @@ class CachedBlock(StatefulBlock):
     """A Wan VAE's causal block: it writes its input into the feature cache it is handed and
     advances the decoder's shared index into it."""
 
-    def forward(self, value: Any, feat_cache: list[Any], feat_idx: list[int]) -> Any:
+    def forward(
+        self, value: Any, feat_cache: list[Any] | None = None, feat_idx: list[int] | None = None
+    ) -> Any:
+        assert feat_cache is not None and feat_idx is not None
         if feat_cache[feat_idx[0]] is not None:
             raise ValueError("a first frame's convolution takes no feature cache")
         feat_cache[feat_idx[0]] = value.clone()

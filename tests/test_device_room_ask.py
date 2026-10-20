@@ -20,4 +20,5 @@ def test_a_room_ask_reaches_the_worker(tmp_path: Path) -> None:
         worker.send({"event": "answer", "seq": 1, "ok": True, "cap_bytes": -1})
         executor._device_room(5 << 20)
         asked = worker.recv()
+        assert asked is not None
         assert (asked["kind"], asked["seq"], asked["free_bytes"]) == ("device_room", 1, 5 << 20)

@@ -310,10 +310,13 @@ def test_a_stage_pages_weights_out_and_recovers_from_running_out(
             # Under an owner's cap MPS refuses past it with a plain RuntimeError: Runtime's
             # recovery gives the idle encoder's weights back and runs the allocation again. The
             # cap holds this process, both components and 24 MiB: not the decoder's 40 MiB.
+            assert m.plane is not None
             evictions = m.plane["evictions"]
             gc.collect()
             accel.release_cached(torch, "mps")
-            mapped = m.executor._plane_facts()["committed_bytes"]
+            facts = m.executor._plane_facts()
+            assert facts is not None
+            mapped = facts["committed_bytes"]
             cap = torch.mps.driver_allocated_memory() - mapped + encoder + decoder + (24 << 20)
             try:
                 tight = m.attempt("run", {"seed": 3, "scratch": 40 << 20}, cap_bytes=cap)
