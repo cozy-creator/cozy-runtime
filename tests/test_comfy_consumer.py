@@ -139,7 +139,7 @@ def test_real_backend_serves_original_logical_dtype_from_resident_parts(tmp_path
     finally:
         model.close()
         backend.close()
-        memory.unclaimed()
+        memory.close()
         native.close()
 
 
