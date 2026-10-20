@@ -93,6 +93,6 @@ def test_varena_exhausted_is_capacity() -> None:
     """`tensorfs.varena.torch.Exhausted`, known by its module and name, fails the attempt as
     capacity; its `Unbound` is a weight bound to nothing, a fault."""
     varena = pytest.importorskip("tensorfs.varena.torch")
-    exhausted = varena.Exhausted(0, 1 << 20, "bind unet", varena.Stats((), (), 0))
+    exhausted = varena.Exhausted(0, 1 << 20, "bind unet", {}, ())
     assert classify(exhausted).code == MEMORY_EXHAUSTED
     assert classify(varena.Unbound("a weight binds to nothing")).code == "weight_unbound"

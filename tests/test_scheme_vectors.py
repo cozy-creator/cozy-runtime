@@ -8,6 +8,7 @@ from dataclasses import replace
 
 import msgspec
 import pytest
+import tensorfs
 
 from cozy_runtime.author._loader import TENSORFS_DTYPES
 from cozy_runtime.internal.decode_cores import CodeOutsideTable
@@ -96,7 +97,7 @@ def _decode_refuses(provider: Provider, case: VectorCase) -> bool:
     """A decode refuses the values the spec constrains (tables, indices, zeros, stored shape)."""
     try:
         decode_case(torch, provider, msgspec.structs.replace(case, dtype="F32"), "cpu")
-    except (ValueError, CodeOutsideTable):
+    except (ValueError, CodeOutsideTable, tensorfs.DecodeError):
         return True
     return False
 
