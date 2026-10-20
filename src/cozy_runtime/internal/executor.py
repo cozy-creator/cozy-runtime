@@ -946,7 +946,9 @@ class Executor:
         if isinstance(value, UnsetType):
             return
         if isinstance(value, bool) or value <= 0:
-            raise SeamError("device_limit_invalid", "the machine's GPU memory limit must be positive")
+            raise SeamError(
+                "device_limit_invalid", "the machine's GPU memory limit must be positive"
+            )
         previous = self.host.device_limit_bytes
         self.host.device_limit_bytes = value if previous is None else min(previous, value)
         if self.host.memory is not None:

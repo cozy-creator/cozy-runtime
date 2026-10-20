@@ -1,4 +1,5 @@
 """Unit checks of machine-authority propagation, not GPU allocation qualification."""
+
 from types import SimpleNamespace
 
 import pytest
@@ -35,11 +36,18 @@ def test_each_rank_clamps_the_fraction_to_its_real_card_and_keeps_that_bound():
     process = executor(rank=1, world=2)
     process._authorize_device_limit(24 << 30)
     applied = []
-    properties = lambda index: SimpleNamespace(total_memory=12 << 30)
-    torch = SimpleNamespace(cuda=SimpleNamespace(
-        get_device_properties=properties,
-        set_per_process_memory_fraction=lambda fraction, index: applied.append((fraction, index)),
-    ))
+
+    def properties(index):
+        return SimpleNamespace(total_memory=12 << 30)
+
+    torch = SimpleNamespace(
+        cuda=SimpleNamespace(
+            get_device_properties=properties,
+            set_per_process_memory_fraction=lambda fraction, index: applied.append(
+                (fraction, index)
+            ),
+        )
+    )
     process._apply_device_limit(torch)
     assert applied == [(1.0, 1)]
     assert process.device_limit_bytes == process.memory.limit_bytes == 12 << 30
