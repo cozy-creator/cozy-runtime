@@ -13,6 +13,7 @@ from __future__ import annotations
 import dataclasses
 import os
 import signal
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -20,7 +21,6 @@ from typing import Any
 
 import msgspec
 import pytest
-from tensorfs.varena import Ledger
 
 from cozy_runtime.author._signature import ModelBinding
 from cozy_runtime.internal import executor_commands, package_interface, spawn
@@ -31,7 +31,6 @@ from cozy_runtime.internal.parallel.group import RankGroup
 from cozy_runtime.internal.parallel.plan import GpuDivergence, GroupPlan, GroupRefusal
 
 PACKAGE = Path(__file__).resolve().parent.parent / "examples" / "marco-polo"
-GiB = 1 << 30
 
 
 def _torch_here() -> str:
@@ -319,11 +318,10 @@ def test_a_followers_start_names_no_ledger_descriptors(tmp_path: Path) -> None:
 
 @needs_torch
 @pytest.mark.skipif(sys.platform != "linux", reason="varena's ledger is Linux's")
-def test_a_group_forms_with_each_followers_ledger_memfd_and_eventfd(tmp_path: Path) -> None:
-    """TensorD hands rank 0 one ledger memfd and eventfd per GPU; rank 0 relays each
-    follower's pair at join, and the follower claims its row there. A real varena ledger's
-    pair crosses the real seam to a real follower process, and the group forms past join:
-    run 11905 broke there, its eventfd refused as a memfd ("cannot take a host tier")."""
+def test_a_group_forms_with_each_followers_three_descriptor_grant(tmp_path: Path) -> None:
+    """The typed table/eventfd/channel grant crosses the real follower seam before Gloo
+    forms. CPU followers retain the grant without claiming GPU memory; native table and
+    row validity are exercised by Creator's Ledger tests and the actual GPU proof."""
     import torch
 
     env = {**os.environ, "CUDA_VISIBLE_DEVICES": "4,5"}
@@ -336,15 +334,20 @@ def test_a_group_forms_with_each_followers_ledger_memfd_and_eventfd(tmp_path: Pa
         launch=_launcher(env),
         devices=("4", "5"),
     )
-    ledger = Ledger.create("GPU-follower-5", GiB)
-    assert ledger.events_fd is not None
+    table = os.open(tmp_path / "ledger-table", os.O_CREAT | os.O_RDWR, 0o600)
+    event = os.eventfd(0, os.EFD_CLOEXEC)
+    custody, owner = socket.socketpair()
     try:
         group.spawn()
         group.dial_back(seal_snapshot(env))
-        group.form(torch, {"NCCL_NVLS_ENABLE": "0"}, ledgers=[ledger.fd, ledger.events_fd])
+        group.form(torch, {"NCCL_NVLS_ENABLE": "0"}, ledgers=[table, event, custody.fileno()])
         assert group.formed and torch.distributed.get_world_size() == 2
     finally:
         group.close()
+        os.close(table)
+        os.close(event)
+        custody.close()
+        owner.close()
     assert not torch.distributed.is_initialized()
 
 
