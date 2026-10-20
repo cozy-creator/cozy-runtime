@@ -1,4 +1,4 @@
-"""`nvfp4-w4a4/1`: the tensor-scaled producer over real TensorFS channels, decode and leaf."""
+"""`nvfp4`: the tensor-scaled producer into the store, decode and leaf."""
 
 from __future__ import annotations
 
@@ -7,18 +7,24 @@ from typing import Any
 
 import numpy as np
 import pytest
-import tensorfs
+from tensorfs import raw
 
 from cozy_runtime.author import Weights
 from cozy_runtime.author.fakes import fake_attempt, fake_telemetry
-from cozy_runtime.derive import safetensors_io as st
 from cozy_runtime.derive.microscale import encode_nvfp4
 from cozy_runtime.derive.operations import EncodingRule, QuantizationPlan, quantize_into
-from cozy_runtime.internal.encoding import SPEC_NVFP4
-from native_weights import NativeExecution
-from test_derive_quantize_facade import BOUND, header, mint
+from cozy_runtime.internal.encoding import params_of
+from store_fixtures import adopted, checkpoint, context, home
 
-ENCODING = "nvfp4-w4a4/1"
+ENCODING = "nvfp4"
+PARAMS = params_of(
+    {
+        "block_size": 16,
+        "global_scale": "multiply",
+        "nibble_order": "low_first",
+        "scale_layout": "row_major",
+    }
+)
 
 
 def weight(rows: int, cols: int, seed: int) -> np.ndarray:
@@ -32,7 +38,7 @@ def test_the_leaf_is_a_leaf_provider() -> None:
     from cozy_runtime.internal.encoding import LeafProvider, Nvfp4NativeLeaf
 
     # Qualification runs a native oracle only for a LeafProvider; a missing member skips it.
-    assert isinstance(Nvfp4NativeLeaf(SPEC_NVFP4), LeafProvider)
+    assert isinstance(Nvfp4NativeLeaf(), LeafProvider)
 
 
 def test_chunked_encode_uses_the_tensor_amax() -> None:
@@ -45,45 +51,54 @@ def test_chunked_encode_uses_the_tensor_amax() -> None:
     assert encode_nvfp4("w", values[:16]).companions[1].raw != whole.companions[1].raw
 
 
-def test_one_lane_carries_nvfp4_beside_int8(tmp_path: Path) -> None:
-    def row(shape: tuple[int, int], seed: int) -> tuple[str, tuple[int, ...], bytes]:
-        return "bf16", shape, st.from_f32(weight(*shape, seed), "BF16")
-
-    rows = {
-        "transformer": {"blocks.0.ff.weight": row((48, 64), 1), "proj_out.weight": row((8, 64), 2)},
-        "text_encoder": {"layers.0.q_proj.weight": row((16, 256), 3)},
-    }
-    store, source = mint(tmp_path, rows)
+def test_one_lane_carries_nvfp4_beside_int8(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = home(tmp_path / "tensorfs", monkeypatch)
+    shown: list[tuple[str, str, str, str]] = []
+    source = checkpoint(
+        store,
+        {
+            "transformer": {
+                "blocks.0.ff.weight": weight(48, 64, 1),
+                "proj_out.weight": weight(8, 64, 2),
+            },
+            "text_encoder": {"layers.0.q_proj.weight": weight(16, 256, 3)},
+        },
+    )
     plan = QuantizationPlan(
         components=("transformer", "text_encoder"),
         include=("transformer.blocks.*.weight", "text_encoder.layers.*.weight"),
         encodings=(EncodingRule("transformer.*", ENCODING),),
         output_precision="preserve",
     )
-    with NativeExecution(store, tmp_path, "nvfp4", {"source": source}, {"model": BOUND}) as owner:
-        artifact = quantize_into(
-            owner.context(),
-            fake_telemetry(fake_attempt("nvfp4")),
-            source=Weights(source.manifest.digest),
-            plan=plan,
-            encoding="int8-convrot256/1",
-            output="model",
-        )
-    parsed = header(store, artifact)
-    q_proj = parsed["components"]["text_encoder"]["layers.0.q_proj.weight"]
-    assert q_proj["encoding"] == dict(tensorfs.seed_digests())["int8-convrot256/1"]
-    # The base role set, first of the four the alias files.
-    assert next(d for a, d in tensorfs.seed_digests() if a == ENCODING) == SPEC_NVFP4
-    ff = parsed["components"]["transformer"]["blocks.0.ff.weight"]
-    parts = ff["parts"]
-    assert ff["encoding"] == SPEC_NVFP4
-    assert (parts["weight"]["dtype"], parts["weight"]["shape"]) == ("u8", [48, 32])
-    assert (parts["weight_scale"]["dtype"], parts["weight_scale"]["shape"]) == (
-        "f8_e4m3fn",
-        [48, 4],
+    quantize_into(
+        context(store, shown=shown), fake_telemetry(fake_attempt("nvfp4")), source=Weights(source),
+        plan=plan, encoding="int8.convrot", output="model",
+    )  # fmt: skip
+    out = adopted(store, shown)
+    q_proj = out.components["text_encoder"].tensors["layers.0.q_proj.weight"]
+    assert q_proj.encoding is not None and q_proj.encoding.scheme == "int8.convrot"
+    ff = out.components["transformer"].tensors["blocks.0.ff.weight"]
+    assert ff.encoding is not None and (ff.encoding.scheme, ff.encoding.params) == (
+        ENCODING,
+        {
+            "block_size": 16,
+            "global_scale": "multiply",
+            "nibble_order": "low_first",
+            "scale_layout": "row_major",
+        },
     )
-    assert (parts["weight_scale_2"]["dtype"], parts["weight_scale_2"]["shape"]) == ("f32", [])
-    assert parsed["components"]["transformer"]["proj_out.weight"]["encoding"] != SPEC_NVFP4
+    parts = {
+        role: (p.dtype, p.shape)
+        for role, p in raw.parts(out, "transformer", "blocks.0.ff.weight").items()
+    }
+    assert parts == {
+        "weight": ("F4", (48, 64)),
+        "scale": ("F8_E4M3", (48, 4)),
+        "scale_2": ("F32", ()),
+    }
+    assert out.components["transformer"].tensors["proj_out.weight"].encoding is None
 
 
 def roles(torch: Any, values: np.ndarray, device: str) -> dict[str, Any]:
@@ -94,11 +109,11 @@ def roles(torch: Any, values: np.ndarray, device: str) -> dict[str, Any]:
         "weight": torch.frombuffer(bytearray(encoded.payload), dtype=torch.uint8)
         .reshape(rows, cols // 2)
         .to(device),
-        "weight_scale": torch.frombuffer(bytearray(scale.raw), dtype=torch.uint8)
+        "scale": torch.frombuffer(bytearray(scale.raw), dtype=torch.uint8)
         .reshape(rows, cols // 16)
         .view(torch.float8_e4m3fn)
         .to(device),
-        "weight_scale_2": torch.frombuffer(bytearray(scale_2.raw), dtype=torch.float32)
+        "scale_2": torch.frombuffer(bytearray(scale_2.raw), dtype=torch.float32)
         .reshape(())
         .to(device),
     }
@@ -109,16 +124,17 @@ def test_decode_is_the_spec_law_and_the_mined_vectors() -> None:
     from cozy_runtime.internal import probe
     from cozy_runtime.internal.encoding import Nvfp4Dequant
 
-    provider = Nvfp4Dequant(SPEC_NVFP4)
+    provider = Nvfp4Dequant(params=PARAMS)
     vectors = probe._spec_vectors(torch, provider, torch.device("cpu"))
-    assert vectors.passed and not vectors.skipped and len(vectors.cases) == 2
+    nvfp4 = [c for c in probe.vector_cases() if c.encoding.scheme == "nvfp4" and not c.refuse]
+    assert vectors.passed and not vectors.skipped and len(vectors.cases) == len(nvfp4) >= 7
     for dtype in (torch.float32, torch.bfloat16, torch.float16):
         assert probe._numerics_nvfp4(torch, provider, torch.device("cpu"), dtype).passed
 
 
 def test_blocked_scales_round_trip() -> None:
     torch = pytest.importorskip("torch")
-    from cozy_runtime.internal.encoding.leaves import from_blocked, to_blocked
+    from cozy_runtime.internal.encoding.formats import from_blocked, to_blocked
 
     grid = torch.randint(0, 126, (200, 12), dtype=torch.uint8)
     assert torch.equal(from_blocked(torch, to_blocked(torch, grid), 200, 12), grid)
@@ -132,7 +148,7 @@ def test_leaf_matches_its_exact_weight() -> None:
     values = weight(256, 512, 5)
     x = torch.randn(3, 40, 512, generator=torch.Generator().manual_seed(9), dtype=torch.float64)
     devices = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
-    leaf_provider = Nvfp4NativeLeaf(SPEC_NVFP4)
+    leaf_provider = Nvfp4NativeLeaf(params=PARAMS)
     for device in devices:
         parts = roles(torch, values, device)
         exact = probe._exact_weight(torch, leaf_provider, parts).cpu()

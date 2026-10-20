@@ -1,0 +1,66 @@
+{
+  "number": 12087,
+  "status": "completed",
+  "execution_ms": 246412,
+  "calls": [
+    {
+      "function": "generate_ref2va_turbo",
+      "status": "succeeded",
+      "memoized": false,
+      "measurements": {
+        "execution": {
+          "ranks": [
+            {
+              "ordinal": 0,
+              "pid": 15518,
+              "uuid": "GPU-138f107f-b40e-eb26-2ff4-74e881cf26d7",
+              "start_us": 1792494175552837,
+              "end_us": 1792494368005950,
+              "arch": "sm_120"
+            }
+          ]
+        },
+        "memory": {
+          "activation_peak_bytes": 6262095872,
+          "alloc_ooms": 19,
+          "alloc_retries": 907,
+          "bounce_bytes": 0,
+          "budget_bytes": 16321085440,
+          "cache_released_bytes": 8543797248,
+          "cache_releases": 7,
+          "cap_bytes": 23141023744,
+          "context_bytes": 377487360,
+          "disk_bytes": 64354801216,
+          "evictions": 347,
+          "modes": {
+            "TileBatchedVideoVAE._decode_tiles.pieces": "10",
+            "audio_vae.grain": "sub-block",
+            "bands": "1 ops, 22220800 B of results in host memory",
+            "lora_bake": "fused",
+            "ref2va_dit.graphs": "runs as written in an attention layout's scope",
+            "ref2va_turbo.grain": "sub-block"
+          },
+          "oom_retries": 19,
+          "paged_in_bytes": 112781878976,
+          "paged_out": 0,
+          "paged_out_bytes": 0,
+          "peak_allocated_bytes": 5033752064,
+          "peak_reserved_bytes": 6400507904,
+          "process_bytes": 23053991936,
+          "register_failed": 0,
+          "reserved_bytes": 6385827840,
+          "shortfall": null,
+          "stage_peaks": {
+            "base_model.condition_ref2va_media": 339738624,
+            "base_model.condition_text": 356515840,
+            "base_model.decode_audio": 392167424,
+            "base_model.decode_video": 5767168000,
+            "base_model.sample_ref2va_turbo": 6262095872,
+            "turbo_lora.sample_ref2va": 6262095872
+          },
+          "weights_bytes": 16290676736
+        }
+      }
+    }
+  ]
+}

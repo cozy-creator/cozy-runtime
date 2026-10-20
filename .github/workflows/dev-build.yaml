@@ -58,7 +58,6 @@ jobs:
           ref: ${{ github.workflow_sha }}
           path: workflow
           sparse-checkout: |
-            scripts/prepare-release-source-access.sh
             scripts/ci-delegated.sh
           sparse-checkout-cone-mode: false
       - uses: actions/checkout@v4
@@ -73,18 +72,9 @@ jobs:
         with:
           repo-token: ${{ github.token }}
       - run: uv python install 3.12
-      - name: TensorFS read access (an arm runner builds TensorFS from its tag)
-        env:
-          TENSORFS_KEY: ${{ secrets.TENSORFS_READ_KEY }}
-        run: bash workflow/scripts/prepare-release-source-access.sh
-      # An arm runner builds the locked TensorFS from its tag until TensorFS publishes aarch64 wheels.
-      - working-directory: source
-        run: |
-          if [ "$RUNNER_ARCH" != ARM64 ]; then uv sync --locked; exit 0; fi
-          uv sync --locked --no-install-package tensorfs
-          version=$(grep -A1 '^name = "tensorfs"$' uv.lock | sed -n 's/^version = "\(.*\)"$/\1/p')
-          uv pip install "tensorfs @ git+https://github.com/cozy-creator/tensorfs@v$version"
-          echo UV_NO_SYNC=1 >> "$GITHUB_ENV"
+      # The lock selects the same TensorFS source/version on both supported Linux CPUs.
+      - run: uv sync --locked
+        working-directory: source
       # From here to the wheel check: publish.yaml's build job, step for step.
       # On either arch the Linux wheel is the pure one plus its kernels.
       - name: Build (sdist + pure-py wheel)

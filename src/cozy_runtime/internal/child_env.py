@@ -63,11 +63,15 @@ ERASED_PREFIXES: tuple[str, ...] = (
     # compiler cache out of the worker-boot scope that owns and deletes it.
     "FLASH_ATTENTION_",
     "TMPDIR",
+    # The machine's TensorFS store is imposed as the machine's own, never an inherited one.
+    "TENSORFS_",
 )
 
 #: The fill plane's capture directory, named here because the allowlist row and the config
 #: authority's reader must spell it identically and this is the table both read.
 FILL_FORENSICS_DIR = "COZY_FILL_FORENSICS_DIR"
+#: The machine's TensorFS store, which the executor reads and writes itself (owner D5).
+TENSORFS_HOME = "TENSORFS_HOME"
 EXECUTOR_SCOPE_ENV = "COZY_EXECUTOR_SCOPE"
 JIT_CACHE_ENV: tuple[tuple[str, str], ...] = (
     ("CUDA_CACHE_PATH", "cuda"),
@@ -180,6 +184,12 @@ CHILD_ENV_ALLOWLIST: tuple[ProjectedVar, ...] = (
         "the worker's own namespace of the same store, read-only to an isolated executor, "
         "so objects the Runtime built are shared without any placement writing where "
         "another placement reads",
+    ),
+    ProjectedVar(
+        TENSORFS_HOME,
+        "worker.tensorfs_home",
+        "the machine's TensorFS store: the executor opens its models there by header ref and "
+        "writes its derived weights there, the one store TensorD prefetches into. A location",
     ),
     ProjectedVar(
         FILL_FORENSICS_DIR,

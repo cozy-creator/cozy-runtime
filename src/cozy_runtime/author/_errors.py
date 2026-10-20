@@ -159,8 +159,8 @@ SUCCEEDED = Outcome("succeeded", "runtime", "ok")
 #: say. Measured: cl-003 watched a plan-arithmetic defect arrive as
 #: `AUTHOR_EXCEPTION/CAUSE_ORIGIN_AUTHOR` on a package that made no memory call.
 DEVICE_OOM = "device_out_of_memory"
-#: The one memory refusal (`internal.memory.MemoryExhausted`): the op did not fit with every
-#: rung of the ladder tried. Capacity, like DEVICE_OOM: it fails the attempt, never the process.
+#: The one memory refusal (`tensorfs.varena.torch.Exhausted`): it did not fit with every other
+#: evictable byte gone. Capacity, like DEVICE_OOM: it fails the attempt, never the process.
 MEMORY_EXHAUSTED = "memory_exhausted"
 
 
@@ -181,8 +181,8 @@ def is_device_oom(exc: BaseException) -> bool:
         return True
     if torch_error and name == "AcceleratorError":
         return getattr(exc, "error_code", None) == 2 or "out of memory" in text
-    if type(exc).__module__ == "tensorfs.plane":  # a driver call of the plane's (run 10996)
-        return name == "CudaError" and "CUDA_ERROR_OUT_OF_MEMORY" in text
+    if type(exc).__module__ == "tensorfs.varena":  # a driver call of the plane's (run 10996)
+        return is_varena_error(exc) and getattr(exc, "code", None) == "DEVICE_FULL"
     if not isinstance(exc, RuntimeError):
         return False
     if "NCCL" in text and "out of memory" in text:
@@ -199,6 +199,24 @@ def is_device_oom(exc: BaseException) -> bool:
             "MPS backend out of memory",
             "Invalid buffer size",
         )
+    )
+
+
+def is_capacity(exc: BaseException) -> bool:
+    """The device ran out: an allocation failure, or varena's `Exhausted`."""
+    exhausted = (
+        type(exc).__module__ == "tensorfs.varena.torch" and type(exc).__name__ == "Exhausted"
+    )
+    return exhausted or is_device_oom(exc)
+
+
+def is_varena_error(exc: BaseException) -> bool:
+    """The native manager's typed failure, without importing Torch or TensorFS."""
+    return (
+        type(exc).__module__ == "tensorfs.varena"
+        and type(exc).__name__ == "VarenaError"
+        and isinstance(getattr(exc, "code", None), str)
+        and type(getattr(exc, "sticky", None)) is bool
     )
 
 
@@ -243,6 +261,18 @@ def classify(exc: BaseException | None) -> Outcome:
     if is_device_oom(exc):
         first = str(exc).partition("\n")[0][:400] or "the device ran out of memory"
         return Outcome("failed", "runtime", DEVICE_OOM, first, (), _trace(exc))
+    if is_varena_error(exc):
+        return Outcome(
+            "failed",
+            "runtime",
+            getattr(exc, "code", "varena_failure"),
+            str(exc)[:400],
+            (),
+            _trace(exc),
+        )
+    if type(exc).__module__ == "tensorfs.varena.torch":  # varena's memory, named structurally
+        code = MEMORY_EXHAUSTED if type(exc).__name__ == "Exhausted" else "weight_unbound"
+        return Outcome("failed", "runtime", code, str(exc)[:400], (), _trace(exc))
     return Outcome(
         "failed",
         "author",

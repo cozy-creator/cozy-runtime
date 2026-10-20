@@ -1,6 +1,6 @@
 [project]
 name = "cozy-runtime"
-version = "0.28.2"
+version = "0.30.0"
 description = "Cozy author surface and device executor"
 # The native wheels carry the kernels (`kernels/`): derived from comfy-kitchen, vLLM and SGLang
 # (Apache-2.0, comfy-kitchen's NOTICE), with CUTLASS and FlashAttention-3 (BSD-3-Clause). The
@@ -13,7 +13,7 @@ license-files = [
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "tensorfs>=0.11,<0.12",
+    "tensorfs>=0.13,<0.14",
     "cryptography>=45",
     "msgspec>=0.19",
     "numpy>=1.26",
@@ -31,7 +31,7 @@ dev = [
     "cozy-eval==0.7.2",
     "ruff>=0.16",
     # Model-bound Runtime tests exercise the real compiled storage boundary.
-    "tensorfs>=0.11,<0.12",
+    "tensorfs>=0.13,<0.14",
     "av>=19.0.1",
     # CI partitions this unchanged suite across independent delegated runners.
     "pytest-split>=0.11.0",
@@ -61,6 +61,12 @@ cozy-native-wheel-proof = "cozy_runtime.cli.native_wheel_proof:main"
 testpaths = ["tests"]
 addopts = "-q -p no:cacheprovider"
 
+[[tool.mypy.overrides]]
+# Pending xs-045 U8: the MPS platform proof (platforms.yaml) still speaks the v1 TensorFS API and
+# skips at import until it is ported.
+module = ["test_mps"]
+ignore_errors = true
+
 [build-system]
 # The pure wheel and the sdist. `task wheel` makes each native wheel from the pure one plus that
 # platform's kernel modules (kernels.yaml).
@@ -78,6 +84,11 @@ packages = ["src/cozy_runtime"]
 package = true
 # The historical SDXL development corpus keeps its own locked dependency cohort.
 conflicts = [[{ extra = "corpus" }, { group = "diffusers" }]]
+
+# TensorFS 0.13 is unreleased: an exact cozy-creator commit (xs053/tfs-hard-cut) until the cohort
+# publishes it (never a test publish). The release replaces this with the version.
+[tool.uv.sources]
+tensorfs = { git = "https://github.com/cozy-creator/cozy-creator.git", rev = "2c6988f30e291f944abe7f669809906d5a6c41d1", subdirectory = "crates/tensorfs-py" }
 
 [tool.mypy]
 python_version = "3.12"
@@ -156,7 +167,7 @@ media = [
 # capability; base worker images provide TensorFS from the same PyPI range.
 # 0.3.82 hedges slow tail objects as fresh ranges (run 2322); 0.3.83 asks a wedged Hub again;
 # 0.3.84 carries the weight plane (`tensorfs.plane`) that executors load weights through.
-model-execution = ["tensorfs>=0.11,<0.12"]
+model-execution = ["tensorfs>=0.13,<0.14"]
 # peft takes any transformers. Without these floors a resolver that picks huggingface-hub 2.x
 # first backtracks to transformers 4.12, whose tokenizers has no wheel.
 adapters = [

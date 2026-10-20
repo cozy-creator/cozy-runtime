@@ -270,8 +270,8 @@ def _named_device(args: tuple[object, ...], kwargs: Mapping[str, object]) -> str
     it is the single most common construction idiom in the ecosystem."""
     candidates = [kwargs.get("device"), *args[1:3]]
     for value in candidates:
-        if value is None or isinstance(value, (int, bool)):
-            continue
+        if not isinstance(value, str) and type(value).__name__ != "device":
+            continue  # str() of anything else (a tensor, say) costs and names no device
         text = str(value)
         if text.startswith(("cpu", "cuda", "mps", "xpu", "hpu", "npu")):
             return text
@@ -451,6 +451,11 @@ def _guard_mode(seen: Observations) -> Any:
                 )
             if name.endswith("_") and not name.endswith("__") and args:
                 _check_inplace(name, args, seen)
+            # An init the fill overwrites, on no storage (`nn.init` passes it as `tensor=`): its
+            # meta kernels cost the factory seconds and write nothing.
+            target = args[0] if args else (kwargs or {}).get("tensor")
+            if name in _PURE_WRITE and isinstance(target, torch.Tensor) and is_virtual(target):
+                return target
             result = func(*args, **(kwargs or {}))
             if isinstance(result, torch.Tensor) and not is_virtual(result):
                 device = str(result.device)

@@ -16,7 +16,7 @@ from __future__ import annotations
 import hashlib
 import random
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, final
@@ -24,11 +24,10 @@ from typing import TYPE_CHECKING, Any, Literal, final
 from cozy_runtime.author._errors import Cancelled, CapabilityError, DeadlineExceeded
 
 if TYPE_CHECKING:
-    from tensorfs.derived import OutputCapability, SourceCapability
-
     from cozy_runtime.author._artifacts import ModelArtifact
     from cozy_runtime.author._loader import Scheduler
     from cozy_runtime.author._weights import Weights
+    from cozy_runtime.weights_store import Checkpoint, Derivation, Output
 
 DeviceType = Literal["cuda", "cpu", "mps"]
 
@@ -129,17 +128,17 @@ class Context:
     device: Device = field(default_factory=Device)
     _cancel: Callable[[], bool] = field(default=lambda: False, repr=False)
     _adapters: tuple[AdapterRef, ...] = field(default=(), repr=False)
-    _tensorfs_source: Callable[[Weights[Any]], SourceCapability] | None = field(
-        default=None, repr=False
-    )
-    _tensorfs_output: Callable[[str], OutputCapability] | None = field(default=None, repr=False)
-    _tensorfs_adopt: Callable[[Mapping[str, Any]], ModelArtifact] | None = field(
-        default=None, repr=False
-    )
+    _tensorfs_source: Callable[[Weights[Any]], Checkpoint] | None = field(default=None, repr=False)
+    _tensorfs_output: Callable[[str, Derivation], Output] | None = field(default=None, repr=False)
+    _tensorfs_adopt: Callable[[Output], ModelArtifact] | None = field(default=None, repr=False)
     _release_gpus: Callable[[], None] | None = field(default=None, repr=False)
+    _plan: Callable[[Sequence[str | Collection[str]]], None] | None = field(
+        default=None, repr=False
+    )
 
-    def tensorfs_source(self, weights: Weights[Any]) -> SourceCapability:
-        """Scoped TensorFS access to an admitted `Weights` argument's metadata and bytes."""
+    def tensorfs_source(self, weights: Weights[Any]) -> Checkpoint:
+        """An admitted `Weights` argument's checkpoint: its pipeline, components and stored
+        bytes."""
         self.raise_if_cancelled()
         if self._tensorfs_source is None:
             raise CapabilityError(
@@ -147,23 +146,25 @@ class Context:
             )
         return self._tensorfs_source(weights)
 
-    def output(self, slot: str) -> OutputCapability:
-        """Return one interface-declared TensorFS output, without enlarging its bound."""
+    def output(self, slot: str, derivation: Derivation) -> Output:
+        """Open one interface-declared weights output: a new checkpoint written into the store
+        from `derivation`'s base and sources, resumable, within the output's bound."""
         self.raise_if_cancelled()
         if self._tensorfs_output is None:
             raise CapabilityError(
-                "this attempt has no TensorFS output binding", code="weights_output_ungranted"
+                "this attempt has no weights output binding", code="weights_output_ungranted"
             )
-        return self._tensorfs_output(slot)
+        return self._tensorfs_output(slot, derivation)
 
-    def adopt_model(self, receipt: Mapping[str, Any]) -> ModelArtifact:
-        """Adopt the exact native result of this attempt's declared output."""
+    def adopt_model(self, output: Output) -> ModelArtifact:
+        """Commit `output` (a committed one replays), upload it to the run's destination when
+        it names one, and keep it as this attempt's model."""
         self.raise_if_cancelled()
         if self._tensorfs_adopt is None:
             raise CapabilityError(
-                "this attempt has no TensorFS receipt binding", code="weights_receipt_mismatch"
+                "this attempt has no weights adopt binding", code="weights_receipt_mismatch"
             )
-        return self._tensorfs_adopt(receipt)
+        return self._tensorfs_adopt(output)
 
     def release_gpus(self) -> None:
         """Say this request is done with GPUs for a long while, so the next request's GPU
@@ -185,6 +186,13 @@ class Context:
     def cancelled(self) -> bool:
         """THE cancellation question. A passed deadline IS cancellation, not a second flag."""
         return self._cancel() or time.monotonic() >= self.deadline
+
+    def plan(self, *steps: str | Collection[str]) -> None:
+        """The models this call runs, in order, so GPU memory evicts and restores by them: each
+        step a component name, or a set of names used together (`{"unet", "controlnet"}`).
+        Declare it before the first model runs; calling again replaces it. No sizes or times."""
+        if self._plan is not None:
+            self._plan(steps)
 
     def raise_if_cancelled(self) -> None:
         """THE cancellation spelling."""

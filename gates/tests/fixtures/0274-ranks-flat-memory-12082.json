@@ -1,0 +1,428 @@
+{
+  "number": 12082,
+  "status": "completed",
+  "execution_ms": 23462,
+  "created_at_ms": 1792493758391,
+  "settled_at_ms": 1792493832662,
+  "target": "fidika/flux-3-klein/generate@0.8.0",
+  "measurements": {
+    "attribution": {
+      "folded_names": 0,
+      "method": "perf_counter deltas accumulated in place: count/total/min/max/first/last and wall bounds per named span; step tracks keep up to 512 [end_unix_ms, ms] points",
+      "stages": {
+        "decoding image": {
+          "count": 1,
+          "ended_unix_ms": 1792493832310,
+          "first_ms": 567.253,
+          "last_ms": 567.253,
+          "max_ms": 567.253,
+          "mean_ms": 567.253,
+          "min_ms": 567.253,
+          "started_unix_ms": 1792493831743,
+          "total_ms": 567.253
+        },
+        "encoding prompt": {
+          "count": 1,
+          "ended_unix_ms": 1792493826945,
+          "first_ms": 583.809,
+          "last_ms": 583.809,
+          "max_ms": 583.809,
+          "mean_ms": 583.809,
+          "min_ms": 583.809,
+          "started_unix_ms": 1792493826361,
+          "total_ms": 583.809
+        },
+        "generating image": {
+          "count": 1,
+          "ended_unix_ms": 1792493831705,
+          "first_ms": 4445.053,
+          "last_ms": 4445.053,
+          "max_ms": 4445.053,
+          "mean_ms": 4445.053,
+          "min_ms": 4445.053,
+          "started_unix_ms": 1792493827260,
+          "total_ms": 4445.053
+        },
+        "loading weights": {
+          "count": 3,
+          "ended_unix_ms": 1792493831751,
+          "first_ms": 219.23,
+          "last_ms": 37.185,
+          "max_ms": 315.173,
+          "mean_ms": 190.529,
+          "min_ms": 37.185,
+          "started_unix_ms": 1792493826191,
+          "total_ms": 571.588
+        },
+        "saving image": {
+          "count": 1,
+          "ended_unix_ms": 1792493832330,
+          "first_ms": 19.397,
+          "last_ms": 19.397,
+          "max_ms": 19.397,
+          "mean_ms": 19.397,
+          "min_ms": 19.397,
+          "started_unix_ms": 1792493832310,
+          "total_ms": 19.397
+        }
+      },
+      "steps": {
+        "generating image": {
+          "count": 16,
+          "ended_unix_ms": 1792493831401,
+          "first_ms": 410.386,
+          "last_ms": 269.041,
+          "max_ms": 410.386,
+          "mean_ms": 258.787,
+          "min_ms": 70.392,
+          "series": [
+            [
+              1792493827671,
+              410.386
+            ],
+            [
+              1792493827741,
+              70.392
+            ],
+            [
+              1792493827912,
+              170.318
+            ],
+            [
+              1792493828179,
+              267.155
+            ],
+            [
+              1792493828446,
+              267.685
+            ],
+            [
+              1792493828714,
+              267.975
+            ],
+            [
+              1792493828983,
+              268.254
+            ],
+            [
+              1792493829251,
+              268.33
+            ],
+            [
+              1792493829520,
+              268.709
+            ],
+            [
+              1792493829788,
+              268.696
+            ],
+            [
+              1792493830057,
+              268.673
+            ],
+            [
+              1792493830326,
+              268.615
+            ],
+            [
+              1792493830594,
+              268.67
+            ],
+            [
+              1792493830863,
+              268.774
+            ],
+            [
+              1792493831132,
+              268.926
+            ],
+            [
+              1792493831401,
+              269.041
+            ]
+          ],
+          "series_dropped": 0,
+          "started_unix_ms": 1792493827260,
+          "total_ms": 4140.598
+        }
+      }
+    },
+    "execution": {
+      "construction": {
+        "fill_ms": 0.0,
+        "legs_ms": {
+          "model.admission": 0.0,
+          "model.attention_pin": 59.1,
+          "model.backend_ctor": 291.6,
+          "model.checkpoint_headers": 19.6,
+          "model.construct.census": 33.3,
+          "model.construct.factory": 252.2,
+          "model.construct.fill": 915.4,
+          "model.construct.fit": 7.9,
+          "model.construct_and_register": 1979.8,
+          "model.construction_config": 1.7,
+          "model.cuda_init": 0.0,
+          "model.execution_plan": 431.7,
+          "model.expect": 81.0,
+          "model.install": 81.9,
+          "model.measure_device": 106.2,
+          "model.package_import": 0.0,
+          "model.qualify": 11992.3,
+          "model.resolve": 163.4,
+          "model.runtime_imports": 0.2,
+          "model.torch_import": 0.1
+        },
+        "prepare_ms": 15215.99,
+        "prepared_unix_ms": 1792493825949,
+        "warm_ms": 0.0
+      },
+      "degree": 1,
+      "executor": {
+        "legs_ms": {
+          "cuda_init": 1540.0,
+          "fork": 220.5,
+          "package_import": 12585.2,
+          "package_warmup": 0.0,
+          "runtime_imports": 0.0,
+          "torch_import": 0.0
+        },
+        "ms": 1540.0,
+        "started_unix_ms": 1792493809149
+      },
+      "ranks": [
+        {
+          "arch": "sm_120",
+          "attention": {
+            "impl": "kitchen-int8:comfy_kitchen.int8_attention,sdpa:efficient+flash",
+            "kernels": [
+              {
+                "compile_ms": 833.3,
+                "kernel": "kitchen-int8",
+                "line": "ready (compiled in 0.8 s)",
+                "served": true,
+                "state": "ready"
+              },
+              {
+                "kernel": "sdpa",
+                "line": "ready",
+                "served": true,
+                "state": "ready"
+              }
+            ],
+            "observed": "transformer=kitchen-int8+sdpa,vae=sdpa",
+            "requested": ""
+          },
+          "end_us": 1792493832336090,
+          "ordinal": 0,
+          "pid": 3162,
+          "rank": 0,
+          "start_us": 1792493826115588,
+          "uuid": "GPU-138f107f-b40e-eb26-2ff4-74e881cf26d7"
+        }
+      ],
+      "spread": {}
+    },
+    "memory": {
+      "activation_peak_bytes": 4320133120,
+      "alloc_ooms": 0,
+      "alloc_retries": 0,
+      "bounce_bytes": 0,
+      "budget_bytes": 10057940992,
+      "cache_released_bytes": 0,
+      "cache_releases": 0,
+      "cap_bytes": 24874778624,
+      "context_bytes": 396361728,
+      "disk_bytes": 9925721608,
+      "evictions": 0,
+      "modes": {},
+      "oom_retries": 0,
+      "paged_in_bytes": 9925721608,
+      "paged_out": 0,
+      "paged_out_bytes": 0,
+      "peak_allocated_bytes": 4100327424,
+      "peak_reserved_bytes": 4968153088,
+      "process_bytes": 15422455808,
+      "register_failed": 0,
+      "reserved_bytes": 4968153088,
+      "shortfall": null,
+      "stage_peaks": {
+        "decode": 4320133120,
+        "denoise": 545259520,
+        "encode": 20073472
+      },
+      "weights_bytes": 10057940992
+    },
+    "models": [
+      {
+        "lane": "bf16",
+        "manifest": "sha256:3c5527a98f98861311fd0cddf10a1daf6fddc75feaaa5c1787dfa9d7e3d0e98d",
+        "release": "0.2.0",
+        "repository": "fidika/qwen3.5-9b-mtp",
+        "slot": "drafter"
+      },
+      {
+        "lane": "int8",
+        "manifest": "sha256:d3e97bd4dde52c09dc2f3f05ce0a80660d25bb2cbe96cec5573f24fc411b2f63",
+        "release": "0.1.0",
+        "repository": "fidika/flux-3-klein",
+        "slot": "model"
+      },
+      {
+        "lane": "int8",
+        "manifest": "sha256:c87b2c7b025722af06e62dc9c00e4f74b75ce55834c11babbafadaca222568e2",
+        "release": "0.2.0",
+        "repository": "fidika/flux-3-klein-upsampler",
+        "slot": "upsampler"
+      }
+    ],
+    "observations": [
+      {
+        "at_unix_ms": 1792493832331,
+        "attempt_key": "1",
+        "fields": {
+          "component": "model/text_encoder",
+          "format": "int8",
+          "leaf": "cozy.int8-convrot256.native-leaf/1",
+          "sites": 224
+        },
+        "kind": "confession",
+        "name": "gemm.selected",
+        "seq": 8,
+        "value": "comfy-kitchen"
+      },
+      {
+        "at_unix_ms": 1792493832331,
+        "attempt_key": "1",
+        "fields": {
+          "component": "model/transformer",
+          "format": "int8",
+          "leaf": "cozy.int8-convrot256.native-leaf/1",
+          "sites": 266
+        },
+        "kind": "confession",
+        "name": "gemm.selected",
+        "seq": 9,
+        "value": "comfy-kitchen"
+      },
+      {
+        "at_unix_ms": 1792493832331,
+        "attempt_key": "1",
+        "fields": {
+          "artifact": "comfy-kitchen",
+          "compile_ms": "833.3",
+          "key": "2c34122edcea8f38",
+          "selection": "attention.selected"
+        },
+        "kind": "confession",
+        "name": "attention.artifact",
+        "seq": 12,
+        "value": "kitchen-int8"
+      },
+      {
+        "at_unix_ms": 1792493832331,
+        "attempt_key": "1",
+        "fields": {
+          "component": "model/transformer",
+          "dense_reference": "",
+          "pin": "",
+          "sites": 33
+        },
+        "kind": "confession",
+        "name": "attention.selected",
+        "seq": 13,
+        "value": "kitchen-int8"
+      },
+      {
+        "at_unix_ms": 1792493832331,
+        "attempt_key": "1",
+        "fields": {
+          "component": "model/transformer",
+          "dense_reference": "",
+          "pin": "",
+          "sites": 10
+        },
+        "kind": "confession",
+        "name": "attention.selected",
+        "seq": 14,
+        "value": "sdpa"
+      },
+      {
+        "at_unix_ms": 1792493832331,
+        "attempt_key": "1",
+        "fields": {
+          "component": "model/vae",
+          "dense_reference": "",
+          "pin": "",
+          "sites": 2
+        },
+        "kind": "confession",
+        "name": "attention.selected",
+        "seq": 15,
+        "value": "sdpa"
+      },
+      {
+        "at_unix_ms": 1792493832331,
+        "attempt_key": "1",
+        "fields": {
+          "artifact": "comfy-kitchen",
+          "compile_ms": "833.3",
+          "key": "2c34122edcea8f38",
+          "selection": "attention.restored"
+        },
+        "kind": "confession",
+        "name": "attention.artifact",
+        "seq": 16,
+        "value": "kitchen-int8"
+      },
+      {
+        "at_unix_ms": 1792493832331,
+        "attempt_key": "1",
+        "fields": {
+          "component": "model/transformer",
+          "dense_reference": "",
+          "pin": "",
+          "sites": 33
+        },
+        "kind": "confession",
+        "name": "attention.restored",
+        "seq": 17,
+        "value": "kitchen-int8"
+      },
+      {
+        "at_unix_ms": 1792493832331,
+        "attempt_key": "1",
+        "fields": {
+          "component": "model/transformer",
+          "dense_reference": "",
+          "pin": "",
+          "sites": 10
+        },
+        "kind": "confession",
+        "name": "attention.restored",
+        "seq": 18,
+        "value": "sdpa"
+      },
+      {
+        "at_unix_ms": 1792493832331,
+        "attempt_key": "1",
+        "fields": {
+          "component": "model/vae",
+          "dense_reference": "",
+          "pin": "",
+          "sites": 2
+        },
+        "kind": "confession",
+        "name": "attention.restored",
+        "seq": 19,
+        "value": "sdpa"
+      }
+    ],
+    "software": {
+      "attempt_ordinal": 1,
+      "runtime": "0.27.4",
+      "tensord": "0.10.2+dev.gb517cd77",
+      "tensord_commit": "b517cd777eb2353dfb2f2ead3a10809b15dfc892",
+      "tensorfs": "0.10.0"
+    }
+  }
+}

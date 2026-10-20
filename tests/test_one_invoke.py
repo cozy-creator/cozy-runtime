@@ -1,5 +1,5 @@
 """One Invoke serves every function: `Weights[M]` sources and weights-output grants ride the
-attempt, over a real Store, a real seam and the owner's writer channels."""
+attempt, over a real store and a real seam; the executor reads and writes the store itself."""
 
 from __future__ import annotations
 
@@ -14,17 +14,22 @@ import numpy as np
 import pytest
 import tensorfs
 
+from cozy_runtime import weights_store
 from cozy_runtime.author import ModelArtifact, describe
-from cozy_runtime.author._artifacts import ObjectRef
-from cozy_runtime.author._executor_requests import ChildCall, Reply, Request, refuse
+from cozy_runtime.author._executor_requests import (
+    Answer,
+    CheckpointItem,
+    ChildCall,
+    Reply,
+    Request,
+    refuse,
+)
+from cozy_runtime.derive import safetensors_io as st
 from cozy_runtime.derive.operations import MAX_QUANTIZED_BYTES, QuantizationPlan, app
-from cozy_runtime.internal import weights_sink
 from cozy_runtime.internal.discovery import Discovered, discover
 from cozy_runtime.internal.seam import RESULT_DOCUMENT
-from native_weights import NativeExecution
 from session import session
-from test_quantize_artifact_native import _source
-from weights_channel import broker_lane
+from store_fixtures import home
 
 MODULE = "one_invoke_fixture"
 QUANTIZE = "cozy_runtime.derive.operations"
@@ -59,9 +64,10 @@ app.entrypoint(calls_child, accelerator=False)
 @invocable
 async def calls_quantize(ctx: Context, *, artifact: ModelArtifact) -> ModelArtifact:
     plan = QuantizationPlan(("unet",))
-    return await quantize(source=artifact, plan=plan, encoding="fp8-rowwise/1")
+    return await quantize(source=artifact, plan=plan, encoding="fp8.rowwise")
 app.entrypoint(calls_quantize, accelerator=False)
 """
+VALUES = np.random.default_rng(22).normal(0, 0.05, (8, 64)).astype(np.float32)
 
 
 @pytest.fixture
@@ -74,61 +80,77 @@ def package(tmp_path: Path) -> Iterator[Discovered]:
     sys.modules.pop(MODULE, None)
 
 
+def _source(root: Path, monkeypatch: pytest.MonkeyPatch) -> str:
+    """A bf16 `unet` of three tensors, each the same values plus its index."""
+    store = home(root, monkeypatch)
+    bf16 = {
+        key: np.frombuffer(st.from_f32(VALUES + index, "BF16"), np.uint16).reshape(8, 64)
+        for index, key in enumerate(("z.weight", "a.weight", "bias"))
+    }
+    writer = tensorfs.Writer(cache_dir=store)
+    unet = writer.component("unet", cls="diffusers.UNet2DConditionModel", config={"in": 64})
+    for key, value in bf16.items():
+        unet.put(key, memoryview(value), dtype="BF16", shape=[8, 64])
+    ref = writer.commit().id
+    assert ref is not None
+    return ref
+
+
 def test_a_weights_argument_reads_the_checkpoint_its_attempt_names(
-    tmp_path: Path, package: Discovered
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, package: Discovered
 ) -> None:
-    store = tensorfs.Store.init(tmp_path / "store")
-    source = _source(store, "unet")
-    root = tmp_path / "attempts"
-    with (
-        NativeExecution(store, root, "read", {"source": source}, {}) as owner,
-        session(tmp_path, package) as host,
-    ):
-        host.handler = broker_lane(owner.broker, owner.attempt)
-        reply = host.run(
-            "read", {"component": "unet"}, owner.spool, sources={"source": source.manifest.digest}
-        )
+    source = _source(tmp_path / "tensorfs", monkeypatch)
+    with session(tmp_path, package) as host:
+        spool = tmp_path / "read"
+        reply = host.run("read", {"component": "unet"}, spool, sources={"source": source})
         assert reply["outcome"]["terminal"] == "succeeded", reply["outcome"]
-        read = json.loads((owner.spool / RESULT_DOCUMENT).read_bytes())
+        read = json.loads((spool / RESULT_DOCUMENT).read_bytes())
         assert read["keys"] == ["a.weight", "bias", "z.weight"]
-        written = np.random.default_rng(22).normal(0, 0.05, (8, 64)).astype(np.float32) + 1
-        assert np.allclose(read["values"], written[0, :4], atol=1e-2)
-        # The next attempt names no checkpoint: the last one's grant never carries over.
-        again = host.run("read", {"component": "unet"}, root / "again")
+        assert np.allclose(read["values"], VALUES[0, :4] + 1, atol=1e-2)
+        # The next attempt names no checkpoint: the last one's never carries over.
+        again = host.run("read", {"component": "unet"}, tmp_path / "again")
         assert again["outcome"]["code"] == "unbound_model", again["outcome"]
 
 
 @pytest.mark.parametrize("granted", [True, False])
-def test_a_writers_output_lands_only_through_its_grant(tmp_path: Path, granted: bool) -> None:
-    store = tensorfs.Store.init(tmp_path / "store")
-    source = _source(store, "unet")
+def test_a_writers_output_lands_only_through_its_grant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, granted: bool
+) -> None:
+    source = _source(tmp_path / "tensorfs", monkeypatch)
     module = sys.modules[app.get("quantize").fn.__module__]
     builtin = Discovered(app, f"{module.__name__}:app", tmp_path, module, describe(app))
     outputs = {"model": MAX_QUANTIZED_BYTES}
-    with (
-        NativeExecution(
-            store, tmp_path / "attempts", "quantize", {"source": source}, outputs
-        ) as owner,
-        session(tmp_path, builtin) as host,
-    ):
-        host.handler = broker_lane(owner.broker, owner.attempt)
+    shown: list[CheckpointItem] = []
+
+    def machine(request: Request) -> Reply:
+        if not isinstance(request, CheckpointItem):
+            return refuse("no_durable_exchange", type(request).__name__)
+        shown.append(request)
+        return Answer(ok=True)
+
+    spool = tmp_path / "quantize"
+    with session(tmp_path, builtin) as host:
+        host.handler = machine
         reply = host.run(
             "quantize",
-            {"plan": msgspec.to_builtins(QuantizationPlan(("unet",))), "encoding": "fp8-rowwise/1"},
-            owner.spool,
-            sources={"source": source.manifest.digest},
+            {"plan": msgspec.to_builtins(QuantizationPlan(("unet",))), "encoding": "fp8.rowwise"},
+            spool,
+            sources={"source": source},
             weights=outputs if granted else {},
         )
     if not granted:
         assert reply["outcome"]["code"] == "weights_output_ungranted", reply["outcome"]
-        assert not owner.receipts
+        assert not shown
         return
     assert reply["outcome"]["terminal"] == "succeeded", reply["outcome"]
-    result = msgspec.json.decode((owner.spool / RESULT_DOCUMENT).read_bytes(), type=ModelArtifact)
-    (receipt,) = owner.receipts.values()
-    assert result.manifest.digest == weights_sink.native_receipt(receipt).manifest.digest
-    assert store.manifest(result.manifest.digest)["header"] is not None
-    assert result.manifest.digest != source.manifest.digest
+    result = msgspec.json.decode((spool / RESULT_DOCUMENT).read_bytes(), type=ModelArtifact)
+    assert result.checkpoint != source
+    (item,) = shown
+    assert (item.output, item.repo_id) == ("model", weights_store.DERIVED)
+    lane = tensorfs.open(item.revision, cache_dir=tmp_path / "tensorfs", local_files_only=True)
+    assert lane.id == result.checkpoint
+    encoded = lane.components["unet"].tensors["a.weight"].encoding
+    assert encoded is not None and encoded.scheme == "fp8.rowwise"
 
 
 @pytest.mark.parametrize(
@@ -140,7 +162,7 @@ def test_a_writers_output_lands_only_through_its_grant(tmp_path: Path, granted: 
             {"module": QUANTIZE, "export": "quantize", "builtin": "operations"},
             {
                 "plan": json.loads(msgspec.json.encode(QuantizationPlan(("unet",)))),
-                "encoding": "fp8-rowwise/1",
+                "encoding": "fp8.rowwise",
             },
         ),
     ],
@@ -148,9 +170,7 @@ def test_a_writers_output_lands_only_through_its_grant(tmp_path: Path, granted: 
 def test_a_direct_call_carries_its_models_beside_its_request(
     tmp_path: Path, package: Discovered, root: str, row: dict[str, Any], payload: dict[str, Any]
 ) -> None:
-    artifact = ModelArtifact(
-        "producer", "model", ObjectRef("sha256:" + "ab" * 32, 9), "sha256:" + "cd" * 32
-    )
+    artifact = ModelArtifact("producer", "model", "sha256:" + "ab" * 32, "sha256:" + "cd" * 32)
     calls: list[ChildCall] = []
 
     def owner(request: Request) -> Reply:

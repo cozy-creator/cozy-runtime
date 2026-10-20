@@ -97,3 +97,15 @@ def test_a_length_prefix_over_the_guard_is_refused_before_its_body() -> None:
         with pytest.raises(SeamError) as refused:
             Channel(right).recv(timeout=5)
     assert refused.value.code == "frame_over_cap"
+
+
+@pytest.mark.parametrize("command", ["load", "invoke"])
+def test_normal_tensorfs_options_cross_the_command_seam(command: str) -> None:
+    frame = {
+        "cmd": command,
+        "tensorfs": {"endpoint": "https://endpoint.example", "token": "supplied-bearer"},
+    }
+    left, right = socket.socketpair()
+    with left, right:
+        Channel(left).send(frame)
+        assert Channel(right).recv(timeout=5) == frame

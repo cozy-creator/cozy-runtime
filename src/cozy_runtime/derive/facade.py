@@ -1,26 +1,19 @@
-"""cr-076: ``plan(components, encoding)`` + ``quantize(source, plan)`` at the dozen-line bar.
+"""cr-076: ``plan(components, encoding)`` + ``quantize(source, plan)``.
 
-One thin layer over the existing derivation math in ``.quantization`` — a per-family
-ingest producer is its model class, one ``plan(...)``, and its threshold policy.
-``quantize`` opens one declared lane transaction, normalizes every plain f32 tensor to
-BF16 as a recorded derivation (FP16 is opt-in; ``keep``-listed components stay
-at source precision; per-tensor round-trip stats recorded on the cut), encodes the
-plan's selected GEMM weights, and runs the tier-1 tripwire INSIDE (per-tensor
-round-trip against the encoding bound, worst relative Frobenius against the declared
-threshold), refusing typed with code ``quantization_tripwire`` on encoding breakage.
-The ``encoding=None`` lane is the canonical ingest lane and its result says so.
-The managed operation can preserve source precision through its explicit policy.
+``quantize`` opens one declared output over the source, normalizes every plain f32 tensor to
+BF16 (FP16 opt-in; ``keep``-listed components stay at source precision; per-tensor round-trip
+stats recorded), encodes the plan's selected weights, and runs the tier-1 tripwire inside
+(round-trip against the scheme's bound, worst relative Frobenius against the declared
+threshold), refusing ``quantization_tripwire``. ``encoding=None`` is the canonical bf16 lane.
 """
 
 from __future__ import annotations
 
 import math
 from collections.abc import Sequence
-from dataclasses import replace
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import msgspec
-from tensorfs.derived import Derivation, SourceInspection, Target, derive
 
 from cozy_runtime.author import (
     Context,
@@ -29,9 +22,20 @@ from cozy_runtime.author import (
     UnsupportedInput,
     Weights,
 )
+from cozy_runtime.weights_store import Checkpoint, Derivation
 
-if TYPE_CHECKING:
-    from .quantization import ArtifactQuantizationPlan
+from .quantization import (
+    _ENCODINGS,
+    ArtifactQuantizationPlan,
+    ArtifactQuantizationRequest,
+    bf16_source_dtypes,
+    column_block,
+    prepare_bf16,
+    prepare_source_quantization,
+    quantize_component_into,
+    source_rows,
+    write_bf16,
+)
 
 
 class QuantizePlan(msgspec.Struct, frozen=True):
@@ -57,7 +61,9 @@ class QuantizeResult(msgspec.Struct):
 
     output: str
     weights_transaction_id: str
-    tensorfs_receipt_digest: str
+    #: the committed checkpoint's header ref
+    checkpoint: str
+    #: nothing was written this run: the output was committed, or journaled whole, before
     replayed: bool
     encoded_keys: int
     reused_keys: int
@@ -89,8 +95,6 @@ def plan(
     selected float tensors inherit at source precision instead of normalizing to bf16.
     ``bf16_sources=("f16", "f32")`` also prepares FP16 adapters ahead of inference.
     """
-    from .quantization import _ENCODINGS, bf16_source_dtypes
-
     selected = tuple(components)
     kept = tuple(keep)
     if len(set(kept)) != len(kept) or any(not name for name in kept):
@@ -136,7 +140,7 @@ def plan(
 
 
 def quantize(
-    source: Weights[Any] | SourceInspection,
+    source: Weights[Any] | Checkpoint,
     plan: QuantizePlan,
     /,
     *,
@@ -144,16 +148,13 @@ def quantize(
     tel: Telemetry,
     output: str = "model",
 ) -> QuantizeResult:
-    """Run one lane end-to-end and commit it, tier-1 tripwire inside.
-
-    ``source`` is a granted ``Weights`` argument or the native source inspection
-    already fetched from it — both reach the same tensors.
-    """
+    """Run one lane end-to-end and commit it, tier-1 tripwire inside. ``source`` is a granted
+    ``Weights`` argument or the source already opened from it."""
     return _quantize(source, plan, ctx=ctx, tel=tel, output=output)[0]
 
 
 def quantize_artifact(
-    source: Weights[Any] | SourceInspection,
+    source: Weights[Any] | Checkpoint,
     plan: QuantizePlan,
     /,
     *,
@@ -161,13 +162,10 @@ def quantize_artifact(
     tel: Telemetry,
     output: str = "model",
 ) -> ModelArtifact:
-    """Run the same lane kernel and return its immutable managed-call artifact.
-
-    Measurements and receipt provenance remain on the original execution. The result
-    contains no per-attempt counters, so memoized operations can retain it unchanged.
-    """
-    result, receipt = _quantize(source, plan, ctx=ctx, tel=tel, output=output)
-    return _artifact_result(result, receipt, tel, output)
+    """The same lane, returning its immutable managed-call artifact (no per-attempt counters,
+    so memoized operations can retain it unchanged)."""
+    result, artifact = _quantize(source, plan, ctx=ctx, tel=tel, output=output)
+    return _artifact_result(result, artifact, tel, output)
 
 
 def _artifact_result(
@@ -188,7 +186,7 @@ def _artifact_result(
 
 
 def _quantize(
-    source: Weights[Any] | SourceInspection,
+    source: Weights[Any] | Checkpoint,
     plan: QuantizePlan,
     /,
     *,
@@ -197,120 +195,43 @@ def _quantize(
     output: str,
     selection: ArtifactQuantizationPlan | None = None,
     preserve_precision: bool = False,
-    source_view: SourceInspection | None = None,
 ) -> tuple[QuantizeResult, ModelArtifact]:
-    from .quantization import (
-        ArtifactQuantizationRequest,
-        bf16_targets,
-        column_block,
-        inherited_configs,
-        prepare_bf16,
-        prepare_source_quantization,
-        quantization_additions,
-        quantize_component_into,
-        source_rows,
-        write_bf16,
-    )
-
-    if isinstance(source, SourceInspection):
-        source_capability = source.source
-        structure = source
-    else:
-        source_capability = ctx.tensorfs_source(source)
-        structure = source_view or source_capability.inspect()
+    opened = source if isinstance(source, Checkpoint) else ctx.tensorfs_source(source)
     keep = (
-        tuple(dict.fromkeys(component for component, _, _ in source_rows(structure)))
+        tuple(dict.fromkeys(component for component, _, _ in source_rows(opened)))
         if preserve_precision
         else plan.keep
     )
-    bf16 = prepare_bf16(structure, keep=keep, source_dtypes=plan.bf16_sources)
-    canonical = plan.encoding is None
-    if plan.encoding is None:
-        artifact = None
-        selected: set[tuple[str, str]] = set()
-        targets = bf16_targets(bf16, source="source")
-    else:
+    bf16 = prepare_bf16(opened, keep=keep, source_dtypes=plan.bf16_sources)
+    artifact = None
+    if plan.encoding is not None:
         artifact = selection or prepare_source_quantization(
-            structure, components=plan.components, block=column_block(plan.encoding)
+            opened, components=plan.components, block=column_block(plan.encoding)
         )
-        selected = {(tensor.component, tensor.key) for tensor in artifact.tensors}
-        targets = bf16_targets(bf16, source="source", excluded=selected)
-        for component in artifact.components:
-            # Encoded tensors follow the same explicit logical-dtype cut as the
-            # unselected tensors. The encoding still reads the original values.
-            additions = quantization_additions(plan.encoding, artifact, component)
-            combined = {
-                **targets[component].add,
-                **{
-                    key: replace(tensor, logical_dtype="bf16")
-                    if tensor.logical_dtype in plan.bf16_sources and not preserve_precision
-                    else tensor
-                    for key, tensor in additions.items()
-                },
-            }
-            targets[component] = Target(
-                source="source",
-                source_component=component,
-                drop=tuple(sorted(combined)),
-                add=combined,
-            )
-    converted = [
-        tensor for tensor in bf16.tensors if (tensor.component, tensor.key) not in selected
-    ]
-    encoded = 0 if artifact is None else len(artifact.tensors)
+    selected = {(t.component, t.key) for t in artifact.tensors} if artifact else set()
+    converted = [t for t in bf16.tensors if (t.component, t.key) not in selected]
+    encoded = len(selected)
     inherited = len(bf16.order) - len(converted) - encoded
 
-    configs = inherited_configs(bf16, source="source")
-    manager = derive(
-        ctx.output(output), Derivation({"source": source_capability}, targets, configs, bf16.order)
-    )
-    with manager as transaction:
-        if transaction.receipt is not None:
-            receipt = transaction.receipt
-            result_artifact = ctx.adopt_model(receipt)
-            transaction_id = receipt["transaction_id"]
-            return QuantizeResult(
-                output=output,
-                weights_transaction_id=transaction_id,
-                tensorfs_receipt_digest=result_artifact.tensorfs_receipt_digest,
-                replayed=True,
-                encoded_keys=encoded,
-                reused_keys=encoded + len(converted),
-                converted_keys=len(converted),
-                inherited_keys=inherited,
-                source_bytes_read_this_run=0,
-                new_bytes_written_this_run=0,
-                saturated_elements_this_run=0,
-                worst_relative_frobenius=None,
-                kept_keys=len(bf16.kept),
-                normalization_worst_relative_frobenius=None,
-                canonical=canonical,
-            ), result_artifact
-        normalization = write_bf16(
-            transaction, ctx, tel, plan=bf16, source="source", excluded=selected or None
-        )
-        read = normalization.source_bytes_read
-        written = normalization.new_bytes_written
-        saturated = 0
+    def logical(tensor: Any) -> str:
+        if tensor.logical_dtype in plan.bf16_sources and not preserve_precision:
+            return "bf16"
+        return str(tensor.logical_dtype)
+
+    with ctx.output(output, Derivation(base=opened, order=bf16.order)) as out:
+        normalization = write_bf16(opened, out, ctx, tel, plan=bf16, excluded=selected or None)
+        read, written = normalization.source_bytes_read, normalization.new_bytes_written
+        reused, saturated = normalization.reused_keys, 0
         worst: float | None = 0.0
-        reused = 0
         if artifact is not None and plan.encoding is not None:
-            payload = ArtifactQuantizationRequest(
+            request = ArtifactQuantizationRequest(
                 max_relative_frobenius=plan.max_relative_frobenius
             )
             for component in artifact.components:
                 stats = quantize_component_into(
-                    transaction,
-                    ctx,
-                    payload,
-                    tel,
-                    encoding=plan.encoding,
-                    plan=artifact,
-                    component=component,
-                    source="source",
-                    source_component=component,
-                    target_component=component,
-                )
+                    opened, out, ctx, request, tel, encoding=plan.encoding, plan=artifact,
+                    component=component, logical_dtype=logical,
+                )  # fmt: skip
                 read += stats.source_bytes_read
                 written += stats.new_bytes_written
                 saturated += stats.saturated_elements
@@ -320,14 +241,13 @@ def _quantize(
                     if worst is not None and stats.worst_relative_frobenius is not None
                     else None
                 )
-        receipt = transaction.commit()
-        result_artifact = ctx.adopt_model(receipt)
-        transaction_id = receipt["transaction_id"]
+        result_artifact = ctx.adopt_model(out)
+        transaction = out.transaction
     return QuantizeResult(
         output=output,
-        weights_transaction_id=transaction_id,
-        tensorfs_receipt_digest=result_artifact.tensorfs_receipt_digest,
-        replayed=False,
+        weights_transaction_id=transaction,
+        checkpoint=result_artifact.checkpoint,
+        replayed=reused == encoded + len(converted),
         encoded_keys=encoded,
         reused_keys=reused,
         converted_keys=len(converted),
@@ -338,5 +258,5 @@ def _quantize(
         worst_relative_frobenius=worst,
         kept_keys=len(bf16.kept),
         normalization_worst_relative_frobenius=normalization.worst_relative_frobenius,
-        canonical=canonical,
+        canonical=plan.encoding is None,
     ), result_artifact

@@ -179,9 +179,11 @@ def test_a_forked_child_is_a_sealed_executor_with_the_imports_done(
     zygote: tuple[subprocess.Popen[bytes], Channel, dict[str, Any]], tmp_path: Path
 ) -> None:
     process, channel, start = zygote
+    start = {**start, "authorized_device_limit_bytes": 6 << 30}
     hello = _call(channel, {"cmd": "hello"})
-    assert "fork/1" in hello["memory"]
+    assert "fork/1" in hello["capabilities"]
     assert _call(channel, {**start, "import_only": True})["ok"]
+    assert not _call(channel, {"cmd": "hello"})["torch_loaded"]
     listener = _listener(tmp_path / "a.sock")
     began = time.monotonic()
     forked = _fork(tmp_path, channel, "a")
@@ -223,30 +225,17 @@ def test_a_fork_refuses_what_it_cannot_keep(
     assert not started["ok"] and started["code"] == "fork_unready"
 
 
-@pytest.mark.parametrize("many", [False, True])
-def test_model_load_requires_sources_and_leaves_weightless_execution_usable(
-    zygote: tuple[subprocess.Popen[bytes], Channel, dict[str, Any]], tmp_path: Path, many: bool
+def test_a_forked_child_loads_and_invokes_a_weightless_package(
+    zygote: tuple[subprocess.Popen[bytes], Channel, dict[str, Any]], tmp_path: Path
 ) -> None:
-    """A real control peer cannot turn an installed full Store into model authority."""
-    import tensorfs
-
-    store = tensorfs.Store.init(tmp_path / "store")
     _process, channel, start = zygote
-    assert _call(channel, start)["ok"]
-    binding = {"model_class": "UnimportableModel", "store": str(store.root)}
-    command: dict[str, Any] = {"cmd": "load", "construction": "ungranted", "devices": ""}
-    command.update(
-        {
-            "models": [
-                {"binding": {**binding, "model_binding_path": name, "model_parameter_name": name}}
-                for name in ("first", "second")
-            ]
-        }
-        if many
-        else {"binding": binding}
-    )
+    assert _call(channel, {**start, "import_only": True})["ok"]
+    listener = _listener(tmp_path / "run.sock")
+    assert _fork(tmp_path, channel, "run")["ok"]
+    child, pid = _accept(listener)
+    assert _call(child, start)["ok"]
     loaded = _call(
-        channel,
+        child,
         {
             "cmd": "load",
             "construction": "weightless",
@@ -258,10 +247,17 @@ def test_model_load_requires_sources_and_leaves_weightless_execution_usable(
         },
     )
     assert loaded["ok"], loaded
-    # A model-bearing load meets its own admission check. It does not require a particular
-    # wheel flavor or fabricate a device budget for this peer.
-    admitted = _call(channel, command)
-    assert admitted["code"] == "authorization_absent", admitted
+    assert _call(child, {"cmd": "activate", "construction": "weightless"})["ok"]
+    attempt = {"request_id": "r", "entrypoint": "generate"}
+    assert _call(child, {"cmd": "prepare_request", **attempt, "payload": {"n": 41}})["ok"]
+    spool = tmp_path / "run" / "r"
+    spool.mkdir()
+    reply = _call(child, {"cmd": "invoke", **attempt, "spool": str(spool), "deadline_s": 60})
+    assert reply["outcome"]["terminal"] == "succeeded", reply
+    assert json.loads((spool / "result.canonical").read_bytes()) == {"value": 42}
+    assert not _call(child, {"cmd": "hello"})["torch_loaded"]
+    assert _call(child, {"cmd": "shutdown"})["ok"]
+    _wait_zombie(pid)
 
 
 def test_children_die_with_their_parent(
