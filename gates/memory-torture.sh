@@ -25,16 +25,26 @@
 # the baseline's is WORSE (D7). GB read per request and per step are reported beside the baseline's.
 # --baseline-wheel: each card first runs its cells on these wheels (0.27.4 + tensorfs 0.10.0) into ./baseline/, then
 # switches the same rental to the candidate (H3 downloads once); those lines override --baseline's for their cells.
+# --slim --control: collect the same workloads/inputs on the legacy baseline, without requiring new telemetry.
+# --tag: use one fixed input tag across separately batched baseline and candidate phases.
+# --packages: run local package directories; --model-override package:slot=ref selects staged checkpoint metadata.
+# --tensord: update the full candidate cohort together with both supplied wheels, not wheels beneath an old control.
 set -uo pipefail
 GATE_RECEIPTS=$(dirname "$(realpath "$0")")/memory_receipts.py
 H=$1 W=$2; shift 2
-MATRIX="" TFS="" BASE="" CARDS="" BW="" BTFS="" ORG=fidika IMG="" ON="" SLIM=""
+MATRIX="" TFS="" BASE="" CARDS="" BW="" BTFS="" ORG=fidika IMG="" ON="" SLIM="" CONTROL="" TD="" PKGS="" INPUT_TAG=""
 declare -A AFTER=()
+MODEL_OVERRIDES=()
 while [ $# -gt 0 ]; do
   case $1 in
     --matrix) MATRIX=1 ;;
     --on) ON=$2; shift ;;
     --slim) SLIM=slim ;;
+    --control) CONTROL=1 ;;
+    --tensord) TD=$2; [ -f "$2" ] && TD=$(realpath "$2"); shift ;;
+    --packages) PKGS=$(realpath "$2"); shift ;;
+    --model-override) MODEL_OVERRIDES+=("$2"); shift ;;
+    --tag) INPUT_TAG=$2; shift ;;
     --tensorfs-wheel) TFS=$2; [ -f "$2" ] && TFS=$(realpath "$2"); shift ;;
     --baseline) BASE=$(realpath "$2"); shift ;;
     --baseline-wheel) BW=$2; [ -f "$2" ] && BW=$(realpath "$2"); shift ;;
@@ -51,8 +61,10 @@ done
 [ -n "$IMG" ] && [ -n "$BW" ] && { echo "--baseline-wheel would replace the pinned image's Runtime" >&2; exit 2; }
 if [ -n "$SLIM" ]; then
   [ -n "$ON" ] || { echo '--slim requires an explicitly owned rental via --on' >&2; exit 2; }
-  [ -n "$BASE$BW" ] || { echo '--slim requires a production baseline; performance cannot pass without one' >&2; exit 2; }
+  [ -n "$CONTROL$BASE$BW" ] || { echo '--slim requires a production baseline; performance cannot pass without one' >&2; exit 2; }
 fi
+[ -z "$CONTROL" ] || [ -n "$SLIM" ] || { echo '--control requires --slim so baseline workloads stay matched' >&2; exit 2; }
+[ -z "$TD" ] || { [ "$W" != - ] && [ -n "$TFS" ]; } || { echo '--tensord requires both candidate wheels' >&2; exit 2; }
 [ -z "$CARDS" ] && { [ -n "$MATRIX" ] && CARDS="8 12 24 2x8" || CARDS="8 12 24 32 2x8"; }
 declare -A SKUS=([8]="rtx-3070 rtx-3060-ti" [12]="rtx-4070-super rtx-5070 rtx-3080-ti rtx-4070-ti rtx-3060"
   [16]="rtx-4080-super rtx-4060-ti rtx-5060-ti" [24]="rtx-4090" [32]="rtx-pro-4500 rtx-5090" [2x8]="rtx-3070 rtx-3060-ti"
@@ -64,8 +76,22 @@ if [ -n "$ON" ]; then
   read -r -a selected_cards <<< "$CARDS"
   [ "${#selected_cards[@]}" = 1 ] || { echo '--on requires one card/cap at a time; reuse the rental sequentially' >&2; exit 2; }
 fi
-TAG=$(basename "$D") FAILED=0 M="" FOLLOW="" ONLY="" SUBST=""
+TAG=${INPUT_TAG:-$(basename "$D")} FAILED=0 M="" FOLLOW="" ONLY="" SUBST=""
+RECORD_MODE=$SLIM
+[ -z "$CONTROL" ] || RECORD_MODE=""
 say() { echo "$(date -u +%T) $*" | tee -a summary.txt; }
+target() {
+  if [ -n "$PKGS" ]; then printf '%s/%s/%s\n' "$PKGS" "$1" "$2"
+  else printf '%s/%s/%s\n' "$ORG" "$1" "$2"; fi
+}
+run_target() {
+  local target=$1 override package=${1%/*}; shift
+  package=${package##*/}
+  for override in "${MODEL_OVERRIDES[@]}"; do
+    [ "${override%%:*}" != "$package" ] || set -- "$@" "model.${override#*:}"
+  done
+  cozy run "$target" "$@"
+}
 release() {  # end the machine this script rented, once its outputs landed, and confirm it is gone
   [ -z "$M" ] && return
   [ -n "$FOLLOW" ] && kill $FOLLOW 2>/dev/null; FOLLOW=""
@@ -99,6 +125,18 @@ fits() {  # rental $M has $2 GPUs, none over $1 GiB, as `cozy machine show` list
     awk -v most="$1" -v n="$2" '{k++; if ($1 > most) big = 1} END {exit !(k == n && !big)}'
 }
 
+native_cap() {  # legacy controls cannot fake an allocator cap: require the actual physical class
+  cozy machine show "$M" --tensorhub "$H" --json 2>/dev/null | python3 -I -c '
+import json, sys
+data = json.load(sys.stdin)
+machine = data.get("machine", data)
+gpus = (machine.get("status") or {}).get("gpus") or []
+cap, count = int(sys.argv[1]) << 30, int(sys.argv[2])
+sizes = [gpu.get("memory_bytes", 0) for gpu in gpus]
+sys.exit(not (len(sizes) >= count and all(0.9 * cap <= size <= cap for size in sizes)))
+' "$1" "$2"
+}
+
 landed() {  # every output of run $1 is in out-$2 under its sha256; gives up only when nothing changes for 3 min
   local n=$1 dir=$2 last="" still=0 state
   while :; do
@@ -126,7 +164,7 @@ PY
 record() {  # one line per run (status, wall, execution, retries, poisoned, leftover, GB read host to GPU, memory rungs);
             # fails if the run misses the absolute bar, named in `bar=`
   local n=$1 cell=$2 state=$3
-  python3 -I "$GATE_RECEIPTS" record "show-$cell.json" "$cell" "$n" "$state" "$SUBST" summary.txt "$SLIM" | tee -a summary.txt
+  python3 -I "$GATE_RECEIPTS" record "show-$cell.json" "$cell" "$n" "$state" "$SUBST" summary.txt "$RECORD_MODE" | tee -a summary.txt
 }
 
 number() { grep -oE '"number": ?[0-9]+' "run-$1.json" 2>/dev/null | head -1 | grep -oE '[0-9]+$'; }
@@ -138,7 +176,7 @@ start() {  # start <cell> <cozy run args…>: a detached run (for pairs); prints
   local arg has_gpus=""
   for arg in "$@"; do [[ "$arg" == --gpus || "$arg" == --gpus=* ]] && has_gpus=1; done
   [ -n "$has_gpus" ] || set -- "$@" --gpus 1
-  cozy run "$@" --on "$M" --tensorhub "$H" --out "out-$cell" --detach --json > "run-$cell.json" 2> "run-$cell.err"
+  run_target "$@" --on "$M" --tensorhub "$H" --out "out-$cell" --detach --json > "run-$cell.json" 2> "run-$cell.err"
   number "$cell"
 }
 
@@ -155,7 +193,7 @@ cell() {  # cell <cell> <cozy run args…>: one run, followed in the foreground 
   local arg has_gpus=""
   for arg in "$@"; do [[ "$arg" == --gpus || "$arg" == --gpus=* ]] && has_gpus=1; done
   [ -n "$has_gpus" ] || set -- "$@" --gpus 1
-  cozy run "$@" --on "$M" --tensorhub "$H" --out "out-$c" --json > "run-$c.json" 2> "run-$c.err"
+  run_target "$@" --on "$M" --tensorhub "$H" --out "out-$c" --json > "run-$c.json" 2> "run-$c.err"
   finish "$c" "$(number "$c")"
 }
 
@@ -163,18 +201,18 @@ image() { ls "$PWD/out-$1"/*.png "$PWD/out-$1"/*.webp "$PWD/out-$1"/*.jpg 2>/dev
 
 references() {  # two character images for the LM and H3 cells
   local k=$1 r=$2
-  cell "$k-klein-a" $ORG/flux-3-klein/generate prompt="portrait of a young lifeguard with long platinum braids, orange swimsuit, $TAG $k a" seed=$((r + 1)) prompt_upsampling=false
-  cell "$k-klein-b" $ORG/flux-3-klein/generate prompt="portrait of a woman with short curly auburn hair, navy wool coat, $TAG $k b" seed=$((r + 2)) prompt_upsampling=false
+  cell "$k-klein-a" "$(target flux-3-klein generate)" prompt="portrait of a young lifeguard with long platinum braids, orange swimsuit, $TAG $k a" seed=$((r + 1)) prompt_upsampling=false
+  cell "$k-klein-b" "$(target flux-3-klein generate)" prompt="portrait of a woman with short curly auburn hair, navy wool coat, $TAG $k b" seed=$((r + 2)) prompt_upsampling=false
 }
 
 cells() {  # the matrix on one machine; $1 = card, $2 = H3 segments
   local k=$1 segs=$2 r=$RANDOM
   references "$k" "$r"
-  cell "$k-sdxl" $ORG/sdxl/generate prompt="a brass doorknob on a blue door in morning sun, $TAG $k" seed=$((r + 3))
-  cell "$k-qwen1" $ORG/qwen-image-2/generate_image prompt="a lighthouse on a cliff at dusk, $TAG $k" seed=$((r + 4)) megapixels:=1
-  cell "$k-qwen4" $ORG/qwen-image-2/generate_image prompt="a market street in the rain at night, $TAG $k" seed=$((r + 5)) megapixels:=4
+  cell "$k-sdxl" "$(target sdxl generate)" prompt="a brass doorknob on a blue door in morning sun, $TAG $k" seed=$((r + 3))
+  cell "$k-qwen1" "$(target qwen-image-2 generate_image)" prompt="a lighthouse on a cliff at dusk, $TAG $k" seed=$((r + 4)) megapixels:=1
+  cell "$k-qwen4" "$(target qwen-image-2 generate_image)" prompt="a market street in the rain at night, $TAG $k" seed=$((r + 5)) megapixels:=4
   local a b; a=$(image "$k-klein-a") b=$(image "$k-klein-b")
-  cell "$k-lm" $ORG/character-describer/describe_character --asset "image=$a"
+  cell "$k-lm" "$(target character-describer describe_character)" --asset "image=$a"
   pair_sdxl "$k" "$r"
   pair_qwen "$k" "$r" "$b"
   h3ref "$k" "$b" "$r"
@@ -184,16 +222,16 @@ cells() {  # the matrix on one machine; $1 = card, $2 = H3 segments
 pair_sdxl() {  # co-resident pair, two runs on one GPU at once: SDXL ∥ Klein
   local k=$1 r=$2 n1 n2
   want "$k-pair-sdxl" || return 0
-  n1=$(start "$k-pair-sdxl" $ORG/sdxl/generate prompt="a red kite over dunes, $TAG $k pair" seed=$((r + 6)))
-  n2=$(start "$k-pair-klein" $ORG/flux-3-klein/generate prompt="a teapot on a windowsill, $TAG $k pair" seed=$((r + 7)) prompt_upsampling=false)
+  n1=$(start "$k-pair-sdxl" "$(target sdxl generate)" prompt="a red kite over dunes, $TAG $k pair" seed=$((r + 6)))
+  n2=$(start "$k-pair-klein" "$(target flux-3-klein generate)" prompt="a teapot on a windowsill, $TAG $k pair" seed=$((r + 7)) prompt_upsampling=false)
   finish "$k-pair-sdxl" "$n1"; finish "$k-pair-klein" "$n2"
 }
 
 pair_qwen() {  # co-resident pair: Qwen 1 MP ∥ LM ($3: the LM's image)
   local k=$1 r=$2 n1 n2
   want "$k-pair-qwen" || return 0
-  n1=$(start "$k-pair-qwen" $ORG/qwen-image-2/generate_image prompt="a fox in fresh snow, $TAG $k pair" seed=$((r + 8)) megapixels:=1)
-  n2=$(start "$k-pair-lm" $ORG/character-describer/describe_character --asset "image=$3")
+  n1=$(start "$k-pair-qwen" "$(target qwen-image-2 generate_image)" prompt="a fox in fresh snow, $TAG $k pair" seed=$((r + 8)) megapixels:=1)
+  n2=$(start "$k-pair-lm" "$(target character-describer describe_character)" --asset "image=$3")
   finish "$k-pair-qwen" "$n1"; finish "$k-pair-lm" "$n2"
 }
 
@@ -202,7 +240,7 @@ h3ref() {  # H3 ref2va_turbo, one clip (15 s unless $4) from one character image
   [ "$s" = 15 ] || c=$k-h3ref$s
   c=$c${5:-}
   printf '{"prompt": "The woman in <Picture 1> walks through a sunlit park in autumn, leaves falling, she picks up a red leaf and smiles, %s %s.\n\nnon_diegetic_music:\nN/A", "seed": %d, "duration_s": %d}\n' "$TAG" "$c" $((r + 40 + s)) "$s" > "$c.json"
-  cell "$c" $ORG/minimax-h3/ref2va_turbo --input "$c.json" --asset "$a"
+  cell "$c" "$(target minimax-h3 ref2va_turbo)" --input "$c.json" --asset "$a"
 }
 
 matrix() {  # the merge matrix on one machine ($1 = card); on 24 each H3 cell runs again warm
@@ -214,15 +252,15 @@ matrix() {  # the merge matrix on one machine ($1 = card); on 24 each H3 cell ru
     h3 "$k-h3" 2 "$a" "$b" "$r" 2
     if [ -n "$SLIM" ]; then
       local left right
-      left=$(start "$k-sdxl-a" $ORG/sdxl/generate prompt="blue door, $TAG" seed=11 --gpus 1)
-      right=$(start "$k-sdxl-b" $ORG/sdxl/generate prompt="red door, $TAG" seed=12 --gpus 1)
+      left=$(start "$k-sdxl-a" "$(target sdxl generate)" prompt="blue door, $TAG" seed=11 --gpus 1)
+      right=$(start "$k-sdxl-b" "$(target sdxl generate)" prompt="red door, $TAG" seed=12 --gpus 1)
       finish "$k-sdxl-a" "$left"; finish "$k-sdxl-b" "$right"
     fi
     return
   fi
-  [ -z "$SLIM" ] || cell "$k-sdxl1" $ORG/sdxl/generate prompt="a brass doorknob, $TAG $k" seed=$((r + 2)) megapixels:=1
-  cell "$k-sdxl4" $ORG/sdxl/generate prompt="a brass doorknob on a blue door in morning sun, $TAG $k" seed=$((r + 3)) megapixels:=4
-  cell "$k-qwen4" $ORG/qwen-image-2/generate_image prompt="a market street in the rain at night, $TAG $k" seed=$((r + 5)) megapixels:=4
+  [ -z "$SLIM" ] || cell "$k-sdxl1" "$(target sdxl generate)" prompt="a brass doorknob, $TAG $k" seed=$((r + 2)) megapixels:=1
+  cell "$k-sdxl4" "$(target sdxl generate)" prompt="a brass doorknob on a blue door in morning sun, $TAG $k" seed=$((r + 3)) megapixels:=4
+  cell "$k-qwen4" "$(target qwen-image-2 generate_image)" prompt="a market street in the rain at night, $TAG $k" seed=$((r + 5)) megapixels:=4
   h3ref "$k" "$b" "$r" 5; { [ "$k" = 24 ] || [ -n "$SLIM" ]; } && h3ref "$k" "$b" $((r + 100)) 5 -warm
   h3ref "$k" "$b" "$r" 15; { [ "$k" = 24 ] || [ -n "$SLIM" ]; } && h3ref "$k" "$b" $((r + 100)) 15 -warm
   h3 "$k-h3" 2 "$a" "$b" "$r" "" 5; [ "$k" = 24 ] && h3 "$k-h3-warm" 2 "$a" "$b" $((r + 100)) "" 5
@@ -249,7 +287,7 @@ h3() {  # H3 long_form <cell>: <segs> × <seconds, 15>; the last segment is guid
       fi
     done
   } > "$c.yaml"
-  cell "$c" $ORG/minimax-h3/long_form --input "$c.yaml" ${gpus:+--gpus "$gpus"}
+  cell "$c" "$(target minimax-h3 long_form)" --input "$c.yaml" ${gpus:+--gpus "$gpus"}
 }
 
 card() {  # one card, in its own subshell: rent, install, run its cells, end the rental; exit status = failures
@@ -263,9 +301,15 @@ card() {  # one card, in its own subshell: rent, install, run its cells, end the
   if [ -n "$ON" ]; then
     M=$ON
     [ -n "${GIB[$card]:-}" ] || { say "unknown cap $card"; FAILED=$((FAILED + 1)); return; }
-    if ! cozy machine update "$M" --gpu-memory-limit "${GIB[$card]}GiB" --tensorhub "$H" > "cap-$card.log" 2>&1 ||
-        ! capped "${GIB[$card]}"; then
-      say "card $card: requested cap on $M is not in force"; FAILED=$((FAILED + 1)); return
+    if [ -n "$CONTROL" ]; then
+      if ! native_cap "${GIB[$card]}" "${gpus:-1}"; then
+        say "card $card: legacy baseline needs that actual physical memory class; no unverified cap"; FAILED=$((FAILED + 1)); return
+      fi
+    else
+      if ! cozy machine update "$M" --gpu-memory-limit "${GIB[$card]}GiB" --tensorhub "$H" > "cap-$card.log" 2>&1 ||
+          ! capped "${GIB[$card]}"; then
+        say "card $card: requested cap on $M is not in force"; FAILED=$((FAILED + 1)); return
+      fi
     fi
     say "card $card: caller-owned rental $M; this script does not rent or end it"
   else
@@ -311,10 +355,10 @@ PY
   if [ -n "$BW" ]; then  # the baseline first, in its own directory; its failures are not the candidate's
     mkdir -p baseline
     if update "$BW" "$BTFS" "$card-baseline"; then
-      (cd baseline && { [ -n "$SLIM" ] || TAG=$TAG-baseline; } && pass "$card")
+      (cd baseline && RECORD_MODE="" && { [ -n "$SLIM" ] || TAG=$TAG-baseline; } && pass "$card")
     else say "card $card: the baseline wheel did not install: $(tail -c 300 "update-$card-baseline.log")"; fi
   fi
-  if { [ "$W" != - ] || [ -n "$BW" ]; } && ! update "$W" "$TFS" "$card"; then
+  if { [ "$W" != - ] || [ -n "$BW" ]; } && ! update "$W" "$TFS" "$card" "$TD"; then
     say "card $card: the wheel did not install: $(tail -c 300 "update-$card.log")"; FAILED=$((FAILED + 1)); release; return
   fi
   pass "$card"
@@ -329,7 +373,8 @@ PY
 update() {  # update <runtime wheel|-> <tensorfs wheel> <name>: install the wheels, or (-) the Hub's target, on $M
   local w=$1 t=$2
   [ "$w" = - ] && w="" t=""
-  cozy machine update "$M" ${w:+--runtime-wheel "$w"} ${t:+--tensorfs-wheel "$t"} --tensorhub "$H" > "update-$3.log" 2>&1
+  local td=${4:-}
+  cozy machine update "$M" ${td:+--tensord "$td"} ${w:+--runtime-wheel "$w"} ${t:+--tensorfs-wheel "$t"} --tensorhub "$H" > "update-$3.log" 2>&1
 }
 
 pass() {  # every cell of card $1 on $M, into the current directory
