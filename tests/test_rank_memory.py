@@ -40,7 +40,8 @@ def test_unmeasured_copy_ceiling_stays_null_on_the_wire() -> None:
     memory = ReplyMemory(copies=[copy])
     decoded = msgspec.json.decode(msgspec.json.encode(memory), type=ReplyMemory)
     assert decoded.copies[0].pct is None
-    assert request_memory.combined([decoded]).copies[0].pct is None
+    combined = request_memory.combined([decoded])
+    assert combined is not None and combined.copies[0].pct is None
 
 
 @contextmanager
