@@ -82,6 +82,40 @@ def slim_group_positive():
 
 
 class MemoryReceipts(unittest.TestCase):
+    def test_pre_io_oom_refusal_is_explicit_and_not_content_or_bind_evidence(self):
+        proof, trace = proof_and_trace([1, 2], {1: 2, 2: 3}, 8)
+        baseline = API["window_lower_bound"](proof, trace)
+        refusal = dict(trace[1], kind="fill-refused", page=99, bytes=8,
+                       fill=dict(phase="allocate", outcome="refused", error="DEVICE_FULL", io_runs=0))
+        trace.insert(1, refusal)
+        for index, event in enumerate(trace):
+            event["sequence"] = index
+        self.assertEqual(API["trace_errors"](trace), [])
+        self.assertEqual(API["window_lower_bound"](proof, trace), baseline)
+        # The refused page deliberately has no catalog entry: no bytes arrived,
+        # so it neither invents demand content nor satisfies a successful bind.
+        no_binds = [event for event in trace if event["kind"] != "bind"]
+        self.assertIn("missing-page-bind-evidence", API["trace_errors"](no_binds))
+        self.assertEqual(API["window_lower_bound"](proof, no_binds), (0, 0))
+
+    def test_refusal_cannot_hide_read_transform_or_unmeasured_failures(self):
+        proof, original = proof_and_trace([1], {1: 2}, 8)
+        valid = dict(phase="allocate", outcome="refused", error="CUDA:2", io_runs=0)
+        for fill in (None, {}, {**valid, "phase": "read"}, {**valid, "phase": "transform"},
+                     {**valid, "outcome": "failed"}, {**valid, "error": "CUDA:700"},
+                     {**valid, "error": []}, {**valid, "io_runs": 1}, {**valid, "io_runs": False}):
+            with self.subTest(fill=fill):
+                trace = copy.deepcopy(original)
+                trace.insert(1, dict(trace[1], kind="fill-refused", fill=fill))
+                for index, event in enumerate(trace):
+                    event["sequence"] = index
+                self.assertIn("invalid-fill-refusal", API["trace_errors"](trace))
+                with self.assertRaisesRegex(ValueError, "invalid-fill-refusal"):
+                    API["window_lower_bound"](proof, trace)
+        unknown = copy.deepcopy(original)
+        unknown[1]["kind"] = "unknown-refusal"
+        self.assertIn("unknown-decision-event", API["trace_errors"](unknown))
+
     def test_window_bound_counts_repeated_passes_without_calling_it_opt(self):
         proof, trace = proof_and_trace([1, 2, 3] * 3, {1: 4, 2: 4, 3: 4}, 8)
         bound, compulsory = API["window_lower_bound"](proof, trace)
