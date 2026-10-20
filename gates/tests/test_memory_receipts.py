@@ -239,6 +239,47 @@ class MemoryReceipts(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("leftover-gpu-coverage", text)
 
+    def test_two_gpu_h3_needs_one_actual_group_not_two_single_gpu_children(self):
+        value = positive()
+        value["gpus"] = 2  # an outer request cannot substitute for execution evidence
+        value["calls"][0]["function"] = "generate_ref2va_turbo"
+        self.assertIn("no-two-gpu-h3-execution", self.record(value, "2x8-h3")[1])
+        other = copy.deepcopy(value["calls"][0])
+        other["measurements"]["execution"]["gpus"][0]["gpu"] = 1
+        other["measurements"]["memory"]["stats"]["leftover_by_gpu"] = [[1, 0]]
+        value["calls"].append(other)
+        self.assertIn("no-two-gpu-h3-execution", self.record(value, "2x12-h3")[1])
+        for cell in ("2x8-klein-a", "2x8-sdxl-a", "2x8-sdxl-b"):
+            self.assertEqual(self.record(positive(), cell)[0], 0)
+
+    def test_actual_h3_group_requires_complete_proofs_from_both_executed_ranks(self):
+        value = slim_positive()
+        call = value["calls"][0]
+        call["function"] = "generate_ref2va_turbo"
+        measurements = call["measurements"]
+        measurements["execution"]["gpus"].append(dict(measurements["execution"]["gpus"][0], gpu=1))
+        memory = measurements["memory"]
+        memory["stats"]["leftover_by_gpu"] = [[0, 0], [1, 0]]
+        proof, trace = proof_and_trace([1], {1: 64}, 256, [1])
+        second = dict(proof, gpu=1, rank=1)
+        memory["stats"]["proofs"] = [proof, second]
+        memory["trace"] = trace + [dict(event, gpu=1, rank=1) for event in trace]
+        code, text = self.record(value, "2x8-h3", slim="slim")
+        self.assertEqual(code, 0, text)
+        call["memoized"] = True
+        self.assertIn("no-two-gpu-h3-execution", self.record(value, "2x8-h3", slim="slim")[1])
+        call["memoized"] = False
+        second["rank"] = 0
+        self.assertIn("incomplete-h3-rank-proof", self.record(value, "2x8-h3", slim="slim")[1])
+        second["rank"] = 1
+        memory["stats"]["proofs"].pop()
+        self.assertIn("incomplete-h3-rank-proof", self.record(value, "2x8-h3", slim="slim")[1])
+        call["function"] = "generate"  # an unrelated two-GPU child is not the H3 group
+        self.assertIn("no-two-gpu-h3-execution", self.record(value, "2x8-h3", slim="slim")[1])
+        self.assertTrue(API["control_reason"]({
+            "status": "completed", "landed": True, "poisoned": "0", "exec": "10s",
+            "bar": "no-two-gpu-h3-execution"}))
+
     def test_missing_malformed_and_duplicate_gpu_totals_refuse(self):
         for by_gpu in (None, [], [0], [[False, 0]], [[0, False]], [[0, -1]], [[0, 0], [0, 0]], [[0, 1]]):
             with self.subTest(by_gpu=by_gpu):

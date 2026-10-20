@@ -51,7 +51,7 @@ def control_reason(row):
     # Old controls predate varena stats/read targets, so only their applicable validity bars
     # constrain timing. A completed old control need not meet the candidate's new read bar.
     bars = set(row.get("bar", "").split(","))
-    if bars & {"incomplete", "poisoned", "leftover"}:
+    if bars & {"incomplete", "poisoned", "leftover", "no-two-gpu-h3-execution"}:
         return "control failed applicable absolute bar"
     if row.get("leftover", "-") not in ("-", "0"):
         return "control left bytes"
@@ -352,6 +352,8 @@ def record(path, cell, number, state, substitute, summary, slim=""):
         bar.append("no-execution-time")
     calls = run.get("calls") or [run]
     gpu_measurements, child_reasons = [], []
+    group_required = bool(re.match(r"2x[^-]+-h3(?:-|$)", cell))
+    group_executed = False
     for call in calls:
         if not isinstance(call, dict):
             bar.append("malformed-call")
@@ -362,13 +364,32 @@ def record(path, cell, number, state, substitute, summary, slim=""):
         executed = {gpu["gpu"] for gpu in gpus if isinstance(gpu, dict) and integer(gpu.get("gpu")) and
                     integer(gpu.get("start_us")) and gpu["start_us"] > 0 and
                     integer(gpu.get("end_us")) and gpu["end_us"] >= gpu["start_us"]}
+        if call.get("memoized") is True:
+            executed = set()
         if executed:
             gpu_measurements.append((measurements, executed))
+            function = str(call.get("function") or call.get("target") or "").rsplit("/", 1)[-1].replace("-", "_")
+            h3 = function in {"generate_ref2va_turbo", "generate_fl2va_turbo",
+                              "ref2va_turbo", "fl2va_turbo", "long_form"}
+            if h3 and len(executed) == 2:
+                group_executed = True
+                if group_required and slim:
+                    memory = measurements.get("memory") or {}
+                    value = memory.get("stats") if isinstance(memory, dict) else None
+                    proofs = value.get("proofs") if isinstance(value, dict) else None
+                    if (not isinstance(proofs, list) or len(proofs) != 2
+                            or any(not isinstance(proof, dict) for proof in proofs)
+                            or {proof.get("gpu") for proof in proofs} != executed
+                            or {proof.get("rank") for proof in proofs} != {0, 1}
+                            or any(proof.get("complete") is not True for proof in proofs)):
+                        bar.append("incomplete-h3-rank-proof")
             child_reasons.append(call.get("reason"))
             if call.get("status") not in (None, "completed"):
                 bar.append("gpu-call-incomplete")
     if not gpu_measurements:
         bar.append("no-gpu-execution")
+    if group_required and not group_executed:
+        bar.append("no-two-gpu-h3-execution")
     stats, movements = [], []
     for measurements, executed in gpu_measurements:
         memory = measurements.get("memory")
