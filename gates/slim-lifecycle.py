@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Full SDXL restart/self-SIGKILL recovery through the supported public CLI.
+"""Full SDXL executor restart/self-SIGKILL recovery through the public CLI.
 
 Requires a caller-owned rental and make-slim-lifecycle.py's exact-source package.
 It rents/ends nothing, signals no foreign PID and never treats cancellation as a kill.
 Raw run records preserve initial residency, copies, fills and readonly-reuse evidence.
+The caller installs its SDK beforehand; this driver never replaces TensorD. Public
+measurements expose final orphan bytes and Torch leftovers, but not native pin counts
+or TensorD's PID. The receipt names those unavailable metrics explicitly.
 """
 
 import argparse
@@ -81,6 +84,18 @@ def gpu_facts(run):
             "missing GPU leftover evidence"
         )
         assert stats.get("proofs"), "missing native request proof metadata"
+        assert all(proof.get("complete") is True for proof in stats["proofs"]), (
+            "incomplete native request proof"
+        )
+        trace = memory.get("trace") or stats.get("trace")
+        assert isinstance(trace, list) and trace, "missing native placement trace"
+        ends = [event for event in trace if event.get("kind") == "end"]
+        assert ends and {event.get("gpu") for event in ends} == {gpus[0]["gpu"]}, (
+            "missing completed GPU request end"
+        )
+        assert all(event.get("orphan_bytes") == 0 for event in ends), (
+            "completed request retained orphan bytes"
+        )
         rows.extend(gpus)
         memories.append(stats)
     assert rows, "no actual GPU inference"
@@ -89,16 +104,75 @@ def gpu_facts(run):
         "pids": sorted({row["pid"] for row in rows}),
         "uuids": sorted({uuid(row["uuid"]) for row in rows}),
         "h2d_bytes": sum(row.get("paged_in", 0) for row in memories),
+        "disk_bytes": sum(
+            copy["bytes"] for row in memories for copy in row["copies"] if copy["kind"] == "disk"
+        ),
+        "end_orphan_bytes": 0,
+        "torch_leftover_bytes": 0,
         "initial_pages": sum(
             len(proof.get("initial", [])) for row in memories for proof in row["proofs"]
         ),
     }
 
 
+def service_identity(value):
+    machine = value.get("machine", value)
+    status = machine.get("status") or {}
+    assert status.get("phase") == "ready", "TensorD must be ready"
+    assert status.get("live_runs", 0) == 0, "finish other runs before lifecycle proof"
+    identity = {
+        key: status.get(key)
+        for key in ("worker_id", "version", "commit", "runtime", "tensorfs", "started_at_ms")
+    }
+    assert type(identity["started_at_ms"]) is int and identity["started_at_ms"] > 0
+    assert all(
+        isinstance(identity[key], str) and identity[key]
+        for key in identity
+        if key != "started_at_ms"
+    )
+    return identity
+
+
+def recovery_path(facts):
+    if facts["initial_pages"]:
+        return "kept-readonly-pages-present-at-request-begin"
+    if facts["h2d_bytes"] and not facts["disk_bytes"]:
+        return "diskless-h2d-refill"
+    if facts["h2d_bytes"] and facts["disk_bytes"]:
+        return "verified-disk-refill"
+    return "no-weight-transfer-reported"
+
+
+def oom_observation(before, after):
+    def counts(snapshot):
+        return {
+            group["path"]: group["events"]["oom_kill"]
+            for group in snapshot.get("cgroups", [])
+            if type(group.get("events", {}).get("oom_kill")) is int
+        }
+
+    first, last = counts(before), counts(after)
+    changes = {path: last[path] - first[path] for path in first.keys() & last.keys()}
+    assert all(delta == 0 for delta in changes.values()), f"cgroup oom_kill changed: {changes}"
+    return {"available": bool(changes), "oom_kill_deltas": changes}
+
+
 def uuid(value):
     normalized = str(value).lower().removeprefix("gpu-").replace("-", "")
     assert re.fullmatch(r"[0-9a-f]{32}", normalized), f"invalid physical GPU UUID: {value}"
     return normalized
+
+
+def model_overrides(values):
+    result = []
+    for value in values:
+        slot, separator, model = value.partition("=")
+        if slot.startswith("model."):
+            slot = slot[len("model."):]
+        if not separator or not slot.strip() or not model.strip():
+            raise ValueError("--model requires a nonempty SLOT=MODEL override")
+        result.append(f"model.{slot}={model}")
+    return result
 
 
 def main():
@@ -108,12 +182,10 @@ def main():
     parser.add_argument("--package", type=Path, required=True)
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--runtime-wheel", required=True)
-    parser.add_argument("--tensorfs-wheel", required=True)
-    parser.add_argument("--tensord", required=True)
     parser.add_argument("--model", action="append", default=[])
     parser.add_argument("--bits", type=int, choices=(8, 16), default=8)
     args = parser.parse_args()
+    models = model_overrides(args.model)
     assert args.on.startswith("rent-"), "use the explicit caller-owned rental alias, never local"
     assert not args.output.exists(), "use a new output directory so earlier evidence is preserved"
     origin = json.loads((args.package / "lifecycle-source.json").read_text())
@@ -134,36 +206,21 @@ def main():
     def machine(label):
         return json.loads(command(label, ["machine", "show", args.on, "--json"]).stdout)
 
-    before = machine("before-restart")
-    status = before["status"]
-    assert status.get("live_runs", 0) == 0, "finish the model matrix before lifecycle proof"
-    assert status["runtime"] == "0.30.0" and status["tensorfs"] == "0.13.0"
-    started = status["started_at_ms"]
-    software = tuple(status[key] for key in ("runtime", "tensorfs", "commit"))
-    command(
-        "restart",
-        [
-            "machine",
-            "update",
-            args.on,
-            "--tensord",
-            args.tensord,
-            "--runtime-wheel",
-            args.runtime_wheel,
-            "--tensorfs-wheel",
-            args.tensorfs_wheel,
-            "--json",
-        ],
-    )
-    deadline = time.monotonic() + 180
-    while True:
-        after = machine("after-restart")
-        current = after.get("status") or {}
-        if current.get("phase") == "ready" and current.get("started_at_ms", 0) > started:
-            assert tuple(current[key] for key in ("runtime", "tensorfs", "commit")) == software
-            break
-        assert time.monotonic() < deadline, "public machine started_at_ms did not advance"
-        time.sleep(2)
+    identity = service_identity(machine("before-lifecycle"))
+    assert identity["runtime"] == "0.30.0" and identity["tensorfs"] == "0.13.0"
+
+    def quiescent(label):
+        deadline = time.monotonic() + 180
+        while True:
+            observed = machine(label)
+            status = observed.get("machine", observed).get("status") or {}
+            if status.get("phase") == "ready" and status.get("live_runs", 0) == 0:
+                assert service_identity(observed) == identity, (
+                    "TensorD changed during executor recovery"
+                )
+                return
+            assert time.monotonic() < deadline, "machine did not settle after the request"
+            time.sleep(2)
 
     def case(name, kill):
         folder = args.output / name
@@ -187,8 +244,7 @@ def main():
             "--detach",
             "--json",
         ]
-        for model in args.model:
-            words.extend(["--model", model])
+        words.extend(models)
         submitted = command(name + "-submit", words)
         number = next(
             doc["number"]
@@ -199,14 +255,17 @@ def main():
         result = command(name + "-show", ["run", "show", str(number), "--json"])
         run = json.loads(result.stdout)
         (folder / "run.json").write_text(json.dumps(run, indent=2) + "\n")
+        quiescent(name + "-quiescent")
         logs = command(
             name + "-tensord", ["machine", "logs", args.on, "tensord", "-n", "1000"], check=False
         )
         command(name + "-memory", ["machine", "logs", args.on, "memory", "-n", "1000"], check=False)
-        events = markers([watched.stdout, watched.stderr, *strings(run), logs.stdout, logs.stderr])
+        all_events = markers(
+            [watched.stdout, watched.stderr, *strings(run), logs.stdout, logs.stderr]
+        )
         events = [
             event
-            for event in events
+            for event in all_events
             if event.get("case") == token
             and event.get("kill") is kill
             and event.get("cuda_completed") is True
@@ -233,7 +292,19 @@ def main():
                 "evidence": "completed CUDA step, self-SIGKILL marker, failed executor/channel",
             }
         assert run["status"] == "completed", run.get("reason")
+        completed = [
+            row
+            for row in all_events
+            if row.get("case") == token
+            and row.get("complete") is True
+            and row.get("step") == -1
+            and row.get("pid") == event["pid"]
+            and row.get("cuda_completed") is True
+        ]
+        assert completed, f"{name}: completed model output marker was not observed"
+        host = oom_observation(event.get("host", {}), completed[-1].get("host", {}))
         facts = gpu_facts(run)
+        facts["recovery_path"] = recovery_path(facts)
         assert facts["uuids"] == [uuid(event["uuid"])]
         assert event["pid"] in facts["pids"]
         expected = {item["sha256"] for item in run.get("output", [])}
@@ -254,19 +325,27 @@ def main():
             **facts,
             "digest": run["result"]["digest"],
             "outputs": sorted(expected),
+            "host_oom_observation": host,
+            "host_at_output": completed[-1].get("host", {}),
         }
 
-    fresh = case("fresh-after-restart", False)
+    prime = case("prime", False)
+    warm = case("warm-before-kill", False)
     killed = case("kill-after-first-step", True)
     first = case("recovery-first", False)
     second = case("recovery-second", False)
-    assert fresh["uuids"] == first["uuids"] == second["uuids"] == [killed["uuid"]], (
-        "physical GPU changed"
+    assert (
+        prime["uuids"] == warm["uuids"] == first["uuids"] == second["uuids"] == [killed["uuid"]]
+    ), "physical GPU changed"
+    assert prime["pids"] == warm["pids"] == [killed["pid"]], (
+        "the self-kill did not end the actual warm model executor"
     )
     assert killed["pid"] not in first["pids"], "killed executor was reused"
     assert first["pids"] == second["pids"], "the recovered executor did not serve the next request"
-    assert fresh["digest"] == first["digest"] == second["digest"], "decoded model pixels differ"
-    assert fresh["outputs"] == first["outputs"] == second["outputs"], (
+    assert prime["digest"] == warm["digest"] == first["digest"] == second["digest"], (
+        "decoded model pixels differ"
+    )
+    assert prime["outputs"] == warm["outputs"] == first["outputs"] == second["outputs"], (
         "landed model output bytes differ"
     )
     (args.output / "lifecycle.json").write_text(
@@ -274,9 +353,13 @@ def main():
             {
                 "source": origin,
                 "machine": args.on,
-                "before_started_at_ms": started,
-                "after_started_at_ms": current["started_at_ms"],
-                "fresh": fresh,
+                "tensord_service_identity": identity,
+                "unavailable_public_metrics": [
+                    "tensord_process_pid",
+                    "quiescent_native_pin_counts",
+                ],
+                "prime": prime,
+                "warm": warm,
                 "killed": killed,
                 "recovery_first": first,
                 "recovery_second": second,

@@ -25,6 +25,15 @@ def generate(ctx, payload, model, out, tel):
 
 
 class LifecycleHarness(unittest.TestCase):
+    def test_models_use_public_inline_cli_overrides(self):
+        self.assertEqual(
+            LIFECYCLE["model_overrides"](["model=repo/name@1", "model.vae=repo/vae@2"]),
+            ["model.model=repo/name@1", "model.vae=repo/vae@2"],
+        )
+        for value in ("", "slot", "=repo/name@1", "slot=", "model.=repo/name@1"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                LIFECYCLE["model_overrides"]([value])
+
     def test_generator_preserves_computation_and_changes_only_the_proof_seam(self):
         before = ast.parse(SOURCE)
         after = ast.parse(GENERATOR["patch"](SOURCE))
@@ -51,6 +60,9 @@ class LifecycleHarness(unittest.TestCase):
         loop = next(node for node in generated.body if isinstance(node, ast.For))
         self.assertEqual(loop.body[-1].value.func.id, "_slim_lifecycle_step")
         loop.body.pop()
+        self.assertEqual(generated.body[-2].value.func.id, "_slim_lifecycle_step")
+        self.assertTrue(generated.body[-2].value.keywords[0].value.value)
+        generated.body.pop(-2)
         self.assertEqual(
             ast.dump(before, include_attributes=False), ast.dump(after, include_attributes=False)
         )
@@ -86,6 +98,74 @@ class LifecycleHarness(unittest.TestCase):
         }
         with self.assertRaisesRegex(AssertionError, "memoized"):
             LIFECYCLE["gpu_facts"]({"calls": [call]})
+
+    def test_public_identity_accepts_cli_envelopes_and_refuses_a_busy_machine(self):
+        status = {
+            "phase": "ready",
+            "live_runs": 0,
+            "worker_id": "worker",
+            "started_at_ms": 123,
+            "version": "0.11.0",
+            "commit": "c" * 40,
+            "runtime": "0.30.0",
+            "tensorfs": "0.13.0",
+        }
+        self.assertEqual(
+            LIFECYCLE["service_identity"]({"status": status}),
+            LIFECYCLE["service_identity"]({"machine": {"status": status}}),
+        )
+        with self.assertRaisesRegex(AssertionError, "other runs"):
+            LIFECYCLE["service_identity"]({"status": {**status, "live_runs": 1}})
+
+    def test_missing_or_nonzero_orphan_evidence_cannot_pass_recovery(self):
+        gpu = {"gpu": 0, "pid": 123, "uuid": "a" * 32, "start_us": 1, "end_us": 2}
+        stats = {
+            "paged_in": 7,
+            "copies": [{"kind": "disk", "bytes": 3}],
+            "leftover": 0,
+            "leftover_by_gpu": [[0, 0]],
+            "proofs": [{"complete": True, "initial": [1]}],
+        }
+
+        def record(trace):
+            return {
+                "measurements": {
+                    "execution": {"gpus": [gpu]},
+                    "memory": {"stats": stats, "trace": trace},
+                }
+            }
+
+        with self.assertRaisesRegex(AssertionError, "placement trace"):
+            LIFECYCLE["gpu_facts"](record([]))
+        with self.assertRaisesRegex(AssertionError, "orphan bytes"):
+            LIFECYCLE["gpu_facts"](record([{"kind": "end", "gpu": 0, "orphan_bytes": 1}]))
+        facts = LIFECYCLE["gpu_facts"](record([{"kind": "end", "gpu": 0, "orphan_bytes": 0}]))
+        self.assertEqual(
+            (facts["initial_pages"], facts["disk_bytes"], facts["end_orphan_bytes"]), (1, 3, 0)
+        )
+
+    def test_reuse_and_refill_are_separately_named(self):
+        facts = {"initial_pages": 1, "h2d_bytes": 2, "disk_bytes": 3}
+        self.assertEqual(
+            LIFECYCLE["recovery_path"](facts), "kept-readonly-pages-present-at-request-begin"
+        )
+        self.assertEqual(
+            LIFECYCLE["recovery_path"]({**facts, "initial_pages": 0}), "verified-disk-refill"
+        )
+        self.assertEqual(
+            LIFECYCLE["recovery_path"]({**facts, "initial_pages": 0, "disk_bytes": 0}),
+            "diskless-h2d-refill",
+        )
+
+    def test_unreadable_oom_counters_are_not_zero_and_increases_fail(self):
+        self.assertFalse(LIFECYCLE["oom_observation"]({}, {})["available"])
+        first = {"cgroups": [{"path": "owned", "events": {"oom_kill": 4}}]}
+        self.assertEqual(
+            LIFECYCLE["oom_observation"](first, first)["oom_kill_deltas"], {"owned": 0}
+        )
+        after = {"cgroups": [{"path": "owned", "events": {"oom_kill": 5}}]}
+        with self.assertRaisesRegex(AssertionError, "oom_kill changed"):
+            LIFECYCLE["oom_observation"](first, after)
 
 
 if __name__ == "__main__":

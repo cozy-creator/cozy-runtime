@@ -19,19 +19,20 @@
 # boots that worker image, and `machine show` must name it; with `-` as <wheel>, the image is the release under test.
 # --after <card>=<cmd>: after the card's cells, `<cmd> <rent-alias> <hub>` runs on its rental; its exit status counts.
 # --matrix: the merge matrix for every memory PR (gates/memory-matrix.sh): cards 8 12 24 2x8; Qwen 4 MP, SDXL 4 MP,
-# H3 ref2va_turbo 5 s and 15 s, H3 long_form (2 × 5 s; 2 × 15 s at degree 2 on 2x8) and the pair SDXL ∥ Klein; on 24
-# each H3 cell runs cold, then warm (`<cell>-warm`, a new prompt and seed), and the pair Qwen 1 MP ∥ LM.
+# H3 ref2va_turbo 5 s and 15 s cold, then warm on 24/12/8/6 (`<cell>-warm`, a new prompt and seed), H3 long_form
+# (2 × 5 s; 2 × 15 s at degree 2 on 2x8) and the pair SDXL ∥ Klein; on 24 long_form also runs warm, plus Qwen 1 MP ∥ LM.
 # --baseline <dir>: a 0.27.4 run's results, for relative checks only: a warm cell whose execution time is >10% over
 # the baseline's is WORSE (D7). GB read per request and per step are reported beside the baseline's.
 # --baseline-wheel: each card first runs its cells on these wheels (0.27.4 + tensorfs 0.10.0) into ./baseline/, then
 # switches the same rental to the candidate (H3 downloads once); those lines override --baseline's for their cells.
 # --slim --control: collect the same workloads/inputs on the legacy baseline, without requiring new telemetry.
 # --tag: use one fixed input tag across separately batched baseline and candidate phases.
-# --packages: run local package directories; --model-override package:slot=ref selects staged checkpoint metadata.
+# --packages: run local package directories; --model-override package[/function]:slot=ref selects checkpoint metadata.
 # --tensord: update the full candidate cohort together with both supplied wheels, not wheels beneath an old control.
 # --bits: pin the same weight precision in both phases (default 8 for --slim).
 set -uo pipefail
 GATE_RECEIPTS=$(dirname "$(realpath "$0")")/memory_receipts.py
+GATE_CAPACITY=$(dirname "$(realpath "$0")")/slim-capacity.py
 H=$1 W=$2; shift 2
 MATRIX="" TFS="" BASE="" CARDS="" BW="" BTFS="" ORG=fidika IMG="" ON="" SLIM="" CONTROL="" TD="" PKGS="" INPUT_TAG="" BITS=""
 declare -A AFTER=()
@@ -90,8 +91,10 @@ target() {
 run_target() {
   local target=$1 override package=${1%/*}; shift
   package=${package##*/}
+  local caller=$package/${target##*/} selector
   for override in "${MODEL_OVERRIDES[@]}"; do
-    [ "${override%%:*}" != "$package" ] || set -- "$@" "model.${override#*:}"
+    selector=${override%%:*}
+    [ "$selector" != "$package" ] && [ "$selector" != "$caller" ] || set -- "$@" "model.${override#*:}"
   done
   [ -z "$BITS" ] || set -- "$@" --bits "$BITS"
   cozy run "$target" "$@"
@@ -109,19 +112,9 @@ release() {  # end the machine this script rented, once its outputs landed, and 
 }
 trap release EXIT INT TERM
 
-capped() {  # every GPU of $M is capped at $1 GiB: `machine show`'s limit line, or (any Calcifer) the memory log's ledger
-  cozy machine show "$M" --tensorhub "$H" 2>/dev/null | awk -v g="$1" '/^gpu memory limit/ {v = $4} END {exit v + 0 != g}' ||
-    cozy machine logs "$M" memory -n 0 --tensorhub "$H" 2>/dev/null | python3 -I -c '
-import json, sys
-cap = {}
-for line in sys.stdin:
-    try:
-        e = json.loads(line[line.index("{"):])
-    except ValueError:
-        continue
-    if e.get("event") == "ledger":
-        cap[e["gpu"]] = e.get("capacity")
-sys.exit(not cap or any(c != int(sys.argv[1]) << 30 for c in cap.values()))' "$1"
+capped() {  # current pool coverage for all assigned GPUs, allowing a cap above physical VRAM
+  cozy machine logs "$M" tensord -n 0 --tensorhub "$H" 2>/dev/null |
+    python3 -I "$GATE_CAPACITY" --gib "$1" --gpus "$2"
 }
 
 fits() {  # rental $M has $2 GPUs, none over $1 GiB, as `cozy machine show` lists them
@@ -173,7 +166,11 @@ record() {  # one line per run (status, wall, execution, retries, poisoned, left
 
 number() { grep -oE '"number": ?[0-9]+' "run-$1.json" 2>/dev/null | head -1 | grep -oE '[0-9]+$'; }
 
-want() { [ -z "$ONLY" ] || [[ $1 == *-klein-[ab] || ",$ONLY," == *",${1#*-},"* ]]; }  # card:<cell>,… names them
+want() {  # card:<cell>,… selects reference warm partners with their cold H3 cell
+  local name=${1#*-}
+  [ -z "$ONLY" ] || [[ $1 == *-klein-[ab] || ",$ONLY," == *",$name,"* ||
+    ( $name == h3ref*-warm && ",$ONLY," == *",${name%-warm},"* ) ]]
+}
 
 start() {  # start <cell> <cozy run args…>: a detached run (for pairs); prints its number
   local cell=$1; shift
@@ -247,8 +244,9 @@ h3ref() {  # H3 ref2va_turbo, one clip (15 s unless $4) from one character image
   cell "$c" "$(target minimax-h3 ref2va_turbo)" --input "$c.json" --asset "$a"
 }
 
-matrix() {  # the merge matrix on one machine ($1 = card); on 24 each H3 cell runs again warm
-  local k=$1 r=$RANDOM a b
+matrix() {  # reference clips run cold/warm on Task A caps; 24 also warms long_form
+  local k=$1 r=$RANDOM a b warm=$SLIM
+  case $k in 24|12|8|6) warm=1 ;; esac
   [ -z "$SLIM" ] || r=17  # matched model inputs for baseline and candidate
   references "$k" "$r"
   a=$(image "$k-klein-a") b=$(image "$k-klein-b")
@@ -265,8 +263,8 @@ matrix() {  # the merge matrix on one machine ($1 = card); on 24 each H3 cell ru
   [ -z "$SLIM" ] || cell "$k-sdxl1" "$(target sdxl generate)" prompt="a brass doorknob, $TAG $k" seed=$((r + 2)) megapixels:=1
   cell "$k-sdxl4" "$(target sdxl generate)" prompt="a brass doorknob on a blue door in morning sun, $TAG $k" seed=$((r + 3)) megapixels:=4
   cell "$k-qwen4" "$(target qwen-image-2 generate_image)" prompt="a market street in the rain at night, $TAG $k" seed=$((r + 5)) megapixels:=4
-  h3ref "$k" "$b" "$r" 5; { [ "$k" = 24 ] || [ -n "$SLIM" ]; } && h3ref "$k" "$b" $((r + 100)) 5 -warm
-  h3ref "$k" "$b" "$r" 15; { [ "$k" = 24 ] || [ -n "$SLIM" ]; } && h3ref "$k" "$b" $((r + 100)) 15 -warm
+  h3ref "$k" "$b" "$r" 5; [ -n "$warm" ] && h3ref "$k" "$b" $((r + 100)) 5 -warm
+  h3ref "$k" "$b" "$r" 15; [ -n "$warm" ] && h3ref "$k" "$b" $((r + 100)) 15 -warm
   h3 "$k-h3" 2 "$a" "$b" "$r" "" 5; [ "$k" = 24 ] && h3 "$k-h3-warm" 2 "$a" "$b" $((r + 100)) "" 5
   pair_sdxl "$k" "$r"
   [ "$k" = 24 ] && pair_qwen "$k" "$r" "$b"
@@ -360,7 +358,7 @@ PY
   # can update the full binary, but do not implement --gpu-memory-limit themselves.
   if { [ -n "$ON" ] && [ -z "$CONTROL" ]; } || [ -n "$SUBST" ]; then
     if ! cozy machine update "$M" --gpu-memory-limit "${GIB[$card]}GiB" --tensorhub "$H" > "cap-$card.log" 2>&1 ||
-        ! capped "${GIB[$card]}"; then
+        ! capped "${GIB[$card]}" "${gpus:-1}"; then
       say "card $card: requested cap on $M is not in force: $(tail -c 300 "cap-$card.log")"
       FAILED=$((FAILED + 1)); release; return
     fi

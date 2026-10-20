@@ -21,6 +21,15 @@ def finite(value, *, positive=False):
         return False
 
 
+def physical_uuid(value):
+    if not isinstance(value, str) or not re.fullmatch(
+        r"(?:gpu-)?(?:[0-9a-f]{32}|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})",
+        value, re.IGNORECASE,
+    ):
+        return None
+    return value.lower().removeprefix("gpu-").replace("-", "")
+
+
 def cells(path):
     out = {}
     for line in Path(path).read_text().splitlines():
@@ -231,7 +240,9 @@ def transfer_bound(stats, events, executed, by_gpu, required):
         total += bound
         compulsory += distinct
         if 100 * by_gpu.get(proof["gpu"], 0) > 105 * bound:
-            return ["h2d-window-bound-inconclusive"], total, "inconclusive"
+            # Exceeding a lower bound cannot prove excessive traffic: even an
+            # optimal weighted cache may exceed this conservative bound.
+            return ["h2d-window-bound-inconclusive"], total, "inconclusive:near-minimum-unproved"
     if keys != executed:
         return ["transfer-proof-gpu-coverage"], None, "unproved"
     if identities != {(event.get("gpu"), event.get("rank"), event.get("request"))
@@ -353,6 +364,8 @@ def record(path, cell, number, state, substitute, summary, slim=""):
     calls = run.get("calls") or [run]
     gpu_measurements, child_reasons = [], []
     group_required = bool(re.match(r"2x[^-]+-h3(?:-|$)", cell))
+    single_required = bool(slim and re.fullmatch(r"2x[^-]+-sdxl-[ab]", cell))
+    single_devices, single_physical = set(), set()
     group_executed = False
     for call in calls:
         if not isinstance(call, dict):
@@ -373,10 +386,22 @@ def record(path, cell, number, state, substitute, summary, slim=""):
         if call.get("memoized") is True:
             executed = set()
         if executed:
+            if slim and cell.startswith("2x"):
+                rows = [row for row in gpus if isinstance(row, dict)
+                        and integer(row.get("gpu")) and row["gpu"] in executed]
+                identities = [physical_uuid(row.get("uuid")) for row in rows]
+                if (len(rows) != len(executed) or None in identities
+                        or len(set(identities)) != len(rows)
+                        or any(not integer(row.get("pid")) or row["pid"] == 0 for row in rows)):
+                    bar.append("invalid-gpu-execution-identity")
+                if single_required:
+                    single_physical.update(identity for identity in identities if identity is not None)
+            if single_required:
+                single_devices.update(executed)
             gpu_measurements.append((measurements, executed, legacy))
             function = str(call.get("function") or call.get("target") or "").rsplit("/", 1)[-1].split("@", 1)[0].replace("-", "_")
             h3 = function in {"generate_ref2va_turbo", "generate_fl2va_turbo",
-                              "ref2va_turbo", "fl2va_turbo", "long_form"}
+                              "ref2va_turbo", "fl2va_turbo", "long_form", "motion_segment"}
             if h3 and len(executed) == 2:
                 group_executed = True
                 if group_required and slim:
@@ -398,6 +423,8 @@ def record(path, cell, number, state, substitute, summary, slim=""):
         bar.append("no-gpu-execution")
     if group_required and not group_executed:
         bar.append("no-two-gpu-h3-execution")
+    if single_required and (len(single_devices) != 1 or len(single_physical) != 1):
+        bar.append("not-single-gpu-sdxl-execution")
     stats, movements = [], []
     for measurements, executed, legacy in gpu_measurements:
         memory = measurements.get("memory")
@@ -456,9 +483,9 @@ def record(path, cell, number, state, substitute, summary, slim=""):
         bar.append("leftover")
     legacy_control = any(row.get("legacy_control") for row in stats)
     if cell.endswith("-warm") and not legacy_control:
-        if not slim and read is not None and read > 40:
+        if cell.startswith("24-") and not slim and read is not None and read > 40:
             bar.append("read>40GB")
-        if "-h3ref5-warm" in cell:
+        if cell == "24-h3ref5-warm":
             if not dit:
                 bar.append("no-dit-step-stats")
             elif max(dit) > 0:
@@ -508,7 +535,7 @@ def compare(baseline, candidate, cards, strict=False):
     for cell in selected:
         control, current = old.get(cell), here.get(cell)
         if current is None or current.get("status") != "completed" or not current.get("landed") or current.get("bar") != "ok":
-            why = f"FAIL absolute: {current.get('bar', '?') if current else 'no candidate run'}"
+            why = f"FAIL acceptance: {current.get('bar', '?') if current else 'no candidate run'}"
             invalid += 1
         elif not strict and not cell.endswith("-warm"):
             why = "absolute bar ok (relative timing applies to warm cells)"
@@ -530,7 +557,7 @@ def compare(baseline, candidate, cards, strict=False):
         old_read = control.get("read", "-") if control else "-"
         new_read = current.get("read", "-") if current else "-"
         print(f"{cell}: control #{old_run}; read {old_read} -> {new_read}; {why}")
-    print(f"memory-matrix: {worse} valid-control timing regressions, {invalid} candidate failures")
+    print(f"memory-matrix: {worse} valid-control timing regressions, {invalid} acceptance checks unmet")
     return min(worse + invalid, 255)
 
 

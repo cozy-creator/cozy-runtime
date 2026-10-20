@@ -45,6 +45,7 @@ def patch(source):
         for node in tree.body
         if isinstance(node, ast.ImportFrom) and node.module == "__future__"
     ]
+    (returned,) = [node for node in generate.body if isinstance(node, ast.Return)]
     last_field = max(node.end_lineno for node in payload.body if isinstance(node, ast.AnnAssign))
     lines = source.splitlines(keepends=True)
     offsets = [0]
@@ -71,6 +72,12 @@ def patch(source):
             offsets[step.end_lineno],
             " " * step.col_offset
             + "_slim_lifecycle_step(index, payload.lifecycle_kill, payload.lifecycle_case, device, tel)\n",
+        ),
+        (
+            offsets[returned.lineno - 1],
+            offsets[returned.lineno - 1],
+            " " * returned.col_offset
+            + "_slim_lifecycle_step(-1, False, payload.lifecycle_case, device, tel, complete=True)\n",
         ),
     ]
     for start, end, replacement in sorted(changes, reverse=True):
