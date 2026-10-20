@@ -37,6 +37,10 @@ def main(
     (root / "conftest.py").write_bytes(conftest.read_bytes())
     logs = root / "logs"
     logs.mkdir()
+    environment_vars = os.environ.copy()
+    # Keep the assigned CUDA device; do not inherit an outer Python source overlay.
+    for key in ("PYTHONPATH", "PYTHONHOME"):
+        environment_vars.pop(key, None)
 
     def run(name: str, command: list[str]) -> str:
         process = subprocess.Popen(
@@ -46,6 +50,7 @@ def main(
             stderr=subprocess.STDOUT,
             text=True,
             start_new_session=True,
+            env=environment_vars,
         )
         try:
             text, _ = process.communicate(timeout=300)
@@ -72,7 +77,9 @@ def main(
         [
             python,
             "-c",
-            "import torch; assert torch.cuda.device_count() == 1; "
+            "import sys, tensorfs, torch; "
+            "assert tensorfs.__file__.startswith(sys.prefix); "
+            "assert torch.cuda.device_count() == 1; "
             "print(torch.cuda.get_device_properties(0))",
         ],
     )
