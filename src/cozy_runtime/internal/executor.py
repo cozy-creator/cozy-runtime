@@ -3436,10 +3436,11 @@ class Executor:
                 record = AuthorAttempt(command.request_id, spool, 0, sink=progress)
         assert record is not None
         self.handled[command.request_id] = (outcome, stage[0], record)
-        # A failure that left the device faulted: this process serves nothing more, so it is
-        # poisoned and the machine ends it, freeing everything (12167 ran on 12166's dead one).
+        # A failure the device raised (CUDA's or NCCL's own error, not capacity), or one that
+        # left it faulted: this process serves nothing more, so it is poisoned and the machine
+        # ends it, freeing everything (12167 and 12293 ran on a faulted one and failed again).
         failed = outcome.terminal == "failed" and torch is not None
-        if failed and not accel.healthy(torch, self.device_kind):
+        if failed and (_device_error(outcome) or not accel.healthy(torch, self.device_kind)):
             self.poisoned = self.poisoned or f"device fault: {outcome.message}"[:300]
         if self.rank == 0:
             for member in self.model_executors or [self]:
@@ -4761,6 +4762,12 @@ def _serialize_result(
         outputs,
         0,
     )
+
+
+def _device_error(outcome: Outcome) -> bool:
+    """A failed attempt's error is the device's own (CUDA's or NCCL's), not capacity."""
+    marks = ("AcceleratorError", "CUDA error", "NCCL")
+    return outcome.code not in CAPACITY_CODES and any(m in outcome.message for m in marks)
 
 
 def _assets_at(node: Any, path: str) -> list[dict[str, Any]]:
