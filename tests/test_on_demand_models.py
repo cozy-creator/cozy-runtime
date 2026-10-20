@@ -214,7 +214,9 @@ def owner(channel: Channel, hub: Hub, store: Store, sealed: list[str]) -> None:
                     if item["source"] == "object"
                 }.items()
             )
-            wire = [{"sha256": sha, "length": length} for sha, length in refs]
+            wire: list[tensorfs.ObjectRef] = [
+                {"sha256": sha, "length": length} for sha, length in refs
+            ]
             with Fetch.from_fd(hub.channel(store)) as fetch:
                 fetch.wait(doc.manifest, wire)
             lease = store.acquire(doc.manifest, [(f"sha256:{sha}", n) for sha, n in refs])

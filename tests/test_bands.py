@@ -9,7 +9,7 @@ memory (`short`): the bands it can run in, or whole.
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -24,6 +24,7 @@ from cozy_runtime.internal import attention_upstream as upstream  # noqa: E402
 from cozy_runtime.internal import spill  # noqa: E402
 from cozy_runtime.internal.attention_ulysses import Options, _call  # noqa: E402
 from cozy_runtime.internal.bands import Bands  # noqa: E402
+from cozy_runtime.internal.weights import Weights  # noqa: E402
 from cozy_runtime.internal.encoding.formats import hadamard256  # noqa: E402
 from cozy_runtime.internal.encoding.leaves import _native_leaf_class  # noqa: E402
 
@@ -257,14 +258,14 @@ def test_row_ops_in_bands_are_bit_exact_and_products_close(room: int) -> None:
     torch.manual_seed(6)
     x, w = torch.randn(3, 50, 64), torch.randn(96, 64)
     aten = torch.ops.aten
-    exact = {
+    exact: dict[str, Callable[[], Any]] = {
         "softmax": lambda: torch.softmax(x, -1),
         "layer_norm": lambda: aten.native_layer_norm(x, [64], w[0], w[1], 1e-5),
         "rms_norm": lambda: torch.nn.functional.rms_norm(x, (64,), w[0], 1e-6),
         "fused_rms_norm": lambda: aten._fused_rms_norm(x, [64], w[0], 1e-6),
     }
     e4m3, rows, cols = x[0].to(torch.float8_e4m3fn), x[0, :, :1].abs() + 0.5, w[None, :, 0].abs()
-    close = {
+    close: dict[str, Callable[[], Any]] = {
         "linear": lambda: torch.nn.functional.linear(x, w),
         "bf16": lambda: torch.nn.functional.linear(x.bfloat16(), w.bfloat16(), w[:, 0].bfloat16()),
         "fp8 rowwise": lambda: torch._scaled_mm(
@@ -365,7 +366,7 @@ def test_attention_out_of_memory_runs_in_head_groups_then_query_rows(
     mask = torch.rand(2, 1, 300, keys) > 0.3 if masking == "mask" else None
     causal = masking == "causal"
     options = Options(attn_mask=mask, dropout_p=0.0, is_causal=causal, scale=None, enable_gqa=True)
-    card = Bands(Card(1 << 30))  # the dispatch finds a device's bands while they live
+    card = Bands(cast(Weights, Card(1 << 30)))  # the dispatch finds a device's bands while they live
     with torch.inference_mode():
         whole = upstream.sdpa(q, k, v, **options)
         with Tight(heads, rows) as tight:
@@ -413,7 +414,7 @@ def test_an_encoded_linear_out_of_memory_runs_in_rows(operand: str) -> None:
         rows = (rotated.abs().amax(-1, keepdim=True) / 127).clamp_(min=1e-12)
         q = torch.round(rotated / rows).clamp_(-127, 127).to(torch.int8)
         given = PreQuantized(q, rows, tuple(x.shape), INT8_CONVROT)
-    card = Bands(Card(1 << 30))  # the leaf finds a device's bands while they live
+    card = Bands(cast(Weights, Card(1 << 30)))  # the leaf finds a device's bands while they live
     with torch.inference_mode():
         whole = leaf(given)
         with Rows(16) as tight:

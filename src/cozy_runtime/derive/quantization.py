@@ -527,13 +527,12 @@ def quantize_component_into(
                 written = 0
                 data_bytes = spill.tell()
                 spill.seek(0)
-                for role, part, part_bytes in (
-                    (roles[0], spill, data_bytes),
-                    *(
-                        (role, raw, len(raw))
-                        for role, raw in zip(roles[1:], result.scales, strict=True)
-                    ),
-                ):
+                parts: list[tuple[str, IO[bytes] | bytes, int]] = [(roles[0], spill, data_bytes)]
+                parts.extend(
+                    (role, raw, len(raw))
+                    for role, raw in zip(roles[1:], result.scales, strict=True)
+                )
+                for role, part, part_bytes in parts:
                     transaction.add_part(target_component, tensor.key, role, part)
                     if (target_component, tensor.key, role) not in completed:
                         written += part_bytes

@@ -348,7 +348,10 @@ def test_a_held_decode_set_lets_idle_attached_weights_go(tmp_path: Path) -> None
         blocks = [region.module for region in stack.blocks]
         need = sum(region.span for region in stack.blocks)
         weights.set_cap(torch.cuda.get_device_properties(0).total_memory)
-        weights.room = lambda _: custody.collect()  # the machine drops what nobody maps
+        def collect(_: int) -> None:
+            custody.collect()  # the machine drops what nobody maps
+
+        weights.room = collect
         torch.cuda.empty_cache()
         free, _ = torch.cuda.mem_get_info()
         with held_elsewhere(free - need // 2):  # another tenant holds the rest of the card

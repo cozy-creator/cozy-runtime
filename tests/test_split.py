@@ -66,7 +66,11 @@ def decoder() -> Any:
 def test_without_a_runtime_the_op_runs_whole() -> None:
     calls: list[tuple[int, ...]] = []
     x = torch.randn(3, 4)
-    assert torch.equal(split(lambda t: calls.append(tuple(t.shape)) or t * 2, x, Cut(0)), x * 2)
+    def twice(value: Any) -> Any:
+        calls.append(tuple(value.shape))
+        return value * 2
+
+    assert torch.equal(split(twice, x, Cut(0)), x * 2)
     assert calls == [(3, 4)]
 
 

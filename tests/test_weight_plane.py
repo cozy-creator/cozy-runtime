@@ -89,7 +89,7 @@ class Block(torch.nn.Module):  # type: ignore[misc,name-defined]
 
 
 class Stack(torch.nn.Module):  # type: ignore[misc,name-defined]
-    _no_split_modules = ("Block",)
+    _no_split_modules: tuple[str, ...] | None = ("Block",)
 
     def __init__(self, reverse: bool = False) -> None:
         super().__init__()
@@ -146,8 +146,8 @@ def store_component(
         ).native_arguments(1 << 30),
         work_fingerprint="sha256:" + "2" * 64,
     )
-    for key, roles in parts.items():
-        for role, data in roles.items():
+    for key, encoded_roles in parts.items():
+        for role, data in encoded_roles.items():
             writer.add_part(name, key, role, io.BytesIO(data))
     writer.add_config(name, io.BytesIO(b"{}"))
     receipt = writer.commit()
@@ -847,7 +847,7 @@ def test_an_earlier_stages_idle_cache_stays_until_a_stage_needs_its_room(card: A
         model.residency.release(method, ("stack",))
 
     def idle() -> int:
-        return torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+        return int(torch.cuda.memory_reserved() - torch.cuda.memory_allocated())
 
     stage("decode", 512 << 20)
     assert idle() >= 512 << 20, "a stage's exit keeps its cache"
@@ -1069,7 +1069,7 @@ def test_an_op_with_no_room_left_moves_the_tensors_the_process_holds_to_host(car
     spill.release(torch)
     with weights.recovering():
         reference = run(model, x, passes=1)
-    assert not spill.PRESSED[0] and not spill.USED, "a run with room notes no op"
+    assert spill.PRESSED == [False] and not spill.USED, "a run with room notes no op"
     model.residency.unpark()
     weights.set_budget(0)
     held = [torch.full((32 << 20,), float(i), device="cuda") for i in range(8)]  # 1 GiB
@@ -1105,7 +1105,7 @@ def test_an_op_with_no_room_left_moves_the_tensors_the_process_holds_to_host(car
     gc.collect()
     spill.release(torch)
     assert not spill.HELD, "every moved tensor is gone"
-    assert not spill.PRESSED[0] and not spill.USED, "no host block left: no op is noted"
+    assert spill.PRESSED == [False] and not spill.USED, "no host block left: no op is noted"
 
 
 def fill_card(weights: Weights) -> list[Any]:
@@ -1642,9 +1642,9 @@ def test_an_op_that_no_unmap_can_help_fails_once(card: Any) -> None:
 
     def counted(*args: Any, **kwargs: Any) -> bool:
         calls["room"] += 1
-        return free_for(*args, **kwargs)
+        return bool(free_for(*args, **kwargs))
 
-    weights.memory.free_for = counted  # type: ignore[method-assign]
+    weights.memory.free_for = counted
     asked: list[int] = []
     weights.room = asked.append  # the Worker: no other tenant here gives anything
     model.residency.admit("run", ("stack",))
@@ -2485,7 +2485,9 @@ def test_a_group_gpus_first_decode_keeps_its_denoisers_weights_under_a_cap(
 
 
 @on_card
-def test_a_components_blocks_run_without_a_dispatch_layer_and_its_ops_recover(card: Any) -> None:
+def test_a_components_blocks_run_without_a_dispatch_layer_and_its_ops_recover(
+    card: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A component's call inside the process's recovery: once their first run showed they
     write nothing they did not make, its blocks run with no op through the dispatch layer, on
     the stage's held leases; only its ops between blocks pass it. One of those that runs out
@@ -2496,7 +2498,7 @@ def test_a_components_blocks_run_without_a_dispatch_layer_and_its_ops_recover(ca
     x = torch.randn(8192, HIDDEN, device="cuda", dtype=torch.float16)
     weights.set_budget(1 << 30)
     reference = run(model, x, passes=1)
-    kind = weights_module._OPS.setdefault(id(torch), weights_module._ops_type(torch))
+    kind: Any = weights_module._OPS.setdefault(id(torch), weights_module._ops_type(torch))
     counted = {"ops": 0, "acquires": 0}
     original_run, original_acquire = kind._run, WeightResidency._acquire
 
@@ -2508,7 +2510,8 @@ def test_a_components_blocks_run_without_a_dispatch_layer_and_its_ops_recover(ca
         counted["acquires"] += 1
         return original_acquire(self, *args)
 
-    kind._run, WeightResidency._acquire = op, acquire
+    monkeypatch.setattr(kind, "_run", op)
+    monkeypatch.setattr(WeightResidency, "_acquire", acquire)
     ballast = None
     try:
         for _ in range(2):  # a cyclic stage: its second entry holds its resident blocks
@@ -2531,7 +2534,8 @@ def test_a_components_blocks_run_without_a_dispatch_layer_and_its_ops_recover(ca
             ballast = torch.empty(free - (16 << 20), dtype=torch.uint8, device="cuda")
             out = model.stack(x)
     finally:
-        kind._run, WeightResidency._acquire = original_run, original_acquire
+        monkeypatch.setattr(kind, "_run", original_run)
+        monkeypatch.setattr(WeightResidency, "_acquire", original_acquire)
         model.residency.release("run", ("stack",))
         del ballast
         torch.cuda.empty_cache()

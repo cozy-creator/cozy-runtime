@@ -58,8 +58,11 @@ def test_a_selection_keeps_the_matched_weights_as_the_sources_objects(tmp_path: 
     source = _source(store, "model", keys=("mtp.fc.weight", "layers.0.weight", "mtp.norm.weight"))
     result, outcome, _ = _select(tmp_path / "head", store, source, ["model.mtp.*"])
     assert outcome.terminal == "succeeded", outcome
-    before = tensorfs.parse_header(store.manifest(source.manifest.digest)["header"])
-    after = tensorfs.parse_header(store.manifest(result.result.manifest.digest)["header"])
+    before_header = store.manifest(source.manifest.digest)["header"]
+    after_header = store.manifest(result.result.manifest.digest)["header"]
+    assert before_header is not None and after_header is not None
+    before = tensorfs.parse_header(before_header)
+    after = tensorfs.parse_header(after_header)
     assert list(after["components"]) == ["model"]
     assert list(after["components"]["model"]) == ["mtp.fc.weight", "mtp.norm.weight"]
     for key in after["components"]["model"]:
