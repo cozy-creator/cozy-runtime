@@ -55,7 +55,7 @@ def test_one_lane_carries_nvfp4_beside_int8(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = home(tmp_path / "tensorfs", monkeypatch)
-    shown: list[tuple[str, str, str, str]] = []
+    shown: list[tuple[str, str, str, str, str]] = []
     source = checkpoint(
         store,
         {
