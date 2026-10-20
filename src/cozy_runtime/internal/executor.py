@@ -706,7 +706,7 @@ class _OnDemand:
 
 
 #: The requests rank 0 relays to the machine for a follower (`_relay`).
-_RELAYED = frozenset({"read_grant", "keep_pages"})
+_RELAYED = frozenset({"read_grant", "keep_pages", "deposit"})
 
 #: The runtime modules a construction imports, named ONCE so `start` can warm
 #: exactly the set `_prepare_first` re-imports (cr-104). Warming a name this tuple omits
@@ -4283,9 +4283,16 @@ class Executor:
         """The host layout the machine holds for `layout` (`ReadGrant`), with the GPU pages a gone
         executor kept of it `(region, fd)` and their fingerprint; `(None, [], "")` when it holds
         none. The fds are the caller's to close."""
-        answer = self._durable(ReadGrant(manifest=manifest, layout=layout, rank=self.rank), Granted)
+        request, pause = ReadGrant(manifest=manifest, layout=layout, rank=self.rank), 0.01
+        answer = self._durable(request, Granted)
+        # Another process seals this layout: its deposit lands as soon as it opens it, so this
+        # one waits for that one copy instead of sealing a second (2x8, 12129).
+        while answer.code == "layout_sealing":
+            time.sleep(pause)
+            pause = min(pause * 2, 0.25)
+            answer = self._durable(request, Granted)
         # Held: TensorD's first descriptor is the sealed layout an executor deposited, adopted
-        # as it is (memory-varena §5.4, D9's refill).
+        # as it is, filled or still filling (memory-varena §5.4, D9's refill).
         if answer.ok and answer.held and len(answer.fds) == 1 + len(answer.pages):
             pages = [(p.region, fd) for p, fd in zip(answer.pages, answer.fds[1:], strict=True)]
             return answer.fds[0], pages, answer.fingerprint

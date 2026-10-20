@@ -20,10 +20,14 @@ MANIFEST = "sha256:" + "a" * 64
 
 
 @contextmanager
-def grants(tmp_path: Path, deposited: dict[str, int]) -> Iterator[tuple[Executor, list[str]]]:
+def grants(
+    tmp_path: Path, deposited: dict[str, int], **peer: object
+) -> Iterator[tuple[Executor, list[str]]]:
     left, right = socket.socketpair()
     asked: list[str] = []
-    serving = threading.Thread(target=answer_read_grants, args=(Channel(right), deposited, asked))
+    serving = threading.Thread(
+        target=answer_read_grants, args=(Channel(right), deposited, asked), kwargs=peer
+    )
     serving.start()
     try:
         yield Executor(Channel(left), tmp_path), asked
@@ -49,6 +53,22 @@ def test_an_unheld_layout_grants_nothing_and_varena_reads_the_checkpoint(tmp_pat
     with grants(tmp_path, {}) as (executor, asked):
         assert executor._read_grant(MANIFEST, "sha256:cold") == (None, [], "")
         assert asked == ["sha256:cold"]
+
+
+def test_a_layout_another_process_seals_is_asked_again_until_its_one_copy_is_deposited(
+    tmp_path: Path,
+) -> None:
+    layout = sealed("layout", b"sealed by GPU 0 while GPU 1 asked")
+    try:
+        peer = {"sealing": {"sha256:s": 2}}
+        with grants(tmp_path, {"sha256:s": layout}, **peer) as (executor, asked):
+            fd, pages, _ = executor._read_grant(MANIFEST, "sha256:s")
+            assert fd is not None and pages == []
+            assert asked == ["sha256:s"] * 3, "two sealing answers, then the deposit"
+            assert os.pread(fd, 64, 0) == b"sealed by GPU 0 while GPU 1 asked"
+            os.close(fd)
+    finally:
+        os.close(layout)
 
 
 def test_a_held_layout_carries_kept_regions_and_their_fingerprint(tmp_path: Path) -> None:
