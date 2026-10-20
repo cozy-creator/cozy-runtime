@@ -95,6 +95,15 @@ class MemoryReceipts(unittest.TestCase):
                 bound, _ = API["window_lower_bound"](proof, trace)
                 self.assertLessEqual(bound, min(states.values()), (sequence, initial))
 
+    def test_weighted_opt_can_exceed_the_window_bound_without_a_traffic_regression(self):
+        # The actual optimum for this weighted sequence is 7 B, but this
+        # conservative partition bound is 5 B. Rejection means unproved.
+        proof, trace = proof_and_trace([1, 1, 1, 1, 2, 3, 2], {1: 1, 2: 2, 3: 2}, 3)
+        errors, measured, label = API["transfer_bound"]({"proofs": [proof]}, trace, {0}, {0: 7}, True)
+        self.assertEqual(measured, 5)
+        self.assertEqual(errors, ["h2d-window-bound-inconclusive"])
+        self.assertEqual(label, "inconclusive:near-minimum-unproved")
+
     def test_proof_requires_true_payload_initial_state_complete_scope_and_gpu_coverage(self):
         proof, trace = proof_and_trace([1, 2], {1: 2, 2: 3}, 8, [1])
         self.assertEqual(API["window_lower_bound"](proof, trace), (3, 3))
@@ -342,6 +351,15 @@ class MemoryReceipts(unittest.TestCase):
         code, text = self.record(value, "24-h3ref5-warm", cold)
         self.assertEqual(code, 1)
         self.assertIn("no-dit-step-stats", text)
+        stats = value.get("calls", [value])[0]["measurements"]["memory"]["stats"]
+        stats["steps"] = {"model/transformer_ref": [1]}
+        self.assertIn("dit-reads-per-step", self.record(value, "24-h3ref5-warm", cold)[1])
+        # A4's zero-DiT bar applies only at 24 GiB. Smaller-cap cells still
+        # require their own valid cold pass and measured per-step stats.
+        for cap in (6, 8, 12):
+            cell = f"{cap}-h3ref5-warm"
+            code, text = self.record(value, cell, cold.replace("24-", f"{cap}-"))
+            self.assertEqual(code, 0, text)
 
     def test_retries_use_current_stats_and_own_cold_pass(self):
         value = positive()

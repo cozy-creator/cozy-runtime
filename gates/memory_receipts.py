@@ -231,7 +231,9 @@ def transfer_bound(stats, events, executed, by_gpu, required):
         total += bound
         compulsory += distinct
         if 100 * by_gpu.get(proof["gpu"], 0) > 105 * bound:
-            return ["h2d-window-bound-inconclusive"], total, "inconclusive"
+            # Exceeding a lower bound cannot prove excessive traffic: even an
+            # optimal weighted cache may exceed this conservative bound.
+            return ["h2d-window-bound-inconclusive"], total, "inconclusive:near-minimum-unproved"
     if keys != executed:
         return ["transfer-proof-gpu-coverage"], None, "unproved"
     if identities != {(event.get("gpu"), event.get("rank"), event.get("request"))
@@ -458,7 +460,7 @@ def record(path, cell, number, state, substitute, summary, slim=""):
     if cell.endswith("-warm") and not legacy_control:
         if not slim and read is not None and read > 40:
             bar.append("read>40GB")
-        if "-h3ref5-warm" in cell:
+        if cell == "24-h3ref5-warm":
             if not dit:
                 bar.append("no-dit-step-stats")
             elif max(dit) > 0:
@@ -508,7 +510,7 @@ def compare(baseline, candidate, cards, strict=False):
     for cell in selected:
         control, current = old.get(cell), here.get(cell)
         if current is None or current.get("status") != "completed" or not current.get("landed") or current.get("bar") != "ok":
-            why = f"FAIL absolute: {current.get('bar', '?') if current else 'no candidate run'}"
+            why = f"FAIL acceptance: {current.get('bar', '?') if current else 'no candidate run'}"
             invalid += 1
         elif not strict and not cell.endswith("-warm"):
             why = "absolute bar ok (relative timing applies to warm cells)"
@@ -530,7 +532,7 @@ def compare(baseline, candidate, cards, strict=False):
         old_read = control.get("read", "-") if control else "-"
         new_read = current.get("read", "-") if current else "-"
         print(f"{cell}: control #{old_run}; read {old_read} -> {new_read}; {why}")
-    print(f"memory-matrix: {worse} valid-control timing regressions, {invalid} candidate failures")
+    print(f"memory-matrix: {worse} valid-control timing regressions, {invalid} acceptance checks unmet")
     return min(worse + invalid, 255)
 
 
