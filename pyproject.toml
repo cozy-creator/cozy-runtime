@@ -88,7 +88,7 @@ conflicts = [[{ extra = "corpus" }, { group = "diffusers" }]]
 # TensorFS 0.13 is unreleased: the matched slim/release reconciliation until the
 # cohort publishes it (never a test publish). The release replaces this with the version.
 [tool.uv.sources]
-tensorfs = { git = "https://github.com/cozy-creator/cozy-creator.git", rev = "a7bf1e8ccfb1553ca5c78aa21cb248eb65e1ea81", subdirectory = "crates/tensorfs-py" }
+tensorfs = { git = "https://github.com/cozy-creator/cozy-creator.git", rev = "bf35aa7026f6fd75e61f2c1f35a3f6d2eea8d7ba", subdirectory = "crates/tensorfs-py" }
 
 [tool.mypy]
 python_version = "3.12"
