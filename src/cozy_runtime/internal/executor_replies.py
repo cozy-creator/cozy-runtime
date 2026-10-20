@@ -40,7 +40,8 @@ class Peak(msgspec.Struct, frozen=True, kw_only=True):
 class Copy(msgspec.Struct, frozen=True, kw_only=True):
     """A run of weight copies since the last request (`tensorfs.varena.torch.Copy`): to a GPU
     (`h2d`: a restore, refill or fill) or a host layout read from disk (`disk`), in GB/s and %
-    of its measured ceiling, with the PCIe link, GPU copy and page-lock seconds."""
+    of its measured ceiling (None while unmeasured), with the PCIe link, GPU copy and page-lock
+    seconds."""
 
     kind: str
     gpu: int
@@ -48,7 +49,7 @@ class Copy(msgspec.Struct, frozen=True, kw_only=True):
     seconds: float
     gbps: float
     ceiling: float
-    pct: float
+    pct: float | None
     link: str = ""
     busy_s: float = 0.0
     pin_s: float = 0.0
