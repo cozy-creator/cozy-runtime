@@ -26,7 +26,8 @@
 # --baseline-wheel: each card first runs its cells on these wheels (0.27.4 + tensorfs 0.10.0) into ./baseline/, then
 # switches the same rental to the candidate (H3 downloads once); those lines override --baseline's for their cells.
 # --slim --control: collect the same workloads/inputs on the legacy baseline, without requiring new telemetry.
-# --tag: use one fixed input tag across separately batched baseline and candidate phases.
+# Default prompts have a unique proof-batch/cell tag; SDK updates do not clear result reuse.
+# --tag: explicit fixed controls only; matching inputs still require real model-step evidence.
 # --packages: run local package directories; --model-override package[/function]:slot=ref selects checkpoint metadata.
 # --tensord: update the full candidate cohort together with both supplied wheels, not wheels beneath an old control.
 # --bits: pin the same weight precision in both phases (default 8 for --slim).
@@ -75,7 +76,10 @@ declare -A SKUS=([8]="rtx-3070 rtx-3060-ti" [12]="rtx-4070-super rtx-5070 rtx-30
   [2x12]="rtx-4070-super rtx-3060")
 declare -A GIB=([6]=6 [8]=8 [12]=12 [16]=16 [24]=24 [32]=32 [2x8]=8 [2x12]=12)  # no GPU of a card may be larger
 declare -A SUB=([8]=12 [12]=16 [24]=32 [2x8]=2x12)  # the next larger class, capped, when a card has no capacity
-D=$PWD/memory-torture-$(date -u +%Y%m%dT%H%M%SZ); mkdir -p "$D"; cd "$D" || exit 1
+COHORT=${MEMORY_PROOF_COHORT:-candidate}
+[[ "$COHORT" =~ ^[a-zA-Z0-9_.-]+$ ]] || { echo 'invalid proof cohort label' >&2; exit 2; }
+D=$(mktemp -d "$PWD/memory-torture-$COHORT-$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX") || exit 1
+cd "$D" || exit 1
 if [ -n "$ON" ]; then
   read -r -a selected_cards <<< "$CARDS"
   [ "${#selected_cards[@]}" = 1 ] || { echo '--on requires one card/cap at a time; reuse the rental sequentially' >&2; exit 2; }
@@ -84,6 +88,13 @@ TAG=${INPUT_TAG:-$(basename "$D")} FAILED=0 M="" FOLLOW="" ONLY="" SUBST=""
 RECORD_MODE=$SLIM
 [ -z "$CONTROL" ] || RECORD_MODE=""
 say() { echo "$(date -u +%T) $*" | tee -a summary.txt; }
+prompt_tag() {
+  # Explicit fixed controls retain their exact old prompts. New proof batches name each cell.
+  if [ -n "$INPUT_TAG" ]; then printf '%s' "$TAG"
+  else printf '%s cell=%s' "$TAG" "$1"; fi
+}
+if [ -n "$INPUT_TAG" ]; then TAG_MODE=explicit-fixed-control; else TAG_MODE=unique-batch-cell; fi
+printf 'tag=%s\nmode=%s\n' "$TAG" "$TAG_MODE" > input-tag.txt
 target() {
   if [ -n "$PKGS" ]; then printf '%s/%s/%s\n' "$PKGS" "$1" "$2"
   else printf '%s/%s/%s\n' "$ORG" "$1" "$2"; fi
@@ -202,16 +213,16 @@ image() { ls "$PWD/out-$1"/*.png "$PWD/out-$1"/*.webp "$PWD/out-$1"/*.jpg 2>/dev
 
 references() {  # two character images for the LM and H3 cells
   local k=$1 r=$2
-  cell "$k-klein-a" "$(target flux-3-klein generate)" prompt="portrait of a young lifeguard with long platinum braids, orange swimsuit, $TAG $k a" seed=$((r + 1)) prompt_upsampling=false
-  cell "$k-klein-b" "$(target flux-3-klein generate)" prompt="portrait of a woman with short curly auburn hair, navy wool coat, $TAG $k b" seed=$((r + 2)) prompt_upsampling=false
+  cell "$k-klein-a" "$(target flux-3-klein generate)" prompt="portrait of a young lifeguard with long platinum braids, orange swimsuit, $(prompt_tag "$k-klein-a") $k a" seed=$((r + 1)) prompt_upsampling=false
+  cell "$k-klein-b" "$(target flux-3-klein generate)" prompt="portrait of a woman with short curly auburn hair, navy wool coat, $(prompt_tag "$k-klein-b") $k b" seed=$((r + 2)) prompt_upsampling=false
 }
 
 cells() {  # the matrix on one machine; $1 = card, $2 = H3 segments
   local k=$1 segs=$2 r=$RANDOM
   references "$k" "$r"
-  cell "$k-sdxl" "$(target sdxl generate)" prompt="a brass doorknob on a blue door in morning sun, $TAG $k" seed=$((r + 3))
-  cell "$k-qwen1" "$(target qwen-image-2 generate_image)" prompt="a lighthouse on a cliff at dusk, $TAG $k" seed=$((r + 4)) megapixels:=1
-  cell "$k-qwen4" "$(target qwen-image-2 generate_image)" prompt="a market street in the rain at night, $TAG $k" seed=$((r + 5)) megapixels:=4
+  cell "$k-sdxl" "$(target sdxl generate)" prompt="a brass doorknob on a blue door in morning sun, $(prompt_tag "$k-sdxl") $k" seed=$((r + 3))
+  cell "$k-qwen1" "$(target qwen-image-2 generate_image)" prompt="a lighthouse on a cliff at dusk, $(prompt_tag "$k-qwen1") $k" seed=$((r + 4)) megapixels:=1
+  cell "$k-qwen4" "$(target qwen-image-2 generate_image)" prompt="a market street in the rain at night, $(prompt_tag "$k-qwen4") $k" seed=$((r + 5)) megapixels:=4
   local a b; a=$(image "$k-klein-a") b=$(image "$k-klein-b")
   cell "$k-lm" "$(target character-describer describe_character)" --asset "image=$a"
   pair_sdxl "$k" "$r"
@@ -223,15 +234,15 @@ cells() {  # the matrix on one machine; $1 = card, $2 = H3 segments
 pair_sdxl() {  # co-resident pair, two runs on one GPU at once: SDXL ∥ Klein
   local k=$1 r=$2 n1 n2
   want "$k-pair-sdxl" || return 0
-  n1=$(start "$k-pair-sdxl" "$(target sdxl generate)" prompt="a red kite over dunes, $TAG $k pair" seed=$((r + 6)))
-  n2=$(start "$k-pair-klein" "$(target flux-3-klein generate)" prompt="a teapot on a windowsill, $TAG $k pair" seed=$((r + 7)) prompt_upsampling=false)
+  n1=$(start "$k-pair-sdxl" "$(target sdxl generate)" prompt="a red kite over dunes, $(prompt_tag "$k-pair-sdxl") $k pair" seed=$((r + 6)))
+  n2=$(start "$k-pair-klein" "$(target flux-3-klein generate)" prompt="a teapot on a windowsill, $(prompt_tag "$k-pair-klein") $k pair" seed=$((r + 7)) prompt_upsampling=false)
   finish "$k-pair-sdxl" "$n1"; finish "$k-pair-klein" "$n2"
 }
 
 pair_qwen() {  # co-resident pair: Qwen 1 MP ∥ LM ($3: the LM's image)
   local k=$1 r=$2 n1 n2
   want "$k-pair-qwen" || return 0
-  n1=$(start "$k-pair-qwen" "$(target qwen-image-2 generate_image)" prompt="a fox in fresh snow, $TAG $k pair" seed=$((r + 8)) megapixels:=1)
+  n1=$(start "$k-pair-qwen" "$(target qwen-image-2 generate_image)" prompt="a fox in fresh snow, $(prompt_tag "$k-pair-qwen") $k pair" seed=$((r + 8)) megapixels:=1)
   n2=$(start "$k-pair-lm" "$(target character-describer describe_character)" --asset "image=$3")
   finish "$k-pair-qwen" "$n1"; finish "$k-pair-lm" "$n2"
 }
@@ -240,7 +251,7 @@ h3ref() {  # H3 ref2va_turbo, one clip (15 s unless $4) from one character image
   local k=$1 a=$2 r=$3 s=${4:-15} c=$1-h3ref
   [ "$s" = 15 ] || c=$k-h3ref$s
   c=$c${5:-}
-  printf '{"prompt": "The woman in <Picture 1> walks through a sunlit park in autumn, leaves falling, she picks up a red leaf and smiles, %s %s.\n\nnon_diegetic_music:\nN/A", "seed": %d, "duration_s": %d}\n' "$TAG" "$c" $((r + 40 + s)) "$s" > "$c.json"
+  printf '{"prompt": "The woman in <Picture 1> walks through a sunlit park in autumn, leaves falling, she picks up a red leaf and smiles, %s %s.\n\nnon_diegetic_music:\nN/A", "seed": %d, "duration_s": %d}\n' "$(prompt_tag "$c")" "$c" $((r + 40 + s)) "$s" > "$c.json"
   cell "$c" "$(target minimax-h3 ref2va_turbo)" --input "$c.json" --asset "$a"
 }
 
@@ -254,15 +265,15 @@ matrix() {  # reference clips run cold/warm on Task A caps; 24 also warms long_f
     h3 "$k-h3" 2 "$a" "$b" "$r" 2
     if [ -n "$SLIM" ]; then
       local left right
-      left=$(start "$k-sdxl-a" "$(target sdxl generate)" prompt="blue door, $TAG" seed=11 --gpus 1)
-      right=$(start "$k-sdxl-b" "$(target sdxl generate)" prompt="red door, $TAG" seed=12 --gpus 1)
+      left=$(start "$k-sdxl-a" "$(target sdxl generate)" prompt="blue door, $(prompt_tag "$k-sdxl-a")" seed=11 --gpus 1)
+      right=$(start "$k-sdxl-b" "$(target sdxl generate)" prompt="red door, $(prompt_tag "$k-sdxl-b")" seed=12 --gpus 1)
       finish "$k-sdxl-a" "$left"; finish "$k-sdxl-b" "$right"
     fi
     return
   fi
-  [ -z "$SLIM" ] || cell "$k-sdxl1" "$(target sdxl generate)" prompt="a brass doorknob, $TAG $k" seed=$((r + 2)) megapixels:=1
-  cell "$k-sdxl4" "$(target sdxl generate)" prompt="a brass doorknob on a blue door in morning sun, $TAG $k" seed=$((r + 3)) megapixels:=4
-  cell "$k-qwen4" "$(target qwen-image-2 generate_image)" prompt="a market street in the rain at night, $TAG $k" seed=$((r + 5)) megapixels:=4
+  [ -z "$SLIM" ] || cell "$k-sdxl1" "$(target sdxl generate)" prompt="a brass doorknob, $(prompt_tag "$k-sdxl1") $k" seed=$((r + 2)) megapixels:=1
+  cell "$k-sdxl4" "$(target sdxl generate)" prompt="a brass doorknob on a blue door in morning sun, $(prompt_tag "$k-sdxl4") $k" seed=$((r + 3)) megapixels:=4
+  cell "$k-qwen4" "$(target qwen-image-2 generate_image)" prompt="a market street in the rain at night, $(prompt_tag "$k-qwen4") $k" seed=$((r + 5)) megapixels:=4
   h3ref "$k" "$b" "$r" 5; [ -n "$warm" ] && h3ref "$k" "$b" $((r + 100)) 5 -warm
   h3ref "$k" "$b" "$r" 15; [ -n "$warm" ] && h3ref "$k" "$b" $((r + 100)) 15 -warm
   h3 "$k-h3" 2 "$a" "$b" "$r" "" 5; [ "$k" = 24 ] && h3 "$k-h3-warm" 2 "$a" "$b" $((r + 100)) "" 5
@@ -283,9 +294,9 @@ h3() {  # H3 long_form <cell>: <segs> × <seconds, 15>; the last segment is guid
     echo "segments:"
     for i in $(seq 1 "$segs"); do
       if [ "$i" = "$segs" ]; then
-        echo "  - {duration_s: $s, seed: $((r + 20 + i)), prompt: '<Lena> and <Mara> walk the boardwalk as the camera moves like <Push>, $TAG $c $i.'}"
+        echo "  - {duration_s: $s, seed: $((r + 20 + i)), prompt: '<Lena> and <Mara> walk the boardwalk as the camera moves like <Push>, $(prompt_tag "$c-$i") $c $i.'}"
       else
-        echo "  - {duration_s: $s, seed: $((r + 20 + i)), prompt: '<Lena> and <Mara> arm-wrestle on a beach boardwalk at golden hour, $TAG $c $i.'}"
+        echo "  - {duration_s: $s, seed: $((r + 20 + i)), prompt: '<Lena> and <Mara> arm-wrestle on a beach boardwalk at golden hour, $(prompt_tag "$c-$i") $c $i.'}"
       fi
     done
   } > "$c.yaml"

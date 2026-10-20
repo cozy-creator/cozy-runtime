@@ -60,7 +60,8 @@ def control_reason(row):
     # Old controls predate varena stats/read targets, so only their applicable validity bars
     # constrain timing. A completed old control need not meet the candidate's new read bar.
     bars = set(row.get("bar", "").split(","))
-    if bars & {"incomplete", "poisoned", "leftover", "no-two-gpu-h3-execution"}:
+    if bars & {"incomplete", "poisoned", "leftover", "no-two-gpu-h3-execution", "no-gpu-execution",
+               "reused-model-result", "no-model-step-evidence"}:
         return "control failed applicable absolute bar"
     if row.get("leftover", "-") not in ("-", "0"):
         return "control left bytes"
@@ -346,6 +347,25 @@ def movement_evidence(stats, events, executed, require_bound=True):
     return list(dict.fromkeys(errors)), facts
 
 
+def model_steps(cell, memory, legacy=False):
+    """Inference invocations, or measured legacy denoise-stage presence; encoding is insufficient."""
+    if legacy:
+        peaks = memory.get("stage_peaks") or {}
+        return int(isinstance(peaks, dict) and any(
+            isinstance(key, str) and ("denoise" in key or "sample" in key
+                                      or "lm" in cell and "decode" in key)
+            and integer(value) and value > 0 for key, value in peaks.items()))
+    stats = memory.get("stats") or {}
+    steps = stats.get("steps") if isinstance(stats, dict) else None
+    if not isinstance(steps, dict):
+        return 0
+    prefix = "unet" if "sdxl" in cell else "transformer"
+    return sum(len(values) for key, values in steps.items()
+               if isinstance(key, str) and isinstance(values, list) and values
+               and all(integer(value) for value in values)
+               and ("lm" in cell or key.rsplit("/", 1)[-1].startswith(prefix)))
+
+
 def record(path, cell, number, state, substitute, summary, slim=""):
     bar = []
     try:
@@ -367,6 +387,9 @@ def record(path, cell, number, state, substitute, summary, slim=""):
     single_required = bool(slim and re.fullmatch(r"2x[^-]+-sdxl-[ab]", cell))
     single_devices, single_physical = set(), set()
     group_executed = False
+    inference_steps = 0
+    if run.get("memoized") is True:
+        bar.append("reused-model-result")
     for call in calls:
         if not isinstance(call, dict):
             bar.append("malformed-call")
@@ -384,6 +407,12 @@ def record(path, cell, number, state, substitute, summary, slim=""):
                     integer(gpu.get("start_us")) and gpu["start_us"] > 0 and
                     integer(gpu.get("end_us")) and gpu["end_us"] >= gpu["start_us"]}
         if call.get("memoized") is True:
+            # A real auxiliary GPU call cannot qualify a reused model result.
+            function = str(call.get("function") or "").rsplit("/", 1)[-1].replace("-", "_")
+            if function in {"generate", "generate_image", "describe_character", "motion_segment",
+                            "generate_ref2va_turbo", "generate_fl2va_turbo",
+                            "ref2va_turbo", "fl2va_turbo", "long_form"}:
+                bar.append("reused-model-result")
             executed = set()
         if executed:
             if slim and cell.startswith("2x"):
@@ -399,6 +428,9 @@ def record(path, cell, number, state, substitute, summary, slim=""):
             if single_required:
                 single_devices.update(executed)
             gpu_measurements.append((measurements, executed, legacy))
+            memory = measurements.get("memory")
+            if isinstance(memory, dict):
+                inference_steps += model_steps(cell, memory, legacy)
             function = str(call.get("function") or call.get("target") or "").rsplit("/", 1)[-1].split("@", 1)[0].replace("-", "_")
             h3 = function in {"generate_ref2va_turbo", "generate_fl2va_turbo",
                               "ref2va_turbo", "fl2va_turbo", "long_form", "motion_segment"}
@@ -421,6 +453,8 @@ def record(path, cell, number, state, substitute, summary, slim=""):
                 bar.append("gpu-call-incomplete")
     if not gpu_measurements:
         bar.append("no-gpu-execution")
+    if not inference_steps:
+        bar.append("no-model-step-evidence")
     if group_required and not group_executed:
         bar.append("no-two-gpu-h3-execution")
     if single_required and (len(single_devices) != 1 or len(single_physical) != 1):
@@ -514,7 +548,7 @@ def record(path, cell, number, state, substitute, summary, slim=""):
                           f"copy_ceiling_pct={percentages or '-'} ")
     print(f"{cell} run={number} {state} wall={wall:.0f}s exec={duration:.3f}s oom_retries={'-' if retries is None else retries} "
           f"poisoned={int(poisoned)} leftover={'-' if leftover is None else leftover} read={read_label}GB "
-          f"steps={steps} read_per_step={per_label}GB dit_step_max={max(dit) if dit else '-'}B "
+          f"steps={steps} model_steps={'-' if legacy_control else inference_steps} read_per_step={per_label}GB dit_step_max={max(dit) if dit else '-'}B "
           f"{f'substitute={substitute} ' if substitute else ''}{'legacy_control=1 ' if legacy_control else ''}{movement_label}bar={','.join(bar) or 'ok'} modes={{}} "
           f"mem_stats={json.dumps(stats)} reason={str(reason)[:300]}")
     return int(bool(bar))

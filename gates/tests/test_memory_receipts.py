@@ -14,7 +14,7 @@ RAW = json.loads((ROOT / "tests/fixtures/h3-warm-11880.json").read_text())
 CONTROLS = (ROOT / "tests/fixtures/0274-controls.txt").read_text()
 
 
-def positive():
+def positive(component="unet"):
     # Deliberately synthetic passing memory assertions, derived from a real completed GPU
     # receipt. The unmodified fixture retains its actual leftover and is tested as a failure.
     value = copy.deepcopy(RAW)
@@ -22,13 +22,13 @@ def positive():
     stats = measurements["memory"]["stats"]
     stats.update(leftover=0, paged_in=0, retries=0)
     stats["leftover_by_gpu"] = [[0, 0]]
-    stats["steps"] = {"model/transformer_ref": [0, 0]}
+    stats["steps"] = {f"model/{component}": [0, 0]}
     return value
 
 
-def slim_positive():
+def slim_positive(component="unet"):
     """A current-schema validator fixture, not a claim of another hardware run."""
-    value = positive()
+    value = positive(component)
     measurements = value.get("calls", [value])[0]["measurements"]
     measurements["execution"]["gpus"][0].update(
         pid=101, uuid="GPU-00000000-0000-0000-0000-000000000001")
@@ -66,7 +66,7 @@ def proof_and_trace(sequence, sizes, capacity, initial=()):
 
 
 def slim_group_positive():
-    value = slim_positive()
+    value = slim_positive("transformer_ref")
     call = value["calls"][0]
     call.update(status="succeeded", function="motion_segment")
     measurements = call["measurements"]
@@ -268,6 +268,37 @@ class MemoryReceipts(unittest.TestCase):
         value["status"] = "succeeded"
         self.assertIn("incomplete", self.record(value, "24-h3ref5")[1])
 
+    def test_actual_reused_h3_12373_is_not_an_inference_pass(self):
+        # Selected unchanged fields from the actual one-second replay; no GPU work occurred.
+        value = json.loads((ROOT / "tests/fixtures/h3-reused-12373.json").read_text())
+        code, text = self.record(value, "24-h3ref5")
+        self.assertEqual(code, 1)
+        self.assertIn("reused-model-result", text)
+        self.assertIn("no-model-step-evidence", text)
+        # Other GPU work must not launder the reused required child into a model pass.
+        auxiliary = positive("transformer_ref")["calls"][0]
+        auxiliary["function"] = "prepare_reference"
+        value["calls"].append(auxiliary)
+        self.assertIn("reused-model-result", self.record(value, "24-h3ref5")[1])
+
+    def test_gpu_preparation_does_not_substitute_for_denoiser_steps(self):
+        value = positive()
+        stats = value["calls"][0]["measurements"]["memory"]["stats"]
+        for steps in ({}, {"model/text_encoder": [0]}, {"model/unet": []}):
+            stats["steps"] = steps
+            self.assertIn("no-model-step-evidence", self.record(value)[1])
+        stats["steps"] = {"model/unet:3": [0, 0]}
+        code, text = self.record(value)
+        self.assertEqual(code, 0, text)
+        self.assertIn("model_steps=2", text)  # real warm execution may read zero bytes
+
+    def test_reused_or_unproved_model_controls_cannot_qualify_timing(self):
+        for reason in ("reused-model-result", "no-model-step-evidence", "no-gpu-execution"):
+            self.assertEqual(API["control_reason"]({
+                "status": "completed", "landed": True, "poisoned": "0", "exec": "1s",
+                "leftover": "0", "bar": reason,
+            }), "control failed applicable absolute bar")
+
     def test_missing_required_gpu_fields_refuse(self):
         for field in ("leftover", "paged_in", "retries", "steps"):
             with self.subTest(field=field):
@@ -323,7 +354,7 @@ class MemoryReceipts(unittest.TestCase):
         value["calls"].append(other)
         self.assertIn("no-two-gpu-h3-execution", self.record(value, "2x12-h3")[1])
         for cell in ("2x8-klein-a", "2x8-sdxl-a", "2x8-sdxl-b"):
-            self.assertEqual(self.record(positive(), cell)[0], 0)
+            self.assertEqual(self.record(positive("unet" if "sdxl" in cell else "transformer"), cell)[0], 0)
 
     def test_actual_h3_group_requires_complete_proofs_from_both_executed_ranks(self):
         value = slim_group_positive()
@@ -392,7 +423,7 @@ class MemoryReceipts(unittest.TestCase):
 
     def test_warm_transformer_steps_cannot_default_to_zero(self):
         cold = "24-h3ref5 run=1 completed landed exec=10s poisoned=0 leftover=0 oom_retries=0 bar=ok\n"
-        value = positive()
+        value = positive("transformer_ref")
         code, text = self.record(value, "24-h3ref5-warm", cold)
         self.assertEqual(code, 0, text)
         value.get("calls", [value])[0]["measurements"]["memory"]["stats"]["steps"] = {}
