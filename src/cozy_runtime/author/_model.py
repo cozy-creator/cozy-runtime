@@ -278,10 +278,6 @@ class Residency(Protocol):
         """A fact about how this attempt executed, reported with its memory facts."""
         ...
 
-    def plan(self, request_id: str, steps: Sequence[str | Collection[str]]) -> None:
-        """The attempt's declared steps by component name (`Context.plan`)."""
-        ...
-
     #: How many attempts (requests) it has opened.
     attempts: int
 

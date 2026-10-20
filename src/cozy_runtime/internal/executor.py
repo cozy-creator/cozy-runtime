@@ -91,22 +91,17 @@ from cozy_runtime.author._errors import (
     classify,
     ends,
     is_device_oom,
+    is_varena_error,
     unwind,
 )
 from cozy_runtime.author._executor_requests import (
     Answer,
     CheckpointItem,
     ChildEvents,
-    Deposit,
     Exchange,
-    Granted,
     Handoff,
-    KeepPages,
-    Page,
     Published,
-    ReadGrant,
     Request,
-    Tier,
 )
 from cozy_runtime.author._executor_requests import encode as encode_request
 from cozy_runtime.author._invoke import (
@@ -685,9 +680,6 @@ class _OnDemand:
         return getattr(self._model, name)
 
 
-#: The requests rank 0 relays to the machine for a follower (`_relay`).
-_RELAYED = frozenset({"read_grant", "keep_pages"})
-
 #: The runtime modules a construction imports, named ONCE so `start` can warm
 #: exactly the set `_prepare_first` re-imports (cr-104). Warming a name this tuple omits
 #: is a missed saving and never a wrong answer: the prepare imports what it needs either
@@ -770,6 +762,7 @@ class Executor:
         #: all their weights live (`tensorfs.varena.torch`).
         self.constructions: dict[str, Executor] = {}
         self.memory: Memory | None = None
+        self.memory_requests: dict[str, MemoryRequest] = {}
         #: HOST ONLY: its GPUs' ledger memfds from `Start` (rank 0 hands follower r the r-th, a
         #: follower holds its own), and the machine's memory mode
         self.ledgers: list[int] = []
@@ -906,16 +899,6 @@ class Executor:
                 return self.probe()
             case Map():
                 return self.map(command)
-            case executor_commands.KeepWeights():
-                keeping = self.constructions.get(command.construction)
-                if keeping is None:
-                    return {"ok": False, "code": "construction_absent"}
-                if self.host._rank_request is not None:
-                    return {"ok": False, "code": "request_memory_busy"}
-                # RequestMemory.end synchronized this follower's device before replying.
-                # Its serial command loop admits no next forward while pages are exported.
-                keeping._keep_weights(quiescent=True)
-                return {"ok": True}
             case executor_commands.RequestMemory():
                 reply = msgspec.to_builtins(self.request_memory(command))
                 assert isinstance(reply, dict)
@@ -1524,7 +1507,7 @@ class Executor:
         and reads as unstarted. The ordinary start that follows only initializes devices,
         warms the package and forms the group.
         """
-        ledgers = [fd for _ in range(command.ledgers) for fd in self.channel.recv_ledger()]
+        ledgers = self.channel.recv_ledgers(command.ledgers)
         if self.poisoned or self.ledgers:
             for fd in ledgers:  # one set per process
                 os.close(fd)
@@ -1690,7 +1673,7 @@ class Executor:
                     self.pg = self.group.form(
                         self.torch,
                         _SEALED,
-                        self.ledgers[2:],
+                        self.ledgers[3:],
                         nccl=self.transport.nccl,
                         formed=self._calibrated if measured.copy_engines else None,
                     )
@@ -1758,6 +1741,8 @@ class Executor:
 
         def follower() -> int:
             self.channel.sock.close()
+            for fd in set(self.ledgers):
+                os.close(fd)
             for sibling in siblings:
                 sibling.sock.close()
             stdin = os.open(os.devnull, os.O_RDONLY)
@@ -1783,6 +1768,8 @@ class Executor:
     def _forked(self, command: Fork, started: float) -> int:
         """In the child: an executor on its own seam, keeping this process's imports."""
         self.channel.sock.close()
+        for fd in set(self.ledgers):
+            os.close(fd)
         for fd, name in ((1, "stdout.log"), (2, "stderr.log")):
             log = os.open(Path(command.root) / name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             os.dup2(log, fd)
@@ -2284,7 +2271,7 @@ class Executor:
         stage("cuda_init")
         from tensorfs.varena import Unsupported as VarenaUnsupported
         from tensorfs.varena import cuts
-        from tensorfs.varena.torch import LedgerGrant, Memory, Mode
+        from tensorfs.varena.torch import Memory
 
         from cozy_runtime.author import ModelRegistry
         from cozy_runtime.author._loader import Artifact, Config, ModelFitRefused
@@ -2507,12 +2494,15 @@ class Executor:
         device = self._rank_device(torch)
         if host.memory is None:
             try:
-                ledger = (
-                    LedgerGrant(device.index or 0, *host.ledgers[:2])
-                    if device.type == "cuda" and len(host.ledgers) >= 2
-                    else None
-                )
-                host.memory = Memory.open(device, ledger, Mode(host.memory_mode))
+                grant: tuple[int, int, int] | None = None
+                if device.type == "cuda" and host.ledgers:
+                    if len(host.ledgers) % 3:
+                        raise SeamError(
+                            "seam_descriptor", "a rank grant requires three descriptors"
+                        )
+                    table, events, custody = host.ledgers[:3]
+                    grant = (table, events, custody)
+                host.memory = Memory.open(device, grant)
             except VarenaUnsupported as exc:  # no varena on this OS (Windows)
                 return {"ok": False, "code": "weight_plane_unavailable", "detail": str(exc)}
             host.memory.context = max(host.device_context, 0)
@@ -2534,9 +2524,8 @@ class Executor:
             qualified=qualified_pair,
             device_facts=device_facts,
             custody=binding.custody,
-            grant=self._read_grant,
-            deposit=self._deposit,
-            keeper=self._keep_pages,
+            rank=self.rank,
+            world=self.world,
         )
         stage("backend_ctor")
         # THE GROUP AGREES ITS PLAN before any rank registers a byte (cr-068), and the smallest
@@ -3366,8 +3355,12 @@ class Executor:
         try:
             with (
                 WARNINGS.attempt() as warnings,
-                self._request(command.request_id) as request,
-                self._ranks_request(command.request_id) as rank_memory,
+                self._request(
+                    command.request_id, shape=shape_cell(prepared.features.values)
+                ) as request,
+                self._ranks_request(
+                    command.request_id, shape=shape_cell(prepared.features.values)
+                ) as rank_memory,
                 attention.override(self._attention_snapshot(), self._attention_roots(), swap, pin)
                 if pin
                 else contextlib.nullcontext(
@@ -3521,16 +3514,6 @@ class Executor:
         if torch is not None and last:
             accel.drain(torch, self.device_kind)
         d2h_ms = (time.perf_counter() - d2h_started) * 1000
-        if last:
-            self._keep_weights(quiescent=True)
-            if self.group is not None:
-                replies = self.group.call(
-                    executor_commands.encode(
-                        executor_commands.KeepWeights(construction=self.construction)
-                    )
-                )
-                if any(not reply.get("ok") for reply in replies):
-                    self.poisoned = "a follower could not keep its completed weight pages"
         released_us = execution_evidence.now_us()
         peak_vram = accel.peak_allocated(torch, self.device_kind) if torch is not None else 0
         peak_reserved = accel.peak_reserved(torch, self.device_kind) if torch is not None else 0
@@ -3911,7 +3894,7 @@ class Executor:
                     request_id=command.request_id,
                     code="request_memory_busy",
                 )
-            context = self._request(command.request_id)
+            context = self._request(command.request_id, shape=command.shape)
             request = context.__enter__()
             self.host._rank_request = _RankRequest(
                 command.construction, command.request_id, context, request
@@ -3928,12 +3911,15 @@ class Executor:
             )
         elif command.phase == "plan":
             if state.request is not None:
-                state.request.plan(command.steps)
+                target = self.constructions.get(command.construction, self)
+                state.request.plan(target._memory_steps(command.steps))
         else:
             self.host._rank_request = None
             state.context.__exit__(None, None, None)
             memory = request_memory.measured(
-                state.request.stats if state.request is not None else None, _gpu_numbers(self.world)
+                state.request.stats if state.request is not None else None,
+                _gpu_numbers(self.world),
+                rank=self.rank,
             )
             return RankMemory(ok=True, rank=self.rank, request_id=command.request_id, memory=memory)
         return RankMemory(ok=True, rank=self.rank, request_id=command.request_id)
@@ -3958,7 +3944,7 @@ class Executor:
         return replies
 
     @contextlib.contextmanager
-    def _ranks_request(self, request_id: str) -> Iterator[list[ReplyMemory]]:
+    def _ranks_request(self, request_id: str, *, shape: str = "") -> Iterator[list[ReplyMemory]]:
         records: list[ReplyMemory] = []
         if self.group is None:
             yield records
@@ -3967,7 +3953,10 @@ class Executor:
         try:
             self._rank_memory_command(
                 executor_commands.RequestMemory(
-                    construction=self.construction, request_id=request_id, phase="begin"
+                    construction=self.construction,
+                    request_id=request_id,
+                    phase="begin",
+                    shape=shape,
                 )
             )
             begun = True
@@ -3997,9 +3986,34 @@ class Executor:
                     # refusal, not an absent state on another rank, remains the failure.
                     self.group.call(executor_commands.encode(command))
 
+    def _memory_steps(self, steps: Sequence[str | Collection[str]]) -> list[Any]:
+        """Resolve labels within this construction, never another tenant's loaded models."""
+        models: dict[str, list[Any]] = {}
+        for member in self.model_executors or [self]:
+            if member.backend is None:
+                continue
+            for name, model in member.backend.models.items():
+                models.setdefault(name, []).append(model)
+                if member._group_model_key:
+                    models.setdefault(f"{member._group_model_key}.{name}", []).append(model)
+
+        def resolve(name: str) -> Any:
+            candidates = models.get(name, [])
+            if len(candidates) > 1:
+                raise InvalidRequest(
+                    f"ambiguous memory-plan model {name!r}", code="memory_plan_ambiguous"
+                )
+            return candidates[0] if candidates else name
+
+        return [
+            resolve(step) if isinstance(step, str) else [resolve(name) for name in step]
+            for step in steps
+        ]
+
     def _plan_request(self, request_id: str, steps: Sequence[str | Collection[str]]) -> None:
-        if self.host.memory is not None:
-            self.host.memory.plan(request_id, list(steps))
+        request = self.host.memory_requests.get(request_id)
+        if request is not None:
+            request.plan(self._memory_steps(steps))
         if self.group is not None:
             normalized = tuple(
                 (step,) if isinstance(step, str) else tuple(sorted(step)) for step in steps
@@ -4226,62 +4240,6 @@ class Executor:
             bindings.setdefault(key, effect_interfaces.unserved(export))
         return bindings
 
-    def _keep_weights(self, *, quiescent: bool = False) -> None:
-        for member in self.model_executors or [self]:
-            if member.backend is not None:
-                member.backend.keep(quiescent=quiescent)
-
-    def _read_grant(
-        self, manifest: str, layout: str
-    ) -> tuple[int | None, list[tuple[int, int]], str]:
-        """The host layout the machine holds for `layout` (`ReadGrant`), with the GPU pages a gone
-        executor kept of it `(region, fd)` and their fingerprint; `(None, [], "")` when it holds
-        none. The fds are the caller's to close."""
-        answer = self._durable(ReadGrant(manifest=manifest, layout=layout, rank=self.rank), Granted)
-        # Held: TensorD's first descriptor is the sealed layout an executor deposited, adopted
-        # as it is (memory-varena §5.4, D9's refill).
-        if answer.ok and answer.held and len(answer.fds) == 1 + len(answer.pages):
-            pages = [(p.region, fd) for p, fd in zip(answer.pages, answer.fds[1:], strict=True)]
-            return answer.fds[0], pages, answer.fingerprint
-        for fd in answer.fds:
-            os.close(fd)
-        if answer.held:
-            raise RuntimeFailure(
-                f"{manifest[:23]}: the machine supplied an invalid kept layout",
-                code="weights_ungranted",
-            )
-        return None, [], ""
-
-    def _keep_pages(self, layout: str, fingerprint: str, pages: list[tuple[int, int, int]]) -> None:
-        """GPU pages varena kept here go to the machine, which holds them past this process
-        for the next executor of `layout`. A refusal only costs that executor a refill."""
-        try:
-            request = KeepPages(
-                layout=layout,
-                fingerprint=fingerprint,
-                rank=self.rank,
-                pages=tuple(Page(region=r, nbytes=n) for r, n, _ in pages),
-                fds=tuple(fd for _, _, fd in pages),
-            )
-            self._durable(request, Answer)
-        finally:
-            for _, _, fd in pages:
-                os.close(fd)
-
-    def _deposit(self, manifest: str, name: str, layout: str, fd: int) -> None:
-        """A host layout varena sealed here goes to the machine, which keeps it for the next
-        load of that layout (memory-varena §5.4). A refusal only costs that load a reseal."""
-        try:
-            request = Deposit(
-                manifest=manifest,
-                name=name,
-                layout=layout,
-                memfd=fd,
-            )
-            self._durable(request, Answer)
-        finally:
-            os.close(fd)
-
     def _store(self) -> Path:
         host = self.host
         if host.store is None:
@@ -4323,27 +4281,12 @@ class Executor:
         default the one this thread serves, "" outside every call).
         """
         body = encode_request(request)
-        sending = request.memfd if isinstance(request, Deposit) else -1
-        kept = list(request.fds) if isinstance(request, KeepPages) else []
-        body.pop("memfd", None)
-        body.pop("fds", None)
-        if sending >= 0:
-            body["descriptor"] = True
-        if kept:
-            body["descriptors"] = len(kept)
         channel, exchange = self.channel, body["kind"]
-
-        def send() -> None:
-            if sending >= 0:
-                channel.send_memfd(sending)
-            channel.send_fds(kept)
 
         def receive(frame: Frame) -> None:
             handoff = issubclass(into, Handoff)
             if frame.get("descriptor") is True:
-                if issubclass(into, Tier):
-                    frame["descriptor"] = channel.recv_memfd()
-                elif not handoff:
+                if not handoff:
                     channel.close()
                     raise SeamError("seam_descriptor", "unexpected capability in control reply")
                 else:
@@ -4353,16 +4296,14 @@ class Executor:
             # descriptors arrive by SCM_RIGHTS, never as numbers
             frame.pop("fds", None)
             count = frame.pop("descriptors", 0)
-            if count and issubclass(into, Granted) and type(count) is int and count > 0:
-                frame["fds"] = channel.recv_fds(count)
-            elif count or frame.get("lease") is True:
+            if count or frame.get("lease") is True:
                 channel.close()
                 raise SeamError("seam_descriptor", "unexpected descriptors in a reply")
 
         frame = self.host.mux.ask(
             {"event": "request", "request_id": _CALL.get() if request_id is None else request_id}
             | body,
-            send,
+            lambda: None,
             receive,
         )
         try:
@@ -4371,46 +4312,21 @@ class Executor:
             raise SeamError("seam_answer_malformed", f"{exchange}: {exc}") from exc
 
     def _relay(self, follower: Channel, frame: Frame) -> None:
-        """A follower's own request to the machine, sent on rank 0's seam and answered on the
-        follower's with every descriptor passed through: its sealed layouts and model files,
-        asked exactly as rank 0 asks them. The follower is inside one command and reads
-        nothing else until this answer."""
-        seq, kind = frame.get("seq"), frame.get("kind")
+        """Weight custody uses the library grant, never the Runtime request seam."""
         count = frame.get("descriptors", 0)
         if type(count) is not int or count < 0:
             raise SeamError("seam_descriptor", "invalid relayed descriptor count")
-        sending = follower.recv_fds(count + (frame.get("descriptor") is True))
-        passed: list[int] = []
-        try:
-            if kind not in _RELAYED:
-                follower.send(
-                    {
-                        "event": "answer",
-                        "seq": seq,
-                        "ok": False,
-                        "code": "request_unsupported",
-                        "detail": f"{_gpu(0)} relays no {kind!r} request",
-                    }
-                )
-                return
-
-            def receive(answer: Frame) -> None:
-                count = answer.get("descriptors", 0)
-                if type(count) is not int or count < 0:
-                    raise SeamError("seam_out_of_order", f"no answer to a relayed {kind}")
-                passed.extend(self.channel.recv_fds(count + (answer.get("descriptor") is True)))
-
-            answer = self.mux.ask(
-                {**frame, "request_id": self._attempt_request},
-                lambda: self.channel.send_fds(sending),
-                receive,
-            )
-            with follower.sending:
-                follower.send({**answer, "seq": seq})
-                follower.send_fds(passed)
-        finally:
-            for fd in sending + passed:
-                os.close(fd)
+        for fd in follower.recv_fds(count + (frame.get("descriptor") is True)):
+            os.close(fd)
+        follower.send(
+            {
+                "event": "answer",
+                "seq": frame.get("seq"),
+                "ok": False,
+                "code": "request_unsupported",
+                "detail": f"rank 0 relays no {frame.get('kind')!r} request",
+            }
+        )
 
     def _activity_sink(self, request_id: str) -> Callable[[int, bool, bool, bool], None]:
         def activity(sequence: int, active: bool, known: bool, finished: bool) -> None:
@@ -4486,13 +4402,21 @@ class Executor:
         lane's device: the worker sealed this process to exactly its lane (cr-066)."""
         return Device(self.device_kind, 0) if self.torch is not None else Device()
 
-    def _request(self, request_id: str) -> contextlib.AbstractContextManager[MemoryRequest | None]:
-        """The attempt as varena's request (memory-varena §5.7): everything it allocated is freed
-        at its end, failed or not, and its steps are measured."""
+    @contextlib.contextmanager
+    def _request(self, request_id: str, *, shape: str = "") -> Iterator[MemoryRequest | None]:
+        """One request owns its declared plan and cleanup, including exceptional exits."""
         memory = self.host.memory
         if memory is None:
-            return contextlib.nullcontext()
-        return memory.request(request_id)
+            yield None
+            return
+        if request_id in self.host.memory_requests:
+            raise InvalidRequest("memory request is already active", code="request_memory_busy")
+        with memory.request(request_id, plan=[], package=self.construction, shape=shape) as request:
+            self.host.memory_requests[request_id] = request
+            try:
+                yield request
+            finally:
+                self.host.memory_requests.pop(request_id, None)
 
     def _quiescent(self) -> bool:
         """No author computation may still mutate GPU or output state when a terminal is
@@ -4559,7 +4483,8 @@ class Executor:
         first = first if first.terminal == "failed" else later
         where = f" in {stage}" if stage else ""
         message = first.message + where + ("" if first is later else f"; then {later.message}")
-        capacity, quiet = later.code in CAPACITY_CODES, False
+        capacity = later.code in CAPACITY_CODES
+        quiet = is_varena_error(exc) and getattr(exc, "sticky", True) is False
         if capacity:
             with contextlib.suppress(Exception):  # a sticky fault raises here: then it is one
                 # Calls still in flight own the work the streams still hold.
@@ -4717,7 +4642,6 @@ _FOLLOWER_COMMANDS = frozenset(
         "unload",
         "run",
         "attention",
-        "keep_weights",
         "request_memory",
         "vacate",
         "restore",

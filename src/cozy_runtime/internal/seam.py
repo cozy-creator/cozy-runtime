@@ -53,7 +53,7 @@ else:
 #: Worker/executor command-and-reply compatibility, independent of SDK package
 #: version or source build. Compatible additive fields keep this revision; only
 #: an incompatible change to required commands/semantics raises it.
-EXECUTOR_PROTOCOL_REVISION = 1
+EXECUTOR_PROTOCOL_REVISION = 2
 
 #: Not a size rule: the most one length prefix may make a reader allocate (the documents'
 #: guard, shared with TensorD's `protocol::MAX_FRAME`). It refuses only a corrupt or hostile
@@ -241,20 +241,37 @@ class Channel:
             raise
         return received
 
-    def send_ledger(self, memfd: int, eventfd: int) -> None:
-        """Hand over one GPU's ledger (`tensorfs.varena.Ledger`): its memfd, then its eventfd."""
-        _require_memfd(memfd)
+    def send_ledger(self, table: int, eventfd: int, custody: int) -> None:
+        """One unbound rank grant: table, eventfd and private custody channel."""
+        _require_ledger_table(table)
         _require_eventfd(eventfd)
-        self._send_fd(memfd, "ledger memfd")
+        _require_custody(custody)
+        self._send_fd(table, "ledger table")
         self._send_fd(eventfd, "ledger eventfd")
+        self._send_fd(custody, "ledger custody channel")
 
     def recv_ledger(self) -> list[int]:
-        """One GPU's ledger memfd and eventfd; anything else is closed and refused."""
-        fds = self.recv_fds(2)
+        """One unbound three-fd grant; an invalid capability closes the whole set."""
+        fds = self.recv_fds(3)
         try:
-            _require_memfd(fds[0])
+            _require_ledger_table(fds[0])
             _require_eventfd(fds[1])
+            _require_custody(fds[2])
         except SeamError:
+            for fd in fds:
+                os.close(fd)
+            raise
+        return fds
+
+    def recv_ledgers(self, count: int) -> list[int]:
+        """Read exactly `count` typed grants, closing earlier grants if any is invalid."""
+        if type(count) is not int or count < 0:
+            raise SeamError("seam_descriptor", "ledger grant count must be a nonnegative integer")
+        fds: list[int] = []
+        try:
+            for _ in range(count):
+                fds.extend(self.recv_ledger())
+        except BaseException:
             for fd in fds:
                 os.close(fd)
             raise
@@ -684,6 +701,44 @@ def sealed(name: str, body: bytes) -> int:
         os.close(fd)
         raise
     return fd
+
+
+def _require_custody(fd: int) -> None:
+    """The grant's per-rank control channel is a connected local byte stream."""
+    try:
+        if not stat.S_ISSOCK(os.fstat(fd).st_mode):
+            raise SeamError("seam_descriptor", "custody channel must be a socket")
+        duplicate = os.dup(fd)
+        try:
+            channel = socket.socket(fileno=duplicate)
+        except OSError:
+            os.close(duplicate)
+            raise
+        with channel:
+            if channel.family != socket.AF_UNIX or channel.type != socket.SOCK_STREAM:
+                raise SeamError(
+                    "seam_descriptor", "custody channel must be a connected local stream"
+                )
+            channel.getpeername()
+    except OSError as exc:
+        raise SeamError("seam_descriptor", f"custody channel unreadable: {exc}") from exc
+
+
+def _require_ledger_table(fd: int) -> None:
+    """The persistent shared table is a read/write regular file, not a weight memfd.
+
+    Native Ledger.adopt validates its exact size and protocol before mapping its rows.
+    The descriptor is authoritative; the Runtime never reopens a supplied pathname.
+    """
+    if sys.platform != "linux":
+        raise SeamError("seam_descriptor", "GPU ledger grants require Linux")
+    try:
+        regular = stat.S_ISREG(os.fstat(fd).st_mode)
+        access = fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE
+    except OSError as exc:
+        raise SeamError("seam_descriptor", f"ledger table unreadable: {exc}") from exc
+    if not regular or access != os.O_RDWR:
+        raise SeamError("seam_descriptor", "ledger table must be a read/write regular file")
 
 
 def _require_eventfd(fd: int) -> None:

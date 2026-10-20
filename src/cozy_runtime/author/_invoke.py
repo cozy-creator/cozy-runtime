@@ -314,11 +314,8 @@ def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> Invoc
     attempt = record
     attempt.outputs = surface.outputs
     ctx = Context(inv.request_id, inv.deadline, inv.device, inv.cancel, inv.adapters)
-    placed = next((m._cozy_residency for m in models if m._cozy_residency is not None), None)
     if inv.plan is not None:
         ctx._plan = inv.plan
-    elif placed is not None:
-        ctx._plan = functools.partial(placed.plan, inv.request_id)
     handles = ExitStack()
     _bind_tensorfs(ctx, record, inv, surface, handles)
     kwargs = _inject(surface, attempt, ctx, overlay, prepared.facts, inv)

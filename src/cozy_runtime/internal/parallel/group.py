@@ -547,8 +547,8 @@ class RankGroup:
         formed: Callable[[Any], None] | None = None,
     ) -> Any:
         """Form the process group: the store on a kernel-chosen loopback port, every
-        follower joining it, rank 0 joining last, one barrier as the proof. `ledgers`, a pair
-        per follower in rank order, are their GPUs' ledger memfds and eventfds: each pair follows
+        follower joining it, rank 0 joining last, one barrier as the proof. `ledgers`, a triple
+        per follower in rank order, are table, eventfd and custody channel: each triple follows
         its `join`, then the
         socket its watcher reads (`interrupt`). `again` forms it AGAIN after an `interrupt`:
         every follower joins a new store.
@@ -583,7 +583,7 @@ class RankGroup:
             try:
                 self.send_one(follower.rank, {**join, "ledger": bool(ledgers), "abort": True})
                 if ledgers:
-                    follower.channel.send_ledger(*ledgers[2 * index : 2 * index + 2])
+                    follower.channel.send_ledger(*ledgers[3 * index : 3 * index + 3])
                 follower.channel.send_descriptor(watcher)
             except SeamError as exc:
                 raise GroupRefusal(
