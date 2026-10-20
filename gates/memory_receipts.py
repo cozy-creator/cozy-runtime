@@ -70,6 +70,15 @@ def control_reason(row):
     return ""
 
 
+def zero_io_fill_refusal(event):
+    """A producer-observed allocation OOM, before the source engine was entered."""
+    fill = event.get("fill")
+    return (isinstance(fill, dict) and fill.get("phase") == "allocate"
+            and fill.get("outcome") == "refused"
+            and fill.get("error") in ("DEVICE_FULL", "CUDA:2")
+            and type(fill.get("io_runs")) is int and fill["io_runs"] == 0)
+
+
 def trace_errors(events):
     """Validate actual placement events, not a simulation of model execution."""
     if not isinstance(events, list) or not events:
@@ -100,8 +109,11 @@ def trace_errors(events):
         request = (*stream, identity)
         step = (*request, event["step"])
         kind, reason, page_class = event.get("kind"), event.get("reason"), event.get("class")
-        if kind not in {"begin", "bind", "fill", "evict", "lower", "end"} or page_class not in classes:
+        if kind not in {"begin", "bind", "fill", "fill-refused", "evict", "lower", "end"} or page_class not in classes:
             errors.append("unknown-decision-event")
+            continue
+        if kind == "fill-refused" and not zero_io_fill_refusal(event):
+            errors.append("invalid-fill-refusal")
             continue
         if kind == "begin":
             if request in began:
@@ -126,7 +138,7 @@ def trace_errors(events):
                 errors.append("orphan-not-reclaimed-first")
             if page_class == "speculative" and reason != "speculation":
                 starved.add(step)
-        if kind == "fill" and reason == "speculation":
+        if kind in {"fill", "fill-refused"} and reason == "speculation":
             key = (*step, event["page"])
             if key in attempted:
                 errors.append("repeated-speculative-fetch")
@@ -137,8 +149,9 @@ def trace_errors(events):
             if not integer(budget) or not integer(event.get("working_set")):
                 errors.append("unmeasured-speculation")
             else:
-                speculative[step] = speculative.get(step, 0) + event["bytes"]
-                if speculative[step] > budget:
+                if kind == "fill":
+                    speculative[step] = speculative.get(step, 0) + event["bytes"]
+                if max(speculative.get(step, 0), event["bytes"]) > budget:
                     errors.append("speculation-exceeded-surplus")
     if began != ended:
         errors.append("unfinished-decision-trace")
@@ -180,6 +193,8 @@ def window_lower_bound(proof, events):
     initial = {pages[page] for page in proof["initial"]}
     groups, previous = [], None
     for event in events:
+        if event["kind"] == "fill-refused" and not zero_io_fill_refusal(event):
+            raise ValueError("invalid-fill-refusal")
         if event["kind"] != "bind":
             continue
         if not integer(event.get("pass_index")) or event["page"] not in pages:
