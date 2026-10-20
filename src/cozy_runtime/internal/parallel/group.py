@@ -217,9 +217,37 @@ def join_rank(torch: Any, spec: RankSpec, sealed: Mapping[str, str]) -> Any:
     abortable(spec.backend)
     route(spec.nccl)
     store = dist.TCPStore("127.0.0.1", spec.port, spec.world, is_master=False)
-    dist.init_process_group(spec.backend, store=store, rank=spec.rank, world_size=spec.world)
+    dist.init_process_group(
+        spec.backend,
+        store=store,
+        rank=spec.rank,
+        world_size=spec.world,
+        device_id=_device(torch, spec.backend),
+    )
     dist.barrier()
+    warm(torch, spec.backend, spec.rank, spec.world)
     return dist.group.WORLD
+
+
+def _device(torch: Any, backend: str) -> Any:
+    """NCCL's device, which makes its communicator eager: its buffers are allocated as the group
+    forms, before weights fill the GPU, never inside a request where no rung can make room
+    for the driver (12298, 12379: "NCCL Error 1: unhandled cuda error")."""
+    return torch.device("cuda", torch.cuda.current_device()) if "nccl" in backend else None
+
+
+def warm(torch: Any, backend: str, rank: int, world: int) -> None:
+    """GPU 0 and each follower exchange one element, so the pair's point-to-point communicator
+    (a request's broadcasts and results ride it) exists from the group's start too."""
+    if "nccl" not in backend:
+        return
+    dist, one = torch.distributed, torch.zeros(1, device=_device(torch, backend))
+    for peer in range(1, world) if rank == 0 else (0,):
+        if rank == 0:
+            dist.send(one, peer)
+        else:
+            dist.recv(one, peer)
+    torch.cuda.synchronize()
 
 
 def abort_process_group() -> None:
@@ -591,9 +619,16 @@ class RankGroup:
                 ) from exc
             finally:
                 watcher.close()
-        dist.init_process_group(self.backend, store=self.store, rank=0, world_size=self.degree)
+        dist.init_process_group(
+            self.backend,
+            store=self.store,
+            rank=0,
+            world_size=self.degree,
+            device_id=_device(torch, self.backend),
+        )
         self.pg = dist.group.WORLD
         dist.barrier()
+        warm(torch, self.backend, 0, self.degree)
         if formed is not None:
             formed(self.pg)
         replies = self.collect("join")
