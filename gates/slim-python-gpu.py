@@ -22,6 +22,7 @@ from cozy_runtime.author import AssetBound, FileAsset, Outputs, Tree
 def main(
     *,
     wheel: Annotated[FileAsset, AssetBound(max_bytes=67108864)],
+    runtime_wheel: Annotated[FileAsset, AssetBound(max_bytes=67108864)],
     tests: Annotated[FileAsset, AssetBound(max_bytes=131072)],
     graph_tests: Annotated[FileAsset, AssetBound(max_bytes=131072)],
     conftest: Annotated[FileAsset, AssetBound(max_bytes=131072)],
@@ -29,18 +30,25 @@ def main(
     out: Outputs,
 ) -> Tree:
     root = Path(tempfile.mkdtemp(prefix="slim-python-gpu-"))
-    contents = wheel.read_bytes()
-    with zipfile.ZipFile(BytesIO(contents)) as archive:
-        info = next(
-            name.rsplit("/", 1)[0]
-            for name in archive.namelist()
-            if name.endswith(".dist-info/METADATA")
-        )
-        metadata = Parser().parsestr(archive.read(f"{info}/METADATA").decode())
-        tags = Parser().parsestr(archive.read(f"{info}/WHEEL").decode())
-        assert metadata["Name"] == "tensorfs"
-        artifact = root / f"tensorfs-{metadata['Version']}-{tags['Tag']}.whl"
-    artifact.write_bytes(contents)
+
+    def supplied_wheel(asset: FileAsset, project: str) -> Path:
+        contents = asset.read_bytes()
+        with zipfile.ZipFile(BytesIO(contents)) as archive:
+            info = next(
+                name.rsplit("/", 1)[0]
+                for name in archive.namelist()
+                if name.endswith(".dist-info/METADATA")
+            )
+            metadata = Parser().parsestr(archive.read(f"{info}/METADATA").decode())
+            tags = Parser().parsestr(archive.read(f"{info}/WHEEL").decode())
+            assert metadata["Name"] == project
+            assert tags["Root-Is-Purelib"] == "false", "supply the native SDK wheel"
+            artifact = root / f"{project.replace('-', '_')}-{metadata['Version']}-{tags['Tag']}.whl"
+        artifact.write_bytes(contents)
+        return artifact
+
+    artifact = supplied_wheel(wheel, "tensorfs")
+    runtime_artifact = supplied_wheel(runtime_wheel, "cozy-runtime")
     (root / "test_slim_varena_gpu.py").write_bytes(tests.read_bytes())
     (root / "test_graph_cache_gpu.py").write_bytes(graph_tests.read_bytes())
     (root / "conftest.py").write_bytes(conftest.read_bytes())
@@ -91,9 +99,12 @@ def main(
             python,
             "--reinstall-package",
             "tensorfs",
+            "--reinstall-package",
+            "cozy-runtime",
             "--torch-backend",
             "cu130",
             str(artifact),
+            str(runtime_artifact),
             "pytest",
             "numpy>=2.0",
             "torch==2.14.0",
@@ -104,7 +115,8 @@ def main(
         [
             python,
             "-c",
-            "import sys, tensorfs, torch; "
+            "import sys, cozy_runtime, tensorfs, torch; "
+            "assert cozy_runtime.__file__.startswith(sys.prefix); "
             "assert tensorfs.__file__.startswith(sys.prefix); "
             "assert torch.cuda.device_count() == 1; "
             "print(torch.cuda.get_device_properties(0))",
