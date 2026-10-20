@@ -28,11 +28,13 @@
 set -uo pipefail
 GATE_RECEIPTS=$(dirname "$(realpath "$0")")/memory_receipts.py
 H=$1 W=$2; shift 2
-MATRIX="" TFS="" BASE="" CARDS="" BW="" BTFS="" ORG=fidika IMG=""
+MATRIX="" TFS="" BASE="" CARDS="" BW="" BTFS="" ORG=fidika IMG="" ON="" SLIM=""
 declare -A AFTER=()
 while [ $# -gt 0 ]; do
   case $1 in
     --matrix) MATRIX=1 ;;
+    --on) ON=$2; shift ;;
+    --slim) SLIM=slim ;;
     --tensorfs-wheel) TFS=$2; [ -f "$2" ] && TFS=$(realpath "$2"); shift ;;
     --baseline) BASE=$(realpath "$2"); shift ;;
     --baseline-wheel) BW=$2; [ -f "$2" ] && BW=$(realpath "$2"); shift ;;
@@ -51,14 +53,22 @@ done
 declare -A SKUS=([8]="rtx-3070 rtx-3060-ti" [12]="rtx-4070-super rtx-5070 rtx-3080-ti rtx-4070-ti rtx-3060"
   [16]="rtx-4080-super rtx-4060-ti rtx-5060-ti" [24]="rtx-4090" [32]="rtx-pro-4500 rtx-5090" [2x8]="rtx-3070 rtx-3060-ti"
   [2x12]="rtx-4070-super rtx-3060")
-declare -A GIB=([8]=8 [12]=12 [16]=16 [24]=24 [32]=32 [2x8]=8 [2x12]=12)  # no GPU of a card may be larger
+declare -A GIB=([6]=6 [8]=8 [12]=12 [16]=16 [24]=24 [32]=32 [2x8]=8 [2x12]=12)  # no GPU of a card may be larger
 declare -A SUB=([8]=12 [12]=16 [24]=32 [2x8]=2x12)  # the next larger class, capped, when a card has no capacity
 D=$PWD/memory-torture-$(date -u +%Y%m%dT%H%M%SZ); mkdir -p "$D"; cd "$D" || exit 1
+if [ -n "$ON" ]; then
+  read -r -a selected_cards <<< "$CARDS"
+  [ "${#selected_cards[@]}" = 1 ] || { echo '--on requires one card/cap at a time; reuse the rental sequentially' >&2; exit 2; }
+fi
+[ -z "$SLIM" ] || [ -n "$ON" ] || { echo '--slim requires an explicitly owned rental via --on' >&2; exit 2; }
 TAG=$(basename "$D") FAILED=0 M="" FOLLOW="" ONLY="" SUBST=""
 say() { echo "$(date -u +%T) $*" | tee -a summary.txt; }
 release() {  # end the machine this script rented, once its outputs landed, and confirm it is gone
   [ -z "$M" ] && return
   [ -n "$FOLLOW" ] && kill $FOLLOW 2>/dev/null; FOLLOW=""
+  # The caller owns --on and its budget; it ends and verifies the rental once
+  # all sequential cap runs are complete. Never terminate an adopted machine.
+  [ -n "$ON" ] && { M=""; return; }
   cozy machine end "$M" --tensorhub "$H" > "end-$M.log" 2>&1
   cozy machine show "$M" --tensorhub "$H" > "gone-$M.txt" 2>&1
   say "ended $M: $(grep -E '^(state|status)' "gone-$M.txt" | tr -s ' ' | tr '\n' ' ')"
@@ -113,7 +123,7 @@ PY
 record() {  # one line per run (status, wall, execution, retries, poisoned, leftover, GB read host to GPU, memory rungs);
             # fails if the run misses the absolute bar, named in `bar=`
   local n=$1 cell=$2 state=$3
-  python3 -I "$GATE_RECEIPTS" record "show-$cell.json" "$cell" "$n" "$state" "$SUBST" summary.txt | tee -a summary.txt
+  python3 -I "$GATE_RECEIPTS" record "show-$cell.json" "$cell" "$n" "$state" "$SUBST" summary.txt "$SLIM" | tee -a summary.txt
 }
 
 number() { grep -oE '"number": ?[0-9]+' "run-$1.json" 2>/dev/null | head -1 | grep -oE '[0-9]+$'; }
@@ -122,6 +132,9 @@ want() { [ -z "$ONLY" ] || [[ $1 == *-klein-[ab] || ",$ONLY," == *",${1#*-},"* ]
 
 start() {  # start <cell> <cozy run args…>: a detached run (for pairs); prints its number
   local cell=$1; shift
+  local arg has_gpus=""
+  for arg in "$@"; do [[ "$arg" == --gpus || "$arg" == --gpus=* ]] && has_gpus=1; done
+  [ -n "$has_gpus" ] || set -- "$@" --gpus 1
   cozy run "$@" --on "$M" --tensorhub "$H" --out "out-$cell" --detach --json > "run-$cell.json" 2> "run-$cell.err"
   number "$cell"
 }
@@ -136,6 +149,9 @@ finish() {  # finish <cell> <run number>: follow it to its end, confirm its outp
 cell() {  # cell <cell> <cozy run args…>: one run, followed in the foreground until it ends
   local c=$1; shift
   want "$c" || return 0
+  local arg has_gpus=""
+  for arg in "$@"; do [[ "$arg" == --gpus || "$arg" == --gpus=* ]] && has_gpus=1; done
+  [ -n "$has_gpus" ] || set -- "$@" --gpus 1
   cozy run "$@" --on "$M" --tensorhub "$H" --out "out-$c" --json > "run-$c.json" 2> "run-$c.err"
   finish "$c" "$(number "$c")"
 }
@@ -190,11 +206,21 @@ matrix() {  # the merge matrix on one machine ($1 = card); on 24 each H3 cell ru
   local k=$1 r=$RANDOM a b
   references "$k" "$r"
   a=$(image "$k-klein-a") b=$(image "$k-klein-b")
-  if [ "$k" = 2x8 ]; then h3 "$k-h3" 2 "$a" "$b" "$r" 2; return; fi
+  if [ "$k" = 2x8 ]; then
+    h3 "$k-h3" 2 "$a" "$b" "$r" 2
+    if [ -n "$SLIM" ]; then
+      local left right
+      left=$(start "$k-sdxl-a" $ORG/sdxl/generate prompt="blue door, $TAG" seed=11 --gpus 1)
+      right=$(start "$k-sdxl-b" $ORG/sdxl/generate prompt="red door, $TAG" seed=12 --gpus 1)
+      finish "$k-sdxl-a" "$left"; finish "$k-sdxl-b" "$right"
+    fi
+    return
+  fi
+  [ -z "$SLIM" ] || cell "$k-sdxl1" $ORG/sdxl/generate prompt="a brass doorknob, $TAG $k" seed=$((r + 2)) megapixels:=1
   cell "$k-sdxl4" $ORG/sdxl/generate prompt="a brass doorknob on a blue door in morning sun, $TAG $k" seed=$((r + 3)) megapixels:=4
   cell "$k-qwen4" $ORG/qwen-image-2/generate_image prompt="a market street in the rain at night, $TAG $k" seed=$((r + 5)) megapixels:=4
-  h3ref "$k" "$b" "$r" 5; [ "$k" = 24 ] && h3ref "$k" "$b" $((r + 100)) 5 -warm
-  h3ref "$k" "$b" "$r" 15; [ "$k" = 24 ] && h3ref "$k" "$b" $((r + 100)) 15 -warm
+  h3ref "$k" "$b" "$r" 5; { [ "$k" = 24 ] || [ -n "$SLIM" ]; } && h3ref "$k" "$b" $((r + 100)) 5 -warm
+  h3ref "$k" "$b" "$r" 15; { [ "$k" = 24 ] || [ -n "$SLIM" ]; } && h3ref "$k" "$b" $((r + 100)) 15 -warm
   h3 "$k-h3" 2 "$a" "$b" "$r" "" 5; [ "$k" = 24 ] && h3 "$k-h3-warm" 2 "$a" "$b" $((r + 100)) "" 5
   pair_sdxl "$k" "$r"
   [ "$k" = 24 ] && pair_qwen "$k" "$r" "$b"
@@ -230,6 +256,15 @@ card() {  # one card, in its own subshell: rent, install, run its cells, end the
   [ "$card" = 2x8 ] && gpus=2
   M=""
   local class
+  if [ -n "$ON" ]; then
+    M=$ON
+    [ -n "${GIB[$card]:-}" ] || { say "unknown cap $card"; FAILED=$((FAILED + 1)); return; }
+    if ! cozy machine update "$M" --gpu-memory-limit "${GIB[$card]}GiB" --tensorhub "$H" > "cap-$card.log" 2>&1 ||
+        ! capped "${GIB[$card]}"; then
+      say "card $card: requested cap on $M is not in force"; FAILED=$((FAILED + 1)); return
+    fi
+    say "card $card: caller-owned rental $M; this script does not rent or end it"
+  else
   for class in "$card" ${SUB[$card]:-}; do
     for sku in ${SKUS[$class]}; do
       cozy machine rent "$sku" ${gpus:+--gpus "$gpus"} --disk-gb 160 ${IMG:+--image-digest "$IMG"} --tensorhub "$H" --json > "rent-$card.json" 2> "rent-$card.err"
@@ -262,6 +297,7 @@ PY
   if [ -n "$SUBST" ] && ! { cozy machine update "$M" --gpu-memory-limit "${GIB[$card]}GiB" --tensorhub "$H" > "cap-$card.log" 2>&1 &&
       capped "${GIB[$card]}"; }; then
     say "card $card: the ${GIB[$card]} GiB cap on $M is not in force: $(tail -c 300 "cap-$card.log")"; FAILED=$((FAILED + 1)); release; return
+  fi
   fi
   local log  # the machine's own and memory logs, kept here in case the machine is lost mid-run
   for log in tensord memory; do
@@ -312,7 +348,7 @@ for c in $CARDS; do (card "$c"; exit "$FAILED") & PIDS="$PIDS $!"; done
 for p in $PIDS; do wait "$p"; FAILED=$((FAILED + $?)); done
 say "memory-torture: $FAILED below the absolute bar"
 if [ -n "$BASE$BW" ]; then  # relative to 0.27.4 (D7): a warm cell >10% slower to execute; GB read reported beside it
-  python3 -I "$GATE_RECEIPTS" compare <(cat ${BASE:+"$BASE/summary.txt"} ${BW:+baseline/summary.txt} 2>/dev/null) summary.txt $CARDS | tee -a summary.txt
+  python3 -I "$GATE_RECEIPTS" compare <(cat ${BASE:+"$BASE/summary.txt"} ${BW:+baseline/summary.txt} 2>/dev/null) summary.txt $CARDS ${SLIM:+--strict} | tee -a summary.txt
   FAILED=$((FAILED + $?))
 fi
 exit $((FAILED > 255 ? 255 : FAILED))

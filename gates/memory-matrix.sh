@@ -4,6 +4,8 @@
 #   gates/memory-matrix.sh <wheel|-> [--tensorfs-wheel <file|url>] [--baseline <dir>]
 #                          [--baseline-wheel <0.27.4> --baseline-tensorfs <0.10.0>] [--tensorhub <hub>] [--org <org>]
 #                          [--image-digest sha256:…] [--after <card>=<cmd>] [card[:cell,…]...]
+# For xs-058, reuse one caller-owned rental sequentially: --on <rental> 24, then
+# --on <rental> 12, 8 or 6 (one invocation per cap). This never rents or ends it.
 #
 # Cards 8 12 24 (RTX 4090) 2x8, at once; cells: SDXL 4 MP, Qwen 4 MP, H3 ref2va_turbo 5 s and 15 s, H3 long_form and
 # the pair SDXL ∥ Klein; on 24 each H3 cell cold then warm, and the pair Qwen 1 MP ∥ LM. Exit status: the cells that

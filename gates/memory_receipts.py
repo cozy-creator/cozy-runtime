@@ -51,7 +51,78 @@ def control_reason(row):
     return ""
 
 
-def record(path, cell, number, state, substitute, summary):
+def trace_errors(events):
+    """Validate actual placement events, not a simulation of model execution."""
+    if not isinstance(events, list) or not events:
+        return ["missing-decision-trace"]
+    errors, last, attempted, speculative, starved = [], {}, set(), {}, set()
+    began, ended = set(), set()
+    classes = {"free", "orphan", "speculative", "unused", "declared", "working", "pinned"}
+    for event in events:
+        if not isinstance(event, dict):
+            errors.append("malformed-decision-event")
+            continue
+        required = ("sequence", "step", "page", "bytes", "capacity", "resident", "orphan_bytes")
+        if any(not integer(event.get(field)) for field in required):
+            errors.append("invalid-decision-values")
+            continue
+        identity = event.get("request")
+        if not ((isinstance(identity, str) and identity) or integer(identity)):
+            errors.append("invalid-decision-request")
+            continue
+        stream = (event.get("rank", 0), event.get("gpu", 0))
+        if any(not integer(value) for value in stream):
+            errors.append("invalid-decision-device")
+            continue
+        sequence = event["sequence"]
+        if sequence <= last.get(stream, -1):
+            errors.append("unordered-decision-trace")
+        last[stream] = sequence
+        request = (*stream, identity)
+        step = (*request, event["step"])
+        kind, reason, page_class = event.get("kind"), event.get("reason"), event.get("class")
+        if kind not in {"begin", "bind", "fill", "evict", "end"} or page_class not in classes:
+            errors.append("unknown-decision-event")
+            continue
+        if kind == "begin":
+            if request in began:
+                errors.append("duplicate-request-begin")
+            began.add(request)
+        elif kind == "end":
+            if request not in began or request in ended:
+                errors.append("unmatched-request-end")
+            ended.add(request)
+        elif request not in began or request in ended:
+            errors.append("decision-outside-request")
+        if kind == "evict":
+            if page_class == "pinned" or (page_class == "working" and reason != "lower"):
+                errors.append("running-page-evicted")
+            if reason == "speculation" and page_class in {"declared", "working", "pinned"}:
+                errors.append("speculation-evicted-declared-use")
+            if event["orphan_bytes"] and page_class in {"speculative", "unused", "declared"}:
+                errors.append("orphan-not-reclaimed-first")
+            if page_class == "speculative" and reason != "speculation":
+                starved.add(step)
+        if kind == "fill" and reason == "speculation":
+            key = (*step, event["page"])
+            if key in attempted:
+                errors.append("repeated-speculative-fetch")
+            attempted.add(key)
+            if step in starved:
+                errors.append("speculation-after-starvation")
+            budget = event.get("speculative_budget")
+            if not integer(budget) or not integer(event.get("working_set")):
+                errors.append("unmeasured-speculation")
+            else:
+                speculative[step] = speculative.get(step, 0) + event["bytes"]
+                if speculative[step] > budget:
+                    errors.append("speculation-exceeded-surplus")
+    if began != ended:
+        errors.append("unfinished-decision-trace")
+    return list(dict.fromkeys(errors))
+
+
+def record(path, cell, number, state, substitute, summary, slim=""):
     bar = []
     try:
         run = json.loads(Path(path).read_text())
@@ -88,6 +159,9 @@ def record(path, cell, number, state, substitute, summary):
     stats = []
     for measurements, executed in gpu_measurements:
         memory = measurements.get("memory")
+        if slim:
+            events = memory.get("trace") if isinstance(memory, dict) else None
+            bar.extend(trace_errors(events))
         value = memory.get("stats") if isinstance(memory, dict) else None
         if not isinstance(value, dict) or not value:
             bar.append("no-mem-stats")
@@ -125,7 +199,7 @@ def record(path, cell, number, state, substitute, summary):
     if leftover:
         bar.append("leftover")
     if cell.endswith("-warm"):
-        if read is not None and read > 40:
+        if not slim and read is not None and read > 40:
             bar.append("read>40GB")
         if "-h3ref5-warm" in cell:
             if not dit:
@@ -154,7 +228,7 @@ def record(path, cell, number, state, substitute, summary):
     return int(bool(bar))
 
 
-def compare(baseline, candidate, cards):
+def compare(baseline, candidate, cards, strict=False):
     asked = {value.split(":")[0]: value.split(":")[1].split(",") if ":" in value else [] for value in cards}
     def wanted(cell):
         card, _, name = cell.partition("-")
@@ -167,7 +241,7 @@ def compare(baseline, candidate, cards):
         if current is None or current.get("status") != "completed" or not current.get("landed") or current.get("bar") != "ok":
             why = f"FAIL absolute: {current.get('bar', '?') if current else 'no candidate run'}"
             invalid += 1
-        elif not cell.endswith("-warm"):
+        elif not strict and not cell.endswith("-warm"):
             why = "absolute bar ok (relative timing applies to warm cells)"
         elif current.get("substitute"):
             why = f"not compared: candidate substitute {current['substitute']}; absolute bars remain"
@@ -176,11 +250,11 @@ def compare(baseline, candidate, cards):
         elif seconds(current) is None:
             why = "FAIL: candidate execution time missing or invalid"
             invalid += 1
-        elif seconds(current) > 1.1 * seconds(control):
-            why = f"WORSE: {current['exec']} > 1.1 x {control['exec']}"
+        elif seconds(current) > (1.0 if strict else 1.1) * seconds(control):
+            why = f"WORSE: {current['exec']} > {1.0 if strict else 1.1} x {control['exec']}"
             worse += 1
         else:
-            why = f"relative timing ok: {current['exec']} <= 1.1 x {control['exec']}"
+            why = f"relative timing ok: {current['exec']} <= {1.0 if strict else 1.1} x {control['exec']}"
         old_run = control.get("run") if control else "-"
         old_read = control.get("read", "-") if control else "-"
         new_read = current.get("read", "-") if current else "-"
@@ -194,7 +268,8 @@ if __name__ == "__main__":
         if sys.argv[1] == "record":
             result = record(*sys.argv[2:])
         elif sys.argv[1] == "compare":
-            result = compare(sys.argv[2], sys.argv[3], sys.argv[4:])
+            cards = [arg for arg in sys.argv[4:] if arg != "--strict"]
+            result = compare(sys.argv[2], sys.argv[3], cards, "--strict" in sys.argv[4:])
         else:
             raise ValueError("use record or compare")
     except (OSError, ValueError, TypeError, KeyError, AttributeError) as error:
