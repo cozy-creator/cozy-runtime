@@ -219,7 +219,7 @@ def _retain_replay(store: Path, transaction: str, tree: str) -> None:
     """Root the uploaded tree under its immutable replay name using Endpoint's CAS."""
     name = tag(transaction)
 
-    def retain(repo: dict[str, object] | None) -> dict[str, object] | None:
+    def retain(repo: dict[str, object] | None) -> dict[str, object]:
         if repo is None:
             raise RuntimeFailure(
                 "uploaded derivation repo is absent", code="weights_replay_missing"
@@ -244,7 +244,7 @@ def _retain_replay(store: Path, transaction: str, tree: str) -> None:
                         f"private derivation replay {name} already names another tree or is public",
                         code="weights_replay_conflict",
                     )
-                return None
+                return repo
         return {**repo, "tags": [*tags, {"name": name, "commit": commit}]}
 
     tensorfs.Endpoint("local", cache_dir=store).update_repo(DERIVED, retain)
