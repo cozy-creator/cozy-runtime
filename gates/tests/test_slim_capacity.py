@@ -64,6 +64,16 @@ class SlimCapacity(unittest.TestCase):
             with self.subTest(text=text), self.assertRaises(ValueError):
                 API["measured_caps"](text, 12 << 30, 1)
 
+    def test_executor_message_text_cannot_replace_native_pool_evidence(self):
+        row = SOURCE["events"][1]
+        captured = {
+            "level": "INFO",
+            "target": "tensord::device_executor",
+            "fields": {"message": json.dumps(row)},
+        }
+        with self.assertRaisesRegex(ValueError, "covers 0 GPUs"):
+            API["measured_caps"](json.dumps(captured), 12 << 30, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

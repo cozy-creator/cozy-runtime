@@ -28,8 +28,14 @@ def events(text):
 def objects(value):
     if isinstance(value, dict):
         fields = value.get("fields")
-        if isinstance(fields, dict) and fields.get("message") == "GPU memory capacity":
-            yield fields
+        if isinstance(fields, dict):
+            if (
+                value.get("target") == "tensord::gpu_service"
+                and value.get("level") == "INFO"
+                and fields.get("message") == "GPU memory capacity"
+            ):
+                yield fields
+            # Other tracing messages are opaque, including captured executor output.
         else:
             for child in value.values():
                 if isinstance(child, str):
