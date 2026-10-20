@@ -77,7 +77,21 @@ def main(
         ["uv", "venv", "--python", sys.executable, "--system-site-packages", str(environment)],
     )
     python = str(environment / "bin/python")
-    run("install", ["uv", "pip", "install", "--python", python, str(artifact), "pytest"])
+    run(
+        "install",
+        [
+            "uv",
+            "pip",
+            "install",
+            "--python",
+            python,
+            "--torch-backend",
+            "cu130",
+            str(artifact),
+            "pytest",
+            "torch==2.14.0",
+        ],
+    )
     run(
         "device",
         [
