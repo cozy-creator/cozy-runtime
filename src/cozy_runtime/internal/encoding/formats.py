@@ -15,7 +15,6 @@ from dataclasses import dataclass
 from types import ModuleType
 from typing import Any, Protocol, runtime_checkable
 
-from cozy_runtime.author._loader import TENSORFS_DTYPES as _TENSORFS_DTYPES
 from cozy_runtime.author._loader import TORCH_DTYPES as _TORCH_DTYPES
 from cozy_runtime.internal.decode_schemes import BY_SCHEME as _CORE_SCHEMES
 from cozy_runtime.internal.decode_schemes import parts_rule as _core_parts_rule
@@ -125,8 +124,9 @@ SCALE_LAYOUTS = ("row_major", "cublas_128x4")
 NIBBLE_ORDERS = ("low_first", "high_first")
 #: nvfp4's second level: `scale_2` multiplies (ModelOpt) or divides (compressed-tensors).
 GLOBAL_SCALES = ("multiply", "divide")
-#: A stored scale's dtype (tensorwise, rowwise, convrot): it enters the decode as it is.
-SCALE_DTYPES = ("F32", "BF16", "F16")
+#: A stored scale's dtypes (tensorwise, rowwise, convrot): the part's own, entering the decode
+#: as it is.
+_SCALES = frozenset({"f32", "bf16", "f16"})
 
 
 def matrix(shape: Sequence[int]) -> tuple[int, int]:
@@ -194,8 +194,7 @@ def part_rule(encoded: Encoded, shape: Sequence[int], dtype: str) -> str:
     rows, cols = matrix(shape)
     params = dict(encoded.params)
     axis = params.get("axis")
-    #: a stored scale is in the dtype its `scale_dtype` names, and enters the decode exactly
-    stored = frozenset({_TENSORFS_DTYPES.get(str(params.get("scale_dtype")), "")})
+    stored = _SCALES
     rules: dict[str, tuple[frozenset[str], int | tuple[int, ...]]] = {
         "fp8.rowwise": {
             "weight": (_F8, tuple(shape)),
@@ -390,7 +389,7 @@ class Verbatim:
 @dataclass(frozen=True, slots=True)
 class TensorwiseDequant:
     """`fp8.tensorwise` and `int8.tensorwise` -> float: `round_L(weight * scale)`, the scale in
-    the dtype its producer stored (`scale_dtype`), never rounded on the way in. `input_scale`
+    the dtype its producer stored the part in, never rounded on the way in. `input_scale`
     is the activation scale of a quantized matmul and never enters the weight."""
 
     encoding: str = "fp8.tensorwise"
@@ -433,7 +432,7 @@ class TensorwiseDequant:
         return frozenset({"input_scale"})
 
     def supports(self, shape: Sequence[int], params: Mapping[str, object]) -> str:
-        return _params(params, {"scale_dtype": SCALE_DTYPES})
+        return _params(params, {})
 
     def decode(self, torch: ModuleType, parts: Mapping[str, Tensor], destination: Tensor) -> None:
         flat = destination.view(-1)
@@ -500,7 +499,7 @@ class RowwiseDequant:
         return frozenset()
 
     def supports(self, shape: Sequence[int], params: Mapping[str, object]) -> str:
-        why = _rows(shape, params) or _params(params, {"axis": (0, 1), "scale_dtype": SCALE_DTYPES})
+        why = _rows(shape, params) or _params(params, {"axis": (0, 1)})
         if why or len(shape) == 2 or params.get("axis") == 0:
             return why
         return "a per-column scale is a rank-2 weight's"
@@ -665,7 +664,6 @@ class Int8ConvRotDequant:
             {
                 "rotation": ("kron_regular_h4",),
                 "rotation_size": ROTATION_SIZES,
-                "scale_dtype": SCALE_DTYPES,
             },
         )
         size = int(str(params.get("rotation_size", 1)))

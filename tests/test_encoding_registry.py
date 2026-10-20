@@ -63,9 +63,7 @@ def test_an_unknown_scheme_refuses_by_name() -> None:
 def test_parts_and_params_outside_the_scheme_refuse() -> None:
     weight = RolePart("weight", "f8_e4m3fn", (2, 64), 128)
     with pytest.raises(EncodingRefusal) as refused:
-        _candidates(
-            Encoded("fp8.rowwise", params_of({"axis": 0, "scale_dtype": "F32"}), (weight,)), (2, 64)
-        )
+        _candidates(Encoded("fp8.rowwise", params_of({"axis": 0}), (weight,)), (2, 64))
     assert refused.value.code == "role_mismatch"
     scale = RolePart("scale", "f32", (2,), 8)
     with pytest.raises(EncodingRefusal) as refused:
@@ -74,7 +72,7 @@ def test_parts_and_params_outside_the_scheme_refuse() -> None:
         )
     assert refused.value.code == "geometry_unsupported" and "zero" in str(refused.value)
     found = _candidates(
-        Encoded("fp8.rowwise", params_of({"axis": 1, "scale_dtype": "F32"}), (weight, scale)),
+        Encoded("fp8.rowwise", params_of({"axis": 1}), (weight, scale)),
         (2, 64),
     )
     assert "native-leaf" in str(found.geometry_refused), "the leaf takes a scale per row only"

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from types import ModuleType
 from typing import TYPE_CHECKING
 
@@ -37,8 +37,6 @@ try:
 except ImportError:  # the eager reference still runs
     triton = None
 
-#: The spec's dtype names (as a param names a part's dtype) -> the runtime's.
-DTYPES = {"F32": "f32", "BF16": "bf16", "F16": "f16", "F8_E4M3": "f8_e4m3fn", "F8_E8M0": "f8_e8m0"}
 TORCH = {
     "f32": "float32",
     "bf16": "bfloat16",
@@ -92,8 +90,8 @@ class View:
 @dataclass(frozen=True)
 class Part:
     role: str
-    #: runtime dtype names, or the param whose value (a spec dtype name) is the dtype
-    dtypes: tuple[str, ...] | str
+    #: runtime dtype names: the part's own dtype is authoritative
+    dtypes: tuple[str, ...]
     shape: Callable[[View], Shape]
     required: bool = True
 
@@ -126,8 +124,6 @@ class Adapter:
     probe_params: Mapping[str, object]
     #: any shape as one row (else rank 2 or more as [R, C])
     flat: bool = False
-    #: params that come with an optional part: present exactly when it is
-    with_part: Mapping[str, str] = field(default_factory=dict)
     #: conditions across parts: "" or why not
     rule: Callable[[View], str] = _no_rule
     #: makes random parts valid where values matter (tables, indices, shapes)
@@ -151,22 +147,14 @@ def _allowed(rule: Rule, value: object) -> bool:
     return any(type(value) is type(a) and value == a for a in rule)
 
 
-def params_rule(
-    a: Adapter, params: Mapping[str, object], roles: Sequence[str] | None = None
-) -> str:
-    """ "" when `params` are the row's: none unknown, every required one present, each allowed. With
-    `roles`, a param that comes with an optional part is present exactly when the part is."""
+def params_rule(a: Adapter, params: Mapping[str, object]) -> str:
+    """ "" when `params` are the row's: none unknown, every one present, each allowed."""
     unknown = sorted(set(params) - set(a.params))
     if unknown:
         return f"{a.scheme}: unknown params {unknown}"
     for key, rule in a.params.items():
-        part = a.with_part.get(key)
         if key not in params:
-            if part is None or (roles is not None and part in roles):
-                return f"{a.scheme}: param {key} is missing"
-            continue
-        if part is not None and roles is not None and part not in roles:
-            return f"{a.scheme}: param {key} without part {part}"
+            return f"{a.scheme}: param {key} is missing"
         if not _allowed(rule, params[key]):
             return f"{a.scheme}: param {key}={params[key]!r}"
     return ""
@@ -193,7 +181,7 @@ def parts_rule(
     parts: Mapping[str, tuple[str, tuple[int, ...]]],
 ) -> str:
     """ "" when the parts are the row's: roles accounted, dtypes and shapes by its rules."""
-    why = params_rule(a, params, list(parts)) or geometry_rule(a, shape, params)
+    why = params_rule(a, params) or geometry_rule(a, shape, params)
     if why:
         return why
     roles = {p.role for p in a.parts}
@@ -204,7 +192,7 @@ def parts_rule(
         if p.role not in parts:
             continue
         dtype, got = parts[p.role]
-        names = (DTYPES.get(str(params[p.dtypes]), ""),) if isinstance(p.dtypes, str) else p.dtypes
+        names = p.dtypes
         try:
             kind, want = p.shape(view)
         except ValueError as e:
@@ -257,10 +245,9 @@ def sample(
     view = View(stored_shape(params, shape), params, {}, a.flat)
     out: dict[str, Tensor] = {}
     for p in a.parts:
-        param = next((k for k, role in a.with_part.items() if role == p.role), None)
-        if not p.required and (param is None or param not in params):
+        if not p.required:
             continue
-        dtype = DTYPES[str(params[p.dtypes])] if isinstance(p.dtypes, str) else p.dtypes[0]
+        dtype = p.dtypes[0]
         _, want = p.shape(view)
         extents = want if isinstance(want, tuple) else (want,)
         out[p.role] = _random(torch, dtype, extents, generator)
@@ -419,7 +406,6 @@ NVFP4 = Adapter(
         "global_scale": ("multiply", "divide"),
         "nibble_order": ("low_first", "high_first"),
         "scale_layout": SCALE_LAYOUTS,
-        "pre_quant_scale_dtype": ("F32", "BF16", "F16"),
     },
     (
         Part("weight", ("u8",), _f4),
@@ -427,7 +413,7 @@ NVFP4 = Adapter(
         Part("scale_2", ("f32",), _one_or_per_matrix("scale_2")),
         Part("input_scale", ("f32",), _one_or_per_matrix("input_scale"), required=False),
         Part(
-            "pre_quant_scale", "pre_quant_scale_dtype", lambda v: ("count", v.cols), required=False
+            "pre_quant_scale", ("f32", "bf16", "f16"), lambda v: ("count", v.cols), required=False
         ),
     ),
     _nvfp4,
@@ -437,7 +423,6 @@ NVFP4 = Adapter(
         "nibble_order": "high_first",
         "scale_layout": "cublas_128x4",
     },
-    with_part={"pre_quant_scale_dtype": "pre_quant_scale"},
     rule=_nvfp4_rule,
 )
 
@@ -548,10 +533,13 @@ def _fp8_blockwise(
 
 FP8_BLOCKWISE = Adapter(
     "fp8.blockwise",
-    {"block_size": _block_size, "scale_dtype": ("F32", "BF16", "F16", "F8_E8M0")},
-    (Part("weight", ("f8_e4m3fn",), _logical), Part("scale", "scale_dtype", _tiles)),
+    {"block_size": _block_size},
+    (
+        Part("weight", ("f8_e4m3fn",), _logical),
+        Part("scale", ("f8_e8m0", "f32", "bf16", "f16"), _tiles),
+    ),
     _fp8_blockwise,
-    {"block_size": [128, 128], "scale_dtype": "F8_E8M0"},
+    {"block_size": [128, 128]},
 )
 
 
