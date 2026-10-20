@@ -23,7 +23,6 @@ from cozy_runtime.internal.decode_cores import (
     Cores,
     Packing,
     blocks_of,
-    round_into,
     unpack,
 )
 
@@ -1334,169 +1333,6 @@ def _ct(bits: int) -> Adapter:
     )
 
 
-# ------------------------------------------------------------------------------- comfy.*
-
-ROTATION = tuple(4**k for k in range(1, 9))
-
-
-def _comfy_packed(bits: int, group: bool = True) -> Callable[[View], Shape]:
-    def shape(v: View) -> Shape:
-        b = _intp(v.params, "rotation_size")
-        g = _intp(v.params, "group_size") if group else 1
-        if v.cols % b or v.cols % g:
-            raise ValueError(f"{v.cols} columns in blocks of {b} and groups of {g}")
-        return "exact", (*v.lead, v.cols * bits // 8)
-
-    return shape
-
-
-def _hadamard(torch: ModuleType, x: Tensor, k: int) -> Tensor:
-    """Rows of `x` (int32, last axis 4^k) times H4 (x) ... (x) H4, unnormalized and exact."""
-    shape = x.shape
-    x = x.reshape(-1, *([4] * k))
-    for axis in range(1, k + 1):
-        a, b, c, d = (x.select(axis, i) for i in range(4))
-        x = torch.stack((a + b + c - d, a + b - c + d, a - b + c + d, b + c + d - a), dim=axis)
-    return x.reshape(shape)
-
-
-def _comfy_rotate(
-    torch: ModuleType,
-    q8: Tensor,
-    s: Tensor,
-    b: int,
-    out: Tensor,
-    corr: Tensor | None = None,
-    g: int = 1,
-) -> None:
-    """((y x s[i]) + z) x 2^-k per block of b, y = q8 . H_b exact; z = sum_g corr(i, g) x M_g, left
-    to right, M_g the block's group indicator times H_b (spec §6 `comfy.*`)."""
-    rows, cols = q8.shape
-    k = b.bit_length() // 2
-    y = _hadamard(torch, q8.reshape(rows, cols // b, b), k).to(torch.float32)
-    v = y * s.reshape(rows, 1, 1)
-    if corr is not None:
-        cg = corr.reshape(-1, rows).t()  # [R, C/g]
-        z = torch.zeros_like(v)
-        span = torch.arange(b, device=v.device)
-        for blk in range(cols // b):
-            for n, grp in enumerate(range(blk * b // g, -(-(blk + 1) * b // g))):
-                inside = ((span + blk * b) // g == grp).to(torch.int32)
-                m = _hadamard(torch, inside.reshape(1, b), k)[0].to(torch.float32)
-                t = cg[:, grp : grp + 1] * m.reshape(1, b)
-                z[:, blk] = t if n == 0 else z[:, blk] + t
-        v = v + z
-    round_into(torch, (v * 2.0**-k).reshape(-1), out)
-
-
-def _comfy_grouped(bits: int) -> Decode:
-    """asym_w4a8 (4) and w6a8 (6): q8 = clip(round(T[q] x s_rel), +-127) by the table core,
-    then rotated back."""
-
-    def decode(
-        c: Cores,
-        parts: Mapping[str, Tensor],
-        params: Mapping[str, object],
-        shape: tuple[int, ...],
-        out: Tensor,
-    ) -> None:
-        torch = c.torch
-        cols = shape[-1]
-        rows = math.prod(shape) // cols
-        g, b = _intp(params, "group_size"), _intp(params, "rotation_size")
-        w = _u8(torch, parts["weight"]).reshape(rows, cols * bits // 8)
-        if bits == 4:
-            words, pack = w, Packing(4, 8)
-        else:  # a nibble plane, then high 2 bits: column t at bits 2(t mod 4) of byte t // 4
-            low = unpack(torch, w[:, : cols // 2].contiguous(), Packing(4, 8), rows, cols)
-            high = unpack(torch, w[:, cols // 2 :].contiguous(), Packing(2, 8), rows, cols)
-            words, pack = (low | (high << 4)).to(torch.uint8), Packing(8, 8)
-        if "weight_codebook" in parts:
-            levels = _f32(torch, parts["weight_codebook"])
-        else:
-            levels = torch.arange(1 << bits, dtype=torch.float32, device=out.device) - (
-                1 << (bits - 1)
-            )
-        scaled = torch.empty(rows * cols, dtype=torch.float32, device=out.device)
-        c.table(words, pack, rows, cols, levels, parts["weight_s_rel"], blocks_of(g), scaled)
-        x = torch.round(scaled)
-        if bool(x.isnan().any()):
-            raise ValueError("comfy: a level scales to NaN")
-        q8 = x.clamp(-127, 127).to(torch.int32).reshape(rows, cols)
-        corr = _f32(torch, parts["weight_correction"]) if "weight_correction" in parts else None
-        _comfy_rotate(torch, q8, _f32(torch, parts["weight_s_channel"]), b, out, corr, g)
-
-    return decode
-
-
-def _convrot_w4a4(
-    c: Cores,
-    parts: Mapping[str, Tensor],
-    params: Mapping[str, object],
-    shape: tuple[int, ...],
-    out: Tensor,
-) -> None:
-    torch = c.torch
-    cols = shape[-1]
-    rows = math.prod(shape) // cols
-    q = unpack(torch, _u8(torch, parts["weight"]), Packing(4, 8, signed=True), rows, cols)
-    b = _intp(params, "rotation_size")
-    _comfy_rotate(torch, q.to(torch.int32), _f32(torch, parts["weight_scale"]), b, out)
-
-
-def _w4_group(g: object) -> bool:
-    return type(g) is int and g >= 4 and (16 % g == 0 or g % 16 == 0)
-
-
-def _w6_group(g: object) -> bool:
-    return type(g) is int and g >= 16 and g % 16 == 0
-
-
-def _s_rel(v: View) -> Shape:
-    return "exact", (*v.lead, v.cols // _intp(v.params, "group_size"))
-
-
-COMFY_W4A8 = Adapter(
-    "comfy.asym_w4a8_int8",
-    {"group_size": _w4_group, "rotation_size": ROTATION},
-    (
-        Part("weight", ("i8",), _comfy_packed(4)),
-        Part("weight_s_rel", ("f8_e4m3fn", "f32"), _s_rel),
-        Part("weight_s_channel", ("f32",), lambda v: ("count", v.rows)),
-        Part("weight_codebook", ("f32",), _count(16), required=False),
-        Part(
-            "weight_correction",
-            ("f32", "bf16", "f16"),
-            lambda v: ("exact", (v.cols // _intp(v.params, "group_size"), v.rows)),
-            required=False,
-        ),
-    ),
-    _comfy_grouped(4),
-    {"group_size": 16, "rotation_size": 256},
-)
-COMFY_W6A8 = Adapter(
-    "comfy.w6a8_int8",
-    {"group_size": _w6_group, "rotation_size": ROTATION},
-    (
-        Part("weight", ("i8",), _comfy_packed(6)),
-        Part("weight_s_rel", ("f8_e4m3fn", "f32"), _s_rel),
-        Part("weight_s_channel", ("f32",), lambda v: ("count", v.rows)),
-    ),
-    _comfy_grouped(6),
-    {"group_size": 32, "rotation_size": 256},
-)
-COMFY_W4A4 = Adapter(
-    "comfy.convrot_w4a4",
-    {"rotation_size": ROTATION},
-    (
-        Part("weight", ("i8",), _comfy_packed(4, group=False)),
-        Part("weight_scale", ("f32",), lambda v: ("count", v.rows)),
-    ),
-    _convrot_w4a4,
-    {"rotation_size": 256},
-)
-
-
 #: Every scheme the cores decode, one row each.
 ADAPTERS: tuple[Adapter, ...] = (
     NVFP4,
@@ -1510,8 +1346,5 @@ ADAPTERS: tuple[Adapter, ...] = (
     _bnb_four_bit("bnb.nf4", NF4),
     _bnb_four_bit("bnb.fp4", FP4),
     BNB_INT8,
-    COMFY_W4A8,
-    COMFY_W6A8,
-    COMFY_W4A4,
 )
 BY_SCHEME = {a.scheme: a for a in ADAPTERS}
