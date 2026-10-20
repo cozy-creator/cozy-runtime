@@ -7,7 +7,7 @@ is its default.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Annotated, Literal, get_args
+from typing import Annotated, Literal, NotRequired, TypedDict, get_args
 
 import msgspec
 from msgspec import UNSET, UnsetType
@@ -34,6 +34,67 @@ class TensorFSOptions(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=T
 
     def __repr__(self) -> str:
         return f"TensorFSOptions(endpoint={self.endpoint!r}, token=<redacted>)"
+
+
+class HubAccess(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
+    """The shared machine HubAccess wire: one run's authority, never a machine key."""
+
+    origin: str
+    key: str = ""
+    issued_token: str | None = None
+    ca_der: str = ""
+    object_hosts: tuple[str, ...] = ()
+    capability: str = ""
+    token_endpoint: str = ""
+
+    def __repr__(self) -> str:
+        return f"HubAccess(origin={self.origin!r}, credentials=<redacted>)"
+
+
+class MetadataModel(msgspec.Struct, frozen=True, kw_only=True):
+    slot: str
+    repo_id: str
+    revision: str | None = None
+    variants: tuple[str, ...] = ()
+    fallback_to_only_variant: bool = False
+
+
+class ResolveWeights(Command, frozen=True, kw_only=True, tag="resolve_weights"):
+    request_id: str
+    hub: HubAccess | None = None
+    models: tuple[MetadataModel, ...] = ()
+
+
+class ResolvedObject(TypedDict):
+    sha256: str
+    length: int
+
+
+class ResolvedMetadata(TypedDict):
+    slot: str
+    repo_id: str
+    revision: str
+    variant: str
+    header: ResolvedObject
+    tree: ResolvedObject | None
+    components: list[str]
+
+
+class _WeightsReply(TypedDict):
+    reply: Literal["resolve_weights"]
+    request_id: str
+    issued_token: NotRequired[str]
+
+
+class ResolvedWeights(_WeightsReply):
+    ok: Literal[True]
+    resolved: list[ResolvedMetadata]
+
+
+class ResolveWeightsFailure(_WeightsReply):
+    ok: Literal[False]
+    code: str
+    detail: str
 
 
 class Hello(Command, frozen=True, kw_only=True, tag="hello"):
@@ -83,6 +144,7 @@ class Map(Command, frozen=True, kw_only=True, tag="map"):
 
 class Unload(Command, frozen=True, kw_only=True, tag="unload"):
     construction: str
+    request_id: str | None = None
 
 
 class KeepWeights(Command, frozen=True, kw_only=True, tag="keep_weights"):
@@ -240,6 +302,8 @@ class Load(Command, frozen=True, kw_only=True, tag="load"):
     TensorFS. The command names one model (`binding`) or several (`models`)."""
 
     construction: str
+    request_id: str = ""
+    hub: HubAccess | None = None
     tensorfs: TensorFSOptions | None = None
     devices: str = ""
     sequence_parallel_degree: int = 1
@@ -300,6 +364,7 @@ class PrepareRequest(_Attempt, frozen=True, kw_only=True, tag="prepare_request")
 
 class Invoke(_Attempt, frozen=True, kw_only=True, tag="invoke"):
     entrypoint: str
+    hub: HubAccess | None = None
     tensorfs: TensorFSOptions | None = None
     spool: str
     deadline_s: float | None
@@ -323,6 +388,7 @@ class Invoke(_Attempt, frozen=True, kw_only=True, tag="invoke"):
 
 type KnownCommand = (
     Hello
+    | ResolveWeights
     | Shutdown
     | Probe
     | Join
