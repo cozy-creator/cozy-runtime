@@ -111,22 +111,15 @@ def test_refused_capture_preserves_cache_held_common_for_eager_fallback(tmp_path
     """A failed setup owns no part of the graph cache's pre-existing bindings."""
     assert torch.cuda.device_count() == 1
 
-    class Weighted(nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.weight = nn.Parameter(torch.empty(2, 2))
+    def weighted() -> nn.Module:
+        layer = nn.Module()
+        layer.register_parameter("weight", nn.Parameter(torch.empty(2, 2)))
 
-        def forward(self, value: Tensor) -> Tensor:
-            return value @ self.weight
+        def forward(value: Tensor) -> Tensor:
+            return value @ layer.weight
 
-    class Nested(nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.bias = nn.Parameter(torch.empty(2))
-            self.body = nn.Sequential(Weighted(), Weighted())
-
-        def forward(self, value: Tensor) -> Tensor:
-            return self.body(value) + self.bias
+        layer.forward = forward
+        return layer
 
     writer = tensorfs.Writer(cache_dir=tmp_path)
     component = writer.component("nested", cls="", config={})
@@ -135,7 +128,14 @@ def test_refused_capture_preserves_cache_held_common_for_eager_fallback(tmp_path
     component.put("body.1.weight", 3 * torch.eye(2))
     ck = writer.commit()
     with torch.device("meta"):
-        module = Nested()
+        module = nn.Module()
+        module.register_parameter("bias", nn.Parameter(torch.empty(2)))
+        module.add_module("body", nn.Sequential(weighted(), weighted()))
+
+    def nested_forward(value: Tensor) -> Tensor:
+        return module.body(value) + module.bias
+
+    module.forward = nested_forward
     module._varena = Declared(blocks=("body.0", "body.1"))
     memory = Memory.open(torch.device("cuda", 0))
     cache = memory.cache("capture-regression", lambda _need: 0)
