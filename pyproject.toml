@@ -61,6 +61,12 @@ cozy-native-wheel-proof = "cozy_runtime.cli.native_wheel_proof:main"
 testpaths = ["tests"]
 addopts = "-q -p no:cacheprovider"
 
+[[tool.mypy.overrides]]
+# Pending xs-045 U8: the MPS platform proof (platforms.yaml) still speaks the v1 TensorFS API and
+# skips at import until it is ported.
+module = ["test_mps"]
+ignore_errors = true
+
 [build-system]
 # The pure wheel and the sdist. `task wheel` makes each native wheel from the pure one plus that
 # platform's kernel modules (kernels.yaml).
@@ -78,6 +84,11 @@ packages = ["src/cozy_runtime"]
 package = true
 # The historical SDXL development corpus keeps its own locked dependency cohort.
 conflicts = [[{ extra = "corpus" }, { group = "diffusers" }]]
+
+# TensorFS 0.13 is unreleased: an exact cozy-creator commit (xs053/tfs-hard-cut) until the cohort
+# publishes it (never a test publish). The release replaces this with the version.
+[tool.uv.sources]
+tensorfs = { git = "https://github.com/cozy-creator/cozy-creator.git", rev = "95b022681eeccaea75176502de09119ae6ebf607", subdirectory = "crates/tensorfs-py" }
 
 [tool.mypy]
 python_version = "3.12"

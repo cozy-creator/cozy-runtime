@@ -12,9 +12,8 @@ Three properties are structural rather than reviewed:
   or hostile length prefix, before any body byte is read. Every wire byte in both directions
   is counted. Output bytes never cross this seam — they land in the attempt spool the worker
   brokered, which keeps the executor's writable storage to exactly that spool (§3.1).
-* **No credentials cross it.** `send` refuses a frame carrying a key from `SECRET_KEYS`, so a
-  grant token or worker JWT reaching the executor is a typed refusal at the boundary and not
-  a code-review rule. The executor holds no RecordOwner, storage or billing credential.
+* **Machine credentials stay outside it.** `send` refuses keys from `SECRET_KEYS`; Load and
+  Invoke may carry an ordinary, already supplied bearer at `tensorfs.token`.
 * **A torn frame is typed.** EOF or a peer reset exactly at a frame boundary is the
   disposable executor's normal end (`None`); EOF inside a header or body is
   `seam_eof_mid_frame`, never a silent short read.
@@ -54,7 +53,7 @@ else:
 #: Worker/executor command-and-reply compatibility, independent of SDK package
 #: version or source build. Compatible additive fields keep this revision; only
 #: an incompatible change to required commands/semantics raises it.
-EXECUTOR_PROTOCOL_REVISION = 1
+EXECUTOR_PROTOCOL_REVISION = 2
 
 #: Not a size rule: the most one length prefix may make a reader allocate (the documents'
 #: guard, shared with TensorD's `protocol::MAX_FRAME`). It refuses only a corrupt or hostile
@@ -65,8 +64,7 @@ MAX_FRAME = DOC_MAX_BYTES
 #: exactly how many header bytes to collect before it commits to anything.
 HEADER = struct.Struct("!I")
 
-#: Key names that must never appear in a frame, at any depth. Credentials stop at the
-#: worker (§3.1); the executor cannot leak what it was never handed.
+#: Secret field names outside the explicitly supplied TensorFS command options.
 SECRET_KEYS = frozenset({"token", "credential", "authorization", "secret", "jwt"})
 
 #: The attempt-spool file the executor writes its serialized typed result into: the bytes
@@ -88,18 +86,24 @@ class SeamError(Exception):
         self.detail = detail
 
 
-def _scan(value: Any, path: str = "") -> None:
+def _scan(value: Any, path: str = "", *, supplied_tensorfs: bool = False) -> None:
     if isinstance(value, dict):
         for key, item in value.items():
-            if key.lower() in SECRET_KEYS:
+            supplied = (
+                supplied_tensorfs
+                and path == "tensorfs."
+                and key == "token"
+                and isinstance(item, str)
+            )
+            if key.lower() in SECRET_KEYS and not supplied:
                 raise SeamError(
                     "credential_at_seam",
                     f"{path}{key!r}: credentials never cross the worker/executor seam",
                 )
-            _scan(item, f"{path}{key}.")
+            _scan(item, f"{path}{key}.", supplied_tensorfs=supplied_tensorfs)
     elif isinstance(value, (list, tuple)):
         for item in value:
-            _scan(item, path)
+            _scan(item, path, supplied_tensorfs=supplied_tensorfs)
 
 
 @dataclass(slots=True)
@@ -123,7 +127,9 @@ class Channel:
     sending: threading.RLock = field(default_factory=threading.RLock, repr=False, compare=False)
 
     def send(self, message: dict[str, Any]) -> None:
-        _scan(message)
+        command = message.get("cmd")
+        supplied = isinstance(command, str) and command in {"load", "invoke"}
+        _scan(message, supplied_tensorfs=supplied)
         data = json.dumps(message, separators=(",", ":"), sort_keys=True).encode()
         if len(data) > MAX_FRAME:
             self.refusals.append("frame_too_large")
@@ -171,7 +177,7 @@ class Channel:
             descriptor.close()
 
     def send_memfd(self, fd: int) -> None:
-        """Transfer one weight set's pinned host tier (`tensorfs.plane` memfd)."""
+        """Transfer one weight set's pinned host tier (`tensorfs.varena` memfd)."""
         _require_memfd(fd)
         self._send_fd(fd, "memfd")
 
@@ -234,6 +240,42 @@ class Channel:
             os.close(received)
             raise
         return received
+
+    def send_ledger(self, table: int, eventfd: int, custody: int) -> None:
+        """One unbound rank grant: table, eventfd and private custody channel."""
+        _require_ledger_table(table)
+        _require_eventfd(eventfd)
+        _require_custody(custody)
+        self._send_fd(table, "ledger table")
+        self._send_fd(eventfd, "ledger eventfd")
+        self._send_fd(custody, "ledger custody channel")
+
+    def recv_ledger(self) -> list[int]:
+        """One unbound three-fd grant; an invalid capability closes the whole set."""
+        fds = self.recv_fds(3)
+        try:
+            _require_ledger_table(fds[0])
+            _require_eventfd(fds[1])
+            _require_custody(fds[2])
+        except SeamError:
+            for fd in fds:
+                os.close(fd)
+            raise
+        return fds
+
+    def recv_ledgers(self, count: int) -> list[int]:
+        """Read exactly `count` typed grants, closing earlier grants if any is invalid."""
+        if type(count) is not int or count < 0:
+            raise SeamError("seam_descriptor", "ledger grant count must be a nonnegative integer")
+        fds: list[int] = []
+        try:
+            for _ in range(count):
+                fds.extend(self.recv_ledger())
+        except BaseException:
+            for fd in fds:
+                os.close(fd)
+            raise
+        return fds
 
     def recv_fds(self, count: int) -> list[int]:
         """`count` descriptors, unopened, for a relay to pass on (`send_fds`)."""
@@ -638,6 +680,75 @@ def anonymous(name: str, sealing: bool = False) -> int:
     if fd < 0:
         raise OSError(ctypes.get_errno(), "memfd_create")
     return fd
+
+
+#: Linux `fcntl` seals by number (python-build-standalone may lack the names): seal, shrink,
+#: grow and write.
+_ADD_SEALS, _SEALS = 1033, 0x8 | 0x4 | 0x2 | 0x1
+
+
+def sealed(name: str, body: bytes) -> int:
+    """`body` in a new memfd, sealed: a document that crosses beside its request. macOS has
+    no memfd and no seals: there it is an unlinked file, which no path names."""
+    fd = anonymous(name, sealing=True)
+    try:
+        view = memoryview(body)
+        while view:
+            view = view[os.write(fd, view) :]
+        if sys.platform == "linux":
+            fcntl.fcntl(fd, _ADD_SEALS, _SEALS)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _require_custody(fd: int) -> None:
+    """The grant's per-rank control channel is a connected local byte stream."""
+    try:
+        if not stat.S_ISSOCK(os.fstat(fd).st_mode):
+            raise SeamError("seam_descriptor", "custody channel must be a socket")
+        duplicate = os.dup(fd)
+        try:
+            channel = socket.socket(fileno=duplicate)
+        except OSError:
+            os.close(duplicate)
+            raise
+        with channel:
+            if channel.family != socket.AF_UNIX or channel.type != socket.SOCK_STREAM:
+                raise SeamError(
+                    "seam_descriptor", "custody channel must be a connected local stream"
+                )
+            channel.getpeername()
+    except OSError as exc:
+        raise SeamError("seam_descriptor", f"custody channel unreadable: {exc}") from exc
+
+
+def _require_ledger_table(fd: int) -> None:
+    """The persistent shared table is a read/write regular file, not a weight memfd.
+
+    Native Ledger.adopt validates its exact size and protocol before mapping its rows.
+    The descriptor is authoritative; the Runtime never reopens a supplied pathname.
+    """
+    if sys.platform != "linux":
+        raise SeamError("seam_descriptor", "GPU ledger grants require Linux")
+    try:
+        regular = stat.S_ISREG(os.fstat(fd).st_mode)
+        access = fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE
+    except OSError as exc:
+        raise SeamError("seam_descriptor", f"ledger table unreadable: {exc}") from exc
+    if not regular or access != os.O_RDWR:
+        raise SeamError("seam_descriptor", "ledger table must be a read/write regular file")
+
+
+def _require_eventfd(fd: int) -> None:
+    """An eventfd, a ledger's freed-bytes signal (Linux only, as varena's ledger is)."""
+    try:
+        named = os.readlink(f"/proc/self/fd/{fd}")
+    except OSError as exc:
+        raise SeamError("seam_descriptor", f"eventfd unreadable: {exc}") from exc
+    if named != "anon_inode:[eventfd]":
+        raise SeamError("seam_descriptor", f"capability must be an eventfd, not {named}")
 
 
 def _require_memfd(fd: int) -> None:

@@ -11,7 +11,7 @@ from cozy_runtime.internal.model_config import ADAPTERS
 GRAPH_CONFIG = ADAPTERS
 FORMAT = "cozy.model.lora/1"
 CAPABILITY = "peft_graph/1"
-_DTYPES = {"f16", "bf16", "f32"}
+_DTYPES = {"F16", "BF16", "F32"}
 
 
 def _refuse(code: str, detail: str) -> CapabilityError:

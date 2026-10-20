@@ -71,18 +71,6 @@ PACKAGE_FENCES: dict[str, tuple[str, ...]] = {
     "internal": ("cozy_runtime.cli",),
     "cli": (),
 }
-# cr-174: TensorFS owns public derivation declarations and scoped handles. These
-# execution bindings may import that API; direct Store and native internals stay fenced.
-SCOPED_TENSORFS_FILES = frozenset(
-    {
-        "author/_context.py",
-        "author/_weights.py",
-        "author/_invoke.py",
-        "derive/facade.py",
-        "derive/operations.py",
-        "derive/quantization.py",
-    }
-)
 # Pillow is a base dependency and the actual public Image value type; imports stay at module scope.
 AUTHOR_ALLOWED_THIRD_PARTY = ("msgspec", "PIL")
 # The `media` extra's encoder (cr-017): allowed in the author package ONLY function-scoped,
@@ -253,20 +241,13 @@ def fence_package_imports() -> list[str]:
         }
         for name in imports(tree):
             rel = path.relative_to(ROOT)
-            scoped_tensorfs = (
-                name == "tensorfs.derived"
-                and path.relative_to(SRC).as_posix() in SCOPED_TENSORFS_FILES
-            )
-            if not scoped_tensorfs and any(
-                name == f or name.startswith(f + ".") for f in forbidden
-            ):
+            if any(name == f or name.startswith(f + ".") for f in forbidden):
                 bad.append(f"{rel}: {module_of(path)} may not import {name}")
             root = name.split(".")[0]
             if (
                 pkg == "author"
                 and root not in stdlib
                 and root != "cozy_runtime"
-                and not scoped_tensorfs
                 and root not in AUTHOR_ALLOWED_THIRD_PARTY
                 and not (
                     root in AUTHOR_ALLOWED_LAZY
@@ -899,7 +880,7 @@ def fence_one_address_predicate() -> list[str]:
 #: `dict[str, Any]` record's missing key, 2026-09-28). Records are decoded once, at their
 #: boundary, into typed structs; this count under `internal/` may only fall. Lower it in
 #: the change that removes some.
-ANY_CEILING = 608
+ANY_CEILING = 599
 
 
 def any_references(tree: ast.AST) -> int:

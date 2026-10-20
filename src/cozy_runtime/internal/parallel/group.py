@@ -325,15 +325,12 @@ class RankGroup:
         #: set once this formation's interrupt has aborted its communicator (set: none due)
         self._ended = threading.Event()
         self._ended.set()
-        #: per follower that made room at the last `form(again=...)`, the room it found (-1: none)
-        self.rooms: dict[int, int] = {}
         #: per mirrored component, the pace of its calls (`watched`): the longest pause any
         #: call of it showed carries over to the next
         self.paces: dict[str, liveness.Pace] = {}
         #: per follower rank, the largest working peak its mirrored calls reported this attempt
         self.working_peaks: dict[int, int] = {}
         #: per follower rank, its executor's plane facts as its latest reply stated them
-        self.rank_planes: dict[int, dict[str, Any]] = {}
         #: per follower rank, its `execution_evidence` record folded over this attempt's calls
         self.rank_records: dict[int, execution_evidence.GpuEvidence] = {}
         #: per spread method this attempt
@@ -411,7 +408,7 @@ class RankGroup:
             if head.event == "request" and self.relay is not None:
                 follower.relaying = True
                 try:
-                    self.relay(follower.channel, frame)
+                    self.relay(follower.channel, {**frame, "rank": follower.rank})
                 except SeamError as exc:
                     follower.gone = f"{follower.gpu}'s request was not relayed: {exc}"
                     break
@@ -419,8 +416,6 @@ class RankGroup:
                     follower.relaying = False
                     follower.relayed += 1
                 continue
-            if isinstance(frame.get("plane"), dict):
-                self.rank_planes[follower.rank] = frame["plane"]
             follower.replies.put((head, frame))
             if head.reply != "run" or head.ok:
                 continue
@@ -546,17 +541,17 @@ class RankGroup:
         self,
         torch: Any,
         sealed: Mapping[str, str],
-        cells: Sequence[int] = (),
-        again: Mapping[int, int] | None = None,
+        ledgers: Sequence[int] = (),
+        again: bool = False,
         nccl: Mapping[str, str] | None = None,
         formed: Callable[[Any], None] | None = None,
     ) -> Any:
         """Form the process group: the store on a kernel-chosen loopback port, every
-        follower joining it, rank 0 joining last, one barrier as the proof. `cells`, one per
-        follower in rank order, are their budget cells: each follows its `join`, then the
+        follower joining it, rank 0 joining last, one barrier as the proof. `ledgers`, a triple
+        per follower in rank order, are table, eventfd and custody channel: each triple follows
+        its `join`, then the
         socket its watcher reads (`interrupt`). `again` forms it AGAIN after an `interrupt`:
-        every follower joins a new store, and each it names (rank -> the room its last run had)
-        first makes more room than that (`rooms`).
+        every follower joins a new store.
         `nccl` is the route every GPU forms under; `formed` runs on rank 0 right after the
         barrier, while each follower runs its half before it answers the join."""
         dist = torch.distributed
@@ -567,7 +562,7 @@ class RankGroup:
         if nccl is not None:
             self.nccl = dict(nccl)
             route(self.nccl)
-        if again is not None and dist.is_initialized():
+        if again and dist.is_initialized():
             dist.destroy_process_group()
         self.store = dist.TCPStore(
             "127.0.0.1", 0, self.degree, is_master=True, wait_for_workers=False
@@ -581,16 +576,14 @@ class RankGroup:
             "calibrate": formed is not None,
         }
         for index, follower in enumerate(self.followers):
-            if again is not None:
-                self.send_one(
-                    follower.rank, {**join, "again": True, "seen": again.get(follower.rank)}
-                )
+            if again:
+                self.send_one(follower.rank, {**join, "again": True})
                 continue
             follower.abort, watcher = socket.socketpair()
             try:
-                self.send_one(follower.rank, {**join, "cell": bool(cells), "abort": True})
-                if cells:
-                    self.memfd_to(follower.rank, cells[index])
+                self.send_one(follower.rank, {**join, "ledger": bool(ledgers), "abort": True})
+                if ledgers:
+                    follower.channel.send_ledger(*ledgers[3 * index : 3 * index + 3])
                 follower.channel.send_descriptor(watcher)
             except SeamError as exc:
                 raise GroupRefusal(
@@ -611,11 +604,6 @@ class RankGroup:
                     f"{reply.get('detail', '')}"[:400],
                     code="group_unformed",
                 )
-        self.rooms = {
-            follower.rank: int(reply["room"])
-            for follower, reply in zip(self.followers, replies, strict=True)
-            if "room" in reply
-        }
         self.formed, self.interrupted = True, False
         return self.pg
 
@@ -631,6 +619,12 @@ class RankGroup:
                 raise GroupRefusal(
                     f"{follower.gpu} cannot be commanded: {exc}", code="group_broken"
                 ) from exc
+
+    def start(self, command: Mapping[str, object]) -> None:
+        """Hand every follower rank 0's Start. The ledger descriptors that follow TensorD's
+        Start are rank 0's; a follower takes its own at join (`form`), so the Start it gets
+        names none, or it would wait in `start` for descriptors nobody sends."""
+        self.broadcast({**command, "ledgers": 0})
 
     def collect(self, name: str) -> list[dict[str, Any]]:
         """One reply named `name` from every follower, in rank order.
@@ -688,15 +682,6 @@ class RankGroup:
         except SeamError as exc:
             raise GroupRefusal(
                 f"{self.gpu(rank)} cannot be commanded: {exc}", code="group_broken"
-            ) from exc
-
-    def memfd_to(self, rank: int, memfd: int) -> None:
-        """Hand follower `rank` one pinned host tier (right after the frame naming it)."""
-        try:
-            self.followers[rank - 1].channel.send_memfd(memfd)
-        except SeamError as exc:
-            raise GroupRefusal(
-                f"{self.gpu(rank)} cannot take a host tier: {exc}", code="group_broken"
             ) from exc
 
     def reply_one(self, rank: int, name: str) -> dict[str, Any]:

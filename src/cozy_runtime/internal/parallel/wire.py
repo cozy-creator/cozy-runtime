@@ -22,7 +22,7 @@ from typing import Any
 import msgspec
 
 from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT, AttentionLayout
-from cozy_runtime.internal import execution_evidence, spill
+from cozy_runtime.internal import execution_evidence
 from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.parallel.plan import GroupRefusal
 
@@ -173,7 +173,6 @@ class Broadcast:
         import torch
 
         with torch.utils._python_dispatch._disable_current_modes():
-            spill.fault(torch, self.tensors, None)  # read here, outside the dispatch mode
             for tensor in self.tensors:
                 if tensor.numel():
                     value = tensor.detach().resolve_conj().resolve_neg()

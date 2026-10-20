@@ -15,8 +15,7 @@ gh workflow run publish.yaml -f release_tag=vX.Y.Z -f mode=source
 The hosted job builds the source and pure wheel, and adds each platform's kernel modules to make
 the native wheels (Linux x86_64 and aarch64, Windows x86_64): `kernels.yaml` reuses cached modules
 when `kernels/` is unchanged, and compiles otherwise. No wheel carries a machine: TensorD ships in
-the `cozy` binary. TensorFS source access is needed only where a runner builds TensorFS from its
-tag; the optional `TENSORFS_READ_KEY` repository secret supplies it.
+the `cozy` binary. An unreleased TensorFS is a git source on the public cozy-creator repository.
 
 A local authenticated source build followed by the prebuilt entrypoint is also supported.
 This requires neither a new deploy key nor copying a personal token into the repository.

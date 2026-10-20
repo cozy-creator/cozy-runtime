@@ -8,7 +8,7 @@ Four things happen per (encoding, IMPLEMENTATION, output dtype), in this order, 
 failure at any one leaves NO record — which is what "fail-closed" means when the table is
 minted rather than declared. The middle term is new: since #517e an encoding carries
 ORDERED CANDIDATES rather than one provider, and each candidate is qualified separately,
-because "fp8-rowwise works here" is not a fact — "this implementation of it works here" is.
+because "fp8.rowwise works here" is not a fact — "this implementation of it works here" is.
 
 1. **numerics self-check** against an INDEPENDENT reference. The e4m3 decoder below is
    written from the OCP number format by integer arithmetic, not by asking torch to cast —
@@ -43,21 +43,22 @@ minor and Runtime source, measured by the release gates and shipped in the wheel
 from __future__ import annotations
 
 import base64
-import hashlib
 import math
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
 from types import ModuleType
 from typing import Any
 
 import msgspec
+from tensorfs import UnsupportedError
 
+from cozy_runtime.author._loader import TENSORFS_DTYPES
 from cozy_runtime.author._numeric import within, worst
 from cozy_runtime.derive.microscale import encode_nvfp4
 from cozy_runtime.internal import accel, canonical
 from cozy_runtime.internal.encoding import (
-    SPEC_VECTORS,
     TORCH_DTYPES,
     Capabilities,
     CapabilityRecord,
@@ -70,7 +71,16 @@ from cozy_runtime.internal.encoding import (
     implementation_digest,
     measure_runtime,
 )
-from cozy_runtime.internal.encoding.formats import E2M1_VALUES, NVFP4_BLOCK, Tensor, hadamard256
+from cozy_runtime.internal.encoding.formats import (
+    E2M1_VALUES,
+    E8M0_NAN,
+    MX_BLOCK,
+    NVFP4_BLOCK,
+    Tensor,
+    e8m0_multipliers,
+    hadamard256,
+    params_of,
+)
 
 # `torch`, `device`, `dtype` and tensor values are `Any`: the check venv carries no torch.
 
@@ -151,11 +161,6 @@ class LeafBench(msgspec.Struct, frozen=True):
     speedup_x: float
 
 
-class VectorRef(msgspec.Struct, frozen=True):
-    filename: str
-    sha256: str
-
-
 class VectorCheck(msgspec.Struct, frozen=True, omit_defaults=True):
     """One mined case: its bytes compared, skipped for geometry, or refused for its roles."""
 
@@ -170,12 +175,11 @@ class VectorCheck(msgspec.Struct, frozen=True, omit_defaults=True):
 class SpecVectors(
     msgspec.Struct, frozen=True, omit_defaults=True, tag_field="kind", tag="spec-vectors"
 ):
-    """The reviewed spec's own vectors (#549.4). SKIPPED neither passes nor fails a record."""
+    """The conformance cases of a provider's schemes. SKIPPED neither passes nor fails."""
 
     passed: bool
     skipped: bool = False
     note: str = ""
-    document: VectorRef | None = None
     cases: list[VectorCheck] = []
 
 
@@ -212,7 +216,7 @@ Evidence = VerbatimEvidence | UnmeasuredEvidence | NativeEvidence | DecodeEviden
 
 
 class Observation(msgspec.Struct, frozen=True):
-    encoding_spec_id: str
+    scheme: str
     implementation: str
     implementation_digest: str
     implementation_revision: str
@@ -260,52 +264,20 @@ def _eps(torch: Any, dtype: Any) -> float:
 
 
 def _numerics(torch: Any, provider: Provider, device: Any, dtype: Any) -> Sweep:
-    """Decode all 256 e4m3 patterns at a known scale and compare to the oracle.
-
-    The tolerance is DERIVED, not chosen: the route casts the element to the destination
-    dtype and multiplies by the scale in that dtype, so two roundings are the whole error
-    budget. A decoder that adds anything of its own fails here.
-    """
-    scale_value = 0.013671875  # exactly representable in f16/bf16/f32: 7 * 2^-9
-    patterns = bytes(range(256))
-    data = torch.frombuffer(bytearray(patterns), dtype=torch.uint8).view(torch.float8_e4m3fn)
-    data = data.reshape(16, 16).to(device)
-    weight_scale = torch.tensor(scale_value, dtype=torch.float32, device=device)
+    """All 256 E4M3 patterns under one f32 scale: the decode is `round_L(weight x scale)`, the
+    scale entering exactly, so it must equal the f64 product cast once into the dtype."""
+    data = torch.frombuffer(bytearray(bytes(range(256))), dtype=torch.uint8)
+    data = data.view(torch.float8_e4m3fn).reshape(16, 16)
+    scale = torch.tensor(0.0123, dtype=torch.float32)
     destination = torch.empty(16, 16, dtype=dtype, device=device)
-    provider.decode(torch, {"data": data, "weight_scale": weight_scale}, destination)
-    got = destination.reshape(-1).cpu().double().tolist()
-    return _grade_scaled(_eps(torch, dtype), got, scale_value)
-
-
-def _grade_scaled(eps: float, got: Sequence[float], scale_value: float) -> Sweep:
-    """Grade the 256 decoded patterns: NaN stays NaN, zero stays exactly zero, and every
-    other value is within two roundings relative. A non-finite error never passes."""
-    worst_rel, worst_abs, nan_ok = 0.0, 0.0, True
-    for byte, have in enumerate(got):
-        want = e4m3_value(byte) * scale_value
-        if math.isnan(want):
-            nan_ok = nan_ok and math.isnan(have)
-            continue
-        error = abs(have - want)
-        worst_abs = worst(worst_abs, error)
-        worst_rel = worst(
-            worst_rel, error / abs(want) if want else (0.0 if error == 0 else math.inf)
-        )
-    bound = 2.0 * eps
-    return Sweep(
-        patterns=len(got),
-        max_abs_error=worst_abs,
-        max_rel_error=worst_rel,
-        tolerance=bound,
-        nan_preserved=nan_ok,
-        passed=within(worst_rel, bound) and nan_ok,
-    )
+    provider.decode(torch, {"weight": data.to(device), "scale": scale.to(device)}, destination)
+    return _exact_sweep(torch, destination.cpu(), data.double() * scale.double(), dtype)
 
 
 def _numerics_rowwise(torch: Any, provider: Provider, device: Any, dtype: Any) -> Sweep:
     """Decode all 256 e4m3 patterns against 256 DIFFERENT row scales — 65,536 pairs.
 
-    `fp8-rowwise/1`'s scale is a CONTINUOUS f32 per output row, not a format with 256 code
+    `fp8.rowwise`'s scale is a CONTINUOUS f32 per output row, not a format with 256 code
     points, so there is no finite cross-product of element and scale codes to exhaust. The
     honest substitute is the one that would catch the failure this route actually has: a
     row scale is applied per ROW, so the domain that matters is (every element pattern) x
@@ -330,7 +302,7 @@ def _numerics_rowwise(torch: Any, provider: Provider, device: Any, dtype: Any) -
         [math.ldexp(1.0, e) for e in exponents], dtype=torch.float32, device=device
     )
     destination = torch.empty(rows, cols, dtype=dtype, device=device)
-    provider.decode(torch, {"data": data, "scale": scale}, destination)
+    provider.decode(torch, {"weight": data, "scale": scale}, destination)
     got = destination.cpu().double().reshape(-1).tolist()
     return _domain_sweep(
         torch, dtype, got, [(math.ldexp(1.0, e), f"row scale 2**{e}") for e in exponents]
@@ -356,7 +328,7 @@ def _numerics_int8_convrot(
     truth = hadamard256(torch, data.double()) * scale.reshape(rows, 1) / 16
     destination = torch.empty(rows, cols, dtype=dtype, device=device)
     provider.decode(
-        torch, {"data": data.to(device), "scale": scale.float().to(device)}, destination
+        torch, {"weight": data.to(device), "scale": scale.float().to(device)}, destination
     )
     got = destination.cpu().double()
     finite = torch.isfinite(got)
@@ -371,6 +343,130 @@ def _numerics_int8_convrot(
         nan_preserved=True,
         passed=exact,
     )
+
+
+def _exact_sweep(torch: ModuleType, got: Tensor, truth: Tensor, dtype: Tensor) -> Sweep:
+    """`got` against the f64 `truth` cast once into `dtype`, bit for bit; NaN as NaN."""
+    want = truth.to(dtype)
+    nan = torch.isnan(truth)
+    same = bool((torch.isnan(got) == nan).all()) and bool((got == want)[~nan].all())
+    finite = torch.isfinite(got.double()) & torch.isfinite(truth)
+    error = (got.double() - truth).abs()[finite]
+    relative = error / truth.abs()[finite].clamp(min=1e-300)
+    return Sweep(
+        patterns=int(truth.numel()),
+        max_abs_error=float(error.max()) if error.numel() else 0.0,
+        max_rel_error=float(relative.max()) if relative.numel() else 0.0,
+        tolerance=_eps(torch, dtype),
+        nan_preserved=bool((torch.isnan(got) == nan).all()),
+        passed=same,
+    )
+
+
+def _numerics_int8_rowwise(
+    torch: ModuleType, provider: Provider, device: Tensor, dtype: Tensor
+) -> Sweep:
+    """Every int8 value against 256 power-of-two row scales: row `r` holds -128..127 shifted by
+    `r`, so a decoder that mis-strides the scale is wrong on every row but one. The product is
+    exact in f32, so the decode must equal the f64 truth cast once into the dtype."""
+    rows = cols = 256
+    columns = torch.arange(cols).reshape(1, cols)
+    data = ((columns + torch.arange(rows).reshape(rows, 1)) % 256 - 128).to(torch.int8)
+    scale = torch.pow(2.0, torch.tensor([(r % 60) - 30 for r in range(rows)], dtype=torch.float64))
+    truth = data.double() * scale.reshape(rows, 1)
+    destination = torch.empty(rows, cols, dtype=dtype, device=device)
+    provider.decode(
+        torch, {"weight": data.to(device), "scale": scale.float().to(device)}, destination
+    )
+    return _exact_sweep(torch, destination.cpu(), truth, dtype)
+
+
+def _numerics_int8_tensorwise(
+    torch: ModuleType, provider: Provider, device: Tensor, dtype: Tensor
+) -> Sweep:
+    """Every int8 value under one f32 scale: the decode is `round_L(weight x scale)`, the scale
+    entering exactly, so it must equal the f64 product cast once into the dtype."""
+    data = (torch.arange(256) - 128).to(torch.int8).reshape(16, 16)
+    scale = torch.tensor(0.0123, dtype=torch.float32)
+    destination = torch.empty(16, 16, dtype=dtype, device=device)
+    provider.decode(torch, {"weight": data.to(device), "scale": scale.to(device)}, destination)
+    return _exact_sweep(torch, destination.cpu(), data.double() * scale.double(), dtype)
+
+
+def _comfy_fixture(
+    torch: ModuleType, provider: Provider, device: Tensor, shape: tuple[int, int]
+) -> tuple[Tensor, dict[str, Tensor]]:
+    """A valid constant-q carrier with an independent exact logical reference.
+
+    Each default level becomes q8=1. Every H4 row sums to 2, so its normalized
+    Kronecker powers map all-ones to all-ones. The result is each F32 channel
+    scale, repeated across its row; no decoder is used to construct the oracle.
+    General codes, corrections, F8 metadata and stacks remain the mined vectors'.
+    """
+    h4 = ((1, 1, 1, -1), (1, 1, -1, 1), (1, -1, 1, 1), (-1, 1, 1, 1))
+    assert tuple(sum(row) for row in h4) == (2, 2, 2, 2)
+    assert all(sum(a * b for a, b in zip(left, right, strict=True)) == (4 if i == j else 0)
+               for i, left in enumerate(h4) for j, right in enumerate(h4))
+    params = dict(provider.params)
+    if provider.supports(shape, params):
+        raise AssertionError("the Comfy synthetic fixture must fit its bound descriptor")
+    rotation = params.get("rotation_size")
+    if not isinstance(rotation, int):
+        raise AssertionError("rotation_size must be an integer")
+    exponent = (rotation.bit_length() - 1) // 2
+    assert 4**exponent == rotation and 2**exponent * 2.0**-exponent == 1.0
+    rows, columns = shape
+    channel = torch.linspace(0.5, 1.5, rows, dtype=torch.float32, device=device)
+    truth = channel.reshape(rows, 1).expand(rows, columns)
+    if provider.encoding == "comfy.convrot_w4a4":
+        # Signed nibble 1 decodes to 1.
+        return truth, {
+            "weight": torch.full((rows, columns // 2), 0x11, dtype=torch.int8, device=device),
+            "weight_scale": channel,
+        }
+    group = params.get("group_size")
+    if not isinstance(group, int) or type(group) is not int:
+        raise AssertionError("the Comfy probe must bind its declared group_size")
+    if provider.encoding == "comfy.asym_w4a8_int8":
+        # Unsigned nibble 9 addresses default level 9 - 8 = 1.
+        weight = torch.full((rows, columns // 2), -103, dtype=torch.int8, device=device)
+    elif provider.encoding == "comfy.w6a8_int8":
+        # Split planes: low nibble1 | (high2 << 4) = 33; level33 - 32 = 1.
+        weight = torch.cat((
+            torch.full((rows, columns // 2), 0x11, dtype=torch.int8, device=device),
+            torch.full((rows, columns // 4), -86, dtype=torch.int8, device=device),
+        ), dim=1)
+    else:
+        raise AssertionError(f"no Comfy fixture for {provider.encoding}")
+    return truth, {
+        "weight": weight,
+        "weight_s_rel": torch.ones((rows, columns // group), dtype=torch.float32, device=device),
+        "weight_s_channel": channel,
+    }
+
+
+def _numerics_comfy(torch: ModuleType, provider: Provider, device: Tensor, dtype: Tensor) -> Sweep:
+    truth, parts = _comfy_fixture(torch, provider, device, (16, 256))
+    destination = torch.empty((16, 256), dtype=dtype, device=device)
+    provider.decode(torch, parts, destination)
+    return _exact_sweep(torch, destination.cpu(), truth.cpu().double(), dtype)
+
+
+def _numerics_mxfp8(torch: ModuleType, provider: Provider, device: Tensor, dtype: Tensor) -> Sweep:
+    """All 256 E4M3 patterns under all 256 E8M0 bytes (row `r` scales every block by byte `r`):
+    65,536 pairs, NaN from either operand included. E4M3 times a power of two is exact in f32,
+    so the decode must equal the f64 truth cast once into the dtype."""
+    rows = cols = 256
+    patterns = torch.frombuffer(bytearray(bytes(range(256)) * rows), dtype=torch.uint8)
+    data = patterns.view(torch.float8_e4m3fn).reshape(rows, cols)
+    byte = torch.arange(rows, dtype=torch.uint8).reshape(rows, 1).expand(rows, cols // MX_BLOCK)
+    scale = byte.contiguous().view(torch.float8_e8m0fnu)
+    mult = torch.pow(2.0, torch.arange(rows, dtype=torch.float64) - 127).reshape(rows, 1)
+    mult[E8M0_NAN] = float("nan")
+    truth = data.double() * mult
+    destination = torch.empty(rows, cols, dtype=dtype, device=device)
+    provider.decode(torch, {"weight": data.to(device), "scale": scale.to(device)}, destination)
+    return _exact_sweep(torch, destination.cpu(), truth, dtype)
 
 
 def _numerics_nvfp4(torch: ModuleType, provider: Provider, device: Tensor, dtype: Tensor) -> Sweep:
@@ -396,8 +492,8 @@ def _numerics_nvfp4(torch: ModuleType, provider: Provider, device: Tensor, dtype
         torch,
         {
             "weight": weight.to(device),
-            "weight_scale": weight_scale.to(device),
-            "weight_scale_2": scale_2.to(device),
+            "scale": weight_scale.to(device),
+            "scale_2": scale_2.to(device),
         },
         destination,
     )
@@ -577,18 +673,20 @@ def _weight_roles(torch: Any, provider: Provider, device: Any) -> tuple[Any, dic
     comparable; and quantized by the encoding's OWN equation, so what the routes are then
     compared on is a real carrier rather than random bytes that no producer would emit.
     """
+    if provider.suite == "comfy-decode":
+        return _comfy_fixture(torch, provider, device, BENCH_SHAPE)
     rows, cols = BENCH_SHAPE
     generator = torch.Generator(device="cpu").manual_seed(0x511B)
     weight = torch.randn(rows, cols, generator=generator, dtype=torch.float32).to(device) * 0.05
     if provider.suite in ("fp8-rowwise-decode", "fp8-rowwise-native"):
         scale = (weight.abs().amax(dim=-1) / 448.0).clamp(min=1e-12)
         payload = (weight / scale.unsqueeze(-1)).clamp(-448.0, 448.0)
-        return weight, {"data": payload.to(torch.float8_e4m3fn), "scale": scale}
-    if provider.suite in ("int8-convrot256-decode", "int8-convrot256-native"):
+        return weight, {"weight": payload.to(torch.float8_e4m3fn), "scale": scale}
+    if provider.suite in ("int8-convrot-decode", "int8-convrot256-native"):
         rotated = hadamard256(torch, weight.double()) / 16
         scale = (rotated.abs().amax(dim=-1) / 127.0).clamp(min=1e-12).float()
         payload = torch.round(rotated / scale.double().unsqueeze(-1)).clamp(-127, 127)
-        return weight, {"data": payload.to(torch.int8), "scale": scale}
+        return weight, {"weight": payload.to(torch.int8), "scale": scale}
     if provider.suite in ("nvfp4-decode", "nvfp4-native"):
         encoded = encode_nvfp4("probe", weight.cpu().numpy())
         scale, scale_2 = encoded.companions
@@ -596,19 +694,39 @@ def _weight_roles(torch: Any, provider: Provider, device: Any) -> tuple[Any, dic
             "weight": torch.frombuffer(bytearray(encoded.payload), dtype=torch.uint8)
             .reshape(rows, cols // 2)
             .to(device),
-            "weight_scale": torch.frombuffer(bytearray(scale.raw), dtype=torch.uint8)
+            "scale": torch.frombuffer(bytearray(scale.raw), dtype=torch.uint8)
             .reshape(rows, cols // NVFP4_BLOCK)
             .view(torch.float8_e4m3fn)
             .to(device),
-            "weight_scale_2": torch.frombuffer(bytearray(scale_2.raw), dtype=torch.float32)
+            "scale_2": torch.frombuffer(bytearray(scale_2.raw), dtype=torch.float32)
             .reshape(())
             .to(device),
         }
-    if provider.suite == "fp8-scalar-decode":
+    if provider.suite == "int8-rowwise-decode":
+        scale = (weight.abs().amax(dim=-1) / 127.0).clamp(min=1e-12)
+        payload = torch.round(weight / scale.unsqueeze(-1)).clamp(-127, 127)
+        return weight, {"weight": payload.to(torch.int8), "scale": scale}
+    if provider.suite in ("mxfp8-decode", "mxfp8-native"):
+        blocks = weight.reshape(rows, cols // MX_BLOCK, MX_BLOCK)
+        amax = blocks.abs().amax(dim=-1)
+        exponent = torch.where(
+            amax > 0, torch.ceil(torch.log2(amax / 448.0)), torch.full_like(amax, -127.0)
+        )
+        byte = (exponent + 127).clamp(0.0, 254.0).to(torch.uint8)
+        payload = blocks / e8m0_multipliers(torch, byte).unsqueeze(-1)
+        return weight, {
+            "weight": payload.reshape(rows, cols).clamp(-448.0, 448.0).to(torch.float8_e4m3fn),
+            "scale": byte.view(torch.float8_e8m0fnu),
+        }
+    if provider.suite == "int8-tensorwise-decode":
+        scale = (weight.abs().max() / 127.0).clamp(min=1e-12).to(torch.float32)
+        payload = torch.round(weight / scale).clamp(-127, 127).to(torch.int8)
+        return weight, {"weight": payload, "scale": scale.reshape(())}
+    if provider.suite == "fp8-tensorwise-decode":
         amax = weight.abs().max().clamp(min=1e-12)
         scale = (amax / 448.0).to(torch.float32)
         payload = (weight / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
-        return weight, {"data": payload, "weight_scale": scale.reshape(())}
+        return weight, {"weight": payload, "scale": scale.reshape(())}
     raise AssertionError(f"no operand builder for suite {provider.suite!r}")
 
 
@@ -621,20 +739,31 @@ def _exact_weight(torch: Any, provider: Provider, roles: Mapping[str, Any]) -> A
     element and a power-of-two or f32 scale multiply without rounding in f64 — so what the
     deviation below measures is entirely the route's own.
     """
+    if provider.suite == "comfy-decode":
+        # Only the constant-q fixture above enters this benchmark/route oracle.
+        # Its normalized rotation is identity on all-ones; the independently
+        # stored channel scale is the exact value, not another decoder's output.
+        rows, packed = (int(n) for n in roles["weight"].shape)
+        columns = packed * 4 // 3 if provider.encoding == "comfy.w6a8_int8" else packed * 2
+        role = "weight_scale" if provider.encoding == "comfy.convrot_w4a4" else "weight_s_channel"
+        return _f64(roles[role]).reshape(rows, 1).expand(rows, columns)
     if provider.suite in ("nvfp4-decode", "nvfp4-native"):
         packed = roles["weight"].cpu()
         rows, cols = int(packed.shape[0]), 2 * int(packed.shape[1])
         nibbles = torch.stack((packed & 0x0F, packed >> 4), dim=-1).reshape(rows, cols).long()
         lut = torch.tensor(E2M1_VALUES, dtype=torch.float64)
-        blocks = roles["weight_scale"].cpu().double().repeat_interleave(NVFP4_BLOCK, dim=1)
-        exact = lut[nibbles] * blocks * roles["weight_scale_2"].cpu().double()
+        blocks = roles["scale"].cpu().double().repeat_interleave(NVFP4_BLOCK, dim=1)
+        exact = lut[nibbles] * blocks * roles["scale_2"].cpu().double()
         return exact.to(roles["weight"].device)
-    data = _f64(roles["data"])
-    if provider.suite in ("fp8-rowwise-decode", "fp8-rowwise-native"):
+    data = _f64(roles["weight"])
+    if provider.suite in ("fp8-rowwise-decode", "fp8-rowwise-native", "int8-rowwise-decode"):
         return data * _f64(roles["scale"]).reshape(int(data.shape[0]), 1)
-    if provider.suite in ("int8-convrot256-decode", "int8-convrot256-native"):
+    if provider.suite in ("mxfp8-decode", "mxfp8-native"):
+        mult = _f64(e8m0_multipliers(torch, roles["scale"]))
+        return data * mult.repeat_interleave(MX_BLOCK, dim=1)[:, : int(data.shape[1])]
+    if provider.suite in ("int8-convrot-decode", "int8-convrot256-native"):
         return hadamard256(torch, data) * _f64(roles["scale"]).reshape(-1, 1) / 16
-    return data * _f64(roles["weight_scale"])
+    return data * _f64(roles["scale"])
 
 
 def _f64(tensor: Tensor) -> Tensor:
@@ -708,187 +837,115 @@ def _native_axes(torch: Any, provider: LeafProvider, device: Any, deviation: flo
     return RouteAxes(deviation, provider.resident_bits_per_element(parts, int(weight.numel())))
 
 
-# ------------------------------------------------------- the reviewed spec's own vectors
+# ------------------------------------------------------------- the conformance vectors
+
+#: The cozytensors/1 conformance decode cases (tensorfs `conformance/vectors/cases.json`). They
+#: ship in the package, so an installed wheel qualifies as the repo does.
+VECTORS = Path(__file__).resolve().parent / "encoding" / "vectors" / "cases.json"
 
 
-#: Where the vendored vector documents live. They ship INSIDE the package, so an installed
-#: wheel qualifies exactly as the repo does; a suite whose subject is only present in a
-#: source checkout qualifies nothing in production.
-VECTOR_ROOT = Path(__file__).resolve().parent / "encoding" / "vectors"
-
-
-class VectorBlob(msgspec.Struct, frozen=True):
+class VectorPart(msgspec.Struct, frozen=True):
+    role: str
     dtype: str
     shape: list[int]
     bits: str
 
 
-class MinedLogical(msgspec.Struct, frozen=True):
+class VectorEncoding(msgspec.Struct, frozen=True):
+    scheme: str
+    params: dict[str, bool | int | float | str | list[int]] = {}
+
+
+class VectorCase(msgspec.Struct, frozen=True):
+    component: str
+    key: str
     dtype: str
     shape: list[int]
+    encoding: VectorEncoding
+    #: in the header's order
+    parts: list[VectorPart]
+    expect: str = ""
+    refuse: str = ""
 
 
-class MinedCase(msgspec.Struct, frozen=True):
-    name: str
-    logical: MinedLogical
-    roles: dict[str, VectorBlob]
-    expect_logical_bits: str
+def vector_cases() -> list[VectorCase]:
+    """The conformance cases with a scheme (the plain ones are TensorFS's read cases)."""
+    cases: list[VectorCase] = []
+    for path in (VECTORS, VECTORS.with_name("comfy.json")):
+        rows = msgspec.json.decode(path.read_bytes(), type=dict[str, list[dict[str, object]]])
+        cases.extend(msgspec.convert(row, VectorCase) for row in rows["cases"] if "encoding" in row)
+    return cases
 
 
-class VectorDocument(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
-    """A producer-mined vector document, as TensorFS vendors it."""
-
-    cases: list[MinedCase]
-
-
-def vector_tensor(torch: Any, blob: VectorBlob, device: Any) -> Any:
-    """One vector role/logical field -> the tensor it encodes. PUBLIC: the conformance
-    runner builds the same tensors to compare a rounding rule against the reference.
-
-    `bits` is base64 of the LITTLE-ENDIAN raw bytes, exactly as the carrier stores them, so
-    this is a `frombuffer` and a `view` and never a parse. A dtype the runtime has no torch
-    binding for is a refusal rather than a guess, for the same reason the fill plane refuses
-    one: landing the wrong number of bytes is worse than not landing them.
-    """
-    torch_name = TORCH_DTYPES.get(blob.dtype)
-    if torch_name is None:
-        raise AssertionError(
-            f"the vendored vectors cite carrier dtype {blob.dtype!r} and this "
-            "runtime has no torch binding for it"
-        )
-    flat = torch.frombuffer(bytearray(base64.b64decode(blob.bits)), dtype=torch.uint8)
-    return flat.view(getattr(torch, torch_name)).reshape(blob.shape).to(device)
+def vector_tensor(torch: ModuleType, part: VectorPart, device: Tensor) -> Tensor:
+    """A vector part's tensor: base64 little-endian bytes, viewed in its dtype. An `F4` part
+    is its packed bytes, u8 `[R, C/2]`, as the fill plane hands it to a decoder."""
+    flat = torch.frombuffer(bytearray(base64.b64decode(part.bits)), dtype=torch.uint8)
+    if part.dtype == "F4":
+        return flat.reshape(*part.shape[:-1], part.shape[-1] // 2).to(device)
+    name = TORCH_DTYPES[TENSORFS_DTYPES[part.dtype]]
+    return flat.view(getattr(torch, name)).reshape(part.shape).to(device)
 
 
-def spec_vector_document(spec_digest: str) -> VectorDocument | None:
-    """The vendored vector document this SPEC DIGEST names, or None if it names none.
-
-    #549.4's substance. A provider declares reviewed spec DIGESTS; each reviewed digest maps
-    to the producer-mined vector document the registry's own seed attaches to that spec, and
-    this is what the qualification suite decodes. `plain/1` has no entry: its route decodes
-    nothing and its evidence is the fill plane's byte-identity proof.
-
-    The reviewed table pins both the nested spec digest and its vector-byte digest. A copied
-    fixture that drifts therefore stops before JSON parsing or provider execution. Pinned
-    bytes this reader cannot decode raise `msgspec.ValidationError`: that is the reader
-    drifting from the bytes, and it must fail rather than skip.
-    """
-    pinned = SPEC_VECTORS.get(spec_digest)
-    if pinned is None:
+def decode_case(torch: ModuleType, provider: Provider, case: VectorCase, device: Tensor) -> Tensor:
+    """`case` decoded by `provider` bound to its params: the logical tensor, or None when the
+    provider refuses the case's shape or params."""
+    bound = replace(provider, params=params_of(case.encoding.params))  # type: ignore[type-var]
+    if bound.supports(case.shape, case.encoding.params):
         return None
-    name, expected_digest = pinned
-    try:
-        raw = (VECTOR_ROOT / name).read_bytes()
-    except OSError:
-        return None
-    if "sha256:" + hashlib.sha256(raw).hexdigest() != expected_digest:
-        return None
-    return msgspec.json.decode(raw, type=VectorDocument)
+    roles = {part.role: vector_tensor(torch, part, device) for part in case.parts}
+    dtype = getattr(torch, TORCH_DTYPES[TENSORFS_DTYPES[case.dtype]])
+    destination = torch.empty(*case.shape, dtype=dtype, device=device)
+    bound.decode(torch, roles, destination)
+    return destination
 
 
-def case_dtype(case: MinedCase) -> str | None:
-    """The TORCH dtype name one mined case's logical value carries, or None.
+def same_bits(torch: ModuleType, got: Tensor, expect: str) -> int:
+    """Differing elements of `got` against the expected bytes; NaN equals NaN (the spec
+    canonicalizes NaN bits, a decode need not)."""
+    want = torch.frombuffer(bytearray(base64.b64decode(expect)), dtype=torch.uint8)
+    want = want.view(got.dtype).reshape(got.shape)
+    got = got.cpu()
+    differ = got.view(torch.uint8).reshape(*got.shape, -1) != want.view(torch.uint8).reshape(
+        *got.shape, -1
+    )
+    differ = differ.any(dim=-1) & ~(got.isnan() & want.isnan())
+    return int(differ.sum())
 
-    The key is `dtype`. These documents are TensorFS's producer-mined vector artifacts,
-    pinned BY DIGEST in `SPEC_VECTORS`, and their `logical` object is the same shape
-    `vector_tensor` reads one line below — it is NOT the CozyTensors header's `logical`,
-    whose dtype field TensorFS 0.3 renamed to `logical_dtype`. Reading the header's name
-    here matched nothing, and a document that matches nothing reports SKIPPED, which is a
-    pass locally and an absence everywhere else.
-    """
-    return TORCH_DTYPES.get(case.logical.dtype)
 
+def _spec_vectors(torch: ModuleType, provider: Provider, device: Tensor) -> SpecVectors:
+    """The conformance cases of the provider's schemes, decoded bit for bit (NaN as NaN).
 
-def _spec_vectors(torch: Any, provider: Provider, device: Any) -> SpecVectors:
-    """Decode the REVIEWED SPEC's own producer-mined cases, BIT-FOR-BIT (#549.4).
-
-    The synthetic oracles above sweep a format's whole domain against arithmetic written from
-    the OCP spec — they prove the decoder's numbers. This proves something they cannot: that
-    the decoder reads the exact ROLE LAYOUT a real producer emits, at the exact rank and
-    stride the reviewed spec digest pins, on bytes that came out of the producer rather than
-    out of this repo.
-
-    The comparison is on RAW BITS, not on a tolerance. These cases carry the producer's own
-    expected logical output for the producer's own carrier; a decoder that is one ULP away
-    from it has made a different choice than the producer did (`fp8-scaled-scalar/1`'s doc
-    calls that out explicitly: narrowing the scale before the multiply differs from
-    multiplying in f32 by a full ulp on 132 of 512 bf16 elements). A tolerance here would
-    admit exactly the drift the vectors were mined to catch.
-
-    Every mined case runs at the producer's own logical dtype, whatever output dtype the fill
-    asked about: the vectors prove the layout, which no output dtype changes, and the
-    synthetic oracle proves the arithmetic at the requested dtype. Filtering cases by the
-    requested dtype skipped the whole check for a float16-only fill (SDXL) because the
-    fp8-rowwise document mines f32 and bf16 cases only, `_reportable` dropped the
-    skip, and `tensorfs.fit` refused `encoding_unqualified` on every card (run 1312).
-
-    A spec with no vendored document is reported as SKIPPED and neither passes nor fails: it
-    must not mint a record on the strength of a check that did not run.
-
-    A document whose cases declare NO dtype this runtime reads is neither of those things —
-    it is a reader that stopped matching the bytes, and it FAILS. Skipping there is how the
-    observed-capability document quietly emptied itself: `_reportable` drops a skipped
-    check, so every accelerator lost every non-verbatim record and `tensorfs.fit` refused
-    `encoding_unqualified` on a card whose decode had actually passed.
-    """
-    spec = f"{provider.encoding[:30]}…"
-    try:
-        document = spec_vector_document(provider.encoding)
-    except msgspec.ValidationError as exc:
-        return SpecVectors(passed=False, note=f"the vendored document for spec {spec}: {exc}")
-    if document is None:
-        return SpecVectors(
-            passed=True, skipped=True, note=f"no vendored vector document for spec {spec}"
-        )
-    if document.cases and not any(case_dtype(case) for case in document.cases):
-        return SpecVectors(
-            passed=False,
-            note=f"the vendored document for spec {spec} declares no logical dtype this "
-            f"runtime reads — its cases carry {sorted({c.logical.dtype for c in document.cases})}"
-            ", and the reader and the mined bytes have to agree before a case can run",
-        )
+    The synthetic sweeps prove the arithmetic; these prove the provider reads the layout a real
+    producer emits. A case whose shape or params the provider refuses is skipped; a case whose
+    parts the provider does not account for fails."""
     cases: list[VectorCheck] = []
-    for case in document.cases:
-        logical_dtype = case_dtype(case)
-        if logical_dtype is None:
+    for case in vector_cases():
+        if case.encoding.scheme != provider.encoding or case.refuse:
             continue
-        roles = {role: vector_tensor(torch, blob, device) for role, blob in case.roles.items()}
-        missing = sorted(provider.required - set(roles))
-        surplus = sorted(set(roles) - provider.required - provider.optional)
+        roles = {part.role for part in case.parts}
+        missing = sorted(provider.required - roles)
+        surplus = sorted(roles - provider.required - provider.optional)
         if missing or surplus:
-            why = (
-                f"the mined case stores roles {sorted(roles)} and this provider requires "
-                f"{sorted(provider.required)} (missing {missing}, unhandled {surplus})"
-            )
-            cases.append(VectorCheck(case.name, passed=False, why=why))
+            why = f"parts {sorted(roles)}: missing {missing}, unhandled {surplus}"
+            cases.append(VectorCheck(case.key, passed=False, why=why))
             continue
-        shape = case.logical.shape
-        why = provider.supports(shape)
-        if why:
-            cases.append(VectorCheck(case.name, passed=True, skipped=True, why=why))
+        got = decode_case(torch, provider, case, device)
+        if got is None:
+            cases.append(VectorCheck(case.key, passed=True, skipped=True, why="refused"))
             continue
-        destination = torch.empty(*shape, dtype=getattr(torch, logical_dtype), device=device)
-        provider.decode(torch, roles, destination)
-        want = vector_tensor(
-            torch, VectorBlob(case.logical.dtype, shape, case.expect_logical_bits), device
-        )
-        got_bits = destination.reshape(-1).view(torch.uint8).cpu()
-        want_bits = want.reshape(-1).view(torch.uint8).cpu()
-        differing = int((got_bits != want_bits).sum())
+        differing = same_bits(torch, got, case.expect)
         cases.append(
             VectorCheck(
-                case.name,
+                case.key,
                 passed=differing == 0,
-                elements=int(want.numel()),
+                elements=int(got.numel()),
                 differing_bytes=differing,
             )
         )
     if not cases:
-        return SpecVectors(passed=True, skipped=True, note="the vendored document carries no case")
-    filename, sha256 = SPEC_VECTORS[provider.encoding]
-    return SpecVectors(
-        passed=all(c.passed for c in cases), document=VectorRef(filename, sha256), cases=cases
-    )
+        return SpecVectors(passed=True, skipped=True, note="no conformance case for these schemes")
+    return SpecVectors(passed=all(c.passed for c in cases), cases=cases)
 
 
 def _micro_bench(torch: Any, provider: Provider, device: Any, dtype: Any) -> DecodeBench:
@@ -956,17 +1013,21 @@ def _leaf_bench(torch: Any, provider: LeafProvider, device: Any, dtype: Any) -> 
 #: never by class or role set, so a second implementation of one encoding is measured by the
 #: same oracle as the first. A suite name in neither table qualifies NOTHING: minting a record
 #: for a decoder no oracle checked is exactly the fabricated evidence the table forbids.
-#: (Keyed on the ROLE SET, `fp8-rowwise/1`'s decode and native leaf — both `{data, scale}` —
-#: would share the decode oracle, which never runs the kernel.)
 DECODE_SUITES: dict[str, Callable[[Any, Provider, Any, Any], Sweep]] = {
-    "fp8-scalar-decode": _numerics,
+    "comfy-decode": _numerics_comfy,
+    "fp8-tensorwise-decode": _numerics,
     "fp8-rowwise-decode": _numerics_rowwise,
-    "int8-convrot256-decode": _numerics_int8_convrot,
+    "int8-convrot-decode": _numerics_int8_convrot,
     "nvfp4-decode": _numerics_nvfp4,
+    "int8-rowwise-decode": _numerics_int8_rowwise,
+    "int8-tensorwise-decode": _numerics_int8_tensorwise,
+    "mxfp8-decode": _numerics_mxfp8,
 }
 
 #: Native leaves' oracle is their own GEMM against arithmetic (`_native_agreement`).
-NATIVE_SUITES = frozenset({"fp8-rowwise-native", "int8-convrot256-native", "nvfp4-native"})
+NATIVE_SUITES = frozenset(
+    {"fp8-rowwise-native", "int8-convrot256-native", "nvfp4-native", "mxfp8-native"}
+)
 
 
 def qualify(
@@ -1024,12 +1085,41 @@ def qualify(
     return admission_table(result), result
 
 
+#: The params a suite's synthetic operands are written with: the producers' own (ModelOpt's
+#: layouts). The spec's conformance cases cover the other layouts.
+PROBE_PARAMS: dict[str, dict[str, object]] = {
+    "comfy.asym_w4a8_int8": {"group_size": 16, "rotation_size": 256},
+    "comfy.w6a8_int8": {"group_size": 32, "rotation_size": 256},
+    "comfy.convrot_w4a4": {"rotation_size": 256},
+    "fp8.tensorwise": {"scale_dtype": "F32"},
+    "int8.tensorwise": {"scale_dtype": "F32"},
+    "fp8.rowwise": {"axis": 0, "scale_dtype": "F32"},
+    "int8.rowwise": {"axis": 0, "scale_dtype": "F32"},
+    "int8.convrot": {"rotation": "kron_regular_h4", "rotation_size": 256, "scale_dtype": "F32"},
+    "mxfp8": {"block_size": MX_BLOCK, "scale_layout": "row_major"},
+    "nvfp4": {
+        "block_size": NVFP4_BLOCK,
+        "global_scale": "multiply",
+        "nibble_order": "low_first",
+        "scale_layout": "row_major",
+    },
+}
+
+
 def _measured(torch: ModuleType, provider: Provider, target: Tensor, dtype: Tensor) -> Evidence:
     """`_evidence`, where a device that lacks a dtype the decode reads (MPS has no float8)
     mints no record for it: the encoding refuses at bind naming why."""
+    # Qualification considers every provider even for a plain F64/FP8 model.
+    # Those are valid verbatim outputs, not logical Comfy decode destinations.
+    if provider.suite == "comfy-decode" and dtype not in (
+        torch.float32, torch.float16, torch.bfloat16
+    ):
+        return UnmeasuredEvidence(note="Comfy logical outputs are F32, F16 or BF16")
+    params = params_of(PROBE_PARAMS.get(provider.encoding, {}))
+    provider = replace(provider, params=params)  # type: ignore[type-var]
     try:
         return _evidence(torch, provider, target, dtype)
-    except (TypeError, RuntimeError, NotImplementedError) as exc:
+    except (TypeError, RuntimeError, NotImplementedError, UnsupportedError) as exc:
         if target.type == "cuda":
             raise
         return UnmeasuredEvidence(note=f"{type(exc).__name__}: {exc}"[:300])
@@ -1104,7 +1194,7 @@ def make_observation(
     encoding: str, provider: Provider, device: DeviceFacts, dtype: str, evidence: Evidence
 ) -> Observation:
     return Observation(
-        encoding_spec_id=encoding,
+        scheme=encoding,
         implementation=provider.name,
         implementation_digest=implementation_digest(provider),
         implementation_revision=provider.code_revision,
@@ -1122,7 +1212,7 @@ def admission_table(result: QualificationResult) -> Capabilities:
     return Capabilities(
         [
             CapabilityRecord(
-                encoding_spec_id=observation.encoding_spec_id,
+                scheme=observation.scheme,
                 implementation_digest=observation.implementation_digest,
                 runtime_release=result.runtime_release,
                 device_predicate=observation.device_predicate,
@@ -1146,7 +1236,7 @@ def admission_table(result: QualificationResult) -> Capabilities:
             if observation.evidence.passed
         ],
         {
-            (o.encoding_spec_id, o.implementation_digest, o.output_dtype): _refusal(o.evidence)
+            (o.scheme, o.implementation_digest, o.output_dtype): _refusal(o.evidence)
             for o in result.observations
             if not o.evidence.passed
         },
@@ -1195,76 +1285,3 @@ class UnreportableObservation(Exception):
     Loud rather than dropped: a silently omitted record reads to the hub as "this card
     cannot run it", which is the wrong answer with the wrong remedy.
     """
-
-
-def observed_capability_records(result: QualificationResult) -> dict[str, list[dict[str, str]]]:
-    """This probe result, projected into TensorFS's OBSERVED capability-records document.
-
-    The sibling of `_table`, over the same observation and for the other consumer. `_table`
-    builds the admission table this process fills against; this builds the document another
-    process joins against, because TensorFS owns the admission RULE and holds no card while
-    this process holds one and owns the OBSERVATION.
-
-    The document states what was qualified and WHERE, and deliberately not which vector set
-    qualified it: the spec pins that, and an observer free to name it could qualify a spec
-    against bytes the spec never carried. TensorFS binds the vector set itself and refuses a
-    record whose spec has none.
-
-    One record per (encoding, device), because that pair is what the rule admits on. The
-    suite mints one per output dtype and implementation, so several collapse into one and
-    every implementation that earned it is named.
-
-    REPRODUCIBLE for a given card class, runtime build and provider set. The observation's
-    `evidence_digest` is deliberately absent: it covers the micro-benchmark, so it moves on
-    every run, and a registered artifact that churns without a change of meaning is one
-    nobody can diff. What was qualified is carried WHOLE by `implementation_digest`, which is
-    over the implementation's name, route, floor, oracle, roles, revision and reviewed specs
-    and over no timing at all.
-    """
-    records: dict[tuple[str, str], tuple[set[str], set[str]]] = {}
-    for observation in result.observations:
-        if not observation.evidence.passed or not _reportable(observation.evidence):
-            continue
-        implementations, dtypes = records.setdefault(
-            (observation.encoding_spec_id, observation.device_predicate), (set(), set())
-        )
-        implementations.add(
-            f"{observation.implementation}[{observation.delivery_route}]"
-            f"@{observation.implementation_digest}"
-        )
-        dtypes.add(observation.output_dtype)
-    out = [
-        {
-            "device": device,
-            "encoding": encoding,
-            "implementation": " ".join(sorted(implementations)),
-            "note": "qualified by the cozy-runtime probe suite for output dtypes "
-            + ",".join(sorted(dtypes)),
-        }
-        for (encoding, device), (implementations, dtypes) in sorted(records.items())
-    ]
-    # TensorFS's canonical layer is printable-ASCII only. A stray character would refuse the
-    # document at the border with an error that points at bytes, not at the provider.
-    for index, record in enumerate(out):
-        for field, value in record.items():
-            if not value.isascii() or not value.isprintable():
-                raise UnreportableObservation(
-                    f".records[{index}].{field} carries a non-printable-ASCII character: {value!r}"
-                )
-    return {"records": out}
-
-
-def _reportable(evidence: Evidence) -> bool:
-    """May this passing observation be REPORTED, not merely believed here?
-
-    A `verbatim` route decodes nothing and its evidence is the fill plane's byte-identity
-    proof, which is evidence anywhere. Any other route must have actually RUN the spec's
-    producer-mined vectors: `_spec_vectors` reports a spec with no vendored document as
-    SKIPPED and passes it, which is right for a local table built beside the synthetic
-    oracle that did run, and is not a claim to hand another component. It is also the fence
-    that keeps a spec TensorFS carries vectorless out of the document, where it would refuse
-    the whole thing rather than one record.
-    """
-    if isinstance(evidence, VerbatimEvidence):
-        return True
-    return isinstance(evidence, DecodeEvidence) and not evidence.spec_vectors.skipped

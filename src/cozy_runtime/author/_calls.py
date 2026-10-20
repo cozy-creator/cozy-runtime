@@ -55,12 +55,18 @@ _UNNOTIFIED_POLL_SECONDS = 0.05
 
 
 class ChildCallError(CapabilityError):
-    """A bounded RecordOwner verdict, never an implementation traceback."""
+    """A child call's failure, as its RecordOwner states it; its cause is the child's own
+    failure, with the child's traceback (`ChildFailure`)."""
 
     def __init__(self, code: str, message: str, call_index: int, child_request_id: str = ""):
         super().__init__(message, code=code)
         self.call_index = call_index
         self.child_request_id = child_request_id
+
+
+class ChildFailure(Exception):
+    """The failure inside a child call: its detail and traceback, chained under the
+    `ChildCallError` so the parent's traceback holds the child's."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -550,7 +556,10 @@ class _Broker:
     @staticmethod
     def _check(answer: Answer, index: int, child_request_id: str = "") -> None:
         if not answer.ok:
-            raise ChildCallError(answer.code, answer.detail[:1024], index, child_request_id)
+            child = ChildFailure(
+                "\n".join(filter(None, (answer.detail, getattr(answer, "traceback", ""))))
+            )
+            raise ChildCallError(answer.code, answer.detail, index, child_request_id) from child
 
     def close(self) -> None:
         self.closed = True
