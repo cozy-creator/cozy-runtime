@@ -1,4 +1,4 @@
-"""Kept layouts and GPU descriptors cross the seam; cold bytes open through TensorFS."""
+"""Kept layouts and GPU descriptors cross the seam; cold bytes are varena's to read."""
 
 from __future__ import annotations
 
@@ -10,30 +10,13 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 
-import numpy as np
 import pytest
-import tensorfs
 
 from cozy_runtime.internal.executor import Executor
-from cozy_runtime.internal.fill import Checkpoint
 from cozy_runtime.internal.seam import Channel, sealed
 from tensord_peer import answer_read_grants
 
-type Stored = tuple[Checkpoint, str, list[tuple[str, int]]]
-
-
-@pytest.fixture
-def checkpoint(tmp_path: Path) -> Stored:
-    writer = tensorfs.Writer(cache_dir=tmp_path / "store")
-    writer.component("dit", cls="", config={}).put(
-        "a.weight", np.arange(20 << 18, dtype=np.float32), dtype="F32", shape=[20 << 18]
-    )
-    writer.component("vae", cls="", config={}).put(
-        "b.weight", np.ones((8, 4), np.float16), dtype="F16", shape=[8, 4]
-    )
-    ck = writer.commit()
-    assert ck.id is not None
-    return Checkpoint(ck), ck.id, sorted(ck.chunks)
+MANIFEST = "sha256:" + "a" * 64
 
 
 @contextmanager
@@ -50,58 +33,32 @@ def grants(tmp_path: Path, deposited: dict[str, int]) -> Iterator[tuple[Executor
         right.close()
 
 
-def test_a_held_layout_is_the_one_descriptor_mapped_as_it_is(
-    tmp_path: Path, checkpoint: Stored
-) -> None:
-    ck, manifest, objects = checkpoint
+def test_a_held_layout_is_the_one_descriptor_mapped_as_it_is(tmp_path: Path) -> None:
     layout = sealed("layout", b"a host layout varena sealed in another executor")
     try:
         with grants(tmp_path, {"sha256:held": layout}) as (executor, asked):
-            fd, files, pages, _ = executor._read_grant(
-                manifest, "sha256:held", objects, checkpoints={manifest: ck}
-            )
-            assert files == [] == pages and fd is not None and asked == ["sha256:held"]
+            fd, pages, _ = executor._read_grant(MANIFEST, "sha256:held")
+            assert pages == [] and fd is not None and asked == ["sha256:held"]
             assert os.pread(fd, 64, 0) == b"a host layout varena sealed in another executor"
             os.close(fd)
     finally:
         os.close(layout)
 
 
-def test_chunk_files_come_in_sha256_order_named_by_their_lists_digest(
-    tmp_path: Path, checkpoint: Stored
-) -> None:
-    ck, manifest, objects = checkpoint
-    with grants(tmp_path, {}) as (executor, _):
-        fd, files, _, _ = executor._read_grant(
-            manifest, "sha256:cold", objects, checkpoints={manifest: ck}
-        )
-        assert fd is None and [(sha, n) for sha, n, _ in files] == objects
-        for _, n, file in files:
-            assert os.fstat(file).st_size == n
-            os.close(file)
+def test_an_unheld_layout_grants_nothing_and_varena_reads_the_checkpoint(tmp_path: Path) -> None:
+    with grants(tmp_path, {}) as (executor, asked):
+        assert executor._read_grant(MANIFEST, "sha256:cold") == (None, [], "")
+        assert asked == ["sha256:cold"]
 
 
-def test_an_object_outside_the_checkpoint_cannot_be_opened(
-    tmp_path: Path, checkpoint: Stored
-) -> None:
-    ck, manifest, _ = checkpoint
-    with grants(tmp_path, {}) as (executor, _), pytest.raises(KeyError):
-        executor._read_grant(manifest, "sha256:cold", [("0" * 64, 1)], checkpoints={manifest: ck})
-
-
-def test_a_held_layout_carries_kept_regions_and_their_fingerprint(
-    tmp_path: Path, checkpoint: Stored
-) -> None:
-    ck, manifest, objects = checkpoint
+def test_a_held_layout_carries_kept_regions_and_their_fingerprint(tmp_path: Path) -> None:
     layout = sealed("layout", b"held layout")
     page = sealed("kept-page", b"opaque page capability")
     left, right = socket.socketpair()
     executor, peer = Executor(Channel(left), tmp_path), Channel(right)
     try:
         with ThreadPoolExecutor(max_workers=1) as pool:
-            received = pool.submit(
-                executor._read_grant, manifest, "held", objects, checkpoints={manifest: ck}
-            )
+            received = pool.submit(executor._read_grant, MANIFEST, "held")
             frame = peer.recv()
             assert frame is not None and frame["kind"] == "read_grant"
             peer.send(
@@ -116,8 +73,8 @@ def test_a_held_layout_carries_kept_regions_and_their_fingerprint(
                 }
             )
             peer.send_fds([layout, page])
-            fd, files, pages, fingerprint = received.result()
-        assert fd is not None and not files and fingerprint == "sha256:layout-parts"
+            fd, pages, fingerprint = received.result()
+        assert fd is not None and fingerprint == "sha256:layout-parts"
         assert len(pages) == 1 and pages[0][0] == 3
         try:
             assert os.pread(fd, 64, 0) == b"held layout"

@@ -129,8 +129,8 @@ class TreeMember(_Request, frozen=True, kw_only=True, tag="tree_member"):
 
 
 class ReadGrant(_Request, frozen=True, kw_only=True, tag="read_grant"):
-    """One weight set's bytes (memory-varena §5.4): `Granted` answers with the host layout
-    deposited for `layout` (`held`), or the manifest's chunk files. TensorD never fills one."""
+    """One weight set's held bytes (memory-varena §5.4): `Granted` answers with the host layout
+    deposited for `layout` (`held`), else nothing. TensorD never fills one."""
 
     manifest: str
     #: what the host layout is kept under: manifest, construction and component, known before
@@ -146,8 +146,6 @@ class Deposit(_Request, frozen=True, kw_only=True, tag="deposit"):
     manifest: str
     name: str
     layout: str
-    #: the chunk objects it was sealed from (`Granted.objects_sha256`)
-    objects_sha256: str
     #: the memfd; never on the wire
     memfd: int = -1
 
@@ -225,10 +223,8 @@ class Tier(Answer, frozen=True, kw_only=True):
 
 class Granted(Tier, frozen=True, kw_only=True):
     """A `ReadGrant`'s answer, its descriptors in `fds`: the one sealed host layout deposited
-    for the layout (`held`), or every chunk file of the manifest's selected components in sha256
-    order, `objects_sha256` naming that list (the sha256 of its `<sha256>:<length>` lines)."""
+    for the layout (`held`)."""
 
-    objects_sha256: str = ""
     fds: tuple[int, ...] = ()
     #: held: GPU pages a gone executor kept of the layout, whose fds follow the layout's
     fingerprint: str = ""

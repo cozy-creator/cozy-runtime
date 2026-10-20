@@ -10,7 +10,6 @@ import socket
 import threading
 from collections import OrderedDict
 from dataclasses import replace
-from functools import partial
 from pathlib import Path
 
 import pytest
@@ -129,7 +128,7 @@ def test_a_changed_held_layout_refills_directly_from_the_stored_checkpoint(tmp_p
         args=(Channel(right), {backend._layout("net"): held}, asked),
     )
     serving.start()
-    backend.grant = partial(executor._read_grant, checkpoints={manifest: ck})
+    backend.grant = executor._read_grant
     try:
         backend.ahead()
         with torch.device("meta"):

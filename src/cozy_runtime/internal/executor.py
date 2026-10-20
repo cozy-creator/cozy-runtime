@@ -301,11 +301,6 @@ def _gpu_numbers(degree: int) -> list[int]:
     return [execution_evidence.identify(entry)["gpu"] for entry in entries]
 
 
-def _objects_sha256(objects: Sequence[tuple[str, int]]) -> str:
-    """A grant's chunk list by digest: the sha256 of its `<sha256>:<length>` lines."""
-    return hashlib.sha256("".join(f"{sha}:{n}\n" for sha, n in objects).encode()).hexdigest()
-
-
 def _gpu(rank: int) -> str:
     """How people name the GPU group process `rank` drives: `GPU 3`, nvidia-smi's number."""
     return execution_evidence.gpu_name(_sealed_entries(), rank)
@@ -2539,10 +2534,7 @@ class Executor:
             qualified=qualified_pair,
             device_facts=device_facts,
             custody=binding.custody,
-            grant=functools.partial(
-                self._read_grant,
-                checkpoints={checkpoint.id: checkpoint for checkpoint in opened.values()},
-            ),
+            grant=self._read_grant,
             deposit=self._deposit,
             keeper=self._keep_pages,
         )
@@ -4240,23 +4232,17 @@ class Executor:
                 member.backend.keep(quiescent=quiescent)
 
     def _read_grant(
-        self,
-        manifest: str,
-        layout: str,
-        objects: list[tuple[str, int]],
-        *,
-        checkpoints: Mapping[str, Checkpoint],
-    ) -> tuple[int | None, list[tuple[str, int, int]], list[tuple[int, int]], str]:
-        """One weight set's bytes from the machine (`ReadGrant`): the host layout deposited for
-        `layout`, with the GPU pages a gone executor kept of it `(region, fd)` and what they hold,
-        or the chunk files of `objects` (`(sha256, length)` in sha256 order, as the header names
-        them), each `(sha256, length, fd)`; the fds are the caller's to close."""
+        self, manifest: str, layout: str
+    ) -> tuple[int | None, list[tuple[int, int]], str]:
+        """The host layout the machine holds for `layout` (`ReadGrant`), with the GPU pages a gone
+        executor kept of it `(region, fd)` and their fingerprint; `(None, [], "")` when it holds
+        none. The fds are the caller's to close."""
         answer = self._durable(ReadGrant(manifest=manifest, layout=layout, rank=self.rank), Granted)
         # Held: TensorD's first descriptor is the sealed layout an executor deposited, adopted
-        # as it is. No chunk list names it (memory-varena §5.4, D9's refill).
+        # as it is (memory-varena §5.4, D9's refill).
         if answer.ok and answer.held and len(answer.fds) == 1 + len(answer.pages):
             pages = [(p.region, fd) for p, fd in zip(answer.pages, answer.fds[1:], strict=True)]
-            return answer.fds[0], [], pages, answer.fingerprint
+            return answer.fds[0], pages, answer.fingerprint
         for fd in answer.fds:
             os.close(fd)
         if answer.held:
@@ -4264,17 +4250,7 @@ class Executor:
                 f"{manifest[:23]}: the machine supplied an invalid kept layout",
                 code="weights_ungranted",
             )
-        ck = checkpoints[manifest].ck
-        index = {sha: i for i, (sha, _) in enumerate(ck.chunks)}
-        files: list[tuple[str, int, int]] = []
-        try:
-            for sha, length in objects:
-                files.append((sha, length, ck.open_chunk(index[sha])))
-        except BaseException:
-            for _, _, fd in files:
-                os.close(fd)
-            raise
-        return None, files, [], ""
+        return None, [], ""
 
     def _keep_pages(self, layout: str, fingerprint: str, pages: list[tuple[int, int, int]]) -> None:
         """GPU pages varena kept here go to the machine, which holds them past this process
@@ -4292,9 +4268,7 @@ class Executor:
             for _, _, fd in pages:
                 os.close(fd)
 
-    def _deposit(
-        self, manifest: str, name: str, layout: str, objects: list[tuple[str, int]], fd: int
-    ) -> None:
+    def _deposit(self, manifest: str, name: str, layout: str, fd: int) -> None:
         """A host layout varena sealed here goes to the machine, which keeps it for the next
         load of that layout (memory-varena §5.4). A refusal only costs that load a reseal."""
         try:
@@ -4302,7 +4276,6 @@ class Executor:
                 manifest=manifest,
                 name=name,
                 layout=layout,
-                objects_sha256=_objects_sha256(objects),
                 memfd=fd,
             )
             self._durable(request, Answer)
