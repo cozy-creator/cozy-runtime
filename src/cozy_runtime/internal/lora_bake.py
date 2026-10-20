@@ -365,7 +365,7 @@ def bakeable(scheme: str, params: Mapping[str, object], roles: Mapping[str, str]
     if scheme == "plain":
         return dict(roles) in ({"value": "bf16"}, {"value": "f16"}, {"value": "f32"})
     if scheme == "fp8.rowwise":
-        return params.get("axis") == 0 and dict(roles) == {"weight": "f8_e4m3fn", "scale": "f32"}
+        return dict(roles) == {"weight": "f8_e4m3fn", "scale": "f32"}
     return scheme == "int8.convrot" and dict(roles) == {"weight": "i8", "scale": "f32"}
 
 

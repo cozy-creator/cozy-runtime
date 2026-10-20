@@ -70,7 +70,7 @@ _ENCODINGS: dict[str, _Encoding] = {
         _rowwise(encode_fp8_rowwise),
         "F8_E4M3",
         32,
-        {"axis": 0},
+        {},
         _row_scale,
     ),
     # The bound is a tripwire for a broken encoder, not a quality gate.

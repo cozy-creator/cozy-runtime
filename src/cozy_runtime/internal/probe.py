@@ -305,8 +305,8 @@ def _numerics_rowwise(torch: Any, provider: Provider, device: Any, dtype: Any) -
         [math.ldexp(1.0, e) for e in exponents], dtype=torch.float32, device=device
     )
     destination = torch.empty(rows, cols, dtype=dtype, device=device)
-    provider.decode(torch, {"weight": data, "scale": scale}, destination)
-    got = destination.cpu().double().reshape(-1).tolist()
+    provider.decode(torch, {"weight": _across(provider, data), "scale": scale}, destination)
+    got = _across(provider, destination).cpu().double().reshape(-1).tolist()
     return _domain_sweep(
         torch, dtype, got, [(math.ldexp(1.0, e), f"row scale 2**{e}") for e in exponents]
     )
@@ -378,10 +378,15 @@ def _numerics_int8_rowwise(
     scale = torch.pow(2.0, torch.tensor([(r % 60) - 30 for r in range(rows)], dtype=torch.float64))
     truth = data.double() * scale.reshape(rows, 1)
     destination = torch.empty(rows, cols, dtype=dtype, device=device)
-    provider.decode(
-        torch, {"weight": data.to(device), "scale": scale.float().to(device)}, destination
-    )
-    return _exact_sweep(torch, destination.cpu(), truth, dtype)
+    weight = _across(provider, data).to(device)
+    provider.decode(torch, {"weight": weight, "scale": scale.float().to(device)}, destination)
+    return _exact_sweep(torch, _across(provider, destination).cpu(), truth, dtype)
+
+
+def _across(provider: Provider, rows: Tensor) -> Tensor:
+    """A columnwise provider's view of a rowwise fixture: the transpose, its scale per column,
+    so one oracle checks both directions (and a decoder that reads the wrong axis fails it)."""
+    return rows.t().contiguous() if provider.encoding.endswith(".columnwise") else rows
 
 
 def _numerics_int8_tensorwise(
@@ -424,11 +429,11 @@ def _comfy_fixture(
     rows, columns = shape
     channel = torch.linspace(0.5, 1.5, rows, dtype=torch.float32, device=device)
     truth = channel.reshape(rows, 1).expand(rows, columns)
-    if provider.encoding == "comfy.convrot_w4a4":
+    if provider.encoding == "int4.convrot":
         # Signed nibble 1 decodes to 1.
         return truth, {
             "weight": torch.full((rows, columns // 2), 0x11, dtype=torch.int8, device=device),
-            "weight_scale": channel,
+            "scale": channel,
         }
     group = params.get("group_size")
     if not isinstance(group, int) or type(group) is not int:
@@ -449,8 +454,8 @@ def _comfy_fixture(
         raise AssertionError(f"no Comfy fixture for {provider.encoding}")
     return truth, {
         "weight": weight,
-        "weight_s_rel": torch.ones((rows, columns // group), dtype=torch.float32, device=device),
-        "weight_s_channel": channel,
+        "group_scale": torch.ones((rows, columns // group), dtype=torch.float32, device=device),
+        "scale": channel,
     }
 
 
@@ -695,6 +700,10 @@ def _weight_roles(torch: Any, provider: Provider, device: Any) -> tuple[Any, dic
         scale = (weight.abs().amax(dim=-1) / 448.0).clamp(min=1e-12)
         payload = (weight / scale.unsqueeze(-1)).clamp(-448.0, 448.0)
         return weight, {"weight": payload.to(torch.float8_e4m3fn), "scale": scale}
+    if provider.suite == "fp8-columnwise-decode":
+        scale = (weight.abs().amax(dim=0) / 448.0).clamp(min=1e-12)
+        payload = (weight / scale.unsqueeze(0)).clamp(-448.0, 448.0)
+        return weight, {"weight": payload.to(torch.float8_e4m3fn), "scale": scale}
     if provider.suite in ("int8-convrot-decode", "int8-convrot256-native"):
         rotated = hadamard256(torch, weight.double()) / 16
         scale = (rotated.abs().amax(dim=-1) / 127.0).clamp(min=1e-12).float()
@@ -718,6 +727,10 @@ def _weight_roles(torch: Any, provider: Provider, device: Any) -> tuple[Any, dic
     if provider.suite == "int8-rowwise-decode":
         scale = (weight.abs().amax(dim=-1) / 127.0).clamp(min=1e-12)
         payload = torch.round(weight / scale.unsqueeze(-1)).clamp(-127, 127)
+        return weight, {"weight": payload.to(torch.int8), "scale": scale}
+    if provider.suite == "int8-columnwise-decode":
+        scale = (weight.abs().amax(dim=0) / 127.0).clamp(min=1e-12)
+        payload = torch.round(weight / scale.unsqueeze(0)).clamp(-127, 127)
         return weight, {"weight": payload.to(torch.int8), "scale": scale}
     if provider.suite in ("mxfp8-decode", "mxfp8-native"):
         blocks = weight.reshape(rows, cols // MX_BLOCK, MX_BLOCK)
@@ -764,8 +777,7 @@ def _exact_weight(torch: Any, provider: Provider, roles: Mapping[str, Any]) -> A
         # stored channel scale is the exact value, not another decoder's output.
         rows, packed = (int(n) for n in roles["weight"].shape)
         columns = packed * 4 // 3 if provider.encoding == "comfy.w6a8_int8" else packed * 2
-        role = "weight_scale" if provider.encoding == "comfy.convrot_w4a4" else "weight_s_channel"
-        return _f64(roles[role]).reshape(rows, 1).expand(rows, columns)
+        return _f64(roles["scale"]).reshape(rows, 1).expand(rows, columns)
     if provider.suite in ("nvfp4-decode", "nvfp4-native"):
         packed = roles["weight"].cpu()
         rows, cols = int(packed.shape[0]), 2 * int(packed.shape[1])
@@ -777,6 +789,8 @@ def _exact_weight(torch: Any, provider: Provider, roles: Mapping[str, Any]) -> A
     data = _f64(roles["weight"])
     if provider.suite in ("fp8-rowwise-decode", "fp8-rowwise-native", "int8-rowwise-decode"):
         return data * _f64(roles["scale"]).reshape(int(data.shape[0]), 1)
+    if provider.suite in ("fp8-columnwise-decode", "int8-columnwise-decode"):
+        return data * _f64(roles["scale"]).reshape(1, int(data.shape[1]))
     if provider.suite in ("mxfp8-decode", "mxfp8-native"):
         mult = _f64(e8m0_multipliers(torch, roles["scale"]))
         return data * mult.repeat_interleave(MX_BLOCK, dim=1)[:, : int(data.shape[1])]
@@ -1068,9 +1082,11 @@ DECODE_SUITES: dict[str, Callable[[Any, Provider, Any, Any], Sweep]] = {
     "comfy-decode": _numerics_comfy,
     "fp8-tensorwise-decode": _numerics,
     "fp8-rowwise-decode": _numerics_rowwise,
+    "fp8-columnwise-decode": _numerics_rowwise,
     "int8-convrot-decode": _numerics_int8_convrot,
     "nvfp4-decode": _numerics_nvfp4,
     "int8-rowwise-decode": _numerics_int8_rowwise,
+    "int8-columnwise-decode": _numerics_int8_rowwise,
     "int8-tensorwise-decode": _numerics_int8_tensorwise,
     "mxfp8-decode": _numerics_mxfp8,
     "cores-decode": _numerics_cores,
@@ -1140,13 +1156,15 @@ def qualify(
 #: The params a suite's synthetic operands are written with: the producers' own (ModelOpt's
 #: layouts). The spec's conformance cases cover the other layouts.
 PROBE_PARAMS: dict[str, dict[str, object]] = {
-    "comfy.asym_w4a8_int8": {"group_size": 16, "rotation_size": 256},
-    "comfy.w6a8_int8": {"group_size": 32, "rotation_size": 256},
-    "comfy.convrot_w4a4": {"rotation_size": 256},
+    "comfy.asym_w4a8_int8": {"group_size": 16, "rotation": "kron_regular_h4", "rotation_size": 256},
+    "comfy.w6a8_int8": {"group_size": 32, "rotation": "kron_regular_h4", "rotation_size": 256},
+    "int4.convrot": {"rotation": "kron_regular_h4", "rotation_size": 256},
     "fp8.tensorwise": {},
     "int8.tensorwise": {},
-    "fp8.rowwise": {"axis": 0},
-    "int8.rowwise": {"axis": 0},
+    "fp8.rowwise": {},
+    "int8.rowwise": {},
+    "fp8.columnwise": {},
+    "int8.columnwise": {},
     "int8.convrot": {"rotation": "kron_regular_h4", "rotation_size": 256},
     "mxfp8": {"block_size": MX_BLOCK, "scale_layout": "row_major"},
     "nvfp4": {
