@@ -25,6 +25,7 @@ def main(
     runtime_wheel: Annotated[FileAsset, AssetBound(max_bytes=67108864)],
     tests: Annotated[FileAsset, AssetBound(max_bytes=131072)],
     graph_tests: Annotated[FileAsset, AssetBound(max_bytes=131072)],
+    accounting: Annotated[FileAsset, AssetBound(max_bytes=131072)],
     conftest: Annotated[FileAsset, AssetBound(max_bytes=131072)],
     read_engine: Annotated[FileAsset, AssetBound(max_bytes=131072)],
     out: Outputs,
@@ -51,6 +52,7 @@ def main(
     runtime_artifact = supplied_wheel(runtime_wheel, "cozy-runtime")
     (root / "test_slim_varena_gpu.py").write_bytes(tests.read_bytes())
     (root / "test_graph_cache_gpu.py").write_bytes(graph_tests.read_bytes())
+    (root / "cuda_cache_accounting.py").write_bytes(accounting.read_bytes())
     (root / "conftest.py").write_bytes(conftest.read_bytes())
     (root / "cuda_read_engine.py").write_bytes(read_engine.read_bytes())
     logs = root / "logs"
@@ -122,6 +124,9 @@ def main(
             "print(torch.cuda.get_device_properties(0))",
         ],
     )
+    accounted = run("cache-accounting", [python, "cuda_cache_accounting.py"])
+    if "CUDA cache accounting: owned growth, real leaks, symmetric shrink" not in accounted:
+        raise RuntimeError("the CUDA cache accounting checks did not finish")
     result = run(
         "tests",
         [
