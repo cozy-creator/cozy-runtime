@@ -33,7 +33,7 @@ class MemoryReceipts(unittest.TestCase):
                        reason="demand", **{"class": "unused"})
             row.update(values)
             return row
-        trace = [event(0, "begin"), event(1, "evict"), event(2, "end")]
+        trace = [event(0, "begin"), event(1, "evict"), event(2, "bind"), event(3, "end")]
         self.assertEqual(API["trace_errors"](trace), [])
         trace[1]["class"] = "working"
         self.assertIn("running-page-evicted", API["trace_errors"](trace))
@@ -46,9 +46,11 @@ class MemoryReceipts(unittest.TestCase):
         begin = dict(sequence=0, request="r", step=0, page=1, bytes=1, capacity=8,
                      resident=1, orphan_bytes=0, kind="begin", reason="demand", **{"class": "unused"})
         fill = dict(begin, sequence=1, kind="fill", reason="speculation", working_set=4, speculative_budget=3)
-        end = dict(begin, sequence=2, kind="end")
-        self.assertEqual(API["trace_errors"]([begin, fill, end]), [])
-        self.assertIn("repeated-speculative-fetch", API["trace_errors"]([begin, fill, dict(fill, sequence=2), dict(end, sequence=3)]))
+        bound = dict(begin, sequence=2, kind="bind")
+        end = dict(begin, sequence=3, kind="end")
+        self.assertEqual(API["trace_errors"]([begin, fill, bound, end]), [])
+        self.assertIn("missing-page-bind-evidence", API["trace_errors"]([begin, end]))
+        self.assertIn("repeated-speculative-fetch", API["trace_errors"]([begin, fill, dict(fill, sequence=2), dict(bound, sequence=3), dict(end, sequence=4)]))
         del fill["working_set"]
         self.assertIn("unmeasured-speculation", API["trace_errors"]([begin, fill, end]))
         self.assertEqual(API["trace_errors"]([]), ["missing-decision-trace"])

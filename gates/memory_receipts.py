@@ -56,7 +56,7 @@ def trace_errors(events):
     if not isinstance(events, list) or not events:
         return ["missing-decision-trace"]
     errors, last, attempted, speculative, starved = [], {}, set(), {}, set()
-    began, ended = set(), set()
+    began, ended, bound = set(), set(), set()
     classes = {"free", "orphan", "speculative", "unused", "declared", "working", "pinned"}
     for event in events:
         if not isinstance(event, dict):
@@ -94,6 +94,8 @@ def trace_errors(events):
             ended.add(request)
         elif request not in began or request in ended:
             errors.append("decision-outside-request")
+        if kind == "bind" and event["bytes"] > 0:
+            bound.add(request)
         if kind == "evict":
             if page_class == "pinned" or (page_class == "working" and reason != "lower"):
                 errors.append("running-page-evicted")
@@ -119,6 +121,8 @@ def trace_errors(events):
                     errors.append("speculation-exceeded-surplus")
     if began != ended:
         errors.append("unfinished-decision-trace")
+    if began - bound:
+        errors.append("missing-page-bind-evidence")
     return list(dict.fromkeys(errors))
 
 
