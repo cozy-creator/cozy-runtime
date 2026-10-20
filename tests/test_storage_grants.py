@@ -299,16 +299,18 @@ def test_local_destinations_replace_the_alias_and_preserve_other_revisions(
     source = checkpoint(store, {"model": {"w": np.array([9], np.uint8)}})
     prior = ""
     with tensorfs.open(source, cache_dir=store, local_files_only=True) as seed:
+        seed_folder = tmp_path / "seed-portable"
+        tensorfs.export(seed, seed_folder, format="cozytensors")
         if previous_release is not None:
             prior = tensorfs.upload_folder(
                 repo_id="local/output", revision=previous_release,
-                folder_path=seed.path, cache_dir=store,
+                folder_path=seed_folder, cache_dir=store,
             )
         draft = tensorfs.upload_folder(
-            repo_id="local/output", folder_path=seed.path, cache_dir=store,
+            repo_id="local/output", folder_path=seed_folder, cache_dir=store,
         )
         tensorfs.upload_folder(
-            repo_id="local/unrelated", revision="7", folder_path=seed.path, cache_dir=store,
+            repo_id="local/unrelated", revision="7", folder_path=seed_folder, cache_dir=store,
         )
     unrelated = endpoint.repo("local/unrelated")
     shown: Shown = []
