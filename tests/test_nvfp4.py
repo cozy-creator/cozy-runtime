@@ -14,7 +14,7 @@ from cozy_runtime.author.fakes import fake_attempt, fake_telemetry
 from cozy_runtime.derive.microscale import encode_nvfp4
 from cozy_runtime.derive.operations import EncodingRule, QuantizationPlan, quantize_into
 from cozy_runtime.internal.encoding import params_of
-from store_fixtures import adopted, checkpoint, context, home
+from store_fixtures import Shown, adopted, checkpoint, context, home
 
 ENCODING = "nvfp4"
 PARAMS = params_of(
@@ -55,7 +55,7 @@ def test_one_lane_carries_nvfp4_beside_int8(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = home(tmp_path / "tensorfs", monkeypatch)
-    shown: list[tuple[str, str, str, str]] = []
+    shown: Shown = []
     source = checkpoint(
         store,
         {

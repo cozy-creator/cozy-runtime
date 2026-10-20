@@ -14,7 +14,7 @@ from cozy_runtime.author.fakes import fake_attempt, fake_telemetry
 from cozy_runtime.derive.microscale import decode_int8_convrot256, encode_int8_convrot256
 from cozy_runtime.derive.operations import QuantizationPlan, quantize_into
 from cozy_runtime.internal.encoding import params_of
-from store_fixtures import adopted, checkpoint, context, home
+from store_fixtures import Shown, adopted, checkpoint, context, home
 
 ENCODING = "int8.convrot"
 
@@ -45,7 +45,7 @@ def test_include_recipe_encodes_exactly_its_weights(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = home(tmp_path / "tensorfs", monkeypatch)
-    shown: list[tuple[str, str, str, str]] = []
+    shown: Shown = []
     source = checkpoint(
         store,
         {
