@@ -49,7 +49,7 @@ def vectors(device: str) -> None:
 
 
 def test_cpu_vectors_through_registered_native_consumers() -> None:
-    assert len(POSITIVE) == 18 and len(NEGATIVE) == 14
+    assert len(POSITIVE) == 18 and len(NEGATIVE) == 16
     vectors("cpu")
 
 

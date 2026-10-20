@@ -475,7 +475,9 @@ class RowwiseDequant:
 
     @property
     def schemes(self) -> frozenset[str]:
-        return frozenset({"fp8.rowwise", "int8.rowwise", "fp8.columnwise", "int8.columnwise"})
+        if self.encoding.endswith(".columnwise"):
+            return frozenset({"fp8.columnwise", "int8.columnwise"})
+        return frozenset({"fp8.rowwise", "int8.rowwise"})
 
     @property
     def code_revision(self) -> str:
@@ -511,6 +513,11 @@ class RowwiseDequant:
             block = payload[start:stop].to(torch.float32)
             block.mul_(scale if per_column else scale[start:stop])
             destination[start:stop].copy_(block)
+
+
+def columnwise(encoding: str = "") -> RowwiseDequant:
+    """The columnwise dequant: one provider of its own, so the rowwise one keeps its identity."""
+    return RowwiseDequant(encoding or "fp8.columnwise")
 
 
 def e8m0_multipliers(torch: ModuleType, scale: Tensor) -> Tensor:

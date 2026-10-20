@@ -43,6 +43,7 @@ from cozy_runtime.internal.encoding.formats import (
     RowwiseDequant,
     TensorwiseDequant,
     Verbatim,
+    columnwise,
     refuse,
 )
 from cozy_runtime.internal.encoding.leaves import (
@@ -542,6 +543,7 @@ def launch_providers() -> dict[str, tuple[Provider, ...]]:
         Verbatim,
         TensorwiseDequant,
         RowwiseDequant,
+        columnwise,
         RowwiseNativeLeaf,
         Int8ConvRotDequant,
         Int8ConvRotNativeLeaf,
