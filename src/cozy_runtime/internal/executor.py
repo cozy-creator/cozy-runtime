@@ -3436,6 +3436,11 @@ class Executor:
                 record = AuthorAttempt(command.request_id, spool, 0, sink=progress)
         assert record is not None
         self.handled[command.request_id] = (outcome, stage[0], record)
+        # A failure that left the device faulted: this process serves nothing more, so it is
+        # poisoned and the machine ends it, freeing everything (12167 ran on 12166's dead one).
+        failed = outcome.terminal == "failed" and torch is not None
+        if failed and not accel.healthy(torch, self.device_kind):
+            self.poisoned = self.poisoned or f"device fault: {outcome.message}"[:300]
         if self.rank == 0:
             for member in self.model_executors or [self]:
                 self._emit_gemm(record, member)
