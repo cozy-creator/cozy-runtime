@@ -181,6 +181,7 @@ from cozy_runtime.internal.executor_commands import (
     Release,
     Shutdown,
     Start,
+    Supplied,
     TensorFSOptions,
     Unload,
 )
@@ -377,9 +378,24 @@ def _held(
         waits.stage(f"waiting for {waiter} compile", (time.perf_counter() - started) * 1000)
 
 
-def _connection(options: TensorFSOptions | None) -> weights_store.Connection | None:
-    """The request's endpoint and token; its private CA, if any, joins TensorFS's trusted roots
-    for this process (`configure` adds a root, so setting it again is harmless)."""
+def _supplied(bearers: weights_store.Bearers, frame: Frame) -> None:
+    """A bearer as the seam reads it, before any later frame; a malformed one is its command's
+    to refuse."""
+    try:
+        supplied = msgspec.convert(frame, Supplied)
+    except msgspec.ValidationError:
+        return
+    options = supplied.tensorfs
+    if options is not None and options.token:
+        bearers.note(supplied.actor, options.endpoint, options.token, options.expires_unix_ms)
+
+
+def _connection(
+    options: TensorFSOptions | None, actor: str, bearers: weights_store.Bearers
+) -> weights_store.Connection | None:
+    """The request's endpoint and, when it was supplied a token, its signer's newest bearer for
+    that endpoint; its private CA, if any, joins TensorFS's trusted roots for this process
+    (`configure` adds a root, so setting it again is harmless)."""
     if options is None:
         return None
     if options.ca_der is not None:
@@ -388,7 +404,11 @@ def _connection(options: TensorFSOptions | None) -> weights_store.Connection | N
         except ValueError as exc:
             raise InvalidRequest("TensorFS CA is not base64 DER", code="tensorfs_config") from exc
         tensorfs.configure(ca_der=ca_der)
-    return weights_store.Connection(options.endpoint, options.token)
+    if options.token is None:
+        return weights_store.Connection(options.endpoint)
+    bearers.offer(actor, options.endpoint, options.token, options.expires_unix_ms)
+    bearer = weights_store.Bearer(bearers, actor, options.endpoint, options.token)
+    return weights_store.Connection(options.endpoint, bearer)
 
 
 def _replay_code(command: Invoke, request: str) -> str:
@@ -755,9 +775,18 @@ class Executor:
         self.channel = channel
         self.root = root
         self.host: Executor = host or self
+        #: HOST ONLY: each signer's newest bearer for each endpoint, which the seam keeps
+        #: current as it reads (`Mux`) and every TensorFS request asks (`weights_store.Bearer`)
+        self.bearers: weights_store.Bearers = (
+            host.bearers if host is not None else weights_store.Bearers()
+        )
         #: HOST ONLY: the seam every thread reads through, the attempts in flight and the lock
         #: their fetch channel opens and closes under
-        self.mux: Mux = host.mux if host is not None else Mux(channel)
+        self.mux: Mux = (
+            host.mux
+            if host is not None
+            else Mux(channel, functools.partial(_supplied, self.bearers))
+        )
         self.in_flight: _InFlight = host.in_flight if host is not None else _InFlight()
         #: this process's CUDA context and first library launches, measured at device init
         #: from this process's own driver row (-1: not attributable)
@@ -2399,7 +2428,9 @@ class Executor:
         # One checkpoint per header ref, through the public TensorFS API.
         opened: dict[str, Checkpoint] = {}
         for manifest in {vmap.get(name, reference.snapshot) for name in names}:
-            opened[manifest] = host._checkpoint(manifest, _connection(command.tensorfs))
+            opened[manifest] = host._checkpoint(
+                manifest, _connection(command.tensorfs, command.actor, host.bearers)
+            )
         checkpoints = {name: opened[vmap.get(name, reference.snapshot)] for name in names}
         # `names` is what the DERIVE constructed (model-code-fit D9), not what the header
         # carries: a constructed component the checkpoint lacks is the fit's own
@@ -2450,7 +2481,9 @@ class Executor:
                 if checkpoint.id == reference.snapshot
             ),
             None,
-        ) or host._checkpoint(reference.snapshot, _connection(command.tensorfs))
+        ) or host._checkpoint(
+            reference.snapshot, _connection(command.tensorfs, command.actor, host.bearers)
+        )
         config_bytes = model_config.construction_config(config_checkpoint.configs())
         config_document = canonical.parse_canonical(config_bytes)
         if not isinstance(config_document, dict):
@@ -3357,7 +3390,7 @@ class Executor:
             name: RawWeights(manifest) for name, manifest in command.sources.items()
         }
         exchange = self._exchange(command.request_id)
-        connection = _connection(command.tensorfs)
+        connection = _connection(command.tensorfs, command.actor, self.bearers)
         weight_outputs = (
             weights_store.Outputs(
                 self._store(),
