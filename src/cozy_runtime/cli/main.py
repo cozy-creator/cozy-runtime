@@ -210,7 +210,7 @@ def dispatch(verb: str, args: list[str], opts: Options, config: RuntimeConfig) -
         except python_interpreters.InterpreterRefusal as exc:
             raise CliError(exc.code, exc.detail, "install a supported Python interpreter") from exc
     if verb == "python-ensure":
-        from cozy_runtime.internal import python_interpreters, storage_admission
+        from cozy_runtime.internal import python_interpreters
 
         if not 1 <= len(args) <= 2:
             raise CliError(
@@ -226,7 +226,7 @@ def dispatch(verb: str, args: list[str], opts: Options, config: RuntimeConfig) -
                 progress=lambda message: print(message, file=sys.stderr, flush=True),
             )
             return Result(document=selected.document())
-        except (python_interpreters.InterpreterRefusal, storage_admission.StorageRefusal) as exc:
+        except python_interpreters.InterpreterRefusal as exc:
             raise CliError(
                 exc.code, exc.detail, "check Python requirements and uv availability"
             ) from exc

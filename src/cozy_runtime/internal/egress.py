@@ -155,7 +155,6 @@ def fetch_public_wheel(
     import uuid
     from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-    from cozy_runtime.internal import storage_admission
     from cozy_runtime.internal.package_environment import (
         EnvironmentRefusal,
         _require_public_wheel_url,
@@ -183,29 +182,28 @@ def fetch_public_wheel(
             bound = int(header) if header is not None else ceiling
             if not 0 < bound <= ceiling:
                 raise EnvironmentRefusal("package_environment_wheel_invalid", "wheel size bound")
-            with storage_admission.admit(storage_admission.Write(path.parent, bound, 16)):
-                path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-                digest = hashlib.sha256()
-                length = 0
-                with temporary.open("xb") as target:
-                    while block := response.read(CHUNK):
-                        length += len(block)
-                        if length > bound:
-                            raise EnvironmentRefusal(
-                                "package_environment_wheel_invalid", "wheel size bound"
-                            )
-                        digest.update(block)
-                        target.write(block)
-                    target.flush()
-                    os.fsync(target.fileno())
-                if (
-                    header is not None and length != bound
-                ) or "sha256:" + digest.hexdigest() != expected_digest:
-                    raise EnvironmentRefusal(
-                        "package_environment_wheel_invalid", "wheel hash or length changed"
-                    )
-                temporary.chmod(0o444)
-                os.replace(temporary, path)
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            digest = hashlib.sha256()
+            length = 0
+            with temporary.open("xb") as target:
+                while block := response.read(CHUNK):
+                    length += len(block)
+                    if length > bound:
+                        raise EnvironmentRefusal(
+                            "package_environment_wheel_invalid", "wheel size bound"
+                        )
+                    digest.update(block)
+                    target.write(block)
+                target.flush()
+                os.fsync(target.fileno())
+            if (
+                header is not None and length != bound
+            ) or "sha256:" + digest.hexdigest() != expected_digest:
+                raise EnvironmentRefusal(
+                    "package_environment_wheel_invalid", "wheel hash or length changed"
+                )
+            temporary.chmod(0o444)
+            os.replace(temporary, path)
         return path, length
     except (OSError, ValueError, EgressRefusal) as exc:
         raise EnvironmentRefusal(
