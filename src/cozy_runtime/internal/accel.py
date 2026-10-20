@@ -421,7 +421,7 @@ def synchronize(torch: Any, kind: str) -> None:
         torch.cuda.synchronize()
 
 
-def healthy(torch: Any, kind: str) -> bool:
+def healthy(torch: ModuleType, kind: str) -> bool:
     """Whether the device still answers a fence: a fault is sticky (an illegal address, a copy
     engine's), and every later call of this process fails with it."""
     try:
