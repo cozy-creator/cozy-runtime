@@ -1459,10 +1459,6 @@ def _probe_image(path: Path, limits: DecodeLimits) -> ImageProbe:
     with _pillow(), pil_open(path) as header:
         width, height = header.size
         _check_pixels(width, height, limits)
-        if getattr(header, "n_frames", 1) != 1:
-            raise MediaDecodeError(
-                "image asset contains more than one frame", code="animated_image"
-            )
         # The base reader parses header metadata only; a PNG `eXIf` after its pixels
         # would need a decode and is not consulted here.
         orientation = PILImage.getexif(header).get(0x0112, 1)
@@ -1549,17 +1545,15 @@ def _image(
     """Decode a still image with Pillow; CLI preparation and Runtime use this one core.
 
     Resource ceilings are application policy. Pillow owns image formats, EXIF
-    orientation (including mirrors), RGB conversion and resampling.
+    orientation (including mirrors), RGB conversion and resampling. A multi-frame
+    file (an iPhone MPO's gain map, APNG, GIF, TIFF pages) reads as its first frame,
+    the picture every viewer shows; Pillow opens there.
     """
     with _pillow():
         source_geometry = image_source_geometry(path, limits, preparation)
         with pil_open(path) as image:
             if image.size != source_geometry:
                 raise MediaDecodeError("image header geometry changed", code="media_geometry")
-            if getattr(image, "n_frames", 1) != 1:
-                raise MediaDecodeError(
-                    "image asset contains more than one frame", code="animated_image"
-                )
             width, height = image_target_size(*source_geometry, preparation)
             budget.claim(width * height * 3, "image RGB")
             # in_place avoids an extra full-size copy for the common upright case.
