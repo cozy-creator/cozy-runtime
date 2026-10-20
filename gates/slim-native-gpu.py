@@ -6,8 +6,9 @@
 
 The outer Runtime launches a standalone Rust binary; it does not replace the worker's SDK.
 The binary checks its actual visible GPU and runs each case in a fresh process.
-Default: ten existing cases. warm_admission=true adds the new eleventh case and
-requires the corresponding updated placement binary; coverage is explicit in result.json.
+The required suite JSON chooses ten existing cases or adds the new eleventh case:
+{"warm_admission": false|true}. The eleventh needs the updated placement binary;
+coverage is explicit in result.json.
 """
 from pathlib import Path
 import json
@@ -44,7 +45,12 @@ PLACEMENT_CASES = {
 
 def main(*, binary: Annotated[FileAsset, AssetBound(max_bytes=67108864)],
          placement_binary: Annotated[FileAsset, AssetBound(max_bytes=67108864)],
-         warm_admission: bool = False, out: Outputs) -> Tree:
+         suite: Annotated[FileAsset, AssetBound(max_bytes=4096)], out: Outputs) -> Tree:
+    selection = json.loads(suite.read_bytes())
+    if (not isinstance(selection, dict) or set(selection) != {"warm_admission"}
+            or type(selection["warm_admission"]) is not bool):
+        raise ValueError('suite must be exactly {"warm_admission": true|false}')
+    warm_admission = selection["warm_admission"]
     root = Path(tempfile.mkdtemp(prefix="varena-slim-gpu-"))
     executable = root / "slim-gpu"
     executable.write_bytes(binary.read_bytes())
