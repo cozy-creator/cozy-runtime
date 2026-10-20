@@ -80,6 +80,16 @@ def test_independent_constant_q_oracle_and_golden_qualification(scheme: str, dty
     assert all(row.passed and not row.skipped for row in golden.cases)
 
 
+@pytest.mark.parametrize("dtype", ["float64", "float8_e4m3fn"])
+def test_plain_only_output_dtypes_leave_comfy_unmeasured(dtype: str) -> None:
+    # The global qualifier visits these candidates even when the model is plain.
+    # An unsupported encoded destination must not abort or mint a capability.
+    evidence = probe._measured(
+        torch, ComfyDequant("comfy.convrot_w4a4"), torch.device("cpu"), getattr(torch, dtype)
+    )
+    assert isinstance(evidence, probe.UnmeasuredEvidence)
+
+
 def test_real_backend_serves_original_logical_dtype_from_resident_parts(tmp_path: Path) -> None:
     from tensorfs.varena.torch import Memory
 

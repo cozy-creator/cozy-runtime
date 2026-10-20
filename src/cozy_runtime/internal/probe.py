@@ -1109,6 +1109,12 @@ PROBE_PARAMS: dict[str, dict[str, object]] = {
 def _measured(torch: ModuleType, provider: Provider, target: Tensor, dtype: Tensor) -> Evidence:
     """`_evidence`, where a device that lacks a dtype the decode reads (MPS has no float8)
     mints no record for it: the encoding refuses at bind naming why."""
+    # Qualification considers every provider even for a plain F64/FP8 model.
+    # Those are valid verbatim outputs, not logical Comfy decode destinations.
+    if provider.suite == "comfy-decode" and dtype not in (
+        torch.float32, torch.float16, torch.bfloat16
+    ):
+        return UnmeasuredEvidence(note="Comfy logical outputs are F32, F16 or BF16")
     params = params_of(PROBE_PARAMS.get(provider.encoding, {}))
     provider = replace(provider, params=params)  # type: ignore[type-var]
     try:
