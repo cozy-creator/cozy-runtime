@@ -26,6 +26,33 @@ def positive():
 
 
 class MemoryReceipts(unittest.TestCase):
+    def test_slim_trace_protects_working_pages_and_orphan_order(self):
+        def event(sequence, kind, **values):
+            row = dict(sequence=sequence, request="r", step=0, page=1, bytes=1,
+                       capacity=8, resident=1, orphan_bytes=0, kind=kind,
+                       reason="demand", **{"class": "unused"})
+            row.update(values)
+            return row
+        trace = [event(0, "begin"), event(1, "evict"), event(2, "end")]
+        self.assertEqual(API["trace_errors"](trace), [])
+        trace[1]["class"] = "working"
+        self.assertIn("running-page-evicted", API["trace_errors"](trace))
+        trace[1]["reason"] = "lower"
+        self.assertEqual(API["trace_errors"](trace), [])
+        trace[1].update(**{"class": "unused", "orphan_bytes": 1})
+        self.assertIn("orphan-not-reclaimed-first", API["trace_errors"](trace))
+
+    def test_slim_trace_rejects_repeated_or_unmeasured_speculation(self):
+        begin = dict(sequence=0, request="r", step=0, page=1, bytes=1, capacity=8,
+                     resident=1, orphan_bytes=0, kind="begin", reason="demand", **{"class": "unused"})
+        fill = dict(begin, sequence=1, kind="fill", reason="speculation", working_set=4, speculative_budget=3)
+        end = dict(begin, sequence=2, kind="end")
+        self.assertEqual(API["trace_errors"]([begin, fill, end]), [])
+        self.assertIn("repeated-speculative-fetch", API["trace_errors"]([begin, fill, dict(fill, sequence=2), dict(end, sequence=3)]))
+        del fill["working_set"]
+        self.assertIn("unmeasured-speculation", API["trace_errors"]([begin, fill, end]))
+        self.assertEqual(API["trace_errors"]([]), ["missing-decision-trace"])
+
     def record(self, value, cell="24-sdxl4", cold=""):
         with tempfile.TemporaryDirectory() as directory:
             path, summary = Path(directory) / "run.json", Path(directory) / "summary.txt"
