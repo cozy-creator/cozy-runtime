@@ -1,0 +1,39 @@
+{
+  "id": "run-4fdd35ef6a29f578216f46b5",
+  "number": 12373,
+  "kind": "call",
+  "target": "local/minimax-h3/ref2va_turbo",
+  "hub": "https://tensorhub.com",
+  "machine": "kaeya",
+  "status": "completed",
+  "cancel_requested": false,
+  "machine_state": "running",
+  "created_at_ms": 1792526820978,
+  "accepted_at_ms": 1792526824884,
+  "settled_at_ms": 1792526851394,
+  "result": {
+    "originals": [],
+    "references": [],
+    "video": {
+      "asset_ref": "sha256:196fb9ec355344d1ee5a7f61fc07d302b052cbd5fcbee089058153f1b0d57ea4",
+      "digest": "sha256:196fb9ec355344d1ee5a7f61fc07d302b052cbd5fcbee089058153f1b0d57ea4",
+      "kind": "video",
+      "media_type": "video/mp4",
+      "size_bytes": 6676545
+    },
+    "warnings": []
+  },
+  "execution_ms": 1038,
+  "calls": [
+    {
+      "run": "run-4fdd35ef6a29f578216f46b5/0",
+      "index": 0,
+      "function": "generate_ref2va_turbo",
+      "label": "Generating original 768p video",
+      "status": "succeeded",
+      "called_at_ms": 1792526850336,
+      "finished_at_ms": 1792526851092,
+      "memoized": true
+    }
+  ]
+}
