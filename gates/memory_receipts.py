@@ -378,7 +378,7 @@ def record(path, cell, number, state, substitute, summary, slim=""):
             gpu_measurements.append((measurements, executed, legacy))
             function = str(call.get("function") or call.get("target") or "").rsplit("/", 1)[-1].split("@", 1)[0].replace("-", "_")
             h3 = function in {"generate_ref2va_turbo", "generate_fl2va_turbo",
-                              "ref2va_turbo", "fl2va_turbo", "long_form"}
+                              "ref2va_turbo", "fl2va_turbo", "long_form", "motion_segment"}
             if h3 and len(executed) == 2:
                 group_executed = True
                 if group_required and slim:

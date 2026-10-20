@@ -319,8 +319,12 @@ class MemoryReceipts(unittest.TestCase):
         second = dict(proof, gpu=1, rank=1)
         memory["stats"]["proofs"] = [proof, second]
         memory["trace"] = trace + [dict(event, gpu=1, rank=1) for event in trace]
-        code, text = self.record(value, "2x8-h3", slim="slim")
-        self.assertEqual(code, 0, text)
+        # Current long_form invokes motion_segment directly; both current and
+        # direct-render H3 children need the same actual two-rank proof.
+        for function in ("generate_ref2va_turbo", "motion_segment"):
+            call["function"] = function
+            code, text = self.record(value, "2x8-h3", slim="slim")
+            self.assertEqual(code, 0, text)
         call["memoized"] = True
         self.assertIn("no-two-gpu-h3-execution", self.record(value, "2x8-h3", slim="slim")[1])
         call["memoized"] = False
