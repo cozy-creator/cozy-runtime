@@ -182,7 +182,7 @@ def is_device_oom(exc: BaseException) -> bool:
     if torch_error and name == "AcceleratorError":
         return getattr(exc, "error_code", None) == 2 or "out of memory" in text
     if type(exc).__module__ == "tensorfs.varena":  # a driver call of the plane's (run 10996)
-        return name == "CudaError" and "CUDA_ERROR_OUT_OF_MEMORY" in text
+        return is_varena_error(exc) and getattr(exc, "code", None) == "DEVICE_FULL"
     if not isinstance(exc, RuntimeError):
         return False
     if "NCCL" in text and "out of memory" in text:

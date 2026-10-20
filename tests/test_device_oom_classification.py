@@ -59,9 +59,11 @@ def test_torch_device_oom_is_still_recognized() -> None:
 def test_a_plane_driver_call_out_of_device_memory_is_a_device_oom() -> None:
     """Run 10996: the weight plane's own driver calls run out of device memory too."""
     errors = pytest.importorskip("tensorfs.varena")
-    exc = errors.CudaError("cuda driver: cuEventCreate failed with CUDA_ERROR_OUT_OF_MEMORY (2)")
+    exc = errors.VarenaError("cuEventCreate ran out of device memory")
+    exc.code, exc.sticky = "DEVICE_FULL", False
     assert classify(exc).code == DEVICE_OOM
-    other = errors.CudaError("cuda driver: cuMemMap failed with CUDA_ERROR_INVALID_VALUE (1)")
+    other = errors.VarenaError("cuMemMap rejected the arguments")
+    other.code, other.sticky = "INVALID", False
     assert not is_device_oom(other)
 
 
@@ -93,6 +95,6 @@ def test_varena_exhausted_is_capacity() -> None:
     """`tensorfs.varena.torch.Exhausted`, known by its module and name, fails the attempt as
     capacity; its `Unbound` is a weight bound to nothing, a fault."""
     varena = pytest.importorskip("tensorfs.varena.torch")
-    exhausted = varena.Exhausted(0, 1 << 20, "bind unet", varena.Stats((), (), 0))
+    exhausted = varena.Exhausted(0, 1 << 20, "bind unet", {}, ())
     assert classify(exhausted).code == MEMORY_EXHAUSTED
     assert classify(varena.Unbound("a weight binds to nothing")).code == "weight_unbound"
