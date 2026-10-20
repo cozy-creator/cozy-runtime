@@ -48,7 +48,7 @@ class Copy(msgspec.Struct, frozen=True, kw_only=True):
     seconds: float
     gbps: float
     ceiling: float
-    pct: float
+    pct: float | None
     link: str = ""
     busy_s: float = 0.0
     pin_s: float = 0.0

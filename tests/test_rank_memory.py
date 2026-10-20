@@ -24,6 +24,7 @@ from cozy_runtime.author import App, Context  # noqa: E402
 from cozy_runtime.author._invoke import Invocation, prepare, run_prepared  # noqa: E402
 from cozy_runtime.internal import request_memory, spawn  # noqa: E402
 from cozy_runtime.internal.executor import Executor, serve  # noqa: E402
+from cozy_runtime.internal.executor_replies import Copy as ReplyCopy  # noqa: E402
 from cozy_runtime.internal.executor_replies import Memory as ReplyMemory  # noqa: E402
 from cozy_runtime.internal.executor_replies import RankMemory  # noqa: E402
 from cozy_runtime.internal.parallel.group import RankGroup  # noqa: E402
@@ -32,6 +33,14 @@ from cozy_runtime.internal.seam import Channel  # noqa: E402
 
 class Empty(msgspec.Struct):
     pass
+
+
+def test_unmeasured_copy_ceiling_stays_null_on_the_wire() -> None:
+    copy = ReplyCopy(kind="disk", gpu=-1, bytes=16, seconds=0.1, gbps=0.0, ceiling=0.0, pct=None)
+    memory = ReplyMemory(copies=[copy])
+    decoded = msgspec.json.decode(msgspec.json.encode(memory), type=ReplyMemory)
+    assert decoded.copies[0].pct is None
+    assert request_memory.combined([decoded]).copies[0].pct is None
 
 
 @contextmanager
