@@ -16,6 +16,7 @@ import io
 import mmap
 import os
 import tempfile
+import threading
 from collections.abc import Buffer, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -41,12 +42,69 @@ type Data = Buffer | IO[bytes]
 type PartData = tuple[str, str, Sequence[int], Data]
 
 
+class Bearers:
+    """Each signer's newest bearer for each endpoint, as TensorD gives them (a Load's or Invoke's
+    own, or a `bearer` frame): a bearer only ever goes to the endpoint it was given for. Of two,
+    the one that expires later stands; an unknown expiry (0) always replaces."""
+
+    def __init__(self) -> None:
+        self._latest: dict[tuple[str, str], tuple[str, int]] = {}
+        self._lock = threading.Lock()
+
+    def note(self, actor: str, endpoint: str, token: str, expires_unix_ms: int) -> None:
+        with self._lock:
+            held = self._latest.get((actor, endpoint))
+            if held is None or expires_unix_ms == 0 or held[1] <= expires_unix_ms:
+                self._latest[(actor, endpoint)] = (token, expires_unix_ms)
+
+    def offer(self, actor: str, endpoint: str, token: str, expires_unix_ms: int) -> None:
+        """`token` if none came for its key: a call's own bearer never replaces a newer one."""
+        with self._lock:
+            self._latest.setdefault((actor, endpoint), (token, expires_unix_ms))
+
+    def latest(self, actor: str, endpoint: str) -> str:
+        held = self._latest.get((actor, endpoint))
+        return "" if held is None else held[0]
+
+
+@dataclass(frozen=True, slots=True)
+class Bearer:
+    """One call's TensorFS `token=` provider: its signer's newest bearer for its endpoint, asked
+    for every request's header, so a call that outlives its bearer keeps working once TensorD
+    sends a newer one. A 401 for a bearer replaced while it was in flight is asked once more."""
+
+    bearers: Bearers
+    actor: str
+    endpoint: str
+    own: str = field(repr=False)
+
+    def _current(self) -> str:
+        return f"Bearer {self.bearers.latest(self.actor, self.endpoint) or self.own}"
+
+    def headers(
+        self, method: str, url: str, headers: Mapping[str, str], payload: str | None
+    ) -> dict[str, str]:
+        return {"authorization": self._current()}
+
+    def retry(
+        self,
+        method: str,
+        url: str,
+        headers: Mapping[str, str],
+        payload: str | None,
+        status: int,
+        response_headers: Mapping[str, str],
+    ) -> bool:
+        sent = next((v for k, v in headers.items() if k.lower() == "authorization"), "")
+        return status == 401 and sent != self._current()
+
+
 @dataclass(frozen=True, slots=True)
 class Connection:
-    """The request's TensorFS endpoint and its already supplied bearer credential."""
+    """The request's TensorFS endpoint and its bearer, when it was supplied one."""
 
     endpoint: str | None = None
-    token: str | None = field(default=None, repr=False)
+    token: str | Bearer | None = field(default=None, repr=False)
 
 
 def open_checkpoint(store: Path, ref: str, connection: Connection | None = None) -> Checkpoint:

@@ -30,10 +30,20 @@ class TensorFSOptions(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=T
 
     endpoint: str
     token: str | None = None
+    #: when `token` expires (0: unknown)
+    expires_unix_ms: int = 0
     ca_der: str | None = None
 
     def __repr__(self) -> str:
         return f"TensorFSOptions(endpoint={self.endpoint!r}, token=<redacted>)"
+
+
+class Supplied(msgspec.Struct, frozen=True, kw_only=True):
+    """A signer's bearer for one endpoint, read off the seam in order (`Mux`): a `bearer` frame
+    (TensorD's newer one, unanswered) or what a Load or Invoke carries."""
+
+    actor: str = ""
+    tensorfs: TensorFSOptions | None = None
 
 
 class Hello(Command, frozen=True, kw_only=True, tag="hello"):
@@ -241,6 +251,8 @@ class Load(Command, frozen=True, kw_only=True, tag="load"):
 
     construction: str
     tensorfs: TensorFSOptions | None = None
+    #: the signer whose bearer `tensorfs` carries
+    actor: str = ""
     devices: str = ""
     sequence_parallel_degree: int = 1
     #: the pin of the request this executor loads for (`LOAD_ATTENTION_PIN`)
