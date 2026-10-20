@@ -46,7 +46,7 @@ permissions:
 
 # A newer push to the same ref replaces a build still running; a caller's build is its own.
 concurrency:
-  group: kernels-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  group: kernels-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: true
 
 jobs:
