@@ -10,6 +10,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 import tensorfs  # noqa: E402
+from cozy_runtime.graphs import capture  # noqa: E402
 from tensorfs.varena.torch import Block, Declared, Memory, Source  # noqa: E402
 from torch import Tensor, nn  # noqa: E402
 
@@ -101,5 +102,96 @@ def test_native_refill_does_not_hold_python_memory_lock(tmp_path: Path) -> None:
     finally:
         if thread.ident is not None:
             thread.join(timeout=15)
+        memory.close()
+        ck.close()
+
+
+@pytest.mark.real_gpu
+def test_refused_capture_preserves_cache_held_common_for_eager_fallback(tmp_path: Path) -> None:
+    """A failed setup owns no part of the graph cache's pre-existing bindings."""
+    assert torch.cuda.device_count() == 1
+
+    class Weighted(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.empty(2, 2))
+
+        def forward(self, value: Tensor) -> Tensor:
+            return value @ self.weight
+
+    class Nested(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.bias = nn.Parameter(torch.empty(2))
+            self.body = nn.Sequential(Weighted(), Weighted())
+
+        def forward(self, value: Tensor) -> Tensor:
+            return self.body(value) + self.bias
+
+    writer = tensorfs.Writer(cache_dir=tmp_path)
+    component = writer.component("nested", cls="", config={})
+    component.put("bias", torch.tensor([1.0, 2.0]))
+    component.put("body.0.weight", 2 * torch.eye(2))
+    component.put("body.1.weight", 3 * torch.eye(2))
+    ck = writer.commit()
+    with torch.device("meta"):
+        module = Nested()
+    module._varena = Declared(blocks=("body.0", "body.1"))
+    memory = Memory.open(torch.device("cuda", 0))
+    cache = memory.cache("capture-regression", lambda _need: 0)
+    try:
+        model = memory.load(module, ck=ck, component="nested")
+        value = torch.tensor([1.0, 2.0], device="cuda")
+        expected = torch.tensor([7.0, 14.0], device="cuda")
+        capture_stream, fallback_stream = torch.cuda.Stream(), torch.cuda.Stream()
+        with torch.no_grad(), memory.request("capture-held-common", plan=[model]):
+            assert torch.equal(module(value), expected)
+            hold = cache.hold(model)
+            try:
+                blocks = (model.common, *model.blocks)
+                held_counts = tuple(block.count for block in blocks)
+                assert all(count > 0 for count in held_counts)
+                assert model.common.regions and model.common.pins
+                assert all(block.stream is not None for block in blocks)
+                with cache.serving():
+                    graph, why = capture(
+                        torch, lambda: module(value), torch.cuda.graph_pool_handle(), capture_stream
+                    )
+                    if graph is not None:
+                        # Some native/CUDA versions permit their normal setup in capture.
+                        # This public measurement callback makes CUDA itself refuse setup
+                        # before this forward acquires common, while the real hold remains.
+                        del graph
+                        prior_measure = memory.measure
+                        memory.measure = torch.cuda.synchronize
+                        try:
+                            graph, why = capture(
+                                torch,
+                                lambda: module(value),
+                                torch.cuda.graph_pool_handle(),
+                                capture_stream,
+                            )
+                        finally:
+                            memory.measure = prior_measure
+                    assert graph is None and why, "the real CUDA capture must be refused"
+                    counts_after_refusal = tuple(block.count for block in blocks)
+                    streams_after_refusal = tuple(block.stream for block in blocks)
+                    # Execute fallback before checking bookkeeping: the old wheel reaches
+                    # wait_stream(None) here, just like the retained SDXL run12156.
+                    with torch.cuda.stream(fallback_stream):
+                        result = module(value)
+                    torch.cuda.current_stream().wait_stream(fallback_stream)
+                    assert torch.equal(result, expected)
+                    del result
+                assert counts_after_refusal == held_counts
+                assert all(stream is not None for stream in streams_after_refusal)
+                assert tuple(block.count for block in blocks) == held_counts
+            finally:
+                hold.close()
+            assert all(block.count == 0 and block.stream is None for block in blocks)
+            assert torch.equal(module(value), expected)
+            assert all(block.count == 0 and block.stream is None for block in blocks)
+    finally:
+        cache.close()
         memory.close()
         ck.close()
