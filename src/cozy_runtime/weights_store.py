@@ -184,11 +184,13 @@ class Output:
             )
         )
         self._components: dict[str, tensorfs.ComponentWriter] = {}
+        self._metadata: dict[str, tuple[str, dict[str, object]]] = {}
 
     def close(self) -> None:
         """Let the writer go; what it wrote stays for an attempt that resumes it."""
         self._writer = None
         self._components.clear()
+        self._metadata.clear()
 
     def __enter__(self) -> Output:
         return self
@@ -196,26 +198,44 @@ class Output:
     def __exit__(self, *_: object) -> None:
         self.close()
 
-    def component(self, name: str) -> tensorfs.ComponentWriter:
-        """Component `name`, with inherited class/config or empty metadata for a fresh output."""
+    def component(
+        self, name: str, *, cls: str | None = None, config: Mapping[str, object] | None = None
+    ) -> tensorfs.ComponentWriter:
+        """Component `name`, inheriting class/config unless explicitly supplied. Explicit
+        metadata also declares a new or renamed component of a derived output. Set it before
+        writing the component; changing metadata after a write is refused."""
+        declared = self.declared.get(name)
+        metadata = (
+            cls if cls is not None else declared.cls if declared is not None else "",
+            dict(config if config is not None else declared.config if declared is not None else {}),
+        )
         writer = self._components.get(name)
         if writer is not None:
+            if (cls is not None or config is not None) and self._metadata[name] != metadata:
+                raise CapabilityError(
+                    "set component metadata before writing its tensors or assets",
+                    code="weights_writer_metadata",
+                )
             return writer
         if self._writer is None:
             raise CapabilityError("the output is committed or closed", code="weights_writer_closed")
-        declared = self.declared.get(name)
-        if declared is None and not self._fresh:
+        if declared is None and not self._fresh and cls is None and config is None:
             raise CapabilityError(
                 f"no checkpoint this output derives from has a component {name!r}",
                 code="weights_output_component",
             )
-        writer = (
-            self._writer.component(name, cls="", config={})
-            if declared is None
-            else self._writer.component(name, cls=declared.cls, config=declared.config)
-        )
+        writer = self._writer.component(name, cls=metadata[0], config=metadata[1])
         self._components[name] = writer
+        self._metadata[name] = metadata
         return writer
+
+    def asset(self, component: str, name: str, data: Data) -> None:
+        """A component asset, counted against this output's granted new-byte bound."""
+        if self.done is not None:
+            return
+        with _view(data) as view:
+            self._spend(view.nbytes)
+            self.component(component).asset(name, view)
 
     def inherit(self, source: Checkpoint) -> None:
         """`source`'s pipeline and each component's class, config and assets, no tensor: what a

@@ -271,6 +271,75 @@ def test_a_closed_uncommitted_writer_resumes_its_saved_tensors(
     assert second.tobytes() == b"two"
 
 
+def test_explicit_output_metadata_overrides_and_adds_components_without_rewriting_sources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cozy_runtime.derive import Derivation, Output
+
+    store = home(tmp_path / "tensorfs", monkeypatch)
+    base = tensorfs.open(
+        checkpoint(store, {"model": {"w": np.arange(4, dtype=np.uint8)}},
+                   classes={"model": "Original"}, configs={"model": {"old": True}}),
+        cache_dir=store, local_files_only=True,
+    )  # fmt: skip
+    definition = Derivation(None, sources=(base,), order=(("renamed", "w"),))
+    ctx = context(store, "metadata", outputs={"model": 4})
+    with ctx.output("model", definition) as output:
+        assert isinstance(output, Output)
+        output.component("renamed", cls="Prepared", config={"architecture": "Example"})
+        output.copy("renamed", "w", base, from_component="model")
+        output.component("model", config={"normalized": True})
+        output.component("conditioning", cls="", config={})
+        output.put("conditioning", "constant", "U8", [4], b"data")
+        assert output.written == 4
+        with pytest.raises(CapabilityError, match="before writing"):
+            output.component("renamed", config={"changed": True})
+        artifact = ctx.adopt_model(output)
+    with tensorfs.open(artifact.checkpoint, cache_dir=store, local_files_only=True) as got:
+        assert got.components["renamed"].cls == "Prepared"
+        assert got.components["renamed"].config == {"architecture": "Example"}
+        assert got.components["model"].cls == "Original"
+        assert got.components["model"].config == {"normalized": True}
+        before = tensorfs.raw.parts(base, "model", "w")[""]
+        after = tensorfs.raw.parts(got, "renamed", "w")[""]
+        assert (before.chunk, before.offset, before.length) == (
+            after.chunk,
+            after.offset,
+            after.length,
+        )
+        constant = got.components["conditioning"].tensors.read("constant")
+        assert isinstance(constant, tensorfs.Array) and constant.tobytes() == b"data"
+    with ctx.output("model", definition) as replay:
+        assert replay.done is not None
+        replay.copy("renamed", "w", base, from_component="model")
+        replay.put("conditioning", "constant", "U8", [4], b"data")
+        assert replay.written == 0 and ctx.adopt_model(replay) == artifact
+
+
+def test_output_assets_share_the_tensor_byte_bound_and_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = home(tmp_path / "tensorfs", monkeypatch)
+    ctx = context(store, "asset", outputs={"model": 7})
+    definition = weights_store.Derivation(None)
+    with ctx.output("model", definition) as output:
+        output.component("model", cls="Prepared", config={})
+        output.asset("model", "LICENSE", b"abc")
+        output.put("model", "w", "U8", [4], b"data")
+        assert output.written == 7
+        artifact = ctx.adopt_model(output)
+    with tensorfs.open(artifact.checkpoint, cache_dir=store, local_files_only=True) as got:
+        assert got.components["model"].asset("LICENSE") == b"abc"
+    with ctx.output("model", definition) as replay:
+        replay.asset("model", "LICENSE", b"abc")
+        assert replay.written == 0 and ctx.adopt_model(replay) == artifact
+    with context(store, "asset-bound", outputs={"model": 6}).output("model", definition) as output:
+        output.asset("model", "LICENSE", b"abc")
+        with pytest.raises(CapabilityError) as refused:
+            output.put("model", "w", "U8", [4], b"data")
+        assert refused.value.code == "weights_output_bound"
+
+
 def test_a_raw_read_fills_only_the_requested_tensor_part(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
