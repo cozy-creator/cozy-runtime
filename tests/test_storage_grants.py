@@ -319,9 +319,8 @@ def test_a_destination_commits_each_output_under_its_private_tag(
         assert repo_id == repo and tree.startswith("sha256:")
         assert moved == (named or weights_store.tag(artifact.transaction))
         trees.append(tree)
-        with tensorfs.open(
-            repo, revision=moved, endpoint=origin, cache_dir=store, local_files_only=True
-        ) as tagged:
+        # A tag resolves through its endpoint: what it names now is the endpoint's to say.
+        with tensorfs.open(repo, revision=moved, endpoint=origin, cache_dir=store) as tagged:
             assert tagged.id == artifact.checkpoint
         with tensorfs.open(
             repo, revision=tree, endpoint=origin, cache_dir=store, local_files_only=True
