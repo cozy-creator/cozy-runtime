@@ -1317,8 +1317,10 @@ class Executor:
                 if spread:
                     # A pure method call whose one tensor result goes straight to rank 0.
                     output = getattr(component, str(command["method"]))(*args, **kwargs)
+                    head = wire.p2p_head(output)
+                    # From the header on, rank 0 reads this answer; before it, `send_nothing`.
                     answered = True
-                    wire.send_tensor(output, 0, self.pg)
+                    wire.send_tensor(output, head, 0, self.pg)
                 elif hosted:
                     call = component.get_submodule(str(command.get("module", "")))
                     result = wire.marshal(

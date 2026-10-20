@@ -218,7 +218,7 @@ def install_spread(
         local = getattr(component, method)
         if prepared[name][0]._cozy_active is None:
             # Outside a component scope no follower may stage it: run here.
-            yield from (local(*args) for args in arguments)
+            yield from (_one_tensor(local(*args)) for args in arguments)
             return
         # This call's decliners sit out its remaining rounds; the attempt's log sums calls.
         declined: dict[str, str] = {}
@@ -273,7 +273,7 @@ def install_spread(
                 spread = msgspec.structs.replace(command, method=method, p2p=True, spare=spare)
                 group.send_one(rank, msgspec.to_builtins(spread))
             index, args = batch[0]
-            finished[index] = getattr(component, method)(*args)
+            finished[index] = _one_tensor(getattr(component, method)(*args))
             calls["0"] = calls.get("0", 0) + 1
             for rank, index, args, _payloads in sent:
                 result = wire.recv_tensor(rank, group.pg, device)
@@ -293,6 +293,12 @@ def install_spread(
                 payloads.clear()
 
     object.__setattr__(component, "_cozy_spread", spread)
+
+
+def _one_tensor(result: Any) -> Any:
+    """A spread call's result here, held to the contract a follower's crosses under."""
+    wire.p2p_head(result)
+    return result
 
 
 class GroupPlacement:

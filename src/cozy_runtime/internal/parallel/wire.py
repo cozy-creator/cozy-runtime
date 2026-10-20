@@ -300,24 +300,35 @@ def unmarshal(value: Json, spool: TensorSpool | Broadcast, *, device: Any) -> ob
     return kind(**{k: unmarshal(v, spool, device=device) for k, v in envelope.v.items()})
 
 
-#: dtypes a point-to-point result may carry, by position in its header
-_P2P_DTYPES = ("float32", "float16", "bfloat16", "float64", "int64", "int32", "uint8", "bool")
+#: dtypes a point-to-point result may carry, by position in its header; its bytes cross as uint8
+_P2P_DTYPES: tuple[str, ...] = ("float32", "float16", "bfloat16", "float64", "int64", "int32")
+_P2P_DTYPES += ("uint8", "bool", "int8", "int16", "float8_e4m3fn", "float8_e5m2")
 _P2P_RANK = 8
 #: header codes for a call that sends no tensor: declined (the rank had no room) or failed
 _P2P_DECLINED = -1
 _P2P_FAILED = -2
 
 
-def send_tensor(tensor: Any, dst: int, pg: Any) -> None:
-    """One tensor to rank `dst` over the group: a fixed header (dtype, shape), then the data.
-    A decoded video clip is ~200 MB; the attempt spool would copy it through the host twice."""
+def p2p_head(value: Any) -> list[int]:
+    """`value`'s point-to-point header. A spread call returns one tensor (`author.spread`): the
+    same check on every rank of the group, before any byte is sent."""
+    dtype = str(getattr(value, "dtype", "")).removeprefix("torch.")
+    rank = getattr(value, "ndim", _P2P_RANK + 1)
+    if dtype not in _P2P_DTYPES or rank > _P2P_RANK:
+        raise UncrossableArgument(
+            f"a spread call returns one tensor of rank <= {_P2P_RANK}, not "
+            f"{type(value).__name__} {dtype}".rstrip()
+        )
+    return [_P2P_DTYPES.index(dtype), rank, *value.shape]
+
+
+def send_tensor(tensor: Any, head: list[int], dst: int, pg: Any) -> None:
+    """One tensor to rank `dst` over the group: its `p2p_head`, then its bytes. A decoded video
+    clip is ~200 MB; the attempt spool would copy it through the host twice."""
     import torch
 
-    dtype = str(tensor.dtype).removeprefix("torch.")
-    if dtype not in _P2P_DTYPES or tensor.ndim > _P2P_RANK:
-        raise UncrossableArgument(f"a {dtype} tensor of rank {tensor.ndim} has no p2p header")
-    _send_head([_P2P_DTYPES.index(dtype), tensor.ndim, *tensor.shape], dst, pg, tensor.device)
-    torch.distributed.send(tensor.contiguous(), dst=dst, group=pg)
+    _send_head(head, dst, pg, tensor.device)
+    torch.distributed.send(tensor.contiguous().reshape(-1).view(torch.uint8), dst=dst, group=pg)
 
 
 def send_nothing(dst: int, pg: Any, device: Any, *, failed: bool) -> None:
@@ -328,7 +339,7 @@ def send_nothing(dst: int, pg: Any, device: Any, *, failed: bool) -> None:
 def _send_head(head: list[int], dst: int, pg: Any, device: Any) -> None:
     import torch
 
-    head += [0] * (_P2P_RANK + 2 - len(head))
+    head = head + [0] * (_P2P_RANK + 2 - len(head))
     torch.distributed.send(torch.tensor(head, dtype=torch.int64, device=device), dst=dst, group=pg)
 
 
@@ -341,9 +352,10 @@ def recv_tensor(src: int, pg: Any, device: Any) -> Any:
     code, ndim, *shape = head.tolist()
     if code < 0:
         return None
-    out = torch.empty(shape[:ndim], dtype=getattr(torch, _P2P_DTYPES[code]), device=device)
-    torch.distributed.recv(out, src=src, group=pg)
-    return out
+    dtype = getattr(torch, _P2P_DTYPES[code])
+    raw = torch.empty(math.prod(shape[:ndim]) * dtype.itemsize, dtype=torch.uint8, device=device)
+    torch.distributed.recv(raw, src=src, group=pg)
+    return raw.view(dtype).reshape(shape[:ndim])
 
 
 class RunReply(msgspec.Struct, frozen=True):
