@@ -150,6 +150,8 @@ class Construction(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True
 class Start(Command, frozen=True, kw_only=True, tag="start"):
     #: The session's GPUs; empty runs on the CPU and never opens CUDA (`accelerator=False`).
     devices: str = ""
+    #: Machine-authorized ceiling; applied after ranks spawn, never by import-only parents.
+    authorized_device_limit_bytes: int | UnsetType = UNSET
     sequence_parallel_degree: int = 1
     application: str = ""
     package_interface: str = ""
@@ -237,6 +239,8 @@ class Load(Command, frozen=True, kw_only=True, tag="load"):
     TensorFS. The command names one model (`binding`) or several (`models`)."""
 
     construction: str
+    #: The same machine ceiling, including constructions without model slots.
+    authorized_device_limit_bytes: int | UnsetType = UNSET
     tensorfs: TensorFSOptions | None = None
     devices: str = ""
     sequence_parallel_degree: int = 1

@@ -762,6 +762,8 @@ class Executor:
         #: all their weights live (`tensorfs.varena.torch`).
         self.constructions: dict[str, Executor] = {}
         self.memory: Memory | None = None
+        #: HOST ONLY: a machine ceiling survives every construction and allocator remeasurement.
+        self.device_limit_bytes: int | None = None
         self.memory_requests: dict[str, MemoryRequest] = {}
         #: HOST ONLY: its GPUs' ledger memfds from `Start` (rank 0 hands follower r the r-th, a
         #: follower holds its own), and the machine's memory mode
@@ -939,6 +941,31 @@ class Executor:
 
     # ------------------------------------------------------------- the group (cr-068)
 
+    def _authorize_device_limit(self, value: int | UnsetType) -> None:
+        """Record authority without importing Torch or touching a device before rank spawn."""
+        if isinstance(value, UnsetType):
+            return
+        if isinstance(value, bool) or value <= 0:
+            raise SeamError("device_limit_invalid", "the machine's GPU memory limit must be positive")
+        previous = self.host.device_limit_bytes
+        self.host.device_limit_bytes = value if previous is None else min(previous, value)
+        if self.host.memory is not None:
+            self.host.memory.limit_bytes = self.host.device_limit_bytes
+
+    def _apply_device_limit(self, torch: Any) -> None:
+        limit = self.host.device_limit_bytes
+        if limit is None or self.device_kind != "cuda":
+            return
+        index = self.rank if self.world > 1 else 0
+        total = int(torch.cuda.get_device_properties(index).total_memory)
+        if total <= 0:
+            raise SeamError("device_limit_invalid", "the GPU reports no physical memory capacity")
+        effective = min(limit, total)
+        self.host.device_limit_bytes = effective
+        if self.host.memory is not None:
+            self.host.memory.limit_bytes = effective
+        torch.cuda.set_per_process_memory_fraction(effective / total, index)
+
     def _initialize_device(self, torch: Any) -> dict[str, Any] | None:
         """Runtime's ONE explicit accelerator init boundary, idempotent per process.
 
@@ -964,6 +991,7 @@ class Executor:
             )
             owner._startup_reported = True
         if self._device_ready:
+            self._apply_device_limit(torch)
             return None
         if accel.initialized(torch, self.device_kind):
             return {
@@ -978,6 +1006,9 @@ class Executor:
         accel.initialize(torch, self.device_kind)
         if self.world > 1 and self.device_kind == "cuda":
             torch.cuda.set_device(self.rank)
+        # The context exists only in this rank, after the fork/zygote boundary. Set the
+        # allocator ceiling before first_launches, package imports or weightless GPU work.
+        self._apply_device_limit(torch)
         accel.first_launches(torch, self.device_kind)
         accel.reset_peak(torch, self.device_kind)
         self.host.device_entry = entry
@@ -1611,6 +1642,7 @@ class Executor:
                     stage("torch_import")
                 if not command.import_only:
                     self.torch = torch
+                    self._authorize_device_limit(command.authorized_device_limit_bytes)
                     try:
                         refused = self._initialize_device(torch)
                     except RuntimeError as exc:
@@ -2232,6 +2264,9 @@ class Executor:
                 "code": "group_unformed",
                 "detail": "a group load needs a started process whose GPUs have joined",
             }
+        self._authorize_device_limit(command.authorized_device_limit_bytes)
+        if self.torch is not None and self._device_ready:
+            self._apply_device_limit(self.torch)
         if command.models is not UNSET:
             return self._prepare_many(command, command.models)
         single = command.single()
@@ -2502,7 +2537,7 @@ class Executor:
                         )
                     table, events, custody = host.ledgers[:3]
                     grant = (table, events, custody)
-                host.memory = Memory.open(device, grant)
+                host.memory = Memory.open(device, grant, limit_bytes=host.device_limit_bytes)
             except VarenaUnsupported as exc:  # no varena on this OS (Windows)
                 return {"ok": False, "code": "weight_plane_unavailable", "detail": str(exc)}
             host.memory.context = max(host.device_context, 0)
@@ -3252,6 +3287,8 @@ class Executor:
 
     def invoke(self, command: Invoke, prepared: PreparedRequest, slot: _Slot) -> dict[str, Any]:
         """ONE attempt through the author kernel, with the §3.4 freeze point held."""
+        if self.torch is not None:
+            self._apply_device_limit(self.torch)
         surface = self.surface_names[command.entrypoint]
         requested = _attention_pin(command.attention_kernel, command.bits)
         # A pin is the run's: a call holding no site in its scope runs its own selection,
@@ -4433,6 +4470,8 @@ class Executor:
                 "construction_not_loaded", f"{command.construction!r} is not loaded"
             )
         if self.memory is not None:
+            if self.torch is not None:
+                self._apply_device_limit(self.torch)
             for member in child.model_executors or [child]:
                 if member.backend is not None:
                     for model in member.backend.models.values():

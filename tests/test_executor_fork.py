@@ -179,9 +179,11 @@ def test_a_forked_child_is_a_sealed_executor_with_the_imports_done(
     zygote: tuple[subprocess.Popen[bytes], Channel, dict[str, Any]], tmp_path: Path
 ) -> None:
     process, channel, start = zygote
+    start = {**start, "authorized_device_limit_bytes": 6 << 30}
     hello = _call(channel, {"cmd": "hello"})
     assert "fork/1" in hello["capabilities"]
     assert _call(channel, {**start, "import_only": True})["ok"]
+    assert not _call(channel, {"cmd": "hello"})["torch_loaded"]
     listener = _listener(tmp_path / "a.sock")
     began = time.monotonic()
     forked = _fork(tmp_path, channel, "a")
