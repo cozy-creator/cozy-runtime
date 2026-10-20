@@ -654,7 +654,7 @@ class _OnDemand:
 
 
 #: The requests rank 0 relays to the machine for a follower (`_relay`).
-_RELAYED = frozenset({"read_grant", "model_source", "keep_pages"})
+_RELAYED = frozenset({"read_grant", "model_source", "keep_pages", "deposit"})
 
 #: The runtime modules a construction imports, named ONCE so `start` can warm
 #: exactly the set `_prepare_first` re-imports (cr-104). Warming a name this tuple omits
@@ -4288,19 +4288,31 @@ class Executor:
         self, manifest: str, layout: str, objects: list[tuple[str, int]]
     ) -> tuple[int | None, list[tuple[str, int, int]], list[tuple[int, int]], str]:
         """One weight set's bytes from the machine (`ReadGrant`): the host layout deposited for
-        `layout`, with the GPU pages a gone executor kept of it `(region, fd)` and what they hold,
-        or the chunk files of `objects` (`(sha256, length)` in sha256 order, as the header names
-        them), each `(sha256, length, fd)`; the fds are the caller's to close."""
-        answer = self._durable(ReadGrant(manifest=manifest, layout=layout, rank=self.rank), Granted)
+        `layout`, with the GPU pages a gone executor kept of it `(region, fd)` and what they hold
+        (or, while its sealer still fills it, with the chunk files too), or the chunk files of
+        `objects` (`(sha256, length)` in sha256 order, as the header names them), each
+        `(sha256, length, fd)`; the fds are the caller's to close."""
+        request, pause = ReadGrant(manifest=manifest, layout=layout, rank=self.rank), 0.01
+        answer = self._durable(request, Granted)
+        # Another process seals this layout: its deposit lands as soon as it opens it, so this
+        # one waits for that one copy instead of sealing a second (2x8, 12129).
+        while answer.code == "layout_sealing":
+            time.sleep(pause)
+            pause = min(pause * 2, 0.25)
+            answer = self._durable(request, Granted)
         # Held: TensorD's first descriptor is the sealed layout an executor deposited, adopted
         # as it is. No chunk list names it (memory-varena §5.4, D9's refill).
-        if answer.ok and answer.held and len(answer.fds) == 1 + len(answer.pages):
+        complete = answer.ok and answer.held and not answer.objects_sha256
+        if complete and len(answer.fds) == 1 + len(answer.pages):
             pages = [(p.region, fd) for p, fd in zip(answer.pages, answer.fds[1:], strict=True)]
             return answer.fds[0], [], pages, answer.fingerprint
+        # Held while its sealer fills it: the layout, then the chunk files, read only for
+        # regions a sealer that dies never fills.
+        held = 1 if answer.held else 0
         if (
             not answer.ok
-            or answer.held
-            or len(answer.fds) != len(objects)
+            or answer.pages
+            or len(answer.fds) != held + len(objects)
             or answer.objects_sha256 != _objects_sha256(objects)
         ):
             for fd in answer.fds:
@@ -4310,8 +4322,9 @@ class Executor:
                 f"chunks ({answer.code or 'a different list'})",
                 code="weights_ungranted",
             )
-        files = [(sha, length, fd) for (sha, length), fd in zip(objects, answer.fds, strict=True)]
-        return None, files, [], ""
+        chunks = answer.fds[held:]
+        files = [(sha, length, fd) for (sha, length), fd in zip(objects, chunks, strict=True)]
+        return (answer.fds[0] if held else None), files, [], ""
 
     def _keep_pages(self, layout: str, fingerprint: str, pages: list[tuple[int, int, int]]) -> None:
         """GPU pages varena kept here go to the machine, which holds them past this process

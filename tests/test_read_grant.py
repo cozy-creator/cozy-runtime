@@ -35,12 +35,12 @@ def checkpoint(tmp_path: Path) -> tuple[tensorfs.Store, str, list[tuple[str, int
 
 @contextmanager
 def grants(
-    tmp_path: Path, store: tensorfs.Store, deposited: dict[str, int]
+    tmp_path: Path, store: tensorfs.Store, deposited: dict[str, int], **peer: object
 ) -> Iterator[tuple[Executor, list[str]]]:
     left, right = socket.socketpair()
     asked: list[str] = []
     serving = threading.Thread(
-        target=answer_read_grants, args=(Channel(right), store, deposited, asked)
+        target=answer_read_grants, args=(Channel(right), store, deposited, asked), kwargs=peer
     )
     serving.start()
     try:
@@ -59,6 +59,40 @@ def test_a_held_layout_is_the_one_descriptor_mapped_as_it_is(tmp_path: Path, che
             fd, files, pages, _ = executor._read_grant(manifest, "sha256:held", objects)
             assert files == [] == pages and fd is not None and asked == ["sha256:held"]
             assert os.pread(fd, 64, 0) == b"a host layout varena sealed in another executor"
+            os.close(fd)
+    finally:
+        os.close(layout)
+
+
+def test_a_layout_another_process_seals_is_asked_again_until_its_one_copy_is_deposited(
+    tmp_path: Path, checkpoint
+) -> None:
+    store, manifest, objects = checkpoint
+    layout = sealed("layout", b"sealed by GPU 0 while GPU 1 asked")
+    try:
+        peer = {"sealing": {"sha256:s": 2}}
+        with grants(tmp_path, store, {"sha256:s": layout}, **peer) as (executor, asked):
+            fd, files, pages, _ = executor._read_grant(manifest, "sha256:s", objects)
+            assert fd is not None and files == [] == pages
+            assert asked == ["sha256:s"] * 3, "two sealing answers, then the deposit"
+            os.close(fd)
+    finally:
+        os.close(layout)
+
+
+def test_a_layout_still_filling_comes_with_the_chunk_files_its_regions_fall_back_to(
+    tmp_path: Path, checkpoint
+) -> None:
+    store, manifest, objects = checkpoint
+    layout = sealed("layout", b"opened, its sealer still filling it")
+    try:
+        peer = {"filling": frozenset({"sha256:f"})}
+        with grants(tmp_path, store, {"sha256:f": layout}, **peer) as (executor, _):
+            fd, files, pages, _ = executor._read_grant(manifest, "sha256:f", objects)
+            assert fd is not None and pages == [] and [(s, n) for s, n, _ in files] == objects
+            assert os.pread(fd, 64, 0) == b"opened, its sealer still filling it"
+            for _, _, file in files:
+                os.close(file)
             os.close(fd)
     finally:
         os.close(layout)

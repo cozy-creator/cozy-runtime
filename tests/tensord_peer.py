@@ -161,29 +161,49 @@ def answer_model_sources(channel: seam.Channel, store: tensorfs.Store, asked: li
 
 
 def answer_read_grants(
-    channel: seam.Channel, store: tensorfs.Store, deposited: Mapping[str, int], asked: list[str]
+    channel: seam.Channel,
+    store: tensorfs.Store,
+    deposited: Mapping[str, int],
+    asked: list[str],
+    sealing: dict[str, int] | None = None,
+    filling: frozenset[str] = frozenset(),
 ) -> None:
     """The machine's half of an executor's `read_grant` requests, as `Callbacks::read_grant`
     (crates/tensord/src/gpu_service.rs) answers them, field for field as its `Answer` serializes:
     the layout deposited for `layout` (`deposited`: layout -> sealed memfd), read-only, as the one
-    descriptor (`held`); else every chunk of the checkpoint in sha256 order with
-    `objects_sha256`, the digest `deposits::objects_digest` names them by. `asked` records each
-    layout."""
+    descriptor (`held`), followed by every chunk while its sealer still fills it (`filling`);
+    else every chunk of the checkpoint in sha256 order with `objects_sha256`, the digest
+    `deposits::objects_digest` names them by. A layout another call seals answers
+    `layout_sealing` as many times as `sealing` says. `asked` records each layout."""
+    sealing = {} if sealing is None else sealing
     while (frame := channel.recv()) is not None:
         if frame.get("event") != "request" or frame.get("kind") != "read_grant":
             continue
         asked.append(frame["layout"])
         answer = {"event": "answer", "seq": frame["seq"], "ok": True, "code": "", "detail": ""}
         answer |= {"sha256": "", "length": 0}
+        if sealing.get(frame["layout"], 0) > 0:
+            sealing[frame["layout"]] -= 1
+            channel.send(answer | {"ok": False, "code": "layout_sealing", "held": False})
+            continue
+        ck = store.checkpoint(frame["manifest"])
+        objects = sorted(ck.chunks)
+        lines = "".join(f"{sha}:{length}\n" for sha, length in objects)
+        digest = hashlib.sha256(lines.encode()).hexdigest()
+        chunks = [os.open(blob(store, sha), os.O_RDONLY) for sha, _ in objects]
         if (layout := deposited.get(frame["layout"])) is not None:
             fds = [os.open(f"/proc/self/fd/{layout}", os.O_RDONLY)]
-            channel.send(answer | {"held": True, "descriptors": 1})
+            if frame["layout"] in filling:
+                fds += chunks
+                channel.send(
+                    answer | {"held": True, "descriptors": len(fds), "objects_sha256": digest}
+                )
+            else:
+                for fd in chunks:
+                    os.close(fd)
+                channel.send(answer | {"held": True, "descriptors": 1})
         else:
-            ck = store.checkpoint(frame["manifest"])
-            objects = sorted(ck.chunks)
-            lines = "".join(f"{sha}:{length}\n" for sha, length in objects)
-            fds = [os.open(blob(store, sha), os.O_RDONLY) for sha, _ in objects]
-            digest = hashlib.sha256(lines.encode()).hexdigest()
+            fds = chunks
             channel.send(
                 answer | {"held": False, "descriptors": len(fds), "objects_sha256": digest}
             )
