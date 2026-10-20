@@ -284,9 +284,10 @@ def movement_evidence(stats, events, executed, require_bound=True):
             errors.append("invalid-copy-identity")
             valid = False
             continue
+        # H2D retains source-page-cache counts too; those bytes still crossed to the GPU.
         cached, staged = row.get("cached"), row.get("staged")
         if (not integer(cached) or not integer(staged) or cached > size or staged > size
-                or (kind != "disk" and cached) or (kind == "zero" and staged)):
+                or (kind == "zero" and (cached or staged))):
             errors.append("invalid-copy-byte-counts")
             valid = False
             continue

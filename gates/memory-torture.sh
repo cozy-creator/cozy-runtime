@@ -362,17 +362,18 @@ PY
       (cd baseline && RECORD_MODE="" && { [ -n "$SLIM" ] || TAG=$TAG-baseline; } && pass "$card")
     else say "card $card: the baseline wheel did not install: $(tail -c 300 "update-$card-baseline.log")"; fi
   fi
-  if { [ "$W" != - ] || [ -n "$BW" ]; } && ! update "$W" "$TFS" "$card" "$TD"; then
-    say "card $card: the wheel did not install: $(tail -c 300 "update-$card.log")"; FAILED=$((FAILED + 1)); release; return
-  fi
-  # Install the matched control before asking it to enforce a cap. Legacy workers
-  # can update the full binary, but do not implement --gpu-memory-limit themselves.
+  local limit=""
   if { [ -n "$ON" ] && [ -z "$CONTROL" ]; } || [ -n "$SUBST" ]; then
-    if ! cozy machine update "$M" --gpu-memory-limit "${GIB[$card]}GiB" --tensorhub "$H" > "cap-$card.log" 2>&1 ||
-        ! capped "${GIB[$card]}" "${gpus:-1}"; then
-      say "card $card: requested cap on $M is not in force: $(tail -c 300 "cap-$card.log")"
-      FAILED=$((FAILED + 1)); release; return
-    fi
+    limit=${GIB[$card]}GiB
+  fi
+  # One update carries the exact candidate artifacts AND cap. A cap-only request is
+  # supported, but a supplied development cohort must never depend on Hub defaults.
+  if { [ "$W" != - ] || [ -n "$BW$limit" ]; } && ! update "$W" "$TFS" "$card" "$TD" "$limit"; then
+    say "card $card: the cohort/cap did not install: $(tail -c 300 "update-$card.log")"; FAILED=$((FAILED + 1)); release; return
+  fi
+  if [ -n "$limit" ] && ! capped "${GIB[$card]}" "${gpus:-1}"; then
+    say "card $card: requested cap on $M is not in force: $(tail -c 300 "update-$card.log")"
+    FAILED=$((FAILED + 1)); release; return
   fi
   pass "$card"
   if [ -n "${AFTER[$card]:-}" ]; then
@@ -386,8 +387,8 @@ PY
 update() {  # update <runtime wheel|-> <tensorfs wheel> <name>: install the wheels, or (-) the Hub's target, on $M
   local w=$1 t=$2
   [ "$w" = - ] && w="" t=""
-  local td=${4:-}
-  cozy machine update "$M" ${td:+--tensord "$td"} ${w:+--runtime-wheel "$w"} ${t:+--tensorfs-wheel "$t"} --tensorhub "$H" > "update-$3.log" 2>&1
+  local td=${4:-} limit=${5:-}
+  cozy machine update "$M" ${td:+--tensord "$td"} ${w:+--runtime-wheel "$w"} ${t:+--tensorfs-wheel "$t"} ${limit:+--gpu-memory-limit "$limit"} --tensorhub "$H" > "update-$3.log" 2>&1
 }
 
 pass() {  # every cell of card $1 on $M, into the current directory

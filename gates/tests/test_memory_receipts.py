@@ -491,6 +491,18 @@ class MemoryReceipts(unittest.TestCase):
         del value["calls"][0]["measurements"]["memory"]["stats"]["copies"]
         self.assertIn("missing-copy-evidence", self.record(value, slim="slim")[1])
 
+    def test_actual_cached_source_h2d_still_counts_full_gpu_traffic(self):
+        # Unchanged measured copy row from completed Qwen run12339.
+        row = dict(busy_s=0.213815299, bytes=1574511360, cached=1574511360,
+                   ceiling=28.02, gbps=14.71, gpu=0, kind="h2d", link="Gen4 x16 of Gen5 x16",
+                   pct=52.5, pin_s=0.0, seconds=0.107011593, staged=1574511360)
+        proof, trace = proof_and_trace([1], {1: row["bytes"]}, 2_000_000_000)
+        errors, facts = API["movement_evidence"]({"copies": [row], "proofs": [proof]}, trace, {0}, True)
+        self.assertEqual(errors, [])
+        self.assertEqual(facts["h2d_bytes"], row["bytes"])
+        self.assertEqual(facts["cached_bytes"], 0)  # no duplicate disk-byte credit
+        self.assertEqual(facts["percentages"], ["h2d@0:52.5%"])
+
     def test_real_copy_percent_is_reported_but_does_not_invent_a_minimum(self):
         value = slim_positive()
         memory = value["calls"][0]["measurements"]["memory"]
