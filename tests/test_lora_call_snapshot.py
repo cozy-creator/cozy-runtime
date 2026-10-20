@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+import inspect
 import threading
 import weakref
 from pathlib import Path
@@ -16,10 +17,55 @@ from tensorfs.varena.torch import Declared, Memory, Unbound  # noqa: E402
 
 from cozy_runtime import graphs  # noqa: E402
 from cozy_runtime.internal.fill import Checkpoint  # noqa: E402
-from cozy_runtime.internal.weights import _Bakes  # noqa: E402
+from cozy_runtime.internal.weights import _Bakes, _forward_arguments  # noqa: E402
 
 BASE = [[1.0, 2.0], [3.0, 4.0]]
 EXPECTED = {None: BASE, "A": [[3.0, 2.0], [6.0, 4.0]], "B": [[1.0, 7.0], [3.0, 11.0]]}
+
+
+def test_actual_h3_named_and_positional_selector_ignore_wrapped_instance_forward() -> None:
+    diffusers = pytest.importorskip("diffusers")
+    root = diffusers.MiniMaxH3Transformer3DModel(
+        num_attention_heads=1,
+        attention_head_dim=8,
+        hidden_size=8,
+        num_layers=2,
+        num_refiner_layers=1,
+        ffn_dim=16,
+        in_channels=2,
+        audio_in_channels=2,
+        patch_size=(1, 1, 1),
+        text_dim=8,
+        freq_dim=4,
+        time_embed_hidden_dim=8,
+        time_embed_dim=4,
+        rope_freq_dim=1,
+    )
+    signature = inspect.signature(type(root).forward)
+    declared = root.forward
+
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+        return declared(*args, **kwargs)
+
+    root.forward = wrapped
+    graphs.install(torch, object(), {"net": root})
+    selector = {"source": "immutable-source"}
+    named = {
+        p.name: object()
+        for p in tuple(signature.parameters.values())[1:]
+        if p.default is inspect.Parameter.empty
+        and p.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+    }
+    named["attention_kwargs"] = selector
+    assert _forward_arguments(root, (), named)["attention_kwargs"] is selector
+    positional = []
+    for parameter in tuple(signature.parameters.values())[1:]:
+        if parameter.name == "attention_kwargs":
+            positional.append(selector)
+            break
+        assert parameter.kind != inspect.Parameter.KEYWORD_ONLY
+        positional.append(named.get(parameter.name, parameter.default))
+    assert _forward_arguments(root, tuple(positional), {})["attention_kwargs"] is selector
 
 
 class Factors(torch.nn.Module):  # type: ignore[misc]
