@@ -3906,7 +3906,8 @@ class Executor:
             )
         elif command.phase == "plan":
             if state.request is not None:
-                state.request.plan(command.steps)
+                target = self.constructions.get(command.construction, self)
+                state.request.plan(target._memory_steps(command.steps))
         else:
             self.host._rank_request = None
             state.context.__exit__(None, None, None)
@@ -3980,10 +3981,34 @@ class Executor:
                     # refusal, not an absent state on another rank, remains the failure.
                     self.group.call(executor_commands.encode(command))
 
+    def _memory_steps(self, steps: Sequence[str | Collection[str]]) -> list[Any]:
+        """Resolve labels within this construction, never another tenant's loaded models."""
+        models: dict[str, list[Any]] = {}
+        for member in self.model_executors or [self]:
+            if member.backend is None:
+                continue
+            for name, model in member.backend.models.items():
+                models.setdefault(name, []).append(model)
+                if member._group_model_key:
+                    models.setdefault(f"{member._group_model_key}.{name}", []).append(model)
+
+        def resolve(name: str) -> Any:
+            candidates = models.get(name, [])
+            if len(candidates) > 1:
+                raise InvalidRequest(
+                    f"ambiguous memory-plan model {name!r}", code="memory_plan_ambiguous"
+                )
+            return candidates[0] if candidates else name
+
+        return [
+            resolve(step) if isinstance(step, str) else [resolve(name) for name in step]
+            for step in steps
+        ]
+
     def _plan_request(self, request_id: str, steps: Sequence[str | Collection[str]]) -> None:
         request = self.host.memory_requests.get(request_id)
         if request is not None:
-            request.plan(list(steps))
+            request.plan(self._memory_steps(steps))
         if self.group is not None:
             normalized = tuple(
                 (step,) if isinstance(step, str) else tuple(sorted(step)) for step in steps
