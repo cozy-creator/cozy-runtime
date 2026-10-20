@@ -51,6 +51,14 @@ jobs:
     env:
       WHEELS: ${{ inputs.build == 'wheels' }}
     steps:
+      # Bootstrap access belongs to the trusted workflow revision, not the source under test.
+      # Older or newer product refs need not carry this CI helper.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: workflow
+          sparse-checkout: scripts/prepare-release-source-access.sh
+          sparse-checkout-cone-mode: false
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref }}
@@ -66,7 +74,7 @@ jobs:
       - name: TensorFS read access (an arm runner builds TensorFS from its tag)
         env:
           TENSORFS_KEY: ${{ secrets.TENSORFS_READ_KEY }}
-        run: bash source/scripts/prepare-release-source-access.sh
+        run: bash workflow/scripts/prepare-release-source-access.sh
       # An arm runner builds the locked TensorFS from its tag until TensorFS publishes aarch64 wheels.
       - working-directory: source
         run: |
