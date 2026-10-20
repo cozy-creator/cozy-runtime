@@ -175,7 +175,7 @@ def normalize(payload: object) -> RequestFeatures:
         if (axis := AXIS_FIELDS.get(node.name)) is not None and isinstance(value, int):
             values[axis] = value
         shape = node.marker(Shape)
-        if shape is not None and value is not None:
+        if shape is not None and (value is not None or None in shape.table_keys()):
             values.update(shape.resolve(value))
         if isinstance(value, (list, tuple)) and any(
             isinstance(item, (Asset, AssetInputValue)) for item in value
