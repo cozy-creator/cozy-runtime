@@ -8,19 +8,6 @@
   "status": "completed",
   "cancel_requested": false,
   "machine_state": "running",
-  "output": [
-    {
-      "id": "12373/video",
-      "name": "video",
-      "index": 0,
-      "rev": 1,
-      "length": 6676545,
-      "media_type": "video/mp4",
-      "status": "completed",
-      "sha256": "sha256:196fb9ec355344d1ee5a7f61fc07d302b052cbd5fcbee089058153f1b0d57ea4",
-      "path": "/home/fidika/cozy_v2/outputs/varena-slim-gpu/kaeya-prepared-30ea-af-e1edf-20261020T185956Z/runs/h3ref5-ae7-cold-assets/12373-video.mp4"
-    }
-  ],
   "created_at_ms": 1792526820978,
   "accepted_at_ms": 1792526824884,
   "settled_at_ms": 1792526851394,
