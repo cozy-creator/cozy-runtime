@@ -32,6 +32,8 @@ from pathlib import Path
 from typing import Any, NoReturn
 
 from cozy_runtime.internal import accel, canonical
+from cozy_runtime.internal.encoding.adapters import CoreDequant
+from cozy_runtime.internal.encoding.comfy import ComfyDequant
 from cozy_runtime.internal.encoding.formats import (
     Encoded,
     Int8ConvRotDequant,
@@ -248,7 +250,7 @@ class RuntimeIdentity:
 #: the worker and the author surface are not, because they cannot change a measurement.
 IDENTITY_SOURCES = (
     "internal/encoding/comfy.py",
-    "internal/encoding/vectors/comfy.json",
+    "internal/encoding/vectors/cases/comfy.json",
     "internal/encoding/formats.py",
     "internal/encoding/leaves.py",
     "internal/encoding/selection.py",
@@ -536,8 +538,6 @@ def launch_providers() -> dict[str, tuple[Provider, ...]]:
     """Scheme -> its candidate providers. Their order decides nothing: `resolution.py` picks
     among qualified records."""
     out: dict[str, list[Provider]] = {}
-    from cozy_runtime.internal.encoding.comfy import ComfyDequant
-
     builds: tuple[Callable[[str], Provider], ...] = (
         Verbatim,
         TensorwiseDequant,
@@ -549,6 +549,7 @@ def launch_providers() -> dict[str, tuple[Provider, ...]]:
         Nvfp4NativeLeaf,
         MicroScaledDequant,
         MicroScaledNativeLeaf,
+        CoreDequant,
         ComfyDequant,
     )
     for build in builds:

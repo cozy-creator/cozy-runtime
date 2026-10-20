@@ -125,6 +125,7 @@ def test_an_attempt_records_its_gpu_setup_and_every_step(executor: Executor) -> 
     boot = execution["executor"]
     assert "package_import" in boot["legs_ms"] and boot["started_unix_ms"] * 1000 < gpu["start_us"]
     assert set(execution["construction"]) >= {"prepared_unix_ms", "prepare_ms", "legs_ms"}
+    assert execution["plan"] == {}  # by model binding path; this package binds no model
 
     attribution = reply["attribution"]
     condition = attribution["stages"]["condition"]

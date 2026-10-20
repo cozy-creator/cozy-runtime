@@ -122,6 +122,12 @@ class ComfyDequant:
         return ""
 
     def decode(self, torch: ModuleType, parts: Mapping[str, Tensor], destination: Tensor) -> None:
+        if destination.device.type not in ("cpu", "cuda"):
+            # TensorFS decodes on the host or on CUDA; any other device (MPS) decodes on the host.
+            host = torch.empty_like(destination, device="cpu")
+            self.decode(torch, {role: part.cpu() for role, part in parts.items()}, host)
+            destination.copy_(host)
+            return
         dtype, shape, _ = _descriptor(destination)
         raw.decode_into(
             self.encoding,

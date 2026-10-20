@@ -58,6 +58,8 @@ from cozy_runtime.author._loader import TENSORFS_DTYPES
 from cozy_runtime.author._numeric import within, worst
 from cozy_runtime.derive.microscale import encode_nvfp4
 from cozy_runtime.internal import accel, canonical
+from cozy_runtime.internal.decode_cores import Cores
+from cozy_runtime.internal.decode_schemes import run, sample
 from cozy_runtime.internal.encoding import (
     TORCH_DTYPES,
     Capabilities,
@@ -71,6 +73,7 @@ from cozy_runtime.internal.encoding import (
     implementation_digest,
     measure_runtime,
 )
+from cozy_runtime.internal.encoding.adapters import CoreDequant
 from cozy_runtime.internal.encoding.formats import (
     E2M1_VALUES,
     E8M0_NAN,
@@ -264,7 +267,7 @@ def _eps(torch: Any, dtype: Any) -> float:
 
 
 def _numerics(torch: Any, provider: Provider, device: Any, dtype: Any) -> Sweep:
-    """All 256 E4M3 patterns under one f32 scale: the decode is `round_L(weight x scale)`, the
+    """All 256 E4M3 patterns under one f32 scale: the decode is `round_L(weight * scale)`, the
     scale entering exactly, so it must equal the f64 product cast once into the dtype."""
     data = torch.frombuffer(bytearray(bytes(range(256))), dtype=torch.uint8)
     data = data.view(torch.float8_e4m3fn).reshape(16, 16)
@@ -384,7 +387,7 @@ def _numerics_int8_rowwise(
 def _numerics_int8_tensorwise(
     torch: ModuleType, provider: Provider, device: Tensor, dtype: Tensor
 ) -> Sweep:
-    """Every int8 value under one f32 scale: the decode is `round_L(weight x scale)`, the scale
+    """Every int8 value under one f32 scale: the decode is `round_L(weight * scale)`, the scale
     entering exactly, so it must equal the f64 product cast once into the dtype."""
     data = (torch.arange(256) - 128).to(torch.int8).reshape(16, 16)
     scale = torch.tensor(0.0123, dtype=torch.float32)
@@ -405,8 +408,11 @@ def _comfy_fixture(
     """
     h4 = ((1, 1, 1, -1), (1, 1, -1, 1), (1, -1, 1, 1), (-1, 1, 1, 1))
     assert tuple(sum(row) for row in h4) == (2, 2, 2, 2)
-    assert all(sum(a * b for a, b in zip(left, right, strict=True)) == (4 if i == j else 0)
-               for i, left in enumerate(h4) for j, right in enumerate(h4))
+    assert all(
+        sum(a * b for a, b in zip(left, right, strict=True)) == (4 if i == j else 0)
+        for i, left in enumerate(h4)
+        for j, right in enumerate(h4)
+    )
     params = dict(provider.params)
     if provider.supports(shape, params):
         raise AssertionError("the Comfy synthetic fixture must fit its bound descriptor")
@@ -432,10 +438,13 @@ def _comfy_fixture(
         weight = torch.full((rows, columns // 2), -103, dtype=torch.int8, device=device)
     elif provider.encoding == "comfy.w6a8_int8":
         # Split planes: low nibble1 | (high2 << 4) = 33; level33 - 32 = 1.
-        weight = torch.cat((
-            torch.full((rows, columns // 2), 0x11, dtype=torch.int8, device=device),
-            torch.full((rows, columns // 4), -86, dtype=torch.int8, device=device),
-        ), dim=1)
+        weight = torch.cat(
+            (
+                torch.full((rows, columns // 2), 0x11, dtype=torch.int8, device=device),
+                torch.full((rows, columns // 4), -86, dtype=torch.int8, device=device),
+            ),
+            dim=1,
+        )
     else:
         raise AssertionError(f"no Comfy fixture for {provider.encoding}")
     return truth, {
@@ -677,6 +686,10 @@ def _weight_roles(torch: Any, provider: Provider, device: Any) -> tuple[Any, dic
         return _comfy_fixture(torch, provider, device, BENCH_SHAPE)
     rows, cols = BENCH_SHAPE
     generator = torch.Generator(device="cpu").manual_seed(0x511B)
+    if isinstance(provider, CoreDequant):
+        roles = sample(torch, provider.adapter, BENCH_SHAPE, generator)
+        roles = {role: part.to(device) for role, part in roles.items()}
+        return _exact_weight(torch, provider, roles), roles
     weight = torch.randn(rows, cols, generator=generator, dtype=torch.float32).to(device) * 0.05
     if provider.suite in ("fp8-rowwise-decode", "fp8-rowwise-native"):
         scale = (weight.abs().amax(dim=-1) / 448.0).clamp(min=1e-12)
@@ -739,6 +752,12 @@ def _exact_weight(torch: Any, provider: Provider, roles: Mapping[str, Any]) -> A
     element and a power-of-two or f32 scale multiply without rounding in f64 — so what the
     deviation below measures is entirely the route's own.
     """
+    if isinstance(provider, CoreDequant):
+        return (
+            _cores_reference(torch, provider, roles, BENCH_SHAPE)
+            .double()
+            .to(next(iter(roles.values())).device)
+        )
     if provider.suite == "comfy-decode":
         # Only the constant-q fixture above enters this benchmark/route oracle.
         # Its normalized rotation is identity on all-ones; the independently
@@ -839,9 +858,10 @@ def _native_axes(torch: Any, provider: LeafProvider, device: Any, deviation: flo
 
 # ------------------------------------------------------------- the conformance vectors
 
-#: The cozytensors/1 conformance decode cases (tensorfs `conformance/vectors/cases.json`). They
-#: ship in the package, so an installed wheel qualifies as the repo does.
-VECTORS = Path(__file__).resolve().parent / "encoding" / "vectors" / "cases.json"
+#: The cozytensors/1 conformance decode cases, one file per scheme family (tensorfs
+#: `conformance/vectors/cases/<family>.json`). They ship in the package, so an installed wheel
+#: qualifies as the repo does.
+VECTORS = Path(__file__).resolve().parent / "encoding" / "vectors" / "cases"
 
 
 class VectorPart(msgspec.Struct, frozen=True):
@@ -870,11 +890,11 @@ class VectorCase(msgspec.Struct, frozen=True):
 
 def vector_cases() -> list[VectorCase]:
     """The conformance cases with a scheme (the plain ones are TensorFS's read cases)."""
-    cases: list[VectorCase] = []
-    for path in (VECTORS, VECTORS.with_name("comfy.json")):
+    out = []
+    for path in sorted(VECTORS.glob("*.json")):
         rows = msgspec.json.decode(path.read_bytes(), type=dict[str, list[dict[str, object]]])
-        cases.extend(msgspec.convert(row, VectorCase) for row in rows["cases"] if "encoding" in row)
-    return cases
+        out += [msgspec.convert(row, VectorCase) for row in rows["cases"] if "encoding" in row]
+    return out
 
 
 def vector_tensor(torch: ModuleType, part: VectorPart, device: Tensor) -> Tensor:
@@ -926,6 +946,11 @@ def _spec_vectors(torch: ModuleType, provider: Provider, device: Tensor) -> Spec
         roles = {part.role for part in case.parts}
         missing = sorted(provider.required - roles)
         surplus = sorted(roles - provider.required - provider.optional)
+        if surplus and not missing:  # the selector never hands this provider such a tensor
+            cases.append(
+                VectorCheck(case.key, passed=True, skipped=True, why=f"takes no {surplus}")
+            )
+            continue
         if missing or surplus:
             why = f"parts {sorted(roles)}: missing {missing}, unhandled {surplus}"
             cases.append(VectorCheck(case.key, passed=False, why=why))
@@ -1009,6 +1034,32 @@ def _leaf_bench(torch: Any, provider: LeafProvider, device: Any, dtype: Any) -> 
     )
 
 
+def _cores_reference(
+    torch: ModuleType, provider: CoreDequant, roles: Mapping[str, Tensor], shape: tuple[int, ...]
+) -> Tensor:
+    """The spec's f32 value of `roles` by the cores' eager reference, on the host: a second
+    implementation of the arithmetic the Triton kernels run."""
+    reference = torch.empty(*shape, dtype=torch.float32)
+    host = {role: part.cpu() for role, part in roles.items()}
+    run(provider.adapter, Cores(torch, kernel=False), host, dict(provider.params), reference)
+    return reference
+
+
+def _numerics_cores(torch: ModuleType, provider: Provider, device: Tensor, dtype: Tensor) -> Sweep:
+    """The row's random parts at its probe params (every byte pattern), decoded on the device
+    and by the eager reference: bit for bit after the one cast."""
+    assert isinstance(provider, CoreDequant)
+    provider = replace(provider, params=params_of(provider.adapter.probe_params))
+    shape = (384, 512)
+    roles = sample(
+        torch, provider.adapter, shape, torch.Generator(device="cpu").manual_seed(0x0C0E)
+    )
+    destination = torch.empty(*shape, dtype=dtype, device=device)
+    provider.decode(torch, {role: part.to(device) for role, part in roles.items()}, destination)
+    truth = _cores_reference(torch, provider, roles, shape).double()
+    return _exact_sweep(torch, destination.cpu(), truth, dtype)
+
+
 #: Which self-check a provider gets, keyed by the ORACLE IT DECLARES (`Provider.suite`) and
 #: never by class or role set, so a second implementation of one encoding is measured by the
 #: same oracle as the first. A suite name in neither table qualifies NOTHING: minting a record
@@ -1022,6 +1073,7 @@ DECODE_SUITES: dict[str, Callable[[Any, Provider, Any, Any], Sweep]] = {
     "int8-rowwise-decode": _numerics_int8_rowwise,
     "int8-tensorwise-decode": _numerics_int8_tensorwise,
     "mxfp8-decode": _numerics_mxfp8,
+    "cores-decode": _numerics_cores,
 }
 
 #: Native leaves' oracle is their own GEMM against arithmetic (`_native_agreement`).
@@ -1091,11 +1143,11 @@ PROBE_PARAMS: dict[str, dict[str, object]] = {
     "comfy.asym_w4a8_int8": {"group_size": 16, "rotation_size": 256},
     "comfy.w6a8_int8": {"group_size": 32, "rotation_size": 256},
     "comfy.convrot_w4a4": {"rotation_size": 256},
-    "fp8.tensorwise": {"scale_dtype": "F32"},
-    "int8.tensorwise": {"scale_dtype": "F32"},
-    "fp8.rowwise": {"axis": 0, "scale_dtype": "F32"},
-    "int8.rowwise": {"axis": 0, "scale_dtype": "F32"},
-    "int8.convrot": {"rotation": "kron_regular_h4", "rotation_size": 256, "scale_dtype": "F32"},
+    "fp8.tensorwise": {},
+    "int8.tensorwise": {},
+    "fp8.rowwise": {"axis": 0},
+    "int8.rowwise": {"axis": 0},
+    "int8.convrot": {"rotation": "kron_regular_h4", "rotation_size": 256},
     "mxfp8": {"block_size": MX_BLOCK, "scale_layout": "row_major"},
     "nvfp4": {
         "block_size": NVFP4_BLOCK,
@@ -1112,10 +1164,15 @@ def _measured(torch: ModuleType, provider: Provider, target: Tensor, dtype: Tens
     # Qualification considers every provider even for a plain F64/FP8 model.
     # Those are valid verbatim outputs, not logical Comfy decode destinations.
     if provider.suite == "comfy-decode" and dtype not in (
-        torch.float32, torch.float16, torch.bfloat16
+        torch.float32,
+        torch.float16,
+        torch.bfloat16,
     ):
         return UnmeasuredEvidence(note="Comfy logical outputs are F32, F16 or BF16")
-    params = params_of(PROBE_PARAMS.get(provider.encoding, {}))
+    if isinstance(provider, CoreDequant):
+        params = params_of(provider.adapter.probe_params)
+    else:
+        params = params_of(PROBE_PARAMS.get(provider.encoding, {}))
     provider = replace(provider, params=params)  # type: ignore[type-var]
     try:
         return _evidence(torch, provider, target, dtype)

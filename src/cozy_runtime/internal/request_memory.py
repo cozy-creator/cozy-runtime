@@ -52,6 +52,7 @@ def measured(
                 streamed=s.streamed,
                 stall_ns=s.stall_ns,
                 activations=s.activations,
+                allocated=s.allocated,
             )
             for s in request.steps
         ],

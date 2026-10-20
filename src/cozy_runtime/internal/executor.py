@@ -869,6 +869,11 @@ class Executor:
         self._bound_calls: tuple[tuple[CallInterface, ...], CallBindings] | None = None
         self.ready = False
         self.poisoned = ""
+        #: its followers were sent the load: from here a refusal leaves them mid-protocol
+        self.commanded = False
+        #: by model binding path: the execution plan it installed (its fused glue's identity),
+        #: "" when eager
+        self.planned: dict[str, str] = {}
         #: by request: an attempt's handler outcome, the stage it last reported and its record,
         #: the reason an attempt whose tail raised still answers with (`unsettled`)
         self.handled: dict[str, tuple[Outcome, str, AuthorAttempt]] = {}
@@ -1105,6 +1110,7 @@ class Executor:
             # per spread method: the calls each rank ran, and why a rank declined
             "spread": dict(self.group.spread_log) if self.group is not None else {},
             "executor": dict(self.host.boot),
+            "plan": {k: v for m in self.model_executors or [self] for k, v in m.planned.items()},
             "construction": {
                 "prepared_unix_ms": int(facts.get("prepared_unix_ms", 0)),
                 "prepare_ms": float(facts.get("prepare_ms", 0)),
@@ -1329,8 +1335,10 @@ class Executor:
                 if spread:
                     # A pure method call whose one tensor result goes straight to rank 0.
                     output = getattr(component, str(command["method"]))(*args, **kwargs)
+                    head = wire.p2p_head(output)
+                    # From the header on, rank 0 reads this answer; before it, `send_nothing`.
                     answered = True
-                    wire.send_tensor(output, 0, self.pg)
+                    wire.send_tensor(output, head, 0, self.pg)
                 elif hosted:
                     call = component.get_submodule(str(command.get("module", "")))
                     result = wire.marshal(
@@ -1346,6 +1354,11 @@ class Executor:
             )
         except Exception as exc:
             ending = mirror.ending(exc)
+            # where it was raised, innermost first: a GPU's own traceback stays on that GPU
+            at = " < ".join(
+                f"{Path(f.filename).name}:{f.lineno} {f.name}"
+                for f in reversed(traceback.extract_tb(exc.__traceback__)[-3:])
+            )
             if spread and not answered:
                 declined = self._declines(exc, ending)
                 with contextlib.suppress(Exception):
@@ -1369,7 +1382,7 @@ class Executor:
                 return {
                     "ok": False,
                     "code": ending,
-                    "detail": f"{type(exc).__name__}: {exc}"[:900],
+                    "detail": f"{type(exc).__name__}: {str(exc)[:640]} (at {at})"[:900],
                     "rank": self.rank,
                     **({} if hosted else {"rerun": True}),
                 }
@@ -1378,7 +1391,7 @@ class Executor:
             return {
                 "ok": False,
                 "code": outcome.code,
-                "detail": f"{type(exc).__name__}: {exc}"[:900],
+                "detail": f"{type(exc).__name__}: {str(exc)[:640]} (at {at})"[:900],
                 "rank": self.rank,
             }
         return {
@@ -2012,10 +2025,10 @@ class Executor:
             self._close_after({})
             raise
         if not reply.get("ok"):
-            if not child.poisoned:
+            if not child.poisoned and not child.commanded:
                 # Refused before touching the process: its other constructions keep serving.
                 return {**reply, "poisoned": ""}
-            self.poisoned = self.poisoned or child.poisoned
+            self.poisoned = self.poisoned or child.poisoned or f"group: {reply.get('code')}"
             return self._close_after({**reply, "poisoned": self.poisoned})
         self._register(key, child, reply)
         return self._load_reply(key, child, reused=False)
@@ -2375,6 +2388,7 @@ class Executor:
                 )
             except GroupRefusal as exc:
                 return self._group_refusal(exc)
+            self.commanded = True
             stage("group_broadcast")
 
         if self.discovered is None:
@@ -2465,7 +2479,10 @@ class Executor:
         # NVML is queried with the sealed device (#549.9): inside the seal, card zero IS the
         # lane's card, so a multi-GPU pod's records name the card the fill actually uses.
         runtime_identity = measure_runtime(torch, binding.release)
-        providers = launch_providers()
+        # Only the schemes these rows store: a machine measures the decoders a model needs (a
+        # table grows as models arrive), not every scheme the Runtime can read.
+        stored = {row.encoded.scheme for row in rows}
+        providers = {s: c for s, c in launch_providers().items() if s in stored}
         # MEASURED ONCE PER (card, build, providers, dtypes), NOT ONCE PER PREPARE
         # (cr-103). The decode suite is 3.2-6.1 s of every model-bearing prepare and none
         # of its inputs change between two models on one warm pod, which is the swap case
@@ -2702,6 +2719,7 @@ class Executor:
         try:
             # THE MODEL'S OWN EXECUTION PLAN: its fused kernels, glue and hooks.
             planned = self._execution_plan(model, torch, load_kernels, kernels_ready)
+            self.planned[binding.model_binding_path] = planned
             roots = backend.roots
             stage("execution_plan")
             # EACH SITE'S KERNEL FROM THE GROUP'S FAMILY CELL AT THE MODEL'S ATTENTION LEVEL,
@@ -3521,6 +3539,12 @@ class Executor:
                     code=classify(cleanup_error).code, detail=ends(str(cleanup_error), 900),
                 )
         self.handled[command.request_id] = (outcome, stage[0], record)
+        # A failure the device raised (CUDA's or NCCL's own error, not capacity), or one that
+        # left it faulted: this process serves nothing more, so it is poisoned and the machine
+        # ends it, freeing everything (12167 and 12293 ran on a faulted one and failed again).
+        failed = outcome.terminal == "failed" and torch is not None
+        if failed and (_device_error(outcome) or not accel.healthy(torch, self.device_kind)):
+            self.poisoned = self.poisoned or f"device fault: {outcome.message}"[:300]
         if self.rank == 0:
             for member in self.model_executors or [self]:
                 self._emit_gemm(record, member)
@@ -4748,6 +4772,12 @@ def _serialize_result(
         outputs,
         0,
     )
+
+
+def _device_error(outcome: Outcome) -> bool:
+    """A failed attempt's error is the device's own (CUDA's or NCCL's), not capacity."""
+    marks = ("AcceleratorError", "CUDA error", "NCCL")
+    return outcome.code not in CAPACITY_CODES and any(m in outcome.message for m in marks)
 
 
 def _assets_at(node: Any, path: str) -> list[dict[str, Any]]:

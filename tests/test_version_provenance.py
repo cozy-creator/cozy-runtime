@@ -9,7 +9,7 @@ import sys
 import tomllib
 from pathlib import Path
 
-from conftest import runtime_test_dependencies
+from conftest import locked, runtime_test_dependencies
 
 ROOT = Path(__file__).resolve().parents[1]
 STAMP = "a" * 40
@@ -46,7 +46,7 @@ def test_installed_wheel_version_is_independent_of_caller_repository(tmp_path: P
     )
     python = environment / "bin" / "python"
     subprocess.run(
-        [uv, "pip", "install", "--python", str(python), str(wheel), *runtime_test_dependencies()],
+        [uv, "pip", "install", "--python", str(python), "-c", str(locked()), str(wheel), *runtime_test_dependencies()],
         check=True,
         capture_output=True,
     )

@@ -45,7 +45,7 @@ def _pipeline(root: Path, monkeypatch: pytest.MonkeyPatch) -> tensorfs.Checkpoin
         "proj.weight", dtype="BF16", shape=[4, 32], scheme="fp8.rowwise",
         parts={"weight": ("F8_E4M3", [4, 32], np.full((4, 32), 0x38, np.uint8)),
          "scale": ("F32", [4], np.ones(4, np.float32))},
-        params={"axis": 0, "scale_dtype": "F32"},
+        params={"axis": 0},
     )  # fmt: skip
     writer.component(
         "scheduler", cls="diffusers.EulerDiscreteScheduler", config=SCHEDULER,
@@ -69,7 +69,7 @@ def test_rows_carry_order_scheme_params_and_parts(
     encoded = next(r for r in rows if r.name == "proj.weight")
     assert (encoded.encoded.scheme, dict(encoded.encoded.params)) == (
         "fp8.rowwise",
-        {"axis": 0, "scale_dtype": "F32"},
+        {"axis": 0},
     )
     assert {p.role: (p.dtype, p.shape) for p in encoded.encoded.parts} == {
         "weight": ("f8_e4m3fn", (4, 32)),

@@ -8,7 +8,7 @@ That is the gap this module closes.
 Harness isolation is LOAD-BEARING (§1.1), so the fences are audit hooks, not politeness:
 `sys.addaudithook` cannot be removed once installed, which is why derivation runs in a
 child process — the fences live exactly as long as the derivation and cannot leak into the
-caller. `scripts/derive-corpus.py` proves each one live by attempting the capability.
+caller.
 
 Not fenced here and deliberately so: CUDA. `CUDA_VISIBLE_DEVICES=""` in the child's
 environment is the fence, and it is stronger than a hook — torch itself then answers

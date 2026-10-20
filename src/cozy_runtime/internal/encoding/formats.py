@@ -15,8 +15,9 @@ from dataclasses import dataclass
 from types import ModuleType
 from typing import Any, Protocol, runtime_checkable
 
-from cozy_runtime.author._loader import TENSORFS_DTYPES as _TENSORFS_DTYPES
 from cozy_runtime.author._loader import TORCH_DTYPES as _TORCH_DTYPES
+from cozy_runtime.internal.decode_schemes import BY_SCHEME as _CORE_SCHEMES
+from cozy_runtime.internal.decode_schemes import parts_rule as _core_parts_rule
 
 # `Any` below is a torch module, tensor, dtype or nn.Module: torch is absent from the check venv.
 
@@ -53,7 +54,8 @@ type Params = tuple[tuple[str, object], ...]
 
 
 def params_of(params: Mapping[str, object]) -> Params:
-    return tuple(sorted(params.items()))
+    """Hashable: a list value (`block_size: [128, 128]`) becomes a tuple."""
+    return tuple(sorted((k, tuple(v) if isinstance(v, list) else v) for k, v in params.items()))
 
 
 #: Runtime dtype name -> torch dtype name (`author/_loader.py` owns it).
@@ -122,8 +124,9 @@ SCALE_LAYOUTS = ("row_major", "cublas_128x4")
 NIBBLE_ORDERS = ("low_first", "high_first")
 #: nvfp4's second level: `scale_2` multiplies (ModelOpt) or divides (compressed-tensors).
 GLOBAL_SCALES = ("multiply", "divide")
-#: A stored scale's dtype (tensorwise, rowwise, convrot): it enters the decode as it is.
-SCALE_DTYPES = ("F32", "BF16", "F16")
+#: A stored scale's dtypes (tensorwise, rowwise, convrot): the part's own, entering the decode
+#: as it is.
+_SCALES = frozenset({"f32", "bf16", "f16"})
 
 
 def matrix(shape: Sequence[int]) -> tuple[int, int]:
@@ -169,13 +172,6 @@ def scale_grid(torch: ModuleType, scale: Tensor, rows: int, blocks: int, layout:
     return scale.reshape(rows, blocks)
 
 
-def _grid_shape(shape: Sequence[int], blocks: int, layout: object) -> tuple[int, ...]:
-    """A block-scale part's stored shape for a logical `shape` and its layout."""
-    if layout == "cublas_128x4":
-        return _blocked_shape(matrix(shape)[0], blocks)
-    return (*tuple(shape[:-1]), blocks)
-
-
 #: E8M0's one non-numeric byte; any other `b` is exactly `2**(b - 127)`.
 E8M0_NAN = 255
 
@@ -187,12 +183,18 @@ def part_rule(encoded: Encoded, shape: Sequence[int], dtype: str) -> str:
         return ""
     if dtype not in DECODED:
         return f"{encoded.scheme} decodes to f32, bf16 or f16, not {dtype}"
+    if encoded.scheme in _CORE_SCHEMES:  # the cores' rows check their own parts (spec §6)
+        return _core_parts_rule(
+            _CORE_SCHEMES[encoded.scheme],
+            shape,
+            dict(encoded.params),
+            {p.role: (p.dtype, p.shape) for p in encoded.parts},
+        )
     parts = {p.role: p for p in encoded.parts}
     rows, cols = matrix(shape)
     params = dict(encoded.params)
-    axis, layout = params.get("axis"), params.get("scale_layout")
-    #: a stored scale is in the dtype its `scale_dtype` names, and enters the decode exactly
-    stored = frozenset({_TENSORFS_DTYPES.get(str(params.get("scale_dtype")), "")})
+    axis = params.get("axis")
+    stored = _SCALES
     rules: dict[str, tuple[frozenset[str], int | tuple[int, ...]]] = {
         "fp8.rowwise": {
             "weight": (_F8, tuple(shape)),
@@ -201,10 +203,6 @@ def part_rule(encoded: Encoded, shape: Sequence[int], dtype: str) -> str:
         "int8.rowwise": {
             "weight": (frozenset({"i8"}), tuple(shape)),
             "scale": (stored, cols if axis == 1 else rows),
-        },
-        "mxfp8": {
-            "weight": (_F8, tuple(shape)),
-            "scale": (frozenset({"f8_e8m0"}), _grid_shape(shape, -(-cols // MX_BLOCK), layout)),
         },
         "fp8.tensorwise": {
             "weight": (_F8, tuple(shape)),
@@ -219,12 +217,6 @@ def part_rule(encoded: Encoded, shape: Sequence[int], dtype: str) -> str:
         "int8.convrot": {
             "weight": (frozenset({"i8"}), tuple(shape)),
             "scale": (stored, rows),
-        },
-        "nvfp4": {
-            "weight": (frozenset({"u8"}), (*tuple(shape[:-1]), cols // 2)),
-            "scale": (frozenset({"f8_e4m3fn"}), _grid_shape(shape, cols // NVFP4_BLOCK, layout)),
-            "scale_2": (frozenset({"f32"}), 1),
-            "input_scale": (frozenset({"f32"}), 1),
         },
     }.get(encoded.scheme, {})  # type: ignore[assignment]
     for role, (dtypes, want) in rules.items():
@@ -323,7 +315,10 @@ class LeafProvider(Provider, Protocol):
 
 def _rank2(shape: Sequence[int]) -> str:
     if len(shape) != 2:
-        return f"a scaled GEMM has two outer dimensions and this tensor is rank {len(shape)} {tuple(shape)}"
+        return (
+            f"a scaled GEMM has two outer dimensions and this tensor is rank "
+            f"{len(shape)} {tuple(shape)}"
+        )
     return ""
 
 
@@ -393,8 +388,8 @@ class Verbatim:
 
 @dataclass(frozen=True, slots=True)
 class TensorwiseDequant:
-    """`fp8.tensorwise` and `int8.tensorwise` -> float: `round_L(weight × scale)`, the scale in
-    the dtype its producer stored (`scale_dtype`), never rounded on the way in. `input_scale`
+    """`fp8.tensorwise` and `int8.tensorwise` -> float: `round_L(weight * scale)`, the scale in
+    the dtype its producer stored the part in, never rounded on the way in. `input_scale`
     is the activation scale of a quantized matmul and never enters the weight."""
 
     encoding: str = "fp8.tensorwise"
@@ -437,7 +432,7 @@ class TensorwiseDequant:
         return frozenset({"input_scale"})
 
     def supports(self, shape: Sequence[int], params: Mapping[str, object]) -> str:
-        return _params(params, {"scale_dtype": SCALE_DTYPES})
+        return _params(params, {})
 
     def decode(self, torch: ModuleType, parts: Mapping[str, Tensor], destination: Tensor) -> None:
         flat = destination.view(-1)
@@ -462,7 +457,7 @@ _CHUNK_BYTES = 16 << 20
 
 @dataclass(frozen=True, slots=True)
 class RowwiseDequant:
-    """`fp8.rowwise` and `int8.rowwise` -> float: `weight[i, j] × scale[axis == 0 ? i : j]`,
+    """`fp8.rowwise` and `int8.rowwise` -> float: `weight[i, j] * scale[axis == 0 ? i : j]`,
     formed in f32 and rounded once into the destination (the producer's rule; narrowing the
     scale first is a full ULP off). Row chunks bound the f32 transient."""
 
@@ -504,7 +499,7 @@ class RowwiseDequant:
         return frozenset()
 
     def supports(self, shape: Sequence[int], params: Mapping[str, object]) -> str:
-        why = _rows(shape, params) or _params(params, {"axis": (0, 1), "scale_dtype": SCALE_DTYPES})
+        why = _rows(shape, params) or _params(params, {"axis": (0, 1)})
         if why or len(shape) == 2 or params.get("axis") == 0:
             return why
         return "a per-column scale is a rank-2 weight's"
@@ -535,7 +530,7 @@ def e8m0_multipliers(torch: ModuleType, scale: Tensor) -> Tensor:
 
 @dataclass(frozen=True, slots=True)
 class MicroScaledDequant:
-    """`mxfp8` -> float: `weight[i, j] × 2**(scale[i, j // 32] - 127)`, formed in f32 (exact:
+    """`mxfp8` -> float: `weight[i, j] * 2**(scale[i, j // 32] - 127)`, formed in f32 (exact:
     an E4M3/E5M2 element times a power of two stays inside f32) and rounded once into the
     destination. A short last block (`ceil(C / 32)` scales) decodes like any other."""
 
@@ -575,9 +570,13 @@ class MicroScaledDequant:
         return frozenset()
 
     def supports(self, shape: Sequence[int], params: Mapping[str, object]) -> str:
-        return _rows(shape, params) or _params(
+        why = _rows(shape, params) or _params(
             params, {"block_size": (MX_BLOCK,), "scale_layout": SCALE_LAYOUTS}
         )
+        if not why and len(shape) > 2 and params.get("scale_layout") == "cublas_128x4":
+            # cuBLAS tiles each matrix of a stack (xs-049 U2): the cores' row
+            return f"a tiled stack {tuple(shape)} decodes through the cores, one matrix at a time"
+        return why
 
     def decode(self, torch: ModuleType, parts: Mapping[str, Tensor], destination: Tensor) -> None:
         rows, cols = matrix(destination.shape)
@@ -621,7 +620,7 @@ def hadamard256(torch: ModuleType, values: Tensor) -> Tensor:
 
 @dataclass(frozen=True, slots=True)
 class Int8ConvRotDequant:
-    """`int8.convrot` -> float: `(y[i] × scale[i]) × 2^-k`, `y` the exact int32 Hadamard sum of
+    """`int8.convrot` -> float: `(y[i] * scale[i]) * 2^-k`, `y` the exact int32 Hadamard sum of
     each `rotation_size = 4^k` group of int8 weights, cast once into the destination."""
 
     encoding: str = "int8.convrot"
@@ -665,7 +664,6 @@ class Int8ConvRotDequant:
             {
                 "rotation": ("kron_regular_h4",),
                 "rotation_size": ROTATION_SIZES,
-                "scale_dtype": SCALE_DTYPES,
             },
         )
         size = int(str(params.get("rotation_size", 1)))
@@ -704,8 +702,8 @@ def nvfp4_values(
     high_first: bool = False,
     divide: bool = False,
 ) -> Tensor:
-    """`nvfp4` rows -> f32: `(e2m1 × e4m3 scale) × scale_2`, or with `divide`
-    `e2m1 × (e4m3 scale ÷ scale_2)`. `weight` is u8 `[R, C/2]`, element 2k in the low nibble,
+    """`nvfp4` rows -> f32: `(e2m1 * e4m3 scale) * scale_2`, or with `divide`
+    `e2m1 * (e4m3 scale ÷ scale_2)`. `weight` is u8 `[R, C/2]`, element 2k in the low nibble,
     or the high one when `high_first`."""
     rows, cols = int(weight.shape[0]), int(weight.shape[1]) * 2
     pair = (weight >> 4, weight & 0x0F) if high_first else (weight & 0x0F, weight >> 4)
@@ -770,8 +768,12 @@ class Nvfp4Dequant:
                 "scale_layout": SCALE_LAYOUTS,
             },
         )
-        if why or int(shape[-1]) % NVFP4_BLOCK == 0:
+        if why:
             return why
+        if len(shape) > 2:  # a scale_2 and cuBLAS tiles per matrix (xs-049 U2): the cores' row
+            return f"a stack {tuple(shape)} decodes through the cores, one matrix at a time"
+        if int(shape[-1]) % NVFP4_BLOCK == 0:
+            return ""
         return (
             f"nvfp4 scales whole {NVFP4_BLOCK}-column blocks; this tensor has {shape[-1]} columns"
         )

@@ -66,18 +66,14 @@ def test_a_nearest_refit_bake_is_the_lane_encoder_on_the_merged_weight() -> None
 
 
 def test_only_a_row_scaled_e4m3_weight_is_bakeable() -> None:
-    assert lora_bake.bakeable(
-        "fp8.rowwise", {"axis": 0, "scale_dtype": "F32"}, {"weight": "f8_e4m3fn", "scale": "f32"}
+    assert lora_bake.bakeable("fp8.rowwise", {"axis": 0}, {"weight": "f8_e4m3fn", "scale": "f32"})
+    assert not lora_bake.bakeable(
+        "fp8.rowwise", {"axis": 0}, {"weight": "f8_e4m3fn", "scale": "u8"}
     )
     assert not lora_bake.bakeable(
-        "fp8.rowwise", {"axis": 0, "scale_dtype": "F32"}, {"weight": "f8_e4m3fn", "scale": "u8"}
+        "fp8.rowwise", {"axis": 1}, {"weight": "f8_e4m3fn", "scale": "f32"}
     )
-    assert not lora_bake.bakeable(
-        "fp8.rowwise", {"axis": 1, "scale_dtype": "F32"}, {"weight": "f8_e4m3fn", "scale": "f32"}
-    )
-    assert not lora_bake.bakeable(
-        "int8.rowwise", {"axis": 0, "scale_dtype": "F32"}, {"weight": "i8", "scale": "f32"}
-    )
+    assert not lora_bake.bakeable("int8.rowwise", {"axis": 0}, {"weight": "i8", "scale": "f32"})
     assert not lora_bake.bakeable(
         "mxfp8",
         {"block_size": 32, "scale_layout": "row_major"},
@@ -234,7 +230,7 @@ def test_an_int8_convrot_bake_keeps_the_delta_in_its_rotated_grid() -> None:
     values, down, up = _layer(11)
     assert lora_bake.bakeable(
         "int8.convrot",
-        {"rotation": "kron_regular_h4", "rotation_size": 256, "scale_dtype": "F32"},
+        {"rotation": "kron_regular_h4", "rotation_size": 256},
         {"weight": "i8", "scale": "f32"},
     )
     data, scale = _int8(values)

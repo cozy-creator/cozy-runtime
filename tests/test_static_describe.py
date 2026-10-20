@@ -27,6 +27,7 @@ from pathlib import Path
 
 import pytest
 
+from conftest import locked
 from cozy_runtime.internal import package_interface, static_interface
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.static_interface import StaticRefusal
@@ -522,10 +523,6 @@ def torch_free() -> Iterator[Path]:
         _run(uv, "build", "--wheel", "--out-dir", str(root / "dist"), str(RICH))
         _run(uv, "venv", "--python", sys.executable, str(root / "venv"))
         runtime = next((root / "dist").glob("cozy_runtime-*.whl"))
-        # The wheel's dependencies as the lock pins them (an unreleased TensorFS is a git source).
-        locked = root / "locked.txt"
-        _run(uv, "export", "--frozen", "--no-dev", "--no-emit-project", "--no-hashes",
-             "--project", str(ROOT), "-o", str(locked))  # fmt: skip
         # numpy is for the ORACLE only: the fixture's quantize result names
         # `cozy_runtime.derive.QuantizeResult`, and importing that module needs numpy. The
         # static reader parses the same file and never imports it.
@@ -535,8 +532,8 @@ def torch_free() -> Iterator[Path]:
             "install",
             "--python",
             str(root / "venv" / "bin" / "python"),
-            "-r",
-            str(locked),
+            "-c",
+            str(locked()),
             str(runtime),
             "numpy",
         )

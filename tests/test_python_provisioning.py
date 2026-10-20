@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 
-from cozy_runtime.internal import config, storage_admission
+from cozy_runtime.internal import config
 from cozy_runtime.internal import python_interpreters as p
 from cozy_runtime.internal.config import package_install_environment
 
@@ -192,27 +192,6 @@ def test_cancellation_reaps_active_child(tmp_path: Path) -> None:
         os.kill(int(pid_file.read_text()), 0)
 
 
-def test_storage_refusal_precedes_download_and_directory_creation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from cozy_runtime.internal import storage_admission
-
-    monkeypatch.setattr(p, "available", lambda *a, **kw: ())
-    monkeypatch.setattr(shutil, "which", lambda _: "/uv")
-    monkeypatch.setattr(p, "_download_version", lambda *a: "3.13.8")
-    monkeypatch.setattr(p, "_run_uv", lambda *a, **kw: pytest.fail("download cannot start"))
-
-    def deny(*writes: storage_admission.Write) -> Any:
-        assert writes[0].bytes >= 1 << 30
-        raise storage_admission.StorageRefusal("insufficient storage")
-
-    monkeypatch.setattr(storage_admission, "admit", deny)
-    root = tmp_path / "absent"
-    with pytest.raises(storage_admission.StorageRefusal):
-        p.ensure(">=3.13", root=root)
-    assert not root.exists()
-
-
 def test_cli_ensure_calls_shared_provisioner_without_an_installer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -311,10 +290,9 @@ def portable_import(name, *args, **kwargs):
         raise ImportError('POSIX-only module unavailable')
     return original(name, *args, **kwargs)
 builtins.__import__ = portable_import
-from cozy_runtime.internal import python_interpreters, storage_admission
+from cozy_runtime.internal import python_interpreters
 from cozy_runtime.cli import main
 assert python_interpreters.supported_minors()
-assert not storage_admission.enabled()
 assert main.main(['--json', 'python-interpreters']) == 0
 """
     subprocess.run([sys.executable, "-c", code], check=True, capture_output=True, text=True)

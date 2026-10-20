@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import runtime_test_dependencies
+from conftest import locked, runtime_test_dependencies
 
 ROOT = Path(__file__).resolve().parent.parent
 PACKAGE = ROOT / "examples" / "marco-polo"
@@ -97,6 +97,8 @@ def installed_cli() -> Iterator[str]:
             "install",
             "--python",
             str(root / "venv" / "bin" / "python"),
+            "-c",
+            str(locked()),
             *wheels,
             *runtime_test_dependencies(),
         )
