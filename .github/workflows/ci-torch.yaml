@@ -6,7 +6,7 @@ name: ci-torch
 on:
   workflow_dispatch:
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || github.ref }}
   cancel-in-progress: true
 jobs:
   torch:
