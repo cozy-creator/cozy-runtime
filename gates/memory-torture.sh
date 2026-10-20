@@ -204,6 +204,7 @@ h3ref() {  # H3 ref2va_turbo, one clip (15 s unless $4) from one character image
 
 matrix() {  # the merge matrix on one machine ($1 = card); on 24 each H3 cell runs again warm
   local k=$1 r=$RANDOM a b
+  [ -z "$SLIM" ] || r=17  # matched model inputs for baseline and candidate
   references "$k" "$r"
   a=$(image "$k-klein-a") b=$(image "$k-klein-b")
   if [ "$k" = 2x8 ]; then
@@ -306,7 +307,8 @@ PY
   done
   if [ -n "$BW" ]; then  # the baseline first, in its own directory; its failures are not the candidate's
     mkdir -p baseline
-    if update "$BW" "$BTFS" "$card-baseline"; then (cd baseline && TAG=$TAG-baseline && pass "$card")
+    if update "$BW" "$BTFS" "$card-baseline"; then
+      (cd baseline && { [ -n "$SLIM" ] || TAG=$TAG-baseline; } && pass "$card")
     else say "card $card: the baseline wheel did not install: $(tail -c 300 "update-$card-baseline.log")"; fi
   fi
   if { [ "$W" != - ] || [ -n "$BW" ]; } && ! update "$W" "$TFS" "$card"; then
