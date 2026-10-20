@@ -7,7 +7,15 @@ from typing import TYPE_CHECKING, cast
 
 import msgspec
 
-from cozy_runtime.internal.executor_replies import Copy, Eviction, Memory, Peak, Step, TraceEvent
+from cozy_runtime.internal.executor_replies import (
+    Copy,
+    Eviction,
+    Memory,
+    Peak,
+    Step,
+    TraceEvent,
+    TransferProof,
+)
 
 if TYPE_CHECKING:
     from tensorfs.varena.torch import RequestStats
@@ -85,6 +93,14 @@ def measured(
             )
             for event in request.trace
         ],
+        proofs=[
+            msgspec.convert(
+                {**proof, "gpu": physical(cast(int, proof["gpu"])), "rank": rank},
+                TransferProof,
+                strict=True,
+            )
+            for proof in request.proofs
+        ],
     )
 
 
@@ -116,4 +132,5 @@ def combined(records: Sequence[Memory]) -> Memory | None:
         plan=plan,
         copies=[row for record in records for row in record.copies],
         trace=[row for record in records for row in record.trace],
+        proofs=[row for record in records for row in record.proofs],
     )

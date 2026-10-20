@@ -1,6 +1,7 @@
 import contextlib
 import copy
 import io
+import itertools
 import json
 import runpy
 import tempfile
@@ -46,7 +47,74 @@ def measured_copy():
                 busy_s=0.08, pin_s=0.01, staged=1_000_000_000, cached=0)
 
 
+def proof_and_trace(sequence, sizes, capacity, initial=()):
+    proof = dict(request="r", gpu=0, rank=0, version=1, complete=True,
+                 isolated=True, capacity=capacity, initial=list(initial), invalid=[],
+                 pages=[dict(page=page, content=f"fingerprint/{page}", payload=size,
+                             mapped=max(size, 8)) for page, size in sizes.items()])
+    base = dict(request="r", gpu=0, rank=0, page=0, bytes=0, capacity=capacity,
+                resident=0, orphan_bytes=0, reason="demand", **{"class": "pinned"})
+    trace = [dict(base, sequence=0, kind="begin", step=0, pass_index=0)]
+    trace.extend(dict(base, sequence=index + 1, kind="bind", page=page,
+                      bytes=max(sizes[page], 8), step=index // 3, pass_index=index // 3)
+                 for index, page in enumerate(sequence))
+    trace.append(dict(base, sequence=len(trace), kind="end", step=0, pass_index=0))
+    return proof, trace
+
+
 class MemoryReceipts(unittest.TestCase):
+    def test_window_bound_counts_repeated_passes_without_calling_it_opt(self):
+        proof, trace = proof_and_trace([1, 2, 3] * 3, {1: 4, 2: 4, 3: 4}, 8)
+        bound, compulsory = API["window_lower_bound"](proof, trace)
+        self.assertEqual((bound, compulsory), (20, 12))
+        # Actual 20 B would satisfy the sufficient bound; 24 B is inconclusive.
+        for actual, status in ((20, "sufficient"), (24, "inconclusive")):
+            errors, measured, label = API["transfer_bound"](
+                {"proofs": [proof]}, trace, {0}, {0: actual}, True)
+            self.assertEqual(measured, 20)
+            self.assertIn(status, label)
+            self.assertEqual(bool(errors), actual == 24)
+
+    def test_window_bound_is_below_exact_weighted_opt_for_small_traces(self):
+        sizes, capacity = {1: 1, 2: 2, 3: 2}, 3
+        for initial in ((), (1,), (2,)):
+            for sequence in itertools.product(sizes, repeat=5):
+                states = {frozenset(initial): 0}
+                for page in sequence:
+                    following = {}
+                    for cache, prior in states.items():
+                        available = tuple(cache | {page})
+                        for mask in range(1 << len(available)):
+                            kept = frozenset(p for i, p in enumerate(available) if mask & (1 << i))
+                            if page not in kept or sum(sizes[p] for p in kept) > capacity:
+                                continue
+                            cost = prior + (0 if page in cache else sizes[page])
+                            following[kept] = min(following.get(kept, cost), cost)
+                    states = following
+                proof, trace = proof_and_trace(sequence, sizes, capacity, initial)
+                bound, _ = API["window_lower_bound"](proof, trace)
+                self.assertLessEqual(bound, min(states.values()), (sequence, initial))
+
+    def test_proof_requires_true_payload_initial_state_complete_scope_and_gpu_coverage(self):
+        proof, trace = proof_and_trace([1, 2], {1: 2, 2: 3}, 8, [1])
+        self.assertEqual(API["window_lower_bound"](proof, trace), (3, 3))
+        for mutate, reason in (
+            (lambda p: p.update(complete=False), "incomplete-transfer-proof"),
+            (lambda p: p["initial"].append(7), "invalid-initial-residency"),
+            (lambda p: p["pages"][0].update(payload=9), "invalid-transfer-catalog"),
+            (lambda p: p.update(invalid=["registration-changed"]), "incomplete-transfer-proof"),
+        ):
+            changed = copy.deepcopy(proof)
+            mutate(changed)
+            errors, _, _ = API["transfer_bound"]({"proofs": [changed]}, trace, {0}, {0: 3}, True)
+            self.assertIn(reason, errors)
+        proof["isolated"] = False
+        errors, _, status = API["transfer_bound"]({"proofs": [proof]}, trace, {0}, {0: 3}, True)
+        self.assertEqual((errors, status), (["transfer-proof-not-isolated"], "shared-scope"))
+        self.assertEqual(API["transfer_bound"]({"proofs": [proof]}, trace, {0}, {0: 3}, False)[0], [])
+        self.assertIn("transfer-proof-gpu-coverage", API["transfer_bound"](
+            {"proofs": [proof]}, trace, {0, 1}, {}, True)[0])
+
     def test_slim_trace_protects_working_pages_and_orphan_order(self):
         def event(sequence, kind, **values):
             row = dict(sequence=sequence, request="r", step=0, page=1, bytes=1,

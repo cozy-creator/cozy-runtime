@@ -175,6 +175,19 @@ def test_real_cpu_context_stats_map_logical_two_gpu_facts_to_lane_two_three() ->
             retries=ordinal,
             copies=copies,
             evictions=(Eviction("transformer", ordinal, 2, "room", 4),),
+            proofs=(
+                {
+                    "request": "cpu",
+                    "gpu": ordinal,
+                    "version": 1,
+                    "complete": True,
+                    "isolated": True,
+                    "capacity": 16,
+                    "pages": [{"page": 1, "content": "fingerprint/0", "payload": 3, "mapped": 8}],
+                    "initial": [1],
+                    "invalid": [],
+                },
+            ),
         )
         measured = request_memory.measured(facts, [2, 3])
         assert measured is not None
@@ -185,6 +198,9 @@ def test_real_cpu_context_stats_map_logical_two_gpu_facts_to_lane_two_three() ->
     assert [row.gpu for row in result.rows] == [2, 3]
     assert [row.gpu for row in result.evictions] == [2, 3]
     assert [row.gpu for row in result.copies] == [2, -1, 3, -1]
+    assert [row.gpu for row in result.proofs] == [2, 3]
+    assert result.proofs[0].pages[0].payload == 3
+    assert result.proofs[0].pages[0].mapped == 8
     assert result.steps == {"transformer": [3]} and result.paged_in == 3 and result.retries == 1
     assert result.plan == [["transformer"]]
     with pytest.raises(ValueError, match="duplicate physical"):

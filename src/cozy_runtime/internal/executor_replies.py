@@ -75,6 +75,29 @@ class TraceEvent(msgspec.Struct, frozen=True, kw_only=True):
     class_: str = msgspec.field(name="class", default="free")
     working_set: int | None = None
     speculative_budget: int | None = None
+    pass_index: int = 0
+
+
+class ProofPage(msgspec.Struct, frozen=True, kw_only=True):
+    page: int
+    content: str
+    payload: int
+    mapped: int
+
+
+class TransferProof(msgspec.Struct, frozen=True, kw_only=True):
+    """A complete content catalog and initial residency for a scoped H2D lower bound."""
+
+    request: str
+    gpu: int
+    rank: int
+    version: int
+    complete: bool
+    isolated: bool
+    capacity: int
+    pages: list[ProofPage]
+    initial: list[int]
+    invalid: list[str]
 
 
 class Memory(msgspec.Struct, frozen=True, kw_only=True):
@@ -97,6 +120,7 @@ class Memory(msgspec.Struct, frozen=True, kw_only=True):
     plan: list[list[str]] = []
     copies: list[Copy] = []
     trace: list[TraceEvent] = []
+    proofs: list[TransferProof] = []
 
 
 class RankMemory(msgspec.Struct, frozen=True, kw_only=True):

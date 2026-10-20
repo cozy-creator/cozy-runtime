@@ -137,17 +137,120 @@ def trace_errors(events):
     return list(dict.fromkeys(errors))
 
 
-def movement_evidence(stats, events, executed):
+def window_lower_bound(proof, events):
+    """H2D lower bound over partitions at actual step/pass boundaries, never OPT.
+
+    Every later window can start with at most capacity payload bytes resident. Its
+    distinct demand payload in excess of that must move. The first window instead
+    uses the complete initial resident identities. Maximizing the sum over disjoint
+    windows stays a lower bound; restricting boundaries makes it cheaper and weaker.
+    """
+    if (not isinstance(proof, dict) or type(proof.get("version")) is not int or proof["version"] != 1
+            or proof.get("complete") is not True or proof.get("invalid") != []
+            or not integer(proof.get("capacity"))):
+        raise ValueError("incomplete-transfer-proof")
+    pages, content_sizes = {}, {}
+    if not isinstance(proof.get("pages"), list) or not isinstance(proof.get("initial"), list):
+        raise ValueError("invalid-transfer-catalog")
+    for page in proof["pages"]:
+        if (not isinstance(page, dict) or not integer(page.get("page"))
+                or page["page"] in pages or not isinstance(page.get("content"), str)
+                or not page["content"] or not integer(page.get("payload"))
+                or not integer(page.get("mapped")) or page["payload"] > page["mapped"]
+                or page["mapped"] > 2**64 - 1):
+            raise ValueError("invalid-transfer-catalog")
+        content, size = page["content"], page["payload"]
+        if content in content_sizes and content_sizes[content] != size:
+            raise ValueError("inconsistent-content-payload")
+        pages[page["page"]] = content
+        content_sizes[content] = size
+    if (any(not integer(page) or page not in pages for page in proof["initial"])
+            or len(set(proof["initial"])) != len(proof["initial"])):
+        raise ValueError("invalid-initial-residency")
+    initial = {pages[page] for page in proof["initial"]}
+    groups, previous = [], None
+    for event in events:
+        if event["kind"] != "bind":
+            continue
+        if not integer(event.get("pass_index")) or event["page"] not in pages:
+            raise ValueError("unknown-demand-content")
+        boundary = (event["step"], event["pass_index"])
+        if boundary != previous:
+            groups.append(set())
+            previous = boundary
+        groups[-1].add(pages[event["page"]])
+    # Limit work by merging adjacent groups, never by dropping references. Any
+    # partition over the retained boundaries is still a sound lower bound.
+    if len(groups) > 512:
+        width = math.ceil(len(groups) / 512)
+        groups = [set().union(*groups[i:i + width]) for i in range(0, len(groups), width)]
+    best = [0] * (len(groups) + 1)
+    capacity = max([proof["capacity"], *(event["capacity"] for event in events)])
+    for end in range(1, len(groups) + 1):
+        seen, total, missing = set(), 0, 0
+        for start in range(end - 1, -1, -1):
+            for content in groups[start] - seen:
+                size = content_sizes[content]
+                total += size
+                missing += size if content not in initial else 0
+                seen.add(content)
+            cost = missing if start == 0 else max(total - capacity, 0)
+            best[end] = max(best[end], best[start] + cost)
+    compulsory = sum(content_sizes[content] for content in set().union(*groups) - initial) if groups else 0
+    return best[-1], compulsory
+
+
+def transfer_bound(stats, events, executed, by_gpu, required):
+    if not isinstance(events, list) or any(not isinstance(event, dict) for event in events):
+        return ["invalid-transfer-proof-trace"], None, "unproved"
+    proofs = stats.get("proofs")
+    if not isinstance(proofs, list) or not proofs:
+        return ["missing-transfer-proof"], None, "unproved"
+    keys, total, compulsory, scoped = set(), 0, 0, True
+    for proof in proofs:
+        if (not isinstance(proof, dict) or not integer(proof.get("gpu"))
+                or proof["gpu"] not in executed or not integer(proof.get("rank"))
+                or not isinstance(proof.get("request"), str) or not proof["request"]):
+            return ["invalid-transfer-proof-identity"], None, "unproved"
+        key = (proof["gpu"], proof["rank"], proof["request"])
+        if proof["gpu"] in keys:
+            return ["duplicate-transfer-proof-gpu"], None, "unproved"
+        keys.add(proof["gpu"])
+        selected = [event for event in events if (event.get("gpu"), event.get("rank"), event.get("request")) == key]
+        if (not selected or selected[0].get("kind") != "begin"
+                or selected[-1].get("kind") != "end"):
+            return ["transfer-proof-trace-coverage"], None, "unproved"
+        if proof.get("isolated") is not True:
+            scoped = False
+            continue
+        try:
+            bound, distinct = window_lower_bound(proof, selected)
+        except (ValueError, KeyError, TypeError) as error:
+            return [str(error)], None, "unproved"
+        total += bound
+        compulsory += distinct
+        if 100 * by_gpu.get(proof["gpu"], 0) > 105 * bound:
+            return ["h2d-window-bound-inconclusive"], total, "inconclusive"
+    if keys != executed:
+        return ["transfer-proof-gpu-coverage"], None, "unproved"
+    if not scoped:
+        return (["transfer-proof-not-isolated"] if required else []), None, "shared-scope"
+    return [], total, f"sufficient:compulsory={compulsory}B"
+
+
+def movement_evidence(stats, events, executed, require_bound=True):
     """Check the existing Copy wire records without inventing missing measurements.
 
     Copy.ceiling/gbps are rounded to two decimals and pct to one by TensorFS. Cached
     disk reads deliberately carry no physical-disk ceiling. The trace carries mapped
-    spans, not copied payload lengths or a complete initial cache state, so it cannot
-    establish an offline traffic minimum for a nonzero transfer.
+    spans. The separate versioned catalog and complete demand trace permit a scoped
+    H2D window lower bound; it is never described as the full offline minimum.
     """
     errors = []
     facts = {"h2d_bytes": 0, "uncached_disk_bytes": 0, "cached_bytes": 0,
-             "percentages": [], "minimum_bytes": None}
+             "percentages": [], "minimum_bytes": None, "bound_bytes": None,
+             "bound_status": "unproved"}
+    by_gpu = {}
     copies = stats.get("copies")
     if not isinstance(copies, list):
         return ["missing-copy-evidence"], facts
@@ -178,6 +281,7 @@ def movement_evidence(stats, events, executed):
             continue
         if kind == "h2d":
             facts["h2d_bytes"] += size
+            by_gpu[gpu] = by_gpu.get(gpu, 0) + size
         else:
             facts["cached_bytes"] += cached
             facts["uncached_disk_bytes"] += size - cached
@@ -213,7 +317,11 @@ def movement_evidence(stats, events, executed):
     if (integer(paged) and valid and not errors and paged == 0 and not facts["h2d_bytes"]
             and not facts["uncached_disk_bytes"] and not fills):
         facts["minimum_bytes"] = 0
-    else:
+    if stats.get("proofs") is not None:
+        proof_errors, bound, status = transfer_bound(stats, events, executed, by_gpu, require_bound)
+        errors.extend(proof_errors)
+        facts.update(bound_bytes=bound, bound_status=status)
+    elif facts["minimum_bytes"] is None:
         errors.append("missing-transfer-minimum-evidence")
     return list(dict.fromkeys(errors)), facts
 
@@ -263,7 +371,7 @@ def record(path, cell, number, state, substitute, summary, slim=""):
             bar.append("no-mem-stats")
             continue
         if slim:
-            errors, movement = movement_evidence(value, events, executed)
+            errors, movement = movement_evidence(value, events, executed, "pair-" not in cell)
             bar.extend(errors)
             movements.append(movement)
         for field in ("leftover", "paged_in", "retries"):
@@ -325,6 +433,8 @@ def record(path, cell, number, state, substitute, summary, slim=""):
         known = bool(movements) and all(row["minimum_bytes"] == 0 for row in movements)
         percentages = ",".join(value for row in movements for value in row["percentages"])
         movement_label = (f"transfer_minimum={'0B' if known else 'unknown'} "
+                          f"h2d_window_lower_bound={sum(row['bound_bytes'] or 0 for row in movements)}B "
+                          f"h2d_bound_status={','.join(row['bound_status'] for row in movements) or 'unproved'} "
                           f"copy_ceiling_pct={percentages or '-'} ")
     print(f"{cell} run={number} {state} wall={wall:.0f}s exec={duration:.3f}s oom_retries={'-' if retries is None else retries} "
           f"poisoned={int(poisoned)} leftover={'-' if leftover is None else leftover} read={read_label}GB "
