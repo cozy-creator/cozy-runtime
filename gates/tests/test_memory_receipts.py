@@ -65,15 +65,25 @@ class MemoryReceipts(unittest.TestCase):
                 code = API["record"](path, cell, str(value["number"]), "completed landed", "", summary)
             return code, out.getvalue()
 
-    def compare(self, controls, candidate):
+    def compare(self, controls, candidate, strict=False):
         with tempfile.TemporaryDirectory() as directory:
             old, new = Path(directory) / "old.txt", Path(directory) / "new.txt"
             old.write_text(controls)
             new.write_text(candidate)
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
-                code = API["compare"](old, new, ["24"])
+                code = API["compare"](old, new, ["24"], strict)
             return code, out.getvalue()
+
+    def test_strict_performance_gate_requires_a_valid_matching_control(self):
+        current = "24-h3ref5 run=2 completed landed exec=100s poisoned=0 leftover=0 bar=ok\n"
+        valid = "24-h3ref5 run=1 completed landed exec=101s poisoned=0 leftover=0 bar=ok\n"
+        self.assertEqual(self.compare(valid, current, strict=True)[0], 0)
+        self.assertEqual(self.compare(valid.replace("101s", "99s"), current, strict=True)[0], 1)
+        for controls in ("", valid.replace("completed", "failed"), valid.replace("bar=ok", "bar=poisoned")):
+            self.assertEqual(self.compare(controls, current, strict=True)[0], 1)
+        self.assertEqual(self.compare(valid, current.replace("bar=ok", "substitute=32 bar=ok"), strict=True)[0], 1)
+        self.assertEqual(self.compare("", "", strict=True)[0], 1)
 
     def test_actual_current_receipt_leftover_cannot_pass(self):
         code, text = self.record(RAW)

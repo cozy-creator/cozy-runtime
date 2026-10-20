@@ -240,7 +240,11 @@ def compare(baseline, candidate, cards, strict=False):
         return card in asked and (not asked[card] or name in asked[card] or name in ("klein-a", "klein-b"))
     old, here = cells(baseline), cells(candidate)
     worse = invalid = 0
-    for cell in sorted(c for c in set(old) | set(here) if wanted(c)):
+    selected = sorted(c for c in set(old) | set(here) if wanted(c))
+    if strict and not selected:
+        print("FAIL: no selected baseline or candidate cells")
+        invalid += 1
+    for cell in selected:
         control, current = old.get(cell), here.get(cell)
         if current is None or current.get("status") != "completed" or not current.get("landed") or current.get("bar") != "ok":
             why = f"FAIL absolute: {current.get('bar', '?') if current else 'no candidate run'}"
@@ -248,9 +252,11 @@ def compare(baseline, candidate, cards, strict=False):
         elif not strict and not cell.endswith("-warm"):
             why = "absolute bar ok (relative timing applies to warm cells)"
         elif current.get("substitute"):
-            why = f"not compared: candidate substitute {current['substitute']}; absolute bars remain"
+            why = f"{'FAIL' if strict else 'not compared'}: candidate substitute {current['substitute']}; absolute bars remain"
+            invalid += int(strict)
         elif bad := control_reason(control):
-            why = f"not compared: {bad}; absolute bars remain"
+            why = f"{'FAIL' if strict else 'not compared'}: {bad}; absolute bars remain"
+            invalid += int(strict)
         elif seconds(current) is None:
             why = "FAIL: candidate execution time missing or invalid"
             invalid += 1
