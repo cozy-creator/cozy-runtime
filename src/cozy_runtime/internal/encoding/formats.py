@@ -479,7 +479,7 @@ class RowwiseDequant:
 
     @property
     def code_revision(self) -> str:
-        return "4"
+        return "3"
 
     @property
     def suite(self) -> str:

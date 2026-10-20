@@ -29,6 +29,8 @@ def test_every_scheme_has_its_parts_and_nothing_else() -> None:
         "int8.tensorwise": ({"weight", "scale"}, {"input_scale"}),
         "fp8.rowwise": ({"weight", "scale"}, set()),
         "int8.rowwise": ({"weight", "scale"}, set()),
+        "fp8.columnwise": ({"weight", "scale"}, set()),
+        "int8.columnwise": ({"weight", "scale"}, set()),
         "int8.convrot": ({"weight", "scale"}, set()),
         "mxfp8": ({"weight", "scale"}, set()),
         "nvfp4": ({"weight", "scale", "scale_2"}, {"input_scale"}),
