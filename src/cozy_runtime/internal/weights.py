@@ -688,12 +688,20 @@ class Residency:
         stay bound until the last reference to the pin goes, so a replay in flight keeps them.
         None when part of the component streams (a slot's address moves)."""
         key = (component, owner)
-        held = self.pins.get(key)
-        if held is not None:
-            return held
         model = self.models.get(component)
         if model is None:
             return None
+        version = model.fill.prepare() if model.fill is not None else None
+        if version != model.version:
+            # Replays bypass the module's prehook. Shed old recordings without
+            # borrowing their bindings; the eager forward refreshes the content.
+            for (name, _), token in tuple(self.pins.items()):
+                if name == component:
+                    token.cache.shrink(token.nbytes)
+            return None
+        held = self.pins.get(key)
+        if held is not None:
+            return held
 
         token_ref: weakref.ReferenceType[_Pin] | None = None
 
