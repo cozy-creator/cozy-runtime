@@ -7,20 +7,46 @@ import re
 import sys
 
 
+TIMESTAMP = r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?Z"
+PLAIN = re.compile(
+    TIMESTAMP + r"[ \t]+INFO tensord::gpu_service: GPU memory capacity(?:[ \t]+(.*))?"
+)
+NUMBERS = ("physical_bytes", "configured_limit_bytes", "effective_limit_bytes")
+
+
+def plain_row(line):
+    match = PLAIN.fullmatch(line)
+    if match is None:
+        return None
+    fields = {}
+    for term in (match[1] or "").split():
+        key, separator, value = term.partition("=")
+        if not separator or key in fields:
+            raise ValueError("malformed native GPU capacity fields")
+        fields[key] = value
+    if set(fields) != {"gpu", "generation", *NUMBERS}:
+        raise ValueError("incomplete native GPU capacity fields")
+    for key in NUMBERS:
+        if re.fullmatch(r"[0-9]+", fields[key]) is None:
+            raise ValueError("invalid native GPU capacity number")
+        fields[key] = int(fields[key])
+    return {"message": "GPU memory capacity", **fields}
+
+
 def events(text):
-    """Read tracing JSON, including JSON-string log envelopes printed by the public CLI."""
+    """Read whole native tracing rows or the public CLI's TensorD log envelope."""
     try:
         value = json.loads(text)
     except ValueError:
         for line in text.splitlines():
-            start = line.find("{")
-            if start < 0:
-                continue
             try:
-                value, _ = json.JSONDecoder().raw_decode(line[start:])
+                value = json.loads(line)
             except ValueError:
-                continue
-            yield from objects(value)
+                row = plain_row(line)
+                if row is not None:
+                    yield row
+            else:
+                yield from objects(value)
     else:
         yield from objects(value)
 
@@ -33,15 +59,14 @@ def objects(value):
                 value.get("target") == "tensord::gpu_service"
                 and value.get("level") == "INFO"
                 and fields.get("message") == "GPU memory capacity"
+                and isinstance(value.get("timestamp"), str)
+                and re.fullmatch(TIMESTAMP, value["timestamp"]) is not None
             ):
                 yield fields
             # Other tracing messages are opaque, including captured executor output.
-        else:
-            for child in value.values():
-                if isinstance(child, str):
-                    yield from events(child)
-                elif isinstance(child, (dict, list)):
-                    yield from objects(child)
+        elif (value.get("log") == "tensord" and isinstance(value.get("machine"), str)
+              and value["machine"] and isinstance(value.get("text"), str)):
+            yield from events(value["text"])
     elif isinstance(value, list):
         for child in value:
             yield from objects(child)
