@@ -5,6 +5,7 @@
 """Run Torch placement and TensorFS reader checks on an explicitly rented GPU."""
 
 import os
+import json
 import re
 import signal
 import subprocess
@@ -17,6 +18,42 @@ from pathlib import Path
 from typing import Annotated
 
 from cozy_runtime.author import AssetBound, FileAsset, Outputs, Tree
+
+FAILURE_BOUNDARY = b"# SLIM_REQUEST_FAILURE_PROOF\n"
+FAILURE_MARKER = "PASS actual failed-request slack release with warm weights and cache preserved"
+
+
+def physical_uuid(value: object) -> str:
+    if not isinstance(value, str):
+        raise RuntimeError("the CUDA proof did not report a physical UUID")
+    normalized = value.lower().removeprefix("gpu-").replace("-", "")
+    if re.fullmatch(r"[0-9a-f]{32}", normalized) is None:
+        raise RuntimeError(f"the CUDA proof reported an invalid physical UUID: {value!r}")
+    return normalized
+
+
+def verify_failed_request(accounted: str, device_output: str) -> None:
+    if accounted.count(FAILURE_MARKER) != 1:
+        raise RuntimeError("the three failed-request cleanup cases did not finish")
+    reports = []
+    for line in accounted.split(FAILURE_MARKER, 1)[1].splitlines():
+        try:
+            report = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(report, dict) and set(report) == {"cases", "gpu"}:
+            reports.append(report)
+    if len(reports) != 1:
+        raise RuntimeError("failed-request cleanup must report one three-case result")
+    cases = reports[0]["cases"]
+    if (not isinstance(cases, list) or len(cases) != 3
+            or any(not isinstance(case, dict) for case in cases)
+            or [case.get("kind") for case in cases] != ["returned", "escaping", "success"]):
+        raise RuntimeError("failed-request cleanup omitted its returned/escaping/success cases")
+    expected = [physical_uuid(line.removeprefix("SLIM_DEVICE_UUID "))
+                for line in device_output.splitlines() if line.startswith("SLIM_DEVICE_UUID ")]
+    if len(expected) != 1 or physical_uuid(reports[0]["gpu"]) != expected[0]:
+        raise RuntimeError("failed-request cleanup used a different physical GPU")
 
 
 def main(
@@ -52,7 +89,9 @@ def main(
     runtime_artifact = supplied_wheel(runtime_wheel, "cozy-runtime")
     (root / "test_slim_varena_gpu.py").write_bytes(tests.read_bytes())
     (root / "test_graph_cache_gpu.py").write_bytes(graph_tests.read_bytes())
-    (root / "cuda_cache_accounting.py").write_bytes(accounting.read_bytes())
+    accounting_source = accounting.read_bytes()
+    failure_requested = FAILURE_BOUNDARY in accounting_source
+    (root / "cuda_cache_accounting.py").write_bytes(accounting_source)
     (root / "conftest.py").write_bytes(conftest.read_bytes())
     (root / "cuda_read_engine.py").write_bytes(read_engine.read_bytes())
     logs = root / "logs"
@@ -112,21 +151,28 @@ def main(
             "torch==2.14.0",
         ],
     )
-    run(
+    device_code = (
+        "import sys, cozy_runtime, tensorfs, torch; "
+        "assert cozy_runtime.__file__.startswith(sys.prefix); "
+        "assert tensorfs.__file__.startswith(sys.prefix); "
+        "assert torch.cuda.device_count() == 1; "
+        "print(torch.cuda.get_device_properties(0))"
+    )
+    if failure_requested:
+        device_code += "; print('SLIM_DEVICE_UUID ' + str(torch.cuda.get_device_properties(0).uuid))"
+    device_output = run(
         "device",
         [
             python,
             "-c",
-            "import sys, cozy_runtime, tensorfs, torch; "
-            "assert cozy_runtime.__file__.startswith(sys.prefix); "
-            "assert tensorfs.__file__.startswith(sys.prefix); "
-            "assert torch.cuda.device_count() == 1; "
-            "print(torch.cuda.get_device_properties(0))",
+            device_code,
         ],
     )
     accounted = run("cache-accounting", [python, "cuda_cache_accounting.py"])
     if "CUDA cache accounting: owned growth, real leaks, symmetric shrink" not in accounted:
         raise RuntimeError("the CUDA cache accounting checks did not finish")
+    if failure_requested:
+        verify_failed_request(accounted, device_output)
     result = run(
         "tests",
         [
