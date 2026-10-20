@@ -267,8 +267,8 @@ class Backend:
         return frozenset(self.checkpoints)
 
     def ahead(self) -> None:
-        """Before the factory runs, each bound component's grant. A held host tier is adopted
-        now and its copies to the GPU run while the module is built (memory-varena §5.4)."""
+        """Before the factory runs, each bound component's grant: its objects fetched while the
+        module is built. The load registers it, held or sealed, the one way it loads any time."""
         started = time.perf_counter()
         for name in self.checkpoints:
             self._granted(name)
@@ -497,8 +497,8 @@ class Backend:
         )
 
     def _granted(self, name: str, *, chunks: bool = False) -> WeightGrant:
-        """A component's grant, asked of TensorD once: its sealed host tier, adopted at once
-        and copying to the GPU, else its chunk files."""
+        """A component's grant, asked of TensorD once: its sealed host tier, else its chunk
+        files."""
         if chunks and name in self.grants:
             _close(self.grants.pop(name))
         grant = self.grants.get(name)
@@ -515,7 +515,6 @@ class Backend:
                     pages=tuple(pages), fingerprint=fingerprint,
                 )
             self.grants[name] = grant
-            self.memory.adopt(grant)
         return grant
 
     def keep(self, *, quiescent: bool = False) -> None:
@@ -530,10 +529,9 @@ class Backend:
                 self.keeper(self._layout(name), fingerprint, pages)
 
     def _release(self) -> None:
-        """Grants no registration took, and what `ahead` adopted for them."""
+        """Grants no registration took."""
         for name in list(self.grants):
             _close(self.grants.pop(name))
-        self.memory.unclaimed()
 
     def _objects(self, checkpoint: Checkpoint) -> list[tuple[str, int]]:
         """Every chunk of the manifest's selected components, `(sha256, length)` in sha256
