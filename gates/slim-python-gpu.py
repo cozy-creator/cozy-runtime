@@ -2,7 +2,7 @@
 # requires-python = ">=3.12"
 # dependencies = ["cozy-runtime==0.27.4"]
 # ///
-"""Run the supplied TensorFS wheel's Torch regressions on an explicitly rented GPU."""
+"""Run Torch placement and TensorFS reader checks on an explicitly rented GPU."""
 
 import os
 import re
@@ -24,6 +24,7 @@ def main(
     wheel: Annotated[FileAsset, AssetBound(max_bytes=67108864)],
     tests: Annotated[FileAsset, AssetBound(max_bytes=131072)],
     conftest: Annotated[FileAsset, AssetBound(max_bytes=131072)],
+    read_engine: Annotated[FileAsset, AssetBound(max_bytes=131072)],
     out: Outputs,
 ) -> Tree:
     root = Path(tempfile.mkdtemp(prefix="slim-python-gpu-"))
@@ -41,6 +42,7 @@ def main(
     artifact.write_bytes(contents)
     (root / "test_slim_varena_gpu.py").write_bytes(tests.read_bytes())
     (root / "conftest.py").write_bytes(conftest.read_bytes())
+    (root / "cuda_read_engine.py").write_bytes(read_engine.read_bytes())
     logs = root / "logs"
     logs.mkdir()
     environment_vars = os.environ.copy()
@@ -122,4 +124,7 @@ def main(
     }
     if counts != {"passed": 2}:
         raise RuntimeError(f"expected two executed CUDA tests, got {counts}")
+    reader = run("read-engine", [python, "cuda_read_engine.py"])
+    if "CUDA arrays: chunk-spanning reads, prebuilt decode, raw parts" not in reader:
+        raise RuntimeError("the native CUDA reader did not finish its real consumer checks")
     return out.save_tree(logs)
