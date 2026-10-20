@@ -3391,6 +3391,7 @@ class Executor:
         warnings: list[WarningRow] = []
         request: MemoryRequest | None = None
         rank_memory: list[ReplyMemory] = []
+        outcome = classify(None)
         try:
             with (
                 WARNINGS.attempt() as warnings,
@@ -3398,7 +3399,9 @@ class Executor:
                     command.request_id, shape=shape_cell(prepared.features.values)
                 ) as request,
                 self._ranks_request(
-                    command.request_id, shape=shape_cell(prepared.features.values)
+                    command.request_id,
+                    shape=shape_cell(prepared.features.values),
+                    failed=lambda: outcome.terminal != "succeeded",
                 ) as rank_memory,
                 attention.override(self._attention_snapshot(), self._attention_roots(), swap, pin)
                 if pin
@@ -3463,14 +3466,26 @@ class Executor:
                             ),
                         ),
                     )
+                if request is not None and outcome.terminal != "succeeded":
+                    request.mark_failed()
                 if capture is not None and outcome.terminal == "succeeded":
                     capture_result = capture.write(spool)
         except Exception as exc:
-            envelope, outcome = None, classify(exc)
+            envelope = None
+            if outcome.terminal == "succeeded":
+                outcome = classify(exc)
+            elif record is not None:
+                record.emit("log", "request cleanup failed", "warn", detail=ends(str(exc), 900))
             unwind(exc)
             if record is None:
                 record = AuthorAttempt(command.request_id, spool, 0, sink=progress)
         assert record is not None
+        if request is not None:
+            for cleanup_error in request.cleanup_errors:
+                record.emit(
+                    "log", "request cleanup failed", "warn",
+                    code=classify(cleanup_error).code, detail=ends(str(cleanup_error), 900),
+                )
         self.handled[command.request_id] = (outcome, stage[0], record)
         if self.rank == 0:
             for member in self.model_executors or [self]:
@@ -3954,7 +3969,16 @@ class Executor:
                 state.request.plan(target._memory_steps(command.steps))
         else:
             self.host._rank_request = None
+            if command.failed and state.request is not None:
+                state.request.mark_failed()
             state.context.__exit__(None, None, None)
+            if state.request is not None and state.request.cleanup_errors:
+                errors = state.request.cleanup_errors
+                return RankMemory(
+                    ok=False, rank=self.rank, request_id=command.request_id,
+                    code=classify(errors[0]).code,
+                    detail=ends("; ".join(str(error) for error in errors), 900),
+                )
             memory = request_memory.measured(
                 state.request.stats if state.request is not None else None,
                 _gpu_numbers(self.world),
@@ -3979,16 +4003,22 @@ class Executor:
             or any(not reply.ok or reply.request_id != command.request_id for reply in replies)
         ):
             self.poisoned = "group request memory did not settle on every rank"
-            raise GroupRefusal(self.poisoned, code="group_broken")
+            details = "; ".join(
+                f"rank {reply.rank}: {reply.code}: {reply.detail}" for reply in replies if not reply.ok
+            )
+            raise GroupRefusal(self.poisoned + (f": {details}" if details else ""), code="group_broken")
         return replies
 
     @contextlib.contextmanager
-    def _ranks_request(self, request_id: str, *, shape: str = "") -> Iterator[list[ReplyMemory]]:
+    def _ranks_request(
+        self, request_id: str, *, shape: str = "", failed: Callable[[], bool] | None = None
+    ) -> Iterator[list[ReplyMemory]]:
         records: list[ReplyMemory] = []
         if self.group is None:
             yield records
             return
         begun = False
+        body_error: BaseException | None = None
         try:
             self._rank_memory_command(
                 executor_commands.RequestMemory(
@@ -4000,30 +4030,41 @@ class Executor:
             )
             begun = True
             yield records
+        except BaseException as error:
+            body_error = error
+            raise
         finally:
-            if not self.group.broken:
-                command = executor_commands.RequestMemory(
-                    construction=self.construction, request_id=request_id, phase="end"
-                )
-                if begun:
-                    replies = self._rank_memory_command(command)
-                    memory = self.host.memory
-                    if memory is not None and memory.cuda:
-                        devices = _gpu_numbers(self.world)
-                        if len(devices) != self.world or any(
-                            reply.memory is None
-                            or reply.memory.leftover < 0
-                            or reply.memory.leftover_by_gpu
-                            != [(devices[reply.rank], reply.memory.leftover)]
-                            for reply in replies
-                        ):
-                            self.poisoned = "a GPU rank omitted its own request memory evidence"
-                            raise GroupRefusal(self.poisoned, code="group_broken")
-                    records.extend(reply.memory for reply in replies if reply.memory is not None)
-                else:
-                    # A partial begin still closes the ranks that entered; the original
-                    # refusal, not an absent state on another rank, remains the failure.
-                    self.group.call(executor_commands.encode(command))
+            try:
+                if not self.group.broken:
+                    command = executor_commands.RequestMemory(
+                        construction=self.construction,
+                        request_id=request_id,
+                        phase="end",
+                        failed=body_error is not None or (failed is not None and failed()),
+                    )
+                    if begun:
+                        replies = self._rank_memory_command(command)
+                        memory = self.host.memory
+                        if memory is not None and memory.cuda:
+                            devices = _gpu_numbers(self.world)
+                            if len(devices) != self.world or any(
+                                reply.memory is None
+                                or reply.memory.leftover < 0
+                                or reply.memory.leftover_by_gpu
+                                != [(devices[reply.rank], reply.memory.leftover)]
+                                for reply in replies
+                            ):
+                                self.poisoned = "a GPU rank omitted its own request memory evidence"
+                                raise GroupRefusal(self.poisoned, code="group_broken")
+                        records.extend(reply.memory for reply in replies if reply.memory is not None)
+                    else:
+                        # A partial begin still closes the ranks that entered; the original
+                        # refusal, not an absent state on another rank, remains the failure.
+                        self.group.call(executor_commands.encode(command))
+            except BaseException as cleanup_error:
+                if body_error is None:
+                    raise
+                body_error.add_note(f"rank memory cleanup failed: {cleanup_error}")
 
     def _memory_steps(self, steps: Sequence[str | Collection[str]]) -> list[Any]:
         """Resolve labels within this construction, never another tenant's loaded models."""

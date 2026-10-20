@@ -22,9 +22,11 @@ torch = pytest.importorskip("torch")
 from tensorfs.varena.torch import Copy, Eviction, Memory, Step  # noqa: E402
 
 from cozy_runtime.author import App, Context  # noqa: E402
+from cozy_runtime.author._errors import classify  # noqa: E402
 from cozy_runtime.author._invoke import Invocation, prepare, run_prepared  # noqa: E402
 from cozy_runtime.internal import request_memory, spawn  # noqa: E402
 from cozy_runtime.internal.executor import Executor, serve  # noqa: E402
+from cozy_runtime.internal.executor_commands import RequestMemory  # noqa: E402
 from cozy_runtime.internal.executor_replies import Copy as ReplyCopy  # noqa: E402
 from cozy_runtime.internal.executor_replies import Memory as ReplyMemory  # noqa: E402
 from cozy_runtime.internal.executor_replies import RankMemory  # noqa: E402
@@ -65,7 +67,8 @@ def follower(tmp_path: Path) -> Iterator[tuple[Executor, Channel]]:
 
 
 def command(
-    peer: Channel, phase: str, request_id: str = "request", steps: tuple[tuple[str, ...], ...] = ()
+    peer: Channel, phase: str, request_id: str = "request", steps: tuple[tuple[str, ...], ...] = (),
+    *, failed: bool = False,
 ) -> RankMemory:
     peer.send(
         {
@@ -74,6 +77,7 @@ def command(
             "request_id": request_id,
             "phase": phase,
             "steps": steps,
+            "failed": failed,
         }
     )
     return msgspec.convert(peer.recv(), RankMemory, strict=True)
@@ -120,6 +124,32 @@ def test_weightless_follower_request_returns_no_gpu_evidence(tmp_path: Path) -> 
         assert command(peer, "plan", steps=(("component",),)).ok
         ended = command(peer, "end")
         assert ended.ok and ended.memory is None and worker._rank_request is None
+
+
+def test_failed_end_marks_actual_follower_request_and_next_request_stays_healthy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tensorfs.varena.torch import Request
+
+    marked: list[Request] = []
+    mark_failed = Request.mark_failed
+
+    def observe(request: Request) -> None:
+        assert request in request.memory.active
+        marked.append(request)
+        mark_failed(request)
+
+    monkeypatch.setattr(Request, "mark_failed", observe)
+    with follower(tmp_path) as (worker, peer):
+        assert command(peer, "begin", "failed").ok
+        assert command(peer, "end", "failed", failed=True).ok
+        assert [request.id for request in marked] == ["failed"]
+        assert marked[0].stats is not None and not marked[0].cleanup_errors
+        assert command(peer, "begin", "healthy").ok
+        assert command(peer, "end", "healthy").ok
+        assert [request.id for request in marked] == ["failed"]
+        assert worker.memory is not None and not worker.memory.active
+        assert not worker.memory_requests and worker._rank_request is None
 
 
 def test_single_rank_keeps_its_local_request_plan_and_reply(tmp_path: Path) -> None:
@@ -218,7 +248,10 @@ def test_real_cpu_context_stats_map_logical_two_gpu_facts_to_lane_two_three() ->
         request_memory.measured(facts, [])
 
 
-def test_group_forwards_plans_and_closes_every_request_after_failure(tmp_path: Path) -> None:
+@pytest.mark.parametrize("terminal", ["failed", "canceled"])
+def test_group_forwards_plans_and_closes_every_request_after_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, terminal: str,
+) -> None:
     fixture = Path(__file__).parent / "testdata/request_memory_follower.py"
 
     def launch(argv: list[str], fd: int) -> spawn.Child:
@@ -239,21 +272,44 @@ def test_group_forwards_plans_and_closes_every_request_after_failure(tmp_path: P
     leader = Executor(Channel(left), tmp_path, world=2, construction="construction")
     leader.memory = Memory.open(torch.device("cpu"))
     leader.group = group
+    commands: list[RequestMemory] = []
+    send = leader._rank_memory_command
+    cleanup_failure: ValueError | None = None
+
+    def observe(command: RequestMemory) -> list[RankMemory]:
+        commands.append(command)
+        replies = send(command)
+        if command.phase == "end" and cleanup_failure is not None:
+            raise cleanup_failure
+        return replies
+
+    monkeypatch.setattr(leader, "_rank_memory_command", observe)
     app = App()
+    cancelled = [False]
 
     @app.entrypoint(accelerator=False)
     def planned(ctx: Context, payload: Empty) -> Empty:
         ctx.plan("old")
         ctx.plan({"right", "left"}, "last")
+        if terminal == "canceled":
+            cancelled[0] = True
+            ctx.raise_if_cancelled()
         raise ValueError("request failure")
 
     prepared = prepare(app.get("planned"), {})
+    outcome = classify(None)
+
+    def outcome_failed() -> bool:
+        return outcome.terminal != "succeeded"
+
     group.spawn()
     try:
         for request_id in ("first", "after-failure"):
+            outcome = classify(None)
+            cancelled[0] = False
             with (
                 leader._request(request_id) as request,
-                leader._ranks_request(request_id) as replies,
+                leader._ranks_request(request_id, failed=outcome_failed) as replies,
             ):
                 _, outcome, _ = run_prepared(
                     prepared,
@@ -262,14 +318,32 @@ def test_group_forwards_plans_and_closes_every_request_after_failure(tmp_path: P
                         tmp_path / request_id,
                         time.monotonic() + 30,
                         plan=functools.partial(leader._plan_request, request_id),
+                        cancel=lambda: cancelled[0],
                     ),
                 )
-                assert outcome.terminal == "failed" and "request failure" in outcome.message
+                assert outcome.terminal == terminal
+                if terminal == "failed":
+                    assert "request failure" in outcome.message
+                assert request is not None
+                request.mark_failed()
             assert request is not None and request.stats is not None
             assert len(replies) == 1 and replies[0].plan == [["left", "right"], ["last"]]
             assert not leader.memory.active and not leader.memory_requests
             own = request_memory.measured(request.stats, [])
             assert own is not None and request_memory.combined([own, *replies]) is not None
+            assert commands[-1].phase == "end" and commands[-1].failed
+
+        original = RuntimeError("body failure must stay primary")
+        cleanup_failure = ValueError("rank cleanup transport failed after closing")
+        with pytest.raises(RuntimeError) as caught:
+            with leader._request("escaping"), leader._ranks_request("escaping"):
+                raise original
+        assert caught.value is original
+        assert original.__notes__ == [
+            "rank memory cleanup failed: rank cleanup transport failed after closing"
+        ]
+        assert commands[-1].phase == "end" and commands[-1].failed
+        assert not leader.memory.active and not leader.memory_requests
     finally:
         group.close()
         left.close()

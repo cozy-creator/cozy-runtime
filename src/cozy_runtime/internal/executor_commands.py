@@ -91,6 +91,7 @@ class RequestMemory(Command, frozen=True, kw_only=True, tag="request_memory"):
     phase: Literal["begin", "plan", "end"]
     shape: str = ""
     steps: tuple[tuple[str, ...], ...] = ()
+    failed: bool = False
 
 
 class Activate(Command, frozen=True, kw_only=True, tag="activate"):

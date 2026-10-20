@@ -21,6 +21,7 @@ from cozy_runtime.internal.discovery import discover  # noqa: E402
 from cozy_runtime.internal.executor import _SEALED, Executor  # noqa: E402
 from cozy_runtime.internal.executor_commands import Activate, Invoke, Load, PrepareRequest, Start  # noqa: E402
 from cozy_runtime.internal.seam import Channel  # noqa: E402
+from tensorfs.varena.torch import Memory, Request as MemoryRequest  # noqa: E402
 
 MODULE = "request_isolation_fixture"
 SOURCE = """
@@ -146,6 +147,55 @@ def test_handler_refusals_and_cancels_keep_the_generation_ready(
     assert canceled["outcome"]["terminal"] == "canceled"
     assert not executor.poisoned and not refused["poisoned"] and not canceled["poisoned"]
     assert _serve(executor, "served", "ok")["outcome"]["terminal"] == "succeeded"
+
+
+@pytest.mark.parametrize("mode", ["ok", "fail", "refuse", "cancel"])
+def test_returned_outcome_marks_the_real_memory_request_before_cleanup(
+    host: tuple[Executor, dict[str, Any]], monkeypatch: pytest.MonkeyPatch, mode: str,
+) -> None:
+    process, load = host
+    assert process.load(msgspec.convert({**load, "construction": "a"}, Load))["ok"]
+    assert process.activate(Activate(construction="a"))["ok"]
+    memory = process.memory = Memory.open(torch.device("cpu"))
+    marked: list[MemoryRequest] = []
+    mark_failed = MemoryRequest.mark_failed
+
+    def observe(request: MemoryRequest) -> None:
+        assert request in memory.active and request.id in process.memory_requests
+        marked.append(request)
+        mark_failed(request)
+
+    monkeypatch.setattr(MemoryRequest, "mark_failed", observe)
+    reply = _serve(process, "outcome", mode)
+    assert reply["outcome"]["terminal"] == {
+        "ok": "succeeded", "fail": "failed", "refuse": "refused", "cancel": "canceled",
+    }[mode]
+    assert [request.id for request in marked] == ([] if mode == "ok" else ["outcome"])
+    assert not memory.active and not process.memory_requests and not process.poisoned
+    assert all(request.stats is not None and not request.cleanup_errors for request in marked)
+
+
+def test_cleanup_failure_does_not_replace_the_returned_author_failure(
+    host: tuple[Executor, dict[str, Any]], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process, load = host
+    assert process.load(msgspec.convert({**load, "construction": "a"}, Load))["ok"]
+    assert process.activate(Activate(construction="a"))["ok"]
+    memory = process.memory = Memory.open(torch.device("cpu"))
+    measure = memory._measure
+
+    def failed_measurement() -> None:
+        raise ValueError("cleanup measurement unavailable")
+
+    monkeypatch.setattr(memory, "_measure", failed_measurement)
+    reply = _serve(process, "failed-cleanup", "fail")
+    assert reply["outcome"]["code"] == "unhandled_exception"
+    assert "handler state is now unknown" in reply["outcome"]["message"]
+    assert "cleanup measurement unavailable" not in reply["outcome"]["message"]
+    assert "cleanup measurement unavailable" in msgspec.json.encode(reply["observations"]).decode()
+    assert not memory.active and not process.memory_requests
+    monkeypatch.setattr(memory, "_measure", measure)
+    assert _serve(process, "after-cleanup", "ok")["outcome"]["terminal"] == "succeeded"
 
 
 @pytest.mark.parametrize(
