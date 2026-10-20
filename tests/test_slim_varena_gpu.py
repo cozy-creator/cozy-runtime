@@ -11,22 +11,23 @@ import pytest
 torch = pytest.importorskip("torch")
 import tensorfs  # noqa: E402
 from tensorfs.varena.torch import Block, Declared, Memory, Source  # noqa: E402
-from torch import nn  # noqa: E402
+from torch import Tensor, nn  # noqa: E402
 
 
-class Burst(nn.Module):
-    def __init__(self, nbytes: int, child: Callable[[], object] | None = None) -> None:
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(()))
-        self.nbytes, self.child = nbytes, child
+def burst(nbytes: int, child: Callable[[], object] | None = None) -> nn.Module:
+    model = nn.Module()
+    model.register_parameter("weight", nn.Parameter(torch.ones(())))
 
-    def forward(self) -> torch.Tensor:
-        temporary = torch.empty(self.nbytes, dtype=torch.uint8, device=self.weight.device)
+    def forward() -> Tensor:
+        temporary = torch.empty(nbytes, dtype=torch.uint8, device=model.weight.device)
         temporary.zero_()
         del temporary
-        if self.child is not None:
-            self.child()
-        return self.weight + 1
+        if child is not None:
+            child()
+        return model.weight + 1
+
+    model.forward = forward
+    return model
 
 
 def weights(folder: Path, names: tuple[str, ...]) -> tensorfs.Checkpoint:
@@ -41,8 +42,8 @@ def test_nested_model_keeps_the_outer_measured_peak(tmp_path: Path) -> None:
     assert torch.cuda.device_count() == 1
     ck = weights(tmp_path, ("outer", "inner"))
     with torch.device("meta"):
-        inner = Burst(10 << 20)
-        outer = Burst(100 << 20, lambda: inner())
+        inner = burst(10 << 20)
+        outer = burst(100 << 20, lambda: inner())
     memory = Memory.open(torch.device("cuda", 0))
     try:
         a = memory.load(outer, ck=ck, component="outer")
@@ -63,7 +64,7 @@ def test_native_refill_does_not_hold_python_memory_lock(tmp_path: Path) -> None:
     assert torch.cuda.device_count() == 1
     ck = weights(tmp_path, ("model",))
     with torch.device("meta"):
-        model = Burst(0)
+        model = burst(0)
     memory = Memory.open(torch.device("cuda", 0))
     entered, acquired = threading.Event(), threading.Event()
 
@@ -73,7 +74,7 @@ def test_native_refill_does_not_hold_python_memory_lock(tmp_path: Path) -> None:
         def prepare(self) -> int:
             return self.version
 
-        def __call__(self, _block: Block, parts: Mapping[str, Mapping[str, torch.Tensor]]) -> None:
+        def __call__(self, _block: Block, parts: Mapping[str, Mapping[str, Tensor]]) -> None:
             if self.version == 2:
                 entered.set()
                 assert acquired.wait(10), "native refill held Memory.lock"

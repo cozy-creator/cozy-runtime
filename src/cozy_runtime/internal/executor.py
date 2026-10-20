@@ -2436,8 +2436,6 @@ class Executor:
             model_class=f"{model_cls.__module__}:{model_cls.__qualname__}",
             components=tuple(names),
             custody=binding.custody,
-            rank=self.rank,
-            world=self.world,
         )
         # CONSENT IS AN INPUT TO RESOLUTION (#549.1). It used to fire at `materialize`, with
         # the plan already chosen and the package already imported; a plan whose route the
@@ -2496,7 +2494,14 @@ class Executor:
         device = self._rank_device(torch)
         if host.memory is None:
             try:
-                grant = tuple(host.ledgers[:3]) if device.type == "cuda" and host.ledgers else None
+                grant: tuple[int, int, int] | None = None
+                if device.type == "cuda" and host.ledgers:
+                    if len(host.ledgers) % 3:
+                        raise SeamError(
+                            "seam_descriptor", "a rank grant requires three descriptors"
+                        )
+                    table, events, custody = host.ledgers[:3]
+                    grant = (table, events, custody)
                 host.memory = Memory.open(device, grant)
             except VarenaUnsupported as exc:  # no varena on this OS (Windows)
                 return {"ok": False, "code": "weight_plane_unavailable", "detail": str(exc)}

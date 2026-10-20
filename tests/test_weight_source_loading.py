@@ -11,7 +11,7 @@ import pytest
 torch = pytest.importorskip("torch")
 import tensorfs  # noqa: E402
 from tensorfs.varena.torch import Declared, Memory, Source, regions_of  # noqa: E402
-from torch import nn  # noqa: E402
+from torch import Tensor, nn  # noqa: E402
 
 DIM, BLOCKS = 64, 4
 
@@ -95,7 +95,7 @@ def test_partial_binding_failure_restores_the_model_and_allows_retry(tmp_path: P
     failure = ValueError("cannot bind bias")
     bound: list[str] = []
 
-    def bind(key: str, parts: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    def bind(key: str, parts: Mapping[str, Tensor]) -> dict[str, Tensor]:
         bound.append(key)
         if key == "bias":
             assert model.weight.device.type == "cpu"  # the earlier write really happened
