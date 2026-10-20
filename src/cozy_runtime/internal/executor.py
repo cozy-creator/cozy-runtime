@@ -777,7 +777,9 @@ class Executor:
         self.host: Executor = host or self
         #: HOST ONLY: each signer's newest bearer for each endpoint, which the seam keeps
         #: current as it reads (`Mux`) and every TensorFS request asks (`weights_store.Bearer`)
-        self.bearers = host.bearers if host is not None else weights_store.Bearers()
+        self.bearers: weights_store.Bearers = (
+            host.bearers if host is not None else weights_store.Bearers()
+        )
         #: HOST ONLY: the seam every thread reads through, the attempts in flight and the lock
         #: their fetch channel opens and closes under
         self.mux: Mux = (
