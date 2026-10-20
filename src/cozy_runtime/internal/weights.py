@@ -11,13 +11,12 @@ what Runtime mechanisms reach a placed component through: graph pins, KV caches 
 
 from __future__ import annotations
 
-import os
 import time
 import weakref
 import zlib
 from collections import Counter
-from collections.abc import Callable, Collection, Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
@@ -27,8 +26,8 @@ from tensorfs.varena.torch import (
     Memory,
     Model,
     Shrink,
+    Source,
     Unbound,
-    WeightGrant,
     blocks_of,
 )
 
@@ -69,18 +68,6 @@ if TYPE_CHECKING:
     from torch import Tensor
     from torch.nn import Module
 
-#: A weight set's held bytes from TensorD (`ReadGrant`), by manifest and layout digest: the host
-#: layout deposited for it, the GPU pages kept of it `(region, fd)` and their fingerprint;
-#: `(None, [], "")` when it holds none, and varena reads the checkpoint.
-type Grant = Callable[[str, str], tuple[int | None, list[tuple[int, int]], str]]
-#: GPU pages varena kept, given to TensorD (`KeepPages`): layout digest, fingerprint, and
-#: `(region, span, fd)` each (the callee's to close).
-type Keep = Callable[[str, str, list[tuple[int, int, int]]], None]
-#: A host layout varena sealed, deposited with TensorD (`Deposit`): manifest, name, layout
-#: digest, the memfd (the callee's to close).
-type Deposit = Callable[[str, str, str, int], None]
-
-
 # ---------------------------------------------------------------------------- the backend
 
 
@@ -101,13 +88,9 @@ class Backend:
         qualified: tuple[Capabilities, QualificationResult],
         device_facts: DeviceFacts,
         custody: str = "canonical",
-        grant: Grant | None = None,
-        deposit: Deposit | None = None,
-        keeper: Keep | None = None,
     ) -> None:
         self.memory = memory
         self.device = device
-        self.grant, self.deposit, self.keeper = grant, deposit, keeper
         self.torch = torch
         self.construction = construction
         self.checkpoints = dict(checkpoints)
@@ -123,8 +106,6 @@ class Backend:
         self.models: dict[str, Model] = {}
         self.bakes: dict[str, _Bakes] = {}
         self.derived: dict[str, dict[tuple[Module, str], Tensor]] = {}
-        #: each bound component's grant from TensorD, asked once (`ahead`); its fds are ours
-        self.grants: dict[str, WeightGrant] = {}
         self.stats: dict[str, float] = {}
         self.device_facts = device_facts
         self.providers = launch_providers()
@@ -263,12 +244,8 @@ class Backend:
         return frozenset(self.checkpoints)
 
     def ahead(self) -> None:
-        """Before the factory runs, each bound component's grant. A held host tier is adopted
-        now and its copies to the GPU run while the module is built (memory-varena §5.4)."""
-        started = time.perf_counter()
-        for name in self.checkpoints:
-            self._granted(name)
-        self.stats["ahead_ms"] = round((time.perf_counter() - started) * 1000, 2)
+        """The loader calls this before construction; source reads wait for registration."""
+        self.stats["ahead_ms"] = 0.0
 
     def expect(self, sets: Mapping[str, Sequence[str]]) -> None:
         """Completeness sets: a destination the census never reaches refuses the commit."""
@@ -422,7 +399,6 @@ class Backend:
             keys = [key for key in order if self.plan[key].component == name]
             if keys:
                 self.models[name] = self._register(name, root, keys)
-        self._release()
         if self.device.type == "cuda" and any(b.bakes for b in self.bakes.values()):
             lora_bake.warm(self.device.index or 0)  # its kernels build at load, in a child
         self.stats["register_ms"] = round((time.perf_counter() - started) * 1000, 2)
@@ -434,7 +410,6 @@ class Backend:
         self.state = "poisoned"
 
     def close(self) -> None:
-        self._release()
         for model in self.models.values():
             model.close()
         self.models.clear()
@@ -445,37 +420,23 @@ class Backend:
         return str(self.selected[key].provider.route)
 
     def _register(self, name: str, root: Module, keys: list[str]) -> Model:
-        """One component loaded into the memory: its stored tensors, bound through their
-        routes, its LoRAs baked on page-in, its bytes the host layout TensorD holds for it, else
-        read from the checkpoint by varena, which seals them and deposits the layout with TensorD
-        for the next load."""
+        """Declare the component's source and transforms; varena owns its byte placement."""
         rows = {self.plan[key].name: self.plan[key] for key in keys}
         bakes = self.bakes[name] = _Bakes(self.torch, root, rows, set(blocks_of(root)))
-        grant = replace(self._granted(name), keys=tuple(rows))
-        vars(root)["_varena"] = Declared(  # `_cozy_state`: what the package's forward changes
-            grant,
+        checkpoint = self.checkpoints[name]
+        source = Source(
+            checkpoint.ck, name, checkpoint.id, keys=tuple(rows), fingerprint=self._layout(name)
+        )
+        vars(root)["_varena"] = Declared(
+            source,
             state=tuple(getattr(root, "_cozy_state", ())),
             fill=bakes if bakes.bakes else None,
             bind=_Routes(self, rows),
         )
-        try:
-            model = self.memory.load(root)
-        finally:
-            remaining = self.grants.pop(name, None)
-            if remaining is not None:
-                _close(remaining)
-        for _, sealed in self.memory.sealed():
-            if self.deposit is not None:
-                label = f"{self.construction}/{name}"
-                self.deposit(grant.manifest, label, self._layout(name), sealed)
-            else:
-                os.close(sealed)
-        return model
+        return self.memory.load(root, level="ram")
 
     def _layout(self, name: str) -> str:
-        """What a component's host tier is deposited and granted under: its manifest, the
-        construction (release, model class, components, custody) and its name. Known before the
-        module exists; a held tier of other regions is a miss (`Memory.load`)."""
+        """The source and transform identity used to reject incompatible retained pages."""
         return canonical.digest(
             {
                 "manifest": self.checkpoints[name].id,
@@ -483,38 +444,6 @@ class Backend:
                 "component": name,
             }
         )
-
-    def _granted(self, name: str) -> WeightGrant:
-        """A component's grant: the sealed host tier TensorD holds for its layout, asked once,
-        adopted at once and copying to the GPU; without one, varena reads the checkpoint (as it
-        does when the held tier's regions differ)."""
-        grant = self.grants.get(name)
-        if grant is None:
-            checkpoint = self.checkpoints[name]
-            grant = WeightGrant(checkpoint.ck, name, checkpoint.id)
-            if self.grant is not None:
-                fd, pages, fingerprint = self.grant(grant.manifest, self._layout(name))
-                grant = replace(grant, host_fd=fd, pages=tuple(pages), fingerprint=fingerprint)
-            self.grants[name] = grant
-            self.memory.adopt(grant)
-        return grant
-
-    def keep(self, *, quiescent: bool = False) -> None:
-        """Its models' GPU pages that landed since the last call, kept past this process:
-        TensorD holds them for the next executor of the same layout. `quiescent` is the
-        executor's fenced, drained end boundary; cached graph pins keep their addresses."""
-        if self.keeper is None:
-            return
-        for name, model in self.models.items():
-            fingerprint, pages = model.kept(quiescent=quiescent)
-            if pages:
-                self.keeper(self._layout(name), fingerprint, pages)
-
-    def _release(self) -> None:
-        """Grants no registration took, and what `ahead` adopted for them."""
-        for name in list(self.grants):
-            _close(self.grants.pop(name))
-        self.memory.unclaimed()
 
     def _install_leaf(self, key: str) -> tuple[Any, Any, tuple[str, ...]]:
         """Replace the linear op that owns `key` with its encoded leaf, on meta. Returns the
@@ -568,12 +497,6 @@ class Backend:
 
 
 # ----------------------------------------------------------------- routes and LoRA bakes
-
-
-def _close(grant: WeightGrant) -> None:
-    held = [] if grant.host_fd is None else [grant.host_fd]
-    for fd in held + [f for _, f in grant.pages]:
-        os.close(fd)
 
 
 class _Routes:
@@ -747,10 +670,6 @@ class Residency:
     def open_attempt(self) -> None:
         self.attempts += 1
         self.notes.clear()
-
-    def plan(self, request_id: str, steps: Sequence[str | Collection[str]]) -> None:
-        """The attempt's declared steps (`Context.plan`): varena evicts and restores by them."""
-        self.memory.plan(request_id, list(steps))
 
     def serve_lora(self, strategy: lora_bake.Strategy) -> None:
         """A request's LoRA serving (`lora_mode`): baked, or per step."""

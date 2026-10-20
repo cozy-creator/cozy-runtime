@@ -93,6 +93,7 @@ class RequestMemory(Command, frozen=True, kw_only=True, tag="request_memory"):
     construction: str
     request_id: str
     phase: Literal["begin", "plan", "end"]
+    shape: str = ""
     steps: tuple[tuple[str, ...], ...] = ()
 
 
@@ -160,7 +161,7 @@ class Start(Command, frozen=True, kw_only=True, tag="start"):
     import_only: bool = False
     #: Absent: the executor keeps its in-memory tier at its default.
     memo: MemoSettings | None = None
-    #: Its GPUs' ledgers follow the frame, a memfd and an eventfd per GPU in `devices` order
+    #: Its GPUs' grants follow the frame: table, eventfd and custody channel per GPU
     #: (memory-varena §5.6): rank 0 claims its row in the first and hands follower r the r-th.
     ledgers: int = 0
     memory_mode: Literal["shared", "dedicated"] = "shared"

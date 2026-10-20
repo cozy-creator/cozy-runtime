@@ -53,7 +53,7 @@ else:
 #: Worker/executor command-and-reply compatibility, independent of SDK package
 #: version or source build. Compatible additive fields keep this revision; only
 #: an incompatible change to required commands/semantics raises it.
-EXECUTOR_PROTOCOL_REVISION = 1
+EXECUTOR_PROTOCOL_REVISION = 2
 
 #: Not a size rule: the most one length prefix may make a reader allocate (the documents'
 #: guard, shared with TensorD's `protocol::MAX_FRAME`). It refuses only a corrupt or hostile
@@ -241,19 +241,22 @@ class Channel:
             raise
         return received
 
-    def send_ledger(self, memfd: int, eventfd: int) -> None:
-        """Hand over one GPU's ledger (`tensorfs.varena.Ledger`): its memfd, then its eventfd."""
+    def send_ledger(self, memfd: int, eventfd: int, custody: int) -> None:
+        """One unbound rank grant: table, eventfd and private custody channel."""
         _require_memfd(memfd)
         _require_eventfd(eventfd)
+        _require_custody(custody)
         self._send_fd(memfd, "ledger memfd")
         self._send_fd(eventfd, "ledger eventfd")
+        self._send_fd(custody, "ledger custody channel")
 
     def recv_ledger(self) -> list[int]:
-        """One GPU's ledger memfd and eventfd; anything else is closed and refused."""
-        fds = self.recv_fds(2)
+        """One unbound three-fd grant; an invalid capability closes the whole set."""
+        fds = self.recv_fds(3)
         try:
             _require_memfd(fds[0])
             _require_eventfd(fds[1])
+            _require_custody(fds[2])
         except SeamError:
             for fd in fds:
                 os.close(fd)
@@ -684,6 +687,16 @@ def sealed(name: str, body: bytes) -> int:
         os.close(fd)
         raise
     return fd
+
+
+def _require_custody(fd: int) -> None:
+    """The grant's per-rank control channel is a socket, never a regular file."""
+    try:
+        valid = stat.S_ISSOCK(os.fstat(fd).st_mode)
+    except OSError as exc:
+        raise SeamError("seam_descriptor", f"custody channel unreadable: {exc}") from exc
+    if not valid:
+        raise SeamError("seam_descriptor", "custody channel must be a socket")
 
 
 def _require_eventfd(fd: int) -> None:

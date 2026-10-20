@@ -210,6 +210,16 @@ def is_capacity(exc: BaseException) -> bool:
     return exhausted or is_device_oom(exc)
 
 
+def is_varena_error(exc: BaseException) -> bool:
+    """The native manager's typed failure, without importing Torch or TensorFS."""
+    return (
+        type(exc).__module__ == "tensorfs.varena"
+        and type(exc).__name__ == "VarenaError"
+        and isinstance(getattr(exc, "code", None), str)
+        and type(getattr(exc, "sticky", None)) is bool
+    )
+
+
 def is_library_refusal(exc: BaseException) -> bool:
     """A cuBLAS or cuDNN status raised from a library call. Each takes device memory for itself
     at a first launch (its handle, a workspace, a kernel's code) and reports its absence under
@@ -251,6 +261,15 @@ def classify(exc: BaseException | None) -> Outcome:
     if is_device_oom(exc):
         first = str(exc).partition("\n")[0][:400] or "the device ran out of memory"
         return Outcome("failed", "runtime", DEVICE_OOM, first, (), _trace(exc))
+    if is_varena_error(exc):
+        return Outcome(
+            "failed",
+            "runtime",
+            getattr(exc, "code", "varena_failure"),
+            str(exc)[:400],
+            (),
+            _trace(exc),
+        )
     if type(exc).__module__ == "tensorfs.varena.torch":  # varena's memory, named structurally
         code = MEMORY_EXHAUSTED if type(exc).__name__ == "Exhausted" else "weight_unbound"
         return Outcome("failed", "runtime", code, str(exc)[:400], (), _trace(exc))
