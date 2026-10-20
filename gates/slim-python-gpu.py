@@ -68,7 +68,7 @@ def main(
         (logs / f"{name}.log").write_text(text)
         print(text, flush=True)
         if process.returncode:
-            raise RuntimeError(f"{name} failed with exit {process.returncode}")
+            raise RuntimeError(f"{name} failed with exit {process.returncode}:\n{text[-4000:]}")
         return text
 
     environment = root / "venv"
