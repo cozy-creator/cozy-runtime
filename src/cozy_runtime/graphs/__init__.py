@@ -42,11 +42,12 @@ import sys
 import time
 import weakref
 from collections.abc import Callable, Mapping
+from contextlib import nullcontext
 from typing import Any
 
 from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT
 from cozy_runtime.author._capture import _capture_clock
-from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building
+from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building, ResidencyPin
 from cozy_runtime.internal import attention_ulysses, module_state
 
 #: Set while a mechanism runs its own graphs over a component (`cozy_runtime.lm`): its calls
@@ -144,7 +145,7 @@ class _Recorder:
         self.pool: Any = None
         self.stream: Any = None
         #: the pin its structure was read under, and that structure
-        self.structure: tuple[object, tuple[object, ...]] = (None, ())
+        self.structure: tuple[ResidencyPin | None, tuple[object, ...]] = (None, ())
         self.pool_bytes = self.replays = 0
         #: signatures that run as written by choice, by why, and the latest one's detail
         self.chose: dict[str, int] = {}
@@ -161,6 +162,9 @@ class _Recorder:
         self.tries.clear()
         self.waiting.clear()
         self.recordings.clear()
+        if self.structure[0] is not None:
+            self.structure[0].nbytes = 0
+        self.structure = (None, ())
         self.pool, self.pool_bytes, self.chose = None, 0, {}
 
 
@@ -207,12 +211,30 @@ def _graphed(torch: Any, cls: type) -> type:
 
 def _shed(torch: Any, recorder: _Recorder) -> int:
     """Drop a component's recordings and their pool (its pin's shed); the pool's bytes."""
-    freed = recorder.pool_bytes
+    pools = {entry.graph.pool() for entry in recorder.recordings.values()}
+    before = _pool_bytes(torch, pools)
+    pin = recorder.structure[0]
     recorder.recordings.clear()  # each holds its pin: the last one dropped lets it go
     recorder.structure = (None, ())
     recorder.pool, recorder.pool_bytes = None, 0
     torch.cuda.empty_cache()
-    return freed
+    remaining = _pool_bytes(torch, pools)
+    if pin is not None:
+        pin.nbytes = remaining
+    return max(before - remaining, 0)
+
+
+def _pool_bytes(torch: Any, pools: set[tuple[int, int]]) -> int:
+    # Cache.bytes is subtracted from Torch's allocated bytes by the memory plane.
+    # Private-pool inactive segments are already counted as allocator slack.
+    return sum(
+        int(segment["allocated_size"])
+        for pool in pools
+        for segment in torch.cuda.memory_snapshot(pool, include_traces=False)
+    )
+
+
+_EAGER = object()
 
 
 def _dispatch(torch: Any, module: Any, call: Callable[..., Any], args: Any, kwargs: Any) -> Any:
@@ -267,12 +289,50 @@ def _dispatch(torch: Any, module: Any, call: Callable[..., Any], args: Any, kwar
         if placed and key in recorder.failed:
             placed[0].note(f"{placed[1]}.graphs", _facts(recorder))
         return out
-    pin: object = None
+    pin: ResidencyPin | None = None
     if placed is not None:
         residency, name = placed
         pin = residency.pin(name, f"graphs:{name}", functools.partial(_shed, torch, recorder))
         if pin is None or recorder.waiting.get(key) == residency.attempts:
+            pin = None
             return call(module, *args, **kwargs)
+    out = _record_or_replay(torch, module, call, leaves, spec, recorder, key, placed, pin)
+    # Neither the inactive lease nor its layout/entry locals may keep a retired
+    # token alive while eager OOM recovery asks to shed these same weights.
+    pin = None
+    if out is _EAGER:
+        return call(module, *args, **kwargs)
+    return out
+
+
+def _record_or_replay(
+    torch: Any,
+    module: Any,
+    call: Callable[..., Any],
+    leaves: list[Any],
+    spec: Any,
+    recorder: _Recorder,
+    key: tuple[object, ...],
+    placed: Any,
+    pin: ResidencyPin | None,
+) -> Any:
+    with pin.serving() if pin is not None else nullcontext(True) as ready:
+        if not ready:
+            return _EAGER
+        return _borrowed(torch, module, call, leaves, spec, recorder, key, placed, pin)
+
+
+def _borrowed(
+    torch: Any,
+    module: Any,
+    call: Callable[..., Any],
+    leaves: list[Any],
+    spec: Any,
+    recorder: _Recorder,
+    key: tuple[object, ...],
+    placed: Any,
+    pin: ResidencyPin | None,
+) -> Any:
     if pin is None or recorder.structure[0] is not pin:  # read once per pin
         recorder.structure = (pin, _structure(module))
     layout = (pin, recorder.structure[1])
@@ -284,8 +344,13 @@ def _dispatch(torch: Any, module: Any, call: Callable[..., Any], args: Any, kwar
             recorder.pool = None
     if entry is None:
         entry = _record(torch, module, call, leaves, spec, recorder, key, layout, placed)
+        recorder.pool_bytes = _pool_bytes(
+            torch, {recording.graph.pool() for recording in recorder.recordings.values()}
+        )
+        if pin is not None:
+            pin.nbytes = recorder.pool_bytes
         if entry is None:
-            return call(module, *args, **kwargs)
+            return _EAGER
     recorder.replays += 1
     if placed is not None:
         placed[0].note(f"{placed[1]}.graphs", _facts(recorder))
@@ -308,7 +373,6 @@ def _record(
     started, landed = time.perf_counter(), LANDED[0]
     if recorder.pool is None:
         recorder.pool, recorder.stream = torch.cuda.graph_pool_handle(), torch.cuda.Stream()
-    reserved = torch.cuda.memory_reserved()
     inputs = [leaf.clone() if isinstance(leaf, torch.Tensor) else None for leaf in leaves]
     static = [s if s is not None else v for s, v in zip(inputs, leaves, strict=True)]
     cargs, ckwargs = torch.utils._pytree.tree_unflatten(static, spec)
@@ -376,7 +440,6 @@ def _record(
         return None
     entry = _Recording(torch, graph, inputs, outputs[0], layout, served)
     if recorder.pool is pool:  # else the plane released the pool for room meanwhile
-        recorder.pool_bytes += max(torch.cuda.memory_reserved() - reserved, 0)
         recorder.recordings[key] = entry
     return entry
 

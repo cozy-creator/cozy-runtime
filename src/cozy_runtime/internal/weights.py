@@ -15,7 +15,8 @@ import time
 import weakref
 import zlib
 from collections import Counter
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
@@ -667,8 +668,7 @@ class Residency:
         self.bakes = dict(backend.bakes)
         self.notes: dict[str, str] = {}
         self.attempts = 0
-        #: (component, owner) -> its pin and the cache that holds it
-        self.pins: dict[tuple[str, str], tuple[_Pin, Cache]] = {}
+        self.pins: dict[tuple[str, str], _Pin] = {}
         for name, model in self.models.items():
             PLACED[model.module] = (self, name)
 
@@ -687,27 +687,45 @@ class Residency:
         room or the component's LoRAs change, `shed` drops what read them there; the weights
         stay bound until the last reference to the pin goes, so a replay in flight keeps them.
         None when part of the component streams (a slot's address moves)."""
-        held = self.pins.get((component, owner))
+        key = (component, owner)
+        held = self.pins.get(key)
         if held is not None:
-            return held[0]
+            return held
         model = self.models.get(component)
         if model is None:
             return None
 
+        token_ref: weakref.ReferenceType[_Pin] | None = None
+
         def give(_: int) -> int:
-            self.pins.pop((component, owner), None)
-            cache.close()
-            return shed()
+            token = token_ref() if token_ref is not None else None
+            if token is None or token.retired:
+                return 0
+            token.retired = True
+            if self.pins.get(key) is token:
+                self.pins.pop(key)
+            # An in-flight recording may still own the token. Its last reference,
+            # after the consumer's borrowed hold exits, closes the persistent hold.
+            try:
+                return shed()
+            finally:
+                # Retired external recordings are live Torch allocations, not
+                # cached bytes available to this owner. Publish before remeasure.
+                cache.nbytes = 0
 
         cache = self.memory.cache(owner, give)
         try:
-            hold = cache.hold(model)
+            with cache.serving():
+                cache.hold(model)
+                token = _Pin(model, cache)
+                token_ref = weakref.ref(token)
+                self.pins[key] = token
         except Unbound:
             cache.close()
             return None
-        token = _Pin()
-        weakref.finalize(token, hold.close)
-        self.pins[(component, owner)] = (token, cache)
+        except BaseException:
+            cache.close()
+            raise
         return token
 
     def cache(self, owner: str, shed: Shrink) -> Cache | None:
@@ -724,7 +742,37 @@ class Residency:
 class _Pin:
     """A pinned component's token: its weights stay bound while a reference lives."""
 
-    __slots__ = ("__weakref__",)
+    __slots__ = ("model", "cache", "retired", "__weakref__")
+
+    def __init__(self, model: Model, cache: Cache) -> None:
+        self.model, self.cache, self.retired = model, cache, False
+        weakref.finalize(self, cache.close)
+
+    @property
+    def nbytes(self) -> int:
+        return self.cache.nbytes
+
+    @nbytes.setter
+    def nbytes(self, value: int) -> None:
+        if not self.retired:
+            self.cache.nbytes = value
+
+    @contextmanager
+    def serving(self) -> Iterator[bool]:
+        if self.retired:
+            yield False
+            return
+        with self.cache.serving():
+            # cache_active may have waited for a reclamation callback to finish.
+            if self.retired:
+                yield False
+                return
+            hold = self.cache.hold(self.model)
+            try:
+                yield True
+            finally:
+                # Public Hold.close joins this consumer into the binding stream.
+                hold.close()
 
 
 def _derived_values(root: Module) -> dict[tuple[Module, str], Tensor]:

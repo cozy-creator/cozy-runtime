@@ -254,6 +254,17 @@ class _Scope(Protocol):
     def __exit__(self, *exc: object) -> None: ...
 
 
+class ResidencyPin(Protocol):
+    """A retained component's bindings and its separately counted allocated cache bytes."""
+
+    nbytes: int
+
+    def serving(self) -> AbstractContextManager[bool]:
+        """Borrow its bindings on the consumer stream. False means pressure retired it;
+        leave the scope and discard the token before running an eager fallback."""
+        ...
+
+
 class Residency(Protocol):
     """What a Runtime mechanism handed a placed component reaches, installed on a constructed
     generation. Memory itself is varena's: it sees each forward through its own hooks.
@@ -263,7 +274,7 @@ class Residency(Protocol):
     supplies the body on varena's memory (`internal/weights.py`).
     """
 
-    def pin(self, component: str, owner: str, shed: Callable[[], int]) -> object | None:
+    def pin(self, component: str, owner: str, shed: Callable[[], int]) -> ResidencyPin | None:
         """Every weight of `component` bound at its home address for `owner` (a CUDA graph
         reads them there) until memory asks for room, when `shed` drops what read them; they
         stay bound while the returned token lives. None when part of it streams."""
