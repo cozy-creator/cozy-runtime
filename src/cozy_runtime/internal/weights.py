@@ -21,6 +21,7 @@ from dataclasses import dataclass, field, replace
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
+from tensorfs import raw
 from tensorfs.varena.torch import (
     Cache,
     Declared,
@@ -545,7 +546,12 @@ class Backend:
         tensors = {name: held.tensors for name, held in checkpoint.ck.components.items()}
         chunks = checkpoint.ck.chunks
         used: set[int] = set()
-        parts = (p for c in selected for t in tensors.get(c, {}).values() for p in t.parts.values())
+        parts = (
+            part
+            for component in selected
+            for key in tensors.get(component, {})
+            for part in raw.parts(checkpoint.ck, component, key).values()
+        )
         for part in parts:
             at, offset, left = part.chunk, part.offset, part.length
             while left > 0:  # a part of 16 MiB or more runs on through the next chunks

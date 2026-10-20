@@ -6,6 +6,8 @@ import importlib
 import math
 from types import ModuleType
 
+from tensorfs import raw
+
 from cozy_runtime.author._errors import CapabilityError
 from cozy_runtime.internal.encoding.formats import RowwiseDequant, params_of
 from cozy_runtime.weights_store import Checkpoint, read_into
@@ -62,11 +64,11 @@ def read_values_into(
         size = torch.empty((), dtype=dtype).element_size()
         for start in range(0, count, _ELEMENTS):
             length = min(_ELEMENTS, count - start)
-            raw = _part(source, component, key, "", (offset + start) * size, length * size)
-            target[start : start + length].copy_(torch.frombuffer(raw, dtype=dtype))
+            payload = _part(source, component, key, "", (offset + start) * size, length * size)
+            target[start : start + length].copy_(torch.frombuffer(payload, dtype=dtype))
         return
     params = dict(tensor.encoding.params)
-    stored = tensor.parts.get("weight")
+    stored = raw.parts(source, component, key).get("weight")
     element = _ROWWISE.get((tensor.encoding.scheme, stored.dtype if stored else ""))
     if (
         element is None

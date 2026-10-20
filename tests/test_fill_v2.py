@@ -49,11 +49,9 @@ def _pipeline(root: Path, monkeypatch: pytest.MonkeyPatch) -> tensorfs.Checkpoin
     )  # fmt: skip
     writer.component(
         "scheduler", cls="diffusers.EulerDiscreteScheduler", config=SCHEDULER,
-        config_file="scheduler_config.json",
     )  # fmt: skip
     tokenizer = writer.component(
         "tokenizer", cls="transformers.CLIPTokenizer", config=TOKENIZER,
-        config_file="tokenizer_config.json",
     )  # fmt: skip
     tokenizer.asset("vocab.json", VOCAB)
     tokenizer.asset("merges.txt", MERGES)
@@ -97,8 +95,8 @@ def test_an_executor_opens_a_checkpoint_from_the_store_with_its_configs_and_asse
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """An executor opens a request's checkpoint by its header ref from the shared store: configs
-    from its components, assets at their folder paths (configs rendered as the HF writers
-    write them, assets byte-exact), the same immutable identity for every later load."""
+    directly from its components, exact supporting bytes without filename export, and
+    the same immutable identity for every later load."""
     ref = _pipeline(tmp_path / "tensorfs", monkeypatch).id
     assert ref is not None
     redirected = tmp_path / "package-changed-store"
@@ -116,19 +114,10 @@ def test_an_executor_opens_a_checkpoint_from_the_store_with_its_configs_and_asse
             "vae": {"z": 4},
         }
         assets = ck.assets()
-        assert sorted(assets) == [
-            "model_index.json",
-            "scheduler/scheduler_config.json",
-            "tokenizer/merges.txt",
-            "tokenizer/tokenizer_config.json",
-            "tokenizer/vocab.json",
-            "unet/config.json",
-            "vae/config.json",
-        ]
+        assert sorted(assets) == ["tokenizer/merges.txt", "tokenizer/vocab.json"]
         assert (assets["tokenizer/vocab.json"], assets["tokenizer/merges.txt"]) == (VOCAB, MERGES)
-        rendered = json.dumps(UNET, indent=2, sort_keys=True) + "\n"
-        assert assets["unet/config.json"] == rendered.encode()
-        assert json.loads(assets["model_index.json"]) == INDEX
+        assert ck.ck.pipeline is not None and ck.ck.pipeline.config == INDEX
+        assert not list((tmp_path / "tensorfs").rglob("config.json")), "loading exported files"
         assert set(ck.asset_digests()) == {"tokenizer/vocab.json", "tokenizer/merges.txt"}
     finally:
         left.close()
@@ -147,7 +136,7 @@ def test_a_model_without_a_pipeline_is_its_root_folder(
         assets={"model": {"tokenizer.json": b"{}", "tokenizer_config.json": b'{"x": 1}'}},
     )
     assets = Checkpoint(tensorfs.open(ref, cache_dir=store, local_files_only=True)).assets()
-    assert sorted(assets) == ["config.json", "tokenizer.json", "tokenizer_config.json"]
+    assert sorted(assets) == ["tokenizer.json", "tokenizer_config.json"]
     assert assets["tokenizer_config.json"] == b'{"x": 1}'
 
 
@@ -210,7 +199,9 @@ def test_a_transformers_model_binds_its_stored_names_through_its_conversion_mapp
     for component, model in built.items():
         model.config.architectures = [type(model).__name__]  # as `save_pretrained` writes it
         held = writer.component(
-            component, cls=f"transformers.{type(model).__name__}", config=model.config.to_dict()
+            component,
+            cls=f"transformers.{type(model).__name__}",
+            config=json.loads(model.config.to_json_string()),
         )
         for key, value in model.state_dict().items():  # upstream on-disk names
             stored = (

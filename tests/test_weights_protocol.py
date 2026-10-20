@@ -17,8 +17,13 @@ def test_current_metadata_wire_preserves_variant_policy_and_redacts_credentials(
             "object_hosts": ["objects.example.test"],
         },
         "models": [
-            {"slot": "policy", "repo_id": "owner/model", "revision": None,
-             "variants": ["int8", "bf16"], "fallback_to_only_variant": True},
+            {
+                "slot": "policy",
+                "repo_id": "owner/model",
+                "revision": None,
+                "variants": ["int8", "bf16"],
+                "fallback_to_only_variant": True,
+            },
             {"slot": "unnamed", "repo_id": "owner/model", "variants": [""]},
             {"slot": "sole", "repo_id": "owner/model", "variants": []},
         ],
