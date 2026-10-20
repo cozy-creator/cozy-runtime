@@ -9,6 +9,7 @@ import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import cast
 
 import msgspec
 import numpy as np
@@ -16,7 +17,7 @@ import pytest
 import tensorfs
 
 from cozy_runtime import weights_store
-from cozy_runtime.author import CapabilityError
+from cozy_runtime.author import CapabilityError, RuntimeFailure
 from cozy_runtime.author._executor_requests import Answer, CheckpointItem, Request, refuse
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.seam import RESULT_DOCUMENT
@@ -115,6 +116,7 @@ def test_a_granted_output_is_written_into_the_store_shown_and_replayed(
     assert [(item.output, item.repo_id) for item in shown] == [("model", weights_store.DERIVED)] * 4
     out = tensorfs.open(shown[0].revision, cache_dir=store, local_files_only=True)
     assert out.id == results[1]["checkpoint"]
+    assert all(item.revision == out.tree for item in shown)
     unet = out.components["unet"]
     assert set(unet.tensors) == {"w", "extra"} and unet.config == {"in": 2}
 
@@ -359,13 +361,16 @@ def test_a_raw_read_fills_only_the_requested_tensor_part(
     assert readonly.value.code == "weights_reader_buffer"
 
 
-@pytest.mark.parametrize("destination", ["local/output", "alice/output"])
-def test_a_destination_adds_each_output_as_an_unreleased_tree(
+@pytest.mark.parametrize(
+    "destination", ["local/output", "local/output@main", "alice/output", "alice/output@main"]
+)
+def test_a_destination_commits_each_output_under_its_private_tag(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, destination: str
 ) -> None:
+    """The tag the destination names (`org/name@tag`), else the output's replay tag."""
     store = home(tmp_path / "tensorfs", monkeypatch)
     origin = None if destination.startswith("local/") else (tmp_path / "origin").as_uri()
-    endpoint = tensorfs.Endpoint(origin or "local", cache_dir=store)
+    repo, _, named = destination.partition("@")
     shown: Shown = []
     trees = []
     for value in (b"one", b"two"):
@@ -383,27 +388,121 @@ def test_a_destination_adds_each_output_as_an_unreleased_tree(
             output.put("model", "w", "U8", [len(value)], value)
             artifact = outputs.adopt(output)
         _, repo_id, tree, _ = shown[-1]
-        assert repo_id == destination and tree.startswith("sha256:")
+        assert repo_id == repo and tree.startswith("sha256:")
+        moved = named or weights_store.tag(artifact.transaction)
         trees.append(tree)
+        # A tag resolves through its endpoint: what it names now is the endpoint's to say.
+        with tensorfs.open(repo, revision=moved, endpoint=origin, cache_dir=store) as tagged:
+            assert tagged.id == artifact.checkpoint
         with tensorfs.open(
-            destination, revision=tree, endpoint=origin, cache_dir=store, local_files_only=True
-        ) as named:
-            assert named.id == artifact.checkpoint
-            array = named.components["model"].tensors.read("w")
+            repo, revision=tree, endpoint=origin, cache_dir=store, local_files_only=True
+        ) as committed:
+            assert committed.id == artifact.checkpoint
+            array = committed.components["model"].tensors.read("w")
             assert isinstance(array, tensorfs.Array) and array.tobytes() == value
-            with weights_store._thin(store, named) as folder:  # the header only; no chunk copies
+            with weights_store._thin(
+                store, committed
+            ) as folder:  # the header only; no chunk copies
                 files = sorted(str(f.relative_to(folder)) for f in folder.rglob("*") if f.is_file())
                 assert len(files) == 1 and files[0].endswith(".cozytensors"), files
         if origin is not None:  # the chunks reached the endpoint from the store
             fresh = tmp_path / f"fresh-{value.decode()}"
-            with tensorfs.open(destination, revision=tree, endpoint=origin, cache_dir=fresh) as got:
+            with tensorfs.open(repo, revision=tree, endpoint=origin, cache_dir=fresh) as got:
                 array = got.components["model"].tensors.read("w")
                 assert isinstance(array, tensorfs.Array) and array.tobytes() == value
     assert trees[0] != trees[1]
-    result = endpoint.repo(destination)
+    # A new tag is private: no public tag names a default for the destination.
+    with pytest.raises(tensorfs.NotFoundError):
+        tensorfs.open(repo, endpoint=origin, cache_dir=tmp_path / "default")
+
+
+def test_private_replay_retains_the_exact_tree_and_refuses_another_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = home(tmp_path / "tensorfs", monkeypatch)
+    with context(store, "stable-replay").output("model", weights_store.Derivation(None)) as output:
+        output.put("model", "w", "U8", [3], b"one")
+        first = output.commit()
+        transaction = output.transaction
+    assert first.tree is not None and first.tree != first.id
+    name = transaction.removeprefix("sha256:")
+    assert weights_store.tag(transaction) == name and len(name) == 64
+    endpoint = tensorfs.Endpoint("local", cache_dir=store)
+    result = endpoint.repo(weights_store.DERIVED)
     assert result is not None
-    repo, _etag = result
-    assert repo["releases"] == []
-    checkpoints = repo["checkpoints"]
-    assert isinstance(checkpoints, list)
-    assert sorted(f"sha256:{row['sha256']}" for row in checkpoints) == sorted(trees)
+    before, etag = result
+    tags = cast("list[dict[str, object]]", before["tags"])
+    replay = next(row for row in tags if row["name"] == name)
+    commit = cast("dict[str, object]", replay["commit"])
+    assert first.tree == "sha256:" + str(commit["sha256"])
+    assert isinstance(commit["length"], int) and commit["length"] > 0
+    assert not replay.get("public", False)
+    assert any(str(row["name"]).startswith("upload-") and row["commit"] == commit for row in tags)
+    weights_store._retain_replay(store, transaction, first.tree)
+    assert endpoint.repo(weights_store.DERIVED) == (before, etag), "same-tree CAS is a no-op"
+
+    other_ref = checkpoint(store, {"model": {"w": np.frombuffer(b"two", dtype=np.uint8)}})
+    with tensorfs.open(other_ref, cache_dir=store, local_files_only=True) as other:
+        with weights_store._thin(store, other) as folder:
+            other_tree = tensorfs.upload_folder(
+                repo_id=weights_store.DERIVED, folder_path=folder, endpoint="local", cache_dir=store
+            )
+    assert other_tree != first.tree
+    before_conflict = endpoint.repo(weights_store.DERIVED)
+    with pytest.raises(RuntimeFailure) as conflict:
+        weights_store._retain_replay(store, transaction, other_tree)
+    assert conflict.value.code == "weights_replay_conflict"
+    assert endpoint.repo(weights_store.DERIVED) == before_conflict
+    for tree, value in ((first.tree, b"one"), (other_tree, b"two")):
+        with tensorfs.open(
+            weights_store.DERIVED, revision=tree, cache_dir=store, local_files_only=True
+        ) as kept:
+            array = kept.components["model"].tensors.read("w")
+            assert isinstance(array, tensorfs.Array) and array.tobytes() == value
+    with tensorfs.open(
+        weights_store.DERIVED, revision=name, cache_dir=store, local_files_only=True
+    ) as replayed:
+        assert replayed.tree == first.tree and replayed.id == first.id
+
+
+def test_explicit_private_output_alias_preserves_public_versions_and_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = home(tmp_path / "tensorfs", monkeypatch)
+    endpoint = tensorfs.Endpoint("local", cache_dir=store)
+    artifacts = []
+    preserved: list[dict[str, object]] = []
+    for value in (b"one", b"two"):
+        outputs = weights_store.Outputs(
+            store, request_id=value.decode(), actor="tester", code=value.decode(),
+            bounds={"model": 3}, show=lambda *item: None, destination="local/output@main",
+        )  # fmt: skip
+        with outputs.open("model", weights_store.Derivation(None)) as output:
+            output.put("model", "w", "U8", [3], value)
+            artifacts.append(outputs.adopt(output))
+        if value == b"one":
+
+            def seed(repo: dict[str, object] | None) -> dict[str, object]:
+                assert repo is not None
+                tags = cast("list[dict[str, object]]", repo["tags"])
+                main = next(row for row in tags if row["name"] == "main")
+                preserved.extend(
+                    [
+                        {"name": "1.2.0", "commit": main["commit"], "public": True},
+                        {"name": "1.1.0", "commit": main["commit"], "public": True, "yanked": True},
+                        {"name": "keep", "commit": main["commit"]},
+                    ]
+                )
+                return {**repo, "tags": [*tags, *preserved]}
+
+            endpoint.update_repo("local/output", seed)
+    result = endpoint.repo("local/output")
+    assert result is not None
+    tags = cast("list[dict[str, object]]", result[0]["tags"])
+    main = next(row for row in tags if row["name"] == "main")
+    assert not main.get("public", False)
+    assert [row for row in tags if row["name"] != "main"] == preserved
+    with tensorfs.open("local/output", cache_dir=store) as default:
+        assert default.id == artifacts[0].checkpoint
+    with tensorfs.open("local/output", revision="main", cache_dir=store) as alias:
+        assert alias.id == artifacts[1].checkpoint != artifacts[0].checkpoint

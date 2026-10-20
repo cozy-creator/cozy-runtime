@@ -3,7 +3,7 @@
 A checkpoint opens by its header ref (`sha256:<hex>`) from the shared store (the executor's
 `TENSORFS_HOME`). A derived checkpoint is written with TensorFS's `Writer` straight into the
 store, only its new chunks written. Its replay key names the work (who asked, what code and
-request, which output, from what): a finished derivation is the `local/derived` release of
+request, which output, from what): a finished derivation is the private `local/derived` tag of
 that key, so the same work in any process replays it, and an interrupted one resumes its
 keyed writer.
 """
@@ -20,7 +20,7 @@ import threading
 from collections.abc import Buffer, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import IO
+from typing import IO, cast
 
 import tensorfs
 from tensorfs import Checkpoint as Checkpoint
@@ -33,7 +33,7 @@ from cozy_runtime.author._errors import CapabilityError, RuntimeFailure
 
 #: The store's location when the machine names none (TensorFS's default, owner D3).
 DEFAULT_HOME = "~/.cache/tensorfs"
-#: The local repo of finished derivations, one release per replay key.
+#: The local repo of finished derivations, one private tag per replay key.
 DERIVED = "local/derived"
 
 #: Bytes to write: a buffer, or a file read from its position to its end.
@@ -113,14 +113,16 @@ def open_checkpoint(store: Path, ref: str, connection: Connection | None = None)
     return tensorfs.open(ref, cache_dir=store, endpoint=options.endpoint, token=options.token)
 
 
-def upload(store: Path, ck: Checkpoint, repo_id: str, connection: Connection | None = None) -> str:
-    """Add `ck` to `repo_id` as an unreleased tree and return the tree id: its revision. A failed
-    upload leaves the committed local checkpoint available."""
+def upload(
+    store: Path, ck: Checkpoint, repo_id: str, tag: str, connection: Connection | None = None
+) -> str:
+    """Commit `ck` to `repo_id`, move its private `tag` there and return the commit (its tree
+    id). A failed upload leaves the committed local checkpoint available."""
     options = connection or Connection()
     try:
         with _thin(store, ck) as folder:
             return tensorfs.upload_folder(
-                repo_id=repo_id, folder_path=folder, cache_dir=store,
+                repo_id=repo_id, folder_path=folder, revision=tag, cache_dir=store,
                 endpoint=options.endpoint, token=options.token,
             )  # fmt: skip
     except tensorfs.Error as exc:
@@ -202,14 +204,50 @@ def finished(store: Path, transaction: str) -> Checkpoint | None:
     """The output a finished derivation of `transaction` committed, if `store` has one."""
     try:
         return tensorfs.open(
-            DERIVED, revision=_release(transaction), cache_dir=store, local_files_only=True
+            DERIVED, revision=tag(transaction), cache_dir=store, local_files_only=True
         )
     except tensorfs.NotFoundError:
         return None
 
 
-def _release(transaction: str) -> str:
+def tag(transaction: str) -> str:
+    """The stable private replay name, preserved across the Repo tags hard cut."""
     return transaction.removeprefix("sha256:")
+
+
+def _retain_replay(store: Path, transaction: str, tree: str) -> None:
+    """Root the uploaded tree under its immutable replay name using Endpoint's CAS."""
+    name = tag(transaction)
+
+    def retain(repo: dict[str, object] | None) -> dict[str, object] | None:
+        if repo is None:
+            raise RuntimeFailure(
+                "uploaded derivation repo is absent", code="weights_replay_missing"
+            )
+        tags = cast("list[dict[str, object]]", repo["tags"])
+        commit = next(
+            (
+                row["commit"]
+                for row in tags
+                if "sha256:" + str(cast("dict[str, object]", row["commit"])["sha256"]) == tree
+            ),
+            None,
+        )
+        if commit is None:
+            raise RuntimeFailure(
+                "uploaded derivation tree is absent", code="weights_replay_missing"
+            )
+        for row in tags:
+            if row["name"] == name:
+                if row["commit"] != commit or row.get("public", False):
+                    raise RuntimeFailure(
+                        f"private derivation replay {name} already names another tree or is public",
+                        code="weights_replay_conflict",
+                    )
+                return None
+        return {**repo, "tags": [*tags, {"name": name, "commit": commit}]}
+
+    tensorfs.Endpoint("local", cache_dir=store).update_repo(DERIVED, retain)
 
 
 class Output:
@@ -238,7 +276,7 @@ class Output:
             None
             if self.done is not None
             else tensorfs.Writer(
-                base=derivation.base, resume=_release(transaction), cache_dir=store
+                base=derivation.base, resume=transaction.removeprefix("sha256:"), cache_dir=store
             )
         )
         self._components: dict[str, tensorfs.ComponentWriter] = {}
@@ -378,13 +416,14 @@ class Output:
                 self.component(component).order(ordered)
             committed = self._writer.commit()
             with _thin(self.store, committed) as folder:
-                tensorfs.upload_folder(
-                    repo_id=DERIVED, revision=_release(self.transaction), folder_path=folder,
+                tree = tensorfs.upload_folder(
+                    repo_id=DERIVED, folder_path=folder,
                     cache_dir=self.store, endpoint="local",
                 )  # fmt: skip
+            _retain_replay(self.store, self.transaction, tree)
             self.done = tensorfs.open(
                 DERIVED,
-                revision=_release(self.transaction),
+                revision=tree,
                 cache_dir=self.store,
                 local_files_only=True,
             )
@@ -402,7 +441,7 @@ class Output:
 
 class Outputs:
     """One attempt's weights outputs in `store`. Each opens under its replay key; adopting one
-    commits it and shows it to the run (`show(slot, repo_id, revision, variant)`)."""
+    commits it and shows it to the run (`show(slot, repo_id, commit, variant)`)."""
 
     def __init__(
         self,
@@ -418,7 +457,10 @@ class Outputs:
     ) -> None:
         self.store, self.request_id, self.actor, self.code = store, request_id, actor, code
         self.bounds, self.show = dict(bounds), show
-        self.destination, self.connection = destination, connection
+        #: `org/name@tag`: the repo the output uploads to and the tag it moves there (its own
+        #: replay tag when the destination names none)
+        self.destination, _, self.destination_tag = destination.partition("@")
+        self.connection = connection
 
     def open(self, slot: str, derivation: Derivation) -> Output:
         bound = self.bounds.get(slot)
@@ -428,12 +470,13 @@ class Outputs:
         return Output(self.store, slot, key, derivation, bound)
 
     def adopt(self, output: Output) -> ModelArtifact:
-        ck = output.commit()
+        ck, moved = output.commit(), tag(output.transaction)
         assert ck.tree is not None
         self.show(output.slot, DERIVED, ck.tree, ck.variant or "")
         if self.destination:
-            revision = upload(self.store, ck, self.destination, self.connection)
-            self.show(output.slot, self.destination, revision, ck.variant or "")
+            named = self.destination_tag or moved
+            commit = upload(self.store, ck, self.destination, named, self.connection)
+            self.show(output.slot, self.destination, commit, ck.variant or "")
         return ModelArtifact(self.request_id, output.slot, ck.id, output.transaction)
 
 
