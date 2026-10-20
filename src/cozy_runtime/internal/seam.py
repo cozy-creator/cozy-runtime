@@ -12,8 +12,8 @@ Three properties are structural rather than reviewed:
   or hostile length prefix, before any body byte is read. Every wire byte in both directions
   is counted. Output bytes never cross this seam — they land in the attempt spool the worker
   brokered, which keeps the executor's writable storage to exactly that spool (§3.1).
-* **Machine credentials stay outside it.** `send` refuses keys from `SECRET_KEYS`; Load and
-  Invoke may carry an ordinary, already supplied bearer at `tensorfs.token`.
+* **Machine credentials stay outside it.** `send` refuses keys from `SECRET_KEYS`; Load,
+  Invoke and `bearer` may carry a signer's supplied bearer at `tensorfs.token`.
 * **A torn frame is typed.** EOF or a peer reset exactly at a frame boundary is the
   disposable executor's normal end (`None`); EOF inside a header or body is
   `seam_eof_mid_frame`, never a silent short read.
@@ -86,24 +86,24 @@ class SeamError(Exception):
         self.detail = detail
 
 
-def _scan(value: Any, path: str = "", *, supplied_tensorfs: bool = False) -> None:
+#: The commands that may carry a signer's supplied bearer, at `tensorfs.token` only.
+SUPPLYING = frozenset({"load", "invoke", "bearer"})
+
+
+def _scan(value: Any, path: str = "", *, supplied: bool = False) -> None:
     if isinstance(value, dict):
         for key, item in value.items():
-            supplied = (
-                supplied_tensorfs
-                and path == "tensorfs."
-                and key == "token"
-                and isinstance(item, str)
-            )
-            if key.lower() in SECRET_KEYS and not supplied:
+            at = f"{path}{key}"
+            allowed = supplied and at == "tensorfs.token" and isinstance(item, str)
+            if key.lower() in SECRET_KEYS and not allowed:
                 raise SeamError(
                     "credential_at_seam",
                     f"{path}{key!r}: credentials never cross the worker/executor seam",
                 )
-            _scan(item, f"{path}{key}.", supplied_tensorfs=supplied_tensorfs)
+            _scan(item, f"{at}.", supplied=supplied)
     elif isinstance(value, (list, tuple)):
         for item in value:
-            _scan(item, path, supplied_tensorfs=supplied_tensorfs)
+            _scan(item, path, supplied=supplied)
 
 
 @dataclass(slots=True)
@@ -127,9 +127,7 @@ class Channel:
     sending: threading.RLock = field(default_factory=threading.RLock, repr=False, compare=False)
 
     def send(self, message: dict[str, Any]) -> None:
-        command = message.get("cmd")
-        supplied = isinstance(command, str) and command in {"load", "invoke"}
-        _scan(message, supplied_tensorfs=supplied)
+        _scan(message, supplied=message.get("cmd") in SUPPLYING)
         data = json.dumps(message, separators=(",", ":"), sort_keys=True).encode()
         if len(data) > MAX_FRAME:
             self.refusals.append("frame_too_large")
@@ -521,11 +519,13 @@ class _Asked:
 class Mux:
     """One seam shared by every thread of the process. Whoever needs a frame reads the next
     one and routes it: an answer to the request waiting on its `seq`, a `cancel` to its call's
-    mark, anything else to the commands, in order. No reader thread exists, so a process that
-    has served no call stays single-threaded and forkable (`zygote`)."""
+    mark, a frame that may carry a bearer (`SUPPLYING`) to `bearer` as it is read (a `bearer`
+    frame goes nowhere else), anything else to the commands, in order. No reader thread exists,
+    so a process that has served no call stays single-threaded and forkable (`zygote`)."""
 
-    def __init__(self, channel: Channel) -> None:
+    def __init__(self, channel: Channel, bearer: Callable[[Frame], None] = _nothing) -> None:
         self.channel = channel
+        self._bearer = bearer
         self._seq = 0
         self._asked: dict[int, _Asked] = {}
         self._commands: deque[Frame] = deque()
@@ -631,7 +631,11 @@ class Mux:
                 asked.answer = frame
         elif frame.get("cmd") == "cancel":
             self.cancel(str(frame.get("request_id", "")))
+        elif frame.get("cmd") == "bearer":
+            self._bearer(frame)
         else:
+            if frame.get("cmd") in SUPPLYING:
+                self._bearer(frame)
             with self._changed:
                 self._commands.append(frame)
 
