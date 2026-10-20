@@ -21,6 +21,15 @@ def finite(value, *, positive=False):
         return False
 
 
+def physical_uuid(value):
+    if not isinstance(value, str) or not re.fullmatch(
+        r"(?:gpu-)?(?:[0-9a-f]{32}|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})",
+        value, re.IGNORECASE,
+    ):
+        return None
+    return value.lower().removeprefix("gpu-").replace("-", "")
+
+
 def cells(path):
     out = {}
     for line in Path(path).read_text().splitlines():
@@ -355,6 +364,8 @@ def record(path, cell, number, state, substitute, summary, slim=""):
     calls = run.get("calls") or [run]
     gpu_measurements, child_reasons = [], []
     group_required = bool(re.match(r"2x[^-]+-h3(?:-|$)", cell))
+    single_required = bool(slim and re.fullmatch(r"2x[^-]+-sdxl-[ab]", cell))
+    single_devices, single_physical = set(), set()
     group_executed = False
     for call in calls:
         if not isinstance(call, dict):
@@ -375,6 +386,18 @@ def record(path, cell, number, state, substitute, summary, slim=""):
         if call.get("memoized") is True:
             executed = set()
         if executed:
+            if slim and cell.startswith("2x"):
+                rows = [row for row in gpus if isinstance(row, dict)
+                        and integer(row.get("gpu")) and row["gpu"] in executed]
+                identities = [physical_uuid(row.get("uuid")) for row in rows]
+                if (len(rows) != len(executed) or None in identities
+                        or len(set(identities)) != len(rows)
+                        or any(not integer(row.get("pid")) or row["pid"] == 0 for row in rows)):
+                    bar.append("invalid-gpu-execution-identity")
+                if single_required:
+                    single_physical.update(identity for identity in identities if identity is not None)
+            if single_required:
+                single_devices.update(executed)
             gpu_measurements.append((measurements, executed, legacy))
             function = str(call.get("function") or call.get("target") or "").rsplit("/", 1)[-1].split("@", 1)[0].replace("-", "_")
             h3 = function in {"generate_ref2va_turbo", "generate_fl2va_turbo",
@@ -400,6 +423,8 @@ def record(path, cell, number, state, substitute, summary, slim=""):
         bar.append("no-gpu-execution")
     if group_required and not group_executed:
         bar.append("no-two-gpu-h3-execution")
+    if single_required and (len(single_devices) != 1 or len(single_physical) != 1):
+        bar.append("not-single-gpu-sdxl-execution")
     stats, movements = [], []
     for measurements, executed, legacy in gpu_measurements:
         memory = measurements.get("memory")

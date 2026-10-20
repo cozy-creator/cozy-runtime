@@ -29,7 +29,10 @@ def positive():
 def slim_positive():
     """A current-schema validator fixture, not a claim of another hardware run."""
     value = positive()
-    memory = value.get("calls", [value])[0]["measurements"]["memory"]
+    measurements = value.get("calls", [value])[0]["measurements"]
+    measurements["execution"]["gpus"][0].update(
+        pid=101, uuid="GPU-00000000-0000-0000-0000-000000000001")
+    memory = measurements["memory"]
     base = dict(request="r", rank=0, gpu=0, step=0, page=1, bytes=64,
                 capacity=256, resident=64, orphan_bytes=0, reason="demand",
                 **{"class": "pinned"})
@@ -60,6 +63,22 @@ def proof_and_trace(sequence, sizes, capacity, initial=()):
                  for index, page in enumerate(sequence))
     trace.append(dict(base, sequence=len(trace), kind="end", step=0, pass_index=0))
     return proof, trace
+
+
+def slim_group_positive():
+    value = slim_positive()
+    call = value["calls"][0]
+    call.update(status="succeeded", function="motion_segment")
+    measurements = call["measurements"]
+    first = measurements["execution"]["gpus"][0]
+    measurements["execution"]["gpus"].append(dict(
+        first, gpu=1, pid=first["pid"] + 1, uuid="GPU-00000000-0000-0000-0000-000000000002"))
+    memory = measurements["memory"]
+    memory["stats"]["leftover_by_gpu"] = [[0, 0], [1, 0]]
+    proof, trace = proof_and_trace([1], {1: 64}, 256, [1])
+    memory["stats"]["proofs"] = [proof, dict(proof, gpu=1, rank=1)]
+    memory["trace"] = trace + [dict(event, gpu=1, rank=1) for event in trace]
+    return value
 
 
 class MemoryReceipts(unittest.TestCase):
@@ -307,18 +326,11 @@ class MemoryReceipts(unittest.TestCase):
             self.assertEqual(self.record(positive(), cell)[0], 0)
 
     def test_actual_h3_group_requires_complete_proofs_from_both_executed_ranks(self):
-        value = slim_positive()
+        value = slim_group_positive()
         call = value["calls"][0]
-        call["status"] = "succeeded"
-        call["function"] = "generate_ref2va_turbo"
         measurements = call["measurements"]
-        measurements["execution"]["gpus"].append(dict(measurements["execution"]["gpus"][0], gpu=1))
         memory = measurements["memory"]
-        memory["stats"]["leftover_by_gpu"] = [[0, 0], [1, 0]]
-        proof, trace = proof_and_trace([1], {1: 64}, 256, [1])
-        second = dict(proof, gpu=1, rank=1)
-        memory["stats"]["proofs"] = [proof, second]
-        memory["trace"] = trace + [dict(event, gpu=1, rank=1) for event in trace]
+        second = memory["stats"]["proofs"][1]
         # Current long_form invokes motion_segment directly; both current and
         # direct-render H3 children need the same actual two-rank proof.
         for function in ("generate_ref2va_turbo", "motion_segment"):
@@ -338,6 +350,38 @@ class MemoryReceipts(unittest.TestCase):
         self.assertTrue(API["control_reason"]({
             "status": "completed", "landed": True, "poisoned": "0", "exec": "10s",
             "bar": "no-two-gpu-h3-execution"}))
+
+    def test_two_gpu_candidate_requires_positive_pids_and_distinct_physical_uuids(self):
+        for field, bad in (("pid", None), ("pid", 0), ("pid", True),
+                           ("uuid", None), ("uuid", ""), ("uuid", "not-a-physical-uuid")):
+            with self.subTest(field=field, bad=bad):
+                value = slim_group_positive()
+                row = value["calls"][0]["measurements"]["execution"]["gpus"][1]
+                if bad is None:
+                    del row[field]
+                else:
+                    row[field] = bad
+                self.assertIn("invalid-gpu-execution-identity",
+                              self.record(value, "2x8-h3", slim="slim")[1])
+        value = slim_group_positive()
+        rows = value["calls"][0]["measurements"]["execution"]["gpus"]
+        rows[1]["uuid"] = rows[0]["uuid"].lower().removeprefix("gpu-").replace("-", "").upper()
+        self.assertIn("invalid-gpu-execution-identity",
+                      self.record(value, "2x8-h3", slim="slim")[1])
+
+    def test_two_gpu_sdxl_cells_require_one_actual_device_per_request(self):
+        for cell in ("2x8-sdxl-a", "2x8-sdxl-b"):
+            self.assertEqual(self.record(slim_positive(), cell, slim="slim")[0], 0)
+            group = slim_group_positive()
+            group["calls"][0]["function"] = "generate"
+            self.assertIn("not-single-gpu-sdxl-execution", self.record(group, cell, slim="slim")[1])
+        # Two individually valid calls still cannot switch physical devices inside one request.
+        value = slim_positive()
+        other = copy.deepcopy(value["calls"][0])
+        other["measurements"]["execution"]["gpus"][0]["uuid"] = "0" * 31 + "2"
+        value["calls"].append(other)
+        self.assertIn("not-single-gpu-sdxl-execution",
+                      self.record(value, "2x8-sdxl-a", slim="slim")[1])
 
     def test_missing_malformed_and_duplicate_gpu_totals_refuse(self):
         for by_gpu in (None, [], [0], [[False, 0]], [[0, False]], [[0, -1]], [[0, 0], [0, 0]], [[0, 1]]):
