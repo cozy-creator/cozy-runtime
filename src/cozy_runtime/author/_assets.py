@@ -231,9 +231,10 @@ class ImageAsset(Asset):
 
     kind: ClassVar[str] = "image"
 
-    def read(self) -> Image:
-        """Display-oriented RGB pixels with the field's `ImagePreparation` applied."""
-        return self._reads().image(self)
+    def read(self, *, mode: Literal["RGB", "RGBA"] = "RGB") -> Image:
+        """Display-oriented pixels with the field's `ImagePreparation` applied. RGB
+        composites transparency over white; RGBA keeps it (opaque sources read alpha 255)."""
+        return self._reads().image(self, mode)
 
     def probe(self) -> ImageProbe:
         """Header geometry: `width`/`height` are what `read()` returns. No decode."""

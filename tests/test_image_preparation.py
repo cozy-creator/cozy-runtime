@@ -237,3 +237,60 @@ def test_still_image_retained_budget_precedes_pixel_decode(tmp_path: Path) -> No
     source.write_bytes(source.read_bytes()[:45])  # Header fits, but pixel loading would fail.
     with pytest.raises(MediaDecodeError, match="decoded"):
         decode_image_path(source, DEFAULT_DECODE_LIMITS, _Budget(104))
+
+
+def _rgba() -> Image.Image:
+    """Opaque red, transparent green, half-transparent blue and a clear pixel over black."""
+    return Image.frombytes(
+        "RGBA", (2, 2), bytes([255, 0, 0, 255, 0, 255, 0, 0, 0, 0, 255, 128, 0, 0, 0, 0])
+    )
+
+
+@pytest.mark.parametrize("format", ["png", "webp"])
+def test_rgba_saves_and_reads_with_its_alpha(tmp_path: Path, format: str) -> None:
+    source = _rgba()
+    saved = fakes.fake_outputs().save_image(source, format=format)
+    assert saved._local is not None
+    with Image.open(saved._local) as encoded:
+        assert encoded.mode == "RGBA"
+        assert encoded.tobytes() == source.tobytes()  # Exact, colour under alpha 0 included.
+    asset = fakes.fake_input(saved)
+    rgba = asset.read(mode="RGBA")
+    assert rgba.mode == "RGBA" and rgba.tobytes() == source.tobytes()
+    rgb = asset.read()
+    assert rgb.mode == "RGB"
+    # Over white: opaque stays, transparent is white, half-transparent blends.
+    assert rgb.tobytes() == bytes([255, 0, 0, 255, 255, 255, 127, 127, 255, 255, 255, 255])
+
+
+def test_save_image_converts_every_mode(tmp_path: Path) -> None:
+    out = fakes.fake_outputs()
+    gray = Image.frombytes("L", (2, 1), bytes([10, 200]))
+    shaded = Image.frombytes("LA", (2, 1), bytes([10, 255, 200, 0]))
+    keyed = Image.new("P", (2, 1))
+    keyed.putpalette([0, 0, 0, 9, 8, 7])
+    keyed.putpixel((1, 0), 1)
+    keyed.info["transparency"] = 1
+    expected = [
+        ("RGB", bytes([10, 10, 10, 200, 200, 200])),
+        ("RGBA", bytes([10, 10, 10, 255, 200, 200, 200, 0])),
+        ("RGBA", bytes([0, 0, 0, 255, 9, 8, 7, 0])),
+    ]
+    for image, (mode, pixels) in zip((gray, shaded, keyed), expected, strict=True):
+        saved = out.save_image(image)
+        assert saved._local is not None
+        with Image.open(saved._local) as encoded:
+            assert (encoded.mode, encoded.tobytes()) == (mode, pixels)
+
+
+def test_rgba_read_is_prepared_and_charged_four_bytes_a_pixel(tmp_path: Path) -> None:
+    source = tmp_path / "large.png"
+    Image.new("RGBA", (64, 32), (0, 0, 255, 0)).save(source)
+    asset = fakes.file_input(ImageAsset, source, preparation=ImagePreparation(max_edge=16))
+    image = asset.read(mode="RGBA")
+    assert (image.mode, image.size) == ("RGBA", (16, 8))
+    assert image.tobytes()[3::4] == bytes(16 * 8)
+    assert asset.read().tobytes() == b"\xff" * (16 * 8 * 3)
+    assert asset._media is not None and asset._media.retained_bytes == 16 * 8 * (4 + 3)
+    with pytest.raises(ValueError, match="RGB or RGBA"):
+        asset.read(mode="CMYK")  # type: ignore[arg-type]
