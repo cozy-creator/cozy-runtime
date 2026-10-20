@@ -263,8 +263,8 @@ class Backend:
         return frozenset(self.checkpoints)
 
     def ahead(self) -> None:
-        """Before the factory runs, each bound component's grant. A held host tier is adopted
-        now and its copies to the GPU run while the module is built (memory-varena §5.4)."""
+        """Before the factory runs, each bound component's grant, asked once. The load registers
+        it, held or sealed, the one way it loads any time."""
         started = time.perf_counter()
         for name in self.checkpoints:
             self._granted(name)
@@ -485,9 +485,8 @@ class Backend:
         )
 
     def _granted(self, name: str) -> WeightGrant:
-        """A component's grant: the sealed host tier TensorD holds for its layout, asked once,
-        adopted at once and copying to the GPU; without one, varena reads the checkpoint (as it
-        does when the held tier's regions differ)."""
+        """A component's grant, asked of TensorD once: the sealed host tier it holds for the
+        layout, registered by the load; without one, varena reads the checkpoint."""
         grant = self.grants.get(name)
         if grant is None:
             checkpoint = self.checkpoints[name]
@@ -496,7 +495,6 @@ class Backend:
                 fd, pages, fingerprint = self.grant(grant.manifest, self._layout(name))
                 grant = replace(grant, host_fd=fd, pages=tuple(pages), fingerprint=fingerprint)
             self.grants[name] = grant
-            self.memory.adopt(grant)
         return grant
 
     def keep(self, *, quiescent: bool = False) -> None:
@@ -511,10 +509,9 @@ class Backend:
                 self.keeper(self._layout(name), fingerprint, pages)
 
     def _release(self) -> None:
-        """Grants no registration took, and what `ahead` adopted for them."""
+        """Grants no registration took."""
         for name in list(self.grants):
             _close(self.grants.pop(name))
-        self.memory.unclaimed()
 
     def _install_leaf(self, key: str) -> tuple[Any, Any, tuple[str, ...]]:
         """Replace the linear op that owns `key` with its encoded leaf, on meta. Returns the
