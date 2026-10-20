@@ -16,8 +16,9 @@ import weakref
 import zlib
 from collections import Counter
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
+from functools import partial
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
@@ -36,6 +37,7 @@ from cozy_runtime.author._loader import Census, TensorLike, TensorSpec, _members
 from cozy_runtime.author._model import PLACED
 from cozy_runtime.internal import canonical, lora_bake
 from cozy_runtime.internal.derive import placing
+from cozy_runtime.internal.derived_values import DerivedValues
 from cozy_runtime.internal.encoding import (
     TORCH_DTYPES,
     Capabilities,
@@ -110,6 +112,7 @@ class Backend:
         self.models: dict[str, Model] = {}
         self.bakes: dict[str, _Bakes] = {}
         self.derived: dict[str, dict[tuple[Module, str], Tensor]] = {}
+        self.derived_owners: list[DerivedValues] = []
         self.stats: dict[str, float] = {}
         self.device_facts = device_facts
         self.providers = launch_providers()
@@ -414,6 +417,9 @@ class Backend:
         self.state = "poisoned"
 
     def close(self) -> None:
+        for owner in self.derived_owners:
+            owner.close()
+        self.derived_owners.clear()
         for model in self.models.values():
             model.close()
         self.models.clear()
@@ -669,8 +675,20 @@ class Residency:
         self.notes: dict[str, str] = {}
         self.attempts = 0
         self.pins: dict[tuple[str, str], _Pin] = {}
+        self.derived: list[DerivedValues] = []
         for name, model in self.models.items():
             PLACED[model.module] = (self, name)
+            owner = DerivedValues.install(
+                memory, model.module, name, backend.torch, partial(self._retire, name)
+            )
+            if owner is not None:
+                self.derived.append(owner)
+                backend.derived_owners.append(owner)
+
+    def _retire(self, component: str) -> None:
+        for (name, _), token in tuple(self.pins.items()):
+            if name == component:
+                token.cache.shrink(token.nbytes)
 
     def open_attempt(self) -> None:
         self.attempts += 1
@@ -725,7 +743,9 @@ class Residency:
         try:
             with cache.serving():
                 cache.hold(model)
-                token = _Pin(model, cache)
+                token = _Pin(
+                    model, cache, [owner for owner in self.derived if owner.component == component]
+                )
                 token_ref = weakref.ref(token)
                 self.pins[key] = token
         except Unbound:
@@ -750,10 +770,11 @@ class Residency:
 class _Pin:
     """A pinned component's token: its weights stay bound while a reference lives."""
 
-    __slots__ = ("model", "cache", "retired", "__weakref__")
+    __slots__ = ("__weakref__", "cache", "derived", "model", "retired")
 
-    def __init__(self, model: Model, cache: Cache) -> None:
+    def __init__(self, model: Model, cache: Cache, derived: Sequence[DerivedValues] = ()) -> None:
         self.model, self.cache, self.retired = model, cache, False
+        self.derived = tuple(derived)
         weakref.finalize(self, cache.close)
 
     @property
@@ -771,7 +792,12 @@ class _Pin:
         if retired:
             yield False
             return
-        with self.cache.serving():
+        with ExitStack() as stack:
+            # Reclamation may have retired this token before the derived lease is acquired.
+            # Take those leases first: their callbacks retire graph pins, never the reverse.
+            for owner in self.derived:
+                stack.enter_context(owner.serving())
+            stack.enter_context(self.cache.serving())
             # cache_active may have waited for a reclamation callback to finish.
             if self.retired:
                 yield False
