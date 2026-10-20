@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["cozy-runtime==0.27.4"]
+# dependencies = ["cozy-runtime>=0.27.4,<0.31"]
 # ///
 """Run Torch placement and TensorFS reader checks on an explicitly rented GPU."""
 

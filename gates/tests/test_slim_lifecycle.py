@@ -2,9 +2,9 @@
 
 import ast
 import json
-from pathlib import Path
 import runpy
 import unittest
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 GENERATOR = runpy.run_path(str(ROOT / "make-slim-lifecycle.py"))
@@ -25,6 +25,15 @@ def generate(ctx, payload, model, out, tel):
 
 
 class LifecycleHarness(unittest.TestCase):
+    def test_models_use_public_inline_cli_overrides(self):
+        self.assertEqual(
+            LIFECYCLE["model_overrides"](["model=repo/name@1", "model.vae=repo/vae@2"]),
+            ["model.model=repo/name@1", "model.vae=repo/vae@2"],
+        )
+        for value in ("", "slot", "=repo/name@1", "slot=", "model.=repo/name@1"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                LIFECYCLE["model_overrides"]([value])
+
     def test_generator_preserves_computation_and_changes_only_the_proof_seam(self):
         before = ast.parse(SOURCE)
         after = ast.parse(GENERATOR["patch"](SOURCE))

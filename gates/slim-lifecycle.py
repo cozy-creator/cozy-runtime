@@ -7,13 +7,14 @@ Raw run records preserve initial residency, copies, fills and readonly-reuse evi
 """
 
 import argparse
+import contextlib
 import hashlib
 import json
-from pathlib import Path
 import re
 import subprocess
 import time
 import uuid as identifiers
+from pathlib import Path
 
 
 def documents(text):
@@ -22,10 +23,8 @@ def documents(text):
     except ValueError:
         result = []
         for line in text.splitlines():
-            try:
+            with contextlib.suppress(ValueError):
                 result.append(json.loads(line))
-            except ValueError:
-                pass
         return result
 
 
@@ -101,6 +100,18 @@ def uuid(value):
     return normalized
 
 
+def model_overrides(values):
+    result = []
+    for value in values:
+        slot, separator, model = value.partition("=")
+        if slot.startswith("model."):
+            slot = slot[len("model."):]
+        if not separator or not slot.strip() or not model.strip():
+            raise ValueError("--model requires a nonempty SLOT=MODEL override")
+        result.append(f"model.{slot}={model}")
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--on", required=True)
@@ -114,6 +125,7 @@ def main():
     parser.add_argument("--model", action="append", default=[])
     parser.add_argument("--bits", type=int, choices=(8, 16), default=8)
     args = parser.parse_args()
+    models = model_overrides(args.model)
     assert args.on.startswith("rent-"), "use the explicit caller-owned rental alias, never local"
     assert not args.output.exists(), "use a new output directory so earlier evidence is preserved"
     origin = json.loads((args.package / "lifecycle-source.json").read_text())
@@ -187,8 +199,7 @@ def main():
             "--detach",
             "--json",
         ]
-        for model in args.model:
-            words.extend(["--model", model])
+        words.extend(models)
         submitted = command(name + "-submit", words)
         number = next(
             doc["number"]

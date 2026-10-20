@@ -1,0 +1,45 @@
+{
+  "scope": "Source-format fixtures only; not actual hardware measurements",
+  "contract": "One tracing row per physical UUID per Pool generation",
+  "events": [
+    {
+      "timestamp": "2026-10-20T12:00:00Z",
+      "level": "INFO",
+      "fields": {
+        "message": "GPU memory capacity",
+        "gpu": "GPU-11111111-1111-1111-1111-111111111111",
+        "physical_bytes": 25000000000,
+        "configured_limit_bytes": 6442450944,
+        "effective_limit_bytes": 6442450944,
+        "generation": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "target": "tensord::gpu_service"
+    },
+    {
+      "timestamp": "2026-10-20T12:01:00Z",
+      "level": "INFO",
+      "fields": {
+        "message": "GPU memory capacity",
+        "gpu": "GPU-11111111-1111-1111-1111-111111111111",
+        "physical_bytes": 25000000000,
+        "configured_limit_bytes": 12884901888,
+        "effective_limit_bytes": 12884901888,
+        "generation": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "target": "tensord::gpu_service"
+    },
+    {
+      "timestamp": "2026-10-20T12:02:00Z",
+      "level": "INFO",
+      "fields": {
+        "message": "GPU memory capacity",
+        "gpu": "GPU-11111111-1111-1111-1111-111111111111",
+        "physical_bytes": 25000000000,
+        "configured_limit_bytes": 25769803776,
+        "effective_limit_bytes": 25000000000,
+        "generation": "cccccccccccccccccccccccccccccccc"
+      },
+      "target": "tensord::gpu_service"
+    }
+  ]
+}
