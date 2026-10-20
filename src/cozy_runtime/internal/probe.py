@@ -53,10 +53,10 @@ from typing import Any
 
 import msgspec
 
+from cozy_runtime.author._loader import TENSORFS_DTYPES
 from cozy_runtime.author._numeric import within, worst
 from cozy_runtime.derive.microscale import encode_nvfp4
 from cozy_runtime.internal import accel, canonical
-from cozy_runtime.author._loader import TENSORFS_DTYPES
 from cozy_runtime.internal.encoding import (
     TORCH_DTYPES,
     Capabilities,
@@ -263,7 +263,7 @@ def _eps(torch: Any, dtype: Any) -> float:
 
 
 def _numerics(torch: Any, provider: Provider, device: Any, dtype: Any) -> Sweep:
-    """All 256 E4M3 patterns under one f32 scale: the decode is `round_L(weight × scale)`, the
+    """All 256 E4M3 patterns under one f32 scale: the decode is `round_L(weight x scale)`, the
     scale entering exactly, so it must equal the f64 product cast once into the dtype."""
     data = torch.frombuffer(bytearray(bytes(range(256))), dtype=torch.uint8)
     data = data.view(torch.float8_e4m3fn).reshape(16, 16)
@@ -383,7 +383,7 @@ def _numerics_int8_rowwise(
 def _numerics_int8_tensorwise(
     torch: ModuleType, provider: Provider, device: Tensor, dtype: Tensor
 ) -> Sweep:
-    """Every int8 value under one f32 scale: the decode is `round_L(weight × scale)`, the scale
+    """Every int8 value under one f32 scale: the decode is `round_L(weight x scale)`, the scale
     entering exactly, so it must equal the f64 product cast once into the dtype."""
     data = (torch.arange(256) - 128).to(torch.int8).reshape(16, 16)
     scale = torch.tensor(0.0123, dtype=torch.float32)
@@ -783,7 +783,7 @@ class VectorPart(msgspec.Struct, frozen=True):
 
 class VectorEncoding(msgspec.Struct, frozen=True):
     scheme: str
-    params: dict[str, int | float | str] = {}
+    params: dict[str, bool | int | float | str | list[int]] = {}
 
 
 class VectorCase(msgspec.Struct, frozen=True):
@@ -800,8 +800,11 @@ class VectorCase(msgspec.Struct, frozen=True):
 
 def vector_cases() -> list[VectorCase]:
     """The conformance cases with a scheme (the plain ones are TensorFS's read cases)."""
-    rows = msgspec.json.decode(VECTORS.read_bytes(), type=dict[str, list[dict[str, object]]])
-    return [msgspec.convert(row, VectorCase) for row in rows["cases"] if "encoding" in row]
+    cases = []
+    for path in (VECTORS, VECTORS.with_name("comfy.json")):
+        rows = msgspec.json.decode(path.read_bytes(), type=dict[str, list[dict[str, object]]])
+        cases.extend(msgspec.convert(row, VectorCase) for row in rows["cases"] if "encoding" in row)
+    return cases
 
 
 def vector_tensor(torch: ModuleType, part: VectorPart, device: Tensor) -> Tensor:
