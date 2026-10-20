@@ -41,7 +41,7 @@ import functools
 import sys
 import time
 import weakref
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import nullcontext
 from typing import Any
 
@@ -168,7 +168,7 @@ class _Recorder:
         self.stream: Any = None
         #: the pin its structure was read under, and that structure
         self.structure: tuple[ResidencyPin | None, tuple[object, ...]] = (None, ())
-        self.pool_bytes = self.replays = 0
+        self.cache_bytes = self.replays = 0
         #: signatures that run as written by choice, by why, and the latest one's detail
         self.chose: dict[str, int] = {}
         self.detail = ""
@@ -187,7 +187,7 @@ class _Recorder:
         if self.structure[0] is not None:
             self.structure[0].nbytes = 0
         self.structure = (None, ())
-        self.pool, self.pool_bytes, self.chose = None, 0, {}
+        self.pool, self.cache_bytes, self.chose = None, 0, {}
 
 
 #: Every graphed component's recorder in this process.
@@ -232,28 +232,64 @@ def _graphed(torch: Any, cls: type) -> type:
 
 
 def _shed(torch: Any, recorder: _Recorder) -> int:
-    """Drop a component's recordings and their pool (its pin's shed); the pool's bytes."""
-    pools = {entry.graph.pool() for entry in recorder.recordings.values()}
-    before = _pool_bytes(torch, pools)
+    """Drop a component's recordings; report their actual released allocator bytes."""
+    pools, inputs = _allocations(recorder.recordings.values())
+    before = _cache_bytes(torch, pools, inputs)
     pin = recorder.structure[0]
     recorder.recordings.clear()  # each holds its pin: the last one dropped lets it go
     recorder.structure = (None, ())
-    recorder.pool, recorder.pool_bytes = None, 0
+    recorder.pool, recorder.cache_bytes = None, 0
     torch.cuda.empty_cache()
-    remaining = _pool_bytes(torch, pools)
+    remaining = _cache_bytes(torch, pools, inputs)
     if pin is not None:
         pin.nbytes = remaining
     return max(before - remaining, 0)
 
 
+def _allocations(
+    recordings: Iterable[_Recording],
+) -> tuple[set[tuple[int, int]], set[tuple[int, int]]]:
+    # Return scalar identities only: this frame must be gone before shed clears
+    # the recordings, or even its last input/recording local would retain bytes.
+    pools: set[tuple[int, int]] = set()
+    inputs: set[tuple[int, int]] = set()
+    for entry in recordings:
+        pools.add(entry.graph.pool())
+        for value in entry.inputs:
+            if value is not None:
+                address = int(value.untyped_storage().data_ptr())
+                if address:
+                    inputs.add((int(value.device.index), address))
+    return pools, inputs
+
+
 def _pool_bytes(torch: Any, pools: set[tuple[int, int]]) -> int:
-    # Cache.bytes is subtracted from Torch's allocated bytes by the memory plane.
-    # Private-pool inactive segments are already counted as allocator slack.
-    return sum(
-        int(segment["allocated_size"])
-        for pool in pools
-        for segment in torch.cuda.memory_snapshot(pool, include_traces=False)
-    )
+    return _cache_bytes(torch, pools, set())
+
+
+def _cache_bytes(torch: Any, pools: set[tuple[int, int]], inputs: set[tuple[int, int]]) -> int:
+    if not pools and not inputs:
+        return 0
+    return _allocated_bytes(torch.cuda.memory_snapshot(include_traces=False), pools, inputs)
+
+
+def _allocated_bytes(
+    segments: Iterable[Mapping[str, Any]],
+    pools: set[tuple[int, int]],
+    inputs: set[tuple[int, int]],
+) -> int:
+    # Cache.bytes is subtracted from Torch's allocated bytes, not reserved slack.
+    # A static input is cloned before capture, outside the graph's private pool.
+    # Count actual allocator block sizes once, even if several views name them.
+    allocated: dict[tuple[int, int], int] = {}
+    for segment in segments:
+        private = tuple(segment["segment_pool_id"]) in pools
+        device = int(segment["device"])
+        for block in segment["blocks"]:
+            key = (device, int(block["address"]))
+            if block["state"] == "active_allocated" and (private or key in inputs):
+                allocated[key] = int(block["size"])
+    return sum(allocated.values())
 
 
 _EAGER = object()
@@ -366,11 +402,9 @@ def _borrowed(
             recorder.pool = None
     if entry is None:
         entry = _record(torch, module, call, leaves, spec, recorder, key, layout, placed)
-        recorder.pool_bytes = _pool_bytes(
-            torch, {recording.graph.pool() for recording in recorder.recordings.values()}
-        )
+        recorder.cache_bytes = _cache_bytes(torch, *_allocations(recorder.recordings.values()))
         if pin is not None:
-            pin.nbytes = recorder.pool_bytes
+            pin.nbytes = recorder.cache_bytes
         if entry is None:
             return _EAGER
     recorder.replays += 1
@@ -476,7 +510,7 @@ def _facts(recorder: _Recorder) -> str:
     chose = ", ".join(f"{n} {why}" for why, n in recorder.chose.items())
     return (
         f"{len(recorder.recordings)} recorded in {recorder.record_s:.2f} s, "
-        f"{recorder.replays} replays, pool {recorder.pool_bytes >> 20} MiB"
+        f"{recorder.replays} replays, cache {recorder.cache_bytes >> 20} MiB"
         + (f"; as written: {chose} ({recorder.detail})" if chose else "")
     )
 
