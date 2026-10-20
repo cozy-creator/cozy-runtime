@@ -347,7 +347,7 @@ class Outputs:
 
     def adopt(self, output: Output) -> ModelArtifact:
         ck = output.commit()
-        assert ck.id is not None and ck.tree is not None
+        assert ck.tree is not None
         self.show(output.slot, DERIVED, ck.tree, ck.variant or "")
         if self.destination:
             revision = upload(self.store, ck, self.destination, self.connection)

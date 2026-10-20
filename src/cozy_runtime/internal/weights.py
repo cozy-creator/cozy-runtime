@@ -24,7 +24,6 @@ from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 from tensorfs.varena.torch import (
     Cache,
     Declared,
-    LayoutChanged,
     Memory,
     Model,
     Shrink,
@@ -460,14 +459,7 @@ class Backend:
             bind=_Routes(self, rows),
         )
         try:
-            try:
-                model = self.memory.load(root)
-            except LayoutChanged:
-                if self.grant is None:
-                    raise
-                fresh = replace(self._granted(name, held=False), keys=tuple(rows))
-                vars(root)["_varena"] = replace(vars(root)["_varena"], weights=fresh)
-                model = self.memory.load(root)
+            model = self.memory.load(root)
         finally:
             remaining = self.grants.pop(name, None)
             if remaining is not None:
@@ -492,17 +484,15 @@ class Backend:
             }
         )
 
-    def _granted(self, name: str, *, held: bool = True) -> WeightGrant:
+    def _granted(self, name: str) -> WeightGrant:
         """A component's grant: the sealed host tier TensorD holds for its layout, asked once,
-        adopted at once and copying to the GPU; without one (or not `held`), varena reads the
-        checkpoint."""
-        if not held and name in self.grants:
-            _close(self.grants.pop(name))
+        adopted at once and copying to the GPU; without one, varena reads the checkpoint (as it
+        does when the held tier's regions differ)."""
         grant = self.grants.get(name)
         if grant is None:
             checkpoint = self.checkpoints[name]
             grant = WeightGrant(checkpoint.ck, name, checkpoint.id)
-            if held and self.grant is not None:
+            if self.grant is not None:
                 fd, pages, fingerprint = self.grant(grant.manifest, self._layout(name))
                 grant = replace(grant, host_fd=fd, pages=tuple(pages), fingerprint=fingerprint)
             self.grants[name] = grant

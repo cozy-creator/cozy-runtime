@@ -182,7 +182,6 @@ class Checkpoint:
     """One opened checkpoint: its rows (in construction order), configs and assets."""
 
     def __init__(self, ck: tensorfs.Checkpoint) -> None:
-        assert ck.id is not None, "a checkpoint of the store"
         self.ck = ck
         #: the weight set's identity: the header's ref, `sha256:<hex>`
         self.id: str = ck.id
