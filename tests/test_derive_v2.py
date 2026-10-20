@@ -10,8 +10,8 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from tensorfs import raw
 import tensorfs
+from tensorfs import raw
 
 from cozy_runtime import weights_store
 from cozy_runtime.author import CapabilityError, UnsupportedInput, Weights
