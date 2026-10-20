@@ -418,10 +418,10 @@ def _replay_code(command: Invoke, request: str) -> str:
 
 
 def _show_checkpoint(
-    exchange: Exchange, slot: str, repo_id: str, revision: str, variant: str
+    exchange: Exchange, slot: str, repo_id: str, revision: str, tag: str, variant: str
 ) -> None:
     """A weights output's checkpoint as the run's checkpoint item (`CheckpointItem`)."""
-    item = CheckpointItem(output=slot, repo_id=repo_id, revision=revision, variant=variant)
+    item = CheckpointItem(output=slot, repo_id=repo_id, revision=revision, tag=tag, variant=variant)
     answer = exchange(item, Answer)
     if not answer.ok:
         raise RuntimeFailure(

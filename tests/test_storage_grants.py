@@ -17,7 +17,8 @@ import pytest
 import tensorfs
 
 from cozy_runtime import weights_store
-from cozy_runtime.author import CapabilityError, RuntimeFailure
+from cozy_runtime.author import CapabilityError
+from cozy_runtime.author._errors import RuntimeFailure
 from cozy_runtime.author._executor_requests import Answer, CheckpointItem, Request, refuse
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.seam import RESULT_DOCUMENT
@@ -114,6 +115,9 @@ def test_a_granted_output_is_written_into_the_store_shown_and_replayed(
     assert results[3]["checkpoint"] == results[4]["checkpoint"] == results[1]["checkpoint"]
     assert results[3]["transaction"] == results[4]["transaction"] != results[1]["transaction"]
     assert [(item.output, item.repo_id) for item in shown] == [("model", weights_store.DERIVED)] * 4
+    assert [item.tag for item in shown] == [
+        result["transaction"].removeprefix("sha256:") for result in results[1:]
+    ]
     out = tensorfs.open(shown[0].revision, cache_dir=store, local_files_only=True)
     assert out.id == results[1]["checkpoint"]
     assert all(item.revision == out.tree for item in shown)
@@ -387,9 +391,9 @@ def test_a_destination_commits_each_output_under_its_private_tag(
         with outputs.open("model", weights_store.Derivation(None)) as output:
             output.put("model", "w", "U8", [len(value)], value)
             artifact = outputs.adopt(output)
-        _, repo_id, tree, _ = shown[-1]
+        _, repo_id, tree, moved, _ = shown[-1]
         assert repo_id == repo and tree.startswith("sha256:")
-        moved = named or weights_store.tag(artifact.transaction)
+        assert moved == (named or weights_store.tag(artifact.transaction))
         trees.append(tree)
         # A tag resolves through its endpoint: what it names now is the endpoint's to say.
         with tensorfs.open(repo, revision=moved, endpoint=origin, cache_dir=store) as tagged:

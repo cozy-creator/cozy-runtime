@@ -441,7 +441,7 @@ class Output:
 
 class Outputs:
     """One attempt's weights outputs in `store`. Each opens under its replay key; adopting one
-    commits it and shows it to the run (`show(slot, repo_id, commit, variant)`)."""
+    commits it and shows it to the run (`show(slot, repo_id, commit, tag, variant)`)."""
 
     def __init__(
         self,
@@ -451,7 +451,7 @@ class Outputs:
         actor: str,
         code: str,
         bounds: Mapping[str, int],
-        show: Callable[[str, str, str, str], None],
+        show: Callable[[str, str, str, str, str], None],
         destination: str = "",
         connection: Connection | None = None,
     ) -> None:
@@ -472,11 +472,11 @@ class Outputs:
     def adopt(self, output: Output) -> ModelArtifact:
         ck, moved = output.commit(), tag(output.transaction)
         assert ck.tree is not None
-        self.show(output.slot, DERIVED, ck.tree, ck.variant or "")
+        self.show(output.slot, DERIVED, ck.tree, moved, ck.variant or "")
         if self.destination:
             named = self.destination_tag or moved
             commit = upload(self.store, ck, self.destination, named, self.connection)
-            self.show(output.slot, self.destination, commit, ck.variant or "")
+            self.show(output.slot, self.destination, commit, named, ck.variant or "")
         return ModelArtifact(self.request_id, output.slot, ck.id, output.transaction)
 
 
