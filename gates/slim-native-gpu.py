@@ -7,9 +7,10 @@
 The outer Runtime launches a standalone Rust binary; it does not replace the worker's SDK.
 The binary checks its actual visible GPU and runs each case in a fresh process.
 The required suite JSON keeps the ten base cases and opts into placement proofs:
-{"warm_admission": false|true, "pin_readiness": false|true}. Omitting pin_readiness
-preserves the old ten/eleven-case inputs. Both true requires all twelve cases from
-the updated placement binary; coverage is explicit in result.json.
+{"warm_admission": false|true, "pin_readiness": false|true, "failed_fills": false|true}.
+Omitting optional keys preserves the old ten/eleven/twelve-case inputs. All true
+requires thirteen cases from the updated placement binary; coverage is explicit
+in result.json.
 """
 from pathlib import Path
 import json
@@ -49,12 +50,14 @@ def main(*, binary: Annotated[FileAsset, AssetBound(max_bytes=67108864)],
          suite: Annotated[FileAsset, AssetBound(max_bytes=4096)], out: Outputs) -> Tree:
     selection = json.loads(suite.read_bytes())
     if (not isinstance(selection, dict) or "warm_admission" not in selection
-            or set(selection) - {"warm_admission", "pin_readiness"}
+            or set(selection) - {"warm_admission", "pin_readiness", "failed_fills"}
             or type(selection["warm_admission"]) is not bool
-            or ("pin_readiness" in selection and type(selection["pin_readiness"]) is not bool)):
-        raise ValueError('suite requires boolean warm_admission and optional boolean pin_readiness')
+            or ("pin_readiness" in selection and type(selection["pin_readiness"]) is not bool)
+            or ("failed_fills" in selection and type(selection["failed_fills"]) is not bool)):
+        raise ValueError('suite requires boolean warm_admission; pin_readiness and failed_fills are optional booleans')
     warm_admission = selection["warm_admission"]
     pin_readiness = selection.get("pin_readiness", False)
+    failed_fills = selection.get("failed_fills", False)
     root = Path(tempfile.mkdtemp(prefix="varena-slim-gpu-"))
     executable = root / "slim-gpu"
     executable.write_bytes(binary.read_bytes())
@@ -79,6 +82,12 @@ def main(*, binary: Annotated[FileAsset, AssetBound(max_bytes=67108864)],
             placement_executable,
             "placement::gpu_tests::actual_readiness_survives_concurrent_fill_and_unmap",
             "PASS actual readiness survives concurrent fill and unmap",
+        ))
+    if failed_fills:
+        cases.append((
+            placement_executable,
+            "placement::gpu_tests::failed_fills_require_real_room_and_recover_in_the_same_placement",
+            "PASS failed fills require real room and recover in the same placement",
         ))
     for program, name, marker in cases:
         command = [str(program), "--ignored", "--exact", name, "--nocapture", "--test-threads=1"]
@@ -111,5 +120,5 @@ def main(*, binary: Annotated[FileAsset, AssetBound(max_bytes=67108864)],
         if len(gpu_uuids) != 1:
             raise RuntimeError(f"Native GPU cases used different physical GPUs: {sorted(gpu_uuids)}")
         results.append(name)
-    (logs / "result.json").write_text(json.dumps({"passed": results, "warm_admission_requested": warm_admission, "pin_readiness_requested": pin_readiness, "gpu_uuid": next(iter(gpu_uuids)), "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES")}, indent=2))
+    (logs / "result.json").write_text(json.dumps({"passed": results, "warm_admission_requested": warm_admission, "pin_readiness_requested": pin_readiness, "failed_fills_requested": failed_fills, "gpu_uuid": next(iter(gpu_uuids)), "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES")}, indent=2))
     return out.save_tree(logs)
