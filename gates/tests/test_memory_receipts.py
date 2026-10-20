@@ -55,6 +55,18 @@ class MemoryReceipts(unittest.TestCase):
         self.assertIn("unmeasured-speculation", API["trace_errors"]([begin, fill, end]))
         self.assertEqual(API["trace_errors"]([]), ["missing-decision-trace"])
 
+    def test_explicit_lowering_stops_speculation_without_forbidding_demand(self):
+        base = dict(request="r", step=0, page=1, bytes=1, capacity=8,
+                    resident=1, orphan_bytes=0, reason="demand", **{"class": "working"})
+        trace = [dict(base, sequence=0, kind="begin"),
+                 dict(base, sequence=1, kind="lower", reason="lower"),
+                 dict(base, sequence=2, kind="bind"),
+                 dict(base, sequence=3, kind="end")]
+        self.assertEqual(API["trace_errors"](trace), [])
+        trace[2] = dict(base, sequence=2, kind="fill", reason="speculation",
+                        working_set=4, speculative_budget=3)
+        self.assertIn("speculation-after-starvation", API["trace_errors"](trace))
+
     def record(self, value, cell="24-sdxl4", cold=""):
         with tempfile.TemporaryDirectory() as directory:
             path, summary = Path(directory) / "run.json", Path(directory) / "summary.txt"

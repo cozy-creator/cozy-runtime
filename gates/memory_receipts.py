@@ -81,7 +81,7 @@ def trace_errors(events):
         request = (*stream, identity)
         step = (*request, event["step"])
         kind, reason, page_class = event.get("kind"), event.get("reason"), event.get("class")
-        if kind not in {"begin", "bind", "fill", "evict", "end"} or page_class not in classes:
+        if kind not in {"begin", "bind", "fill", "evict", "lower", "end"} or page_class not in classes:
             errors.append("unknown-decision-event")
             continue
         if kind == "begin":
@@ -96,6 +96,8 @@ def trace_errors(events):
             errors.append("decision-outside-request")
         if kind == "bind" and event["bytes"] > 0:
             bound.add(request)
+        if kind == "lower":
+            starved.add(step)
         if kind == "evict":
             if page_class == "pinned" or (page_class == "working" and reason != "lower"):
                 errors.append("running-page-evicted")
