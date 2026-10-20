@@ -663,7 +663,7 @@ class Int8ConvRotDequant:
         why = _rows(shape, params) or _params(
             params,
             {
-                "rotation": ("hadamard",),
+                "rotation": ("kron_regular_h4",),
                 "rotation_size": ROTATION_SIZES,
                 "scale_dtype": SCALE_DTYPES,
             },

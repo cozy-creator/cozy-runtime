@@ -1095,7 +1095,7 @@ PROBE_PARAMS: dict[str, dict[str, object]] = {
     "int8.tensorwise": {"scale_dtype": "F32"},
     "fp8.rowwise": {"axis": 0, "scale_dtype": "F32"},
     "int8.rowwise": {"axis": 0, "scale_dtype": "F32"},
-    "int8.convrot": {"rotation": "hadamard", "rotation_size": 256, "scale_dtype": "F32"},
+    "int8.convrot": {"rotation": "kron_regular_h4", "rotation_size": 256, "scale_dtype": "F32"},
     "mxfp8": {"block_size": MX_BLOCK, "scale_layout": "row_major"},
     "nvfp4": {
         "block_size": NVFP4_BLOCK,

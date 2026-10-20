@@ -68,7 +68,7 @@ def _read(ck: tensorfs.Checkpoint, key: str) -> np.ndarray:
         ("fp8.rowwise", {"axis": 0, "scale_dtype": "F32"}, 0.07),
         (
             "int8.convrot",
-            {"rotation": "hadamard", "rotation_size": 256, "scale_dtype": "F32"},
+            {"rotation": "kron_regular_h4", "rotation_size": 256, "scale_dtype": "F32"},
             0.02,
         ),
         (

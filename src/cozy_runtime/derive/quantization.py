@@ -79,7 +79,7 @@ _ENCODINGS: dict[str, _Encoding] = {
         _rowwise(encode_int8_convrot256),
         "I8",
         CONVROT_GROUP,
-        {"rotation": "hadamard", "rotation_size": CONVROT_GROUP, "scale_dtype": "F32"},
+        {"rotation": "kron_regular_h4", "rotation_size": CONVROT_GROUP, "scale_dtype": "F32"},
         _row_scale,
     ),
     # A block's error is at most half its largest E2M1 step (2 of 6) times its scale, and a
