@@ -57,6 +57,13 @@ class Copy(msgspec.Struct, frozen=True, kw_only=True):
     cached: int = 0
 
 
+class FillResult(msgspec.Struct, frozen=True, kw_only=True):
+    phase: str
+    outcome: str
+    error: str | None
+    io_runs: int
+
+
 class TraceEvent(msgspec.Struct, frozen=True, kw_only=True):
     """An actual native placement decision, with the state before its action."""
 
@@ -77,6 +84,7 @@ class TraceEvent(msgspec.Struct, frozen=True, kw_only=True):
     working_set: int | None = None
     speculative_budget: int | None = None
     pass_index: int = 0
+    fill: FillResult | None = None
 
 
 class ProofPage(msgspec.Struct, frozen=True, kw_only=True):
