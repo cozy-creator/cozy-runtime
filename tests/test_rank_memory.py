@@ -12,6 +12,7 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 
 import msgspec
 import pytest
@@ -167,7 +168,7 @@ def test_real_cpu_context_stats_map_logical_two_gpu_facts_to_lane_two_three() ->
             )
             for kind, gpu in (("h2d", ordinal), ("disk", -1))
         )
-        proof_fields = {}
+        proof_fields: dict[str, Any] = {}
         if hasattr(source, "proofs"):
             proof_fields["proofs"] = (
                 {
