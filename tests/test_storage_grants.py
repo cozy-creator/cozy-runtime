@@ -441,7 +441,10 @@ def test_private_replay_retains_the_exact_tree_and_refuses_another_commit(
     assert first.tree == "sha256:" + str(commit["sha256"])
     assert isinstance(commit["length"], int) and commit["length"] > 0
     assert not replay.get("public", False)
-    assert any(str(row["name"]).startswith("upload-") and row["commit"] == commit for row in tags)
+    assert any(
+        row["name"] != name and row["commit"] == commit and not row.get("public", False)
+        for row in tags
+    ), tags
     weights_store._retain_replay(store, transaction, first.tree)
     assert endpoint.repo(weights_store.DERIVED) == (before, etag), "same-tree CAS is a no-op"
 
