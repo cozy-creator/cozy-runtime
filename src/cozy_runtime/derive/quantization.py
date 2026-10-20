@@ -16,7 +16,7 @@ import threading
 from collections import deque
 from collections.abc import Callable, Generator, Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import NamedTuple
+from typing import IO, NamedTuple
 
 import msgspec
 import numpy as np
