@@ -7,6 +7,7 @@ from typing import Any
 
 import numpy as np
 import pytest
+from tensorfs import raw
 
 from cozy_runtime.author import UnsupportedInput, Weights
 from cozy_runtime.author.fakes import fake_attempt, fake_telemetry
@@ -78,7 +79,8 @@ def test_include_recipe_encodes_exactly_its_weights(
     }
     to_q = out.components["transformer"].tensors["blocks.0.attn.to_q.weight"]
     assert to_q.encoding is not None and to_q.encoding.scheme == ENCODING
-    assert (to_q.parts["weight"].dtype, to_q.parts["scale"].shape) == ("I8", (8,))
+    parts = raw.parts(out, "transformer", "blocks.0.attn.to_q.weight")
+    assert (parts["weight"].dtype, parts["scale"].shape) == ("I8", (8,))
     assert out.components["transformer"].tensors["proj_out.weight"].dtype == "F32", "preserved"
     typo = QuantizationPlan(components=("transformer",), include=("transformer.nope.*",))
     with pytest.raises(UnsupportedInput, match="match no weight"):

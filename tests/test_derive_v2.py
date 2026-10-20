@@ -10,6 +10,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from tensorfs import raw
 import tensorfs
 
 from cozy_runtime import weights_store
@@ -167,7 +168,7 @@ def test_a_part_reads_across_its_chunks_from_any_offset(store: Path) -> None:
     )
     assert len(ck.chunks) > 1
     into = bytearray(4 << 20)
-    part = ck.components["unet"].tensors["big"].parts[""]
+    part = raw.parts(ck, "unet", "big")[""]
     offset = ck.chunks[part.chunk][1] - part.offset - 1001
     weights_store.read_into(ck, "unet", "big", "", offset, into)
     assert bytes(into) == memoryview(big)[offset : offset + len(into)]

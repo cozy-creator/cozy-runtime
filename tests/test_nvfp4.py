@@ -7,6 +7,7 @@ from typing import Any
 
 import numpy as np
 import pytest
+from tensorfs import raw
 
 from cozy_runtime.author import Weights
 from cozy_runtime.author.fakes import fake_attempt, fake_telemetry
@@ -88,7 +89,10 @@ def test_one_lane_carries_nvfp4_beside_int8(
             "scale_layout": "row_major",
         },
     )
-    parts = {role: (p.dtype, p.shape) for role, p in ff.parts.items()}
+    parts = {
+        role: (p.dtype, p.shape)
+        for role, p in raw.parts(out, "transformer", "blocks.0.ff.weight").items()
+    }
     assert parts == {
         "weight": ("F4", (48, 64)),
         "scale": ("F8_E4M3", (48, 4)),
