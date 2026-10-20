@@ -232,7 +232,7 @@ def test_a_fresh_output_creates_its_component_and_replays_without_a_source(
         output.put("model", "table", "U8", [4], b"data")
         first = ctx.adopt_model(output)
     ck = tensorfs.open(first.checkpoint, cache_dir=store, local_files_only=True)
-    assert ck.components["model"].cls == "" and ck.components["model"].config == {}
+    assert tuple(ck.components["model"].cls) == ("", "", "") and ck.components["model"].config == {}
     data = bytearray(4)
     ck.components["model"].tensors.read_into("table", data, role="")
     assert data == b"data"

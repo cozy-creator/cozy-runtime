@@ -35,6 +35,8 @@ from cozy_runtime.author._errors import CapabilityError, RuntimeFailure
 DEFAULT_HOME = "~/.cache/tensorfs"
 #: The local repo of finished derivations, one release per replay key.
 DERIVED = "local/derived"
+#: A fresh output component's class: unknown (an empty library), as TensorFS spells it.
+UNKNOWN_CLASS = ("", "", "")
 
 #: Bytes to write: a buffer, or a file read from its position to its end.
 type Data = Buffer | IO[bytes]
@@ -271,7 +273,7 @@ class Output:
                 code="weights_output_component",
             )
         writer = (
-            self._writer.component(name, cls="", config={})
+            self._writer.component(name, cls=UNKNOWN_CLASS, config={})
             if declared is None
             else self._writer.component(name, cls=declared.cls, config=declared.config)
         )

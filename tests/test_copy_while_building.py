@@ -57,7 +57,7 @@ def test_a_changed_held_layout_refills_directly_from_the_stored_checkpoint(tmp_p
     torch.manual_seed(0)
     reference = network()
     writer = tensorfs.Writer(cache_dir=tmp_path / "store")
-    component = writer.component("net", cls="", config={})
+    component = writer.component("net", cls=("", "", ""), config={})
     for key, t in reference.state_dict().items():
         t = t.detach().contiguous()
         component.put(key, t.numpy(), dtype="F32", shape=list(t.shape))
@@ -112,7 +112,7 @@ def test_a_standalone_checkpoint_load_owns_its_parameter_views(tmp_path: Path) -
     torch.manual_seed(7)
     reference = network()
     writer = tensorfs.Writer(cache_dir=tmp_path / "store")
-    component = writer.component("net", cls="", config={})
+    component = writer.component("net", cls=("", "", ""), config={})
     for key, value in reference.state_dict().items():
         component.put(
             key, value.detach().contiguous().numpy(), dtype="F32", shape=list(value.shape)

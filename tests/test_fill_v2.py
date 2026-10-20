@@ -36,8 +36,8 @@ INDEX = {"_class_name": "StableDiffusionPipeline", "unet": ["diffusers", "UNet2D
 def _pipeline(root: Path, monkeypatch: pytest.MonkeyPatch) -> tensorfs.Checkpoint:
     store = home(root, monkeypatch)
     writer = tensorfs.Writer(cache_dir=store)
-    writer.pipeline("diffusers.StableDiffusionPipeline", INDEX)
-    unet = writer.component("unet", cls="diffusers.UNet2DConditionModel", config=UNET)
+    writer.pipeline(("diffusers", "", "StableDiffusionPipeline"), INDEX)
+    unet = writer.component("unet", cls=("diffusers", "", "UNet2DConditionModel"), config=UNET)
     unet.put("conv_in.weight", np.ones((8, 4), np.float16), dtype="F16", shape=[8, 4])
     big = np.arange(20 << 18, dtype=np.float32)  # 20 MiB: chunks of its own
     unet.put("mid.weight", big, dtype="F32", shape=[20 << 18])
@@ -48,14 +48,14 @@ def _pipeline(root: Path, monkeypatch: pytest.MonkeyPatch) -> tensorfs.Checkpoin
         params={},
     )  # fmt: skip
     writer.component(
-        "scheduler", cls="diffusers.EulerDiscreteScheduler", config=SCHEDULER,
+        "scheduler", cls=("diffusers", "", "EulerDiscreteScheduler"), config=SCHEDULER,
     )  # fmt: skip
     tokenizer = writer.component(
-        "tokenizer", cls="transformers.CLIPTokenizer", config=TOKENIZER,
+        "tokenizer", cls=("transformers", "", "CLIPTokenizer"), config=TOKENIZER,
     )  # fmt: skip
     tokenizer.asset("vocab.json", VOCAB)
     tokenizer.asset("merges.txt", MERGES)
-    vae = writer.component("vae", cls="diffusers.AutoencoderKL", config={"z": 4})
+    vae = writer.component("vae", cls=("diffusers", "", "AutoencoderKL"), config={"z": 4})
     vae.put("decoder.weight", np.ones(3, np.float32), dtype="F32", shape=[3])
     return writer.commit()
 
@@ -131,7 +131,7 @@ def test_a_model_without_a_pipeline_is_its_root_folder(
     ref = checkpoint(
         store,
         {"model": {"w": np.ones(2, np.float32)}},
-        classes={"model": "transformers.Qwen3ForCausalLM"},
+        classes={"model": ("transformers", "", "Qwen3ForCausalLM")},
         configs={"model": {"hidden_size": 2}},
         assets={"model": {"tokenizer.json": b"{}", "tokenizer_config.json": b'{"x": 1}'}},
     )
@@ -200,7 +200,7 @@ def test_a_transformers_model_binds_its_stored_names_through_its_conversion_mapp
         model.config.architectures = [type(model).__name__]  # as `save_pretrained` writes it
         held = writer.component(
             component,
-            cls=f"transformers.{type(model).__name__}",
+            cls=("transformers", "", type(model).__name__),
             config=json.loads(model.config.to_json_string()),
         )
         for key, value in model.state_dict().items():  # upstream on-disk names
@@ -238,7 +238,7 @@ def test_the_census_dtype_a_fit_pins_is_the_runtimes_name(
     store = home(tmp_path, monkeypatch)
     writer = tensorfs.Writer(cache_dir=store)
     value = np.zeros(1, {"BF16": np.uint16, "F16": np.float16, "F32": np.float32}[stored])
-    writer.component("unet", cls="", config={}).put(
+    writer.component("unet", cls=("", "", ""), config={}).put(
         "weight", memoryview(value), dtype=stored, shape=[1]
     )
     ck = Checkpoint(writer.commit())
