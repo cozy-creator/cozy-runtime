@@ -10,6 +10,9 @@ import signal
 import subprocess
 import sys
 import tempfile
+import zipfile
+from email.parser import Parser
+from io import BytesIO
 from pathlib import Path
 from typing import Annotated
 
@@ -19,20 +22,23 @@ from cozy_runtime.author import AssetBound, FileAsset, Outputs, Tree
 def main(
     *,
     wheel: Annotated[FileAsset, AssetBound(max_bytes=67108864)],
-    wheel_name: str,
     tests: Annotated[FileAsset, AssetBound(max_bytes=131072)],
     conftest: Annotated[FileAsset, AssetBound(max_bytes=131072)],
     out: Outputs,
 ) -> Tree:
-    if (
-        Path(wheel_name).name != wheel_name
-        or not wheel_name.startswith("tensorfs-")
-        or not wheel_name.endswith(".whl")
-    ):
-        raise ValueError("wheel_name must be the TensorFS wheel's original filename")
     root = Path(tempfile.mkdtemp(prefix="slim-python-gpu-"))
-    artifact = root / wheel_name
-    artifact.write_bytes(wheel.read_bytes())
+    contents = wheel.read_bytes()
+    with zipfile.ZipFile(BytesIO(contents)) as archive:
+        info = next(
+            name.rsplit("/", 1)[0]
+            for name in archive.namelist()
+            if name.endswith(".dist-info/METADATA")
+        )
+        metadata = Parser().parsestr(archive.read(f"{info}/METADATA").decode())
+        tags = Parser().parsestr(archive.read(f"{info}/WHEEL").decode())
+        assert metadata["Name"] == "tensorfs"
+        artifact = root / f"tensorfs-{metadata['Version']}-{tags['Tag']}.whl"
+    artifact.write_bytes(contents)
     (root / "test_slim_varena_gpu.py").write_bytes(tests.read_bytes())
     (root / "conftest.py").write_bytes(conftest.read_bytes())
     logs = root / "logs"
