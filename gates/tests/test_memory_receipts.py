@@ -360,6 +360,10 @@ class MemoryReceipts(unittest.TestCase):
         self.assertIn("dit-reads-per-step", self.record(value, "24-h3ref5-warm", cold)[1])
         # A4's zero-DiT bar applies only at 24 GiB. Smaller-cap cells still
         # require their own valid cold pass and measured per-step stats.
+        stats["paged_in"] = 50_000_000_000
+        stats["steps"] = {"model/transformer_ref": [0]}
+        self.assertIn("read>40GB", self.record(value, "24-h3ref5-warm", cold)[1])
+        stats["steps"] = {"model/transformer_ref": [1]}
         for cap in (6, 8, 12):
             cell = f"{cap}-h3ref5-warm"
             code, text = self.record(value, cell, cold.replace("24-", f"{cap}-"))

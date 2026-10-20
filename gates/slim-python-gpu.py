@@ -23,6 +23,7 @@ def main(
     *,
     wheel: Annotated[FileAsset, AssetBound(max_bytes=67108864)],
     tests: Annotated[FileAsset, AssetBound(max_bytes=131072)],
+    graph_tests: Annotated[FileAsset, AssetBound(max_bytes=131072)],
     conftest: Annotated[FileAsset, AssetBound(max_bytes=131072)],
     read_engine: Annotated[FileAsset, AssetBound(max_bytes=131072)],
     out: Outputs,
@@ -41,6 +42,7 @@ def main(
         artifact = root / f"tensorfs-{metadata['Version']}-{tags['Tag']}.whl"
     artifact.write_bytes(contents)
     (root / "test_slim_varena_gpu.py").write_bytes(tests.read_bytes())
+    (root / "test_graph_cache_gpu.py").write_bytes(graph_tests.read_bytes())
     (root / "conftest.py").write_bytes(conftest.read_bytes())
     (root / "cuda_read_engine.py").write_bytes(read_engine.read_bytes())
     logs = root / "logs"
@@ -119,14 +121,15 @@ def main(
             "-p",
             "no:cacheprovider",
             "test_slim_varena_gpu.py",
+            "test_graph_cache_gpu.py",
         ],
     )
     counts = {
         kind: int(count)
         for count, kind in re.findall(r"(\d+) (passed|failed|skipped|xfailed|xpassed)", result)
     }
-    if counts != {"passed": 4}:
-        raise RuntimeError(f"expected four executed CUDA tests, got {counts}")
+    if counts != {"passed": 8}:
+        raise RuntimeError(f"expected eight executed tests (seven CUDA and one CPU), got {counts}")
     reader = run("read-engine", [python, "cuda_read_engine.py"])
     if "CUDA arrays: chunk-spanning reads, prebuilt decode, raw parts" not in reader:
         raise RuntimeError("the native CUDA reader did not finish its real consumer checks")

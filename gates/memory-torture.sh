@@ -19,8 +19,8 @@
 # boots that worker image, and `machine show` must name it; with `-` as <wheel>, the image is the release under test.
 # --after <card>=<cmd>: after the card's cells, `<cmd> <rent-alias> <hub>` runs on its rental; its exit status counts.
 # --matrix: the merge matrix for every memory PR (gates/memory-matrix.sh): cards 8 12 24 2x8; Qwen 4 MP, SDXL 4 MP,
-# H3 ref2va_turbo 5 s and 15 s, H3 long_form (2 × 5 s; 2 × 15 s at degree 2 on 2x8) and the pair SDXL ∥ Klein; on 24
-# each H3 cell runs cold, then warm (`<cell>-warm`, a new prompt and seed), and the pair Qwen 1 MP ∥ LM.
+# H3 ref2va_turbo 5 s and 15 s cold, then warm on 24/12/8/6 (`<cell>-warm`, a new prompt and seed), H3 long_form
+# (2 × 5 s; 2 × 15 s at degree 2 on 2x8) and the pair SDXL ∥ Klein; on 24 long_form also runs warm, plus Qwen 1 MP ∥ LM.
 # --baseline <dir>: a 0.27.4 run's results, for relative checks only: a warm cell whose execution time is >10% over
 # the baseline's is WORSE (D7). GB read per request and per step are reported beside the baseline's.
 # --baseline-wheel: each card first runs its cells on these wheels (0.27.4 + tensorfs 0.10.0) into ./baseline/, then
@@ -166,7 +166,11 @@ record() {  # one line per run (status, wall, execution, retries, poisoned, left
 
 number() { grep -oE '"number": ?[0-9]+' "run-$1.json" 2>/dev/null | head -1 | grep -oE '[0-9]+$'; }
 
-want() { [ -z "$ONLY" ] || [[ $1 == *-klein-[ab] || ",$ONLY," == *",${1#*-},"* ]]; }  # card:<cell>,… names them
+want() {  # card:<cell>,… selects reference warm partners with their cold H3 cell
+  local name=${1#*-}
+  [ -z "$ONLY" ] || [[ $1 == *-klein-[ab] || ",$ONLY," == *",$name,"* ||
+    ( $name == h3ref*-warm && ",$ONLY," == *",${name%-warm},"* ) ]]
+}
 
 start() {  # start <cell> <cozy run args…>: a detached run (for pairs); prints its number
   local cell=$1; shift
@@ -240,8 +244,9 @@ h3ref() {  # H3 ref2va_turbo, one clip (15 s unless $4) from one character image
   cell "$c" "$(target minimax-h3 ref2va_turbo)" --input "$c.json" --asset "$a"
 }
 
-matrix() {  # the merge matrix on one machine ($1 = card); on 24 each H3 cell runs again warm
-  local k=$1 r=$RANDOM a b
+matrix() {  # reference clips run cold/warm on Task A caps; 24 also warms long_form
+  local k=$1 r=$RANDOM a b warm=$SLIM
+  case $k in 24|12|8|6) warm=1 ;; esac
   [ -z "$SLIM" ] || r=17  # matched model inputs for baseline and candidate
   references "$k" "$r"
   a=$(image "$k-klein-a") b=$(image "$k-klein-b")
@@ -258,8 +263,8 @@ matrix() {  # the merge matrix on one machine ($1 = card); on 24 each H3 cell ru
   [ -z "$SLIM" ] || cell "$k-sdxl1" "$(target sdxl generate)" prompt="a brass doorknob, $TAG $k" seed=$((r + 2)) megapixels:=1
   cell "$k-sdxl4" "$(target sdxl generate)" prompt="a brass doorknob on a blue door in morning sun, $TAG $k" seed=$((r + 3)) megapixels:=4
   cell "$k-qwen4" "$(target qwen-image-2 generate_image)" prompt="a market street in the rain at night, $TAG $k" seed=$((r + 5)) megapixels:=4
-  h3ref "$k" "$b" "$r" 5; { [ "$k" = 24 ] || [ -n "$SLIM" ]; } && h3ref "$k" "$b" $((r + 100)) 5 -warm
-  h3ref "$k" "$b" "$r" 15; { [ "$k" = 24 ] || [ -n "$SLIM" ]; } && h3ref "$k" "$b" $((r + 100)) 15 -warm
+  h3ref "$k" "$b" "$r" 5; [ -n "$warm" ] && h3ref "$k" "$b" $((r + 100)) 5 -warm
+  h3ref "$k" "$b" "$r" 15; [ -n "$warm" ] && h3ref "$k" "$b" $((r + 100)) 15 -warm
   h3 "$k-h3" 2 "$a" "$b" "$r" "" 5; [ "$k" = 24 ] && h3 "$k-h3-warm" 2 "$a" "$b" $((r + 100)) "" 5
   pair_sdxl "$k" "$r"
   [ "$k" = 24 ] && pair_qwen "$k" "$r" "$b"

@@ -458,7 +458,7 @@ def record(path, cell, number, state, substitute, summary, slim=""):
         bar.append("leftover")
     legacy_control = any(row.get("legacy_control") for row in stats)
     if cell.endswith("-warm") and not legacy_control:
-        if not slim and read is not None and read > 40:
+        if cell.startswith("24-") and not slim and read is not None and read > 40:
             bar.append("read>40GB")
         if cell == "24-h3ref5-warm":
             if not dit:
