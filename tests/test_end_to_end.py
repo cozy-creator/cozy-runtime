@@ -18,6 +18,8 @@ from pathlib import Path
 
 import pytest
 
+from conftest import locked
+
 ROOT = Path(__file__).resolve().parent.parent
 PACKAGE = ROOT / "examples" / "marco-polo"
 TIMEOUT = 420
@@ -89,7 +91,16 @@ def installed_cli() -> Iterator[str]:
         wheels = sorted(str(path) for path in (root / "dist").glob("*.whl"))
         assert len(wheels) == 2, wheels
         _run(uv, "venv", "--python", sys.executable, str(root / "venv"))
-        _run(uv, "pip", "install", "--python", str(root / "venv" / "bin" / "python"), *wheels)
+        _run(
+            uv,
+            "pip",
+            "install",
+            "--python",
+            str(root / "venv" / "bin" / "python"),
+            "-c",
+            str(locked()),
+            *wheels,
+        )
         yield str(root / "venv" / "bin" / "cozy-runtime")
 
 
