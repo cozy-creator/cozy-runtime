@@ -1,0 +1,2 @@
+self-hosted-runner:
+  labels: [linux-x64-16core]

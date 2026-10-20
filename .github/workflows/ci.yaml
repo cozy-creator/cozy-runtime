@@ -9,7 +9,7 @@ on:
     branches: [master]
   workflow_dispatch:
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || github.ref }}
   cancel-in-progress: true
 jobs:
   quality:
@@ -81,8 +81,7 @@ jobs:
         env:
           TEST_GROUP: ${{ matrix.group }}
         run: |
-          sudo systemd-run --wait --pipe --collect \
-            --unit="cozy-runtime-tests-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${TEST_GROUP}" \
+          bash "scripts/ci-delegated.sh" "cozy-runtime-tests-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${TEST_GROUP}" \
             --uid="$(id -u)" --gid="$(id -g)" \
             --property=Delegate=yes --working-directory="$PWD" \
             --setenv="PATH=$PATH" --setenv="HOME=$HOME" \
