@@ -29,15 +29,17 @@ def test_every_scheme_has_its_parts_and_nothing_else() -> None:
         "int8.tensorwise": ({"weight", "scale"}, {"input_scale"}),
         "fp8.rowwise": ({"weight", "scale"}, set()),
         "int8.rowwise": ({"weight", "scale"}, set()),
+        "fp8.columnwise": ({"weight", "scale"}, set()),
+        "int8.columnwise": ({"weight", "scale"}, set()),
         "int8.convrot": ({"weight", "scale"}, set()),
         "mxfp8": ({"weight", "scale"}, set()),
         "nvfp4": ({"weight", "scale", "scale_2"}, {"input_scale"}),
         "comfy.asym_w4a8_int8": (
-            {"weight", "weight_s_rel", "weight_s_channel"},
-            {"weight_codebook", "weight_correction"},
+            {"weight", "group_scale", "scale"},
+            {"codebook", "correction"},
         ),
-        "comfy.w6a8_int8": ({"weight", "weight_s_rel", "weight_s_channel"}, set()),
-        "comfy.convrot_w4a4": ({"weight", "weight_scale"}, set()),
+        "comfy.w6a8_int8": ({"weight", "group_scale", "scale"}, set()),
+        "int4.convrot": ({"weight", "scale"}, set()),
     }
     # The cores' rows (decode_schemes.ADAPTERS) are their own: nvfp4's adds AWQ's pre_quant_scale.
     rows = {a.scheme: (set(a.required), set(a.optional)) for a in ADAPTERS}
@@ -63,16 +65,12 @@ def test_an_unknown_scheme_refuses_by_name() -> None:
 def test_parts_and_params_outside_the_scheme_refuse() -> None:
     weight = RolePart("weight", "f8_e4m3fn", (2, 64), 128)
     with pytest.raises(EncodingRefusal) as refused:
-        _candidates(Encoded("fp8.rowwise", params_of({"axis": 0}), (weight,)), (2, 64))
+        _candidates(Encoded("fp8.rowwise", params_of({}), (weight,)), (2, 64))
     assert refused.value.code == "role_mismatch"
     scale = RolePart("scale", "f32", (2,), 8)
     with pytest.raises(EncodingRefusal) as refused:
-        _candidates(
-            Encoded("fp8.rowwise", params_of({"axis": 0, "zero": 1}), (weight, scale)), (2, 64)
-        )
+        _candidates(Encoded("fp8.rowwise", params_of({"zero": 1}), (weight, scale)), (2, 64))
     assert refused.value.code == "geometry_unsupported" and "zero" in str(refused.value)
-    found = _candidates(
-        Encoded("fp8.rowwise", params_of({"axis": 1}), (weight, scale)),
-        (2, 64),
-    )
-    assert "native-leaf" in str(found.geometry_refused), "the leaf takes a scale per row only"
+    columns = RolePart("scale", "f32", (64,), 256)
+    found = _candidates(Encoded("fp8.columnwise", params_of({}), (weight, columns)), (2, 64))
+    assert found.routes_offered == {"decoded_float"}, "the leaf takes a scale per row only"

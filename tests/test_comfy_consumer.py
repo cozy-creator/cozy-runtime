@@ -25,7 +25,7 @@ torch = pytest.importorskip("torch")
 CASES = [row for row in probe.vector_cases() if row.encoding.scheme in SCHEMES]
 POSITIVE = [row for row in CASES if not row.refuse]
 NEGATIVE = [row for row in CASES if row.refuse]
-COUNTS = {"comfy.asym_w4a8_int8": 10, "comfy.w6a8_int8": 5, "comfy.convrot_w4a4": 3}
+COUNTS = {"comfy.asym_w4a8_int8": 10, "comfy.w6a8_int8": 5, "int4.convrot": 3}
 
 
 def provider(case: probe.VectorCase) -> ComfyDequant:
@@ -49,7 +49,7 @@ def vectors(device: str) -> None:
 
 
 def test_cpu_vectors_through_registered_native_consumers() -> None:
-    assert len(POSITIVE) == 18 and len(NEGATIVE) == 14
+    assert len(POSITIVE) == 18 and len(NEGATIVE) == 16
     vectors("cpu")
 
 
@@ -85,7 +85,7 @@ def test_plain_only_output_dtypes_leave_comfy_unmeasured(dtype: str) -> None:
     # The global qualifier visits these candidates even when the model is plain.
     # An unsupported encoded destination must not abort or mint a capability.
     evidence = probe._measured(
-        torch, ComfyDequant("comfy.convrot_w4a4"), torch.device("cpu"), getattr(torch, dtype)
+        torch, ComfyDequant("int4.convrot"), torch.device("cpu"), getattr(torch, dtype)
     )
     assert isinstance(evidence, probe.UnmeasuredEvidence)
 

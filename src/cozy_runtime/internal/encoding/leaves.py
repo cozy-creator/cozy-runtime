@@ -313,7 +313,7 @@ class RowwiseNativeLeaf:
 
     def supports(self, shape: Sequence[int], params: Mapping[str, object]) -> str:
         """Rank 2, a scale per row, and the fp8 GEMMs' 16-byte rows: K and N divisible by 16."""
-        why = _rank2(shape) or _params(params, {"axis": (0,)})
+        why = _rank2(shape) or _params(params, {})
         if why or (int(shape[0]) % 16 == 0 and int(shape[1]) % 16 == 0):
             return why
         return f"the fp8 GEMM needs K and N divisible by 16; this tensor is {list(shape)}"

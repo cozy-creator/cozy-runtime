@@ -192,18 +192,12 @@ def part_rule(encoded: Encoded, shape: Sequence[int], dtype: str) -> str:
         )
     parts = {p.role: p for p in encoded.parts}
     rows, cols = matrix(shape)
-    params = dict(encoded.params)
-    axis = params.get("axis")
     stored = _SCALES
     rules: dict[str, tuple[frozenset[str], int | tuple[int, ...]]] = {
-        "fp8.rowwise": {
-            "weight": (_F8, tuple(shape)),
-            "scale": (stored, cols if axis == 1 else rows),
-        },
-        "int8.rowwise": {
-            "weight": (frozenset({"i8"}), tuple(shape)),
-            "scale": (stored, cols if axis == 1 else rows),
-        },
+        "fp8.rowwise": {"weight": (_F8, tuple(shape)), "scale": (stored, rows)},
+        "fp8.columnwise": {"weight": (_F8, tuple(shape)), "scale": (stored, cols)},
+        "int8.rowwise": {"weight": (frozenset({"i8"}), tuple(shape)), "scale": (stored, rows)},
+        "int8.columnwise": {"weight": (frozenset({"i8"}), tuple(shape)), "scale": (stored, cols)},
         "fp8.tensorwise": {
             "weight": (_F8, tuple(shape)),
             "scale": (stored, 1),
@@ -457,9 +451,10 @@ _CHUNK_BYTES = 16 << 20
 
 @dataclass(frozen=True, slots=True)
 class RowwiseDequant:
-    """`fp8.rowwise` and `int8.rowwise` -> float: `weight[i, j] * scale[axis == 0 ? i : j]`,
-    formed in f32 and rounded once into the destination (the producer's rule; narrowing the
-    scale first is a full ULP off). Row chunks bound the f32 transient."""
+    """`fp8.rowwise`, `int8.rowwise` and their `.columnwise` twins -> float: `weight[i, j] *
+    scale[i]` (rowwise) or `scale[j]` (columnwise), formed in f32 and rounded once into the
+    destination (the producer's rule; narrowing the scale first is a full ULP off). Row chunks
+    bound the f32 transient."""
 
     encoding: str = "fp8.rowwise"
     params: Params = ()
@@ -480,6 +475,8 @@ class RowwiseDequant:
 
     @property
     def schemes(self) -> frozenset[str]:
+        if self.encoding.endswith(".columnwise"):
+            return frozenset({"fp8.columnwise", "int8.columnwise"})
         return frozenset({"fp8.rowwise", "int8.rowwise"})
 
     @property
@@ -488,7 +485,7 @@ class RowwiseDequant:
 
     @property
     def suite(self) -> str:
-        return {"int8.rowwise": "int8-rowwise-decode"}.get(self.encoding, "fp8-rowwise-decode")
+        return self.encoding.replace(".", "-") + "-decode"
 
     @property
     def required(self) -> frozenset[str]:
@@ -499,8 +496,8 @@ class RowwiseDequant:
         return frozenset()
 
     def supports(self, shape: Sequence[int], params: Mapping[str, object]) -> str:
-        why = _rows(shape, params) or _params(params, {"axis": (0, 1)})
-        if why or len(shape) == 2 or params.get("axis") == 0:
+        why = _rows(shape, params) or _params(params, {})
+        if why or len(shape) == 2 or not self.encoding.endswith(".columnwise"):
             return why
         return "a per-column scale is a rank-2 weight's"
 
@@ -508,7 +505,7 @@ class RowwiseDequant:
         rows, cols = matrix(destination.shape)
         destination = destination.view(rows, cols)
         payload = parts["weight"].view(rows, cols)
-        per_column = dict(self.params).get("axis") == 1
+        per_column = self.encoding.endswith(".columnwise")
         scale = parts["scale"].to(torch.float32).reshape((1, cols) if per_column else (rows, 1))
         stride = max(1, _CHUNK_BYTES // max(cols * 4, 1))
         for start in range(0, rows, stride):
@@ -516,6 +513,11 @@ class RowwiseDequant:
             block = payload[start:stop].to(torch.float32)
             block.mul_(scale if per_column else scale[start:stop])
             destination[start:stop].copy_(block)
+
+
+def columnwise(encoding: str = "") -> RowwiseDequant:
+    """The columnwise dequant: one provider of its own, so the rowwise one keeps its identity."""
+    return RowwiseDequant(encoding or "fp8.columnwise")
 
 
 def e8m0_multipliers(torch: ModuleType, scale: Tensor) -> Tensor:

@@ -66,14 +66,10 @@ def test_a_nearest_refit_bake_is_the_lane_encoder_on_the_merged_weight() -> None
 
 
 def test_only_a_row_scaled_e4m3_weight_is_bakeable() -> None:
-    assert lora_bake.bakeable("fp8.rowwise", {"axis": 0}, {"weight": "f8_e4m3fn", "scale": "f32"})
-    assert not lora_bake.bakeable(
-        "fp8.rowwise", {"axis": 0}, {"weight": "f8_e4m3fn", "scale": "u8"}
-    )
-    assert not lora_bake.bakeable(
-        "fp8.rowwise", {"axis": 1}, {"weight": "f8_e4m3fn", "scale": "f32"}
-    )
-    assert not lora_bake.bakeable("int8.rowwise", {"axis": 0}, {"weight": "i8", "scale": "f32"})
+    assert lora_bake.bakeable("fp8.rowwise", {}, {"weight": "f8_e4m3fn", "scale": "f32"})
+    assert not lora_bake.bakeable("fp8.rowwise", {}, {"weight": "f8_e4m3fn", "scale": "u8"})
+    assert not lora_bake.bakeable("fp8.columnwise", {}, {"weight": "f8_e4m3fn", "scale": "f32"})
+    assert not lora_bake.bakeable("int8.rowwise", {}, {"weight": "i8", "scale": "f32"})
     assert not lora_bake.bakeable(
         "mxfp8",
         {"block_size": 32, "scale_layout": "row_major"},

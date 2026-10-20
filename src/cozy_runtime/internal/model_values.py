@@ -73,12 +73,7 @@ def read_values_into(
     stored, scaled = parts.get("weight"), parts.get("scale")
     element = _ROWWISE.get((tensor.encoding.scheme, stored.dtype if stored else ""))
     scale_dtype = scaled.dtype if scaled else ""
-    if (
-        element is None
-        or params.get("axis") != 0
-        or scale_dtype not in _WIDTHS
-        or len(tensor.shape) != 2
-    ):
+    if element is None or params or scale_dtype not in _WIDTHS or len(tensor.shape) != 2:
         raise CapabilityError(
             f"no model reader for {tensor.encoding.scheme} {params}", code="weights_reader_encoding"
         )

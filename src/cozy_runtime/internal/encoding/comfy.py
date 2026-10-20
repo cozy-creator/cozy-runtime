@@ -19,7 +19,7 @@ from cozy_runtime.author._loader import TENSORFS_DTYPES
 from cozy_runtime.internal import canonical
 from cozy_runtime.internal.encoding.formats import TORCH_DTYPES, Params, Tensor
 
-SCHEMES = frozenset({"comfy.asym_w4a8_int8", "comfy.w6a8_int8", "comfy.convrot_w4a4"})
+SCHEMES = frozenset({"comfy.asym_w4a8_int8", "comfy.w6a8_int8", "int4.convrot"})
 _ROTATIONS = frozenset(4**n for n in range(1, 9))
 _FORMAT_DTYPES = {
     TORCH_DTYPES[value]: key for key, value in TENSORFS_DTYPES.items() if value in TORCH_DTYPES
@@ -84,23 +84,29 @@ class ComfyDequant:
 
     @property
     def required(self) -> frozenset[str]:
-        if self.encoding == "comfy.convrot_w4a4":
-            return frozenset({"weight", "weight_scale"})
-        return frozenset({"weight", "weight_s_rel", "weight_s_channel"})
+        if self.encoding == "int4.convrot":
+            return frozenset({"weight", "scale"})
+        return frozenset({"weight", "group_scale", "scale"})
 
     @property
     def optional(self) -> frozenset[str]:
         if self.encoding == "comfy.asym_w4a8_int8":
-            return frozenset({"weight_codebook", "weight_correction"})
+            return frozenset({"codebook", "correction"})
         return frozenset()
 
     def supports(self, shape: Sequence[int], params: Mapping[str, object]) -> str:
         if self.encoding not in SCHEMES:
             return "unknown Comfy scheme"
-        grouped = self.encoding != "comfy.convrot_w4a4"
-        wanted = {"rotation_size", "group_size"} if grouped else {"rotation_size"}
+        grouped = self.encoding != "int4.convrot"
+        wanted = (
+            {"rotation", "rotation_size", "group_size"}
+            if grouped
+            else {"rotation", "rotation_size"}
+        )
         if set(params) != wanted:
             return f"{self.encoding}: params must name exactly {sorted(wanted)}"
+        if params.get("rotation") != "kron_regular_h4":
+            return "rotation must be kron_regular_h4"
         rotation = params.get("rotation_size")
         if not isinstance(rotation, int) or type(rotation) is not int or rotation not in _ROTATIONS:
             return "rotation_size must be a supported power of four"
