@@ -110,7 +110,7 @@ def record(path, cell, number, state, substitute, summary):
         if executed:
             gpu_measurements.append((measurements, executed))
             child_reasons.append(call.get("reason"))
-            if call.get("status") not in (None, "completed"):
+            if call.get("status") not in (None, "completed", "succeeded"):
                 bar.append("gpu-call-incomplete")
     if not gpu_measurements:
         bar.append("no-gpu-execution")

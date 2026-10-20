@@ -51,6 +51,12 @@ class MemoryReceipts(unittest.TestCase):
                 code = API["compare"](old, new, ["24"])
             return code, out.getvalue()
 
+    def test_a_succeeded_call_is_complete(self):
+        value = positive()
+        value.get("calls", [value])[0]["status"] = "succeeded"
+        code, text = self.record(value)
+        self.assertNotIn("gpu-call-incomplete", text)
+
     def test_actual_current_receipt_leftover_cannot_pass(self):
         code, text = self.record(RAW)
         self.assertEqual(code, 1)

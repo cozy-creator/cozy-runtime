@@ -7,7 +7,8 @@ import msgspec
 
 class Step(msgspec.Struct, frozen=True, kw_only=True):
     """One pass of a model: bytes at home and resident, copied home and streamed through slots,
-    the GPU-timed prefetch stall, and torch's allocated peak above the pass's start."""
+    the GPU-timed prefetch stall, torch's allocated peak above the pass's start, and torch's
+    allocated bytes at that start (a leak shows as their growth)."""
 
     model: str
     gpu: int
@@ -18,6 +19,7 @@ class Step(msgspec.Struct, frozen=True, kw_only=True):
     streamed: int
     stall_ns: int
     activations: int
+    allocated: int = 0
 
 
 class Eviction(msgspec.Struct, frozen=True, kw_only=True):
