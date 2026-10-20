@@ -309,17 +309,17 @@ _P2P_DECLINED = -1
 _P2P_FAILED = -2
 
 
-def p2p_head(value: Any) -> list[int]:
+def p2p_head(value: object) -> list[int]:
     """`value`'s point-to-point header. A spread call returns one tensor (`author.spread`): the
     same check on every rank of the group, before any byte is sent."""
     dtype = str(getattr(value, "dtype", "")).removeprefix("torch.")
-    rank = getattr(value, "ndim", _P2P_RANK + 1)
-    if dtype not in _P2P_DTYPES or rank > _P2P_RANK:
+    shape = [int(n) for n in getattr(value, "shape", [0] * (_P2P_RANK + 1))]
+    if dtype not in _P2P_DTYPES or len(shape) > _P2P_RANK:
         raise UncrossableArgument(
             f"a spread call returns one tensor of rank <= {_P2P_RANK}, not "
             f"{type(value).__name__} {dtype}".rstrip()
         )
-    return [_P2P_DTYPES.index(dtype), rank, *value.shape]
+    return [_P2P_DTYPES.index(dtype), len(shape), *shape]
 
 
 def send_tensor(tensor: Any, head: list[int], dst: int, pg: Any) -> None:

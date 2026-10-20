@@ -295,7 +295,7 @@ def install_spread(
     object.__setattr__(component, "_cozy_spread", spread)
 
 
-def _one_tensor(result: Any) -> Any:
+def _one_tensor[T](result: T) -> T:
     """A spread call's result here, held to the contract a follower's crosses under."""
     wire.p2p_head(result)
     return result
