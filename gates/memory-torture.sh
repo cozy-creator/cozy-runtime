@@ -126,8 +126,15 @@ fits() {  # rental $M has $2 GPUs, none over $1 GiB, as `cozy machine show` list
 }
 
 native_cap() {  # legacy controls cannot fake an allocator cap: require the actual physical class
-  cozy machine show "$M" --tensorhub "$H" 2>/dev/null | sed -nE 's/^GPU [0-9]+ .* ([0-9.]+) GiB .*/\1/p' |
-    awk -v cap="$1" -v n="$2" '{k++; if ($1 > cap || $1 < cap * 0.9) wrong = 1} END {exit !(k >= n && !wrong)}'
+  cozy machine show "$M" --tensorhub "$H" --json 2>/dev/null | python3 -I -c '
+import json, sys
+data = json.load(sys.stdin)
+machine = data.get("machine", data)
+gpus = (machine.get("status") or {}).get("gpus") or []
+cap, count = int(sys.argv[1]) << 30, int(sys.argv[2])
+sizes = [gpu.get("memory_bytes", 0) for gpu in gpus]
+sys.exit(not (len(sizes) >= count and all(0.9 * cap <= size <= cap for size in sizes)))
+' "$1" "$2"
 }
 
 landed() {  # every output of run $1 is in out-$2 under its sha256; gives up only when nothing changes for 3 min
