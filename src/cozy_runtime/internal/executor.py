@@ -845,6 +845,9 @@ class Executor:
         self._bound_calls: tuple[tuple[CallInterface, ...], CallBindings] | None = None
         self.ready = False
         self.poisoned = ""
+        #: by model binding path: the execution plan it installed (its fused glue's identity),
+        #: "" when eager
+        self.planned: dict[str, str] = {}
         #: by request: an attempt's handler outcome, the stage it last reported and its record,
         #: the reason an attempt whose tail raised still answers with (`unsettled`)
         self.handled: dict[str, tuple[Outcome, str, AuthorAttempt]] = {}
@@ -1060,6 +1063,7 @@ class Executor:
             # per spread method: the calls each rank ran, and why a rank declined
             "spread": dict(self.group.spread_log) if self.group is not None else {},
             "executor": dict(self.host.boot),
+            "plan": {k: v for m in self.model_executors or [self] for k, v in m.planned.items()},
             "construction": {
                 "prepared_unix_ms": int(facts.get("prepared_unix_ms", 0)),
                 "prepare_ms": float(facts.get("prepare_ms", 0)),
@@ -1301,6 +1305,11 @@ class Executor:
             )
         except Exception as exc:
             ending = mirror.ending(exc)
+            # where it was raised, innermost first: a GPU's own traceback stays on that GPU
+            at = " < ".join(
+                f"{Path(f.filename).name}:{f.lineno} {f.name}"
+                for f in reversed(traceback.extract_tb(exc.__traceback__)[-3:])
+            )
             if spread and not answered:
                 declined = self._declines(exc, ending)
                 with contextlib.suppress(Exception):
@@ -1324,7 +1333,7 @@ class Executor:
                 return {
                     "ok": False,
                     "code": ending,
-                    "detail": f"{type(exc).__name__}: {exc}"[:900],
+                    "detail": f"{type(exc).__name__}: {str(exc)[:640]} (at {at})"[:900],
                     "rank": self.rank,
                     **({} if hosted else {"rerun": True}),
                 }
@@ -1333,7 +1342,7 @@ class Executor:
             return {
                 "ok": False,
                 "code": outcome.code,
-                "detail": f"{type(exc).__name__}: {exc}"[:900],
+                "detail": f"{type(exc).__name__}: {str(exc)[:640]} (at {at})"[:900],
                 "rank": self.rank,
             }
         return {
@@ -2645,7 +2654,8 @@ class Executor:
             return {"ok": False, "code": exc.code, "detail": str(exc).splitlines()[0][:900]}
         try:
             # THE MODEL'S OWN EXECUTION PLAN: its fused kernels, glue and hooks.
-            planned = self.planned = self._execution_plan(model, torch, load_kernels, kernels_ready)
+            planned = self._execution_plan(model, torch, load_kernels, kernels_ready)
+            self.planned[binding.model_binding_path] = planned
             roots = backend.roots
             stage("execution_plan")
             # EACH SITE'S KERNEL FROM THE GROUP'S FAMILY CELL AT THE MODEL'S ATTENTION LEVEL,
@@ -3462,8 +3472,6 @@ class Executor:
             self._restore_attention()
             for held in later:
                 served_attention = served_attention.joined(held) if served_attention else held
-        # The model's execution plan as installed (its fused glue's identity), "" when eager.
-        record.emit("confession", "execution.plan", getattr(self, "planned", ""))
         if served_attention is not None:
             self._emit_attention(record, served_attention, "attention.selected")
             sparse_kernels = attention.sparse_names(served_attention.totals())
