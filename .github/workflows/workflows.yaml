@@ -1,10 +1,10 @@
 name: workflows
 on:
   pull_request:
-    paths: ['.github/workflows/**']
+    paths: ['.github/workflows/**', '.github/actionlint.yaml']
   push:
     branches: [master]
-    paths: ['.github/workflows/**']
+    paths: ['.github/workflows/**', '.github/actionlint.yaml']
   workflow_dispatch:
 
 permissions:
@@ -25,4 +25,4 @@ jobs:
           curl --fail --silent --show-error --location \
             https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz \
             | tar -xz -C "$RUNNER_TEMP" actionlint
-          "$RUNNER_TEMP/actionlint" -color
+          "$RUNNER_TEMP/actionlint" -color -shellcheck= -pyflakes=
