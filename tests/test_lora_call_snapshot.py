@@ -152,7 +152,14 @@ def fixture(folder: Path, device: str = "cpu") -> tuple[Any, ...]:
     factors, factor_models = {}, []
     for name in ("A", "B"):
         value = Factors(f"{checkpoint.id}/{name}/linear")
+        if memory.cuda:
+            # GPU placement installs lazy CUDA placeholders only for meta weights.
+            # Ordinary CPU Parameters deliberately keep their original residency.
+            value.to_empty(device="meta")
         factor_models.append(memory.load(value, ck=checkpoint, component=name, level="gpu"))
+        if memory.cuda:
+            assert value.down.device == memory.device
+            assert value.up.device == memory.device
         factors[name] = value
     hook = Selection(factors)
     root = Root(hook)
@@ -275,13 +282,16 @@ def test_real_page_in_switches_before_prehooks_and_reuses_only_same_fingerprint(
     tmp_path: Path,
 ) -> None:
     assert torch.cuda.device_count() == 1
+    device = torch.device("cuda", 0)
+    with torch.cuda.device(device):
+        torch.cuda.current_blas_handle()
     root, hook, bakes, model, factors, memory, checkpoint = fixture(tmp_path, "cuda:0")
     registrations, versions, copied = [], [], []
     placed = residency(memory, model)
     try:
         graphs.install(torch, object(), {"net": root})
         bakes.install_call(model)
-        with torch.inference_mode(), memory.request("switch", plan=[(model, *factors)]):
+        with torch.inference_mode(), memory.request("switch", plan=[(model, *factors)]) as request:
             for adapter in (None, "A", "A", "A", "B", None):
                 result = root(torch.eye(2, device="cuda"), adapter=adapter)
                 assert torch.equal(result.cpu(), torch.tensor(EXPECTED[adapter]).t())
@@ -297,9 +307,23 @@ def test_real_page_in_switches_before_prehooks_and_reuses_only_same_fingerprint(
             assert versions[0] == versions[-1]
             assert versions[1] == versions[2] == versions[3]
             assert len(set(versions)) == 3
+            del result
+            # This test owns the recorder; retire it before closing its Memory.
+            recorder = graphs._RECORDERS.pop(root, None)
+            if recorder is not None:
+                graphs._shed(torch, recorder)
+            recorder = None
+            for token in tuple(placed.pins.values()):
+                token.cache.close()
+            placed.pins.clear()
+            torch.cuda.synchronize(device)
+            gc.collect()
+        assert request.stats is not None and not request.cleanup_errors
+        assert request.stats.leftover == ((0, 0),), request.stats.leftover
     finally:
         for token in placed.pins.values():
             token.cache.close()
         placed.pins.clear()
         memory.close()
         checkpoint.close()
+    assert not memory.models and not memory.caches
