@@ -401,7 +401,10 @@ class Outputs:
     ) -> None:
         self.store, self.request_id, self.actor, self.code = store, request_id, actor, code
         self.bounds, self.show = dict(bounds), show
-        self.destination, self.connection = destination, connection
+        #: `org/name@tag`: the repo the output uploads to and the tag it moves there (its own
+        #: replay tag when the destination names none)
+        self.destination, _, self.destination_tag = destination.partition("@")
+        self.connection = connection
 
     def open(self, slot: str, derivation: Derivation) -> Output:
         bound = self.bounds.get(slot)
@@ -415,8 +418,9 @@ class Outputs:
         assert ck.tree is not None
         self.show(output.slot, DERIVED, ck.tree, moved, ck.variant or "")
         if self.destination:
-            commit = upload(self.store, ck, self.destination, moved, self.connection)
-            self.show(output.slot, self.destination, commit, moved, ck.variant or "")
+            named = self.destination_tag or moved
+            commit = upload(self.store, ck, self.destination, named, self.connection)
+            self.show(output.slot, self.destination, commit, named, ck.variant or "")
         return ModelArtifact(self.request_id, output.slot, ck.id, output.transaction)
 
 

@@ -291,12 +291,14 @@ def test_a_raw_read_fills_only_the_requested_tensor_part(
     assert readonly.value.code == "weights_reader_buffer"
 
 
-@pytest.mark.parametrize("destination", ["local/output", "alice/output"])
-def test_a_destination_commits_each_output_under_its_private_replay_tag(
+@pytest.mark.parametrize("destination", ["local/output", "alice/output", "alice/output@main"])
+def test_a_destination_commits_each_output_under_its_private_tag(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, destination: str
 ) -> None:
+    """The tag the destination names (`org/name@tag`), else the output's replay tag."""
     store = home(tmp_path / "tensorfs", monkeypatch)
     origin = None if destination.startswith("local/") else (tmp_path / "origin").as_uri()
+    repo, _, named = destination.partition("@")
     shown: Shown = []
     trees = []
     for value in (b"one", b"two"):
@@ -314,28 +316,30 @@ def test_a_destination_commits_each_output_under_its_private_replay_tag(
             output.put("model", "w", "U8", [len(value)], value)
             artifact = outputs.adopt(output)
         _, repo_id, tree, moved, _ = shown[-1]
-        assert repo_id == destination and tree.startswith("sha256:")
-        assert moved == weights_store.tag(artifact.transaction) and moved.startswith("replay-")
+        assert repo_id == repo and tree.startswith("sha256:")
+        assert moved == (named or weights_store.tag(artifact.transaction))
         trees.append(tree)
         with tensorfs.open(
-            destination, revision=moved, endpoint=origin, cache_dir=store, local_files_only=True
+            repo, revision=moved, endpoint=origin, cache_dir=store, local_files_only=True
         ) as tagged:
             assert tagged.id == artifact.checkpoint
         with tensorfs.open(
-            destination, revision=tree, endpoint=origin, cache_dir=store, local_files_only=True
-        ) as named:
-            assert named.id == artifact.checkpoint
-            array = named.components["model"].tensors.read("w")
+            repo, revision=tree, endpoint=origin, cache_dir=store, local_files_only=True
+        ) as committed:
+            assert committed.id == artifact.checkpoint
+            array = committed.components["model"].tensors.read("w")
             assert isinstance(array, tensorfs.Array) and array.tobytes() == value
-            with weights_store._thin(store, named) as folder:  # the header only; no chunk copies
+            with weights_store._thin(
+                store, committed
+            ) as folder:  # the header only; no chunk copies
                 files = sorted(str(f.relative_to(folder)) for f in folder.rglob("*") if f.is_file())
                 assert len(files) == 1 and files[0].endswith(".cozytensors"), files
         if origin is not None:  # the chunks reached the endpoint from the store
             fresh = tmp_path / f"fresh-{value.decode()}"
-            with tensorfs.open(destination, revision=tree, endpoint=origin, cache_dir=fresh) as got:
+            with tensorfs.open(repo, revision=tree, endpoint=origin, cache_dir=fresh) as got:
                 array = got.components["model"].tensors.read("w")
                 assert isinstance(array, tensorfs.Array) and array.tobytes() == value
     assert trees[0] != trees[1]
-    # Replay tags are private: no public tag names a default for the destination.
+    # A new tag is private: no public tag names a default for the destination.
     with pytest.raises(tensorfs.NotFoundError):
-        tensorfs.open(destination, endpoint=origin, cache_dir=tmp_path / "default")
+        tensorfs.open(repo, endpoint=origin, cache_dir=tmp_path / "default")
