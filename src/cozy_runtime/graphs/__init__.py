@@ -85,26 +85,48 @@ def capture(torch: Any, step: Callable[[], object], pool: Any, stream: Any) -> t
     current = torch.cuda.current_stream()
     stream.wait_stream(current)
     failure: BaseException | None = None
-    with torch.utils._python_dispatch._disable_current_modes(), torch.cuda.stream(stream):
-        try:
-            graph.capture_begin(pool=pool, capture_error_mode="thread_local")
-        except Exception as exc:
-            failure = exc
-        else:
+    try:
+        with torch.utils._python_dispatch._disable_current_modes(), torch.cuda.stream(stream):
             try:
-                step()
-            except Exception as exc:  # the first cause, not the capture's end it spoils
-                failure = exc
-            try:
-                graph.capture_end()
+                graph.capture_begin(pool=pool, capture_error_mode="thread_local")
             except Exception as exc:
-                failure = failure or exc
-    current.wait_stream(stream)
-    if isinstance(failure, Building):
-        raise failure
-    if failure is not None:
-        return None, f"{type(failure).__name__}: {failure}".splitlines()[0][:300]
-    return graph, ""
+                failure = exc
+            else:
+                try:
+                    step()
+                except Exception as exc:  # the first cause, not the capture's end it spoils
+                    failure = exc
+                try:
+                    graph.capture_end()
+                except Exception as exc:
+                    failure = failure or exc
+        current.wait_stream(stream)
+        if isinstance(failure, Building):
+            raise failure
+        if failure is not None:
+            return None, _capture_failure(failure)
+        return graph, ""
+    finally:
+        # A traceback points back into this frame and its callers' graph leases.
+        # Even a propagated Building must not retain itself through this local.
+        failure = None
+
+
+def _capture_failure(failure: BaseException) -> str:
+    """Keep a swallowed capture's diagnostic, without its frames and binding leases."""
+    why = f"{type(failure).__name__}: {failure}".splitlines()[0][:300]
+    pending = [failure]
+    seen: set[int] = set()
+    while pending:
+        error = pending.pop()
+        if id(error) in seen:
+            continue
+        seen.add(id(error))
+        pending.extend(link for link in (error.__cause__, error.__context__) if link is not None)
+        if isinstance(error, BaseExceptionGroup):
+            pending.extend(error.exceptions)
+        error.__traceback__ = None
+    return why
 
 
 class _Recording:
