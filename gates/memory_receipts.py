@@ -261,16 +261,16 @@ def movement_evidence(stats, events, executed, require_bound=True):
             valid = False
             continue
         kind, gpu, size = row.get("kind"), row.get("gpu"), row.get("bytes")
-        if (not isinstance(kind, str) or kind not in {"h2d", "disk"}
+        if (not isinstance(kind, str) or kind not in {"h2d", "disk", "zero"}
                 or type(gpu) is not int or not integer(size)
                 or size > 2**64 - 1
-                or (kind == "h2d" and gpu not in executed) or (kind == "disk" and gpu != -1)):
+                or (kind != "disk" and gpu not in executed) or (kind == "disk" and gpu != -1)):
             errors.append("invalid-copy-identity")
             valid = False
             continue
         cached, staged = row.get("cached"), row.get("staged")
         if (not integer(cached) or not integer(staged) or cached > size or staged > size
-                or (kind == "h2d" and cached)):
+                or (kind != "disk" and cached) or (kind == "zero" and staged)):
             errors.append("invalid-copy-byte-counts")
             valid = False
             continue
@@ -282,7 +282,7 @@ def movement_evidence(stats, events, executed, require_bound=True):
         if kind == "h2d":
             facts["h2d_bytes"] += size
             by_gpu[gpu] = by_gpu.get(gpu, 0) + size
-        else:
+        elif kind == "disk":
             facts["cached_bytes"] += cached
             facts["uncached_disk_bytes"] += size - cached
         if not size:
@@ -290,6 +290,11 @@ def movement_evidence(stats, events, executed, require_bound=True):
         rate = size / seconds / 1e9
         if not math.isfinite(rate) or abs(gbps - rate) > 0.005001:
             errors.append("copy-rate-mismatch")
+        if kind == "zero":
+            # Padding initialization is a device memset, not host→device traffic.
+            if ceiling != 0 or pct is not None:
+                errors.append("zero-initialization-has-transfer-ceiling")
+            continue
         if kind == "disk" and cached == size:
             if ceiling != 0 or pct is not None:
                 errors.append("cached-disk-has-hardware-ceiling")

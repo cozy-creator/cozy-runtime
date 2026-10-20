@@ -356,6 +356,16 @@ class MemoryReceipts(unittest.TestCase):
         self.assertIn("mixed-disk-copy-unmeasured",
                       API["movement_evidence"]({"copies": [row], "paged_in": 0}, [], {0})[0])
 
+    def test_padding_initialization_is_preserved_without_invented_h2d_traffic(self):
+        row = dict(kind="zero", gpu=0, bytes=2_000_000, seconds=0.001, gbps=2.0,
+                   ceiling=0.0, pct=None, cached=0, staged=0)
+        errors, facts = API["movement_evidence"]({"copies": [row], "paged_in": 0}, [], {0})
+        self.assertEqual(errors, [])
+        self.assertEqual(facts["h2d_bytes"], 0)
+        row.update(ceiling=2.0, pct=100.0)
+        self.assertIn("zero-initialization-has-transfer-ceiling",
+                      API["movement_evidence"]({"copies": [row], "paged_in": 0}, [], {0})[0])
+
     def test_disk_and_each_gpu_report_their_measured_percentage(self):
         disk = dict(kind="disk", gpu=-1, bytes=1_000_000_000, seconds=1.0,
                     gbps=1.0, ceiling=2.0, pct=50.0, cached=0, staged=0)
