@@ -26,7 +26,8 @@ torch = pytest.importorskip("torch")
 import tensorfs  # noqa: E402
 from tensorfs import Store  # noqa: E402
 from tensorfs import plane as tfs_plane  # noqa: E402
-from tensorfs.fetch import Fetch, ObjectRef  # noqa: E402
+from tensorfs.fetch import Fetch  # noqa: E402
+from tensorfs.records import ObjectRef  # noqa: E402
 
 from cozy_runtime.author._errors import ConformanceError  # noqa: E402
 from cozy_runtime.author._executor_requests import SealedPlan  # noqa: E402
