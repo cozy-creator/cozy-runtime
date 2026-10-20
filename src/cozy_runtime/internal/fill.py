@@ -16,6 +16,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 
 import tensorfs
+from tensorfs import raw
 
 from cozy_runtime.author._loader import TENSORFS_DTYPES, TensorSpec, canonical_dtype
 from cozy_runtime.internal.encoding import PLAIN, TORCH_DTYPES, Encoded, RolePart, params_of
@@ -24,8 +25,6 @@ from cozy_runtime.internal.resolution import PlanRefusal, ResolvedModelPlan
 
 #: The component of a model without a pipeline, whose folder is the root (a Transformers model).
 ROOT_COMPONENT = "model"
-#: What a pipeline's config was on disk.
-PIPELINE_FILE = "model_index.json"
 
 
 #: Element bytes per Runtime dtype name.
@@ -143,7 +142,7 @@ def _dtype(key: str, name: str) -> str:
     return dtype
 
 
-def _part(key: str, role: str, part: tensorfs.Part) -> RolePart:
+def _part(key: str, role: str, part: raw.Part) -> RolePart:
     shape = tuple(part.shape)
     if part.dtype == "F4":  # packed two per byte: a decoder reads u8 [..., C/2]
         if len(shape) < 2 or shape[-1] % 2:
@@ -152,7 +151,13 @@ def _part(key: str, role: str, part: tensorfs.Part) -> RolePart:
     return RolePart(role, _dtype(key, part.dtype), shape, part.length)
 
 
-def row(component: str, name: str, info: tensorfs.Info, bound: str = "") -> PlanRow:
+def row(
+    checkpoint: tensorfs.Checkpoint,
+    component: str,
+    name: str,
+    info: tensorfs.TensorMetadata,
+    bound: str = "",
+) -> PlanRow:
     """One header tensor as a plan row, bound to the module name `bound` (default: its own);
     a part that breaks its scheme refuses."""
     key = f"{component}.{bound or name}"
@@ -161,10 +166,11 @@ def row(component: str, name: str, info: tensorfs.Info, bound: str = "") -> Plan
     nbytes = WIDTHS[dtype]
     for extent in shape:
         nbytes *= extent
+    physical = raw.parts(checkpoint, component, name)
     if info.encoding is None:
-        encoded = Encoded(PLAIN, (), (_part(key, "value", info.parts[""]),))
+        encoded = Encoded(PLAIN, (), (_part(key, "value", physical[""]),))
     else:
-        parts = tuple(_part(key, role, part) for role, part in info.parts.items())
+        parts = tuple(_part(key, role, part) for role, part in physical.items())
         encoded = Encoded(info.encoding.scheme, params_of(info.encoding.params), parts)
         why = part_rule(encoded, shape, dtype)
         if why:
@@ -184,7 +190,7 @@ class Checkpoint:
     def has(self, component: str) -> bool:
         return component in self.ck.components
 
-    def tensors(self, component: str) -> Mapping[str, tensorfs.Info]:
+    def tensors(self, component: str) -> Mapping[str, tensorfs.TensorMetadata]:
         held = self.ck.components.get(component)
         return {} if held is None else held.tensors
 
@@ -198,7 +204,7 @@ class Checkpoint:
             )
         bind = self.binding(component)
         tensors = self.tensors(component)
-        return [row(component, name, info, bind(name)) for name, info in tensors.items()]
+        return [row(self.ck, component, name, info, bind(name)) for name, info in tensors.items()]
 
     def binding(self, component: str) -> Callable[[str], str]:
         """Stored name -> the name the component's module tree uses: a Transformers model's
@@ -264,46 +270,37 @@ class Checkpoint:
                         part.offset,
                         part.length,
                     ]
-                    for role, part in info.parts.items()
+                    for role, part in raw.parts(self.ck, component, key).items()
                 ),
             ]
         return out
 
 
 class Assets(Mapping[str, bytes]):
-    """A checkpoint's run files at the paths its Diffusers or Transformers folder gives them, as
-    `tensorfs.export` writes it: `model_index.json` from the pipeline, each component's config
-    (`config.json`, or its `config_file`) rendered as the HF writers write it, and its assets
-    byte-exact, read from the store on first use. A pipeline's component is the folder of its
-    name; without one, `model` is the root."""
+    """Supporting files read directly from component assets, never an exported directory.
+
+    Construction configuration is read separately through component.config. Filename
+    recreation belongs to explicit TensorFS compatibility export, not model loading.
+    """
 
     def __init__(self, checkpoint: Checkpoint) -> None:
         ck = checkpoint.ck
         self._checkpoint = checkpoint
-        self._configs: dict[str, Mapping[str, object]] = {}
-        #: path -> (component, asset name)
         self._assets: dict[str, tuple[str, str]] = {}
-        if ck.pipeline is not None:
-            self._configs[PIPELINE_FILE] = ck.pipeline.config
-        for name, held in ck.components.items():
-            folder = "" if ck.pipeline is None and name == ROOT_COMPONENT else f"{name}/"
-            if held.config or held.config_file:
-                self._configs[f"{folder}{held.config_file or 'config.json'}"] = held.config
-            for asset in held.assets:
-                self._assets[f"{folder}{asset}"] = (name, asset)
+        for component, held in ck.components.items():
+            prefix = "" if ck.pipeline is None and component == ROOT_COMPONENT else f"{component}/"
+            for name in held.assets:
+                self._assets[f"{prefix}{name}"] = (component, name)
 
     def __getitem__(self, path: str) -> bytes:
-        config = self._configs.get(path)
-        if config is not None:
-            return (json.dumps(config, indent=2, sort_keys=True) + "\n").encode()
         component, name = self._assets[path]
         return self._checkpoint.asset(component, name)
 
     def __iter__(self) -> Iterator[str]:
-        return iter([*self._configs, *self._assets])
+        return iter(self._assets)
 
     def __len__(self) -> int:
-        return len(self._configs) + len(self._assets)
+        return len(self._assets)
 
 
 @dataclass(frozen=True, slots=True)
@@ -394,10 +391,12 @@ def fit(
                 )
             else:
                 routes["encoded_gemm"] += 1
-        for key, info in stored.items():
+        for key in stored:
             if key not in wanted:
                 ignored.append(f"{component}/{key}")
-                ignored_bytes += sum(part.length for part in info.parts.values())
+                ignored_bytes += sum(
+                    part.length for part in raw.parts(checkpoint.ck, component, key).values()
+                )
         header = [key for key in stored if key in wanted]
         census = list(wanted)
         if header != census:

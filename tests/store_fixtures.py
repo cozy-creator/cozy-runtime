@@ -36,7 +36,6 @@ def checkpoint(
     *,
     classes: Mapping[str, str] = {},
     configs: Mapping[str, Mapping[str, object]] = {},
-    config_files: Mapping[str, str] = {},
     assets: Mapping[str, Mapping[str, bytes]] = {},
     pipeline: tuple[str, Mapping[str, object]] | None = None,
 ) -> str:
@@ -50,7 +49,6 @@ def checkpoint(
             name,
             cls=classes.get(name, ""),
             config=dict(configs.get(name, {})),
-            config_file=config_files.get(name, "config.json"),
         )
         for key, value in components.get(name, {}).items():
             component.put(

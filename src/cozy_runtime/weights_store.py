@@ -22,7 +22,8 @@ from typing import IO, TYPE_CHECKING, cast
 
 import tensorfs
 from tensorfs import Checkpoint as Checkpoint
-from tensorfs import Info as Info
+from tensorfs import TensorMetadata as TensorMetadata
+from tensorfs import raw
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author._artifacts import ModelArtifact
@@ -107,7 +108,8 @@ def read_into(
     """Stored bytes of one part (`""`: a plain tensor's), read by TensorFS."""
     try:
         tensors = ck.components[component].tensors
-        part = tensors[key].parts[role]
+        tensors[key]  # Validate the logical tensor before requesting raw carrier metadata.
+        part = raw.parts(ck, component, key)[role]
     except KeyError:
         raise CapabilityError("model tensor part is absent", code="weights_reader_tensor") from None
     try:
@@ -230,9 +232,7 @@ class Output:
         writer = (
             self._writer.component(name, cls="", config={})
             if declared is None
-            else self._writer.component(
-                name, cls=declared.cls, config=declared.config, config_file=declared.config_file
-            )
+            else self._writer.component(name, cls=declared.cls, config=declared.config)
         )
         self._components[name] = writer
         return writer
