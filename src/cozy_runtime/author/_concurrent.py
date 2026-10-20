@@ -51,6 +51,9 @@ def concurrently(*calls: Callable[[], Any]) -> tuple[Any, ...]:
             thread.join()
     failure = next((failure for failure in failures if failure is not None), None)
     if failure is not None:
+        for index, other in enumerate(failures):  # the others, which may have come first
+            if other is not None and other is not failure:
+                failure.add_note(f"call {index} failed too: {type(other).__name__}: {other}")
         raise failure
     return tuple(results)
 
