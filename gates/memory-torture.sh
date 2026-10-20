@@ -27,7 +27,7 @@
 # switches the same rental to the candidate (H3 downloads once); those lines override --baseline's for their cells.
 # --slim --control: collect the same workloads/inputs on the legacy baseline, without requiring new telemetry.
 # --tag: use one fixed input tag across separately batched baseline and candidate phases.
-# --packages: run local package directories; --model-override package:slot=ref selects staged checkpoint metadata.
+# --packages: run local package directories; --model-override package[/function]:slot=ref selects checkpoint metadata.
 # --tensord: update the full candidate cohort together with both supplied wheels, not wheels beneath an old control.
 # --bits: pin the same weight precision in both phases (default 8 for --slim).
 set -uo pipefail
@@ -91,8 +91,10 @@ target() {
 run_target() {
   local target=$1 override package=${1%/*}; shift
   package=${package##*/}
+  local caller=$package/${target##*/} selector
   for override in "${MODEL_OVERRIDES[@]}"; do
-    [ "${override%%:*}" != "$package" ] || set -- "$@" "model.${override#*:}"
+    selector=${override%%:*}
+    [ "$selector" != "$package" ] && [ "$selector" != "$caller" ] || set -- "$@" "model.${override#*:}"
   done
   [ -z "$BITS" ] || set -- "$@" --bits "$BITS"
   cozy run "$target" "$@"
