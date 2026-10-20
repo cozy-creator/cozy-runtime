@@ -12,6 +12,15 @@ def integer(value):
     return type(value) is int and value >= 0
 
 
+def finite(value, *, positive=False):
+    if type(value) not in (int, float):
+        return False
+    try:
+        return math.isfinite(value) and (value > 0 if positive else value >= 0)
+    except OverflowError:
+        return False
+
+
 def cells(path):
     out = {}
     for line in Path(path).read_text().splitlines():
@@ -128,6 +137,87 @@ def trace_errors(events):
     return list(dict.fromkeys(errors))
 
 
+def movement_evidence(stats, events, executed):
+    """Check the existing Copy wire records without inventing missing measurements.
+
+    Copy.ceiling/gbps are rounded to two decimals and pct to one by TensorFS. Cached
+    disk reads deliberately carry no physical-disk ceiling. The trace carries mapped
+    spans, not copied payload lengths or a complete initial cache state, so it cannot
+    establish an offline traffic minimum for a nonzero transfer.
+    """
+    errors = []
+    facts = {"h2d_bytes": 0, "uncached_disk_bytes": 0, "cached_bytes": 0,
+             "percentages": [], "minimum_bytes": None}
+    copies = stats.get("copies")
+    if not isinstance(copies, list):
+        return ["missing-copy-evidence"], facts
+    valid = True
+    for row in copies:
+        if not isinstance(row, dict):
+            errors.append("malformed-copy-evidence")
+            valid = False
+            continue
+        kind, gpu, size = row.get("kind"), row.get("gpu"), row.get("bytes")
+        if (not isinstance(kind, str) or kind not in {"h2d", "disk"}
+                or type(gpu) is not int or not integer(size)
+                or size > 2**64 - 1
+                or (kind == "h2d" and gpu not in executed) or (kind == "disk" and gpu != -1)):
+            errors.append("invalid-copy-identity")
+            valid = False
+            continue
+        cached, staged = row.get("cached"), row.get("staged")
+        if (not integer(cached) or not integer(staged) or cached > size or staged > size
+                or (kind == "h2d" and cached)):
+            errors.append("invalid-copy-byte-counts")
+            valid = False
+            continue
+        seconds, gbps, ceiling, pct = (row.get(key) for key in ("seconds", "gbps", "ceiling", "pct"))
+        if not finite(seconds, positive=bool(size)) or not finite(gbps) or not finite(ceiling):
+            errors.append("invalid-copy-measurement")
+            valid = False
+            continue
+        if kind == "h2d":
+            facts["h2d_bytes"] += size
+        else:
+            facts["cached_bytes"] += cached
+            facts["uncached_disk_bytes"] += size - cached
+        if not size:
+            continue
+        rate = size / seconds / 1e9
+        if not math.isfinite(rate) or abs(gbps - rate) > 0.005001:
+            errors.append("copy-rate-mismatch")
+        if kind == "disk" and cached == size:
+            if ceiling != 0 or pct is not None:
+                errors.append("cached-disk-has-hardware-ceiling")
+            continue
+        if kind == "disk" and cached:
+            errors.append("mixed-disk-copy-unmeasured")
+            continue
+        if ceiling <= 0 or not finite(pct) or pct > 100:
+            errors.append(f"unmeasured-{kind}-ceiling")
+            continue
+        # Compare intervals implied by the producer's decimal rounding, rather than
+        # silently interpreting rounded zeroes as measured rates or adding a speed bar.
+        low = 100 * rate / (ceiling + 0.005)
+        high = 100 * rate / max(ceiling - 0.005, sys.float_info.min)
+        if not low - 0.050001 <= pct <= high + 0.050001:
+            errors.append("copy-percentage-mismatch")
+        facts["percentages"].append(f"{kind}@{gpu}:{pct:.1f}%")
+    paged = stats.get("paged_in")
+    if integer(paged) and valid and facts["h2d_bytes"] != paged:
+        # The producer currently drains a process-wide log. It must not be mistaken
+        # for complete per-request evidence when concurrent requests split that log.
+        errors.append("copy-request-accounting-mismatch")
+    fills = (isinstance(events, list) and any(isinstance(event, dict)
+             and event.get("kind") == "fill" and event.get("bytes", 0) != 0 for event in events))
+    if (integer(paged) and valid and not errors and paged == 0 and not facts["h2d_bytes"]
+            and not facts["uncached_disk_bytes"] and not fills):
+        facts["minimum_bytes"] = 0
+    else:
+        errors.append("missing-transfer-minimum-evidence")
+    return list(dict.fromkeys(errors)), facts
+
+
 def record(path, cell, number, state, substitute, summary, slim=""):
     bar = []
     try:
@@ -162,7 +252,7 @@ def record(path, cell, number, state, substitute, summary, slim=""):
                 bar.append("gpu-call-incomplete")
     if not gpu_measurements:
         bar.append("no-gpu-execution")
-    stats = []
+    stats, movements = [], []
     for measurements, executed in gpu_measurements:
         memory = measurements.get("memory")
         if slim:
@@ -172,6 +262,10 @@ def record(path, cell, number, state, substitute, summary, slim=""):
         if not isinstance(value, dict) or not value:
             bar.append("no-mem-stats")
             continue
+        if slim:
+            errors, movement = movement_evidence(value, events, executed)
+            bar.extend(errors)
+            movements.append(movement)
         for field in ("leftover", "paged_in", "retries"):
             if not integer(value.get(field)):
                 bar.append(f"no-valid-{field}")
@@ -226,10 +320,16 @@ def record(path, cell, number, state, substitute, summary, slim=""):
                 if isinstance(key, str) and key.rsplit("/", 1)[-1].startswith("transformer") and isinstance(per, list))
     read_label = "-" if read is None else f"{read:.3f}"
     per_label = "-" if read is None or not steps else f"{read / steps:.3f}"
+    movement_label = ""
+    if slim:
+        known = bool(movements) and all(row["minimum_bytes"] == 0 for row in movements)
+        percentages = ",".join(value for row in movements for value in row["percentages"])
+        movement_label = (f"transfer_minimum={'0B' if known else 'unknown'} "
+                          f"copy_ceiling_pct={percentages or '-'} ")
     print(f"{cell} run={number} {state} wall={wall:.0f}s exec={duration:.3f}s oom_retries={'-' if retries is None else retries} "
           f"poisoned={int(poisoned)} leftover={'-' if leftover is None else leftover} read={read_label}GB "
           f"steps={steps} read_per_step={per_label}GB dit_step_max={max(dit) if dit else '-'}B "
-          f"{f'substitute={substitute} ' if substitute else ''}bar={','.join(bar) or 'ok'} modes={{}} "
+          f"{f'substitute={substitute} ' if substitute else ''}{movement_label}bar={','.join(bar) or 'ok'} modes={{}} "
           f"mem_stats={json.dumps(stats)} reason={str(reason)[:300]}")
     return int(bool(bar))
 

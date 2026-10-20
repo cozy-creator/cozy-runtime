@@ -25,6 +25,27 @@ def positive():
     return value
 
 
+def slim_positive():
+    """A current-schema validator fixture, not a claim of another hardware run."""
+    value = positive()
+    memory = value.get("calls", [value])[0]["measurements"]["memory"]
+    base = dict(request="r", rank=0, gpu=0, step=0, page=1, bytes=64,
+                capacity=256, resident=64, orphan_bytes=0, reason="demand",
+                **{"class": "pinned"})
+    memory["trace"] = [dict(base, sequence=0, kind="begin", page=0, bytes=0),
+                       dict(base, sequence=1, kind="bind"),
+                       dict(base, sequence=2, kind="end", page=0, bytes=0)]
+    memory["stats"]["copies"] = []
+    return value
+
+
+def measured_copy():
+    # 1 GB in 0.1 s is 10 GB/s, exactly 50% of a 20 GB/s measured ceiling.
+    return dict(kind="h2d", gpu=0, bytes=1_000_000_000, seconds=0.1,
+                gbps=10.0, ceiling=20.0, pct=50.0, link="Gen4 x16 of Gen4 x16",
+                busy_s=0.08, pin_s=0.01, staged=1_000_000_000, cached=0)
+
+
 class MemoryReceipts(unittest.TestCase):
     def test_slim_trace_protects_working_pages_and_orphan_order(self):
         def event(sequence, kind, **values):
@@ -67,14 +88,14 @@ class MemoryReceipts(unittest.TestCase):
                         working_set=4, speculative_budget=3)
         self.assertIn("speculation-after-starvation", API["trace_errors"](trace))
 
-    def record(self, value, cell="24-sdxl4", cold=""):
+    def record(self, value, cell="24-sdxl4", cold="", slim=""):
         with tempfile.TemporaryDirectory() as directory:
             path, summary = Path(directory) / "run.json", Path(directory) / "summary.txt"
             path.write_text(json.dumps(value))
             summary.write_text(cold)
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
-                code = API["record"](path, cell, str(value["number"]), "completed landed", "", summary)
+                code = API["record"](path, cell, str(value["number"]), "completed landed", "", summary, slim)
             return code, out.getvalue()
 
     def compare(self, controls, candidate, strict=False):
@@ -201,6 +222,91 @@ class MemoryReceipts(unittest.TestCase):
             self.assertIn("time missing or invalid", self.compare(old, current)[1])
         invalid = current.replace("bar=ok", "bar=no-mem-stats")
         self.assertEqual(self.compare("", invalid)[0], 1)
+
+    def test_zero_transfer_proves_zero_minimum_without_invented_cache_state(self):
+        value = slim_positive()
+        code, text = self.record(value, slim="slim")
+        self.assertEqual(code, 0, text)
+        self.assertIn("transfer_minimum=0B", text)
+        self.assertIn("copy_ceiling_pct=-", text)
+        del value["calls"][0]["measurements"]["memory"]["stats"]["copies"]
+        self.assertIn("missing-copy-evidence", self.record(value, slim="slim")[1])
+
+    def test_real_copy_percent_is_reported_but_does_not_invent_a_minimum(self):
+        value = slim_positive()
+        memory = value["calls"][0]["measurements"]["memory"]
+        memory["stats"].update(paged_in=1_000_000_000, copies=[measured_copy()])
+        memory["trace"].insert(1, dict(memory["trace"][1], kind="fill"))
+        for index, event in enumerate(memory["trace"]):
+            event["sequence"] = index
+        code, text = self.record(value, slim="slim")
+        self.assertEqual(code, 1)
+        self.assertIn("copy_ceiling_pct=h2d@0:50.0%", text)
+        self.assertIn("transfer_minimum=unknown", text)
+        self.assertIn("missing-transfer-minimum-evidence", text)
+        self.assertNotIn("copy-percentage-mismatch", text)
+
+    def test_missing_or_impossible_copy_measurements_cannot_pass(self):
+        cases = [
+            ("seconds", 0, "invalid-copy-measurement"),
+            ("seconds", float("nan"), "invalid-copy-measurement"),
+            ("ceiling", 0, "unmeasured-h2d-ceiling"),
+            ("ceiling", float("inf"), "invalid-copy-measurement"),
+            ("pct", None, "unmeasured-h2d-ceiling"),
+            ("pct", 101, "unmeasured-h2d-ceiling"),
+            ("pct", 75, "copy-percentage-mismatch"),
+            ("gbps", 5, "copy-rate-mismatch"),
+            ("bytes", True, "invalid-copy-identity"),
+            ("gpu", 1, "invalid-copy-identity"),
+            ("staged", 1_000_000_001, "invalid-copy-byte-counts"),
+        ]
+        for field, value, reason in cases:
+            with self.subTest(field=field, value=value):
+                row = measured_copy()
+                row[field] = value
+                errors, _ = API["movement_evidence"]({"copies": [row], "paged_in": 1_000_000_000}, [], {0})
+                self.assertIn(reason, errors)
+
+    def test_decimal_rounding_does_not_become_a_false_percentage_failure(self):
+        row = measured_copy()
+        row.update(bytes=1_000_000, seconds=0.003, gbps=0.33,
+                   ceiling=3.33, pct=10.0, staged=1_000_000)
+        errors, _ = API["movement_evidence"]({"copies": [row], "paged_in": 1_000_000}, [], {0})
+        self.assertEqual(errors, ["missing-transfer-minimum-evidence"])
+
+    def test_cached_reads_are_not_claimed_as_physical_disk_measurements(self):
+        row = dict(kind="disk", gpu=-1, bytes=100, seconds=1.0, gbps=0.0,
+                   ceiling=0.0, pct=None, cached=100, staged=0)
+        errors, facts = API["movement_evidence"]({"copies": [row], "paged_in": 0}, [], {0})
+        self.assertEqual(errors, [])
+        self.assertEqual(facts["cached_bytes"], 100)
+        self.assertEqual(facts["minimum_bytes"], 0)
+        row.update(ceiling=1.0, pct=0.0)
+        self.assertIn("cached-disk-has-hardware-ceiling",
+                      API["movement_evidence"]({"copies": [row], "paged_in": 0}, [], {0})[0])
+        row.update(cached=50, ceiling=0.0, pct=None)
+        self.assertIn("mixed-disk-copy-unmeasured",
+                      API["movement_evidence"]({"copies": [row], "paged_in": 0}, [], {0})[0])
+
+    def test_disk_and_each_gpu_report_their_measured_percentage(self):
+        disk = dict(kind="disk", gpu=-1, bytes=1_000_000_000, seconds=1.0,
+                    gbps=1.0, ceiling=2.0, pct=50.0, cached=0, staged=0)
+        second = dict(measured_copy(), gpu=1)
+        errors, facts = API["movement_evidence"](
+            {"copies": [disk, measured_copy(), second], "paged_in": 2_000_000_000}, [], {0, 1})
+        self.assertEqual(errors, ["missing-transfer-minimum-evidence"])
+        self.assertEqual(facts["percentages"], ["disk@-1:50.0%", "h2d@0:50.0%", "h2d@1:50.0%"])
+        self.assertEqual(facts["uncached_disk_bytes"], 1_000_000_000)
+        self.assertEqual(facts["h2d_bytes"], 2_000_000_000)
+
+    def test_copy_log_must_match_the_request_counter(self):
+        stats = {"copies": [measured_copy()], "paged_in": 1}
+        self.assertIn("copy-request-accounting-mismatch",
+                      API["movement_evidence"](stats, [], {0})[0])
+        stats = {"copies": [], "paged_in": 1}
+        errors, facts = API["movement_evidence"](stats, [], {0})
+        self.assertIn("copy-request-accounting-mismatch", errors)
+        self.assertIsNone(facts["minimum_bytes"])
 
 
 if __name__ == "__main__":
