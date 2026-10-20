@@ -88,6 +88,8 @@ class Backend:
         qualified: tuple[Capabilities, QualificationResult],
         device_facts: DeviceFacts,
         custody: str = "canonical",
+        rank: int = 0,
+        world: int = 1,
     ) -> None:
         self.memory = memory
         self.device = device
@@ -96,6 +98,7 @@ class Backend:
         self.checkpoints = dict(checkpoints)
         self.plan = {row.key: row for row in rows}
         self.custody = custody
+        self.rank, self.world = rank, world
         self.state = "open"
         self.expected: dict[str, frozenset[str]] = {}
         #: component -> stored tensors the code does not build: never read or mapped
@@ -442,6 +445,8 @@ class Backend:
                 "manifest": self.checkpoints[name].id,
                 "construction": self.execution.construction.document(),
                 "component": name,
+                "rank": self.rank,
+                "world": self.world,
             }
         )
 

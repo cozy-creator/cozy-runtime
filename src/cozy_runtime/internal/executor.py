@@ -2436,6 +2436,8 @@ class Executor:
             model_class=f"{model_cls.__module__}:{model_cls.__qualname__}",
             components=tuple(names),
             custody=binding.custody,
+            rank=self.rank,
+            world=self.world,
         )
         # CONSENT IS AN INPUT TO RESOLUTION (#549.1). It used to fire at `materialize`, with
         # the plan already chosen and the package already imported; a plan whose route the
@@ -2517,6 +2519,8 @@ class Executor:
             qualified=qualified_pair,
             device_facts=device_facts,
             custody=binding.custody,
+            rank=self.rank,
+            world=self.world,
         )
         stage("backend_ctor")
         # THE GROUP AGREES ITS PLAN before any rank registers a byte (cr-068), and the smallest
