@@ -11,6 +11,8 @@ what Runtime mechanisms reach a placed component through: graph pins, KV caches 
 
 from __future__ import annotations
 
+import inspect
+import threading
 import time
 import weakref
 import zlib
@@ -440,7 +442,7 @@ class Backend:
         vars(root)["_varena"] = Declared(
             source,
             state=tuple(getattr(root, "_cozy_state", ())),
-            fill=bakes if bakes.bakes else None,
+            fill=bakes.snapshot({}) if bakes.bakes else None,
             bind=_Routes(self, rows),
         )
         return self.memory.load(root, level="ram")
@@ -554,18 +556,49 @@ class _Routes:
 @runtime_checkable
 class LoRASource(Protocol):
     """A model's forward hook on a linear that adds a LoRA update the model owns (H3's turbo
-    overlay). Its `lora_factors()` (identity, down, up, scale; None when it adds nothing now)
+    overlay). Its `lora_for_call()` (identity, down, up, scale; None for the base call)
     are baked into the linear's bytes, and `_cozy_baked` is set while they hold it."""
 
     _cozy_baked: bool
 
-    def lora_factors(self) -> tuple[object, Tensor, Tensor, float] | None: ...
+    def lora_for_call(
+        self, arguments: Mapping[str, object]
+    ) -> tuple[str, Tensor, Tensor, float] | None:
+        """Immutable source/component/site identity and lazy factors for this root call.
+
+        Selection reads metadata only, before placement or graph replay. The identity
+        names actual source bytes; module repr or object identity is not provenance.
+        """
+        ...
 
 
 class LoRALayer(Protocol):
     active_adapters: Sequence[str]
     scaling: Mapping[str, float]
     _cozy_baked: bool
+
+
+def _forward_arguments(
+    module: Module, args: tuple[object, ...], kwargs: Mapping[str, object]
+) -> dict[str, object]:
+    """The declared class method, never Varena's instance-level `*args/**kwargs` wrapper."""
+    signature = inspect.signature(inspect.unwrap(type(module).forward))
+    parameters = tuple(signature.parameters.values())
+    if not parameters or not any(
+        value.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+        for value in parameters[1:]
+    ):
+        raise Unbound("LoRA selection requires a declared forward signature")
+    arguments = dict(signature.bind(module, *args, **kwargs).arguments)
+    arguments.pop(parameters[0].name)
+    for parameter in parameters:
+        if parameter.kind == inspect.Parameter.VAR_POSITIONAL and arguments.get(parameter.name):
+            raise Unbound("LoRA selection cannot infer unnamed positional forward arguments")
+        if parameter.kind == inspect.Parameter.VAR_KEYWORD:
+            extra = arguments.pop(parameter.name, {})
+            if isinstance(extra, Mapping):
+                arguments.update(extra)
+    return arguments
 
 
 @dataclass(slots=True)
@@ -577,6 +610,51 @@ class _Bake:
     layer: LoRALayer | None = None
     factors: list[tuple[str, str, float]] = field(default_factory=list)
     hooks: list[LoRASource] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
+class _BakeUse:
+    weight: str
+    factors: tuple[tuple[str, str, float], ...]
+    external: tuple[tuple[str, Tensor, Tensor, float], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _BakeSnapshot:
+    """One registration's immutable transform: no call inputs or live hook selection."""
+
+    version: str
+    strategy: lora_bake.Strategy
+    uses: tuple[_BakeUse, ...]
+    owner: _Bakes
+
+    def prepare(self) -> str:
+        return self.version
+
+    def __call__(self, block: object, parts: Mapping[str, Mapping[str, Tensor]]) -> None:
+        if self.strategy != "bake":
+            return
+        torch = self.owner.torch
+        for use in self.uses:
+            weight = parts.get(use.weight)
+            if weight is None or any(a not in parts or b not in parts for a, b, _ in use.factors):
+                continue
+            downs = [parts[a]["value"] for a, _, _ in use.factors]
+            ups = [parts[b]["value"] * scale for _, b, scale in use.factors]
+            for _, down, up, scale in use.external:
+                downs.append(down)
+                ups.append(up * scale)
+            if not downs:
+                continue
+            kind = downs[0].dtype
+            lora_bake.bake(
+                torch,
+                dict(weight),
+                torch.cat([d.to(kind) for d in downs]),
+                torch.cat([u.to(kind) for u in ups], dim=1),
+                seed=zlib.crc32(use.weight.encode()),
+            )
+            self.owner.baked += 1
 
 
 class _Bakes:
@@ -591,6 +669,8 @@ class _Bakes:
         self.bakes: dict[str, _Bake] = {}
         self.strategy: lora_bake.Strategy = "bake"
         self.baked = 0
+        self.lock = threading.RLock()
+        self.active: _BakeSnapshot | None = None
         names = {row.key.partition(".")[2]: stored for stored, row in rows.items()}
         for local, stored in names.items():
             encoded = rows[stored].encoded
@@ -620,45 +700,87 @@ class _Bakes:
             if bake.layer is not None or bake.hooks:
                 self.bakes[stored] = bake
 
-    def prepare(self) -> tuple[object, ...]:
-        """As a forward starts (`Fill.prepare`): each LoRA'd linear told whether its bytes
-        carry its delta, and what baking now adds (the strategy, each linear's graph and hook
-        factors); pages baked for other deltas refill."""
-        baked, rows = self.strategy == "bake", []
+    def snapshot(self, arguments: Mapping[str, object]) -> _BakeSnapshot:
+        """Resolve metadata once; later fills never ask a mutable hook which overlay is armed."""
+        strategy = self.strategy
+        uses, identities = [], []
+        for bake in self.bakes.values():
+            external = tuple(
+                value for hook in bake.hooks if (value := hook.lora_for_call(arguments)) is not None
+            )
+            if any(not isinstance(value[0], str) or not value[0] for value in external):
+                raise ValueError("LoRA source identities must be nonempty immutable source keys")
+            uses.append(_BakeUse(bake.weight, tuple(bake.factors), external))
+            identities.append(
+                {
+                    "weight": bake.weight,
+                    "stored": list(bake.factors),
+                    "external": [(identity, scale) for identity, _, _, scale in external],
+                }
+            )
+        version = canonical.digest(
+            {
+                "bake": lora_bake.VARIANT,
+                "strategy": strategy,
+                "weights": identities,
+            }
+        )
+        return _BakeSnapshot(version, strategy, tuple(uses), self)
+
+    def _flags(self) -> list[LoRALayer | LoRASource]:
+        flags: list[LoRALayer | LoRASource] = []
         for bake in self.bakes.values():
             if bake.layer is not None:
-                bake.layer._cozy_baked = baked
-            for hook in bake.hooks:
-                hook._cozy_baked = baked
-            hooks = (hook.lora_factors() for hook in bake.hooks)
-            rows.append((bake.layer is not None, *(g and (g[0], g[3]) for g in hooks)))
-        return (self.strategy, *rows)
+                flags.append(bake.layer)
+            flags.extend(bake.hooks)
+        return flags
 
-    def __call__(self, block: object, parts: Mapping[str, Mapping[str, Tensor]]) -> None:
-        if self.strategy != "bake":
+    @contextmanager
+    def call(self, model: Model, arguments: Mapping[str, object]) -> Iterator[None]:
+        # Other threads serialize. Same-thread nesting may borrow the exact selection,
+        # but may never replace bytes/flags an outer forward is still consuming.
+        with self.lock:
+            selected = self.snapshot(arguments)
+            prior, active = model.fill, self.active
+            if active is not None and selected.version != active.version:
+                raise Unbound("a nested call cannot change an active LoRA selection")
+            flags = [(item, item._cozy_baked) for item in self._flags()]
+            model.fill = self.active = active or selected
+            for item, _ in flags:
+                item._cozy_baked = selected.strategy == "bake"
+            try:
+                yield
+            except BaseException:
+                model.fill = prior
+                for item, value in flags:
+                    item._cozy_baked = value
+                raise
+            finally:
+                self.active = active
+
+    def install_call(self, model: Model) -> None:
+        """Outside graph __call__, which itself precedes nn.Module's forward prehooks."""
+        if not self.bakes or getattr(type(model.module), "_cozy_fill_call", False):
             return
-        for stored, bake in self.bakes.items():
-            weight = parts.get(stored)
-            if weight is None or any(a not in parts or b not in parts for a, b, _ in bake.factors):
-                continue
-            downs = [parts[a]["value"] for a, _, _ in bake.factors]
-            ups = [parts[b]["value"] * scale for _, b, scale in bake.factors]
-            for hook in bake.hooks:
-                got = hook.lora_factors()
-                if got is not None:
-                    downs.append(got[1])
-                    ups.append(got[2] * got[3])
-            if not downs:
-                continue
-            kind, torch = downs[0].dtype, self.torch
-            lora_bake.bake(
-                torch,
-                dict(weight),
-                torch.cat([d.to(kind) for d in downs]),
-                torch.cat([u.to(kind) for u in ups], dim=1),
-                seed=zlib.crc32(stored.encode()),
-            )
-            self.baked += 1
+        root, owner = model.module, self
+        cls = type(root)
+        call = cls.__call__
+
+        def __call__(module: Any, *args: Any, **kwargs: Any) -> Any:
+            arguments = _forward_arguments(module, args, kwargs)
+            with owner.call(model, arguments):
+                return call(module, *args, **kwargs)
+
+        root.__class__ = type(
+            cls.__name__,
+            (cls,),
+            {
+                "__call__": __call__,
+                "_cozy_fill_call": True,
+                "__module__": cls.__module__,
+                "__qualname__": cls.__qualname__,
+            },
+        )
 
 
 # ------------------------------------------------------------------------- the residency
@@ -693,6 +815,13 @@ class Residency:
     def open_attempt(self) -> None:
         self.attempts += 1
         self.notes.clear()
+
+    def prepare_calls(self) -> None:
+        """Install only after graph wrappers, so replays also select their transform first."""
+        for name, bakes in self.bakes.items():
+            model = self.models.get(name)
+            if model is not None:
+                bakes.install_call(model)
 
     def serve_lora(self, strategy: lora_bake.Strategy) -> None:
         """A request's LoRA serving (`lora_mode`): baked, or per step."""

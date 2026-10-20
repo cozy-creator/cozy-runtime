@@ -2732,6 +2732,7 @@ class Executor:
         object.__setattr__(model, "_cozy_residency", self.residency)
         # Its components' calls replay CUDA graphs once recorded (`graphs`), unless uncaptured.
         graphs.install(self.torch, model, {name: m.module for name, m in backend.models.items()})
+        self.residency.prepare_calls()
         stage_memo.install(
             model,
             torch=torch,
