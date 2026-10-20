@@ -4450,6 +4450,19 @@ class Executor:
             return
         if request_id in self.host.memory_requests:
             raise InvalidRequest("memory request is already active", code="request_memory_busy")
+        if self.torch is not None and memory.cuda:
+            try:
+                # Library workspaces belong to the calling thread's framework context,
+                # before Memory.request snapshots package-owned allocation growth.
+                memory._measure()
+                with self.torch.cuda.device(memory.device):
+                    self.torch.cuda.current_blas_handle()
+            except BaseException as error:
+                try:
+                    memory._measure()
+                except BaseException as measurement_error:
+                    error.add_note(f"framework context measurement failed: {measurement_error}")
+                raise
         with memory.request(request_id, plan=[], package=self.construction, shape=shape) as request:
             self.host.memory_requests[request_id] = request
             try:
