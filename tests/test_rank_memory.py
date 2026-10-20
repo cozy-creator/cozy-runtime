@@ -22,7 +22,7 @@ from tensorfs.varena.torch import Copy, Eviction, Memory, Step  # noqa: E402
 
 from cozy_runtime.author import App, Context  # noqa: E402
 from cozy_runtime.author._invoke import Invocation, prepare, run_prepared  # noqa: E402
-from cozy_runtime.internal import executor_commands, request_memory, spawn  # noqa: E402
+from cozy_runtime.internal import request_memory, spawn  # noqa: E402
 from cozy_runtime.internal.executor import Executor, serve  # noqa: E402
 from cozy_runtime.internal.executor_replies import Memory as ReplyMemory  # noqa: E402
 from cozy_runtime.internal.executor_replies import RankMemory  # noqa: E402
@@ -68,19 +68,11 @@ def command(
     return msgspec.convert(peer.recv(), RankMemory, strict=True)
 
 
-def test_answer_path_preserves_keep_weights_and_request_boundaries(tmp_path: Path) -> None:
+def test_answer_path_preserves_request_boundaries(tmp_path: Path) -> None:
     with follower(tmp_path) as (worker, peer):
-        peer.send(
-            executor_commands.encode(executor_commands.KeepWeights(construction="construction"))
-        )
-        assert peer.recv() == {"reply": "keep_weights", "ok": True}
         for request_id in ("first", "second"):
             assert command(peer, "begin", request_id).ok
             assert worker.memory is not None and len(worker.memory.active) == 1
-            peer.send(executor_commands.encode(executor_commands.KeepWeights(construction="construction")))
-            assert peer.recv() == {
-                "reply": "keep_weights", "ok": False, "code": "request_memory_busy"
-            }
             assert command(peer, "plan", request_id, (("old",),)).ok
             assert command(peer, "plan", request_id, (("right", "left"), ("last",))).ok
             assert not command(peer, "end", "another-request").ok
@@ -91,11 +83,9 @@ def test_answer_path_preserves_keep_weights_and_request_boundaries(tmp_path: Pat
             assert not reply.memory.leftover_by_gpu, "CPU requests cannot supply GPU evidence"
             assert (
                 not worker.memory.active
-                and not worker.memory.plans
+                and not worker.memory_requests
                 and worker._rank_request is None
             )
-            peer.send(executor_commands.encode(executor_commands.KeepWeights(construction="construction")))
-            assert peer.recv() == {"reply": "keep_weights", "ok": True}
 
 
 def test_failed_mirrored_command_still_closes_its_request(tmp_path: Path) -> None:
@@ -108,8 +98,6 @@ def test_failed_mirrored_command_still_closes_its_request(tmp_path: Path) -> Non
         assert (
             worker.memory is not None and not worker.memory.active and worker._rank_request is None
         )
-        peer.send(executor_commands.encode(executor_commands.KeepWeights(construction="construction")))
-        assert peer.recv() == {"reply": "keep_weights", "ok": True}
         assert command(peer, "begin", "next").ok
         assert command(peer, "end", "next").ok
 
@@ -135,7 +123,7 @@ def test_single_rank_keeps_its_local_request_plan_and_reply(tmp_path: Path) -> N
         assert request is not None and request.stats is not None and not ranks
         reply = msgspec.convert(executor._memory(request.stats, ranks), ReplyMemory, strict=True)
         assert reply.plan == [["local"]] and reply.leftover == 0 and not reply.leftover_by_gpu
-        assert not executor.memory.active and not executor.memory.plans
+        assert not executor.memory.active and not executor.memory_requests
     finally:
         left.close()
         right.close()
@@ -246,13 +234,9 @@ def test_group_forwards_plans_and_closes_every_request_after_failure(tmp_path: P
                 assert outcome.terminal == "failed" and "request failure" in outcome.message
             assert request is not None and request.stats is not None
             assert len(replies) == 1 and replies[0].plan == [["left", "right"], ["last"]]
-            assert not leader.memory.active and not leader.memory.plans
+            assert not leader.memory.active and not leader.memory_requests
             own = request_memory.measured(request.stats, [])
             assert own is not None and request_memory.combined([own, *replies]) is not None
-        kept = group.call(
-            executor_commands.encode(executor_commands.KeepWeights(construction="construction"))
-        )
-        assert all(reply.get("ok") is True for reply in kept)
     finally:
         group.close()
         left.close()
