@@ -87,6 +87,8 @@ def main(
             "install",
             "--python",
             python,
+            "--reinstall-package",
+            "tensorfs",
             "--torch-backend",
             "cu130",
             str(artifact),
