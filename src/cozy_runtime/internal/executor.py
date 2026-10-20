@@ -2645,7 +2645,7 @@ class Executor:
             return {"ok": False, "code": exc.code, "detail": str(exc).splitlines()[0][:900]}
         try:
             # THE MODEL'S OWN EXECUTION PLAN: its fused kernels, glue and hooks.
-            planned = self._execution_plan(model, torch, load_kernels, kernels_ready)
+            planned = self.planned = self._execution_plan(model, torch, load_kernels, kernels_ready)
             roots = backend.roots
             stage("execution_plan")
             # EACH SITE'S KERNEL FROM THE GROUP'S FAMILY CELL AT THE MODEL'S ATTENTION LEVEL,
@@ -3462,6 +3462,8 @@ class Executor:
             self._restore_attention()
             for held in later:
                 served_attention = served_attention.joined(held) if served_attention else held
+        # The model's execution plan as installed (its fused glue's identity), "" when eager.
+        record.emit("confession", "execution.plan", getattr(self, "planned", ""))
         if served_attention is not None:
             self._emit_attention(record, served_attention, "attention.selected")
             sparse_kernels = attention.sparse_names(served_attention.totals())
