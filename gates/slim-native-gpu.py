@@ -80,13 +80,19 @@ def main(*, binary: Annotated[FileAsset, AssetBound(max_bytes=67108864)],
             os.killpg(process.pid, signal.SIGKILL)
             stdout, stderr = process.communicate()
             print(stdout + stderr, flush=True)
-            raise RuntimeError(f"Native GPU case {name} exceeded its test-harness bound") from None
+            raise RuntimeError(
+                f"Native GPU case {name} exceeded its test-harness bound\n"
+                f"stdout (tail):\n{stdout[-4000:]}\nstderr (tail):\n{stderr[-4000:]}"
+            ) from None
         text = stdout + stderr
         (logs / f"{name.replace('::', '_')}.log").write_text(text)
         print(text, flush=True)
         summary = re.findall(r"test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored", text)
         if process.returncode or marker not in text or not summary or summary[-1] != ("1", "0", "0"):
-            raise RuntimeError(f"Native GPU case {name} failed (exit {process.returncode})")
+            raise RuntimeError(
+                f"Native GPU case {name} failed (exit {process.returncode})\n"
+                f"stdout (tail):\n{stdout[-4000:]}\nstderr (tail):\n{stderr[-4000:]}"
+            )
         identities = [line.split(marker, 1)[1].split()[0]
                       for line in text.splitlines() if marker in line]
         if not identities:
