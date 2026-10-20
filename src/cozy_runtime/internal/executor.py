@@ -874,6 +874,8 @@ class Executor:
         self._bound_calls: tuple[tuple[CallInterface, ...], CallBindings] | None = None
         self.ready = False
         self.poisoned = ""
+        #: its followers were sent the load: from here a refusal leaves them mid-protocol
+        self.commanded = False
         #: by model binding path: the execution plan it installed (its fused glue's identity),
         #: "" when eager
         self.planned: dict[str, str] = {}
@@ -2000,10 +2002,10 @@ class Executor:
             self._close_after({})
             raise
         if not reply.get("ok"):
-            if not child.poisoned:
+            if not child.poisoned and not child.commanded:
                 # Refused before touching the process: its other constructions keep serving.
                 return {**reply, "poisoned": ""}
-            self.poisoned = self.poisoned or child.poisoned
+            self.poisoned = self.poisoned or child.poisoned or f"group: {reply.get('code')}"
             return self._close_after({**reply, "poisoned": self.poisoned})
         self._register(key, child, reply)
         return self._load_reply(key, child, reused=False)
@@ -2360,6 +2362,7 @@ class Executor:
                 )
             except GroupRefusal as exc:
                 return self._group_refusal(exc)
+            self.commanded = True
             stage("group_broadcast")
 
         if self.discovered is None:
