@@ -30,6 +30,12 @@ def test_every_scheme_has_its_parts_and_nothing_else() -> None:
         "int8.convrot": ({"weight", "scale"}, set()),
         "mxfp8": ({"weight", "scale"}, set()),
         "nvfp4": ({"weight", "scale", "scale_2"}, {"input_scale"}),
+        "comfy.asym_w4a8_int8": (
+            {"weight", "weight_s_rel", "weight_s_channel"},
+            {"weight_codebook", "weight_correction"},
+        ),
+        "comfy.w6a8_int8": ({"weight", "weight_s_rel", "weight_s_channel"}, set()),
+        "comfy.convrot_w4a4": ({"weight", "weight_scale"}, set()),
     }
     assert set(providers) == set(expected)
     for scheme, candidates in providers.items():

@@ -6,9 +6,11 @@ import importlib
 import math
 from types import ModuleType
 
+import numpy as np
 from tensorfs import raw
 
 from cozy_runtime.author._errors import CapabilityError
+from cozy_runtime.derive.safetensors_io import to_f32
 from cozy_runtime.internal.encoding.formats import RowwiseDequant, params_of
 from cozy_runtime.weights_store import Checkpoint, read_into
 
@@ -40,14 +42,7 @@ def read_values_into(
     into: memoryview,
 ) -> None:
     """Elements `offset..` of a plain float or per-row (`fp8.rowwise`, `int8.rowwise`) tensor,
-    as f32."""
-    if torch is None:
-        try:
-            torch = importlib.import_module("torch")
-        except ImportError as exc:
-            raise CapabilityError(
-                "logical model decoder is unavailable", code="weights_reader_decoder_unavailable"
-            ) from exc
+    as f32. Plain floats need no torch; a per-row decode does."""
     held = source.components.get(component)
     tensor = None if held is None else held.tensors.get(key)
     count = into.nbytes // 4
@@ -55,18 +50,24 @@ def read_values_into(
         raise CapabilityError("model tensor is absent", code="weights_reader_tensor")
     if offset < 0 or offset + count > math.prod(tensor.shape):
         raise CapabilityError("logical read leaves the tensor", code="weights_reader_bounds")
-    target = torch.frombuffer(into, dtype=torch.float32)
     if tensor.encoding is None:
-        name = _FLOATS.get(tensor.dtype)
-        if name is None:
+        size = _WIDTHS.get(tensor.dtype)
+        if size is None:
             raise CapabilityError("logical dtype is not a float", code="weights_reader_encoding")
-        dtype = getattr(torch, name)
-        size = torch.empty((), dtype=dtype).element_size()
+        values = np.frombuffer(into, dtype=np.float32)
         for start in range(0, count, _ELEMENTS):
             length = min(_ELEMENTS, count - start)
             payload = _part(source, component, key, "", (offset + start) * size, length * size)
-            target[start : start + length].copy_(torch.frombuffer(payload, dtype=dtype))
+            values[start : start + length] = to_f32(payload, tensor.dtype, [length])
         return
+    if torch is None:
+        try:
+            torch = importlib.import_module("torch")
+        except ImportError as exc:
+            raise CapabilityError(
+                "logical model decoder is unavailable", code="weights_reader_decoder_unavailable"
+            ) from exc
+    target = torch.frombuffer(into, dtype=torch.float32)
     params = dict(tensor.encoding.params)
     stored = raw.parts(source, component, key).get("weight")
     element = _ROWWISE.get((tensor.encoding.scheme, stored.dtype if stored else ""))

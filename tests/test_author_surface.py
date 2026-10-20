@@ -246,7 +246,7 @@ def test_a_model_may_not_name_an_artifact_identifier() -> None:
         Denoiser.for_test(checkpoint_ref="hf:org/model@v2")
     assert scheme.value.code == "identifier_in_code"
 
-    # And raw weights take a Manifest digest, never a name.
+    # And raw weights take a checkpoint header ref, never a name.
     with pytest.raises(ConformanceError) as derived:
         Weights("stabilityai/stable-diffusion-xl-base-1.0")
-    assert derived.value.code == "weights_manifest_invalid"
+    assert derived.value.code == "weights_ref_invalid"
