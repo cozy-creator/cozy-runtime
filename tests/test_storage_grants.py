@@ -303,22 +303,50 @@ def test_local_destinations_replace_the_alias_and_preserve_other_revisions(
         tensorfs.materialize(seed, local_dir=seed_folder, format="cozytensors")
         if previous_release is not None:
             prior = tensorfs.upload_folder(
-                repo_id="local/output", revision=previous_release,
-                folder_path=seed_folder, cache_dir=store,
+                repo_id="local/output",
+                revision=previous_release,
+                folder_path=seed_folder,
+                cache_dir=store,
             )
+            repeated = tensorfs.upload_folder(
+                repo_id="local/output",
+                folder_path=seed_folder,
+                cache_dir=store,
+            )
+            assert repeated == prior
+            released = endpoint.repo("local/output")
+            assert released is not None and released[0].get("checkpoints", []) == []
+        # A different repository file makes this an independent unreleased TREE,
+        # rather than a duplicate of the release whose retention we also check.
+        (seed_folder / "README.md").write_text("Independent unreleased checkpoint.\n")
         draft = tensorfs.upload_folder(
-            repo_id="local/output", folder_path=seed_folder, cache_dir=store,
+            repo_id="local/output",
+            folder_path=seed_folder,
+            cache_dir=store,
         )
+        assert draft != prior
         tensorfs.upload_folder(
-            repo_id="local/unrelated", revision="7", folder_path=seed_folder, cache_dir=store,
+            repo_id="local/unrelated",
+            revision="7",
+            folder_path=seed_folder,
+            cache_dir=store,
         )
+    with tensorfs.open(draft, cache_dir=store, local_files_only=True) as pending:
+        assert pending.tree_ref is not None
+        pending_ref = {"sha256": pending.tree_ref[0], "length": pending.tree_ref[1]}
+    initial = endpoint.repo("local/output")
+    assert initial is not None and initial[0]["checkpoints"] == [pending_ref]
     unrelated = endpoint.repo("local/unrelated")
     shown: Shown = []
 
     def adopt(request: str, value: bytes) -> tuple[str, str]:
         outputs = weights_store.Outputs(
-            store, request_id=request, actor="tester", code=request,
-            bounds={"model": 4}, show=lambda *item: shown.append(item),
+            store,
+            request_id=request,
+            actor="tester",
+            code=request,
+            bounds={"model": 4},
+            show=lambda *item: shown.append(item),
             destination="local/output",
         )
         with outputs.open("model", weights_store.Derivation(None)) as output:
@@ -361,8 +389,13 @@ def test_a_remote_destination_still_adds_an_unreleased_checkpoint(
     origin = (tmp_path / "origin").as_uri()
     shown: Shown = []
     outputs = weights_store.Outputs(
-        store, request_id="remote", actor="tester", code="remote", bounds={"model": 4},
-        show=lambda *item: shown.append(item), destination="alice/output",
+        store,
+        request_id="remote",
+        actor="tester",
+        code="remote",
+        bounds={"model": 4},
+        show=lambda *item: shown.append(item),
+        destination="alice/output",
         connection=weights_store.Connection(endpoint=origin),
     )
     with outputs.open("model", weights_store.Derivation(None)) as output:

@@ -57,7 +57,9 @@ def source(store: Path) -> str:
 
 
 def _read(ck: tensorfs.Checkpoint, key: str) -> np.ndarray:
-    return np.asarray(torch.from_dlpack(ck.components["unet"].tensors.read(key)).float().numpy())
+    return np.asarray(
+        torch.from_dlpack(ck.components["unet"].tensors.read(key, decode=True)).float().numpy()
+    )
 
 
 @pytest.mark.parametrize(
