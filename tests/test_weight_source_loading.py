@@ -83,3 +83,41 @@ def test_loaded_tensor_owns_its_bytes_after_checkpoint_and_model_close(tmp_path:
     memory.close()
     assert retained.data_ptr() == expected_pointer
     assert torch.equal(retained, reference.embed.weight)
+
+
+def test_failed_binding_rolls_back_partial_writes_and_allows_a_clean_retry(tmp_path: Path) -> None:
+    torch.manual_seed(11)
+    reference = network()
+    ck = checkpoint(reference, tmp_path / "store")
+    with torch.device("meta"):
+        model = network()
+    originals = dict(model.named_parameters())
+    fail = True
+    writes = 0
+
+    def bind(key: str, parts: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        nonlocal writes
+        writes += 1
+        if fail and writes == 2:
+            raise RuntimeError("deliberate bind failure after one parameter")
+        return {key: parts["value"]}
+
+    declaration = Declared(Source(ck, "net", ck.id), bind=bind)
+    model._varena = declaration
+    memory = Memory.open(torch.device("cpu"))
+    try:
+        with pytest.raises(RuntimeError, match="deliberate bind failure"):
+            memory.load(model)
+        assert not memory.models
+        assert not memory.by_module
+        assert model._varena is declaration
+        assert all(value is originals[key] for key, value in model.named_parameters())
+        fail = False
+        loaded = memory.load(model)
+        assert memory.load(model) is loaded
+        sample = torch.randn(8, DIM, generator=torch.Generator().manual_seed(12))
+        with torch.no_grad(), memory.request("retry-load"):
+            assert torch.equal(model(sample), reference(sample))
+    finally:
+        memory.close()
+        ck.close()
