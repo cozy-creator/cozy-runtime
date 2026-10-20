@@ -361,14 +361,20 @@ def record(path, cell, number, state, substitute, summary, slim=""):
         measurements = call.get("measurements") or {}
         execution = measurements.get("execution") or {}
         gpus = execution.get("gpus") or []
+        legacy = not slim and not gpus and isinstance(execution.get("ranks"), list)
+        if legacy:
+            # Runtime 0.27.4 controls report actual CUDA ranks, not the new GPU wire.
+            gpus = [{**rank, "gpu": rank.get("ordinal")} for rank in execution["ranks"]
+                    if isinstance(rank, dict) and integer(rank.get("pid")) and rank["pid"] > 0
+                    and isinstance(rank.get("uuid"), str) and rank["uuid"]]
         executed = {gpu["gpu"] for gpu in gpus if isinstance(gpu, dict) and integer(gpu.get("gpu")) and
                     integer(gpu.get("start_us")) and gpu["start_us"] > 0 and
                     integer(gpu.get("end_us")) and gpu["end_us"] >= gpu["start_us"]}
         if call.get("memoized") is True:
             executed = set()
         if executed:
-            gpu_measurements.append((measurements, executed))
-            function = str(call.get("function") or call.get("target") or "").rsplit("/", 1)[-1].replace("-", "_")
+            gpu_measurements.append((measurements, executed, legacy))
+            function = str(call.get("function") or call.get("target") or "").rsplit("/", 1)[-1].split("@", 1)[0].replace("-", "_")
             h3 = function in {"generate_ref2va_turbo", "generate_fl2va_turbo",
                               "ref2va_turbo", "fl2va_turbo", "long_form"}
             if h3 and len(executed) == 2:
@@ -391,12 +397,22 @@ def record(path, cell, number, state, substitute, summary, slim=""):
     if group_required and not group_executed:
         bar.append("no-two-gpu-h3-execution")
     stats, movements = [], []
-    for measurements, executed in gpu_measurements:
+    for measurements, executed, legacy in gpu_measurements:
         memory = measurements.get("memory")
         if slim:
             events = memory.get("trace") if isinstance(memory, dict) else None
             bar.extend(trace_errors(events))
         value = memory.get("stats") if isinstance(memory, dict) else None
+        if legacy and isinstance(memory, dict) and any(
+                key in memory for key in ("paged_in_bytes", "oom_retries", "weights_bytes")):
+            value = {"legacy_control": True, "legacy_memory": memory}
+            for target, source in (("paged_in", "paged_in_bytes"), ("retries", "oom_retries")):
+                if integer(memory.get(source)):
+                    value[target] = memory[source]
+            # Flat weights/reserved/process bytes do not measure request leftovers,
+            # per-GPU cleanup, per-step reads or the new native decision proof.
+            stats.append(value)
+            continue
         if not isinstance(value, dict) or not value:
             bar.append("no-mem-stats")
             continue
@@ -436,7 +452,8 @@ def record(path, cell, number, state, substitute, summary, slim=""):
         bar.append("poisoned")
     if leftover:
         bar.append("leftover")
-    if cell.endswith("-warm"):
+    legacy_control = any(row.get("legacy_control") for row in stats)
+    if cell.endswith("-warm") and not legacy_control:
         if not slim and read is not None and read > 40:
             bar.append("read>40GB")
         if "-h3ref5-warm" in cell:
@@ -469,7 +486,7 @@ def record(path, cell, number, state, substitute, summary, slim=""):
     print(f"{cell} run={number} {state} wall={wall:.0f}s exec={duration:.3f}s oom_retries={'-' if retries is None else retries} "
           f"poisoned={int(poisoned)} leftover={'-' if leftover is None else leftover} read={read_label}GB "
           f"steps={steps} read_per_step={per_label}GB dit_step_max={max(dit) if dit else '-'}B "
-          f"{f'substitute={substitute} ' if substitute else ''}{movement_label}bar={','.join(bar) or 'ok'} modes={{}} "
+          f"{f'substitute={substitute} ' if substitute else ''}{'legacy_control=1 ' if legacy_control else ''}{movement_label}bar={','.join(bar) or 'ok'} modes={{}} "
           f"mem_stats={json.dumps(stats)} reason={str(reason)[:300]}")
     return int(bool(bar))
 
