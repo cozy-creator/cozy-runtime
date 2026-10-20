@@ -15,6 +15,7 @@ import hashlib
 import io
 import mmap
 import os
+import tempfile
 from collections.abc import Buffer, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -65,15 +66,25 @@ def upload(store: Path, ck: Checkpoint, repo_id: str, connection: Connection | N
     """Upload normally; a failed upload leaves the committed local checkpoint available."""
     options = connection or Connection()
     try:
-        tree = tensorfs.upload_folder(
-            repo_id=repo_id, folder_path=ck.path, cache_dir=store,
-            endpoint=options.endpoint, token=options.token, ca_der=options.ca_der,
-        )  # fmt: skip
+        with _portable(ck) as folder:
+            tree = tensorfs.upload_folder(
+                repo_id=repo_id, folder_path=folder, cache_dir=store,
+                endpoint=options.endpoint, token=options.token, ca_der=options.ca_der,
+            )  # fmt: skip
         if repo_id.startswith("local/"):
             _local_alias(store, repo_id, tree, ck.variant)
         return tree
     except tensorfs.Error as exc:
         raise RuntimeFailure(f"uploading to {repo_id}: {exc}"[:900], code="upload_failed") from exc
+
+
+@contextlib.contextmanager
+def _portable(checkpoint: Checkpoint) -> Iterator[Path]:
+    """An explicit, complete publication export; never part of model loading."""
+    with tempfile.TemporaryDirectory(prefix="tensorfs-publish-") as directory:
+        folder = Path(directory)
+        tensorfs.export(checkpoint, folder, format="cozytensors")
+        yield folder
 
 
 def _local_alias(store: Path, repo_id: str, tree: str, variant: str | None) -> None:
@@ -319,10 +330,11 @@ class Output:
             for component, ordered in keys.items():
                 self.component(component).order(ordered)
             committed = self._writer.commit()
-            tensorfs.upload_folder(
-                repo_id=DERIVED, revision=_release(self.transaction), folder_path=committed.path,
-                cache_dir=self.store, endpoint="local",
-            )  # fmt: skip
+            with _portable(committed) as folder:
+                tensorfs.upload_folder(
+                    repo_id=DERIVED, revision=_release(self.transaction), folder_path=folder,
+                    cache_dir=self.store, endpoint="local",
+                )  # fmt: skip
             self.done = tensorfs.open(
                 DERIVED,
                 revision=_release(self.transaction),
