@@ -767,7 +767,11 @@ class _Bakes:
         call = cls.__call__
 
         def __call__(module: Any, *args: Any, **kwargs: Any) -> Any:
-            arguments = _forward_arguments(module, args, kwargs)
+            arguments = (
+                _forward_arguments(module, args, kwargs)
+                if any(bake.hooks for bake in owner.bakes.values())
+                else {}
+            )
             with owner.call(model, arguments):
                 return call(module, *args, **kwargs)
 

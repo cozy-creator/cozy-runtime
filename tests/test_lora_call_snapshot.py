@@ -14,6 +14,7 @@ import pytest
 torch = pytest.importorskip("torch")
 import tensorfs  # noqa: E402
 from tensorfs.varena.torch import Declared, Memory, Unbound  # noqa: E402
+from test_graph_cache_gpu import residency  # noqa: E402
 
 from cozy_runtime import graphs  # noqa: E402
 from cozy_runtime.internal.fill import Checkpoint  # noqa: E402
@@ -58,7 +59,7 @@ def test_actual_h3_named_and_positional_selector_ignore_wrapped_instance_forward
     }
     named["attention_kwargs"] = selector
     assert _forward_arguments(root, (), named)["attention_kwargs"] is selector
-    positional = []
+    positional: list[object] = []
     for parameter in tuple(signature.parameters.values())[1:]:
         if parameter.name == "attention_kwargs":
             positional.append(selector)
@@ -68,7 +69,10 @@ def test_actual_h3_named_and_positional_selector_ignore_wrapped_instance_forward
     assert _forward_arguments(root, tuple(positional), {})["attention_kwargs"] is selector
 
 
-class Factors(torch.nn.Module):  # type: ignore[misc]
+module_type: Any = torch.nn.Module
+
+
+class Factors(module_type):  # type: ignore[misc]
     def __init__(self, identity: str) -> None:
         super().__init__()
         self.down = torch.nn.Parameter(torch.empty(1, 2))
@@ -80,7 +84,8 @@ class Selection:
     _cozy_baked = False
 
     def __init__(self, factors: dict[str, Factors]) -> None:
-        self.factors, self.armed = factors, None
+        self.factors = factors
+        self.armed: str | None = None
 
     def lora_for_call(self, arguments: Any) -> Any:
         key = arguments.get("adapter")
@@ -98,7 +103,7 @@ class Selection:
         )
 
 
-class Block(torch.nn.Module):  # type: ignore[misc]
+class Block(module_type):  # type: ignore[misc]
     def __init__(self) -> None:
         super().__init__()
         self.linear = torch.nn.Linear(2, 2, bias=False)
@@ -107,7 +112,7 @@ class Block(torch.nn.Module):  # type: ignore[misc]
         return self.linear(x)
 
 
-class Root(torch.nn.Module):  # type: ignore[misc]
+class Root(module_type):  # type: ignore[misc]
     _no_split_modules = ["Block"]
 
     def __init__(self, selection: Selection) -> None:
@@ -272,6 +277,7 @@ def test_real_page_in_switches_before_prehooks_and_reuses_only_same_fingerprint(
     assert torch.cuda.device_count() == 1
     root, hook, bakes, model, factors, memory, checkpoint = fixture(tmp_path, "cuda:0")
     registrations, versions, copied = [], [], []
+    placed = residency(memory, model)
     try:
         graphs.install(torch, object(), {"net": root})
         bakes.install_call(model)
@@ -292,5 +298,8 @@ def test_real_page_in_switches_before_prehooks_and_reuses_only_same_fingerprint(
             assert versions[1] == versions[2] == versions[3]
             assert len(set(versions)) == 3
     finally:
+        for token in placed.pins.values():
+            token.cache.close()
+        placed.pins.clear()
         memory.close()
         checkpoint.close()
