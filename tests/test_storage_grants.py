@@ -300,7 +300,7 @@ def test_local_destinations_replace_the_alias_and_preserve_other_revisions(
     prior = ""
     with tensorfs.open(source, cache_dir=store, local_files_only=True) as seed:
         seed_folder = tmp_path / "seed-portable"
-        tensorfs.export(seed, seed_folder, format="cozytensors")
+        tensorfs.materialize(seed, local_dir=seed_folder, format="cozytensors")
         if previous_release is not None:
             prior = tensorfs.upload_folder(
                 repo_id="local/output", revision=previous_release,

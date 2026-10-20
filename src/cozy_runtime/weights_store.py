@@ -80,10 +80,10 @@ def upload(store: Path, ck: Checkpoint, repo_id: str, connection: Connection | N
 
 @contextlib.contextmanager
 def _portable(checkpoint: Checkpoint) -> Iterator[Path]:
-    """An explicit, complete publication export; never part of model loading."""
+    """Materialize a complete publication folder explicitly; never during model loading."""
     with tempfile.TemporaryDirectory(prefix="tensorfs-publish-") as directory:
         folder = Path(directory)
-        tensorfs.export(checkpoint, folder, format="cozytensors")
+        tensorfs.materialize(checkpoint, local_dir=folder, format="cozytensors")
         yield folder
 
 
