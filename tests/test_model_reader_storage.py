@@ -9,6 +9,7 @@ from typing import Any
 import numpy as np
 import pytest
 import tensorfs
+from tensorfs.derived import serve_source
 
 from cozy_runtime.author import Cancelled
 from cozy_runtime.internal import storage_admission as storage
@@ -52,7 +53,6 @@ def test_cancel_can_close_source_while_native_metadata_check_waits(
     view = sources["source"]
     asked, allow = threading.Event(), threading.Event()
     errors: list[BaseException] = []
-    serve_source = weights_channel.serve_source
 
     def serve(*args: Any, **kwargs: Any) -> None:
         check = kwargs["check_current"]
