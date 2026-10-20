@@ -29,10 +29,11 @@
 # --tag: use one fixed input tag across separately batched baseline and candidate phases.
 # --packages: run local package directories; --model-override package:slot=ref selects staged checkpoint metadata.
 # --tensord: update the full candidate cohort together with both supplied wheels, not wheels beneath an old control.
+# --bits: pin the same weight precision in both phases (default 8 for --slim).
 set -uo pipefail
 GATE_RECEIPTS=$(dirname "$(realpath "$0")")/memory_receipts.py
 H=$1 W=$2; shift 2
-MATRIX="" TFS="" BASE="" CARDS="" BW="" BTFS="" ORG=fidika IMG="" ON="" SLIM="" CONTROL="" TD="" PKGS="" INPUT_TAG=""
+MATRIX="" TFS="" BASE="" CARDS="" BW="" BTFS="" ORG=fidika IMG="" ON="" SLIM="" CONTROL="" TD="" PKGS="" INPUT_TAG="" BITS=""
 declare -A AFTER=()
 MODEL_OVERRIDES=()
 while [ $# -gt 0 ]; do
@@ -45,6 +46,7 @@ while [ $# -gt 0 ]; do
     --packages) PKGS=$(realpath "$2"); shift ;;
     --model-override) MODEL_OVERRIDES+=("$2"); shift ;;
     --tag) INPUT_TAG=$2; shift ;;
+    --bits) BITS=$2; shift ;;
     --tensorfs-wheel) TFS=$2; [ -f "$2" ] && TFS=$(realpath "$2"); shift ;;
     --baseline) BASE=$(realpath "$2"); shift ;;
     --baseline-wheel) BW=$2; [ -f "$2" ] && BW=$(realpath "$2"); shift ;;
@@ -60,6 +62,7 @@ done
 [ -f "$W" ] && W=$(realpath "$W")
 [ -n "$IMG" ] && [ -n "$BW" ] && { echo "--baseline-wheel would replace the pinned image's Runtime" >&2; exit 2; }
 if [ -n "$SLIM" ]; then
+  BITS=${BITS:-8}
   [ -n "$ON" ] || { echo '--slim requires an explicitly owned rental via --on' >&2; exit 2; }
   [ -n "$CONTROL$BASE$BW" ] || { echo '--slim requires a production baseline; performance cannot pass without one' >&2; exit 2; }
 fi
@@ -90,6 +93,7 @@ run_target() {
   for override in "${MODEL_OVERRIDES[@]}"; do
     [ "${override%%:*}" != "$package" ] || set -- "$@" "model.${override#*:}"
   done
+  [ -z "$BITS" ] || set -- "$@" --bits "$BITS"
   cozy run "$target" "$@"
 }
 release() {  # end the machine this script rented, once its outputs landed, and confirm it is gone
@@ -305,11 +309,6 @@ card() {  # one card, in its own subshell: rent, install, run its cells, end the
       if ! native_cap "${GIB[$card]}" "${gpus:-1}"; then
         say "card $card: legacy baseline needs that actual physical memory class; no unverified cap"; FAILED=$((FAILED + 1)); return
       fi
-    else
-      if ! cozy machine update "$M" --gpu-memory-limit "${GIB[$card]}GiB" --tensorhub "$H" > "cap-$card.log" 2>&1 ||
-          ! capped "${GIB[$card]}"; then
-        say "card $card: requested cap on $M is not in force"; FAILED=$((FAILED + 1)); return
-      fi
     fi
     say "card $card: caller-owned rental $M; this script does not rent or end it"
   else
@@ -342,10 +341,6 @@ PY
   done
   [ -z "$M" ] && { say "card $card: no SKU had capacity ($(tail -c 200 "rent-$card.err"))"; FAILED=$((FAILED + 1)); return; }
   [ "$class" = "$card" ] || SUBST=$class@${GIB[$card]}
-  if [ -n "$SUBST" ] && ! { cozy machine update "$M" --gpu-memory-limit "${GIB[$card]}GiB" --tensorhub "$H" > "cap-$card.log" 2>&1 &&
-      capped "${GIB[$card]}"; }; then
-    say "card $card: the ${GIB[$card]} GiB cap on $M is not in force: $(tail -c 300 "cap-$card.log")"; FAILED=$((FAILED + 1)); release; return
-  fi
   fi
   local log  # the machine's own and memory logs, kept here in case the machine is lost mid-run
   for log in tensord memory; do
@@ -360,6 +355,15 @@ PY
   fi
   if { [ "$W" != - ] || [ -n "$BW" ]; } && ! update "$W" "$TFS" "$card" "$TD"; then
     say "card $card: the wheel did not install: $(tail -c 300 "update-$card.log")"; FAILED=$((FAILED + 1)); release; return
+  fi
+  # Install the matched control before asking it to enforce a cap. Legacy workers
+  # can update the full binary, but do not implement --gpu-memory-limit themselves.
+  if { [ -n "$ON" ] && [ -z "$CONTROL" ]; } || [ -n "$SUBST" ]; then
+    if ! cozy machine update "$M" --gpu-memory-limit "${GIB[$card]}GiB" --tensorhub "$H" > "cap-$card.log" 2>&1 ||
+        ! capped "${GIB[$card]}"; then
+      say "card $card: requested cap on $M is not in force: $(tail -c 300 "cap-$card.log")"
+      FAILED=$((FAILED + 1)); release; return
+    fi
   fi
   pass "$card"
   if [ -n "${AFTER[$card]:-}" ]; then
