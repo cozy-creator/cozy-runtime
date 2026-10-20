@@ -189,7 +189,7 @@ def test_removed_keep_command_is_refused_without_stopping_the_executor(tmp_path:
     try:
         executor = Executor(Channel(left), tmp_path)
         reply = _reply(executor, {"cmd": "keep_weights", "construction": "old"})
-        assert reply is not None and reply["code"] == "command_malformed"
+        assert reply is not None and reply["code"] == "unknown_command"
         assert executor.hello()["ok"] is True
     finally:
         left.close()
