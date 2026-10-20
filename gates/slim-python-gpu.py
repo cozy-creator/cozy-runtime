@@ -91,6 +91,7 @@ def main(
             "cu130",
             str(artifact),
             "pytest",
+            "numpy>=2.0",
             "torch==2.14.0",
         ],
     )
