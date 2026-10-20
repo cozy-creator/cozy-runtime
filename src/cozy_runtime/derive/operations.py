@@ -21,7 +21,7 @@ from cozy_runtime.author import (
     WeightsOutput,
     invocable,
 )
-from cozy_runtime.tensord_channels import Derivation, Source
+from cozy_runtime.weights_store import Checkpoint, Derivation
 
 from . import facade
 from .quantization import (
@@ -66,7 +66,7 @@ app = App()
 
 
 def _selection(
-    source: Source, plan: QuantizationPlan, encoding: str | None = None
+    source: Checkpoint, plan: QuantizationPlan, encoding: str | None = None
 ) -> ArtifactQuantizationPlan:
     if (
         not 1 <= len(plan.components) <= 64
@@ -205,7 +205,7 @@ def _selection(
         "cozy_runtime.derive.quantization",
         "cozy_runtime.derive.microscale",
         "cozy_runtime.derive.safetensors_io",
-        "cozy_runtime.tensord_channels",
+        "cozy_runtime.weights_store",
         MemoDistribution("tensorfs"),
         MemoDistribution("numpy"),
         MemoDistribution("msgspec"),
@@ -262,8 +262,8 @@ def quantize_into(
 class SelectionPlan(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     """The weights a lane keeps: those whose `component.key` matches one of `include`'s fnmatch
     patterns, each of which must match one. Every other tensor is dropped; the kept ones keep the
-    source's objects and every file comes along. A small lane of a big checkpoint's part, such
-    as its multi-token-prediction head."""
+    source's objects, and the pipeline, every component's config and its assets come along. A
+    small lane of a big checkpoint's part, such as its multi-token-prediction head."""
 
     include: tuple[str, ...]
 
@@ -291,12 +291,10 @@ def select_into(
             code="selection_plan",
         )
     with ctx.output(output, Derivation(base=None, sources=(opened,), order=order)) as out:
+        out.inherit(opened)
         for component, key in order:
             if not out.has(component, key):
-                out.copy(component, key, opened.manifest)
-        for path in opened.files:
-            if path != "model.cozytensors":
-                out.file(path, opened.file(path))
+                out.copy(component, key, opened)
         artifact = ctx.adopt_model(out)
     tel.log("selection", output=output, kept_keys=len(order), dropped_keys=len(rows) - len(order))
     return artifact

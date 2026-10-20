@@ -22,7 +22,7 @@ from cozy_runtime.author import (
     UnsupportedInput,
     Weights,
 )
-from cozy_runtime.tensord_channels import Derivation, Source
+from cozy_runtime.weights_store import Checkpoint, Derivation
 
 from .quantization import (
     _ENCODINGS,
@@ -61,7 +61,8 @@ class QuantizeResult(msgspec.Struct):
 
     output: str
     weights_transaction_id: str
-    tensorfs_receipt_digest: str
+    #: the committed checkpoint's header ref
+    checkpoint: str
     #: nothing was written this run: the output was committed, or journaled whole, before
     replayed: bool
     encoded_keys: int
@@ -139,7 +140,7 @@ def plan(
 
 
 def quantize(
-    source: Weights[Any] | Source,
+    source: Weights[Any] | Checkpoint,
     plan: QuantizePlan,
     /,
     *,
@@ -153,7 +154,7 @@ def quantize(
 
 
 def quantize_artifact(
-    source: Weights[Any] | Source,
+    source: Weights[Any] | Checkpoint,
     plan: QuantizePlan,
     /,
     *,
@@ -185,7 +186,7 @@ def _artifact_result(
 
 
 def _quantize(
-    source: Weights[Any] | Source,
+    source: Weights[Any] | Checkpoint,
     plan: QuantizePlan,
     /,
     *,
@@ -195,7 +196,7 @@ def _quantize(
     selection: ArtifactQuantizationPlan | None = None,
     preserve_precision: bool = False,
 ) -> tuple[QuantizeResult, ModelArtifact]:
-    opened = source if isinstance(source, Source) else ctx.tensorfs_source(source)
+    opened = source if isinstance(source, Checkpoint) else ctx.tensorfs_source(source)
     keep = (
         tuple(dict.fromkeys(component for component, _, _ in source_rows(opened)))
         if preserve_precision
@@ -245,7 +246,7 @@ def _quantize(
     return QuantizeResult(
         output=output,
         weights_transaction_id=transaction,
-        tensorfs_receipt_digest=result_artifact.tensorfs_receipt_digest,
+        checkpoint=result_artifact.checkpoint,
         replayed=reused == encoded + len(converted),
         encoded_keys=encoded,
         reused_keys=reused,

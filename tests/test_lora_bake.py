@@ -234,7 +234,7 @@ def test_an_int8_convrot_bake_keeps_the_delta_in_its_rotated_grid() -> None:
     values, down, up = _layer(11)
     assert lora_bake.bakeable(
         "int8.convrot",
-        {"rotation": "hadamard", "rotation_size": 256, "scale_dtype": "F32"},
+        {"rotation": "kron_regular_h4", "rotation_size": 256, "scale_dtype": "F32"},
         {"weight": "i8", "scale": "f32"},
     )
     data, scale = _int8(values)

@@ -1,4 +1,4 @@
-"""`nvfp4`: the tensor-scaled producer over TensorD's channels, decode and leaf."""
+"""`nvfp4`: the tensor-scaled producer into the store, decode and leaf."""
 
 from __future__ import annotations
 
@@ -7,13 +7,14 @@ from typing import Any
 
 import numpy as np
 import pytest
+from tensorfs import raw
 
 from cozy_runtime.author import Weights
 from cozy_runtime.author.fakes import fake_attempt, fake_telemetry
 from cozy_runtime.derive.microscale import encode_nvfp4
 from cozy_runtime.derive.operations import EncodingRule, QuantizationPlan, quantize_into
 from cozy_runtime.internal.encoding import params_of
-from tensord_peer import context, lane, output
+from store_fixtures import adopted, checkpoint, context, home
 
 ENCODING = "nvfp4"
 PARAMS = params_of(
@@ -50,9 +51,13 @@ def test_chunked_encode_uses_the_tensor_amax() -> None:
     assert encode_nvfp4("w", values[:16]).companions[1].raw != whole.companions[1].raw
 
 
-def test_one_lane_carries_nvfp4_beside_int8(tmp_path: Path) -> None:
-    store, source, peer = lane(
-        tmp_path,
+def test_one_lane_carries_nvfp4_beside_int8(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = home(tmp_path / "tensorfs", monkeypatch)
+    shown: list[tuple[str, str, str, str]] = []
+    source = checkpoint(
+        store,
         {
             "transformer": {
                 "blocks.0.ff.weight": weight(48, 64, 1),
@@ -68,13 +73,13 @@ def test_one_lane_carries_nvfp4_beside_int8(tmp_path: Path) -> None:
         output_precision="preserve",
     )
     quantize_into(
-        context(peer), fake_telemetry(fake_attempt("nvfp4")), source=Weights(source),
+        context(store, shown=shown), fake_telemetry(fake_attempt("nvfp4")), source=Weights(source),
         plan=plan, encoding="int8.convrot", output="model",
     )  # fmt: skip
-    out = output(store, peer)
-    q_proj = out.tensors["text_encoder"]["layers.0.q_proj.weight"]
+    out = adopted(store, shown)
+    q_proj = out.components["text_encoder"].tensors["layers.0.q_proj.weight"]
     assert q_proj.encoding is not None and q_proj.encoding.scheme == "int8.convrot"
-    ff = out.tensors["transformer"]["blocks.0.ff.weight"]
+    ff = out.components["transformer"].tensors["blocks.0.ff.weight"]
     assert ff.encoding is not None and (ff.encoding.scheme, ff.encoding.params) == (
         ENCODING,
         {
@@ -84,13 +89,16 @@ def test_one_lane_carries_nvfp4_beside_int8(tmp_path: Path) -> None:
             "scale_layout": "row_major",
         },
     )
-    parts = {role: (p.dtype, p.shape) for role, p in ff.parts.items()}
+    parts = {
+        role: (p.dtype, p.shape)
+        for role, p in raw.parts(out, "transformer", "blocks.0.ff.weight").items()
+    }
     assert parts == {
         "weight": ("F4", (48, 64)),
         "scale": ("F8_E4M3", (48, 4)),
         "scale_2": ("F32", ()),
     }
-    assert out.tensors["transformer"]["proj_out.weight"].encoding is None
+    assert out.components["transformer"].tensors["proj_out.weight"].encoding is None
 
 
 def roles(torch: Any, values: np.ndarray, device: str) -> dict[str, Any]:

@@ -31,17 +31,17 @@ class ObjectRef(msgspec.Struct, frozen=True):
 
 
 class ModelArtifact(msgspec.Struct, frozen=True):
-    """A produced model's original receipt provenance, independent of its current holder.
+    """A produced model: the checkpoint (its header ref) an output committed, the request and
+    output that produced it, and the derivation's replay key (`transaction`).
 
-    Reusing it never rewrites the producer or receipt. The RecordOwner verifies
-    current access and acquires a new native hold before delegating it to a child.
-    Neither this value nor its digest grants access by itself.
+    Reusing it never rewrites the producer. Neither this value nor its digest grants access
+    by itself.
     """
 
     producer_request_id: str
     output_slot: str
-    manifest: ObjectRef
-    tensorfs_receipt_digest: str
+    checkpoint: str
+    transaction: str
 
     def __post_init__(self) -> None:
         if (
@@ -49,11 +49,12 @@ class ModelArtifact(msgspec.Struct, frozen=True):
             or _REQUEST.fullmatch(self.producer_request_id) is None
             or not isinstance(self.output_slot, str)
             or _SLOT.fullmatch(self.output_slot) is None
-            or not isinstance(self.manifest, ObjectRef)
-            or not isinstance(self.tensorfs_receipt_digest, str)
-            or _DIGEST.fullmatch(self.tensorfs_receipt_digest) is None
+            or not isinstance(self.checkpoint, str)
+            or _DIGEST.fullmatch(self.checkpoint) is None
+            or not isinstance(self.transaction, str)
+            or _DIGEST.fullmatch(self.transaction) is None
         ):
             raise ConformanceError(
-                "model artifact requires exact producer, output and native receipt provenance",
+                "model artifact requires an exact checkpoint, producer, output and transaction",
                 code="model_artifact",
             )

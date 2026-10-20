@@ -62,9 +62,9 @@ testpaths = ["tests"]
 addopts = "-q -p no:cacheprovider"
 
 [[tool.mypy.overrides]]
-# Pending xs-045 U8 / U9b and cr-203 U11b: these files still speak the v1 TensorFS API and
-# skip at import until those units port them.
-module = ["test_baked_variant", "test_client_scripts", "test_construction_dtype", "test_constructor_initialization", "test_encoded_residency", "test_fetch_load", "test_lora_bake_plane", "test_lora_consumer_bake", "test_lora_encoded_base", "test_lora_peft", "test_model_artifact_calls", "test_model_reader", "test_model_runtime_closure", "test_mps", "test_on_demand_models", "test_one_invoke", "test_parallel_calls", "test_partial_binding", "test_quantize_artifact_native", "test_runtime_quantize_operations"]
+# Pending xs-045 U8: the MPS platform proof (platforms.yaml) still speaks the v1 TensorFS API and
+# skips at import until it is ported.
+module = ["test_mps"]
 ignore_errors = true
 
 [build-system]
@@ -84,6 +84,11 @@ packages = ["src/cozy_runtime"]
 package = true
 # The historical SDXL development corpus keeps its own locked dependency cohort.
 conflicts = [[{ extra = "corpus" }, { group = "diffusers" }]]
+
+# TensorFS 0.13 is unreleased: an exact cozy-creator commit (xs053/tfs-hard-cut) until the cohort
+# publishes it (never a test publish). The release replaces this with the version.
+[tool.uv.sources]
+tensorfs = { git = "https://github.com/cozy-creator/cozy-creator.git", rev = "f91d904e5d8c7f676bd7aa4071225b93596bcf45", subdirectory = "crates/tensorfs-py" }
 
 [tool.mypy]
 python_version = "3.12"

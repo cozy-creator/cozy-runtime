@@ -25,6 +25,17 @@ class Command(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True, tag
     """One worker command; `cmd` names it."""
 
 
+class TensorFSOptions(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
+    """Ordinary endpoint settings and an already supplied bearer credential."""
+
+    endpoint: str
+    token: str | None = None
+    ca_der: str | None = None
+
+    def __repr__(self) -> str:
+        return f"TensorFSOptions(endpoint={self.endpoint!r}, token=<redacted>)"
+
+
 class Hello(Command, frozen=True, kw_only=True, tag="hello"):
     pass
 
@@ -226,9 +237,10 @@ LOAD_ATTENTION_PIN = "attention.load_pin/1"
 
 class Load(Command, frozen=True, kw_only=True, tag="load"):
     """Ask Runtime to construct models and register their weights with its memory, read through
-    TensorD's grants. The command names one model (`binding`) or several (`models`)."""
+    TensorFS. The command names one model (`binding`) or several (`models`)."""
 
     construction: str
+    tensorfs: TensorFSOptions | None = None
     devices: str = ""
     sequence_parallel_degree: int = 1
     #: the pin of the request this executor loads for (`LOAD_ATTENTION_PIN`)
@@ -288,6 +300,7 @@ class PrepareRequest(_Attempt, frozen=True, kw_only=True, tag="prepare_request")
 
 class Invoke(_Attempt, frozen=True, kw_only=True, tag="invoke"):
     entrypoint: str
+    tensorfs: TensorFSOptions | None = None
     spool: str
     deadline_s: float | None
     inputs: dict[str, InputFile] = {}
@@ -299,10 +312,13 @@ class Invoke(_Attempt, frozen=True, kw_only=True, tag="invoke"):
     construction: str = ""
     attention_kernel: str = ""
     bits: int = 0  # as `PrepareRequest.bits`
-    #: Each `Weights[M]` parameter's checkpoint, read through the owner's source channel.
+    #: Each `Weights[M]` parameter's checkpoint, opened directly through TensorFS.
     sources: dict[str, _MANIFEST] = {}
     #: The weights outputs this attempt may write, and each one's granted new bytes.
     weights: dict[str, int] = {}
+    destination: str = ""
+    actor: str = ""
+    operation: str = ""
 
 
 type KnownCommand = (

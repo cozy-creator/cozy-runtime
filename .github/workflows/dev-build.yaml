@@ -63,10 +63,6 @@ jobs:
         with:
           repo-token: ${{ github.token }}
       - run: uv python install 3.12
-      - name: TensorFS read access (an arm runner builds TensorFS from its tag)
-        env:
-          TENSORFS_KEY: ${{ secrets.TENSORFS_READ_KEY }}
-        run: bash source/scripts/prepare-release-source-access.sh
       # An arm runner builds the locked TensorFS from its tag until TensorFS publishes aarch64 wheels.
       - working-directory: source
         run: |

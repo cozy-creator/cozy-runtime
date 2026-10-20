@@ -57,7 +57,7 @@ class EncodedLeafDtypeTest(unittest.TestCase):
         original = torch.nn.Linear(256, 16, dtype=torch.float16)
         original.weight.data.copy_(weight)
         leaf = Int8ConvRotNativeLeaf(
-            params=params_of({"rotation": "hadamard", "rotation_size": 256, "scale_dtype": "F32"})
+            params=params_of({"rotation": "kron_regular_h4", "rotation_size": 256, "scale_dtype": "F32"})
         ).leaf(torch, {"weight": data, "scale": scale}, original, torch.float16)
         x = torch.randn(4, 256, generator=generator)
         expected = original.to(torch.float32)(x)

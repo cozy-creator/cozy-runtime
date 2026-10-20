@@ -1,8 +1,8 @@
-"""Lane derivations: normalize floats to bf16 and encode selected weights, through TensorD.
+"""Lane derivations: normalize floats to bf16 and encode selected weights, in the store.
 
-A derivation reads one granted source (`tensord_channels.Source`) and writes one output
-(`Output`) whose base is that source: every tensor and file it does not write again carries
-over, in the source's construction order. Writes are resumable: a tensor TensorD journaled
+A derivation reads one source checkpoint and writes one output (`weights_store.Output`) whose
+base is that source: every component and tensor it does not write again carries over, in the
+source's construction order. Writes are resumable: a tensor an interrupted attempt wrote
 (`has`) is not computed again.
 """
 
@@ -24,7 +24,7 @@ import numpy as np
 from cozy_runtime._cpus import cpus
 from cozy_runtime.author import Context, Telemetry, UnsupportedInput, _numeric
 from cozy_runtime.author._loader import TENSORFS_DTYPES, TENSORFS_NAMES
-from cozy_runtime.tensord_channels import Output, PartData, Source
+from cozy_runtime.weights_store import Checkpoint, Output, PartData, read_into
 
 from . import safetensors_io as st
 from .microscale import (
@@ -79,7 +79,7 @@ _ENCODINGS: dict[str, _Encoding] = {
         _rowwise(encode_int8_convrot256),
         "I8",
         CONVROT_GROUP,
-        {"rotation": "hadamard", "rotation_size": CONVROT_GROUP, "scale_dtype": "F32"},
+        {"rotation": "kron_regular_h4", "rotation_size": CONVROT_GROUP, "scale_dtype": "F32"},
         _row_scale,
     ),
     # A block's error is at most half its largest E2M1 step (2 of 6) times its scale, and a
@@ -117,10 +117,10 @@ class SourceTensor(NamedTuple):
     plain: bool
 
 
-def source_rows(source: Source) -> Iterator[tuple[str, str, SourceTensor]]:
+def source_rows(source: Checkpoint) -> Iterator[tuple[str, str, SourceTensor]]:
     """The source's tensors in construction order."""
-    for component, tensors in source.checkpoint.tensors.items():
-        for key, info in tensors.items():
+    for component, held in source.components.items():
+        for key, info in held.tensors.items():
             dtype = TENSORFS_DTYPES.get(info.dtype, info.dtype)
             yield component, key, SourceTensor(dtype, tuple(info.shape), info.encoding is None)
 
@@ -192,7 +192,7 @@ def bf16_source_dtypes(sources: Sequence[str]) -> tuple[str, ...]:
 
 
 def prepare_bf16(
-    source: Source, *, keep: tuple[str, ...] = (), source_dtypes: tuple[str, ...] = ("f32",)
+    source: Checkpoint, *, keep: tuple[str, ...] = (), source_dtypes: tuple[str, ...] = ("f32",)
 ) -> Bf16Plan:
     """Normalize selected plain floats; other tensors carry over unchanged."""
     source_dtypes = bf16_source_dtypes(source_dtypes)
@@ -225,7 +225,7 @@ def column_block(encoding: str | None) -> int:
 
 
 def prepare_source_quantization(
-    source: Source, *, components: tuple[str, ...], block: int = 32
+    source: Checkpoint, *, components: tuple[str, ...], block: int = 32
 ) -> ArtifactQuantizationPlan:
     """Select plain rank-2 float weights whose columns are a multiple of the scheme's `block`."""
     rows = list(source_rows(source))
@@ -248,7 +248,7 @@ def prepare_source_quantization(
 
 
 def write_bf16(
-    source: Source,
+    source: Checkpoint,
     output: Output,
     ctx: Context,
     tel: Telemetry,
@@ -310,7 +310,7 @@ def write_bf16(
 
 
 def quantize_component_into(
-    source: Source,
+    source: Checkpoint,
     output: Output,
     ctx: Context,
     payload: ArtifactQuantizationRequest,
@@ -412,7 +412,7 @@ class _Encoded(NamedTuple):
 
 
 def _encode_tensor(
-    source: Source, encoding: str, tensor: QuantizationTensor, stop: threading.Event
+    source: Checkpoint, encoding: str, tensor: QuantizationTensor, stop: threading.Event
 ) -> _Encoded:
     encoder = _ENCODINGS[encoding]
     expected = encoder.companions(*tensor.shape)
@@ -501,7 +501,7 @@ def _pool() -> ThreadPoolExecutor:
 
 
 def _read_chunks(
-    source: Source, component: str, key: str, logical_dtype: str, shape: tuple[int, ...]
+    source: Checkpoint, component: str, key: str, logical_dtype: str, shape: tuple[int, ...]
 ) -> Iterator[np.ndarray]:
     """Whole rows of float32 values, about `_SOURCE_READ_CHUNK` source bytes at a time."""
     itemsize = _WIDTH[logical_dtype]
@@ -511,7 +511,7 @@ def _read_chunks(
     for first in range(0, rows, step):
         count = min(step, rows - first)
         raw = bytearray(count * row_bytes)
-        source.read_into(component, key, "", first * row_bytes, raw)
+        read_into(source, component, key, "", first * row_bytes, raw)
         values = st.to_f32(raw, TENSORFS_NAMES[logical_dtype], [count, *tail] if shape else [])
         if not bool(np.isfinite(values).all()):
             raise UnsupportedInput(f"source {component}.{key} contains non-finite weights")
