@@ -767,7 +767,8 @@ class _Pin:
 
     @contextmanager
     def serving(self) -> Iterator[bool]:
-        if self.retired:
+        retired = self.retired
+        if retired:
             yield False
             return
         with self.cache.serving():
