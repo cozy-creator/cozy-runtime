@@ -317,6 +317,23 @@ class MemoryReceipts(unittest.TestCase):
         self.assertIn("missing-transfer-minimum-evidence", text)
         self.assertNotIn("copy-percentage-mismatch", text)
 
+    def test_complete_nonzero_proof_reaches_record_without_claiming_a_minimum(self):
+        value = slim_positive()
+        memory = value["calls"][0]["measurements"]["memory"]
+        proof, trace = proof_and_trace([1], {1: 1_000_000_000}, 2_000_000_000)
+        trace.insert(1, dict(trace[1], kind="fill"))
+        for index, event in enumerate(trace):
+            event["sequence"] = index
+        memory["trace"] = trace
+        memory["stats"].update(paged_in=1_000_000_000, copies=[measured_copy()], proofs=[proof])
+        code, text = self.record(value, slim="slim")
+        self.assertEqual(code, 0, text)
+        self.assertIn("h2d_window_lower_bound=1000000000B", text)
+        self.assertIn("h2d_bound_status=sufficient", text)
+        self.assertIn("transfer_minimum=unknown", text)
+        proof["complete"] = False
+        self.assertIn("incomplete-transfer-proof", self.record(value, slim="slim")[1])
+
     def test_missing_or_impossible_copy_measurements_cannot_pass(self):
         cases = [
             ("seconds", 0, "invalid-copy-measurement"),
