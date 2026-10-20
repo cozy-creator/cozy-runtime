@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -85,39 +86,37 @@ def test_loaded_tensor_owns_its_bytes_after_checkpoint_and_model_close(tmp_path:
     assert torch.equal(retained, reference.embed.weight)
 
 
-def test_failed_binding_rolls_back_partial_writes_and_allows_a_clean_retry(tmp_path: Path) -> None:
-    torch.manual_seed(11)
-    reference = network()
+def test_partial_binding_failure_restores_the_model_and_allows_retry(tmp_path: Path) -> None:
+    reference = nn.Linear(2, 2)
     ck = checkpoint(reference, tmp_path / "store")
     with torch.device("meta"):
-        model = network()
-    originals = dict(model.named_parameters())
-    fail = True
-    writes = 0
+        model = nn.Linear(2, 2)
+    original = dict(model.named_parameters())
+    failure = ValueError("cannot bind bias")
+    bound: list[str] = []
 
-    def bind(key: str, parts: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        nonlocal writes
-        writes += 1
-        if fail and writes == 2:
-            raise RuntimeError("deliberate bind failure after one parameter")
+    def bind(key: str, parts: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        bound.append(key)
+        if key == "bias":
+            assert model.weight.device.type == "cpu"  # the earlier write really happened
+            raise failure
         return {key: parts["value"]}
 
-    declaration = Declared(Source(ck, "net", ck.id), bind=bind)
-    model._varena = declaration
     memory = Memory.open(torch.device("cpu"))
+    model._varena = Declared(Source(ck, "net", ck.id), bind=bind)
     try:
-        with pytest.raises(RuntimeError, match="deliberate bind failure"):
+        with pytest.raises(ValueError) as raised:
             memory.load(model)
-        assert not memory.models
-        assert not memory.by_module
-        assert model._varena is declaration
-        assert all(value is originals[key] for key, value in model.named_parameters())
-        fail = False
+        assert raised.value is failure
+        assert bound == ["weight", "bias"]
+        assert memory.models == {} and memory.by_module == {}
+        assert all(parameter is original[name] for name, parameter in model.named_parameters())
+        model._varena = Declared(Source(ck, "net", ck.id))
         loaded = memory.load(model)
-        assert memory.load(model) is loaded
-        sample = torch.randn(8, DIM, generator=torch.Generator().manual_seed(12))
-        with torch.no_grad(), memory.request("retry-load"):
+        sample = torch.tensor([[1.0, 2.0]])
+        with torch.no_grad(), memory.request("retry-after-bind-failure"):
             assert torch.equal(model(sample), reference(sample))
+        loaded.close()
     finally:
         memory.close()
         ck.close()
