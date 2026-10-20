@@ -8,9 +8,9 @@ The outer Runtime launches a standalone Rust binary; it does not replace the wor
 The binary checks its actual visible GPU and runs each case in a fresh process.
 The required suite JSON keeps the ten base cases and opts into placement proofs:
 {"warm_admission": false|true, "pin_readiness": false|true, "failed_fills": false|true,
- "declared_step": false|true}.
-Omitting optional keys preserves the old ten/eleven/twelve/thirteen-case inputs. All true
-requires fourteen cases from the updated placement binary; coverage is explicit
+ "declared_step": false|true, "lower_targets": false|true}.
+Omitting optional keys preserves the old ten/eleven/twelve/thirteen/fourteen-case inputs.
+All true requires fifteen cases from the updated placement binary; coverage is explicit
 in result.json.
 """
 from pathlib import Path
@@ -51,16 +51,18 @@ def main(*, binary: Annotated[FileAsset, AssetBound(max_bytes=67108864)],
          suite: Annotated[FileAsset, AssetBound(max_bytes=4096)], out: Outputs) -> Tree:
     selection = json.loads(suite.read_bytes())
     if (not isinstance(selection, dict) or "warm_admission" not in selection
-            or set(selection) - {"warm_admission", "pin_readiness", "failed_fills", "declared_step"}
+            or set(selection) - {"warm_admission", "pin_readiness", "failed_fills", "declared_step", "lower_targets"}
             or type(selection["warm_admission"]) is not bool
             or ("pin_readiness" in selection and type(selection["pin_readiness"]) is not bool)
             or ("failed_fills" in selection and type(selection["failed_fills"]) is not bool)
-            or ("declared_step" in selection and type(selection["declared_step"]) is not bool)):
-        raise ValueError('suite requires boolean warm_admission; pin_readiness, failed_fills and declared_step are optional booleans')
+            or ("declared_step" in selection and type(selection["declared_step"]) is not bool)
+            or ("lower_targets" in selection and type(selection["lower_targets"]) is not bool)):
+        raise ValueError('suite requires boolean warm_admission; pin_readiness, failed_fills, declared_step and lower_targets are optional booleans')
     warm_admission = selection["warm_admission"]
     pin_readiness = selection.get("pin_readiness", False)
     failed_fills = selection.get("failed_fills", False)
     declared_step = selection.get("declared_step", False)
+    lower_targets = selection.get("lower_targets", False)
     root = Path(tempfile.mkdtemp(prefix="varena-slim-gpu-"))
     executable = root / "slim-gpu"
     executable.write_bytes(binary.read_bytes())
@@ -98,6 +100,12 @@ def main(*, binary: Annotated[FileAsset, AssetBound(max_bytes=67108864)],
             "placement::gpu_tests::repeated_component_forward_keeps_its_declared_step",
             "PASS repeated component forward keeps its declared step",
         ))
+    if lower_targets:
+        cases.append((
+            placement_executable,
+            "placement::gpu_tests::lower_relief_keeps_fitting_home_and_requires_real_reclaim",
+            "PASS controlled lower preserves fitting home, pins and bounded physical reclaim",
+        ))
     for program, name, marker in cases:
         command = [str(program), "--ignored", "--exact", name, "--nocapture", "--test-threads=1"]
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -129,5 +137,5 @@ def main(*, binary: Annotated[FileAsset, AssetBound(max_bytes=67108864)],
         if len(gpu_uuids) != 1:
             raise RuntimeError(f"Native GPU cases used different physical GPUs: {sorted(gpu_uuids)}")
         results.append(name)
-    (logs / "result.json").write_text(json.dumps({"passed": results, "warm_admission_requested": warm_admission, "pin_readiness_requested": pin_readiness, "failed_fills_requested": failed_fills, "declared_step_requested": declared_step, "gpu_uuid": next(iter(gpu_uuids)), "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES")}, indent=2))
+    (logs / "result.json").write_text(json.dumps({"passed": results, "warm_admission_requested": warm_admission, "pin_readiness_requested": pin_readiness, "failed_fills_requested": failed_fills, "declared_step_requested": declared_step, "lower_targets_requested": lower_targets, "gpu_uuid": next(iter(gpu_uuids)), "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES")}, indent=2))
     return out.save_tree(logs)
