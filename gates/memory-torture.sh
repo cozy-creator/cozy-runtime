@@ -49,6 +49,10 @@ while [ $# -gt 0 ]; do
 done
 [ -f "$W" ] && W=$(realpath "$W")
 [ -n "$IMG" ] && [ -n "$BW" ] && { echo "--baseline-wheel would replace the pinned image's Runtime" >&2; exit 2; }
+if [ -n "$SLIM" ]; then
+  [ -n "$ON" ] || { echo '--slim requires an explicitly owned rental via --on' >&2; exit 2; }
+  [ -n "$BASE$BW" ] || { echo '--slim requires a production baseline; performance cannot pass without one' >&2; exit 2; }
+fi
 [ -z "$CARDS" ] && { [ -n "$MATRIX" ] && CARDS="8 12 24 2x8" || CARDS="8 12 24 32 2x8"; }
 declare -A SKUS=([8]="rtx-3070 rtx-3060-ti" [12]="rtx-4070-super rtx-5070 rtx-3080-ti rtx-4070-ti rtx-3060"
   [16]="rtx-4080-super rtx-4060-ti rtx-5060-ti" [24]="rtx-4090" [32]="rtx-pro-4500 rtx-5090" [2x8]="rtx-3070 rtx-3060-ti"
@@ -60,7 +64,6 @@ if [ -n "$ON" ]; then
   read -r -a selected_cards <<< "$CARDS"
   [ "${#selected_cards[@]}" = 1 ] || { echo '--on requires one card/cap at a time; reuse the rental sequentially' >&2; exit 2; }
 fi
-[ -z "$SLIM" ] || [ -n "$ON" ] || { echo '--slim requires an explicitly owned rental via --on' >&2; exit 2; }
 TAG=$(basename "$D") FAILED=0 M="" FOLLOW="" ONLY="" SUBST=""
 say() { echo "$(date -u +%T) $*" | tee -a summary.txt; }
 release() {  # end the machine this script rented, once its outputs landed, and confirm it is gone
