@@ -167,15 +167,9 @@ def test_real_cpu_context_stats_map_logical_two_gpu_facts_to_lane_two_three() ->
             )
             for kind, gpu in (("h2d", ordinal), ("disk", -1))
         )
-        facts = dataclasses.replace(
-            source,
-            steps=(step,),
-            leftover=((ordinal, ordinal + 2),),
-            copied=ordinal + 1,
-            retries=ordinal,
-            copies=copies,
-            evictions=(Eviction("transformer", ordinal, 2, "room", 4),),
-            proofs=(
+        proof_fields = {}
+        if hasattr(source, "proofs"):
+            proof_fields["proofs"] = (
                 {
                     "request": "cpu",
                     "gpu": ordinal,
@@ -187,7 +181,16 @@ def test_real_cpu_context_stats_map_logical_two_gpu_facts_to_lane_two_three() ->
                     "initial": [1],
                     "invalid": [],
                 },
-            ),
+            )
+        facts = dataclasses.replace(
+            source,
+            steps=(step,),
+            leftover=((ordinal, ordinal + 2),),
+            copied=ordinal + 1,
+            retries=ordinal,
+            copies=copies,
+            evictions=(Eviction("transformer", ordinal, 2, "room", 4),),
+            **proof_fields,
         )
         measured = request_memory.measured(facts, [2, 3])
         assert measured is not None
@@ -198,9 +201,12 @@ def test_real_cpu_context_stats_map_logical_two_gpu_facts_to_lane_two_three() ->
     assert [row.gpu for row in result.rows] == [2, 3]
     assert [row.gpu for row in result.evictions] == [2, 3]
     assert [row.gpu for row in result.copies] == [2, -1, 3, -1]
-    assert [row.gpu for row in result.proofs] == [2, 3]
-    assert result.proofs[0].pages[0].payload == 3
-    assert result.proofs[0].pages[0].mapped == 8
+    if hasattr(source, "proofs"):
+        assert [row.gpu for row in result.proofs] == [2, 3]
+        assert result.proofs[0].pages[0].payload == 3
+        assert result.proofs[0].pages[0].mapped == 8
+    else:
+        assert not result.proofs, "older TensorFS cannot provide proof evidence"
     assert result.steps == {"transformer": [3]} and result.paged_in == 3 and result.retries == 1
     assert result.plan == [["transformer"]]
     with pytest.raises(ValueError, match="duplicate physical"):

@@ -99,7 +99,7 @@ def measured(
                 TransferProof,
                 strict=True,
             )
-            for proof in request.proofs
+            for proof in getattr(request, "proofs", ())
         ],
     )
 
