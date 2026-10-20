@@ -85,10 +85,10 @@ package = true
 # The historical SDXL development corpus keeps its own locked dependency cohort.
 conflicts = [[{ extra = "corpus" }, { group = "diffusers" }]]
 
-# TensorFS 0.13 is unreleased: an exact cozy-creator commit (xs053/tfs013-integration) until the
+# TensorFS 0.13 is unreleased: an exact cozy-creator commit (xs053/tfs013-named-checkpoints) until the
 # cohort publishes it (never a test publish). The release replaces this with the version.
 [tool.uv.sources]
-tensorfs = { git = "https://github.com/cozy-creator/cozy-creator.git", rev = "9bb3bb97281fee0b2f883930c1ea42891437db9a", subdirectory = "crates/tensorfs-py" }
+tensorfs = { git = "https://github.com/cozy-creator/cozy-creator.git", rev = "ddee093df6c8ff59e6d75b549a6b70dbd4333b91", subdirectory = "crates/tensorfs-py" }
 
 [tool.mypy]
 python_version = "3.12"
