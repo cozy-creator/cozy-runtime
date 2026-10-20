@@ -4,8 +4,8 @@
 # ///
 """Measure the real store and assigned GPUs before the model matrix.
 
-Run through cozy run --on RENTAL --gpus N, after the reference-image run has
-downloaded weights. The child uses the supplied TensorFS wheel in isolation;
+Run through cozy run --on RENTAL --gpus N before the model matrix. The child
+uses the supplied TensorFS wheel in isolation;
 the outer Runtime and worker installation are not changed by this script.
 TensorFS owns both probes and keeps their results in the sealed shared store.
 """
@@ -28,6 +28,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import tempfile
 
 sys.path.insert(0, sys.argv[1])
 import tensorfs
@@ -46,18 +47,29 @@ count = ctypes.c_int()
 checked('cuDeviceGetCount', ctypes.byref(count))
 assert 1 <= count.value <= 2, f'expected one or two assigned GPUs, got {count.value}'
 devices = []
-for device in range(count.value):
-    uuid = (ctypes.c_ubyte * 16)()
-    checked('cuDeviceGetUuid', ctypes.byref(uuid), device)
-    measured = ceiling(device=device, path=home)
-    assert measured.disk_direct, 'the store filesystem refused uncached disk measurement'
-    assert measured.disk_gbps > 0 and measured.h2d_gbps > 0
-    assert measured.streams in (1, 2, 4), measured.streams
-    devices.append({
-        'device': device, 'uuid': bytes(uuid).hex(),
-        'disk_gbps': measured.disk_gbps, 'disk_direct': measured.disk_direct,
-        'h2d_gbps': measured.h2d_gbps, 'streams': measured.streams,
-    })
+# A private, non-sparse fixture measures the same volume even before the first
+# model arrives. TensorFS performs the actual O_DIRECT reads and H2D probes.
+scratch = home / 'tmp'
+scratch.mkdir(exist_ok=True)
+with tempfile.TemporaryDirectory(prefix='slim-ceiling-', dir=scratch) as folder:
+    sample = Path(folder) / 'probe.bin'
+    with sample.open('wb') as stream:
+        for _ in range(32):
+            stream.write(os.urandom(8 << 20))
+        stream.flush()
+        os.fdatasync(stream.fileno())
+    for device in range(count.value):
+        uuid = (ctypes.c_ubyte * 16)()
+        checked('cuDeviceGetUuid', ctypes.byref(uuid), device)
+        measured = ceiling(device=device, path=sample)
+        assert measured.disk_direct, 'the store filesystem refused uncached disk measurement'
+        assert measured.disk_gbps > 0 and measured.h2d_gbps > 0
+        assert measured.streams in (1, 2, 4), measured.streams
+        devices.append({
+            'device': device, 'uuid': bytes(uuid).hex(),
+            'disk_gbps': measured.disk_gbps, 'disk_direct': measured.disk_direct,
+            'h2d_gbps': measured.h2d_gbps, 'streams': measured.streams,
+        })
 print(json.dumps({
     'tensorfs': importlib.metadata.version('tensorfs'), 'store': str(home),
     'cuda_visible_devices': os.environ.get('CUDA_VISIBLE_DEVICES'),
