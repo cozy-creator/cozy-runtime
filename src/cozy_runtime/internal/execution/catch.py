@@ -158,7 +158,7 @@ def _clear(exc: BaseException) -> None:
 
 
 def _capturing() -> bool:
-    return torch.cuda.is_initialized() and torch.cuda.is_current_stream_capturing()
+    return bool(torch.cuda.is_initialized() and torch.cuda.is_current_stream_capturing())
 
 
 # ------------------------------------------------------------------------------ answers
@@ -348,7 +348,7 @@ def wrap(
                 return forward(*args, **kwargs)
             return run(block, module, forward, args, kwargs)
 
-    module.forward = caught  # type: ignore[method-assign]
+    module.forward = caught
 
 
 def run[T](
@@ -417,7 +417,7 @@ def _layer() -> Iterator[Layer]:
 
 def _kept(root: nn.Module, paths: Sequence[str]) -> Callable[[], None]:
     """Declared state as it is now, and how to put it back (lists and dicts by their items)."""
-    taken = []
+    taken: list[tuple[object, str, object, object]] = []
     for path in paths:
         where, _, attr = path.rpartition(".")
         owner = functools.reduce(getattr, where.split("."), root) if where else root
@@ -429,9 +429,11 @@ def _kept(root: nn.Module, paths: Sequence[str]) -> Callable[[], None]:
             if value is _MISSING:
                 vars(owner).pop(attr, None)
                 continue
-            if isinstance(value, list | dict):
+            if isinstance(value, dict) and isinstance(items, dict):
                 value.clear()
-                (value.update if isinstance(value, dict) else value.extend)(items)
+                value.update(items)
+            elif isinstance(value, list) and isinstance(items, list):
+                value[:] = items
             setattr(owner, attr, value)
 
     return put
@@ -510,7 +512,7 @@ class _Journal:
             self.made.update(map(_storage, tensors(out)))
 
 
-class Layer(TorchDispatchMode):
+class Layer(TorchDispatchMode):  # type: ignore[misc]
     """Every op, caught at itself."""
 
     def __init__(self) -> None:
@@ -523,7 +525,7 @@ class Layer(TorchDispatchMode):
     def _should_skip_dynamo(cls) -> bool:
         return False  # nothing compiles here: no Dynamo wrapper around every op
 
-    def __torch_dispatch__(  # type: ignore[override]
+    def __torch_dispatch__(
         self, func: OpOverload, types: object, args: Args = (), kwargs: Kwargs | None = None
     ) -> object:
         kwargs = kwargs or {}

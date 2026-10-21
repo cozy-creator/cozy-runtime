@@ -494,11 +494,6 @@ class Backend(Protocol):
         component outside the set stays on meta: never fit, filled or registered."""
         ...
 
-    def ahead(self) -> None:
-        """Before the factory runs: what needs no module starts now (a held host tier's copies
-        to the GPU run while the module is built)."""
-        ...
-
     def fit(self, walked: Census, *, encoded_leaves: str) -> Fit | None:
         """The one verdict, or None when this backend holds no checkpoint header to judge
         against (derive mode; a local lane tree). The runtime keeps no other matcher."""
@@ -524,9 +519,6 @@ class _NullBackend:
     """Derive mode's backend: the walk runs, nothing is judged, allocated or filled."""
 
     bound: frozenset[str] | None = None
-
-    def ahead(self) -> None:
-        return None
 
     def fit(self, walked: Census, *, encoded_leaves: str) -> Fit | None:
         return None
@@ -780,9 +772,6 @@ class Loader:
                 else {key: spec.dtype for key, spec in self._artifact.tensor_schema.items()},
                 bound=self._backend.bound,
             )
-        self._backend.ahead()
-        _legs.append(("ahead", round((time.perf_counter() - _t0) * 1000, 1)))
-        _t0 = time.perf_counter()
         construction = CONSTRUCTION.set(object())
         try:
             obj = factory(config)

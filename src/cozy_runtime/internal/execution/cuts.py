@@ -12,6 +12,7 @@ from __future__ import annotations
 import functools
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from typing import cast
 
 import torch
 from torch import Tensor, nn
@@ -133,7 +134,7 @@ def _axis(x: Tensor) -> int:
 
 def _each(value: object, n: int, default: int) -> list[int]:
     values = list(value) if isinstance(value, list | tuple) else [value or default]
-    return [int(v) for v in values] * (n if len(values) == 1 else 1)  # type: ignore[call-overload]
+    return [int(cast(int, v)) for v in values] * (n if len(values) == 1 else 1)
 
 
 def _pointwise(func: OpOverload, args: Args, kwargs: Kwargs) -> Plan | None:
@@ -229,7 +230,7 @@ def _group_norm(func: OpOverload, args: Args, kwargs: Kwargs) -> Plan | None:
     pass over all of it would be (up to rounding); then each band normalized."""
     a = _arguments(func, args, kwargs)
     x, weight, bias = a.get("input"), a.get("weight"), a.get("bias")
-    groups = int(a.get("num_groups", a.get("group")) or 1)  # type: ignore[call-overload]
+    groups = int(cast(int, a.get("num_groups", a.get("group")) or 1))
     eps = float(a.get("eps") or 1e-5)  # type: ignore[arg-type]
     if not isinstance(x, Tensor) or x.dim() < 3 or x.shape[1] % groups:
         return None
@@ -285,11 +286,11 @@ def install(module: nn.Module) -> int:
         kinds = [c.__name__ for c in type(sub).__mro__ if c.__module__.startswith("diffusers.")]
         rms = _rms_contract(sub, kinds)
         if rms is not None and "_cozy_cut" not in vars(sub):
-            sub.forward = _rms(f"{path}:rows", *rms, sub.forward)  # type: ignore[method-assign]
+            sub.forward = _rms(f"{path}:rows", *rms, sub.forward)
             vars(sub)["_cozy_cut"] = True
             count += 1
         if any(k in _FFN for k in kinds) and "_cozy_cut" not in vars(sub):
-            sub.forward = _ffn(f"{path}:tokens", sub.forward)  # type: ignore[method-assign]
+            sub.forward = _ffn(f"{path}:tokens", sub.forward)
             vars(sub)["_cozy_cut"] = True
             count += 1
     return count

@@ -100,7 +100,7 @@ def attention_backend() -> AttentionBackendName:
     return attention_ulysses.member("_cozy_test_execution", local)
 
 
-class Block(nn.Module):
+class Block(nn.Module):  # type: ignore[misc]
     """Self-attention through the Runtime's attention dispatch, then Diffusers' FeedForward."""
 
     def __init__(self, dim: int, heads: int) -> None:
@@ -119,7 +119,7 @@ class Block(nn.Module):
         return x + torch.nn.functional.silu(self.ff(self.norm2(x)))
 
 
-class Transformer(nn.Module):
+class Transformer(nn.Module):  # type: ignore[misc]
     _no_split_modules = ("Block",)
 
     def __init__(self, dim: int = 64, heads: int = 4, depth: int = 3) -> None:
@@ -136,7 +136,9 @@ class Transformer(nn.Module):
 
 def transformer() -> Transformer:
     torch.manual_seed(0)
-    return Transformer().to(torch.bfloat16).eval()
+    model = Transformer()
+    model.to(torch.bfloat16).eval()
+    return model
 
 
 # --------------------------------------------------------------------------- a tiny VAE

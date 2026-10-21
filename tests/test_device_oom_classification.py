@@ -5,6 +5,8 @@ any other CUDA or NCCL error ends the executor. varena's `Exhausted` is capacity
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from cozy_runtime.author._errors import (
@@ -54,7 +56,7 @@ def test_torch_s_oom_type_and_cuda_codes() -> None:
     assert fault(torch.OutOfMemoryError()) is Fault.OOM
     assert classify(torch.OutOfMemoryError("CUDA out of memory.")).code == DEVICE_OOM
 
-    def accelerator(code: int) -> BaseException:
+    def accelerator(code: int) -> Any:
         exc = torch.AcceleratorError(f"CUDA error {code}")
         exc.error_code = code  # torch sets it from cudaError_t
         return exc

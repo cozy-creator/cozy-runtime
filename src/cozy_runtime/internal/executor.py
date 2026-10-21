@@ -1023,7 +1023,8 @@ class Executor:
     def _open_memory(self, torch: Any) -> None:
         """This process's memory (`tensorfs.varena.torch`), on its grant from TensorD, and the
         execution layer that runs torch under it."""
-        from tensorfs.varena.torch import Grant, Memory
+        from tensorfs.varena import Grant
+        from tensorfs.varena.torch import Memory
 
         from cozy_runtime.internal import execution
 

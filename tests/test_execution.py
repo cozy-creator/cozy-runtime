@@ -184,7 +184,7 @@ def test_each_band_rule_is_the_whole_op(dtype: Any) -> None:
         plan = catch.RULES[func.overloadpacket](func, args, {})
         assert plan is not None and plan.finest >= 3, name
         for level in (1, 2, 3):
-            got = plan(catch.Scope(name, plan.finest, level))
+            got: Any = plan(catch.Scope(name, plan.finest, level))
             if name == "group_norm":
                 torch.testing.assert_close(got[0], whole[0], rtol=2**-20, atol=2**-20)
             elif name in ("silu", "gelu") and dtype == torch.float32:
@@ -193,7 +193,7 @@ def test_each_band_rule_is_the_whole_op(dtype: Any) -> None:
                 assert torch.equal(got, whole), (name, level)
 
 
-class Tiles(nn.Module):
+class Tiles(nn.Module):  # type: ignore[misc]
     """A decoder whose forward splits itself by batch (`author.split`)."""
 
     def __init__(self) -> None:
@@ -206,7 +206,9 @@ class Tiles(nn.Module):
 
 def tiles() -> Tiles:
     torch.manual_seed(4)
-    return Tiles().to(BF16).eval()
+    tiles = Tiles()
+    tiles.to(BF16).eval()
+    return tiles
 
 
 def test_a_package_split_runs_in_the_windows_rust_cuts(tmp_path: Path) -> None:
@@ -243,7 +245,7 @@ class FailsAfter(TorchDispatchMode):  # type: ignore[misc]
         return out
 
 
-class Accumulates(nn.Module):
+class Accumulates(nn.Module):  # type: ignore[misc]
     """Adds its input into a tensor that existed before it ran (a KV cache's shape)."""
 
     def __init__(self, held: Any) -> None:
@@ -255,7 +257,7 @@ class Accumulates(nn.Module):
         return self.held * 2
 
 
-class Fresh(nn.Module):
+class Fresh(nn.Module):  # type: ignore[misc]
     """Writes only into what it made, and draws from the default generator."""
 
     def forward(self, x: Any) -> Any:
@@ -286,11 +288,11 @@ def test_a_failed_write_is_never_run_again(tmp_path: Path) -> None:
 
 def test_a_bare_block_runs_again_with_its_generators_and_declared_state_back() -> None:
     root = nn.Module()
-    root.seen = []  # type: ignore[assignment]
+    root.seen = []
     fresh = Fresh()
 
     def forward(x: Any) -> Any:
-        root.seen.append(1)  # type: ignore[operator, union-attr]
+        root.seen.append(1)
         return Fresh.forward(fresh, x)
 
     fresh.forward = forward  # type: ignore[method-assign]
@@ -301,12 +303,13 @@ def test_a_bare_block_runs_again_with_its_generators_and_declared_state_back() -
     mem = memory()
     with torch.no_grad(), mem.request("bare") as r, execution.serving(r):
         fresh(x)
-        assert block.bare is True, "a block writing only what it made stayed under the layer"
+        bare = [block.bare]  # a block writing only what it made runs bare
         torch.manual_seed(7)
         with FailsAfter(torch.ops.aten.sin.default) as mode:  # out of memory at its last op
             got = fresh(x)
+        bare.append(block.bare)  # it ran short: under the layer from now on
     assert mode.attempts == 2 and torch.equal(got, reference)
-    assert block.bare is False and root.seen == [1, 1], root.seen  # type: ignore[attr-defined]
+    assert bare == [True, False] and root.seen == [1, 1], (bare, root.seen)
 
 
 # ----------------------------------------------------------------------------- collectives

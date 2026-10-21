@@ -436,15 +436,6 @@ class Backend:
         execution.install(root, getattr(root, "_cozy_state", ()))
         return model
 
-    def _owner(self, module: object) -> tuple[str, str] | None:
-        """The checkpoint (its content id) and module path of the loaded component holding
-        `module`."""
-        for name, model in self.models.items():
-            for path, sub in model.module.named_modules():
-                if sub is module:
-                    return self.checkpoints[name].id, path
-        return None
-
     def _install_leaf(self, key: str) -> tuple[Any, Any, tuple[str, ...]]:
         """Replace the linear op that owns `key` with its encoded leaf, on meta. Returns the
         leaf, the replaced module, and the roles the provider derives from stored bytes."""
@@ -580,7 +571,7 @@ class _Bakes:
     def __init__(
         self, backend: Backend, root: Module, rows: Mapping[str, PlanRow], blocks: set[str]
     ) -> None:
-        self.torch, self.owner = backend.torch, backend._owner
+        self.torch = backend.torch
         self.bakes: dict[str, _Bake] = {}
         self.strategy: lora_bake.Strategy = "bake"
         self.baked = 0
@@ -614,12 +605,11 @@ class _Bakes:
                 self.bakes[stored] = bake
 
     @property
-    def identity(self) -> str | None:
+    def identity(self) -> str:
         """What a bake writes now, the same in every process (`Filling.identity`): the strategy
         and recipe (`lora_bake.recipe`), torch and the GPU's architecture, and each baked
         weight's stored name and encoding with each delta's content (a stored factor pair of
-        this checkpoint; a hook's declared identity, else the loaded component and path that
-        hold its factors), dtypes and scale. None when a delta cannot be named: never kept."""
+        this checkpoint, or the identity a hook's package declares), dtypes and scale."""
         torch = self.torch
         baked = self.strategy == "bake"
         for bake in self.bakes.values():  # each LoRA'd linear told whether its bytes carry it
@@ -638,10 +628,7 @@ class _Bakes:
                 got = hook.lora_factors()
                 if got is None:
                     continue
-                named = got[0] if isinstance(got[0], str) else self.owner(got[0])
-                if named is None:
-                    return None
-                deltas.append((named, str(got[1].dtype), str(got[2].dtype), repr(float(got[3]))))
+                deltas.append((got[0], str(got[1].dtype), str(got[2].dtype), repr(float(got[3]))))
             held.append((stored, bake.encoding, deltas))
         return repr(held)
 
