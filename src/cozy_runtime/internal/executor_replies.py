@@ -72,13 +72,26 @@ class Stats(msgspec.Struct, frozen=True, kw_only=True):
     leftover: int
 
 
+class Allocator(msgspec.Struct, frozen=True, kw_only=True):
+    """torch's caching allocator over a request on one GPU (`torch.cuda.memory_stats` deltas,
+    the device's: a request beside it on that GPU counts too): allocations retried after it
+    freed its cache, cudaMalloc and cudaFree calls, and the all-stream syncs those frees took."""
+
+    num_alloc_retries: int
+    num_device_alloc: int
+    num_device_free: int
+    num_sync_all_streams: int
+
+
 class GpuMemory(msgspec.Struct, frozen=True, kw_only=True):
     """One GPU's part of a request: its physical number, the fill ceilings there (None: not
-    measured yet), and varena's record of the request."""
+    measured yet), varena's record of the request, and torch's allocator over it (None: no
+    GPU)."""
 
     gpu: int
     ceiling: Ceiling | None
     stats: Stats
+    torch: Allocator | None
 
 
 class RankMemory(msgspec.Struct, frozen=True, kw_only=True):

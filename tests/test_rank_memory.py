@@ -124,6 +124,7 @@ def test_one_rank_plans_its_own_request_and_records_it(tmp_path: Path) -> None:
             assert list(executor.requests) == ["single"]
         assert not ranks and not executor.requests
         assert len(rows) == 1 and rows[0].stats.request == "single"
+        assert rows[0].torch is None  # no GPU: no allocator to count
     finally:
         left.close()
         right.close()

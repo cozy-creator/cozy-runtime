@@ -4477,6 +4477,9 @@ class Executor:
             yield rows
             return
         request: MemoryRequest | None = None
+        cuda = host.memory.cuda
+        device = host.memory.device.index if cuda else None
+        since = host.execution.counters(device)
         try:
             with host.memory.request(request_id) as request, host.execution.serving(request):
                 host.requests[request_id] = request
@@ -4486,10 +4489,9 @@ class Executor:
                     del host.requests[request_id]
         finally:
             if request is not None:
-                cuda = host.memory.cuda
                 gpu = _gpu_numbers(self.world)[self.rank] if cuda else -1
-                device = host.memory.device.index if cuda else None
-                rows.append(host.execution.record(request.stats(), gpu, device, self._store()))
+                stats = request.stats()
+                rows.append(host.execution.record(stats, gpu, device, self._store(), since))
 
     def _quiescent(self) -> bool:
         """No author computation may still mutate GPU or output state when a terminal is
