@@ -191,6 +191,8 @@ def is_device_oom(exc: BaseException) -> bool:
         mark in text
         for mark in (
             "CUDA error: out of memory",
+            "CUDA driver error: out of memory",
+            "Triton Error [CUDA]: out of memory",
             "CUBLAS_STATUS_ALLOC_FAILED",
             "CUDNN_STATUS_ALLOC_FAILED",
             "CUFFT_ALLOC_FAILED",

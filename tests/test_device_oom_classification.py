@@ -24,6 +24,8 @@ ALLOCATION_FAILURES = (
     "NCCL error in: ProcessGroupNCCL.cpp:3356, unhandled cuda error, NCCL version 2.27.5\n"
     "ncclUnhandledCudaError: Call to CUDA function failed.\nLast error:\n"
     "Cuda failure 2 'out of memory'",
+    "Triton Error [CUDA]: out of memory",
+    "CUDA driver error: out of memory",
 )
 
 
