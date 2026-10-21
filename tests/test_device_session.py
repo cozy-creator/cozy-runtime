@@ -13,26 +13,22 @@ from typing import Any, cast
 
 import pytest
 
-from cozy_runtime.internal import child_env, jit_cache
+from cozy_runtime.internal import child_env
 
 PROBE = Path(__file__).parent / "testdata" / "device_session.py"
 REAL_GPU = os.environ.get("COZY_TEST_GPU_DEVICE") == "1"
 
 
 def probe(mode: str, root: Path, *, script: Path = PROBE) -> dict[str, Any]:
-    # The fresh child gets the same erase/impose boundary and installation-scoped
-    # compiler cache as a worker. Cold upstream imports must not invent cache
-    # variables after the child's real _capture_seal() snapshot.
-    cache = jit_cache.scope(
-        root.resolve(),
-        "local-" + uuid.uuid4().hex,
-        pod_scope=str(root.resolve()),
-    )
+    # The fresh child gets the same erase/impose boundary and compiler caches the machine
+    # imposes on an executor. Cold upstream imports must not invent cache variables after
+    # the child's real _capture_seal() snapshot.
+    cache = child_env.jit_environment(root.resolve() / ("jit-" + uuid.uuid4().hex))
     visible = "" if mode in {"cpu", "cpu-order"} else os.environ.get("CUDA_VISIBLE_DEVICES", "0")
     if mode == "torchless":
         visible = "0"  # what TensorD sets for the GPU it gave; no CUDA is touched
     env = {name: value for name, value in os.environ.items() if not child_env.erased(name)}
-    env.update(child_env.project_child_env({"CUDA_VISIBLE_DEVICES": visible, **cache.environment}))
+    env.update(child_env.project_child_env({"CUDA_VISIBLE_DEVICES": visible, **cache}))
     run = subprocess.run(
         [sys.executable, str(script), mode, str(root)],
         env=env,

@@ -19,7 +19,7 @@ from typing import Any
 
 import pytest
 
-from cozy_runtime.internal import accel, attention_sol, jit_cache, kernel_cache, kernel_compile
+from cozy_runtime.internal import accel, attention_sol, kernel_cache, kernel_compile
 
 KEY_DOC = {"library": {"sol_attn_sources": "0" * 64}, "target": "sm_90a", "variant": {}}
 
@@ -154,26 +154,6 @@ def test_a_claimed_lock_lives_exactly_as_long_as_the_child_holding_it(tmp_path: 
         assert store.get(key) == b"from-the-builder"
     assert child.wait() == 0
     assert waited > 0.3
-
-
-def test_machine_namespaces_under_one_uid(tmp_path: Path) -> None:
-    root = tmp_path / "var/lib/cozy/kernels"
-    environment = jit_cache.machine(root)
-    own = kernel_cache.namespace(root, os.geteuid())
-    assert environment == {
-        kernel_cache.OWN_ENV: str(own),
-        "FLASH_ATTENTION_CUTE_DSL_CACHE_DIR": str(own / "flash-attn4"),
-        "TRITON_CACHE_DIR": str(own / "triton"),
-    }
-    assert root.stat().st_mode & 0o777 == 0o711 and own.stat().st_mode & 0o777 == 0o755
-    store = kernel_cache.from_sealed(environment)
-    assert store is not None and store.own == own and store.trusted is None
-    assert jit_cache.machine(root) == environment
-    installed = jit_cache.machine(root, installation="release-45299ff1")
-    assert installed == {
-        **environment,
-        "PYTORCH_KERNEL_CACHE_PATH": str(own / "torch-kernels.release-45299ff1"),
-    }
 
 
 def _site() -> None:
@@ -315,8 +295,9 @@ def test_a_triton_kernel_compiles_once_per_machine(tmp_path: Path) -> None:
     pytest.importorskip("triton")
     if not accel.present(torch, "cuda"):
         pytest.skip("requires a CUDA device")
-    env = jit_cache.machine(tmp_path / "var/lib/cozy/kernels")
-    cache = Path(env["TRITON_CACHE_DIR"])
+    # Triton's cache in the store's namespace, as the machine imposes it on an executor.
+    cache = kernel_cache.namespace(tmp_path / "var/lib/cozy/kernels", os.geteuid()) / "triton"
+    env = {"TRITON_CACHE_DIR": str(cache)}
     code = """
         import json, sys, torch, triton, triton.language as tl
 
@@ -353,8 +334,12 @@ def test_a_torch_nvrtc_kernel_compiles_once_per_installation(tmp_path: Path) -> 
     torch = pytest.importorskip("torch")
     if not accel.present(torch, "cuda"):
         pytest.skip("requires a CUDA device")
-    env = jit_cache.machine(tmp_path / "var/lib/cozy/kernels", installation="release-x")
-    cache = Path(env["PYTORCH_KERNEL_CACHE_PATH"])
+    # PyTorch's NVRTC cache under the generation's name, as the machine imposes it; PyTorch
+    # never creates the directory it is named.
+    own = kernel_cache.namespace(tmp_path / "var/lib/cozy/kernels", os.geteuid())
+    cache = own / "torch-kernels.release-x"
+    cache.mkdir(parents=True)
+    env = {"PYTORCH_KERNEL_CACHE_PATH": str(cache)}
     code = (
         "import json, torch\n"
         "x = torch.linspace(0.5, 4.0, 64, device='cuda')\n"
