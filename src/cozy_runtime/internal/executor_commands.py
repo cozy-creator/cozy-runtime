@@ -14,6 +14,7 @@ from msgspec import UNSET, UnsetType
 
 from cozy_runtime.author._assets import FileState, GrantedInput, InputMetadata
 from cozy_runtime.author._services import MAX_OUTPUT_BYTES
+from cozy_runtime.internal.attention import Choice
 from cozy_runtime.internal.canonical import Json
 
 _MANIFEST = Annotated[str, msgspec.Meta(pattern="^sha256:[0-9a-f]{64}$")]
@@ -114,12 +115,23 @@ class Activate(Command, frozen=True, kw_only=True, tag="activate"):
 
 
 class Attention(Command, frozen=True, kw_only=True, tag="attention"):
-    """A follower's attention: adopt rank 0's kernels, hold a `pin`, or restore (neither)."""
+    """A follower's attention: install rank 0's whole selection (`adopt`), hold a `pin`, or
+    restore (neither)."""
 
     construction: str = ""
     pin: str | UnsetType = UNSET
     model_key: str | None = None
-    adopt: dict[str, str] | UnsetType = UNSET
+    adopt: Choice | UnsetType = UNSET
+
+
+class Kernels(Command, frozen=True, kw_only=True, tag="kernels"):
+    """A follower's deferred kernel installs (`Plan.when_ready`) at rank 0's boundary: which
+    of `sets` this GPU has built, or, with `install`, install those rank 0 installed."""
+
+    construction: str = ""
+    model_key: str | None = None
+    sets: tuple[str, ...] = ()
+    install: bool = False
 
 
 class Release(msgspec.Struct, frozen=True, kw_only=True):
@@ -345,6 +357,7 @@ type KnownCommand = (
     | RequestMemory
     | Activate
     | Attention
+    | Kernels
     | Start
     | Load
     | PrepareRequest

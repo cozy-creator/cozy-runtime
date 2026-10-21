@@ -68,6 +68,18 @@ class AttentionRefusal(RuntimeError):
         self.code = code
 
 
+class Lacking(AttentionRefusal):
+    """Another GPU's choice names kernels this one cannot serve now: each one's refusal
+    code (`attention_kernel_compiling`: not yet). Nothing changed here."""
+
+    def __init__(self, kernels: dict[str, str]) -> None:
+        super().__init__(
+            "attention_kernel_lacking",
+            "; ".join(f"{name}: {code}" for name, code in sorted(kernels.items())),
+        )
+        self.kernels = kernels
+
+
 @dataclass(frozen=True, slots=True)
 class Candidate:
     """One attention kernel the runtime knows how to reach, and what it needs to run."""
@@ -719,6 +731,7 @@ def _sol_dense(
             or _off_row(candidate, row)
             or not _admits(candidate, "bfloat16", 128)
             or (dense is not None and not candidate.exact)
+            or name in refused
         ):
             continue
         if name not in resolved:
@@ -737,19 +750,24 @@ def _sol_dense(
     raise AttentionRefusal("attention_kernel_absent", "Sol has no ready dense reference")
 
 
+#: How a dense identity names the exact kernel beside a quantizing dense one.
+_EXACT_AT = "; exact="
+
+
 def _bind_sol_dense(chosen: tuple[Ready, Ready | None]) -> None:
     dense, exact = chosen
     backends = _registry()._backends
     attention_sol.bind_dense(
         backends[dense.member],
-        dense.name if exact is None else f"{dense.name}; exact={exact.name}",
+        dense.name if exact is None else f"{dense.name}{_EXACT_AT}{exact.name}",
         None if exact is None else backends[exact.member],
     )
 
 
-def pinned(name: str, device: DeviceFacts) -> list[Ready]:
+def pinned(name: str, device: DeviceFacts, wait: bool = True) -> list[Ready]:
     """The single kernel the execution-path override names, or a typed refusal (cr-125).
-    A request's `plan` turns a refusal into a visible fallback, never a silent one."""
+    A request's `plan` turns a refusal into a visible fallback, never a silent one. Not
+    `wait`: one still compiling refuses (`attention_kernel_compiling`) instead."""
     candidate = known().get(name)
     if candidate is None:
         raise AttentionRefusal(
@@ -764,7 +782,7 @@ def pinned(name: str, device: DeviceFacts) -> list[Ready]:
             f"{unsupported}, sm{device.sm}. This environment runs {image_kernels(device)} on "
             f"{device.name}",
         )
-    return [_resolve(candidate, device)]
+    return [_resolve(candidate, device, wait)]
 
 
 # ------------------------------------------------------------------------------ the pin
@@ -1280,13 +1298,16 @@ def install(
     bits: int | Mapping[str, int] = 16,
     row: arch.Row | None = None,
     skipped: dict[str, str] | None = None,
+    choice: Choice | None = None,
 ) -> Applied:
     """Validate a complete per-site selection before changing any processor.
 
     A site in the pin's scope takes the pinned kernel, or refuses (`EXACT`: its walk at level
-    16). Every other site takes the first kernel of its walk on ROW (else DEVICE's) at the
-    model's `bits` for it (`walk`, `level`); a classic site keeps SDPA. Without a DEVICE,
-    sites take the READY kernels in order.
+    16). Given another GPU's CHOICE (a group follower takes rank 0's), each site takes the
+    kernel that GPU serves there and Sol its dense reference, each resolved on DEVICE as a pin
+    is, or refuses. Every other site takes the first kernel of its walk on ROW (else DEVICE's)
+    at the model's `bits` for it (`walk`, `level`); a classic site keeps SDPA. Without a
+    DEVICE, sites take the READY kernels in order.
     """
     scope, name = _pin_parts(pin)
     if device is not None:
@@ -1294,6 +1315,18 @@ def install(
     hosts: dict[str, dict[str, int]] = {}
     assignments: list[_Site] = []
     resolved = {entry.name: entry for entry in ready}
+    taken = {} if choice is None else {(c, path): k for c, path, k in choice.sites}
+    if choice is not None:
+        if device is None:
+            raise AttentionRefusal("attention_kernel_unsupported", "a choice installs on a device")
+        lacking: dict[str, str] = {}
+        for kernel in sorted({*taken.values(), choice.dense, choice.exact} - {""}):
+            try:
+                resolved[kernel] = pinned(kernel, device, wait=False)[0]
+            except AttentionRefusal as exc:
+                lacking[kernel] = exc.code
+        if lacking:
+            raise Lacking(lacking)
     refused: dict[str, str] = dict(skipped or {})
     matched = False
     sol_order: list[str] | None = None
@@ -1313,6 +1346,14 @@ def install(
             if entry is not None and _unfit(entry.candidate, None, module, dtype, head_dim, degree):
                 entry = None
             order = [name]
+        elif choice is not None:
+            order = [taken.get((component, path), "")]
+            if not order[0]:
+                raise AttentionRefusal(
+                    "attention_kernel_unsupported",
+                    f"the choice names no kernel for {component}/{path}",
+                )
+            entry = _first(order, None, None, component, module, degree, resolved, refused, [])
         else:
             at = 16 if forced else level(bits, component, path)
             order = (
@@ -1326,8 +1367,9 @@ def install(
                 order, row, device, component, module, degree, resolved, refused, fallbacks
             )
         if entry is None:
+            wanted = name if forced else order[0] if choice is not None else ""
             detail = _site_refusal(
-                name if forced else "no available attention kernel", component, dtype, head_dim
+                wanted or "no available attention kernel", component, dtype, head_dim
             )
             if degree > 1:
                 detail = AttentionRefusal(
@@ -1344,7 +1386,12 @@ def install(
         raise AttentionRefusal(
             "attention_kernel_unsupported", f"{pin!r} matches no attention component"
         )
-    if device is not None and sol_order is not None:
+    if choice is not None and sol_order is not None:
+        if not choice.dense:
+            raise AttentionRefusal("attention_kernel_absent", "the choice names no dense reference")
+        exact = resolved[choice.exact] if choice.exact else None
+        _bind_sol_dense((resolved[choice.dense], exact))
+    elif device is not None and sol_order is not None:
         _bind_sol_dense(_sol_dense(sol_order, device, resolved, refused))
     _install_sites(
         [
@@ -1394,14 +1441,24 @@ def _install_sites(records: Sequence[tuple[Ready, str, str, Any]]) -> None:
         raise
 
 
+def _names() -> dict[str, str]:
+    """Diffusers backend value -> the kernel name it serves."""
+    return {candidate.backend: candidate.name for candidate in known().values()}
+
+
+def _served(processor: object, names: Mapping[str, str]) -> str:
+    """The kernel a site's processor dispatches to now."""
+    backend = getattr(processor, "_attention_backend", None)
+    value = getattr(backend, "value", str(backend))
+    return names.get(value, value)
+
+
 def observed(roots: Mapping[str, object], pin: str = "") -> Applied:
     """Read actual processor choices; never substitute the prepared recommendation."""
-    names = {candidate.backend: candidate.name for candidate in known().values()}
+    names = _names()
     hosts: dict[str, dict[str, int]] = {}
     for component, _module, processor in _sites(roots):
-        backend = getattr(processor, "_attention_backend", None)
-        value = getattr(backend, "value", str(backend))
-        name = names.get(value, value)
+        name = _served(processor, names)
         hosts.setdefault(component, {})
         hosts[component][name] = hosts[component].get(name, 0) + 1
     served = {name for kernels in hosts.values() for name in kernels}
@@ -1413,20 +1470,70 @@ def observed(roots: Mapping[str, object], pin: str = "") -> Applied:
     return Applied(hosts, (), pin, artifacts=artifacts or None)
 
 
+class Choice(msgspec.Struct, frozen=True, kw_only=True):
+    """One GPU's whole selection, as a group's followers install it (`install`): the kernel
+    each site serves, by (component, module path), and the dense reference Sol recomputes
+    rows with where Sol serves, with the exact kernel beside a quantizing one ("" for none)."""
+
+    sites: tuple[tuple[str, str, str], ...] = ()
+    dense: str = ""
+    exact: str = ""
+
+
+def chosen(roots: Mapping[str, object]) -> Choice:
+    """What this GPU serves now: every site's kernel, and Sol's dense reference where Sol
+    serves (`attention_sol.binding`)."""
+    names = _names()
+    sites = tuple(
+        (component, path, _served(processor, names))
+        for component, path, _module, processor in _site_records(roots)
+    )
+    if not any(kernel == "sol-attn" for *_, kernel in sites):
+        return Choice(sites=sites)
+    dense, _, exact = attention_sol.binding()[1].partition(_EXACT_AT)
+    return Choice(sites=sites, dense=dense, exact=exact)
+
+
+def difference(ours: Choice, theirs: Choice) -> str:
+    """The first way THEIRS serves other than OURS; "" when it serves the same."""
+    if (ours.dense, ours.exact) != (theirs.dense, theirs.exact):
+        return (
+            f"Sol's dense reference {ours.dense or 'none'} (exact {ours.exact or 'itself'}) "
+            f"against {theirs.dense or 'none'} (exact {theirs.exact or 'itself'})"
+        )
+    held = {(component, path): kernel for component, path, kernel in theirs.sites}
+    for component, path, kernel in ours.sites:
+        other = held.pop((component, path), None)
+        if other != kernel:
+            return f"{component}/{path}: {kernel} against {other or 'none'}"
+    if held:
+        (component, path), kernel = sorted(held.items())[0]
+        return f"{component}/{path}: none against {kernel}"
+    return ""
+
+
 @dataclass(frozen=True, slots=True)
 class Snapshot:
-    """Prepared processor choices, restored without resolution or policy re-execution."""
+    """Prepared processor choices, restored without resolution or policy re-execution, with
+    the dense reference Sol ran with when one of them is Sol."""
 
     choices: tuple[tuple[Any, Any], ...]
+    dense: attention_sol.Binding | None = None
 
     def restore(self) -> None:
         for processor, member in self.choices:
             processor._attention_backend = member
+        if self.dense is not None:
+            attention_sol.rebind(self.dense)
 
 
 def snapshot(roots: Mapping[str, object]) -> Snapshot:
+    names = _names()
+    held = [processor for _, _, processor in _sites(roots)]
+    sol = any(_served(processor, names) == "sol-attn" for processor in held)
     return Snapshot(
-        tuple((processor, processor._attention_backend) for _, _, processor in _sites(roots))
+        tuple((processor, processor._attention_backend) for processor in held),
+        attention_sol.binding() if sol else None,
     )
 
 
@@ -1652,12 +1759,14 @@ def select(
     *,
     bits: int | Mapping[str, int] = 16,
     row: arch.Row | None = None,
+    passed: Mapping[str, str] | None = None,
 ) -> Applied:
-    """Select once at preparation: each site's walk at the model's `bits`, or the pin."""
+    """Select once at preparation: each site's walk at the model's `bits`, or the pin. Every
+    kernel in `passed` is passed over, with why (another GPU of the group lacks it)."""
     adopt(roots)
     _, name = _pin_parts(pin)
     ready = pinned(name, device) if name and name != EXACT else []
-    skipped: dict[str, str] = {}
+    skipped: dict[str, str] = dict(passed or {})
     applied = install(ready, roots, pin, degree, device=device, bits=bits, row=row, skipped=skipped)
     return replace(applied, skipped=skipped or None)
 

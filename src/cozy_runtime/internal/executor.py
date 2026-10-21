@@ -172,6 +172,7 @@ from cozy_runtime.internal.executor_commands import (
     Hello,
     Invoke,
     Join,
+    Kernels,
     KnownCommand,
     Load,
     Map,
@@ -741,6 +742,17 @@ def _dense(kernels: Iterable[str]) -> str:
     return ", ".join(dict.fromkeys(attention.dense_identity(name) for name in sparse))
 
 
+def _attention_divergence(mine: attention.Choice, reply: Mapping[str, object]) -> str:
+    """How a follower's answer to rank 0's selection differs from it; "" when it serves it."""
+    if not reply.get("ok"):
+        return f"{reply.get('code', '')}: {reply.get('detail', '')}"
+    try:
+        theirs = msgspec.convert(reply.get("choice"), attention.Choice)
+    except msgspec.ValidationError as exc:
+        return f"an unreadable selection: {exc}"
+    return attention.difference(mine, theirs)
+
+
 def _segment(stage: str, step: int, held: attention.Applied, at_us: int = 0) -> dict[str, Any]:
     """A selection a run served from step `step` of `stage` on (`execution_evidence`)."""
     return {
@@ -887,10 +899,11 @@ class Executor:
         #: line, not a per-attempt record: the choice is a function of device and image.
         self.attention: attention.Applied | None = None
         self.attention_defaults = attention.Snapshot(())
-        #: this construction's selection, made again between requests (`_upgrade_attention`)
-        self._reselect: Callable[[], attention.Applied] | None = None
-        #: kernel installs waiting for their build (`Plan.when_ready`), tried between requests
-        self._installs: list[tuple[Callable[[], Launch | None], Callable[[Launch], None]]] = []
+        #: this construction's selection, made again between requests (`_upgrade_attention`),
+        #: passing over what `passed` names
+        self._reselect: Callable[..., attention.Applied] | None = None
+        #: kernel installs waiting for their build on every GPU (`Plan.when_ready`), by set name
+        self._installs: list[tuple[str, Callable[[], Launch | None], Callable[[Launch], None]]] = []
         #: Device facts for this prepared generation, reused for per-request pin checks.
         self.device_facts: Any = None
         #: a follower's hold of rank 0's attention selection for the current attempt
@@ -915,6 +928,8 @@ class Executor:
                 return self.join(command)
             case Attention():
                 return self.select_attention(command)
+            case Kernels():
+                return self.kernels(command)
             case Fork():
                 return self.fork(command)
             case Start():
@@ -1918,14 +1933,10 @@ class Executor:
         device = self._rank_device(torch)
 
         def when_ready(kernels: TritonKernels, install: Callable[[Launch], None]) -> bool:
-            launch = (
-                load(kernels, device=device) if self.world > 1 else ready(kernels, device=device)
-            )
-            if launch is None:
-                self._installs.append((functools.partial(ready, kernels, device=device), install))
-                return False
-            install(launch)
-            return True
+            built = functools.partial(ready, kernels, device=device)
+            here = built() is not None
+            self._installs.append((kernels.name, built, install))
+            return here
 
         try:
             identity = model.execution_plan(
@@ -2795,14 +2806,19 @@ class Executor:
                             f"{theirs.get('filled_bytes')!r}",
                         )
                     )
-            refused = self._agree_attention(applied)
+            refused = self._agree_attention()
             if refused is not None:
                 return refused
         self.facts = {}
         refused = self._install_group(torch, model, agreed)
+        if refused is None and self.rank == 0:
+            # The execution plan's kernels already built for every GPU install now, before
+            # the first request, on every GPU (`_install_ready_kernels`).
+            refused = self._install_ready_kernels()
         if refused is not None:
             return refused
         stage("install")
+        applied = self.attention  # the group may have selected again (`_agree_attention`)
         if attention.sparse_names(applied.totals()):
             frozen = attention._baked_in(dict(backend.roots))
             if frozen:
@@ -3195,12 +3211,15 @@ class Executor:
         return reply
 
     def _grant(self, target: Executor, command: Invoke, *, first: bool) -> Frame | None:
-        """The kernels that became ready, installed while no call is in a scope; the first
-        attempt in also opens the residency's attempt."""
+        """The kernels that became ready, installed while no call is in a scope (a group none
+        of whose GPUs may serve otherwise refuses); the first attempt in also opens the
+        residency's attempt."""
         turn = object()
         with SCOPES.held(turn):
             target._upgrade_attention(turn)
-            target._install_ready_kernels()
+            refused = target._install_ready_kernels()
+            if refused is not None:
+                return {**refused, "poisoned": target.poisoned}
             if first and target.residency is not None:
                 target.residency.open_attempt()
             if first and target.torch is not None:
@@ -3674,12 +3693,10 @@ class Executor:
     # ------------------------------------------------------- the per-request attention pin
 
     def _attention_snapshot(self) -> attention.Snapshot:
+        defaults = [executor.attention_defaults for executor in self.model_executors or [self]]
         return attention.Snapshot(
-            tuple(
-                choice
-                for executor in (self.model_executors or [self])
-                for choice in executor.attention_defaults.choices
-            )
+            tuple(choice for held in defaults for choice in held.choices),
+            next((held.dense for held in defaults if held.dense is not None), None),
         )
 
     def _restore_attention(self) -> None:
@@ -3781,20 +3798,123 @@ class Executor:
             return None
         return attention.plan(self._attention_device(pin), roots, pin, self.world)
 
-    def _install_ready_kernels(self) -> None:
-        """Between requests: each execution plan's install whose kernels finished compiling
-        since (`Plan.when_ready`). One that fails leaves its construction serving as it was."""
+    def _install_ready_kernels(self) -> Frame | None:
+        """THE EXECUTION PLAN'S INSTALLS (`Plan.when_ready`), each once its kernels are built
+        for every GPU of its construction: at the end of preparation and between requests, on
+        every GPU at the same boundary, never waiting for a compile. Rank 0 decides and
+        installs first; each follower then installs what rank 0 did (`kernels`). One that
+        raises on rank 0 is dropped and its construction serves as it was; one only a
+        follower cannot install leaves a divergent group, refused."""
         for executor in self.model_executors or [self]:
-            waiting, executor._installs = executor._installs, []
-            for ready, install in waiting:
+            launches, _ = executor._built()
+            if not launches:
+                continue
+            if executor.group is None:
+                executor._install(launches)
+                continue
+            refused = executor._install_in_group(launches)
+            if refused is not None:
+                return refused
+        return None
+
+    def _built(self, sets: Collection[str] | None = None) -> tuple[dict[str, Launch], list[str]]:
+        """This GPU's waiting installs (of `sets`, else all) whose kernels are built here, by
+        set name, and the sets whose build ended without them, dropped for good."""
+        launches: dict[str, Launch] = {}
+        failed: list[str] = []
+        for name, ready, _install in self._installs:
+            if (sets is not None and name not in sets) or name in launches or name in failed:
+                continue
+            try:
+                launch = ready()
+            except Exception as exc:  # an upgrade is never worth a failed run
+                print(f"[kernels] {name}: deferred install refused: {exc}"[:600], file=sys.stderr)
+                failed.append(name)
+                continue
+            if launch is not None:
+                launches[name] = launch
+        self._drop(failed)
+        return launches, failed
+
+    def _install(self, launches: Mapping[str, Launch]) -> list[str]:
+        """Every waiting install of these built sets, now: the sets whose installs all ran. One
+        that raises is dropped with its set's others, and the construction serves as it was."""
+        failed: set[str] = set()
+        for name, _ready, install in self._installs:
+            if name in launches and name not in failed:
                 try:
-                    launch = ready()
-                    if launch is None:
-                        executor._installs.append((ready, install))
-                    else:
-                        install(launch)
+                    install(launches[name])
                 except Exception as exc:  # an upgrade is never worth a failed run
-                    print(f"[kernels] deferred install refused: {exc}"[:600], file=sys.stderr)
+                    print(f"[kernels] {name}: install refused: {exc}"[:600], file=sys.stderr)
+                    failed.add(name)
+        self._drop(launches)
+        return sorted(set(launches) - failed)
+
+    def _drop(self, sets: Collection[str]) -> None:
+        self._installs = [row for row in self._installs if row[0] not in sets]
+
+    def _install_in_group(self, launches: dict[str, Launch]) -> Frame | None:
+        """Rank 0's half: each follower names which of these sets it has built (one whose
+        build failed there is dropped here too), rank 0 installs the sets every GPU has, and
+        then each follower installs what rank 0 installed."""
+        group = self.group
+        assert group is not None
+        asked = functools.partial(
+            Kernels, construction=self.construction, model_key=self._group_model_key
+        )
+        with group.hold(range(1, group.degree)):
+            try:
+                replies = group.call(executor_commands.encode(asked(sets=tuple(sorted(launches)))))
+                for follower, reply in zip(group.followers, replies, strict=True):
+                    if not reply.get("ok"):
+                        raise GpuDivergence(follower.gpu, "kernels", str(reply.get("detail")))
+                    missing = set(launches) - set(reply.get("built") or ())
+                    for name in sorted(set(reply.get("failed") or ()) & missing):
+                        print(
+                            f"[kernels] {name}: {follower.gpu} has no build of it; the group "
+                            "serves without it",
+                            file=sys.stderr,
+                        )
+                        self._drop((name,))
+                    launches = {n: launch for n, launch in launches.items() if n not in missing}
+                installed = self._install(launches) if launches else []
+                if not installed:
+                    return None
+                command = asked(sets=tuple(installed), install=True)
+                replies = group.call(executor_commands.encode(command))
+                for follower, reply in zip(group.followers, replies, strict=True):
+                    if not reply.get("ok"):
+                        raise GpuDivergence(
+                            follower.gpu,
+                            "kernels",
+                            f"{_gpu(0)} installed {installed}: {reply.get('detail')}"[:800],
+                        )
+            except GroupRefusal as exc:
+                return self._group_refusal(exc)
+        return None
+
+    def kernels(self, command: Kernels) -> Frame:
+        """A follower's half of `_install_in_group`: which of rank 0's built sets this GPU has
+        built (and which failed here, for good), or install those rank 0 installed."""
+        target = self._follower_target(command.construction, command.model_key)
+        if target is None:
+            return {"ok": False, "code": "gpu_divergence", "detail": "no such construction"}
+        launches, failed = target._built(command.sets)
+        if not command.install:
+            return {"ok": True, "rank": self.rank, "built": sorted(launches), "failed": failed}
+        missing = sorted(set(command.sets) - set(target._install(launches)))
+        if missing:
+            detail = f"{_gpu(self.rank)} installed none of {missing}"
+            return {"ok": False, "code": "gpu_divergence", "detail": detail, "rank": self.rank}
+        return {"ok": True, "rank": self.rank}
+
+    def _follower_target(self, construction: str, model_key: str | None) -> Executor | None:
+        """The generation rank 0 names on this follower: its construction, or one model of a
+        many-model construction."""
+        container = self.constructions.get(construction)
+        members = (container.model_executors or [container]) if container is not None else []
+        target = next((m for m in members if m._group_model_key == model_key), None)
+        return None if self.rank == 0 else target
 
     def _upgrade_attention(self, call: object = None) -> bool:
         """A RUN WITHOUT AN OVERRIDE NEVER WAITS FOR A COMPILE: at each step or stage boundary
@@ -3831,88 +3951,110 @@ class Executor:
             executor.attention_defaults.restore()
             executor.attention = replace(applied, waiting=())
             return False
+        executor.attention = fresh
         if executor.group is not None:
             with executor.group.hold(range(1, executor.group.degree)):
-                if executor._agree_attention(fresh, poison=False):
+                if executor._agree_attention(poison=False):
+                    # Every GPU back on the prepared selection; one that cannot take it back
+                    # leaves a divergent group, refused.
                     executor.attention_defaults.restore()
-                    executor._agree_attention(applied, poison=False)
+                    executor.attention = applied
+                    executor._agree_attention()
                     executor.attention = replace(applied, waiting=())
                     return False
         assert executor.backend is not None
-        executor.attention = fresh
         executor.attention_defaults = attention.snapshot(dict(executor.backend.roots))
         return True
 
-    def _agree_attention(
-        self, applied: attention.Applied, *, poison: bool = True
-    ) -> dict[str, Any] | None:
-        """THE GROUP SERVES RANK 0'S PREPARED SELECTION. Each rank selected beside rank 0
-        under its own probes, so a follower takes rank 0's per-component kernels before the
-        group installs; one that cannot serve them refuses the group instead of serving a
-        mixed selection that every request would then refuse."""
-        assert self.group is not None
-        chosen = {c: next(iter(k)) for c, k in applied.hosts.items() if len(k) == 1}
-        try:
-            self.group.broadcast(
-                executor_commands.encode(
-                    Attention(
-                        construction=self.construction,
-                        model_key=self._group_model_key,
-                        adopt=chosen,
+    def _agree_attention(self, *, poison: bool = True) -> dict[str, Any] | None:
+        """THE GROUP SERVES ONE SELECTION, WHOLE, THAT EVERY GPU HAS READY: each site's kernel
+        and Sol's dense reference. Every follower installs rank 0's through the
+        `attention.install` rank 0 selected with, never waiting for a build, and answers what
+        it then serves. A kernel a follower lacks, rank 0 selects again without, and one still
+        compiling there waits for a later boundary (`_upgrade_attention`), as kernel sets do
+        (`_install_ready_kernels`). A follower that serves anything else refuses the group
+        instead of serving a mixed selection. Not `poison`: an upgrade a follower did not take
+        is refused for this group alone, which stays whole."""
+        assert self.group is not None and self.backend is not None and self.attention is not None
+        passed: dict[str, str] = {}
+        later: set[str] = set()
+        while True:
+            mine = attention.chosen(self.backend.roots)
+            try:
+                self.group.broadcast(
+                    executor_commands.encode(
+                        Attention(
+                            construction=self.construction,
+                            model_key=self._group_model_key,
+                            adopt=mine,
+                        )
                     )
                 )
-            )
-            replies = self.group.collect("attention")
-        except GroupRefusal as exc:
-            return self._group_refusal(exc)
+                replies = self.group.collect("attention")
+            except GroupRefusal as exc:
+                return self._group_refusal(exc)
+            lacking = {
+                (name, follower.gpu, code)
+                for follower, reply in zip(self.group.followers, replies, strict=True)
+                for name, code in dict(reply.get("lacking") or {}).items()
+            }
+            if not {name for name, _, _ in lacking} - set(passed):
+                break
+            passed.update({name: f"{gpu}: {code}" for name, gpu, code in lacking})
+            later.update(n for n, _, code in lacking if code == "attention_kernel_compiling")
+            assert self._reselect is not None
+            try:
+                self.attention = self._reselect(passed=passed)
+            except attention.AttentionRefusal as exc:
+                replies = [{"ok": False, "code": exc.code, "detail": str(exc)}] * len(replies)
+                break
+        if later:
+            waiting = tuple(sorted({*self.attention.waiting, *later}))
+            self.attention = replace(self.attention, waiting=waiting)
         for follower, reply in zip(self.group.followers, replies, strict=True):
-            if not reply.get("ok") or reply.get("hosts") != applied.hosts:
-                if not poison:  # an upgrade the followers did not take leaves the group whole
-                    return {"ok": False, "code": "gpu_divergence"}
+            why = _attention_divergence(mine, reply)
+            if why:
+                if not poison:
+                    return {"ok": False, "code": "gpu_divergence", "detail": why}
                 return self._group_refusal(
-                    GpuDivergence(
-                        follower.gpu,
-                        "attention",
-                        f"{_gpu(0)} prepared {applied.hosts}, {follower.gpu} holds "
-                        f"{reply.get('hosts')} {reply.get('code', '')} {reply.get('detail', '')}",
-                    )
+                    GpuDivergence(follower.gpu, "attention", f"{_gpu(0)} serves otherwise: {why}")
                 )
         return None
 
-    def _adopt_attention(self, command: Attention, adopt: dict[str, str]) -> dict[str, Any]:
-        """A follower's half of `_agree_attention`: take rank 0's kernel per component as
-        this construction's prepared selection."""
-        container = self.constructions.get(command.construction)
-        members = (container.model_executors or [container]) if container is not None else []
-        target = next((m for m in members if m._group_model_key == command.model_key), None)
-        if self.rank == 0 or target is None or target.backend is None:
+    def _adopt_attention(self, command: Attention, choice: attention.Choice) -> dict[str, Any]:
+        """A follower's half of `_agree_attention`: rank 0's whole selection installed here as
+        this construction's prepared one, and what this GPU then serves."""
+        target = self._follower_target(command.construction, command.model_key)
+        if target is None or target.backend is None or target.device_facts is None:
             return {"ok": False, "code": "gpu_divergence", "detail": "no such construction"}
         roots = target.backend.roots
-        held = attention.observed(roots).hosts
+        held = attention.chosen(roots)
         try:
-            for component, name in sorted(adopt.items()):
-                if set(held.get(component) or ()) == {name}:
-                    continue
-                if component not in roots or target.device_facts is None:
-                    raise attention.AttentionRefusal(
-                        "attention_kernel_unsupported", f"{_gpu(self.rank)} holds no {component}"
-                    )
-                attention.plan(
-                    target.device_facts, {component: roots[component]}, name, self.world
-                ).apply()
-                print(
-                    f"[attention] {_gpu(self.rank)} {component}: took {_gpu(0)}'s {name} over "
-                    f"its own {sorted(held.get(component) or ())}",
-                    file=sys.stderr,
-                    flush=True,
-                )
+            applied = attention.install(
+                [], roots, degree=self.world, device=target.device_facts, choice=choice
+            )
         except attention.AttentionRefusal as exc:
-            return {"ok": False, "code": exc.code, "detail": str(exc)[:900], "rank": self.rank}
+            lacking = exc.kernels if isinstance(exc, attention.Lacking) else {}
+            detail = str(exc)[:900]
+            return {
+                "ok": False,
+                "code": exc.code,
+                "detail": detail,
+                "rank": self.rank,
+                "lacking": lacking,
+            }
+        took = attention.difference(choice, held)
+        if took:
+            print(
+                f"[attention] {_gpu(self.rank)} took {_gpu(0)}'s selection: {took}",
+                file=sys.stderr,
+                flush=True,
+            )
         target.attention_defaults = attention.snapshot(roots)
-        hosts = attention.observed(roots).hosts
         if target.attention is not None:
-            target.attention = replace(target.attention, hosts=hosts)
-        return {"ok": True, "rank": self.rank, "hosts": hosts}
+            target.attention = replace(target.attention, hosts=applied.hosts)
+        serves = attention.chosen(roots)
+        return {"ok": True, "rank": self.rank, "choice": msgspec.to_builtins(serves)}
 
     def select_attention(self, command: Attention) -> dict[str, Any]:
         """A FOLLOWER restores its prepared selection and, given rank 0's `pin` for the next
@@ -4787,6 +4929,7 @@ _FOLLOWER_COMMANDS = frozenset(
         "unload",
         "run",
         "attention",
+        "kernels",
         "keep_weights",
         "request_memory",
         "vacate",
