@@ -1,8 +1,43 @@
 {
   "fields": "only status, identity, timings, GPU execution and the memory stats the receipts read; values unchanged",
-  "h3-warm-12665.json": {"run": 12665, "target": "local/minimax-h3/ref2va_turbo", "machine": "curran (RTX 4090)", "runtime": "0.30.0", "tensorfs": "0.12.0", "tensord": "0.11.0+dev.gdce19a5e", "show_sha256": "7f0cdb3e1cd033e09b4b1a909bbea150ff367408d68cb592b31f3435d2613bca"},
-  "h3-cold-12663.json": {"run": 12663, "target": "local/minimax-h3/ref2va_turbo", "machine": "curran (RTX 4090)", "runtime": "0.30.0", "tensorfs": "0.12.0", "tensord": "0.11.0+dev.gdce19a5e", "show_sha256": "0cfb47bd4ec0c7eb4fbe119591faf18c90ace1c1d1641e35728a840b38a2bcf2"},
-  "qwen4-12709.json": {"run": 12709, "target": "local/qwen-image-2/generate_image", "machine": "kuromitsu (RTX 4090)", "runtime": "0.30.0", "tensorfs": "0.12.0", "tensord": "0.11.0+dev.gdce19a5e", "show_sha256": "c7d2accdbb814f391d79a550f7e111ffdc880bc77a40e96ccd022e1b6da9192e"},
+  "h3-warm-12665.json": {
+    "run": 12665,
+    "target": "local/minimax-h3/ref2va_turbo",
+    "machine": "curran (RTX 4090)",
+    "runtime": "0.30.0",
+    "tensorfs": "0.12.0",
+    "tensord": "0.11.0+dev.gdce19a5e",
+    "show_sha256": "7f0cdb3e1cd033e09b4b1a909bbea150ff367408d68cb592b31f3435d2613bca"
+  },
+  "h3-cold-12663.json": {
+    "run": 12663,
+    "target": "local/minimax-h3/ref2va_turbo",
+    "machine": "curran (RTX 4090)",
+    "runtime": "0.30.0",
+    "tensorfs": "0.12.0",
+    "tensord": "0.11.0+dev.gdce19a5e",
+    "show_sha256": "0cfb47bd4ec0c7eb4fbe119591faf18c90ace1c1d1641e35728a840b38a2bcf2"
+  },
+  "qwen4-12709.json": {
+    "run": 12709,
+    "target": "local/qwen-image-2/generate_image",
+    "machine": "kuromitsu (RTX 4090)",
+    "runtime": "0.30.0",
+    "tensorfs": "0.12.0",
+    "tensord": "0.11.0+dev.gdce19a5e",
+    "show_sha256": "c7d2accdbb814f391d79a550f7e111ffdc880bc77a40e96ccd022e1b6da9192e"
+  },
   "catalog-20261021.json": "`cozy machine rent --json --tensorhub tensorhub` on 2026-10-21, nine SKUs kept",
-  "portrait.jpg (gates/)": "outputs/xs046-b4/proofs/lena.png, a Klein portrait from the 0.27.4 matrix, scaled to 768x768"
+  "portrait.jpg (gates/)": "outputs/xs046-b4/proofs/lena.png, a Klein portrait from the 0.27.4 matrix, scaled to 768x768",
+  "sdxl1-candidate-12857.json": {
+    "run": 12857,
+    "target": "paul/sdxl/generate@2.11.1",
+    "hub": "local (8819)",
+    "machine": "lydia (rtx-pro-4000, S8's vertical slice)",
+    "runtime": "0.30.0+05d2c3b8",
+    "tensorfs": "0.13.0",
+    "tensord": "0.11.0+dev.g5dbf9254",
+    "client": "cozy 0.11.0+dev.g2afc1937",
+    "show_sha256": "49e27354903683b40fc7ee4cc853a55cdadf787c1f92914e6ddb1940670fccd0"
+  }
 }

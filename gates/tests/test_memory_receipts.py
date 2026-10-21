@@ -19,20 +19,22 @@ def fixture(name):
     return json.loads((FIXTURES / f"{name}.json").read_text())
 
 
-def varena(reads, capacity=3 * GB, w=int(2.5 * GB)):
-    """A one-GPU candidate record in S1's `Stats` field names: a 2 GB DiT in two 1 GB blocks over three steps; `reads`
-    names each step's origin for both blocks (`tier` copies them, `hit` finds them mapped)."""
+def varena(reads, capacity=3 * GB, w=int(2.5 * GB), prefetched=0):
+    """A one-GPU candidate record as TensorD reports it, in S1's `Stats` field names: a 2 GB DiT in two 1 GB blocks over
+    three steps; `reads` names each step's origin for both blocks (`Tier` copies them, `Hit` finds them mapped). The
+    first `prefetched` bytes of hits were prefetched by this request."""
     trace = [{"step": s, "set": "base_model/transformer_ref", "block": b, "bytes": GB, "origin": origin,
-              "speculative": False} for s, origin in enumerate(reads) for b in (0, 1)]
+              "speculative": s == 0 and origin == "Hit"} for s, origin in enumerate(reads) for b in (0, 1)]
     copied = sum(r["bytes"] for r in trace if r["origin"] == "Tier")
     stats = {"request": "r", "trace": trace, "stall_ns": copied // 40, "evicted": [0] * 7, "evicted_lowered": 0,
              "speculative_evicted_d": 0, "retries": 0, "cuts": 0, "parks": 0, "lowered": False, "peak": w, "leftover": 0,
              "moved": {"kept": {"bytes": 0, "ns": 0}, "tier": {"bytes": copied, "ns": copied // 20},
-                       "store": {"bytes": 0, "ns": 0}, "speculative": 0},
+                       "store": {"bytes": 0, "ns": 0}, "speculative": prefetched},
              "steps": [{"capacity": capacity, "w": w, "evicted": [0] * 7} for _ in reads]}
     return {"number": 1, "status": "completed", "execution_ms": 1000, "created_at_ms": 1, "settled_at_ms": 2001,
             "calls": [{"measurements": {"execution": {"gpus": [{"gpu": 0, "start_us": 1, "end_us": 2}]},
-                                        "memory": {"varena": [{"gpu": 0, "ceiling": 25.0, "stats": stats}]}}}]}
+                                        "memory": {"stats": {"varena": [
+                                            {"gpu": 0, "ceiling": {"disk_gbps": 7.0, "h2d_gbps": 25.0}, "stats": stats}]}}}}]}
 
 
 class Receipts(unittest.TestCase):
@@ -87,6 +89,7 @@ class Receipts(unittest.TestCase):
         code, text, _ = self.record(fixture("qwen4-12709"), "24-qwen4")
         self.assertEqual(code, 0, text)
         self.assertIn("parks=1", text)
+        self.assertIn("fill=h2d:3.91GB/s/19.7%,disk:1.72GB/s/50.9% ", text)  # each against its own ceiling
         code, text, row = self.record(fixture("qwen4-12709"), "24-qwen4-warm.2")
         self.assertEqual(row.bar, "warm-oom-retries,store-in-warm")
 
@@ -123,9 +126,27 @@ class Receipts(unittest.TestCase):
         warm = varena(["Hit", "Hit", "Hit"])
         self.assertEqual(self.record(warm, "24-h3ref5-warm.1", line="candidate")[2].bar, "ok")
 
+    def test_candidate_hits_prefetched_by_this_request_are_moves_for_min(self):
+        # Two prefetched hits at step 0: held before the request when it copied nothing, copied by it otherwise.
+        self.assertEqual(self.record(varena(["Hit", "Hit", "Hit"]), "24-h3ref5", line="candidate")[2].min, 0.0)
+        row = self.record(varena(["Hit", "Hit", "Hit"], prefetched=2 * GB), "24-h3ref5", line="candidate")[2]
+        self.assertEqual(row.min, 2.0)
+        row = self.record(varena(["Hit", "Hit", "Hit"], prefetched=GB), "24-h3ref5", line="candidate")[2]
+        self.assertEqual(row.min, 1.0)
+
+    def test_candidate_fills_against_their_own_ceilings(self):
+        code, text, _ = self.record(varena(["Tier", "Hit", "Hit"]), "24-h3ref5", line="candidate")
+        self.assertIn("fill=tier:20.00GB/s/80.0% ", text)  # 2 GB in 0.1 s against the 25 GB/s h2d ceiling
+
+    def test_actual_candidate_record_12857(self):
+        # S8's vertical slice: SDXL 1 MP on varena-one, its weights loaded before the request; TensorD's wrapping.
+        code, text, row = self.record(fixture("sdxl1-candidate-12857"), "24-sdxl1", line="candidate")
+        self.assertEqual((code, row.bar, row.moved, row.min), (0, "ok", 0.0, 0.0), text)
+        self.assertIn("leftover=0 ", text)
+
     def test_candidate_misplaced_evictions_fail(self):
         value = varena(["Tier", "Hit", "Hit"])
-        stats = value["calls"][0]["measurements"]["memory"]["varena"][0]["stats"]
+        stats = value["calls"][0]["measurements"]["memory"]["stats"]["varena"][0]["stats"]
         stats["evicted"] = [0, 0, 0, 0, 0, 5, 1]
         stats["evicted_lowered"] = 4
         stats["speculative_evicted_d"] = 1

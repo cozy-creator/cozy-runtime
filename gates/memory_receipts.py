@@ -43,8 +43,8 @@ class Memory:
     kept: int  # bytes imported by fingerprint, no copy
     tier: int  # bytes copied from host RAM
     store: int  # bytes read from the store (disk) on their way to the GPU
-    fill_ns: int  # device time the copies took
-    ceiling: float  # GB/s the copies could reach, weighted by bytes; 0 unmeasured
+    fills: tuple[tuple[str, int, int, float], ...]  # (source, bytes, ns, its ceiling in GB/s; 0 unmeasured)
+    copy_ns: int  # time the copies to the GPU took
     stall_ns: int
     retries: int
     cuts: int
@@ -128,24 +128,28 @@ def belady(trace, held=()):
 
 
 def shipping(memory):
-    """Runtime 0.30 + TensorFS 0.12 (`measurements.memory.stats`): one dict over the call's GPUs. It records no page
-    trace, so no MIN. Its disk fills count as store bytes, the rest of what it copied to the GPU as tier bytes; a copy
-    run's time is its span from first job to last landing, as its own `pct` takes it."""
+    """Runtime 0.30 (`measurements.memory.stats`): one dict over the call's GPUs. It records no page trace, so no MIN.
+    Its disk fills count as store bytes, the rest of what it copied to the GPU as tier bytes; a copy run's time is its
+    span from first job to last landing, as its own `pct` takes it."""
     stats = memory.get("stats") if isinstance(memory, dict) else None
     if not isinstance(stats, dict) or not stats:
         raise ValueError("no memory stats")
     copies = stats["copies"]
-    h2d = [c for c in copies if c["kind"] == "h2d"]
-    copied = sum(count(c["bytes"], "copy") for c in h2d)
-    disk = min(sum(count(c["bytes"], "disk") for c in copies if c["kind"] == "disk"), copied)
+    fills = []
+    for kind in ("h2d", "disk"):
+        runs = [c for c in copies if c["kind"] == kind]
+        n = sum(count(c["bytes"], kind) for c in runs)
+        fills.append((kind, n, round(sum(c["seconds"] for c in runs) * 1e9),
+                      sum(c["ceiling"] * c["bytes"] for c in runs) / n if n else 0.0))
+    (_, copied, copy_ns, _), (_, disk, _, _) = fills
+    disk = min(disk, copied)
     evicted = {}
     for e in stats["evictions"]:
         evicted[RUNGS[e["rung"]]] = evicted.get(RUNGS[e["rung"]], 0) + count(e["nbytes"], "eviction")
     rows = stats["rows"]
     return Memory(
         leftover_by_gpu=tuple((count(g, "gpu"), count(n, "leftover")) for g, n in stats["leftover_by_gpu"]),
-        kept=0, tier=copied - disk, store=disk, fill_ns=round(sum(c["seconds"] for c in h2d) * 1e9),
-        ceiling=sum(c["ceiling"] * c["bytes"] for c in h2d) / copied if copied else 0.0,
+        kept=0, tier=copied - disk, store=disk, fills=tuple(fills), copy_ns=copy_ns,
         stall_ns=sum(count(r["stall_ns"], "stall") for r in rows), retries=count(stats["retries"], "retries"),
         cuts=sum(len(p["cuts"]) for p in stats["peaks"]), parks=sum(e["rung"] == 5 for e in stats["evictions"]),
         evicted=tuple(sorted(evicted.items())), misplaced=(),
@@ -157,11 +161,13 @@ def shipping(memory):
 
 def device_trace(stats):
     """One GPU's trace by step. A step's capacity for weights is its measured capacity less its pass room (W less the
-    weights it binds); pages first bound as hits or kept imports, not prefetched, were resident when it began."""
+    weights it binds). Pages first bound as hits or kept imports were resident when the request began, except the
+    prefetched ones this request copied (`moved.speculative` bytes of them, taken in bind order)."""
     steps = {}
     for ref in stats["trace"]:
         steps.setdefault(count(ref["step"], "step"), []).append(ref)
     trace, held, seen = [], [], set()
+    prefetched = count(stats["moved"]["speculative"], "speculative")
     for step, refs in steps.items():
         measured = stats["steps"][step]
         pages = {(r["set"], r["block"]): count(r["bytes"], "ref bytes") for r in refs}
@@ -172,15 +178,20 @@ def device_trace(stats):
             page = f"{r['set']}#{r['block']}"
             if page not in seen:
                 seen.add(page)
-                if r["origin"].lower() in ("hit", "kept") and not r["speculative"]:
-                    held.append((page, r["bytes"]))
+                if r["origin"].lower() not in ("hit", "kept"):
+                    continue
+                if r["speculative"] and prefetched > 0:
+                    prefetched -= r["bytes"]
+                    continue
+                held.append((page, r["bytes"]))
     return trace, held
 
 
 def candidate(memory):
-    """varena-one (`measurements.memory.varena`): one `{gpu, ceiling, stats}` per GPU, `stats` being S1's `Stats`
-    (memory.rs) as serde writes it and `ceiling` the GPU's measured copy ceiling in GB/s."""
-    devices = memory.get("varena") if isinstance(memory, dict) else None
+    """varena-one, as TensorD wraps the executor's record: `measurements.memory.stats.varena`, one `{gpu, ceiling,
+    stats}` per GPU. `stats` is S1's `Stats` (memory.rs) as serde writes it; `ceiling` is TensorFS's measured
+    `{disk_gbps, h2d_gbps}`: kept and tier fills are held to the h2d ceiling, store fills to the disk one."""
+    devices = ((memory.get("stats") if isinstance(memory, dict) else None) or {}).get("varena")
     if not isinstance(devices, list) or not devices:
         raise ValueError("no varena stats")
     evicted, misplaced, dit, least, rows = {}, [], [], 0, []
@@ -200,16 +211,18 @@ def candidate(memory):
                 per[r["step"]] = per.get(r["step"], 0) + r["bytes"] * (r["origin"].lower() in ("tier", "store"))
         dit += [per[step] for step in sorted(per)]
         least += belady(*device_trace(s))
-        moved = s["moved"]
-        rows.append((gpu, s, moved, float(device["ceiling"]), moved["tier"]["bytes"] + moved["store"]["bytes"]))
-    copied = sum(r[4] for r in rows)
+        rows.append((gpu, s, s["moved"], device["ceiling"]))
+    fills = []
+    for source, ceiling in (("kept", "h2d_gbps"), ("tier", "h2d_gbps"), ("store", "disk_gbps")):
+        n = sum(count(m[source]["bytes"], source) for _, _, m, _ in rows)
+        fills.append((source, n, sum(count(m[source]["ns"], source) for _, _, m, _ in rows),
+                      sum(float(c[ceiling]) * m[source]["bytes"] for _, _, m, c in rows) / n if n else 0.0))
     return Memory(
         leftover_by_gpu=tuple((gpu, count(s["leftover"], "leftover")) for gpu, s, *_ in rows),
         kept=sum(count(m["kept"]["bytes"], "kept") for _, _, m, *_ in rows),
         tier=sum(count(m["tier"]["bytes"], "tier") for _, _, m, *_ in rows),
         store=sum(count(m["store"]["bytes"], "store") for _, _, m, *_ in rows),
-        fill_ns=sum(count(m["tier"]["ns"], "ns") + count(m["store"]["ns"], "ns") for _, _, m, *_ in rows),
-        ceiling=sum(c * n for *_, c, n in rows) / copied if copied else 0.0,
+        fills=tuple(fills), copy_ns=fills[1][2] + fills[2][2],
         stall_ns=sum(count(s["stall_ns"], "stall") for _, s, *_ in rows),
         retries=sum(count(s["retries"], "retries") for _, s, *_ in rows),
         cuts=sum(count(s["cuts"], "cuts") for _, s, *_ in rows),
@@ -270,20 +283,23 @@ def record(path, cell, number, state, line, cap):
     if poisoned:
         bar.append("poisoned")
     m = [m for _, m in memories]
-    total = {f: sum(getattr(x, f) for x in m) for f in ("kept", "tier", "store", "fill_ns", "stall_ns", "retries",
+    total = {f: sum(getattr(x, f) for x in m) for f in ("kept", "tier", "store", "copy_ns", "stall_ns", "retries",
                                                          "cuts", "parks")}
     moved = total["tier"] + total["store"]
     leftover = sum(n for x in m for _, n in x.leftover_by_gpu)
     least = None if not m or any(x.min_bytes is None for x in m) else sum(x.min_bytes for x in m)
     dit = [n for x in m for n in x.dit_steps]
-    ceiling = sum(x.ceiling * (x.tier + x.store) for x in m) / moved if moved else 0.0
-    rate = moved / total["fill_ns"] if total["fill_ns"] else 0.0  # bytes per ns: GB/s
+    fills = {}  # source -> [bytes, ns, ceiling x bytes]
+    for x in m:
+        for source, n, ns, ceiling in x.fills:
+            f = fills.setdefault(source, [0, 0, 0.0])
+            f[0], f[1], f[2] = f[0] + n, f[1] + ns, f[2] + ceiling * n
     evicted = {}
     for x in m:
         for name, n in x.evicted:
             evicted[name] = evicted.get(name, 0) + n
     if m and not victim:
-        bar += ["leftover"] * bool(leftover) + ["stall>copy"] * (total["stall_ns"] > total["fill_ns"])
+        bar += ["leftover"] * bool(leftover) + ["stall>copy"] * (total["stall_ns"] > total["copy_ns"])
         bar += [b for x in m for b in x.misplaced]
         if least is not None and moved > MIN_SLACK * least:
             bar.append("moved>1.05xMIN")
@@ -299,10 +315,12 @@ def record(path, cell, number, state, line, cap):
         "line": line, "cap": cap, "wall": f"{wall:.0f}s", "exec": "-" if duration is None else f"{duration:.3f}s",
         "moved": f"{gb(some(moved))}GB", "store": f"{gb(some(total['store']))}GB",
         "tier": f"{gb(some(total['tier']))}GB", "kept": f"{gb(some(total['kept']))}GB",
-        "ram_hit": f"{pct(total['tier'], moved)}%", "fill": f"{rate:.2f}GB/s", "fill_pct": f"{pct(rate, ceiling)}%",
-        "stall": f"{total['stall_ns'] / 1e9:.3f}s", "copy": f"{total['fill_ns'] / 1e9:.3f}s",
+        "ram_hit": f"{pct(total['tier'], moved)}%",
+        "fill": ",".join(f"{source}:{n / ns:.2f}GB/s/{pct(n / ns, c / n)}%" for source, (n, ns, c) in fills.items()
+                         if n and ns) or "-",  # bytes per ns is GB/s
+        "stall": f"{total['stall_ns'] / 1e9:.3f}s", "copy": f"{total['copy_ns'] / 1e9:.3f}s",
         "oom_retries": some(total["retries"]), "cuts": some(total["cuts"]), "parks": some(total["parks"]),
-        "evicted": ",".join(f"{k}:{v / 1e9:.2f}" for k, v in sorted(evicted.items())) or "-",
+        "evicted": ",".join(f"{k}:{v / 1e9:.2f}" for k, v in sorted(evicted.items()) if v) or "-",
         "leftover": some(leftover), "poisoned": int(poisoned), "min": f"{gb(least)}GB",
         "dit_step_max": f"{max(dit) if dit else '-'}B", "bar": ",".join(bar) or "ok",
     }
