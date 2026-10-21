@@ -63,7 +63,7 @@ def passing(module: nn.Module, args: Args, kwargs: Kwargs) -> Iterator[None]:
         mine = max((level for _, level in proposed), default=0)
         shapes = zlib.crc32(repr([(t.shape, t.dtype) for t in tensors((args, kwargs))]).encode())
         sent = torch.tensor([mine, shapes], dtype=torch.int64, device=_device())
-        got = sent.new_empty(2 * group.size())
+        got = torch.empty(2 * group.size(), dtype=torch.int64, device=sent.device)
         work = dist.all_gather_into_tensor(got, sent, group=group, async_op=True)
         _pass.level, _pass.model = (work, got), module
     try:

@@ -129,11 +129,11 @@ def banded(func: Any) -> bool:
     return func.overloadpacket in catch.RULES
 
 
-def test_a_vae_decode_runs_in_conv_norm_and_upsampling_bands(tmp_path: Path) -> None:
-    """At 36 KiB no [16, 32, 32] conv, group norm or nearest upsampling of the decoder fits
-    with its working memory: they run in channel bands, each the whole op's. Each op's site is
-    its block's path and its place among the block's ops of its kind, the same in every pass:
-    the next request starts each at the level Rust kept, and nothing runs out."""
+def test_a_vae_decode_runs_in_conv_bands(tmp_path: Path) -> None:
+    """At 36 KiB no [16, 32, 32] conv of the decoder fits with its working memory: they run in
+    channel bands, each the whole conv's. Each conv's site is its block's path and its place
+    among the block's convs, the same in every pass: the next request starts each at the level
+    Rust kept, and nothing runs out."""
     plain = vae()
     mem = memory()
     model = placed(mem, checkpoint(tmp_path, "vae", plain), "vae", vae)
@@ -170,11 +170,9 @@ def test_ooms_at_seeded_random_ops_in_a_vae_decode_change_nothing(
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 def test_each_band_rule_is_the_whole_op(dtype: Any) -> None:
-    """Every op band at every level against the op whole on real CPU kernels, each one's max
-    error printed: nearest upsampling at a non-integer scale and to a size no scale divides
-    (the whole op's index mapping in every band) and group norm by whole groups and by images
-    (eps 0 stays 0) are bit-exact; conv by images and by output channels (whole groups of a
-    grouped one) is in bfloat16, and in float32 within the rounding of another blocking."""
+    """Conv bands at every level against the conv whole on real CPU kernels, each one's max
+    error printed: by images and by output channels (whole groups of a grouped one), 2-D and
+    3-D, bit-exact in bfloat16 and in float32 within the rounding of another blocking."""
     aten = torch.ops.aten
     gen = torch.Generator().manual_seed(9)
     x = torch.randn(1, 16, 32, 32, generator=gen).to(dtype)
@@ -182,29 +180,29 @@ def test_each_band_rule_is_the_whole_op(dtype: Any) -> None:
     w, b = torch.randn(16, 16, 3, 3, generator=gen).to(dtype), torch.randn(16).to(dtype)
     grouped = torch.randn(16, 4, 3, 3, generator=gen).to(dtype)
     conv = ([1, 1], [1, 1], [1, 1], False, [0, 0])
+    video = torch.randn(1, 8, 3, 8, 8, generator=gen).to(dtype)
+    w3 = torch.randn(16, 8, 3, 3, 3, generator=gen).to(dtype)
+    conv3 = ([1, 1, 1], [1, 1, 1], [1, 1, 1], False, [0, 0, 0])
     cases = {
-        "conv by channels": (aten.convolution.default, (x, w, b, *conv, 1)),
-        "grouped conv by groups": (aten.convolution.default, (x, grouped, b, *conv, 4)),
-        "conv by images": (aten.convolution.default, (four, w, None, *conv, 1)),
-        "upsample x1.5": (aten.upsample_nearest2d.vec, (x, None, [1.5, 1.5])),
-        "exact upsample to 45": (aten._upsample_nearest_exact2d.vec, (four, [45, 45], None)),
-        "upsample x2": (aten.upsample_nearest2d.default, (x, [64, 64], 2.0, 2.0)),
-        "group norm by groups": (aten.native_group_norm.default, (x, b, b, 1, 16, 1024, 4, 1e-6)),
-        "group norm eps 0": (aten.native_group_norm.default, (four, b, b, 4, 16, 64, 4, 0.0)),
+        "conv by channels": (x, w, b, *conv, 1),
+        "grouped conv by groups": (x, grouped, b, *conv, 4),
+        "conv by images": (four, w, None, *conv, 1),
+        "conv3d by channels": (video, w3, b, *conv3, 1),
     }
-    for name, (func, args) in cases.items():
+    func = aten.convolution.default
+    assert set(catch.RULES) == {aten.convolution}
+    for name, args in cases.items():
         whole = func(*args)
-        plan = catch.RULES[func.overloadpacket](func, args, {})
+        plan = catch.RULES[aten.convolution](func, args, {})
         assert plan is not None and plan.finest >= 2, name
         for level in range(1, plan.finest + 1):
             got = plan(catch.Scope(name, plan.finest, level))
-            for a, b in zip(catch.tensors(got), catch.tensors(whole), strict=True):
-                error = (a.float() - b.float()).abs().max().item()
-                print(f"{dtype} {name} level {level}: max error {error:.3g} against whole")
-                if name.startswith(("conv", "grouped")):  # a CPU kernel blocks fewer channels
-                    torch.testing.assert_close(a, b, rtol=2**-16, atol=2**-14)  # otherwise
-                else:
-                    assert torch.equal(a, b), (name, level)
+            error = (got.float() - whole.float()).abs().max().item()
+            print(f"{dtype} {name} level {level}: max error {error:.3g} against whole")
+            if dtype == torch.bfloat16:
+                assert torch.equal(got, whole), (name, level)
+            else:  # a CPU kernel blocks fewer channels otherwise
+                torch.testing.assert_close(got, whole, rtol=2**-16, atol=2**-14)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
@@ -415,11 +413,16 @@ def decoder() -> Decoder:
     return model
 
 
+def silu_or_conv(func: Any) -> bool:
+    """The SiLU's result beside its input, and the conv's working memory (`Card`)."""
+    return func.overloadpacket in (torch.ops.aten.silu, torch.ops.aten.convolution)
+
+
 def test_a_silu_whose_input_is_dead_runs_in_place_else_needs_the_park(tmp_path: Path) -> None:
     """At 40 KiB the up-block's [16, 32, 32] SiLU beside its input does not fit. Cold, nothing
     has shown its input dead: Rust's answers reach Park, and a CPU has nothing to park, so the
-    request is exhausted. Once a run has shown the input dead, the SiLU runs in place, the norm
-    and conv in bands, and the result is the whole one."""
+    request is exhausted. Once a run has shown the input dead, the SiLU runs in place, the conv
+    in bands, and the result is the whole one."""
     plain = decoder()
     ck = checkpoint(tmp_path, "decoder", plain)
     x = torch.randn(1, 16, 16, 16, generator=torch.Generator().manual_seed(13)).to(BF16)
@@ -429,7 +432,7 @@ def test_a_silu_whose_input_is_dead_runs_in_place_else_needs_the_park(tmp_path: 
         model = placed(cold, ck, "decoder", decoder)
         with (
             pytest.raises(Exception) as raised,
-            Card(limit=40 << 10),
+            Card(limit=40 << 10, working=silu_or_conv),
             cold.request("cold") as r,
             execution.serving(r),
         ):
@@ -439,12 +442,12 @@ def test_a_silu_whose_input_is_dead_runs_in_place_else_needs_the_park(tmp_path: 
         model = placed(warm, ck, "decoder", decoder)
         with warm.request("warm") as r, execution.serving(r):
             assert torch.equal(model(x), want)
-        card = Card(limit=40 << 10)
+        card = Card(limit=40 << 10, working=silu_or_conv)
         with card, warm.request("short") as r, execution.serving(r):
             got = model(x)
     assert card.refused and r.stats().parks == 0
     error = (got.float() - want.float()).abs().max().item()
-    print(f"up-block, SiLU in place, norm and conv in bands: max error {error:.3g} against whole")
+    print(f"up-block, SiLU in place, conv in bands: max error {error:.3g} against whole")
     torch.testing.assert_close(got, want, rtol=2**-7, atol=2**-7)
 
 

@@ -1,9 +1,11 @@
 """Each op band rule on a GPU (py-review-1 item 9): the banded op's peak live bytes
-(`torch.cuda.max_memory_allocated`, its results included) below the whole op's, and its
-results the whole op's. A rule whose bands save nothing has no place in `cuts`.
+(`torch.cuda.max_memory_allocated`, its result included) below the whole op's, its max error
+printed. A rule whose bands save nothing has no place in `cuts`: on an RTX PRO 4000 (run 4393d3352,
+bands1) conv kept its own (2-D by channels 52.5 -> 42.5 MiB, by images 25.1 -> 15.1, 3-D 113.0 ->
+39.4), nearest upsampling none (64.0 -> 64.0) and group norm grew (16.0 -> 20.0): those two went.
 
 The shapes are a VAE decoder's at 1024 px: a 3x3 conv at 512 channels, a causal video conv's
-3x3x3, a 2x nearest upsampling, a 32-group norm; by images where the batch has more than one.
+3x3x3; by images where the batch has more than one.
 """
 
 from __future__ import annotations
@@ -37,22 +39,6 @@ CASES: dict[str, Callable[[], tuple[Any, tuple[object, ...]]]] = {
     "conv2d 512ch 128px by channels": lambda: _conv(_randn(1, 512, 128, 128), 512, 3),
     "conv2d 256ch 64px by images": lambda: _conv(_randn(4, 256, 64, 64), 256, 3),
     "conv3d 384ch 5x64px by channels": lambda: _conv(_randn(1, 384, 5, 64, 64), 384, 3),
-    "upsample 2x 512ch 128px by channels": lambda: (
-        aten.upsample_nearest2d.vec,
-        (_randn(1, 512, 128, 128), None, [2.0, 2.0]),
-    ),
-    "upsample 2x 256ch 64px by images": lambda: (
-        aten.upsample_nearest2d.vec,
-        (_randn(4, 256, 64, 64), None, [2.0, 2.0]),
-    ),
-    "group norm 32 groups 512ch 128px by groups": lambda: (
-        aten.native_group_norm.default,
-        (_randn(1, 512, 128, 128), _randn(512), _randn(512), 1, 512, 128 * 128, 32, 1e-6),
-    ),
-    "group norm 32 groups 256ch 64px by images": lambda: (
-        aten.native_group_norm.default,
-        (_randn(4, 256, 64, 64), _randn(256), _randn(256), 4, 256, 64 * 64, 32, 1e-6),
-    ),
 }
 
 
@@ -75,12 +61,9 @@ def test_a_band_rule_lowers_the_op_s_live_bytes(name: str) -> None:
         plan = catch.RULES[func.overloadpacket](func, args, {})
         assert plan is not None and plan.finest >= LEVEL, name
         banded_peak, got = _peak(lambda: plan(catch.Scope(name, plan.finest, LEVEL)))
-    errors = [
-        (a.float() - b.float()).abs().max().item()
-        for a, b in zip(catch.tensors(got), catch.tensors(whole), strict=True)
-    ]
+    error = (got.float() - whole.float()).abs().max().item()
     print(
         f"LIVE {name}: whole {whole_peak / 2**20:.1f} MiB, {1 << LEVEL} bands "
-        f"{banded_peak / 2**20:.1f} MiB, max error {max(errors):.3g}"
+        f"{banded_peak / 2**20:.1f} MiB, max error {error:.3g}"
     )
     assert banded_peak < whole_peak, (name, whole_peak, banded_peak)

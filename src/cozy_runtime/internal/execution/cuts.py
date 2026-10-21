@@ -1,11 +1,12 @@
 """Exact cuts (varena-slim §2): each computes what the whole computes, results on the device, at
 the level Rust holds for its site (`r.cut`). Level L is 2^L pieces, down to the finest.
 
-Op bands (the layer's, `catch.RULES`): conv, nearest upsampling and group norm by images, else by
-channels (whole groups), each band written by the op's `out` form straight into its slice of the
-op's results: only the op's own working memory (conv's workspace, a norm's float32 upcast)
-shrinks with the band. An elementwise op whose one allocation is its result has no band that
-saves room; SiLU and GELU run in place when their input is dead (`catch`), else Rust parks.
+Op bands (the layer's, `catch.RULES`): conv only, by images, else by output channels (whole
+groups), each band written by the conv's `out` form into its slice of the result, so its
+workspace shrinks with the band (measured on a GPU: tests/test_band_live_bytes.py). Nearest
+upsampling and group norm keep no working memory beyond their results: bands save nothing
+there, and Rust cuts the call around them (a package's `split`). SiLU and GELU run in place when
+their input is dead (`catch`), else Rust parks.
 Call cuts: Diffusers' FFNs by token, its channel RMS norms by rows, attention by head groups
 then query rows, a package's `split` by windows.
 """
@@ -45,56 +46,55 @@ def pieces(units: int, level: int) -> int:
 # ---------------------------------------------------------------------------- op bands
 
 
-#: What a band writes: the op on [lo, hi) of its first result's band axis, straight into its
-#: slices of the op's preallocated results (`outs`), through the op's `out` form.
-type Write = Callable[[int, int, Sequence[Tensor]], None]
+#: What a band writes: the op on [lo, hi) of its result's band axis, straight into its slice of
+#: the op's preallocated result, through the op's `out` form.
+type Write = Callable[[int, int, Tensor], None]
 
 
 @dataclass(frozen=True, slots=True)
 class Plan:
-    """An op in bands of its first result's outermost axis of more than one (a batch, else the
-    channels: a contiguous slice of each result), `align` of them a unit. `write` runs the op on
-    its operands' matching part straight into its slices of the preallocated results: no band
-    holds a result of its own. Its results are the op's own."""
+    """An op in bands of its result's outermost axis of more than one (a batch, else the
+    channels: a contiguous slice), `align` of them a unit. `write` runs the op on its operands'
+    matching part straight into its slice of the preallocated result: no band holds a result of
+    its own."""
 
     x: Tensor
-    outs: tuple[Tensor, ...]  # the op's results, meta
+    made: Tensor  # the op's result, meta
     axis: int
     write: Write
     align: int = 1
 
     @property
     def units(self) -> int:
-        return -(-int(self.outs[0].shape[self.axis]) // self.align)
+        return -(-int(self.made.shape[self.axis]) // self.align)
 
     @property
     def finest(self) -> int:
         return levels(self.units)
 
-    def __call__(self, own: Scope) -> object:
-        device = self.x.device
-        outs = [catch.settle(functools.partial(_empty, m, device), None, self.x) for m in self.outs]
-        operands = (self.x, outs)  # never parked while a band writes them
+    def __call__(self, own: Scope) -> Tensor:
+        out = catch.settle(functools.partial(_empty, self.made, self.x.device), None, self.x)
+        operands = (self.x, out)  # never parked while a band writes them
         at = 0
         while at < self.units:
-            write = functools.partial(self._band, outs, at, own)
-            at = catch.settle(write, own, operands, first=True)
-        return outs[0] if len(outs) == 1 else tuple(outs)
+            band = functools.partial(self._band, out, at, own)
+            at = catch.settle(band, own, operands, first=True)
+        return out
 
-    def _band(self, outs: Sequence[Tensor], at: int, own: Scope) -> int:
+    def _band(self, out: Tensor, at: int, own: Scope) -> int:
         stop = min(at + pieces(self.units, own.level), self.units)
-        self.write(at * self.align, stop * self.align, outs)
+        self.write(at * self.align, stop * self.align, out)
         return stop
 
 
 def _plan(made: list[Tensor], x: Tensor, write: Write, align: int = 1) -> Plan | None:
-    """Over the results' outermost axis of more than one unit, when every result is contiguous."""
-    if not made or not all(m.is_contiguous() for m in made):
+    """Over the result's outermost axis of more than one unit, when it is contiguous."""
+    if len(made) != 1 or not made[0].is_contiguous():
         return None
     axis = next((i for i, n in enumerate(made[0].shape[:2]) if n > 1), None)
     if axis is None or made[0].shape[axis] < 2 * align:
         return None
-    return Plan(x, tuple(made), axis, write, align)
+    return Plan(x, made[0], axis, write, align)
 
 
 def _arguments(func: OpOverload, args: Args, kwargs: Kwargs) -> dict[str, object]:
@@ -139,73 +139,19 @@ def _conv(func: OpOverload, args: Args, kwargs: Kwargs) -> Plan | None:
     per_out, per_in = int(w.shape[0]) // groups, int(x.shape[1]) // groups
     by_image = bool(made) and made[0].shape[0] > 1
 
-    def write(lo: int, hi: int, outs: Sequence[Tensor]) -> None:
+    def write(lo: int, hi: int, result: Tensor) -> None:
         if by_image:
-            out(x[lo:hi], w, bias, *rest, groups, out=outs[0][lo:hi])
+            out(x[lo:hi], w, bias, *rest, groups, out=result[lo:hi])
             return
         part = bias[lo:hi] if isinstance(bias, Tensor) else None
         g0, g1 = lo // per_out, hi // per_out
         inputs = x if groups == 1 else x[:, g0 * per_in : g1 * per_in]
-        out(inputs, w[lo:hi], part, *rest, 1 if groups == 1 else g1 - g0, out=outs[0][:, lo:hi])
+        out(inputs, w[lo:hi], part, *rest, 1 if groups == 1 else g1 - g0, out=result[:, lo:hi])
 
     return _plan(made, x, write, 1 if by_image or groups == 1 else per_out)
 
 
-def _upsample(func: OpOverload, args: Args, kwargs: Kwargs) -> Plan | None:
-    """By images, else by channels: each band the whole op's index mapping (its output size
-    and scales, a `vec` call's as the `out` form takes them) over its own planes."""
-    x, made = args[0] if args else None, _meta(func, args, kwargs)
-    if not isinstance(x, Tensor) or x.dim() < 3 or not made:
-        return None
-    rest: Sequence[object] = args[1:]
-    if func._overloadname == "vec":
-        scales = cast(list[float | None] | None, _arguments(func, args, kwargs).get("scale_factors"))
-        rest, kwargs = [list(made[0].shape[2:]), *(scales or [None] * (x.dim() - 2))], {}
-    out, by_image = cast(OpOverload, func.overloadpacket.out), made[0].shape[0] > 1
-
-    def write(lo: int, hi: int, outs: Sequence[Tensor]) -> None:
-        if by_image:
-            out(x[lo:hi], *rest, **kwargs, out=outs[0][lo:hi])
-        else:
-            out(x[:, lo:hi], *rest, **kwargs, out=outs[0][:, lo:hi])
-
-    return _plan(made, x, write)
-
-
-def _group_norm(func: OpOverload, args: Args, kwargs: Kwargs) -> Plan | None:
-    """By images, else by whole groups: each group's statistics over its own channels, as the
-    whole op computes them."""
-    a = _arguments(func, args, kwargs)
-    x, weight, bias = a.get("input"), a.get("weight"), a.get("bias")
-    if not isinstance(x, Tensor) or x.dim() < 2:
-        return None
-    n, c, hxw = (int(cast(int, a[k])) for k in ("N", "C", "HxW"))
-    groups, eps = int(cast(int, a["group"])), float(cast(float, a["eps"]))
-    out, made = cast(OpOverload, aten.native_group_norm.out), _meta(func, args, kwargs)
-    per, by_image = c // groups, n > 1
-
-    def write(lo: int, hi: int, outs: Sequence[Tensor]) -> None:
-        y, mean, rstd = outs
-        if by_image:
-            out(x[lo:hi], weight, bias, hi - lo, c, hxw, groups, eps,
-                out0=y[lo:hi], out1=mean[lo:hi], out2=rstd[lo:hi])
-            return
-        g0, g1 = lo // per, hi // per
-        w = weight[lo:hi] if isinstance(weight, Tensor) else None
-        b = bias[lo:hi] if isinstance(bias, Tensor) else None
-        out(x[:, lo:hi], w, b, n, hi - lo, hxw, g1 - g0, eps,
-            out0=y[:, lo:hi], out1=mean[:, g0:g1], out2=rstd[:, g0:g1])
-
-    return _plan(made, x, write, 1 if by_image else per)
-
-
-_UPSAMPLES = [f"{p}{d}d" for p in ("upsample_nearest", "_upsample_nearest_exact") for d in "123"]
-_SPEC = {
-    _conv: "convolution",
-    _upsample: " ".join(_UPSAMPLES),
-    _group_norm: "native_group_norm",
-}
-catch.RULES.update({getattr(aten, n): r for r, ns in _SPEC.items() for n in ns.split()})
+catch.RULES[aten.convolution] = _conv
 
 
 # --------------------------------------------------------------------------- call cuts

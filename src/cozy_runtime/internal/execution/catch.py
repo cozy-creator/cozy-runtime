@@ -605,9 +605,10 @@ class Banded(Protocol):
     """An op as bands (`cuts.Plan`): its finest level, and itself at `own.level` (finer while a
     band runs out and Rust cuts `own`)."""
 
-    finest: int
+    @property
+    def finest(self) -> int: ...
 
-    def __call__(self, own: Scope) -> object: ...
+    def __call__(self, own: Scope) -> Tensor: ...
 
 
 #: what an op that runs out may become: its result in bands, else None
