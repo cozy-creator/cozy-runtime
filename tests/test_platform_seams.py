@@ -1,11 +1,14 @@
 """The OS seams under the executor's GPU path, on real calls: the CPUs a process may use, every
 byte of a directory output and of a kernel store entry, a link out of a directory output, each
-NVML query where the host has no NVIDIA driver, and a kernel build where the OS cannot end its
-tree. Windows runs this file on windows-2025 (`platforms.yaml`)."""
+NVML query where the host has no NVIDIA driver, a kernel build where the OS cannot end its tree,
+and an async call under the network fence, which still refuses loopback. Windows runs this file
+on windows-2025 (`platforms.yaml`)."""
 
 from __future__ import annotations
 
 import os
+import socket
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -22,6 +25,40 @@ if sys.platform == "win32":
 
 #: What a text-mode descriptor rewrites: CRLF, LF and Ctrl-Z.
 BYTES = b"a\r\nb\nc\x1ad\x00"
+
+#: The executor's fence, armed as at its boot; then an async entrypoint (its loop's self-pipe is
+#: a loopback pair on Windows), the same pair spelled out on every OS, and a dial to the
+#: 127.0.0.1 port in argv, which must be refused.
+FENCED = """
+import asyncio, socket, sys, time
+from pathlib import Path
+import msgspec
+from cozy_runtime.author import App, Invocation, attempt
+from cozy_runtime.internal.sandbox import FenceViolation, refuse_network
+
+class Request(msgspec.Struct):
+    pass
+
+class Reply(msgspec.Struct):
+    total: int
+
+app = App()
+
+@app.entrypoint(accelerator=False)
+async def main(payload: Request) -> Reply:
+    return Reply(await asyncio.get_running_loop().run_in_executor(None, sum, [1, 2]))
+
+refuse_network("the seams test", allow_unix_seam=True)
+deadline = time.monotonic() + 30
+result, outcome, _ = attempt(app.get("main"), {}, Invocation("f", Path(sys.argv[1]), deadline))
+print(outcome.terminal, outcome.message, result and result.result)
+with socket.create_server(("127.0.0.1", 0)) as listener:
+    socket.socket().connect(listener.getsockname())
+try:
+    socket.socket().connect(("127.0.0.1", int(sys.argv[2])))
+except FenceViolation as exc:
+    print(exc.fence)
+"""
 
 
 class Request(msgspec.Struct):
@@ -95,3 +132,19 @@ def test_a_kernel_build_is_absent_where_the_os_cannot_end_its_tree(tmp_path: Pat
     store = kernel_cache.Store(tmp_path / "kernels")
     job = kernel_compile.Job("python", kernel_cache.Key.of("seams", {}))
     assert kernel_compile.wait(store, job).state == "absent"
+
+
+def test_an_async_call_runs_under_the_network_fence_which_still_refuses_loopback(
+    tmp_path: Path,
+) -> None:
+    with socket.create_server(("127.0.0.1", 0)) as service:
+        port = service.getsockname()[1]
+        fenced = subprocess.run(
+            [sys.executable, "-c", FENCED, str(tmp_path), str(port)],
+            capture_output=True,
+            text=True,
+        )
+    assert fenced.returncode == 0, fenced.stderr
+    ran, refused = fenced.stdout.splitlines()
+    assert ran == "succeeded  Reply(total=3)", fenced.stdout
+    assert refused == "no_network", fenced.stdout

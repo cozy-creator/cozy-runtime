@@ -18,9 +18,11 @@ False is the assertion the harness makes afterwards.
 
 from __future__ import annotations
 
+import contextlib
 import socket
 import sys
-from collections.abc import Sequence
+import weakref
+from collections.abc import Iterable, Sequence
 
 if sys.platform != "win32":
     import resource
@@ -95,6 +97,19 @@ def unix_seam(event: str, args: tuple[object, ...]) -> bool:
     return unix is not None and getattr(args[0], "family", None) == unix
 
 
+def _own_listener(bound: Iterable[socket.socket], event: str, args: tuple[object, ...]) -> bool:
+    """True when a connect dials a socket this process bound: an in-process pair, not egress.
+    Windows has no AF_UNIX `socketpair`; Python pairs two loopback TCP sockets instead, as
+    every asyncio loop's self-pipe does."""
+    if event != "socket.connect" or len(args) < 2 or not isinstance(args[1], tuple):
+        return False
+    for listener in list(bound):
+        with contextlib.suppress(OSError):
+            if listener.getsockname()[:2] == args[1][:2]:
+                return True
+    return False
+
+
 def refuse_network(why: str, *, allow_unix_seam: bool = False) -> None:
     """Refuse every `NETWORK_EVENTS` spelling in THIS process. IRREVERSIBLE.
 
@@ -108,10 +123,21 @@ def refuse_network(why: str, *, allow_unix_seam: bool = False) -> None:
     a kernel bound (`CLONE_NEWNET`, seccomp) that a process cannot install for itself, and
     the runtime does not have one. `scripts/lifecycle-live.py egress` observes BOTH halves
     on the real serving executor, so this paragraph cannot quietly become a bigger claim.
+
+    A connect to a socket this process bound after the fence armed stays in the process
+    (`_own_listener`); every other address, loopback included, is refused.
     """
 
+    bound: weakref.WeakSet[socket.socket] = weakref.WeakSet()
+
     def hook(event: str, args: tuple[object, ...]) -> None:
-        if event in NETWORK_EVENTS and not (allow_unix_seam and unix_seam(event, args)):
+        if event == "socket.bind" and isinstance(args[0], socket.socket):
+            bound.add(args[0])
+        elif (
+            event in NETWORK_EVENTS
+            and not (allow_unix_seam and unix_seam(event, args))
+            and not _own_listener(bound, event, args)
+        ):
             raise FenceViolation("no_network", f"{event}{args[1:2] or args[:1]} — {why}")
 
     sys.addaudithook(hook)
