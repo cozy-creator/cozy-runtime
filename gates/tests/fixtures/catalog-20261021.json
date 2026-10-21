@@ -1,0 +1,343 @@
+[
+ {
+  "name": "rtx-3060",
+  "vram_gb": 12,
+  "widths": [
+   {
+    "accelerator_count": 1,
+    "bandwidth_usd_micros_per_gb": 6000,
+    "container_disk_gb": 140,
+    "expected_price": {
+     "disk_usd_micros": 70000,
+     "download_gb": 100,
+     "download_hours": 0.1892863903085368,
+     "download_mbps": 1174,
+     "download_usd_micros": 587000,
+     "gpu_usd_micros": 143000,
+     "hours": 1.0,
+     "total_usd_micros": 800000
+    },
+    "price_usd_micros_per_hour": 120000,
+    "storage_usd_micros_per_hour": 59000
+   }
+  ]
+ },
+ {
+  "name": "rtx-pro-4000",
+  "vram_gb": 24,
+  "widths": [
+   {
+    "accelerator_count": 1,
+    "container_disk_gb": 300,
+    "expected_price": {
+     "disk_usd_micros": 63000,
+     "download_gb": 0,
+     "download_hours": 0.0,
+     "download_mbps": 2000,
+     "download_usd_micros": 0,
+     "gpu_usd_micros": 855000,
+     "hours": 1.0,
+     "total_usd_micros": 918000
+    },
+    "price_usd_micros_per_hour": 855000,
+    "storage_usd_micros_per_hour": 63000
+   },
+   {
+    "accelerator_count": 2,
+    "container_disk_gb": 300,
+    "expected_price": {
+     "disk_usd_micros": 63000,
+     "download_gb": 0,
+     "download_hours": 0.0,
+     "download_mbps": 2000,
+     "download_usd_micros": 0,
+     "gpu_usd_micros": 1710000,
+     "hours": 1.0,
+     "total_usd_micros": 1773000
+    },
+    "price_usd_micros_per_hour": 1710000,
+    "storage_usd_micros_per_hour": 63000
+   },
+   {
+    "accelerator_count": 4,
+    "container_disk_gb": 300,
+    "expected_price": {
+     "disk_usd_micros": 63000,
+     "download_gb": 0,
+     "download_hours": 0.0,
+     "download_mbps": 2000,
+     "download_usd_micros": 0,
+     "gpu_usd_micros": 3420000,
+     "hours": 1.0,
+     "total_usd_micros": 3483000
+    },
+    "price_usd_micros_per_hour": 3420000,
+    "storage_usd_micros_per_hour": 63000
+   }
+  ]
+ },
+ {
+  "name": "rtx-3070",
+  "vram_gb": 8,
+  "widths": [
+   {
+    "accelerator_count": 1,
+    "bandwidth_usd_micros_per_gb": 6000,
+    "container_disk_gb": 300,
+    "expected_price": {
+     "disk_usd_micros": 146000,
+     "download_gb": 100,
+     "download_hours": 0.16375992794563168,
+     "download_mbps": 1357,
+     "download_usd_micros": 587000,
+     "gpu_usd_micros": 187000,
+     "hours": 1.0,
+     "total_usd_micros": 920000
+    },
+    "price_usd_micros_per_hour": 161000,
+    "storage_usd_micros_per_hour": 126000
+   }
+  ]
+ },
+ {
+  "name": "l4",
+  "vram_gb": 24,
+  "widths": [
+   {
+    "accelerator_count": 1,
+    "container_disk_gb": 300,
+    "expected_price": {
+     "disk_usd_micros": 63000,
+     "download_gb": 0,
+     "download_hours": 0.0,
+     "download_mbps": 2000,
+     "download_usd_micros": 0,
+     "gpu_usd_micros": 885000,
+     "hours": 1.0,
+     "total_usd_micros": 948000
+    },
+    "price_usd_micros_per_hour": 885000,
+    "storage_usd_micros_per_hour": 63000
+   },
+   {
+    "accelerator_count": 2,
+    "container_disk_gb": 300,
+    "expected_price": {
+     "disk_usd_micros": 63000,
+     "download_gb": 0,
+     "download_hours": 0.0,
+     "download_mbps": 2000,
+     "download_usd_micros": 0,
+     "gpu_usd_micros": 1770000,
+     "hours": 1.0,
+     "total_usd_micros": 1833000
+    },
+    "price_usd_micros_per_hour": 1770000,
+    "storage_usd_micros_per_hour": 63000
+   }
+  ]
+ },
+ {
+  "name": "rtx-4090",
+  "vram_gb": 24,
+  "widths": [
+   {
+    "accelerator_count": 1,
+    "container_disk_gb": 300,
+    "expected_price": {
+     "disk_usd_micros": 63000,
+     "download_gb": 0,
+     "download_hours": 0.0,
+     "download_mbps": 2000,
+     "download_usd_micros": 0,
+     "gpu_usd_micros": 1335000,
+     "hours": 1.0,
+     "total_usd_micros": 1398000
+    },
+    "price_usd_micros_per_hour": 1335000,
+    "storage_usd_micros_per_hour": 63000
+   },
+   {
+    "accelerator_count": 2,
+    "container_disk_gb": 300,
+    "expected_price": {
+     "disk_usd_micros": 63000,
+     "download_gb": 0,
+     "download_hours": 0.0,
+     "download_mbps": 2000,
+     "download_usd_micros": 0,
+     "gpu_usd_micros": 2670000,
+     "hours": 1.0,
+     "total_usd_micros": 2733000
+    },
+    "price_usd_micros_per_hour": 2670000,
+    "storage_usd_micros_per_hour": 63000
+   },
+   {
+    "accelerator_count": 4,
+    "container_disk_gb": 300,
+    "expected_price": {
+     "disk_usd_micros": 63000,
+     "download_gb": 0,
+     "download_hours": 0.0,
+     "download_mbps": 2000,
+     "download_usd_micros": 0,
+     "gpu_usd_micros": 5340000,
+     "hours": 1.0,
+     "total_usd_micros": 5403000
+    },
+    "price_usd_micros_per_hour": 5340000,
+    "storage_usd_micros_per_hour": 63000
+   }
+  ]
+ },
+ {
+  "name": "rtx-3090",
+  "vram_gb": 24,
+  "widths": [
+   {
+    "accelerator_count": 1,
+    "bandwidth_usd_micros_per_gb": 20000,
+    "container_disk_gb": 300,
+    "expected_price": {
+     "disk_usd_micros": 297000,
+     "download_gb": 100,
+     "download_hours": 0.09657636776280844,
+     "download_mbps": 2301,
+     "download_usd_micros": 1954000,
+     "gpu_usd_micros": 878000,
+     "hours": 1.0,
+     "total_usd_micros": 3129000
+    },
+    "price_usd_micros_per_hour": 800000,
+    "storage_usd_micros_per_hour": 271000
+   },
+   {
+    "accelerator_count": 2,
+    "bandwidth_usd_micros_per_gb": 40000,
+    "container_disk_gb": 300,
+    "expected_price": {
+     "disk_usd_micros": 477000,
+     "download_gb": 100,
+     "download_hours": 0.14401958666378628,
+     "download_mbps": 1543,
+     "download_usd_micros": 3907000,
+     "gpu_usd_micros": 2060000,
+     "hours": 1.0,
+     "total_usd_micros": 6444000
+    },
+    "price_usd_micros_per_hour": 1800000,
+    "storage_usd_micros_per_hour": 417000
+   },
+   {
+    "accelerator_count": 4,
+    "bandwidth_usd_micros_per_gb": 59000,
+    "container_disk_gb": 300,
+    "expected_price": {
+     "disk_usd_micros": 644000,
+     "download_gb": 100,
+     "download_hours": 0.02877408030845814,
+     "download_mbps": 7723,
+     "download_usd_micros": 5860000,
+     "gpu_usd_micros": 4116000,
+     "hours": 1.0,
+     "total_usd_micros": 10620000
+    },
+    "price_usd_micros_per_hour": 4001000,
+    "storage_usd_micros_per_hour": 626000
+   }
+  ]
+ },
+ {
+  "name": "h100-nvl",
+  "vram_gb": 94,
+  "widths": [
+   {
+    "accelerator_count": 1,
+    "container_disk_gb": 300,
+    "expected_price": {
+     "disk_usd_micros": 70000,
+     "download_gb": 100,
+     "download_hours": 0.1111111111111111,
+     "download_mbps": 2000,
+     "download_usd_micros": 0,
+     "gpu_usd_micros": 5317000,
+     "hours": 1.0,
+     "total_usd_micros": 5387000
+    },
+    "price_usd_micros_per_hour": 4785000,
+    "storage_usd_micros_per_hour": 63000
+   },
+   {
+    "accelerator_count": 2,
+    "container_disk_gb": 300,
+    "expected_price": {
+     "disk_usd_micros": 70000,
+     "download_gb": 100,
+     "download_hours": 0.1111111111111111,
+     "download_mbps": 2000,
+     "download_usd_micros": 0,
+     "gpu_usd_micros": 10634000,
+     "hours": 1.0,
+     "total_usd_micros": 10704000
+    },
+    "price_usd_micros_per_hour": 9570000,
+    "storage_usd_micros_per_hour": 63000
+   }
+  ]
+ },
+ {
+  "name": "h100-sxm5-80gb",
+  "vram_gb": 80,
+  "widths": [
+   {
+    "accelerator_count": 1,
+    "container_disk_gb": 300,
+    "expected_price": {
+     "disk_usd_micros": 63000,
+     "download_gb": 0,
+     "download_hours": 0.0,
+     "download_mbps": 2000,
+     "download_usd_micros": 0,
+     "gpu_usd_micros": 5985000,
+     "hours": 1.0,
+     "total_usd_micros": 6048000
+    },
+    "price_usd_micros_per_hour": 5985000,
+    "storage_usd_micros_per_hour": 63000
+   },
+   {
+    "accelerator_count": 2,
+    "container_disk_gb": 300,
+    "expected_price": {
+     "disk_usd_micros": 63000,
+     "download_gb": 0,
+     "download_hours": 0.0,
+     "download_mbps": 2000,
+     "download_usd_micros": 0,
+     "gpu_usd_micros": 11970000,
+     "hours": 1.0,
+     "total_usd_micros": 12033000
+    },
+    "price_usd_micros_per_hour": 11970000,
+    "storage_usd_micros_per_hour": 63000
+   },
+   {
+    "accelerator_count": 4,
+    "container_disk_gb": 300,
+    "expected_price": {
+     "disk_usd_micros": 63000,
+     "download_gb": 0,
+     "download_hours": 0.0,
+     "download_mbps": 2000,
+     "download_usd_micros": 0,
+     "gpu_usd_micros": 23940000,
+     "hours": 1.0,
+     "total_usd_micros": 24003000
+    },
+    "price_usd_micros_per_hour": 23940000,
+    "storage_usd_micros_per_hour": 63000
+   }
+  ]
+ }
+]

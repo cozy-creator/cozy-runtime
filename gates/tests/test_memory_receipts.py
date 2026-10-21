@@ -9,193 +9,164 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 API = runpy.run_path(str(ROOT / "memory_receipts.py"))
-RAW = json.loads((ROOT / "tests/fixtures/h3-warm-11880.json").read_text())
-CONTROLS = (ROOT / "tests/fixtures/0274-controls.txt").read_text()
+FIXTURES = ROOT / "tests/fixtures"
+CATALOG = FIXTURES / "catalog-20261021.json"
+Step, belady = API["Step"], API["belady"]
+GB = 10**9
 
 
-def positive():
-    # Deliberately synthetic passing memory assertions, derived from a real completed GPU
-    # receipt. The unmodified fixture retains its actual leftover and is tested as a failure.
-    value = copy.deepcopy(RAW)
-    measurements = value.get("calls", [value])[0]["measurements"]
-    stats = measurements["memory"]["stats"]
-    stats.update(leftover=0, paged_in=0, retries=0)
-    stats["leftover_by_gpu"] = [[0, 0]]
-    stats["steps"] = {"model/transformer_ref": [0, 0]}
-    stats["rows"] = [
-        {"model": "model/transformer_ref", "gpu": 0, "step": step,
-         "home": 10, "resident": 10, "paged_in": 0, "streamed": 0, "stall_ns": 0, "activations": 0}
-        for step in (7, 8)
-    ]
-    return value
+def fixture(name):
+    return json.loads((FIXTURES / f"{name}.json").read_text())
 
 
-class MemoryReceipts(unittest.TestCase):
-    def record(self, value, cell="24-sdxl4", cold=""):
+def varena(reads, capacity=3 * GB, w=int(2.5 * GB)):
+    """A one-GPU candidate record in S1's `Stats` field names: a 2 GB DiT in two 1 GB blocks over three steps; `reads`
+    names each step's origin for both blocks (`tier` copies them, `hit` finds them mapped)."""
+    trace = [{"step": s, "set": "base_model/transformer_ref", "block": b, "bytes": GB, "origin": origin,
+              "speculative": False} for s, origin in enumerate(reads) for b in (0, 1)]
+    copied = sum(r["bytes"] for r in trace if r["origin"] == "Tier")
+    stats = {"request": "r", "trace": trace, "stall_ns": copied // 40, "evicted": [0] * 7, "evicted_lowered": 0,
+             "speculative_evicted_d": 0, "retries": 0, "cuts": 0, "parks": 0, "lowered": False, "peak": w, "leftover": 0,
+             "moved": {"kept": {"bytes": 0, "ns": 0}, "tier": {"bytes": copied, "ns": copied // 20},
+                       "store": {"bytes": 0, "ns": 0}, "speculative": 0},
+             "steps": [{"capacity": capacity, "w": w, "evicted": [0] * 7} for _ in reads]}
+    return {"number": 1, "status": "completed", "execution_ms": 1000, "created_at_ms": 1, "settled_at_ms": 2001,
+            "calls": [{"measurements": {"execution": {"gpus": [{"gpu": 0, "start_us": 1, "end_us": 2}]},
+                                        "memory": {"varena": [{"gpu": 0, "ceiling": 25.0, "stats": stats}]}}}]}
+
+
+class Receipts(unittest.TestCase):
+    def record(self, value, cell, line="shipping", cap="24", state="completed landed"):
         with tempfile.TemporaryDirectory() as directory:
-            path, summary = Path(directory) / "run.json", Path(directory) / "summary.txt"
+            path = Path(directory) / "run.json"
             path.write_text(json.dumps(value))
-            summary.write_text(cold)
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
-                code = API["record"](path, cell, str(value["number"]), "completed landed", "", summary)
-            return code, out.getvalue()
+                code = API["record"](path, cell, str(value["number"]), state, line, cap)
+            text = out.getvalue()
+            (Path(directory) / "summary.txt").write_text(text)
+            return code, text, API["receipts"](Path(directory) / "summary.txt")[0]
 
-    def compare(self, controls, candidate):
+    def compare(self, text, lines):
         with tempfile.TemporaryDirectory() as directory:
-            old, new = Path(directory) / "old.txt", Path(directory) / "new.txt"
-            old.write_text(controls)
-            new.write_text(candidate)
+            path = Path(directory) / "summary.txt"
+            path.write_text(text)
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
-                code = API["compare"](old, new, ["24"])
+                code = API["compare"](path, lines)
             return code, out.getvalue()
 
-    def test_a_succeeded_call_is_complete(self):
-        value = positive()
-        value.get("calls", [value])[0]["status"] = "succeeded"
-        code, text = self.record(value)
-        self.assertNotIn("gpu-call-incomplete", text)
+    def test_belady_is_the_textbook_optimum(self):
+        pages = [7, 0, 1, 2, 0, 3, 0, 4, 2, 3, 0, 3, 2, 1, 2, 0, 1, 7, 0, 1]  # 3 frames: OPT faults 9 times
+        self.assertEqual(belady([Step(3, tuple((str(p), 1) for p in pages))]), 9)
 
-    def test_actual_current_receipt_leftover_cannot_pass(self):
-        code, text = self.record(RAW)
+    def test_belady_counts_held_pages_free_and_shrinks_with_capacity(self):
+        refs = (("a", 1), ("b", 1))
+        self.assertEqual(belady([Step(2, refs)] * 3), 2)
+        self.assertEqual(belady([Step(2, refs)] * 3, held=refs), 0)
+        # A step with room for one page evicts the one used furthest ahead (b), which costs its copy back later.
+        self.assertEqual(belady([Step(2, refs), Step(1, (("a", 1),)), Step(2, refs)], held=refs), 1)
+        # A page larger than the capacity streams through every time.
+        self.assertEqual(belady([Step(1, (("big", 2),))] * 3), 6)
+
+    def test_shipping_warm_h3_on_24_streams_its_dit_every_step(self):
+        code, text, row = self.record(fixture("h3-warm-12665"), "24-h3ref5-warm.1")
         self.assertEqual(code, 1)
-        self.assertIn("leftover=33554432", text)
-        self.assertRegex(text, r"bar=[^ ]*leftover")
+        self.assertEqual(row.bar, "dit-reads-per-step")
+        self.assertEqual(row.moved, 70.264)  # every copy run's bytes: the record's paged_in
+        self.assertIn("dit_step_max=11366756352B", text)
+        self.assertIn("ram_hit=100.0%", text)
+        self.assertIn("min=-GB", text)  # no page trace on the shipping line
 
-    def test_missing_required_gpu_fields_refuse(self):
-        for field in ("leftover", "paged_in", "retries", "steps"):
-            with self.subTest(field=field):
-                value = positive()
-                del value.get("calls", [value])[0]["measurements"]["memory"]["stats"][field]
-                code, text = self.record(value)
-                self.assertEqual(code, 1)
-                self.assertIn(f"no-valid-{field}", text)
-        value = positive()
-        value.get("calls", [value])[0]["measurements"].pop("memory")
-        code, text = self.record(value)
-        self.assertEqual(code, 1)
-        self.assertIn("no-mem-stats", text)
+    def test_shipping_cold_h3_meets_the_bar_with_its_retries(self):
+        code, text, row = self.record(fixture("h3-cold-12663"), "24-h3ref5")
+        self.assertEqual((code, row.bar), (0, "ok"), text)
+        self.assertIn("oom_retries=1333 cuts=1 parks=0", text)
 
-    def test_cpu_orchestrators_do_not_need_memory_but_gpu_calls_do(self):
-        value = positive()
-        gpu = value.pop("measurements") if "measurements" in value else value.pop("calls")[0]["measurements"]
-        value["calls"] = [{"measurements": {"execution": {"gpus": [{"gpu": -1}]}}}, {"measurements": gpu}]
-        self.assertEqual(self.record(value)[0], 0)
-        value["calls"].pop()
-        code, text = self.record(value)
-        self.assertEqual(code, 1)
-        self.assertIn("no-gpu-execution", text)
-
-    def test_every_executed_gpu_requires_its_leftover_receipt(self):
-        value = positive()
-        m = value.get("calls", [value])[0]["measurements"]
-        m["execution"]["gpus"].append({**m["execution"]["gpus"][0], "gpu": 1})
-        code, text = self.record(value)
-        self.assertEqual(code, 1)
-        self.assertIn("leftover-gpu-coverage", text)
-        m["memory"]["stats"]["leftover_by_gpu"].append([1, 0])
-        self.assertEqual(self.record(value)[0], 0)
-        m["memory"]["stats"]["leftover_by_gpu"][1][1] = 32
-        self.assertIn("leftover-gpu-coverage", self.record(value)[1])
-        m["memory"]["stats"]["leftover_by_gpu"] = [[0, 0], [1, 0], [2, 0]]
-        self.assertIn("leftover-gpu-coverage", self.record(value)[1])
-
-    def test_actual_degree_two_receipt_exposes_missing_gpu_one(self):
-        value = json.loads((ROOT / "tests/fixtures/h3-degree2-11916.json").read_text())
-        code, text = self.record(value, "2x8-h3")
-        self.assertEqual(code, 1)
-        self.assertIn("leftover-gpu-coverage", text)
-
-    def test_missing_malformed_and_duplicate_gpu_totals_refuse(self):
-        for by_gpu in (None, [], [0], [[False, 0]], [[0, False]], [[0, -1]], [[0, 0], [0, 0]], [[0, 1]]):
-            with self.subTest(by_gpu=by_gpu):
-                value = positive()
-                value.get("calls", [value])[0]["measurements"]["memory"]["stats"]["leftover_by_gpu"] = by_gpu
-                self.assertEqual(self.record(value)[0], 1)
-
-    def test_warm_transformer_steps_cannot_default_to_zero(self):
-        cold = "24-h3ref5 run=1 completed landed exec=10s poisoned=0 leftover=0 oom_retries=0 bar=ok\n"
-        value = positive()
-        code, text = self.record(value, "24-h3ref5-warm", cold)
+    def test_shipping_qwen_retries_park_and_disk_reads_fail_only_a_warm_cell(self):
+        code, text, _ = self.record(fixture("qwen4-12709"), "24-qwen4")
         self.assertEqual(code, 0, text)
-        value.get("calls", [value])[0]["measurements"]["memory"]["stats"]["steps"] = {}
-        code, text = self.record(value, "24-h3ref5-warm", cold)
-        self.assertEqual(code, 1)
-        self.assertIn("no-dit-step-stats", text)
+        self.assertIn("parks=1", text)
+        code, text, row = self.record(fixture("qwen4-12709"), "24-qwen4-warm.2")
+        self.assertEqual(row.bar, "warm-oom-retries,store-in-warm")
 
-    def test_h3_requires_every_physical_ranks_real_transformer_passes(self):
-        fixture = json.loads((ROOT / "tests/fixtures/h3-transformer-ranks.json").read_text())
-        value = positive()
-        measurements = value.get("calls", [value])[0]["measurements"]
-        measurements["execution"]["gpus"] = fixture["execution"]
-        stats = measurements["memory"]["stats"]
-        stats["leftover_by_gpu"] = [[2, 0], [3, 0]]
-        stats["rows"] = fixture["complete"]
-        cold = "24-h3ref5 run=1 completed landed exec=10s poisoned=0 leftover=0 oom_retries=0 bar=ok\n"
-        self.assertEqual(self.record(value, "24-h3ref5-warm", cold)[0], 0)
-        for name in ("missing_gpu3", "short_gpu3", "duplicate_pass", "wrong_gpu"):
-            with self.subTest(name=name):
-                stats["rows"] = fixture[name]
-                code, text = self.record(value, "24-h3ref5-warm", cold)
-                self.assertEqual(code, 1)
-                self.assertIn("dit-row-", text)
-        stats["rows"] = fixture["complete"]
-        # Other components can run only on the leader; no blanket rank symmetry rule.
-        stats["rows"].append({"model": "model/text_encoder", "gpu": 2, "step": 1})
-        self.assertEqual(self.record(value, "24-h3ref5-warm", cold)[0], 0)
-        stats["rows"][2]["paged_in"] = 1
-        code, text = self.record(value, "24-h3ref5-warm", cold)
-        self.assertEqual(code, 1)
-        self.assertIn("dit-reads-per-step", text)
+    def test_every_executed_gpu_needs_its_leftover(self):
+        value = fixture("h3-warm-12665")
+        value["calls"][0]["measurements"]["execution"]["gpus"].append({"gpu": 1, "start_us": 5, "end_us": 6})
+        self.assertIn("leftover-gpu-coverage", self.record(value, "24-h3ref5")[2].bar)
 
-    def test_h3_transformer_rows_require_typed_identity_and_reads(self):
-        for key, bad in (("model", None), ("gpu", False), ("step", False),
-                         ("step", -1), ("paged_in", None), ("streamed", False)):
-            with self.subTest(key=key, bad=bad):
-                value = positive()
-                value.get("calls", [value])[0]["measurements"]["memory"]["stats"]["rows"][0][key] = bad
-                code, text = self.record(value, "24-h3ref5")
-                self.assertEqual(code, 1)
-                self.assertIn("no-valid-dit-rows", text)
+    def test_leftover_poison_and_missing_stats_fail(self):
+        value = fixture("h3-cold-12663")
+        value["calls"][0]["measurements"]["memory"]["stats"]["leftover_by_gpu"] = [[0, 32]]
+        value["reason"] = {"code": "executor_poisoned", "message": "poisoned"}
+        self.assertEqual(self.record(value, "24-h3ref5")[2].bar, "poisoned,leftover")
+        del value["calls"][0]["measurements"]["memory"]["stats"]["copies"]
+        self.assertIn("no-mem-stats(KeyError:'copies')", self.record(value, "24-h3ref5")[2].bar)
 
-    def test_retries_use_current_stats_and_own_cold_pass(self):
-        value = positive()
-        value.get("calls", [value])[0]["measurements"]["memory"]["stats"]["retries"] = 3
-        cold = "24-h3ref5 run=1 completed landed exec=10s poisoned=0 leftover=0 oom_retries=2 bar=ok\n"
-        code, text = self.record(value, "24-h3ref5-warm", cold)
-        self.assertEqual(code, 1)
-        self.assertIn("oom_retries=3", text)
-        self.assertIn("more-retries-than-cold", text)
-        code, text = self.record(positive(), "24-h3ref5-warm")
-        self.assertEqual(code, 1)
-        self.assertIn("no-valid-cold", text)
+    def test_the_kill_victim_must_end_canceled(self):
+        value = fixture("h3-cold-12663")
+        self.assertEqual(self.record(value, "24-kill-victim")[2].bar, "not-killed")
+        value["status"] = "canceled"
+        self.assertEqual(self.record(value, "24-kill-victim", state="canceled landed")[0], 0)
 
-    def test_failed_poisoned_11618_is_never_numeric_control(self):
-        old = next(line for line in CONTROLS.splitlines() if "run=11618 " in line) + "\n"
-        current = "24-h3ref-warm run=2 completed landed exec=1000s poisoned=0 leftover=0 bar=ok\n"
-        code, text = self.compare(old, current)
-        self.assertEqual(code, 0)
-        self.assertIn("not compared: control failed", text)
-        self.assertNotIn("WORSE", text)
+    def test_candidate_bytes_against_belady_min(self):
+        code, text, row = self.record(varena(["Tier", "Hit", "Hit"]), "24-h3ref5-warm.1", line="candidate")
+        self.assertEqual((code, row.bar, row.min, row.moved), (1, "dit-reads-per-step", 2.0, 2.0))
+        code, text, row = self.record(varena(["Tier", "Hit", "Hit"]), "24-h3ref5", line="candidate")
+        self.assertEqual((code, row.bar), (0, "ok"), text)
+        code, text, row = self.record(varena(["Tier", "Tier", "Tier"]), "24-h3ref5", line="candidate")
+        self.assertEqual(row.bar, "moved>1.05xMIN")
+        self.assertEqual((row.min, row.moved), (2.0, 6.0))
+        # A 1.5 GB pass room leaves one block's room: MIN itself streams all 6 GB.
+        _, _, row = self.record(varena(["Tier", "Tier", "Tier"], w=int(3.5 * GB)), "24-h3ref5", line="candidate")
+        self.assertEqual((row.bar, row.min), ("ok", 6.0))
+        warm = varena(["Hit", "Hit", "Hit"])
+        self.assertEqual(self.record(warm, "24-h3ref5-warm.1", line="candidate")[2].bar, "ok")
 
-    def test_completed_legacy_control_times_compare_without_new_varena_schema(self):
-        old = next(line for line in CONTROLS.splitlines() if "run=11616 " in line) + "\n"
-        current = "24-h3ref5-warm run=2 completed landed exec=126s poisoned=0 leftover=0 bar=ok\n"
-        code, text = self.compare(old, current)
+    def test_candidate_misplaced_evictions_fail(self):
+        value = varena(["Tier", "Hit", "Hit"])
+        stats = value["calls"][0]["measurements"]["memory"]["varena"][0]["stats"]
+        stats["evicted"] = [0, 0, 0, 0, 0, 5, 1]
+        stats["evicted_lowered"] = 4
+        stats["speculative_evicted_d"] = 1
+        self.assertEqual(self.record(value, "24-sdxl4", line="candidate")[2].bar,
+                         "gpu0-W-evicted,gpu0-P-evicted,gpu0-speculation-evicted-D")
+
+    def test_matched_comparison_uses_medians_and_counts_only_the_line_under_test(self):
+        line = "{cell} run={n} completed landed line={line} cap=24 wall=10s exec={e}s moved={m}GB min=-GB bar={bar}\n"
+        rows = [line.format(cell=f"24-h3ref5-warm.{k}", n=k, line="shipping", e=e, m=5, bar="ok")
+                for k, e in ((1, 90), (2, 91), (3, 89))]
+        rows += [line.format(cell=f"24-h3ref5-warm.{k}", n=10 + k, line="candidate", e=e, m=0, bar="ok")
+                 for k, e in ((1, 88), (2, 200), (3, 89))]
+        code, text = self.compare("".join(rows), ["shipping", "candidate"])
+        self.assertEqual(code, 0, text)
+        self.assertIn("exec 90.000 -> 89.000; moved 5.000 -> 0.000", text)
+        rows[3] = rows[3].replace("exec=88s", "exec=95s")
+        code, text = self.compare("".join(rows), ["shipping", "candidate"])
         self.assertEqual(code, 1)
         self.assertIn("WORSE", text)
+        missed = rows[0].replace("bar=ok", "bar=dit-reads-per-step")
+        code, text = self.compare("".join([missed, *rows[1:]]).replace("exec=95s", "exec=88s"), ["shipping", "candidate"])
+        self.assertEqual(code, 0)
+        self.assertIn("not compared (shipping missed its bar)", text)
+        self.assertEqual(self.compare(missed, ["shipping"])[0], 1)  # a shakedown counts the shipping line's own
 
-    def test_missing_and_substitute_controls_are_explicit(self):
-        current = "24-h3ref5-warm run=2 completed landed exec=126s poisoned=0 leftover=0 bar=ok\n"
-        self.assertIn("missing control; absolute bars remain", self.compare("", current)[1])
-        old = "24-h3ref5-warm run=1 completed landed exec=1s poisoned=0 leftover=0 substitute=32 bar=ok\n"
-        self.assertIn("control substitute 32", self.compare(old, current)[1])
-        for time in ("0s", "nans", "infs"):
-            old = f"24-h3ref5-warm run=1 completed landed exec={time} poisoned=0 leftover=0 bar=ok\n"
-            self.assertIn("time missing or invalid", self.compare(old, current)[1])
-        invalid = current.replace("bar=ok", "bar=no-mem-stats")
-        self.assertEqual(self.compare("", invalid)[0], 1)
+    def test_rentals_come_cheapest_first_from_the_catalog(self):
+        self.assertEqual(API["rental"](CATALOG, "8"), "1x24 1 8GiB rtx-pro-4000 l4 rtx-4090 rtx-3090")
+        self.assertEqual(API["rental"](CATALOG, "2x12"), "2x24 2 12GiB rtx-pro-4000 l4 rtx-4090 rtx-3090")
+        self.assertEqual(API["rental"](CATALOG, "real8"), "real8 1 - rtx-3070")
+        self.assertEqual(API["rental"](CATALOG, "h100"), "h100 1 - h100-nvl h100-sxm5-80gb")
+
+    def test_the_plan_prices_measured_groups_and_lists_the_rest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            walls = Path(directory) / "summary.txt"
+            walls.write_text("24-h3ref5 run=1 completed landed line=shipping cap=24 wall=1800s exec=1s bar=ok\n"
+                             "24-h3ref5-warm.1 run=2 completed landed line=shipping cap=24 wall=1800s exec=1s bar=ok\n")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                API["plan"](CATALOG, ["shipping", "candidate"], [walls], ["24=h3ref5,sdxl4", "8=h3ref5"])
+            text = out.getvalue()
+        self.assertIn("1x24 (24 8): rtx-pro-4000 x1 $0.918/h; measured 2.00 h, $1.84; unmeasured: 24:sdxl4 8:h3ref5", text)
 
 
 if __name__ == "__main__":

@@ -1,15 +1,8 @@
 {
-  "source": "outputs/xs046-b4/runs/b4-p3-d9-refill-20261019T142102Z/show-h3-d1-warm.json",
-  "sha256": "b1e4fd66464fa0ebbc1aa019e211a24f4f0f7b4305730274319d81b86f87f7e7",
-  "fields": "only status/identity/timings/GPU facts and required memory stats retained; fixture is not changed to pass",
-  "baseline_source": "outputs/memory-matrix-0274/summary.txt",
-  "control_runs": [
-    11616,
-    11618
-  ],
-  "degree2_source": {
-    "source": "outputs/xs046-b4/runs/b4-p2-h3-2x8-20261019T191353Z/show-2x8-h3.json",
-    "sha256": "26e743c914a7f4afc074abc9163dd4f6c1c2d3ba8e0c53aeaff535e3b7e820c3",
-    "fields": "same reduced facts, actual failed GPU0/1 execution and only GPU0 leftover receipt retained"
-  }
+  "fields": "only status, identity, timings, GPU execution and the memory stats the receipts read; values unchanged",
+  "h3-warm-12665.json": {"run": 12665, "target": "local/minimax-h3/ref2va_turbo", "machine": "curran (RTX 4090)", "runtime": "0.30.0", "tensorfs": "0.12.0", "tensord": "0.11.0+dev.gdce19a5e", "show_sha256": "7f0cdb3e1cd033e09b4b1a909bbea150ff367408d68cb592b31f3435d2613bca"},
+  "h3-cold-12663.json": {"run": 12663, "target": "local/minimax-h3/ref2va_turbo", "machine": "curran (RTX 4090)", "runtime": "0.30.0", "tensorfs": "0.12.0", "tensord": "0.11.0+dev.gdce19a5e", "show_sha256": "0cfb47bd4ec0c7eb4fbe119591faf18c90ace1c1d1641e35728a840b38a2bcf2"},
+  "qwen4-12709.json": {"run": 12709, "target": "local/qwen-image-2/generate_image", "machine": "kuromitsu (RTX 4090)", "runtime": "0.30.0", "tensorfs": "0.12.0", "tensord": "0.11.0+dev.gdce19a5e", "show_sha256": "c7d2accdbb814f391d79a550f7e111ffdc880bc77a40e96ccd022e1b6da9192e"},
+  "catalog-20261021.json": "`cozy machine rent --json --tensorhub tensorhub` on 2026-10-21, nine SKUs kept",
+  "portrait.jpg (gates/)": "outputs/xs046-b4/proofs/lena.png, a Klein portrait from the 0.27.4 matrix, scaled to 768x768"
 }
