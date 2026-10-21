@@ -19,6 +19,7 @@ False is the assertion the harness makes afterwards.
 from __future__ import annotations
 
 import contextlib
+import ipaddress
 import socket
 import sys
 import weakref
@@ -98,14 +99,27 @@ def unix_seam(event: str, args: tuple[object, ...]) -> bool:
 
 
 def _own_listener(bound: Iterable[socket.socket], event: str, args: tuple[object, ...]) -> bool:
-    """True when a connect dials a socket this process bound: an in-process pair, not egress.
-    Windows has no AF_UNIX `socketpair`; Python pairs two loopback TCP sockets instead, as
-    every asyncio loop's self-pipe does."""
-    if event != "socket.connect" or len(args) < 2 or not isinstance(args[1], tuple):
+    """True when a connect dials a loopback TCP listener this process bound, of the dialer's
+    family: the pair Python's `socketpair` builds where the OS has no AF_UNIX (every asyncio
+    loop's self-pipe on Windows), not egress."""
+    if event != "socket.connect" or len(args) < 2:
+        return False
+    dialer, address = args[0], args[1]
+    if not isinstance(dialer, socket.socket) or not isinstance(address, tuple):
+        return False
+    try:
+        if not ipaddress.ip_address(address[0]).is_loopback:
+            return False
+    except (ValueError, TypeError, IndexError):
         return False
     for listener in list(bound):
         with contextlib.suppress(OSError):
-            if listener.getsockname()[:2] == args[1][:2]:
+            if (
+                listener.type == socket.SOCK_STREAM
+                and listener.family == dialer.family
+                and listener.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN)
+                and listener.getsockname()[:2] == address[:2]
+            ):
                 return True
     return False
 
@@ -124,14 +138,16 @@ def refuse_network(why: str, *, allow_unix_seam: bool = False) -> None:
     the runtime does not have one. `scripts/lifecycle-live.py egress` observes BOTH halves
     on the real serving executor, so this paragraph cannot quietly become a bigger claim.
 
-    A connect to a socket this process bound after the fence armed stays in the process
-    (`_own_listener`); every other address, loopback included, is refused.
+    Where the OS has no AF_UNIX (Windows), `socketpair` is a loopback TCP listener this
+    process binds and dials: that connect is admitted (`_own_listener`). Every other connect,
+    loopback included, is refused.
     """
 
+    paired = getattr(socket, "AF_UNIX", None) is None
     bound: weakref.WeakSet[socket.socket] = weakref.WeakSet()
 
     def hook(event: str, args: tuple[object, ...]) -> None:
-        if event == "socket.bind" and isinstance(args[0], socket.socket):
+        if paired and event == "socket.bind" and isinstance(args[0], socket.socket):
             bound.add(args[0])
         elif (
             event in NETWORK_EVENTS

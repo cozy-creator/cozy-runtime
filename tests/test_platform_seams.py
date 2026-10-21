@@ -6,6 +6,7 @@ on windows-2025 (`platforms.yaml`)."""
 
 from __future__ import annotations
 
+import json
 import os
 import socket
 import subprocess
@@ -27,10 +28,11 @@ if sys.platform == "win32":
 BYTES = b"a\r\nb\nc\x1ad\x00"
 
 #: The executor's fence, armed as at its boot; then an async entrypoint (its loop's self-pipe is
-#: a loopback pair on Windows), the same pair spelled out on every OS, and a dial to the
-#: 127.0.0.1 port in argv, which must be refused.
+#: a loopback pair on Windows) and non-blocking dials, each refused or admitted: the same pair
+#: spelled out, another process's 127.0.0.1 listener (port in argv) plainly and after a UDP
+#: bind to its port, and a remote address after a free bind to it.
 FENCED = """
-import asyncio, socket, sys, time
+import asyncio, json, socket, sys, time
 from pathlib import Path
 import msgspec
 from cozy_runtime.author import App, Invocation, attempt
@@ -52,12 +54,31 @@ refuse_network("the seams test", allow_unix_seam=True)
 deadline = time.monotonic() + 30
 result, outcome, _ = attempt(app.get("main"), {}, Invocation("f", Path(sys.argv[1]), deadline))
 print(outcome.terminal, outcome.message, result and result.result)
+
+def dial(address, decoy=False, free=False):
+    if decoy:
+        udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        if free:
+            udp.setsockopt(socket.IPPROTO_IP, 15, 1)  # Linux's IP_FREEBIND
+        udp.bind(address)
+    client = socket.socket()
+    client.setblocking(False)
+    try:
+        client.connect(address)
+    except FenceViolation as exc:
+        return exc.fence
+    except OSError:
+        pass
+    return "admitted"
+
+service = ("127.0.0.1", int(sys.argv[2]))
 with socket.create_server(("127.0.0.1", 0)) as listener:
-    socket.socket().connect(listener.getsockname())
-try:
-    socket.socket().connect(("127.0.0.1", int(sys.argv[2])))
-except FenceViolation as exc:
-    print(exc.fence)
+    dials = {"own pair": dial(listener.getsockname())}
+dials["service"] = dial(service)
+dials["udp decoy"] = dial(service, decoy=True)
+if sys.platform == "linux":
+    dials["free bind"] = dial(("192.0.2.1", 44444), decoy=True, free=True)
+print(json.dumps(dials))
 """
 
 
@@ -145,6 +166,11 @@ def test_an_async_call_runs_under_the_network_fence_which_still_refuses_loopback
             text=True,
         )
     assert fenced.returncode == 0, fenced.stderr
-    ran, refused = fenced.stdout.splitlines()
+    ran, dials = fenced.stdout.splitlines()
     assert ran == "succeeded  Reply(total=3)", fenced.stdout
-    assert refused == "no_network", fenced.stdout
+    # Only where Python pairs loopback TCP (no AF_UNIX) is its own pair admitted.
+    own = "admitted" if getattr(socket, "AF_UNIX", None) is None else "no_network"
+    refused = {"service": "no_network", "udp decoy": "no_network"}
+    if sys.platform == "linux":
+        refused["free bind"] = "no_network"
+    assert json.loads(dials) == {"own pair": own, **refused}, fenced.stdout
