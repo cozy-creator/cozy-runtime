@@ -29,8 +29,8 @@ BYTES = b"a\r\nb\nc\x1ad\x00"
 
 #: The executor's fence, armed as at its boot; then an async entrypoint (its loop's self-pipe is
 #: a loopback pair on Windows) and non-blocking dials, each refused or admitted: the same pair
-#: spelled out, another process's 127.0.0.1 listener (port in argv) plainly and after a UDP
-#: bind to its port, and a remote address after a free bind to it.
+#: spelled out and its listener dialled over UDP, another process's 127.0.0.1 listener (port in
+#: argv) plainly and after a UDP bind to its port, and a remote address after a free bind to it.
 FENCED = """
 import asyncio, json, socket, sys, time
 from pathlib import Path
@@ -55,13 +55,13 @@ deadline = time.monotonic() + 30
 result, outcome, _ = attempt(app.get("main"), {}, Invocation("f", Path(sys.argv[1]), deadline))
 print(outcome.terminal, outcome.message, result and result.result)
 
-def dial(address, decoy=False, free=False):
+def dial(address, decoy=False, free=False, kind=socket.SOCK_STREAM):
     if decoy:
         udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         if free:
             udp.setsockopt(socket.IPPROTO_IP, 15, 1)  # Linux's IP_FREEBIND
         udp.bind(address)
-    client = socket.socket()
+    client = socket.socket(socket.AF_INET, kind)
     client.setblocking(False)
     try:
         client.connect(address)
@@ -74,6 +74,7 @@ def dial(address, decoy=False, free=False):
 service = ("127.0.0.1", int(sys.argv[2]))
 with socket.create_server(("127.0.0.1", 0)) as listener:
     dials = {"own pair": dial(listener.getsockname())}
+    dials["udp to own pair"] = dial(listener.getsockname(), kind=socket.SOCK_DGRAM)
 dials["service"] = dial(service)
 dials["udp decoy"] = dial(service, decoy=True)
 if sys.platform == "linux":
@@ -170,7 +171,7 @@ def test_an_async_call_runs_under_the_network_fence_which_still_refuses_loopback
     assert ran == "succeeded  Reply(total=3)", fenced.stdout
     # Only where Python pairs loopback TCP (no AF_UNIX) is its own pair admitted.
     own = "admitted" if getattr(socket, "AF_UNIX", None) is None else "no_network"
-    refused = {"service": "no_network", "udp decoy": "no_network"}
+    refused = {"udp to own pair": "no_network", "service": "no_network", "udp decoy": "no_network"}
     if sys.platform == "linux":
         refused["free bind"] = "no_network"
     assert json.loads(dials) == {"own pair": own, **refused}, fenced.stdout

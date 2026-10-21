@@ -99,13 +99,15 @@ def unix_seam(event: str, args: tuple[object, ...]) -> bool:
 
 
 def _own_listener(bound: Iterable[socket.socket], event: str, args: tuple[object, ...]) -> bool:
-    """True when a connect dials a loopback TCP listener this process bound, of the dialer's
+    """True when a TCP connect dials a loopback TCP listener this process bound, of the dialer's
     family: the pair Python's `socketpair` builds where the OS has no AF_UNIX (every asyncio
     loop's self-pipe on Windows), not egress."""
     if event != "socket.connect" or len(args) < 2:
         return False
     dialer, address = args[0], args[1]
     if not isinstance(dialer, socket.socket) or not isinstance(address, tuple):
+        return False
+    if dialer.type != socket.SOCK_STREAM:
         return False
     try:
         if not ipaddress.ip_address(address[0]).is_loopback:
