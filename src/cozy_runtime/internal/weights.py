@@ -684,6 +684,7 @@ class _Bakes:
             if site == local or not lora_bake.bakeable(encoded.scheme, dict(encoded.params), roles):
                 continue
             bake = _Bake(stored)
+            hooks: list[object]
             try:
                 hooks = list(root.get_submodule(site)._forward_hooks.values())
             except AttributeError:  # a tensor named `.weight` on no module of its own
